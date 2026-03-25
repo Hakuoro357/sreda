@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from uuid import uuid4
+
+from sqlalchemy.orm import Session
+
+from sreda.db.models.core import InboundMessage, User, Workspace
+from sreda.services.privacy_guard import get_default_privacy_guard
+from sreda.services.secure_storage import store_secure_json
+
+
+@dataclass(slots=True)
+class TelegramInboundPersistResult:
+    inbound_message_id: str
+    contains_sensitive_data: bool
+
+
+def persist_telegram_inbound_event(
+    session: Session,
+    *,
+    bot_key: str,
+    payload: dict,
+) -> TelegramInboundPersistResult:
+    chat_id = _extract_chat_id(payload)
+    message_text = _extract_message_text(payload)
+
+    user = None
+    workspace = None
+    tenant_id = None
+    workspace_id = None
+    user_id = None
+    if chat_id is not None:
+        user = session.query(User).filter(User.telegram_account_id == chat_id).one_or_none()
+    if user is not None:
+        tenant_id = user.tenant_id
+        user_id = user.id
+        workspace = (
+            session.query(Workspace)
+            .filter(Workspace.tenant_id == tenant_id)
+            .order_by(Workspace.id.asc())
+            .first()
+        )
+        if workspace is not None:
+            workspace_id = workspace.id
+
+    secure_record = store_secure_json(
+        session,
+        record_type="telegram_webhook_raw",
+        record_key=str(_extract_update_id(payload) or uuid4().hex),
+        value=payload,
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+    )
+
+    sanitized_text = None
+    contains_sensitive_data = False
+    if message_text is not None:
+        sanitization = get_default_privacy_guard().sanitize_text(message_text)
+        if sanitization is not None:
+            sanitized_text = sanitization.sanitized_text
+            contains_sensitive_data = sanitization.contains_sensitive_data
+
+    inbound = InboundMessage(
+        id=f"in_{uuid4().hex[:24]}",
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        channel_type="telegram",
+        channel_account_id=bot_key,
+        bot_key=bot_key,
+        external_update_id=_extract_update_id(payload),
+        sender_chat_id=chat_id,
+        message_text_sanitized=sanitized_text,
+        contains_sensitive_data=contains_sensitive_data,
+        secure_record_id=secure_record.id,
+    )
+    session.add(inbound)
+    session.commit()
+
+    return TelegramInboundPersistResult(
+        inbound_message_id=inbound.id,
+        contains_sensitive_data=contains_sensitive_data,
+    )
+
+
+def _extract_update_id(payload: dict) -> str | None:
+    value = payload.get("update_id")
+    if value is None:
+        return None
+    return str(value)
+
+
+def _extract_chat_id(payload: dict) -> str | None:
+    message = _extract_message_container(payload)
+    if not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
+        return None
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return None
+    return str(chat_id)
+
+
+def _extract_message_text(payload: dict) -> str | None:
+    message = _extract_message_container(payload)
+    if not isinstance(message, dict):
+        return None
+    for key in ("text", "caption"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _extract_message_container(payload: dict) -> dict | None:
+    for key in ("message", "edited_message"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
