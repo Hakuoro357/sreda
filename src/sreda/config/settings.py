@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     database_url: str = Field(default="postgresql+psycopg://sreda:sreda@localhost:5432/sreda")
     telegram_bot_token: str | None = None
+    connect_public_base_url: str | None = None
 
     openai_base_url: str | None = None
     openai_api_key: str | None = None

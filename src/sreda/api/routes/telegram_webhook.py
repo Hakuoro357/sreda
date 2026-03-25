@@ -6,12 +6,8 @@ from sreda.db.session import get_db_session
 from sreda.integrations.telegram.client import TelegramClient
 from sreda.schemas.api import TelegramWebhookAccepted
 from sreda.services.inbound_messages import persist_telegram_inbound_event
-from sreda.services.onboarding import (
-    CONNECT_EDS_CALLBACK,
-    build_connect_eds_message,
-    build_welcome_message,
-    ensure_telegram_user_bundle,
-)
+from sreda.services.onboarding import ensure_telegram_user_bundle
+from sreda.services.telegram_bot import handle_telegram_interaction
 
 router = APIRouter(prefix="/webhooks/telegram", tags=["telegram"])
 
@@ -31,25 +27,11 @@ async def telegram_webhook(
     settings = get_settings()
     if settings.telegram_bot_token and onboarding.chat_id:
         telegram_client = TelegramClient(settings.telegram_bot_token)
-        callback_query = payload.get("callback_query")
-        if (
-            isinstance(callback_query, dict)
-            and callback_query.get("data") == CONNECT_EDS_CALLBACK
-            and callback_query.get("id")
-        ):
-            await telegram_client.answer_callback_query(
-                str(callback_query["id"]),
-                text="Запрос на подключение EDS принят",
-            )
-            await telegram_client.send_message(
-                chat_id=onboarding.chat_id,
-                text=build_connect_eds_message(),
-            )
-        elif onboarding.is_new_user:
-            text, reply_markup = build_welcome_message()
-            await telegram_client.send_message(
-                chat_id=onboarding.chat_id,
-                text=text,
-                reply_markup=reply_markup,
-            )
+        await handle_telegram_interaction(
+            session,
+            bot_key=bot_key,
+            payload=payload,
+            telegram_client=telegram_client,
+            onboarding=onboarding,
+        )
     return TelegramWebhookAccepted(ok=True, request_id=result.inbound_message_id)

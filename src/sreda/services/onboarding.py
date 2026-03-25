@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.core import User
 from sreda.db.repositories.seed import SeedRepository
+from sreda.services.billing import STATUS_CALLBACK, SUBSCRIPTIONS_CALLBACK
 
 CONNECT_EDS_CALLBACK = "onboarding:connect_eds"
 
@@ -60,11 +61,13 @@ def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnbo
 def build_welcome_message() -> tuple[str, dict]:
     text = (
         "Привет! Я Среда.\n\n"
-        "Я помогу следить за важными изменениями и со временем подключу рабочие сценарии вокруг EDS.\n"
-        "Сейчас тебе уже доступен базовый режим, а мониторинг можно подключить отдельно."
+        "Я помогу следить за важными изменениями и управлять подписками вокруг EDS.\n"
+        "Сейчас можно посмотреть статус, открыть подписки и подключить EDS Monitor."
     )
     reply_markup = {
         "inline_keyboard": [
+            [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
             [
                 {
                     "text": "Подключить EDS",
@@ -76,10 +79,16 @@ def build_welcome_message() -> tuple[str, dict]:
     return text, reply_markup
 
 
-def build_connect_eds_message() -> str:
+def build_connect_eds_message(*, base_active: bool, connected_count: int, allowed_count: int) -> str:
+    if not base_active:
+        return (
+            "Сначала подключи подписку EDS Monitor.\n\n"
+            "После этого можно будет привязать кабинет EDS."
+        )
     return (
-        "Подключение EDS пока настраивается вручную.\n\n"
-        "Я зафиксировала запрос. Следующий шаг — привязать логин EDS и включить для тебя мониторинг."
+        "Подключение EDS скоро будет доступно через защищенную веб-страницу.\n\n"
+        f"Сейчас подключено кабинетов: {connected_count} из {allowed_count}.\n"
+        "Следующий шаг — открыть защищенную форму и передать логин и пароль от кабинета."
     )
 
 

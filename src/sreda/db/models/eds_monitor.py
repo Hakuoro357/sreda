@@ -13,6 +13,12 @@ class EDSAccount(Base):
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
     assistant_id: Mapped[str] = mapped_column(ForeignKey("assistants.id"), index=True)
+    tenant_eds_account_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenant_eds_accounts.id"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
     site_key: Mapped[str] = mapped_column(String(64))
     account_key: Mapped[str] = mapped_column(String(128), unique=True)
     label: Mapped[str] = mapped_column(String(255))
