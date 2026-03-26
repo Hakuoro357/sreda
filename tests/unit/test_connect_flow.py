@@ -79,7 +79,8 @@ def test_connect_callback_creates_one_time_link(
     assert response.status_code == 202
     assert len(answered_callbacks) == 1
     assert len(sent_messages) == 1
-    assert "Ссылка действует 15 минут" in sent_messages[0]["text"]
+    assert "Сейчас откроется защищенная одноразовая страница" in sent_messages[0]["text"]
+    assert "сохраняются в системе только в зашифрованном виде" in sent_messages[0]["text"]
     open_button = sent_messages[0]["reply_markup"]["inline_keyboard"][0][0]
     assert open_button["text"] == "Ввести логин и пароль от EDS"
     assert open_button["web_app"]["url"].startswith("https://connect.example.test/connect/eds/")
@@ -127,6 +128,9 @@ def test_open_connect_form_returns_html_for_valid_token(
 
     assert response.status_code == 200
     assert "Подключение кабинета EDS" in response.text
+    assert "Это защищенная одноразовая страница для подключения личного кабинета EDS." in response.text
+    assert 'Введите логин и пароль и нажмите кнопку "Подключить"' in response.text
+    assert "Ссылка действует до:" in response.text
     assert "Логин" in response.text
     assert "Пароль" in response.text
 

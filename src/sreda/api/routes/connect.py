@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from html import escape
 from urllib.parse import parse_qs
 
@@ -31,7 +32,7 @@ def open_eds_connect_form(
     return HTMLResponse(
         _render_form_page(
             account_slot_type=connect_session.account_slot_type,
-            expires_at=connect_session.expires_at.isoformat(),
+            expires_at=_format_expires_at(connect_session.expires_at),
         ),
         status_code=200,
     )
@@ -63,29 +64,86 @@ async def submit_eds_connect_form(
 
 
 def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
-    slot_label = "первого кабинета" if account_slot_type == "primary" else "дополнительного кабинета"
     return f"""<!doctype html>
 <html lang="ru">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Подключение EDS</title>
+    <style>
+      * {{
+        box-sizing: border-box;
+      }}
+      body {{
+        margin: 0;
+        padding: 16px;
+        font-family: Arial, sans-serif;
+        line-height: 1.5;
+        color: #111827;
+        background: #ffffff;
+      }}
+      main {{
+        max-width: 560px;
+        margin: 0 auto;
+      }}
+      h1 {{
+        margin: 0 0 24px;
+        font-size: 32px;
+        line-height: 1.15;
+      }}
+      p {{
+        margin: 0 0 16px;
+      }}
+      .expires-at {{
+        color: #4b5563;
+      }}
+      label {{
+        display: block;
+        margin-bottom: 16px;
+      }}
+      .label-text {{
+        display: block;
+        margin-bottom: 8px;
+        font-size: 16px;
+      }}
+      input {{
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        padding: 12px;
+        font-size: 16px;
+        border: 1px solid #d1d5db;
+        border-radius: 10px;
+        background: #ffffff;
+      }}
+      button {{
+        padding: 12px 18px;
+        font-size: 16px;
+        border: 0;
+        border-radius: 10px;
+        background: #2563eb;
+        color: #ffffff;
+        cursor: pointer;
+      }}
+    </style>
   </head>
   <body>
-    <main style="max-width:560px;margin:40px auto;font-family:Arial,sans-serif;line-height:1.5;">
+    <main>
       <h1>Подключение кабинета EDS</h1>
-      <p>Форма для {escape(slot_label)}. Данные будут сохранены в зашифрованном виде.</p>
-      <p><small>Ссылка действует ограниченное время: {escape(expires_at)}</small></p>
+      <p>Это защищенная одноразовая страница для подключения личного кабинета EDS.</p>
+      <p>Логин и пароль передаются по защищенному соединению и сохраняются в системе только в зашифрованном виде.</p>
+      <p>Введите логин и пароль и нажмите кнопку "Подключить"</p>
+      <p class="expires-at">Ссылка действует до: {escape(expires_at)}</p>
       <form method="post">
-        <label style="display:block;margin-bottom:16px;">
-          <span>Логин</span><br>
-          <input type="text" name="login" autocomplete="username" style="width:100%;padding:10px;">
+        <label>
+          <span class="label-text">Логин</span>
+          <input type="text" name="login" autocomplete="username">
         </label>
-        <label style="display:block;margin-bottom:16px;">
-          <span>Пароль</span><br>
-          <input type="password" name="password" autocomplete="current-password" style="width:100%;padding:10px;">
+        <label>
+          <span class="label-text">Пароль</span>
+          <input type="password" name="password" autocomplete="current-password">
         </label>
-        <button type="submit" style="padding:10px 16px;">Подключить</button>
+        <button type="submit">Подключить</button>
       </form>
     </main>
   </body>
@@ -125,3 +183,11 @@ def _render_error_page(message: str) -> str:
     </main>
   </body>
 </html>"""
+
+
+def _format_expires_at(value: datetime) -> str:
+    try:
+        localized = value.astimezone()
+    except ValueError:
+        localized = value
+    return localized.strftime("%d.%m.%Y %H:%M")
