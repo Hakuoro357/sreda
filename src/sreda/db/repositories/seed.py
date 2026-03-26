@@ -34,6 +34,8 @@ class SeedRepository(Repository):
         else:
             user.telegram_account_id = telegram_account_id
 
+        self.session.flush()
+
         assistant = self.session.get(Assistant, assistant_id)
         if assistant is None:
             self.session.add(

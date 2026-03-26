@@ -9,6 +9,7 @@ from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import Assistant, Job, SecureRecord, Tenant, TenantFeature, User, Workspace
 from sreda.db.models.eds_monitor import EDSAccount
 from sreda.db.session import get_engine, get_session_factory
+from sreda.integrations.telegram.client import TelegramDeliveryError
 from sreda.services.billing import BillingService
 from sreda.services.eds_account_verification import (
     EDSAccountVerificationService,
@@ -40,6 +41,17 @@ class FakeTelegramClient:
             }
         )
         return {"ok": True}
+
+
+class FailingTelegramClient:
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        raise TelegramDeliveryError("timeout")
 
 
 class SuccessAdapter:
@@ -184,6 +196,30 @@ def test_temporary_failure_keeps_job_pending_for_retry(monkeypatch, tmp_path) ->
     assert tenant_account.status == "pending_verification"
     assert "\"attempts\": 1" in job.payload_json
     assert telegram_client.messages == []
+
+
+def test_successful_verification_completes_even_if_telegram_delivery_fails(monkeypatch, tmp_path) -> None:
+    session = _build_session(monkeypatch, tmp_path)
+    try:
+        job_id = _seed_submitted_connect(session)
+        service = EDSAccountVerificationService(
+            session,
+            telegram_client=FailingTelegramClient(),
+            adapter=SuccessAdapter(),
+        )
+
+        result = asyncio.run(service.process_job(job_id))
+
+        connect_session = session.query(ConnectSession).one()
+        tenant_account = session.query(TenantEDSAccount).one()
+        job = session.query(Job).one()
+    finally:
+        session.close()
+
+    assert result == "completed"
+    assert job.status == "completed"
+    assert connect_session.status == "verified"
+    assert tenant_account.status == "active"
 
 
 def _build_session(monkeypatch, tmp_path):

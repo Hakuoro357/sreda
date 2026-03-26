@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 from sreda.db.models.eds_monitor import EDSAccount
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import Job, SecureRecord, User
-from sreda.integrations.telegram.client import TelegramClient
+from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.services.billing import BillingService, STATUS_CALLBACK, SUBSCRIPTIONS_CALLBACK
 from sreda.services.secure_storage import load_secure_json, store_secure_json
 
@@ -22,6 +23,7 @@ RETRY_LIMITS = {
     "verification_temporary_failed": 2,
     "verification_unknown_failed": 1,
 }
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -390,17 +392,19 @@ class EDSAccountVerificationService:
                 "Дополнительный кабинет EDS подключен.\n\n"
                 f"Подключено кабинетов: {connected_count} из {allowed_count}"
             )
-        await self.telegram_client.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup={
-                "inline_keyboard": [
-                    [{"text": "Последние события", "callback_data": "events:latest"}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                ]
-            },
-        )
+        try:
+            await self.telegram_client.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                    ]
+                },
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning("Telegram success notification delivery failed: %s", exc)
 
     async def _send_failure_message(
         self,
@@ -418,16 +422,19 @@ class EDSAccountVerificationService:
             if (tenant_account is None or tenant_account.account_role == "primary")
             else RETRY_CONNECT_EXTRA_CALLBACK
         )
-        await self.telegram_client.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup={
-                "inline_keyboard": [
-                    [{"text": "Повторить подключение", "callback_data": retry_callback}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                ]
-            },
-        )
+        try:
+            await self.telegram_client.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": "Повторить подключение", "callback_data": retry_callback}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                },
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning("Telegram failure notification delivery failed: %s", exc)
 
     def _get_recipient_chat_id(self, tenant_id: str) -> str | None:
         user = (

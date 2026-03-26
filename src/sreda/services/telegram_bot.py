@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.orm import Session
 
 from sreda.config.settings import get_settings
-from sreda.integrations.telegram.client import TelegramClient
+from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.eds_account_verification import (
     RETRY_CONNECT_EXTRA_CALLBACK,
@@ -15,6 +17,10 @@ from sreda.services.billing import (
     CANCEL_BASE_CALLBACK,
     CONNECT_BASE_CALLBACK,
     REMOVE_EDS_ACCOUNT_CALLBACK,
+    REMOVE_EDS_ACCOUNT_SELECT_PREFIX,
+    RESTORE_EDS_ACCOUNT_CALLBACK,
+    RESTORE_EDS_ACCOUNT_SELECT_PREFIX,
+    RESUME_BASE_CALLBACK,
     RENEW_CALLBACK,
     STATUS_CALLBACK,
     SUBSCRIPTIONS_CALLBACK,
@@ -25,6 +31,8 @@ from sreda.services.onboarding import (
     build_connect_eds_message,
     build_welcome_message,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def handle_telegram_interaction(
@@ -82,7 +90,10 @@ async def _handle_callback(
     callback_data = callback_query.get("data")
     callback_id = callback_query.get("id")
     if callback_id:
-        await telegram_client.answer_callback_query(str(callback_id), text="Готово")
+        try:
+            await telegram_client.answer_callback_query(str(callback_id), text="Готово")
+        except TelegramDeliveryError as exc:
+            logger.warning("Telegram callback acknowledgement failed: %s", exc)
 
     if not isinstance(callback_data, str):
         return
@@ -92,7 +103,8 @@ async def _handle_callback(
     if tenant_id and callback_data in {CONNECT_EDS_CALLBACK, RETRY_CONNECT_PRIMARY_CALLBACK, RETRY_CONNECT_EXTRA_CALLBACK}:
         requested_slot_type = "primary" if callback_data == RETRY_CONNECT_PRIMARY_CALLBACK else "extra"
         if callback_data == CONNECT_EDS_CALLBACK:
-            requested_slot_type = "primary" if billing.get_summary(tenant_id).connected_count == 0 else "extra"
+            summary = billing.get_summary(tenant_id)
+            requested_slot_type = "primary" if not summary.connected_accounts else "extra"
         await _handle_connect_callback(
             session,
             telegram_client=telegram_client,
@@ -136,6 +148,32 @@ async def _handle_callback(
             reply_markup=result.reply_markup,
         )
         return
+    if tenant_id and callback_data.startswith(REMOVE_EDS_ACCOUNT_SELECT_PREFIX):
+        tenant_eds_account_id = callback_data.removeprefix(REMOVE_EDS_ACCOUNT_SELECT_PREFIX)
+        result = billing.schedule_connected_eds_account_cancel(tenant_id, tenant_eds_account_id)
+        await telegram_client.send_message(
+            chat_id=chat_id,
+            text=result.message_text,
+            reply_markup=result.reply_markup,
+        )
+        return
+    if callback_data == RESTORE_EDS_ACCOUNT_CALLBACK and tenant_id:
+        result = billing.restore_extra_account_slot(tenant_id)
+        await telegram_client.send_message(
+            chat_id=chat_id,
+            text=result.message_text,
+            reply_markup=result.reply_markup,
+        )
+        return
+    if tenant_id and callback_data.startswith(RESTORE_EDS_ACCOUNT_SELECT_PREFIX):
+        tenant_eds_account_id = callback_data.removeprefix(RESTORE_EDS_ACCOUNT_SELECT_PREFIX)
+        result = billing.restore_connected_eds_account_cancel(tenant_id, tenant_eds_account_id)
+        await telegram_client.send_message(
+            chat_id=chat_id,
+            text=result.message_text,
+            reply_markup=result.reply_markup,
+        )
+        return
     if callback_data == RENEW_CALLBACK and tenant_id:
         result = billing.renew_cycle(tenant_id)
         await telegram_client.send_message(
@@ -152,13 +190,14 @@ async def _handle_callback(
             reply_markup=result.reply_markup,
         )
         return
-    if callback_data == "events:latest":
+    if callback_data == RESUME_BASE_CALLBACK and tenant_id:
+        result = billing.resume_base_renewal(tenant_id)
         await telegram_client.send_message(
             chat_id=chat_id,
-            text="Раздел последних событий уже зарезервирован. Как только появятся данные EDS, я покажу их здесь.",
-            reply_markup={"inline_keyboard": [[{"text": "Мой статус", "callback_data": STATUS_CALLBACK}]]},
+            text=result.message_text,
+            reply_markup=result.reply_markup,
         )
-
+        return
 
 async def _handle_command(
     session: Session,
@@ -183,14 +222,6 @@ async def _handle_command(
         text, reply_markup = billing.build_subscriptions_message(tenant_id)
         await telegram_client.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         return
-    if command in {"/events", "последние события"}:
-        await telegram_client.send_message(
-            chat_id=chat_id,
-            text="Раздел последних событий уже зарезервирован. Как только появятся данные EDS, я покажу их здесь.",
-            reply_markup={"inline_keyboard": [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]},
-        )
-        return
-
 
 def _extract_message_text(payload: dict) -> str | None:
     for key in ("message", "edited_message"):
@@ -226,7 +257,7 @@ async def _handle_connect_callback(
             reply_markup=_build_connect_reply_markup(False),
         )
         return
-    if summary.connected_count >= summary.allowed_count:
+    if summary.free_count <= 0:
         await telegram_client.send_message(
             chat_id=chat_id,
             text="Сейчас все оплаченные кабинеты уже заняты.\n\nЕсли нужен еще один кабинет, сначала добавь его в подписках.",

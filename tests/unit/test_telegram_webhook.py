@@ -8,7 +8,7 @@ from sreda.config.settings import get_settings
 from sreda.db.base import Base
 from sreda.db.models.core import InboundMessage, SecureRecord, Tenant, User, Workspace
 from sreda.db.session import get_engine, get_session_factory
-from sreda.integrations.telegram.client import TelegramClient
+from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.main import create_app
 from sreda.services.secure_storage import load_secure_json
 
@@ -270,6 +270,67 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     assert len(answered_callbacks) == 1
     assert len(sent_messages) == 1
     assert "Подписка EDS Monitor подключена." in sent_messages[0]["text"]
+
+    session = get_session_factory()()
+    try:
+        subscriptions = session.query(TenantSubscription).all()
+    finally:
+        session.close()
+
+    assert len(subscriptions) == 1
+
+
+def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+
+    async def failing_send_message(
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        raise TelegramDeliveryError("timeout")
+
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(TelegramClient, "send_message", failing_send_message)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        session.commit()
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 9003,
+        "callback_query": {
+            "id": "cb_timeout",
+            "data": "billing:connect_plan:eds_monitor_base",
+            "message": {
+                "message_id": 12,
+                "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            },
+        },
+    }
+
+    response = client.post("/webhooks/telegram/sreda", json=payload)
+
+    assert response.status_code == 202
 
     session = get_session_factory()()
     try:

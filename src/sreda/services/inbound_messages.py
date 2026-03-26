@@ -52,6 +52,7 @@ def persist_telegram_inbound_event(
         tenant_id=tenant_id,
         workspace_id=workspace_id,
     )
+    session.flush()
 
     sanitized_text = None
     contains_sensitive_data = False

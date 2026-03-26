@@ -23,10 +23,33 @@ RENEW_CALLBACK = "billing:renew"
 CONNECT_BASE_CALLBACK = "billing:connect_plan:eds_monitor_base"
 ADD_EDS_ACCOUNT_CALLBACK = "billing:add_eds_account"
 REMOVE_EDS_ACCOUNT_CALLBACK = "billing:remove_eds_account"
+REMOVE_EDS_ACCOUNT_SELECT_PREFIX = "billing:remove_eds_account:select:"
+RESTORE_EDS_ACCOUNT_CALLBACK = "billing:restore_eds_account"
+RESTORE_EDS_ACCOUNT_SELECT_PREFIX = "billing:restore_eds_account:select:"
 CANCEL_BASE_CALLBACK = "billing:cancel_plan:eds_monitor_base"
+RESUME_BASE_CALLBACK = "billing:resume_plan:eds_monitor_base"
 
 PLAN_EDS_MONITOR_BASE = "eds_monitor_base"
 PLAN_EDS_MONITOR_EXTRA = "eds_monitor_extra_account"
+OCCUPIED_ACCOUNT_STATUSES = {
+    "pending_verification",
+    "active",
+    "auth_failed",
+    "scheduled_for_disconnect",
+}
+CONNECTED_ACCOUNT_STATUSES = {
+    "active",
+    "scheduled_for_disconnect",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectedEDSAccountSummary:
+    tenant_eds_account_id: str
+    account_role: str
+    login_masked: str
+    status: str
+    scheduled_for_disconnect: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +79,8 @@ class BillingSummary:
     extra_active_until: datetime | None
     allowed_count: int
     connected_count: int
+    free_count: int
+    connected_accounts: list[ConnectedEDSAccountSummary]
 
 
 @dataclass(slots=True)
@@ -71,7 +96,7 @@ PLAN_SEEDS: tuple[PlanSeed, ...] = (
         feature_key="eds_monitor",
         title="EDS Monitor",
         description="Базовая подписка на мониторинг EDS. Включает 1 кабинет.",
-        price_rub=990,
+        price_rub=2990,
         sort_order=10,
     ),
     PlanSeed(
@@ -80,7 +105,7 @@ PLAN_SEEDS: tuple[PlanSeed, ...] = (
         feature_key="eds_monitor",
         title="Доп. кабинет EDS",
         description="Дополнительный кабинет для EDS Monitor.",
-        price_rub=290,
+        price_rub=2990,
         sort_order=20,
     ),
 )
@@ -129,14 +154,12 @@ class BillingService:
             "Сейчас я умею:\n"
             "- показывать статус аккаунта и подписок;\n"
             "- подключать и продлевать подписки;\n"
-            "- показывать последние события по EDS;\n"
             "- помогать с подключением EDS."
         )
         return text, _inline_keyboard(
             [
                 [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
                 [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                [{"text": "Последние события", "callback_data": "events:latest"}],
             ]
         )
 
@@ -155,19 +178,20 @@ class BillingService:
             and base_subscription.status in {"active", "scheduled_for_cancel"}
         )
         base_next_quantity = self._get_next_cycle_quantity(base_subscription)
+        if (
+            base_active
+            and base_subscription is not None
+            and base_subscription.quantity > 0
+            and base_next_quantity <= 0
+        ):
+            base_next_quantity = base_subscription.quantity
         extra_quantity = extra_subscription.quantity if extra_subscription and extra_subscription.quantity > 0 else 0
         extra_next_quantity = self._get_next_cycle_quantity(extra_subscription)
         allowed_count = (1 if base_active else 0) + extra_quantity
-        connected_count = (
-            self.session.query(TenantEDSAccount)
-            .filter(
-                TenantEDSAccount.tenant_id == tenant_id,
-                TenantEDSAccount.status.in_(["pending_verification", "active"]),
-            )
-            .count()
-            if allowed_count > 0
-            else 0
-        )
+        occupied_accounts = self._list_occupied_accounts(tenant_id) if allowed_count > 0 else []
+        connected_accounts = self._build_connected_account_summaries(occupied_accounts)
+        connected_count = len(connected_accounts)
+        free_count = max(allowed_count - len(occupied_accounts), 0)
 
         next_amount_rub = 0
         if cycle is not None:
@@ -188,6 +212,8 @@ class BillingService:
             extra_active_until=extra_subscription.active_until if extra_subscription else None,
             allowed_count=allowed_count,
             connected_count=connected_count,
+            free_count=free_count,
+            connected_accounts=connected_accounts,
         )
 
     def build_status_message(self, tenant_id: str) -> tuple[str, dict]:
@@ -206,21 +232,30 @@ class BillingService:
             active_lines.append("- нет")
 
         due_text = _format_date(summary.next_payment_due_at) if summary.next_payment_due_at else "не назначен"
+        connected_account_lines = [
+            f"  - {account.login_masked}{' (не продлевать)' if account.scheduled_for_disconnect else ''}"
+            for account in summary.connected_accounts
+        ]
+        if not connected_account_lines:
+            connected_account_lines.append("  - нет")
+
         text = (
             "Мой статус\n\n"
             f"Следующий платеж: {due_text}\n"
             f"Сумма к оплате: {summary.next_amount_rub} ₽\n\n"
             "Активные подписки:\n"
             f"{chr(10).join(active_lines)}\n\n"
-            "EDS:\n"
-            f"- {'подключен' if summary.connected_count > 0 else 'не подключен'}\n"
-            f"- кабинетов подключено: {summary.connected_count} из {summary.allowed_count}"
+            "Кабинеты EDS:\n"
+            f"- подключено: {summary.connected_count} из {summary.allowed_count}\n"
+            f"- свободно для подключения: {summary.free_count}\n"
+            "- подключенные кабинеты:\n"
+            f"{chr(10).join(connected_account_lines)}"
         )
 
         buttons: list[list[dict]] = [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
         if summary.next_payment_due_at is not None and summary.next_amount_rub > 0:
             buttons.append([{"text": "Продлить", "callback_data": RENEW_CALLBACK}])
-        if summary.base_active:
+        if summary.base_active and summary.free_count > 0:
             buttons.append([{"text": "Подключить EDS", "callback_data": "onboarding:connect_eds"}])
         return text, _inline_keyboard(buttons)
 
@@ -258,10 +293,17 @@ class BillingService:
         if not summary.base_active:
             buttons.append([{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}])
         else:
-            buttons.append([{"text": "Не продлевать EDS", "callback_data": CANCEL_BASE_CALLBACK}])
-            buttons.append([{"text": "Добавить кабинет", "callback_data": ADD_EDS_ACCOUNT_CALLBACK}])
+            primary_actions = [
+                {
+                    "text": "Продлевать EDS" if summary.base_cancel_at_period_end else "Не продлевать EDS",
+                    "callback_data": RESUME_BASE_CALLBACK if summary.base_cancel_at_period_end else CANCEL_BASE_CALLBACK,
+                },
+                {"text": "Добавить кабинет", "callback_data": ADD_EDS_ACCOUNT_CALLBACK},
+            ]
+            buttons.append(primary_actions)
             if summary.extra_next_cycle_quantity > 0:
                 buttons.append([{"text": "Убрать кабинет", "callback_data": REMOVE_EDS_ACCOUNT_CALLBACK}])
+            buttons.extend(self._build_restore_rows(summary))
         buttons.append([{"text": "Мой статус", "callback_data": STATUS_CALLBACK}])
         return text, _inline_keyboard(buttons)
 
@@ -469,6 +511,14 @@ class BillingService:
             if plan is None:
                 continue
             next_quantity = self._get_next_cycle_quantity(subscription)
+            if (
+                plan.plan_key == PLAN_EDS_MONITOR_BASE
+                and subscription.quantity > 0
+                and subscription.active_until
+                and _coerce_utc(subscription.active_until) > current_time
+                and next_quantity <= 0
+            ):
+                next_quantity = subscription.quantity
             if next_quantity <= 0:
                 continue
             renewable_items.append((subscription, plan, next_quantity))
@@ -488,6 +538,7 @@ class BillingService:
             amount_rub=total_amount_rub,
             description="Продление подписок",
         )
+        renewable_subscriptions = {item[0] for item in renewable_items}
         for subscription, plan, quantity in renewable_items:
             self.session.add(
                 PaymentOrderItem(
@@ -510,7 +561,7 @@ class BillingService:
             subscription.updated_at = current_time
 
         for subscription in subscriptions:
-            if subscription in [item[0] for item in renewable_items]:
+            if subscription in renewable_subscriptions:
                 continue
             subscription.status = "expired"
             subscription.quantity = 0
@@ -528,6 +579,7 @@ class BillingService:
             "eds_monitor",
             bool(base_subscription and base_subscription.quantity > 0 and base_subscription.status == "active"),
         )
+        self._apply_tenant_eds_account_renewal_state(tenant_id)
         self.session.commit()
 
         summary = self.get_summary(tenant_id)
@@ -571,6 +623,33 @@ class BillingService:
             ),
         )
 
+    def resume_base_renewal(self, tenant_id: str) -> SubscriptionActionResult:
+        subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
+        if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
+            return SubscriptionActionResult(
+                message_text="Подписка EDS Monitor сейчас не активна.",
+                reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
+            )
+
+        subscription.cancel_at_period_end = False
+        subscription.next_cycle_quantity = max(subscription.quantity, 1)
+        subscription.status = "active"
+        subscription.updated_at = _utcnow()
+        self.session.commit()
+        return SubscriptionActionResult(
+            message_text=(
+                "Продление EDS Monitor снова включено.\n\n"
+                f"Подписка активна до: {_format_date(subscription.active_until)}\n"
+                "Она будет продлена в следующий платежный цикл."
+            ),
+            reply_markup=_inline_keyboard(
+                [
+                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                ]
+            ),
+        )
+
     def remove_extra_account_at_period_end(self, tenant_id: str) -> SubscriptionActionResult:
         subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
         if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
@@ -583,6 +662,32 @@ class BillingService:
                     ]
                 ),
             )
+
+        summary = self.get_summary(tenant_id)
+        if summary.free_count <= 0:
+            connected_extra_accounts = [
+                account
+                for account in summary.connected_accounts
+                if account.account_role == "extra" and not account.scheduled_for_disconnect
+            ]
+            if connected_extra_accounts:
+                buttons = [
+                    [
+                        {
+                            "text": account.login_masked,
+                            "callback_data": f"{REMOVE_EDS_ACCOUNT_SELECT_PREFIX}{account.tenant_eds_account_id}",
+                        }
+                    ]
+                    for account in connected_extra_accounts
+                ]
+                buttons.append([{"text": "Назад", "callback_data": SUBSCRIPTIONS_CALLBACK}])
+                return SubscriptionActionResult(
+                    message_text=(
+                        "Сейчас все оплаченные кабинеты уже заняты.\n\n"
+                        "Выбери, какой кабинет не продлевать на следующий период."
+                    ),
+                    reply_markup=_inline_keyboard(buttons),
+                )
 
         next_quantity = max(self._get_next_cycle_quantity(subscription) - 1, 0)
         subscription.next_cycle_quantity = next_quantity
@@ -599,8 +704,216 @@ class BillingService:
         return SubscriptionActionResult(
             message_text=(
                 "Дополнительный кабинет не будет продлеваться в следующий период.\n\n"
+                f"До {_format_date(subscription.active_until)} текущая емкость подписки сохранится.\n"
+                f"После этой даты число доступных кабинетов уменьшится до {next_allowed_count}."
+            ),
+            reply_markup=_inline_keyboard(
+                [
+                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                ]
+            ),
+        )
+
+    def schedule_connected_eds_account_cancel(
+        self,
+        tenant_id: str,
+        tenant_eds_account_id: str,
+    ) -> SubscriptionActionResult:
+        subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
+        if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
+            return SubscriptionActionResult(
+                message_text="Сейчас нет дополнительных кабинетов, которые можно убрать.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        tenant_account = self.session.get(TenantEDSAccount, tenant_eds_account_id)
+        if tenant_account is None or tenant_account.tenant_id != tenant_id or tenant_account.account_role != "extra":
+            return SubscriptionActionResult(
+                message_text="Не удалось найти выбранный кабинет.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        if tenant_account.status not in CONNECTED_ACCOUNT_STATUSES:
+            return SubscriptionActionResult(
+                message_text="Выбранный кабинет уже не активен.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        if tenant_account.status == "scheduled_for_disconnect":
+            return SubscriptionActionResult(
+                message_text=(
+                    f"Кабинет {tenant_account.login_masked} уже помечен как не продленный на следующий период."
+                ),
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        next_quantity = max(self._get_next_cycle_quantity(subscription) - 1, 0)
+        subscription.next_cycle_quantity = next_quantity
+        subscription.status = "scheduled_for_cancel" if next_quantity == 0 else "active"
+        subscription.updated_at = _utcnow()
+        tenant_account.status = "scheduled_for_disconnect"
+        tenant_account.updated_at = _utcnow()
+        self.session.commit()
+
+        next_allowed_count = 0
+        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
+        if base_subscription and self._get_next_cycle_quantity(base_subscription) > 0:
+            next_allowed_count += 1
+        next_allowed_count += next_quantity
+
+        return SubscriptionActionResult(
+            message_text=(
+                f"Кабинет {tenant_account.login_masked} не будет продлеваться на следующий период.\n\n"
                 f"До {_format_date(subscription.active_until)} он останется активным.\n"
                 f"После этой даты число доступных кабинетов уменьшится до {next_allowed_count}."
+            ),
+            reply_markup=_inline_keyboard(
+                [
+                    [
+                        {
+                            "text": "Вернуть кабинет",
+                            "callback_data": f"{RESTORE_EDS_ACCOUNT_SELECT_PREFIX}{tenant_account.id}",
+                        }
+                    ],
+                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                ]
+            ),
+        )
+
+    def restore_extra_account_slot(self, tenant_id: str) -> SubscriptionActionResult:
+        subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
+        if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
+            return SubscriptionActionResult(
+                message_text="Сейчас нет дополнительных кабинетов, которые можно вернуть.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        scheduled_accounts = [
+            account
+            for account in self._list_occupied_accounts(tenant_id)
+            if account.account_role == "extra" and account.status == "scheduled_for_disconnect"
+        ]
+        if scheduled_accounts:
+            return SubscriptionActionResult(
+                message_text="Для возврата нужно выбрать конкретный кабинет.",
+                reply_markup=_inline_keyboard(
+                    self._build_restore_rows(self.get_summary(tenant_id))
+                    + [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
+                ),
+            )
+
+        next_quantity = self._get_next_cycle_quantity(subscription)
+        if next_quantity >= subscription.quantity:
+            return SubscriptionActionResult(
+                message_text="Сейчас нет пустых слотов, которые нужно вернуть.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        subscription.next_cycle_quantity = min(next_quantity + 1, subscription.quantity)
+        subscription.status = "active"
+        subscription.updated_at = _utcnow()
+        self.session.commit()
+
+        summary = self.get_summary(tenant_id)
+        return SubscriptionActionResult(
+            message_text=(
+                "Дополнительный слот снова будет продлен на следующий период.\n\n"
+                f"Следующий платеж: {_format_date(summary.next_payment_due_at)}\n"
+                f"Сумма следующего платежа: {summary.next_amount_rub} ₽"
+            ),
+            reply_markup=_inline_keyboard(
+                [
+                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                ]
+            ),
+        )
+
+    def restore_connected_eds_account_cancel(
+        self,
+        tenant_id: str,
+        tenant_eds_account_id: str,
+    ) -> SubscriptionActionResult:
+        subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
+        if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
+            return SubscriptionActionResult(
+                message_text="Сейчас нет дополнительных кабинетов, которые можно вернуть.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        tenant_account = self.session.get(TenantEDSAccount, tenant_eds_account_id)
+        if tenant_account is None or tenant_account.tenant_id != tenant_id or tenant_account.account_role != "extra":
+            return SubscriptionActionResult(
+                message_text="Не удалось найти выбранный кабинет.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        if tenant_account.status != "scheduled_for_disconnect":
+            return SubscriptionActionResult(
+                message_text=f"Кабинет {tenant_account.login_masked} сейчас не помечен как отмененный.",
+                reply_markup=_inline_keyboard(
+                    [
+                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                    ]
+                ),
+            )
+
+        tenant_account.status = "active"
+        tenant_account.updated_at = _utcnow()
+        subscription.next_cycle_quantity = min(self._get_next_cycle_quantity(subscription) + 1, subscription.quantity)
+        subscription.status = "active"
+        subscription.updated_at = _utcnow()
+        self.session.commit()
+
+        summary = self.get_summary(tenant_id)
+        return SubscriptionActionResult(
+            message_text=(
+                f"Кабинет {tenant_account.login_masked} снова будет продлен на следующий период.\n\n"
+                f"Следующий платеж: {_format_date(summary.next_payment_due_at)}\n"
+                f"Сумма следующего платежа: {summary.next_amount_rub} ₽"
             ),
             reply_markup=_inline_keyboard(
                 [
@@ -637,6 +950,76 @@ class BillingService:
         )
         return plan
 
+    def _list_occupied_accounts(self, tenant_id: str) -> list[TenantEDSAccount]:
+        return (
+            self.session.query(TenantEDSAccount)
+            .filter(
+                TenantEDSAccount.tenant_id == tenant_id,
+                TenantEDSAccount.status.in_(tuple(OCCUPIED_ACCOUNT_STATUSES)),
+            )
+            .order_by(TenantEDSAccount.account_index.asc(), TenantEDSAccount.created_at.asc())
+            .all()
+        )
+
+    def _build_connected_account_summaries(
+        self,
+        tenant_accounts: list[TenantEDSAccount],
+    ) -> list[ConnectedEDSAccountSummary]:
+        items: list[ConnectedEDSAccountSummary] = []
+        for account in tenant_accounts:
+            if account.status not in CONNECTED_ACCOUNT_STATUSES:
+                continue
+            items.append(
+                ConnectedEDSAccountSummary(
+                    tenant_eds_account_id=account.id,
+                    account_role=account.account_role,
+                    login_masked=account.login_masked,
+                    status=account.status,
+                    scheduled_for_disconnect=account.status == "scheduled_for_disconnect",
+                )
+            )
+        return items
+
+    def _build_restore_rows(self, summary: BillingSummary) -> list[list[dict]]:
+        rows: list[list[dict]] = []
+        scheduled_accounts = [
+            account
+            for account in summary.connected_accounts
+            if account.account_role == "extra" and account.scheduled_for_disconnect
+        ]
+        if scheduled_accounts:
+            for account in scheduled_accounts:
+                rows.append(
+                    [
+                        {
+                            "text": f"Вернуть {account.login_masked}",
+                            "callback_data": f"{RESTORE_EDS_ACCOUNT_SELECT_PREFIX}{account.tenant_eds_account_id}",
+                        }
+                    ]
+                )
+            return rows
+
+        if summary.extra_quantity > 0 and summary.extra_next_cycle_quantity < summary.extra_quantity:
+            rows.append([{"text": "Вернуть кабинет", "callback_data": RESTORE_EDS_ACCOUNT_CALLBACK}])
+        return rows
+
+    def _apply_tenant_eds_account_renewal_state(self, tenant_id: str) -> None:
+        scheduled_accounts = (
+            self.session.query(TenantEDSAccount)
+            .filter(
+                TenantEDSAccount.tenant_id == tenant_id,
+                TenantEDSAccount.status == "scheduled_for_disconnect",
+            )
+            .order_by(TenantEDSAccount.account_index.asc(), TenantEDSAccount.created_at.asc())
+            .all()
+        )
+        if not scheduled_accounts:
+            return
+        now = _utcnow()
+        for account in scheduled_accounts:
+            account.status = "expired"
+            account.updated_at = now
+
     def _create_paid_stub_order(
         self,
         *,
@@ -647,6 +1030,8 @@ class BillingService:
         description: str,
     ) -> PaymentOrder:
         now = _utcnow()
+        if cycle is not None:
+            self.session.flush()
         order = PaymentOrder(
             id=f"po_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
