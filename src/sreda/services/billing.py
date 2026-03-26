@@ -253,10 +253,6 @@ class BillingService:
         )
 
         buttons: list[list[dict]] = [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
-        if summary.next_payment_due_at is not None and summary.next_amount_rub > 0:
-            buttons.append([{"text": "Продлить", "callback_data": RENEW_CALLBACK}])
-        if summary.base_active and summary.free_count > 0:
-            buttons.append([{"text": "Подключить EDS", "callback_data": "onboarding:connect_eds"}])
         return text, _inline_keyboard(buttons)
 
     def build_subscriptions_message(self, tenant_id: str) -> tuple[str, dict]:
@@ -293,14 +289,17 @@ class BillingService:
         if not summary.base_active:
             buttons.append([{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}])
         else:
-            primary_actions = [
-                {
-                    "text": "Продлевать EDS" if summary.base_cancel_at_period_end else "Не продлевать EDS",
-                    "callback_data": RESUME_BASE_CALLBACK if summary.base_cancel_at_period_end else CANCEL_BASE_CALLBACK,
-                },
-                {"text": "Добавить кабинет", "callback_data": ADD_EDS_ACCOUNT_CALLBACK},
-            ]
-            buttons.append(primary_actions)
+            buttons.append(
+                [
+                    {
+                        "text": "Продлевать EDS" if summary.base_cancel_at_period_end else "Отменить подписку на EDS",
+                        "callback_data": RESUME_BASE_CALLBACK if summary.base_cancel_at_period_end else CANCEL_BASE_CALLBACK,
+                    }
+                ]
+            )
+            buttons.append([{"text": "Добавить подписку на EDS", "callback_data": ADD_EDS_ACCOUNT_CALLBACK}])
+            if summary.free_count > 0:
+                buttons.append([{"text": "Добавить кабинет", "callback_data": "onboarding:connect_eds"}])
             if summary.extra_next_cycle_quantity > 0:
                 buttons.append([{"text": "Убрать кабинет", "callback_data": REMOVE_EDS_ACCOUNT_CALLBACK}])
             buttons.extend(self._build_restore_rows(summary))

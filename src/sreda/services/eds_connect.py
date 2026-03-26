@@ -149,6 +149,7 @@ class EDSConnectService:
             tenant_id=connect_session.tenant_id,
             workspace_id=connect_session.workspace_id,
         )
+        self.session.flush()
 
         tenant_eds_account = TenantEDSAccount(
             id=f"teds_{uuid4().hex[:24]}",

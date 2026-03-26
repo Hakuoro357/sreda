@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from html import escape
 from urllib.parse import parse_qs
 
@@ -9,9 +10,12 @@ from sqlalchemy.orm import Session
 
 from sreda.config.settings import get_settings
 from sreda.db.session import get_db_session
+from sreda.integrations.telegram.client import TelegramClient
+from sreda.services.eds_account_verification import EDSAccountVerificationService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 
 router = APIRouter(tags=["connect"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/connect/eds/{token}", response_class=HTMLResponse)
@@ -39,15 +43,22 @@ async def submit_eds_connect_form(
     request: Request,
     session: Session = Depends(get_db_session),
 ) -> HTMLResponse:
-    service = EDSConnectService(session, get_settings())
+    settings = get_settings()
+    service = EDSConnectService(session, settings)
     body = await request.body()
     parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
     login = (parsed.get("login") or [""])[0]
     password = (parsed.get("password") or [""])[0]
     try:
-        service.submit_form(token, login=login, password=password)
+        result = service.submit_form(token, login=login, password=password)
     except ConnectSessionError as exc:
         return HTMLResponse(_render_error_page(exc.message), status_code=exc.status_code)
+    telegram_client = TelegramClient(settings.telegram_bot_token) if settings.telegram_bot_token else None
+    verifier = EDSAccountVerificationService(session, telegram_client=telegram_client)
+    try:
+        await verifier.process_job(result.job_id)
+    except Exception:
+        logger.exception("Inline EDS verification kick failed for job %s", result.job_id)
     return HTMLResponse(_render_submitted_page(), status_code=200)
 
 

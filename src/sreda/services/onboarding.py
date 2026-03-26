@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from sreda.db.models.core import User
+from sreda.db.models.core import Assistant, User, Workspace
 from sreda.db.repositories.seed import SeedRepository
 from sreda.services.billing import STATUS_CALLBACK, SUBSCRIPTIONS_CALLBACK
 
@@ -28,13 +28,28 @@ def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnbo
 
     existing_user = session.query(User).filter(User.telegram_account_id == chat_id).one_or_none()
     if existing_user is not None:
+        assistant = (
+            session.query(Assistant)
+            .filter(Assistant.tenant_id == existing_user.tenant_id)
+            .order_by(Assistant.id.asc())
+            .first()
+        )
+        workspace_id = assistant.workspace_id if assistant is not None else None
+        if workspace_id is None:
+            workspace = (
+                session.query(Workspace)
+                .filter(Workspace.tenant_id == existing_user.tenant_id)
+                .order_by(Workspace.id.asc())
+                .first()
+            )
+            workspace_id = workspace.id if workspace is not None else None
         return TelegramOnboardingResult(
             False,
             chat_id,
             existing_user.tenant_id,
-            f"workspace_tg_{chat_id}",
+            workspace_id,
             existing_user.id,
-            f"assistant_tg_{chat_id}",
+            assistant.id if assistant is not None else None,
         )
 
     display_name = _extract_display_name(payload) or f"Пользователь {chat_id}"

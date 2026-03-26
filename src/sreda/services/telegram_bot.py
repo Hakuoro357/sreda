@@ -139,6 +139,15 @@ async def _handle_callback(
             text=result.message_text,
             reply_markup=result.reply_markup,
         )
+        await _handle_connect_callback(
+            session,
+            telegram_client=telegram_client,
+            chat_id=chat_id,
+            tenant_id=tenant_id,
+            workspace_id=onboarding.workspace_id,
+            user_id=onboarding.user_id,
+            requested_slot_type="extra",
+        )
         return
     if callback_data == REMOVE_EDS_ACCOUNT_CALLBACK and tenant_id:
         result = billing.remove_extra_account_at_period_end(tenant_id)
@@ -314,5 +323,5 @@ def _build_connect_reply_markup(base_active: bool) -> dict:
 
 def _build_connect_open_button(url: str) -> dict:
     if url.startswith("https://"):
-        return {"text": "Открыть Mini App", "web_app": {"url": url}}
-    return {"text": "Открыть защищенную страницу", "url": url}
+        return {"text": "Ввести логин и пароль от EDS", "web_app": {"url": url}}
+    return {"text": "Ввести логин и пароль от EDS", "url": url}

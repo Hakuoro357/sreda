@@ -10,6 +10,7 @@ from sreda.db.models.core import Assistant, Job, SecureRecord, Tenant, TenantFea
 from sreda.db.session import get_engine, get_session_factory
 from sreda.integrations.telegram.client import TelegramClient
 from sreda.main import create_app
+from sreda.services.eds_account_verification import EDSAccountVerificationService
 from sreda.services.billing import BillingService
 from sreda.services.eds_connect import EDSConnectService
 from sreda.services.secure_storage import load_secure_json
@@ -80,7 +81,7 @@ def test_connect_callback_creates_one_time_link(
     assert len(sent_messages) == 1
     assert "Ссылка действует 15 минут" in sent_messages[0]["text"]
     open_button = sent_messages[0]["reply_markup"]["inline_keyboard"][0][0]
-    assert open_button["text"] == "Открыть Mini App"
+    assert open_button["text"] == "Ввести логин и пароль от EDS"
     assert open_button["web_app"]["url"].startswith("https://connect.example.test/connect/eds/")
 
     session = get_session_factory()()
@@ -139,6 +140,13 @@ def test_submit_connect_form_stores_secure_payload_and_queues_job(
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
+    called_job_ids: list[str] = []
+
+    async def fake_process_job(self, job_id: str) -> str:
+        called_job_ids.append(job_id)
+        return "completed"
+
+    monkeypatch.setattr(EDSAccountVerificationService, "process_job", fake_process_job)
 
     get_settings.cache_clear()
     get_engine.cache_clear()
@@ -186,12 +194,92 @@ def test_submit_connect_form_stores_secure_payload_and_queues_job(
     assert payload["login"] == "5047136341"
     assert payload["password"] == "super-secret"
     assert job.job_type == "eds.verify_account_connect"
+    assert called_job_ids == [job.id]
+
+
+def test_connect_callback_uses_existing_legacy_workspace_and_assistant(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    sent_messages: list[dict] = []
+    answered_callbacks: list[dict] = []
+
+    async def fake_send_message(
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+        return {"ok": True}
+
+    async def fake_answer_callback_query(self, callback_query_id: str, text: str | None = None) -> dict:
+        answered_callbacks.append({"id": callback_query_id, "text": text})
+        return {"ok": True}
+
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
+    monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
+    monkeypatch.setattr(TelegramClient, "answer_callback_query", fake_answer_callback_query)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_eds", name="tenant_eds"))
+        session.add(Workspace(id="workspace_eds", tenant_id="tenant_eds", name="workspace_eds"))
+        session.add(User(id="user_eds", tenant_id="tenant_eds", telegram_account_id=CHAT_ID))
+        session.flush()
+        session.add(Assistant(id="assistant_eds", tenant_id="tenant_eds", workspace_id="workspace_eds", name="Среда"))
+        session.add(TenantFeature(id="tenant_eds:core_assistant", tenant_id="tenant_eds", feature_key="core_assistant", enabled=True))
+        session.commit()
+        BillingService(session).start_base_subscription("tenant_eds")
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 9102,
+        "callback_query": {
+            "id": "cb_connect_legacy",
+            "data": "onboarding:connect_eds",
+            "message": {
+                "message_id": 12,
+                "chat": {"id": int(CHAT_ID), "type": "private"},
+            },
+        },
+    }
+
+    response = client.post("/webhooks/telegram/sreda", json=payload)
+
+    assert response.status_code == 202
+    assert len(answered_callbacks) == 1
+    assert len(sent_messages) == 1
+
+    session = get_session_factory()()
+    try:
+        connect_session = session.query(ConnectSession).one()
+    finally:
+        session.close()
+
+    assert connect_session.tenant_id == "tenant_eds"
+    assert connect_session.workspace_id == "workspace_eds"
+    assert connect_session.user_id == "user_eds"
 
 
 def _seed_bundle(session) -> None:
     session.add(Tenant(id="tenant_1", name="Tenant 1"))
     session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
     session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=CHAT_ID))
+    session.flush()
     session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_1", name="Среда"))
     session.add(TenantFeature(id="tenant_1:core_assistant", tenant_id="tenant_1", feature_key="core_assistant", enabled=True))
     session.commit()

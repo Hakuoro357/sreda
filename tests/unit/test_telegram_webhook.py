@@ -10,6 +10,7 @@ from sreda.db.models.core import InboundMessage, SecureRecord, Tenant, User, Wor
 from sreda.db.session import get_engine, get_session_factory
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.main import create_app
+from sreda.services.billing import BillingService
 from sreda.services.secure_storage import load_secure_json
 
 EXISTING_CHAT_ID = "100000003"
@@ -278,6 +279,74 @@ def test_telegram_webhook_handles_connect_subscription_callback(
         session.close()
 
     assert len(subscriptions) == 1
+
+
+def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    sent_messages: list[dict] = []
+    answered_callbacks: list[dict] = []
+
+    async def fake_send_message(
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+        return {"ok": True}
+
+    async def fake_answer_callback_query(self, callback_query_id: str, text: str | None = None) -> dict:
+        answered_callbacks.append({"id": callback_query_id, "text": text})
+        return {"ok": True}
+
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
+    monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
+    monkeypatch.setattr(TelegramClient, "answer_callback_query", fake_answer_callback_query)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        session.commit()
+        BillingService(session).start_base_subscription("tenant_1")
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 9004,
+        "callback_query": {
+            "id": "cb_add_subscription",
+            "data": "billing:add_eds_account",
+            "message": {
+                "message_id": 13,
+                "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            },
+        },
+    }
+
+    response = client.post("/webhooks/telegram/sreda", json=payload)
+
+    assert response.status_code == 202
+    assert len(answered_callbacks) == 1
+    assert len(sent_messages) == 2
+    assert "Дополнительный кабинет EDS подключен." in sent_messages[0]["text"]
+    open_button = sent_messages[1]["reply_markup"]["inline_keyboard"][0][0]
+    assert open_button["text"] == "Ввести логин и пароль от EDS"
 
 
 def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(

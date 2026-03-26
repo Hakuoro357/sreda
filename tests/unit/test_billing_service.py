@@ -104,7 +104,7 @@ def test_subscriptions_message_shows_resume_button_after_base_cancel_requested()
 
     button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
     assert "Продлевать EDS" in button_texts
-    assert "Не продлевать EDS" not in button_texts
+    assert "Отменить подписку на EDS" not in button_texts
 
 
 def test_resume_base_renewal_restores_next_cycle() -> None:
@@ -153,6 +153,22 @@ def test_status_message_hides_connect_button_when_all_slots_are_occupied() -> No
 
     button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
     assert "Подключить EDS" not in button_texts
+    assert button_texts == ["Подписки"]
+
+
+def test_status_message_contains_only_subscriptions_button() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_tenant_bundle(session)
+    service = BillingService(session)
+
+    service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
+
+    _, reply_markup = service.build_status_message("tenant_1")
+
+    button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
+    assert button_texts == ["Подписки"]
 
 
 def test_status_message_shows_connected_accounts_and_free_slots() -> None:
@@ -405,6 +421,52 @@ def test_subscriptions_message_shows_restore_button_for_removed_empty_slot() -> 
     button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
 
     assert "Вернуть кабинет" in button_texts
+
+
+def test_subscriptions_message_uses_new_eds_labels_and_actions() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_tenant_bundle(session)
+    service = BillingService(session)
+
+    service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
+
+    _, reply_markup = service.build_subscriptions_message("tenant_1")
+    button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
+
+    assert "Отменить подписку на EDS" in button_texts
+    assert "Добавить подписку на EDS" in button_texts
+    assert "Добавить кабинет" in button_texts
+
+
+def test_subscriptions_message_hides_add_cabinet_when_no_free_paid_slots() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_tenant_bundle(session)
+    service = BillingService(session)
+
+    service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
+    session.add(
+        TenantEDSAccount(
+            id="teds_primary",
+            tenant_id="tenant_1",
+            workspace_id="workspace_1",
+            assistant_id="assistant_1",
+            account_index="1",
+            account_role="primary",
+            status="active",
+            login_masked="5047***341",
+        )
+    )
+    session.commit()
+
+    _, reply_markup = service.build_subscriptions_message("tenant_1")
+    button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
+
+    assert "Добавить подписку на EDS" in button_texts
+    assert "Добавить кабинет" not in button_texts
 
 
 def test_summary_counts_base_amount_even_if_base_marked_not_to_renew() -> None:
