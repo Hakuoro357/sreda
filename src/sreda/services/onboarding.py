@@ -85,7 +85,7 @@ def build_welcome_message() -> tuple[str, dict]:
             [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
             [
                 {
-                    "text": "Подключить EDS",
+                    "text": "Подключить ЛК EDS",
                     "callback_data": CONNECT_EDS_CALLBACK,
                 }
             ]

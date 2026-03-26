@@ -136,7 +136,7 @@ def test_telegram_webhook_creates_new_user_and_sends_welcome_message(
         "inline_keyboard": [
             [{"text": "Мой статус", "callback_data": "billing:status"}],
             [{"text": "Подписки", "callback_data": "billing:subscriptions"}],
-            [{"text": "Подключить EDS", "callback_data": "onboarding:connect_eds"}],
+            [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
         ]
     }
 
