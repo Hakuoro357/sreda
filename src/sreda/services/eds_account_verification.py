@@ -213,6 +213,24 @@ class EDSAccountVerificationService:
                 error=exc,
             )
 
+        existing_runtime_account = self._find_existing_runtime_account(
+            tenant_id=tenant_account.tenant_id,
+            login=login,
+            exclude_tenant_eds_account_id=tenant_account.id,
+        )
+        if existing_runtime_account is not None:
+            duplicate_error = VerificationError(
+                "verification_duplicate_login",
+                "Этот личный кабинет EDS уже подключен. Используй другой кабинет.",
+                retryable=False,
+            )
+            return await self._handle_verification_error(
+                job=job,
+                connect_session=connect_session,
+                tenant_account=tenant_account,
+                error=duplicate_error,
+            )
+
         credential_record = store_secure_json(
             self.session,
             record_type="eds_account_credentials",
@@ -312,6 +330,23 @@ class EDSAccountVerificationService:
         self.session.flush()
         return runtime_account
 
+    def _find_existing_runtime_account(
+        self,
+        *,
+        tenant_id: str,
+        login: str,
+        exclude_tenant_eds_account_id: str,
+    ) -> EDSAccount | None:
+        return (
+            self.session.query(EDSAccount)
+            .filter(
+                EDSAccount.tenant_id == tenant_id,
+                EDSAccount.login == login,
+                EDSAccount.tenant_eds_account_id != exclude_tenant_eds_account_id,
+            )
+            .one_or_none()
+        )
+
     async def _handle_verification_error(
         self,
         *,
@@ -361,7 +396,12 @@ class EDSAccountVerificationService:
         connect_session.updated_at = now
 
         if tenant_account is not None:
-            tenant_account.status = "auth_failed" if error_code in AUTH_FAILURE_CODES else "pending_verification"
+            if error_code in AUTH_FAILURE_CODES:
+                tenant_account.status = "auth_failed"
+            elif error_code == "verification_duplicate_login":
+                tenant_account.status = "duplicate_login"
+            else:
+                tenant_account.status = "pending_verification"
             tenant_account.last_error_code = error_code
             tenant_account.last_error_message_sanitized = error_message
             tenant_account.updated_at = now

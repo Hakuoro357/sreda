@@ -90,12 +90,57 @@ class TemporaryFailAdapter:
         account_key: str,
         login: str,
         password: str,
-    ) -> VerificationResult:
+        ) -> VerificationResult:
         raise VerificationError(
             "verification_temporary_failed",
             "Временная ошибка подключения. Попробуй еще раз позже.",
             retryable=True,
         )
+
+
+def test_duplicate_login_does_not_create_second_active_account(monkeypatch, tmp_path) -> None:
+    session = _build_session(monkeypatch, tmp_path)
+    telegram_client = FakeTelegramClient()
+    try:
+        first_job_id = _seed_submitted_connect(session)
+        service = EDSAccountVerificationService(
+            session,
+            telegram_client=telegram_client,
+            adapter=SuccessAdapter(),
+        )
+        first_result = asyncio.run(service.process_job(first_job_id))
+        BillingService(session).add_extra_eds_account("tenant_1")
+        second_job_id = _seed_submitted_connect(
+            session,
+            slot_type="extra",
+            login="5047136341",
+            password="super-secret",
+        )
+
+        second_result = asyncio.run(service.process_job(second_job_id))
+
+        tenant_accounts = session.query(TenantEDSAccount).order_by(TenantEDSAccount.created_at.asc()).all()
+        runtime_accounts = session.query(EDSAccount).order_by(EDSAccount.id.asc()).all()
+        connect_sessions = session.query(ConnectSession).order_by(ConnectSession.created_at.asc()).all()
+    finally:
+        session.close()
+
+    assert first_result == "completed"
+    assert second_result == "failed"
+    assert len(tenant_accounts) == 2
+    assert tenant_accounts[0].status == "active"
+    assert tenant_accounts[1].status == "duplicate_login"
+    assert len(runtime_accounts) == 1
+    assert runtime_accounts[0].tenant_eds_account_id == tenant_accounts[0].id
+    assert connect_sessions[-1].status == "failed"
+    assert connect_sessions[-1].error_code == "verification_duplicate_login"
+    assert "уже подключен" in connect_sessions[-1].error_message_sanitized
+    assert len(telegram_client.messages) == 2
+    assert "уже подключен" in telegram_client.messages[-1]["text"]
+    assert (
+        telegram_client.messages[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        == "eds:retry_connect:extra"
+    )
 
 
 def test_successful_verification_activates_account_and_sends_message(monkeypatch, tmp_path) -> None:
@@ -239,18 +284,24 @@ def _build_session(monkeypatch, tmp_path):
     return session
 
 
-def _seed_submitted_connect(session) -> str:
+def _seed_submitted_connect(
+    session,
+    *,
+    slot_type: str = "primary",
+    login: str = "5047136341",
+    password: str = "super-secret",
+) -> str:
     BillingService(session).start_base_subscription("tenant_1")
     link = EDSConnectService(session, _build_test_settings()).create_connect_link(
         tenant_id="tenant_1",
         workspace_id="workspace_1",
         user_id="user_1",
-        slot_type="primary",
+        slot_type=slot_type,
     )
     submit_result = EDSConnectService(session, _build_test_settings()).submit_form(
         link.raw_token,
-        login="5047136341",
-        password="super-secret",
+        login=login,
+        password=password,
     )
     return submit_result.job_id
 
