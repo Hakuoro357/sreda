@@ -62,48 +62,50 @@
 Статус:
 - `in_progress`
 
+Что уже сделано:
+- добавлены runtime-сущности:
+  - `agent_threads`
+  - `agent_runs`
+- добавлен `action dispatcher` для read-only Telegram действий;
+- первый runtime slice уже обрабатывает:
+  - помощь;
+  - мой статус;
+  - подписки;
+- эти сценарии уже проходят через `job -> run -> runtime`.
+
 ### Task 4.1
 
-Довести state schema для assistant flow:
-- `tenant_id`
-- `workspace_id`
-- `assistant_id`
-- `thread_id`
-- `incoming_message`
-- `intent`
-- `final_response`
+Перенести mutation actions в новый runtime:
+- добавить подписку на `EDS`;
+- подключить личный кабинет `EDS`;
+- убрать слот / вернуть слот;
+- убрать кабинет / вернуть кабинет.
 
 ### Task 4.2
 
-Реализовать узлы:
+Довести runtime graph:
 - `load_context`
-- `route_intent`
+- `route_action`
 - `policy_guard`
-- `generate_response`
+- `execute_action`
 - `persist_and_enqueue_reply`
 
 ### Task 4.3
 
-Добавить сущности runtime:
-- `agent_threads`
-- `agent_runs`
+Добавить `claim.lookup` как первый assistant-сценарий поверх нового runtime.
 
 ### Task 4.4
 
-Связать inbound message, job и LangGraph execution.
-
-### Task 4.5
-
-Поддержать первые сценарии:
-- помощь;
-- мой статус;
-- последние изменения;
-- просмотр заявки по номеру.
+Связать inbound event, job, run и outbox в один стабильный execution path.
 
 ## Epic 5. Worker And Outbox Runtime
 
 Статус:
 - `in_progress`
+
+Что уже зафиксировано:
+- пока Среда остается на текущем DB job-механизме;
+- позже execution backend будет вынесен на `Dramatiq + Redis`.
 
 ### Task 5.1
 
@@ -203,19 +205,14 @@
 ## Epic 9. Self-Service EDS Onboarding
 
 Статус:
-- `planned`
+- `done`
 
-### Task 9.1
-
-Сделать chat-driven flow подключения `EDS`.
-
-### Task 9.2
-
-Добавить понятный статус подключения и ошибок.
-
-### Task 9.3
-
-Свести ручные инженерные действия к минимуму.
+Что уже сделано:
+- self-service flow подключения `EDS`;
+- защищенная connect-страница;
+- verification worker;
+- статус подключения и ошибок в Telegram;
+- bridge в runtime `eds_monitor`.
 
 ## Ближайший приоритет
 

@@ -2,11 +2,18 @@
 
 ## Текущее состояние
 
-Среда уже прошла базовый infrastructure stage и сейчас находится между:
-- завершенным vertical slice по `eds_monitor`;
-- и незавершенным общим assistant runtime.
+Среда уже вышла за пределы базового MVP-скелета.
 
-То есть roadmap надо считать не от нуля, а от уже готового фундамента.
+На сегодня в продукте уже есть:
+- core backend и data model;
+- secure Telegram ingress;
+- self-service onboarding;
+- stub billing и подписки;
+- self-service подключение кабинета `EDS`;
+- verification flow;
+- рабочий `eds_monitor`.
+
+Поэтому roadmap надо считать не от нуля, а от уже работающего пользовательского контура.
 
 ## Этап 1. Foundation
 
@@ -19,7 +26,7 @@
 - `tenants`, `workspaces`, `users`, `assistants`, `tenant_features`;
 - `jobs`, `outbox_messages`, `secure_records`, `inbound_messages`;
 - plugin/capability model;
-- `Telegram` webhook каркас;
+- `Telegram` integration layer;
 - local secrets model через `.secrets/`.
 
 ## Этап 2. Secure Ingress
@@ -50,24 +57,62 @@
 - Telegram delivery с фотографиями;
 - transient processing без хранения полной заявки.
 
-## Этап 4. Assistant Runtime MVP
+## Этап 4. Billing And Self-Service EDS Connect
 
 Статус:
-- `next`
+- `done`
+
+Что уже есть:
+- подписки на `EDS` через `stub` billing;
+- статус и управление подписками в Telegram;
+- безопасная connect-страница через `Mini App` / `web_app`;
+- encrypted хранение логина и пароля `EDS`;
+- verification worker;
+- bridge из `tenant_eds_accounts` в runtime `eds_accounts`;
+- защита от повторного подключения одного и того же личного кабинета `EDS`.
+
+## Этап 5. Assistant Runtime MVP
+
+Статус:
+- `in_progress`
 
 Что нужно сделать:
 - полноценный assistant flow в `LangGraph`;
-- routing пользовательских сообщений;
+- routing пользовательских действий;
 - `message -> job -> graph -> outbox reply`;
 - thread/run model;
 - нормальный worker loop;
 - базовые команды:
   - помощь;
   - мой статус;
-  - последние изменения;
   - просмотр заявки по номеру.
 
-## Этап 5. Automation And Reliability
+Что уже начато:
+- добавлены runtime-сущности `agent_threads` и `agent_runs`;
+- появился первый runtime slice для read-only действий:
+  - помощь;
+  - мой статус;
+  - подписки;
+- transport слой начал переводиться на модель `update -> action -> job -> run`.
+
+Примечание:
+- свободный чат пока не является основной UX-моделью;
+- основной интерфейс сейчас строится вокруг меню и inline-кнопок.
+
+## Этап 6. Payments And Subscription Lifecycle
+
+Статус:
+- `next`
+
+Что нужно сделать:
+- интеграция с `ЮKassa`;
+- переход со `stub` billing на реальную оплату;
+- reminders перед продлением;
+- lifecycle jobs для истечения и продления подписок;
+- обработка неуспешной оплаты;
+- финальная шлифовка UX подписок.
+
+## Этап 7. Automation And Reliability
 
 Статус:
 - `next`
@@ -80,7 +125,11 @@
 - структурные логи и correlation ids;
 - smoke tests на полный цикл.
 
-## Этап 6. Security And Control
+Примечание:
+- на текущем этапе Среда остается на встроенном DB job-механизме;
+- позже execution backend планируется перевести на `Dramatiq + Redis`, не меняя собственные runtime-сущности и предметную логику.
+
+## Этап 8. Security And Control
 
 Статус:
 - `next`
@@ -92,19 +141,18 @@
 - более строгие правила доступа к sensitive данным;
 - отдельные encrypted сущности для пользовательской памяти.
 
-## Этап 7. Early Production
+## Этап 9. Early Production
 
 Статус:
 - `later`
 
 Что входит:
 - несколько `EDS`-логинов на одного клиента;
-- self-service onboarding для мониторинга;
 - базовая операторская админка;
 - расширенные лимиты и антиспам;
 - более богатый audit trail.
 
-## Этап 8. Platform
+## Этап 10. Platform
 
 Статус:
 - `later`
@@ -117,7 +165,7 @@
 - analytics;
 - второй message provider.
 
-## Этап 9. On-Prem Box
+## Этап 11. On-Prem Box
 
 Статус:
 - `later`
@@ -134,5 +182,5 @@
 - не строить full multi-agent platform до завершения assistant runtime;
 - не добавлять новые каналы до стабилизации `Telegram`;
 - не делать approval/policy слой наполовину;
-- не тащить billing и operator UI раньше, чем стабилен core flow;
+- не усложнять billing раньше, чем стабилен текущий self-service flow;
 - не смешивать pilot-ready продукт и enterprise-on-prem scope.
