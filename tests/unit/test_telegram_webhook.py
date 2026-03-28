@@ -3,10 +3,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from sreda.db.models import AgentRun, AgentThread
 from sreda.db.models.billing import TenantSubscription
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
-from sreda.db.models.core import InboundMessage, SecureRecord, Tenant, User, Workspace
+from sreda.db.models.core import InboundMessage, Job, OutboxMessage, SecureRecord, Tenant, User, Workspace
 from sreda.db.session import get_engine, get_session_factory
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.main import create_app
@@ -207,6 +208,23 @@ def test_telegram_webhook_handles_status_command(
     assert sent_messages[0]["chat_id"] == EXISTING_CHAT_ID
     assert "Мой статус" in sent_messages[0]["text"]
     assert "Сумма к оплате: 0 ₽" in sent_messages[0]["text"]
+
+    session = get_session_factory()()
+    try:
+        jobs = session.query(Job).filter(Job.job_type == "agent.execute_action").all()
+        threads = session.query(AgentThread).all()
+        runs = session.query(AgentRun).all()
+        outbox = session.query(OutboxMessage).all()
+    finally:
+        session.close()
+
+    assert len(jobs) == 1
+    assert len(threads) == 1
+    assert len(runs) == 1
+    assert len(outbox) == 1
+    assert jobs[0].status == "completed"
+    assert runs[0].status == "completed"
+    assert outbox[0].status == "sent"
 
 
 def test_telegram_webhook_handles_connect_subscription_callback(

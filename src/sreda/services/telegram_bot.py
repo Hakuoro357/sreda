@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 
 from sreda.config.settings import get_settings
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
+from sreda.runtime.dispatcher import dispatch_telegram_action
+from sreda.runtime.executor import ActionRuntimeService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.eds_account_verification import (
     RETRY_CONNECT_EXTRA_CALLBACK,
@@ -42,6 +44,7 @@ async def handle_telegram_interaction(
     payload: dict,
     telegram_client: TelegramClient,
     onboarding: TelegramOnboardingResult,
+    inbound_message_id: str | None = None,
 ) -> None:
     if onboarding.chat_id is None:
         return
@@ -54,6 +57,9 @@ async def handle_telegram_interaction(
             chat_id=onboarding.chat_id,
             callback_query=callback_query,
             onboarding=onboarding,
+            bot_key=bot_key,
+            payload=payload,
+            inbound_message_id=inbound_message_id,
         )
         return
 
@@ -76,6 +82,10 @@ async def handle_telegram_interaction(
         chat_id=onboarding.chat_id,
         tenant_id=onboarding.tenant_id,
         message_text=message_text,
+        bot_key=bot_key,
+        payload=payload,
+        onboarding=onboarding,
+        inbound_message_id=inbound_message_id,
     )
 
 
@@ -86,6 +96,9 @@ async def _handle_callback(
     chat_id: str,
     callback_query: dict,
     onboarding: TelegramOnboardingResult,
+    bot_key: str,
+    payload: dict,
+    inbound_message_id: str | None,
 ) -> None:
     callback_data = callback_query.get("data")
     callback_id = callback_query.get("id")
@@ -100,6 +113,17 @@ async def _handle_callback(
 
     billing = BillingService(session)
     tenant_id = onboarding.tenant_id
+    runtime_action = dispatch_telegram_action(
+        payload=payload,
+        bot_key=bot_key,
+        onboarding=onboarding,
+        inbound_message_id=inbound_message_id,
+    )
+    if runtime_action is not None:
+        runtime = ActionRuntimeService(session, telegram_client=telegram_client)
+        queued = runtime.enqueue_action(runtime_action)
+        await runtime.process_job(queued.job_id)
+        return
     if tenant_id and callback_data in {CONNECT_EDS_CALLBACK, RETRY_CONNECT_PRIMARY_CALLBACK, RETRY_CONNECT_EXTRA_CALLBACK}:
         requested_slot_type = "primary" if callback_data == RETRY_CONNECT_PRIMARY_CALLBACK else "extra"
         if callback_data == CONNECT_EDS_CALLBACK:
@@ -215,22 +239,22 @@ async def _handle_command(
     chat_id: str,
     tenant_id: str | None,
     message_text: str,
+    bot_key: str,
+    payload: dict,
+    onboarding: TelegramOnboardingResult,
+    inbound_message_id: str | None,
 ) -> None:
-    command = message_text.strip().lower()
-    billing = BillingService(session)
-
-    if command in {"/help", "помощь"}:
-        text, reply_markup = billing.build_help_message()
-        await telegram_client.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    runtime_action = dispatch_telegram_action(
+        payload=payload,
+        bot_key=bot_key,
+        onboarding=onboarding,
+        inbound_message_id=inbound_message_id,
+    )
+    if runtime_action is None:
         return
-    if command in {"/status", "мой статус"} and tenant_id:
-        text, reply_markup = billing.build_status_message(tenant_id)
-        await telegram_client.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-        return
-    if command in {"/subscriptions", "подписки"} and tenant_id:
-        text, reply_markup = billing.build_subscriptions_message(tenant_id)
-        await telegram_client.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-        return
+    runtime = ActionRuntimeService(session, telegram_client=telegram_client)
+    queued = runtime.enqueue_action(runtime_action)
+    await runtime.process_job(queued.job_id)
 
 def _extract_message_text(payload: dict) -> str | None:
     for key in ("message", "edited_message"):

@@ -18,8 +18,11 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
+from sreda.db.models.runtime import AgentRun, AgentThread
 
 __all__ = [
+    "AgentRun",
+    "AgentThread",
     "Assistant",
     "ConnectSession",
     "PaymentOrder",

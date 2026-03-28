@@ -37,6 +37,7 @@ async def telegram_webhook(
                 payload=payload,
                 telegram_client=telegram_client,
                 onboarding=onboarding,
+                inbound_message_id=result.inbound_message_id,
             )
         except TelegramDeliveryError as exc:
             logger.warning("Telegram delivery failed during webhook handling: %s", exc)
