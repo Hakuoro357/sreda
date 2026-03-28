@@ -2,8 +2,22 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from sreda.services.billing import STATUS_CALLBACK, SUBSCRIPTIONS_CALLBACK
-from sreda.services.onboarding import TelegramOnboardingResult
+from sreda.services.billing import (
+    ADD_EDS_ACCOUNT_CALLBACK,
+    CONNECT_BASE_CALLBACK,
+    REMOVE_EDS_ACCOUNT_CALLBACK,
+    REMOVE_EDS_ACCOUNT_SELECT_PREFIX,
+    RENEW_CALLBACK,
+    RESTORE_EDS_ACCOUNT_CALLBACK,
+    RESTORE_EDS_ACCOUNT_SELECT_PREFIX,
+    STATUS_CALLBACK,
+    SUBSCRIPTIONS_CALLBACK,
+)
+from sreda.services.eds_account_verification import (
+    RETRY_CONNECT_EXTRA_CALLBACK,
+    RETRY_CONNECT_PRIMARY_CALLBACK,
+)
+from sreda.services.onboarding import CONNECT_EDS_CALLBACK, TelegramOnboardingResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,9 +54,10 @@ def dispatch_telegram_action(
         callback_data = callback_query.get("data")
         if not isinstance(callback_data, str):
             return None
-        action_type = _ACTION_BY_CALLBACK.get(callback_data)
-        if action_type is None:
+        resolved = _resolve_callback_action(callback_data)
+        if resolved is None:
             return None
+        action_type, params = resolved
         return ActionEnvelope(
             action_type=action_type,
             tenant_id=onboarding.tenant_id,
@@ -55,7 +70,7 @@ def dispatch_telegram_action(
             inbound_message_id=inbound_message_id,
             source_type="telegram_callback",
             source_value=callback_data,
-            params={},
+            params=params,
         )
 
     message_text = _extract_message_text(payload)
@@ -81,6 +96,23 @@ def dispatch_telegram_action(
     )
 
 
+def _resolve_callback_action(callback_data: str) -> tuple[str, dict] | None:
+    if callback_data.startswith(REMOVE_EDS_ACCOUNT_SELECT_PREFIX):
+        return "eds.account.remove", {
+            "tenant_eds_account_id": callback_data.removeprefix(REMOVE_EDS_ACCOUNT_SELECT_PREFIX)
+        }
+    if callback_data.startswith(RESTORE_EDS_ACCOUNT_SELECT_PREFIX):
+        return "eds.account.restore", {
+            "tenant_eds_account_id": callback_data.removeprefix(RESTORE_EDS_ACCOUNT_SELECT_PREFIX)
+        }
+
+    action_type = _ACTION_BY_CALLBACK.get(callback_data)
+    if action_type is None:
+        return None
+    params = dict(_CALLBACK_PARAMS.get(callback_data, {}))
+    return action_type, params
+
+
 def _extract_message_text(payload: dict) -> str | None:
     for key in ("message", "edited_message"):
         message = payload.get(key)
@@ -94,11 +126,28 @@ def _extract_message_text(payload: dict) -> str | None:
 
 _ACTION_BY_COMMAND = {
     "/help": "help.show",
+    "помощь": "help.show",
     "/status": "status.show",
+    "мой статус": "status.show",
     "/subscriptions": "subscriptions.show",
+    "подписки": "subscriptions.show",
 }
 
 _ACTION_BY_CALLBACK = {
     STATUS_CALLBACK: "status.show",
     SUBSCRIPTIONS_CALLBACK: "subscriptions.show",
+    CONNECT_BASE_CALLBACK: "subscription.connect_base",
+    ADD_EDS_ACCOUNT_CALLBACK: "subscription.add_eds",
+    RENEW_CALLBACK: "subscription.renew_cycle",
+    CONNECT_EDS_CALLBACK: "eds.connect.start",
+    RETRY_CONNECT_PRIMARY_CALLBACK: "eds.connect.retry",
+    RETRY_CONNECT_EXTRA_CALLBACK: "eds.connect.retry",
+    REMOVE_EDS_ACCOUNT_CALLBACK: "eds.slot.remove_free",
+    RESTORE_EDS_ACCOUNT_CALLBACK: "eds.slot.restore_free",
+}
+
+_CALLBACK_PARAMS = {
+    CONNECT_EDS_CALLBACK: {"slot_type": "available_slot"},
+    RETRY_CONNECT_PRIMARY_CALLBACK: {"slot_type": "primary"},
+    RETRY_CONNECT_EXTRA_CALLBACK: {"slot_type": "extra"},
 }

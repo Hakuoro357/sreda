@@ -293,10 +293,16 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     session = get_session_factory()()
     try:
         subscriptions = session.query(TenantSubscription).all()
+        jobs = session.query(Job).filter(Job.job_type == "agent.execute_action").all()
+        runs = session.query(AgentRun).all()
+        outbox = session.query(OutboxMessage).all()
     finally:
         session.close()
 
     assert len(subscriptions) == 1
+    assert len(jobs) == 1
+    assert len(runs) == 1
+    assert len(outbox) == 1
 
 
 def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
@@ -365,6 +371,18 @@ def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
     assert "Дополнительный кабинет EDS подключен." in sent_messages[0]["text"]
     open_button = sent_messages[1]["reply_markup"]["inline_keyboard"][0][0]
     assert open_button["text"] == "Ввести логин и пароль от EDS"
+
+    session = get_session_factory()()
+    try:
+        jobs = session.query(Job).filter(Job.job_type == "agent.execute_action").all()
+        runs = session.query(AgentRun).all()
+        outbox = session.query(OutboxMessage).all()
+    finally:
+        session.close()
+
+    assert len(jobs) == 1
+    assert len(runs) == 1
+    assert len(outbox) == 2
 
 
 def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(

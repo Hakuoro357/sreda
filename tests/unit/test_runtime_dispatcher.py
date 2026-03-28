@@ -60,7 +60,7 @@ def test_dispatch_telegram_action_ignores_mutation_callback() -> None:
     payload = {
         "callback_query": {
             "id": "cb_2",
-            "data": "billing:connect_plan:eds_monitor_base",
+            "data": "unsupported:mutation",
             "message": {"chat": {"id": 100000003, "type": "private"}},
         }
     }
@@ -73,3 +73,44 @@ def test_dispatch_telegram_action_ignores_mutation_callback() -> None:
     )
 
     assert action is None
+
+
+def test_dispatch_telegram_action_maps_connect_base_callback() -> None:
+    payload = {
+        "callback_query": {
+            "id": "cb_2",
+            "data": "billing:connect_plan:eds_monitor_base",
+            "message": {"chat": {"id": 100000003, "type": "private"}},
+        }
+    }
+
+    action = dispatch_telegram_action(
+        payload=payload,
+        bot_key="sreda",
+        onboarding=_onboarding(),
+        inbound_message_id="in_3",
+    )
+
+    assert action is not None
+    assert action.action_type == "subscription.connect_base"
+
+
+def test_dispatch_telegram_action_maps_remove_account_select_callback() -> None:
+    payload = {
+        "callback_query": {
+            "id": "cb_4",
+            "data": "billing:remove_eds_account:select:teds_123",
+            "message": {"chat": {"id": 100000003, "type": "private"}},
+        }
+    }
+
+    action = dispatch_telegram_action(
+        payload=payload,
+        bot_key="sreda",
+        onboarding=_onboarding(),
+        inbound_message_id="in_4",
+    )
+
+    assert action is not None
+    assert action.action_type == "eds.account.remove"
+    assert action.params == {"tenant_eds_account_id": "teds_123"}

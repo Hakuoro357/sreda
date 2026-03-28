@@ -8,20 +8,29 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from sreda.config.settings import get_settings
 from sreda.db.models import AgentRun, AgentThread
 from sreda.db.models.core import Job, OutboxMessage
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.dispatcher import ActionEnvelope
-from sreda.services.billing import BillingService
+from sreda.services.billing import (
+    BillingService,
+    CONNECT_BASE_CALLBACK,
+    STATUS_CALLBACK,
+    SUBSCRIPTIONS_CALLBACK,
+)
+from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
+from sreda.services.onboarding import build_connect_eds_message
 
 AGENT_EXECUTE_ACTION_JOB = "agent.execute_action"
 
 
 class ActionRuntimeError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, reply_markup: dict | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.reply_markup = reply_markup
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,23 +134,42 @@ class ActionRuntimeService:
         run.started_at = run.started_at or now
         self.session.commit()
 
+        action: ActionEnvelope | None = None
+        context: dict[str, Any] | None = None
         try:
             action = self._load_action(run)
             context = self._load_context(action)
             handler = self._route_action(action.action_type)
             self._policy_guard(action, context)
-            reply = handler(action, context)
-            await self._persist_and_enqueue_reply(job=job, run=run, action=action, context=context, reply=reply)
-            return "completed"
-        except ActionRuntimeError as exc:
-            self._mark_failed(job=job, run=run, error_code=exc.code, message=exc.message)
-            return "failed"
-        except Exception:
-            self._mark_failed(
+            replies = handler(action, context)
+            await self._persist_and_enqueue_replies(
                 job=job,
                 run=run,
+                action=action,
+                context=context,
+                replies=replies,
+            )
+            return "completed"
+        except ActionRuntimeError as exc:
+            await self._mark_failed(
+                job=job,
+                run=run,
+                action=action,
+                context=context,
+                error_code=exc.code,
+                message=exc.message,
+                reply_markup=exc.reply_markup,
+            )
+            return "failed"
+        except Exception:
+            await self._mark_failed(
+                job=job,
+                run=run,
+                action=action,
+                context=context,
                 error_code="runtime_unexpected_error",
                 message="Не удалось выполнить действие из-за технической ошибки.",
+                reply_markup=None,
             )
             return "failed"
 
@@ -176,10 +204,17 @@ class ActionRuntimeService:
         return ActionEnvelope(**payload)
 
     def _load_context(self, action: ActionEnvelope) -> dict[str, Any]:
+        billing_summary = BillingService(self.session).get_summary(action.tenant_id)
         return {
             "tenant_id": action.tenant_id,
             "workspace_id": action.workspace_id,
             "assistant_id": action.assistant_id,
+            "billing_summary": {
+                "base_active": billing_summary.base_active,
+                "allowed_count": billing_summary.allowed_count,
+                "connected_count": billing_summary.connected_count,
+                "free_count": billing_summary.free_count,
+            },
         }
 
     def _route_action(self, action_type: str):
@@ -187,6 +222,15 @@ class ActionRuntimeService:
             "help.show": self._execute_help_show,
             "status.show": self._execute_status_show,
             "subscriptions.show": self._execute_subscriptions_show,
+            "subscription.connect_base": self._execute_subscription_connect_base,
+            "subscription.add_eds": self._execute_subscription_add_eds,
+            "subscription.renew_cycle": self._execute_subscription_renew_cycle,
+            "eds.connect.start": self._execute_eds_connect_start,
+            "eds.connect.retry": self._execute_eds_connect_retry,
+            "eds.slot.remove_free": self._execute_eds_slot_remove_free,
+            "eds.slot.restore_free": self._execute_eds_slot_restore_free,
+            "eds.account.remove": self._execute_eds_account_remove,
+            "eds.account.restore": self._execute_eds_account_restore,
         }.get(action_type)
         if handler is None:
             raise ActionRuntimeError("runtime_unsupported_action", "Это действие пока не поддерживается.")
@@ -201,55 +245,212 @@ class ActionRuntimeService:
                 "Не удалось определить контекст пользователя для этого действия.",
             )
 
-    def _execute_help_show(self, action: ActionEnvelope, context: dict[str, Any]) -> RuntimeReply:
+        summary = context["billing_summary"]
+        if action.action_type == "subscription.add_eds" and not summary["base_active"]:
+            raise ActionRuntimeError(
+                "subscription_required",
+                "Сначала подключи EDS Monitor, а потом можно будет добавить еще один кабинет.",
+                reply_markup=_subscriptions_markup(),
+            )
+        if action.action_type in {"eds.connect.start", "eds.connect.retry"}:
+            if not summary["base_active"]:
+                raise ActionRuntimeError(
+                    "subscription_required",
+                    build_connect_eds_message(
+                        base_active=False,
+                        connected_count=summary["connected_count"],
+                        allowed_count=summary["allowed_count"],
+                    ),
+                    reply_markup=_connect_reply_markup(False),
+                )
+            if summary["free_count"] <= 0:
+                raise ActionRuntimeError(
+                    "limit_exceeded",
+                    "Сейчас все оплаченные кабинеты уже заняты.\n\nЕсли нужен еще один кабинет, сначала добавь его в подписках.",
+                    reply_markup=_subscriptions_markup(),
+                )
+
+    def _execute_help_show(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
         text, reply_markup = BillingService(self.session).build_help_message()
-        return RuntimeReply(text=text, reply_markup=reply_markup)
+        return [RuntimeReply(text=text, reply_markup=reply_markup)]
 
-    def _execute_status_show(self, action: ActionEnvelope, context: dict[str, Any]) -> RuntimeReply:
+    def _execute_status_show(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
         text, reply_markup = BillingService(self.session).build_status_message(action.tenant_id)
-        return RuntimeReply(text=text, reply_markup=reply_markup)
+        return [RuntimeReply(text=text, reply_markup=reply_markup)]
 
-    def _execute_subscriptions_show(self, action: ActionEnvelope, context: dict[str, Any]) -> RuntimeReply:
+    def _execute_subscriptions_show(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
         text, reply_markup = BillingService(self.session).build_subscriptions_message(action.tenant_id)
-        return RuntimeReply(text=text, reply_markup=reply_markup)
+        return [RuntimeReply(text=text, reply_markup=reply_markup)]
 
-    async def _persist_and_enqueue_reply(
+    def _execute_subscription_connect_base(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        result = BillingService(self.session).start_base_subscription(action.tenant_id)
+        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+    def _execute_subscription_add_eds(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        result = BillingService(self.session).add_extra_eds_account(action.tenant_id)
+        replies = [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+        replies.extend(self._build_connect_replies(action, slot_type="extra"))
+        return replies
+
+    def _execute_subscription_renew_cycle(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        result = BillingService(self.session).renew_cycle(action.tenant_id)
+        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+    def _execute_eds_connect_start(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        slot_type = str(action.params.get("slot_type") or "available_slot")
+        resolved_slot_type = self._resolve_slot_type(action.tenant_id, slot_type)
+        return self._build_connect_replies(action, slot_type=resolved_slot_type)
+
+    def _execute_eds_connect_retry(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        slot_type = str(action.params.get("slot_type") or "")
+        return self._build_connect_replies(action, slot_type=slot_type)
+
+    def _execute_eds_slot_remove_free(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        result = BillingService(self.session).remove_extra_account_at_period_end(action.tenant_id)
+        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+    def _execute_eds_slot_restore_free(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        result = BillingService(self.session).restore_extra_account_slot(action.tenant_id)
+        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+    def _execute_eds_account_remove(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        tenant_eds_account_id = str(action.params.get("tenant_eds_account_id") or "").strip()
+        if not tenant_eds_account_id:
+            raise ActionRuntimeError(
+                "tenant_eds_account_missing",
+                "Не удалось определить кабинет для отключения.",
+                reply_markup=_subscriptions_markup(),
+            )
+        result = BillingService(self.session).schedule_connected_eds_account_cancel(
+            action.tenant_id,
+            tenant_eds_account_id,
+        )
+        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+    def _execute_eds_account_restore(
+        self,
+        action: ActionEnvelope,
+        context: dict[str, Any],
+    ) -> list[RuntimeReply]:
+        tenant_eds_account_id = str(action.params.get("tenant_eds_account_id") or "").strip()
+        if not tenant_eds_account_id:
+            raise ActionRuntimeError(
+                "tenant_eds_account_missing",
+                "Не удалось определить кабинет для возврата.",
+                reply_markup=_subscriptions_markup(),
+            )
+        result = BillingService(self.session).restore_connected_eds_account_cancel(
+            action.tenant_id,
+            tenant_eds_account_id,
+        )
+        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+    def _build_connect_replies(self, action: ActionEnvelope, *, slot_type: str) -> list[RuntimeReply]:
+        connect_service = EDSConnectService(self.session, get_settings())
+        try:
+            link = connect_service.create_connect_link(
+                tenant_id=action.tenant_id,
+                workspace_id=action.workspace_id,
+                user_id=action.user_id,
+                slot_type=slot_type,
+            )
+        except ConnectSessionError as exc:
+            raise ActionRuntimeError(exc.code, exc.message, reply_markup=_subscriptions_markup()) from exc
+
+        return [
+            RuntimeReply(
+                text=(
+                    "Сейчас откроется защищенная одноразовая страница для подключения личного кабинета EDS.\n\n"
+                    "Логин и пароль передаются по защищенному соединению и сохраняются в системе только в зашифрованном виде.\n\n"
+                    "Чтобы ввести данные для подключения, нажмите кнопку ниже."
+                ),
+                reply_markup={
+                    "inline_keyboard": [
+                        [_build_connect_open_button(link.url)],
+                        [{"text": "Отменить", "callback_data": STATUS_CALLBACK}],
+                    ]
+                },
+            )
+        ]
+
+    def _resolve_slot_type(self, tenant_id: str, slot_type: str) -> str:
+        if slot_type in {"primary", "extra"}:
+            return slot_type
+        summary = BillingService(self.session).get_summary(tenant_id)
+        return "primary" if not summary.connected_accounts else "extra"
+
+    async def _persist_and_enqueue_replies(
         self,
         *,
         job: Job,
         run: AgentRun,
         action: ActionEnvelope,
         context: dict[str, Any],
-        reply: RuntimeReply,
+        replies: list[RuntimeReply],
     ) -> None:
-        outbox = OutboxMessage(
-            id=f"out_{uuid4().hex[:24]}",
-            tenant_id=run.tenant_id,
-            workspace_id=run.workspace_id,
-            channel_type="telegram",
-            status="pending",
-            payload_json=json.dumps(
-                {
-                    "chat_id": action.external_chat_id,
-                    "text": reply.text,
-                    "reply_markup": reply.reply_markup,
-                },
-                ensure_ascii=False,
-            ),
-        )
-        self.session.add(outbox)
-        self.session.flush()
+        outbox_items: list[OutboxMessage] = []
+        for reply in replies:
+            outbox = OutboxMessage(
+                id=f"out_{uuid4().hex[:24]}",
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                channel_type="telegram",
+                status="pending",
+                payload_json=json.dumps(
+                    {
+                        "chat_id": action.external_chat_id,
+                        "text": reply.text,
+                        "reply_markup": reply.reply_markup,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            self.session.add(outbox)
+            self.session.flush()
 
-        if self.telegram_client is not None:
-            try:
-                await self.telegram_client.send_message(
-                    chat_id=action.external_chat_id,
-                    text=reply.text,
-                    reply_markup=reply.reply_markup,
-                )
-                outbox.status = "sent"
-            except TelegramDeliveryError:
-                outbox.status = "pending"
+            if self.telegram_client is not None:
+                try:
+                    await self.telegram_client.send_message(
+                        chat_id=action.external_chat_id,
+                        text=reply.text,
+                        reply_markup=reply.reply_markup,
+                    )
+                    outbox.status = "sent"
+                except TelegramDeliveryError:
+                    outbox.status = "pending"
+            outbox_items.append(outbox)
 
         now = _utcnow()
         job.status = "completed"
@@ -257,19 +458,72 @@ class ActionRuntimeService:
         run.context_json = json.dumps(context, ensure_ascii=False)
         run.result_json = json.dumps(
             {
-                "outbox_message_id": outbox.id,
-                "outbox_status": outbox.status,
-                "reply_text_preview": reply.text[:120],
+                "outbox_message_ids": [item.id for item in outbox_items],
+                "outbox_statuses": [item.status for item in outbox_items],
+                "reply_count": len(outbox_items),
             },
             ensure_ascii=False,
         )
         run.finished_at = now
         self.session.commit()
 
-    def _mark_failed(self, *, job: Job, run: AgentRun, error_code: str, message: str) -> None:
+    async def _mark_failed(
+        self,
+        *,
+        job: Job,
+        run: AgentRun,
+        action: ActionEnvelope | None,
+        context: dict[str, Any] | None,
+        error_code: str,
+        message: str,
+        reply_markup: dict | None,
+    ) -> None:
+        outbox_ids: list[str] = []
+        outbox_statuses: list[str] = []
+        if action is not None:
+            outbox = OutboxMessage(
+                id=f"out_{uuid4().hex[:24]}",
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                channel_type="telegram",
+                status="pending",
+                payload_json=json.dumps(
+                    {
+                        "chat_id": action.external_chat_id,
+                        "text": message,
+                        "reply_markup": reply_markup,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            self.session.add(outbox)
+            self.session.flush()
+            if self.telegram_client is not None:
+                try:
+                    await self.telegram_client.send_message(
+                        chat_id=action.external_chat_id,
+                        text=message,
+                        reply_markup=reply_markup,
+                    )
+                    outbox.status = "sent"
+                except TelegramDeliveryError:
+                    outbox.status = "pending"
+            outbox_ids.append(outbox.id)
+            outbox_statuses.append(outbox.status)
+
         now = _utcnow()
         job.status = "failed"
         run.status = "failed"
+        if context is not None:
+            run.context_json = json.dumps(context, ensure_ascii=False)
+        run.result_json = json.dumps(
+            {
+                "outbox_message_ids": outbox_ids,
+                "outbox_statuses": outbox_statuses,
+                "reply_count": len(outbox_ids),
+            },
+            ensure_ascii=False,
+        )
         run.error_code = error_code
         run.error_message_sanitized = message
         run.finished_at = now
@@ -283,6 +537,32 @@ def _extract_run_id(payload_json: str) -> str | None:
         return None
     run_id = payload.get("run_id")
     return str(run_id) if run_id else None
+
+
+def _subscriptions_markup() -> dict:
+    return {"inline_keyboard": [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]}
+
+
+def _connect_reply_markup(base_active: bool) -> dict:
+    if base_active:
+        return {
+            "inline_keyboard": [
+                [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+            ]
+        }
+    return {
+        "inline_keyboard": [
+            [{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}],
+            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+        ]
+    }
+
+
+def _build_connect_open_button(url: str) -> dict:
+    if url.startswith("https://"):
+        return {"text": "Ввести логин и пароль от EDS", "web_app": {"url": url}}
+    return {"text": "Ввести логин и пароль от EDS", "url": url}
 
 
 def _utcnow() -> datetime:
