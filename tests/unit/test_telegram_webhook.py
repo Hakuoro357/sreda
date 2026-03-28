@@ -7,7 +7,18 @@ from sreda.db.models import AgentRun, AgentThread
 from sreda.db.models.billing import TenantSubscription
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
-from sreda.db.models.core import InboundMessage, Job, OutboxMessage, SecureRecord, Tenant, User, Workspace
+from sreda.db.models.core import (
+    Assistant,
+    InboundMessage,
+    Job,
+    OutboxMessage,
+    SecureRecord,
+    Tenant,
+    TenantFeature,
+    User,
+    Workspace,
+)
+from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState
 from sreda.db.session import get_engine, get_session_factory
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.main import create_app
@@ -444,3 +455,112 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
         session.close()
 
     assert len(subscriptions) == 1
+
+
+def test_telegram_webhook_handles_claim_lookup_command(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "claim_webhook.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    sent_messages: list[dict] = []
+
+    async def fake_send_message(
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+        return {"ok": True}
+
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
+        session.flush()
+        session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_tg_100000003", name="Sreda"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        session.add(TenantFeature(id="feature_1", tenant_id="tenant_1", feature_key="eds_monitor", enabled=True))
+        session.add(
+            EDSAccount(
+                id="eds_acc_1",
+                tenant_id="tenant_1",
+                workspace_id="workspace_tg_100000003",
+                assistant_id="assistant_1",
+                tenant_eds_account_id=None,
+                site_key="mosreg",
+                account_key="eds-1",
+                label="EDS кабинет 1",
+                login="5047136341",
+            )
+        )
+        session.add(
+            EDSClaimState(
+                id="state_1",
+                eds_account_id="eds_acc_1",
+                claim_id="6230173",
+                fingerprint_hash="hash_1",
+                status="WORK",
+                status_name="В работе",
+                last_seen_changed="2026-03-28T15:10:00+00:00",
+                last_history_order=12,
+                last_history_code="HISTORY_SOLVED",
+                last_history_date="2026-03-28T15:09:00+00:00",
+            )
+        )
+        session.add(
+            EDSChangeEvent(
+                id="evt_1",
+                eds_account_id="eds_acc_1",
+                claim_id="6230173",
+                change_type="client_updated",
+                has_new_response=True,
+                requires_user_action=False,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 9010,
+        "message": {
+            "message_id": 21,
+            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            "text": "/claim 6230173",
+        },
+    }
+
+    response = client.post("/webhooks/telegram/sreda", json=payload)
+
+    assert response.status_code == 202
+    assert len(sent_messages) == 1
+    assert "Заявка #6230173" in sent_messages[0]["text"]
+    assert "Статус: В работе" in sent_messages[0]["text"]
+
+    session = get_session_factory()()
+    try:
+        jobs = session.query(Job).filter(Job.job_type == "agent.execute_action").all()
+        runs = session.query(AgentRun).all()
+        outbox = session.query(OutboxMessage).all()
+    finally:
+        session.close()
+
+    assert len(jobs) == 1
+    assert len(runs) == 1
+    assert runs[0].action_type == "claim.lookup"
+    assert runs[0].status == "completed"
+    assert len(outbox) == 1

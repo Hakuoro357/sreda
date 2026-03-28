@@ -34,6 +34,47 @@ def test_dispatch_telegram_action_maps_status_command() -> None:
     assert action.source_type == "telegram_message"
 
 
+def test_dispatch_telegram_action_maps_claim_command() -> None:
+    payload = {
+        "message": {
+            "chat": {"id": 100000003, "type": "private"},
+            "text": "/claim 6230173",
+        }
+    }
+
+    action = dispatch_telegram_action(
+        payload=payload,
+        bot_key="sreda",
+        onboarding=_onboarding(),
+        inbound_message_id="in_claim",
+    )
+
+    assert action is not None
+    assert action.action_type == "claim.lookup"
+    assert action.params == {"claim_id": "6230173"}
+    assert action.source_type == "telegram_message"
+
+
+def test_dispatch_telegram_action_maps_claim_command_without_id() -> None:
+    payload = {
+        "message": {
+            "chat": {"id": 100000003, "type": "private"},
+            "text": "/claim",
+        }
+    }
+
+    action = dispatch_telegram_action(
+        payload=payload,
+        bot_key="sreda",
+        onboarding=_onboarding(),
+        inbound_message_id="in_claim_missing",
+    )
+
+    assert action is not None
+    assert action.action_type == "claim.lookup"
+    assert action.params == {}
+
+
 def test_dispatch_telegram_action_maps_subscriptions_callback() -> None:
     payload = {
         "callback_query": {

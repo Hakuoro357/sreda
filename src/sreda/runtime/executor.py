@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from sreda.config.settings import get_settings
 from sreda.db.models import AgentRun, AgentThread
-from sreda.db.models.core import Job, OutboxMessage
+from sreda.db.models.core import Job, OutboxMessage, TenantFeature
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.services.billing import (
@@ -19,6 +19,7 @@ from sreda.services.billing import (
     STATUS_CALLBACK,
     SUBSCRIPTIONS_CALLBACK,
 )
+from sreda.services.claim_lookup import ClaimLookupService, is_valid_claim_id
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.onboarding import build_connect_eds_message
 
@@ -205,10 +206,21 @@ class ActionRuntimeService:
 
     def _load_context(self, action: ActionEnvelope) -> dict[str, Any]:
         billing_summary = BillingService(self.session).get_summary(action.tenant_id)
+        eds_monitor_enabled = (
+            self.session.query(TenantFeature)
+            .filter(
+                TenantFeature.tenant_id == action.tenant_id,
+                TenantFeature.feature_key == "eds_monitor",
+                TenantFeature.enabled.is_(True),
+            )
+            .one_or_none()
+            is not None
+        )
         return {
             "tenant_id": action.tenant_id,
             "workspace_id": action.workspace_id,
             "assistant_id": action.assistant_id,
+            "eds_monitor_enabled": eds_monitor_enabled,
             "billing_summary": {
                 "base_active": billing_summary.base_active,
                 "allowed_count": billing_summary.allowed_count,
@@ -222,6 +234,7 @@ class ActionRuntimeService:
             "help.show": self._execute_help_show,
             "status.show": self._execute_status_show,
             "subscriptions.show": self._execute_subscriptions_show,
+            "claim.lookup": self._execute_claim_lookup,
             "subscription.connect_base": self._execute_subscription_connect_base,
             "subscription.add_eds": self._execute_subscription_add_eds,
             "subscription.renew_cycle": self._execute_subscription_renew_cycle,
@@ -246,6 +259,28 @@ class ActionRuntimeService:
             )
 
         summary = context["billing_summary"]
+        if action.action_type == "claim.lookup":
+            claim_id = str(action.params.get("claim_id") or "").strip()
+            if not claim_id:
+                raise ActionRuntimeError(
+                    "claim_id_missing",
+                    "Используй команду в формате:\n\n/claim <номер_заявки>",
+                    reply_markup=_status_subscriptions_markup(),
+                )
+            if not is_valid_claim_id(claim_id):
+                raise ActionRuntimeError(
+                    "claim_id_invalid",
+                    "Номер заявки должен содержать только буквы, цифры, '-' или '_'.",
+                    reply_markup=_status_subscriptions_markup(),
+                )
+            if not context.get("eds_monitor_enabled"):
+                raise ActionRuntimeError(
+                    "eds_monitor_disabled",
+                    "Поиск по заявкам станет доступен после подключения EDS.",
+                    reply_markup=_subscriptions_markup(),
+                )
+            return
+
         if action.action_type == "subscription.add_eds" and not summary["base_active"]:
             raise ActionRuntimeError(
                 "subscription_required",
@@ -281,6 +316,27 @@ class ActionRuntimeService:
     def _execute_subscriptions_show(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
         text, reply_markup = BillingService(self.session).build_subscriptions_message(action.tenant_id)
         return [RuntimeReply(text=text, reply_markup=reply_markup)]
+
+    def _execute_claim_lookup(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
+        claim_id = str(action.params.get("claim_id") or "").strip()
+        service = ClaimLookupService(self.session)
+        result = service.lookup_local_claim(action.tenant_id, claim_id)
+        if result is None:
+            return [
+                RuntimeReply(
+                    text=(
+                        f"Заявка #{claim_id} пока не найдена в локальном состоянии Среды.\n\n"
+                        "Если она появилась недавно, попробуй еще раз позже."
+                    ),
+                    reply_markup=_status_subscriptions_markup(),
+                )
+            ]
+        return [
+            RuntimeReply(
+                text=service.build_claim_reply(result),
+                reply_markup=_status_subscriptions_markup(),
+            )
+        ]
 
     def _execute_subscription_connect_base(
         self,
@@ -543,14 +599,18 @@ def _subscriptions_markup() -> dict:
     return {"inline_keyboard": [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]}
 
 
+def _status_subscriptions_markup() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+        ]
+    }
+
+
 def _connect_reply_markup(base_active: bool) -> dict:
     if base_active:
-        return {
-            "inline_keyboard": [
-                [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-            ]
-        }
+        return _status_subscriptions_markup()
     return {
         "inline_keyboard": [
             [{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}],

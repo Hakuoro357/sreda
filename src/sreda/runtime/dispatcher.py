@@ -76,10 +76,10 @@ def dispatch_telegram_action(
     message_text = _extract_message_text(payload)
     if not message_text:
         return None
-    normalized = message_text.strip().lower()
-    action_type = _ACTION_BY_COMMAND.get(normalized)
-    if action_type is None:
+    resolved_command = _resolve_command_action(message_text.strip())
+    if resolved_command is None:
         return None
+    action_type, params = resolved_command
     return ActionEnvelope(
         action_type=action_type,
         tenant_id=onboarding.tenant_id,
@@ -92,7 +92,7 @@ def dispatch_telegram_action(
         inbound_message_id=inbound_message_id,
         source_type="telegram_message",
         source_value=message_text.strip(),
-        params={},
+        params=params,
     )
 
 
@@ -111,6 +111,27 @@ def _resolve_callback_action(callback_data: str) -> tuple[str, dict] | None:
         return None
     params = dict(_CALLBACK_PARAMS.get(callback_data, {}))
     return action_type, params
+
+
+def _resolve_command_action(message_text: str) -> tuple[str, dict] | None:
+    normalized_full = message_text.strip().lower()
+    action_type = _ACTION_BY_COMMAND.get(normalized_full)
+    if action_type is not None:
+        return action_type, {}
+
+    parts = message_text.split(maxsplit=1)
+    if not parts:
+        return None
+
+    command = parts[0].strip().lower()
+    if command == "/claim":
+        claim_id = parts[1].strip() if len(parts) > 1 else ""
+        return "claim.lookup", {"claim_id": claim_id} if claim_id else {}
+
+    action_type = _ACTION_BY_COMMAND.get(command)
+    if action_type is None:
+        return None
+    return action_type, {}
 
 
 def _extract_message_text(payload: dict) -> str | None:
