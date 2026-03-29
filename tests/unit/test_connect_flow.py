@@ -133,6 +133,9 @@ def test_open_connect_form_returns_html_for_valid_token(
     assert "Ссылка действует до:" in response.text
     assert "Логин" in response.text
     assert "Пароль" in response.text
+    assert 'id="submit-button"' in response.text
+    assert 'submitButton.disabled = true' in response.text
+    assert 'submitButton.textContent = "Проверяем..."' in response.text
 
 
 def test_submit_connect_form_stores_secure_payload_and_queues_job(
@@ -199,6 +202,68 @@ def test_submit_connect_form_stores_secure_payload_and_queues_job(
     assert payload["password"] == "super-secret"
     assert job.job_type == "eds.verify_account_connect"
     assert called_job_ids == [job.id]
+
+
+def test_repeat_submit_returns_processing_page_without_duplicates(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    called_job_ids: list[str] = []
+
+    async def fake_process_job(self, job_id: str) -> str:
+        called_job_ids.append(job_id)
+        return "completed"
+
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
+    monkeypatch.setattr(EDSAccountVerificationService, "process_job", fake_process_job)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        _seed_bundle(session)
+        BillingService(session).start_base_subscription("tenant_1")
+        link = EDSConnectService(session, get_settings()).create_connect_link(
+            tenant_id="tenant_1",
+            workspace_id="workspace_1",
+            user_id="user_1",
+            slot_type="primary",
+        )
+        token = link.raw_token
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    first_response = client.post(
+        f"/connect/eds/{token}",
+        data={"login": "5047136341", "password": "super-secret"},
+    )
+    second_response = client.post(
+        f"/connect/eds/{token}",
+        data={"login": "5047136341", "password": "super-secret"},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert "Проверка уже запущена." in second_response.text
+
+    session = get_session_factory()()
+    try:
+        assert session.query(ConnectSession).count() == 1
+        assert session.query(TenantEDSAccount).count() == 1
+        assert session.query(SecureRecord).filter(SecureRecord.record_type == "eds_connect_payload").count() == 1
+        assert session.query(Job).count() == 1
+    finally:
+        session.close()
+
+    assert len(called_job_ids) == 1
 
 
 def test_connect_callback_uses_existing_legacy_workspace_and_assistant(

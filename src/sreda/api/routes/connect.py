@@ -53,6 +53,8 @@ async def submit_eds_connect_form(
     try:
         result = service.submit_form(token, login=login, password=password)
     except ConnectSessionError as exc:
+        if exc.code == "session_used":
+            return HTMLResponse(_render_submitted_page(already_started=True), status_code=200)
         return HTMLResponse(_render_error_page(exc.message), status_code=exc.status_code)
     telegram_client = TelegramClient(settings.telegram_bot_token) if settings.telegram_bot_token else None
     verifier = EDSAccountVerificationService(session, telegram_client=telegram_client)
@@ -125,6 +127,10 @@ def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
         color: #ffffff;
         cursor: pointer;
       }}
+      button[disabled] {{
+        background: #93c5fd;
+        cursor: not-allowed;
+      }}
     </style>
   </head>
   <body>
@@ -143,14 +149,29 @@ def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
           <span class="label-text">Пароль</span>
           <input type="password" name="password" autocomplete="current-password">
         </label>
-        <button type="submit">Подключить</button>
+        <button type="submit" id="submit-button">Подключить</button>
       </form>
     </main>
+    <script>
+      const form = document.querySelector("form");
+      const submitButton = document.getElementById("submit-button");
+      if (form && submitButton) {{
+        form.addEventListener("submit", () => {{
+          submitButton.disabled = true;
+          submitButton.textContent = "Проверяем...";
+        }}, {{ once: true }});
+      }}
+    </script>
   </body>
 </html>"""
 
 
-def _render_submitted_page() -> str:
+def _render_submitted_page(*, already_started: bool = False) -> str:
+    message = (
+        "Проверка уже запущена."
+        if already_started
+        else "Сейчас проверяем доступ к кабинету EDS."
+    )
     return """<!doctype html>
 <html lang="ru">
   <head>
@@ -161,7 +182,7 @@ def _render_submitted_page() -> str:
   <body>
     <main style="max-width:560px;margin:40px auto;font-family:Arial,sans-serif;line-height:1.5;">
       <h1>Данные получены</h1>
-      <p>Сейчас проверяем доступ к кабинету EDS.</p>
+      <p>""" + escape(message) + """</p>
       <p>Можно закрыть эту страницу и вернуться в Telegram.</p>
     </main>
   </body>
