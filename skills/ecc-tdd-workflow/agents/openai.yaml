@@ -1,0 +1,4 @@
+interface:
+  display_name: "ECC TDD Workflow"
+  short_description: "Tight test-driven implementation workflow."
+  default_prompt: "Use $ecc-tdd-workflow to drive a small change with focused tests and minimal implementation."

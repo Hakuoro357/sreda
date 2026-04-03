@@ -1,0 +1,7 @@
+interface:
+  display_name: "ECC Security Review"
+  short_description: "Compact security review patterns adapted from ECC."
+  default_prompt: "Use $ecc-security-review to review a change or integration for secrets, validation, exfiltration, and prompt-injection risk."
+
+policy:
+  allow_implicit_invocation: true

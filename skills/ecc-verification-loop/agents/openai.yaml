@@ -1,0 +1,7 @@
+interface:
+  display_name: "ECC Verification Loop"
+  short_description: "Post-change verification loop adapted from ECC."
+  default_prompt: "Use $ecc-verification-loop after a code change to run a compact build, lint, test, and diff verification pass."
+
+policy:
+  allow_implicit_invocation: true

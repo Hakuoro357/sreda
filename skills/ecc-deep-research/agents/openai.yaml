@@ -1,0 +1,4 @@
+interface:
+  display_name: "ECC Deep Research"
+  short_description: "Structured multi-source research workflow."
+  default_prompt: "Use $ecc-deep-research to investigate a topic across multiple sources and synthesize the findings with evidence."
