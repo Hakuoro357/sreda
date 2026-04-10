@@ -258,7 +258,7 @@ class EDSAccountVerificationService:
 
         existing_runtime_account = self._find_existing_runtime_account(
             tenant_id=tenant_account.tenant_id,
-            login=login,
+            login_masked=result.login_masked,
             exclude_tenant_eds_account_id=tenant_account.id,
         )
         if existing_runtime_account is not None:
@@ -290,7 +290,7 @@ class EDSAccountVerificationService:
         self.session.flush()
         runtime_account = self._upsert_runtime_eds_account(
             tenant_account=tenant_account,
-            login=login,
+            login_masked=result.login_masked,
         )
 
         now = _utcnow()
@@ -333,7 +333,7 @@ class EDSAccountVerificationService:
         self,
         *,
         tenant_account: TenantEDSAccount,
-        login: str,
+        login_masked: str,
     ) -> EDSAccount:
         if not tenant_account.assistant_id:
             raise VerificationError(
@@ -356,7 +356,7 @@ class EDSAccountVerificationService:
                 site_key="eds",
                 account_key=tenant_account.id,
                 label=f"EDS кабинет {tenant_account.account_index}",
-                login=login,
+                login_masked=login_masked,
             )
             self.session.add(runtime_account)
             self.session.flush()
@@ -369,7 +369,7 @@ class EDSAccountVerificationService:
         runtime_account.site_key = "eds"
         runtime_account.account_key = tenant_account.id
         runtime_account.label = f"EDS кабинет {tenant_account.account_index}"
-        runtime_account.login = login
+        runtime_account.login_masked = login_masked
         self.session.flush()
         return runtime_account
 
@@ -377,14 +377,14 @@ class EDSAccountVerificationService:
         self,
         *,
         tenant_id: str,
-        login: str,
+        login_masked: str,
         exclude_tenant_eds_account_id: str,
     ) -> EDSAccount | None:
         return (
             self.session.query(EDSAccount)
             .filter(
                 EDSAccount.tenant_id == tenant_id,
-                EDSAccount.login == login,
+                EDSAccount.login_masked == login_masked,
                 EDSAccount.tenant_eds_account_id != exclude_tenant_eds_account_id,
             )
             .one_or_none()

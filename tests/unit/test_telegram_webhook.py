@@ -608,7 +608,7 @@ def test_telegram_webhook_handles_claim_lookup_command(
                 site_key="mosreg",
                 account_key="eds-1",
                 label="EDS кабинет 1",
-                login="5047136341",
+                login_masked="***41",
             )
         )
         session.add(

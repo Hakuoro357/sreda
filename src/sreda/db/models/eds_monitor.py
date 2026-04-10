@@ -22,7 +22,7 @@ class EDSAccount(Base):
     site_key: Mapped[str] = mapped_column(String(64))
     account_key: Mapped[str] = mapped_column(String(128), unique=True)
     label: Mapped[str] = mapped_column(String(255))
-    login: Mapped[str] = mapped_column(String(255))
+    login_masked: Mapped[str] = mapped_column(String(255))
 
 
 class EDSClaimState(Base):

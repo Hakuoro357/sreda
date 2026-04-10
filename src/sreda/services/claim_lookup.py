@@ -55,7 +55,7 @@ class ClaimLookupService:
             claim_id=claim_state.claim_id,
             status_name=claim_state.status_name,
             account_label=account.label,
-            account_login_masked=_mask_login(account.login),
+            account_login_masked=account.login_masked,
             last_seen_changed=claim_state.last_seen_changed,
             last_history_code=claim_state.last_history_code,
             last_history_date=claim_state.last_history_date,

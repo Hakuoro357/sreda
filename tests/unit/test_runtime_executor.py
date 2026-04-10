@@ -234,7 +234,7 @@ def test_runtime_service_claim_lookup_sends_claim_card(monkeypatch, tmp_path: Pa
                 site_key="mosreg",
                 account_key="eds-1",
                 label="EDS кабинет 1",
-                login="5047136341",
+                login_masked="***41",
             )
         )
         session.add(

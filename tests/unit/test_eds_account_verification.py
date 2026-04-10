@@ -298,7 +298,7 @@ def test_successful_verification_activates_account_and_sends_message(monkeypatch
     assert runtime_account.tenant_eds_account_id == tenant_account.id
     assert runtime_account.account_key == tenant_account.id
     assert runtime_account.label == "EDS кабинет 1"
-    assert runtime_account.login == "5047136341"
+    assert runtime_account.login_masked == "***41"
     assert payload["login"] == "5047136341"
     assert payload["password"] == "super-secret"
     assert len(telegram_client.messages) == 1

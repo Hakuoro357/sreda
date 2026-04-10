@@ -43,7 +43,7 @@ def test_claim_lookup_service_returns_latest_known_claim(monkeypatch, tmp_path) 
                 site_key="mosreg",
                 account_key="eds-1",
                 label="EDS кабинет 1",
-                login="5047136341",
+                login_masked="***41",
             )
         )
         session.add(
