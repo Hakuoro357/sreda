@@ -198,7 +198,7 @@ def test_submit_connect_form_stores_secure_payload_and_queues_job(
     assert connect_session.secure_record_id == secure_record.id
     assert connect_session.tenant_eds_account_id == tenant_account.id
     assert tenant_account.status == "pending_verification"
-    assert tenant_account.login_masked == "5047***341"
+    assert tenant_account.login_masked == "***41"
     assert payload["login"] == "5047136341"
     assert payload["password"] == "super-secret"
     assert job.job_type == "eds.verify_account_connect"

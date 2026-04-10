@@ -83,7 +83,10 @@ class ActionRuntimeService:
             inbound_message_id=action.inbound_message_id,
             action_type=action.action_type,
             status="pending",
-            input_json=json.dumps(action.as_dict(), ensure_ascii=False),
+            input_json=json.dumps(
+                get_default_privacy_guard().sanitize_structure(action.as_dict()).sanitized_value,
+                ensure_ascii=False,
+            ),
         )
         self.session.add(run)
         job.payload_json = json.dumps({"run_id": run.id}, ensure_ascii=False)

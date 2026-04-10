@@ -66,7 +66,7 @@ class SuccessAdapter:
         assert account_key.startswith("teds_")
         assert login == "5047136341"
         assert password == "super-secret"
-        return VerificationResult(login_masked="5047***341")
+        return VerificationResult(login_masked="***41")
 
 
 class AuthFailAdapter:
@@ -431,7 +431,7 @@ def test_process_job_is_race_safe_under_concurrent_workers(monkeypatch, tmp_path
             password: str,
         ) -> VerificationResult:
             adapter_calls.append(account_key)
-            return VerificationResult(login_masked="5047***341")
+            return VerificationResult(login_masked="***41")
 
     def worker() -> None:
         engine = create_engine(f"sqlite:///{db_path.as_posix()}")

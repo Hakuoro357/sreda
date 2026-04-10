@@ -17,7 +17,7 @@ from sreda.services.billing import BillingService
 from sreda.services.secure_storage import store_secure_json
 
 
-SESSION_TTL_MINUTES = 15
+SESSION_TTL_MINUTES_DEFAULT = 15  # Overridden by settings.connect_session_ttl_minutes
 
 
 class ConnectSessionError(Exception):
@@ -87,7 +87,8 @@ class EDSConnectService:
 
         raw_token = secrets.token_urlsafe(24)
         token_hash = _hash_token(raw_token)
-        expires_at = _utcnow() + timedelta(minutes=SESSION_TTL_MINUTES)
+        ttl = self.settings.connect_session_ttl_minutes or SESSION_TTL_MINUTES_DEFAULT
+        expires_at = _utcnow() + timedelta(minutes=ttl)
         connect_session = ConnectSession(
             id=f"cs_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -303,9 +304,9 @@ def _hash_token(raw_token: str) -> str:
 
 
 def _mask_login(login: str) -> str:
-    if len(login) <= 4:
-        return "*" * len(login)
-    return f"{login[:4]}***{login[-3:]}"
+    if len(login) <= 3:
+        return "***"
+    return f"***{login[-2:]}"
 
 
 def _utcnow() -> datetime:

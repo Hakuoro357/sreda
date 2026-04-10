@@ -62,6 +62,23 @@ def persist_telegram_inbound_event(
             sanitized_text = sanitization.sanitized_text
             contains_sensitive_data = sanitization.contains_sensitive_data
 
+    update_id = _extract_update_id(payload)
+
+    # M8: idempotency — if we already persisted an inbound message for
+    # this ``update_id``, return the existing record instead of creating
+    # a duplicate. Telegram may retry webhook delivery on network hiccups.
+    if update_id is not None:
+        existing = (
+            session.query(InboundMessage)
+            .filter(InboundMessage.external_update_id == update_id)
+            .first()
+        )
+        if existing is not None:
+            return TelegramInboundPersistResult(
+                inbound_message_id=existing.id,
+                contains_sensitive_data=existing.contains_sensitive_data,
+            )
+
     inbound = InboundMessage(
         id=f"in_{uuid4().hex[:24]}",
         tenant_id=tenant_id,
@@ -70,7 +87,7 @@ def persist_telegram_inbound_event(
         channel_type="telegram",
         channel_account_id=bot_key,
         bot_key=bot_key,
-        external_update_id=_extract_update_id(payload),
+        external_update_id=update_id,
         sender_chat_id=chat_id,
         message_text_sanitized=sanitized_text,
         contains_sensitive_data=contains_sensitive_data,

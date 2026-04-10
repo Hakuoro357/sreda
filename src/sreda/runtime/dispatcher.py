@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 
 from sreda.services.billing import (
@@ -98,13 +99,15 @@ def dispatch_telegram_action(
 
 def _resolve_callback_action(callback_data: str) -> tuple[str, dict] | None:
     if callback_data.startswith(REMOVE_EDS_ACCOUNT_SELECT_PREFIX):
-        return "eds.account.remove", {
-            "tenant_eds_account_id": callback_data.removeprefix(REMOVE_EDS_ACCOUNT_SELECT_PREFIX)
-        }
+        account_id = callback_data.removeprefix(REMOVE_EDS_ACCOUNT_SELECT_PREFIX)
+        if not _is_valid_entity_id(account_id):
+            return None
+        return "eds.account.remove", {"tenant_eds_account_id": account_id}
     if callback_data.startswith(RESTORE_EDS_ACCOUNT_SELECT_PREFIX):
-        return "eds.account.restore", {
-            "tenant_eds_account_id": callback_data.removeprefix(RESTORE_EDS_ACCOUNT_SELECT_PREFIX)
-        }
+        account_id = callback_data.removeprefix(RESTORE_EDS_ACCOUNT_SELECT_PREFIX)
+        if not _is_valid_entity_id(account_id):
+            return None
+        return "eds.account.restore", {"tenant_eds_account_id": account_id}
 
     action_type = _ACTION_BY_CALLBACK.get(callback_data)
     if action_type is None:
@@ -172,3 +175,10 @@ _CALLBACK_PARAMS = {
     RETRY_CONNECT_PRIMARY_CALLBACK: {"slot_type": "primary"},
     RETRY_CONNECT_EXTRA_CALLBACK: {"slot_type": "extra"},
 }
+
+_ENTITY_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _is_valid_entity_id(value: str) -> bool:
+    """Reject garbage after ``removeprefix`` — only allow safe identifiers."""
+    return bool(value and _ENTITY_ID_RE.match(value))

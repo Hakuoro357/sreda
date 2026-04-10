@@ -1,6 +1,10 @@
+import logging
+
 from sqlalchemy import text
 
 from sreda.db.session import get_engine
+
+logger = logging.getLogger(__name__)
 
 
 def database_is_ready() -> bool:
@@ -9,4 +13,5 @@ def database_is_ready() -> bool:
             connection.execute(text("SELECT 1"))
         return True
     except Exception:
+        logger.warning("database health check failed", exc_info=True)
         return False

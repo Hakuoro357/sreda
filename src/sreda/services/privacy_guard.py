@@ -136,6 +136,14 @@ _RULES: list[tuple[re.Pattern[str], Any]] = [
         _replace_group_value("secret", "[secret]"),
     ),
     (
+        # Telegram bot token: ``123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11``
+        # Appears in API URLs (``/bot<token>/sendMessage``), proxy logs,
+        # httpx debug output, Sentry breadcrumbs. Must be redacted
+        # before the generic URL rule runs.
+        re.compile(r"\bbot(\d{8,}:[A-Za-z0-9_-]{30,})\b"),
+        _replace_full("telegram_bot_token", "[telegram_bot_token]"),
+    ),
+    (
         re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b", re.IGNORECASE),
         _replace_full("email", "[email]"),
     ),

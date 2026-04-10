@@ -1,12 +1,15 @@
 class SiteMonitorClient:
+    """Legacy stub — superseded by ``sreda_feature_eds_monitor``.
+
+    All methods raise ``NotImplementedError`` so any accidental import
+    fails loudly instead of silently returning empty results.
+    """
+
     async def ensure_authenticated_session(self, account_key: str) -> None:
-        # TODO: rewrite current Playwright-based integration in Python.
-        _ = account_key
+        raise NotImplementedError("SiteMonitorClient is a legacy stub; use sreda_feature_eds_monitor")
 
     async def fetch_claims(self, account_key: str) -> list[dict]:
-        _ = account_key
-        return []
+        raise NotImplementedError("SiteMonitorClient is a legacy stub; use sreda_feature_eds_monitor")
 
     async def fetch_claim_detail(self, account_key: str, claim_id: str) -> dict:
-        _ = (account_key, claim_id)
-        return {}
+        raise NotImplementedError("SiteMonitorClient is a legacy stub; use sreda_feature_eds_monitor")

@@ -574,9 +574,9 @@ def _sanitize_error_message(message: str) -> str:
 
 
 def _mask_login(login: str) -> str:
-    if len(login) <= 4:
-        return "*" * len(login)
-    return f"{login[:4]}***{login[-3:]}"
+    if len(login) <= 3:
+        return "***"
+    return f"***{login[-2:]}"
 
 
 def _utcnow() -> datetime:

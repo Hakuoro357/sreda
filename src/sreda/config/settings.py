@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str | None = None
 
+    connect_session_ttl_minutes: int = 15
     encryption_key: str | None = None
     encryption_key_id: str = "primary"
     encryption_key_salt: str | None = None

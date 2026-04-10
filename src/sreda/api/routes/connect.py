@@ -92,7 +92,10 @@ async def submit_eds_connect_form(
     _enforce_same_origin(request, settings)
     service = EDSConnectService(session, settings)
     body = await request.body()
-    parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    try:
+        parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except (UnicodeDecodeError, ValueError):
+        return HTMLResponse(_render_error_page("Некорректные данные формы."), status_code=400)
     login = (parsed.get("login") or [""])[0]
     password = (parsed.get("password") or [""])[0]
     try:
@@ -103,11 +106,13 @@ async def submit_eds_connect_form(
         return HTMLResponse(_render_error_page(exc.message), status_code=exc.status_code)
     telegram_client = TelegramClient(settings.telegram_bot_token) if settings.telegram_bot_token else None
     verifier = EDSAccountVerificationService(session, telegram_client=telegram_client)
+    inline_ok = False
     try:
         await verifier.process_job(result.job_id)
+        inline_ok = True
     except Exception:
         logger.exception("Inline EDS verification kick failed for job %s", result.job_id)
-    return HTMLResponse(_render_submitted_page(), status_code=200)
+    return HTMLResponse(_render_submitted_page(queued=not inline_ok), status_code=200)
 
 
 def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
@@ -211,12 +216,13 @@ def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
 </html>"""
 
 
-def _render_submitted_page(*, already_started: bool = False) -> str:
-    message = (
-        "Проверка уже запущена."
-        if already_started
-        else "Сейчас проверяем доступ к кабинету EDS."
-    )
+def _render_submitted_page(*, already_started: bool = False, queued: bool = False) -> str:
+    if already_started:
+        message = "Проверка уже запущена."
+    elif queued:
+        message = "Данные получены. Проверка запустится в ближайшее время."
+    else:
+        message = "Сейчас проверяем доступ к кабинету EDS."
     return """<!doctype html>
 <html lang="ru">
   <head>
