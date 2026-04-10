@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import threading
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -96,6 +97,126 @@ class TemporaryFailAdapter:
             "Временная ошибка подключения. Попробуй еще раз позже.",
             retryable=True,
         )
+
+
+class HangingAdapter:
+    """Adapter whose ``verify_account`` blocks forever — simulates a
+    hung EDS endpoint. Without ``asyncio.wait_for`` guarding the call
+    site, the enclosing job would remain in ``running`` state
+    indefinitely.
+    """
+
+    def __init__(self) -> None:
+        self.hit_count = 0
+
+    async def verify_account(
+        self,
+        *,
+        account_key: str,
+        login: str,
+        password: str,
+    ) -> VerificationResult:
+        self.hit_count += 1
+        await asyncio.sleep(3600)
+        return VerificationResult(login_masked="hang")
+
+
+class LeakingPasswordAdapter:
+    """Adapter whose ``VerificationError`` message leaks the raw
+    password. This is the exact shape of a careless upstream integration
+    that embeds the credential into its error text — the sanitization
+    layer must scrub it before it hits the database or a Telegram
+    message.
+    """
+
+    async def verify_account(
+        self,
+        *,
+        account_key: str,
+        login: str,
+        password: str,
+    ) -> VerificationResult:
+        raise VerificationError(
+            "verification_auth_failed",
+            f"Ошибка авторизации (login={login}, password={password}).",
+            retryable=False,
+        )
+
+
+def test_failure_persists_sanitized_error_message_not_raw_password(monkeypatch, tmp_path) -> None:
+    """Regression guard for H8: a ``VerificationError.message`` that
+    accidentally contains credentials must be redacted before being
+    written to ``connect_session.error_message_sanitized`` /
+    ``tenant_account.last_error_message_sanitized`` / the Telegram
+    failure notification. The field name implies sanitization — until
+    this fix, the content was the raw upstream string.
+    """
+
+    session = _build_session(monkeypatch, tmp_path)
+    telegram_client = FakeTelegramClient()
+    try:
+        job_id = _seed_submitted_connect(session)
+        service = EDSAccountVerificationService(
+            session,
+            telegram_client=telegram_client,
+            adapter=LeakingPasswordAdapter(),
+        )
+
+        asyncio.run(service.process_job(job_id))
+
+        connect_session = session.query(ConnectSession).one()
+        tenant_account = session.query(TenantEDSAccount).one()
+    finally:
+        session.close()
+
+    # The raw password must NOT appear in any persisted or outbound
+    # field — only the placeholders from RegexPrivacyGuard may survive.
+    assert "super-secret" not in (connect_session.error_message_sanitized or "")
+    assert "super-secret" not in (tenant_account.last_error_message_sanitized or "")
+    assert "5047136341" not in (connect_session.error_message_sanitized or "")
+    assert "5047136341" not in (tenant_account.last_error_message_sanitized or "")
+    assert "[password]" in (connect_session.error_message_sanitized or "")
+    assert "[login]" in (connect_session.error_message_sanitized or "")
+
+    assert telegram_client.messages, "failure notification must still be sent"
+    failure_text = telegram_client.messages[-1]["text"]
+    assert "super-secret" not in failure_text
+    assert "5047136341" not in failure_text
+    assert "[password]" in failure_text
+
+
+def test_verification_process_job_fails_fast_when_adapter_hangs(monkeypatch, tmp_path) -> None:
+    """Regression guard for H4 in the EDS verification service: a
+    hanging adapter must be cancelled within ``job_max_runtime_seconds``
+    and the job moved into a terminal ``failed`` state so retries can
+    proceed.
+    """
+
+    monkeypatch.setenv("SREDA_JOB_MAX_RUNTIME_SECONDS", "0.25")
+    session = _build_session(monkeypatch, tmp_path)
+    adapter = HangingAdapter()
+    try:
+        job_id = _seed_submitted_connect(session)
+        service = EDSAccountVerificationService(
+            session,
+            telegram_client=FakeTelegramClient(),
+            adapter=adapter,
+        )
+
+        result = asyncio.run(service.process_job(job_id))
+
+        connect_session = session.query(ConnectSession).one()
+        tenant_account = session.query(TenantEDSAccount).one()
+        job = session.query(Job).one()
+    finally:
+        session.close()
+
+    assert adapter.hit_count == 1
+    assert result == "failed"
+    assert job.status == "failed"
+    assert connect_session.status == "failed"
+    assert connect_session.error_code == "verification_timeout"
+    assert tenant_account.status == "pending_verification"
 
 
 def test_duplicate_login_does_not_create_second_active_account(monkeypatch, tmp_path) -> None:
@@ -265,6 +386,105 @@ def test_successful_verification_completes_even_if_telegram_delivery_fails(monke
     assert job.status == "completed"
     assert connect_session.status == "verified"
     assert tenant_account.status == "active"
+
+
+def test_process_job_is_race_safe_under_concurrent_workers(monkeypatch, tmp_path) -> None:
+    # Seed DB with a pending eds.verify_account_connect job, then close the
+    # seeding session so both worker threads start from fresh state.
+    db_path = tmp_path / "test.db"
+    setup_session = _build_session(monkeypatch, tmp_path)
+    try:
+        job_id = _seed_submitted_connect(setup_session)
+    finally:
+        setup_session.close()
+
+    # Widen the window between "load job" and "claim job" so both workers
+    # race on the same pending row. Without the CAS fix both threads pass
+    # the pending-status check and both invoke the adapter, leaving duplicate
+    # secure records / runtime accounts behind.
+    gate = threading.Barrier(2, timeout=5)
+    original_load_payload = EDSAccountVerificationService._load_payload_record
+
+    def gated_load_payload(self, connect_session):
+        try:
+            gate.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return original_load_payload(self, connect_session)
+
+    monkeypatch.setattr(
+        EDSAccountVerificationService,
+        "_load_payload_record",
+        gated_load_payload,
+    )
+
+    results: list[str] = []
+    adapter_calls: list[str] = []
+    errors: list[BaseException] = []
+
+    class CountingAdapter:
+        async def verify_account(
+            self,
+            *,
+            account_key: str,
+            login: str,
+            password: str,
+        ) -> VerificationResult:
+            adapter_calls.append(account_key)
+            return VerificationResult(login_masked="5047***341")
+
+    def worker() -> None:
+        engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+        session = sessionmaker(bind=engine)()
+        try:
+            service = EDSAccountVerificationService(
+                session,
+                telegram_client=FakeTelegramClient(),
+                adapter=CountingAdapter(),
+            )
+            result = asyncio.run(service.process_job(job_id))
+            results.append(result)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            session.close()
+            engine.dispose()
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    t2.start()
+    t1.join(10)
+    t2.join(10)
+
+    assert not errors, f"worker raised: {errors}"
+    assert len(results) == 2
+
+    # Verify DB state is consistent: exactly one success, one skip; only
+    # one runtime account / credential record was created.
+    verify_engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    verify_session = sessionmaker(bind=verify_engine)()
+    try:
+        runtime_accounts = verify_session.query(EDSAccount).all()
+        credential_records = (
+            verify_session.query(SecureRecord)
+            .filter(SecureRecord.record_type == "eds_account_credentials")
+            .all()
+        )
+        tenant_accounts = verify_session.query(TenantEDSAccount).all()
+        job = verify_session.query(Job).one()
+    finally:
+        verify_session.close()
+        verify_engine.dispose()
+
+    assert len(adapter_calls) == 1, f"adapter was called {len(adapter_calls)} times"
+    assert results.count("completed") == 1
+    # Loser should report that the job was already claimed.
+    assert results.count("claimed_by_other") == 1
+    assert len(runtime_accounts) == 1
+    assert len(credential_records) == 1
+    assert len(tenant_accounts) == 1
+    assert job.status == "completed"
 
 
 def _build_session(monkeypatch, tmp_path):

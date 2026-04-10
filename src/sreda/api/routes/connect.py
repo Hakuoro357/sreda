@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from html import escape
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
-from sreda.config.settings import get_settings
+from sreda.api.deps import enforce_connect_rate_limit
+from sreda.config.settings import Settings, get_settings
 from sreda.db.session import get_db_session
 from sreda.integrations.telegram.client import TelegramClient
 from sreda.services.eds_account_verification import EDSAccountVerificationService
@@ -19,7 +20,46 @@ router = APIRouter(tags=["connect"])
 logger = logging.getLogger(__name__)
 
 
-@router.get("/connect/eds/{token}", response_class=HTMLResponse)
+def _enforce_same_origin(request: Request, settings: Settings) -> None:
+    """Reject cross-origin POSTs to the connect form.
+
+    Real browsers always send ``Origin`` on POST requests since the
+    Fetch spec landed in every evergreen engine, so an Origin that
+    does not match the public base URL means the request originated
+    from a different site (classic CSRF). A missing ``Origin`` is
+    accepted for server-side clients and tests — browsers never omit
+    it on same-origin POSTs that our rendered form triggers, so the
+    relaxation does not widen the browser attack surface.
+    """
+
+    origin = request.headers.get("origin")
+    if origin is None:
+        return
+    expected_base = (settings.connect_public_base_url or "").strip().rstrip("/")
+    if not expected_base:
+        return
+    try:
+        expected = urlsplit(expected_base)
+        actual = urlsplit(origin.rstrip("/"))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="origin_invalid") from exc
+    if (
+        expected.scheme != actual.scheme
+        or expected.hostname != actual.hostname
+        or (expected.port or None) != (actual.port or None)
+    ):
+        logger.warning(
+            "connect form POST rejected: cross-origin submission (origin=%s)",
+            origin,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="origin_mismatch")
+
+
+@router.get(
+    "/connect/eds/{token}",
+    response_class=HTMLResponse,
+    dependencies=[Depends(enforce_connect_rate_limit)],
+)
 def open_eds_connect_form(
     token: str,
     session: Session = Depends(get_db_session),
@@ -38,13 +78,18 @@ def open_eds_connect_form(
     )
 
 
-@router.post("/connect/eds/{token}", response_class=HTMLResponse)
+@router.post(
+    "/connect/eds/{token}",
+    response_class=HTMLResponse,
+    dependencies=[Depends(enforce_connect_rate_limit)],
+)
 async def submit_eds_connect_form(
     token: str,
     request: Request,
     session: Session = Depends(get_db_session),
 ) -> HTMLResponse:
     settings = get_settings()
+    _enforce_same_origin(request, settings)
     service = EDSConnectService(session, settings)
     body = await request.body()
     parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)

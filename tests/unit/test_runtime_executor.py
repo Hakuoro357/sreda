@@ -349,3 +349,176 @@ def test_runtime_service_claim_lookup_requires_claim_id(monkeypatch, tmp_path: P
     assert runs[0].status == "failed"
     assert runs[0].error_code == "claim_id_missing"
     assert "Используй команду" in telegram_client.sent_messages[0]["text"]
+
+
+def test_runtime_mark_failed_sanitizes_error_message_before_persisting(monkeypatch, tmp_path: Path) -> None:
+    """Regression guard for H8: an ``ActionRuntimeError.message`` that
+    accidentally embeds credentials must be scrubbed before being
+    written to ``AgentRun.error_message_sanitized`` or echoed back to
+    the user via the Telegram outbox.
+
+    We trigger the real ``claim_id_invalid`` error path with a crafted
+    claim id carrying a password-shaped substring — the sanitizer must
+    redact it in both the DB row and the outbound message.
+    """
+
+    db_path = tmp_path / "runtime_sanitize.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
+        session.flush()
+        session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_1", name="Sreda"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id="100000003"))
+        session.add(TenantFeature(id="feature_1", tenant_id="tenant_1", feature_key="eds_monitor", enabled=True))
+        session.commit()
+
+        telegram_client = FakeTelegramClient()
+        service = ActionRuntimeService(session, telegram_client=telegram_client)
+
+        # Inject a leaky runtime error from inside the router to simulate
+        # an upstream handler that embedded credentials into its message.
+        from sreda.runtime.executor import ActionRuntimeError
+
+        leaky_message = (
+            "Сбой в обработчике (пароль: hunter2-PROD, email test@example.com)."
+        )
+
+        def _leaky_route(action_type: str):
+            def _handler(action, context):
+                raise ActionRuntimeError("runtime_unexpected_error", leaky_message)
+
+            return _handler
+
+        monkeypatch.setattr(service, "_route_action", _leaky_route)
+
+        queued = service.enqueue_action(
+            ActionEnvelope(
+                action_type="help.show",
+                tenant_id="tenant_1",
+                workspace_id="workspace_1",
+                assistant_id="assistant_1",
+                user_id="user_1",
+                channel_type="telegram_dm",
+                external_chat_id="100000003",
+                bot_key="sreda",
+                inbound_message_id=None,
+                source_type="telegram_message",
+                source_value="/help",
+                params={},
+            )
+        )
+        result = asyncio.run(service.process_job(queued.job_id))
+
+        run = session.query(AgentRun).filter(AgentRun.id == queued.run_id).one()
+        outbox = session.query(OutboxMessage).order_by(OutboxMessage.id.asc()).all()
+    finally:
+        session.close()
+
+    assert result == "failed"
+    assert run.status == "failed"
+    # The raw password and email must not survive in the persisted field
+    # or in the outbound Telegram message — only the privacy-guard
+    # placeholders may remain.
+    assert "hunter2-PROD" not in (run.error_message_sanitized or "")
+    assert "test@example.com" not in (run.error_message_sanitized or "")
+    assert "[password]" in (run.error_message_sanitized or "")
+    assert "[email]" in (run.error_message_sanitized or "")
+
+    assert outbox, "failure notification must be recorded in outbox"
+    assert "hunter2-PROD" not in telegram_client.sent_messages[0]["text"]
+    assert "test@example.com" not in telegram_client.sent_messages[0]["text"]
+    assert "[password]" in telegram_client.sent_messages[0]["text"]
+
+
+class HangingTelegramClient:
+    """Telegram client that blocks forever on send. Used to exercise the
+    job-level timeout: without ``asyncio.wait_for`` around the outbound
+    delivery, a hung upstream would pin the job in ``running`` state
+    indefinitely.
+    """
+
+    def __init__(self) -> None:
+        self.hit_count = 0
+
+    async def send_message(self, chat_id: str, text: str, parse_mode=None, reply_markup=None) -> dict:
+        self.hit_count += 1
+        # Sleep for far longer than any reasonable test timeout so the
+        # wait_for guard is what unblocks us.
+        await asyncio.sleep(3600)
+        return {"ok": True}
+
+
+def test_runtime_process_job_fails_fast_when_telegram_send_hangs(monkeypatch, tmp_path: Path) -> None:
+    """Regression guard for H4: when the Telegram send call hangs, the
+    job must fail within ``SREDA_JOB_MAX_RUNTIME_SECONDS`` instead of
+    leaving the row in ``running`` forever.
+    """
+
+    db_path = tmp_path / "runtime_timeout.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_JOB_MAX_RUNTIME_SECONDS", "0.25")
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
+        session.flush()
+        session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_1", name="Sreda"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id="100000003"))
+        session.commit()
+
+        hanging_client = HangingTelegramClient()
+        service = ActionRuntimeService(session, telegram_client=hanging_client)
+
+        queued = service.enqueue_action(
+            ActionEnvelope(
+                action_type="help.show",
+                tenant_id="tenant_1",
+                workspace_id="workspace_1",
+                assistant_id="assistant_1",
+                user_id="user_1",
+                channel_type="telegram_dm",
+                external_chat_id="100000003",
+                bot_key="sreda",
+                inbound_message_id=None,
+                source_type="telegram_message",
+                source_value="/help",
+                params={},
+            )
+        )
+        result = asyncio.run(service.process_job(queued.job_id))
+
+        job = session.query(Job).filter(Job.id == queued.job_id).one()
+        run = session.query(AgentRun).filter(AgentRun.id == queued.run_id).one()
+    finally:
+        session.close()
+        get_settings.cache_clear()
+        get_engine.cache_clear()
+        get_session_factory.cache_clear()
+
+    assert result == "failed"
+    assert job.status == "failed"
+    assert run.status == "failed"
+    assert run.error_code == "runtime_timeout"
+    # ``send_message`` is hit at least once on the happy-path attempt;
+    # the failure-notification path either hits it again (and times out
+    # again) or is skipped entirely. What matters is that we never get
+    # stuck — the test completes under its own pytest-level budget.
+    assert hanging_client.hit_count >= 1

@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from sreda.config.settings import get_settings
 from sreda.db.models.eds_monitor import EDSAccount
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import Job, SecureRecord, User
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.services.billing import BillingService, STATUS_CALLBACK, SUBSCRIPTIONS_CALLBACK
+from sreda.services.privacy_guard import get_default_privacy_guard
 from sreda.services.secure_storage import load_secure_json, store_secure_json
 
 RETRY_CONNECT_PRIMARY_CALLBACK = "eds:retry_connect:primary"
@@ -196,14 +200,53 @@ class EDSAccountVerificationService:
             await self._send_failure_message(connect_session, tenant_account=None)
             return "failed"
 
-        job.status = "running"
+        # Compare-and-set claim: flip ``status`` from ``pending`` to
+        # ``running`` in a single UPDATE so concurrent workers race on a
+        # row-level write instead of on the stale ORM snapshot we loaded
+        # above. The loser sees rowcount == 0 and bails out before calling
+        # the verification adapter, preventing duplicate secure records,
+        # runtime accounts, and Telegram notifications.
+        claim = self.session.execute(
+            update(Job)
+            .where(Job.id == job.id)
+            .where(Job.status == "pending")
+            .values(status="running")
+        )
+        if claim.rowcount != 1:
+            self.session.rollback()
+            return "claimed_by_other"
         self.session.commit()
+        # Expire the in-memory job object so the subsequent ORM updates
+        # below apply to the same row we just claimed rather than
+        # re-writing a stale snapshot on commit.
+        self.session.expire(job)
 
+        # H4: wall-clock budget for the external EDS call. A hung
+        # adapter (network stall, upstream outage) must not pin the job
+        # in ``running`` forever. We translate the timeout into a
+        # non-retryable ``verification_timeout`` failure so the normal
+        # failure path finalizes the job and notifies the user.
+        timeout_seconds = max(get_settings().job_max_runtime_seconds, 0.001)
         try:
-            result = await self.adapter.verify_account(
-                account_key=tenant_account.id,
-                login=login,
-                password=password,
+            result = await asyncio.wait_for(
+                self.adapter.verify_account(
+                    account_key=tenant_account.id,
+                    login=login,
+                    password=password,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timeout_error = VerificationError(
+                "verification_timeout",
+                "Проверка кабинета не успела завершиться. Попробуй еще раз позже.",
+                retryable=False,
+            )
+            return await self._handle_verification_error(
+                job=job,
+                connect_session=connect_session,
+                tenant_account=tenant_account,
+                error=timeout_error,
             )
         except VerificationError as exc:
             return await self._handle_verification_error(
@@ -388,11 +431,19 @@ class EDSAccountVerificationService:
         error_code: str,
         error_message: str,
     ) -> None:
+        # H8: the ``*_error_message_sanitized`` columns promise sanitized
+        # content, but upstream adapters (and our own code) occasionally
+        # embed credentials, tokens, or phone numbers into exception
+        # text. Scrub everything through the shared RegexPrivacyGuard
+        # before it reaches the DB so the field name matches the
+        # contents — and so the failure notification we ship to the
+        # user via Telegram cannot echo secrets back.
+        sanitized_message = _sanitize_error_message(error_message)
         now = _utcnow()
         connect_session.status = "failed"
         connect_session.failed_at = now
         connect_session.error_code = error_code
-        connect_session.error_message_sanitized = error_message
+        connect_session.error_message_sanitized = sanitized_message
         connect_session.updated_at = now
 
         if tenant_account is not None:
@@ -403,7 +454,7 @@ class EDSAccountVerificationService:
             else:
                 tenant_account.status = "pending_verification"
             tenant_account.last_error_code = error_code
-            tenant_account.last_error_message_sanitized = error_message
+            tenant_account.last_error_message_sanitized = sanitized_message
             tenant_account.updated_at = now
 
         job.status = "failed"
@@ -504,6 +555,22 @@ def _extract_attempts(payload_json: str) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _sanitize_error_message(message: str) -> str:
+    """Pass an error string through the shared privacy guard.
+
+    Failure codes come from a fixed allow-list, but the human-readable
+    ``error_message_sanitized`` text can originate from upstream
+    exceptions that embed secrets (the EDS adapter, our own f-strings,
+    ``str(exc)`` fallbacks). This helper guarantees the column contents
+    always match the column name, and is cheap to call on every write.
+    """
+
+    result = get_default_privacy_guard().sanitize_text(message)
+    if result is None:
+        return ""
+    return result.sanitized_text
 
 
 def _mask_login(login: str) -> str:

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from sreda.config.settings import Settings
@@ -135,6 +136,30 @@ class EDSConnectService:
                 "Нет свободного лимита кабинетов.",
                 status_code=409,
             )
+
+        # Compare-and-set claim: flip ``used_at`` from NULL to now in a single
+        # UPDATE so concurrent submitters race on a row-level lock instead of
+        # on the ORM check above. The loser sees rowcount == 0 and bails out
+        # before any state-changing work happens, so no duplicate account,
+        # job, or secure record can be created.
+        claim_ts = _utcnow()
+        claim_result = self.session.execute(
+            update(ConnectSession)
+            .where(ConnectSession.id == connect_session.id)
+            .where(ConnectSession.used_at.is_(None))
+            .values(used_at=claim_ts, updated_at=claim_ts)
+        )
+        if claim_result.rowcount != 1:
+            self.session.rollback()
+            raise ConnectSessionError(
+                "session_used",
+                "Эта ссылка уже использована.",
+                status_code=410,
+            )
+        # Make the in-memory ORM object see the claim we just persisted so
+        # the final state update below UPDATEs the same row rather than
+        # re-applying a stale snapshot.
+        self.session.expire(connect_session)
 
         secure_record = store_secure_json(
             self.session,

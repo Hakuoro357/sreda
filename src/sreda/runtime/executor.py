@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from sreda.config.settings import get_settings
@@ -22,6 +24,7 @@ from sreda.services.billing import (
 from sreda.services.claim_lookup import ClaimLookupService, is_valid_claim_id
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.onboarding import build_connect_eds_message
+from sreda.services.privacy_guard import get_default_privacy_guard
 
 AGENT_EXECUTE_ACTION_JOB = "agent.execute_action"
 
@@ -129,11 +132,37 @@ class ActionRuntimeService:
             self.session.commit()
             return "completed"
 
+        # Compare-and-set claim: atomically flip ``status`` from ``pending``
+        # to ``running`` so concurrent workers race on a row-level write
+        # instead of on the ORM snapshot. The loser bails out before any
+        # handler runs, preventing duplicate outbox messages and repeat
+        # side effects.
+        #
+        # H3: we piggy-back the ``run`` row update on top of the same
+        # transaction so the claim and the ``run.status=running`` flip
+        # commit together instead of as two separate round-trips.
+        claim = self.session.execute(
+            update(Job)
+            .where(Job.id == job.id)
+            .where(Job.status == "pending")
+            .values(status="running")
+        )
+        if claim.rowcount != 1:
+            self.session.rollback()
+            return "claimed_by_other"
+        self.session.expire(job)
         now = _utcnow()
-        job.status = "running"
         run.status = "running"
         run.started_at = run.started_at or now
         self.session.commit()
+
+        # H4: wall-clock budget for network-bound work so a hung Telegram
+        # send (the only ``await`` in the happy path) cannot pin the job
+        # in ``running`` indefinitely. We map ``TimeoutError`` to a
+        # ``runtime_timeout`` failure and let the existing ``_mark_failed``
+        # path finalize the row; that call is itself guarded so a hang
+        # during the failure notification still releases the job.
+        timeout_seconds = max(get_settings().job_max_runtime_seconds, 0.001)
 
         action: ActionEnvelope | None = None
         context: dict[str, Any] | None = None
@@ -143,16 +172,19 @@ class ActionRuntimeService:
             handler = self._route_action(action.action_type)
             self._policy_guard(action, context)
             replies = handler(action, context)
-            await self._persist_and_enqueue_replies(
-                job=job,
-                run=run,
-                action=action,
-                context=context,
-                replies=replies,
+            await asyncio.wait_for(
+                self._persist_and_enqueue_replies(
+                    job=job,
+                    run=run,
+                    action=action,
+                    context=context,
+                    replies=replies,
+                ),
+                timeout=timeout_seconds,
             )
             return "completed"
         except ActionRuntimeError as exc:
-            await self._mark_failed(
+            await self._mark_failed_with_timeout(
                 job=job,
                 run=run,
                 action=action,
@@ -160,10 +192,35 @@ class ActionRuntimeService:
                 error_code=exc.code,
                 message=exc.message,
                 reply_markup=exc.reply_markup,
+                timeout_seconds=timeout_seconds,
+            )
+            return "failed"
+        except asyncio.TimeoutError:
+            # Primary handler timed out mid-flight — the session may
+            # hold a partially-applied outbox row that was flushed but
+            # not committed. Drop it before we try to write the failure
+            # state so ``_mark_failed`` starts from a clean snapshot.
+            self.session.rollback()
+            # Re-attach the ORM objects we still need after the rollback.
+            refreshed_job = self.session.get(Job, job.id)
+            refreshed_run = self.session.get(AgentRun, run.id)
+            if refreshed_job is not None:
+                job = refreshed_job
+            if refreshed_run is not None:
+                run = refreshed_run
+            await self._mark_failed_with_timeout(
+                job=job,
+                run=run,
+                action=action,
+                context=context,
+                error_code="runtime_timeout",
+                message="Действие отменено по таймауту.",
+                reply_markup=None,
+                timeout_seconds=timeout_seconds,
             )
             return "failed"
         except Exception:
-            await self._mark_failed(
+            await self._mark_failed_with_timeout(
                 job=job,
                 run=run,
                 action=action,
@@ -171,8 +228,56 @@ class ActionRuntimeService:
                 error_code="runtime_unexpected_error",
                 message="Не удалось выполнить действие из-за технической ошибки.",
                 reply_markup=None,
+                timeout_seconds=timeout_seconds,
             )
             return "failed"
+
+    async def _mark_failed_with_timeout(
+        self,
+        *,
+        job: Job,
+        run: AgentRun,
+        action: ActionEnvelope | None,
+        context: dict[str, Any] | None,
+        error_code: str,
+        message: str,
+        reply_markup: dict | None,
+        timeout_seconds: float,
+    ) -> None:
+        # If the failure notification itself hangs, we still have to
+        # finalize the job row. Persist the failure state in the DB
+        # first, then try to ship the outbound message under a tight
+        # budget, and on timeout downgrade the outbound delivery to
+        # ``pending`` so the outbox worker can retry it later.
+        try:
+            await asyncio.wait_for(
+                self._mark_failed(
+                    job=job,
+                    run=run,
+                    action=action,
+                    context=context,
+                    error_code=error_code,
+                    message=message,
+                    reply_markup=reply_markup,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            # Best-effort finalize: the hung client has already been
+            # abandoned, but we still need the job row to leave the
+            # ``running`` state so workers can move on.
+            self.session.rollback()
+            job_row = self.session.get(Job, job.id)
+            if job_row is not None and job_row.status != "failed":
+                job_row.status = "failed"
+            run_row = self.session.get(AgentRun, run.id)
+            if run_row is not None:
+                run_row.status = "failed"
+                run_row.error_code = error_code
+                # H8: route through the privacy guard before persisting.
+                run_row.error_message_sanitized = _sanitize_error_message(message)
+                run_row.finished_at = _utcnow()
+            self.session.commit()
 
     def _get_or_create_thread(self, action: ActionEnvelope) -> AgentThread:
         thread = (
@@ -534,6 +639,12 @@ class ActionRuntimeService:
         message: str,
         reply_markup: dict | None,
     ) -> None:
+        # H8: sanitize the error text once, at the top of the failure
+        # path, and use the scrubbed version everywhere downstream — the
+        # outbox payload, the Telegram send, the ``error_message_sanitized``
+        # column. This keeps credentials out of the DB *and* prevents
+        # us from echoing them back to the user.
+        sanitized_message = _sanitize_error_message(message)
         outbox_ids: list[str] = []
         outbox_statuses: list[str] = []
         if action is not None:
@@ -546,7 +657,7 @@ class ActionRuntimeService:
                 payload_json=json.dumps(
                     {
                         "chat_id": action.external_chat_id,
-                        "text": message,
+                        "text": sanitized_message,
                         "reply_markup": reply_markup,
                     },
                     ensure_ascii=False,
@@ -558,7 +669,7 @@ class ActionRuntimeService:
                 try:
                     await self.telegram_client.send_message(
                         chat_id=action.external_chat_id,
-                        text=message,
+                        text=sanitized_message,
                         reply_markup=reply_markup,
                     )
                     outbox.status = "sent"
@@ -581,9 +692,27 @@ class ActionRuntimeService:
             ensure_ascii=False,
         )
         run.error_code = error_code
-        run.error_message_sanitized = message
+        run.error_message_sanitized = sanitized_message
         run.finished_at = now
         self.session.commit()
+
+
+def _sanitize_error_message(message: str) -> str:
+    """Pass an error string through the shared privacy guard.
+
+    ``_mark_failed`` and ``_mark_failed_with_timeout`` both write the
+    error text into ``AgentRun.error_message_sanitized`` (column name
+    promises sanitization) and into the outbound Telegram message.
+    Upstream handlers or ``ActionRuntimeError`` constructors can
+    accidentally embed secrets (tokens, passwords, account numbers);
+    this helper guarantees the column contents always match the
+    column name and keeps credentials out of user-visible replies.
+    """
+
+    result = get_default_privacy_guard().sanitize_text(message)
+    if result is None:
+        return ""
+    return result.sanitized_text
 
 
 def _extract_run_id(payload_json: str) -> str | None:

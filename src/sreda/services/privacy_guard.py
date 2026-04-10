@@ -104,20 +104,27 @@ def _replace_group_value(entity_type: str, replacement: str, *, prefix_group: in
 
 
 _RULES: list[tuple[re.Pattern[str], Any]] = [
+    # NOTE: the credential/label rules require the "value" group to be
+    # at least 3 non-space characters. Without this guard the regex
+    # happily eats Russian conjunctions and sentence terminators — e.g.
+    # "Проверь логин и пароль." becomes "Проверь логин [login][password]",
+    # corrupting legitimate natural-language error messages that happen
+    # to mention the words ``логин``/``пароль``. Real credentials are
+    # always longer than 2 characters, so this threshold is safe.
     (
-        re.compile(r"(?i)(\b(?:пароль|password)\b\s*[:=]?\s*)([^\s,;]+)"),
+        re.compile(r"(?i)(\b(?:пароль|password)\b\s*[:=]?\s*)([^\s,;]{3,})"),
         _replace_group_value("password", "[password]"),
     ),
     (
-        re.compile(r"(?i)(\b(?:логин|login)\b\s*[:=]?\s*)([^\s,;]+)"),
+        re.compile(r"(?i)(\b(?:логин|login)\b\s*[:=]?\s*)([^\s,;]{3,})"),
         _replace_group_value("login", "[login]"),
     ),
     (
-        re.compile(r"(?i)(\b(?:код\s+подтверждения|verification\s+code|код)\b\s*[:=]?\s*)([^\s,;]+)"),
+        re.compile(r"(?i)(\b(?:код\s+подтверждения|verification\s+code|код)\b\s*[:=]?\s*)([^\s,;]{3,})"),
         _replace_group_value("verification_code", "[verification_code]"),
     ),
     (
-        re.compile(r"(?i)(\b(?:номер\s+лицевого\s+сч[её]та)\b\s*[:=]?\s*)([^\s,;]+)"),
+        re.compile(r"(?i)(\b(?:номер\s+лицевого\s+сч[её]та)\b\s*[:=]?\s*)([^\s,;]{3,})"),
         _replace_group_value("account_number", "[account_number]"),
     ),
     (
@@ -125,7 +132,7 @@ _RULES: list[tuple[re.Pattern[str], Any]] = [
         _replace_group_value("account_number", "[account_number]"),
     ),
     (
-        re.compile(r"(?i)(\b(?:bearer|token|api[_ -]?key|secret)\b\s*[:=]?\s*)([^\s,;]+)"),
+        re.compile(r"(?i)(\b(?:bearer|token|api[_ -]?key|secret)\b\s*[:=]?\s*)([^\s,;]{3,})"),
         _replace_group_value("secret", "[secret]"),
     ),
     (
