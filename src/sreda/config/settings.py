@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     # ``running`` forever.
     job_max_runtime_seconds: float = 120.0
 
+    # Опциональный путь к файлу для structured JSON-лога неудачных
+    # попыток подключения EDS-ЛК (для post-mortem анализа). Одна
+    # запись — одна строка JSON с timestamp, tenant_id, login_masked,
+    # error_code, underlying exception. Если None — лог в файл не
+    # ведётся (данные всё равно попадают в обычный logger).
+    failed_connect_log_path: str | None = None
+
     # Per-IP rate limits for public endpoints. These are defence-in-depth
     # on top of any reverse-proxy limiting that might be in front: they
     # guarantee a floor of protection for single-process deployments and

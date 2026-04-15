@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import threading
 
 from sqlalchemy import create_engine
@@ -165,16 +166,16 @@ def test_failure_persists_sanitized_error_message_not_raw_password(monkeypatch, 
         asyncio.run(service.process_job(job_id))
 
         connect_session = session.query(ConnectSession).one()
-        tenant_account = session.query(TenantEDSAccount).one()
+        tenant_accounts = session.query(TenantEDSAccount).all()
     finally:
         session.close()
 
-    # The raw password must NOT appear in any persisted or outbound
-    # field — only the placeholders from RegexPrivacyGuard may survive.
+    # Non-retryable auth failure удаляет tenant_eds_account (slot
+    # освобождается). Санитизация проверяется на единственном
+    # сохранившемся канале — connect_session + Telegram-сообщение.
+    assert tenant_accounts == []
     assert "super-secret" not in (connect_session.error_message_sanitized or "")
-    assert "super-secret" not in (tenant_account.last_error_message_sanitized or "")
     assert "5047136341" not in (connect_session.error_message_sanitized or "")
-    assert "5047136341" not in (tenant_account.last_error_message_sanitized or "")
     assert "[password]" in (connect_session.error_message_sanitized or "")
     assert "[login]" in (connect_session.error_message_sanitized or "")
 
@@ -206,7 +207,7 @@ def test_verification_process_job_fails_fast_when_adapter_hangs(monkeypatch, tmp
         result = asyncio.run(service.process_job(job_id))
 
         connect_session = session.query(ConnectSession).one()
-        tenant_account = session.query(TenantEDSAccount).one()
+        tenant_accounts = session.query(TenantEDSAccount).all()
         job = session.query(Job).one()
     finally:
         session.close()
@@ -216,7 +217,9 @@ def test_verification_process_job_fails_fast_when_adapter_hangs(monkeypatch, tmp
     assert job.status == "failed"
     assert connect_session.status == "failed"
     assert connect_session.error_code == "verification_timeout"
-    assert tenant_account.status == "pending_verification"
+    # verification_timeout — non-retryable (см. NON_RETRYABLE_CLEANUP_CODES),
+    # tenant_eds_account удаляется, slot освобождается.
+    assert tenant_accounts == []
 
 
 def test_duplicate_login_does_not_create_second_active_account(monkeypatch, tmp_path) -> None:
@@ -248,9 +251,11 @@ def test_duplicate_login_does_not_create_second_active_account(monkeypatch, tmp_
 
     assert first_result == "completed"
     assert second_result == "failed"
-    assert len(tenant_accounts) == 2
+    # duplicate_login non-retryable → extra tenant_eds_account удаляется,
+    # slot освобождается. Остаётся только primary (active).
+    assert len(tenant_accounts) == 1
     assert tenant_accounts[0].status == "active"
-    assert tenant_accounts[1].status == "duplicate_login"
+    assert tenant_accounts[0].account_role == "primary"
     assert len(runtime_accounts) == 1
     assert runtime_accounts[0].tenant_eds_account_id == tenant_accounts[0].id
     assert connect_sessions[-1].status == "failed"
@@ -258,6 +263,8 @@ def test_duplicate_login_does_not_create_second_active_account(monkeypatch, tmp_
     assert "уже подключен" in connect_sessions[-1].error_message_sanitized
     assert len(telegram_client.messages) == 2
     assert "уже подключен" in telegram_client.messages[-1]["text"]
+    # Retry-кнопка сохраняет slot_type=extra (взяли snapshot роли ДО
+    # cleanup), значит пользователь попадёт снова в extra-слот.
     assert (
         telegram_client.messages[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
         == "eds:retry_connect:extra"
@@ -319,7 +326,7 @@ def test_auth_failure_marks_account_failed_and_sends_retry(monkeypatch, tmp_path
         result = asyncio.run(service.process_job(job_id))
 
         connect_session = session.query(ConnectSession).one()
-        tenant_account = session.query(TenantEDSAccount).one()
+        tenant_accounts = session.query(TenantEDSAccount).all()
         job = session.query(Job).one()
     finally:
         session.close()
@@ -328,7 +335,10 @@ def test_auth_failure_marks_account_failed_and_sends_retry(monkeypatch, tmp_path
     assert job.status == "failed"
     assert connect_session.status == "failed"
     assert connect_session.error_code == "verification_auth_failed"
-    assert tenant_account.status == "auth_failed"
+    # Non-retryable failure → tenant_eds_account удаляется, slot
+    # освобождается. Retry-кнопка в Telegram создаст fresh row.
+    assert tenant_accounts == []
+    assert connect_session.tenant_eds_account_id is None
     assert len(telegram_client.messages) == 1
     assert "Проверь логин и пароль" in telegram_client.messages[0]["text"]
     assert (
@@ -562,6 +572,39 @@ def _build_test_settings():
 # Реальный прогон на продакшене упал именно на этом: одна попытка → failed,
 # пользователь видел "Не удалось завершить подключение из-за технической
 # ошибки" без шанса на retry.
+
+
+def test_failed_connect_log_path_writes_json_line(monkeypatch, tmp_path) -> None:
+    """Regression guard: когда ``SREDA_FAILED_CONNECT_LOG_PATH`` задан,
+    каждая неудачная попытка подключения должна записывать одну строку
+    JSON с метаданными для post-mortem разбора (тип исходного
+    exception, login_masked, error_code, account_role, attempts)."""
+
+    log_file = tmp_path / "failed-connect.log"
+    monkeypatch.setenv("SREDA_FAILED_CONNECT_LOG_PATH", str(log_file))
+    session = _build_session(monkeypatch, tmp_path)
+    try:
+        job_id = _seed_submitted_connect(session)
+        service = EDSAccountVerificationService(
+            session,
+            telegram_client=FakeTelegramClient(),
+            adapter=AuthFailAdapter(),
+        )
+        asyncio.run(service.process_job(job_id))
+    finally:
+        session.close()
+
+    assert log_file.exists(), "failed-connect log file must be created"
+    lines = log_file.read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["error_code"] == "verification_auth_failed"
+    assert record["account_role"] == "primary"
+    assert record["login_masked"] == "***41"
+    assert record["attempts"] == 1
+    assert record["tenant_id"] == "tenant_1"
+    assert "ts" in record
+    assert "connect_session_id" in record
 
 
 def _install_leak_client(monkeypatch, side_effect):

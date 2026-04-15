@@ -5,6 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol
 
 import httpx
@@ -27,6 +28,19 @@ AUTH_FAILURE_CODES = {"verification_auth_failed"}
 RETRY_LIMITS = {
     "verification_temporary_failed": 2,
     "verification_unknown_failed": 1,
+}
+
+# Коды, после которых ``tenant_eds_account`` уже не может быть оживлён
+# retry-ом в том же slot'е: либо credentials заведомо неверны, либо
+# исчерпан бюджет попыток. В этих случаях row удаляется (вместе с
+# associated secure_records и eds_accounts), чтобы слот освободился
+# и пользователь мог начать заново через "Подключить ЛК EDS".
+NON_RETRYABLE_CLEANUP_CODES = {
+    "verification_auth_failed",
+    "verification_timeout",
+    "verification_duplicate_login",
+    "verification_unknown_failed",
+    "secure_store_failed",
 }
 logger = logging.getLogger(__name__)
 
@@ -436,14 +450,24 @@ class EDSAccountVerificationService:
             self.session.commit()
             return "retry_scheduled"
 
+        # Снимаем snapshot роли ДО cleanup внутри _fail_verification —
+        # там строка tenant_eds_accounts может быть удалена, и после
+        # этого ``tenant_account.account_role`` нельзя читать надёжно.
+        account_role = tenant_account.account_role if tenant_account else None
         self._fail_verification(
             job=job,
             connect_session=connect_session,
             tenant_account=tenant_account,
             error_code=error.code,
             error_message=error.message,
+            underlying_exception=error.__cause__,
+            attempts=attempts,
         )
-        await self._send_failure_message(connect_session, tenant_account=tenant_account)
+        await self._send_failure_message(
+            connect_session,
+            tenant_account=None,  # после cleanup объект может быть deleted
+            account_role=account_role,
+        )
         return "failed"
 
     def _fail_verification(
@@ -454,23 +478,50 @@ class EDSAccountVerificationService:
         tenant_account: TenantEDSAccount | None,
         error_code: str,
         error_message: str,
+        underlying_exception: BaseException | None = None,
+        attempts: int = 0,
     ) -> None:
-        # H8: the ``*_error_message_sanitized`` columns promise sanitized
-        # content, but upstream adapters (and our own code) occasionally
-        # embed credentials, tokens, or phone numbers into exception
-        # text. Scrub everything through the shared RegexPrivacyGuard
-        # before it reaches the DB so the field name matches the
-        # contents — and so the failure notification we ship to the
-        # user via Telegram cannot echo secrets back.
+        # H8: sanitize outbound-visible text via RegexPrivacyGuard so
+        # credentials/tokens/phones from upstream exceptions cannot land
+        # in DB or in the Telegram notification.
         sanitized_message = _sanitize_error_message(error_message)
         now = _utcnow()
+
+        # Лог неудачного подключения — в файл (если задан путь в
+        # settings.failed_connect_log_path) и в общий logger. Нужен для
+        # post-mortem разбора: real exception message из ``__cause__``
+        # сохраняется целиком, без санитизации, ведь файл не уходит
+        # пользователю.
+        _log_failed_connection_record(
+            tenant_id=(tenant_account.tenant_id if tenant_account else connect_session.tenant_id),
+            tenant_eds_account_id=(tenant_account.id if tenant_account else None),
+            connect_session_id=connect_session.id,
+            account_role=(tenant_account.account_role if tenant_account else None),
+            login_masked=(tenant_account.login_masked if tenant_account else None),
+            error_code=error_code,
+            error_message=sanitized_message,
+            attempts=attempts,
+            underlying_exception=underlying_exception,
+        )
+
         connect_session.status = "failed"
         connect_session.failed_at = now
         connect_session.error_code = error_code
         connect_session.error_message_sanitized = sanitized_message
         connect_session.updated_at = now
 
-        if tenant_account is not None:
+        # Cleanup: non-retryable failures освобождают slot, удаляя
+        # tenant_eds_account + associated EDSAccount + credential
+        # SecureRecord. Retry-кнопка в Telegram вызывает
+        # ``eds.connect.retry`` → ``_build_connect_replies`` → fresh
+        # connect_link, так что retry продолжает работать и создаёт
+        # новую строку tenant_eds_accounts.
+        if tenant_account is not None and error_code in NON_RETRYABLE_CLEANUP_CODES:
+            self._cleanup_failed_tenant_account(tenant_account)
+        elif tenant_account is not None:
+            # Fallback на случай нового error_code вне CLEANUP set —
+            # сохраняем старое поведение (сохраняем row для возможного
+            # retry через тот же slot).
             if error_code in AUTH_FAILURE_CODES:
                 tenant_account.status = "auth_failed"
             elif error_code == "verification_duplicate_login":
@@ -483,6 +534,27 @@ class EDSAccountVerificationService:
 
         job.status = "failed"
         self.session.commit()
+
+    def _cleanup_failed_tenant_account(self, tenant_account: TenantEDSAccount) -> None:
+        """Удаляет tenant_eds_account + связанные EDSAccount и
+        credential secure records. Оставляет connect_session и job для
+        audit-истории (в connect_session уже записаны error_code и
+        failed_at). Освобождает slot в ``_list_occupied_accounts``.
+        """
+        self.session.query(EDSAccount).filter(
+            EDSAccount.tenant_eds_account_id == tenant_account.id
+        ).delete(synchronize_session=False)
+        self.session.query(SecureRecord).filter(
+            SecureRecord.record_type == "eds_account_credentials",
+            SecureRecord.record_key == tenant_account.id,
+        ).delete(synchronize_session=False)
+        # Разрываем FK из connect_sessions (ON DELETE RESTRICT по
+        # умолчанию в SQLAlchemy) — session остаётся, но больше не
+        # указывает на удалённую tenant_eds_account.
+        self.session.query(ConnectSession).filter(
+            ConnectSession.tenant_eds_account_id == tenant_account.id
+        ).update({"tenant_eds_account_id": None}, synchronize_session=False)
+        self.session.delete(tenant_account)
 
     async def _send_success_message(
         self,
@@ -526,16 +598,20 @@ class EDSAccountVerificationService:
         connect_session: ConnectSession,
         *,
         tenant_account: TenantEDSAccount | None,
+        account_role: str | None = None,
     ) -> None:
         chat_id = self._get_recipient_chat_id(connect_session.tenant_id)
         if self.telegram_client is None or chat_id is None:
             return
 
         text = connect_session.error_message_sanitized or "Не удалось завершить подключение из-за технической ошибки."
+        role = account_role
+        if role is None and tenant_account is not None:
+            role = tenant_account.account_role
         retry_callback = (
-            RETRY_CONNECT_PRIMARY_CALLBACK
-            if (tenant_account is None or tenant_account.account_role == "primary")
-            else RETRY_CONNECT_EXTRA_CALLBACK
+            RETRY_CONNECT_EXTRA_CALLBACK
+            if role == "extra"
+            else RETRY_CONNECT_PRIMARY_CALLBACK
         )
         try:
             await self.telegram_client.send_message(
@@ -579,6 +655,59 @@ def _extract_attempts(payload_json: str) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _log_failed_connection_record(
+    *,
+    tenant_id: str | None,
+    tenant_eds_account_id: str | None,
+    connect_session_id: str | None,
+    account_role: str | None,
+    login_masked: str | None,
+    error_code: str,
+    error_message: str,
+    attempts: int,
+    underlying_exception: BaseException | None,
+) -> None:
+    """Записывает одну JSON-строку в файл ``settings.failed_connect_log_path``
+    (если задан) плюс эмитит запись в стандартный logger.
+
+    В файл не попадает ничего PII-чувствительного: login_masked, error_code,
+    sanitized error message, plus тип и repr исходного exception (нужен
+    для разбора инцидентов — например, чтобы отличить ReadTimeout vs
+    HTTPStatusError). Если файл недоступен — просто warn в log.
+    """
+
+    record = {
+        "ts": datetime.now(UTC).isoformat(),
+        "tenant_id": tenant_id,
+        "tenant_eds_account_id": tenant_eds_account_id,
+        "connect_session_id": connect_session_id,
+        "account_role": account_role,
+        "login_masked": login_masked,
+        "error_code": error_code,
+        "error_message_sanitized": error_message,
+        "attempts": attempts,
+        "underlying_exception_type": (
+            type(underlying_exception).__name__ if underlying_exception is not None else None
+        ),
+        "underlying_exception_message": (
+            str(underlying_exception) if underlying_exception is not None else None
+        ),
+    }
+
+    logger.warning("eds_connect_failed %s", record)
+
+    path_value = get_settings().failed_connect_log_path
+    if not path_value:
+        return
+    try:
+        path = Path(path_value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.error("failed to append to failed-connect log %s: %s", path_value, exc)
 
 
 def _sanitize_error_message(message: str) -> str:
