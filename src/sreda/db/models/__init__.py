@@ -18,6 +18,7 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
+from sreda.db.models.memory import AssistantMemory
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.db.models.skill_platform import (
     SkillAIExecution,
@@ -37,6 +38,7 @@ __all__ = [
     "AgentRun",
     "AgentThread",
     "Assistant",
+    "AssistantMemory",
     "ConnectSession",
     "PaymentOrder",
     "PaymentOrderItem",

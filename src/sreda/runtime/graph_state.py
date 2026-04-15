@@ -34,6 +34,12 @@ class AssistantGraphState(TypedDict, total=False):
     profile: dict[str, Any]
     skill_configs: list[dict[str, Any]]
 
+    # Populated by ``load_memories`` node (Phase 3). Top-k memory hits
+    # for the current query; only set for conversational actions
+    # (``conversation.chat``). Each entry: ``{id, tier, content,
+    # score, source}``.
+    memories: list[dict[str, Any]]
+
     # Populated by ``execute_action`` node on success.
     replies: list[dict[str, Any]]  # [{"text": ..., "reply_markup": ...}]
 

@@ -92,9 +92,17 @@ class ActionRuntimeService:
         session: Session,
         *,
         telegram_client: TelegramClient | None = None,
+        llm_client: object | None = None,
+        embedding_client: object | None = None,
     ) -> None:
         self.session = session
         self.telegram_client = telegram_client
+        # ``llm_client`` / ``embedding_client`` are optional — when
+        # ``None``, handlers fall through to the settings-based factories
+        # (``get_chat_llm`` / ``get_embeddings_client``). Tests inject
+        # fakes here to avoid live provider calls.
+        self.llm_client = llm_client
+        self.embedding_client = embedding_client
         self._graph = get_assistant_graph()
 
     # ------------------------------------------------------------- enqueue
@@ -220,6 +228,8 @@ class ActionRuntimeService:
                 "thread_id": thread_id,
                 "session": self.session,
                 "telegram_client": self.telegram_client,
+                "llm_client": self.llm_client,
+                "embedding_client": self.embedding_client,
             }
         }
 

@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models import AgentRun
 from sreda.db.models.core import Job, OutboxMessage, TenantFeature
+from sreda.db.repositories.memory import MemoryRepository
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.delivery_policy import DeliveryKind, decide_delivery
@@ -49,6 +50,7 @@ from sreda.runtime.graph_state import AssistantGraphState
 from sreda.runtime.handlers import HANDLERS, ActionRuntimeError, RuntimeReply
 from sreda.runtime.policy import evaluate_policy
 from sreda.services.billing import BillingService
+from sreda.services.embeddings import EmbeddingClient
 from sreda.services.privacy_guard import get_default_privacy_guard
 
 
@@ -166,6 +168,67 @@ def node_load_profile(state: AssistantGraphState, config: RunnableConfig) -> dic
     return {"profile": profile_dict, "skill_configs": skill_config_dicts}
 
 
+def node_load_memories(state: AssistantGraphState, config: RunnableConfig) -> dict:
+    """Retrieve top-k relevant memories for conversational actions.
+
+    Only fires for ``conversation.chat`` — deterministic commands
+    (``help.show``, ``/profile``, etc.) don't benefit from semantic
+    memory recall and we want to keep their latency flat.
+
+    Embedding client is resolved via ``config.configurable`` (tests
+    inject fakes) or the settings factory (prod). If embeddings are
+    disabled, we skip recall silently — the conversation handler will
+    still work, just without any prior context.
+    """
+    action = _action(state)
+    if action.action_type != "conversation.chat":
+        return {"memories": []}
+
+    query_text = str(action.params.get("text") or "").strip()
+    if not query_text or not action.user_id:
+        return {"memories": []}
+
+    session = _session(config)
+    embedding_client: EmbeddingClient | None = config["configurable"].get(
+        "embedding_client"
+    )
+    if embedding_client is None:
+        # Factory fallback — allow_fake=True keeps dev ergonomics when
+        # LM Studio isn't running; prod should always configure a real
+        # embeddings endpoint.
+        from sreda.services.embeddings import get_embeddings_client
+
+        embedding_client = get_embeddings_client(allow_fake=True)
+
+    try:
+        query_vec = embedding_client.embed_query(query_text)
+    except Exception:
+        # Embeddings down → skip, don't block the conversation.
+        return {"memories": []}
+
+    repo = MemoryRepository(session)
+    hits = repo.recall(
+        action.tenant_id, action.user_id, query_vec, top_k=10, min_score=0.1
+    )
+    # Touch access counts for returned memories — useful signal for
+    # future recency boosts and eviction policies.
+    for hit in hits:
+        repo.touch_accessed(hit.memory.id)
+
+    return {
+        "memories": [
+            {
+                "id": hit.memory.id,
+                "tier": hit.memory.tier,
+                "content": hit.memory.content,
+                "score": round(hit.score, 4),
+                "source": hit.memory.source,
+            }
+            for hit in hits
+        ]
+    }
+
+
 def node_policy_guard(state: AssistantGraphState, config: RunnableConfig) -> dict:
     action = _action(state)
     context = state.get("context") or {}
@@ -182,7 +245,17 @@ def node_policy_guard(state: AssistantGraphState, config: RunnableConfig) -> dic
 def node_execute_action(state: AssistantGraphState, config: RunnableConfig) -> dict:
     session = _session(config)
     action = _action(state)
-    context = state.get("context") or {}
+    # Pass state-level snapshots down to the handler via ``context`` so
+    # handlers don't need to peek at LangGraph state directly. Underscore
+    # prefix signals "internal wiring, not user-visible data". Handlers
+    # that care (profile.show, conversation.chat) read these keys; those
+    # that don't simply ignore them.
+    context = dict(state.get("context") or {})
+    context["_profile"] = state.get("profile") or {}
+    context["_skill_configs"] = state.get("skill_configs") or []
+    context["_memories"] = state.get("memories") or []
+    context["_llm_client"] = config["configurable"].get("llm_client")
+    context["_embedding_client"] = config["configurable"].get("embedding_client")
 
     handler = HANDLERS.get(action.action_type)
     if handler is None:
@@ -401,6 +474,7 @@ def build_assistant_graph(*, checkpointer: Any | None = None):
     graph = StateGraph(AssistantGraphState)
     graph.add_node("load_context", node_load_context)
     graph.add_node("load_profile", node_load_profile)
+    graph.add_node("load_memories", node_load_memories)
     graph.add_node("policy_guard", node_policy_guard)
     graph.add_node("execute_action", node_execute_action)
     graph.add_node("persist_replies", node_persist_replies)
@@ -408,7 +482,8 @@ def build_assistant_graph(*, checkpointer: Any | None = None):
 
     graph.add_edge(START, "load_context")
     graph.add_edge("load_context", "load_profile")
-    graph.add_edge("load_profile", "policy_guard")
+    graph.add_edge("load_profile", "load_memories")
+    graph.add_edge("load_memories", "policy_guard")
     graph.add_conditional_edges(
         "policy_guard",
         _branch_after_policy,

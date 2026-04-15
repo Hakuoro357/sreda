@@ -18,6 +18,7 @@ from sreda.db.models import core as _core_models  # noqa: F401
 from sreda.db.models import eds_monitor as _eds_models  # noqa: F401
 from sreda.db.models import skill_platform as _skill_platform_models  # noqa: F401
 from sreda.db.models import user_profile as _user_profile_models  # noqa: F401
+from sreda.db.models import memory as _memory_models  # noqa: F401
 
 config = context.config
 

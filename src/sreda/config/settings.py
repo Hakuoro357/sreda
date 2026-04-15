@@ -27,6 +27,29 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str | None = None
 
+    # Chat LLM (Phase 3). Primary is MiMo-V2-Pro via its OpenAI-compatible
+    # endpoint. ``mimo_api_key_file`` is a local filesystem path — useful
+    # for dev: store the key in ``.secrets/mimo_api_key.txt`` (gitignored)
+    # instead of shell-env. Precedence at resolve time:
+    #   1. ``mimo_api_key`` (explicit)  → used as-is
+    #   2. ``mimo_api_key_file``         → read from file
+    #   3. ``None``                      → LLM features disabled
+    mimo_base_url: str = "https://token-plan-sgp.xiaomimimo.com/v1"
+    mimo_api_key: str | None = None
+    mimo_api_key_file: str | None = None
+    mimo_chat_model: str = "mimo-v2-pro"
+    mimo_request_timeout_seconds: float = 60.0
+
+    # Embeddings service (Phase 3). Separate from chat LLM so we can
+    # point the two at different endpoints — common setup is MiMo for
+    # chat + local LM Studio (multilingual-e5-large) for embeddings.
+    # Leave ``embeddings_base_url`` = None to run with a deterministic
+    # in-process fallback (tests / bootstrap mode).
+    embeddings_base_url: str | None = None
+    embeddings_api_key: str = "lm-studio"
+    embeddings_model: str | None = None
+    embeddings_request_timeout_seconds: float = 30.0
+
     connect_session_ttl_minutes: int = 15
     encryption_key: str | None = None
     encryption_key_id: str = "primary"
@@ -112,6 +135,23 @@ class Settings(BaseSettings):
         if not raw:
             return []
         return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def resolve_mimo_api_key(self) -> str | None:
+        """Resolve MiMo API key with file-based fallback.
+
+        Precedence: explicit env value → file contents → None. The file
+        path is relative to the process CWD (typically the package root
+        in dev, or wherever systemd runs the service in prod)."""
+        if self.mimo_api_key:
+            return self.mimo_api_key.strip()
+        if self.mimo_api_key_file:
+            from pathlib import Path
+
+            path = Path(self.mimo_api_key_file)
+            if path.exists() and path.is_file():
+                value = path.read_text(encoding="utf-8").strip()
+                return value or None
+        return None
 
 
 @lru_cache

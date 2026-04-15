@@ -14,6 +14,7 @@ unit-testing trivial.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from sreda.db.repositories.user_profile import (
 )
 from sreda.features.app_registry import get_feature_registry
 from sreda.runtime.dispatcher import ActionEnvelope
+from sreda.runtime.tools import build_memory_tools
 from sreda.services.billing import (
     BillingService,
     CONNECT_BASE_CALLBACK,
@@ -37,6 +39,10 @@ from sreda.services.billing import (
 )
 from sreda.services.claim_lookup import ClaimLookupService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
+from sreda.services.embeddings import get_embeddings_client
+from sreda.services.llm import get_chat_llm
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,6 +638,151 @@ def execute_skill_set_priority(
 
 
 # ---------------------------------------------------------------------------
+# Conversation (LLM-driven) handler (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+_CONVERSATION_SYSTEM_PROMPT = """\
+Ты — Среда, персональный AI-ассистент пользователя в Telegram. Говоришь на русском, если пользователь не переходит на другой язык.
+
+Поведение:
+- Отвечай кратко и по делу, без воды.
+- Если пользователь делится стабильным фактом о себе (семья, работа, место жительства, долгосрочные предпочтения) — зови инструмент ``save_core_fact``, записывай факт одним предложением в словах пользователя.
+- Если пользователь делится событием или настроением ("сегодня устал", "вчера ругался с коллегой") — зови ``save_episode``, короткое summary.
+- Если нужна дополнительная память — зови ``recall_memory`` с поисковым запросом.
+- НЕ сохраняй моментальные запросы ("помоги с X"), мнения, которые могут меняться, или сомнения.
+- Используй уже известные факты ниже, чтобы отвечать без переспрашивания.
+"""
+
+
+def _format_profile_for_prompt(profile: dict[str, Any]) -> str:
+    if not profile:
+        return "Профиль ещё не заполнен."
+    parts = []
+    if profile.get("display_name"):
+        parts.append(f"Имя: {profile['display_name']}")
+    if profile.get("timezone") and profile["timezone"] != "UTC":
+        parts.append(f"Часовой пояс: {profile['timezone']}")
+    if profile.get("communication_style"):
+        parts.append(f"Стиль общения: {profile['communication_style']}")
+    tags = profile.get("interest_tags") or []
+    if tags:
+        parts.append(f"Интересы: {', '.join(tags)}")
+    return "\n".join(parts) if parts else "Профиль заполнен минимально."
+
+
+def _format_memories_for_prompt(memories: list[dict[str, Any]]) -> str:
+    if not memories:
+        return "Пока ничего не помню о пользователе."
+    lines = []
+    for mem in memories:
+        tier = mem.get("tier", "?")
+        content = mem.get("content", "")
+        lines.append(f"- [{tier}] {content}")
+    return "\n".join(lines)
+
+
+def execute_conversation_chat(
+    session: Session, action: ActionEnvelope, context: dict[str, Any]
+) -> list[RuntimeReply]:
+    """LLM-driven conversational handler with memory tool-loop.
+
+    Dispatched from free-form user text (anything not matching a
+    slash-command). Builds a system prompt with user's profile +
+    relevant memories, binds the memory tools, then loops on LLM
+    tool calls until the model returns a plain assistant message.
+    """
+    from langchain_core.messages import (  # local import — LLM path only
+        AIMessage,
+        HumanMessage,
+        SystemMessage,
+        ToolMessage,
+    )
+
+    user_id = _require_user_id(action)
+    user_text = str(action.params.get("text") or "").strip()
+    if not user_text:
+        raise ActionRuntimeError(
+            "conversation_text_missing",
+            "Пустое сообщение — нечего обрабатывать.",
+        )
+
+    llm = context.get("_llm_client") or get_chat_llm()
+    if llm is None:
+        return [
+            RuntimeReply(
+                text=(
+                    "LLM пока не подключён (нет SREDA_MIMO_API_KEY). "
+                    "Используй команды /help, /profile, /skills."
+                ),
+                reply_markup=None,
+            )
+        ]
+
+    embedding_client = context.get("_embedding_client") or get_embeddings_client(
+        allow_fake=True
+    )
+    profile = context.get("_profile") or {}
+    memories = context.get("_memories") or []
+
+    system_text = (
+        _CONVERSATION_SYSTEM_PROMPT
+        + "\n\n[ПРОФИЛЬ]\n"
+        + _format_profile_for_prompt(profile)
+        + "\n\n[ПАМЯТЬ — релевантные факты]\n"
+        + _format_memories_for_prompt(memories)
+    )
+
+    tools = build_memory_tools(
+        session=session,
+        tenant_id=action.tenant_id,
+        user_id=user_id,
+        embedding_client=embedding_client,
+    )
+    tools_by_name = {t.name: t for t in tools}
+
+    llm_with_tools = llm.bind_tools(tools)
+    messages: list[Any] = [
+        SystemMessage(content=system_text),
+        HumanMessage(content=user_text),
+    ]
+
+    # Tool-call loop. Cap at 5 iterations so a runaway LLM can't pin us.
+    final_ai: AIMessage | None = None
+    for _iter in range(5):
+        ai_msg: AIMessage = llm_with_tools.invoke(messages)
+        messages.append(ai_msg)
+        tool_calls = getattr(ai_msg, "tool_calls", None) or []
+        if not tool_calls:
+            final_ai = ai_msg
+            break
+        for tc in tool_calls:
+            name = tc.get("name")
+            args = tc.get("args") or {}
+            tc_id = tc.get("id", "")
+            tool = tools_by_name.get(name)
+            if tool is None:
+                messages.append(
+                    ToolMessage(content=f"error:unknown_tool:{name}", tool_call_id=tc_id)
+                )
+                continue
+            try:
+                result = tool.invoke(args)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("tool %s failed", name)
+                result = f"error:{type(exc).__name__}"
+            messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
+    else:
+        # Loop exhausted without a final plain message — synthesize one.
+        final_ai = AIMessage(
+            content="Не смог сформировать ответ — слишком много шагов с инструментами."
+        )
+
+    text = (final_ai.content or "").strip() or "..."
+    return [RuntimeReply(text=text, reply_markup=None)]
+
+
+# ---------------------------------------------------------------------------
 # Registry — used by the graph's ``execute_action`` node and as the single
 # source of truth for "which action_types are supported".
 # ---------------------------------------------------------------------------
@@ -656,6 +807,7 @@ HANDLERS: dict[str, HandlerFn] = {
     "profile.propose_update": execute_profile_propose_update,
     "profile.confirm_update": execute_profile_confirm_update,
     "profile.reject_update": execute_profile_reject_update,
+    "conversation.chat": execute_conversation_chat,
     "skills.list": execute_skills_list,
     "skill.show": execute_skill_show,
     "skill.set_priority": execute_skill_set_priority,

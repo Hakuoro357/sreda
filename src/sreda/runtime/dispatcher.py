@@ -175,9 +175,17 @@ def _resolve_command_action(message_text: str) -> tuple[str, dict] | None:
         return "skill.show", {"feature_key": feature_key}
 
     action_type = _ACTION_BY_COMMAND.get(command)
-    if action_type is None:
+    if action_type is not None:
+        return action_type, {}
+
+    # Fallback for free-form text (Phase 3): any non-command message
+    # routes to the conversational LLM handler. Slash-commands we don't
+    # recognize still fall through here — the LLM will respond with
+    # "я не знаю такой команды", which is usually a better UX than
+    # silently ignoring.
+    if not message_text.strip():
         return None
-    return action_type, {}
+    return "conversation.chat", {"text": message_text.strip()}
 
 
 def _extract_message_text(payload: dict) -> str | None:
