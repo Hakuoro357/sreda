@@ -30,6 +30,20 @@ settings = get_settings()
 config.set_main_option("sqlalchemy.url", settings.database_url)
 target_metadata = Base.metadata
 
+# Explicit naming convention for implicit FK/UQ/IX/PK constraints.
+# Alembic >= 1.18 refuses to recreate SQLite tables in batch mode when
+# any existing constraint is unnamed, which breaks incremental
+# ``batch_alter_table`` migrations. Declaring the convention here
+# makes both new migrations and ``render_as_batch`` round-trips name
+# their constraints consistently.
+NAMING_CONVENTION = {
+    "ix": "ix_%(table_name)s_%(column_0_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+}
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
@@ -38,6 +52,8 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        render_as_batch=True,
+        naming_convention=NAMING_CONVENTION,
     )
 
     with context.begin_transaction():
@@ -52,7 +68,12 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            render_as_batch=True,
+            naming_convention=NAMING_CONVENTION,
+        )
 
         with context.begin_transaction():
             context.run_migrations()

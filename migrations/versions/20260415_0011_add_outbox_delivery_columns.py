@@ -28,12 +28,20 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("outbox_messages") as batch_op:
+    # Explicit naming convention for the batch-recreated table's
+    # constraints — SQLite's batch mode in alembic >= 1.18 rejects
+    # unnamed FKs when recreating the table underneath us.
+    naming = {
+        "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+        "ix": "ix_%(table_name)s_%(column_0_name)s",
+        "uq": "uq_%(table_name)s_%(column_0_name)s",
+    }
+    with op.batch_alter_table("outbox_messages", naming_convention=naming) as batch_op:
         batch_op.add_column(
             sa.Column(
                 "user_id",
                 sa.String(length=64),
-                sa.ForeignKey("users.id"),
+                sa.ForeignKey("users.id", name="fk_outbox_messages_user_id_users"),
                 nullable=True,
             )
         )
@@ -47,7 +55,7 @@ def upgrade() -> None:
         )
         batch_op.create_index("ix_outbox_messages_user_id", ["user_id"])
 
-    with op.batch_alter_table("outbox_messages") as batch_op:
+    with op.batch_alter_table("outbox_messages", naming_convention=naming) as batch_op:
         batch_op.alter_column("is_interactive", server_default=None)
 
 
