@@ -332,7 +332,13 @@ class BillingService:
         buttons.append([{"text": "Мой статус", "callback_data": STATUS_CALLBACK}])
         return text, _inline_keyboard(buttons)
 
-    def start_base_subscription(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
+    def start_base_subscription(
+        self,
+        tenant_id: str,
+        *,
+        now: datetime | None = None,
+        connect_button_override: dict | None = None,
+    ) -> SubscriptionActionResult:
         self.ensure_default_plans()
         current_time = _utcnow(now)
         existing = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
@@ -425,14 +431,22 @@ class BillingService:
             ),
             reply_markup=_inline_keyboard(
                 [
-                    [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
+                    [connect_button_override]
+                    if connect_button_override is not None
+                    else [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
                     [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
                     [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
                 ]
             ),
         )
 
-    def add_extra_eds_account(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
+    def add_extra_eds_account(
+        self,
+        tenant_id: str,
+        *,
+        now: datetime | None = None,
+        connect_button_override: dict | None = None,
+    ) -> SubscriptionActionResult:
         self.ensure_default_plans()
         current_time = _utcnow(now)
         base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
@@ -510,7 +524,9 @@ class BillingService:
             ),
             reply_markup=_inline_keyboard(
                 [
-                    [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
+                    [connect_button_override]
+                    if connect_button_override is not None
+                    else [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
                     [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
                     [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
                 ]

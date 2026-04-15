@@ -99,26 +99,11 @@ def execute_subscriptions_show(session: Session, action: ActionEnvelope, context
     summary = billing.get_summary(action.tenant_id)
 
     connect_button_override: dict | None = None
-    if (
-        summary.base_active
-        and summary.free_count > 0
-        and action.user_id is not None
-    ):
+    if summary.base_active and summary.free_count > 0:
         slot_type = "primary" if not summary.connected_accounts else "extra"
-        try:
-            link = EDSConnectService(session, get_settings()).create_connect_link(
-                tenant_id=action.tenant_id,
-                workspace_id=action.workspace_id,
-                user_id=action.user_id,
-                slot_type=slot_type,
-            )
-            connect_button_override = _build_connect_subscriptions_button(link.url)
-        except ConnectSessionError as exc:
-            logger.warning(
-                "subscriptions.show: could not pre-generate connect link (%s); "
-                "falling back to callback button",
-                exc.code,
-            )
+        connect_button_override = _try_build_connect_override(
+            session, action, slot_type=slot_type
+        )
 
     text, reply_markup = billing.build_subscriptions_message(
         action.tenant_id, connect_button_override=connect_button_override
@@ -136,6 +121,31 @@ def _build_connect_subscriptions_button(url: str) -> dict:
     if url.startswith("https://"):
         return {"text": "Подключить ЛК EDS", "web_app": {"url": url}}
     return {"text": "Подключить ЛК EDS", "url": url}
+
+
+def _try_build_connect_override(
+    session: Session, action: ActionEnvelope, *, slot_type: str
+) -> dict | None:
+    """Pre-generate a one-time EDS connect link and wrap it as a
+    ``web_app`` inline button. Returns ``None`` if the link cannot be
+    created — caller falls back to the legacy callback button."""
+    if action.user_id is None:
+        return None
+    try:
+        link = EDSConnectService(session, get_settings()).create_connect_link(
+            tenant_id=action.tenant_id,
+            workspace_id=action.workspace_id,
+            user_id=action.user_id,
+            slot_type=slot_type,
+        )
+    except ConnectSessionError as exc:
+        logger.warning(
+            "connect-override: could not pre-generate link (%s); "
+            "falling back to callback button",
+            exc.code,
+        )
+        return None
+    return _build_connect_subscriptions_button(link.url)
 
 
 def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
@@ -163,17 +173,28 @@ def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict
 def execute_subscription_connect_base(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    result = BillingService(session).start_base_subscription(action.tenant_id)
+    # After base subscription activation the user has 1 free slot → pre-gen
+    # connect link and swap the "Подключить ЛК EDS" button for a one-tap
+    # web_app button on the confirmation reply.
+    connect_override = _try_build_connect_override(session, action, slot_type="primary")
+    result = BillingService(session).start_base_subscription(
+        action.tenant_id, connect_button_override=connect_override
+    )
     return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
 
 
 def execute_subscription_add_eds(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    result = BillingService(session).add_extra_eds_account(action.tenant_id)
-    replies = [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-    replies.extend(_build_connect_replies(session, action, slot_type="extra"))
-    return replies
+    # After adding an extra slot: pre-gen connect link for the new slot.
+    # The billing reply's "Подключить ЛК EDS" button now opens the
+    # mini-app directly — no need to send the separate intermediate
+    # "click to open" message afterwards.
+    connect_override = _try_build_connect_override(session, action, slot_type="extra")
+    result = BillingService(session).add_extra_eds_account(
+        action.tenant_id, connect_button_override=connect_override
+    )
+    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
 
 
 def execute_subscription_renew_cycle(

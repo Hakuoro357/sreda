@@ -195,14 +195,17 @@ def test_runtime_service_add_eds_sends_subscription_and_connect_messages(monkeyp
         session.close()
 
     assert len(subscriptions) == 2
-    assert len(telegram_client.sent_messages) == 3
+    # Phase: direct-to-miniapp UX — subscription activation messages now
+    # carry the "Подключить ЛК EDS" web_app button inline, so only two
+    # messages go out (no intermediate "click to open" reply).
+    assert len(telegram_client.sent_messages) == 2
     assert "Подписка EDS Monitor подключена." in telegram_client.sent_messages[0]["text"]
     assert "Дополнительный кабинет EDS подключен." in telegram_client.sent_messages[1]["text"]
-    assert "защищенная одноразовая страница" in telegram_client.sent_messages[2]["text"]
-    open_button = telegram_client.sent_messages[2]["reply_markup"]["inline_keyboard"][0][0]
-    assert open_button["text"] == "Ввести логин и пароль от EDS"
-    assert "web_app" in open_button or "url" in open_button
-    assert len(outbox) == 3
+    # Extra-subscription confirmation carries the one-tap connect button.
+    connect_button = telegram_client.sent_messages[1]["reply_markup"]["inline_keyboard"][0][0]
+    assert connect_button["text"] == "Подключить ЛК EDS"
+    assert "web_app" in connect_button or "url" in connect_button
+    assert len(outbox) == 2
 
 
 def test_runtime_service_claim_lookup_sends_claim_card(monkeypatch, tmp_path: Path) -> None:

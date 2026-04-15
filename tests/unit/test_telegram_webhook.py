@@ -378,10 +378,13 @@ def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
 
     assert response.status_code == 202
     assert len(answered_callbacks) == 1
-    assert len(sent_messages) == 2
+    # Phase: direct-to-miniapp UX — single reply carries the connect
+    # web_app button inline (no separate "click to open" message).
+    assert len(sent_messages) == 1
     assert "Дополнительный кабинет EDS подключен." in sent_messages[0]["text"]
-    open_button = sent_messages[1]["reply_markup"]["inline_keyboard"][0][0]
-    assert open_button["text"] == "Ввести логин и пароль от EDS"
+    connect_button = sent_messages[0]["reply_markup"]["inline_keyboard"][0][0]
+    assert connect_button["text"] == "Подключить ЛК EDS"
+    assert "web_app" in connect_button or "url" in connect_button
 
     session = get_session_factory()()
     try:
@@ -393,7 +396,7 @@ def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
 
     assert len(jobs) == 1
     assert len(runs) == 1
-    assert len(outbox) == 2
+    assert len(outbox) == 1
 
 
 def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
