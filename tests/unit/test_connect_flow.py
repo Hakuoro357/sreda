@@ -583,6 +583,150 @@ def test_connect_endpoint_rate_limits_excess_requests(monkeypatch, tmp_path: Pat
     assert fourth.json()["detail"] == "rate_limited"
 
 
+def test_submit_form_shows_verified_message_when_inline_verification_completes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Regression guard for M1 follow-up: страница мини-аппа должна
+    показывать "Кабинет EDS подключен" только если ``process_job`` вернул
+    ``"completed"`` — именно это пользователь видел как ложный success в
+    реальном прогоне (job упал с failed, а страница говорила "проверяем").
+    """
+
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
+
+    async def fake_process_job(self, job_id: str) -> str:
+        return "completed"
+
+    monkeypatch.setattr(EDSAccountVerificationService, "process_job", fake_process_job)
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        _seed_bundle(session)
+        BillingService(session).start_base_subscription("tenant_1")
+        link = EDSConnectService(session, get_settings()).create_connect_link(
+            tenant_id="tenant_1",
+            workspace_id="workspace_1",
+            user_id="user_1",
+            slot_type="primary",
+        )
+        token = link.raw_token
+    finally:
+        session.close()
+
+    response = TestClient(create_app()).post(
+        f"/connect/eds/{token}",
+        data={"login": "5047136341", "password": "super-secret"},
+    )
+
+    assert response.status_code == 200
+    assert "Кабинет EDS подключен" in response.text
+    assert "Результат проверки придёт" not in response.text
+
+
+def test_submit_form_shows_neutral_message_when_inline_verification_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Regression guard for M1 follow-up: когда ``process_job`` возвращает
+    ``"failed"`` (штатный исход без exception), страница не должна
+    утверждать, что кабинет подключён. Должна отдавать нейтральный
+    текст "результат придёт в Telegram".
+    """
+
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
+
+    async def fake_process_job(self, job_id: str) -> str:
+        return "failed"
+
+    monkeypatch.setattr(EDSAccountVerificationService, "process_job", fake_process_job)
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        _seed_bundle(session)
+        BillingService(session).start_base_subscription("tenant_1")
+        link = EDSConnectService(session, get_settings()).create_connect_link(
+            tenant_id="tenant_1",
+            workspace_id="workspace_1",
+            user_id="user_1",
+            slot_type="primary",
+        )
+        token = link.raw_token
+    finally:
+        session.close()
+
+    response = TestClient(create_app()).post(
+        f"/connect/eds/{token}",
+        data={"login": "5047136341", "password": "super-secret"},
+    )
+
+    assert response.status_code == 200
+    assert "Кабинет EDS подключен" not in response.text
+    assert "Результат проверки придёт в Telegram" in response.text
+
+
+def test_submit_form_shows_neutral_message_when_inline_verification_raises(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Exception из ``process_job`` — такой же нейтральный исход, как и
+    ``"failed"``. Страница не должна обещать успех."""
+
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
+
+    async def fake_process_job(self, job_id: str) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(EDSAccountVerificationService, "process_job", fake_process_job)
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        _seed_bundle(session)
+        BillingService(session).start_base_subscription("tenant_1")
+        link = EDSConnectService(session, get_settings()).create_connect_link(
+            tenant_id="tenant_1",
+            workspace_id="workspace_1",
+            user_id="user_1",
+            slot_type="primary",
+        )
+        token = link.raw_token
+    finally:
+        session.close()
+
+    response = TestClient(create_app()).post(
+        f"/connect/eds/{token}",
+        data={"login": "5047136341", "password": "super-secret"},
+    )
+
+    assert response.status_code == 200
+    assert "Кабинет EDS подключен" not in response.text
+    assert "Результат проверки придёт в Telegram" in response.text
+
+
 def _seed_bundle(session) -> None:
     session.add(Tenant(id="tenant_1", name="Tenant 1"))
     session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))

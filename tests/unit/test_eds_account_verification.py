@@ -549,3 +549,97 @@ def _build_test_settings():
         encryption_key=base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii"),
         connect_public_base_url="https://connect.example.test",
     )
+
+
+# ---------------------------------------------------------------------------
+# DefaultEDSVerificationAdapter — classifier-level tests
+# ---------------------------------------------------------------------------
+#
+# Regression guard: раньше адаптер классифицировал исключения только по
+# подстроке в ``str(exc)``. ``httpx.ReadTimeout`` часто приходит с пустым
+# текстом, поэтому попадал в ``verification_unknown_failed`` (non-retryable
+# после RETRY_LIMITS=1) вместо ``verification_temporary_failed`` (retryable).
+# Реальный прогон на продакшене упал именно на этом: одна попытка → failed,
+# пользователь видел "Не удалось завершить подключение из-за технической
+# ошибки" без шанса на retry.
+
+
+def _install_leak_client(monkeypatch, side_effect):
+    """Подменяет ``EDSMonitorClient`` так, чтобы первая же сетевая операция
+    (``login``) подняла переданный exception."""
+
+    from sreda_feature_eds_monitor.integrations.client import EDSMonitorClient
+
+    async def _fail(self, *args, **kwargs):
+        raise side_effect
+
+    monkeypatch.setattr(EDSMonitorClient, "login", _fail)
+
+
+def test_adapter_maps_httpx_readtimeout_to_retryable_temporary_failed(monkeypatch) -> None:
+    import httpx
+
+    from sreda.services.eds_account_verification import (
+        DefaultEDSVerificationAdapter,
+        VerificationError,
+    )
+
+    _install_leak_client(monkeypatch, httpx.ReadTimeout(""))
+
+    adapter = DefaultEDSVerificationAdapter()
+    try:
+        asyncio.run(
+            adapter.verify_account(account_key="teds_x", login="5047136341", password="p")
+        )
+    except VerificationError as exc:
+        assert exc.code == "verification_temporary_failed"
+        assert exc.retryable is True
+    else:
+        raise AssertionError("VerificationError was expected")
+
+
+def test_adapter_maps_asyncio_timeout_to_retryable_temporary_failed(monkeypatch) -> None:
+    from sreda.services.eds_account_verification import (
+        DefaultEDSVerificationAdapter,
+        VerificationError,
+    )
+
+    _install_leak_client(monkeypatch, asyncio.TimeoutError())
+
+    adapter = DefaultEDSVerificationAdapter()
+    try:
+        asyncio.run(
+            adapter.verify_account(account_key="teds_x", login="5047136341", password="p")
+        )
+    except VerificationError as exc:
+        assert exc.code == "verification_temporary_failed"
+        assert exc.retryable is True
+    else:
+        raise AssertionError("VerificationError was expected")
+
+
+def test_adapter_maps_http_401_to_non_retryable_auth_failed(monkeypatch) -> None:
+    import httpx
+
+    from sreda.services.eds_account_verification import (
+        DefaultEDSVerificationAdapter,
+        VerificationError,
+    )
+
+    request = httpx.Request("POST", "https://eds.mosreg.ru/api/login")
+    response = httpx.Response(401, request=request)
+    _install_leak_client(
+        monkeypatch,
+        httpx.HTTPStatusError("401 Unauthorized", request=request, response=response),
+    )
+
+    adapter = DefaultEDSVerificationAdapter()
+    try:
+        asyncio.run(
+            adapter.verify_account(account_key="teds_x", login="5047136341", password="p")
+        )
+    except VerificationError as exc:
+        assert exc.code == "verification_auth_failed"
+        assert exc.retryable is False
+    else:
+        raise AssertionError("VerificationError was expected")

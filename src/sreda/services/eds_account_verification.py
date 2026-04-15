@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+import httpx
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -81,7 +82,24 @@ class DefaultEDSVerificationAdapter:
             )
             await client.activate_operator_role(account_key, login=login)
             await client.fetch_claims(account_key, max_pages=1, login=login)
-        except Exception as exc:  # pragma: no cover - integration branch
+        except Exception as exc:
+            # Сначала классифицируем по типу исключения — некоторые
+            # httpx/asyncio-таймауты приходят с пустым str(exc), и
+            # substring-матчинг ниже не сработает. Мы теряли из-за этого
+            # retryable-статус: падали с non-retryable unknown_failed
+            # после одной попытки.
+            if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+                raise VerificationError(
+                    "verification_temporary_failed",
+                    "Временная ошибка подключения. Попробуй еще раз позже.",
+                    retryable=True,
+                ) from exc
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 403}:
+                raise VerificationError(
+                    "verification_auth_failed",
+                    "Не удалось подключить кабинет. Проверь логин и пароль.",
+                    retryable=False,
+                ) from exc
             message = str(exc).strip() or "EDS verification failed."
             lowered = message.lower()
             if "401" in lowered or "403" in lowered or "password" in lowered or "логин" in lowered:

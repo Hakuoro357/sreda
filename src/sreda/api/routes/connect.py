@@ -106,13 +106,19 @@ async def submit_eds_connect_form(
         return HTMLResponse(_render_error_page(exc.message), status_code=exc.status_code)
     telegram_client = TelegramClient(settings.telegram_bot_token) if settings.telegram_bot_token else None
     verifier = EDSAccountVerificationService(session, telegram_client=telegram_client)
-    inline_ok = False
+    inline_result: str | None = None
     try:
-        await verifier.process_job(result.job_id)
-        inline_ok = True
+        inline_result = await verifier.process_job(result.job_id)
     except Exception:
         logger.exception("Inline EDS verification kick failed for job %s", result.job_id)
-    return HTMLResponse(_render_submitted_page(queued=not inline_ok), status_code=200)
+    # Показываем "подключено" только если верификация реально прошла. Любой
+    # другой исход (failed / retry_scheduled / claimed_by_other / exception)
+    # — нейтральный текст "результат придёт в Telegram": именно туда уходит
+    # итоговое сообщение (success или failure).
+    return HTMLResponse(
+        _render_submitted_page(verified=(inline_result == "completed")),
+        status_code=200,
+    )
 
 
 def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
@@ -216,13 +222,16 @@ def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
 </html>"""
 
 
-def _render_submitted_page(*, already_started: bool = False, queued: bool = False) -> str:
+def _render_submitted_page(*, already_started: bool = False, verified: bool = False) -> str:
     if already_started:
         message = "Проверка уже запущена."
-    elif queued:
-        message = "Данные получены. Проверка запустится в ближайшее время."
+    elif verified:
+        message = "Кабинет EDS подключен. Подробности в Telegram."
     else:
-        message = "Сейчас проверяем доступ к кабинету EDS."
+        # Нейтральная формулировка для всех не-успешных исходов (в том
+        # числе когда inline-kick упал с failed/retry/exception): мы
+        # приняли данные, итог придёт через Telegram.
+        message = "Данные получены. Результат проверки придёт в Telegram."
     return """<!doctype html>
 <html lang="ru">
   <head>
