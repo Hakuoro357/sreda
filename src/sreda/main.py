@@ -6,17 +6,13 @@ from sreda.api.routes.health import router as health_router
 from sreda.api.routes.telegram_webhook import router as telegram_router
 from sreda.config.logging import configure_logging
 from sreda.config.settings import get_settings
-from sreda.features.builtin import CoreAssistantFeature
-from sreda.features.loader import load_feature_modules
-from sreda.features.registry import FeatureRegistry
+from sreda.features.app_registry import get_feature_registry
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level)
-    feature_registry = FeatureRegistry()
-    feature_registry.register(CoreAssistantFeature())
-    load_feature_modules(settings.feature_modules, feature_registry)
+    feature_registry = get_feature_registry()
 
     app = FastAPI(title=settings.app_name)
     app.include_router(health_router)

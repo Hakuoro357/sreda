@@ -60,6 +60,13 @@ class Job(Base):
     job_type: Mapped[str] = mapped_column(String(100), index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    # Required for retention cleanup (spec 41). Indexed because the cleanup
+    # job filters by ``status IN (...) AND created_at < cutoff``.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
 
 
 class OutboxMessage(Base):
@@ -71,6 +78,39 @@ class OutboxMessage(Base):
     channel_type: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     payload_json: Mapped[str] = mapped_column(Text)
+    # Required for retention cleanup (spec 41): 30 days for sent,
+    # 60 days for failed — all keyed off creation time since we don't
+    # store a separate ``sent_at`` yet.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+    # Deferred delivery (Phase 2). ``NULL`` means "send now". The outbox
+    # delivery worker picks up rows where ``scheduled_at IS NULL OR
+    # scheduled_at <= now``. Used by the quiet-hours enforcement to bump
+    # non-urgent messages past the user's quiet window.
+    scheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    # Which skill produced this reply. ``NULL`` means "platform core"
+    # (help/status/subscriptions). Used by quiet-hours enforcement to
+    # look up per-skill ``notification_priority`` in
+    # ``tenant_user_skill_configs``.
+    feature_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    # Recipient user (Phase 2d). The delivery worker uses this to resolve
+    # per-user profile + per-skill priority. ``NULL`` means "broadcast
+    # or system-level" and skips the user-scoped policy entirely.
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    # ``True`` when this reply is a direct response to an inbound user
+    # message (``action.inbound_message_id is not None``). Interactive
+    # deliveries bypass quiet-hours — users get replies to their own
+    # commands immediately, always.
+    is_interactive: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class SecureRecord(Base):

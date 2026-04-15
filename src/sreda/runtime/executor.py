@@ -1,10 +1,30 @@
+"""Action runtime service — thin wrapper around the assistant graph.
+
+Responsibilities that live here (NOT in the graph):
+
+  * ``enqueue_action`` — create the ``Job`` + ``AgentRun`` rows and the
+    owning ``AgentThread`` so a webhook handler can fire-and-forget.
+  * ``process_job`` — load the run, CAS-claim the job row
+    (``pending`` → ``running`` under row-level lock to block duplicate
+    workers), and hand off to the compiled graph.
+  * Wall-clock timeout around the async graph invocation: a hung upstream
+    (Telegram send, etc.) must not pin a job in ``running`` forever.
+  * Best-effort failure finalization if the graph itself raises or times
+    out mid-flight — the graph's ``persist_error`` node normally handles
+    this, but if it never ran (timeout), we still need the DB row to
+    leave ``running``.
+
+Everything else — context loading, policy, dispatch, reply persistence,
+Telegram side-effects — is inside the graph (``sreda.runtime.graph``).
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import update
@@ -12,29 +32,24 @@ from sqlalchemy.orm import Session
 
 from sreda.config.settings import get_settings
 from sreda.db.models import AgentRun, AgentThread
-from sreda.db.models.core import Job, OutboxMessage, TenantFeature
+from sreda.db.models.core import Job, OutboxMessage
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.dispatcher import ActionEnvelope
-from sreda.services.billing import (
-    BillingService,
-    CONNECT_BASE_CALLBACK,
-    STATUS_CALLBACK,
-    SUBSCRIPTIONS_CALLBACK,
-)
-from sreda.services.claim_lookup import ClaimLookupService, is_valid_claim_id
-from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
-from sreda.services.onboarding import build_connect_eds_message
+from sreda.runtime.graph import get_assistant_graph, sanitize_error_message
+from sreda.runtime.handlers import ActionRuntimeError, RuntimeReply  # re-export
 from sreda.services.privacy_guard import get_default_privacy_guard
 
+__all__ = [
+    "ActionRuntimeError",
+    "ActionRuntimeService",
+    "AGENT_EXECUTE_ACTION_JOB",
+    "QueuedRuntimeAction",
+    "RuntimeReply",
+]
+
+logger = logging.getLogger(__name__)
+
 AGENT_EXECUTE_ACTION_JOB = "agent.execute_action"
-
-
-class ActionRuntimeError(Exception):
-    def __init__(self, code: str, message: str, *, reply_markup: dict | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.reply_markup = reply_markup
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,10 +59,31 @@ class QueuedRuntimeAction:
     job_id: str
 
 
-@dataclass(frozen=True, slots=True)
-class RuntimeReply:
-    text: str
-    reply_markup: dict | None
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _make_thread_id(action: ActionEnvelope, run_id: str) -> str:
+    """Checkpointer thread identity.
+
+    Uses ``run_id`` so each invocation is isolated from previous runs on
+    the same (tenant, channel, chat). Phase 3's long-term memory will
+    live in a separate LangMem store — NOT in graph channel-state — so
+    we don't need cross-invocation continuity here. Sharing thread_id
+    across invocations would leak stale ``error_code`` / ``replies``
+    from prior runs into the new one (LangGraph's ``last_value``
+    channels preserve fields not re-set by the new input)."""
+    _ = action  # kept for future when we want hierarchical thread ids
+    return run_id
+
+
+def _extract_run_id(payload_json: str) -> str | None:
+    try:
+        payload = json.loads(payload_json or "{}")
+    except json.JSONDecodeError:
+        return None
+    run_id = payload.get("run_id")
+    return str(run_id) if run_id else None
 
 
 class ActionRuntimeService:
@@ -59,6 +95,9 @@ class ActionRuntimeService:
     ) -> None:
         self.session = session
         self.telegram_client = telegram_client
+        self._graph = get_assistant_graph()
+
+    # ------------------------------------------------------------- enqueue
 
     def enqueue_action(self, action: ActionEnvelope) -> QueuedRuntimeAction:
         thread = self._get_or_create_thread(action)
@@ -94,6 +133,8 @@ class ActionRuntimeService:
         self.session.commit()
         return QueuedRuntimeAction(thread_id=thread.id, run_id=run.id, job_id=job.id)
 
+    # --------------------------------------------------------- batch runner
+
     async def process_pending_jobs(self, *, limit: int = 20) -> int:
         jobs = (
             self.session.query(Job)
@@ -107,6 +148,8 @@ class ActionRuntimeService:
             await self.process_job(job.id)
             processed += 1
         return processed
+
+    # ------------------------------------------------------------- process
 
     async def process_job(self, job_id: str) -> str:
         job = self.session.get(Job, job_id)
@@ -135,15 +178,9 @@ class ActionRuntimeService:
             self.session.commit()
             return "completed"
 
-        # Compare-and-set claim: atomically flip ``status`` from ``pending``
-        # to ``running`` so concurrent workers race on a row-level write
-        # instead of on the ORM snapshot. The loser bails out before any
-        # handler runs, preventing duplicate outbox messages and repeat
-        # side effects.
-        #
-        # H3: we piggy-back the ``run`` row update on top of the same
-        # transaction so the claim and the ``run.status=running`` flip
-        # commit together instead of as two separate round-trips.
+        # CAS-claim: atomically flip ``status`` from ``pending`` → ``running``
+        # so concurrent workers race on a row-level write. The loser rolls
+        # back and bails out before any side-effect runs.
         claim = self.session.execute(
             update(Job)
             .where(Job.id == job.id)
@@ -159,128 +196,62 @@ class ActionRuntimeService:
         run.started_at = run.started_at or now
         self.session.commit()
 
-        # H4: wall-clock budget for network-bound work so a hung Telegram
-        # send (the only ``await`` in the happy path) cannot pin the job
-        # in ``running`` indefinitely. We map ``TimeoutError`` to a
-        # ``runtime_timeout`` failure and let the existing ``_mark_failed``
-        # path finalize the row; that call is itself guarded so a hang
-        # during the failure notification still releases the job.
         timeout_seconds = max(get_settings().job_max_runtime_seconds, 0.001)
 
-        action: ActionEnvelope | None = None
-        context: dict[str, Any] | None = None
         try:
-            action = self._load_action(run)
-            context = self._load_context(action)
-            handler = self._route_action(action.action_type)
-            self._policy_guard(action, context)
-            replies = handler(action, context)
-            await asyncio.wait_for(
-                self._persist_and_enqueue_replies(
-                    job=job,
-                    run=run,
-                    action=action,
-                    context=context,
-                    replies=replies,
-                ),
-                timeout=timeout_seconds,
-            )
-            return "completed"
-        except ActionRuntimeError as exc:
-            await self._mark_failed_with_timeout(
-                job=job,
-                run=run,
-                action=action,
-                context=context,
-                error_code=exc.code,
-                message=exc.message,
-                reply_markup=exc.reply_markup,
-                timeout_seconds=timeout_seconds,
+            action = ActionEnvelope(**json.loads(run.input_json or "{}"))
+        except Exception:
+            logger.exception("runtime: failed to decode action envelope for run %s", run.id)
+            await self._finalize_unexpected_failure(
+                job_id=job.id,
+                run_id=run.id,
+                error_code="runtime_unexpected_error",
             )
             return "failed"
+
+        thread_id = _make_thread_id(action, run.id)
+        graph_input = {
+            "action": action.as_dict(),
+            "run_id": run.id,
+            "job_id": job.id,
+        }
+        graph_config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "session": self.session,
+                "telegram_client": self.telegram_client,
+            }
+        }
+
+        try:
+            final_state = await asyncio.wait_for(
+                self._graph.ainvoke(graph_input, config=graph_config),
+                timeout=timeout_seconds,
+            )
         except asyncio.TimeoutError:
-            # Primary handler timed out mid-flight — the session may
-            # hold a partially-applied outbox row that was flushed but
-            # not committed. Drop it before we try to write the failure
-            # state so ``_mark_failed`` starts from a clean snapshot.
             self.session.rollback()
-            # Re-attach the ORM objects we still need after the rollback.
-            refreshed_job = self.session.get(Job, job.id)
-            refreshed_run = self.session.get(AgentRun, run.id)
-            if refreshed_job is not None:
-                job = refreshed_job
-            if refreshed_run is not None:
-                run = refreshed_run
-            await self._mark_failed_with_timeout(
-                job=job,
-                run=run,
+            await self._finalize_timeout(
+                job_id=job.id,
+                run_id=run.id,
                 action=action,
-                context=context,
-                error_code="runtime_timeout",
-                message="Действие отменено по таймауту.",
-                reply_markup=None,
                 timeout_seconds=timeout_seconds,
             )
             return "failed"
         except Exception:
-            await self._mark_failed_with_timeout(
-                job=job,
-                run=run,
+            logger.exception("runtime: graph raised for run %s", run.id)
+            self.session.rollback()
+            await self._finalize_unexpected_failure(
+                job_id=job.id,
+                run_id=run.id,
                 action=action,
-                context=context,
                 error_code="runtime_unexpected_error",
-                message="Не удалось выполнить действие из-за технической ошибки.",
-                reply_markup=None,
-                timeout_seconds=timeout_seconds,
             )
             return "failed"
 
-    async def _mark_failed_with_timeout(
-        self,
-        *,
-        job: Job,
-        run: AgentRun,
-        action: ActionEnvelope | None,
-        context: dict[str, Any] | None,
-        error_code: str,
-        message: str,
-        reply_markup: dict | None,
-        timeout_seconds: float,
-    ) -> None:
-        # If the failure notification itself hangs, we still have to
-        # finalize the job row. Persist the failure state in the DB
-        # first, then try to ship the outbound message under a tight
-        # budget, and on timeout downgrade the outbound delivery to
-        # ``pending`` so the outbox worker can retry it later.
-        try:
-            await asyncio.wait_for(
-                self._mark_failed(
-                    job=job,
-                    run=run,
-                    action=action,
-                    context=context,
-                    error_code=error_code,
-                    message=message,
-                    reply_markup=reply_markup,
-                ),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            # Best-effort finalize: the hung client has already been
-            # abandoned, but we still need the job row to leave the
-            # ``running`` state so workers can move on.
-            self.session.rollback()
-            job_row = self.session.get(Job, job.id)
-            if job_row is not None and job_row.status != "failed":
-                job_row.status = "failed"
-            run_row = self.session.get(AgentRun, run.id)
-            if run_row is not None:
-                run_row.status = "failed"
-                run_row.error_code = error_code
-                # H8: route through the privacy guard before persisting.
-                run_row.error_message_sanitized = _sanitize_error_message(message)
-                run_row.finished_at = _utcnow()
-            self.session.commit()
+        outcome = (final_state or {}).get("outcome")
+        return "failed" if outcome == "failed" else "completed"
+
+    # ------------------------------------------------------------- helpers
 
     def _get_or_create_thread(self, action: ActionEnvelope) -> AgentThread:
         thread = (
@@ -308,389 +279,131 @@ class ActionRuntimeService:
         self.session.flush()
         return thread
 
-    def _load_action(self, run: AgentRun) -> ActionEnvelope:
-        payload = json.loads(run.input_json or "{}")
-        return ActionEnvelope(**payload)
-
-    def _load_context(self, action: ActionEnvelope) -> dict[str, Any]:
-        billing_summary = BillingService(self.session).get_summary(action.tenant_id)
-        eds_monitor_enabled = (
-            self.session.query(TenantFeature)
-            .filter(
-                TenantFeature.tenant_id == action.tenant_id,
-                TenantFeature.feature_key == "eds_monitor",
-                TenantFeature.enabled.is_(True),
-            )
-            .one_or_none()
-            is not None
-        )
-        return {
-            "tenant_id": action.tenant_id,
-            "workspace_id": action.workspace_id,
-            "assistant_id": action.assistant_id,
-            "eds_monitor_enabled": eds_monitor_enabled,
-            "billing_summary": {
-                "base_active": billing_summary.base_active,
-                "allowed_count": billing_summary.allowed_count,
-                "connected_count": billing_summary.connected_count,
-                "free_count": billing_summary.free_count,
-            },
-        }
-
-    def _route_action(self, action_type: str):
-        handler = {
-            "help.show": self._execute_help_show,
-            "status.show": self._execute_status_show,
-            "subscriptions.show": self._execute_subscriptions_show,
-            "claim.lookup": self._execute_claim_lookup,
-            "subscription.connect_base": self._execute_subscription_connect_base,
-            "subscription.add_eds": self._execute_subscription_add_eds,
-            "subscription.renew_cycle": self._execute_subscription_renew_cycle,
-            "eds.connect.start": self._execute_eds_connect_start,
-            "eds.connect.retry": self._execute_eds_connect_retry,
-            "eds.slot.remove_free": self._execute_eds_slot_remove_free,
-            "eds.slot.restore_free": self._execute_eds_slot_restore_free,
-            "eds.account.remove": self._execute_eds_account_remove,
-            "eds.account.restore": self._execute_eds_account_restore,
-        }.get(action_type)
-        if handler is None:
-            raise ActionRuntimeError("runtime_unsupported_action", "Это действие пока не поддерживается.")
-        return handler
-
-    def _policy_guard(self, action: ActionEnvelope, context: dict[str, Any]) -> None:
-        if action.action_type == "help.show":
-            return
-        if not context.get("tenant_id") or not context.get("workspace_id"):
-            raise ActionRuntimeError(
-                "runtime_context_missing",
-                "Не удалось определить контекст пользователя для этого действия.",
-            )
-
-        summary = context["billing_summary"]
-        if action.action_type == "claim.lookup":
-            claim_id = str(action.params.get("claim_id") or "").strip()
-            if not claim_id:
-                raise ActionRuntimeError(
-                    "claim_id_missing",
-                    "Используй команду в формате:\n\n/claim <номер_заявки>",
-                    reply_markup=_status_subscriptions_markup(),
-                )
-            if not is_valid_claim_id(claim_id):
-                raise ActionRuntimeError(
-                    "claim_id_invalid",
-                    "Номер заявки должен содержать только буквы, цифры, '-' или '_'.",
-                    reply_markup=_status_subscriptions_markup(),
-                )
-            if not context.get("eds_monitor_enabled"):
-                raise ActionRuntimeError(
-                    "eds_monitor_disabled",
-                    "Поиск по заявкам станет доступен после подключения EDS.",
-                    reply_markup=_subscriptions_markup(),
-                )
-            return
-
-        if action.action_type == "subscription.add_eds" and not summary["base_active"]:
-            raise ActionRuntimeError(
-                "subscription_required",
-                "Сначала подключи EDS Monitor, а потом можно будет добавить еще один кабинет.",
-                reply_markup=_subscriptions_markup(),
-            )
-        if action.action_type in {"eds.connect.start", "eds.connect.retry"}:
-            if not summary["base_active"]:
-                raise ActionRuntimeError(
-                    "subscription_required",
-                    build_connect_eds_message(
-                        base_active=False,
-                        connected_count=summary["connected_count"],
-                        allowed_count=summary["allowed_count"],
-                    ),
-                    reply_markup=_connect_reply_markup(False),
-                )
-            if summary["free_count"] <= 0:
-                raise ActionRuntimeError(
-                    "limit_exceeded",
-                    "Сейчас все оплаченные кабинеты уже заняты.\n\nЕсли нужен еще один кабинет, сначала добавь его в подписках.",
-                    reply_markup=_subscriptions_markup(),
-                )
-
-    def _execute_help_show(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-        text, reply_markup = BillingService(self.session).build_help_message()
-        return [RuntimeReply(text=text, reply_markup=reply_markup)]
-
-    def _execute_status_show(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-        text, reply_markup = BillingService(self.session).build_status_message(action.tenant_id)
-        return [RuntimeReply(text=text, reply_markup=reply_markup)]
-
-    def _execute_subscriptions_show(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-        text, reply_markup = BillingService(self.session).build_subscriptions_message(action.tenant_id)
-        return [RuntimeReply(text=text, reply_markup=reply_markup)]
-
-    def _execute_claim_lookup(self, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-        claim_id = str(action.params.get("claim_id") or "").strip()
-        service = ClaimLookupService(self.session)
-        result = service.lookup_local_claim(action.tenant_id, claim_id)
-        if result is None:
-            return [
-                RuntimeReply(
-                    text=(
-                        f"Заявка #{claim_id} пока не найдена в локальном состоянии Среды.\n\n"
-                        "Если она появилась недавно, попробуй еще раз позже."
-                    ),
-                    reply_markup=_status_subscriptions_markup(),
-                )
-            ]
-        return [
-            RuntimeReply(
-                text=service.build_claim_reply(result),
-                reply_markup=_status_subscriptions_markup(),
-            )
-        ]
-
-    def _execute_subscription_connect_base(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        result = BillingService(self.session).start_base_subscription(action.tenant_id)
-        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-
-    def _execute_subscription_add_eds(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        result = BillingService(self.session).add_extra_eds_account(action.tenant_id)
-        replies = [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-        replies.extend(self._build_connect_replies(action, slot_type="extra"))
-        return replies
-
-    def _execute_subscription_renew_cycle(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        result = BillingService(self.session).renew_cycle(action.tenant_id)
-        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-
-    def _execute_eds_connect_start(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        slot_type = str(action.params.get("slot_type") or "available_slot")
-        resolved_slot_type = self._resolve_slot_type(action.tenant_id, slot_type)
-        return self._build_connect_replies(action, slot_type=resolved_slot_type)
-
-    def _execute_eds_connect_retry(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        slot_type = str(action.params.get("slot_type") or "")
-        return self._build_connect_replies(action, slot_type=slot_type)
-
-    def _execute_eds_slot_remove_free(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        result = BillingService(self.session).remove_extra_account_at_period_end(action.tenant_id)
-        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-
-    def _execute_eds_slot_restore_free(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        result = BillingService(self.session).restore_extra_account_slot(action.tenant_id)
-        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-
-    def _execute_eds_account_remove(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        tenant_eds_account_id = str(action.params.get("tenant_eds_account_id") or "").strip()
-        if not tenant_eds_account_id:
-            raise ActionRuntimeError(
-                "tenant_eds_account_missing",
-                "Не удалось определить кабинет для отключения.",
-                reply_markup=_subscriptions_markup(),
-            )
-        result = BillingService(self.session).schedule_connected_eds_account_cancel(
-            action.tenant_id,
-            tenant_eds_account_id,
-        )
-        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-
-    def _execute_eds_account_restore(
-        self,
-        action: ActionEnvelope,
-        context: dict[str, Any],
-    ) -> list[RuntimeReply]:
-        tenant_eds_account_id = str(action.params.get("tenant_eds_account_id") or "").strip()
-        if not tenant_eds_account_id:
-            raise ActionRuntimeError(
-                "tenant_eds_account_missing",
-                "Не удалось определить кабинет для возврата.",
-                reply_markup=_subscriptions_markup(),
-            )
-        result = BillingService(self.session).restore_connected_eds_account_cancel(
-            action.tenant_id,
-            tenant_eds_account_id,
-        )
-        return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
-
-    def _build_connect_replies(self, action: ActionEnvelope, *, slot_type: str) -> list[RuntimeReply]:
-        connect_service = EDSConnectService(self.session, get_settings())
-        try:
-            link = connect_service.create_connect_link(
-                tenant_id=action.tenant_id,
-                workspace_id=action.workspace_id,
-                user_id=action.user_id,
-                slot_type=slot_type,
-            )
-        except ConnectSessionError as exc:
-            raise ActionRuntimeError(exc.code, exc.message, reply_markup=_subscriptions_markup()) from exc
-
-        return [
-            RuntimeReply(
-                text=(
-                    "Сейчас откроется защищенная одноразовая страница для подключения личного кабинета EDS.\n\n"
-                    "Логин и пароль передаются по защищенному соединению и сохраняются в системе только в зашифрованном виде.\n\n"
-                    "Чтобы ввести данные для подключения, нажмите кнопку ниже."
-                ),
-                reply_markup={
-                    "inline_keyboard": [
-                        [_build_connect_open_button(link.url)],
-                        [{"text": "Отменить", "callback_data": STATUS_CALLBACK}],
-                    ]
-                },
-            )
-        ]
-
-    def _resolve_slot_type(self, tenant_id: str, slot_type: str) -> str:
-        if slot_type in {"primary", "extra"}:
-            return slot_type
-        summary = BillingService(self.session).get_summary(tenant_id)
-        return "primary" if not summary.connected_accounts else "extra"
-
-    async def _persist_and_enqueue_replies(
+    async def _finalize_timeout(
         self,
         *,
-        job: Job,
-        run: AgentRun,
+        job_id: str,
+        run_id: str,
         action: ActionEnvelope,
-        context: dict[str, Any],
-        replies: list[RuntimeReply],
+        timeout_seconds: float,
     ) -> None:
-        outbox_items: list[OutboxMessage] = []
-        for reply in replies:
-            outbox = OutboxMessage(
-                id=f"out_{uuid4().hex[:24]}",
-                tenant_id=run.tenant_id,
-                workspace_id=run.workspace_id,
-                channel_type="telegram",
-                status="pending",
-                payload_json=json.dumps(
-                    {
-                        "chat_id": action.external_chat_id,
-                        "text": reply.text,
-                        "reply_markup": reply.reply_markup,
-                    },
-                    ensure_ascii=False,
+        """Graph timed out mid-flight — persist ``failed`` state + best-effort
+        user notification. The notification itself is bounded by the same
+        budget so a hung Telegram client can't re-pin the job."""
+        message = "Действие отменено по таймауту."
+        sanitized = sanitize_error_message(message)
+        try:
+            await asyncio.wait_for(
+                self._write_failure_with_notification(
+                    job_id=job_id,
+                    run_id=run_id,
+                    action=action,
+                    error_code="runtime_timeout",
+                    sanitized_message=sanitized,
+                    reply_markup=None,
                 ),
+                timeout=timeout_seconds,
             )
-            self.session.add(outbox)
-            self.session.flush()
+        except asyncio.TimeoutError:
+            # Notification hung too — drop to a bare DB finalize so the
+            # job row at least leaves ``running``.
+            self.session.rollback()
+            self._write_failure_row_only(
+                job_id=job_id,
+                run_id=run_id,
+                error_code="runtime_timeout",
+                sanitized_message=sanitized,
+            )
 
-            if self.telegram_client is not None:
-                try:
-                    await self.telegram_client.send_message(
-                        chat_id=action.external_chat_id,
-                        text=reply.text,
-                        reply_markup=reply.reply_markup,
-                    )
-                    outbox.status = "sent"
-                except TelegramDeliveryError:
-                    outbox.status = "pending"
-            outbox_items.append(outbox)
-
-        now = _utcnow()
-        job.status = "completed"
-        run.status = "completed"
-        run.context_json = json.dumps(context, ensure_ascii=False)
-        run.result_json = json.dumps(
-            {
-                "outbox_message_ids": [item.id for item in outbox_items],
-                "outbox_statuses": [item.status for item in outbox_items],
-                "reply_count": len(outbox_items),
-            },
-            ensure_ascii=False,
-        )
-        run.finished_at = now
-        self.session.commit()
-
-    async def _mark_failed(
+    async def _finalize_unexpected_failure(
         self,
         *,
-        job: Job,
-        run: AgentRun,
-        action: ActionEnvelope | None,
-        context: dict[str, Any] | None,
+        job_id: str,
+        run_id: str,
+        action: ActionEnvelope | None = None,
         error_code: str,
-        message: str,
+    ) -> None:
+        message = "Не удалось выполнить действие из-за технической ошибки."
+        sanitized = sanitize_error_message(message)
+        if action is None:
+            self._write_failure_row_only(
+                job_id=job_id,
+                run_id=run_id,
+                error_code=error_code,
+                sanitized_message=sanitized,
+            )
+            return
+        try:
+            await self._write_failure_with_notification(
+                job_id=job_id,
+                run_id=run_id,
+                action=action,
+                error_code=error_code,
+                sanitized_message=sanitized,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.exception("runtime: failed to persist unexpected-failure state")
+            self.session.rollback()
+            self._write_failure_row_only(
+                job_id=job_id,
+                run_id=run_id,
+                error_code=error_code,
+                sanitized_message=sanitized,
+            )
+
+    async def _write_failure_with_notification(
+        self,
+        *,
+        job_id: str,
+        run_id: str,
+        action: ActionEnvelope,
+        error_code: str,
+        sanitized_message: str,
         reply_markup: dict | None,
     ) -> None:
-        # H8: sanitize the error text once, at the top of the failure
-        # path, and use the scrubbed version everywhere downstream — the
-        # outbox payload, the Telegram send, the ``error_message_sanitized``
-        # column. This keeps credentials out of the DB *and* prevents
-        # us from echoing them back to the user.
-        sanitized_message = _sanitize_error_message(message)
-        outbox_ids: list[str] = []
-        outbox_statuses: list[str] = []
-        if action is not None:
-            outbox = OutboxMessage(
-                id=f"out_{uuid4().hex[:24]}",
-                tenant_id=run.tenant_id,
-                workspace_id=run.workspace_id,
-                channel_type="telegram",
-                status="pending",
-                payload_json=json.dumps(
-                    {
-                        "chat_id": action.external_chat_id,
-                        "text": sanitized_message,
-                        "reply_markup": reply_markup,
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            self.session.add(outbox)
-            self.session.flush()
-            if self.telegram_client is not None:
-                try:
-                    await self.telegram_client.send_message(
-                        chat_id=action.external_chat_id,
-                        text=sanitized_message,
-                        reply_markup=reply_markup,
-                    )
-                    outbox.status = "sent"
-                except TelegramDeliveryError:
-                    outbox.status = "pending"
-            outbox_ids.append(outbox.id)
-            outbox_statuses.append(outbox.status)
+        job = self.session.get(Job, job_id)
+        run = self.session.get(AgentRun, run_id)
+        if job is None or run is None:
+            return
+
+        outbox = OutboxMessage(
+            id=f"out_{uuid4().hex[:24]}",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            channel_type="telegram",
+            status="pending",
+            payload_json=json.dumps(
+                {
+                    "chat_id": action.external_chat_id,
+                    "text": sanitized_message,
+                    "reply_markup": reply_markup,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        self.session.add(outbox)
+        self.session.flush()
+
+        if self.telegram_client is not None:
+            try:
+                await self.telegram_client.send_message(
+                    chat_id=action.external_chat_id,
+                    text=sanitized_message,
+                    reply_markup=reply_markup,
+                )
+                outbox.status = "sent"
+            except TelegramDeliveryError:
+                outbox.status = "pending"
 
         now = _utcnow()
         job.status = "failed"
         run.status = "failed"
-        if context is not None:
-            run.context_json = json.dumps(context, ensure_ascii=False)
         run.result_json = json.dumps(
             {
-                "outbox_message_ids": outbox_ids,
-                "outbox_statuses": outbox_statuses,
-                "reply_count": len(outbox_ids),
+                "outbox_message_ids": [outbox.id],
+                "outbox_statuses": [outbox.status],
+                "reply_count": 1,
             },
             ensure_ascii=False,
         )
@@ -699,63 +412,21 @@ class ActionRuntimeService:
         run.finished_at = now
         self.session.commit()
 
-
-def _sanitize_error_message(message: str) -> str:
-    """Pass an error string through the shared privacy guard.
-
-    ``_mark_failed`` and ``_mark_failed_with_timeout`` both write the
-    error text into ``AgentRun.error_message_sanitized`` (column name
-    promises sanitization) and into the outbound Telegram message.
-    Upstream handlers or ``ActionRuntimeError`` constructors can
-    accidentally embed secrets (tokens, passwords, account numbers);
-    this helper guarantees the column contents always match the
-    column name and keeps credentials out of user-visible replies.
-    """
-
-    result = get_default_privacy_guard().sanitize_text(message)
-    if result is None:
-        return ""
-    return result.sanitized_text
-
-
-def _extract_run_id(payload_json: str) -> str | None:
-    try:
-        payload = json.loads(payload_json or "{}")
-    except json.JSONDecodeError:
-        return None
-    run_id = payload.get("run_id")
-    return str(run_id) if run_id else None
-
-
-def _subscriptions_markup() -> dict:
-    return {"inline_keyboard": [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]}
-
-
-def _status_subscriptions_markup() -> dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-        ]
-    }
-
-
-def _connect_reply_markup(base_active: bool) -> dict:
-    if base_active:
-        return _status_subscriptions_markup()
-    return {
-        "inline_keyboard": [
-            [{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}],
-            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-        ]
-    }
-
-
-def _build_connect_open_button(url: str) -> dict:
-    if url.startswith("https://"):
-        return {"text": "Ввести логин и пароль от EDS", "web_app": {"url": url}}
-    return {"text": "Ввести логин и пароль от EDS", "url": url}
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+    def _write_failure_row_only(
+        self,
+        *,
+        job_id: str,
+        run_id: str,
+        error_code: str,
+        sanitized_message: str,
+    ) -> None:
+        job = self.session.get(Job, job_id)
+        run = self.session.get(AgentRun, run_id)
+        if job is not None and job.status != "failed":
+            job.status = "failed"
+        if run is not None:
+            run.status = "failed"
+            run.error_code = error_code
+            run.error_message_sanitized = sanitized_message
+            run.finished_at = _utcnow()
+        self.session.commit()

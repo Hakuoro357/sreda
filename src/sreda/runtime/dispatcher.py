@@ -108,6 +108,17 @@ def _resolve_callback_action(callback_data: str) -> tuple[str, dict] | None:
         if not _is_valid_entity_id(account_id):
             return None
         return "eds.account.restore", {"tenant_eds_account_id": account_id}
+    # Profile proposal confirm / reject (Phase 2e hybrid-UX).
+    if callback_data.startswith("profile:confirm:"):
+        proposal_id = callback_data.removeprefix("profile:confirm:")
+        if not _is_valid_entity_id(proposal_id):
+            return None
+        return "profile.confirm_update", {"proposal_id": proposal_id}
+    if callback_data.startswith("profile:reject:"):
+        proposal_id = callback_data.removeprefix("profile:reject:")
+        if not _is_valid_entity_id(proposal_id):
+            return None
+        return "profile.reject_update", {"proposal_id": proposal_id}
 
     action_type = _ACTION_BY_CALLBACK.get(callback_data)
     if action_type is None:
@@ -130,6 +141,38 @@ def _resolve_command_action(message_text: str) -> tuple[str, dict] | None:
     if command == "/claim":
         claim_id = parts[1].strip() if len(parts) > 1 else ""
         return "claim.lookup", {"claim_id": claim_id} if claim_id else {}
+
+    if command == "/tz":
+        tz = parts[1].strip() if len(parts) > 1 else ""
+        return "profile.set_timezone", {"timezone": tz}
+
+    if command == "/quiet":
+        # ``/quiet`` (no args)       → show current profile
+        # ``/quiet off``/``/quiet clear`` → clear all windows
+        # ``/quiet 22-8``             → single window 22..08 every day
+        # Handler validates/reports bad syntax.
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not rest:
+            return "profile.show", {}
+        return "profile.set_quiet_hours", {"args_raw": rest}
+
+    if command == "/skill":
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not rest:
+            return "skills.list", {}
+        tokens = rest.split()
+        feature_key = tokens[0].lower()
+        if len(tokens) == 1:
+            return "skill.show", {"feature_key": feature_key}
+        # ``/skill <key> priority <level>``
+        if len(tokens) >= 3 and tokens[1].lower() == "priority":
+            return "skill.set_priority", {
+                "feature_key": feature_key,
+                "priority": tokens[2].lower(),
+            }
+        # Unrecognized subcommand — still route to ``skill.show`` so the
+        # handler can render a help message pointing to correct syntax.
+        return "skill.show", {"feature_key": feature_key}
 
     action_type = _ACTION_BY_COMMAND.get(command)
     if action_type is None:
@@ -155,6 +198,8 @@ _ACTION_BY_COMMAND = {
     "мой статус": "status.show",
     "/subscriptions": "subscriptions.show",
     "подписки": "subscriptions.show",
+    "/profile": "profile.show",
+    "/skills": "skills.list",
 }
 
 _ACTION_BY_CALLBACK = {

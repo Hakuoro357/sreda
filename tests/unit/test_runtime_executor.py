@@ -385,21 +385,22 @@ def test_runtime_mark_failed_sanitizes_error_message_before_persisting(monkeypat
         telegram_client = FakeTelegramClient()
         service = ActionRuntimeService(session, telegram_client=telegram_client)
 
-        # Inject a leaky runtime error from inside the router to simulate
-        # an upstream handler that embedded credentials into its message.
+        # Inject a leaky runtime error from inside a handler to simulate
+        # an upstream skill that embedded credentials into its message.
+        # After the Phase 1 refactor handlers live in a module-level
+        # registry; monkeypatching that dict is the supported
+        # injection point.
         from sreda.runtime.executor import ActionRuntimeError
+        from sreda.runtime.handlers import HANDLERS
 
         leaky_message = (
             "Сбой в обработчике (пароль: hunter2-PROD, email test@example.com)."
         )
 
-        def _leaky_route(action_type: str):
-            def _handler(action, context):
-                raise ActionRuntimeError("runtime_unexpected_error", leaky_message)
+        def _leaky_handler(_session, _action, _context):
+            raise ActionRuntimeError("runtime_unexpected_error", leaky_message)
 
-            return _handler
-
-        monkeypatch.setattr(service, "_route_action", _leaky_route)
+        monkeypatch.setitem(HANDLERS, "help.show", _leaky_handler)
 
         queued = service.enqueue_action(
             ActionEnvelope(

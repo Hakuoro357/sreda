@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # ``running`` forever.
     job_max_runtime_seconds: float = 120.0
 
+    # Polling interval for the always-on job runner (spec 36 Stage 2).
+    # Set to 0 to disable the loop and only run a single pass (used in tests).
+    job_poll_interval_seconds: float = 5.0
+
     # Опциональный путь к файлу для structured JSON-лога неудачных
     # попыток подключения EDS-ЛК (для post-mortem анализа). Одна
     # запись — одна строка JSON с timestamp, tenant_id, login_masked,

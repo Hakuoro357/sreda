@@ -19,6 +19,19 @@ from sreda.db.models.core import (
 )
 from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
 from sreda.db.models.runtime import AgentRun, AgentThread
+from sreda.db.models.skill_platform import (
+    SkillAIExecution,
+    SkillEvent,
+    SkillRun,
+    SkillRunAttempt,
+    TenantSkillConfig,
+    TenantSkillState,
+)
+from sreda.db.models.user_profile import (
+    TenantUserProfile,
+    TenantUserProfileProposal,
+    TenantUserSkillConfig,
+)
 
 __all__ = [
     "AgentRun",
@@ -36,11 +49,20 @@ __all__ = [
     "Job",
     "OutboxMessage",
     "SecureRecord",
+    "SkillAIExecution",
+    "SkillEvent",
+    "SkillRun",
+    "SkillRunAttempt",
     "Tenant",
     "TenantBillingCycle",
     "TenantEDSAccount",
+    "TenantSkillConfig",
+    "TenantSkillState",
     "TenantSubscription",
     "TenantFeature",
+    "TenantUserProfile",
+    "TenantUserProfileProposal",
+    "TenantUserSkillConfig",
     "User",
     "Workspace",
 ]
