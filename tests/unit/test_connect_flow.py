@@ -182,7 +182,7 @@ def test_submit_connect_form_stores_secure_payload_and_queues_job(
     )
 
     assert response.status_code == 200
-    assert "Данные получены" in response.text
+    assert "Кабинет EDS" in response.text  # verified path → title/message упоминают подключённый ЛК
 
     session = get_session_factory()()
     try:
@@ -438,7 +438,7 @@ def test_submit_connect_form_accepts_same_origin_post(
     )
 
     assert response.status_code == 200
-    assert "Данные получены" in response.text
+    assert "Кабинет EDS" in response.text  # verified path → title/message упоминают подключённый ЛК
 
 
 def test_submit_connect_form_concurrent_requests_create_only_one_account(
@@ -628,7 +628,7 @@ def test_submit_form_shows_verified_message_when_inline_verification_completes(
     )
 
     assert response.status_code == 200
-    assert "Кабинет EDS подключен" in response.text
+    assert "Кабинет EDS подключ" in response.text  # покрывает "подключен/подключён"
     assert "Результат проверки придёт" not in response.text
 
 
@@ -677,7 +677,7 @@ def test_submit_form_shows_neutral_message_when_inline_verification_fails(
     )
 
     assert response.status_code == 200
-    assert "Кабинет EDS подключен" not in response.text
+    assert "Кабинет EDS подключ" not in response.text
     assert "Результат проверки придёт в Telegram" in response.text
 
 
@@ -723,7 +723,7 @@ def test_submit_form_shows_neutral_message_when_inline_verification_raises(
     )
 
     assert response.status_code == 200
-    assert "Кабинет EDS подключен" not in response.text
+    assert "Кабинет EDS подключ" not in response.text
     assert "Результат проверки придёт в Telegram" in response.text
 
 

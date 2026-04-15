@@ -223,26 +223,32 @@ def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
 
 
 def _render_submitted_page(*, already_started: bool = False, verified: bool = False) -> str:
+    # Title + heading должны соответствовать message. Если оставлять
+    # "Данные получены" для любого исхода — пользователь читает это как
+    # подтверждение успеха, даже когда inline-kick фактически упал.
     if already_started:
+        title = "Проверка уже идёт"
         message = "Проверка уже запущена."
     elif verified:
-        message = "Кабинет EDS подключен. Подробности в Telegram."
+        title = "Кабинет EDS подключён"
+        message = "Подробности — в Telegram."
     else:
-        # Нейтральная формулировка для всех не-успешных исходов (в том
-        # числе когда inline-kick упал с failed/retry/exception): мы
-        # приняли данные, итог придёт через Telegram.
-        message = "Данные получены. Результат проверки придёт в Telegram."
-    return """<!doctype html>
+        # Нейтральная формулировка для всех не-успешных исходов (failed /
+        # retry_scheduled / claimed_by_other / exception): форму мы
+        # приняли, но про успех или провал узнаем через Telegram.
+        title = "Форма отправлена"
+        message = "Результат проверки придёт в Telegram."
+    return f"""<!doctype html>
 <html lang="ru">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Данные получены</title>
+    <title>{escape(title)}</title>
   </head>
   <body>
     <main style="max-width:560px;margin:40px auto;font-family:Arial,sans-serif;line-height:1.5;">
-      <h1>Данные получены</h1>
-      <p>""" + escape(message) + """</p>
+      <h1>{escape(title)}</h1>
+      <p>{escape(message)}</p>
       <p>Можно закрыть эту страницу и вернуться в Telegram.</p>
     </main>
   </body>

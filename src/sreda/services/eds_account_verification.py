@@ -73,6 +73,12 @@ class DefaultEDSVerificationAdapter:
 
         client = EDSMonitorClient()
         try:
+            # Fast-fail precheck через прямой POST /api/login. EDS
+            # моментально отвечает 403 на неверные credentials — без
+            # этого Playwright-login ниже ждёт до 120с до timeout'а
+            # и пользователь видит обобщённое "Проверка не успела
+            # завершиться" вместо точного "Проверь логин и пароль".
+            await client.precheck_credentials(login=login, password=password)
             await client.login(
                 account_key,
                 login=login,

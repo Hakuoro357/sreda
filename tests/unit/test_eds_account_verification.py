@@ -565,14 +565,20 @@ def _build_test_settings():
 
 
 def _install_leak_client(monkeypatch, side_effect):
-    """Подменяет ``EDSMonitorClient`` так, чтобы первая же сетевая операция
-    (``login``) подняла переданный exception."""
+    """Подменяет ``EDSMonitorClient`` так, чтобы ``login`` поднял
+    переданный exception. ``precheck_credentials`` замещается no-op,
+    чтобы проверить именно classification login-ветки (в отдельных
+    тестах можно заменить precheck на нужный side_effect)."""
 
     from sreda_feature_eds_monitor.integrations.client import EDSMonitorClient
+
+    async def _noop(self, *args, **kwargs):
+        return None
 
     async def _fail(self, *args, **kwargs):
         raise side_effect
 
+    monkeypatch.setattr(EDSMonitorClient, "precheck_credentials", _noop)
     monkeypatch.setattr(EDSMonitorClient, "login", _fail)
 
 
