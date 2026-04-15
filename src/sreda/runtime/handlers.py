@@ -90,8 +90,52 @@ def execute_status_show(session: Session, action: ActionEnvelope, context: dict[
 
 
 def execute_subscriptions_show(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-    text, reply_markup = BillingService(session).build_subscriptions_message(action.tenant_id)
+    # Phase: direct-to-miniapp UX. When the user has an active base
+    # subscription + free slot, render "Подключить ЛК EDS" as a
+    # ``web_app`` button with a pre-generated one-time connect URL —
+    # single tap opens the mini-app. Fallback to callback button if
+    # link creation fails or we lack user context (e.g. broadcast).
+    billing = BillingService(session)
+    summary = billing.get_summary(action.tenant_id)
+
+    connect_button_override: dict | None = None
+    if (
+        summary.base_active
+        and summary.free_count > 0
+        and action.user_id is not None
+    ):
+        slot_type = "primary" if not summary.connected_accounts else "extra"
+        try:
+            link = EDSConnectService(session, get_settings()).create_connect_link(
+                tenant_id=action.tenant_id,
+                workspace_id=action.workspace_id,
+                user_id=action.user_id,
+                slot_type=slot_type,
+            )
+            connect_button_override = _build_connect_subscriptions_button(link.url)
+        except ConnectSessionError as exc:
+            logger.warning(
+                "subscriptions.show: could not pre-generate connect link (%s); "
+                "falling back to callback button",
+                exc.code,
+            )
+
+    text, reply_markup = billing.build_subscriptions_message(
+        action.tenant_id, connect_button_override=connect_button_override
+    )
     return [RuntimeReply(text=text, reply_markup=reply_markup)]
+
+
+def _build_connect_subscriptions_button(url: str) -> dict:
+    """Inline button for "Подключить ЛК EDS" in the subscriptions view.
+
+    Distinguished from the legacy connect-flow button (which uses the
+    "Ввести логин и пароль от EDS" label sent in the intermediate
+    message) by its subscriptions-facing label. Both point at the
+    same one-time ``url`` through Telegram's web_app / url field."""
+    if url.startswith("https://"):
+        return {"text": "Подключить ЛК EDS", "web_app": {"url": url}}
+    return {"text": "Подключить ЛК EDS", "url": url}
 
 
 def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:

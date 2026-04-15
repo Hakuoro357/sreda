@@ -260,7 +260,22 @@ class BillingService:
         buttons: list[list[dict]] = [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
         return text, _inline_keyboard(buttons)
 
-    def build_subscriptions_message(self, tenant_id: str, *, now: datetime | None = None) -> tuple[str, dict]:
+    def build_subscriptions_message(
+        self,
+        tenant_id: str,
+        *,
+        now: datetime | None = None,
+        connect_button_override: dict | None = None,
+    ) -> tuple[str, dict]:
+        """Render the /subscriptions message + markup.
+
+        ``connect_button_override`` — if set, replaces the default
+        ``callback_data`` button for "Подключить ЛК EDS" with a
+        caller-supplied button dict (typically a ``web_app``-backed
+        one carrying a pre-generated one-time connect URL). Lets the
+        dispatcher skip the intermediate "click to open" step and
+        launch the connect UI with a single tap.
+        """
         summary = self.get_summary(tenant_id, now=now)
         base_plan = self._get_plan(PLAN_EDS_MONITOR_BASE)
         extra_plan = self._get_plan(PLAN_EDS_MONITOR_EXTRA)
@@ -296,7 +311,10 @@ class BillingService:
         else:
             buttons.append([{"text": "Добавить подписку на EDS", "callback_data": ADD_EDS_ACCOUNT_CALLBACK}])
             if summary.free_count > 0:
-                buttons.append([{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}])
+                if connect_button_override is not None:
+                    buttons.append([connect_button_override])
+                else:
+                    buttons.append([{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}])
             for account in summary.connected_accounts:
                 if account.scheduled_for_disconnect:
                     continue
