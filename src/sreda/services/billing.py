@@ -165,9 +165,9 @@ class BillingService:
             ]
         )
 
-    def get_summary(self, tenant_id: str) -> BillingSummary:
+    def get_summary(self, tenant_id: str, *, now: datetime | None = None) -> BillingSummary:
         self.ensure_default_plans()
-        now = _utcnow()
+        now = _utcnow(now)
         base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
         extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
         cycle = self._get_cycle(tenant_id)
@@ -221,8 +221,8 @@ class BillingService:
             connected_accounts=connected_accounts,
         )
 
-    def build_status_message(self, tenant_id: str) -> tuple[str, dict]:
-        summary = self.get_summary(tenant_id)
+    def build_status_message(self, tenant_id: str, *, now: datetime | None = None) -> tuple[str, dict]:
+        summary = self.get_summary(tenant_id, now=now)
         active_lines: list[str] = []
         if summary.base_active and summary.base_active_until:
             active_lines.append(f"- EDS Monitor — активно до {_format_date(summary.base_active_until)}")
@@ -260,8 +260,8 @@ class BillingService:
         buttons: list[list[dict]] = [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
         return text, _inline_keyboard(buttons)
 
-    def build_subscriptions_message(self, tenant_id: str) -> tuple[str, dict]:
-        summary = self.get_summary(tenant_id)
+    def build_subscriptions_message(self, tenant_id: str, *, now: datetime | None = None) -> tuple[str, dict]:
+        summary = self.get_summary(tenant_id, now=now)
         base_plan = self._get_plan(PLAN_EDS_MONITOR_BASE)
         extra_plan = self._get_plan(PLAN_EDS_MONITOR_EXTRA)
         next_cycle_free_slots = self._get_free_slots_for_next_cycle(tenant_id)
@@ -310,7 +310,7 @@ class BillingService:
                 )
             if next_cycle_free_slots > 0:
                 buttons.append([{"text": "Убрать свободную подписку на EDS", "callback_data": REMOVE_EDS_ACCOUNT_CALLBACK}])
-            buttons.extend(self._build_restore_rows(tenant_id, summary))
+            buttons.extend(self._build_restore_rows(tenant_id, summary, now=now))
         buttons.append([{"text": "Мой статус", "callback_data": STATUS_CALLBACK}])
         return text, _inline_keyboard(buttons)
 
@@ -397,7 +397,7 @@ class BillingService:
         self._ensure_feature_enabled(tenant_id, "eds_monitor", True)
         self.session.commit()
 
-        summary = self.get_summary(tenant_id)
+        summary = self.get_summary(tenant_id, now=current_time)
         return SubscriptionActionResult(
             message_text=(
                 "Подписка EDS Monitor подключена.\n\n"
@@ -432,7 +432,10 @@ class BillingService:
             )
 
         cycle = self._get_cycle(tenant_id)
-        assert cycle is not None
+        if cycle is None:
+            raise RuntimeError(
+                f"tenant {tenant_id} has an active base subscription but no billing cycle"
+            )
         plan = self._get_plan(PLAN_EDS_MONITOR_EXTRA)
         amount_rub = _calculate_proration(plan.price_rub, cycle.next_payment_due_at, current_time)
 
@@ -479,7 +482,7 @@ class BillingService:
         extra_subscription.updated_at = current_time
 
         self.session.commit()
-        summary = self.get_summary(tenant_id)
+        summary = self.get_summary(tenant_id, now=current_time)
         return SubscriptionActionResult(
             message_text=(
                 "Дополнительный кабинет EDS подключен.\n\n"
@@ -506,17 +509,21 @@ class BillingService:
                 reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
             )
 
-        subscriptions = (
-            self.session.query(TenantSubscription)
+        # Join subscriptions with their plans in a single round-trip so
+        # the loop below no longer issues ``session.get(SubscriptionPlan,
+        # subscription.plan_id)`` per row (N+1). An INNER JOIN matches
+        # the old behavior: subscriptions whose plan row is missing were
+        # silently skipped.
+        subscription_plan_rows: list[tuple[TenantSubscription, SubscriptionPlan]] = (
+            self.session.query(TenantSubscription, SubscriptionPlan)
+            .join(SubscriptionPlan, TenantSubscription.plan_id == SubscriptionPlan.id)
             .filter(TenantSubscription.tenant_id == tenant_id)
             .all()
         )
+        subscriptions = [row[0] for row in subscription_plan_rows]
         renewable_items: list[tuple[TenantSubscription, SubscriptionPlan, int]] = []
         total_amount_rub = 0
-        for subscription in subscriptions:
-            plan = self.session.get(SubscriptionPlan, subscription.plan_id)
-            if plan is None:
-                continue
+        for subscription, plan in subscription_plan_rows:
             next_quantity = self._get_next_cycle_quantity(subscription)
             if (
                 plan.plan_key == PLAN_EDS_MONITOR_BASE
@@ -589,7 +596,7 @@ class BillingService:
         self._apply_tenant_eds_account_renewal_state(tenant_id)
         self.session.commit()
 
-        summary = self.get_summary(tenant_id)
+        summary = self.get_summary(tenant_id, now=current_time)
         return SubscriptionActionResult(
             message_text=(
                 "Подписка продлена.\n\n"
@@ -657,8 +664,9 @@ class BillingService:
             ),
         )
 
-    def remove_extra_account_at_period_end(self, tenant_id: str) -> SubscriptionActionResult:
-        summary = self.get_summary(tenant_id)
+    def remove_extra_account_at_period_end(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
+        current_time = _utcnow(now)
+        summary = self.get_summary(tenant_id, now=current_time)
         if summary.allowed_count <= 0:
             return SubscriptionActionResult(
                 message_text="Сейчас нет подписок EDS, которые можно убрать.",
@@ -781,8 +789,9 @@ class BillingService:
             ),
         )
 
-    def restore_extra_account_slot(self, tenant_id: str) -> SubscriptionActionResult:
-        if self._get_removed_free_slot_count(tenant_id) <= 0:
+    def restore_extra_account_slot(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
+        current_time = _utcnow(now)
+        if self._get_removed_free_slot_count(tenant_id, now=current_time) <= 0:
             return SubscriptionActionResult(
                 message_text="Сейчас нет свободной подписки EDS, которую можно вернуть.",
                 reply_markup=_inline_keyboard(
@@ -796,7 +805,7 @@ class BillingService:
         self._restore_next_cycle_free_slot(tenant_id)
         self.session.commit()
 
-        summary = self.get_summary(tenant_id)
+        summary = self.get_summary(tenant_id, now=current_time)
         return SubscriptionActionResult(
             message_text=(
                 "Свободная подписка на EDS снова будет продлена на следующий период.\n\n"
@@ -815,7 +824,10 @@ class BillingService:
         self,
         tenant_id: str,
         tenant_eds_account_id: str,
+        *,
+        now: datetime | None = None,
     ) -> SubscriptionActionResult:
+        current_time = _utcnow(now)
         tenant_account = self.session.get(TenantEDSAccount, tenant_eds_account_id)
         if tenant_account is None or tenant_account.tenant_id != tenant_id:
             return SubscriptionActionResult(
@@ -854,7 +866,7 @@ class BillingService:
         tenant_account.updated_at = _utcnow()
         self.session.commit()
 
-        summary = self.get_summary(tenant_id)
+        summary = self.get_summary(tenant_id, now=current_time)
         return SubscriptionActionResult(
             message_text=(
                 f"Кабинет {tenant_account.login_masked} снова будет продлен на следующий период.\n\n"
@@ -926,7 +938,7 @@ class BillingService:
             )
         return items
 
-    def _build_restore_rows(self, tenant_id: str, summary: BillingSummary) -> list[list[dict]]:
+    def _build_restore_rows(self, tenant_id: str, summary: BillingSummary, *, now: datetime | None = None) -> list[list[dict]]:
         rows: list[list[dict]] = []
         scheduled_accounts = [account for account in summary.connected_accounts if account.scheduled_for_disconnect]
         if scheduled_accounts:
@@ -939,7 +951,7 @@ class BillingService:
                         }
                     ]
                 )
-        if self._get_removed_free_slot_count(tenant_id) > 0:
+        if self._get_removed_free_slot_count(tenant_id, now=now) > 0:
             rows.append([{"text": "Вернуть свободную подписку на EDS", "callback_data": RESTORE_EDS_ACCOUNT_CALLBACK}])
         return rows
 
@@ -968,8 +980,8 @@ class BillingService:
         next_allowed_count = self._get_next_allowed_count(tenant_id)
         return max(next_allowed_count - self._get_unscheduled_occupied_count(tenant_id), 0)
 
-    def _get_removed_free_slot_count(self, tenant_id: str) -> int:
-        summary = self.get_summary(tenant_id)
+    def _get_removed_free_slot_count(self, tenant_id: str, *, now: datetime | None = None) -> int:
+        summary = self.get_summary(tenant_id, now=now)
         scheduled_connected_count = sum(
             1 for account in summary.connected_accounts if account.scheduled_for_disconnect
         )

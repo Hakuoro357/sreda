@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
@@ -67,6 +67,54 @@ def test_add_extra_eds_account_increases_quantity_and_next_amount() -> None:
     assert summary.next_amount_rub == 5980
 
 
+def test_renew_cycle_loads_subscription_plans_without_n_plus_one() -> None:
+    """Regression guard: renew_cycle used to call ``session.get`` on
+    ``SubscriptionPlan`` inside a loop over each tenant subscription,
+    producing an N+1 round-trip pattern. With both base and extra
+    subscriptions active, a fresh renew_cycle call should never hit
+    the plans table more than once (a single batched/JOIN query)."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_tenant_bundle(session)
+    service = BillingService(session)
+
+    service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
+    service.add_extra_eds_account("tenant_1", now=datetime(2026, 3, 2, 12, 0, tzinfo=UTC))
+
+    plan_by_id_selects: list[str] = []
+
+    def _before_execute(conn, cursor, statement, parameters, context, executemany):
+        # Only count SELECTs keyed by ``subscription_plans.id`` — those are
+        # the ``session.get(SubscriptionPlan, plan_id)`` calls made once
+        # per tenant subscription in the old implementation. Lookups by
+        # ``plan_key`` are used by ``ensure_default_plans`` and other
+        # code paths and are not part of the N+1 pattern we're fixing.
+        lowered = statement.lower()
+        if (
+            lowered.lstrip().startswith("select")
+            and "subscription_plans" in lowered
+            and "subscription_plans.id = ?" in lowered
+        ):
+            plan_by_id_selects.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _before_execute)
+    try:
+        service.renew_cycle("tenant_1", now=datetime(2026, 3, 10, 12, 0, tzinfo=UTC))
+    finally:
+        event.remove(engine, "before_cursor_execute", _before_execute)
+
+    # Two subscriptions (base + extra) ⇒ the old code issued two plan
+    # SELECTs by id (one per subscription). The fix must batch them into
+    # zero (JOIN'd with the subscriptions query) or at most one.
+    assert len(plan_by_id_selects) <= 1, (
+        f"renew_cycle issued {len(plan_by_id_selects)} "
+        f"`SELECT ... subscription_plans.id = ?` queries inside its loop "
+        f"(expected <= 1)"
+    )
+
+
 def test_renew_cycle_respects_scheduled_cancel_for_extra_account() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -76,7 +124,7 @@ def test_renew_cycle_respects_scheduled_cancel_for_extra_account() -> None:
 
     service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
     service.add_extra_eds_account("tenant_1", now=datetime(2026, 3, 2, 12, 0, tzinfo=UTC))
-    service.remove_extra_account_at_period_end("tenant_1")
+    service.remove_extra_account_at_period_end("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
 
     result = service.renew_cycle("tenant_1", now=datetime(2026, 3, 10, 12, 0, tzinfo=UTC))
 
@@ -194,7 +242,7 @@ def test_status_message_shows_connected_accounts_and_free_slots() -> None:
     )
     session.commit()
 
-    text, _ = service.build_status_message("tenant_1")
+    text, _ = service.build_status_message("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
 
     assert "Кабинеты EDS:" in text
     assert "подключено кабинетов: 1 из 2" in text
@@ -346,11 +394,11 @@ def test_restore_extra_account_slot_restores_next_cycle_quantity() -> None:
 
     service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
     service.add_extra_eds_account("tenant_1", now=datetime(2026, 3, 2, 12, 0, tzinfo=UTC))
-    service.remove_extra_account_at_period_end("tenant_1")
+    service.remove_extra_account_at_period_end("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
 
-    result = service.restore_extra_account_slot("tenant_1")
+    result = service.restore_extra_account_slot("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
     extra = service._get_subscription("tenant_1", PLAN_EDS_MONITOR_EXTRA)
-    summary = service.get_summary("tenant_1")
+    summary = service.get_summary("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
 
     assert "снова будет продлен" in result.message_text
     assert extra is not None and extra.next_cycle_quantity == 1
@@ -413,9 +461,9 @@ def test_subscriptions_message_shows_restore_button_for_removed_empty_slot() -> 
 
     service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
     service.add_extra_eds_account("tenant_1", now=datetime(2026, 3, 2, 12, 0, tzinfo=UTC))
-    service.remove_extra_account_at_period_end("tenant_1")
+    service.remove_extra_account_at_period_end("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
 
-    _, reply_markup = service.build_subscriptions_message("tenant_1")
+    _, reply_markup = service.build_subscriptions_message("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
     button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
 
     assert "Вернуть свободную подписку на EDS" in button_texts
@@ -430,7 +478,7 @@ def test_subscriptions_message_uses_new_eds_labels_and_actions() -> None:
 
     service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
 
-    _, reply_markup = service.build_subscriptions_message("tenant_1")
+    _, reply_markup = service.build_subscriptions_message("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
     button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
 
     assert "Отменить подписку на EDS" not in button_texts
@@ -461,7 +509,7 @@ def test_subscriptions_message_hides_add_cabinet_when_no_free_paid_slots() -> No
     )
     session.commit()
 
-    _, reply_markup = service.build_subscriptions_message("tenant_1")
+    _, reply_markup = service.build_subscriptions_message("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
     button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
 
     assert "Добавить подписку на EDS" in button_texts
@@ -503,7 +551,7 @@ def test_subscriptions_message_shows_remove_button_for_each_connected_account() 
     )
     session.commit()
 
-    _, reply_markup = service.build_subscriptions_message("tenant_1")
+    _, reply_markup = service.build_subscriptions_message("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
     button_texts = [button["text"] for row in reply_markup["inline_keyboard"] for button in row]
 
     assert "Убрать 5047***341" in button_texts
@@ -522,7 +570,7 @@ def test_summary_counts_base_amount_even_if_base_marked_not_to_renew() -> None:
     service.add_extra_eds_account("tenant_1", now=datetime(2026, 3, 2, 12, 0, tzinfo=UTC))
     service.cancel_base_at_period_end("tenant_1")
 
-    summary = service.get_summary("tenant_1")
+    summary = service.get_summary("tenant_1", now=datetime(2026, 3, 5, 12, 0, tzinfo=UTC))
 
     assert summary.next_amount_rub == 5980
 
@@ -548,6 +596,30 @@ def test_renew_cycle_renews_active_base_even_if_marked_not_to_renew() -> None:
     assert base is not None and base.quantity == 1 and base.status == "active"
     assert extra is not None and extra.quantity == 1 and extra.status == "active"
     assert summary.next_amount_rub == 5980
+
+
+def test_add_extra_eds_account_raises_runtime_error_when_billing_cycle_missing() -> None:
+    import pytest
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    _seed_tenant_bundle(session)
+    service = BillingService(session)
+
+    service.start_base_subscription("tenant_1", now=datetime(2026, 3, 1, 12, 0, tzinfo=UTC))
+    # Corrupt invariant: active base subscription stays but the billing cycle
+    # row disappears (simulates a data-fix / race / partial wipe). The guard
+    # on add_extra_eds_account must produce a real exception, not an
+    # AssertionError that vanishes under python -O.
+    session.query(TenantBillingCycle).delete()
+    session.commit()
+
+    with pytest.raises(RuntimeError, match="billing cycle"):
+        service.add_extra_eds_account(
+            "tenant_1",
+            now=datetime(2026, 3, 2, 12, 0, tzinfo=UTC),
+        )
 
 
 def _seed_tenant_bundle(session) -> None:

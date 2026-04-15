@@ -457,6 +457,111 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
     assert len(subscriptions) == 1
 
 
+def test_telegram_webhook_rejects_request_without_secret_token_header(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "secret_required.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "expected-secret")
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            "text": "hi",
+        },
+    }
+
+    response = client.post("/webhooks/telegram/sreda", json=payload)
+
+    assert response.status_code == 401
+    # Ensure nothing was persisted — attacker must not be able to trigger side effects
+    session = get_session_factory()()
+    try:
+        assert session.query(InboundMessage).count() == 0
+    finally:
+        session.close()
+
+
+def test_telegram_webhook_rejects_request_with_wrong_secret_token(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "secret_wrong.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "expected-secret")
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/webhooks/telegram/sreda",
+        json={"update_id": 2},
+        headers={"X-Telegram-Bot-Api-Secret-Token": "attacker-guess"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_telegram_webhook_accepts_request_with_matching_secret_token(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "secret_ok.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "expected-secret")
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        session.commit()
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 3,
+        "message": {
+            "message_id": 1,
+            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            "text": "hi",
+        },
+    }
+
+    response = client.post(
+        "/webhooks/telegram/sreda",
+        json=payload,
+        headers={"X-Telegram-Bot-Api-Secret-Token": "expected-secret"},
+    )
+
+    assert response.status_code == 202
+
+
 def test_telegram_webhook_handles_claim_lookup_command(
     monkeypatch,
     tmp_path: Path,
@@ -503,7 +608,7 @@ def test_telegram_webhook_handles_claim_lookup_command(
                 site_key="mosreg",
                 account_key="eds-1",
                 label="EDS кабинет 1",
-                login="5047136341",
+                login_masked="***41",
             )
         )
         session.add(
@@ -564,3 +669,68 @@ def test_telegram_webhook_handles_claim_lookup_command(
     assert runs[0].action_type == "claim.lookup"
     assert runs[0].status == "completed"
     assert len(outbox) == 1
+
+
+def test_telegram_webhook_rate_limits_excess_requests(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Regression guard for H1: the webhook must refuse traffic above
+    the per-IP cap with a ``429``. We set a tiny cap, fire more
+    requests than that, and check that the excess lands on 429. The
+    rate-limit check runs BEFORE the secret-token verification, so
+    the test does not need a real secret to reach the limiter.
+    """
+
+    db_path = tmp_path / "test.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_RATE_LIMIT_TELEGRAM_MAX_REQUESTS", "2")
+    monkeypatch.setenv("SREDA_RATE_LIMIT_TELEGRAM_WINDOW_SECONDS", "60")
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    from sreda.api.deps import reset_rate_limiters
+
+    reset_rate_limiters()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        session.commit()
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 9999,
+        "message": {
+            "message_id": 1,
+            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            "text": "/help",
+        },
+    }
+    try:
+        statuses = [
+            client.post("/webhooks/telegram/sreda", json=payload).status_code
+            for _ in range(4)
+        ]
+    finally:
+        reset_rate_limiters()
+        get_settings.cache_clear()
+        get_engine.cache_clear()
+        get_session_factory.cache_clear()
+
+    # Two allowed (even if they return 202 or 4xx downstream), the
+    # remainder must be hard 429s from the limiter.
+    assert statuses[0] != 429
+    assert statuses[1] != 429
+    assert statuses[2] == 429
+    assert statuses[3] == 429

@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from html import escape
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
-from sreda.config.settings import get_settings
+from sreda.api.deps import enforce_connect_rate_limit
+from sreda.config.settings import Settings, get_settings
 from sreda.db.session import get_db_session
 from sreda.integrations.telegram.client import TelegramClient
 from sreda.services.eds_account_verification import EDSAccountVerificationService
@@ -19,7 +20,46 @@ router = APIRouter(tags=["connect"])
 logger = logging.getLogger(__name__)
 
 
-@router.get("/connect/eds/{token}", response_class=HTMLResponse)
+def _enforce_same_origin(request: Request, settings: Settings) -> None:
+    """Reject cross-origin POSTs to the connect form.
+
+    Real browsers always send ``Origin`` on POST requests since the
+    Fetch spec landed in every evergreen engine, so an Origin that
+    does not match the public base URL means the request originated
+    from a different site (classic CSRF). A missing ``Origin`` is
+    accepted for server-side clients and tests — browsers never omit
+    it on same-origin POSTs that our rendered form triggers, so the
+    relaxation does not widen the browser attack surface.
+    """
+
+    origin = request.headers.get("origin")
+    if origin is None:
+        return
+    expected_base = (settings.connect_public_base_url or "").strip().rstrip("/")
+    if not expected_base:
+        return
+    try:
+        expected = urlsplit(expected_base)
+        actual = urlsplit(origin.rstrip("/"))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="origin_invalid") from exc
+    if (
+        expected.scheme != actual.scheme
+        or expected.hostname != actual.hostname
+        or (expected.port or None) != (actual.port or None)
+    ):
+        logger.warning(
+            "connect form POST rejected: cross-origin submission (origin=%s)",
+            origin,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="origin_mismatch")
+
+
+@router.get(
+    "/connect/eds/{token}",
+    response_class=HTMLResponse,
+    dependencies=[Depends(enforce_connect_rate_limit)],
+)
 def open_eds_connect_form(
     token: str,
     session: Session = Depends(get_db_session),
@@ -38,16 +78,24 @@ def open_eds_connect_form(
     )
 
 
-@router.post("/connect/eds/{token}", response_class=HTMLResponse)
+@router.post(
+    "/connect/eds/{token}",
+    response_class=HTMLResponse,
+    dependencies=[Depends(enforce_connect_rate_limit)],
+)
 async def submit_eds_connect_form(
     token: str,
     request: Request,
     session: Session = Depends(get_db_session),
 ) -> HTMLResponse:
     settings = get_settings()
+    _enforce_same_origin(request, settings)
     service = EDSConnectService(session, settings)
     body = await request.body()
-    parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    try:
+        parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except (UnicodeDecodeError, ValueError):
+        return HTMLResponse(_render_error_page("Некорректные данные формы."), status_code=400)
     login = (parsed.get("login") or [""])[0]
     password = (parsed.get("password") or [""])[0]
     try:
@@ -58,11 +106,19 @@ async def submit_eds_connect_form(
         return HTMLResponse(_render_error_page(exc.message), status_code=exc.status_code)
     telegram_client = TelegramClient(settings.telegram_bot_token) if settings.telegram_bot_token else None
     verifier = EDSAccountVerificationService(session, telegram_client=telegram_client)
+    inline_result: str | None = None
     try:
-        await verifier.process_job(result.job_id)
+        inline_result = await verifier.process_job(result.job_id)
     except Exception:
         logger.exception("Inline EDS verification kick failed for job %s", result.job_id)
-    return HTMLResponse(_render_submitted_page(), status_code=200)
+    # Показываем "подключено" только если верификация реально прошла. Любой
+    # другой исход (failed / retry_scheduled / claimed_by_other / exception)
+    # — нейтральный текст "результат придёт в Telegram": именно туда уходит
+    # итоговое сообщение (success или failure).
+    return HTMLResponse(
+        _render_submitted_page(verified=(inline_result == "completed")),
+        status_code=200,
+    )
 
 
 def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
@@ -166,23 +222,33 @@ def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
 </html>"""
 
 
-def _render_submitted_page(*, already_started: bool = False) -> str:
-    message = (
-        "Проверка уже запущена."
-        if already_started
-        else "Сейчас проверяем доступ к кабинету EDS."
-    )
-    return """<!doctype html>
+def _render_submitted_page(*, already_started: bool = False, verified: bool = False) -> str:
+    # Title + heading должны соответствовать message. Если оставлять
+    # "Данные получены" для любого исхода — пользователь читает это как
+    # подтверждение успеха, даже когда inline-kick фактически упал.
+    if already_started:
+        title = "Проверка уже идёт"
+        message = "Проверка уже запущена."
+    elif verified:
+        title = "Кабинет EDS подключён"
+        message = "Подробности — в Telegram."
+    else:
+        # Нейтральная формулировка для всех не-успешных исходов (failed /
+        # retry_scheduled / claimed_by_other / exception): форму мы
+        # приняли, но про успех или провал узнаем через Telegram.
+        title = "Форма отправлена"
+        message = "Результат проверки придёт в Telegram."
+    return f"""<!doctype html>
 <html lang="ru">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Данные получены</title>
+    <title>{escape(title)}</title>
   </head>
   <body>
     <main style="max-width:560px;margin:40px auto;font-family:Arial,sans-serif;line-height:1.5;">
-      <h1>Данные получены</h1>
-      <p>""" + escape(message) + """</p>
+      <h1>{escape(title)}</h1>
+      <p>{escape(message)}</p>
       <p>Можно закрыть эту страницу и вернуться в Telegram.</p>
     </main>
   </body>
