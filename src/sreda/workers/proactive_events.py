@@ -38,7 +38,15 @@ from sreda.db.repositories.inbound_event import InboundEventRepository
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.features.app_registry import get_feature_registry
 from sreda.runtime.handlers import RuntimeReply
+from sreda.runtime.proactive_policy import (
+    ProactiveDecisionKind,
+    decide_proactive,
+)
 from sreda.services.budget import BudgetService
+from sreda.services.embeddings import (
+    EmbeddingClient,
+    get_embeddings_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +68,19 @@ class ProactiveEventContext:
 
 
 class ProactiveEventWorker:
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        embedding_client: EmbeddingClient | None = None,
+    ) -> None:
         self.session = session
         self.repo = InboundEventRepository(session)
+        # Embedding client is optional — when absent, decide_proactive's
+        # semantic duplicate detection degrades to substring equality.
+        # Falls back to settings-based factory so production deployments
+        # get real embeddings without extra wiring.
+        self.embedding_client = embedding_client
 
     async def process_pending(
         self, *, limit: int = 50, min_score: float = 0.5
@@ -114,6 +132,7 @@ class ProactiveEventWorker:
                     "quiet_hours": UserProfileRepository.decode_quiet_hours(profile),
                     "communication_style": profile.communication_style,
                     "interest_tags": UserProfileRepository.decode_interest_tags(profile),
+                    "proactive_throttle_minutes": profile.proactive_throttle_minutes,
                 }
 
         context = ProactiveEventContext(
@@ -138,8 +157,34 @@ class ProactiveEventWorker:
             self.session.commit()
             return
 
+        # Resolve embedding client once (for duplicate detection across
+        # all replies this turn). Factory-default is the fake client
+        # when no endpoint is configured — duplicate dedup then reduces
+        # to substring equality, which is still better than nothing.
+        embedding_client = self.embedding_client or get_embeddings_client(
+            allow_fake=True
+        )
+        now_utc = datetime.now(timezone.utc)
+
         for reply in replies:
-            self._write_outbox(event, reply, chat_id=chat_id)
+            decision = decide_proactive(
+                session=self.session,
+                reply_text=reply.text,
+                tenant_id=event.tenant_id,
+                user_id=event.user_id,
+                feature_key=event.feature_key,
+                profile=profile_dict,
+                embedding_client=embedding_client,
+                now_utc=now_utc,
+            )
+            self._write_outbox_with_decision(
+                event=event,
+                reply=reply,
+                chat_id=chat_id,
+                decision_kind=decision.kind,
+                defer_until=decision.defer_until_utc,
+                drop_reason=decision.drop_reason,
+            )
 
         self.repo.mark_status(event.id, status="consumed")
         self.session.commit()
@@ -158,17 +203,36 @@ class ProactiveEventWorker:
             return None
         return user.telegram_account_id
 
-    def _write_outbox(
+    def _write_outbox_with_decision(
         self,
+        *,
         event: InboundEvent,
         reply: RuntimeReply,
-        *,
         chat_id: str,
+        decision_kind: ProactiveDecisionKind,
+        defer_until: datetime | None,
+        drop_reason: str | None,
     ) -> OutboxMessage:
-        # Resolve workspace for the tenant. For proactive events we use
-        # the user's workspace if known; otherwise first workspace of
-        # the tenant. (Multi-workspace is edge case for current setup.)
+        """Persist a proactive reply with the outcome of decide_proactive.
+
+        All three outcomes (send/defer/drop) produce a row — the ``drop``
+        case writes a ``status='dropped'`` row with ``drop_reason`` so
+        ``/stats`` can explain the silence to the user."""
         workspace_id = self._resolve_workspace_id(event)
+
+        if decision_kind == ProactiveDecisionKind.send:
+            status = "pending"
+            scheduled_at: datetime | None = None
+            row_drop_reason: str | None = None
+        elif decision_kind == ProactiveDecisionKind.defer:
+            status = "pending"
+            scheduled_at = defer_until
+            row_drop_reason = None
+        else:  # drop
+            status = "dropped"
+            scheduled_at = None
+            row_drop_reason = drop_reason
+
         outbox = OutboxMessage(
             id=f"out_{uuid4().hex[:24]}",
             tenant_id=event.tenant_id,
@@ -176,8 +240,10 @@ class ProactiveEventWorker:
             user_id=event.user_id,
             channel_type="telegram",
             feature_key=reply.feature_key or event.feature_key,
-            is_interactive=False,  # proactive, not response-to-command
-            status="pending",
+            is_interactive=False,
+            status=status,
+            scheduled_at=scheduled_at,
+            drop_reason=row_drop_reason,
             payload_json=json.dumps(
                 {
                     "chat_id": chat_id,

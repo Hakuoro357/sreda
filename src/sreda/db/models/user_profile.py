@@ -69,6 +69,14 @@ class TenantUserProfile(Base):
     updated_by_source: Mapped[str] = mapped_column(String(32), default="user_command")
     updated_by_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Phase 5-lite: per-user throttle for proactive messages. When a
+    # skill's proactive handler wants to push a reply, the policy
+    # checks outbox for earlier proactive rows (same user, same
+    # feature_key) within this window. If any exist, the new reply
+    # is deferred rather than sent. 0 = no throttle (deliver every
+    # proactive event immediately).
+    proactive_throttle_minutes: Mapped[int] = mapped_column(Integer, default=30)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 

@@ -36,7 +36,11 @@ class InboundEventDraft:
     external_event_key: str
     payload: dict[str, Any] = field(default_factory=dict)
     user_id: str | None = None
-    relevance_score: float = 0.0
+    # ``None`` → skill hasn't scored this event; row lands with
+    # ``status='needs_classification'`` and waits for the future
+    # relevance-classifier worker (LLM-based). Most MVP skills set
+    # a concrete score here from their own domain rules.
+    relevance_score: float | None = 0.0
     relevance_reason: str | None = None
 
 
@@ -59,7 +63,20 @@ class InboundEventRepository:
         separate classifier pass. Returns the inserted row, or ``None``
         if the external_event_key was already ingested."""
         now = _utcnow()
-        classified = draft.relevance_score >= threshold
+        # Three-way status at ingest time:
+        #   * draft.relevance_score is None       → needs_classification
+        #     (waiting for a future LLM-classifier worker to score it)
+        #   * draft.relevance_score >= threshold  → classified
+        #   * otherwise                           → new (below threshold,
+        #     picked up by nothing until manually re-scored)
+        if draft.relevance_score is None:
+            initial_status = "needs_classification"
+            score_value = 0.0
+            classified = False
+        else:
+            score_value = float(draft.relevance_score)
+            classified = score_value >= threshold
+            initial_status = "classified" if classified else "new"
         # Explicit dedup check first — using rollback() on IntegrityError
         # would throw away the caller's other pending work in the same
         # session, which is surprising. The UNIQUE constraint still
@@ -83,9 +100,9 @@ class InboundEventRepository:
             event_type=draft.event_type,
             external_event_key=draft.external_event_key,
             payload_json=json.dumps(draft.payload, ensure_ascii=False, sort_keys=True),
-            relevance_score=float(draft.relevance_score),
+            relevance_score=score_value,
             relevance_reason=draft.relevance_reason,
-            status="classified" if classified else "new",
+            status=initial_status,
             created_at=now,
             classified_at=now if classified else None,
         )
@@ -100,7 +117,7 @@ class InboundEventRepository:
         status: str,
         reason: str | None = None,
     ) -> InboundEvent | None:
-        if status not in {"new", "classified", "consumed", "skipped"}:
+        if status not in {"new", "needs_classification", "classified", "consumed", "skipped"}:
             raise ValueError(f"unknown status: {status!r}")
         row = self.session.get(InboundEvent, event_id)
         if row is None:

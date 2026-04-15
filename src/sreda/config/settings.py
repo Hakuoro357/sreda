@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     mimo_api_key_file: str | None = None
     mimo_chat_model: str = "mimo-v2-pro"
     mimo_request_timeout_seconds: float = 60.0
+    # Cheap-model hook for per-event relevance classification + future
+    # ``decide_to_speak`` LLM layer. When set (e.g. ``mimo-v2-omni`` or
+    # the yet-unreleased ``mimo-v2-flash``), the classifier worker starts
+    # scoring inbound events that arrive without a skill-provided score.
+    # None → classifier worker is disabled; skills must score their own
+    # events via domain rules.
+    mimo_classifier_model: str | None = None
 
     # Embeddings service (Phase 3). Separate from chat LLM so we can
     # point the two at different endpoints — common setup is MiMo for

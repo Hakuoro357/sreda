@@ -141,6 +141,12 @@ class SkillManifestBase(BaseModel):
     # when seeding new plans for this feature. Doesn't affect runtime
     # enforcement — the plan row is the authoritative source.
     default_credits_monthly_quota: int | None = None
+    # Phase 4 LLM-classifier hook: natural-language prompt instructing
+    # the classifier how to score this skill's inbound events. Used by
+    # the future ``RelevanceClassifierWorker`` when a skill ingests
+    # events with ``relevance_score=None``. Left empty by skills that
+    # always score their own events via domain rules.
+    relevance_prompt: str | None = None
     required_secrets: list[str] = Field(default_factory=list)
     default_retry_profile: SkillRetryProfile = Field(default_factory=SkillRetryProfile)
     default_retention_profile: SkillRetentionProfile = Field(

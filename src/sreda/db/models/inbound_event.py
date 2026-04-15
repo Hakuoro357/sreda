@@ -73,10 +73,16 @@ class InboundEvent(Base):
     relevance_score: Mapped[float] = mapped_column(Float, default=0.0)
     relevance_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # "new" | "classified" | "consumed" | "skipped"
-    # "new" = waiting for classifier (future); "classified" = ready for
-    # proactive worker; "consumed" = proactive handler ran successfully;
-    # "skipped" = low relevance / no handler / quota exhausted / mute.
+    # "new" | "needs_classification" | "classified" | "consumed" | "skipped"
+    #   * "new"                   — below score threshold, no further action
+    #   * "needs_classification"  — skill didn't score; waiting for the
+    #                               future LLM-classifier worker (see
+    #                               ``sreda.services.relevance_classifier``
+    #                               hook — currently stub, enabled when
+    #                               ``settings.mimo_classifier_model`` set).
+    #   * "classified"            — ready for proactive worker
+    #   * "consumed"              — proactive handler ran successfully
+    #   * "skipped"               — no handler / quota exhausted / muted
     status: Mapped[str] = mapped_column(String(16), default="new", index=True)
     status_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
 

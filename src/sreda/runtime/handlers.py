@@ -572,6 +572,153 @@ def execute_profile_reject_update(
     ]
 
 
+def execute_profile_set_throttle(
+    session: Session, action: ActionEnvelope, context: dict[str, Any]
+) -> list[RuntimeReply]:
+    """``/throttle`` — view or set per-user proactive throttle window.
+
+    * ``/throttle``          — show current value
+    * ``/throttle 60``       — set to 60 minutes
+    * ``/throttle 0``        — disable throttle (every proactive
+                              event delivered immediately)
+    """
+    user_id = _require_user_id(action)
+    repo = UserProfileRepository(session)
+    profile = repo.get_or_create_profile(action.tenant_id, user_id)
+    session.commit()
+
+    raw = str(action.params.get("minutes") or "").strip()
+    if not raw:
+        minutes = profile.proactive_throttle_minutes
+        suffix = (
+            "отключён — все проактивные уведомления приходят сразу"
+            if minutes == 0
+            else f"{minutes} минут между проактивными уведомлениями от одного скила"
+        )
+        return [
+            RuntimeReply(
+                text=f"⏱ Throttle: {suffix}\n\nИзменить: /throttle <минут> (0 — выключить)",
+                reply_markup=None,
+            )
+        ]
+
+    try:
+        minutes = int(raw)
+    except ValueError:
+        raise ActionRuntimeError(
+            "throttle_invalid",
+            "Укажи число минут: /throttle 60",
+        )
+    if not 0 <= minutes <= 1440:
+        raise ActionRuntimeError(
+            "throttle_out_of_range",
+            "Throttle должен быть от 0 до 1440 минут (24 часа).",
+        )
+
+    profile = repo.get_or_create_profile(action.tenant_id, user_id)
+    profile.proactive_throttle_minutes = minutes
+    profile.updated_by_source = "user_command"
+    profile.updated_by_user_id = user_id
+    session.commit()
+    text = (
+        "✅ Throttle отключён — проактивные уведомления без задержки."
+        if minutes == 0
+        else f"✅ Throttle: не чаще 1 раза в {minutes} минут на скил."
+    )
+    return [RuntimeReply(text=text, reply_markup=None)]
+
+
+def execute_stats_show(
+    session: Session, action: ActionEnvelope, context: dict[str, Any]
+) -> list[RuntimeReply]:
+    """``/stats`` — show proactive delivery stats for last 7 days.
+
+    Reads outbox, groups by (feature_key, status, drop_reason) for
+    this user. Covers sent/deferred/dropped paths so the user can
+    see WHY the bot did or didn't speak."""
+    from datetime import datetime, timedelta, timezone
+
+    from sreda.db.models.core import OutboxMessage
+
+    user_id = _require_user_id(action)
+    since = datetime.now(timezone.utc) - timedelta(days=7)
+
+    rows = (
+        session.query(OutboxMessage)
+        .filter(
+            OutboxMessage.tenant_id == action.tenant_id,
+            OutboxMessage.user_id == user_id,
+            OutboxMessage.created_at >= since,
+        )
+        .all()
+    )
+
+    if not rows:
+        return [
+            RuntimeReply(
+                text="📊 За 7 дней — ни одного сообщения через outbox. Пока всё тихо.",
+                reply_markup=None,
+            )
+        ]
+
+    # Group counts
+    by_feature: dict[str, dict[str, int]] = {}
+    for row in rows:
+        fk = row.feature_key or "(core)"
+        bucket = by_feature.setdefault(
+            fk,
+            {
+                "sent": 0,
+                "pending": 0,
+                "muted": 0,
+                "dropped_duplicate": 0,
+                "dropped_other": 0,
+                "failed": 0,
+            },
+        )
+        if row.status == "sent":
+            bucket["sent"] += 1
+        elif row.status == "pending":
+            bucket["pending"] += 1
+        elif row.status == "muted":
+            bucket["muted"] += 1
+        elif row.status == "dropped":
+            if (row.drop_reason or "") == "duplicate":
+                bucket["dropped_duplicate"] += 1
+            else:
+                bucket["dropped_other"] += 1
+        else:
+            bucket["failed"] += 1
+
+    # Current throttle setting
+    repo = UserProfileRepository(session)
+    profile = repo.get_profile(action.tenant_id, user_id)
+    throttle = profile.proactive_throttle_minutes if profile else 30
+    throttle_text = (
+        "отключён" if throttle == 0 else f"1 раз / {throttle} мин"
+    )
+
+    lines = ["📊 За 7 дней", ""]
+    for fk in sorted(by_feature.keys()):
+        b = by_feature[fk]
+        lines.append(f"🔹 {fk}")
+        if b["sent"]:
+            lines.append(f"  • отправлено: {b['sent']}")
+        if b["pending"]:
+            lines.append(f"  • в очереди / отложено: {b['pending']}")
+        if b["muted"]:
+            lines.append(f"  • заглушено (mute): {b['muted']}")
+        if b["dropped_duplicate"]:
+            lines.append(f"  • отброшено (дубликат): {b['dropped_duplicate']}")
+        if b["dropped_other"]:
+            lines.append(f"  • отброшено (политика): {b['dropped_other']}")
+        if b["failed"]:
+            lines.append(f"  • ошибок: {b['failed']}")
+        lines.append("")
+    lines.append(f"Throttle: {throttle_text}  →  /throttle <минут>")
+    return [RuntimeReply(text="\n".join(lines), reply_markup=None)]
+
+
 def execute_profile_set_timezone(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
@@ -931,6 +1078,8 @@ HANDLERS: dict[str, HandlerFn] = {
     "profile.reject_update": execute_profile_reject_update,
     "conversation.chat": execute_conversation_chat,
     "billing.buy_extra": execute_billing_buy_extra,
+    "profile.set_throttle": execute_profile_set_throttle,
+    "stats.show": execute_stats_show,
     "skills.list": execute_skills_list,
     "skill.show": execute_skill_show,
     "skill.set_priority": execute_skill_set_priority,

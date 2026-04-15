@@ -149,6 +149,10 @@ def _resolve_command_action(message_text: str) -> tuple[str, dict] | None:
         claim_id = parts[1].strip() if len(parts) > 1 else ""
         return "claim.lookup", {"claim_id": claim_id} if claim_id else {}
 
+    if command == "/throttle":
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        return "profile.set_throttle", {"minutes": rest}
+
     if command == "/buy_extra":
         rest = parts[1].strip() if len(parts) > 1 else ""
         return "billing.buy_extra", {"feature_key": rest}
@@ -219,6 +223,7 @@ _ACTION_BY_COMMAND = {
     "подписки": "subscriptions.show",
     "/profile": "profile.show",
     "/skills": "skills.list",
+    "/stats": "stats.show",
 }
 
 _ACTION_BY_CALLBACK = {

@@ -173,6 +173,28 @@ def test_high_relevance_auto_classified(session):
     assert row.classified_at is not None
 
 
+def test_no_score_marks_needs_classification(session):
+    """LLM-classifier hook: when skill doesn't score the event (score=None),
+    row lands with status='needs_classification' so a future worker
+    can pick it up. Proactive worker ignores these rows for now."""
+    repo = InboundEventRepository(session)
+    row = repo.create_from_draft(
+        InboundEventDraft(
+            tenant_id="t1",
+            feature_key=TEST_FEATURE_KEY,
+            event_type="synthetic",
+            external_event_key="evt-unscored",
+            relevance_score=None,  # explicit opt-in to classifier path
+        )
+    )
+    session.commit()
+    assert row.status == "needs_classification"
+    assert row.classified_at is None
+    # Not returned by the ready-for-delivery query
+    ready = repo.list_ready_for_delivery()
+    assert all(e.id != row.id for e in ready)
+
+
 def test_low_relevance_stays_new(session):
     repo = InboundEventRepository(session)
     row = repo.create_from_draft(

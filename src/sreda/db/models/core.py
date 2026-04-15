@@ -111,6 +111,13 @@ class OutboxMessage(Base):
     # deliveries bypass quiet-hours — users get replies to their own
     # commands immediately, always.
     is_interactive: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Phase 5-lite: reason the message was dropped by decide_to_speak
+    # or muted by skill config. Values: ``duplicate`` / ``throttle`` /
+    # ``llm_filter`` (future) / ``muted`` / ``policy`` /NULL. Surfaces
+    # in ``/stats`` so users see WHY the bot stayed silent.
+    drop_reason: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
 
 
 class SecureRecord(Base):
