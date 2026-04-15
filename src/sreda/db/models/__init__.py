@@ -18,6 +18,7 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
+from sreda.db.models.inbound_event import InboundEvent
 from sreda.db.models.memory import AssistantMemory
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.db.models.skill_platform import (
@@ -47,6 +48,7 @@ __all__ = [
     "EDSChangeEvent",
     "EDSClaimState",
     "EDSDeliveryRecord",
+    "InboundEvent",
     "SubscriptionPlan",
     "Job",
     "OutboxMessage",

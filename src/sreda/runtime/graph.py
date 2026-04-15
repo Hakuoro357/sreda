@@ -256,6 +256,10 @@ def node_execute_action(state: AssistantGraphState, config: RunnableConfig) -> d
     context["_memories"] = state.get("memories") or []
     context["_llm_client"] = config["configurable"].get("llm_client")
     context["_embedding_client"] = config["configurable"].get("embedding_client")
+    # Phase 4.5: run_id flows into context so the conversation handler
+    # can attribute LLM usage to this specific AgentRun in
+    # skill_ai_executions.
+    context["_run_id"] = state.get("run_id")
 
     handler = HANDLERS.get(action.action_type)
     if handler is None:

@@ -18,6 +18,14 @@ Concrete keyword signature is flexible — the runner passes ``session``
 positionally and the rest as kwargs, so handlers should accept
 ``(session, *, job, run_id, attempt_id)`` or ``(session, **kwargs)``."""
 
+ProactiveEventHandler = Callable[..., Any]
+"""Signature: ``def handler(context) -> list[RuntimeReply]``.
+
+``context`` is a ``ProactiveEventContext`` (session, inbound_event,
+profile, memories, budget). Handler composes reply(ies) from the event;
+platform handles outbox + delivery policy afterwards. Pure function of
+its inputs — side-effects only through the session it was given."""
+
 
 @dataclass(frozen=True)
 class RegisteredSkillJobHandler:
@@ -30,6 +38,7 @@ class FeatureRegistry:
     def __init__(self) -> None:
         self._modules: dict[str, FeatureModule] = {}
         self._skill_job_handlers: dict[str, RegisteredSkillJobHandler] = {}
+        self._proactive_handlers: dict[str, ProactiveEventHandler] = {}
 
     # ------------------------------------------------------------- modules
 
@@ -107,3 +116,25 @@ class FeatureRegistry:
 
     def skill_job_types(self) -> list[str]:
         return list(self._skill_job_handlers.keys())
+
+    # ---------------------------------------------------- proactive handlers
+
+    def register_proactive_handler(
+        self,
+        *,
+        feature_key: str,
+        handler: ProactiveEventHandler,
+    ) -> None:
+        """Register the function invoked when the proactive worker picks
+        up a classified ``InboundEvent`` for this feature. At most one
+        handler per feature_key; second registration raises."""
+        if feature_key in self._proactive_handlers:
+            raise ValueError(
+                f"proactive handler already registered for feature_key={feature_key!r}"
+            )
+        self._proactive_handlers[feature_key] = handler
+
+    def get_proactive_handler(
+        self, feature_key: str
+    ) -> ProactiveEventHandler | None:
+        return self._proactive_handlers.get(feature_key)

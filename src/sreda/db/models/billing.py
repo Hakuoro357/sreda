@@ -19,6 +19,12 @@ class SubscriptionPlan(Base):
     is_public: Mapped[bool] = mapped_column(Boolean, default=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=100)
+    # Per-billing-cycle credit quota (Phase 4.5). NULL = unmetered plan
+    # (legacy). Each LLM call attributed to this plan's feature_key
+    # consumes credits per the MiMo rate formula; when the cumulative
+    # usage in the current period reaches this number, the skill's
+    # LLM-backed features fall back to "quota exhausted".
+    credits_monthly_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

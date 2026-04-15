@@ -236,6 +236,11 @@ class SkillAIExecution(Base):
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     estimated_cost_rub_micro: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # MiMo credits consumed (Phase 4.5). Computed from model + tokens via
+    # ``sreda.services.credit_formula.credits_for`` at write time. Used
+    # for per-skill quota enforcement against
+    # ``SubscriptionPlan.credits_monthly_quota``.
+    credits_consumed: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message_sanitized: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

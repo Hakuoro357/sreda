@@ -10,6 +10,7 @@ from sreda.integrations.telegram.client import TelegramClient
 from sreda.runtime.executor import ActionRuntimeService
 from sreda.services.eds_account_verification import EDSAccountVerificationService
 from sreda.workers.outbox_delivery import OutboxDeliveryWorker
+from sreda.workers.proactive_events import ProactiveEventWorker
 from sreda.workers.skill_platform_processor import SkillPlatformJobProcessor
 
 logger = logging.getLogger(__name__)
@@ -28,16 +29,20 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         runtime_service = ActionRuntimeService(session, telegram_client=telegram_client)
         verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
         skill_platform = SkillPlatformJobProcessor(session, registry)
+        proactive = ProactiveEventWorker(session)
         delivery = OutboxDeliveryWorker(session, telegram_client=telegram_client)
 
+        # Order matters: proactive worker fills outbox → delivery drains it.
         runtime_processed = await runtime_service.process_pending_jobs(limit=limit)
         verification_processed = await verification.process_pending_jobs(limit=limit)
         skill_processed = await skill_platform.process_pending_jobs(limit=limit)
+        proactive_processed = await proactive.process_pending(limit=limit)
         delivery_processed = await delivery.process_pending_messages(limit=limit)
         return (
             runtime_processed
             + verification_processed
             + skill_processed
+            + proactive_processed
             + delivery_processed
         )
     finally:

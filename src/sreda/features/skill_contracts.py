@@ -132,6 +132,15 @@ class SkillManifestBase(BaseModel):
     supports_runtime: bool = False
     supports_user_surfaces: bool = False
     supports_per_tenant_config: bool = True
+    # Phase 4.5: does this skill provide free-form chat with the user?
+    # Dispatcher routes ``conversation.chat`` actions to the first
+    # subscribed skill with ``provides_chat=True``. EDS-monitor style
+    # skills (no chat) leave this False.
+    provides_chat: bool = False
+    # Optional default for ``SubscriptionPlan.credits_monthly_quota``
+    # when seeding new plans for this feature. Doesn't affect runtime
+    # enforcement — the plan row is the authoritative source.
+    default_credits_monthly_quota: int | None = None
     required_secrets: list[str] = Field(default_factory=list)
     default_retry_profile: SkillRetryProfile = Field(default_factory=SkillRetryProfile)
     default_retention_profile: SkillRetentionProfile = Field(

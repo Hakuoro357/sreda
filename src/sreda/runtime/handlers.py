@@ -37,6 +37,7 @@ from sreda.services.billing import (
     STATUS_CALLBACK,
     SUBSCRIPTIONS_CALLBACK,
 )
+from sreda.services.budget import BudgetService, QuotaStatus
 from sreda.services.claim_lookup import ClaimLookupService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.embeddings import get_embeddings_client
@@ -682,15 +683,80 @@ def _format_memories_for_prompt(memories: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def execute_billing_buy_extra(
+    session: Session, action: ActionEnvelope, context: dict[str, Any]
+) -> list[RuntimeReply]:
+    """Stub for "buy extra credits pack" — payment integration is
+    out of scope for this chunk. Replies with a support-contact prompt
+    so users know what to do today. Feature_key is optional (user may
+    have tapped a skill-specific button)."""
+    feature_key = str(action.params.get("feature_key") or "").strip()
+    _ = feature_key  # placeholder — used once payment is wired up
+    return [
+        RuntimeReply(
+            text=(
+                "Докупить пакет пока нельзя — интеграция с платёжной системой "
+                "ещё не подключена. Если хочешь расширить бюджет сейчас — "
+                "напиши администратору."
+            ),
+            reply_markup=None,
+        )
+    ]
+
+
+def _resolve_chat_feature_key(session: Session, tenant_id: str) -> str | None:
+    """Pick a subscribed skill that provides chat.
+
+    Walks the feature registry for manifests with ``provides_chat=True``,
+    returns the first one the tenant has an active subscription for.
+    Returns ``None`` when no suitable skill is found — the handler
+    then replies with an upsell prompt instead of calling the LLM.
+    """
+    registry = get_feature_registry()
+    chat_manifests = [m for m in registry.iter_manifests() if getattr(m, "provides_chat", False)]
+    if not chat_manifests:
+        return None
+    budget = BudgetService(session)
+    for manifest in chat_manifests:
+        status = budget.get_quota_status(tenant_id, manifest.feature_key)
+        if status.is_subscribed:
+            return manifest.feature_key
+    return None
+
+
+def _format_quota_reset(status: QuotaStatus) -> str:
+    if status.period_end is None:
+        return "в дату следующего платежа"
+    return status.period_end.strftime("%d.%m.%Y")
+
+
+def _upgrade_reply_markup(feature_key: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Докупить пакет",
+                    "callback_data": f"billing:buy_extra:{feature_key}",
+                }
+            ],
+            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+        ]
+    }
+
+
 def execute_conversation_chat(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     """LLM-driven conversational handler with memory tool-loop.
 
-    Dispatched from free-form user text (anything not matching a
-    slash-command). Builds a system prompt with user's profile +
-    relevant memories, binds the memory tools, then loops on LLM
-    tool calls until the model returns a plain assistant message.
+    Flow:
+      1. Resolve which chat-capable skill is active for this tenant.
+         No subscription → upsell reply, no LLM.
+      2. Check the skill's LLM budget. Exhausted → fallback + /buy_extra.
+      3. Build system prompt from profile + memories.
+      4. Run LLM tool-call loop (capped at 5 iterations); record each
+         call's usage against the skill's budget.
+      5. Return the final assistant message.
     """
     from langchain_core.messages import (  # local import — LLM path only
         AIMessage,
@@ -707,6 +773,39 @@ def execute_conversation_chat(
             "Пустое сообщение — нечего обрабатывать.",
         )
 
+    # --- 1. Skill attribution ------------------------------------------
+    feature_key = _resolve_chat_feature_key(session, action.tenant_id)
+    if feature_key is None:
+        return [
+            RuntimeReply(
+                text=(
+                    "Свободный чат с ассистентом доступен только при активной "
+                    "подписке на chat-скил. Открой /subscriptions — там список."
+                ),
+                reply_markup=None,
+            )
+        ]
+
+    # --- 2. Budget check (one-shot at turn start) ----------------------
+    budget = BudgetService(session)
+    quota = budget.get_quota_status(action.tenant_id, feature_key)
+    if quota.is_exhausted:
+        reset_text = _format_quota_reset(quota)
+        used = quota.credits_used
+        cap = quota.credits_quota or 0
+        return [
+            RuntimeReply(
+                text=(
+                    f"Бюджет скила {feature_key!r} на этот период исчерпан "
+                    f"({used} / {cap} credits). Следующий сброс — {reset_text}.\n\n"
+                    "Вариант: докупить пакет — /buy_extra — или дождаться сброса."
+                ),
+                reply_markup=_upgrade_reply_markup(feature_key),
+                feature_key=feature_key,
+            )
+        ]
+
+    # --- 3. Build prompt + tools ---------------------------------------
     llm = context.get("_llm_client") or get_chat_llm()
     if llm is None:
         return [
@@ -716,6 +815,7 @@ def execute_conversation_chat(
                     "Используй команды /help, /profile, /skills."
                 ),
                 reply_markup=None,
+                feature_key=feature_key,
             )
         ]
 
@@ -724,6 +824,8 @@ def execute_conversation_chat(
     )
     profile = context.get("_profile") or {}
     memories = context.get("_memories") or []
+    settings = get_settings()
+    model_name = getattr(llm, "model_name", None) or settings.mimo_chat_model
 
     system_text = (
         _CONVERSATION_SYSTEM_PROMPT
@@ -747,10 +849,30 @@ def execute_conversation_chat(
         HumanMessage(content=user_text),
     ]
 
-    # Tool-call loop. Cap at 5 iterations so a runaway LLM can't pin us.
+    # --- 4. Tool-call loop with per-call usage recording --------------
+    run_id = context.get("_run_id") or "run_unknown"
     final_ai: AIMessage | None = None
     for _iter in range(5):
         ai_msg: AIMessage = llm_with_tools.invoke(messages)
+        # Record LLM usage for this iteration.
+        usage = getattr(ai_msg, "usage_metadata", None) or {}
+        prompt_tokens = int(usage.get("input_tokens") or 0)
+        completion_tokens = int(usage.get("output_tokens") or 0)
+        if prompt_tokens or completion_tokens:
+            try:
+                budget.record_llm_usage(
+                    tenant_id=action.tenant_id,
+                    feature_key=feature_key,
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    run_id=run_id,
+                    task_type="conversation.chat",
+                )
+                session.commit()
+            except Exception:  # noqa: BLE001 — usage tracking must not kill the turn
+                logger.exception("budget: failed to record LLM usage")
+
         messages.append(ai_msg)
         tool_calls = getattr(ai_msg, "tool_calls", None) or []
         if not tool_calls:
@@ -779,7 +901,7 @@ def execute_conversation_chat(
         )
 
     text = (final_ai.content or "").strip() or "..."
-    return [RuntimeReply(text=text, reply_markup=None)]
+    return [RuntimeReply(text=text, reply_markup=None, feature_key=feature_key)]
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +930,7 @@ HANDLERS: dict[str, HandlerFn] = {
     "profile.confirm_update": execute_profile_confirm_update,
     "profile.reject_update": execute_profile_reject_update,
     "conversation.chat": execute_conversation_chat,
+    "billing.buy_extra": execute_billing_buy_extra,
     "skills.list": execute_skills_list,
     "skill.show": execute_skill_show,
     "skill.set_priority": execute_skill_set_priority,

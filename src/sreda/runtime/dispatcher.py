@@ -108,6 +108,13 @@ def _resolve_callback_action(callback_data: str) -> tuple[str, dict] | None:
         if not _is_valid_entity_id(account_id):
             return None
         return "eds.account.restore", {"tenant_eds_account_id": account_id}
+    # Billing: buy-extra CTA from quota-exhausted replies (Phase 4.5).
+    if callback_data.startswith("billing:buy_extra:"):
+        feature_key = callback_data.removeprefix("billing:buy_extra:")
+        if not _is_valid_entity_id(feature_key):
+            return None
+        return "billing.buy_extra", {"feature_key": feature_key}
+
     # Profile proposal confirm / reject (Phase 2e hybrid-UX).
     if callback_data.startswith("profile:confirm:"):
         proposal_id = callback_data.removeprefix("profile:confirm:")
@@ -141,6 +148,10 @@ def _resolve_command_action(message_text: str) -> tuple[str, dict] | None:
     if command == "/claim":
         claim_id = parts[1].strip() if len(parts) > 1 else ""
         return "claim.lookup", {"claim_id": claim_id} if claim_id else {}
+
+    if command == "/buy_extra":
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        return "billing.buy_extra", {"feature_key": rest}
 
     if command == "/tz":
         tz = parts[1].strip() if len(parts) > 1 else ""

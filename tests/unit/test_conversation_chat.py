@@ -26,11 +26,81 @@ from sreda.db.models import (
     User,
     Workspace,
 )
+from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.repositories.memory import MemoryRepository
 from sreda.db.session import get_engine, get_session_factory
+from sreda.features.app_registry import get_feature_registry
+from sreda.features.skill_contracts import (
+    SkillLifecycleStatus,
+    SkillManifestBase,
+)
 from sreda.runtime.dispatcher import ActionEnvelope, _resolve_command_action
 from sreda.runtime.executor import ActionRuntimeService
 from sreda.services.embeddings import FakeEmbeddingClient
+
+
+TEST_CHAT_FEATURE_KEY = "test_chat_skill"
+
+
+class _TestChatFeature:
+    """Minimal feature module with ``provides_chat=True`` for tests."""
+
+    feature_key = TEST_CHAT_FEATURE_KEY
+
+    def register_api(self, app):
+        pass
+
+    def register_runtime(self):
+        pass
+
+    def register_workers(self):
+        pass
+
+    def get_manifest(self):
+        return SkillManifestBase(
+            feature_key=TEST_CHAT_FEATURE_KEY,
+            title="Test Chat",
+            description="Chat skill used by tests.",
+            default_status=SkillLifecycleStatus.active,
+            provides_chat=True,
+            default_credits_monthly_quota=1_000_000,
+        )
+
+
+def _register_chat_skill_once():
+    """Install the test chat manifest into the process-wide registry
+    if it isn't there yet. Safe to call from multiple tests."""
+    registry = get_feature_registry()
+    if registry.get_manifest(TEST_CHAT_FEATURE_KEY) is None:
+        registry.register(_TestChatFeature())
+
+
+def _seed_chat_subscription(session, *, credits_quota: int | None = 1_000_000):
+    """Give tenant t1 an active subscription to the test chat skill."""
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
+    plan = SubscriptionPlan(
+        id=f"plan_{uuid4().hex[:16]}",
+        plan_key=f"{TEST_CHAT_FEATURE_KEY}_basic",
+        feature_key=TEST_CHAT_FEATURE_KEY,
+        title="Test Chat Basic",
+        description="",
+        price_rub=300,
+        credits_monthly_quota=credits_quota,
+    )
+    session.add(plan)
+    session.flush()
+    sub = TenantSubscription(
+        id=f"sub_{uuid4().hex[:16]}",
+        tenant_id="t1",
+        plan_id=plan.id,
+        status="active",
+        starts_at=datetime.now(timezone.utc) - timedelta(days=1),
+        active_until=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    session.add(sub)
+    session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +163,7 @@ class FakeTelegram:
         self.sent: list[dict] = []
 
     async def send_message(self, chat_id: str, text: str, reply_markup=None, **kwargs):
-        self.sent.append({"chat_id": chat_id, "text": text})
+        self.sent.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
         return {"ok": True}
 
 
@@ -102,7 +172,14 @@ class FakeTelegram:
 # ---------------------------------------------------------------------------
 
 
-def _bootstrap(monkeypatch, tmp_path: Path, name: str):
+def _bootstrap(
+    monkeypatch,
+    tmp_path: Path,
+    name: str,
+    *,
+    seed_subscription: bool = True,
+    credits_quota: int | None = 1_000_000,
+):
     db_path = tmp_path / name
     key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
@@ -118,6 +195,13 @@ def _bootstrap(monkeypatch, tmp_path: Path, name: str):
     session.add(Assistant(id="a1", tenant_id="t1", workspace_id="w1", name="Sreda"))
     session.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
     session.commit()
+
+    # Phase 4.5: conversation.chat requires a chat-capable skill + active
+    # subscription. Register and seed both by default; tests that want
+    # to exercise the "no subscription" path pass seed_subscription=False.
+    _register_chat_skill_once()
+    if seed_subscription:
+        _seed_chat_subscription(session, credits_quota=credits_quota)
     return session
 
 
@@ -422,6 +506,116 @@ def test_acceptance_fact_persists_across_invocations(monkeypatch, tmp_path: Path
 # ---------------------------------------------------------------------------
 # Tools direct tests (save_core_fact / save_episode / recall_memory)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.5: per-skill budget attribution
+# ---------------------------------------------------------------------------
+
+
+def test_conversation_without_subscription_returns_upsell(monkeypatch, tmp_path: Path):
+    """No chat-skill subscription → do NOT call the LLM; reply with
+    upsell prompt. This keeps users out of the expensive path until
+    they've paid for at least one chat-capable skill."""
+    session = _bootstrap(monkeypatch, tmp_path, "cb_nosub.db", seed_subscription=False)
+    try:
+        # FakeLLM with no scripted responses — if the handler calls it,
+        # we'll see an index-error. Presence of zero responses = proof
+        # of the no-LLM path.
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=FakeLLM([]),
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("привет"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    assert "подписк" in telegram.sent[0]["text"].lower()
+
+
+def test_conversation_exhausted_budget_returns_upgrade_prompt(monkeypatch, tmp_path: Path):
+    """Subscription exists but quota is fully consumed → reply with
+    quota-exhausted message + inline upgrade button, no LLM call."""
+    session = _bootstrap(
+        monkeypatch, tmp_path, "cb_exhausted.db",
+        seed_subscription=True, credits_quota=100,  # tiny quota
+    )
+    try:
+        # Pre-fill usage so the quota is exhausted.
+        from sreda.services.budget import BudgetService
+        BudgetService(session).record_llm_usage(
+            tenant_id="t1", feature_key=TEST_CHAT_FEATURE_KEY,
+            model="mimo-v2-pro", prompt_tokens=100, completion_tokens=0,
+            run_id="run_seed",
+        )
+        session.commit()
+
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=FakeLLM([]),  # must not be called
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("привет"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    msg = telegram.sent[0]
+    assert "исчерпан" in msg["text"].lower()
+    # Upgrade CTA present as inline button
+    assert msg["reply_markup"] is not None
+    btn_labels = [
+        btn.get("callback_data", "")
+        for row in msg["reply_markup"]["inline_keyboard"]
+        for btn in row
+    ]
+    assert any("buy_extra" in cd for cd in btn_labels)
+
+
+def test_conversation_records_llm_usage_in_skill_ai_executions(monkeypatch, tmp_path: Path):
+    """After an LLM call, skill_ai_executions should have a row with
+    the right tenant/feature/model/credits_consumed."""
+    from langchain_core.messages import AIMessage
+    from sreda.db.models.skill_platform import SkillAIExecution
+
+    session = _bootstrap(monkeypatch, tmp_path, "cb_usage.db", seed_subscription=True)
+    try:
+        # Scripted AI response carrying usage_metadata the handler
+        # should pick up and record.
+        msg = AIMessage(content="ok", usage_metadata={"input_tokens": 120, "output_tokens": 80, "total_tokens": 200})
+        fake_llm = FakeLLM([msg])
+        # Pretend model is mimo-v2-pro so credits = 200*2 = 400.
+        monkeypatch.setenv("SREDA_MIMO_CHAT_MODEL", "mimo-v2-pro")
+        get_settings.cache_clear()
+
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=FakeTelegram(),
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("hi"))
+        asyncio.run(svc.process_job(queued.job_id))
+
+        rows = session.query(SkillAIExecution).all()
+    finally:
+        session.close()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.tenant_id == "t1"
+    assert row.feature_key == TEST_CHAT_FEATURE_KEY
+    assert row.prompt_tokens == 120
+    assert row.completion_tokens == 80
+    assert row.credits_consumed == 400  # 200 tokens × 2 (pro rate)
 
 
 def test_tools_write_memories_with_correct_tier(monkeypatch, tmp_path: Path):
