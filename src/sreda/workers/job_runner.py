@@ -75,3 +75,8 @@ def run_job_loop() -> None:
         asyncio.run(process_pending_jobs_once())
         return
     asyncio.run(run_job_loop_async())
+
+
+if __name__ == "__main__":
+    # ``python -m sreda.workers.job_runner`` entrypoint for production.
+    run_job_loop()
