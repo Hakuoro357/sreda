@@ -133,6 +133,7 @@ class OutboxDeliveryWorker:
                 chat_id=payload.get("chat_id"),
                 text=payload.get("text", ""),
                 reply_markup=payload.get("reply_markup"),
+                parse_mode=payload.get("parse_mode"),
             )
             row.status = "sent"
         except TelegramDeliveryError:
