@@ -31,6 +31,9 @@ RESUME_BASE_CALLBACK = "billing:resume_plan:eds_monitor_base"
 
 PLAN_EDS_MONITOR_BASE = "eds_monitor_base"
 PLAN_EDS_MONITOR_EXTRA = "eds_monitor_extra_account"
+PLAN_VOICE_TRANSCRIPTION = "voice_transcription_base"
+CONNECT_VOICE_CALLBACK = "billing:connect_plan:voice_transcription_base"
+CANCEL_VOICE_CALLBACK = "billing:cancel_plan:voice_transcription_base"
 OCCUPIED_ACCOUNT_STATUSES = {
     "pending_verification",
     "active",
@@ -281,6 +284,11 @@ class BillingService:
         extra_plan = self._get_plan(PLAN_EDS_MONITOR_EXTRA)
         next_cycle_free_slots = self._get_free_slots_for_next_cycle(tenant_id)
 
+        # Voice transcription subscription state
+        voice_plan = self._get_plan_optional(PLAN_VOICE_TRANSCRIPTION)
+        voice_sub = self._get_subscription_optional(tenant_id, PLAN_VOICE_TRANSCRIPTION)
+        voice_active = self._is_subscription_active(voice_sub, _utcnow(now)) if voice_sub else False
+
         active_lines: list[str] = []
         if summary.base_active and summary.base_active_until:
             active_lines.append(
@@ -289,6 +297,11 @@ class BillingService:
         if summary.extra_quantity > 0 and summary.extra_active_until:
             active_lines.append(
                 f"- {extra_plan.title} — {summary.extra_quantity} × {extra_plan.price_rub} ₽ / 30 дней, активно до {_format_date(summary.extra_active_until)}"
+            )
+        if voice_active and voice_sub and voice_plan:
+            price_label = f"{voice_plan.price_rub} ₽ / 30 дней" if voice_plan.price_rub > 0 else "бесплатно"
+            active_lines.append(
+                f"- {voice_plan.title} — {price_label}, активно до {_format_date(voice_sub.active_until)}"
             )
 
         if active_lines:
@@ -301,6 +314,9 @@ class BillingService:
             available_lines.append(f"- {base_plan.title} — {base_plan.price_rub} ₽ / 30 дней")
         elif summary.base_active:
             available_lines.append(f"- {extra_plan.title} — {extra_plan.price_rub} ₽ / 30 дней")
+        if not voice_active and voice_plan:
+            price_label = f"{voice_plan.price_rub} ₽ / 30 дней" if voice_plan.price_rub > 0 else "бесплатно"
+            available_lines.append(f"- {voice_plan.title} — {price_label}")
         available_block = "Доступные:\n" + ("\n".join(available_lines) if available_lines else "- нет")
 
         text = f"Подписки\n\n{active_block}\n\n{available_block}"
@@ -329,6 +345,12 @@ class BillingService:
             if next_cycle_free_slots > 0:
                 buttons.append([{"text": "Убрать свободную подписку на EDS", "callback_data": REMOVE_EDS_ACCOUNT_CALLBACK}])
             buttons.extend(self._build_restore_rows(tenant_id, summary, now=now))
+        # Voice transcription toggle
+        if voice_plan:
+            if not voice_active:
+                buttons.append([{"text": f"Подключить {voice_plan.title}", "callback_data": CONNECT_VOICE_CALLBACK}])
+            else:
+                buttons.append([{"text": f"Отключить {voice_plan.title}", "callback_data": CANCEL_VOICE_CALLBACK}])
         buttons.append([{"text": "Мой статус", "callback_data": STATUS_CALLBACK}])
         return text, _inline_keyboard(buttons)
 
@@ -915,6 +937,71 @@ class BillingService:
             ),
         )
 
+    def start_voice_subscription(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
+        """Activate the free voice_transcription plan for a tenant."""
+        current_time = _utcnow(now)
+        plan = self._get_plan_optional(PLAN_VOICE_TRANSCRIPTION)
+        if plan is None:
+            return SubscriptionActionResult(
+                message_text="План распознавания голоса не найден.",
+                reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
+            )
+        sub = self._get_subscription_optional(tenant_id, PLAN_VOICE_TRANSCRIPTION)
+        if sub is not None and self._is_subscription_active(sub, current_time):
+            return SubscriptionActionResult(
+                message_text="Распознавание голоса уже подключено.",
+                reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
+            )
+        if sub is None:
+            sub = TenantSubscription(
+                id=f"sub_{uuid4().hex[:24]}",
+                tenant_id=tenant_id,
+                plan_id=plan.id,
+            )
+            self.session.add(sub)
+        sub.status = "active"
+        sub.starts_at = current_time
+        sub.active_until = current_time + timedelta(days=plan.billing_period_days)
+        sub.cancel_at_period_end = False
+        sub.quantity = 1
+        sub.next_cycle_quantity = 1
+        sub.updated_at = current_time
+        self._ensure_feature_enabled(tenant_id, "voice_transcription", True)
+        self.session.commit()
+        return SubscriptionActionResult(
+            message_text=(
+                f"{plan.title} подключено.\n\n"
+                f"Активно до: {_format_date(sub.active_until)}"
+            ),
+            reply_markup=_inline_keyboard([
+                [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+            ]),
+        )
+
+    def cancel_voice_subscription(self, tenant_id: str) -> SubscriptionActionResult:
+        """Deactivate voice_transcription for a tenant."""
+        sub = self._get_subscription_optional(tenant_id, PLAN_VOICE_TRANSCRIPTION)
+        if sub is None or sub.quantity <= 0:
+            return SubscriptionActionResult(
+                message_text="Распознавание голоса сейчас не активно.",
+                reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
+            )
+        sub.status = "cancelled"
+        sub.quantity = 0
+        sub.next_cycle_quantity = 0
+        sub.cancel_at_period_end = True
+        sub.updated_at = _utcnow()
+        self._ensure_feature_enabled(tenant_id, "voice_transcription", False)
+        self.session.commit()
+        return SubscriptionActionResult(
+            message_text="Распознавание голоса отключено.",
+            reply_markup=_inline_keyboard([
+                [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+            ]),
+        )
+
     def _get_cycle(self, tenant_id: str) -> TenantBillingCycle | None:
         return (
             self.session.query(TenantBillingCycle)
@@ -941,6 +1028,26 @@ class BillingService:
             .one()
         )
         return plan
+
+    def _get_plan_optional(self, plan_key: str) -> SubscriptionPlan | None:
+        return (
+            self.session.query(SubscriptionPlan)
+            .filter(SubscriptionPlan.plan_key == plan_key)
+            .one_or_none()
+        )
+
+    def _get_subscription_optional(self, tenant_id: str, plan_key: str) -> TenantSubscription | None:
+        plan = self._get_plan_optional(plan_key)
+        if plan is None:
+            return None
+        return (
+            self.session.query(TenantSubscription)
+            .filter(
+                TenantSubscription.tenant_id == tenant_id,
+                TenantSubscription.plan_id == plan.id,
+            )
+            .one_or_none()
+        )
 
     def _list_occupied_accounts(self, tenant_id: str) -> list[TenantEDSAccount]:
         return (

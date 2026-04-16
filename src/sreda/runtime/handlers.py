@@ -229,6 +229,20 @@ def execute_subscription_renew_cycle(
     return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
 
 
+def execute_subscription_connect_voice(
+    session: Session, action: ActionEnvelope, context: dict[str, Any]
+) -> list[RuntimeReply]:
+    result = BillingService(session).start_voice_subscription(action.tenant_id)
+    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+
+def execute_subscription_cancel_voice(
+    session: Session, action: ActionEnvelope, context: dict[str, Any]
+) -> list[RuntimeReply]:
+    result = BillingService(session).cancel_voice_subscription(action.tenant_id)
+    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+
+
 def execute_eds_connect_start(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
@@ -1154,6 +1168,8 @@ HANDLERS: dict[str, HandlerFn] = {
     "subscription.connect_base": execute_subscription_connect_base,
     "subscription.add_eds": execute_subscription_add_eds,
     "subscription.renew_cycle": execute_subscription_renew_cycle,
+    "subscription.connect_voice": execute_subscription_connect_voice,
+    "subscription.cancel_voice": execute_subscription_cancel_voice,
     "eds.connect.start": execute_eds_connect_start,
     "eds.connect.retry": execute_eds_connect_retry,
     "eds.slot.remove_free": execute_eds_slot_remove_free,

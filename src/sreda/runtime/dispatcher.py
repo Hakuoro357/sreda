@@ -5,7 +5,9 @@ from dataclasses import asdict, dataclass
 
 from sreda.services.billing import (
     ADD_EDS_ACCOUNT_CALLBACK,
+    CANCEL_VOICE_CALLBACK,
     CONNECT_BASE_CALLBACK,
+    CONNECT_VOICE_CALLBACK,
     REMOVE_EDS_ACCOUNT_CALLBACK,
     REMOVE_EDS_ACCOUNT_SELECT_PREFIX,
     RENEW_CALLBACK,
@@ -237,6 +239,8 @@ _ACTION_BY_CALLBACK = {
     RETRY_CONNECT_EXTRA_CALLBACK: "eds.connect.retry",
     REMOVE_EDS_ACCOUNT_CALLBACK: "eds.slot.remove_free",
     RESTORE_EDS_ACCOUNT_CALLBACK: "eds.slot.restore_free",
+    CONNECT_VOICE_CALLBACK: "subscription.connect_voice",
+    CANCEL_VOICE_CALLBACK: "subscription.cancel_voice",
 }
 
 _CALLBACK_PARAMS = {
