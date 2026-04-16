@@ -235,9 +235,12 @@ async def test_happy_path_injects_text():
             payload, session=session, telegram_client=telegram, onboarding=onboarding
         )
 
-    assert result is not None
-    assert result["message"]["text"] == "Привет мир"
-    telegram.send_message.assert_not_called()
+    # Voice transcription sends the transcription back and returns None
+    # (no further pipeline processing until a chat skill is available).
+    assert result is None
+    telegram.send_message.assert_awaited_once()
+    msg = telegram.send_message.call_args.kwargs["text"]
+    assert "Привет мир" in msg
 
     # Verify file download sequence
     telegram.get_file_info.assert_awaited_once_with("fid1")

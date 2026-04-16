@@ -172,9 +172,18 @@ async def _maybe_transcribe_voice(
         credits_consumed=1,
     )
 
-    # 8. Inject transcribed text into payload
-    message["text"] = text
-    return payload
+    # 8. Send transcription back to user and stop processing.
+    # Once a chat-capable skill is available, this block should be replaced
+    # with ``message["text"] = text; return payload`` to route transcribed
+    # text into the normal pipeline.
+    try:
+        await telegram_client.send_message(
+            chat_id=chat_id,
+            text=f"🎤 {text}",
+        )
+    except TelegramDeliveryError as exc:
+        logger.warning("Failed to send transcription: %s", exc)
+    return None
 
 
 async def _handle_callback(
