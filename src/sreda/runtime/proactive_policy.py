@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 DUPLICATE_LOOKBACK_HOURS = 24
-DUPLICATE_COSINE_THRESHOLD = 0.97
+DUPLICATE_COSINE_THRESHOLD = 1.0  # effectively disabled; exact text match is sufficient
 
 
 class ProactiveDecisionKind(str, Enum):
