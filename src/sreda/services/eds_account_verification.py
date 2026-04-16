@@ -16,8 +16,7 @@ from sreda.config.settings import get_settings
 from sreda.db.models.eds_monitor import EDSAccount
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import Job, SecureRecord, User
-from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
-from sreda.services.billing import BillingService, STATUS_CALLBACK, SUBSCRIPTIONS_CALLBACK
+from sreda.integrations.telegram.client import TelegramClient
 from sreda.services.privacy_guard import get_default_privacy_guard
 from sreda.services.secure_storage import load_secure_json, store_secure_json
 
@@ -561,37 +560,14 @@ class EDSAccountVerificationService:
         connect_session: ConnectSession,
         tenant_account: TenantEDSAccount,
     ) -> None:
-        chat_id = self._get_recipient_chat_id(connect_session.tenant_id)
-        if self.telegram_client is None or chat_id is None:
-            return
-
-        summary = BillingService(self.session).get_summary(connect_session.tenant_id)
-        connected_count = summary.connected_count
-        allowed_count = summary.allowed_count
-        if tenant_account.account_role == "primary":
-            text = (
-                "Кабинет EDS подключен.\n\n"
-                "Теперь мониторинг активен.\n"
-                f"Подключено кабинетов: {connected_count} из {allowed_count}"
-            )
-        else:
-            text = (
-                "Дополнительный кабинет EDS подключен.\n\n"
-                f"Подключено кабинетов: {connected_count} из {allowed_count}"
-            )
-        try:
-            await self.telegram_client.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup={
-                    "inline_keyboard": [
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    ]
-                },
-            )
-        except TelegramDeliveryError as exc:
-            logger.warning("Telegram success notification delivery failed: %s", exc)
+        # Intentionally no-op. Since `/subscriptions` now opens the
+        # Mini App, the connect form itself shows the success page with
+        # a "Вернуться в подписки" button, and the Mini App reflects
+        # the new account on the next open. Pushing an extra chat
+        # message creates noise (the screenshot the user flagged) and
+        # the Mini App is the canonical surface for state. Kept as a
+        # stub so call sites don't need to branch on origin.
+        return
 
     async def _send_failure_message(
         self,
@@ -600,32 +576,12 @@ class EDSAccountVerificationService:
         tenant_account: TenantEDSAccount | None,
         account_role: str | None = None,
     ) -> None:
-        chat_id = self._get_recipient_chat_id(connect_session.tenant_id)
-        if self.telegram_client is None or chat_id is None:
-            return
-
-        text = connect_session.error_message_sanitized or "Не удалось завершить подключение из-за технической ошибки."
-        role = account_role
-        if role is None and tenant_account is not None:
-            role = tenant_account.account_role
-        retry_callback = (
-            RETRY_CONNECT_EXTRA_CALLBACK
-            if role == "extra"
-            else RETRY_CONNECT_PRIMARY_CALLBACK
-        )
-        try:
-            await self.telegram_client.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup={
-                    "inline_keyboard": [
-                        [{"text": "Повторить подключение", "callback_data": retry_callback}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                },
-            )
-        except TelegramDeliveryError as exc:
-            logger.warning("Telegram failure notification delivery failed: %s", exc)
+        # Intentionally no-op. See `_send_success_message` for the
+        # rationale — all subscription state lives in the Mini App now.
+        # Failure details are surfaced on the connect form and via the
+        # Mini App status/error screens; async retries continue to work
+        # through the verification job regardless of notifications.
+        return
 
     def _get_recipient_chat_id(self, tenant_id: str) -> str | None:
         user = (

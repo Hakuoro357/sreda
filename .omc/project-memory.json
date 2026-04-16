@@ -1,0 +1,248 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776326657141,
+  "projectRoot": "C:\\pro\\vex-assistant\\sreda",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "fastapi",
+        "version": null,
+        "category": "backend"
+      },
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 1,
+      "lastAccessed": 1776326657117,
+      "keyFiles": [
+        "README.md"
+      ]
+    },
+    "migrations": {
+      "path": "migrations",
+      "purpose": "Database migrations",
+      "fileCount": 3,
+      "lastAccessed": 1776326657118,
+      "keyFiles": [
+        "env.py",
+        "README.md",
+        "script.py.mako"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 0,
+      "lastAccessed": 1776326657118,
+      "keyFiles": []
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 0,
+      "lastAccessed": 1776326657119,
+      "keyFiles": []
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 0,
+      "lastAccessed": 1776326657119,
+      "keyFiles": []
+    },
+    "docs\\public": {
+      "path": "docs\\public",
+      "purpose": "Public files",
+      "fileCount": 17,
+      "lastAccessed": 1776326657120,
+      "keyFiles": [
+        "01-product-vision.md",
+        "02-why-langgraph.md",
+        "03-mvp-architecture.md"
+      ]
+    },
+    "tests\\fixtures": {
+      "path": "tests\\fixtures",
+      "purpose": "Test fixtures",
+      "fileCount": 1,
+      "lastAccessed": 1776326657121,
+      "keyFiles": [
+        "README.md"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src\\sreda\\runtime\\handlers.py",
+      "accessCount": 5,
+      "lastAccessed": 1776329621491,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\workers\\proactive_events.py",
+      "accessCount": 5,
+      "lastAccessed": 1776329627552,
+      "type": "directory"
+    },
+    {
+      "path": "tests\\unit\\test_phase5_commands.py",
+      "accessCount": 4,
+      "lastAccessed": 1776329159374,
+      "type": "file"
+    },
+    {
+      "path": "src\\sreda\\features\\registry.py",
+      "accessCount": 4,
+      "lastAccessed": 1776329651662,
+      "type": "file"
+    },
+    {
+      "path": "tests\\unit\\test_miniapp_api.py",
+      "accessCount": 4,
+      "lastAccessed": 1776352896285,
+      "type": "file"
+    },
+    {
+      "path": "src\\sreda\\workers\\outbox_delivery.py",
+      "accessCount": 3,
+      "lastAccessed": 1776329669290,
+      "type": "file"
+    },
+    {
+      "path": "src\\sreda\\services\\eds_connect.py",
+      "accessCount": 2,
+      "lastAccessed": 1776328165666,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\workers",
+      "accessCount": 2,
+      "lastAccessed": 1776329493202,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\api\\routes\\miniapp.py",
+      "accessCount": 2,
+      "lastAccessed": 1776352740760,
+      "type": "file"
+    },
+    {
+      "path": "tests",
+      "accessCount": 2,
+      "lastAccessed": 1776352881990,
+      "type": "directory"
+    },
+    {
+      "path": "tests\\unit\\test_connect_flow.py",
+      "accessCount": 2,
+      "lastAccessed": 1776370927155,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\admin\\routes.py",
+      "accessCount": 1,
+      "lastAccessed": 1776328098417,
+      "type": "file"
+    },
+    {
+      "path": "src\\sreda\\db\\models\\eds_monitor.py",
+      "accessCount": 1,
+      "lastAccessed": 1776328116465,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\db\\models\\connect.py",
+      "accessCount": 1,
+      "lastAccessed": 1776328116801,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda",
+      "accessCount": 1,
+      "lastAccessed": 1776328172167,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\db\\models\\user_profile.py",
+      "accessCount": 1,
+      "lastAccessed": 1776329132663,
+      "type": "file"
+    },
+    {
+      "path": "src\\sreda\\runtime\\proactive_policy.py",
+      "accessCount": 1,
+      "lastAccessed": 1776329419272,
+      "type": "file"
+    },
+    {
+      "path": "src\\sreda\\integrations\\telegram\\client.py",
+      "accessCount": 1,
+      "lastAccessed": 1776329591516,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\db\\session.py",
+      "accessCount": 1,
+      "lastAccessed": 1776352848885,
+      "type": "file"
+    },
+    {
+      "path": "src\\sreda\\db\\models",
+      "accessCount": 1,
+      "lastAccessed": 1776352871956,
+      "type": "directory"
+    },
+    {
+      "path": "src\\sreda\\db",
+      "accessCount": 1,
+      "lastAccessed": 1776352876374,
+      "type": "directory"
+    }
+  ],
+  "userDirectives": []
+}

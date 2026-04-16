@@ -629,7 +629,7 @@ def test_submit_form_shows_verified_message_when_inline_verification_completes(
 
     assert response.status_code == 200
     assert "Кабинет EDS подключ" in response.text  # покрывает "подключен/подключён"
-    assert "Результат проверки придёт" not in response.text
+    assert "Результат проверки появится" not in response.text
 
 
 def test_submit_form_shows_neutral_message_when_inline_verification_fails(
@@ -639,7 +639,7 @@ def test_submit_form_shows_neutral_message_when_inline_verification_fails(
     """Regression guard for M1 follow-up: когда ``process_job`` возвращает
     ``"failed"`` (штатный исход без exception), страница не должна
     утверждать, что кабинет подключён. Должна отдавать нейтральный
-    текст "результат придёт в Telegram".
+    текст "результат появится в приложении".
     """
 
     db_path = tmp_path / "test.db"
@@ -678,7 +678,7 @@ def test_submit_form_shows_neutral_message_when_inline_verification_fails(
 
     assert response.status_code == 200
     assert "Кабинет EDS подключ" not in response.text
-    assert "Результат проверки придёт в Telegram" in response.text
+    assert "Результат проверки появится в приложении" in response.text
 
 
 def test_submit_form_shows_neutral_message_when_inline_verification_raises(
@@ -724,7 +724,7 @@ def test_submit_form_shows_neutral_message_when_inline_verification_raises(
 
     assert response.status_code == 200
     assert "Кабинет EDS подключ" not in response.text
-    assert "Результат проверки придёт в Telegram" in response.text
+    assert "Результат проверки появится в приложении" in response.text
 
 
 def _seed_bundle(session) -> None:

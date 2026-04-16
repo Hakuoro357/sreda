@@ -74,12 +74,14 @@ def admin_tenant_reset(
 ):
     """Full tenant reset: unbind EDS cabinets, delete subscriptions,
     skill states, all events, outbox — as if the user just registered."""
-    from sreda.db.models.billing import TenantSubscription
+    from sreda.db.models.billing import TenantSubscription  # noqa: keep cycles/orders
     from sreda.db.models.connect import ConnectSession, TenantEDSAccount
     from sreda.db.models.core import OutboxMessage, SecureRecord, Tenant
     from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState
     from sreda.db.models.inbound_event import InboundEvent
     from sreda.db.models.skill_platform import TenantSkillConfig, TenantSkillState
+    # Note: PaymentOrder / TenantBillingCycle are NOT deleted — FK cascades
+    # make it fragile, and billing history is useful for audit.
 
     tenant = session.get(Tenant, tenant_id)
     if tenant is None:
