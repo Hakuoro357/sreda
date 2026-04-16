@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 DUPLICATE_LOOKBACK_HOURS = 24
-DUPLICATE_COSINE_THRESHOLD = 0.85
+DUPLICATE_COSINE_THRESHOLD = 0.97
 
 
 class ProactiveDecisionKind(str, Enum):
