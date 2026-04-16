@@ -50,9 +50,19 @@ def _telegram_limiter() -> InMemoryRateLimiter:
     )
 
 
+@lru_cache(maxsize=1)
+def _miniapp_limiter() -> InMemoryRateLimiter:
+    settings = get_settings()
+    return InMemoryRateLimiter(
+        max_requests=settings.rate_limit_miniapp_max_requests,
+        window_seconds=settings.rate_limit_miniapp_window_seconds,
+    )
+
+
 def reset_rate_limiters() -> None:
     _connect_limiter.cache_clear()
     _telegram_limiter.cache_clear()
+    _miniapp_limiter.cache_clear()
 
 
 def _client_ip(request: Request) -> str:
@@ -81,6 +91,17 @@ def enforce_telegram_rate_limit(request: Request) -> None:
     key = _client_ip(request)
     if not limiter.check(key):
         logger.warning("telegram webhook rate-limit hit for %s", key)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="rate_limited",
+        )
+
+
+def enforce_miniapp_rate_limit(request: Request) -> None:
+    limiter = _miniapp_limiter()
+    key = _client_ip(request)
+    if not limiter.check(key):
+        logger.warning("miniapp rate-limit hit for %s", key)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="rate_limited",

@@ -4,6 +4,7 @@ from sreda.admin.routes import router as admin_router
 from sreda.api.routes.approvals import router as approvals_router
 from sreda.api.routes.connect import router as connect_router
 from sreda.api.routes.health import router as health_router
+from sreda.api.routes.miniapp import router as miniapp_router
 from sreda.api.routes.telegram_webhook import router as telegram_router
 from sreda.config.logging import configure_logging
 from sreda.config.settings import get_settings
@@ -19,6 +20,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router)
     app.include_router(health_router)
     app.include_router(connect_router)
+    app.include_router(miniapp_router)
     app.include_router(telegram_router)
     app.include_router(approvals_router)
     feature_registry.register_api(app)

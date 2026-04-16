@@ -1,0 +1,467 @@
+{% extends "base.html" %}
+
+{% block scripts %}
+<script>
+(function() {
+  "use strict";
+
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+
+  var initData = tg ? tg.initData : "";
+  var $app = document.getElementById("app");
+
+  // -- State --
+  var state = { summary: null, plans: null, loading: true, error: null };
+
+  // -- API --
+  function apiFetch(path, opts) {
+    opts = opts || {};
+    var headers = { "Authorization": "tma " + initData };
+    if (opts.body) headers["Content-Type"] = "application/json";
+    return fetch("{{ base_url }}" + path, {
+      method: opts.method || "GET",
+      headers: headers,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    }).then(function(r) {
+      if (r.status === 401) {
+        state.error = "Сессия истекла. Закройте и откройте подписки заново.";
+        render();
+        throw new Error("auth_expired");
+      }
+      return r.json();
+    });
+  }
+
+  function loadData() {
+    state.loading = true;
+    state.error = null;
+    render();
+    return Promise.all([
+      apiFetch("/miniapp/api/v1/summary"),
+      apiFetch("/miniapp/api/v1/plans"),
+    ]).then(function(results) {
+      state.summary = results[0];
+      state.plans = results[1];
+      state.loading = false;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.loading = false;
+        state.error = "Не удалось загрузить данные.";
+        render();
+      }
+    });
+  }
+
+  function doAction(path, body) {
+    return apiFetch(path, { method: "POST", body: body || {} })
+      .then(function(res) {
+        if (res.summary) state.summary = res.summary;
+        return res;
+      })
+      .then(function() { return loadData(); });
+  }
+
+  function showPopup(message, onOk) {
+    if (tg && tg.showPopup) {
+      tg.showPopup(
+        { message: message, buttons: [{ type: "ok", text: "Да" }, { type: "cancel", text: "Отмена" }] },
+        function(btn) { if (btn === "ok") onOk(); }
+      );
+    } else {
+      if (confirm(message)) onOk();
+    }
+  }
+
+  function showAlert(message) {
+    if (tg && tg.showAlert) tg.showAlert(message);
+    else alert(message);
+  }
+
+  // -- Routing --
+  function getRoute() {
+    var hash = location.hash || "#/";
+    return hash.replace(/^#/, "") || "/";
+  }
+
+  function navigate(path) {
+    location.hash = "#" + path;
+  }
+
+  function setupBackButton(show) {
+    if (!tg || !tg.BackButton) return;
+    if (show) {
+      tg.BackButton.show();
+      tg.BackButton.onClick(function() { history.back(); });
+    } else {
+      tg.BackButton.hide();
+    }
+  }
+
+  // -- Helpers --
+  function formatDate(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    var dd = String(d.getDate()).padStart(2, "0");
+    var mm = String(d.getMonth() + 1).padStart(2, "0");
+    var yyyy = d.getFullYear();
+    return dd + "." + mm + "." + yyyy;
+  }
+
+  function formatPrice(rub) {
+    if (!rub || rub === 0) return "Бесплатно";
+    return rub.toLocaleString("ru-RU") + " \u20bd / мес";
+  }
+
+  function escHtml(s) {
+    if (!s) return "";
+    var el = document.createElement("span");
+    el.textContent = s;
+    return el.innerHTML;
+  }
+
+  function findPlan(planKey) {
+    if (!state.plans || !state.plans.plans) return null;
+    for (var i = 0; i < state.plans.plans.length; i++) {
+      if (state.plans.plans[i].plan_key === planKey) return state.plans.plans[i];
+    }
+    return null;
+  }
+
+  // -- Renderers --
+
+  function renderLoading() {
+    return '<div class="loading"><div class="spinner"></div></div>';
+  }
+
+  function renderError() {
+    return '<div class="error-state">' + escHtml(state.error) + '</div>';
+  }
+
+  // --- Screen: Main (#/) ---
+  function renderMain() {
+    setupBackButton(false);
+    var s = state.summary;
+    var html = '<h1>Мои подписки</h1>';
+
+    // Payment banner
+    if (s.next_payment_due_at && s.next_amount_rub > 0) {
+      html += '<div class="banner">';
+      html += 'Следующий платёж: <strong>' + formatDate(s.next_payment_due_at) + '</strong><br>';
+      html += 'Сумма: <strong>' + s.next_amount_rub.toLocaleString("ru-RU") + ' \u20bd</strong>';
+      html += '</div>';
+    }
+
+    // Active subscriptions
+    var activeSkills = s.active_skills || [];
+    if (activeSkills.length > 0) {
+      html += '<div class="section-title">Активные</div>';
+      for (var i = 0; i < activeSkills.length; i++) {
+        var sk = activeSkills[i];
+        html += '<div class="card card-link" onclick="window._nav(\'/skill/' + escHtml(sk.feature_key) + '\')">';
+        html += '<div>';
+        html += '<div class="card-title">' + escHtml(sk.icon || "") + " " + escHtml(sk.title);
+        html += ' <span class="status-active">\u2713</span></div>';
+        html += '<div class="card-subtitle">' + escHtml(sk.summary_line) + '</div>';
+        html += '</div>';
+        html += '<span class="chevron">\u203A</span>';
+        html += '</div>';
+      }
+    }
+
+    // Add subscription button
+    html += '<div class="card card-link" onclick="window._nav(\'/catalog\')">';
+    html += '<div><div class="card-title">+ Добавить подписку</div></div>';
+    html += '<span class="chevron">\u203A</span>';
+    html += '</div>';
+
+    return html;
+  }
+
+  // --- Screen: EDS Monitor skill (#/skill/eds_monitor) ---
+  function renderEdsSkill() {
+    setupBackButton(true);
+    var s = state.summary;
+    var html = '<h1>EDS Monitor</h1>';
+
+    html += '<div class="section-title">Подписки EDS</div>';
+
+    var subs = s.eds_subscriptions || [];
+    for (var i = 0; i < subs.length; i++) {
+      var sub = subs[i];
+      html += '<div class="card">';
+      html += '<div class="card-title">' + escHtml(sub.title);
+      if (sub.status === "active") {
+        html += ' <span class="status-active">\u2713</span>';
+      } else if (sub.status === "scheduled_for_cancel") {
+        html += ' <span class="status-warning">\u26A0</span>';
+      }
+      html += '</div>';
+      html += '<div class="card-subtitle">' + formatPrice(sub.price_rub) + '</div>';
+      html += '<div class="card-subtitle">до ' + formatDate(sub.active_until) + '</div>';
+
+      if (sub.status === "scheduled_for_cancel") {
+        html += '<div class="card-subtitle status-warning">Не будет продлена</div>';
+      }
+
+      // Connected EDS account
+      if (sub.account) {
+        var acc = sub.account;
+        html += '<div class="eds-account">';
+        html += '<div class="eds-account-header">';
+        html += '<div>';
+        html += '<div class="eds-account-login">' + escHtml(acc.login_masked) + '</div>';
+        if (acc.status === "active") {
+          html += '<div class="eds-account-status status-active">Активен</div>';
+        } else if (acc.status === "scheduled_for_disconnect") {
+          html += '<div class="eds-account-status status-warning">Будет отключён</div>';
+        } else if (acc.status === "pending_verification") {
+          html += '<div class="eds-account-status">Проверка...</div>';
+        } else if (acc.status === "auth_failed") {
+          html += '<div class="eds-account-status status-warning">Ошибка авторизации</div>';
+        } else {
+          html += '<div class="eds-account-status">' + escHtml(acc.status) + '</div>';
+        }
+        html += '</div>';
+        if (acc.status === "scheduled_for_disconnect") {
+          html += '<button class="btn btn-success btn-small" onclick="window._edsRestore(\'' + escHtml(acc.id) + '\')">Вернуть</button>';
+        } else {
+          html += '<button class="btn btn-danger btn-small" onclick="window._edsCancel(\'' + escHtml(acc.id) + '\', \'' + escHtml(acc.login_masked) + '\')">Отвязать</button>';
+        }
+        html += '</div></div>';
+      } else if (sub.is_free_slot) {
+        // Free slot without connected account
+        html += '<div class="card-subtitle mt-8" style="font-style:italic">Кабинет не подключён</div>';
+        html += '<button class="btn btn-primary btn-small mt-8" onclick="window._edsConnect()">Подключить ЛК EDS</button>';
+      }
+
+      // Cancel/resume subscription
+      if (sub.status === "scheduled_for_cancel") {
+        html += '<div class="text-right mt-8"><button class="btn btn-success" onclick="window._resume(\'eds_monitor_base\')">Возобновить</button></div>';
+      } else if (sub.can_cancel) {
+        if (sub.slot_type === "free") {
+          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._removeSlot()">Убрать слот</button></div>';
+        } else {
+          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._cancelEds(\'' + escHtml(sub.cancel_type || "base") + '\')">Отменить</button></div>';
+        }
+      }
+
+      html += '</div>';
+    }
+
+    // Add cabinet button
+    html += '<div class="card">';
+    html += '<button class="btn btn-primary" onclick="window._addCabinet()">+ Добавить кабинет</button>';
+    html += '<div class="card-subtitle mt-8" style="text-align:center">' + formatPrice(s.extra_price_rub || 2990) + '</div>';
+    html += '</div>';
+
+    // Renewal section
+    if (s.next_payment_due_at && s.next_amount_rub > 0) {
+      html += '<div class="section-title">Продление</div>';
+      html += '<div class="card">';
+      html += '<div class="card-subtitle">Следующий платёж: ' + formatDate(s.next_payment_due_at) + '</div>';
+      html += '<div class="card-subtitle">Сумма: ' + s.next_amount_rub.toLocaleString("ru-RU") + ' \u20bd</div>';
+      html += '<button class="btn btn-primary mt-16" onclick="window._renew()">Продлить сейчас</button>';
+      html += '</div>';
+    }
+
+    return html;
+  }
+
+  // --- Screen: Generic skill (#/skill/{key}) ---
+  function renderGenericSkill(featureKey) {
+    setupBackButton(true);
+    var s = state.summary;
+    var skill = null;
+    var allSkills = (s.active_skills || []).concat(s.available_skills || []);
+    for (var i = 0; i < allSkills.length; i++) {
+      if (allSkills[i].feature_key === featureKey) { skill = allSkills[i]; break; }
+    }
+    if (!skill) return '<div class="error-state">Навык не найден</div>';
+
+    var html = '<h1>' + escHtml(skill.title) + '</h1>';
+    html += '<div class="description">' + escHtml(skill.description) + '</div>';
+
+    html += '<div class="card">';
+    if (skill.is_active) {
+      html += '<div class="card-title">Статус: Активно <span class="status-active">\u2713</span></div>';
+      html += '<div class="card-subtitle">' + formatPrice(skill.price_rub) + '</div>';
+      html += '<div class="card-subtitle">до ' + formatDate(skill.active_until) + '</div>';
+    } else {
+      html += '<div class="card-title">Статус: <span class="status-inactive">Не подключено</span></div>';
+      html += '<div class="card-subtitle">' + formatPrice(skill.price_rub) + '</div>';
+    }
+    html += '</div>';
+
+    if (skill.is_active) {
+      html += '<button class="btn btn-danger mt-8" onclick="window._cancelSkill(\'' + escHtml(featureKey) + '\', \'' + escHtml(skill.plan_key) + '\')">Отключить</button>';
+    } else {
+      html += '<button class="btn btn-primary mt-8" onclick="window._subscribeSkill(\'' + escHtml(skill.plan_key) + '\', \'' + escHtml(skill.title) + '\', ' + (skill.price_rub || 0) + ')">Подключить</button>';
+    }
+
+    return html;
+  }
+
+  // --- Screen: Catalog (#/catalog) ---
+  function renderCatalog() {
+    setupBackButton(true);
+    var html = '<h1>Добавить подписку</h1>';
+
+    var available = (state.summary && state.summary.available_skills) || [];
+    if (available.length === 0) {
+      html += '<div class="empty-state">Все доступные подписки уже подключены</div>';
+      return html;
+    }
+
+    for (var i = 0; i < available.length; i++) {
+      var p = available[i];
+      html += '<div class="card card-link" onclick="window._nav(\'/catalog/' + escHtml(p.plan_key) + '\')">';
+      html += '<div>';
+      html += '<div class="card-title">' + escHtml(p.icon || "") + " " + escHtml(p.title) + '</div>';
+      html += '<div class="card-subtitle">' + escHtml(p.description) + '</div>';
+      html += '<div class="card-subtitle">' + formatPrice(p.price_rub) + '</div>';
+      html += '</div>';
+      html += '<span class="chevron">\u203A</span>';
+      html += '</div>';
+    }
+
+    return html;
+  }
+
+  // --- Screen: Plan detail (#/catalog/{plan_key}) ---
+  function renderPlanDetail(planKey) {
+    setupBackButton(true);
+    var plan = findPlan(planKey);
+    if (!plan) return '<div class="error-state">План не найден</div>';
+
+    var html = '<h1>' + escHtml(plan.title) + '</h1>';
+    html += '<div class="description">' + escHtml(plan.description) + '</div>';
+    html += '<div class="price-large">' + formatPrice(plan.price_rub) + '</div>';
+    html += '<button class="btn btn-primary" onclick="window._subscribeSkill(\'' + escHtml(plan.plan_key) + '\', \'' + escHtml(plan.title) + '\', ' + (plan.price_rub || 0) + ')">Подключить</button>';
+
+    return html;
+  }
+
+  // -- Main render --
+  function render() {
+    if (state.loading) { $app.innerHTML = renderLoading(); return; }
+    if (state.error) { $app.innerHTML = renderError(); return; }
+
+    var route = getRoute();
+    var html;
+
+    if (route === "/") {
+      html = renderMain();
+    } else if (route === "/skill/eds_monitor") {
+      html = renderEdsSkill();
+    } else if (route.indexOf("/skill/") === 0) {
+      var featureKey = route.replace("/skill/", "");
+      html = renderGenericSkill(featureKey);
+    } else if (route === "/catalog") {
+      html = renderCatalog();
+    } else if (route.indexOf("/catalog/") === 0) {
+      var planKey = route.replace("/catalog/", "");
+      html = renderPlanDetail(planKey);
+    } else {
+      html = renderMain();
+    }
+
+    $app.innerHTML = html;
+  }
+
+  // -- Global actions --
+
+  window._nav = function(path) { navigate(path); };
+
+  window._subscribeSkill = function(planKey, title, priceRub) {
+    var msg = priceRub > 0
+      ? "Подключить " + title + " за " + priceRub.toLocaleString("ru-RU") + " \u20bd/мес?"
+      : "Подключить " + title + "?";
+    showPopup(msg, function() {
+      doAction("/miniapp/api/v1/subscribe", { plan_key: planKey })
+        .then(function() { navigate("/"); })
+        .catch(function() { showAlert("Не удалось подключить."); });
+    });
+  };
+
+  window._cancelSkill = function(featureKey, planKey) {
+    showPopup("Отключить подписку?", function() {
+      doAction("/miniapp/api/v1/cancel", { plan_key: planKey })
+        .then(function() { navigate("/"); })
+        .catch(function() { showAlert("Не удалось отключить."); });
+    });
+  };
+
+  window._cancelEds = function(cancelType) {
+    showPopup("Подписка будет активна до конца периода. Отменить продление?", function() {
+      doAction("/miniapp/api/v1/cancel", { plan_key: "eds_monitor_base" })
+        .catch(function() { showAlert("Не удалось отменить."); });
+    });
+  };
+
+  window._resume = function(planKey) {
+    doAction("/miniapp/api/v1/resume", { plan_key: planKey })
+      .catch(function() { showAlert("Не удалось возобновить."); });
+  };
+
+  window._renew = function() {
+    showPopup("Продлить подписки сейчас?", function() {
+      doAction("/miniapp/api/v1/renew")
+        .catch(function() { showAlert("Не удалось продлить."); });
+    });
+  };
+
+  window._edsCancel = function(accountId, login) {
+    showPopup("Отвязать кабинет " + login + "?", function() {
+      doAction("/miniapp/api/v1/eds/accounts/" + accountId + "/cancel")
+        .catch(function() { showAlert("Не удалось отвязать."); });
+    });
+  };
+
+  window._edsRestore = function(accountId) {
+    doAction("/miniapp/api/v1/eds/accounts/" + accountId + "/restore")
+      .catch(function() { showAlert("Не удалось вернуть."); });
+  };
+
+  window._edsConnect = function() {
+    apiFetch("/miniapp/api/v1/eds/connect", { method: "POST", body: {} })
+      .then(function(res) {
+        if (res.connect_url) {
+          location.href = res.connect_url;
+        } else {
+          showAlert(res.message || "Не удалось создать ссылку.");
+        }
+      })
+      .catch(function() { showAlert("Не удалось создать ссылку."); });
+  };
+
+  window._addCabinet = function() {
+    var price = (state.summary && state.summary.extra_price_rub) || 2990;
+    showPopup("Добавить кабинет за " + price.toLocaleString("ru-RU") + " \u20bd/мес?", function() {
+      apiFetch("/miniapp/api/v1/eds/add-and-connect", { method: "POST", body: {} })
+        .then(function(res) {
+          if (res.connect_url) {
+            location.href = res.connect_url;
+          } else {
+            showAlert(res.message || "Не удалось создать ссылку.");
+            loadData();
+          }
+        })
+        .catch(function() { showAlert("Не удалось добавить."); });
+    });
+  };
+
+  window._removeSlot = function() {
+    showPopup("Убрать свободный слот?", function() {
+      doAction("/miniapp/api/v1/eds/slot/remove")
+        .catch(function() { showAlert("Не удалось убрать."); });
+    });
+  };
+
+  // -- Init --
+  window.addEventListener("hashchange", render);
+  loadData();
+})();
+</script>
+{% endblock %}

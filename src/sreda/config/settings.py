@@ -104,6 +104,8 @@ class Settings(BaseSettings):
     rate_limit_connect_window_seconds: float = 60.0
     rate_limit_telegram_max_requests: int = 120
     rate_limit_telegram_window_seconds: float = 60.0
+    rate_limit_miniapp_max_requests: int = 60
+    rate_limit_miniapp_window_seconds: float = 60.0
 
     @field_validator("connect_public_base_url")
     @classmethod

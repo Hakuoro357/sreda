@@ -116,6 +116,17 @@ def execute_subscriptions_show(session: Session, action: ActionEnvelope, context
     text, reply_markup = billing.build_subscriptions_message(
         action.tenant_id, connect_button_override=connect_button_override
     )
+
+    # Prepend Mini App button when connect_public_base_url is configured
+    settings = get_settings()
+    base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
+    if base_url:
+        miniapp_url = f"{base_url}/miniapp/"
+        miniapp_button = {"text": "Управление подписками", "web_app": {"url": miniapp_url}}
+        rows = reply_markup.get("inline_keyboard", [])
+        rows.insert(0, [miniapp_button])
+        reply_markup = {"inline_keyboard": rows}
+
     return [RuntimeReply(text=text, reply_markup=reply_markup)]
 
 
