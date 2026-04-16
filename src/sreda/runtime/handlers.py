@@ -55,6 +55,10 @@ class RuntimeReply:
     # Set by skill-provided handlers so the delivery worker can look up
     # per-skill ``notification_priority`` for quiet-hours / mute policy.
     feature_key: str | None = None
+    # Telegram parse_mode: ``"HTML"`` or ``"MarkdownV2"`` or ``None``.
+    # Proactive handlers (e.g. EDS monitor) use this to preserve rich
+    # formatting when their messages go through the outbox path.
+    parse_mode: str | None = None
 
 
 class ActionRuntimeError(Exception):

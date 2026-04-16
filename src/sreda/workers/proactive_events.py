@@ -233,6 +233,14 @@ class ProactiveEventWorker:
             scheduled_at = None
             row_drop_reason = drop_reason
 
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": reply.text,
+            "reply_markup": reply.reply_markup,
+        }
+        if reply.parse_mode:
+            payload["parse_mode"] = reply.parse_mode
+
         outbox = OutboxMessage(
             id=f"out_{uuid4().hex[:24]}",
             tenant_id=event.tenant_id,
@@ -244,14 +252,7 @@ class ProactiveEventWorker:
             status=status,
             scheduled_at=scheduled_at,
             drop_reason=row_drop_reason,
-            payload_json=json.dumps(
-                {
-                    "chat_id": chat_id,
-                    "text": reply.text,
-                    "reply_markup": reply.reply_markup,
-                },
-                ensure_ascii=False,
-            ),
+            payload_json=json.dumps(payload, ensure_ascii=False),
         )
         self.session.add(outbox)
         self.session.flush()
