@@ -331,10 +331,22 @@ def test_proactive_duplicate_dropped_by_policy(
 def test_proactive_throttle_defers_second_event(
     monkeypatch, tmp_path: Path, _fresh_registry
 ):
-    """With default throttle=30, a second proactive reply (unique text)
-    within the window is deferred rather than dropped."""
+    """With explicit throttle=30 in profile, a second proactive reply
+    (unique text) within the window is deferred rather than dropped."""
     session = _bootstrap(monkeypatch, tmp_path, "p5e2e2.db")
     _seed_subscription(session, TEST_FEATURE_KEY)
+
+    # Default throttle is 0 (disabled). Explicitly set throttle=30 in
+    # user profile to test the deferral behaviour.
+    session.add(
+        TenantUserProfile(
+            id="prof1",
+            tenant_id="t1",
+            user_id="u1",
+            proactive_throttle_minutes=30,
+        )
+    )
+    session.commit()
 
     counter = [0]
 
