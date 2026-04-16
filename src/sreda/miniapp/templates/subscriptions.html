@@ -65,8 +65,16 @@
 
   function showPopup(message, onOk) {
     if (tg && tg.showPopup) {
+      // Buttons need explicit `id` — without it, the callback receives
+      // an empty string for type:"ok" and we'd never trigger onOk().
       tg.showPopup(
-        { message: message, buttons: [{ type: "ok", text: "Да" }, { type: "cancel", text: "Отмена" }] },
+        {
+          message: message,
+          buttons: [
+            { id: "ok", type: "default", text: "Да" },
+            { id: "cancel", type: "default", text: "Отмена" }
+          ]
+        },
         function(btn) { if (btn === "ok") onOk(); }
       );
     } else {
@@ -287,7 +295,11 @@
     if (skill.is_active) {
       html += '<div class="card-title">Статус: Активно <span class="status-active">\u2713</span></div>';
       html += '<div class="card-subtitle">' + formatPrice(skill.price_rub) + '</div>';
-      html += '<div class="card-subtitle">до ' + formatDate(skill.active_until) + '</div>';
+      if (skill.price_rub && skill.price_rub > 0) {
+        html += '<div class="card-subtitle">до ' + formatDate(skill.active_until) + '</div>';
+      } else {
+        html += '<div class="card-subtitle">Подключено бессрочно</div>';
+      }
     } else {
       html += '<div class="card-title">Статус: <span class="status-inactive">Не подключено</span></div>';
       html += '<div class="card-subtitle">' + formatPrice(skill.price_rub) + '</div>';

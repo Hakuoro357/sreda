@@ -961,18 +961,30 @@ class BillingService:
             self.session.add(sub)
         sub.status = "active"
         sub.starts_at = current_time
-        sub.active_until = current_time + timedelta(days=plan.billing_period_days)
+        # Free plans (price_rub == 0) are perpetual: active_until is set
+        # ~100 years out so _is_subscription_active stays True forever and
+        # no "cycle renewal" path ever surfaces a billing event for them.
+        # This is the backend half of "бесплатный скил подключается
+        # бессрочно"; the UI half is hiding the expiry line when price == 0.
+        if plan.price_rub == 0:
+            sub.active_until = current_time + timedelta(days=36500)
+        else:
+            sub.active_until = current_time + timedelta(days=plan.billing_period_days)
         sub.cancel_at_period_end = False
         sub.quantity = 1
         sub.next_cycle_quantity = 1
         sub.updated_at = current_time
         self._ensure_feature_enabled(tenant_id, "voice_transcription", True)
         self.session.commit()
-        return SubscriptionActionResult(
-            message_text=(
+        if plan.price_rub == 0:
+            message_text = f"{plan.title} подключено."
+        else:
+            message_text = (
                 f"{plan.title} подключено.\n\n"
                 f"Активно до: {_format_date(sub.active_until)}"
-            ),
+            )
+        return SubscriptionActionResult(
+            message_text=message_text,
             reply_markup=_inline_keyboard([
                 [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
                 [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],

@@ -98,11 +98,33 @@ def execute_status_show(session: Session, action: ActionEnvelope, context: dict[
 
 
 def execute_subscriptions_show(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-    # Phase: direct-to-miniapp UX. When the user has an active base
-    # subscription + free slot, render "Подключить ЛК EDS" as a
-    # ``web_app`` button with a pre-generated one-time connect URL —
-    # single tap opens the mini-app. Fallback to callback button if
-    # link creation fails or we lack user context (e.g. broadcast).
+    # Phase: Mini App is the primary entry point for subscription
+    # management. When connect_public_base_url is configured we send a
+    # short prompt with the Mini App button only — this keeps the chat
+    # clean (one message instead of two screens worth of inline buttons)
+    # and gives users a single obvious tap target.
+    #
+    # Fallback (no public URL configured, e.g. local dev without HTTPS
+    # tunnel): render the legacy inline-keyboard view so the flow still
+    # works end-to-end.
+    settings = get_settings()
+    base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
+
+    if base_url:
+        miniapp_url = f"{base_url}/miniapp/"
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": "Открыть подписки", "web_app": {"url": miniapp_url}}]
+            ]
+        }
+        return [
+            RuntimeReply(
+                text="Управление подписками в приложении:",
+                reply_markup=reply_markup,
+            )
+        ]
+
+    # Legacy fallback for environments without a public HTTPS base URL.
     billing = BillingService(session)
     summary = billing.get_summary(action.tenant_id)
 
@@ -116,17 +138,6 @@ def execute_subscriptions_show(session: Session, action: ActionEnvelope, context
     text, reply_markup = billing.build_subscriptions_message(
         action.tenant_id, connect_button_override=connect_button_override
     )
-
-    # Prepend Mini App button when connect_public_base_url is configured
-    settings = get_settings()
-    base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
-    if base_url:
-        miniapp_url = f"{base_url}/miniapp/"
-        miniapp_button = {"text": "Управление подписками", "web_app": {"url": miniapp_url}}
-        rows = reply_markup.get("inline_keyboard", [])
-        rows.insert(0, [miniapp_button])
-        reply_markup = {"inline_keyboard": rows}
-
     return [RuntimeReply(text=text, reply_markup=reply_markup)]
 
 
