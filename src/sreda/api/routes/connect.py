@@ -250,16 +250,17 @@ def _render_submitted_page(*, already_started: bool = False, verified: bool = Fa
     <title>{escape(title)}</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
+      * {{ box-sizing: border-box; }}
       body {{
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
         background: var(--tg-theme-bg-color, #fff);
         color: var(--tg-theme-text-color, #000);
         line-height: 1.5;
-        margin: 0;
+        margin: 0 auto;
         padding: 16px;
+        max-width: 480px;
       }}
-      main {{ max-width: 480px; margin: 24px auto; }}
-      h1 {{ font-size: 22px; margin: 0 0 12px; }}
+      h1 {{ font-size: 22px; margin: 16px 0 12px; }}
       p {{ margin: 8px 0; color: var(--tg-theme-hint-color, #666); }}
       .btn {{
         display: block;
@@ -281,11 +282,9 @@ def _render_submitted_page(*, already_started: bool = False, verified: bool = Fa
     </style>
   </head>
   <body>
-    <main>
-      <h1>{escape(title)}</h1>
-      <p>{escape(message)}</p>
-      <a href="/miniapp/" class="btn" id="back-btn">Вернуться в подписки</a>
-    </main>
+    <h1>{escape(title)}</h1>
+    <p>{escape(message)}</p>
+    <a href="/miniapp/" class="btn" id="back-btn">Вернуться в подписки</a>
     <script>
       (function() {{
         var tg = window.Telegram && window.Telegram.WebApp;
