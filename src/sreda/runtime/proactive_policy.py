@@ -120,7 +120,7 @@ def decide_proactive(
         )
 
     # Rule 2: throttle
-    throttle_minutes = int((profile or {}).get("proactive_throttle_minutes", 30) or 0)
+    throttle_minutes = int((profile or {}).get("proactive_throttle_minutes", 0) or 0)
     if throttle_minutes > 0:
         defer_until = _throttle_defer_until(
             recent, now_utc=now_utc, throttle_minutes=throttle_minutes
