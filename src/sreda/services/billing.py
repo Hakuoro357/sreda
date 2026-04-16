@@ -359,7 +359,7 @@ class BillingService:
 
         cycle = self._get_cycle(tenant_id)
         plan = self._get_plan(PLAN_EDS_MONITOR_BASE)
-        if cycle is None or cycle.status == "expired" or cycle.next_payment_due_at <= current_time:
+        if cycle is None or cycle.status == "expired" or _ensure_aware(cycle.next_payment_due_at) <= current_time:
             cycle = TenantBillingCycle(
                 id=f"cycle_{uuid4().hex[:24]}",
                 tenant_id=tenant_id,
@@ -1242,6 +1242,11 @@ def _utcnow(value: datetime | None = None) -> datetime:
     if value is not None:
         return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
     return datetime.now(UTC)
+
+
+def _ensure_aware(dt: datetime) -> datetime:
+    """Normalize naive datetimes (e.g. from SQLite) to UTC-aware."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 def _format_date(value: datetime | None) -> str:
