@@ -240,6 +240,8 @@ class ProactiveEventWorker:
         }
         if reply.parse_mode:
             payload["parse_mode"] = reply.parse_mode
+        if reply.extra_payload:
+            payload.update(reply.extra_payload)
 
         outbox = OutboxMessage(
             id=f"out_{uuid4().hex[:24]}",

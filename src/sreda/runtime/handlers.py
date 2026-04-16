@@ -59,6 +59,10 @@ class RuntimeReply:
     # Proactive handlers (e.g. EDS monitor) use this to preserve rich
     # formatting when their messages go through the outbox path.
     parse_mode: str | None = None
+    # Arbitrary extra data merged into the outbox payload. Used by
+    # skill-specific proactive handlers to pass through delivery-time
+    # data (e.g. ``photo_entries``, ``eds_account_key``).
+    extra_payload: dict | None = None
 
 
 class ActionRuntimeError(Exception):

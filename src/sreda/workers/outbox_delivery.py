@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.core import OutboxMessage
 from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.delivery_policy import DeliveryKind, decide_delivery
 
@@ -135,6 +136,24 @@ class OutboxDeliveryWorker:
                 reply_markup=payload.get("reply_markup"),
                 parse_mode=payload.get("parse_mode"),
             )
+            # Feature-specific post-delivery (e.g. EDS photo sending)
+            if row.feature_key:
+                hook = get_feature_registry().get_delivery_hook(row.feature_key)
+                if hook is not None:
+                    try:
+                        await hook(
+                            session=self.session,
+                            telegram_client=self.telegram,
+                            outbox_row=row,
+                            payload=payload,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "outbox delivery: delivery hook failed for %s (feature=%s)",
+                            row.id,
+                            row.feature_key,
+                            exc_info=True,
+                        )
             row.status = "sent"
         except TelegramDeliveryError:
             logger.warning("outbox delivery: telegram error on %s, keeping pending", row.id)

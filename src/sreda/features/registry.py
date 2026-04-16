@@ -18,6 +18,13 @@ Concrete keyword signature is flexible — the runner passes ``session``
 positionally and the rest as kwargs, so handlers should accept
 ``(session, *, job, run_id, attempt_id)`` or ``(session, **kwargs)``."""
 
+DeliveryHook = Callable[..., Awaitable[None]]
+"""Signature: ``async def hook(session, telegram_client, outbox_row, payload) -> None``.
+
+Called by ``OutboxDeliveryWorker`` after the text message is sent.
+Allows feature-specific post-delivery logic (e.g. downloading and
+sending photos for EDS notifications)."""
+
 ProactiveEventHandler = Callable[..., Any]
 """Signature: ``def handler(context) -> list[RuntimeReply]``.
 
@@ -39,6 +46,7 @@ class FeatureRegistry:
         self._modules: dict[str, FeatureModule] = {}
         self._skill_job_handlers: dict[str, RegisteredSkillJobHandler] = {}
         self._proactive_handlers: dict[str, ProactiveEventHandler] = {}
+        self._delivery_hooks: dict[str, DeliveryHook] = {}
 
     # ------------------------------------------------------------- modules
 
@@ -138,3 +146,25 @@ class FeatureRegistry:
         self, feature_key: str
     ) -> ProactiveEventHandler | None:
         return self._proactive_handlers.get(feature_key)
+
+    # ------------------------------------------------------ delivery hooks
+
+    def register_delivery_hook(
+        self,
+        *,
+        feature_key: str,
+        hook: DeliveryHook,
+    ) -> None:
+        """Register a post-send delivery hook for a feature.
+
+        Called by ``OutboxDeliveryWorker`` after the text message is
+        successfully sent via Telegram. Allows features to perform
+        extra delivery steps (e.g. sending photos)."""
+        if feature_key in self._delivery_hooks:
+            raise ValueError(
+                f"delivery hook already registered for feature_key={feature_key!r}"
+            )
+        self._delivery_hooks[feature_key] = hook
+
+    def get_delivery_hook(self, feature_key: str) -> DeliveryHook | None:
+        return self._delivery_hooks.get(feature_key)
