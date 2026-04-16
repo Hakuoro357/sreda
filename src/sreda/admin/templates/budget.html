@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Бюджет{% endblock %}
+{% block content %}
+<h2>Бюджет по скилам</h2>
+
+{% if not rows %}
+<p>Нет активных подписок.</p>
+{% else %}
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Tenant</th>
+      <th>Скилл</th>
+      <th>План</th>
+      <th>Кредиты</th>
+      <th>Использование</th>
+      <th>Вызовов LLM</th>
+      <th>Токенов</th>
+      <th>Период</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.tenant_name }}</td>
+      <td><strong>{{ r.feature_key }}</strong></td>
+      <td>{{ r.plan_title or "—" }}</td>
+      <td>
+        {{ "{:,}".format(r.credits_used) }}
+        {% if r.credits_quota is not none %}
+          / {{ "{:,}".format(r.credits_quota) }}
+        {% else %}
+          / <span class="muted">∞</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if r.usage_pct is not none %}
+          <span class="usage-bar">
+            <span class="usage-bar-fill" style="width: {{ [r.usage_pct, 100] | min }}%;
+              {% if r.usage_pct > 95 %}background: #dc3545;
+              {% elif r.usage_pct > 80 %}background: #ffc107;
+              {% else %}background: #28a745;
+              {% endif %}
+            "></span>
+          </span>
+          {{ r.usage_pct }}%
+        {% else %}
+          <span class="muted">∞</span>
+        {% endif %}
+      </td>
+      <td>{{ "{:,}".format(r.total_calls) }}</td>
+      <td>{{ "{:,}".format(r.total_tokens) }}</td>
+      <td><span class="muted">{{ r.period_start }} → {{ r.period_end }}</span></td>
+      <td>
+        <a href="/admin/llm-calls?tenant_id={{ r.tenant_id }}&feature_key={{ r.feature_key }}&token={{ token }}" role="button" class="outline" style="padding: 4px 10px; font-size: 12px;">
+          Детали
+        </a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% endif %}
+{% endblock %}

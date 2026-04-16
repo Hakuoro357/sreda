@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Пользователи{% endblock %}
+{% block content %}
+<h2>Пользователи</h2>
+
+{% if not users %}
+<p>Нет пользователей.</p>
+{% else %}
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Tenant</th>
+      <th>User ID</th>
+      <th>Telegram</th>
+      <th>Имя</th>
+      <th>TZ</th>
+      <th>Подписки</th>
+      <th>ЛК (EDS)</th>
+      <th>Навыки</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for u in users %}
+    <tr>
+      <td><span class="muted">{{ u.tenant_name }}</span></td>
+      <td><code class="muted">{{ u.user_id[:12] }}…</code></td>
+      <td>{{ u.telegram_id or "—" }}</td>
+      <td>{{ u.display_name or "—" }}</td>
+      <td>{{ u.timezone or "—" }}</td>
+      <td>
+        {% for s in u.subscriptions %}
+        <div>
+          <strong>{{ s.plan_title }}</strong>
+          {% if s.status == "active" %}
+            <span class="badge badge-green">{{ s.status }}</span>
+          {% elif s.status == "expired" %}
+            <span class="badge badge-red">{{ s.status }}</span>
+          {% else %}
+            <span class="badge badge-yellow">{{ s.status }}</span>
+          {% endif %}
+          <span class="muted">до {{ s.active_until }}</span>
+        </div>
+        {% else %}
+        <span class="muted">—</span>
+        {% endfor %}
+      </td>
+      <td>
+        {% for e in u.eds_accounts %}
+        <div>
+          <code>{{ e.login_masked }}</code>
+          {% if e.status == "active" %}
+            <span class="badge badge-green">{{ e.status }}</span>
+          {% elif e.status == "pending_verification" %}
+            <span class="badge badge-yellow">{{ e.status }}</span>
+          {% else %}
+            <span class="badge badge-gray">{{ e.status }}</span>
+          {% endif %}
+          {% if e.last_error %}
+            <span class="badge badge-red">{{ e.last_error }}</span>
+          {% endif %}
+          <span class="muted">poll: {{ e.last_poll_at }}</span>
+        </div>
+        {% else %}
+        <span class="muted">—</span>
+        {% endfor %}
+      </td>
+      <td>
+        {% for sk in u.skill_states %}
+        <div>
+          <strong>{{ sk.feature_key }}</strong>
+          {% if sk.health_status == "healthy" %}
+            <span class="badge badge-green">{{ sk.health_status }}</span>
+          {% elif sk.health_status == "degraded" %}
+            <span class="badge badge-yellow">{{ sk.health_status }}</span>
+          {% else %}
+            <span class="badge badge-red">{{ sk.health_status }}</span>
+          {% endif %}
+          <span class="muted">{{ sk.lifecycle_status }} | run: {{ sk.last_successful_run_at }}</span>
+        </div>
+        {% else %}
+        <span class="muted">—</span>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% endif %}
+{% endblock %}

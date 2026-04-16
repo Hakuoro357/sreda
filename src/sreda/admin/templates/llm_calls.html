@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}LLM-вызовы — {{ data.feature_key }}{% endblock %}
+{% block content %}
+<h2>LLM-вызовы: {{ data.tenant_name }} / {{ data.feature_key }}</h2>
+<p class="muted">Всего: {{ "{:,}".format(data.total) }} вызовов. Страница {{ data.page }} из {{ data.total_pages }}.</p>
+
+{% if not data.rows %}
+<p>Нет вызовов.</p>
+{% else %}
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Дата</th>
+      <th>Модель</th>
+      <th>Тип</th>
+      <th>Статус</th>
+      <th>Prompt</th>
+      <th>Completion</th>
+      <th>Total</th>
+      <th>Кредиты</th>
+      <th>Latency</th>
+      <th>Run ID</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in data.rows %}
+    <tr>
+      <td><span class="muted">{{ r.created_at }}</span></td>
+      <td><code>{{ r.model or "—" }}</code></td>
+      <td>{{ r.task_type or "—" }}</td>
+      <td>
+        {% if r.status == "succeeded" %}
+          <span class="badge badge-green">{{ r.status }}</span>
+        {% elif r.status == "failed" %}
+          <span class="badge badge-red">{{ r.status }}</span>
+        {% else %}
+          <span class="badge badge-gray">{{ r.status }}</span>
+        {% endif %}
+      </td>
+      <td>{{ "{:,}".format(r.prompt_tokens or 0) }}</td>
+      <td>{{ "{:,}".format(r.completion_tokens or 0) }}</td>
+      <td>{{ "{:,}".format(r.total_tokens or 0) }}</td>
+      <td><strong>{{ "{:,}".format(r.credits_consumed) }}</strong></td>
+      <td>
+        {% if r.latency_ms %}
+          {{ "{:,}".format(r.latency_ms) }}ms
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </td>
+      <td><code class="muted">{{ (r.run_id or "—")[:12] }}</code></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+
+{# Pagination #}
+<nav>
+  <ul>
+    {% if data.page > 1 %}
+    <li><a href="/admin/llm-calls?tenant_id={{ data.rows[0].id[:0] }}{{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page - 1 }}&token={{ token }}">← Назад</a></li>
+    {% else %}
+    <li><span class="muted">← Назад</span></li>
+    {% endif %}
+
+    <li><span class="muted">{{ data.page }} / {{ data.total_pages }}</span></li>
+
+    {% if data.page < data.total_pages %}
+    <li><a href="/admin/llm-calls?tenant_id={{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page + 1 }}&token={{ token }}">Вперёд →</a></li>
+    {% else %}
+    <li><span class="muted">Вперёд →</span></li>
+    {% endif %}
+  </ul>
+</nav>
+{% endif %}
+
+<p><a href="/admin/budget?token={{ token }}">← Вернуться к бюджету</a></p>
+{% endblock %}

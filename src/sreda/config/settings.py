@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     encryption_legacy_keys: str | None = None  # JSON: {"key_id": "base64_or_hex_material"}
     feature_modules_raw: str | None = Field(default=None, validation_alias="SREDA_FEATURE_MODULES")
 
+    # Admin dashboard token. When set, /admin/* routes are accessible
+    # with ?token=<value>. When None, admin is disabled (403).
+    admin_token: str | None = None
+
     # Hard wall-clock budget for a single job run. Applied around the
     # network-bound parts of job handlers (Telegram send, EDS adapter
     # verification, etc.) so a hung upstream cannot pin a job in

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Admin{% endblock %} — Sreda</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    :root { --pico-font-size: 14px; }
+    table { font-size: 13px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+    .badge-green { background: #d4edda; color: #155724; }
+    .badge-yellow { background: #fff3cd; color: #856404; }
+    .badge-red { background: #f8d7da; color: #721c24; }
+    .badge-gray { background: #e2e3e5; color: #383d41; }
+    .badge-blue { background: #cce5ff; color: #004085; }
+    .muted { color: var(--pico-muted-color); font-size: 12px; }
+    .usage-bar { width: 100px; height: 14px; background: #e9ecef; border-radius: 3px; display: inline-block; vertical-align: middle; }
+    .usage-bar-fill { height: 100%; border-radius: 3px; }
+    nav ul { gap: 0.5rem; }
+  </style>
+</head>
+<body>
+  <nav class="container-fluid">
+    <ul><li><strong>Sreda Admin</strong></li></ul>
+    <ul>
+      <li><a href="/admin/users?token={{ token }}">Пользователи</a></li>
+      <li><a href="/admin/budget?token={{ token }}">Бюджет</a></li>
+    </ul>
+  </nav>
+  <main class="container-fluid">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="container-fluid">
+    <small class="muted">Sreda Admin Dashboard</small>
+  </footer>
+</body>
+</html>
