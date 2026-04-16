@@ -178,7 +178,7 @@ class BudgetService:
         now = _utcnow()
         row = SkillAIExecution(
             id=f"skai_{_short_uuid()}",
-            run_id=run_id,
+            run_id=run_id or f"api_{_short_uuid()}",
             attempt_id=None,
             tenant_id=tenant_id,
             feature_key=feature_key,
