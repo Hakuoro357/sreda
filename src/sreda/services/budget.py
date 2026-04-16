@@ -161,6 +161,45 @@ class BudgetService:
         self.session.flush()
         return credits
 
+    def record_api_usage(
+        self,
+        *,
+        tenant_id: str,
+        feature_key: str,
+        provider_key: str,
+        task_type: str,
+        credits_consumed: int,
+        run_id: str | None = None,
+    ) -> int:
+        """Write a SkillAIExecution row for a non-LLM API call (e.g. speech recognition).
+
+        Returns credits_consumed for convenience.
+        """
+        now = _utcnow()
+        row = SkillAIExecution(
+            id=f"skai_{_short_uuid()}",
+            run_id=run_id,
+            attempt_id=None,
+            tenant_id=tenant_id,
+            feature_key=feature_key,
+            task_type=task_type,
+            provider_key=provider_key,
+            model="n/a",
+            ai_schema_version=1,
+            status="succeeded",
+            structured_output_json=None,
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            credits_consumed=credits_consumed,
+            created_at=now,
+            started_at=now,
+            finished_at=now,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return credits_consumed
+
     # -------------------------------------------------------------- helpers
 
     def _active_subscription(

@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     # Set to 0 to disable the loop and only run a single pass (used in tests).
     job_poll_interval_seconds: float = 5.0
 
+    # Speech recognition provider. Set to "yandex" to enable Yandex SpeechKit.
+    # Leave None to disable voice transcription entirely.
+    speech_provider: str | None = Field(default=None, validation_alias="SREDA_SPEECH_PROVIDER")
+    yandex_speechkit_api_key: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_SPEECHKIT_API_KEY"
+    )
+
     # Опциональный путь к файлу для structured JSON-лога неудачных
     # попыток подключения EDS-ЛК (для post-mortem анализа). Одна
     # запись — одна строка JSON с timestamp, tenant_id, login_masked,

@@ -64,6 +64,22 @@ class TelegramClient:
             timeout=20.0,
         )
 
+    async def get_file_info(self, file_id: str) -> dict:
+        """Telegram Bot API getFile → {"file_path": "voice/file_123.oga", ...}"""
+        resp = await self._post_json("getFile", {"file_id": file_id}, timeout=5.0)
+        return resp.get("result", resp)
+
+    async def download_file(self, file_path: str) -> bytes:
+        """Download a file from Telegram CDN by file_path."""
+        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0, trust_env=True) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.content
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+            raise TelegramDeliveryError(f"Failed to download file: {file_path}") from exc
+
     async def _post_json(self, method: str, payload: dict, *, timeout: float) -> dict:
         return await self._post_request(
             method,
