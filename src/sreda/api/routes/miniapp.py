@@ -158,9 +158,6 @@ def get_summary(
 
     # Query plans and subscriptions directly
     plans_by_key = _plans_by_key(session)
-    voice_plan = plans_by_key.get(PLAN_VOICE_TRANSCRIPTION)
-    voice_sub = _get_sub(session, ctx.tenant_id, voice_plan) if voice_plan else None
-    voice_active = _is_active(voice_sub, now)
 
     base_plan = plans_by_key.get(PLAN_EDS_MONITOR_BASE)
     extra_plan = plans_by_key.get(PLAN_EDS_MONITOR_EXTRA)
@@ -194,29 +191,43 @@ def get_summary(
             "is_active": False,
         })
 
-    # Voice transcription
-    if voice_active and voice_plan:
-        active_skills.append({
-            "feature_key": "voice_transcription",
-            "title": voice_plan.title or "Распознавание голоса",
-            "icon": "\U0001f3a4",
-            "summary_line": "Бесплатно",
-            "is_active": True,
-            "plan_key": PLAN_VOICE_TRANSCRIPTION,
-            "description": voice_plan.description or "",
-            "price_rub": voice_plan.price_rub,
-            "active_until": _iso(voice_sub.active_until) if voice_sub else None,
-        })
-    elif voice_plan:
-        available_skills.append({
-            "feature_key": "voice_transcription",
-            "plan_key": PLAN_VOICE_TRANSCRIPTION,
-            "title": voice_plan.title or "Распознавание голоса",
-            "icon": "\U0001f3a4",
-            "description": voice_plan.description or "",
-            "price_rub": voice_plan.price_rub,
-            "is_active": False,
-        })
+    # Simple skills (one plan → one subscription → one card). Voice was
+    # first, housewife joined it; any future plan that doesn't need
+    # bespoke aggregation (like EDS base+extra) can be added here with
+    # just one line.
+    _simple_skills: list[tuple[str, str, str, str]] = [
+        # (plan_key, feature_key, default_title, icon)
+        (PLAN_VOICE_TRANSCRIPTION, "voice_transcription", "Распознавание голоса", "\U0001f3a4"),
+        ("housewife_assistant_base", "housewife_assistant", "Помощник домохозяйки", "\U0001f3e0"),
+    ]
+    for plan_key, feature_key, default_title, icon in _simple_skills:
+        plan = plans_by_key.get(plan_key)
+        if plan is None:
+            continue
+        sub = _get_sub(session, ctx.tenant_id, plan)
+        is_active = _is_active(sub, now)
+        if is_active:
+            active_skills.append({
+                "feature_key": feature_key,
+                "title": plan.title or default_title,
+                "icon": icon,
+                "summary_line": "Бесплатно" if plan.price_rub == 0 else f"{plan.price_rub:,} \u20bd/мес".replace(",", " "),
+                "is_active": True,
+                "plan_key": plan_key,
+                "description": plan.description or "",
+                "price_rub": plan.price_rub,
+                "active_until": _iso(sub.active_until) if sub else None,
+            })
+        else:
+            available_skills.append({
+                "feature_key": feature_key,
+                "plan_key": plan_key,
+                "title": plan.title or default_title,
+                "icon": icon,
+                "description": plan.description or "",
+                "price_rub": plan.price_rub,
+                "is_active": False,
+            })
 
     # EDS subscriptions detail (for EDS skill page)
     eds_subscriptions = _build_eds_subscriptions(
