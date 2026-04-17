@@ -249,7 +249,7 @@
         html += '<div class="text-right mt-8"><button class="btn btn-success" onclick="window._resume(\'eds_monitor_base\')">Возобновить</button></div>';
       } else if (sub.can_cancel) {
         if (sub.slot_type === "free") {
-          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._removeSlot()">Убрать слот</button></div>';
+          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._removeSlot()">Отменить</button></div>';
         } else {
           html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._cancelEds(\'' + escHtml(sub.cancel_type || "base") + '\')">Отменить</button></div>';
         }
@@ -465,9 +465,9 @@
   };
 
   window._removeSlot = function() {
-    showPopup("Убрать свободный слот?", function() {
+    showPopup("Подписка будет активна до конца периода. Отменить продление?", function() {
       doAction("/miniapp/api/v1/eds/slot/remove")
-        .catch(function() { showAlert("Не удалось убрать."); });
+        .catch(function() { showAlert("Не удалось отменить."); });
     });
   };
 
