@@ -443,10 +443,17 @@ def subscribe(
         result = billing.start_base_subscription(ctx.tenant_id)
     elif plan_key == PLAN_EDS_MONITOR_EXTRA:
         result = billing.add_extra_eds_account(ctx.tenant_id)
-    elif plan_key == PLAN_VOICE_TRANSCRIPTION:
-        result = billing.start_voice_subscription(ctx.tenant_id)
     else:
-        raise HTTPException(status_code=400, detail="unknown_plan")
+        # Generic simple-skill path: any plan_key that exists in
+        # subscription_plans with a feature_key can be (un)subscribed
+        # via start_simple_subscription. Covers voice, housewife, any
+        # future simple skill without per-skill branching.
+        plan = session.query(SubscriptionPlan).filter(
+            SubscriptionPlan.plan_key == plan_key
+        ).one_or_none()
+        if plan is None:
+            raise HTTPException(status_code=400, detail="unknown_plan")
+        result = billing.start_simple_subscription(ctx.tenant_id, plan_key)
 
     return {"ok": True, "message": result.message_text}
 
@@ -462,10 +469,13 @@ def cancel(
 
     if plan_key == PLAN_EDS_MONITOR_BASE:
         result = billing.cancel_base_at_period_end(ctx.tenant_id)
-    elif plan_key == PLAN_VOICE_TRANSCRIPTION:
-        result = billing.cancel_voice_subscription(ctx.tenant_id)
     else:
-        raise HTTPException(status_code=400, detail="unknown_plan")
+        plan = session.query(SubscriptionPlan).filter(
+            SubscriptionPlan.plan_key == plan_key
+        ).one_or_none()
+        if plan is None:
+            raise HTTPException(status_code=400, detail="unknown_plan")
+        result = billing.cancel_simple_subscription(ctx.tenant_id, plan_key)
 
     return {"ok": True, "message": result.message_text}
 

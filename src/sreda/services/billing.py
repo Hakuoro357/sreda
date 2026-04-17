@@ -1014,6 +1014,118 @@ class BillingService:
             ]),
         )
 
+    # ------------------------------------------------------------------
+    # Simple subscription (one plan_key → one subscription → toggle)
+    #
+    # For any skill that doesn't need EDS-style base+extra aggregation.
+    # Derives feature_key from the plan row itself, so adding a new
+    # simple skill is:
+    #   1. Seed SubscriptionPlan with feature_key
+    #   2. Wire start/cancel_simple_subscription in the Mini App API
+    # ``start_voice_subscription`` and ``cancel_voice_subscription`` stay
+    # as focused aliases (used by callback handlers) but share identical
+    # semantics with this path.
+    # ------------------------------------------------------------------
+
+    def start_simple_subscription(
+        self,
+        tenant_id: str,
+        plan_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> SubscriptionActionResult:
+        current_time = _utcnow(now)
+        plan = self._get_plan_optional(plan_key)
+        if plan is None:
+            return SubscriptionActionResult(
+                message_text=f"План {plan_key!r} не найден.",
+                reply_markup=_inline_keyboard(
+                    [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
+                ),
+            )
+        sub = self._get_subscription_optional(tenant_id, plan_key)
+        if sub is not None and self._is_subscription_active(sub, current_time):
+            return SubscriptionActionResult(
+                message_text=f"{plan.title} уже подключено.",
+                reply_markup=_inline_keyboard(
+                    [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
+                ),
+            )
+        if sub is None:
+            sub = TenantSubscription(
+                id=f"sub_{uuid4().hex[:24]}",
+                tenant_id=tenant_id,
+                plan_id=plan.id,
+            )
+            self.session.add(sub)
+        sub.status = "active"
+        sub.starts_at = current_time
+        # Free plans are perpetual (~100 years out). See voice spec 57.
+        if plan.price_rub == 0:
+            sub.active_until = current_time + timedelta(days=36500)
+        else:
+            sub.active_until = current_time + timedelta(
+                days=plan.billing_period_days
+            )
+        sub.cancel_at_period_end = False
+        sub.quantity = 1
+        sub.next_cycle_quantity = 1
+        sub.updated_at = current_time
+        self._ensure_feature_enabled(tenant_id, plan.feature_key, True)
+        self.session.commit()
+        if plan.price_rub == 0:
+            message_text = f"{plan.title} подключено."
+        else:
+            message_text = (
+                f"{plan.title} подключено.\n\n"
+                f"Активно до: {_format_date(sub.active_until)}"
+            )
+        return SubscriptionActionResult(
+            message_text=message_text,
+            reply_markup=_inline_keyboard(
+                [
+                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                ]
+            ),
+        )
+
+    def cancel_simple_subscription(
+        self, tenant_id: str, plan_key: str
+    ) -> SubscriptionActionResult:
+        plan = self._get_plan_optional(plan_key)
+        if plan is None:
+            return SubscriptionActionResult(
+                message_text=f"План {plan_key!r} не найден.",
+                reply_markup=_inline_keyboard(
+                    [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
+                ),
+            )
+        sub = self._get_subscription_optional(tenant_id, plan_key)
+        if sub is None or sub.quantity <= 0:
+            return SubscriptionActionResult(
+                message_text=f"{plan.title} сейчас не активно.",
+                reply_markup=_inline_keyboard(
+                    [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
+                ),
+            )
+        sub.status = "cancelled"
+        sub.quantity = 0
+        sub.next_cycle_quantity = 0
+        sub.cancel_at_period_end = True
+        sub.updated_at = _utcnow()
+        self._ensure_feature_enabled(tenant_id, plan.feature_key, False)
+        self.session.commit()
+        return SubscriptionActionResult(
+            message_text=f"{plan.title} отключено.",
+            reply_markup=_inline_keyboard(
+                [
+                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
+                ]
+            ),
+        )
+
     def _get_cycle(self, tenant_id: str) -> TenantBillingCycle | None:
         return (
             self.session.query(TenantBillingCycle)
