@@ -1,0 +1,7 @@
+# Session state from local tooling — not committed at workspace level
+.claude/
+.omc/
+.runtime/
+graphify-out/
+.tmp_*
+*.tmp
