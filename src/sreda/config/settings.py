@@ -74,12 +74,25 @@ class Settings(BaseSettings):
     # Defaults to the launchd plist StandardOut/StandardError paths used
     # on the Mac mini deploy. Files that don't exist are shown disabled
     # in the dropdown — they never become a 500 for the admin.
+    # Default labels describe WHAT each service does so the dropdown is
+    # readable without knowing the process name. Labels on the Mac mini
+    # deploy:
+    #   - Uvicorn       → serves Mini App, /connect/eds form, admin UI,
+    #                     Telegram webhook. HTTP access log + app errors.
+    #   - Long-poll     → pulls getUpdates from Telegram and forwards
+    #                     each update to the local webhook (Mac is NAT'd).
+    #                     If the bot goes silent — look here first.
+    #   - Job runner    → background worker: EDS polling, credential
+    #                     verification, subscription renewal, proactive
+    #                     delivery.
+    #   - pproxy        → HTTP-to-SOCKS5 shim for outbound traffic that
+    #                     must exit through the VPS tunnel (e.g. EDS).
     admin_log_files_raw: str = Field(
         default=(
-            "Uvicorn=/tmp/sreda-uvicorn.log,"
-            "Long-poll=/tmp/sreda-long-poll.log,"
-            "Job runner=/tmp/sreda-job-runner.log,"
-            "Public proxy=/tmp/sreda-pproxy.log"
+            "Веб-сервер (Mini App и админка)=/tmp/sreda-uvicorn.log,"
+            "Приём сообщений из Telegram=/tmp/sreda-long-poll.log,"
+            "Фоновые задачи (EDS-мониторинг, верификация)=/tmp/sreda-job-runner.log,"
+            "Прокси исходящих запросов (HTTP→SOCKS5)=/tmp/sreda-pproxy.log"
         ),
         validation_alias="SREDA_ADMIN_LOG_FILES",
     )
