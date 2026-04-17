@@ -230,7 +230,7 @@ class EDSConnectService:
         if connect_session is None:
             raise ConnectSessionError(
                 "token_not_found",
-                "Ссылка недействительна. Запроси новую в Telegram.",
+                "Ссылка недействительна или уже отозвана.",
                 status_code=404,
             )
         if connect_session.expires_at and _coerce_utc(connect_session.expires_at) <= _utcnow():
@@ -239,7 +239,7 @@ class EDSConnectService:
             self.session.commit()
             raise ConnectSessionError(
                 "session_expired",
-                "Срок действия ссылки истек. Запроси новую в Telegram.",
+                "Срок действия ссылки истёк.",
                 status_code=410,
             )
         if connect_session.used_at is not None:

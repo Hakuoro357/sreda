@@ -317,18 +317,23 @@ def _build_eds_subscriptions(
         acc = active_accounts[i] if i < len(active_accounts) else None
         is_free = acc is None
 
+        # A free slot (paid but no cabinet attached) should be
+        # cancel-able right from the card — otherwise the user has a
+        # paid slot they can't get rid of unless they first attach a
+        # cabinet. slot_type="free" routes the JS to window._removeSlot.
         card = {
             "title": "Доп. кабинет EDS",
             "price_rub": extra_price,
             "active_until": _iso(summary.extra_active_until),
             "status": "active",
-            "can_cancel": False,
+            "can_cancel": is_free,
             "cancel_type": "extra",
-            "slot_type": "extra",
+            "slot_type": "free" if is_free else "extra",
             "is_free_slot": is_free,
             "account": _account_dict(acc) if acc else None,
         }
-        # Check if this extra slot is scheduled for removal
+        # Already scheduled for removal at period end — keep the same
+        # labelling as the free-slot case so the UI is consistent.
         if i >= summary.extra_next_cycle_quantity and summary.extra_next_cycle_quantity < summary.extra_quantity:
             card["slot_type"] = "free"
             card["can_cancel"] = True
