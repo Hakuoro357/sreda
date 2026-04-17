@@ -3,6 +3,13 @@ from logging.config import dictConfig
 
 
 def _build_config(level_no: int) -> dict:
+    # Rationale for the split handlers:
+    #   * "default"  — app / uvicorn error logs, filtered by the
+    #                  configured log level (WARNING on prod).
+    #   * "access"   — HTTP access log, ALWAYS at INFO regardless of
+    #                  the app log level. Access lines are forensic
+    #                  signal (spot 500-storms, missing webhooks) and
+    #                  cost nothing relative to the real traffic.
     return {
         "version": 1,
         "disable_existing_loggers": False,
@@ -18,19 +25,23 @@ def _build_config(level_no: int) -> dict:
                 "formatter": "default",
                 "level": level_no,
             },
+            "access": {
+                "class": "logging.StreamHandler",
+                "formatter": "default",
+                "level": logging.INFO,
+            },
         },
         "root": {"level": level_no, "handlers": ["default"]},
         "loggers": {
-            "uvicorn": {"level": level_no, "handlers": ["default"], "propagate": False},
-            "uvicorn.error": {"level": level_no, "handlers": ["default"], "propagate": False},
-            # propagate=True here is the critical bit: uvicorn's access
-            # formatter expects ``record.args`` to be a 5-tuple (method,
-            # path, proto, status, size). When we emit *plain* log lines
-            # through this logger (from tests, from our own code), those
-            # args are empty and uvicorn's formatter crashes. Letting the
-            # handler live on root via propagation means access lines
-            # flow through our simple formatter regardless of args shape.
-            "uvicorn.access": {"level": level_no, "handlers": [], "propagate": True},
+            # uvicorn.* are pinned at INFO so server-lifecycle lines
+            # ("Started server process", "Application startup complete",
+            # startup errors) always land in the log regardless of the
+            # app-level SREDA_LOG_LEVEL. On prod WARNING these are
+            # startup-only — a handful of lines per restart, not noise.
+            # Both use the "access" handler so they pass its INFO gate.
+            "uvicorn": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
+            "uvicorn.error": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
+            "uvicorn.access": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
         },
     }
 
