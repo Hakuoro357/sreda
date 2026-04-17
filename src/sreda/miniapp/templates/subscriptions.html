@@ -249,9 +249,9 @@
         html += '<div class="text-right mt-8"><button class="btn btn-success" onclick="window._resume(\'eds_monitor_base\')">Возобновить</button></div>';
       } else if (sub.can_cancel) {
         if (sub.slot_type === "free") {
-          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._removeSlot()">Отменить</button></div>';
+          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._removeSlot()">Отменить подписку</button></div>';
         } else {
-          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._cancelEds(\'' + escHtml(sub.cancel_type || "base") + '\')">Отменить</button></div>';
+          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._cancelEds(\'' + escHtml(sub.cancel_type || "base") + '\')">Отменить подписку</button></div>';
         }
       }
 
