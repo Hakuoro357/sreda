@@ -19,3 +19,11 @@ docs/internal/
 dist/
 build/
 *.egg-info/
+
+# Session state from local tooling — not product artifacts
+.omc/
+.runtime/
+.claude/
+graphify-out/
+.tmp_*
+*.tmp

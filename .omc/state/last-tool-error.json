@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd C:/pro/vex-assistant/sreda && python -m ruff check src/sreda/services/billing.py src/sreda/runtime/handlers.py src/sreda/miniapp/templates/subscriptions.html 2>&1\",\"description\":\"Lint m...",
-  "error": "Exit code 1\ninvalid-syntax: Expected an expression\n --> src\\sreda\\miniapp\\templates\\subscriptions.html:1:2\n  |\n1 | {% extends \"base.html\" %}\n  |  ^\n2 |\n3 | {% block scripts %}\n  |\n\ninvalid-syntax: Expected `,`, found string\n --> src\\sreda\\miniapp\\templates\\subscriptions.html:1:12\n  |\n1 | {% extends \"base.html\" %}\n  |            ^^^^^^^^^^^\n2 |\n3 | {% block scripts %}\n  |\n\ninvalid-syntax: Expected an expression\n --> src\\sreda\\miniapp\\templates\\subscriptions.html:1:25\n  |\n1 | {% extends \"base.html...",
-  "timestamp": "2026-04-16T20:10:57.923Z",
-  "retry_count": 1
-}
