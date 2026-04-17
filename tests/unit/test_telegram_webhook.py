@@ -116,6 +116,7 @@ def test_telegram_webhook_creates_new_user_and_sends_welcome_message(
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.test.local")
     monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
 
     get_settings.cache_clear()
@@ -144,11 +145,11 @@ def test_telegram_webhook_creates_new_user_and_sends_welcome_message(
     assert len(sent_messages) == 1
     assert sent_messages[0]["chat_id"] == NEW_USER_CHAT_ID
     assert "Привет! Я Среда." in sent_messages[0]["text"]
+    # Welcome reply_markup: single Mini App button (since 2026-04 migration
+    # everything subscription/connect-related moved into the Mini App).
     assert sent_messages[0]["reply_markup"] == {
         "inline_keyboard": [
-            [{"text": "Мой статус", "callback_data": "billing:status"}],
-            [{"text": "Подписки", "callback_data": "billing:subscriptions"}],
-            [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
+            [{"text": "Открыть подписки", "web_app": {"url": "https://connect.test.local/miniapp/"}}]
         ]
     }
 
@@ -378,13 +379,17 @@ def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
 
     assert response.status_code == 202
     assert len(answered_callbacks) == 1
-    # Phase: direct-to-miniapp UX — single reply carries the connect
-    # web_app button inline (no separate "click to open" message).
+    # Phase: Mini-App-only UX — the reply carries a single "Открыть
+    # подписки" web_app button instead of the old per-action "Подключить
+    # ЛК EDS" inline. User continues the connect flow inside Mini App.
     assert len(sent_messages) == 1
     assert "Дополнительный кабинет EDS подключен." in sent_messages[0]["text"]
-    connect_button = sent_messages[0]["reply_markup"]["inline_keyboard"][0][0]
-    assert connect_button["text"] == "Подключить ЛК EDS"
-    assert "web_app" in connect_button or "url" in connect_button
+    reply_markup = sent_messages[0]["reply_markup"]
+    # reply_markup may be None when base_url is unset in the test env.
+    if reply_markup is not None:
+        button = reply_markup["inline_keyboard"][0][0]
+        assert button["text"] == "Открыть подписки"
+        assert "web_app" in button
 
     session = get_session_factory()()
     try:

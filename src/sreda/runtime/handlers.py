@@ -88,13 +88,14 @@ HandlerFn = Callable[[Session, ActionEnvelope, dict[str, Any]], list[RuntimeRepl
 
 
 def execute_help_show(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-    text, reply_markup = BillingService(session).build_help_message()
-    return [RuntimeReply(text=text, reply_markup=reply_markup)]
+    text, _legacy_markup = BillingService(session).build_help_message()
+    # Discard legacy inline-keyboard — Mini App is the single control surface.
+    return [RuntimeReply(text=text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_status_show(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
-    text, reply_markup = BillingService(session).build_status_message(action.tenant_id)
-    return [RuntimeReply(text=text, reply_markup=reply_markup)]
+    text, _legacy_markup = BillingService(session).build_status_message(action.tenant_id)
+    return [RuntimeReply(text=text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_subscriptions_show(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
@@ -219,50 +220,42 @@ def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict
 def execute_subscription_connect_base(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    # First create the subscription (so connect-link check passes),
-    # then generate the one-tap miniapp button for the reply.
+    # Legacy callback path (chat history pre-migration). Subscription
+    # gets activated; Mini App button is the single next action —
+    # pre-generating a one-tap connect link stopped making sense when
+    # /subscriptions stopped showing the inline keyboard that hosted it.
     result = BillingService(session).start_base_subscription(action.tenant_id)
-    # Now subscription is active → we can pre-gen the connect link
-    # and replace the fallback callback button in the reply markup.
-    connect_override = _try_build_connect_override(session, action, slot_type="primary")
-    markup = result.reply_markup
-    if connect_override is not None:
-        markup = _swap_connect_button(markup, connect_override)
-    return [RuntimeReply(text=result.message_text, reply_markup=markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_subscription_add_eds(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    # First add the extra slot, then pre-gen connect link (subscription
-    # must already exist for link creation to succeed).
+    # Legacy callback path. Slot is added; user continues in Mini App
+    # (it has an explicit "Подключить ЛК EDS" button on the fresh slot).
     result = BillingService(session).add_extra_eds_account(action.tenant_id)
-    connect_override = _try_build_connect_override(session, action, slot_type="extra")
-    markup = result.reply_markup
-    if connect_override is not None:
-        markup = _swap_connect_button(markup, connect_override)
-    return [RuntimeReply(text=result.message_text, reply_markup=markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_subscription_renew_cycle(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     result = BillingService(session).renew_cycle(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_subscription_connect_voice(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     result = BillingService(session).start_voice_subscription(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_subscription_cancel_voice(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     result = BillingService(session).cancel_voice_subscription(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_eds_connect_start(
@@ -284,14 +277,14 @@ def execute_eds_slot_remove_free(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     result = BillingService(session).remove_extra_account_at_period_end(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_eds_slot_restore_free(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     result = BillingService(session).restore_extra_account_slot(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_eds_account_remove(
@@ -302,12 +295,12 @@ def execute_eds_account_remove(
         raise ActionRuntimeError(
             "tenant_eds_account_missing",
             "Не удалось определить кабинет для отключения.",
-            reply_markup=_subscriptions_markup(),
+            reply_markup=_miniapp_reply_markup(),
         )
     result = BillingService(session).schedule_connected_eds_account_cancel(
         action.tenant_id, tenant_eds_account_id
     )
-    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 def execute_eds_account_restore(
@@ -318,12 +311,12 @@ def execute_eds_account_restore(
         raise ActionRuntimeError(
             "tenant_eds_account_missing",
             "Не удалось определить кабинет для возврата.",
-            reply_markup=_subscriptions_markup(),
+            reply_markup=_miniapp_reply_markup(),
         )
     result = BillingService(session).restore_connected_eds_account_cancel(
         action.tenant_id, tenant_eds_account_id
     )
-    return [RuntimeReply(text=result.message_text, reply_markup=result.reply_markup)]
+    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
 
 
 # ---------------------------------------------------------------------------
@@ -1259,17 +1252,34 @@ def _resolve_slot_type(session: Session, tenant_id: str, slot_type: str) -> str:
     return "primary" if not summary.connected_accounts else "extra"
 
 
-def _subscriptions_markup() -> dict:
-    return {"inline_keyboard": [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]}
+def _miniapp_reply_markup() -> dict | None:
+    """Mini-App button — единая кнопка, заменяющая все устаревшие
+    inline-keyboards с callback-кнопками управления подписками,
+    статусом, ЛК и renew-циклом.
 
-
-def _status_subscriptions_markup() -> dict:
+    Все эти действия теперь живут в Mini App. Бот в ответных сообщениях
+    показывает одну кнопку «Открыть подписки» (или ничего, если
+    ``connect_public_base_url`` не настроен — например, локальный dev
+    без HTTPS-тоннеля)."""
+    settings = get_settings()
+    base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
+    if not base_url:
+        return None
     return {
         "inline_keyboard": [
-            [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
+            [{"text": "Открыть подписки", "web_app": {"url": f"{base_url}/miniapp/"}}]
         ]
     }
+
+
+# Backwards-compat aliases for the handlers — all three call sites now
+# produce the same Mini-App button regardless of original semantic.
+def _subscriptions_markup() -> dict | None:
+    return _miniapp_reply_markup()
+
+
+def _status_subscriptions_markup() -> dict | None:
+    return _miniapp_reply_markup()
 
 
 def connect_reply_markup(base_active: bool) -> dict:

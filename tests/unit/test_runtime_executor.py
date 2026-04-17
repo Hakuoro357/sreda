@@ -195,16 +195,15 @@ def test_runtime_service_add_eds_sends_subscription_and_connect_messages(monkeyp
         session.close()
 
     assert len(subscriptions) == 2
-    # Phase: direct-to-miniapp UX — subscription activation messages now
-    # carry the "Подключить ЛК EDS" web_app button inline, so only two
-    # messages go out (no intermediate "click to open" reply).
+    # Phase: Mini-App-only UX — both subscription-activation replies
+    # carry a single "Открыть подписки" web_app button (state updates
+    # happen in Mini App, not through chat callbacks).
     assert len(telegram_client.sent_messages) == 2
     assert "Подписка EDS Monitor подключена." in telegram_client.sent_messages[0]["text"]
     assert "Дополнительный кабинет EDS подключен." in telegram_client.sent_messages[1]["text"]
-    # Extra-subscription confirmation carries the one-tap connect button.
-    connect_button = telegram_client.sent_messages[1]["reply_markup"]["inline_keyboard"][0][0]
-    assert connect_button["text"] == "Подключить ЛК EDS"
-    assert "web_app" in connect_button or "url" in connect_button
+    miniapp_button = telegram_client.sent_messages[1]["reply_markup"]["inline_keyboard"][0][0]
+    assert miniapp_button["text"] == "Открыть подписки"
+    assert "web_app" in miniapp_button
     assert len(outbox) == 2
 
 

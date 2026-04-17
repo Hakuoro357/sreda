@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.core import Assistant, User, Workspace
 from sreda.db.repositories.seed import SeedRepository
-from sreda.services.billing import STATUS_CALLBACK, SUBSCRIPTIONS_CALLBACK
 
 CONNECT_EDS_CALLBACK = "onboarding:connect_eds"
 
@@ -73,22 +72,25 @@ def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnbo
     return TelegramOnboardingResult(True, chat_id, tenant_id, workspace_id, user_id, assistant_id)
 
 
-def build_welcome_message() -> tuple[str, dict]:
+def build_welcome_message() -> tuple[str, dict | None]:
     text = (
         "Привет! Я Среда.\n\n"
         "Я помогу следить за важными изменениями и управлять подписками вокруг EDS.\n"
-        "Сейчас можно посмотреть статус, открыть подписки и подключить EDS Monitor."
+        "Подписки и подключение ЛК EDS — в приложении."
     )
+    # Все управление подписками теперь живёт в Mini App. Welcome —
+    # единственное место, где мы всё ещё ведём нового пользователя
+    # в приложение явной кнопкой (Menu Button тоже есть, но не все
+    # её замечают сразу).
+    from sreda.config.settings import get_settings
+
+    settings = get_settings()
+    base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
+    if not base_url:
+        return text, None
     reply_markup = {
         "inline_keyboard": [
-            [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-            [
-                {
-                    "text": "Подключить ЛК EDS",
-                    "callback_data": CONNECT_EDS_CALLBACK,
-                }
-            ]
+            [{"text": "Открыть подписки", "web_app": {"url": f"{base_url}/miniapp/"}}]
         ]
     }
     return text, reply_markup
