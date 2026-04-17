@@ -28,6 +28,10 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # NOTE: create_table without server_default — we rely on the
+    # SQLAlchemy model's Python-side defaults. batch_alter_table to
+    # strip server_defaults afterwards breaks on SQLite (temp table
+    # leftover on any failure), so we skip that dance entirely.
     op.create_table(
         "family_reminders",
         sa.Column("id", sa.String(length=64), primary_key=True),
@@ -46,27 +50,12 @@ def upgrade() -> None:
         sa.Column("title", sa.String(length=500), nullable=False),
         sa.Column("trigger_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("recurrence_rule", sa.String(length=255), nullable=True),
-        sa.Column(
-            "status",
-            sa.String(length=32),
-            nullable=False,
-            server_default="pending",
-        ),
+        sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("source_memo", sa.Text(), nullable=True),
         sa.Column("next_trigger_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_fired_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.func.current_timestamp(),
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.func.current_timestamp(),
-        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index(
         "ix_family_reminders_tenant_id", "family_reminders", ["tenant_id"]
@@ -90,13 +79,6 @@ def upgrade() -> None:
         "family_reminders",
         ["tenant_id", "next_trigger_at"],
     )
-
-    # Drop SQLite-style server_defaults so the model's Python-side
-    # defaults drive new inserts — consistent with other tables.
-    with op.batch_alter_table("family_reminders") as batch_op:
-        batch_op.alter_column("status", server_default=None)
-        batch_op.alter_column("created_at", server_default=None)
-        batch_op.alter_column("updated_at", server_default=None)
 
     # Seed the subscription plan. Beta-phase is free-perpetual: backend
     # special-cases ``price_rub == 0`` in ``start_*_subscription`` to set
