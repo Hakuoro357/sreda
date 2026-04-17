@@ -84,23 +84,15 @@ def upgrade() -> None:
     # special-cases ``price_rub == 0`` in ``start_*_subscription`` to set
     # ``active_until`` ~100 years out (see spec 27 addendum).
     op.execute(
-        """
-        INSERT INTO subscription_plans
-            (id, plan_key, feature_key, title, description,
-             price_rub, billing_period_days,
-             is_public, is_active, sort_order,
-             created_at, updated_at)
-        VALUES
-            ('plan_housewife_base',
-             'housewife_assistant_base',
-             'housewife_assistant',
-             'Помощник домохозяйки',
-             'Проактивный помощник по семейной рутине: память о семье, '
-             'напоминания, меню и покупки. На бета-тесте — бесплатно.',
-             0, 30,
-             1, 1, 30,
-             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        """
+        "INSERT INTO subscription_plans "
+        "(id, plan_key, feature_key, title, description, "
+        "price_rub, billing_period_days, is_public, is_active, sort_order, "
+        "created_at, updated_at) VALUES "
+        "('plan_housewife_base', 'housewife_assistant_base', "
+        "'housewife_assistant', 'Помощник домохозяйки', "
+        "'Проактивный помощник по семейной рутине: память о семье, "
+        "напоминания, меню и покупки. На бета-тесте — бесплатно.', "
+        "0, 30, 1, 1, 30, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
 
 
