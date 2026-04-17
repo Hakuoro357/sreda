@@ -1,0 +1,189 @@
+"""Housewife reminders — domain service (no LLM, pure DB logic).
+
+Used both by LLM-tool closures (from chat) and by the background worker
+that fires due reminders. Keep this module import-cheap — no LangChain,
+no LLM clients.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from dateutil.rrule import rrulestr
+from sqlalchemy.orm import Session
+
+from sreda.db.models.housewife import FamilyReminder
+
+logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _coerce_utc(value: datetime) -> datetime:
+    """Normalise tz-naive datetimes to UTC. SQLite drivers occasionally
+    strip tzinfo on round-trip even when the column is timezone-aware."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+@dataclass(slots=True)
+class ReminderSummary:
+    id: str
+    title: str
+    next_trigger_at: datetime | None
+    recurrence_rule: str | None
+    status: str
+
+
+class HousewifeReminderService:
+    """Create / list / cancel / fire reminders for a tenant.
+
+    Writes commit after each mutation — no batch transactions — so tools
+    can be invoked one-at-a-time from the chat LLM tool-loop without
+    risking one bad call rolling back another.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    # --- user-facing (invoked from chat tools) --------------------------
+
+    def schedule(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str | None,
+        title: str,
+        trigger_at: datetime,
+        recurrence_rule: str | None = None,
+        source_memo: str | None = None,
+    ) -> FamilyReminder:
+        trigger_at = _coerce_utc(trigger_at)
+        # Validate rrule upfront — silently accepting a bad RRULE would
+        # create a reminder that never fires.
+        if recurrence_rule:
+            try:
+                rrulestr(recurrence_rule, dtstart=trigger_at)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"invalid recurrence_rule: {exc}") from exc
+
+        reminder = FamilyReminder(
+            id=f"rem_{uuid4().hex[:24]}",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            title=title.strip(),
+            trigger_at=trigger_at,
+            next_trigger_at=trigger_at,
+            recurrence_rule=recurrence_rule,
+            status="pending",
+            source_memo=source_memo,
+        )
+        self.session.add(reminder)
+        self.session.commit()
+        return reminder
+
+    def list_active(
+        self, *, tenant_id: str, user_id: str | None = None
+    ) -> list[FamilyReminder]:
+        q = (
+            self.session.query(FamilyReminder)
+            .filter(
+                FamilyReminder.tenant_id == tenant_id,
+                FamilyReminder.status == "pending",
+            )
+            .order_by(FamilyReminder.next_trigger_at.asc().nullslast())
+        )
+        if user_id:
+            q = q.filter(FamilyReminder.user_id == user_id)
+        return q.all()
+
+    def cancel(self, *, tenant_id: str, reminder_id: str) -> bool:
+        reminder = (
+            self.session.query(FamilyReminder)
+            .filter(
+                FamilyReminder.id == reminder_id,
+                FamilyReminder.tenant_id == tenant_id,
+            )
+            .one_or_none()
+        )
+        if reminder is None or reminder.status == "cancelled":
+            return False
+        reminder.status = "cancelled"
+        reminder.next_trigger_at = None
+        reminder.updated_at = _utcnow()
+        self.session.commit()
+        return True
+
+    # --- worker-facing --------------------------------------------------
+
+    def due_now(self, *, now: datetime | None = None, limit: int = 100) -> list[FamilyReminder]:
+        """Cross-tenant fetch of pending reminders whose ``next_trigger_at``
+        has passed. Called by the worker; NEVER expose to chat tools —
+        they must stay tenant-scoped."""
+        current = _coerce_utc(now or _utcnow())
+        return (
+            self.session.query(FamilyReminder)
+            .filter(
+                FamilyReminder.status == "pending",
+                FamilyReminder.next_trigger_at.isnot(None),
+                FamilyReminder.next_trigger_at <= current,
+            )
+            .order_by(FamilyReminder.next_trigger_at.asc())
+            .limit(limit)
+            .all()
+        )
+
+    def mark_fired(
+        self, reminder: FamilyReminder, *, now: datetime | None = None
+    ) -> None:
+        """Advance a reminder after firing.
+
+        One-shot → status='fired', next_trigger_at=None.
+        Recurring → status stays 'pending', next_trigger_at advanced to
+        the next RRULE occurrence strictly after ``now``.
+
+        If the RRULE has no future occurrences, row transitions to 'fired'.
+        Caller is responsible for committing (worker does it after all
+        fires in the batch succeed)."""
+        current = _coerce_utc(now or _utcnow())
+        reminder.last_fired_at = current
+        reminder.updated_at = current
+
+        if not reminder.recurrence_rule:
+            reminder.status = "fired"
+            reminder.next_trigger_at = None
+            return
+
+        try:
+            rule = rrulestr(
+                reminder.recurrence_rule,
+                dtstart=_coerce_utc(reminder.trigger_at),
+            )
+            next_occ = rule.after(current, inc=False)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "reminder %s: failed to compute next occurrence, marking fired",
+                reminder.id,
+            )
+            next_occ = None
+
+        if next_occ is None:
+            reminder.status = "fired"
+            reminder.next_trigger_at = None
+        else:
+            reminder.next_trigger_at = _coerce_utc(next_occ)
+
+    def as_summary(self, reminder: FamilyReminder) -> ReminderSummary:
+        return ReminderSummary(
+            id=reminder.id,
+            title=reminder.title,
+            next_trigger_at=reminder.next_trigger_at,
+            recurrence_rule=reminder.recurrence_rule,
+            status=reminder.status,
+        )

@@ -1107,6 +1107,16 @@ def execute_conversation_chat(
         user_id=user_id,
         embedding_client=embedding_client,
     )
+    # Feature-specific chat tools. Dispatch by feature_key; default is
+    # empty (memory tools alone). Housewife skill adds reminders
+    # tooling so the LLM can ``schedule_reminder`` / ``list_reminders``
+    # / ``cancel_reminder`` during a conversation turn.
+    if feature_key == "housewife_assistant":
+        from sreda.services.housewife_chat_tools import build_housewife_tools
+
+        tools = tools + build_housewife_tools(
+            session=session, tenant_id=action.tenant_id, user_id=user_id
+        )
     tools_by_name = {t.name: t for t in tools}
 
     llm_with_tools = llm.bind_tools(tools)
