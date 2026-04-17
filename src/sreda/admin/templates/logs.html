@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Логи{% endblock %}
+{% block content %}
+<h2>Логи</h2>
+
+<form method="get" action="/admin/logs" style="margin-bottom: 16px; display: flex; gap: 12px; align-items: end; flex-wrap: wrap;">
+  <input type="hidden" name="token" value="{{ token }}">
+  <div>
+    <label for="file" style="display: block; font-size: 12px; color: var(--pico-muted-color);">Файл</label>
+    <select name="file" id="file" style="min-width: 260px;">
+      {% for lf in log_files %}
+      <option value="{{ lf.key }}" {% if lf.key == selected_key %}selected{% endif %}>
+        {{ lf.label }}{% if not lf.exists %} (нет){% endif %}
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label for="tail" style="display: block; font-size: 12px; color: var(--pico-muted-color);">Строк с конца</label>
+    <input type="number" name="tail" id="tail" value="{{ tail }}" min="50" max="5000" step="50" style="width: 110px;">
+  </div>
+  <div>
+    <label for="grep" style="display: block; font-size: 12px; color: var(--pico-muted-color);">Фильтр (подстрока)</label>
+    <input type="text" name="grep" id="grep" value="{{ grep or '' }}" placeholder="tenant_tg_..., ERROR, /miniapp/..." style="width: 260px;">
+  </div>
+  <div style="display: flex; gap: 8px;">
+    <button type="submit">Показать</button>
+    <button type="button" onclick="window.location.reload()" class="secondary outline">Обновить</button>
+  </div>
+</form>
+
+{% if selected_file %}
+<div style="margin-bottom: 8px; font-size: 12px; color: var(--pico-muted-color);">
+  <code>{{ selected_file.path }}</code>
+  &nbsp;·&nbsp; размер: {{ selected_file.size_human }}
+  &nbsp;·&nbsp; изменён: {{ selected_file.mtime }}
+  &nbsp;·&nbsp; показано строк: {{ lines|length }}{% if grep %} (после фильтра){% endif %}
+</div>
+{% endif %}
+
+{% if error %}
+<article style="padding: .75rem 1rem; background: #f8d7da; color: #721c24; border-radius: 4px;">
+  {{ error }}
+</article>
+{% elif not lines %}
+<p class="muted">Пусто.</p>
+{% else %}
+<pre style="background: #1e2a3a; color: #d4e4ff; padding: 12px; border-radius: 6px; font-size: 12px; font-family: 'Menlo', 'Consolas', monospace; line-height: 1.45; max-height: 75vh; overflow: auto; white-space: pre-wrap; word-break: break-all;">{% for line in lines %}{{ line }}
+{% endfor %}</pre>
+{% endif %}
+{% endblock %}

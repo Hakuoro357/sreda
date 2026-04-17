@@ -68,6 +68,22 @@ class Settings(BaseSettings):
     # with ?token=<value>. When None, admin is disabled (403).
     admin_token: str | None = None
 
+    # CSV list of log files surfaced in the /admin/logs view. Each entry
+    # may be a plain path (``/tmp/sreda-uvicorn.log``) or ``label=path``
+    # (``Uvicorn=/tmp/sreda-uvicorn.log``) for a friendlier nav label.
+    # Defaults to the launchd plist StandardOut/StandardError paths used
+    # on the Mac mini deploy. Files that don't exist are shown disabled
+    # in the dropdown — they never become a 500 for the admin.
+    admin_log_files_raw: str = Field(
+        default=(
+            "Uvicorn=/tmp/sreda-uvicorn.log,"
+            "Long-poll=/tmp/sreda-long-poll.log,"
+            "Job runner=/tmp/sreda-job-runner.log,"
+            "Public proxy=/tmp/sreda-pproxy.log"
+        ),
+        validation_alias="SREDA_ADMIN_LOG_FILES",
+    )
+
     # Hard wall-clock budget for a single job run. Applied around the
     # network-bound parts of job handlers (Telegram send, EDS adapter
     # verification, etc.) so a hung upstream cannot pin a job in
@@ -155,6 +171,30 @@ class Settings(BaseSettings):
         if not raw:
             return []
         return [item.strip() for item in raw.split(",") if item.strip()]
+
+    @property
+    def admin_log_files(self) -> list[tuple[str, str]]:
+        """Parse ``admin_log_files_raw`` into ``[(label, path), ...]``.
+
+        Entries without an explicit ``label=`` get the path's basename
+        as the label. Empty or blank configuration returns ``[]``.
+        """
+        raw = self.admin_log_files_raw or ""
+        result: list[tuple[str, str]] = []
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                label, _, path = item.partition("=")
+                label = label.strip() or path.strip().rsplit("/", 1)[-1]
+                path = path.strip()
+            else:
+                path = item
+                label = path.rsplit("/", 1)[-1]
+            if path:
+                result.append((label, path))
+        return result
 
     def resolve_mimo_api_key(self) -> str | None:
         """Resolve MiMo API key with file-based fallback.

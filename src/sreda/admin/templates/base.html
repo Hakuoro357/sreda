@@ -6,7 +6,45 @@
   <title>{% block title %}Admin{% endblock %} — Sreda</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   <style>
-    :root { --pico-font-size: 14px; }
+    :root { --pico-font-size: 14px; --sidebar-width: 220px; }
+    body { margin: 0; }
+    .layout { display: flex; min-height: 100vh; }
+    .sidebar {
+      width: var(--sidebar-width);
+      flex-shrink: 0;
+      background: #1e2a3a;
+      color: #e0e6ed;
+      padding: 20px 0;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+    }
+    .sidebar-brand {
+      padding: 0 20px 16px;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid #2d3e56;
+      margin-bottom: 12px;
+    }
+    .sidebar-nav { display: flex; flex-direction: column; }
+    .sidebar-nav a {
+      padding: 10px 20px;
+      color: #b4c0ce;
+      text-decoration: none;
+      font-size: 14px;
+      border-left: 3px solid transparent;
+      transition: background 0.15s;
+    }
+    .sidebar-nav a:hover { background: #263449; color: #fff; }
+    .sidebar-nav a.active {
+      background: #263449;
+      color: #fff;
+      border-left-color: #4a90e2;
+      font-weight: 600;
+    }
+    .content { flex: 1; padding: 20px 28px; overflow-x: auto; min-width: 0; }
     table { font-size: 13px; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
     .badge-green { background: #d4edda; color: #155724; }
@@ -17,22 +55,21 @@
     .muted { color: var(--pico-muted-color); font-size: 12px; }
     .usage-bar { width: 100px; height: 14px; background: #e9ecef; border-radius: 3px; display: inline-block; vertical-align: middle; }
     .usage-bar-fill { height: 100%; border-radius: 3px; }
-    nav ul { gap: 0.5rem; }
   </style>
 </head>
 <body>
-  <nav class="container-fluid">
-    <ul><li><strong>Sreda Admin</strong></li></ul>
-    <ul>
-      <li><a href="/admin/users?token={{ token }}">Пользователи</a></li>
-      <li><a href="/admin/budget?token={{ token }}">Бюджет</a></li>
-    </ul>
-  </nav>
-  <main class="container-fluid">
-    {% block content %}{% endblock %}
-  </main>
-  <footer class="container-fluid">
-    <small class="muted">Sreda Admin Dashboard</small>
-  </footer>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-brand">Sreda Admin</div>
+      <nav class="sidebar-nav">
+        <a href="/admin/users?token={{ token }}" class="{% if section == 'users' %}active{% endif %}">Пользователи</a>
+        <a href="/admin/logs?token={{ token }}" class="{% if section == 'logs' %}active{% endif %}">Логи</a>
+        <a href="/admin/budget?token={{ token }}" class="{% if section == 'budget' %}active{% endif %}">Бюджет</a>
+      </nav>
+    </aside>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
 </body>
 </html>
