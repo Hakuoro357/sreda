@@ -172,18 +172,14 @@ async def _maybe_transcribe_voice(
         credits_consumed=1,
     )
 
-    # 8. Send transcription back to user and stop processing.
-    # Once a chat-capable skill is available, this block should be replaced
-    # with ``message["text"] = text; return payload`` to route transcribed
-    # text into the normal pipeline.
-    try:
-        await telegram_client.send_message(
-            chat_id=chat_id,
-            text=f"🎤 {text}",
-        )
-    except TelegramDeliveryError as exc:
-        logger.warning("Failed to send transcription: %s", exc)
-    return None
+    # 8. Inject transcript into the payload as if the user had typed it.
+    # Downstream pipeline (``_extract_message_text`` → dispatcher →
+    # ``conversation.chat`` → chat-capable skill) handles it from here.
+    # No ``🎤`` echo — the goal is "treated like hand-typed text";
+    # Telegram already shows the original voice bubble in chat, so the
+    # user can replay it if the transcription looked off.
+    message["text"] = text
+    return payload
 
 
 async def _handle_callback(
