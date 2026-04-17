@@ -179,11 +179,11 @@ def test_failure_persists_sanitized_error_message_not_raw_password(monkeypatch, 
     assert "[password]" in (connect_session.error_message_sanitized or "")
     assert "[login]" in (connect_session.error_message_sanitized or "")
 
-    assert telegram_client.messages, "failure notification must still be sent"
-    failure_text = telegram_client.messages[-1]["text"]
-    assert "super-secret" not in failure_text
-    assert "5047136341" not in failure_text
-    assert "[password]" in failure_text
+    # Chat notifications for EDS verification — no-op since 2026-04
+    # (Mini App is the canonical surface). Sanitization is checked on
+    # connect_session.error_message_sanitized above — that's the only
+    # persistent channel now.
+    assert telegram_client.messages == []
 
 
 def test_verification_process_job_fails_fast_when_adapter_hangs(monkeypatch, tmp_path) -> None:
@@ -261,14 +261,11 @@ def test_duplicate_login_does_not_create_second_active_account(monkeypatch, tmp_
     assert connect_sessions[-1].status == "failed"
     assert connect_sessions[-1].error_code == "verification_duplicate_login"
     assert "уже подключен" in connect_sessions[-1].error_message_sanitized
-    assert len(telegram_client.messages) == 2
-    assert "уже подключен" in telegram_client.messages[-1]["text"]
-    # Retry-кнопка сохраняет slot_type=extra (взяли snapshot роли ДО
-    # cleanup), значит пользователь попадёт снова в extra-слот.
-    assert (
-        telegram_client.messages[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
-        == "eds:retry_connect:extra"
-    )
+    # Chat notifications (both success and duplicate-failure) are no-ops
+    # since 2026-04. State transitions above are the source of truth;
+    # the user sees the duplicate-login error on the connect form itself
+    # and in the Mini App.
+    assert telegram_client.messages == []
 
 
 def test_successful_verification_activates_account_and_sends_message(monkeypatch, tmp_path) -> None:
@@ -308,8 +305,10 @@ def test_successful_verification_activates_account_and_sends_message(monkeypatch
     assert runtime_account.login_masked == "***41"
     assert payload["login"] == "5047136341"
     assert payload["password"] == "super-secret"
-    assert len(telegram_client.messages) == 1
-    assert "Кабинет EDS подключен." in telegram_client.messages[0]["text"]
+    # Chat notification on success — no-op since 2026-04. Success is
+    # visible on the connect form (/connect/eds/<token> success page)
+    # and in the Mini App. Keeping the test scoped to state transitions.
+    assert telegram_client.messages == []
 
 
 def test_auth_failure_marks_account_failed_and_sends_retry(monkeypatch, tmp_path) -> None:
@@ -339,12 +338,12 @@ def test_auth_failure_marks_account_failed_and_sends_retry(monkeypatch, tmp_path
     # освобождается. Retry-кнопка в Telegram создаст fresh row.
     assert tenant_accounts == []
     assert connect_session.tenant_eds_account_id is None
-    assert len(telegram_client.messages) == 1
-    assert "Проверь логин и пароль" in telegram_client.messages[0]["text"]
-    assert (
-        telegram_client.messages[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
-        == "eds:retry_connect:primary"
-    )
+    # Chat notification with retry button — no-op since 2026-04. The
+    # user sees the failure on the connect form and in the Mini App
+    # (account status = auth_failed). Retry is initiated by reopening
+    # /subscriptions → Mini App → Подключить ЛК EDS which spins up a
+    # fresh connect_session.
+    assert telegram_client.messages == []
 
 
 def test_temporary_failure_keeps_job_pending_for_retry(monkeypatch, tmp_path) -> None:
