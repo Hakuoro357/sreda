@@ -91,7 +91,7 @@ class Settings(BaseSettings):
         default=(
             "Веб-сервер (Mini App и админка)=/tmp/sreda-uvicorn.log,"
             "Приём сообщений из Telegram=/tmp/sreda-long-poll.log,"
-            "Фоновые задачи (EDS-мониторинг, верификация)=/tmp/sreda-job-runner.log,"
+            "Фоновые задачи (EDS-мониторинг и верификация)=/tmp/sreda-job-runner.log,"
             "Прокси исходящих запросов (HTTP→SOCKS5)=/tmp/sreda-pproxy.log"
         ),
         validation_alias="SREDA_ADMIN_LOG_FILES",
