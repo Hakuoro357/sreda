@@ -160,9 +160,11 @@ def admin_logs(
 
 
 def _tail_file(path: str, n: int, grep: str | None) -> list[str]:
-    """Read the last ``n`` lines of ``path``. Optional substring filter
-    is applied AFTER the tail, so grep narrows what's visible but does
-    not widen the window (avoids scanning huge log files)."""
+    """Read the last ``n`` lines of ``path`` and return them
+    NEWEST-FIRST so the admin sees the latest event at the top of the
+    page without scrolling. Optional substring filter is applied AFTER
+    the tail, so grep narrows what's visible but does not widen the
+    window (avoids scanning huge log files)."""
     # A blocksize of 64K is enough for any reasonable line length while
     # keeping us out of O(filesize) territory. For files smaller than
     # the blocksize we just read the whole thing.
@@ -184,6 +186,7 @@ def _tail_file(path: str, n: int, grep: str | None) -> list[str]:
     lines = text.splitlines()[-n:]
     if grep:
         lines = [line for line in lines if grep in line]
+    lines.reverse()
     return lines
 
 
