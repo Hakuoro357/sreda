@@ -97,11 +97,29 @@
     location.hash = "#" + path;
   }
 
+  // Telegram.WebApp.BackButton.onClick() SUBSCRIBES a new handler on
+  // every call without replacing — after N navigations, one tap fires
+  // all N handlers and history.back() runs N times, jumping past the
+  // previous screen. Track the active callback and unsubscribe it
+  // before installing a new one.
+  var _backHandler = null;
+
   function setupBackButton(show) {
     if (!tg || !tg.BackButton) return;
+    if (_backHandler) {
+      try { tg.BackButton.offClick(_backHandler); } catch (e) {}
+      _backHandler = null;
+    }
     if (show) {
+      _backHandler = function() {
+        // On the main screen there's nothing to go back to — guard
+        // against it even though setupBackButton(false) should keep
+        // us out of this branch.
+        if (getRoute() === "/") return;
+        history.back();
+      };
+      tg.BackButton.onClick(_backHandler);
       tg.BackButton.show();
-      tg.BackButton.onClick(function() { history.back(); });
     } else {
       tg.BackButton.hide();
     }

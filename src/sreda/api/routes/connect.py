@@ -122,12 +122,18 @@ async def submit_eds_connect_form(
 
 
 def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
+    # Load Telegram.WebApp SDK + wire BackButton → /miniapp/. Without
+    # this, the arrow in Telegram's header on this page does nothing:
+    # the form opens inside the Mini App WebView and the user's only
+    # escape was closing the whole WebView (×). Now the back arrow
+    # cleanly returns to the subscriptions Mini App.
     return f"""<!doctype html>
 <html lang="ru">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Подключение EDS</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
       * {{
         box-sizing: border-box;
@@ -217,6 +223,18 @@ def _render_form_page(*, account_slot_type: str, expires_at: str) -> str:
           submitButton.textContent = "Проверяем...";
         }}, {{ once: true }});
       }}
+      (function() {{
+        var tg = window.Telegram && window.Telegram.WebApp;
+        if (!tg) return;
+        tg.ready();
+        tg.expand();
+        if (tg.BackButton) {{
+          tg.BackButton.show();
+          tg.BackButton.onClick(function() {{
+            window.location.href = "/miniapp/";
+          }});
+        }}
+      }})();
     </script>
   </body>
 </html>"""
