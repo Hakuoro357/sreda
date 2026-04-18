@@ -187,18 +187,23 @@ def build_memory_tools(
         )
         return "ok:logged"
 
-    # web_search is imported lazily so skills that don't expose it
-    # (or environments without duckduckgo-search installed) don't pay
-    # the import cost. The factory call is cheap — just wraps a
-    # closure around the ddg client.
-    from sreda.services.web_search_tool import build_web_search_tool
+    # web tools are imported lazily so skills that don't expose them
+    # (or environments without duckduckgo-search / readability-lxml
+    # installed) don't pay the import cost. The factory calls are
+    # cheap — just closures around httpx/ddgs clients.
+    from sreda.services.web_search_tool import (
+        build_fetch_url_tool,
+        build_web_search_tool,
+    )
 
     web_search_tool = build_web_search_tool()
+    fetch_url_tool = build_fetch_url_tool()
 
     return [
         save_core_fact,
         save_episode,
         recall_memory,
         web_search_tool,
+        fetch_url_tool,
         log_unsupported_request,
     ]
