@@ -154,7 +154,7 @@ def test_fetch_url_timeout_returns_error_string() -> None:
 
 
 def test_fetch_url_truncates_long_text() -> None:
-    body = "x" * 10000  # plain text — raw extractor
+    body = "x" * 20000  # exceeds the 12k budget → truncation expected
     tool = build_fetch_url_tool()
     fake_client = MagicMock()
     fake_client.__enter__.return_value = fake_client
@@ -166,5 +166,32 @@ def test_fetch_url_truncates_long_text() -> None:
 
     data = json.loads(result)
     assert data["truncated"] is True
-    # banner (~90) + 3500 chars ≈ 3600
-    assert data["length"] < 4000
+    # banner (~90) + 12000 chars ≈ 12100 — well under 20k raw body.
+    assert 12000 < data["length"] < 13000
+
+
+def test_fetch_url_does_not_truncate_medium_json() -> None:
+    """A 5k-byte JSON (typical wttr.in hourly) must pass through whole.
+
+    Regression: previous 3500-char budget chopped wttr.in ?format=j1
+    right inside the hourly-forecast array, making "how long will it
+    rain" queries unanswerable; LLM then cycled through tool calls
+    trying different formats and exhausted the tool loop.
+    """
+    payload = {"hours": [{"t": i, "temp": i} for i in range(200)]}
+    body = json.dumps(payload)
+    assert 3500 < len(body) < 12000, f"fixture size off: {len(body)}"
+
+    tool = build_fetch_url_tool()
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    fake_client.__exit__.return_value = False
+    fake_client.get.return_value = _make_response(body, content_type="application/json")
+
+    with patch("httpx.Client", return_value=fake_client):
+        result = _invoke(tool, "https://api.ex.com/w")
+
+    data = json.loads(result)
+    assert data["truncated"] is False
+    # Last hour must still be in the text — the bug we're preventing.
+    assert '"t": 199' in data["text"]

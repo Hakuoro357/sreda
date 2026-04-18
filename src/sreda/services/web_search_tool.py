@@ -38,7 +38,11 @@ _MAX_RESULTS = 3
 _MAX_SNIPPET_CHARS = 280
 _REGION = "ru-ru"  # Russian-first, matches the product audience
 
-_MAX_FETCH_CHARS = 3500  # per-page budget that fits the chat context
+_MAX_FETCH_CHARS = 12000  # per-page budget that fits the chat context.
+# Sized for structured JSON responses like wttr.in ?format=j1 (hourly
+# forecast ~3.5k chars truncated at the hourly array = useless for
+# "how long will it rain" questions). HTML via readability typically
+# yields 1.5-3k chars so the ceiling rarely kicks in for articles.
 _FETCH_TIMEOUT_SECONDS = 15.0
 _MAX_REDIRECTS = 5
 _FETCH_UA = (

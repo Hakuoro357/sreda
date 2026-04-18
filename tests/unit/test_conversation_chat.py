@@ -144,7 +144,13 @@ class _BoundFakeLLM:
 
 
 class FakeLLM:
-    """Duck-types just enough of ChatOpenAI to run our handler."""
+    """Duck-types just enough of ChatOpenAI to run our handler.
+
+    Exposes both ``bind_tools(...).invoke(...)`` (normal tool-loop path)
+    and a direct ``invoke(...)`` (used by the exhaustion fallback in
+    ``execute_conversation_chat`` — one final summary call WITHOUT
+    tools bound). Both paths pull from the same scripted-response
+    queue so tests can mix them naturally."""
 
     def __init__(self, responses: list[AIMessage]) -> None:
         self._bound = _BoundFakeLLM(responses)
@@ -152,6 +158,11 @@ class FakeLLM:
     def bind_tools(self, tools):
         self._bound.tools = list(tools)
         return self._bound
+
+    def invoke(self, messages):
+        # Same queue as the bound object — keeps call-order clear when
+        # a test scripts both tool-call and final-summary responses.
+        return self._bound.invoke(messages)
 
     @property
     def last_call(self) -> list[Any] | None:
@@ -390,11 +401,16 @@ def test_conversation_sees_loaded_memories_in_prompt(monkeypatch, tmp_path: Path
     assert "у меня дочь Маша 9 лет" in system_content
 
 
-def test_conversation_loop_terminates_after_max_iterations(monkeypatch, tmp_path: Path):
-    """A runaway LLM that keeps emitting tool calls must be stopped."""
+def test_conversation_loop_terminates_naturally_before_cap(monkeypatch, tmp_path: Path):
+    """An LLM that emits fewer tool-calls than the cap must terminate
+    cleanly when it finally returns plain text — WITHOUT invoking the
+    exhaustion-summary fallback. Keeps budget usage tight on simple
+    turns."""
     session = _bootstrap(monkeypatch, tmp_path, "conv5.db")
     try:
-        # Six tool-call messages — the handler caps at 5 iterations
+        # Six tool-call messages, then a final plain-text reply. The
+        # handler's cap is 8 iterations; here the loop exits naturally
+        # at iter=6 on the plain-text message.
         scripted = [
             AIMessage(
                 content="",
@@ -408,10 +424,13 @@ def test_conversation_loop_terminates_after_max_iterations(monkeypatch, tmp_path
             )
             for i in range(6)
         ]
+        scripted.append(AIMessage(content="Готово — сохранил всё."))
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
         svc = ActionRuntimeService(
             session,
-            telegram_client=FakeTelegram(),
-            llm_client=FakeLLM(scripted),
+            telegram_client=telegram,
+            llm_client=fake_llm,
             embedding_client=ConstantEmbeddingClient(),
         )
         queued = svc.enqueue_action(_chat_envelope("hi"))
@@ -422,8 +441,11 @@ def test_conversation_loop_terminates_after_max_iterations(monkeypatch, tmp_path
         session.close()
 
     assert result == "completed"
-    # Handler caps at 5 iterations, so at most 5 tool calls executed
-    assert memory_count <= 5
+    # 6 tool-calls fired, one plain-text message delivered, loop did
+    # NOT hit the cap — exactly 7 invokes total.
+    assert memory_count == 6
+    assert fake_llm._bound.idx == 7
+    assert telegram.sent[0]["text"] == "Готово — сохранил всё."
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +638,61 @@ def test_conversation_records_llm_usage_in_skill_ai_executions(monkeypatch, tmp_
     assert row.prompt_tokens == 120
     assert row.completion_tokens == 80
     assert row.credits_consumed == 400  # 200 tokens × 2 (pro rate)
+
+
+def test_tool_loop_exhaustion_forces_summary_turn(monkeypatch, tmp_path: Path):
+    """Regression: if the model keeps calling tools past the budget,
+    the handler MUST force one tool-less summary call so the user gets
+    a real reply instead of the "couldn't form answer" stub.
+
+    Reproduces the weather-on-Schodnya case from 2026-04-18 where the
+    LLM cycled wttr.in formats for 5 rounds and the user got a dead
+    reply despite having the data.
+    """
+    session = _bootstrap(monkeypatch, tmp_path, "conv_exhaust.db")
+    try:
+        # Script 8 tool-call responses (_MAX_TOOL_ITERATIONS = 8) so the
+        # loop exhausts exactly as in prod. Then a plain-text response
+        # which the forced summary invoke must pick up.
+        def _tc_response(i: int) -> AIMessage:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "save_episode",
+                        "args": {"summary": f"iter {i}"},
+                        "id": f"tc_{i}",
+                    }
+                ],
+            )
+
+        scripted = [_tc_response(i) for i in range(8)]
+        scripted.append(
+            AIMessage(content="На основе собранных данных: дождь идёт весь день.")
+        )
+        fake_llm = FakeLLM(scripted)
+
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("долго будет идти дождь?"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    sent_text = telegram.sent[0]["text"]
+    # The forced-summary response is what the user must see — NOT the
+    # legacy "couldn't form answer" stub.
+    assert "дождь идёт весь день" in sent_text
+    assert "слишком много шагов" not in sent_text
+
+    # Exactly 9 LLM invocations: 8 in-loop + 1 forced summary.
+    assert fake_llm._bound.idx == 9
 
 
 def test_tools_write_memories_with_correct_tier(monkeypatch, tmp_path: Path):

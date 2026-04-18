@@ -922,7 +922,13 @@ _CONVERSATION_SYSTEM_PROMPT = """\
 - ``save_episode`` — событие/настроение («сегодня устал», «вчера ругался с коллегой»). Короткое summary.
 - ``recall_memory`` — когда надо вытащить факт, которого нет в [ПАМЯТЬ] выше.
 - ``web_search`` — актуальные данные из интернета (новости, расписания, цены, определения, курсы валют). Короткий запрос на языке поиска.
-- ``fetch_url`` — когда ``web_search`` вернул подходящий URL и нужно прочитать страницу целиком. ВАЖНО для погоды: ходи на ``https://wttr.in/<город>?format=3`` — plain-text сервис, возвращает одну строку типа «Сходня: ☁️ +12°C». Надёжнее парсинга Яндекс.Погоды.
+- ``fetch_url`` — когда ``web_search`` вернул подходящий URL и нужно прочитать страницу целиком.
+  Погода на wttr.in — шпаргалка по форматам, НЕ перебирай их случайно:
+    * «сейчас / текущая погода» → ``https://wttr.in/<город>?format=3`` (одна строка: «Сходня: 🌦 +6°C»)
+    * «с осадками и ветром сейчас» → ``?format=%l:+%c+%t+%p+%h+%w`` (кратко: температура, осадки, влажность, ветер)
+    * «на день / сегодня / прогноз на несколько часов» → БЕЗ ?format, чистый URL ``https://wttr.in/<город>`` (html, Среда достанет сводку дня)
+    * «часовой прогноз / долго ли будет идти дождь / когда закончится» → ``?format=j1`` (JSON с hourly-массивом; читай поля ``hourly[].time``, ``chanceofrain``, ``precipMM``)
+  Если первый формат не даёт ответ — переключайся осознанно, не повторяй одно и то же.
 - ``log_unsupported_request`` — ПЕРЕД тем как сказать пользователю «я не могу X» / «не умею X» / «у меня нет возможности X», обязательно вызывай этот tool. Только после него — дружелюбно отвечаешь пользователю. Если ты НЕ вызвал log_unsupported_request, значит ты можешь это сделать — попробуй сначала разобраться как.
 
 Правила:
@@ -1285,23 +1291,21 @@ def execute_conversation_chat(
     messages.append(HumanMessage(content=user_text))
 
     # --- 4. Tool-call loop with per-call usage recording --------------
-    final_ai: AIMessage | None = None
-    for _iter in range(5):
-        _log_llm_invoke(
-            tenant_id=action.tenant_id,
-            feature_key=feature_key,
-            iteration=_iter,
-            messages=messages,
-        )
-        ai_msg: AIMessage = llm_with_tools.invoke(messages)
-        # Record LLM usage for this iteration.
+    # Limit tuned to common chains (weather: search→fetch→format-switch→fetch
+    # easily hits 4-5; with log_unsupported_request preflight add another).
+    # If the model is still calling tools at the end of the budget, we do
+    # ONE final invoke without bind_tools so it is forced to summarise
+    # from what it has — beats the old "I couldn't form an answer" stub.
+    _MAX_TOOL_ITERATIONS = 8
+
+    def _record_and_log(ai_msg: AIMessage, *, iteration: int) -> None:
         usage = getattr(ai_msg, "usage_metadata", None) or {}
         prompt_tokens = int(usage.get("input_tokens") or 0)
         completion_tokens = int(usage.get("output_tokens") or 0)
         _log_llm_response(
             tenant_id=action.tenant_id,
             feature_key=feature_key,
-            iteration=_iter,
+            iteration=iteration,
             ai_msg=ai_msg,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -1321,6 +1325,16 @@ def execute_conversation_chat(
             except Exception:  # noqa: BLE001 — usage tracking must not kill the turn
                 logger.exception("budget: failed to record LLM usage")
 
+    final_ai: AIMessage | None = None
+    for _iter in range(_MAX_TOOL_ITERATIONS):
+        _log_llm_invoke(
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            iteration=_iter,
+            messages=messages,
+        )
+        ai_msg: AIMessage = llm_with_tools.invoke(messages)
+        _record_and_log(ai_msg, iteration=_iter)
         messages.append(ai_msg)
         tool_calls = getattr(ai_msg, "tool_calls", None) or []
         if not tool_calls:
@@ -1343,10 +1357,41 @@ def execute_conversation_chat(
                 result = f"error:{type(exc).__name__}"
             messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
     else:
-        # Loop exhausted without a final plain message — synthesize one.
-        final_ai = AIMessage(
-            content="Не смог сформировать ответ — слишком много шагов с инструментами."
+        # Budget exhausted while still calling tools. Force ONE final
+        # completion with NO bind_tools so the model must write plain
+        # text using whatever it collected. Keeps the user from seeing
+        # a "couldn't form answer" stub when the data was actually there.
+        logger.warning(
+            "chat tool-loop exhausted at iter=%d; forcing summary turn for tenant=%s",
+            _MAX_TOOL_ITERATIONS,
+            action.tenant_id,
         )
+        summary_nudge = HumanMessage(
+            content=(
+                "Инструменты больше вызывать нельзя — бюджет шагов исчерпан. "
+                "Сформулируй лучший возможный ответ пользователю на основе "
+                "данных, которые ты уже получил выше. Если чего-то не хватает — "
+                "честно скажи, чего именно."
+            )
+        )
+        messages.append(summary_nudge)
+        _log_llm_invoke(
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            iteration=_MAX_TOOL_ITERATIONS,  # one past the loop
+            messages=messages,
+        )
+        try:
+            final_ai = llm.invoke(messages)  # NOTE: no bind_tools
+            _record_and_log(final_ai, iteration=_MAX_TOOL_ITERATIONS)
+        except Exception:  # noqa: BLE001 — must not crash the turn
+            logger.exception("chat: forced-summary invoke failed")
+            final_ai = AIMessage(
+                content=(
+                    "Я собрал какие-то данные, но не смог сложить их в ответ. "
+                    "Попробуй переформулировать вопрос покороче."
+                )
+            )
 
     text = (final_ai.content or "").strip() or "..."
     return [RuntimeReply(text=text, reply_markup=None, feature_key=feature_key)]
