@@ -103,6 +103,19 @@ class HousewifeReminderService:
             q = q.filter(FamilyReminder.user_id == user_id)
         return q.all()
 
+    def count_active(
+        self, *, tenant_id: str, user_id: str | None = None
+    ) -> int:
+        """Cheap count for UI badges (Mini App home screen). Avoids
+        materializing rows we don't need for the "3 active" subtitle."""
+        q = self.session.query(FamilyReminder).filter(
+            FamilyReminder.tenant_id == tenant_id,
+            FamilyReminder.status == "pending",
+        )
+        if user_id:
+            q = q.filter(FamilyReminder.user_id == user_id)
+        return q.count()
+
     def cancel(self, *, tenant_id: str, reminder_id: str) -> bool:
         reminder = (
             self.session.query(FamilyReminder)

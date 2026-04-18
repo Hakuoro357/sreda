@@ -12,7 +12,16 @@
   var $app = document.getElementById("app");
 
   // -- State --
-  var state = { summary: null, plans: null, loading: true, error: null };
+  // ``menu`` — dashboard tiles (skills + Подписки). ``reminders`` lazy-loaded
+  // when the user opens #/reminders so we don't hit the DB on every boot.
+  var state = {
+    summary: null,
+    plans: null,
+    menu: null,
+    reminders: null,
+    loading: true,
+    error: null,
+  };
 
   // -- API --
   function apiFetch(path, opts) {
@@ -40,15 +49,29 @@
     return Promise.all([
       apiFetch("/miniapp/api/v1/summary"),
       apiFetch("/miniapp/api/v1/plans"),
+      apiFetch("/miniapp/api/v1/menu"),
     ]).then(function(results) {
       state.summary = results[0];
       state.plans = results[1];
+      state.menu = results[2];
       state.loading = false;
       render();
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.loading = false;
         state.error = "Не удалось загрузить данные.";
+        render();
+      }
+    });
+  }
+
+  function loadReminders() {
+    return apiFetch("/miniapp/api/v1/reminders").then(function(res) {
+      state.reminders = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.reminders = { items: [], _error: true };
         render();
       }
     });
@@ -135,6 +158,23 @@
     return dd + "." + mm + "." + yyyy;
   }
 
+  // Human-friendly datetime used on the reminders page. Today / tomorrow
+  // get relative prefixes; further dates show day + month. Renders in
+  // the device's locale so the Telegram user sees their own timezone.
+  function formatDateTime(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    var now = new Date();
+    var sameDay = d.toDateString() === now.toDateString();
+    var tmrw = new Date(now.getTime() + 86400000);
+    var isTomorrow = d.toDateString() === tmrw.toDateString();
+    var timeStr = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+    if (sameDay) return "Сегодня в " + timeStr;
+    if (isTomorrow) return "Завтра в " + timeStr;
+    var dateStr = d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+    return dateStr + ", " + timeStr;
+  }
+
   function formatPrice(rub) {
     if (!rub || rub === 0) return "Бесплатно";
     return rub.toLocaleString("ru-RU") + " \u20bd / мес";
@@ -165,9 +205,38 @@
     return '<div class="error-state">' + escHtml(state.error) + '</div>';
   }
 
-  // --- Screen: Main (#/) ---
-  function renderMain() {
+  // --- Screen: Dashboard (#/) — dynamic menu from subscribed agents ---
+  function renderDashboard() {
     setupBackButton(false);
+    var html = '<h1>Среда</h1>';
+    var items = (state.menu && state.menu.items) || [];
+    if (items.length === 0) {
+      // Should never happen — Подписки is always injected server-side,
+      // but keep a graceful fallback.
+      return html + '<div class="empty-state">Меню пустое. Попробуй обновить.</div>';
+    }
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var route = it.route || "";
+      // Route is a URL fragment like "#/reminders"; _nav expects a path.
+      var path = route.replace(/^#/, "");
+      html += '<div class="card card-link" onclick="window._nav(\'' + escHtml(path) + '\')">';
+      html += '<div>';
+      html += '<div class="card-title">' + escHtml(it.icon || "") + " " + escHtml(it.title) + '</div>';
+      if (it.subtitle) {
+        html += '<div class="card-subtitle">' + escHtml(it.subtitle) + '</div>';
+      }
+      html += '</div>';
+      html += '<span class="chevron">\u203A</span>';
+      html += '</div>';
+    }
+    return html;
+  }
+
+  // --- Screen: Subscriptions (#/subscriptions) — renamed from old main.
+  // Same content: list of subscribed agents + payment banner + "+ Добавить".
+  function renderSubscriptions() {
+    setupBackButton(true);
     var s = state.summary;
     var html = '<h1>Мои подписки</h1>';
 
@@ -202,6 +271,50 @@
     html += '<span class="chevron">\u203A</span>';
     html += '</div>';
 
+    return html;
+  }
+
+  // --- Screen: Reminders (#/reminders) ---
+  function renderReminders() {
+    setupBackButton(true);
+    var html = '<h1>Напоминания</h1>';
+
+    if (state.reminders === null) {
+      // First visit — kick off fetch and show spinner. loadReminders
+      // re-renders on completion.
+      loadReminders();
+      return html + renderLoading();
+    }
+    var items = (state.reminders && state.reminders.items) || [];
+    if (state.reminders && state.reminders._error) {
+      return html + '<div class="error-state">Не удалось загрузить напоминания.</div>';
+    }
+    if (items.length === 0) {
+      html += '<div class="empty-state">';
+      html += 'Напоминаний пока нет.<br><br>';
+      html += 'Скажи боту «напомни мне через 2 часа …» — и оно появится здесь.';
+      html += '</div>';
+      return html;
+    }
+
+    for (var i = 0; i < items.length; i++) {
+      var r = items[i];
+      // JS doesn't grok \U0001fXXX syntax — use literal UTF-8 chars (the
+      // template is served UTF-8) or surrogate-pair escapes. Literals
+      // here are clearer and render fine in Telegram WebView.
+      var icon = r.is_recurring ? "\uD83D\uDD01" : "\uD83D\uDD14";  // 🔁 or 🔔
+      html += '<div class="card">';
+      html += '<div class="card-title">' + icon + " " + escHtml(r.title) + '</div>';
+      html += '<div class="card-subtitle">' + escHtml(formatDateTime(r.next_trigger_at)) + '</div>';
+      if (r.is_recurring) {
+        html += '<div class="card-subtitle">' + escHtml(r.recurrence_rule) + '</div>';
+      }
+      html += '<div class="text-right mt-8">';
+      html += '<button class="btn btn-danger btn-small" onclick="window._cancelReminder(\'' + escHtml(r.id) + '\', \'' + escHtml(r.title).replace(/\'/g, "") + '\')">Отменить</button>';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '<div class="card-subtitle" style="text-align:center;margin-top:16px">Всего: ' + items.length + '</div>';
     return html;
   }
 
@@ -382,7 +495,11 @@
     var html;
 
     if (route === "/") {
-      html = renderMain();
+      html = renderDashboard();
+    } else if (route === "/subscriptions") {
+      html = renderSubscriptions();
+    } else if (route === "/reminders") {
+      html = renderReminders();
     } else if (route === "/skill/eds_monitor") {
       html = renderEdsSkill();
     } else if (route.indexOf("/skill/") === 0) {
@@ -394,7 +511,7 @@
       var planKey = route.replace("/catalog/", "");
       html = renderPlanDetail(planKey);
     } else {
-      html = renderMain();
+      html = renderDashboard();
     }
 
     $app.innerHTML = html;
@@ -410,7 +527,7 @@
       : "Подключить " + title + "?";
     showPopup(msg, function() {
       doAction("/miniapp/api/v1/subscribe", { plan_key: planKey })
-        .then(function() { navigate("/"); })
+        .then(function() { navigate("/subscriptions"); })
         .catch(function() { showAlert("Не удалось подключить."); });
     });
   };
@@ -418,8 +535,29 @@
   window._cancelSkill = function(featureKey, planKey) {
     showPopup("Отключить подписку?", function() {
       doAction("/miniapp/api/v1/cancel", { plan_key: planKey })
-        .then(function() { navigate("/"); })
+        .then(function() { navigate("/subscriptions"); })
         .catch(function() { showAlert("Не удалось отключить."); });
+    });
+  };
+
+  window._cancelReminder = function(reminderId, title) {
+    showPopup("Отменить напоминание «" + title + "»?", function() {
+      apiFetch("/miniapp/api/v1/reminders/" + reminderId + "/cancel", {
+        method: "POST",
+        body: {},
+      }).then(function(res) {
+        if (res && res.ok) {
+          // Refresh reminders list in place — also refresh the menu so
+          // the dashboard counter drops when the user goes back.
+          state.reminders = null;
+          state.menu = null;
+          loadData().then(function() {
+            loadReminders();
+          });
+        } else {
+          showAlert("Не удалось отменить.");
+        }
+      }).catch(function() { showAlert("Не удалось отменить."); });
     });
   };
 

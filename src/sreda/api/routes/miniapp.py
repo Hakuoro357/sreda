@@ -21,13 +21,16 @@ from sqlalchemy.orm import Session
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
 from sreda.config.settings import get_settings
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+from sreda.features.app_registry import get_feature_registry
+from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
+from sreda.services.agent_capabilities import active_feature_keys
 from sreda.services.billing import (
     PLAN_EDS_MONITOR_BASE,
     PLAN_EDS_MONITOR_EXTRA,
-    PLAN_VOICE_TRANSCRIPTION,
     BillingService,
 )
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
+from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     resolve_tenant_from_telegram_id,
@@ -191,13 +194,13 @@ def get_summary(
             "is_active": False,
         })
 
-    # Simple skills (one plan → one subscription → one card). Voice was
-    # first, housewife joined it; any future plan that doesn't need
-    # bespoke aggregation (like EDS base+extra) can be added here with
-    # just one line.
+    # Simple skills (one plan → one subscription → one card). Voice
+    # transcription was removed in 2026-04 — it's now a capability
+    # bundled with agents (see SkillManifestBase.includes_voice), not
+    # a standalone subscription. Add any future simple agent here with
+    # one tuple and no per-agent branching.
     _simple_skills: list[tuple[str, str, str, str]] = [
         # (plan_key, feature_key, default_title, icon)
-        (PLAN_VOICE_TRANSCRIPTION, "voice_transcription", "Распознавание голоса", "\U0001f3a4"),
         ("housewife_assistant_base", "housewife_assistant", "Помощник домохозяйки", "\U0001f3e0"),
     ]
     for plan_key, feature_key, default_title, icon in _simple_skills:
@@ -614,3 +617,139 @@ def eds_add_and_connect(
         return {"ok": True, "message": result.message_text, "connect_url": None}
 
     return {"ok": True, "connect_url": link.url, "message": result.message_text}
+
+
+# ---------------------------------------------------------------------------
+# JSON API — Mini App home-screen menu (skill-level sections)
+# ---------------------------------------------------------------------------
+
+
+def _collect_menu_sections(
+    session: Session, tenant_id: str, user_id: str | None
+) -> list[MiniAppSection]:
+    """Aggregate Mini App sections from every agent the tenant has active.
+
+    Deduplication rule: if two agents contribute sections with the same
+    ``id``, the first-registered wins title/icon, counts are summed.
+    This lets "Напоминания" from housewife and teamlead surface as one
+    card in the future without Mini App needing to know about agents.
+    """
+    active_keys = active_feature_keys(session, tenant_id)
+    if not active_keys:
+        return []
+
+    registry = get_feature_registry()
+    merged: dict[str, MiniAppSection] = {}
+    for feature_key in active_keys:
+        module = registry.modules.get(feature_key)
+        if module is None or not isinstance(module, MiniAppSectionsProvider):
+            continue
+        try:
+            sections = module.get_miniapp_sections(session, tenant_id, user_id)
+        except Exception:  # noqa: BLE001 — one broken agent mustn't kill the menu
+            logger.exception(
+                "miniapp sections provider failed for feature=%s", feature_key
+            )
+            continue
+        for section in sections:
+            existing = merged.get(section.id)
+            if existing is None:
+                merged[section.id] = section
+            else:
+                # Sum counts; keep first agent's title/icon/route.
+                summed_count = (existing.count or 0) + (section.count or 0)
+                subtitle = (
+                    f"{summed_count} активных" if summed_count else "пока пусто"
+                )
+                merged[section.id] = MiniAppSection(
+                    id=existing.id,
+                    title=existing.title,
+                    icon=existing.icon,
+                    route=existing.route,
+                    subtitle=subtitle,
+                    count=summed_count,
+                )
+    return list(merged.values())
+
+
+@router.get("/api/v1/menu")
+def get_menu(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Home-screen menu for the Mini App.
+
+    Returns skill-level entry-points (Напоминания, etc.) aggregated
+    from subscribed agents, plus the always-on Подписки tile.
+    """
+    sections = _collect_menu_sections(session, ctx.tenant_id, ctx.user_id)
+    items = [
+        {
+            "id": s.id,
+            "title": s.title,
+            "icon": s.icon,
+            "route": s.route,
+            "subtitle": s.subtitle,
+            "count": s.count,
+        }
+        for s in sections
+    ]
+    # Platform-level tile — not an agent contribution, always present.
+    items.append(
+        {
+            "id": "subscriptions",
+            "title": "Подписки",
+            "icon": "\U0001f4b3",  # 💳
+            "route": "#/subscriptions",
+            "subtitle": None,
+            "count": None,
+        }
+    )
+    return {"items": items}
+
+
+# ---------------------------------------------------------------------------
+# JSON API — Reminders (housewife skill; listed / cancelled from UI)
+# ---------------------------------------------------------------------------
+
+
+def _reminder_to_dict(reminder) -> dict:
+    """Serialise a FamilyReminder for the Mini App. Times as ISO-8601
+    UTC; the browser applies user locale when formatting."""
+    return {
+        "id": reminder.id,
+        "title": reminder.title,
+        "next_trigger_at": _iso(reminder.next_trigger_at),
+        "recurrence_rule": reminder.recurrence_rule,
+        "is_recurring": bool(reminder.recurrence_rule),
+    }
+
+
+@router.get("/api/v1/reminders")
+def list_reminders(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """List pending reminders for the current tenant + user.
+
+    Scoped by user so two people in the same tenant don't see each
+    other's reminders. Future agents that contribute reminders (e.g.
+    teamlead) can plug into this endpoint by storing into the same
+    table or by adding a provider pattern — for v1 only housewife.
+    """
+    service = HousewifeReminderService(session)
+    rows = service.list_active(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+    return {"items": [_reminder_to_dict(r) for r in rows]}
+
+
+@router.post("/api/v1/reminders/{reminder_id}/cancel")
+def cancel_reminder(
+    reminder_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    service = HousewifeReminderService(session)
+    ok = service.cancel(tenant_id=ctx.tenant_id, reminder_id=reminder_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="reminder_not_found")
+    return {"ok": True}
