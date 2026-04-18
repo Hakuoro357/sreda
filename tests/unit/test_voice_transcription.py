@@ -40,9 +40,8 @@ def _make_registry(registered: bool = True):
     return registry
 
 
-def _make_budget(has_quota: bool = True):
+def _make_budget():
     budget = MagicMock()
-    budget.has_quota.return_value = has_quota
     budget.record_api_usage = MagicMock()
     return budget
 
@@ -57,6 +56,11 @@ def _make_settings(speech_provider: str = "yandex"):
     settings = MagicMock()
     settings.speech_provider = speech_provider
     return settings
+
+
+def _patch_voice_access(value: bool):
+    """Shortcut for patching the agent-capability gate."""
+    return patch("sreda.services.telegram_bot.has_voice_access", return_value=value)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +102,7 @@ async def test_no_message_fast_path():
 
 @pytest.mark.asyncio
 async def test_feature_not_registered_sends_error():
-    """Returns None and sends error when voice_transcription not in registry."""
+    """Returns None and sends error when voice_transcription plugin not installed."""
     payload = _make_voice_payload()
     session = MagicMock()
     telegram = _make_telegram()
@@ -118,17 +122,16 @@ async def test_feature_not_registered_sends_error():
 
 
 @pytest.mark.asyncio
-async def test_no_quota_sends_error():
-    """Returns None and sends error when tenant has no quota."""
+async def test_no_voice_access_sends_error():
+    """Returns None and sends error when tenant has no agent with includes_voice=True."""
     payload = _make_voice_payload()
     session = MagicMock()
     telegram = _make_telegram()
     onboarding = _make_onboarding()
-    budget = _make_budget(has_quota=False)
 
     with (
         patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
-        patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
+        _patch_voice_access(False),
     ):
         result = await _maybe_transcribe_voice(
             payload, session=session, telegram_client=telegram, onboarding=onboarding
@@ -137,7 +140,10 @@ async def test_no_quota_sends_error():
     assert result is None
     telegram.send_message.assert_awaited_once()
     msg = telegram.send_message.call_args.kwargs["text"]
-    assert "Лимит" in msg
+    # New semantics: no mention of "limit"; user is pointed at the
+    # Помощник домохозяйки agent, which bundles voice.
+    assert "Помощник" in msg
+    assert "/subscriptions" in msg
 
 
 @pytest.mark.asyncio
@@ -151,6 +157,7 @@ async def test_duration_too_long_sends_error():
 
     with (
         patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
     ):
         result = await _maybe_transcribe_voice(
@@ -174,6 +181,7 @@ async def test_no_speech_provider_sends_error():
 
     with (
         patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
         patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
         patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=None),
@@ -201,6 +209,7 @@ async def test_speech_recognition_error_sends_error():
 
     with (
         patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
         patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
         patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
@@ -227,6 +236,7 @@ async def test_happy_path_injects_text():
 
     with (
         patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
         patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
         patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),

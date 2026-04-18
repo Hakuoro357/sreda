@@ -137,6 +137,13 @@ class SkillManifestBase(BaseModel):
     # subscribed skill with ``provides_chat=True``. EDS-monitor style
     # skills (no chat) leave this False.
     provides_chat: bool = False
+    # Voice transcription is a shared capability, not a standalone
+    # subscription. Any agent that wants incoming voice messages auto-
+    # transcribed to text sets this to ``True``. Voice gate in
+    # ``services.telegram_bot._maybe_transcribe_voice`` checks whether
+    # any subscribed agent has it. Leaving False = voice messages get
+    # a "not supported" reply.
+    includes_voice: bool = False
     # Optional default for ``SubscriptionPlan.credits_monthly_quota``
     # when seeding new plans for this feature. Doesn't affect runtime
     # enforcement — the plan row is the authoritative source.

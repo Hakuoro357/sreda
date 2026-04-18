@@ -9,6 +9,7 @@ from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.dispatcher import dispatch_telegram_action
 from sreda.runtime.executor import ActionRuntimeService
+from sreda.services.agent_capabilities import has_voice_access
 from sreda.services.budget import BudgetService
 from sreda.services.onboarding import TelegramOnboardingResult, build_welcome_message
 from sreda.services.speech.base import SpeechRecognitionError
@@ -105,22 +106,29 @@ async def _maybe_transcribe_voice(
         except TelegramDeliveryError as exc:
             logger.warning("Failed to send voice error message: %s", exc)
 
-    # 1. Feature registered?
+    # 1. Voice plugin installed? Runtime package must be present — otherwise
+    # the Yandex SpeechKit dependency is missing and we can't transcribe
+    # regardless of what agent the user has.
     registry = get_feature_registry()
     if _VOICE_FEATURE_KEY not in registry.modules:
         await _send_error(
             "Я пока не умею обрабатывать голосовые сообщения. "
-            "Подключите навык распознавания речи → /subscriptions"
+            "Подключите подходящий агент → /subscriptions"
         )
         return None
 
-    # 2. Quota check
-    budget = BudgetService(session)
-    if not tenant_id or not budget.has_quota(tenant_id, _VOICE_FEATURE_KEY):
+    # 2. Tenant has an active agent that includes voice?
+    # Voice is no longer a standalone subscription — it's a capability
+    # bundled with agents like Помощник домохозяйки (see manifest
+    # ``includes_voice``). EDS Monitor and other text-only agents do
+    # NOT grant voice.
+    if not tenant_id or not has_voice_access(session, tenant_id):
         await _send_error(
-            "Лимит распознавания голоса исчерпан. Проверьте подписку → /subscriptions"
+            "Распознавание голосовых сообщений включено в Помощник "
+            "домохозяйки. Подключите его → /subscriptions"
         )
         return None
+    budget = BudgetService(session)
 
     # 3. Duration limit
     duration = voice.get("duration", 0)
