@@ -121,6 +121,14 @@ class Settings(BaseSettings):
     # ведётся (данные всё равно попадают в обычный logger).
     failed_connect_log_path: str | None = None
 
+    # Feature-request log: когда LLM-ассистент встречает запрос,
+    # который он не может выполнить (не хватает скила, нет tool'а), он
+    # зовёт tool ``log_unsupported_request`` → пишется строка в этот
+    # файл. Помогает продукту видеть реальные хотелки пользователей и
+    # выстраивать roadmap. Если None — строки уходят только в общий
+    # logger (можно грепать по имени ``sreda.feature_requests``).
+    feature_requests_log_path: str | None = None
+
     # Per-IP rate limits for public endpoints. These are defence-in-depth
     # on top of any reverse-proxy limiting that might be in front: they
     # guarantee a floor of protection for single-process deployments and

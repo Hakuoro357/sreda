@@ -148,4 +148,57 @@ def build_memory_tools(
             ensure_ascii=False,
         )
 
-    return [save_core_fact, save_episode, recall_memory]
+    feature_requests_logger = logging.getLogger("sreda.feature_requests")
+
+    @lc_tool
+    def log_unsupported_request(user_asked: str, reason: str) -> str:
+        """Log a user request the assistant CANNOT fulfil right now.
+
+        Call whenever the user asks for something the assistant lacks
+        the skill, tool, integration, or data to do — so product can
+        see real hotspots and prioritize. Examples: "закажи такси",
+        "напиши код для X", "позвони в банк", "купи билеты".
+
+        Do NOT call for things you CAN do via existing tools (schedule
+        reminders, recall memory, web search, save facts). Do NOT call
+        as a cop-out when you just need to think harder.
+
+        Args:
+            user_asked: A short paraphrase of the user's ask, in the
+                user's language, ≤ 200 chars.
+            reason: Why it's unsupported — which skill / integration /
+                tool is missing. Concrete ("нет интеграции с Яндекс.Такси")
+                beats vague ("not supported").
+
+        Returns "ok:logged" on success. Does not surface anything to
+        the user — your job after calling it is to reply to the user
+        gracefully (explain briefly, suggest a workaround if you have one).
+        """
+        asked = (user_asked or "").strip()[:200]
+        why = (reason or "").strip()[:200]
+        if not asked or not why:
+            return "error: both user_asked and reason required"
+        feature_requests_logger.info(
+            "tenant=%s user=%s asked=%r reason=%r",
+            tenant_id,
+            user_id,
+            asked,
+            why,
+        )
+        return "ok:logged"
+
+    # web_search is imported lazily so skills that don't expose it
+    # (or environments without duckduckgo-search installed) don't pay
+    # the import cost. The factory call is cheap — just wraps a
+    # closure around the ddg client.
+    from sreda.services.web_search_tool import build_web_search_tool
+
+    web_search_tool = build_web_search_tool()
+
+    return [
+        save_core_fact,
+        save_episode,
+        recall_memory,
+        web_search_tool,
+        log_unsupported_request,
+    ]

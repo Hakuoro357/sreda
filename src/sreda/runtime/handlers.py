@@ -14,6 +14,7 @@ unit-testing trivial.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Callable
@@ -914,9 +915,12 @@ _CONVERSATION_SYSTEM_PROMPT = """\
 
 Поведение:
 - Отвечай кратко и по делу, без воды.
+- В контексте — последние ~10 ходов переписки. Опирайся на них: если пользователь уточняет предыдущий ход («да», «нет», «именно», «отмени это») — применяй к самой свежей твоей реплике, а не спрашивай «к чему относится».
 - Если пользователь делится стабильным фактом о себе (семья, работа, место жительства, долгосрочные предпочтения) — зови инструмент ``save_core_fact``, записывай факт одним предложением в словах пользователя.
 - Если пользователь делится событием или настроением ("сегодня устал", "вчера ругался с коллегой") — зови ``save_episode``, короткое summary.
 - Если нужна дополнительная память — зови ``recall_memory`` с поисковым запросом.
+- Если спрашивают про актуальные данные из интернета (новости, расписания, цены, определения, курсы валют) — зови ``web_search`` с коротким запросом на языке поиска.
+- Если пользователь просит что-то, чего ты реально не можешь (нет tool'а, нет интеграции, скил не подключён) — зови ``log_unsupported_request``, потом дружелюбно объясни что не умеешь и предложи разумный workaround.
 - НЕ сохраняй моментальные запросы ("помоги с X"), мнения, которые могут меняться, или сомнения.
 - Используй уже известные факты ниже, чтобы отвечать без переспрашивания.
 """
@@ -968,6 +972,146 @@ def execute_billing_buy_extra(
             reply_markup=None,
         )
     ]
+
+
+_CHAT_HISTORY_LIMIT = 10
+# Log each LLM invocation (request preview + response preview + token
+# counts) via a dedicated logger. Enables post-mortem debugging of
+# "bot lost context" / "hallucinated" complaints. ``sreda.llm`` is
+# pinned at INFO in configure_logging, so entries survive WARNING-
+# level app config.
+_LLM_LOGGER = logging.getLogger("sreda.llm")
+_LLM_PREVIEW_CHARS = 400
+
+
+def _load_chat_history(
+    session: Session, current_run_id: str, *, limit: int = _CHAT_HISTORY_LIMIT
+) -> list[tuple[str, str]]:
+    """Reconstruct the last N user↔bot turns for the chat thread of
+    ``current_run_id``, newest first (caller reverses to feed the LLM
+    in chronological order).
+
+    Source of truth:
+      * user turn = ``AgentRun.input_json["params"]["text"]`` for rows
+        with ``action_type="conversation.chat"`` and ``status="completed"``
+      * bot turn  = concatenation of ``OutboxMessage.payload_json["text"]``
+        for ids listed in ``AgentRun.result_json["outbox_message_ids"]``
+
+    Skips the current run (it's in-progress) and skips any run where we
+    can't extract both sides cleanly — partial history is better than
+    blocking the whole turn. Returns ``[(user_text, bot_text), ...]``
+    in reverse chronological order."""
+    from sreda.db.models import AgentRun, OutboxMessage  # local — hot-path cost
+
+    current_run = session.get(AgentRun, current_run_id)
+    if current_run is None:
+        return []
+    thread_id = current_run.thread_id
+    prior_runs = (
+        session.query(AgentRun)
+        .filter(
+            AgentRun.thread_id == thread_id,
+            AgentRun.action_type == "conversation.chat",
+            AgentRun.status == "completed",
+            AgentRun.id != current_run_id,
+        )
+        .order_by(AgentRun.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    turns: list[tuple[str, str]] = []
+    for run in prior_runs:
+        try:
+            input_data = json.loads(run.input_json or "{}")
+            user_text = str(
+                (input_data.get("params") or {}).get("text") or ""
+            ).strip()
+            if not user_text:
+                continue
+            result_data = json.loads(run.result_json or "{}")
+            outbox_ids = result_data.get("outbox_message_ids") or []
+            bot_parts: list[str] = []
+            for oid in outbox_ids:
+                ob = session.get(OutboxMessage, oid)
+                if ob is None or not ob.payload_json:
+                    continue
+                payload = json.loads(ob.payload_json)
+                text = (payload.get("text") or "").strip()
+                if text:
+                    bot_parts.append(text)
+            bot_text = "\n".join(bot_parts)
+            if not bot_text:
+                continue
+            turns.append((user_text, bot_text))
+        except (ValueError, TypeError) as exc:
+            # Malformed JSON in a historical row shouldn't kill the
+            # current turn — skip and continue.
+            logger.warning(
+                "chat history: skipped run %s due to parse error: %s",
+                run.id,
+                exc,
+            )
+            continue
+    return turns
+
+
+def _log_llm_invoke(
+    *,
+    tenant_id: str,
+    feature_key: str,
+    iteration: int,
+    messages: list[Any],
+) -> None:
+    """Trace one LLM request. ``messages`` is the full list passed to
+    ``llm.invoke`` — we log a compact summary (count + type-per-entry +
+    preview of last message) so logs stay readable but we can still
+    eyeball history drift."""
+    counts: dict[str, int] = {}
+    last_content = ""
+    for msg in messages:
+        role = type(msg).__name__.replace("Message", "").lower() or "?"
+        counts[role] = counts.get(role, 0) + 1
+        content = getattr(msg, "content", "") or ""
+        if content:
+            last_content = str(content)
+    preview = last_content[:_LLM_PREVIEW_CHARS]
+    if len(last_content) > _LLM_PREVIEW_CHARS:
+        preview += "…"
+    _LLM_LOGGER.info(
+        "invoke tenant=%s feature=%s iter=%d msgs=%s last=%r",
+        tenant_id,
+        feature_key,
+        iteration,
+        counts,
+        preview,
+    )
+
+
+def _log_llm_response(
+    *,
+    tenant_id: str,
+    feature_key: str,
+    iteration: int,
+    ai_msg: Any,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> None:
+    content = str(getattr(ai_msg, "content", "") or "")
+    preview = content[:_LLM_PREVIEW_CHARS]
+    if len(content) > _LLM_PREVIEW_CHARS:
+        preview += "…"
+    tool_calls = getattr(ai_msg, "tool_calls", None) or []
+    tool_names = [tc.get("name") for tc in tool_calls]
+    _LLM_LOGGER.info(
+        "response tenant=%s feature=%s iter=%d tokens=%d/%d tools=%s text=%r",
+        tenant_id,
+        feature_key,
+        iteration,
+        prompt_tokens,
+        completion_tokens,
+        tool_names,
+        preview,
+    )
 
 
 def _resolve_chat_feature_key(session: Session, tenant_id: str) -> str | None:
@@ -1120,20 +1264,42 @@ def execute_conversation_chat(
     tools_by_name = {t.name: t for t in tools}
 
     llm_with_tools = llm.bind_tools(tools)
-    messages: list[Any] = [
-        SystemMessage(content=system_text),
-        HumanMessage(content=user_text),
-    ]
+
+    # Build the message list with last N turns of history so the LLM
+    # can resolve references like "да" / "нет" / "this one" back to
+    # the thing we asked about in the previous turn. Without this,
+    # every turn starts from a blank slate and the bot loses context.
+    run_id = context.get("_run_id") or "run_unknown"
+    history_turns = _load_chat_history(session, run_id)
+    messages: list[Any] = [SystemMessage(content=system_text)]
+    # History rows come newest-first; feed the LLM chronologically.
+    for user_text_prev, bot_text_prev in reversed(history_turns):
+        messages.append(HumanMessage(content=user_text_prev))
+        messages.append(AIMessage(content=bot_text_prev))
+    messages.append(HumanMessage(content=user_text))
 
     # --- 4. Tool-call loop with per-call usage recording --------------
-    run_id = context.get("_run_id") or "run_unknown"
     final_ai: AIMessage | None = None
     for _iter in range(5):
+        _log_llm_invoke(
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            iteration=_iter,
+            messages=messages,
+        )
         ai_msg: AIMessage = llm_with_tools.invoke(messages)
         # Record LLM usage for this iteration.
         usage = getattr(ai_msg, "usage_metadata", None) or {}
         prompt_tokens = int(usage.get("input_tokens") or 0)
         completion_tokens = int(usage.get("output_tokens") or 0)
+        _log_llm_response(
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            iteration=_iter,
+            ai_msg=ai_msg,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
         if prompt_tokens or completion_tokens:
             try:
                 budget.record_llm_usage(

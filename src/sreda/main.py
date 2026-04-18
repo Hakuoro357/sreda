@@ -13,7 +13,10 @@ from sreda.features.app_registry import get_feature_registry
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(
+        settings.log_level,
+        feature_requests_log_path=settings.feature_requests_log_path,
+    )
     feature_registry = get_feature_registry()
 
     app = FastAPI(title=settings.app_name)

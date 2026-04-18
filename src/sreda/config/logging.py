@@ -2,14 +2,44 @@ import logging
 from logging.config import dictConfig
 
 
-def _build_config(level_no: int) -> dict:
+def _build_config(level_no: int, feature_requests_log_path: str | None = None) -> dict:
     # Rationale for the split handlers:
     #   * "default"  — app / uvicorn error logs, filtered by the
     #                  configured log level (WARNING on prod).
-    #   * "access"   — HTTP access log, ALWAYS at INFO regardless of
-    #                  the app log level. Access lines are forensic
-    #                  signal (spot 500-storms, missing webhooks) and
-    #                  cost nothing relative to the real traffic.
+    #   * "access"   — HTTP access log + other operationally-important
+    #                  signals (uvicorn lifecycle, LLM request trace),
+    #                  ALWAYS at INFO regardless of app log level.
+    #   * "feature_requests"  — dedicated file for user asks the bot
+    #                  can't fulfil; enabled when
+    #                  ``SREDA_FEATURE_REQUESTS_LOG_PATH`` is set.
+    handlers: dict = {
+        "default": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "level": level_no,
+        },
+        "access": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "level": logging.INFO,
+        },
+    }
+    feature_requests_logger: dict = {
+        "level": logging.INFO,
+        # Always emit to the general access stream so grep still works.
+        "handlers": ["access"],
+        "propagate": False,
+    }
+    if feature_requests_log_path:
+        handlers["feature_requests_file"] = {
+            "class": "logging.FileHandler",
+            "formatter": "default",
+            "level": logging.INFO,
+            "filename": feature_requests_log_path,
+            "encoding": "utf-8",
+        }
+        feature_requests_logger["handlers"] = ["access", "feature_requests_file"]
+
     return {
         "version": 1,
         "disable_existing_loggers": False,
@@ -19,18 +49,7 @@ def _build_config(level_no: int) -> dict:
                 "datefmt": "%Y-%m-%d %H:%M:%S",
             },
         },
-        "handlers": {
-            "default": {
-                "class": "logging.StreamHandler",
-                "formatter": "default",
-                "level": level_no,
-            },
-            "access": {
-                "class": "logging.StreamHandler",
-                "formatter": "default",
-                "level": logging.INFO,
-            },
-        },
+        "handlers": handlers,
         "root": {"level": level_no, "handlers": ["default"]},
         "loggers": {
             # uvicorn.* are pinned at INFO so server-lifecycle lines
@@ -42,11 +61,23 @@ def _build_config(level_no: int) -> dict:
             "uvicorn": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
             "uvicorn.error": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
             "uvicorn.access": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
+            # sreda.llm — request/response traces for the conversational
+            # handler. Pinned at INFO so traces survive prod WARNING.
+            # Troubleshooting "bot forgot context" / "LLM hallucinated"
+            # starts here; without this, each turn is opaque.
+            "sreda.llm": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
+            # sreda.feature_requests — user asks the bot can't fulfil.
+            # Dedicated file (when configured) for product input; also
+            # goes to the access stream so it's visible in the normal
+            # uvicorn log during dev.
+            "sreda.feature_requests": feature_requests_logger,
         },
     }
 
 
-def configure_logging(level: str = "INFO") -> None:
+def configure_logging(
+    level: str = "INFO", *, feature_requests_log_path: str | None = None
+) -> None:
     """Install a timestamped stream handler for the root logger and for
     uvicorn's named loggers, and mutate ``uvicorn.config.LOGGING_CONFIG``
     in place so uvicorn's own ``Server.serve()`` — which re-applies
@@ -58,7 +89,7 @@ def configure_logging(level: str = "INFO") -> None:
     """
     level_upper = level.upper()
     level_no = getattr(logging, level_upper, logging.INFO)
-    cfg = _build_config(level_no)
+    cfg = _build_config(level_no, feature_requests_log_path=feature_requests_log_path)
     dictConfig(cfg)
 
     # Mutate uvicorn's module-level config so its `Config.configure_logging`
