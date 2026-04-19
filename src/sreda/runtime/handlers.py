@@ -1332,12 +1332,15 @@ def execute_conversation_chat(
         )
 
         # Skip-onboarding heuristic: if the user already has core-tier
-        # memories they've been chatting long enough for a real profile
-        # to accumulate — nothing the flow would ask about is still
-        # unknown. Pivoting a live conversation to "как к тебе обращаться"
-        # feels like amnesia. Auto-complete instead; the flow stays
-        # exclusively for fresh subscribers with an empty slate.
-        if ob_state.get("status") in (STATUS_NOT_STARTED, STATUS_IN_PROGRESS):
+        # memories at the moment the flow is about to START, they've
+        # been chatting long enough for a real profile to accumulate —
+        # pivoting to "как к тебе обращаться" feels like amnesia. Only
+        # checked for STATUS_NOT_STARTED: once the flow is in_progress,
+        # every ``save_core_fact`` call by the LLM during onboarding
+        # would otherwise trip this check and auto-complete mid-flow
+        # (happened in 2026-04-19 pilot — addressing got answered, then
+        # turn 2 saved a memory, turn 3 saw 1 memory → complete).
+        if ob_state.get("status") == STATUS_NOT_STARTED:
             existing_core_memories = (
                 session.query(AssistantMemory)
                 .filter(
