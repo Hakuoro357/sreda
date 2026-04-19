@@ -41,6 +41,7 @@ from sreda.services.billing import (
 from sreda.services.budget import BudgetService, QuotaStatus
 from sreda.services.claim_lookup import ClaimLookupService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
+from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
 from sreda.services.llm import get_chat_llm
 
@@ -1338,7 +1339,14 @@ def execute_conversation_chat(
             iteration=_iter,
             messages=messages,
         )
-        ai_msg: AIMessage = llm_with_tools.invoke(messages)
+        with trace.step(f"llm.iter.{_iter}", model=model_name) as _trace_meta:
+            ai_msg: AIMessage = llm_with_tools.invoke(messages)
+            usage = getattr(ai_msg, "usage_metadata", None) or {}
+            _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
+            _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
+            _trace_meta["tools"] = [
+                tc.get("name") for tc in (getattr(ai_msg, "tool_calls", None) or [])
+            ]
         _record_and_log(ai_msg, iteration=_iter)
         messages.append(ai_msg)
         tool_calls = getattr(ai_msg, "tool_calls", None) or []
@@ -1387,7 +1395,14 @@ def execute_conversation_chat(
             messages=messages,
         )
         try:
-            final_ai = llm.invoke(messages)  # NOTE: no bind_tools
+            with trace.step(
+                f"llm.iter.{_MAX_TOOL_ITERATIONS}.summary", model=model_name
+            ) as _trace_meta:
+                final_ai = llm.invoke(messages)  # NOTE: no bind_tools
+                usage = getattr(final_ai, "usage_metadata", None) or {}
+                _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
+                _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
+                _trace_meta["forced"] = True
             _record_and_log(final_ai, iteration=_MAX_TOOL_ITERATIONS)
         except Exception:  # noqa: BLE001 — must not crash the turn
             logger.exception("chat: forced-summary invoke failed")

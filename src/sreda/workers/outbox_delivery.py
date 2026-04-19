@@ -30,6 +30,7 @@ from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.delivery_policy import DeliveryKind, decide_delivery
+from sreda.services import trace
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,16 @@ class OutboxDeliveryWorker:
             row.status = "failed"
             self.session.commit()
             return
+
+        # Extract end-to-end trace (if the uvicorn process stashed it
+        # when enqueuing). Worker emits the final block here after the
+        # send attempt so the block lands with the complete timing
+        # including delivery latency. Removing it from ``payload`` BEFORE
+        # the send means the user-facing Telegram message body doesn't
+        # carry our internal bookkeeping — only ``chat_id``/``text``/
+        # ``reply_markup``/``parse_mode`` keys are read downstream.
+        trace_payload = payload.pop("_trace", None)
+
         try:
             await self.telegram.send_message(
                 chat_id=payload.get("chat_id"),
@@ -155,10 +166,46 @@ class OutboxDeliveryWorker:
                             exc_info=True,
                         )
             row.status = "sent"
+            self._emit_trace(
+                trace_payload,
+                chat_id=payload.get("chat_id"),
+                status="ok",
+            )
         except TelegramDeliveryError:
             logger.warning("outbox delivery: telegram error on %s, keeping pending", row.id)
             row.status = "pending"
+            # Stays pending — worker retries next tick. Trace will be
+            # emitted then. Don't emit now or we'd fire the same block
+            # again on retry (idempotency is on a fresh context, which
+            # the worker reconstructs each time).
         except Exception:
             logger.exception("outbox delivery: unexpected error on %s", row.id)
             row.status = "failed"
+            self._emit_trace(
+                trace_payload,
+                chat_id=payload.get("chat_id"),
+                status="failed",
+            )
         self.session.commit()
+
+    @staticmethod
+    def _emit_trace(
+        trace_payload: dict | None, *, chat_id: object, status: str
+    ) -> None:
+        """Render the accumulated end-to-end trace block. No-op if the
+        outbox row wasn't tagged with a trace (reminders / EDS
+        notifications / other non-conversation rows)."""
+        if not trace_payload:
+            return
+        try:
+            ctx = trace.deserialize_from_outbox(trace_payload)
+            trace.emit_block(
+                ctx,
+                final_event_name="outbox.delivered",
+                final_meta={
+                    "chat": str(chat_id) if chat_id is not None else None,
+                    "status": status,
+                },
+            )
+        except Exception:  # noqa: BLE001 — trace must never kill delivery
+            logger.exception("outbox delivery: failed to emit trace block")

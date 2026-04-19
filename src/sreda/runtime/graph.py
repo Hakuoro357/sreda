@@ -49,6 +49,7 @@ from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.graph_state import AssistantGraphState
 from sreda.runtime.handlers import HANDLERS, ActionRuntimeError, RuntimeReply
 from sreda.runtime.policy import evaluate_policy
+from sreda.services import trace
 from sreda.services.billing import BillingService
 from sreda.services.embeddings import EmbeddingClient
 from sreda.services.privacy_guard import get_default_privacy_guard
@@ -304,6 +305,13 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
     now_utc = _utcnow()
 
     outbox_items: list[OutboxMessage] = []
+    # Only the FIRST outbox row carries the trace; 2nd+ replies in the
+    # same turn (rare for conversation.chat) reuse the same trace_id via
+    # the shared ContextVar but don't re-embed the buffer. Worker still
+    # emits on the first row's delivery — that's the one the user sees
+    # first anyway.
+    _trace_ctx = trace.current()
+    _trace_stashed = False
     for reply in replies:
         feature_key = reply.get("feature_key")
         skill_config = _find_skill_config(skill_configs, feature_key)
@@ -315,6 +323,15 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             now_utc=now_utc,
         )
 
+        payload: dict[str, Any] = {
+            "chat_id": action.external_chat_id,
+            "text": reply["text"],
+            "reply_markup": reply["reply_markup"],
+        }
+        if _trace_ctx is not None and not _trace_stashed:
+            payload["_trace"] = trace.serialize_for_outbox(_trace_ctx)
+            _trace_stashed = True
+
         outbox = OutboxMessage(
             id=f"out_{uuid4().hex[:24]}",
             tenant_id=run.tenant_id,
@@ -325,17 +342,17 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             is_interactive=is_interactive,
             status="pending",
             scheduled_at=decision.defer_until_utc,
-            payload_json=json.dumps(
-                {
-                    "chat_id": action.external_chat_id,
-                    "text": reply["text"],
-                    "reply_markup": reply["reply_markup"],
-                },
-                ensure_ascii=False,
-            ),
+            payload_json=json.dumps(payload, ensure_ascii=False),
         )
         session.add(outbox)
         session.flush()
+
+        trace.record(
+            "outbox.enqueued",
+            chars=len(reply["text"] or ""),
+            feature_key=feature_key,
+            decision=decision.kind.value,
+        )
 
         if decision.kind == DeliveryKind.drop:
             outbox.status = "muted"
@@ -358,6 +375,29 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             else:
                 outbox.status = "sent"
         outbox_items.append(outbox)
+
+    # Trace emission policy: delivery worker handles anything left in
+    # 'pending' (defer / retry). Rows that will NOT reach the worker
+    # (inline-sent, muted, missing telegram client) must be finalised
+    # here so the trace isn't lost.
+    if _trace_ctx is not None and outbox_items:
+        first = outbox_items[0]
+        if first.status == "sent":
+            trace.emit_block(
+                _trace_ctx,
+                final_event_name="outbox.delivered",
+                final_meta={
+                    "chat": action.external_chat_id,
+                    "status": "ok",
+                    "path": "inline",
+                },
+            )
+        elif first.status == "muted":
+            trace.emit_block(
+                _trace_ctx,
+                final_event_name="outbox.muted",
+                final_meta={"status": "muted"},
+            )
 
     now = _utcnow()
     job.status = "completed"
@@ -395,6 +435,15 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
     # Error replies are always interactive (they're responses to the
     # user's own command that failed) — bypass quiet-hours/mute policy
     # and deliver inline.
+    _trace_ctx = trace.current()
+    error_payload: dict[str, Any] = {
+        "chat_id": action.external_chat_id,
+        "text": sanitized_message,
+        "reply_markup": reply_markup,
+    }
+    if _trace_ctx is not None:
+        error_payload["_trace"] = trace.serialize_for_outbox(_trace_ctx)
+
     outbox = OutboxMessage(
         id=f"out_{uuid4().hex[:24]}",
         tenant_id=run.tenant_id,
@@ -403,17 +452,16 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
         channel_type="telegram",
         is_interactive=action.inbound_message_id is not None,
         status="pending",
-        payload_json=json.dumps(
-            {
-                "chat_id": action.external_chat_id,
-                "text": sanitized_message,
-                "reply_markup": reply_markup,
-            },
-            ensure_ascii=False,
-        ),
+        payload_json=json.dumps(error_payload, ensure_ascii=False),
     )
     session.add(outbox)
     session.flush()
+
+    trace.record(
+        "outbox.enqueued",
+        chars=len(sanitized_message or ""),
+        error_code=error_code,
+    )
 
     if telegram is not None:
         try:
@@ -427,6 +475,20 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
             outbox.status = "pending"
     outbox_ids.append(outbox.id)
     outbox_statuses.append(outbox.status)
+
+    # If delivered inline, emit the trace here (worker won't reprocess
+    # a 'sent' row). If still 'pending' — worker will emit on retry.
+    if _trace_ctx is not None and outbox.status == "sent":
+        trace.emit_block(
+            _trace_ctx,
+            final_event_name="outbox.delivered",
+            final_meta={
+                "chat": action.external_chat_id,
+                "status": "error",
+                "error_code": error_code,
+                "path": "inline",
+            },
+        )
 
     now = _utcnow()
     job.status = "failed"

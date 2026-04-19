@@ -131,6 +131,13 @@ class Settings(BaseSettings):
     # logger (можно грепать по имени ``sreda.feature_requests``).
     feature_requests_log_path: str | None = None
 
+    # Trace log: per-turn multi-line timing block for user conversations
+    # (entry → voice → LLM iters → outbox → delivery). One block per
+    # completed turn, written by ``services.trace.emit_block``. Opt-in
+    # via ``SREDA_TRACE_LOG_PATH``; если None — sreda.trace пишет только
+    # в общий access stream без отдельного файла.
+    trace_log_path: str | None = None
+
     # Per-IP rate limits for public endpoints. These are defence-in-depth
     # on top of any reverse-proxy limiting that might be in front: they
     # guarantee a floor of protection for single-process deployments and

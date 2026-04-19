@@ -9,6 +9,7 @@ from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.dispatcher import dispatch_telegram_action
 from sreda.runtime.executor import ActionRuntimeService
+from sreda.services import trace
 from sreda.services.agent_capabilities import has_voice_access
 from sreda.services.budget import BudgetService
 from sreda.services.onboarding import TelegramOnboardingResult, build_welcome_message
@@ -146,30 +147,45 @@ async def _maybe_transcribe_voice(
         await _send_error("Сервис распознавания речи не настроен. Обратитесь к администратору.")
         return None
 
-    # 5. Download audio
-    file_id = voice.get("file_id")
-    if not file_id:
-        await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
-        return None
+    # 5 + 6: Download audio + transcribe. Wrapped in one trace step —
+    # download-vs-recognize latency is usually dwarfed by the recognize
+    # call, so splitting them into two steps adds log noise without
+    # actionable insight. If we ever need per-phase timing, the step
+    # block can be split.
+    provider = settings.speech_provider or "unknown"
+    with trace.step("voice.transcribe", provider=provider) as _trace_meta:
+        # 5. Download audio
+        file_id = voice.get("file_id")
+        if not file_id:
+            await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
+            _trace_meta["status"] = "no_file_id"
+            return None
 
-    try:
-        file_info = await telegram_client.get_file_info(str(file_id))
-        file_path = file_info.get("file_path")
-        if not file_path:
-            raise TelegramDeliveryError("file_path missing in getFile response")
-        audio_bytes = await telegram_client.download_file(str(file_path))
-    except TelegramDeliveryError as exc:
-        logger.warning("Voice download failed: %s", exc)
-        await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
-        return None
+        try:
+            file_info = await telegram_client.get_file_info(str(file_id))
+            file_path = file_info.get("file_path")
+            if not file_path:
+                raise TelegramDeliveryError("file_path missing in getFile response")
+            audio_bytes = await telegram_client.download_file(str(file_path))
+        except TelegramDeliveryError as exc:
+            logger.warning("Voice download failed: %s", exc)
+            await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
+            _trace_meta["status"] = "download_failed"
+            return None
 
-    # 6. Transcribe
-    try:
-        text = await recognizer.recognize(audio_bytes)
-    except SpeechRecognitionError as exc:
-        logger.warning("Speech recognition failed: %s", exc)
-        await _send_error("Не удалось расшифровать сообщение. Попробуйте ещё раз.")
-        return None
+        _trace_meta["bytes_in"] = len(audio_bytes)
+
+        # 6. Transcribe
+        try:
+            text = await recognizer.recognize(audio_bytes)
+        except SpeechRecognitionError as exc:
+            logger.warning("Speech recognition failed: %s", exc)
+            await _send_error("Не удалось расшифровать сообщение. Попробуйте ещё раз.")
+            _trace_meta["status"] = "recognize_failed"
+            return None
+
+        _trace_meta["chars_out"] = len(text)
+        _trace_meta["status"] = "ok"
 
     # 7. Record usage (1 credit per message)
     budget.record_api_usage(

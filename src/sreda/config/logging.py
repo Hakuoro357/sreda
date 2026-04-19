@@ -2,7 +2,11 @@ import logging
 from logging.config import dictConfig
 
 
-def _build_config(level_no: int, feature_requests_log_path: str | None = None) -> dict:
+def _build_config(
+    level_no: int,
+    feature_requests_log_path: str | None = None,
+    trace_log_path: str | None = None,
+) -> dict:
     # Rationale for the split handlers:
     #   * "default"  — app / uvicorn error logs, filtered by the
     #                  configured log level (WARNING on prod).
@@ -12,6 +16,9 @@ def _build_config(level_no: int, feature_requests_log_path: str | None = None) -
     #   * "feature_requests"  — dedicated file for user asks the bot
     #                  can't fulfil; enabled when
     #                  ``SREDA_FEATURE_REQUESTS_LOG_PATH`` is set.
+    #   * "trace"    — dedicated file for end-to-end per-turn timing
+    #                  blocks; enabled when ``SREDA_TRACE_LOG_PATH`` is
+    #                  set. Admin UI surfaces it as the default log.
     handlers: dict = {
         "default": {
             "class": "logging.StreamHandler",
@@ -39,6 +46,25 @@ def _build_config(level_no: int, feature_requests_log_path: str | None = None) -
             "encoding": "utf-8",
         }
         feature_requests_logger["handlers"] = ["access", "feature_requests_file"]
+
+    trace_logger: dict = {
+        "level": logging.INFO,
+        "handlers": ["access"],
+        "propagate": False,
+    }
+    if trace_log_path:
+        handlers["trace_file"] = {
+            "class": "logging.FileHandler",
+            # trace blocks carry their own timestamp in the header line,
+            # so the formatter's leading ``asctime`` is redundant — but
+            # keeping a consistent format across log files is more
+            # useful for admin-UI scanning than saving 20 bytes/block.
+            "formatter": "default",
+            "level": logging.INFO,
+            "filename": trace_log_path,
+            "encoding": "utf-8",
+        }
+        trace_logger["handlers"] = ["access", "trace_file"]
 
     return {
         "version": 1,
@@ -71,12 +97,19 @@ def _build_config(level_no: int, feature_requests_log_path: str | None = None) -
             # goes to the access stream so it's visible in the normal
             # uvicorn log during dev.
             "sreda.feature_requests": feature_requests_logger,
+            # sreda.trace — end-to-end per-turn timing blocks
+            # (entry → voice → LLM iters → outbox → delivery).
+            # Block-per-turn, one logger.info call = one atomic block.
+            "sreda.trace": trace_logger,
         },
     }
 
 
 def configure_logging(
-    level: str = "INFO", *, feature_requests_log_path: str | None = None
+    level: str = "INFO",
+    *,
+    feature_requests_log_path: str | None = None,
+    trace_log_path: str | None = None,
 ) -> None:
     """Install a timestamped stream handler for the root logger and for
     uvicorn's named loggers, and mutate ``uvicorn.config.LOGGING_CONFIG``
@@ -89,7 +122,11 @@ def configure_logging(
     """
     level_upper = level.upper()
     level_no = getattr(logging, level_upper, logging.INFO)
-    cfg = _build_config(level_no, feature_requests_log_path=feature_requests_log_path)
+    cfg = _build_config(
+        level_no,
+        feature_requests_log_path=feature_requests_log_path,
+        trace_log_path=trace_log_path,
+    )
     dictConfig(cfg)
 
     # Mutate uvicorn's module-level config so its `Config.configure_logging`

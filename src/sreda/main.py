@@ -16,6 +16,7 @@ def create_app() -> FastAPI:
     configure_logging(
         settings.log_level,
         feature_requests_log_path=settings.feature_requests_log_path,
+        trace_log_path=settings.trace_log_path,
     )
     feature_registry = get_feature_registry()
 

@@ -9,6 +9,7 @@ from sreda.config.settings import get_settings
 from sreda.db.session import get_db_session
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.schemas.api import TelegramWebhookAccepted
+from sreda.services import trace
 from sreda.services.inbound_messages import persist_telegram_inbound_event
 from sreda.services.onboarding import ensure_telegram_user_bundle
 from sreda.services.telegram_bot import handle_telegram_interaction
@@ -63,6 +64,37 @@ async def telegram_webhook(
     settings = get_settings()
     if settings.telegram_bot_token and onboarding.chat_id:
         telegram_client = TelegramClient(settings.telegram_bot_token)
+
+        # Begin an end-to-end trace for this turn. Steps recorded
+        # downstream (voice.transcribe, llm.iter.N, outbox.enqueued,
+        # outbox.delivered) find this context via a ContextVar and
+        # append to it. The block is emitted by the delivery worker
+        # after the reply lands in Telegram (happy path); if the
+        # handler never writes an outbox row, we emit here so the
+        # trace isn't lost.
+        trace_ctx = trace.start_trace(
+            user_id=onboarding.user_id,
+            tenant_id=onboarding.tenant_id,
+            channel="telegram",
+        )
+        message = payload.get("message") if isinstance(payload, dict) else None
+        if isinstance(message, dict):
+            if isinstance(message.get("voice"), dict):
+                voice = message["voice"]
+                trace.record(
+                    "webhook.received",
+                    type="voice",
+                    voice_duration_s=voice.get("duration"),
+                )
+            elif message.get("text"):
+                trace.record("webhook.received", type="text")
+            else:
+                trace.record("webhook.received", type="other")
+        elif isinstance(payload, dict) and payload.get("callback_query"):
+            trace.record("webhook.received", type="callback")
+        else:
+            trace.record("webhook.received", type="unknown")
+
         try:
             await handle_telegram_interaction(
                 session,
@@ -74,4 +106,13 @@ async def telegram_webhook(
             )
         except TelegramDeliveryError as exc:
             logger.warning("Telegram delivery failed during webhook handling: %s", exc)
+        finally:
+            # If the handler DID enqueue an outbox row, the delivery
+            # worker will emit the block once it lands in Telegram.
+            # Otherwise emit here so /help-style inline replies and
+            # early-return paths still produce a trace record.
+            if trace_ctx is not None and not any(
+                e.step == "outbox.enqueued" for e in trace_ctx.events
+            ):
+                trace.emit_block(trace_ctx)
     return TelegramWebhookAccepted(ok=True, request_id=result.inbound_message_id)

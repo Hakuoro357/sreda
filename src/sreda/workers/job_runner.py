@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from sreda.config.logging import configure_logging
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
 from sreda.features.app_registry import get_feature_registry
@@ -73,8 +74,21 @@ async def run_job_loop_async() -> None:
 
 
 def run_job_loop() -> None:
-    """Entry point for the worker process."""
+    """Entry point for the worker process.
+
+    Configures logging up-front so ``sreda.trace`` / ``sreda.feature_requests``
+    etc. get their dedicated file handlers in this process too (the
+    trace delivery event is emitted from the OutboxDeliveryWorker,
+    which lives here, not in the uvicorn process). Without this call,
+    we inherit Python's default root-logger config and dedicated log
+    files stay empty.
+    """
     settings = get_settings()
+    configure_logging(
+        settings.log_level,
+        feature_requests_log_path=settings.feature_requests_log_path,
+        trace_log_path=settings.trace_log_path,
+    )
     if settings.job_poll_interval_seconds <= 0:
         # Legacy one-shot mode used by cron-driven deployments.
         asyncio.run(process_pending_jobs_once())
