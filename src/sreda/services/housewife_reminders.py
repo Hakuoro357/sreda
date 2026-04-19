@@ -25,11 +25,23 @@ def _utcnow() -> datetime:
 
 
 def _coerce_utc(value: datetime) -> datetime:
-    """Normalise tz-naive datetimes to UTC. SQLite drivers occasionally
-    strip tzinfo on round-trip even when the column is timezone-aware."""
+    """Normalise any datetime to UTC.
+
+    Rules:
+      * naive → assume UTC (tenant contract: all DB values are UTC).
+      * aware non-UTC → convert to UTC (``astimezone``).
+      * aware UTC → no-op.
+
+    Why ``astimezone`` matters: SQLAlchemy + SQLite w/ DateTime(timezone=True)
+    strips tzinfo on store. If we hand it an aware MSK datetime
+    ``13:30+03:00`` without converting, SQLite stores the local portion
+    ``13:30`` — which the worker later compares against ``now(UTC)``
+    and (correctly) considers in the future. Result: reminders never
+    fire. Always convert FIRST so stored string is genuinely UTC.
+    """
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
-    return value
+    return value.astimezone(timezone.utc)
 
 
 @dataclass(slots=True)

@@ -52,18 +52,31 @@ def build_housewife_tools(
         про кружок"). Always resolve relative phrases ("через час",
         "завтра") to an explicit ISO-8601 datetime before calling.
 
+        ВАЖНО: все времена хранятся в **UTC**. User's local time must be
+        converted. Moscow = UTC+3, so 16:00 MSK = 13:00 UTC.
+
         Args:
             title: Short reminder text shown to the user (под 200
                 chars). Use imperative mood, e.g. "Купить молоко",
                 "Сказать Пете про кружок".
-            trigger_iso: When to fire — ISO-8601 with timezone offset,
-                e.g. "2026-04-17T19:30:00+03:00". For one-shot reminders
-                this IS the fire time. For recurring ones, it's the
-                anchor (DTSTART).
+            trigger_iso: ISO-8601 datetime. Either:
+                • with explicit offset: "2026-04-17T19:30:00+03:00" —
+                  will be converted to UTC internally, safest choice.
+                • naive (no offset): "2026-04-17T16:30:00" — treated
+                  as UTC. Use ONLY if you've already done the MSK→UTC
+                  math yourself. For user convenience prefer the first
+                  form.
             recurrence_rule: Optional RFC-5545 RRULE string for
-                recurring reminders. Examples:
-                - Weekly every Tuesday at 16:00 MSK: "FREQ=WEEKLY;BYDAY=TU;BYHOUR=16;BYMINUTE=0"
-                - Daily at 9am: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+                recurring reminders. BYHOUR / BYMINUTE MUST be in UTC
+                because rrulestr doesn't understand timezones embedded
+                in the rule itself — it uses the dtstart's tz. Examples:
+                - User wants каждый вторник 16:00 MSK →
+                  "FREQ=WEEKLY;BYDAY=TU;BYHOUR=13;BYMINUTE=0"  ← UTC!
+                - User wants каждый день в 9:00 MSK →
+                  "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"  ← UTC!
+                Common MSK→UTC shifts: subtract 3 hours (wrap mod 24
+                when crossing midnight — e.g. 01:00 MSK = 22:00 UTC of
+                previous day, still fine for BYHOUR=22).
                 Leave None for a one-shot reminder.
 
         Returns short status string with the reminder id.
@@ -73,8 +86,15 @@ def build_housewife_tools(
         except ValueError:
             return f"error: cannot parse trigger_iso={trigger_iso!r}"
 
+        # Always work in UTC. Naive ISO is ambiguous — treat as already-UTC
+        # (the docstring says so) rather than guessing user TZ. Aware ISO
+        # with any offset gets converted to UTC so downstream compares are
+        # apples-to-apples. See services/housewife_reminders._coerce_utc
+        # for the SQLite reason this matters.
         if trigger_at.tzinfo is None:
             trigger_at = trigger_at.replace(tzinfo=timezone.utc)
+        else:
+            trigger_at = trigger_at.astimezone(timezone.utc)
 
         try:
             reminder = service.schedule(

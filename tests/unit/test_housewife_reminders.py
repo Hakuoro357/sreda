@@ -175,3 +175,59 @@ def test_list_active_excludes_fired_and_cancelled() -> None:
     active = service.list_active(tenant_id="tenant_1")
 
     assert [r.id for r in active] == [rem1.id]
+
+
+# ---------------------------------------------------------------------------
+# Timezone regression (2026-04-19): reminders scheduled with an explicit
+# offset like +03:00 were stored as local clock values instead of UTC,
+# so due_now() never matched. Fix: _coerce_utc now astimezone's to UTC.
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_utc_converts_aware_non_utc() -> None:
+    from datetime import timezone as tz_mod
+
+    msk = tz_mod(timedelta(hours=3))
+    aware_msk = datetime(2026, 4, 19, 13, 30, tzinfo=msk)
+
+    converted = _coerce_utc(aware_msk)
+
+    assert converted.tzinfo is UTC
+    assert converted.hour == 10  # 13:30 MSK = 10:30 UTC
+
+
+def test_coerce_utc_noop_on_utc_aware() -> None:
+    aware_utc = datetime(2026, 4, 19, 10, 30, tzinfo=UTC)
+    assert _coerce_utc(aware_utc) == aware_utc
+
+
+def test_coerce_utc_tags_naive_as_utc() -> None:
+    naive = datetime(2026, 4, 19, 10, 30)
+    converted = _coerce_utc(naive)
+    assert converted.tzinfo is UTC
+    assert converted.hour == 10
+
+
+def test_schedule_with_msk_offset_fires_when_utc_due() -> None:
+    """Regression: MSK-offset reminder must become due at the correct
+    UTC instant. Stores 13:30 MSK; worker at 12:30 UTC (=15:30 MSK)
+    must see it as due because 10:30 UTC < 12:30 UTC."""
+    from datetime import timezone as tz_mod
+
+    msk = tz_mod(timedelta(hours=3))
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Сделать оливье",
+        trigger_at=datetime(2026, 4, 19, 13, 30, tzinfo=msk),  # 10:30 UTC
+    )
+
+    # Simulated "now" at 12:30 UTC (=15:30 MSK, after the scheduled time).
+    now_utc = datetime(2026, 4, 19, 12, 30, tzinfo=UTC)
+    due = service.due_now(now=now_utc)
+
+    assert len(due) == 1
+    assert due[0].title == "Сделать оливье"
