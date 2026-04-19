@@ -1312,21 +1312,14 @@ def execute_conversation_chat(
     settings = get_settings()
     model_name = getattr(llm, "model_name", None) or settings.mimo_chat_model
 
-    system_text = (
-        _CONVERSATION_SYSTEM_PROMPT
-        + "\n\n[ТЕКУЩЕЕ ВРЕМЯ]\n"
-        + _format_time_context_for_prompt(profile)
-        + "\n\n[ПРОФИЛЬ]\n"
-        + _format_profile_for_prompt(profile)
-        + "\n\n[ПАМЯТЬ — релевантные факты]\n"
-        + _format_memories_for_prompt(memories)
-    )
-
-    # Onboarding for Помощник домохозяйки — inject the [ОНБОРДИНГ]
-    # block ONLY while the flow is in_progress. Once complete, the
-    # block is omitted and the chat resumes normal behaviour.
+    # Onboarding for Помощник домохозяйки — compute state first so the
+    # block can go at the TOP of the system prompt. Leaving it at the
+    # bottom buried it under [ПАМЯТЬ]; LLM read known facts and decided
+    # the flow was already done. First thing model reads = what it acts on.
     onboarding_follow_up_needed = False
+    onboarding_prompt_block: str | None = None
     if feature_key == "housewife_assistant" and user_id:
+        from sreda.db.models.memory import AssistantMemory
         from sreda.services.housewife_onboarding import (
             HousewifeOnboardingService,
             STATUS_IN_PROGRESS,
@@ -1337,17 +1330,60 @@ def execute_conversation_chat(
         ob_state = ob_service.get_raw_state(
             tenant_id=action.tenant_id, user_id=user_id
         )
+
+        # Skip-onboarding heuristic: if the user already has core-tier
+        # memories they've been chatting long enough for a real profile
+        # to accumulate — nothing the flow would ask about is still
+        # unknown. Pivoting a live conversation to "как к тебе обращаться"
+        # feels like amnesia. Auto-complete instead; the flow stays
+        # exclusively for fresh subscribers with an empty slate.
+        if ob_state.get("status") in (STATUS_NOT_STARTED, STATUS_IN_PROGRESS):
+            existing_core_memories = (
+                session.query(AssistantMemory)
+                .filter(
+                    AssistantMemory.tenant_id == action.tenant_id,
+                    AssistantMemory.user_id == user_id,
+                    AssistantMemory.tier == "core",
+                )
+                .count()
+            )
+            if existing_core_memories > 0:
+                ob_state = ob_service.mark_complete(
+                    tenant_id=action.tenant_id, user_id=user_id
+                )
+
         if ob_state.get("status") == STATUS_NOT_STARTED:
-            # User wrote first → bot starts the flow on this very turn.
             ob_state = ob_service.start(
                 tenant_id=action.tenant_id, user_id=user_id
             )
         if ob_state.get("status") == STATUS_IN_PROGRESS:
-            system_text += (
-                "\n\n[ОНБОРДИНГ]\n"
-                + ob_service.format_for_prompt(ob_state)
-            )
+            onboarding_prompt_block = ob_service.format_for_prompt(ob_state)
             onboarding_follow_up_needed = True
+
+    parts: list[str] = []
+    if onboarding_prompt_block:
+        # At the very top — above even the base persona prompt. The
+        # base prompt tells the model how to be a helpful assistant;
+        # the onboarding block overrides the priority of this turn.
+        parts.append(
+            "[ПРИОРИТЕТ ЭТОГО ХОДА — ОНБОРДИНГ]\n"
+            "Ты ВЕДЁШЬ первичное знакомство. Что бы пользователь ни "
+            "написал сейчас (привет / да / вопрос), твой ПЕРВЫЙ "
+            "приоритет в этом ответе — задать один короткий вопрос по "
+            "текущей теме онбординга и, если применимо, коротко "
+            "отреагировать на реплику пользователя. НЕ отвечай так, "
+            "будто онбординг закончен, пока ниже написано что он "
+            "in_progress. Профиль и память показываются только как "
+            "справочный контекст — НЕ основание считать тему решённой.\n\n"
+            + onboarding_prompt_block
+        )
+    parts.append(_CONVERSATION_SYSTEM_PROMPT)
+    parts.append("[ТЕКУЩЕЕ ВРЕМЯ]\n" + _format_time_context_for_prompt(profile))
+    parts.append("[ПРОФИЛЬ]\n" + _format_profile_for_prompt(profile))
+    parts.append(
+        "[ПАМЯТЬ — релевантные факты]\n" + _format_memories_for_prompt(memories)
+    )
+    system_text = "\n\n".join(parts)
 
     tools = build_memory_tools(
         session=session,
