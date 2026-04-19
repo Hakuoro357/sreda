@@ -215,11 +215,17 @@ def test_telegram_webhook_handles_status_command(
 
     response = client.post("/webhooks/telegram/sreda", json=payload)
 
+    from sreda.services.ack_messages import all_phrases
+
     assert response.status_code == 202
-    assert len(sent_messages) == 1
-    assert sent_messages[0]["chat_id"] == EXISTING_CHAT_ID
-    assert "Мой статус" in sent_messages[0]["text"]
-    assert "Сумма к оплате: 0 ₽" in sent_messages[0]["text"]
+    # Two messages now: the fast ack (index 0) + real reply (index 1).
+    # Ack is UX sugar — filter it out and assert on the real response.
+    assert len(sent_messages) == 2
+    assert sent_messages[0]["text"] in all_phrases()
+    real_reply = sent_messages[1]
+    assert real_reply["chat_id"] == EXISTING_CHAT_ID
+    assert "Мой статус" in real_reply["text"]
+    assert "Сумма к оплате: 0 ₽" in real_reply["text"]
 
     session = get_session_factory()()
     try:
@@ -659,10 +665,15 @@ def test_telegram_webhook_handles_claim_lookup_command(
 
     response = client.post("/webhooks/telegram/sreda", json=payload)
 
+    from sreda.services.ack_messages import all_phrases
+
     assert response.status_code == 202
-    assert len(sent_messages) == 1
-    assert "Заявка #6230173" in sent_messages[0]["text"]
-    assert "Статус: В работе" in sent_messages[0]["text"]
+    # Fast ack (index 0) + real claim reply (index 1).
+    assert len(sent_messages) == 2
+    assert sent_messages[0]["text"] in all_phrases()
+    real_reply = sent_messages[1]
+    assert "Заявка #6230173" in real_reply["text"]
+    assert "Статус: В работе" in real_reply["text"]
 
     session = get_session_factory()()
     try:

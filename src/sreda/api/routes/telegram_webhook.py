@@ -10,6 +10,7 @@ from sreda.db.session import get_db_session
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.schemas.api import TelegramWebhookAccepted
 from sreda.services import trace
+from sreda.services.ack_messages import pick_ack
 from sreda.services.inbound_messages import persist_telegram_inbound_event
 from sreda.services.onboarding import ensure_telegram_user_bundle
 from sreda.services.telegram_bot import handle_telegram_interaction
@@ -78,22 +79,52 @@ async def telegram_webhook(
             channel="telegram",
         )
         message = payload.get("message") if isinstance(payload, dict) else None
+        message_type = "unknown"
         if isinstance(message, dict):
             if isinstance(message.get("voice"), dict):
                 voice = message["voice"]
+                message_type = "voice"
                 trace.record(
                     "webhook.received",
                     type="voice",
                     voice_duration_s=voice.get("duration"),
                 )
             elif message.get("text"):
+                message_type = "text"
                 trace.record("webhook.received", type="text")
             else:
+                message_type = "other"
                 trace.record("webhook.received", type="other")
         elif isinstance(payload, dict) and payload.get("callback_query"):
+            message_type = "callback"
             trace.record("webhook.received", type="callback")
         else:
             trace.record("webhook.received", type="unknown")
+
+        # Fast acknowledgement. A one-word reply ("работаю", "секунду",
+        # ...) goes out immediately so the user sees the bot react while
+        # the real turn is still crunching voice / LLM / outbox. Sent
+        # DIRECTLY via the Telegram client — outbox adds ~1s worker-
+        # poll latency which defeats the purpose. Skipped for button
+        # taps (already feel instant) and new-user flow (they're
+        # getting a welcome screen, not a question to ack).
+        if (
+            message_type in ("text", "voice")
+            and not onboarding.is_new_user
+        ):
+            ack_text = pick_ack()
+            with trace.step("ack.sent", phrase=ack_text) as _ack_meta:
+                try:
+                    await telegram_client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=ack_text,
+                    )
+                    _ack_meta["status"] = "ok"
+                except TelegramDeliveryError as exc:
+                    # UX sugar — don't fail the turn if ack can't be
+                    # delivered. The real reply path is independent.
+                    logger.warning("ack delivery failed: %s", exc)
+                    _ack_meta["status"] = "failed"
 
         try:
             await handle_telegram_interaction(
