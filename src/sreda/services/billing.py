@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import ceil
@@ -15,7 +16,9 @@ from sreda.db.models.billing import (
     TenantSubscription,
 )
 from sreda.db.models.connect import TenantEDSAccount
-from sreda.db.models.core import TenantFeature
+from sreda.db.models.core import TenantFeature, User
+
+logger = logging.getLogger(__name__)
 
 STATUS_CALLBACK = "billing:status"
 SUBSCRIPTIONS_CALLBACK = "billing:subscriptions"
@@ -1072,6 +1075,7 @@ class BillingService:
         sub.next_cycle_quantity = 1
         sub.updated_at = current_time
         self._ensure_feature_enabled(tenant_id, plan.feature_key, True)
+        self._schedule_onboarding_if_needed(tenant_id, plan.feature_key)
         self.session.commit()
         if plan.price_rub == 0:
             message_text = f"{plan.title} подключено."
@@ -1445,6 +1449,46 @@ class BillingService:
             self.session.add(feature)
             return
         feature.enabled = enabled
+
+    def _schedule_onboarding_if_needed(
+        self, tenant_id: str, feature_key: str
+    ) -> None:
+        """For skills with a first-contact onboarding flow (currently only
+        housewife_assistant), schedule a kickoff so the bot can proactively
+        introduce itself ~5 minutes after subscription if the user doesn't
+        write first. Idempotent — if onboarding is already in progress or
+        complete, this is a no-op.
+
+        We pick the tenant's first User row as the target. For the current
+        single-user-per-Telegram-account model this is unambiguous; when
+        the platform grows to multi-user tenants, the caller will need to
+        pass user_id explicitly.
+        """
+        from sreda.services.housewife_onboarding import (
+            HOUSEWIFE_FEATURE_KEY,
+            HousewifeOnboardingService,
+        )
+
+        if feature_key != HOUSEWIFE_FEATURE_KEY:
+            return
+        user = (
+            self.session.query(User)
+            .filter(User.tenant_id == tenant_id)
+            .order_by(User.id.asc())
+            .first()
+        )
+        if user is None:
+            # No user bound to this tenant yet — onboarding will be
+            # initialised naturally on the user's first message.
+            return
+        try:
+            HousewifeOnboardingService(self.session).schedule_kickoff(
+                tenant_id=tenant_id,
+                user_id=user.id,
+                delay_minutes=5,
+            )
+        except Exception:  # noqa: BLE001 — onboarding is additive; never block a subscription
+            logger.exception("failed to schedule housewife onboarding kickoff")
 
     @staticmethod
     def _is_subscription_active(subscription: TenantSubscription | None, now: datetime) -> bool:

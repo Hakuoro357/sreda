@@ -17,6 +17,10 @@ from typing import Any
 from langchain_core.tools import tool as lc_tool
 from sqlalchemy.orm import Session
 
+from sreda.services.housewife_onboarding import (
+    TOPIC_DESCRIPTIONS,
+    HousewifeOnboardingService,
+)
 from sreda.services.housewife_reminders import HousewifeReminderService
 
 logger = logging.getLogger(__name__)
@@ -150,4 +154,118 @@ def build_housewife_tools(
             return "error: internal"
         return "ok:cancelled" if ok else f"error: reminder {reminder_id!r} not found"
 
-    return [schedule_reminder, list_reminders, cancel_reminder]
+    # ----------------------------------------------------------------
+    # Onboarding tools. Only meaningful during the first-contact flow;
+    # the LLM is told (via the [ОНБОРДИНГ] prompt block) when to use
+    # them. Outside onboarding the tools are still callable but the
+    # underlying service returns a neutral state.
+    # ----------------------------------------------------------------
+    onboarding_service = HousewifeOnboardingService(session)
+
+    @lc_tool
+    def onboarding_answered(topic: str, summary: str) -> str:
+        """Mark an onboarding topic as answered and advance to the next one.
+
+        Call this when the user has given you a meaningful answer to the
+        current onboarding topic (see [ОНБОРДИНГ] in the system prompt
+        for which topic is current). The ``summary`` is what will be
+        stored — a 1–2 sentence paraphrase in the user's own words.
+
+        Args:
+            topic: One of: addressing, self_intro, family, diet, routine,
+                pain_point. Match the [ОНБОРДИНГ] block's current_topic.
+            summary: The answer in 1–2 sentences, preserving user wording.
+                For the ``addressing`` topic — just the name.
+
+        Returns short status string.
+        """
+        topic_norm = (topic or "").strip().lower()
+        if topic_norm not in TOPIC_DESCRIPTIONS:
+            return f"error: unknown topic {topic!r}"
+        if not user_id:
+            return "error: no user_id context"
+        text = (summary or "").strip()
+        if not text:
+            return "error: empty summary"
+        try:
+            state = onboarding_service.mark_answered(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                topic=topic_norm,
+                summary=text,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("onboarding_answered failed")
+            return "error: internal"
+        next_topic = state.get("current_topic") or "none"
+        return f"ok:answered:{topic_norm}:next={next_topic}:status={state.get('status')}"
+
+    @lc_tool
+    def onboarding_deferred(topic: str, reason: str) -> str:
+        """Mark an onboarding topic as deferred and advance to the next one.
+
+        Call this when the user explicitly wants to skip the current topic
+        ("потом", "не сейчас", "пропусти"). First skip keeps the topic in
+        a retry queue; second skip on the same topic makes the skip
+        permanent.
+
+        Args:
+            topic: One of: addressing, self_intro, family, diet, routine,
+                pain_point.
+            reason: Short explanation of why skipping — for audit.
+
+        Returns short status string.
+        """
+        topic_norm = (topic or "").strip().lower()
+        if topic_norm not in TOPIC_DESCRIPTIONS:
+            return f"error: unknown topic {topic!r}"
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            state = onboarding_service.mark_deferred(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                topic=topic_norm,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("onboarding_deferred failed")
+            return "error: internal"
+        next_topic = state.get("current_topic") or "none"
+        topic_state = (
+            state.get("topics", {}).get(topic_norm, {}).get("state") or "?"
+        )
+        return (
+            f"ok:deferred:{topic_norm}:topic_state={topic_state}:"
+            f"next={next_topic}:status={state.get('status')}"
+        )
+
+    @lc_tool
+    def onboarding_complete() -> str:
+        """Explicitly mark onboarding complete.
+
+        Normally the flow auto-completes when all topics are closed
+        (answered or permanently skipped), so you don't have to call
+        this. Use only if user clearly says "всё, хватит, мне надоело"
+        before natural completion.
+
+        Returns short status string.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            state = onboarding_service.mark_complete(
+                tenant_id=tenant_id, user_id=user_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("onboarding_complete failed")
+            return "error: internal"
+        return f"ok:complete:status={state.get('status')}"
+
+    return [
+        schedule_reminder,
+        list_reminders,
+        cancel_reminder,
+        onboarding_answered,
+        onboarding_deferred,
+        onboarding_complete,
+    ]

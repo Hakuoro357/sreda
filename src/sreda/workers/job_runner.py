@@ -10,6 +10,9 @@ from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.telegram.client import TelegramClient
 from sreda.runtime.executor import ActionRuntimeService
 from sreda.services.eds_account_verification import EDSAccountVerificationService
+from sreda.workers.housewife_onboarding_worker import (
+    HousewifeOnboardingKickoffWorker,
+)
 from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 from sreda.workers.outbox_delivery import OutboxDeliveryWorker
 from sreda.workers.proactive_events import ProactiveEventWorker
@@ -33,6 +36,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         skill_platform = SkillPlatformJobProcessor(session, registry)
         proactive = ProactiveEventWorker(session)
         housewife_reminders = HousewifeReminderWorker(session)
+        housewife_onboarding = HousewifeOnboardingKickoffWorker(session)
         delivery = OutboxDeliveryWorker(session, telegram_client=telegram_client)
 
         # Order matters: proactive & housewife workers fill outbox →
@@ -42,6 +46,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         skill_processed = await skill_platform.process_pending_jobs(limit=limit)
         proactive_processed = await proactive.process_pending(limit=limit)
         housewife_processed = await housewife_reminders.process_pending(limit=limit)
+        onboarding_processed = await housewife_onboarding.process_pending(limit=limit)
         delivery_processed = await delivery.process_pending_messages(limit=limit)
         return (
             runtime_processed
@@ -49,6 +54,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             + skill_processed
             + proactive_processed
             + housewife_processed
+            + onboarding_processed
             + delivery_processed
         )
     finally:

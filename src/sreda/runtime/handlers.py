@@ -1322,6 +1322,33 @@ def execute_conversation_chat(
         + _format_memories_for_prompt(memories)
     )
 
+    # Onboarding for Помощник домохозяйки — inject the [ОНБОРДИНГ]
+    # block ONLY while the flow is in_progress. Once complete, the
+    # block is omitted and the chat resumes normal behaviour.
+    onboarding_follow_up_needed = False
+    if feature_key == "housewife_assistant" and user_id:
+        from sreda.services.housewife_onboarding import (
+            HousewifeOnboardingService,
+            STATUS_IN_PROGRESS,
+            STATUS_NOT_STARTED,
+        )
+
+        ob_service = HousewifeOnboardingService(session)
+        ob_state = ob_service.get_raw_state(
+            tenant_id=action.tenant_id, user_id=user_id
+        )
+        if ob_state.get("status") == STATUS_NOT_STARTED:
+            # User wrote first → bot starts the flow on this very turn.
+            ob_state = ob_service.start(
+                tenant_id=action.tenant_id, user_id=user_id
+            )
+        if ob_state.get("status") == STATUS_IN_PROGRESS:
+            system_text += (
+                "\n\n[ОНБОРДИНГ]\n"
+                + ob_service.format_for_prompt(ob_state)
+            )
+            onboarding_follow_up_needed = True
+
     tools = build_memory_tools(
         session=session,
         tenant_id=action.tenant_id,
@@ -1391,6 +1418,16 @@ def execute_conversation_chat(
                 logger.exception("budget: failed to record LLM usage")
 
     final_ai: AIMessage | None = None
+    # Track whether the LLM resolved the current onboarding topic this
+    # turn (via answered/deferred/complete). If not, the post-turn hook
+    # increments topic depth so next turn's prompt forces a resolution
+    # after the cap.
+    _onboarding_resolution_called = False
+    _ONBOARDING_RESOLUTION_TOOLS = {
+        "onboarding_answered",
+        "onboarding_deferred",
+        "onboarding_complete",
+    }
     for _iter in range(_MAX_TOOL_ITERATIONS):
         _log_llm_invoke(
             tenant_id=action.tenant_id,
@@ -1427,6 +1464,8 @@ def execute_conversation_chat(
             except Exception as exc:  # noqa: BLE001
                 logger.exception("tool %s failed", name)
                 result = f"error:{type(exc).__name__}"
+            if name in _ONBOARDING_RESOLUTION_TOOLS and str(result).startswith("ok:"):
+                _onboarding_resolution_called = True
             messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
     else:
         # Budget exhausted while still calling tools. Force ONE final
@@ -1471,6 +1510,27 @@ def execute_conversation_chat(
                     "Попробуй переформулировать вопрос покороче."
                 )
             )
+
+    # Onboarding depth bookkeeping: if we're still in onboarding AND the
+    # LLM didn't resolve the topic (answered / deferred / complete), it
+    # means it followed up with another question on the same topic.
+    # Bump depth so next turn's prompt tightens the screw.
+    if (
+        onboarding_follow_up_needed
+        and not _onboarding_resolution_called
+        and feature_key == "housewife_assistant"
+        and user_id
+    ):
+        try:
+            from sreda.services.housewife_onboarding import (
+                HousewifeOnboardingService,
+            )
+
+            HousewifeOnboardingService(session).record_follow_up(
+                tenant_id=action.tenant_id, user_id=user_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("onboarding depth bookkeeping failed")
 
     text = (final_ai.content or "").strip() or "..."
     return [RuntimeReply(text=text, reply_markup=None, feature_key=feature_key)]
