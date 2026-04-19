@@ -103,9 +103,11 @@ class Settings(BaseSettings):
     # ``running`` forever.
     job_max_runtime_seconds: float = 120.0
 
-    # Polling interval for the always-on job runner (spec 36 Stage 2).
-    # Set to 0 to disable the loop and only run a single pass (used in tests).
-    job_poll_interval_seconds: float = 5.0
+    # Worker loop tick. Default 1s — alarm-style UX for reminders needs
+    # worst-case latency under ~1s (user-perceivable jitter). Cost is a
+    # handful of empty SQL queries per second across workers; trivial on
+    # SQLite and Postgres. Set to 0 to disable the loop (tests only).
+    job_poll_interval_seconds: float = 1.0
 
     # Speech recognition provider. Set to "yandex" to enable Yandex SpeechKit.
     # Leave None to disable voice transcription entirely.
