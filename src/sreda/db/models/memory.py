@@ -25,6 +25,7 @@ from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
+from sreda.db.types import EncryptedString
 
 
 def _utcnow() -> datetime:
@@ -44,7 +45,11 @@ class AssistantMemory(Base):
 
     # "core" | "episodic" — tier values enumerated in repository.
     tier: Mapped[str] = mapped_column(String(16))
-    content: Mapped[str] = mapped_column(Text)
+    # Encrypted at rest (AES-256-GCM). Reads return plaintext to the
+    # ORM caller; writes accept plaintext. Legacy rows written before
+    # this column was marked encrypted still decode transparently via
+    # the TypeDecorator's envelope-sniffing fallback.
+    content: Mapped[str] = mapped_column(EncryptedString())
 
     # JSON-encoded list[float]. Nullable because a memory can be saved
     # even if embeddings are disabled — we'll just skip it in cosine

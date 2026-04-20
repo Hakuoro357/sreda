@@ -30,6 +30,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
+from sreda.db.types import EncryptedString
 
 
 def _utcnow() -> datetime:
@@ -134,8 +135,14 @@ class TenantUserSkillConfig(Base):
     notification_priority: Mapped[str] = mapped_column(String(16), default="normal")
     # Per-skill daily LLM token budget. 0 == unlimited.
     token_budget_daily: Mapped[int] = mapped_column(Integer, default=0)
-    # Free-form JSON owned by the skill (e.g. EDS filter tags).
-    skill_params_json: Mapped[str] = mapped_column(Text, default="{}")
+    # Free-form JSON owned by the skill (e.g. EDS filter tags, housewife
+    # onboarding state with family answers). Encrypted at rest —
+    # skill_params often contain the user's structured personal data
+    # (e.g. онбординг-ответы: "жена Екатерина, дети Николай/Никита/...").
+    # Callers see plaintext JSON on read; writes accept plaintext.
+    skill_params_json: Mapped[str] = mapped_column(
+        EncryptedString(), default="{}"
+    )
 
     updated_by_source: Mapped[str] = mapped_column(String(32), default="user_command")
     updated_by_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
