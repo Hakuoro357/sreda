@@ -30,6 +30,7 @@ from sreda.services.billing import (
     BillingService,
 )
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
+from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
 from sreda.services.telegram_auth import (
@@ -870,3 +871,97 @@ def clear_bought_shopping_endpoint(
     service = HousewifeShoppingService(session)
     n = service.clear_bought(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
     return {"ok": True, "cleared": n}
+
+
+# ---------------------------------------------------------------------------
+# JSON API — Recipes (housewife v1.1)
+# ---------------------------------------------------------------------------
+
+
+def _recipe_summary_dict(row) -> dict:
+    """Short dict for the list view — no ingredients / no instructions
+    (large text, only fetched on detail view)."""
+    import json as _json
+
+    tags: list[str] = []
+    if row.tags_json:
+        try:
+            parsed = _json.loads(row.tags_json)
+            if isinstance(parsed, list):
+                tags = [str(t) for t in parsed]
+        except _json.JSONDecodeError:
+            pass
+    return {
+        "id": row.id,
+        "title": row.title,
+        "servings": row.servings,
+        "source": row.source,
+        "source_url": row.source_url,
+        "tags": tags,
+        "created_at": _iso(row.created_at),
+    }
+
+
+def _recipe_detail_dict(row) -> dict:
+    """Full dict for the detail view — ingredients + instructions."""
+    base = _recipe_summary_dict(row)
+    base["description"] = row.description
+    base["instructions_md"] = row.instructions_md
+    base["ingredients"] = [
+        {
+            "id": ing.id,
+            "title": ing.title,
+            "quantity_text": ing.quantity_text,
+            "is_optional": ing.is_optional,
+        }
+        for ing in (row.ingredients or [])
+    ]
+    return base
+
+
+@router.get("/api/v1/recipes")
+def list_recipes(
+    q: str | None = None,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """List the user's recipe book (most recent first). ``?q=...``
+    filters by title or tag substring (case-insensitive).
+    """
+    service = HousewifeRecipeService(session)
+    rows = service.list_recipes(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, query=q or None,
+    )
+    return {"items": [_recipe_summary_dict(r) for r in rows]}
+
+
+@router.get("/api/v1/recipes/{recipe_id}")
+def get_recipe_endpoint(
+    recipe_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Full recipe with ingredients + instructions for the detail view."""
+    service = HousewifeRecipeService(session)
+    recipe = service.get_recipe(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, recipe_id=recipe_id,
+    )
+    if recipe is None:
+        raise HTTPException(status_code=404, detail="recipe_not_found")
+    return {"recipe": _recipe_detail_dict(recipe)}
+
+
+@router.delete("/api/v1/recipes/{recipe_id}")
+def delete_recipe_endpoint(
+    recipe_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Delete a recipe from the user's book. Cascades to ingredients."""
+    service = HousewifeRecipeService(session)
+    ok = service.delete_recipe(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, recipe_id=recipe_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="recipe_not_found")
+    return {"ok": True}

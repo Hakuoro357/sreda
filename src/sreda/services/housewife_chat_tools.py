@@ -10,6 +10,7 @@ as the tool's specification, so bad docstring = bad tool use.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,7 @@ from sreda.services.housewife_onboarding import (
     TOPIC_DESCRIPTIONS,
     HousewifeOnboardingService,
 )
+from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
 
@@ -426,6 +428,183 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:cleared:{n}"
 
+    # ----------------------------------------------------------------
+    # Recipe-book tools (v1.1). Four tools: save, search, get, delete.
+    # No explicit "update" — edits = delete + save (keeps the schema
+    # simpler and matches what the LLM produces more naturally).
+    # ----------------------------------------------------------------
+    recipe_service = HousewifeRecipeService(session)
+
+    @lc_tool
+    def save_recipe(
+        title: str,
+        ingredients: list[dict[str, Any]],
+        instructions_md: str,
+        servings: int,
+        source: str,
+        source_url: str | None = None,
+        tags: list[str] | None = None,
+    ) -> str:
+        """Save a recipe to the user's recipe book.
+
+        Use when the user explicitly asks to save ("сохрани рецепт"),
+        when you (the AI) generated a recipe the user liked and they
+        confirmed saving, when you fetched one from the web and the
+        user agreed, or when promoting a menu free_text into a structured
+        recipe. Always classify the origin via the ``source`` arg — the
+        UI shows a badge per source type.
+
+        Args:
+            title: Short name of the dish. Imperative-free ("Борщ",
+                не "Сварить борщ").
+            ingredients: list of {title, quantity_text?, is_optional?}.
+                title required per item; quantity_text free-form
+                ("2 шт", "500 г", "по вкусу").
+            instructions_md: step-by-step cooking instructions in
+                markdown. Keep concise — bullets or numbered list.
+            servings: how many people it feeds (integer). Best-guess
+                from ingredient amounts if unclear; default 2.
+            source: MUST be one of:
+                • "user_dictated" — user narrated the recipe to you
+                • "ai_generated" — you invented it during the chat
+                • "web_found" — you fetched it from a URL (set
+                  source_url too)
+                • "upgraded_from_menu" — promoting a free_text menu
+                  cell into a full recipe
+            source_url: only set when source == "web_found" — the
+                origin URL.
+            tags: optional short tags like ["суп", "быстрое", "завтрак"].
+
+        Returns status string with the new recipe id.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            recipe = recipe_service.save_recipe(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                title=title,
+                ingredients=ingredients or [],
+                instructions_md=instructions_md,
+                servings=servings,
+                source=source,
+                source_url=source_url,
+                tags=tags,
+            )
+        except ValueError as exc:
+            return f"error: {exc}"
+        except Exception:  # noqa: BLE001
+            logger.exception("save_recipe failed")
+            return "error: internal"
+        return f"ok:saved:{recipe.id}"
+
+    @lc_tool
+    def search_recipes(query: str) -> str:
+        """Search the user's recipe book by title or tag substring.
+
+        Use at the start of ``plan_week_menu`` to see what's already
+        saved (aim for ≥50% of menu cells pointing at existing
+        recipes) and whenever the user says "найди мой рецепт X". Empty
+        query returns ALL recipes in reverse-chronological order.
+
+        Args:
+            query: search substring (case-insensitive). Empty string
+                returns all recipes.
+
+        Returns a compact text dump — one line per recipe with id,
+        title, source badge, and first few tags.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            rows = recipe_service.search_recipes(
+                tenant_id=tenant_id, user_id=user_id, query=query or "",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("search_recipes failed")
+            return "error: internal"
+        if not rows:
+            return "no recipes found"
+        lines = [f"{len(rows)} recipe(s):"]
+        for r in rows[:50]:
+            badge = {
+                "user_dictated": "📝",
+                "ai_generated": "🤖",
+                "web_found": "🌐",
+                "upgraded_from_menu": "📅",
+            }.get(r.source, "❔")
+            tags_blob = ""
+            if r.tags_json:
+                try:
+                    parsed = json.loads(r.tags_json) or []
+                    if parsed:
+                        tags_blob = f" tags=[{','.join(str(t) for t in parsed[:3])}]"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            lines.append(f"  [{r.id}] {badge} {r.title}{tags_blob}")
+        return "\n".join(lines)
+
+    @lc_tool
+    def get_recipe(recipe_id: str) -> str:
+        """Fetch full details of a saved recipe (ingredients + instructions).
+
+        Use when you need to reference a recipe in detail — e.g.
+        when user asks "как готовить борщ" and you want to quote their
+        own saved version, or when pulling ingredients during menu
+        generation.
+
+        Args:
+            recipe_id: id from search_recipes output (starts with ``rec_``).
+
+        Returns a compact text dump or "error: not found".
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            recipe = recipe_service.get_recipe(
+                tenant_id=tenant_id, user_id=user_id, recipe_id=recipe_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("get_recipe failed")
+            return "error: internal"
+        if recipe is None:
+            return f"error: recipe {recipe_id!r} not found"
+        lines = [f"{recipe.title} (on {recipe.servings} servings, source={recipe.source})"]
+        if recipe.ingredients:
+            lines.append("ingredients:")
+            for ing in recipe.ingredients:
+                opt = " [optional]" if ing.is_optional else ""
+                qty = f" — {ing.quantity_text}" if ing.quantity_text else ""
+                lines.append(f"  - {ing.title}{qty}{opt}")
+        if recipe.instructions_md:
+            lines.append("instructions:")
+            lines.append(recipe.instructions_md)
+        return "\n".join(lines)
+
+    @lc_tool
+    def delete_recipe(recipe_id: str) -> str:
+        """Delete a recipe from the user's book. Cascades to ingredients.
+
+        Use sparingly — only when user explicitly asks to remove a
+        recipe. To EDIT a recipe, call delete_recipe followed by
+        save_recipe with updated data (there's no separate update tool).
+
+        Args:
+            recipe_id: id (starts with ``rec_``).
+
+        Returns ``ok:deleted`` or error.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            ok = recipe_service.delete_recipe(
+                tenant_id=tenant_id, user_id=user_id, recipe_id=recipe_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("delete_recipe failed")
+            return "error: internal"
+        return "ok:deleted" if ok else f"error: recipe {recipe_id!r} not found"
+
     return [
         schedule_reminder,
         list_reminders,
@@ -438,4 +617,8 @@ def build_housewife_tools(
         remove_shopping_items,
         list_shopping,
         clear_bought_shopping,
+        save_recipe,
+        search_recipes,
+        get_recipe,
+        delete_recipe,
     ]

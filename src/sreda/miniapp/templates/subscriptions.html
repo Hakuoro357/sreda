@@ -20,6 +20,8 @@
     menu: null,
     reminders: null,
     shopping: null,
+    recipes: null,
+    recipeDetail: {},
     loading: true,
     error: null,
   };
@@ -85,6 +87,30 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.shopping = { items: [], _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadRecipes() {
+    return apiFetch("/miniapp/api/v1/recipes").then(function(res) {
+      state.recipes = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.recipes = { items: [], _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadRecipeDetail(recipeId) {
+    return apiFetch("/miniapp/api/v1/recipes/" + recipeId).then(function(res) {
+      state.recipeDetail[recipeId] = res.recipe;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.recipeDetail[recipeId] = { _error: true };
         render();
       }
     });
@@ -408,6 +434,108 @@
     return html;
   }
 
+  // --- Screen: Recipes list (#/recipes) ---
+  var _RECIPE_SOURCE_BADGES = {
+    "user_dictated": "\uD83D\uDCDD",      // 📝
+    "ai_generated": "\uD83E\uDD16",       // 🤖
+    "web_found": "\uD83C\uDF10",          // 🌐
+    "upgraded_from_menu": "\uD83D\uDCC5"  // 📅
+  };
+  var _RECIPE_SOURCE_LABELS = {
+    "user_dictated": "ты сохранил",
+    "ai_generated": "придумала Среда",
+    "web_found": "из сети",
+    "upgraded_from_menu": "из меню"
+  };
+
+  function renderRecipesList() {
+    setupBackButton(true);
+    var html = '<h1>\uD83D\uDCD6 Рецепты</h1>';
+
+    if (state.recipes === null) {
+      loadRecipes();
+      return html + renderLoading();
+    }
+    var items = (state.recipes && state.recipes.items) || [];
+    if (state.recipes && state.recipes._error) {
+      return html + '<div class="error-state">Не удалось загрузить рецепты.</div>';
+    }
+    if (items.length === 0) {
+      html += '<div class="empty-state">';
+      html += 'Рецептов пока нет.<br><br>';
+      html += 'Скажи боту «сохрани рецепт борща: ...» — или попроси ';
+      html += '«придумай рецепт из того что есть в холодильнике» и сохрани.';
+      html += '</div>';
+      return html;
+    }
+
+    for (var i = 0; i < items.length; i++) {
+      var r = items[i];
+      var badge = _RECIPE_SOURCE_BADGES[r.source] || "❔";
+      html += '<div class="card card-link" onclick="window._nav(\'/recipes/' + escHtml(r.id) + '\')">';
+      html += '<div>';
+      html += '<div class="card-title">' + badge + " " + escHtml(r.title) + '</div>';
+      var sub = "на " + r.servings + " чел";
+      if (r.tags && r.tags.length) {
+        sub += " · " + r.tags.slice(0, 3).map(escHtml).join(", ");
+      }
+      html += '<div class="card-subtitle">' + sub + '</div>';
+      html += '</div>';
+      html += '<span class="chevron">\u203A</span>';
+      html += '</div>';
+    }
+    return html;
+  }
+
+  // --- Screen: Recipe detail (#/recipes/{id}) ---
+  function renderRecipeDetail(recipeId) {
+    setupBackButton(true);
+    var html = '';
+
+    var detail = state.recipeDetail[recipeId];
+    if (!detail) {
+      loadRecipeDetail(recipeId);
+      return renderLoading();
+    }
+    if (detail._error) {
+      return '<div class="error-state">Рецепт не найден.</div>';
+    }
+
+    var badge = _RECIPE_SOURCE_BADGES[detail.source] || "❔";
+    var sourceLabel = _RECIPE_SOURCE_LABELS[detail.source] || detail.source;
+
+    html += '<h1>' + badge + ' ' + escHtml(detail.title) + '</h1>';
+    html += '<div class="card-subtitle">Источник: ' + escHtml(sourceLabel);
+    if (detail.source_url) {
+      html += ' <a href="' + escHtml(detail.source_url) + '">ссылка</a>';
+    }
+    html += '</div>';
+    html += '<div class="card-subtitle">На ' + detail.servings + ' чел</div>';
+
+    if (detail.ingredients && detail.ingredients.length) {
+      html += '<div class="section-title">Ингредиенты</div>';
+      html += '<div class="card">';
+      for (var i = 0; i < detail.ingredients.length; i++) {
+        var ing = detail.ingredients[i];
+        var qty = ing.quantity_text ? " — " + escHtml(ing.quantity_text) : "";
+        var opt = ing.is_optional ? " <em>(по желанию)</em>" : "";
+        html += '<div>• ' + escHtml(ing.title) + qty + opt + '</div>';
+      }
+      html += '</div>';
+    }
+
+    if (detail.instructions_md) {
+      html += '<div class="section-title">Приготовление</div>';
+      html += '<div class="card" style="white-space:pre-wrap">' + escHtml(detail.instructions_md) + '</div>';
+    }
+
+    html += '<div class="mt-16 text-right">';
+    html += '<button class="btn btn-danger btn-small" onclick="window._deleteRecipe(\'' + escHtml(detail.id) + '\', \'' + escHtml(detail.title).replace(/\'/g, "") + '\')">Удалить</button>';
+    html += '</div>';
+
+    return html;
+  }
+
   // --- Screen: EDS Monitor skill (#/skill/eds_monitor) ---
   function renderEdsSkill() {
     setupBackButton(true);
@@ -592,6 +720,11 @@
       html = renderReminders();
     } else if (route === "/shopping") {
       html = renderShopping();
+    } else if (route === "/recipes") {
+      html = renderRecipesList();
+    } else if (route.indexOf("/recipes/") === 0) {
+      var recipeId = route.replace("/recipes/", "");
+      html = renderRecipeDetail(recipeId);
     } else if (route === "/skill/eds_monitor") {
       html = renderEdsSkill();
     } else if (route.indexOf("/skill/") === 0) {
@@ -682,6 +815,22 @@
           showAlert("Не удалось убрать.");
         }
       }).catch(function() { showAlert("Не удалось убрать."); });
+    });
+  };
+
+  window._deleteRecipe = function(recipeId, title) {
+    showPopup("Удалить рецепт «" + title + "»?", function() {
+      apiFetch("/miniapp/api/v1/recipes/" + recipeId, { method: "DELETE" })
+        .then(function(res) {
+          if (res && res.ok) {
+            state.recipes = null;
+            state.menu = null;
+            delete state.recipeDetail[recipeId];
+            loadData().then(function() { navigate("/recipes"); });
+          } else {
+            showAlert("Не удалось удалить.");
+          }
+        }).catch(function() { showAlert("Не удалось удалить."); });
     });
   };
 
