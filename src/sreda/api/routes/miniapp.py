@@ -30,6 +30,7 @@ from sreda.services.billing import (
     BillingService,
 )
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
+from sreda.services.housewife_family import HousewifeFamilyService
 from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
@@ -1077,6 +1078,115 @@ def generate_shopping_from_menu_endpoint(
         ],
     )
     return {"ok": True, "added": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# JSON API — Family members (housewife v1.2)
+# ---------------------------------------------------------------------------
+
+
+class FamilyMemberCreate(BaseModel):
+    name: str
+    role: str
+    birth_year: int | None = None
+    age_hint: str | None = None
+    notes: str | None = None
+
+
+class FamilyMemberPatch(BaseModel):
+    name: str | None = None
+    role: str | None = None
+    birth_year: int | None = None
+    age_hint: str | None = None
+    notes: str | None = None
+
+
+def _family_member_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "role": row.role,
+        "birth_year": row.birth_year,
+        "age_hint": row.age_hint,
+        "notes": row.notes,
+        "created_at": _iso(row.created_at),
+    }
+
+
+@router.get("/api/v1/family")
+def list_family(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """All family members for the current user, ordered by role."""
+    service = HousewifeFamilyService(session)
+    rows = service.list_members(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+    return {"items": [_family_member_dict(r) for r in rows]}
+
+
+@router.post("/api/v1/family")
+def add_family_member_endpoint(
+    body: FamilyMemberCreate,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Add one family member from Mini App UI."""
+    service = HousewifeFamilyService(session)
+    try:
+        row = service.add_member(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            name=body.name,
+            role=body.role,
+            birth_year=body.birth_year,
+            age_hint=body.age_hint,
+            notes=body.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "member": _family_member_dict(row)}
+
+
+@router.patch("/api/v1/family/{member_id}")
+def update_family_member_endpoint(
+    member_id: str,
+    body: FamilyMemberPatch,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Update any subset of fields. Pass only what changed."""
+    service = HousewifeFamilyService(session)
+    try:
+        row = service.update_member(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            member_id=member_id,
+            name=body.name,
+            role=body.role,
+            birth_year=body.birth_year,
+            age_hint=body.age_hint,
+            notes=body.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="member_not_found")
+    return {"ok": True, "member": _family_member_dict(row)}
+
+
+@router.delete("/api/v1/family/{member_id}")
+def delete_family_member_endpoint(
+    member_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    service = HousewifeFamilyService(session)
+    ok = service.remove_member(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, member_id=member_id
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="member_not_found")
+    return {"ok": True}
 
 
 @router.delete("/api/v1/weekly-menu")

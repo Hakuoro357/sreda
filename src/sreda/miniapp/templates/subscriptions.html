@@ -23,6 +23,7 @@
     recipes: null,
     recipeDetail: {},
     weeklyMenu: null,
+    family: null,
     loading: true,
     error: null,
   };
@@ -124,6 +125,18 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.weeklyMenu = { plan: null, _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadFamily() {
+    return apiFetch("/miniapp/api/v1/family").then(function(res) {
+      state.family = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.family = { items: [], _error: true };
         render();
       }
     });
@@ -444,6 +457,87 @@
       html += '</div>';
     }
     html += '<div class="card-subtitle" style="text-align:center;margin-top:16px">Всего: ' + items.length + '</div>';
+    return html;
+  }
+
+  // --- Screen: Family (#/family) ---
+  var _FAMILY_ROLE_LABELS = {
+    "self": "Я",
+    "spouse": "Супруг(а)",
+    "child": "Ребёнок",
+    "parent": "Родитель",
+    "other": "Другое"
+  };
+  var _FAMILY_ROLES = ["self", "spouse", "child", "parent", "other"];
+
+  function renderFamily() {
+    setupBackButton(true);
+    var html = '<h1>\uD83D\uDC6A Семья</h1>';
+
+    // Add-new form at the top.
+    html += '<form class="card" onsubmit="return window._addFamilyMember(event)">';
+    html += '<input type="text" id="family-new-name" placeholder="Имя" ';
+    html += 'style="width:100%;padding:10px;border:1px solid var(--tg-theme-hint-color,#aaa);';
+    html += 'border-radius:8px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);font-size:15px;margin-bottom:8px" />';
+    html += '<select id="family-new-role" style="width:100%;padding:10px;border:1px solid var(--tg-theme-hint-color,#aaa);';
+    html += 'border-radius:8px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);font-size:15px;margin-bottom:8px">';
+    for (var i = 0; i < _FAMILY_ROLES.length; i++) {
+      var role = _FAMILY_ROLES[i];
+      html += '<option value="' + role + '">' + _FAMILY_ROLE_LABELS[role] + '</option>';
+    }
+    html += '</select>';
+    html += '<input type="number" id="family-new-year" placeholder="Год рождения (необязательно)" min="1900" max="2100" ';
+    html += 'style="width:100%;padding:10px;border:1px solid var(--tg-theme-hint-color,#aaa);';
+    html += 'border-radius:8px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);font-size:15px;margin-bottom:8px" />';
+    html += '<input type="text" id="family-new-notes" placeholder="Аллергии, предпочтения (необязательно)" ';
+    html += 'style="width:100%;padding:10px;border:1px solid var(--tg-theme-hint-color,#aaa);';
+    html += 'border-radius:8px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);font-size:15px;margin-bottom:8px" />';
+    html += '<button type="submit" class="btn btn-primary" style="width:100%">+ Добавить</button>';
+    html += '</form>';
+
+    if (state.family === null) {
+      loadFamily();
+      return html + renderLoading();
+    }
+    if (state.family && state.family._error) {
+      return html + '<div class="error-state">Не удалось загрузить список.</div>';
+    }
+    var items = (state.family && state.family.items) || [];
+    if (items.length === 0) {
+      html += '<div class="empty-state">';
+      html += 'Семья пока не заполнена.<br><br>';
+      html += 'Расскажи боту «у меня жена Катя и дети Миша 8 и Маша 5» — ';
+      html += 'или введи сверху руками.';
+      html += '</div>';
+      return html;
+    }
+
+    var thisYear = new Date().getFullYear();
+    html += '<div class="section-title">Всего: ' + items.length + '</div>';
+    for (var j = 0; j < items.length; j++) {
+      var m = items[j];
+      html += '<div class="card">';
+      html += '<div class="card-title">' + escHtml(m.name);
+      var roleLabel = _FAMILY_ROLE_LABELS[m.role] || m.role;
+      html += ' <span class="card-subtitle" style="font-weight:normal">(' + escHtml(roleLabel) + ')</span>';
+      html += '</div>';
+      var ageBlob = "";
+      if (m.birth_year) {
+        ageBlob = (thisYear - m.birth_year) + " лет, " + m.birth_year + " г.р.";
+      } else if (m.age_hint) {
+        ageBlob = m.age_hint;
+      }
+      if (ageBlob) {
+        html += '<div class="card-subtitle">' + escHtml(ageBlob) + '</div>';
+      }
+      if (m.notes) {
+        html += '<div class="card-subtitle">' + escHtml(m.notes) + '</div>';
+      }
+      html += '<div class="text-right mt-8">';
+      html += '<button class="btn btn-danger btn-small" onclick="window._deleteFamilyMember(\'' + escHtml(m.id) + '\', \'' + escHtml(m.name).replace(/\'/g, "") + '\')">Удалить</button>';
+      html += '</div>';
+      html += '</div>';
+    }
     return html;
   }
 
@@ -811,6 +905,8 @@
       html = renderReminders();
     } else if (route === "/shopping") {
       html = renderShopping();
+    } else if (route === "/family") {
+      html = renderFamily();
     } else if (route === "/menu") {
       html = renderWeeklyMenu();
     } else if (route === "/recipes") {
@@ -908,6 +1004,55 @@
           showAlert("Не удалось убрать.");
         }
       }).catch(function() { showAlert("Не удалось убрать."); });
+    });
+  };
+
+  // ---- Family actions ----
+  window._addFamilyMember = function(event) {
+    if (event) event.preventDefault();
+    var nameEl = document.getElementById("family-new-name");
+    var roleEl = document.getElementById("family-new-role");
+    var yearEl = document.getElementById("family-new-year");
+    var notesEl = document.getElementById("family-new-notes");
+    var name = (nameEl && nameEl.value || "").trim();
+    if (!name) return false;
+    var body = {
+      name: name,
+      role: (roleEl && roleEl.value) || "other"
+    };
+    var year = parseInt((yearEl && yearEl.value) || "", 10);
+    if (!isNaN(year) && year >= 1900 && year <= 2100) body.birth_year = year;
+    var notes = (notesEl && notesEl.value || "").trim();
+    if (notes) body.notes = notes;
+    apiFetch("/miniapp/api/v1/family", { method: "POST", body: body })
+      .then(function(res) {
+        if (res && res.ok) {
+          if (nameEl) nameEl.value = "";
+          if (yearEl) yearEl.value = "";
+          if (notesEl) notesEl.value = "";
+          state.family = null;
+          state.menu = null;
+          loadData().then(function() { loadFamily(); });
+        } else {
+          showAlert("Не удалось добавить.");
+        }
+      })
+      .catch(function() { showAlert("Не удалось добавить."); });
+    return false;
+  };
+
+  window._deleteFamilyMember = function(memberId, name) {
+    showPopup("Убрать «" + name + "» из семьи?", function() {
+      apiFetch("/miniapp/api/v1/family/" + memberId, { method: "DELETE" })
+        .then(function(res) {
+          if (res && res.ok) {
+            state.family = null;
+            state.menu = null;
+            loadData().then(function() { loadFamily(); });
+          } else {
+            showAlert("Не удалось удалить.");
+          }
+        }).catch(function() { showAlert("Не удалось удалить."); });
     });
   };
 
