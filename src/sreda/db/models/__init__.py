@@ -19,6 +19,13 @@ from sreda.db.models.core import (
 )
 from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
 from sreda.db.models.housewife import FamilyReminder
+from sreda.db.models.housewife_food import (
+    MenuPlan,
+    MenuPlanItem,
+    Recipe,
+    RecipeIngredient,
+    ShoppingListItem,
+)
 from sreda.db.models.inbound_event import InboundEvent
 from sreda.db.models.memory import AssistantMemory
 from sreda.db.models.runtime import AgentRun, AgentThread
@@ -51,6 +58,11 @@ __all__ = [
     "EDSDeliveryRecord",
     "FamilyReminder",
     "InboundEvent",
+    "MenuPlan",
+    "MenuPlanItem",
+    "Recipe",
+    "RecipeIngredient",
+    "ShoppingListItem",
     "SubscriptionPlan",
     "Job",
     "OutboxMessage",

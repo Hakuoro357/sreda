@@ -1,0 +1,294 @@
+"""Unit tests for HousewifeShoppingService."""
+
+from __future__ import annotations
+
+import base64
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from sreda.db.base import Base
+from sreda.db.models.core import Tenant, User
+from sreda.db.models.housewife_food import SHOPPING_CATEGORIES, ShoppingListItem
+from sreda.services.encryption import get_encryption_service
+from sreda.services.housewife_shopping import (
+    DEFAULT_CATEGORY,
+    HousewifeShoppingService,
+    ShoppingItemInput,
+    _coerce_category,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stable_encryption_key(monkeypatch):
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY_ID", "test")
+    monkeypatch.delenv("SREDA_ENCRYPTION_KEY_SALT", raising=False)
+    monkeypatch.delenv("SREDA_ENCRYPTION_LEGACY_KEYS", raising=False)
+    from sreda.config.settings import get_settings
+
+    get_settings.cache_clear()
+    get_encryption_service.cache_clear()
+    yield
+    get_settings.cache_clear()
+    get_encryption_service.cache_clear()
+
+
+@pytest.fixture
+def session():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    sess = sessionmaker(bind=engine)()
+    sess.add(Tenant(id="t1", name="Test"))
+    sess.add(User(id="u1", tenant_id="t1", telegram_account_id="100"))
+    sess.commit()
+    yield sess
+    sess.close()
+
+
+# ---------------------------------------------------------------------------
+# _coerce_category
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_category_maps_exact():
+    assert _coerce_category("молочные") == "молочные"
+    assert _coerce_category("Молочные") == "молочные"  # case-insensitive
+    assert _coerce_category(" бакалея ") == "бакалея"  # trim
+
+
+def test_coerce_category_unknown_falls_to_default():
+    assert _coerce_category("специи") == DEFAULT_CATEGORY
+    assert _coerce_category("") == DEFAULT_CATEGORY
+    assert _coerce_category(None) == DEFAULT_CATEGORY
+
+
+# ---------------------------------------------------------------------------
+# add_items
+# ---------------------------------------------------------------------------
+
+
+def test_add_items_persists_batch(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1",
+        user_id="u1",
+        items=[
+            {"title": "молоко", "category": "молочные"},
+            {"title": "хлеб", "category": "хлеб"},
+            {"title": "помидоры", "quantity_text": "1 кг", "category": "овощи_фрукты"},
+        ],
+    )
+    assert len(rows) == 3
+    # Reload from DB to confirm encryption round-trip
+    session.expire_all()
+    all_items = session.query(ShoppingListItem).all()
+    titles = {r.title for r in all_items}
+    assert titles == {"молоко", "хлеб", "помидоры"}
+    # Categories recorded
+    cats = {r.category for r in all_items}
+    assert cats == {"молочные", "хлеб", "овощи_фрукты"}
+
+
+def test_add_items_accepts_dataclass_input(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1",
+        user_id="u1",
+        items=[ShoppingItemInput(title="кефир", category="молочные")],
+    )
+    assert len(rows) == 1
+    assert rows[0].title == "кефир"
+
+
+def test_add_items_skips_empty_title(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1",
+        user_id="u1",
+        items=[{"title": ""}, {"title": "  "}, {"title": "молоко"}],
+    )
+    assert len(rows) == 1
+    assert rows[0].title == "молоко"
+
+
+def test_add_items_unknown_category_falls_to_default(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1",
+        user_id="u1",
+        items=[{"title": "шафран", "category": "специи"}],
+    )
+    assert rows[0].category == DEFAULT_CATEGORY
+
+
+def test_add_items_empty_list_is_noop(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(tenant_id="t1", user_id="u1", items=[])
+    assert rows == []
+    assert session.query(ShoppingListItem).count() == 0
+
+
+def test_title_is_encrypted_at_rest(session):
+    """Sanity that EncryptedString is actually applied to title."""
+    svc = HousewifeShoppingService(session)
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "редкое слово", "category": "бакалея"}],
+    )
+    from sqlalchemy import text
+    raw = session.execute(text("SELECT title FROM shopping_list_items")).scalar()
+    assert raw.startswith("v2:test:")
+    assert "редкое слово" not in raw
+
+
+# ---------------------------------------------------------------------------
+# mark_bought / remove_items
+# ---------------------------------------------------------------------------
+
+
+def test_mark_bought_updates_status_and_skips_unknown(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "молоко"}, {"title": "хлеб"}],
+    )
+    a, b = rows[0].id, rows[1].id
+
+    updated = svc.mark_bought(
+        tenant_id="t1", user_id="u1",
+        ids=[a, "bogus_id", b],
+    )
+    assert updated == 2
+
+    statuses = {r.id: r.status for r in session.query(ShoppingListItem).all()}
+    assert statuses[a] == "bought"
+    assert statuses[b] == "bought"
+
+
+def test_mark_bought_ignores_other_tenants(session):
+    """Don't accidentally flip status for another tenant's items."""
+    session.add(Tenant(id="t2", name="Other"))
+    session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))
+    session.commit()
+
+    svc = HousewifeShoppingService(session)
+    mine = svc.add_items(tenant_id="t1", user_id="u1", items=[{"title": "молоко"}])
+    theirs = svc.add_items(tenant_id="t2", user_id="u2", items=[{"title": "молоко"}])
+
+    # try to mark the other tenant's item as bought from my context
+    updated = svc.mark_bought(
+        tenant_id="t1", user_id="u1",
+        ids=[theirs[0].id],
+    )
+    assert updated == 0
+    # Their item stays pending
+    assert session.get(ShoppingListItem, theirs[0].id).status == "pending"
+    # Mine untouched too (id wasn't in the list)
+    assert session.get(ShoppingListItem, mine[0].id).status == "pending"
+
+
+def test_remove_items_flips_to_cancelled(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "молоко"}, {"title": "хлеб"}],
+    )
+    svc.remove_items(tenant_id="t1", user_id="u1", ids=[rows[0].id])
+    session.expire_all()
+    assert session.get(ShoppingListItem, rows[0].id).status == "cancelled"
+    assert session.get(ShoppingListItem, rows[1].id).status == "pending"
+
+
+def test_remove_items_can_cancel_already_bought(session):
+    svc = HousewifeShoppingService(session)
+    [row] = svc.add_items(tenant_id="t1", user_id="u1", items=[{"title": "молоко"}])
+    svc.mark_bought(tenant_id="t1", user_id="u1", ids=[row.id])
+    svc.remove_items(tenant_id="t1", user_id="u1", ids=[row.id])
+    assert session.get(ShoppingListItem, row.id).status == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# list_pending / count_pending
+# ---------------------------------------------------------------------------
+
+
+def test_list_pending_returns_only_pending(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[
+            {"title": "молоко", "category": "молочные"},
+            {"title": "хлеб", "category": "хлеб"},
+            {"title": "картошка", "category": "овощи_фрукты"},
+        ],
+    )
+    svc.mark_bought(tenant_id="t1", user_id="u1", ids=[rows[0].id])
+    svc.remove_items(tenant_id="t1", user_id="u1", ids=[rows[2].id])
+
+    pending = svc.list_pending(tenant_id="t1", user_id="u1")
+    titles = [r.title for r in pending]
+    assert titles == ["хлеб"]
+
+
+def test_list_pending_ordered_by_taxonomy(session):
+    """Rendering order should follow the fixed shopping categories list,
+    not alphabetical — so the shopper sees the list in "store aisle" order.
+    """
+    svc = HousewifeShoppingService(session)
+    # Insert in alphabetical order; expect taxonomy order on read.
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[
+            {"title": "бакалея-item", "category": "бакалея"},
+            {"title": "молочные-item", "category": "молочные"},
+            {"title": "хлеб-item", "category": "хлеб"},
+        ],
+    )
+    pending = svc.list_pending(tenant_id="t1", user_id="u1")
+    cats = [r.category for r in pending]
+    # Taxonomy order: молочные → мясо_рыба → овощи_фрукты → хлеб → бакалея
+    idx_map = {c: i for i, c in enumerate(SHOPPING_CATEGORIES)}
+    assert cats == sorted(cats, key=idx_map.get)
+
+
+def test_count_pending_respects_status(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "a"}, {"title": "b"}, {"title": "c"}],
+    )
+    assert svc.count_pending(tenant_id="t1", user_id="u1") == 3
+    svc.mark_bought(tenant_id="t1", user_id="u1", ids=[rows[0].id])
+    svc.remove_items(tenant_id="t1", user_id="u1", ids=[rows[1].id])
+    assert svc.count_pending(tenant_id="t1", user_id="u1") == 1
+
+
+# ---------------------------------------------------------------------------
+# clear_bought
+# ---------------------------------------------------------------------------
+
+
+def test_clear_bought_cancels_all_bought_items(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "a"}, {"title": "b"}, {"title": "c"}],
+    )
+    svc.mark_bought(tenant_id="t1", user_id="u1", ids=[rows[0].id, rows[1].id])
+
+    cleared = svc.clear_bought(tenant_id="t1", user_id="u1")
+    assert cleared == 2
+
+    statuses = {r.id: r.status for r in session.query(ShoppingListItem).all()}
+    assert statuses[rows[0].id] == "cancelled"
+    assert statuses[rows[1].id] == "cancelled"
+    assert statuses[rows[2].id] == "pending"  # was never bought
+
+
+def test_clear_bought_empty_list_is_noop(session):
+    svc = HousewifeShoppingService(session)
+    cleared = svc.clear_bought(tenant_id="t1", user_id="u1")
+    assert cleared == 0
