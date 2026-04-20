@@ -22,6 +22,7 @@ from sreda.services.housewife_onboarding import (
     TOPIC_DESCRIPTIONS,
     HousewifeOnboardingService,
 )
+from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
@@ -605,6 +606,227 @@ def build_housewife_tools(
             return "error: internal"
         return "ok:deleted" if ok else f"error: recipe {recipe_id!r} not found"
 
+    # ----------------------------------------------------------------
+    # Menu-planning tools (v1.1). Week grid 7×3(+snack) stored as
+    # MenuPlan + MenuPlanItem. plan_week_menu is the heavy call; the
+    # LLM composes 21 meals in one go, the service just persists.
+    # ----------------------------------------------------------------
+    menu_service = HousewifeMenuService(session)
+
+    @lc_tool
+    def plan_week_menu(
+        week_start: str,
+        days: list[dict[str, Any]],
+        notes: str | None = None,
+    ) -> str:
+        """Create (or replace) the weekly menu for the user.
+
+        Heavy composite call: YOU generate 21 meal cells (7 days ×
+        breakfast/lunch/dinner) and pass them as structured data. Before
+        calling this, invoke ``search_recipes("")`` to pull the user's
+        recipe book — **aim for ≥50% of cells to point at existing
+        recipes via recipe_id**. Otherwise the book is bookshelf decoration.
+
+        Priority order when composing meals:
+          1. Respect allergies / diet (hard constraint from [ПАМЯТЬ])
+          2. Prefer recipe_id over free_text (reuse саved recipes)
+          3. Variety — no repeat within 3 days
+          4. Practicality — ≤30 min dishes on weekdays, longer OK Sat/Sun
+          5. Budget — not steaks daily
+
+        Args:
+            week_start: ISO date, any day of the target week. Service
+                normalises to Monday automatically.
+            days: list of day objects.
+                [{"day_of_week": 0,
+                  "meals": {
+                    "breakfast": {"recipe_id": "rec_..."} | {"free_text": "овсянка с ягодами"},
+                    "lunch": {...}, "dinner": {...}, "snack": {...}?
+                  }},
+                 {"day_of_week": 1, "meals": {...}},
+                 ...]
+                day_of_week: 0=Mon, 1=Tue, ..., 6=Sun.
+                meals values: dict with EITHER ``recipe_id`` OR
+                ``free_text`` (not both). Omit meal key to leave it
+                empty. ``notes`` optional per cell.
+            notes: optional overall note for the week.
+
+        Returns ok:plan_created:<plan_id>:<week_start>.
+        """
+        if not user_id:
+            return "error: no user_id context"
+
+        # Flatten days→cells into the shape HousewifeMenuService expects.
+        cells: list[dict[str, Any]] = []
+        for day_spec in days or []:
+            if not isinstance(day_spec, dict):
+                continue
+            try:
+                day = int(day_spec["day_of_week"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            meals = day_spec.get("meals") or {}
+            if not isinstance(meals, dict):
+                continue
+            for meal_type, meal in meals.items():
+                if not isinstance(meal, dict):
+                    continue
+                cells.append(
+                    {
+                        "day_of_week": day,
+                        "meal_type": meal_type,
+                        "recipe_id": meal.get("recipe_id"),
+                        "free_text": meal.get("free_text"),
+                        "notes": meal.get("notes"),
+                    }
+                )
+
+        try:
+            plan = menu_service.plan_week(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                week_start=week_start,
+                cells=cells,
+                notes=notes,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("plan_week_menu failed")
+            return "error: internal"
+        return f"ok:plan_created:{plan.id}:{plan.week_start_date.isoformat()}"
+
+    @lc_tool
+    def update_menu_item(
+        plan_id: str,
+        day_of_week: int,
+        meal_type: str,
+        recipe_id: str | None = None,
+        free_text: str | None = None,
+        notes: str | None = None,
+    ) -> str:
+        """Replace a single cell in an existing weekly menu.
+
+        Use for point edits like "замени ужин в среду на пасту". If no
+        cell currently exists at (day, meal_type) it's created. Passing
+        both recipe_id and free_text as None clears the cell.
+
+        Args:
+            plan_id: id from plan_week_menu or list_menu (``menu_...``).
+            day_of_week: 0-6 (Mon-Sun).
+            meal_type: breakfast | lunch | dinner | snack.
+            recipe_id: optional — reuse a saved recipe.
+            free_text: optional — ad-hoc dish description.
+            notes: optional note for this cell.
+
+        Returns ok:updated or error.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            item = menu_service.update_item(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                plan_id=plan_id.strip(),
+                day_of_week=day_of_week,
+                meal_type=meal_type,
+                recipe_id=(recipe_id or None),
+                free_text=(free_text or None),
+                notes=(notes or None),
+            )
+        except ValueError as exc:
+            return f"error: {exc}"
+        except Exception:  # noqa: BLE001
+            logger.exception("update_menu_item failed")
+            return "error: internal"
+        if item is None:
+            # Either plan not found OR cell was cleared.
+            return "ok:cleared_or_not_found"
+        return f"ok:updated:{item.id}"
+
+    @lc_tool
+    def list_menu(week_start: str | None = None) -> str:
+        """Fetch a weekly menu grid.
+
+        Args:
+            week_start: ISO date. If None, returns the user's most
+                recent menu across all weeks.
+
+        Returns a compact text dump grouped by day → meal, with recipe
+        links shown as [rec_...] ids so get_recipe can follow.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            if week_start:
+                plan = menu_service.get_plan_for_week(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    week_start=week_start,
+                )
+            else:
+                plans = menu_service.list_user_plans(
+                    tenant_id=tenant_id, user_id=user_id
+                )
+                plan = plans[0] if plans else None
+                # Need items eagerly loaded — fetch by the found week
+                if plan is not None:
+                    plan = menu_service.get_plan_for_week(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        week_start=plan.week_start_date,
+                    )
+        except Exception:  # noqa: BLE001
+            logger.exception("list_menu failed")
+            return "error: internal"
+        if plan is None:
+            return "no menu plan for that week"
+
+        day_names = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+        lines = [f"menu plan [{plan.id}] week starting {plan.week_start_date.isoformat()}:"]
+        # Group by day
+        by_day: dict[int, list] = {}
+        for item in plan.items:
+            by_day.setdefault(item.day_of_week, []).append(item)
+        for d in range(7):
+            items = by_day.get(d, [])
+            if not items:
+                continue
+            lines.append(f"  {day_names[d]}:")
+            for item in sorted(items, key=lambda x: x.meal_type):
+                if item.recipe_id and item.recipe is not None:
+                    body = f"[{item.recipe_id}] {item.recipe.title}"
+                elif item.free_text:
+                    body = item.free_text
+                else:
+                    continue
+                lines.append(f"    {item.meal_type}: {body}")
+        return "\n".join(lines)
+
+    @lc_tool
+    def clear_menu(week_start: str) -> str:
+        """Delete the weekly menu for the given week.
+
+        Use when user says "убери меню", "отмени план на неделю". After
+        this, ``list_menu`` for that week returns empty.
+
+        Args:
+            week_start: ISO date within the target week. Service
+                normalises to Monday.
+
+        Returns ok:cleared:N where N is the number of plans removed.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            n = menu_service.clear_menu(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                week_start=week_start,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("clear_menu failed")
+            return "error: internal"
+        return f"ok:cleared:{n}"
+
     return [
         schedule_reminder,
         list_reminders,
@@ -621,4 +843,8 @@ def build_housewife_tools(
         search_recipes,
         get_recipe,
         delete_recipe,
+        plan_week_menu,
+        update_menu_item,
+        list_menu,
+        clear_menu,
     ]

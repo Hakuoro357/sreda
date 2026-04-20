@@ -30,6 +30,7 @@ from sreda.services.billing import (
     BillingService,
 )
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
+from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
@@ -965,3 +966,91 @@ def delete_recipe_endpoint(
     if not ok:
         raise HTTPException(status_code=404, detail="recipe_not_found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# JSON API — Menu planning (housewife v1.1)
+# ---------------------------------------------------------------------------
+
+
+def _menu_item_dict(item) -> dict:
+    """Serialise one menu cell for the week grid. Includes the linked
+    recipe's title if any so the UI doesn't need a second request."""
+    out = {
+        "id": item.id,
+        "day_of_week": item.day_of_week,
+        "meal_type": item.meal_type,
+        "recipe_id": item.recipe_id,
+        "free_text": item.free_text,
+        "notes": item.notes,
+        "recipe_title": None,
+    }
+    if item.recipe_id and item.recipe is not None:
+        out["recipe_title"] = item.recipe.title
+    return out
+
+
+def _menu_plan_dict(plan) -> dict:
+    return {
+        "id": plan.id,
+        "week_start_date": plan.week_start_date.isoformat(),
+        "notes": plan.notes,
+        "status": plan.status,
+        "items": [_menu_item_dict(item) for item in (plan.items or [])],
+    }
+
+
+@router.get("/api/v1/weekly-menu")
+def get_weekly_menu(
+    week_start: str | None = None,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Fetch the user's weekly menu grid.
+
+    Without ``?week_start=`` returns the most recent plan. With it
+    returns the plan for that specific week (Monday-anchored; any date
+    works, service coerces). 404 if no plan exists for the requested
+    week.
+    """
+    service = HousewifeMenuService(session)
+
+    if week_start:
+        plan = service.get_plan_for_week(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            week_start=week_start,
+        )
+    else:
+        all_plans = service.list_user_plans(
+            tenant_id=ctx.tenant_id, user_id=ctx.user_id
+        )
+        plan = all_plans[0] if all_plans else None
+        if plan is not None:
+            # Re-fetch with items eagerly loaded — list_user_plans
+            # skips them for cheap listings.
+            plan = service.get_plan_for_week(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                week_start=plan.week_start_date,
+            )
+
+    if plan is None:
+        return {"plan": None}
+    return {"plan": _menu_plan_dict(plan)}
+
+
+@router.delete("/api/v1/weekly-menu")
+def clear_weekly_menu_endpoint(
+    week_start: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Remove the weekly menu for the given week (UI "Очистить меню")."""
+    service = HousewifeMenuService(session)
+    n = service.clear_menu(
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        week_start=week_start,
+    )
+    return {"ok": True, "cleared": n}

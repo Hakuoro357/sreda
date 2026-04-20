@@ -22,6 +22,7 @@
     shopping: null,
     recipes: null,
     recipeDetail: {},
+    weeklyMenu: null,
     loading: true,
     error: null,
   };
@@ -111,6 +112,18 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.recipeDetail[recipeId] = { _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadWeeklyMenu() {
+    return apiFetch("/miniapp/api/v1/weekly-menu").then(function(res) {
+      state.weeklyMenu = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.weeklyMenu = { plan: null, _error: true };
         render();
       }
     });
@@ -434,6 +447,84 @@
     return html;
   }
 
+  // --- Screen: Weekly menu (#/menu) ---
+  var _MENU_DAYS_RU = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"];
+  var _MEAL_LABELS = {
+    "breakfast": "Завтрак",
+    "lunch": "Обед",
+    "dinner": "Ужин",
+    "snack": "Перекус"
+  };
+  var _MEAL_ORDER = ["breakfast", "lunch", "dinner", "snack"];
+
+  function renderWeeklyMenu() {
+    setupBackButton(true);
+    var html = '<h1>\uD83D\uDCC5 Меню недели</h1>';
+
+    if (state.weeklyMenu === null) {
+      loadWeeklyMenu();
+      return html + renderLoading();
+    }
+    if (state.weeklyMenu && state.weeklyMenu._error) {
+      return html + '<div class="error-state">Не удалось загрузить меню.</div>';
+    }
+    var plan = state.weeklyMenu && state.weeklyMenu.plan;
+    if (!plan) {
+      html += '<div class="empty-state">';
+      html += 'Меню ещё не составлено.<br><br>';
+      html += 'Напиши боту «составь меню на неделю» — Среда подберёт ';
+      html += 'блюда с учётом твоей семьи и сохранённых рецептов.';
+      html += '</div>';
+      return html;
+    }
+
+    // Index items by (day, meal_type) for O(1) cell lookup.
+    var byCell = {};
+    for (var i = 0; i < (plan.items || []).length; i++) {
+      var it = plan.items[i];
+      byCell[it.day_of_week + ":" + it.meal_type] = it;
+    }
+
+    html += '<div class="card-subtitle" style="margin-bottom:12px">с ' + escHtml(plan.week_start_date) + '</div>';
+
+    for (var d = 0; d < 7; d++) {
+      html += '<div class="section-title">' + escHtml(_MENU_DAYS_RU[d]) + '</div>';
+      html += '<div class="card">';
+      var hasAny = false;
+      for (var m = 0; m < _MEAL_ORDER.length; m++) {
+        var mt = _MEAL_ORDER[m];
+        var cell = byCell[d + ":" + mt];
+        if (!cell) continue;
+        hasAny = true;
+        html += '<div style="margin-bottom:8px">';
+        html += '<span class="card-subtitle">' + escHtml(_MEAL_LABELS[mt]) + ': </span>';
+        if (cell.recipe_id && cell.recipe_title) {
+          html += '<a href="#/recipes/' + escHtml(cell.recipe_id) + '">' + escHtml(cell.recipe_title) + '</a>';
+        } else if (cell.free_text) {
+          html += escHtml(cell.free_text);
+        }
+        html += '</div>';
+      }
+      if (!hasAny) {
+        html += '<div class="card-subtitle" style="font-style:italic">—</div>';
+      }
+      html += '</div>';
+    }
+
+    // Auto-gen shopping (Stage 6 wires the button — endpoint comes later).
+    html += '<div class="mt-16">';
+    html += '<button class="btn btn-primary" onclick="window._generateShoppingFromMenu(\'' + escHtml(plan.id) + '\')" style="width:100%">';
+    html += '\uD83D\uDED2 Добавить ингредиенты в список покупок';
+    html += '</button>';
+    html += '</div>';
+
+    html += '<div class="mt-8">';
+    html += '<button class="btn btn-danger btn-small" onclick="window._clearWeeklyMenu(\'' + escHtml(plan.week_start_date) + '\')">Очистить меню</button>';
+    html += '</div>';
+
+    return html;
+  }
+
   // --- Screen: Recipes list (#/recipes) ---
   var _RECIPE_SOURCE_BADGES = {
     "user_dictated": "\uD83D\uDCDD",      // 📝
@@ -720,6 +811,8 @@
       html = renderReminders();
     } else if (route === "/shopping") {
       html = renderShopping();
+    } else if (route === "/menu") {
+      html = renderWeeklyMenu();
     } else if (route === "/recipes") {
       html = renderRecipesList();
     } else if (route.indexOf("/recipes/") === 0) {
@@ -816,6 +909,28 @@
         }
       }).catch(function() { showAlert("Не удалось убрать."); });
     });
+  };
+
+  window._clearWeeklyMenu = function(weekStart) {
+    showPopup("Очистить меню на неделю с " + weekStart + "?", function() {
+      apiFetch("/miniapp/api/v1/weekly-menu?week_start=" + weekStart, {
+        method: "DELETE"
+      }).then(function(res) {
+        if (res && res.ok) {
+          state.weeklyMenu = null;
+          state.menu = null;  // dashboard counter
+          loadData().then(function() { navigate("/"); });
+        } else {
+          showAlert("Не удалось очистить.");
+        }
+      }).catch(function() { showAlert("Не удалось очистить."); });
+    });
+  };
+
+  // Stage 6 will wire this endpoint; for now the click shows a
+  // placeholder so the button isn't a dead link.
+  window._generateShoppingFromMenu = function(planId) {
+    showAlert("Скоро заработает — напиши боту «добавь ингредиенты из меню в список».");
   };
 
   window._deleteRecipe = function(recipeId, title) {
