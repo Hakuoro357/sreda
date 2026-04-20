@@ -11,6 +11,23 @@
   var initData = tg ? tg.initData : "";
   var $app = document.getElementById("app");
 
+  // If initData is missing (e.g. page opened in a plain browser or via
+  // a shared link outside the Telegram client), server-side auth is
+  // impossible. Show a clear message instead of firing requests that
+  // will all 401 and leave the user staring at a white screen.
+  if (!initData) {
+    var msg = !tg
+      ? "Это приложение открывается только внутри Telegram."
+      : "Не удалось получить данные Telegram. Откройте приложение через кнопку в чате бота (а не по прямой ссылке).";
+    console.warn("miniapp: initData missing", {hasTg: !!tg, ua: navigator.userAgent});
+    $app.innerHTML =
+      '<div class="card" style="margin:16px;padding:24px;">' +
+      '<h2 style="margin-top:0;">Не удалось открыть</h2>' +
+      '<p>' + msg + '</p>' +
+      '</div>';
+    return;
+  }
+
   // -- State --
   // ``menu`` — dashboard tiles (skills + Подписки). ``reminders`` lazy-loaded
   // when the user opens #/reminders so we don't hit the DB on every boot.

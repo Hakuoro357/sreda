@@ -76,6 +76,17 @@ def _require_miniapp_auth(
 ) -> MiniAppContext:
     auth_header = request.headers.get("authorization", "")
     if not auth_header.lower().startswith("tma "):
+        # Diagnostic: log enough to distinguish "no header at all" vs
+        # "header present but wrong prefix" without leaking the payload.
+        ua = request.headers.get("user-agent", "")[:120]
+        logger.warning(
+            "miniapp auth: missing/invalid Authorization header "
+            "(len=%d prefix=%r ua=%r path=%s)",
+            len(auth_header),
+            auth_header[:8],
+            ua,
+            request.url.path,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_auth")
 
     init_data_raw = auth_header[4:]
