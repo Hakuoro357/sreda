@@ -24,6 +24,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -159,6 +160,22 @@ class Recipe(Base):
     )
 
     servings: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # Nutrition estimates per SERVING (not per whole recipe). LLM fills
+    # at save_recipe time; all nullable so legacy/partial data survives.
+    # Accuracy: LLM text-generation level, ~±20% typical — good enough
+    # for a household planner, not a dietetics clinic.
+    calories_per_serving: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    protein_per_serving: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    fat_per_serving: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    carbs_per_serving: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     # Populated when ``source == "web_found"``; fetch_url origin.
     source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)

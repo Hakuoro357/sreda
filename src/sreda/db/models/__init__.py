@@ -18,7 +18,7 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
-from sreda.db.models.housewife import FamilyReminder
+from sreda.db.models.housewife import FamilyMember, FamilyReminder
 from sreda.db.models.housewife_food import (
     MenuPlan,
     MenuPlanItem,
@@ -56,6 +56,7 @@ __all__ = [
     "EDSChangeEvent",
     "EDSClaimState",
     "EDSDeliveryRecord",
+    "FamilyMember",
     "FamilyReminder",
     "InboundEvent",
     "MenuPlan",

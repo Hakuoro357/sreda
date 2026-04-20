@@ -1,19 +1,23 @@
 """Housewife assistant skill — DB models.
 
-Phase 1 scope: only ``family_reminders`` (scheduled proactive triggers).
-Structured FamilyContext (FamilyHub / FamilyMember / FamilyFact) is
-intentionally deferred — generic ``AssistantMemory`` covers family facts
-well enough for MVP.
+Phase 1: ``family_reminders`` (scheduled proactive triggers).
+
+Phase v1.2: ``family_members`` — structured rows per household member.
+Powers shopping-list scaling (recipe servings × member count), menu
+planning context enrichment, and a dedicated Mini App management page.
+Name + notes encrypted at rest via EncryptedString. Replaces the
+loose "состав семьи" kept only as ``AssistantMemory.content`` text.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
+from sreda.db.types import EncryptedString
 
 
 def _utcnow() -> datetime:
@@ -79,4 +83,54 @@ class FamilyReminder(Base):
             "tenant_id",
             "next_trigger_at",
         ),
+    )
+
+
+FAMILY_ROLES = ("self", "spouse", "child", "parent", "other")
+
+
+class FamilyMember(Base):
+    """One row per member of the user's household.
+
+    Minimal structured shape — we don't try to model relationships or
+    full anamnesis. Just enough to: (a) compute list-scaling factor
+    for the shopping generator, (b) enrich menu planning context
+    ("учти аллергию Маши на горчицу"), (c) show a maintainable list
+    in Mini App.
+
+    Name and notes go through ``EncryptedString`` — these are identifying
+    PII. Role / birth_year / age_hint are plaintext (used in filters
+    and display, no leak beyond "there's a child aged 9").
+    """
+
+    __tablename__ = "family_members"
+    __table_args__ = (
+        Index("ix_family_members_tenant_user", "tenant_id", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id"), nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False
+    )
+
+    name: Mapped[str] = mapped_column(EncryptedString(), nullable=False)
+    # One of FAMILY_ROLES. ``self`` marks the user themselves — useful
+    # so generation doesn't skip them when counting eaters.
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # Birth year preferred (stable across time). age_hint is the
+    # fallback when user only gave us "8 лет" without a year.
+    birth_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    age_hint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    notes: Mapped[str | None] = mapped_column(EncryptedString(), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
     )

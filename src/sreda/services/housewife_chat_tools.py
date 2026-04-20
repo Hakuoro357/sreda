@@ -22,6 +22,7 @@ from sreda.services.housewife_onboarding import (
     TOPIC_DESCRIPTIONS,
     HousewifeOnboardingService,
 )
+from sreda.services.housewife_family import HousewifeFamilyService
 from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
@@ -907,6 +908,146 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:generated:{len(rows)}"
 
+    # ----------------------------------------------------------------
+    # Family member tools (v1.2). Structured household roster used by
+    # the shopping scaler and menu planning prompt context. Replaces
+    # the loose "состав семьи" free-form AssistantMemory blob.
+    # ----------------------------------------------------------------
+    family_service = HousewifeFamilyService(session)
+
+    @lc_tool
+    def add_family_members(members: list[dict[str, Any]]) -> str:
+        """Add one or more family members at once.
+
+        **Use this preferentially over single-member adds** — one call
+        saves N members, same reason save_recipes_batch beats looping
+        save_recipe. Each item is a dict:
+            {
+              "name": "Маша",
+              "role": "self|spouse|child|parent|other",
+              "birth_year": 2017,                 # optional
+              "age_hint": "8 лет",                 # optional, fallback
+              "notes": "аллергия на горчицу"       # optional
+            }
+        Invalid items (empty name, unknown role, implausible birth_year)
+        skipped silently — rest of the batch persists.
+
+        Call ``add_family_members`` when the user says something like
+        "у меня жена Катя, сын Никита 10 лет, дочь Маша 8 лет" — LLM
+        parses, batches, one tool call.
+
+        Returns ok:added:N:ids=[fm_...,...].
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not members:
+            return "error: empty batch"
+        try:
+            created = family_service.add_members_batch(
+                tenant_id=tenant_id, user_id=user_id, members=members
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("add_family_members failed")
+            return "error: internal"
+        if not created:
+            return "ok:added:0"
+        ids_csv = ",".join(m.id for m in created)
+        return f"ok:added:{len(created)}:ids=[{ids_csv}]"
+
+    @lc_tool
+    def list_family_members() -> str:
+        """List all recorded household members for the current user.
+
+        Call before ``plan_week_menu`` to know who to cook for, and
+        before ``generate_shopping_from_menu`` so shopping scales
+        correctly. Also handy when user asks "кто у меня в семье".
+
+        Returns text dump with ids, names, roles, ages, notes.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            rows = family_service.list_members(
+                tenant_id=tenant_id, user_id=user_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("list_family_members failed")
+            return "error: internal"
+        if not rows:
+            return "no family members recorded"
+        lines = [f"{len(rows)} member(s):"]
+        from datetime import datetime as _dt
+
+        this_year = _dt.now().year
+        for m in rows:
+            age_blob = ""
+            if m.birth_year:
+                age_blob = f", {this_year - m.birth_year} лет"
+            elif m.age_hint:
+                age_blob = f", {m.age_hint}"
+            notes_blob = f" — {m.notes}" if m.notes else ""
+            lines.append(
+                f"  [{m.id}] {m.name} ({m.role}{age_blob}){notes_blob}"
+            )
+        return "\n".join(lines)
+
+    @lc_tool
+    def update_family_member(
+        member_id: str,
+        name: str | None = None,
+        role: str | None = None,
+        birth_year: int | None = None,
+        age_hint: str | None = None,
+        notes: str | None = None,
+    ) -> str:
+        """Update fields of an existing family member.
+
+        Pass None / leave out args you don't want to change. Use when
+        user corrects info: "Маше 9 уже" → set birth_year or age_hint;
+        "у Никиты аллергия на молоко теперь" → set notes.
+
+        Args:
+            member_id: id from list_family_members (``fm_...``).
+            name / role / birth_year / age_hint / notes: new values.
+                Roles: self | spouse | child | parent | other.
+
+        Returns ok:updated or error.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            row = family_service.update_member(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                member_id=member_id.strip(),
+                name=name,
+                role=role,
+                birth_year=birth_year,
+                age_hint=age_hint,
+                notes=notes,
+            )
+        except ValueError as exc:
+            return f"error: {exc}"
+        except Exception:  # noqa: BLE001
+            logger.exception("update_family_member failed")
+            return "error: internal"
+        return "ok:updated" if row else f"error: member {member_id!r} not found"
+
+    @lc_tool
+    def remove_family_member(member_id: str) -> str:
+        """Delete a family member record. Use only when user explicitly
+        says to remove someone (moved out, no longer applicable)."""
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            ok = family_service.remove_member(
+                tenant_id=tenant_id, user_id=user_id, member_id=member_id.strip()
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("remove_family_member failed")
+            return "error: internal"
+        return "ok:removed" if ok else f"error: member {member_id!r} not found"
+
     @lc_tool
     def clear_menu(week_start: str) -> str:
         """Delete the weekly menu for the given week.
@@ -955,4 +1096,8 @@ def build_housewife_tools(
         list_menu,
         clear_menu,
         generate_shopping_from_menu,
+        add_family_members,
+        list_family_members,
+        update_family_member,
+        remove_family_member,
     ]
