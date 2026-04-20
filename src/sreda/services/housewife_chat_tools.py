@@ -22,6 +22,7 @@ from sreda.services.housewife_onboarding import (
     HousewifeOnboardingService,
 )
 from sreda.services.housewife_reminders import HousewifeReminderService
+from sreda.services.housewife_shopping import HousewifeShoppingService
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,170 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:complete:status={state.get('status')}"
 
+    # ----------------------------------------------------------------
+    # Shopping tools (v1.1). Single global per-user list; the LLM
+    # classifies categories on add. UI groups visually; chat can add
+    # / remove / check off items. See services/housewife_shopping.py
+    # for state lifecycle.
+    # ----------------------------------------------------------------
+    shopping_service = HousewifeShoppingService(session)
+
+    @lc_tool
+    def add_shopping_items(items: list[dict[str, Any]]) -> str:
+        """Add items to the user's shopping list.
+
+        Batch-add — one call for everything the user mentioned, not one
+        call per item. Each item is a dict; only ``title`` is required.
+
+        Args:
+            items: List of {title, quantity_text?, category?} dicts.
+                • title — item name ("молоко", "батон нарезной"). Free form.
+                • quantity_text — free-form quantity label ("1 л", "2 шт",
+                  "500 г"). Optional. No math done on it.
+                • category — ONE of: молочные, мясо_рыба, овощи_фрукты,
+                  хлеб, бакалея, напитки, готовое, замороженное,
+                  бытовая_химия, другое.
+                  Best-effort classify yourself — молоко→молочные,
+                  хлеб→хлеб, etc. Unknown → "другое" (tool auto-maps).
+
+        Example:
+            add_shopping_items([
+                {"title": "молоко", "quantity_text": "1 л", "category": "молочные"},
+                {"title": "хлеб", "category": "хлеб"},
+                {"title": "помидоры", "quantity_text": "1 кг", "category": "овощи_фрукты"},
+            ])
+
+        Returns a short status string with how many rows were inserted
+        and the ids (needed if the user immediately changes their mind
+        and you need to remove_shopping_items the last add).
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not items:
+            return "error: empty items list"
+        try:
+            rows = shopping_service.add_items(
+                tenant_id=tenant_id, user_id=user_id, items=items
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("add_shopping_items failed")
+            return "error: internal"
+        if not rows:
+            return "ok:added:0"
+        ids_csv = ",".join(r.id for r in rows)
+        return f"ok:added:{len(rows)}:ids=[{ids_csv}]"
+
+    @lc_tool
+    def mark_shopping_bought(item_ids: list[str]) -> str:
+        """Mark shopping list items as bought (checked off).
+
+        Call when the user says they've bought something. Items move to
+        ``bought`` status and disappear from the normal view. Batch —
+        one call for all items the user mentioned.
+
+        Args:
+            item_ids: List of ids (each starts with ``sh_``) to mark as
+                bought. Get the ids from the most recent ``list_shopping``
+                output or from an earlier ``add_shopping_items`` return.
+
+        Returns ``ok:bought:N`` with the count actually updated.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not item_ids:
+            return "error: empty item_ids"
+        try:
+            n = shopping_service.mark_bought(
+                tenant_id=tenant_id, user_id=user_id, ids=item_ids
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("mark_shopping_bought failed")
+            return "error: internal"
+        return f"ok:bought:{n}"
+
+    @lc_tool
+    def remove_shopping_items(item_ids: list[str]) -> str:
+        """Remove items from the shopping list (cancel without buying).
+
+        Use when the user says "убери молоко из списка" / "не надо
+        хлеб" / "перехотел". Different from mark_shopping_bought —
+        these items were never bought. Both move out of the user's view.
+
+        Args:
+            item_ids: List of ids to cancel.
+
+        Returns ``ok:removed:N``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not item_ids:
+            return "error: empty item_ids"
+        try:
+            n = shopping_service.remove_items(
+                tenant_id=tenant_id, user_id=user_id, ids=item_ids
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("remove_shopping_items failed")
+            return "error: internal"
+        return f"ok:removed:{n}"
+
+    @lc_tool
+    def list_shopping() -> str:
+        """List the user's pending (not-yet-bought, not-cancelled)
+        shopping items.
+
+        Returns a compact text dump grouped by category with ids so
+        subsequent mark_shopping_bought / remove_shopping_items can
+        reference rows. Use when the user asks "что в списке?",
+        "что покупать?", "сколько осталось?".
+
+        Empty list returns the exact string ``no shopping items``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            rows = shopping_service.list_pending(
+                tenant_id=tenant_id, user_id=user_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("list_shopping failed")
+            return "error: internal"
+        if not rows:
+            return "no shopping items"
+
+        # Group by category in the service's taxonomy order (already sorted).
+        lines: list[str] = ["pending shopping items:"]
+        current_cat: str | None = None
+        for r in rows:
+            if r.category != current_cat:
+                current_cat = r.category
+                lines.append(f"[{current_cat}]")
+            qty = f" ({r.quantity_text})" if r.quantity_text else ""
+            lines.append(f"  [{r.id}] {r.title}{qty}")
+        return "\n".join(lines)
+
+    @lc_tool
+    def clear_bought_shopping() -> str:
+        """Cancel all items currently in the ``bought`` state — use as
+        bulk housekeeping when the user has finished a shopping trip
+        and wants a clean list for next time.
+
+        This doesn't affect ``pending`` items; it just moves already-
+        checked-off rows out of the history view.
+
+        Returns ``ok:cleared:N``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            n = shopping_service.clear_bought(
+                tenant_id=tenant_id, user_id=user_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("clear_bought_shopping failed")
+            return "error: internal"
+        return f"ok:cleared:{n}"
+
     return [
         schedule_reminder,
         list_reminders,
@@ -268,4 +433,9 @@ def build_housewife_tools(
         onboarding_answered,
         onboarding_deferred,
         onboarding_complete,
+        add_shopping_items,
+        mark_shopping_bought,
+        remove_shopping_items,
+        list_shopping,
+        clear_bought_shopping,
     ]
