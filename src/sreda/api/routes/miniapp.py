@@ -31,6 +31,7 @@ from sreda.services.billing import (
 )
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.housewife_reminders import HousewifeReminderService
+from sreda.services.housewife_shopping import HousewifeShoppingService
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     resolve_tenant_from_telegram_id,
@@ -753,3 +754,119 @@ def cancel_reminder(
     if not ok:
         raise HTTPException(status_code=404, detail="reminder_not_found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# JSON API — Shopping list (housewife v1.1)
+# ---------------------------------------------------------------------------
+
+
+class ShoppingItemCreate(BaseModel):
+    """Mini App inline "+ Добавить" input. Only title is required;
+    category defaults to ``другое`` server-side and the LLM can later
+    re-classify in a follow-up chat turn."""
+
+    title: str
+    quantity_text: str | None = None
+    category: str | None = None
+
+
+def _shopping_item_to_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "title": row.title,
+        "quantity_text": row.quantity_text,
+        "category": row.category,
+        "status": row.status,
+        "added_at": _iso(row.added_at),
+    }
+
+
+@router.get("/api/v1/shopping")
+def list_shopping(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """All ``pending`` shopping items for (tenant, user), ordered by
+    the fixed category taxonomy (матчится со store-aisle раскладкой,
+    не по алфавиту). Front-end groups by ``category`` field."""
+    service = HousewifeShoppingService(session)
+    rows = service.list_pending(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+    return {"items": [_shopping_item_to_dict(r) for r in rows]}
+
+
+@router.post("/api/v1/shopping")
+def add_shopping_item(
+    body: ShoppingItemCreate,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Add one item from the Mini App inline input. LLM-driven bulk
+    adds use the chat tool (``add_shopping_items``) — this endpoint
+    is the UI-side "+ Добавить" button."""
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="empty_title")
+    service = HousewifeShoppingService(session)
+    rows = service.add_items(
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        items=[
+            {
+                "title": title,
+                "quantity_text": body.quantity_text,
+                "category": body.category,
+            }
+        ],
+    )
+    if not rows:
+        raise HTTPException(status_code=400, detail="insert_failed")
+    return {"ok": True, "item": _shopping_item_to_dict(rows[0])}
+
+
+@router.post("/api/v1/shopping/{item_id}/bought")
+def mark_shopping_bought_endpoint(
+    item_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Checkbox flip in Mini App → ``status='bought'``."""
+    service = HousewifeShoppingService(session)
+    n = service.mark_bought(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, ids=[item_id]
+    )
+    if n == 0:
+        raise HTTPException(status_code=404, detail="item_not_found")
+    return {"ok": True}
+
+
+@router.delete("/api/v1/shopping/{item_id}")
+def delete_shopping_item(
+    item_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Trash icon / swipe-to-delete — cancel without buying.
+
+    Semantically different from mark-bought: user never bought it, they
+    just removed it from the list. Both hide from ``list_pending``.
+    """
+    service = HousewifeShoppingService(session)
+    n = service.remove_items(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, ids=[item_id]
+    )
+    if n == 0:
+        raise HTTPException(status_code=404, detail="item_not_found")
+    return {"ok": True}
+
+
+@router.post("/api/v1/shopping/clear-bought")
+def clear_bought_shopping_endpoint(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Bulk housekeeping — cancel every item in ``bought`` state.
+    Used by the Mini App "Очистить купленное" button."""
+    service = HousewifeShoppingService(session)
+    n = service.clear_bought(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+    return {"ok": True, "cleared": n}

@@ -19,6 +19,7 @@
     plans: null,
     menu: null,
     reminders: null,
+    shopping: null,
     loading: true,
     error: null,
   };
@@ -72,6 +73,18 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.reminders = { items: [], _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadShopping() {
+    return apiFetch("/miniapp/api/v1/shopping").then(function(res) {
+      state.shopping = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.shopping = { items: [], _error: true };
         render();
       }
     });
@@ -318,6 +331,83 @@
     return html;
   }
 
+  // --- Screen: Shopping (#/shopping) ---
+  // User-visible category labels. Keys must match the backend taxonomy
+  // (see services/housewife_shopping.py::SHOPPING_CATEGORIES).
+  var _SHOPPING_CATEGORY_LABELS = {
+    "молочные": "Молочные",
+    "мясо_рыба": "Мясо и рыба",
+    "овощи_фрукты": "Овощи и фрукты",
+    "хлеб": "Хлеб",
+    "бакалея": "Бакалея",
+    "напитки": "Напитки",
+    "готовое": "Готовое",
+    "замороженное": "Замороженное",
+    "бытовая_химия": "Бытовая химия",
+    "другое": "Другое"
+  };
+
+  function renderShopping() {
+    setupBackButton(true);
+    var html = '<h1>\uD83D\uDED2 Покупки</h1>';
+
+    // Inline "+ Добавить" input at the top — simpler than a modal.
+    // Using a form so Enter on mobile submits naturally.
+    html += '<form class="card" onsubmit="return window._addShoppingItem(event)">';
+    html += '<input type="text" id="shopping-new-input" placeholder="Что добавить в список?" ';
+    html += 'style="width:100%;padding:10px;border:1px solid var(--tg-theme-hint-color,#aaa);';
+    html += 'border-radius:8px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);font-size:15px" />';
+    html += '<button type="submit" class="btn btn-primary mt-8" style="width:100%">Добавить</button>';
+    html += '</form>';
+
+    if (state.shopping === null) {
+      loadShopping();
+      return html + renderLoading();
+    }
+    var items = (state.shopping && state.shopping.items) || [];
+    if (state.shopping && state.shopping._error) {
+      return html + '<div class="error-state">Не удалось загрузить список.</div>';
+    }
+    if (items.length === 0) {
+      html += '<div class="empty-state">';
+      html += 'Список пуст.<br><br>';
+      html += 'Напиши боту «добавь в список молоко и хлеб» — или ';
+      html += 'введи вручную сверху.';
+      html += '</div>';
+      return html;
+    }
+
+    // Group by category (items are already sorted by taxonomy order
+    // server-side — we just emit a header whenever the category changes).
+    var currentCategory = null;
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.category !== currentCategory) {
+        currentCategory = it.category;
+        var label = _SHOPPING_CATEGORY_LABELS[currentCategory] || currentCategory;
+        html += '<div class="section-title">' + escHtml(label) + '</div>';
+      }
+      html += '<div class="card" style="display:flex;align-items:center;gap:12px">';
+      // Check-box — tap to mark bought
+      html += '<div onclick="window._markShoppingBought(\'' + escHtml(it.id) + '\')" ';
+      html += 'style="width:28px;height:28px;border:2px solid var(--tg-theme-hint-color,#aaa);';
+      html += 'border-radius:6px;flex-shrink:0;cursor:pointer"></div>';
+      // Title + optional quantity
+      html += '<div style="flex:1">';
+      html += '<div class="card-title" style="margin:0">' + escHtml(it.title) + '</div>';
+      if (it.quantity_text) {
+        html += '<div class="card-subtitle" style="margin:0">' + escHtml(it.quantity_text) + '</div>';
+      }
+      html += '</div>';
+      // Delete icon
+      html += '<div onclick="window._deleteShoppingItem(\'' + escHtml(it.id) + '\', \'' + escHtml(it.title).replace(/\'/g, "") + '\')" ';
+      html += 'style="font-size:20px;color:var(--tg-theme-destructive-text-color,#e04b4b);cursor:pointer;padding:4px 8px">\u00d7</div>';
+      html += '</div>';
+    }
+    html += '<div class="card-subtitle" style="text-align:center;margin-top:16px">Всего: ' + items.length + '</div>';
+    return html;
+  }
+
   // --- Screen: EDS Monitor skill (#/skill/eds_monitor) ---
   function renderEdsSkill() {
     setupBackButton(true);
@@ -500,6 +590,8 @@
       html = renderSubscriptions();
     } else if (route === "/reminders") {
       html = renderReminders();
+    } else if (route === "/shopping") {
+      html = renderShopping();
     } else if (route === "/skill/eds_monitor") {
       html = renderEdsSkill();
     } else if (route.indexOf("/skill/") === 0) {
@@ -537,6 +629,59 @@
       doAction("/miniapp/api/v1/cancel", { plan_key: planKey })
         .then(function() { navigate("/subscriptions"); })
         .catch(function() { showAlert("Не удалось отключить."); });
+    });
+  };
+
+  // ---- Shopping actions ----
+  window._addShoppingItem = function(event) {
+    if (event) event.preventDefault();
+    var inp = document.getElementById("shopping-new-input");
+    var title = (inp && inp.value || "").trim();
+    if (!title) return false;
+    apiFetch("/miniapp/api/v1/shopping", {
+      method: "POST",
+      body: { title: title }
+    }).then(function(res) {
+      if (res && res.ok) {
+        if (inp) inp.value = "";
+        state.shopping = null;
+        state.menu = null; // refresh dashboard counter
+        loadData().then(function() { loadShopping(); });
+      } else {
+        showAlert("Не удалось добавить.");
+      }
+    }).catch(function() { showAlert("Не удалось добавить."); });
+    return false;
+  };
+
+  window._markShoppingBought = function(itemId) {
+    apiFetch("/miniapp/api/v1/shopping/" + itemId + "/bought", {
+      method: "POST",
+      body: {}
+    }).then(function(res) {
+      if (res && res.ok) {
+        state.shopping = null;
+        state.menu = null;
+        loadData().then(function() { loadShopping(); });
+      } else {
+        showAlert("Не удалось отметить.");
+      }
+    }).catch(function() { showAlert("Не удалось отметить."); });
+  };
+
+  window._deleteShoppingItem = function(itemId, title) {
+    showPopup("Убрать «" + title + "» из списка?", function() {
+      apiFetch("/miniapp/api/v1/shopping/" + itemId, {
+        method: "DELETE"
+      }).then(function(res) {
+        if (res && res.ok) {
+          state.shopping = null;
+          state.menu = null;
+          loadData().then(function() { loadShopping(); });
+        } else {
+          showAlert("Не удалось убрать.");
+        }
+      }).catch(function() { showAlert("Не удалось убрать."); });
     });
   };
 
