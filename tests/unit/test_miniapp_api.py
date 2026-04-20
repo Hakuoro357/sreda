@@ -123,14 +123,22 @@ class TestMiniAppAuth:
         )
         assert resp.status_code == 401
 
-    def test_unknown_user_returns_401(self, client):
-        # Valid signature but user not in DB
+    def test_unknown_user_auto_provisioned(self, client):
+        # Valid signature but user not in DB — Mini App must be usable
+        # immediately, so the auth layer lazily provisions a tenant
+        # bundle instead of 401. See _require_miniapp_auth.
         init_data = _make_init_data(user_id=999999)
         resp = client.get(
             "/miniapp/api/v1/summary",
             headers={"Authorization": f"tma {init_data}"},
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 200
+        data = resp.json()
+        # Freshly provisioned — no active skills, EDS Monitor in available.
+        assert data["active_skills"] == []
+        assert any(
+            s["plan_key"] == "eds_monitor_base" for s in data["available_skills"]
+        )
 
 
 class TestMiniAppSummary:

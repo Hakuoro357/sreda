@@ -52,10 +52,64 @@ def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnbo
         )
 
     display_name = _extract_display_name(payload) or f"Пользователь {chat_id}"
-    tenant_id = f"tenant_tg_{chat_id}"
-    workspace_id = f"workspace_tg_{chat_id}"
-    user_id = f"user_tg_{chat_id}"
-    assistant_id = f"assistant_tg_{chat_id}"
+    return ensure_telegram_user_bundle_by_id(
+        session, telegram_id=chat_id, display_name=display_name
+    )
+
+
+def ensure_telegram_user_bundle_by_id(
+    session: Session,
+    *,
+    telegram_id: str,
+    display_name: str | None = None,
+) -> TelegramOnboardingResult:
+    """Ensure a tenant/user/assistant bundle exists for a Telegram account.
+
+    Unlike ``ensure_telegram_user_bundle``, this variant does not require
+    a webhook payload — used by Mini App auth to lazily provision a bundle
+    when the user opens the WebApp before ever sending /start. The
+    WebApp's initData hash is signed by Telegram, so the telegram_id is
+    trustworthy at this point.
+
+    Returns the same ``TelegramOnboardingResult`` shape. ``is_new_user``
+    is True only when a new bundle was actually created.
+    """
+    if not telegram_id:
+        return TelegramOnboardingResult(False, None, None, None, None, None)
+
+    existing_user = (
+        session.query(User).filter(User.telegram_account_id == telegram_id).one_or_none()
+    )
+    if existing_user is not None:
+        assistant = (
+            session.query(Assistant)
+            .filter(Assistant.tenant_id == existing_user.tenant_id)
+            .order_by(Assistant.id.asc())
+            .first()
+        )
+        workspace_id = assistant.workspace_id if assistant is not None else None
+        if workspace_id is None:
+            workspace = (
+                session.query(Workspace)
+                .filter(Workspace.tenant_id == existing_user.tenant_id)
+                .order_by(Workspace.id.asc())
+                .first()
+            )
+            workspace_id = workspace.id if workspace is not None else None
+        return TelegramOnboardingResult(
+            False,
+            telegram_id,
+            existing_user.tenant_id,
+            workspace_id,
+            existing_user.id,
+            assistant.id if assistant is not None else None,
+        )
+
+    display_name = display_name or f"Пользователь {telegram_id}"
+    tenant_id = f"tenant_tg_{telegram_id}"
+    workspace_id = f"workspace_tg_{telegram_id}"
+    user_id = f"user_tg_{telegram_id}"
+    assistant_id = f"assistant_tg_{telegram_id}"
 
     SeedRepository(session).ensure_tenant_bundle(
         tenant_id=tenant_id,
@@ -63,13 +117,15 @@ def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnbo
         workspace_id=workspace_id,
         workspace_name=display_name,
         user_id=user_id,
-        telegram_account_id=chat_id,
+        telegram_account_id=telegram_id,
         assistant_id=assistant_id,
         assistant_name="Среда",
         eds_monitor_enabled=False,
     )
 
-    return TelegramOnboardingResult(True, chat_id, tenant_id, workspace_id, user_id, assistant_id)
+    return TelegramOnboardingResult(
+        True, telegram_id, tenant_id, workspace_id, user_id, assistant_id
+    )
 
 
 def build_welcome_message() -> tuple[str, dict | None]:

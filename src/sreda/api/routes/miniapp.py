@@ -35,6 +35,7 @@ from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
+from sreda.services.onboarding import ensure_telegram_user_bundle_by_id
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     resolve_tenant_from_telegram_id,
@@ -91,9 +92,49 @@ def _require_miniapp_auth(
 
     resolved = resolve_tenant_from_telegram_id(session, webapp_user.telegram_id)
     if resolved is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user_not_found")
-
-    tenant_id, user_id = resolved
+        # User has a valid Telegram-signed initData but never triggered the
+        # bot webhook (e.g. opened the Mini App directly via menu button or
+        # deep link before sending /start). Hash was signed by Telegram —
+        # trust it and provision a bundle lazily so the Mini App is usable
+        # immediately instead of returning 401 user_not_found.
+        display_name = (
+            (webapp_user.first_name or "").strip()
+            or (webapp_user.username or "").strip()
+            or None
+        )
+        try:
+            onboarding = ensure_telegram_user_bundle_by_id(
+                session,
+                telegram_id=webapp_user.telegram_id,
+                display_name=display_name,
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception(
+                "miniapp auth: lazy provision failed for tg=%s",
+                webapp_user.telegram_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="provision_failed",
+            )
+        logger.info(
+            "miniapp auth: lazily provisioned bundle tg=%s tenant=%s user=%s new=%s",
+            webapp_user.telegram_id,
+            onboarding.tenant_id,
+            onboarding.user_id,
+            onboarding.is_new_user,
+        )
+        if onboarding.tenant_id is None or onboarding.user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="provision_incomplete",
+            )
+        tenant_id = onboarding.tenant_id
+        user_id = onboarding.user_id
+    else:
+        tenant_id, user_id = resolved
 
     # Resolve workspace_id for connect link creation
     from sreda.db.models.core import Assistant, Workspace
@@ -900,6 +941,10 @@ def _recipe_summary_dict(row) -> dict:
         "source": row.source,
         "source_url": row.source_url,
         "tags": tags,
+        "calories_per_serving": row.calories_per_serving,
+        "protein_per_serving": row.protein_per_serving,
+        "fat_per_serving": row.fat_per_serving,
+        "carbs_per_serving": row.carbs_per_serving,
         "created_at": _iso(row.created_at),
     }
 
@@ -976,7 +1021,8 @@ def delete_recipe_endpoint(
 
 def _menu_item_dict(item) -> dict:
     """Serialise one menu cell for the week grid. Includes the linked
-    recipe's title if any so the UI doesn't need a second request."""
+    recipe's title + per-serving calories if any — saves a round-trip
+    when the UI wants to sum "day total kcal"."""
     out = {
         "id": item.id,
         "day_of_week": item.day_of_week,
@@ -985,9 +1031,11 @@ def _menu_item_dict(item) -> dict:
         "free_text": item.free_text,
         "notes": item.notes,
         "recipe_title": None,
+        "recipe_calories": None,
     }
     if item.recipe_id and item.recipe is not None:
         out["recipe_title"] = item.recipe.title
+        out["recipe_calories"] = item.recipe.calories_per_serving
     return out
 
 
