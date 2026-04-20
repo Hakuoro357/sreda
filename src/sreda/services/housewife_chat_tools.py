@@ -446,6 +446,10 @@ def build_housewife_tools(
         source: str,
         source_url: str | None = None,
         tags: list[str] | None = None,
+        calories_per_serving: float | None = None,
+        protein_per_serving: float | None = None,
+        fat_per_serving: float | None = None,
+        carbs_per_serving: float | None = None,
     ) -> str:
         """Save ONE recipe to the user's recipe book.
 
@@ -459,6 +463,12 @@ def build_housewife_tools(
         or when promoting a menu free_text into a structured recipe.
         Always classify the origin via the ``source`` arg — the UI
         shows a badge per source type.
+
+        ALWAYS estimate nutrition per serving (kcal + B/Ж/У in grams)
+        unless the recipe has no structured ingredients. ±20%
+        accuracy from ingredient knowledge is fine for a household
+        planner. Skip only if genuinely unknowable (fancy restaurant
+        dish with no ingredient list, etc.).
 
         Args:
             title: Short name of the dish. Imperative-free ("Борщ",
@@ -496,6 +506,10 @@ def build_housewife_tools(
                 source=source,
                 source_url=source_url,
                 tags=tags,
+                calories_per_serving=calories_per_serving,
+                protein_per_serving=protein_per_serving,
+                fat_per_serving=fat_per_serving,
+                carbs_per_serving=carbs_per_serving,
             )
         except ValueError as exc:
             return f"error: {exc}"
@@ -522,7 +536,11 @@ def build_housewife_tools(
               "servings": 4,
               "source": "user_dictated",  # or ai_generated / web_found / upgraded_from_menu
               "source_url": null,         # only when source == web_found
-              "tags": ["суп"]              # optional
+              "tags": ["суп"],             # optional
+              "calories_per_serving": 320, # optional, ALWAYS estimate
+              "protein_per_serving": 12,   # grams; estimate from ingredients
+              "fat_per_serving": 8,
+              "carbs_per_serving": 45
             }
 
         Items with empty title or unknown ``source`` are silently

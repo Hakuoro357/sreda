@@ -582,7 +582,22 @@
     html += '<div class="card-subtitle" style="margin-bottom:12px">с ' + escHtml(plan.week_start_date) + '</div>';
 
     for (var d = 0; d < 7; d++) {
-      html += '<div class="section-title">' + escHtml(_MENU_DAYS_RU[d]) + '</div>';
+      // Compute day-total calories on the fly (sum of recipe cells
+      // that have per-serving nutrition). Free-text cells skipped.
+      var dayKcal = 0;
+      var kcalHasAny = false;
+      for (var mk = 0; mk < _MEAL_ORDER.length; mk++) {
+        var ck = byCell[d + ":" + _MEAL_ORDER[mk]];
+        if (ck && ck.recipe_calories != null) {
+          dayKcal += ck.recipe_calories;
+          kcalHasAny = true;
+        }
+      }
+      var title = _MENU_DAYS_RU[d];
+      if (kcalHasAny) {
+        title += " \u00b7 ~" + Math.round(dayKcal) + " ккал";
+      }
+      html += '<div class="section-title">' + escHtml(title) + '</div>';
       html += '<div class="card">';
       var hasAny = false;
       for (var m = 0; m < _MEAL_ORDER.length; m++) {
@@ -696,6 +711,26 @@
     }
     html += '</div>';
     html += '<div class="card-subtitle">На ' + detail.servings + ' чел</div>';
+
+    // Nutrition — per-serving if available. Skip block entirely if
+    // all four are null (recipe saved before nutrition rollout or
+    // LLM couldn't estimate).
+    var nutriBits = [];
+    if (detail.calories_per_serving != null) {
+      nutriBits.push(Math.round(detail.calories_per_serving) + ' ккал');
+    }
+    if (detail.protein_per_serving != null) {
+      nutriBits.push('Б ' + Math.round(detail.protein_per_serving) + 'г');
+    }
+    if (detail.fat_per_serving != null) {
+      nutriBits.push('Ж ' + Math.round(detail.fat_per_serving) + 'г');
+    }
+    if (detail.carbs_per_serving != null) {
+      nutriBits.push('У ' + Math.round(detail.carbs_per_serving) + 'г');
+    }
+    if (nutriBits.length) {
+      html += '<div class="card-subtitle">На порцию: ' + nutriBits.join(' · ') + '</div>';
+    }
 
     if (detail.ingredients && detail.ingredients.length) {
       html += '<div class="section-title">Ингредиенты</div>';

@@ -78,13 +78,21 @@ class HousewifeRecipeService:
         source: str = "user_dictated",
         source_url: str | None = None,
         tags: list[str] | None = None,
+        calories_per_serving: float | None = None,
+        protein_per_serving: float | None = None,
+        fat_per_serving: float | None = None,
+        carbs_per_serving: float | None = None,
     ) -> Recipe:
         """Insert a new recipe row plus its ingredient rows atomically.
 
         ``source`` must be one of RECIPE_SOURCES (enforced). ``title``
         is required and non-empty. Ingredients normalise empty titles
         out — a recipe with zero ingredients is still legal (a free-
-        form instructions-only recipe) but we never add empty ones."""
+        form instructions-only recipe) but we never add empty ones.
+
+        Nutrition args are all optional per-serving floats. LLM fills
+        at save time with best-effort estimates from its food knowledge
+        (~±20% accuracy). Negative values / NaN are coerced to None."""
         title_clean = (title or "").strip()
         if not title_clean:
             raise ValueError("title required")
@@ -102,6 +110,10 @@ class HousewifeRecipeService:
             description=None,
             instructions_md=(instructions_md or None),
             servings=servings,
+            calories_per_serving=_clean_nutrient(calories_per_serving),
+            protein_per_serving=_clean_nutrient(protein_per_serving),
+            fat_per_serving=_clean_nutrient(fat_per_serving),
+            carbs_per_serving=_clean_nutrient(carbs_per_serving),
             source=source,
             source_url=(source_url or None),
             tags_json=json.dumps(tags, ensure_ascii=False) if tags else None,
@@ -176,6 +188,10 @@ class HousewifeRecipeService:
                 description=None,
                 instructions_md=(raw.get("instructions_md") or None),
                 servings=servings,
+                calories_per_serving=_clean_nutrient(raw.get("calories_per_serving")),
+                protein_per_serving=_clean_nutrient(raw.get("protein_per_serving")),
+                fat_per_serving=_clean_nutrient(raw.get("fat_per_serving")),
+                carbs_per_serving=_clean_nutrient(raw.get("carbs_per_serving")),
                 source=source,
                 source_url=(raw.get("source_url") or None),
                 tags_json=tags_json,
@@ -308,6 +324,21 @@ class HousewifeRecipeService:
             )
             .count()
         )
+
+
+def _clean_nutrient(value: Any) -> float | None:
+    """Coerce an LLM-supplied nutrient value to a non-negative float or
+    None. Handles strings ("450"), negatives (→ None), and non-numeric
+    junk (→ None) gracefully."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f < 0 or f != f:  # negative or NaN
+        return None
+    return f
 
 
 def _normalise_ingredients(
