@@ -197,8 +197,47 @@ def miniapp_page(request: Request) -> HTMLResponse:
     settings = get_settings()
     base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
     template = _jinja_env.get_template("subscriptions.html")
-    html = template.render(base_url=base_url)
-    return HTMLResponse(content=html)
+    # Embed a server-side build stamp so we can confirm what code the
+    # client actually received (iOS Telegram WebView caches aggressively
+    # and bug reports sometimes involve stale HTML).
+    build_stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    html = template.render(base_url=base_url, build_stamp=build_stamp)
+    # no-store + no-cache forces the Telegram WebView to re-fetch every
+    # time the WebApp is opened, so we never serve a stale subscriptions
+    # shell after a deploy.
+    return HTMLResponse(
+        content=html,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@router.post("/api/v1/client-diagnostic")
+async def client_diagnostic(request: Request) -> dict:
+    """Unauthenticated diagnostic sink.
+
+    The Mini App JS posts here when something prevents the normal
+    bootstrap (e.g. ``window.Telegram.WebApp.initData`` is empty). We
+    log the payload so we can tell from server logs whether the client
+    even reached JS, what User-Agent it was, and what diagnostic the
+    frontend found — instead of staring at a white screen with no trace.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    logger.warning(
+        "miniapp client-diagnostic: reason=%r has_tg=%r ua=%r ip=%s body=%r",
+        (body.get("reason") if isinstance(body, dict) else None),
+        (body.get("has_tg") if isinstance(body, dict) else None),
+        (body.get("ua") if isinstance(body, dict) else None),
+        request.client.host if request.client else "?",
+        body,
+    )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

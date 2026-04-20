@@ -5,26 +5,54 @@
 (function() {
   "use strict";
 
+  var BUILD_STAMP = "{{ build_stamp }}";
   var tg = window.Telegram && window.Telegram.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
 
   var initData = tg ? tg.initData : "";
   var $app = document.getElementById("app");
 
+  // Always ping the server once on load with what the client sees — we
+  // want server-side confirmation that JS actually ran, what TG reported
+  // and which build the client got. This is unauth'd — just diagnostics.
+  function _postDiag(reason) {
+    try {
+      fetch("{{ base_url }}/miniapp/api/v1/client-diagnostic", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          reason: reason,
+          build: BUILD_STAMP,
+          has_tg: !!tg,
+          init_data_len: initData ? initData.length : 0,
+          ua: navigator.userAgent,
+        }),
+        keepalive: true,
+      });
+    } catch (e) {}
+  }
+  _postDiag("page_load");
+
   // If initData is missing (e.g. page opened in a plain browser or via
   // a shared link outside the Telegram client), server-side auth is
-  // impossible. Show a clear message instead of firing requests that
-  // will all 401 and leave the user staring at a white screen.
+  // impossible. Show a clear, VERY visible message instead of firing
+  // requests that will all 401 and leave the user staring at a white
+  // screen. Inline styles so we don't depend on theme vars.
   if (!initData) {
     var msg = !tg
       ? "Это приложение открывается только внутри Telegram."
-      : "Не удалось получить данные Telegram. Откройте приложение через кнопку в чате бота (а не по прямой ссылке).";
+      : "Не удалось получить данные Telegram. Закройте и откройте приложение через кнопку в чате бота.";
     console.warn("miniapp: initData missing", {hasTg: !!tg, ua: navigator.userAgent});
-    $app.innerHTML =
-      '<div class="card" style="margin:16px;padding:24px;">' +
-      '<h2 style="margin-top:0;">Не удалось открыть</h2>' +
-      '<p>' + msg + '</p>' +
-      '</div>';
+    if ($app) {
+      $app.innerHTML =
+        '<div style="margin:16px;padding:24px;background:#ffeaea;' +
+        'border:1px solid #e57373;border-radius:12px;color:#000;">' +
+        '<h2 style="margin:0 0 12px 0;font-size:18px;color:#b71c1c;">Не удалось открыть</h2>' +
+        '<p style="margin:0 0 12px 0;line-height:1.4;">' + msg + '</p>' +
+        '<p style="margin:0;font-size:11px;color:#777;">build ' + BUILD_STAMP + '</p>' +
+        '</div>';
+    }
+    _postDiag("no_init_data");
     return;
   }
 
