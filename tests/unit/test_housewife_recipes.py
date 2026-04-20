@@ -325,3 +325,87 @@ def test_delete_recipe_returns_false_for_unknown_id(session):
     assert svc.delete_recipe(
         tenant_id="t1", user_id="u1", recipe_id="rec_bogus"
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# save_recipes_batch — added to unblock "сохрани 18 рецептов" workflows
+# ---------------------------------------------------------------------------
+
+
+def test_save_recipes_batch_persists_all(session):
+    svc = HousewifeRecipeService(session)
+    created = svc.save_recipes_batch(
+        tenant_id="t1", user_id="u1",
+        recipes=[
+            {
+                "title": "Борщ",
+                "ingredients": [{"title": "свёкла"}, {"title": "капуста"}],
+                "instructions_md": "варить 40 мин",
+                "servings": 4,
+                "source": "ai_generated",
+            },
+            {
+                "title": "Омлет",
+                "ingredients": [{"title": "яйца", "quantity_text": "3 шт"}],
+                "instructions_md": "жарить 5 мин",
+                "servings": 2,
+                "source": "ai_generated",
+            },
+            {
+                "title": "Паста",
+                "ingredients": [{"title": "паста"}, {"title": "сыр"}],
+                "instructions_md": "варить 10 мин",
+                "servings": 2,
+                "source": "ai_generated",
+            },
+        ],
+    )
+    assert len(created) == 3
+    titles = {r.title for r in created}
+    assert titles == {"Борщ", "Омлет", "Паста"}
+
+    # Ingredients persisted
+    assert session.query(RecipeIngredient).count() == 5
+
+
+def test_save_recipes_batch_skips_invalid_items(session):
+    """A bad entry shouldn't nuke the whole batch."""
+    svc = HousewifeRecipeService(session)
+    created = svc.save_recipes_batch(
+        tenant_id="t1", user_id="u1",
+        recipes=[
+            {"title": "Good", "ingredients": [{"title": "x"}], "source": "user_dictated"},
+            {"title": "", "ingredients": [], "source": "user_dictated"},     # empty title
+            {"title": "Bad source", "ingredients": [], "source": "mystery"}, # invalid source
+            "not a dict",                                                     # wrong shape
+            {"title": "Also Good", "ingredients": [], "source": "ai_generated"},
+        ],
+    )
+    assert len(created) == 2
+    titles = {r.title for r in created}
+    assert titles == {"Good", "Also Good"}
+
+
+def test_save_recipes_batch_tags_json_encoded(session):
+    svc = HousewifeRecipeService(session)
+    created = svc.save_recipes_batch(
+        tenant_id="t1", user_id="u1",
+        recipes=[
+            {
+                "title": "X",
+                "ingredients": [],
+                "source": "user_dictated",
+                "tags": ["суп", "быстрое"],
+            },
+        ],
+    )
+    assert created[0].tags_json == json.dumps(
+        ["суп", "быстрое"], ensure_ascii=False
+    )
+
+
+def test_save_recipes_batch_empty_list_returns_empty(session):
+    svc = HousewifeRecipeService(session)
+    assert svc.save_recipes_batch(
+        tenant_id="t1", user_id="u1", recipes=[]
+    ) == []

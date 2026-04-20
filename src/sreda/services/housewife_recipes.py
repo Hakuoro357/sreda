@@ -126,6 +126,82 @@ class HousewifeRecipeService:
         self.session.commit()
         return recipe
 
+    def save_recipes_batch(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        recipes: list[dict[str, Any]],
+    ) -> list[Recipe]:
+        """Batch version of ``save_recipe`` — one commit for all inputs.
+
+        Same per-recipe semantics (required title, ingredient
+        normalisation, source enum validation). Items that fail
+        validation are skipped silently — the whole batch shouldn't
+        die because one entry has an empty title.
+
+        Used by the LLM when the user asks for many recipes in one go
+        ("сохрани 18 рецептов из книги"). Keeps turn budget under
+        control by collapsing what would be N tool calls into one.
+        """
+        created: list[Recipe] = []
+        for raw in recipes or []:
+            if not isinstance(raw, dict):
+                continue
+            title = (raw.get("title") or "").strip()
+            if not title:
+                continue
+            source = raw.get("source") or "user_dictated"
+            if source not in RECIPE_SOURCES:
+                continue
+            servings = max(1, int(raw.get("servings") or 2))
+
+            normalised_ings = _normalise_ingredients(raw.get("ingredients"))
+
+            tags = raw.get("tags") or None
+            tags_json = None
+            if tags:
+                try:
+                    tags_json = json.dumps(
+                        [str(t) for t in tags], ensure_ascii=False
+                    )
+                except (TypeError, ValueError):
+                    tags_json = None
+
+            recipe = Recipe(
+                id=f"rec_{uuid4().hex[:24]}",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                title=title[:500],
+                description=None,
+                instructions_md=(raw.get("instructions_md") or None),
+                servings=servings,
+                source=source,
+                source_url=(raw.get("source_url") or None),
+                tags_json=tags_json,
+                created_at=_utcnow(),
+                updated_at=_utcnow(),
+            )
+            self.session.add(recipe)
+            self.session.flush()
+
+            for idx, ing in enumerate(normalised_ings):
+                self.session.add(
+                    RecipeIngredient(
+                        id=f"ring_{uuid4().hex[:20]}",
+                        recipe_id=recipe.id,
+                        title=ing.title,
+                        quantity_text=ing.quantity_text,
+                        is_optional=ing.is_optional,
+                        sort_order=idx,
+                    )
+                )
+            created.append(recipe)
+
+        if created:
+            self.session.commit()
+        return created
+
     def delete_recipe(
         self, *, tenant_id: str, user_id: str, recipe_id: str
     ) -> bool:

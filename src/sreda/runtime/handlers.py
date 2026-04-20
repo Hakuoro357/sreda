@@ -952,9 +952,9 @@ _CONVERSATION_SYSTEM_PROMPT = """\
     * «убери X», «перехотел X» → ``remove_shopping_items([ids])``.
     * «что в списке», «что покупать» → ``list_shopping()``.
 - Рецепты:
-    * user диктует рецепт → ``save_recipe(source="user_dictated", ...)`` с структурой ингредиентов.
-    * ты сам придумал рецепт и user говорит «сохрани» → ``save_recipe(source="ai_generated", ...)``.
-    * нашёл рецепт в интернете → ``save_recipe(source="web_found", source_url="...", ...)``.
+    * **Один рецепт** → ``save_recipe(title, ingredients, ..., source=...)``.
+    * **Много рецептов за раз** («сохрани все рецепты меню», «запиши 10 рецептов») → **ОБЯЗАТЕЛЬНО** ``save_recipes_batch([{title, ingredients, ...}, ...])`` одним вызовом. НЕ зови save_recipe в цикле — упрёшься в бюджет шагов.
+    * user диктует рецепт → source="user_dictated". Ты придумал и user сохраняет → "ai_generated". Нашёл в интернете → "web_found", source_url выставлен. Upgrade из меню → "upgraded_from_menu".
     * ПЕРЕД ``plan_week_menu`` всегда вызывай ``search_recipes("")`` чтобы увидеть книгу рецептов user'а. Минимум 50% блюд в меню должны ссылаться на сохранённые ``recipe_id``.
 - Меню на неделю:
     * «составь меню на неделю» → собери контекст из [ПАМЯТЬ] (аллергии, семья), вызови ``search_recipes("")``, потом ``plan_week_menu(week_start="...", days=[{"day_of_week":0, "meals":{"breakfast":{"recipe_id":"..."}, "lunch":{"free_text":"..."}, "dinner":{"recipe_id":"..."}}}, ...])``. 21 cell на 7 дней.
@@ -1439,12 +1439,14 @@ def execute_conversation_chat(
     messages.append(HumanMessage(content=user_text))
 
     # --- 4. Tool-call loop with per-call usage recording --------------
-    # Limit tuned to common chains (weather: search→fetch→format-switch→fetch
-    # easily hits 4-5; with log_unsupported_request preflight add another).
-    # If the model is still calling tools at the end of the budget, we do
-    # ONE final invoke without bind_tools so it is forced to summarise
-    # from what it has — beats the old "I couldn't form an answer" stub.
-    _MAX_TOOL_ITERATIONS = 8
+    # Limit tuned to common chains: weather lookup (search→fetch→format
+    # switch) ~ 4-5; "сохрани 18 рецептов" batches require ≤ 2 since
+    # save_recipes_batch consolidates; plan_week + search_recipes +
+    # generate_shopping_from_menu ~ 3-4. Bumped 8→12 in 2026-04-20
+    # after pilot exhaustion on a 18-recipe batch ended up partial.
+    # If still exhausted, one final tools-less invoke forces a summary
+    # so the user always gets a real reply (not a "budget exhausted" stub).
+    _MAX_TOOL_ITERATIONS = 12
 
     def _record_and_log(ai_msg: AIMessage, *, iteration: int) -> None:
         usage = getattr(ai_msg, "usage_metadata", None) or {}

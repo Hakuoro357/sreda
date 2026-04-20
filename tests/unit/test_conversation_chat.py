@@ -651,7 +651,7 @@ def test_tool_loop_exhaustion_forces_summary_turn(monkeypatch, tmp_path: Path):
     """
     session = _bootstrap(monkeypatch, tmp_path, "conv_exhaust.db")
     try:
-        # Script 8 tool-call responses (_MAX_TOOL_ITERATIONS = 8) so the
+        # Script _MAX_TOOL_ITERATIONS=12 tool-call responses so the
         # loop exhausts exactly as in prod. Then a plain-text response
         # which the forced summary invoke must pick up.
         def _tc_response(i: int) -> AIMessage:
@@ -666,7 +666,7 @@ def test_tool_loop_exhaustion_forces_summary_turn(monkeypatch, tmp_path: Path):
                 ],
             )
 
-        scripted = [_tc_response(i) for i in range(8)]
+        scripted = [_tc_response(i) for i in range(12)]
         scripted.append(
             AIMessage(content="На основе собранных данных: дождь идёт весь день.")
         )
@@ -691,8 +691,8 @@ def test_tool_loop_exhaustion_forces_summary_turn(monkeypatch, tmp_path: Path):
     assert "дождь идёт весь день" in sent_text
     assert "слишком много шагов" not in sent_text
 
-    # Exactly 9 LLM invocations: 8 in-loop + 1 forced summary.
-    assert fake_llm._bound.idx == 9
+    # Exactly 13 LLM invocations: 12 in-loop + 1 forced summary.
+    assert fake_llm._bound.idx == 13
 
 
 def test_tools_write_memories_with_correct_tier(monkeypatch, tmp_path: Path):

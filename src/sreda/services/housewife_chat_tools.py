@@ -446,14 +446,18 @@ def build_housewife_tools(
         source_url: str | None = None,
         tags: list[str] | None = None,
     ) -> str:
-        """Save a recipe to the user's recipe book.
+        """Save ONE recipe to the user's recipe book.
 
-        Use when the user explicitly asks to save ("сохрани рецепт"),
-        when you (the AI) generated a recipe the user liked and they
-        confirmed saving, when you fetched one from the web and the
-        user agreed, or when promoting a menu free_text into a structured
-        recipe. Always classify the origin via the ``source`` arg — the
-        UI shows a badge per source type.
+        **For multiple recipes in one turn — use ``save_recipes_batch``
+        instead.** Looping save_recipe over N dishes burns the 12-call
+        tool budget and leaves the batch half-done.
+
+        Use save_recipe when the user explicitly asks to save a single
+        recipe ("сохрани рецепт борща"), when you (the AI) generated
+        one recipe the user liked, when you fetched one from the web,
+        or when promoting a menu free_text into a structured recipe.
+        Always classify the origin via the ``source`` arg — the UI
+        shows a badge per source type.
 
         Args:
             title: Short name of the dish. Imperative-free ("Борщ",
@@ -498,6 +502,51 @@ def build_housewife_tools(
             logger.exception("save_recipe failed")
             return "error: internal"
         return f"ok:saved:{recipe.id}"
+
+    @lc_tool
+    def save_recipes_batch(recipes: list[dict[str, Any]]) -> str:
+        """Batch-save multiple recipes to the user's recipe book in one call.
+
+        **Prefer this over calling ``save_recipe`` in a loop** when the
+        user asks for many recipes at once ("сохрани 18 рецептов",
+        "запиши все рецепты из книги"). Using save_recipe 18 times
+        burns the tool-call budget (8 iterations) before you finish.
+
+        Each item in ``recipes`` has the same shape as ``save_recipe``
+        args wrapped in a dict:
+            {
+              "title": "Борщ",
+              "ingredients": [{"title": "свёкла", "quantity_text": "2 шт"}, ...],
+              "instructions_md": "...",
+              "servings": 4,
+              "source": "user_dictated",  # or ai_generated / web_found / upgraded_from_menu
+              "source_url": null,         # only when source == web_found
+              "tags": ["суп"]              # optional
+            }
+
+        Items with empty title or unknown ``source`` are silently
+        skipped — the rest of the batch still persists.
+
+        Returns ``ok:batch_saved:N:ids=[...]`` where N is the number
+        actually created.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not recipes:
+            return "error: empty batch"
+        try:
+            created = recipe_service.save_recipes_batch(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                recipes=recipes,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("save_recipes_batch failed")
+            return "error: internal"
+        if not created:
+            return "ok:batch_saved:0"
+        ids_csv = ",".join(r.id for r in created)
+        return f"ok:batch_saved:{len(created)}:ids=[{ids_csv}]"
 
     @lc_tool
     def search_recipes(query: str) -> str:
@@ -897,6 +946,7 @@ def build_housewife_tools(
         list_shopping,
         clear_bought_shopping,
         save_recipe,
+        save_recipes_batch,
         search_recipes,
         get_recipe,
         delete_recipe,
