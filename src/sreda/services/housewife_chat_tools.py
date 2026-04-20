@@ -802,6 +802,63 @@ def build_housewife_tools(
         return "\n".join(lines)
 
     @lc_tool
+    def generate_shopping_from_menu(plan_id: str) -> str:
+        """Pull all ingredients from a menu plan's recipes into the
+        shopping list.
+
+        Use when user says "добавь ингредиенты меню в список покупок"
+        or "собери список покупок на неделю". Ingredients get a
+        ``source_recipe_id`` tag so shopping items know which recipe
+        they came from (enables future "купил для борща" UX).
+
+        Free-text menu cells (no ``recipe_id``) contribute nothing —
+        LLM / user add stuff manually for those.
+
+        Args:
+            plan_id: id from plan_week_menu / list_menu (``menu_...``).
+
+        Returns ``ok:generated:N`` where N is the number of items
+        added. Returns ``ok:generated:0`` if the plan exists but all
+        cells are free-text (nothing structured to aggregate).
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            ingredients = menu_service.aggregate_ingredients_for_shopping(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                plan_id=plan_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("generate_shopping_from_menu: aggregation failed")
+            return "error: internal"
+
+        if not ingredients:
+            return "ok:generated:0"
+
+        # Transform aggregated ingredients into shopping_service input.
+        # LLM may later re-classify categories via re-read + add; for
+        # now auto-gen always sets category=default so the LLM can
+        # batch-fix in a follow-up turn.
+        items = [
+            {
+                "title": ing.title,
+                "quantity_text": ing.quantity_text,
+                "category": None,  # service coerces to "другое"
+                "source_recipe_id": ing.source_recipe_id,
+            }
+            for ing in ingredients
+        ]
+        try:
+            rows = shopping_service.add_items(
+                tenant_id=tenant_id, user_id=user_id, items=items
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("generate_shopping_from_menu: add_items failed")
+            return "error: internal"
+        return f"ok:generated:{len(rows)}"
+
+    @lc_tool
     def clear_menu(week_start: str) -> str:
         """Delete the weekly menu for the given week.
 
@@ -847,4 +904,5 @@ def build_housewife_tools(
         update_menu_item,
         list_menu,
         clear_menu,
+        generate_shopping_from_menu,
     ]

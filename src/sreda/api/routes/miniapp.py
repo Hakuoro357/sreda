@@ -1040,6 +1040,45 @@ def get_weekly_menu(
     return {"plan": _menu_plan_dict(plan)}
 
 
+@router.post("/api/v1/weekly-menu/{plan_id}/generate-shopping")
+def generate_shopping_from_menu_endpoint(
+    plan_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Aggregate all recipe ingredients referenced by the plan's items
+    into the user's shopping list. Called by the Mini App button
+    "Добавить ингредиенты в список покупок".
+
+    Cross-tenant safe — aggregator returns empty if plan isn't owned
+    by the calling user, producing ``added=0`` instead of 404 to keep
+    the UI path predictable.
+    """
+    menu_svc = HousewifeMenuService(session)
+    shop_svc = HousewifeShoppingService(session)
+
+    ingredients = menu_svc.aggregate_ingredients_for_shopping(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, plan_id=plan_id
+    )
+    if not ingredients:
+        return {"ok": True, "added": 0}
+
+    rows = shop_svc.add_items(
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        items=[
+            {
+                "title": ing.title,
+                "quantity_text": ing.quantity_text,
+                "category": None,
+                "source_recipe_id": ing.source_recipe_id,
+            }
+            for ing in ingredients
+        ],
+    )
+    return {"ok": True, "added": len(rows)}
+
+
 @router.delete("/api/v1/weekly-menu")
 def clear_weekly_menu_endpoint(
     week_start: str,

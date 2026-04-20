@@ -927,10 +927,27 @@
     });
   };
 
-  // Stage 6 will wire this endpoint; for now the click shows a
-  // placeholder so the button isn't a dead link.
   window._generateShoppingFromMenu = function(planId) {
-    showAlert("Скоро заработает — напиши боту «добавь ингредиенты из меню в список».");
+    showPopup("Добавить ингредиенты блюд недели в список покупок?", function() {
+      apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/generate-shopping", {
+        method: "POST",
+        body: {}
+      }).then(function(res) {
+        if (res && res.ok) {
+          var added = res.added || 0;
+          if (added === 0) {
+            showAlert("В меню нет рецептов с ингредиентами — добавить нечего.");
+          } else {
+            showAlert("Добавлено в список: " + added + ".");
+            state.shopping = null;
+            state.menu = null;
+            loadData();
+          }
+        } else {
+          showAlert("Не удалось собрать список.");
+        }
+      }).catch(function() { showAlert("Не удалось собрать список."); });
+    });
   };
 
   window._deleteRecipe = function(recipeId, title) {
