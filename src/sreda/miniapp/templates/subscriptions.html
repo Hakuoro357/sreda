@@ -677,10 +677,10 @@
         html += '</div>';
         // Regenerate button — only when cell has something to replace
         if (cell && (cell.recipe_id || cell.free_text)) {
-          html += '<button class="btn btn-small" ';
-          html += 'onclick="event.stopPropagation();window._regenerateMenuCell(\'' + escHtml(plan.id) + '\',' + d + ',\'' + mt + '\')" ';
-          html += 'style="padding:4px 8px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer" ';
-          html += 'title="Подобрать другое блюдо — старые продукты из списка тоже уйдут">';
+          html += '<button class="btn btn-small menu-regen-btn" ';
+          html += 'onclick="event.stopPropagation();window._regenerateMenuCell(\'' + escHtml(plan.id) + '\',' + d + ',\'' + mt + '\',this)" ';
+          html += 'style="padding:4px 8px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;min-width:32px" ';
+          html += 'title="Подобрать другое блюдо">';
           html += '\u21BB';  // ↻
           html += '</button>';
         }
@@ -1346,44 +1346,47 @@
     }).catch(function() { showAlert("Не удалось собрать список."); });
   };
 
-  window._regenerateMenuCell = function(planId, day, mealType) {
-    showPopup("Подобрать другое блюдо? Старые продукты из списка покупок будут удалены.", function() {
-      // Show a quick in-place hint so the user knows the LLM is working.
-      var hint = document.createElement("div");
-      hint.style.cssText =
-        "position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:2000;" +
-        "background:var(--tg-theme-secondary-bg-color,#f5f5f5);color:var(--tg-theme-text-color,#000);" +
-        "padding:10px 16px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.2);font-size:14px;";
-      hint.textContent = "Подбираю блюдо…";
-      document.body.appendChild(hint);
+  window._regenerateMenuCell = function(planId, day, mealType, btn) {
+    // Lock the button that was tapped so the user can't spam-click
+    // while the LLM is working (each call costs a network round-trip
+    // + a model invocation). Also acts as a visual cue — the icon
+    // swaps to a subtle "…" and opacity drops.
+    var originalLabel = null;
+    if (btn && btn.tagName === "BUTTON") {
+      originalLabel = btn.innerHTML;
+      btn.disabled = true;
+      btn.style.opacity = "0.5";
+      btn.style.cursor = "default";
+      btn.innerHTML = "\u2026";  // …
+    }
+    function unlock() {
+      if (btn && btn.tagName === "BUTTON") {
+        btn.disabled = false;
+        btn.style.opacity = "";
+        btn.style.cursor = "pointer";
+        if (originalLabel !== null) btn.innerHTML = originalLabel;
+      }
+    }
 
-      apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/regenerate-item", {
-        method: "POST",
-        body: { day_of_week: day, meal_type: mealType },
-      }).then(function(res) {
-        if (hint.parentNode) document.body.removeChild(hint);
-        if (res && res.ok) {
-          var parts = ["Готово"];
-          if (res.removed_from_shopping) {
-            parts.push("убрано из списка: " + res.removed_from_shopping);
-          }
-          if (res.added_to_shopping) {
-            parts.push("добавлено: " + res.added_to_shopping);
-          }
-          showAlert(parts.join(". "));
-          state.weeklyMenu = null;
-          state.shopping = null;
-          state.menu = null;
-          loadData();
-          loadWeeklyMenu();
-        } else {
-          showAlert("Не удалось подобрать блюдо.");
-        }
-      }).catch(function() {
-        if (hint.parentNode) document.body.removeChild(hint);
-        showAlert("Не удалось подобрать блюдо.");
-      });
-    });
+    apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/regenerate-item", {
+      method: "POST",
+      body: { day_of_week: day, meal_type: mealType },
+    }).then(function(res) {
+      if (res && res.ok) {
+        // Silent success — refresh menu + shopping so the new dish
+        // appears in place and the list reflects swapped items.
+        state.weeklyMenu = null;
+        state.shopping = null;
+        state.menu = null;
+        loadData();
+        loadWeeklyMenu();
+      }
+      // Note: no alert on failure either per UX request. A failed
+      // swap leaves the original cell and shopping list untouched
+      // (endpoint is atomic before the LLM returns). The user can
+      // just tap again.
+      unlock();
+    }).catch(unlock);
   };
 
   window._generateShoppingFromMenu = function(planId) {
