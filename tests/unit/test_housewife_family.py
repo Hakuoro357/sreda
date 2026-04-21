@@ -226,3 +226,95 @@ def test_remove_member_unknown_returns_false(session):
     assert svc.remove_member(
         tenant_id="t1", user_id="u1", member_id="fm_bogus"
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# Dedup by name (bugfix 2026-04-21 — LLM called add_family_members twice
+# in the same session and produced 9 family rows for 5 distinct members)
+# ---------------------------------------------------------------------------
+
+
+def test_add_member_skips_when_name_already_exists(session):
+    """Second add_member call with the same normalised name returns the
+    existing row instead of inserting a duplicate."""
+    svc = HousewifeFamilyService(session)
+    first = svc.add_member(tenant_id="t1", user_id="u1", name="Катя", role="spouse")
+    second = svc.add_member(tenant_id="t1", user_id="u1", name="катя", role="spouse")
+    assert second.id == first.id
+    assert svc.session.query(FamilyMember).filter_by(
+        tenant_id="t1", user_id="u1"
+    ).count() == 1
+
+
+def test_add_member_case_and_whitespace_insensitive(session):
+    """'Катя', 'КАТЯ' and '  катя  ' collapse to the same record."""
+    svc = HousewifeFamilyService(session)
+    svc.add_member(tenant_id="t1", user_id="u1", name="Катя", role="spouse")
+    svc.add_member(tenant_id="t1", user_id="u1", name="КАТЯ", role="spouse")
+    svc.add_member(tenant_id="t1", user_id="u1", name="  катя  ", role="spouse")
+    assert svc.session.query(FamilyMember).filter_by(
+        tenant_id="t1", user_id="u1"
+    ).count() == 1
+
+
+def test_add_member_same_name_different_user_not_duplicate(session):
+    """Dedup is scoped per (tenant, user). Two distinct users can each
+    have a "Катя"."""
+    session.add(User(id="u2", tenant_id="t1", telegram_account_id="200"))
+    session.commit()
+    svc = HousewifeFamilyService(session)
+    svc.add_member(tenant_id="t1", user_id="u1", name="Катя", role="spouse")
+    svc.add_member(tenant_id="t1", user_id="u2", name="Катя", role="spouse")
+    assert svc.session.query(FamilyMember).count() == 2
+
+
+def test_add_members_batch_skips_existing(session):
+    """The bug we observed on prod: LLM called add_family_members on
+    two separate turns (onboarding + later request for meal plan),
+    duplicating 4 members. Batch must check the DB state and skip
+    entries that already exist."""
+    svc = HousewifeFamilyService(session)
+    # Seed the "onboarding" batch
+    svc.add_members_batch(
+        tenant_id="t1", user_id="u1",
+        members=[
+            {"name": "Катя", "role": "spouse"},
+            {"name": "Николай", "role": "child"},
+            {"name": "Никита", "role": "child"},
+            {"name": "Лиза", "role": "child"},
+        ],
+    )
+    # Second LLM call re-adds them all plus "self" — only self is new.
+    result = svc.add_members_batch(
+        tenant_id="t1", user_id="u1",
+        members=[
+            {"name": "Борис", "role": "self"},
+            {"name": "Катя", "role": "spouse"},
+            {"name": "Николай", "role": "child"},
+            {"name": "Никита", "role": "child"},
+            {"name": "Лиза", "role": "child"},
+        ],
+    )
+    # Only "Борис" should actually persist as a new row.
+    assert len(result) == 1
+    assert result[0].name == "Борис"
+    # Total household count is now 5, not 9.
+    assert svc.session.query(FamilyMember).filter_by(
+        tenant_id="t1", user_id="u1"
+    ).count() == 5
+
+
+def test_add_members_batch_dedups_within_input(session):
+    """LLM passes "Катя" twice in the same batch — collapse to one."""
+    svc = HousewifeFamilyService(session)
+    result = svc.add_members_batch(
+        tenant_id="t1", user_id="u1",
+        members=[
+            {"name": "Катя", "role": "spouse"},
+            {"name": "катя", "role": "spouse"},
+            {"name": "Николай", "role": "child"},
+        ],
+    )
+    assert len(result) == 2
+    names = {r.name for r in result}
+    assert names == {"Катя", "Николай"}

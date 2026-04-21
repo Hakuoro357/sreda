@@ -997,11 +997,20 @@ def build_housewife_tools(
         Invalid items (empty name, unknown role, implausible birth_year)
         skipped silently — rest of the batch persists.
 
+        **Dedup by name.** Family members are unique per user by
+        normalised name (case-insensitive, whitespace-insensitive).
+        If a name already exists it is SKIPPED, not re-inserted —
+        don't add the same person twice across turns. If you're
+        unsure whether the family is already recorded, call
+        ``list_family_members`` first.
+
         Call ``add_family_members`` when the user says something like
         "у меня жена Катя, сын Никита 10 лет, дочь Маша 8 лет" — LLM
         parses, batches, one tool call.
 
-        Returns ok:added:N:ids=[fm_...,...].
+        Returns ok:added:N:skipped_as_duplicate:M:ids=[fm_...,...].
+        M is the count of entries short-circuited because they were
+        already in the book.
         """
         if not user_id:
             return "error: no user_id context"
@@ -1014,10 +1023,14 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("add_family_members failed")
             return "error: internal"
+        skipped = max(0, len(members) - len(created))
         if not created:
-            return "ok:added:0"
+            return f"ok:added:0:skipped_as_duplicate:{skipped}"
         ids_csv = ",".join(m.id for m in created)
-        return f"ok:added:{len(created)}:ids=[{ids_csv}]"
+        return (
+            f"ok:added:{len(created)}:skipped_as_duplicate:{skipped}"
+            f":ids=[{ids_csv}]"
+        )
 
     @lc_tool
     def list_family_members() -> str:
