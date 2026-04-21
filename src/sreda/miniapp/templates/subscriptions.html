@@ -1346,13 +1346,30 @@
     }).catch(function() { showAlert("Не удалось собрать список."); });
   };
 
+  // Regen in-flight counter. When > 0 the grid is in the middle of
+  // one or more swaps; we coalesce the post-success reload so that
+  // three concurrent regens do ONE final refresh, not three, avoiding
+  // the flicker storm the user reported.
+  var _regenInFlight = 0;
+  var _regenNeedsRefresh = false;
+  function _maybeRefreshAfterRegen() {
+    if (_regenInFlight > 0) return;
+    if (!_regenNeedsRefresh) return;
+    _regenNeedsRefresh = false;
+    // Don't null out state before fetching — keep showing current data
+    // until fresh arrives, then swap atomically. loadWeeklyMenu and
+    // loadData overwrite the slots on success.
+    loadWeeklyMenu();
+    loadData();
+  }
+
   window._regenerateMenuCell = function(planId, day, mealType, btn) {
-    // Lock the button that was tapped so the user can't spam-click
-    // while the LLM is working (each call costs a network round-trip
-    // + a model invocation). Also acts as a visual cue — the icon
-    // swaps to a subtle "…" and opacity drops.
+    // Per-button cosmetic lock. Backend also guards against concurrent
+    // requests on the same cell (returns 409). The user normally won't
+    // see that — the button is disabled while in flight.
     var originalLabel = null;
     if (btn && btn.tagName === "BUTTON") {
+      if (btn.disabled) return;  // defensive — already in flight
       originalLabel = btn.innerHTML;
       btn.disabled = true;
       btn.style.opacity = "0.5";
@@ -1360,7 +1377,7 @@
       btn.innerHTML = "\u2026";  // …
     }
     function unlock() {
-      if (btn && btn.tagName === "BUTTON") {
+      if (btn && btn.tagName === "BUTTON" && btn.isConnected) {
         btn.disabled = false;
         btn.style.opacity = "";
         btn.style.cursor = "pointer";
@@ -1368,25 +1385,19 @@
       }
     }
 
+    _regenInFlight++;
     apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/regenerate-item", {
       method: "POST",
       body: { day_of_week: day, meal_type: mealType },
     }).then(function(res) {
       if (res && res.ok) {
-        // Silent success — refresh menu + shopping so the new dish
-        // appears in place and the list reflects swapped items.
-        state.weeklyMenu = null;
-        state.shopping = null;
-        state.menu = null;
-        loadData();
-        loadWeeklyMenu();
+        _regenNeedsRefresh = true;
       }
-      // Note: no alert on failure either per UX request. A failed
-      // swap leaves the original cell and shopping list untouched
-      // (endpoint is atomic before the LLM returns). The user can
-      // just tap again.
       unlock();
-    }).catch(unlock);
+    }).catch(unlock).finally(function() {
+      _regenInFlight--;
+      _maybeRefreshAfterRegen();
+    });
   };
 
   window._generateShoppingFromMenu = function(planId) {

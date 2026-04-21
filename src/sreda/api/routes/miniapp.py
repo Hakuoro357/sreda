@@ -8,6 +8,7 @@ Serves:
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1303,6 +1304,18 @@ def generate_shopping_for_day_endpoint(
     return {"ok": True, "added": len(rows)}
 
 
+# In-flight guards for regenerate_menu_item_endpoint. A concurrent tap
+# on the same menu cell while the previous LLM call is still running
+# would otherwise race: both reads the same old_recipe_id, both swap
+# the cell, last commit wins, and shopping-list sync happens twice
+# with stale assumptions. We reject the second request quickly with
+# 409 Conflict so the client can unlock its button and let the user
+# tap again later. Scope is (tenant, user, plan, day, meal_type) —
+# regens of DIFFERENT cells proceed in parallel.
+_regen_inflight: set[tuple[str, ...]] = set()
+_regen_inflight_lock = threading.Lock()
+
+
 @router.post("/api/v1/weekly-menu/{plan_id}/regenerate-item")
 def regenerate_menu_item_endpoint(
     plan_id: str,
@@ -1327,6 +1340,35 @@ def regenerate_menu_item_endpoint(
     sees "Не удалось подобрать" and their existing cell + shopping
     list stay intact.
     """
+    # Per-cell in-flight guard — see _regen_inflight comment.
+    cell_key = (
+        ctx.tenant_id, ctx.user_id, plan_id,
+        str(body.day_of_week), body.meal_type,
+    )
+    with _regen_inflight_lock:
+        if cell_key in _regen_inflight:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="regen_already_in_flight",
+            )
+        _regen_inflight.add(cell_key)
+
+    try:
+        return _regenerate_menu_item_impl(
+            session=session, ctx=ctx, plan_id=plan_id, body=body
+        )
+    finally:
+        with _regen_inflight_lock:
+            _regen_inflight.discard(cell_key)
+
+
+def _regenerate_menu_item_impl(
+    *,
+    session: Session,
+    ctx: MiniAppContext,
+    plan_id: str,
+    body: MenuItemRegenRequest,
+) -> dict:
     menu_svc = HousewifeMenuService(session)
     shop_svc = HousewifeShoppingService(session)
     family_svc = HousewifeFamilyService(session)
@@ -1384,19 +1426,30 @@ def regenerate_menu_item_endpoint(
         ) from exc
 
     # 4. Swap succeeded — now synchronise shopping. Remove items from
-    # the OLD recipe, then add items for the NEW recipe (if it has a
-    # recipe_id and that recipe has ingredients). Errors here are
-    # logged but do NOT undo the swap — the cell already reflects the
-    # user's intent; the user can fix shopping manually.
+    # the OLD recipe (ONLY if no other cell in this plan still uses
+    # it — shared recipes shouldn't have their shopping wiped), then
+    # add items for the NEW recipe. Errors here are logged but do NOT
+    # undo the swap — the cell already reflects the user's intent;
+    # the user can fix shopping manually.
     removed = 0
     added = 0
     if old_recipe_id:
         try:
-            removed = shop_svc.delete_by_source_recipe(
-                tenant_id=ctx.tenant_id,
-                user_id=ctx.user_id,
-                recipe_id=old_recipe_id,
+            plan_after = menu_svc._get_plan(
+                ctx.tenant_id, ctx.user_id, plan_id
             )
+            still_used = False
+            if plan_after is not None:
+                for other in plan_after.items:
+                    if other.recipe_id == old_recipe_id:
+                        still_used = True
+                        break
+            if not still_used:
+                removed = shop_svc.delete_by_source_recipe(
+                    tenant_id=ctx.tenant_id,
+                    user_id=ctx.user_id,
+                    recipe_id=old_recipe_id,
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "regenerate_menu_item: delete_by_source_recipe failed "
