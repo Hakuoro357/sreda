@@ -36,7 +36,7 @@ def session():
 
 def test_save_recipe_persists_recipe_and_ingredients(session):
     svc = HousewifeRecipeService(session)
-    recipe = svc.save_recipe(
+    recipe, _ = svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Борщ",
         ingredients=[
@@ -66,7 +66,7 @@ def test_save_recipe_persists_recipe_and_ingredients(session):
 
 def test_save_recipe_accepts_dataclass_ingredients(session):
     svc = HousewifeRecipeService(session)
-    recipe = svc.save_recipe(
+    recipe, _ = svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Пицца",
         ingredients=[
@@ -80,7 +80,7 @@ def test_save_recipe_accepts_dataclass_ingredients(session):
 
 def test_save_recipe_skips_empty_ingredient_titles(session):
     svc = HousewifeRecipeService(session)
-    recipe = svc.save_recipe(
+    recipe, _ = svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Омлет",
         ingredients=[{"title": ""}, {"title": "  "}, {"title": "яйца"}],
@@ -162,7 +162,7 @@ def test_saved_recipe_title_is_encrypted_at_rest(session):
 
 def test_get_recipe_returns_with_ingredients(session):
     svc = HousewifeRecipeService(session)
-    recipe = svc.save_recipe(
+    recipe, _ = svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Салат Цезарь",
         ingredients=[
@@ -189,7 +189,7 @@ def test_get_recipe_is_tenant_scoped(session):
     session.commit()
 
     svc = HousewifeRecipeService(session)
-    mine = svc.save_recipe(
+    mine, _ = svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Мой рецепт",
         ingredients=[{"title": "x"}],
@@ -286,7 +286,7 @@ def test_count_recipes_scoped_by_user(session):
 
 def test_delete_recipe_cascades_ingredients(session):
     svc = HousewifeRecipeService(session)
-    recipe = svc.save_recipe(
+    recipe, _ = svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="X",
         ingredients=[{"title": "a"}, {"title": "b"}],
@@ -308,7 +308,7 @@ def test_delete_recipe_returns_false_for_cross_tenant(session):
     session.commit()
 
     svc = HousewifeRecipeService(session)
-    mine = svc.save_recipe(
+    mine, _ = svc.save_recipe(
         tenant_id="t1", user_id="u1", title="Мой",
         ingredients=[{"title": "x"}], source="user_dictated",
     )
@@ -334,7 +334,7 @@ def test_delete_recipe_returns_false_for_unknown_id(session):
 
 def test_save_recipes_batch_persists_all(session):
     svc = HousewifeRecipeService(session)
-    created = svc.save_recipes_batch(
+    result = svc.save_recipes_batch(
         tenant_id="t1", user_id="u1",
         recipes=[
             {
@@ -360,8 +360,9 @@ def test_save_recipes_batch_persists_all(session):
             },
         ],
     )
-    assert len(created) == 3
-    titles = {r.title for r in created}
+    assert len(result.created) == 3
+    assert result.skipped_existing == []
+    titles = {r.title for r in result.created}
     assert titles == {"Борщ", "Омлет", "Паста"}
 
     # Ingredients persisted
@@ -371,7 +372,7 @@ def test_save_recipes_batch_persists_all(session):
 def test_save_recipes_batch_skips_invalid_items(session):
     """A bad entry shouldn't nuke the whole batch."""
     svc = HousewifeRecipeService(session)
-    created = svc.save_recipes_batch(
+    result = svc.save_recipes_batch(
         tenant_id="t1", user_id="u1",
         recipes=[
             {"title": "Good", "ingredients": [{"title": "x"}], "source": "user_dictated"},
@@ -381,14 +382,14 @@ def test_save_recipes_batch_skips_invalid_items(session):
             {"title": "Also Good", "ingredients": [], "source": "ai_generated"},
         ],
     )
-    assert len(created) == 2
-    titles = {r.title for r in created}
+    assert len(result.created) == 2
+    titles = {r.title for r in result.created}
     assert titles == {"Good", "Also Good"}
 
 
 def test_save_recipes_batch_tags_json_encoded(session):
     svc = HousewifeRecipeService(session)
-    created = svc.save_recipes_batch(
+    result = svc.save_recipes_batch(
         tenant_id="t1", user_id="u1",
         recipes=[
             {
@@ -399,13 +400,117 @@ def test_save_recipes_batch_tags_json_encoded(session):
             },
         ],
     )
-    assert created[0].tags_json == json.dumps(
+    assert result.created[0].tags_json == json.dumps(
         ["суп", "быстрое"], ensure_ascii=False
     )
 
 
 def test_save_recipes_batch_empty_list_returns_empty(session):
     svc = HousewifeRecipeService(session)
-    assert svc.save_recipes_batch(
+    result = svc.save_recipes_batch(
         tenant_id="t1", user_id="u1", recipes=[]
-    ) == []
+    )
+    assert result.created == []
+    assert result.skipped_existing == []
+
+
+# ---------------------------------------------------------------------------
+# Dedup by title (Stage 6, v1.2)
+# ---------------------------------------------------------------------------
+
+
+def test_save_recipe_returns_existing_on_duplicate_title(session):
+    """Second save_recipe with same (tenant, user, normalised-title)
+    must NOT insert a new row — return the original with is_new=False."""
+    svc = HousewifeRecipeService(session)
+    first, is_new1 = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[{"title": "свёкла"}],
+        source="user_dictated",
+    )
+    assert is_new1 is True
+
+    second, is_new2 = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ",  # exact same title
+        ingredients=[{"title": "капуста"}],  # different ingredients
+        source="ai_generated",
+    )
+    assert is_new2 is False
+    assert second.id == first.id
+    # Only ONE row in DB despite two calls
+    assert svc.count_recipes(tenant_id="t1", user_id="u1") == 1
+
+
+def test_save_recipe_title_dedup_is_case_and_whitespace_insensitive(session):
+    """'Борщ' and '  борщ ' normalise to the same key."""
+    svc = HousewifeRecipeService(session)
+    first, _ = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[{"title": "x"}],
+        source="user_dictated",
+    )
+    _, is_new = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="  борщ  ",  # case + padding
+        ingredients=[{"title": "y"}],
+        source="user_dictated",
+    )
+    assert is_new is False
+    assert svc.count_recipes(tenant_id="t1", user_id="u1") == 1
+
+
+def test_save_recipe_same_title_different_user_not_duplicate(session):
+    """Dedup is per (tenant, user). Another user can have 'Борщ' too."""
+    session.add(User(id="u2", tenant_id="t1", telegram_account_id="200"))
+    session.commit()
+
+    svc = HousewifeRecipeService(session)
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+    _, is_new = svc.save_recipe(
+        tenant_id="t1", user_id="u2",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+    assert is_new is True  # different user → not a dup
+    assert svc.count_recipes(tenant_id="t1", user_id="u1") == 1
+    assert svc.count_recipes(tenant_id="t1", user_id="u2") == 1
+
+
+def test_save_recipes_batch_dedups_within_input(session):
+    """LLM passes the same title twice in one batch — collapse to one."""
+    svc = HousewifeRecipeService(session)
+    result = svc.save_recipes_batch(
+        tenant_id="t1", user_id="u1",
+        recipes=[
+            {"title": "Плов", "ingredients": [], "source": "user_dictated"},
+            {"title": "плов", "ingredients": [], "source": "user_dictated"},
+            {"title": "Омлет", "ingredients": [], "source": "user_dictated"},
+        ],
+    )
+    assert len(result.created) == 2  # плов collapsed, Омлет new
+    titles = {r.title for r in result.created}
+    assert titles == {"Плов", "Омлет"}
+
+
+def test_save_recipes_batch_reports_skipped_against_db(session):
+    """Title already in book → skipped_existing, not re-inserted."""
+    svc = HousewifeRecipeService(session)
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+    result = svc.save_recipes_batch(
+        tenant_id="t1", user_id="u1",
+        recipes=[
+            {"title": "Борщ", "ingredients": [], "source": "user_dictated"},
+            {"title": "Окрошка", "ingredients": [], "source": "user_dictated"},
+        ],
+    )
+    assert len(result.created) == 1
+    assert result.created[0].title == "Окрошка"
+    assert len(result.skipped_existing) == 1
+    assert result.skipped_existing[0].title == "Борщ"
+    assert svc.count_recipes(tenant_id="t1", user_id="u1") == 2

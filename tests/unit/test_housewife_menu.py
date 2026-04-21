@@ -147,7 +147,7 @@ def test_plan_week_replaces_prior_plan_for_same_week(session):
 
 def test_plan_week_accepts_recipe_id_cells(session):
     recipe_svc = HousewifeRecipeService(session)
-    r = recipe_svc.save_recipe(
+    r, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Борщ", ingredients=[{"title": "свёкла"}],
         source="user_dictated",
@@ -266,7 +266,7 @@ def test_clear_menu_removes_plans_for_week(session):
 
 def test_get_plan_for_week_returns_items_with_recipes(session):
     recipe_svc = HousewifeRecipeService(session)
-    r = recipe_svc.save_recipe(
+    r, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Борщ", ingredients=[{"title": "свёкла"}],
         source="user_dictated",
@@ -326,7 +326,7 @@ def test_aggregate_ingredients_empty_when_no_recipes(session):
 
 def test_aggregate_ingredients_flattens_per_recipe(session):
     recipe_svc = HousewifeRecipeService(session)
-    r1 = recipe_svc.save_recipe(
+    r1, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Борщ",
         ingredients=[
@@ -335,7 +335,7 @@ def test_aggregate_ingredients_flattens_per_recipe(session):
         ],
         source="user_dictated",
     )
-    r2 = recipe_svc.save_recipe(
+    r2, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Омлет",
         ingredients=[
@@ -374,7 +374,7 @@ def test_aggregate_ingredients_cross_tenant_returns_empty(session):
     session.commit()
 
     recipe_svc = HousewifeRecipeService(session)
-    r = recipe_svc.save_recipe(
+    r, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Мой", ingredients=[{"title": "x"}],
         source="user_dictated",
@@ -452,7 +452,7 @@ def test_scale_quantity_integer_formatting():
 def test_aggregate_scales_by_eaters_count(session):
     """Family of 4 + 2-serving recipe → factor 2 → quantities double."""
     recipe_svc = HousewifeRecipeService(session)
-    r = recipe_svc.save_recipe(
+    r, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Паста", servings=2,
         ingredients=[
@@ -477,7 +477,7 @@ def test_aggregate_eaters_under_servings_no_shrink(session):
     """Family of 1 + 4-serving recipe → factor stays 1 (we don't shrink
     recipes just because fewer people eat — leftovers are fine)."""
     recipe_svc = HousewifeRecipeService(session)
-    r = recipe_svc.save_recipe(
+    r, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Торт", servings=8,
         ingredients=[{"title": "мука", "quantity_text": "500 г"}],
@@ -498,7 +498,7 @@ def test_aggregate_default_eaters_count_is_one(session):
     """Old callers that don't pass eaters_count see the original
     behaviour — factor 1, no scaling."""
     recipe_svc = HousewifeRecipeService(session)
-    r = recipe_svc.save_recipe(
+    r, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Суп", servings=2,
         ingredients=[{"title": "вода", "quantity_text": "1 л"}],
@@ -519,7 +519,7 @@ def test_aggregate_ceiling_rounds_up_for_odd_eaters(session):
     """5 eaters on a 2-serving recipe: ceil(5/2) = 3 → triple the batch
     (one portion goes leftover rather than someone eating nothing)."""
     recipe_svc = HousewifeRecipeService(session)
-    r = recipe_svc.save_recipe(
+    r, _ = recipe_svc.save_recipe(
         tenant_id="t1", user_id="u1",
         title="Плов", servings=2,
         ingredients=[{"title": "рис", "quantity_text": "300 г"}],

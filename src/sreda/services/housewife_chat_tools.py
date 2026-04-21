@@ -464,6 +464,14 @@ def build_housewife_tools(
         Always classify the origin via the ``source`` arg — the UI
         shows a badge per source type.
 
+        **Dedup.** Recipe titles are unique per user (case /
+        whitespace-insensitive). If a recipe with the same title
+        already exists, this returns ``ok:duplicate:<id>`` WITHOUT
+        inserting a new row — tell the user the recipe is already
+        in the book. Don't call save_recipe with a near-identical
+        title variation ("борщ" after already saving "Борщ
+        классический") — that's almost certainly the same dish.
+
         ALWAYS estimate nutrition per serving (kcal + B/Ж/У in grams)
         unless the recipe has no structured ingredients. ±20%
         accuracy from ingredient knowledge is fine for a household
@@ -496,7 +504,7 @@ def build_housewife_tools(
         if not user_id:
             return "error: no user_id context"
         try:
-            recipe = recipe_service.save_recipe(
+            recipe, is_new = recipe_service.save_recipe(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 title=title,
@@ -516,6 +524,11 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("save_recipe failed")
             return "error: internal"
+        if not is_new:
+            # Title already existed for this user — tell the LLM so it
+            # can surface "рецепт уже был в книге" to the user instead
+            # of claiming it just created one.
+            return f"ok:duplicate:{recipe.id}"
         return f"ok:saved:{recipe.id}"
 
     @lc_tool
@@ -546,15 +559,28 @@ def build_housewife_tools(
         Items with empty title or unknown ``source`` are silently
         skipped — the rest of the batch still persists.
 
-        Returns ``ok:batch_saved:N:ids=[...]`` where N is the number
-        actually created.
+        **Dedup.** The recipe book is unique per user by recipe title
+        (case-insensitive, whitespace-insensitive). If the user asks
+        "сохрани 10 рецептов" and some are already in the book, they
+        will be reported as skipped — NOT re-inserted. Treat trivial
+        name variations ("борщ" vs "борщ классический") as the SAME
+        recipe and don't bother saving twice; semantic near-duplicates
+        ("пельмени" vs "пельмени со сметаной") still go through if
+        titles differ — the user will tell you if that's a problem.
+
+        Before a big batch-save where you're unsure what's already
+        saved, call ``search_recipes("")`` first to see the book.
+
+        Returns ``ok:batch_saved:N:skipped_as_duplicate:M:ids=[...]``
+        where N is newly-created and M is how many were short-circuited
+        because the title already existed.
         """
         if not user_id:
             return "error: no user_id context"
         if not recipes:
             return "error: empty batch"
         try:
-            created = recipe_service.save_recipes_batch(
+            outcome = recipe_service.save_recipes_batch(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 recipes=recipes,
@@ -562,10 +588,14 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("save_recipes_batch failed")
             return "error: internal"
-        if not created:
-            return "ok:batch_saved:0"
-        ids_csv = ",".join(r.id for r in created)
-        return f"ok:batch_saved:{len(created)}:ids=[{ids_csv}]"
+        skipped_n = len(outcome.skipped_existing)
+        if not outcome.created:
+            return f"ok:batch_saved:0:skipped_as_duplicate:{skipped_n}"
+        ids_csv = ",".join(r.id for r in outcome.created)
+        return (
+            f"ok:batch_saved:{len(outcome.created)}:"
+            f"skipped_as_duplicate:{skipped_n}:ids=[{ids_csv}]"
+        )
 
     @lc_tool
     def search_recipes(query: str) -> str:

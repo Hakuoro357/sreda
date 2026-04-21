@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -42,6 +43,21 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_TITLE_WS_RE = re.compile(r"\s+")
+
+
+def _normalise_title(title: str) -> str:
+    """Canonical form for exact-title dedup.
+
+    Lowercased, stripped, internal whitespace collapsed. "Плов с курицей"
+    and "  ПЛОВ  с  курицей  " normalise to the same key.
+    Semantic near-duplicates ("Пельмени домашние" vs "Пельмени домашние
+    со сметаной") are deliberately NOT deduped — that needs fuzzy or
+    embedding match, out of scope for v1.2.
+    """
+    return _TITLE_WS_RE.sub(" ", (title or "").strip().lower())
+
+
 @dataclass(slots=True)
 class IngredientInput:
     """Normalised ingredient payload for ``save_recipe``."""
@@ -49,6 +65,17 @@ class IngredientInput:
     title: str
     quantity_text: str | None = None
     is_optional: bool = False
+
+
+@dataclass(slots=True)
+class SaveRecipesBatchResult:
+    """Return shape for ``save_recipes_batch`` that exposes how many
+    items were newly inserted vs short-circuited as duplicates of an
+    existing recipe. Stage 6 (v1.2) — production saw the book grow
+    copies of the same dish after tool-budget restarts."""
+
+    created: list[Recipe] = field(default_factory=list)
+    skipped_existing: list[Recipe] = field(default_factory=list)
 
 
 class HousewifeRecipeService:
@@ -82,13 +109,22 @@ class HousewifeRecipeService:
         protein_per_serving: float | None = None,
         fat_per_serving: float | None = None,
         carbs_per_serving: float | None = None,
-    ) -> Recipe:
-        """Insert a new recipe row plus its ingredient rows atomically.
+    ) -> tuple[Recipe, bool]:
+        """Insert a new recipe row + its ingredient rows atomically,
+        unless a recipe with the same (tenant, user, normalised-title)
+        already exists. Returns ``(recipe, is_new)`` — ``is_new=False``
+        means we short-circuited on a duplicate and the returned row
+        is the PRE-EXISTING one (nothing was inserted).
 
         ``source`` must be one of RECIPE_SOURCES (enforced). ``title``
         is required and non-empty. Ingredients normalise empty titles
         out — a recipe with zero ingredients is still legal (a free-
         form instructions-only recipe) but we never add empty ones.
+
+        Dedup (Stage 6) compares by ``_normalise_title``: lowercased,
+        whitespace-collapsed. Real semantic near-duplicates ("Пельмени
+        домашние" vs "Пельмени домашние со сметаной") still slip
+        through — fuzzy match is v2+.
 
         Nutrition args are all optional per-serving floats. LLM fills
         at save time with best-effort estimates from its food knowledge
@@ -99,6 +135,16 @@ class HousewifeRecipeService:
         if source not in RECIPE_SOURCES:
             raise ValueError(f"unknown source: {source!r}")
         servings = max(1, int(servings or 1))
+
+        # Dedup against existing book — exact-title match (normalised).
+        existing_index = self._existing_by_normalised_title(tenant_id, user_id)
+        existing = existing_index.get(_normalise_title(title_clean))
+        if existing is not None:
+            logger.info(
+                "save_recipe: dedup hit tenant=%s user=%s title=%r → existing id=%s",
+                tenant_id, user_id, title_clean, existing.id,
+            )
+            return existing, False
 
         normalised_ings = _normalise_ingredients(ingredients)
 
@@ -136,7 +182,7 @@ class HousewifeRecipeService:
                 )
             )
         self.session.commit()
-        return recipe
+        return recipe, True
 
     def save_recipes_batch(
         self,
@@ -144,7 +190,7 @@ class HousewifeRecipeService:
         tenant_id: str,
         user_id: str,
         recipes: list[dict[str, Any]],
-    ) -> list[Recipe]:
+    ) -> SaveRecipesBatchResult:
         """Batch version of ``save_recipe`` — one commit for all inputs.
 
         Same per-recipe semantics (required title, ingredient
@@ -152,11 +198,23 @@ class HousewifeRecipeService:
         validation are skipped silently — the whole batch shouldn't
         die because one entry has an empty title.
 
+        Dedup (Stage 6): two passes.
+          1. Collapse duplicate titles WITHIN the input batch — if
+             the LLM passed two "борщ"s, only the first is considered.
+          2. Check each survivor against the existing book via
+             ``_normalise_title``. Matches are reported in
+             ``skipped_existing`` (not re-inserted).
+
         Used by the LLM when the user asks for many recipes in one go
         ("сохрани 18 рецептов из книги"). Keeps turn budget under
-        control by collapsing what would be N tool calls into one.
+        control by collapsing what would be N tool calls into one,
+        and now survives tool-budget restarts without producing
+        duplicate rows for recipes that were already saved.
         """
-        created: list[Recipe] = []
+        result = SaveRecipesBatchResult()
+        existing_index = self._existing_by_normalised_title(tenant_id, user_id)
+        seen_in_batch: set[str] = set()
+
         for raw in recipes or []:
             if not isinstance(raw, dict):
                 continue
@@ -167,6 +225,28 @@ class HousewifeRecipeService:
             if source not in RECIPE_SOURCES:
                 continue
             servings = max(1, int(raw.get("servings") or 2))
+
+            normal_key = _normalise_title(title)
+
+            # Within-batch dedup
+            if normal_key in seen_in_batch:
+                logger.info(
+                    "save_recipes_batch: in-batch duplicate title=%r skipped",
+                    title,
+                )
+                continue
+            seen_in_batch.add(normal_key)
+
+            # Against-DB dedup
+            existing = existing_index.get(normal_key)
+            if existing is not None:
+                logger.info(
+                    "save_recipes_batch: dedup hit tenant=%s user=%s "
+                    "title=%r → existing id=%s",
+                    tenant_id, user_id, title, existing.id,
+                )
+                result.skipped_existing.append(existing)
+                continue
 
             normalised_ings = _normalise_ingredients(raw.get("ingredients"))
 
@@ -212,11 +292,41 @@ class HousewifeRecipeService:
                         sort_order=idx,
                     )
                 )
-            created.append(recipe)
+            result.created.append(recipe)
+            # Keep index current so later items in this batch see the
+            # newly-inserted row (further in-batch dup protection).
+            existing_index[normal_key] = recipe
 
-        if created:
+        if result.created:
             self.session.commit()
-        return created
+        return result
+
+    def _existing_by_normalised_title(
+        self, tenant_id: str, user_id: str
+    ) -> dict[str, Recipe]:
+        """Load all owned recipes and index them by normalised title.
+
+        Titles are EncryptedString, so ORM-level decryption happens on
+        attribute access — we can't do SQL LIKE. At pilot scale this
+        is fine (< 100 recipes per user); if it ever gets hot we'll
+        add a plaintext ``title_normal`` mirror column + a trigram
+        index.
+        """
+        rows = (
+            self.session.query(Recipe)
+            .filter(
+                Recipe.tenant_id == tenant_id,
+                Recipe.user_id == user_id,
+            )
+            .all()
+        )
+        out: dict[str, Recipe] = {}
+        for r in rows:
+            key = _normalise_title(r.title)
+            # First-wins: if two older rows already share a normalised
+            # title (legacy data), the oldest is kept as the dedup target.
+            out.setdefault(key, r)
+        return out
 
     def delete_recipe(
         self, *, tenant_id: str, user_id: str, recipe_id: str
