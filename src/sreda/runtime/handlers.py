@@ -1591,6 +1591,7 @@ def execute_conversation_chat(
             logger.exception("onboarding depth bookkeeping failed")
 
     text = (final_ai.content or "").strip()
+    rescued = False
     if not text:
         # Some models emit the user-facing answer TOGETHER with their
         # tool_calls in an earlier iteration and then return an empty
@@ -1604,14 +1605,42 @@ def execute_conversation_chat(
             candidate = (getattr(m, "content", "") or "").strip()
             if candidate:
                 text = candidate
+                rescued = True
                 logger.info(
                     "chat: empty final_ai content, rescued text from "
-                    "prior AI iter (len=%d)",
+                    "prior AI iter (len=%d) tenant=%s feature=%s",
                     len(text),
+                    action.tenant_id,
+                    feature_key,
                 )
                 break
     if not text:
+        # Fallback fired — user will see "..." which is a visible bug
+        # surface. Emit a distinctive structured WARNING so we can
+        # find these incidents in /admin/logs via grep=CHAT_EMPTY_REPLY
+        # and fix the upstream behaviour (prompt, model, tool design).
+        ai_count = sum(1 for m in messages if isinstance(m, AIMessage))
+        tool_count = sum(1 for m in messages if isinstance(m, ToolMessage))
+        last_tools = (
+            [tc.get("name") for tc in (getattr(final_ai, "tool_calls", None) or [])]
+            if final_ai is not None
+            else []
+        )
+        logger.warning(
+            "CHAT_EMPTY_REPLY tenant=%s user=%s feature=%s ai_msgs=%d "
+            "tool_msgs=%d final_tool_calls=%s — user sees '...' fallback",
+            action.tenant_id,
+            user_id or "?",
+            feature_key,
+            ai_count,
+            tool_count,
+            last_tools,
+        )
         text = "..."
+    # Trace breadcrumb — in /admin/logs filtering by trace_id you'll
+    # see whether this turn had to rescue an earlier AI message.
+    with trace.step("chat.reply", rescued=rescued, chars=len(text)):
+        pass
     return [RuntimeReply(text=text, reply_markup=None, feature_key=feature_key)]
 
 
