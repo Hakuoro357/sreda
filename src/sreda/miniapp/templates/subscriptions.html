@@ -6,6 +6,28 @@
   "use strict";
 
   var BUILD_STAMP = "{{ build_stamp }}";
+
+  // Wait for telegram-web-app.js to finish injecting window.Telegram.
+  // On Android Telegram 12.6+ (observed on Samsung SM-A566B) this
+  // inline script runs BEFORE the head <script src=telegram-web-app>
+  // has populated window.Telegram, even though the network load
+  // looks completed. Retry every 100ms up to 3s before giving up
+  // and rendering the "не удалось открыть" fallback.
+  var _bootAttempts = 0;
+  function _bootstrap() {
+    if (!(window.Telegram && window.Telegram.WebApp)) {
+      if (_bootAttempts < 30) {
+        _bootAttempts++;
+        setTimeout(_bootstrap, 100);
+        return;
+      }
+      // Gave up — proceed with tg=null → fallback branch below will
+      // show a clear error with the build stamp.
+    }
+    _mainInit();
+  }
+
+  function _mainInit() {
   var tg = window.Telegram && window.Telegram.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
 
@@ -1996,6 +2018,9 @@
   }
   window.addEventListener("focus", _refetchAllOnReturn);
   loadData();
+  }  // end of _mainInit
+
+  _bootstrap();
 })();
 </script>
 {% endblock %}
