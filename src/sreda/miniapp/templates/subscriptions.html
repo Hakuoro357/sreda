@@ -1154,13 +1154,46 @@
     // cached yet, fire loadRecipes and show a stub message in the list.
     if (state.recipes === null) loadRecipes();
 
+    // Preserve the route-level back handler so we can restore it when
+    // the modal closes. Without this, Android's system-back triangle
+    // bubbles up to the route handler and navigates the whole Mini App
+    // back a step while the modal stays visible on top.
+    var prevBackHandler = _backHandler;
+
     var overlay = document.createElement("div");
     overlay.style.cssText =
       "position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);" +
       "z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;";
+
+    function closeModal() {
+      if (!overlay.parentNode) return;
+      document.body.removeChild(overlay);
+      if (tg && tg.BackButton) {
+        try { tg.BackButton.offClick(closeModal); } catch (e) {}
+        _backHandler = prevBackHandler;
+        if (_backHandler) {
+          tg.BackButton.onClick(_backHandler);
+        } else {
+          tg.BackButton.hide();
+        }
+      }
+    }
+
     overlay.onclick = function(e) {
-      if (e.target === overlay) document.body.removeChild(overlay);
+      if (e.target === overlay) closeModal();
     };
+
+    // Hijack the Telegram BackButton (== Android system back on iOS/Android
+    // Telegram clients) to close the modal instead of navigating the
+    // route. On close we restore the route-level handler above.
+    if (tg && tg.BackButton) {
+      if (_backHandler) {
+        try { tg.BackButton.offClick(_backHandler); } catch (e) {}
+      }
+      _backHandler = closeModal;
+      tg.BackButton.onClick(closeModal);
+      tg.BackButton.show();
+    }
 
     var modal = document.createElement("div");
     modal.style.cssText =
@@ -1208,16 +1241,12 @@
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
 
-    function close() {
-      if (overlay.parentNode) document.body.removeChild(overlay);
-    }
-
     function patchCell(payload) {
       apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/item", {
         method: "PATCH",
         body: payload,
       }).then(function(res) {
-        close();
+        closeModal();
         if (res && res.ok) {
           state.weeklyMenu = null;  // force reload on next renderWeeklyMenu
           loadWeeklyMenu();
@@ -1255,7 +1284,7 @@
       };
     }
 
-    document.getElementById("_me_cancel").onclick = close;
+    document.getElementById("_me_cancel").onclick = closeModal;
   };
 
   window._clearWeeklyMenu = function(weekStart) {
@@ -1402,6 +1431,40 @@
 
   // -- Init --
   window.addEventListener("hashchange", render);
+
+  // Invalidate cached server state when the Mini App regains focus —
+  // the user likely went to chat and asked the bot to mutate something
+  // (save recipes, add shopping, edit family). Without this, the UI
+  // keeps showing stale data until the user force-closes and reopens.
+  // Fires on tab-focus (visibility) and on Telegram viewport events.
+  var _lastRefreshAt = 0;
+  function _refetchAllOnReturn() {
+    // Throttle: at most once every 2s. Telegram fires viewportChanged
+    // frequently on keyboard open/close, don't bombard the server.
+    var now = Date.now();
+    if (now - _lastRefreshAt < 2000) return;
+    _lastRefreshAt = now;
+    state.summary = null;
+    state.plans = null;
+    state.menu = null;
+    state.reminders = null;
+    state.shopping = null;
+    state.recipes = null;
+    state.recipeDetail = {};
+    state.weeklyMenu = null;
+    state.family = null;
+    loadData();
+    render();
+  }
+  document.addEventListener("visibilitychange", function() {
+    if (document.visibilityState === "visible") _refetchAllOnReturn();
+  });
+  if (tg && typeof tg.onEvent === "function") {
+    // Telegram-specific: fires when the Mini App is re-opened from the
+    // tray or when the user returns from another screen within Telegram.
+    try { tg.onEvent("themeChanged", _refetchAllOnReturn); } catch (e) {}
+  }
+  window.addEventListener("focus", _refetchAllOnReturn);
   loadData();
 })();
 </script>
