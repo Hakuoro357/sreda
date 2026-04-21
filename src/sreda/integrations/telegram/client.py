@@ -36,6 +36,28 @@ class TelegramClient:
             payload["text"] = text
         return await self._post_json("answerCallbackQuery", payload, timeout=3.0)
 
+    async def edit_message_text(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        """Rewrite an existing message in-place. Used to update a
+        reminder message ("🔔 купить молоко") into its acknowledged
+        form ("✅ купить молоко") and drop the inline keyboard so the
+        buttons can't be tapped twice.
+        """
+        payload: dict = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return await self._post_json("editMessageText", payload, timeout=5.0)
+
     async def set_my_commands(self, commands: list[dict]) -> dict:
         return await self._post_json("setMyCommands", {"commands": commands}, timeout=10.0)
 

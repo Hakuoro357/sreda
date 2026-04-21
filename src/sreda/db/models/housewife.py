@@ -67,6 +67,21 @@ class FamilyReminder(Base):
     last_fired_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Set when the user tapped "Сделал ✅" on the reminder's inline
+    # keyboard. Distinguishes a cleanly-closed reminder from one the
+    # worker just stopped re-pinging because escalation capped out.
+    # Kept even after the row transitions to fired / rrule-advances
+    # so we retain a 1-shot audit trail per firing.
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # How many times the CURRENT firing instance has been sent to the
+    # user. First send = 1. Re-ping 2 minutes later = 2. Worker caps
+    # at ESCALATION_MAX and then finalises. Reset to 0 when the row
+    # transitions via rrule advance or gets snoozed.
+    escalation_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

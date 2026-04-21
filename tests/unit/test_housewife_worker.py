@@ -52,6 +52,9 @@ def test_worker_fires_due_reminder_and_writes_outbox() -> None:
 
 
 def test_worker_leaves_future_reminders_alone() -> None:
+    """After escalation lands, the past reminder STAYS pending (re-ping
+    scheduled +2min out) — the future one is untouched. A single tick
+    only sends the message once."""
     session = _fresh_session()
     svc = HousewifeReminderService(session)
     now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
@@ -70,17 +73,20 @@ def test_worker_leaves_future_reminders_alone() -> None:
     assert fired == 1
     outbox = session.query(OutboxMessage).all()
     assert len(outbox) == 1
-    # Only the past reminder advanced to fired; future stays pending.
-    remaining = (
-        session.query(FamilyReminder)
-        .filter(FamilyReminder.status == "pending")
-        .all()
-    )
-    assert len(remaining) == 1
-    assert remaining[0].title == "Future"
+    # Both reminders still pending — Past got its first fire + re-ping
+    # scheduled; Future untouched.
+    pending = session.query(FamilyReminder).filter_by(status="pending").all()
+    assert {r.title for r in pending} == {"Past", "Future"}
+    past = next(r for r in pending if r.title == "Past")
+    assert past.escalation_count == 1
 
 
-def test_worker_advances_recurring_reminder() -> None:
+def test_worker_recurring_first_fire_schedules_re_ping() -> None:
+    """A single worker tick against a recurring reminder bumps
+    escalation_count to 1 and schedules a +2min re-ping — NOT the
+    next week. Weekly advance happens only after the cycle caps."""
+    from sreda.services.housewife_reminders import ESCALATION_INTERVAL_MINUTES
+
     session = _fresh_session()
     svc = HousewifeReminderService(session)
     first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
@@ -91,17 +97,17 @@ def test_worker_advances_recurring_reminder() -> None:
     )
 
     worker = HousewifeReminderWorker(session)
-    # Use the first_tuesday as "now" so the reminder is due.
     asyncio.run(worker.process_pending(now=first_tuesday))
 
     session.refresh(reminder)
     assert reminder.status == "pending"
-    assert reminder.next_trigger_at is not None
-    # After firing the first occurrence, next should be +7 days.
+    assert reminder.escalation_count == 1
     next_at = reminder.next_trigger_at
     if next_at.tzinfo is None:
         next_at = next_at.replace(tzinfo=UTC)
-    assert next_at == first_tuesday + timedelta(days=7)
+    assert next_at == first_tuesday + timedelta(
+        minutes=ESCALATION_INTERVAL_MINUTES
+    )
 
 
 def test_worker_skips_tenant_without_telegram() -> None:

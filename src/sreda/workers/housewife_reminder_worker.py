@@ -92,11 +92,27 @@ class HousewifeReminderWorker:
             )
             return
 
+        # Escalation UI: inline keyboard lets the user ack or snooze
+        # with one tap. Callback data carries the reminder id — the
+        # telegram bot callback handler parses our prefix and routes
+        # to HousewifeReminderService.acknowledge / .snooze.
         text = f"🔔 {reminder.title}"
+        reply_markup = {
+            "inline_keyboard": [[
+                {
+                    "text": "Сделал ✅",
+                    "callback_data": f"rem_done:{reminder.id}",
+                },
+                {
+                    "text": "Отложить ⏰",
+                    "callback_data": f"rem_snooze:{reminder.id}",
+                },
+            ]],
+        }
         payload = {
             "chat_id": chat_id,
             "text": text,
-            "reply_markup": None,
+            "reply_markup": reply_markup,
         }
         outbox = OutboxMessage(
             id=f"out_{uuid4().hex[:24]}",

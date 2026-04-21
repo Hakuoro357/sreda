@@ -217,6 +217,22 @@ async def _handle_callback(
     inbound_message_id: str | None,
 ) -> None:
     callback_id = callback_query.get("id")
+    data = str(callback_query.get("data") or "")
+
+    # Reminder-escalation callbacks (v1.2). The housewife reminder
+    # worker sends inline buttons with callback_data of the form
+    # ``rem_done:<reminder_id>`` / ``rem_snooze:<reminder_id>``. We
+    # intercept here BEFORE the generic dispatch so the core runtime
+    # pipeline doesn't try to treat this as a chat turn.
+    if data.startswith("rem_done:") or data.startswith("rem_snooze:"):
+        await _handle_reminder_callback(
+            session=session,
+            telegram_client=telegram_client,
+            callback_query=callback_query,
+            data=data,
+        )
+        return
+
     if callback_id:
         try:
             await telegram_client.answer_callback_query(str(callback_id), text="Готово")
@@ -235,6 +251,82 @@ async def _handle_callback(
     runtime = ActionRuntimeService(session, telegram_client=telegram_client)
     queued = runtime.enqueue_action(runtime_action)
     await runtime.process_job(queued.job_id)
+
+
+async def _handle_reminder_callback(
+    *,
+    session: Session,
+    telegram_client: TelegramClient,
+    callback_query: dict,
+    data: str,
+) -> None:
+    """Handle the "Сделал ✅" / "Отложить ⏰" buttons on a housewife
+    reminder message. Updates the FamilyReminder state, edits the
+    original message to remove the keyboard (so the user can't tap
+    twice) and answers the callback with a short toast.
+    """
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.services.housewife_reminders import (
+        SNOOZE_DEFAULT_MINUTES,
+        HousewifeReminderService,
+    )
+
+    action, _, reminder_id = data.partition(":")
+    callback_id = str(callback_query.get("id") or "")
+    message = callback_query.get("message") or {}
+    chat = (message.get("chat") or {}) if isinstance(message, dict) else {}
+    chat_id = str(chat.get("id") or "") if isinstance(chat, dict) else ""
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    original_text = (message.get("text") or "") if isinstance(message, dict) else ""
+
+    reminder = session.get(FamilyReminder, reminder_id) if reminder_id else None
+    if reminder is None:
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(
+                    callback_id, text="Напоминание уже закрыто"
+                )
+            except TelegramDeliveryError:
+                pass
+        return
+
+    service = HousewifeReminderService(session)
+    toast_text: str
+    new_message_text: str
+    if action == "rem_done":
+        service.acknowledge(reminder)
+        toast_text = "Принято ✅"
+        # Replace the bell emoji with a check so the user sees the
+        # ack state at a glance when scrolling chat history.
+        new_message_text = "✅ " + original_text.lstrip("🔔 ").strip()
+    else:  # rem_snooze
+        service.snooze(reminder, minutes=SNOOZE_DEFAULT_MINUTES)
+        toast_text = f"Отложено на {SNOOZE_DEFAULT_MINUTES} мин ⏰"
+        new_message_text = (
+            f"⏰ {original_text.lstrip('🔔 ').strip()} "
+            f"(напомню через {SNOOZE_DEFAULT_MINUTES} мин)"
+        )
+    session.commit()
+
+    if callback_id:
+        try:
+            await telegram_client.answer_callback_query(callback_id, text=toast_text)
+        except TelegramDeliveryError as exc:
+            logger.warning("reminder callback ack failed: %s", exc)
+
+    # Clear the inline keyboard — pass an empty inline_keyboard rather
+    # than None so editMessageText actually strips the buttons (Telegram
+    # Bot API: omit reply_markup to leave unchanged).
+    if chat_id and message_id:
+        try:
+            await telegram_client.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=new_message_text,
+                reply_markup={"inline_keyboard": []},
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning("reminder edit_message_text failed: %s", exc)
 
 
 async def _handle_command(

@@ -92,7 +92,10 @@ def test_due_now_returns_past_pending_only() -> None:
     assert due[0].title == "Past"
 
 
-def test_mark_fired_oneshot_transitions_to_fired() -> None:
+def test_mark_fired_oneshot_first_fire_schedules_re_ping() -> None:
+    """v1.2 escalation: first mark_fired does NOT transition to 'fired';
+    it bumps escalation_count to 1 and schedules a re-ping 2 min later,
+    waiting for user acknowledgement via inline buttons."""
     session = _fresh_session()
     service = HousewifeReminderService(session)
     reminder = service.schedule(
@@ -100,14 +103,104 @@ def test_mark_fired_oneshot_transitions_to_fired() -> None:
         title="One", trigger_at=datetime(2026, 5, 1, tzinfo=UTC),
     )
 
-    service.mark_fired(reminder, now=datetime(2026, 5, 1, tzinfo=UTC))
+    fire_at = datetime(2026, 5, 1, tzinfo=UTC)
+    service.mark_fired(reminder, now=fire_at)
+
+    assert reminder.status == "pending"
+    assert reminder.escalation_count == 1
+    assert reminder.last_fired_at is not None
+    assert reminder.next_trigger_at is not None
+    assert _coerce_utc(reminder.next_trigger_at) == fire_at + timedelta(minutes=2)
+
+
+def test_mark_fired_oneshot_final_fire_transitions_to_fired() -> None:
+    """After ESCALATION_MAX_FIRES firings, the one-shot closes out:
+    status='fired', escalation_count reset, next_trigger_at cleared."""
+    from sreda.services.housewife_reminders import ESCALATION_MAX_FIRES
+
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    reminder = service.schedule(
+        tenant_id="tenant_1", user_id="user_1",
+        title="One", trigger_at=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+    now = datetime(2026, 5, 1, tzinfo=UTC)
+    for i in range(ESCALATION_MAX_FIRES):
+        service.mark_fired(reminder, now=now + timedelta(minutes=2 * i))
 
     assert reminder.status == "fired"
     assert reminder.next_trigger_at is None
-    assert reminder.last_fired_at is not None
+    assert reminder.escalation_count == 0  # reset on finalize
 
 
-def test_mark_fired_recurring_advances_next_trigger() -> None:
+def test_acknowledge_oneshot_closes_without_reping() -> None:
+    """User taps "Сделал ✅" on first ping → reminder goes to 'fired'
+    immediately, no re-ping waits."""
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    reminder = service.schedule(
+        tenant_id="tenant_1", user_id="user_1",
+        title="Buy bread", trigger_at=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+    service.mark_fired(reminder, now=datetime(2026, 5, 1, tzinfo=UTC))
+    # Simulate user tap 30 seconds later.
+    ack_at = datetime(2026, 5, 1, 0, 0, 30, tzinfo=UTC)
+    service.acknowledge(reminder, now=ack_at)
+
+    assert reminder.status == "fired"
+    assert reminder.next_trigger_at is None
+    assert reminder.acknowledged_at is not None
+    assert _coerce_utc(reminder.acknowledged_at) == ack_at
+    assert reminder.escalation_count == 0
+
+
+def test_acknowledge_recurring_advances_without_reping() -> None:
+    """Acking a weekly reminder rolls to the next occurrence and
+    clears the escalation counter without waiting for the re-ping."""
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
+    reminder = service.schedule(
+        tenant_id="tenant_1", user_id="user_1",
+        title="Купить хлеб",
+        trigger_at=first_tuesday,
+        recurrence_rule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=16",
+    )
+    service.mark_fired(reminder, now=first_tuesday)
+    service.acknowledge(reminder, now=first_tuesday + timedelta(seconds=45))
+
+    assert reminder.status == "pending"
+    # Next Tuesday, not +2min re-ping.
+    assert _coerce_utc(reminder.next_trigger_at) == first_tuesday + timedelta(days=7)
+    assert reminder.escalation_count == 0
+
+
+def test_snooze_pushes_trigger_out_and_resets_escalation() -> None:
+    """User taps "Отложить 10м ⏰" → next_trigger_at = now+10, counter
+    resets so fresh escalation starts from re-ping #1 next time."""
+    from sreda.services.housewife_reminders import SNOOZE_DEFAULT_MINUTES
+
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    reminder = service.schedule(
+        tenant_id="tenant_1", user_id="user_1",
+        title="Buy bread", trigger_at=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+    service.mark_fired(reminder, now=datetime(2026, 5, 1, tzinfo=UTC))
+
+    snooze_at = datetime(2026, 5, 1, 0, 0, 45, tzinfo=UTC)
+    service.snooze(reminder, now=snooze_at)
+
+    assert reminder.status == "pending"
+    assert reminder.escalation_count == 0
+    assert reminder.acknowledged_at is None
+    expected = snooze_at + timedelta(minutes=SNOOZE_DEFAULT_MINUTES)
+    assert _coerce_utc(reminder.next_trigger_at) == expected
+
+
+def test_mark_fired_recurring_first_fire_schedules_re_ping() -> None:
+    """Recurring reminder — first fire ALSO schedules a +2min re-ping
+    before advancing to next week. Escalation applies uniformly."""
     session = _fresh_session()
     service = HousewifeReminderService(session)
     first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
@@ -117,10 +210,31 @@ def test_mark_fired_recurring_advances_next_trigger() -> None:
         recurrence_rule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=16;BYMINUTE=0",
     )
 
-    # Simulate firing at the first occurrence; next should be +7 days.
     service.mark_fired(reminder, now=first_tuesday)
 
     assert reminder.status == "pending"
+    assert reminder.escalation_count == 1
+    assert _coerce_utc(reminder.next_trigger_at) == first_tuesday + timedelta(minutes=2)
+
+
+def test_mark_fired_recurring_final_fire_advances_next_week() -> None:
+    """After escalation caps out, recurring reminder rolls to next
+    occurrence with escalation_count reset."""
+    from sreda.services.housewife_reminders import ESCALATION_MAX_FIRES
+
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
+    reminder = service.schedule(
+        tenant_id="tenant_1", user_id="user_1",
+        title="Weekly", trigger_at=first_tuesday,
+        recurrence_rule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=16;BYMINUTE=0",
+    )
+    for i in range(ESCALATION_MAX_FIRES):
+        service.mark_fired(reminder, now=first_tuesday + timedelta(minutes=2 * i))
+
+    assert reminder.status == "pending"
+    assert reminder.escalation_count == 0
     assert _coerce_utc(reminder.next_trigger_at) == first_tuesday + timedelta(days=7)
 
 
@@ -169,7 +283,11 @@ def test_list_active_excludes_fired_and_cancelled() -> None:
         title="ToFire", trigger_at=datetime(2026, 5, 3, tzinfo=UTC),
     )
     service.cancel(tenant_id="tenant_1", reminder_id=rem2.id)
+    # Finalise rem3 via mark_fired + acknowledge (new escalation flow;
+    # a single mark_fired now leaves status=pending with a re-ping
+    # scheduled, so list_active would still return it).
     service.mark_fired(rem3, now=datetime(2026, 5, 3, tzinfo=UTC))
+    service.acknowledge(rem3, now=datetime(2026, 5, 3, 0, 1, tzinfo=UTC))
     session.commit()
 
     active = service.list_active(tenant_id="tenant_1")
