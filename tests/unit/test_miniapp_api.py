@@ -276,3 +276,84 @@ class TestMiniAppSubscribe:
         )
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
+
+
+class TestMiniAppMenuItemPatch:
+    """PATCH /api/v1/weekly-menu/{plan_id}/item — Stage 5 inline editor."""
+
+    def _seed_plan(self):
+        """Create an empty menu plan directly via service, return plan_id."""
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_menu import HousewifeMenuService
+
+        session = get_session_factory()()
+        try:
+            plan = HousewifeMenuService(session).plan_week(
+                tenant_id="tenant_test",
+                user_id="user_test",
+                week_start="2026-04-20",
+                cells=[],  # empty plan — all cells created via PATCH
+            )
+            return plan.id
+        finally:
+            session.close()
+
+    def test_patch_creates_cell_with_free_text(self, seeded_client):
+        plan_id = self._seed_plan()
+        init_data = _make_init_data()
+        resp = seeded_client.patch(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/item",
+            json={
+                "day_of_week": 2,
+                "meal_type": "dinner",
+                "free_text": "паста карбонара",
+                "notes": "на двоих",
+            },
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["item"]["free_text"] == "паста карбонара"
+        assert data["item"]["day_of_week"] == 2
+        assert data["item"]["meal_type"] == "dinner"
+
+    def test_patch_clears_cell_when_both_empty(self, seeded_client):
+        """Passing recipe_id=None + free_text empty/None deletes the cell.
+        Service returns None → endpoint reports cleared=True (not 404)."""
+        plan_id = self._seed_plan()
+        init_data = _make_init_data()
+
+        # First create a cell
+        seeded_client.patch(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/item",
+            json={"day_of_week": 0, "meal_type": "breakfast", "free_text": "каша"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        # Then clear it
+        resp = seeded_client.patch(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/item",
+            json={"day_of_week": 0, "meal_type": "breakfast"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "cleared": True}
+
+    def test_patch_unknown_plan_returns_404(self, seeded_client):
+        init_data = _make_init_data()
+        resp = seeded_client.patch(
+            "/miniapp/api/v1/weekly-menu/nonexistent_plan/item",
+            json={"day_of_week": 0, "meal_type": "lunch", "free_text": "x"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 404
+
+    def test_patch_invalid_meal_type_returns_400(self, seeded_client):
+        plan_id = self._seed_plan()
+        init_data = _make_init_data()
+        resp = seeded_client.patch(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/item",
+            json={"day_of_week": 0, "meal_type": "teatime", "free_text": "чай"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 400

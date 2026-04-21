@@ -643,24 +643,26 @@
         title += " \u00b7 ~" + Math.round(dayKcal) + " ккал";
       }
       html += '<div class="section-title">' + escHtml(title) + '</div>';
-      html += '<div class="card">';
-      var hasAny = false;
+      html += '<div class="card" style="padding:8px 12px">';
+      // Render ALL 4 meal slots per day (filled or placeholder) so the
+      // user can tap an empty slot to add without going to chat.
       for (var m = 0; m < _MEAL_ORDER.length; m++) {
         var mt = _MEAL_ORDER[m];
         var cell = byCell[d + ":" + mt];
-        if (!cell) continue;
-        hasAny = true;
-        html += '<div style="margin-bottom:8px">';
-        html += '<span class="card-subtitle">' + escHtml(_MEAL_LABELS[mt]) + ': </span>';
-        if (cell.recipe_id && cell.recipe_title) {
-          html += '<a href="#/recipes/' + escHtml(cell.recipe_id) + '">' + escHtml(cell.recipe_title) + '</a>';
-        } else if (cell.free_text) {
-          html += escHtml(cell.free_text);
+        var cellJson = cell ? JSON.stringify(cell) : 'null';
+        var cellArg = encodeURIComponent(cellJson);
+        html += '<div class="menu-cell" ';
+        html += 'onclick="window._openMenuEditor(\'' + escHtml(plan.id) + '\',' + d + ',\'' + mt + '\',\'' + cellArg + '\')" ';
+        html += 'style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06);cursor:pointer;-webkit-tap-highlight-color:rgba(0,0,0,0.08);">';
+        html += '<span class="card-subtitle" style="display:inline-block;min-width:90px">' + escHtml(_MEAL_LABELS[mt]) + ':</span> ';
+        if (cell && cell.recipe_id && cell.recipe_title) {
+          html += '<span>' + escHtml(cell.recipe_title) + '</span>';
+        } else if (cell && cell.free_text) {
+          html += '<span>' + escHtml(cell.free_text) + '</span>';
+        } else {
+          html += '<span class="card-subtitle" style="font-style:italic">+ добавить</span>';
         }
         html += '</div>';
-      }
-      if (!hasAny) {
-        html += '<div class="card-subtitle" style="font-style:italic">—</div>';
       }
       html += '</div>';
     }
@@ -1134,6 +1136,126 @@
           }
         }).catch(function() { showAlert("Не удалось удалить."); });
     });
+  };
+
+  // Menu cell editor (v1.2 Stage 5). Tap on a #/menu cell opens a
+  // modal with three fields: free-text title, dropdown over the user's
+  // recipe book, and notes. Save calls PATCH weekly-menu/{plan}/item.
+  // "Очистить" sends the same PATCH with recipe_id=null + empty text,
+  // service treats that as cell deletion.
+  window._openMenuEditor = function(planId, day, mealType, cellArg) {
+    var cell = null;
+    try {
+      var raw = decodeURIComponent(cellArg || "null");
+      cell = JSON.parse(raw);
+    } catch (e) { cell = null; }
+
+    // Make sure recipes are loaded so the dropdown has options. If not
+    // cached yet, fire loadRecipes and show a stub message in the list.
+    if (state.recipes === null) loadRecipes();
+
+    var overlay = document.createElement("div");
+    overlay.style.cssText =
+      "position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);" +
+      "z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;";
+    overlay.onclick = function(e) {
+      if (e.target === overlay) document.body.removeChild(overlay);
+    };
+
+    var modal = document.createElement("div");
+    modal.style.cssText =
+      "background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);" +
+      "border-radius:12px;padding:16px;max-width:400px;width:100%;" +
+      "max-height:80vh;overflow-y:auto;box-shadow:0 10px 40px rgba(0,0,0,0.3);";
+
+    var dayName = _MENU_DAYS_RU[day] || ("День " + day);
+    var mealLabel = _MEAL_LABELS[mealType] || mealType;
+    var currentRecipeId = (cell && cell.recipe_id) || "";
+    var currentText = (cell && cell.free_text) || "";
+    var currentNotes = (cell && cell.notes) || "";
+    var titlePrefill = cell && cell.recipe_title ? cell.recipe_title : currentText;
+
+    var recipes = (state.recipes && state.recipes.items) || [];
+    var options = '<option value="">— не из книги —</option>';
+    for (var i = 0; i < recipes.length; i++) {
+      var r = recipes[i];
+      var sel = r.id === currentRecipeId ? " selected" : "";
+      options += '<option value="' + escHtml(r.id) + '"' + sel + '>' + escHtml(r.title) + '</option>';
+    }
+
+    modal.innerHTML =
+      '<h2 style="margin:0 0 4px 0;font-size:18px">' + escHtml(dayName) + ' · ' + escHtml(mealLabel) + '</h2>' +
+      '<p class="card-subtitle" style="margin:0 0 12px 0">Что готовим?</p>' +
+
+      '<label class="card-subtitle" style="display:block;margin:8px 0 4px 0">Название блюда</label>' +
+      '<input id="_me_text" type="text" style="width:100%;padding:10px;border:1px solid rgba(0,0,0,0.15);border-radius:8px;font-size:15px;box-sizing:border-box" ' +
+      'value="' + escHtml(titlePrefill) + '" placeholder="например, «паста с курицей»">' +
+
+      '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Или из книги рецептов</label>' +
+      '<select id="_me_recipe" style="width:100%;padding:10px;border:1px solid rgba(0,0,0,0.15);border-radius:8px;font-size:15px;box-sizing:border-box">' +
+      options + '</select>' +
+
+      '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Заметки</label>' +
+      '<textarea id="_me_notes" rows="2" style="width:100%;padding:10px;border:1px solid rgba(0,0,0,0.15);border-radius:8px;font-size:15px;box-sizing:border-box;resize:vertical" ' +
+      'placeholder="на двоих / холодный / с собой">' + escHtml(currentNotes) + '</textarea>' +
+
+      '<div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">' +
+      '<button id="_me_save" class="btn btn-primary" style="flex:1;min-width:120px">Сохранить</button>' +
+      (cell ? '<button id="_me_clear" class="btn btn-danger" style="flex:1;min-width:100px">Очистить</button>' : '') +
+      '<button id="_me_cancel" class="btn" style="flex:1;min-width:100px;background:rgba(0,0,0,0.08)">Отмена</button>' +
+      '</div>';
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    function close() {
+      if (overlay.parentNode) document.body.removeChild(overlay);
+    }
+
+    function patchCell(payload) {
+      apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/item", {
+        method: "PATCH",
+        body: payload,
+      }).then(function(res) {
+        close();
+        if (res && res.ok) {
+          state.weeklyMenu = null;  // force reload on next renderWeeklyMenu
+          loadWeeklyMenu();
+        } else {
+          showAlert("Не удалось сохранить.");
+        }
+      }).catch(function() { showAlert("Не удалось сохранить."); });
+    }
+
+    document.getElementById("_me_save").onclick = function() {
+      var txt = (document.getElementById("_me_text").value || "").trim();
+      var rid = document.getElementById("_me_recipe").value || null;
+      var nts = (document.getElementById("_me_notes").value || "").trim() || null;
+      // Recipe dropdown wins when set — title field ignored in that
+      // case (service stores recipe_id; UI shows recipe title).
+      patchCell({
+        day_of_week: day,
+        meal_type: mealType,
+        recipe_id: rid,
+        free_text: rid ? null : (txt || null),
+        notes: nts,
+      });
+    };
+
+    var clearBtn = document.getElementById("_me_clear");
+    if (clearBtn) {
+      clearBtn.onclick = function() {
+        patchCell({
+          day_of_week: day,
+          meal_type: mealType,
+          recipe_id: null,
+          free_text: null,
+          notes: null,
+        });
+      };
+    }
+
+    document.getElementById("_me_cancel").onclick = close;
   };
 
   window._clearWeeklyMenu = function(weekStart) {
