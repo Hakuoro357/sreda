@@ -13,7 +13,6 @@ from sreda.db.models.core import Tenant, User
 from sreda.db.models.housewife_food import MenuPlan, MenuPlanItem
 from sreda.services.housewife_menu import (
     HousewifeMenuService,
-    MenuCellInput,
     _coerce_monday,
 )
 from sreda.services.housewife_recipes import HousewifeRecipeService
@@ -390,3 +389,148 @@ def test_aggregate_ingredients_cross_tenant_returns_empty(session):
     assert svc.aggregate_ingredients_for_shopping(
         tenant_id="t2", user_id="u2", plan_id=plan.id,
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# _scale_quantity — standalone unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_scale_quantity_simple_int():
+    from sreda.services.housewife_menu import _scale_quantity
+    assert _scale_quantity("500 г", 2) == "1000 г"
+
+
+def test_scale_quantity_decimal_dot():
+    from sreda.services.housewife_menu import _scale_quantity
+    assert _scale_quantity("0.5 л", 3) == "1.5 л"
+
+
+def test_scale_quantity_decimal_comma_russian():
+    from sreda.services.housewife_menu import _scale_quantity
+    # "1,5 кг" * 2 → "3 кг" (integer result drops decimals)
+    assert _scale_quantity("1,5 кг", 2) == "3 кг"
+
+
+def test_scale_quantity_no_space_unit():
+    from sreda.services.housewife_menu import _scale_quantity
+    assert _scale_quantity("2шт", 2) == "4 шт"
+
+
+def test_scale_quantity_factor_one_is_noop():
+    from sreda.services.housewife_menu import _scale_quantity
+    assert _scale_quantity("500 г", 1) == "500 г"
+    assert _scale_quantity("по вкусу", 1) == "по вкусу"
+    assert _scale_quantity("2-3 шт", 1) == "2-3 шт"
+
+
+def test_scale_quantity_none_passthrough():
+    from sreda.services.housewife_menu import _scale_quantity
+    assert _scale_quantity(None, 3) is None
+
+
+def test_scale_quantity_unparseable_gets_prefix():
+    from sreda.services.housewife_menu import _scale_quantity
+    # Ranges, fractions and free text can't be multiplied numerically.
+    # We prefix with ×N so the user sees the scaling intent.
+    assert _scale_quantity("по вкусу", 3) == "×3 по вкусу"
+    assert _scale_quantity("2-3 шт", 2) == "×2 2-3 шт"
+    assert _scale_quantity("1/2 стакана", 2) == "×2 1/2 стакана"
+
+
+def test_scale_quantity_integer_formatting():
+    from sreda.services.housewife_menu import _scale_quantity
+    # 0.25 * 4 = 1.0 → "1" (integer), not "1.0"
+    assert _scale_quantity("0.25 л", 4) == "1 л"
+
+
+# ---------------------------------------------------------------------------
+# aggregate_ingredients_for_shopping — scaling by eaters_count (Stage 4)
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_scales_by_eaters_count(session):
+    """Family of 4 + 2-serving recipe → factor 2 → quantities double."""
+    recipe_svc = HousewifeRecipeService(session)
+    r = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Паста", servings=2,
+        ingredients=[
+            {"title": "спагетти", "quantity_text": "200 г"},
+            {"title": "соль", "quantity_text": "по вкусу"},
+        ],
+        source="user_dictated",
+    )
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 1, "meal_type": "dinner", "recipe_id": r.id}],
+    )
+    result = svc.aggregate_ingredients_for_shopping(
+        tenant_id="t1", user_id="u1", plan_id=plan.id, eaters_count=4,
+    )
+    by_title = {i.title: i.quantity_text for i in result}
+    assert by_title == {"спагетти": "400 г", "соль": "×2 по вкусу"}
+
+
+def test_aggregate_eaters_under_servings_no_shrink(session):
+    """Family of 1 + 4-serving recipe → factor stays 1 (we don't shrink
+    recipes just because fewer people eat — leftovers are fine)."""
+    recipe_svc = HousewifeRecipeService(session)
+    r = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Торт", servings=8,
+        ingredients=[{"title": "мука", "quantity_text": "500 г"}],
+        source="user_dictated",
+    )
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 1, "meal_type": "dinner", "recipe_id": r.id}],
+    )
+    result = svc.aggregate_ingredients_for_shopping(
+        tenant_id="t1", user_id="u1", plan_id=plan.id, eaters_count=1,
+    )
+    assert [i.quantity_text for i in result] == ["500 г"]
+
+
+def test_aggregate_default_eaters_count_is_one(session):
+    """Old callers that don't pass eaters_count see the original
+    behaviour — factor 1, no scaling."""
+    recipe_svc = HousewifeRecipeService(session)
+    r = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Суп", servings=2,
+        ingredients=[{"title": "вода", "quantity_text": "1 л"}],
+        source="user_dictated",
+    )
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 2, "meal_type": "lunch", "recipe_id": r.id}],
+    )
+    result = svc.aggregate_ingredients_for_shopping(
+        tenant_id="t1", user_id="u1", plan_id=plan.id,  # no eaters_count
+    )
+    assert [i.quantity_text for i in result] == ["1 л"]
+
+
+def test_aggregate_ceiling_rounds_up_for_odd_eaters(session):
+    """5 eaters on a 2-serving recipe: ceil(5/2) = 3 → triple the batch
+    (one portion goes leftover rather than someone eating nothing)."""
+    recipe_svc = HousewifeRecipeService(session)
+    r = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Плов", servings=2,
+        ingredients=[{"title": "рис", "quantity_text": "300 г"}],
+        source="user_dictated",
+    )
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 3, "meal_type": "dinner", "recipe_id": r.id}],
+    )
+    result = svc.aggregate_ingredients_for_shopping(
+        tenant_id="t1", user_id="u1", plan_id=plan.id, eaters_count=5,
+    )
+    assert result[0].quantity_text == "900 г"

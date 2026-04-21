@@ -869,15 +869,35 @@ def build_housewife_tools(
                 lines.append(f"    {item.meal_type}: {body}")
         return "\n".join(lines)
 
+    # ----------------------------------------------------------------
+    # Family member tools (v1.2). Structured household roster used by
+    # the shopping scaler and menu planning prompt context. Replaces
+    # the loose "состав семьи" free-form AssistantMemory blob.
+    #
+    # Instantiated here (before generate_shopping_from_menu) so the
+    # auto-gen tool can read count_eaters for ingredient scaling.
+    # ----------------------------------------------------------------
+    family_service = HousewifeFamilyService(session)
+
     @lc_tool
     def generate_shopping_from_menu(plan_id: str) -> str:
         """Pull all ingredients from a menu plan's recipes into the
-        shopping list.
+        shopping list, scaled to the user's family size.
 
         Use when user says "добавь ингредиенты меню в список покупок"
         or "собери список покупок на неделю". Ingredients get a
         ``source_recipe_id`` tag so shopping items know which recipe
         they came from (enables future "купил для борща" UX).
+
+        Scaling: the service multiplies every ingredient quantity by
+        ``ceil(eaters / recipe.servings)``. ``eaters`` comes from
+        ``count_eaters`` on the family-members table (fallback 1 for
+        solo users). A 2-serving recipe with a family of 4 doubles
+        all quantities. Numeric strings ("500 г") get multiplied;
+        free-form ones ("по вкусу") get an ``×N `` prefix so the user
+        still sees that scaling was applied. If the user hasn't
+        recorded family members yet, call ``add_family_members``
+        FIRST so the list is sized correctly.
 
         Free-text menu cells (no ``recipe_id``) contribute nothing —
         LLM / user add stuff manually for those.
@@ -885,17 +905,21 @@ def build_housewife_tools(
         Args:
             plan_id: id from plan_week_menu / list_menu (``menu_...``).
 
-        Returns ``ok:generated:N`` where N is the number of items
-        added. Returns ``ok:generated:0`` if the plan exists but all
-        cells are free-text (nothing structured to aggregate).
+        Returns ``ok:generated:N:eaters=E`` where N is the items added
+        and E is the family-size factor used. ``ok:generated:0`` if
+        the plan exists but all cells are free-text.
         """
         if not user_id:
             return "error: no user_id context"
+        eaters = family_service.count_eaters(
+            tenant_id=tenant_id, user_id=user_id
+        )
         try:
             ingredients = menu_service.aggregate_ingredients_for_shopping(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 plan_id=plan_id.strip(),
+                eaters_count=eaters,
             )
         except Exception:  # noqa: BLE001
             logger.exception("generate_shopping_from_menu: aggregation failed")
@@ -924,14 +948,7 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("generate_shopping_from_menu: add_items failed")
             return "error: internal"
-        return f"ok:generated:{len(rows)}"
-
-    # ----------------------------------------------------------------
-    # Family member tools (v1.2). Structured household roster used by
-    # the shopping scaler and menu planning prompt context. Replaces
-    # the loose "состав семьи" free-form AssistantMemory blob.
-    # ----------------------------------------------------------------
-    family_service = HousewifeFamilyService(session)
+        return f"ok:generated:{len(rows)}:eaters={eaters}"
 
     @lc_tool
     def add_family_members(members: list[dict[str, Any]]) -> str:

@@ -90,7 +90,9 @@ def test_generate_shopping_from_menu_end_to_end(session):
     gen_result = tools["generate_shopping_from_menu"].invoke({
         "plan_id": plan_id,
     })
-    assert gen_result == "ok:generated:3"
+    # v1.2 Stage 4 — return format now includes eaters=E. With no
+    # family members recorded, count_eaters falls back to 1 (solo user).
+    assert gen_result == "ok:generated:3:eaters=1"
 
     # 4. Inspect shopping rows
     rows = session.query(ShoppingListItem).all()

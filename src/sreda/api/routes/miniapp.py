@@ -1155,9 +1155,16 @@ def generate_shopping_from_menu_endpoint(
     """
     menu_svc = HousewifeMenuService(session)
     shop_svc = HousewifeShoppingService(session)
+    family_svc = HousewifeFamilyService(session)
 
+    eaters = family_svc.count_eaters(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id
+    )
     ingredients = menu_svc.aggregate_ingredients_for_shopping(
-        tenant_id=ctx.tenant_id, user_id=ctx.user_id, plan_id=plan_id
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        plan_id=plan_id,
+        eaters_count=eaters,
     )
     if not ingredients:
         return {"ok": True, "added": 0}

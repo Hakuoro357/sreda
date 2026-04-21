@@ -25,6 +25,8 @@ Key design choices:
 from __future__ import annotations
 
 import logging
+import math
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -270,18 +272,34 @@ class HousewifeMenuService:
     # ------------------------------------------------------------------
 
     def aggregate_ingredients_for_shopping(
-        self, *, tenant_id: str, user_id: str, plan_id: str
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        plan_id: str,
+        eaters_count: int = 1,
     ) -> list[AggregatedIngredient]:
-        """Flatten all ingredients from all recipes referenced by a
-        plan's items. One output row per (recipe × ingredient) pair —
-        no dedup, no scaling; the user (or a later enhancement) handles
-        "нужно 3 л молока всего" math themselves.
+        """Flatten all ingredients from recipes referenced by a plan's
+        items. One output row per (recipe × ingredient) — no dedup
+        (semantic "молоко 500мл + молоко 200мл = 700мл" math is v2+).
 
-        Free-text cells contribute nothing — they have no structured
-        ingredients. The user can manually add stuff for those.
+        ``eaters_count`` scales quantities by
+        ``factor = ceil(eaters / recipe.servings)``. So a 2-serving
+        recipe with a family of 4 cooks twice → ingredients × 2. Pass
+        ``HousewifeFamilyService.count_eaters(...)`` to get the right
+        number. Default 1 keeps the old behaviour (no scaling) for
+        callers that don't know about family.
+
+        Numeric quantities get parsed + multiplied ("500 г" → "1000 г").
+        Non-numeric or unparseable quantities ("по вкусу", "2-3 шт")
+        get an ``×N`` prefix when factor > 1, so the user sees what
+        was supposed to scale.
+
+        Free-text menu cells contribute nothing — they have no
+        structured ingredients.
 
         Cross-tenant safe: if the plan isn't owned by (tenant, user),
-        returns empty list.
+        returns an empty list.
         """
         plan = self._get_plan(tenant_id, user_id, plan_id)
         if plan is None:
@@ -297,7 +315,7 @@ class HousewifeMenuService:
             return []
 
         rows = (
-            self.session.query(RecipeIngredient, Recipe.id.label("rid"))
+            self.session.query(RecipeIngredient, Recipe)
             .join(Recipe, Recipe.id == RecipeIngredient.recipe_id)
             .filter(
                 Recipe.tenant_id == tenant_id,
@@ -308,14 +326,17 @@ class HousewifeMenuService:
             .all()
         )
 
+        eaters = max(1, int(eaters_count or 1))
         out: list[AggregatedIngredient] = []
-        for ing, rid in rows:
+        for ing, recipe in rows:
+            servings = max(1, int(recipe.servings or 1))
+            factor = max(1, math.ceil(eaters / servings))
             out.append(
                 AggregatedIngredient(
                     title=ing.title,
-                    quantity_text=ing.quantity_text,
+                    quantity_text=_scale_quantity(ing.quantity_text, factor),
                     is_optional=ing.is_optional,
-                    source_recipe_id=rid,
+                    source_recipe_id=recipe.id,
                 )
             )
         return out
@@ -385,3 +406,42 @@ def _normalise_cells(
             )
         )
     return out
+
+
+# Matches a quantity starting with a number (int / decimal using . or ,)
+# optionally followed by a simple unit like "г", "мл", "шт", "кг".
+# Ranges ("2-3"), fractions ("1/2") and free text ("по вкусу") do not
+# match — they fall through to the ``×N`` prefix branch.
+_QTY_RE = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-яЁё\s.]*?)\s*$")
+
+
+def _scale_quantity(text: str | None, factor: int) -> str | None:
+    """Multiply a free-form quantity string by ``factor``.
+
+    "500 г" + factor=2 → "1000 г". "0.5 л" + factor=3 → "1.5 л"
+    (comma decimals normalised). Unparseable quantities like
+    "по вкусу" or "2-3 шт" get an ``×N `` prefix when factor > 1 so
+    the user sees that they were meant to scale; factor == 1 returns
+    the input verbatim.
+
+    ``None`` quantity_text passes through unchanged — ingredient
+    rows sometimes have no quantity at all.
+    """
+    if text is None:
+        return None
+    if factor <= 1:
+        return text
+    match = _QTY_RE.match(text)
+    if match is None:
+        return f"×{factor} {text}"
+    num_raw, unit_raw = match.group(1), (match.group(2) or "").strip()
+    try:
+        num = float(num_raw.replace(",", "."))
+    except ValueError:
+        return f"×{factor} {text}"
+    scaled = num * factor
+    if scaled.is_integer():
+        num_out = str(int(scaled))
+    else:
+        num_out = f"{scaled:.3f}".rstrip("0").rstrip(".")
+    return f"{num_out} {unit_raw}".strip() if unit_raw else num_out
