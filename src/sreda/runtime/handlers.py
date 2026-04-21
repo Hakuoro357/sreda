@@ -1590,7 +1590,28 @@ def execute_conversation_chat(
         except Exception:  # noqa: BLE001
             logger.exception("onboarding depth bookkeeping failed")
 
-    text = (final_ai.content or "").strip() or "..."
+    text = (final_ai.content or "").strip()
+    if not text:
+        # Some models emit the user-facing answer TOGETHER with their
+        # tool_calls in an earlier iteration and then return an empty
+        # message on the post-tool iter (they consider themselves done).
+        # Rescue the most recent non-empty AI content from the message
+        # history so the user doesn't see a "..." fallback when the
+        # actual answer was already written.
+        for m in reversed(messages):
+            if not isinstance(m, AIMessage):
+                continue
+            candidate = (getattr(m, "content", "") or "").strip()
+            if candidate:
+                text = candidate
+                logger.info(
+                    "chat: empty final_ai content, rescued text from "
+                    "prior AI iter (len=%d)",
+                    len(text),
+                )
+                break
+    if not text:
+        text = "..."
     return [RuntimeReply(text=text, reply_markup=None, feature_key=feature_key)]
 
 
