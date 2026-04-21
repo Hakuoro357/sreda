@@ -1252,18 +1252,21 @@ def generate_shopping_from_menu_endpoint(
     if not ingredients:
         return {"ok": True, "added": 0}
 
+    # Transform cooking-units → buyable-units via LLM. This is the fix
+    # for "молоко 6 стаканов" and "соль по вкусу" landing in the list.
+    from sreda.services.housewife_shopping_llm import (
+        convert_ingredients_to_shopping_list,
+    )
+    shop_items = convert_ingredients_to_shopping_list(
+        ingredients, eaters_count=eaters,
+    )
+    if not shop_items:
+        return {"ok": True, "added": 0}
+
     rows = shop_svc.add_items(
         tenant_id=ctx.tenant_id,
         user_id=ctx.user_id,
-        items=[
-            {
-                "title": ing.title,
-                "quantity_text": ing.quantity_text,
-                "category": None,
-                "source_recipe_id": ing.source_recipe_id,
-            }
-            for ing in ingredients
-        ],
+        items=shop_items,
     )
     return {"ok": True, "added": len(rows)}
 
@@ -1301,18 +1304,20 @@ def generate_shopping_for_day_endpoint(
         ) from exc
     if not ingredients:
         return {"ok": True, "added": 0}
+
+    from sreda.services.housewife_shopping_llm import (
+        convert_ingredients_to_shopping_list,
+    )
+    shop_items = convert_ingredients_to_shopping_list(
+        ingredients, eaters_count=eaters,
+    )
+    if not shop_items:
+        return {"ok": True, "added": 0}
+
     rows = shop_svc.add_items(
         tenant_id=ctx.tenant_id,
         user_id=ctx.user_id,
-        items=[
-            {
-                "title": ing.title,
-                "quantity_text": ing.quantity_text,
-                "category": None,
-                "source_recipe_id": ing.source_recipe_id,
-            }
-            for ing in ingredients
-        ],
+        items=shop_items,
     )
     return {"ok": True, "added": len(rows)}
 
@@ -1521,20 +1526,19 @@ def _regenerate_menu_item_impl(
                 ing for ing in day_ings if ing.source_recipe_id == new_recipe_id
             ]
             if day_ings:
-                rows = shop_svc.add_items(
-                    tenant_id=ctx.tenant_id,
-                    user_id=ctx.user_id,
-                    items=[
-                        {
-                            "title": ing.title,
-                            "quantity_text": ing.quantity_text,
-                            "category": None,
-                            "source_recipe_id": ing.source_recipe_id,
-                        }
-                        for ing in day_ings
-                    ],
+                from sreda.services.housewife_shopping_llm import (
+                    convert_ingredients_to_shopping_list,
                 )
-                added = len(rows)
+                shop_items = convert_ingredients_to_shopping_list(
+                    day_ings, eaters_count=eaters,
+                )
+                if shop_items:
+                    rows = shop_svc.add_items(
+                        tenant_id=ctx.tenant_id,
+                        user_id=ctx.user_id,
+                        items=shop_items,
+                    )
+                    added = len(rows)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "regenerate_menu_item: add new recipe ingredients failed "

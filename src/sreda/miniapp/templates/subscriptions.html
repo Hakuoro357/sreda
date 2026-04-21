@@ -719,15 +719,19 @@
       html += '<span class="card-subtitle" style="font-style:italic">+ добавить</span>';
     }
     html += '</div>';
-    if (cell && (cell.recipe_id || cell.free_text)) {
-      html +=
-        '<button class="btn btn-small menu-regen-btn" ' +
-        'onclick="event.stopPropagation();window._regenerateMenuCell(\'' + escHtml(planId) + '\',' + day + ',\'' + mealType + '\',this)" ' +
-        'style="padding:4px 8px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;min-width:32px" ' +
-        'title="Подобрать другое блюдо">' +
-        '\u21BB' +
-        '</button>';
-    }
+    // Always render the regen button — for empty cells it CREATES
+    // the dish, for filled cells it SWAPS. The endpoint handles both
+    // (get_cell returns None → no shopping cleanup needed → LLM just
+    // generates the initial suggestion).
+    html +=
+      '<button class="btn btn-small menu-regen-btn" ' +
+      'onclick="event.stopPropagation();window._regenerateMenuCell(\'' + escHtml(planId) + '\',' + day + ',\'' + mealType + '\',this)" ' +
+      'style="padding:4px 8px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;min-width:32px" ' +
+      (cell && (cell.recipe_id || cell.free_text)
+        ? 'title="Подобрать другое блюдо">'
+        : 'title="Подобрать блюдо">') +
+      '\u21BB' +
+      '</button>';
     return html;
   }
 
@@ -826,13 +830,22 @@
       // Day header row: title + "add-to-shopping-for-day" button.
       // data-day-header lets the surgical cell-patch locate this
       // header to recompute the kcal total after an in-place swap.
-      html += '<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 8px 4px">';
-      html += '<div class="section-title" data-day-header="' + d + '" style="margin:0">' + escHtml(title) + '</div>';
+      html += '<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 8px 4px;gap:8px">';
+      html += '<div class="section-title" data-day-header="' + d + '" style="margin:0;flex:1">' + escHtml(title) + '</div>';
+      // Regenerate WHOLE day — fires regen for each of the 4 meal
+      // slots; backend serialises per-plan so dishes don't duplicate.
+      html += '<button class="btn btn-small" ';
+      html += 'onclick="window._regenerateDay(\'' + escHtml(plan.id) + '\',' + d + ',this)" ';
+      html += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;flex-shrink:0" ';
+      html += 'title="Подобрать все блюда этого дня заново">';
+      html += '\u21BB день';
+      html += '</button>';
+      // Add the day's ingredients to the shopping list.
       html += '<button class="btn btn-small" ';
       html += 'onclick="window._generateShoppingForDay(\'' + escHtml(plan.id) + '\',' + d + ',this)" ';
-      html += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer" ';
+      html += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;flex-shrink:0" ';
       html += 'title="Добавить продукты этого дня в список покупок">';
-      html += '\uD83D\uDED2 В список';
+      html += '\uD83D\uDED2';
       html += '</button>';
       html += '</div>';
 
@@ -1636,6 +1649,58 @@
           showAlert("Не удалось очистить.");
         }
       }).catch(function() { showAlert("Не удалось очистить."); });
+    });
+  };
+
+  // Regenerate every meal slot in one day. Fires 4 parallel POSTs
+  // to /regenerate-item; the backend per-plan lock serialises them
+  // so each LLM call sees the previous commits and dishes don't
+  // duplicate. The day-level button spins while any child is in
+  // flight; individual cell buttons also spin via their own locks.
+  window._regenerateDay = function(planId, day, btn) {
+    var originalLabel = null;
+    if (btn && btn.tagName === "BUTTON") {
+      if (btn.disabled) return;
+      originalLabel = btn.innerHTML;
+      btn.disabled = true;
+      btn.style.opacity = "0.6";
+      btn.innerHTML = '<span class="spinner-small"></span>';
+    }
+    var meals = _MEAL_ORDER;
+    var remaining = meals.length;
+    function oneDone() {
+      remaining--;
+      if (remaining <= 0 && btn && btn.tagName === "BUTTON") {
+        btn.disabled = false;
+        btn.style.opacity = "";
+        btn.innerHTML = originalLabel;
+      }
+    }
+    meals.forEach(function(mt) {
+      apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/regenerate-item", {
+        method: "POST",
+        body: { day_of_week: day, meal_type: mt },
+      }).then(function(res) {
+        if (res && res.ok && res.item) {
+          // Update state in place
+          if (state.weeklyMenu && state.weeklyMenu.plan) {
+            var items = state.weeklyMenu.plan.items || [];
+            var replaced = false;
+            for (var i = 0; i < items.length; i++) {
+              if (items[i].day_of_week === day && items[i].meal_type === mt) {
+                items[i] = res.item;
+                replaced = true;
+                break;
+              }
+            }
+            if (!replaced) items.push(res.item);
+            state.weeklyMenu.plan.items = items;
+          }
+          var patched = _patchMenuCellInDom(planId, day, mt, res.item);
+          if (!patched) render();
+        }
+        oneDone();
+      }).catch(oneDone);
     });
   };
 

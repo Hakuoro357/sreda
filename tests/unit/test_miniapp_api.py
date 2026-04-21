@@ -528,7 +528,23 @@ class TestMiniAppDayShopping:
         finally:
             session.close()
 
-    def test_generate_day_adds_only_that_day(self, seeded_client):
+    def test_generate_day_adds_only_that_day(self, seeded_client, monkeypatch):
+        # As of v1.2 Stage 8, the endpoint runs ingredients through
+        # convert_ingredients_to_shopping_list (LLM call). In tests
+        # there's no LLM, so stub the transformer to pass ingredients
+        # through unchanged.
+        monkeypatch.setattr(
+            "sreda.services.housewife_shopping_llm.convert_ingredients_to_shopping_list",
+            lambda ingredients, *, eaters_count, llm=None: [
+                {
+                    "title": i.title,
+                    "quantity_text": i.quantity_text,
+                    "category": None,
+                    "source_recipe_id": i.source_recipe_id,
+                }
+                for i in ingredients
+            ],
+        )
         plan_id = self._seed_plan_with_recipes()
         init_data = _make_init_data()
         resp = seeded_client.post(

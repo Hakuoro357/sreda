@@ -958,19 +958,19 @@ def build_housewife_tools(
         if not ingredients:
             return "ok:generated:0"
 
-        # Transform aggregated ingredients into shopping_service input.
-        # LLM may later re-classify categories via re-read + add; for
-        # now auto-gen always sets category=default so the LLM can
-        # batch-fix in a follow-up turn.
-        items = [
-            {
-                "title": ing.title,
-                "quantity_text": ing.quantity_text,
-                "category": None,  # service coerces to "другое"
-                "source_recipe_id": ing.source_recipe_id,
-            }
-            for ing in ingredients
-        ]
+        # Convert recipe-level units (стаканы, ст.л., "по вкусу") into
+        # buyable shopping units (литры, граммы, пачки) via LLM. Drops
+        # "по вкусу"-style items users already have on hand. Without
+        # this step the list becomes nonsense like "молоко 6 стаканов"
+        # and "соль по вкусу" — users complained.
+        from sreda.services.housewife_shopping_llm import (
+            convert_ingredients_to_shopping_list,
+        )
+        items = convert_ingredients_to_shopping_list(
+            ingredients, eaters_count=eaters
+        )
+        if not items:
+            return f"ok:generated:0:eaters={eaters}"
         try:
             rows = shopping_service.add_items(
                 tenant_id=tenant_id, user_id=user_id, items=items

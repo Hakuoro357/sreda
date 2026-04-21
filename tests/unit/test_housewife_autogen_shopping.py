@@ -84,12 +84,32 @@ def test_generate_shopping_from_menu_end_to_end(session):
     })
     plan_id = plan_result.split(":")[2]
 
-    # 3. Generate shopping — expect 3 ingredients total (Борщ: 2,
-    # Омлет: 1; deduplicated by recipe, not by ingredient, so no
-    # double-counting of яйца despite being used twice in the week)
-    gen_result = tools["generate_shopping_from_menu"].invoke({
-        "plan_id": plan_id,
-    })
+    # 3. Generate shopping. As of v1.2 Stage 8 this goes through an
+    # LLM transformer (convert_ingredients_to_shopping_list). In unit
+    # tests there's no LLM configured, so we stub the transformer to
+    # just pass the ingredients through with default category. The
+    # point of THIS test is the happy-path wiring, not the LLM output.
+    import sreda.services.housewife_shopping_llm as _llm_mod
+
+    original_convert = _llm_mod.convert_ingredients_to_shopping_list
+    def _passthrough(ingredients, *, eaters_count, llm=None):
+        return [
+            {
+                "title": i.title,
+                "quantity_text": i.quantity_text,
+                "category": None,
+                "source_recipe_id": i.source_recipe_id,
+            }
+            for i in ingredients
+        ]
+    _llm_mod.convert_ingredients_to_shopping_list = _passthrough
+    try:
+        gen_result = tools["generate_shopping_from_menu"].invoke({
+            "plan_id": plan_id,
+        })
+    finally:
+        _llm_mod.convert_ingredients_to_shopping_list = original_convert
+
     # v1.2 Stage 4 — return format now includes eaters=E. With no
     # family members recorded, count_eaters falls back to 1 (solo user).
     assert gen_result == "ok:generated:3:eaters=1"
