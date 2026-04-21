@@ -167,6 +167,35 @@ class HousewifeShoppingService:
             only_from=("pending", "bought"),
         )
 
+    def delete_by_source_recipe(
+        self, *, tenant_id: str, user_id: str, recipe_id: str
+    ) -> int:
+        """Hard-delete every pending/bought shopping item that was
+        added from the given recipe (``source_recipe_id`` match).
+
+        Used by the "Подобрать заново" menu-cell action: when the user
+        swaps out a dish, the ingredients auto-generated from the OLD
+        dish should disappear from the shopping list — otherwise the
+        list keeps stale items that the user won't buy. Cancelled-status
+        items are also removed so the recipe-tied history is clean.
+
+        Returns the number of rows actually deleted. Cross-tenant safe.
+        """
+        if not recipe_id:
+            return 0
+        q = self.session.query(ShoppingListItem).filter(
+            ShoppingListItem.tenant_id == tenant_id,
+            ShoppingListItem.user_id == user_id,
+            ShoppingListItem.source_recipe_id == recipe_id,
+        )
+        rows = q.all()
+        if not rows:
+            return 0
+        for row in rows:
+            self.session.delete(row)
+        self.session.commit()
+        return len(rows)
+
     def clear_bought(self, *, tenant_id: str, user_id: str) -> int:
         """Cancel everything currently in ``bought`` state. Used as a
         bulk housekeeping operation — "уже всё закупил, убери из списка

@@ -271,6 +271,62 @@ class HousewifeMenuService:
     # Aggregation — used by Stage 6 auto-gen
     # ------------------------------------------------------------------
 
+    def aggregate_ingredients_for_day(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        plan_id: str,
+        day_of_week: int,
+        eaters_count: int = 1,
+    ) -> list[AggregatedIngredient]:
+        """Same as ``aggregate_ingredients_for_shopping`` but restricted
+        to a single day of the plan. Backs the per-day "В список
+        покупок" button on the Mini App menu screen — sometimes the
+        user only wants shopping for today/tomorrow instead of the
+        whole week.
+        """
+        if not 0 <= int(day_of_week) <= 6:
+            raise ValueError(f"day_of_week must be 0-6, got {day_of_week}")
+        plan = self._get_plan(tenant_id, user_id, plan_id)
+        if plan is None:
+            return []
+
+        recipe_ids = {
+            item.recipe_id
+            for item in plan.items
+            if item.recipe_id is not None and item.day_of_week == day_of_week
+        }
+        if not recipe_ids:
+            return []
+
+        rows = (
+            self.session.query(RecipeIngredient, Recipe)
+            .join(Recipe, Recipe.id == RecipeIngredient.recipe_id)
+            .filter(
+                Recipe.tenant_id == tenant_id,
+                Recipe.user_id == user_id,
+                Recipe.id.in_(recipe_ids),
+            )
+            .order_by(Recipe.id, RecipeIngredient.sort_order)
+            .all()
+        )
+
+        eaters = max(1, int(eaters_count or 1))
+        out: list[AggregatedIngredient] = []
+        for ing, recipe in rows:
+            servings = max(1, int(recipe.servings or 1))
+            factor = max(1, math.ceil(eaters / servings))
+            out.append(
+                AggregatedIngredient(
+                    title=ing.title,
+                    quantity_text=_scale_quantity(ing.quantity_text, factor),
+                    is_optional=ing.is_optional,
+                    source_recipe_id=recipe.id,
+                )
+            )
+        return out
+
     def aggregate_ingredients_for_shopping(
         self,
         *,
@@ -340,6 +396,25 @@ class HousewifeMenuService:
                 )
             )
         return out
+
+    def get_cell(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        plan_id: str,
+        day_of_week: int,
+        meal_type: str,
+    ) -> MenuPlanItem | None:
+        """Fetch one cell by (plan, day, meal_type). Cross-tenant safe —
+        returns None if plan isn't owned."""
+        plan = self._get_plan(tenant_id, user_id, plan_id)
+        if plan is None:
+            return None
+        for item in plan.items:
+            if item.day_of_week == day_of_week and item.meal_type == meal_type:
+                return item
+        return None
 
     # ------------------------------------------------------------------
     # Internals

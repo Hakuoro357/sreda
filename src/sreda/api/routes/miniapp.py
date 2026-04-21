@@ -1147,6 +1147,15 @@ class MenuItemUpdateRequest(BaseModel):
     notes: str | None = None
 
 
+class MenuDayShoppingRequest(BaseModel):
+    day_of_week: int
+
+
+class MenuItemRegenRequest(BaseModel):
+    day_of_week: int
+    meal_type: str
+
+
 @router.patch("/api/v1/weekly-menu/{plan_id}/item")
 def update_weekly_menu_item_endpoint(
     plan_id: str,
@@ -1243,6 +1252,326 @@ def generate_shopping_from_menu_endpoint(
         ],
     )
     return {"ok": True, "added": len(rows)}
+
+
+@router.post("/api/v1/weekly-menu/{plan_id}/generate-shopping-for-day")
+def generate_shopping_for_day_endpoint(
+    plan_id: str,
+    body: MenuDayShoppingRequest,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Same as ``generate-shopping`` but limited to ONE day. Used by
+    the per-day "🛒 В список покупок" button on each day card.
+
+    Scaling still applies via ``count_eaters``. Free-text cells
+    contribute nothing.
+    """
+    menu_svc = HousewifeMenuService(session)
+    shop_svc = HousewifeShoppingService(session)
+    family_svc = HousewifeFamilyService(session)
+    eaters = family_svc.count_eaters(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id
+    )
+    try:
+        ingredients = menu_svc.aggregate_ingredients_for_day(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            plan_id=plan_id,
+            day_of_week=body.day_of_week,
+            eaters_count=eaters,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    if not ingredients:
+        return {"ok": True, "added": 0}
+    rows = shop_svc.add_items(
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        items=[
+            {
+                "title": ing.title,
+                "quantity_text": ing.quantity_text,
+                "category": None,
+                "source_recipe_id": ing.source_recipe_id,
+            }
+            for ing in ingredients
+        ],
+    )
+    return {"ok": True, "added": len(rows)}
+
+
+@router.post("/api/v1/weekly-menu/{plan_id}/regenerate-item")
+def regenerate_menu_item_endpoint(
+    plan_id: str,
+    body: MenuItemRegenRequest,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Re-suggest a dish for one menu cell, using the LLM.
+
+    1. Look up the cell's current recipe_id (if any) and delete every
+       shopping list item tied to it via ``source_recipe_id`` — the
+       user is swapping the dish, old ingredients should not remain.
+    2. Build context (family allergies, recent week's dishes, saved
+       recipes) and call the chat LLM for ONE structured suggestion.
+    3. Write the suggestion back into the cell.
+
+    Returns the new cell serialised the same way as the PATCH endpoint
+    plus ``removed_from_shopping`` so the UI can tell the user how
+    many items were dropped.
+    """
+    menu_svc = HousewifeMenuService(session)
+    shop_svc = HousewifeShoppingService(session)
+
+    # 1. Find current cell + clean up shopping
+    current = menu_svc.get_cell(
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        plan_id=plan_id,
+        day_of_week=body.day_of_week,
+        meal_type=body.meal_type,
+    )
+    if current is None and menu_svc._get_plan(ctx.tenant_id, ctx.user_id, plan_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="plan_not_found"
+        )
+
+    removed = 0
+    if current is not None and current.recipe_id:
+        removed = shop_svc.delete_by_source_recipe(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            recipe_id=current.recipe_id,
+        )
+
+    # 2. Ask the LLM for one new dish
+    try:
+        suggestion = _suggest_menu_cell_via_llm(
+            session=session,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            plan_id=plan_id,
+            day_of_week=body.day_of_week,
+            meal_type=body.meal_type,
+            avoid_recipe_id=current.recipe_id if current else None,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("regenerate_menu_item: LLM suggestion failed")
+        # At least leave the cell cleared so the user isn't stuck with
+        # the old dish + cleaned-up shopping (inconsistent state).
+        menu_svc.update_item(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            plan_id=plan_id,
+            day_of_week=body.day_of_week,
+            meal_type=body.meal_type,
+            recipe_id=None,
+            free_text=None,
+            notes=None,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="llm_suggestion_failed",
+        )
+
+    # 3. Write it into the cell
+    try:
+        new_item = menu_svc.update_item(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            plan_id=plan_id,
+            day_of_week=body.day_of_week,
+            meal_type=body.meal_type,
+            recipe_id=suggestion.get("recipe_id"),
+            free_text=suggestion.get("free_text"),
+            notes=suggestion.get("notes"),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+    return {
+        "ok": True,
+        "item": _menu_item_dict(new_item) if new_item is not None else None,
+        "removed_from_shopping": removed,
+    }
+
+
+def _suggest_menu_cell_via_llm(
+    *,
+    session: Session,
+    tenant_id: str,
+    user_id: str,
+    plan_id: str,
+    day_of_week: int,
+    meal_type: str,
+    avoid_recipe_id: str | None,
+) -> dict:
+    """Ask the chat LLM for one replacement dish. Returns a dict with
+    optional ``recipe_id``, ``free_text``, ``notes``. Prefers to reuse
+    a saved recipe when one fits. Mini App-local (not a chat turn) —
+    no history, no tool loop; we don't need the bot conversation
+    pipeline for a single-cell suggestion.
+
+    Raises on LLM misconfig or unparseable response — caller decides
+    what to surface. Keeps the prompt small (under 1.5k tokens typical)
+    by summarising context rather than dumping everything.
+    """
+    import json as _json
+    import re as _re
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from sreda.services.housewife_family import HousewifeFamilyService
+    from sreda.services.housewife_recipes import HousewifeRecipeService
+    from sreda.services.llm import get_chat_llm
+
+    menu_svc = HousewifeMenuService(session)
+    recipe_svc = HousewifeRecipeService(session)
+    family_svc = HousewifeFamilyService(session)
+
+    # Family context — count + notes (allergies etc.)
+    members = family_svc.list_members(tenant_id=tenant_id, user_id=user_id)
+    family_lines: list[str] = []
+    if members:
+        for m in members:
+            bits = [m.name, f"роль={m.role}"]
+            if m.birth_year:
+                from datetime import datetime as _dt
+
+                bits.append(f"{_dt.now().year - m.birth_year} лет")
+            elif m.age_hint:
+                bits.append(m.age_hint)
+            if m.notes:
+                bits.append(m.notes)
+            family_lines.append(" / ".join(bits))
+    family_blob = "\n".join(f"  - {ln}" for ln in family_lines) or "  нет данных"
+
+    # Already-planned dishes this week (avoid repeats)
+    plan = menu_svc._get_plan(tenant_id, user_id, plan_id)
+    week_lines: list[str] = []
+    if plan is not None:
+        day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        meal_labels = {
+            "breakfast": "завтрак",
+            "lunch": "обед",
+            "dinner": "ужин",
+            "snack": "перекус",
+        }
+        for it in plan.items:
+            # Skip the cell we're replacing
+            if it.day_of_week == day_of_week and it.meal_type == meal_type:
+                continue
+            label = (
+                it.recipe.title
+                if it.recipe_id and it.recipe is not None
+                else (it.free_text or "")
+            )
+            if not label:
+                continue
+            week_lines.append(
+                f"  - {day_names[it.day_of_week]} {meal_labels.get(it.meal_type, it.meal_type)}: {label}"
+            )
+    week_blob = "\n".join(week_lines) or "  пусто"
+
+    # Saved recipes — ids, titles, brief tags (first 25 to keep prompt tight)
+    recipes = recipe_svc.list_recipes(tenant_id=tenant_id, user_id=user_id)
+    rec_lines: list[str] = []
+    for r in recipes[:25]:
+        if r.id == avoid_recipe_id:
+            continue
+        tags = ""
+        if r.tags_json:
+            try:
+                t = _json.loads(r.tags_json) or []
+                if t:
+                    tags = " [" + ", ".join(str(x) for x in t[:3]) + "]"
+            except (ValueError, TypeError):
+                pass
+        rec_lines.append(f"  - {r.id}: {r.title}{tags}")
+    rec_blob = "\n".join(rec_lines) or "  книга пустая"
+
+    day_name_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][day_of_week]
+    meal_label_ru = {
+        "breakfast": "завтрак",
+        "lunch": "обед",
+        "dinner": "ужин",
+        "snack": "перекус",
+    }.get(meal_type, meal_type)
+
+    system_msg = SystemMessage(
+        content=(
+            "Ты подбираешь ОДНО блюдо в недельное меню семьи. "
+            "Отвечай строго в JSON без комментариев. "
+            "Обязательно учитывай аллергии и предпочтения семьи. "
+            "Если в книге рецептов есть подходящее — используй recipe_id. "
+            "Иначе предложи free_text (короткое название блюда). "
+            "Избегай повторов с уже запланированным меню."
+        )
+    )
+    human_msg = HumanMessage(
+        content=(
+            f"Подбери блюдо на {day_name_ru}, {meal_label_ru}.\n\n"
+            f"[СЕМЬЯ]\n{family_blob}\n\n"
+            f"[УЖЕ В МЕНЮ НА НЕДЕЛЮ]\n{week_blob}\n\n"
+            f"[КНИГА РЕЦЕПТОВ — доступно для reuse]\n{rec_blob}\n\n"
+            "Верни JSON вида:\n"
+            '{"recipe_id": "rec_xxx" или null, '
+            '"free_text": "Название блюда" или null, '
+            '"notes": "короткий комментарий" или null}'
+        )
+    )
+
+    llm = get_chat_llm()
+    if llm is None:
+        raise RuntimeError("LLM not configured")
+    resp = llm.invoke([system_msg, human_msg])
+    raw = (getattr(resp, "content", "") or "").strip()
+    # Extract the JSON blob — some models wrap in ``` or prefix text.
+    match = _re.search(r"\{[\s\S]*\}", raw)
+    if match is None:
+        raise ValueError(f"LLM returned no JSON object: {raw[:200]!r}")
+    parsed = _json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"LLM JSON is not an object: {parsed!r}")
+
+    recipe_id = parsed.get("recipe_id")
+    free_text = parsed.get("free_text")
+    notes = parsed.get("notes")
+
+    # Validate recipe_id actually exists in the user's book — LLMs
+    # hallucinate ids. If invalid, drop to free_text fallback.
+    if recipe_id:
+        rid = str(recipe_id).strip()
+        if not rid.startswith("rec_") or recipe_svc.get_recipe(
+            tenant_id=tenant_id, user_id=user_id, recipe_id=rid
+        ) is None:
+            logger.warning(
+                "regenerate_menu_item: LLM hallucinated recipe_id=%r, "
+                "falling back to free_text",
+                rid,
+            )
+            recipe_id = None
+            if not free_text:
+                # Salvage whatever the LLM put in the recipe_id slot as
+                # a free_text guess so the cell isn't empty.
+                free_text = str(parsed.get("recipe_id") or "").strip() or None
+
+    result: dict = {
+        "recipe_id": recipe_id or None,
+        "free_text": free_text or None,
+        "notes": notes or None,
+    }
+    # At least one of recipe_id / free_text must be set — else we'd
+    # clear the cell silently. If both are missing, synthesise a hint.
+    if not result["recipe_id"] and not result["free_text"]:
+        result["free_text"] = "Придумать"
+        result["notes"] = (result["notes"] or "") + " (LLM не вернул конкретику)"
+    return result
 
 
 # ---------------------------------------------------------------------------

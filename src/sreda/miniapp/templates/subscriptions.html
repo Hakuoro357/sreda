@@ -642,7 +642,17 @@
       if (kcalHasAny) {
         title += " \u00b7 ~" + Math.round(dayKcal) + " ккал";
       }
-      html += '<div class="section-title">' + escHtml(title) + '</div>';
+      // Day header row: title + "add-to-shopping-for-day" button.
+      html += '<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 8px 4px">';
+      html += '<div class="section-title" style="margin:0">' + escHtml(title) + '</div>';
+      html += '<button class="btn btn-small" ';
+      html += 'onclick="window._generateShoppingForDay(\'' + escHtml(plan.id) + '\',' + d + ')" ';
+      html += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer" ';
+      html += 'title="Добавить продукты этого дня в список покупок">';
+      html += '\uD83D\uDED2 В список';
+      html += '</button>';
+      html += '</div>';
+
       html += '<div class="card" style="padding:8px 12px">';
       // Render ALL 4 meal slots per day (filled or placeholder) so the
       // user can tap an empty slot to add without going to chat.
@@ -652,8 +662,10 @@
         var cellJson = cell ? JSON.stringify(cell) : 'null';
         var cellArg = encodeURIComponent(cellJson);
         html += '<div class="menu-cell" ';
-        html += 'onclick="window._openMenuEditor(\'' + escHtml(plan.id) + '\',' + d + ',\'' + mt + '\',\'' + cellArg + '\')" ';
-        html += 'style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06);cursor:pointer;-webkit-tap-highlight-color:rgba(0,0,0,0.08);">';
+        html += 'style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06);display:flex;align-items:center;gap:8px">';
+        // Tappable content area — opens editor modal
+        html += '<div onclick="window._openMenuEditor(\'' + escHtml(plan.id) + '\',' + d + ',\'' + mt + '\',\'' + cellArg + '\')" ';
+        html += 'style="flex:1;cursor:pointer;-webkit-tap-highlight-color:rgba(0,0,0,0.08)">';
         html += '<span class="card-subtitle" style="display:inline-block;min-width:90px">' + escHtml(_MEAL_LABELS[mt]) + ':</span> ';
         if (cell && cell.recipe_id && cell.recipe_title) {
           html += '<span>' + escHtml(cell.recipe_title) + '</span>';
@@ -661,6 +673,16 @@
           html += '<span>' + escHtml(cell.free_text) + '</span>';
         } else {
           html += '<span class="card-subtitle" style="font-style:italic">+ добавить</span>';
+        }
+        html += '</div>';
+        // Regenerate button — only when cell has something to replace
+        if (cell && (cell.recipe_id || cell.free_text)) {
+          html += '<button class="btn btn-small" ';
+          html += 'onclick="event.stopPropagation();window._regenerateMenuCell(\'' + escHtml(plan.id) + '\',' + d + ',\'' + mt + '\')" ';
+          html += 'style="padding:4px 8px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer" ';
+          html += 'title="Подобрать другое блюдо — старые продукты из списка тоже уйдут">';
+          html += '\u21BB';  // ↻
+          html += '</button>';
         }
         html += '</div>';
       }
@@ -1300,6 +1322,64 @@
           showAlert("Не удалось очистить.");
         }
       }).catch(function() { showAlert("Не удалось очистить."); });
+    });
+  };
+
+  window._generateShoppingForDay = function(planId, day) {
+    apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/generate-shopping-for-day", {
+      method: "POST",
+      body: { day_of_week: day },
+    }).then(function(res) {
+      if (res && res.ok) {
+        var added = res.added || 0;
+        if (added === 0) {
+          showAlert("В этот день нет блюд с ингредиентами.");
+        } else {
+          showAlert("Добавлено в список: " + added + ".");
+          state.shopping = null;
+          state.menu = null;
+          loadData();
+        }
+      } else {
+        showAlert("Не удалось собрать список.");
+      }
+    }).catch(function() { showAlert("Не удалось собрать список."); });
+  };
+
+  window._regenerateMenuCell = function(planId, day, mealType) {
+    showPopup("Подобрать другое блюдо? Старые продукты из списка покупок будут удалены.", function() {
+      // Show a quick in-place hint so the user knows the LLM is working.
+      var hint = document.createElement("div");
+      hint.style.cssText =
+        "position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:2000;" +
+        "background:var(--tg-theme-secondary-bg-color,#f5f5f5);color:var(--tg-theme-text-color,#000);" +
+        "padding:10px 16px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.2);font-size:14px;";
+      hint.textContent = "Подбираю блюдо…";
+      document.body.appendChild(hint);
+
+      apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/regenerate-item", {
+        method: "POST",
+        body: { day_of_week: day, meal_type: mealType },
+      }).then(function(res) {
+        if (hint.parentNode) document.body.removeChild(hint);
+        if (res && res.ok) {
+          var msg = "Готово";
+          if (res.removed_from_shopping) {
+            msg += ". Из списка покупок убрано: " + res.removed_from_shopping;
+          }
+          showAlert(msg);
+          state.weeklyMenu = null;
+          state.shopping = null;
+          state.menu = null;
+          loadData();
+          loadWeeklyMenu();
+        } else {
+          showAlert("Не удалось подобрать блюдо.");
+        }
+      }).catch(function() {
+        if (hint.parentNode) document.body.removeChild(hint);
+        showAlert("Не удалось подобрать блюдо.");
+      });
     });
   };
 
