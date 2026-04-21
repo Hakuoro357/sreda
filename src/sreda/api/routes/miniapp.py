@@ -1304,16 +1304,39 @@ def generate_shopping_for_day_endpoint(
     return {"ok": True, "added": len(rows)}
 
 
-# In-flight guards for regenerate_menu_item_endpoint. A concurrent tap
-# on the same menu cell while the previous LLM call is still running
-# would otherwise race: both reads the same old_recipe_id, both swap
-# the cell, last commit wins, and shopping-list sync happens twice
-# with stale assumptions. We reject the second request quickly with
-# 409 Conflict so the client can unlock its button and let the user
-# tap again later. Scope is (tenant, user, plan, day, meal_type) —
-# regens of DIFFERENT cells proceed in parallel.
+# In-flight guards for regenerate_menu_item_endpoint.
+#
+# Two-level locking:
+#
+# 1. Same-cell — set of (tenant, user, plan, day, meal_type) tuples.
+#    A second tap while the previous is in flight is rejected with
+#    409 Conflict (user double-tap; second call would race through
+#    update_item with stale reads).
+#
+# 2. Same-plan — dict of plan_id → threading.Lock. Different cells
+#    of the same plan ACQUIRE (blocking) this lock, serialising
+#    regens across the plan. Without this, two parallel calls each
+#    build their LLM context from the same pre-swap menu and the
+#    model can return the SAME dish for both cells (observed on
+#    prod: Обед and Ужин both swapped to "Запечённая курица" when
+#    the user tapped three regen buttons back-to-back). Serial
+#    execution means call #2 sees #1's committed swap in context.
+#
+# Regens on DIFFERENT plans run fully in parallel.
 _regen_inflight: set[tuple[str, ...]] = set()
 _regen_inflight_lock = threading.Lock()
+_regen_plan_locks: dict[str, threading.Lock] = {}
+_regen_plan_locks_guard = threading.Lock()
+
+
+def _get_regen_plan_lock(plan_id: str) -> threading.Lock:
+    """Return the per-plan serialization lock, creating it on first use."""
+    with _regen_plan_locks_guard:
+        lock = _regen_plan_locks.get(plan_id)
+        if lock is None:
+            lock = threading.Lock()
+            _regen_plan_locks[plan_id] = lock
+        return lock
 
 
 @router.post("/api/v1/weekly-menu/{plan_id}/regenerate-item")
@@ -1340,7 +1363,7 @@ def regenerate_menu_item_endpoint(
     sees "Не удалось подобрать" and their existing cell + shopping
     list stay intact.
     """
-    # Per-cell in-flight guard — see _regen_inflight comment.
+    # Level 1 — per-cell 409 guard (same button tapped twice fast).
     cell_key = (
         ctx.tenant_id, ctx.user_id, plan_id,
         str(body.day_of_week), body.meal_type,
@@ -1353,10 +1376,16 @@ def regenerate_menu_item_endpoint(
             )
         _regen_inflight.add(cell_key)
 
+    # Level 2 — per-plan serialization. Acquired BLOCKING (no 409):
+    # three parallel regens of different cells in the same plan
+    # proceed one after another, so each LLM call sees the previous
+    # request's committed swap in the "уже в меню" context.
+    plan_lock = _get_regen_plan_lock(plan_id)
     try:
-        return _regenerate_menu_item_impl(
-            session=session, ctx=ctx, plan_id=plan_id, body=body
-        )
+        with plan_lock:
+            return _regenerate_menu_item_impl(
+                session=session, ctx=ctx, plan_id=plan_id, body=body
+            )
     finally:
         with _regen_inflight_lock:
             _regen_inflight.discard(cell_key)

@@ -594,6 +594,114 @@ class TestMiniAppRegenItem:
         finally:
             session.close()
 
+    def test_regen_serializes_parallel_requests_on_same_plan(
+        self, seeded_client, monkeypatch
+    ):
+        """Two parallel regen requests on DIFFERENT cells of the SAME
+        plan must run sequentially — the LLM call for the 2nd one must
+        start only AFTER the 1st one has committed, so the 2nd sees
+        the updated plan state and doesn't duplicate the freshly-picked
+        dish.
+
+        Without this, two parallel regens both read the pre-swap menu
+        and the LLM can return the same dish for both cells (observed
+        on prod: Обед and Ужин both swapped to "Запечённая курица").
+        """
+        import threading
+
+        # Seed: 2 cells with different recipes on same plan.
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_menu import HousewifeMenuService
+        from sreda.services.housewife_recipes import HousewifeRecipeService
+
+        session = get_session_factory()()
+        try:
+            r1, _ = HousewifeRecipeService(session).save_recipe(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Борщ", ingredients=[{"title": "x"}],
+                source="user_dictated",
+            )
+            r2, _ = HousewifeRecipeService(session).save_recipe(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Суп", ingredients=[{"title": "y"}],
+                source="user_dictated",
+            )
+            plan = HousewifeMenuService(session).plan_week(
+                tenant_id="tenant_test", user_id="user_test",
+                week_start="2026-04-20",
+                cells=[
+                    {"day_of_week": 1, "meal_type": "lunch", "recipe_id": r1.id},
+                    {"day_of_week": 1, "meal_type": "dinner", "recipe_id": r2.id},
+                ],
+            )
+            plan_id = plan.id
+        finally:
+            session.close()
+
+        # Instrument the LLM stub: record {"entered": [...], "exited": [...]}
+        # timestamps so we can assert that call #2 entered only AFTER call
+        # #1 exited. Stub blocks until released.
+        entered: list[float] = []
+        exited: list[float] = []
+        release = threading.Event()
+
+        def slow_suggest(**kwargs):
+            entered.append(time.time())
+            release.wait(timeout=5)
+            exited.append(time.time())
+            return {
+                "recipe_id": None,
+                "free_text": f"Dish-{len(entered)}",
+                "notes": None,
+            }
+
+        monkeypatch.setattr(
+            "sreda.api.routes.miniapp._suggest_menu_cell_via_llm",
+            slow_suggest,
+        )
+
+        init_data = _make_init_data()
+        headers = {"Authorization": f"tma {init_data}"}
+
+        results: dict = {}
+
+        def call(key: str, meal: str):
+            results[key] = seeded_client.post(
+                f"/miniapp/api/v1/weekly-menu/{plan_id}/regenerate-item",
+                json={"day_of_week": 1, "meal_type": meal},
+                headers=headers,
+            )
+
+        t1 = threading.Thread(target=call, args=("a", "lunch"))
+        t2 = threading.Thread(target=call, args=("b", "dinner"))
+        t1.start()
+        # Give t1 a head start so it grabs the plan lock first.
+        time.sleep(0.1)
+        t2.start()
+
+        # At this point t1 should be inside slow_suggest; t2 should be
+        # WAITING on the plan lock — NOT inside slow_suggest yet.
+        time.sleep(0.2)
+        assert len(entered) == 1, (
+            f"per-plan lock failed: both requests entered LLM in "
+            f"parallel (entered count = {len(entered)})"
+        )
+
+        # Release — t1 finishes, t2 proceeds serially.
+        release.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert results["a"].status_code == 200
+        assert results["b"].status_code == 200
+        # Both finished; entered order should match exit order for t1 → t2.
+        assert len(entered) == 2
+        assert len(exited) == 2
+        assert entered[1] >= exited[0], (
+            "2nd suggest call started before 1st finished — "
+            "per-plan serialization is broken"
+        )
+
     def test_regen_rejects_concurrent_same_cell_with_409(
         self, seeded_client, monkeypatch
     ):
