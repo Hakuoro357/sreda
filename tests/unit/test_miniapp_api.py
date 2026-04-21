@@ -278,6 +278,79 @@ class TestMiniAppSubscribe:
         assert resp.json()["ok"] is True
 
 
+class TestMiniAppFamilyPatch:
+    """PATCH /api/v1/family/{member_id} — Mini App member editor."""
+
+    def _seed_member(self):
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_family import HousewifeFamilyService
+
+        session = get_session_factory()()
+        try:
+            m = HousewifeFamilyService(session).add_member(
+                tenant_id="tenant_test", user_id="user_test",
+                name="Катя", role="spouse", birth_year=1988,
+                notes="аллергия на горчицу",
+            )
+            return m.id
+        finally:
+            session.close()
+
+    def test_patch_updates_single_field(self, seeded_client):
+        member_id = self._seed_member()
+        init_data = _make_init_data()
+        resp = seeded_client.patch(
+            f"/miniapp/api/v1/family/{member_id}",
+            json={"birth_year": 1989},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["member"]["birth_year"] == 1989
+        # Other fields should be unchanged
+        assert body["member"]["name"] == "Катя"
+        assert body["member"]["notes"] == "аллергия на горчицу"
+
+    def test_patch_updates_multiple_fields(self, seeded_client):
+        member_id = self._seed_member()
+        init_data = _make_init_data()
+        resp = seeded_client.patch(
+            f"/miniapp/api/v1/family/{member_id}",
+            json={
+                "name": "Екатерина",
+                "role": "spouse",
+                "notes": "аллергия на горчицу + непереносимость лактозы",
+            },
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        m = resp.json()["member"]
+        assert m["name"] == "Екатерина"
+        assert m["notes"] == "аллергия на горчицу + непереносимость лактозы"
+        # Unspecified field (birth_year) stays.
+        assert m["birth_year"] == 1988
+
+    def test_patch_unknown_id_returns_404(self, seeded_client):
+        init_data = _make_init_data()
+        resp = seeded_client.patch(
+            "/miniapp/api/v1/family/fm_nonexistent",
+            json={"name": "X"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 404
+
+    def test_patch_invalid_role_returns_400(self, seeded_client):
+        member_id = self._seed_member()
+        init_data = _make_init_data()
+        resp = seeded_client.patch(
+            f"/miniapp/api/v1/family/{member_id}",
+            json={"role": "alien"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 400
+
+
 class TestMiniAppMenuItemPatch:
     """PATCH /api/v1/weekly-menu/{plan_id}/item — Stage 5 inline editor."""
 

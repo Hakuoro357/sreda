@@ -589,7 +589,10 @@
       if (m.notes) {
         html += '<div class="card-subtitle">' + escHtml(m.notes) + '</div>';
       }
-      html += '<div class="text-right mt-8">';
+      html += '<div class="text-right mt-8" style="display:flex;gap:8px;justify-content:flex-end">';
+      html += '<button class="btn btn-small" ' +
+              'onclick="window._editFamilyMember(\'' + escHtml(m.id) + '\')" ' +
+              'style="background:rgba(0,0,0,0.06)">Редактировать</button>';
       html += '<button class="btn btn-danger btn-small" onclick="window._deleteFamilyMember(\'' + escHtml(m.id) + '\', \'' + escHtml(m.name).replace(/\'/g, "") + '\')">Удалить</button>';
       html += '</div>';
       html += '</div>';
@@ -1222,6 +1225,141 @@
           }
         }).catch(function() { showAlert("Не удалось удалить."); });
     });
+  };
+
+  // Family-member edit modal. Opens with the current row's fields
+  // prefilled. Uses the same Telegram BackButton hijack as the menu
+  // editor so Android's system-back closes the modal without
+  // navigating the whole Mini App.
+  window._editFamilyMember = function(memberId) {
+    var member = null;
+    var items = (state.family && state.family.items) || [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].id === memberId) { member = items[i]; break; }
+    }
+    if (!member) return;
+
+    var prevBackHandler = _backHandler;
+
+    var overlay = document.createElement("div");
+    overlay.style.cssText =
+      "position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);" +
+      "z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;";
+
+    function closeModal() {
+      if (!overlay.parentNode) return;
+      document.body.removeChild(overlay);
+      if (tg && tg.BackButton) {
+        try { tg.BackButton.offClick(closeModal); } catch (e) {}
+        _backHandler = prevBackHandler;
+        if (_backHandler) tg.BackButton.onClick(_backHandler);
+        else tg.BackButton.hide();
+      }
+    }
+
+    overlay.onclick = function(e) {
+      if (e.target === overlay) closeModal();
+    };
+
+    if (tg && tg.BackButton) {
+      if (_backHandler) { try { tg.BackButton.offClick(_backHandler); } catch (e) {} }
+      _backHandler = closeModal;
+      tg.BackButton.onClick(closeModal);
+      tg.BackButton.show();
+    }
+
+    var modal = document.createElement("div");
+    modal.style.cssText =
+      "background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);" +
+      "border-radius:12px;padding:16px;max-width:400px;width:100%;" +
+      "max-height:85vh;overflow-y:auto;box-shadow:0 10px 40px rgba(0,0,0,0.3);";
+
+    var roleOptions = "";
+    var roles = ["self", "spouse", "child", "parent", "other"];
+    for (var r = 0; r < roles.length; r++) {
+      var sel = roles[r] === member.role ? " selected" : "";
+      roleOptions += '<option value="' + roles[r] + '"' + sel + '>' +
+                     escHtml(_FAMILY_ROLE_LABELS[roles[r]]) + '</option>';
+    }
+
+    var inputStyle = "width:100%;padding:10px;border:1px solid rgba(0,0,0,0.15);border-radius:8px;font-size:15px;box-sizing:border-box";
+
+    modal.innerHTML =
+      '<h2 style="margin:0 0 12px 0;font-size:18px">Редактировать: ' + escHtml(member.name) + '</h2>' +
+
+      '<label class="card-subtitle" style="display:block;margin:8px 0 4px 0">Имя</label>' +
+      '<input id="_fm_name" type="text" style="' + inputStyle + '" value="' + escHtml(member.name) + '">' +
+
+      '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Кто</label>' +
+      '<select id="_fm_role" style="' + inputStyle + '">' + roleOptions + '</select>' +
+
+      '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Год рождения</label>' +
+      '<input id="_fm_birth_year" type="number" min="1900" max="2100" placeholder="например, 1988" style="' + inputStyle + '" ' +
+      'value="' + (member.birth_year != null ? member.birth_year : "") + '">' +
+
+      '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Возраст (если год неизвестен)</label>' +
+      '<input id="_fm_age_hint" type="text" placeholder="например, 8 лет" style="' + inputStyle + '" ' +
+      'value="' + escHtml(member.age_hint || "") + '">' +
+
+      '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Заметки</label>' +
+      '<textarea id="_fm_notes" rows="2" placeholder="аллергии, привычки..." style="' + inputStyle + ';resize:vertical">' +
+      escHtml(member.notes || "") + '</textarea>' +
+
+      '<div style="display:flex;gap:8px;margin-top:16px">' +
+      '<button id="_fm_save" class="btn btn-primary" style="flex:1">Сохранить</button>' +
+      '<button id="_fm_cancel" class="btn" style="flex:1;background:rgba(0,0,0,0.08)">Отмена</button>' +
+      '</div>';
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    document.getElementById("_fm_save").onclick = function() {
+      var payload = {
+        name: (document.getElementById("_fm_name").value || "").trim(),
+        role: document.getElementById("_fm_role").value,
+      };
+      var by = document.getElementById("_fm_birth_year").value.trim();
+      if (by) payload.birth_year = parseInt(by, 10);
+      var ah = document.getElementById("_fm_age_hint").value.trim();
+      if (ah) payload.age_hint = ah;
+      // Notes: always send (empty string clears it). API trims and
+      // stores None for empty, so passing "" is fine.
+      payload.notes = document.getElementById("_fm_notes").value.trim();
+      if (!payload.name) { showAlert("Имя не может быть пустым."); return; }
+
+      var btn = document.getElementById("_fm_save");
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner-small"></span>';
+
+      apiFetch("/miniapp/api/v1/family/" + memberId, {
+        method: "PATCH",
+        body: payload,
+      }).then(function(res) {
+        if (res && res.ok && res.member) {
+          // Update state in place for the family list.
+          if (state.family && state.family.items) {
+            for (var k = 0; k < state.family.items.length; k++) {
+              if (state.family.items[k].id === memberId) {
+                state.family.items[k] = res.member;
+                break;
+              }
+            }
+          }
+          closeModal();
+          render();  // re-draw family list with updated row
+        } else {
+          btn.disabled = false;
+          btn.innerHTML = "Сохранить";
+          showAlert("Не удалось сохранить.");
+        }
+      }).catch(function() {
+        btn.disabled = false;
+        btn.innerHTML = "Сохранить";
+        showAlert("Не удалось сохранить.");
+      });
+    };
+
+    document.getElementById("_fm_cancel").onclick = closeModal;
   };
 
   // Menu cell editor (v1.2 Stage 5). Tap on a #/menu cell opens a
