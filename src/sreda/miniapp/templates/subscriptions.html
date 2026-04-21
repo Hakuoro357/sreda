@@ -92,10 +92,21 @@
     });
   }
 
-  function loadData() {
-    state.loading = true;
-    state.error = null;
-    render();
+  // loadData supports a silent mode used by the visibility-refresh path:
+  // we don't null state before the fetch and we don't set state.loading
+  // (which would replace the dashboard with a spinner for 200–500ms).
+  // Instead we keep the old data visible, fetch in the background, and
+  // only re-render when fresh data has overwritten the slots. Without
+  // this, tapping a dashboard card (e.g. "Меню недели") right after
+  // the Mini App becomes visible ate into the loading placeholder and
+  // the user had to tap twice.
+  function loadData(opts) {
+    var silent = !!(opts && opts.silent);
+    if (!silent) {
+      state.loading = true;
+      state.error = null;
+      render();
+    }
     return Promise.all([
       apiFetch("/miniapp/api/v1/summary"),
       apiFetch("/miniapp/api/v1/plans"),
@@ -109,7 +120,7 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.loading = false;
-        state.error = "Не удалось загрузить данные.";
+        if (!silent) state.error = "Не удалось загрузить данные.";
         render();
       }
     });
@@ -1541,17 +1552,27 @@
     var now = Date.now();
     if (now - _lastRefreshAt < 2000) return;
     _lastRefreshAt = now;
-    state.summary = null;
-    state.plans = null;
-    state.menu = null;
-    state.reminders = null;
-    state.shopping = null;
-    state.recipes = null;
-    state.recipeDetail = {};
-    state.weeklyMenu = null;
-    state.family = null;
-    loadData();
-    render();
+    // Silent refresh: we don't null state slots or flip loading=true,
+    // because that would replace visible content with a spinner and
+    // swallow the user's first tap on a dashboard card. Instead each
+    // loader overwrites its slot on resolve and re-renders, giving
+    // an atomic "old data → new data" swap with no blank in-between.
+    loadData({silent: true});
+    // Page-specific loaders are only fired when the corresponding
+    // route is currently visible — otherwise re-fetching a screen the
+    // user isn't looking at wastes bandwidth. The hashchange handler
+    // will re-trigger them lazily if the user navigates there.
+    var route = getRoute();
+    if (route === "/reminders" && state.reminders !== null) loadReminders();
+    if (route === "/shopping" && state.shopping !== null) loadShopping();
+    if (route === "/recipes" && state.recipes !== null) loadRecipes();
+    if (route === "/menu" && state.weeklyMenu !== null) loadWeeklyMenu();
+    if (route === "/family" && state.family !== null) loadFamily();
+    // Recipe detail page (#/recipes/{id}) — refetch currently viewed recipe.
+    var detailMatch = route.match(/^\/recipes\/(.+)$/);
+    if (detailMatch && state.recipeDetail[detailMatch[1]] !== undefined) {
+      loadRecipeDetail(detailMatch[1]);
+    }
   }
   document.addEventListener("visibilitychange", function() {
     if (document.visibilityState === "visible") _refetchAllOnReturn();
