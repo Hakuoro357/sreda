@@ -292,3 +292,79 @@ def test_clear_bought_empty_list_is_noop(session):
     svc = HousewifeShoppingService(session)
     cleared = svc.clear_bought(tenant_id="t1", user_id="u1")
     assert cleared == 0
+
+
+# ---------------------------------------------------------------------------
+# delete_by_source_recipe — Stage 5/6 regen support
+# ---------------------------------------------------------------------------
+
+
+def test_delete_by_source_recipe_removes_only_matching_rows(session):
+    """Hard-deletes pending + bought items whose source_recipe_id matches.
+    Rows with other source_recipe_id (or NULL) stay untouched."""
+    svc = HousewifeShoppingService(session)
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[
+            {"title": "свёкла", "source_recipe_id": "rec_A"},
+            {"title": "капуста", "source_recipe_id": "rec_A"},
+            {"title": "яйца", "source_recipe_id": "rec_B"},
+            {"title": "хлеб"},  # no recipe
+        ],
+    )
+    deleted = svc.delete_by_source_recipe(
+        tenant_id="t1", user_id="u1", recipe_id="rec_A"
+    )
+    assert deleted == 2
+    remaining = {r.title for r in session.query(ShoppingListItem).all()}
+    assert remaining == {"яйца", "хлеб"}
+
+
+def test_delete_by_source_recipe_ignores_empty_recipe_id(session):
+    """Passing an empty/None recipe_id must be a no-op — don't accidentally
+    wipe every manually-added item (NULL source_recipe_id)."""
+    svc = HousewifeShoppingService(session)
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "хлеб"}, {"title": "молоко"}],  # no source
+    )
+    assert svc.delete_by_source_recipe(
+        tenant_id="t1", user_id="u1", recipe_id=""
+    ) == 0
+    assert session.query(ShoppingListItem).count() == 2
+
+
+def test_delete_by_source_recipe_is_tenant_scoped(session):
+    """Another tenant's items with the same recipe_id stay intact."""
+    session.add(Tenant(id="t2", name="Other"))
+    session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))
+    session.commit()
+
+    svc = HousewifeShoppingService(session)
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "A", "source_recipe_id": "rec_shared"}],
+    )
+    svc.add_items(
+        tenant_id="t2", user_id="u2",
+        items=[{"title": "B", "source_recipe_id": "rec_shared"}],
+    )
+    deleted = svc.delete_by_source_recipe(
+        tenant_id="t1", user_id="u1", recipe_id="rec_shared"
+    )
+    assert deleted == 1
+    remaining_titles = {r.title for r in session.query(ShoppingListItem).all()}
+    assert remaining_titles == {"B"}
+
+
+def test_delete_by_source_recipe_returns_zero_when_no_match(session):
+    """Recipe id that doesn't exist in the list — clean 0, no error."""
+    svc = HousewifeShoppingService(session)
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "x", "source_recipe_id": "rec_A"}],
+    )
+    assert svc.delete_by_source_recipe(
+        tenant_id="t1", user_id="u1", recipe_id="rec_NONEXISTENT"
+    ) == 0
+    assert session.query(ShoppingListItem).count() == 1

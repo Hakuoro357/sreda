@@ -357,3 +357,297 @@ class TestMiniAppMenuItemPatch:
             headers={"Authorization": f"tma {init_data}"},
         )
         assert resp.status_code == 400
+
+
+class TestMiniAppDayShopping:
+    """POST /api/v1/weekly-menu/{plan_id}/generate-shopping-for-day"""
+
+    def _seed_plan_with_recipes(self):
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_menu import HousewifeMenuService
+        from sreda.services.housewife_recipes import HousewifeRecipeService
+
+        session = get_session_factory()()
+        try:
+            recipe_svc = HousewifeRecipeService(session)
+            r_day0, _ = recipe_svc.save_recipe(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Каша", ingredients=[{"title": "овсянка"}],
+                servings=2, source="user_dictated",
+            )
+            r_day1, _ = recipe_svc.save_recipe(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Суп", ingredients=[{"title": "вода"}, {"title": "курица"}],
+                servings=2, source="user_dictated",
+            )
+            plan = HousewifeMenuService(session).plan_week(
+                tenant_id="tenant_test", user_id="user_test",
+                week_start="2026-04-20",
+                cells=[
+                    {"day_of_week": 0, "meal_type": "breakfast", "recipe_id": r_day0.id},
+                    {"day_of_week": 1, "meal_type": "lunch", "recipe_id": r_day1.id},
+                ],
+            )
+            return plan.id
+        finally:
+            session.close()
+
+    def test_generate_day_adds_only_that_day(self, seeded_client):
+        plan_id = self._seed_plan_with_recipes()
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/generate-shopping-for-day",
+            json={"day_of_week": 1},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        # day 1 had "Суп" with 2 ingredients
+        assert resp.json() == {"ok": True, "added": 2}
+
+    def test_generate_day_returns_zero_for_empty_day(self, seeded_client):
+        plan_id = self._seed_plan_with_recipes()
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/generate-shopping-for-day",
+            json={"day_of_week": 5},  # no cells that day
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "added": 0}
+
+    def test_generate_day_invalid_day_returns_400(self, seeded_client):
+        plan_id = self._seed_plan_with_recipes()
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/generate-shopping-for-day",
+            json={"day_of_week": 9},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 400
+
+
+class TestMiniAppRegenItem:
+    """POST /api/v1/weekly-menu/{plan_id}/regenerate-item
+
+    The endpoint calls _suggest_menu_cell_via_llm internally; we
+    monkeypatch that to control what "the LLM" returns, avoiding an
+    actual model dependency in unit tests. Three scenarios covered:
+    successful swap with shopping sync, recipe-still-used (shopping
+    preserved), and the concurrent-request 409 guard.
+    """
+
+    def _seed_plan_two_cells_same_recipe(self):
+        """Two cells on different days sharing the same recipe — used to
+        verify that replacing ONE cell doesn't wipe shopping for the
+        recipe still used by the OTHER cell."""
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_menu import HousewifeMenuService
+        from sreda.services.housewife_recipes import HousewifeRecipeService
+        from sreda.services.housewife_shopping import HousewifeShoppingService
+
+        session = get_session_factory()()
+        try:
+            r, _ = HousewifeRecipeService(session).save_recipe(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Плов", servings=2,
+                ingredients=[{"title": "рис", "quantity_text": "300 г"}],
+                source="user_dictated",
+            )
+            plan = HousewifeMenuService(session).plan_week(
+                tenant_id="tenant_test", user_id="user_test",
+                week_start="2026-04-20",
+                cells=[
+                    {"day_of_week": 1, "meal_type": "lunch", "recipe_id": r.id},
+                    {"day_of_week": 3, "meal_type": "dinner", "recipe_id": r.id},
+                ],
+            )
+            # Manually add a shopping item tied to the shared recipe.
+            HousewifeShoppingService(session).add_items(
+                tenant_id="tenant_test", user_id="user_test",
+                items=[{
+                    "title": "рис",
+                    "quantity_text": "600 г",
+                    "source_recipe_id": r.id,
+                }],
+            )
+            return plan.id, r.id
+        finally:
+            session.close()
+
+    def test_regen_swaps_cell_and_returns_new_item(
+        self, seeded_client, monkeypatch
+    ):
+        """Happy path — LLM suggests new free_text, cell updates, 200."""
+        plan_id, _ = self._seed_plan_two_cells_same_recipe()
+
+        def fake_suggest(**kwargs):
+            return {"recipe_id": None, "free_text": "Окрошка", "notes": None}
+
+        monkeypatch.setattr(
+            "sreda.api.routes.miniapp._suggest_menu_cell_via_llm",
+            fake_suggest,
+        )
+
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/regenerate-item",
+            json={"day_of_week": 1, "meal_type": "lunch"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["item"]["free_text"] == "Окрошка"
+        # The shared recipe is still used on day 3 → shopping preserved.
+        assert body["removed_from_shopping"] == 0
+
+    def test_regen_preserves_shopping_when_recipe_still_used(
+        self, seeded_client, monkeypatch
+    ):
+        """After swapping day=1 to a new dish, the rice item must stay —
+        day=3 still uses the original recipe."""
+        plan_id, shared_recipe_id = self._seed_plan_two_cells_same_recipe()
+
+        monkeypatch.setattr(
+            "sreda.api.routes.miniapp._suggest_menu_cell_via_llm",
+            lambda **kw: {"recipe_id": None, "free_text": "Окрошка", "notes": None},
+        )
+
+        init_data = _make_init_data()
+        seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/regenerate-item",
+            json={"day_of_week": 1, "meal_type": "lunch"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+
+        # Verify: shopping item for the shared recipe is still there.
+        from sreda.db.models.housewife_food import ShoppingListItem
+        from sreda.db.session import get_session_factory
+
+        session = get_session_factory()()
+        try:
+            items = session.query(ShoppingListItem).filter_by(
+                source_recipe_id=shared_recipe_id
+            ).all()
+            assert len(items) == 1, (
+                "Shopping for rice should NOT be deleted when another "
+                "cell still references the recipe"
+            )
+        finally:
+            session.close()
+
+    def test_regen_removes_shopping_when_recipe_orphaned(
+        self, seeded_client, monkeypatch
+    ):
+        """After swapping the ONLY cell that uses a recipe, its shopping
+        items should be cleaned up."""
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_menu import HousewifeMenuService
+        from sreda.services.housewife_recipes import HousewifeRecipeService
+        from sreda.services.housewife_shopping import HousewifeShoppingService
+
+        session = get_session_factory()()
+        try:
+            r, _ = HousewifeRecipeService(session).save_recipe(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Блины", servings=2,
+                ingredients=[{"title": "мука"}],
+                source="user_dictated",
+            )
+            plan = HousewifeMenuService(session).plan_week(
+                tenant_id="tenant_test", user_id="user_test",
+                week_start="2026-04-20",
+                cells=[
+                    {"day_of_week": 0, "meal_type": "breakfast", "recipe_id": r.id},
+                ],
+            )
+            HousewifeShoppingService(session).add_items(
+                tenant_id="tenant_test", user_id="user_test",
+                items=[{"title": "мука", "source_recipe_id": r.id}],
+            )
+            plan_id = plan.id
+            orphan_recipe_id = r.id
+        finally:
+            session.close()
+
+        monkeypatch.setattr(
+            "sreda.api.routes.miniapp._suggest_menu_cell_via_llm",
+            lambda **kw: {"recipe_id": None, "free_text": "Овсянка", "notes": None},
+        )
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/regenerate-item",
+            json={"day_of_week": 0, "meal_type": "breakfast"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["removed_from_shopping"] == 1
+
+        # Verify DB too.
+        from sreda.db.models.housewife_food import ShoppingListItem
+
+        session = get_session_factory()()
+        try:
+            assert session.query(ShoppingListItem).filter_by(
+                source_recipe_id=orphan_recipe_id
+            ).count() == 0
+        finally:
+            session.close()
+
+    def test_regen_rejects_concurrent_same_cell_with_409(
+        self, seeded_client, monkeypatch
+    ):
+        """Two parallel regen calls on the SAME (plan, day, meal_type)
+        cell: the second one short-circuits with 409 instead of racing
+        through update_item. Uses threading to drive true concurrency
+        against the in-memory lock."""
+        import threading
+
+        plan_id, _ = self._seed_plan_two_cells_same_recipe()
+
+        # Block the LLM call so we can run a second request while the
+        # first is still "inside" the critical section.
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow_suggest(**kwargs):
+            started.set()
+            release.wait(timeout=5)
+            return {"recipe_id": None, "free_text": "A", "notes": None}
+
+        monkeypatch.setattr(
+            "sreda.api.routes.miniapp._suggest_menu_cell_via_llm",
+            slow_suggest,
+        )
+
+        init_data = _make_init_data()
+        headers = {"Authorization": f"tma {init_data}"}
+        payload = {"day_of_week": 1, "meal_type": "lunch"}
+
+        first_result: dict = {}
+
+        def first_request():
+            r = seeded_client.post(
+                f"/miniapp/api/v1/weekly-menu/{plan_id}/regenerate-item",
+                json=payload, headers=headers,
+            )
+            first_result["resp"] = r
+
+        t = threading.Thread(target=first_request)
+        t.start()
+        # Wait until the first request is inside the slow LLM call —
+        # at that point the inflight set contains our cell key.
+        assert started.wait(timeout=5), "first request never reached slow_suggest"
+
+        # Second call on the same cell — should get rejected fast.
+        second = seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/regenerate-item",
+            json=payload, headers=headers,
+        )
+        assert second.status_code == 409
+        assert second.json()["detail"] == "regen_already_in_flight"
+
+        # Let the first finish.
+        release.set()
+        t.join(timeout=10)
+        assert first_result["resp"].status_code == 200

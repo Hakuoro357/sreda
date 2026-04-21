@@ -534,3 +534,165 @@ def test_aggregate_ceiling_rounds_up_for_odd_eaters(session):
         tenant_id="t1", user_id="u1", plan_id=plan.id, eaters_count=5,
     )
     assert result[0].quantity_text == "900 г"
+
+
+# ---------------------------------------------------------------------------
+# aggregate_ingredients_for_day (Stage 5 per-day button)
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_for_day_returns_only_that_day(session):
+    """Ingredients from OTHER days must not leak into the day-scoped
+    aggregator. Menu has 3 days with 1 recipe each, we ask for day=1 and
+    expect only that recipe's ingredients."""
+    recipe_svc = HousewifeRecipeService(session)
+    r_mon, _ = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Каша", servings=2,
+        ingredients=[{"title": "овсянка"}],
+        source="user_dictated",
+    )
+    r_tue, _ = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Паста", servings=2,
+        ingredients=[{"title": "спагетти"}, {"title": "соус"}],
+        source="user_dictated",
+    )
+    r_wed, _ = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Плов", servings=2,
+        ingredients=[{"title": "рис"}],
+        source="user_dictated",
+    )
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[
+            {"day_of_week": 0, "meal_type": "breakfast", "recipe_id": r_mon.id},
+            {"day_of_week": 1, "meal_type": "lunch", "recipe_id": r_tue.id},
+            {"day_of_week": 2, "meal_type": "dinner", "recipe_id": r_wed.id},
+        ],
+    )
+    # Day 1 (Tuesday) — should get only spaghetti+sauce.
+    result = svc.aggregate_ingredients_for_day(
+        tenant_id="t1", user_id="u1", plan_id=plan.id, day_of_week=1,
+    )
+    assert {i.title for i in result} == {"спагетти", "соус"}
+
+
+def test_aggregate_for_day_rejects_out_of_range_day(session):
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 0, "meal_type": "breakfast", "free_text": "x"}],
+    )
+    with pytest.raises(ValueError):
+        svc.aggregate_ingredients_for_day(
+            tenant_id="t1", user_id="u1", plan_id=plan.id, day_of_week=7,
+        )
+
+
+def test_aggregate_for_day_applies_scaling(session):
+    """Day-scoped aggregator must apply the same eaters_count scaling
+    as the week-level one. 4 eaters + 2-serving recipe → ×2 quantities."""
+    recipe_svc = HousewifeRecipeService(session)
+    r, _ = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Суп", servings=2,
+        ingredients=[{"title": "вода", "quantity_text": "1 л"}],
+        source="user_dictated",
+    )
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 2, "meal_type": "lunch", "recipe_id": r.id}],
+    )
+    result = svc.aggregate_ingredients_for_day(
+        tenant_id="t1", user_id="u1", plan_id=plan.id,
+        day_of_week=2, eaters_count=4,
+    )
+    assert result[0].quantity_text == "2 л"
+
+
+def test_aggregate_for_day_empty_when_no_recipes_that_day(session):
+    """Day with only free_text cells → empty aggregation (nothing
+    structured to pull)."""
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 0, "meal_type": "breakfast", "free_text": "бутерброд"}],
+    )
+    assert svc.aggregate_ingredients_for_day(
+        tenant_id="t1", user_id="u1", plan_id=plan.id, day_of_week=0,
+    ) == []
+
+
+def test_aggregate_for_day_cross_tenant_returns_empty(session):
+    session.add(Tenant(id="t2", name="Other"))
+    session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))
+    session.commit()
+
+    recipe_svc = HousewifeRecipeService(session)
+    r, _ = recipe_svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="X", ingredients=[{"title": "a"}],
+        source="user_dictated",
+    )
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 0, "meal_type": "lunch", "recipe_id": r.id}],
+    )
+    assert svc.aggregate_ingredients_for_day(
+        tenant_id="t2", user_id="u2", plan_id=plan.id, day_of_week=0,
+    ) == []
+
+
+# ---------------------------------------------------------------------------
+# get_cell (used by regenerate endpoint)
+# ---------------------------------------------------------------------------
+
+
+def test_get_cell_returns_matching_cell(session):
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[
+            {"day_of_week": 2, "meal_type": "dinner", "free_text": "паста"},
+            {"day_of_week": 2, "meal_type": "lunch", "free_text": "суп"},
+        ],
+    )
+    cell = svc.get_cell(
+        tenant_id="t1", user_id="u1", plan_id=plan.id,
+        day_of_week=2, meal_type="dinner",
+    )
+    assert cell is not None
+    assert cell.free_text == "паста"
+
+
+def test_get_cell_returns_none_when_missing(session):
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 0, "meal_type": "breakfast", "free_text": "x"}],
+    )
+    assert svc.get_cell(
+        tenant_id="t1", user_id="u1", plan_id=plan.id,
+        day_of_week=5, meal_type="dinner",
+    ) is None
+
+
+def test_get_cell_cross_tenant_returns_none(session):
+    session.add(Tenant(id="t2", name="Other"))
+    session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))
+    session.commit()
+
+    svc = HousewifeMenuService(session)
+    plan = svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[{"day_of_week": 0, "meal_type": "breakfast", "free_text": "x"}],
+    )
+    assert svc.get_cell(
+        tenant_id="t2", user_id="u2", plan_id=plan.id,
+        day_of_week=0, meal_type="breakfast",
+    ) is None
