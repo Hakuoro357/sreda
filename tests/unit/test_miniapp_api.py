@@ -501,6 +501,44 @@ class TestMiniAppRegenItem:
         # The shared recipe is still used on day 3 → shopping preserved.
         assert body["removed_from_shopping"] == 0
 
+    def test_regen_response_item_shape_for_client_dom_patch(
+        self, seeded_client, monkeypatch
+    ):
+        """Surgical DOM update on the Mini App depends on
+        ``res.item`` carrying everything the cell needs to render
+        without a reload: day_of_week + meal_type + recipe_id +
+        recipe_title + recipe_calories + free_text + notes. Lock
+        this shape — the frontend patches the cell in place using
+        these fields."""
+        plan_id, _ = self._seed_plan_two_cells_same_recipe()
+        monkeypatch.setattr(
+            "sreda.api.routes.miniapp._suggest_menu_cell_via_llm",
+            lambda **kw: {
+                "recipe_id": None,
+                "free_text": "Солянка",
+                "notes": "с оливками",
+            },
+        )
+
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            f"/miniapp/api/v1/weekly-menu/{plan_id}/regenerate-item",
+            json={"day_of_week": 1, "meal_type": "lunch"},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        item = resp.json()["item"]
+        for key in (
+            "id", "day_of_week", "meal_type",
+            "recipe_id", "recipe_title", "recipe_calories",
+            "free_text", "notes",
+        ):
+            assert key in item, f"regen response item missing '{key}'"
+        assert item["day_of_week"] == 1
+        assert item["meal_type"] == "lunch"
+        assert item["free_text"] == "Солянка"
+        assert item["notes"] == "с оливками"
+
     def test_regen_preserves_shopping_when_recipe_still_used(
         self, seeded_client, monkeypatch
     ):
