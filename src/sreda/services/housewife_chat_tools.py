@@ -478,6 +478,13 @@ def build_housewife_tools(
         planner. Skip only if genuinely unknowable (fancy restaurant
         dish with no ingredient list, etc.).
 
+        **Heat level in instructions_md**: for EACH step that involves
+        жарку / варку / тушение / запекание, ALWAYS state the fire
+        intensity — «на большом огне», «на среднем огне», «на малом
+        огне» (или «на медленном огне»). For oven steps — temperature
+        in °C ("в духовке при 180°C"). The user cooks by these steps
+        and asks "на каком огне?" — don't leave that ambiguous.
+
         Args:
             title: Short name of the dish. Imperative-free ("Борщ",
                 не "Сварить борщ").
@@ -558,6 +565,12 @@ def build_housewife_tools(
 
         Items with empty title or unknown ``source`` are silently
         skipped — the rest of the batch still persists.
+
+        **Heat level in instructions_md**: same rule as save_recipe —
+        каждый шаг с термообработкой должен указывать интенсивность
+        огня («на большом огне» / «на среднем» / «на малом») или
+        температуру духовки в °C. Не оставляй «варить 10 минут» без
+        уточнения — пользователь спросит «на каком огне?».
 
         **Dedup.** The recipe book is unique per user by recipe title
         (case-insensitive, whitespace-insensitive). If the user asks
@@ -731,6 +744,11 @@ def build_housewife_tools(
           3. Variety — no repeat within 3 days
           4. Practicality — ≤30 min dishes on weekdays, longer OK Sat/Sun
           5. Budget — not steaks daily
+
+        When a meal is free_text and you mention a cooking method,
+        include heat level briefly — «на среднем огне» / «в духовке
+        при 180°C» — consistent with the save_recipe rule. Avoids
+        vague "варить 10 мин" with no idea at what intensity.
 
         Args:
             week_start: ISO date, any day of the target week. Service
