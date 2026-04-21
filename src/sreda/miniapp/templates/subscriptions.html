@@ -1363,11 +1363,14 @@
       }).then(function(res) {
         if (hint.parentNode) document.body.removeChild(hint);
         if (res && res.ok) {
-          var msg = "Готово";
+          var parts = ["Готово"];
           if (res.removed_from_shopping) {
-            msg += ". Из списка покупок убрано: " + res.removed_from_shopping;
+            parts.push("убрано из списка: " + res.removed_from_shopping);
           }
-          showAlert(msg);
+          if (res.added_to_shopping) {
+            parts.push("добавлено: " + res.added_to_shopping);
+          }
+          showAlert(parts.join(". "));
           state.weeklyMenu = null;
           state.shopping = null;
           state.menu = null;

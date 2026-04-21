@@ -1312,21 +1312,32 @@ def regenerate_menu_item_endpoint(
 ) -> dict:
     """Re-suggest a dish for one menu cell, using the LLM.
 
-    1. Look up the cell's current recipe_id (if any) and delete every
-       shopping list item tied to it via ``source_recipe_id`` — the
-       user is swapping the dish, old ingredients should not remain.
-    2. Build context (family allergies, recent week's dishes, saved
-       recipes) and call the chat LLM for ONE structured suggestion.
-    3. Write the suggestion back into the cell.
+    Ordering (atomic-ish — LLM is the only risky step):
 
-    Returns the new cell serialised the same way as the PATCH endpoint
-    plus ``removed_from_shopping`` so the UI can tell the user how
-    many items were dropped.
+      1. Read the current cell so we know the OLD recipe_id before
+         overwriting.
+      2. Ask the LLM for ONE replacement dish (family allergies,
+         existing week, saved recipes in context).
+      3. Swap the cell to the new suggestion.
+      4. Only AFTER the swap succeeds, synchronise shopping: delete
+         items tied to the OLD recipe, then aggregate + add items
+         for the NEW recipe (if it has a recipe_id with ingredients).
+
+    This way an LLM failure aborts before touching anything: the user
+    sees "Не удалось подобрать" and their existing cell + shopping
+    list stay intact.
     """
     menu_svc = HousewifeMenuService(session)
     shop_svc = HousewifeShoppingService(session)
+    family_svc = HousewifeFamilyService(session)
 
-    # 1. Find current cell + clean up shopping
+    # 0. Plan ownership check
+    if menu_svc._get_plan(ctx.tenant_id, ctx.user_id, plan_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="plan_not_found"
+        )
+
+    # 1. Read current cell (we need old recipe_id for shopping cleanup later).
     current = menu_svc.get_cell(
         tenant_id=ctx.tenant_id,
         user_id=ctx.user_id,
@@ -1334,20 +1345,10 @@ def regenerate_menu_item_endpoint(
         day_of_week=body.day_of_week,
         meal_type=body.meal_type,
     )
-    if current is None and menu_svc._get_plan(ctx.tenant_id, ctx.user_id, plan_id) is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="plan_not_found"
-        )
+    old_recipe_id = current.recipe_id if current else None
 
-    removed = 0
-    if current is not None and current.recipe_id:
-        removed = shop_svc.delete_by_source_recipe(
-            tenant_id=ctx.tenant_id,
-            user_id=ctx.user_id,
-            recipe_id=current.recipe_id,
-        )
-
-    # 2. Ask the LLM for one new dish
+    # 2. Ask the LLM for one new dish. If it fails we bail out BEFORE
+    # touching the cell or the shopping list.
     try:
         suggestion = _suggest_menu_cell_via_llm(
             session=session,
@@ -1356,28 +1357,16 @@ def regenerate_menu_item_endpoint(
             plan_id=plan_id,
             day_of_week=body.day_of_week,
             meal_type=body.meal_type,
-            avoid_recipe_id=current.recipe_id if current else None,
+            avoid_recipe_id=old_recipe_id,
         )
     except Exception:  # noqa: BLE001
         logger.exception("regenerate_menu_item: LLM suggestion failed")
-        # At least leave the cell cleared so the user isn't stuck with
-        # the old dish + cleaned-up shopping (inconsistent state).
-        menu_svc.update_item(
-            tenant_id=ctx.tenant_id,
-            user_id=ctx.user_id,
-            plan_id=plan_id,
-            day_of_week=body.day_of_week,
-            meal_type=body.meal_type,
-            recipe_id=None,
-            free_text=None,
-            notes=None,
-        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="llm_suggestion_failed",
         )
 
-    # 3. Write it into the cell
+    # 3. Swap the cell to the new suggestion.
     try:
         new_item = menu_svc.update_item(
             tenant_id=ctx.tenant_id,
@@ -1394,10 +1383,75 @@ def regenerate_menu_item_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
 
+    # 4. Swap succeeded — now synchronise shopping. Remove items from
+    # the OLD recipe, then add items for the NEW recipe (if it has a
+    # recipe_id and that recipe has ingredients). Errors here are
+    # logged but do NOT undo the swap — the cell already reflects the
+    # user's intent; the user can fix shopping manually.
+    removed = 0
+    added = 0
+    if old_recipe_id:
+        try:
+            removed = shop_svc.delete_by_source_recipe(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                recipe_id=old_recipe_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "regenerate_menu_item: delete_by_source_recipe failed "
+                "(cell swap already committed) old_recipe_id=%s",
+                old_recipe_id,
+            )
+
+    new_recipe_id = suggestion.get("recipe_id")
+    if new_recipe_id:
+        try:
+            eaters = family_svc.count_eaters(
+                tenant_id=ctx.tenant_id, user_id=ctx.user_id
+            )
+            # Aggregate ingredients for just this one recipe by
+            # filtering the day-level aggregator to the cell we wrote.
+            day_ings = menu_svc.aggregate_ingredients_for_day(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                plan_id=plan_id,
+                day_of_week=body.day_of_week,
+                eaters_count=eaters,
+            )
+            # Keep only ingredients of the NEW recipe — the day may
+            # have other cells with their own recipes we don't want
+            # to duplicate here.
+            day_ings = [
+                ing for ing in day_ings if ing.source_recipe_id == new_recipe_id
+            ]
+            if day_ings:
+                rows = shop_svc.add_items(
+                    tenant_id=ctx.tenant_id,
+                    user_id=ctx.user_id,
+                    items=[
+                        {
+                            "title": ing.title,
+                            "quantity_text": ing.quantity_text,
+                            "category": None,
+                            "source_recipe_id": ing.source_recipe_id,
+                        }
+                        for ing in day_ings
+                    ],
+                )
+                added = len(rows)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "regenerate_menu_item: add new recipe ingredients failed "
+                "(cell swap already committed) new_recipe_id=%s",
+                new_recipe_id,
+            )
+
     return {
         "ok": True,
         "item": _menu_item_dict(new_item) if new_item is not None else None,
         "removed_from_shopping": removed,
+        "added_to_shopping": added,
     }
 
 
