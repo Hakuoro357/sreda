@@ -27,11 +27,34 @@
     _mainInit();
   }
 
+  // Extract initData directly from location.hash — Telegram passes
+  // it as a URL fragment BEFORE telegram-web-app.js initialises
+  // window.Telegram. Works even when the SDK script never loads
+  // (observed on some Android Telegram 12.6 builds). Fragment looks
+  // like: #tgWebAppData=<urlencoded>&tgWebAppVersion=...&tgWebAppPlatform=...
+  function _initDataFromHash() {
+    try {
+      var hash = (window.location.hash || "").replace(/^#/, "");
+      if (!hash || hash.indexOf("tgWebAppData=") < 0) return "";
+      var pairs = hash.split("&");
+      for (var i = 0; i < pairs.length; i++) {
+        var eq = pairs[i].indexOf("=");
+        if (eq < 0) continue;
+        if (pairs[i].substring(0, eq) === "tgWebAppData") {
+          return decodeURIComponent(pairs[i].substring(eq + 1));
+        }
+      }
+    } catch (e) {}
+    return "";
+  }
+
   function _mainInit() {
   var tg = window.Telegram && window.Telegram.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
 
-  var initData = tg ? tg.initData : "";
+  // Prefer the SDK-provided initData; fall back to hash extraction if
+  // window.Telegram is unavailable (SDK script failed to inject).
+  var initData = (tg && tg.initData) ? tg.initData : _initDataFromHash();
   var $app = document.getElementById("app");
 
   // Always ping the server once on load with what the client sees — we
@@ -39,6 +62,20 @@
   // and which build the client got. This is unauth'd — just diagnostics.
   function _postDiag(reason) {
     try {
+      // Hash preview — strip actual user payload, keep only which keys
+      // are present so we can tell if Telegram populated the fragment
+      // even when the SDK script didn't load. "tgWebAppData,tgWebAppVersion"
+      // means it DID populate, we just couldn't read it via window.Telegram.
+      var hashKeys = "";
+      try {
+        var rawHash = (window.location.hash || "").replace(/^#/, "");
+        if (rawHash) {
+          hashKeys = rawHash.split("&")
+            .map(function(p) { return p.split("=")[0]; })
+            .filter(Boolean)
+            .join(",");
+        }
+      } catch (e) {}
       fetch("{{ base_url }}/miniapp/api/v1/client-diagnostic", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -47,6 +84,7 @@
           build: BUILD_STAMP,
           has_tg: !!tg,
           init_data_len: initData ? initData.length : 0,
+          hash_keys: hashKeys,
           ua: navigator.userAgent,
         }),
         keepalive: true,

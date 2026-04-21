@@ -231,9 +231,10 @@ async def client_diagnostic(request: Request) -> dict:
     except Exception:
         body = {}
     logger.warning(
-        "miniapp client-diagnostic: reason=%r has_tg=%r ua=%r ip=%s body=%r",
+        "miniapp client-diagnostic: reason=%r has_tg=%r hash_keys=%r ua=%r ip=%s body=%r",
         (body.get("reason") if isinstance(body, dict) else None),
         (body.get("has_tg") if isinstance(body, dict) else None),
+        (body.get("hash_keys") if isinstance(body, dict) else None),
         (body.get("ua") if isinstance(body, dict) else None),
         request.client.host if request.client else "?",
         body,
