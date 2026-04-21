@@ -69,6 +69,106 @@ def _coerce_category(raw: str | None) -> str:
     return DEFAULT_CATEGORY
 
 
+# Keyword dictionary for title-based auto-classification. Each entry is
+# (category, [keywords]). First-match wins — so order the categories
+# by specificity if a keyword could match multiple.
+_CATEGORY_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    (
+        "молочные",
+        (
+            "молоко", "сметан", "творог", "кефир", "йогурт", "ряженк",
+            "сыр", "масло сливоч", "масло слив", "сливки", "сгущёнк", "сгущенк",
+            "брынза", "моцарелл", "рикотт", "пармезан", "фета",
+        ),
+    ),
+    (
+        "мясо_рыба",
+        (
+            "курица", "куриное", "куриная", "куриный", "курин",
+            "говядин", "свинин", "баранин", "телятин", "индейк", "утк", "утиное",
+            "фарш", "котлет", "стейк", "ребр", "окорок", "бекон", "ветчин",
+            "колбас", "сосиск", "карбонад",
+            "рыба", "рыбн", "лосос", "сёмг", "семг", "тунец", "треск", "минта",
+            "форель", "скумбри", "сельд", "селёдк", "селедк", "хек",
+            "кревет", "кальмар", "мидии", "осьминог",
+        ),
+    ),
+    (
+        "овощи_фрукты",
+        (
+            "морков", "лук ", "лук.", "репчат", "картошк", "картоф",
+            "помидор", "томат", "огурц", "огурец", "огурк",
+            "капуст", "свёкл", "свекл", "чеснок", "перец", "болгарск",
+            "баклажан", "кабачок", "цуккин", "тыкв", "редис", "редьк",
+            "укроп", "петрушк", "кинза", "базилик", "зелень", "шпинат",
+            "яблок", "груш", "банан", "апельсин", "лимон", "мандарин",
+            "виноград", "арбуз", "дын", "клубник", "малин", "вишн", "черешн",
+            "ягод", "авокадо", "ананас", "манго", "киви", "персик", "слив",
+            "гриб", "шампиньон",
+        ),
+    ),
+    (
+        "хлеб",
+        (
+            "хлеб", "батон", "булк", "булоч", "багет", "лаваш", "тост",
+        ),
+    ),
+    (
+        "бакалея",
+        (
+            "мука", "сахар", "соль", "сод", "разрыхлит", "дрожж",
+            "рис", "гречк", "пшен", "овсянк", "овсян", "перловк", "булгур", "киноа",
+            "макарон", "спагетти", "паста", "лапш", "вермишел",
+            "масло растит", "масло подсолн", "масло олив", "оливковое",
+            "уксус", "соус", "кетчуп", "майонез", "горчиц",
+            "специй", "специи", "приправ", "перец молот", "лаврушк", "лавровы",
+            "чай", "кофе", "какао",
+            "орех", "миндал", "фундук", "арахис", "фисташк", "кешью",
+            "мёд", "мед ", "варенье",
+        ),
+    ),
+    (
+        "напитки",
+        (
+            "сок", "вода", "минерал", "лимонад", "кола", "пепси",
+            "пиво", "вино", "шампанск",
+        ),
+    ),
+    (
+        "замороженное",
+        ("мороженое", "заморож", "пельмен", "вареник",),
+    ),
+    (
+        "бытовая_химия",
+        (
+            "мыло", "шампунь", "гель для душа", "стиральн", "порошок стир",
+            "кондицион", "туалетн", "салфетк", "полотенце бумаж",
+            "губк", "тряпк", "средство для", "жидкость для",
+        ),
+    ),
+]
+
+
+def _guess_category(title: str) -> str:
+    """Best-effort keyword classification of a shopping item title.
+
+    Returns one of ``SHOPPING_CATEGORIES``. Used when the LLM doesn't
+    supply an explicit category (happens with auto-gen from menu —
+    previously every ingredient ended up in 'другое'). Dictionary-based
+    Russian keywords; case-insensitive substring match. First matching
+    category wins (see ``_CATEGORY_KEYWORDS`` ordering for priority).
+    Unknown titles fall back to ``DEFAULT_CATEGORY``.
+    """
+    low = (title or "").lower().strip()
+    if not low:
+        return DEFAULT_CATEGORY
+    for cat, keywords in _CATEGORY_KEYWORDS:
+        for kw in keywords:
+            if kw in low:
+                return cat
+    return DEFAULT_CATEGORY
+
+
 class HousewifeShoppingService:
     """Service facade for the shopping list.
 
@@ -120,13 +220,22 @@ class HousewifeShoppingService:
         now = _utcnow()
         rows: list[ShoppingListItem] = []
         for item in normalised:
+            # When the caller supplies an explicit category, respect it
+            # (LLM in chat may know context the heuristic doesn't).
+            # When it's missing — common for generate_shopping_from_menu
+            # which passes None — guess from the title so the item
+            # lands in a real bucket rather than piling into "другое".
+            if item.category:
+                resolved_category = _coerce_category(item.category)
+            else:
+                resolved_category = _guess_category(item.title)
             row = ShoppingListItem(
                 id=f"sh_{uuid4().hex[:24]}",
                 tenant_id=tenant_id,
                 user_id=user_id,
                 title=item.title,
                 quantity_text=item.quantity_text,
-                category=_coerce_category(item.category),
+                category=resolved_category,
                 status="pending",
                 source_recipe_id=item.source_recipe_id,
                 added_at=now,
@@ -195,6 +304,28 @@ class HousewifeShoppingService:
             self.session.delete(row)
         self.session.commit()
         return len(rows)
+
+    def clear_pending(self, *, tenant_id: str, user_id: str) -> int:
+        """Mark every pending item as cancelled — the "Очистить всё"
+        button on the Mini App shopping screen. Bought items are
+        preserved (they're part of history, not clutter) and
+        already-cancelled rows are left alone. Returns the count of
+        rows actually moved.
+        """
+        q = self.session.query(ShoppingListItem).filter(
+            ShoppingListItem.tenant_id == tenant_id,
+            ShoppingListItem.user_id == user_id,
+            ShoppingListItem.status == "pending",
+        )
+        now = _utcnow()
+        updated = 0
+        for row in q.all():
+            row.status = "cancelled"
+            row.updated_at = now
+            updated += 1
+        if updated:
+            self.session.commit()
+        return updated
 
     def clear_bought(self, *, tenant_id: str, user_id: str) -> int:
         """Cancel everything currently in ``bought`` state. Used as a

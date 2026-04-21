@@ -295,6 +295,141 @@ def test_clear_bought_empty_list_is_noop(session):
 
 
 # ---------------------------------------------------------------------------
+# clear_pending — "очистить всё" button on the shopping screen
+# ---------------------------------------------------------------------------
+
+
+def test_clear_pending_cancels_every_pending_row(session):
+    svc = HousewifeShoppingService(session)
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "молоко"}, {"title": "хлеб"}, {"title": "яйца"}],
+    )
+    cleared = svc.clear_pending(tenant_id="t1", user_id="u1")
+    assert cleared == 3
+    remaining_statuses = {
+        r.id: r.status for r in session.query(ShoppingListItem).all()
+    }
+    assert all(s == "cancelled" for s in remaining_statuses.values())
+
+
+def test_clear_pending_leaves_bought_and_cancelled_alone(session):
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "A"}, {"title": "B"}, {"title": "C"}],
+    )
+    svc.mark_bought(tenant_id="t1", user_id="u1", ids=[rows[1].id])
+    svc.remove_items(tenant_id="t1", user_id="u1", ids=[rows[2].id])
+    # Only one pending now (rows[0]).
+    cleared = svc.clear_pending(tenant_id="t1", user_id="u1")
+    assert cleared == 1
+    # State after: rows[0] cancelled (was pending), rows[1] bought
+    # (untouched), rows[2] cancelled (already was).
+    after = {r.id: r.status for r in session.query(ShoppingListItem).all()}
+    assert after[rows[0].id] == "cancelled"
+    assert after[rows[1].id] == "bought"
+    assert after[rows[2].id] == "cancelled"
+
+
+def test_clear_pending_empty_list_is_noop(session):
+    svc = HousewifeShoppingService(session)
+    assert svc.clear_pending(tenant_id="t1", user_id="u1") == 0
+
+
+def test_guess_category_dairy():
+    from sreda.services.housewife_shopping import _guess_category
+    for title in ["молоко", "Молоко 3.2%", "сметана", "творог", "кефир", "йогурт", "сыр", "масло сливочное"]:
+        assert _guess_category(title) == "молочные", f"{title!r} should be молочные, got {_guess_category(title)!r}"
+
+
+def test_guess_category_meat_and_fish():
+    from sreda.services.housewife_shopping import _guess_category
+    for title in ["курица", "куриное филе", "говядина", "свинина", "фарш", "рыба", "лосось", "сёмга"]:
+        assert _guess_category(title) == "мясо_рыба", f"{title!r}"
+
+
+def test_guess_category_vegetables_fruits():
+    from sreda.services.housewife_shopping import _guess_category
+    for title in ["морковь", "лук репчатый", "картошка", "картофель", "помидор", "огурец", "капуста", "свёкла", "чеснок", "яблоки", "банан", "лимон", "зелень", "петрушка"]:
+        assert _guess_category(title) == "овощи_фрукты", f"{title!r}"
+
+
+def test_guess_category_bread():
+    from sreda.services.housewife_shopping import _guess_category
+    for title in ["хлеб", "батон", "булка", "хлеб бородинский"]:
+        assert _guess_category(title) == "хлеб", f"{title!r}"
+
+
+def test_guess_category_staples():
+    from sreda.services.housewife_shopping import _guess_category
+    for title in ["мука", "сахар", "соль", "рис", "гречка", "макароны", "спагетти", "масло растительное"]:
+        assert _guess_category(title) == "бакалея", f"{title!r}"
+
+
+def test_guess_category_unknown_falls_back_to_другое():
+    from sreda.services.housewife_shopping import _guess_category
+    assert _guess_category("плюшевый мишка") == "другое"
+    assert _guess_category("") == "другое"
+    assert _guess_category("загадочный ингредиент") == "другое"
+
+
+def test_add_items_auto_classifies_when_category_missing(session):
+    """When auto-gen (generate_shopping_from_menu) adds ingredients
+    with category=None, the service should auto-classify by title
+    keywords — otherwise everything lands in 'другое' and the
+    shopping screen becomes one giant section. Observed on prod:
+    13 pending items all in 'другое' including молоко, хлеб, мясо."""
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[
+            {"title": "молоко"},
+            {"title": "хлеб"},
+            {"title": "курица"},
+            {"title": "огурцы"},
+            {"title": "неведомая фигня"},
+        ],
+    )
+    by_title = {r.title: r.category for r in rows}
+    assert by_title["молоко"] == "молочные"
+    assert by_title["хлеб"] == "хлеб"
+    assert by_title["курица"] == "мясо_рыба"
+    assert by_title["огурцы"] == "овощи_фрукты"
+    assert by_title["неведомая фигня"] == "другое"
+
+
+def test_add_items_explicit_category_beats_auto_guess(session):
+    """If LLM explicitly provides a category (chat path), trust it
+    over the keyword heuristic — LLM may know context the heuristic
+    doesn't (e.g. 'курица' as a stuffed toy)."""
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "курица", "category": "готовое"}],
+    )
+    assert rows[0].category == "готовое"
+
+
+def test_clear_pending_is_tenant_scoped(session):
+    session.add(Tenant(id="t2", name="Other"))
+    session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))
+    session.commit()
+
+    svc = HousewifeShoppingService(session)
+    svc.add_items(tenant_id="t1", user_id="u1", items=[{"title": "A"}])
+    svc.add_items(tenant_id="t2", user_id="u2", items=[{"title": "B"}])
+    # Clear only for t1.
+    cleared = svc.clear_pending(tenant_id="t1", user_id="u1")
+    assert cleared == 1
+    # t2's item remains pending.
+    pending_t2 = session.query(ShoppingListItem).filter_by(
+        tenant_id="t2", status="pending"
+    ).count()
+    assert pending_t2 == 1
+
+
+# ---------------------------------------------------------------------------
 # delete_by_source_recipe — Stage 5/6 regen support
 # ---------------------------------------------------------------------------
 

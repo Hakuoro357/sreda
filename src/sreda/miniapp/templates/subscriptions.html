@@ -457,11 +457,19 @@
 
   function renderShopping() {
     setupBackButton(true);
-    var html = '<h1>\uD83D\uDED2 Покупки</h1>';
+    // Header row: title + clear-all icon button.
+    var html =
+      '<div style="display:flex;align-items:center;justify-content:space-between">' +
+      '<h1 style="margin:0">\uD83D\uDED2 Покупки</h1>' +
+      '<button class="btn btn-small" ' +
+      'onclick="window._clearAllShopping()" ' +
+      'style="padding:6px 10px;font-size:18px;background:rgba(0,0,0,0.06);min-width:40px" ' +
+      'title="Очистить весь список">\uD83D\uDDD1\uFE0F</button>' +  // 🗑️
+      '</div>';
 
     // Inline "+ Добавить" input at the top — simpler than a modal.
     // Using a form so Enter on mobile submits naturally.
-    html += '<form class="card" onsubmit="return window._addShoppingItem(event)">';
+    html += '<form class="card mt-8" onsubmit="return window._addShoppingItem(event)">';
     html += '<input type="text" id="shopping-new-input" placeholder="Что добавить в список?" ';
     html += 'style="width:100%;padding:10px;border:1px solid var(--tg-theme-hint-color,#aaa);';
     html += 'border-radius:8px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);font-size:15px" />';
@@ -493,27 +501,104 @@
       if (it.category !== currentCategory) {
         currentCategory = it.category;
         var label = _SHOPPING_CATEGORY_LABELS[currentCategory] || currentCategory;
-        html += '<div class="section-title">' + escHtml(label) + '</div>';
+        html += '<div class="section-title" data-shop-cat="' + escHtml(currentCategory) + '">' + escHtml(label) + '</div>';
       }
-      html += '<div class="card" style="display:flex;align-items:center;gap:12px">';
-      // Check-box — tap to mark bought
-      html += '<div onclick="window._markShoppingBought(\'' + escHtml(it.id) + '\')" ';
+      // data-shop-item lets the handler find the card for surgical
+      // remove-with-animation instead of a full re-render.
+      html += '<div class="card shop-item" data-shop-item="' + escHtml(it.id) + '" data-shop-cat="' + escHtml(it.category) + '" ';
+      html += 'style="display:flex;align-items:center;gap:12px;transition:opacity 0.25s ease,max-height 0.35s ease,padding 0.35s ease,margin 0.35s ease;overflow:hidden;max-height:200px">';
+      // Check-box — tap to mark bought. CSS transitions give a brief
+      // "check" animation before the card collapses.
+      html += '<div class="shop-check" onclick="window._markShoppingBought(\'' + escHtml(it.id) + '\',this)" ';
       html += 'style="width:28px;height:28px;border:2px solid var(--tg-theme-hint-color,#aaa);';
-      html += 'border-radius:6px;flex-shrink:0;cursor:pointer"></div>';
+      html += 'border-radius:6px;flex-shrink:0;cursor:pointer;display:flex;align-items:center;justify-content:center;';
+      html += 'color:transparent;font-weight:bold;font-size:18px;transition:background 0.2s,color 0.2s,border-color 0.2s">';
+      html += '\u2713';  // checkmark is invisible until checked
+      html += '</div>';
       // Title + optional quantity
-      html += '<div style="flex:1">';
+      html += '<div class="shop-text" style="flex:1;transition:opacity 0.25s ease">';
       html += '<div class="card-title" style="margin:0">' + escHtml(it.title) + '</div>';
       if (it.quantity_text) {
         html += '<div class="card-subtitle" style="margin:0">' + escHtml(it.quantity_text) + '</div>';
       }
       html += '</div>';
       // Delete icon
-      html += '<div onclick="window._deleteShoppingItem(\'' + escHtml(it.id) + '\', \'' + escHtml(it.title).replace(/\'/g, "") + '\')" ';
+      html += '<div onclick="window._deleteShoppingItem(\'' + escHtml(it.id) + '\')" ';
       html += 'style="font-size:20px;color:var(--tg-theme-destructive-text-color,#e04b4b);cursor:pointer;padding:4px 8px">\u00d7</div>';
       html += '</div>';
     }
-    html += '<div class="card-subtitle" style="text-align:center;margin-top:16px">Всего: ' + items.length + '</div>';
+    html += '<div class="card-subtitle" style="text-align:center;margin-top:16px" id="shop-total">Всего: ' + items.length + '</div>';
     return html;
+  }
+
+  // Surgical animate-and-remove for one shopping item. checked=true
+  // plays a green checkmark animation first (bought), checked=false
+  // skips straight to collapse (delete/cancel). 700ms total for the
+  // happy "tick → fade → collapse" sequence; 350ms for the direct
+  // delete path. After collapse we prune from state + DOM.
+  function _animateRemoveShoppingItem(itemId, checked) {
+    var card = document.querySelector('[data-shop-item="' + itemId + '"]');
+    if (!card) {
+      // Card already gone; just prune state.
+      _pruneShoppingItemFromState(itemId);
+      return;
+    }
+    var delayBeforeFade = 0;
+    if (checked) {
+      var check = card.querySelector(".shop-check");
+      if (check) {
+        check.style.background = "#2ecc71";
+        check.style.borderColor = "#2ecc71";
+        check.style.color = "#fff";
+      }
+      var text = card.querySelector(".shop-text");
+      if (text) text.style.textDecoration = "line-through";
+      delayBeforeFade = 350;
+    }
+    setTimeout(function() {
+      card.style.opacity = "0";
+      card.style.maxHeight = "0px";
+      card.style.padding = "0";
+      card.style.margin = "0";
+      setTimeout(function() {
+        if (card.parentNode) card.parentNode.removeChild(card);
+        _pruneShoppingItemFromState(itemId);
+      }, 380);
+    }, delayBeforeFade);
+  }
+
+  // Remove the item from state.shopping.items AND clean up the
+  // category header if that was the last item in its bucket. Also
+  // updates the "Всего: N" counter. If the list becomes empty, we
+  // do a single render() so the empty-state message appears.
+  function _pruneShoppingItemFromState(itemId) {
+    if (!state.shopping || !state.shopping.items) return;
+    var removedCat = null;
+    state.shopping.items = state.shopping.items.filter(function(it) {
+      if (it.id === itemId) { removedCat = it.category; return false; }
+      return true;
+    });
+    // Dashboard tile counter is stale — silently refresh.
+    state.menu = null;
+    loadData({silent: true});
+
+    // Category header cleanup — if no remaining items share the
+    // removed category, drop the header too.
+    if (removedCat) {
+      var still = state.shopping.items.some(function(it) { return it.category === removedCat; });
+      if (!still) {
+        var hdr = document.querySelector('.section-title[data-shop-cat="' + removedCat + '"]');
+        if (hdr && hdr.parentNode) hdr.parentNode.removeChild(hdr);
+      }
+    }
+
+    var total = document.getElementById("shop-total");
+    if (total) total.textContent = "Всего: " + state.shopping.items.length;
+
+    if (state.shopping.items.length === 0) {
+      // Show the empty state banner.
+      render();
+    }
   }
 
   // --- Screen: Family (#/family) ---
@@ -592,8 +677,12 @@
       html += '<div class="text-right mt-8" style="display:flex;gap:8px;justify-content:flex-end">';
       html += '<button class="btn btn-small" ' +
               'onclick="window._editFamilyMember(\'' + escHtml(m.id) + '\')" ' +
-              'style="background:rgba(0,0,0,0.06)">Редактировать</button>';
-      html += '<button class="btn btn-danger btn-small" onclick="window._deleteFamilyMember(\'' + escHtml(m.id) + '\', \'' + escHtml(m.name).replace(/\'/g, "") + '\')">Удалить</button>';
+              'style="background:rgba(0,0,0,0.06);padding:4px 10px;font-size:16px;min-width:34px" ' +
+              'title="Редактировать">\u270F\uFE0F</button>';  // ✏️
+      html += '<button class="btn btn-danger btn-small" ' +
+              'onclick="window._deleteFamilyMember(\'' + escHtml(m.id) + '\', \'' + escHtml(m.name).replace(/\'/g, "") + '\')" ' +
+              'style="padding:4px 10px;font-size:16px;min-width:34px" ' +
+              'title="Удалить">\uD83D\uDDD1\uFE0F</button>';  // 🗑️
       html += '</div>';
       html += '</div>';
     }
@@ -1147,34 +1236,63 @@
     return false;
   };
 
-  window._markShoppingBought = function(itemId) {
+  window._markShoppingBought = function(itemId, checkEl) {
+    // Optimistic UX: start the animation immediately, don't wait for
+    // the server. If the request fails we rollback via render().
+    if (checkEl && checkEl.dataset.busy) return;
+    if (checkEl) checkEl.dataset.busy = "1";
     apiFetch("/miniapp/api/v1/shopping/" + itemId + "/bought", {
       method: "POST",
       body: {}
     }).then(function(res) {
       if (res && res.ok) {
-        state.shopping = null;
-        state.menu = null;
-        loadData().then(function() { loadShopping(); });
+        _animateRemoveShoppingItem(itemId, true);
       } else {
+        if (checkEl) delete checkEl.dataset.busy;
         showAlert("Не удалось отметить.");
       }
-    }).catch(function() { showAlert("Не удалось отметить."); });
+    }).catch(function() {
+      if (checkEl) delete checkEl.dataset.busy;
+      showAlert("Не удалось отметить.");
+    });
   };
 
-  window._deleteShoppingItem = function(itemId, title) {
-    showPopup("Убрать «" + title + "» из списка?", function() {
-      apiFetch("/miniapp/api/v1/shopping/" + itemId, {
-        method: "DELETE"
+  window._deleteShoppingItem = function(itemId) {
+    // No confirm popup — delete is one tap, undo is just "добавь X"
+    // to the chat. Keeps the list feeling light.
+    apiFetch("/miniapp/api/v1/shopping/" + itemId, {
+      method: "DELETE"
+    }).then(function(res) {
+      if (res && res.ok) {
+        _animateRemoveShoppingItem(itemId, false);
+      } else {
+        showAlert("Не удалось убрать.");
+      }
+    }).catch(function() { showAlert("Не удалось убрать."); });
+  };
+
+  window._clearAllShopping = function() {
+    var count = (state.shopping && state.shopping.items)
+      ? state.shopping.items.length : 0;
+    if (count === 0) return;
+    showPopup("Очистить весь список? Будет убрано: " + count + ".", function() {
+      apiFetch("/miniapp/api/v1/shopping/clear-all", {
+        method: "POST",
+        body: {}
       }).then(function(res) {
         if (res && res.ok) {
-          state.shopping = null;
-          state.menu = null;
-          loadData().then(function() { loadShopping(); });
+          var items = ((state.shopping && state.shopping.items) || []).slice();
+          // Stagger the collapse animations by 30ms each for a nice
+          // "waterfall" effect. Total time = 30ms × N + 380ms.
+          items.forEach(function(it, idx) {
+            setTimeout(function() {
+              _animateRemoveShoppingItem(it.id, false);
+            }, idx * 30);
+          });
         } else {
-          showAlert("Не удалось убрать.");
+          showAlert("Не удалось очистить список.");
         }
-      }).catch(function() { showAlert("Не удалось убрать."); });
+      }).catch(function() { showAlert("Не удалось очистить список."); });
     });
   };
 
@@ -1297,17 +1415,13 @@
       '<input id="_fm_birth_year" type="number" min="1900" max="2100" placeholder="например, 1988" style="' + inputStyle + '" ' +
       'value="' + (member.birth_year != null ? member.birth_year : "") + '">' +
 
-      '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Возраст (если год неизвестен)</label>' +
-      '<input id="_fm_age_hint" type="text" placeholder="например, 8 лет" style="' + inputStyle + '" ' +
-      'value="' + escHtml(member.age_hint || "") + '">' +
-
       '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Заметки</label>' +
       '<textarea id="_fm_notes" rows="2" placeholder="аллергии, привычки..." style="' + inputStyle + ';resize:vertical">' +
       escHtml(member.notes || "") + '</textarea>' +
 
       '<div style="display:flex;gap:8px;margin-top:16px">' +
-      '<button id="_fm_save" class="btn btn-primary" style="flex:1">Сохранить</button>' +
       '<button id="_fm_cancel" class="btn" style="flex:1;background:rgba(0,0,0,0.08)">Отмена</button>' +
+      '<button id="_fm_save" class="btn btn-primary" style="flex:1">Сохранить</button>' +
       '</div>';
 
     overlay.appendChild(modal);
@@ -1320,8 +1434,6 @@
       };
       var by = document.getElementById("_fm_birth_year").value.trim();
       if (by) payload.birth_year = parseInt(by, 10);
-      var ah = document.getElementById("_fm_age_hint").value.trim();
-      if (ah) payload.age_hint = ah;
       // Notes: always send (empty string clears it). API trims and
       // stores None for empty, so passing "" is fine.
       payload.notes = document.getElementById("_fm_notes").value.trim();

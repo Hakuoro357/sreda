@@ -432,6 +432,69 @@ class TestMiniAppMenuItemPatch:
         assert resp.status_code == 400
 
 
+class TestMiniAppClearAllShopping:
+    """POST /api/v1/shopping/clear-all — Mini App "очистить всё" button."""
+
+    def _seed_items(self):
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_shopping import HousewifeShoppingService
+
+        session = get_session_factory()()
+        try:
+            svc = HousewifeShoppingService(session)
+            rows = svc.add_items(
+                tenant_id="tenant_test", user_id="user_test",
+                items=[{"title": "A"}, {"title": "B"}, {"title": "C"}],
+            )
+            # Mark one as bought so clear-all doesn't touch it.
+            svc.mark_bought(
+                tenant_id="tenant_test", user_id="user_test",
+                ids=[rows[1].id],
+            )
+            return [rows[0].id, rows[1].id, rows[2].id]
+        finally:
+            session.close()
+
+    def test_clear_all_cancels_pending_only(self, seeded_client):
+        ids = self._seed_items()
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            "/miniapp/api/v1/shopping/clear-all",
+            json={},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "cleared": 2}
+
+        # Verify bought item survives.
+        from sreda.db.models.housewife_food import ShoppingListItem
+        from sreda.db.session import get_session_factory
+
+        session = get_session_factory()()
+        try:
+            statuses = {
+                r.id: r.status
+                for r in session.query(ShoppingListItem).filter(
+                    ShoppingListItem.id.in_(ids)
+                ).all()
+            }
+            assert statuses[ids[0]] == "cancelled"
+            assert statuses[ids[1]] == "bought"  # untouched
+            assert statuses[ids[2]] == "cancelled"
+        finally:
+            session.close()
+
+    def test_clear_all_on_empty_list_returns_zero(self, seeded_client):
+        init_data = _make_init_data()
+        resp = seeded_client.post(
+            "/miniapp/api/v1/shopping/clear-all",
+            json={},
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "cleared": 0}
+
+
 class TestMiniAppDayShopping:
     """POST /api/v1/weekly-menu/{plan_id}/generate-shopping-for-day"""
 

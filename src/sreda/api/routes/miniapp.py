@@ -967,6 +967,19 @@ def clear_bought_shopping_endpoint(
     return {"ok": True, "cleared": n}
 
 
+@router.post("/api/v1/shopping/clear-all")
+def clear_all_shopping_endpoint(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Cancel every pending item — the "Очистить всё" button on the
+    Mini App shopping screen. Bought items survive (history).
+    """
+    service = HousewifeShoppingService(session)
+    n = service.clear_pending(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+    return {"ok": True, "cleared": n}
+
+
 # ---------------------------------------------------------------------------
 # JSON API — Recipes (housewife v1.1)
 # ---------------------------------------------------------------------------
