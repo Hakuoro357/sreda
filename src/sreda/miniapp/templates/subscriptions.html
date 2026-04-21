@@ -658,9 +658,10 @@
   function _patchMenuCellInDom(planId, day, mealType, cell) {
     var sel = '[data-cell="' + day + ':' + mealType + '"]';
     var el = document.querySelector(sel);
-    if (!el) return;
+    if (!el) return false;
     el.innerHTML = _renderMenuCellInner(planId, day, mealType, cell);
     _updateDayKcalHeader(day);
+    return true;
   }
 
   // Recompute "Понедельник · ~1800 ккал" in the day header after a
@@ -736,7 +737,7 @@
       html += '<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 8px 4px">';
       html += '<div class="section-title" data-day-header="' + d + '" style="margin:0">' + escHtml(title) + '</div>';
       html += '<button class="btn btn-small" ';
-      html += 'onclick="window._generateShoppingForDay(\'' + escHtml(plan.id) + '\',' + d + ')" ';
+      html += 'onclick="window._generateShoppingForDay(\'' + escHtml(plan.id) + '\',' + d + ',this)" ';
       html += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer" ';
       html += 'title="Добавить продукты этого дня в список покупок">';
       html += '\uD83D\uDED2 В список';
@@ -1388,7 +1389,26 @@
     });
   };
 
-  window._generateShoppingForDay = function(planId, day) {
+  window._generateShoppingForDay = function(planId, day, btn) {
+    // Silent AJAX — no full re-render, no loading spinner replacing
+    // the menu page. Only the tapped button's label briefly changes
+    // to "…" and then to a tick/count so the user sees the outcome
+    // without leaving their scroll position on #/menu.
+    var originalLabel = null;
+    if (btn && btn.tagName === "BUTTON") {
+      if (btn.disabled) return;
+      originalLabel = btn.innerHTML;
+      btn.disabled = true;
+      btn.style.opacity = "0.7";
+      btn.innerHTML = '<span class="spinner-small"></span>';
+    }
+    function restore(labelOverride) {
+      if (btn && btn.tagName === "BUTTON") {
+        btn.disabled = false;
+        btn.style.opacity = "";
+        btn.innerHTML = labelOverride != null ? labelOverride : originalLabel;
+      }
+    }
     apiFetch("/miniapp/api/v1/weekly-menu/" + planId + "/generate-shopping-for-day", {
       method: "POST",
       body: { day_of_week: day },
@@ -1396,17 +1416,21 @@
       if (res && res.ok) {
         var added = res.added || 0;
         if (added === 0) {
-          showAlert("В этот день нет блюд с ингредиентами.");
+          // Show a short "0" on the button for a moment, then restore.
+          restore("0");
+          setTimeout(function() { restore(); }, 1200);
         } else {
-          showAlert("Добавлено в список: " + added + ".");
+          // Briefly show "+N" so the user sees their tap took effect,
+          // then restore. Shopping list data itself is invalidated so
+          // next visit to #/shopping will fetch fresh.
+          restore("+" + added);
+          setTimeout(function() { restore(); }, 1500);
           state.shopping = null;
-          state.menu = null;
-          loadData();
         }
       } else {
-        showAlert("Не удалось собрать список.");
+        restore();
       }
-    }).catch(function() { showAlert("Не удалось собрать список."); });
+    }).catch(function() { restore(); });
   };
 
   window._regenerateMenuCell = function(planId, day, mealType, btn) {
@@ -1424,7 +1448,13 @@
       btn.innerHTML = '<span class="spinner-small"></span>';
     }
     function unlock() {
-      if (btn && btn.tagName === "BUTTON" && btn.isConnected) {
+      // Always try to restore the button even if it was detached from
+      // DOM by a surgical patch — detaching sets isConnected=false but
+      // the object still holds state. If the patch succeeded the fresh
+      // button in the new DOM is already unlocked; this call is a
+      // safety net for the case where the patch didn't run (no-op DOM
+      // still shows the original spinning button that must be cleared).
+      if (btn && btn.tagName === "BUTTON") {
         btn.disabled = false;
         btn.style.opacity = "";
         btn.style.cursor = "pointer";
@@ -1436,38 +1466,46 @@
       method: "POST",
       body: { day_of_week: day, meal_type: mealType },
     }).then(function(res) {
-      if (res && res.ok && res.item) {
-        // Update in-memory state IN PLACE so subsequent full renders
-        // (e.g. navigation away and back) show the new cell without
-        // a server round-trip.
-        if (state.weeklyMenu && state.weeklyMenu.plan) {
-          var items = state.weeklyMenu.plan.items || [];
-          var replaced = false;
-          for (var i = 0; i < items.length; i++) {
-            if (items[i].day_of_week === day && items[i].meal_type === mealType) {
-              items[i] = res.item;
-              replaced = true;
-              break;
+      try {
+        if (res && res.ok && res.item) {
+          // Update in-memory state IN PLACE so subsequent full renders
+          // (e.g. navigation away and back) show the new cell without
+          // a server round-trip.
+          if (state.weeklyMenu && state.weeklyMenu.plan) {
+            var items = state.weeklyMenu.plan.items || [];
+            var replaced = false;
+            for (var i = 0; i < items.length; i++) {
+              if (items[i].day_of_week === day && items[i].meal_type === mealType) {
+                items[i] = res.item;
+                replaced = true;
+                break;
+              }
             }
+            if (!replaced) items.push(res.item);
+            state.weeklyMenu.plan.items = items;
           }
-          if (!replaced) items.push(res.item);
-          state.weeklyMenu.plan.items = items;
+          // Surgical DOM update for the one cell.
+          var patched = _patchMenuCellInDom(planId, day, mealType, res.item);
+          if (!patched) {
+            // Fallback: couldn't locate the cell in the DOM (user
+            // may have navigated away and back). Do a full render
+            // so state-in-place doesn't stay invisible.
+            render();
+          }
         }
-        // Surgical DOM update — swaps the one cell without
-        // touching scroll position or the rest of the grid. Avoids
-        // the perceived "reload" of re-running renderWeeklyMenu.
-        // Note: after innerHTML rewrite the ORIGINAL btn reference
-        // (the one we passed to unlock) is no longer in the DOM —
-        // the patch already produced a fresh ↻ button, so nothing
-        // to unlock on the happy path.
-        _patchMenuCellInDom(planId, day, mealType, res.item);
-        // Dashboard tiles (shopping count, menu card) silently refresh
-        // so counters stay correct — no screen-wide flicker.
-        loadData({silent: true});
-      } else {
-        unlock();
+      } catch (e) {
+        console.error("regen: post-success handler failed", e);
       }
-    }).catch(unlock);
+      // ALWAYS unlock as the last step, regardless of whether the
+      // patch succeeded — if the button is still in the DOM (patch
+      // failed, or full re-render hasn't happened yet), we unstick
+      // the spinner. This is the bug-fix for "кнопки крутятся,
+      // ничего не происходит".
+      unlock();
+    }).catch(function(err) {
+      console.warn("regen failed", err);
+      unlock();
+    });
   };
 
   window._generateShoppingFromMenu = function(planId) {
