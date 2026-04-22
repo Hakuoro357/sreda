@@ -53,20 +53,35 @@ class ShoppingItemInput:
 
 
 def _coerce_category(raw: str | None) -> str:
-    """Map an LLM-supplied category string to the fixed taxonomy.
+    """Normalise an LLM/user-supplied category name.
 
-    Accepts exact matches (case-insensitive) or falls through to
-    ``DEFAULT_CATEGORY`` — the LLM occasionally invents novel buckets
-    ("специи", "детское питание") and we don't want those to leak into
-    the DB as uncategorised mystery values.
+    As of v1.2 launch: we accept ARBITRARY categories, not just the
+    fixed taxonomy. When the LLM invents "специи" / "детское питание"
+    / "канцелярия" — that's a legitimate user bucket and should be
+    preserved, not force-mapped to "другое". The Mini App renders
+    unknown keys as-is (fallback in ``_SHOPPING_CATEGORY_LABELS``),
+    and sorting treats unknown categories as trailing the fixed
+    taxonomy (see ``_list_by_status``).
+
+    Normalisation: strip whitespace, collapse internal whitespace to
+    single spaces, lowercase, truncate to 64 chars. Empty / None →
+    ``DEFAULT_CATEGORY`` because "no category" = "другое".
+
+    SHOPPING_CATEGORIES still maps to canonical form (keeps DB
+    consistent for historical rows that came through the old path).
     """
     if not raw:
         return DEFAULT_CATEGORY
-    candidate = raw.strip().lower()
+    candidate = " ".join(raw.strip().lower().split())
+    if not candidate:
+        return DEFAULT_CATEGORY
+    # Canonicalise known taxonomy names (defensive for typos like
+    # "молочные  " or "МОЛОЧНЫЕ").
     for allowed in SHOPPING_CATEGORIES:
         if candidate == allowed:
             return allowed
-    return DEFAULT_CATEGORY
+    # Custom category from LLM / user — preserve but truncate.
+    return candidate[:64]
 
 
 # Keyword dictionary for title-based auto-classification. Each entry is

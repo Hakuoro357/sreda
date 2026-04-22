@@ -59,10 +59,13 @@ def test_coerce_category_maps_exact():
     assert _coerce_category(" бакалея ") == "бакалея"  # trim
 
 
-def test_coerce_category_unknown_falls_to_default():
-    assert _coerce_category("специи") == DEFAULT_CATEGORY
+def test_coerce_category_empty_only_falls_to_default():
+    """Pre-v1.2-launch the contract was 'unknown → другое'. New
+    contract: only truly empty input falls to DEFAULT. Custom labels
+    preserved — see test_coerce_category_preserves_custom_llm_category."""
     assert _coerce_category("") == DEFAULT_CATEGORY
     assert _coerce_category(None) == DEFAULT_CATEGORY
+    assert _coerce_category("   ") == DEFAULT_CATEGORY
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +117,17 @@ def test_add_items_skips_empty_title(session):
     assert rows[0].title == "молоко"
 
 
-def test_add_items_unknown_category_falls_to_default(session):
+def test_add_items_preserves_custom_category(session):
+    """New contract — custom LLM-supplied category names are
+    preserved. Shopper sees a 'специи' section in Mini App even
+    though it's not in the canonical taxonomy."""
     svc = HousewifeShoppingService(session)
     rows = svc.add_items(
         tenant_id="t1",
         user_id="u1",
         items=[{"title": "шафран", "category": "специи"}],
     )
-    assert rows[0].category == DEFAULT_CATEGORY
+    assert rows[0].category == "специи"
 
 
 def test_add_items_empty_list_is_noop(session):
@@ -454,6 +460,39 @@ def test_guess_category_medicine_names():
         assert _guess_category(title) == "лекарства", (
             f"{title!r} should be лекарства, got {_guess_category(title)!r}"
         )
+
+
+def test_coerce_category_preserves_custom_llm_category():
+    """As of v1.2-launch: LLM/user can create any category, not just
+    the 10 fixed buckets. `_coerce_category` normalises whitespace and
+    case but doesn't force-map unknown into 'другое'."""
+    assert _coerce_category("специи") == "специи"
+    # Case + whitespace normalisation
+    assert _coerce_category("ДЕТСКОЕ ПИТАНИЕ") == "детское питание"
+    assert _coerce_category("  Канцелярия  ") == "канцелярия"
+
+
+def test_coerce_category_known_category_still_matches():
+    """Fixed taxonomy still resolves to canonical form (case-insensitive)."""
+    assert _coerce_category("МОЛОЧНЫЕ") == "молочные"
+    assert _coerce_category("молочные") == "молочные"
+
+
+def test_coerce_category_empty_falls_back_to_другое():
+    """Empty / None still falls back to DEFAULT_CATEGORY — without any
+    category info we bucket as 'другое'."""
+    assert _coerce_category(None) == "другое"
+    assert _coerce_category("") == "другое"
+    assert _coerce_category("   ") == "другое"
+
+
+def test_coerce_category_truncates_long_strings():
+    """Defensive cap — LLM hallucination could produce very long
+    category names. Truncate to keep DB column reasonable and UI
+    not-broken."""
+    long = "очень длинное название категории " * 10  # >300 chars
+    out = _coerce_category(long)
+    assert 0 < len(out) <= 64
 
 
 def test_guess_category_unknown_falls_back_to_другое():
