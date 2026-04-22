@@ -600,6 +600,61 @@ def test_update_items_category_bulk_reassigns(session):
     assert after[rows[2].id] == "молочные"
 
 
+def test_add_items_skips_duplicate_titles_already_pending(session):
+    """Hot bug 2026-04-22: shopping list gets duplicated when the
+    user adds menu for Thursday then Friday separately — each
+    generate_shopping_from_menu call re-added the same ingredients
+    as new rows.
+
+    Fix: add_items skips items whose normalised title already matches
+    a pending row for (tenant, user). User sees one 'молоко' not
+    two 'молоко / Молоко'."""
+    svc = HousewifeShoppingService(session)
+    # Day 1: add 3 items
+    svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[
+            {"title": "молоко", "quantity_text": "1 л"},
+            {"title": "хлеб"},
+            {"title": "картофель", "quantity_text": "1 кг"},
+        ],
+    )
+    # Day 2: tries to add some of the same + new
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[
+            {"title": "Молоко", "quantity_text": "500 мл"},     # dup (case)
+            {"title": "морковь", "quantity_text": "2 шт"},      # new
+            {"title": "  картофель  "},                           # dup (ws)
+            {"title": "яблоко"},                                   # new
+        ],
+    )
+    # Only 2 new rows added
+    assert len(rows) == 2
+    titles = {r.title for r in rows}
+    assert titles == {"морковь", "яблоко"}
+    # Total pending is 5 (3 original + 2 new)
+    pending = svc.list_pending(tenant_id="t1", user_id="u1")
+    assert len(pending) == 5
+
+
+def test_add_items_does_NOT_dedup_against_bought_or_cancelled(session):
+    """If user bought the item (status=bought) yesterday and adds it
+    again today, it IS a new need — not a dup. Only pending collide."""
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1", items=[{"title": "молоко"}],
+    )
+    # Mark as bought
+    svc.mark_bought(tenant_id="t1", user_id="u1", ids=[rows[0].id])
+    # Add again — should succeed as NEW pending row
+    new_rows = svc.add_items(
+        tenant_id="t1", user_id="u1", items=[{"title": "молоко"}],
+    )
+    assert len(new_rows) == 1
+    assert svc.list_pending(tenant_id="t1", user_id="u1")[0].title == "молоко"
+
+
 def test_update_items_category_cross_tenant_safe(session):
     session.add(Tenant(id="t2", name="Other"))
     session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))

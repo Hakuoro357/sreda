@@ -52,6 +52,18 @@ class ShoppingItemInput:
     source_recipe_id: str | None = None
 
 
+def _normalise_title(title: str | None) -> str:
+    """Canonical form for exact-title dedup in the shopping list.
+
+    Lowercased, stripped, internal whitespace collapsed. 'молоко',
+    'Молоко' and '  молоко  ' all normalise to the same key so
+    add_items can skip cross-day duplicates.
+    """
+    if not title:
+        return ""
+    return " ".join(title.strip().lower().split())
+
+
 def _coerce_category(raw: str | None) -> str:
     """Normalise an LLM/user-supplied category name.
 
@@ -245,9 +257,27 @@ class HousewifeShoppingService:
                 )
             )
 
+        # Dedup: skip items whose normalised title already exists as
+        # a PENDING row for this (tenant, user). Prevents the "Friday
+        # menu re-adds Thursday's ingredients" duplicate flood. Bought
+        # / cancelled rows don't count — if user bought 'молоко'
+        # yesterday, re-adding today is a legitimate new need.
+        existing_titles: set[str] = set()
+        for existing in self._list_by_status(
+            tenant_id, user_id, ("pending",)
+        ):
+            existing_titles.add(_normalise_title(existing.title))
+
         now = _utcnow()
         rows: list[ShoppingListItem] = []
         for item in normalised:
+            norm = _normalise_title(item.title)
+            if norm in existing_titles:
+                # Skip — already on the list.
+                continue
+            # Track this one so a later item within the same batch
+            # with the same normalised title also gets deduped.
+            existing_titles.add(norm)
             # When the caller supplies an explicit category, respect it
             # (LLM in chat may know context the heuristic doesn't).
             # When it's missing — common for generate_shopping_from_menu
