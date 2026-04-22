@@ -109,11 +109,21 @@ class Settings(BaseSettings):
     # SQLite and Postgres. Set to 0 to disable the loop (tests only).
     job_poll_interval_seconds: float = 1.0
 
-    # Speech recognition provider. Set to "yandex" to enable Yandex SpeechKit.
-    # Leave None to disable voice transcription entirely.
+    # Speech recognition provider:
+    #   ``yandex``        — Yandex SpeechKit only (current default).
+    #   ``groq``          — Groq Whisper only (~0.3-0.5s vs Yandex ~1-2s).
+    #   ``groq+yandex``   — Groq primary, Yandex fallback on any error.
+    #   None              — STT disabled (voice messages ignored).
     speech_provider: str | None = Field(default=None, validation_alias="SREDA_SPEECH_PROVIDER")
     yandex_speechkit_api_key: str | None = Field(
         default=None, validation_alias="SREDA_YANDEX_SPEECHKIT_API_KEY"
+    )
+    # Groq Whisper — OpenAI-compatible /audio/transcriptions endpoint on
+    # LPU hardware. Same resolve-precedence as MiMo: explicit key first,
+    # then file path, then disabled.
+    groq_api_key: str | None = Field(default=None, validation_alias="SREDA_GROQ_API_KEY")
+    groq_api_key_file: str | None = Field(
+        default=None, validation_alias="SREDA_GROQ_API_KEY_FILE"
     )
 
     # Опциональный путь к файлу для structured JSON-лога неудачных
@@ -238,6 +248,20 @@ class Settings(BaseSettings):
             from pathlib import Path
 
             path = Path(self.mimo_api_key_file)
+            if path.exists() and path.is_file():
+                value = path.read_text(encoding="utf-8").strip()
+                return value or None
+        return None
+
+    def resolve_groq_api_key(self) -> str | None:
+        """Resolve Groq API key with the same env→file→None precedence
+        as ``resolve_mimo_api_key``. File path is relative to CWD."""
+        if self.groq_api_key:
+            return self.groq_api_key.strip()
+        if self.groq_api_key_file:
+            from pathlib import Path
+
+            path = Path(self.groq_api_key_file)
             if path.exists() and path.is_file():
                 value = path.read_text(encoding="utf-8").strip()
                 return value or None
