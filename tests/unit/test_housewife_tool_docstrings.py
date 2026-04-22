@@ -339,6 +339,38 @@ def test_gemma_discipline_addendum_skipped_for_mimo():
     assert "строгая дисциплина tool-calls" not in mimo_prompt
 
 
+def test_prompt_has_recipe_to_shopping_intent_rule():
+    """2026-04-22 prod: user asked 'добавь продукты этого рецепта в
+    список' → Gemma called save_recipe + search_recipes instead of
+    add_shopping_items. Prompt must disambiguate recipe→shopping from
+    menu→shopping from save-recipe."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt = build_system_prompt("housewife_assistant").lower()
+    assert (
+        "продукты" in prompt and "этого рецепта" in prompt
+        and "add_shopping_items" in prompt
+    ), (
+        "Housewife prompt must explicitly map 'добавь продукты этого "
+        "рецепта в список' to add_shopping_items (NOT save_recipe, "
+        "NOT generate_shopping_from_menu)."
+    )
+
+
+def test_prompt_has_title_morphology_rule():
+    """2026-04-22 prod: Gemma saved recipe as 'Бараний шурпа' (wrong
+    gender) reconstructing nominative from 'бараней шурпы'. Prompt
+    must spell out rod agreement for common Russian dish names so the
+    model doesn't default to masculine."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt = build_system_prompt("housewife_assistant").lower()
+    assert "именительном падеже" in prompt
+    assert "шурпа" in prompt  # explicit gender example
+    # Must mention both masculine and feminine examples to anchor
+    assert "мужской" in prompt and "женский" in prompt
+
+
 def test_gemma_discipline_addendum_skipped_for_no_model_name():
     """Callers that don't know the model yet (bench tools, tests that
     import the prompt standalone) get the baseline — addendum logic
