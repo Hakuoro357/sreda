@@ -44,7 +44,7 @@ from sreda.services.claim_lookup import ClaimLookupService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
-from sreda.services.llm import get_chat_llm
+from sreda.services.llm import get_chat_llm, strip_reasoning_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -1708,7 +1708,13 @@ def execute_conversation_chat(
 
     # final_ai is None when the turn aborted via _turn_timed_out before
     # any iter produced a result — guard the content read.
-    text = (getattr(final_ai, "content", None) or "").strip()
+    _raw = (getattr(final_ai, "content", None) or "").strip()
+    text = strip_reasoning_prefix(_raw)
+    if text != _raw:
+        logger.info(
+            "chat: stripped reasoning-prefix from %s reply (tenant=%s feature=%s)",
+            model_name, action.tenant_id, feature_key,
+        )
     rescued = False
     if not text:
         # Some models emit the user-facing answer TOGETHER with their

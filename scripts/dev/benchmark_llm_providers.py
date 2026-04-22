@@ -66,43 +66,57 @@ def _openrouter_key() -> str | None:
 
 
 PROVIDERS = [
+    # Baseline — current production provider. No price tracking.
     {
         "label": "MiMo-V2-Pro",
         "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
         "api_key": _read_secret(".secrets/mimo_api_key.txt"),
         "model": "mimo-v2-pro",
+        "price_in": 0.0, "price_out": 0.0,
     },
+    # OpenRouter paid candidates (prices per 1M tokens, verified
+    # against /api/v1/models on 2026-04-22).
     {
-        "label": "Cerebras/llama3.1-8b",
-        "base_url": "https://api.cerebras.ai/v1",
-        "api_key": _read_secret(".secrets/cerebras_chat_token.txt"),
-        "model": "llama3.1-8b",
-    },
-    {
-        "label": "Cerebras/qwen-3-235b",
-        "base_url": "https://api.cerebras.ai/v1",
-        "api_key": _read_secret(".secrets/cerebras_chat_token.txt"),
-        "model": "qwen-3-235b-a22b-instruct-2507",
-    },
-    # OpenRouter free-tier alternatives. All tool-calling supported,
-    # 262K context. Free tier is typically ~20 RPM / 200 RPD per model.
-    {
-        "label": "OR/gemma-4-31b:free",
+        "label": "OR/gemma-4-26b-moe",
         "base_url": "https://openrouter.ai/api/v1",
         "api_key": _openrouter_key(),
-        "model": "google/gemma-4-31b-it:free",
+        "model": "google/gemma-4-26b-a4b-it",
+        "price_in": 0.07, "price_out": 0.35,
     },
     {
-        "label": "OR/nemotron-120b:free",
+        "label": "OR/gemma-4-31b",
         "base_url": "https://openrouter.ai/api/v1",
         "api_key": _openrouter_key(),
-        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+        "model": "google/gemma-4-31b-it",
+        "price_in": 0.13, "price_out": 0.38,
     },
     {
-        "label": "OR/ling-2.6-flash:free",
+        "label": "OR/grok-4.1-fast",
         "base_url": "https://openrouter.ai/api/v1",
         "api_key": _openrouter_key(),
-        "model": "inclusionai/ling-2.6-flash:free",
+        "model": "x-ai/grok-4.1-fast",
+        "price_in": 0.20, "price_out": 0.50,
+    },
+    {
+        "label": "OR/minimax-m2.7",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "minimax/minimax-m2.7",
+        "price_in": 0.30, "price_out": 1.20,
+    },
+    {
+        "label": "OR/qwen3.6-plus",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "qwen/qwen3.6-plus",
+        "price_in": 0.33, "price_out": 1.95,
+    },
+    {
+        "label": "OR/kimi-k2.5",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "moonshotai/kimi-k2.5",
+        "price_in": 0.44, "price_out": 2.00,
     },
 ]
 
@@ -272,9 +286,13 @@ def main(runs_per_pair: int = 2) -> int:
     print(f"Providers: {len(PROVIDERS)}, scenarios: {len(SCENARIOS)}, runs each: {runs_per_pair}")
     print()
 
-    header = f"{'provider':<24} {'scenario':<16} {'wall (s)':>10} {'iters':>6} {'in_tok':>7} {'out_tok':>8} {'tools':<40}"
+    header = (
+        f"{'provider':<24} {'scenario':<16} {'wall (s)':>10} {'iters':>6} "
+        f"{'in_tok':>7} {'out_tok':>8} {'cost $':>10} {'tools':<40}"
+    )
     print(header)
     print("-" * len(header))
+    total_cost_by_provider: dict[str, float] = {}
 
     agg: dict[tuple[str, str], list[float]] = {}
 
@@ -297,15 +315,33 @@ def main(runs_per_pair: int = 2) -> int:
                 median = round(statistics.median(walls), 2)
                 agg[(provider["label"], scenario["name"])] = walls
                 tools_str = ",".join(last.get("tools", []))[:40]
+                # Cost for the LAST run shown (median chosen visually;
+                # tokens may drift across runs but order of magnitude
+                # identical). Summed per-provider below for a true total.
+                cost_one = (
+                    last["in_tok"] * provider["price_in"] / 1_000_000
+                    + last["out_tok"] * provider["price_out"] / 1_000_000
+                )
+                total_cost_by_provider[provider["label"]] = (
+                    total_cost_by_provider.get(provider["label"], 0.0)
+                    + cost_one * len(walls)
+                )
                 print(
                     f"{provider['label']:<24} {scenario['name']:<16} "
                     f"{median:>10} {last['iters']:>6} {last['in_tok']:>7} "
-                    f"{last['out_tok']:>8} {tools_str:<40}"
+                    f"{last['out_tok']:>8} {cost_one:>10.5f} {tools_str:<40}"
                 )
                 fp = last.get("final_preview") or ""
                 if fp:
                     print(f"    reply: {fp[:160]!r}")
 
+    print()
+    print("---- total spend per provider (all scenarios × all runs) ----")
+    grand = 0.0
+    for label, cost in sorted(total_cost_by_provider.items(), key=lambda kv: kv[1]):
+        grand += cost
+        print(f"  {label:<24} ${cost:.5f}")
+    print(f"  {'GRAND TOTAL':<24} ${grand:.5f}")
     print()
     print("---- median wall per (provider, scenario) ----")
     header2 = f"{'provider':<24}" + "".join(f" {s['name']:>16}" for s in SCENARIOS)

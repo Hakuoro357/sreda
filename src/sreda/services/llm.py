@@ -24,6 +24,7 @@ flip; behaviour is default.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -31,6 +32,42 @@ from langchain_openai import ChatOpenAI
 from sreda.config.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+
+# Models trained on ReAct-style tool-calling data (Gemma-4 family,
+# some Qwen variants, early DeepSeek R1 forks) occasionally prepend
+# reasoning-trace markers to their final user-visible text. Verified
+# 2026-04-22 on google/gemma-4-26b-a4b-it: every tool-calling reply
+# came back as ``thought\n<real answer>``. System prompt rules can't
+# suppress it — the training signal overrides user instructions.
+# Fixing it at the boundary (once, where we extract the reply text)
+# keeps the rest of the code provider-agnostic.
+_REASONING_PREFIXES = (
+    "thought", "thinking", "reasoning", "analysis", "internal",
+    "reflect", "reflection",
+)
+# Matches a leading ReAct marker on its own line or followed by ":".
+# Case-insensitive. Example hits: ``thought\n``, ``Thinking: ``,
+# ``REASONING\n\n``. The whole marker + following whitespace is
+# stripped; the actual answer stays intact.
+_REASONING_PREFIX_RE = re.compile(
+    r"^(?:" + "|".join(_REASONING_PREFIXES) + r")\s*[:\n]\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_reasoning_prefix(text: str) -> str:
+    """Remove a leading ReAct-style reasoning marker from an LLM reply.
+
+    Returns ``text`` unchanged if no known marker is present at the
+    start. Idempotent — safe to apply to already-clean output.
+    """
+    if not text:
+        return text
+    match = _REASONING_PREFIX_RE.match(text)
+    if not match:
+        return text
+    return text[match.end():]
 
 
 def get_chat_llm(
