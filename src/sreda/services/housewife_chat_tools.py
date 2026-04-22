@@ -374,6 +374,93 @@ def build_housewife_tools(
         return f"ok:removed:{n}"
 
     @lc_tool
+    def update_shopping_item(
+        item_id: str,
+        title: str | None = None,
+        quantity_text: str | None = None,
+        category: str | None = None,
+    ) -> str:
+        """Update a single shopping item in place — rename, re-quantify,
+        or re-categorise WITHOUT going through remove+add.
+
+        **Use this instead of remove_shopping_items + add_shopping_items
+        when the user wants to edit an existing row.** One LLM call
+        instead of two saves 5–10 seconds and a chunk of the tool
+        budget. Any argument passed as None leaves that field
+        untouched — so you can update only the category and keep
+        title / quantity as they were.
+
+        Args:
+            item_id: id from a recent ``list_shopping`` (``sh_...``).
+            title: new title (optional).
+            quantity_text: new quantity label (e.g. "2 л", "500 г",
+                "по вкусу"). Empty string clears to None.
+            category: any string — fixed taxonomy (молочные, мясо_рыба,
+                овощи_фрукты, хлеб, бакалея, напитки, готовое,
+                замороженное, бытовая_химия, лекарства, другое) OR any
+                custom label the user prefers ("специи", "детское
+                питание", "канцелярия").
+
+        Returns ``ok:updated:<id>`` or error message.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not item_id or not item_id.strip():
+            return "error: empty item_id"
+        try:
+            row = shopping_service.update_item(
+                tenant_id=tenant_id, user_id=user_id,
+                item_id=item_id.strip(),
+                title=title, quantity_text=quantity_text,
+                category=category,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("update_shopping_item failed")
+            return "error: internal"
+        if row is None:
+            return f"error: item {item_id!r} not found"
+        return f"ok:updated:{row.id}"
+
+    @lc_tool
+    def update_shopping_items_category(
+        item_ids: list[str],
+        category: str,
+    ) -> str:
+        """Bulk re-assign category for several shopping items in one call.
+
+        **Use this when the user asks to split/regroup a list**
+        ("лекарства отдельно", "все молочные в одну категорию") —
+        1 tool call instead of a delete+add cycle per item. Observed
+        prod case: LLM regrouped 3 items with list+remove+add = 4 LLM
+        iterations / 32 seconds, where this would be list + 1 bulk
+        update = 2 iterations / ~12 seconds.
+
+        Args:
+            item_ids: list of ids from a recent ``list_shopping``.
+            category: target bucket — any string (same contract as
+                ``update_shopping_item.category``).
+
+        Returns ``ok:updated:N`` where N is the number of rows
+        actually changed (ids that don't exist or belong to other
+        tenants are silently skipped).
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not item_ids:
+            return "error: empty item_ids"
+        if not category or not category.strip():
+            return "error: empty category"
+        try:
+            n = shopping_service.update_items_category(
+                tenant_id=tenant_id, user_id=user_id,
+                ids=item_ids, category=category,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("update_shopping_items_category failed")
+            return "error: internal"
+        return f"ok:updated:{n}"
+
+    @lc_tool
     def list_shopping() -> str:
         """List the user's pending (not-yet-bought, not-cancelled)
         shopping items.
@@ -1195,6 +1282,8 @@ def build_housewife_tools(
         add_shopping_items,
         mark_shopping_bought,
         remove_shopping_items,
+        update_shopping_item,
+        update_shopping_items_category,
         list_shopping,
         clear_bought_shopping,
         save_recipe,

@@ -155,6 +155,42 @@ def test_plan_week_menu_docstring_warns_about_overwrite():
     )
 
 
+def test_system_prompt_prefers_update_over_remove_add():
+    """Prod: LLM did list + remove(2) + add(3) + final text = 4 LLM
+    iterations / 32s for a simple regroup. The prompt must point to
+    update_shopping_item(s_category) as the cheap path."""
+    from sreda.runtime.handlers import _CONVERSATION_SYSTEM_PROMPT
+
+    low = _CONVERSATION_SYSTEM_PROMPT.lower()
+    assert "update_shopping_item" in low, (
+        "System prompt must instruct LLM to prefer "
+        "update_shopping_item / update_shopping_items_category over "
+        "remove_shopping_items + add_shopping_items when the user "
+        "wants to re-category or rename an existing row. "
+        "Each avoided LLM call saves 5–10 seconds."
+    )
+    # Also must explicitly forbid the remove+add anti-pattern
+    assert any(
+        phrase in low
+        for phrase in ("не делай remove+add", "remove+add", "минимизируй", "не дубли")
+    ), (
+        "System prompt must explicitly call out the remove+add "
+        "anti-pattern and/or duplicate list_* calls."
+    )
+
+
+def test_update_shopping_tools_exposed():
+    """New tools must be in the builder's return list — otherwise the
+    LLM doesn't know they exist."""
+    tools = _tools()
+    assert "update_shopping_item" in tools, (
+        "update_shopping_item is missing from build_housewife_tools return list"
+    )
+    assert "update_shopping_items_category" in tools, (
+        "update_shopping_items_category is missing from build_housewife_tools return list"
+    )
+
+
 def test_search_recipes_distinguishes_from_menu():
     """LLM confused the recipe book (search_recipes) with the weekly
     menu (list_menu). When user asked 'какое меню на среду?' agent

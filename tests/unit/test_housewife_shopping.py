@@ -539,6 +539,86 @@ def test_add_items_explicit_category_beats_auto_guess(session):
     assert rows[0].category == "готовое"
 
 
+def test_update_item_changes_fields_in_place(session):
+    """Avoid LLM's delete+add cycle: one update call, one commit."""
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[{"title": "Беталок зок 100 мг", "category": "другое"}],
+    )
+    item_id = rows[0].id
+    updated = svc.update_item(
+        tenant_id="t1", user_id="u1", item_id=item_id,
+        category="лекарства",
+    )
+    assert updated is not None
+    assert updated.category == "лекарства"
+    # Unchanged fields stay
+    assert updated.title == "Беталок зок 100 мг"
+    assert updated.status == "pending"
+
+
+def test_update_item_returns_none_for_unknown_id(session):
+    svc = HousewifeShoppingService(session)
+    assert svc.update_item(
+        tenant_id="t1", user_id="u1", item_id="sh_nonexistent",
+        category="лекарства",
+    ) is None
+
+
+def test_update_item_cross_tenant_returns_none(session):
+    session.add(Tenant(id="t2", name="Other"))
+    session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))
+    session.commit()
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(tenant_id="t1", user_id="u1", items=[{"title": "X"}])
+    # Different tenant can't modify
+    assert svc.update_item(
+        tenant_id="t2", user_id="u2", item_id=rows[0].id, category="лекарства",
+    ) is None
+
+
+def test_update_items_category_bulk_reassigns(session):
+    """One tool call re-categorises many items — much cheaper than
+    remove+add cycle through the LLM."""
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1", user_id="u1",
+        items=[
+            {"title": "молоко"}, {"title": "хлеб"}, {"title": "сыр"},
+        ],
+    )
+    n = svc.update_items_category(
+        tenant_id="t1", user_id="u1",
+        ids=[rows[0].id, rows[2].id],
+        category="молочные",
+    )
+    assert n == 2
+    after = {r.id: r.category for r in session.query(ShoppingListItem).all()}
+    assert after[rows[0].id] == "молочные"
+    assert after[rows[1].id] != "молочные"  # не трогали
+    assert after[rows[2].id] == "молочные"
+
+
+def test_update_items_category_cross_tenant_safe(session):
+    session.add(Tenant(id="t2", name="Other"))
+    session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))
+    session.commit()
+    svc = HousewifeShoppingService(session)
+    r_t1 = svc.add_items(tenant_id="t1", user_id="u1", items=[{"title": "A"}])
+    r_t2 = svc.add_items(tenant_id="t2", user_id="u2", items=[{"title": "B"}])
+    # t2 user tries to reassign t1's row — no effect
+    n = svc.update_items_category(
+        tenant_id="t2", user_id="u2",
+        ids=[r_t1[0].id, r_t2[0].id],
+        category="лекарства",
+    )
+    assert n == 1  # only own row updated
+    by_id = {r.id: r for r in session.query(ShoppingListItem).all()}
+    assert by_id[r_t1[0].id].category != "лекарства"  # t1's untouched
+    assert by_id[r_t2[0].id].category == "лекарства"
+
+
 def test_clear_pending_is_tenant_scoped(session):
     session.add(Tenant(id="t2", name="Other"))
     session.add(User(id="u2", tenant_id="t2", telegram_account_id="200"))

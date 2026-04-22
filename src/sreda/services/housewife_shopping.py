@@ -333,6 +333,82 @@ class HousewifeShoppingService:
         self.session.commit()
         return len(rows)
 
+    def update_item(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        item_id: str,
+        title: str | None = None,
+        quantity_text: str | None = None,
+        category: str | None = None,
+    ) -> ShoppingListItem | None:
+        """Partial update of a single shopping item — lets the LLM
+        re-categorise / rename / re-quantify with ONE tool call
+        instead of the burn-your-budget delete+add cycle.
+
+        Any arg passed as None leaves that field untouched. Pass an
+        explicit empty string to clear (only makes sense for
+        quantity_text). Returns the updated row, or None if the item
+        doesn't exist or belongs to another tenant.
+        """
+        row = (
+            self.session.query(ShoppingListItem)
+            .filter(
+                ShoppingListItem.id == item_id,
+                ShoppingListItem.tenant_id == tenant_id,
+                ShoppingListItem.user_id == user_id,
+            )
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        if title is not None:
+            clean = (title or "").strip()
+            if clean:
+                row.title = clean[:500]
+        if quantity_text is not None:
+            q = (quantity_text or "").strip()[:64]
+            row.quantity_text = q or None
+        if category is not None:
+            row.category = _coerce_category(category)
+        row.updated_at = _utcnow()
+        self.session.commit()
+        return row
+
+    def update_items_category(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        ids: list[str],
+        category: str,
+    ) -> int:
+        """Bulk re-assign category for a set of items. Rows owned by
+        other tenants / users are silently skipped (cross-tenant safe).
+        Returns the count of rows actually updated.
+
+        Keeps the LLM's tool-budget down — one call instead of one
+        per item via ``update_item`` or a remove+add cycle.
+        """
+        if not ids:
+            return 0
+        new_cat = _coerce_category(category)
+        q = self.session.query(ShoppingListItem).filter(
+            ShoppingListItem.tenant_id == tenant_id,
+            ShoppingListItem.user_id == user_id,
+            ShoppingListItem.id.in_(ids),
+        )
+        now = _utcnow()
+        updated = 0
+        for row in q.all():
+            row.category = new_cat
+            row.updated_at = now
+            updated += 1
+        if updated:
+            self.session.commit()
+        return updated
+
     def clear_pending(self, *, tenant_id: str, user_id: str) -> int:
         """Mark every pending item as cancelled — the "Очистить всё"
         button on the Mini App shopping screen. Bought items are
