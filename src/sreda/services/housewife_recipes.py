@@ -121,6 +121,13 @@ class HousewifeRecipeService:
 
     def __init__(self, session: Session) -> None:
         self.session = session
+        # Per-instance cache of "all owned recipes" keyed by
+        # (tenant_id, user_id). A single LLM turn re-creates the
+        # service once, then often calls list_recipes() /
+        # search_recipes() multiple times (dedup check, render,
+        # confirmation). Caching here avoids N× decryption of every
+        # title. Invalidated on any write (save/delete).
+        self._owned_cache: dict[tuple[str, str], list[Recipe]] = {}
 
     # ------------------------------------------------------------------
     # Write
@@ -228,6 +235,7 @@ class HousewifeRecipeService:
                 )
             )
         self.session.commit()
+        self._invalidate_cache(tenant_id, user_id)
         return recipe, True
 
     def save_recipes_batch(
@@ -356,27 +364,54 @@ class HousewifeRecipeService:
 
         if result.created:
             self.session.commit()
+            self._invalidate_cache(tenant_id, user_id)
         return result
 
-    def _existing_by_normalised_title(
-        self, tenant_id: str, user_id: str
-    ) -> dict[str, Recipe]:
-        """Load all owned recipes and index them by normalised title.
-
-        Titles are EncryptedString, so ORM-level decryption happens on
-        attribute access — we can't do SQL LIKE. At pilot scale this
-        is fine (< 100 recipes per user); if it ever gets hot we'll
-        add a plaintext ``title_normal`` mirror column + a trigram
-        index.
-        """
-        rows = (
+    def _load_owned_recipes(
+        self, *, tenant_id: str, user_id: str
+    ) -> list[Recipe]:
+        """Cold DB loader — every time this is called it hits the
+        database. Use ``_get_owned_recipes`` for cached access."""
+        return (
             self.session.query(Recipe)
             .filter(
                 Recipe.tenant_id == tenant_id,
                 Recipe.user_id == user_id,
             )
+            .order_by(Recipe.created_at.desc())
             .all()
         )
+
+    def _get_owned_recipes(
+        self, *, tenant_id: str, user_id: str
+    ) -> list[Recipe]:
+        """Cache-aware accessor used by list_recipes / search_recipes /
+        dedup. Populates the per-instance cache on first call and
+        reuses it until a write invalidates the entry."""
+        key = (tenant_id, user_id)
+        cached = self._owned_cache.get(key)
+        if cached is not None:
+            return cached
+        rows = self._load_owned_recipes(tenant_id=tenant_id, user_id=user_id)
+        self._owned_cache[key] = rows
+        return rows
+
+    def _invalidate_cache(self, tenant_id: str, user_id: str) -> None:
+        self._owned_cache.pop((tenant_id, user_id), None)
+
+    def _existing_by_normalised_title(
+        self, tenant_id: str, user_id: str
+    ) -> dict[str, Recipe]:
+        """Index owned recipes by normalised title.
+
+        Titles are EncryptedString, so ORM-level decryption happens on
+        attribute access — we can't do SQL LIKE. At pilot scale this
+        is fine (< 100 recipes per user); if it ever gets hot we'll
+        add a plaintext ``title_normal`` mirror column + a trigram
+        index. Shares the same per-instance cache as ``list_recipes``,
+        so repeated dedup checks within a turn don't re-decrypt titles.
+        """
+        rows = self._get_owned_recipes(tenant_id=tenant_id, user_id=user_id)
         out: dict[str, Recipe] = {}
         for r in rows:
             key = _normalise_title(r.title)
@@ -404,6 +439,7 @@ class HousewifeRecipeService:
             return False
         self.session.delete(row)
         self.session.commit()
+        self._invalidate_cache(tenant_id, user_id)
         return True
 
     # ------------------------------------------------------------------
@@ -443,15 +479,7 @@ class HousewifeRecipeService:
 
         The load is cheap: 1 query + decryption of title strings. No
         ingredients loaded here — ``get_recipe`` for the detail page."""
-        base = (
-            self.session.query(Recipe)
-            .filter(
-                Recipe.tenant_id == tenant_id,
-                Recipe.user_id == user_id,
-            )
-            .order_by(Recipe.created_at.desc())
-        )
-        rows = base.all()
+        rows = self._get_owned_recipes(tenant_id=tenant_id, user_id=user_id)
         if not query:
             return rows
         q_lower = query.strip().lower()

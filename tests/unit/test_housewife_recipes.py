@@ -592,3 +592,119 @@ def test_save_recipes_batch_reports_skipped_against_db(session):
     assert len(result.skipped_existing) == 1
     assert result.skipped_existing[0].title == "Борщ"
     assert svc.count_recipes(tenant_id="t1", user_id="u1") == 2
+
+
+# ---------------------------------------------------------------------------
+# Per-instance list cache (Stage 7.5 NICE). One LLM turn re-uses the
+# same HousewifeRecipeService — when it calls list_recipes("")  /
+# search_recipes() multiple times (common: before dedup, before render,
+# before confirmation message), we should hit the DB once. Invalidated
+# on save_recipe / save_recipes_batch / delete_recipe.
+# ---------------------------------------------------------------------------
+
+
+def test_list_recipes_caches_empty_query_on_instance(session):
+    """Second call with no query reuses the cached row list without
+    hitting the DB again — LLM often calls search_recipes() twice in
+    one turn and each call decrypts every title."""
+    svc = HousewifeRecipeService(session)
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+
+    calls = {"n": 0}
+    real_loader = svc._load_owned_recipes
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real_loader(*args, **kwargs)
+
+    svc._load_owned_recipes = counting  # type: ignore[method-assign]
+
+    a = svc.list_recipes(tenant_id="t1", user_id="u1")
+    b = svc.list_recipes(tenant_id="t1", user_id="u1")
+    c = svc.search_recipes(tenant_id="t1", user_id="u1", query="")
+    assert [r.title for r in a] == ["Борщ"]
+    assert [r.title for r in b] == ["Борщ"]
+    assert [r.title for r in c] == ["Борщ"]
+    assert calls["n"] == 1, (
+        "list_recipes(query=None/'') should DB-load once per instance, "
+        "not on every call"
+    )
+
+
+def test_list_recipes_with_query_does_not_poison_cache(session):
+    """Filtered calls must not cache narrowed results under the empty-
+    query key — otherwise a later list_recipes() would miss rows."""
+    svc = HousewifeRecipeService(session)
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Окрошка", ingredients=[], source="user_dictated",
+    )
+
+    filtered = svc.list_recipes(tenant_id="t1", user_id="u1", query="борщ")
+    assert [r.title for r in filtered] == ["Борщ"]
+
+    full = svc.list_recipes(tenant_id="t1", user_id="u1")
+    assert {r.title for r in full} == {"Борщ", "Окрошка"}
+
+
+def test_save_recipe_invalidates_list_cache(session):
+    """After saving, the cached list must reflect the new row on next
+    call — otherwise the LLM would report 'у тебя 5 рецептов' right
+    after saving the 6th."""
+    svc = HousewifeRecipeService(session)
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+    first = svc.list_recipes(tenant_id="t1", user_id="u1")
+    assert len(first) == 1
+
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Окрошка", ingredients=[], source="user_dictated",
+    )
+    second = svc.list_recipes(tenant_id="t1", user_id="u1")
+    assert {r.title for r in second} == {"Борщ", "Окрошка"}
+
+
+def test_delete_recipe_invalidates_list_cache(session):
+    svc = HousewifeRecipeService(session)
+    r1, _ = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Окрошка", ingredients=[], source="user_dictated",
+    )
+    # prime cache
+    assert len(svc.list_recipes(tenant_id="t1", user_id="u1")) == 2
+
+    svc.delete_recipe(tenant_id="t1", user_id="u1", recipe_id=r1.id)
+    assert [r.title for r in svc.list_recipes(tenant_id="t1", user_id="u1")] == ["Окрошка"]
+
+
+def test_save_recipes_batch_invalidates_list_cache(session):
+    svc = HousewifeRecipeService(session)
+    svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Борщ", ingredients=[], source="user_dictated",
+    )
+    assert len(svc.list_recipes(tenant_id="t1", user_id="u1")) == 1
+
+    svc.save_recipes_batch(
+        tenant_id="t1", user_id="u1",
+        recipes=[
+            {"title": "Окрошка", "ingredients": [], "source": "user_dictated"},
+            {"title": "Омлет", "ingredients": [], "source": "user_dictated"},
+        ],
+    )
+    titles = {r.title for r in svc.list_recipes(tenant_id="t1", user_id="u1")}
+    assert titles == {"Борщ", "Окрошка", "Омлет"}
