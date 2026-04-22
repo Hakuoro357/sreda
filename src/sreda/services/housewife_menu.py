@@ -102,17 +102,36 @@ class HousewifeMenuService:
         cells: list[MenuCellInput] | list[dict[str, Any]],
         notes: str | None = None,
     ) -> MenuPlan:
-        """Create (or replace) the menu for the given ISO week.
+        """Upsert the menu for the given ISO week — overwrite the
+        (day, meal_type) slots present in ``cells`` and PRESERVE every
+        other cell from the prior plan for the same week. Idempotent
+        by ``(tenant, user, week_start)``.
 
-        Idempotent by ``(tenant, user, week_start)``: a prior plan for
-        the same week gets deleted, then a fresh one is inserted with
-        the new cells. Callers don't need to call ``clear_menu`` first.
+        Regression guard (2026-04-22 prod): Gemma-4 called this with
+        ``days=[{day_of_week: 4, meals: {...}}]`` (only Friday) when
+        asked to «обнови чт+пт» — previous semantics then wiped
+        Mon-Thu + Sat-Sun. The preserve-merge below keeps unspecified
+        slots intact, so the worst a partial payload can do is
+        re-write the slots it actually mentions. To do a full clean
+        rebuild, pass cells covering all 7 days (or call
+        ``clear_menu`` first).
+
+        ``cells`` with both ``recipe_id=None`` AND empty ``free_text``
+        are treated as EXPLICIT CLEAR for that slot — the prior item
+        is dropped. Omitting a slot entirely (not passing it) is what
+        preserves the prior value.
         """
         start = _coerce_monday(week_start)
         normalised_cells = _normalise_cells(cells)
 
-        # Delete any prior plan for this week — cascade wipes items.
+        # Pull prior items (if any) so we can merge — load before we
+        # delete the MenuPlan row, which cascades items via the FK.
+        prior_items: dict[tuple[int, str], MenuPlanItem] = {}
         for prior in self._find_plans(tenant_id, user_id, start):
+            for item in prior.items:
+                prior_items.setdefault(
+                    (item.day_of_week, item.meal_type), item
+                )
             self.session.delete(prior)
 
         plan = MenuPlan(
@@ -128,10 +147,16 @@ class HousewifeMenuService:
         self.session.add(plan)
         self.session.flush()
 
+        # Slots explicitly mentioned in the incoming payload — these
+        # override the prior (either with new content or an explicit
+        # clear, depending on their fields).
+        new_keys: set[tuple[int, str]] = set()
         for cell in normalised_cells:
-            # Slot with nothing in it → skip. We don't insert placeholder
-            # rows; the UI renders empty grid cells for missing (day,
-            # meal_type) combinations.
+            key = (cell.day_of_week, cell.meal_type)
+            new_keys.add(key)
+            # Slot with nothing in it → skip insert. This is how
+            # callers explicitly clear a slot: present in payload,
+            # empty fields. Prior item is dropped via the delete above.
             if cell.recipe_id is None and not (cell.free_text or "").strip():
                 continue
             self.session.add(
@@ -143,6 +168,24 @@ class HousewifeMenuService:
                     recipe_id=cell.recipe_id,
                     free_text=(cell.free_text or None),
                     notes=(cell.notes or None),
+                )
+            )
+
+        # Carry over every prior slot NOT in the new payload. This is
+        # the "preserve" half of the upsert — unspecified days stay
+        # intact so a partial call can't accidentally wipe the week.
+        for (day, meal), prior_item in prior_items.items():
+            if (day, meal) in new_keys:
+                continue
+            self.session.add(
+                MenuPlanItem(
+                    id=f"mpi_{uuid4().hex[:24]}",
+                    menu_plan_id=plan.id,
+                    day_of_week=prior_item.day_of_week,
+                    meal_type=prior_item.meal_type,
+                    recipe_id=prior_item.recipe_id,
+                    free_text=prior_item.free_text,
+                    notes=prior_item.notes,
                 )
             )
 

@@ -119,9 +119,13 @@ def test_plan_week_drops_out_of_range_day(session):
     assert session.query(MenuPlanItem).count() == 1
 
 
-def test_plan_week_replaces_prior_plan_for_same_week(session):
+def test_plan_week_upserts_while_preserving_unspecified_slots(session):
+    """Partial calls to plan_week must merge into the prior plan, not
+    wipe it. Regression guard for the 2026-04-22 prod incident where
+    Gemma-4 called plan_week_menu with only Friday's 3 meals and
+    Mon-Thu + Sat-Sun got silently wiped."""
     svc = HousewifeMenuService(session)
-    # First plan — 2 cells
+    # First plan — 2 cells on Monday
     svc.plan_week(
         tenant_id="t1", user_id="u1", week_start="2026-04-20",
         cells=[
@@ -132,7 +136,8 @@ def test_plan_week_replaces_prior_plan_for_same_week(session):
     assert session.query(MenuPlan).count() == 1
     assert session.query(MenuPlanItem).count() == 2
 
-    # Second plan for the SAME week — 1 cell, replaces the first
+    # Second plan for the SAME week — 1 cell on Tuesday. Monday's two
+    # cells must be preserved; Tuesday's new cell added. Total = 3.
     svc.plan_week(
         tenant_id="t1", user_id="u1", week_start="2026-04-20",
         cells=[
@@ -140,9 +145,40 @@ def test_plan_week_replaces_prior_plan_for_same_week(session):
         ],
     )
     assert session.query(MenuPlan).count() == 1
-    assert session.query(MenuPlanItem).count() == 1
-    remaining = session.query(MenuPlanItem).first()
-    assert remaining.free_text == "рыба"
+    assert session.query(MenuPlanItem).count() == 3
+    titles = {(item.day_of_week, item.meal_type, item.free_text)
+              for item in session.query(MenuPlanItem).all()}
+    assert (0, "breakfast", "овсянка") in titles
+    assert (0, "lunch", "борщ") in titles
+    assert (1, "dinner", "рыба") in titles
+
+
+def test_plan_week_explicit_empty_cell_clears_prior_slot(session):
+    """Passing a cell with recipe_id=None AND empty free_text is the
+    explicit way to clear a previously-filled slot. Omitting a slot
+    entirely (not passing it in cells) preserves it."""
+    svc = HousewifeMenuService(session)
+    svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[
+            {"day_of_week": 0, "meal_type": "breakfast", "free_text": "овсянка"},
+            {"day_of_week": 0, "meal_type": "lunch", "free_text": "борщ"},
+        ],
+    )
+    assert session.query(MenuPlanItem).count() == 2
+
+    # Explicit clear of Monday's breakfast + don't touch lunch. Lunch
+    # stays because it's NOT in the new payload.
+    svc.plan_week(
+        tenant_id="t1", user_id="u1", week_start="2026-04-20",
+        cells=[
+            {"day_of_week": 0, "meal_type": "breakfast",
+             "recipe_id": None, "free_text": ""},
+        ],
+    )
+    remaining = {(it.day_of_week, it.meal_type, it.free_text)
+                 for it in session.query(MenuPlanItem).all()}
+    assert remaining == {(0, "lunch", "борщ")}
 
 
 def test_plan_week_accepts_recipe_id_cells(session):
