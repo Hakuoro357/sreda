@@ -1499,12 +1499,22 @@ def execute_conversation_chat(
             onboarding_prompt_block = ob_service.format_for_prompt(ob_state)
             onboarding_follow_up_needed = True
 
-    parts: list[str] = []
+    # Split the system prompt into a STABLE prefix (persona + feature
+    # rules + tool-discipline addendum) and a VARIABLE tail (time,
+    # profile, memory, onboarding nudge). OpenRouter / Anthropic-style
+    # prompt caching kicks in on the stable prefix: the 5-minute
+    # ephemeral cache means the ~1.5-2k tokens of prompt overhead
+    # are billed at 10% of input price after the first call. Providers
+    # that don't support the cache_control marker (MiMo, Qwen) receive
+    # the content as plain multi-part text and ignore the marker.
+    stable_text = build_system_prompt(feature_key, model_name=model_name)
+
+    variable_parts: list[str] = []
     if onboarding_prompt_block:
-        # At the very top — above even the base persona prompt. The
-        # base prompt tells the model how to be a helpful assistant;
-        # the onboarding block overrides the priority of this turn.
-        parts.append(
+        # Onboarding changes step-by-step so it can't share the cache
+        # boundary — kept in the variable tail. Model still sees it
+        # clearly; attention isn't strictly positional.
+        variable_parts.append(
             "[ПРИОРИТЕТ ЭТОГО ХОДА — ОНБОРДИНГ]\n"
             "Ты ВЕДЁШЬ первичное знакомство. Что бы пользователь ни "
             "написал сейчас (привет / да / вопрос), твой ПЕРВЫЙ "
@@ -1516,13 +1526,18 @@ def execute_conversation_chat(
             "справочный контекст — НЕ основание считать тему решённой.\n\n"
             + onboarding_prompt_block
         )
-    parts.append(build_system_prompt(feature_key, model_name=model_name))
-    parts.append("[ТЕКУЩЕЕ ВРЕМЯ]\n" + _format_time_context_for_prompt(profile))
-    parts.append("[ПРОФИЛЬ]\n" + _format_profile_for_prompt(profile))
-    parts.append(
+    variable_parts.append(
+        "[ТЕКУЩЕЕ ВРЕМЯ]\n" + _format_time_context_for_prompt(profile)
+    )
+    variable_parts.append("[ПРОФИЛЬ]\n" + _format_profile_for_prompt(profile))
+    variable_parts.append(
         "[ПАМЯТЬ — релевантные факты]\n" + _format_memories_for_prompt(memories)
     )
-    system_text = "\n\n".join(parts)
+    variable_text = "\n\n".join(variable_parts)
+    # Kept for legacy callers that expect a single ``system_text``
+    # string (e.g. tests, debug logging). The runtime always feeds the
+    # structured multi-part content to the LLM below.
+    system_text = stable_text + "\n\n" + variable_text
 
     tools = build_memory_tools(
         session=session,
@@ -1550,7 +1565,25 @@ def execute_conversation_chat(
     # every turn starts from a blank slate and the bot loses context.
     run_id = context.get("_run_id") or "run_unknown"
     history_turns = _load_chat_history(session, run_id)
-    messages: list[Any] = [SystemMessage(content=system_text)]
+    # Multi-part content with Anthropic-style ephemeral cache_control
+    # on the stable prefix. Supported providers (Grok 4.1 Fast via
+    # OpenRouter, Claude, Gemini) cache the prefix for 5 minutes —
+    # subsequent turns in the same minute pay 10% of the prefix's
+    # input token price. Unsupported providers ignore the marker; the
+    # content list is still valid plain text for them.
+    messages: list[Any] = [
+        SystemMessage(content=[
+            {
+                "type": "text",
+                "text": stable_text,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": variable_text,
+            },
+        ])
+    ]
     # History rows come newest-first; feed the LLM chronologically.
     for user_text_prev, bot_text_prev in reversed(history_turns):
         messages.append(HumanMessage(content=user_text_prev))
