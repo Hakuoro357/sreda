@@ -58,18 +58,35 @@ def admin_budget(
 _LLM_PROVIDERS_METADATA = [
     # Order here drives the dropdown order in llm.html. Keep the
     # current production default (mimo) first so the UI opens with a
-    # sensible-looking selection.
+    # sensible-looking selection. OpenRouter variants live after.
     {
         "key": "mimo",
         "label": "MiMo-V2-Pro",
         "default_model_attr": "mimo_chat_model",
         "resolver": "resolve_mimo_api_key",
+        # Static model id for the UI catalogue row.
+        "static_model": None,
     },
     {
         "key": "openrouter",
-        "label": "OpenRouter (gemma-4-26b-moe default)",
+        "label": "OpenRouter · Gemma 4 26B MoE",
         "default_model_attr": "openrouter_chat_model",
         "resolver": "resolve_openrouter_api_key",
+        "static_model": None,
+    },
+    {
+        "key": "openrouter-grok",
+        "label": "OpenRouter · Grok 4.1 Fast",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "x-ai/grok-4.1-fast",
+    },
+    {
+        "key": "openrouter-qwen",
+        "label": "OpenRouter · Qwen 3.6 Plus",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "qwen/qwen3.6-plus",
     },
 ]
 
@@ -95,10 +112,20 @@ def _llm_context(
     for meta in _LLM_PROVIDERS_METADATA:
         resolver = getattr(settings, meta["resolver"], None)
         available = bool(resolver and resolver())
+        # Model label: static override beats settings attribute.
+        # OpenRouter variants fix their model (grok / qwen / ...); the
+        # two 'anchor' providers (mimo, openrouter) read the configured
+        # default from settings. Either way, the UI just gets a string.
+        if meta.get("static_model"):
+            default_model = meta["static_model"]
+        elif meta.get("default_model_attr"):
+            default_model = getattr(settings, meta["default_model_attr"], "")
+        else:
+            default_model = ""
         providers.append({
             "key": meta["key"],
             "label": meta["label"],
-            "default_model": getattr(settings, meta["default_model_attr"], ""),
+            "default_model": default_model,
             "available": available,
         })
     current_primary = (

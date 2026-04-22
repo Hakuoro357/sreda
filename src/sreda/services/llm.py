@@ -191,7 +191,22 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
 # branch in ``_build_chat_llm`` and a matching setting block in
 # ``config.settings``; the handler layer treats unknown providers as
 # "LLM disabled" rather than crashing the turn.
-CHAT_PROVIDERS = ("mimo", "openrouter")
+CHAT_PROVIDERS = (
+    "mimo",
+    "openrouter",            # gemma-4-26b-a4b-it (default), verified fast
+    "openrouter-grok",       # x-ai/grok-4.1-fast — "lowest hallucination" claim
+    "openrouter-qwen",       # qwen/qwen3.6-plus — clean runner-up in bench
+)
+
+# OpenRouter variants share the same base_url + api key — they differ
+# only in which model is invoked. Keeping the mapping here means
+# adding a 4th/5th variant is a single dict entry in both the
+# build-dispatch and the admin UI metadata.
+_OPENROUTER_MODEL_BY_PROVIDER = {
+    "openrouter": None,  # None = fall back to settings.openrouter_chat_model
+    "openrouter-grok": "x-ai/grok-4.1-fast",
+    "openrouter-qwen": "qwen/qwen3.6-plus",
+}
 
 
 def _build_chat_llm(
@@ -222,15 +237,19 @@ def _build_chat_llm(
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,
         )
-    if provider == "openrouter":
+    if provider in _OPENROUTER_MODEL_BY_PROVIDER:
         api_key = settings.resolve_openrouter_api_key()
         if not api_key:
             logger.info("chat LLM disabled: no OpenRouter API key configured")
             return None
+        override = _OPENROUTER_MODEL_BY_PROVIDER[provider]
         return ChatOpenAI(
             base_url=settings.openrouter_base_url,
             api_key=api_key,
-            model=model or settings.openrouter_chat_model,
+            # Explicit ``model=`` arg (bench probes) beats per-provider
+            # override beats settings default. Lets one config hit
+            # multiple targets without per-variant settings plumbing.
+            model=model or override or settings.openrouter_chat_model,
             temperature=temperature,
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,

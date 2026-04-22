@@ -132,6 +132,41 @@ def test_unknown_provider_returns_none() -> None:
     assert llm_module.get_chat_llm(s) is None
 
 
+def test_openrouter_grok_variant_overrides_model() -> None:
+    """The ``openrouter-grok`` provider key points at Grok on OR —
+    same base_url + key as the default openrouter, but the model id
+    is hard-overridden. Lets the admin switcher expose multiple OR
+    models as distinct rows without per-variant settings plumbing."""
+    s = _settings(
+        chat_provider="openrouter-grok",
+        openrouter_api_key="or-k",
+    )
+    got = llm_module.get_chat_llm(s)
+    assert isinstance(got, _FakeLLM)
+    assert got.model == "x-ai/grok-4.1-fast"
+    assert "openrouter.ai" in got.base_url
+
+
+def test_openrouter_qwen_variant_overrides_model() -> None:
+    s = _settings(
+        chat_provider="openrouter-qwen",
+        openrouter_api_key="or-k",
+    )
+    got = llm_module.get_chat_llm(s)
+    assert isinstance(got, _FakeLLM)
+    assert got.model == "qwen/qwen3.6-plus"
+
+
+def test_openrouter_variants_share_the_same_key() -> None:
+    """All three OpenRouter variants must degrade to None when the OR
+    key isn't configured — prevents silent behaviour where the UI
+    showed 'available' but runtime found no key."""
+    s = _settings()  # no keys
+    for variant in ("openrouter", "openrouter-grok", "openrouter-qwen"):
+        s_v = _settings(chat_provider=variant)
+        assert llm_module.get_chat_llm(s_v) is None, variant
+
+
 def test_openrouter_missing_key_returns_none() -> None:
     s = _settings(chat_provider="openrouter")  # no OR key
     assert llm_module.get_chat_llm(s) is None
