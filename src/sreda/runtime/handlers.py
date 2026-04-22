@@ -44,7 +44,7 @@ from sreda.services.claim_lookup import ClaimLookupService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
-from sreda.services.llm import get_chat_llm, strip_reasoning_prefix
+from sreda.services.llm import detect_unbacked_claim, get_chat_llm, strip_reasoning_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -992,19 +992,44 @@ _FEATURE_PROMPTS: dict[str, str] = {
 }
 
 
-def build_system_prompt(feature_key: str | None) -> str:
+# Extra discipline block for Gemma-4-family models. Verified 2026-04-22:
+# Gemma-4 is ReAct-trained and sometimes (a) narrates a side-effect as
+# completed without calling the tool, and (b) leaks raw tool-call
+# syntax (``save_recipe(...)``) into the text channel. Stage 7.5 rules
+# aren't strict enough alone for this model — we add a model-specific
+# imperative reminder. Shipped behind model-name detection so MiMo and
+# other providers aren't penalised with Gemma-flavoured text.
+_GEMMA_DISCIPLINE_ADDENDUM = """\
+КРИТИЧЕСКИ ВАЖНО (строгая дисциплина tool-calls — не нарушать):
+- Если хочешь что-то СОХРАНИТЬ / ДОБАВИТЬ / СОЗДАТЬ / УДАЛИТЬ / ПОСТАВИТЬ НАПОМИНАНИЕ — это СТРОГО через tool_calls API (JSON-канал). НИКОГДА не пиши tool-call синтаксис (``save_recipe(title=...)``, ``add_shopping_items(...)``) в текстовый ответ пользователю — этот текст попадёт в Telegram как есть и будет выглядеть поломанным.
+- Если написал пользователю «сохранила рецепт», «добавила в список», «создала меню» — в ЭТОМ ЖЕ ответе ОБЯЗАН быть tool_call, который это выполнил. Никаких «сохранила» без реального вызова. Последовательность всегда: tool_call → ответ пользователю, не наоборот.
+- Если нужно сделать несколько действий (найти + сохранить) — отправь tool_calls, дождись результатов, ПОТОМ напиши текстовый ответ. Не объясняй свои действия, описывая вызовы текстом.
+"""
+
+
+def build_system_prompt(
+    feature_key: str | None, *, model_name: str | None = None,
+) -> str:
     """Compose the system prompt for one turn.
 
     Always includes the core persona + memory + web-search rules; if
     ``feature_key`` maps to a feature-specific addon, that block is
     appended verbatim. Generic chat (no feature) gets the core prompt
     alone, saving ~500 input tokens per iteration.
+
+    When ``model_name`` identifies a Gemma-4 model, a short
+    model-specific discipline block is appended at the end of the
+    prompt (highest attention weight in most transformer inference
+    stacks). Other models see the prompt unchanged.
     """
     core = _CORE_SYSTEM_PROMPT
     addon = _FEATURE_PROMPTS.get(feature_key or "")
+    parts = [core]
     if addon:
-        return core + "\n" + addon
-    return core
+        parts.append(addon)
+    if model_name and "gemma" in model_name.lower():
+        parts.append(_GEMMA_DISCIPLINE_ADDENDUM)
+    return "\n".join(parts)
 
 
 # Back-compat alias for tests that import the single-blob prompt.
@@ -1486,7 +1511,7 @@ def execute_conversation_chat(
             "справочный контекст — НЕ основание считать тему решённой.\n\n"
             + onboarding_prompt_block
         )
-    parts.append(build_system_prompt(feature_key))
+    parts.append(build_system_prompt(feature_key, model_name=model_name))
     parts.append("[ТЕКУЩЕЕ ВРЕМЯ]\n" + _format_time_context_for_prompt(profile))
     parts.append("[ПРОФИЛЬ]\n" + _format_profile_for_prompt(profile))
     parts.append(
@@ -1586,6 +1611,15 @@ def execute_conversation_chat(
         "onboarding_deferred",
         "onboarding_complete",
     }
+    # Union of tool names actually invoked across all iterations of
+    # this turn. Used post-loop to detect Gemma-style "я сохранила
+    # рецепт" narrations that weren't backed by a save_recipe call
+    # (see ``detect_unbacked_claim``). Populated below inside the
+    # tool-execution block.
+    called_tools: set[str] = set()
+    # Guard so the anti-hallucination nudge runs at most once per turn
+    # — two consecutive empty iterations would otherwise spiral.
+    _hallucination_nudged = False
     _turn_timed_out = False
     for _iter in range(_MAX_TOOL_ITERATIONS):
         # Cooperative turn-level timeout. Checked before each iteration
@@ -1626,6 +1660,41 @@ def execute_conversation_chat(
         messages.append(ai_msg)
         tool_calls = getattr(ai_msg, "tool_calls", None) or []
         if not tool_calls:
+            # Anti-hallucination retry (Gemma-4 prod case 2026-04-22):
+            # model emits a confident narration ("я сохранила рецепт в
+            # твою книгу") with tools=[]. One nudge injection is worth
+            # the extra round-trip because it actually lands the save
+            # — without it the user has to notice the missing state
+            # and re-ask, doubling frustration + LLM cost anyway.
+            ai_text = str(getattr(ai_msg, "content", "") or "")
+            if (
+                not _hallucination_nudged
+                and detect_unbacked_claim(ai_text, called_tools)
+            ):
+                _hallucination_nudged = True
+                logger.warning(
+                    "CHAT_UNBACKED_CLAIM tenant=%s user=%s feature=%s "
+                    "iter=%d model=%s — model narrated a side-effect "
+                    "without a matching tool_call; injecting nudge and "
+                    "retrying once.",
+                    action.tenant_id, user_id or "?", feature_key,
+                    _iter, model_name,
+                )
+                messages.append(
+                    HumanMessage(content=(
+                        "Ты ответил как будто действие уже выполнено, но "
+                        "в этом ходе не было соответствующего tool-call'а. "
+                        "Вызови нужный tool СЕЙЧАС (save_recipe / "
+                        "save_recipes_batch / add_shopping_items / "
+                        "plan_week_menu / schedule_reminder / и т.п.) — "
+                        "без вызова состояние не меняется. Затем коротко "
+                        "подтверди пользователю результат."
+                    ))
+                )
+                # Loop continues — next iteration hopefully emits a
+                # real tool_call. If it doesn't, _hallucination_nudged
+                # blocks a second retry.
+                continue
             final_ai = ai_msg
             break
         for tc in tool_calls:
@@ -1645,6 +1714,8 @@ def execute_conversation_chat(
                 result = f"error:{type(exc).__name__}"
             if name in _ONBOARDING_RESOLUTION_TOOLS and str(result).startswith("ok:"):
                 _onboarding_resolution_called = True
+            if name:
+                called_tools.add(name)
             messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
     else:
         # Budget exhausted while still calling tools. Force ONE final

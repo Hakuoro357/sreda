@@ -56,18 +56,135 @@ _REASONING_PREFIX_RE = re.compile(
 )
 
 
-def strip_reasoning_prefix(text: str) -> str:
-    """Remove a leading ReAct-style reasoning marker from an LLM reply.
+# Full tool-call signatures occasionally leak into the text channel
+# on Gemma-4 (reproduced 2026-04-22: ``search_recipes(query='X')\n
+# save_recipe(calories_per_serving=650, ingredients=[{...}], ...)\n
+# Прости, пожалуйста...``). The proper tool_calls JSON DID fire in
+# earlier iterations — this is the "wrap-up" message re-narrating
+# the actions as raw syntax, which looks like a bug to the user.
+# We detect the shape and strip those lines from the rendered text.
+#
+# Regex must handle multi-line calls (the save_recipe signature often
+# wraps) — we match greedily up to the first ``)`` that's followed by
+# end-of-line or another top-level ``<ident>(`` line. Case-sensitive
+# and anchored at start of string so legitimate prose mentioning
+# function names in the middle of a reply is untouched.
+_TOOL_CALL_SYNTAX_RE = re.compile(
+    r"^\s*[a-z_][a-z0-9_]*\([^)]*\)\s*(?:\n|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+# Multi-line variant: open paren without matching close on same line.
+# Consumes until the matching ``)`` followed by newline. Works for
+# single-level parens (our tool arg schemas don't nest raw ``)``
+# outside quotes at top level; worst case we leave some residue,
+# which is cosmetic).
+_TOOL_CALL_MULTILINE_RE = re.compile(
+    r"^\s*[a-z_][a-z0-9_]*\(.*?\)\s*(?:\n|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 
-    Returns ``text`` unchanged if no known marker is present at the
-    start. Idempotent — safe to apply to already-clean output.
+
+def _strip_tool_call_prefix_lines(text: str) -> str:
+    """Peel off any number of leading tool-call-syntax lines. Stops at
+    the first non-matching line so legitimate content below stays
+    intact."""
+    changed = True
+    while changed and text:
+        changed = False
+        match = _TOOL_CALL_SYNTAX_RE.match(text)
+        if match:
+            text = text[match.end():]
+            changed = True
+            continue
+        # Fallback for multi-line signatures (save_recipe spans lines).
+        match = _TOOL_CALL_MULTILINE_RE.match(text)
+        if match:
+            text = text[match.end():]
+            changed = True
+    return text.lstrip()
+
+
+def strip_reasoning_prefix(text: str) -> str:
+    """Remove leading ReAct-style meta from an LLM reply — both the
+    short ``thought\\n`` marker (Gemma-4 default) and fully-expanded
+    tool-call syntax that sometimes leaks into the text channel when
+    the model re-narrates its actions instead of just writing a
+    human reply.
+
+    Returns ``text`` unchanged if nothing matches. Idempotent —
+    applying twice equals once.
     """
     if not text:
         return text
     match = _REASONING_PREFIX_RE.match(text)
-    if not match:
-        return text
-    return text[match.end():]
+    if match:
+        text = text[match.end():]
+    # Leaked tool-call syntax can appear WITHOUT a reasoning prefix
+    # (Gemma sometimes opens directly with ``search_recipes(...)``),
+    # so run this unconditionally.
+    text = _strip_tool_call_prefix_lines(text)
+    return text
+
+
+# Write-tools whose invocation we expect when the LLM claims a stable
+# side-effect ("сохранил рецепт", "добавила в список", "создал меню").
+# Used by ``detect_unbacked_claim`` to spot Gemma-4 hallucinations
+# where the model narrates an action without actually calling the
+# corresponding tool. Keep ordered as-registered — dispatch is by
+# membership only.
+_WRITE_TOOL_NAMES = frozenset({
+    "save_core_fact", "save_episode",
+    "save_recipe", "save_recipes_batch", "delete_recipe",
+    "add_shopping_items", "remove_shopping_items", "mark_shopping_bought",
+    "update_shopping_item", "update_shopping_items_category",
+    "plan_week_menu", "update_menu_item", "generate_shopping_from_menu",
+    "add_family_members", "remove_family_member", "update_family_member",
+    "schedule_reminder", "cancel_reminder",
+})
+
+# Verb+object pairs that indicate the model claims a side-effect.
+# Conservative by design — must match a verb AND an object noun in
+# the same sentence to fire. Too many false positives would cost us a
+# wasted LLM iteration on every benign "сохраню это на будущее".
+_CLAIM_VERBS = ("сохранил", "сохранила", "сохранено",
+                "добавил", "добавила", "добавлено",
+                "создал", "создала", "создано",
+                "записал", "записала", "записано",
+                "удалил", "удалила", "удалено",
+                "поставил напомин", "поставила напомин",
+                "запланировал", "запланировала")
+_CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в покупк",
+                  "в меню", "меню на", "напомина", "семь",
+                  "в твою книг", "в твой список")
+
+
+def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
+    """Return True when the assistant text claims a side-effect but
+    no corresponding write-tool was invoked this turn.
+
+    Used after the tool-loop terminates: if this fires, the handler
+    injects a nudge message and runs one more iteration asking the
+    model to ACTUALLY call the tool. Bounded to one retry per turn
+    to avoid runaway loops.
+    """
+    if not text:
+        return False
+    # Any write-tool call counts as backing — we don't try to map
+    # specific verb → specific tool, that's fragile across wording.
+    if called_tools & _WRITE_TOOL_NAMES:
+        return False
+    low = text.lower()
+    for verb in _CLAIM_VERBS:
+        verb_idx = low.find(verb)
+        if verb_idx < 0:
+            continue
+        # Limit the object-search window so "я сохранил то что ты
+        # сказала — готово, меню не трогай" doesn't false-fire from
+        # a distant "меню" mention.
+        window = low[max(0, verb_idx - 40): verb_idx + 120]
+        if any(obj in window for obj in _CLAIM_OBJECTS):
+            return True
+    return False
 
 
 # Supported chat-LLM providers. Extend this tuple AFTER adding a build

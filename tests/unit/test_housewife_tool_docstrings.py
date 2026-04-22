@@ -293,3 +293,61 @@ def test_build_system_prompt_no_feature_returns_core_only():
     assert build_system_prompt(None) == _CORE_SYSTEM_PROMPT
     assert build_system_prompt("") == _CORE_SYSTEM_PROMPT
     assert build_system_prompt("unknown_feature_xyz") == _CORE_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Gemma-4 discipline addendum — shipped 2026-04-22 after prod incident
+# where Gemma narrated "я сохранила рецепт" with tools=[] AND leaked
+# raw tool-call syntax into the text reply. Addendum tightens the
+# tool_calls-vs-text split specifically for Gemma; other models pay
+# no token tax.
+# ---------------------------------------------------------------------------
+
+
+def test_gemma_discipline_addendum_fires_for_gemma_model():
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt = build_system_prompt(
+        "housewife_assistant", model_name="google/gemma-4-26b-a4b-it",
+    )
+    low = prompt.lower()
+    # Addendum must mention the actual failure modes we observed:
+    # tool_calls API vs text-channel, and the "no claim without call"
+    # contract.
+    assert "tool_calls" in prompt or "tool-call" in low
+    assert "никогда не пиши" in low or "не пиши tool" in low
+    assert "в этом же ответе" in low or "обязан" in low
+
+
+def test_gemma_discipline_addendum_skipped_for_mimo():
+    """Other providers (MiMo etc) follow the shared rule-set without
+    the Gemma tax. Verified by absence of the most specific addendum
+    marker phrases."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    mimo_prompt = build_system_prompt(
+        "housewife_assistant", model_name="mimo-v2-pro",
+    )
+    gemma_prompt = build_system_prompt(
+        "housewife_assistant", model_name="google/gemma-4-26b-a4b-it",
+    )
+    assert len(gemma_prompt) > len(mimo_prompt), (
+        "Gemma prompt must be strictly longer than MiMo prompt due to "
+        "the discipline addendum. Regression = addendum logic broken."
+    )
+    # Addendum's distinctive marker text must NOT appear in MiMo
+    assert "строгая дисциплина tool-calls" not in mimo_prompt
+
+
+def test_gemma_discipline_addendum_skipped_for_no_model_name():
+    """Callers that don't know the model yet (bench tools, tests that
+    import the prompt standalone) get the baseline — addendum logic
+    is opt-in via model_name."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt_no_model = build_system_prompt("housewife_assistant")
+    prompt_gemma = build_system_prompt(
+        "housewife_assistant", model_name="google/gemma-4-26b-a4b-it",
+    )
+    assert "строгая дисциплина tool-calls" not in prompt_no_model
+    assert "строгая дисциплина tool-calls" in prompt_gemma

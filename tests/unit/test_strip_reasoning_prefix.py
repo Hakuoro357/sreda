@@ -69,3 +69,130 @@ def test_case_insensitive_match() -> None:
 
 def test_strips_extra_whitespace_after_marker() -> None:
     assert strip_reasoning_prefix("thought\n\n\n  actual answer") == "actual answer"
+
+
+# ---------------------------------------------------------------------------
+# Tool-call syntax leak (Gemma-4 2026-04-22 prod case)
+# ---------------------------------------------------------------------------
+
+
+def test_strips_leading_tool_call_syntax_single_line() -> None:
+    """Gemma-4 sometimes opens a reply with the raw tool-call
+    signature. The text channel should only contain the human-facing
+    reply — strip the echo."""
+    raw = "search_recipes(query='Ташкентский плов')\nПрости, рецепт сохранён."
+    assert strip_reasoning_prefix(raw) == "Прости, рецепт сохранён."
+
+
+def test_strips_multi_line_tool_call_syntax() -> None:
+    """save_recipe(...) often wraps across many lines because of
+    nested ingredients[]. Strip up to the closing paren + newline."""
+    raw = (
+        "save_recipe(calories_per_serving=650, ingredients=[{'title': 'мясо'}], "
+        "title='Плов')\n"
+        "Готово! Рецепт сохранён."
+    )
+    cleaned = strip_reasoning_prefix(raw)
+    assert cleaned.startswith("Готово")
+    assert "save_recipe" not in cleaned
+
+
+def test_strips_stack_of_tool_calls() -> None:
+    """The real prod leak had TWO tool calls one after another —
+    search_recipes + save_recipe — then user-facing text."""
+    raw = (
+        "search_recipes(query='X')\n"
+        "save_recipe(title='X', ingredients=[{}])\n"
+        "Прости, техническая заминка — теперь точно сохранено."
+    )
+    cleaned = strip_reasoning_prefix(raw)
+    assert "search_recipes" not in cleaned
+    assert "save_recipe" not in cleaned
+    assert "Прости" in cleaned
+
+
+def test_preserves_function_name_in_prose() -> None:
+    """Legitimate text that happens to mention a function name in
+    the middle of a sentence must not be mangled."""
+    raw = "Для проверки я использую search_recipes по ключевому слову."
+    assert strip_reasoning_prefix(raw) == raw
+
+
+def test_preserves_parenthesised_fragments_that_are_not_tool_calls() -> None:
+    raw = "Проверил (на всякий случай). Всё ок."
+    # The regex requires ``ident(`` at line start, so "(на всякий..."
+    # without a leading identifier doesn't match.
+    assert strip_reasoning_prefix(raw) == raw
+
+
+def test_thought_prefix_then_tool_call_strips_both() -> None:
+    """Combined case — thought marker on first line, tool-call on
+    second, answer after. All meta must go."""
+    raw = (
+        "thought\n"
+        "save_recipe(title='X')\n"
+        "Сохранено в книгу."
+    )
+    assert strip_reasoning_prefix(raw) == "Сохранено в книгу."
+
+
+# ---------------------------------------------------------------------------
+# detect_unbacked_claim — hallucination-without-tool-call guard
+# ---------------------------------------------------------------------------
+
+
+def test_detect_unbacked_claim_fires_on_save_without_tool_call() -> None:
+    """Prod 2026-04-22: Gemma wrote 'Я подготовила для тебя рецепт и
+    сразу сохранила его в твою книгу рецептов' with tools=[] —
+    exactly the case we want to catch."""
+    from sreda.services.llm import detect_unbacked_claim
+
+    text = "Я подготовила рецепт и сразу сохранила его в твою книгу рецептов."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_detect_unbacked_claim_silent_when_save_tool_was_actually_called() -> None:
+    from sreda.services.llm import detect_unbacked_claim
+
+    text = "Готово! Сохранила рецепт в книгу."
+    called = {"save_recipe"}
+    assert detect_unbacked_claim(text, called_tools=called) is False
+
+
+def test_detect_unbacked_claim_silent_on_benign_phrases() -> None:
+    """Must not false-fire on phrases that use claim verbs but don't
+    actually promise a side-effect."""
+    from sreda.services.llm import detect_unbacked_claim
+
+    # "сохраню" is future tense → not a claim of done work
+    assert detect_unbacked_claim(
+        "Я сохраню это на будущее, потом разберёмся.",
+        called_tools=set(),
+    ) is False
+
+    # "сохранила в памяти" - no rel. object in window
+    assert detect_unbacked_claim(
+        "Сохранила для следующего раза.",
+        called_tools=set(),
+    ) is False
+
+
+def test_detect_unbacked_claim_fires_on_shopping_add() -> None:
+    from sreda.services.llm import detect_unbacked_claim
+
+    text = "Добавила молоко в список покупок."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+    # Backed by the right tool → silent
+    assert detect_unbacked_claim(
+        text, called_tools={"add_shopping_items"},
+    ) is False
+
+
+def test_detect_unbacked_claim_fires_on_menu_create() -> None:
+    from sreda.services.llm import detect_unbacked_claim
+
+    text = "Создала меню на неделю с учётом твоих предпочтений."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+    assert detect_unbacked_claim(
+        text, called_tools={"plan_week_menu"},
+    ) is False
