@@ -482,8 +482,19 @@ def _account_dict(acc) -> dict:
 
 
 def _iso(dt) -> str | None:
+    """Serialize a datetime for JSON consumption by the Mini App.
+
+    SQLite drops tzinfo on round-trip, so every datetime we read back
+    is naive — but the services always write UTC via ``_utcnow()``.
+    Without the ``Z`` suffix, JS's ``new Date(iso)`` interprets the
+    string as LOCAL time, which shifted reminder display by the
+    local timezone offset (prod 2026-04-22: MSK user saw '09:00' for
+    a 12:00-MSK reminder because UTC 09:00 was re-parsed as MSK).
+    """
     if dt is None:
         return None
+    if dt.tzinfo is None:
+        return dt.isoformat() + "Z"
     return dt.isoformat()
 
 
