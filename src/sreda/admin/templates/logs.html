@@ -37,6 +37,12 @@
      title="Случаи, когда пользователь получил «...» вместо ответа">
     Пустые ответы (CHAT_EMPTY_REPLY)
   </a>
+  <a href="/admin/logs?token={{ token }}&file={{ selected_key or '' }}&tail={{ tail }}&grep=CHAT_TURN_TIMEOUT"
+     class="secondary outline" role="button"
+     style="padding: 4px 10px; font-size: 12px; text-decoration: none;"
+     title="Turns которые превысили 90с — аборт, пользователь получил сообщение о таймауте">
+    Зависшие turns (CHAT_TURN_TIMEOUT)
+  </a>
   <a href="/admin/logs?token={{ token }}&file={{ selected_key or '' }}&tail={{ tail }}&grep=ERROR"
      class="secondary outline" role="button"
      style="padding: 4px 10px; font-size: 12px; text-decoration: none;">

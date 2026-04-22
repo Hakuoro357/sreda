@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -46,6 +47,13 @@ from sreda.services.embeddings import get_embeddings_client
 from sreda.services.llm import get_chat_llm
 
 logger = logging.getLogger(__name__)
+
+
+# Module-level ceiling on total chat-turn wall time (seconds). Applied
+# via cooperative check at the top of each tool-loop iteration. Module
+# constant (not function-local) so tests and admin tooling can import
+# the same value. See ``execute_conversation_chat`` for usage.
+CHAT_TURN_TIMEOUT_SECONDS = 90
 
 
 @dataclass(frozen=True, slots=True)
@@ -1460,6 +1468,17 @@ def execute_conversation_chat(
     # so the user always gets a real reply (not a "budget exhausted" stub).
     _MAX_TOOL_ITERATIONS = 12
 
+    # Hard ceiling on total turn time. Observed 2026-04-22: a single
+    # turn hung for 1198 seconds (20 minutes) with iters=0, starving a
+    # worker thread and leaving the user waiting forever. 90s is a
+    # generous cap — normal turns finish in 10–40s, pathological in
+    # 60–90s. Beyond that we abort, surface a loud CHAT_TURN_TIMEOUT
+    # warning (admin /logs quick-filter), and fall through to the
+    # empty-reply rescue / "..." fallback so the user at least sees
+    # an error.
+    _CHAT_TURN_TIMEOUT_SECONDS = CHAT_TURN_TIMEOUT_SECONDS
+    _turn_start_monotonic = time.monotonic()
+
     def _record_and_log(ai_msg: AIMessage, *, iteration: int) -> None:
         usage = getattr(ai_msg, "usage_metadata", None) or {}
         prompt_tokens = int(usage.get("input_tokens") or 0)
@@ -1498,7 +1517,28 @@ def execute_conversation_chat(
         "onboarding_deferred",
         "onboarding_complete",
     }
+    _turn_timed_out = False
     for _iter in range(_MAX_TOOL_ITERATIONS):
+        # Cooperative turn-level timeout. Checked before each iteration
+        # (can't interrupt a running LLM call from here — MiMo has its
+        # own per-request timeout via settings.mimo_request_timeout_seconds).
+        # Catches cases where the turn spends too long in aggregate, or
+        # where the first LLM call itself hangs past the per-request cap.
+        _elapsed = time.monotonic() - _turn_start_monotonic
+        if _elapsed > _CHAT_TURN_TIMEOUT_SECONDS:
+            logger.warning(
+                "CHAT_TURN_TIMEOUT tenant=%s user=%s feature=%s iter=%d "
+                "elapsed=%.1fs cap=%ds — aborting turn, falling back to "
+                "rescue/empty-reply path",
+                action.tenant_id,
+                user_id or "?",
+                feature_key,
+                _iter,
+                _elapsed,
+                _CHAT_TURN_TIMEOUT_SECONDS,
+            )
+            _turn_timed_out = True
+            break
         _log_llm_invoke(
             tenant_id=action.tenant_id,
             feature_key=feature_key,
@@ -1602,7 +1642,9 @@ def execute_conversation_chat(
         except Exception:  # noqa: BLE001
             logger.exception("onboarding depth bookkeeping failed")
 
-    text = (final_ai.content or "").strip()
+    # final_ai is None when the turn aborted via _turn_timed_out before
+    # any iter produced a result — guard the content read.
+    text = (getattr(final_ai, "content", None) or "").strip()
     rescued = False
     if not text:
         # Some models emit the user-facing answer TOGETHER with their
@@ -1638,17 +1680,27 @@ def execute_conversation_chat(
             if final_ai is not None
             else []
         )
-        logger.warning(
-            "CHAT_EMPTY_REPLY tenant=%s user=%s feature=%s ai_msgs=%d "
-            "tool_msgs=%d final_tool_calls=%s — user sees '...' fallback",
-            action.tenant_id,
-            user_id or "?",
-            feature_key,
-            ai_count,
-            tool_count,
-            last_tools,
-        )
-        text = "..."
+        if _turn_timed_out:
+            # Don't double-log — the CHAT_TURN_TIMEOUT warning was
+            # already emitted at the break point with elapsed time.
+            # Just give the user a concrete error message rather than
+            # the generic "..." so they know to retry.
+            text = (
+                "Не успел обдумать за отведённое время. "
+                "Попробуй спросить проще или повторить через минуту."
+            )
+        else:
+            logger.warning(
+                "CHAT_EMPTY_REPLY tenant=%s user=%s feature=%s ai_msgs=%d "
+                "tool_msgs=%d final_tool_calls=%s — user sees '...' fallback",
+                action.tenant_id,
+                user_id or "?",
+                feature_key,
+                ai_count,
+                tool_count,
+                last_tools,
+            )
+            text = "..."
     # Trace breadcrumb — in /admin/logs filtering by trace_id you'll
     # see whether this turn had to rescue an earlier AI message.
     with trace.step("chat.reply", rescued=rescued, chars=len(text)):

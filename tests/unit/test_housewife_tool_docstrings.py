@@ -179,6 +179,32 @@ def test_system_prompt_prefers_update_over_remove_add():
     )
 
 
+def test_chat_turn_timeout_constant_defined():
+    """Lock in that the turn-level timeout constant exists and is
+    reasonable. Prod observed 20-minute hanging turn; constant caps
+    wall time per turn."""
+    from sreda.runtime.handlers import CHAT_TURN_TIMEOUT_SECONDS
+
+    # Must be a positive number, and not absurdly small (normal turns
+    # take up to 40s) or absurdly large (20-min outlier is what we're
+    # protecting against).
+    assert isinstance(CHAT_TURN_TIMEOUT_SECONDS, (int, float))
+    assert 30 <= CHAT_TURN_TIMEOUT_SECONDS <= 300
+
+
+def test_admin_logs_has_chat_turn_timeout_filter():
+    """Admin UI quick-filter button for CHAT_TURN_TIMEOUT must be
+    present so operators can find hung turns without writing grep
+    by hand."""
+    from pathlib import Path
+    tpl = Path("src/sreda/admin/templates/logs.html").read_text(encoding="utf-8")
+    assert "CHAT_TURN_TIMEOUT" in tpl, (
+        "admin/templates/logs.html must have a quick-filter link "
+        "for CHAT_TURN_TIMEOUT — matches the existing "
+        "CHAT_EMPTY_REPLY filter pattern."
+    )
+
+
 def test_update_shopping_tools_exposed():
     """New tools must be in the builder's return list — otherwise the
     LLM doesn't know they exist."""
