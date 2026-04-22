@@ -1,5 +1,23 @@
 import logging
+import warnings
 from logging.config import dictConfig
+
+
+def _suppress_third_party_warnings() -> None:
+    """Silence third-party DeprecationWarning spam that fills prod logs.
+
+    Observed 2026-04-22: ~350 lines / run of
+      langchain_core.runnables.config:
+      DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated
+      and slated for removal in Python 3.16
+    These are langchain's responsibility, not ours — filter them so
+    our own grep for ERROR / WARNING stays readable.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r"'asyncio\.iscoroutinefunction' is deprecated.*",
+    )
 
 
 def _build_config(
@@ -120,6 +138,7 @@ def configure_logging(
     dictConfig and the access log reverts to the default
     ``INFO:     1.2.3.4:5678 - "GET /..."`` (no timestamp).
     """
+    _suppress_third_party_warnings()
     level_upper = level.upper()
     level_no = getattr(logging, level_upper, logging.INFO)
     cfg = _build_config(
