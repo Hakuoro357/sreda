@@ -104,12 +104,30 @@ def _strip_tool_call_prefix_lines(text: str) -> str:
     return text.lstrip()
 
 
+# Internal DB identifiers that occasionally leak into user-facing
+# text — observed 2026-04-22 on x-ai/grok-4.1-fast dumping
+# ``[rec_f5197...]`` after every meal line. Users don't need these
+# (they're FK keys for tool calls) and seeing them reads as a
+# rendering bug. Strip any occurrence of ``<space>[rec_hex]`` /
+# ``<space>[menu_hex]`` / ``<space>[sh_hex]`` — with or without the
+# brackets — from the middle or end of any line. Prefix and core
+# pattern list kept narrow so a legitimate mention of e.g. 'recipe'
+# in prose isn't touched.
+_INTERNAL_ID_RE = re.compile(
+    r"\s*[\[\(]?"
+    r"(?:rec|menu|mpi|sh|ring|ob|run|thread|job|evt)_[a-f0-9]{8,}"
+    r"[\]\)]?",
+)
+
+
 def strip_reasoning_prefix(text: str) -> str:
     """Remove leading ReAct-style meta from an LLM reply — both the
     short ``thought\\n`` marker (Gemma-4 default) and fully-expanded
     tool-call syntax that sometimes leaks into the text channel when
     the model re-narrates its actions instead of just writing a
-    human reply.
+    human reply. Also scrubs internal DB identifiers
+    (``rec_...``, ``menu_...``, ``sh_...``) that some models echo
+    next to items as a pseudo-helpful reference.
 
     Returns ``text`` unchanged if nothing matches. Idempotent —
     applying twice equals once.
@@ -123,6 +141,9 @@ def strip_reasoning_prefix(text: str) -> str:
     # (Gemma sometimes opens directly with ``search_recipes(...)``),
     # so run this unconditionally.
     text = _strip_tool_call_prefix_lines(text)
+    # Internal-ID scrubber runs last so the cleanup is visible in the
+    # final reply regardless of which meta layer was also stripped.
+    text = _INTERNAL_ID_RE.sub("", text)
     return text
 
 

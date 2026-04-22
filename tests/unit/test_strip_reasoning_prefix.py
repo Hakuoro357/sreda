@@ -72,6 +72,56 @@ def test_strips_extra_whitespace_after_marker() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Internal-id scrubber — Grok 4.1 prod 2026-04-22: model dumped
+# ``[rec_f5197...]`` after every meal line. User saw tech IDs as
+# rendering noise.
+# ---------------------------------------------------------------------------
+
+
+def test_strips_bracketed_recipe_id_after_line() -> None:
+    raw = "* Завтрак: Овсянка с ягодами 🥣 [rec_f5197d66b5d44a468bfeb988]"
+    cleaned = strip_reasoning_prefix(raw)
+    assert "rec_" not in cleaned
+    assert "Овсянка с ягодами" in cleaned
+
+
+def test_strips_recipe_id_without_brackets() -> None:
+    raw = "Борщ классический rec_a1b2c3d4e5f6a7b8"
+    assert "rec_" not in strip_reasoning_prefix(raw)
+
+
+def test_strips_menu_plan_and_shopping_ids() -> None:
+    raw = "План [menu_abc123def456] — продукт sh_9876543210ab готов"
+    cleaned = strip_reasoning_prefix(raw)
+    assert "menu_" not in cleaned
+    assert "sh_" not in cleaned
+    assert "План" in cleaned and "продукт" in cleaned
+
+
+def test_preserves_prose_that_happens_to_contain_rec_word() -> None:
+    """The strip targets only '<prefix>_<hex>' patterns. Prose like
+    'я использую recipe_id' or 'record the change' must pass through
+    untouched."""
+    raw = "Пользователь может использовать recipe_id для поиска — это technical term."
+    assert strip_reasoning_prefix(raw) == raw
+
+
+def test_real_prod_grok_output_cleans_up() -> None:
+    raw = (
+        "**📅 Расписание еды на завтра (четверг, 23 апреля):**\n\n"
+        "* **Завтрак:** Овсянка с ягодами и мёдом 🥣 [rec_f5197d66b5d44a468bfeb988]\n"
+        "* **Обед:** Куриный суп с вермишелью 🍲 [rec_213d5c3d718541bfbc597c0e]\n"
+        "* **Ужин:** Запечённая курица с картофелем и салатом 🍗 [rec_4dfa7acf86d94c3daeec6ac0]"
+    )
+    cleaned = strip_reasoning_prefix(raw)
+    assert "[rec_" not in cleaned
+    # All the dish names still intact
+    assert "Овсянка с ягодами и мёдом" in cleaned
+    assert "Куриный суп с вермишелью" in cleaned
+    assert "Запечённая курица с картофелем и салатом" in cleaned
+
+
+# ---------------------------------------------------------------------------
 # Tool-call syntax leak (Gemma-4 2026-04-22 prod case)
 # ---------------------------------------------------------------------------
 
