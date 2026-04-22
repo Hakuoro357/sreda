@@ -122,6 +122,37 @@ def _build_chat_llm(
     return None
 
 
+def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
+    """Consult the admin-switcher DB table for live overrides, falling
+    back to env-var-based Settings when a key isn't set. Returns
+    ``(primary, fallback_or_None)``.
+
+    An empty-string override in the DB is treated as "explicitly
+    disable" — useful when the admin wants to kill the fallback chain
+    without nulling the setting entirely.
+    """
+    primary = settings.chat_provider
+    fallback = settings.chat_fallback_provider
+    try:
+        from sreda.db.session import get_session_factory
+        from sreda.services import runtime_config as rc
+
+        session = get_session_factory()()
+        try:
+            db_primary = rc.get_config(session, rc.KEY_CHAT_PROVIDER)
+            db_fallback = rc.get_config(session, rc.KEY_CHAT_FALLBACK_PROVIDER)
+        finally:
+            session.close()
+        if db_primary:
+            primary = db_primary
+        if db_fallback is not None:
+            # Empty string = explicit "no fallback".
+            fallback = db_fallback or None
+    except Exception:  # noqa: BLE001 — DB trouble must not kill a turn
+        logger.exception("chat LLM: runtime_config read failed, using env defaults")
+    return primary, fallback
+
+
 def get_chat_llm(
     settings: Settings | None = None,
     *,
@@ -138,53 +169,60 @@ def get_chat_llm(
     and short-circuit the turn with a "LLM disabled" reply — crashing
     hurts UX more than admitting the limitation.
 
+    Resolution order for the provider name:
+      1. Explicit ``provider=`` argument (bench/probe use).
+      2. ``runtime_config.chat_primary_provider`` (admin live-switch).
+      3. ``settings.chat_provider`` (env-var / default).
+
     Parameters
     ----------
     provider :
-        Override for ``settings.chat_provider``. Useful in benches and
-        for the admin LLM-switcher when it wants to hot-probe a
-        specific backend without mutating settings.
+        Override for the resolved provider. Skips the admin-switcher
+        DB lookup entirely — intended for bench tools and hot-probing
+        a specific backend without mutating persistent state.
     with_fallback :
-        When True and ``settings.chat_fallback_provider`` is set,
-        wraps the primary runnable with LangChain's
+        When True and a fallback provider is configured (via admin
+        switcher or env), wraps the primary runnable with LangChain's
         ``.with_fallbacks([...])``. The fallback kicks in on ANY
         exception from the primary — rate limits, timeouts, 5xx — and
-        replays the same message list against the backup provider
-        transparently. One level deep on purpose; three-tier would
-        hide the freshly-interesting failure mode.
+        replays the same message list against the backup transparently.
+        One level deep on purpose; three-tier would hide the freshly-
+        interesting failure mode.
     """
     settings = settings or get_settings()
-    effective = provider or settings.chat_provider
-    primary = _build_chat_llm(
-        effective, settings, model=model, temperature=temperature, **kwargs
+    if provider is not None:
+        effective_primary = provider
+        effective_fallback = None  # bench/probe: fallback irrelevant
+    else:
+        effective_primary, effective_fallback = _resolve_provider_overrides(settings)
+    primary_llm = _build_chat_llm(
+        effective_primary, settings,
+        model=model, temperature=temperature, **kwargs,
     )
-    if primary is None:
+    if primary_llm is None:
         return None
-    if not with_fallback or not settings.chat_fallback_provider:
-        return primary
-    if settings.chat_fallback_provider == effective:
+    if not with_fallback or not effective_fallback:
+        return primary_llm
+    if effective_fallback == effective_primary:
         # Fallback same as primary is a no-op and a config smell.
         logger.warning(
             "chat LLM: fallback provider equals primary (%s) — skipping wrap",
-            effective,
+            effective_primary,
         )
-        return primary
-    fallback = _build_chat_llm(
-        settings.chat_fallback_provider,
-        settings,
+        return primary_llm
+    fallback_llm = _build_chat_llm(
+        effective_fallback, settings,
         model=None,  # fallback uses its provider's default model
-        temperature=temperature,
-        **kwargs,
+        temperature=temperature, **kwargs,
     )
-    if fallback is None:
+    if fallback_llm is None:
         logger.warning(
             "chat LLM: fallback provider %r not configured — primary-only",
-            settings.chat_fallback_provider,
+            effective_fallback,
         )
-        return primary
+        return primary_llm
     logger.info(
         "chat LLM: wrapping %s with fallback → %s",
-        effective,
-        settings.chat_fallback_provider,
+        effective_primary, effective_fallback,
     )
-    return primary.with_fallbacks([fallback])
+    return primary_llm.with_fallbacks([fallback_llm])

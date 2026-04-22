@@ -15,6 +15,7 @@ Docs:     https://console.groq.com/docs/speech-to-text
 from __future__ import annotations
 
 import logging
+import os
 
 import httpx
 
@@ -24,6 +25,21 @@ logger = logging.getLogger(__name__)
 
 _ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 _DEFAULT_MODEL = "whisper-large-v3-turbo"
+
+
+def _resolve_outbound_proxy() -> str | None:
+    """Groq blocks Russian IPs with HTTP 403. On the Mac-mini prod the
+    local ``HTTPS_PROXY`` env var already points at pproxy (HTTP→SOCKS5
+    to the VDS tunnel) that MiMo and Telegram use. httpx's AsyncClient
+    doesn't always honour env proxies in async mode, so we read the
+    var ourselves and pass it explicitly. Returns None when no proxy
+    is configured — dev machines reaching Groq directly."""
+    for var in ("SREDA_GROQ_HTTP_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
+                "https_proxy", "http_proxy"):
+        value = os.environ.get(var)
+        if value:
+            return value
+    return None
 
 
 class GroqWhisperRecognizer:
@@ -48,8 +64,12 @@ class GroqWhisperRecognizer:
             "response_format": "json",
             "temperature": "0",
         }
+        proxy = _resolve_outbound_proxy()
+        client_kwargs: dict = {"timeout": 30.0}
+        if proxy:
+            client_kwargs["proxy"] = proxy
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.post(
                     _ENDPOINT, headers=headers, files=files, data=data,
                 )
