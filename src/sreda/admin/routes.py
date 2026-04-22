@@ -6,7 +6,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -53,6 +53,126 @@ def admin_budget(
         request, "budget.html",
         {"token": token, "rows": rows, "section": "budget"},
     )
+
+
+_LLM_PROVIDERS_METADATA = [
+    # Order here drives the dropdown order in llm.html. Keep the
+    # current production default (mimo) first so the UI opens with a
+    # sensible-looking selection.
+    {
+        "key": "mimo",
+        "label": "MiMo-V2-Pro",
+        "default_model_attr": "mimo_chat_model",
+        "resolver": "resolve_mimo_api_key",
+    },
+    {
+        "key": "openrouter",
+        "label": "OpenRouter (gemma-4-26b-moe default)",
+        "default_model_attr": "openrouter_chat_model",
+        "resolver": "resolve_openrouter_api_key",
+    },
+]
+
+
+def _llm_context(session, token: str, *, flash: str | None = None) -> dict:
+    """Shared state for GET + POST /admin/llm. Computes availability
+    (key configured?), reads current DB overrides, and exposes a
+    provider catalogue the template renders into two dropdowns."""
+    from sreda.services import runtime_config as rc
+
+    settings = get_settings()
+    providers = []
+    for meta in _LLM_PROVIDERS_METADATA:
+        resolver = getattr(settings, meta["resolver"], None)
+        available = bool(resolver and resolver())
+        providers.append({
+            "key": meta["key"],
+            "label": meta["label"],
+            "default_model": getattr(settings, meta["default_model_attr"], ""),
+            "available": available,
+        })
+    current_primary = (
+        rc.get_config(session, rc.KEY_CHAT_PROVIDER)
+        or settings.chat_provider
+    )
+    current_fallback = (
+        rc.get_config(session, rc.KEY_CHAT_FALLBACK_PROVIDER)
+        or settings.chat_fallback_provider
+        or ""
+    )
+    return {
+        "token": token,
+        "section": "llm",
+        "providers": providers,
+        "current_primary": current_primary,
+        "current_fallback": current_fallback,
+        "flash": flash,
+    }
+
+
+@router.get("/llm", response_class=HTMLResponse)
+def admin_llm(
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    ctx = _llm_context(session, token)
+    return templates.TemplateResponse(request, "llm.html", ctx)
+
+
+@router.post("/llm", response_class=HTMLResponse)
+def admin_llm_save(
+    request: Request,
+    primary: str = Form(...),
+    fallback: str = Form(default=""),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Persist the chosen primary/fallback to ``runtime_config``.
+    Both values take effect on the NEXT chat turn in any process —
+    5-second in-process cache on the service side caps staleness."""
+    from sreda.services import runtime_config as rc
+
+    # Validate against the known-provider catalogue — protects against
+    # a stale bookmark sending a typo'd value via POST.
+    known_keys = {meta["key"] for meta in _LLM_PROVIDERS_METADATA}
+    if primary not in known_keys:
+        ctx = _llm_context(
+            session, token,
+            flash=f"Неизвестный primary-провайдер: {primary!r}",
+        )
+        return templates.TemplateResponse(request, "llm.html", ctx)
+
+    fallback_clean = fallback.strip()
+    if fallback_clean and fallback_clean not in known_keys:
+        ctx = _llm_context(
+            session, token,
+            flash=f"Неизвестный fallback-провайдер: {fallback_clean!r}",
+        )
+        return templates.TemplateResponse(request, "llm.html", ctx)
+    if fallback_clean == primary:
+        ctx = _llm_context(
+            session, token,
+            flash="Fallback не может совпадать с primary — сохранение отменено.",
+        )
+        return templates.TemplateResponse(request, "llm.html", ctx)
+
+    rc.set_config(session, rc.KEY_CHAT_PROVIDER, primary)
+    # Empty string in DB = "explicitly no fallback" so it overrides
+    # env-based defaults. None drops the row entirely.
+    rc.set_config(
+        session, rc.KEY_CHAT_FALLBACK_PROVIDER,
+        fallback_clean if fallback_clean else "",
+    )
+    ctx = _llm_context(
+        session, token,
+        flash=(
+            f"Сохранено — primary: {primary}"
+            + (f", fallback: {fallback_clean}" if fallback_clean else ", без fallback")
+            + ". Применится в течение ~5с."
+        ),
+    )
+    return templates.TemplateResponse(request, "llm.html", ctx)
 
 
 @router.get("/llm-calls", response_class=HTMLResponse)

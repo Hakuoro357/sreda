@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}LLM{% endblock %}
+{% block content %}
+<h2>LLM: primary и fallback</h2>
+
+<p class="muted" style="max-width: 720px;">
+  Переключение провайдера живое — применяется со следующего хода
+  любого активного диалога, рестарт сервисов не нужен. Fallback
+  активируется автоматически на 429/5xx/timeout primary-провайдера
+  и прозрачно переигрывает тот же запрос на запасном.
+</p>
+
+{% if flash %}
+<article style="padding: .75rem 1rem; background: #d4edda; color: #155724; border-radius: 4px; margin-bottom: 16px;">
+  {{ flash }}
+</article>
+{% endif %}
+
+<form method="post" action="/admin/llm" style="max-width: 720px;">
+  <input type="hidden" name="token" value="{{ token }}">
+
+  <div style="display: grid; grid-template-columns: 180px 1fr; gap: 16px 20px; align-items: center; margin-bottom: 20px;">
+    <label for="primary"><strong>Primary</strong></label>
+    <select name="primary" id="primary">
+      {% for p in providers %}
+      <option value="{{ p.key }}"
+              {% if p.key == current_primary %}selected{% endif %}
+              {% if not p.available %}disabled{% endif %}>
+        {{ p.label }}{% if not p.available %} — ключ не настроен{% endif %}
+      </option>
+      {% endfor %}
+    </select>
+
+    <label for="fallback"><strong>Fallback</strong></label>
+    <select name="fallback" id="fallback">
+      <option value="" {% if not current_fallback %}selected{% endif %}>— нет (без fallback)</option>
+      {% for p in providers %}
+      <option value="{{ p.key }}"
+              {% if p.key == current_fallback %}selected{% endif %}
+              {% if not p.available %}disabled{% endif %}>
+        {{ p.label }}{% if not p.available %} — ключ не настроен{% endif %}
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <button type="submit">Сохранить</button>
+</form>
+
+<h3 style="margin-top: 32px;">Доступные провайдеры</h3>
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Ключ</th>
+      <th>Название</th>
+      <th>Модель по умолчанию</th>
+      <th>Ключ API</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in providers %}
+    <tr>
+      <td><code>{{ p.key }}</code></td>
+      <td>{{ p.label }}</td>
+      <td><code>{{ p.default_model }}</code></td>
+      <td>
+        {% if p.available %}
+        <span class="badge badge-green">настроен</span>
+        {% else %}
+        <span class="badge badge-red">нет</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+
+<details style="margin-top: 24px; max-width: 720px;">
+  <summary style="cursor: pointer; color: var(--pico-muted-color); font-size: 13px;">
+    Приоритет значений
+  </summary>
+  <ol style="font-size: 13px; color: var(--pico-muted-color);">
+    <li>Значения из этой формы (сохраняются в таблицу <code>runtime_config</code>).</li>
+    <li>Env-переменные <code>SREDA_CHAT_PROVIDER</code> / <code>SREDA_CHAT_FALLBACK_PROVIDER</code>.</li>
+    <li>Дефолт <code>mimo</code> для primary, без fallback.</li>
+  </ol>
+  <p style="font-size: 13px; color: var(--pico-muted-color);">
+    Кэш значений — 5 секунд в памяти процесса. Изменения видны в
+    течение ~5с в каждом воркере.
+  </p>
+</details>
+
+{% endblock %}

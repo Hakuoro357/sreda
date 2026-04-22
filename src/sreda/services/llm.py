@@ -122,6 +122,13 @@ def _build_chat_llm(
     return None
 
 
+# Once-per-process flag so a persistent DB problem (missing table,
+# revoked permissions) doesn't spam a full traceback on every chat
+# turn. First hit logs at WARNING with the cause; subsequent hits
+# are silent until the process restarts.
+_RUNTIME_CONFIG_WARNED = False
+
+
 def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
     """Consult the admin-switcher DB table for live overrides, falling
     back to env-var-based Settings when a key isn't set. Returns
@@ -130,26 +137,47 @@ def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
     An empty-string override in the DB is treated as "explicitly
     disable" — useful when the admin wants to kill the fallback chain
     without nulling the setting entirely.
+
+    DB errors (missing table, locked db, etc.) degrade silently to
+    env defaults so a half-migrated install still serves turns.
     """
+    global _RUNTIME_CONFIG_WARNED
+
     primary = settings.chat_provider
     fallback = settings.chat_fallback_provider
     try:
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
         from sreda.db.session import get_session_factory
         from sreda.services import runtime_config as rc
+    except ImportError:
+        return primary, fallback
 
+    try:
         session = get_session_factory()()
-        try:
-            db_primary = rc.get_config(session, rc.KEY_CHAT_PROVIDER)
-            db_fallback = rc.get_config(session, rc.KEY_CHAT_FALLBACK_PROVIDER)
-        finally:
-            session.close()
-        if db_primary:
-            primary = db_primary
-        if db_fallback is not None:
-            # Empty string = explicit "no fallback".
-            fallback = db_fallback or None
-    except Exception:  # noqa: BLE001 — DB trouble must not kill a turn
-        logger.exception("chat LLM: runtime_config read failed, using env defaults")
+    except Exception:  # noqa: BLE001 — session factory not ready yet
+        return primary, fallback
+    try:
+        db_primary = rc.get_config(session, rc.KEY_CHAT_PROVIDER)
+        db_fallback = rc.get_config(session, rc.KEY_CHAT_FALLBACK_PROVIDER)
+    except (OperationalError, ProgrammingError) as exc:
+        if not _RUNTIME_CONFIG_WARNED:
+            logger.warning(
+                "chat LLM: runtime_config unavailable (%s) — using env defaults; "
+                "create the table via Base.metadata.create_all to enable the "
+                "admin LLM-switcher. This warning fires once per process.",
+                type(exc).__name__,
+            )
+            _RUNTIME_CONFIG_WARNED = True
+        return primary, fallback
+    finally:
+        session.close()
+
+    if db_primary:
+        primary = db_primary
+    if db_fallback is not None:
+        # Empty string = explicit "no fallback".
+        fallback = db_fallback or None
     return primary, fallback
 
 

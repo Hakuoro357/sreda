@@ -147,18 +147,19 @@ async def _maybe_transcribe_voice(
         await _send_error("Сервис распознавания речи не настроен. Обратитесь к администратору.")
         return None
 
-    # 5 + 6: Download audio + transcribe. Wrapped in one trace step —
-    # download-vs-recognize latency is usually dwarfed by the recognize
-    # call, so splitting them into two steps adds log noise without
-    # actionable insight. If we ever need per-phase timing, the step
-    # block can be split.
+    # 5 + 6: Download audio + transcribe. Split across two trace
+    # steps as of 2026-04-22 — pproxy → VDS tunnel round-trip on the
+    # Telegram ``getFile`` + ``download_file`` calls is comparable to
+    # the STT call itself, so rolling them together was hiding whether
+    # a slow voice turn was the STT provider's fault or Telegram-side
+    # latency. Ops dashboards now get ``voice.download`` vs
+    # ``voice.transcribe`` independently.
     provider = settings.speech_provider or "unknown"
-    with trace.step("voice.transcribe", provider=provider) as _trace_meta:
-        # 5. Download audio
+    with trace.step("voice.download", provider="telegram") as _dl_meta:
         file_id = voice.get("file_id")
         if not file_id:
             await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
-            _trace_meta["status"] = "no_file_id"
+            _dl_meta["status"] = "no_file_id"
             return None
 
         try:
@@ -170,9 +171,12 @@ async def _maybe_transcribe_voice(
         except TelegramDeliveryError as exc:
             logger.warning("Voice download failed: %s", exc)
             await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
-            _trace_meta["status"] = "download_failed"
+            _dl_meta["status"] = "download_failed"
             return None
 
+        _dl_meta["bytes_in"] = len(audio_bytes)
+
+    with trace.step("voice.transcribe", provider=provider) as _trace_meta:
         _trace_meta["bytes_in"] = len(audio_bytes)
 
         # 6. Transcribe
