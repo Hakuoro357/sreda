@@ -16,7 +16,7 @@
 </article>
 {% endif %}
 
-<form method="post" action="/admin/llm" style="max-width: 720px;">
+<form method="post" action="/admin/llm?token={{ token }}" style="max-width: 720px;">
   <input type="hidden" name="token" value="{{ token }}">
 
   <div style="display: grid; grid-template-columns: 180px 1fr; gap: 16px 20px; align-items: center; margin-bottom: 20px;">
