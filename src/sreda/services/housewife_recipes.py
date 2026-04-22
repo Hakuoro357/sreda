@@ -51,11 +51,44 @@ def _normalise_title(title: str) -> str:
 
     Lowercased, stripped, internal whitespace collapsed. "Плов с курицей"
     and "  ПЛОВ  с  курицей  " normalise to the same key.
-    Semantic near-duplicates ("Пельмени домашние" vs "Пельмени домашние
-    со сметаной") are deliberately NOT deduped — that needs fuzzy or
-    embedding match, out of scope for v1.2.
     """
     return _TITLE_WS_RE.sub(" ", (title or "").strip().lower())
+
+
+# Jaccard threshold for fuzzy-title dedup. A lower value catches more
+# near-duplicates but risks false positives on related-but-distinct
+# dishes. 0.70 empirically works: "Плов с курицей 5 чел" vs "... 6 чел"
+# → matched (5/7 words overlap); "Жареная картошка" vs "Тушёная картошка"
+# → not matched (1/3 words overlap).
+_FUZZY_JACCARD_THRESHOLD = 0.70
+
+
+def _are_titles_similar(title_a: str, title_b: str) -> bool:
+    """Detect semantic near-duplicates of recipe titles.
+
+    Two-pass rule:
+      1. Word-set subset — shorter title's words fully contained in
+         longer title's words. Catches "Борщ" vs "Борщ классический"
+         and "Пельмени" vs "Пельмени со сметаной".
+      2. Jaccard similarity over word sets ≥ ``_FUZZY_JACCARD_THRESHOLD``.
+         Catches "Плов с курицей 5 чел" vs "Плов с курицей 6 чел" and
+         similar prod cases where the titles agree on ~all content
+         words but a single token differs.
+
+    Empty / identical titles are not handled here — exact-title dedup
+    runs earlier in the pipeline and short-circuits those.
+    """
+    words_a = set(_normalise_title(title_a).split())
+    words_b = set(_normalise_title(title_b).split())
+    if not words_a or not words_b:
+        return False
+    # Subset catches length-disparate cases.
+    if words_a <= words_b or words_b <= words_a:
+        return True
+    # Jaccard for length-similar cases.
+    inter = len(words_a & words_b)
+    union = len(words_a | words_b)
+    return (inter / union) >= _FUZZY_JACCARD_THRESHOLD
 
 
 @dataclass(slots=True)
@@ -145,6 +178,19 @@ class HousewifeRecipeService:
                 tenant_id, user_id, title_clean, existing.id,
             )
             return existing, False
+
+        # Fuzzy-title dedup — catches variations like "Пельмени" vs
+        # "Пельмени со сметаной" and "Плов с курицей 5 чел" vs
+        # "Плов с курицей 6 чел" that exact-title match misses.
+        for existing_title_norm, existing_row in existing_index.items():
+            if _are_titles_similar(title_clean, existing_row.title):
+                logger.info(
+                    "save_recipe: fuzzy dedup hit tenant=%s user=%s "
+                    "new=%r ~ existing=%r (id=%s)",
+                    tenant_id, user_id, title_clean,
+                    existing_row.title, existing_row.id,
+                )
+                return existing_row, False
 
         normalised_ings = _normalise_ingredients(ingredients)
 
@@ -237,8 +283,19 @@ class HousewifeRecipeService:
                 continue
             seen_in_batch.add(normal_key)
 
-            # Against-DB dedup
+            # Against-DB dedup — exact then fuzzy.
             existing = existing_index.get(normal_key)
+            if existing is None:
+                for existing_row in existing_index.values():
+                    if _are_titles_similar(title, existing_row.title):
+                        existing = existing_row
+                        logger.info(
+                            "save_recipes_batch: fuzzy dedup hit "
+                            "tenant=%s user=%s new=%r ~ existing=%r (id=%s)",
+                            tenant_id, user_id, title,
+                            existing_row.title, existing_row.id,
+                        )
+                        break
             if existing is not None:
                 logger.info(
                     "save_recipes_batch: dedup hit tenant=%s user=%s "

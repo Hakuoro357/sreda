@@ -375,16 +375,16 @@ def test_save_recipes_batch_skips_invalid_items(session):
     result = svc.save_recipes_batch(
         tenant_id="t1", user_id="u1",
         recipes=[
-            {"title": "Good", "ingredients": [{"title": "x"}], "source": "user_dictated"},
+            {"title": "Борщ", "ingredients": [{"title": "x"}], "source": "user_dictated"},
             {"title": "", "ingredients": [], "source": "user_dictated"},     # empty title
             {"title": "Bad source", "ingredients": [], "source": "mystery"}, # invalid source
             "not a dict",                                                     # wrong shape
-            {"title": "Also Good", "ingredients": [], "source": "ai_generated"},
+            {"title": "Омлет", "ingredients": [], "source": "ai_generated"},
         ],
     )
     assert len(result.created) == 2
     titles = {r.title for r in result.created}
-    assert titles == {"Good", "Also Good"}
+    assert titles == {"Борщ", "Омлет"}
 
 
 def test_save_recipes_batch_tags_json_encoded(session):
@@ -493,6 +493,84 @@ def test_save_recipes_batch_dedups_within_input(session):
     assert len(result.created) == 2  # плов collapsed, Омлет new
     titles = {r.title for r in result.created}
     assert titles == {"Плов", "Омлет"}
+
+
+def test_are_titles_similar_subset():
+    """'Борщ' is a subset of 'Борщ классический' → same dish."""
+    from sreda.services.housewife_recipes import _are_titles_similar
+    assert _are_titles_similar("Борщ", "Борщ классический")
+    assert _are_titles_similar("Пельмени", "Пельмени со сметаной")
+    # Symmetric
+    assert _are_titles_similar("Пельмени со сметаной", "Пельмени")
+
+
+def test_are_titles_similar_jaccard_half_tokens_shared():
+    """'Плов с курицей на 5 чел' vs 'Плов с курицей на 6 чел' —
+    differ only in one word. 5/7 tokens shared → merge."""
+    from sreda.services.housewife_recipes import _are_titles_similar
+    assert _are_titles_similar(
+        "Плов с курицей на 5 чел",
+        "Плов с курицей на 6 чел",
+    )
+
+
+def test_are_titles_similar_different_dishes():
+    """'Борщ' and 'Щи' share no tokens → keep separate."""
+    from sreda.services.housewife_recipes import _are_titles_similar
+    assert not _are_titles_similar("Борщ", "Щи")
+    assert not _are_titles_similar("Оливье", "Цезарь")
+
+
+def test_are_titles_similar_cooking_method_differs():
+    """Cooking method matters — 'Жареная картошка' vs 'Тушёная картошка'
+    share only 'картошка' (1/3 Jaccard) → different recipes."""
+    from sreda.services.housewife_recipes import _are_titles_similar
+    assert not _are_titles_similar("Жареная картошка", "Тушёная картошка")
+
+
+def test_are_titles_similar_case_insensitive():
+    from sreda.services.housewife_recipes import _are_titles_similar
+    assert _are_titles_similar("БОРЩ", "борщ классический")
+
+
+def test_save_recipe_fuzzy_dedup_suppresses_variation(session):
+    """The whole point of fuzzy-match: don't save 'Пельмени со сметаной'
+    when 'Пельмени' already exists. Return existing, is_new=False."""
+    svc = HousewifeRecipeService(session)
+    first, is_new1 = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Пельмени", ingredients=[{"title": "тесто"}],
+        source="user_dictated",
+    )
+    assert is_new1 is True
+
+    second, is_new2 = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Пельмени со сметаной",  # same dish + variation
+        ingredients=[{"title": "тесто"}, {"title": "сметана"}],
+        source="user_dictated",
+    )
+    assert is_new2 is False
+    assert second.id == first.id
+    assert svc.count_recipes(tenant_id="t1", user_id="u1") == 1
+
+
+def test_save_recipe_fuzzy_dedup_allows_distinct_dishes(session):
+    """Safety: 'Жареная картошка' and 'Тушёная картошка' differ in
+    cooking method — MUST stay as separate recipes, not merge."""
+    svc = HousewifeRecipeService(session)
+    _, n1 = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Жареная картошка", ingredients=[{"title": "картошка"}],
+        source="user_dictated",
+    )
+    _, n2 = svc.save_recipe(
+        tenant_id="t1", user_id="u1",
+        title="Тушёная картошка", ingredients=[{"title": "картошка"}],
+        source="user_dictated",
+    )
+    assert n1 is True and n2 is True
+    assert svc.count_recipes(tenant_id="t1", user_id="u1") == 2
 
 
 def test_save_recipes_batch_reports_skipped_against_db(session):
