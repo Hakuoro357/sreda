@@ -165,3 +165,74 @@ def test_returns_empty_on_unknown_run_id() -> None:
     session = _fresh_session()
     history = _load_chat_history(session, "run_does_not_exist")
     assert history == []
+
+
+# ---------------------------------------------------------------------------
+# Turn-text truncation — cap per-turn text fed back to the LLM so a fat
+# bot reply (rendered 37-item shopping list) doesn't re-inflate input
+# tokens on every subsequent turn.
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_turn_text_short_passes_through() -> None:
+    from sreda.runtime.handlers import _truncate_turn_text
+
+    short = "Короткий ответ бота"
+    assert _truncate_turn_text(short) == short
+
+
+def test_truncate_turn_text_long_gets_head_and_tail() -> None:
+    """Must preserve BOTH the head (what the follow-up turn usually
+    references) AND the tail (final question, if any). A head-only
+    truncation broke conversational continuity in 2025 pilot."""
+    from sreda.runtime.handlers import _truncate_turn_text
+
+    long = "A" * 500 + "B" * 500  # 1000 chars, clearly over default 800
+    result = _truncate_turn_text(long)
+    assert len(result) <= 820  # budget + short marker
+    assert result.startswith("A")
+    assert result.endswith("B")
+    assert "truncated" in result.lower()
+
+
+def test_truncate_turn_text_respects_custom_budget() -> None:
+    from sreda.runtime.handlers import _truncate_turn_text
+
+    # 400-char budget should refuse a 1000-char input
+    long = "X" * 1000
+    result = _truncate_turn_text(long, budget=400)
+    assert len(result) <= 420
+    assert "truncated" in result.lower()
+
+
+def test_load_chat_history_truncates_fat_bot_reply() -> None:
+    """The helper itself must apply truncation, not just expose it.
+    Regression: without this, a week-long menu summary (~2-3k chars)
+    lands in 10 subsequent turns = ~20-30k chars of slop."""
+    from sreda.runtime.handlers import _CHAT_HISTORY_TEXT_BUDGET_CHARS
+
+    session = _fresh_session()
+    base_ts = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    fat_reply = "Меню на неделю: " + ("строка " * 500)  # ~3500 chars
+    _make_turn(
+        session,
+        run_id="r_prior",
+        user_text="дай меню на неделю",
+        bot_text=fat_reply,
+        created_at=base_ts,
+    )
+    current = _make_turn(
+        session,
+        run_id="r_current",
+        user_text="спасибо",
+        bot_text="Пожалуйста!",
+        status="in_progress",
+        created_at=base_ts + timedelta(seconds=1),
+    )
+
+    history = _load_chat_history(session, current.id)
+    assert len(history) == 1
+    _, bot_text = history[0]
+    assert len(bot_text) <= _CHAT_HISTORY_TEXT_BUDGET_CHARS + 64
+    assert "truncated" in bot_text.lower()
+    assert bot_text.startswith("Меню на неделю")

@@ -1117,6 +1117,35 @@ def execute_billing_buy_extra(
 
 
 _CHAT_HISTORY_LIMIT = 10
+
+# Per-side cap on historical turn text fed back into the LLM. A fat
+# bot reply (rendered 37-item shopping list, week-long menu summary)
+# otherwise re-inflates input tokens on every subsequent turn — at 10
+# turns × 3 kB each, we were burning ~1.5-2 k extra input tokens per
+# iteration for no real gain. The head+tail snippet preserves the
+# opening line (what the user was answering) and the closing lines
+# (last thing the bot asked, if any), which is what follow-up
+# references like "да", "нет, не это" actually latch onto.
+_CHAT_HISTORY_TEXT_BUDGET_CHARS = 800
+
+
+def _truncate_turn_text(text: str, *, budget: int = _CHAT_HISTORY_TEXT_BUDGET_CHARS) -> str:
+    """Head + ellipsis marker + tail, keeping the text under ``budget``
+    characters. Short texts pass through unchanged so most turns are
+    byte-identical to the no-op baseline."""
+    if len(text) <= budget:
+        return text
+    # Budget is split 2/3 head + 1/3 tail — the opening context is
+    # usually more meaningful than the closing filler, but we still
+    # keep a tail so "as I said above …" references don't dangle.
+    head_budget = int(budget * 0.66)
+    tail_budget = budget - head_budget - 32  # leave room for the marker
+    if tail_budget < 0:
+        tail_budget = 0
+    marker = "…[truncated]…"
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    return f"{head}\n{marker}\n{tail}" if tail else f"{head}\n{marker}"
 # Log each LLM invocation (request preview + response preview + token
 # counts) via a dedicated logger. Enables post-mortem debugging of
 # "bot lost context" / "hallucinated" complaints. ``sreda.llm`` is
@@ -1184,7 +1213,12 @@ def _load_chat_history(
             bot_text = "\n".join(bot_parts)
             if not bot_text:
                 continue
-            turns.append((user_text, bot_text))
+            turns.append(
+                (
+                    _truncate_turn_text(user_text),
+                    _truncate_turn_text(bot_text),
+                )
+            )
         except (ValueError, TypeError) as exc:
             # Malformed JSON in a historical row shouldn't kill the
             # current turn — skip and continue.
