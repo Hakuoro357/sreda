@@ -14,6 +14,12 @@ from sreda.services.secure_storage import store_secure_json
 class TelegramInboundPersistResult:
     inbound_message_id: str
     contains_sensitive_data: bool
+    # True when this payload matched an existing record by
+    # ``external_update_id`` — Telegram long-poll / webhook retry
+    # delivered the same update twice. Downstream handlers MUST
+    # short-circuit on duplicates instead of firing a second chat
+    # turn; the original request is already in flight (or done).
+    is_duplicate: bool = False
 
 
 def persist_telegram_inbound_event(
@@ -77,6 +83,7 @@ def persist_telegram_inbound_event(
             return TelegramInboundPersistResult(
                 inbound_message_id=existing.id,
                 contains_sensitive_data=existing.contains_sensitive_data,
+                is_duplicate=True,
             )
 
     inbound = InboundMessage(

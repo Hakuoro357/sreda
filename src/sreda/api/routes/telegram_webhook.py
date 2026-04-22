@@ -62,6 +62,23 @@ async def telegram_webhook(
         bot_key=bot_key,
         payload=payload,
     )
+
+    # Long-poll / webhook retry short-circuit. Same update_id → a
+    # turn is already in-flight (or finished) for this input. Firing
+    # a second chat turn causes the double-reply bug observed
+    # 2026-04-22: long-running turn failed to ack in time, Telegram
+    # re-delivered the same voice, both turns ran to completion, user
+    # got duplicate replies with slightly different wording.
+    if result.is_duplicate:
+        logger.info(
+            "telegram webhook: duplicate update_id %s for bot %s — "
+            "skipping second chat turn",
+            payload.get("update_id"), bot_key,
+        )
+        return TelegramWebhookAccepted(
+            ok=True, request_id=result.inbound_message_id,
+        )
+
     settings = get_settings()
     if settings.telegram_bot_token and onboarding.chat_id:
         telegram_client = TelegramClient(settings.telegram_bot_token)
