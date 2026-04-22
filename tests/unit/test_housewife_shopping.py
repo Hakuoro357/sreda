@@ -367,6 +367,24 @@ def test_guess_category_staples():
         assert _guess_category(title) == "бакалея", f"{title!r}"
 
 
+def test_shopping_categories_includes_лекарства():
+    """'лекарства' is a first-class category (user requested 2026-04-22
+    after LLM invented it on a medicine-containing list)."""
+    assert "лекарства" in SHOPPING_CATEGORIES
+
+
+def test_guess_category_medicine_names():
+    from sreda.services.housewife_shopping import _guess_category
+    for title in [
+        "Беталок зок 100 мг", "Аевит", "парацетамол", "анальгин",
+        "нурофен", "но-шпа", "Ибупрофен", "таблетки от головы",
+        "витамин D", "капли для носа",
+    ]:
+        assert _guess_category(title) == "лекарства", (
+            f"{title!r} should be лекарства, got {_guess_category(title)!r}"
+        )
+
+
 def test_guess_category_unknown_falls_back_to_другое():
     from sreda.services.housewife_shopping import _guess_category
     assert _guess_category("плюшевый мишка") == "другое"
