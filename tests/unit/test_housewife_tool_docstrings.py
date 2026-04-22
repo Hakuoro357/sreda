@@ -230,3 +230,66 @@ def test_search_recipes_distinguishes_from_menu():
         "weekly menu). To check what's on the menu for a day, use "
         "list_menu — they are different sources of truth."
     )
+
+
+# ---------------------------------------------------------------------------
+# Prompt split (2026-04-22) — feature-scoped addons. Core prompt
+# should NOT contain food-v1.1 rules; housewife addon MUST add them.
+# Keeps non-housewife turns ~500 input tokens lighter per iteration.
+# ---------------------------------------------------------------------------
+
+
+def test_core_prompt_excludes_housewife_food_rules():
+    """Generic / non-housewife turns shouldn't pay the food-section
+    token tax. Housewife-specific keywords (list_shopping, plan_week_menu,
+    recipe sources) must NOT appear in the core prompt."""
+    from sreda.runtime.handlers import _CORE_SYSTEM_PROMPT
+
+    low = _CORE_SYSTEM_PROMPT.lower()
+    for forbidden in (
+        "list_shopping",
+        "list_menu",
+        "plan_week_menu",
+        "save_recipes_batch",
+        "user_dictated",
+        "огне",  # heat-level rule is housewife-only
+    ):
+        assert forbidden not in low, (
+            f"core prompt must NOT contain {forbidden!r} — it's "
+            "housewife-scoped and belongs in _HOUSEWIFE_FOOD_PROMPT, "
+            "not in the always-on core that every feature pays for."
+        )
+
+
+def test_build_system_prompt_housewife_includes_food_rules():
+    """Full assembled prompt for feature='housewife_assistant' must
+    still contain all Stage 7.5 critical rules — they're only moved,
+    not deleted."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    assembled = build_system_prompt("housewife_assistant").lower()
+    for required in (
+        "list_shopping",
+        "list_menu",
+        "search_recipes",
+        "plan_week_menu",
+        "save_recipes_batch",
+        "update_shopping_item",
+        "огне",
+        "не по памяти",
+    ):
+        assert required in assembled, (
+            f"housewife prompt missing {required!r} — prompt split "
+            "dropped a Stage 7.5 rule. Re-check the move from "
+            "_CONVERSATION_SYSTEM_PROMPT to _HOUSEWIFE_FOOD_PROMPT."
+        )
+
+
+def test_build_system_prompt_no_feature_returns_core_only():
+    """Calling without a feature_key (or with an unknown one) must
+    return the core prompt verbatim — no stray feature-addon leaks."""
+    from sreda.runtime.handlers import _CORE_SYSTEM_PROMPT, build_system_prompt
+
+    assert build_system_prompt(None) == _CORE_SYSTEM_PROMPT
+    assert build_system_prompt("") == _CORE_SYSTEM_PROMPT
+    assert build_system_prompt("unknown_feature_xyz") == _CORE_SYSTEM_PROMPT

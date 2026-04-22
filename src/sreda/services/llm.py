@@ -12,6 +12,13 @@ these from scratch against raw ``httpx`` would be a week of work per
 provider. Pinning to ``langchain-openai`` also means swapping
 providers later (if MiMo rate-limits us) is a one-line change in
 settings — no code refactor.
+
+Parallel tool-calls: verified 2026-04-22 that MiMo-V2-Pro emits
+multiple ``tool_calls`` in a single assistant message when the
+prompt invites it (e.g. "что в списке И что в меню"). The
+``execute_conversation_chat`` loop handles the list correctly —
+saves ~1 LLM round-trip (~3-5s) on multi-read turns. No flag to
+flip; behaviour is default.
 """
 
 from __future__ import annotations

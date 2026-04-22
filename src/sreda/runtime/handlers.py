@@ -919,7 +919,11 @@ def execute_skill_set_priority(
 # ---------------------------------------------------------------------------
 
 
-_CONVERSATION_SYSTEM_PROMPT = """\
+# Core prompt — always loaded, feature-agnostic. Persona + memory
+# tools + web/search + generic reminders. Feature-specific rules live
+# in _FEATURE_PROMPTS below and are appended only for that skill, so
+# non-housewife turns don't pay ~500 tokens of food-v1.1 guidance.
+_CORE_SYSTEM_PROMPT = """\
 Ты — Среда, персональный AI-ассистент пользователя в Telegram. Говоришь на русском, если пользователь не переходит на другой язык.
 
 Контекст переписки:
@@ -931,13 +935,7 @@ _CONVERSATION_SYSTEM_PROMPT = """\
 - ``save_episode`` — событие/настроение («сегодня устал», «вчера ругался с коллегой»). Короткое summary.
 - ``recall_memory`` — когда надо вытащить факт, которого нет в [ПАМЯТЬ] выше.
 - ``web_search`` — актуальные данные из интернета (новости, расписания, цены, определения, курсы валют). Короткий запрос на языке поиска.
-- ``fetch_url`` — когда ``web_search`` вернул подходящий URL и нужно прочитать страницу целиком.
-  Погода на wttr.in — шпаргалка по форматам, НЕ перебирай их случайно:
-    * «сейчас / текущая погода» → ``https://wttr.in/<город>?format=3`` (одна строка: «Сходня: 🌦 +6°C»)
-    * «с осадками и ветром сейчас» → ``?format=%l:+%c+%t+%p+%h+%w`` (кратко: температура, осадки, влажность, ветер)
-    * «на день / сегодня / прогноз на несколько часов» → БЕЗ ?format, чистый URL ``https://wttr.in/<город>`` (html, Среда достанет сводку дня)
-    * «часовой прогноз / долго ли будет идти дождь / когда закончится» → ``?format=j1`` (JSON с hourly-массивом; читай поля ``hourly[].time``, ``chanceofrain``, ``precipMM``)
-  Если первый формат не даёт ответ — переключайся осознанно, не повторяй одно и то же.
+- ``fetch_url`` — когда ``web_search`` вернул подходящий URL и нужно прочитать страницу целиком. Для погоды формат URL указан в docstring самого tool'а.
 - ``log_unsupported_request`` — ПЕРЕД тем как сказать пользователю «я не могу X» / «не умею X» / «у меня нет возможности X», обязательно вызывай этот tool. Только после него — дружелюбно отвечаешь пользователю. Если ты НЕ вызвал log_unsupported_request, значит ты можешь это сделать — попробуй сначала разобраться как.
 
 Правила:
@@ -948,11 +946,16 @@ _CONVERSATION_SYSTEM_PROMPT = """\
 Напоминания и время:
 - Текущие дата и время — в секции [ТЕКУЩЕЕ ВРЕМЯ] выше. НЕ спрашивай у пользователя «какое сегодня число», не догадывайся из своей памяти. Используй этот блок.
 - Когда пользователь говорит «сегодня», «завтра», «через час» — привязывайся к [ТЕКУЩЕЕ ВРЕМЯ].
-- ВСЕ времена в инструменте ``schedule_reminder`` хранятся в **UTC**. Смотри [ПРОФИЛЬ] → часовой пояс пользователя.
-- Если пользователь живёт в Europe/Moscow (+03:00) и просит напомнить в 16:00 — передавай ``trigger_iso="...T13:00:00+00:00"`` или ``"...T16:00:00+03:00"`` (будет конвертировано). Для RRULE: ``BYHOUR=13`` (UTC-часы, не 16).
-- Формула: **MSK час - 3 = UTC час** (при отрицательном — вычитай из 24, это предыдущий день UTC).
-- Перед ``schedule_reminder`` мысленно проверь: год и месяц в ``trigger_iso`` совпадают с [ТЕКУЩЕЕ ВРЕМЯ]? Если нет — это баг, исправь.
+- ВСЕ времена в инструменте ``schedule_reminder`` хранятся в UTC; формула MSK→UTC и примеры — в docstring tool'а. Перед вызовом сверь год и месяц в ``trigger_iso`` с [ТЕКУЩЕЕ ВРЕМЯ].
+"""
 
+
+# Feature-scoped addons. Appended after the core prompt only when the
+# user's turn is dispatched to the matching ``feature_key``. Keeps
+# non-housewife turns light and makes per-skill iteration cheap — a
+# new rule for housewife doesn't inflate the prompt for eds_monitor
+# or generic chat users.
+_HOUSEWIFE_FOOD_PROMPT = """\
 Критические правила (housewife — не врать, не путать книгу с меню):
 - Состояние списка покупок / меню / книги рецептов — ВСЕГДА через tool, НЕ по памяти. Источник правды — только вызовы ``list_shopping`` / ``list_menu`` / ``search_recipes``. Память ([ПАМЯТЬ]) — для долгосрочных фактов о семье (аллергии, расписания), НЕ для текущего содержимого списков. Не отвечай «у тебя в списке X, Y, Z» не вызвав ``list_shopping`` в этом же turn'е — user мог изменить список через Mini App между сообщениями.
 - Не отчитывайся о несделанном. Если говоришь user'у «сохранил 3 рецепта», «добавил в список», «создал меню» — в ЭТОМ ЖЕ turn'е должен быть tool-call, который это выполнил. Пустая фраза «готово!» без соответствующего tool-call — запрещена. Если LLM решил что-то сделать — сначала вызов, потом рапорт.
@@ -965,7 +968,7 @@ _CONVERSATION_SYSTEM_PROMPT = """\
 
 Продукты, рецепты, меню (housewife food v1.1):
 - Список покупок:
-    * «добавь X в список» → ``add_shopping_items([{"title":"X","category":"<one of: молочные|мясо_рыба|овощи_фрукты|хлеб|бакалея|напитки|готовое|замороженное|бытовая_химия|другое>"}])``. Всегда классифицируй категорию сам — не ленись.
+    * «добавь X в список» → ``add_shopping_items([{"title":"X","category":"<one of: молочные|мясо_рыба|овощи_фрукты|хлеб|бакалея|напитки|готовое|замороженное|бытовая_химия|лекарства|другое>"}])``. Всегда классифицируй категорию сам — не ленись.
     * «купил X» → сначала ``list_shopping()`` чтобы взять id, потом ``mark_shopping_bought([ids])``.
     * «убери X», «перехотел X» → ``remove_shopping_items([ids])``.
     * «что в списке», «что покупать» → ``list_shopping()``.
@@ -982,6 +985,33 @@ _CONVERSATION_SYSTEM_PROMPT = """\
     * «добавь ингредиенты меню в список покупок» → ``generate_shopping_from_menu(plan_id)``.
     * «что на этой неделе» → ``list_menu()``.
 """
+
+
+_FEATURE_PROMPTS: dict[str, str] = {
+    "housewife_assistant": _HOUSEWIFE_FOOD_PROMPT,
+}
+
+
+def build_system_prompt(feature_key: str | None) -> str:
+    """Compose the system prompt for one turn.
+
+    Always includes the core persona + memory + web-search rules; if
+    ``feature_key`` maps to a feature-specific addon, that block is
+    appended verbatim. Generic chat (no feature) gets the core prompt
+    alone, saving ~500 input tokens per iteration.
+    """
+    core = _CORE_SYSTEM_PROMPT
+    addon = _FEATURE_PROMPTS.get(feature_key or "")
+    if addon:
+        return core + "\n" + addon
+    return core
+
+
+# Back-compat alias for tests that import the single-blob prompt.
+# Returns the housewife-flavoured build because every existing lock-in
+# test was written against the pre-split monolith. Remove once those
+# tests migrate to ``build_system_prompt(feature_key)`` directly.
+_CONVERSATION_SYSTEM_PROMPT = build_system_prompt("housewife_assistant")
 
 
 def _format_profile_for_prompt(profile: dict[str, Any]) -> str:
@@ -1417,7 +1447,7 @@ def execute_conversation_chat(
             "справочный контекст — НЕ основание считать тему решённой.\n\n"
             + onboarding_prompt_block
         )
-    parts.append(_CONVERSATION_SYSTEM_PROMPT)
+    parts.append(build_system_prompt(feature_key))
     parts.append("[ТЕКУЩЕЕ ВРЕМЯ]\n" + _format_time_context_for_prompt(profile))
     parts.append("[ПРОФИЛЬ]\n" + _format_profile_for_prompt(profile))
     parts.append(
