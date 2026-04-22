@@ -90,3 +90,81 @@ def test_system_prompt_has_heat_level_rule():
         "docstrings alone aren't enough — they get compressed when "
         "the model's context window fills up."
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 7.5 — anti-hallucination, book-vs-menu split, plan_week_menu
+# overwrite warning, and "state via tools not memory" rules.
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_forbids_memory_for_shopping_state():
+    """Bug observed 2026-04-22 tenant_tg_755682022: user marked items
+    bought in Mini App; next day agent listed them as still pending.
+    Service filter is correct. Likely cause: LLM pulls old shopping
+    state from [ПАМЯТЬ] instead of calling list_shopping(). Explicit
+    rule in system prompt required."""
+    from sreda.runtime.handlers import _CONVERSATION_SYSTEM_PROMPT
+
+    low = _CONVERSATION_SYSTEM_PROMPT.lower()
+    # Need to explicitly say: for shopping/recipes/menu → use tools,
+    # not memory. Accept several wordings.
+    has_rule = any(
+        phrase in low
+        for phrase in (
+            "не по памяти", "не из памяти", "не по [память",
+            "состояние.*через tool", "источник правды",
+        )
+    )
+    # Also require mention of list_shopping specifically
+    assert "list_shopping" in _CONVERSATION_SYSTEM_PROMPT and has_rule, (
+        "System prompt must instruct LLM that shopping/menu/recipe "
+        "STATE comes from tools (list_shopping, list_menu, "
+        "search_recipes), NOT from [ПАМЯТЬ]. Memory is for long-term "
+        "profile facts (family composition, allergies) — not mutable "
+        "state that changes between turns."
+    )
+
+
+def test_system_prompt_anti_hallucination_tool_call_rule():
+    """LLM sometimes claimed 'сохранил 3 рецепта, добавил 18 товаров'
+    without any corresponding tool-call — pure hallucination.
+    System prompt must forbid this."""
+    from sreda.runtime.handlers import _CONVERSATION_SYSTEM_PROMPT
+
+    low = _CONVERSATION_SYSTEM_PROMPT.lower()
+    # Accept either "tool-call" language or "не отчитывайся" language.
+    assert (
+        ("tool-call" in low or "tool call" in low or "вызов tool" in low)
+        and ("не отчитыв" in low or "не говори" in low or "только о сделанном" in low)
+    ), (
+        "System prompt must instruct LLM: if you say 'сохранил X' / "
+        "'добавил Y' — there MUST be a tool-call for X and Y in this "
+        "SAME turn. No reporting of planned-but-not-executed actions."
+    )
+
+
+def test_plan_week_menu_docstring_warns_about_overwrite():
+    tools = _tools()
+    desc = tools["plan_week_menu"].description.lower()
+    assert "перезапис" in desc or "overwrite" in desc or "replaces" in desc, (
+        "plan_week_menu REPLACES the entire week's plan — if the user "
+        "incrementally adds one day, the other days get wiped. "
+        "Docstring must warn and point to update_menu_item for "
+        "incremental changes."
+    )
+
+
+def test_search_recipes_distinguishes_from_menu():
+    """LLM confused the recipe book (search_recipes) with the weekly
+    menu (list_menu). When user asked 'какое меню на среду?' agent
+    saw matching recipe names and said 'меню уже есть' — wrong, those
+    were just recipes in the book, not bound to any menu day."""
+    tools = _tools()
+    desc = tools["search_recipes"].description.lower()
+    assert "книг" in desc and ("list_menu" in desc or "не меню" in desc), (
+        "search_recipes docstring must clarify that it returns the "
+        "WHOLE RECIPE BOOK (all saved recipes, independent of the "
+        "weekly menu). To check what's on the menu for a day, use "
+        "list_menu — they are different sources of truth."
+    )

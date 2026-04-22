@@ -295,6 +295,77 @@ def test_clear_bought_empty_list_is_noop(session):
 
 
 # ---------------------------------------------------------------------------
+# Cross-session visibility (Mini App <-> agent sync bug investigation)
+# ---------------------------------------------------------------------------
+
+
+def test_list_pending_sees_cross_session_mark_bought(session):
+    """Agent's list_pending must see status changes made by the Mini App
+    in a DIFFERENT SQLAlchemy session.
+
+    Production bug (2026-04-22 tenant_tg_755682022): user yesterday
+    added items via voice → today taps "bought" in Mini App (different
+    session per request) → today asks agent "что в списке" → agent's
+    session still returns the already-bought items, because its
+    implicit read transaction holds an older snapshot.
+
+    This test sets up two engines sharing one SQLite file so we can
+    prove our service-level query re-reads fresh data on each call
+    regardless of what OTHER sessions did after the first call."""
+    import tempfile
+    from pathlib import Path
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from sreda.db.base import Base
+    from sreda.db.models.core import Tenant, User
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_file = Path(tmpdir) / "cross.db"
+        url = f"sqlite:///{db_file.as_posix()}"
+        engine_a = create_engine(url)
+        engine_b = create_engine(url)
+        Base.metadata.create_all(engine_a)
+
+        # Seed tenant + user in engine A.
+        sess_a = sessionmaker(bind=engine_a)()
+        sess_a.add(Tenant(id="t1", name="Test"))
+        sess_a.add(User(id="u1", tenant_id="t1", telegram_account_id="100"))
+        sess_a.commit()
+        svc_a = HousewifeShoppingService(sess_a)
+
+        # Two pending items via session A.
+        rows = svc_a.add_items(
+            tenant_id="t1", user_id="u1",
+            items=[{"title": "молоко"}, {"title": "хлеб"}],
+        )
+        assert len(svc_a.list_pending(tenant_id="t1", user_id="u1")) == 2
+
+        # Session B (separate engine, simulating Mini App request)
+        # marks one as bought and commits.
+        sess_b = sessionmaker(bind=engine_b)()
+        svc_b = HousewifeShoppingService(sess_b)
+        svc_b.mark_bought(tenant_id="t1", user_id="u1", ids=[rows[0].id])
+        sess_b.close()
+
+        # Session A queries again — must see only 1 pending. Without
+        # session.expire_all()/commit() SQLAlchemy's identity map could
+        # return the stale cached row.
+        pending_after = svc_a.list_pending(tenant_id="t1", user_id="u1")
+        assert len(pending_after) == 1, (
+            "Agent's session failed to see Mini App's commit. "
+            f"Expected 1 pending, got {len(pending_after)}: "
+            f"{[r.title for r in pending_after]}"
+        )
+        assert pending_after[0].title == "хлеб"
+
+        sess_a.close()
+        engine_a.dispose()
+        engine_b.dispose()
+
+
+# ---------------------------------------------------------------------------
 # clear_pending — "очистить всё" button on the shopping screen
 # ---------------------------------------------------------------------------
 

@@ -614,6 +614,14 @@ def build_housewife_tools(
     def search_recipes(query: str) -> str:
         """Search the user's recipe book by title or tag substring.
 
+        **Returns the WHOLE RECIPE BOOK (all saved recipes), NOT the
+        weekly menu.** A recipe being in the book does NOT mean it's
+        on the menu for any particular day. To check what the user
+        has planned for a specific day — use ``list_menu``. Those are
+        different sources of truth:
+          - search_recipes → книга (catalog, independent of menu days)
+          - list_menu      → план меню на неделю (day-bound cells)
+
         Use at the start of ``plan_week_menu`` to see what's already
         saved (aim for ≥50% of menu cells pointing at existing
         recipes) and whenever the user says "найди мой рецепт X". Empty
@@ -731,6 +739,13 @@ def build_housewife_tools(
         notes: str | None = None,
     ) -> str:
         """Create (or replace) the weekly menu for the user.
+
+        ⚠️ **ПЕРЕЗАПИСЫВАЕТ всю неделю.** Если для week_start уже есть
+        план, он ПОЛНОСТЬЮ заменяется переданными днями. Если user
+        просит инкрементально добавить ОДИН день (а другие дни
+        остаются) — НЕ вызывай plan_week_menu с одним днём, иначе
+        сотрёшь остальное. Вместо этого используй ``update_menu_item``
+        (по одной ячейке) для точечной вставки.
 
         Heavy composite call: YOU generate 21 meal cells (7 days ×
         breakfast/lunch/dinner) and pass them as structured data. Before
