@@ -47,6 +47,51 @@
   <button type="submit">Сохранить</button>
 </form>
 
+<h3 style="margin-top: 32px;">Баланс и лимиты
+  <a href="/admin/llm?token={{ token }}&refresh=1"
+     style="font-size: 12px; font-weight: normal; margin-left: 12px;">
+    обновить
+  </a>
+</h3>
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Провайдер</th>
+      <th>Статус</th>
+      <th>Остаток / лимит</th>
+      <th>Детали</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for b in balances %}
+    <tr>
+      <td><strong>{{ b.label }}</strong></td>
+      <td>
+        {% if b.status == "ok" %}
+          <span class="badge badge-green">ok</span>
+        {% elif b.status == "not_configured" %}
+          <span class="badge badge-gray">—</span>
+        {% elif b.status == "not_supported" %}
+          <span class="badge badge-gray">n/a</span>
+        {% else %}
+          <span class="badge badge-red">error</span>
+        {% endif %}
+      </td>
+      <td>{{ b.headline }}</td>
+      <td class="muted">{{ b.details }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+<p class="muted" style="font-size: 12px;">
+  Данные кэшируются 60с в памяти процесса. Нажми «обновить» чтобы
+  принудительно перечитать сейчас. OpenRouter показывает доллары,
+  Groq/Cerebras/MiMo — rate-limit remaining из headers последнего
+  запроса.
+</p>
+
 <h3 style="margin-top: 32px;">Доступные провайдеры</h3>
 <figure>
 <table>

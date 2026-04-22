@@ -74,11 +74,21 @@ _LLM_PROVIDERS_METADATA = [
 ]
 
 
-def _llm_context(session, token: str, *, flash: str | None = None) -> dict:
+def _llm_context(
+    session,
+    token: str,
+    *,
+    flash: str | None = None,
+    with_balances: bool = True,
+) -> dict:
     """Shared state for GET + POST /admin/llm. Computes availability
     (key configured?), reads current DB overrides, and exposes a
-    provider catalogue the template renders into two dropdowns."""
+    provider catalogue the template renders into two dropdowns.
+    When ``with_balances`` is True (the default for GET), also fetches
+    live provider balances — cached 60s inside the service so the
+    extra round-trips don't accumulate across admin refreshes."""
     from sreda.services import runtime_config as rc
+    from sreda.services import provider_balances as pb
 
     settings = get_settings()
     providers = []
@@ -100,12 +110,14 @@ def _llm_context(session, token: str, *, flash: str | None = None) -> dict:
         or settings.chat_fallback_provider
         or ""
     )
+    balances = pb.fetch_balances(settings) if with_balances else []
     return {
         "token": token,
         "section": "llm",
         "providers": providers,
         "current_primary": current_primary,
         "current_fallback": current_fallback,
+        "balances": balances,
         "flash": flash,
     }
 
@@ -113,9 +125,13 @@ def _llm_context(session, token: str, *, flash: str | None = None) -> dict:
 @router.get("/llm", response_class=HTMLResponse)
 def admin_llm(
     request: Request,
+    refresh: int = Query(default=0),
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
+    if refresh:
+        from sreda.services import provider_balances as pb
+        pb.invalidate_cache()
     ctx = _llm_context(session, token)
     return templates.TemplateResponse(request, "llm.html", ctx)
 
