@@ -94,8 +94,9 @@ async def test_groq_sends_ogg_bytes_and_lang(monkeypatch: pytest.MonkeyPatch) ->
     assert files["file"][2] == "audio/ogg"
     # language must be normalised to 2-letter "ru" for Whisper
     assert kwargs["data"]["language"] == "ru"
-    # default model is turbo — fastest + cheapest
-    assert "turbo" in kwargs["data"]["model"]
+    # default model is full whisper-large-v3 (not turbo) —
+    # better WER on foreign/code-switched Russian speech
+    assert kwargs["data"]["model"] == "whisper-large-v3"
 
 
 @pytest.mark.asyncio

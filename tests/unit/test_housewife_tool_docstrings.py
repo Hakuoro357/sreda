@@ -339,6 +339,26 @@ def test_gemma_discipline_addendum_skipped_for_mimo():
     assert "строгая дисциплина tool-calls" not in mimo_prompt
 
 
+def test_prompt_requires_full_recipe_text_before_save_confirmation():
+    """Prod 2026-04-22: after we added the retry-nudge for save,
+    Gemma started replying with just '✅ сохранила' — user lost the
+    recipe body entirely and had to open the Mini App to read it.
+    Prompt must force the full recipe in the reply text even when
+    save_recipe is also being called."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt = build_system_prompt("housewife_assistant").lower()
+    # Needs the "both actions in one turn" instruction
+    assert "полный рецепт" in prompt, (
+        "Prompt must tell the model to include the full recipe in "
+        "the chat reply, not just a 'сохранено' confirmation."
+    )
+    # Confirmation must explicitly go at the END, after the body
+    assert (
+        "в конце" in prompt and ("подтверждение" in prompt or "подтверди" in prompt)
+    ), "Prompt must order: full recipe first, confirmation last."
+
+
 def test_prompt_has_recipe_to_shopping_intent_rule():
     """2026-04-22 prod: user asked 'добавь продукты этого рецепта в
     список' → Gemma called save_recipe + search_recipes instead of

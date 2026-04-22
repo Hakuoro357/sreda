@@ -24,7 +24,12 @@ from sreda.services.speech.base import SpeechRecognitionError
 logger = logging.getLogger(__name__)
 
 _ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
-_DEFAULT_MODEL = "whisper-large-v3-turbo"
+# Full Whisper-large-v3 — the "turbo" variant drops 30% of decoder
+# layers and is notably weaker on foreign words / code-switching
+# ("Дьявола"→"Диабла", "latte"→"лат"). For a Russian-speaking user
+# base who sprinkles in foreign dish names / brand names we trade
+# ~100-200ms latency for ~5-10% WER win on those tokens.
+_DEFAULT_MODEL = "whisper-large-v3"
 
 
 def _resolve_outbound_proxy() -> str | None:
