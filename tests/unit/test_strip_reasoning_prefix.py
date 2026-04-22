@@ -106,6 +106,40 @@ def test_preserves_prose_that_happens_to_contain_rec_word() -> None:
     assert strip_reasoning_prefix(raw) == raw
 
 
+def test_strips_tool_call_with_url_garbage_prefix() -> None:
+    """Prod 2026-04-22 Gemma Sunday-menu turn: reply started with
+    ``://plan_week_menu(week_start='2026-04-26', days=[...])``. The
+    leading ``://`` made the anchored ^-regex miss it entirely — we
+    now scrub the signature anywhere in the text regardless of what
+    junk precedes it."""
+    raw = (
+        "://plan_week_menu(week_start=\"2026-04-26\", "
+        "days=[{\"day_of_week\":6, \"meals\":{\"breakfast\":{\"recipe_id\":\"\"}}}])"
+    )
+    cleaned = strip_reasoning_prefix(raw)
+    assert "plan_week_menu" not in cleaned
+    assert "day_of_week" not in cleaned
+
+
+def test_strips_tool_call_in_middle_of_sentence() -> None:
+    raw = (
+        "Сейчас попробую: save_recipe(title='X', ingredients=[{}]) — это "
+        "должно помочь. Проверь результат."
+    )
+    cleaned = strip_reasoning_prefix(raw)
+    assert "save_recipe" not in cleaned
+    assert "Сейчас попробую" in cleaned
+    assert "Проверь результат" in cleaned
+
+
+def test_preserves_unknown_function_call_syntax() -> None:
+    """Only KNOWN tool names trigger the scrub. If a model writes
+    prose like 'вызови print(х) в питоне' we leave it alone —
+    print() isn't one of our tools."""
+    raw = "В питоне пишут print(x) чтобы вывести."
+    assert strip_reasoning_prefix(raw) == raw
+
+
 def test_real_prod_grok_output_cleans_up() -> None:
     raw = (
         "**📅 Расписание еды на завтра (четверг, 23 апреля):**\n\n"

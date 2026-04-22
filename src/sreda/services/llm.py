@@ -57,51 +57,64 @@ _REASONING_PREFIX_RE = re.compile(
 
 
 # Full tool-call signatures occasionally leak into the text channel
-# on Gemma-4 (reproduced 2026-04-22: ``search_recipes(query='X')\n
-# save_recipe(calories_per_serving=650, ingredients=[{...}], ...)\n
-# Прости, пожалуйста...``). The proper tool_calls JSON DID fire in
-# earlier iterations — this is the "wrap-up" message re-narrating
-# the actions as raw syntax, which looks like a bug to the user.
-# We detect the shape and strip those lines from the rendered text.
+# on Gemma-4 / Grok (reproduced 2026-04-22: ``:://plan_week_menu(
+# week_start='2026-04-26', days=[{...}])``, ``search_recipes(query=
+# 'X')\nsave_recipe(...)``, etc). The proper tool_calls JSON DID
+# fire in earlier iterations — this is the "wrap-up" message
+# re-narrating the actions as raw syntax, which looks like a bug to
+# the user.
 #
-# Regex must handle multi-line calls (the save_recipe signature often
-# wraps) — we match greedily up to the first ``)`` that's followed by
-# end-of-line or another top-level ``<ident>(`` line. Case-sensitive
-# and anchored at start of string so legitimate prose mentioning
-# function names in the middle of a reply is untouched.
-_TOOL_CALL_SYNTAX_RE = re.compile(
-    r"^\s*[a-z_][a-z0-9_]*\([^)]*\)\s*(?:\n|$)",
-    re.IGNORECASE | re.DOTALL,
+# Our housewife tool names are finite and have a distinctive
+# ``<snake_case>(<args>)`` shape — enumerating them lets us scrub
+# anywhere in the text, not just at the start. This fixes the prod
+# case where the model prepended garbage like ``://`` before the
+# tool-call and our anchored regex skipped the match.
+_KNOWN_TOOL_NAMES = (
+    # Memory
+    "save_core_fact", "save_episode", "recall_memory",
+    # Web
+    "web_search", "fetch_url", "log_unsupported_request",
+    # Reminders
+    "schedule_reminder", "cancel_reminder", "list_reminders",
+    # Housewife shopping
+    "list_shopping", "add_shopping_items", "remove_shopping_items",
+    "mark_shopping_bought", "clear_bought_shopping",
+    "update_shopping_item", "update_shopping_items_category",
+    # Housewife recipes
+    "search_recipes", "get_recipe", "save_recipe", "save_recipes_batch",
+    "delete_recipe",
+    # Housewife menu
+    "plan_week_menu", "list_menu", "update_menu_item",
+    "generate_shopping_from_menu", "clear_menu",
+    # Housewife family
+    "add_family_members", "remove_family_member", "update_family_member",
+    "list_family_members",
+    # Onboarding
+    "onboarding_answered", "onboarding_deferred", "onboarding_complete",
 )
-# Multi-line variant: open paren without matching close on same line.
-# Consumes until the matching ``)`` followed by newline. Works for
-# single-level parens (our tool arg schemas don't nest raw ``)``
-# outside quotes at top level; worst case we leave some residue,
-# which is cosmetic).
-_TOOL_CALL_MULTILINE_RE = re.compile(
-    r"^\s*[a-z_][a-z0-9_]*\(.*?\)\s*(?:\n|$)",
+_TOOL_NAME_ALT = "|".join(re.escape(name) for name in _KNOWN_TOOL_NAMES)
+# Match a known tool name + its paren-wrapped args, optionally
+# preceded by URL-like junk (``://``, ``http://``, etc) — greedy on
+# the args body so multi-line signatures fold together. Non-anchored
+# so it strips occurrences anywhere in the reply. DOTALL so a nested
+# newline inside args[] still gets swallowed.
+_TOOL_CALL_ANYWHERE_RE = re.compile(
+    r"(?:https?://|://)?(?:" + _TOOL_NAME_ALT + r")\([^)]*\)",
     re.IGNORECASE | re.DOTALL,
 )
 
 
-def _strip_tool_call_prefix_lines(text: str) -> str:
-    """Peel off any number of leading tool-call-syntax lines. Stops at
-    the first non-matching line so legitimate content below stays
-    intact."""
-    changed = True
-    while changed and text:
-        changed = False
-        match = _TOOL_CALL_SYNTAX_RE.match(text)
-        if match:
-            text = text[match.end():]
-            changed = True
-            continue
-        # Fallback for multi-line signatures (save_recipe spans lines).
-        match = _TOOL_CALL_MULTILINE_RE.match(text)
-        if match:
-            text = text[match.end():]
-            changed = True
-    return text.lstrip()
+def _strip_tool_call_syntax(text: str) -> str:
+    """Remove any recognisable tool-call signature from anywhere in
+    the text. Only matches against the known tool name list, so
+    prose mentioning ``add`` or ``save`` in a sentence isn't affected
+    — the ``(`` after a full tool identifier is the discriminator."""
+    cleaned = _TOOL_CALL_ANYWHERE_RE.sub("", text)
+    # Collapse whitespace runs left behind by the removal so the
+    # remaining prose reads naturally instead of with stray blank
+    # lines where the signatures used to be.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 # Internal DB identifiers that occasionally leak into user-facing
@@ -137,10 +150,12 @@ def strip_reasoning_prefix(text: str) -> str:
     match = _REASONING_PREFIX_RE.match(text)
     if match:
         text = text[match.end():]
-    # Leaked tool-call syntax can appear WITHOUT a reasoning prefix
-    # (Gemma sometimes opens directly with ``search_recipes(...)``),
-    # so run this unconditionally.
-    text = _strip_tool_call_prefix_lines(text)
+    # Leaked tool-call syntax can appear anywhere in the reply —
+    # sometimes at the start (Gemma opens with ``search_recipes(...)``),
+    # sometimes mid-message after a garbage prefix like ``://``
+    # (observed 2026-04-22 on a Sunday-menu turn). Scan the whole
+    # string for known tool names + paren args.
+    text = _strip_tool_call_syntax(text)
     # Internal-ID scrubber runs last so the cleanup is visible in the
     # final reply regardless of which meta layer was also stripped.
     text = _INTERNAL_ID_RE.sub("", text)
