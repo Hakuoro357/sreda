@@ -1,7 +1,7 @@
 from functools import lru_cache
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEV_HOST_SUFFIXES = (".test", ".local", ".localhost")
@@ -46,6 +46,37 @@ class Settings(BaseSettings):
     # None → classifier worker is disabled; skills must score their own
     # events via domain rules.
     mimo_classifier_model: str | None = None
+
+    # Alternative chat-LLM providers reachable via their OpenAI-compatible
+    # endpoints. Selected at runtime through ``chat_provider`` below; the
+    # defaults keep MiMo as the production brain so enabling openrouter
+    # is an explicit, reviewable change (not accidentally triggered by
+    # a forgotten env var).
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_api_key: str | None = None
+    openrouter_api_key_file: str | None = None
+    # Recommended defaults for the two front-runners from the 2026-04-22
+    # bench. google/gemma-4-26b-a4b-it wins latency but emits a
+    # ``thought\\n`` prefix we strip in services.llm. qwen3.6-plus is
+    # the clean runner-up.
+    openrouter_chat_model: str = "google/gemma-4-26b-a4b-it"
+
+    # Chat-LLM dispatcher. Accepted values: ``mimo``, ``openrouter``.
+    # ``chat_fallback_provider`` is optional — when set, the tool-loop
+    # wraps the primary LLM with LangChain's ``.with_fallbacks([...])``
+    # so a provider-level error (429/5xx/timeout) on any iteration
+    # transparently retries the same step on the fallback provider
+    # without losing the accumulated message history.
+    chat_provider: str = Field(
+        default="mimo",
+        validation_alias=AliasChoices("chat_provider", "SREDA_CHAT_PROVIDER"),
+    )
+    chat_fallback_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "chat_fallback_provider", "SREDA_CHAT_FALLBACK_PROVIDER"
+        ),
+    )
 
     # Embeddings service (Phase 3). Separate from chat LLM so we can
     # point the two at different endpoints — common setup is MiMo for
@@ -265,6 +296,24 @@ class Settings(BaseSettings):
             if path.exists() and path.is_file():
                 value = path.read_text(encoding="utf-8").strip()
                 return value or None
+        return None
+
+    def resolve_openrouter_api_key(self) -> str | None:
+        """Resolve OpenRouter key with the same env→file→None
+        precedence. OpenRouter tokens live on disk in markdown so the
+        file path is usually ``.secrets/openrouter-token.md``; the
+        first non-empty stripped line of that file is returned."""
+        if self.openrouter_api_key:
+            return self.openrouter_api_key.strip()
+        if self.openrouter_api_key_file:
+            from pathlib import Path
+
+            path = Path(self.openrouter_api_key_file)
+            if path.exists() and path.is_file():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    value = line.strip()
+                    if value:
+                        return value
         return None
 
 

@@ -70,30 +70,121 @@ def strip_reasoning_prefix(text: str) -> str:
     return text[match.end():]
 
 
+# Supported chat-LLM providers. Extend this tuple AFTER adding a build
+# branch in ``_build_chat_llm`` and a matching setting block in
+# ``config.settings``; the handler layer treats unknown providers as
+# "LLM disabled" rather than crashing the turn.
+CHAT_PROVIDERS = ("mimo", "openrouter")
+
+
+def _build_chat_llm(
+    provider: str,
+    settings: Settings,
+    *,
+    model: str | None,
+    temperature: float,
+    **kwargs: Any,
+) -> ChatOpenAI | None:
+    """Construct a ``ChatOpenAI`` for the named provider or return None
+    if the provider isn't configured (missing key, unknown name).
+
+    Keeping the per-provider wiring in one helper lets
+    ``get_chat_llm`` stay small and makes adding a provider a single
+    new ``if`` branch.
+    """
+    if provider == "mimo":
+        api_key = settings.resolve_mimo_api_key()
+        if not api_key:
+            logger.info("chat LLM disabled: no MiMo API key configured")
+            return None
+        return ChatOpenAI(
+            base_url=settings.mimo_base_url,
+            api_key=api_key,
+            model=model or settings.mimo_chat_model,
+            temperature=temperature,
+            timeout=settings.mimo_request_timeout_seconds,
+            **kwargs,
+        )
+    if provider == "openrouter":
+        api_key = settings.resolve_openrouter_api_key()
+        if not api_key:
+            logger.info("chat LLM disabled: no OpenRouter API key configured")
+            return None
+        return ChatOpenAI(
+            base_url=settings.openrouter_base_url,
+            api_key=api_key,
+            model=model or settings.openrouter_chat_model,
+            temperature=temperature,
+            timeout=settings.mimo_request_timeout_seconds,
+            **kwargs,
+        )
+    logger.warning("chat LLM: unknown provider %r — ignoring", provider)
+    return None
+
+
 def get_chat_llm(
     settings: Settings | None = None,
     *,
+    provider: str | None = None,
     model: str | None = None,
     temperature: float = 0.3,
+    with_fallback: bool = False,
     **kwargs: Any,
-) -> ChatOpenAI | None:
-    """Build a ``ChatOpenAI`` instance pointed at the configured provider.
+) -> Any | None:
+    """Build a chat-LLM client pointed at the configured provider.
 
-    Returns ``None`` if no API key is available (either via env or the
-    fallback file). Callers should check for this and short-circuit to
-    a "LLM not configured" user-facing reply rather than crash.
+    Returns ``None`` when no provider is available (no key configured,
+    or an unknown provider name). Callers must tolerate this gracefully
+    and short-circuit the turn with a "LLM disabled" reply — crashing
+    hurts UX more than admitting the limitation.
+
+    Parameters
+    ----------
+    provider :
+        Override for ``settings.chat_provider``. Useful in benches and
+        for the admin LLM-switcher when it wants to hot-probe a
+        specific backend without mutating settings.
+    with_fallback :
+        When True and ``settings.chat_fallback_provider`` is set,
+        wraps the primary runnable with LangChain's
+        ``.with_fallbacks([...])``. The fallback kicks in on ANY
+        exception from the primary — rate limits, timeouts, 5xx — and
+        replays the same message list against the backup provider
+        transparently. One level deep on purpose; three-tier would
+        hide the freshly-interesting failure mode.
     """
     settings = settings or get_settings()
-    api_key = settings.resolve_mimo_api_key()
-    if not api_key:
-        logger.info("chat LLM disabled: no MiMo API key configured")
+    effective = provider or settings.chat_provider
+    primary = _build_chat_llm(
+        effective, settings, model=model, temperature=temperature, **kwargs
+    )
+    if primary is None:
         return None
-
-    return ChatOpenAI(
-        base_url=settings.mimo_base_url,
-        api_key=api_key,
-        model=model or settings.mimo_chat_model,
+    if not with_fallback or not settings.chat_fallback_provider:
+        return primary
+    if settings.chat_fallback_provider == effective:
+        # Fallback same as primary is a no-op and a config smell.
+        logger.warning(
+            "chat LLM: fallback provider equals primary (%s) — skipping wrap",
+            effective,
+        )
+        return primary
+    fallback = _build_chat_llm(
+        settings.chat_fallback_provider,
+        settings,
+        model=None,  # fallback uses its provider's default model
         temperature=temperature,
-        timeout=settings.mimo_request_timeout_seconds,
         **kwargs,
     )
+    if fallback is None:
+        logger.warning(
+            "chat LLM: fallback provider %r not configured — primary-only",
+            settings.chat_fallback_provider,
+        )
+        return primary
+    logger.info(
+        "chat LLM: wrapping %s with fallback → %s",
+        effective,
+        settings.chat_fallback_provider,
+    )
+    return primary.with_fallbacks([fallback])

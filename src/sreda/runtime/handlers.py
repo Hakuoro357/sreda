@@ -1392,7 +1392,12 @@ def execute_conversation_chat(
         ]
 
     # --- 3. Build prompt + tools ---------------------------------------
-    llm = context.get("_llm_client") or get_chat_llm()
+    # ``with_fallback=True`` activates LangChain's
+    # ``.with_fallbacks([...])`` when ``settings.chat_fallback_provider``
+    # is set. No-op when unset, so single-provider installs behave
+    # exactly as before. Tests inject ``_llm_client`` directly to keep
+    # provider-dispatch out of their way.
+    llm = context.get("_llm_client") or get_chat_llm(with_fallback=True)
     if llm is None:
         return [
             RuntimeReply(
