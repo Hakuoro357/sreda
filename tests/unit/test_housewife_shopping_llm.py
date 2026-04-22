@@ -72,6 +72,77 @@ def test_transformer_produces_shoppable_units(recipe_ingredients):
     assert by_title["мёд"]["quantity_text"] == "200 г"
 
 
+def test_transformer_skips_llm_for_short_input():
+    """Perf: for a tiny input (1-2 items) the aggregation/normalisation
+    value of going through the LLM is low — we'd burn a 3-8 second
+    round-trip to rename "молоко 500 мл" to "молоко 500 мл". Short-
+    circuit to passthrough with category guess.
+
+    An llm that RAISES on .invoke() proves we didn't touch it."""
+    from sreda.services.housewife_shopping_llm import (
+        convert_ingredients_to_shopping_list,
+    )
+
+    class _ExplodingLLM:
+        def invoke(self, messages):
+            raise AssertionError(
+                "LLM should not be called for <=2 ingredients"
+            )
+
+    result = convert_ingredients_to_shopping_list(
+        [
+            AggregatedIngredient(
+                title="молоко", quantity_text="1 л",
+                is_optional=False, source_recipe_id="rec_1",
+            ),
+            AggregatedIngredient(
+                title="хлеб", quantity_text="1 буханка",
+                is_optional=False, source_recipe_id="rec_2",
+            ),
+        ],
+        eaters_count=2,
+        llm=_ExplodingLLM(),
+    )
+    # Passthrough preserves content verbatim
+    assert len(result) == 2
+    by_title = {r["title"]: r for r in result}
+    assert by_title["молоко"]["quantity_text"] == "1 л"
+    assert by_title["хлеб"]["quantity_text"] == "1 буханка"
+    # Category guess fills from _guess_category dict
+    assert by_title["молоко"]["category"] == "молочные"
+    assert by_title["хлеб"]["category"] == "хлеб"
+
+
+def test_transformer_threshold_kicks_in_at_3_items():
+    """3 ingredients IS enough to benefit from aggregation/conversion —
+    LLM should be invoked."""
+    from sreda.services.housewife_shopping_llm import (
+        convert_ingredients_to_shopping_list,
+    )
+    called = {"n": 0}
+
+    class _CountingLLM:
+        def invoke(self, messages):
+            called["n"] += 1
+
+            class R:
+                content = '{"items": [{"title": "x", "quantity_text": "1 шт", "category": "другое"}]}'
+            return R()
+
+    convert_ingredients_to_shopping_list(
+        [
+            AggregatedIngredient(
+                title=t, quantity_text=None,
+                is_optional=False, source_recipe_id="rec_z",
+            )
+            for t in ("a", "b", "c")
+        ],
+        eaters_count=1,
+        llm=_CountingLLM(),
+    )
+    assert called["n"] == 1
+
+
 def test_transformer_survives_json_wrapped_in_markdown():
     """Some models wrap JSON in ```json code fences or prefix text.
     Extractor must still find the JSON."""

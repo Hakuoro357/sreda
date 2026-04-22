@@ -71,6 +71,25 @@ def convert_ingredients_to_shopping_list(
     if not ingredients:
         return []
 
+    # Perf short-circuit: for 1-2 items there's nothing to aggregate
+    # and the cooking-units-to-buyable-units normalisation isn't worth
+    # a 3-8 second LLM round-trip. Passthrough with category guess.
+    # LLM pays off when there are duplicates to merge (3+ items).
+    if len(ingredients) < 3:
+        from sreda.services.housewife_shopping import _guess_category
+
+        out: list[dict[str, Any]] = []
+        for ing in ingredients:
+            row: dict[str, Any] = {
+                "title": ing.title,
+                "quantity_text": ing.quantity_text,
+                "category": _guess_category(ing.title),
+            }
+            if ing.source_recipe_id:
+                row["source_recipe_id"] = ing.source_recipe_id
+            out.append(row)
+        return out
+
     if llm is None:
         from sreda.services.llm import get_chat_llm
 
