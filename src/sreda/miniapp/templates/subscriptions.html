@@ -764,7 +764,7 @@
   // or "+ добавить" placeholder). Shared by the full renderWeeklyMenu
   // pass AND by the surgical DOM patch after a regen response, so
   // both paths produce identical HTML.
-  function _renderMenuCellInner(planId, day, mealType, cell) {
+  function _renderMenuCellInner(planId, day, mealType, cell, hideCellActions) {
     var cellJson = cell ? JSON.stringify(cell) : "null";
     var cellArg = encodeURIComponent(cellJson);
     var html =
@@ -780,29 +780,33 @@
       html += '<span class="card-subtitle" style="font-style:italic">+ добавить</span>';
     }
     html += '</div>';
-    // Always render the regen button — for empty cells it CREATES
-    // the dish, for filled cells it SWAPS. The endpoint handles both
-    // (get_cell returns None → no shopping cleanup needed → LLM just
-    // generates the initial suggestion).
-    html +=
-      '<button class="btn btn-small menu-regen-btn" ' +
-      'onclick="event.stopPropagation();window._regenerateMenuCell(\'' + escHtml(planId) + '\',' + day + ',\'' + mealType + '\',this)" ' +
-      'style="padding:4px 8px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;min-width:32px" ' +
-      (cell && (cell.recipe_id || cell.free_text)
-        ? 'title="Подобрать другое блюдо">'
-        : 'title="Подобрать блюдо">') +
-      '\u21BB' +
-      '</button>';
+    if (!hideCellActions) {
+      // Regen button — for empty cells it CREATES the dish, for
+      // filled cells it SWAPS. The endpoint handles both (get_cell
+      // returns None → no shopping cleanup needed → LLM just
+      // generates the initial suggestion). Skipped for past-week
+      // days where the meal already happened — no re-generation is
+      // meaningful for "yesterday's lunch".
+      html +=
+        '<button class="btn btn-small menu-regen-btn" ' +
+        'onclick="event.stopPropagation();window._regenerateMenuCell(\'' + escHtml(planId) + '\',' + day + ',\'' + mealType + '\',this)" ' +
+        'style="padding:4px 8px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;min-width:32px" ' +
+        (cell && (cell.recipe_id || cell.free_text)
+          ? 'title="Подобрать другое блюдо">'
+          : 'title="Подобрать блюдо">') +
+        '\u21BB' +
+        '</button>';
+    }
     return html;
   }
 
   // The full cell element — outer div with the data-cell attribute
   // that the surgical patch looks up, wrapping the inner content.
-  function _renderMenuCellOuter(planId, day, mealType, cell) {
+  function _renderMenuCellOuter(planId, day, mealType, cell, hideCellActions) {
     return (
       '<div class="menu-cell" data-cell="' + day + ':' + mealType + '" ' +
       'style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06);display:flex;align-items:center;gap:8px">' +
-      _renderMenuCellInner(planId, day, mealType, cell) +
+      _renderMenuCellInner(planId, day, mealType, cell, hideCellActions) +
       '</div>'
     );
   }
@@ -924,9 +928,11 @@
 
       out += '<div class="card" style="padding:8px 12px">';
       // Render ALL 4 meal slots per day (filled or placeholder) so the
-      // user can tap an empty slot to add without going to chat.
+      // user can tap an empty slot to add without going to chat. Pass
+      // the same hide-actions flag so per-cell regen buttons disappear
+      // for past days alongside the day-level action row.
       for (var m = 0; m < _MEAL_ORDER.length; m++) {
-        out += _renderMenuCellOuter(plan.id, d, _MEAL_ORDER[m], byCell[d + ":" + _MEAL_ORDER[m]]);
+        out += _renderMenuCellOuter(plan.id, d, _MEAL_ORDER[m], byCell[d + ":" + _MEAL_ORDER[m]], hideDayActions);
       }
       out += '</div>';
       return out;
@@ -946,10 +952,25 @@
     if (pastCount > 0) {
       var pastNoun = (pastCount === 1) ? 'день' :
                      (pastCount >= 2 && pastCount <= 4) ? 'дня' : 'дней';
+      // Inject a tiny CSS block once per page to drive the
+      // раскрыть/закрыть swap via native ``details[open]`` selector —
+      // no JS handler, no flicker on toggle. idempotent: the style
+      // tag's id guards against duplicate insertion if render runs
+      // multiple times.
+      if (!document.getElementById('menu-past-collapse-style')) {
+        var _styleEl = document.createElement('style');
+        _styleEl.id = 'menu-past-collapse-style';
+        _styleEl.textContent =
+          '.menu-past-collapse summary .past-toggle-close { display: none; }' +
+          '.menu-past-collapse[open] summary .past-toggle-open { display: none; }' +
+          '.menu-past-collapse[open] summary .past-toggle-close { display: inline; }';
+        document.head.appendChild(_styleEl);
+      }
       html += '<details class="menu-past-collapse" style="margin:8px 0 4px;padding:0;">';
       html += '<summary style="cursor:pointer;padding:10px 14px;background:rgba(0,0,0,0.04);border-radius:10px;font-weight:500;color:var(--tg-theme-hint-color,#666);list-style:none;display:flex;justify-content:space-between;align-items:center;">';
-      html += '<span>\uD83D\uDCC6 Начало недели — ' + pastCount + ' ' + pastNoun + '</span>';
-      html += '<span style="font-size:13px;opacity:0.7">раскрыть</span>';
+      html += '<span>\uD83D\uDCC6 Прошедшие дни — ' + pastCount + ' ' + pastNoun + '</span>';
+      html += '<span class="past-toggle-open" style="font-size:13px;opacity:0.7">раскрыть</span>';
+      html += '<span class="past-toggle-close" style="font-size:13px;opacity:0.7">закрыть</span>';
       html += '</summary>';
       html += '<div style="margin-top:6px">' + pastHtml + '</div>';
       html += '</details>';
