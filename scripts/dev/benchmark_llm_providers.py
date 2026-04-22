@@ -56,6 +56,15 @@ def _read_secret(rel_path: str) -> str | None:
     return val or None
 
 
+def _openrouter_key() -> str | None:
+    # OpenRouter token file is markdown with the bare key on line 1.
+    p = Path(".secrets/openrouter-token.md")
+    if not p.exists():
+        return None
+    first_line = p.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    return first_line or None
+
+
 PROVIDERS = [
     {
         "label": "MiMo-V2-Pro",
@@ -74,6 +83,26 @@ PROVIDERS = [
         "base_url": "https://api.cerebras.ai/v1",
         "api_key": _read_secret(".secrets/cerebras_chat_token.txt"),
         "model": "qwen-3-235b-a22b-instruct-2507",
+    },
+    # OpenRouter free-tier alternatives. All tool-calling supported,
+    # 262K context. Free tier is typically ~20 RPM / 200 RPD per model.
+    {
+        "label": "OR/gemma-4-31b:free",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "google/gemma-4-31b-it:free",
+    },
+    {
+        "label": "OR/nemotron-120b:free",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+    },
+    {
+        "label": "OR/ling-2.6-flash:free",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "inclusionai/ling-2.6-flash:free",
     },
 ]
 
@@ -273,6 +302,9 @@ def main(runs_per_pair: int = 2) -> int:
                     f"{median:>10} {last['iters']:>6} {last['in_tok']:>7} "
                     f"{last['out_tok']:>8} {tools_str:<40}"
                 )
+                fp = last.get("final_preview") or ""
+                if fp:
+                    print(f"    reply: {fp[:160]!r}")
 
     print()
     print("---- median wall per (provider, scenario) ----")
