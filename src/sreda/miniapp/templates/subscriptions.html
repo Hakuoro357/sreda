@@ -872,7 +872,13 @@
 
     html += '<div class="card-subtitle" style="margin-bottom:12px">с ' + escHtml(plan.week_start_date) + '</div>';
 
-    for (var d = 0; d < 7; d++) {
+    // Sreda's ``day_of_week`` convention is 0=понедельник..6=воскресенье.
+    // JS ``Date.getDay()`` is 0=Sun..6=Sat — convert with +6 %7.
+    // Past days are collapsed into a <details> so the screen opens
+    // on "today", not on week-start-you-already-cooked-past.
+    var todayD = (new Date().getDay() + 6) % 7;
+
+    function renderDayBlock(d, hideDayActions) {
       // Compute day-total calories on the fly (sum of recipe cells
       // that have per-serving nutrition). Free-text cells skipped.
       var dayKcal = 0;
@@ -885,38 +891,75 @@
         }
       }
       var title = _MENU_DAYS_RU[d];
+      if (d === todayD) {
+        title += " \u00B7 сегодня";
+      }
       if (kcalHasAny) {
         title += " \u00b7 ~" + Math.round(dayKcal) + " ккал";
       }
+      var out = '';
       // Day header row: title + "add-to-shopping-for-day" button.
       // data-day-header lets the surgical cell-patch locate this
       // header to recompute the kcal total after an in-place swap.
-      html += '<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 8px 4px;gap:8px">';
-      html += '<div class="section-title" data-day-header="' + d + '" style="margin:0;flex:1">' + escHtml(title) + '</div>';
-      // Regenerate WHOLE day — fires regen for each of the 4 meal
-      // slots; backend serialises per-plan so dishes don't duplicate.
-      html += '<button class="btn btn-small" ';
-      html += 'onclick="window._regenerateDay(\'' + escHtml(plan.id) + '\',' + d + ',this)" ';
-      html += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;flex-shrink:0" ';
-      html += 'title="Подобрать все блюда этого дня заново">';
-      html += '\u21BB день';
-      html += '</button>';
-      // Add the day's ingredients to the shopping list.
-      html += '<button class="btn btn-small" ';
-      html += 'onclick="window._generateShoppingForDay(\'' + escHtml(plan.id) + '\',' + d + ',this)" ';
-      html += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;flex-shrink:0" ';
-      html += 'title="Добавить продукты этого дня в список покупок">';
-      html += '\uD83D\uDED2';
-      html += '</button>';
-      html += '</div>';
+      out += '<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 8px 4px;gap:8px">';
+      out += '<div class="section-title" data-day-header="' + d + '" style="margin:0;flex:1">' + escHtml(title) + '</div>';
+      if (!hideDayActions) {
+        // Regenerate WHOLE day — fires regen for each of the 4 meal
+        // slots; backend serialises per-plan so dishes don't duplicate.
+        out += '<button class="btn btn-small" ';
+        out += 'onclick="window._regenerateDay(\'' + escHtml(plan.id) + '\',' + d + ',this)" ';
+        out += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;flex-shrink:0" ';
+        out += 'title="Подобрать все блюда этого дня заново">';
+        out += '\u21BB день';
+        out += '</button>';
+        // Add the day's ingredients to the shopping list.
+        out += '<button class="btn btn-small" ';
+        out += 'onclick="window._generateShoppingForDay(\'' + escHtml(plan.id) + '\',' + d + ',this)" ';
+        out += 'style="padding:4px 10px;font-size:12px;background:rgba(0,0,0,0.06);cursor:pointer;flex-shrink:0" ';
+        out += 'title="Добавить продукты этого дня в список покупок">';
+        out += '\uD83D\uDED2';
+        out += '</button>';
+      }
+      out += '</div>';
 
-      html += '<div class="card" style="padding:8px 12px">';
+      out += '<div class="card" style="padding:8px 12px">';
       // Render ALL 4 meal slots per day (filled or placeholder) so the
       // user can tap an empty slot to add without going to chat.
       for (var m = 0; m < _MEAL_ORDER.length; m++) {
-        html += _renderMenuCellOuter(plan.id, d, _MEAL_ORDER[m], byCell[d + ":" + _MEAL_ORDER[m]]);
+        out += _renderMenuCellOuter(plan.id, d, _MEAL_ORDER[m], byCell[d + ":" + _MEAL_ORDER[m]]);
       }
-      html += '</div>';
+      out += '</div>';
+      return out;
+    }
+
+    // Past days first — stuffed into a collapsed <details>. Wrapping
+    // in a native element avoids a bespoke toggle handler and keeps
+    // accessibility (keyboard toggle, screen readers) for free. Past
+    // days don't get the regen / add-to-shopping buttons: they're
+    // already cooked, actions would create noise not value.
+    var pastHtml = '';
+    var pastCount = 0;
+    for (var dp = 0; dp < todayD; dp++) {
+      pastHtml += renderDayBlock(dp, /* hideDayActions */ true);
+      pastCount++;
+    }
+    if (pastCount > 0) {
+      var pastNoun = (pastCount === 1) ? 'день' :
+                     (pastCount >= 2 && pastCount <= 4) ? 'дня' : 'дней';
+      html += '<details class="menu-past-collapse" style="margin:8px 0 4px;padding:0;">';
+      html += '<summary style="cursor:pointer;padding:10px 14px;background:rgba(0,0,0,0.04);border-radius:10px;font-weight:500;color:var(--tg-theme-hint-color,#666);list-style:none;display:flex;justify-content:space-between;align-items:center;">';
+      html += '<span>\uD83D\uDCC6 Начало недели — ' + pastCount + ' ' + pastNoun + '</span>';
+      html += '<span style="font-size:13px;opacity:0.7">раскрыть</span>';
+      html += '</summary>';
+      html += '<div style="margin-top:6px">' + pastHtml + '</div>';
+      html += '</details>';
+    }
+
+    // Today + remaining future days — rendered as usual, with full
+    // action buttons. Today first so the user lands on what they're
+    // actually eating right now.
+    for (var df = todayD; df < 7; df++) {
+      html += renderDayBlock(df, /* hideDayActions */ false);
     }
 
     // Auto-gen shopping (Stage 6 wires the button — endpoint comes later).
