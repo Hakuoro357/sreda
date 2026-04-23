@@ -68,6 +68,20 @@ _LLM_PROVIDERS_METADATA = [
         "static_model": None,
     },
     {
+        "key": "mimo-v2.5",
+        "label": "MiMo-V2.5-Pro",
+        "default_model_attr": None,
+        "resolver": "resolve_mimo_api_key",
+        "static_model": "mimo-v2.5-pro",
+    },
+    {
+        "key": "mimo-v2.5-light",
+        "label": "MiMo-V2.5 (light, для простых задач)",
+        "default_model_attr": None,
+        "resolver": "resolve_mimo_api_key",
+        "static_model": "mimo-v2.5",
+    },
+    {
         "key": "openrouter",
         "label": "OpenRouter · Gemma 4 26B MoE",
         "default_model_attr": "openrouter_chat_model",

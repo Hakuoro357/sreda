@@ -89,6 +89,10 @@ _KNOWN_TOOL_NAMES = (
     # Housewife family
     "add_family_members", "remove_family_member", "update_family_member",
     "list_family_members",
+    # Task scheduler («Расписание»)
+    "add_task", "list_tasks", "update_task",
+    "complete_task", "uncomplete_task", "cancel_task", "delete_task",
+    "attach_reminder", "detach_reminder",
     # Onboarding
     "onboarding_answered", "onboarding_deferred", "onboarding_complete",
 )
@@ -176,6 +180,9 @@ _WRITE_TOOL_NAMES = frozenset({
     "plan_week_menu", "update_menu_item", "generate_shopping_from_menu",
     "add_family_members", "remove_family_member", "update_family_member",
     "schedule_reminder", "cancel_reminder",
+    # Task scheduler write-tools (ack claims like "поставила задачу")
+    "add_task", "update_task", "complete_task", "uncomplete_task",
+    "cancel_task", "delete_task", "attach_reminder", "detach_reminder",
 })
 
 # Verb+object pairs that indicate the model claims a side-effect.
@@ -191,7 +198,10 @@ _CLAIM_VERBS = ("сохранил", "сохранила", "сохранено",
                 "запланировал", "запланировала")
 _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в покупк",
                   "в меню", "меню на", "напомина", "семь",
-                  "в твою книг", "в твой список")
+                  "в твою книг", "в твой список",
+                  # Task scheduler claims: "поставила задачу",
+                  # "добавила в расписание", "запланировала на".
+                  "задач", "в расписан", "запланирова")
 
 
 def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
@@ -229,10 +239,21 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
 # "LLM disabled" rather than crashing the turn.
 CHAT_PROVIDERS = (
     "mimo",
+    "mimo-v2.5",             # mimo-v2.5-pro — Xiaomi's next-gen baseline
+    "mimo-v2.5-light",       # mimo-v2.5 (no -pro) — lighter variant, ~2x faster
     "openrouter",            # gemma-4-26b-a4b-it (default), verified fast
     "openrouter-grok",       # x-ai/grok-4.1-fast — "lowest hallucination" claim
     "openrouter-qwen",       # qwen/qwen3.6-plus — clean runner-up in bench
 )
+
+# MiMo variants share base_url + api key — only the model id changes.
+# Same pattern as ``_OPENROUTER_MODEL_BY_PROVIDER`` below: one dict
+# entry per exposed provider key.
+_MIMO_MODEL_BY_PROVIDER = {
+    "mimo": None,                      # None = fall back to settings.mimo_chat_model
+    "mimo-v2.5": "mimo-v2.5-pro",
+    "mimo-v2.5-light": "mimo-v2.5",    # light variant for simple tasks
+}
 
 # OpenRouter variants share the same base_url + api key — they differ
 # only in which model is invoked. Keeping the mapping here means
@@ -260,15 +281,19 @@ def _build_chat_llm(
     ``get_chat_llm`` stay small and makes adding a provider a single
     new ``if`` branch.
     """
-    if provider == "mimo":
+    if provider in _MIMO_MODEL_BY_PROVIDER:
         api_key = settings.resolve_mimo_api_key()
         if not api_key:
             logger.info("chat LLM disabled: no MiMo API key configured")
             return None
+        override = _MIMO_MODEL_BY_PROVIDER[provider]
         return ChatOpenAI(
             base_url=settings.mimo_base_url,
             api_key=api_key,
-            model=model or settings.mimo_chat_model,
+            # Explicit ``model=`` beats per-variant override beats
+            # settings default. ``mimo`` → ``settings.mimo_chat_model``
+            # (currently ``mimo-v2-pro``); ``mimo-v2.5`` → ``mimo-v2.5-pro``.
+            model=model or override or settings.mimo_chat_model,
             temperature=temperature,
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,

@@ -27,6 +27,7 @@ from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
+from sreda.services.tasks import TaskService
 
 logger = logging.getLogger(__name__)
 
@@ -1246,6 +1247,354 @@ def build_housewife_tools(
             return "error: internal"
         return "ok:removed" if ok else f"error: member {member_id!r} not found"
 
+    # ------------------------------------------------------------------
+    # Task scheduler («Расписание») — MVP tools
+    # ------------------------------------------------------------------
+
+    task_service = TaskService(session, reminder_service=service)
+
+    def _parse_task_date(raw: str | None) -> "date | None":
+        """Parse the date argument accepted by add_task/update_task/list_tasks.
+        ``today`` / ``tomorrow`` / ``inbox`` / ISO. Returns None for
+        inbox or unparseable input (caller decides whether to error)."""
+        from datetime import date, datetime as _dt, timedelta as _td
+
+        if raw is None:
+            return None
+        s = raw.strip().lower()
+        if not s or s == "inbox":
+            return None
+        if s == "today":
+            return _dt.now(timezone.utc).date()
+        if s == "tomorrow":
+            return _dt.now(timezone.utc).date() + _td(days=1)
+        try:
+            return _dt.fromisoformat(s).date()
+        except ValueError:
+            return None
+
+    def _parse_hhmm(raw: str | None) -> "time | None":
+        from datetime import time as _t
+
+        if not raw:
+            return None
+        s = raw.strip()
+        if not s:
+            return None
+        # Accept "07:00" or "7:00" or full ISO "07:00:00"
+        try:
+            parts = s.split(":")
+            h = int(parts[0])
+            m = int(parts[1]) if len(parts) > 1 else 0
+            return _t(hour=h, minute=m)
+        except (ValueError, IndexError):
+            return None
+
+    def _fmt_task_for_llm(t: Any) -> str:
+        """Compact one-liner for list_tasks output."""
+        bits: list[str] = [f"[{t.id}]"]
+        bits.append(t.title)
+        when: list[str] = []
+        if t.scheduled_date:
+            when.append(t.scheduled_date.isoformat())
+        if t.time_start:
+            hhmm = t.time_start.strftime("%H:%M")
+            if t.time_end:
+                hhmm += "–" + t.time_end.strftime("%H:%M")
+            when.append(hhmm)
+        if when:
+            bits.append("on " + " ".join(when))
+        if t.recurrence_rule:
+            bits.append(f"recurring={t.recurrence_rule}")
+        if t.reminder_id:
+            bits.append(
+                f"reminder=за {t.reminder_offset_minutes or 0}мин"
+            )
+        if t.status != "pending":
+            bits.append(f"status={t.status}")
+        return " · ".join(bits)
+
+    @lc_tool
+    def add_task(
+        title: str,
+        scheduled_date: str | None = None,
+        time_start: str | None = None,
+        time_end: str | None = None,
+        recurrence_rule: str | None = None,
+        notes: str | None = None,
+        reminder_offset_minutes: int | None = None,
+    ) -> str:
+        """Create a task in the user's planner (Расписание).
+
+        Use for any "поставь задачу X", "добавь Y в расписание",
+        "запиши на завтра Z". Map the user's phrasing into:
+
+        Args:
+            title: short name ("утренняя разминка", "встреча с врачом")
+            scheduled_date: one of ``"today"``, ``"tomorrow"``, an ISO
+                date ``"2026-04-25"``, ``"inbox"`` / null for an
+                undated task (not shown on today-view).
+            time_start: local time ``"HH:MM"`` (e.g. ``"07:00"`` = 7 AM
+                in the user's timezone). Optional.
+            time_end: local time, optional — "07:00–07:30" uses both.
+            recurrence_rule: RFC 5545 RRULE, UTC-anchored BYHOUR like
+                ``schedule_reminder``. Example ``каждый будний день
+                7 утра MSK`` → ``"FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR;
+                BYHOUR=4;BYMINUTE=0"`` (MSK−3 = UTC).
+            notes: optional free-form note.
+            reminder_offset_minutes: minutes BEFORE time_start to ping
+                the user. Pass only when the user EXPLICITLY asks for
+                a reminder at creation time ("с напоминанием за 15
+                минут"). Otherwise leave null and ASK the user AFTER
+                the task is created.
+
+        Returns ``ok:created:task_<id>`` (possibly with ``+reminder``
+        suffix) or ``error:<reason>``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        date_obj = _parse_task_date(scheduled_date)
+        t_start = _parse_hhmm(time_start)
+        t_end = _parse_hhmm(time_end)
+        # reminder requires a schedule
+        if reminder_offset_minutes is not None and (not date_obj or not t_start):
+            return (
+                "error: reminder requires scheduled_date + time_start; "
+                "re-call without reminder_offset_minutes and ask user"
+            )
+        try:
+            task = task_service.add(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                title=title,
+                scheduled_date=date_obj,
+                time_start=t_start,
+                time_end=t_end,
+                recurrence_rule=recurrence_rule,
+                notes=notes,
+                reminder_offset_minutes=reminder_offset_minutes,
+            )
+        except ValueError as exc:
+            return f"error:{exc}"
+        except Exception:  # noqa: BLE001
+            logger.exception("add_task failed")
+            return "error: internal"
+        suffix = ""
+        if task.reminder_id:
+            suffix = f":reminder=за {task.reminder_offset_minutes}мин"
+        return f"ok:created:{task.id}{suffix}"
+
+    @lc_tool
+    def list_tasks(date: str = "today", status: str = "pending") -> str:
+        """List tasks filtered by date and status.
+
+        Args:
+            date: ``"today"`` (default) / ``"tomorrow"`` / ISO date /
+                ``"inbox"`` (tasks without a date) / ``"all"`` (no
+                date filter).
+            status: ``"pending"`` (default) / ``"completed"`` /
+                ``"all"``.
+
+        Returns a text listing with task ids the LLM can pass to
+        complete_task / update_task / cancel_task. Empty set →
+        ``"no tasks"``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        s = (date or "today").strip().lower()
+        if s == "all":
+            # No date filter — returns every row regardless of
+            # scheduled_date (both dated and inbox tasks).
+            date_obj = None
+            include_no_date = False
+        elif s == "inbox":
+            # Only rows with scheduled_date IS NULL.
+            date_obj = None
+            include_no_date = True
+        else:
+            date_obj = _parse_task_date(s)
+            include_no_date = False
+
+        status_arg: str | None
+        if status == "all":
+            status_arg = None
+        else:
+            status_arg = status
+
+        # For inbox specifically, we want ONLY no-date rows; list()
+        # treats scheduled_date=None + include_no_date=True as that.
+        if s == "inbox":
+            rows = task_service.list(
+                tenant_id=tenant_id, user_id=user_id,
+                scheduled_date=None, include_no_date=True,
+                status=status_arg,
+            )
+        else:
+            rows = task_service.list(
+                tenant_id=tenant_id, user_id=user_id,
+                scheduled_date=date_obj, include_no_date=include_no_date,
+                status=status_arg,
+            )
+        if not rows:
+            return "no tasks"
+        return "\n".join(_fmt_task_for_llm(t) for t in rows)
+
+    @lc_tool
+    def update_task(
+        task_id: str,
+        title: str | None = None,
+        scheduled_date: str | None = None,
+        time_start: str | None = None,
+        time_end: str | None = None,
+        recurrence_rule: str | None = None,
+        notes: str | None = None,
+    ) -> str:
+        """Patch an existing task. Only pass fields that changed.
+
+        Changes to ``scheduled_date`` / ``time_start`` automatically
+        reschedule the linked reminder (if any). Use
+        ``attach_reminder`` / ``detach_reminder`` to toggle the
+        reminder itself.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        date_obj = _parse_task_date(scheduled_date) if scheduled_date is not None else None
+        t_start = _parse_hhmm(time_start) if time_start is not None else None
+        t_end = _parse_hhmm(time_end) if time_end is not None else None
+        try:
+            task = task_service.update(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                task_id=task_id.strip(),
+                title=title,
+                scheduled_date=date_obj,
+                time_start=t_start,
+                time_end=t_end,
+                recurrence_rule=recurrence_rule,
+                notes=notes,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("update_task failed")
+            return "error: internal"
+        if task is None:
+            return f"error: task {task_id!r} not found"
+        return f"ok:updated:{task.id}"
+
+    @lc_tool
+    def complete_task(task_id: str) -> str:
+        """Mark a task as done. For one-shot tasks with a linked
+        reminder, the reminder gets cancelled automatically (no ping
+        for something already finished). Recurring tasks keep their
+        reminder active — tomorrow's occurrence still fires."""
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            task = task_service.complete(
+                tenant_id=tenant_id, user_id=user_id, task_id=task_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("complete_task failed")
+            return "error: internal"
+        if task is None:
+            return f"error: task {task_id!r} not found"
+        return f"ok:completed:{task.id}"
+
+    @lc_tool
+    def uncomplete_task(task_id: str) -> str:
+        """Restore a completed task to pending. The linked reminder,
+        if it got cancelled on completion, is NOT brought back — the
+        user can call ``attach_reminder`` to re-add one."""
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            task = task_service.uncomplete(
+                tenant_id=tenant_id, user_id=user_id, task_id=task_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("uncomplete_task failed")
+            return "error: internal"
+        if task is None:
+            return f"error: task {task_id!r} not found"
+        return f"ok:uncompleted:{task.id}"
+
+    @lc_tool
+    def cancel_task(task_id: str) -> str:
+        """Soft-cancel a task — row stays in DB with status=cancelled,
+        disappears from pending lists. Cancels the linked reminder
+        if any. Use when user says "отмени задачу X" without asking
+        to fully delete it."""
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            task = task_service.cancel(
+                tenant_id=tenant_id, user_id=user_id, task_id=task_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cancel_task failed")
+            return "error: internal"
+        if task is None:
+            return f"error: task {task_id!r} not found"
+        return f"ok:cancelled:{task.id}"
+
+    @lc_tool
+    def delete_task(task_id: str) -> str:
+        """Hard-delete a task (row gone from DB). Cancels the linked
+        reminder if any. Use when user says "убери совсем", "удали"."""
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            ok = task_service.delete(
+                tenant_id=tenant_id, user_id=user_id, task_id=task_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("delete_task failed")
+            return "error: internal"
+        return "ok:deleted" if ok else f"error: task {task_id!r} not found"
+
+    @lc_tool
+    def attach_reminder(task_id: str, offset_minutes: int) -> str:
+        """Attach a reminder to an already-created task. Use when the
+        user answered the post-creation "нужно ли напоминание?"
+        question with "да, за N минут". Requires the task to have a
+        scheduled date + time_start (can't remind for inbox tasks)."""
+        if not user_id:
+            return "error: no user_id context"
+        if not isinstance(offset_minutes, int) or offset_minutes <= 0:
+            return "error: offset_minutes must be a positive integer"
+        try:
+            task = task_service.attach_reminder(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                task_id=task_id.strip(),
+                offset_minutes=offset_minutes,
+            )
+        except ValueError as exc:
+            return f"error:{exc}"
+        except Exception:  # noqa: BLE001
+            logger.exception("attach_reminder failed")
+            return "error: internal"
+        if task is None:
+            return f"error: task {task_id!r} not found"
+        return f"ok:reminder_attached:{task.reminder_id}:за {offset_minutes}мин"
+
+    @lc_tool
+    def detach_reminder(task_id: str) -> str:
+        """Remove the reminder from a task (cancels the underlying
+        FamilyReminder). Use when user says "убери напоминание с
+        этой задачи"."""
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            task = task_service.detach_reminder(
+                tenant_id=tenant_id, user_id=user_id, task_id=task_id.strip(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("detach_reminder failed")
+            return "error: internal"
+        if task is None:
+            return f"error: task {task_id!r} not found"
+        return "ok:reminder_detached"
+
     @lc_tool
     def clear_menu(week_start: str) -> str:
         """Delete the weekly menu for the given week.
@@ -1300,4 +1649,14 @@ def build_housewife_tools(
         list_family_members,
         update_family_member,
         remove_family_member,
+        # Task scheduler («Расписание») — v1 MVP (2026-04-22)
+        add_task,
+        list_tasks,
+        update_task,
+        complete_task,
+        uncomplete_task,
+        cancel_task,
+        delete_task,
+        attach_reminder,
+        detach_reminder,
     ]
