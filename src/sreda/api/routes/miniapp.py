@@ -1101,9 +1101,107 @@ def delete_recipe_endpoint(
 
 
 # (menu helpers + 5 endpoints removed below — they lived here before
-#  the 2026-04-22 Mini App cleanup)
+#  the 2026-04-22 Mini App cleanup. Task scheduler below replaces
+#  the UI slot.)
 
 
+# ---------------------------------------------------------------------------
+# JSON API — Task scheduler («Расписание»)
+# ---------------------------------------------------------------------------
+
+
+def _task_dict(task) -> dict:
+    """Serialize one Task row for the /schedule/today response.
+
+    Time fields come back as ``"HH:MM"`` strings (LLM tools accept the
+    same shape). ``has_reminder`` + ``reminder_offset_minutes`` let
+    the Mini App render the 🔔 icon + "напомнить за N мин" label
+    without an extra FK fetch per row.
+    """
+    return {
+        "id": task.id,
+        "title": task.title,
+        "notes": task.notes,
+        "time_start": task.time_start.strftime("%H:%M") if task.time_start else None,
+        "time_end": task.time_end.strftime("%H:%M") if task.time_end else None,
+        "is_recurring": bool(task.recurrence_rule),
+        "has_reminder": bool(task.reminder_id),
+        "reminder_offset_minutes": task.reminder_offset_minutes,
+        "delegated_to": task.delegated_to,
+    }
+
+
+# Time-of-day buckets for the schedule screen. Strict cuts chosen to
+# match user mental model ("morning" ends at lunch, "evening" starts
+# after the work day for most users). Tasks with time_start < 12:00
+# → morning; 12:00 ≤ t < 17:00 → day; t ≥ 17:00 → evening; no time
+# → "no_time" bucket (shown below the timed ones).
+def _bucket_task(task) -> str:
+    if task.time_start is None:
+        return "no_time"
+    hour = task.time_start.hour
+    if hour < 12:
+        return "morning"
+    if hour < 17:
+        return "day"
+    return "evening"
+
+
+_SECTION_LABELS: dict[str, str] = {
+    "morning": "Сегодня утром",
+    "day": "Сегодня днём",
+    "evening": "Сегодня вечером",
+    "no_time": "Без времени",
+}
+_SECTION_ORDER = ("morning", "day", "evening", "no_time")
+
+
+@router.get("/api/v1/schedule/today")
+def get_today_schedule(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Return today's pending tasks grouped by time-of-day.
+
+    Shape:
+      ``{"date": "2026-04-23",
+         "groups": [{"section": "morning", "label": "Сегодня утром",
+                     "tasks": [...]}, ...]}``
+
+    Empty buckets are omitted so the client doesn't render blank
+    section headers. Read-only — no mutations from Mini App in the
+    MVP; all task CRUD goes through voice.
+    """
+    from datetime import datetime as _dt
+
+    from sreda.services.tasks import TaskService
+
+    if ctx.user_id is None:
+        return {"date": None, "groups": []}
+
+    today = _dt.now(timezone.utc).date()
+    tasks = TaskService(session).list_today(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, today=today,
+    )
+
+    grouped: dict[str, list[dict]] = {k: [] for k in _SECTION_ORDER}
+    for t in tasks:
+        grouped[_bucket_task(t)].append(_task_dict(t))
+
+    groups = [
+        {
+            "section": section,
+            "label": _SECTION_LABELS[section],
+            "tasks": grouped[section],
+        }
+        for section in _SECTION_ORDER
+        if grouped[section]
+    ]
+
+    return {
+        "date": today.isoformat(),
+        "groups": groups,
+    }
 
 
 # ---------------------------------------------------------------------------

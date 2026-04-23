@@ -127,6 +127,7 @@
     shopping: null,
     recipes: null,
     recipeDetail: {},
+    schedule: null,
     family: null,
     loading: true,
     error: null,
@@ -192,6 +193,18 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.reminders = { items: [], _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadSchedule() {
+    return apiFetch("/miniapp/api/v1/schedule/today").then(function(res) {
+      state.schedule = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.schedule = { groups: [], _error: true };
         render();
       }
     });
@@ -483,6 +496,101 @@
       html += '</div>';
     }
     html += '<div class="card-subtitle" style="text-align:center;margin-top:16px">Всего: ' + items.length + '</div>';
+    return html;
+  }
+
+  // --- Screen: Schedule (#/schedule) ---
+  // Day-of-week names for the header line. 0=Sunday..6=Saturday as
+  // per JS Date.getDay() — different from the server's
+  // ``day_of_week`` convention (0=Monday) but since we just need
+  // today's label the JS mapping is simpler.
+  var _SCHEDULE_DAY_NAMES_RU = [
+    "воскресенье", "понедельник", "вторник", "среда",
+    "четверг", "пятница", "суббота"
+  ];
+  var _SCHEDULE_MONTH_NAMES_RU = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря"
+  ];
+
+  function renderSchedule() {
+    setupBackButton(true);
+    var now = new Date();
+    var dayLabel = _SCHEDULE_DAY_NAMES_RU[now.getDay()]
+      + ", " + now.getDate() + " " + _SCHEDULE_MONTH_NAMES_RU[now.getMonth()];
+    // Capitalize first letter for the heading.
+    var headerDate = dayLabel.charAt(0).toUpperCase() + dayLabel.slice(1);
+
+    var html = '<h1>\uD83D\uDCC5 Расписание</h1>';  // 📅
+    html += '<div class="card-subtitle" style="margin-bottom:16px">' + escHtml(headerDate) + '</div>';
+
+    if (state.schedule === null) {
+      loadSchedule();
+      return html + renderLoading();
+    }
+    if (state.schedule && state.schedule._error) {
+      return html + '<div class="error-state">Не удалось загрузить расписание.</div>';
+    }
+
+    var groups = (state.schedule && state.schedule.groups) || [];
+    if (groups.length === 0) {
+      html += '<div class="empty-state">';
+      html += 'Сегодня задач не запланировано.<br><br>';
+      html += 'Скажи Среде: «поставь задачу прогуляться в 18:00» ';
+      html += 'или «добавь утреннюю разминку каждый будний день».';
+      html += '</div>';
+      return html;
+    }
+
+    for (var g = 0; g < groups.length; g++) {
+      var group = groups[g];
+      html += '<div class="section-title" style="margin:16px 0 8px 4px">';
+      html += escHtml(group.label);
+      html += '</div>';
+      html += '<div class="card" style="padding:4px 12px">';
+      var tasks = group.tasks || [];
+      for (var i = 0; i < tasks.length; i++) {
+        var t = tasks[i];
+        var iconsPrefix = "";
+        if (t.is_recurring) iconsPrefix += "\uD83D\uDD04 ";   // 🔄
+        if (t.has_reminder) iconsPrefix += "\uD83D\uDD14 ";   // 🔔
+
+        html += '<div style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)">';
+        html += '<div style="font-weight:500">'
+          + iconsPrefix + escHtml(t.title) + '</div>';
+
+        // Meta line: time · reminder-offset (if any) · delegated (if any)
+        var metaBits = [];
+        if (t.time_start) {
+          metaBits.push(t.time_end
+            ? (t.time_start + "–" + t.time_end)
+            : t.time_start);
+        }
+        if (t.has_reminder && t.reminder_offset_minutes) {
+          metaBits.push("напомнить за " + t.reminder_offset_minutes + " мин");
+        }
+        if (t.delegated_to) {
+          metaBits.push("поручено: " + escHtml(t.delegated_to));
+        }
+        if (metaBits.length > 0) {
+          html += '<div class="card-subtitle" style="margin-top:2px">'
+            + metaBits.join(" · ") + '</div>';
+        }
+        if (t.notes) {
+          html += '<div class="card-subtitle" style="margin-top:2px;font-style:italic">'
+            + escHtml(t.notes) + '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    // Voice-only hint at the bottom. Read-only Mini App: all edits
+    // go through the chat. Single-line, muted, not clickable.
+    html += '<div class="card-subtitle" ';
+    html += 'style="text-align:center;margin-top:24px;padding:0 8px;line-height:1.4">';
+    html += 'Для изменения или удаления задачи просто скажи Среде голосом.';
+    html += '</div>';
     return html;
   }
 
@@ -1046,6 +1154,8 @@
       html = renderSubscriptions();
     } else if (route === "/reminders") {
       html = renderReminders();
+    } else if (route === "/schedule") {
+      html = renderSchedule();
     } else if (route === "/shopping") {
       html = renderShopping();
     } else if (route === "/family") {
@@ -1485,6 +1595,7 @@
     // will re-trigger them lazily if the user navigates there.
     var route = getRoute();
     if (route === "/reminders" && state.reminders !== null) loadReminders();
+    if (route === "/schedule" && state.schedule !== null) loadSchedule();
     if (route === "/shopping" && state.shopping !== null) loadShopping();
     if (route === "/recipes" && state.recipes !== null) loadRecipes();
     if (route === "/family" && state.family !== null) loadFamily();
