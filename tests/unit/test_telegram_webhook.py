@@ -156,18 +156,19 @@ def test_telegram_webhook_creates_new_user_and_sends_welcome_message(
     assert response.status_code == 202
     assert len(sent_messages) == 1
     assert sent_messages[0]["chat_id"] == NEW_USER_CHAT_ID
-    # 2026-04-27: pending-бот упрощён до одного развёрнутого welcome
-    # без кнопок. Текст содержит ключевые маркеры: «Среда», «модератор»,
-    # описания всех функций (расписание, дела, покупки, рецепты, семья).
+    # 2026-04-27 (вечер): pending-бот шлёт цепочку из 10 сообщений.
+    # Первое — intro с одной кнопкой «🎙️ Голос →» (callback pb:voice),
+    # которая ведёт на следующее сообщение про голос.
     text = sent_messages[0]["text"]
     assert "Среда" in text
-    assert "модератор" in text
-    assert "Голос" in text  # самый верхний функциональный блок
-    assert "Расписание" in text
-    assert "Список покупок" in text
-    # Кнопок в pending-фазе больше нет.
+    assert "тапай" in text.lower() or "кнопк" in text.lower()
     markup = sent_messages[0]["reply_markup"]
-    assert markup is None
+    assert markup is not None
+    rows = markup["inline_keyboard"]
+    assert len(rows) == 1
+    btn = rows[0][0]
+    assert btn["callback_data"] == "pb:voice"
+    assert "Голос" in btn["text"]
 
     session = get_session_factory()()
     try:
