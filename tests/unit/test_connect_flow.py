@@ -304,12 +304,26 @@ def test_connect_callback_uses_existing_legacy_workspace_and_assistant(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_eds", name="tenant_eds"))
+        # 2026-04-27: approved_at + предзаполненный профиль обязательны,
+        # иначе webhook'ом перехватит state-machine онбординга и
+        # callback `onboarding:connect_eds` не дойдёт до connect-flow.
+        from datetime import datetime as _dt2
+        from datetime import timezone as _tz2
+
+        from sreda.db.models.user_profile import TenantUserProfile
+
+        _now = _dt2.now(_tz2.utc)
+        session.add(Tenant(id="tenant_eds", name="tenant_eds", approved_at=_now))
         session.add(Workspace(id="workspace_eds", tenant_id="tenant_eds", name="workspace_eds"))
         session.add(User(id="user_eds", tenant_id="tenant_eds", telegram_account_id=CHAT_ID))
         session.flush()
         session.add(Assistant(id="assistant_eds", tenant_id="tenant_eds", workspace_id="workspace_eds", name="Среда"))
         session.add(TenantFeature(id="tenant_eds:core_assistant", tenant_id="tenant_eds", feature_key="core_assistant", enabled=True))
+        session.add(TenantUserProfile(
+            id="tup_eds", tenant_id="tenant_eds", user_id="user_eds",
+            display_name="Тестовый Юзер", address_form="ty",
+            created_at=_now, updated_at=_now,
+        ))
         session.commit()
         BillingService(session).start_base_subscription("tenant_eds")
     finally:
@@ -728,10 +742,25 @@ def test_submit_form_shows_neutral_message_when_inline_verification_raises(
 
 
 def _seed_bundle(session) -> None:
-    session.add(Tenant(id="tenant_1", name="Tenant 1"))
+    # 2026-04-27: тенант помечен approved (иначе approval-gate в
+    # telegram_webhook посылает запросы в pending_bot вместо нормального
+    # flow); профиль предзаполнен display_name+address_form, чтобы
+    # state-machine онбординга «имя+ты/вы» не перехватывала.
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from sreda.db.models.user_profile import TenantUserProfile
+
+    now = _dt.now(_tz.utc)
+    session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=now))
     session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
     session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=CHAT_ID))
     session.flush()
     session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_1", name="Среда"))
     session.add(TenantFeature(id="tenant_1:core_assistant", tenant_id="tenant_1", feature_key="core_assistant", enabled=True))
+    session.add(TenantUserProfile(
+        id="tup_test", tenant_id="tenant_1", user_id="user_1",
+        display_name="Тестовый Юзер", address_form="ty",
+        created_at=now, updated_at=now,
+    ))
     session.commit()

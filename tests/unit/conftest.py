@@ -44,6 +44,16 @@ def _default_encryption_key(monkeypatch):
     # that historically hard-coded "primary".
     if not os.environ.get("SREDA_ENCRYPTION_KEY_ID"):
         monkeypatch.setenv("SREDA_ENCRYPTION_KEY_ID", "primary")
+    # 152-ФЗ обезличивание Часть 1 (2026-04-27): hash tg_id требует
+    # salt'а; иначе services.tg_account_hash.hash_tg_account падает
+    # RuntimeError'ом, и любой test, который проходит через
+    # find_user_by_chat_id или ensure_telegram_user_bundle, ломается
+    # при импорте. Стабильный test-salt — детерминирует hash.
+    if not os.environ.get("SREDA_TG_ACCOUNT_SALT"):
+        monkeypatch.setenv(
+            "SREDA_TG_ACCOUNT_SALT",
+            "test-salt-for-unit-tests-do-not-use-in-prod",
+        )
 
     # Clear the LRU-cached EncryptionService / Settings so the new env
     # vars take effect for this test's session.

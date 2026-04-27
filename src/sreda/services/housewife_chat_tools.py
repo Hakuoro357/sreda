@@ -13,10 +13,42 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Annotated, Any
 
 from langchain_core.tools import tool as lc_tool
+from pydantic import BeforeValidator
 from sqlalchemy.orm import Session
+
+
+def _coerce_to_list(value: Any) -> Any:
+    """Pydantic BeforeValidator: если LLM прислала JSON-строку
+    типа ``'["a","b"]'`` (что наблюдалось в проде у MiMo для
+    save_recipe.tags 50+ раз/неделю) — парсим её в нативный list,
+    чтобы pydantic-валидация не упала. Не-строки + не-JSON
+    оставляем как есть; ``None`` → ``None``.
+    """
+    if value is None or isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return value
+
+
+# Type aliases для tool-сигнатур: list-args, которые LLM может
+# случайно сериализовать в JSON-строку. BeforeValidator превращает
+# строку обратно в list ДО валидации pydantic.
+ListOfStr = Annotated[list[str] | None, BeforeValidator(_coerce_to_list)]
+ListOfDict = Annotated[
+    list[dict[str, Any]], BeforeValidator(_coerce_to_list)
+]
 
 from sreda.services.housewife_onboarding import (
     TOPIC_DESCRIPTIONS,
@@ -26,6 +58,7 @@ from sreda.services.housewife_family import HousewifeFamilyService
 from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
+from sreda.services.checklists import ChecklistService
 from sreda.services.housewife_shopping import HousewifeShoppingService
 from sreda.services.tasks import TaskService
 
@@ -44,10 +77,19 @@ def build_housewife_tools(
     session: Session,
     tenant_id: str,
     user_id: str | None,
+    pending_buttons_state: dict | None = None,
 ) -> list[Any]:
     """Return LLM tools for the housewife skill, bound to the given
     tenant/user. Called from ``execute_conversation_chat`` when the
-    feature_key resolves to ``housewife_assistant``."""
+    feature_key resolves to ``housewife_assistant``.
+
+    ``pending_buttons_state``: optional mutable dict for the
+    ``reply_with_buttons`` tool (Часть 0 плана v2). When LLM calls
+    that tool, the (text, buttons) payload is stashed here. The caller
+    (``execute_conversation_chat``) reads it after the LLM loop ends
+    and converts to an inline keyboard. Pass ``None`` (or omit) to
+    disable button support for that turn — then the tool is absent
+    from the returned list."""
 
     service = HousewifeReminderService(session)
 
@@ -105,6 +147,24 @@ def build_housewife_tools(
             trigger_at = trigger_at.replace(tzinfo=timezone.utc)
         else:
             trigger_at = trigger_at.astimezone(timezone.utc)
+
+        # 2026-04-23 «баг 2a»: для one-shot напоминаний — не создаём те
+        # что уже просрочены. Иначе LLM (которая любит расписывать «в
+        # 11:00, 15:00, 20:00 сегодня» при запросе в 20:42) плодит пачку
+        # past-due записей, и воркер их выстреливает скопом. Для
+        # recurring не трогаем: RRULE сам найдёт следующее будущее
+        # срабатывание.
+        from sreda.services.housewife_reminders import (
+            LATE_FIRE_GRACE_MINUTES,
+        )
+        if not recurrence_rule:
+            now_utc = datetime.now(timezone.utc)
+            late_by_min = (now_utc - trigger_at).total_seconds() / 60
+            if late_by_min > LATE_FIRE_GRACE_MINUTES:
+                return (
+                    f"skipped:past:{trigger_iso}:"
+                    f"late_by_{int(late_by_min)}min"
+                )
 
         try:
             reminder = service.schedule(
@@ -528,12 +588,12 @@ def build_housewife_tools(
     @lc_tool
     def save_recipe(
         title: str,
-        ingredients: list[dict[str, Any]],
+        ingredients: ListOfDict,
         instructions_md: str,
         servings: int,
         source: str,
         source_url: str | None = None,
-        tags: list[str] | None = None,
+        tags: ListOfStr = None,
         calories_per_serving: float | None = None,
         protein_per_serving: float | None = None,
         fat_per_serving: float | None = None,
@@ -627,7 +687,7 @@ def build_housewife_tools(
         return f"ok:saved:{recipe.id}"
 
     @lc_tool
-    def save_recipes_batch(recipes: list[dict[str, Any]]) -> str:
+    def save_recipes_batch(recipes: ListOfDict) -> str:
         """Batch-save multiple recipes to the user's recipe book in one call.
 
         **Prefer this over calling ``save_recipe`` in a loop** when the
@@ -1312,6 +1372,13 @@ def build_housewife_tools(
             )
         if t.status != "pending":
             bits.append(f"status={t.status}")
+        # 2026-04-27 fix (прод-баг): юзер сохранял в notes детали кроя
+        # («Лайм — простыня 140×200×20, пододеяльник 140×200, наволочки
+        # 50×70»), потом спрашивал бота «что по лайму?» — LLM отвечала
+        # «нет данных», потому что list_tasks отдавал только title без
+        # notes. Mini App в _task_dict notes отдаёт. Догоняем формат.
+        if t.notes:
+            bits.append(f"notes={t.notes}")
         return " · ".join(bits)
 
     @lc_tool
@@ -1428,6 +1495,16 @@ def build_housewife_tools(
                 tenant_id=tenant_id, user_id=user_id,
                 scheduled_date=None, include_no_date=True,
                 status=status_arg,
+            )
+        elif date_obj is not None and status_arg == "pending":
+            # Specific date + pending status → use RRULE-aware path so
+            # a daily task created on day N surfaces on day N+k too.
+            # Regression 2026-04-23: base list() returns only rows where
+            # scheduled_date == date_obj, missing all recurring
+            # expansions. list_today() handles that correctly.
+            rows = task_service.list_today(
+                tenant_id=tenant_id, user_id=user_id,
+                today=date_obj,
             )
         else:
             rows = task_service.list(
@@ -1621,6 +1698,274 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:cleared:{n}"
 
+    # ------------------------------------------------------------------
+    # reply_with_buttons (Часть 0 плана v2 — inline-кнопки для ответов)
+    # ------------------------------------------------------------------
+    @lc_tool
+    def reply_with_buttons(text: str, buttons: list[str]) -> str:
+        """Отправить ответ с 2-4 inline-кнопками-вариантами.
+
+        ИСПОЛЬЗУЙ ОБЯЗАТЕЛЬНО, если твой ответ содержит вопрос к юзеру.
+        Кнопки — короткие (≤20 символов) реплики, которые юзер мог бы
+        сам написать в ответ. Никаких «Да/Нет» — всегда конкретика:
+        вместо «Да» → «Да, собери меню», вместо «Нет» → «Не сейчас».
+
+        Примеры корректных вызовов:
+        - text="Помню у Пети безлактозная. Собрать меню?",
+          buttons=["Да, собери", "Не сейчас", "Покажи список блюд"]
+        - text="Кто идёт к врачу?",
+          buttons=["Петя — к педиатру", "Маша — к ортодонту", "Другое"]
+
+        Не добавляй пустых действий («Отмена», «Назад») — Telegram
+        даёт стандартный back-button сам.
+
+        Если вопроса в ответе нет — НЕ вызывай этот тул, отвечай
+        обычным текстом.
+
+        Args:
+            text: Текст сообщения пользователю.
+            buttons: 2-4 короткие реплики-варианта ответа.
+
+        Returns: ok:buttons:<N> где N — число принятых кнопок.
+        """
+        if pending_buttons_state is None:
+            # Caller не передал state — тул не работает, возвращаем
+            # ошибку, чтобы LLM в логах это увидела и ответила без
+            # кнопок на следующей итерации.
+            return "error: buttons disabled in this context"
+        clean = [b for b in (buttons or []) if b and b.strip()]
+        clean = clean[:4]
+        if len(clean) < 2:
+            return "error: need at least 2 buttons"
+        pending_buttons_state["text"] = (text or "").strip()
+        pending_buttons_state["buttons"] = clean
+        return f"ok:buttons:{len(clean)}"
+
+    # ------------------------------------------------------------------
+    # Checklists — именованные списки дел с галочками (план 2026-04-25)
+    # ------------------------------------------------------------------
+    checklist_service = ChecklistService(session)
+
+    @lc_tool
+    def create_checklist(title: str) -> str:
+        """Create a named checklist (todo-list with checkboxes).
+
+        Use when the user dictates a NAMED list of items WITHOUT
+        specific dates — e.g. «План кроя на эту неделю», «Дела на дачу»,
+        «Сборы в школу». NOT for shopping (use add_shopping_items)
+        and NOT for events with dates (use add_task).
+
+        Args:
+            title: short list name (≤200 chars), e.g. «План кроя на эту неделю».
+
+        Returns: ``ok:created:checklist_<id>:<title>`` or ``error:<msg>``.
+        Pair with ``add_checklist_items`` next call to populate.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            cl = checklist_service.create_list(
+                tenant_id=tenant_id, user_id=user_id, title=title,
+            )
+        except ValueError as exc:
+            return f"error: {exc}"
+        except Exception:  # noqa: BLE001
+            logger.exception("create_checklist failed")
+            return "error: internal"
+        return f"ok:created:{cl.id}:{cl.title}"
+
+    @lc_tool
+    def add_checklist_items(list_id_or_title: str, items: list[str]) -> str:
+        """Add items to an existing checklist (or create one if missing).
+
+        Resolves ``list_id_or_title`` either by exact id (``checklist_*``)
+        or fuzzy title match against active lists. If no match — creates
+        a NEW checklist with that title and adds items there.
+
+        Args:
+            list_id_or_title: id like ``checklist_xxx`` OR a short title
+                that fuzzy-matches an existing active list (e.g. «План кроя»).
+            items: list of item titles, e.g. ["Лаванда 298 ТС, простыня
+                141×200×19", "Шампань страйп, простыня 202×204×26"].
+
+        Returns: ``ok:added:N:list=<id>`` or ``error:<msg>``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        if not items or not any((i or "").strip() for i in items):
+            return "error: empty items"
+
+        cl = checklist_service.find_list_by_title(
+            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        )
+        if cl is None:
+            try:
+                cl = checklist_service.create_list(
+                    tenant_id=tenant_id, user_id=user_id,
+                    title=list_id_or_title,
+                )
+            except ValueError as exc:
+                return f"error: {exc}"
+            except Exception:  # noqa: BLE001
+                logger.exception("add_checklist_items: implicit create failed")
+                return "error: internal"
+        try:
+            added = checklist_service.add_items(list_id=cl.id, items=items)
+        except Exception:  # noqa: BLE001
+            logger.exception("add_checklist_items failed")
+            return "error: internal"
+        return f"ok:added:{len(added)}:list={cl.id}"
+
+    @lc_tool
+    def list_checklists() -> str:
+        """List all active checklists with item counts (pending/done/total).
+
+        Use when user asks «какие у меня списки», «покажи все мои планы»,
+        «что у меня в чек-листах». Returns one line per checklist with
+        id+title+counts. Empty → ``no checklists``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        rows = checklist_service.list_active(
+            tenant_id=tenant_id, user_id=user_id,
+        )
+        if not rows:
+            return "no checklists"
+        lines = []
+        for cl in rows:
+            p, d, t = checklist_service.list_summary(list_id=cl.id)
+            lines.append(f"[{cl.id}] · {cl.title} · {p} pending, {d} done, {t} total")
+        return "\n".join(lines)
+
+    @lc_tool
+    def show_checklist(list_id_or_title: str) -> str:
+        """Show items inside one checklist with their status (pending/done).
+
+        Use when user asks «покажи план кроя», «что осталось в списке X»,
+        «что я ещё не сделал из плана». Resolves list by id or fuzzy title.
+
+        Args:
+            list_id_or_title: ``checklist_xxx`` id or fuzzy title fragment.
+
+        Returns: multi-line listing or ``error:not_found:<needle>``.
+        Format per item: ``[<id>] ☐ <title>`` (pending) or ``☑`` (done).
+        """
+        if not user_id:
+            return "error: no user_id context"
+        cl = checklist_service.find_list_by_title(
+            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        )
+        if cl is None:
+            return f"error: not_found: {list_id_or_title!r}"
+        items = checklist_service.list_items(list_id=cl.id)
+        if not items:
+            return f"empty: list={cl.id} title={cl.title!r}"
+        lines = [f"# {cl.title} ({cl.id})"]
+        for it in items:
+            mark = {"pending": "☐", "done": "☑", "cancelled": "✗"}.get(
+                it.status, "?"
+            )
+            lines.append(f"[{it.id}] {mark} {it.title}")
+        return "\n".join(lines)
+
+    @lc_tool
+    def mark_checklist_item_done(
+        list_id_or_title: str, item_title_match: str,
+    ) -> str:
+        """Mark one item inside a checklist as done.
+
+        Use when user says «закройила лаванду», «купила сахар»,
+        «сделал X» — find the matching pending item and flip status.
+
+        Args:
+            list_id_or_title: which list to look in (id or fuzzy title).
+            item_title_match: substring of the item to mark done.
+
+        Returns: ``ok:done:<item_id>:<title>`` or ``error:not_found``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        cl = checklist_service.find_list_by_title(
+            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        )
+        if cl is None:
+            return f"error: list_not_found: {list_id_or_title!r}"
+        item = checklist_service.find_item_by_title(
+            list_id=cl.id, needle=item_title_match,
+        )
+        if item is None:
+            return f"error: item_not_found: {item_title_match!r}"
+        done = checklist_service.mark_done(item_id=item.id)
+        if done is None:
+            return "error: internal"
+        return f"ok:done:{done.id}:{done.title}"
+
+    @lc_tool
+    def delete_checklist_item(
+        list_id_or_title: str, item_title_match: str,
+    ) -> str:
+        """Hard-delete one item from a checklist (item is GONE).
+
+        Use when user says «удали пункт X», «убери из списка Y»,
+        «не то записала, удали» — pure correction, item disappears
+        from all views. Differs from mark_checklist_item_done (status=
+        done, ☑) and from archive_checklist (whole list out of view).
+
+        Use this in particular when YOU (the AI) misheard / wrote a
+        wrong item earlier in this conversation and the user asks
+        to remove that wrong record — the previous bad item is gone,
+        only the corrected one stays.
+
+        Args:
+            list_id_or_title: id or fuzzy title of the checklist.
+            item_title_match: substring of the item title to remove.
+
+        Returns: ``ok:deleted:<item_id>:<title>`` or ``error:not_found``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        cl = checklist_service.find_list_by_title(
+            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        )
+        if cl is None:
+            return f"error: list_not_found: {list_id_or_title!r}"
+        item = checklist_service.find_item_by_title(
+            list_id=cl.id, needle=item_title_match,
+            only_pending=False,  # ищем по всем — может удалять и done
+        )
+        if item is None:
+            return f"error: item_not_found: {item_title_match!r}"
+        item_id = item.id
+        item_title = item.title
+        ok = checklist_service.delete_item(item_id=item_id)
+        if not ok:
+            return "error: internal"
+        return f"ok:deleted:{item_id}:{item_title}"
+
+    @lc_tool
+    def archive_checklist(list_id_or_title: str) -> str:
+        """Archive a checklist (hide from active lists, keep in DB).
+
+        Use when user says «закрой список X», «убери план кроя»,
+        «архивируй» — checklist disappears from list_checklists и Mini App,
+        но pages не удаляется (для recall истории).
+
+        Returns: ``ok:archived:<id>`` or ``error:not_found``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        cl = checklist_service.find_list_by_title(
+            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        )
+        if cl is None:
+            return f"error: not_found: {list_id_or_title!r}"
+        archived = checklist_service.archive_list(
+            tenant_id=tenant_id, user_id=user_id, list_id=cl.id,
+        )
+        if archived is None:
+            return "error: internal"
+        return f"ok:archived:{archived.id}"
+
     return [
         schedule_reminder,
         list_reminders,
@@ -1659,4 +2004,14 @@ def build_housewife_tools(
         delete_task,
         attach_reminder,
         detach_reminder,
+        # Inline-кнопки (Часть 0 плана v2).
+        reply_with_buttons,
+        # Чек-листы — именованные списки дел с галочками (план 2026-04-25)
+        create_checklist,
+        add_checklist_items,
+        list_checklists,
+        show_checklist,
+        mark_checklist_item_done,
+        delete_checklist_item,
+        archive_checklist,
     ]

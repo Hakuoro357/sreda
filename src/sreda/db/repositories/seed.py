@@ -28,9 +28,19 @@ class SeedRepository(Repository):
         if workspace is None:
             self.session.add(Workspace(id=workspace_id, tenant_id=tenant_id, name=workspace_name))
 
+        # 152-ФЗ обезличивание Часть 1: tg_account_hash заполнится сам
+        # через event-листенер на User.telegram_account_id (см.
+        # db/models/core.py). Тут просто пишем chat_id — hash и
+        # шифрование plaintext отрабатывают прозрачно.
         user = self.session.get(User, user_id)
         if user is None:
-            self.session.add(User(id=user_id, tenant_id=tenant_id, telegram_account_id=telegram_account_id))
+            self.session.add(
+                User(
+                    id=user_id,
+                    tenant_id=tenant_id,
+                    telegram_account_id=telegram_account_id,
+                )
+            )
         else:
             user.telegram_account_id = telegram_account_id
 

@@ -17,8 +17,6 @@ from urllib.parse import parse_qsl
 
 from sqlalchemy.orm import Session
 
-from sreda.db.models.core import User
-
 
 class TelegramInitDataError(Exception):
     """Raised when initData validation fails (bad signature, expired, etc.)."""
@@ -130,11 +128,11 @@ def resolve_tenant_from_telegram_id(
 
     Returns ``(tenant_id, user_id)`` or ``None`` if no matching user.
     """
-    user = (
-        session.query(User)
-        .filter(User.telegram_account_id == telegram_id)
-        .one_or_none()
-    )
+    # 152-ФЗ обезличивание Часть 1: lookup идёт через hash, не через
+    # plaintext (см. services.tg_account_hash + миграция 0027).
+    from sreda.services.onboarding import find_user_by_chat_id
+
+    user = find_user_by_chat_id(session, telegram_id)
     if user is None:
         return None
     return user.tenant_id, user.id

@@ -48,7 +48,11 @@ async def handle_telegram_interaction(
         return
 
     if onboarding.is_new_user:
-        text, reply_markup = build_welcome_message()
+        text, reply_markup = build_welcome_message(
+            session=session,
+            tenant_id=onboarding.tenant_id,
+            user_id=onboarding.user_id,
+        )
         await telegram_client.send_message(
             chat_id=onboarding.chat_id,
             text=text,
@@ -113,8 +117,8 @@ async def _maybe_transcribe_voice(
     registry = get_feature_registry()
     if _VOICE_FEATURE_KEY not in registry.modules:
         await _send_error(
-            "Я пока не умею обрабатывать голосовые сообщения. "
-            "Подключите подходящий агент → /subscriptions"
+            "Голосовые сообщения доступны в подписке. "
+            "Открой /subscriptions, чтобы узнать подробнее."
         )
         return None
 
@@ -125,8 +129,8 @@ async def _maybe_transcribe_voice(
     # NOT grant voice.
     if not tenant_id or not has_voice_access(session, tenant_id):
         await _send_error(
-            "Распознавание голосовых сообщений включено в Помощник "
-            "домохозяйки. Подключите его → /subscriptions"
+            "Голосовые сообщения доступны в подписке. "
+            "Открой /subscriptions, чтобы узнать подробнее."
         )
         return None
     budget = BudgetService(session)
@@ -135,8 +139,8 @@ async def _maybe_transcribe_voice(
     duration = voice.get("duration", 0)
     if duration > _VOICE_MAX_DURATION_SECONDS:
         await _send_error(
-            f"Голосовое сообщение слишком длинное (макс. {_VOICE_MAX_DURATION_SECONDS} секунд). "
-            "Попробуйте короче."
+            f"Голосовое сообщение слишком длинное — "
+            f"макс. {_VOICE_MAX_DURATION_SECONDS} секунд. Отправь покороче."
         )
         return None
 
@@ -144,7 +148,7 @@ async def _maybe_transcribe_voice(
     settings = get_settings()
     recognizer = get_speech_recognizer(settings)
     if recognizer is None:
-        await _send_error("Сервис распознавания речи не настроен. Обратитесь к администратору.")
+        await _send_error("Голосовые сообщения сейчас не работают. Напиши текстом или попробуй позже.")
         return None
 
     # 5 + 6: Download audio + transcribe. Split across two trace
@@ -158,7 +162,7 @@ async def _maybe_transcribe_voice(
     with trace.step("voice.download", provider="telegram") as _dl_meta:
         file_id = voice.get("file_id")
         if not file_id:
-            await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
+            await _send_error("Не удалось получить голосовое сообщение. Отправь ещё раз.")
             _dl_meta["status"] = "no_file_id"
             return None
 
@@ -170,7 +174,7 @@ async def _maybe_transcribe_voice(
             audio_bytes = await telegram_client.download_file(str(file_path))
         except TelegramDeliveryError as exc:
             logger.warning("Voice download failed: %s", exc)
-            await _send_error("Не удалось получить голосовое сообщение. Попробуйте ещё раз.")
+            await _send_error("Не удалось получить голосовое сообщение. Отправь ещё раз.")
             _dl_meta["status"] = "download_failed"
             return None
 
@@ -184,7 +188,7 @@ async def _maybe_transcribe_voice(
             text = await recognizer.recognize(audio_bytes)
         except SpeechRecognitionError as exc:
             logger.warning("Speech recognition failed: %s", exc)
-            await _send_error("Не удалось расшифровать сообщение. Попробуйте ещё раз.")
+            await _send_error("Не получилось расшифровать голос. Отправь ещё раз или напиши.")
             _trace_meta["status"] = "recognize_failed"
             return None
 
@@ -223,6 +227,20 @@ async def _handle_callback(
     callback_id = callback_query.get("id")
     data = str(callback_query.get("data") or "")
 
+    # Onboarding шаг 2 (2026-04-27): callback "addrform:ty|vy" фиксирует
+    # выбор формы обращения и шлёт housewife-welcome про семью. Не
+    # дёргает LLM — это чистый state-update + side-effect отправки
+    # следующего сообщения. Должен идти ПЕРВЫМ, до всех btn_reply / rem_*.
+    if data.startswith("addrform:"):
+        await _handle_address_form_callback(
+            session=session,
+            telegram_client=telegram_client,
+            callback_query=callback_query,
+            onboarding=onboarding,
+            choice=data[len("addrform:"):],
+        )
+        return
+
     # Reminder-escalation callbacks (v1.2). The housewife reminder
     # worker sends inline buttons with callback_data of the form
     # ``rem_done:<reminder_id>`` / ``rem_snooze:<reminder_id>``. We
@@ -234,6 +252,23 @@ async def _handle_callback(
             telegram_client=telegram_client,
             callback_query=callback_query,
             data=data,
+        )
+        return
+
+    # Inline-кнопки (Часть 0 плана v2). LLM в прошлом turn'е положил
+    # в БД токены для 2-4 кнопок; payload у них = "btn_reply:<token>".
+    # Достаём label по токену, подставляем как message.text и дальше —
+    # обычный chat-turn, будто юзер сам это написал.
+    if data.startswith("btn_reply:"):
+        await _handle_btn_reply_callback(
+            session=session,
+            telegram_client=telegram_client,
+            callback_query=callback_query,
+            onboarding=onboarding,
+            bot_key=bot_key,
+            payload=payload,
+            inbound_message_id=inbound_message_id,
+            token=data[len("btn_reply:"):],
         )
         return
 
@@ -255,6 +290,108 @@ async def _handle_callback(
     runtime = ActionRuntimeService(session, telegram_client=telegram_client)
     queued = runtime.enqueue_action(runtime_action)
     await runtime.process_job(queued.job_id)
+
+
+async def _handle_address_form_callback(
+    *,
+    session: Session,
+    telegram_client: TelegramClient,
+    callback_query: dict,
+    onboarding: TelegramOnboardingResult,
+    choice: str,
+) -> None:
+    """Сохраняет выбор «ты/вы» в профиле и отправляет housewife-welcome.
+
+    После этого юзер на шаге 3 онбординга. Telegram-кнопки удаляем
+    через edit_message_text, чтобы юзер не мог тапнуть дважды.
+    Toast'ом подтверждаем выбор соответствующей формой обращения.
+    """
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    callback_id = str(callback_query.get("id") or "")
+    message = callback_query.get("message") or {}
+    chat = (message.get("chat") or {}) if isinstance(message, dict) else {}
+    chat_id = (
+        str(chat.get("id") or "") if isinstance(chat, dict) else ""
+    )
+    message_id = (
+        message.get("message_id") if isinstance(message, dict) else None
+    )
+    original_text = (
+        (message.get("text") or "") if isinstance(message, dict) else ""
+    )
+
+    if choice not in ("ty", "vy"):
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(
+                    callback_id, text="Не понял выбор"
+                )
+            except TelegramDeliveryError:
+                pass
+        return
+
+    if onboarding.tenant_id is None or onboarding.user_id is None:
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(
+                    callback_id, text="Что-то пошло не так"
+                )
+            except TelegramDeliveryError:
+                pass
+        return
+
+    repo = UserProfileRepository(session)
+    repo.update_profile(
+        tenant_id=onboarding.tenant_id,
+        user_id=onboarding.user_id,
+        source="user_command",
+        actor_user_id=onboarding.user_id,
+        address_form=choice,
+    )
+    session.commit()
+
+    # Toast: «Понял» (vy) / «Поняла» (ty). Подбираем форму родовой
+    # гендерности самой Среды позже (Среда — она, поэтому всегда
+    # феминитивы); здесь форма зависит от того, к юзеру на ты или вы.
+    toast = "Поняла" if choice == "ty" else "Поняла, перехожу на «вы»"
+    if callback_id:
+        try:
+            await telegram_client.answer_callback_query(
+                callback_id, text=toast
+            )
+        except TelegramDeliveryError:
+            pass
+
+    # Стираем кнопки на сообщении-вопросе (юзер не должен тапнуть
+    # дважды), оставляем оригинальный текст.
+    if chat_id and message_id is not None and original_text:
+        try:
+            await telegram_client.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=original_text,
+                reply_markup=None,
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning("addrform edit_message_text failed: %s", exc)
+
+    # Шаг 3: housewife-welcome про семью.
+    welcome_text, welcome_markup = build_welcome_message(
+        session=session,
+        tenant_id=onboarding.tenant_id,
+        user_id=onboarding.user_id,
+    )
+    target_chat_id = chat_id or onboarding.chat_id
+    if target_chat_id:
+        try:
+            await telegram_client.send_message(
+                chat_id=target_chat_id,
+                text=welcome_text,
+                reply_markup=welcome_markup,
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning("housewife welcome delivery failed: %s", exc)
 
 
 async def _handle_reminder_callback(
@@ -288,7 +425,7 @@ async def _handle_reminder_callback(
         if callback_id:
             try:
                 await telegram_client.answer_callback_query(
-                    callback_id, text="Напоминание уже закрыто"
+                    callback_id, text="Это напоминание уже выполнено."
                 )
             except TelegramDeliveryError:
                 pass
@@ -331,6 +468,89 @@ async def _handle_reminder_callback(
             )
         except TelegramDeliveryError as exc:
             logger.warning("reminder edit_message_text failed: %s", exc)
+
+
+async def _handle_btn_reply_callback(
+    *,
+    session: Session,
+    telegram_client: TelegramClient,
+    callback_query: dict,
+    onboarding: TelegramOnboardingResult,
+    bot_key: str,
+    payload: dict,
+    inbound_message_id: str | None,
+    token: str,
+) -> None:
+    """Inline-кнопка от LLM-ответа (Часть 0 плана v2).
+
+    Resolve токена в label, подставляем label как text-message и
+    запускаем обычный chat-turn, будто юзер сам это написал.
+    Если токен устарел / уже использован / чужой — toast-отлуп.
+    Клавиатуру под старым сообщением стираем.
+    """
+    from sreda.runtime.executor import ActionRuntimeService
+    from sreda.services.reply_buttons import ReplyButtonService
+
+    callback_id = str(callback_query.get("id") or "")
+    message = callback_query.get("message") or {}
+    chat = (message.get("chat") or {}) if isinstance(message, dict) else {}
+    chat_id = str(chat.get("id") or "") if isinstance(chat, dict) else ""
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    original_text = (message.get("text") or "") if isinstance(message, dict) else ""
+
+    label: str | None = None
+    if onboarding.tenant_id and onboarding.user_id:
+        label = ReplyButtonService(session).resolve_token(
+            tenant_id=onboarding.tenant_id,
+            user_id=onboarding.user_id,
+            token=token,
+        )
+
+    if label is None:
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(
+                    callback_id, text="Выбор устарел. Напиши что нужно."
+                )
+            except TelegramDeliveryError:
+                pass
+        return
+
+    # Toast + убираем клавиатуру, чтобы повторный клик не работал.
+    if callback_id:
+        try:
+            await telegram_client.answer_callback_query(callback_id, text=label)
+        except TelegramDeliveryError as exc:
+            logger.warning("btn_reply callback ack failed: %s", exc)
+    if chat_id and message_id:
+        try:
+            await telegram_client.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=original_text,  # оставляем текст как есть
+                reply_markup={"inline_keyboard": []},
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning("btn_reply edit_message_text failed: %s", exc)
+
+    # Подставляем label как обычный text-message и запускаем chat-turn.
+    synthetic_payload = dict(payload)
+    synthetic_payload.pop("callback_query", None)
+    synthetic_message = dict(message) if isinstance(message, dict) else {}
+    synthetic_message["text"] = label
+    synthetic_payload["message"] = synthetic_message
+
+    runtime_action = dispatch_telegram_action(
+        payload=synthetic_payload,
+        bot_key=bot_key,
+        onboarding=onboarding,
+        inbound_message_id=inbound_message_id,
+    )
+    if runtime_action is None:
+        return
+    runtime = ActionRuntimeService(session, telegram_client=telegram_client)
+    queued = runtime.enqueue_action(runtime_action)
+    await runtime.process_job(queued.job_id)
 
 
 async def _handle_command(

@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from sreda.db.models.core import InboundMessage, User, Workspace
+from sreda.db.models.core import InboundMessage, Workspace
 from sreda.services.privacy_guard import get_default_privacy_guard
 from sreda.services.secure_storage import store_secure_json
 
@@ -37,7 +37,10 @@ def persist_telegram_inbound_event(
     workspace_id = None
     user_id = None
     if chat_id is not None:
-        user = session.query(User).filter(User.telegram_account_id == chat_id).one_or_none()
+        # Lookup by hash, не plaintext — 152-ФЗ обезличивание Часть 1.
+        from sreda.services.onboarding import find_user_by_chat_id
+
+        user = find_user_by_chat_id(session, chat_id)
     if user is not None:
         tenant_id = user.tenant_id
         user_id = user.id

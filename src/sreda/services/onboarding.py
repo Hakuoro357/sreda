@@ -10,6 +10,35 @@ from sreda.db.repositories.seed import SeedRepository
 CONNECT_EDS_CALLBACK = "onboarding:connect_eds"
 
 
+def find_user_by_chat_id(session: Session, chat_id: str | int) -> User | None:
+    """Резолв юзера по telegram chat_id через hash-lookup.
+
+    Раньше: ``filter(User.telegram_account_id == chat_id)``.
+    Теперь: считаем HMAC-SHA256 от chat_id под salt'ом и ищем по
+    `tg_account_hash` (индексированная колонка).
+
+    152-ФЗ Часть 1: plaintext chat_id больше нигде в коде не равняется
+    напрямую к колонке БД — только через hash. Это нужно, чтобы в
+    дампе БД не было plain Telegram-идентификаторов.
+
+    Возвращает None, если salt не сконфигурирован (RuntimeError ловится
+    выше — это критичная ошибка деплоя, а не пользовательская).
+    """
+    if chat_id is None:
+        return None
+    cid = str(chat_id).strip()
+    if not cid:
+        return None
+    from sreda.services.tg_account_hash import hash_tg_account
+
+    tg_hash = hash_tg_account(cid)
+    return (
+        session.query(User)
+        .filter(User.tg_account_hash == tg_hash)
+        .one_or_none()
+    )
+
+
 @dataclass(slots=True)
 class TelegramOnboardingResult:
     is_new_user: bool
@@ -25,7 +54,7 @@ def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnbo
     if chat_id is None:
         return TelegramOnboardingResult(False, None, None, None, None, None)
 
-    existing_user = session.query(User).filter(User.telegram_account_id == chat_id).one_or_none()
+    existing_user = find_user_by_chat_id(session, chat_id)
     if existing_user is not None:
         assistant = (
             session.query(Assistant)
@@ -77,9 +106,7 @@ def ensure_telegram_user_bundle_by_id(
     if not telegram_id:
         return TelegramOnboardingResult(False, None, None, None, None, None)
 
-    existing_user = (
-        session.query(User).filter(User.telegram_account_id == telegram_id).one_or_none()
-    )
+    existing_user = find_user_by_chat_id(session, telegram_id)
     if existing_user is not None:
         assistant = (
             session.query(Assistant)
@@ -128,26 +155,105 @@ def ensure_telegram_user_bundle_by_id(
     )
 
 
-def build_welcome_message() -> tuple[str, dict | None]:
-    text = (
-        "Привет! Я Среда.\n\n"
-        "Я помогу следить за важными изменениями и управлять подписками вокруг EDS.\n"
-        "Подписки и подключение ЛК EDS — в приложении."
-    )
-    # Все управление подписками теперь живёт в Mini App. Welcome —
-    # единственное место, где мы всё ещё ведём нового пользователя
-    # в приложение явной кнопкой (Menu Button тоже есть, но не все
-    # её замечают сразу).
-    from sreda.config.settings import get_settings
+def build_name_question_message() -> str:
+    """Шаг 1 онбординга после admin-approve (2026-04-27).
 
-    settings = get_settings()
-    base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
-    if not base_url:
-        return text, None
+    Бот ещё не знает, как обращаться к юзеру (имя, ты/вы). Прежде чем
+    показывать housewife-welcome про семью — собираем минимум контекста.
+
+    Шаг 1: вопрос про имя (свободный ввод, без кнопок).
+    Шаг 2: вопрос про ты/вы (callback-кнопки, см.
+    ``services.telegram_bot._handle_address_form_callback``).
+    Шаг 3: ``build_welcome_message`` про семью (текущий housewife-welcome).
+    """
+    return (
+        "Привет! Я Среда — твой персональный ассистент.\n\n"
+        "Подскажи, как тебя зовут? Можно просто имя — или как удобно, "
+        "чтобы я к тебе обращалась."
+    )
+
+
+def build_address_form_question_message(display_name: str) -> tuple[str, dict]:
+    """Шаг 2 онбординга — вопрос «на ты или на вы» с inline-кнопками.
+
+    callback_data: ``addrform:ty`` / ``addrform:vy``. Префикс
+    интерсептится в ``services.telegram_bot._handle_callback`` ДО
+    ``btn_reply:`` — без LLM-turn'а, чистый state-update.
+    """
+    text = (
+        f"Приятно познакомиться, {display_name}!\n\n"
+        "Ещё один маленький вопрос — как удобнее общаться?"
+    )
     reply_markup = {
         "inline_keyboard": [
-            [{"text": "Открыть подписки", "web_app": {"url": f"{base_url}/miniapp/"}}]
-        ]
+            [
+                {"text": "На ты", "callback_data": "addrform:ty"},
+                {"text": "На вы", "callback_data": "addrform:vy"},
+            ],
+        ],
+    }
+    return text, reply_markup
+
+
+def build_welcome_message(
+    *,
+    session=None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+) -> tuple[str, dict | None]:
+    """Welcome-сообщение после approval (Часть B плана v2).
+
+    Текст — housewife-ориентированный, не про EDS/подписки. По
+    фильтру «анти-сталкер» — сначала объясняем ЗАЧЕМ нужны данные,
+    потом просим, и всегда даём эскейп-кнопку «Позже».
+
+    Если переданы ``session + tenant_id + user_id`` — создаём через
+    ``ReplyButtonService`` токен для кнопки «Позже, сначала осмотрюсь»
+    (переведёт юзера в свободный чат без формы). Иначе — возвращаем
+    текст без кнопок (совместимость с тестами, которые могут не
+    передавать контекст).
+    """
+    text = (
+        "✅ Готово! Модератор подключил.\n\n"
+        "Теперь я могу отвечать по-настоящему.\n\n"
+        "Чтобы я была полезной сразу — коротко расскажи про семью: "
+        "имена и возрасты (чтобы обращаться правильно), и есть ли у "
+        "кого-то диета или аллергия (чтобы меню подходило всем).\n\n"
+        "Ничего не обязательно — можно начать без этого и "
+        "рассказывать по мере того, как будет уместно.\n\n"
+        "Пиши голосом или текстом — как удобно."
+    )
+
+    if session is None or not tenant_id or not user_id:
+        return text, None
+
+    # «Позже» — эскейп-кнопка: переводит в свободный чат без формы.
+    # Это обычный btn_reply: юзер «нажимает» → бот получает text
+    # «Позже, сначала осмотрюсь» и отвечает LLM'ом.
+    try:
+        from sreda.services.reply_buttons import ReplyButtonService
+
+        pairs = ReplyButtonService(session).create_tokens(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            labels=[
+                "Может, позже",
+                "Расскажу про семью",
+            ],
+        )
+    except Exception:  # noqa: BLE001
+        # Если токены не создаются — отдаём welcome без кнопок,
+        # юзер просто ответит свободным текстом.
+        return text, None
+
+    if not pairs:
+        return text, None
+
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": f"btn_reply:{tok}"}]
+            for tok, label in pairs
+        ],
     }
     return text, reply_markup
 

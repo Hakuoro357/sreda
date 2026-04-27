@@ -460,3 +460,140 @@ def admin_tenant_reset(
         url=f"/admin/users?token={token}&reset=ok&msg={msg}",
         status_code=303,
     )
+
+
+@router.post("/tenant/approve", response_class=HTMLResponse)
+async def admin_tenant_approve(
+    tenant_id: str = Query(...),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Approve a pending tenant + send the welcome message.
+
+    Sets ``tenants.approved_at = NOW()`` so the telegram_webhook stops
+    silent-dropping their messages, and proactively pushes the welcome
+    card (same ``build_welcome_message`` used for the pre-approval
+    flow) so the user knows they can now use the bot.
+    """
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from sreda.db.models.core import Tenant, User
+    from sreda.integrations.telegram.client import (
+        TelegramClient,
+        TelegramDeliveryError,
+    )
+    from sreda.services.onboarding import build_name_question_message
+
+    tenant = session.get(Tenant, tenant_id)
+    if tenant is None:
+        return RedirectResponse(
+            url=f"/admin/users?token={token}&approve=err&msg=tenant_not_found",
+            status_code=303,
+        )
+
+    was_pending = tenant.approved_at is None
+    tenant.approved_at = _dt.now(UTC)
+    user = (
+        session.query(User).filter(User.tenant_id == tenant_id).first()
+    )
+
+    # Auto-grant подписки на housewife_assistant на 30 дней (2026-04-25).
+    # Пока «Подписки» в Mini App скрыты, юзер сам не может оформить —
+    # модератор апрувом сразу даёт месяц доступа. Идемпотентно:
+    # только если ранее не было активной подписки на этот feature_key.
+    grant_status = "skipped"
+    if was_pending:
+        from datetime import timedelta as _td
+        from uuid import uuid4 as _uuid
+        from sreda.db.models.billing import (
+            SubscriptionPlan,
+            TenantSubscription,
+        )
+
+        plan = (
+            session.query(SubscriptionPlan)
+            .filter(
+                SubscriptionPlan.feature_key == "housewife_assistant",
+                SubscriptionPlan.is_active.is_(True),
+            )
+            .order_by(SubscriptionPlan.price_rub.asc())
+            .first()
+        )
+        if plan is not None:
+            now_utc = _dt.now(UTC)
+            until = now_utc + _td(days=30)
+            existing = (
+                session.query(TenantSubscription)
+                .filter(
+                    TenantSubscription.tenant_id == tenant_id,
+                    TenantSubscription.plan_id == plan.id,
+                )
+                .one_or_none()
+            )
+            if existing is None:
+                session.add(TenantSubscription(
+                    id=f"sub_{_uuid().hex[:24]}",
+                    tenant_id=tenant_id,
+                    plan_id=plan.id,
+                    status="active",
+                    starts_at=now_utc,
+                    active_until=until,
+                    cancel_at_period_end=False,
+                    quantity=1,
+                    next_cycle_quantity=1,
+                    updated_at=now_utc,
+                ))
+                grant_status = "granted_30d"
+            else:
+                # Если ранее уже была подписка (например, прошлая итерация
+                # — отменили) — освежаем active_until до now+30 без
+                # дублирования строки.
+                existing.status = "active"
+                existing.starts_at = now_utc
+                existing.active_until = until
+                existing.cancel_at_period_end = False
+                existing.quantity = 1
+                existing.next_cycle_quantity = 1
+                existing.updated_at = now_utc
+                grant_status = "renewed_30d"
+        else:
+            grant_status = "no_plan_in_db"
+
+    session.commit()
+
+    # Proactive Telegram welcome. Skipped if:
+    # - tenant was already approved (idempotent re-click)
+    # - no bot token configured (dev/test)
+    # - user has no telegram_account_id (manual CLI-created tenant)
+    settings = get_settings()
+    delivery_status = "skipped"
+    if (
+        was_pending
+        and settings.telegram_bot_token
+        and user is not None
+        and user.telegram_account_id
+    ):
+        client = TelegramClient(settings.telegram_bot_token)
+        # 2026-04-27: после approve шлём не housewife-welcome (про
+        # семью), а вопрос «как тебя зовут?» — это шаг 1 трёхступенчатого
+        # онбординга (имя → ты/вы → housewife-welcome). Дальше state-machine
+        # в telegram_webhook ловит ответ юзера и переходит на следующий шаг.
+        text = build_name_question_message()
+        try:
+            await client.send_message(
+                chat_id=user.telegram_account_id,
+                text=text,
+                reply_markup=None,
+            )
+            delivery_status = "ok"
+        except TelegramDeliveryError:
+            delivery_status = "tg_error"
+
+    return RedirectResponse(
+        url=(
+            f"/admin/users?token={token}&approve=ok&tenant={tenant_id}"
+            f"&welcome={delivery_status}&grant={grant_status}"
+        ),
+        status_code=303,
+    )

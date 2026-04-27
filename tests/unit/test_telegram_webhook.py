@@ -1,4 +1,5 @@
 import base64
+from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -45,9 +46,20 @@ def test_telegram_webhook_persists_sanitized_and_encrypted_payload(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.commit()
     finally:
         session.close()
@@ -144,18 +156,30 @@ def test_telegram_webhook_creates_new_user_and_sends_welcome_message(
     assert response.status_code == 202
     assert len(sent_messages) == 1
     assert sent_messages[0]["chat_id"] == NEW_USER_CHAT_ID
-    assert "Привет! Я Среда." in sent_messages[0]["text"]
-    # Welcome reply_markup: single Mini App button (since 2026-04 migration
-    # everything subscription/connect-related moved into the Mini App).
-    assert sent_messages[0]["reply_markup"] == {
-        "inline_keyboard": [
-            [{"text": "Открыть подписки", "web_app": {"url": "https://connect.test.local/miniapp/"}}]
-        ]
-    }
+    # 2026-04-25 Часть B плана v2: вместо silent-drop'а pending-бот
+    # отдаёт scripted welcome с 4 кнопками-темами (см. pending_bot.py).
+    text = sent_messages[0]["text"]
+    assert "Среда" in text and "модератор" in text
+    markup = sent_messages[0]["reply_markup"]
+    assert markup is not None and "inline_keyboard" in markup
+    # 4 кнопки welcome: каждая на своей строке.
+    rows = markup["inline_keyboard"]
+    assert len(rows) == 4
+    # Все callback_data с префиксом pb: (pending_bot.is_pending_callback).
+    for row in rows:
+        for btn in row:
+            assert btn["callback_data"].startswith("pb:")
 
     session = get_session_factory()()
     try:
-        user = session.query(User).filter(User.telegram_account_id == NEW_USER_CHAT_ID).one()
+        # 2026-04-27: lookup идёт через services.onboarding.find_user_by_chat_id,
+        # которая считает hash от chat_id и матчит User.tg_account_hash.
+        # Раньше было `filter(User.telegram_account_id == ...)`, но колонка
+        # теперь EncryptedString — равенство по plaintext не работает.
+        from sreda.services.onboarding import find_user_by_chat_id
+
+        user = find_user_by_chat_id(session, NEW_USER_CHAT_ID)
+        assert user is not None
         tenant = session.get(Tenant, user.tenant_id)
         workspace = session.get(Workspace, f"workspace_tg_{NEW_USER_CHAT_ID}")
     finally:
@@ -163,6 +187,7 @@ def test_telegram_webhook_creates_new_user_and_sends_welcome_message(
 
     assert user.id == f"user_tg_{NEW_USER_CHAT_ID}"
     assert tenant is not None
+    assert tenant.approved_at is None, "new tenant must land as pending-approval"
     assert workspace is not None
 
 
@@ -196,9 +221,20 @@ def test_telegram_webhook_handles_status_command(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.commit()
     finally:
         session.close()
@@ -281,9 +317,20 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.commit()
     finally:
         session.close()
@@ -360,9 +407,20 @@ def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.commit()
         BillingService(session).start_base_subscription("tenant_1")
     finally:
@@ -438,9 +496,20 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.commit()
     finally:
         session.close()
@@ -550,9 +619,20 @@ def test_telegram_webhook_accepts_request_with_matching_secret_token(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.commit()
     finally:
         session.close()
@@ -606,11 +686,22 @@ def test_telegram_webhook_handles_claim_lookup_command(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
         session.flush()
         session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_tg_100000003", name="Sreda"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.add(TenantFeature(id="feature_1", tenant_id="tenant_1", feature_key="eds_monitor", enabled=True))
         session.add(
             EDSAccount(
@@ -720,9 +811,20 @@ def test_telegram_webhook_rate_limits_excess_requests(
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     try:
-        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        # approved_at set explicitly: approval gate (2026-04-23) silent-
+        # drops tenants with NULL; existing users were auto-approved by
+        # migration, so tests mirror that.
+        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
         session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
         session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        # 2026-04-27: бипасс state-machine онбординга в webhook'е
+        # (имя+форма обращения должны быть заполнены, иначе вместо
+        # обычного chat-flow приходит вопрос «как тебя зовут?»).
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_test", tenant_id="tenant_1", user_id="user_1",
+            display_name="Тестовый Юзер", address_form="ty",
+        ))
         session.commit()
     finally:
         session.close()

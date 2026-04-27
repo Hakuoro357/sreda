@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     encryption_key_id: str = "primary"
     encryption_key_salt: str | None = None
     encryption_legacy_keys: str | None = None  # JSON: {"key_id": "base64_or_hex_material"}
+    # Salt для HMAC-SHA256 хеширования telegram chat_id (152-ФЗ
+    # обезличивание Часть 1, 2026-04-27). Без этого salt'а lookup
+    # по hash не работает — bot не найдёт юзера. Salt — secret-уровня:
+    # никогда не менять после первого деплоя без full backfill.
+    # Генерится `python -c 'import secrets; print(secrets.token_hex(32))'`.
+    # ENV: SREDA_TG_ACCOUNT_SALT.
+    tg_account_salt: str | None = None
     feature_modules_raw: str | None = Field(default=None, validation_alias="SREDA_FEATURE_MODULES")
 
     # Admin dashboard token. When set, /admin/* routes are accessible

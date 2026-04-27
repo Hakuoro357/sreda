@@ -51,6 +51,10 @@ class TenantUserProfile(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
 
     display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Form of address chosen during onboarding: "ty" | "vy" | None.
+    # NULL = ещё не выбрано (юзер не прошёл шаг 2 онбординга);
+    # LLM/ack-фразы fallback'ат на нейтральную форму.
+    address_form: Mapped[str | None] = mapped_column(String(8), nullable=True)
     # IANA timezone string ("UTC", "Europe/Moscow"). Not validated here; the
     # handlers that write it use zoneinfo lookup to reject bad values at
     # the API boundary.

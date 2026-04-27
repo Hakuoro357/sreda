@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, event
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
+from sreda.db.types import EncryptedString
 
 
 class Tenant(Base):
@@ -14,6 +15,14 @@ class Tenant(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
+    )
+    # Approval gate (2026-04-23, MVP-костыль до подписок). NULL = заявка
+    # принята, но ещё не одобрена модератором; сообщения silent-drop'ятся
+    # в telegram_webhook. Одобрение — в админке /admin/users. Существующие
+    # тенанты помечены NOW() миграцией при накатывании колонки, так что
+    # живые пользователи не ломаются.
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
 
 
@@ -39,7 +48,21 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
-    telegram_account_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Plaintext Telegram chat_id, зашифрован через EncryptedString
+    # (152-ФЗ обезличивание Часть 1, 2026-04-27). В дампе БД лежит
+    # base64-шифр, не PII. Worker'ы получают plaintext через ORM read
+    # (TypeDecorator расшифровывает) — нужно для вызова `sendMessage`.
+    # Lookup по chat_id идёт через `tg_account_hash` (HMAC-SHA256),
+    # см. `services/tg_account_hash.py` + `find_user_by_chat_id`.
+    telegram_account_id: Mapped[str | None] = mapped_column(
+        EncryptedString(), nullable=True,
+    )
+    # Hash от plaintext chat_id для O(1) lookup'а без расшифровки
+    # всех записей. Backfill миграцией 0027. Unique — один tg-аккаунт
+    # = один user. None для legacy/seed юзеров без telegram_account_id.
+    tg_account_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True,
+    )
 
 
 class Assistant(Base):
@@ -161,3 +184,30 @@ class InboundMessage(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+# 152-ФЗ обезличивание Часть 1 (2026-04-27): автоматически вычисляем
+# `tg_account_hash` каждый раз, когда выставляется `telegram_account_id`.
+# Это снимает с вызывающего кода (онбординг, тесты, seed) обязанность
+# помнить про вторую колонку — достаточно записать chat_id, hash
+# заполнится сам.
+#
+# Если salt не сконфигурирован (`SREDA_TG_ACCOUNT_SALT`), листенер
+# падает RuntimeError — но это правильно: иначе lookup по hash будет
+# всегда возвращать None и юзер «потеряется». Тесты подсовывают salt
+# через conftest.
+@event.listens_for(User.telegram_account_id, "set", retval=False)
+def _user_telegram_account_id_set(  # noqa: ANN001 — SQLAlchemy event signature
+    target, value, oldvalue, initiator,  # noqa: ARG001
+):
+    if value is None or value == "":
+        target.tg_account_hash = None
+        return
+    if isinstance(value, str) and not value.strip():
+        target.tg_account_hash = None
+        return
+    # Lazy import — services.tg_account_hash тянет settings,
+    # которые при импорте models создают цикл.
+    from sreda.services.tg_account_hash import hash_tg_account
+
+    target.tg_account_hash = hash_tg_account(value)

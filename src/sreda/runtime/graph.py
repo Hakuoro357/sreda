@@ -155,6 +155,10 @@ def node_load_profile(state: AssistantGraphState, config: RunnableConfig) -> dic
             "quiet_hours": UserProfileRepository.decode_quiet_hours(profile),
             "communication_style": profile.communication_style,
             "interest_tags": UserProfileRepository.decode_interest_tags(profile),
+            # 2026-04-27: ты/вы выбираются на шаге 2 онбординга
+            # (services.telegram_bot._handle_address_form_callback).
+            # NULL = ещё не выбрано → LLM использует нейтральные формы.
+            "address_form": profile.address_form,
         }
 
     skill_config_dicts = [

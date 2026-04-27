@@ -27,6 +27,7 @@ from sreda.db.models.user_profile import (
 
 NOTIFICATION_PRIORITIES = frozenset({"urgent", "normal", "low", "mute"})
 COMMUNICATION_STYLES = frozenset({"terse", "casual", "formal"})
+ADDRESS_FORMS = frozenset({"ty", "vy"})
 UPDATE_SOURCES = frozenset(
     {"user_command", "agent_tool_direct", "agent_tool_confirmed", "system"}
 )
@@ -83,6 +84,7 @@ class UserProfileRepository:
         quiet_hours: list[dict[str, Any]] | None = None,
         communication_style: str | None = None,
         interest_tags: list[str] | None = None,
+        address_form: str | None = None,
     ) -> TenantUserProfile:
         if source not in UPDATE_SOURCES:
             raise ValueError(f"unknown source: {source!r}")
@@ -93,6 +95,8 @@ class UserProfileRepository:
             raise ValueError(
                 f"unknown communication_style: {communication_style!r}"
             )
+        if address_form is not None and address_form not in ADDRESS_FORMS:
+            raise ValueError(f"unknown address_form: {address_form!r}")
         if quiet_hours is not None:
             _validate_quiet_hours(quiet_hours)
 
@@ -107,6 +111,8 @@ class UserProfileRepository:
             profile.communication_style = communication_style
         if interest_tags is not None:
             profile.interest_tags_json = json.dumps(interest_tags, ensure_ascii=False)
+        if address_form is not None:
+            profile.address_form = address_form
         profile.updated_by_source = source
         profile.updated_by_user_id = actor_user_id
         profile.updated_at = _utcnow()
