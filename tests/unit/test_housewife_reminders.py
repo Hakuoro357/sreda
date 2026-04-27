@@ -92,10 +92,11 @@ def test_due_now_returns_past_pending_only() -> None:
     assert due[0].title == "Past"
 
 
-def test_mark_fired_oneshot_first_fire_schedules_re_ping() -> None:
-    """v1.2 escalation: first mark_fired does NOT transition to 'fired';
-    it bumps escalation_count to 1 and schedules a re-ping 2 min later,
-    waiting for user acknowledgement via inline buttons."""
+def test_mark_fired_oneshot_first_fire_finalises() -> None:
+    """2026-04-23: single-fire mode (ESCALATION_MAX_FIRES=1) — первый и
+    единственный fire сразу завершает one-shot reminder со status='fired',
+    без re-ping'а через 2 минуты. Юзеры жаловались на дубли при v1.2
+    политике, поэтому auto-escalation выключена."""
     session = _fresh_session()
     service = HousewifeReminderService(session)
     reminder = service.schedule(
@@ -106,11 +107,11 @@ def test_mark_fired_oneshot_first_fire_schedules_re_ping() -> None:
     fire_at = datetime(2026, 5, 1, tzinfo=UTC)
     service.mark_fired(reminder, now=fire_at)
 
-    assert reminder.status == "pending"
-    assert reminder.escalation_count == 1
+    assert reminder.status == "fired"
+    assert reminder.next_trigger_at is None
     assert reminder.last_fired_at is not None
-    assert reminder.next_trigger_at is not None
-    assert _coerce_utc(reminder.next_trigger_at) == fire_at + timedelta(minutes=2)
+    # escalation_count сбрасывается при finalize, поэтому 0.
+    assert reminder.escalation_count == 0
 
 
 def test_mark_fired_oneshot_final_fire_transitions_to_fired() -> None:
@@ -198,9 +199,10 @@ def test_snooze_pushes_trigger_out_and_resets_escalation() -> None:
     assert _coerce_utc(reminder.next_trigger_at) == expected
 
 
-def test_mark_fired_recurring_first_fire_schedules_re_ping() -> None:
-    """Recurring reminder — first fire ALSO schedules a +2min re-ping
-    before advancing to next week. Escalation applies uniformly."""
+def test_mark_fired_recurring_first_fire_advances_to_next_week() -> None:
+    """2026-04-23: single-fire mode — recurring reminder сразу advance'ит
+    next_trigger_at до следующей итерации (через RRULE, без +2min re-ping).
+    Status остаётся 'pending', потому что recurring никогда не финалится."""
     session = _fresh_session()
     service = HousewifeReminderService(session)
     first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
@@ -213,8 +215,10 @@ def test_mark_fired_recurring_first_fire_schedules_re_ping() -> None:
     service.mark_fired(reminder, now=first_tuesday)
 
     assert reminder.status == "pending"
-    assert reminder.escalation_count == 1
-    assert _coerce_utc(reminder.next_trigger_at) == first_tuesday + timedelta(minutes=2)
+    # escalation_count сбрасывается при advance.
+    assert reminder.escalation_count == 0
+    # Сразу следующий вторник по RRULE, не +2 минуты.
+    assert _coerce_utc(reminder.next_trigger_at) == first_tuesday + timedelta(days=7)
 
 
 def test_mark_fired_recurring_final_fire_advances_next_week() -> None:

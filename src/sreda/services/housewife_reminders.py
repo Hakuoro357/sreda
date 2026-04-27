@@ -20,17 +20,24 @@ from sreda.db.models.housewife import FamilyReminder
 logger = logging.getLogger(__name__)
 
 
-# Escalation policy (v1.2 reminder escalation).
+# Escalation policy.
 #
-# When a reminder fires the user sees an inline keyboard with
-# "Сделал ✅" and "Отложить ⏰". If neither button is tapped the
-# worker re-pings once after ESCALATION_INTERVAL_MINUTES. After
-# ESCALATION_MAX_FIRES total messages the reminder finalises
-# (one-shot → status=fired; recurring → next rrule occurrence), and
-# escalation_count resets for the next cycle.
+# 2026-04-23: auto-escalation ВЫКЛЮЧЕНА (MAX_FIRES=1 → ровно одна
+# отправка). Причина — юзеры жаловались на дубли: re-ping через 2 мин
+# воспринимался как спам, а race-условие с нажатием «Сделал» иногда
+# позволяло напоминанию прилететь повторно даже после подтверждения.
+# Кнопка «Отложить ⏰» — это явный action юзера, она продолжает
+# работать через ``snooze()``. Если захотим вернуть — меняем обратно
+# на 2, больше ничего трогать не надо.
 ESCALATION_INTERVAL_MINUTES = 2
-ESCALATION_MAX_FIRES = 2  # original message + 1 re-ping
+ESCALATION_MAX_FIRES = 1  # single-fire mode; no auto re-ping
 SNOOZE_DEFAULT_MINUTES = 10
+
+# 2026-04-23 «баг 2»: если напоминание просрочено БОЛЬШЕ чем на эту
+# величину, воркер закрывает его silently — без отправки. Нужно чтобы
+# серия one-shot'ов с прошедшими часами (LLM создала 3 на 11/15/20,
+# юзер попросил в 20:42) не прилетала пачкой «дублей».
+LATE_FIRE_GRACE_MINUTES = 15
 
 
 def _utcnow() -> datetime:

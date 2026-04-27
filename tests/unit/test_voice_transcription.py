@@ -140,9 +140,10 @@ async def test_no_voice_access_sends_error():
     assert result is None
     telegram.send_message.assert_awaited_once()
     msg = telegram.send_message.call_args.kwargs["text"]
-    # New semantics: no mention of "limit"; user is pointed at the
-    # Помощник домохозяйки agent, which bundles voice.
-    assert "Помощник" in msg
+    # 2026-04-27: текст ошибки изменили на нейтрально-короткий
+    # «Голосовые сообщения доступны в подписке. Открой /subscriptions…»
+    # Тест переписан под новый текст; «Помощник» больше не упоминается.
+    assert "Голосовые" in msg
     assert "/subscriptions" in msg
 
 
@@ -193,7 +194,10 @@ async def test_no_speech_provider_sends_error():
     assert result is None
     telegram.send_message.assert_awaited_once()
     msg = telegram.send_message.call_args.kwargs["text"]
-    assert "не настроен" in msg
+    # 2026-04-27: текст обновили — теперь «Голосовые сообщения сейчас
+    # не работают. Напиши текстом или попробуй позже.»
+    assert "Голосовые" in msg
+    assert "не работают" in msg
 
 
 @pytest.mark.asyncio

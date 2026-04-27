@@ -22,7 +22,10 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.core import OutboxMessage, User, Workspace
 from sreda.db.models.housewife import FamilyReminder
-from sreda.services.housewife_reminders import HousewifeReminderService
+from sreda.services.housewife_reminders import (
+    LATE_FIRE_GRACE_MINUTES,
+    HousewifeReminderService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +55,33 @@ class HousewifeReminderWorker:
             return 0
 
         fired = 0
+        skipped_late = 0
         for reminder in due:
             try:
+                # 2026-04-23 «баг 2b»: если напоминание просрочено больше
+                # чем LATE_FIRE_GRACE_MINUTES — закрываем его silently
+                # без отправки в Telegram. Типичный случай: LLM создала
+                # серию one-shot'ов на прошедшие часы, воркер на первой
+                # же итерации увидит их всех past-due — без этого guard'а
+                # юзер получает несколько одинаковых сообщений пачкой.
+                # mark_fired всё равно вызываем чтобы advance'нуть state
+                # (recurring → next RRULE, one-shot → status='fired').
+                trigger = reminder.next_trigger_at
+                if trigger is not None:
+                    if trigger.tzinfo is None:
+                        trigger = trigger.replace(tzinfo=timezone.utc)
+                    late_min = (current - trigger).total_seconds() / 60
+                    if late_min > LATE_FIRE_GRACE_MINUTES:
+                        logger.info(
+                            "reminder %s: past-due by %dmin > grace %dmin, "
+                            "silent-finalise",
+                            reminder.id, int(late_min),
+                            LATE_FIRE_GRACE_MINUTES,
+                        )
+                        self.service.mark_fired(reminder, now=current)
+                        skipped_late += 1
+                        continue
+
                 self._enqueue_outbox_for(reminder)
                 self.service.mark_fired(reminder, now=current)
                 fired += 1
@@ -64,8 +92,11 @@ class HousewifeReminderWorker:
                 )
                 continue
         self.session.commit()
-        if fired:
-            logger.info("housewife: fired %d reminder(s)", fired)
+        if fired or skipped_late:
+            logger.info(
+                "housewife: fired=%d skipped_late=%d",
+                fired, skipped_late,
+            )
         return fired
 
     # --- internals ------------------------------------------------------
@@ -96,15 +127,17 @@ class HousewifeReminderWorker:
         # with one tap. Callback data carries the reminder id — the
         # telegram bot callback handler parses our prefix and routes
         # to HousewifeReminderService.acknowledge / .snooze.
+        from sreda.services.ui_labels import BUTTON_ACK, BUTTON_SNOOZE
+
         text = f"🔔 {reminder.title}"
         reply_markup = {
             "inline_keyboard": [[
                 {
-                    "text": "Сделал ✅",
+                    "text": BUTTON_ACK,
                     "callback_data": f"rem_done:{reminder.id}",
                 },
                 {
-                    "text": "Отложить ⏰",
+                    "text": BUTTON_SNOOZE,
                     "callback_data": f"rem_snooze:{reminder.id}",
                 },
             ]],

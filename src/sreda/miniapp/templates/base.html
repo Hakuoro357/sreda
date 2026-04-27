@@ -228,6 +228,50 @@
     .mt-8 { margin-top: 8px; }
     .mt-16 { margin-top: 16px; }
     .mb-8 { margin-bottom: 8px; }
+
+    /* Schedule past-days collapse. CSS-only via the native
+       <details>/<summary> element — no JS toggle. Reuses the pattern
+       from the removed «Меню недели» UI. Past days render as a muted
+       spoiler so the user's eye lands on today first. */
+    .schedule-past-collapse {
+      margin: 8px 0 4px;
+    }
+    .schedule-past-collapse > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--tg-theme-secondary-bg-color, #f2f2f7);
+      color: var(--tg-theme-hint-color, #999);
+      font-size: 13px;
+      user-select: none;
+    }
+    .schedule-past-collapse > summary::-webkit-details-marker { display: none; }
+    .schedule-past-collapse > summary::after {
+      content: " раскрыть ▾";
+      color: var(--tg-theme-link-color, #2481cc);
+    }
+    .schedule-past-collapse[open] > summary::after {
+      content: " скрыть ▴";
+    }
+    /* Load-more button at the end of the week list. */
+    .schedule-next-week {
+      display: block;
+      width: 100%;
+      margin: 20px 0 8px;
+      padding: 12px;
+      background: var(--tg-theme-secondary-bg-color, #f2f2f7);
+      color: var(--tg-theme-link-color, #2481cc);
+      border: 0;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .schedule-next-week:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
   </style>
 </head>
 <body>

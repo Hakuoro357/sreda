@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -801,17 +801,10 @@ def get_menu(
         }
         for s in sections
     ]
-    # Platform-level tile — not an agent contribution, always present.
-    items.append(
-        {
-            "id": "subscriptions",
-            "title": "Подписки",
-            "icon": "\U0001f4b3",  # 💳
-            "route": "#/subscriptions",
-            "subtitle": None,
-            "count": None,
-        }
-    )
+    # Platform-level tile «Подписки» временно скрыт (2026-04-25 —
+    # подписку выдаёт админ при approve, юзер сам не оформляет).
+    # Route #/subscriptions и весь биллинг-код остаются нетронутыми;
+    # просто tile не инжектится в Mini App home до запуска платежей.
     return {"items": items}
 
 
@@ -1111,7 +1104,7 @@ def delete_recipe_endpoint(
 
 
 def _task_dict(task) -> dict:
-    """Serialize one Task row for the /schedule/today response.
+    """Serialize one Task row for the /schedule/week response.
 
     Time fields come back as ``"HH:MM"`` strings (LLM tools accept the
     same shape). ``has_reminder`` + ``reminder_offset_minutes`` let
@@ -1131,76 +1124,112 @@ def _task_dict(task) -> dict:
     }
 
 
-# Time-of-day buckets for the schedule screen. Strict cuts chosen to
-# match user mental model ("morning" ends at lunch, "evening" starts
-# after the work day for most users). Tasks with time_start < 12:00
-# → morning; 12:00 ≤ t < 17:00 → day; t ≥ 17:00 → evening; no time
-# → "no_time" bucket (shown below the timed ones).
-def _bucket_task(task) -> str:
-    if task.time_start is None:
-        return "no_time"
-    hour = task.time_start.hour
-    if hour < 12:
-        return "morning"
-    if hour < 17:
-        return "day"
-    return "evening"
+# Human-readable day labels for the schedule screen. Generated server-
+# side so the Mini App just renders whatever the endpoint returns; no
+# JS locale dance, and the same wording lands in the home card count
+# if we ever surface it there.
+_DAY_NAMES_RU = (
+    "Понедельник", "Вторник", "Среда", "Четверг",
+    "Пятница", "Суббота", "Воскресенье",
+)
+_MONTH_NAMES_RU = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
 
 
-_SECTION_LABELS: dict[str, str] = {
-    "morning": "Сегодня утром",
-    "day": "Сегодня днём",
-    "evening": "Сегодня вечером",
-    "no_time": "Без времени",
-}
-_SECTION_ORDER = ("morning", "day", "evening", "no_time")
+def _day_label(d: date) -> str:
+    """«День-недели, ДД месяц» — e.g. «Четверг, 23 апреля»."""
+    return f"{_DAY_NAMES_RU[d.weekday()]}, {d.day} {_MONTH_NAMES_RU[d.month - 1]}"
 
 
-@router.get("/api/v1/schedule/today")
-def get_today_schedule(
+def _current_monday(today: date) -> date:
+    """Start of the ISO week (Monday) that contains ``today``."""
+    return today - timedelta(days=today.weekday())
+
+
+@router.get("/api/v1/schedule/week")
+def get_week_schedule(
+    start: str | None = None,
     session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    """Return today's pending tasks grouped by time-of-day.
+    """Return a 7-day window starting at ``start`` (ISO date, Monday-
+    aligned by convention but not enforced).
 
-    Shape:
-      ``{"date": "2026-04-23",
-         "groups": [{"section": "morning", "label": "Сегодня утром",
-                     "tasks": [...]}, ...]}``
+    If ``start`` is omitted we default to the Monday of the current
+    UTC week. Undated (``scheduled_date IS NULL``) tasks surface in
+    the top-level ``inbox`` field **only** when ``start`` equals the
+    current-week Monday — so the Mini App can render the inbox block
+    once above the first loaded week and subsequent «next week»
+    fetches don't duplicate it.
 
-    Empty buckets are omitted so the client doesn't render blank
-    section headers. Read-only — no mutations from Mini App in the
-    MVP; all task CRUD goes through voice.
+    Response shape::
+
+        {
+          "week_start": "YYYY-MM-DD",
+          "inbox": [task_dict, ...],
+          "days": [
+            {"date": "...", "label": "Понедельник, 20 апреля",
+             "is_past": bool, "tasks": [...]},
+            ... # exactly 7 entries
+          ]
+        }
+
+    Read-only — mutations go through voice (chat tools).
     """
-    from datetime import datetime as _dt
-
     from sreda.services.tasks import TaskService
 
     if ctx.user_id is None:
-        return {"date": None, "groups": []}
+        return {"week_start": None, "inbox": [], "days": []}
 
-    today = _dt.now(timezone.utc).date()
-    tasks = TaskService(session).list_today(
-        tenant_id=ctx.tenant_id, user_id=ctx.user_id, today=today,
+    today = datetime.now(UTC).date()
+    current_monday = _current_monday(today)
+
+    if start:
+        try:
+            week_start = date.fromisoformat(start)
+        except ValueError as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail=f"invalid start date: {exc}",
+            ) from exc
+    else:
+        week_start = current_monday
+    week_end = week_start + timedelta(days=6)
+
+    svc = TaskService(session)
+    per_day = svc.list_range(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id,
+        from_date=week_start, to_date=week_end,
     )
 
-    grouped: dict[str, list[dict]] = {k: [] for k in _SECTION_ORDER}
-    for t in tasks:
-        grouped[_bucket_task(t)].append(_task_dict(t))
+    # Inbox only on the current week — avoids rendering the same
+    # undated list at the top of every loaded week.
+    if week_start == current_monday:
+        inbox_rows = svc.list(
+            tenant_id=ctx.tenant_id, user_id=ctx.user_id,
+            scheduled_date=None, include_no_date=True,
+            status="pending",
+        )
+        inbox = [_task_dict(t) for t in inbox_rows]
+    else:
+        inbox = []
 
-    groups = [
-        {
-            "section": section,
-            "label": _SECTION_LABELS[section],
-            "tasks": grouped[section],
-        }
-        for section in _SECTION_ORDER
-        if grouped[section]
-    ]
+    days = []
+    cursor = week_start
+    while cursor <= week_end:
+        days.append({
+            "date": cursor.isoformat(),
+            "label": _day_label(cursor),
+            "is_past": cursor < today,
+            "tasks": [_task_dict(t) for t in per_day.get(cursor, [])],
+        })
+        cursor = cursor + timedelta(days=1)
 
     return {
-        "date": today.isoformat(),
-        "groups": groups,
+        "week_start": week_start.isoformat(),
+        "inbox": inbox,
+        "days": days,
     }
 
 
@@ -1312,4 +1341,67 @@ def delete_family_member_endpoint(
         raise HTTPException(status_code=404, detail="member_not_found")
     return {"ok": True}
 
+
+# ---------------------------------------------------------------------------
+# Checklists (план 2026-04-25 — именованные списки дел с галочками)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/v1/checklists")
+def list_checklists_endpoint(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """All ACTIVE checklists with their items embedded.
+
+    One-shot fetch — Mini App рендерит весь экран за один запрос.
+    Items в каждом checklist отсортированы по position.
+
+    Shape::
+
+        {
+          "checklists": [
+            {
+              "id": "checklist_xxx",
+              "title": "План кроя на эту неделю",
+              "pending": 5, "done": 2, "total": 7,
+              "items": [
+                {"id": "clitem_yyy", "title": "Лаванда 298 ТС...",
+                 "status": "pending", "position": 0},
+                ...
+              ]
+            },
+            ...
+          ]
+        }
+
+    Mutations через голос (по UX-решению — Mini App read-only в MVP).
+    """
+    from sreda.services.checklists import ChecklistService
+
+    svc = ChecklistService(session)
+    lists = svc.list_active(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+
+    out = []
+    for cl in lists:
+        items = svc.list_items(list_id=cl.id)
+        pending = sum(1 for i in items if i.status == "pending")
+        done = sum(1 for i in items if i.status == "done")
+        out.append({
+            "id": cl.id,
+            "title": cl.title,
+            "pending": pending,
+            "done": done,
+            "total": len(items),
+            "items": [
+                {
+                    "id": i.id,
+                    "title": i.title,
+                    "status": i.status,
+                    "position": i.position,
+                }
+                for i in items
+            ],
+        })
+    return {"checklists": out}
 

@@ -51,16 +51,17 @@ def test_worker_fires_due_reminder_and_writes_outbox() -> None:
     assert "🔔 Купить молоко" in outbox[0].payload_json
 
 
-def test_worker_leaves_future_reminders_alone() -> None:
-    """After escalation lands, the past reminder STAYS pending (re-ping
-    scheduled +2min out) — the future one is untouched. A single tick
-    only sends the message once."""
+def test_worker_fires_due_reminder_within_grace_window() -> None:
+    """2026-04-23 single-fire mode + LATE_FIRE_GRACE: due-в-окне 15мин
+    напоминание отправляется один раз и сразу финализируется (oneshot →
+    fired). Future-напоминание не трогается."""
     session = _fresh_session()
     svc = HousewifeReminderService(session)
     now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    # 5 минут просрочки — внутри grace window, отправляем.
     svc.schedule(
         tenant_id="tenant_1", user_id="user_1",
-        title="Past", trigger_at=now - timedelta(hours=1),
+        title="DueNow", trigger_at=now - timedelta(minutes=5),
     )
     svc.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -73,20 +74,23 @@ def test_worker_leaves_future_reminders_alone() -> None:
     assert fired == 1
     outbox = session.query(OutboxMessage).all()
     assert len(outbox) == 1
-    # Both reminders still pending — Past got its first fire + re-ping
-    # scheduled; Future untouched.
-    pending = session.query(FamilyReminder).filter_by(status="pending").all()
-    assert {r.title for r in pending} == {"Past", "Future"}
-    past = next(r for r in pending if r.title == "Past")
-    assert past.escalation_count == 1
+    # DueNow → fired (oneshot single-fire); Future → pending.
+    fired_titles = {
+        r.title for r in
+        session.query(FamilyReminder).filter_by(status="fired").all()
+    }
+    pending_titles = {
+        r.title for r in
+        session.query(FamilyReminder).filter_by(status="pending").all()
+    }
+    assert fired_titles == {"DueNow"}
+    assert pending_titles == {"Future"}
 
 
-def test_worker_recurring_first_fire_schedules_re_ping() -> None:
-    """A single worker tick against a recurring reminder bumps
-    escalation_count to 1 and schedules a +2min re-ping — NOT the
-    next week. Weekly advance happens only after the cycle caps."""
-    from sreda.services.housewife_reminders import ESCALATION_INTERVAL_MINUTES
-
+def test_worker_recurring_first_fire_advances_to_next_week() -> None:
+    """2026-04-23 single-fire mode: recurring reminder при первом fire
+    сразу advance'ит next_trigger_at до следующей итерации RRULE
+    (next Tuesday), без +2min re-ping'а."""
     session = _fresh_session()
     svc = HousewifeReminderService(session)
     first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
@@ -101,13 +105,12 @@ def test_worker_recurring_first_fire_schedules_re_ping() -> None:
 
     session.refresh(reminder)
     assert reminder.status == "pending"
-    assert reminder.escalation_count == 1
+    # escalation_count сбрасывается при advance.
+    assert reminder.escalation_count == 0
     next_at = reminder.next_trigger_at
     if next_at.tzinfo is None:
         next_at = next_at.replace(tzinfo=UTC)
-    assert next_at == first_tuesday + timedelta(
-        minutes=ESCALATION_INTERVAL_MINUTES
-    )
+    assert next_at == first_tuesday + timedelta(days=7)
 
 
 def test_worker_skips_tenant_without_telegram() -> None:
@@ -119,9 +122,11 @@ def test_worker_skips_tenant_without_telegram() -> None:
 
     svc = HousewifeReminderService(session)
     now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    # 2026-04-27: схедулим в окне grace (5 минут просрочки), чтобы
+    # LATE_FIRE_GRACE_MINUTES=15 не зашибил silently.
     svc.schedule(
         tenant_id="tenant_notg", user_id=None,
-        title="Orphan", trigger_at=now - timedelta(hours=1),
+        title="Orphan", trigger_at=now - timedelta(minutes=5),
     )
 
     worker = HousewifeReminderWorker(session)

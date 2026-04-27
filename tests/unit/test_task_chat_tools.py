@@ -154,6 +154,22 @@ def test_list_tasks_inbox_filter(tools):
     assert "scheduled" not in res
 
 
+def test_list_tasks_tomorrow_sees_recurring_from_today(tools):
+    """Regression 2026-04-23: a daily-recurring task created today must
+    show up when the LLM queries ``list_tasks("tomorrow")`` — same
+    RRULE-expansion rule the Mini App /schedule/today uses. Without
+    this, voice «что у меня завтра» returns «no tasks» even though the
+    recurring task clearly fires tomorrow."""
+    tools["add_task"].invoke({
+        "title": "Прогулка с собакой",
+        "scheduled_date": "today",
+        "time_start": "18:00",
+        "recurrence_rule": "FREQ=DAILY;BYHOUR=15;BYMINUTE=0",
+    })
+    res = tools["list_tasks"].invoke({"date": "tomorrow"})
+    assert "Прогулка с собакой" in res, f"expected recurring task in tomorrow list, got: {res!r}"
+
+
 def test_list_tasks_all_scope(tools):
     tools["add_task"].invoke({
         "title": "today",

@@ -128,6 +128,7 @@
     recipes: null,
     recipeDetail: {},
     schedule: null,
+    checklists: null,
     family: null,
     loading: true,
     error: null,
@@ -199,15 +200,54 @@
   }
 
   function loadSchedule() {
-    return apiFetch("/miniapp/api/v1/schedule/today").then(function(res) {
-      state.schedule = res;
+    // First-page load: current week (no start param) + inbox.
+    return apiFetch("/miniapp/api/v1/schedule/week").then(function(res) {
+      state.schedule = {
+        weeks: [{ week_start: res.week_start, days: res.days || [] }],
+        inbox: res.inbox || [],
+        loading: false,
+        _error: false,
+      };
       render();
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
-        state.schedule = { groups: [], _error: true };
+        state.schedule = {
+          weeks: [], inbox: [], loading: false, _error: true,
+        };
         render();
       }
     });
+  }
+
+  function loadNextWeek() {
+    // Appends the week AFTER the last loaded week to state.schedule.
+    // Button is click-to-load, not scroll-based — keeps behaviour
+    // predictable on Mini App constrained viewports.
+    if (!state.schedule || state.schedule.loading) return;
+    var weeks = state.schedule.weeks || [];
+    if (weeks.length === 0) return;
+    var lastStart = weeks[weeks.length - 1].week_start;
+    // +7 days from the last start, as YYYY-MM-DD. Compute in JS to
+    // avoid a server round-trip; the endpoint itself will accept any
+    // valid ISO date and just return that Monday-aligned week.
+    var d = new Date(lastStart + "T00:00:00Z");
+    d.setUTCDate(d.getUTCDate() + 7);
+    var nextStart = d.toISOString().slice(0, 10);
+
+    state.schedule.loading = true;
+    render();
+    apiFetch("/miniapp/api/v1/schedule/week?start=" + nextStart)
+      .then(function(res) {
+        state.schedule.weeks.push({
+          week_start: res.week_start, days: res.days || [],
+        });
+        state.schedule.loading = false;
+        render();
+      })
+      .catch(function(err) {
+        state.schedule.loading = false;
+        if (err.message !== "auth_expired") render();
+      });
   }
 
   function loadShopping() {
@@ -217,6 +257,18 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.shopping = { items: [], _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadChecklists() {
+    return apiFetch("/miniapp/api/v1/checklists").then(function(res) {
+      state.checklists = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.checklists = { checklists: [], _error: true };
         render();
       }
     });
@@ -429,8 +481,12 @@
       html += '</div>';
     }
 
-    // Active subscriptions
-    var activeSkills = s.active_skills || [];
+    // Active subscriptions. 2026-04-23: EDS скрыт из UI подписок
+    // (временный костыль). Backend скила цел, cron-мониторинг
+    // продолжает работать — просто плашка не рендерится в Mini App.
+    var activeSkills = (s.active_skills || []).filter(function(sk) {
+      return sk.feature_key !== "eds_monitor";
+    });
     if (activeSkills.length > 0) {
       html += '<div class="section-title">Активные</div>';
       for (var i = 0; i < activeSkills.length; i++) {
@@ -453,6 +509,48 @@
     html += '</div>';
 
     return html;
+  }
+
+  // Human-readable RRULE summary for reminder cards. Covers the
+  // common shapes the LLM emits (FREQ=DAILY / WEEKLY BYDAY=...).
+  // Unknown shapes fall back to the raw RRULE so the user at least
+  // sees SOMETHING rather than «undefined».
+  var _DOW_RU = {
+    MO: "понедельник", TU: "вторник", WE: "среда", TH: "четверг",
+    FR: "пятница", SA: "суббота", SU: "воскресенье",
+  };
+  var _DOW_RU_PLURAL = {
+    MO: "понедельникам", TU: "вторникам", WE: "средам", TH: "четвергам",
+    FR: "пятницам", SA: "субботам", SU: "воскресеньям",
+  };
+  function formatRRule(rule) {
+    if (!rule) return "";
+    var parts = {};
+    rule.split(";").forEach(function(chunk) {
+      var kv = chunk.split("=");
+      if (kv.length === 2) parts[kv[0]] = kv[1];
+    });
+    var freq = parts.FREQ;
+    var byday = parts.BYDAY;
+    if (freq === "DAILY") {
+      if (byday === "MO,TU,WE,TH,FR") return "по будням";
+      if (byday === "SA,SU") return "по выходным";
+      return "каждый день";
+    }
+    if (freq === "WEEKLY") {
+      if (!byday) return "каждую неделю";
+      var days = byday.split(",");
+      if (days.length === 1 && _DOW_RU[days[0]]) {
+        return "каждый " + _DOW_RU[days[0]];
+      }
+      var names = days.map(function(d) {
+        return _DOW_RU_PLURAL[d] || d;
+      });
+      return "по " + names.join(", ");
+    }
+    if (freq === "MONTHLY") return "каждый месяц";
+    if (freq === "YEARLY") return "каждый год";
+    return rule;  // fallback: still better than nothing
   }
 
   // --- Screen: Reminders (#/reminders) ---
@@ -488,7 +586,7 @@
       html += '<div class="card-title">' + icon + " " + escHtml(r.title) + '</div>';
       html += '<div class="card-subtitle">' + escHtml(formatDateTime(r.next_trigger_at)) + '</div>';
       if (r.is_recurring) {
-        html += '<div class="card-subtitle">' + escHtml(r.recurrence_rule) + '</div>';
+        html += '<div class="card-subtitle">' + escHtml(formatRRule(r.recurrence_rule)) + '</div>';
       }
       html += '<div class="text-right mt-8">';
       html += '<button class="btn btn-danger btn-small" onclick="window._cancelReminder(\'' + escHtml(r.id) + '\', \'' + escHtml(r.title).replace(/\'/g, "") + '\')">Отменить</button>';
@@ -500,95 +598,147 @@
   }
 
   // --- Screen: Schedule (#/schedule) ---
-  // Day-of-week names for the header line. 0=Sunday..6=Saturday as
-  // per JS Date.getDay() — different from the server's
-  // ``day_of_week`` convention (0=Monday) but since we just need
-  // today's label the JS mapping is simpler.
-  var _SCHEDULE_DAY_NAMES_RU = [
-    "воскресенье", "понедельник", "вторник", "среда",
-    "четверг", "пятница", "суббота"
-  ];
-  var _SCHEDULE_MONTH_NAMES_RU = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря"
-  ];
+  // Day labels (e.g. «Четверг, 23 апреля») now come from the server
+  // in each day object's ``label`` field, generated by _day_label()
+  // in miniapp.py. No JS locale tables needed.
+
+  // Render a single task card (flat row). Used for both dated days
+  // and the top-of-page inbox section — shape identical.
+  function _renderTaskRow(t) {
+    var iconsPrefix = "";
+    if (t.is_recurring) iconsPrefix += "\uD83D\uDD04 ";   // 🔄
+    if (t.has_reminder) iconsPrefix += "\uD83D\uDD14 ";   // 🔔
+
+    var h = '<div style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)">';
+    h += '<div style="font-weight:500">' + iconsPrefix + escHtml(t.title) + '</div>';
+    var metaBits = [];
+    if (t.time_start) {
+      metaBits.push(t.time_end
+        ? (t.time_start + "–" + t.time_end)
+        : t.time_start);
+    }
+    if (t.has_reminder && t.reminder_offset_minutes) {
+      metaBits.push("напомнить за " + t.reminder_offset_minutes + " мин");
+    }
+    if (t.delegated_to) {
+      metaBits.push("поручено: " + escHtml(t.delegated_to));
+    }
+    if (metaBits.length > 0) {
+      h += '<div class="card-subtitle" style="margin-top:2px">'
+        + metaBits.join(" · ") + '</div>';
+    }
+    if (t.notes) {
+      h += '<div class="card-subtitle" style="margin-top:2px;font-style:italic">'
+        + escHtml(t.notes) + '</div>';
+    }
+    h += '</div>';
+    return h;
+  }
+
+  // One dated day block: label + either tasks or муted "ничего не запланировано".
+  function _renderScheduleDay(day) {
+    var h = '<div class="section-title" style="margin:16px 0 8px 4px">';
+    h += escHtml(day.label) + '</div>';
+    h += '<div class="card" style="padding:4px 12px">';
+    var tasks = day.tasks || [];
+    if (tasks.length === 0) {
+      h += '<div class="card-subtitle" style="padding:8px 0">ничего не запланировано</div>';
+    } else {
+      for (var i = 0; i < tasks.length; i++) {
+        h += _renderTaskRow(tasks[i]);
+      }
+    }
+    h += '</div>';
+    return h;
+  }
 
   function renderSchedule() {
     setupBackButton(true);
-    var now = new Date();
-    var dayLabel = _SCHEDULE_DAY_NAMES_RU[now.getDay()]
-      + ", " + now.getDate() + " " + _SCHEDULE_MONTH_NAMES_RU[now.getMonth()];
-    // Capitalize first letter for the heading.
-    var headerDate = dayLabel.charAt(0).toUpperCase() + dayLabel.slice(1);
-
-    var html = '<h1>\uD83D\uDCC5 Расписание</h1>';  // 📅
-    html += '<div class="card-subtitle" style="margin-bottom:16px">' + escHtml(headerDate) + '</div>';
+    var html = '<h1>\uD83D\uDCC5 Расписание</h1>';
 
     if (state.schedule === null) {
       loadSchedule();
       return html + renderLoading();
     }
-    if (state.schedule && state.schedule._error) {
+    if (state.schedule._error) {
       return html + '<div class="error-state">Не удалось загрузить расписание.</div>';
     }
 
-    var groups = (state.schedule && state.schedule.groups) || [];
-    if (groups.length === 0) {
+    var weeks = state.schedule.weeks || [];
+    var inbox = state.schedule.inbox || [];
+    var totalTasks = inbox.length;
+    for (var wi = 0; wi < weeks.length; wi++) {
+      var ds = weeks[wi].days || [];
+      for (var di = 0; di < ds.length; di++) {
+        totalTasks += (ds[di].tasks || []).length;
+      }
+    }
+
+    // Fully empty state — only show if literally nothing is scheduled
+    // in the loaded week and inbox is empty.
+    if (totalTasks === 0 && weeks.length <= 1) {
       html += '<div class="empty-state">';
-      html += 'Сегодня задач не запланировано.<br><br>';
+      html += 'На этой неделе задач не запланировано.<br><br>';
       html += 'Скажи Среде: «поставь задачу прогуляться в 18:00» ';
       html += 'или «добавь утреннюю разминку каждый будний день».';
       html += '</div>';
+      // Still allow "next week" from empty state.
+      html += '<button class="schedule-next-week" onclick="window._loadNextWeek()"';
+      html += (state.schedule.loading ? ' disabled' : '') + '>';
+      html += (state.schedule.loading ? 'Загружаю…' : 'Показать следующую неделю ▾');
+      html += '</button>';
       return html;
     }
 
-    for (var g = 0; g < groups.length; g++) {
-      var group = groups[g];
+    // Inbox section — only rendered if it has items (server puts it in
+    // the FIRST week response only; subsequent "next week" responses
+    // return inbox: []).
+    if (inbox.length > 0) {
       html += '<div class="section-title" style="margin:16px 0 8px 4px">';
-      html += escHtml(group.label);
-      html += '</div>';
+      html += '\uD83D\uDCE5 Без даты</div>';  // 📥
       html += '<div class="card" style="padding:4px 12px">';
-      var tasks = group.tasks || [];
-      for (var i = 0; i < tasks.length; i++) {
-        var t = tasks[i];
-        var iconsPrefix = "";
-        if (t.is_recurring) iconsPrefix += "\uD83D\uDD04 ";   // 🔄
-        if (t.has_reminder) iconsPrefix += "\uD83D\uDD14 ";   // 🔔
-
-        html += '<div style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)">';
-        html += '<div style="font-weight:500">'
-          + iconsPrefix + escHtml(t.title) + '</div>';
-
-        // Meta line: time · reminder-offset (if any) · delegated (if any)
-        var metaBits = [];
-        if (t.time_start) {
-          metaBits.push(t.time_end
-            ? (t.time_start + "–" + t.time_end)
-            : t.time_start);
-        }
-        if (t.has_reminder && t.reminder_offset_minutes) {
-          metaBits.push("напомнить за " + t.reminder_offset_minutes + " мин");
-        }
-        if (t.delegated_to) {
-          metaBits.push("поручено: " + escHtml(t.delegated_to));
-        }
-        if (metaBits.length > 0) {
-          html += '<div class="card-subtitle" style="margin-top:2px">'
-            + metaBits.join(" · ") + '</div>';
-        }
-        if (t.notes) {
-          html += '<div class="card-subtitle" style="margin-top:2px;font-style:italic">'
-            + escHtml(t.notes) + '</div>';
-        }
-        html += '</div>';
+      for (var ii = 0; ii < inbox.length; ii++) {
+        html += _renderTaskRow(inbox[ii]);
       }
       html += '</div>';
     }
 
-    // Voice-only hint at the bottom. Read-only Mini App: all edits
-    // go through the chat. Single-line, muted, not clickable.
+    // Weeks loop. Past days in the FIRST loaded week get wrapped in
+    // a <details> collapse so the current day lands at the top of
+    // the open list. Subsequent weeks are fully future — no collapse.
+    for (var w = 0; w < weeks.length; w++) {
+      var week = weeks[w];
+      var days = week.days || [];
+      var pastDays = [];
+      var futureDays = [];
+      for (var j = 0; j < days.length; j++) {
+        (days[j].is_past ? pastDays : futureDays).push(days[j]);
+      }
+
+      if (pastDays.length > 0) {
+        html += '<details class="schedule-past-collapse">';
+        html += '<summary>\uD83D\uDCCB Прошедшие дни</summary>';  // 📋
+        for (var p = 0; p < pastDays.length; p++) {
+          html += _renderScheduleDay(pastDays[p]);
+        }
+        html += '</details>';
+      }
+      for (var f = 0; f < futureDays.length; f++) {
+        html += _renderScheduleDay(futureDays[f]);
+      }
+    }
+
+    // Load-next-week button — always at the very end, rebuilt on every
+    // render so pushing a new week into state.schedule.weeks just
+    // re-appends days before the button.
+    html += '<button class="schedule-next-week" onclick="window._loadNextWeek()"';
+    html += (state.schedule.loading ? ' disabled' : '') + '>';
+    html += (state.schedule.loading ? 'Загружаю…' : 'Показать следующую неделю ▾');
+    html += '</button>';
+
+    // Voice-only hint. Read-only Mini App: all edits via chat.
     html += '<div class="card-subtitle" ';
-    html += 'style="text-align:center;margin-top:24px;padding:0 8px;line-height:1.4">';
+    html += 'style="text-align:center;margin-top:16px;padding:0 8px;line-height:1.4">';
     html += 'Для изменения или удаления задачи просто скажи Среде голосом.';
     html += '</div>';
     return html;
@@ -755,6 +905,78 @@
       // Show the empty state banner.
       render();
     }
+  }
+
+  // --- Screen: Checklists (#/checklists) ---
+  // Read-only в MVP: пункты ставит / снимает голос (LLM tools).
+  // Каждый именованный список рендерим как раскрывающийся блок с
+  // галочками ☐/☑. Done-пункты с strikethrough.
+  function renderChecklists() {
+    setupBackButton(true);
+    var html = '<h1>\uD83D\uDCCB Дела</h1>';
+
+    if (state.checklists === null) {
+      loadChecklists();
+      return html + renderLoading();
+    }
+    if (state.checklists && state.checklists._error) {
+      return html + '<div class="error-state">Не удалось загрузить дела.</div>';
+    }
+    var lists = (state.checklists && state.checklists.checklists) || [];
+    if (lists.length === 0) {
+      html += '<div class="empty-state">';
+      html += 'Пока дел нет.<br><br>';
+      html += 'Скажи мне голосом или текстом: «запиши план кроя на эту неделю: ' +
+              'лаванда 298 простыня 141 на 200, шампань 202 на 204, …» — ' +
+              'я создам именованный список дел с пунктами.<br><br>';
+      html += 'Дела удобны для пунктов БЕЗ конкретных дат, по которым ' +
+              'нужно отметить «сделано». Если нужно событие на дату — ' +
+              'это в Расписании.';
+      html += '</div>';
+      return html;
+    }
+
+    for (var i = 0; i < lists.length; i++) {
+      var cl = lists[i];
+      // Заголовок списка + счётчики.
+      var hasPending = cl.pending > 0;
+      // Открытым по умолчанию — если есть pending. Если все done —
+      // свернутый, чтобы не отвлекал.
+      var openAttr = hasPending ? ' open' : '';
+      html += '<details class="card"' + openAttr + ' style="padding:0">';
+      html += '<summary style="padding:14px 16px;cursor:pointer;list-style:none">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center">';
+      html += '<div class="card-title" style="margin:0">' + escHtml(cl.title) + '</div>';
+      html += '<div class="card-subtitle" style="margin:0">';
+      html += cl.pending + ' / ' + cl.total;
+      html += '</div></div></summary>';
+
+      // Пункты внутри.
+      html += '<div style="padding:0 16px 12px 16px">';
+      var items = cl.items || [];
+      for (var j = 0; j < items.length; j++) {
+        var it = items[j];
+        var isDone = it.status === 'done';
+        var isCancelled = it.status === 'cancelled';
+        var mark = isDone ? '\u2611' : (isCancelled ? '\u2717' : '\u2610');  // ☑ / ✗ / ☐
+        var textStyle = isDone
+          ? 'text-decoration:line-through;opacity:0.55'
+          : (isCancelled ? 'opacity:0.45;color:var(--tg-theme-hint-color,#999)' : '');
+        html += '<div style="display:flex;gap:10px;padding:6px 0;align-items:flex-start">';
+        html += '<div style="font-size:18px;line-height:1.2;flex-shrink:0">' + mark + '</div>';
+        html += '<div style="flex:1;' + textStyle + '">' + escHtml(it.title) + '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+      html += '</details>';
+    }
+
+    html += '<div class="card-subtitle" style="text-align:center;margin-top:16px;padding:0 8px;line-height:1.4">';
+    html += 'Чтобы добавить или отметить пункт — скажи мне голосом ' +
+            '(«закройила лаванду», «добавь в план кроя X»). ' +
+            'Архивировать список — «закрой план кроя».';
+    html += '</div>';
+    return html;
   }
 
   // --- Screen: Family (#/family) ---
@@ -1105,7 +1327,10 @@
     setupBackButton(true);
     var html = '<h1>Добавить подписку</h1>';
 
-    var available = (state.summary && state.summary.available_skills) || [];
+    // 2026-04-23: EDS-план скрыт из каталога (временный костыль).
+    // См. комментарий у active_skills filter выше.
+    var available = ((state.summary && state.summary.available_skills) || [])
+      .filter(function(p) { return p.plan_key !== "eds_monitor_base"; });
     if (available.length === 0) {
       html += '<div class="empty-state">Все доступные подписки уже подключены</div>';
       return html;
@@ -1158,6 +1383,8 @@
       html = renderSchedule();
     } else if (route === "/shopping") {
       html = renderShopping();
+    } else if (route === "/checklists") {
+      html = renderChecklists();
     } else if (route === "/family") {
       html = renderFamily();
     } else if (route === "/recipes") {
@@ -1185,6 +1412,8 @@
   // -- Global actions --
 
   window._nav = function(path) { navigate(path); };
+
+  window._loadNextWeek = function() { loadNextWeek(); };
 
   window._subscribeSkill = function(planKey, title, priceRub) {
     var msg = priceRub > 0
@@ -1597,6 +1826,7 @@
     if (route === "/reminders" && state.reminders !== null) loadReminders();
     if (route === "/schedule" && state.schedule !== null) loadSchedule();
     if (route === "/shopping" && state.shopping !== null) loadShopping();
+    if (route === "/checklists" && state.checklists !== null) loadChecklists();
     if (route === "/recipes" && state.recipes !== null) loadRecipes();
     if (route === "/family" && state.family !== null) loadFamily();
     // Recipe detail page (#/recipes/{id}) — refetch currently viewed recipe.

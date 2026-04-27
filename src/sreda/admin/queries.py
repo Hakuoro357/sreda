@@ -53,6 +53,10 @@ class UserRow:
     subscriptions: list[SubInfo]
     eds_accounts: list[EDSInfo]
     skill_states: list[SkillInfo]
+    # None = pending approval (new user, admin hasn't clicked "Одобрить"
+    # yet). Non-None = approved; admin UI hides the button in that case.
+    approved_at: str | None = None
+    is_pending: bool = False
 
 
 @dataclass
@@ -81,7 +85,10 @@ class SkillInfo:
 
 def get_all_users(session: Session) -> list[UserRow]:
     """All users with their profiles, subscriptions, EDS accounts, skills."""
-    tenants = {t.id: t.name for t in session.query(Tenant).all()}
+    tenant_rows = session.query(Tenant).all()
+    tenants = {t.id: t.name for t in tenant_rows}
+    # Keep approved_at handy for the "Одобрить" button on /admin/users.
+    tenants_approved = {t.id: t.approved_at for t in tenant_rows}
     users = session.query(User).all()
 
     # Bulk-load related data keyed by tenant_id
@@ -127,6 +134,7 @@ def get_all_users(session: Session) -> list[UserRow]:
     result: list[UserRow] = []
     for u in users:
         profile = profiles_by_key.get((u.tenant_id, u.id))
+        approved_at = tenants_approved.get(u.tenant_id)
         result.append(
             UserRow(
                 tenant_id=u.tenant_id,
@@ -138,6 +146,8 @@ def get_all_users(session: Session) -> list[UserRow]:
                 subscriptions=subs_by_tenant.get(u.tenant_id, []),
                 eds_accounts=eds_by_tenant.get(u.tenant_id, []),
                 skill_states=skills_by_tenant.get(u.tenant_id, []),
+                approved_at=_fmt_dt(approved_at),
+                is_pending=approved_at is None,
             )
         )
     return result

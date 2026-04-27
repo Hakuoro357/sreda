@@ -306,9 +306,49 @@ class TaskService:
 
     def _attach_reminder_inner(self, *, task: Task, offset_minutes: int) -> None:
         """Internal helper: create a FamilyReminder, link it, commit.
-        Caller guarantees the task has scheduled_date + time_start."""
+        Caller guarantees the task has scheduled_date + time_start.
+
+        Timezone rules (2026-04-23 fix for «напоминание в 20:45 вместо 17:45»
+        prod incident):
+          * If the task has ``recurrence_rule``: the RRULE already encodes
+            UTC hours (see _HOUSEWIFE_FOOD_PROMPT — LLM converts MSK→UTC
+            before writing BYHOUR). We compute the first trigger by asking
+            the RRULE for its next occurrence on or after ``scheduled_date``;
+            that value is correctly UTC without needing profile TZ.
+          * Otherwise (one-shot): ``time_start`` is stored as the user's
+            local wall-clock time. We read their TZ from TenantUserProfile
+            (default UTC) and convert combine(date, time_local) → UTC.
+
+        In both cases we subtract ``offset_minutes`` once we have the
+        correct UTC fire time.
+        """
         assert task.scheduled_date is not None and task.time_start is not None
-        trigger_dt = _combine_local(task.scheduled_date, task.time_start)
+
+        if task.recurrence_rule:
+            # RRULE is UTC by contract. Compute first occurrence anchored
+            # on scheduled_date 00:00 UTC so BYHOUR/BYMINUTE control the
+            # fire time (rather than time_start, which might be local).
+            from dateutil.rrule import rrulestr
+            anchor = datetime.combine(
+                task.scheduled_date, time(0, 0), tzinfo=timezone.utc,
+            )
+            rule = rrulestr(task.recurrence_rule, dtstart=anchor)
+            first = rule.after(anchor, inc=True)
+            if first is None:
+                # Rule never fires — fall back to old behaviour so we at
+                # least create a reminder. Should be unreachable in prod.
+                trigger_dt = _combine_local(
+                    task.scheduled_date, task.time_start,
+                )
+            else:
+                trigger_dt = first
+        else:
+            # One-shot: interpret time_start as user's local TZ.
+            tz = self._user_timezone(task.tenant_id, task.user_id)
+            naive_local = datetime.combine(task.scheduled_date, task.time_start)
+            aware_local = naive_local.replace(tzinfo=tz)
+            trigger_dt = aware_local.astimezone(timezone.utc)
+
         trigger_dt = trigger_dt - timedelta(minutes=offset_minutes)
         # Copy RRULE over so a recurring task gets a recurring reminder.
         reminder = self.reminders.schedule(
@@ -323,6 +363,30 @@ class TaskService:
         task.reminder_offset_minutes = offset_minutes
         task.updated_at = _utcnow()
         self.session.commit()
+
+    def _user_timezone(self, tenant_id: str, user_id: str):
+        """Resolve the user's IANA timezone for local-wall-clock ↔ UTC
+        conversion. Falls back to UTC if no profile row or an unknown
+        zone — matching the TenantUserProfile default column value."""
+        try:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        except ImportError:  # pragma: no cover
+            return timezone.utc
+
+        from sreda.db.models.user_profile import TenantUserProfile
+        profile = (
+            self.session.query(TenantUserProfile)
+            .filter(
+                TenantUserProfile.tenant_id == tenant_id,
+                TenantUserProfile.user_id == user_id,
+            )
+            .one_or_none()
+        )
+        tz_name = (profile.timezone if profile else None) or "UTC"
+        try:
+            return ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            return timezone.utc
 
     # ------------------------------------------------------------------
     # Queries
@@ -361,13 +425,131 @@ class TaskService:
             Task.created_at.asc(),
         ).all()
 
+    def list_range(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        from_date: date,
+        to_date: date,
+    ) -> dict[date, list[Task]]:
+        """Pending tasks across ``[from_date, to_date]`` (inclusive).
+
+        Returns a dict keyed by **every** date in the window
+        (even empty ones → empty list) so callers can render a 7-day
+        skeleton without special-casing misses.
+
+        One-shots appear on their ``scheduled_date``. Recurring tasks
+        (``recurrence_rule`` non-null) are expanded via
+        ``dateutil.rrule.rrulestr(...).between(...)`` so a `FREQ=DAILY`
+        task surfaces on every day the RRULE yields inside the window
+        — without needing an auto-clone worker.
+
+        Recurring tasks whose one-shot scheduled_date falls inside the
+        window appear only once (dedup by id + date pair is implicit
+        since one-shots and RRULE expansions share the same row).
+        """
+        from dateutil.rrule import rrulestr
+
+        if to_date < from_date:
+            return {}
+
+        # Initialise the skeleton: every date in the window gets an
+        # empty bucket upfront. Callers can iterate keys in order via
+        # `sorted(result)` or use it as a lookup.
+        result: dict[date, list[Task]] = {}
+        cursor = from_date
+        while cursor <= to_date:
+            result[cursor] = []
+            cursor = cursor + timedelta(days=1)
+
+        # 1) One-shots (and first-occurrence rows of recurring tasks)
+        #    whose scheduled_date falls inside the window.
+        in_window = (
+            self.session.query(Task)
+            .filter(
+                Task.tenant_id == tenant_id,
+                Task.user_id == user_id,
+                Task.status == "pending",
+                Task.scheduled_date.isnot(None),
+                Task.scheduled_date >= from_date,
+                Task.scheduled_date <= to_date,
+            )
+            .all()
+        )
+        for t in in_window:
+            result[t.scheduled_date].append(t)
+
+        # 2) Recurring tasks whose scheduled_date STARTS on or before
+        #    the window and has a rule. For each, ask the RRULE which
+        #    days inside the window fire, and attach the row to each
+        #    of those days — EXCEPT the row's own scheduled_date which
+        #    step 1 already covered.
+        recurring = (
+            self.session.query(Task)
+            .filter(
+                Task.tenant_id == tenant_id,
+                Task.user_id == user_id,
+                Task.status == "pending",
+                Task.recurrence_rule.isnot(None),
+                Task.scheduled_date.isnot(None),
+                Task.scheduled_date <= to_date,
+            )
+            .all()
+        )
+        window_start_dt = datetime.combine(
+            from_date, time.min, tzinfo=timezone.utc,
+        )
+        window_end_dt = datetime.combine(
+            to_date, time.min, tzinfo=timezone.utc,
+        ) + timedelta(days=1)
+
+        for t in recurring:
+            try:
+                start_time = t.time_start or time(0, 0)
+                dtstart = datetime.combine(
+                    t.scheduled_date, start_time, tzinfo=timezone.utc,
+                )
+                rule = rrulestr(t.recurrence_rule, dtstart=dtstart)
+                for occ in rule.between(
+                    window_start_dt, window_end_dt, inc=True,
+                ):
+                    occ_date = occ.date()
+                    if occ_date not in result:
+                        continue
+                    if t.scheduled_date == occ_date:
+                        # Already added by step 1 — don't dup.
+                        continue
+                    result[occ_date].append(t)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "rrule_expansion_failed task=%s rule=%r err=%s",
+                    t.id, t.recurrence_rule, exc,
+                )
+
+        # Sort each bucket by time_start (no-time last), then by
+        # creation order. Stable so the same expansion yields the
+        # same order across calls.
+        for d in result:
+            result[d].sort(
+                key=lambda t: (
+                    t.time_start or time(23, 59),
+                    t.created_at,
+                ),
+            )
+
+        return result
+
     def list_today(
         self, *, tenant_id: str, user_id: str, today: date,
     ) -> list[Task]:
-        return self.list(
+        """Thin wrapper around :meth:`list_range` for the single-day
+        case. Kept as a stable contract because ``plugin.py`` and the
+        chat tool both rely on it for today's count / listing."""
+        return self.list_range(
             tenant_id=tenant_id, user_id=user_id,
-            scheduled_date=today, status="pending",
-        )
+            from_date=today, to_date=today,
+        ).get(today, [])
 
     # ------------------------------------------------------------------
     # Helpers

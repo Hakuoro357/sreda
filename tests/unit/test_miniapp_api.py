@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+from datetime import timedelta
 from urllib.parse import urlencode
 
 import pytest
@@ -412,5 +413,137 @@ class TestMiniAppClearAllShopping:
         )
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "cleared": 0}
+
+
+class TestMiniAppScheduleWeek:
+    """GET /api/v1/schedule/week — Mini App «Расписание» недельный вид.
+
+    Replaces the 2026-04-23 single-day endpoint. The week view is what
+    actually maps to the user's mental model: recurring tasks should
+    visibly span every day they fire on, and the current week is the
+    natural scope for «что у меня сегодня и дальше».
+
+    Shape:
+      ``{"week_start": "YYYY-MM-DD",
+         "inbox": [task_dict, ...],    # current week only, else []
+         "days": [
+           {"date": "...", "label": "Понедельник, 20 апреля",
+            "is_past": bool, "tasks": [...]},
+           ...  # exactly 7 entries
+         ]}``
+    """
+
+    @staticmethod
+    def _current_monday_utc():
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+        today = _dt.now(_tz.utc).date()
+        return today - timedelta(days=today.weekday())
+
+    def test_week_endpoint_default_returns_current_week(self, seeded_client):
+        """Empty DB, no start param — 200 with 7 days, ISO labels,
+        is_past correct relative to today."""
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        init_data = _make_init_data()
+        resp = seeded_client.get(
+            "/miniapp/api/v1/schedule/week",
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["week_start"] == self._current_monday_utc().isoformat()
+        assert body["inbox"] == []
+        assert len(body["days"]) == 7
+
+        today = _dt.now(_tz.utc).date()
+        for day in body["days"]:
+            assert "date" in day
+            assert "label" in day and day["label"]
+            assert "is_past" in day
+            assert "tasks" in day
+            day_date = _dt.fromisoformat(day["date"]).date()
+            assert day["is_past"] == (day_date < today)
+
+    def test_week_endpoint_with_start_param_returns_that_week(self, seeded_client):
+        """Explicit future start → that Monday, inbox omitted."""
+        from datetime import datetime as _dt
+
+        future_monday = self._current_monday_utc() + timedelta(days=7)
+        init_data = _make_init_data()
+        resp = seeded_client.get(
+            f"/miniapp/api/v1/schedule/week?start={future_monday.isoformat()}",
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["week_start"] == future_monday.isoformat()
+        assert body["inbox"] == []
+        # All days are future → no is_past=true.
+        assert all(d["is_past"] is False for d in body["days"])
+        # First day's date matches the requested Monday.
+        assert _dt.fromisoformat(body["days"][0]["date"]).date() == future_monday
+
+    def test_week_endpoint_inbox_in_current_week_only(self, seeded_client):
+        """Undated tasks surface in inbox only when start=current Monday.
+        Requesting next week must return inbox=[] to avoid duplication."""
+        from sreda.db.session import get_session_factory
+        from sreda.services.tasks import TaskService
+
+        session = get_session_factory()()
+        try:
+            TaskService(session).add(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Undated item",  # no scheduled_date → inbox
+            )
+        finally:
+            session.close()
+
+        init_data = _make_init_data()
+        resp_current = seeded_client.get(
+            "/miniapp/api/v1/schedule/week",
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp_current.status_code == 200
+        inbox = resp_current.json()["inbox"]
+        assert len(inbox) == 1 and inbox[0]["title"] == "Undated item"
+
+        next_monday = self._current_monday_utc() + timedelta(days=7)
+        resp_next = seeded_client.get(
+            f"/miniapp/api/v1/schedule/week?start={next_monday.isoformat()}",
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp_next.json()["inbox"] == []
+
+    def test_week_endpoint_recurring_task_spans_all_days(self, seeded_client):
+        """A daily-recurring task must appear in every day of the week."""
+        from datetime import time as _time
+
+        from sreda.db.session import get_session_factory
+        from sreda.services.tasks import TaskService
+
+        start_monday = self._current_monday_utc()
+        session = get_session_factory()()
+        try:
+            TaskService(session).add(
+                tenant_id="tenant_test", user_id="user_test",
+                title="Прогулка",
+                scheduled_date=start_monday,
+                time_start=_time(18, 0),
+                recurrence_rule="FREQ=DAILY;BYHOUR=15;BYMINUTE=0",
+            )
+        finally:
+            session.close()
+
+        init_data = _make_init_data()
+        resp = seeded_client.get(
+            "/miniapp/api/v1/schedule/week",
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert resp.status_code == 200
+        for day in resp.json()["days"]:
+            titles = [t["title"] for t in day["tasks"]]
+            assert "Прогулка" in titles, f"missing on {day['date']}"
 
 
