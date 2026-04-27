@@ -156,19 +156,18 @@ def test_telegram_webhook_creates_new_user_and_sends_welcome_message(
     assert response.status_code == 202
     assert len(sent_messages) == 1
     assert sent_messages[0]["chat_id"] == NEW_USER_CHAT_ID
-    # 2026-04-25 Часть B плана v2: вместо silent-drop'а pending-бот
-    # отдаёт scripted welcome с 4 кнопками-темами (см. pending_bot.py).
+    # 2026-04-27: pending-бот упрощён до одного развёрнутого welcome
+    # без кнопок. Текст содержит ключевые маркеры: «Среда», «модератор»,
+    # описания всех функций (расписание, дела, покупки, рецепты, семья).
     text = sent_messages[0]["text"]
-    assert "Среда" in text and "модератор" in text
+    assert "Среда" in text
+    assert "модератор" in text
+    assert "Голос" in text  # самый верхний функциональный блок
+    assert "Расписание" in text
+    assert "Список покупок" in text
+    # Кнопок в pending-фазе больше нет.
     markup = sent_messages[0]["reply_markup"]
-    assert markup is not None and "inline_keyboard" in markup
-    # 4 кнопки welcome: каждая на своей строке.
-    rows = markup["inline_keyboard"]
-    assert len(rows) == 4
-    # Все callback_data с префиксом pb: (pending_bot.is_pending_callback).
-    for row in rows:
-        for btn in row:
-            assert btn["callback_data"].startswith("pb:")
+    assert markup is None
 
     session = get_session_factory()()
     try:
