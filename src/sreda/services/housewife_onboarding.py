@@ -44,9 +44,16 @@ HOUSEWIFE_FEATURE_KEY = "housewife_assistant"
 logger = logging.getLogger(__name__)
 
 
-# Topic order is fixed — covering the household domain without tripping
-# over cold-start awkwardness (start with "how should I call you", end
-# with the outcome-oriented "what do you want help with").
+# 2026-04-27 (вечер): TOPIC_ORDER сокращена до одной темы `addressing`.
+# Раньше было 6 тем (addressing, self_intro, family, diet, routine,
+# pain_point) — это создавало ощущение анкеты после длинной pending-
+# цепочки. Решение: после approve LLM спрашивает только имя, дальше
+# обычный chat-flow без проактивных расспросов. Возврат остальных тем
+# — backlog (`docs/tomorrow-plan.md` пункт 8).
+#
+# Константы остальных топиков сохраняются как valid string identifiers
+# (могут использоваться через update_profile_field в свободной форме),
+# но НЕ участвуют в активном цикле сбора.
 TOPIC_ADDRESSING = "addressing"
 TOPIC_SELF_INTRO = "self_intro"
 TOPIC_FAMILY = "family"
@@ -56,21 +63,17 @@ TOPIC_PAIN_POINT = "pain_point"
 
 TOPIC_ORDER: tuple[str, ...] = (
     TOPIC_ADDRESSING,
-    TOPIC_SELF_INTRO,
-    TOPIC_FAMILY,
-    TOPIC_DIET,
-    TOPIC_ROUTINE,
-    TOPIC_PAIN_POINT,
 )
 
 # Prompt-facing descriptions. The LLM formulates the actual question;
-# these are just seeds so it knows what the topic is about and doesn't
-# reinterpret "diet" as "exercise".
+# these are just seeds so it knows what the topic is about. Описания
+# удалённых из TOPIC_ORDER тем оставлены для совместимости — на случай
+# если LLM передаст один из них в `onboarding_answered(topic=...)`.
 TOPIC_DESCRIPTIONS: dict[str, str] = {
     TOPIC_ADDRESSING: "Как обращаться к пользователю — имя или прозвище.",
     TOPIC_SELF_INTRO: "Короткий рассказ о себе — чем занимается, что любит.",
     TOPIC_FAMILY: "Кто живёт вместе (супруг/а, дети с именами и возрастами, питомцы).",
-    TOPIC_DIET: "Ограничения по питанию — аллергии, диеты, что не любит.",
+    TOPIC_DIET: "Ограничения по питанию — что не любит, что нельзя.",
     TOPIC_ROUTINE: "Ключевые якоря дня — подъём, работа/садик/школа, отбой.",
     TOPIC_PAIN_POINT: "С чем чаще всего хочется помощи — меню / покупки / расписание детей / уборка / дневник дел.",
 }

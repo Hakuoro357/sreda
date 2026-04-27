@@ -43,33 +43,26 @@ def _fresh_session():
 # ---------------------------------------------------------------------------
 
 
-def test_next_topic_first_pending_wins():
+def test_next_topic_addressing_pending_returns_addressing():
+    """2026-04-27: TOPIC_ORDER = (TOPIC_ADDRESSING,). Если addressing
+    pending — он же current."""
     state = {
         "topics": {
-            TOPIC_ADDRESSING: {"state": STATE_ANSWERED},
-            TOPIC_SELF_INTRO: {"state": STATE_ANSWERED},
-            TOPIC_FAMILY: {"state": STATE_PENDING},
-            TOPIC_DIET: {"state": STATE_PENDING},
-            TOPIC_ROUTINE: {"state": STATE_PENDING},
-            TOPIC_PAIN_POINT: {"state": STATE_PENDING},
+            TOPIC_ADDRESSING: {"state": STATE_PENDING},
         }
     }
-    assert _next_topic(state["topics"]) == TOPIC_FAMILY
+    assert _next_topic(state["topics"]) == TOPIC_ADDRESSING
 
 
-def test_next_topic_skipped_once_gets_second_pass():
-    """After all pending exhausted, skipped_once topics come back."""
+def test_next_topic_skipped_once_returns_for_second_pass():
+    """skipped_once темы возвращаются на повторный показ. Для одной
+    темы — это сама addressing после первого defer."""
     state = {
         "topics": {
-            TOPIC_ADDRESSING: {"state": STATE_ANSWERED},
-            TOPIC_SELF_INTRO: {"state": STATE_SKIPPED_ONCE},
-            TOPIC_FAMILY: {"state": STATE_ANSWERED},
-            TOPIC_DIET: {"state": STATE_ANSWERED},
-            TOPIC_ROUTINE: {"state": STATE_ANSWERED},
-            TOPIC_PAIN_POINT: {"state": STATE_ANSWERED},
+            TOPIC_ADDRESSING: {"state": STATE_SKIPPED_ONCE},
         }
     }
-    assert _next_topic(state["topics"]) == TOPIC_SELF_INTRO
+    assert _next_topic(state["topics"]) == TOPIC_ADDRESSING
 
 
 def test_next_topic_returns_none_when_all_settled():
@@ -136,7 +129,10 @@ def test_start_transitions_to_in_progress_and_picks_first_topic():
 # ---------------------------------------------------------------------------
 
 
-def test_mark_answered_advances_topic_and_saves_summary():
+def test_mark_answered_saves_summary_and_completes():
+    """2026-04-27: TOPIC_ORDER = (addressing,). После ответа на
+    единственную тему — current_topic становится None (все темы
+    пройдены)."""
     session = _fresh_session()
     service = HousewifeOnboardingService(session)
     service.start(tenant_id="t1", user_id="u1")
@@ -150,8 +146,8 @@ def test_mark_answered_advances_topic_and_saves_summary():
 
     assert state["topics"][TOPIC_ADDRESSING]["state"] == STATE_ANSWERED
     assert state["topics"][TOPIC_ADDRESSING]["answer"] == "Борис"
-    assert state["current_topic"] == TOPIC_SELF_INTRO
-    assert state["current_topic_depth"] == 0
+    # Все темы пройдены, current_topic None.
+    assert state["current_topic"] is None
 
 
 def test_mark_answered_addressing_mirrors_into_profile():
@@ -198,7 +194,9 @@ def test_mark_answered_all_topics_flips_status_to_complete():
 # ---------------------------------------------------------------------------
 
 
-def test_mark_deferred_once_moves_to_skipped_once_and_retries_later():
+def test_mark_deferred_once_moves_to_skipped_once_for_retry():
+    """2026-04-27: TOPIC_ORDER = (addressing,). После defer'а единственной
+    темы она в skipped_once и остаётся current — ждёт второго шанса."""
     session = _fresh_session()
     service = HousewifeOnboardingService(session)
     service.start(tenant_id="t1", user_id="u1")
@@ -208,24 +206,8 @@ def test_mark_deferred_once_moves_to_skipped_once_and_retries_later():
     )
     state = service.get_raw_state(tenant_id="t1", user_id="u1")
     assert state["topics"][TOPIC_ADDRESSING]["state"] == STATE_SKIPPED_ONCE
-    # Next topic should be the next pending one.
-    assert state["current_topic"] == TOPIC_SELF_INTRO
-
-    # Answer the rest except addressing; after that, addressing should
-    # come back up for a second chance.
-    for topic in (
-        TOPIC_SELF_INTRO,
-        TOPIC_FAMILY,
-        TOPIC_DIET,
-        TOPIC_ROUTINE,
-        TOPIC_PAIN_POINT,
-    ):
-        service.mark_answered(
-            tenant_id="t1", user_id="u1", topic=topic, summary="ok"
-        )
-
-    state = service.get_raw_state(tenant_id="t1", user_id="u1")
-    # Five answered, addressing still skipped_once → that's the current.
+    # Единственная тема, после первого defer — она же current
+    # (для повторной попытки).
     assert state["current_topic"] == TOPIC_ADDRESSING
 
 
@@ -289,7 +271,28 @@ def test_record_follow_up_noop_when_not_in_progress():
 # ---------------------------------------------------------------------------
 
 
-def test_format_for_prompt_shows_current_topic_and_status_markers():
+def test_format_for_prompt_shows_current_topic_at_start():
+    """До ответа на addressing prompt показывает её как current и
+    содержит tool-call hints для LLM."""
+    session = _fresh_session()
+    service = HousewifeOnboardingService(session)
+    service.start(tenant_id="t1", user_id="u1")
+
+    state = service.get_raw_state(tenant_id="t1", user_id="u1")
+    prompt = service.format_for_prompt(state)
+
+    # Current topic — addressing.
+    assert TOPIC_ADDRESSING in prompt
+    # Pending marker (юзер ещё не ответил).
+    assert "⏸" in prompt
+    # Tool call hints для LLM.
+    assert "onboarding_answered" in prompt
+    assert "onboarding_deferred" in prompt
+
+
+def test_format_for_prompt_shows_completion_after_addressing_answered():
+    """После ответа на единственную тему — current_topic None и
+    prompt сообщает что все темы пройдены."""
     session = _fresh_session()
     service = HousewifeOnboardingService(session)
     service.start(tenant_id="t1", user_id="u1")
@@ -301,14 +304,11 @@ def test_format_for_prompt_shows_current_topic_and_status_markers():
     state = service.get_raw_state(tenant_id="t1", user_id="u1")
     prompt = service.format_for_prompt(state)
 
-    # Current topic block
-    assert TOPIC_SELF_INTRO in prompt
-    # Marker for answered
+    # Сохранённый ответ показан с маркером.
     assert "✅" in prompt
-    assert "Борис" in prompt  # saved answer shown
-    # Tool call hints for the LLM
-    assert "onboarding_answered" in prompt
-    assert "onboarding_deferred" in prompt
+    assert "Борис" in prompt
+    # Все темы пройдены — закрывающий blurb.
+    assert "Все темы пройдены" in prompt
 
 
 def test_format_for_prompt_depth_warning_at_cap():
@@ -346,7 +346,9 @@ def test_format_for_prompt_when_complete_asks_for_closing_message():
 
 
 def test_state_survives_service_recreation():
-    """Two services on the same session see the same persisted state."""
+    """Two services on the same session see the same persisted state.
+    2026-04-27: с TOPIC_ORDER=(addressing,) после ответа single topic
+    статус становится `complete` (нет других тем для сбора)."""
     session = _fresh_session()
     svc1 = HousewifeOnboardingService(session)
     svc1.start(tenant_id="t1", user_id="u1")
@@ -357,7 +359,8 @@ def test_state_survives_service_recreation():
 
     svc2 = HousewifeOnboardingService(session)
     state = svc2.get_raw_state(tenant_id="t1", user_id="u1")
-    assert state["status"] == STATUS_IN_PROGRESS
+    # После единственной темы — flow закончен.
+    assert state["status"] == STATUS_COMPLETE
     assert state["topics"][TOPIC_ADDRESSING]["state"] == STATE_ANSWERED
 
 
