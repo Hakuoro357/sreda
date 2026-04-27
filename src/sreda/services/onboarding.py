@@ -155,107 +155,21 @@ def ensure_telegram_user_bundle_by_id(
     )
 
 
-def build_name_question_message() -> str:
-    """Шаг 1 онбординга после admin-approve (2026-04-27).
+def build_post_approve_message() -> str:
+    """Сообщение после admin-approve (2026-04-27 simplified).
 
-    Бот ещё не знает, как обращаться к юзеру (имя, ты/вы). Прежде чем
-    показывать housewife-welcome про семью — собираем минимум контекста.
-
-    Шаг 1: вопрос про имя (свободный ввод, без кнопок).
-    Шаг 2: вопрос про ты/вы (callback-кнопки, см.
-    ``services.telegram_bot._handle_address_form_callback``).
-    Шаг 3: ``build_welcome_message`` про семью (текущий housewife-welcome).
+    Юзер только что прошёл pending-цепочку из 11 сообщений (включая
+    представление Среды и обзор всех функций). Здесь просто
+    подтверждаем что доступ открыт и спрашиваем имя — без кнопок,
+    без расспросов про семью / диеты / другие данные. LLM сама
+    спросит дальше, когда уместно.
     """
     return (
-        "Привет! Я Среда — твой персональный ассистент.\n\n"
-        "Подскажи, как тебя зовут? Можно просто имя — или как удобно, "
-        "чтобы я к тебе обращалась."
+        "✅ Готово! Модератор открыл доступ — рада знакомству.\n\n"
+        "Прежде чем приступим, подскажи, как к тебе обращаться? "
+        "Имя или ник, как удобно. Это нужно, чтобы напоминания и "
+        "сообщения были по-человечески, а не «уважаемый пользователь»."
     )
-
-
-def build_address_form_question_message(display_name: str) -> tuple[str, dict]:
-    """Шаг 2 онбординга — вопрос «на ты или на вы» с inline-кнопками.
-
-    callback_data: ``addrform:ty`` / ``addrform:vy``. Префикс
-    интерсептится в ``services.telegram_bot._handle_callback`` ДО
-    ``btn_reply:`` — без LLM-turn'а, чистый state-update.
-    """
-    text = (
-        f"Приятно познакомиться, {display_name}!\n\n"
-        "Ещё один маленький вопрос — как удобнее общаться?"
-    )
-    reply_markup = {
-        "inline_keyboard": [
-            [
-                {"text": "На ты", "callback_data": "addrform:ty"},
-                {"text": "На вы", "callback_data": "addrform:vy"},
-            ],
-        ],
-    }
-    return text, reply_markup
-
-
-def build_welcome_message(
-    *,
-    session=None,
-    tenant_id: str | None = None,
-    user_id: str | None = None,
-) -> tuple[str, dict | None]:
-    """Welcome-сообщение после approval (Часть B плана v2).
-
-    Текст — housewife-ориентированный, не про EDS/подписки. По
-    фильтру «анти-сталкер» — сначала объясняем ЗАЧЕМ нужны данные,
-    потом просим, и всегда даём эскейп-кнопку «Позже».
-
-    Если переданы ``session + tenant_id + user_id`` — создаём через
-    ``ReplyButtonService`` токен для кнопки «Позже, сначала осмотрюсь»
-    (переведёт юзера в свободный чат без формы). Иначе — возвращаем
-    текст без кнопок (совместимость с тестами, которые могут не
-    передавать контекст).
-    """
-    text = (
-        "✅ Готово! Модератор подключил.\n\n"
-        "Теперь я могу отвечать по-настоящему.\n\n"
-        "Чтобы я была полезной сразу — коротко расскажи про семью: "
-        "имена и возрасты (чтобы обращаться правильно), и есть ли у "
-        "кого-то диета или аллергия (чтобы меню подходило всем).\n\n"
-        "Ничего не обязательно — можно начать без этого и "
-        "рассказывать по мере того, как будет уместно.\n\n"
-        "Пиши голосом или текстом — как удобно."
-    )
-
-    if session is None or not tenant_id or not user_id:
-        return text, None
-
-    # «Позже» — эскейп-кнопка: переводит в свободный чат без формы.
-    # Это обычный btn_reply: юзер «нажимает» → бот получает text
-    # «Позже, сначала осмотрюсь» и отвечает LLM'ом.
-    try:
-        from sreda.services.reply_buttons import ReplyButtonService
-
-        pairs = ReplyButtonService(session).create_tokens(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            labels=[
-                "Может, позже",
-                "Расскажу про семью",
-            ],
-        )
-    except Exception:  # noqa: BLE001
-        # Если токены не создаются — отдаём welcome без кнопок,
-        # юзер просто ответит свободным текстом.
-        return text, None
-
-    if not pairs:
-        return text, None
-
-    reply_markup = {
-        "inline_keyboard": [
-            [{"text": label, "callback_data": f"btn_reply:{tok}"}]
-            for tok, label in pairs
-        ],
-    }
-    return text, reply_markup
 
 
 def build_connect_eds_message(*, base_active: bool, connected_count: int, allowed_count: int) -> str:

@@ -483,7 +483,7 @@ async def admin_tenant_approve(
         TelegramClient,
         TelegramDeliveryError,
     )
-    from sreda.services.onboarding import build_name_question_message
+    from sreda.services.onboarding import build_post_approve_message
 
     tenant = session.get(Tenant, tenant_id)
     if tenant is None:
@@ -575,11 +575,11 @@ async def admin_tenant_approve(
         and user.telegram_account_id
     ):
         client = TelegramClient(settings.telegram_bot_token)
-        # 2026-04-27: после approve шлём не housewife-welcome (про
-        # семью), а вопрос «как тебя зовут?» — это шаг 1 трёхступенчатого
-        # онбординга (имя → ты/вы → housewife-welcome). Дальше state-machine
-        # в telegram_webhook ловит ответ юзера и переходит на следующий шаг.
-        text = build_name_question_message()
+        # 2026-04-27 simplified: после approve шлём ОДНО короткое
+        # сообщение — подтверждение + вопрос про имя. Без кнопок.
+        # LLM сама развивает диалог дальше (имя через
+        # update_profile_field tool, остальное по контексту).
+        text = build_post_approve_message()
         try:
             await client.send_message(
                 chat_id=user.telegram_account_id,

@@ -12,7 +12,7 @@ from sreda.runtime.executor import ActionRuntimeService
 from sreda.services import trace
 from sreda.services.agent_capabilities import has_voice_access
 from sreda.services.budget import BudgetService
-from sreda.services.onboarding import TelegramOnboardingResult, build_welcome_message
+from sreda.services.onboarding import TelegramOnboardingResult
 from sreda.services.speech.base import SpeechRecognitionError
 from sreda.services.speech.factory import get_speech_recognizer
 
@@ -47,18 +47,10 @@ async def handle_telegram_interaction(
         )
         return
 
-    if onboarding.is_new_user:
-        text, reply_markup = build_welcome_message(
-            session=session,
-            tenant_id=onboarding.tenant_id,
-            user_id=onboarding.user_id,
-        )
-        await telegram_client.send_message(
-            chat_id=onboarding.chat_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
-        return
+    # 2026-04-27 simplified: ветка `is_new_user` удалена. До approval-gate
+    # юзер не доходит до этой функции (webhook routes pending tenants
+    # в pending_bot.match). После approve admin route шлёт
+    # build_post_approve_message напрямую — отдельной ветки тут не надо.
 
     payload = await _maybe_transcribe_voice(
         payload,
@@ -227,20 +219,6 @@ async def _handle_callback(
     callback_id = callback_query.get("id")
     data = str(callback_query.get("data") or "")
 
-    # Onboarding шаг 2 (2026-04-27): callback "addrform:ty|vy" фиксирует
-    # выбор формы обращения и шлёт housewife-welcome про семью. Не
-    # дёргает LLM — это чистый state-update + side-effect отправки
-    # следующего сообщения. Должен идти ПЕРВЫМ, до всех btn_reply / rem_*.
-    if data.startswith("addrform:"):
-        await _handle_address_form_callback(
-            session=session,
-            telegram_client=telegram_client,
-            callback_query=callback_query,
-            onboarding=onboarding,
-            choice=data[len("addrform:"):],
-        )
-        return
-
     # Reminder-escalation callbacks (v1.2). The housewife reminder
     # worker sends inline buttons with callback_data of the form
     # ``rem_done:<reminder_id>`` / ``rem_snooze:<reminder_id>``. We
@@ -290,108 +268,6 @@ async def _handle_callback(
     runtime = ActionRuntimeService(session, telegram_client=telegram_client)
     queued = runtime.enqueue_action(runtime_action)
     await runtime.process_job(queued.job_id)
-
-
-async def _handle_address_form_callback(
-    *,
-    session: Session,
-    telegram_client: TelegramClient,
-    callback_query: dict,
-    onboarding: TelegramOnboardingResult,
-    choice: str,
-) -> None:
-    """Сохраняет выбор «ты/вы» в профиле и отправляет housewife-welcome.
-
-    После этого юзер на шаге 3 онбординга. Telegram-кнопки удаляем
-    через edit_message_text, чтобы юзер не мог тапнуть дважды.
-    Toast'ом подтверждаем выбор соответствующей формой обращения.
-    """
-    from sreda.db.repositories.user_profile import UserProfileRepository
-
-    callback_id = str(callback_query.get("id") or "")
-    message = callback_query.get("message") or {}
-    chat = (message.get("chat") or {}) if isinstance(message, dict) else {}
-    chat_id = (
-        str(chat.get("id") or "") if isinstance(chat, dict) else ""
-    )
-    message_id = (
-        message.get("message_id") if isinstance(message, dict) else None
-    )
-    original_text = (
-        (message.get("text") or "") if isinstance(message, dict) else ""
-    )
-
-    if choice not in ("ty", "vy"):
-        if callback_id:
-            try:
-                await telegram_client.answer_callback_query(
-                    callback_id, text="Не понял выбор"
-                )
-            except TelegramDeliveryError:
-                pass
-        return
-
-    if onboarding.tenant_id is None or onboarding.user_id is None:
-        if callback_id:
-            try:
-                await telegram_client.answer_callback_query(
-                    callback_id, text="Что-то пошло не так"
-                )
-            except TelegramDeliveryError:
-                pass
-        return
-
-    repo = UserProfileRepository(session)
-    repo.update_profile(
-        tenant_id=onboarding.tenant_id,
-        user_id=onboarding.user_id,
-        source="user_command",
-        actor_user_id=onboarding.user_id,
-        address_form=choice,
-    )
-    session.commit()
-
-    # Toast: «Понял» (vy) / «Поняла» (ty). Подбираем форму родовой
-    # гендерности самой Среды позже (Среда — она, поэтому всегда
-    # феминитивы); здесь форма зависит от того, к юзеру на ты или вы.
-    toast = "Поняла" if choice == "ty" else "Поняла, перехожу на «вы»"
-    if callback_id:
-        try:
-            await telegram_client.answer_callback_query(
-                callback_id, text=toast
-            )
-        except TelegramDeliveryError:
-            pass
-
-    # Стираем кнопки на сообщении-вопросе (юзер не должен тапнуть
-    # дважды), оставляем оригинальный текст.
-    if chat_id and message_id is not None and original_text:
-        try:
-            await telegram_client.edit_message_text(
-                chat_id=chat_id,
-                message_id=int(message_id),
-                text=original_text,
-                reply_markup=None,
-            )
-        except TelegramDeliveryError as exc:
-            logger.warning("addrform edit_message_text failed: %s", exc)
-
-    # Шаг 3: housewife-welcome про семью.
-    welcome_text, welcome_markup = build_welcome_message(
-        session=session,
-        tenant_id=onboarding.tenant_id,
-        user_id=onboarding.user_id,
-    )
-    target_chat_id = chat_id or onboarding.chat_id
-    if target_chat_id:
-        try:
-            await telegram_client.send_message(
-                chat_id=target_chat_id,
-                text=welcome_text,
-                reply_markup=welcome_markup,
-            )
-        except TelegramDeliveryError as exc:
-            logger.warning("housewife welcome delivery failed: %s", exc)
 
 
 async def _handle_reminder_callback(

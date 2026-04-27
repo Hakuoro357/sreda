@@ -161,115 +161,10 @@ async def telegram_webhook(
             ok=True, request_id=result.inbound_message_id,
         )
 
-    # Onboarding state-machine (2026-04-27): после approval, но ДО
-    # обычного chat-flow, бот собирает имя + форму обращения (ты/вы).
-    #
-    #   profile.display_name IS NULL  → ловим первый text → save → шлём
-    #                                   вопрос «на ты или на вы?»
-    #   profile.address_form IS NULL  → ловим callback "addrform:ty|vy"
-    #                                   → save → шлём housewife-welcome
-    #   оба поля заданы               → fall through к обычному chat-flow
-    #
-    # Если шаг сорвался (юзер прислал callback вместо имени, или text
-    # вместо callback на форму обращения) — мягко напоминаем какого
-    # ответа ждём, без LLM.
-    if (
-        settings.telegram_bot_token
-        and onboarding.chat_id
-        and onboarding.tenant_id
-        and onboarding.user_id
-    ):
-        from sreda.db.repositories.user_profile import UserProfileRepository
-        from sreda.services.onboarding import (
-            build_address_form_question_message,
-        )
-
-        profile = UserProfileRepository(session).get_or_create_profile(
-            tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
-        )
-
-        message = (
-            payload.get("message") if isinstance(payload, dict) else None
-        )
-        callback_query = (
-            payload.get("callback_query") if isinstance(payload, dict) else None
-        )
-
-        # Шаг 1: имя ещё не задано. Ждём свободный text.
-        if profile.display_name is None:
-            ob_client = TelegramClient(settings.telegram_bot_token)
-            text_value: str | None = None
-            if isinstance(message, dict):
-                text_value = (message.get("text") or "").strip() or None
-            if text_value:
-                # Сохраняем имя (cap до 64 символов, чтобы случайные
-                # обращения «Привет, я Борис, очень рад тебя видеть» не
-                # засоряли display_name полностью).
-                clean_name = text_value[:64]
-                profile.display_name = clean_name
-                session.commit()
-                ask_text, ask_markup = build_address_form_question_message(
-                    clean_name
-                )
-                try:
-                    await ob_client.send_message(
-                        chat_id=onboarding.chat_id,
-                        text=ask_text,
-                        reply_markup=ask_markup,
-                    )
-                except TelegramDeliveryError as exc:
-                    logger.warning("address_form question delivery failed: %s", exc)
-                return TelegramWebhookAccepted(
-                    ok=True, request_id=result.inbound_message_id,
-                )
-            # Юзер прислал callback / voice / стикер — мягко
-            # переспросим имя.
-            try:
-                await ob_client.send_message(
-                    chat_id=onboarding.chat_id,
-                    text=(
-                        "Напиши, пожалуйста, как тебя зовут — "
-                        "просто текстом."
-                    ),
-                )
-            except TelegramDeliveryError as exc:
-                logger.warning("name re-ask delivery failed: %s", exc)
-            return TelegramWebhookAccepted(
-                ok=True, request_id=result.inbound_message_id,
-            )
-
-        # Шаг 2: имя есть, но форма обращения ещё не выбрана.
-        # Ждём callback addrform:ty|vy. Логика выбора + housewife-welcome
-        # живёт в ``services.telegram_bot._handle_address_form_callback``.
-        # Если юзер прислал text/voice — пускаем в обычный chat-flow,
-        # но через delegate в telegram_bot тоже идёт обработка callback'а
-        # addrform: единым кодпасом.
-        if profile.address_form is None:
-            cb_data = (
-                str(callback_query.get("data") or "")
-                if isinstance(callback_query, dict) else ""
-            )
-            if not cb_data.startswith("addrform:"):
-                # Не callback и не addrform — переспрашиваем кнопками.
-                ob_client = TelegramClient(settings.telegram_bot_token)
-                ask_text, ask_markup = build_address_form_question_message(
-                    profile.display_name
-                )
-                try:
-                    await ob_client.send_message(
-                        chat_id=onboarding.chat_id,
-                        text=ask_text,
-                        reply_markup=ask_markup,
-                    )
-                except TelegramDeliveryError as exc:
-                    logger.warning(
-                        "address_form re-ask delivery failed: %s", exc,
-                    )
-                return TelegramWebhookAccepted(
-                    ok=True, request_id=result.inbound_message_id,
-                )
-            # Если callback addrform: — fall through к telegram_bot,
-            # там _handle_callback ловит этот префикс и обрабатывает.
+    # 2026-04-27 simplified: state-machine «имя + ты/вы» удалена.
+    # После approval-gate юзер сразу попадает в обычный chat-flow.
+    # Имя извлекается LLM-tool'ом `update_profile_field` во время
+    # естественного диалога — webhook ничего не перехватывает.
 
     if settings.telegram_bot_token and onboarding.chat_id:
         telegram_client = TelegramClient(settings.telegram_bot_token)
@@ -320,24 +215,7 @@ async def telegram_webhook(
             message_type in ("text", "voice")
             and not onboarding.is_new_user
         ):
-            # Подтягиваем address_form из профиля для выбора пула
-            # ack-фраз. Если профиля ещё нет / форма не выбрана —
-            # pick_ack отдаёт нейтральный пул.
-            ack_address_form: str | None = None
-            try:
-                from sreda.db.repositories.user_profile import (
-                    UserProfileRepository,
-                )
-
-                _profile = UserProfileRepository(session).get_profile(
-                    onboarding.tenant_id, onboarding.user_id
-                ) if onboarding.tenant_id and onboarding.user_id else None
-                if _profile is not None:
-                    ack_address_form = _profile.address_form
-            except Exception:  # noqa: BLE001
-                # Профиль не критичен для ack — fall back на нейтральный.
-                ack_address_form = None
-            ack_text = pick_ack(address_form=ack_address_form)
+            ack_text = pick_ack()
             with trace.step("ack.sent", phrase=ack_text) as _ack_meta:
                 try:
                     await telegram_client.send_message(
