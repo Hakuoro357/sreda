@@ -44,7 +44,13 @@ from sreda.services.claim_lookup import ClaimLookupService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
-from sreda.services.llm import detect_unbacked_claim, get_chat_llm, strip_reasoning_prefix
+from sreda.services.llm import (
+    LLMCallTimeout,
+    detect_unbacked_claim,
+    get_chat_llm,
+    invoke_with_per_call_timeout,
+    strip_reasoning_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1628,12 +1634,15 @@ def execute_conversation_chat(
         ]
 
     # --- 3. Build prompt + tools ---------------------------------------
-    # ``with_fallback=True`` activates LangChain's
-    # ``.with_fallbacks([...])`` when ``settings.chat_fallback_provider``
-    # is set. No-op when unset, so single-provider installs behave
-    # exactly as before. Tests inject ``_llm_client`` directly to keep
-    # provider-dispatch out of their way.
-    llm = context.get("_llm_client") or get_chat_llm(with_fallback=True)
+    # 2026-04-28: вместо `.with_fallbacks([])` (langchain ловит exceptions
+    # ВНУТРИ thread'а primary) — собираем primary + fallback отдельно
+    # и используем РУЧНУЮ fallback логику в loop'е через
+    # `invoke_with_per_call_timeout`. Это работает на hangs (когда
+    # primary не raises exception, а просто висит — incident 13:27 MSK
+    # 2026-04-28, MiMo 131s). Тесты инжектят `_llm_client` для bypass.
+    from sreda.services.llm import resolve_provider_pair
+
+    llm = context.get("_llm_client") or get_chat_llm()
     if llm is None:
         return [
             RuntimeReply(
@@ -1775,6 +1784,32 @@ def execute_conversation_chat(
 
     llm_with_tools = llm.bind_tools(tools)
 
+    # 2026-04-28: построим fallback клиент отдельно (без with_fallbacks)
+    # чтобы ручная try/except логика в invoke loop переключалась на него
+    # при LLMCallTimeout. Если context._fallback_llm_client задан —
+    # используем его (тесты могут инжектить mock). Иначе берём из
+    # runtime_config / settings через resolve_provider_pair.
+    _fallback_with_tools = None
+    if "_fallback_llm_client" in context:
+        _fb_llm = context["_fallback_llm_client"]
+        if _fb_llm is not None:
+            _fallback_with_tools = _fb_llm.bind_tools(tools)
+    elif context.get("_llm_client") is None:
+        # Только когда не подменяется через _llm_client (= prod path):
+        # spin up отдельный fallback на основе runtime_config / env.
+        try:
+            _, _fb_provider_name = resolve_provider_pair()
+        except Exception:  # noqa: BLE001
+            _fb_provider_name = None
+        if _fb_provider_name:
+            _fb_llm = get_chat_llm(provider=_fb_provider_name)
+            if _fb_llm is not None:
+                _fallback_with_tools = _fb_llm.bind_tools(tools)
+                logger.info(
+                    "chat: fallback LLM built provider=%s tenant=%s",
+                    _fb_provider_name, action.tenant_id,
+                )
+
     # Build the message list with last N turns of history so the LLM
     # can resolve references like "да" / "нет" / "this one" back to
     # the thing we asked about in the previous turn. Without this,
@@ -1909,7 +1944,37 @@ def execute_conversation_chat(
             messages=messages,
         )
         with trace.step(f"llm.iter.{_iter}", model=model_name) as _trace_meta:
-            ai_msg: AIMessage = llm_with_tools.invoke(messages)
+            # 2026-04-28: per-call timeout через ThreadPoolExecutor +
+            # ручная fallback логика. Langchain .with_fallbacks() ловит
+            # exceptions ВНУТРИ thread'а primary — на hangs не работает
+            # (incident 13:27 MSK: MiMo 131s без exception). Делаем
+            # внешний timeout + manual fallback на отдельный fallback
+            # клиент.
+            _per_call_timeout = get_settings().mimo_request_timeout_seconds
+            try:
+                ai_msg = invoke_with_per_call_timeout(
+                    llm_with_tools,
+                    messages,
+                    timeout_seconds=_per_call_timeout,
+                )
+            except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
+                # Любая ошибка primary (timeout / 5xx / rate limit) →
+                # пытаемся fallback если он есть.
+                if _fallback_with_tools is None:
+                    raise
+                logger.warning(
+                    "LLM_FALLBACK_ENGAGED tenant=%s feature=%s iter=%d "
+                    "primary_exc=%s reason=%s — switching to fallback",
+                    action.tenant_id, feature_key, _iter,
+                    type(exc).__name__, str(exc)[:120],
+                )
+                _trace_meta["fallback"] = True
+                _trace_meta["primary_exc"] = type(exc).__name__
+                ai_msg = invoke_with_per_call_timeout(
+                    _fallback_with_tools,
+                    messages,
+                    timeout_seconds=_per_call_timeout,
+                )
             usage = getattr(ai_msg, "usage_metadata", None) or {}
             _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
             _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)

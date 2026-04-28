@@ -23,8 +23,10 @@ flip; behaviour is default.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import re
+import threading
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -32,6 +34,87 @@ from langchain_openai import ChatOpenAI
 from sreda.config.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-call timeout enforcement (2026-04-28)
+# ---------------------------------------------------------------------------
+#
+# `ChatOpenAI(timeout=60)` сам по себе ненадёжен: на проде наблюдали
+# ответ от MiMo через 131 секунду без TimeoutError'а (видимо streaming
+# resetит per-chunk timer, либо langchain не передаёт timeout в httpx).
+# Без явного timeout fallback chain `.with_fallbacks([grok])` НЕ
+# срабатывает — нет исключения чтобы поймать.
+#
+# Решение: внешний timeout через ThreadPoolExecutor. Если invoke не
+# завершился за N секунд — кидаем TimeoutError, который ловится
+# RunnableWithFallbacks → переключается на fallback провайдер.
+#
+# Side effect: hung thread продолжает работать (httpx connection кладётся
+# в pool / GC). На наших объёмах (10 concurrent users) это допустимо.
+# ThreadPoolExecutor создаётся per-call намеренно — иначе hung threads
+# накапливались бы в shared pool.
+
+_PER_CALL_TIMEOUT_DEFAULT = 60.0
+
+
+class LLMCallTimeout(TimeoutError):
+    """Raised by ``invoke_with_per_call_timeout`` when LLM exceeds wall-time.
+
+    Inherits TimeoutError → langchain RunnableWithFallbacks ловит как
+    Exception и переключается на fallback провайдер.
+    """
+
+
+def invoke_with_per_call_timeout(
+    runnable: Any,
+    messages: list,
+    *,
+    timeout_seconds: float = _PER_CALL_TIMEOUT_DEFAULT,
+) -> Any:
+    """Invoke `runnable.invoke(messages)` с жёстким wall-clock timeout.
+
+    Args:
+        runnable: LangChain Runnable (typically `llm.bind_tools(...)`).
+        messages: список Message objects для invoke.
+        timeout_seconds: лимит. Default 60s (= mimo_request_timeout_seconds).
+
+    Returns:
+        Результат runnable.invoke(messages) (обычно AIMessage).
+
+    Raises:
+        LLMCallTimeout: если timeout превышен. Поднимает TimeoutError-
+            совместимый exception, который ловится `with_fallbacks` chain.
+        Любые другие исключения от runnable пробрасываются как есть.
+    """
+    # Per-call executor — изолируем hung thread от shared pool.
+    # ВАЖНО: НЕ используем `with` block — exit() вызывает shutdown(wait=True)
+    # и ждёт пока медленный thread завершится, перечёркивая весь смысл
+    # timeout'а. Делаем shutdown(wait=False, cancel_futures=True) вручную.
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="llm-invoke"
+    )
+    future = executor.submit(runnable.invoke, messages)
+    try:
+        result = future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        # Hung thread остаётся в executor'е, его нельзя убить из Python.
+        # shutdown(wait=False) не блокирует наш возврат. cancel_futures=True
+        # cancel'ит pending tasks (хотя у нас одна running, она не cancel'ится).
+        # Главное: текущий turn НЕ блокируется в ожидании MiMo.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise LLMCallTimeout(
+            f"LLM invoke exceeded {timeout_seconds}s wall time"
+        ) from exc
+    except Exception:
+        # Любые другие исключения (provider errors, и т.п.) — пробрасываем.
+        # Executor cleanup идёт в обычном порядке после раскрутки.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        # Успех. Cleanup non-blocking.
+        executor.shutdown(wait=False, cancel_futures=True)
+        return result
 
 
 # Models trained on ReAct-style tool-calling data (Gemma-4 family,
@@ -406,6 +489,18 @@ def _build_chat_llm(
 # turn. First hit logs at WARNING with the cause; subsequent hits
 # are silent until the process restarts.
 _RUNTIME_CONFIG_WARNED = False
+
+
+def resolve_provider_pair(settings: Settings | None = None) -> tuple[str, str | None]:
+    """Public wrapper для _resolve_provider_overrides.
+
+    Возвращает (primary_provider_name, fallback_provider_name_or_None) на
+    основе runtime_config (admin live-switch) и settings (env). Используется
+    в handlers.py для построения отдельных primary + fallback LLM
+    клиентов под per-call timeout с ручной fallback логикой.
+    """
+    s = settings or get_settings()
+    return _resolve_provider_overrides(s)
 
 
 def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
