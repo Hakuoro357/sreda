@@ -258,8 +258,8 @@ def cleanup_runtime_retention(
         select(SkillRun.output_secure_record_id).where(
             SkillRun.output_secure_record_id.isnot(None)
         ),
-        select(SkillRunAttempt.raw_artifact_secure_record_id).where(
-            SkillRunAttempt.raw_artifact_secure_record_id.isnot(None)
+        select(SkillAIExecution.raw_artifact_secure_record_id).where(
+            SkillAIExecution.raw_artifact_secure_record_id.isnot(None)
         ),
     )
     result.secure_records_eds_connect_payload = _delete_returning_count(
