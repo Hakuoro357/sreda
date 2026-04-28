@@ -137,3 +137,43 @@ def test_gender_assumption_blocked() -> None:
     code2 = _strip_comments_and_docstrings(gendered2)
     matched2 = any(p.search(code2) for p in _BANNED_PATTERNS)
     assert matched2, "gender-assumption pattern must catch 'ты говорила'"
+
+
+# ---------------------------------------------------------------------------
+# Brand voice + Yandex Maps prompt rules (2026-04-28, п.7.1 + 7.2)
+# ---------------------------------------------------------------------------
+#
+# Эти тесты проверяют что в _HOUSEWIFE_FOOD_PROMPT прописаны правила:
+# - Среда всегда отвечает в ж.р. (бренд)
+# - Адреса сопровождаются ссылкой на yandex.ru/maps
+# Не сканируем динамический output LLM (это может сделать только
+# integration-тест с реальным LLM-вызовом), но проверяем что инструкции
+# в prompt'е есть.
+
+
+def test_housewife_prompt_has_sreda_feminine_rule() -> None:
+    from sreda.runtime.handlers import _HOUSEWIFE_FOOD_PROMPT
+
+    text = _HOUSEWIFE_FOOD_PROMPT.lower()
+    assert "род среды" in text or "среда — она" in text, (
+        "В _HOUSEWIFE_FOOD_PROMPT должен быть раздел про обязательный "
+        "женский род самонарратива Среды (бренд)."
+    )
+    # Явные примеры правильного и запрещённого
+    assert "запомнила" in text and "помог" in text, (
+        "Раздел про ж.р. должен содержать примеры правильного "
+        "(«запомнила») и запрещённого («помог»)."
+    )
+
+
+def test_housewife_prompt_has_yandex_maps_rule() -> None:
+    from sreda.runtime.handlers import _HOUSEWIFE_FOOD_PROMPT
+
+    text = _HOUSEWIFE_FOOD_PROMPT.lower()
+    assert "yandex.ru/maps" in text, (
+        "В _HOUSEWIFE_FOOD_PROMPT должна быть инструкция про "
+        "сопровождение адресов ссылкой на yandex.ru/maps."
+    )
+    assert "адрес" in text and "ссылк" in text, (
+        "Раздел про адреса должен явно упоминать про ссылки."
+    )
