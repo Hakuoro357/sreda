@@ -1826,10 +1826,20 @@ def build_housewife_tools(
                 logger.exception("add_checklist_items: implicit create failed")
                 return "error: internal"
         try:
-            added = checklist_service.add_items(list_id=cl.id, items=items)
+            added, skipped_dup = checklist_service.add_items(
+                list_id=cl.id, items=items
+            )
         except Exception:  # noqa: BLE001
             logger.exception("add_checklist_items failed")
             return "error: internal"
+        # 2026-04-28: возвращаем и dup count чтобы LLM мог сказать
+        # юзеру «3 пункта добавлены, 2 уже были» вместо тихого
+        # удвоения (incident tg_634496616 — move task создал дубль).
+        if skipped_dup:
+            return (
+                f"ok:added:{len(added)}:dups:{len(skipped_dup)}:"
+                f"list={cl.id}"
+            )
         return f"ok:added:{len(added)}:list={cl.id}"
 
     @lc_tool

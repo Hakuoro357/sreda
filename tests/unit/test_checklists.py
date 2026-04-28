@@ -80,21 +80,93 @@ def test_create_list_empty_title_raises(session):
 def test_add_items_filters_empty_and_assigns_position(session):
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
-    items = svc.add_items(
+    items, _ = svc.add_items(
         list_id=cl.id,
         items=["a", "", "  ", "b", "c"],
     )
     assert len(items) == 3  # пустые отфильтрованы
     assert [i.position for i in items] == [0, 1, 2]
     # next batch — позиции продолжаются
-    items2 = svc.add_items(list_id=cl.id, items=["d"])
+    items2, _ = svc.add_items(list_id=cl.id, items=["d"])
     assert items2[0].position == 3
+
+
+# 2026-04-28: dedup tests (incident tg_634496616 — move task создал
+# дубль т.к. add_items не проверял существующие пункты)
+
+
+def test_add_items_dedup_against_existing_pending(session):
+    svc = ChecklistService(session)
+    cl = svc.create_list(tenant_id="t1", user_id="u1", title="Дача")
+    svc.add_items(list_id=cl.id, items=["Покрасить дом", "Чинить забор"])
+
+    # Повторяем «Покрасить дом» в новом batch'е → должен skip
+    new, skipped = svc.add_items(list_id=cl.id, items=["Покрасить дом", "Косить траву"])
+
+    assert len(new) == 1
+    assert new[0].title == "Косить траву"
+    assert skipped == ["Покрасить дом"]
+
+
+def test_add_items_dedup_case_insensitive_and_whitespace():
+    """«покрасить дом» = «Покрасить  Дом» (нижний регистр + collapse spaces)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.base import Base
+    from sreda.db.models.core import Tenant, User
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    s = sessionmaker(bind=engine)()
+    s.add(Tenant(id="t1", name="T"))
+    s.add(User(id="u1", tenant_id="t1", telegram_account_id="100"))
+    s.commit()
+
+    svc = ChecklistService(s)
+    cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
+    svc.add_items(list_id=cl.id, items=["Покрасить дом"])
+
+    new, skipped = svc.add_items(
+        list_id=cl.id,
+        items=["покрасить дом", "Покрасить  Дом", "Новый пункт"],
+    )
+    assert len(new) == 1
+    assert new[0].title == "Новый пункт"
+    assert len(skipped) == 2
+
+
+def test_add_items_dedup_against_done_status(session):
+    """Если пункт был и done — повторный add тоже skip (юзер уже
+    выполнил, не нужно опять)."""
+    svc = ChecklistService(session)
+    cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
+    [item], _ = svc.add_items(list_id=cl.id, items=["Покрасить дом"])
+    svc.mark_done(item_id=item.id)
+
+    new, skipped = svc.add_items(
+        list_id=cl.id, items=["Покрасить дом", "Чинить забор"]
+    )
+    assert len(new) == 1
+    assert new[0].title == "Чинить забор"
+    assert skipped == ["Покрасить дом"]
+
+
+def test_add_items_dedup_within_batch(session):
+    """LLM передал «купить молоко» дважды в одном batch'е — берём один."""
+    svc = ChecklistService(session)
+    cl = svc.create_list(tenant_id="t1", user_id="u1", title="Покупки")
+    new, skipped = svc.add_items(
+        list_id=cl.id,
+        items=["купить молоко", "купить молоко", "купить хлеб"],
+    )
+    assert len(new) == 2
+    assert {i.title for i in new} == {"купить молоко", "купить хлеб"}
+    assert skipped == ["купить молоко"]
 
 
 def test_mark_done_sets_status_and_timestamp(session):
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
-    [item] = svc.add_items(list_id=cl.id, items=["A"])
+    [item], _ = svc.add_items(list_id=cl.id, items=["A"])
     done = svc.mark_done(item_id=item.id)
     assert done.status == "done"
     assert done.done_at is not None
@@ -103,7 +175,7 @@ def test_mark_done_sets_status_and_timestamp(session):
 def test_undo_done_restores_pending(session):
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
-    [item] = svc.add_items(list_id=cl.id, items=["A"])
+    [item], _ = svc.add_items(list_id=cl.id, items=["A"])
     svc.mark_done(item_id=item.id)
     restored = svc.undo_done(item_id=item.id)
     assert restored.status == "pending"
@@ -152,7 +224,7 @@ def test_find_list_by_title_other_tenant_invisible(session):
 def test_find_item_by_title_pending_priority(session):
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
-    [a, b, c] = svc.add_items(list_id=cl.id, items=[
+    [a, b, c], _ = svc.add_items(list_id=cl.id, items=[
         "Lavanda", "Champagne", "Lime",
     ])
     svc.mark_done(item_id=a.id)
@@ -169,7 +241,7 @@ def test_find_item_by_title_pending_priority(session):
 def test_counts_after_done_and_archive(session):
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
-    [a, b, c] = svc.add_items(list_id=cl.id, items=["a", "b", "c"])
+    [a, b, c], _ = svc.add_items(list_id=cl.id, items=["a", "b", "c"])
     assert svc.count_open_items(tenant_id="t1", user_id="u1") == 3
     assert svc.count_active_lists(tenant_id="t1", user_id="u1") == 1
 
@@ -185,7 +257,7 @@ def test_counts_after_done_and_archive(session):
 def test_list_summary_returns_p_d_total(session):
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
-    items = svc.add_items(list_id=cl.id, items=["a", "b", "c", "d"])
+    items, _ = svc.add_items(list_id=cl.id, items=["a", "b", "c", "d"])
     svc.mark_done(item_id=items[0].id)
     svc.mark_done(item_id=items[1].id)
     p, d, t = svc.list_summary(list_id=cl.id)
@@ -271,7 +343,7 @@ def test_service_delete_item_removes_row(session):
     """Сервисный delete_item — hard delete, отличается от cancel."""
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")
-    [a, b] = svc.add_items(list_id=cl.id, items=["a", "b"])
+    [a, b], _ = svc.add_items(list_id=cl.id, items=["a", "b"])
     ok = svc.delete_item(item_id=a.id)
     assert ok
     assert svc.delete_item(item_id="missing") is False

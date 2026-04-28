@@ -47,7 +47,7 @@ def _create_checklist_with_item(
     cl = svc.create_list(
         tenant_id=tenant_id, user_id=user_id, title="Тест-список"
     )
-    items = svc.add_items(list_id=cl.id, items=["Пункт 1"])
+    items, _ = svc.add_items(list_id=cl.id, items=["Пункт 1"])
     if item_status != "pending":
         item = items[0]
         item.status = item_status

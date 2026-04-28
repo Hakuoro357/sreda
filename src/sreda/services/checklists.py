@@ -41,6 +41,16 @@ def _normalise(text: str) -> str:
     return (text or "").strip().lower()
 
 
+def _normalise_title(text: str) -> str:
+    """Lowercase + strip + collapse internal whitespace.
+
+    Используется для item-level dedup: «Купить  молоко» и «купить молоко»
+    считаются одним. Применяется в add_items (2026-04-28 fix против
+    дублей при move task → checklist).
+    """
+    return " ".join((text or "").lower().split())
+
+
 class ChecklistService:
     """CRUD + поиск + статусные переходы для чек-листов и их пунктов."""
 
@@ -152,16 +162,53 @@ class ChecklistService:
 
     def add_items(
         self, *, list_id: str, items: list[str],
-    ) -> list[ChecklistItem]:
+    ) -> tuple[list[ChecklistItem], list[str]]:
         """Пакетно добавляет пункты в конец списка.
 
         Авто-position: max(position)+1, +1 для каждого следующего.
         Пустые/whitespace-only items пропускаются.
+
+        2026-04-28: добавлен dedup. Возвращает кортеж
+        ``(created, skipped_titles)``:
+        * ``created``        — реально вставленные ChecklistItem
+        * ``skipped_titles`` — пункты которые НЕ добавлены т.к.
+          такой title уже есть в списке (case-insensitive,
+          whitespace-collapsed). В частности ловит сценарий
+          tg_634496616 (move task → итог в чек-листе ДВАЖДЫ).
+
+        Dedup проверяется против ВСЕХ статусов (pending/done/cancelled)
+        — если пункт был и done, повторно его не нужно. Также внутри
+        самого batch'а: если LLM передал «купить молоко» дважды — берём
+        один.
         """
         clean = [(i or "").strip() for i in items]
         clean = [i for i in clean if i]
         if not clean:
-            return []
+            return [], []
+
+        # Existing items для dedup'а — все статусы.
+        existing_norms: set[str] = {
+            _normalise_title(it.title)
+            for it in (
+                self.session.query(ChecklistItem.title)
+                .filter(ChecklistItem.checklist_id == list_id)
+                .all()
+            )
+        }
+
+        seen_in_batch: set[str] = set()
+        skipped_titles: list[str] = []
+        fresh: list[str] = []
+        for title in clean:
+            norm = _normalise_title(title)
+            if norm in existing_norms or norm in seen_in_batch:
+                skipped_titles.append(title)
+                continue
+            seen_in_batch.add(norm)
+            fresh.append(title)
+
+        if not fresh:
+            return [], skipped_titles
 
         # Берём текущий max position в списке.
         max_pos = (
@@ -174,7 +221,7 @@ class ChecklistService:
 
         now = _utcnow()
         added: list[ChecklistItem] = []
-        for offset, title in enumerate(clean):
+        for offset, title in enumerate(fresh):
             item = ChecklistItem(
                 id=f"clitem_{uuid4().hex[:24]}",
                 checklist_id=list_id,
@@ -188,7 +235,7 @@ class ChecklistService:
             added.append(item)
 
         self.session.commit()
-        return added
+        return added, skipped_titles
 
     def list_items(
         self,

@@ -201,7 +201,13 @@ _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в поку
                   "в твою книг", "в твой список",
                   # Task scheduler claims: "поставила задачу",
                   # "добавила в расписание", "запланировала на".
-                  "задач", "в расписан", "запланирова")
+                  "задач", "в расписан", "запланирова",
+                  # 2026-04-28: checklist claims (incident tg_634496616).
+                  # «Добавила ✅\n— ☐ Х» при tools=[] = галлюцинация.
+                  # Маркер «☐»/«☑»/«☒»/«✗» в выводе = претензия на
+                  # отображение чек-листа.
+                  "чек-лист", "чек лист", "пункт",
+                  "☐", "☑", "☒", "✗")
 
 
 def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
@@ -231,6 +237,82 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
         if any(obj in window for obj in _CLAIM_OBJECTS):
             return True
     return False
+
+
+# Pattern for checklist item lines в text-ответе бота.
+# Matches: «— ☐ X» / «- ☑ X» / «☐ X» / «☑ X» / «✗ X» с любыми
+# whitespace вокруг.
+import re as _re
+
+_CHECKLIST_ITEM_LINE_RE = _re.compile(
+    r"^[\s\-—•*]*([☐☑☒✓✗])\s+(.+?)\s*$",
+    _re.MULTILINE,
+)
+
+
+def _normalise_item_title(title: str) -> str:
+    """Normalize item title for comparison: lowercase + collapse whitespace."""
+    return " ".join((title or "").lower().split())
+
+
+def detect_hallucinated_checklist_items(
+    text: str, *, last_show_checklist_result: str | None
+) -> list[str]:
+    """Return a list of checklist item titles the model wrote in its
+    text reply that DON'T appear in the most recent ``show_checklist``
+    tool result.
+
+    Использовался для incident'а tg_634496616 (2026-04-28): LLM писал
+    «— ☐ Покрасить дом, — ☐ Чинить забор, ...» в финальном тексте,
+    хотя в БД был только «Покрасить дом». Юзер видел вранье и считал
+    что 4 пункта существуют.
+
+    Args:
+        text: финальный assistant text ответа.
+        last_show_checklist_result: содержимое последнего ToolMessage
+            от ``show_checklist`` в этом turn'е. None если show_checklist
+            не вызывался — значит мы НЕ можем валидировать (LLM пишет
+            из памяти, а не из tool result; это отдельная проблема —
+            «mutation без verify» — ловится через prompt rule, не здесь).
+
+    Returns:
+        Список титлов в text'е которых нет в tool-result. Пустой → ОК.
+    """
+    if not text or not last_show_checklist_result:
+        return []
+
+    # Парсим строки в text'e: какие items LLM показывает юзеру?
+    text_items: list[str] = []
+    for match in _CHECKLIST_ITEM_LINE_RE.finditer(text):
+        title = match.group(2).strip()
+        if title:
+            text_items.append(title)
+
+    if not text_items:
+        return []
+
+    # Парсим items из tool result (формат:
+    # «[clitem_xxx] ☐ Title» или похожее)
+    tool_norms: set[str] = set()
+    for line in last_show_checklist_result.splitlines():
+        m = _CHECKLIST_ITEM_LINE_RE.search(line)
+        if m:
+            tool_norms.add(_normalise_item_title(m.group(2)))
+        # Fallback: «[clitem_id] ☐ X» формат
+        if "[clitem_" in line:
+            for marker in ("☐", "☑", "☒", "✓", "✗"):
+                idx = line.find(marker)
+                if idx >= 0:
+                    tail = line[idx + 1:].strip()
+                    if tail:
+                        tool_norms.add(_normalise_item_title(tail))
+                    break
+
+    hallucinated: list[str] = []
+    for title in text_items:
+        if _normalise_item_title(title) not in tool_norms:
+            hallucinated.append(title)
+    return hallucinated
 
 
 # Supported chat-LLM providers. Extend this tuple AFTER adding a build
