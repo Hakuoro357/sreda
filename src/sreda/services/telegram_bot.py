@@ -243,12 +243,14 @@ async def _handle_callback(
     # Ничего не идёт в LLM, никаких tool-call'ов, чистый scripted-flow.
     if data.startswith("pb:"):
         from sreda.services import pending_bot
+        from sreda.services.housewife_onboarding import record_pb_tour_progress
 
         if callback_id:
             try:
                 await telegram_client.answer_callback_query(str(callback_id), text="")
             except TelegramDeliveryError as exc:
                 logger.warning("pb: callback ack failed: %s", exc)
+        branch = data[len("pb:"):]
         if onboarding.chat_id:
             reply = pending_bot.match(data, is_callback=True)
             try:
@@ -260,8 +262,25 @@ async def _handle_callback(
             except TelegramDeliveryError as exc:
                 logger.warning(
                     "pb: branch '%s' delivery failed: %s",
-                    data[len("pb:"):], exc,
+                    branch, exc,
                 )
+        # Трекаем прогресс welcome v2 тура. Best-effort: ошибки записи
+        # не должны убивать turn (юзер уже получил сообщение). Только
+        # для approved юзеров — pending-фаза трекинг не пишет, потому
+        # что у непрошедшего approval ещё нет ни tenant_id, ни user_id
+        # в state-machine смысле.
+        if onboarding.tenant_id and onboarding.user_id:
+            try:
+                record_pb_tour_progress(
+                    session,
+                    tenant_id=onboarding.tenant_id,
+                    user_id=onboarding.user_id,
+                    branch=branch,
+                )
+                session.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception("pb: progress tracking failed for branch=%s", branch)
+                session.rollback()
         return
 
     # Inline-кнопки (Часть 0 плана v2). LLM в прошлом turn'е положил

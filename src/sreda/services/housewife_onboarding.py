@@ -640,6 +640,71 @@ def _extract_short_name(text: str | None) -> str:
     return s[:30]
 
 
+# ---------------------------------------------------------------------------
+# Welcome v2 broadcast tour — progress tracking (2026-04-28)
+# ---------------------------------------------------------------------------
+#
+# Когда existing approved тенанты получают рассылку pending-цепочки
+# (intro → 10 шагов → done), мы хотим знать кто докуда дошёл, без
+# миграций. Решение: пишем прогресс в TenantUserSkillConfig.skill_params_json
+# под ключом ``welcome_v2_progress`` с полями started_at / last_branch /
+# last_at / completed_at. Админка читает это и показывает emoji-индикатор
+# рядом с telegram_id.
+
+WELCOME_V2_PROGRESS_KEY = "welcome_v2_progress"
+
+
+def record_pb_tour_progress(
+    session: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    branch: str,
+) -> None:
+    """Обновить прогресс прохождения welcome v2 тура для (tenant, user).
+
+    Каждый ``pb:<branch>`` callback от approved юзера во время broadcast-
+    рассылки вызывает этот хелпер. Поведение:
+    * Первый вызов — пишет started_at = NOW.
+    * Каждый вызов — обновляет last_branch + last_at.
+    * При branch == "done" — пишет completed_at.
+
+    Идемпотентно: повторный вызов с тем же branch просто обновляет
+    last_at. Никогда не сбрасывает started_at — юзер не «начинает
+    заново», даже если кликнул intro дважды.
+
+    Не валидирует branch против ``pending_bot._BRANCHES`` — это
+    защитный слой. Ничего страшного, если в БД попадёт неизвестный
+    branch (например, alias `pb:welcome`); при чтении админка просто
+    покажет «in_progress».
+    """
+    repo = UserProfileRepository(session)
+    config = repo.get_skill_config(tenant_id, user_id, HOUSEWIFE_FEATURE_KEY)
+    params = (
+        UserProfileRepository.decode_skill_params(config) if config else {}
+    )
+    progress = params.get(WELCOME_V2_PROGRESS_KEY) or {}
+    if not isinstance(progress, dict):
+        progress = {}
+
+    now = datetime.now(timezone.utc).isoformat()
+    if not progress.get("started_at"):
+        progress["started_at"] = now
+    progress["last_branch"] = branch
+    progress["last_at"] = now
+    if branch == "done":
+        progress["completed_at"] = now
+
+    params[WELCOME_V2_PROGRESS_KEY] = progress
+    repo.upsert_skill_config(
+        tenant_id,
+        user_id,
+        HOUSEWIFE_FEATURE_KEY,
+        source="agent_tool_direct",
+        skill_params=params,
+    )
+
+
 def _merge_with_defaults(state: dict[str, Any]) -> dict[str, Any]:
     """Fill in any fields missing from an older state shape."""
     base = _default_state()

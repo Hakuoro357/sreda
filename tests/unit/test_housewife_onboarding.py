@@ -26,6 +26,7 @@ from sreda.services.housewife_onboarding import (
     HousewifeOnboardingService,
     _extract_short_name,
     _next_topic,
+    record_pb_tour_progress,
 )
 
 
@@ -499,3 +500,94 @@ def test_mark_answered_addressing_sanitizes_polzovatel_hochet_phrase():
     profile = UserProfileRepository(session).get_profile("t1", "u1")
     assert profile is not None
     assert profile.display_name == "Шеф"
+
+
+# ---------------------------------------------------------------------------
+# record_pb_tour_progress — трекинг welcome v2 broadcast tour
+# ---------------------------------------------------------------------------
+#
+# 2026-04-28: после рассылки welcome v2 (pending-цепочка из 11 сообщений)
+# нужно знать кто докуда дошёл. Записываем прогресс в
+# ``TenantUserSkillConfig.skill_params_json`` под ключом
+# ``welcome_v2_progress``. Никаких миграций — переиспользуем существующее
+# поле housewife_assistant skill.
+
+
+def _get_welcome_progress(session, tenant_id: str, user_id: str) -> dict:
+    """Helper: read the welcome_v2_progress sub-dict from skill params."""
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    repo = UserProfileRepository(session)
+    config = repo.get_skill_config(tenant_id, user_id, HOUSEWIFE_FEATURE_KEY)
+    if config is None:
+        return {}
+    params = UserProfileRepository.decode_skill_params(config)
+    return params.get("welcome_v2_progress") or {}
+
+
+def test_record_pb_tour_progress_first_callback_sets_started_at():
+    """Первый pb:<branch> создаёт started_at + last_branch + last_at."""
+    session = _fresh_session()
+    record_pb_tour_progress(
+        session, tenant_id="t1", user_id="u1", branch="voice"
+    )
+    progress = _get_welcome_progress(session, "t1", "u1")
+    assert progress.get("started_at") is not None
+    assert progress.get("last_branch") == "voice"
+    assert progress.get("last_at") is not None
+    assert progress.get("completed_at") is None
+
+
+def test_record_pb_tour_progress_subsequent_keeps_started_at():
+    """Повторные callback'и обновляют last_branch/last_at, но started_at
+    остаётся прежним (юзер не «начал заново»)."""
+    session = _fresh_session()
+    record_pb_tour_progress(
+        session, tenant_id="t1", user_id="u1", branch="voice"
+    )
+    started_at_first = _get_welcome_progress(session, "t1", "u1")["started_at"]
+
+    record_pb_tour_progress(
+        session, tenant_id="t1", user_id="u1", branch="schedule"
+    )
+    progress = _get_welcome_progress(session, "t1", "u1")
+    assert progress["started_at"] == started_at_first
+    assert progress["last_branch"] == "schedule"
+
+
+def test_record_pb_tour_progress_done_sets_completed_at():
+    """branch='done' → пишет completed_at + остальные поля."""
+    session = _fresh_session()
+    for branch in ("voice", "schedule", "reminders", "done"):
+        record_pb_tour_progress(
+            session, tenant_id="t1", user_id="u1", branch=branch
+        )
+    progress = _get_welcome_progress(session, "t1", "u1")
+    assert progress["completed_at"] is not None
+    assert progress["last_branch"] == "done"
+
+
+def test_record_pb_tour_progress_preserves_other_skill_params():
+    """welcome_v2_progress — это субключ, остальные skill params не
+    должны затираться (например, состояние онбординга)."""
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    session = _fresh_session()
+    UserProfileRepository(session).upsert_skill_config(
+        "t1", "u1", HOUSEWIFE_FEATURE_KEY,
+        source="user_command",
+        skill_params={"unrelated": "value", "onboarding": {"status": "complete"}},
+    )
+    session.commit()
+
+    record_pb_tour_progress(
+        session, tenant_id="t1", user_id="u1", branch="voice"
+    )
+
+    config = UserProfileRepository(session).get_skill_config(
+        "t1", "u1", HOUSEWIFE_FEATURE_KEY
+    )
+    params = UserProfileRepository.decode_skill_params(config)
+    assert params.get("unrelated") == "value"
+    assert params.get("onboarding") == {"status": "complete"}
+    assert params.get("welcome_v2_progress", {}).get("last_branch") == "voice"

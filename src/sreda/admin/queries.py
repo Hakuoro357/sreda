@@ -16,8 +16,13 @@ from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.models.connect import TenantEDSAccount
 from sreda.db.models.core import Tenant, User
 from sreda.db.models.skill_platform import SkillAIExecution, TenantSkillState
-from sreda.db.models.user_profile import TenantUserProfile
+from sreda.db.models.user_profile import TenantUserProfile, TenantUserSkillConfig
+from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.services.budget import BudgetService
+from sreda.services.housewife_onboarding import (
+    HOUSEWIFE_FEATURE_KEY,
+    WELCOME_V2_PROGRESS_KEY,
+)
 
 
 # ---------------------------------------------------------------- helpers
@@ -57,6 +62,11 @@ class UserRow:
     # yet). Non-None = approved; admin UI hides the button in that case.
     approved_at: str | None = None
     is_pending: bool = False
+    # Welcome v2 broadcast tour (2026-04-28) — статус прохождения
+    # pending-цепочки 11 сообщений. "completed" = тапнул pb:done,
+    # "in_progress" = есть started_at но нет completed_at, "not_started"
+    # = ничего не записано в skill_params.welcome_v2_progress.
+    welcome_v2_status: str = "not_started"
 
 
 @dataclass
@@ -131,10 +141,33 @@ def get_all_users(session: Session) -> list[UserRow]:
         )
         skills_by_tenant.setdefault(sk.tenant_id, []).append(info)
 
+    # Welcome v2 broadcast tour прогресс — читаем из housewife
+    # skill_params_json. Bulk: одним запросом по всем (tenant, user).
+    welcome_status_by_key: dict[tuple[str, str], str] = {}
+    for cfg in (
+        session.query(TenantUserSkillConfig)
+        .filter(TenantUserSkillConfig.feature_key == HOUSEWIFE_FEATURE_KEY)
+        .all()
+    ):
+        params = UserProfileRepository.decode_skill_params(cfg)
+        progress = params.get(WELCOME_V2_PROGRESS_KEY) or {}
+        if not isinstance(progress, dict):
+            continue
+        if progress.get("completed_at"):
+            status = "completed"
+        elif progress.get("started_at"):
+            status = "in_progress"
+        else:
+            status = "not_started"
+        welcome_status_by_key[(cfg.tenant_id, cfg.user_id)] = status
+
     result: list[UserRow] = []
     for u in users:
         profile = profiles_by_key.get((u.tenant_id, u.id))
         approved_at = tenants_approved.get(u.tenant_id)
+        welcome_v2_status = welcome_status_by_key.get(
+            (u.tenant_id, u.id), "not_started"
+        )
         result.append(
             UserRow(
                 tenant_id=u.tenant_id,
@@ -148,6 +181,7 @@ def get_all_users(session: Session) -> list[UserRow]:
                 skill_states=skills_by_tenant.get(u.tenant_id, []),
                 approved_at=_fmt_dt(approved_at),
                 is_pending=approved_at is None,
+                welcome_v2_status=welcome_v2_status,
             )
         )
     return result

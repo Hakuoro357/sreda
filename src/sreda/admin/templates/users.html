@@ -32,7 +32,14 @@
     <tr>
       <td><span class="muted">{{ u.tenant_name }}</span></td>
       <td><code class="muted">{{ u.user_id[:12] }}…</code></td>
-      <td>{{ u.telegram_id or "—" }}</td>
+      <td>
+        {{ u.telegram_id or "—" }}
+        {% if u.welcome_v2_status == "completed" %}
+          <span title="онбординг welcome v2 пройден до конца">✅</span>
+        {% elif u.welcome_v2_status == "in_progress" %}
+          <span title="онбординг welcome v2 начат, не закончен">🟡</span>
+        {% endif %}
+      </td>
       <td>{{ u.display_name or "—" }}</td>
       <td>{{ u.timezone or "—" }}</td>
       <td>
