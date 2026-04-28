@@ -278,7 +278,15 @@ _CLAIM_VERBS = ("сохранил", "сохранила", "сохранено",
                 "записал", "записала", "записано",
                 "удалил", "удалила", "удалено",
                 "поставил напомин", "поставила напомин",
-                "запланировал", "запланировала")
+                "запланировал", "запланировала",
+                # 2026-04-29: incident user_tg_352612382. LLM сказал
+                # «Готово! ⏰ Каждый день в 9:00 утра будет напоминание»
+                # без вызова schedule_reminder. Прежние паттерны были
+                # только activе («поставил/добавил») — passive future
+                # forms ("будет напомин") и общие affirmation
+                # («готово/готова») проходили мимо детектора.
+                "готово", "готова",
+                "будет напомин")
 _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в покупк",
                   "в меню", "меню на", "напомина", "семь",
                   "в твою книг", "в твой список",
@@ -291,6 +299,16 @@ _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в поку
                   # отображение чек-листа.
                   "чек-лист", "чек лист", "пункт",
                   "☐", "☑", "☒", "✗")
+
+
+# 2026-04-29: self-asserting verbs — verb itself implies a side-effect,
+# не требует ближнего object'а. «Напомню тебе завтра в 9» сам по себе
+# claim что reminder будет создан, без отдельного слова «напоминание».
+# Held in separate set чтобы первое-pass проверка была быстрее (small
+# set + early-return).
+_SELF_CLAIMING_VERBS = frozenset({
+    "напомню", "напоминаю", "напоминать буду", "буду напоминать",
+})
 
 
 def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
@@ -309,6 +327,11 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
     if called_tools & _WRITE_TOOL_NAMES:
         return False
     low = text.lower()
+    # Pass 1: self-asserting verbs — fire on bare presence.
+    for verb in _SELF_CLAIMING_VERBS:
+        if verb in low:
+            return True
+    # Pass 2: verb + nearby object pair.
     for verb in _CLAIM_VERBS:
         verb_idx = low.find(verb)
         if verb_idx < 0:

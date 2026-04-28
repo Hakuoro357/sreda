@@ -1161,11 +1161,17 @@ _FEATURE_PROMPTS: dict[str, str] = {
 # aren't strict enough alone for this model — we add a model-specific
 # imperative reminder. Shipped behind model-name detection so MiMo and
 # other providers aren't penalised with Gemma-flavoured text.
-_GEMMA_DISCIPLINE_ADDENDUM = """\
+# 2026-04-22 (gemma) → 2026-04-29 (universal): rule applies to all LLM
+# providers, не только Gemma. Incident user_tg_352612382 — MiMo-v2.5-pro
+# тоже галлюцинирует «Готово! ⏰ ... будет напоминание» без вызова
+# schedule_reminder. Tool-discipline нужна всем моделям — её отсутствие
+# показалось бы как Gemma-specific было лишь иллюзией статистики.
+_TOOL_DISCIPLINE_ADDENDUM = """\
 КРИТИЧЕСКИ ВАЖНО (строгая дисциплина tool-calls — не нарушать):
-- Если хочешь что-то СОХРАНИТЬ / ДОБАВИТЬ / СОЗДАТЬ / УДАЛИТЬ / ПОСТАВИТЬ НАПОМИНАНИЕ — это СТРОГО через tool_calls API (JSON-канал). НИКОГДА не пиши tool-call синтаксис (``save_recipe(title=...)``, ``add_shopping_items(...)``) в текстовый ответ пользователю — этот текст попадёт в Telegram как есть и будет выглядеть поломанным.
-- Если написал пользователю «сохранила рецепт», «добавила в список», «создала меню» — в ЭТОМ ЖЕ ответе ОБЯЗАН быть tool_call, который это выполнил. Никаких «сохранила» без реального вызова. Последовательность всегда: tool_call → ответ пользователю, не наоборот.
+- Если хочешь что-то СОХРАНИТЬ / ДОБАВИТЬ / СОЗДАТЬ / УДАЛИТЬ / ПОСТАВИТЬ НАПОМИНАНИЕ / ЗАПЛАНИРОВАТЬ ЗАДАЧУ — это СТРОГО через tool_calls API (JSON-канал). НИКОГДА не пиши tool-call синтаксис (``save_recipe(title=...)``, ``add_shopping_items(...)``) в текстовый ответ пользователю — этот текст попадёт в Telegram как есть и будет выглядеть поломанным.
+- ЗАПРЕЩЕНО говорить пользователю «Готово», «Поставила», «Создала», «Добавила», «Напомню», «Будет напоминание» — если в ЭТОМ ЖЕ turn'е НЕ был вызван соответствующий tool. Последовательность всегда: tool_call → дождаться результата → честный ответ пользователю. Если tool вернул ошибку — скажи правду «не получилось, попробуй переформулировать», НЕ выдумывай результат.
 - Если нужно сделать несколько действий (найти + сохранить) — отправь tool_calls, дождись результатов, ПОТОМ напиши текстовый ответ. Не объясняй свои действия, описывая вызовы текстом.
+- Реминдеры (`schedule_reminder`) всегда требуют RRULE для повторов: «каждый день в 9:00 MSK» = ``recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0"`` (UTC!). Не отвечай «настроила» без реального вызова tool с правильным RRULE.
 """
 
 
@@ -1189,8 +1195,12 @@ def build_system_prompt(
     parts = [core]
     if addon:
         parts.append(addon)
-    if model_name and "gemma" in model_name.lower():
-        parts.append(_GEMMA_DISCIPLINE_ADDENDUM)
+    # 2026-04-29: tool-discipline applies to ALL models, не только Gemma.
+    # MiMo-v2.5-pro hallucinated reminder creation (incident
+    # user_tg_352612382) — same failure mode что у Gemma. Universal
+    # rule безопасный — добавляет ~250 токенов в system prompt в обмен
+    # на снятие класса hallucinations.
+    parts.append(_TOOL_DISCIPLINE_ADDENDUM)
     return "\n".join(parts)
 
 

@@ -73,7 +73,105 @@ logging.Formatter.converter = time.localtime  # или явно pytz Moscow
 **Acceptance.** `tail /var/log/sreda/uvicorn.log` показывает MSK
 (или явный TZ-суффикс), та же запись в трейсе и в админке /admin/logs.
 
-### 0.3 Pre-existing FK bug (carry-over)
+### 0.3 LLM hallucinates reminder creation (incident 2026-04-29 00:17 MSK)
+
+**Симптом.** Юзер: «поставь напоминалку на 9 утра каждый день на год —
+принимать лекарства». LLM (MiMo-v2.5) ответил «Готово! ⏰ Каждый день
+в 9:00 утра будет напоминание «Принять лекарства»...» **с пустым
+tools=[]** — `schedule_reminder` НЕ вызван. В БД ничего не появилось.
+
+**Trace:**
+```
+iter=0 tokens=23192/326 tools=[] text='Готово! ⏰ Каждый день в 9:00 утра ...'
+```
+
+**Это та же модель галлюцинации что была с checklist'ами 2026-04-28**
+(см. commit a39a662). Detector добавили только для checklist
+hallucination, не для reminders.
+
+**Что сделать.**
+1. Расширить detector в `src/sreda/runtime/handlers.py` (или там где
+   сидит `_chat_response_validator`):
+   - Если ответ LLM содержит «готово», «поставил», «напомнить»,
+     «напоминание создано/добавлено», «✅», «⏰» — а в tools_used нет
+     `schedule_reminder` → reject reply, force re-iter с подсказкой
+     «вы заявили о создании напоминания но не вызвали schedule_reminder
+     tool, обязательно вызовите его сначала».
+2. Усилить prompt rule в `_HOUSEWIFE_FOOD_PROMPT` (или скил-промпте):
+   - Добавить «MUST CALL TOOL FIRST: для reminders/tasks/checklists
+     любое заявление об успешном создании ОБЯЗАТЕЛЬНО предваряется
+     вызовом соответствующего tool. Без tool-call'а — отвечай "не
+     получилось", не выдумывай результат».
+
+**Acceptance.** Юзер просит создать reminder/task/checklist → LLM
+**обязательно** вызывает соответствующий tool → если tool вернул
+ошибку, ответ юзеру правдивый («не получилось, попробуй
+переформулировать»). Никогда не «Готово!» без тула.
+
+**Тесты:**
+- Добавить unit-тест: дать LLM mock'нутый response без tool_call,
+  проверить что детектор reject'ит.
+
+**Файлы:**
+- `src/sreda/runtime/handlers.py` (детектор)
+- `src/sreda/services/housewife_chat_tools.py` или где сидит prompt
+- `tests/unit/test_hallucination_detector.py` (новый)
+
+### 0.4 Schedule counter в Mini App home показывает «пока пусто» в полночь МСК
+
+**Симптом.** Юзер открыл Mini App в 00:30 MSK 29 апреля. На главной
+карточка «📅 Расписание / пока пусто», но при тапе drill-down
+показывает 2 задачи на 29 апреля.
+
+**Корень.** В
+`sreda-private-features/src/sreda_feature_housewife_assistant/plugin.py`
+schedule counter использует `today = datetime.now(UTC).date()`. В
+00:30 MSK это 21:30 UTC 28 апреля → ищет задачи на 28-е, ничего не
+находит. Drill-down (`/api/v1/schedule/week`) использует ту же
+функцию `list_today` но через 7-day window, поэтому 29-е попадает
+в окно и показывается.
+
+**Fix.**
+```python
+from zoneinfo import ZoneInfo
+from sreda.db.repositories.user_profile import UserProfileRepository
+
+profile = UserProfileRepository(session).get_profile(tenant_id, user_id)
+tz_name = (profile.timezone or "Europe/Moscow") if profile else "Europe/Moscow"
+today = _dt.now(ZoneInfo(tz_name)).date()
+```
+
+Дефолт `Europe/Moscow` чтобы существующие профили с `timezone='UTC'`
+не показывали путаницу. В будущем: при онбординге спрашивать TZ
+или определять по `tg.from.language_code`.
+
+**Файл:** `sreda-private-features/.../plugin.py` строка 117.
+
+### 0.5 Убрать форму ввода из списка покупок
+
+**Симптом.** В Mini App «Покупки» сверху висит инпут «Что добавить в
+список?» + кнопка «Добавить». Это противоречит позиционированию
+Среды — «голос как главный режим». Юзер должен использовать голос
+или текст в чате, а не вбивать в форму.
+
+**Что сделать.**
+- Убрать `<input>` + `<button>Добавить</button>` из шапки экрана
+  «Покупки» в Mini App.
+- Заменить на read-only-надпись (можно с иконкой 🎙️):
+  «Просто скажи мне что добавить или удалить из списка»
+- Для удаления отдельного пункта оставить чекбокс (current behavior),
+  но кнопку «очистить весь список» (мусорка справа сверху) — обсудить
+  оставлять или нет.
+
+**Файл:** Mini App template для shopping (`miniapp/templates/...`
+или JS-роут #/shopping). Найти grep'ом по «Что добавить в список».
+
+**Acceptance.** В «Покупки» нет input-поля. Сверху совет «скажи мне
+голосом или текстом». Чекбоксы для отметки купленного остаются.
+
+---
+
+### 0.6 Pre-existing FK bug (carry-over)
 
 **Симптом (был до VDS-миграции).** Webhook `tenant_tg_1089832184` →
 500 на insert outbox: `FOREIGN KEY constraint failed`,

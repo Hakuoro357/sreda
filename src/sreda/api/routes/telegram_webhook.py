@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import logging
 
@@ -22,6 +23,30 @@ from sreda.services.telegram_bot import handle_telegram_interaction
 
 router = APIRouter(prefix="/webhooks/telegram", tags=["telegram"])
 logger = logging.getLogger(__name__)
+
+
+async def _fire_and_forget_ack(
+    client: TelegramClient, chat_id: str, text: str,
+) -> None:
+    """Send a one-word ack reply concurrently with main turn processing.
+
+    Used as ``asyncio.create_task`` target so ``await client.send_message``
+    doesn't block voice.download / text llm. Uses parent's TraceContext
+    (ContextVar copied into child task) — the ``ack.sent`` event lands
+    in the same trace block as the rest of the turn. Failures are
+    logged but don't propagate (UX sugar — don't fail the turn if ack
+    can't be delivered)."""
+    with trace.step("ack.sent", phrase=text) as meta:
+        try:
+            await client.send_message(chat_id=chat_id, text=text)
+            meta["status"] = "ok"
+        except TelegramDeliveryError as exc:
+            logger.warning("ack delivery failed: %s", exc)
+            meta["status"] = "failed"
+        except Exception as exc:  # noqa: BLE001
+            # Defensive: ack must NEVER take down a turn.
+            logger.exception("ack task crashed: %s", exc)
+            meta["status"] = "crashed"
 
 
 def _verify_telegram_secret_token(
@@ -211,23 +236,30 @@ async def telegram_webhook(
         # poll latency which defeats the purpose. Skipped for button
         # taps (already feel instant) and new-user flow (they're
         # getting a welcome screen, not a question to ack).
+        #
+        # 2026-04-29 (Phase C optimization): ack идёт через
+        # `asyncio.create_task` — fire-and-forget параллельно с
+        # voice.download/transcribe. Раньше `await` блокировал на
+        # ~425мс (через SOCKS5 RTT). Теперь download стартует
+        # одновременно с ack send, экономит этот штраф из user-perceived
+        # latency. ContextVar (TraceContext) копируется в child task
+        # автоматически, так что trace.step внутри ack корректно пишет
+        # в текущий trace блок. В конце handler'а ждём `ack_task`
+        # с таймаутом 2с — обычно он уже завершён (sendMessage ~400мс
+        # vs voice flow ~10с), но явное ожидание гарантирует что trace
+        # блок включит ack.sent перед emit_block.
+        ack_task: asyncio.Task | None = None
         if (
             message_type in ("text", "voice")
             and not onboarding.is_new_user
         ):
             ack_text = pick_ack()
-            with trace.step("ack.sent", phrase=ack_text) as _ack_meta:
-                try:
-                    await telegram_client.send_message(
-                        chat_id=onboarding.chat_id,
-                        text=ack_text,
-                    )
-                    _ack_meta["status"] = "ok"
-                except TelegramDeliveryError as exc:
-                    # UX sugar — don't fail the turn if ack can't be
-                    # delivered. The real reply path is independent.
-                    logger.warning("ack delivery failed: %s", exc)
-                    _ack_meta["status"] = "failed"
+            ack_task = asyncio.create_task(
+                _fire_and_forget_ack(
+                    telegram_client, onboarding.chat_id, ack_text,
+                ),
+                name=f"ack:{onboarding.chat_id}",
+            )
 
         try:
             await handle_telegram_interaction(
@@ -241,6 +273,18 @@ async def telegram_webhook(
         except TelegramDeliveryError as exc:
             logger.warning("Telegram delivery failed during webhook handling: %s", exc)
         finally:
+            # Wait briefly for ack task to complete so ``ack.sent`` event
+            # is recorded in trace block before emit. Voice flow takes
+            # ~10с, ack ~400мс — task обычно already done by here.
+            # Cap at 2с safety so a stuck ack doesn't delay the response.
+            if ack_task is not None and not ack_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(ack_task), timeout=2.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "ack task still pending after main turn — abandoning",
+                    )
+
             # If the handler DID enqueue an outbox row, the delivery
             # worker will emit the block once it lands in Telegram.
             # Otherwise emit here so /help-style inline replies and
