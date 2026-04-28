@@ -135,8 +135,12 @@ class BudgetService:
         status: str = "succeeded",
     ) -> int:
         """Write a ``skill_ai_executions`` row and return credits_consumed."""
-        credits = credits_for(model, prompt_tokens, completion_tokens)
         now = _utcnow()
+        # 2026-04-28: pass now → credit_formula применяет off-peak discount
+        # 20% в окне 09:00–17:00 PDT (16:00–24:00 UTC).
+        credits = credits_for(
+            model, prompt_tokens, completion_tokens, now=now
+        )
         row = SkillAIExecution(
             id=f"skai_{_short_uuid()}",
             run_id=run_id,
