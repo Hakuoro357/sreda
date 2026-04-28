@@ -66,13 +66,34 @@ def _openrouter_key() -> str | None:
 
 
 PROVIDERS = [
-    # Baseline — current production provider. No price tracking.
+    # Baseline — legacy MiMo-V2-Pro (Сяоми Preferential rate 2026-04-28:
+    # 2 credits / token = $0.08/M на 1x rate, но V2-Pro был 2x → $0.16/M
+    # эквивалентно. Сохраняем для исторического сравнения).
     {
         "label": "MiMo-V2-Pro",
         "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
         "api_key": _read_secret(".secrets/mimo_api_key.txt"),
         "model": "mimo-v2-pro",
-        "price_in": 0.0, "price_out": 0.0,
+        "price_in": 0.16, "price_out": 0.16,
+    },
+    # Текущий production primary — MiMo-V2.5-Pro. Сяоми Preferential
+    # rate (2026-04-28): 1 token = 2 credits = $0.08/M (по сообщению
+    # юзера про rate $0.08/M token). 2x rate (Pro) уже учтён в credit
+    # → реальная плата ~$0.08/M. Off-peak –20% в 16-24 UTC.
+    {
+        "label": "MiMo-V2.5-Pro",
+        "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
+        "api_key": _read_secret(".secrets/mimo_api_key.txt"),
+        "model": "mimo-v2.5-pro",
+        "price_in": 0.08, "price_out": 0.08,
+    },
+    # MiMo V2.5 (light, ~2x быстрее). 1x rate = $0.04/M эквивалент.
+    {
+        "label": "MiMo-V2.5",
+        "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
+        "api_key": _read_secret(".secrets/mimo_api_key.txt"),
+        "model": "mimo-v2.5",
+        "price_in": 0.04, "price_out": 0.04,
     },
     # OpenRouter paid candidates (prices per 1M tokens, verified
     # against /api/v1/models on 2026-04-22).
@@ -117,6 +138,16 @@ PROVIDERS = [
         "api_key": _openrouter_key(),
         "model": "moonshotai/kimi-k2.5",
         "price_in": 0.44, "price_out": 2.00,
+    },
+    # 2026-04-28: DeepSeek V4 Flash — релиз 24.04, MoE 284B/13B
+    # активных, 1M context. Конкурент MiMo по цене / скорости.
+    # Поддерживает structured tool calling.
+    {
+        "label": "OR/deepseek-v4-flash",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "deepseek/deepseek-v4-flash",
+        "price_in": 0.14, "price_out": 0.28,
     },
 ]
 
