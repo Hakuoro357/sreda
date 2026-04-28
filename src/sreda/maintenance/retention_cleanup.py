@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.orm import Session
 
+from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import InboundMessage, Job, OutboxMessage, SecureRecord
 from sreda.db.models.runtime import AgentRun
 from sreda.db.models.skill_platform import (
@@ -44,6 +45,7 @@ from sreda.db.models.skill_platform import (
     SkillEvent,
     SkillRun,
     SkillRunAttempt,
+    TenantSkillConfig,
 )
 
 
@@ -228,13 +230,48 @@ def cleanup_runtime_retention(
     )
 
     # ---------- secure_records (eds_connect_payload only) ----------
+    # 2026-04-28 fix: было FK-violation. SecureRecord ссылается из
+    # connect_sessions / tenant_eds_accounts / inbound_messages /
+    # tenant_skill_configs / skill_runs (in/out) / skill_run_attempts.
+    # Удаляем ТОЛЬКО orphan'ов — у которых ни один FK не указывает на них.
+    # Если кто-то ещё ссылается — secure_record нужен (parent живой),
+    # его TTL обнуляется.
     eds_cutoff = now - timedelta(days=EDS_CONNECT_PAYLOAD_DAYS)
+    referenced_ids = (
+        select(ConnectSession.secure_record_id)
+        .where(ConnectSession.secure_record_id.isnot(None))
+        .union_all(
+            select(TenantEDSAccount.secure_record_id)
+            .where(TenantEDSAccount.secure_record_id.isnot(None))
+        )
+        .union_all(
+            select(InboundMessage.secure_record_id)
+            .where(InboundMessage.secure_record_id.isnot(None))
+        )
+        .union_all(
+            select(TenantSkillConfig.secure_record_id)
+            .where(TenantSkillConfig.secure_record_id.isnot(None))
+        )
+        .union_all(
+            select(SkillRun.input_secure_record_id)
+            .where(SkillRun.input_secure_record_id.isnot(None))
+        )
+        .union_all(
+            select(SkillRun.output_secure_record_id)
+            .where(SkillRun.output_secure_record_id.isnot(None))
+        )
+        .union_all(
+            select(SkillRunAttempt.raw_artifact_secure_record_id)
+            .where(SkillRunAttempt.raw_artifact_secure_record_id.isnot(None))
+        )
+    )
     result.secure_records_eds_connect_payload = _delete_returning_count(
         session,
         delete(SecureRecord).where(
             and_(
                 SecureRecord.record_type == "eds_connect_payload",
                 SecureRecord.created_at < eds_cutoff,
+                SecureRecord.id.notin_(referenced_ids),
             )
         ),
     )

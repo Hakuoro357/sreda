@@ -71,6 +71,13 @@ class RetentionWorker:
             result = cleanup_runtime_retention(self.session, now=now)
         except Exception:  # noqa: BLE001 — никогда не убиваем job_runner
             logger.exception("retention cleanup failed")
+            # 2026-04-28: rollback чтобы транзакция не висела в bad state
+            # — иначе следующие workers внутри того же job_runner tick'а
+            # начнут падать с InvalidRequestError на чтении.
+            try:
+                self.session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
             return 0
         self._record_run(now, result)
         self._log_result(now, result)
