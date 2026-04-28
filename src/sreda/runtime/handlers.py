@@ -529,9 +529,16 @@ def _validate_proposed_field(field_name: str, proposed_value: Any) -> tuple[str,
             return None
         return field_name, proposed_value
     if field_name == "display_name":
-        if not isinstance(proposed_value, str) or not 1 <= len(proposed_value) <= 128:
+        if not isinstance(proposed_value, str):
             return None
-        return field_name, proposed_value
+        # 2026-04-28: LLM иногда передаёт фразу «Пользователя зовут X»
+        # вместо «X». Прогоняем через sanitizer общий с onboarding-flow,
+        # чтобы было одно правило в двух местах. См. housewife_onboarding.
+        from sreda.services.housewife_onboarding import _extract_short_name
+        clean = _extract_short_name(proposed_value)
+        if not 1 <= len(clean) <= 128:
+            return None
+        return field_name, clean
     # Quiet hours / skill configs not supported via proposal path (too
     # structured; users use direct commands). Agents that want those
     # changes should prompt the user via chat instead of confirm-button.

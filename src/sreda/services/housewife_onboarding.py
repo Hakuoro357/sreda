@@ -31,6 +31,7 @@ Depth cap:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -454,8 +455,11 @@ class HousewifeOnboardingService:
             "ответь / выполни, и только потом аккуратно верни к теме онбординга."
         )
         lines.append(
-            "5. Для темы ``addressing`` — если user сказал «Борис» или «Борис Петрович», "
-            "сохрани то имя которым он сам себя назвал; summary = имя."
+            "5. Для темы ``addressing`` summary = ТОЛЬКО имя/ник 1-3 словами. "
+            "ПРАВИЛЬНО: summary='Борис', summary='Анна Викторовна', summary='Шеф'. "
+            "ЗАПРЕЩЕНО: summary='Пользователя зовут Борис.', "
+            "summary='Меня зовут Анна', summary='Пользователь хочет, чтобы его называли «Шеф»'. "
+            "Без префиксов, без точки в конце, без кавычек, без пояснений."
         )
         return "\n".join(lines)
 
@@ -528,20 +532,112 @@ class HousewifeOnboardingService:
         self, *, tenant_id: str, user_id: str, name: str
     ) -> None:
         """Mirror addressing answer to TenantUserProfile.display_name.
-        Best-effort: if the profile row doesn't exist we'd need to
-        upsert it too. UserProfileRepository exposes ``upsert_profile``
-        for that path."""
+
+        2026-04-28: вызываем ``_extract_short_name`` чтобы вырезать
+        префиксы «Пользователя зовут …», «Меня зовут …», «Пользователь
+        хочет, чтобы его называли «X»» и подобный мусор, который LLM
+        иногда передаёт как ``summary``. Без этой защиты в проде
+        наблюдалось ``display_name = "Пользователя зовут Борис."``.
+        Best-effort: если запись профиля ещё не создана,
+        ``update_profile`` сама её апсёртит через ``get_or_create_profile``.
+        """
+        clean = _extract_short_name(name)
+        if not clean:
+            # Совсем пустой/невнятный summary — не записываем мусор поверх
+            # существующего имени.
+            return
         try:
             self.repo.update_profile(
                 tenant_id,
                 user_id,
                 source="agent_tool_direct",
-                display_name=name[:120],
+                display_name=clean[:120],
             )
         except Exception:  # noqa: BLE001 — naming is sugar, don't kill the turn
             logger.exception(
                 "failed to mirror addressing answer into profile.display_name"
             )
+
+
+# ---------------------------------------------------------------------------
+# Display-name sanitizer (2026-04-28 incident response)
+# ---------------------------------------------------------------------------
+#
+# LLM-tool ``onboarding_answered(topic="addressing", summary=...)`` мирорит
+# ``summary`` в ``TenantUserProfile.display_name``. Docstring явно говорит
+# «just the name», но иногда LLM сохраняет полную фразу:
+#   * «Пользователя зовут Борис.»
+#   * «Пользователь хочет, чтобы его называли «Шеф».»
+#   * «Меня зовут Анна Викторовна»
+# В этих случаях имя в админке выглядит как предложение, а в LLM-prompt'е
+# секция профиля становится `Имя: Пользователя зовут Борис.`. Helper
+# ниже срезает префиксы, кавычки, терминальную пунктуацию и обрезает
+# хвост после тире/запятой/точки. Применяется в ``_set_display_name``
+# и в ``_validate_proposed_field`` (handlers.py) — две точки входа,
+# через которые имя попадает в профиль.
+
+_NAME_PREFIX_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # «Пользователь хочет, чтобы его называли …» / «Пользователя хочет, чтобы её называли …»
+    re.compile(r"^пользовател[ьяй]\s+хочет.*?чтобы\s+(?:его|её|ее)\s+называли\s+", re.IGNORECASE),
+    # «Пользователя зовут …», «Пользователь зовут …»
+    re.compile(r"^пользовател[ьяй]\s+зовут\s+", re.IGNORECASE),
+    # «Меня зовут …»
+    re.compile(r"^меня\s+зовут\s+", re.IGNORECASE),
+    # «Зови меня …»
+    re.compile(r"^зови\s+меня\s+", re.IGNORECASE),
+    # «Имя: …», «Имя — …»
+    re.compile(r"^имя\s*[:—-]\s*", re.IGNORECASE),
+    # «Зовут …» (без «меня/пользователя»)
+    re.compile(r"^зовут\s+", re.IGNORECASE),
+)
+
+# Окружающая пунктуация (кавычки, скобки, точки, запятые, дефисы), которую
+# нужно убрать с краёв. Включает и обычные ASCII, и русские «ёлочки».
+_TRIM_CHARS = " .,;:!?'\"«»()[]{}—–-"
+
+
+def _extract_short_name(text: str | None) -> str:
+    """Извлечь короткое имя из произвольной строки от LLM.
+
+    Шаги:
+    1. Strip + пустую строку → "".
+    2. Срезать известный префикс («Пользователя зовут», «Меня зовут», …).
+    3. Убрать окружающие кавычки/пунктуацию.
+    4. Если результат содержит пояснительный clause через «—»/«,»/«.»
+       (например «Повелитель — просил называть его так»), оставить только
+       первую часть.
+    5. Обрезать до 30 символов как защиту от мусора.
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    if not s:
+        return ""
+
+    # 1. Срезаем известные префиксы.
+    for pattern in _NAME_PREFIX_PATTERNS:
+        new = pattern.sub("", s, count=1)
+        if new != s:
+            s = new
+            break
+
+    # 2. Trim окружающую пунктуацию.
+    s = s.strip(_TRIM_CHARS)
+
+    # 3. Если есть «— пояснение» / «, пояснение» / «. вторая фраза» —
+    #    берём только первую часть. Имя редко содержит такие разделители,
+    #    «John — friend» / «Шеф, как обычно» / «Борис. Зови так» — это
+    #    мусор на хвосте.
+    for sep in ("—", "–", ",", ".", ";", "  "):
+        if sep in s:
+            s = s.split(sep, 1)[0].strip()
+
+    # 4. Финальный trim после split.
+    s = s.strip(_TRIM_CHARS)
+
+    # 5. Cap на 30 символов — защита от случаев когда не удалось ничего
+    #    вырезать и осталась длинная фраза.
+    return s[:30]
 
 
 def _merge_with_defaults(state: dict[str, Any]) -> dict[str, Any]:

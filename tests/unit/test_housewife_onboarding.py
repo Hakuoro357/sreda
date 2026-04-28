@@ -24,6 +24,7 @@ from sreda.services.housewife_onboarding import (
     TOPIC_ROUTINE,
     TOPIC_SELF_INTRO,
     HousewifeOnboardingService,
+    _extract_short_name,
     _next_topic,
 )
 
@@ -388,3 +389,113 @@ def test_initialize_does_not_clobber_unrelated_skill_params():
     assert params.get("some_unrelated_flag") is True
     assert params.get("other") == "value"
     assert "onboarding" in params
+
+
+# ---------------------------------------------------------------------------
+# _extract_short_name — defense against LLM stuffing full sentences as names
+# ---------------------------------------------------------------------------
+#
+# 2026-04-28 incident (см. docs/copy/welcome.md): LLM, передавая
+# `summary` в `onboarding_answered(topic="addressing")`, иногда сохраняет
+# целую фразу вместо имени. На проде нашли:
+#   * "Пользователя зовут Борис."
+#   * "Пользователя зовут Повелитель — просил называть его так."
+#   * "Пользователь хочет, чтобы его называли «Шеф»."
+# Эти строки попадали в `display_name`, и в LLM-prompt'е выглядело как
+# `Имя: Пользователя зовут Борис.` Защита: helper, который чистит
+# распространённые префиксы и обрезает результат до короткого имени.
+
+
+def test_extract_short_name_returns_short_input_unchanged():
+    assert _extract_short_name("Борис") == "Борис"
+    assert _extract_short_name("Анна") == "Анна"
+    assert _extract_short_name("Кэт") == "Кэт"
+
+
+def test_extract_short_name_strips_polzovatel_zovut_prefix():
+    assert _extract_short_name("Пользователя зовут Борис.") == "Борис"
+    assert _extract_short_name("Пользователя зовут Анна") == "Анна"
+
+
+def test_extract_short_name_strips_menya_zovut_prefix():
+    assert _extract_short_name("Меня зовут Борис") == "Борис"
+    assert _extract_short_name("меня зовут Анна Викторовна") == "Анна Викторовна"
+
+
+def test_extract_short_name_strips_zovi_menya_prefix():
+    assert _extract_short_name("Зови меня Кэт") == "Кэт"
+    assert _extract_short_name("зови меня кошечкой") == "кошечкой"
+
+
+def test_extract_short_name_handles_polzovatel_hochet_phrase():
+    """«Пользователь хочет, чтобы его называли «Шеф».» → «Шеф»."""
+    raw = "Пользователь хочет, чтобы его называли «Шеф»."
+    assert _extract_short_name(raw) == "Шеф"
+
+
+def test_extract_short_name_truncates_with_explanation_clause():
+    """«Пользователя зовут Повелитель — просил называть его так.» → «Повелитель»."""
+    raw = "Пользователя зовут Повелитель — просил называть его так."
+    assert _extract_short_name(raw) == "Повелитель"
+
+
+def test_extract_short_name_strips_quotes_and_terminal_punct():
+    assert _extract_short_name("«Шеф»") == "Шеф"
+    assert _extract_short_name("'Борис'") == "Борис"
+    assert _extract_short_name("Анна.") == "Анна"
+    assert _extract_short_name("Анна,") == "Анна"
+
+
+def test_extract_short_name_empty_input_returns_empty():
+    assert _extract_short_name("") == ""
+    assert _extract_short_name("   ") == ""
+    assert _extract_short_name(None) == ""  # type: ignore[arg-type]
+
+
+def test_extract_short_name_caps_at_30_chars():
+    """Длинные несжимаемые строки обрезаются до 30 — это всё ещё мусор,
+    но не полная портянка, и validate_proposed_field в handlers.py
+    отрежет такое в дальнейшем при ужесточении."""
+    raw = "Очень длинное предложение которое в имя точно не лезет"
+    assert len(_extract_short_name(raw)) <= 30
+
+
+def test_mark_answered_addressing_sanitizes_display_name():
+    """LLM передаёт full-sentence summary → mirror в display_name
+    должен быть очищен через _extract_short_name. Это последняя линия
+    обороны — даже если LLM не послушал docstring."""
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    session = _fresh_session()
+    service = HousewifeOnboardingService(session)
+    service.start(tenant_id="t1", user_id="u1")
+
+    service.mark_answered(
+        tenant_id="t1",
+        user_id="u1",
+        topic=TOPIC_ADDRESSING,
+        summary="Пользователя зовут Борис.",
+    )
+
+    profile = UserProfileRepository(session).get_profile("t1", "u1")
+    assert profile is not None
+    assert profile.display_name == "Борис"
+
+
+def test_mark_answered_addressing_sanitizes_polzovatel_hochet_phrase():
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    session = _fresh_session()
+    service = HousewifeOnboardingService(session)
+    service.start(tenant_id="t1", user_id="u1")
+
+    service.mark_answered(
+        tenant_id="t1",
+        user_id="u1",
+        topic=TOPIC_ADDRESSING,
+        summary="Пользователь хочет, чтобы его называли «Шеф».",
+    )
+
+    profile = UserProfileRepository(session).get_profile("t1", "u1")
+    assert profile is not None
+    assert profile.display_name == "Шеф"

@@ -144,9 +144,9 @@
   сообщение — лучше в естественный диалог.
 
 **Замечания.**
-- LLM сама извлекает имя через `update_profile_field` tool, когда
-  юзер пишет ответ. Webhook не перехватывает первый text как
-  display_name.
+- LLM сама извлекает имя через `onboarding_answered(topic="addressing",
+  summary="<имя>")` tool, когда юзер пишет ответ. Webhook не
+  перехватывает первый text как display_name.
 - Расспросы про семью / диеты / другие данные смещены в обычный
   chat-flow — LLM спрашивает когда уместно, по своему усмотрению
   (тон housewife-prompt'а уже задаёт правильный flow).
@@ -154,16 +154,40 @@
   (`docs/tomorrow-plan.md` пункт 8). Колонка `address_form`
   остаётся в БД для возврата фичи.
 
+**Sanitizer для display_name (2026-04-28 incident).** На проде
+обнаружили 3 испорченных `display_name` — LLM передавала в
+`onboarding_answered.summary` целые фразы вместо имени:
+- `"Пользователя зовут Борис."`
+- `"Пользователь хочет, чтобы его называли «Шеф»."`
+- `"Пользователя зовут Повелитель — просил называть его так."`
+
+Защита трёхслойная (см. `services/housewife_onboarding._extract_short_name`):
+1. **Tool docstring** в `services/housewife_chat_tools.onboarding_answered` —
+   явные ПРАВИЛЬНО / ЗАПРЕЩЕНО примеры.
+2. **Prompt rule №5** в `format_for_prompt` — расширен с примерами
+   запрещённых summary.
+3. **Backend sanitizer** `_extract_short_name` — последняя линия
+   обороны: режет префиксы «Пользователя зовут», «Меня зовут»,
+   «Пользователь хочет, чтобы его называли», обрезает кавычки и
+   терминальную пунктуацию, оставляет только первую часть до
+   тире/запятой/точки. Применяется в `_set_display_name`
+   (housewife) и в `runtime.handlers._validate_proposed_field`.
+
+Существующие 3 испорченных значения исправлены вручную SQL UPDATE'ом
+в проде:
+- `tup_4da5c5567362487da11a22e7` (`tg_352612382`) → «Борис»
+- `tup_d05ba443080c491694cd47f5` (`tg_30223042`) → «Повелитель»
+- `tup_482305551f564a979e90b1b5` (`tg_981993906`) → «Шеф»
+
 ---
 
 ## 3. Ссылки
 
-- `src/sreda/services/pending_bot.py` — единое pending-приветствие
-- `src/sreda/services/onboarding.py::build_welcome_message` — post-approval
-- `src/sreda/services/onboarding.py::build_name_question_message` — шаг 1 (имя)
-- `src/sreda/services/onboarding.py::build_address_form_question_message` — шаг 2 (ты/вы)
-- `src/sreda/api/routes/telegram_webhook.py` — approval-gate +
-  state-machine онбординга (вызов pending_bot.match)
+- `src/sreda/services/pending_bot.py` — pending-цепочка из 11 сообщений
+- `src/sreda/services/onboarding.py::build_post_approve_message` — post-approval (один simplified-вопрос про имя)
+- `src/sreda/services/housewife_onboarding._extract_short_name` — sanitizer имени
+- `src/sreda/services/housewife_chat_tools.onboarding_answered` — tool через который LLM сохраняет имя
+- `src/sreda/api/routes/telegram_webhook.py` — approval-gate (вызов pending_bot.match)
 - `src/sreda/services/ui_labels.py` — `BUTTON_ACK`, `BUTTON_SNOOZE`,
   `BUTTON_SNOOZE_MORNING`
 - `src/sreda/services/pricing.py` — плейсхолдеры цен

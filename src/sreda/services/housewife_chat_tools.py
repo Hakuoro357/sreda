@@ -241,7 +241,15 @@ def build_housewife_tools(
             topic: One of: addressing, self_intro, family, diet, routine,
                 pain_point. Match the [ОНБОРДИНГ] block's current_topic.
             summary: The answer in 1–2 sentences, preserving user wording.
-                For the ``addressing`` topic — just the name.
+                For the ``addressing`` topic — ТОЛЬКО короткое имя/ник
+                (1-3 слова), БЕЗ префиксов «Пользователя зовут»,
+                «Меня зовут», «Пользователь хочет, чтобы его называли».
+                Примеры правильного значения: "Борис", "Анна Викторовна",
+                "Шеф". Примеры НЕПРАВИЛЬНОГО (запрещены): "Пользователя
+                зовут Борис.", "Меня зовут Анна", "Пользователь хочет,
+                чтобы его называли «Шеф»". Backend-санитайзер обрежет
+                префиксы автоматически, но это последняя линия защиты —
+                всё равно передавай чистое имя.
 
         Returns short status string.
         """
