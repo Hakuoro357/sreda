@@ -1843,6 +1843,92 @@ def build_housewife_tools(
         return f"ok:added:{len(added)}:list={cl.id}"
 
     @lc_tool
+    def move_task_to_checklist(
+        task_id: str, list_id_or_title: str
+    ) -> str:
+        """Atomically move a task from schedule to a checklist.
+
+        ОДИН вызов вместо двух (cancel_task + add_checklist_items) —
+        безопаснее, так как невозможно «потерять» task частично или
+        задвоить пункт. Используй когда:
+
+        * Юзер просит «перенеси X из расписания в дела/чек-лист Y»
+        * Понял что в прошлом turn'е ошибочно создал task вместо
+          add_checklist_items, и хочешь перенести
+        * Юзер уточнил «это не на конкретное время — переложи в дела»
+
+        Что делает (атомарно, в одной транзакции):
+        1. Cancel task (status='cancelled' — soft delete, audit
+           trail сохраняется, retention worker подчистит позже)
+        2. Если у task'а был reminder — он тоже отменяется
+        3. Add item с title задачи в target checklist (с dedup
+           защитой — если такой пункт уже есть, не задвоит)
+        4. Если target checklist не найден — создаёт его с этим title
+
+        Args:
+            task_id: id задачи (формат ``task_*``).
+            list_id_or_title: target checklist — либо id
+                (``checklist_*``), либо title (fuzzy-match по
+                существующим, например «Глобальные дела на даче»).
+
+        Returns:
+            ``ok:moved:item_id=clitem_xxx:list=checklist_yyy``
+            ``ok:moved:item_id=existing:list=...:dup`` (если уже было)
+            ``error:task_not_found`` / ``error:list_resolve_failed``
+        """
+        if not user_id:
+            return "error: no user_id context"
+
+        # Step 1: cancel task (with ownership check via _get inside)
+        try:
+            task = task_service.cancel(
+                tenant_id=tenant_id, user_id=user_id, task_id=task_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("move_task_to_checklist: cancel failed")
+            return "error: internal_cancel"
+        if task is None:
+            return "error: task_not_found"
+
+        # Сохраняем title пока task ещё доступен (EncryptedString
+        # decrypted via ORM read).
+        task_title = (task.title or "").strip()
+        if not task_title:
+            return "error: task_has_empty_title"
+
+        # Step 2: resolve target checklist
+        cl = checklist_service.find_list_by_title(
+            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        )
+        if cl is None:
+            try:
+                cl = checklist_service.create_list(
+                    tenant_id=tenant_id, user_id=user_id,
+                    title=list_id_or_title,
+                )
+            except ValueError as exc:
+                return f"error: {exc}"
+            except Exception:  # noqa: BLE001
+                logger.exception("move_task_to_checklist: create_list failed")
+                return "error: list_resolve_failed"
+
+        # Step 3: add item (with dedup)
+        try:
+            created, skipped = checklist_service.add_items(
+                list_id=cl.id, items=[task_title]
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("move_task_to_checklist: add_items failed")
+            return "error: internal_add"
+
+        if created:
+            return f"ok:moved:item_id={created[0].id}:list={cl.id}"
+        if skipped:
+            return f"ok:moved:item_id=existing:list={cl.id}:dup"
+        # Не должно дойти сюда — items был непуст
+        return "error: nothing_added"
+
+    @lc_tool
     def list_checklists() -> str:
         """List all active checklists with item counts (pending/done/total).
 
@@ -2040,4 +2126,6 @@ def build_housewife_tools(
         mark_checklist_item_done,
         delete_checklist_item,
         archive_checklist,
+        # 2026-04-28: атомарный перенос task → checklist
+        move_task_to_checklist,
     ]
