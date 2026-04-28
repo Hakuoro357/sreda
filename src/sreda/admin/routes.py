@@ -29,12 +29,38 @@ def _get_session():
         session.close()
 
 
+def _audit_admin_view(
+    session, action: str, token: str, request: Request, **metadata
+) -> None:
+    """Helper: пишет audit_log запись для admin GET-view операций.
+
+    2026-04-28: для compliance каждое чтение PII через админку
+    логируется. Best-effort — ошибки не пробрасывает (не валит view).
+    """
+    from sreda.services.audit import audit_event, hash_admin_token
+
+    md = {
+        "ip": request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+              or (request.client.host if request.client else "?"),
+        "ua": (request.headers.get("user-agent") or "")[:120],
+    }
+    md.update(metadata)
+    audit_event(
+        session,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        action=action,
+        metadata=md,
+    )
+
+
 @router.get("/users", response_class=HTMLResponse)
 def admin_users(
     request: Request,
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
+    _audit_admin_view(session, "admin.users.viewed", token, request)
     users = get_all_users(session)
     return templates.TemplateResponse(
         request, "users.html",
@@ -48,6 +74,7 @@ def admin_budget(
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
+    _audit_admin_view(session, "admin.budget.viewed", token, request)
     rows = get_budget_summary(session)
     return templates.TemplateResponse(
         request, "budget.html",
@@ -170,6 +197,10 @@ def admin_llm(
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
+    _audit_admin_view(
+        session, "admin.llm.viewed", token, request,
+        refresh=bool(refresh),
+    )
     if refresh:
         from sreda.services import provider_balances as pb
         pb.invalidate_cache()
@@ -221,6 +252,11 @@ def admin_llm_save(
         session, rc.KEY_CHAT_FALLBACK_PROVIDER,
         fallback_clean if fallback_clean else "",
     )
+    # Audit: admin сменил LLM provider — важная compliance-actie.
+    _audit_admin_view(
+        session, "admin.llm.changed", token, request,
+        primary=primary, fallback=fallback_clean or "(none)",
+    )
     ctx = _llm_context(
         session, token,
         flash=(
@@ -241,6 +277,10 @@ def admin_llm_calls(
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
+    _audit_admin_view(
+        session, "admin.llm_calls.viewed", token, request,
+        tenant_id=tenant_id, feature_key=feature_key, page=page,
+    )
     data = get_llm_calls(session, tenant_id, feature_key, page=page)
     return templates.TemplateResponse(
         request, "llm_calls.html",
@@ -255,7 +295,12 @@ def admin_logs(
     tail: int = Query(default=500, ge=50, le=5000),
     grep: str | None = Query(default=None),
     token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
 ):
+    _audit_admin_view(
+        session, "admin.logs.viewed", token, request,
+        file=file, tail=tail, grep=grep,
+    )
     """Tail view over launchd log files configured in settings.
 
     The file is picked via ``?file=<index>`` (stringified). When a file
