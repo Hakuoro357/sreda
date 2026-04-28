@@ -312,9 +312,26 @@ def _run_one_turn(provider, scenario):
     }
 
 
-def main(runs_per_pair: int = 2) -> int:
+def main(runs_per_pair: int = 2, only_labels: list[str] | None = None) -> int:
+    # 2026-04-28: support filtering via --only label1,label2,... чтобы
+    # тестить отдельные модели без запуска всей матрицы (стоит денег).
+    providers = PROVIDERS
+    if only_labels:
+        wanted = {lbl.strip().lower() for lbl in only_labels if lbl.strip()}
+        providers = [
+            p for p in PROVIDERS
+            if p["label"].lower() in wanted
+            or any(w in p["label"].lower() for w in wanted)
+        ]
+        if not providers:
+            print(f"ERROR: --only {only_labels!r} matched no providers.")
+            print(f"Available labels: {[p['label'] for p in PROVIDERS]}")
+            return 2
+
     print(f"System-prompt size: {len(SYSTEM_PROMPT)} chars")
-    print(f"Providers: {len(PROVIDERS)}, scenarios: {len(SCENARIOS)}, runs each: {runs_per_pair}")
+    print(f"Providers: {len(providers)}, scenarios: {len(SCENARIOS)}, runs each: {runs_per_pair}")
+    if only_labels:
+        print(f"Filtered: {[p['label'] for p in providers]}")
     print()
 
     header = (
@@ -327,7 +344,7 @@ def main(runs_per_pair: int = 2) -> int:
 
     agg: dict[tuple[str, str], list[float]] = {}
 
-    for provider in PROVIDERS:
+    for provider in providers:
         # Cerebras qwen-3-235b preview is rate-limited to 5 RPM.
         # Pause between runs so we don't blow the quota and miss all data.
         slow_provider = "qwen-3-235b" in provider["model"]
@@ -377,7 +394,7 @@ def main(runs_per_pair: int = 2) -> int:
     print("---- median wall per (provider, scenario) ----")
     header2 = f"{'provider':<24}" + "".join(f" {s['name']:>16}" for s in SCENARIOS)
     print(header2)
-    for provider in PROVIDERS:
+    for provider in providers:
         row = f"{provider['label']:<24}"
         for scenario in SCENARIOS:
             walls = agg.get((provider["label"], scenario["name"]))
@@ -390,4 +407,18 @@ def main(runs_per_pair: int = 2) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument(
+        "--only", default=None,
+        help="CSV labels (case-insensitive substring match) для фильтра. "
+             "Пример: --only deepseek,mimo-v2.5-pro",
+    )
+    parser.add_argument(
+        "--runs", type=int, default=2,
+        help="Сколько повторов на каждую (provider, scenario) пару. Default: 2.",
+    )
+    args = parser.parse_args()
+    only_labels = args.only.split(",") if args.only else None
+    raise SystemExit(main(runs_per_pair=args.runs, only_labels=only_labels))
