@@ -232,7 +232,58 @@ perception ≠ trace timing.
 
 ---
 
-### 0.7 Pre-existing FK bug (carry-over)
+### 0.7 Чек-листы: дубликат создаётся при single-turn create+add
+
+**Симптом.** 2026-04-29 ~01:29 МСК. Юзер просит «создай чек-лист
+„Доработки среды" и добавь туда „Создать сайт для среды"». LLM
+ответил «Готово ✅ Создала чек-лист „Доработки среды" и добавила
+первый пункт». В Mini App «Дела» появились **ДВА** одинаковых
+чек-листа «Доработки среды» с одним пунктом «Создать сайт для
+среды» в каждом.
+
+**Скриншот:**
+```
+📋 Дела
+
+Доработки среды        1/1
+☐ Создать сайт для среды
+
+Доработки среды        1/1
+☐ Создать сайт для среды
+```
+
+**Гипотеза.** LLM в одном turn'е делает 2 tool-call'а:
+1. `create_checklist(title="Доработки среды", items=["Создать сайт..."])`
+2. `add_checklist_items(...)` или второй `create_checklist(...)`
+
+Что-то из этого создаёт второй row. Или dedup по title не работает,
+или сама pre-existing БД хранит две записи (Mac DB накачен on top
+of VDS — могла быть существующая запись + новая создалась).
+
+**Что сделать:**
+1. Получить trace turn'а — посмотреть какие tool-calls сделал LLM.
+   `grep -A 50 "0:29" /var/log/sreda/trace.log` или поиск по
+   tenant=tenant_tg_352612382 в районе времени.
+2. Проверить ChecklistService.create — есть ли там idempotency / dedup
+   по (tenant_id, user_id, title).
+3. Проверить prompt: даёт ли LLM явное правило «один tool-call на
+   создание + add_items в том же call'е, либо create_checklist с
+   items=...»?
+4. Если LLM делает 2 create_checklist подряд — добавить dedup в
+   `ChecklistService.create`: если уже есть row с таким же title для
+   этого user'а в последние 60 секунд — return existing вместо create.
+
+**Файлы:**
+- `src/sreda/services/checklist.py` (или где сидит ChecklistService)
+- `src/sreda/services/housewife_chat_tools.py` (tool definitions)
+- `src/sreda/runtime/handlers.py` (prompt)
+
+**Acceptance.** Юзер просит «создай Х и добавь туда Y» → создаётся
+ровно ОДИН чек-лист с пунктами.
+
+---
+
+### 0.8 Pre-existing FK bug (carry-over)
 
 **Симптом (был до VDS-миграции).** Webhook `tenant_tg_1089832184` →
 500 на insert outbox: `FOREIGN KEY constraint failed`,
