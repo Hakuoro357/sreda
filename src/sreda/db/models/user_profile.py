@@ -87,6 +87,13 @@ class TenantUserProfile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
+    # 152-ФЗ Часть 2 (2026-04-28): timestamp когда юзер дал согласие на
+    # обработку ПДн. NULL = не давал. UX-флоу пока отсутствует — поле
+    # заполняется в backlog, когда будет публичная политика на сайте.
+    privacy_policy_accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
 
 class TenantUserProfileProposal(Base):
     """Agent-proposed profile change awaiting user confirmation (Phase 2e).
