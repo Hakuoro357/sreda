@@ -242,21 +242,121 @@ async def _handle_callback(
     # через `pending_bot.match()`, отправляем следующее сообщение цепочки.
     # Ничего не идёт в LLM, никаких tool-call'ов, чистый scripted-flow.
     if data.startswith("pb:"):
+        from datetime import datetime, timedelta, timezone
         from sreda.services import pending_bot
-        from sreda.services.housewife_onboarding import record_pb_tour_progress
+        from sreda.services.housewife_onboarding import (
+            WELCOME_V2_PROGRESS_KEY,
+            record_pb_tour_progress,
+        )
+        from sreda.db.repositories.user_profile import UserProfileRepository
 
+        branch = data[len("pb:"):]
+
+        # 2026-04-28 step 1: Idempotency + cooldown.
+        # (a) Idempotency: если юзер уже клик'ал кнопку с таким branch'ом
+        #     ИЛИ продвинулся дальше по туру — current click это no-op.
+        #     "tap N times = 1 click" (по запросу юзера).
+        # (b) Cooldown 3s: даже если branch новый, не позволяем больше
+        #     1 успешного pb: callback per 3 секунды (защита от tap-flood
+        #     на edge cases типа aliases).
+        # Защищает от incident'a tg_1089832184 19:25 — 361 callback
+        # за 6 минут на одну и ту же кнопку pb:schedule.
+        from sreda.services import pending_bot as _pb_mod
+        if onboarding.tenant_id and onboarding.user_id:
+            try:
+                repo = UserProfileRepository(session)
+                cfg = repo.get_skill_config(
+                    onboarding.tenant_id, onboarding.user_id,
+                    "housewife_assistant",
+                )
+                if cfg is not None:
+                    params = UserProfileRepository.decode_skill_params(cfg)
+                    progress = params.get(WELCOME_V2_PROGRESS_KEY) or {}
+                    if isinstance(progress, dict):
+                        # (a) Idempotency by branch position
+                        last_branch = progress.get("last_branch")
+                        if last_branch and branch != last_branch:
+                            cur_idx = _pb_mod.branch_index(branch)
+                            last_idx = _pb_mod.branch_index(last_branch)
+                            # Если current ≤ last (повтор / откат на старую
+                            # кнопку) — drop. Известные branches только
+                            # (cur_idx == -1 — alias или unknown, пропускаем).
+                            if cur_idx >= 0 and last_idx >= 0 and cur_idx <= last_idx:
+                                logger.info(
+                                    "pb: idempotent skip tenant=%s branch=%s "
+                                    "last=%s (cur_idx=%d last_idx=%d)",
+                                    onboarding.tenant_id, branch, last_branch,
+                                    cur_idx, last_idx,
+                                )
+                                if callback_id:
+                                    try:
+                                        await telegram_client.answer_callback_query(
+                                            str(callback_id), text=""
+                                        )
+                                    except TelegramDeliveryError:
+                                        pass
+                                return
+                        elif last_branch and branch == last_branch:
+                            # Same branch tapped again — pure idempotent
+                            logger.info(
+                                "pb: idempotent skip (same branch) tenant=%s branch=%s",
+                                onboarding.tenant_id, branch,
+                            )
+                            if callback_id:
+                                try:
+                                    await telegram_client.answer_callback_query(
+                                        str(callback_id), text=""
+                                    )
+                                except TelegramDeliveryError:
+                                    pass
+                            return
+                        # (b) Cooldown 3s — fallback для случая когда
+                        # last_branch не помогает (напр. первый click)
+                        last_at_str = progress.get("last_at")
+                        if last_at_str:
+                            last_at = datetime.fromisoformat(last_at_str)
+                            elapsed = datetime.now(timezone.utc) - last_at
+                            if elapsed < timedelta(seconds=3):
+                                logger.info(
+                                    "pb: cooldown skip tenant=%s branch=%s elapsed=%.2fs",
+                                    onboarding.tenant_id, branch, elapsed.total_seconds(),
+                                )
+                                if callback_id:
+                                    try:
+                                        await telegram_client.answer_callback_query(
+                                            str(callback_id), text=""
+                                        )
+                                    except TelegramDeliveryError:
+                                        pass
+                                return
+            except Exception:  # noqa: BLE001
+                logger.exception("pb: cooldown/idempotency check failed (continuing)")
+
+        # 2026-04-28 step 2: answerCallbackQuery first — если 400
+        # (callback query expired, ~15 мин лимит Telegram'а), ВЫХОДИМ
+        # БЕЗ отправки следующего сообщения. Юзер уже не на той кнопке,
+        # и Telegram redeliver'ит этот update в loop пока answerCB не
+        # успешен. Single-attempt — без retry для callback'ов
+        # (TelegramClient уже не retry-ит 4xx).
         if callback_id:
             try:
                 await telegram_client.answer_callback_query(str(callback_id), text="")
             except TelegramDeliveryError as exc:
-                logger.warning("pb: callback ack failed: %s", exc)
-        branch = data[len("pb:"):]
+                if exc.status_code == 400:
+                    # Expired callback — drop entire request silently.
+                    logger.info(
+                        "pb: callback expired (400) tenant=%s branch=%s — drop",
+                        onboarding.tenant_id, branch,
+                    )
+                    return
+                # Other errors (network/5xx): log and continue (можем
+                # отправить сообщение даже если ack не прошёл).
+                logger.warning(
+                    "pb: callback ack failed status=%s: %s",
+                    exc.status_code, exc,
+                )
+
         if onboarding.chat_id:
-            # _handle_callback вызывается только для approved юзеров
-            # (pre-approve путь обрабатывается в telegram_webhook.py).
-            # Для финальной ветки `done` используем broadcast-flavour
-            # closing — без обещания «модератор одобрит», т.к. у
-            # broadcast-юзеров доступ уже есть.
             if branch == "done":
                 reply = pending_bot._DONE_BROADCAST
             else:
@@ -268,15 +368,15 @@ async def _handle_callback(
                     reply_markup=pending_bot.build_inline_keyboard(reply),
                 )
             except TelegramDeliveryError as exc:
+                # 429 — rate-limited, retries только усугубят. Просто
+                # log + drop. 403 — bot blocked. 400 — bad chat_id.
+                # Все 4xx — non-retryable.
                 logger.warning(
-                    "pb: branch '%s' delivery failed: %s",
-                    branch, exc,
+                    "pb: branch '%s' delivery failed status=%s: %s",
+                    branch, exc.status_code, exc,
                 )
-        # Трекаем прогресс welcome v2 тура. Best-effort: ошибки записи
-        # не должны убивать turn (юзер уже получил сообщение). Только
-        # для approved юзеров — pending-фаза трекинг не пишет, потому
-        # что у непрошедшего approval ещё нет ни tenant_id, ни user_id
-        # в state-machine смысле.
+
+        # Трекаем прогресс welcome v2 тура. Best-effort.
         if onboarding.tenant_id and onboarding.user_id:
             try:
                 record_pb_tour_progress(

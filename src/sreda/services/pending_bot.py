@@ -232,6 +232,24 @@ _BRANCHES: dict[str, PendingReply] = {
 }
 
 
+# Linear order of tour branches (used for idempotency check —
+# tap on an "older" branch button after user already advanced is a
+# no-op). Aliases (welcome / what / demo_morning / menu_example /
+# life) НЕ В ORDER — они map'ятся в intro сразу.
+BRANCH_ORDER: tuple[str, ...] = (
+    "intro", "voice", "schedule", "reminders", "checklists",
+    "shopping", "recipes", "family", "memory", "dont_do", "done",
+)
+
+
+def branch_index(branch: str) -> int:
+    """Linear position of branch in tour. -1 если неизвестен."""
+    try:
+        return BRANCH_ORDER.index(branch)
+    except ValueError:
+        return -1
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------

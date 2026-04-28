@@ -9,7 +9,23 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramDeliveryError(Exception):
-    pass
+    """Raised when Telegram API call fails after retries (or on non-retryable
+    4xx responses). ``status_code`` is set when the failure was an HTTP
+    status (400/403/429/etc.) — None for timeouts/network errors. ``method``
+    holds the API method name (sendMessage / answerCallbackQuery / ...)
+    for caller-side dispatch.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.method = method
+        self.status_code = status_code
 
 
 class TelegramClient:
@@ -135,20 +151,44 @@ class TelegramClient:
     ) -> dict:
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         last_error: Exception | None = None
+        last_status: int | None = None
         for attempt in range(1, 4):
             try:
                 async with httpx.AsyncClient(timeout=timeout, trust_env=True) as client:
                     response = await client.post(url, json=json, data=data, files=files)
                     response.raise_for_status()
                     return response.json()
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                last_status = exc.response.status_code
+                logger.warning(
+                    "Telegram request failed: method=%s attempt=%s status=%s error=%s",
+                    method, attempt, last_status, exc,
+                )
+                # 2026-04-28: 4xx — non-retryable. 400 (callback expired,
+                # bad request), 403 (bot blocked), 404 (chat not found),
+                # 429 (rate limit) — повторные попытки только усугубят
+                # rate-limit и не приведут к успеху. Failing fast убирает
+                # spam loops при tap-flood / истёкших callback'ах.
+                if 400 <= last_status < 500:
+                    raise TelegramDeliveryError(
+                        f"Telegram {method} non-retryable {last_status}",
+                        method=method,
+                        status_code=last_status,
+                    ) from exc
+                # 5xx — retryable, продолжаем
+                if attempt < 3:
+                    await asyncio.sleep(0.5 * attempt)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
                 logger.warning(
                     "Telegram request failed: method=%s attempt=%s error=%s",
-                    method,
-                    attempt,
-                    exc,
+                    method, attempt, exc,
                 )
                 if attempt < 3:
                     await asyncio.sleep(0.5 * attempt)
-        raise TelegramDeliveryError(f"Telegram request failed for {method}") from last_error
+        raise TelegramDeliveryError(
+            f"Telegram request failed for {method}",
+            method=method,
+            status_code=last_status,
+        ) from last_error
