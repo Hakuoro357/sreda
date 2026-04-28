@@ -161,6 +161,14 @@ class Recipe(Base):
     )
 
     servings: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # Общее время приготовления в минутах от начала до подачи на стол.
+    # 2026-04-28: одно поле, без раздельного prep/cook (расширим если
+    # понадобится). LLM при save_recipe оценивает по сложности рецепта;
+    # юзер может поправить через update tool. Nullable: legacy рецепты
+    # без значения, дозаполнятся при редактировании.
+    cooking_time_minutes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     # Nutrition estimates per SERVING (not per whole recipe). LLM fills
     # at save_recipe time; all nullable so legacy/partial data survives.
     # Accuracy: LLM text-generation level, ~±20% typical — good enough

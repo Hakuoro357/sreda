@@ -145,6 +145,7 @@ class HousewifeRecipeService:
         source: str = "user_dictated",
         source_url: str | None = None,
         tags: list[str] | None = None,
+        cooking_time_minutes: int | None = None,
         calories_per_serving: float | None = None,
         protein_per_serving: float | None = None,
         fat_per_serving: float | None = None,
@@ -201,6 +202,17 @@ class HousewifeRecipeService:
 
         normalised_ings = _normalise_ingredients(ingredients)
 
+        # cooking_time_minutes: cap to 1..600 (10 hours) — sanity limit
+        # на случай если LLM передаст что-то странное.
+        ctm: int | None = None
+        if cooking_time_minutes is not None:
+            try:
+                ctm_int = int(cooking_time_minutes)
+                if 1 <= ctm_int <= 600:
+                    ctm = ctm_int
+            except (ValueError, TypeError):
+                ctm = None
+
         recipe = Recipe(
             id=f"rec_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -209,6 +221,7 @@ class HousewifeRecipeService:
             description=None,
             instructions_md=(instructions_md or None),
             servings=servings,
+            cooking_time_minutes=ctm,
             calories_per_serving=_clean_nutrient(calories_per_serving),
             protein_per_serving=_clean_nutrient(protein_per_serving),
             fat_per_serving=_clean_nutrient(fat_per_serving),
@@ -325,6 +338,17 @@ class HousewifeRecipeService:
                 except (TypeError, ValueError):
                     tags_json = None
 
+            # cooking_time_minutes parsing (same logic as save_recipe).
+            ctm: int | None = None
+            raw_ctm = raw.get("cooking_time_minutes")
+            if raw_ctm is not None:
+                try:
+                    ctm_int = int(raw_ctm)
+                    if 1 <= ctm_int <= 600:
+                        ctm = ctm_int
+                except (ValueError, TypeError):
+                    ctm = None
+
             recipe = Recipe(
                 id=f"rec_{uuid4().hex[:24]}",
                 tenant_id=tenant_id,
@@ -333,6 +357,7 @@ class HousewifeRecipeService:
                 description=None,
                 instructions_md=(raw.get("instructions_md") or None),
                 servings=servings,
+                cooking_time_minutes=ctm,
                 calories_per_serving=_clean_nutrient(raw.get("calories_per_serving")),
                 protein_per_serving=_clean_nutrient(raw.get("protein_per_serving")),
                 fat_per_serving=_clean_nutrient(raw.get("fat_per_serving")),

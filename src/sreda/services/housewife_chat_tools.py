@@ -602,6 +602,7 @@ def build_housewife_tools(
         source: str,
         source_url: str | None = None,
         tags: ListOfStr = None,
+        cooking_time_minutes: int | None = None,
         calories_per_serving: float | None = None,
         protein_per_serving: float | None = None,
         fat_per_serving: float | None = None,
@@ -661,6 +662,12 @@ def build_housewife_tools(
             source_url: only set when source == "web_found" — the
                 origin URL.
             tags: optional short tags like ["суп", "быстрое", "завтрак"].
+            cooking_time_minutes: общее время приготовления (от начала
+                нарезки до подачи на стол) в МИНУТАХ. Один int, не два
+                поля prep+cook. Оценивай по сложности рецепта: салат
+                10-15, плов или борщ ~60-90, жаркое в духовке 90-120,
+                гуляш 120+. Cap 1..600. Можно None если совсем
+                непонятно — но старайся проставлять.
 
         Returns status string with the new recipe id.
         """
@@ -677,6 +684,7 @@ def build_housewife_tools(
                 source=source,
                 source_url=source_url,
                 tags=tags,
+                cooking_time_minutes=cooking_time_minutes,
                 calories_per_serving=calories_per_serving,
                 protein_per_serving=protein_per_serving,
                 fat_per_serving=fat_per_serving,
