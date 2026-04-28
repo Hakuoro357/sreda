@@ -2,10 +2,61 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-04-29: per-process httpx.AsyncClient pool keyed by bot token.
+# Воссоздание httpx.AsyncClient на каждый запрос требует нового TCP +
+# TLS handshake (~150-300мс через SOCKS5 egress). voice flow делает 4
+# Telegram-вызова подряд (sendMessage ack, getFile, download, sendMessage
+# reply) — это давало ~600-1200мс лишней латентности.
+#
+# Pool кэширует одного клиента на токен; httpx сам поддерживает
+# keep-alive в connection pool. На shutdown процесса OS закрывает FDs
+# (не lift'аем lifespan-hook ради этого, но при необходимости можно
+# вызвать close_pool()).
+#
+# Безопасность по event loop: pool — module-level dict, его держит ОДИН
+# процесс. uvicorn держит один loop; job_runner — отдельный процесс
+# (свой loop, свой dict). Cross-loop проблем нет.
+_CLIENT_POOL: dict[str, httpx.AsyncClient] = {}
+
+
+def _make_pool_client() -> httpx.AsyncClient:
+    """Build httpx.AsyncClient suitable for keep-alive Telegram traffic."""
+    return httpx.AsyncClient(
+        trust_env=True,
+        # Defaults; per-call timeout passed via .request(timeout=)
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        limits=httpx.Limits(
+            max_keepalive_connections=10,
+            max_connections=20,
+            keepalive_expiry=60.0,  # держим idle TCP до 60с
+        ),
+    )
+
+
+def _get_pool_client(token: str) -> httpx.AsyncClient:
+    """Lazy-init cached client per token."""
+    client = _CLIENT_POOL.get(token)
+    if client is None or client.is_closed:
+        client = _make_pool_client()
+        _CLIENT_POOL[token] = client
+    return client
+
+
+async def close_pool() -> None:
+    """Close all pooled clients. Best to call on graceful shutdown."""
+    for client in list(_CLIENT_POOL.values()):
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            logger.debug("close_pool: aclose failed (ignored)", exc_info=True)
+    _CLIENT_POOL.clear()
 
 
 class TelegramDeliveryError(Exception):
@@ -110,11 +161,11 @@ class TelegramClient:
     async def download_file(self, file_path: str) -> bytes:
         """Download a file from Telegram CDN by file_path."""
         url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        client = _get_pool_client(self.token)
         try:
-            async with httpx.AsyncClient(timeout=15.0, trust_env=True) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                return response.content
+            response = await client.get(url, timeout=15.0)
+            response.raise_for_status()
+            return response.content
         except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
             raise TelegramDeliveryError(f"Failed to download file: {file_path}") from exc
 
@@ -150,14 +201,16 @@ class TelegramClient:
         files: dict | None = None,
     ) -> dict:
         url = f"https://api.telegram.org/bot{self.token}/{method}"
+        client = _get_pool_client(self.token)
         last_error: Exception | None = None
         last_status: int | None = None
         for attempt in range(1, 4):
             try:
-                async with httpx.AsyncClient(timeout=timeout, trust_env=True) as client:
-                    response = await client.post(url, json=json, data=data, files=files)
-                    response.raise_for_status()
-                    return response.json()
+                response = await client.post(
+                    url, json=json, data=data, files=files, timeout=timeout,
+                )
+                response.raise_for_status()
+                return response.json()
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 last_status = exc.response.status_code

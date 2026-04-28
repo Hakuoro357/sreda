@@ -16,9 +16,7 @@
 </article>
 {% endif %}
 
-<form method="post" action="/admin/llm?token={{ token }}" style="max-width: 720px;">
-  <input type="hidden" name="token" value="{{ token }}">
-
+<form method="post" action="/admin/llm" style="max-width: 720px;">
   <div style="display: grid; grid-template-columns: 180px 1fr; gap: 16px 20px; align-items: center; margin-bottom: 20px;">
     <label for="primary"><strong>Primary</strong></label>
     <select name="primary" id="primary">
@@ -48,7 +46,7 @@
 </form>
 
 <h3 style="margin-top: 32px;">Баланс и лимиты
-  <a href="/admin/llm?token={{ token }}&refresh=1"
+  <a href="/admin/llm?refresh=1"
      style="font-size: 12px; font-weight: normal; margin-left: 12px;">
     обновить
   </a>

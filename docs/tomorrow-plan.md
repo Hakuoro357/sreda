@@ -10,6 +10,85 @@ YYYY-MM-DD` и переносим в нижнюю секцию. В начало 
 
 ---
 
+## 0. Hot-fix'ы после cloud-migration (2026-04-29)
+
+После переезда на VDS 62.113.41.104 (Phase 1-8 done 2026-04-28) видны
+два косяка из реальной эксплуатации:
+
+### 0.1 Погода/web_search не работает на VDS
+
+**Симптом.** Юзер: «какая завтра погода в Сходне». Сейчас два пути
+оба сломаны:
+1. `wttr.in` через `fetch_url` — отдаёт **только текущую**, не прогноз.
+2. `web_search` через DuckDuckGo (Bing backend) — `ConnectError` от
+   `bing.com/search` (RU IP блокирует / RKN, не идёт через текущий
+   NO_PROXY либо не туда роутится).
+
+**Лог 2026-04-28 23:46 (МСК):**
+```
+WARNING sreda.services.web_search_tool web_search failed for
+'погода Сходня завтра': ConnectError: bing.com/search
+```
+
+**Что сделать (выбрать ОДНО, обсудить):**
+- **A.** Переключить web_search backend с DDG/Bing на что-то более
+  стабильное от RU egress (Yandex Search API? OpenAI Responses
+  search? Brave Search API?). Bing с RU блок'ит часто.
+- **B.** Заменить fetch_url(wttr.in) на API Яндекс.Погоды (есть
+  бесплатный тариф 50 запросов/сутки, прогноз на 7 дней) — direct
+  call without web_search detour.
+- **C.** Маршрутизировать web_search через SOCKS5 (как Telegram /
+  Groq) — добавить Bing в proxy-routes.
+
+**Файлы:** `src/sreda/services/web_search_tool.py`,
+`src/sreda/services/fetch_url_tool.py`, `src/sreda/runtime/handlers.py`
+(если меняем provider).
+
+**Acceptance.** Реальный запрос «прогноз погоды на завтра в [город]»
+→ корректный ответ с температурой / осадками на нужную дату.
+
+### 0.2 Таймзона в логах
+
+**Симптом.** Логи на VDS пишутся в UTC (`2026-04-28 20:47:43`), хотя
+для дебага удобнее MSK. На Mac mini было локальное (тоже не идеально
+для distributed setup, но удобнее в моменте).
+
+**Что сделать.** Установить системную TZ на VDS либо явно указать в
+logging formatter:
+
+```python
+# src/sreda/logging_config.py (или там где configure_logging)
+import time
+logging.Formatter.converter = time.localtime  # или явно pytz Moscow
+```
+
+Альтернатива системная: `sudo timedatectl set-timezone Europe/Moscow`
+(но это сменит TZ для всего что пишет журналы — postgres, cron'ы и
+т.п. — на 1 ноду тоже норм).
+
+**Решение какое выбираем — обсудить.** Я склоняюсь к ISO timestamp
++ суффикс TZ (`2026-04-29T01:47:43+03:00`) — однозначно и при
+любой ноде понятно. Но ломает грепы по «20:47», поэтому уточнить.
+
+**Acceptance.** `tail /var/log/sreda/uvicorn.log` показывает MSK
+(или явный TZ-суффикс), та же запись в трейсе и в админке /admin/logs.
+
+### 0.3 Pre-existing FK bug (carry-over)
+
+**Симптом (был до VDS-миграции).** Webhook `tenant_tg_1089832184` →
+500 на insert outbox: `FOREIGN KEY constraint failed`,
+`user_id='user_tg_[phone]'` — какой-то PII-маскировщик `[phone]`
+подменяет 10-цифровой ID в data path вместо log path.
+
+**Файлы для расследования.** Любая sanitizer-функция применяемая к
+user_id перед insert. Вероятно `src/sreda/services/sanitize.py` или
+runtime/handlers.py при сборке payload outbox_messages.
+
+**Acceptance.** Тенант с 10-цифровым telegram_id (например 1089832184)
+получает корректный outbox без FK-violation.
+
+---
+
 ## 1. Доработка онбординга
 
 **Что входит.**

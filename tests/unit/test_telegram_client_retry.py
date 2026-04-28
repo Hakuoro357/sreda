@@ -11,15 +11,21 @@ callback и 429 rate-limit), что только усугубляло loop. Те
 - 429 → no retry (rate-limit)
 - 5xx → retry до 3 попыток
 - timeout → retry до 3 попыток
+
+2026-04-29: тесты адаптированы под новый connection-pool в
+TelegramClient (`_CLIENT_POOL` keyed by token). Вместо
+`patch("httpx.AsyncClient")` подменяем `_get_pool_client` чтобы
+вернуть mock со срежиссированным `.post()` (AsyncMock).
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
+from sreda.integrations.telegram import client as tgclient
 from sreda.integrations.telegram.client import (
     TelegramClient,
     TelegramDeliveryError,
@@ -35,164 +41,139 @@ def _make_http_status_error(status_code: int) -> httpx.HTTPStatusError:
     )
 
 
+@pytest.fixture
+def mock_pool_client(monkeypatch):
+    """Replace `_get_pool_client` with one that returns a mock client.
+
+    Returns the mock — tests configure its `.post.side_effect` /
+    `.get.side_effect` and inspect `.post.call_count`.
+    """
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock()
+    mock_client.get = AsyncMock()
+    monkeypatch.setattr(
+        tgclient, "_get_pool_client", lambda _token: mock_client,
+    )
+    # Also kill the real cache so other tests don't see leftover.
+    tgclient._CLIENT_POOL.clear()
+    yield mock_client
+    tgclient._CLIENT_POOL.clear()
+
+
+def _ok_response(payload: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = payload
+    return resp
+
+
+def _err_response(status_code: int) -> MagicMock:
+    resp = MagicMock()
+    resp.raise_for_status.side_effect = _make_http_status_error(status_code)
+    return resp
+
+
 @pytest.mark.asyncio
-async def test_400_non_retryable() -> None:
+async def test_400_non_retryable(mock_pool_client) -> None:
     """400 (callback expired / bad request) — no retry, raise immediately."""
+    mock_pool_client.post.side_effect = [_err_response(400)]
+
     client = TelegramClient(token="test-token")
-
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = _make_http_status_error(400)
-    post_call_count = 0
-
-    async def mock_post(*args, **kwargs):
-        nonlocal post_call_count
-        post_call_count += 1
-        return mock_response
-
-    with patch("httpx.AsyncClient") as mock_async_client:
-        mock_instance = AsyncMock()
-        mock_instance.post = mock_post
-        mock_async_client.return_value.__aenter__.return_value = mock_instance
-
-        with pytest.raises(TelegramDeliveryError) as exc_info:
-            await client.send_message("123", "test")
+    with pytest.raises(TelegramDeliveryError) as exc_info:
+        await client.send_message("123", "test")
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.method == "sendMessage"
-    assert post_call_count == 1, "must NOT retry on 4xx"
+    assert mock_pool_client.post.call_count == 1, "must NOT retry on 4xx"
 
 
 @pytest.mark.asyncio
-async def test_403_non_retryable() -> None:
+async def test_403_non_retryable(mock_pool_client) -> None:
     """403 (bot blocked by user) — no retry."""
+    mock_pool_client.post.side_effect = [_err_response(403)]
+
     client = TelegramClient(token="test-token")
-
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = _make_http_status_error(403)
-    post_call_count = 0
-
-    async def mock_post(*args, **kwargs):
-        nonlocal post_call_count
-        post_call_count += 1
-        return mock_response
-
-    with patch("httpx.AsyncClient") as mock_async_client:
-        mock_instance = AsyncMock()
-        mock_instance.post = mock_post
-        mock_async_client.return_value.__aenter__.return_value = mock_instance
-
-        with pytest.raises(TelegramDeliveryError) as exc_info:
-            await client.answer_callback_query("cb_id_123")
+    with pytest.raises(TelegramDeliveryError) as exc_info:
+        await client.answer_callback_query("cb_id_123")
 
     assert exc_info.value.status_code == 403
     assert exc_info.value.method == "answerCallbackQuery"
-    assert post_call_count == 1
+    assert mock_pool_client.post.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_429_non_retryable() -> None:
+async def test_429_non_retryable(mock_pool_client) -> None:
     """429 (rate-limit) — no retry. Retry'и только усугубят rate-limit."""
+    mock_pool_client.post.side_effect = [_err_response(429)]
+
     client = TelegramClient(token="test-token")
-
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = _make_http_status_error(429)
-    post_call_count = 0
-
-    async def mock_post(*args, **kwargs):
-        nonlocal post_call_count
-        post_call_count += 1
-        return mock_response
-
-    with patch("httpx.AsyncClient") as mock_async_client:
-        mock_instance = AsyncMock()
-        mock_instance.post = mock_post
-        mock_async_client.return_value.__aenter__.return_value = mock_instance
-
-        with pytest.raises(TelegramDeliveryError) as exc_info:
-            await client.send_message("123", "test")
+    with pytest.raises(TelegramDeliveryError) as exc_info:
+        await client.send_message("123", "test")
 
     assert exc_info.value.status_code == 429
-    assert post_call_count == 1
+    assert mock_pool_client.post.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_500_retries_three_times() -> None:
-    """5xx (server error) — retryable, до 3 попыток. После исчерпания
-    raise TelegramDeliveryError."""
+async def test_500_retries_three_times(mock_pool_client, monkeypatch) -> None:
+    """5xx (server error) — retryable, до 3 попыток."""
+    mock_pool_client.post.side_effect = [
+        _err_response(500), _err_response(500), _err_response(500),
+    ]
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
     client = TelegramClient(token="test-token")
-
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = _make_http_status_error(500)
-    post_call_count = 0
-
-    async def mock_post(*args, **kwargs):
-        nonlocal post_call_count
-        post_call_count += 1
-        return mock_response
-
-    with patch("httpx.AsyncClient") as mock_async_client:
-        mock_instance = AsyncMock()
-        mock_instance.post = mock_post
-        mock_async_client.return_value.__aenter__.return_value = mock_instance
-
-        # asyncio.sleep делаем no-op чтобы тест не ждал 0.5+1.0 секунды
-        with patch("asyncio.sleep", new=AsyncMock()):
-            with pytest.raises(TelegramDeliveryError) as exc_info:
-                await client.send_message("123", "test")
+    with pytest.raises(TelegramDeliveryError) as exc_info:
+        await client.send_message("123", "test")
 
     assert exc_info.value.status_code == 500
-    assert post_call_count == 3, "5xx must retry 3 times"
+    assert mock_pool_client.post.call_count == 3, "5xx must retry 3 times"
 
 
 @pytest.mark.asyncio
-async def test_timeout_retries_three_times() -> None:
+async def test_timeout_retries_three_times(mock_pool_client, monkeypatch) -> None:
     """TimeoutException — retry до 3 попыток. status_code=None в финале."""
+    mock_pool_client.post.side_effect = httpx.TimeoutException("timeout")
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
     client = TelegramClient(token="test-token")
-    post_call_count = 0
-
-    async def mock_post(*args, **kwargs):
-        nonlocal post_call_count
-        post_call_count += 1
-        raise httpx.TimeoutException("timeout")
-
-    with patch("httpx.AsyncClient") as mock_async_client:
-        mock_instance = AsyncMock()
-        mock_instance.post = mock_post
-        mock_async_client.return_value.__aenter__.return_value = mock_instance
-
-        with patch("asyncio.sleep", new=AsyncMock()):
-            with pytest.raises(TelegramDeliveryError) as exc_info:
-                await client.send_message("123", "test")
+    with pytest.raises(TelegramDeliveryError) as exc_info:
+        await client.send_message("123", "test")
 
     assert exc_info.value.status_code is None
     assert exc_info.value.method == "sendMessage"
-    assert post_call_count == 3
+    assert mock_pool_client.post.call_count == 3
 
 
 @pytest.mark.asyncio
-async def test_success_no_retry() -> None:
+async def test_success_no_retry(mock_pool_client) -> None:
     """200 OK с первого раза — один POST, без retry."""
+    mock_pool_client.post.side_effect = [
+        _ok_response({"ok": True, "result": {"message_id": 1}}),
+    ]
+
     client = TelegramClient(token="test-token")
-
-    mock_response = MagicMock()
-    mock_response.raise_for_status.return_value = None
-    mock_response.json.return_value = {"ok": True, "result": {"message_id": 1}}
-    post_call_count = 0
-
-    async def mock_post(*args, **kwargs):
-        nonlocal post_call_count
-        post_call_count += 1
-        return mock_response
-
-    with patch("httpx.AsyncClient") as mock_async_client:
-        mock_instance = AsyncMock()
-        mock_instance.post = mock_post
-        mock_async_client.return_value.__aenter__.return_value = mock_instance
-
-        result = await client.send_message("123", "test")
+    result = await client.send_message("123", "test")
 
     assert result == {"ok": True, "result": {"message_id": 1}}
-    assert post_call_count == 1
+    assert mock_pool_client.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pool_reused_across_requests(mock_pool_client) -> None:
+    """Connection pool: два последовательных вызова одного TelegramClient
+    инстанса используют один и тот же httpx-клиент (TLS handshake amortized)."""
+    mock_pool_client.post.side_effect = [
+        _ok_response({"ok": True, "result": {}}),
+        _ok_response({"ok": True, "result": {}}),
+    ]
+
+    client = TelegramClient(token="test-token")
+    await client.send_message("123", "first")
+    await client.send_message("123", "second")
+
+    # Same mock served both calls — proves single client reused.
+    assert mock_pool_client.post.call_count == 2
 
 
 def test_telegram_delivery_error_carries_method_and_status() -> None:

@@ -60,7 +60,7 @@
 <nav>
   <ul>
     {% if data.page > 1 %}
-    <li><a href="/admin/llm-calls?tenant_id={{ data.rows[0].id[:0] }}{{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page - 1 }}&token={{ token }}">← Назад</a></li>
+    <li><a href="/admin/llm-calls?tenant_id={{ data.rows[0].id[:0] }}{{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page - 1 }}">← Назад</a></li>
     {% else %}
     <li><span class="muted">← Назад</span></li>
     {% endif %}
@@ -68,7 +68,7 @@
     <li><span class="muted">{{ data.page }} / {{ data.total_pages }}</span></li>
 
     {% if data.page < data.total_pages %}
-    <li><a href="/admin/llm-calls?tenant_id={{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page + 1 }}&token={{ token }}">Вперёд →</a></li>
+    <li><a href="/admin/llm-calls?tenant_id={{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page + 1 }}">Вперёд →</a></li>
     {% else %}
     <li><span class="muted">Вперёд →</span></li>
     {% endif %}
@@ -76,5 +76,5 @@
 </nav>
 {% endif %}
 
-<p><a href="/admin/budget?token={{ token }}">← Вернуться к бюджету</a></p>
+<p><a href="/admin/budget">← Вернуться к бюджету</a></p>
 {% endblock %}

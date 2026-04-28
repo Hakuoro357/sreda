@@ -4,7 +4,6 @@
 <h2>Логи</h2>
 
 <form method="get" action="/admin/logs" style="margin-bottom: 16px; display: flex; gap: 12px; align-items: end; flex-wrap: wrap;">
-  <input type="hidden" name="token" value="{{ token }}">
   <div>
     <label for="file" style="display: block; font-size: 12px; color: var(--pico-muted-color);">Файл</label>
     <select name="file" id="file" style="min-width: 260px;">
@@ -31,29 +30,29 @@
 
 <div style="margin: -8px 0 16px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
   <span style="font-size: 12px; color: var(--pico-muted-color);">Быстрые фильтры:</span>
-  <a href="/admin/logs?token={{ token }}&file={{ selected_key or '' }}&tail={{ tail }}&grep=CHAT_EMPTY_REPLY"
+  <a href="/admin/logs?file={{ selected_key or '' }}&tail={{ tail }}&grep=CHAT_EMPTY_REPLY"
      class="secondary outline" role="button"
      style="padding: 4px 10px; font-size: 12px; text-decoration: none;"
      title="Случаи, когда пользователь получил «...» вместо ответа">
     Пустые ответы (CHAT_EMPTY_REPLY)
   </a>
-  <a href="/admin/logs?token={{ token }}&file={{ selected_key or '' }}&tail={{ tail }}&grep=CHAT_TURN_TIMEOUT"
+  <a href="/admin/logs?file={{ selected_key or '' }}&tail={{ tail }}&grep=CHAT_TURN_TIMEOUT"
      class="secondary outline" role="button"
      style="padding: 4px 10px; font-size: 12px; text-decoration: none;"
      title="Turns которые превысили 90с — аборт, пользователь получил сообщение о таймауте">
     Зависшие turns (CHAT_TURN_TIMEOUT)
   </a>
-  <a href="/admin/logs?token={{ token }}&file={{ selected_key or '' }}&tail={{ tail }}&grep=ERROR"
+  <a href="/admin/logs?file={{ selected_key or '' }}&tail={{ tail }}&grep=ERROR"
      class="secondary outline" role="button"
      style="padding: 4px 10px; font-size: 12px; text-decoration: none;">
     ERROR
   </a>
-  <a href="/admin/logs?token={{ token }}&file={{ selected_key or '' }}&tail={{ tail }}&grep=WARNING"
+  <a href="/admin/logs?file={{ selected_key or '' }}&tail={{ tail }}&grep=WARNING"
      class="secondary outline" role="button"
      style="padding: 4px 10px; font-size: 12px; text-decoration: none;">
     WARNING
   </a>
-  <a href="/admin/logs?token={{ token }}&file={{ selected_key or '' }}&tail={{ tail }}&grep=miniapp%20auth"
+  <a href="/admin/logs?file={{ selected_key or '' }}&tail={{ tail }}&grep=miniapp%20auth"
      class="secondary outline" role="button"
      style="padding: 4px 10px; font-size: 12px; text-decoration: none;">
     miniapp auth

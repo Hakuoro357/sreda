@@ -54,7 +54,7 @@
       <td>{{ "{:,}".format(r.total_tokens) }}</td>
       <td><span class="muted">{{ r.period_start }} → {{ r.period_end }}</span></td>
       <td>
-        <a href="/admin/llm-calls?tenant_id={{ r.tenant_id }}&feature_key={{ r.feature_key }}&token={{ token }}" role="button" class="outline" style="padding: 4px 10px; font-size: 12px;">
+        <a href="/admin/llm-calls?tenant_id={{ r.tenant_id }}&feature_key={{ r.feature_key }}" role="button" class="outline" style="padding: 4px 10px; font-size: 12px;">
           Детали
         </a>
       </td>
