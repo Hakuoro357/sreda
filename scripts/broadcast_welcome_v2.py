@@ -57,7 +57,7 @@ logger = logging.getLogger("broadcast_welcome_v2")
 # (Telegram не рендерит). Опечатку «famaly» → «family» юзер сам
 # подтвердил оставить как есть.
 _BORIS_TEXT = (
-    "Привет. Это Борис. Мини тест на friends&famaly показал что "
+    "Привет. Это Борис. Мини тест на friends&family показал что "
     "многим не очень понятно что такое Среда и как ее можно "
     "использовать. Я приготовил несколько приветственных сообщений "
     "в которых Среда рассказывает что она такое."
@@ -75,10 +75,15 @@ def _log(msg: str) -> None:
 
 
 def _list_targets(
-    session: Session, *, only: str | None
+    session: Session, *, only: str | None, exclude: set[str]
 ) -> list[tuple[str, str, str]]:
     """Returns list of (tenant_id, user_id, telegram_account_id_decrypted)
-    для всех approved тенантов (или одного, если --only)."""
+    для всех approved тенантов.
+
+    Filtering:
+    * ``only`` — оставить только этот telegram_account_id (приоритет над exclude).
+    * ``exclude`` — выкинуть эти telegram_account_id'ы из выдачи.
+    """
     rows: list[tuple[str, str, str]] = []
     q = (
         session.query(Tenant, User)
@@ -91,7 +96,10 @@ def _list_targets(
         chat_id = (user.telegram_account_id or "").strip()
         if not chat_id:
             continue
-        if only is not None and chat_id != only:
+        if only is not None:
+            if chat_id != only:
+                continue
+        elif chat_id in exclude:
             continue
         rows.append((tenant.id, user.id, chat_id))
     return rows
@@ -110,37 +118,44 @@ async def _send_intro(client: TelegramClient, chat_id: str) -> None:
     )
 
 
-async def _broadcast_one(
+async def _send_boris_phase(
     client: TelegramClient,
-    chat_id: str,
+    targets: list[tuple[str, str, str]],
     *,
-    boris: bool,
-    intro: bool,
-    sleep_seconds: int,
     dry_run: bool,
 ) -> None:
-    if boris:
+    """Send Boris-message to ALL targets first (broadcast pattern)."""
+    for _, _, chat_id in targets:
         if dry_run:
             _log(f"[dry-run] would send Boris → chat_id={chat_id}")
-        else:
-            try:
-                await _send_boris(client, chat_id)
-                _log(f"sent Boris → chat_id={chat_id}")
-            except TelegramDeliveryError as exc:
-                _log(f"FAILED Boris → chat_id={chat_id}: {exc}")
-                return
-    if boris and intro and not dry_run and sleep_seconds > 0:
-        _log(f"sleeping {sleep_seconds}s before INTRO for chat_id={chat_id}")
-        await asyncio.sleep(sleep_seconds)
-    if intro:
+            continue
+        try:
+            await _send_boris(client, chat_id)
+            _log(f"sent Boris → chat_id={chat_id}")
+        except TelegramDeliveryError as exc:
+            _log(f"FAILED Boris → chat_id={chat_id}: {exc}")
+        # Telegram throttle safety: 30 msg/sec global для бота, но
+        # per-chat безопасно ~1 msg/sec. Берём 0.5s — все 8 уйдут за 4 сек.
+        await asyncio.sleep(0.5)
+
+
+async def _send_intro_phase(
+    client: TelegramClient,
+    targets: list[tuple[str, str, str]],
+    *,
+    dry_run: bool,
+) -> None:
+    """Send INTRO-message to ALL targets (broadcast pattern)."""
+    for _, _, chat_id in targets:
         if dry_run:
             _log(f"[dry-run] would send INTRO → chat_id={chat_id}")
-        else:
-            try:
-                await _send_intro(client, chat_id)
-                _log(f"sent INTRO → chat_id={chat_id}")
-            except TelegramDeliveryError as exc:
-                _log(f"FAILED INTRO → chat_id={chat_id}: {exc}")
+            continue
+        try:
+            await _send_intro(client, chat_id)
+            _log(f"sent INTRO → chat_id={chat_id}")
+        except TelegramDeliveryError as exc:
+            _log(f"FAILED INTRO → chat_id={chat_id}: {exc}")
+        await asyncio.sleep(0.5)
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -155,7 +170,8 @@ async def _run(args: argparse.Namespace) -> int:
     session_gen = get_db_session()
     session = next(session_gen)
     try:
-        targets = _list_targets(session, only=args.only)
+        exclude_set = {x.strip() for x in (args.exclude or "").split(",") if x.strip()}
+        targets = _list_targets(session, only=args.only, exclude=exclude_set)
     finally:
         try:
             next(session_gen)
@@ -188,15 +204,19 @@ async def _run(args: argparse.Namespace) -> int:
 
     sleep_seconds = 0 if args.no_sleep else args.sleep_seconds
 
-    for _, _, chat_id in targets:
-        await _broadcast_one(
-            client,
-            chat_id,
-            boris=boris,
-            intro=intro,
-            sleep_seconds=sleep_seconds,
-            dry_run=args.dry_run,
-        )
+    # Phase 1: Boris всем сразу.
+    if boris:
+        await _send_boris_phase(client, targets, dry_run=args.dry_run)
+
+    # Phase 2: пауза между Boris и INTRO. ВСЕ юзеры получат INTRO
+    # примерно одновременно (~3 минуты после Boris у всех).
+    if boris and intro and not args.dry_run and sleep_seconds > 0:
+        _log(f"sleeping {sleep_seconds}s before INTRO phase")
+        await asyncio.sleep(sleep_seconds)
+
+    # Phase 3: INTRO всем сразу.
+    if intro:
+        await _send_intro_phase(client, targets, dry_run=args.dry_run)
 
     return 0
 
@@ -206,6 +226,10 @@ def main() -> int:
     parser.add_argument(
         "--only", default=None,
         help="отправить только этому telegram_account_id (рекомендуется для теста)",
+    )
+    parser.add_argument(
+        "--exclude", default=None,
+        help="CSV telegram_account_id'ов, которым НЕ слать (полезно для уже протестированных)",
     )
     parser.add_argument(
         "--boris-only", action="store_true",
