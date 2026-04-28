@@ -17,6 +17,7 @@ from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 from sreda.workers.onboarding_aha_worker import OnboardingAhaWorker
 from sreda.workers.outbox_delivery import OutboxDeliveryWorker
 from sreda.workers.proactive_events import ProactiveEventWorker
+from sreda.workers.retention_worker import RetentionWorker
 from sreda.workers.skill_platform_processor import SkillPlatformJobProcessor
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,10 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         housewife_onboarding = HousewifeOnboardingKickoffWorker(session)
         onboarding_aha = OnboardingAhaWorker(session)
         delivery = OutboxDeliveryWorker(session, telegram_client=telegram_client)
+        # Retention worker — внутренне throttle'ит до 1 раза в 24 часа,
+        # state в /tmp/sreda-retention-state.json. На каждом tick
+        # просто проверяет «пора ли». 152-ФЗ Часть 2.
+        retention = RetentionWorker(session)
 
         # Order matters: proactive & housewife workers fill outbox →
         # delivery drains it within the same tick.
@@ -51,6 +56,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         onboarding_processed = await housewife_onboarding.process_pending(limit=limit)
         aha_processed = await onboarding_aha.process_pending(limit=limit)
         delivery_processed = await delivery.process_pending_messages(limit=limit)
+        retention_processed = await retention.process_pending()
         return (
             runtime_processed
             + verification_processed
@@ -60,6 +66,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             + onboarding_processed
             + aha_processed
             + delivery_processed
+            + retention_processed
         )
     finally:
         session.close()
