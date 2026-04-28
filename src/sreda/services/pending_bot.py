@@ -192,6 +192,23 @@ _DONE = PendingReply(
 )
 
 
+# 2026-04-28: Closing для broadcast-рассылки existing approved юзерам.
+# Оригинальный `_DONE` обещает «модератор одобрит твой доступ — я
+# напишу» — это для новых /start юзеров в pending-фазе. Приближает
+# доступ. Существующим юзерам, у которых approve уже есть, такая
+# фраза вводит в замешательство («модератор? я же давно работаю»).
+# Используется в `telegram_bot._handle_callback` для approved юзеров —
+# tour может пройти только approved (pre-approve `pb:done` обрабатывается
+# в `telegram_webhook.py` и шлёт оригинальный `_DONE`).
+_DONE_BROADCAST = PendingReply(
+    text=(
+        "На этом всё, что хотела рассказать про себя.\n\n"
+        "Если что-то нужно — пиши или говори голосом, как удобно. Я тут."
+    ),
+    buttons=(),
+)
+
+
 _BRANCHES: dict[str, PendingReply] = {
     "intro": _INTRO,
     "voice": _VOICE,

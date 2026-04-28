@@ -252,7 +252,15 @@ async def _handle_callback(
                 logger.warning("pb: callback ack failed: %s", exc)
         branch = data[len("pb:"):]
         if onboarding.chat_id:
-            reply = pending_bot.match(data, is_callback=True)
+            # _handle_callback вызывается только для approved юзеров
+            # (pre-approve путь обрабатывается в telegram_webhook.py).
+            # Для финальной ветки `done` используем broadcast-flavour
+            # closing — без обещания «модератор одобрит», т.к. у
+            # broadcast-юзеров доступ уже есть.
+            if branch == "done":
+                reply = pending_bot._DONE_BROADCAST
+            else:
+                reply = pending_bot.match(data, is_callback=True)
             try:
                 await telegram_client.send_message(
                     chat_id=onboarding.chat_id,
