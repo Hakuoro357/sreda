@@ -171,7 +171,68 @@ today = _dt.now(ZoneInfo(tz_name)).date()
 
 ---
 
-### 0.6 Pre-existing FK bug (carry-over)
+### 0.6 Fire-and-forget ack всё равно ощущается медленным
+
+**Симптом.** 2026-04-29 ~01:30 МСК. После деплоя fire-and-forget
+(commit `0737119`) trace показывает `voice.download` стартует на 4ms
+параллельно с ack — но юзер по ощущениям не видит ускорения, ack
+всё равно «приходит поздно».
+
+**Trace подтверждает деплой:**
+```
+0ms webhook.received type=voice
+0ms ack.sent [304ms] phrase=Посмотрю
+4ms voice.download [716ms]
+```
+Технически `ack` и `voice.download` стартуют одновременно. Но user
+perception ≠ trace timing.
+
+**Гипотезы корня:**
+1. **Telegram delivery ordering.** Telegram сервер может ставить ack
+   message в очередь чата ПОСЛЕ longer-running operations того же
+   chat'а. Нужно проверить timestamp в самом Telegram (когда юзер
+   видит сообщение) vs когда мы вернули sendMessage.
+2. **Connection pool warming.** Первый sendMessage после рестарта
+   uvicorn делает TLS handshake (~150-300мс через SOCKS5). После —
+   keepalive. Если ack — первый запрос, он stalls dependent voice.
+   Pool prewarm на startup мог бы помочь.
+3. **TCP head-of-line blocking** на shared connection — ack и
+   download делят connection из pool. Если ack задерживается на
+   server side, download стримит на ту же connection и ждёт.
+4. **Async scheduling**. `asyncio.create_task` не гарантирует что
+   coroutine стартует немедленно — event loop может промедлить.
+   Передавать через `loop.call_soon` / `eager_task_factory` могло
+   бы стартовать ack synchronously до return.
+
+**Что сделать.**
+- Добавить trace.step с реальным wall-clock при отправке ack:
+  `ack.posted_at` (когда наш sendMessage вернул 200) vs
+  `ack.network_visible_at` (когда поллинг увидел свой message_id).
+- Замерить ack delivery time в Telegram client side (проверить через
+  message_id sequence — если ack message_id < reply message_id,
+  Telegram посылает ack первым).
+- Если корень — pool warming, добавить prewarm на uvicorn startup
+  (ping `getMe` через все pool connections).
+- Если корень — call ordering, попробовать `asyncio.shield` +
+  явный `await asyncio.sleep(0)` для немедленного yield.
+- Если корень — Telegram chat queue ordering, добиться невозможно
+  на стороне клиента; стратегия — посылать ack БЫСТРЕЕ через
+  separate-channel (например через bot's getUpdates emulation —
+  не реализовать).
+
+**Acceptance.** Юзер видит ack «Посмотрю/Сейчас» в течение 1 секунды
+после отправки голосового, при том что full reply ещё crunch'ится.
+Метрика — wall-clock от user_send_voice до ack_visible_in_chat
+< 1500ms.
+
+**Файлы:**
+- `src/sreda/api/routes/telegram_webhook.py` — trace доплнения
+- `src/sreda/integrations/telegram/client.py` — pool prewarm
+- Возможно `src/sreda/main.py` (FastAPI lifespan startup hook)
+
+---
+
+### 0.7 Pre-existing FK bug (carry-over)
 
 **Симптом (был до VDS-миграции).** Webhook `tenant_tg_1089832184` →
 500 на insert outbox: `FOREIGN KEY constraint failed`,
