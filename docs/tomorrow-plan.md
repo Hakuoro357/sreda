@@ -728,6 +728,50 @@ Daily 09:00 AM – 5:00 PM PDT
 
 ## Сделанное (архив)
 
+### ✅ DONE 2026-04-28
+
+**152-ФЗ Часть 2 (compliance + encryption):**
+- **Phase 1** Migration 0029 — зашифрованы 6 колонок (729 rows на проде):
+  `outbox_messages.payload_json`, `inbound_messages.message_text_sanitized`,
+  `tenants.name`, `tenant_user_profiles.display_name`,
+  `inbound_events.payload_json`, `jobs.payload_json`. AES-256-GCM v2.
+- **Phase 2** RetentionWorker — wired в job_runner с 24h throttle.
+  Live проверен: удалил 131 устаревшую строку при первом прогоне.
+- **Phase 3** Migration 0030 — таблица `audit_log` + реальная реализация
+  `audit_event()`. Wired в `admin_tenant_approve` / `admin_tenant_reset`.
+- **Phase 5** Migration 0031 — колонка `privacy_policy_accepted_at`
+  (без UX impact, для будущего сайта).
+- **Phase 7** Migration 0032 — `recipes.cooking_time_minutes` (single
+  int, общее время от начала до подачи). LLM-tool обновлён.
+- Backup snapshots: `pre-part2-20260428-1203.db` (5.75 MB),
+  `pre-migration-0029-123624.db`, `pre-migrations-0030-0032-130034.db`
+  в `/Users/boris/sreda-backup/`.
+- ⏭️ Phase 4 (self-service delete) отложен — admin reset работает.
+
+**Онбординг + рассылка:**
+- Sanitizer `_extract_short_name` для display_name — защита от LLM-фраз
+  типа «Пользователя зовут Борис.» в имени. 3 испорченных значения
+  на проде вручную исправлены (Борис / Повелитель / Шеф).
+- Webhook routing для `pb:<branch>` callbacks от approved юзеров
+  (broadcast tour работает).
+- Tracking welcome_v2_progress в `skill_params_json` + emoji-индикатор
+  в `/admin/users` (🟡 in_progress, ✅ completed).
+- Broadcast рассылка приветственной цепочки на всех 9 одобренных
+  юзеров: Boris-сообщение + INTRO с кнопкой через 3 минуты, 8/8
+  успешно за phase-pattern (broadcast не sequential).
+- Отдельный `_DONE_BROADCAST` closing для approved юзеров (без
+  упоминания «модератор одобрит» — у них доступ уже есть).
+
+**Brand + UX:**
+- **п.7.1** Адреса → ссылка на Яндекс Навигатор в LLM-prompt.
+- **п.7.2** Среда ВСЕГДА в женском роде (правило усилено с примерами
+  правильного/запрещённого, тесты в `test_anti_stalker_tone.py`).
+
+**MiMo тарифы:**
+- **п.11** Новые ставки Сяоми: V2.5-Pro 2x flat, V2.5 1x flat
+  (убран 4x tier для контекста ≥256k). Off-peak 20% discount
+  в окне 16:00–24:00 UTC (19:00–03:00 MSK). 19 unit-тестов.
+
 ### ✅ DONE 2026-04-25
 
 - **Полный GTM plan** (`docs/gtm-plan.md`): ICP, УТП, каналы, мехника
