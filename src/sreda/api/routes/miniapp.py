@@ -1405,3 +1405,62 @@ def list_checklists_endpoint(
         })
     return {"checklists": out}
 
+
+@router.post("/api/v1/checklist/items/{item_id}/toggle")
+def toggle_checklist_item_endpoint(
+    item_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Toggle pending ↔ done для пункта чек-листа из Mini App.
+
+    Pre-2026-04-28 поведение: галочки были read-only (пункты ставит
+    голос). Юзеры жаловались — тапали и ничего не происходит.
+    Теперь tap → toggle через этот endpoint.
+
+    Семантика:
+    * pending → done (отметили сделанным)
+    * done → pending (передумали, undo)
+    * cancelled → нельзя toggle (юзер сам сказал «удали этот пункт»,
+      возврат через UI запрещён, можно только голосом)
+
+    Security: проверяем что пункт принадлежит чек-листу tenant+user.
+    """
+    from sreda.db.models.checklists import Checklist, ChecklistItem
+    from sreda.services.checklists import ChecklistService
+
+    # Ownership check: item → checklist → tenant/user.
+    item = (
+        session.query(ChecklistItem)
+        .join(Checklist, ChecklistItem.checklist_id == Checklist.id)
+        .filter(
+            ChecklistItem.id == item_id,
+            Checklist.tenant_id == ctx.tenant_id,
+            Checklist.user_id == ctx.user_id,
+        )
+        .one_or_none()
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="item_not_found")
+
+    svc = ChecklistService(session)
+    if item.status == "pending":
+        updated = svc.mark_done(item_id=item_id)
+        new_status = "done"
+    elif item.status == "done":
+        updated = svc.undo_done(item_id=item_id)
+        new_status = "pending"
+    else:
+        # cancelled — не позволяем toggle через UI
+        raise HTTPException(
+            status_code=409,
+            detail="cancelled_items_cannot_be_toggled",
+        )
+
+    if updated is None:
+        # race / concurrent delete
+        raise HTTPException(status_code=404, detail="item_not_found")
+
+    return {"ok": True, "status": new_status}
+
+

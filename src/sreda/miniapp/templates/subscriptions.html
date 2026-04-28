@@ -908,7 +908,9 @@
   }
 
   // --- Screen: Checklists (#/checklists) ---
-  // Read-only в MVP: пункты ставит / снимает голос (LLM tools).
+  // 2026-04-28: галочки кликабельные — tap toggle через
+  // POST /miniapp/api/v1/checklist/items/{id}/toggle. Голос тоже
+  // продолжает работать (mark_checklist_item_done tool).
   // Каждый именованный список рендерим как раскрывающийся блок с
   // галочками ☐/☑. Done-пункты с strikethrough.
   function renderChecklists() {
@@ -926,11 +928,13 @@
     if (lists.length === 0) {
       html += '<div class="empty-state">';
       html += 'Пока дел нет.<br><br>';
-      html += 'Скажи мне голосом или текстом: «запиши план кроя на эту неделю: ' +
-              'лаванда 298 простыня 141 на 200, шампань 202 на 204, …» — ' +
-              'я создам именованный список дел с пунктами.<br><br>';
-      html += 'Дела удобны для пунктов БЕЗ конкретных дат, по которым ' +
-              'нужно отметить «сделано». Если нужно событие на дату — ' +
+      html += 'Скажи мне голосом или текстом, например: ' +
+              '«сборы в отпуск: купальники, кремы, аптечка, документы, ' +
+              'зарядки» — я создам именованный список дел с пунктами.<br><br>';
+      html += 'Подходит для генеральной уборки, сборов в школу/садик, ' +
+              'дел перед приёмом гостей, рутинных проверок дома — ' +
+              'всё что не привязано к конкретной дате, но нужно ' +
+              'отмечать как сделанное. Если нужно событие на дату — ' +
               'это в Расписании.';
       html += '</div>';
       return html;
@@ -962,9 +966,16 @@
         var textStyle = isDone
           ? 'text-decoration:line-through;opacity:0.55'
           : (isCancelled ? 'opacity:0.45;color:var(--tg-theme-hint-color,#999)' : '');
-        html += '<div style="display:flex;gap:10px;padding:6px 0;align-items:flex-start">';
-        html += '<div style="font-size:18px;line-height:1.2;flex-shrink:0">' + mark + '</div>';
-        html += '<div style="flex:1;' + textStyle + '">' + escHtml(it.title) + '</div>';
+        var rowStyle = 'display:flex;gap:10px;padding:6px 0;align-items:flex-start';
+        if (!isCancelled) {
+          rowStyle += ';cursor:pointer';
+          html += '<div style="' + rowStyle + '" ' +
+                  'onclick="window._toggleChecklistItem(this, \'' + it.id + '\')">';
+        } else {
+          html += '<div style="' + rowStyle + '">';
+        }
+        html += '<div class="cl-mark" style="font-size:18px;line-height:1.2;flex-shrink:0;min-width:20px">' + mark + '</div>';
+        html += '<div class="cl-text" style="flex:1;' + textStyle + '">' + escHtml(it.title) + '</div>';
         html += '</div>';
       }
       html += '</div>';
@@ -972,12 +983,61 @@
     }
 
     html += '<div class="card-subtitle" style="text-align:center;margin-top:16px;padding:0 8px;line-height:1.4">';
-    html += 'Чтобы добавить или отметить пункт — скажи мне голосом ' +
-            '(«закройила лаванду», «добавь в план кроя X»). ' +
-            'Архивировать список — «закрой план кроя».';
+    html += 'Тапни галочку — отметится как сделанное. Тап ещё раз — снимется. ' +
+            'Голосом тоже работает: «купила сахар», «убери из списка X».';
     html += '</div>';
     return html;
   }
+
+  // 2026-04-28: tap-toggle pending ↔ done через POST API.
+  // Optimistic UI: галочка меняется СРАЗУ, потом запрос. На ошибке —
+  // откат. Юзеры жаловались что галочки не реагируют — фикс.
+  window._toggleChecklistItem = function(rowEl, itemId) {
+    var markEl = rowEl.querySelector('.cl-mark');
+    var textEl = rowEl.querySelector('.cl-text');
+    if (!markEl || !textEl) return;
+
+    var DONE_MARK = '☑';  // checked box
+    var TODO_MARK = '☐';  // empty box
+    var wasDone = markEl.textContent === DONE_MARK;
+    var newMark = wasDone ? TODO_MARK : DONE_MARK;
+    var newTextStyle = wasDone
+      ? 'flex:1;'
+      : 'flex:1;text-decoration:line-through;opacity:0.55';
+
+    // Optimistic UI flip
+    markEl.textContent = newMark;
+    textEl.setAttribute('style', newTextStyle);
+
+    // Telegram haptic feedback
+    try {
+      if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.HapticFeedback) {
+        window.Telegram.WebApp.HapticFeedback.impactOccurred('light');
+      }
+    } catch (_e) { /* noop */ }
+
+    apiFetch("/miniapp/api/v1/checklist/items/" + itemId + "/toggle", {
+      method: "POST",
+    }).then(function(res) {
+      if (!res || res.ok !== true) {
+        markEl.textContent = wasDone ? DONE_MARK : TODO_MARK;
+        textEl.setAttribute('style', wasDone
+          ? 'flex:1;text-decoration:line-through;opacity:0.55'
+          : 'flex:1;');
+        return;
+      }
+      // Refresh — счётчики pending/done на <summary> обновятся.
+      state.checklists = null;
+      if ((location.hash || '') === '#/checklists') {
+        render();
+      }
+    }).catch(function(_err) {
+      markEl.textContent = wasDone ? DONE_MARK : TODO_MARK;
+      textEl.setAttribute('style', wasDone
+        ? 'flex:1;text-decoration:line-through;opacity:0.55'
+        : 'flex:1;');
+    });
+  };
 
   // --- Screen: Family (#/family) ---
   var _FAMILY_ROLE_LABELS = {

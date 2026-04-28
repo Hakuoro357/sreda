@@ -726,6 +726,92 @@ Daily 09:00 AM – 5:00 PM PDT
 
 ---
 
+## 12. DeepSeek-V4-Flash vs MiMo-V2.5 — сравнение (2026-04-28)
+
+**Контекст.** MiMo тормозит (наблюдаем 130+ сек на больших промптах,
+turn aborted на 120s outer timeout). Сегодня случай tg_634496616 —
+voice → 131с латентность LLM. Тарифы Сяоми обновили в этот же день,
+возможно ребалансируют upstream.
+
+**Текущая стоимость MiMo-V2.5:**
+- $0.08 / 1M токенов (из переписки с юзером)
+- 1x rate (после изменений)
+- 20% off-peak в 16:00–24:00 UTC
+
+**Что сравнить с DeepSeek-V4-Flash на OpenRouter:**
+
+1. **Цена:**
+   - На openrouter.ai/models — посмотреть актуальный price per 1M
+     prompt + 1M completion (могут отличаться)
+   - Сравнить с MiMo $0.08/1M (если у MiMo тоже отдельные prompt/comp
+     ставки — пересчитать)
+
+2. **Latency:**
+   - Прогнать одинаковый prompt (~20k tokens, ~400 completion) через
+     оба провайдера N=20 раз. Замерить mean / p50 / p95.
+   - Учесть geographic latency: MiMo (Сингапур) vs OpenRouter
+     (зависит от endpoint региона)
+
+3. **Качество (housewife use cases):**
+   - Прогнать на наборе 10–20 реальных turns из логов:
+     - голос «расписание клиросного пения ПН/ЧТ» → правильность
+       расшифровки + RRULE генерации
+     - текст «составь меню на неделю» → 21 cell корректно
+     - «у меня есть полкурицы и картошка» → подходящий рецепт
+     - tool-call accuracy: правильно ли вызывает tools
+   - Subjective scoring 1–5 по каждому ответу
+
+4. **Tool-calling совместимость:**
+   - DeepSeek-V4 поддерживает structured output / function calling
+     через OpenRouter? (проверить — некоторые модели OpenRouter не
+     поддерживают tools)
+   - Тестовый turn с `add_task` tool — выполнит?
+
+5. **Context window:**
+   - MiMo 256k+ (мы используем ~21k стабильно)
+   - DeepSeek-V4-Flash — какое окно?
+
+**Decision criteria:**
+- Если DeepSeek дешевле + сравнимое качество + tool-calling работает →
+  переключить housewife на DeepSeek (только этот скил, остальные
+  на MiMo пока)
+- Если дороже но быстрее на >2x → можно как fallback при MiMo timeout
+- Если одинаково по всем параметрам → оставить MiMo
+
+**Реализация (если решим переключать):**
+- Запись в `LLMRouter`: новый provider option `deepseek_openrouter`
+- Тарификация в `credit_formula.py` — добавить ставку для
+  `deepseek-v4-flash`
+- Smoke-тест на одном тестовом аккаунте перед массовым переключением
+
+**Оценка:** ~2–3 часа (прогнать N=20 turns × 2 модели + субъективная
+оценка + расчёт economics).
+
+---
+
+## 13. Дубль в add_checklist_items + move-task-to-checklist
+
+**Контекст (2026-04-28).** tg_634496616 попросил «перенеси «забрать
+с дачи» из расписания в дела». Бот сделал `delete_task` +
+`add_checklist_items` → итог: пункт оказался в чек-листе ДВАЖДЫ
+(юзер потом отдельно сказал «удали дубль»). Похоже add_checklist_items
+не делает dedup по title в том же списке.
+
+**Что нужно:**
+1. В `services/checklists.py::add_items` — проверять есть ли уже
+   пункт с таким title (case-insensitive, whitespace-collapsed) в этом
+   же списке. Если есть → пропускать (как `save_recipes_batch`
+   делает с рецептами).
+2. Возможно отдельный tool `move_task_to_checklist(task_id, list_id)`
+   который инкапсулирует delete + add+dedup в одну операцию (LLM
+   станет точнее не повторяя dedup-логику).
+
+**Тесты:** add_items с дублем → возвращает существующий, не плодит.
+
+**Оценка:** ~30 минут (мелкая правка + 2 теста).
+
+---
+
 ## Сделанное (архив)
 
 ### ✅ DONE 2026-04-28
