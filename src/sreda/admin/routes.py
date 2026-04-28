@@ -451,6 +451,23 @@ def admin_tenant_reset(
         tenant_id=tenant_id
     ).delete()
 
+    # 152-ФЗ Часть 2: audit log admin reset action до финального commit'а,
+    # чтобы запись попала в одну транзакцию с deletes.
+    from sreda.services.audit import audit_event, hash_admin_token
+
+    audit_event(
+        session,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        action="admin.tenant.reset",
+        resource_type="tenant",
+        resource_id=tenant_id,
+        metadata={
+            "deleted_counts": {k: v for k, v in d.items() if v > 0},
+        },
+        commit=False,
+    )
+
     session.commit()
 
     parts = [f"{k}={v}" for k, v in d.items() if v > 0]
@@ -559,6 +576,21 @@ async def admin_tenant_approve(
                 grant_status = "renewed_30d"
         else:
             grant_status = "no_plan_in_db"
+
+    # 152-ФЗ Часть 2: audit admin approve action.
+    if was_pending:
+        from sreda.services.audit import audit_event, hash_admin_token
+
+        audit_event(
+            session,
+            actor_type="admin",
+            actor_id=hash_admin_token(token),
+            action="admin.tenant.approve",
+            resource_type="tenant",
+            resource_id=tenant_id,
+            metadata={"grant_status": grant_status},
+            commit=False,
+        )
 
     session.commit()
 
