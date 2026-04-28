@@ -139,7 +139,12 @@ class Settings(BaseSettings):
     # network-bound parts of job handlers (Telegram send, EDS adapter
     # verification, etc.) so a hung upstream cannot pin a job in
     # ``running`` forever.
-    job_max_runtime_seconds: float = 120.0
+    # 2026-04-28: bumped 120 → 240 to accomodate slow MiMo turns where
+    # LLM may take 100+s on prompt 21k + completion 400+. Inner
+    # CHAT_TURN_TIMEOUT_SECONDS = 180 — outer must be larger so the
+    # handler-level timeout (with tool-summary rescue) fires before
+    # this one (which produces a generic "отменено по таймауту").
+    job_max_runtime_seconds: float = 240.0
 
     # Worker loop tick. Default 1s — alarm-style UX for reminders needs
     # worst-case latency under ~1s (user-perceivable jitter). Cost is a

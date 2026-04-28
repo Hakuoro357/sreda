@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # via cooperative check at the top of each tool-loop iteration. Module
 # constant (not function-local) so tests and admin tooling can import
 # the same value. See ``execute_conversation_chat`` for usage.
-CHAT_TURN_TIMEOUT_SECONDS = 90
+CHAT_TURN_TIMEOUT_SECONDS = 180
 
 
 @dataclass(frozen=True, slots=True)
@@ -1871,6 +1871,12 @@ def execute_conversation_chat(
     # (see ``detect_unbacked_claim``). Populated below inside the
     # tool-execution block.
     called_tools: set[str] = set()
+    # 2026-04-28: track successful tool execution counts for timeout-
+    # rescue summary. If turn aborts after tools already wrote to DB,
+    # we surface a short "что успела сделать" message instead of generic
+    # «не успел обдумать» — иначе юзер не знает что задачи реально
+    # созданы (incident с tg_634496616 13:27 MSK).
+    successful_tool_counts: dict[str, int] = {}
     # Guard so the anti-hallucination nudge runs at most once per turn
     # — two consecutive empty iterations would otherwise spiral.
     _hallucination_nudged = False
@@ -1970,10 +1976,16 @@ def execute_conversation_chat(
             except Exception as exc:  # noqa: BLE001
                 logger.exception("tool %s failed", name)
                 result = f"error:{type(exc).__name__}"
-            if name in _ONBOARDING_RESOLUTION_TOOLS and str(result).startswith("ok:"):
+            result_str = str(result)
+            if name in _ONBOARDING_RESOLUTION_TOOLS and result_str.startswith("ok:"):
                 _onboarding_resolution_called = True
             if name:
                 called_tools.add(name)
+                # Считаем только успешные вызовы — для timeout-rescue
+                # summary показываем что РЕАЛЬНО сделали в БД. Errors не
+                # стоит обещать юзеру.
+                if result_str.startswith("ok") or result_str.startswith("saved"):
+                    successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
             messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
     else:
         # Budget exhausted while still calling tools. Force ONE final
@@ -2087,12 +2099,17 @@ def execute_conversation_chat(
         if _turn_timed_out:
             # Don't double-log — the CHAT_TURN_TIMEOUT warning was
             # already emitted at the break point with elapsed time.
-            # Just give the user a concrete error message rather than
-            # the generic "..." so they know to retry.
-            text = (
-                "Не успел обдумать за отведённое время. "
-                "Попробуй спросить проще или повторить через минуту."
-            )
+            # 2026-04-28: если в этом turn'е УСПЕШНО выполнились
+            # некоторые tools — выдаём summary что было сделано вместо
+            # generic «не успел обдумать». Иначе юзер думает что
+            # ничего не работает, а на самом деле задачи в БД.
+            if successful_tool_counts:
+                text = _format_timeout_summary(successful_tool_counts)
+            else:
+                text = (
+                    "Не успел(а) обдумать за отведённое время. "
+                    "Попробуй спросить проще или повторить через минуту."
+                )
         else:
             logger.warning(
                 "CHAT_EMPTY_REPLY tenant=%s user=%s feature=%s ai_msgs=%d "
@@ -2182,6 +2199,94 @@ _CJK_PATTERN = re.compile(
 )
 _MD_BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _MD_UNDERLINE_PATTERN = re.compile(r"__(.+?)__", re.DOTALL)
+
+
+# Mapping tool name → пользовательский домен (на русском). Используется
+# в timeout-rescue summary, чтобы вместо «не успел обдумать» сказать
+# «расписание + 2 задачи» если LLM успел вызвать tools до timeout'а.
+# 2026-04-28 incident: tg_634496616 → клиросное пение, LLM думал 131s,
+# turn aborted, юзер увидел «отменено» хотя add_task × 2 уже в БД.
+_TOOL_TO_DOMAIN: dict[str, str] = {
+    # Расписание / задачи
+    "add_task": "расписание",
+    "complete_task": "расписание",
+    "cancel_task": "расписание",
+    "delete_task": "расписание",
+    "update_task": "расписание",
+    "attach_reminder": "расписание",
+    # Список покупок
+    "add_shopping_items": "список покупок",
+    "remove_shopping_items": "список покупок",
+    "mark_shopping_bought": "список покупок",
+    "update_shopping_item": "список покупок",
+    "update_shopping_items_category": "список покупок",
+    "clear_shopping_list": "список покупок",
+    # Рецепты
+    "save_recipe": "рецепты",
+    "save_recipes_batch": "рецепты",
+    "delete_recipe": "рецепты",
+    # Меню
+    "plan_week_menu": "меню",
+    "update_menu_item": "меню",
+    "generate_shopping_from_menu": "список покупок",
+    # Чек-листы
+    "create_checklist": "чек-лист",
+    "add_checklist_items": "чек-лист",
+    "mark_checklist_item_done": "чек-лист",
+    "delete_checklist_item": "чек-лист",
+    "archive_checklist": "чек-лист",
+    # Семья
+    "add_family_member": "семья",
+    "add_family_members": "семья",
+    "update_family_member": "семья",
+    "remove_family_member": "семья",
+    # Напоминания
+    "schedule_reminder": "напоминания",
+    "cancel_reminder": "напоминания",
+    # Память
+    "save_core_fact": "память",
+    "save_episode": "память",
+    # Профиль
+    "update_profile_field": "профиль",
+}
+
+
+def _format_timeout_summary(tool_counts: dict[str, int]) -> str:
+    """Сформировать короткое сообщение о том ЧТО было сделано когда
+    turn оборвался по таймауту.
+
+    Группирует tool вызовы по доменам, считает сколько успехов в каждом.
+    Возвращает текст в духе:
+        «Успела добавить (расписание × 2). Открой Mini App, чтобы
+        увидеть. Извини за задержку — ответ запоздал.»
+    """
+    domain_totals: dict[str, int] = {}
+    for tool_name, count in tool_counts.items():
+        domain = _TOOL_TO_DOMAIN.get(tool_name)
+        if domain is None:
+            continue  # неизвестный tool — пропускаем (не показываем юзеру)
+        domain_totals[domain] = domain_totals.get(domain, 0) + count
+
+    if not domain_totals:
+        # Все вызванные tools не в нашем mapping'е (новый tool
+        # без domain). Generic.
+        return (
+            "Что-то успела сделать в этом ходе, но не успела сформулировать "
+            "ответ. Открой Mini App, чтобы увидеть. Извини за задержку."
+        )
+
+    # Сортируем по убыванию count для читаемости
+    parts = sorted(
+        domain_totals.items(), key=lambda x: (-x[1], x[0])
+    )
+    summary = ", ".join(
+        f"{domain} × {count}" if count > 1 else domain
+        for domain, count in parts
+    )
+    return (
+        f"Успела сделать ({summary}). Открой Mini App, чтобы увидеть. "
+        "Извини за задержку — ответ запоздал."
+    )
 
 
 def _sanitize_chat_reply(text: str) -> tuple[str, dict[str, int]]:
