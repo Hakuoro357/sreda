@@ -233,6 +233,37 @@ async def _handle_callback(
         )
         return
 
+    # Pending-bot tour callbacks (`pb:<branch>`). 2026-04-28: эти кнопки
+    # используются ДВАЖДЫ. (1) В pending-фазе (до approve) — обрабатываются
+    # в `telegram_webhook.py` ДО approval-gate. (2) После approve, во
+    # время одноразовой broadcast-рассылки (`scripts/broadcast_welcome_v2.py`),
+    # юзер уже approved, но получает intro-сообщение и тапает кнопки —
+    # callback идёт сюда. В обоих случаях логика та же: матчим branch
+    # через `pending_bot.match()`, отправляем следующее сообщение цепочки.
+    # Ничего не идёт в LLM, никаких tool-call'ов, чистый scripted-flow.
+    if data.startswith("pb:"):
+        from sreda.services import pending_bot
+
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(str(callback_id), text="")
+            except TelegramDeliveryError as exc:
+                logger.warning("pb: callback ack failed: %s", exc)
+        if onboarding.chat_id:
+            reply = pending_bot.match(data, is_callback=True)
+            try:
+                await telegram_client.send_message(
+                    chat_id=onboarding.chat_id,
+                    text=reply.text,
+                    reply_markup=pending_bot.build_inline_keyboard(reply),
+                )
+            except TelegramDeliveryError as exc:
+                logger.warning(
+                    "pb: branch '%s' delivery failed: %s",
+                    data[len("pb:"):], exc,
+                )
+        return
+
     # Inline-кнопки (Часть 0 плана v2). LLM в прошлом turn'е положил
     # в БД токены для 2-4 кнопок; payload у них = "btn_reply:<token>".
     # Достаём label по токену, подставляем как message.text и дальше —
