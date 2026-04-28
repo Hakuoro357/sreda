@@ -36,6 +36,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
+from sreda.db.types import EncryptedString
 
 
 def _utcnow() -> datetime:
@@ -65,7 +66,9 @@ class InboundEvent(Base):
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     # Dedup key, unique per feature. For EDS: hash of claim_id + change_type.
     external_event_key: Mapped[str] = mapped_column(String(128))
-    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 152-ФЗ Часть 2: skill event payload может содержать PII
+    # (claim details, расписание, диагнозы). Шифруется.
+    payload_json: Mapped[str] = mapped_column(EncryptedString(), default="{}")
 
     # Skill-assigned relevance (0..1). Skills with clear domain rules
     # write it directly; when the LLM-classifier path is enabled later,

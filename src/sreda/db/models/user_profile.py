@@ -50,7 +50,9 @@ class TenantUserProfile(Base):
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
 
-    display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 152-ФЗ Часть 2: display_name содержит имя обращения юзера
+    # («Борис», «Шеф») — PII. Шифруется через EncryptedString.
+    display_name: Mapped[str | None] = mapped_column(EncryptedString(), nullable=True)
     # Form of address chosen during onboarding: "ty" | "vy" | None.
     # NULL = ещё не выбрано (юзер не прошёл шаг 2 онбординга);
     # LLM/ack-фразы fallback'ат на нейтральную форму.

@@ -11,7 +11,10 @@ class Tenant(Base):
     __tablename__ = "tenants"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    name: Mapped[str] = mapped_column(String(255))
+    # 152-ФЗ Часть 2 (2026-04-28): tenant.name содержит Telegram
+    # first/last name юзера — это PII. Шифруется через EncryptedString;
+    # в дампе БД лежит base64-шифр. ORM прозрачно расшифровывает на read.
+    name: Mapped[str] = mapped_column(EncryptedString())
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -82,7 +85,9 @@ class Job(Base):
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
     job_type: Mapped[str] = mapped_column(String(100), index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
-    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 152-ФЗ Часть 2: payload_json может содержать task title / args
+    # с PII. Шифруется через EncryptedString.
+    payload_json: Mapped[str] = mapped_column(EncryptedString(), default="{}")
     # Required for retention cleanup (spec 41). Indexed because the cleanup
     # job filters by ``status IN (...) AND created_at < cutoff``.
     created_at: Mapped[datetime] = mapped_column(
@@ -100,7 +105,9 @@ class OutboxMessage(Base):
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
     channel_type: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
-    payload_json: Mapped[str] = mapped_column(Text)
+    # 152-ФЗ Часть 2: payload_json содержит сгенерированный LLM текст
+    # ответа бота — это контент переписки. Шифруется EncryptedString.
+    payload_json: Mapped[str] = mapped_column(EncryptedString())
     # Required for retention cleanup (spec 41): 30 days for sent,
     # 60 days for failed — all keyed off creation time since we don't
     # store a separate ``sent_at`` yet.
@@ -174,7 +181,11 @@ class InboundMessage(Base):
     bot_key: Mapped[str] = mapped_column(String(64), index=True)
     external_update_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     sender_chat_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    message_text_sanitized: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 152-ФЗ Часть 2: содержит входящие сообщения юзера (после
+    # privacy_guard санитизации). Это контент переписки → шифруем.
+    message_text_sanitized: Mapped[str | None] = mapped_column(
+        EncryptedString(), nullable=True
+    )
     contains_sensitive_data: Mapped[bool] = mapped_column(Boolean, default=False)
     secure_record_id: Mapped[str | None] = mapped_column(
         ForeignKey("secure_records.id"), nullable=True, index=True
