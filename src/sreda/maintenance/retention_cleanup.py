@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, or_, select, union_all
 from sqlalchemy.orm import Session
 
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
@@ -237,33 +237,30 @@ def cleanup_runtime_retention(
     # Если кто-то ещё ссылается — secure_record нужен (parent живой),
     # его TTL обнуляется.
     eds_cutoff = now - timedelta(days=EDS_CONNECT_PAYLOAD_DAYS)
-    referenced_ids = (
-        select(ConnectSession.secure_record_id)
-        .where(ConnectSession.secure_record_id.isnot(None))
-        .union_all(
-            select(TenantEDSAccount.secure_record_id)
-            .where(TenantEDSAccount.secure_record_id.isnot(None))
-        )
-        .union_all(
-            select(InboundMessage.secure_record_id)
-            .where(InboundMessage.secure_record_id.isnot(None))
-        )
-        .union_all(
-            select(TenantSkillConfig.secure_record_id)
-            .where(TenantSkillConfig.secure_record_id.isnot(None))
-        )
-        .union_all(
-            select(SkillRun.input_secure_record_id)
-            .where(SkillRun.input_secure_record_id.isnot(None))
-        )
-        .union_all(
-            select(SkillRun.output_secure_record_id)
-            .where(SkillRun.output_secure_record_id.isnot(None))
-        )
-        .union_all(
-            select(SkillRunAttempt.raw_artifact_secure_record_id)
-            .where(SkillRunAttempt.raw_artifact_secure_record_id.isnot(None))
-        )
+    # union_all через function-form (SQLAlchemy 2.x): chained .union_all
+    # на Select возвращает CompoundSelect у которого нет своего .union_all.
+    referenced_ids = union_all(
+        select(ConnectSession.secure_record_id).where(
+            ConnectSession.secure_record_id.isnot(None)
+        ),
+        select(TenantEDSAccount.secure_record_id).where(
+            TenantEDSAccount.secure_record_id.isnot(None)
+        ),
+        select(InboundMessage.secure_record_id).where(
+            InboundMessage.secure_record_id.isnot(None)
+        ),
+        select(TenantSkillConfig.secure_record_id).where(
+            TenantSkillConfig.secure_record_id.isnot(None)
+        ),
+        select(SkillRun.input_secure_record_id).where(
+            SkillRun.input_secure_record_id.isnot(None)
+        ),
+        select(SkillRun.output_secure_record_id).where(
+            SkillRun.output_secure_record_id.isnot(None)
+        ),
+        select(SkillRunAttempt.raw_artifact_secure_record_id).where(
+            SkillRunAttempt.raw_artifact_secure_record_id.isnot(None)
+        ),
     )
     result.secure_records_eds_connect_payload = _delete_returning_count(
         session,
