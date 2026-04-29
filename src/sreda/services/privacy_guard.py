@@ -148,7 +148,15 @@ _RULES: list[tuple[re.Pattern[str], Any]] = [
         _replace_full("email", "[email]"),
     ),
     (
-        re.compile(r"\+?\d[\d\s()\-]{8,}\d"),
+        # 2026-04-29 (incident user_tg_1089832184): boundary lookbehind/
+        # lookahead против match'а внутри structural ID'ов вида
+        # `user_tg_1089832184` / `tenant_tg_1089832184`. Раньше regex без
+        # boundary'ев матчил 10-значное окно внутри ID и заменял на
+        # [phone] → ломал FK при insert outbox (`user_id='user_tg_[phone]'`
+        # — отсутствует в users). `\b` стандартно не срабатывает между
+        # `_` и `\d` т.к. оба — `\w`. Меняем на explicit `(?<!\w)/(?!\w)`
+        # чтобы любой `\w` (в т.ч. underscore) blocked match.
+        re.compile(r"(?<!\w)\+?\d[\d\s()\-]{8,}\d(?!\w)"),
         _replace_full("phone", "[phone]"),
     ),
     (
@@ -156,7 +164,10 @@ _RULES: list[tuple[re.Pattern[str], Any]] = [
         lambda match, entities: _replace_url(match, entities),
     ),
     (
-        re.compile(r"\b\d{10,}\b"),
+        # Аналогично — explicit boundary вместо `\b` чтобы underscore
+        # тоже считался разделителем (структурные ID типа
+        # `tg_352612382` не должны трактоваться как «number»).
+        re.compile(r"(?<!\w)\d{10,}(?!\w)"),
         _replace_full("number", "[number]"),
     ),
     # 2026-04-27 (152-ФЗ обезличивание Часть 1): спец-категория ст. 10
