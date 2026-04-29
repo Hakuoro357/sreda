@@ -145,7 +145,17 @@
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     }).then(function(r) {
       if (r.status === 401) {
-        state.error = "Сессия истекла. Закройте и откройте подписки заново.";
+        // 2026-04-29: убрали слово «подписки» (Mini App теперь
+        // general-purpose — Дела/Покупки/Расписание etc).
+        // Action-instruction для юзера: показываем как починить
+        // (Telegram кэширует initData при открытии приложения, в
+        // пределах TTL 24ч; tap по кнопке меню Telegram-чата
+        // генерирует свежий initData).
+        state.error = (
+          "Сессия истекла. Закрой приложение и открой заново — " +
+          "тапни кнопку «Приложение» под полем ввода в чате с ботом, " +
+          "или открой через меню Telegram-чата."
+        );
         render();
         throw new Error("auth_expired");
       }

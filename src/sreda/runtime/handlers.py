@@ -1366,7 +1366,10 @@ def _truncate_turn_text(text: str, *, budget: int = _CHAT_HISTORY_TEXT_BUDGET_CH
 # pinned at INFO in configure_logging, so entries survive WARNING-
 # level app config.
 _LLM_LOGGER = logging.getLogger("sreda.llm")
-_LLM_PREVIEW_CHARS = 400
+# 2026-04-29: previously _LLM_PREVIEW_CHARS=400 для logging text/last
+# preview'ов в `_log_llm_request/response`. Удалено — 152-ФЗ требует
+# не оставлять пользовательский контент в логах. Теперь логируем
+# только metadata (chars/role/tools).
 
 
 def _load_chat_history(
@@ -1456,24 +1459,29 @@ def _log_llm_invoke(
     ``llm.invoke`` — we log a compact summary (count + type-per-entry +
     preview of last message) so logs stay readable but we can still
     eyeball history drift."""
+    # 2026-04-29 (152-ФЗ): не логируем содержимое сообщений. Только
+    # метаданные — counts по ролям, длина последнего, его роль. Этого
+    # хватает для дебага истории/контекста (юзер пишет N сообщений,
+    # last_chars показывает рост контекста по итерациям) без утечки
+    # PII и контента бесед в logs/backups/object-storage.
     counts: dict[str, int] = {}
-    last_content = ""
+    last_chars = 0
+    last_role = "?"
     for msg in messages:
         role = type(msg).__name__.replace("Message", "").lower() or "?"
         counts[role] = counts.get(role, 0) + 1
         content = getattr(msg, "content", "") or ""
         if content:
-            last_content = str(content)
-    preview = last_content[:_LLM_PREVIEW_CHARS]
-    if len(last_content) > _LLM_PREVIEW_CHARS:
-        preview += "…"
+            last_chars = len(str(content))
+            last_role = role
     _LLM_LOGGER.info(
-        "invoke tenant=%s feature=%s iter=%d msgs=%s last=%r",
+        "invoke tenant=%s feature=%s iter=%d msgs=%s last_chars=%d last_role=%s",
         tenant_id,
         feature_key,
         iteration,
         counts,
-        preview,
+        last_chars,
+        last_role,
     )
 
 
@@ -1486,21 +1494,21 @@ def _log_llm_response(
     prompt_tokens: int,
     completion_tokens: int,
 ) -> None:
+    # 2026-04-29 (152-ФЗ): не логируем text ответа. Tools + длина —
+    # достаточно для дебага «бот молчит / галлюцинирует» (см.
+    # detect_unbacked_claim'а) без утечки контента.
     content = str(getattr(ai_msg, "content", "") or "")
-    preview = content[:_LLM_PREVIEW_CHARS]
-    if len(content) > _LLM_PREVIEW_CHARS:
-        preview += "…"
     tool_calls = getattr(ai_msg, "tool_calls", None) or []
     tool_names = [tc.get("name") for tc in tool_calls]
     _LLM_LOGGER.info(
-        "response tenant=%s feature=%s iter=%d tokens=%d/%d tools=%s text=%r",
+        "response tenant=%s feature=%s iter=%d tokens=%d/%d tools=%s chars=%d",
         tenant_id,
         feature_key,
         iteration,
         prompt_tokens,
         completion_tokens,
         tool_names,
-        preview,
+        len(content),
     )
 
 

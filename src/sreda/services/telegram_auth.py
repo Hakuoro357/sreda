@@ -33,7 +33,7 @@ def validate_init_data(
     init_data_raw: str,
     bot_token: str,
     *,
-    max_age_seconds: int = 3600,
+    max_age_seconds: int = 86400,  # 24h, indust standard
 ) -> TelegramWebAppUser:
     """Parse and validate Telegram Mini App ``initData``.
 
