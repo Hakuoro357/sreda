@@ -358,6 +358,23 @@ def test_tool_discipline_addendum_forbids_internal_jargon_to_user():
     )
 
 
+def test_persona_gender_rule_has_universal_pattern_and_few_shot():
+    """2026-04-29 (incident: бот ответил «Посмотрел прогноз» в м.р.):
+    промпт усилен — universal pattern «все глаголы -ла, не -л» +
+    конкретные few-shot пары ❌→✅ для anchor'а."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt = build_system_prompt("housewife_assistant").lower()
+    # Universal pattern явно указан
+    assert "все глаголы прошедшего времени" in prompt
+    assert "окончание «-ла»" in prompt or "окончание -ла" in prompt or "«-ла»" in prompt
+    # Few-shot examples — конкретные глаголы которых раньше не было в whitelist
+    for verb in ("посмотрела", "прочитала", "решила", "увидела", "подумала", "услышала"):
+        assert verb in prompt, f"few-shot example missing: {verb}"
+    # Возвратные тоже
+    assert "нашлась" in prompt or "получилось" in prompt
+
+
 def test_tool_discipline_addendum_present_regardless_of_model_name():
     """Callers that don't know the model yet (bench tools, tests that
     import the prompt standalone) ALSO get the addendum — discipline
