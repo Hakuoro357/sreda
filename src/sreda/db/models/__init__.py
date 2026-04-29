@@ -44,6 +44,7 @@ from sreda.db.models.user_profile import (
     TenantUserProfileProposal,
     TenantUserSkillConfig,
 )
+from sreda.db.models.web_search import WebSearchUsage
 
 __all__ = [
     "AgentRun",
@@ -87,5 +88,6 @@ __all__ = [
     "TenantUserProfileProposal",
     "TenantUserSkillConfig",
     "User",
+    "WebSearchUsage",
     "Workspace",
 ]

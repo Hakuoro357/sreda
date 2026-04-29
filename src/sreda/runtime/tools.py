@@ -201,7 +201,12 @@ def build_memory_tools(
     # фактически не работал.
     from sreda.services.weather_tool import build_weather_tool
 
-    web_search_tool = build_web_search_tool()
+    # 2026-04-29: web_search получает session/tenant/user для quota
+    # tracking (Tavily 30/user/мес + 950 global). При исчерпании квоты
+    # tool сам fall'нётся на DDG `backend="api"`.
+    web_search_tool = build_web_search_tool(
+        session=session, tenant_id=tenant_id, user_id=user_id,
+    )
     fetch_url_tool = build_fetch_url_tool()
     weather_tool = build_weather_tool()
 

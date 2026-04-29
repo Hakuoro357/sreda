@@ -169,6 +169,15 @@ class Settings(BaseSettings):
         default=None, validation_alias="SREDA_GROQ_API_KEY_FILE"
     )
 
+    # Tavily AI — API search tool для LLM-агентов (заменил DuckDuckGo
+    # 2026-04-29 после Bing-403 c RU egress). Free tier 1000 query/мес.
+    # Используется в `services/web_search_tool.build_web_search_tool`,
+    # квота отслеживается в `WebSearchUsageCounter` (per-user 30/мес,
+    # global 950/мес). При превышении — fallback на DDG `backend="api"`.
+    tavily_api_key: str | None = Field(
+        default=None, validation_alias="TAVILY_API_KEY"
+    )
+
     # Опциональный путь к файлу для structured JSON-лога неудачных
     # попыток подключения EDS-ЛК (для post-mortem анализа). Одна
     # запись — одна строка JSON с timestamp, tenant_id, login_masked,

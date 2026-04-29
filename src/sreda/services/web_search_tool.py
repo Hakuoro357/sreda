@@ -32,6 +32,8 @@ from urllib.parse import urlparse
 import httpx
 from langchain_core.tools import tool as lc_tool
 
+from sreda.config.settings import get_settings
+
 logger = logging.getLogger(__name__)
 
 _MAX_RESULTS = 3
@@ -146,8 +148,123 @@ def _extract_article(html_text: str) -> tuple[str, str]:
         return "", _normalize(_strip_tags(html_text))
 
 
-def build_web_search_tool() -> Callable:
-    """Return a LangChain tool the chat LLM can call with ``query`` str."""
+_TAVILY_URL = "https://api.tavily.com/search"
+_TAVILY_TIMEOUT_SECONDS = 8.0
+_QUOTA_EXHAUSTED_MSG = "error: Достигнут лимит поиска"
+
+
+def _format_results(items: list[tuple[str, str, str]]) -> str:
+    """Convert (title, body, url) tuples to the LLM-facing formatted block:
+    `1. Title\\n<snippet>\\n<url>` joined by blank lines."""
+    if not items:
+        return "no results"
+    lines: list[str] = []
+    for idx, (title, body, url) in enumerate(items[:_MAX_RESULTS], start=1):
+        title = (title or "").strip()
+        body = (body or "").strip()
+        url = (url or "").strip()
+        if len(body) > _MAX_SNIPPET_CHARS:
+            body = body[:_MAX_SNIPPET_CHARS].rstrip() + "…"
+        lines.append(f"{idx}. {title}\n{body}\n{url}")
+    return "\n\n".join(lines)
+
+
+def _call_tavily(query: str, api_key: str) -> list[tuple[str, str, str]] | None:
+    """Tavily API call. Returns list of (title, body, url) on success,
+    None on failure (caller falls back to DDG).
+
+    Tavily request schema:
+        POST https://api.tavily.com/search
+        {"api_key": ..., "query": ..., "search_depth": "basic",
+         "max_results": 3, "include_answer": false}
+
+    Response:
+        {"results": [{"title", "url", "content", "score"}, ...]}
+    """
+    try:
+        r = httpx.post(
+            _TAVILY_URL,
+            json={
+                "api_key": api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": _MAX_RESULTS,
+                "include_answer": False,
+            },
+            timeout=_TAVILY_TIMEOUT_SECONDS,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "tavily search HTTP %s for %r: %s",
+            exc.response.status_code, query, exc,
+        )
+        return None
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("tavily search failed for %r: %s", query, exc)
+        return None
+    results = data.get("results") or []
+    return [
+        (r.get("title", ""), r.get("content", ""), r.get("url", ""))
+        for r in results
+    ]
+
+
+def _call_ddg_fallback(query: str) -> list[tuple[str, str, str]] | None:
+    """DDG fallback при превышении Tavily-квоты. `backend="api"` идёт
+    на DDG instant-answer endpoint (не SERP-scraping → не зависит от
+    Bing-403). Качество результатов ниже Tavily, но что-то лучше чем
+    ничего. Returns None on failure."""
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+    except ImportError:
+        logger.warning("duckduckgo-search not installed for fallback")
+        return None
+
+    try:
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(
+                query, region=_REGION, max_results=_MAX_RESULTS, backend="api",
+            ))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ddg fallback failed for %r: %s", query, exc)
+        return None
+
+    return [
+        (
+            (item.get("title") or "").strip(),
+            (item.get("body") or "").strip(),
+            (item.get("href") or item.get("url") or "").strip(),
+        )
+        for item in raw
+    ]
+
+
+def build_web_search_tool(
+    *,
+    session: "Session | None" = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+) -> Callable:
+    """Return a LangChain tool — Tavily primary + DDG fallback при
+    превышении квоты.
+
+    2026-04-29: переехали с DDGS-html (Bing) на Tavily API из-за
+    Bing-403 на RU egress. Tavily free 1000/мес, разделяем по юзерам
+    через `WebSearchUsageCounter` (30/user/month + 950 global hard).
+    При исчерпании — fallback на DDG `backend="api"` (instant answers,
+    free но низкого качества).
+
+    Args:
+        session: SQLAlchemy session для quota-counter. Если None —
+            quota не проверяется (legacy fallback / tests без БД).
+        tenant_id, user_id: scoping для quota-counter. Без них
+            quota не отслеживается.
+    """
+    from sqlalchemy.orm import Session as _Session  # noqa: F401  (typing only)
+
+    api_key = (get_settings().tavily_api_key or "").strip()
 
     @lc_tool
     def web_search(query: str) -> str:
@@ -170,37 +287,50 @@ def build_web_search_tool() -> Callable:
 
         Returns:
             A formatted block with up to 3 results, each
-            "N. Title\\n<snippet>\\n<url>". Returns a short error
-            string on failure; adapt and respond gracefully.
+            "N. Title\\n<snippet>\\n<url>". On quota exhaustion +
+            fallback failure returns ``"error: Достигнут лимит
+            поиска"``. Adapt and respond gracefully.
         """
         q = (query or "").strip()
         if not q:
             return "error: empty query"
-        try:
-            from duckduckgo_search import DDGS  # type: ignore
-        except ImportError:
-            logger.warning("duckduckgo-search not installed")
-            return "error: web_search not available"
 
-        try:
-            with DDGS() as ddgs:
-                raw = list(ddgs.text(q, region=_REGION, max_results=_MAX_RESULTS))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("web_search failed for %r: %s", q, exc)
-            return f"error: {type(exc).__name__}"
+        # Decide: Tavily or DDG fallback?
+        use_tavily = bool(api_key)
+        if use_tavily and session is not None and tenant_id and user_id:
+            from sreda.services.web_search_usage import WebSearchUsageCounter
+            counter = WebSearchUsageCounter(session)
+            if not counter.can_use_tavily(tenant_id=tenant_id, user_id=user_id):
+                logger.info(
+                    "web_search: quota exhausted tenant=%s user=%s — fallback to DDG",
+                    tenant_id, user_id,
+                )
+                use_tavily = False
+        else:
+            counter = None
 
-        if not raw:
-            return "no results"
+        # Primary: Tavily
+        if use_tavily:
+            results = _call_tavily(q, api_key)
+            if results is not None:
+                if counter is not None and tenant_id and user_id:
+                    try:
+                        counter.record_tavily(tenant_id=tenant_id, user_id=user_id)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("web_search: tavily counter failed")
+                return _format_results(results)
+            # Tavily fail (network/auth/etc) — fall through to DDG.
 
-        lines: list[str] = []
-        for idx, item in enumerate(raw[:_MAX_RESULTS], start=1):
-            title = (item.get("title") or "").strip()
-            body = (item.get("body") or "").strip()
-            url = (item.get("href") or item.get("url") or "").strip()
-            if len(body) > _MAX_SNIPPET_CHARS:
-                body = body[:_MAX_SNIPPET_CHARS].rstrip() + "…"
-            lines.append(f"{idx}. {title}\n{body}\n{url}")
-        return "\n\n".join(lines)
+        # Fallback: DDG
+        results = _call_ddg_fallback(q)
+        if results is None:
+            return _QUOTA_EXHAUSTED_MSG
+        if counter is not None and tenant_id and user_id:
+            try:
+                counter.record_fallback(tenant_id=tenant_id, user_id=user_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("web_search: fallback counter failed")
+        return _format_results(results)
 
     return web_search
 

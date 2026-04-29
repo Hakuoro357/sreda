@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Поиск{% endblock %}
+{% block content %}
+<h2>Web search — Tavily quota</h2>
+
+<p class="muted" style="max-width: 720px;">
+  Tavily free tier — 1000 запросов в месяц. Per-user soft cap
+  {{ summary.per_user_limit }}/мес: после превышения юзер уходит на DDG fallback
+  (instant answers, низкого качества). Global hard cap {{ summary.global_limit }}/мес
+  с запасом 50 от 1000. Сброс по календарным месяцам.
+</p>
+
+<figure style="max-width: 720px;">
+<table>
+  <thead>
+    <tr><th>Период</th><th>Tavily</th><th>Fallback (DDG)</th><th>Остаток Tavily</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>{{ summary.year_month }}</strong></td>
+      <td>{{ summary.tavily_calls_total }} / {{ summary.global_limit }}</td>
+      <td>{{ summary.fallback_calls_total }}</td>
+      <td>
+        {% set pct = (summary.tavily_calls_total / summary.global_limit * 100) | round(1) %}
+        <span class="usage-bar">
+          <span class="usage-bar-fill" style="width: {{ [pct, 100] | min }}%;
+            {% if pct > 95 %}background: #dc3545;
+            {% elif pct > 80 %}background: #ffc107;
+            {% else %}background: #28a745;
+            {% endif %}
+          "></span>
+        </span>
+        {{ summary.tavily_remaining }}
+      </td>
+    </tr>
+  </tbody>
+</table>
+</figure>
+
+<h3 style="margin-top: 32px;">Расход по пользователям</h3>
+
+{% if not per_user %}
+<p class="muted">В этом месяце поисковых запросов ещё не было.</p>
+{% else %}
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Tenant</th>
+      <th>User ID</th>
+      <th>Tavily</th>
+      <th>Fallback (DDG)</th>
+      <th>Остаток (per-user)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in per_user %}
+    <tr>
+      <td>{{ r.tenant_name or r.tenant_id }}</td>
+      <td><code>{{ r.user_id }}</code></td>
+      <td>
+        <strong>{{ r.tavily_calls }}</strong> / {{ summary.per_user_limit }}
+      </td>
+      <td>
+        {% if r.fallback_calls > 0 %}
+          <span class="badge badge-yellow">{{ r.fallback_calls }}</span>
+        {% else %}
+          <span class="muted">0</span>
+        {% endif %}
+      </td>
+      <td>
+        {% set upct = (r.tavily_calls / summary.per_user_limit * 100) | round(1) %}
+        <span class="usage-bar">
+          <span class="usage-bar-fill" style="width: {{ [upct, 100] | min }}%;
+            {% if upct >= 100 %}background: #dc3545;
+            {% elif upct > 80 %}background: #ffc107;
+            {% else %}background: #28a745;
+            {% endif %}
+          "></span>
+        </span>
+        {{ r.user_remaining }}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% endif %}
+
+<details style="margin-top: 24px; max-width: 720px;">
+  <summary style="cursor: pointer; color: var(--pico-muted-color); font-size: 13px;">
+    Как работает квота
+  </summary>
+  <ul style="font-size: 13px; color: var(--pico-muted-color);">
+    <li>Каждый <code>web_search</code>-tool вызов проверяет: per-user лимит
+        ({{ summary.per_user_limit }}/мес) → global лимит
+        ({{ summary.global_limit }}/мес) → если ОК, идёт в Tavily</li>
+    <li>Если превышен любой из лимитов — tool fall'ётся на DuckDuckGo с
+        <code>backend="api"</code> (instant answers, free но низкого
+        качества)</li>
+    <li>Если DDG тоже сфейлился — юзер видит <code>error: Достигнут лимит поиска</code>,
+        LLM формулирует ответ типа «не могу сейчас искать»</li>
+    <li>Период reset'ится по календарным месяцам (1-го числа в 00:00 UTC).
+        Старые строки остаются в <code>web_search_usage</code> для аналитики</li>
+  </ul>
+</details>
+
+{% endblock %}

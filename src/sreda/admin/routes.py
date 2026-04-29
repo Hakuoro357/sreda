@@ -82,6 +82,32 @@ def admin_budget(
     )
 
 
+@router.get("/web-search", response_class=HTMLResponse)
+def admin_web_search(
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Tavily quota dashboard — global stats + per-user breakdown.
+
+    2026-04-29: введено вместе с переездом web_search на Tavily
+    (1000/мес free tier разделяется на per-user 30 + global 950)."""
+    _audit_admin_view(session, "admin.web_search.viewed", token, request)
+    from sreda.services.web_search_usage import WebSearchUsageCounter
+    counter = WebSearchUsageCounter(session)
+    summary = counter.admin_summary()
+    per_user = counter.admin_per_user()
+    return templates.TemplateResponse(
+        request, "web_search.html",
+        {
+            "token": token,
+            "summary": summary,
+            "per_user": per_user,
+            "section": "web-search",
+        },
+    )
+
+
 _LLM_PROVIDERS_METADATA = [
     # Order here drives the dropdown order in llm.html. Keep the
     # current production default (mimo) first so the UI opens with a
