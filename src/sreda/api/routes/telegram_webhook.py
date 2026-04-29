@@ -27,52 +27,58 @@ logger = logging.getLogger(__name__)
 
 async def _fire_and_forget_ack(
     client: TelegramClient, chat_id: str, text: str,
-) -> None:
+) -> int | None:
     """Send a one-word ack reply concurrently with main turn processing.
 
-    Used as ``asyncio.create_task`` target so ``await client.send_message``
-    doesn't block voice.download / text llm. Uses parent's TraceContext
-    (ContextVar copied into child task) — the ``ack.sent`` event lands
-    in the same trace block as the rest of the turn. Failures are
-    logged but don't propagate (UX sugar — don't fail the turn if ack
-    can't be delivered)."""
+    Returns Telegram message_id of the ack (None on failure). Used by
+    webhook handler чтобы потом вызвать `delete_message` после
+    доставки реального reply'я — clean-chat UX (одно сообщение в
+    чате на turn вместо двух).
+
+    Используется как ``asyncio.create_task`` target — `await
+    client.send_message` не блокирует voice.download/transcribe.
+    ContextVar (TraceContext) копируется в child task автоматически,
+    `ack.sent` event попадает в trace-блок текущего turn'а.
+    Failures swallowed: ack — UX sugar, не correctness-critical."""
     with trace.step("ack.sent", phrase=text) as meta:
         try:
-            await client.send_message(chat_id=chat_id, text=text)
+            response = await client.send_message(chat_id=chat_id, text=text)
             meta["status"] = "ok"
+            result = response.get("result") or {}
+            mid = result.get("message_id")
+            return int(mid) if isinstance(mid, int) else None
         except TelegramDeliveryError as exc:
             logger.warning("ack delivery failed: %s", exc)
             meta["status"] = "failed"
+            return None
         except Exception as exc:  # noqa: BLE001
-            # Defensive: ack must NEVER take down a turn.
             logger.exception("ack task crashed: %s", exc)
             meta["status"] = "crashed"
+            return None
 
 
-async def _fire_chat_action_typing(
-    client: TelegramClient, chat_id: str,
+async def _delete_ack_after_reply(
+    client: TelegramClient, chat_id: str, message_id: int,
 ) -> None:
-    """Fire-and-forget Telegram «печатает…» индикатор на webhook entry.
+    """Удаляет ack-сообщение после доставки реального reply'я.
 
-    2026-04-29: одноразовый sendChatAction(typing). Telegram держит
-    индикатор ~5с, потом гасит сам. Параллельно в той же задаче
-    летит ack-message — когда он доходит до юзера, индикатор сменяется
-    реальным текстом (Telegram гасит typing на любом message от бота).
+    2026-04-29: clean-chat UX. Раньше юзер видел в чате 2 сообщения
+    на turn: ack «🔍 Смотрю…» + reply. Теперь ack удаляется после
+    того как reply дошёл до юзера → остаётся одно сообщение реального
+    ответа. Ack виден только пока bot crunch'ит (200мс — 15с).
 
-    Никаких keep-alive циклов — индикатор должен исчезнуть сам через
-    5с в худшем сценарии. Если ack успел придти раньше (обычно ~80-200мс
-    с warm pool), typing вообще не успевает быть виден визуально как
-    отдельная фаза — юзер видит typing→ack плавно. На холодном pool
-    sendChatAction сам прогревает TLS-connection => ack использует уже
-    warm connection.
-
-    Failures DEBUG-level: chat action — UX sugar, не correctness."""
+    Failures DEBUG: best-effort delete — ack-message в чате тоже не
+    катастрофа. Может fail'нуть если юзер сам удалил ack или Telegram
+    rate-limit'нул deleteMessage."""
     try:
-        await client.send_chat_action(chat_id=chat_id, action="typing")
+        await client.delete_message(chat_id=chat_id, message_id=message_id)
     except TelegramDeliveryError as exc:
-        logger.debug("chat_action delivery failed status=%s", exc.status_code)
+        logger.debug(
+            "ack delete failed status=%s msg_id=%s",
+            exc.status_code, message_id,
+        )
     except Exception:  # noqa: BLE001
-        logger.debug("chat_action task crashed", exc_info=True)
+        logger.debug("ack delete crashed", exc_info=True)
 
 
 def _verify_telegram_secret_token(
@@ -323,23 +329,18 @@ async def telegram_webhook(
         # с таймаутом 2с — обычно он уже завершён (sendMessage ~400мс
         # vs voice flow ~10с), но явное ожидание гарантирует что trace
         # блок включит ack.sent перед emit_block.
+        # 2026-04-29 rollback: убран `sendChatAction(typing)` task.
+        # Эмпирические данные (1346/1760мс на ack-send vs обычные
+        # <500мс) показали что parallel chat_action деграфит ack-send
+        # — оба request'а боролись за SOCKS5 bandwidth на egress.
+        # UX-выигрыш от typing-индикатора был незаметен (ack догонял
+        # его раньше). Pinger keepalive держит pool warm 24/7, цены
+        # за warm pool теперь без концурренции.
         ack_task: asyncio.Task | None = None
         if (
             message_type in ("text", "voice")
             and not onboarding.is_new_user
         ):
-            # 2026-04-29: chat_action «печатает…» fire-and-forget.
-            # Самый дешёвый UX-сигнал юзеру что бот реагирует. Идёт
-            # параллельно с ack — обычно ack догоняет за 80-200мс и
-            # сменяет индикатор на текст. На холодном pool'е
-            # sendChatAction служит pool-warmer'ом для последующего
-            # ack. Не trace'ится (DEBUG-level only on errors).
-            asyncio.create_task(
-                _fire_chat_action_typing(
-                    telegram_client, onboarding.chat_id,
-                ),
-                name=f"chat_action:{onboarding.chat_id}",
-            )
             ack_text = pick_ack()
             ack_task = asyncio.create_task(
                 _fire_and_forget_ack(
@@ -360,17 +361,52 @@ async def telegram_webhook(
         except TelegramDeliveryError as exc:
             logger.warning("Telegram delivery failed during webhook handling: %s", exc)
         finally:
-            # Wait briefly for ack task to complete so ``ack.sent`` event
-            # is recorded in trace block before emit. Voice flow takes
+            # Wait briefly for ack task to complete — нужно знать
+            # message_id ack'а, чтобы потом удалить его. Voice flow
             # ~10с, ack ~400мс — task обычно already done by here.
-            # Cap at 2с safety so a stuck ack doesn't delay the response.
-            if ack_task is not None and not ack_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(ack_task), timeout=2.0)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "ack task still pending after main turn — abandoning",
-                    )
+            # Cap 2с safety если ack завис (rare).
+            ack_message_id: int | None = None
+            if ack_task is not None:
+                if not ack_task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(ack_task), timeout=2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "ack task still pending after main turn — abandoning",
+                        )
+                if ack_task.done() and not ack_task.cancelled():
+                    try:
+                        ack_message_id = ack_task.result()
+                    except Exception:  # noqa: BLE001
+                        ack_message_id = None
+
+            # 2026-04-29: clean-chat — удаляем ack-message ТОЛЬКО если
+            # реальный reply был доставлен inline. Если reply
+            # deferred (quiet hours / muted) — ack оставляем, иначе
+            # юзер не увидит ничего. Inline-доставка детектится по
+            # наличию `outbox.delivered` event в trace.
+            reply_delivered_inline = (
+                trace_ctx is not None and any(
+                    e.step == "outbox.delivered" for e in trace_ctx.events
+                )
+            )
+            if (
+                ack_message_id is not None
+                and reply_delivered_inline
+                and onboarding.chat_id is not None
+            ):
+                # Fire-and-forget delete: не блокируем 202-ack юзера
+                # ради cleanup'а. Failures DEBUG-only.
+                asyncio.create_task(
+                    _delete_ack_after_reply(
+                        telegram_client,
+                        str(onboarding.chat_id),
+                        ack_message_id,
+                    ),
+                    name=f"ack_del:{onboarding.chat_id}",
+                )
 
             # If the handler DID enqueue an outbox row, the delivery
             # worker will emit the block once it lands in Telegram.

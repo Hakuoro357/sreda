@@ -154,6 +154,21 @@ class TelegramClient:
             timeout=3.0,
         )
 
+    async def delete_message(self, chat_id: str, message_id: int) -> dict:
+        """Telegram `deleteMessage` — удаляет ранее отправленное ботом
+        сообщение из чата. Используется для clean-chat паттерна:
+        ack-message удаляется после доставки реального reply'я,
+        в чате остаётся одно сообщение на turn вместо двух.
+
+        Bot может удалять только свои сообщения — это ограничение
+        Telegram API. Фейлится 400 если message_id не существует
+        или удалён юзером (best-effort delete; caller игнорирует)."""
+        return await self._post_json(
+            "deleteMessage",
+            {"chat_id": chat_id, "message_id": message_id},
+            timeout=3.0,
+        )
+
     async def get_me(self) -> dict:
         """Telegram `getMe` — лёгкий запрос для прогрева TLS connection.
 

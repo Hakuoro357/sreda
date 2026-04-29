@@ -101,11 +101,19 @@ def test_navigation_keyboard_pre_final_branch_uses_gotovo_label() -> None:
     assert "→" not in next_btn["text"], "final next: emoji ✓, not arrow"
 
 
-def test_navigation_keyboard_done_is_empty_keyboard() -> None:
-    """Финал `done` — пустой inline_keyboard (Telegram удалит buttons
-    при editMessageText с этим markup'ом)."""
+def test_navigation_keyboard_done_keeps_prev_button() -> None:
+    """2026-04-29: финал `done` остаётся navigable. Раньше keyboard
+    очищался (`inline_keyboard=[]`), теперь prev-кнопка остаётся —
+    tour становится permanent reference, юзер может скроллить
+    обратно через все ветки."""
     kb = pending_bot.build_navigation_keyboard("done")
-    assert kb == {"inline_keyboard": []}
+    rows = kb["inline_keyboard"]
+    assert len(rows) == 1, f"done: expected 1 row with prev button, got {rows}"
+    assert len(rows[0]) == 1, "done: expected only prev (no next)"
+    btn = rows[0][0]
+    assert btn["callback_data"] == "pb:dont_do"
+    assert "←" in btn["text"]
+    assert "Чего не делаю" in btn["text"]
 
 
 def test_navigation_keyboard_unknown_branch_falls_back_to_intro() -> None:
@@ -118,27 +126,28 @@ def test_navigation_keyboard_unknown_branch_falls_back_to_intro() -> None:
 def test_navigation_keyboard_all_branches_round_trip_consistent() -> None:
     """Цепочка: на каждой ветке next ведёт к следующей в BRANCH_ORDER,
     prev ведёт к предыдущей. Проверка что builder корректно собирает
-    переходы по всему туру."""
+    переходы по всему туру (включая done — там только prev)."""
     order = pending_bot.BRANCH_ORDER
     for i, br in enumerate(order):
         kb = pending_bot.build_navigation_keyboard(br)
-        if br == "done":
-            assert kb == {"inline_keyboard": []}
-            continue
         rows = kb["inline_keyboard"]
         flat = rows[0]
-        # Prev button
+        # Prev button (на всех кроме intro)
         if i == 0:
-            assert all(
-                not b["callback_data"].endswith(order[max(i-1, 0)]) or
-                b["text"].startswith("←") is False  # no prev on first
-                for b in flat
+            assert not any(b["text"].startswith("←") for b in flat), (
+                f"intro: should NOT have prev button"
             )
         else:
             prev_match = [b for b in flat if b["callback_data"] == f"pb:{order[i-1]}"]
             assert prev_match, f"branch {br}: missing prev button to {order[i-1]}"
-        # Next button
-        next_match = [b for b in flat if b["callback_data"] == f"pb:{order[i+1]}"]
-        assert next_match, f"branch {br}: missing next button to {order[i+1]}"
+        # Next button (на всех кроме done)
+        if br == "done":
+            assert not any(
+                b["callback_data"].startswith("pb:") and "→" in b["text"]
+                for b in flat
+            ), "done: should NOT have next button"
+        else:
+            next_match = [b for b in flat if b["callback_data"] == f"pb:{order[i+1]}"]
+            assert next_match, f"branch {br}: missing next button to {order[i+1]}"
 
 

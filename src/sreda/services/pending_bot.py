@@ -335,17 +335,17 @@ def build_navigation_keyboard(current_branch: str) -> dict:
     * Промежуточные ветки → две кнопки в одном ряду:
       «← <prev_label>» + «<next_label> →»
     * `dont_do` (предпоследняя) → «← 🧠 Память» + «Готово ✓»
-    * `done` (финал) → пустой ``inline_keyboard`` — Telegram
-      убирает клавиатуру при edit'е с пустым массивом.
+    * `done` (финал) → одна кнопка «← 🚫 Чего не делаю» —
+      без next, юзер может скроллить тур обратно.
 
-    Возвращает всегда dict (не None как legacy ``build_inline_keyboard``)
-    чтобы edit-flow всегда явно прописывал состояние клавиатуры —
-    иначе Telegram сохранит старую при edit'е (не удаляя).
+    2026-04-29: tour остаётся permanent reference в чате после
+    прохождения. Юзер может в любой момент вернуться к нему и
+    переглянуть. Раньше на `done` клавиатура пропадала (`inline_keyboard=[]`),
+    теперь там prev-кнопка для отката назад.
+
+    Возвращает всегда dict чтобы edit-flow всегда явно прописывал
+    состояние клавиатуры — иначе Telegram сохранит старую при edit'е.
     """
-    if current_branch == "done":
-        # Final: явно убираем клавиатуру через empty inline_keyboard
-        return {"inline_keyboard": []}
-
     try:
         idx = BRANCH_ORDER.index(current_branch)
     except ValueError:
