@@ -773,14 +773,15 @@
       'title="Очистить весь список">\uD83D\uDDD1\uFE0F</button>' +  // 🗑️
       '</div>';
 
-    // Inline "+ Добавить" input at the top — simpler than a modal.
-    // Using a form so Enter on mobile submits naturally.
-    html += '<form class="card mt-8" onsubmit="return window._addShoppingItem(event)">';
-    html += '<input type="text" id="shopping-new-input" placeholder="Что добавить в список?" ';
-    html += 'style="width:100%;padding:10px;border:1px solid var(--tg-theme-hint-color,#aaa);';
-    html += 'border-radius:8px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);font-size:15px" />';
-    html += '<button type="submit" class="btn btn-primary mt-8" style="width:100%">Добавить</button>';
-    html += '</form>';
+    // 2026-04-29: ввод убран per user request — Среда позиционируется
+    // как голосовой ассистент, форма противоречит сообщению. Юзер
+    // добавляет/удаляет голосом или текстом боту. Чекбокс «купил»
+    // и кнопка «очистить весь список» (мусорка справа сверху)
+    // остаются — это inline mutations Mini App'а.
+    html += '<div class="card mt-8 card-subtitle" style="text-align:center;line-height:1.5;padding:14px 16px">';
+    html += '🎙️ ';  // 🎙️
+    html += 'Просто скажи мне что добавить или убрать из списка — голосом или текстом.';
+    html += '</div>';
 
     if (state.shopping === null) {
       loadShopping();
@@ -1026,11 +1027,43 @@
           : 'flex:1;');
         return;
       }
-      // Refresh — счётчики pending/done на <summary> обновятся.
-      state.checklists = null;
-      if ((location.hash || '') === '#/checklists') {
-        render();
-      }
+      // 2026-04-29: in-place patch без full re-render. Раньше делали
+      // `state.checklists = null; render();` — full re-fetch + redraw,
+      // юзер видел flash of empty content («page reload»). Теперь:
+      // patch state в памяти + обновляем counter на <summary>
+      // напрямую. <details open/close> не дёргается, scroll не
+      // сбрасывается. Если patch не нашёл item (тип gone от соседней
+      // сессии) — ничего не падаем; на следующей навигации refresh.
+      try {
+        var lists = (state.checklists && state.checklists.checklists) || [];
+        for (var li = 0; li < lists.length; li++) {
+          var cl = lists[li];
+          var its = cl.items || [];
+          for (var ii = 0; ii < its.length; ii++) {
+            if (its[ii].id !== itemId) continue;
+            var prev = its[ii].status;
+            its[ii].status = wasDone ? 'pending' : 'done';
+            // Recompute aggregates by replaying статусов.
+            var pending = 0, done = 0;
+            for (var k = 0; k < its.length; k++) {
+              if (its[k].status === 'done') done += 1;
+              else if (its[k].status !== 'cancelled') pending += 1;
+            }
+            cl.pending = pending;
+            cl.done = done;
+            // Patch <summary> counter в DOM (rowEl → ближайший
+            // <details> → <summary> → .card-subtitle).
+            try {
+              var det = rowEl.closest('details');
+              if (det) {
+                var sub = det.querySelector('summary .card-subtitle');
+                if (sub) sub.textContent = pending + ' / ' + (cl.total || its.length);
+              }
+            } catch (_e) { /* DOM patch best-effort */ }
+            return;
+          }
+        }
+      } catch (_e) { /* state patch best-effort */ }
     }).catch(function(_err) {
       markEl.textContent = wasDone ? DONE_MARK : TODO_MARK;
       textEl.setAttribute('style', wasDone

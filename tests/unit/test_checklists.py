@@ -77,6 +77,50 @@ def test_create_list_empty_title_raises(session):
         svc.create_list(tenant_id="t1", user_id="u1", title="   ")
 
 
+# 2026-04-29: dedup tests for create_list (incident user_tg_352612382 —
+# LLM в одном turn'е сделал create_checklist + add_checklist_items
+# подряд, fuzzy match в add_checklist_items промахнулся, и создался
+# дубликат active list с тем же title).
+
+
+def test_create_list_returns_existing_when_same_title(session):
+    """Повторный create с тем же title → возвращает существующий
+    list, не создаёт второй row."""
+    svc = ChecklistService(session)
+    first = svc.create_list(tenant_id="t1", user_id="u1", title="Доработки среды")
+    second = svc.create_list(tenant_id="t1", user_id="u1", title="Доработки среды")
+    assert first.id == second.id
+    assert svc.count_active_lists(tenant_id="t1", user_id="u1") == 1
+
+
+def test_create_list_dedup_case_insensitive(session):
+    """Регистр и пробелы игнорируются (как в add_items dedup)."""
+    svc = ChecklistService(session)
+    a = svc.create_list(tenant_id="t1", user_id="u1", title="План кроя")
+    b = svc.create_list(tenant_id="t1", user_id="u1", title="  ПЛАН   КРОЯ  ")
+    assert a.id == b.id
+
+
+def test_create_list_dedup_scoped_to_user(session):
+    """Юзер u1 и u2 — независимые scope'ы, дубликат не считается."""
+    svc = ChecklistService(session)
+    a = svc.create_list(tenant_id="t1", user_id="u1", title="Дача")
+    b = svc.create_list(tenant_id="t1", user_id="u2", title="Дача")
+    assert a.id != b.id
+
+
+def test_create_list_dedup_ignores_archived(session):
+    """Если предыдущий list был archive'нут — новый создаётся,
+    archived в счёт не идёт."""
+    svc = ChecklistService(session)
+    a = svc.create_list(tenant_id="t1", user_id="u1", title="Сборы")
+    svc.archive_list(tenant_id="t1", user_id="u1", list_id=a.id)
+    b = svc.create_list(tenant_id="t1", user_id="u1", title="Сборы")
+    # Новый list с тем же title создан — archived не блокирует.
+    assert b.id != a.id
+    assert b.status == "active"
+
+
 def test_add_items_filters_empty_and_assigns_position(session):
     svc = ChecklistService(session)
     cl = svc.create_list(tenant_id="t1", user_id="u1", title="X")

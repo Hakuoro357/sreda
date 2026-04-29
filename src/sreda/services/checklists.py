@@ -64,11 +64,43 @@ class ChecklistService:
     def create_list(
         self, *, tenant_id: str, user_id: str, title: str,
     ) -> Checklist:
+        """Create checklist OR return existing active list with same title.
+
+        2026-04-29 (incident user_tg_352612382): LLM в одном turn'е
+        сделал 2 tool-call'а — `create_checklist("X")` + затем
+        `add_checklist_items("X", [...])`. add_checklist_items должен
+        был fuzzy-match найти только что созданный список, но fuzzy
+        матчинг иногда промахивается (пунктуация, регистр, добавочные
+        пробелы), и создавался ВТОРОЙ list с тем же title. Юзер видел
+        дубликат в Mini App «Дела».
+
+        Dedup-правило: если у юзера уже есть active checklist с
+        case-insensitive нормализованным title — возвращаем его, не
+        создаём новый. Это идемпотентность в стиле «pb-кнопок» для
+        write-tool'а.
+        """
         clean = (title or "").strip()
         if not clean:
             raise ValueError("title required")
         if len(clean) > 200:
             clean = clean[:200]
+
+        # Dedup: ищем active list с таким же title (case-insensitive,
+        # collapsed whitespace). Маленькая SQL-нагрузка — у одного
+        # юзера активных списков обычно <20.
+        norm_target = " ".join(clean.lower().split())
+        existing = (
+            self.session.query(Checklist)
+            .filter(
+                Checklist.tenant_id == tenant_id,
+                Checklist.user_id == user_id,
+                Checklist.status == "active",
+            )
+            .all()
+        )
+        for cl in existing:
+            if " ".join((cl.title or "").lower().split()) == norm_target:
+                return cl
 
         now = _utcnow()
         checklist = Checklist(
