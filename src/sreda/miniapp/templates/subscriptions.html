@@ -1891,7 +1891,29 @@
   };
 
   // -- Init --
-  window.addEventListener("hashchange", render);
+  // 2026-04-29: на каждый hashchange — silent re-fetch данных целевой
+  // страницы. Mini App'ом юзер часто пользуется паралельно с чатом
+  // (попросил бота создать чек-лист → возвращается в Mini App).
+  // Старая логика «cache once, never refresh» давала stale view —
+  // новый чек-лист появлялся только после полного reopen Mini App.
+  // Silent: state НЕ null'им, loadX перезапишет slot атомарно когда
+  // ответ придёт. Юзер мгновенно видит знакомую страницу (cached
+  // state) + через 100-300мс свежие данные подменяются.
+  function _refreshRouteOnEnter() {
+    var r = (location.hash || "#/").replace(/^#/, "") || "/";
+    if (r === "/reminders" && state.reminders !== null) loadReminders();
+    if (r === "/schedule" && state.schedule !== null) loadSchedule();
+    if (r === "/shopping" && state.shopping !== null) loadShopping();
+    if (r === "/checklists" && state.checklists !== null) loadChecklists();
+    if (r === "/recipes" && state.recipes !== null) loadRecipes();
+    if (r === "/family" && state.family !== null) loadFamily();
+    // Dashboard (/) — через loadData (silent), refresh menu+summary.
+    if (r === "/" || r === "") loadData({silent: true});
+  }
+  window.addEventListener("hashchange", function() {
+    render();
+    _refreshRouteOnEnter();
+  });
 
   // Invalidate cached server state when the Mini App regains focus —
   // the user likely went to chat and asked the bot to mutate something
