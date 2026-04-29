@@ -358,6 +358,22 @@ def test_tool_discipline_addendum_forbids_internal_jargon_to_user():
     )
 
 
+def test_local_search_rule_redirects_to_yandex_maps():
+    """2026-04-29 (incident: bot выдумал «аптеки на Первомайской» из
+    web_search): при «найти X рядом / поблизости» — НЕ web_search,
+    отдать Яндекс.Карты ссылку с адресом юзера из памяти."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt = build_system_prompt("housewife_assistant").lower()
+    # Tool description явно запрещает web_search для local-business
+    assert "поиска ближайших мест" in prompt or "ближайших мест" in prompt
+    assert "не используй" in prompt or "не индексирует яндекс" in prompt
+    # Section про navigation должна показывать формат yandex.ru/maps
+    assert "yandex.ru/maps/?text=" in prompt
+    # Указание читать адрес из памяти
+    assert "[память]" in prompt or "save_core_fact" in prompt
+
+
 def test_persona_gender_rule_has_universal_pattern_and_few_shot():
     """2026-04-29 (incident: бот ответил «Посмотрел прогноз» в м.р.):
     промпт усилен — universal pattern «все глаголы -ла, не -л» +
