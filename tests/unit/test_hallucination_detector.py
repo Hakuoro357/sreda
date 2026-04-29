@@ -122,6 +122,39 @@ def test_user_question_about_reminder_no_fire() -> None:
     assert detect_unbacked_claim(text, called_tools=set()) is False
 
 
+def test_completion_marker_with_shopping_object_fires() -> None:
+    """Round 2 (2026-04-29): «✅ В списке покупок» без verb'а из старого
+    списка. Раньше пропускалось, теперь ловится через completion-marker
+    («✅») + object («в список»)."""
+    text = "✅ В список покупок добавлены молоко и хлеб."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_completion_marker_sdelano_with_reminder_object_fires() -> None:
+    text = "Сделано — напоминание на 9 утра каждый день стоит."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_completion_marker_zafiksirovano_with_recipe_object_fires() -> None:
+    text = "Зафиксировано: рецепт борща в книге."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_completion_marker_alone_without_object_no_fire() -> None:
+    """«Сделано» без domain-object'а — не fire (могут быть legit
+    contexts типа «дело сделано, переходим дальше» в общем диалоге)."""
+    text = "Сделано! Идём дальше."
+    assert detect_unbacked_claim(text, called_tools=set()) is False
+
+
+def test_completion_marker_with_correct_tool_passes() -> None:
+    """«✅ В список покупок» + add_shopping_items вызван — no fire."""
+    text = "✅ Список покупок обновлён, молоко и хлеб добавлены."
+    assert detect_unbacked_claim(
+        text, called_tools={"add_shopping_items"},
+    ) is False
+
+
 def test_negation_no_fire_intentional_limitation() -> None:
     """Известное ограничение: текущий simple word-search не
     различает «не поставил» от «поставил». Зафиксировано как known

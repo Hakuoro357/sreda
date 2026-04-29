@@ -720,3 +720,158 @@ def test_tools_write_memories_with_correct_tier(monkeypatch, tmp_path: Path):
 
     assert "live in Moscow" in contents
     assert "bad day" in contents
+
+
+# ---------------------------------------------------------------------------
+# Hallucination detector integration (handler-level retry mechanism)
+# ---------------------------------------------------------------------------
+# Эти тесты проверяют что детектор `detect_unbacked_claim` действительно
+# триггерит retry внутри `execute_conversation_chat`, а не только в
+# unit-тестах самой функции. Сценарий:
+#   iter 0 → AIMessage(content="Сохранила рецепт", tool_calls=[])
+#   handler: detect_unbacked_claim → True
+#         → injects HumanMessage(nudge) → continues loop
+#   iter 1 → AIMessage(tool_calls=[save_core_fact])
+#   handler: runs tool → continues
+#   iter 2 → AIMessage(content="Запомнила.")  — финальный summary
+# Сравнивается с happy-path где iter 0 сразу делает tool_call.
+
+
+def test_hallucination_triggers_one_retry(monkeypatch, tmp_path: Path):
+    """LLM в первой итерации описывает действие текстом без tool_call →
+    handler детектит claim, инжектит nudge, перезапускает iteration.
+    Конечный результат: write-tool вызван, юзер получает финальный текст."""
+    session = _bootstrap(monkeypatch, tmp_path, "halluc_retry.db")
+    try:
+        scripted = [
+            # iter 0: hallucination — claim без tool_call
+            AIMessage(
+                content="Готово! Сохранила рецепт борща в твою книгу.",
+                tool_calls=[],
+            ),
+            # iter 1: после nudge'а — реальный tool call
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "save_core_fact",
+                        "args": {"content": "рецепт борща"},
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+            ),
+            # iter 2: финальный текст после исполнения tool'а
+            AIMessage(content="Запомнила рецепт борща."),
+        ]
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("сохрани рецепт борща"))
+        asyncio.run(svc.process_job(queued.job_id))
+
+        memories = session.query(AssistantMemory).all()
+    finally:
+        session.close()
+
+    # Все 3 scripted-response'а потреблены — handler сделал retry
+    assert fake_llm._bound.idx == 3, (
+        f"expected 3 invocations (hallucination + retry + final summary), "
+        f"got {fake_llm._bound.idx}"
+    )
+    # Tool реально вызван — память записана
+    assert len(memories) == 1
+    assert memories[0].content == "рецепт борща"
+    # Юзер получил финальный текст (НЕ галлюцинированный первый)
+    assert len(telegram.sent) == 1
+    assert "запомнила" in telegram.sent[0]["text"].lower()
+
+
+def test_no_hallucination_no_retry(monkeypatch, tmp_path: Path):
+    """Happy path: LLM сразу делает tool_call в iter 0. Handler НЕ
+    делает retry — детектор пропускает (есть write-tool в called_tools)."""
+    session = _bootstrap(monkeypatch, tmp_path, "halluc_skip.db")
+    try:
+        scripted = [
+            # iter 0: сразу tool_call, никакой галлюцинации
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "save_core_fact",
+                        "args": {"content": "рецепт супа"},
+                        "id": "tc_1",
+                    }
+                ],
+            ),
+            # iter 1: финальный текст
+            AIMessage(content="Записала рецепт супа в книгу."),
+        ]
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("запиши рецепт супа"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    # Только 2 invocation'а — retry не делался
+    assert fake_llm._bound.idx == 2, (
+        f"expected 2 invocations (tool_call + final summary), no retry — "
+        f"got {fake_llm._bound.idx}"
+    )
+    assert len(telegram.sent) == 1
+
+
+def test_hallucination_retry_bounded_to_one(monkeypatch, tmp_path: Path):
+    """Если LLM повторно галлюцинирует после nudge'а — handler НЕ делает
+    второй retry, а принимает текст как есть. `_hallucination_nudged`
+    флаг не позволяет уйти в бесконечный loop."""
+    session = _bootstrap(monkeypatch, tmp_path, "halluc_bounded.db")
+    try:
+        scripted = [
+            # iter 0: claim без tool — fire detector
+            AIMessage(
+                content="Сохранила рецепт борща в книгу.",
+                tool_calls=[],
+            ),
+            # iter 1: ОПЯТЬ claim без tool — должен приниматься как final
+            AIMessage(
+                content="Готово! Записала рецепт.",
+                tool_calls=[],
+            ),
+        ]
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("сохрани рецепт"))
+        asyncio.run(svc.process_job(queued.job_id))
+
+        memories = session.query(AssistantMemory).all()
+    finally:
+        session.close()
+
+    # Ровно 2 invocation'а — один retry, не больше
+    assert fake_llm._bound.idx == 2, (
+        f"expected exactly 2 invocations (hallucination + ONE retry), "
+        f"got {fake_llm._bound.idx}"
+    )
+    # Tool НЕ вызывался (LLM повторно соврал) — память пуста
+    assert len(memories) == 0
+    # Юзер получил второе (последнее) сообщение — handler не блокирует
+    # ответ при повторной галлюцинации, иначе юзер останется без reply'я
+    assert len(telegram.sent) == 1
