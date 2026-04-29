@@ -10,6 +10,155 @@ YYYY-MM-DD` и переносим в нижнюю секцию. В начало 
 
 ---
 
+## ✅ DONE 2026-04-29 PM (вторая половина дня)
+
+Хот-фиксы по жалобам реальных юзеров:
+
+### PM.1 Phone-маска — ✅ DONE 2026-04-29
+
+**Симптом.** Юзеры жаловались «не могу записать номер телефона»
+(скриншоты от Бориса). LLM видела `[phone]` placeholder вместо цифр
+→ tool-call'ы для сохранения контактов получали placeholder, реальный
+номер терялся.
+
+**Корень.** `PrivacyGuard.sanitize_text` маскировал любой `\+?\d[\d\s()-]{8,}\d`
+как `[phone]` ДО того как сообщение попадало в LLM. Plaintext оставался
+только в зашифрованном `SecureRecord`.
+
+**Решение (Approach A).** Снят phone-rule + generic `\d{10,}` rule
+из `privacy_guard.py`. Телефон — обычные ПДн (не спец-категория ст.10),
+покрывается явным согласием в политике. Что осталось маскироваться:
+passwords, login, secrets, account_number, verification_code,
+telegram_bot_token, email, url-with-secrets, allergy/diagnosis (ст.10).
+
+**Файлы.** `src/sreda/services/privacy_guard.py:185-205`,
+4 теста обновлены под новое поведение.
+
+**Commit.** `3a6c141 privacy_guard: drop phone-mask`. Деплой на VDS
+через `git reset --hard origin/main` (на проде накопилось 24 modified
++ 6 untracked файлов от прежних rsync-деплоев — все matched origin/main
+кроме privacy_guard.py + tomorrow-plan.md, поэтому reset был безопасен).
+
+### PM.2 Telegram client — ловить HTTP 200 + ok=false
+
+**Симптом инцидента (user_tg_471032584).** Юзер сделал /start, бэк
+получил inbound, pending_bot вернул intro, в логах `sendMessage 200 OK`
+— но юзер ничего не получил. Никаких warnings.
+
+**Корень.** Telegram Bot API в edge-cases (невалидный reply_markup,
+malformed parse_mode, длина текста и т.п.) умеет вернуть HTTP 200
+с body `{"ok": false, "description": "..."}`. Раньше client делал
+`response.raise_for_status()` (на 4xx/5xx) + `return response.json()`
+без проверки `ok`. Caller думал что отправка прошла, юзер ничего
+не получал.
+
+**Решение.** В `_post_request` после `raise_for_status` явно проверяем
+`body.get("ok") is False` и кидаем `TelegramDeliveryError` с полным
+body. Caller (pending_bot path, ack flow, outbox delivery) поймает
+в существующих try/except и залогит warning. Body логируется только
+при `ok=false` (не на success — спам + PII risk).
+
+**Файлы.** `src/sreda/integrations/telegram/client.py:266-288`,
+`tests/unit/test_telegram_client_retry.py::test_200_with_ok_false_raises`.
+
+**Commit.** `06e7f4f`.
+
+### PM.3 backup_sqlite.sh в репо
+
+**Контекст.** Скрипт жил только на проде через rsync (untracked
+в git). При previous `git reset --hard origin/main` мы его сохранили
+в `/tmp` как untracked, после reset он остался на диске.
+
+**Решение.** Добавлен в `scripts/backup_sqlite.sh`. WAL-safe daily
+SQLite backup через `.backup` команду, integrity_check, gzip -9,
+ротация 14 дней, лог в `/var/log/sreda/backup.log`. Cron 03:00 UTC.
+
+**Commit.** `2bda9ab`.
+
+### PM.4 User 471032584 incident
+
+**Симптом.** Максим Петров (`@rustyt0aster`, tg=471032584) нажал
+/start через `t.me/sreda01_bot` link — у него на экране ничего
+не появилось. Бэк говорил «sendMessage 200 OK», `getChatMember`
+показал что бот не заблокирован.
+
+**Гипотеза.** HTTP 200 + ok=false (см. PM.2). Сейчас наш fix
+будет ловить такое в будущем — при следующем подобном инциденте
+в логах будет `Telegram sendMessage ok=false: description=...`.
+
+**Действия.** Юзер проапрувлен через admin. Все 11 сообщений
+pending_bot tour отправлены ему руками через скрипт — все 11 OK.
+Юзер сейчас может пользоваться ботом через нормальный chat-flow.
+
+---
+
+## План на 2026-04-30 (следующий рабочий день)
+
+Приоритеты по убыванию:
+
+### 1. Mini App lazy-provision: dead-end сценарий
+
+**Контекст.** При входе через `t.me/sreda01_bot?startapp=...` или
+прямую ссылку на Mini App, Telegram сразу открывает Mini App во
+встроенном WebView. `miniapp.lazy_provision` создаёт tenant+user
+**без** отправки welcome-сообщения в чат с ботом. Юзер закрывает
+Mini App → видит пустой чат → не понимает что делать.
+
+**Что сделать.**
+- Когда `lazy_provision` создаёт нового юзера (`new=True`) — поставить
+  в outbox welcome message от лица бота (тот же 11-step pending_bot
+  tour либо короткий «Привет, я Среда — пиши прямо в чат»).
+- Acceptance: юзер открыл Mini App → закрыл → в чате с ботом видит
+  pending_bot intro.
+
+**Файл.** `src/sreda/api/routes/miniapp.py` (lazy_provision branch).
+
+**Оценка.** 1-2 часа.
+
+### 2. Сайт sredaspace.ru — execute по плану
+
+План у пользователя в `~/.claude/plans/mellow-discovering-conway.md`.
+Запросить green-light на ExitPlanMode → начать с Phase 0 (DNS + Astro
+init + nginx server blocks). Phase 0.5 (prompt caching + history
+compaction) — критично до Phase 4 (ЮKassa), но не блокер для Phase 1
+(landing) и Phase 3 (LK).
+
+**Оценка.** Phase 0 = 1-2 дня.
+
+### 3. Web_search/weather на VDS (из утреннего раздела 0.1)
+
+Решение от Бориса не дано. Варианты:
+- A: переключить web_search backend (Yandex / Brave / OpenAI Responses)
+- B: Яндекс.Погода API напрямую через fetch_url
+- C: SOCKS5 для Bing
+
+**Acceptance.** Запрос «прогноз погоды на завтра в [город]» работает.
+
+### 4. LLM hallucinates reminder (из утреннего раздела 0.3)
+
+`schedule_reminder` иногда не вызывается, LLM просто пишет «Готово!
+напоминание поставлено» без tool-call. Нужен hallucination detector
++ assertive completion markers. Уже частично сделано (commit `d1bb81b`),
+но симптом всё ещё всплывает.
+
+### 5. Mini App: иконка на домашний экран — добавить инструкцию
+
+В `/welcome` или на отдельную страницу добавить текст «как закрепить
+иконку чата». Безопасный путь:
+- iOS Safari → `t.me/sreda01_bot` → Share → На экран «Домой»
+- Android Chrome → `t.me/sreda01_bot` → ⋮ → Добавить на главный экран
+
+Запрос приходил от юзера сегодня.
+
+**Открытые блокеры.**
+- Решение по pricing (тиры sredaspace.ru) ещё не финализировано
+  — есть в plan-файле, но вы не подтвердили. Без этого Phase 1
+  лендинг не запустить (pricing block в hero).
+- LLM-провайдер — текущая MiMo-Pro Singapore работает, но 152-ФЗ
+  риск растёт со scale. Миграция на YandexGPT-Lite — отдельный трек.
+
+---
+
 ## 0. Hot-fix'ы после cloud-migration (2026-04-29)
 
 После переезда на VDS 62.113.41.104 (Phase 1-8 done 2026-04-28) видны
