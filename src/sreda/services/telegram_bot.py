@@ -273,31 +273,18 @@ async def _handle_callback(
                     params = UserProfileRepository.decode_skill_params(cfg)
                     progress = params.get(WELCOME_V2_PROGRESS_KEY) or {}
                     if isinstance(progress, dict):
-                        # (a) Idempotency by branch position
+                        # (a) Idempotency: блокируем ТОЛЬКО точный повтор
+                        # того же branch'а. С 2026-04-29 wizard стал
+                        # двусторонним (prev/next): юзер может валидно
+                        # тапнуть «← Голос» когда `last_branch=schedule`,
+                        # cur_idx < last_idx, и это не spam. Раньше
+                        # `cur_idx <= last_idx` блокировал этот кейс.
+                        # Теперь блокируем только cur_idx == last_idx
+                        # (аккуратно: спам-loop был на ПОВТОРНЫЕ
+                        # `pb:schedule` после schedule, не на «откат
+                        # назад на intro»).
                         last_branch = progress.get("last_branch")
-                        if last_branch and branch != last_branch:
-                            cur_idx = _pb_mod.branch_index(branch)
-                            last_idx = _pb_mod.branch_index(last_branch)
-                            # Если current ≤ last (повтор / откат на старую
-                            # кнопку) — drop. Известные branches только
-                            # (cur_idx == -1 — alias или unknown, пропускаем).
-                            if cur_idx >= 0 and last_idx >= 0 and cur_idx <= last_idx:
-                                logger.info(
-                                    "pb: idempotent skip tenant=%s branch=%s "
-                                    "last=%s (cur_idx=%d last_idx=%d)",
-                                    onboarding.tenant_id, branch, last_branch,
-                                    cur_idx, last_idx,
-                                )
-                                if callback_id:
-                                    try:
-                                        await telegram_client.answer_callback_query(
-                                            str(callback_id), text=""
-                                        )
-                                    except TelegramDeliveryError:
-                                        pass
-                                return
-                        elif last_branch and branch == last_branch:
-                            # Same branch tapped again — pure idempotent
+                        if last_branch and branch == last_branch:
                             logger.info(
                                 "pb: idempotent skip (same branch) tenant=%s branch=%s",
                                 onboarding.tenant_id, branch,
@@ -361,20 +348,63 @@ async def _handle_callback(
                 reply = pending_bot._DONE_BROADCAST
             else:
                 reply = pending_bot.match(data, is_callback=True)
-            try:
-                await telegram_client.send_message(
-                    chat_id=onboarding.chat_id,
-                    text=reply.text,
-                    reply_markup=pending_bot.build_inline_keyboard(reply),
-                )
-            except TelegramDeliveryError as exc:
-                # 429 — rate-limited, retries только усугубят. Просто
-                # log + drop. 403 — bot blocked. 400 — bad chat_id.
-                # Все 4xx — non-retryable.
-                logger.warning(
-                    "pb: branch '%s' delivery failed status=%s: %s",
-                    branch, exc.status_code, exc,
-                )
+            keyboard = pending_bot.build_navigation_keyboard(branch)
+
+            # 2026-04-29: edit-based wizard. Вместо send_message нового
+            # сообщения per branch — editMessageText того же
+            # сообщения с новым text + новой keyboard. Юзер видит
+            # plавный wizard с prev/next, а не 11 сообщений в чате.
+            # message_id берём из callback_query (Telegram включает
+            # сообщение к которому привязана нажатая кнопка).
+            cb_message = (
+                callback_query.get("message")
+                if isinstance(callback_query, dict) else None
+            )
+            msg_id = (
+                cb_message.get("message_id")
+                if isinstance(cb_message, dict) else None
+            )
+
+            edited = False
+            if msg_id is not None:
+                try:
+                    await telegram_client.edit_message_text(
+                        chat_id=str(onboarding.chat_id),
+                        message_id=int(msg_id),
+                        text=reply.text,
+                        reply_markup=keyboard,
+                    )
+                    edited = True
+                except TelegramDeliveryError as exc:
+                    # 400 «message is not modified» — Telegram молча
+                    # игнорировать (юзер тапнул на ту же ветку, но
+                    # её мы уже отфильтровали idempotency-проверкой
+                    # выше; это запасной guard для гонок).
+                    # 400 «message to edit not found» / 403 «bot blocked» —
+                    # fallback на send_message ниже.
+                    if exc.status_code == 400 and "not modified" in (str(exc) or "").lower():
+                        edited = True  # silent no-op
+                    else:
+                        logger.info(
+                            "pb: editMessageText failed status=%s — fallback to send_message",
+                            exc.status_code,
+                        )
+
+            if not edited:
+                try:
+                    await telegram_client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=reply.text,
+                        reply_markup=keyboard,
+                    )
+                except TelegramDeliveryError as exc:
+                    # 429 — rate-limited, retries только усугубят. Просто
+                    # log + drop. 403 — bot blocked. 400 — bad chat_id.
+                    # Все 4xx — non-retryable.
+                    logger.warning(
+                        "pb: branch '%s' delivery failed status=%s: %s",
+                        branch, exc.status_code, exc,
+                    )
 
         # Трекаем прогресс welcome v2 тура. Best-effort.
         if onboarding.tenant_id and onboarding.user_id:

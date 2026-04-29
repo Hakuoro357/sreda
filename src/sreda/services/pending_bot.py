@@ -288,8 +288,12 @@ def match(input_text: str | None, *, is_callback: bool = False) -> PendingReply:
 
 
 def build_inline_keyboard(reply: PendingReply) -> dict | None:
-    """Telegram inline_keyboard из ``PendingReply.buttons``. Одна
-    кнопка = одна строка (вертикально, лучше читается)."""
+    """Legacy keyboard builder — одна кнопка = одна строка вертикально.
+
+    Сохранён для backwards-compat (call site'ы переезжают на
+    ``build_navigation_keyboard`` в edit-flow). Новые сообщения
+    отправляйте через nav_keyboard, а не этот builder.
+    """
     if not reply.buttons:
         return None
     return {
@@ -298,3 +302,77 @@ def build_inline_keyboard(reply: PendingReply) -> dict | None:
             for label, branch in reply.buttons
         ],
     }
+
+
+# 2026-04-29 (edit-based wizard rework): короткие лейблы для каждой
+# ветки тура. Используются в `build_navigation_keyboard()` чтобы юзер
+# видел куда ведёт каждая кнопка («← 🎙️ Голос», «📅 Расписание →»).
+_BRANCH_LABELS: dict[str, str] = {
+    "intro":      "Привет",
+    "voice":      "🎙️ Голос",
+    "schedule":   "📅 Расписание",
+    "reminders":  "🔔 Напоминания",
+    "checklists": "📝 Дела",
+    "shopping":   "🛒 Покупки",
+    "recipes":    "📖 Рецепты",
+    "family":     "👨‍👩‍👧 Семья",
+    "memory":     "🧠 Память",
+    "dont_do":    "🚫 Чего не делаю",
+    "done":       "Готово",
+}
+
+
+def build_navigation_keyboard(current_branch: str) -> dict:
+    """Inline-keyboard для wizard-style edit-навигации.
+
+    2026-04-29: pending_bot tour теперь edit-based — одно сообщение
+    в чате, текст и кнопки эволюционируют через editMessageText.
+    Этот builder возвращает клавиатуру с prev/next переходами на
+    основе позиции в ``BRANCH_ORDER``.
+
+    Контракт:
+    * `intro` (первая ветка) → одна кнопка: «🎙️ Голос →»
+    * Промежуточные ветки → две кнопки в одном ряду:
+      «← <prev_label>» + «<next_label> →»
+    * `dont_do` (предпоследняя) → «← 🧠 Память» + «Готово ✓»
+    * `done` (финал) → пустой ``inline_keyboard`` — Telegram
+      убирает клавиатуру при edit'е с пустым массивом.
+
+    Возвращает всегда dict (не None как legacy ``build_inline_keyboard``)
+    чтобы edit-flow всегда явно прописывал состояние клавиатуры —
+    иначе Telegram сохранит старую при edit'е (не удаляя).
+    """
+    if current_branch == "done":
+        # Final: явно убираем клавиатуру через empty inline_keyboard
+        return {"inline_keyboard": []}
+
+    try:
+        idx = BRANCH_ORDER.index(current_branch)
+    except ValueError:
+        # Unknown branch — fallback на intro keyboard
+        return build_navigation_keyboard("intro")
+
+    row: list[dict] = []
+    # Prev button (если не на первой ветке)
+    if idx > 0:
+        prev_branch = BRANCH_ORDER[idx - 1]
+        prev_label = _BRANCH_LABELS.get(prev_branch, prev_branch)
+        row.append({
+            "text": f"← {prev_label}",
+            "callback_data": f"{_CB_PREFIX}{prev_branch}",
+        })
+    # Next button (если не на последней ветке)
+    if idx < len(BRANCH_ORDER) - 1:
+        next_branch = BRANCH_ORDER[idx + 1]
+        next_label = _BRANCH_LABELS.get(next_branch, next_branch)
+        if next_branch == "done":
+            # Особый кейс: финальная кнопка — «Готово ✓», без эмодзи лейбла
+            next_text = "Готово ✓"
+        else:
+            next_text = f"{next_label} →"
+        row.append({
+            "text": next_text,
+            "callback_data": f"{_CB_PREFIX}{next_branch}",
+        })
+
+    return {"inline_keyboard": [row]}

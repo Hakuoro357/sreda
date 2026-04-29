@@ -192,17 +192,66 @@ async def telegram_webhook(
                 except TelegramDeliveryError:
                     pass
 
-            try:
-                await pending_client.send_message(
-                    chat_id=onboarding.chat_id,
-                    text=reply.text,
-                    reply_markup=pending_bot.build_inline_keyboard(reply),
-                )
-            except TelegramDeliveryError as exc:
-                logger.warning(
-                    "pending_bot reply failed tenant=%s: %s",
-                    onboarding.tenant_id, exc,
-                )
+            # 2026-04-29: edit-based wizard. Если callback — эдитим
+            # тот же message (wizard navigation prev/next). Если text/
+            # voice — send_message нового intro (юзер ещё не в туре).
+            #
+            # branch резолвим через `pending_bot.match()` который
+            # возвращает PendingReply, но нам нужно знать сам branch
+            # name для `build_navigation_keyboard`. Если callback с
+            # `pb:<branch>` — извлекаем branch напрямую. Иначе —
+            # fallback на "intro" (новый юзер).
+            from sreda.services.pending_bot import (
+                _BRANCHES as _PB_BRANCHES,  # noqa: F401  (легковесный import)
+            )
+            current_branch = "intro"
+            if is_callback and input_text:
+                raw = input_text.removeprefix("pb:").strip()
+                if raw in _PB_BRANCHES:
+                    current_branch = raw
+            keyboard = pending_bot.build_navigation_keyboard(current_branch)
+
+            cb_message = (
+                callback_query.get("message")
+                if isinstance(callback_query, dict) else None
+            )
+            cb_msg_id = (
+                cb_message.get("message_id")
+                if isinstance(cb_message, dict) else None
+            )
+
+            edited = False
+            if is_callback and cb_msg_id is not None:
+                try:
+                    await pending_client.edit_message_text(
+                        chat_id=str(onboarding.chat_id),
+                        message_id=int(cb_msg_id),
+                        text=reply.text,
+                        reply_markup=keyboard,
+                    )
+                    edited = True
+                except TelegramDeliveryError as exc:
+                    if exc.status_code == 400 and "not modified" in (str(exc) or "").lower():
+                        edited = True
+                    else:
+                        logger.info(
+                            "pending: editMessageText failed status=%s — "
+                            "fallback to send_message",
+                            exc.status_code,
+                        )
+
+            if not edited:
+                try:
+                    await pending_client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=reply.text,
+                        reply_markup=keyboard,
+                    )
+                except TelegramDeliveryError as exc:
+                    logger.warning(
+                        "pending_bot reply failed tenant=%s: %s",
+                        onboarding.tenant_id, exc,
+                    )
         else:
             logger.info(
                 "pending tenant %s — no bot token/chat_id, drop (update_id=%s)",

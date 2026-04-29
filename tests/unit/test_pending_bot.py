@@ -46,23 +46,99 @@ def test_branch_index_unknown_returns_minus_one() -> None:
     assert pending_bot.branch_index("") == -1
 
 
-def test_branch_index_supports_idempotency_compare() -> None:
-    """Контракт: cur_idx <= last_idx означает повтор/откат → no-op.
+def test_branch_index_supports_strict_equality_idempotency() -> None:
+    """2026-04-29: после edit-based wizard rework контракт изменился.
+    Idempotency блокирует ТОЛЬКО точный повтор того же branch'а
+    (cur_idx == last_idx). «Откат назад» (cur_idx < last_idx) — теперь
+    легитимная навигация (юзер тапнул «← prev»), не блокируется.
 
-    Сценарий tg_1089832184 19:25: юзер тапнул `pb:schedule` (idx=2),
-    welcome_v2_progress.last_branch == 'schedule'. Повторный tap должен
-    дать cur_idx <= last_idx, т.е. skip."""
-    cur = pending_bot.branch_index("schedule")
-    last = pending_bot.branch_index("schedule")
-    assert cur >= 0 and last >= 0
-    assert cur <= last  # повтор → drop
+    Старая семантика `cur_idx <= last_idx` вызывала бы блок prev-таппа
+    в wizard'е, что сломало бы B (двустороннюю) навигацию."""
+    # Точный повтор — блокируется
+    assert pending_bot.branch_index("schedule") == pending_bot.branch_index("schedule")
+    # «Откат назад» — НЕ блокируется (cur != last)
+    assert pending_bot.branch_index("intro") != pending_bot.branch_index("reminders")
+    # Forward — НЕ блокируется
+    assert pending_bot.branch_index("schedule") != pending_bot.branch_index("voice")
 
-    # Откат назад: юзер на reminders (3), тапнул intro (0)
-    cur = pending_bot.branch_index("intro")
-    last = pending_bot.branch_index("reminders")
-    assert cur < last  # cur ≤ last → drop
 
-    # Forward progress: юзер на voice (1), тапнул schedule (2)
-    cur = pending_bot.branch_index("schedule")
-    last = pending_bot.branch_index("voice")
-    assert cur > last  # cur > last → proceed
+def test_navigation_keyboard_intro_has_only_next() -> None:
+    """Первая ветка — только кнопка «next →» (нет prev)."""
+    kb = pending_bot.build_navigation_keyboard("intro")
+    rows = kb["inline_keyboard"]
+    assert len(rows) == 1, f"intro: expected 1 row, got {rows}"
+    assert len(rows[0]) == 1, "intro: expected only 'next' button"
+    btn = rows[0][0]
+    assert btn["callback_data"] == "pb:voice"
+    assert "Голос" in btn["text"] and "→" in btn["text"]
+
+
+def test_navigation_keyboard_middle_has_prev_and_next() -> None:
+    """Средняя ветка (например voice) — prev + next в одном ряду."""
+    kb = pending_bot.build_navigation_keyboard("voice")
+    rows = kb["inline_keyboard"]
+    assert len(rows) == 1
+    assert len(rows[0]) == 2, "voice: expected prev + next buttons"
+    prev_btn, next_btn = rows[0]
+    assert prev_btn["callback_data"] == "pb:intro"
+    assert "←" in prev_btn["text"]
+    assert "Привет" in prev_btn["text"]
+    assert next_btn["callback_data"] == "pb:schedule"
+    assert "Расписание" in next_btn["text"]
+    assert "→" in next_btn["text"]
+
+
+def test_navigation_keyboard_pre_final_branch_uses_gotovo_label() -> None:
+    """Предпоследняя ветка `dont_do` — next кнопка «Готово ✓»,
+    не «Готово →»."""
+    kb = pending_bot.build_navigation_keyboard("dont_do")
+    rows = kb["inline_keyboard"]
+    prev_btn, next_btn = rows[0]
+    assert prev_btn["callback_data"] == "pb:memory"
+    assert next_btn["callback_data"] == "pb:done"
+    assert "Готово" in next_btn["text"]
+    assert "✓" in next_btn["text"]
+    assert "→" not in next_btn["text"], "final next: emoji ✓, not arrow"
+
+
+def test_navigation_keyboard_done_is_empty_keyboard() -> None:
+    """Финал `done` — пустой inline_keyboard (Telegram удалит buttons
+    при editMessageText с этим markup'ом)."""
+    kb = pending_bot.build_navigation_keyboard("done")
+    assert kb == {"inline_keyboard": []}
+
+
+def test_navigation_keyboard_unknown_branch_falls_back_to_intro() -> None:
+    """Неизвестный branch (alias / typo) → intro keyboard."""
+    intro_kb = pending_bot.build_navigation_keyboard("intro")
+    fallback_kb = pending_bot.build_navigation_keyboard("nonexistent_xyz")
+    assert fallback_kb == intro_kb
+
+
+def test_navigation_keyboard_all_branches_round_trip_consistent() -> None:
+    """Цепочка: на каждой ветке next ведёт к следующей в BRANCH_ORDER,
+    prev ведёт к предыдущей. Проверка что builder корректно собирает
+    переходы по всему туру."""
+    order = pending_bot.BRANCH_ORDER
+    for i, br in enumerate(order):
+        kb = pending_bot.build_navigation_keyboard(br)
+        if br == "done":
+            assert kb == {"inline_keyboard": []}
+            continue
+        rows = kb["inline_keyboard"]
+        flat = rows[0]
+        # Prev button
+        if i == 0:
+            assert all(
+                not b["callback_data"].endswith(order[max(i-1, 0)]) or
+                b["text"].startswith("←") is False  # no prev on first
+                for b in flat
+            )
+        else:
+            prev_match = [b for b in flat if b["callback_data"] == f"pb:{order[i-1]}"]
+            assert prev_match, f"branch {br}: missing prev button to {order[i-1]}"
+        # Next button
+        next_match = [b for b in flat if b["callback_data"] == f"pb:{order[i+1]}"]
+        assert next_match, f"branch {br}: missing next button to {order[i+1]}"
+
+

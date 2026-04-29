@@ -114,7 +114,12 @@ async def _send_intro(client: TelegramClient, chat_id: str) -> None:
     await client.send_message(
         chat_id=chat_id,
         text=intro.text,
-        reply_markup=pending_bot.build_inline_keyboard(intro),
+        # 2026-04-29: edit-based wizard. Broadcast создаёт ОДНО intro
+        # сообщение, дальше юзер навигирует через prev/next кнопки
+        # которые edit'ят то же самое сообщение (через
+        # `_handle_callback`). build_navigation_keyboard("intro")
+        # возвращает только «Голос →» (нет prev на первой ветке).
+        reply_markup=pending_bot.build_navigation_keyboard("intro"),
     )
 
 
