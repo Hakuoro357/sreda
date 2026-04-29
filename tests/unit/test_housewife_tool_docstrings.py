@@ -340,6 +340,24 @@ def test_tool_discipline_addendum_fires_for_all_models():
         )
 
 
+def test_tool_discipline_addendum_forbids_internal_jargon_to_user():
+    """2026-04-29 (incident user_tg_352612382): LLM ответил юзеру
+    «я только что вызвала оба tool'а» — раскрывает внутреннюю
+    механику. Промпт должен явно запрещать упоминание tool/функция/
+    API/идентификаторов и т.п. в финальном ответе."""
+    from sreda.runtime.handlers import _TOOL_DISCIPLINE_ADDENDUM
+
+    low = _TOOL_DISCIPLINE_ADDENDUM.lower()
+    # Rule must call out the most common leak phrases.
+    assert "tool" in low and "функц" in low and "api" in low, (
+        "addendum missing technical-jargon ban list"
+    )
+    # Must say juser doesn't see code.
+    assert "по-человечески" in low or "видит ассистент" in low, (
+        "addendum must position juser-facing language vs internal mechanics"
+    )
+
+
 def test_tool_discipline_addendum_present_regardless_of_model_name():
     """Callers that don't know the model yet (bench tools, tests that
     import the prompt standalone) ALSO get the addendum — discipline
