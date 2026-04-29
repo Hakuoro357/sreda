@@ -355,7 +355,36 @@ text='Спасибо, что спрашиваешь! 😊 Работаю, всё
 
 ---
 
-### 0.10 Pre-existing FK bug (carry-over) — FIXED 2026-04-29
+### 0.10 web_search полностью переписать на Tavily
+
+**Статус:** key уже в `/etc/sreda/.env::TAVILY_API_KEY`, доступность
+api.tavily.com c VDS подтверждена 2026-04-29.
+
+**Симптом сейчас.** `duckduckgo_search==8.1.1` через `backend="auto"`
+ходит на html-scraping DDG, который под капотом форвардит query
+через bing.com. Bing блочит RU egress (`89.110.77.78`) → ConnectError.
+«Только Yandex+Google» в этой библиотеке не настраивается — она
+сделана исключительно под DuckDuckGo SERP'ы.
+
+**Решение.** Заменить `build_web_search_tool` на новый
+`tavily_search` tool через Tavily API:
+* `pip install tavily-python`
+* `TavilyClient(api_key=settings.tavily_api_key).search(q, max_results=3)`
+* Адаптировать output под текущий контракт `web_search` (форматированный
+  блок «N. Title\n<snippet>\n<url>») чтобы prompt rules не ломались.
+
+**Что не трогать.** `fetch_url` — он годен для чтения конкретных URL
+(когда LLM получил ссылку и хочет вытащить content). Tavily может
+сам предоставлять content, но `fetch_url` — это другой контракт.
+
+**Acceptance.** Запрос вне погодного домена («новости», «когда
+открывается ИКЕА», «что такое Х») → Tavily возвращает 1-3 результата,
+LLM формулирует ответ. Никаких ConnectError на Bing. 0.1 закрывается
+как FIXED.
+
+---
+
+### 0.11 Pre-existing FK bug (carry-over) — FIXED 2026-04-29
 
 ✅ Заfix'ен в commit `c39a11c`. Регрессия покрыта 3 тестами.
 

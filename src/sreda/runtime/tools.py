@@ -195,14 +195,21 @@ def build_memory_tools(
         build_fetch_url_tool,
         build_web_search_tool,
     )
+    # 2026-04-29: get_weather через Open-Meteo (free, без API key,
+    # 14-day forecast). Заменяет fetch_url(wttr.in) для погодных
+    # запросов — wttr отдавал только current weather, прогноз
+    # фактически не работал.
+    from sreda.services.weather_tool import build_weather_tool
 
     web_search_tool = build_web_search_tool()
     fetch_url_tool = build_fetch_url_tool()
+    weather_tool = build_weather_tool()
 
     return [
         save_core_fact,
         save_episode,
         recall_memory,
+        weather_tool,
         web_search_tool,
         fetch_url_tool,
         log_unsupported_request,
