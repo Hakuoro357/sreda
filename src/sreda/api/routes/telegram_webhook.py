@@ -49,6 +49,32 @@ async def _fire_and_forget_ack(
             meta["status"] = "crashed"
 
 
+async def _fire_chat_action_typing(
+    client: TelegramClient, chat_id: str,
+) -> None:
+    """Fire-and-forget Telegram «печатает…» индикатор на webhook entry.
+
+    2026-04-29: одноразовый sendChatAction(typing). Telegram держит
+    индикатор ~5с, потом гасит сам. Параллельно в той же задаче
+    летит ack-message — когда он доходит до юзера, индикатор сменяется
+    реальным текстом (Telegram гасит typing на любом message от бота).
+
+    Никаких keep-alive циклов — индикатор должен исчезнуть сам через
+    5с в худшем сценарии. Если ack успел придти раньше (обычно ~80-200мс
+    с warm pool), typing вообще не успевает быть виден визуально как
+    отдельная фаза — юзер видит typing→ack плавно. На холодном pool
+    sendChatAction сам прогревает TLS-connection => ack использует уже
+    warm connection.
+
+    Failures DEBUG-level: chat action — UX sugar, не correctness."""
+    try:
+        await client.send_chat_action(chat_id=chat_id, action="typing")
+    except TelegramDeliveryError as exc:
+        logger.debug("chat_action delivery failed status=%s", exc.status_code)
+    except Exception:  # noqa: BLE001
+        logger.debug("chat_action task crashed", exc_info=True)
+
+
 def _verify_telegram_secret_token(
     secret_token_header: str | None = Header(
         default=None,
@@ -253,6 +279,18 @@ async def telegram_webhook(
             message_type in ("text", "voice")
             and not onboarding.is_new_user
         ):
+            # 2026-04-29: chat_action «печатает…» fire-and-forget.
+            # Самый дешёвый UX-сигнал юзеру что бот реагирует. Идёт
+            # параллельно с ack — обычно ack догоняет за 80-200мс и
+            # сменяет индикатор на текст. На холодном pool'е
+            # sendChatAction служит pool-warmer'ом для последующего
+            # ack. Не trace'ится (DEBUG-level only on errors).
+            asyncio.create_task(
+                _fire_chat_action_typing(
+                    telegram_client, onboarding.chat_id,
+                ),
+                name=f"chat_action:{onboarding.chat_id}",
+            )
             ack_text = pick_ack()
             ack_task = asyncio.create_task(
                 _fire_and_forget_ack(

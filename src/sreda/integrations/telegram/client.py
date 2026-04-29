@@ -35,7 +35,14 @@ def _make_pool_client() -> httpx.AsyncClient:
         limits=httpx.Limits(
             max_keepalive_connections=10,
             max_connections=20,
-            keepalive_expiry=60.0,  # держим idle TCP до 60с
+            # 2026-04-29 (incident: ack 800-900ms на холодном pool):
+            # bumped 60s → 300s. Связка с keepalive-pinger task
+            # (`run_keepalive_pinger`) который пингует `getMe` каждые
+            # 45с — пинг рефрешит idle-таймер до 300s expiry => idle
+            # connection не отрубается, ack стабильно <100мс. 300s
+            # запас на случай если pinger пропустил один tick (sleep
+            # drift, временный network glitch).
+            keepalive_expiry=300.0,
         ),
     )
 
@@ -124,6 +131,38 @@ class TelegramClient:
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         return await self._post_json("editMessageText", payload, timeout=5.0)
+
+    async def send_chat_action(self, chat_id: str, action: str = "typing") -> dict:
+        """Telegram chat-action API — показывает юзеру индикатор «печатает…».
+
+        Действие живёт ~5 секунд на стороне Telegram, потом гаснет само.
+        Если за это время бот пришлёт реальное сообщение — индикатор
+        снимается мгновенно (Telegram гарантирует это поведение).
+
+        Используется на webhook entry чтобы юзер мгновенно видел что
+        бот «реагирует», ещё до того как мы успели сформулировать
+        ack-message. Параллельно с этим вызовом запускается
+        ack-task — обычно реальный ack приходит за 80-200мс, что
+        снимает typing-индикатор естественным путём.
+
+        Возможные ``action``: typing / record_voice / upload_document /
+        find_location etc. Для нас — только ``typing``.
+        """
+        return await self._post_json(
+            "sendChatAction",
+            {"chat_id": chat_id, "action": action},
+            timeout=3.0,
+        )
+
+    async def get_me(self) -> dict:
+        """Telegram `getMe` — лёгкий запрос для прогрева TLS connection.
+
+        Используется keepalive-pinger task'ом (см. `run_keepalive_pinger`)
+        чтобы idle TCP+TLS не остывал в connection pool'е. Через SOCKS5
+        egress fresh handshake = ~800мс, warm reuse = ~50мс. Пинг каждые
+        45с держит connection живым (keepalive_expiry=300с в pool config).
+        """
+        return await self._post_json("getMe", {}, timeout=5.0)
 
     async def set_my_commands(self, commands: list[dict]) -> dict:
         return await self._post_json("setMyCommands", {"commands": commands}, timeout=10.0)
@@ -245,3 +284,56 @@ class TelegramClient:
             method=method,
             status_code=last_status,
         ) from last_error
+
+
+# 2026-04-29: keepalive pinger — фоновая task которая раз в 45с пингует
+# `getMe`, чтобы TCP+TLS connection не остывал в pool'е. Через SOCKS5
+# egress (RU IP заблокирован Telegram'ом, ходим через 89.110.77.78)
+# fresh handshake занимает 800-900мс — невыносимо для UX когда первый
+# ack юзера в день этим занимается. Pinger держит connection «горячим»
+# 24/7 ценой ~1920 пустых getMe'ев в день (копейки $-wise).
+#
+# Стратегия dumb: не трекаем last_activity, не оптимизируем — фиксированный
+# интервал 45с. Это упрощает код (нет shared state, нет race conditions),
+# а 1 запрос в 45с не тревожит rate-limit Telegram'а ни на йоту.
+#
+# DEBUG-level logging — пингов очень много, INFO засорил бы trace.
+
+_PINGER_INTERVAL_SECONDS = 45.0
+
+
+async def run_keepalive_pinger(token: str) -> None:
+    """Бесконечная task: getMe → sleep 45s → repeat.
+
+    Запускается на FastAPI lifespan startup, отменяется на shutdown
+    (через asyncio.CancelledError). Сбои getMe (network glitches,
+    egress down) не пробрасываются — просто log + продолжаем тикать.
+    Когда egress поднимется обратно, следующий пинг прогреет
+    connection заново.
+    """
+    client = TelegramClient(token)
+    logger.info(
+        "telegram keepalive pinger started: interval=%.0fs token=...%s",
+        _PINGER_INTERVAL_SECONDS, token[-6:] if len(token) > 6 else "?",
+    )
+    try:
+        while True:
+            await asyncio.sleep(_PINGER_INTERVAL_SECONDS)
+            try:
+                await client.get_me()
+                logger.debug("telegram keepalive pinger: getMe ok")
+            except TelegramDeliveryError as exc:
+                logger.debug(
+                    "telegram keepalive pinger: getMe failed status=%s",
+                    exc.status_code,
+                )
+            except Exception:  # noqa: BLE001
+                # Defensive: pinger никогда не должен ломаться. Любая
+                # неожиданная ошибка — log debug и идём дальше.
+                logger.debug(
+                    "telegram keepalive pinger: unexpected error",
+                    exc_info=True,
+                )
+    except asyncio.CancelledError:
+        logger.info("telegram keepalive pinger stopped")
+        raise
