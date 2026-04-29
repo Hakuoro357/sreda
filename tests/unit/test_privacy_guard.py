@@ -90,6 +90,77 @@ def test_privacy_guard_still_masks_real_phone() -> None:
         )
 
 
+def test_privacy_guard_structure_passes_through_id_keys() -> None:
+    """В nested dict'е поля типа `user_id`, `chat_id`, `tenant_id` не
+    должны санитайзиться — это структурные идентификаторы. Только
+    контентные поля (text/message/content/items под не-ID ключом)
+    sanitize'ятся.
+
+    2026-04-29 (Variant E — belt-and-suspenders к regex-fix'у):
+    walker сам прокинет ID нетронутым даже если кто-то в будущем
+    добавит regex без word-boundary. Контент ВЛОЖЕННЫХ контейнеров
+    под ID-ключом тоже не трогается (но ActionEnvelope не вкладывает
+    контент в ID-keys, так что edge case теоретический)."""
+    guard = get_default_privacy_guard()
+    payload = {
+        # Все ID — passthrough
+        "user_id": "user_tg_1089832184",
+        "chat_id": 1089832184,
+        "tenant_id": "tenant_tg_1089832184",
+        "workspace_id": "workspace_tg_1089832184",
+        "external_chat_id": "1089832184",
+        "feature_key": "housewife_assistant",
+        "action_type": "chat",
+        "channel_type": "telegram",
+        "bot_key": "sreda",
+        # Контентные поля — sanitize
+        "text": "позвони мне на 89261234567",
+        "items": [
+            "email: test@example.com",
+        ],
+        # Nested params dict с контентом — рекурсивный sanitize
+        "params": {
+            "message_text": "пароль qwerty12",
+        },
+    }
+
+    result = guard.sanitize_structure(payload)
+    s = result.sanitized_value
+
+    # Все ID'ы прошли без изменений
+    assert s["user_id"] == "user_tg_1089832184"
+    assert s["chat_id"] == 1089832184
+    assert s["tenant_id"] == "tenant_tg_1089832184"
+    assert s["workspace_id"] == "workspace_tg_1089832184"
+    assert s["external_chat_id"] == "1089832184"
+    assert s["feature_key"] == "housewife_assistant"
+    assert s["action_type"] == "chat"
+    assert s["channel_type"] == "telegram"
+    assert s["bot_key"] == "sreda"
+    # Контентные поля санитайзились
+    assert "[phone]" in s["text"]
+    assert "[email]" in s["items"][0]
+    # Вложенный dict под не-ID ключом — рекурсивно sanitize
+    assert "[password]" in s["params"]["message_text"]
+
+
+def test_privacy_guard_structure_id_key_protects_even_with_phone_lookalike() -> None:
+    """Даже если значение ID-ключа само похоже на телефон («+7…»),
+    walker passthrough'ит без regex'а. Защищает от corner-case'ов
+    типа `external_chat_id="+791234567890"`."""
+    guard = get_default_privacy_guard()
+    payload = {
+        "user_id": "+79261234567",        # ← искусственный, но валидный ID-формат
+        "external_chat_id": "+79261234567",
+        "text": "позвони на +79261234567",  # ← контент, должен маскироваться
+    }
+    result = guard.sanitize_structure(payload)
+    s = result.sanitized_value
+    assert s["user_id"] == "+79261234567"        # passthrough
+    assert s["external_chat_id"] == "+79261234567"
+    assert "[phone]" in s["text"]
+
+
 def test_privacy_guard_sanitizes_nested_structure() -> None:
     guard = get_default_privacy_guard()
     payload = {

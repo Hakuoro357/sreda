@@ -68,11 +68,46 @@ class RegexPrivacyGuard:
         if isinstance(value, list):
             return [self._sanitize_structure_inner(item, entities) for item in value]
         if isinstance(value, dict):
-            return {
-                key: self._sanitize_structure_inner(item, entities)
-                for key, item in value.items()
-            }
+            out: dict[Any, Any] = {}
+            for key, item in value.items():
+                # 2026-04-29 (incident user_tg_1089832184): structural
+                # ID-keys passthrough untouched. Sanitize'ить надо
+                # контент сообщений, не идентификаторы. Defence in depth
+                # к regex word-boundary fix: даже если кто-то добавит
+                # новый regex без `(?<!\w)/(?!\w)`, известные ID-поля
+                # защищены на walker-уровне.
+                if isinstance(key, str) and key in _STRUCTURAL_KEY_NAMES:
+                    out[key] = item
+                else:
+                    out[key] = self._sanitize_structure_inner(item, entities)
+            return out
         return value
+
+
+# 2026-04-29: ключи которые `sanitize_structure` оставляет нетронутыми.
+# Это структурные идентификаторы / метаданные, не пользовательский
+# контент. Их значения часто содержат 10+цифровые ID (Telegram user
+# IDs, например) и регулярки маскировки телефонов их ломали.
+#
+# Содержимое ВЛОЖЕННЫХ структур под этими ключами тоже passthrough
+# — например `params: {...}` под ключом не из этого набора будет
+# рекурсивно sanitize'иться (там `text` юзера и т.п.). Но
+# `inbound_message_id` или `tenant_id` — простой ID, walker не
+# идёт глубже.
+_STRUCTURAL_KEY_NAMES: frozenset[str] = frozenset({
+    # Generic identifiers
+    "id", "tenant_id", "workspace_id", "user_id", "assistant_id",
+    "feature_key", "skill_id",
+    # Runtime / orchestration
+    "action_id", "action_type", "run_id", "job_id", "thread_id",
+    "trace_id", "inbound_message_id", "outbox_id", "out_id",
+    "parent_id", "request_id", "correlation_id",
+    # Channel / Telegram-specific
+    "channel_type", "bot_key", "external_chat_id", "chat_id",
+    "telegram_account_id", "callback_query_id", "update_id",
+    "message_id", "from_id",
+    "voice_file_id", "file_id", "file_unique_id",
+})
 
 
 def _replace_full(entity_type: str, replacement: str):
