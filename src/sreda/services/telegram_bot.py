@@ -297,15 +297,27 @@ async def _handle_callback(
                                 except TelegramDeliveryError:
                                     pass
                             return
-                        # (b) Cooldown 3s — fallback для случая когда
-                        # last_branch не помогает (напр. первый click)
+                        # (b) Cooldown 3s — race-backstop ТОЛЬКО для
+                        # same-branch double-tap. (a) idempotency
+                        # выше блокирует branch == last_branch если
+                        # DB-state свежий, но между двумя clicks может
+                        # быть race window: первый click читает старый
+                        # last_branch ещё до commit'а второго handler'а.
+                        # Cooldown ловит этот race по `last_at`.
+                        #
+                        # 2026-04-29: применяется ТОЛЬКО когда
+                        # branch == last_branch. Для legitimate
+                        # prev/next navigation (разные ветки) не
+                        # блокирует — иначе wizard зависает на быстрых
+                        # кликах (юзер прокликивает тур за 5-10с).
                         last_at_str = progress.get("last_at")
-                        if last_at_str:
+                        if last_at_str and branch == last_branch:
                             last_at = datetime.fromisoformat(last_at_str)
                             elapsed = datetime.now(timezone.utc) - last_at
                             if elapsed < timedelta(seconds=3):
                                 logger.info(
-                                    "pb: cooldown skip tenant=%s branch=%s elapsed=%.2fs",
+                                    "pb: cooldown skip (same-branch race) tenant=%s "
+                                    "branch=%s elapsed=%.2fs",
                                     onboarding.tenant_id, branch, elapsed.total_seconds(),
                                 )
                                 if callback_id:
