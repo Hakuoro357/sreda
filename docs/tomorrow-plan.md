@@ -313,7 +313,51 @@ fetch() PATCH) — вся страница перезагружается. UX п
 
 ---
 
-### 0.9 Pre-existing FK bug (carry-over)
+### 0.9 Не писать содержимое сообщений / ответов в логи (152-ФЗ)
+
+**Симптом.** В `/var/log/sreda/uvicorn.log` пишется raw payload:
+
+```
+2026-04-29 07:48:18 INFO sreda.llm response tenant=tenant_tg_352612382
+feature=housewife_assistant iter=0 tokens=23933/72 tools=[]
+text='Спасибо, что спрашиваешь! 😊 Работаю, всё хорошо. У тебя как дела?
+Чем могу помочь сегодня?'
+```
+
+Также видны:
+- `sreda.llm invoke ... last='привет'` — последняя human-message
+- `sreda.runtime.handlers chat: fallback LLM built provider=...`
+  (no leak, OK)
+
+**Почему критично.** 152-ФЗ + general PII hygiene: сообщения юзеров и
+ответы ассистента — персональные данные. Логи на VDS читаются при
+дебаге, могут попасть в backup, в Object Storage. Не должны
+содержать сырого контента.
+
+**Что сделать.**
+1. Убрать `text=...` поле из `sreda.llm response` лога. Заменить на
+   `chars=N` (длина) и `tools=[...]` — этого хватает для дебага
+   разрывов вроде «бот молчит» / «бот не вызвал tool».
+2. Убрать `last=...` из `sreda.llm invoke` лога. Заменить на
+   `last_chars=N` и `last_role`.
+3. Проверить весь stack: `runtime/handlers.py`, `services/llm.py`,
+   `runtime/graph.py`, `services/inbound_messages.py`,
+   `services/housewife_*.py`. Любое логирование `text`, `payload`,
+   `content`, `message` должно быть с redaction или вообще снято.
+4. Trace тоже — `chat.reply chars=271` (OK, длина), но проверить нет
+   ли `text=` где-то.
+
+**Acceptance.** В `/var/log/sreda/uvicorn.log` НЕТ raw text юзера или
+бота. Только metadata (длины, tool-имена, ID'ы, latency, tenant_id).
+
+**Файлы:** `src/sreda/services/llm.py`, `src/sreda/runtime/handlers.py`,
+любые `*.py` где `logger.info("... text=%r", text)` или подобное.
+
+---
+
+### 0.10 Pre-existing FK bug (carry-over) — FIXED 2026-04-29
+
+✅ Заfix'ен в commit `c39a11c`. Регрессия покрыта 3 тестами.
 
 **Симптом (был до VDS-миграции).** Webhook `tenant_tg_1089832184` →
 500 на insert outbox: `FOREIGN KEY constraint failed`,
