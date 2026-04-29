@@ -4,7 +4,7 @@ from sreda.services.privacy_guard import get_default_privacy_guard
 def test_privacy_guard_redacts_common_sensitive_fragments() -> None:
     guard = get_default_privacy_guard()
     text = (
-        "Телефон +7 999 123-45-67, email test@example.com, "
+        "email test@example.com, "
         "номер лицевого счета: 1407009, пароль qwerty, "
         "логин user@example.com, token abc123, "
         "ссылка https://example.com/reset?token=abc123"
@@ -14,13 +14,36 @@ def test_privacy_guard_redacts_common_sensitive_fragments() -> None:
 
     assert result is not None
     assert result.contains_sensitive_data is True
-    assert "[phone]" in result.sanitized_text
     assert "[email]" in result.sanitized_text
     assert "[account_number]" in result.sanitized_text
     assert "[password]" in result.sanitized_text
     assert "[login]" in result.sanitized_text
     assert "[secret]" in result.sanitized_text
     assert "[url]" in result.sanitized_text
+
+
+# 2026-04-29: phone-rule снят (см. privacy_guard.py). Телефоны теперь
+# проходят как plaintext в sanitized_text — это нужно для скилов,
+# которые сохраняют контакты (аптеки, врачи, члены семьи). Тест
+# фиксирует это новое поведение.
+def test_privacy_guard_does_not_mask_phone_numbers() -> None:
+    guard = get_default_privacy_guard()
+    cases = [
+        "позвони +79261234567",
+        "тел 8 (926) 123-45-67",
+        "номер 89261234567 это мой",
+        "+7 999 123-45-67",
+        "+7 495 969-50-03",
+    ]
+    for text in cases:
+        result = guard.sanitize_text(text)
+        assert result is not None, text
+        assert "[phone]" not in result.sanitized_text, (
+            f"phone unexpectedly masked in {text!r} → {result.sanitized_text!r}"
+        )
+        assert "[number]" not in result.sanitized_text, (
+            f"phone-as-number unexpectedly masked in {text!r} → {result.sanitized_text!r}"
+        )
 
 
 def test_privacy_guard_does_not_redact_plain_claim_id() -> None:
@@ -73,23 +96,6 @@ def test_privacy_guard_preserves_outbox_id() -> None:
         assert result.sanitized_text == raw_id
 
 
-def test_privacy_guard_still_masks_real_phone() -> None:
-    """Регрессия не сломала маскировку настоящих телефонов."""
-    guard = get_default_privacy_guard()
-    cases = [
-        "позвони +79261234567",
-        "тел 8 (926) 123-45-67",
-        "номер 89261234567 это мой",
-        "+7 999 123-45-67",
-    ]
-    for text in cases:
-        result = guard.sanitize_text(text)
-        assert result is not None, text
-        assert "[phone]" in result.sanitized_text, (
-            f"phone NOT masked in {text!r} → {result.sanitized_text!r}"
-        )
-
-
 def test_privacy_guard_structure_passes_through_id_keys() -> None:
     """В nested dict'е поля типа `user_id`, `chat_id`, `tenant_id` не
     должны санитайзиться — это структурные идентификаторы. Только
@@ -114,9 +120,9 @@ def test_privacy_guard_structure_passes_through_id_keys() -> None:
         "channel_type": "telegram",
         "bot_key": "sreda",
         # Контентные поля — sanitize
-        "text": "позвони мне на 89261234567",
+        "text": "напиши на test@example.com",
         "items": [
-            "email: test@example.com",
+            "email: other@example.com",
         ],
         # Nested params dict с контентом — рекурсивный sanitize
         "params": {
@@ -138,27 +144,10 @@ def test_privacy_guard_structure_passes_through_id_keys() -> None:
     assert s["channel_type"] == "telegram"
     assert s["bot_key"] == "sreda"
     # Контентные поля санитайзились
-    assert "[phone]" in s["text"]
+    assert "[email]" in s["text"]
     assert "[email]" in s["items"][0]
     # Вложенный dict под не-ID ключом — рекурсивно sanitize
     assert "[password]" in s["params"]["message_text"]
-
-
-def test_privacy_guard_structure_id_key_protects_even_with_phone_lookalike() -> None:
-    """Даже если значение ID-ключа само похоже на телефон («+7…»),
-    walker passthrough'ит без regex'а. Защищает от corner-case'ов
-    типа `external_chat_id="+791234567890"`."""
-    guard = get_default_privacy_guard()
-    payload = {
-        "user_id": "+79261234567",        # ← искусственный, но валидный ID-формат
-        "external_chat_id": "+79261234567",
-        "text": "позвони на +79261234567",  # ← контент, должен маскироваться
-    }
-    result = guard.sanitize_structure(payload)
-    s = result.sanitized_value
-    assert s["user_id"] == "+79261234567"        # passthrough
-    assert s["external_chat_id"] == "+79261234567"
-    assert "[phone]" in s["text"]
 
 
 def test_privacy_guard_sanitizes_nested_structure() -> None:
@@ -173,9 +162,11 @@ def test_privacy_guard_sanitizes_nested_structure() -> None:
 
     result = guard.sanitize_structure(payload)
 
+    # Phone больше не маскируется, проходит plaintext'ом.
+    # Email и password продолжают маскироваться.
     assert result.contains_sensitive_data is True
     assert result.sanitized_value == {
-        "text": "мой телефон [phone]",
+        "text": "мой телефон +7 999 123-45-67",
         "items": [
             "email [email]",
             {"note": "пароль [password]"},

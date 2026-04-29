@@ -182,28 +182,17 @@ _RULES: list[tuple[re.Pattern[str], Any]] = [
         re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b", re.IGNORECASE),
         _replace_full("email", "[email]"),
     ),
-    (
-        # 2026-04-29 (incident user_tg_1089832184): boundary lookbehind/
-        # lookahead против match'а внутри structural ID'ов вида
-        # `user_tg_1089832184` / `tenant_tg_1089832184`. Раньше regex без
-        # boundary'ев матчил 10-значное окно внутри ID и заменял на
-        # [phone] → ломал FK при insert outbox (`user_id='user_tg_[phone]'`
-        # — отсутствует в users). `\b` стандартно не срабатывает между
-        # `_` и `\d` т.к. оба — `\w`. Меняем на explicit `(?<!\w)/(?!\w)`
-        # чтобы любой `\w` (в т.ч. underscore) blocked match.
-        re.compile(r"(?<!\w)\+?\d[\d\s()\-]{8,}\d(?!\w)"),
-        _replace_full("phone", "[phone]"),
-    ),
+    # 2026-04-29: phone-маскировка снята. Телефон — обычные ПДн (не
+    # спец-категория ст.10), и без plaintext'а для LLM юзеры не могут
+    # сохранять номера в скилах (housewife: контакты аптек, врачей,
+    # семьи). Юр. покрытие — через явное согласие в политике обработки
+    # ПДн + цель «персональный AI-ассистент». Аналогично снят generic
+    # `\d{10,}` rule (раньше ловил телефоны без разделителей и id'шники
+    # внешних систем как `[number]`). Credentials/health-data/url-secrets
+    # маскируются как раньше.
     (
         re.compile(r"https?://[^\s]+", re.IGNORECASE),
         lambda match, entities: _replace_url(match, entities),
-    ),
-    (
-        # Аналогично — explicit boundary вместо `\b` чтобы underscore
-        # тоже считался разделителем (структурные ID типа
-        # `tg_352612382` не должны трактоваться как «number»).
-        re.compile(r"(?<!\w)\d{10,}(?!\w)"),
-        _replace_full("number", "[number]"),
     ),
     # 2026-04-27 (152-ФЗ обезличивание Часть 1): спец-категория ст. 10
     # — данные о состоянии здоровья. Маркируем триггерные слова

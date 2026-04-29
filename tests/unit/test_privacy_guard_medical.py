@@ -89,22 +89,25 @@ def test_diagnosis_inflected_forms(guard):
 
 def test_other_rules_still_work(guard):
     """Добавление мед-правил не должно ломать существующие правила."""
-    res = guard.sanitize_text("email mom@example.com и тел +79991234567")
+    res = guard.sanitize_text("email mom@example.com и пароль supersecret")
     assert res is not None
     assert "[email]" in res.sanitized_text
-    assert "[phone]" in res.sanitized_text
+    assert "[password]" in res.sanitized_text
 
 
 def test_combined_medical_and_pii(guard):
+    # Phone-rule снят (см. privacy_guard.py, 2026-04-29). Allergy
+    # остаётся спец-категорией ст.10 — маскируется. Phone проходит
+    # plaintext'ом — это нужно для скилов сохраняющих контакты.
     res = guard.sanitize_text(
         "У ребёнка аллергия, звонок врачу +79991234567"
     )
     assert res is not None
     assert "[allergy]" in res.sanitized_text
-    assert "[phone]" in res.sanitized_text
+    assert "+79991234567" in res.sanitized_text
     types = {e.entity_type for e in res.entities}
     assert "allergy" in types
-    assert "phone" in types
+    assert "phone" not in types
 
 
 def test_original_text_preserved(guard):

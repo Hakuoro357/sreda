@@ -70,7 +70,7 @@ def test_telegram_webhook_persists_sanitized_and_encrypted_payload(
         "message": {
             "message_id": 77,
             "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
-            "text": "мой пароль qwerty и телефон +7 999 123-45-67",
+            "text": "мой пароль qwerty и email me@example.com",
         },
     }
 
@@ -90,13 +90,13 @@ def test_telegram_webhook_persists_sanitized_and_encrypted_payload(
 
     assert inbound.bot_key == "sreda"
     assert inbound.sender_chat_id == EXISTING_CHAT_ID
-    assert inbound.message_text_sanitized == "мой пароль [password] и телефон [phone]"
+    assert inbound.message_text_sanitized == "мой пароль [password] и email [email]"
     assert inbound.contains_sensitive_data is True
     assert inbound.secure_record_id == secure_record.id
     assert secure_record.record_type == "telegram_webhook_raw"
     assert secure_record.record_key == "12345"
     assert "qwerty" not in secure_record.encrypted_json
-    assert "+7 999 123-45-67" not in secure_record.encrypted_json
+    assert "me@example.com" not in secure_record.encrypted_json
     assert load_secure_json(secure_record) == payload
 
 
