@@ -192,3 +192,30 @@ def test_telegram_delivery_error_defaults_to_none() -> None:
     err = TelegramDeliveryError("legacy")
     assert err.method is None
     assert err.status_code is None
+
+
+# 2026-04-29 (incident user_tg_471032584): Telegram Bot API в edge-cases
+# (невалидный reply_markup, malformed parse_mode, etc.) умеет вернуть
+# HTTP 200 с `{"ok": false, "description": "..."}`. Раньше client
+# возвращал такой body как успех, caller думал что отправили, юзер
+# не получал ничего, в логах только `200 OK`. Теперь явно raise
+# TelegramDeliveryError на ok=false.
+@pytest.mark.asyncio
+async def test_200_with_ok_false_raises(mock_pool_client) -> None:
+    """HTTP 200 + body `{ok: false, description: ...}` → TelegramDeliveryError."""
+    mock_pool_client.post.side_effect = [
+        _ok_response({
+            "ok": False,
+            "error_code": 400,
+            "description": "Bad Request: can't parse entities",
+        }),
+    ]
+
+    client = TelegramClient(token="test-token")
+    with pytest.raises(TelegramDeliveryError) as exc_info:
+        await client.send_message("123", "test")
+
+    assert exc_info.value.method == "sendMessage"
+    assert "ok=false" in str(exc_info.value)
+    assert "can't parse entities" in str(exc_info.value)
+    assert mock_pool_client.post.call_count == 1, "ok=false — no retry"

@@ -264,7 +264,28 @@ class TelegramClient:
                     url, json=json, data=data, files=files, timeout=timeout,
                 )
                 response.raise_for_status()
-                return response.json()
+                # 2026-04-29 (incident user_tg_471032584): Telegram Bot API
+                # умеет возвращать HTTP 200 с `{"ok": false, "description":
+                # "..."}` (невалидный reply_markup, parse_mode-ошибка, и
+                # т.п.). Раньше return'или body как есть → caller думал
+                # что отправка прошла, юзер ничего не получал, в логах
+                # только «200 OK». Теперь явно ловим `ok=false` и кидаем
+                # TelegramDeliveryError с полным body чтобы при инциденте
+                # было видно что реально вернул Telegram.
+                body = response.json()
+                if isinstance(body, dict) and body.get("ok") is False:
+                    description = body.get("description")
+                    logger.warning(
+                        "Telegram %s ok=false: status=%s description=%r body=%s",
+                        method, response.status_code, description,
+                        str(body)[:500],
+                    )
+                    raise TelegramDeliveryError(
+                        f"Telegram {method}: ok=false desc={description!r}",
+                        method=method,
+                        status_code=response.status_code,
+                    )
+                return body
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 last_status = exc.response.status_code
