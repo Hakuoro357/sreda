@@ -24,6 +24,7 @@ import sys
 import time
 from typing import Iterable
 
+import sqlalchemy as sa
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
@@ -69,10 +70,13 @@ def main() -> int:
     print(f"[snapshot] {len(src_counts)} tables, {total_rows} total rows")
 
     # ------------------------------------------------------------------
-    # Phase 2: TRUNCATE PG tables in reverse FK order (clears alembic
-    # seed rows like subscription_plans без drop/recreate базы).
+    # Phase 2: TRUNCATE PG tables (clears alembic seed rows).
+    # Disable FK checks via session_replication_role=replica — sorted_tables
+    # неточно из-за cycle connect_sessions ↔ tenant_eds_accounts.
+    # Требует SUPERUSER (granted in deploy script).
     # ------------------------------------------------------------------
     with pg_engine.begin() as dst:
+        dst.execute(sa.text("SET session_replication_role = replica"))
         for table in reversed(Base.metadata.sorted_tables):
             if table.name in SKIP_TABLES:
                 continue
@@ -86,28 +90,30 @@ def main() -> int:
     SqliteSession = sessionmaker(sqlite_engine)
     PgSession = sessionmaker(pg_engine)
 
-    for table in Base.metadata.sorted_tables:
-        if table.name in SKIP_TABLES:
-            continue
-        n_expected = src_counts[table.name]
-        if n_expected == 0:
-            print(f"[skip ] {table.name:<40} 0 rows")
-            continue
+    # Открываем ONE connection для всей INSERT-phase. session_replication_role=replica
+    # отключает FK triggers, обходит cycle connect_sessions ↔ tenant_eds_accounts.
+    with pg_engine.begin() as dst:
+        dst.execute(sa.text("SET session_replication_role = replica"))
+        for table in Base.metadata.sorted_tables:
+            if table.name in SKIP_TABLES:
+                continue
+            n_expected = src_counts[table.name]
+            if n_expected == 0:
+                print(f"[skip ] {table.name:<40} 0 rows")
+                continue
 
-        t0 = time.time()
-        with sqlite_engine.connect() as src:
-            rows = [dict(r._mapping) for r in src.execute(select(table)).all()]
+            t0 = time.time()
+            with sqlite_engine.connect() as src:
+                rows = [dict(r._mapping) for r in src.execute(select(table)).all()]
 
-        # Insert into PG в одной транзакции на таблицу.
-        n_inserted = 0
-        with pg_engine.begin() as dst:
+            n_inserted = 0
             for batch in _chunks(rows, BATCH_SIZE):
                 dst.execute(table.insert(), batch)
                 n_inserted += len(batch)
 
-        elapsed = time.time() - t0
-        rate = n_inserted / elapsed if elapsed > 0 else float("inf")
-        print(f"[load ] {table.name:<40} {n_inserted:>6} rows in {elapsed:>5.2f}s ({rate:>6.0f} rps)")
+            elapsed = time.time() - t0
+            rate = n_inserted / elapsed if elapsed > 0 else float("inf")
+            print(f"[load ] {table.name:<40} {n_inserted:>6} rows in {elapsed:>5.2f}s ({rate:>6.0f} rps)")
 
     # ------------------------------------------------------------------
     # Phase 4: verify counts match.
