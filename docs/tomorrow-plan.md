@@ -383,6 +383,60 @@ SSH dynamic-forward = TCP-over-TCP, head-of-line blocking возможен:
 - (если делаем 9.3): outbound `sendMessage` p95 latency < 800мс
   стабильно, без spike'ов >5 секунд
 
+### 10. MAX integration — sprint целиком, сразу long-poll
+
+**Контекст.** Бот в МАКС зарегистрирован, токен в `/etc/sreda/.env`
+как `SREDA_MAX_BOT_TOKEN`. Schema 0035 уже добавила `users.max_account_id`
++ `tenants.preferred_channel`. Inbound/outbound для MAX **не реализован**.
+Юзер с MAX сейчас не может ничего ни отправить ни получить.
+
+**Решение принято 2026-04-30 PM:** делаем **сразу long-poll**, без webhook'а.
+Webhook путь для TG сегодня показал свою фрагильность (middlebox'ы между
+TG и нашим nginx); у MAX по тому же сценарию могут быть аналогичные
+проблемы. Нет смысла идти `webhook → потом ломаться → переделывать на
+long-poll`. Шаблон `TelegramLongPoller` готов и протестирован — копировать
+проще чем писать webhook путь с нуля.
+
+**Объём:** 2-3 рабочих дня сплошным спринтом (не куски — иначе контекст MAX
+API будет каждый раз заново грузить).
+
+**Файлы:**
+- `src/sreda/integrations/max/client.py` — `MaxClient` (httpx-обёртка
+  над `platform-api.max.ru`). Аутентификация через `Authorization`
+  header, не Bearer-token как у TG
+- `src/sreda/services/max_inbound.py::handle_max_update` — channel-agnostic
+  durable ingest, тот же lifecycle `ingested → processing_started → processed`
+  на `inbound_messages.processing_status`
+- `src/sreda/services/onboarding.py::ensure_max_user_bundle` — создаёт
+  tenant/user/workspace для MAX-юзера (по `max_account_id` вместо
+  `telegram_account_id`)
+- `src/sreda/workers/max_long_poll.py` — `MaxLongPoller`, advisory
+  lock с другим `LOCK_KEY`, heartbeat в той же `poller_heartbeats`
+  с `channel='max'`, offset в `poller_offsets` с `channel='max'`
+- `deploy/systemd/sreda-max-poller.service` — отдельный systemd unit
+- `tests/unit/test_max_long_poll.py` — копия паттернов test_telegram_long_poll.py
+- `scripts/dev/probe_max_api.py` — research-script для понимания формата
+  updates, ack-механики, error codes (нет публичной доки уровня TG)
+
+**Что НЕ пишем:**
+- ❌ FastAPI webhook route для MAX — обходимся long-poll'ом сразу
+- ❌ MAX-specific privacy_guard — общий privacy_guard работает на тексте
+  независимо от канала
+
+**Acceptance:**
+- Юзер регистрируется в MAX → `ensure_max_user_bundle` создаёт tenant
+- Юзер пишет → ответ за 5-15 секунд (как TG)
+- 0 алертов от `unprocessed_inbound` за 24 часа
+- Tenant с `preferred_channel='max'` получает outbound в MAX, не TG
+- Tenant с обоими каналами (`max_account_id IS NOT NULL AND
+  telegram_account_id IS NOT NULL`) — отдельный тест-кейс на маршрутизацию
+
+**Когда:** после закрытия пункта 9 (outbound фикс), ориентир — после
+завтрашнего разбора `message_id` логов.
+
+**Риск:** MAX API менее зрелый чем TG, нет публичной доки. Возможно
+придётся реверс-инжинирить через probe. На probe заложить ~0.5 дня.
+
 ---
 
 **Открытые блокеры.**
