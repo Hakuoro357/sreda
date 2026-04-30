@@ -252,20 +252,28 @@ def probe_pg_locks() -> ProbeResult:
 # ---------------------------------------------------------------------------
 # External API latency probes
 # ---------------------------------------------------------------------------
-def _external_latency(url: str, name: str, baseline_ms: int = 500) -> ProbeResult:
-    """Measure GET latency. Critical if 2x consecutive misses or >2x baseline."""
+def _external_latency(
+    url: str,
+    name: str,
+    baseline_ms: int = 500,
+    warning_ms: int | None = None,
+    timeout_s: float = 5.0,
+) -> ProbeResult:
+    """Measure GET latency. Critical if 5xx или timeout. Warning если elapsed
+    > warning_ms (если задан) или > 4x baseline иначе."""
+    threshold_ms = warning_ms if warning_ms is not None else baseline_ms * 4
     try:
         t0 = time.time()
-        with httpx.Client(timeout=5.0) as c:
+        with httpx.Client(timeout=timeout_s) as c:
             r = c.get(url)
         elapsed_ms = int((time.time() - t0) * 1000)
         if r.status_code >= 500:
             return ProbeResult(name, "critical", f"{r.status_code} ({elapsed_ms}ms)")
-        if elapsed_ms > baseline_ms * 4:
-            return ProbeResult(name, "warning", f"{elapsed_ms}ms (4x baseline {baseline_ms}ms)")
+        if elapsed_ms > threshold_ms:
+            return ProbeResult(name, "warning", f"{elapsed_ms}ms (threshold {threshold_ms}ms)")
         return ProbeResult(name, "ok", f"{elapsed_ms}ms")
     except httpx.TimeoutException:
-        return ProbeResult(name, "critical", "timeout >5s")
+        return ProbeResult(name, "critical", f"timeout >{timeout_s}s")
     except Exception as e:
         return ProbeResult(name, "critical", f"error: {type(e).__name__}: {str(e)[:100]}")
 
@@ -279,8 +287,17 @@ def probe_telegram_api_latency() -> ProbeResult:
 
 
 def probe_mimo_llm_latency() -> ProbeResult:
-    return _external_latency("https://token-plan-sgp.xiaomimimo.com/v1/models",
-                              "mimo_llm_latency", baseline_ms=500)
+    # Singapore datacenter — нестабильный путь через инет, периодические
+    # сетевые блипы давали false-warnings. Поднял threshold до 20s —
+    # ловим только серьёзные деградации (юзеры на fallback openrouter
+    # переключатся раньше). Increase timeout до 22s чтобы ничего не
+    # обрезалось на стороне probe.
+    return _external_latency(
+        "https://token-plan-sgp.xiaomimimo.com/v1/models",
+        "mimo_llm_latency",
+        warning_ms=20_000,
+        timeout_s=22.0,
+    )
 
 
 def probe_openrouter_latency() -> ProbeResult:
