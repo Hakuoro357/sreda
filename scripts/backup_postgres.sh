@@ -17,8 +17,13 @@ DEST=/var/backups/sreda
 LOG=/var/log/sreda/backup.log
 RETENTION_DAYS=14
 KEY_FILE=/etc/sreda/.backup_key
+PGPASSFILE_PATH=/var/lib/sreda/.pgpass
 DATE=$(date -u +%Y%m%d-%H%M%S)
 DUMP="$DEST/sreda-$DATE.dump"
+
+# Explicit pgpass — sreda user's HOME is not always /var/lib/sreda when
+# called from cron, so HOME/.pgpass discovery is unreliable.
+export PGPASSFILE="$PGPASSFILE_PATH"
 
 mkdir -p "$DEST"
 ts() { date -u +'%Y-%m-%d %H:%M:%S UTC'; }
