@@ -69,16 +69,15 @@ def main() -> int:
     print(f"[snapshot] {len(src_counts)} tables, {total_rows} total rows")
 
     # ------------------------------------------------------------------
-    # Phase 2: verify PG is empty (besides alembic_version).
+    # Phase 2: TRUNCATE PG tables in reverse FK order (clears alembic
+    # seed rows like subscription_plans без drop/recreate базы).
     # ------------------------------------------------------------------
-    with pg_engine.connect() as dst:
-        for table in Base.metadata.sorted_tables:
+    with pg_engine.begin() as dst:
+        for table in reversed(Base.metadata.sorted_tables):
             if table.name in SKIP_TABLES:
                 continue
-            n = _row_count(dst, table)
-            if n != 0:
-                print(f"[FATAL] PG.{table.name} has {n} rows — expected empty. Drop & recreate the dryrun DB first.")
-                return 2
+            dst.execute(table.delete())
+    print(f"[truncate] cleared {len(src_counts)} target tables")
 
     # ------------------------------------------------------------------
     # Phase 3: copy each table in FK-dependency order.
