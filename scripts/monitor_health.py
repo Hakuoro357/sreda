@@ -385,18 +385,28 @@ def _percentile(values: list[int], p: float) -> int:
 
 
 def probe_turn_latency_p95() -> ProbeResult:
+    # 2026-04-30: thresholds увеличены, добавлен минимум sample size.
+    # Multi-iter LLM с tools (3+ iter) штатно занимает 15-25s — это не
+    # аномалия, бот честно работает. Алертим только на p95 > 30s.
+    # Минимум n=10 защищает от single-outlier на малой выборке (один
+    # heavy 17s turn при n=3 ломал p95 в warning).
     traces = _recent_traces(window_min=30)
     if not traces:
         return ProbeResult("turn_latency_p95", "ok", "(no traces in 30m)")
     totals = [t["total_ms"] for t in traces if t["total_ms"] > 0]
-    if not totals:
-        return ProbeResult("turn_latency_p95", "ok", f"(no completed turns in 30m, n={len(traces)})")
+    n = len(totals)
+    if n < 10:
+        # Не достаточно данных для p95 — outlier'ы доминируют.
+        return ProbeResult(
+            "turn_latency_p95", "ok",
+            f"(n={n} < 10, p95 не считаем)",
+        )
     p95 = _percentile(totals, 0.95)
+    if p95 > 60_000:
+        return ProbeResult("turn_latency_p95", "critical", f"p95={p95}ms (n={n})")
     if p95 > 30_000:
-        return ProbeResult("turn_latency_p95", "critical", f"p95={p95}ms (n={len(totals)})")
-    if p95 > 15_000:
-        return ProbeResult("turn_latency_p95", "warning", f"p95={p95}ms (n={len(totals)})")
-    return ProbeResult("turn_latency_p95", "ok", f"p95={p95}ms (n={len(totals)})")
+        return ProbeResult("turn_latency_p95", "warning", f"p95={p95}ms (n={n})")
+    return ProbeResult("turn_latency_p95", "ok", f"p95={p95}ms (n={n})")
 
 
 def probe_failed_turns_rate() -> ProbeResult:
