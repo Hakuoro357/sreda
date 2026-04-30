@@ -1,0 +1,51 @@
+# sreda-telegram-poller — Telegram long-poll worker.
+#
+# Runs alongside sreda-uvicorn and sreda-job-runner. While both webhook
+# и long-poll wired to the same handle_telegram_update entry point, the
+# long-poller is the canonical inbound path on prod (см. plan
+# mellow-discovering-conway.md, перенос с webhook на long-poll
+# 2026-05-02).
+#
+# Install:
+#   sudo cp deploy/systemd/sreda-telegram-poller.service \
+#       /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sreda-telegram-poller
+#
+# Exit codes (см. RestartPreventExitStatus ниже):
+#   0 — clean shutdown (SIGTERM)
+#   1 — fatal config error (e.g. SREDA_TELEGRAM_BOT_TOKEN missing)
+#   2 — singleton lock held by another instance
+#   3 — Telegram 409 Conflict (active webhook blocks getUpdates)
+#
+# При exit code 2/3 systemd НЕ рестартует автоматически — это требует
+# ручного действия (см. runbook в plan mellow-discovering-conway.md):
+#   systemctl reset-failed sreda-telegram-poller
+#   systemctl start sreda-telegram-poller
+
+[Unit]
+Description=Sreda Telegram long-poller
+After=network-online.target
+Wants=network-online.target
+# Если БД локально через systemd — добавить `postgresql.service` в After.
+# Сейчас PG на этом же VDS, но poller сам ретраит при ConnectionError,
+# а advisory lock освобождается атомарно при разрыве connection. Безопасно
+# оставить только network-online.target.
+
+[Service]
+Type=simple
+User=sreda
+Group=sreda
+WorkingDirectory=/opt/sreda
+EnvironmentFile=/etc/sreda/.env
+ExecStart=/opt/sreda/.venv/bin/python -m sreda.workers.telegram_long_poll
+Restart=on-failure
+RestartSec=5
+# 2 (singleton lock) и 3 (409 Conflict) требуют ручного действия —
+# auto-restart только спамил бы логи. См. runbook в plan.
+RestartPreventExitStatus=2 3
+StandardOutput=append:/var/log/sreda/telegram-poller.log
+StandardError=append:/var/log/sreda/telegram-poller.log
+
+[Install]
+WantedBy=multi-user.target
