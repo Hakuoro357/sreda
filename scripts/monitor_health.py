@@ -323,9 +323,19 @@ def _recent_traces(window_min: int = 30) -> list[dict]:
                     if len(parts) >= 5:
                         try:
                             ts = datetime.fromisoformat(parts[3] + "T" + parts[4]).replace(tzinfo=timezone.utc)
-                            current = {"ts": ts, "iters": 0, "total_ms": 0, "ack_ms": None}
+                            current = {"ts": ts, "iters": 0, "total_ms": 0, "ack_ms": None, "type": None}
                         except Exception:
                             current = None
+                elif "webhook.received" in line and current is not None:
+                    # "      0ms  webhook.received       type=text"
+                    if "type=text" in line:
+                        current["type"] = "text"
+                    elif "type=voice" in line:
+                        current["type"] = "voice"
+                    elif "type=callback" in line:
+                        current["type"] = "callback"
+                    else:
+                        current["type"] = "other"
                 elif "ack.sent" in line and current is not None:
                     # "      4ms  ack.sent  [539ms] phrase=..."
                     try:
@@ -374,14 +384,17 @@ def probe_turn_latency_p95() -> ProbeResult:
 
 def probe_failed_turns_rate() -> ProbeResult:
     traces = _recent_traces(window_min=30)
-    if not traces:
-        return ProbeResult("failed_turns_rate", "ok", "(no traces in 30m)")
-    n = len(traces)
-    failed = sum(1 for t in traces if t["iters"] == 0)
+    # Считаем только text/voice (где LLM ОБЯЗАН отработать). Callback'и и
+    # pending-bot ведут к iters=0 by design.
+    chat_traces = [t for t in traces if t.get("type") in ("text", "voice")]
+    if not chat_traces:
+        return ProbeResult("failed_turns_rate", "ok", "(no chat turns in 30m)")
+    n = len(chat_traces)
+    failed = sum(1 for t in chat_traces if t["iters"] == 0)
     pct = 100 * failed / n if n else 0
     if n >= 5 and pct > 20:
-        return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} failed ({pct:.0f}%)")
-    return ProbeResult("failed_turns_rate", "ok", f"{failed}/{n} failed ({pct:.0f}%)")
+        return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} chat-turns failed ({pct:.0f}%)")
+    return ProbeResult("failed_turns_rate", "ok", f"{failed}/{n} chat-turns failed ({pct:.0f}%)")
 
 
 def probe_ack_latency_p95() -> ProbeResult:
@@ -400,24 +413,16 @@ def probe_ack_latency_p95() -> ProbeResult:
 # ---------------------------------------------------------------------------
 # Security
 # ---------------------------------------------------------------------------
-def probe_fail2ban_bans() -> ProbeResult:
+def probe_fail2ban_active() -> ProbeResult:
+    # fail2ban-client status требует sudo, sreda юзер не имеет привилегий.
+    # Проверяем только что service active. Ban count не critical для monitoring.
     rc = subprocess.run(
-        ["fail2ban-client", "status", "sreda-scanner"],
+        ["systemctl", "is-active", "fail2ban"],
         capture_output=True, text=True, timeout=5,
     )
-    if rc.returncode != 0:
-        return ProbeResult("fail2ban_bans", "warning", "fail2ban not responsive")
-    # parse "Currently banned: N"
-    for line in rc.stdout.split("\n"):
-        if "Currently banned:" in line:
-            try:
-                n = int(line.split(":")[1].strip())
-            except Exception:
-                continue
-            if n > 50:
-                return ProbeResult("fail2ban_bans", "warning", f"{n} IPs banned (atypical)")
-            return ProbeResult("fail2ban_bans", "ok", f"{n} IPs banned")
-    return ProbeResult("fail2ban_bans", "ok", "0 IPs banned (parse fallback)")
+    if rc.stdout.strip() == "active":
+        return ProbeResult("fail2ban_active", "ok", "active")
+    return ProbeResult("fail2ban_active", "warning", f"fail2ban={rc.stdout.strip() or 'unknown'}")
 
 
 PROBES: list[Callable[[], ProbeResult]] = [
@@ -440,7 +445,7 @@ PROBES: list[Callable[[], ProbeResult]] = [
     probe_failed_turns_rate,
     probe_ack_latency_p95,
     # Security
-    probe_fail2ban_bans,
+    probe_fail2ban_active,
 ]
 
 
