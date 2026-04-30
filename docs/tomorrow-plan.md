@@ -188,7 +188,37 @@ strengthen feminine-gender rule with universal pattern + few-shot`.
 
 Запрос приходил от юзера сегодня.
 
-### 7. Перейти с webhook на long-polling (TG + MAX)
+### 7. Перейти с webhook на long-polling (TG + MAX) — ✅ DONE 2026-04-30 PM
+
+**Сделано вечером 30 апреля.** Cutover около 23:05 МСК — webhook упал в очередной раз с
+`Connection timed out`, юзер в стрессе, переключение прошло без отката.
+
+Финальная архитектура: отдельный systemd unit `sreda-telegram-poller`,
+который через `getUpdates(timeout=25)` тянет updates в loop'е и
+вызывает тот же `handle_telegram_update` что и (старый) webhook —
+durable ingest до advance offset'а в БД, idempotency по
+`external_update_id`. Обвязка:
+- `schema 0036` (poller_offsets, poller_heartbeats, inbound.processing_status)
+- thin webhook (на всякий случай не выпилен — оставлен для rollback'а)
+- `--check-config` для pre-cutover sanity
+- monitor probes: `telegram_poller_alive`, `telegram_api_health`, `unprocessed_inbound`
+- `RestartPreventExitStatus=2 3` — exit code 2 (singleton lock) и 3 (409 Conflict)
+  не auto-restart'ятся, требуют ручного reset-failed
+
+После cutover'а:
+- inbound webhook timeouts больше не приходят (по определению — webhook удалён)
+- ack'и иногда визуально приходят после реплая → **это другая проблема**, не inbound,
+  см. п.9 ниже про outbound
+
+**Что осталось хвостом:**
+- `webhook_health` probe всё ещё в monitor — даёт warning при пустом
+  url (это норма, удалить пробу после 24h soak'а)
+- MAX long-poller (когда подключим MAX) — отдельный спринт, паттерн
+  тот же что в TG
+
+---
+
+(оригинальный текст пункта 7 ниже — для истории)
 
 **Контекст.** 2026-04-30 имели несколько инцидентов «Connection timed out»
 на webhook'ах Telegram. Симптом: TG не может достучаться до нашего nginx,
@@ -278,6 +308,80 @@ max_connections=4) ловят >95% случаев — отложено до сл
 - кол-во тестов: ≤ 800 (минус ~200 удалённых)
 - 0 регрессий — webhook/inbound/billing/encryption suite остаются
   100% зелёными
+
+### 9. Outbound delivery: ack приходит ПОСЛЕ реплая
+
+**Контекст (2026-04-30 PM).** После cutover'а на long-poll inbound стабилен,
+но юзер видит хаотичный порядок исходящих сообщений: сначала прилетает
+финальный реплай, потом — ack «🌀 Секунду…». В trace.log при этом
+`ack.sent` стоит с latency 100-300мс и status=ok, sendMessage возвращает
+`{"ok": true}` за те же 100-300мс. То есть наш код шлёт ack первым,
+TG возвращает 200, но юзер визуально получает в «вывернутом» порядке.
+
+Второе мнение от другого ИИ (см. чат 2026-04-30): после `ok=true` на
+`sendMessage` outbound transport свою работу сделал — задержка либо в
+**Telegram client-side delivery sync** (мобильный TG любит батчить),
+либо реально транспорт делает HOL blocking (TCP-over-TCP в SSH-SOCKS).
+
+**Подходы по убыванию ROI:**
+
+#### 9.1. Залогировать `message_id` и `date` (5 мин)
+
+Цель: понять, какой это вариант. Изменить логирование в
+`telegram_inbound._fire_and_forget_ack` и в outbox delivery:
+
+```python
+resp = await client.send_message(...)
+msg = resp["result"]
+logger.info(
+    "tg_send kind=%s chat=%s message_id=%s tg_date=%s latency_ms=%.1f",
+    kind, msg["chat"]["id"], msg["message_id"], msg["date"], latency_ms,
+)
+```
+
+День на наблюдение → анализ:
+- если `ack.message_id < final.message_id` → TG client-side sync,
+  сетью не лечится → идти в 9.2 (placeholder + edit)
+- если `ack.message_id > final.message_id` → ack физически создаётся
+  в TG позже, проблема в нашем коде (порядок `await`'ов?) или в
+  транспорте (HOL blocking) → идти в 9.3 (WireGuard) или править код
+
+#### 9.2. Placeholder + editMessageText (2-3 часа)
+
+UX-фикс. Вместо «ack отдельным сообщением, потом реплай отдельным»:
+1. Шлём «🌀 Секунду…» через `sendMessage`, запоминаем `message_id`
+2. Когда LLM/voice готовы → `editMessageText(message_id, final_text)`
+
+В чате юзера остаётся **одно** сообщение которое сначала «секунду»,
+потом превращается в реплай. Никакого хаоса визуального порядка.
+Bonus: нет дубликата `ack + delete_after_reply`-логики.
+
+Делать **если 9.1 покажет client-side sync**.
+
+#### 9.3. WireGuard вместо SSH-SOCKS5 (день)
+
+Радикальный архитектурный фикс outbound-транспорта. Сейчас:
+RU VDS → `ssh -D 1080` → EU egress (89.110.77.78) → TG.
+SSH dynamic-forward = TCP-over-TCP, head-of-line blocking возможен:
+один retransmit на одном channel'е тормозит остальные.
+
+Замена на WireGuard:
+- WG tunnel RU↔EU, policy route 149.154.160.0/20 + 91.108.4.0/22 через WG
+- В httpx убрать `trust_env=True` → нет proxy parsing
+- Прямые TCP к api.telegram.org, kernel-side TCP keepalive работает
+  как задумано, никакого ssh-channel мультиплексирования
+
+Конфиги в комментариях — приведены в чате (другой ИИ).
+
+Делать **если 9.1 покажет ack физически создан позже final**, или
+после внедрения 9.2 захотим убрать SSH-SOCKS как «кривой костыль».
+
+#### Acceptance
+- 9.1 даст диагностику в логах за 1 день
+- После 9.2: юзер видит плавную трансформацию одного сообщения, никаких
+  «ack после реплая». 0 жалоб 24 часа.
+- (если делаем 9.3): outbound `sendMessage` p95 latency < 800мс
+  стабильно, без spike'ов >5 секунд
 
 ---
 
