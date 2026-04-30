@@ -164,6 +164,199 @@ def probe_webhook_health() -> ProbeResult:
         return ProbeResult("webhook_health", "critical", f"getWebhookInfo failed: {e}")
 
 
+def probe_telegram_poller_alive() -> ProbeResult:
+    """Liveness — процесс long-poller'а жив И тикает.
+
+    Двухсторонняя проверка:
+      1. ``systemctl is-active sreda-telegram-poller`` == "active"
+      2. ``poller_heartbeats.last_attempt_at`` свежее 2 минут.
+
+    Используем именно ``last_attempt_at`` (не ``last_ok_at``) — он ставится
+    после КАЖДОГО getUpdates, в том числе при `200 []` и при сетевых
+    ошибках. То есть liveness не зависит от того, отвечает ли сейчас
+    Telegram API; для этого есть отдельная `telegram_api_health`.
+
+    Если systemd-юнит ещё не установлен (loaded=not-found), пробу
+    игнорируем (status=ok с пометкой) — пока мы на webhook-режиме это
+    нормально. Удалить эту ветку после cutover.
+    """
+    rc = subprocess.run(
+        ["systemctl", "is-active", "sreda-telegram-poller"],
+        capture_output=True, text=True, timeout=5,
+    )
+    state = rc.stdout.strip()
+    if state == "inactive":
+        # Может быть либо «не установлен» либо «остановлен». Различим
+        # через is-enabled — если disabled И not-found, юнит просто
+        # ещё не существует на этой машине.
+        rc2 = subprocess.run(
+            ["systemctl", "is-enabled", "sreda-telegram-poller"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "not-found" in (rc2.stdout + rc2.stderr).lower():
+            return ProbeResult(
+                "telegram_poller_alive", "ok",
+                "(unit not installed yet — pre-cutover)",
+            )
+        return ProbeResult(
+            "telegram_poller_alive", "critical",
+            "sreda-telegram-poller systemd state=inactive",
+        )
+    if state != "active":
+        return ProbeResult(
+            "telegram_poller_alive", "critical",
+            f"sreda-telegram-poller systemd state={state or 'unknown'}",
+        )
+
+    # Юнит активен — проверяем heartbeat в БД.
+    last_attempt = _pg_query(
+        "SELECT EXTRACT(EPOCH FROM (NOW() - last_attempt_at))::int "
+        "FROM poller_heartbeats WHERE channel = 'telegram'"
+    )
+    if last_attempt is None or last_attempt == "":
+        return ProbeResult(
+            "telegram_poller_alive", "critical",
+            "no heartbeat row for channel='telegram' (poller never ticked?)",
+        )
+    try:
+        secs = int(last_attempt)
+    except ValueError:
+        return ProbeResult(
+            "telegram_poller_alive", "warning",
+            f"heartbeat parse fail: {last_attempt!r}",
+        )
+    if secs > 120:
+        return ProbeResult(
+            "telegram_poller_alive", "critical",
+            f"last_attempt_at {secs}s ago (>120s threshold)",
+        )
+    return ProbeResult(
+        "telegram_poller_alive", "ok",
+        f"systemd active, heartbeat {secs}s ago",
+    )
+
+
+def probe_telegram_api_health() -> ProbeResult:
+    """Health — отвечает ли Telegram API на наши getUpdates.
+
+    Считаем разницу между `last_attempt_at` и `last_ok_at`. Если
+    last_ok_at старее 5 минут, но last_attempt_at свежий → upstream
+    проблема (TG API down / rate-limit / network issue), не наша.
+    Severity: warning (не critical), плюс показываем `last_error`
+    для диагностики.
+
+    Если поллер ещё не установлен — игнорим как и в `_alive` пробе.
+    """
+    rc = subprocess.run(
+        ["systemctl", "is-enabled", "sreda-telegram-poller"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if "not-found" in (rc.stdout + rc.stderr).lower():
+        return ProbeResult(
+            "telegram_api_health", "ok",
+            "(unit not installed yet — pre-cutover)",
+        )
+
+    row = _pg_query(
+        "SELECT "
+        "  COALESCE(EXTRACT(EPOCH FROM (NOW() - last_ok_at))::int, -1), "
+        "  COALESCE(last_error, '') "
+        "FROM poller_heartbeats WHERE channel = 'telegram'"
+    )
+    if row is None or row == "":
+        # Heartbeat row отсутствует — это поймает _alive проба, тут ok.
+        return ProbeResult(
+            "telegram_api_health", "ok",
+            "(no heartbeat row yet)",
+        )
+    parts = row.split("|", 1)
+    if len(parts) != 2:
+        return ProbeResult(
+            "telegram_api_health", "warning",
+            f"heartbeat parse fail: {row!r}",
+        )
+    try:
+        ok_secs = int(parts[0])
+    except ValueError:
+        return ProbeResult(
+            "telegram_api_health", "warning",
+            f"last_ok_at parse fail: {parts[0]!r}",
+        )
+    last_err = parts[1].strip()
+
+    if ok_secs == -1:
+        # last_ok_at IS NULL — поллер запустился но ни разу не получил
+        # успешный ответ. Может быть на холодном старте, может быть
+        # реальная проблема. Warning.
+        return ProbeResult(
+            "telegram_api_health", "warning",
+            f"last_ok_at NULL (no successful getUpdates yet); "
+            f"last_error={last_err[:200] or 'none'}",
+        )
+    if ok_secs > 300:
+        return ProbeResult(
+            "telegram_api_health", "warning",
+            f"last_ok_at {ok_secs}s ago (>300s); last_error={last_err[:200] or 'none'}",
+        )
+    return ProbeResult(
+        "telegram_api_health", "ok",
+        f"last_ok_at {ok_secs}s ago",
+    )
+
+
+def probe_unprocessed_inbound() -> ProbeResult:
+    """Inbound persisted, но processing не дошёл до конца.
+
+    Закрывает риск «inbound сохранён, _process_approved_turn упал /
+    не стартовал». Считаем строки в ``inbound_messages`` со статусом
+    ``ingested`` или ``processing_started``, созданные более 5 минут
+    назад (но не старше 24 часов — historical noise игнорируем).
+
+    Если статус-колонки ещё нет (миграция 0036 не накачена) —
+    возвращаем ok с пометкой, проба не должна валить весь
+    monitor_health на pre-cutover окружении.
+    """
+    # Сначала проверим что колонка существует.
+    has_col = _pg_query(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'inbound_messages' "
+        "AND column_name = 'processing_status'"
+    )
+    if has_col != "1":
+        return ProbeResult(
+            "unprocessed_inbound", "ok",
+            "(column processing_status not present yet — migration 0036 pending)",
+        )
+
+    n = _pg_query(
+        "SELECT COUNT(*) FROM inbound_messages "
+        "WHERE processing_status IN ('ingested', 'processing_started') "
+        "  AND created_at < NOW() - INTERVAL '5 minutes' "
+        "  AND created_at > NOW() - INTERVAL '24 hours'"
+    )
+    if n is None:
+        return ProbeResult(
+            "unprocessed_inbound", "warning",
+            "psql query failed",
+        )
+    try:
+        count = int(n)
+    except ValueError:
+        return ProbeResult(
+            "unprocessed_inbound", "warning",
+            f"count parse fail: {n!r}",
+        )
+    if count > 0:
+        return ProbeResult(
+            "unprocessed_inbound", "critical",
+            f"{count} inbound stuck in ingested/processing_started >5min",
+        )
+    return ProbeResult(
+        "unprocessed_inbound", "ok",
+        "0 stuck inbound",
+    )
+
+
 def probe_last_backup_age() -> ProbeResult:
     if not BACKUP_DIR.exists():
         return ProbeResult("last_backup_age", "critical", "backup dir missing")
@@ -461,6 +654,12 @@ PROBES: list[Callable[[], ProbeResult]] = [
     probe_pg_disk_free,
     probe_pg_locks,
     probe_webhook_health,
+    # Long-poll worker (см. plan mellow-discovering-conway.md). До cutover'а
+    # пробы сами игнорят отсутствие systemd-юнита и колонки processing_status,
+    # после cutover'а — заменят webhook_health.
+    probe_telegram_poller_alive,
+    probe_telegram_api_health,
+    probe_unprocessed_inbound,
     probe_last_backup_age,
     # External APIs
     probe_telegram_api_latency,
