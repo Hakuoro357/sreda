@@ -205,6 +205,14 @@ class InboundMessage(Base):
         ForeignKey("secure_records.id"), nullable=True, index=True
     )
     status: Mapped[str] = mapped_column(String(32), default="accepted", index=True)
+    # processing_status — explicit lifecycle для мониторинга «inbound persisted
+    # но processing crashed». Значения: ingested → processing_started →
+    # processed (штатное завершение turn'а), либо ignored (pending user /
+    # unsupported / service command — намеренный skip без processing'а).
+    # Duplicate update_id — отдельный no-op (новая row не создаётся).
+    processing_status: Mapped[str] = mapped_column(
+        String(32), default="ingested", server_default="ingested", index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

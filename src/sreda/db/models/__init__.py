@@ -28,6 +28,7 @@ from sreda.db.models.housewife_food import (
 )
 from sreda.db.models.inbound_event import InboundEvent
 from sreda.db.models.memory import AssistantMemory
+from sreda.db.models.poller_state import PollerHeartbeat, PollerOffset
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.db.models.runtime_config import RuntimeConfig
 from sreda.db.models.tasks import Task
@@ -71,6 +72,8 @@ __all__ = [
     "SubscriptionPlan",
     "Job",
     "OutboxMessage",
+    "PollerHeartbeat",
+    "PollerOffset",
     "SecureRecord",
     "SkillAIExecution",
     "SkillEvent",
