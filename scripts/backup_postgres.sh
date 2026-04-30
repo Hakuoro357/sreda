@@ -13,6 +13,11 @@
 
 set -euo pipefail
 
+# Move to a CWD readable by sreda — иначе `find` в конце ругается
+# "Failed to restore initial working directory" если запущено из
+# домашней директории root/boris.
+cd /tmp
+
 DEST=/var/backups/sreda
 LOG=/var/log/sreda/backup.log
 RETENTION_DAYS=14
