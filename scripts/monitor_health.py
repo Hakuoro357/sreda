@@ -138,18 +138,28 @@ def probe_webhook_health() -> ProbeResult:
         last_err_msg = info.get("last_error_message")
         now = int(time.time())
 
+        # Logic: алерт только если ВИДНО проблему ПРЯМО СЕЙЧАС.
+        # last_error_date в TG getWebhookInfo это историческая запись,
+        # сохраняется индефинитно. Сам факт recent error НЕ значит что
+        # сейчас проблема — Telegram уже мог retry'нуть успешно.
+        # Поэтому критерий: pending > 0 (юзеры висят в очереди) ИЛИ
+        # рост queue (тренд).
         if pending >= 5:
             return ProbeResult(
                 "webhook_health", "critical",
-                f"pending_update_count={pending} (queue stuck)",
-                value={"pending": pending, "last_err": last_err_msg},
+                f"pending_update_count={pending} (queue stuck): {last_err_msg}",
+                value={"pending": pending},
             )
-        if last_err and (now - last_err) < 300:
+        if pending >= 1 and last_err and (now - last_err) < 300:
+            # 1-4 pending + recent error = текущий incident, может разрастись
             return ProbeResult(
-                "webhook_health", "critical",
-                f"recent error ({(now-last_err)}s ago): {last_err_msg}",
+                "webhook_health", "warning",
+                f"pending={pending} + last_err {now-last_err}s ago: {last_err_msg}",
             )
-        return ProbeResult("webhook_health", "ok", f"pending={pending}")
+        return ProbeResult(
+            "webhook_health", "ok",
+            f"pending={pending} (last_err: {last_err_msg or 'none'} {(now-last_err)}s ago)" if last_err else f"pending={pending}",
+        )
     except Exception as e:
         return ProbeResult("webhook_health", "critical", f"getWebhookInfo failed: {e}")
 
