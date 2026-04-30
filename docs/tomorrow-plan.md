@@ -188,6 +188,60 @@ strengthen feminine-gender rule with universal pattern + few-shot`.
 
 Запрос приходил от юзера сегодня.
 
+### 7. Перейти с webhook на long-polling (TG + MAX)
+
+**Контекст.** 2026-04-30 имели несколько инцидентов «Connection timed out»
+на webhook'ах Telegram. Симптом: TG не может достучаться до нашего nginx,
+пакеты теряются где-то в пути (Singapore → Москва Timeweb через 5-10
+провайдеров), middlebox/anti-DDoS дропает idle TCP-connection без RST.
+Юзер на 30-60s видит «бот не отвечает».
+
+Палиативы (применены):
+- TCP keepalive tuning sysctl 60/15/3 (commit `(не закоммичено)` —
+  `deploy/sysctl/99-sreda-tcp.conf`)
+- nginx `keepalive_timeout 0` для bot.sredaspace.ru (закоммитить нужно)
+- setWebhook с `ip_address=62.113.41.104` + `max_connections=4`
+- safe_restart.sh который делает deleteWebhook+setWebhook после рестарта
+
+**Радикальный фикс — long-polling.** Полностью убирает inbound-сетку:
+- Background asyncio task'и в `sreda-job-runner` делают long-poll
+  `getUpdates` (TG) и `POST /updates` (MAX)
+- TG/MAX edge-network/anti-DDoS / nginx webhook-endpoint больше не наши
+  проблемы
+- Connection initiated с НАШЕЙ стороны → kernel сам видит dead и
+  переоткрывает
+- Унифицированная архитектура для всех каналов (TG, MAX, потом WhatsApp/
+  Viber если когда-то)
+- `safe_restart.sh` упрощается — просто kill+restart bg task
+
+**Объём работы:** 1-2 рабочих дня
+- `src/sreda/workers/telegram_long_poll.py` — async loop через
+  `getUpdates(timeout=25, offset=...)`, парсит updates, вызывает тот
+  же `_process_approved_turn` что и webhook
+- `src/sreda/workers/max_long_poll.py` — аналог через MAX API
+- Регистрация background tasks в `sreda-job-runner` startup
+- `deleteWebhook` на проде когда переедем — финальный шаг
+- Webhook routes можно оставить (для совместимости) или удалить
+
+**Acceptance.**
+- 24 часа без `webhook_health` warning'ов в monitor
+- Юзер пишет → ответ в стандартные 5-10 сек, без 30-60s timeout-окон
+- nginx reload не вызывает never-ending Connection-timed-out у TG
+
+**Минусы:**
+- +200ms latency vs webhook в идеальных условиях (long-poll round-trip)
+- Background task supervision: если task падает — не получает updates.
+  Нужен auto-restart через systemd Restart=always или supervisor pattern
+- Если решим, надо переехать на long-polling ДО подключения MAX webhook'а
+  (иначе придётся переделывать)
+
+**Когда делать.** Если палиативы (keepalive_timeout=0 + ip_address +
+max_connections=4) ловят >95% случаев — отложено до следующих incident'ов.
+Если в ближайшие 2-3 дня webhook'ы будут отваливаться повторно — приоритет
+повышается до P0.
+
+---
+
 **Открытые блокеры.**
 - Решение по pricing (тиры sredaspace.ru) ещё не финализировано
   — есть в plan-файле, но вы не подтвердили. Без этого Phase 1
