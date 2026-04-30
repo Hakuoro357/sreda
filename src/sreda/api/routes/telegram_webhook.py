@@ -81,6 +81,24 @@ async def _delete_ack_after_reply(
         logger.debug("ack delete crashed", exc_info=True)
 
 
+# 2026-04-30: per-tenant async lock — сериализует обработку
+# нескольких inbound'ов от одного tenant'а. Когда юзер шлёт 4 voice
+# подряд (incident user_tg_755682022: 4 update'а в 150мс), без лока
+# 4 bg-task'а параллельно конкурируют за SQLite write (single-writer
+# model) → 30-90с залипы на add_checklist_items / create_checklist.
+# Lock обеспечивает последовательную обработку: 1-й turn run, 2-4
+# ждут в очереди. Не влияет на разных юзеров (lock per tenant_id).
+_TENANT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_tenant_lock(tenant_id: str) -> asyncio.Lock:
+    lock = _TENANT_LOCKS.get(tenant_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _TENANT_LOCKS[tenant_id] = lock
+    return lock
+
+
 async def _process_approved_turn(
     *,
     bot_key: str,
@@ -100,7 +118,37 @@ async def _process_approved_turn(
     Решение: webhook handler возвращает 202 СРАЗУ после persist_inbound,
     основная обработка едет здесь как detached task с собственной DB
     session (request-scoped session уже закрыта к этому моменту).
+
+    2026-04-30 (incident user_tg_755682022 4-voice burst): обработка
+    обёрнута в per-tenant lock — несколько одновременных turn'ов
+    от одного юзера сериализуются. Без этого SQLite write-lock
+    contention давал 30-90с gaps между LLM итерациями.
     """
+    tenant_lock = _get_tenant_lock(onboarding.tenant_id)
+    if tenant_lock.locked():
+        logger.info(
+            "tenant turn queued behind in-flight: tenant=%s inbound=%s",
+            onboarding.tenant_id, inbound_message_id,
+        )
+    async with tenant_lock:
+        await _process_approved_turn_locked(
+            bot_key=bot_key,
+            payload=payload,
+            onboarding=onboarding,
+            inbound_message_id=inbound_message_id,
+            bot_token=bot_token,
+        )
+
+
+async def _process_approved_turn_locked(
+    *,
+    bot_key: str,
+    payload: dict,
+    onboarding,
+    inbound_message_id: str,
+    bot_token: str,
+) -> None:
+    """Inner — runs under tenant lock. См. `_process_approved_turn` docstring."""
     SessionLocal = get_session_factory()
     bg_session: Session = SessionLocal()
     try:
