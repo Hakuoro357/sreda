@@ -32,51 +32,9 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # ---------- shopping_list_items ----------
-    op.create_table(
-        "shopping_list_items",
-        sa.Column("id", sa.String(length=64), primary_key=True),
-        sa.Column(
-            "tenant_id",
-            sa.String(length=64),
-            sa.ForeignKey("tenants.id"),
-            nullable=False,
-        ),
-        sa.Column(
-            "user_id",
-            sa.String(length=64),
-            sa.ForeignKey("users.id"),
-            nullable=False,
-        ),
-        # title is EncryptedString at the ORM layer (AES-GCM envelope
-        # stored here as Text). See db/types.py.
-        sa.Column("title", sa.Text(), nullable=False),
-        sa.Column("quantity_text", sa.String(length=64), nullable=True),
-        # enum-like short string. See housewife_food module for values.
-        sa.Column("category", sa.String(length=32), nullable=False),
-        # pending | bought | cancelled
-        sa.Column("status", sa.String(length=16), nullable=False),
-        # When this item was auto-added from a menu's recipe (aggregation).
-        # NULL for manually added items.
-        sa.Column(
-            "source_recipe_id",
-            sa.String(length=64),
-            sa.ForeignKey("recipes.id", ondelete="SET NULL"),
-            nullable=True,
-        ),
-        sa.Column("added_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-    )
-    op.create_index(
-        "ix_shopping_list_items_tenant_user_status",
-        "shopping_list_items",
-        ["tenant_id", "user_id", "status"],
-    )
-    op.create_index(
-        "ix_shopping_list_items_source_recipe",
-        "shopping_list_items",
-        ["source_recipe_id"],
-    )
+    # 2026-04-30: order changed for PG compatibility — `recipes` создаётся
+    # ПЕРЕД `shopping_list_items` потому что у последнего FK к recipes.
+    # SQLite не enforces FK на CREATE TABLE, PG enforces.
 
     # ---------- recipes ----------
     op.create_table(
@@ -129,6 +87,52 @@ def upgrade() -> None:
     )
     op.create_index(
         "ix_recipe_ingredients_recipe", "recipe_ingredients", ["recipe_id"]
+    )
+
+    # ---------- shopping_list_items ----------
+    op.create_table(
+        "shopping_list_items",
+        sa.Column("id", sa.String(length=64), primary_key=True),
+        sa.Column(
+            "tenant_id",
+            sa.String(length=64),
+            sa.ForeignKey("tenants.id"),
+            nullable=False,
+        ),
+        sa.Column(
+            "user_id",
+            sa.String(length=64),
+            sa.ForeignKey("users.id"),
+            nullable=False,
+        ),
+        # title is EncryptedString at the ORM layer (AES-GCM envelope
+        # stored here as Text). See db/types.py.
+        sa.Column("title", sa.Text(), nullable=False),
+        sa.Column("quantity_text", sa.String(length=64), nullable=True),
+        # enum-like short string. See housewife_food module for values.
+        sa.Column("category", sa.String(length=32), nullable=False),
+        # pending | bought | cancelled
+        sa.Column("status", sa.String(length=16), nullable=False),
+        # When this item was auto-added from a menu's recipe (aggregation).
+        # NULL for manually added items.
+        sa.Column(
+            "source_recipe_id",
+            sa.String(length=64),
+            sa.ForeignKey("recipes.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column("added_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index(
+        "ix_shopping_list_items_tenant_user_status",
+        "shopping_list_items",
+        ["tenant_id", "user_id", "status"],
+    )
+    op.create_index(
+        "ix_shopping_list_items_source_recipe",
+        "shopping_list_items",
+        ["source_recipe_id"],
     )
 
     # ---------- menu_plans ----------
@@ -196,17 +200,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # 2026-04-30: drop order — все FK-зависимые ДО `recipes`. Иначе PG
+    # отбивает drop с FK violation.
     op.drop_index("ix_menu_plan_items_plan_day", table_name="menu_plan_items")
     op.drop_table("menu_plan_items")
 
     op.drop_index("ix_menu_plans_tenant_user_week", table_name="menu_plans")
     op.drop_table("menu_plans")
-
-    op.drop_index("ix_recipe_ingredients_recipe", table_name="recipe_ingredients")
-    op.drop_table("recipe_ingredients")
-
-    op.drop_index("ix_recipes_tenant_user", table_name="recipes")
-    op.drop_table("recipes")
 
     op.drop_index(
         "ix_shopping_list_items_source_recipe", table_name="shopping_list_items"
@@ -215,3 +215,9 @@ def downgrade() -> None:
         "ix_shopping_list_items_tenant_user_status", table_name="shopping_list_items"
     )
     op.drop_table("shopping_list_items")
+
+    op.drop_index("ix_recipe_ingredients_recipe", table_name="recipe_ingredients")
+    op.drop_table("recipe_ingredients")
+
+    op.drop_index("ix_recipes_tenant_user", table_name="recipes")
+    op.drop_table("recipes")
