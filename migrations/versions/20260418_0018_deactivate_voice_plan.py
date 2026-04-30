@@ -41,8 +41,8 @@ def upgrade() -> None:
     op.execute(
         """
         UPDATE subscription_plans
-           SET is_public = 0,
-               is_active = 0,
+           SET is_public = FALSE,
+               is_active = FALSE,
                updated_at = CURRENT_TIMESTAMP
          WHERE plan_key = 'voice_transcription_base'
         """
@@ -53,8 +53,8 @@ def downgrade() -> None:
     op.execute(
         """
         UPDATE subscription_plans
-           SET is_public = 1,
-               is_active = 1,
+           SET is_public = TRUE,
+               is_active = TRUE,
                updated_at = CURRENT_TIMESTAMP
          WHERE plan_key = 'voice_transcription_base'
         """

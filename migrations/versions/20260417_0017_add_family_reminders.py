@@ -92,7 +92,7 @@ def upgrade() -> None:
         "'housewife_assistant', 'Помощник домохозяйки', "
         "'Проактивный помощник по семейной рутине: память о семье, "
         "напоминания, меню и покупки. На бета-тесте — бесплатно.', "
-        "0, 30, 1, 1, 30, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        "0, 30, TRUE, TRUE, 30, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
 
 
