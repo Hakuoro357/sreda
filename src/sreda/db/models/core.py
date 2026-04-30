@@ -27,6 +27,13 @@ class Tenant(Base):
     approved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # Dual-channel (2026-05-01): 'telegram' | 'max'. Юзер выбирает канал
+    # при регистрации тарифа на sredaspace.ru. NULL = legacy (Telegram-only,
+    # все 12 существующих тенантов до миграции). Handler'ы трактуют NULL
+    # как 'telegram' для back-compat.
+    preferred_channel: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+    )
 
 
 class Workspace(Base):
@@ -65,6 +72,13 @@ class User(Base):
     # = один user. None для legacy/seed юзеров без telegram_account_id.
     tg_account_hash: Mapped[str | None] = mapped_column(
         String(64), nullable=True, unique=True, index=True,
+    )
+    # MAX user identifier (parallel to telegram_account_id, 2026-05-01).
+    # Plain (НЕ encrypted) — MAX user_id это просто числовой ID, как
+    # Telegram tg_account_hash. Indexed для O(1) lookup'а в onboarding.
+    # NULL для TG-only юзеров.
+    max_account_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True,
     )
 
 
