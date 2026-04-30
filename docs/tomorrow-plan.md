@@ -240,6 +240,45 @@ max_connections=4) ловят >95% случаев — отложено до сл
 Если в ближайшие 2-3 дня webhook'ы будут отваливаться повторно — приоритет
 повышается до P0.
 
+### 8. Тесты — почистить лишнее, ускорить фикстуры
+
+**Контекст.** 995 unit-тестов, полный прогон 5-8 минут. Большая часть
+времени уходит на fixture overhead, не на сами ассерты — каждый тест
+делает `Base.metadata.create_all` на свежий sqlite (~40+ таблиц) →
+~200-500ms × 995 ≈ 5-8 минут только на стартах.
+
+**Что почистить (~150-200 тестов на удаление):**
+- `test_housewife_tool_docstrings.py` — 23 теста на формат docstring'ов,
+  раз написал и забыл
+- `test_housewife_*.py` (10+ файлов) — частично дублируют покрытие
+  через разные пути (chat_tools / family / food / menu / recipes /
+  shopping / shopping_llm / onboarding / worker / autogen_shopping)
+- `test_credit_formula.py` — 19 тестов на одну формулу, можно
+  ужать до 5 параметризованных
+- `test_hallucinated_checklist_detector.py` + `test_hallucination_detector.py` —
+  соседние модули, почти одинаковые кейсы
+
+**Что трогать НЕЛЬЗЯ:**
+- `test_telegram_webhook.py`, `test_telegram_long_poll.py`,
+  `test_inbound_dedup.py` — критический путь
+- `test_encrypted_string.py` / `test_encryption.py` — 152-ФЗ
+- `test_billing_service.py` — деньги
+- `test_chat_turn_timeout_rescue.py` — реальный инцидент-фикс
+
+**Ускорение фикстур (даёт больше всего в pure time):**
+- session-scope DB fixture с per-test `BEGIN ... ROLLBACK`-обёрткой
+  (вместо `create_all` каждый раз) → суммарно 60-90s вместо 5-8 минут
+- mark slow-tests `@pytest.mark.slow`, в pre-commit hook гонять
+  только fast → обычный цикл < 30 сек
+
+**Объём:** ~1 день. Не критично, делать когда сильно достанет ждать.
+
+**Acceptance.**
+- pytest tests/unit/ на ноуте < 90 сек
+- кол-во тестов: ≤ 800 (минус ~200 удалённых)
+- 0 регрессий — webhook/inbound/billing/encryption suite остаются
+  100% зелёными
+
 ---
 
 **Открытые блокеры.**
