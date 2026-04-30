@@ -191,12 +191,256 @@ def probe_last_backup_age() -> ProbeResult:
     )
 
 
+def _pg_query(sql: str) -> str | None:
+    """Run a single SQL via psql, return scalar string or None on error."""
+    pg_pwd_dsn = _ENV.get("SREDA_DATABASE_URL", "")
+    if "@" not in pg_pwd_dsn:
+        return None
+    try:
+        password = pg_pwd_dsn.split("://")[1].split("@")[0].split(":")[1]
+    except Exception:
+        return None
+    rc = subprocess.run(
+        ["psql", "-h", "127.0.0.1", "-U", "sreda", "-d", "sreda",
+         "-tA", "-c", sql],
+        capture_output=True, text=True, timeout=5,
+        env={**os.environ, "PGPASSWORD": password},
+    )
+    if rc.returncode == 0:
+        return rc.stdout.strip()
+    return None
+
+
+def probe_pg_connections() -> ProbeResult:
+    n = _pg_query("SELECT count(*) FROM pg_stat_activity")
+    if n is None:
+        return ProbeResult("pg_connections", "warning", "psql query failed")
+    n_int = int(n)
+    if n_int >= 70:
+        return ProbeResult("pg_connections", "warning", f"{n_int}/100 connections")
+    return ProbeResult("pg_connections", "ok", f"{n_int}/100 connections")
+
+
+def probe_pg_disk_free() -> ProbeResult:
+    rc = subprocess.run(
+        ["df", "-BG", "--output=avail", "/var/lib/postgresql"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if rc.returncode != 0:
+        return ProbeResult("pg_disk_free", "warning", "df failed")
+    lines = rc.stdout.strip().split("\n")
+    if len(lines) < 2:
+        return ProbeResult("pg_disk_free", "warning", "df parse fail")
+    avail_gb = int(lines[1].strip().rstrip("G"))
+    if avail_gb < 1:
+        return ProbeResult("pg_disk_free", "critical", f"{avail_gb}G free on /var/lib/postgresql")
+    if avail_gb < 3:
+        return ProbeResult("pg_disk_free", "warning", f"{avail_gb}G free on /var/lib/postgresql")
+    return ProbeResult("pg_disk_free", "ok", f"{avail_gb}G free")
+
+
+def probe_pg_locks() -> ProbeResult:
+    n = _pg_query("SELECT count(*) FROM pg_locks WHERE NOT granted")
+    if n is None:
+        return ProbeResult("pg_locks", "ok", "(query failed, skip)")
+    n_int = int(n)
+    if n_int > 5:
+        return ProbeResult("pg_locks", "warning", f"{n_int} ungranted locks")
+    return ProbeResult("pg_locks", "ok", f"{n_int} ungranted locks")
+
+
+# ---------------------------------------------------------------------------
+# External API latency probes
+# ---------------------------------------------------------------------------
+def _external_latency(url: str, name: str, baseline_ms: int = 500) -> ProbeResult:
+    """Measure GET latency. Critical if 2x consecutive misses or >2x baseline."""
+    try:
+        t0 = time.time()
+        with httpx.Client(timeout=5.0) as c:
+            r = c.get(url)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        if r.status_code >= 500:
+            return ProbeResult(name, "critical", f"{r.status_code} ({elapsed_ms}ms)")
+        if elapsed_ms > baseline_ms * 4:
+            return ProbeResult(name, "warning", f"{elapsed_ms}ms (4x baseline {baseline_ms}ms)")
+        return ProbeResult(name, "ok", f"{elapsed_ms}ms")
+    except httpx.TimeoutException:
+        return ProbeResult(name, "critical", "timeout >5s")
+    except Exception as e:
+        return ProbeResult(name, "critical", f"error: {type(e).__name__}: {str(e)[:100]}")
+
+
+def probe_telegram_api_latency() -> ProbeResult:
+    token = _ENV.get("SREDA_TELEGRAM_BOT_TOKEN")
+    if not token:
+        return ProbeResult("telegram_api_latency", "ok", "(no token, skip)")
+    return _external_latency(f"https://api.telegram.org/bot{token}/getMe",
+                              "telegram_api_latency", baseline_ms=200)
+
+
+def probe_mimo_llm_latency() -> ProbeResult:
+    return _external_latency("https://token-plan-sgp.xiaomimimo.com/v1/models",
+                              "mimo_llm_latency", baseline_ms=500)
+
+
+def probe_openrouter_latency() -> ProbeResult:
+    return _external_latency("https://openrouter.ai/api/v1/models",
+                              "openrouter_latency", baseline_ms=500)
+
+
+def probe_groq_stt_latency() -> ProbeResult:
+    return _external_latency("https://api.groq.com/openai/v1/models",
+                              "groq_stt_latency", baseline_ms=400)
+
+
+# ---------------------------------------------------------------------------
+# Trace.log analysis
+# ---------------------------------------------------------------------------
+def _recent_traces(window_min: int = 30) -> list[dict]:
+    """Парсит последние N мин trace.log в struct'ы.
+
+    Trace формат — multiline блок начинается с ``=== TRACE trace_<id> <ts> ...``,
+    содержит indented events, заканчивается ``------- TOTAL <ms>ms iters=N ...``.
+    """
+    if not TRACE_LOG.exists():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_min)
+    traces = []
+    current = None
+    try:
+        with open(TRACE_LOG, "r", encoding="utf-8", errors="ignore") as fh:
+            # Tail-style: read last N MB
+            try:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 500_000))
+            except OSError:
+                pass
+            for line in fh:
+                line = line.rstrip()
+                if "=== TRACE " in line:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        try:
+                            ts = datetime.fromisoformat(parts[3] + "T" + parts[4]).replace(tzinfo=timezone.utc)
+                            current = {"ts": ts, "iters": 0, "total_ms": 0, "ack_ms": None}
+                        except Exception:
+                            current = None
+                elif "ack.sent" in line and current is not None:
+                    # "      4ms  ack.sent  [539ms] phrase=..."
+                    try:
+                        bracket = line.split("[")[1].split("ms]")[0]
+                        current["ack_ms"] = int(bracket)
+                    except Exception:
+                        pass
+                elif line.startswith("------- TOTAL ") and current is not None:
+                    try:
+                        ms = int(line.split("TOTAL ")[1].split("ms")[0])
+                        iters = int(line.split("iters=")[1].split()[0])
+                        current["total_ms"] = ms
+                        current["iters"] = iters
+                        if current["ts"] >= cutoff:
+                            traces.append(current)
+                    except Exception:
+                        pass
+                    current = None
+    except Exception:
+        return []
+    return traces
+
+
+def _percentile(values: list[int], p: float) -> int:
+    if not values:
+        return 0
+    s = sorted(values)
+    idx = min(int(len(s) * p), len(s) - 1)
+    return s[idx]
+
+
+def probe_turn_latency_p95() -> ProbeResult:
+    traces = _recent_traces(window_min=30)
+    if not traces:
+        return ProbeResult("turn_latency_p95", "ok", "(no traces in 30m)")
+    totals = [t["total_ms"] for t in traces if t["total_ms"] > 0]
+    if not totals:
+        return ProbeResult("turn_latency_p95", "ok", f"(no completed turns in 30m, n={len(traces)})")
+    p95 = _percentile(totals, 0.95)
+    if p95 > 30_000:
+        return ProbeResult("turn_latency_p95", "critical", f"p95={p95}ms (n={len(totals)})")
+    if p95 > 15_000:
+        return ProbeResult("turn_latency_p95", "warning", f"p95={p95}ms (n={len(totals)})")
+    return ProbeResult("turn_latency_p95", "ok", f"p95={p95}ms (n={len(totals)})")
+
+
+def probe_failed_turns_rate() -> ProbeResult:
+    traces = _recent_traces(window_min=30)
+    if not traces:
+        return ProbeResult("failed_turns_rate", "ok", "(no traces in 30m)")
+    n = len(traces)
+    failed = sum(1 for t in traces if t["iters"] == 0)
+    pct = 100 * failed / n if n else 0
+    if n >= 5 and pct > 20:
+        return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} failed ({pct:.0f}%)")
+    return ProbeResult("failed_turns_rate", "ok", f"{failed}/{n} failed ({pct:.0f}%)")
+
+
+def probe_ack_latency_p95() -> ProbeResult:
+    traces = _recent_traces(window_min=30)
+    ack_values = [t["ack_ms"] for t in traces if t.get("ack_ms")]
+    if not ack_values:
+        return ProbeResult("ack_latency_p95", "ok", "(no ack samples in 30m)")
+    p95 = _percentile(ack_values, 0.95)
+    if p95 > 5000:
+        return ProbeResult("ack_latency_p95", "critical", f"p95={p95}ms (n={len(ack_values)})")
+    if p95 > 2000:
+        return ProbeResult("ack_latency_p95", "warning", f"p95={p95}ms (n={len(ack_values)})")
+    return ProbeResult("ack_latency_p95", "ok", f"p95={p95}ms (n={len(ack_values)})")
+
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+def probe_fail2ban_bans() -> ProbeResult:
+    rc = subprocess.run(
+        ["fail2ban-client", "status", "sreda-scanner"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if rc.returncode != 0:
+        return ProbeResult("fail2ban_bans", "warning", "fail2ban not responsive")
+    # parse "Currently banned: N"
+    for line in rc.stdout.split("\n"):
+        if "Currently banned:" in line:
+            try:
+                n = int(line.split(":")[1].strip())
+            except Exception:
+                continue
+            if n > 50:
+                return ProbeResult("fail2ban_bans", "warning", f"{n} IPs banned (atypical)")
+            return ProbeResult("fail2ban_bans", "ok", f"{n} IPs banned")
+    return ProbeResult("fail2ban_bans", "ok", "0 IPs banned (parse fallback)")
+
+
 PROBES: list[Callable[[], ProbeResult]] = [
+    # Critical infra
     probe_uvicorn_active,
     probe_job_runner_active,
     probe_pg_responsive,
+    probe_pg_connections,
+    probe_pg_disk_free,
+    probe_pg_locks,
     probe_webhook_health,
     probe_last_backup_age,
+    # External APIs
+    probe_telegram_api_latency,
+    probe_mimo_llm_latency,
+    probe_openrouter_latency,
+    probe_groq_stt_latency,
+    # Trace metrics
+    probe_turn_latency_p95,
+    probe_failed_turns_rate,
+    probe_ack_latency_p95,
+    # Security
+    probe_fail2ban_bans,
 ]
 
 
