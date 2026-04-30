@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Среда — AI-ассистент для семьи в Telegram</title>
+  <meta name="description" content="Среда — персональный AI-ассистент в Telegram. Помогает с расписанием, напоминаниями, списком покупок, рецептами и памятью семьи.">
+  <style>
+    :root {
+      --primary: #2E5266;
+      --secondary: #E8B4A0;
+      --bg: #FBF7F4;
+      --text: #1F2937;
+      --muted: #5B6470;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    main {
+      flex: 1;
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 64px 24px 40px;
+      width: 100%;
+    }
+    .brand {
+      font-size: 32px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: var(--primary);
+      margin: 0 0 8px;
+    }
+    .brand-dot { color: var(--secondary); }
+    .tagline {
+      color: var(--muted);
+      font-size: 18px;
+      margin: 0 0 48px;
+    }
+    h1 {
+      font-size: 36px;
+      line-height: 1.2;
+      margin: 0 0 16px;
+      color: var(--primary);
+    }
+    p { font-size: 17px; margin: 0 0 18px; }
+    .skills {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+      margin: 32px 0;
+      list-style: none;
+      padding: 0;
+    }
+    .skills li {
+      background: white;
+      border-radius: 12px;
+      padding: 16px;
+      font-size: 15px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .skills .emoji { font-size: 22px; margin-right: 8px; }
+    .cta {
+      display: inline-block;
+      background: var(--primary);
+      color: white;
+      text-decoration: none;
+      padding: 14px 28px;
+      border-radius: 999px;
+      font-weight: 600;
+      margin-top: 24px;
+      transition: opacity 0.15s;
+    }
+    .cta:hover { opacity: 0.9; }
+    .note {
+      background: white;
+      border-left: 4px solid var(--secondary);
+      padding: 16px 20px;
+      border-radius: 8px;
+      margin: 32px 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    footer {
+      border-top: 1px solid #e5e7eb;
+      padding: 24px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    footer a { color: var(--muted); margin: 0 8px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">сред<span class="brand-dot">а</span></div>
+    <p class="tagline">AI-ассистент для семьи в Telegram</p>
+
+    <h1>Перестаньте держать всё в голове.</h1>
+    <p>
+      Среда — персональный ассистент, который ведёт семейный быт за вас:
+      расписание, напоминания, списки покупок, меню, рецепты, память о близких.
+      Работаете голосом или текстом — как удобно в моменте.
+    </p>
+
+    <ul class="skills">
+      <li><span class="emoji">🎙️</span>Голосовой ввод</li>
+      <li><span class="emoji">📅</span>Расписание</li>
+      <li><span class="emoji">🔔</span>Напоминания</li>
+      <li><span class="emoji">📝</span>Дела по дому</li>
+      <li><span class="emoji">🛒</span>Список покупок</li>
+      <li><span class="emoji">📖</span>Книга рецептов</li>
+      <li><span class="emoji">👨‍👩‍👧</span>Память о семье</li>
+      <li><span class="emoji">🧠</span>Долгая память</li>
+    </ul>
+
+    <a href="https://t.me/sreda01_bot" class="cta">Открыть в Telegram</a>
+
+    <div class="note">
+      Сайт находится в разработке. Полноценный лендинг с тарифами, разделами FAQ и
+      входом в личный кабинет появится в ближайшее время. Сейчас Среда работает
+      в формате закрытой беты в Telegram-канале <a href="https://t.me/sreda01_bot">@sreda01_bot</a>.
+    </div>
+  </main>
+
+  <footer>
+    <a href="/legal/contacts.html">Контакты</a> ·
+    <a href="/legal/privacy.html">Политика конфиденциальности</a> ·
+    © 2026 Sreda
+  </footer>
+</body>
+</html>
