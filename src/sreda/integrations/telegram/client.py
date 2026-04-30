@@ -33,16 +33,21 @@ def _make_pool_client() -> httpx.AsyncClient:
         # Defaults; per-call timeout passed via .request(timeout=)
         timeout=httpx.Timeout(30.0, connect=10.0),
         limits=httpx.Limits(
-            max_keepalive_connections=10,
+            # 2026-04-30 (incident: ack/sendMessage висели 30-60s на
+            # stale connections): через SOCKS5 с DNS-flapping на egress
+            # (89.110.77.78) keepalive connections превращались в
+            # zombies. Pool отдавал «живой» connection, httpx писал
+            # request, ssh-channel пытался открыться → DNS-fail → 30s
+            # timeout. Пинг-таска лишь усугубляла, refreshя зомби.
+            #
+            # Откат: max_keepalive=0, никакого keepalive. Каждый
+            # request — fresh TCP+TLS handshake (~800ms через SOCKS).
+            # Медленнее но детерминистично, никаких 30-60s залипов.
+            # Когда SOCKS станет стабильным или станем direct-only —
+            # можно вернуть keepalive=10/expiry=60.
+            max_keepalive_connections=0,
             max_connections=20,
-            # 2026-04-29 (incident: ack 800-900ms на холодном pool):
-            # bumped 60s → 300s. Связка с keepalive-pinger task
-            # (`run_keepalive_pinger`) который пингует `getMe` каждые
-            # 45с — пинг рефрешит idle-таймер до 300s expiry => idle
-            # connection не отрубается, ack стабильно <100мс. 300s
-            # запас на случай если pinger пропустил один tick (sleep
-            # drift, временный network glitch).
-            keepalive_expiry=300.0,
+            keepalive_expiry=5.0,
         ),
     )
 
