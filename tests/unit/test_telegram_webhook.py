@@ -30,6 +30,23 @@ EXISTING_CHAT_ID = "100000003"
 NEW_USER_CHAT_ID = "100000004"
 
 
+# 2026-04-30: после переезда approved-flow в asyncio.create_task() основная
+# обработка идёт в фоне. TestClient уже вернул 202, но background task
+# (LLM/voice/outbox/tracе) только начинается. Хелпер ждёт пока условие
+# станет true, опрашивая state — типичный wait-for-condition паттерн.
+def _wait_for(condition, timeout: float = 5.0, interval: float = 0.05) -> None:
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if condition():
+                return
+        except Exception:  # noqa: BLE001 — condition может бросать пока state ещё не готов
+            pass
+        time.sleep(interval)
+    raise AssertionError(f"timed out after {timeout}s waiting for background task")
+
+
 def test_telegram_webhook_persists_sanitized_and_encrypted_payload(
     monkeypatch,
     tmp_path: Path,
@@ -256,6 +273,7 @@ def test_telegram_webhook_handles_status_command(
     assert response.status_code == 202
     # Two messages now: the fast ack (index 0) + real reply (index 1).
     # Ack is UX sugar — filter it out and assert on the real response.
+    _wait_for(lambda: len(sent_messages) == 2)
     assert len(sent_messages) == 2
     assert sent_messages[0]["text"] in all_phrases()
     real_reply = sent_messages[1]
@@ -351,6 +369,7 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     response = client.post("/webhooks/telegram/sreda", json=payload)
 
     assert response.status_code == 202
+    _wait_for(lambda: len(answered_callbacks) == 1 and len(sent_messages) == 1)
     assert len(answered_callbacks) == 1
     assert len(sent_messages) == 1
     assert "Подписка EDS Monitor подключена." in sent_messages[0]["text"]
@@ -442,6 +461,7 @@ def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
     response = client.post("/webhooks/telegram/sreda", json=payload)
 
     assert response.status_code == 202
+    _wait_for(lambda: len(answered_callbacks) == 1 and len(sent_messages) == 1)
     assert len(answered_callbacks) == 1
     # Phase: Mini-App-only UX — the reply carries a single "Открыть
     # подписки" web_app button instead of the old per-action "Подключить
@@ -760,6 +780,7 @@ def test_telegram_webhook_handles_claim_lookup_command(
 
     assert response.status_code == 202
     # Fast ack (index 0) + real claim reply (index 1).
+    _wait_for(lambda: len(sent_messages) == 2)
     assert len(sent_messages) == 2
     assert sent_messages[0]["text"] in all_phrases()
     real_reply = sent_messages[1]

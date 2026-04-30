@@ -2,13 +2,13 @@ import asyncio
 import hmac
 import logging
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_telegram_rate_limit
 from sreda.config.settings import get_settings
 from sreda.db.models.core import Tenant
-from sreda.db.session import get_db_session
+from sreda.db.session import get_db_session, get_session_factory
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.schemas.api import TelegramWebhookAccepted
 from sreda.services import trace
@@ -81,6 +81,131 @@ async def _delete_ack_after_reply(
         logger.debug("ack delete crashed", exc_info=True)
 
 
+async def _process_approved_turn(
+    *,
+    bot_key: str,
+    payload: dict,
+    onboarding,
+    inbound_message_id: str,
+    bot_token: str,
+) -> None:
+    """Run full approved-user processing detached from webhook response.
+
+    2026-04-30 (incident voice-webhook timeout): Telegram webhook delivery
+    имеет cutoff ~10 сек. Voice + multi-iter LLM runs регулярно занимают
+    16-20 сек, вебхук возвращал 202 после полной обработки → Telegram
+    считал доставку failed → ставил retry в очередь → pending update
+    застревал → юзер видел «не отвечает».
+
+    Решение: webhook handler возвращает 202 СРАЗУ после persist_inbound,
+    основная обработка едет здесь как detached task с собственной DB
+    session (request-scoped session уже закрыта к этому моменту).
+    """
+    SessionLocal = get_session_factory()
+    bg_session: Session = SessionLocal()
+    try:
+        telegram_client = TelegramClient(bot_token)
+        trace_ctx = trace.start_trace(
+            user_id=onboarding.user_id,
+            tenant_id=onboarding.tenant_id,
+            channel="telegram",
+        )
+        message = payload.get("message") if isinstance(payload, dict) else None
+        message_type = "unknown"
+        if isinstance(message, dict):
+            if isinstance(message.get("voice"), dict):
+                voice = message["voice"]
+                message_type = "voice"
+                trace.record(
+                    "webhook.received",
+                    type="voice",
+                    voice_duration_s=voice.get("duration"),
+                )
+            elif message.get("text"):
+                message_type = "text"
+                trace.record("webhook.received", type="text")
+            else:
+                message_type = "other"
+                trace.record("webhook.received", type="other")
+        elif isinstance(payload, dict) and payload.get("callback_query"):
+            message_type = "callback"
+            trace.record("webhook.received", type="callback")
+        else:
+            trace.record("webhook.received", type="unknown")
+
+        ack_task: asyncio.Task | None = None
+        if (
+            message_type in ("text", "voice")
+            and not onboarding.is_new_user
+        ):
+            ack_text = pick_ack()
+            ack_task = asyncio.create_task(
+                _fire_and_forget_ack(
+                    telegram_client, onboarding.chat_id, ack_text,
+                ),
+                name=f"ack:{onboarding.chat_id}",
+            )
+
+        try:
+            await handle_telegram_interaction(
+                bg_session,
+                bot_key=bot_key,
+                payload=payload,
+                telegram_client=telegram_client,
+                onboarding=onboarding,
+                inbound_message_id=inbound_message_id,
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning(
+                "Telegram delivery failed during webhook handling: %s", exc,
+            )
+        finally:
+            ack_message_id: int | None = None
+            if ack_task is not None:
+                if not ack_task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(ack_task), timeout=2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "ack task still pending after main turn — abandoning",
+                        )
+                if ack_task.done() and not ack_task.cancelled():
+                    try:
+                        ack_message_id = ack_task.result()
+                    except Exception:  # noqa: BLE001
+                        ack_message_id = None
+
+            reply_delivered_inline = (
+                trace_ctx is not None and any(
+                    e.step == "outbox.delivered" for e in trace_ctx.events
+                )
+            )
+            if (
+                ack_message_id is not None
+                and reply_delivered_inline
+                and onboarding.chat_id is not None
+            ):
+                asyncio.create_task(
+                    _delete_ack_after_reply(
+                        telegram_client,
+                        str(onboarding.chat_id),
+                        ack_message_id,
+                    ),
+                    name=f"ack_del:{onboarding.chat_id}",
+                )
+
+            if trace_ctx is not None and not any(
+                e.step == "outbox.enqueued" for e in trace_ctx.events
+            ):
+                trace.emit_block(trace_ctx)
+    except Exception:  # noqa: BLE001
+        logger.exception("background turn processing crashed")
+    finally:
+        bg_session.close()
+
+
 def _verify_telegram_secret_token(
     secret_token_header: str | None = Header(
         default=None,
@@ -116,6 +241,7 @@ def _verify_telegram_secret_token(
 async def telegram_webhook(
     bot_key: str,
     payload: dict,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_db_session),
 ) -> TelegramWebhookAccepted:
     onboarding = ensure_telegram_user_bundle(session, payload)
@@ -272,148 +398,20 @@ async def telegram_webhook(
     # Имя извлекается LLM-tool'ом `update_profile_field` во время
     # естественного диалога — webhook ничего не перехватывает.
 
+    # 2026-04-30 (incident voice-webhook timeout): обработка voice + multi-iter
+    # LLM регулярно занимает 16-20 сек, что превышает Telegram webhook timeout
+    # (~10 сек). Раньше handler возвращал 202 ПОСЛЕ полной обработки → Telegram
+    # классифицировал доставку как failed → ставил retry → pending update
+    # застревал → юзер видел «не отвечает». Теперь handler возвращает 202
+    # СРАЗУ после persist_inbound, основная обработка едет в FastAPI
+    # BackgroundTasks (запускается ПОСЛЕ response.send в Starlette/Uvicorn).
     if settings.telegram_bot_token and onboarding.chat_id:
-        telegram_client = TelegramClient(settings.telegram_bot_token)
-
-        # Begin an end-to-end trace for this turn. Steps recorded
-        # downstream (voice.transcribe, llm.iter.N, outbox.enqueued,
-        # outbox.delivered) find this context via a ContextVar and
-        # append to it. The block is emitted by the delivery worker
-        # after the reply lands in Telegram (happy path); if the
-        # handler never writes an outbox row, we emit here so the
-        # trace isn't lost.
-        trace_ctx = trace.start_trace(
-            user_id=onboarding.user_id,
-            tenant_id=onboarding.tenant_id,
-            channel="telegram",
+        background_tasks.add_task(
+            _process_approved_turn,
+            bot_key=bot_key,
+            payload=payload,
+            onboarding=onboarding,
+            inbound_message_id=result.inbound_message_id,
+            bot_token=settings.telegram_bot_token,
         )
-        message = payload.get("message") if isinstance(payload, dict) else None
-        message_type = "unknown"
-        if isinstance(message, dict):
-            if isinstance(message.get("voice"), dict):
-                voice = message["voice"]
-                message_type = "voice"
-                trace.record(
-                    "webhook.received",
-                    type="voice",
-                    voice_duration_s=voice.get("duration"),
-                )
-            elif message.get("text"):
-                message_type = "text"
-                trace.record("webhook.received", type="text")
-            else:
-                message_type = "other"
-                trace.record("webhook.received", type="other")
-        elif isinstance(payload, dict) and payload.get("callback_query"):
-            message_type = "callback"
-            trace.record("webhook.received", type="callback")
-        else:
-            trace.record("webhook.received", type="unknown")
-
-        # Fast acknowledgement. A one-word reply ("работаю", "секунду",
-        # ...) goes out immediately so the user sees the bot react while
-        # the real turn is still crunching voice / LLM / outbox. Sent
-        # DIRECTLY via the Telegram client — outbox adds ~1s worker-
-        # poll latency which defeats the purpose. Skipped for button
-        # taps (already feel instant) and new-user flow (they're
-        # getting a welcome screen, not a question to ack).
-        #
-        # 2026-04-29 (Phase C optimization): ack идёт через
-        # `asyncio.create_task` — fire-and-forget параллельно с
-        # voice.download/transcribe. Раньше `await` блокировал на
-        # ~425мс (через SOCKS5 RTT). Теперь download стартует
-        # одновременно с ack send, экономит этот штраф из user-perceived
-        # latency. ContextVar (TraceContext) копируется в child task
-        # автоматически, так что trace.step внутри ack корректно пишет
-        # в текущий trace блок. В конце handler'а ждём `ack_task`
-        # с таймаутом 2с — обычно он уже завершён (sendMessage ~400мс
-        # vs voice flow ~10с), но явное ожидание гарантирует что trace
-        # блок включит ack.sent перед emit_block.
-        # 2026-04-29 rollback: убран `sendChatAction(typing)` task.
-        # Эмпирические данные (1346/1760мс на ack-send vs обычные
-        # <500мс) показали что parallel chat_action деграфит ack-send
-        # — оба request'а боролись за SOCKS5 bandwidth на egress.
-        # UX-выигрыш от typing-индикатора был незаметен (ack догонял
-        # его раньше). Pinger keepalive держит pool warm 24/7, цены
-        # за warm pool теперь без концурренции.
-        ack_task: asyncio.Task | None = None
-        if (
-            message_type in ("text", "voice")
-            and not onboarding.is_new_user
-        ):
-            ack_text = pick_ack()
-            ack_task = asyncio.create_task(
-                _fire_and_forget_ack(
-                    telegram_client, onboarding.chat_id, ack_text,
-                ),
-                name=f"ack:{onboarding.chat_id}",
-            )
-
-        try:
-            await handle_telegram_interaction(
-                session,
-                bot_key=bot_key,
-                payload=payload,
-                telegram_client=telegram_client,
-                onboarding=onboarding,
-                inbound_message_id=result.inbound_message_id,
-            )
-        except TelegramDeliveryError as exc:
-            logger.warning("Telegram delivery failed during webhook handling: %s", exc)
-        finally:
-            # Wait briefly for ack task to complete — нужно знать
-            # message_id ack'а, чтобы потом удалить его. Voice flow
-            # ~10с, ack ~400мс — task обычно already done by here.
-            # Cap 2с safety если ack завис (rare).
-            ack_message_id: int | None = None
-            if ack_task is not None:
-                if not ack_task.done():
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(ack_task), timeout=2.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "ack task still pending after main turn — abandoning",
-                        )
-                if ack_task.done() and not ack_task.cancelled():
-                    try:
-                        ack_message_id = ack_task.result()
-                    except Exception:  # noqa: BLE001
-                        ack_message_id = None
-
-            # 2026-04-29: clean-chat — удаляем ack-message ТОЛЬКО если
-            # реальный reply был доставлен inline. Если reply
-            # deferred (quiet hours / muted) — ack оставляем, иначе
-            # юзер не увидит ничего. Inline-доставка детектится по
-            # наличию `outbox.delivered` event в trace.
-            reply_delivered_inline = (
-                trace_ctx is not None and any(
-                    e.step == "outbox.delivered" for e in trace_ctx.events
-                )
-            )
-            if (
-                ack_message_id is not None
-                and reply_delivered_inline
-                and onboarding.chat_id is not None
-            ):
-                # Fire-and-forget delete: не блокируем 202-ack юзера
-                # ради cleanup'а. Failures DEBUG-only.
-                asyncio.create_task(
-                    _delete_ack_after_reply(
-                        telegram_client,
-                        str(onboarding.chat_id),
-                        ack_message_id,
-                    ),
-                    name=f"ack_del:{onboarding.chat_id}",
-                )
-
-            # If the handler DID enqueue an outbox row, the delivery
-            # worker will emit the block once it lands in Telegram.
-            # Otherwise emit here so /help-style inline replies and
-            # early-return paths still produce a trace record.
-            if trace_ctx is not None and not any(
-                e.step == "outbox.enqueued" for e in trace_ctx.events
-            ):
-                trace.emit_block(trace_ctx)
     return TelegramWebhookAccepted(ok=True, request_id=result.inbound_message_id)
