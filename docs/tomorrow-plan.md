@@ -358,23 +358,63 @@ Bonus: нет дубликата `ack + delete_after_reply`-логики.
 
 Делать **если 9.1 покажет client-side sync**.
 
-#### 9.3. WireGuard вместо SSH-SOCKS5 (день)
+#### 9.3. Заменить транспорт RU↔EU (один из двух вариантов)
 
 Радикальный архитектурный фикс outbound-транспорта. Сейчас:
 RU VDS → `ssh -D 1080` → EU egress (89.110.77.78) → TG.
 SSH dynamic-forward = TCP-over-TCP, head-of-line blocking возможен:
-один retransmit на одном channel'е тормозит остальные.
+один retransmit на одном channel'е тормозит остальные. Делать **если
+9.1 покажет ack физически создан позже final**, или после внедрения
+9.2 захотим убрать SSH-SOCKS как «кривой костыль».
 
-Замена на WireGuard:
-- WG tunnel RU↔EU, policy route 149.154.160.0/20 + 91.108.4.0/22 через WG
-- В httpx убрать `trust_env=True` → нет proxy parsing
-- Прямые TCP к api.telegram.org, kernel-side TCP keepalive работает
-  как задумано, никакого ssh-channel мультиплексирования
+##### 9.3.A — Маленький Go-прокси на egress (рекомендуемый, ~1 час)
+
+Узкий слой: на 89.110.77.78 поднимаем маленький Go-сервис, который
+принимает CONNECT/SOCKS5 от RU VDS и форвардит как **direct TCP** к
+api.telegram.org. Один TCP-сокет на один outbound-запрос, никакого
+SSH-channel мультиплексирования → HOL blocking устранён by design.
+
+- ~150 строк Go (`net.Listen` → `net/http` CONNECT либо мини-SOCKS5)
+- single binary, systemd-юнит на egress'е
+- firewall whitelist на src=62.113.41.104 (только наш RU VDS пускаем)
+- TLS termination остаётся на стороне httpx как сейчас (egress
+  только TCP-форвардит, не расшифровывает)
+
+**Плюсы vs WireGuard:**
+- 1 час работы вместо дня
+- Не требует kernel-level WireGuard модуля (на Timeweb VPS может быть
+  неудобно настраивать)
+- Возможность залогировать каждый outbound на egress'е (диагностика
+  будущих инцидентов)
+
+**Минусы:**
+- Ещё один компонент в обвязке (мини-сервис на egress'е)
+- Если egress reboot'нётся — нужен systemd Restart=always
+
+##### 9.3.B — WireGuard RU↔EU (день, более радикальный)
+
+WG tunnel RU↔EU, policy route 149.154.160.0/20 + 91.108.4.0/22 через WG.
+В httpx убрать `trust_env=True` → нет proxy parsing. Прямые TCP к
+api.telegram.org, kernel-side TCP keepalive работает как задумано,
+никакого ssh-channel мультиплексирования.
 
 Конфиги в комментариях — приведены в чате (другой ИИ).
 
-Делать **если 9.1 покажет ack физически создан позже final**, или
-после внедрения 9.2 захотим убрать SSH-SOCKS как «кривой костыль».
+**Плюсы vs Go-прокси:**
+- Kernel-level, ничего не парсится в userspace
+- Решение «промышленное», переиспользуемо для других egress-задач
+- Нет дополнительного процесса на egress'е
+
+**Минусы:**
+- День работы вместо часа
+- Требует root + WG kernel module на обоих VPS
+- Конфиги ключей — лишний вектор для ошибки
+
+##### Какой выбирать
+
+**Сначала пробуем 9.3.A (Go-прокси).** Если решит — оставляем как есть.
+Если поведение не улучшится — копаем глубже, возможно идём в 9.3.B
+(WireGuard) либо разбираемся с самим egress-провайдером.
 
 #### Acceptance
 - 9.1 даст диагностику в логах за 1 день
