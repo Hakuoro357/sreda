@@ -115,13 +115,28 @@ def build_memory_tools(
     def recall_memory(query: str, top_k: int = 3) -> str:
         """Search previously saved user memories by semantic similarity.
 
-        The conversation handler already seeded top-k memories into your
-        prompt. Use this only if you need to dig deeper on a specific
-        topic that wasn't covered by the initial retrieval.
+        ALWAYS call this tool when:
+        - the user asks for a list/all/everything about a topic
+          ("покажи все Х", "что у меня есть про Y", "перечисли все Z",
+          "помнишь Y", "в переписке было")
+        - you can't find a specific fact in [ПАМЯТЬ] above and want to
+          verify before answering
+        - BEFORE saying "у меня нет данных по X" / "ты не записывала Y" /
+          "я этого не помню" — first call recall_memory with relevant
+          query, then decide. Never claim absence without verifying.
+
+        The conversation handler seeds memories into your prompt at the
+        start of each turn, but that seed may be incomplete for
+        list-style queries. Don't assume seeded [ПАМЯТЬ] is the full
+        picture — when the user asks for completeness, verify.
 
         Args:
-            query: the question or topic to recall ("how old is her daughter").
-            top_k: number of results to return (default 3, max 10).
+            query: the question or topic to recall. Use either the user's
+                   exact phrasing OR specific keywords from it
+                   ("ткани характеристики", "дети возраст", "адреса").
+            top_k: number of results to return (default 3, max 10). Bump
+                   to 10 for list-style queries; default 3 is fine for
+                   single-fact lookups.
 
         Returns:
             JSON string with list of {content, tier, score}.

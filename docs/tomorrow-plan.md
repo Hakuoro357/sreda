@@ -475,7 +475,87 @@ API будет каждый раз заново грузить).
 завтрашнего разбора `message_id` логов.
 
 **Риск:** MAX API менее зрелый чем TG, нет публичной доки. Возможно
-придётся реверс-инжинирить через probe. На probe заложить ~0.5 дня.
+придётся реверс-инжинирить через probe. On probe заложить ~0.5 дня.
+
+### 11. recall_memory proactive policy — staged roadmap
+
+**Контекст.** 30 апреля 2026 ~19:42 МСК юзер tg=755682022 написала
+«покажи все ткани с характеристиками ширина и усадка». Бот ответил
+«пока только одна ткань: Лён хлопок пудра». В реальности в
+`assistant_memories` уже было 5+ записей про другие ткани (Тенсель
+шампань, Страйп шампань, Страйп лайм, Индийская сирень, Пепельная
+сирень тенцель), созданных 22-25 апреля и активно использовавшихся.
+
+**Stage 1 — ✅ DONE 2026-05-01 (commit `<TBD>`)** — hotfix
+prompt/tool contract:
+- `recall_memory` docstring переписан на императивные триггеры
+  (ALWAYS на списочных запросах, BEFORE на негативных ответах).
+- `_CORE_SYSTEM_PROMPT` блок про память: добавлены ОБЯЗАТЕЛЬНО
+  и ВСЕГДА директивы, плюс анти-internals и анти-confabulation
+  правила.
+- `tests/unit/test_recall_memory_prompt.py` — 4 unit-теста на
+  prompt builder (4/4 зелёные).
+- `docs/qa/recall_memory_smoke.md` — 5-сценарный manual checklist
+  для прогона на dev-боте после deploy'а.
+
+**Stage 2 — required follow-up (1-2 суток наблюдения)**:
+
+Перед любыми изменениями `top_k` / `min_score` нужно понять, как
+retrieval работает СЕЙЧАС. Иначе понизим порог → накачаем `[ПАМЯТЬ]`
+шумом → ответы могут стать хуже, не лучше.
+
+Что добавить — структурированный лог в `node_load_memories`:
+
+```python
+logger.info(
+    "node_load_memories tenant=%s seeded=%d "
+    "scores_min=%.3f scores_max=%.3f scores_p50=%.3f "
+    "filtered_below_min=%d total_in_db=%d",
+    ...
+)
+```
+
+Прогон 1-2 суток на проде. Анализ:
+- Сколько в среднем seeded в `[ПАМЯТЬ]`? (целевое — близко к top_k=10)
+- Сколько отфильтровалось `min_score`'ом?
+- Какая медиана score'ов?
+
+**Risks Stage 2:** нулевые. Только observability, не меняет behaviour.
+
+**Когда:** сразу после Stage 1, до закрытия пунктов 9 / 10.
+
+**Stage 3+ — conditional design notes** (не обязательный путь, активировать
+только если evidence из Stage 2 + smoke checklist'а покажут что Stage 1
+недостаточно):
+
+- **Stage 3 (retrieval params tuning):** менять `top_k` / `min_score`
+  через `RuntimeConfig` (admin-toggleable), не in-place в коде.
+  Risks: понижение порога → больше irrelevant memories → возможно
+  ухудшение ответов на specific factual queries.
+- **Stage 4 (broad recall + rerank):** candidate pool 50 + rerank до
+  top-10. ~1 день кода. Без schema changes.
+- **Stage 5 (structured facts):** новая таблица `tenant_facts` с
+  типизацией entities — `fabric`, `contact`, `order`. Plain
+  metadata flags (`has_width`) рядом с encrypted attributes.
+  Detеrministic SQL для list-style queries. ~2-3 дня на первый
+  домен. Требует отдельный HMAC ключ `MEMORY_FACT_NAME_HMAC_KEY`.
+- **Stage 6 (blind token index):** keyword index с per-tenant HMAC
+  (`HMAC(tenant_token_key, normalized_token)`). ~2 дня.
+  Leakage: внутри tenant'а frequency/equality раскрывается, across
+  tenants — нет (благодаря per-tenant ключу).
+
+Полный детализированный staged plan + risk register — в
+`~/.claude/plans/mellow-discovering-conway.md` (одобренный 1 мая 2026).
+
+**Открытые вопросы для Stage 5+** (требуют отдельной discovery-сессии):
+1. Какие fabric-атрибуты обязательные/опциональные? (минимум:
+   width_cm, shrinkage_edge_pct, shrinkage_cross_pct)
+2. Migration legacy assistant_memories с темой «ткани» в
+   `tenant_facts` — автоматически или вручную?
+3. Threat model: 152-ФЗ или защита от mole внутри SaaS?
+   От этого зависит выбор HMAC-стратегии.
+4. Stage 4 rerank choice: cross-encoder (CPU latency?) vs simple
+   score formula vs LLM-rerank (latency?). Нужен бенчмарк.
 
 ---
 
