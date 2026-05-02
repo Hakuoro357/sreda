@@ -141,12 +141,25 @@ class OutboxDeliveryWorker:
         trace_payload = payload.pop("_trace", None)
 
         try:
-            await self.telegram.send_message(
+            send_response = await self.telegram.send_message(
                 chat_id=payload.get("chat_id"),
                 text=payload.get("text", ""),
                 reply_markup=payload.get("reply_markup"),
                 parse_mode=payload.get("parse_mode"),
             )
+            # Stage 9.1: capture TG-side message_id/date for ack-vs-final
+            # ordering analysis. См. tomorrow-plan пункт 9.
+            tg_msg_id: int | None = None
+            tg_date: int | None = None
+            result = send_response.get("result") if isinstance(send_response, dict) else None
+            if isinstance(result, dict):
+                mid = result.get("message_id")
+                date_v = result.get("date")
+                if isinstance(mid, int):
+                    tg_msg_id = mid
+                if isinstance(date_v, int):
+                    tg_date = date_v
+
             # Feature-specific post-delivery (e.g. EDS photo sending)
             if row.feature_key:
                 hook = get_feature_registry().get_delivery_hook(row.feature_key)
@@ -170,6 +183,8 @@ class OutboxDeliveryWorker:
                 trace_payload,
                 chat_id=payload.get("chat_id"),
                 status="ok",
+                tg_message_id=tg_msg_id,
+                tg_date=tg_date,
             )
         except TelegramDeliveryError:
             logger.warning("outbox delivery: telegram error on %s, keeping pending", row.id)
@@ -190,22 +205,39 @@ class OutboxDeliveryWorker:
 
     @staticmethod
     def _emit_trace(
-        trace_payload: dict | None, *, chat_id: object, status: str
+        trace_payload: dict | None,
+        *,
+        chat_id: object,
+        status: str,
+        tg_message_id: int | None = None,
+        tg_date: int | None = None,
     ) -> None:
         """Render the accumulated end-to-end trace block. No-op if the
         outbox row wasn't tagged with a trace (reminders / EDS
-        notifications / other non-conversation rows)."""
+        notifications / other non-conversation rows).
+
+        ``tg_message_id`` / ``tg_date`` (Stage 9.1, см. tomorrow-plan
+        пункт 9) — Telegram-side ids возвращённые ``sendMessage``.
+        Лежат в final_meta трейса; ``ack.sent`` событие так же содержит
+        свой ``tg_message_id`` через ``trace.step``. Сравнение даёт
+        диагностику «ack приходит после реплая».
+        """
         if not trace_payload:
             return
         try:
             ctx = trace.deserialize_from_outbox(trace_payload)
+            final_meta: dict = {
+                "chat": str(chat_id) if chat_id is not None else None,
+                "status": status,
+            }
+            if tg_message_id is not None:
+                final_meta["tg_message_id"] = tg_message_id
+            if tg_date is not None:
+                final_meta["tg_date"] = tg_date
             trace.emit_block(
                 ctx,
                 final_event_name="outbox.delivered",
-                final_meta={
-                    "chat": str(chat_id) if chat_id is not None else None,
-                    "status": status,
-                },
+                final_meta=final_meta,
             )
         except Exception:  # noqa: BLE001 — trace must never kill delivery
             logger.exception("outbox delivery: failed to emit trace block")

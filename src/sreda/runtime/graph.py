@@ -381,6 +381,12 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             decision=decision.kind.value,
         )
 
+        # Stage 9.1: capture TG-side message_id/date for the inline path
+        # so we can correlate ack vs final delivery order. Lives only
+        # for the duration of this turn — fed into final_meta below.
+        first_send_tg_message_id: int | None = None
+        first_send_tg_date: int | None = None
+
         if decision.kind == DeliveryKind.drop:
             outbox.status = "muted"
         elif decision.kind == DeliveryKind.defer:
@@ -390,12 +396,20 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
         else:  # send
             if telegram is not None:
                 try:
-                    await telegram.send_message(
+                    response = await telegram.send_message(
                         chat_id=action.external_chat_id,
                         text=reply["text"],
                         reply_markup=reply["reply_markup"],
                     )
                     outbox.status = "sent"
+                    result = response.get("result") if isinstance(response, dict) else None
+                    if isinstance(result, dict):
+                        mid = result.get("message_id")
+                        tg_date = result.get("date")
+                        if isinstance(mid, int):
+                            first_send_tg_message_id = mid
+                        if isinstance(tg_date, int):
+                            first_send_tg_date = tg_date
                 except TelegramDeliveryError:
                     # Leave pending; delivery worker will retry.
                     outbox.status = "pending"
@@ -410,14 +424,22 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
     if _trace_ctx is not None and outbox_items:
         first = outbox_items[0]
         if first.status == "sent":
+            final_meta = {
+                "chat": action.external_chat_id,
+                "status": "ok",
+                "path": "inline",
+            }
+            # Stage 9.1 (см. tomorrow-plan пункт 9): TG-side ids для
+            # сравнения с ack.tg_message_id. Сравнение покажет, нужен
+            # editMessageText UX-fix или transport-layer fix.
+            if first_send_tg_message_id is not None:
+                final_meta["tg_message_id"] = first_send_tg_message_id
+            if first_send_tg_date is not None:
+                final_meta["tg_date"] = first_send_tg_date
             trace.emit_block(
                 _trace_ctx,
                 final_event_name="outbox.delivered",
-                final_meta={
-                    "chat": action.external_chat_id,
-                    "status": "ok",
-                    "path": "inline",
-                },
+                final_meta=final_meta,
             )
         elif first.status == "muted":
             trace.emit_block(

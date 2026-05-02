@@ -85,6 +85,17 @@ async def _fire_and_forget_ack(
             meta["status"] = "ok"
             result = response.get("result") or {}
             mid = result.get("message_id")
+            # Stage 9.1 (см. tomorrow-plan): TG-side identifiers для
+            # диагностики «ack приходит после реплая». Если ack.message_id
+            # < final.message_id — Telegram client-side sync, сетью не
+            # лечится, нужен placeholder + editMessageText (9.2).
+            # Если ack.message_id > final.message_id — реальный transport
+            # HOL, нужен WireGuard / Go-egress (9.3).
+            if isinstance(mid, int):
+                meta["tg_message_id"] = mid
+            tg_date = result.get("date")
+            if isinstance(tg_date, int):
+                meta["tg_date"] = tg_date
             return int(mid) if isinstance(mid, int) else None
         except TelegramDeliveryError as exc:
             logger.warning("ack delivery failed: %s", exc)
