@@ -460,7 +460,7 @@ async def test_handle_telegram_update_fast_no_blocking_io(fresh_db, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_handle_telegram_update_idempotent_on_duplicate(fresh_db):
+async def test_handle_telegram_update_idempotent_on_duplicate(fresh_db, monkeypatch):
     """Same update_id twice → second call is a true no-op:
     persist_telegram_inbound_event returns is_duplicate; we do not
     create a new InboundMessage row, do not change the existing row's
@@ -494,8 +494,13 @@ async def test_handle_telegram_update_idempotent_on_duplicate(fresh_db):
                 row.processing_status = "processed"
                 s.commit()
 
-    monkeypatch_target = ti
-    monkeypatch_target._process_approved_turn = noop_turn
+    # CRITICAL: must use pytest's monkeypatch fixture so the stub gets
+    # rolled back after this test. Direct ``ti._process_approved_turn = ...``
+    # would persist for the rest of the session and silently break ALL
+    # subsequent tests that exercise real turn processing (notably
+    # test_telegram_webhook). This was the root of пункт 8.1 isolation
+    # bug — fixed 2026-05-02.
+    monkeypatch.setattr(ti, "_process_approved_turn", noop_turn)
 
     inb_id_1 = await handle_telegram_update(payload)
     # Drain the create_task'd turn.

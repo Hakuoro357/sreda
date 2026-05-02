@@ -309,7 +309,7 @@ max_connections=4) ловят >95% случаев — отложено до сл
 - 0 регрессий — webhook/inbound/billing/encryption suite остаются
   100% зелёными
 
-### 8.1. Test isolation: long_poll корруптит state webhook'а (P1)
+### 8.1. Test isolation: long_poll корруптит state webhook'а — ✅ DONE 2026-05-02
 
 **Симптом.** Если запустить
 `pytest tests/unit/test_telegram_long_poll.py tests/unit/test_telegram_webhook.py`
@@ -339,6 +339,29 @@ for background task». Solo каждый suite зелёный (13/13 + 11/11).
 
 **Когда:** до первого CI runner с полным `pytest tests/unit/` прогоном
 ИЛИ когда сильно начнёт мешать локально.
+
+**Root cause (DONE 2026-05-02).** В `test_handle_telegram_update_idempotent_on_duplicate`
+строка `monkeypatch_target = ti; monkeypatch_target._process_approved_turn = noop_turn` —
+это не pytest-monkeypatch, а direct module-attribute assignment.
+Замена `_process_approved_turn` на `noop_turn` **persist'ила между
+тестами**: все следующие тесты в session видели stub'ovую версию,
+которая делала pretend «turn ran» вместо реального LLM/outbox.
+Webhook-тесты ждали 2 outbound message (ack + final reply), но
+final reply никогда не отправлялся → timeout 5s в `_wait_for`.
+
+**Fix:** заменили `monkeypatch_target = ti; ti._process_approved_turn = ...`
+на `monkeypatch.setattr(ti, "_process_approved_turn", noop_turn)`.
+Pytest-monkeypatch автоматически откатывает изменение в teardown'е.
+
+**Bonus:** добавили autouse-фикстуру в `tests/unit/conftest.py` который
+очищает `_TENANT_LOCKS` и `_CLIENT_POOL` (модульные dict с asyncio.Lock /
+httpx.AsyncClient объектами привязанными к event loop) после каждого
+теста. Это не было причиной 8.1, но защищает от похожих leak'ов в
+будущем.
+
+После fix'а: `pytest tests/unit/test_telegram_long_poll.py
+tests/unit/test_telegram_webhook.py` → 26/26 ✓ (раньше 5/11 webhook
+fail'ов в combined прогоне).
 
 ### 9. Outbound delivery: ack приходит ПОСЛЕ реплая
 

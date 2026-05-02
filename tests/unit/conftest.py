@@ -174,3 +174,46 @@ def _default_encryption_key(monkeypatch):
     yield
     get_settings.cache_clear()
     get_encryption_service.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_module_level_loop_bound_state():
+    """Clear module-level state that's tied to a specific asyncio event loop.
+
+    Background (пункт 8.1 tomorrow-plan): pytest-asyncio creates a fresh
+    event loop per test. But several modules cache loop-bound objects
+    (asyncio.Lock, httpx.AsyncClient with its own loop) at module level.
+    When the next test creates a NEW loop, those cached objects belong
+    to the DEAD loop — `lock.acquire()` blocks forever, `client.post()`
+    raises RuntimeError 'attached to a different loop'.
+
+    Concrete leak observed 2026-05-02:
+    `tests/unit/test_telegram_long_poll.py` exercises
+    `handle_telegram_update` which populates
+    `services.telegram_inbound._TENANT_LOCKS["tenant_1"]` with an
+    asyncio.Lock bound to that test's loop. Subsequent
+    `tests/unit/test_telegram_webhook.py` runs handle_telegram_update
+    again for the same tenant — picks up the stale Lock — its
+    `_process_approved_turn` background task blocks on `async with
+    tenant_lock` forever — `_wait_for` test helper times out at 5s.
+
+    Fix: clear both module dicts after each test. Loop-bound objects
+    become unreachable, GC reclaims them, next test creates fresh ones.
+    `httpx.AsyncClient` instances in `_CLIENT_POOL` should ideally be
+    `await client.aclose()`'d, but that requires a running loop here
+    and the warning at GC time ("Unclosed client session") is benign in
+    tests — accepted noise vs the alternative of test deadlocks.
+    """
+    yield
+    # Imports are local — each module costs ~10-50ms first time, and
+    # we only pay it for tests that actually touched these modules.
+    try:
+        from sreda.services.telegram_inbound import _TENANT_LOCKS
+        _TENANT_LOCKS.clear()
+    except ImportError:
+        pass
+    try:
+        from sreda.integrations.telegram.client import _CLIENT_POOL
+        _CLIENT_POOL.clear()
+    except ImportError:
+        pass
