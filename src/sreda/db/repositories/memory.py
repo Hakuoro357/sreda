@@ -47,6 +47,34 @@ class MemoryRecallHit:
     score: float
 
 
+@dataclass(frozen=True, slots=True)
+class RecallStats:
+    """Diagnostic stats for one recall() invocation.
+
+    Used by ``node_load_memories`` (Stage 2 observability of the
+    memory retrieval staged plan, see ``docs/tomorrow-plan.md`` пункт
+    11). Lets us answer questions like:
+
+    * how many memories does this user actually have on disk?
+    * how many had embeddings (vs. needing re-embed)?
+    * how many were dropped by ``min_score``?
+    * what does the score distribution look like?
+
+    All numeric. Logged structured so we can grep/awk later.
+    """
+
+    candidates_total: int       # all memories for (tenant, user, tier)
+    with_embedding: int         # subset that has a stored embedding_json
+    scored_total: int           # subset that produced a valid score
+    filtered_below_min: int     # scored but dropped by min_score
+    seeded_count: int           # final returned (after top_k cut)
+    min_score: float            # threshold used
+    top_k: int                  # cap used
+    scores_min: float | None    # min over passing scores (None if none passed)
+    scores_max: float | None    # max over passing scores
+    scores_p50: float | None    # median over passing scores
+
+
 class MemoryRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -126,8 +154,43 @@ class MemoryRepository:
         Rows without a stored embedding are skipped (they'll need an
         out-of-band re-embed migration when embeddings get turned on).
         ``min_score`` filters out near-zero matches so the LLM context
-        isn't polluted with irrelevant rows."""
+        isn't polluted with irrelevant rows.
+
+        Backward-compatible thin wrapper over ``recall_with_stats``;
+        callers that don't need observability stats get the bare hit
+        list as before. Use ``recall_with_stats`` when logging the
+        retrieval-distribution diagnostics (e.g. ``node_load_memories``
+        Stage 2).
+        """
+        hits, _stats = self.recall_with_stats(
+            tenant_id, user_id, query_embedding,
+            tier=tier, top_k=top_k, min_score=min_score,
+        )
+        return hits
+
+    def recall_with_stats(
+        self,
+        tenant_id: str,
+        user_id: str,
+        query_embedding: list[float],
+        *,
+        tier: str | None = None,
+        top_k: int = 5,
+        min_score: float = 0.0,
+    ) -> tuple[list[MemoryRecallHit], RecallStats]:
+        """Same as ``recall`` but also returns ``RecallStats``.
+
+        Stats are computed over the *full* candidate pool — useful for
+        observability (Stage 2 of memory-retrieval roadmap). Score
+        percentiles are over the rows that passed ``min_score`` (i.e.
+        what the LLM might actually see), not the raw cosine
+        distribution, because pre-filter scores include noise.
+        """
         candidates = self.list_by_user(tenant_id, user_id, tier=tier)
+        candidates_total = len(candidates)
+        with_embedding = 0
+        passing_scores: list[float] = []
+        filtered_below_min = 0
         hits: list[MemoryRecallHit] = []
         for row in candidates:
             if not row.embedding_json:
@@ -136,12 +199,35 @@ class MemoryRepository:
                 vec = json.loads(row.embedding_json)
             except json.JSONDecodeError:
                 continue
+            with_embedding += 1
             score = cosine_similarity(query_embedding, vec)
             if score < min_score:
+                filtered_below_min += 1
                 continue
+            passing_scores.append(score)
             hits.append(MemoryRecallHit(memory=row, score=score))
         hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[:top_k]
+        seeded = hits[:top_k]
+        scores_min = min(passing_scores) if passing_scores else None
+        scores_max = max(passing_scores) if passing_scores else None
+        scores_p50 = (
+            sorted(passing_scores)[len(passing_scores) // 2]
+            if passing_scores
+            else None
+        )
+        stats = RecallStats(
+            candidates_total=candidates_total,
+            with_embedding=with_embedding,
+            scored_total=len(passing_scores) + filtered_below_min,
+            filtered_below_min=filtered_below_min,
+            seeded_count=len(seeded),
+            min_score=min_score,
+            top_k=top_k,
+            scores_min=scores_min,
+            scores_max=scores_max,
+            scores_p50=scores_p50,
+        )
+        return seeded, stats
 
     # ----------------------------------------------------------------- update
 

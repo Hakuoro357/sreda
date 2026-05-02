@@ -309,6 +309,37 @@ max_connections=4) ловят >95% случаев — отложено до сл
 - 0 регрессий — webhook/inbound/billing/encryption suite остаются
   100% зелёными
 
+### 8.1. Test isolation: long_poll корруптит state webhook'а (P1)
+
+**Симптом.** Если запустить
+`pytest tests/unit/test_telegram_long_poll.py tests/unit/test_telegram_webhook.py`
+вместе, **5/11 webhook-тестов падают** на «timed out after 5.0s waiting
+for background task». Solo каждый suite зелёный (13/13 + 11/11).
+
+**Что точно:**
+- Не моё Stage 2 (commit `<TBD>` 2026-05-02) — поломка существует на
+  чистом main, проверено через `git stash`
+- Pre-existing: появилась когда добавил `test_telegram_long_poll.py`
+  в long-poll session 2026-04-30/05-01
+
+**Причина (гипотеза):**
+- `_FetchScript`/lock fixtures в test_telegram_long_poll создают
+  module-level state или не убирают `monkeypatch.setenv` cleanly
+- Альтернатива: `get_session_factory` lru_cache подхватывает state
+  от long_poll fixture'а
+
+**Что проверить в первую очередь:**
+1. autouse fixtures в `tests/unit/test_telegram_long_poll.py` —
+   корректный teardown
+2. `get_session_factory.cache_clear()` после каждого long_poll теста
+3. Module-level `_FetchScript` instances vs class-level state
+
+**Объём:** 1-2 часа дебага. Pre-existing, не блокер для прода (юнит
+тесты solo зелёные, deploy идёт). Но в CI suite это вызовет fail.
+
+**Когда:** до первого CI runner с полным `pytest tests/unit/` прогоном
+ИЛИ когда сильно начнёт мешать локально.
+
 ### 9. Outbound delivery: ack приходит ПОСЛЕ реплая
 
 **Контекст (2026-04-30 PM).** После cutover'а на long-poll inbound стабилен,
@@ -498,31 +529,29 @@ prompt/tool contract:
 - `docs/qa/recall_memory_smoke.md` — 5-сценарный manual checklist
   для прогона на dev-боте после deploy'а.
 
-**Stage 2 — required follow-up (1-2 суток наблюдения)**:
+**Stage 2 — ✅ DONE 2026-05-02** (commit `<TBD>`)
 
-Перед любыми изменениями `top_k` / `min_score` нужно понять, как
-retrieval работает СЕЙЧАС. Иначе понизим порог → накачаем `[ПАМЯТЬ]`
-шумом → ответы могут стать хуже, не лучше.
+Реализован структурированный лог в `node_load_memories`:
 
-Что добавить — структурированный лог в `node_load_memories`:
-
-```python
-logger.info(
-    "node_load_memories tenant=%s seeded=%d "
-    "scores_min=%.3f scores_max=%.3f scores_p50=%.3f "
-    "filtered_below_min=%d total_in_db=%d",
-    ...
-)
+```
+INFO sreda.runtime.graph node_load_memories tenant=<id> user=<id>
+  candidates_total=N with_embedding=N
+  filtered_below_min=N seeded=N
+  min_score=X.XXX top_k=N
+  scores_min=X.XXX scores_max=X.XXX scores_p50=X.XXX
 ```
 
-Прогон 1-2 суток на проде. Анализ:
-- Сколько в среднем seeded в `[ПАМЯТЬ]`? (целевое — близко к top_k=10)
+`MemoryRepository.recall` обёрнут в backward-compatible thin wrapper над
+новым `recall_with_stats(...) -> (hits, RecallStats)`. Старые caller'ы
+не затронуты.
+
+Прогон **1-2 суток на проде**. Анализ через awk/grep по trace.log:
+- Сколько в среднем `seeded` в `[ПАМЯТЬ]`? (целевое — близко к top_k=10)
 - Сколько отфильтровалось `min_score`'ом?
-- Какая медиана score'ов?
+- Какая медиана `scores_p50`?
 
-**Risks Stage 2:** нулевые. Только observability, не меняет behaviour.
-
-**Когда:** сразу после Stage 1, до закрытия пунктов 9 / 10.
+После анализа решаем — нужен ли Stage 3 (retrieval params tuning) и
+с какими параметрами.
 
 **Stage 3+ — conditional design notes** (не обязательный путь, активировать
 только если evidence из Stage 2 + smoke checklist'а покажут что Stage 1

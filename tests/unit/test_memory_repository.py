@@ -234,6 +234,160 @@ def test_recall_min_score_filters_noise(session, embeddings):
 
 
 # ---------------------------------------------------------------------------
+# recall_with_stats — Stage 2 observability of memory retrieval
+# (см. tomorrow-plan пункт 11). Tests on the diagnostic stats accumulator,
+# not on hit ordering (recall() tests above already cover ordering).
+# ---------------------------------------------------------------------------
+
+
+def test_recall_with_stats_returns_hits_and_full_distribution(session, embeddings):
+    """Happy path — three memories, no min_score filter (we use -1.0
+    because fake hash-embeddings can give negative cosines for unrelated
+    pairs and we don't want to test cosine semantics here, only the
+    stats accumulator). All three should be seeded; distribution is
+    populated."""
+    repo = MemoryRepository(session)
+    for i in range(3):
+        repo.save(
+            "t1", "u1",
+            tier="core",
+            content=f"fact {i}",
+            embedding=embeddings.embed_document(f"fact {i}"),
+        )
+    session.commit()
+
+    hits, stats = repo.recall_with_stats(
+        "t1", "u1",
+        embeddings.embed_query("fact 1"),
+        top_k=10,
+        min_score=-1.0,  # accept any cosine, including negatives
+    )
+    assert len(hits) == 3
+    assert stats.candidates_total == 3
+    assert stats.with_embedding == 3
+    assert stats.filtered_below_min == 0
+    assert stats.seeded_count == 3
+    assert stats.top_k == 10
+    assert stats.min_score == -1.0
+    assert stats.scores_min is not None and stats.scores_max is not None
+    assert stats.scores_min <= stats.scores_max
+    assert stats.scores_p50 is not None
+
+
+def test_recall_with_stats_counts_filtered_below_min(session, embeddings):
+    """When min_score drops everything, stats should show
+    filtered_below_min=N and seeded_count=0; scores_min/max/p50 must be
+    None (no scores survived to compute percentiles over)."""
+    repo = MemoryRepository(session)
+    for i in range(5):
+        repo.save(
+            "t1", "u1",
+            tier="core",
+            content=f"a{i}",
+            embedding=embeddings.embed_document(f"a{i}"),
+        )
+    session.commit()
+
+    hits, stats = repo.recall_with_stats(
+        "t1", "u1",
+        embeddings.embed_query("totally unrelated zzz"),
+        top_k=10,
+        min_score=0.99,  # nothing survives
+    )
+    assert hits == []
+    assert stats.candidates_total == 5
+    assert stats.with_embedding == 5
+    assert stats.filtered_below_min == 5
+    assert stats.seeded_count == 0
+    assert stats.scores_min is None
+    assert stats.scores_max is None
+    assert stats.scores_p50 is None
+
+
+def test_recall_with_stats_counts_missing_embeddings(session, embeddings):
+    """Memories saved without an embedding must NOT count as
+    with_embedding; they're invisible to the cosine pipeline. Useful
+    signal for when we need a re-embed migration."""
+    repo = MemoryRepository(session)
+    repo.save(
+        "t1", "u1",
+        tier="core",
+        content="has embedding",
+        embedding=embeddings.embed_document("has embedding"),
+    )
+    repo.save(
+        "t1", "u1",
+        tier="core",
+        content="no embedding",
+        embedding=None,
+    )
+    session.commit()
+
+    hits, stats = repo.recall_with_stats(
+        "t1", "u1",
+        embeddings.embed_query("has embedding"),
+        top_k=10,
+        min_score=0.0,
+    )
+    assert stats.candidates_total == 2
+    assert stats.with_embedding == 1   # only one had a vector
+    assert stats.seeded_count == 1
+
+
+def test_recall_with_stats_top_k_caps_seeded_but_distribution_is_full(session, embeddings):
+    """Score distribution (min/max/p50) is computed across ALL passing
+    scores, not just the top_k slice — otherwise we lose the long-tail
+    visibility we want for tuning."""
+    repo = MemoryRepository(session)
+    for i in range(20):
+        repo.save(
+            "t1", "u1",
+            tier="core",
+            content=f"item {i}",
+            embedding=embeddings.embed_document(f"item {i}"),
+        )
+    session.commit()
+
+    hits, stats = repo.recall_with_stats(
+        "t1", "u1",
+        embeddings.embed_query("item 5"),
+        top_k=5,
+        min_score=-1.0,  # accept any cosine — see note above
+    )
+    assert len(hits) == 5
+    assert stats.seeded_count == 5
+    assert stats.candidates_total == 20
+    # All 20 had embeddings and passed min_score=-1
+    assert stats.with_embedding == 20
+    assert stats.filtered_below_min == 0
+    # Distribution is over all 20 passers (not just the 5 seeded)
+    assert stats.scores_min is not None and stats.scores_max is not None
+
+
+def test_recall_returns_same_hits_as_recall_with_stats(session, embeddings):
+    """recall() is now a thin wrapper over recall_with_stats(). Make
+    sure both paths produce identical hit lists for the same args, so
+    no caller is silently affected by the refactor."""
+    repo = MemoryRepository(session)
+    for i in range(7):
+        repo.save(
+            "t1", "u1",
+            tier="core",
+            content=f"row {i}",
+            embedding=embeddings.embed_document(f"row {i}"),
+        )
+    session.commit()
+
+    query = embeddings.embed_query("row 3")
+    hits_legacy = repo.recall("t1", "u1", query, top_k=4, min_score=0.0)
+    hits_new, _ = repo.recall_with_stats(
+        "t1", "u1", query, top_k=4, min_score=0.0,
+    )
+    assert [h.memory.id for h in hits_legacy] == [h.memory.id for h in hits_new]
+    assert [h.score for h in hits_legacy] == [h.score for h in hits_new]
+
+
+# ---------------------------------------------------------------------------
 # touch_accessed / delete
 # ---------------------------------------------------------------------------
 

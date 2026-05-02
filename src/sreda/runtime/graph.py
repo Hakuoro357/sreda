@@ -29,10 +29,13 @@ change in ``_make_checkpointer``.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
@@ -212,9 +215,29 @@ def node_load_memories(state: AssistantGraphState, config: RunnableConfig) -> di
         return {"memories": []}
 
     repo = MemoryRepository(session)
-    hits = repo.recall(
+    hits, stats = repo.recall_with_stats(
         action.tenant_id, action.user_id, query_vec, top_k=10, min_score=0.1
     )
+
+    # Stage 2 observability (см. tomorrow-plan пункт 11). Логируем
+    # распределение retrieval'а по каждому conversation.chat — это
+    # данные для понимания, надо ли в Stage 3 трогать top_k/min_score.
+    # Структурный формат ради простого awk/grep-парсинга.
+    logger.info(
+        "node_load_memories tenant=%s user=%s "
+        "candidates_total=%d with_embedding=%d "
+        "filtered_below_min=%d seeded=%d "
+        "min_score=%.3f top_k=%d "
+        "scores_min=%s scores_max=%s scores_p50=%s",
+        action.tenant_id, action.user_id,
+        stats.candidates_total, stats.with_embedding,
+        stats.filtered_below_min, stats.seeded_count,
+        stats.min_score, stats.top_k,
+        f"{stats.scores_min:.3f}" if stats.scores_min is not None else "NA",
+        f"{stats.scores_max:.3f}" if stats.scores_max is not None else "NA",
+        f"{stats.scores_p50:.3f}" if stats.scores_p50 is not None else "NA",
+    )
+
     # Touch access counts for returned memories — useful signal for
     # future recency boosts and eviction policies.
     for hit in hits:
