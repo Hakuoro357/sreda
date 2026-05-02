@@ -512,14 +512,28 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
         error_code=error_code,
     )
 
+    err_tg_message_id: int | None = None
+    err_tg_date: int | None = None
     if telegram is not None:
         try:
-            await telegram.send_message(
+            err_response = await telegram.send_message(
                 chat_id=action.external_chat_id,
                 text=sanitized_message,
                 reply_markup=reply_markup,
             )
             outbox.status = "sent"
+            # Stage 9.1: capture TG-side ids for symmetry with the
+            # success-path. Diagnostic «когда ack приходит после реплая»
+            # должна работать и для error-replies (они редкие, но именно
+            # при инцидентах нужна максимальная видимость).
+            err_result = err_response.get("result") if isinstance(err_response, dict) else None
+            if isinstance(err_result, dict):
+                mid = err_result.get("message_id")
+                date_v = err_result.get("date")
+                if isinstance(mid, int):
+                    err_tg_message_id = mid
+                if isinstance(date_v, int):
+                    err_tg_date = date_v
         except TelegramDeliveryError:
             outbox.status = "pending"
     outbox_ids.append(outbox.id)
@@ -528,15 +542,20 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
     # If delivered inline, emit the trace here (worker won't reprocess
     # a 'sent' row). If still 'pending' — worker will emit on retry.
     if _trace_ctx is not None and outbox.status == "sent":
+        err_meta: dict = {
+            "chat": action.external_chat_id,
+            "status": "error",
+            "error_code": error_code,
+            "path": "inline",
+        }
+        if err_tg_message_id is not None:
+            err_meta["tg_message_id"] = err_tg_message_id
+        if err_tg_date is not None:
+            err_meta["tg_date"] = err_tg_date
         trace.emit_block(
             _trace_ctx,
             final_event_name="outbox.delivered",
-            final_meta={
-                "chat": action.external_chat_id,
-                "status": "error",
-                "error_code": error_code,
-                "path": "inline",
-            },
+            final_meta=err_meta,
         )
 
     now = _utcnow()

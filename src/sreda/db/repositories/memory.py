@@ -64,8 +64,10 @@ class RecallStats:
     """
 
     candidates_total: int       # all memories for (tenant, user, tier)
-    with_embedding: int         # subset that has a stored embedding_json
-    scored_total: int           # subset that produced a valid score
+    with_embedding: int         # subset that produced a valid cosine score
+                                # (= passed the JSON parse + has embedding_json
+                                # gate; equivalent to filtered_below_min +
+                                # len(passing_scores))
     filtered_below_min: int     # scored but dropped by min_score
     seeded_count: int           # final returned (after top_k cut)
     min_score: float            # threshold used
@@ -218,7 +220,6 @@ class MemoryRepository:
         stats = RecallStats(
             candidates_total=candidates_total,
             with_embedding=with_embedding,
-            scored_total=len(passing_scores) + filtered_below_min,
             filtered_below_min=filtered_below_min,
             seeded_count=len(seeded),
             min_score=min_score,
