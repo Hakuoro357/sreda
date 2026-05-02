@@ -53,7 +53,28 @@ logger = logging.getLogger(__name__)
 
 
 DUPLICATE_LOOKBACK_HOURS = 24
-DUPLICATE_COSINE_THRESHOLD = 1.0  # effectively disabled; exact text match is sufficient
+
+# DUPLICATE_COSINE_THRESHOLD = 1.0 — Tier 2 (cosine-similarity) дедупликация
+# намеренно отключена через заведомо нереализуемый порог. Tier 1 (exact text
+# match) выше остаётся работать.
+#
+# Почему 1.0, а не, скажем, 0.85: для русских proactive-сообщений в нашем
+# домене (напоминания, расписания, детские факты) типичный cosine между
+# легитимно разными сообщениями находится в диапазоне 0.7–0.85. При пороге
+# 0.85 мы получили бы false-positive drop'ы вида:
+#   "Не забудь забрать заказ" vs "Не забудь принять лекарство" → ~0.78
+#   "Привет!" vs "Здравствуй!"                                  → ~0.85+
+# Цена ложного отрицательного (юзер не получит важный второй reminder)
+# выше цены ложного положительного (юзер увидит парафраз). Поэтому Tier 2
+# отключён до тех пор, пока не появится evaluation set, на котором можно
+# подобрать threshold без regress'а.
+#
+# Tier 1 (exact-match) catches «handler выстрелил один и тот же шаблон
+# дважды» — типовая регрессия идемпотентности. На проде за 30 дней
+# (215 proactive-сообщений) ни одного drop_reason='duplicate' зафиксировано
+# не было — это OK, означает что текущая бизнес-логика стабильно генерирует
+# уникальные тексты.
+DUPLICATE_COSINE_THRESHOLD = 1.0
 
 
 class ProactiveDecisionKind(str, Enum):

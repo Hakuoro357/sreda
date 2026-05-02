@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 from datetime import datetime, timezone
 
@@ -355,6 +356,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _install_signal_handlers(main_task: asyncio.Task) -> bool:
+    """Wire SIGTERM / SIGINT to cancel the running main task.
+
+    Why: при ``systemctl stop sreda-telegram-poller`` systemd шлёт
+    SIGTERM. Если мы не установим asyncio-aware handler, Python в
+    стандартном поведении НЕ конвертирует SIGTERM в CancelledError
+    (только SIGINT/Ctrl+C). Поллер просто продолжит крутиться, systemd
+    подождёт TimeoutStopSec (по умолчанию 90с) и пошлёт SIGKILL.
+    SIGKILL — жёсткий kill, никакие ``finally`` не срабатывают, в
+    частности `pg_advisory_unlock` не вызывается.
+
+    PostgreSQL **обычно** освобождает advisory lock сразу как connection
+    закрывается (TCP RST после убитого процесса), но при keepalive +
+    server-side idle linger возможно окно секунд-десятки когда lock
+    висит «осиротевший». Следующий старт получит SingletonLockError
+    (exit 2) и из-за ``RestartPreventExitStatus=2 3`` systemd не
+    перезапустит сервис автоматически — нужно ручное reset-failed.
+
+    С installed signal handlers: SIGTERM → main_task.cancel() →
+    CancelledError на ближайшем await → finally блок _amain →
+    poller.shutdown() → явный pg_advisory_unlock → clean exit.
+
+    Returns True если handlers установлены, False если платформа их
+    не поддерживает (Windows, либо запуск из non-main thread).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, main_task.cancel)
+        return True
+    except (NotImplementedError, RuntimeError, AttributeError):
+        # NotImplementedError: Windows
+        # RuntimeError: not main thread
+        # AttributeError: signal module missing some signals
+        return False
+
+
 async def _amain(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     settings = get_settings()
@@ -368,6 +406,16 @@ async def _amain(argv: list[str] | None = None) -> int:
     poller = TelegramLongPoller(
         settings.telegram_bot_token, auto_delete_webhook=auto_delete,
     )
+
+    # Graceful shutdown on SIGTERM / SIGINT — see helper docstring.
+    # Falls back silently on platforms that don't support
+    # loop.add_signal_handler (Windows tests).
+    main_task = asyncio.current_task()
+    if main_task is not None:
+        installed = _install_signal_handlers(main_task)
+        if installed:
+            logger.info("signal handlers installed: SIGTERM/SIGINT → cancel main")
+
     try:
         try:
             await poller.startup()
@@ -385,6 +433,12 @@ async def _amain(argv: list[str] | None = None) -> int:
             await poller.run_forever()
         except TelegramConflictError:
             return 3
+        except asyncio.CancelledError:
+            # Graceful shutdown via SIGTERM/SIGINT — main task was
+            # cancelled by signal handler. Swallow CancelledError so
+            # finally runs cleanly and we exit 0.
+            logger.info("received shutdown signal — exiting cleanly")
+            return 0
         return 0
     finally:
         await poller.shutdown()

@@ -8,6 +8,35 @@ _DEV_HOST_SUFFIXES = (".test", ".local", ".localhost")
 _DEV_HOST_NAMES = {"localhost", "127.0.0.1", "::1"}
 
 
+# Имена полей, значения которых — СЕКРЕТЫ. При repr/str объекта Settings
+# (например `print(settings)`, `f"settings={settings}"`, traceback с
+# locals()) их значения заменяются на ``***``. Это защита от случайной
+# утечки в логи / стек-трейсы / отладочный вывод.
+#
+# Field-тип остаётся ``str | None`` (а не ``SecretStr``) чтобы caller'ы
+# работали как раньше: ``settings.mimo_api_key.strip()``,
+# ``if settings.admin_token: ...`` — без ``.get_secret_value()``.
+# Маскирование — только в repr-слое.
+_SECRET_FIELD_NAMES = frozenset({
+    "telegram_bot_token",
+    "telegram_webhook_secret_token",
+    "openai_api_key",
+    "mimo_api_key",
+    "openrouter_api_key",
+    "embeddings_api_key",
+    "encryption_key",
+    "encryption_key_salt",
+    "encryption_legacy_keys",
+    "tg_account_salt",
+    "admin_token",
+    "yandex_speechkit_api_key",
+    "groq_api_key",
+    "tavily_api_key",
+    # database_url содержит пароль PG в DSN — тоже маскируем
+    "database_url",
+})
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SREDA_", extra="ignore")
 
@@ -336,6 +365,21 @@ class Settings(BaseSettings):
                     if value:
                         return value
         return None
+
+    def __repr_args__(self):
+        """Pydantic v2 BaseModel composes ``__repr__`` from this method.
+        Mask secret-typed fields so accidental ``logger.info(settings)``,
+        traceback locals, or ``print(settings)`` don't leak credentials.
+
+        Non-secret fields are returned as-is. Secret fields show ``***``
+        when value is set, ``None`` when unset (so misconfiguration is
+        still visible without exposing the actual value).
+        """
+        for name, value in super().__repr_args__():
+            if name in _SECRET_FIELD_NAMES and value is not None:
+                yield name, "***"
+            else:
+                yield name, value
 
 
 @lru_cache

@@ -35,6 +35,7 @@ from sreda.workers.telegram_long_poll import (
     TelegramConflictError,
     TelegramLongPoller,
 )
+from tests.unit.conftest import seed_telegram_user
 
 EXISTING_CHAT_ID = "100000003"
 
@@ -422,21 +423,7 @@ async def test_handle_telegram_update_fast_no_blocking_io(fresh_db, monkeypatch)
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        session.add(Tenant(
-            id="tenant_1", name="T1", approved_at=datetime.now(timezone.utc),
-        ))
-        session.add(Workspace(
-            id=f"workspace_tg_{EXISTING_CHAT_ID}", tenant_id="tenant_1", name="W",
-        ))
-        session.add(User(
-            id="user_1", tenant_id="tenant_1",
-            telegram_account_id=EXISTING_CHAT_ID,
-        ))
-        from sreda.db.models.user_profile import TenantUserProfile as _TUP
-        session.add(_TUP(
-            id="tup_1", tenant_id="tenant_1", user_id="user_1",
-            display_name="Test", address_form="ty",
-        ))
+        seed_telegram_user(session, chat_id=EXISTING_CHAT_ID, profile_id="tup_1")
         session.commit()
 
     payload = {
@@ -483,21 +470,7 @@ async def test_handle_telegram_update_idempotent_on_duplicate(fresh_db):
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        session.add(Tenant(
-            id="tenant_1", name="T1", approved_at=datetime.now(timezone.utc),
-        ))
-        session.add(Workspace(
-            id=f"workspace_tg_{EXISTING_CHAT_ID}", tenant_id="tenant_1", name="W",
-        ))
-        session.add(User(
-            id="user_1", tenant_id="tenant_1",
-            telegram_account_id=EXISTING_CHAT_ID,
-        ))
-        from sreda.db.models.user_profile import TenantUserProfile as _TUP
-        session.add(_TUP(
-            id="tup_1", tenant_id="tenant_1", user_id="user_1",
-            display_name="Test", address_form="ty",
-        ))
+        seed_telegram_user(session, chat_id=EXISTING_CHAT_ID, profile_id="tup_1")
         session.commit()
 
     payload = {
@@ -540,3 +513,77 @@ async def test_handle_telegram_update_idempotent_on_duplicate(fresh_db):
         # Still 'processed' (set by first turn) — duplicate did not
         # rewind to 'ingested' / 'processing_started'.
         assert rows[0].processing_status == "processed"
+
+
+# ---- Graceful shutdown signal handler ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_install_signal_handlers_returns_bool_without_crash():
+    """``_install_signal_handlers`` must never crash regardless of
+    platform. On Linux/macOS it returns True; on Windows or under
+    threading constraints it returns False. Both paths are valid."""
+
+    async def _runnable():
+        await asyncio.sleep(60)
+
+    task = asyncio.create_task(_runnable())
+    try:
+        result = tlp._install_signal_handlers(task)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert isinstance(result, bool)
+
+
+@pytest.mark.asyncio
+async def test_amain_returns_0_on_cancellation_during_run_forever(fresh_db):
+    """When main task gets cancelled (simulating SIGTERM behaviour
+    via ``main_task.cancel()``), ``_amain`` must:
+    1. Catch CancelledError gracefully (not propagate)
+    2. Return 0 (clean shutdown)
+    3. Run finally block (poller.shutdown released advisory lock)
+    """
+    fake_engine = MagicMock()
+    fake_conn = MagicMock()
+    fake_conn.execute.return_value.scalar.return_value = True  # lock granted
+    fake_engine.connect.return_value = fake_conn
+
+    # Make _fetch_updates park forever so we can cancel cleanly.
+    parking_event = asyncio.Event()
+
+    async def park_fetch(self):
+        await parking_event.wait()
+        return []
+
+    with patch.object(tlp, "create_engine", return_value=fake_engine):
+        with patch.object(
+            tlp.TelegramLongPoller, "_fetch_updates", park_fetch
+        ):
+            main_task = asyncio.create_task(tlp._amain([]))
+            # Let the task get past startup() and into run_forever().
+            await asyncio.sleep(0.1)
+            # Simulate SIGTERM: cancel the main task externally.
+            main_task.cancel()
+            rc = await main_task
+
+    assert rc == 0
+    # Verify shutdown was called: lock + unlock means execute() was
+    # invoked at least twice on the dedicated lock-conn (once in startup
+    # for pg_try_advisory_lock, once in shutdown for pg_advisory_unlock).
+    # SQLAlchemy ``text(...)`` produces TextClause objects whose repr
+    # doesn't contain the SQL string, so we count calls instead of
+    # pattern-matching call args.
+    assert fake_conn.execute.call_count >= 2, (
+        f"poller.shutdown() must call pg_advisory_unlock after graceful "
+        f"cancellation. Expected at least 2 execute() calls (lock+unlock), "
+        f"got {fake_conn.execute.call_count}."
+    )
+    # Also verify lock conn was closed (shutdown's finally)
+    assert fake_conn.close.called, (
+        "poller.shutdown() must close the lock connection in finally."
+    )
