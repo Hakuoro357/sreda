@@ -654,6 +654,141 @@ INFO sreda.runtime.graph node_load_memories tenant=<id> user=<id>
 4. Stage 4 rerank choice: cross-encoder (CPU latency?) vs simple
    score formula vs LLM-rerank (latency?). Нужен бенчмарк.
 
+### 12. Findings из conversation review 2026-05-03 (5 дней соака)
+
+**Контекст.** 2026-05-03 проанализировал 179 turns / 9 active users
+за период 28 апреля — 3 мая. Расшифровал outbox + inbound через prod
+encryption key. Полная сводка в чате 2026-05-03.
+
+**Здоровье системы:** 0 stuck, 0 ignored, 0 outbox drops. Все 9 юзеров
+получили ответы. Stage 1 recall_memory hotfix эффективен (5 вызовов
+recall_memory, юзер 755682022 после 1 мая работает чисто).
+
+**Найденные проблемы (4):**
+
+#### 12.1. Capability-confabulation (Boris 1 мая 8:10-8:12) 🔴
+
+**Симптом.** Юзер: «Можешь сделать себе задачу — каждое утро в 8
+присылать погоду?». Бот ответил **«Готово!» дважды** (8:10, 8:11),
+описал что «настроил» — и только на третий turn (8:12) признался:
+«К сожалению, напоминание отправляет только статический текст — я не
+могу автоматически проснуться, посмотреть погоду и прислать актуальный
+прогноз. Это ограничение системы».
+
+То есть бот сначала **соврал что выполнил**, потом исправился. Это
+фактический log_unsupported_request (запись в feature-requests.log
+от 5:12 этого дня), но **с trail of false confirmations**.
+
+**Тип проблемы.** Capability-level confabulation — отличается от
+memory-level (закрытой Stage 1). Stage 1 запрещал выдумывать
+ретроспективу действий. Capability-confabulation — это выдумывание
+будущей способности.
+
+**Fix (Stage 1.1, ~30 мин кода + тесты):**
+
+a) Расширить system prompt в `_CORE_SYSTEM_PROMPT`:
+
+```
+- НЕ говори "Готово" / "Сделала" / "Настроила" пока в этом ЖЕ turn'е
+  не было реального tool-call'а который это выполнил. Если решил
+  что-то сделать — сначала вызов tool'а, ПОТОМ рапорт.
+- Если запрос требует CAPABILITY которой у тебя нет (например,
+  "автоматически каждое утро рассчитывать данные и присылать") — НЕ
+  обещай что сделаешь. Сразу вызови `log_unsupported_request` и
+  честно объясни ограничение.
+```
+
+b) Уже есть похожее правило в _HOUSEWIFE_FOOD_PROMPT (line 990):
+   «Не отчитывайся о несделанном». Но оно про housewife scope —
+   eds_monitor / generic chat не покрыт. Расширить на core-level.
+
+c) Regression-тесты в `test_recall_memory_prompt.py`:
+   - `test_anti_capability_confabulation_in_system_prompt` —
+     инструкция против "Готово без tool-call" присутствует в
+     compiled prompt
+   - `test_log_unsupported_request_called_on_capability_gap` — на
+     запрос вида «делай X каждое утро автоматически» (где X требует
+     dynamic compute) bot вызывает log_unsupported_request, не «Готово».
+
+**Когда делать:** P1, ~30 мин. Рядом с Stage 1 hotfix'ом по логике.
+
+#### 12.2. Динамические напоминания (real product gap) 🟡
+
+**Симптом.** Юзер запросил то, что bot не умеет: cron + fetch_data +
+LLM-format + send. Текущая `schedule_reminder` шлёт статический
+заранее заданный текст.
+
+**Архитектурное решение:**
+- Добавить тип reminder'а `dynamic` (схема: рекуррент + LLM-prompt
+  template который при срабатывании генерирует свежий контент)
+- При срабатывании worker вызывает LLM с template + tools (включая
+  `get_weather`, `web_search`) → LLM формирует свежий ответ → outbox
+- Dedup по `dynamic_key` чтобы при перезапусках worker'а не дублить
+
+**Effort:** 2-3 дня. Требует:
+- schema migration (`reminder_type`, `dynamic_template`, `dynamic_key`)
+- доработка `proactive_events` worker'а
+- LLM-prompt для генерации контента из template
+- ~10 unit-тестов
+
+**Когда делать:** P2. Не блокер, но фича востребованная (Boris лично
+её попросил).
+
+#### 12.3. update_reminder tool отсутствует — UX trash 🟡
+
+**Симптом.** Юзер «Дорогая Юлечка» (893811320) 1 мая 11:26-11:30:
+- 11:26 «Не приходят напоминания» → bot пересоздал
+- 11:27 «Должно быть сегодня каждый час до 20 ч» → bot пересоздал
+- 11:27 «Учти, у меня +1 час к московскому» → bot пересоздал ещё раз
+- 11:28 bot выдал 2 разных ответа подряд про разные timezone
+- 11:29 «Начни оповещать сегодня» → bot пересоздал в 4-й раз
+
+Каждое уточнение от юзера → delete+create нового reminder'а. Это
+плохой UX: state дёргается, юзер не понимает что **актуально**, и
+если тот период был glitch — не уверен что reminders пойдут.
+
+**Fix:** добавить tool `update_reminder(id, **fields)`. LLM при
+получении уточнения должен вызывать `update_reminder` с известным
+`reminder_id` (видимым через `list_reminders`), а не `cancel + create`.
+
+**Effort:** ~3-4 часа. Доработка housewife_chat_tools + обучение
+LLM-у через docstring + 3-4 теста.
+
+**Когда делать:** P2. Хорошее улучшение UX для всех reminder-flow.
+
+#### 12.4. Onboarding /start spam (1089832184, 4 раза подряд) 🟡
+
+**Симптом.** Юзер 28 апреля 22:28-23:00 написал:
+```
+22:28 USER: Расписание
+22:49 USER: /start
+22:49 USER: /start
+23:00 USER: /start
+04-29 10:43 USER: /start
+```
+
+В этом dump НЕ ВИДЕЛ ответов от бота на эти `/start`. Возможные
+объяснения:
+- Юзер был в pending-approval статусе → silent-drop через
+  `pending_bot.match()` flow
+- Pending-bot отвечал, но в outbox`status='sent'` query это не
+  попало (есть фильтр `is_interactive=True` который мог отрезать?)
+
+**Investigation (~1 час):**
+- Посмотреть actual outbox-row'ы для этого тенанта 28-29 апреля
+- Проверить `pending_bot.match()` flow на конкретном /start
+- Если pending-bot молчит на `/start` — это баг (он должен слать
+  «Заявка принята, ждите модератора»)
+
+**Fix:** TBD после investigation. Возможно нужно:
+- pending_bot отвечать на ВСЕ /start даже если уже отвечал ранее
+  (idempotent welcome)
+- ИЛИ показать loading-индикатор / typing статус юзеру чтобы понимал
+  что бот видит сообщение
+
+**Когда делать:** P3. Onboarding rough edge, но в текущем размере
+(1 юзер за 5 дней) не критично.
+
 ---
 
 **Открытые блокеры.**
