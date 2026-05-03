@@ -27,3 +27,6 @@ build/
 graphify-out/
 .tmp_*
 *.tmp
+
+# Per-developer plan-review-loop artifacts (qwen/codex review cycles)
+plans/
