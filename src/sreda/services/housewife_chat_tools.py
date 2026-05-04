@@ -2166,6 +2166,7 @@ def build_housewife_tools(
 
     return [
         schedule_reminder,
+        update_reminder,
         list_reminders,
         cancel_reminder,
         onboarding_answered,
