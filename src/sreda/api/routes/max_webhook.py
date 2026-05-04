@@ -20,7 +20,7 @@ from __future__ import annotations
 import hmac
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from sreda.config.settings import get_settings
 from sreda.services.max_inbound import handle_max_update
@@ -30,18 +30,28 @@ router = APIRouter(prefix="/api/max", tags=["max"])
 logger = logging.getLogger(__name__)
 
 
-def _verify_max_secret_token(
-    secret_header: str | None = Header(
-        default=None,
-        alias="X-Sreda-MAX-Webhook-Secret",
-    ),
-) -> None:
+# Phase 11 live-debug (2026-05-04): MAX в первом prod-сообщении шлёт webhook,
+# но мы не знаем точный header в котором приходит secret_token. Логируем все
+# request headers на каждом запросе ПОКА не закрепим контракт; потом этот
+# блок убираем.
+# Candidate header names per docs/probe — разные мессенджеры используют
+# разные конвенции. MAX docs не специфицируют, поэтому пробуем все три
+# наиболее вероятные.
+_CANDIDATE_SECRET_HEADERS = (
+    "x-sreda-max-webhook-secret",   # как мы изначально предположили
+    "x-bot-api-secret-token",       # TG-style
+    "x-max-bot-api-secret-token",   # MAX-namespaced TG-style
+    "secret-token",                  # bare
+    "x-secret-token",                # bare с x-prefix
+)
+
+
+def _verify_max_secret_token(request: Request) -> None:
     """Verify secret token header.
 
-    При первом deploy лучше использовать настоящий secret в env
-    (``SREDA_MAX_WEBHOOK_SECRET_TOKEN``). Без secret в env — request
-    accepted (dev fallback) с warning log; в prod admin-alert через
-    health-check Phase 9.
+    Tries multiple candidate header names (см. _CANDIDATE_SECRET_HEADERS)
+    т.к. точный header который MAX использует не задокументирован.
+    Если ни один не совпал — 401 + лог всех headers для диагностики.
     """
     expected = get_settings().max_webhook_secret_token
     if not expected:
@@ -51,21 +61,32 @@ def _verify_max_secret_token(
             "это OK для dev, в prod ставит admin alert."
         )
         return
-    if secret_header is None or not hmac.compare_digest(
-        secret_header, expected
-    ):
-        logger.warning("max webhook rejected: secret token mismatch")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    headers_lower = {k.lower(): v for k, v in request.headers.items()}
+    for name in _CANDIDATE_SECRET_HEADERS:
+        candidate = headers_lower.get(name)
+        if candidate and hmac.compare_digest(candidate, expected):
+            return  # match → accept
+
+    # No candidate matched — log full headers (без значений для приватности
+    # values, чтобы не утекли потенциальные tokens в логи) для диагностики.
+    header_keys = sorted(headers_lower.keys())
+    logger.warning(
+        "max webhook rejected: secret token mismatch. "
+        "incoming header keys=%s",
+        header_keys,
+    )
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
 
 @router.post(
     "/webhook",
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(_verify_max_secret_token)],
 )
 async def max_webhook(
     payload: dict,
     background_tasks: BackgroundTasks,
+    request: Request,
 ) -> dict:
     """Thin wrapper над ``handle_max_update`` (mirror TG webhook шаблон).
 
@@ -75,6 +96,7 @@ async def max_webhook(
     Возвращаем ``{"ok": True, "request_id": <inbound_message_id>}``.
     202 ACCEPTED — durable ingest committed, heavy work detached.
     """
+    _verify_max_secret_token(request)
     inbound_message_id = await handle_max_update(
         payload, bot_key="sreda_max", background_tasks=background_tasks,
     )
