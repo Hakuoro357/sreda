@@ -226,16 +226,22 @@ class MaxClient:
     ) -> dict:
         """POST /subscriptions — register webhook URL.
 
-        ``secret_token`` поддержка — TBD probe. Если MAX принимает
-        — будет передаваться в payload и валидироваться нашим webhook
-        handler через равенство header value. Если не принимает —
-        используем HMAC fallback (см. plan Phase 0/5 lock-in).
+        Payload field per MAX docs (2026-05-04 confirmed):
+        - ``url`` — webhook endpoint
+        - ``update_types`` — optional list filter
+        - ``secret`` — optional shared secret. MAX будет echo'ить его в
+          ``X-Max-Bot-Api-Secret`` header каждого webhook POST'а.
+          Recommended (non-empty → header-based verification возможен).
+
+        Note: keyword-arg в Python остаётся ``secret_token`` для совместимости
+        с TG-style nomenclature нашего вызывающего кода; на wire он мапится
+        в MAX-specific ``secret``.
         """
         payload: dict[str, Any] = {"url": url}
         if update_types:
             payload["update_types"] = update_types
         if secret_token:
-            payload["secret_token"] = secret_token
+            payload["secret"] = secret_token
         return await self._request(
             "POST", "/subscriptions", json_payload=payload, timeout=10.0,
         )

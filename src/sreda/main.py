@@ -56,36 +56,23 @@ async def _lifespan(app: FastAPI):
     # health endpoint показывает degraded если регистрация не удалась.
     # Rollback path: убрать SREDA_MAX_BOT_TOKEN из env → этот блок skip.
     app.state.max_webhook_status = "disabled"
-    if (
-        settings.max_bot_token
-        and settings.max_webhook_url
-        and settings.max_webhook_secret_token
-    ):
-        # 2026-05-04 live-fix: MAX не отправляет secret в header — accept'им
-        # secret в path. Final URL = base + "/" + secret. base в env стоит
-        # БЕЗ trailing slash.
-        full_webhook_url = (
-            f"{settings.max_webhook_url.rstrip('/')}"
-            f"/{settings.max_webhook_secret_token}"
-        )
+    if settings.max_bot_token and settings.max_webhook_url:
         try:
             from sreda.integrations.max import MaxClient
             from sreda.services.admin_alerts import alert_admin_async
 
             max_client = MaxClient(token=settings.max_bot_token)
+            # MAX docs (2026-05-04): payload field — `secret` (NOT
+            # `secret_token`). MaxClient.set_webhook мапит наш kwarg
+            # secret_token → wire field "secret". MAX echo'ит значение
+            # в `X-Max-Bot-Api-Secret` header каждого webhook'а.
             await max_client.set_webhook(
-                url=full_webhook_url,
-                # secret_token в payload — best-effort, MAX молча игнорит
-                # сейчас, но если когда-нибудь начнёт echo — будет дополнительный
-                # уровень. Не полагаемся на него для verification.
+                url=settings.max_webhook_url,
                 secret_token=settings.max_webhook_secret_token,
             )
             app.state.max_webhook_status = "ok"
-            # Не логируем full_webhook_url — secret попадёт в logs. Логируем
-            # только base (mask).
             logger.info(
-                "MAX webhook registered: %s/<secret>",
-                settings.max_webhook_url.rstrip("/"),
+                "MAX webhook registered: %s", settings.max_webhook_url,
             )
         except Exception as exc:  # noqa: BLE001
             logger.critical("MAX webhook registration failed: %s", exc)
@@ -93,7 +80,7 @@ async def _lifespan(app: FastAPI):
                 from sreda.services.admin_alerts import alert_admin_async
                 await alert_admin_async(
                     f"🔴 startup: MAX webhook registration failed\n"
-                    f"url: {settings.max_webhook_url}/<secret>\n"
+                    f"url: {settings.max_webhook_url}\n"
                     f"error: {exc}\n"
                     f"Бот глух в МАКС до тех пор пока не починим."
                 )

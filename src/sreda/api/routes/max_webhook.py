@@ -1,21 +1,17 @@
 """MAX (российский мессенджер) webhook route.
 
-Phase 5 + 11 live-fix (2026-05-04) of MAX integration.
+Phase 5 of MAX integration. Mirror шаблон ``api/routes/telegram_webhook.py``.
 
-Auth: **path-based secret** — URL `/api/max/webhook/{secret}`. MAX
-не отправляет secret-token в header (probe Phase 11: incoming headers
-содержат только connection/content-*/host/user-agent/x-forwarded-*/x-real-ip,
-никакого X-*-Secret-* нет, хотя мы передаём `secret_token` в
-`POST /subscriptions`). Стандартный workaround для webhook'ов без
-header-auth — secret в path/query (как Stripe legacy / GitHub).
+Auth (per MAX docs 2026-05-04):
+- При регистрации в payload ``POST /subscriptions`` мы посылаем поле
+  ``secret`` (не ``secret_token`` как в TG — это специфика MAX).
+  ``MaxClient.set_webhook`` мапит наш kwarg ``secret_token`` → ``secret``.
+- MAX echo'ит это значение в каждом webhook POST'е через header
+  ``X-Max-Bot-Api-Secret``. Сравнение constant-time через hmac.compare_digest.
+- Mismatch → 401 (Unauthorized).
 
-URL формируется в lifespan (см. `main.py`):
-``f"{max_webhook_url}/{max_webhook_secret_token}"``. Поэтому каждый
-restart auto-register перезаписывает текущий URL у MAX. Path mismatch
-→ 404 (не 401 — чтобы не палить наличие endpoint'а сканеру).
-
-Inbound payload — single update объект, не array (отличие от MAX
-``GET /updates`` which возвращает list).
+Inbound payload — single update объект (не array — отличие от MAX
+``GET /updates`` которое возвращает list).
 """
 
 from __future__ import annotations
@@ -23,7 +19,7 @@ from __future__ import annotations
 import hmac
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 
 from sreda.config.settings import get_settings
 from sreda.services.max_inbound import handle_max_update
@@ -33,34 +29,42 @@ router = APIRouter(prefix="/api/max", tags=["max"])
 logger = logging.getLogger(__name__)
 
 
-def _verify_path_secret(secret_in_path: str, request: Request) -> None:
-    """Constant-time check path secret matches env."""
+def _verify_max_secret(
+    secret_header: str | None = Header(
+        default=None, alias="X-Max-Bot-Api-Secret",
+    ),
+) -> None:
+    """Verify X-Max-Bot-Api-Secret header (per MAX docs).
+
+    Per MAX docs: «Если secret указан при создании подписки, он
+    передаётся в заголовке X-Max-Bot-Api-Secret каждого Webhook-запроса».
+
+    Если в env нет ``max_webhook_secret_token`` — ничего не проверяем
+    (dev fallback). В prod секрет обязан быть настроен.
+    """
     expected = get_settings().max_webhook_secret_token
     if not expected:
-        # No secret configured — reject everything since path requires one.
         logger.warning(
-            "max webhook hit but max_webhook_secret_token не настроен; "
-            "rejecting all requests"
+            "max webhook accepted без secret check — "
+            "max_webhook_secret_token не настроен; "
+            "это OK для dev, в prod ставит admin alert."
         )
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    if not hmac.compare_digest(secret_in_path, expected):
-        logger.warning(
-            "max webhook rejected: path secret mismatch (client=%s, ua=%s)",
-            request.client.host if request.client else "?",
-            request.headers.get("user-agent", "?"),
-        )
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        return
+    if secret_header is None or not hmac.compare_digest(
+        secret_header, expected
+    ):
+        logger.warning("max webhook rejected: X-Max-Bot-Api-Secret mismatch")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
 
 @router.post(
-    "/webhook/{secret}",
+    "/webhook",
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(_verify_max_secret)],
 )
 async def max_webhook(
-    secret: str,
     payload: dict,
     background_tasks: BackgroundTasks,
-    request: Request,
 ) -> dict:
     """Thin wrapper над ``handle_max_update`` (mirror TG webhook шаблон).
 
@@ -70,7 +74,6 @@ async def max_webhook(
     Возвращаем ``{"ok": True, "request_id": <inbound_message_id>}``.
     202 ACCEPTED — durable ingest committed, heavy work detached.
     """
-    _verify_path_secret(secret, request)
     inbound_message_id = await handle_max_update(
         payload, bot_key="sreda_max", background_tasks=background_tasks,
     )

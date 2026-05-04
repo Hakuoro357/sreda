@@ -55,40 +55,24 @@ async def _verify_max_subscription(settings) -> None:
     from sreda.integrations.max import MaxClient
     from sreda.services.admin_alerts import alert_admin_async
 
-    if not settings.max_webhook_secret_token:
-        logger.warning(
-            "max sub health: secret_token не настроен — skip "
-            "(URL содержит secret в path; без него register бессмысленный)"
-        )
-        return
-
     client = MaxClient(token=settings.max_bot_token)
     response = await client.get_subscriptions()
     subs = response.get("subscriptions", []) if isinstance(response, dict) else []
-    # 2026-05-04 live-fix: secret в path, не в header. Final URL =
-    # base + "/" + secret. Mask secret для логов.
-    base_url = settings.max_webhook_url.rstrip("/")
-    expected = f"{base_url}/{settings.max_webhook_secret_token}"
-    expected_masked = f"{base_url}/<secret>"
+    expected = settings.max_webhook_url
 
     matches = [s for s in subs if isinstance(s, dict) and s.get("url") == expected]
     if matches:
         logger.info(
             "max sub health: OK (url=%s, %d subscriptions)",
-            expected_masked, len(subs),
+            expected, len(subs),
         )
         return
 
-    # Stale / missing — re-register. Маскируем secret в любых URL'ах
-    # которые мы логируем (включая foreign subs если в них вдруг наш token).
-    masked_existing = [
-        _mask_secret(s.get("url", ""), settings.max_webhook_secret_token)
-        for s in subs if isinstance(s, dict)
-    ]
+    # Stale / missing — re-register
     logger.warning(
         "max sub health: subscription stale (expected=%s, found=%s); "
         "re-registering",
-        expected_masked, masked_existing,
+        expected, [s.get("url") for s in subs],
     )
     try:
         await client.set_webhook(
@@ -97,22 +81,15 @@ async def _verify_max_subscription(settings) -> None:
         )
         await alert_admin_async(
             f"🟡 MAX subscription stale, re-registered\n"
-            f"old_subs: {masked_existing}\n"
-            f"new_url: {expected_masked}"
+            f"old_subs: {[s.get('url') for s in subs]}\n"
+            f"new_url: {expected}"
         )
     except Exception as exc:  # noqa: BLE001
         await alert_admin_async(
             f"🔴 MAX subscription stale AND re-register failed\n"
-            f"url: {expected_masked}\n"
+            f"url: {expected}\n"
             f"error: {exc}"
         )
-
-
-def _mask_secret(url: str, secret: str) -> str:
-    """Replace secret token with literal <secret> in URL for safe logging."""
-    if not secret:
-        return url
-    return url.replace(secret, "<secret>")
 
 
 def _cleanup_expired_tokens() -> None:
