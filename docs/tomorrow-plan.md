@@ -537,6 +537,33 @@ backend + outbox routing + subscription health-check.
   - Mini-app frontend UI для linking (source button, target confirm screen)
   - Live test recipient format (`{chat_id: ...}` not yet проверен на real send)
 
+**Live-fix 2026-05-04 EOD** (commits `fcbb223` → `8b6892b` → `86e9481`):
+Webhook auth не работал — MAX отклонял каждый POST. Probe-assumption
+оказался ошибочным:
+- Мы посылали в `POST /subscriptions` поле `secret_token` — MAX
+  молча игнорировал (его поле называется `secret`).
+- Из-за этого MAX вообще не echo'ил secret обратно — ни в каком header'е.
+- Trial 1 (header sweep `x-bot-api-secret-token` etc.) — мимо.
+- Trial 2 (path-secret kludge `/webhook/{secret}`) — заработало, но костыль.
+- Trial 3 (Boris нашёл доку): payload field = `secret`, header echo
+  = `X-Max-Bot-Api-Secret`. Это и закрепили.
+
+End-state на проде:
+- Webhook доходит → 202, header-auth через hmac.compare_digest
+- `inbound_messages` row создаётся, `tenant_max_40921122` создан
+- `processing_status='ignored'` потому что `_process_approved_max_turn`
+  всё ещё placeholder (10.1 follow-up)
+- Старая path-secret subscription на стороне MAX удалена вручную
+  через DELETE `/subscriptions?url=...`
+
+**Lessons** (записаны в `~/.claude/plan-mistakes/general.md`):
+- g-019: probe для webhook-провайдеров должен включать end-to-end
+  verify-step «после set_webhook отправить тестовый POST → убедиться
+  что header реально приходит». Spec-assumption проходит молча.
+- g-020: API провайдеры тихо принимают unknown payload fields
+  (200 OK, без ошибки) — нельзя считать успешный response
+  подтверждением что наше поле понято.
+
 **Original plan (для истории):**
 
 
