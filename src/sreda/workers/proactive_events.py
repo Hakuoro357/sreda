@@ -158,12 +158,12 @@ class ProactiveEventWorker:
             return
 
         # Resolve embedding client once (for duplicate detection across
-        # all replies this turn). Factory-default is the fake client
-        # when no endpoint is configured — duplicate dedup then reduces
-        # to substring equality, which is still better than nothing.
-        embedding_client = self.embedding_client or get_embeddings_client(
-            allow_fake=True
-        )
+        # all replies this turn). 2026-05-04 (Кати-incident lesson):
+        # allow_fake убран. Без настроенных embeddings → DisabledEmbeddingClient
+        # → embed_query raises RuntimeError → существующий decide_proactive
+        # обрабатывает ошибку gracefully. Startup-check шлёт alert если
+        # endpoint не настроен.
+        embedding_client = self.embedding_client or get_embeddings_client()
         now_utc = datetime.now(timezone.utc)
 
         for reply in replies:

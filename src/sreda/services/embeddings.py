@@ -190,6 +190,67 @@ def get_embeddings_client(
     return DisabledEmbeddingClient()
 
 
+async def assert_embeddings_configured_or_alert() -> None:
+    """Startup check: убеждается что embeddings клиент сконфигурирован.
+
+    Прецедент 2026-05-04: ``SREDA_EMBEDDINGS_*`` потерялись в .env
+    при SQLite→PG миграции, fallback на FakeEmbeddingClient тихо
+    деградировал recall_memory для всех юзеров на 3-4 дня. Никто
+    бы не заметил без жалобы юзера. Этот check — последняя линия
+    защиты от такой регрессии.
+
+    Поведение:
+    - Embeddings настроены и работают → log info, return.
+    - Не настроены (Disabled/Fake клиент) → log critical + Telegram
+      alert владельцу инстанса (через ``alert_admin_async``).
+    - Embeddings настроены но endpoint не отвечает → log critical +
+      alert. Не блокируем старт — может быть транзиентная сеть.
+
+    Никогда не raise. Старт сервиса не должен ломаться от того что
+    embedding endpoint глючит — лучше работать без recall чем не
+    работать вообще, alert даст owner'у время разобраться.
+    """
+    from sreda.services.admin_alerts import alert_admin_async
+
+    client = get_embeddings_client()
+    if isinstance(client, (DisabledEmbeddingClient, FakeEmbeddingClient)):
+        msg = (
+            "🔴 startup: embeddings НЕ настроены\n"
+            f"client: {type(client).__name__}\n"
+            "recall_memory будет тихо возвращать [] для всех юзеров.\n"
+            "Проверь SREDA_EMBEDDINGS_BASE_URL + SREDA_EMBEDDINGS_MODEL "
+            "+ SREDA_EMBEDDINGS_API_KEY в /etc/sreda/.env"
+        )
+        logger.critical(msg)
+        await alert_admin_async(msg)
+        return
+
+    # Real client — pingуем тестовым embed_query чтобы убедиться что
+    # endpoint реально отвечает (не просто SDK сконфигурирован).
+    try:
+        vec = client.embed_query("startup health check")
+        if not vec or len(vec) < 64:
+            raise RuntimeError(f"embed_query returned invalid vec (len={len(vec)})")
+    except Exception as exc:  # noqa: BLE001
+        msg = (
+            "🟡 startup: embeddings client сконфигурирован, но endpoint "
+            "не отвечает на ping\n"
+            f"client: {type(client).__name__} model: "
+            f"{getattr(client, 'model', 'unknown')}\n"
+            f"error: {exc}\n"
+            "Сервис стартует, recall может работать после восстановления "
+            "endpoint'а. Проверь сетевой доступ + API key."
+        )
+        logger.critical(msg)
+        await alert_admin_async(msg)
+        return
+
+    logger.info(
+        "startup: embeddings OK (model=%s, dim=%d)",
+        getattr(client, "model", "?"), len(vec),
+    )
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Standard cosine similarity. Returns ``0.0`` if either vector has
     zero magnitude (defensive against pathological embeddings)."""

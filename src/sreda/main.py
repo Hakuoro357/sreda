@@ -42,6 +42,14 @@ async def _lifespan(app: FastAPI):
             name="telegram-keepalive-pinger",
         )
 
+    # Startup check: embeddings (2026-05-04 lesson). Best-effort, не блокирует
+    # старт — шлёт alert в admin chat при проблеме.
+    try:
+        from sreda.services.embeddings import assert_embeddings_configured_or_alert
+        await assert_embeddings_configured_or_alert()
+    except Exception:  # noqa: BLE001
+        logger.warning("embeddings startup-check raised", exc_info=True)
+
     yield
 
     if pinger_task is not None and not pinger_task.done():

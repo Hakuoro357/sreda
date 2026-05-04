@@ -201,12 +201,15 @@ def node_load_memories(state: AssistantGraphState, config: RunnableConfig) -> di
         "embedding_client"
     )
     if embedding_client is None:
-        # Factory fallback — allow_fake=True keeps dev ergonomics when
-        # LM Studio isn't running; prod should always configure a real
-        # embeddings endpoint.
+        # Factory fallback. allow_fake убран 2026-05-04 после Кати-incident:
+        # silent FakeEmbeddingClient тихо ломал recall на 3-4 дня. Теперь
+        # без настроенных embeddings → DisabledEmbeddingClient → embed_query
+        # бросает RuntimeError → нижний try/except возвращает {memories: []}.
+        # Startup-check (services.embeddings.assert_embeddings_configured_or_alert)
+        # шлёт alert в admin chat если конфиг отсутствует.
         from sreda.services.embeddings import get_embeddings_client
 
-        embedding_client = get_embeddings_client(allow_fake=True)
+        embedding_client = get_embeddings_client()
 
     try:
         query_vec = embedding_client.embed_query(query_text)

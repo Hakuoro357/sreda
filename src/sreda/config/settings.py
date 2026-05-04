@@ -135,6 +135,18 @@ class Settings(BaseSettings):
     # with ?token=<value>. When None, admin is disabled (403).
     admin_token: str | None = None
 
+    # Telegram chat_id для критических нотификаций админу (Boris).
+    # Используется когда инстанс должен сообщить о serious issue:
+    # embeddings не настроены, alembic head ≠ DB head, etc. Через этот
+    # канал бот шлёт сообщения вида «🔴 startup: ... недоступен».
+    #
+    # Default = None: альерты только в логи, в Telegram ничего не идёт.
+    # Для prod-инстанса (Boris's чат с ботом) выставить
+    # SREDA_ADMIN_TELEGRAM_CHAT_ID=352612382 в .env. Hardcode'ить здесь
+    # 352612382 нельзя — любой OSS-deploy без явной настройки молча
+    # отправлял бы alert'ы в Boris'овский чат вместо своего.
+    admin_telegram_chat_id: str | None = None
+
     # CSV list of log files surfaced in the /admin/logs view. Each entry
     # may be a plain path (``/tmp/sreda-uvicorn.log``) or ``label=path``
     # (``Uvicorn=/tmp/sreda-uvicorn.log``) for a friendlier nav label.

@@ -1727,9 +1727,11 @@ def execute_conversation_chat(
             )
         ]
 
-    embedding_client = context.get("_embedding_client") or get_embeddings_client(
-        allow_fake=True
-    )
+    # allow_fake убран 2026-05-04 (lesson из Кати-incident — silent
+    # FakeEmbeddingClient тихо ломал recall_memory на 3-4 дня). Теперь
+    # без настроенных embeddings → DisabledEmbeddingClient → tool
+    # вернёт [] honestly. Startup-check шлёт alert в admin chat.
+    embedding_client = context.get("_embedding_client") or get_embeddings_client()
     profile = context.get("_profile") or {}
     memories = context.get("_memories") or []
     settings = get_settings()

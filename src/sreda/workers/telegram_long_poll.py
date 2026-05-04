@@ -399,6 +399,17 @@ async def _amain(argv: list[str] | None = None) -> int:
     if not settings.telegram_bot_token:
         logger.error("SREDA_TELEGRAM_BOT_TOKEN is not set; refusing to start")
         return 1
+
+    # Startup check: embeddings (2026-05-04 lesson). Best-effort, не блокирует
+    # старт — отправит alert в admin chat при проблеме.
+    try:
+        from sreda.services.embeddings import (
+            assert_embeddings_configured_or_alert,
+        )
+        await assert_embeddings_configured_or_alert()
+    except Exception:  # noqa: BLE001
+        logger.warning("embeddings startup-check raised", exc_info=True)
+
     auto_delete = (
         os.environ.get("SREDA_TELEGRAM_POLLER_AUTO_DELETE_WEBHOOK", "")
         .strip().lower() == "true"
