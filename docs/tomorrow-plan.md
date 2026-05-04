@@ -654,7 +654,7 @@ INFO sreda.runtime.graph node_load_memories tenant=<id> user=<id>
 4. Stage 4 rerank choice: cross-encoder (CPU latency?) vs simple
    score formula vs LLM-rerank (latency?). Нужен бенчмарк.
 
-### 11.3. Stage 1.3 — Консолидация overlapping "Готово" rules
+### 11.3. Stage 1.3 — Консолидация overlapping "Готово" rules — ✅ DONE 2026-05-04 (commit `314bb91`)
 
 **Контекст (от Explore-reviewer'а 2026-05-03 при ревью Stage 1.1):**
 
@@ -857,6 +857,99 @@ LLM-у через docstring + 3-4 теста.
   лендинг не запустить (pricing block в hero).
 - LLM-провайдер — текущая MiMo-Pro Singapore работает, но 152-ФЗ
   риск растёт со scale. Миграция на YandexGPT-Lite — отдельный трек.
+
+---
+
+## 13. Закрытое 2026-05-04 (полный день)
+
+### 13.1. Stage 1.3 — Консолидация "Готово" rules — ✅ DONE (commit `314bb91`)
+
+См. секцию 11.3 — три overlapping правила объединены в `_TOOL_DISCIPLINE_ADDENDUM`
+(всегда appendится). Word list = union всех + "Сохранила". 27/27 housewife
+docstring tests + 4/4 anti-confab lock-in зелёные.
+
+### 13.2. Embedding endpoint — ✅ DONE (root cause fix)
+
+**Найдено утром.** `recall_memory` молча возвращал `[]` всем юзерам с момента
+SQLite→PG миграции (~05-01). `/etc/sreda/.env` потерял `SREDA_EMBEDDINGS_*`,
+fallback на `FakeEmbeddingClient(dim=64)` против хранимых 1024-dim → cos=0.0
+→ всё фильтруется ниже min_score → бот честно говорит «нет в памяти».
+
+**Зашли:**
+1. Сначала e5-large через neuraldeep.ru (free tier, 250/h лимит).
+2. Re-embed 6 битых dim=64 записей (Boris адрес, Марина Стамбул, Юлечкин
+   tz×2 + обращение, Катин брат др).
+3. Подтверждено что recall работает: scores 0.71-0.78, `seeded=10`.
+
+**Затем переключились на bge-m3 через cloud.ru** (Foundation Models, pay-as-you-go,
+200 RPS, 0.61 ₽/1M токенов). Вердикт лучше: больше gap relevant/irrelevant
+(0.42-0.48 vs 0.25-0.44 у Qwen3-Embedding-0.6B), нет жёстких rate-limits.
+Re-embed всех 261 записи (50 memories + 66 checklist + 145 reminders) за 1 мин 22 сек.
+
+**Файлы:**
+- `services/embeddings.py` — `EMBEDDING_MODEL_NAME = "bge-m3"`
+- `scripts/reembed_all_with_current_model.py` (новый) — для будущих model swap'ов
+- `scripts/backfill_structured_embeddings.py` — uses cloud.ru bge-m3
+- prod env: `SREDA_EMBEDDINGS_BASE_URL=https://foundation-models.api.cloud.ru/v1`
+
+**Lessons (для plan-mistakes):**
+- Settings без default'а → silent fallback на fake клиент = months-long bug. Добавить
+  startup-time check: «если `embeddings_model is None` — log critical».
+- Fixed-window rate-limits (250/h на neuraldeep): backfill попадает в шум активного
+  траффика. Pay-as-you-go (cloud.ru 200 RPS) предпочтительнее для prod.
+- Embedding model swap = re-embed ВСЕЙ базы (vector spaces несовместимы, cos=0.04
+  на same text между bge-m3 и qwen3-emb). Скрипт должен быть idempotent.
+
+### 13.3. recall-broadcast (Phases 1-5) — ✅ DONE (commit `d4eff87`)
+
+**Корень.** Юзер диктует факт → LLM роутит в `add_checklist_items` /
+`schedule_reminder` → данные **только** в structured store. Юзер ждёт «всё что
+я диктую — Среда помнит», но `recall_memory` ищет только в `assistant_memories`.
+Катя (755682022): «помнишь ширину льна?» — бот честно «нет в памяти», хотя
+факт лежал в чек-листе «Характеристики тканей».
+
+**Дизайн (после qwen-loop R3 NO SIGNIFICANT CONCERNS).** `recall_broadcast`
+fans out на 3 источника (memory + checklist + reminder), pairwise dedup
+cos>0.95, `min_per_source=1` guarantee, error isolation per source.
+
+**Реализация:**
+- Migration 0037 — embedding columns в checklist_items + family_reminders
+- ChecklistService / HousewifeReminderService — embedding на add/schedule
+  с structural prefix (`{title}: {item}` для checklist, `Напоминание: {text}`
+  для reminder)
+- `MemoryRepository.recall_broadcast` (+`BroadcastHit`, `_dedup_pairwise`,
+  3 source helpers)
+- `recall_memory` tool — новая response shape `{content, source, score, metadata}`
+- 10 unit-тестов в `test_recall_broadcast.py`
+
+**Smoke (после deploy):**
+- «лён хлопок пудра» → cos=0.703, source=`checklist:cl_xxx` 🎯 (Катина боль закрыта)
+- «когда у брата др» → cos=0.675, source=`reminder:rem_xxx`
+- «адрес аптеки» → cos=0.682, source=`memory:core`
+
+**Independent reviewer findings (применены):**
+- 1 HIGH (plaintext embeddings of encrypted content) — accepted risk, документировано
+- 2 MEDIUM (Python cosine не масштабируется, status filter) — known limitations
+  с TODO про pgvector
+- 4 LOW — fixed (constant extracted, type annotation, dup assert removed)
+
+### 13.4. cloud.ru переход — ✅ DONE (commits `e22e5d6`, `72bbb5b`)
+
+См. 13.2 выше — отдельным коммитом switch с e5-large на bge-m3.
+
+---
+
+## P3 — что осталось открытым (по приоритету боли)
+
+| # | Задача | Размер | Приоритет |
+|---|---|---|---|
+| 12.4 | /start spam от u_1089832184 (4 раза подряд) | ~30 мин | 🟢 small |
+| 12.3 | `update_reminder` tool (Юлечкин UX) | ~1-2ч | 🟡 medium |
+| 9.2 | Placeholder + editMessageText (ack до реплая) | ~2-3ч | 🟡 medium |
+| 12.2 | Динамические напоминания (cron+fetch+send) | 2-3 дня | 🟠 big |
+| 10 | MAX integration sprint | 2-3 дня | 🟠 big |
+| 24h | bge-m3 soak — verify no regressions, false positives recall | passive | 🟢 |
+| - | Stage 13.2 lessons — startup check на embeddings | ~30 мин | 🟢 |
 
 ---
 
