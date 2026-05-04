@@ -46,7 +46,13 @@ EMBEDDING_DIM_FAKE = 64
 # когда модель меняется, можно найти и перевычислить старые векторы.
 # Source of truth для service-side write hooks (checklists, reminders).
 # В runtime client настраивается через ``settings.embeddings_model``.
-EMBEDDING_MODEL_NAME = "e5-large"
+#
+# 2026-05-04 PM: переключились с e5-large (neuraldeep.ru, free 250/h) на
+# bge-m3 (cloud.ru, pay-as-you-go без rate-limit). bge-m3 даёт лучшую
+# семантическую дискриминацию (gap relevant/irrelevant +0.05-0.17 на
+# RU prose). Все старые e5-large embeddings re-generated через
+# scripts/reembed_all_with_current_model.py.
+EMBEDDING_MODEL_NAME = "bge-m3"
 
 
 class EmbeddingClient(Protocol):
