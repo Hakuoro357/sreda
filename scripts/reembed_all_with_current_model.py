@@ -12,9 +12,9 @@
 Идемпотентно: можно запускать повторно. Каждая итерация overwrites
 embedding_json + embedding_model полем для всех rows (не только NULL).
 
-Throttle: 1 req/2s — sane default. cloud.ru тариф pay-as-you-go,
-жёстких rate-limits нет, но не хочется зашумлять прод параллельно
-с live trafficom.
+Throttle: 0.05s = 20 RPS = 10% от cloud.ru лимита 200 RPS. Достаточно
+консервативно, чтобы не давить параллельный live traffic, но 261 row
+завершается за ~15 сек вместо 9 минут.
 
 Usage on prod:
 
@@ -46,7 +46,7 @@ from sreda.services.embeddings import (
 )
 
 
-THROTTLE_SECONDS = 2.0
+THROTTLE_SECONDS = 0.05  # 20 RPS, 10% of cloud.ru 200 RPS limit
 
 
 def _setup_logging() -> logging.Logger:

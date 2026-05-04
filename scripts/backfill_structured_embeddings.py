@@ -43,7 +43,7 @@ from sreda.services.embeddings import (
 )
 
 
-THROTTLE_SECONDS = 2.0
+THROTTLE_SECONDS = 0.05  # 20 RPS, 10% of cloud.ru 200 RPS limit
 MODEL_NAME = EMBEDDING_MODEL_NAME
 
 
