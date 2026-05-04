@@ -445,26 +445,28 @@ logger.info(
   в TG позже, проблема в нашем коде (порядок `await`'ов?) или в
   транспорте (HOL blocking) → идти в 9.3 (WireGuard) или править код
 
-#### 9.2. Placeholder + editMessageText (2-3 часа)
+#### 9.2. Placeholder + editMessageText — 🗑 REMOVED 2026-05-04
 
-UX-фикс. Вместо «ack отдельным сообщением, потом реплай отдельным»:
-1. Шлём «🌀 Секунду…» через `sendMessage`, запоминаем `message_id`
-2. Когда LLM/voice готовы → `editMessageText(message_id, final_text)`
+Решение Boris: **не делаем.** Аргумент — когда финал приходит вторым
+сообщением, Telegram явно нотифицирует юзера (звук + badge). С
+`editMessageText` юзер не узнает что ответ готов — обновление баббла
+не триггерит уведомление. Двойное сообщение = двойная нотификация =
+юзер видит «бот ответил». Это feature, не bug.
 
-В чате юзера остаётся **одно** сообщение которое сначала «секунду»,
-потом превращается в реплай. Никакого хаоса визуального порядка.
-Bonus: нет дубликата `ack + delete_after_reply`-логики.
-
-Делать **если 9.1 покажет client-side sync**.
+Альтернатива видимого хаоса (ack приходит ПОСЛЕ реплая) — лечим
+через 9.1 (логи) → 9.3 (транспорт RU↔EU), а не через editMessageText.
 
 #### 9.3. Заменить транспорт RU↔EU (один из двух вариантов)
 
 Радикальный архитектурный фикс outbound-транспорта. Сейчас:
 RU VDS → `ssh -D 1080` → EU egress (89.110.77.78) → TG.
 SSH dynamic-forward = TCP-over-TCP, head-of-line blocking возможен:
-один retransmit на одном channel'е тормозит остальные. Делать **если
-9.1 покажет ack физически создан позже final**, или после внедрения
-9.2 захотим убрать SSH-SOCKS как «кривой костыль».
+один retransmit на одном channel'е тормозит остальные.
+
+**Решение делать если 9.1 (логи) покажет ack физически создан позже
+final** — это будет означать что race на стороне транспорта (а не
+client-side ordering как мы изначально подозревали). 9.2 (placeholder)
+снят 2026-05-04 — больше не зависимость для 9.3.
 
 ##### 9.3.A — Маленький Go-прокси на egress (рекомендуемый, ~1 час)
 
@@ -772,7 +774,12 @@ c) Regression-тесты в `test_recall_memory_prompt.py`:
 
 **Когда делать:** P1, ~30 мин. Рядом с Stage 1 hotfix'ом по логике.
 
-#### 12.2. Динамические напоминания (real product gap) 🟡
+#### 12.2. Динамические напоминания (real product gap) — ⏸️ DEFERRED после п.10 (MAX integration), 2026-05-04
+
+Boris: «откладываем после Макса». Логика — MAX-канал это критичная
+infra-задача (long-poll bot for второго мессенджера, sprint 2-3 дня),
+динамические reminder'ы — feature для одного канала. Лучше выкатить
+MAX, а потом расширить reminder'ы.
 
 **Симптом.** Юзер запросил то, что bot не умеет: cron + fetch_data +
 LLM-format + send. Текущая `schedule_reminder` шлёт статический
@@ -945,11 +952,13 @@ cos>0.95, `min_per_source=1` guarantee, error isolation per source.
 |---|---|---|---|
 | 12.4 | /start spam от u_1089832184 (4 раза подряд) | ~30 мин | 🟢 small |
 | 12.3 | `update_reminder` tool (Юлечкин UX) | ~1-2ч | 🟡 medium |
-| 9.2 | Placeholder + editMessageText (ack до реплая) | ~2-3ч | 🟡 medium |
-| 12.2 | Динамические напоминания (cron+fetch+send) | 2-3 дня | 🟠 big |
-| 10 | MAX integration sprint | 2-3 дня | 🟠 big |
-| 24h | bge-m3 soak — verify no regressions, false positives recall | passive | 🟢 |
-| - | Stage 13.2 lessons — startup check на embeddings | ~30 мин | 🟢 |
+| 13.2.lesson | Startup check на `embeddings_model is None` | ~30 мин | 🟢 small |
+| 24h soak | bge-m3 — verify no regressions, false positives recall | passive | 🟢 |
+| 9.1 анализ | Поднять метрики ack-vs-reply ordering, решить про 9.3 | ~30 мин | 🟢 |
+| 9.3 | Транспорт RU↔EU (Go-прокси / WireGuard) — если 9.1 покажет race | ~1ч / день | 🟡 conditional |
+| **10** | **MAX integration sprint — следующий большой блок** | 2-3 дня | 🟠 big |
+| 12.2 | Динамические напоминания — после MAX | 2-3 дня | ⏸ deferred |
+| 9.2 | ~~Placeholder + editMessageText~~ | — | 🗑 removed |
 
 ---
 
