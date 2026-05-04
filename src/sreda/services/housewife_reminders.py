@@ -3,19 +3,29 @@
 Used both by LLM-tool closures (from chat) and by the background worker
 that fires due reminders. Keep this module import-cheap — no LangChain,
 no LLM clients.
+
+Recall-broadcast (Phase 2, 2026-05-04): on schedule, optional embedding
+of ``f"Напоминание: {title}"`` via injected ``embedding_client``.
+Failure non-fatal (warning + NULL embedding; backfill подхватит позже).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from dateutil.rrule import rrulestr
 from sqlalchemy.orm import Session
 
 from sreda.db.models.housewife import FamilyReminder
+from sreda.services.embeddings import EMBEDDING_MODEL_NAME
+
+if TYPE_CHECKING:  # avoid runtime LLM imports here (per module docstring)
+    from sreda.services.embeddings import EmbeddingClient
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +91,37 @@ class HousewifeReminderService:
     risking one bad call rolling back another.
     """
 
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        embedding_client: "EmbeddingClient | None" = None,
+    ) -> None:
         self.session = session
+        # Optional. Когда задан — reminders получают embedding на schedule.
+        # None в legacy callers — backfill подхватит позже.
+        self._embedding_client = embedding_client
+
+    def _embed_title(self, title: str) -> tuple[str | None, str | None]:
+        """Embed reminder title with structural prefix.
+
+        Short reminders («молоко», «брат др») имеют слабый semantic signal.
+        Префикс ``Напоминание: ...`` даёт E5 контекст (R2#2 from qwen review).
+
+        Returns ``(json, model)`` или ``(None, None)`` при ошибке.
+        Failure non-fatal — reminder сохраняется без embedding.
+        """
+        if self._embedding_client is None:
+            return None, None
+        text = f"Напоминание: {title}"
+        try:
+            vec = self._embedding_client.embed_document(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "reminder.embed failed (non-fatal): %s", exc
+            )
+            return None, None
+        return json.dumps(vec), EMBEDDING_MODEL_NAME
 
     # --- user-facing (invoked from chat tools) --------------------------
 
@@ -105,16 +144,21 @@ class HousewifeReminderService:
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(f"invalid recurrence_rule: {exc}") from exc
 
+        clean_title = title.strip()
+        embedding_json, embedding_model = self._embed_title(clean_title)
+
         reminder = FamilyReminder(
             id=f"rem_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
             user_id=user_id,
-            title=title.strip(),
+            title=clean_title,
             trigger_at=trigger_at,
             next_trigger_at=trigger_at,
             recurrence_rule=recurrence_rule,
             status="pending",
             source_memo=source_memo,
+            embedding_json=embedding_json,
+            embedding_model=embedding_model,
         )
         self.session.add(reminder)
         self.session.commit()

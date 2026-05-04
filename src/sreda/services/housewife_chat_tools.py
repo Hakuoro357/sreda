@@ -78,6 +78,7 @@ def build_housewife_tools(
     tenant_id: str,
     user_id: str | None,
     pending_buttons_state: dict | None = None,
+    embedding_client: Any = None,
 ) -> list[Any]:
     """Return LLM tools for the housewife skill, bound to the given
     tenant/user. Called from ``execute_conversation_chat`` when the
@@ -89,9 +90,15 @@ def build_housewife_tools(
     (``execute_conversation_chat``) reads it after the LLM loop ends
     and converts to an inline keyboard. Pass ``None`` (or omit) to
     disable button support for that turn — then the tool is absent
-    from the returned list."""
+    from the returned list.
 
-    service = HousewifeReminderService(session)
+    ``embedding_client``: optional. When provided, ChecklistService
+    embeds new items for recall-broadcast (Phase 2, 2026-05-04).
+    None falls back to legacy behaviour (items без embedding,
+    backfill подхватит позже).
+    """
+
+    service = HousewifeReminderService(session, embedding_client=embedding_client)
 
     @lc_tool
     def schedule_reminder(
@@ -1760,7 +1767,7 @@ def build_housewife_tools(
     # ------------------------------------------------------------------
     # Checklists — именованные списки дел с галочками (план 2026-04-25)
     # ------------------------------------------------------------------
-    checklist_service = ChecklistService(session)
+    checklist_service = ChecklistService(session, embedding_client=embedding_client)
 
     @lc_tool
     def create_checklist(title: str) -> str:

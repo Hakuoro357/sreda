@@ -113,7 +113,9 @@ def build_memory_tools(
 
     @lc_tool
     def recall_memory(query: str, top_k: int = 3) -> str:
-        """Search previously saved user memories by semantic similarity.
+        """Search what the user previously told you — across memory,
+        active checklists, and pending reminders (recall-broadcast,
+        2026-05-04).
 
         ALWAYS call this tool when:
         - the user asks for a list/all/everything about a topic
@@ -125,10 +127,26 @@ def build_memory_tools(
           "я этого не помню" — first call recall_memory with relevant
           query, then decide. Never claim absence without verifying.
 
+        Search covers three stores:
+        - core/episodic memory (``source="memory:core"`` /
+          ``"memory:episodic"``) — long-term curated facts
+        - active checklist items (``source="checklist:<id>"``,
+          ``metadata.list_title``) — items the user dictated into a
+          named list
+        - pending reminders (``source="reminder:<id>"``,
+          ``metadata.due_at``) — scheduled triggers
+
+        At least one hit from each source with matches above min_score
+        is included regardless of global rank (``min_per_source=1``
+        guarantee). When you cite a hit to the user, reference its
+        source naturally ("у тебя в чек-листе «План кроя»: ..." for
+        checklist; "в напоминании на 18 мая: ..." for reminder). NEVER
+        say "это в core памяти" / "запомнила в long-term store" —
+        источник для юзера называть на русском по смыслу, не техжаргоном.
+
         The conversation handler seeds memories into your prompt at the
-        start of each turn, but that seed may be incomplete for
-        list-style queries. Don't assume seeded [ПАМЯТЬ] is the full
-        picture — when the user asks for completeness, verify.
+        start of each turn, but that seed is memory-only and may miss
+        checklist/reminder content; verify via this tool when needed.
 
         Args:
             query: the question or topic to recall. Use either the user's
@@ -139,7 +157,7 @@ def build_memory_tools(
                    single-fact lookups.
 
         Returns:
-            JSON string with list of {content, tier, score}.
+            JSON string: ``[{content, source, score, metadata}, ...]``.
         """
         q = (query or "").strip()
         if not q:
@@ -150,13 +168,17 @@ def build_memory_tools(
         except Exception as exc:  # noqa: BLE001
             logger.warning("recall_memory: embedding failed: %s", exc)
             return json.dumps([])
-        hits = repo.recall(tenant_id, user_id, query_vec, top_k=top_k)
+        hits, _stats = repo.recall_broadcast(
+            tenant_id, user_id, query_vec,
+            top_k=top_k, min_score=0.1,
+        )
         return json.dumps(
             [
                 {
-                    "content": hit.memory.content,
-                    "tier": hit.memory.tier,
+                    "content": hit.content,
+                    "source": hit.source,
                     "score": round(hit.score, 3),
+                    "metadata": hit.metadata,
                 }
                 for hit in hits
             ],

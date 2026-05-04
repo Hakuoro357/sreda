@@ -12,10 +12,16 @@
 В отличие от Task, у пункта нет связанного reminder и нет даты.
 Если юзер хочет напоминание о пункте чек-листа — это отдельный flow:
 ``schedule_reminder`` напрямую (можно потом завести соединение, v1.2).
+
+Recall-broadcast (Phase 2, 2026-05-04): items получают embedding через
+optional ``embedding_client`` в конструкторе. Embed input —
+``f"{checklist.title}: {item.title}"`` (R1#7 — короткий item без
+title даёт плохой semantic signal). Failure tolerated: warning + NULL.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -28,6 +34,7 @@ from sreda.db.models.checklists import (
     Checklist,
     ChecklistItem,
 )
+from sreda.services.embeddings import EMBEDDING_MODEL_NAME, EmbeddingClient
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +61,42 @@ def _normalise_title(text: str) -> str:
 class ChecklistService:
     """CRUD + поиск + статусные переходы для чек-листов и их пунктов."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        embedding_client: EmbeddingClient | None = None,
+    ) -> None:
         self.session = session
+        # Optional. Когда задан — items получают embedding на add/update.
+        # None в legacy-callers (тесты, scripts) — items без embedding,
+        # recall их найдёт только при backfill потом.
+        self._embedding_client = embedding_client
+
+    def _embed_item(
+        self, checklist_title: str, item_title: str
+    ) -> tuple[str | None, str | None]:
+        """Generate embedding for a checklist item.
+
+        Embed input combines list title + item text (R1#7 from qwen review):
+        bare item like «молоко» has poor semantic signal; «Покупки: молоко»
+        gives E5 the context to differentiate.
+
+        Returns ``(embedding_json, model_name)`` or ``(None, None)`` on
+        any failure — failure is non-fatal (item still saved without
+        embedding; backfill or next update can fill it).
+        """
+        if self._embedding_client is None:
+            return None, None
+        text = f"{checklist_title}: {item_title}"
+        try:
+            vec = self._embedding_client.embed_document(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "checklist_item.embed failed (non-fatal): %s", exc
+            )
+            return None, None
+        return json.dumps(vec), EMBEDDING_MODEL_NAME
 
     # ------------------------------------------------------------------
     # Checklist (родительский список)
@@ -251,15 +292,32 @@ class ChecklistService:
         )
         next_pos = (max_pos[0] + 1) if max_pos else 0
 
+        # Title родительского списка для embedding input (Phase 2).
+        # Если list_id не находится — пропускаем embedding, items без
+        # него по-прежнему создадутся (graceful).
+        checklist_title: str | None = None
+        if self._embedding_client is not None:
+            parent = self.session.get(Checklist, list_id)
+            checklist_title = parent.title if parent else None
+
         now = _utcnow()
         added: list[ChecklistItem] = []
         for offset, title in enumerate(fresh):
+            clean_title = title[:1000]  # safety cap, EncryptedString вмещает Text
+            embedding_json: str | None = None
+            embedding_model: str | None = None
+            if checklist_title is not None:
+                embedding_json, embedding_model = self._embed_item(
+                    checklist_title, clean_title
+                )
             item = ChecklistItem(
                 id=f"clitem_{uuid4().hex[:24]}",
                 checklist_id=list_id,
                 position=next_pos + offset,
-                title=title[:1000],  # safety cap, EncryptedString вмещает Text
+                title=clean_title,
                 status="pending",
+                embedding_json=embedding_json,
+                embedding_model=embedding_model,
                 created_at=now,
                 updated_at=now,
             )

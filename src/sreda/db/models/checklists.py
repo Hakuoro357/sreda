@@ -127,6 +127,25 @@ class ChecklistItem(Base):
         DateTime(timezone=True), nullable=True,
     )
 
+    # Embedding for recall-broadcast (migration 0037, Phase 1).
+    # Generated from f"{checklist.title}: {item.title}" via e5-large
+    # passage prefix. NULL for legacy rows until backfill runs.
+    # ``embedding_dim`` not stored — derivable from ``embedding_model``.
+    #
+    # SECURITY tradeoff: ``title`` shifrуется EncryptedString, а
+    # ``embedding_json`` хранится plaintext. Атакующий с DB read-доступом
+    # может через cosine similarity сделать guessing attack — частично
+    # обходит encryption-at-rest. Принят как accepted risk (тот же
+    # паттерн в AssistantMemory.embedding_json), потому что:
+    #   1) cosine over плейн-эмбеддингов нужен для recall;
+    #   2) шифрование embedding_json потребовало бы decrypt-on-recall,
+    #      что фундаментально несовместимо с in-place vector search.
+    # Если threat-model изменится — мигрировать обе таблицы вместе.
+    embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

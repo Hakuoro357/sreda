@@ -82,6 +82,19 @@ class FamilyReminder(Base):
     escalation_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
+
+    # Embedding for recall-broadcast (migration 0037, Phase 1).
+    # Generated from f"Напоминание: {reminder.title}" via e5-large passage
+    # prefix. NULL for legacy rows until backfill runs.
+    # NOTE: reminder.title — String(500) plaintext (не EncryptedString),
+    # поэтому здесь plaintext embedding не дополнительный security risk.
+    # Сравнить с ChecklistItem.embedding_json — там есть accepted-risk
+    # comment. См. plans/recall-broadcast-fanout-final.md.
+    embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

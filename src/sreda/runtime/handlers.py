@@ -1850,6 +1850,7 @@ def execute_conversation_chat(
             tenant_id=action.tenant_id,
             user_id=user_id,
             pending_buttons_state=pending_buttons_state,
+            embedding_client=embedding_client,
         )
     tools_by_name = {t.name: t for t in tools}
 

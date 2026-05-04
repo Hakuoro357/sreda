@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM_FAKE = 64
 
+# Canonical embedding-model name for stored vectors (recall-broadcast,
+# 2026-05-04). Recorded в `embedding_model` колонках для каждой записи —
+# когда модель меняется, можно найти и перевычислить старые векторы.
+# Source of truth для service-side write hooks (checklists, reminders).
+# В runtime client настраивается через ``settings.embeddings_model``.
+EMBEDDING_MODEL_NAME = "e5-large"
+
 
 class EmbeddingClient(Protocol):
     """Minimal interface expected by memory repo + graph node.
