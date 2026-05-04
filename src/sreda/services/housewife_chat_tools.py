@@ -211,6 +211,85 @@ def build_housewife_tools(
         return "active reminders:\n" + "\n".join(lines)
 
     @lc_tool
+    def update_reminder(
+        reminder_id: str,
+        *,
+        title: str | None = None,
+        trigger_iso: str | None = None,
+        recurrence_rule: str | None = None,
+        clear_recurrence: bool = False,
+    ) -> str:
+        """Update a pending reminder IN-PLACE — preferred over
+        cancel + schedule when the user is refining an existing reminder.
+
+        WHEN TO USE:
+        - Юзер уточняет существующее: «увеличь до 20:00», «не каждый
+          час, а каждые 30 мин», «timezone +1», «измени на пятницу».
+        - Любое уточнение, которое правит **тот же** reminder.
+
+        WHEN NOT TO USE:
+        - Юзер просит **новый** reminder (отдельная сущность) →
+          ``schedule_reminder``.
+        - Юзер хочет **отменить** существующий → ``cancel_reminder``.
+
+        FLOW:
+        1. Сначала ``list_reminders`` чтобы получить ``reminder_id``.
+        2. Потом ``update_reminder(rem_xxx, **fields_to_change)`` —
+           передавай ТОЛЬКО изменяющиеся поля. Неуказанные остаются как есть.
+
+        Args:
+            reminder_id: id reminder'а (`rem_xxx`) — взять из
+                ``list_reminders``.
+            title: Новый текст (если меняется).
+            trigger_iso: Новое время в ISO-8601. Те же правила что у
+                schedule_reminder (см. его docstring) — UTC, либо ISO с
+                offset'ом, который сконвертится в UTC.
+            recurrence_rule: Новая RFC-5545 RRULE string (BYHOUR/BYMINUTE
+                в UTC). Передавай для смены частоты.
+            clear_recurrence: Если True — убрать recurrence (превратить в
+                one-shot). Используй когда юзер просит «убери повтор».
+
+        Returns:
+            ``ok:updated:rem_xxx:<next_trigger_at_iso>`` либо
+            ``error: not found`` либо ``error: <reason>``.
+        """
+        clean_id = (reminder_id or "").strip()
+        if not clean_id:
+            return "error: reminder_id required"
+
+        # Parse trigger_iso если задан — те же правила что в schedule_reminder.
+        trigger_at_dt: datetime | None = None
+        if trigger_iso is not None:
+            try:
+                trigger_at_dt = datetime.fromisoformat(trigger_iso)
+            except ValueError:
+                return f"error: cannot parse trigger_iso={trigger_iso!r}"
+            if trigger_at_dt.tzinfo is None:
+                trigger_at_dt = trigger_at_dt.replace(tzinfo=timezone.utc)
+            else:
+                trigger_at_dt = trigger_at_dt.astimezone(timezone.utc)
+
+        try:
+            rem = service.update(
+                tenant_id=tenant_id,
+                reminder_id=clean_id,
+                title=title,
+                trigger_at=trigger_at_dt,
+                recurrence_rule=recurrence_rule,
+                clear_recurrence=clear_recurrence,
+            )
+        except ValueError as exc:
+            return f"error: {exc}"
+        except Exception:  # noqa: BLE001
+            logger.exception("update_reminder failed")
+            return "error: internal"
+
+        if rem is None:
+            return f"error: reminder {clean_id!r} not found"
+        next_at = rem.next_trigger_at.isoformat() if rem.next_trigger_at else "none"
+        return f"ok:updated:{rem.id}:{next_at}"
+
+    @lc_tool
     def cancel_reminder(reminder_id: str) -> str:
         """Cancel a pending reminder by its id.
 

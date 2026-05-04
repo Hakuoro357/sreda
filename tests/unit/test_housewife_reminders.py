@@ -353,3 +353,228 @@ def test_schedule_with_msk_offset_fires_when_utc_due() -> None:
 
     assert len(due) == 1
     assert due[0].title == "Сделать оливье"
+
+
+# ---------------------------------------------------------------------------
+# update() — added 2026-05-04 (12.3 UX fix vs cancel+create churn)
+# ---------------------------------------------------------------------------
+
+
+def test_update_changes_title_and_reembeds() -> None:
+    """Title change → row.title updated + embedding regenerated."""
+    from unittest.mock import Mock
+
+    session = _fresh_session()
+    fake_ec = Mock()
+    fake_ec.embed_document.side_effect = [
+        [0.1] * 1024,  # на schedule
+        [0.9] * 1024,  # на update title
+    ]
+    service = HousewifeReminderService(session, embedding_client=fake_ec)
+
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Купить молоко",
+        trigger_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+    )
+    original_id = rem.id
+
+    updated = service.update(
+        tenant_id="tenant_1",
+        reminder_id=rem.id,
+        title="Купить молоко и хлеб",
+    )
+
+    assert updated is not None
+    assert updated.id == original_id  # SAME row, not new one
+    assert updated.title == "Купить молоко и хлеб"
+    assert updated.embedding_model == "bge-m3"
+    # Embedding должен быть обновлён (вторая mock-запись)
+    import json
+
+    assert json.loads(updated.embedding_json)[0] == 0.9
+    # На title-only update время не сбрасывается
+    assert _coerce_utc(updated.next_trigger_at) == datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+
+
+def test_update_changes_trigger_resets_escalation() -> None:
+    """trigger_at change → next_trigger_at пересинхрон + escalation сброс."""
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="X",
+        trigger_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+    )
+    # Имитируем уже первое срабатывание
+    rem.escalation_count = 1
+    session.commit()
+
+    new_trigger = datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
+    updated = service.update(
+        tenant_id="tenant_1",
+        reminder_id=rem.id,
+        trigger_at=new_trigger,
+    )
+
+    assert updated is not None
+    assert _coerce_utc(updated.trigger_at) == new_trigger
+    assert _coerce_utc(updated.next_trigger_at) == new_trigger
+    assert updated.escalation_count == 0  # reset
+    # Title не трогали — остался прежним
+    assert updated.title == "X"
+
+
+def test_update_validates_recurrence_rule() -> None:
+    """invalid RRULE → ValueError, row не меняется."""
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Y",
+        trigger_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        recurrence_rule="FREQ=DAILY;BYHOUR=9",
+    )
+
+    with pytest.raises(ValueError, match="invalid recurrence_rule"):
+        service.update(
+            tenant_id="tenant_1",
+            reminder_id=rem.id,
+            recurrence_rule="NOT_A_VALID_RRULE",
+        )
+
+    # Row не должен быть мутирован при invalid input
+    session.refresh(rem)
+    assert rem.recurrence_rule == "FREQ=DAILY;BYHOUR=9"
+
+
+def test_update_clear_recurrence_makes_oneshot() -> None:
+    """clear_recurrence=True → recurrence_rule=NULL (one-shot)."""
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Z",
+        trigger_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        recurrence_rule="FREQ=DAILY;BYHOUR=9",
+    )
+
+    updated = service.update(
+        tenant_id="tenant_1",
+        reminder_id=rem.id,
+        clear_recurrence=True,
+    )
+
+    assert updated is not None
+    assert updated.recurrence_rule is None
+
+
+def test_update_returns_none_for_unknown_id() -> None:
+    """Unknown reminder_id → None (не raise)."""
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    result = service.update(
+        tenant_id="tenant_1",
+        reminder_id="rem_does_not_exist",
+        title="anything",
+    )
+    assert result is None
+
+
+def test_update_rejects_non_pending_reminder() -> None:
+    """fired/cancelled reminder → update returns None (HIGH guard).
+
+    Без этой проверки cancel+update вернул бы row в active-like state
+    (next_trigger_at + escalation_count=0) при том что worker
+    его не подхватит. LLM получает «не найдено», что корректно с UX.
+    """
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="To cancel",
+        trigger_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+    )
+    service.cancel(tenant_id="tenant_1", reminder_id=rem.id)
+
+    # Cancelled — update должен вернуть None
+    result = service.update(
+        tenant_id="tenant_1",
+        reminder_id=rem.id,
+        title="Try to revive",
+    )
+    assert result is None
+    session.refresh(rem)
+    assert rem.status == "cancelled"
+    assert rem.title == "To cancel"  # без изменений
+
+
+def test_update_rejects_blank_title() -> None:
+    """Пустая/whitespace-only title — ValueError (MEDIUM guard).
+
+    None = «не трогай», явный пустой = программерская ошибка LLM
+    (передал empty placeholder вместо реального текста).
+    """
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="X",
+        trigger_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="title must not be blank"):
+        service.update(
+            tenant_id="tenant_1",
+            reminder_id=rem.id,
+            title="   ",
+        )
+
+    with pytest.raises(ValueError, match="title must not be blank"):
+        service.update(
+            tenant_id="tenant_1",
+            reminder_id=rem.id,
+            title="",
+        )
+
+    # Row не мутирован
+    session.refresh(rem)
+    assert rem.title == "X"
+
+
+def test_update_isolates_tenants() -> None:
+    """Reminder из чужого tenant'а — None (security)."""
+    session = _fresh_session()
+    session.add(Tenant(id="tenant_2", name="Other"))
+    session.add(User(id="user_2", tenant_id="tenant_2", telegram_account_id="200"))
+    session.commit()
+
+    service = HousewifeReminderService(session)
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="A",
+        trigger_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+    )
+
+    # tenant_2 пытается обновить — должен получить None (не утечь данные)
+    result = service.update(
+        tenant_id="tenant_2",
+        reminder_id=rem.id,
+        title="malicious",
+    )
+    assert result is None
+    # Original не изменился
+    session.refresh(rem)
+    assert rem.title == "A"

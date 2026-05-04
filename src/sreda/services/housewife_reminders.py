@@ -164,6 +164,90 @@ class HousewifeReminderService:
         self.session.commit()
         return reminder
 
+    def update(
+        self,
+        *,
+        tenant_id: str,
+        reminder_id: str,
+        title: str | None = None,
+        trigger_at: datetime | None = None,
+        recurrence_rule: str | None = None,
+        clear_recurrence: bool = False,
+    ) -> FamilyReminder | None:
+        """Patch an existing reminder in-place — used вместо delete+create
+        когда юзер уточняет существующее напоминание.
+
+        Returns the updated row, or None if not found / wrong tenant.
+
+        Семантика:
+          * ``title``               — если задан, перезаписывает + re-embed.
+          * ``trigger_at``          — если задан, перезаписывает + сбрасывает
+                                      ``next_trigger_at`` и ``escalation_count``.
+          * ``recurrence_rule``     — если задан, валидируется через rrulestr.
+                                      Передавать ``""`` (или используй
+                                      ``clear_recurrence=True``) чтобы убрать.
+          * ``clear_recurrence``    — explicit-флаг сброса в NULL (т.к.
+                                      None в kwarg означает «не трогай»).
+
+        Что НЕ обновляется этой операцией: ``status``, ``acknowledged_at``,
+        ``last_fired_at``. Cancel — отдельный метод. Mark-fired — worker.
+        """
+        rem = self.session.get(FamilyReminder, reminder_id)
+        if rem is None or rem.tenant_id != tenant_id:
+            return None
+
+        # Status guard (HIGH из reviewer 2026-05-04): не позволяем patch'ить
+        # fired/cancelled reminders — иначе row из терминального статуса
+        # может вернуться в pending-like состояние (новый next_trigger_at
+        # + escalation_count=0) при том что worker'у он невидим. LLM
+        # получит None и LLM-tool отрапортует юзеру «not found».
+        if rem.status != "pending":
+            return None
+
+        # Blank-title guard (MEDIUM из reviewer): None означает «не трогай»,
+        # пустая/whitespace строка — программерская ошибка, не «no-op».
+        if title is not None and not title.strip():
+            raise ValueError("title must not be blank")
+
+        # Validate rrule (если меняется) до любых мутаций. Берём dtstart из
+        # обновлённого trigger_at если есть, иначе старого.
+        rrule_value: str | None
+        if clear_recurrence:
+            rrule_value = None
+        elif recurrence_rule is not None:
+            new_dtstart = (
+                _coerce_utc(trigger_at) if trigger_at is not None
+                else rem.trigger_at
+            )
+            try:
+                rrulestr(recurrence_rule, dtstart=new_dtstart)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"invalid recurrence_rule: {exc}") from exc
+            rrule_value = recurrence_rule
+        else:
+            rrule_value = rem.recurrence_rule  # unchanged
+
+        if title is not None:
+            clean = title.strip()
+            if clean and clean != rem.title:
+                rem.title = clean
+                emb_json, emb_model = self._embed_title(clean)
+                rem.embedding_json = emb_json
+                rem.embedding_model = emb_model
+
+        if trigger_at is not None:
+            ts = _coerce_utc(trigger_at)
+            rem.trigger_at = ts
+            rem.next_trigger_at = ts
+            rem.escalation_count = 0  # reset escalation cycle on time change
+
+        if clear_recurrence or recurrence_rule is not None:
+            rem.recurrence_rule = rrule_value
+
+        rem.updated_at = _utcnow()
+        self.session.commit()
+        return rem
+
     def list_active(
         self, *, tenant_id: str, user_id: str | None = None
     ) -> list[FamilyReminder]:

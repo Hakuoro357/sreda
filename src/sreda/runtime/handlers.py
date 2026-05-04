@@ -994,6 +994,7 @@ _HOUSEWIFE_FOOD_PROMPT = """\
 - Минимизируй количество tool-вызовов. LLM — узкое место. Правила:
   * НЕ дублируй ``list_shopping`` / ``list_menu`` / ``search_recipes`` в одном turn'е — первый вызов остаётся актуальным.
   * Если user хочет ПЕРЕИМЕНОВАТЬ / ПЕРЕКАТЕГОРИЗИРОВАТЬ существующий item — ``update_shopping_item`` или ``update_shopping_items_category``. НЕ делай remove+add.
+  * Если user уточняет существующий REMINDER (изменить время, частоту, текст, добавить +1ч таймзону, «не каждый час, а каждые 30 мин») — сначала ``list_reminders`` чтобы взять `reminder_id`, потом ``update_reminder(rem_xxx, **changed_fields)``. **НЕ делай ``cancel_reminder`` + ``schedule_reminder``** — это ломает UX (state дёргается, юзер не понимает что актуально).
   * Если хочешь обновить N items одной категорией — ``update_shopping_items_category(ids, category)`` одним вызовом, не N раз ``update_shopping_item``.
   * Batch-вызовы (``add_shopping_items(items=[...])``, ``save_recipes_batch``, ``add_family_members(members=[...])``) всегда предпочтительнее for-each.
 
