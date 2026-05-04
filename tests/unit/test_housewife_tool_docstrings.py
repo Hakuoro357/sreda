@@ -133,10 +133,19 @@ def test_system_prompt_anti_hallucination_tool_call_rule():
     from sreda.runtime.handlers import _CONVERSATION_SYSTEM_PROMPT
 
     low = _CONVERSATION_SYSTEM_PROMPT.lower()
-    # Accept either "tool-call" language or "не отчитывайся" language.
+    # Accept either "tool-call" language or various forms of the "don't report
+    # without doing" rule. Stage 1.3 (2026-05-04) consolidated three overlapping
+    # rules into one canonical "ЗАПРЕЩЕНО говорить" formulation in
+    # _TOOL_DISCIPLINE_ADDENDUM (always-loaded), so "запрещено говор" is the
+    # current canonical anchor.
     assert (
         ("tool-call" in low or "tool call" in low or "вызов tool" in low)
-        and ("не отчитыв" in low or "не говори" in low or "только о сделанном" in low)
+        and (
+            "не отчитыв" in low
+            or "не говори" in low
+            or "только о сделанном" in low
+            or "запрещено говор" in low
+        )
     ), (
         "System prompt must instruct LLM: if you say 'сохранил X' / "
         "'добавил Y' — there MUST be a tool-call for X and Y in this "
