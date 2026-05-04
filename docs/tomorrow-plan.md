@@ -524,7 +524,21 @@ api.telegram.org, kernel-side TCP keepalive работает как задума
 - (если делаем 9.3): outbound `sendMessage` p95 latency < 800мс
   стабильно, без spike'ов >5 секунд
 
-### 10. MAX integration — sprint целиком, сразу long-poll
+### 10. MAX integration — ✅ DONE 2026-05-04 (commit `26301cf`)
+
+**Sprint deployed:** webhook + mini-app dual support + channel linking
+backend + outbox routing + subscription health-check.
+
+- Migrations 0038 (channel_link_tokens) + 0039 (users.max_chat_id) applied
+- Webhook auto-зарегистрирован: `https://bot.sredaspace.ru/api/max/webhook`
+- 35 new unit tests + 5-round qwen-loop reviewed plan (R5 NO SIGNIFICANT CONCERNS)
+- KNOWN LIMITATIONS deferred на next sprint:
+  - `_process_approved_max_turn` — placeholder, не wired в conversation graph
+  - Mini-app frontend UI для linking (source button, target confirm screen)
+  - Live test recipient format (`{chat_id: ...}` not yet проверен на real send)
+
+**Original plan (для истории):**
+
 
 **Контекст.** Бот в МАКС зарегистрирован, токен в `/etc/sreda/.env`
 как `SREDA_MAX_BOT_TOKEN`. Schema 0035 уже добавила `users.max_account_id`
@@ -956,7 +970,10 @@ cos>0.95, `min_per_source=1` guarantee, error isolation per source.
 | 24h soak | bge-m3 — verify no regressions, false positives recall | passive | 🟢 |
 | 9.1 анализ | Поднять метрики ack-vs-reply ordering, решить про 9.3 | ~30 мин | 🟢 |
 | 9.3 | Транспорт RU↔EU (Go-прокси / WireGuard) — если 9.1 покажет race | ~1ч / день | 🟡 conditional |
-| **10** | **MAX integration sprint — следующий большой блок** | 2-3 дня | 🟠 big |
+| ~~10~~ | ~~MAX integration sprint~~ — ✅ DONE 2026-05-04 (commit `26301cf`) | — | ✅ |
+| 10.1 | MAX `_process_approved_max_turn` wire to conversation graph | ~2-3ч | 🟡 follow-up |
+| 10.2 | Mini-app frontend UI для linking (source button + target confirm) | ~3-4ч | 🟡 follow-up |
+| 10.3 | Live verify recipient send_message format на реальном MAX-ответе | ~30 мин | 🟢 follow-up |
 | 12.2 | Динамические напоминания — после MAX | 2-3 дня | ⏸ deferred |
 | 9.2 | ~~Placeholder + editMessageText~~ | — | 🗑 removed |
 
