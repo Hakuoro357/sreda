@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from sreda.db.models.core import OutboxMessage
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.features.app_registry import get_feature_registry
+from sreda.integrations.max.client import MaxClient, MaxDeliveryError
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.runtime.delivery_policy import DeliveryKind, decide_delivery
 from sreda.services import trace
@@ -40,9 +41,14 @@ class OutboxDeliveryWorker:
         self,
         session: Session,
         telegram_client: TelegramClient | None = None,
+        max_client: "MaxClient | None" = None,
     ) -> None:
         self.session = session
         self.telegram = telegram_client
+        # MAX channel client (Phase 6 of MAX integration sprint).
+        # None — MAX channel delivery будет skip'аться (fallback chain
+        # попробует TG если у юзера есть и telegram_account_id).
+        self.max = max_client
 
     async def process_pending_messages(
         self, *, now: datetime | None = None, limit: int = 50
@@ -52,7 +58,7 @@ class OutboxDeliveryWorker:
             self.session.query(OutboxMessage)
             .filter(
                 OutboxMessage.status == "pending",
-                OutboxMessage.channel_type == "telegram",
+                OutboxMessage.channel_type.in_(("telegram", "max")),
                 or_(
                     OutboxMessage.scheduled_at.is_(None),
                     OutboxMessage.scheduled_at <= now_utc,
@@ -117,6 +123,15 @@ class OutboxDeliveryWorker:
         return profile_dict, skill_config_dict
 
     async def _send_now(self, row: OutboxMessage) -> None:
+        # Phase 6 of MAX integration sprint (2026-05-04): branch by channel.
+        # MAX и Telegram имеют разные SDK / payload форматы — разносим
+        # на отдельные методы. Для будущей расширяемости (e.g. дополнительный
+        # канал) этот dispatch расширяется одной веткой.
+        if row.channel_type == "max":
+            await self._send_now_max(row)
+            return
+
+        # Default: Telegram path (legacy code, не трогаем).
         if self.telegram is None:
             # Dev/test path with no Telegram wired — just mark sent so
             # tests can assert policy without a client mock.
@@ -200,6 +215,78 @@ class OutboxDeliveryWorker:
                 trace_payload,
                 chat_id=payload.get("chat_id"),
                 status="failed",
+            )
+        self.session.commit()
+
+    async def _send_now_max(self, row: OutboxMessage) -> None:
+        """MAX channel send (Phase 6).
+
+        Payload contract (mirror TG):
+        - ``payload.chat_id`` — MAX chat_id (mandatory)
+        - ``payload.text`` — message text
+        - ``payload.format`` — optional ``markdown``/``html``
+        - ``payload.attachments`` — optional list (inline keyboard etc.)
+
+        Trace flow тот же как у TG: ``_emit_trace`` вызывается с
+        chat_id и status. Stage 9.1 message_id/date capture — после probe
+        Phase 0 знаем что MAX отдаёт ``body.mid`` per message; формат
+        capture добавим в follow-up если нужно.
+        """
+        if self.max is None:
+            # Dev/test path — mark sent для unit-тестов
+            row.status = "sent"
+            self.session.commit()
+            return
+
+        try:
+            payload = json.loads(row.payload_json or "{}")
+        except json.JSONDecodeError:
+            logger.exception("max outbox: bad payload_json for %s", row.id)
+            row.status = "failed"
+            self.session.commit()
+            return
+
+        trace_payload = payload.pop("_trace", None)
+        chat_id = payload.get("chat_id")
+        text = payload.get("text", "")
+
+        # Reviewer CRITICAL-1: guard against missing chat_id. Без recipient
+        # MAX API всё равно бросит 4xx, но лучше не делать сетевой вызов,
+        # пометить failed и оставить trail в логах для диагностики.
+        if chat_id is None:
+            logger.error(
+                "max outbox %s: missing chat_id в payload — "
+                "outbound маршрутизация сломана",
+                row.id,
+            )
+            row.status = "failed"
+            self._emit_trace(
+                trace_payload, chat_id=None, status="failed_no_recipient",
+            )
+            self.session.commit()
+            return
+
+        try:
+            await self.max.send_message(
+                recipient={"chat_id": chat_id},
+                text=text,
+                format=payload.get("format"),
+                attachments=payload.get("attachments"),
+            )
+            row.status = "sent"
+            self._emit_trace(
+                trace_payload, chat_id=chat_id, status="ok",
+            )
+        except MaxDeliveryError:
+            logger.warning(
+                "max outbox: delivery error on %s, keeping pending", row.id,
+            )
+            row.status = "pending"
+        except Exception:
+            logger.exception("max outbox: unexpected error on %s", row.id)
+            row.status = "failed"
+            self._emit_trace(
+                trace_payload, chat_id=chat_id, status="failed",
             )
         self.session.commit()
 

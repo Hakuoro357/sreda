@@ -77,17 +77,38 @@ async def run_job_loop_async() -> None:
 
     Sleeps ``job_poll_interval_seconds`` between empty passes; when work is
     found, loops immediately until the queue drains. Designed to be run as
-    a long-lived process alongside the API."""
+    a long-lived process alongside the API.
+
+    2026-05-04 (Phase 9 of MAX integration sprint): runs параллельно
+    с MAX subscription health check + channel-link token cleanup
+    (every 6h). Errors per-iteration swallowed independently — health
+    check failure не валит job loop, и наоборот.
+    """
     settings = get_settings()
     interval = max(0.1, settings.job_poll_interval_seconds)
-    while True:
+
+    # Spawn long-running periodic max health check task. Best-effort —
+    # если max_bot_token не настроен, check сам skip'нется.
+    from sreda.workers.max_subscription_health import run_health_check_loop
+    health_task = asyncio.create_task(
+        run_health_check_loop(), name="max_subscription_health",
+    )
+
+    try:
+        while True:
+            try:
+                processed = await process_pending_jobs_once()
+            except Exception:  # noqa: BLE001 — we never want the loop to die
+                logger.exception("job_runner: iteration failed, continuing")
+                processed = 0
+            if processed == 0:
+                await asyncio.sleep(interval)
+    finally:
+        health_task.cancel()
         try:
-            processed = await process_pending_jobs_once()
-        except Exception:  # noqa: BLE001 — we never want the loop to die
-            logger.exception("job_runner: iteration failed, continuing")
-            processed = 0
-        if processed == 0:
-            await asyncio.sleep(interval)
+            await health_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def run_job_loop() -> None:

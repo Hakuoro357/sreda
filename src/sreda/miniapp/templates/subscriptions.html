@@ -139,7 +139,12 @@
     opts = opts || {};
     var headers = { "Authorization": "tma " + initData };
     if (opts.body) headers["Content-Type"] = "application/json";
-    return fetch("{{ base_url }}" + path, {
+    // Phase 8 of MAX integration (2026-05-04): add ?platform= query так
+    // backend dispatches на правильный validator (R2#6 fail-explicit).
+    var fullPath = (typeof window.__sredaWithPlatform === "function")
+      ? window.__sredaWithPlatform(path)
+      : path;
+    return fetch("{{ base_url }}" + fullPath, {
       method: opts.method || "GET",
       headers: headers,
       body: opts.body ? JSON.stringify(opts.body) : undefined,

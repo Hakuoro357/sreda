@@ -5,6 +5,78 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>{% block title %}Подписки{% endblock %} — Среда</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://st.max.ru/js/max-web-app.js"></script>
+  <script>
+    // Phase 8 of MAX integration: platform_bridge — detect TG vs MAX,
+    // expose unified globals + polyfill window.Telegram.WebApp from MAX
+    // когда юзер пришёл из МАКСА. Полифил позволяет existing шаблон-код
+    // (subscriptions.html etc.) продолжать работать БЕЗ переписывания.
+    //
+    // Frontend invariant (R2#6 fail-explicit): API calls добавляют
+    // ?platform=... query param. Backend без явного claim → 400.
+    (function() {
+      var qp = new URLSearchParams(location.search);
+      var claimed = qp.get("platform"); // "telegram" | "max" | null
+
+      function detectPlatform() {
+        if (claimed === "max") return "max";
+        if (claimed === "telegram") return "telegram";
+        // Fallback: sniff. MAX runtime exposes window.WebApp synchronously
+        // (via st.max.ru/js/max-web-app.js); TG — window.Telegram.WebApp.
+        if (window.WebApp && window.WebApp.initData) return "max";
+        if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) return "telegram";
+        return "browser";
+      }
+
+      var platform = detectPlatform();
+      window.__SREDA_PLATFORM__ = platform;
+
+      // Polyfill: если в MAX, синтезируем window.Telegram.WebApp shape
+      // от window.WebApp чтобы существующий код продолжал работать.
+      // initDataUnsafe + initData + ready/expand/close — минимально
+      // достаточный API для текущих шаблонов.
+      if (platform === "max" && window.WebApp) {
+        var max = window.WebApp;
+        window.Telegram = window.Telegram || {};
+        window.Telegram.WebApp = window.Telegram.WebApp || {
+          initData: max.initData || "",
+          initDataUnsafe: max.initDataUnsafe || {},
+          ready: function() { try { max.ready && max.ready(); } catch (e) {} },
+          expand: function() { try { max.expand && max.expand(); } catch (e) {} },
+          close: function() { try { max.close && max.close(); } catch (e) {} },
+          themeParams: max.themeParams || {},
+          MainButton: max.MainButton || { setText: function(){}, show: function(){}, hide: function(){}, onClick: function(){} },
+          BackButton: max.BackButton || { show: function(){}, hide: function(){}, onClick: function(){} },
+          openTelegramLink: function(url) { try { window.open(url, '_blank'); } catch (e) {} },
+        };
+      }
+
+      // Helper: добавить ?platform=... к API URL. Если URL уже имеет
+      // platform — оставляем (может быть явно указан caller'ом).
+      window.__sredaWithPlatform = function(path) {
+        if (!path) return path;
+        var sep = path.indexOf("?") >= 0 ? "&" : "?";
+        if (path.indexOf("platform=") >= 0) return path;
+        return path + sep + "platform=" + encodeURIComponent(platform);
+      };
+
+      // Browser fallback: показать banner если открыто в чистом браузере
+      // (не в TG и не в MAX). Этот случай legitimate (web preview, debug),
+      // но без initData backend вернёт 401 — лучше явно сказать юзеру.
+      if (platform === "browser") {
+        document.addEventListener("DOMContentLoaded", function() {
+          var app = document.getElementById("app");
+          if (app) {
+            app.innerHTML =
+              '<div class="banner" style="text-align:center; padding:32px 16px;">' +
+              '<strong>Откройте в приложении Telegram или MAX</strong><br>' +
+              '<span style="opacity:0.7; font-size:13px;">Это приложение — мини-приложение бота Среда.</span>' +
+              '</div>';
+          }
+        });
+      }
+    })();
+  </script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 

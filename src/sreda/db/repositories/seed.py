@@ -13,11 +13,24 @@ class SeedRepository(Repository):
         workspace_id: str,
         workspace_name: str,
         user_id: str,
-        telegram_account_id: str,
+        telegram_account_id: str | None = None,
+        max_account_id: str | None = None,
         assistant_id: str,
         assistant_name: str,
         eds_monitor_enabled: bool,
     ) -> None:
+        """Idempotently create / update a tenant bundle.
+
+        Принимает либо ``telegram_account_id``, либо ``max_account_id``
+        (либо оба — для mixed-channel юзеров после channel linking).
+        Хотя бы один должен быть задан — иначе раннее ошибка.
+        """
+        if not telegram_account_id and not max_account_id:
+            raise ValueError(
+                "ensure_tenant_bundle requires telegram_account_id "
+                "or max_account_id"
+            )
+
         now = datetime.now(timezone.utc)
 
         tenant = self.session.get(Tenant, tenant_id)
@@ -30,8 +43,8 @@ class SeedRepository(Repository):
 
         # 152-ФЗ обезличивание Часть 1: tg_account_hash заполнится сам
         # через event-листенер на User.telegram_account_id (см.
-        # db/models/core.py). Тут просто пишем chat_id — hash и
-        # шифрование plaintext отрабатывают прозрачно.
+        # db/models/core.py). max_account_id хранится прямо (per
+        # schema 0035, plain indexed column).
         user = self.session.get(User, user_id)
         if user is None:
             self.session.add(
@@ -39,10 +52,14 @@ class SeedRepository(Repository):
                     id=user_id,
                     tenant_id=tenant_id,
                     telegram_account_id=telegram_account_id,
+                    max_account_id=max_account_id,
                 )
             )
         else:
-            user.telegram_account_id = telegram_account_id
+            if telegram_account_id is not None:
+                user.telegram_account_id = telegram_account_id
+            if max_account_id is not None:
+                user.max_account_id = max_account_id
 
         self.session.flush()
 

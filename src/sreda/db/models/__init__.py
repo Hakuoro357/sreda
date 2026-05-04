@@ -5,6 +5,7 @@ from sreda.db.models.billing import (
     TenantBillingCycle,
     TenantSubscription,
 )
+from sreda.db.models.channel_linking import ChannelLinkToken
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import (
     Assistant,

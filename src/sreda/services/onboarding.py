@@ -220,3 +220,139 @@ def _extract_display_name(payload: dict) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+# ────────────────────────────────────────────────────────────────────
+# MAX channel onboarding (Phase 4 of MAX integration sprint)
+# ────────────────────────────────────────────────────────────────────
+
+
+@dataclass(slots=True)
+class MaxOnboardingResult:
+    """Mirror TelegramOnboardingResult для MAX channel."""
+
+    is_new_user: bool
+    max_account_id: str | None
+    max_chat_id: str | None
+    tenant_id: str | None
+    workspace_id: str | None
+    user_id: str | None
+    assistant_id: str | None
+
+
+def find_user_by_max_account_id(
+    session: Session, max_account_id: str | int
+) -> User | None:
+    """Резолв юзера по MAX user_id через indexed колонку.
+
+    В отличие от Telegram-lookup'а (через HMAC hash из 152-ФЗ Часть 1),
+    MAX user_id — plain identifier в схеме 0035. Лукап по существующему
+    индексу `ix_users_max_account_id`.
+    """
+    if max_account_id is None:
+        return None
+    aid = str(max_account_id).strip()
+    if not aid:
+        return None
+    return (
+        session.query(User)
+        .filter(User.max_account_id == aid)
+        .one_or_none()
+    )
+
+
+def ensure_max_user_bundle(
+    session: Session,
+    *,
+    max_account_id: str | int,
+    max_chat_id: str | int | None = None,
+    display_name: str | None = None,
+) -> MaxOnboardingResult:
+    """Ensure tenant/user/workspace/assistant bundle for a MAX account.
+
+    Phase 4 of MAX integration. Mirrors `ensure_telegram_user_bundle_by_id`
+    но для MAX-specific identifiers.
+
+    Race condition (R1#5): tenant row держится в одной транзакции
+    через ``session.add → session.commit``; параллельные вызовы
+    `ensure_max_user_bundle` для одного `max_account_id` корректно
+    обработаются благодаря unique constraint на User PK + index lookup
+    `find_user_by_max_account_id` ПЕРЕД создание нового tenant'а.
+
+    Channel linking (R3): этот метод вызывается ТОЛЬКО когда юзер
+    впервые пишет в MAX. Если юзер уже зарегистрирован через TG и хочет
+    связать каналы — flow идёт через ``services.channel_linking``,
+    `ensure_max_user_bundle` не вызывается.
+
+    Returns ``MaxOnboardingResult`` с флагом ``is_new_user``.
+    """
+    aid = str(max_account_id).strip() if max_account_id is not None else ""
+    if not aid:
+        return MaxOnboardingResult(False, None, None, None, None, None, None)
+
+    chat_id_str: str | None = None
+    if max_chat_id is not None:
+        chat_id_str = str(max_chat_id).strip() or None
+
+    # SELECT existing — channel linking уже мог связать этот max_account_id
+    # к существующему tenant'у, не создаём дубль.
+    existing_user = find_user_by_max_account_id(session, aid)
+    if existing_user is not None:
+        # Update chat_id if newly known
+        if chat_id_str and existing_user.max_chat_id != chat_id_str:
+            existing_user.max_chat_id = chat_id_str
+            session.commit()
+
+        assistant = (
+            session.query(Assistant)
+            .filter(Assistant.tenant_id == existing_user.tenant_id)
+            .order_by(Assistant.id.asc())
+            .first()
+        )
+        workspace_id = assistant.workspace_id if assistant is not None else None
+        if workspace_id is None:
+            workspace = (
+                session.query(Workspace)
+                .filter(Workspace.tenant_id == existing_user.tenant_id)
+                .order_by(Workspace.id.asc())
+                .first()
+            )
+            workspace_id = workspace.id if workspace is not None else None
+        return MaxOnboardingResult(
+            False,
+            aid,
+            chat_id_str or existing_user.max_chat_id,
+            existing_user.tenant_id,
+            workspace_id,
+            existing_user.id,
+            assistant.id if assistant is not None else None,
+        )
+
+    display_name = display_name or f"Пользователь {aid}"
+    tenant_id = f"tenant_max_{aid}"
+    workspace_id = f"workspace_max_{aid}"
+    user_id = f"user_max_{aid}"
+    assistant_id = f"assistant_max_{aid}"
+
+    SeedRepository(session).ensure_tenant_bundle(
+        tenant_id=tenant_id,
+        tenant_name=display_name,
+        workspace_id=workspace_id,
+        workspace_name=display_name,
+        user_id=user_id,
+        max_account_id=aid,
+        assistant_id=assistant_id,
+        assistant_name="Среда",
+        eds_monitor_enabled=False,
+    )
+
+    # ensure_tenant_bundle commit'нул, теперь patch'им chat_id
+    if chat_id_str:
+        u = session.get(User, user_id)
+        if u is not None:
+            u.max_chat_id = chat_id_str
+            session.commit()
+
+    return MaxOnboardingResult(
+        True, aid, chat_id_str, tenant_id, workspace_id, user_id, assistant_id
+    )

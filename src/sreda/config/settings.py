@@ -20,6 +20,8 @@ _DEV_HOST_NAMES = {"localhost", "127.0.0.1", "::1"}
 _SECRET_FIELD_NAMES = frozenset({
     "telegram_bot_token",
     "telegram_webhook_secret_token",
+    "max_bot_token",
+    "max_webhook_secret_token",
     "openai_api_key",
     "mimo_api_key",
     "openrouter_api_key",
@@ -50,6 +52,15 @@ class Settings(BaseSettings):
     database_url: str = Field(default="postgresql+psycopg://sreda:sreda@localhost:5432/sreda")
     telegram_bot_token: str | None = None
     telegram_webhook_secret_token: str | None = None
+
+    # MAX (российский мессенджер) channel — Phase 5 of MAX integration
+    # sprint, 2026-05-04. ``max_bot_token`` доступен через
+    # SREDA_MAX_BOT_TOKEN. ``max_webhook_url`` указывает на
+    # https://bot.sredaspace.ru/api/max/webhook (lifespan auto-register'ит
+    # на старте). Все три = None → MAX-код dormant (rollback path).
+    max_bot_token: str | None = None
+    max_webhook_url: str | None = None
+    max_webhook_secret_token: str | None = None
     connect_public_base_url: str | None = None
 
     openai_base_url: str | None = None

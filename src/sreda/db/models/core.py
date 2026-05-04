@@ -80,6 +80,15 @@ class User(Base):
     max_account_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True, index=True,
     )
+    # MAX chat_id — DM chat между ботом и юзером (parallel to MAX user_id).
+    # Phase 1 (migration 0039, 2026-05-04): probe показал что в MAX
+    # `recipient` для send_message = ``{"chat_id": ...}``, не user_id.
+    # При первом incoming update'е сохраняем оба идентификатора:
+    # ``user.user_id`` → max_account_id, ``chat_id`` → max_chat_id.
+    # Indexed для outbox lookup. NULL legacy/migrated rows.
+    max_chat_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
 
 
 class Assistant(Base):

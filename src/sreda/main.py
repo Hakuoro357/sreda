@@ -8,6 +8,7 @@ from sreda.admin.routes import router as admin_router
 from sreda.api.routes.approvals import router as approvals_router
 from sreda.api.routes.connect import router as connect_router
 from sreda.api.routes.health import router as health_router
+from sreda.api.routes.max_webhook import router as max_router
 from sreda.api.routes.miniapp import router as miniapp_router
 from sreda.api.routes.telegram_webhook import router as telegram_router
 from sreda.config.logging import configure_logging
@@ -50,6 +51,39 @@ async def _lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001
         logger.warning("embeddings startup-check raised", exc_info=True)
 
+    # MAX webhook auto-register (2026-05-04, Phase 5 of MAX integration).
+    # Fail-closed semantics (R1#3 from qwen review): app стартует, но
+    # health endpoint показывает degraded если регистрация не удалась.
+    # Rollback path: убрать SREDA_MAX_BOT_TOKEN из env → этот блок skip.
+    app.state.max_webhook_status = "disabled"
+    if settings.max_bot_token and settings.max_webhook_url:
+        try:
+            from sreda.integrations.max import MaxClient
+            from sreda.services.admin_alerts import alert_admin_async
+
+            max_client = MaxClient(token=settings.max_bot_token)
+            await max_client.set_webhook(
+                url=settings.max_webhook_url,
+                secret_token=settings.max_webhook_secret_token,
+            )
+            app.state.max_webhook_status = "ok"
+            logger.info(
+                "MAX webhook registered: %s", settings.max_webhook_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.critical("MAX webhook registration failed: %s", exc)
+            try:
+                from sreda.services.admin_alerts import alert_admin_async
+                await alert_admin_async(
+                    f"🔴 startup: MAX webhook registration failed\n"
+                    f"url: {settings.max_webhook_url}\n"
+                    f"error: {exc}\n"
+                    f"Бот глух в МАКС до тех пор пока не починим."
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("admin alert failed (ignored)", exc_info=True)
+            app.state.max_webhook_status = "failed"
+
     yield
 
     if pinger_task is not None and not pinger_task.done():
@@ -81,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(connect_router)
     app.include_router(miniapp_router)
     app.include_router(telegram_router)
+    app.include_router(max_router)
     app.include_router(approvals_router)
     feature_registry.register_api(app)
     app.state.feature_registry = feature_registry
