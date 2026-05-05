@@ -102,8 +102,8 @@ class HousewifeReminderWorker:
     # --- internals ------------------------------------------------------
 
     def _enqueue_outbox_for(self, reminder: FamilyReminder) -> None:
-        routing = self._resolve_routing(reminder)
-        if routing is None:
+        routings = self._resolve_routings(reminder)
+        if not routings:
             logger.warning(
                 "reminder %s: tenant %s has no deliverable channel "
                 "(нет ни TG, ни MAX account_id), skipping delivery",
@@ -122,10 +122,10 @@ class HousewifeReminderWorker:
             return
 
         # Escalation UI: inline keyboard. NB: callback_data format is
-        # TG-style; для MAX inline-button format unknown пока (probe
-        # требуется). Если routing.channel='max', кнопки отрендерятся
-        # как regular send без работающих callback'ов — TODO в 10.6
-        # follow-up или Boris скажет MAX inline format.
+        # TG-style; для MAX inline-button format probe required (планируется
+        # в follow-up). Сейчас MAX outbox row будет отправлена как text-only
+        # т.к. ``OutboxDeliveryWorker._send_now_max`` не понимает TG
+        # inline_keyboard schema.
         from sreda.services.ui_labels import BUTTON_ACK, BUTTON_SNOOZE
 
         text = f"🔔 {reminder.title}"
@@ -141,35 +141,39 @@ class HousewifeReminderWorker:
                 },
             ]],
         }
-        payload = {
-            "chat_id": routing.chat_id,
-            "text": text,
-            "reply_markup": reply_markup,
-        }
-        outbox = OutboxMessage(
-            id=f"out_{uuid4().hex[:24]}",
-            tenant_id=reminder.tenant_id,
-            workspace_id=workspace_id,
-            channel_type=routing.channel,  # 10.6: dynamic per user/tenant
-            feature_key=HOUSEWIFE_FEATURE_KEY,
-            status="pending",
-            payload_json=json.dumps(payload, ensure_ascii=False),
-        )
-        if hasattr(OutboxMessage, "user_id"):
-            outbox.user_id = reminder.user_id
-        if hasattr(OutboxMessage, "is_interactive"):
-            outbox.is_interactive = False
-        self.session.add(outbox)
+        # Dual delivery (Boris directive 2026-05-05): создаём отдельную
+        # outbox row на каждый available channel — юзер видит reminder
+        # и в TG и в МАКСе.
+        for routing in routings:
+            payload = {
+                "chat_id": routing.chat_id,
+                "text": text,
+                "reply_markup": reply_markup,
+            }
+            outbox = OutboxMessage(
+                id=f"out_{uuid4().hex[:24]}",
+                tenant_id=reminder.tenant_id,
+                workspace_id=workspace_id,
+                channel_type=routing.channel,
+                feature_key=HOUSEWIFE_FEATURE_KEY,
+                status="pending",
+                payload_json=json.dumps(payload, ensure_ascii=False),
+            )
+            if hasattr(OutboxMessage, "user_id"):
+                outbox.user_id = reminder.user_id
+            if hasattr(OutboxMessage, "is_interactive"):
+                outbox.is_interactive = False
+            self.session.add(outbox)
         self.session.flush()
 
-    def _resolve_routing(self, reminder: FamilyReminder):
-        """Reminder → channel-aware OutboxRouting (10.6).
+    def _resolve_routings(self, reminder: FamilyReminder):
+        """Reminder → list of OutboxRouting (10.6 dual-channel).
 
         Prefer reminder's ``user_id`` binding; fallback к любому user
         tenant'а который имеет account_id в любом из каналов. Возвращает
-        None если ни TG, ни MAX account нет.
+        empty list если нет account'ов.
         """
-        from sreda.services.channel_routing import resolve_outbox_routing
+        from sreda.services.channel_routing import resolve_outbox_routings
         from sreda.db.models.core import Tenant as _Tenant
 
         tenant = self.session.get(_Tenant, reminder.tenant_id)
@@ -178,11 +182,11 @@ class HousewifeReminderWorker:
         if reminder.user_id:
             user = self.session.get(User, reminder.user_id)
             if user is not None:
-                routing = resolve_outbox_routing(
+                routings = resolve_outbox_routings(
                     self.session, tenant=tenant, user=user,
                 )
-                if routing is not None:
-                    return routing
+                if routings:
+                    return routings
 
         # Fallback: any user of the tenant with any account
         user = (
@@ -198,8 +202,8 @@ class HousewifeReminderWorker:
             .first()
         )
         if user is None:
-            return None
-        return resolve_outbox_routing(self.session, tenant=tenant, user=user)
+            return []
+        return resolve_outbox_routings(self.session, tenant=tenant, user=user)
 
     def _resolve_workspace_id(self, tenant_id: str) -> str | None:
         ws = (

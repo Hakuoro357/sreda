@@ -136,9 +136,9 @@ class OnboardingAhaWorker:
             self._create_sentinel(tenant, now, diet_member_name=None)
             return False
 
-        # 3) Узнаём channel + chat_id для доставки (10.6 channel routing).
-        user, routing = self._resolve_user_and_routing(tenant)
-        if user is None or routing is None:
+        # 3) Узнаём channels для доставки (10.6 dual-channel routing).
+        user, routings = self._resolve_user_and_routings(tenant)
+        if user is None or not routings:
             self._create_sentinel(tenant, now, diet_member_name=None)
             return False
 
@@ -176,26 +176,28 @@ class OnboardingAhaWorker:
                 ],
             }
 
-        # 6) Кладём в outbox. Доставку делает OutboxDeliveryWorker.
-        payload = {
-            "chat_id": routing.chat_id,
-            "text": text,
-            "reply_markup": reply_markup,
-        }
-        outbox = OutboxMessage(
-            id=f"out_{uuid4().hex[:24]}",
-            tenant_id=tenant.id,
-            workspace_id=workspace_id,
-            channel_type=routing.channel,  # 10.6 dynamic per user/tenant
-            feature_key=HOUSEWIFE_FEATURE_KEY,
-            status="pending",
-            payload_json=json.dumps(payload, ensure_ascii=False),
-        )
-        if hasattr(OutboxMessage, "user_id"):
-            outbox.user_id = user.id
-        if hasattr(OutboxMessage, "is_interactive"):
-            outbox.is_interactive = False
-        self.session.add(outbox)
+        # 6) Кладём в outbox. Dual delivery: одна row на каждый channel
+        # (Boris directive 2026-05-05).
+        for routing in routings:
+            payload = {
+                "chat_id": routing.chat_id,
+                "text": text,
+                "reply_markup": reply_markup,
+            }
+            outbox = OutboxMessage(
+                id=f"out_{uuid4().hex[:24]}",
+                tenant_id=tenant.id,
+                workspace_id=workspace_id,
+                channel_type=routing.channel,
+                feature_key=HOUSEWIFE_FEATURE_KEY,
+                status="pending",
+                payload_json=json.dumps(payload, ensure_ascii=False),
+            )
+            if hasattr(OutboxMessage, "user_id"):
+                outbox.user_id = user.id
+            if hasattr(OutboxMessage, "is_interactive"):
+                outbox.is_interactive = False
+            self.session.add(outbox)
 
         # 7) Sentinel — чтобы второй раз не сработало.
         self._create_sentinel(tenant, now, diet_member_name=member_name)
@@ -236,16 +238,16 @@ class OnboardingAhaWorker:
                     return m
         return None
 
-    def _resolve_user_and_routing(
+    def _resolve_user_and_routings(
         self, tenant: Tenant,
     ):
-        """10.6 channel routing: user + OutboxRouting.
+        """10.6 dual-channel routing: user + list[OutboxRouting].
 
         Берём первого юзера tenant'а с любым TG/MAX account_id и
-        вычисляем channel через ``resolve_outbox_routing`` (учитывает
-        ``tenant.preferred_channel``).
+        вычисляем все доступные channels через
+        ``resolve_outbox_routings``.
         """
-        from sreda.services.channel_routing import resolve_outbox_routing
+        from sreda.services.channel_routing import resolve_outbox_routings
 
         user = (
             self.session.query(User)
@@ -260,9 +262,9 @@ class OnboardingAhaWorker:
             .first()
         )
         if user is None:
-            return None, None
-        routing = resolve_outbox_routing(self.session, tenant=tenant, user=user)
-        return user, routing
+            return None, []
+        routings = resolve_outbox_routings(self.session, tenant=tenant, user=user)
+        return user, routings
 
     def _resolve_workspace_id(self, tenant_id: str) -> str | None:
         ws = (

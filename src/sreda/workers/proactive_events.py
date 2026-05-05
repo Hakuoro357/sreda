@@ -149,8 +149,8 @@ class ProactiveEventWorker:
         if isinstance(replies, RuntimeReply):
             replies = [replies]
 
-        routing = self._resolve_routing(event)
-        if routing is None:
+        routings = self._resolve_routings(event)
+        if not routings:
             self.repo.mark_status(
                 event.id, status="skipped", reason="no_delivery_channel"
             )
@@ -177,35 +177,37 @@ class ProactiveEventWorker:
                 embedding_client=embedding_client,
                 now_utc=now_utc,
             )
-            self._write_outbox_with_decision(
-                event=event,
-                reply=reply,
-                routing=routing,
-                decision_kind=decision.kind,
-                defer_until=decision.defer_until_utc,
-                drop_reason=decision.drop_reason,
-            )
+            # Dual delivery (10.6 Boris directive): для каждого reply
+            # создаём отдельные outbox rows на ВСЕ available channels.
+            for routing in routings:
+                self._write_outbox_with_decision(
+                    event=event,
+                    reply=reply,
+                    routing=routing,
+                    decision_kind=decision.kind,
+                    defer_until=decision.defer_until_utc,
+                    drop_reason=decision.drop_reason,
+                )
 
         self.repo.mark_status(event.id, status="consumed")
         self.session.commit()
 
-    def _resolve_routing(self, event: InboundEvent):
-        """10.6: channel-aware routing для proactive event.
+    def _resolve_routings(self, event: InboundEvent):
+        """10.6 dual-channel: list of OutboxRouting для proactive event.
 
-        Возвращает ``OutboxRouting`` (channel + chat_id) на основе
-        ``tenant.preferred_channel`` + available account_ids у user'а.
-        None если ни TG ни MAX account нет.
+        Возвращает все доступные channels (TG+MAX если оба set'нуты).
+        Empty list если ни TG ни MAX account нет.
         """
         if not event.user_id:
-            return None
+            return []
         from sreda.db.models.core import Tenant as _Tenant, User
-        from sreda.services.channel_routing import resolve_outbox_routing
+        from sreda.services.channel_routing import resolve_outbox_routings
 
         user = self.session.get(User, event.user_id)
         if user is None:
-            return None
+            return []
         tenant = self.session.get(_Tenant, event.tenant_id)
-        return resolve_outbox_routing(self.session, tenant=tenant, user=user)
+        return resolve_outbox_routings(self.session, tenant=tenant, user=user)
 
     def _write_outbox_with_decision(
         self,
