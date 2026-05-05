@@ -645,14 +645,17 @@ async def _handle_max_reminder_callback(
 ) -> None:
     """Handle "Готово ✅" / "Отложить ⏰" buttons on a housewife reminder.
 
-    Mirror ``services.telegram_bot._handle_reminder_callback``:
-    - Lookup FamilyReminder by id
-    - acknowledge / snooze
-    - answer_callback с toast
-    - Без editMessageText (MAX edit API parity не реализован yet) —
-      cleanup keyboard через TODO в follow-up. Пока юзер видит только
-      toast от answer_callback, повторный tap корректно блокируется в
-      acknowledge() через DB state.
+    Mirror ``services.telegram_bot._handle_reminder_callback``, но с
+    MAX-специфичным UX:
+
+    Per probe 2026-05-05 PM (Boris live test): MAX игнорирует
+    ``notification`` toast в DM, юзер не видит feedback. Решение —
+    использовать ``message`` field в ``POST /answers`` body, который
+    заменяет original message целиком (как TG editMessageText). Юзер
+    видит "🔔 X" → "✅ X" с пропавшими кнопками, identical к TG UX.
+
+    Lookup FamilyReminder → acknowledge/snooze → ack с replacement
+    message. Cross-tenant defensive check сохранён.
     """
     from sreda.db.models.housewife import FamilyReminder
     from sreda.services.housewife_reminders import (
@@ -661,60 +664,78 @@ async def _handle_max_reminder_callback(
     )
 
     action, _, reminder_id = data.partition(":")
+
+    # Original message text для context в replacement.
+    original_text = ""
+    msg = payload.get("message")
+    if isinstance(msg, dict):
+        body = msg.get("body")
+        if isinstance(body, dict):
+            txt = body.get("text")
+            if isinstance(txt, str):
+                # Strip leading "🔔 " emoji если есть — заменим на ✅/⏰
+                original_text = txt.lstrip("🔔 ").strip()
+
+    async def _ack_with_replacement(new_text: str) -> None:
+        """Send /answers с message field — replaces original message body
+        (clears buttons + changes text). Fallback на notification если
+        replacement отвергнут MAX'ом.
+        """
+        if not callback_id:
+            return
+        try:
+            await max_client.answer_callback(
+                str(callback_id),
+                message={"text": new_text},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "max reminder cb replacement failed (action=%s): %s — "
+                "trying notification fallback",
+                action, exc,
+            )
+            try:
+                await max_client.answer_callback(
+                    str(callback_id), notification=new_text[:64],
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "max reminder cb notification fallback failed",
+                    exc_info=True,
+                )
+
     reminder = (
         session.get(FamilyReminder, reminder_id) if reminder_id else None
     )
     if reminder is None:
-        if callback_id:
-            try:
-                await max_client.answer_callback(
-                    str(callback_id),
-                    notification="Это напоминание уже выполнено.",
-                )
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "max reminder cb ack failed (no reminder)",
-                    exc_info=True,
-                )
+        await _ack_with_replacement("Это напоминание уже выполнено.")
         return
 
-    # Cross-tenant defensive check: callback payload может быть от другого
-    # tenant'а (например, юзер tapnul старую кнопку из чужого reminder'а).
-    # Не allow'аем mutate чужой reminder.
+    # Cross-tenant defensive check.
     if reminder.tenant_id != onboarding.tenant_id:
         logger.warning(
             "max reminder cb cross-tenant: caller=%s reminder=%s — refused",
             onboarding.tenant_id, reminder.tenant_id,
         )
-        if callback_id:
-            try:
-                await max_client.answer_callback(
-                    str(callback_id),
-                    notification="Это напоминание не ваше.",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        await _ack_with_replacement("Это напоминание не ваше.")
         return
 
     service = HousewifeReminderService(session)
     if action == "rem_done":
         service.acknowledge(reminder)
-        toast_text = "Принято ✅"
+        replacement = (
+            f"✅ {original_text}" if original_text else "✅ Готово"
+        )
     else:  # rem_snooze
         service.snooze(reminder, minutes=SNOOZE_DEFAULT_MINUTES)
-        toast_text = f"Отложено на {SNOOZE_DEFAULT_MINUTES} мин ⏰"
+        suffix = f" (напомню через {SNOOZE_DEFAULT_MINUTES} мин)"
+        replacement = (
+            f"⏰ {original_text}{suffix}"
+            if original_text else f"⏰ Отложено{suffix}"
+        )
     session.commit()
 
-    if callback_id:
-        try:
-            await max_client.answer_callback(
-                str(callback_id), notification=toast_text,
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "max reminder cb ack failed (action=%s)", action,
-                exc_info=True,
-            )
+    await _ack_with_replacement(replacement)
 
 
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:

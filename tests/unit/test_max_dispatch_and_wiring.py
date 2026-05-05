@@ -632,11 +632,13 @@ async def test_handle_max_callback_reminder_done_completes_and_acks(
 
     assert handled is True  # inline path consumed turn
 
-    # answer_callback вызвана с toast (notification kw)
+    # answer_callback вызвана с message replacement (per MAX UX —
+    # toast notification невидим, заменяем body целиком)
     fake_max_client.answer_callback.assert_awaited_once()
     call = fake_max_client.answer_callback.call_args
     assert call.args[0] == "cb_rem_42"
-    assert "Принято" in call.kwargs.get("notification", "")
+    msg = call.kwargs.get("message", {})
+    assert "✅" in msg.get("text", "")
 
     # Reminder помечен fired + acknowledged_at set (one-shot path)
     verify = db.session()
