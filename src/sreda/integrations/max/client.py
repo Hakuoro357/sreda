@@ -42,11 +42,17 @@ def _make_pool_client() -> httpx.AsyncClient:
     """httpx.AsyncClient с conservative настройками.
 
     keepalive=0 как в TG-клиенте (lessons из incident'a 2026-04-30 — stale
-    connections через SOCKS5). MAX endpoint должен быть в ``NO_PROXY``,
-    поэтому SOCKS5 не задействован, но защищаемся от любых зомби.
+    connections через SOCKS5).
+
+    ``trust_env=False`` (Boris directive 2026-05-05): MAX endpoint
+    `platform-api.max.ru` — российский сервер, не должен ходить через
+    наш SOCKS-tunnel в Singapore (для TG/OpenAI). Прокси добавляет
+    latency и не нужен для RU-trafic. Раньше было `trust_env=True` +
+    предположение что admin поставит NO_PROXY — fragile, нашли проблему
+    после deploy. Лучше явно отключить proxy на стороне клиента.
     """
     return httpx.AsyncClient(
-        trust_env=True,
+        trust_env=False,
         timeout=httpx.Timeout(30.0, connect=10.0),
         limits=httpx.Limits(
             max_keepalive_connections=0,
