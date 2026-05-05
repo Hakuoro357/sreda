@@ -381,7 +381,10 @@ class ActionRuntimeService:
             id=f"out_{uuid4().hex[:24]}",
             tenant_id=run.tenant_id,
             workspace_id=run.workspace_id,
-            channel_type="telegram",
+            # Derived from action — see ActionEnvelope.outbox_channel.
+            # MAX failure-notifications идут через worker (status='pending'),
+            # TG inline.
+            channel_type=action.outbox_channel,
             status="pending",
             payload_json=json.dumps(
                 {
@@ -395,7 +398,9 @@ class ActionRuntimeService:
         self.session.add(outbox)
         self.session.flush()
 
-        if self.telegram_client is not None:
+        # Inline-send только для telegram (см. graph.py rationale). MAX
+        # failure rows подхватит OutboxDeliveryWorker._send_now_max.
+        if action.outbox_channel == "telegram" and self.telegram_client is not None:
             try:
                 await self.telegram_client.send_message(
                     chat_id=action.external_chat_id,

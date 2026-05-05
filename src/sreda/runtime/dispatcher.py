@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import asdict, dataclass
 
@@ -20,7 +21,43 @@ from sreda.services.eds_account_verification import (
     RETRY_CONNECT_EXTRA_CALLBACK,
     RETRY_CONNECT_PRIMARY_CALLBACK,
 )
-from sreda.services.onboarding import CONNECT_EDS_CALLBACK, TelegramOnboardingResult
+from sreda.services.onboarding import (
+    CONNECT_EDS_CALLBACK,
+    MaxOnboardingResult,
+    TelegramOnboardingResult,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def to_outbox_channel(action_channel_type: str) -> str:
+    """Map ``ActionEnvelope.channel_type`` → ``OutboxMessage.channel_type``.
+
+    Action envelopes carry surface-specific suffixes (``telegram_dm`` /
+    ``max_dm``) so AgentThread может различать DM vs group thread на
+    одном канале. OutboxMessage хранит **bare** channel-id (``telegram`` /
+    ``max``) — это то на что route'ит ``OutboxDeliveryWorker._send_now*``.
+
+    Идемпотентен — если что-то уже bare (``"telegram"``, ``"max"``),
+    возвращаем как есть.
+
+    Unknown channel types — log warning + passthrough. Не raise чтобы
+    не убить весь turn если кто-то завёл новый канал и забыл здесь
+    добавить prefix; warning видно в логах + monitor подхватит row
+    с unknown channel_type который worker не сможет route'ить
+    (status='pending' навсегда → unprocessed_outbox alert).
+    """
+    if action_channel_type.startswith("telegram"):
+        return "telegram"
+    if action_channel_type.startswith("max"):
+        return "max"
+    logger.warning(
+        "to_outbox_channel: unknown channel %r — passthrough; "
+        "outbox worker может не знать как route'ить эту row",
+        action_channel_type,
+    )
+    return action_channel_type
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +77,11 @@ class ActionEnvelope:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    @property
+    def outbox_channel(self) -> str:
+        """``OutboxMessage.channel_type`` — derived from ``channel_type``."""
+        return to_outbox_channel(self.channel_type)
 
 
 def dispatch_telegram_action(
@@ -97,6 +139,105 @@ def dispatch_telegram_action(
         source_value=message_text.strip(),
         params=params,
     )
+
+
+def dispatch_max_action(
+    *,
+    payload: dict,
+    bot_key: str,
+    onboarding: MaxOnboardingResult,
+    inbound_message_id: str | None,
+) -> ActionEnvelope | None:
+    """Build ActionEnvelope for an incoming MAX update.
+
+    Mirror semantics ``dispatch_telegram_action``:
+    - free-form text → ``conversation.chat`` (LLM)
+    - commands ``/help``, ``/status``, ``подписки`` etc. → resolved
+      to typed action via ``_resolve_command_action``
+    - callback_query for MAX (если в будущем будут inline-buttons) — TBD,
+      сейчас возвращаем None
+
+    Differences from TG dispatch:
+    - text extracted из ``message.body.text`` (см. probe Phase 0); TG
+      кладёт в ``message.text`` напрямую.
+    - ``channel_type='max_dm'`` → AgentThread separate from TG-thread даже
+      для same tenant (connected accounts видят одинаковый context но
+      разные threads — это OK, история объединяется через recall_memory).
+    - ``external_chat_id`` = ``onboarding.max_chat_id`` (string,
+      max_chat_id в БД хранится как строка).
+    """
+    if not (
+        onboarding.max_chat_id
+        and onboarding.tenant_id
+        and onboarding.workspace_id
+    ):
+        return None
+
+    # MAX: callback_data в inline-buttons — нет в текущем sprint'е
+    # (mini-app linking flow не использует chat-callback). Future:
+    # detect и рутить аналогично TG.
+    update_type = payload.get("update_type")
+    if update_type not in ("message_created", "bot_started"):
+        # Прочее (bot_added/removed, message_callback и т.д.) пропускаем.
+        return None
+
+    message_text = _extract_max_message_text(payload)
+    if not message_text:
+        # bot_started без текста ИЛИ unsupported message-type (image/voice/file).
+        # Текущее поведение — silent skip → status='ignored' в caller'е.
+        # TODO (R1 review #5): добавить TODO-action для bot_started
+        # (canned welcome) — separate task. (R1 review #6): для
+        # voice/image отправлять «I can only process text for now» вместо
+        # silent drop — separate task.
+        logger.info(
+            "max dispatch: no extractable text (update_type=%s) — ignored",
+            update_type,
+        )
+        return None
+
+    # _resolve_command_action ВКЛЮЧАЕТ free-form-text fallback на
+    # ``conversation.chat`` (см. dispatcher.py — последняя строка функции:
+    # `return "conversation.chat", {"text": message_text.strip()}`).
+    # Возвращает None ТОЛЬКО когда text пустой, что мы уже отфильтровали.
+    # Именование `_resolve_command_action` исторически misleading; не
+    # переименовываем сейчас чтобы не задеть TG path.
+    resolved_command = _resolve_command_action(message_text.strip())
+    if resolved_command is None:
+        # Defensive — fallthrough если когда-то семантика поменяется.
+        return None
+    action_type, params = resolved_command
+    return ActionEnvelope(
+        action_type=action_type,
+        tenant_id=onboarding.tenant_id,
+        workspace_id=onboarding.workspace_id,
+        assistant_id=onboarding.assistant_id,
+        user_id=onboarding.user_id,
+        channel_type="max_dm",
+        external_chat_id=str(onboarding.max_chat_id),
+        bot_key=bot_key,
+        inbound_message_id=inbound_message_id,
+        source_type="max_message",
+        source_value=message_text.strip(),
+        params=params,
+    )
+
+
+def _extract_max_message_text(payload: dict) -> str | None:
+    """Extract text из MAX message_created payload.
+
+    Probe Phase 0 закрепил: text в ``message.body.text``. Возвращаем
+    stripped не-пустой текст или None. Идемпотентно к None/missing keys.
+    """
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return None
+    body = message.get("body")
+    if not isinstance(body, dict):
+        return None
+    text = body.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return None
 
 
 def _resolve_callback_action(callback_data: str) -> tuple[str, dict] | None:

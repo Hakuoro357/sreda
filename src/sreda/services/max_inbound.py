@@ -160,20 +160,74 @@ async def _process_approved_max_turn(
 ) -> None:
     """Run the heavy approved-tenant turn for a MAX update.
 
-    Phase 3 placeholder — пока что просто log + mark processed.
-    Phase 6 свяжет с conversation graph (тот же graph что для TG).
+    Mirror ``services.telegram_inbound._process_approved_turn_locked``
+    с двумя отличиями:
+    - Нет ack flow (TG-only fire-and-forget UX). Можно добавить позже когда
+      MAX поддержит editMessageText или аналог.
+    - Нет inline-send. ``ActionRuntimeService(telegram_client=None)`` →
+      runtime пишет outbox row с ``channel_type='max'`` и status='pending';
+      ``OutboxDeliveryWorker._send_now_max`` подхватывает и доставляет
+      через ``MaxClient.send_message``.
 
-    Future: вызывать ``runtime.handlers.execute_conversation_chat`` channel-agnostic
-    с ``channel_type="max"`` и delivery routing через outbox c
-    ``max_chat_id`` recipient.
+    Per-tenant lock используем shared с TG (``_get_tenant_lock`` из
+    telegram_inbound) — если юзер связал каналы и шлёт одновременно,
+    обработка сериализуется per tenant_id чтобы conversation context
+    оставался coherent.
     """
-    logger.info(
-        "max approved turn placeholder: tenant=%s inbound=%s update_type=%s",
-        onboarding.tenant_id, inbound_message_id, payload.get("update_type"),
-    )
+    # Late imports — избегаем circular: runtime/dispatcher ← onboarding
+    # (через type hint).
+    from sreda.runtime.dispatcher import dispatch_max_action
+    from sreda.runtime.executor import ActionRuntimeService
+    from sreda.services.tenant_lock import get_tenant_lock
+
     SessionLocal = get_session_factory()
-    with SessionLocal() as session:
-        _set_processing_status(session, inbound_message_id, "processed")
+    bg_session = SessionLocal()
+    try:
+        _set_processing_status(
+            bg_session, inbound_message_id, "processing_started",
+        )
+
+        action = dispatch_max_action(
+            payload=payload,
+            bot_key=bot_key,
+            onboarding=onboarding,
+            inbound_message_id=inbound_message_id,
+        )
+        if action is None:
+            logger.info(
+                "max approved: no action resolved tenant=%s inbound=%s "
+                "update_type=%s — ignored",
+                onboarding.tenant_id, inbound_message_id,
+                payload.get("update_type"),
+            )
+            _set_processing_status(bg_session, inbound_message_id, "ignored")
+            return
+
+        tenant_lock = get_tenant_lock(onboarding.tenant_id)
+        if tenant_lock.locked():
+            logger.info(
+                "max tenant turn queued behind in-flight: tenant=%s inbound=%s",
+                onboarding.tenant_id, inbound_message_id,
+            )
+        async with tenant_lock:
+            runtime = ActionRuntimeService(bg_session, telegram_client=None)
+            queued = runtime.enqueue_action(action)
+            await runtime.process_job(queued.job_id)
+
+        _set_processing_status(bg_session, inbound_message_id, "processed")
+    except Exception:  # noqa: BLE001
+        # Symmetry с TG ``_process_approved_turn_locked``:
+        # processing_status НЕ помечается 'failed' on exception — row
+        # остаётся 'processing_started' и подхватывается monitor probe
+        # ``unprocessed_inbound`` (см. ops dashboard). Объяснение
+        # дизайн-решения: 'failed' status сделал бы row невидимым для
+        # monitor'а, а нам нужно видеть stuck inbound'ы.
+        logger.exception(
+            "max approved turn crashed: tenant=%s inbound=%s",
+            onboarding.tenant_id, inbound_message_id,
+        )
+    finally:
+        bg_session.close()
 
 
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:

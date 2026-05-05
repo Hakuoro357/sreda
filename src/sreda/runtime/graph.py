@@ -367,7 +367,11 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             tenant_id=run.tenant_id,
             workspace_id=run.workspace_id,
             user_id=action.user_id,
-            channel_type="telegram",
+            # Derived from action.channel_type (e.g. 'telegram_dm' →
+            # 'telegram', 'max_dm' → 'max'). OutboxDeliveryWorker route'ит
+            # send-вызов по этому полю — ``channel_type='max'`` идёт через
+            # _send_now_max + MaxClient, не TG path.
+            channel_type=action.outbox_channel,
             feature_key=feature_key,
             is_interactive=is_interactive,
             status="pending",
@@ -397,27 +401,36 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             # OutboxDeliveryWorker picks it up at its exit time.
             pass
         else:  # send
-            if telegram is not None:
-                try:
-                    response = await telegram.send_message(
-                        chat_id=action.external_chat_id,
-                        text=reply["text"],
-                        reply_markup=reply["reply_markup"],
-                    )
+            # Inline-send только для telegram channel (MVP). Для MAX и
+            # будущих каналов оставляем 'pending' → OutboxDeliveryWorker
+            # подхватит на следующем poll-цикле через _send_now_max
+            # (Phase 6, channel-routed delivery). Latency cost: один tick
+            # job_poll_interval_seconds. Acceptable для MVP, reduces
+            # surface area runtime'а (нет MaxClient в graph).
+            if action.outbox_channel == "telegram":
+                if telegram is not None:
+                    try:
+                        response = await telegram.send_message(
+                            chat_id=action.external_chat_id,
+                            text=reply["text"],
+                            reply_markup=reply["reply_markup"],
+                        )
+                        outbox.status = "sent"
+                        result = response.get("result") if isinstance(response, dict) else None
+                        if isinstance(result, dict):
+                            mid = result.get("message_id")
+                            tg_date = result.get("date")
+                            if isinstance(mid, int):
+                                first_send_tg_message_id = mid
+                            if isinstance(tg_date, int):
+                                first_send_tg_date = tg_date
+                    except TelegramDeliveryError:
+                        # Leave pending; delivery worker will retry.
+                        outbox.status = "pending"
+                else:
+                    # Dev/test path — no client, pretend sent.
                     outbox.status = "sent"
-                    result = response.get("result") if isinstance(response, dict) else None
-                    if isinstance(result, dict):
-                        mid = result.get("message_id")
-                        tg_date = result.get("date")
-                        if isinstance(mid, int):
-                            first_send_tg_message_id = mid
-                        if isinstance(tg_date, int):
-                            first_send_tg_date = tg_date
-                except TelegramDeliveryError:
-                    # Leave pending; delivery worker will retry.
-                    outbox.status = "pending"
-            else:
-                outbox.status = "sent"
+            # else: non-telegram channel → status='pending', worker delivers.
         outbox_items.append(outbox)
 
     # Trace emission policy: delivery worker handles anything left in
@@ -501,7 +514,7 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
         tenant_id=run.tenant_id,
         workspace_id=run.workspace_id,
         user_id=action.user_id,
-        channel_type="telegram",
+        channel_type=action.outbox_channel,
         is_interactive=action.inbound_message_id is not None,
         status="pending",
         payload_json=json.dumps(error_payload, ensure_ascii=False),
@@ -517,7 +530,9 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
 
     err_tg_message_id: int | None = None
     err_tg_date: int | None = None
-    if telegram is not None:
+    # Inline-send только для telegram (см. node_persist_replies). MAX
+    # error-replies идут через worker, status='pending' остаётся.
+    if action.outbox_channel == "telegram" and telegram is not None:
         try:
             err_response = await telegram.send_message(
                 chat_id=action.external_chat_id,

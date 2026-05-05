@@ -53,21 +53,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# 2026-04-30: per-tenant async lock — сериализует обработку нескольких
-# inbound'ов от одного tenant'а. Когда юзер шлёт 4 voice подряд (incident
-# user_tg_755682022: 4 update'а в 150мс), без лока 4 bg-task'а параллельно
-# конкурируют за SQLite/PG write → 30-90с залипы на add_checklist_items
-# / create_checklist. Lock обеспечивает последовательную обработку: 1-й
-# turn run, 2-4 ждут в очереди. Не влияет на разных юзеров.
-_TENANT_LOCKS: dict[str, asyncio.Lock] = {}
-
-
-def _get_tenant_lock(tenant_id: str) -> asyncio.Lock:
-    lock = _TENANT_LOCKS.get(tenant_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _TENANT_LOCKS[tenant_id] = lock
-    return lock
+# 2026-04-30: per-tenant async lock — выделено в ``services.tenant_lock``
+# 2026-05-05 (review R1: cross-module private import был fragile).
+# Re-export для backward compat — старые тесты импортируют ``_TENANT_LOCKS``
+# / ``_get_tenant_lock`` отсюда.
+from sreda.services.tenant_lock import (  # noqa: E402
+    _TENANT_LOCKS,
+    get_tenant_lock as _get_tenant_lock,
+)
 
 
 async def _fire_and_forget_ack(
