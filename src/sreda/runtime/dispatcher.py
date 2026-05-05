@@ -173,12 +173,42 @@ def dispatch_max_action(
     ):
         return None
 
-    # MAX: callback_data в inline-buttons — нет в текущем sprint'е
-    # (mini-app linking flow не использует chat-callback). Future:
-    # detect и рутить аналогично TG.
     update_type = payload.get("update_type")
+
+    # message_callback — юзер тапнул inline-button. Mirror TG callback path:
+    # извлекаем ``payload.callback.payload`` (это TG-эквивалент
+    # ``callback_query.data``), резолвим через _resolve_callback_action.
+    # Inline-handlers (rem_done/rem_snooze/pb/btn_reply) рутятся ВНЕ
+    # dispatcher'а — см. ``services.max_inbound._handle_max_callback``
+    # (это symmetric с TG ``services.telegram_bot._handle_callback``).
+    if update_type == "message_callback":
+        callback = payload.get("callback")
+        if not isinstance(callback, dict):
+            return None
+        callback_data = callback.get("payload")
+        if not isinstance(callback_data, str):
+            return None
+        resolved = _resolve_callback_action(callback_data)
+        if resolved is None:
+            return None
+        action_type, params = resolved
+        return ActionEnvelope(
+            action_type=action_type,
+            tenant_id=onboarding.tenant_id,
+            workspace_id=onboarding.workspace_id,
+            assistant_id=onboarding.assistant_id,
+            user_id=onboarding.user_id,
+            channel_type="max_dm",
+            external_chat_id=str(onboarding.max_chat_id),
+            bot_key=bot_key,
+            inbound_message_id=inbound_message_id,
+            source_type="max_callback",
+            source_value=callback_data,
+            params=params,
+        )
+
     if update_type not in ("message_created", "bot_started"):
-        # Прочее (bot_added/removed, message_callback и т.д.) пропускаем.
+        # Прочее (bot_added/removed и т.д.) пропускаем.
         return None
 
     message_text = _extract_max_message_text(payload)

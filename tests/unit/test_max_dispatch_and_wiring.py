@@ -312,6 +312,84 @@ def test_dispatch_max_missing_chat_id_returns_none():
     assert envelope is None
 
 
+def test_dispatch_max_callback_routes_through_resolve_callback_action():
+    """message_callback с known callback_data → ActionEnvelope.
+
+    Проверяем что ``payload.callback.payload`` (MAX-специфичный путь —
+    TG кладёт в ``callback_query.data``) extracted и резолвится через
+    тот же ``_resolve_callback_action`` что и TG.
+    """
+    from sreda.services.billing import SUBSCRIPTIONS_CALLBACK
+
+    onboarding = _make_onboarding()
+    payload = {
+        "update_type": "message_callback",
+        "timestamp": 1777994922729,
+        "callback": {
+            "callback_id": "cb_xyz",
+            "user": {"user_id": 40921122, "name": "Борис"},
+            "payload": SUBSCRIPTIONS_CALLBACK,  # known TG-style callback_data
+        },
+        "message": {
+            "recipient": {"chat_id": 320955459},
+            "body": {"mid": "mid.x"},
+            "sender": {"user_id": 290524257, "is_bot": True},
+        },
+    }
+
+    envelope = dispatch_max_action(
+        payload=payload, bot_key="sreda_max",
+        onboarding=onboarding, inbound_message_id="in_cb_1",
+    )
+
+    assert envelope is not None
+    assert envelope.action_type == "subscriptions.show"
+    assert envelope.channel_type == "max_dm"
+    assert envelope.source_type == "max_callback"
+    assert envelope.source_value == SUBSCRIPTIONS_CALLBACK
+
+
+def test_dispatch_max_callback_unknown_data_returns_none():
+    """Unknown callback_data (e.g. ``test_done``) — None, caller рутит
+    через inline-handler в max_inbound._handle_max_callback."""
+    onboarding = _make_onboarding()
+    payload = {
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_x",
+            "user": {"user_id": 40921122, "name": "Борис"},
+            "payload": "test_done",  # not in _ACTION_BY_CALLBACK
+        },
+        "message": {
+            "recipient": {"chat_id": 320955459},
+            "body": {"mid": "m"},
+            "sender": {"user_id": 290524257, "is_bot": True},
+        },
+    }
+
+    envelope = dispatch_max_action(
+        payload=payload, bot_key="sreda_max",
+        onboarding=onboarding, inbound_message_id=None,
+    )
+
+    assert envelope is None
+
+
+def test_dispatch_max_callback_missing_payload_returns_none():
+    """Malformed callback (no payload) — graceful None, не raise."""
+    onboarding = _make_onboarding()
+    payload = {
+        "update_type": "message_callback",
+        "callback": {"callback_id": "x", "user": {"user_id": 40921122}},
+        "message": {"recipient": {"chat_id": 320955459}},
+    }
+    envelope = dispatch_max_action(
+        payload=payload, bot_key="sreda_max",
+        onboarding=onboarding, inbound_message_id=None,
+    )
+    assert envelope is None
+
+
 def test_dispatch_max_voice_or_image_no_text_returns_none():
     """Probe Phase 0: MAX message без body.text (e.g. голос/картинка)
     extractор возвращает None → dispatch отдаёт None."""
@@ -458,6 +536,175 @@ async def test_process_approved_max_turn_no_dispatchable_action_marks_ignored(
     try:
         row = verify.get(InboundMessage, "in_ignore")
         assert row.processing_status == "ignored"
+    finally:
+        verify.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_max_callback_unknown_payload_acks_and_returns_false(
+    db, monkeypatch,
+):
+    """Generic callback (e.g. ``test_done``) → answer_callback вызвана,
+    handler возвращает False (caller продолжает через dispatcher).
+    """
+    from sreda.services import max_inbound
+
+    onboarding = _make_onboarding()
+    payload = {
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_test_42",
+            "user": {"user_id": 40921122, "name": "Борис"},
+            "payload": "test_done",
+        },
+        "message": {"recipient": {"chat_id": 320955459}},
+    }
+
+    fake_max_client = MagicMock()
+    fake_max_client.answer_callback = AsyncMock(return_value={"ok": True})
+
+    sess = db.session()
+    try:
+        handled = await max_inbound._handle_max_callback(
+            session=sess,
+            max_client=fake_max_client,
+            payload=payload,
+            onboarding=onboarding,
+        )
+    finally:
+        sess.close()
+
+    assert handled is False  # caller routes via dispatcher
+    fake_max_client.answer_callback.assert_awaited_once()
+    call_args = fake_max_client.answer_callback.call_args
+    assert call_args.args[0] == "cb_test_42"
+
+
+@pytest.mark.asyncio
+async def test_handle_max_callback_reminder_done_completes_and_acks(
+    db, monkeypatch,
+):
+    """``rem_done:<id>`` → FamilyReminder acknowledged + toast'ed."""
+    from datetime import datetime, timezone
+
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.services import max_inbound
+
+    setup = db.session()
+    setup.add(
+        FamilyReminder(
+            id="rem_test_1",
+            tenant_id="t1",
+            user_id=None,  # tenant-wide for test simplicity
+            title="купить молоко",
+            trigger_at=datetime.now(timezone.utc),
+            next_trigger_at=datetime.now(timezone.utc),
+            status="pending",
+        )
+    )
+    setup.commit()
+    setup.close()
+
+    onboarding = _make_onboarding()
+    payload = {
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_rem_42",
+            "user": {"user_id": 40921122, "name": "Борис"},
+            "payload": "rem_done:rem_test_1",
+        },
+        "message": {"recipient": {"chat_id": 320955459}},
+    }
+
+    fake_max_client = MagicMock()
+    fake_max_client.answer_callback = AsyncMock(return_value={"ok": True})
+
+    sess = db.session()
+    try:
+        handled = await max_inbound._handle_max_callback(
+            session=sess,
+            max_client=fake_max_client,
+            payload=payload,
+            onboarding=onboarding,
+        )
+    finally:
+        sess.close()
+
+    assert handled is True  # inline path consumed turn
+
+    # answer_callback вызвана с toast (notification kw)
+    fake_max_client.answer_callback.assert_awaited_once()
+    call = fake_max_client.answer_callback.call_args
+    assert call.args[0] == "cb_rem_42"
+    assert "Принято" in call.kwargs.get("notification", "")
+
+    # Reminder помечен fired + acknowledged_at set (one-shot path)
+    verify = db.session()
+    try:
+        rem = verify.get(FamilyReminder, "rem_test_1")
+        assert rem.acknowledged_at is not None
+        assert rem.status == "fired"
+    finally:
+        verify.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_max_callback_cross_tenant_refuses_mutation(db, monkeypatch):
+    """Callback от tenant t1, reminder в tenant t2 → refuse, не mutate."""
+    from datetime import datetime, timezone
+
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.services import max_inbound
+
+    setup = db.session()
+    setup.add(Tenant(id="t2", name="T2"))
+    setup.commit()
+    setup.add(
+        FamilyReminder(
+            id="rem_other",
+            tenant_id="t2",  # OTHER tenant
+            user_id=None,  # tenant-wide; nullable
+            title="чужое",
+            trigger_at=datetime.now(timezone.utc),
+            next_trigger_at=datetime.now(timezone.utc),
+            status="pending",
+        )
+    )
+    setup.commit()
+    setup.close()
+
+    onboarding = _make_onboarding(tenant_id="t1")
+    payload = {
+        "update_type": "message_callback",
+        "callback": {
+            "callback_id": "cb_x",
+            "user": {"user_id": 40921122},
+            "payload": "rem_done:rem_other",
+        },
+        "message": {"recipient": {"chat_id": 320955459}},
+    }
+
+    fake_max_client = MagicMock()
+    fake_max_client.answer_callback = AsyncMock(return_value={"ok": True})
+
+    sess = db.session()
+    try:
+        handled = await max_inbound._handle_max_callback(
+            session=sess,
+            max_client=fake_max_client,
+            payload=payload,
+            onboarding=onboarding,
+        )
+    finally:
+        sess.close()
+
+    assert handled is True  # inline path responds (refuse)
+    # Verify reminder UNCHANGED (status still "pending", not acked)
+    verify = db.session()
+    try:
+        rem = verify.get(FamilyReminder, "rem_other")
+        assert rem.status == "pending"  # NOT modified
+        assert rem.acknowledged_at is None
     finally:
         verify.close()
 

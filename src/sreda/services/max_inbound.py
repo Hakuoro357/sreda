@@ -482,12 +482,44 @@ async def _process_approved_max_turn(
                 onboarding.tenant_id, inbound_message_id,
             )
         async with tenant_lock:
+            # message_callback (inline-button tap): обработать ДО
+            # dispatch'а / voice. Inline-handlers (rem_done/rem_snooze/
+            # btn_reply/pb) выполняются здесь — DB updates + answer_callback
+            # — и возвращают True если turn полностью обработан. Остальные
+            # callback prefixes (billing/profile/eds) идут через dispatcher.
+            if payload.get("update_type") == "message_callback":
+                if settings.max_bot_token:
+                    max_client_cb = MaxClient(token=settings.max_bot_token)
+                    handled = await _handle_max_callback(
+                        session=bg_session,
+                        max_client=max_client_cb,
+                        payload=payload,
+                        onboarding=onboarding,
+                    )
+                    if handled:
+                        _set_processing_status(
+                            bg_session, inbound_message_id, "processed",
+                        )
+                        return
+                else:
+                    logger.warning(
+                        "max callback received but no max_bot_token; "
+                        "skipping ack — tenant=%s",
+                        onboarding.tenant_id,
+                    )
+
             # Voice → STT перед dispatch'ем. Если payload содержит audio
             # attachment, transcribe + inject text → dispatch видит обычный
             # text turn. Если voice processing бросил ошибку юзеру (no
             # token, no recognizer, etc.) — возвращает None, мы тут
             # останавливаемся.
-            if settings.max_bot_token:
+            #
+            # Skip для message_callback: callback payload не содержит
+            # audio_url (только original message с inline-buttons), STT
+            # был бы no-op-ом возвращающим payload unchanged. Code-reviewer
+            # MEDIUM 2026-05-05: убираем лишнюю работу.
+            is_callback = payload.get("update_type") == "message_callback"
+            if settings.max_bot_token and not is_callback:
                 max_client = MaxClient(token=settings.max_bot_token)
                 transcribed = await _maybe_transcribe_max_voice(
                     payload,
@@ -543,6 +575,148 @@ async def _process_approved_max_turn(
         bg_session.close()
 
 
+async def _handle_max_callback(
+    *,
+    session,
+    max_client,
+    payload: dict,
+    onboarding,
+) -> bool:
+    """Handle MAX inline-button tap.
+
+    Mirror ``services.telegram_bot._handle_callback``:
+    - rem_done:/rem_snooze: → FamilyReminder state update + ack toast
+    - btn_reply:<token> → resolve token → inject as message text → re-dispatch
+    - pb:<branch> → pending-bot tour navigation (TG-only сейчас, для MAX
+      пока silent ack)
+    - все остальные prefixes → False (caller рутит через dispatcher)
+
+    Returns True если turn полностью обработан (inline path); False если
+    caller должен продолжить через dispatch_max_action.
+
+    Best-effort на ack — если answer_callback падает, log warn но не
+    breaking. MAX не retry'ит callbacks (по нашему observation), так
+    что failed ack = silent UX miss, не loop.
+    """
+    callback = payload.get("callback")
+    if not isinstance(callback, dict):
+        return False
+    callback_id = callback.get("callback_id")
+    data = callback.get("payload")
+    if not isinstance(data, str):
+        return False
+
+    # rem_done: / rem_snooze: — reminder ack flow
+    if data.startswith("rem_done:") or data.startswith("rem_snooze:"):
+        await _handle_max_reminder_callback(
+            session=session,
+            max_client=max_client,
+            callback_id=callback_id,
+            data=data,
+            payload=payload,
+            onboarding=onboarding,
+        )
+        return True
+
+    # Прочие callbacks (billing/profile/eds/pb/btn_reply) пока — generic ack +
+    # дальше через dispatcher. pb:/btn_reply: handlers — TG-specific, для
+    # MAX отдельный issue (нет 1:1 editMessageText API parity yet).
+    if callback_id:
+        try:
+            await max_client.answer_callback(
+                str(callback_id), notification="",
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "max callback ack failed (data=%r) — continuing",
+                data, exc_info=True,
+            )
+    return False
+
+
+async def _handle_max_reminder_callback(
+    *,
+    session,
+    max_client,
+    callback_id,
+    data: str,
+    payload: dict,
+    onboarding,
+) -> None:
+    """Handle "Готово ✅" / "Отложить ⏰" buttons on a housewife reminder.
+
+    Mirror ``services.telegram_bot._handle_reminder_callback``:
+    - Lookup FamilyReminder by id
+    - acknowledge / snooze
+    - answer_callback с toast
+    - Без editMessageText (MAX edit API parity не реализован yet) —
+      cleanup keyboard через TODO в follow-up. Пока юзер видит только
+      toast от answer_callback, повторный tap корректно блокируется в
+      acknowledge() через DB state.
+    """
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.services.housewife_reminders import (
+        SNOOZE_DEFAULT_MINUTES,
+        HousewifeReminderService,
+    )
+
+    action, _, reminder_id = data.partition(":")
+    reminder = (
+        session.get(FamilyReminder, reminder_id) if reminder_id else None
+    )
+    if reminder is None:
+        if callback_id:
+            try:
+                await max_client.answer_callback(
+                    str(callback_id),
+                    notification="Это напоминание уже выполнено.",
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "max reminder cb ack failed (no reminder)",
+                    exc_info=True,
+                )
+        return
+
+    # Cross-tenant defensive check: callback payload может быть от другого
+    # tenant'а (например, юзер tapnul старую кнопку из чужого reminder'а).
+    # Не allow'аем mutate чужой reminder.
+    if reminder.tenant_id != onboarding.tenant_id:
+        logger.warning(
+            "max reminder cb cross-tenant: caller=%s reminder=%s — refused",
+            onboarding.tenant_id, reminder.tenant_id,
+        )
+        if callback_id:
+            try:
+                await max_client.answer_callback(
+                    str(callback_id),
+                    notification="Это напоминание не ваше.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
+    service = HousewifeReminderService(session)
+    if action == "rem_done":
+        service.acknowledge(reminder)
+        toast_text = "Принято ✅"
+    else:  # rem_snooze
+        service.snooze(reminder, minutes=SNOOZE_DEFAULT_MINUTES)
+        toast_text = f"Отложено на {SNOOZE_DEFAULT_MINUTES} мин ⏰"
+    session.commit()
+
+    if callback_id:
+        try:
+            await max_client.answer_callback(
+                str(callback_id), notification=toast_text,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "max reminder cb ack failed (action=%s)", action,
+                exc_info=True,
+            )
+
+
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:
     """Update inbound_messages.processing_status + commit."""
     from sreda.db.models.core import InboundMessage
@@ -554,20 +728,42 @@ def _set_processing_status(session, inbound_message_id: str, status: str) -> Non
 
 
 def _extract_max_display_name(payload: dict) -> str | None:
-    """Best-effort first/last/name из MAX payload (bot_started ИЛИ
-    message_created)."""
+    """Best-effort first/last/name из MAX payload (bot_started /
+    message_created / message_callback).
+
+    message_callback: юзер в ``payload.callback.user`` — здесь проверяем
+    ПЕРВЫМ. ``message.sender`` для callback указывает на бота → не имя
+    юзера.
+    """
+    update_type = payload.get("update_type")
+
+    # message_callback: юзер сидит в callback.user
+    if update_type == "message_callback":
+        callback = payload.get("callback")
+        if isinstance(callback, dict):
+            cb_user = callback.get("user")
+            if isinstance(cb_user, dict):
+                for key in ("name", "first_name"):
+                    value = cb_user.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+
+    # bot_started: top-level user
     user = payload.get("user")
     if isinstance(user, dict):
         for key in ("name", "first_name"):
             value = user.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-    msg = payload.get("message")
-    if isinstance(msg, dict):
-        sender = msg.get("sender")
-        if isinstance(sender, dict):
-            for key in ("name", "first_name"):
-                value = sender.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
+    # message_created: message.sender — но НЕ для message_callback,
+    # короткозамкнули выше.
+    if update_type != "message_callback":
+        msg = payload.get("message")
+        if isinstance(msg, dict):
+            sender = msg.get("sender")
+            if isinstance(sender, dict):
+                for key in ("name", "first_name"):
+                    value = sender.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
     return None

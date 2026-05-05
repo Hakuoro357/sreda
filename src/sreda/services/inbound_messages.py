@@ -276,15 +276,31 @@ def persist_max_inbound_event(
 
 def _extract_max_external_update_id(payload: dict) -> str | None:
     """Per Phase 0 probe: MAX не имеет global ``update_id``.
-    Используем ``body.mid`` для message_created; synthetic для остального.
+    Используем ``body.mid`` для message_created; ``callback.callback_id``
+    для message_callback; synthetic для остального.
+
+    NB: для message_callback мы намеренно используем ``callback_id`` как
+    dedup key, а не ``message.body.mid`` — каждый tap кнопки даёт новый
+    callback_id даже на одном и том же message, и каждый из них требует
+    отдельной обработки (separate ack + state update). Если бы ключевали
+    по mid, второй tap молча no-op'ался бы.
     """
     update_type = payload.get("update_type")
+
+    # message_callback: dedup по callback_id (уникален per tap).
+    if update_type == "message_callback":
+        callback = payload.get("callback")
+        if isinstance(callback, dict):
+            cb_id = callback.get("callback_id")
+            if cb_id:
+                return f"max:cb:{cb_id}"
+
     msg = payload.get("message")
     if isinstance(msg, dict):
         body = msg.get("body")
         if isinstance(body, dict):
             mid = body.get("mid")
-            if mid:
+            if mid and update_type != "message_callback":
                 return str(mid)
 
     # Synthetic key для bot_started / других events:
@@ -297,22 +313,56 @@ def _extract_max_external_update_id(payload: dict) -> str | None:
 
 
 def _extract_max_chat_id(payload: dict) -> int | str | None:
-    # bot_started: chat_id top-level. message_created: message.recipient.chat_id.
-    if "chat_id" in payload:
-        return payload.get("chat_id")
+    """Resolve recipient chat_id из MAX update.
+
+    Sources в order priority:
+    - message_callback: ``message.recipient.chat_id`` (callback events
+      include original message объект)
+    - bot_started: top-level ``chat_id``
+    - message_created: ``message.recipient.chat_id``
+    """
+    # message.recipient — общий путь для message_created и message_callback
     msg = payload.get("message")
     if isinstance(msg, dict):
         recipient = msg.get("recipient")
         if isinstance(recipient, dict):
-            return recipient.get("chat_id")
+            cid = recipient.get("chat_id")
+            if cid is not None:
+                return cid
+    if "chat_id" in payload:
+        return payload.get("chat_id")
     return None
 
 
 def _extract_max_sender_user_id(payload: dict) -> int | str | None:
-    # bot_started: user.user_id. message_created: message.sender.user_id.
+    """Resolve user_id of the human who triggered this update.
+
+    CRITICAL: для message_callback читаем ``payload.callback.user.user_id``
+    — это юзер, нажавший кнопку. ``message.sender`` в callback events
+    указывает на **бота** (он автор сообщения с inline-кнопками), не на
+    юзера. До 2026-05-05 этот код смотрел в message.sender и создавал
+    orphan tenant'ы под bot_id'ом — incident tenant_max_290524257
+    (bot id 290524257) вместо привязки к существующему Boris tenant.
+    """
+    update_type = payload.get("update_type")
+
+    # message_callback: юзер сидит в payload.callback.user
+    if update_type == "message_callback":
+        callback = payload.get("callback")
+        if isinstance(callback, dict):
+            cb_user = callback.get("user")
+            if isinstance(cb_user, dict):
+                uid = cb_user.get("user_id")
+                if uid is not None:
+                    return uid
+
+    # bot_started: user.user_id top-level
     user = payload.get("user")
     if isinstance(user, dict):
         return user.get("user_id")
+
+    # message_created: message.sender.user_id (для callback это БОТ,
+    # поэтому проверка update_type выше short-circuit'ит этот путь).
     msg = payload.get("message")
     if isinstance(msg, dict):
         sender = msg.get("sender")

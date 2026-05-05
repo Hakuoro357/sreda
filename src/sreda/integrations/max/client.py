@@ -435,6 +435,44 @@ class MaxClient:
                 method="audio_download", status_code=None,
             ) from exc
 
+    async def answer_callback(
+        self,
+        callback_id: str,
+        *,
+        notification: str | None = None,
+        message: dict | None = None,
+    ) -> dict:
+        """POST /answers?callback_id=... — acknowledge an inline-button tap.
+
+        TamTam/MAX equivalent of Telegram's ``answerCallbackQuery``.
+        Без ack юзер видит только индикатор «нажато» секунду — никакого
+        toast, никакого UX-feedback. Bot ОБЯЗАН ответить в течение
+        ~30 секунд иначе MAX считает callback failed.
+
+        Body schema (per MAX docs / TamTam compatibility):
+        - ``notification``: короткий toast text (опционально)
+        - ``message``: optional NewMessageBody — заменяет original
+          message с inline-кнопкой (analog editMessageText). Не
+          используем сейчас (PUT /messages для editing — отдельный path).
+
+        ``callback_id`` берём из incoming ``payload.callback.callback_id``.
+        Single-attempt без retry — повторный ack на тот же callback_id
+        вернёт error («already answered»), и retry только усугубит.
+        Timeout 5s — должен быть быстрым.
+        """
+        if not callback_id:
+            raise ValueError("answer_callback: callback_id is required")
+        params: dict[str, Any] = {"callback_id": callback_id}
+        body: dict[str, Any] = {}
+        if notification is not None:
+            body["notification"] = notification
+        if message is not None:
+            body["message"] = message
+        return await self._request(
+            "POST", "/answers",
+            params=params, json_payload=body, timeout=5.0,
+        )
+
     async def get_updates(
         self,
         *,
