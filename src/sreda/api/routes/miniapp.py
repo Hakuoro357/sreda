@@ -389,12 +389,25 @@ class EmptyBody(BaseModel):
 def miniapp_page(request: Request) -> HTMLResponse:
     settings = get_settings()
     base_url = (settings.connect_public_base_url or "").strip().rstrip("/")
+    # 2026-05-05 (Boris directive): conditional SDK injection per platform.
+    # В МАКС-WebView'е не грузим TG SDK (telegram.org cross-origin) и
+    # наоборот. Снижает cold-start time на ~50KB external script + блокирующий
+    # HTTPS connect к telegram.org из MAX-app (наблюдалось 100+с задержки).
+    # ``?platform=`` query param передаётся MAX из business.max.ru
+    # registration URL и TG mini-app menu (если когда-то начнём).
+    platform = (request.query_params.get("platform") or "telegram").lower()
+    if platform not in ("telegram", "max"):
+        platform = "telegram"  # fallback для безопасности
     template = _jinja_env.get_template("subscriptions.html")
     # Embed a server-side build stamp so we can confirm what code the
     # client actually received (iOS Telegram WebView caches aggressively
     # and bug reports sometimes involve stale HTML).
     build_stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    html = template.render(base_url=base_url, build_stamp=build_stamp)
+    html = template.render(
+        base_url=base_url,
+        build_stamp=build_stamp,
+        platform=platform,
+    )
     # no-store + no-cache forces the Telegram WebView to re-fetch every
     # time the WebApp is opened, so we never serve a stale subscriptions
     # shell after a deploy.
