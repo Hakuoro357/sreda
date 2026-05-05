@@ -7,6 +7,7 @@ from sreda.config.logging import configure_logging
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
 from sreda.features.app_registry import get_feature_registry
+from sreda.integrations.max import MaxClient
 from sreda.integrations.telegram.client import TelegramClient
 from sreda.runtime.executor import ActionRuntimeService
 from sreda.services.eds_account_verification import EDSAccountVerificationService
@@ -33,6 +34,17 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             if settings.telegram_bot_token
             else None
         )
+        # MAX client (2026-05-05): без него OutboxDeliveryWorker._send_now_max
+        # уходит в dev-stub path и помечает row 'sent' БЕЗ реальной
+        # отправки — Boris вёлся как «MAX delivered» когда на самом деле
+        # юзеру ничего не приходило. Если SREDA_MAX_BOT_TOKEN не задан,
+        # MaxClient=None — outbox row для MAX останется 'sent'-fake'ом
+        # (acceptable для dev/test envs).
+        max_client = (
+            MaxClient(settings.max_bot_token)
+            if settings.max_bot_token
+            else None
+        )
         runtime_service = ActionRuntimeService(session, telegram_client=telegram_client)
         verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
         skill_platform = SkillPlatformJobProcessor(session, registry)
@@ -40,7 +52,11 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         housewife_reminders = HousewifeReminderWorker(session)
         housewife_onboarding = HousewifeOnboardingKickoffWorker(session)
         onboarding_aha = OnboardingAhaWorker(session)
-        delivery = OutboxDeliveryWorker(session, telegram_client=telegram_client)
+        delivery = OutboxDeliveryWorker(
+            session,
+            telegram_client=telegram_client,
+            max_client=max_client,
+        )
         # Retention worker — внутренне throttle'ит до 1 раза в 24 часа,
         # state в /tmp/sreda-retention-state.json. На каждом tick
         # просто проверяет «пора ли». 152-ФЗ Часть 2.

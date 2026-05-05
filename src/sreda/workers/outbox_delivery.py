@@ -233,8 +233,37 @@ class OutboxDeliveryWorker:
         capture добавим в follow-up если нужно.
         """
         if self.max is None:
-            # Dev/test path — mark sent для unit-тестов
-            row.status = "sent"
+            # 2026-05-05 incident: prod ran без max_client (job_runner
+            # forgot to wire его) и rows для МАКС'а тихо помечались
+            # 'sent' — Boris думал bot отвечает, по факту message в
+            # МАКС не уходил. Чтобы такое больше не повторялось:
+            # отличаем dev/test (env без SREDA_MAX_BOT_TOKEN — OK,
+            # тестам нужен dev-stub) от prod-misconfig (token задан
+            # но клиент не дошёл до worker'а — alert).
+            from sreda.config.settings import get_settings as _get_settings
+            from sreda.services.admin_alerts import (
+                alert_admin_async as _alert,
+            )
+            if _get_settings().max_bot_token:
+                logger.critical(
+                    "max outbox %s: max_client=None но "
+                    "SREDA_MAX_BOT_TOKEN set — misconfiguration; "
+                    "row помечена failed чтобы не врать о delivery",
+                    row.id,
+                )
+                try:
+                    await _alert(
+                        f"🔴 MAX outbox misconfig: max_client=None в "
+                        f"worker'е, row={row.id} помечена failed. "
+                        f"Проверь job_runner.py wiring."
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("admin alert failed", exc_info=True)
+                row.status = "failed"
+            else:
+                # Dev/test path — token не настроен в env, mark sent
+                # для unit-тестов
+                row.status = "sent"
             self.session.commit()
             return
 

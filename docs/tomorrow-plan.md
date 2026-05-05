@@ -489,6 +489,25 @@ look up the just-mentioned one and add reminder to it».
 - `tests/unit/test_follow_up_reminder.py` — regression scenario
   (с conversation graph mocked LLM)
 
+#### 12.6. Misleading log «chat: fallback LLM built provider=X» 🟢
+
+**Симптом.** При обычном invoke'е LLM в логах появляется
+`chat: fallback LLM built provider=openrouter-grok ...`. Звучит как
+«мы используем fallback (т.е. primary упал)», но на самом деле это
+момент **сборки backup-instance**, не вызова. Реальный invoke идёт
+через primary (MiMo) если не было LLMCallTimeout. Меня (Boris)
+запутало 2026-05-05 при разборе MAX deploy — подумал что грок
+реально активирован.
+
+**Файл.** `src/sreda/runtime/handlers.py:1883-1886`
+
+**Fix:** переформулировать log → `chat: fallback LLM ready as backup
+provider=...` или передвинуть лог внутрь fallback-branch invoke loop'а
+(только на реальное переключение). Не делает ничего вредного, просто
+шум в диагностике.
+
+**Когда:** P3. Косметика логов, делать когда мешает.
+
 ---
 
 **Открытые блокеры.**
