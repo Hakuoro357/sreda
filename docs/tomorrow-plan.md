@@ -435,6 +435,60 @@ LLM-у через docstring + 3-4 теста.
 **Когда делать:** P3. Onboarding rough edge, но в текущем размере
 (1 юзер за 5 дней) не критично.
 
+#### 12.5. Дубликат task при follow-up reminder (Boris incident 2026-05-05) 🟡
+
+**Симптом.** Boris попросил голосом «замена колёс пятница 13:10
+Зеленоград 514 строение 1». Бот ответил «Записала! ... Нужно ли
+напоминание?». На голосовое «да напомни утром» бот создал **вторую
+задачу** с reminder вместо того чтобы привязать reminder к первой.
+
+В UI видны 2 разных entry на пятницу 8 мая 13:10:
+- «Замена колёс в сервисном центре» (без reminder, из turn 1)
+- «Замена колёс — Зеленоград 514, строение 1» (с reminder в 9:00,
+  из turn 2)
+
+**Корневая причина.** LLM не имеет тула привязать reminder к
+существующей task. На follow-up «да напомни» модель пошла по «лёгкому»
+пути — пересоздала задачу с reminder в одном tool-call'е (single-turn
+create+add). Title в turn 2 чуть отличается потому что был voice
+transcript, не точная копия.
+
+**Известный паттерн.** Тот же failure-mode что в:
+- 0.7 «Чек-листы: дубликат при single-turn create+add»
+- 12.3 «update_reminder tool отсутствует»
+
+Все три — одна корневая дыра в tool-set'е: **нет find_X + add_Y_to_X
+тулов**, бот вынужден create_X_with_Y которое в follow-up turn'е
+дублирует.
+
+**Fix (минимум):**
+- `find_task_by_text(query, tenant_id) → task_id | None` —
+  semantic search по recent tasks
+- `add_reminder_to_task(task_id, when, advance_minutes)` —
+  привязка reminder к существующей task без re-create
+- `update_task_metadata(task_id, address|notes|title)` —
+  если из голоса пришли уточнения
+
+Plus prompt-level addendum: «when user says "да напомни" or similar
+follow-up to a confirmation question — DO NOT create a new task,
+look up the just-mentioned one and add reminder to it».
+
+**Acceptance.** Multi-turn flow:
+1. «замена колёс пятница 13:10 …» → 1 task created
+2. «да напомни утром» → reminder added to existing task, **0 new tasks**
+3. БД: ровно 1 row в `tasks` с linked_reminder_id
+
+**Когда делать:** P2. После того как несколько юзеров репортят
+дубли — будет видна частота. Pre-existing prod-state у Boris'а:
+2 задачи 8 мая, не чистим (Boris решил не трогать БД).
+
+**Файлы:**
+- `src/sreda/runtime/handlers.py` — добавить find_task / add_reminder
+  тулы
+- `src/sreda/runtime/tools/...` — новый tool registration
+- `tests/unit/test_follow_up_reminder.py` — regression scenario
+  (с conversation graph mocked LLM)
+
 ---
 
 **Открытые блокеры.**
