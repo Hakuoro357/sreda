@@ -215,6 +215,32 @@ class MaxClient:
             params=params, json_payload=payload, timeout=10.0,
         )
 
+    # Allowlist для signed URL хостов MAX (probe 2026-05-05). Если MAX
+    # начнёт раздавать с других CDN — добавлять явно. Codex R1 review
+    # CRITICAL #1: без allowlist'а download_audio это SSRF vector.
+    _ALLOWED_AUDIO_HOSTS: frozenset[str] = frozenset({
+        "a.oneme.ru",
+    })
+    # ~30s OGG/Opus 16kbps mono ≈ 60KB; 1MB = generous cap для MAX'овых
+    # voice-длительностей. Yandex sync REST API лимит — 30s аудио;
+    # держим UX-промис в линии с этим (codex R1 MAJOR #4).
+    _MAX_AUDIO_DOWNLOAD_BYTES: int = 1_000_000
+
+    @staticmethod
+    def _redact_audio_url(url: str) -> str:
+        """Strip query string before logging (codex R1 MAJOR #2).
+
+        Signed URL содержит ``signatureToken=...&expires=...`` в query —
+        leak'аются в logs/proxy/error messages. Возвращаем только
+        scheme://host/path для diagnostic, ``?<redacted>`` суффикс.
+        """
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+            sp = urlsplit(url)
+            return urlunsplit((sp.scheme, sp.netloc, sp.path, "", "")) + "?<redacted>"
+        except Exception:  # noqa: BLE001
+            return "<unparsable-url>"
+
     async def download_audio(self, url: str, *, timeout: float = 15.0) -> bytes:
         """Download voice/audio attachment from a signed MAX URL.
 
@@ -229,35 +255,110 @@ class MaxClient:
         <token>`` может быть подозрительным для CDN. Используем чистый
         httpx-клиент без наших headers.
 
-        Returns raw audio bytes. Raises ``MaxDeliveryError`` на network
-        ошибки и не-200 status.
+        Security (codex R1 review applied):
+        - Host allowlist: scheme должен быть https И host ∈
+          ``_ALLOWED_AUDIO_HOSTS``. Любой другой URL → ``ValueError``.
+          Защищает от SSRF если webhook payload подделан.
+        - Streaming download с early-abort при превышении
+          ``_MAX_AUDIO_DOWNLOAD_BYTES`` — нельзя забить память
+          злонамеренной 1GB-respond'ом.
+        - ``follow_redirects=False`` — redirect на private IP / другой
+          host обходит host check'и. Если MAX когда-нибудь начнёт
+          редиректить — нужен per-redirect re-check.
+        - URL redaction в error messages — query string содержит signed
+          token, не должен утекать в логи.
+
+        Returns raw audio bytes (≤ ``_MAX_AUDIO_DOWNLOAD_BYTES``).
+        Raises ``MaxDeliveryError`` на network/non-200/oversize.
+        Raises ``ValueError`` на untrusted URL host.
         """
         import httpx as _httpx
+        from urllib.parse import urlsplit
 
+        # 1. Host allowlist (CRITICAL — anti-SSRF)
+        try:
+            sp = urlsplit(url)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"audio url unparsable: {exc}") from exc
+        if sp.scheme != "https" or sp.hostname not in self._ALLOWED_AUDIO_HOSTS:
+            raise ValueError(
+                f"audio url host not in allowlist: {sp.hostname!r} "
+                f"(allowed: {sorted(self._ALLOWED_AUDIO_HOSTS)})"
+            )
+
+        redacted = self._redact_audio_url(url)
+        max_bytes = self._MAX_AUDIO_DOWNLOAD_BYTES
+
+        # 2. Streaming download с early abort (CRITICAL — anti-DoS)
+        # Codex R2 fixes:
+        # - ``trust_env=False`` — signed URL не должен уходить через env
+        #   proxy (HTTP_PROXY / HTTPS_PROXY). Прод может иметь общий SOCKS
+        #   tunnel для TG/MAX API, но MAX CDN (a.oneme.ru) — отдельный
+        #   путь который НЕ через тоннель (мы сами для тестового VDS
+        #   так настроили), и signed token попадал в proxy logs.
+        # - non-200 body теперь bounded read (не ``aread()`` весь body) —
+        #   defence in depth от large error response DoS.
         try:
             async with _httpx.AsyncClient(
                 timeout=_httpx.Timeout(timeout, connect=5.0),
-                trust_env=True,
+                trust_env=False,
+                follow_redirects=False,  # MINOR — host check'и не обходятся
             ) as client:
-                resp = await client.get(url)
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code != 200:
+                        # Bounded read на error body (max 1KB).
+                        err_chunks: list[bytes] = []
+                        err_total = 0
+                        try:
+                            async for chunk in resp.aiter_bytes(chunk_size=1024):
+                                err_total += len(chunk)
+                                err_chunks.append(chunk)
+                                if err_total >= 1024:
+                                    break
+                            body = (
+                                b"".join(err_chunks)[:1024]
+                                .decode("utf-8", errors="replace")
+                            )
+                        except Exception:  # noqa: BLE001
+                            body = "<unreadable>"
+                        raise MaxDeliveryError(
+                            f"audio download {resp.status_code} "
+                            f"url={redacted}: {body}",
+                            method="audio_download",
+                            status_code=resp.status_code,
+                        )
+
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > max_bytes:
+                            # Прерываем чтение — больше не качаем; client
+                            # context-manager закроет соединение в exit.
+                            raise MaxDeliveryError(
+                                f"audio download exceeds cap "
+                                f"{max_bytes} bytes (got >{total}) "
+                                f"url={redacted}",
+                                method="audio_download_oversize",
+                                status_code=413,  # synthetic — request too large
+                            )
+                        chunks.append(chunk)
+                    return b"".join(chunks)
         except _httpx.TimeoutException as exc:
             raise MaxDeliveryError(
-                f"audio download timeout: {exc}",
+                f"audio download timeout url={redacted}",
                 method="audio_download", status_code=None,
             ) from exc
         except _httpx.RequestError as exc:
+            # Не включаем exc-text напрямую — может содержать URL
+            # с signature. Класс exception'а достаточно informative.
             raise MaxDeliveryError(
-                f"audio download network: {exc}",
+                f"audio download network ({type(exc).__name__}) "
+                f"url={redacted}",
                 method="audio_download", status_code=None,
             ) from exc
-
-        if resp.status_code != 200:
-            body = resp.text[:300] if resp.text else "<empty>"
-            raise MaxDeliveryError(
-                f"audio download {resp.status_code}: {body}",
-                method="audio_download", status_code=resp.status_code,
-            )
-        return resp.content
 
     async def get_updates(
         self,

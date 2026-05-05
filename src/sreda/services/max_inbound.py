@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING
 from sreda.config.settings import get_settings
 from sreda.db.models.core import Tenant
 from sreda.db.session import get_session_factory
+from sreda.integrations.max import MaxClient
+from sreda.integrations.max.client import MaxDeliveryError
 from sreda.services.inbound_messages import persist_max_inbound_event
 from sreda.services.onboarding import ensure_max_user_bundle
 
@@ -152,7 +154,17 @@ async def handle_max_update(
 
 
 _VOICE_FEATURE_KEY = "voice_transcription"
-_VOICE_MAX_BYTES = 2_000_000  # ~2MB, ≈60s OGG/Opus 16kbps mono
+# Cap shared с MaxClient._MAX_AUDIO_DOWNLOAD_BYTES чтобы UX-сообщение
+# «до 30 секунд» не разъехалось с фактическим streaming early-abort'ом
+# (codex R3 MINOR — раньше cap дублировался, мог разойтись при правке).
+# 1MB ≈ 30s OGG/Opus 16kbps mono — выровнено с Yandex sync STT 30s limit
+# (codex R1 MAJOR #4). MaxClient импортирован module-level (codex R4
+# MINOR — было late import после function defs, ruff E402).
+# NB: byte-cap проверка в _maybe_transcribe_max_voice сама по себе
+# unreachable т.к. download_audio aborts streaming раньше — её
+# оставляем как defence-in-depth, но реальный «слишком длинное» UX
+# идёт через ловлю MaxDeliveryError(status_code=413).
+_VOICE_MAX_BYTES = MaxClient._MAX_AUDIO_DOWNLOAD_BYTES
 
 
 def _extract_max_voice_url(payload: dict) -> str | None:
@@ -161,12 +173,22 @@ def _extract_max_voice_url(payload: dict) -> str | None:
     Probe 2026-05-05: MAX voice update has empty body.text and
     ``body.attachments[].type == "audio"`` with payload.url — signed URL
     ready for direct httpx GET (no auth header, signature in query).
+
+    Codex R1 MAJOR #8: если ``body.text`` non-empty (audio с caption),
+    воспринимаем text как намерение юзера; voice processing skip'аем
+    чтобы не overwrite'ить caption нашим STT. Юзер может прислать audio
+    с подписью где caption — то что хочет сказать боту, а audio просто
+    file. Возвращаем None в этом случае.
     """
     msg = payload.get("message")
     if not isinstance(msg, dict):
         return None
     body = msg.get("body")
     if not isinstance(body, dict):
+        return None
+    # Каптион имеет приоритет — не лезем с STT
+    text = body.get("text")
+    if isinstance(text, str) and text.strip():
         return None
     attachments = body.get("attachments")
     if not isinstance(attachments, list):
@@ -188,15 +210,21 @@ async def _maybe_transcribe_max_voice(
     session,
     max_client,
     onboarding,
+    inbound_message_id: str | None = None,
 ) -> dict | None:
     """If MAX payload contains audio attachment, transcribe → inject text.
 
     Mirror ``services.telegram_bot._maybe_transcribe_voice`` с deltas:
     - Detection: ``body.attachments[].type=='audio'`` (не ``message.voice``)
-    - Download: один httpx GET signed URL (не двухступенчатый ``getFile``)
-    - Duration limit: byte-cap (~2MB ≈ 60s) т.к. MAX не возвращает
-      duration в payload
-    - Error replies via ``max_client.send_message`` inline (MVP, как TG)
+    - Download: один streaming httpx GET signed URL (не двухступенчатый
+      ``getFile``), early-abort на > _VOICE_MAX_BYTES (1MB ≈ 30s OGG/Opus
+      mono — выровнено с Yandex sync STT 30s limit)
+    - Duration limit: 1MB byte-cap (codex R3) — proxy для duration т.к.
+      MAX не возвращает duration в payload. Превышение → MaxClient
+      raises MaxDeliveryError(status_code=413) → user видит «слишком
+      длинное», не generic «не удалось получить» (codex R4)
+    - Error replies via ``max_client.send_message`` inline (MVP, как TG;
+      outbox-based typed error queue — отдельный follow-up)
 
     Returns:
         Updated payload (с injected ``message.body.text``) — продолжаем
@@ -259,20 +287,67 @@ async def _maybe_transcribe_max_voice(
     with trace.step("voice.download", provider="max") as _dl_meta:
         try:
             audio_bytes = await max_client.download_audio(audio_url)
-        except Exception as exc:  # noqa: BLE001
+        except MaxDeliveryError as exc:
+            # codex R4 MAJOR new: oversize specifically — download_audio
+            # streaming-обрывает на > _MAX_AUDIO_DOWNLOAD_BYTES и raises
+            # status_code=413. Без этой ветки юзер видел generic
+            # «не удалось получить» вместо точного «слишком длинное».
+            if exc.status_code == 413:
+                logger.info(
+                    "max voice oversize: tenant=%s — sending too-long error",
+                    tenant_id,
+                )
+                await _send_error(
+                    "Голосовое слишком длинное. "
+                    "Отправь покороче (до ~30 секунд)."
+                )
+                _dl_meta["status"] = "too_long"
+                return None
             logger.warning("max voice download failed: %s", exc)
             await _send_error(
                 "Не удалось получить голосовое сообщение. Отправь ещё раз."
             )
             _dl_meta["status"] = "download_failed"
             return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("max voice download crashed: %s", exc)
+            await _send_error(
+                "Не удалось получить голосовое сообщение. Отправь ещё раз."
+            )
+            _dl_meta["status"] = "download_crashed"
+            return None
         _dl_meta["bytes_in"] = len(audio_bytes)
+        # Codex R2 MAJOR #3 partial fix: capture audio magic bytes для
+        # diagnostic. Если в проде увидим что MAX шлёт не-OGG/Opus —
+        # узнаем какой формат и сможем добавить provider routing
+        # (groq поддерживает шире, yandex — только OGG/Opus). Без этого
+        # SpeechRecognitionError было бы единственным сигналом.
+        if audio_bytes:
+            magic = audio_bytes[:4]
+            _dl_meta["magic_hex"] = magic.hex()
+            # Известные signatures:
+            # b"OggS" → OGG/Opus (TG/MAX expected)
+            # b"RIFF" → WAV
+            # b"ID3\x03" / b"\xFF\xFB" → MP3
+            # b"ftyp" (offset 4) → MP4/M4A
+            if magic.startswith(b"OggS"):
+                _dl_meta["format_guess"] = "ogg"
+            elif magic == b"RIFF":
+                _dl_meta["format_guess"] = "wav"
+            elif magic.startswith(b"ID3") or magic.startswith(b"\xff\xfb"):
+                _dl_meta["format_guess"] = "mp3"
+            elif len(audio_bytes) > 8 and audio_bytes[4:8] == b"ftyp":
+                _dl_meta["format_guess"] = "mp4_m4a"
+            else:
+                _dl_meta["format_guess"] = "unknown"
 
         # Byte-cap (proxy для duration т.к. MAX не возвращает duration).
+        # Codex R1 MAJOR #4: 30s STT limit (Yandex sync REST) — UX-фраза
+        # выровнена с реальным provider'ским ограничением.
         if len(audio_bytes) > _VOICE_MAX_BYTES:
             await _send_error(
                 "Голосовое слишком длинное. "
-                "Отправь покороче (до ~60 секунд)."
+                "Отправь покороче (до ~30 секунд)."
             )
             _dl_meta["status"] = "too_long"
             return None
@@ -292,7 +367,60 @@ async def _maybe_transcribe_max_voice(
         _trace_meta["chars_out"] = len(text)
         _trace_meta["status"] = "ok"
 
-    # 6. Record budget usage (1 credit per voice)
+    # Codex R5 MINOR fix: ordering — persist transcript ПЕРВЫМ, budget
+    # ВТОРЫМ. Reasoning: если sanitize/persist бросит → except + rollback
+    # → НЕ хотим charge юзера за un-persisted transcript. Если budget
+    # бросит → transcript уже сохранён, juser получит ответ — потеря
+    # 1 credit'а accounting'а acceptable (re-import через admin tool).
+    # Раньше budget был перед persist — risk «charge без transcript'а»
+    # на rollback'е.
+
+    # 6. Persist sanitized transcript на inbound row (codex R1 MAJOR #6).
+    # Если процесс крашнется после STT но до завершения turn'а — без
+    # этой записи мы потеряли transcript (signed URL уже истечёт через 24h
+    # и retry скачать не сможем). С persist'ом — у нас есть text для
+    # ручного re-process'инга через admin tool.
+    if inbound_message_id is not None:
+        try:
+            from sreda.db.models.core import InboundMessage
+            from sreda.services.privacy_guard import get_default_privacy_guard
+
+            # TextSanitizationResult API (codex R2 fix — было `.matches`,
+            # его не существует, AttributeError упал бы в except и persist
+            # тихо не работал). Реальные attrs: ``entities`` (list) +
+            # ``contains_sensitive_data`` property.
+            sanitized_result = get_default_privacy_guard().sanitize_text(text)
+            sanitized_text = (
+                sanitized_result.sanitized_text if sanitized_result else None
+            )
+            row = session.get(InboundMessage, inbound_message_id)
+            if row is not None:
+                row.message_text_sanitized = sanitized_text
+                if (
+                    sanitized_result is not None
+                    and sanitized_result.contains_sensitive_data
+                ):
+                    row.contains_sensitive_data = True
+                session.commit()
+        except Exception:  # noqa: BLE001
+            # Не убиваем turn если persist не удался — text уже в payload
+            # для in-memory dispatch'а.
+            logger.warning(
+                "max voice: transcript persist failed for inbound=%s",
+                inbound_message_id, exc_info=True,
+            )
+            session.rollback()
+
+    # 7. Inject text into payload — downstream dispatch_max_action видит
+    # обычный text turn (``_extract_max_message_text`` читает body.text).
+    msg = payload.get("message")
+    if isinstance(msg, dict):
+        body = msg.setdefault("body", {})
+        if isinstance(body, dict):
+            body["text"] = text
+
+    # 8. Record budget usage — после persist'а (codex R5 ordering fix).
+    # Если сюда дошли — STT и persist прошли; charge корректно.
     from sreda.services.budget import BudgetService
     BudgetService(session).record_api_usage(
         tenant_id=tenant_id,
@@ -302,13 +430,6 @@ async def _maybe_transcribe_max_voice(
         credits_consumed=1,
     )
 
-    # 7. Inject text — downstream dispatch_max_action подхватит как
-    # обычный text turn (``_extract_max_message_text`` читает body.text).
-    msg = payload.get("message")
-    if isinstance(msg, dict):
-        body = msg.setdefault("body", {})
-        if isinstance(body, dict):
-            body["text"] = text
     return payload
 
 
@@ -336,8 +457,7 @@ async def _process_approved_max_turn(
     оставался coherent.
     """
     # Late imports — избегаем circular: runtime/dispatcher ← onboarding
-    # (через type hint).
-    from sreda.integrations.max import MaxClient
+    # (через type hint). MaxClient теперь module-level (codex R4 fix).
     from sreda.runtime.dispatcher import dispatch_max_action
     from sreda.runtime.executor import ActionRuntimeService
     from sreda.services.tenant_lock import get_tenant_lock
@@ -350,43 +470,11 @@ async def _process_approved_max_turn(
             bg_session, inbound_message_id, "processing_started",
         )
 
-        # Voice → STT перед dispatch'ем. Если payload содержит audio
-        # attachment, transcribe + inject text → dispatch видит обычный
-        # text turn. Если voice processing бросил ошибку юзеру (no token,
-        # no recognizer, etc.) — возвращает None, мы тут останавливаемся.
-        if settings.max_bot_token:
-            max_client = MaxClient(token=settings.max_bot_token)
-            transcribed = await _maybe_transcribe_max_voice(
-                payload,
-                session=bg_session,
-                max_client=max_client,
-                onboarding=onboarding,
-            )
-            if transcribed is None:
-                # Error reply отправлен юзеру inline. Помечаем как
-                # ignored — turn закончен, не запускаем conversation graph.
-                _set_processing_status(
-                    bg_session, inbound_message_id, "ignored",
-                )
-                return
-            payload = transcribed
-
-        action = dispatch_max_action(
-            payload=payload,
-            bot_key=bot_key,
-            onboarding=onboarding,
-            inbound_message_id=inbound_message_id,
-        )
-        if action is None:
-            logger.info(
-                "max approved: no action resolved tenant=%s inbound=%s "
-                "update_type=%s — ignored",
-                onboarding.tenant_id, inbound_message_id,
-                payload.get("update_type"),
-            )
-            _set_processing_status(bg_session, inbound_message_id, "ignored")
-            return
-
+        # Codex R1 MAJOR #5: voice STT идёт ВНУТРИ tenant_lock'а.
+        # До рефакторинга STT (1-3s сетевой+CPU) был ДО lock'а — если
+        # юзер шлёт быстро voice + text, text-turn мог обогнать voice,
+        # порядок conversation history стал бы реверсивен. Теперь оба
+        # turn'а serialize'аются per tenant_id.
         tenant_lock = get_tenant_lock(onboarding.tenant_id)
         if tenant_lock.locked():
             logger.info(
@@ -394,6 +482,47 @@ async def _process_approved_max_turn(
                 onboarding.tenant_id, inbound_message_id,
             )
         async with tenant_lock:
+            # Voice → STT перед dispatch'ем. Если payload содержит audio
+            # attachment, transcribe + inject text → dispatch видит обычный
+            # text turn. Если voice processing бросил ошибку юзеру (no
+            # token, no recognizer, etc.) — возвращает None, мы тут
+            # останавливаемся.
+            if settings.max_bot_token:
+                max_client = MaxClient(token=settings.max_bot_token)
+                transcribed = await _maybe_transcribe_max_voice(
+                    payload,
+                    session=bg_session,
+                    max_client=max_client,
+                    onboarding=onboarding,
+                    inbound_message_id=inbound_message_id,
+                )
+                if transcribed is None:
+                    # Error reply отправлен юзеру inline. Помечаем как
+                    # ignored — turn закончен, не запускаем conversation graph.
+                    _set_processing_status(
+                        bg_session, inbound_message_id, "ignored",
+                    )
+                    return
+                payload = transcribed
+
+            action = dispatch_max_action(
+                payload=payload,
+                bot_key=bot_key,
+                onboarding=onboarding,
+                inbound_message_id=inbound_message_id,
+            )
+            if action is None:
+                logger.info(
+                    "max approved: no action resolved tenant=%s inbound=%s "
+                    "update_type=%s — ignored",
+                    onboarding.tenant_id, inbound_message_id,
+                    payload.get("update_type"),
+                )
+                _set_processing_status(
+                    bg_session, inbound_message_id, "ignored",
+                )
+                return
+
             runtime = ActionRuntimeService(bg_session, telegram_client=None)
             queued = runtime.enqueue_action(action)
             await runtime.process_job(queued.job_id)
