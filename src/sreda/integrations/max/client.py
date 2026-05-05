@@ -435,6 +435,43 @@ class MaxClient:
                 method="audio_download", status_code=None,
             ) from exc
 
+    async def delete_message(self, message_id: str) -> dict:
+        """DELETE /messages?message_id=<mid> — remove a message.
+
+        Probe 2026-05-05 PM: confirmed working, returns ``{"success": true}``.
+        Used для clean-chat UX (delete ack message after real reply lands).
+        """
+        if not message_id:
+            raise ValueError("delete_message: message_id is required")
+        return await self._request(
+            "DELETE", "/messages",
+            params={"message_id": message_id}, timeout=5.0,
+        )
+
+    async def edit_message(
+        self,
+        message_id: str,
+        *,
+        text: str,
+        attachments: list[dict] | None = None,
+    ) -> dict:
+        """PUT /messages?message_id=<mid> — replace a message in-place.
+
+        Probe 2026-05-05 PM: confirmed working. Used для editMessage flow
+        (e.g. transform ack "Думаю..." into real reply без второго
+        message в chat).
+        """
+        if not message_id:
+            raise ValueError("edit_message: message_id is required")
+        body: dict[str, Any] = {"text": text}
+        if attachments is not None:
+            body["attachments"] = attachments
+        return await self._request(
+            "PUT", "/messages",
+            params={"message_id": message_id},
+            json_payload=body, timeout=10.0,
+        )
+
     async def answer_callback(
         self,
         callback_id: str,

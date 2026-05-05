@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from sreda.config.settings import get_settings
@@ -465,6 +466,8 @@ async def _process_approved_max_turn(
     SessionLocal = get_session_factory()
     bg_session = SessionLocal()
     settings = get_settings()
+    # Cut-off time для outbox correlation (используется в ack delete polling).
+    turn_started_at = datetime.now(timezone.utc)
     try:
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
@@ -537,6 +540,36 @@ async def _process_approved_max_turn(
                     return
                 payload = transcribed
 
+            # Ack message — UX parity с TG: показываем «⏳ Работаю…» как
+            # только начали обработку, чтобы юзер не молча ждал 5-15s
+            # пока LLM думает + outbox doставляет. Boris directive
+            # 2026-05-05: «ack сообщение делаем».
+            #
+            # Conditions (mirror TG):
+            # - не для callback events (там answer_callback уже UX-feedback)
+            # - не для new users (у них welcome-flow вместо ack)
+            # - только если у нас есть токен для send'а
+            #
+            # Fire-and-forget — не блокируем main turn. После turn
+            # удаляем ack message чтобы chat остался clean (одно
+            # bot-message per turn).
+            ack_task: asyncio.Task | None = None
+            if (
+                settings.max_bot_token
+                and not is_callback
+                and not onboarding.is_new_user
+            ):
+                from sreda.services.ack_messages import pick_ack
+                ack_text = pick_ack()
+                ack_task = asyncio.create_task(
+                    _send_max_ack(
+                        token=settings.max_bot_token,
+                        chat_id=str(onboarding.max_chat_id),
+                        text=ack_text,
+                    ),
+                    name=f"max_ack:{onboarding.max_chat_id}",
+                )
+
             action = dispatch_max_action(
                 payload=payload,
                 bot_key=bot_key,
@@ -550,6 +583,19 @@ async def _process_approved_max_turn(
                     onboarding.tenant_id, inbound_message_id,
                     payload.get("update_type"),
                 )
+                # Не оставляем ack-message в чате если turn оказался
+                # ignored — юзер увидит «⏳ Работаю…» и пустоту.
+                if ack_task is not None:
+                    asyncio.create_task(
+                        _wait_ack_then_delete(
+                            ack_task=ack_task,
+                            token=settings.max_bot_token,
+                            wait_for_delivery=False,
+                            tenant_id=onboarding.tenant_id,
+                            turn_started_at=turn_started_at,
+                        ),
+                        name=f"max_ack_del:{inbound_message_id}",
+                    )
                 _set_processing_status(
                     bg_session, inbound_message_id, "ignored",
                 )
@@ -558,6 +604,22 @@ async def _process_approved_max_turn(
             runtime = ActionRuntimeService(bg_session, telegram_client=None)
             queued = runtime.enqueue_action(action)
             await runtime.process_job(queued.job_id)
+
+            # После main turn — спавним cleanup'у ack message.
+            # Polls outbox для tenant_id+since (start of turn), max 15s,
+            # потом DELETE /messages. Если delivery failed — ack
+            # остаётся (юзер видит «⏳ Работаю…», знает что бот пытался).
+            if ack_task is not None:
+                asyncio.create_task(
+                    _wait_ack_then_delete(
+                        ack_task=ack_task,
+                        token=settings.max_bot_token,
+                        wait_for_delivery=True,
+                        tenant_id=onboarding.tenant_id,
+                        turn_started_at=turn_started_at,
+                    ),
+                    name=f"max_ack_del:{inbound_message_id}",
+                )
 
         _set_processing_status(bg_session, inbound_message_id, "processed")
     except Exception:  # noqa: BLE001
@@ -573,6 +635,125 @@ async def _process_approved_max_turn(
         )
     finally:
         bg_session.close()
+
+
+async def _send_max_ack(
+    *, token: str, chat_id: str, text: str,
+) -> str | None:
+    """Send одну ack-фразу в МАКС, возвращаем mid для последующего delete.
+
+    Mirror ``services.telegram_inbound._fire_and_forget_ack``. Failures
+    swallowed — ack это UX sugar, не correctness-critical signal.
+    """
+    try:
+        client = MaxClient(token=token)
+        response = await client.send_message(
+            recipient={"chat_id": chat_id}, text=text,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("max ack send failed: %s", exc)
+        return None
+    # Probe 2026-05-05 PM: response shape `{"message": {"body": {"mid": ...}, ...}}`
+    msg = response.get("message") if isinstance(response, dict) else None
+    if not isinstance(msg, dict):
+        return None
+    body = msg.get("body")
+    if not isinstance(body, dict):
+        return None
+    mid = body.get("mid")
+    return str(mid) if mid else None
+
+
+async def _wait_ack_then_delete(
+    *,
+    ack_task: asyncio.Task,
+    token: str,
+    wait_for_delivery: bool,
+    tenant_id: str,
+    turn_started_at: datetime,
+) -> None:
+    """Wait for ack send to finish, then DELETE the ack message.
+
+    Args:
+        ack_task: задача ``_send_max_ack`` — её результат = ack mid (или None).
+        wait_for_delivery: True для normal turns — polls outbox row
+            делая sure что real reply already delivered (clean-chat UX —
+            ack исчезает только когда появляется real reply).
+            False для ignored/early-exit turns — delete сразу (нет real
+            reply на pending).
+        tenant_id: для polling outbox row delivery (per-tenant scoped).
+        turn_started_at: cut-off time для поиска outbox row этого turn'а.
+
+    Best-effort throughout. Любая ошибка → log debug + return.
+    Timeout 15s overall — если delivery worker завис, ack остаётся.
+    """
+    try:
+        ack_mid = await asyncio.wait_for(asyncio.shield(ack_task), timeout=10.0)
+    except asyncio.TimeoutError:
+        logger.debug("max ack send timeout — leaving ack visible")
+        return
+    except Exception:  # noqa: BLE001
+        logger.debug("max ack task failed", exc_info=True)
+        return
+    if not ack_mid:
+        return  # ack send failed; nothing to delete
+
+    if wait_for_delivery:
+        delivered = await _wait_outbox_delivered_for_tenant(
+            tenant_id=tenant_id, since=turn_started_at, timeout_s=15.0,
+        )
+        if not delivered:
+            logger.info(
+                "max ack cleanup: outbox not delivered after 15s — "
+                "leaving ack mid=%s visible (tenant=%s)",
+                ack_mid, tenant_id,
+            )
+            return
+
+    try:
+        client = MaxClient(token=token)
+        await client.delete_message(ack_mid)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("max ack delete failed (mid=%s): %s", ack_mid, exc)
+
+
+async def _wait_outbox_delivered_for_tenant(
+    *, tenant_id: str, since: datetime, timeout_s: float = 15.0,
+) -> bool:
+    """Poll outbox_messages для tenant'а до status='sent' (channel=max).
+
+    NB: OutboxMessage не имеет inbound_message_id column, поэтому
+    correlation by tenant_id + created_at > since (start of turn) +
+    channel='max'. В edge cases (overlapping turns) может surface
+    false-positive (early ack delete на другой outbox row), но per-tenant
+    lock сериализует turn'ы, так что overlap unlikely.
+
+    Returns True если хотя бы одна row 'sent', False если timeout.
+    """
+    from sqlalchemy import select
+
+    from sreda.db.models.core import OutboxMessage
+
+    SessionLocal = get_session_factory()
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            with SessionLocal() as poll_sess:
+                row = poll_sess.scalars(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.channel_type == "max",
+                        OutboxMessage.status == "sent",
+                        OutboxMessage.created_at >= since,
+                    ).limit(1)
+                ).first()
+                if row is not None:
+                    return True
+        except Exception:  # noqa: BLE001
+            logger.debug("max ack outbox poll crashed", exc_info=True)
+            return False
+        await asyncio.sleep(0.3)
+    return False
 
 
 async def _handle_max_callback(
