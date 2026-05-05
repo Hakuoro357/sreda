@@ -126,10 +126,35 @@ class HousewifeOnboardingKickoffWorker:
         """Send intro + flip status. Returns True if an outbox row was
         enqueued; False on soft failures (no chat binding, no workspace)
         so the caller can decide whether to count it."""
-        chat_id = self._resolve_chat_id(user_id, tenant_id)
-        if not chat_id:
+        from sreda.services.channel_routing import resolve_outbox_routing
+        from sreda.db.models.core import Tenant as _Tenant
+
+        tenant = self.session.get(_Tenant, tenant_id)
+        user = self.session.get(User, user_id)
+        routing = resolve_outbox_routing(self.session, tenant=tenant, user=user)
+        if routing is None:
+            # Fallback: любой user под tenant с любым binding
+            fallback_user = (
+                self.session.query(User)
+                .filter(
+                    User.tenant_id == tenant_id,
+                    (
+                        User.telegram_account_id.is_not(None)
+                        | User.max_account_id.is_not(None)
+                    ),
+                )
+                .order_by(User.id.asc())
+                .first()
+            )
+            if fallback_user is not None:
+                routing = resolve_outbox_routing(
+                    self.session, tenant=tenant, user=fallback_user,
+                )
+
+        if routing is None:
             logger.warning(
-                "housewife_onboarding: no telegram binding for tenant=%s user=%s, skipping",
+                "housewife_onboarding: no deliverable channel "
+                "(нет TG/MAX account) tenant=%s user=%s, skipping",
                 tenant_id, user_id,
             )
             return False
@@ -147,7 +172,7 @@ class HousewifeOnboardingKickoffWorker:
         self.service.start(tenant_id=tenant_id, user_id=user_id)
 
         payload = {
-            "chat_id": chat_id,
+            "chat_id": routing.chat_id,
             "text": _INTRO_MESSAGE,
             "reply_markup": None,
         }
@@ -155,7 +180,7 @@ class HousewifeOnboardingKickoffWorker:
             id=f"out_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
             workspace_id=workspace_id,
-            channel_type="telegram",
+            channel_type=routing.channel,  # 10.6: dynamic per user/tenant
             feature_key=HOUSEWIFE_FEATURE_KEY,
             status="pending",
             payload_json=json.dumps(payload, ensure_ascii=False),
@@ -163,29 +188,10 @@ class HousewifeOnboardingKickoffWorker:
         if hasattr(OutboxMessage, "user_id"):
             outbox.user_id = user_id
         if hasattr(OutboxMessage, "is_interactive"):
-            # Kickoff is a bot-initiated proactive message, NOT a reply
-            # to a user command. Mark non-interactive so quiet-hours
-            # policy applies normally.
             outbox.is_interactive = False
         self.session.add(outbox)
         self.session.flush()
         return True
-
-    def _resolve_chat_id(self, user_id: str, tenant_id: str) -> str | None:
-        user = self.session.get(User, user_id)
-        if user and user.telegram_account_id:
-            return user.telegram_account_id
-        # Fallback: any user with a binding under the tenant.
-        user = (
-            self.session.query(User)
-            .filter(
-                User.tenant_id == tenant_id,
-                User.telegram_account_id.is_not(None),
-            )
-            .order_by(User.id.asc())
-            .first()
-        )
-        return user.telegram_account_id if user else None
 
     def _resolve_workspace_id(self, tenant_id: str) -> str | None:
         ws = (

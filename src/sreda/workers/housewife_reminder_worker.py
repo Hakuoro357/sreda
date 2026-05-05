@@ -102,13 +102,11 @@ class HousewifeReminderWorker:
     # --- internals ------------------------------------------------------
 
     def _enqueue_outbox_for(self, reminder: FamilyReminder) -> None:
-        chat_id = self._resolve_chat_id(reminder)
-        if not chat_id:
-            # No Telegram chat binding — mark fired anyway so we don't
-            # keep retrying. A user without telegram_account_id can't
-            # receive reminders; this is a bootstrap state, not an error.
+        routing = self._resolve_routing(reminder)
+        if routing is None:
             logger.warning(
-                "reminder %s: tenant %s has no Telegram chat binding, skipping delivery",
+                "reminder %s: tenant %s has no deliverable channel "
+                "(нет ни TG, ни MAX account_id), skipping delivery",
                 reminder.id,
                 reminder.tenant_id,
             )
@@ -123,10 +121,11 @@ class HousewifeReminderWorker:
             )
             return
 
-        # Escalation UI: inline keyboard lets the user ack or snooze
-        # with one tap. Callback data carries the reminder id — the
-        # telegram bot callback handler parses our prefix and routes
-        # to HousewifeReminderService.acknowledge / .snooze.
+        # Escalation UI: inline keyboard. NB: callback_data format is
+        # TG-style; для MAX inline-button format unknown пока (probe
+        # требуется). Если routing.channel='max', кнопки отрендерятся
+        # как regular send без работающих callback'ов — TODO в 10.6
+        # follow-up или Boris скажет MAX inline format.
         from sreda.services.ui_labels import BUTTON_ACK, BUTTON_SNOOZE
 
         text = f"🔔 {reminder.title}"
@@ -143,7 +142,7 @@ class HousewifeReminderWorker:
             ]],
         }
         payload = {
-            "chat_id": chat_id,
+            "chat_id": routing.chat_id,
             "text": text,
             "reply_markup": reply_markup,
         }
@@ -151,13 +150,11 @@ class HousewifeReminderWorker:
             id=f"out_{uuid4().hex[:24]}",
             tenant_id=reminder.tenant_id,
             workspace_id=workspace_id,
-            channel_type="telegram",
+            channel_type=routing.channel,  # 10.6: dynamic per user/tenant
             feature_key=HOUSEWIFE_FEATURE_KEY,
             status="pending",
             payload_json=json.dumps(payload, ensure_ascii=False),
         )
-        # ``OutboxMessage.user_id`` may or may not exist on the
-        # current schema — set only if attribute is present.
         if hasattr(OutboxMessage, "user_id"):
             outbox.user_id = reminder.user_id
         if hasattr(OutboxMessage, "is_interactive"):
@@ -165,25 +162,44 @@ class HousewifeReminderWorker:
         self.session.add(outbox)
         self.session.flush()
 
-    def _resolve_chat_id(self, reminder: FamilyReminder) -> str | None:
-        """Reminder → Telegram chat_id. Prefer the binding on the
-        reminder's ``user_id`` when set; fall back to any user of the
-        tenant with ``telegram_account_id``."""
+    def _resolve_routing(self, reminder: FamilyReminder):
+        """Reminder → channel-aware OutboxRouting (10.6).
+
+        Prefer reminder's ``user_id`` binding; fallback к любому user
+        tenant'а который имеет account_id в любом из каналов. Возвращает
+        None если ни TG, ни MAX account нет.
+        """
+        from sreda.services.channel_routing import resolve_outbox_routing
+        from sreda.db.models.core import Tenant as _Tenant
+
+        tenant = self.session.get(_Tenant, reminder.tenant_id)
+
+        # Try the reminder's specific user first
         if reminder.user_id:
             user = self.session.get(User, reminder.user_id)
-            if user and user.telegram_account_id:
-                return user.telegram_account_id
+            if user is not None:
+                routing = resolve_outbox_routing(
+                    self.session, tenant=tenant, user=user,
+                )
+                if routing is not None:
+                    return routing
 
+        # Fallback: any user of the tenant with any account
         user = (
             self.session.query(User)
             .filter(
                 User.tenant_id == reminder.tenant_id,
-                User.telegram_account_id.is_not(None),
+                (
+                    User.telegram_account_id.is_not(None)
+                    | User.max_account_id.is_not(None)
+                ),
             )
             .order_by(User.id.asc())
             .first()
         )
-        return user.telegram_account_id if user else None
+        if user is None:
+            return None
+        return resolve_outbox_routing(self.session, tenant=tenant, user=user)
 
     def _resolve_workspace_id(self, tenant_id: str) -> str | None:
         ws = (

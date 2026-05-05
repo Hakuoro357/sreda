@@ -2303,6 +2303,25 @@ def execute_conversation_chat(
             _sanitize_stats["cjk_stripped"],
         )
 
+    # 12.7 (incident tg=634496616 2026-05-03): MiMo content-filter
+    # иногда возвращает английский «The request was rejected because it
+    # was considered high risk» как content (in_tok=0/out_tok=0 — pre-canned
+    # safety message). Если оставить — юзер видит непонятный английский
+    # reject. Detect + substitute с русским generic fallback.
+    if _is_provider_refusal(text) or _is_predominantly_non_russian(text):
+        logger.warning(
+            "CHAT_PROVIDER_REFUSAL tenant=%s feature=%s original_chars=%d original_first=%r",
+            action.tenant_id, feature_key, len(text), text[:80],
+        )
+        with trace.step(
+            "llm.refusal_substituted", original_chars=len(text),
+        ):
+            pass
+        text = (
+            "Прости, не получилось понять запрос. "
+            "Попробуй переформулировать или спросить иначе."
+        )
+
     # Inline-кнопки (Часть 0 плана v2). Если LLM вызывал
     # ``reply_with_buttons`` во время этого turn'а — он положил в
     # state словарь {"text": ..., "buttons": [labels]}. Создаём
@@ -2345,6 +2364,41 @@ def execute_conversation_chat(
     with trace.step("chat.reply", rescued=rescued, chars=len(text)):
         pass
     return [RuntimeReply(text=text, reply_markup=reply_markup, feature_key=feature_key)]
+
+
+# 12.7 (incident tg=634496616 2026-05-03): provider refusal substitution.
+# MiMo content-filter возвращает pre-canned английский reject text как content
+# (token count = 0 — характерный признак). Detect + replace с русским fallback
+# чтобы юзер не видел непонятный английский «request rejected».
+_PROVIDER_REFUSAL_PATTERNS = (
+    "the request was rejected because it was considered high risk",
+    "i cannot fulfill this request",
+    "i'm sorry, but i can't",
+    "i cannot help with that",
+    "this content is not allowed",
+)
+
+
+def _is_provider_refusal(text: str) -> bool:
+    """Match against known LLM provider safety refusal strings."""
+    if not text:
+        return False
+    lower = text.lower().strip()
+    return any(p in lower for p in _PROVIDER_REFUSAL_PATTERNS)
+
+
+def _is_predominantly_non_russian(text: str, threshold: float = 0.3) -> bool:
+    """True если cyrillic content < threshold (default 30%).
+
+    Catch-all для случаев когда provider возвращает что-то на иностранном
+    что не matches refusal pattern, но и не наш русский. Skip короткие
+    тексты (<20 chars) — там ratio шумный (e.g. emoji-only «✅» или
+    короткие ack'и от bot'а).
+    """
+    if not text or len(text) < 20:
+        return False
+    cyrillic = sum(1 for c in text if "Ѐ" <= c <= "ӿ")
+    return (cyrillic / len(text)) < threshold
 
 
 # Unicode ranges for CJK + Japanese kana. Matches Chinese Hanzi, Japanese

@@ -149,8 +149,8 @@ class ProactiveEventWorker:
         if isinstance(replies, RuntimeReply):
             replies = [replies]
 
-        chat_id = self._resolve_chat_id(event)
-        if chat_id is None:
+        routing = self._resolve_routing(event)
+        if routing is None:
             self.repo.mark_status(
                 event.id, status="skipped", reason="no_delivery_channel"
             )
@@ -180,7 +180,7 @@ class ProactiveEventWorker:
             self._write_outbox_with_decision(
                 event=event,
                 reply=reply,
-                chat_id=chat_id,
+                routing=routing,
                 decision_kind=decision.kind,
                 defer_until=decision.defer_until_utc,
                 drop_reason=decision.drop_reason,
@@ -189,26 +189,30 @@ class ProactiveEventWorker:
         self.repo.mark_status(event.id, status="consumed")
         self.session.commit()
 
-    def _resolve_chat_id(self, event: InboundEvent) -> str | None:
-        """Find the Telegram chat_id for the event recipient.
+    def _resolve_routing(self, event: InboundEvent):
+        """10.6: channel-aware routing для proactive event.
 
-        For now we walk ``User.telegram_account_id``; later this could
-        be more flexible (per-user channel preference)."""
+        Возвращает ``OutboxRouting`` (channel + chat_id) на основе
+        ``tenant.preferred_channel`` + available account_ids у user'а.
+        None если ни TG ни MAX account нет.
+        """
         if not event.user_id:
             return None
-        from sreda.db.models.core import User
+        from sreda.db.models.core import Tenant as _Tenant, User
+        from sreda.services.channel_routing import resolve_outbox_routing
 
         user = self.session.get(User, event.user_id)
-        if user is None or not user.telegram_account_id:
+        if user is None:
             return None
-        return user.telegram_account_id
+        tenant = self.session.get(_Tenant, event.tenant_id)
+        return resolve_outbox_routing(self.session, tenant=tenant, user=user)
 
     def _write_outbox_with_decision(
         self,
         *,
         event: InboundEvent,
         reply: RuntimeReply,
-        chat_id: str,
+        routing,  # OutboxRouting
         decision_kind: ProactiveDecisionKind,
         defer_until: datetime | None,
         drop_reason: str | None,
@@ -234,7 +238,7 @@ class ProactiveEventWorker:
             row_drop_reason = drop_reason
 
         payload: dict[str, Any] = {
-            "chat_id": chat_id,
+            "chat_id": routing.chat_id,
             "text": reply.text,
             "reply_markup": reply.reply_markup,
         }
@@ -248,7 +252,7 @@ class ProactiveEventWorker:
             tenant_id=event.tenant_id,
             workspace_id=workspace_id,
             user_id=event.user_id,
-            channel_type="telegram",
+            channel_type=routing.channel,  # 10.6 dynamic
             feature_key=reply.feature_key or event.feature_key,
             is_interactive=False,
             status=status,

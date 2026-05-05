@@ -136,9 +136,9 @@ class OnboardingAhaWorker:
             self._create_sentinel(tenant, now, diet_member_name=None)
             return False
 
-        # 3) Узнаём chat_id для доставки.
-        user, chat_id = self._resolve_user_and_chat(tenant.id)
-        if not user or not chat_id:
+        # 3) Узнаём channel + chat_id для доставки (10.6 channel routing).
+        user, routing = self._resolve_user_and_routing(tenant)
+        if user is None or routing is None:
             self._create_sentinel(tenant, now, diet_member_name=None)
             return False
 
@@ -178,7 +178,7 @@ class OnboardingAhaWorker:
 
         # 6) Кладём в outbox. Доставку делает OutboxDeliveryWorker.
         payload = {
-            "chat_id": chat_id,
+            "chat_id": routing.chat_id,
             "text": text,
             "reply_markup": reply_markup,
         }
@@ -186,7 +186,7 @@ class OnboardingAhaWorker:
             id=f"out_{uuid4().hex[:24]}",
             tenant_id=tenant.id,
             workspace_id=workspace_id,
-            channel_type="telegram",
+            channel_type=routing.channel,  # 10.6 dynamic per user/tenant
             feature_key=HOUSEWIFE_FEATURE_KEY,
             status="pending",
             payload_json=json.dumps(payload, ensure_ascii=False),
@@ -236,21 +236,33 @@ class OnboardingAhaWorker:
                     return m
         return None
 
-    def _resolve_user_and_chat(
-        self, tenant_id: str,
-    ) -> tuple[User | None, str | None]:
+    def _resolve_user_and_routing(
+        self, tenant: Tenant,
+    ):
+        """10.6 channel routing: user + OutboxRouting.
+
+        Берём первого юзера tenant'а с любым TG/MAX account_id и
+        вычисляем channel через ``resolve_outbox_routing`` (учитывает
+        ``tenant.preferred_channel``).
+        """
+        from sreda.services.channel_routing import resolve_outbox_routing
+
         user = (
             self.session.query(User)
             .filter(
-                User.tenant_id == tenant_id,
-                User.telegram_account_id.is_not(None),
+                User.tenant_id == tenant.id,
+                (
+                    User.telegram_account_id.is_not(None)
+                    | User.max_account_id.is_not(None)
+                ),
             )
             .order_by(User.id.asc())
             .first()
         )
         if user is None:
             return None, None
-        return user, user.telegram_account_id
+        routing = resolve_outbox_routing(self.session, tenant=tenant, user=user)
+        return user, routing
 
     def _resolve_workspace_id(self, tenant_id: str) -> str | None:
         ws = (
