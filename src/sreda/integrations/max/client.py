@@ -80,6 +80,75 @@ async def close_pool() -> None:
     _CLIENT_POOL.clear()
 
 
+def render_max_inline_keyboard_attachment(
+    tg_reply_markup: dict | None,
+) -> list[dict] | None:
+    """Convert Telegram-style ``inline_keyboard`` → MAX ``attachments[]``.
+
+    Producers (housewife_reminder, onboarding_aha, etc.) пишут TG
+    inline_keyboard в outbox payload. MAX API ожидает другой shape —
+    ``attachments=[{"type":"inline_keyboard", "payload": {"buttons": [[
+    {"type":"callback","text":...,"payload":...}]]}}]`` (см. MAX docs
+    /docs-api/objects/NewMessageBody, probe 2026-05-05).
+
+    Поля кнопок:
+    - ``type``: callback | link | request_contact | request_geo_location
+    - ``text``: required (центруется, обрезается)
+    - ``payload``: required для callback (TG: callback_data)
+    - ``url``: required для link
+
+    Если ``tg_reply_markup`` None или пустой — None (caller skip
+    attachments).
+
+    Returns: list[dict] для passing в ``MaxClient.send_message(..., attachments=...)``,
+    или None.
+    """
+    if not tg_reply_markup or not isinstance(tg_reply_markup, dict):
+        return None
+    rows = tg_reply_markup.get("inline_keyboard")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    max_buttons: list[list[dict]] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        max_row: list[dict] = []
+        for btn in row:
+            if not isinstance(btn, dict):
+                continue
+            text = btn.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if btn.get("url"):
+                max_row.append({
+                    "type": "link",
+                    "text": text,
+                    "url": str(btn["url"]),
+                })
+            elif btn.get("callback_data") is not None:
+                # MAX field называется ``payload`` (TG: ``callback_data``).
+                # Limit per probe: TG = 64 байта; MAX docs не специфицируют,
+                # но скорее всего similar — caller responsibility ограничивать.
+                max_row.append({
+                    "type": "callback",
+                    "text": text,
+                    "payload": str(btn["callback_data"]),
+                })
+            # web_app / login_url / pay / switch_inline — пока skip
+            # (нет MAX equivalent), text сохраняется в text-only message.
+        if max_row:
+            max_buttons.append(max_row)
+
+    if not max_buttons:
+        return None
+
+    return [{
+        "type": "inline_keyboard",
+        "payload": {"buttons": max_buttons},
+    }]
+
+
 class MaxDeliveryError(Exception):
     """Raised when MAX API call fails after retries OR returns non-success.
 

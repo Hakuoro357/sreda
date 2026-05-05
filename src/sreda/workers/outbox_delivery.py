@@ -295,12 +295,26 @@ class OutboxDeliveryWorker:
             self.session.commit()
             return
 
+        # Convert TG-style reply_markup → MAX attachments inline_keyboard.
+        # Producers пишут TG schema (исторически), но MAX API ожидает
+        # другую structure. Если payload.attachments уже set'нут MAX-native
+        # — используем его; иначе конвертим reply_markup. Если reply_markup
+        # пустой — text-only message (без кнопок).
+        from sreda.integrations.max.client import (
+            render_max_inline_keyboard_attachment,
+        )
+        attachments = payload.get("attachments")
+        if not attachments:
+            attachments = render_max_inline_keyboard_attachment(
+                payload.get("reply_markup"),
+            )
+
         try:
             await self.max.send_message(
                 recipient={"chat_id": chat_id},
                 text=text,
                 format=payload.get("format"),
-                attachments=payload.get("attachments"),
+                attachments=attachments,
             )
             row.status = "sent"
             self._emit_trace(
