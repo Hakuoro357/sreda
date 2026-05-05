@@ -169,33 +169,52 @@ class HousewifeReminderWorker:
     def _resolve_routings(self, reminder: FamilyReminder):
         """Reminder → list of OutboxRouting (10.6 dual-channel).
 
-        Prefer reminder's ``user_id`` binding; fallback к любому user
-        tenant'а который имеет account_id в любом из каналов. Возвращает
-        empty list если нет account'ов.
+        Codex R1 CRITICAL fix: если ``reminder.user_id`` задан, мы НЕ
+        должны fallback'аться на другого user'а tenant'а — это leak'ало
+        бы личные reminder'ы (e.g. Боре приходило бы reminder сына, т.к.
+        outbox.user_id остаётся сыном для quiet-hours / mute policy
+        lookup). Fallback на random tenant-user'а только если
+        ``reminder.user_id is None`` (tenant-wide reminder без owner'а).
+
+        Codex R1 MAJOR #2: deliverable MAX = ``max_chat_id IS NOT NULL``
+        (не ``max_account_id``), т.к. chat_id это recipient.
         """
         from sreda.services.channel_routing import resolve_outbox_routings
         from sreda.db.models.core import Tenant as _Tenant
 
         tenant = self.session.get(_Tenant, reminder.tenant_id)
 
-        # Try the reminder's specific user first
+        # User-scoped reminder: возвращаем routings ТОЛЬКО для своего
+        # user'а. Если у юзера нет account'ов — empty list (skip + log),
+        # НЕ fallback на чужого юзера.
+        # Codex R2 MAJOR: проверяем что user.tenant_id == reminder.tenant_id
+        # — defence against data inconsistency (manual SQL merge ошибся,
+        # FK был snapshot'ом, и т.д.). Иначе personal-data leak в чужой
+        # tenant.
         if reminder.user_id:
             user = self.session.get(User, reminder.user_id)
-            if user is not None:
-                routings = resolve_outbox_routings(
-                    self.session, tenant=tenant, user=user,
+            if user is None or user.tenant_id != reminder.tenant_id:
+                logger.warning(
+                    "reminder %s: user %s mismatch tenant (user.tenant=%s "
+                    "vs reminder.tenant=%s) — skipping (no leak)",
+                    reminder.id, reminder.user_id,
+                    user.tenant_id if user else None,
+                    reminder.tenant_id,
                 )
-                if routings:
-                    return routings
+                return []
+            return resolve_outbox_routings(
+                self.session, tenant=tenant, user=user,
+            )
 
-        # Fallback: any user of the tenant with any account
+        # Tenant-wide reminder (user_id=None): берём любого юзера с
+        # deliverable account.
         user = (
             self.session.query(User)
             .filter(
                 User.tenant_id == reminder.tenant_id,
                 (
                     User.telegram_account_id.is_not(None)
-                    | User.max_account_id.is_not(None)
+                    | User.max_chat_id.is_not(None)
                 ),
             )
             .order_by(User.id.asc())

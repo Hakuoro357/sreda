@@ -5,9 +5,16 @@
 proactive_events) на channel-aware маршрутизацию.
 
 **Dual delivery semantics (Boris directive 2026-05-05):**
-если у юзера есть **оба** account_id (TG и MAX) — нотификация шлётся
-**в оба канала** (две независимые outbox rows). Если только один —
-шлётся туда. Если ни одного — empty list (caller skip + log).
+если у юзера есть **оба** deliverable channels (TG: ``telegram_account_id``
++ MAX: ``max_chat_id``) — нотификация шлётся **в оба канала** (две
+независимые outbox rows). Если только один deliverable — шлётся туда.
+Если ни одного — empty list (caller skip + log).
+
+**Deliverable predicate** (codex R1/R2): для TG нужен
+``telegram_account_id``, для MAX — ``max_chat_id`` (НЕ ``max_account_id``).
+``max_account_id`` — bot identity (ВКонтакте-style ID); ``max_chat_id``
+— recipient в ``POST /messages?chat_id=...``. Может расходиться у
+legacy data: account_id есть, chat_id нет → MAX undeliverable.
 
 ``tenant.preferred_channel`` используется только для **порядка**
 доставки в списке (primary first), на сам факт duplicate не влияет.
@@ -101,6 +108,20 @@ def resolve_outbox_routing(
     """[DEPRECATED] Use ``resolve_outbox_routings`` (plural) для
     dual-channel delivery. Возвращает только первый routing — теряет
     второй канал если оба доступны.
+
+    Codex R1 MINOR fix: emit DeprecationWarning так чтобы случайные
+    callers (старый код / новые ошибки) не получали тихо single-channel
+    behavior после миграции на dual-delivery.
     """
+    import warnings
+    warnings.warn(
+        "resolve_outbox_routing (singular) is deprecated; "
+        "use resolve_outbox_routings (plural) для dual-channel delivery. "
+        "Single-channel routing is a violation of Boris's directive "
+        "(2026-05-05): notifications должны идти в ОБА channel'а если "
+        "юзер имеет оба account'а.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     routings = resolve_outbox_routings(session, tenant=tenant, user=user)
     return routings[0] if routings else None

@@ -249,13 +249,15 @@ class OnboardingAhaWorker:
         """
         from sreda.services.channel_routing import resolve_outbox_routings
 
+        # Codex R1 MAJOR #2: deliverable MAX = ``max_chat_id IS NOT NULL``
+        # (chat_id — recipient в /messages, account_id — bot identity).
         user = (
             self.session.query(User)
             .filter(
                 User.tenant_id == tenant.id,
                 (
                     User.telegram_account_id.is_not(None)
-                    | User.max_account_id.is_not(None)
+                    | User.max_chat_id.is_not(None)
                 ),
             )
             .order_by(User.id.asc())

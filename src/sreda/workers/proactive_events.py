@@ -197,6 +197,9 @@ class ProactiveEventWorker:
 
         Возвращает все доступные channels (TG+MAX если оба set'нуты).
         Empty list если ни TG ни MAX account нет.
+
+        Codex R2 MAJOR: defensive cross-tenant check — user.tenant_id
+        должен совпадать с event.tenant_id (защита от data inconsistency).
         """
         if not event.user_id:
             return []
@@ -204,7 +207,7 @@ class ProactiveEventWorker:
         from sreda.services.channel_routing import resolve_outbox_routings
 
         user = self.session.get(User, event.user_id)
-        if user is None:
+        if user is None or user.tenant_id != event.tenant_id:
             return []
         tenant = self.session.get(_Tenant, event.tenant_id)
         return resolve_outbox_routings(self.session, tenant=tenant, user=user)

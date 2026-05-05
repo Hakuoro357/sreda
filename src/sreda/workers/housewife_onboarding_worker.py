@@ -133,27 +133,21 @@ class HousewifeOnboardingKickoffWorker:
         from sreda.services.channel_routing import resolve_outbox_routings
         from sreda.db.models.core import Tenant as _Tenant
 
+        # Codex R1 CRITICAL: НЕ fallback на чужого user'а в tenant'е —
+        # `kickoff` это user-scoped intro, leak'нуть его другому юзеру
+        # (даже под одним tenant'ом) недопустимо.
+        # Codex R2 MAJOR: defensive cross-tenant check — user.tenant_id
+        # должен совпадать с tenant_id аргумента, иначе data inconsistency.
         tenant = self.session.get(_Tenant, tenant_id)
         user = self.session.get(User, user_id)
-        routings = resolve_outbox_routings(self.session, tenant=tenant, user=user)
-        if not routings:
-            # Fallback: любой user под tenant с любым binding
-            fallback_user = (
-                self.session.query(User)
-                .filter(
-                    User.tenant_id == tenant_id,
-                    (
-                        User.telegram_account_id.is_not(None)
-                        | User.max_account_id.is_not(None)
-                    ),
-                )
-                .order_by(User.id.asc())
-                .first()
+        if user is not None and user.tenant_id != tenant_id:
+            logger.warning(
+                "housewife_onboarding: user %s belongs to tenant %s "
+                "не %s — skipping (no leak)",
+                user_id, user.tenant_id, tenant_id,
             )
-            if fallback_user is not None:
-                routings = resolve_outbox_routings(
-                    self.session, tenant=tenant, user=fallback_user,
-                )
+            return False
+        routings = resolve_outbox_routings(self.session, tenant=tenant, user=user)
 
         if not routings:
             logger.warning(
