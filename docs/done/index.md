@@ -26,6 +26,8 @@
 | ~~10.1~~ | ~~MAX `_process_approved_max_turn` wire to conversation graph~~ — ✅ DONE 2026-05-05 (commits 5c5cbb1 + 1c74ab8) | — | ✅ |
 | 10.2 | Mini-app frontend UI для linking (source button + target confirm) | ~3-4ч | 🟡 follow-up |
 | ~~10.3~~ | ~~Live verify recipient send_message format на реальном MAX-ответе~~ — ✅ DONE 2026-05-05 (commit f5b2f5c, chat_id в query) | — | ✅ |
-| 10.4 | MAX voice support (probe payload + MaxClient download_file + voice flow) | ~3-4ч | 🟡 follow-up |
+| ~~10.4~~ | ~~MAX voice support~~ — ✅ DONE 2026-05-05 (commits 8619f3a + 4187a41, codex-loop R6 NO SIGNIFICANT CONCERNS) | — | ✅ |
+| 10.5 | Account merge — Boris's tenant_max_40921122 merged в tenant_tg_352612382 | — | ✅ DONE 2026-05-05 (manual SQL) |
+| 10.6 | Proactive notifications channel routing (preferred_channel + fallback) | ~1-2ч | 🟡 follow-up |
 | 12.2 | Динамические напоминания — после MAX | 2-3 дня | ⏸ deferred |
 | 9.2 | [~~Placeholder + editMessageText~~ → 2026-W19](2026-W19.md#92-placeholder--editmessagetext---removed-2026-05-04) | — | 🗑 removed |
