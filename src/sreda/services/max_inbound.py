@@ -151,6 +151,167 @@ async def handle_max_update(
     return inbound_message_id
 
 
+_VOICE_FEATURE_KEY = "voice_transcription"
+_VOICE_MAX_BYTES = 2_000_000  # ~2MB, ≈60s OGG/Opus 16kbps mono
+
+
+def _extract_max_voice_url(payload: dict) -> str | None:
+    """Find audio attachment URL in MAX message payload.
+
+    Probe 2026-05-05: MAX voice update has empty body.text and
+    ``body.attachments[].type == "audio"`` with payload.url — signed URL
+    ready for direct httpx GET (no auth header, signature in query).
+    """
+    msg = payload.get("message")
+    if not isinstance(msg, dict):
+        return None
+    body = msg.get("body")
+    if not isinstance(body, dict):
+        return None
+    attachments = body.get("attachments")
+    if not isinstance(attachments, list):
+        return None
+    for att in attachments:
+        if not isinstance(att, dict) or att.get("type") != "audio":
+            continue
+        att_payload = att.get("payload")
+        if isinstance(att_payload, dict):
+            url = att_payload.get("url")
+            if isinstance(url, str) and url:
+                return url
+    return None
+
+
+async def _maybe_transcribe_max_voice(
+    payload: dict,
+    *,
+    session,
+    max_client,
+    onboarding,
+) -> dict | None:
+    """If MAX payload contains audio attachment, transcribe → inject text.
+
+    Mirror ``services.telegram_bot._maybe_transcribe_voice`` с deltas:
+    - Detection: ``body.attachments[].type=='audio'`` (не ``message.voice``)
+    - Download: один httpx GET signed URL (не двухступенчатый ``getFile``)
+    - Duration limit: byte-cap (~2MB ≈ 60s) т.к. MAX не возвращает
+      duration в payload
+    - Error replies via ``max_client.send_message`` inline (MVP, как TG)
+
+    Returns:
+        Updated payload (с injected ``message.body.text``) — продолжаем
+        обработку как text turn.
+        ``None`` — ошибка отправлена юзеру, processing должен остановиться.
+        Same payload (unchanged) если не voice — caller продолжает обычно.
+    """
+    audio_url = _extract_max_voice_url(payload)
+    if audio_url is None:
+        return payload  # not voice — passthrough
+
+    chat_id = onboarding.max_chat_id
+    tenant_id = onboarding.tenant_id
+
+    async def _send_error(text: str) -> None:
+        try:
+            await max_client.send_message(
+                recipient={"chat_id": chat_id}, text=text,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("max voice: error reply failed", exc_info=True)
+
+    # 1. Voice feature module installed
+    from sreda.features.app_registry import get_feature_registry
+    registry = get_feature_registry()
+    if _VOICE_FEATURE_KEY not in registry.modules:
+        await _send_error(
+            "Голосовые сообщения доступны в подписке. "
+            "Открой /subscriptions, чтобы узнать подробнее."
+        )
+        return None
+
+    # 2. Tenant has active agent с voice access
+    from sreda.services.agent_capabilities import has_voice_access
+    if not tenant_id or not has_voice_access(session, tenant_id):
+        await _send_error(
+            "Голосовые сообщения доступны в подписке. "
+            "Открой /subscriptions, чтобы узнать подробнее."
+        )
+        return None
+
+    # 3. Speech recognizer configured
+    settings = get_settings()
+    from sreda.services.speech.factory import get_speech_recognizer
+    recognizer = get_speech_recognizer(settings)
+    if recognizer is None:
+        await _send_error(
+            "Голосовые сообщения сейчас не работают. "
+            "Напиши текстом или попробуй позже."
+        )
+        return None
+
+    # 4 + 5: Download + transcribe (same trace steps as TG для cross-channel
+    # ops dashboard parity).
+    from sreda.services import trace
+    from sreda.services.speech.base import SpeechRecognitionError
+
+    provider = settings.speech_provider or "unknown"
+
+    with trace.step("voice.download", provider="max") as _dl_meta:
+        try:
+            audio_bytes = await max_client.download_audio(audio_url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("max voice download failed: %s", exc)
+            await _send_error(
+                "Не удалось получить голосовое сообщение. Отправь ещё раз."
+            )
+            _dl_meta["status"] = "download_failed"
+            return None
+        _dl_meta["bytes_in"] = len(audio_bytes)
+
+        # Byte-cap (proxy для duration т.к. MAX не возвращает duration).
+        if len(audio_bytes) > _VOICE_MAX_BYTES:
+            await _send_error(
+                "Голосовое слишком длинное. "
+                "Отправь покороче (до ~60 секунд)."
+            )
+            _dl_meta["status"] = "too_long"
+            return None
+
+    with trace.step("voice.transcribe", provider=provider) as _trace_meta:
+        _trace_meta["bytes_in"] = len(audio_bytes)
+        try:
+            text = await recognizer.recognize(audio_bytes)
+        except SpeechRecognitionError as exc:
+            logger.warning("max voice STT failed: %s", exc)
+            await _send_error(
+                "Не получилось расшифровать голос. "
+                "Отправь ещё раз или напиши."
+            )
+            _trace_meta["status"] = "recognize_failed"
+            return None
+        _trace_meta["chars_out"] = len(text)
+        _trace_meta["status"] = "ok"
+
+    # 6. Record budget usage (1 credit per voice)
+    from sreda.services.budget import BudgetService
+    BudgetService(session).record_api_usage(
+        tenant_id=tenant_id,
+        feature_key=_VOICE_FEATURE_KEY,
+        provider_key=settings.speech_provider or "unknown",
+        task_type="speech_recognition",
+        credits_consumed=1,
+    )
+
+    # 7. Inject text — downstream dispatch_max_action подхватит как
+    # обычный text turn (``_extract_max_message_text`` читает body.text).
+    msg = payload.get("message")
+    if isinstance(msg, dict):
+        body = msg.setdefault("body", {})
+        if isinstance(body, dict):
+            body["text"] = text
+    return payload
+
+
 async def _process_approved_max_turn(
     *,
     bot_key: str,
@@ -176,16 +337,39 @@ async def _process_approved_max_turn(
     """
     # Late imports — избегаем circular: runtime/dispatcher ← onboarding
     # (через type hint).
+    from sreda.integrations.max import MaxClient
     from sreda.runtime.dispatcher import dispatch_max_action
     from sreda.runtime.executor import ActionRuntimeService
     from sreda.services.tenant_lock import get_tenant_lock
 
     SessionLocal = get_session_factory()
     bg_session = SessionLocal()
+    settings = get_settings()
     try:
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
         )
+
+        # Voice → STT перед dispatch'ем. Если payload содержит audio
+        # attachment, transcribe + inject text → dispatch видит обычный
+        # text turn. Если voice processing бросил ошибку юзеру (no token,
+        # no recognizer, etc.) — возвращает None, мы тут останавливаемся.
+        if settings.max_bot_token:
+            max_client = MaxClient(token=settings.max_bot_token)
+            transcribed = await _maybe_transcribe_max_voice(
+                payload,
+                session=bg_session,
+                max_client=max_client,
+                onboarding=onboarding,
+            )
+            if transcribed is None:
+                # Error reply отправлен юзеру inline. Помечаем как
+                # ignored — turn закончен, не запускаем conversation graph.
+                _set_processing_status(
+                    bg_session, inbound_message_id, "ignored",
+                )
+                return
+            payload = transcribed
 
         action = dispatch_max_action(
             payload=payload,

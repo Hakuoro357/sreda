@@ -23,8 +23,9 @@
 | 9.1 анализ | Поднять метрики ack-vs-reply ordering, решить про 9.3 | ~30 мин | 🟢 |
 | 9.3 | Транспорт RU↔EU (Go-прокси / WireGuard) — если 9.1 покажет race | ~1ч / день | 🟡 conditional |
 | ~~10~~ | ~~MAX integration sprint~~ — [✅ DONE 2026-05-04 → 2026-W19](2026-W19.md#10-max-integration--done-2026-05-04-commit-26301cf) | — | ✅ |
-| 10.1 | MAX `_process_approved_max_turn` wire to conversation graph | ~2-3ч | 🟡 follow-up |
+| ~~10.1~~ | ~~MAX `_process_approved_max_turn` wire to conversation graph~~ — ✅ DONE 2026-05-05 (commits 5c5cbb1 + 1c74ab8) | — | ✅ |
 | 10.2 | Mini-app frontend UI для linking (source button + target confirm) | ~3-4ч | 🟡 follow-up |
-| 10.3 | Live verify recipient send_message format на реальном MAX-ответе | ~30 мин | 🟢 follow-up |
+| ~~10.3~~ | ~~Live verify recipient send_message format на реальном MAX-ответе~~ — ✅ DONE 2026-05-05 (commit f5b2f5c, chat_id в query) | — | ✅ |
+| 10.4 | MAX voice support (probe payload + MaxClient download_file + voice flow) | ~3-4ч | 🟡 follow-up |
 | 12.2 | Динамические напоминания — после MAX | 2-3 дня | ⏸ deferred |
 | 9.2 | [~~Placeholder + editMessageText~~ → 2026-W19](2026-W19.md#92-placeholder--editmessagetext---removed-2026-05-04) | — | 🗑 removed |

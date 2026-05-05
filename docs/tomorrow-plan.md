@@ -508,6 +508,132 @@ provider=...` или передвинуть лог внутрь fallback-branch 
 
 **Когда:** P3. Косметика логов, делать когда мешает.
 
+#### 12.7. LLM provider content-filter leaks English to user (incident tg=634496616) 🔴
+
+**Симптом.** 2026-05-03 20:45 МСК юзер `tg=634496616` прислал voice
+«Напомни завтра в 12 часов написать томатологу-хирургу» (очепятка
+вместо «стоматологу»). MiMo (xiaomi mimo-v2.5-pro) забанил запрос
+через content-filter и вернул pre-canned text:
+
+> «The request was rejected because it was considered high risk»
+
+Среда отправила это юзеру дословно — английским, без перевода. Юзер
+видит непонятный reject от китайского cloud'а вместо своей Среды.
+Через минуту юзер переспросил, тот же домен — MiMo пропустил, бот
+поставил напоминание корректно. Filter **недетерминирован** (Boris
+проверил: «поставь напоминание написать хирургу» сейчас работает,
+но та же фраза в другом surface — не работала).
+
+**Trace markers:** `in_tok=0/out_tok=0` от LLM в trace event (token
+count = 0 — характерный признак provider safety refusal, не настоящий
+LLM-ответ). Также `chars_out=60` при `text starts with "The request..."`.
+
+**Fix (MVP):**
+
+```python
+_PROVIDER_REFUSAL_PATTERNS = (
+    "the request was rejected because it was considered high risk",
+    "i cannot fulfill this request",
+    "i'm sorry, but i can't",
+    # добавлять по мере появления других providers
+)
+
+def _is_provider_refusal(text: str) -> bool:
+    if not text:
+        return False
+    return any(p in text.lower().strip() for p in _PROVIDER_REFUSAL_PATTERNS)
+
+def _is_predominantly_non_russian(text: str, threshold: float = 0.3) -> bool:
+    """Cyrillic ratio < threshold (default 30%) → не наш язык."""
+    if not text or len(text) < 20:
+        return False
+    cyrillic = sum(1 for c in text if "Ѐ" <= c <= "ӿ")
+    return (cyrillic / len(text)) < threshold
+
+# В точке consume LLM response:
+if _is_provider_refusal(reply) or _is_predominantly_non_russian(reply):
+    logger.warning("LLM refusal/non-Russian — substituting (provider=%s tenant=%s)", ...)
+    trace.record("llm.refusal_substituted", original_chars=len(reply))
+    reply = (
+        "Прости, не получилось понять запрос. "
+        "Попробуй переформулировать или спросить иначе."
+    )
+```
+
+**Файлы:** `src/sreda/runtime/handlers.py` — после получения LLM-reply,
+перед persist в outbox.
+
+**Acceptance:**
+- Юзер на проде шлёт сообщение которое триггерит MiMo filter →
+  получает русский fallback вместо английского reject
+- Trace event `llm.refusal_substituted` появляется в diagnostic logs
+- TG path не сломан (regression: ASCII-only ack-message не triggers
+  the substitution — `len < 20` guard)
+
+**Long-term следствие:** смена провайдера на менее агрессивный
+(YandexGPT-Lite / GigaChat / Claude direct) уберёт root cause. Но это
+отдельный sprint, не сейчас.
+
+**Когда делать:** P1. Visible UX bug — юзер видит непонятный английский
+reject вместо ответа Среды. Малая площадь (~30 мин код + 1 unit test +
+deploy). После MAX voice (10.4) и merge accounts.
+
+#### 12.8. Proactive notifications не route'ятся по каналам 🟡
+
+**Симптом.** После merge accounts (10.1+10.3) юзер имеет
+`telegram_account_id` + `max_account_id` в одной row, но все
+proactive notifications (напоминания, EDS-alerts, onboarding aha,
+checklist nudges) hardcoded `channel_type="telegram"` в 4 worker'ах:
+
+- `housewife_reminder_worker.py:154`
+- `housewife_onboarding_worker.py:158`
+- `onboarding_aha_worker.py:189`
+- `proactive_events.py:251`
+
+`tenants.preferred_channel` колонка существует (schema 0035), но в
+коде producer'ов не читается.
+
+**Что нужно (минимум):**
+
+```python
+# Helper в shared module
+def resolve_outbox_channel(tenant: Tenant, user: User) -> str:
+    """Choose where to deliver proactive notification.
+
+    Priority: tenant.preferred_channel → first non-null account → 'telegram'.
+    """
+    if tenant.preferred_channel in ("telegram", "max"):
+        return tenant.preferred_channel
+    if user.telegram_account_id:
+        return "telegram"
+    if user.max_account_id:
+        return "max"
+    return "telegram"  # legacy default
+```
+
+Producers читают этот helper при enqueue outbox.
+
+**Опции UX:**
+- (a) preferred_channel один — юзер выбирает в settings → notifications туда
+- (b) duplicate — слать в **оба** канала (если оба acc'а есть). Красиво
+  но 2x cost (LLM + delivery), risk дублирующих нотиф если юзер видит оба
+- (c) primary/fallback — основной + резерв если primary fail'ит (`OutboxDeliveryWorker`
+  уже умеет fallback chain)
+
+**Acceptance:** юзер с `preferred_channel='max'` получает напоминание
+в МАКС, а не TG. Юзер с обоими аккаунтами без явного preference — TG
+(legacy default).
+
+**Файлы:**
+- `src/sreda/workers/{housewife_reminder,housewife_onboarding,onboarding_aha,proactive_events}.py`
+- `src/sreda/services/channel_routing.py` (новый, helper)
+- `src/sreda/runtime/dispatcher.py` (alignment с outbox_channel)
+- Tests: `test_channel_routing.py` + 4 worker regression tests
+
+**Когда делать:** P2. После того как juзеры начнут реально использовать
+МАКС (нужен 10.2 mini-app linking чтобы flow был доступен) — пока
+только Boris и его test acc'ы.
+
 ---
 
 **Открытые блокеры.**

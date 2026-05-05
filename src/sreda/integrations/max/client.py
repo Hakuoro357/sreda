@@ -215,6 +215,50 @@ class MaxClient:
             params=params, json_payload=payload, timeout=10.0,
         )
 
+    async def download_audio(self, url: str, *, timeout: float = 15.0) -> bytes:
+        """Download voice/audio attachment from a signed MAX URL.
+
+        Probe 2026-05-05: incoming voice message contains
+        ``message.body.attachments[].payload.url`` — signed URL of form
+        ``https://a.oneme.ru/audio?cid=...&signatureToken=...&expires=<ms>``.
+        Сразу готовый к download — НИЧЕГО не нужно (никакого
+        ``getFile``-аналога как в TG). Signature + expires в query
+        params (≈24h окна).
+
+        Auth header **не нужен** — наоборот, наличие ``Authorization:
+        <token>`` может быть подозрительным для CDN. Используем чистый
+        httpx-клиент без наших headers.
+
+        Returns raw audio bytes. Raises ``MaxDeliveryError`` на network
+        ошибки и не-200 status.
+        """
+        import httpx as _httpx
+
+        try:
+            async with _httpx.AsyncClient(
+                timeout=_httpx.Timeout(timeout, connect=5.0),
+                trust_env=True,
+            ) as client:
+                resp = await client.get(url)
+        except _httpx.TimeoutException as exc:
+            raise MaxDeliveryError(
+                f"audio download timeout: {exc}",
+                method="audio_download", status_code=None,
+            ) from exc
+        except _httpx.RequestError as exc:
+            raise MaxDeliveryError(
+                f"audio download network: {exc}",
+                method="audio_download", status_code=None,
+            ) from exc
+
+        if resp.status_code != 200:
+            body = resp.text[:300] if resp.text else "<empty>"
+            raise MaxDeliveryError(
+                f"audio download {resp.status_code}: {body}",
+                method="audio_download", status_code=resp.status_code,
+            )
+        return resp.content
+
     async def get_updates(
         self,
         *,
