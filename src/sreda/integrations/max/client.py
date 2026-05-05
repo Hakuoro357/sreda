@@ -179,19 +179,41 @@ class MaxClient:
     ) -> dict:
         """POST /messages — send a text/attachment message.
 
-        ``recipient`` shape — точную форму подтвердим в Phase 0/2 probe
-        первым реальным send'ом. Гипотезы из docs: ``{"chat_id": ...}``
-        или ``{"user_id": ...}`` или комбо.
+        Recipient routing per probe 2026-05-05 (Boris прямой curl на проде):
+        MAX ожидает ``chat_id`` или ``user_id`` в **query string**, НЕ
+        в JSON body. ``{"recipient": {"chat_id": ...}}`` в body отвергается
+        с ``"Unknown recipient"``. Корректный shape:
+        ``POST /messages?chat_id=...`` body: ``{"text": "..."}``.
+
+        ``recipient`` dict теперь интерпретируется как «один из ключей
+        chat_id/user_id» — извлекаем + кладём в params. Это сохраняет
+        backward-compat сигнатуру для caller'ов.
 
         ``format`` — optional ``"markdown"`` / ``"html"``.
         ``attachments`` — optional list, including inline-buttons keyboard.
+
+        Raises ValueError если ни chat_id ни user_id в recipient.
         """
-        payload: dict[str, Any] = {"recipient": recipient, "text": text}
+        params: dict[str, Any] = {}
+        if "chat_id" in recipient and recipient["chat_id"] is not None:
+            params["chat_id"] = recipient["chat_id"]
+        elif "user_id" in recipient and recipient["user_id"] is not None:
+            params["user_id"] = recipient["user_id"]
+        else:
+            raise ValueError(
+                "MaxClient.send_message: recipient must contain "
+                "non-None chat_id or user_id"
+            )
+
+        payload: dict[str, Any] = {"text": text}
         if format:
             payload["format"] = format
         if attachments:
             payload["attachments"] = attachments
-        return await self._request("POST", "/messages", json_payload=payload, timeout=10.0)
+        return await self._request(
+            "POST", "/messages",
+            params=params, json_payload=payload, timeout=10.0,
+        )
 
     async def get_updates(
         self,
