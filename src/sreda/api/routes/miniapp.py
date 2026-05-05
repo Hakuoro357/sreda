@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
@@ -35,7 +36,15 @@ from sreda.services.housewife_family import HousewifeFamilyService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
-from sreda.services.onboarding import ensure_telegram_user_bundle_by_id
+from sreda.services.max_auth import (
+    MaxInitDataError,
+    resolve_tenant_from_max_account_id,
+    validate_max_init_data,
+)
+from sreda.services.onboarding import (
+    ensure_max_user_bundle,
+    ensure_telegram_user_bundle_by_id,
+)
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     resolve_tenant_from_telegram_id,
@@ -66,18 +75,34 @@ _jinja_env = Environment(
 class MiniAppContext:
     tenant_id: str
     user_id: str
-    telegram_id: str
     workspace_id: str | None
+    # Channel-agnostic identity (Phase 8 dual-platform). ``channel``
+    # ∈ {"telegram", "max"}. ``account_id`` — the channel-native id
+    # (telegram numeric id OR MAX user_id). External callers should
+    # not branch on these — used only for diagnostic logging.
+    channel: str = "telegram"
+    account_id: str = ""
 
 
 def _require_miniapp_auth(
     request: Request,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ) -> MiniAppContext:
+    """Channel-agnostic mini-app auth.
+
+    Reads ``?platform=`` query param (default ``telegram`` for backward
+    compat). Dispatches initData validation to TG or MAX validator,
+    resolves tenant by appropriate id, lazy-provisions if missing.
+
+    Phase 8 of MAX integration sprint — без этого dispatch'а MAX-юзер
+    получал 401 на любом ``/api/v1/...`` (старая версия валидировала
+    как TG-only). Mini-app frontend (`platform_bridge.js` в base.html)
+    добавляет ``?platform=`` query на каждый fetch — backend дальше
+    маршрутит.
+    """
     auth_header = request.headers.get("authorization", "")
     if not auth_header.lower().startswith("tma "):
-        # Diagnostic: log enough to distinguish "no header at all" vs
-        # "header present but wrong prefix" without leaking the payload.
         ua = request.headers.get("user-agent", "")[:120]
         logger.warning(
             "miniapp auth: missing/invalid Authorization header "
@@ -91,63 +116,230 @@ def _require_miniapp_auth(
 
     init_data_raw = auth_header[4:]
     settings = get_settings()
-    bot_token = settings.telegram_bot_token
-    if not bot_token:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="bot_token_not_configured")
 
-    try:
-        webapp_user = validate_init_data(init_data_raw, bot_token)
-    except TelegramInitDataError as exc:
-        logger.warning("miniapp auth failed: %s", exc)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_init_data") from exc
-
-    resolved = resolve_tenant_from_telegram_id(session, webapp_user.telegram_id)
-    if resolved is None:
-        # User has a valid Telegram-signed initData but never triggered the
-        # bot webhook (e.g. opened the Mini App directly via menu button or
-        # deep link before sending /start). Hash was signed by Telegram —
-        # trust it and provision a bundle lazily so the Mini App is usable
-        # immediately instead of returning 401 user_not_found.
-        display_name = (
-            (webapp_user.first_name or "").strip()
-            or (webapp_user.username or "").strip()
-            or None
+    # Default channel = telegram для backward-compat (старые TG-юзеры
+    # без ?platform=). Frontend platform_bridge.js всегда добавляет
+    # query, но осторожный default нужен для прямых curl/тестов.
+    channel = (request.query_params.get("platform") or "telegram").lower()
+    if channel not in ("telegram", "max"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unknown platform: {channel!r}",
         )
+
+    if channel == "telegram":
+        bot_token = settings.telegram_bot_token
+        if not bot_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="telegram_bot_token_not_configured",
+            )
         try:
-            onboarding = ensure_telegram_user_bundle_by_id(
-                session,
-                telegram_id=webapp_user.telegram_id,
-                display_name=display_name,
-            )
-            session.commit()
-        except Exception:
-            session.rollback()
-            logger.exception(
-                "miniapp auth: lazy provision failed for tg=%s",
-                webapp_user.telegram_id,
-            )
+            webapp_user = validate_init_data(init_data_raw, bot_token)
+        except TelegramInitDataError as exc:
+            logger.warning("miniapp auth failed (tg): %s", exc)
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="provision_failed",
-            )
-        logger.info(
-            "miniapp auth: lazily provisioned bundle tg=%s tenant=%s user=%s new=%s",
-            webapp_user.telegram_id,
-            onboarding.tenant_id,
-            onboarding.user_id,
-            onboarding.is_new_user,
-        )
-        if onboarding.tenant_id is None or onboarding.user_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="provision_incomplete",
-            )
-        tenant_id = onboarding.tenant_id
-        user_id = onboarding.user_id
-    else:
-        tenant_id, user_id = resolved
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_init_data",
+            ) from exc
 
-    # Resolve workspace_id for connect link creation
+        account_id = webapp_user.telegram_id
+        resolved = resolve_tenant_from_telegram_id(session, account_id)
+        if resolved is None:
+            display_name = (
+                (webapp_user.first_name or "").strip()
+                or (webapp_user.username or "").strip()
+                or None
+            )
+            try:
+                onboarding = ensure_telegram_user_bundle_by_id(
+                    session,
+                    telegram_id=account_id,
+                    display_name=display_name,
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception(
+                    "miniapp auth: lazy provision failed for tg=%s",
+                    account_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="provision_failed",
+                )
+            logger.info(
+                "miniapp auth: lazily provisioned tg=%s tenant=%s user=%s new=%s",
+                account_id, onboarding.tenant_id, onboarding.user_id,
+                onboarding.is_new_user,
+            )
+            if onboarding.tenant_id is None or onboarding.user_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="provision_incomplete",
+                )
+            tenant_id = onboarding.tenant_id
+            user_id = onboarding.user_id
+        else:
+            tenant_id, user_id = resolved
+
+    else:  # channel == "max"
+        if not settings.max_bot_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="max_bot_token_not_configured",
+            )
+        try:
+            max_user = validate_max_init_data(
+                init_data_raw, settings.max_bot_token,
+            )
+        except MaxInitDataError as exc:
+            logger.warning("miniapp auth failed (max): %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_init_data",
+            ) from exc
+
+        account_id = max_user.max_user_id
+        try:
+            resolved = resolve_tenant_from_max_account_id(session, account_id)
+        except MultipleResultsFound:
+            # codex R2 MINOR #6: specific exception вместо bare ``Exception``.
+            # `find_user_by_max_account_id` использует one_or_none(),
+            # на duplicate `users.max_account_id` (нет UNIQUE constraint
+            # в текущей schema) бросит MultipleResultsFound. Любые другие
+            # DB ошибки пробрасываются вверх (FastAPI 500) с raw stack —
+            # это правильно: «duplicate integrity» — не маска любого
+            # falure'а, а конкретный case.
+            logger.exception(
+                "miniapp auth: duplicate users.max_account_id for max=%s — "
+                "DATA INTEGRITY ERROR, нужен migration с UNIQUE partial index",
+                account_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="duplicate_max_account_integrity",
+            )
+
+        if resolved is None:
+            # Codex R1 MAJOR #6: admin alert на создание MAX-only tenant'а.
+            # Boris's design (R5 channel-linking sprint): auto-merge запрещён,
+            # юзер с TG-аккаунтом и MAX-аккаунтом — отдельные tenants до
+            # explicit channel linking. Но для нового MAX-юзера без TG
+            # это OK. Alert чтобы можно было через support слить если
+            # это случайно existing TG-юзер (например, Boris вручную
+            # SQL-merge, как 2026-05-05).
+            #
+            # Codex R3 MAJOR new: race condition защита. Mini-app при
+            # первой загрузке параллельно fire'ит 4-5 fetch'ей
+            # (summary/plans/menu/schedule/...), все попадают сюда для
+            # нового MAX-юзера. ``ensure_max_user_bundle`` использует
+            # deterministic PK (`f"user_max_{account_id}"`), параллельные
+            # INSERT'ы получают IntegrityError. Catch + retry resolve.
+            try:
+                onboarding = ensure_max_user_bundle(
+                    session,
+                    max_account_id=account_id,
+                    max_chat_id=max_user.max_chat_id,
+                    display_name=(max_user.first_name or "").strip() or None,
+                )
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                logger.info(
+                    "miniapp auth: lazy provision race for max=%s — "
+                    "another request created tenant первым, re-resolving",
+                    account_id,
+                )
+                resolved = resolve_tenant_from_max_account_id(session, account_id)
+                if resolved is None:
+                    # Резолв failed even after rollback — что-то еще
+                    # сломано (не race), пропускаем как provision_failed.
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="provision_failed_after_race",
+                    )
+                tenant_id, user_id = resolved
+                # skip the rest of the new-user branch (logging, alert)
+                onboarding = None
+            except Exception:
+                session.rollback()
+                logger.exception(
+                    "miniapp auth: lazy provision failed for max=%s",
+                    account_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="provision_failed",
+                )
+            # Skip block ниже если race-fallback уже set'нул tenant_id/user_id
+            # из resolve (onboarding=None означает что provision сделал
+            # другой parallel request).
+            if onboarding is not None:
+                logger.info(
+                    "miniapp auth: lazily provisioned max=%s tenant=%s user=%s new=%s",
+                    account_id, onboarding.tenant_id, onboarding.user_id,
+                    onboarding.is_new_user,
+                )
+                if onboarding.is_new_user:
+                    # codex R2 MAJOR fix: ``asyncio.create_task`` в sync FastAPI
+                    # dependency не работает (нет running event loop в worker
+                    # thread). Использовать ``background_tasks.add_task`` —
+                    # FastAPI выполнит после response в правильном контексте.
+                    # Best-effort: alert не блокирует юзера и не ломает auth.
+                    try:
+                        from sreda.services.admin_alerts import alert_admin_async
+                        name = (max_user.first_name or "").strip() or "unknown"
+                        background_tasks.add_task(
+                            alert_admin_async,
+                            f"🟢 New MAX tenant via mini-app lazy-provision\n"
+                            f"max_account_id={account_id} name={name}\n"
+                            f"tenant={onboarding.tenant_id}\n"
+                            f"⚠ Если это existing TG-юзер — нужен manual merge через "
+                            f"channel_link или SQL",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "schedule admin alert на new max tenant failed",
+                            exc_info=True,
+                        )
+                if onboarding.tenant_id is None or onboarding.user_id is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="provision_incomplete",
+                    )
+                tenant_id = onboarding.tenant_id
+                user_id = onboarding.user_id
+        else:
+            tenant_id, user_id = resolved
+            # Codex R1 MAJOR #4: refresh max_chat_id если изменился.
+            # Сценарий: Boris вручную SQL-merge'нул tenant'ы; max_chat_id
+            # был известен на момент merge'а. Если юзер удалит и пересоздаст
+            # MAX-аккаунт (новый chat_id), без refresh outbound delivery
+            # пойдёт на старый chat_id и упадёт.
+            if max_user.max_chat_id:
+                try:
+                    from sreda.db.models.core import User
+                    user_row = session.get(User, user_id)
+                    if (
+                        user_row is not None
+                        and user_row.max_chat_id != max_user.max_chat_id
+                    ):
+                        logger.info(
+                            "miniapp auth: refreshing max_chat_id user=%s "
+                            "old=%r new=%s",
+                            user_id, user_row.max_chat_id, max_user.max_chat_id,
+                        )
+                        user_row.max_chat_id = max_user.max_chat_id
+                        session.commit()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "miniapp auth: max_chat_id refresh failed user=%s",
+                        user_id, exc_info=True,
+                    )
+                    session.rollback()
+
+    # Resolve workspace_id for connect link creation (channel-agnostic)
     from sreda.db.models.core import Assistant, Workspace
 
     assistant = (
@@ -169,8 +361,9 @@ def _require_miniapp_auth(
     return MiniAppContext(
         tenant_id=tenant_id,
         user_id=user_id,
-        telegram_id=webapp_user.telegram_id,
         workspace_id=workspace_id,
+        channel=channel,
+        account_id=account_id,
     )
 
 

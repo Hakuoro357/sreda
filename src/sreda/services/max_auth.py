@@ -141,9 +141,13 @@ def validate_max_init_data(
     except (json.JSONDecodeError, TypeError) as exc:
         raise MaxInitDataError("invalid user JSON") from exc
 
-    user_id = user_data.get("id")
+    # Codex R1 MAJOR #8: MAX webhook payloads используют ``user.user_id``
+    # (probe Phase 0). Mini-app initData может следовать тому же shape.
+    # docs не специфицируют — принимаем оба поля для robustness, что бы
+    # MAX ни прислал.
+    user_id = user_data.get("id") or user_data.get("user_id")
     if user_id is None:
-        raise MaxInitDataError("user.id missing")
+        raise MaxInitDataError("user.id / user.user_id missing")
 
     chat_id_str: str | None = None
     if chat_json:
@@ -161,3 +165,24 @@ def validate_max_init_data(
         username=user_data.get("username"),
         start_param=start_param,
     )
+
+
+def resolve_tenant_from_max_account_id(
+    session,  # type: ignore[no-untyped-def]
+    max_account_id: str,
+) -> tuple[str, str] | None:
+    """Look up ``(tenant_id, user_id)`` by MAX account ID.
+
+    Returns ``None`` if no matching user — caller (mini-app context
+    resolver) делает lazy provision через ``ensure_max_user_bundle``.
+
+    Mirror ``services.telegram_auth.resolve_tenant_from_telegram_id`` —
+    одинаковая сигнатура для unified channel-agnostic dispatch в
+    `miniapp._resolve_miniapp_context`.
+    """
+    from sreda.services.onboarding import find_user_by_max_account_id
+
+    user = find_user_by_max_account_id(session, max_account_id)
+    if user is None:
+        return None
+    return user.tenant_id, user.id

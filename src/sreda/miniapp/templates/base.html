@@ -35,24 +35,37 @@
       // от window.WebApp чтобы существующий код продолжал работать.
       // initDataUnsafe + initData + ready/expand/close — минимально
       // достаточный API для текущих шаблонов.
+      //
+      // Codex R1 CRITICAL fix: Telegram SDK мог уже создать
+      // ``window.Telegram.WebApp`` с empty ``initData`` даже в МАКС-окружении
+      // (SDK script грузится раньше platform_bridge). Если просто использовать
+      // ``window.Telegram.WebApp = window.Telegram.WebApp || {...}``, в MAX
+      // получили бы empty TG initData → backend 401. Поэтому мы FORCIBLY
+      // перезаписываем initData/initDataUnsafe от MAX SDK.
       if (platform === "max" && window.WebApp) {
         var max = window.WebApp;
         window.Telegram = window.Telegram || {};
-        window.Telegram.WebApp = window.Telegram.WebApp || {
+        var existing = window.Telegram.WebApp || {};
+        window.Telegram.WebApp = {
+          // Force MAX initData/initDataUnsafe over any TG SDK shell
           initData: max.initData || "",
           initDataUnsafe: max.initDataUnsafe || {},
           ready: function() { try { max.ready && max.ready(); } catch (e) {} },
           expand: function() { try { max.expand && max.expand(); } catch (e) {} },
           close: function() { try { max.close && max.close(); } catch (e) {} },
-          themeParams: max.themeParams || {},
-          MainButton: max.MainButton || { setText: function(){}, show: function(){}, hide: function(){}, onClick: function(){} },
-          BackButton: max.BackButton || { show: function(){}, hide: function(){}, onClick: function(){} },
+          themeParams: max.themeParams || existing.themeParams || {},
+          MainButton: max.MainButton || existing.MainButton || { setText: function(){}, show: function(){}, hide: function(){}, onClick: function(){} },
+          BackButton: max.BackButton || existing.BackButton || { show: function(){}, hide: function(){}, onClick: function(){} },
           openTelegramLink: function(url) { try { window.open(url, '_blank'); } catch (e) {} },
         };
       }
 
       // Helper: добавить ?platform=... к API URL. Если URL уже имеет
       // platform — оставляем (может быть явно указан caller'ом).
+      //
+      // Backend default: ``platform=telegram`` если query отсутствует
+      // (backward-compat для legacy curl/тестов). Frontend ВСЕГДА
+      // добавляет explicit query через эту функцию.
       window.__sredaWithPlatform = function(path) {
         if (!path) return path;
         var sep = path.indexOf("?") >= 0 ? "&" : "?";
