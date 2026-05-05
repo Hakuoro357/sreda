@@ -666,6 +666,11 @@ async def _handle_max_reminder_callback(
     action, _, reminder_id = data.partition(":")
 
     # Original message text для context в replacement.
+    # Probe 2026-05-05 PM #2: на повторный tap (после первого ack)
+    # original_text может уже начинаться с "✅"/"⏰" — strip эти маркеры
+    # тоже, чтобы не накапливалось "✅ ✅ ✅ ...". Symbol set: bell + чек +
+    # будильник + space.
+    _CLEANUP_PREFIX = "🔔✅⏰ \t"
     original_text = ""
     msg = payload.get("message")
     if isinstance(msg, dict):
@@ -673,20 +678,23 @@ async def _handle_max_reminder_callback(
         if isinstance(body, dict):
             txt = body.get("text")
             if isinstance(txt, str):
-                # Strip leading "🔔 " emoji если есть — заменим на ✅/⏰
-                original_text = txt.lstrip("🔔 ").strip()
+                original_text = txt.lstrip(_CLEANUP_PREFIX).strip()
 
     async def _ack_with_replacement(new_text: str) -> None:
         """Send /answers с message field — replaces original message body
         (clears buttons + changes text). Fallback на notification если
         replacement отвергнут MAX'ом.
+
+        Probe 2026-05-05 PM #2: ``attachments: []`` обязателен чтобы убрать
+        inline-кнопки. Без него MAX оставляет original buttons (юзер
+        продолжает тапать впустую).
         """
         if not callback_id:
             return
         try:
             await max_client.answer_callback(
                 str(callback_id),
-                message={"text": new_text},
+                message={"text": new_text, "attachments": []},
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
