@@ -1800,28 +1800,45 @@
         return;
       }
       var targetLabel = res.target_channel === "max" ? "MAX" : "Telegram";
-      var bridge = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
-      if (bridge && typeof bridge.openLink === "function") {
-        try { bridge.openLink(res.deep_link); }
-        catch (e) { window.open(res.deep_link, "_blank"); }
-      } else {
-        window.open(res.deep_link, "_blank");
-      }
+      // Не вызываем bridge.openLink automatically — TG-Android opens
+      // max.ru URL внутри TG webview, что ломает initData. Юзер должен
+      // вручную скопировать ссылку и открыть в external app.
 
       var slot = document.getElementById("channel-link-slot");
       if (slot) {
+        // Note: TG-Android's openLink opens URL внутри TG webview, не
+        // external. Юзер должен скопировать ссылку и открыть в МАКС
+        // приложении напрямую. Compute escaped link once для inline.
+        var linkEsc = escHtml(res.deep_link);
         slot.innerHTML =
           '<div class="card">' +
             '<div class="card-title">Открой ' + targetLabel + ' и подтверди связь</div>' +
-            '<div class="card-subtitle" style="word-break:break-all;margin-top:8px">' +
-              'Если ничего не открылось, скопируй:<br>' +
-              '<a href="' + escHtml(res.deep_link) + '" style="color:#3b82f6">' +
-              escHtml(res.deep_link) + '</a>' +
+            '<div class="card-subtitle" style="margin-top:8px">' +
+              '<button id="cl-copy-btn" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px">📋 Скопировать ссылку</button>' +
+              '<span id="cl-copy-status" style="margin-left:8px;color:#16a34a"></span>' +
+            '</div>' +
+            '<div class="card-subtitle" style="word-break:break-all;margin-top:8px;font-size:11px;color:#6b7280">' +
+              'Или вручную: <a href="' + linkEsc + '" style="color:#3b82f6">' + linkEsc + '</a>' +
             '</div>' +
             '<div class="card-subtitle" style="margin-top:8px">' +
-              'Ссылка действует 5 минут' +
+              'Ссылка действует 5 минут. После открытия в МАКС подтверди связь.' +
             '</div>' +
           '</div>';
+        var copyBtn = document.getElementById("cl-copy-btn");
+        if (copyBtn) {
+          copyBtn.addEventListener("click", function() {
+            var status = document.getElementById("cl-copy-status");
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(res.deep_link).then(function() {
+                if (status) status.textContent = "✓ Готово";
+              }).catch(function() {
+                if (status) status.textContent = "Не удалось — копируй ссылку ниже";
+              });
+            } else {
+              if (status) status.textContent = "Копируй ссылку ниже";
+            }
+          });
+        }
       }
 
       var attempts = 0;
