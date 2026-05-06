@@ -1718,11 +1718,12 @@
   // -- Main render --
   function render() {
     var route = getRoute();
-    // TG-Android quirk fix: initData засовывается в location.hash как
-    // tgWebAppData=...&tgWebAppVersion=...&tgWebAppPlatform=...&tgWebAppThemeParams=...
-    // Что getRoute() ошибочно интерпретирует как route. Если route начинается
-    // с "tgWebApp" — это initData, не настоящий route. Default к "/".
-    if (route.indexOf("tgWebApp") === 0) {
+    // TG-Android / MAX quirk fix: initData засовывается в location.hash:
+    // - TG: tgWebAppData=...&tgWebAppVersion=...&tgWebAppPlatform=...
+    // - MAX: WebAppData=...&WebAppPlatform=...&WebAppVersion=...
+    // getRoute() ошибочно интерпретирует это как route → fallback "/" если
+    // route начинается с любого из этих префиксов.
+    if (route.indexOf("tgWebApp") === 0 || route.indexOf("WebApp") === 0) {
       route = "/";
     }
     var channelLinkToken = getChannelLinkToken();
