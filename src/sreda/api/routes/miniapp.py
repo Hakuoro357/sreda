@@ -1870,12 +1870,41 @@ async def channel_link_start(
     except Exception:  # noqa: BLE001
         logger.debug("admin alert failed (non-fatal)", exc_info=True)
 
+    # Send deep-link to source channel chat — простой UX: юзер видит
+    # ссылку прямо в bot чате, тапает напрямую (system-level URL routing
+    # → MAX/TG app), без copy/paste workflow в miniapp.
+    target_label = "MAX" if result.target_channel == "max" else "Telegram"
+    msg_text = (
+        f"Чтобы привязать аккаунт {target_label}, открой эту ссылку "
+        f"(она действует 5 минут):\n\n{result.deep_link}\n\n"
+        f"Откроется бот в {target_label} — подтверди связь там."
+    )
+    try:
+        from sreda.db.models.core import User as _User
+        if platform == "telegram":
+            from sreda.integrations.telegram.client import TelegramClient
+            source_user_row = session.get(_User, source_user_id)
+            tg_chat_id = source_user_row.telegram_account_id if source_user_row else None
+            if tg_chat_id and settings.telegram_bot_token:
+                tg_client = TelegramClient(token=settings.telegram_bot_token)
+                await tg_client.send_message(chat_id=str(tg_chat_id), text=msg_text)
+        else:  # platform == "max"
+            from sreda.integrations.max.client import MaxClient
+            source_user_row = session.get(_User, source_user_id)
+            max_chat_id = source_user_row.max_chat_id if source_user_row else None
+            if max_chat_id and settings.max_bot_token:
+                max_client = MaxClient(token=settings.max_bot_token)
+                await max_client.send_message(
+                    recipient={"chat_id": max_chat_id}, text=msg_text,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("channel-link: send deep-link to source chat failed: %s", exc)
+
     return {
         "id": result.id,
-        "deep_link": result.deep_link,
         "target_channel": result.target_channel,
         "expires_at": result.expires_at.isoformat(),
-        "raw_token": result.raw_token,  # для frontend display + handoff
+        "sent_to_chat": True,  # frontend signal close miniapp без card
     }
 
 

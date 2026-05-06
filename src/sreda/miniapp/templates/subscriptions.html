@@ -1804,86 +1804,39 @@
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({}),
     }).then(function(res) {
-      if (!res || !res.deep_link) {
+      if (!res || !res.sent_to_chat) {
         showAlert("Не удалось создать ссылку. Попробуй позже.");
         return;
       }
-      if (!/^https:\/\//i.test(res.deep_link)) {
-        showAlert("Получена некорректная ссылка от сервера");
-        return;
+      // Backend отправил deep-link в bot чат. Закрываем miniapp —
+      // юзер найдёт ссылку в чате с ботом.
+      var bridge = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
+      if (bridge && typeof bridge.close === "function") {
+        try { bridge.close(); return; } catch (e) {}
       }
-      var targetLabel = res.target_channel === "max" ? "MAX" : "Telegram";
-      // Не вызываем bridge.openLink automatically — TG-Android opens
-      // max.ru URL внутри TG webview, что ломает initData. Юзер должен
-      // вручную скопировать ссылку и открыть в external app.
-
+      // Fallback when bridge.close недоступен: in-page banner.
       var slot = document.getElementById("channel-link-slot");
       if (slot) {
-        // Note: TG-Android's openLink opens URL внутри TG webview, не
-        // external. Юзер должен скопировать ссылку и открыть в МАКС
-        // приложении напрямую. Compute escaped link once для inline.
-        var linkEsc = escHtml(res.deep_link);
         slot.innerHTML =
-          '<div class="card">' +
-            '<div class="card-title">Открой ' + targetLabel + ' и подтверди связь</div>' +
-            '<div class="card-subtitle" style="margin-top:8px">' +
-              '<button id="cl-copy-btn" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px">📋 Скопировать ссылку</button>' +
-              '<span id="cl-copy-status" style="margin-left:8px;color:#16a34a"></span>' +
-            '</div>' +
-            '<div class="card-subtitle" style="word-break:break-all;margin-top:8px;font-size:11px;color:#6b7280">' +
-              'Или вручную: <a href="' + linkEsc + '" style="color:#3b82f6">' + linkEsc + '</a>' +
-            '</div>' +
-            '<div class="card-subtitle" style="margin-top:8px">' +
-              'Ссылка действует 5 минут. После открытия в МАКС подтверди связь.' +
-            '</div>' +
+          '<div class="card" style="background:#dcfce7;border-color:#86efac">' +
+            '<div class="card-title">✓ Ссылка отправлена в чат с ботом</div>' +
+            '<div class="card-subtitle" style="margin-top:6px">Открой чат и тапни ссылку.</div>' +
           '</div>';
-        var copyBtn = document.getElementById("cl-copy-btn");
-        if (copyBtn) {
-          copyBtn.addEventListener("click", function() {
-            var status = document.getElementById("cl-copy-status");
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-              navigator.clipboard.writeText(res.deep_link).then(function() {
-                if (status) status.textContent = "✓ Готово";
-              }).catch(function() {
-                if (status) status.textContent = "Не удалось — копируй ссылку ниже";
-              });
-            } else {
-              if (status) status.textContent = "Копируй ссылку ниже";
-            }
-          });
-        }
       }
-
-      var attempts = 0;
-      clearChannelLinkPoll();
-      _channelLinkPollIntervalId = setInterval(function() {
-        attempts++;
-        if (getRoute() !== "/") { clearChannelLinkPoll(); return; }
-        if (attempts > 15) { clearChannelLinkPoll(); return; }
-        channelLinkApiFetch("/miniapp/api/v1/channel-link/account-status").then(function(s) {
-          if (s && s.linked) {
-            clearChannelLinkPoll();
-            var slot2 = document.getElementById("channel-link-slot");
-            if (slot2) {
-              slot2.innerHTML =
-                '<div class="card" style="background:#dcfce7;border-color:#86efac">' +
-                  '<div class="card-title">✅ Аккаунты связаны</div>' +
-              '</div>';
-            }
-          }
-        }).catch(function(err) {
-          if (err && err.message === "auth_expired") clearChannelLinkPoll();
-        });
-      }, 2000);
+      return;
     }).catch(function(err) {
       if (err && err.message === "auth_expired") return;
       if (err && err.status === 429) {
         showAlert("Слишком много попыток. Попробуй через 30 минут.");
+      } else if (err && err.status === 409) {
+        showAlert("Аккаунт уже привязан.");
       } else {
         showAlert("Не удалось создать ссылку. Попробуй позже.");
       }
     });
   };
+
+  // (Legacy card UI removed — chat-based delivery теперь handles ссылку)
 
   window._consumeChannelLink = function(rawToken, opts) {
     _channelLinkLastErrorMessage = null;
