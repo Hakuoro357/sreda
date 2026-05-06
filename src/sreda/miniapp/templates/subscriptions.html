@@ -1705,14 +1705,13 @@
   // -- Main render --
   function render() {
     var route = getRoute();
-    // DIAGNOSTIC v3: log every render() entry с route + state
-    try {
-      fetch("https://miniapp.sredaspace.ru/miniapp/api/v1/client-diagnostic", {
-        method: "POST",
-        headers: {"Content-Type": "application/json", "Authorization": "tma " + initData},
-        body: JSON.stringify({reason: "render_entry", build: "debug-003", route: route, hash: location.hash || "(empty)", state_loading: !!state.loading, state_error: !!state.error}),
-      });
-    } catch (e) {}
+    // TG-Android quirk fix: initData засовывается в location.hash как
+    // tgWebAppData=...&tgWebAppVersion=...&tgWebAppPlatform=...&tgWebAppThemeParams=...
+    // Что getRoute() ошибочно интерпретирует как route. Если route начинается
+    // с "tgWebApp" — это initData, не настоящий route. Default к "/".
+    if (route.indexOf("tgWebApp") === 0) {
+      route = "/";
+    }
     var channelLinkToken = getChannelLinkToken();
     if (channelLinkToken && !_channelLinkConfirmShown) {
       _channelLinkConfirmShown = true;
