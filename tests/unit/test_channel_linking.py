@@ -63,7 +63,7 @@ def test_start_link_creates_opaque_token_with_hash(session):
     )
 
     assert result.target_channel == "max"
-    assert result.deep_link.startswith("https://max.ru/id320700072280_bot?startapp=lnk_")
+    assert result.deep_link.startswith("https://max.ru/id320700072280_bot?start=lnk_")
     assert len(result.raw_token) >= 32
 
     # Token хранится hashed

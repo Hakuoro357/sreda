@@ -82,6 +82,42 @@ async def handle_max_update(
         )
         return ""
 
+    # Channel-link interception — handle BEFORE ensure_max_user_bundle
+    # чтобы не создать orphan tenant_max_<id> для one-shot link command.
+    # User не существует в DB — consume_link's collision check вернёт
+    # None → goto «no collision» branch → attach to source tenant cleanly.
+    if update_type == "message_created":
+        from sreda.services.inbound_messages import _extract_max_message_text
+        text_msg = _extract_max_message_text(payload)
+        if isinstance(text_msg, str) and text_msg.strip().startswith("/start lnk_"):
+            raw_token = text_msg.strip().removeprefix("/start lnk_").strip()
+            await _handle_max_link_start_cmd(
+                raw_token=raw_token,
+                chat_id=str(chat_id) if chat_id is not None else None,
+            )
+            return ""
+
+    if update_type == "message_callback":
+        callback = payload.get("callback") or {}
+        cb_data = callback.get("payload") or ""
+        if isinstance(cb_data, str) and cb_data.startswith("confirm_link:"):
+            raw_token = cb_data.removeprefix("confirm_link:").strip()
+            callback_id = callback.get("callback_id")
+            await _handle_max_link_confirm_cb(
+                raw_token=raw_token,
+                sender_user_id=str(sender_user_id),
+                chat_id=str(chat_id) if chat_id is not None else None,
+                callback_id=callback_id,
+            )
+            return ""
+        if isinstance(cb_data, str) and cb_data.startswith("cancel_link:"):
+            callback_id = callback.get("callback_id")
+            await _handle_max_link_cancel_cb(
+                raw_token=cb_data.removeprefix("cancel_link:").strip(),
+                callback_id=callback_id,
+            )
+            return ""
+
     with SessionLocal() as session:
         # Sender display name (best-effort).
         display_name = _extract_max_display_name(payload)
@@ -925,6 +961,159 @@ async def _handle_max_reminder_callback(
     session.commit()
 
     await _ack_with_replacement(replacement)
+
+
+async def _handle_max_link_start_cmd(*, raw_token: str, chat_id: str | None) -> None:
+    """Handle `/start lnk_<token>` command in MAX bot chat.
+
+    Replies с inline button «✅ Подтвердить» / «❌ Отмена». User tap
+    triggers `confirm_link:<token>` или `cancel_link:<token>` callback
+    что мы catches in handle_max_update.
+    """
+    from sreda.services.channel_linking import lookup_token
+
+    settings = get_settings()
+    if not (settings.max_bot_token and chat_id):
+        logger.warning("max link /start: missing max_bot_token или chat_id")
+        return
+
+    SessionLocal = get_session_factory()
+    with SessionLocal() as session:
+        token_row = lookup_token(session, raw_token)
+
+    client = MaxClient(token=settings.max_bot_token)
+
+    if token_row is None:
+        try:
+            await client.send_message(
+                recipient={"chat_id": chat_id},
+                text="Ссылка истекла или уже использована. Сгенерируй новую в Telegram.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("max link /start invalid token reply failed", exc_info=True)
+        return
+
+    if token_row.target_channel != "max":
+        try:
+            await client.send_message(
+                recipient={"chat_id": chat_id},
+                text="Эта ссылка не для MAX. Открой её в Telegram.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    try:
+        await client.send_message(
+            recipient={"chat_id": chat_id},
+            text=(
+                "Подтвердить связь твоего MAX-аккаунта с Sreda юзером?\n\n"
+                "⚠ Если у тебя был отдельный аккаунт Среды в MAX — его данные "
+                "будут заменены."
+            ),
+            attachments=[{
+                "type": "inline_keyboard",
+                "payload": {
+                    "buttons": [[
+                        {"type": "callback", "text": "✅ Подтвердить",
+                         "payload": f"confirm_link:{raw_token}"},
+                        {"type": "callback", "text": "❌ Отмена",
+                         "payload": f"cancel_link:{raw_token}"},
+                    ]],
+                },
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("max link /start confirm send failed: %s", exc)
+
+
+async def _handle_max_link_confirm_cb(
+    *, raw_token: str, sender_user_id: str, chat_id: str | None,
+    callback_id,
+) -> None:
+    """Handle `confirm_link:<token>` callback — execute consume_link."""
+    from sreda.services.channel_linking import consume_link
+
+    settings = get_settings()
+    SessionLocal = get_session_factory()
+
+    with SessionLocal() as session:
+        outcome = consume_link(
+            session,
+            raw_token=raw_token,
+            target_channel="max",
+            target_account_id=sender_user_id,
+            target_chat_id=chat_id,
+        )
+
+    if outcome.success:
+        reply_text = (
+            "✅ Аккаунты связаны! Теперь Среда видит тебя в обоих мессенджерах."
+        )
+    elif outcome.error == "account_already_registered_separately":
+        reply_text = (
+            "У тебя уже есть отдельный Sreda-аккаунт в MAX. "
+            "Напиши в @sreda_support — свяжем вручную."
+        )
+    elif outcome.error == "already_linked_other_account":
+        reply_text = "К этому Sreda-юзеру уже привязан другой MAX-аккаунт."
+    elif outcome.error == "account_belongs_to_other_family_member":
+        reply_text = "Этот аккаунт уже привязан к другому члену семьи."
+    elif outcome.error == "not_found_or_expired":
+        reply_text = "Ссылка истекла или уже использована."
+    else:
+        reply_text = f"Не удалось связать: {outcome.error or 'неизвестная ошибка'}"
+
+    if not settings.max_bot_token:
+        return
+    client = MaxClient(token=settings.max_bot_token)
+    try:
+        if callback_id:
+            await client.answer_callback(
+                str(callback_id),
+                message={"text": reply_text, "attachments": []},
+            )
+        elif chat_id:
+            await client.send_message(
+                recipient={"chat_id": chat_id}, text=reply_text,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("max link confirm reply failed: %s", exc)
+
+
+async def _handle_max_link_cancel_cb(
+    *, raw_token: str, callback_id,
+) -> None:
+    """Handle `cancel_link:<token>` callback — invalidate token."""
+    from sreda.db.models.channel_linking import ChannelLinkToken
+    from sreda.services.channel_linking import _hash_token
+    from sqlalchemy import update as sa_update
+
+    settings = get_settings()
+    SessionLocal = get_session_factory()
+
+    with SessionLocal() as session:
+        token_hash = _hash_token(raw_token)
+        session.execute(
+            sa_update(ChannelLinkToken)
+            .where(
+                ChannelLinkToken.token_hash == token_hash,
+                ChannelLinkToken.used_at.is_(None),
+            )
+            .values(used_at=datetime.now(timezone.utc))
+        )
+        session.commit()
+
+    if not (settings.max_bot_token and callback_id):
+        return
+    client = MaxClient(token=settings.max_bot_token)
+    try:
+        await client.answer_callback(
+            str(callback_id),
+            message={"text": "Отменено. Ссылка деактивирована.", "attachments": []},
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:

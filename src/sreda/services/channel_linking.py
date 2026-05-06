@@ -119,9 +119,16 @@ def _build_deep_link(
     tg_bot_username: str | None,
     tg_miniapp_shortname: str | None,
 ) -> str:
-    """Build platform-specific deep-link with start_param."""
+    """Build platform-specific deep-link with start_param.
+
+    For MAX target: use `?start=lnk_X` (chat-based) instead of
+    `?startapp=lnk_X` (mini-app). Bot's mini-app registration in MAX
+    causes mini-app launch when `?startapp=` used, but mini-app initData
+    delivery of start_param is unreliable. Chat-based: bot receives
+    /start command with payload, sends inline confirm button. Mirror
+    TG-style chat flow."""
     if target_channel == "max":
-        return f"https://max.ru/{_MAX_BOT_USERNAME}?startapp=lnk_{raw_token}"
+        return f"https://max.ru/{_MAX_BOT_USERNAME}?start=lnk_{raw_token}"
     if target_channel == "telegram":
         if not tg_bot_username or not tg_miniapp_shortname:
             raise ValueError(
