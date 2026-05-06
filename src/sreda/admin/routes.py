@@ -665,33 +665,45 @@ async def admin_tenant_approve(
 
     session.commit()
 
-    # Proactive Telegram welcome. Skipped if:
+    # Proactive welcome: route в TG если есть telegram_account_id, в MAX
+    # если есть max_chat_id (пользователь зарегался через MAX-only). Если
+    # есть и то и то — шлём в оба канала.
+    # Skipped if:
     # - tenant was already approved (idempotent re-click)
     # - no bot token configured (dev/test)
-    # - user has no telegram_account_id (manual CLI-created tenant)
+    # - user has neither telegram_account_id nor max_chat_id
     settings = get_settings()
     delivery_status = "skipped"
-    if (
-        was_pending
-        and settings.telegram_bot_token
-        and user is not None
-        and user.telegram_account_id
-    ):
-        client = TelegramClient(settings.telegram_bot_token)
-        # 2026-04-27 simplified: после approve шлём ОДНО короткое
-        # сообщение — подтверждение + вопрос про имя. Без кнопок.
-        # LLM сама развивает диалог дальше (имя через
-        # update_profile_field tool, остальное по контексту).
+    if was_pending and user is not None:
         text = build_post_approve_message()
-        try:
-            await client.send_message(
-                chat_id=user.telegram_account_id,
-                text=text,
-                reply_markup=None,
-            )
-            delivery_status = "ok"
-        except TelegramDeliveryError:
-            delivery_status = "tg_error"
+        delivery_results: list[str] = []
+
+        if settings.telegram_bot_token and user.telegram_account_id:
+            client = TelegramClient(settings.telegram_bot_token)
+            try:
+                await client.send_message(
+                    chat_id=user.telegram_account_id,
+                    text=text,
+                    reply_markup=None,
+                )
+                delivery_results.append("tg_ok")
+            except TelegramDeliveryError:
+                delivery_results.append("tg_error")
+
+        if settings.max_bot_token and user.max_chat_id:
+            from sreda.integrations.max.client import MaxClient
+            max_client = MaxClient(token=settings.max_bot_token)
+            try:
+                await max_client.send_message(
+                    recipient={"chat_id": user.max_chat_id},
+                    text=text,
+                )
+                delivery_results.append("max_ok")
+            except Exception:  # noqa: BLE001
+                delivery_results.append("max_error")
+
+        if delivery_results:
+            delivery_status = "+".join(delivery_results)
 
     return RedirectResponse(
         url=(
