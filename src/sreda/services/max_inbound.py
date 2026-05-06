@@ -1126,10 +1126,11 @@ async def _handle_max_pending_tenant(
 ) -> None:
     """Send pending welcome message via MaxClient.
 
-    Mirror TG ``_handle_pending_tenant``, scaled-down (no edit-message
-    flow):
+    Mirror TG ``_handle_pending_tenant``:
     - bot_started: send intro (pending_bot.match(None)) с inline buttons
-    - message_callback с payload "pb:*": send next branch
+    - message_callback с payload "pb:*": **edit** original message
+      in place (mirror TG editMessageText flow), fallback to send.
+      Also acks the callback to remove "loading" UX.
     - message_created: silent (юзер видел intro; spam'инг неуместно)
     - другое: silent
 
@@ -1149,6 +1150,8 @@ async def _handle_max_pending_tenant(
 
     input_text: str | None = None
     is_callback = False
+    callback_id: str | None = None
+    cb_message_mid: str | None = None
 
     if update_type == "bot_started":
         # Intro branch — pending_bot.match(None) returns intro reply
@@ -1159,6 +1162,18 @@ async def _handle_max_pending_tenant(
         if isinstance(cb_data, str) and pending_bot.is_pending_callback(cb_data):
             input_text = cb_data
             is_callback = True
+            cb_id_raw = callback.get("callback_id")
+            if cb_id_raw:
+                callback_id = str(cb_id_raw)
+            # MAX: original message (с inline keyboard) живёт в
+            # ``payload.message.body.mid`` для message_callback events.
+            msg = payload.get("message")
+            if isinstance(msg, dict):
+                body = msg.get("body")
+                if isinstance(body, dict):
+                    mid = body.get("mid")
+                    if mid:
+                        cb_message_mid = str(mid)
         else:
             return  # not pending_bot button → silent
     else:
@@ -1177,17 +1192,42 @@ async def _handle_max_pending_tenant(
     attachments = render_max_inline_keyboard_attachment(keyboard) if keyboard else None
 
     client = MaxClient(token=settings.max_bot_token)
-    try:
-        await client.send_message(
-            recipient={"chat_id": onboarding.max_chat_id},
-            text=reply.text,
-            attachments=attachments,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "max pending welcome send failed tenant=%s: %s",
-            onboarding.tenant_id, exc,
-        )
+
+    edited = False
+    if is_callback and cb_message_mid:
+        try:
+            await client.edit_message(
+                cb_message_mid,
+                text=reply.text,
+                attachments=attachments or [],
+            )
+            edited = True
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "max pending: edit_message failed mid=%s tenant=%s: %s "
+                "— fallback to send_message",
+                cb_message_mid, onboarding.tenant_id, exc,
+            )
+
+    if not edited:
+        try:
+            await client.send_message(
+                recipient={"chat_id": onboarding.max_chat_id},
+                text=reply.text,
+                attachments=attachments,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "max pending welcome send failed tenant=%s: %s",
+                onboarding.tenant_id, exc,
+            )
+
+    # Ack callback — remove «loading» state в UI юзера.
+    if is_callback and callback_id:
+        try:
+            await client.answer_callback(callback_id)
+        except Exception:  # noqa: BLE001
+            pass  # ack failure не critical — ux sugar
 
 
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:
