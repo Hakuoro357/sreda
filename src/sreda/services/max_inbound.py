@@ -144,11 +144,14 @@ async def handle_max_update(
         is_approved = tenant is not None and tenant.approved_at is not None
 
         if not is_approved:
-            # MVP: pending-flow для MAX = silent skip + log. Когда
-            # pending_bot будет channel-agnostic, добавим welcome flow.
-            logger.info(
-                "max inbound: pending tenant %s — drop (update_type=%s)",
-                onboarding.tenant_id, update_type,
+            # Pending tenant — send welcome через pending_bot (intro
+            # branch при bot_started; tour branch на pb:* callbacks).
+            # Иначе silent (избегаем spam'а при regular messages).
+            await _handle_max_pending_tenant(
+                payload=payload,
+                update_type=update_type,
+                onboarding=onboarding,
+                settings=settings,
             )
             _set_processing_status(
                 session, result.inbound_message_id, "ignored",
@@ -1115,6 +1118,76 @@ async def _handle_max_link_cancel_cb(
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+async def _handle_max_pending_tenant(
+    *, payload: dict, update_type: str | None, onboarding,
+    settings,
+) -> None:
+    """Send pending welcome message via MaxClient.
+
+    Mirror TG ``_handle_pending_tenant``, scaled-down (no edit-message
+    flow):
+    - bot_started: send intro (pending_bot.match(None)) с inline buttons
+    - message_callback с payload "pb:*": send next branch
+    - message_created: silent (юзер видел intro; spam'инг неуместно)
+    - другое: silent
+
+    Errors swallowed — pending welcome это UX sugar, не correctness-critical.
+    """
+    if not (settings.max_bot_token and onboarding.max_chat_id):
+        logger.info(
+            "max pending: no token/chat_id — drop tenant=%s",
+            onboarding.tenant_id,
+        )
+        return
+
+    from sreda.integrations.max.client import (
+        MaxClient, render_max_inline_keyboard_attachment,
+    )
+    from sreda.services import pending_bot
+
+    input_text: str | None = None
+    is_callback = False
+
+    if update_type == "bot_started":
+        # Intro branch — pending_bot.match(None) returns intro reply
+        pass  # input_text=None, is_callback=False
+    elif update_type == "message_callback":
+        callback = payload.get("callback") or {}
+        cb_data = callback.get("payload") or ""
+        if isinstance(cb_data, str) and pending_bot.is_pending_callback(cb_data):
+            input_text = cb_data
+            is_callback = True
+        else:
+            return  # not pending_bot button → silent
+    else:
+        return  # message_created / other → silent
+
+    reply = pending_bot.match(input_text, is_callback=is_callback)
+
+    # Determine current branch for navigation keyboard.
+    from sreda.services.pending_bot import _BRANCHES as _PB_BRANCHES
+    current_branch = "intro"
+    if is_callback and input_text:
+        raw = input_text.removeprefix("pb:").strip()
+        if raw in _PB_BRANCHES:
+            current_branch = raw
+    keyboard = pending_bot.build_navigation_keyboard(current_branch)
+    attachments = render_max_inline_keyboard_attachment(keyboard) if keyboard else None
+
+    client = MaxClient(token=settings.max_bot_token)
+    try:
+        await client.send_message(
+            recipient={"chat_id": onboarding.max_chat_id},
+            text=reply.text,
+            attachments=attachments,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "max pending welcome send failed tenant=%s: %s",
+            onboarding.tenant_id, exc,
+        )
 
 
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:
