@@ -134,6 +134,16 @@
     error: null,
   };
 
+  var _channelLinkSessionExpired = false;
+  var _channelLinkPollIntervalId = null;
+
+  function clearChannelLinkPoll() {
+    if (_channelLinkPollIntervalId !== null) {
+      clearInterval(_channelLinkPollIntervalId);
+      _channelLinkPollIntervalId = null;
+    }
+  }
+
   // -- API --
   function apiFetch(path, opts) {
     opts = opts || {};
@@ -166,6 +176,86 @@
       }
       return r.json();
     });
+  }
+
+  function channelLinkApiFetch(path, opts) {
+    if (_channelLinkSessionExpired) {
+      var expiredErr = new Error("auth_expired");
+      expiredErr.status = 401;
+      return Promise.reject(expiredErr);
+    }
+    opts = opts || {};
+    var headers = { "Authorization": "tma " + initData };
+    var optHeaders = opts.headers || {};
+    for (var h in optHeaders) {
+      if (Object.prototype.hasOwnProperty.call(optHeaders, h)) {
+        headers[h] = optHeaders[h];
+      }
+    }
+    if (opts.body !== undefined && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    var fullPath = (typeof window.__sredaWithPlatform === "function")
+      ? window.__sredaWithPlatform(path)
+      : path;
+    return fetch("{{ base_url }}" + fullPath, {
+      method: opts.method || "GET",
+      headers: headers,
+      body: opts.body,
+    }).then(function(r) {
+      return r.text().then(function(text) {
+        var data = null;
+        if (text) {
+          try { data = JSON.parse(text); }
+          catch (e) { data = { detail: text }; }
+        }
+        if (r.status === 401) {
+          if (!_channelLinkSessionExpired) {
+            _channelLinkSessionExpired = true;
+            state.error = (
+              "Сессия истекла. Закрой приложение и открой заново — " +
+              "тапни кнопку «Приложение» под полем ввода в чате с ботом, " +
+              "или открой через меню Telegram-чата."
+            );
+            clearChannelLinkPoll();
+            render();
+          }
+          var authErr = new Error("auth_expired");
+          authErr.status = 401;
+          authErr.response = data || {};
+          authErr.detail = authErr.response.detail;
+          return Promise.reject(authErr);
+        }
+        if (!r.ok) {
+          var err = new Error("HTTP " + r.status);
+          err.status = r.status;
+          err.response = data || {};
+          err.detail = err.response.detail;
+          throw err;
+        }
+        return data || {};
+      });
+    });
+  }
+
+  var CHANNEL_LINK_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
+
+  function isValidChannelLinkToken(token) {
+    return CHANNEL_LINK_TOKEN_RE.test(token || "");
+  }
+
+  function channelLinkErrorMessage(code) {
+    var messages = {
+      account_already_registered_separately:
+        "У тебя уже есть отдельный Sreda-аккаунт в этом мессенджере. Напиши в @sreda_support, мы свяжем.",
+      already_linked_other_account:
+        "К этому Sreda-юзеру уже привязан другой аккаунт",
+      account_belongs_to_other_family_member:
+        "Этот аккаунт принадлежит другому члену семьи",
+      not_found_or_expired:
+        "Ссылка истекла или уже использована",
+    };
+    return messages[code] || "Не удалось связать аккаунты. Попробуй позже.";
   }
 
   // loadData supports a silent mode used by the visibility-refresh path:
@@ -478,7 +568,31 @@
       html += '<span class="chevron">\u203A</span>';
       html += '</div>';
     }
+    html += '<div id="channel-link-slot"></div>';
     return html;
+  }
+
+  function checkChannelLinkStatus() {
+    var slot = document.getElementById("channel-link-slot");
+    if (!slot) return;
+    channelLinkApiFetch("/miniapp/api/v1/channel-link/account-status").then(function(res) {
+      if (!res || res.linked) {
+        slot.innerHTML = "";
+        return;
+      }
+      var targetLabel = res.target_channel === "max" ? "MAX" : "Telegram";
+      var icon = res.target_channel === "max" ? "\uD83C\uDD7C" : "\u2708\uFE0F";
+      slot.innerHTML =
+        '<div class="card card-link" onclick="window._startChannelLink()">' +
+          '<div>' +
+            '<div class="card-title">' + icon + ' Привязать ' + targetLabel + '</div>' +
+            '<div class="card-subtitle">Получай напоминания в обоих мессенджерах</div>' +
+          '</div>' +
+          '<span class="chevron">\u203A</span>' +
+        '</div>';
+    }).catch(function() {
+      slot.innerHTML = "";
+    });
   }
 
   // --- Screen: Subscriptions (#/subscriptions) — renamed from old main.
@@ -1475,14 +1589,19 @@
 
   // -- Main render --
   function render() {
+    var route = getRoute();
+    if (route !== "/" && _channelLinkPollIntervalId !== null) {
+      clearChannelLinkPoll();
+    }
     if (state.loading) { $app.innerHTML = renderLoading(); return; }
     if (state.error) { $app.innerHTML = renderError(); return; }
 
-    var route = getRoute();
     var html;
+    var afterMount = null;
 
     if (route === "/") {
       html = renderDashboard();
+      afterMount = checkChannelLinkStatus;
     } else if (route === "/subscriptions") {
       html = renderSubscriptions();
     } else if (route === "/reminders") {
@@ -1515,6 +1634,10 @@
     }
 
     $app.innerHTML = html;
+    if (typeof afterMount === "function") {
+      try { afterMount(); }
+      catch (e) { console.error("afterMount hook crashed:", e); }
+    }
   }
 
   // -- Global actions --
@@ -1522,6 +1645,99 @@
   window._nav = function(path) { navigate(path); };
 
   window._loadNextWeek = function() { loadNextWeek(); };
+
+  window._startChannelLink = function() {
+    clearChannelLinkPoll();
+    channelLinkApiFetch("/miniapp/api/v1/channel-link/start", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({}),
+    }).then(function(res) {
+      if (!res || !res.deep_link) {
+        showAlert("Не удалось создать ссылку. Попробуй позже.");
+        return;
+      }
+      if (!/^https:\/\//i.test(res.deep_link)) {
+        showAlert("Получена некорректная ссылка от сервера");
+        return;
+      }
+      var targetLabel = res.target_channel === "max" ? "MAX" : "Telegram";
+      var bridge = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
+      if (bridge && typeof bridge.openLink === "function") {
+        try { bridge.openLink(res.deep_link); }
+        catch (e) { window.open(res.deep_link, "_blank"); }
+      } else {
+        window.open(res.deep_link, "_blank");
+      }
+
+      var slot = document.getElementById("channel-link-slot");
+      if (slot) {
+        slot.innerHTML =
+          '<div class="card">' +
+            '<div class="card-title">Открой ' + targetLabel + ' и подтверди связь</div>' +
+            '<div class="card-subtitle" style="word-break:break-all;margin-top:8px">' +
+              'Если ничего не открылось, скопируй:<br>' +
+              '<a href="' + escHtml(res.deep_link) + '" style="color:#3b82f6">' +
+              escHtml(res.deep_link) + '</a>' +
+            '</div>' +
+            '<div class="card-subtitle" style="margin-top:8px">' +
+              'Ссылка действует 5 минут' +
+            '</div>' +
+          '</div>';
+      }
+
+      var attempts = 0;
+      clearChannelLinkPoll();
+      _channelLinkPollIntervalId = setInterval(function() {
+        attempts++;
+        if (getRoute() !== "/") { clearChannelLinkPoll(); return; }
+        if (attempts > 15) { clearChannelLinkPoll(); return; }
+        channelLinkApiFetch("/miniapp/api/v1/channel-link/account-status").then(function(s) {
+          if (s && s.linked) {
+            clearChannelLinkPoll();
+            var slot2 = document.getElementById("channel-link-slot");
+            if (slot2) {
+              slot2.innerHTML =
+                '<div class="card" style="background:#dcfce7;border-color:#86efac">' +
+                  '<div class="card-title">✅ Аккаунты связаны</div>' +
+              '</div>';
+            }
+          }
+        }).catch(function(err) {
+          if (err && err.message === "auth_expired") clearChannelLinkPoll();
+        });
+      }, 2000);
+    }).catch(function(err) {
+      if (err && err.message === "auth_expired") return;
+      if (err && err.status === 429) {
+        showAlert("Слишком много попыток. Попробуй через 30 минут.");
+      } else {
+        showAlert("Не удалось создать ссылку. Попробуй позже.");
+      }
+    });
+  };
+
+  window._consumeChannelLink = function(rawToken) {
+    var token = (rawToken || "").replace(/^lnk_/, "");
+    if (!isValidChannelLinkToken(token)) {
+      showAlert(channelLinkErrorMessage("not_found_or_expired"));
+      return Promise.resolve(false);
+    }
+    return channelLinkApiFetch("/miniapp/api/v1/channel-link/consume", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ raw_token: token }),
+    }).then(function(res) {
+      if (res && res.ok) return true;
+      showAlert(channelLinkErrorMessage(res && res.error));
+      return false;
+    }).catch(function(err) {
+      if (err && err.message === "auth_expired") return false;
+      var response = (err && err.response) || {};
+      showAlert(channelLinkErrorMessage(response.error || response.detail));
+      return false;
+    });
+  };
 
   window._subscribeSkill = function(planKey, title, priceRub) {
     var msg = priceRub > 0
