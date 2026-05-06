@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -53,7 +54,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.channel_linking import LINK_CHANNELS, ChannelLinkToken
-from sreda.db.models.core import Tenant, User
+from sreda.db.models.core import User
+from sreda.services.tg_account_hash import hash_tg_account
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ logger = logging.getLogger(__name__)
 TOKEN_TTL_MINUTES = 5
 RATE_LIMIT_MAX = 5  # successful starts per tenant per window
 RATE_LIMIT_WINDOW_MINUTES = 30
+TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
 
 def _utcnow() -> datetime:
@@ -82,6 +85,12 @@ def _id() -> str:
 
 def _hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _validate_token_format(raw_token: str) -> None:
+    """Raise ValueError if token не matches alphabet/length."""
+    if not isinstance(raw_token, str) or not TOKEN_PATTERN.fullmatch(raw_token):
+        raise ValueError("invalid token format")
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +145,7 @@ def start_link(
     *,
     tenant_id: str,
     source_channel: str,
+    source_user_id: str,
     tg_bot_username: str | None = None,
 ) -> StartLinkResult:
     """Generate a new linking token. Source = current channel (where mini-app
@@ -166,6 +176,7 @@ def start_link(
         tenant_id=tenant_id,
         source_channel=source_channel,
         target_channel=target_channel,
+        source_user_id=source_user_id,
         token_hash=token_hash,
         expires_at=expires_at,
         created_at=now,
@@ -186,13 +197,21 @@ def start_link(
 
 @dataclass(frozen=True, slots=True)
 class ConsumeOutcome:
-    """Result of consume_link()."""
+    """Result of consume_link().
+
+    Errors:
+        'not_found_or_expired' | 'missing_chat_id' |
+        'source_user_not_found' | 'already_linked_other_account' |
+        'account_already_registered_separately' |
+        'account_belongs_to_other_family_member' | 'invalid_token_format'
+    """
 
     success: bool
-    error: str | None = None        # 'expired' / 'used' / 'not_found' / 'collision' / 'wrong_channel'
+    error: str | None = None
     tenant_id: str | None = None    # set on success
     source_channel: str | None = None
     target_channel: str | None = None
+    idempotent: bool = False
 
 
 def lookup_token(session: Session, raw_token: str) -> ChannelLinkToken | None:
@@ -220,102 +239,102 @@ def consume_link(
     raw_token: str,
     target_channel: str,
     target_account_id: str,
+    target_chat_id: str | None = None,
 ) -> ConsumeOutcome:
-    """Atomically consume token AND link target_account_id к tenant.
-
-    Args:
-        raw_token: opaque token from deep-link or callback_data.
-        target_channel: канал в котором юзер сейчас (тот же что target_channel в БД row).
-        target_account_id: account_id юзера в target_channel (max или telegram id).
-
-    Atomic SQL: ``UPDATE ... SET used_at=now() WHERE token_hash=? AND used_at
-    IS NULL AND expires_at > now() RETURNING *``. Race-safe — даже если 2
-    параллельных consume пришли одновременно, only один success.
-
-    Также проверяется collision: если у юзера уже есть отдельный tenant
-    с этим account_id в target канале — abort с error='collision'. Юзер
-    должен через support манульно мерджить.
-    """
+    """MVP happy-path. No destructive merge."""
+    _validate_token_format(raw_token)
     token_hash = _hash_token(raw_token)
+    now = _utcnow()
 
-    # Atomic atomic consume — RETURNING строки если matched.
     stmt = (
         update(ChannelLinkToken)
         .where(
             ChannelLinkToken.token_hash == token_hash,
             ChannelLinkToken.used_at.is_(None),
-            ChannelLinkToken.expires_at > _utcnow(),
+            ChannelLinkToken.expires_at > now,
+            ChannelLinkToken.target_channel == target_channel,
+            ChannelLinkToken.source_user_id.is_not(None),
         )
-        .values(used_at=_utcnow())
+        .values(used_at=now)
         .returning(ChannelLinkToken)
     )
     row = session.execute(stmt).scalar_one_or_none()
     if row is None:
-        # Distinguish error category для logs/admin alert.
-        existing = session.execute(
-            select(ChannelLinkToken).where(ChannelLinkToken.token_hash == token_hash)
-        ).scalar_one_or_none()
-        if existing is None:
-            return ConsumeOutcome(success=False, error="not_found")
-        if existing.used_at is not None:
-            return ConsumeOutcome(success=False, error="used")
-        if _coerce_utc(existing.expires_at) <= _utcnow():
-            return ConsumeOutcome(success=False, error="expired")
-        return ConsumeOutcome(success=False, error="not_found")
+        return ConsumeOutcome(success=False, error="not_found_or_expired")
 
-    # Verify target_channel matches expected (защита от replay token из
-    # другого направления).
-    if row.target_channel != target_channel:
-        # Atomic UPDATE уже произошёл, откатываем
+    if target_channel == "max" and not target_chat_id:
         session.rollback()
-        return ConsumeOutcome(success=False, error="wrong_channel")
+        return ConsumeOutcome(success=False, error="missing_chat_id")
 
-    # Collision detection: target_account_id уже привязан к ДРУГОМУ tenant?
+    source_user = session.execute(
+        select(User)
+        .where(User.id == row.source_user_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if source_user is None:
+        session.rollback()
+        return ConsumeOutcome(success=False, error="source_user_not_found")
+
+    source_tenant = source_user.tenant_id
+    incoming_target = str(target_account_id)
+    existing_target = (
+        source_user.max_account_id
+        if target_channel == "max"
+        else source_user.telegram_account_id
+    )
+    if existing_target:
+        if str(existing_target) == incoming_target:
+            session.commit()
+            return ConsumeOutcome(
+                success=True,
+                tenant_id=source_tenant,
+                source_channel=row.source_channel,
+                target_channel=row.target_channel,
+                idempotent=True,
+            )
+        session.rollback()
+        return ConsumeOutcome(success=False, error="already_linked_other_account")
+
+    if target_channel == "max":
+        collision_filter = User.max_account_id == incoming_target
+    elif target_channel == "telegram":
+        collision_filter = User.tg_account_hash == hash_tg_account(incoming_target)
+    else:
+        session.rollback()
+        return ConsumeOutcome(success=False, error="not_found_or_expired")
+
     other_user = session.execute(
         select(User).where(
-            (User.max_account_id == target_account_id)
-            if target_channel == "max"
-            else (User.telegram_account_id == target_account_id)
+            User.id != source_user.id,
+            collision_filter,
         )
     ).scalar_one_or_none()
 
-    if other_user is not None and other_user.tenant_id != row.tenant_id:
-        # Существующий аккаунт в target канале → конфликт.
-        # Откатываем UPDATE used_at чтобы юзер мог попробовать ещё раз
-        # после manual support resolution.
+    if other_user is not None and other_user.tenant_id != source_tenant:
         session.rollback()
         return ConsumeOutcome(
-            success=False, error="collision",
-            tenant_id=row.tenant_id,
+            success=False,
+            error="account_already_registered_separately",
+            tenant_id=source_tenant,
         )
 
-    # Найти/создать User в этом target канале для tenant'а.
-    # Source-tenant уже имеет одного юзера (создан при первом сообщении в
-    # source channel). Мы добавляем target account_id к этому же User row
-    # (если есть user в этом tenant'е) или создаём нового User row.
-    tenant_user = session.execute(
-        select(User).where(
-            User.tenant_id == row.tenant_id,
-            (User.max_account_id.is_(None) if target_channel == "max"
-             else User.telegram_account_id.is_(None)),
+    if other_user is not None and other_user.tenant_id == source_tenant:
+        session.rollback()
+        return ConsumeOutcome(
+            success=False,
+            error="account_belongs_to_other_family_member",
         )
-    ).scalar_one_or_none()
 
-    if tenant_user is not None:
-        # Update existing user — добавляем target account_id рядом.
-        if target_channel == "max":
-            tenant_user.max_account_id = target_account_id
-        else:
-            tenant_user.telegram_account_id = target_account_id
-    # Если other_user None и tenant_user None — strange state; пусть
-    # caller (handle_*_update) создаёт нового User через
-    # ensure_*_user_bundle с tenant_id. Возвращаем success — линкование
-    # на уровне tokens прошло, остальное — наверху.
+    if target_channel == "max":
+        source_user.max_account_id = incoming_target
+        source_user.max_chat_id = str(target_chat_id)
+    else:
+        source_user.telegram_account_id = incoming_target
 
     session.commit()
     return ConsumeOutcome(
         success=True,
-        tenant_id=row.tenant_id,
+        tenant_id=source_tenant,
         source_channel=row.source_channel,
         target_channel=row.target_channel,
     )

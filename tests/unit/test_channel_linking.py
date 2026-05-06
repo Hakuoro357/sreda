@@ -23,6 +23,7 @@ from sqlalchemy.orm import sessionmaker
 from sreda.db.base import Base
 from sreda.db.models.channel_linking import ChannelLinkToken
 from sreda.db.models.core import Tenant, User
+from sreda.services.tg_account_hash import hash_tg_account
 from sreda.services.channel_linking import (
     ChannelLinkRateLimitedError,
     RATE_LIMIT_MAX,
@@ -56,7 +57,7 @@ def session():
 
 def test_start_link_creates_opaque_token_with_hash(session):
     result = start_link(
-        session, tenant_id="t1", source_channel="telegram",
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
     )
 
     assert result.target_channel == "max"
@@ -79,7 +80,7 @@ def test_start_link_creates_opaque_token_with_hash(session):
 
 def test_start_link_max_to_telegram_direction(session):
     result = start_link(
-        session, tenant_id="t1", source_channel="max",
+        session, tenant_id="t1", source_channel="max", source_user_id="u1",
         tg_bot_username="sreda_test_bot",
     )
     assert result.target_channel == "telegram"
@@ -88,15 +89,21 @@ def test_start_link_max_to_telegram_direction(session):
 
 def test_start_link_unknown_source_raises(session):
     with pytest.raises(ValueError, match="unknown source_channel"):
-        start_link(session, tenant_id="t1", source_channel="discord")
+        start_link(
+            session, tenant_id="t1", source_channel="discord", source_user_id="u1",
+        )
 
 
 def test_start_link_rate_limited_after_max_attempts(session):
     for _ in range(RATE_LIMIT_MAX):
-        start_link(session, tenant_id="t1", source_channel="telegram")
+        start_link(
+            session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+        )
 
     with pytest.raises(ChannelLinkRateLimitedError):
-        start_link(session, tenant_id="t1", source_channel="telegram")
+        start_link(
+            session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +112,9 @@ def test_start_link_rate_limited_after_max_attempts(session):
 
 
 def test_lookup_returns_active_token(session):
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     found = lookup_token(session, result.raw_token)
     assert found is not None
     assert found.id == result.id
@@ -116,7 +125,9 @@ def test_lookup_returns_none_for_unknown(session):
 
 
 def test_lookup_returns_none_for_expired(session):
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     row = session.get(ChannelLinkToken, result.id)
     row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     session.commit()
@@ -124,7 +135,9 @@ def test_lookup_returns_none_for_expired(session):
 
 
 def test_lookup_returns_none_for_used(session):
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     row = session.get(ChannelLinkToken, result.id)
     row.used_at = datetime.now(timezone.utc)
     session.commit()
@@ -137,18 +150,22 @@ def test_lookup_returns_none_for_used(session):
 
 
 def test_consume_link_success_links_account(session):
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     outcome = consume_link(
         session,
         raw_token=result.raw_token,
         target_channel="max",
         target_account_id="555",
+        target_chat_id="chat_555",
     )
     assert outcome.success is True
     assert outcome.tenant_id == "t1"
+    assert outcome.idempotent is False
 
     # User у tenant_t1 должен теперь иметь max_account_id=555
-    user = session.query(User).filter(User.tenant_id == "t1").first()
+    user = session.get(User, "u1")
     assert user.max_account_id == "555"
 
     # Token marked used
@@ -157,75 +174,207 @@ def test_consume_link_success_links_account(session):
 
 
 def test_consume_link_replay_fails(session):
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     consume_link(
         session, raw_token=result.raw_token,
-        target_channel="max", target_account_id="555",
+        target_channel="max", target_account_id="555", target_chat_id="chat_555",
     )
     # Second consume same token
     outcome2 = consume_link(
         session, raw_token=result.raw_token,
-        target_channel="max", target_account_id="666",
+        target_channel="max", target_account_id="666", target_chat_id="chat_666",
     )
     assert outcome2.success is False
-    assert outcome2.error == "used"
+    assert outcome2.error == "not_found_or_expired"
 
 
 def test_consume_link_expired_fails(session):
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     row = session.get(ChannelLinkToken, result.id)
     row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     session.commit()
 
     outcome = consume_link(
-        session, raw_token=result.raw_token,
-        target_channel="max", target_account_id="555",
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
     )
     assert outcome.success is False
-    assert outcome.error == "expired"
+    assert outcome.error == "not_found_or_expired"
 
 
 def test_consume_link_unknown_token(session):
     outcome = consume_link(
-        session, raw_token="garbage_token",
-        target_channel="max", target_account_id="555",
+        session, raw_token="A" * 32, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
     )
     assert outcome.success is False
-    assert outcome.error == "not_found"
+    assert outcome.error == "not_found_or_expired"
 
 
-def test_consume_link_collision_detected(session):
+def test_consume_link_collision_returns_error(session):
     """Если target account_id уже принадлежит ДРУГОМУ tenant'у — abort."""
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     # max_account_id=999 уже у t2 (см. fixture)
     outcome = consume_link(
-        session, raw_token=result.raw_token,
-        target_channel="max", target_account_id="999",
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="999", target_chat_id="chat_999",
     )
     assert outcome.success is False
-    assert outcome.error == "collision"
+    assert outcome.error == "account_already_registered_separately"
 
-    # Token row — used_at сброшен после rollback
     session.expire_all()
-    row = session.get(ChannelLinkToken, result.id)
-    # После rollback используем session.refresh для чистого state
-    # Note: тест может быть hairy на SQLite vs Postgres semantics — для
-    # MVP проверяем главное: collision сработал, original tenant не
-    # сломан.
     other = session.get(User, "u_max_other")
     assert other.tenant_id == "t2"  # не мутировался
 
 
 def test_consume_link_wrong_target_channel(session):
     """Token создан с target=max, но consume вызван с target=telegram → reject."""
-    result = start_link(session, tenant_id="t1", source_channel="telegram")
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
     outcome = consume_link(
         session, raw_token=result.raw_token,
         target_channel="telegram",  # WRONG — token want max
         target_account_id="555",
     )
     assert outcome.success is False
-    assert outcome.error == "wrong_channel"
+    assert outcome.error == "not_found_or_expired"
+
+
+def test_consume_link_idempotent_same_target(session):
+    first = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    consume_link(
+        session, raw_token=first.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+
+    second = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    outcome = consume_link(
+        session, raw_token=second.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+
+    assert outcome.success is True
+    assert outcome.idempotent is True
+
+
+def test_consume_link_already_linked_different_target_error(session):
+    source_user = session.get(User, "u1")
+    source_user.max_account_id = "222"
+    session.commit()
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+
+    outcome = consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="333", target_chat_id="chat_333",
+    )
+
+    assert outcome.success is False
+    assert outcome.error == "already_linked_other_account"
+
+
+def test_consume_link_max_missing_chat_id(session):
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+
+    outcome = consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555",
+    )
+
+    assert outcome.success is False
+    assert outcome.error == "missing_chat_id"
+
+
+def test_consume_link_max_attaches_chat_id(session):
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+
+    outcome = consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+
+    assert outcome.success is True
+    assert session.get(User, "u1").max_chat_id == "chat_555"
+
+
+def test_consume_link_tg_target_uses_hash(session):
+    source = User(id="u_max_source", tenant_id="t1", max_account_id="333")
+    hashed_other = User(
+        id="u_tg_hashed_other",
+        tenant_id="t2",
+        tg_account_hash=hash_tg_account("777"),
+    )
+    session.add_all([source, hashed_other])
+    session.commit()
+    result = start_link(
+        session, tenant_id="t1", source_channel="max",
+        source_user_id="u_max_source", tg_bot_username="sreda_test_bot",
+    )
+
+    outcome = consume_link(
+        session, raw_token=result.raw_token, target_channel="telegram",
+        target_account_id="777",
+    )
+
+    assert outcome.success is False
+    assert outcome.error == "account_already_registered_separately"
+
+
+def test_consume_link_invalid_token_format(session):
+    with pytest.raises(ValueError, match="invalid token format"):
+        consume_link(
+            session, raw_token="garbage", target_channel="max",
+            target_account_id="555", target_chat_id="chat_555",
+        )
+
+
+def test_consume_link_same_tenant_same_user_idempotent(session):
+    source_user = session.get(User, "u1")
+    source_user.max_account_id = "555"
+    session.commit()
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+
+    outcome = consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+
+    assert outcome.success is True
+    assert outcome.idempotent is True
+
+
+def test_consume_link_same_tenant_other_user_blocked(session):
+    session.add(User(id="u_same_tenant_other", tenant_id="t1", max_account_id="555"))
+    session.commit()
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+
+    outcome = consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+
+    assert outcome.success is False
+    assert outcome.error == "account_belongs_to_other_family_member"
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +384,9 @@ def test_consume_link_wrong_target_channel(session):
 
 def test_cleanup_deletes_expired_tokens(session):
     # Свежий — should survive
-    fresh = start_link(session, tenant_id="t1", source_channel="telegram")
+    fresh = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
 
     # Старый (expired more than 1 day ago) — should be deleted
     stale = ChannelLinkToken(
