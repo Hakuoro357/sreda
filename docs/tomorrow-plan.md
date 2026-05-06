@@ -14,6 +14,45 @@ Workflow и конвенция хранения — `docs/done/README.md`.
 
 ---
 
+## ✅ DONE 2026-05-06 — Channel-linking MVP (TG → MAX) shipped
+
+Реализован полным циклом (Codex coder + Claude orchestrator + Xiaomi
+extra reviewer). 8 phases, 85 tests, live E2E verified на Boris's
+tenant в 12:17 UTC. Final UX: bot sends deep-link в чат, miniapp
+закрывается, юзер тапает ссылку → MAX bot chat → inline confirm.
+
+**Что задеплоено** (commits `42b4a80`...`3b12e6b`):
+- Migration 0040 (`channel_link_tokens.source_user_id`)
+- consume_link MVP (atomic UPDATE WHERE, idempotent retry, collision guard)
+- Endpoints: `/start` (sends link к chat), `/consume`, `/cancel`,
+  `/status`, `/account-status`
+- TG initData start_param parsing + miniapp shortname `sreda_app`
+- MAX bot_started intercept (avoids orphan tenant creation)
+- AuditLog + ownership checks
+- 85 unit/integration tests passing
+
+**Известные ограничения / на следующий sprint:**
+- TG-Android `bridge.openLink` quirk → workaround: bot шлёт ссылку в чат
+- MAX `?startapp=` mini-app delivery unreliable → switched to `?start=` chat-based
+- Lazy-provision orphan при first MAX bot interaction (handled для lnk_)
+- **MAX → TG direction not tested** (TG-target chat-based handler probably
+  needs probe — `/start lnk_X` в TG bot работает?)
+- Destructive merge для cross-tenant collision: blocked w/ error
+  «account_already_registered_separately» (manual support merge для MVP)
+
+**Deferred к full plan** (`plans/channel-linking-fix-stalled-r7.md`):
+- Destructive merge + subscription sum-extend
+- Migrations 0041-0044 (channel_identity hash, partial unique indexes)
+- Postgres advisory locks + race deadlock test
+- channel_identity abstraction
+- TenantFeature recompute logic
+
+**Open issue из dev-loop:**
+- Rate limit raised от 5 до 100 для smoke testing —
+  TODO restore to 5 production value
+
+---
+
 ## План на 2026-04-30 (следующий рабочий день)
 
 Приоритеты по убыванию:
