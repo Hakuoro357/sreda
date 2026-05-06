@@ -688,8 +688,25 @@
   }
 
   function checkChannelLinkStatus() {
+    // DIAGNOSTIC beacon — remove after debugging
+    try {
+      fetch("https://miniapp.sredaspace.ru/miniapp/api/v1/client-diagnostic", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "Authorization": "tma " + initData},
+        body: JSON.stringify({reason: "checkChannelLinkStatus_fired", build: "channel-link-debug-001"}),
+      });
+    } catch (e) {}
     var slot = document.getElementById("channel-link-slot");
-    if (!slot) return;
+    if (!slot) {
+      try {
+        fetch("https://miniapp.sredaspace.ru/miniapp/api/v1/client-diagnostic", {
+          method: "POST",
+          headers: {"Content-Type": "application/json", "Authorization": "tma " + initData},
+          body: JSON.stringify({reason: "checkChannelLinkStatus_no_slot", build: "channel-link-debug-001"}),
+        });
+      } catch (e) {}
+      return;
+    }
     channelLinkApiFetch("/miniapp/api/v1/channel-link/account-status").then(function(res) {
       if (!res || res.linked) {
         slot.innerHTML = "";
