@@ -1694,6 +1694,7 @@ def toggle_checklist_item_endpoint(
 def _resolve_platform_auth(
     request: Request,
     settings,
+    session: Session | None = None,
 ) -> tuple[str, dict]:
     """Validate initData по claimed `?platform=` query param.
 
@@ -1720,12 +1721,19 @@ def _resolve_platform_auth(
             tg_user = validate_init_data(init_data_raw, settings.telegram_bot_token)
         except TelegramInitDataError as exc:
             raise HTTPException(status_code=401, detail="invalid_init_data") from exc
-        return ("telegram", {
+        payload = {
             "telegram_id": tg_user.telegram_id,
             "first_name": tg_user.first_name,
             "username": tg_user.username,
-            "start_param": None,  # TG initData has start_param parsing — skipped here
-        })
+            "start_param": tg_user.start_param,
+        }
+        if session is not None:
+            resolved = resolve_tenant_from_telegram_id(session, tg_user.telegram_id)
+            if resolved is not None:
+                tenant_id, user_id = resolved
+                payload["tenant_id"] = tenant_id
+                payload["user_id"] = user_id
+        return ("telegram", payload)
 
     if platform == "max":
         from sreda.services.max_auth import (
@@ -1759,7 +1767,7 @@ async def channel_link_start(
     Возвращает opaque token + deep_link для target-channel bot.
     """
     settings = get_settings()
-    platform, payload = _resolve_platform_auth(request, settings)
+    platform, payload = _resolve_platform_auth(request, settings, session)
 
     # Resolve tenant_id из source platform
     if platform == "telegram":
@@ -1820,7 +1828,7 @@ async def channel_link_consume(
     предпочёл его передать в body вместо start_param).
     """
     settings = get_settings()
-    platform, payload = _resolve_platform_auth(request, settings)
+    platform, payload = _resolve_platform_auth(request, settings, session)
 
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
     raw_token = body.get("raw_token") if isinstance(body, dict) else None
@@ -1885,7 +1893,7 @@ async def channel_link_status(
     # Auth required, но платформа не важна — токен по id, ownership
     # implicitly через rate-limit на start (caller уже доказал что
     # инициировал этот token).
-    _platform, _payload = _resolve_platform_auth(request, settings)
+    _platform, _payload = _resolve_platform_auth(request, settings, session)
 
     from sreda.db.models.channel_linking import ChannelLinkToken
     row = session.get(ChannelLinkToken, id)
@@ -1898,5 +1906,3 @@ async def channel_link_status(
         "expires_at": row.expires_at.isoformat(),
         "consumed": row.used_at is not None,
     }
-
-

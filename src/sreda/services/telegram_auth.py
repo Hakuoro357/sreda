@@ -27,6 +27,7 @@ class TelegramWebAppUser:
     telegram_id: str
     first_name: str | None
     username: str | None
+    start_param: str | None = None
 
 
 def validate_init_data(
@@ -81,11 +82,14 @@ def validate_init_data(
     # 7. Check auth_date freshness
     auth_date_str: str | None = None
     user_json: str | None = None
+    start_param: str | None = None
     for key, value in data_pairs:
         if key == "auth_date":
             auth_date_str = value
         elif key == "user":
             user_json = value
+        elif key == "start_param":
+            start_param = value
 
     if auth_date_str is None:
         raise TelegramInitDataError("missing auth_date")
@@ -118,6 +122,7 @@ def validate_init_data(
         telegram_id=str(user_id),
         first_name=user_data.get("first_name"),
         username=user_data.get("username"),
+        start_param=start_param,
     )
 
 
