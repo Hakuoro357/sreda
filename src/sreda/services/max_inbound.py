@@ -84,13 +84,14 @@ async def handle_max_update(
 
     # Channel-link interception — handle BEFORE ensure_max_user_bundle
     # чтобы не создать orphan tenant_max_<id> для one-shot link command.
-    # User не существует в DB — consume_link's collision check вернёт
-    # None → goto «no collision» branch → attach to source tenant cleanly.
-    if update_type == "message_created":
-        from sreda.services.inbound_messages import _extract_max_message_text
-        text_msg = _extract_max_message_text(payload)
-        if isinstance(text_msg, str) and text_msg.strip().startswith("/start lnk_"):
-            raw_token = text_msg.strip().removeprefix("/start lnk_").strip()
+    # MAX delivers `?start=lnk_X` deep-link param как bot_started event с
+    # `payload="lnk_<token>"` field. Probe 2026-05-06 confirmed structure.
+    # User не существует в DB → consume_link's collision check вернёт
+    # None → «no collision» branch → attach to source tenant cleanly.
+    if update_type == "bot_started":
+        bot_payload = payload.get("payload")
+        if isinstance(bot_payload, str) and bot_payload.startswith("lnk_"):
+            raw_token = bot_payload[len("lnk_"):].strip()
             await _handle_max_link_start_cmd(
                 raw_token=raw_token,
                 chat_id=str(chat_id) if chat_id is not None else None,
