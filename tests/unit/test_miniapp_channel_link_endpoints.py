@@ -264,3 +264,94 @@ async def test_account_status_max_target_tg_uses_hash(db_session, monkeypatch):
     )
 
     assert response == {"linked": False, "target_channel": "telegram"}
+
+
+@pytest.mark.asyncio
+async def test_status_other_tenant_token_returns_404(db_session, monkeypatch):
+    """Token belonging to tenant_tg must return 404 when queried by tenant_max."""
+    from sreda.api.routes import miniapp as mi
+
+    _patch_settings(monkeypatch)
+
+    # Create a token from tenant_tg
+    result = start_link(
+        db_session,
+        tenant_id="tenant_tg",
+        source_channel="telegram",
+        source_user_id="user_tg",
+    )
+
+    # Caller is from tenant_max — different tenant
+    _patch_auth(
+        monkeypatch,
+        platform="max",
+        payload={"max_user_id": "200", "max_chat_id": "chat_200"},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await mi.channel_link_status(
+            FakeRequest(platform="max"),
+            id=result.id,
+            session=db_session,
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_status_same_tenant_token_returns_200(db_session, monkeypatch):
+    """Token belonging to same tenant returns data, not 404."""
+    from sreda.api.routes import miniapp as mi
+
+    _patch_settings(monkeypatch)
+
+    result = start_link(
+        db_session,
+        tenant_id="tenant_tg",
+        source_channel="telegram",
+        source_user_id="user_tg",
+    )
+
+    _patch_auth(
+        monkeypatch,
+        platform="telegram",
+        payload={"telegram_id": "100", "user_id": "user_tg", "tenant_id": "tenant_tg"},
+    )
+
+    response = await mi.channel_link_status(
+        FakeRequest(platform="telegram"),
+        id=result.id,
+        session=db_session,
+    )
+
+    assert response["id"] == result.id
+    assert response["consumed"] is False
+
+
+@pytest.mark.asyncio
+async def test_start_already_linked_returns_409(db_session, monkeypatch):
+    """If tenant already has target channel linked, /start returns 409."""
+    from sreda.api.routes import miniapp as mi
+
+    _patch_settings(monkeypatch)
+
+    # tenant_tg user already has max_account_id set
+    user = db_session.get(User, "user_tg")
+    user.max_account_id = "200"
+    db_session.commit()
+
+    _patch_auth(
+        monkeypatch,
+        platform="telegram",
+        payload={"telegram_id": "100", "user_id": "user_tg", "tenant_id": "tenant_tg"},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await mi.channel_link_start(
+            FakeRequest(platform="telegram"),
+            session=db_session,
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "already_linked"

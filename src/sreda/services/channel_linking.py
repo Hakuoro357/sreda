@@ -43,6 +43,7 @@ Security (R5 hardening):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -53,6 +54,7 @@ from uuid import uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from sreda.db.models.audit import AuditLog
 from sreda.db.models.channel_linking import LINK_CHANNELS, ChannelLinkToken
 from sreda.db.models.core import User
 from sreda.services.tg_account_hash import hash_tg_account
@@ -347,6 +349,21 @@ def consume_link(
     else:
         source_user.telegram_account_id = incoming_target
 
+    session.add(AuditLog(
+        id=f"al_{uuid4().hex[:24]}",
+        actor_type="user",
+        actor_id=row.source_user_id,
+        action="channel_link.attached",
+        resource_type="tenant",
+        resource_id=source_user.tenant_id,
+        metadata_json=json.dumps({
+            "target_channel": target_channel,
+            "target_account_id_present": True,
+            "target_chat_id_present": target_chat_id is not None,
+            "token_id": row.id,
+        }),
+    ))
+
     session.commit()
     return ConsumeOutcome(
         success=True,
@@ -354,6 +371,37 @@ def consume_link(
         source_channel=row.source_channel,
         target_channel=row.target_channel,
     )
+
+
+def is_account_already_linked(
+    session: Session,
+    *,
+    tenant_id: str,
+    target_channel: str,
+) -> bool:
+    """Check if any user in this tenant already has the target channel linked.
+
+    Server-side guard for /start — UI hide is insufficient; the backend
+    must enforce to prevent redundant linking attempts.
+
+    Args:
+        session: SQLAlchemy session.
+        tenant_id: The tenant to check.
+        target_channel: ``"max"`` or ``"telegram"``.
+
+    Returns:
+        True if at least one user in the tenant has the target account
+        already linked.
+    """
+    if target_channel not in LINK_CHANNELS:
+        raise ValueError(f"unknown target_channel: {target_channel!r}")
+    col = User.max_account_id if target_channel == "max" else User.telegram_account_id
+    exists = session.execute(
+        select(User.id)
+        .where(User.tenant_id == tenant_id, col.is_not(None))
+        .limit(1)
+    ).first()
+    return exists is not None
 
 
 def cleanup_expired_tokens(session: Session) -> int:

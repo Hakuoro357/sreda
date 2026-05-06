@@ -1830,6 +1830,19 @@ async def channel_link_start(
     from sreda.services.channel_linking import (
         ChannelLinkRateLimitedError, start_link,
     )
+
+    # Server-side recheck: if tenant already has the target channel linked,
+    # reject before creating a new token. UI hide is insufficient.
+    if platform == "telegram":
+        target_channel = "max"
+    else:
+        target_channel = "telegram"
+
+    from sreda.services.channel_linking import is_account_already_linked
+    if is_account_already_linked(session, tenant_id=tenant_id,
+                                 target_channel=target_channel):
+        raise HTTPException(409, "already_linked")
+
     try:
         result = start_link(
             session,
@@ -1995,17 +2008,31 @@ async def channel_link_status(
     """Polling endpoint для source-side mini-app. Возвращает текущий
     used_at статус токена. Frontend пуллит каждые 2с до used_at != null
     или истечения expires_at.
+
+    Ownership check: caller must own the token (same tenant_id).
+    Returns 404 instead of 403 to avoid leaking cross-tenant token
+    existence.
     """
     settings = get_settings()
-    # Auth required, но платформа не важна — токен по id, ownership
-    # implicitly через rate-limit на start (caller уже доказал что
-    # инициировал этот token).
-    _platform, _payload = _resolve_platform_auth(request, settings, session)
+    platform, payload = _resolve_platform_auth(request, settings, session)
+
+    # Resolve caller's tenant_id for ownership check.
+    caller_tenant_id: str | None = None
+    if platform == "telegram":
+        caller_tenant_id = payload.get("tenant_id")
+    else:  # max
+        from sreda.services.onboarding import find_user_by_max_account_id
+
+        user = find_user_by_max_account_id(session, payload["max_user_id"])
+        caller_tenant_id = user.tenant_id if user else None
+
+    if not caller_tenant_id:
+        raise HTTPException(status_code=401, detail="tenant_not_resolved")
 
     from sreda.db.models.channel_linking import ChannelLinkToken
     row = session.get(ChannelLinkToken, id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="token_not_found")
+    if row is None or row.tenant_id != caller_tenant_id:
+        raise HTTPException(status_code=404, detail="not_found")
 
     return {
         "id": row.id,

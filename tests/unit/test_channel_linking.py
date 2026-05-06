@@ -21,6 +21,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
+from sreda.db.models.audit import AuditLog
 from sreda.db.models.channel_linking import ChannelLinkToken
 from sreda.db.models.core import Tenant, User
 from sreda.services.tg_account_hash import hash_tg_account
@@ -29,6 +30,7 @@ from sreda.services.channel_linking import (
     RATE_LIMIT_MAX,
     cleanup_expired_tokens,
     consume_link,
+    is_account_already_linked,
     lookup_token,
     start_link,
 )
@@ -410,3 +412,110 @@ def test_cleanup_deletes_expired_tokens(session):
     # Fresh всё ещё на месте
     assert session.get(ChannelLinkToken, fresh.id) is not None
     assert session.get(ChannelLinkToken, "link_stale") is None
+
+
+# ---------------------------------------------------------------------------
+# AuditLog
+# ---------------------------------------------------------------------------
+
+
+def test_consume_link_writes_audit_log(session):
+    """Clean attach must write an AuditLog row."""
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    outcome = consume_link(
+        session,
+        raw_token=result.raw_token,
+        target_channel="max",
+        target_account_id="555",
+        target_chat_id="chat_555",
+    )
+    assert outcome.success is True
+    assert outcome.idempotent is False
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.action == "channel_link.attached"
+    ).all()
+    assert len(logs) == 1
+    log = logs[0]
+    assert log.actor_type == "user"
+    assert log.actor_id == "u1"
+    assert log.resource_type == "tenant"
+    assert log.resource_id == "t1"
+    import json
+    meta = json.loads(log.metadata_json)
+    assert meta["target_channel"] == "max"
+    assert meta["target_account_id_present"] is True
+    assert meta["target_chat_id_present"] is True
+    assert meta["token_id"] == result.id
+
+
+def test_consume_link_idempotent_no_audit(session):
+    """Idempotent same-target attach must NOT write an extra AuditLog row."""
+    first = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    consume_link(
+        session, raw_token=first.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+    audit_count_after_first = session.query(AuditLog).filter(
+        AuditLog.action == "channel_link.attached"
+    ).count()
+    assert audit_count_after_first == 1
+
+    second = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    outcome = consume_link(
+        session, raw_token=second.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+    assert outcome.idempotent is True
+
+    audit_count_after_second = session.query(AuditLog).filter(
+        AuditLog.action == "channel_link.attached"
+    ).count()
+    assert audit_count_after_second == 1  # no extra row
+
+
+# ---------------------------------------------------------------------------
+# is_account_already_linked
+# ---------------------------------------------------------------------------
+
+
+def test_is_account_already_linked_returns_false_when_clean(session):
+    assert is_account_already_linked(session, tenant_id="t1", target_channel="max") is False
+
+
+def test_is_account_already_linked_returns_true_when_linked(session):
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+    assert is_account_already_linked(session, tenant_id="t1", target_channel="max") is True
+
+
+def test_is_account_already_linked_per_channel(session):
+    """is_account_already_linked is per-channel: u1 in t1 has telegram=100
+    (fixture) but no max. After consume_link attaches max=555, BOTH
+    channels return True (tenant has at least one user в каждом).
+    Demonstrates per-channel discrimination."""
+    # Initial state: u1 has telegram only
+    assert is_account_already_linked(session, tenant_id="t1", target_channel="telegram") is True
+    assert is_account_already_linked(session, tenant_id="t1", target_channel="max") is False
+
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+    # After: both channels populated
+    assert is_account_already_linked(session, tenant_id="t1", target_channel="telegram") is True
+    assert is_account_already_linked(session, tenant_id="t1", target_channel="max") is True
