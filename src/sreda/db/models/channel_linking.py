@@ -62,6 +62,9 @@ class ChannelLinkToken(Base):
     )
     source_channel: Mapped[str] = mapped_column(String(16), nullable=False)
     target_channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True,
+    )
 
     # SHA-256 hex digest от raw token. Raw token уходит ТОЛЬКО в URL +
     # response, в БД не кладётся — даже при leak'е DB атакующий не
