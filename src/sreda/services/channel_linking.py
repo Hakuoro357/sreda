@@ -110,14 +110,25 @@ class StartLinkResult:
 _MAX_BOT_USERNAME = "id320700072280_bot"
 
 
-def _build_deep_link(target_channel: str, raw_token: str, *, tg_bot_username: str | None) -> str:
+def _build_deep_link(
+    target_channel: str,
+    raw_token: str,
+    *,
+    tg_bot_username: str | None,
+    tg_miniapp_shortname: str | None,
+) -> str:
     """Build platform-specific deep-link with start_param."""
     if target_channel == "max":
         return f"https://max.ru/{_MAX_BOT_USERNAME}?startapp=lnk_{raw_token}"
     if target_channel == "telegram":
-        if not tg_bot_username:
-            raise ValueError("tg_bot_username required for target=telegram")
-        return f"https://t.me/{tg_bot_username}?start=lnk_{raw_token}"
+        if not tg_bot_username or not tg_miniapp_shortname:
+            raise ValueError(
+                "tg_bot_username + tg_miniapp_shortname required for target=telegram"
+            )
+        return (
+            f"https://t.me/{tg_bot_username}/{tg_miniapp_shortname}"
+            f"?startapp=lnk_{raw_token}"
+        )
     raise ValueError(f"unknown target_channel: {target_channel!r}")
 
 
@@ -147,6 +158,7 @@ def start_link(
     source_channel: str,
     source_user_id: str,
     tg_bot_username: str | None = None,
+    tg_miniapp_shortname: str | None = None,
 ) -> StartLinkResult:
     """Generate a new linking token. Source = current channel (where mini-app
     is opened); target = the opposite.
@@ -170,6 +182,12 @@ def start_link(
     token_hash = _hash_token(raw_token)
     now = _utcnow()
     expires_at = now + timedelta(minutes=TOKEN_TTL_MINUTES)
+    deep_link = _build_deep_link(
+        target_channel,
+        raw_token,
+        tg_bot_username=tg_bot_username,
+        tg_miniapp_shortname=tg_miniapp_shortname,
+    )
 
     row = ChannelLinkToken(
         id=_id(),
@@ -183,8 +201,6 @@ def start_link(
     )
     session.add(row)
     session.commit()
-
-    deep_link = _build_deep_link(target_channel, raw_token, tg_bot_username=tg_bot_username)
 
     return StartLinkResult(
         id=row.id,

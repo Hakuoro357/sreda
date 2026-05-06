@@ -7,8 +7,9 @@ Serves:
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import threading
+import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.orm import Session
 
@@ -1745,15 +1747,57 @@ def _resolve_platform_auth(
             max_user = validate_max_init_data(init_data_raw, settings.max_bot_token)
         except MaxInitDataError as exc:
             raise HTTPException(status_code=401, detail="invalid_init_data") from exc
-        return ("max", {
+        payload = {
             "max_user_id": max_user.max_user_id,
             "max_chat_id": max_user.max_chat_id,
             "first_name": max_user.first_name,
             "username": max_user.username,
             "start_param": max_user.start_param,
-        })
+        }
+        if session is not None:
+            resolved = resolve_tenant_from_max_account_id(session, max_user.max_user_id)
+            if resolved is not None:
+                tenant_id, user_id = resolved
+                payload["tenant_id"] = tenant_id
+                payload["user_id"] = user_id
+        return ("max", payload)
 
     raise HTTPException(status_code=400, detail=f"unknown platform: {platform!r}")
+
+
+def _validate_token_format(raw_token: str) -> None:
+    """Validate opaque channel-link token before hashing/DB lookup."""
+    try:
+        from sreda.services.channel_linking import TOKEN_PATTERN
+    except ImportError:
+        token_pattern = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+    else:
+        token_pattern = TOKEN_PATTERN
+    if not isinstance(raw_token, str) or token_pattern.fullmatch(raw_token) is None:
+        raise HTTPException(status_code=400, detail="invalid_token_format")
+
+
+def _channel_link_token_hash(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+async def _json_body(request: Request) -> dict:
+    if not request.headers.get("content-type", "").startswith("application/json"):
+        return {}
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="invalid_json") from exc
+    return body if isinstance(body, dict) else {}
+
+
+def _consume_outcome_dict(outcome) -> dict:
+    return {
+        "ok": bool(outcome.success),
+        "error": outcome.error,
+        "tenant_id": outcome.tenant_id,
+        "idempotent": outcome.idempotent,
+    }
 
 
 @router.post("/api/v1/channel-link/start")
@@ -1771,17 +1815,17 @@ async def channel_link_start(
 
     # Resolve tenant_id из source platform
     if platform == "telegram":
-        from sreda.services.telegram_auth import resolve_tenant_from_telegram_id
-        resolved = resolve_tenant_from_telegram_id(session, payload["telegram_id"])
-        if resolved is None:
+        tenant_id = payload.get("tenant_id")
+        source_user_id = payload.get("user_id")
+        if tenant_id is None or source_user_id is None:
             raise HTTPException(status_code=404, detail="tenant_not_found")
-        tenant_id, _user_id = resolved
     else:  # max
         from sreda.services.onboarding import find_user_by_max_account_id
         user = find_user_by_max_account_id(session, payload["max_user_id"])
         if user is None:
             raise HTTPException(status_code=404, detail="tenant_not_found")
         tenant_id = user.tenant_id
+        source_user_id = user.id
 
     from sreda.services.channel_linking import (
         ChannelLinkRateLimitedError, start_link,
@@ -1791,10 +1835,17 @@ async def channel_link_start(
             session,
             tenant_id=tenant_id,
             source_channel=platform,
-            tg_bot_username=None,  # TODO: read from settings if MAX→TG
+            source_user_id=source_user_id,
+            tg_bot_username=settings.telegram_bot_username,
+            tg_miniapp_shortname=settings.telegram_miniapp_shortname,
         )
     except ChannelLinkRateLimitedError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        if "tg_bot_username" in detail or "tg_miniapp_shortname" in detail:
+            raise HTTPException(status_code=500, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
 
     # Audit log → admin chat (R5 hardening)
     try:
@@ -1824,31 +1875,28 @@ async def channel_link_consume(
     (открыл deep-link от source mini-app), backend получает target initData
     с start_param=lnk_<token>.
 
-    Body может также содержать explicit ``raw_token`` (если frontend
-    предпочёл его передать в body вместо start_param).
+    Body должен содержать explicit ``raw_token``. Target identity берём
+    только из validated initData, не из client-supplied JSON.
     """
     settings = get_settings()
     platform, payload = _resolve_platform_auth(request, settings, session)
 
-    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    body = await _json_body(request)
     raw_token = body.get("raw_token") if isinstance(body, dict) else None
 
     if not raw_token:
-        # Try to extract from start_param in target initData
-        sp = payload.get("start_param", "")
-        if isinstance(sp, str) and sp.startswith("lnk_"):
-            raw_token = sp[4:]
-
-    if not raw_token:
         raise HTTPException(
-            status_code=400, detail="missing raw_token / lnk_<token> in start_param",
+            status_code=400, detail="missing_raw_token",
         )
+    _validate_token_format(raw_token)
 
     # Determine target_account_id from validated initData
     if platform == "max":
         target_account_id = payload["max_user_id"]
+        target_chat_id = payload["max_chat_id"]
     else:
         target_account_id = payload["telegram_id"]
+        target_chat_id = None
 
     from sreda.services.channel_linking import consume_link
     outcome = consume_link(
@@ -1856,6 +1904,7 @@ async def channel_link_consume(
         raw_token=raw_token,
         target_channel=platform,
         target_account_id=target_account_id,
+        target_chat_id=target_chat_id,
     )
 
     # Audit log → admin chat
@@ -1874,9 +1923,67 @@ async def channel_link_consume(
     except Exception:  # noqa: BLE001
         logger.debug("admin alert failed (non-fatal)", exc_info=True)
 
-    if not outcome.success:
-        return {"ok": False, "error": outcome.error}
-    return {"ok": True, "tenant_id": outcome.tenant_id}
+    return _consume_outcome_dict(outcome)
+
+
+@router.post("/api/v1/channel-link/cancel")
+async def channel_link_cancel(
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Invalidate a pending token from the target-side mini-app."""
+    settings = get_settings()
+    platform, _payload = _resolve_platform_auth(request, settings, session)
+    body = await _json_body(request)
+    raw_token = body.get("raw_token") if isinstance(body, dict) else None
+    if not raw_token:
+        raise HTTPException(status_code=400, detail="missing_raw_token")
+    _validate_token_format(raw_token)
+
+    from sreda.db.models.channel_linking import ChannelLinkToken
+
+    result = session.execute(
+        update(ChannelLinkToken)
+        .where(
+            ChannelLinkToken.token_hash == _channel_link_token_hash(raw_token),
+            ChannelLinkToken.target_channel == platform,
+            ChannelLinkToken.used_at.is_(None),
+        )
+        .values(used_at=datetime.now(UTC))
+    )
+    session.commit()
+    return {"ok": bool(result.rowcount)}
+
+
+@router.get("/api/v1/channel-link/account-status")
+async def channel_link_account_status(
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Return whether current user's opposite-channel account is linked."""
+    settings = get_settings()
+    platform, payload = _resolve_platform_auth(request, settings, session)
+
+    from sreda.db.models.core import User
+    from sreda.services.onboarding import find_user_by_max_account_id
+
+    if platform == "telegram":
+        user_id = payload.get("user_id")
+        user = session.get(User, user_id) if user_id else None
+        if user is None:
+            raise HTTPException(status_code=404, detail="tenant_not_found")
+        return {
+            "linked": user.max_account_id is not None,
+            "target_channel": "max",
+        }
+
+    user = find_user_by_max_account_id(session, payload["max_user_id"])
+    if user is None:
+        raise HTTPException(status_code=404, detail="tenant_not_found")
+    return {
+        "linked": user.tg_account_hash is not None,
+        "target_channel": "telegram",
+    }
 
 
 @router.get("/api/v1/channel-link/status")

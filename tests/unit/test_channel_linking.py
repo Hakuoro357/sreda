@@ -81,10 +81,12 @@ def test_start_link_creates_opaque_token_with_hash(session):
 def test_start_link_max_to_telegram_direction(session):
     result = start_link(
         session, tenant_id="t1", source_channel="max", source_user_id="u1",
-        tg_bot_username="sreda_test_bot",
+        tg_bot_username="sreda_test_bot", tg_miniapp_shortname="sreda_app",
     )
     assert result.target_channel == "telegram"
-    assert result.deep_link.startswith("https://t.me/sreda_test_bot?start=lnk_")
+    assert result.deep_link.startswith(
+        "https://t.me/sreda_test_bot/sreda_app?startapp=lnk_"
+    )
 
 
 def test_start_link_unknown_source_raises(session):
@@ -325,6 +327,7 @@ def test_consume_link_tg_target_uses_hash(session):
     result = start_link(
         session, tenant_id="t1", source_channel="max",
         source_user_id="u_max_source", tg_bot_username="sreda_test_bot",
+        tg_miniapp_shortname="sreda_app",
     )
 
     outcome = consume_link(
