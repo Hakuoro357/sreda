@@ -1,6 +1,16 @@
 {% extends "base.html" %}
 
 {% block scripts %}
+<!-- Manual smoke (Phase 6):
+     1. Open mini-app в TG with ?startapp=lnk_<valid-token>
+        → confirm screen rendered, token validated
+     2. Tap Подтвердить → POST /consume → success view
+     3. Open mini-app с ?startapp=lnk_<expired-token>
+        → confirm screen rendered, on tap error toast
+     4. Open mini-app с ?startapp=lnk_invalid → confirm не показывается
+        (alphabet validate fail)
+     5. Cancel button → POST /cancel + close
+-->
 <script>
 (function() {
   "use strict";
@@ -136,6 +146,10 @@
 
   var _channelLinkSessionExpired = false;
   var _channelLinkPollIntervalId = null;
+  var _channelLinkConfirmShown = false;
+  var _channelLinkView = null;
+  var _channelLinkToken = null;
+  var _channelLinkLastErrorMessage = null;
 
   function clearChannelLinkPoll() {
     if (_channelLinkPollIntervalId !== null) {
@@ -242,6 +256,17 @@
 
   function isValidChannelLinkToken(token) {
     return CHANNEL_LINK_TOKEN_RE.test(token || "");
+  }
+
+  function getChannelLinkToken() {
+    var initDataUnsafe = window.bridge && window.bridge.initDataUnsafe
+      ? window.bridge.initDataUnsafe()
+      : null;
+    var sp = initDataUnsafe && initDataUnsafe.start_param;
+    if (typeof sp !== "string" || !sp.startsWith("lnk_")) return null;
+    var token = sp.slice(4);
+    if (!isValidChannelLinkToken(token)) return null;
+    return token;
   }
 
   function channelLinkErrorMessage(code) {
@@ -541,6 +566,96 @@
 
   function renderError() {
     return '<div class="error-state">' + escHtml(state.error) + '</div>';
+  }
+
+  function currentMessengerLabel() {
+    return window.__SREDA_PLATFORM__ === "max" ? "MAX" : "Telegram";
+  }
+
+  function renderChannelLinkConfirm() {
+    setupBackButton(false);
+    var messenger = currentMessengerLabel();
+    var html = '<h1>Связь аккаунтов</h1>';
+    html += '<div class="card">';
+    html += '<div class="card-title">Привязать аккаунт ' + escHtml(messenger) + ' к Sreda юзеру?</div>';
+    html += '<div class="description">⚠ Если в ' + escHtml(messenger) + ' у тебя был отдельный аккаунт Sreda, обратись в @sreda_support — мы свяжем вручную.</div>';
+    html += '<div id="channel-link-confirm-error" class="error-state" style="display:none;padding:0 0 12px 0;text-align:left"></div>';
+    html += '<div style="display:flex;gap:8px;margin-top:16px">';
+    html += '<button id="channel-link-confirm-btn" class="btn btn-primary" style="flex:1">✅ Подтвердить</button>';
+    html += '<button id="channel-link-cancel-btn" class="btn btn-danger" style="flex:1;background:rgba(0,0,0,0.06)">❌ Отмена</button>';
+    html += '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  function renderChannelLinkSuccess() {
+    setupBackButton(false);
+    var html = '<div class="empty-state" style="color:#34c759;font-size:18px;font-weight:600">✅ Аккаунты связаны</div>';
+    html += '<button id="channel-link-continue-btn" class="btn btn-primary" style="margin-top:16px">Продолжить</button>';
+    return html;
+  }
+
+  function showChannelLinkConfirmError(message) {
+    var el = document.getElementById("channel-link-confirm-error");
+    if (!el) {
+      showAlert(message);
+      return;
+    }
+    el.textContent = message;
+    el.style.display = "block";
+  }
+
+  function closeMiniAppOrClear() {
+    var closed = false;
+    if (window.bridge && typeof window.bridge.close === "function") {
+      try { closed = !!window.bridge.close(); } catch (e) { closed = false; }
+    }
+    if (!closed && $app) $app.innerHTML = "";
+  }
+
+  function bindChannelLinkConfirm(token) {
+    var confirmBtn = document.getElementById("channel-link-confirm-btn");
+    var cancelBtn = document.getElementById("channel-link-cancel-btn");
+    if (confirmBtn) {
+      confirmBtn.addEventListener("click", function() {
+        if (confirmBtn.disabled) return;
+        confirmBtn.disabled = true;
+        confirmBtn.innerHTML = '<span class="spinner-small"></span>';
+        window._consumeChannelLink(token, {silent: true}).then(function(ok) {
+          if (ok) {
+            _channelLinkView = "success";
+            render();
+            return;
+          }
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = "✅ Подтвердить";
+          showChannelLinkConfirmError(
+            _channelLinkLastErrorMessage || "Не удалось связать аккаунты. Попробуй позже."
+          );
+        }).catch(function() {
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = "✅ Подтвердить";
+          showChannelLinkConfirmError("Не удалось связать аккаунты. Попробуй позже.");
+        });
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", function() {
+        if (cancelBtn.disabled) return;
+        cancelBtn.disabled = true;
+        window._cancelChannelLink(token);
+      });
+    }
+  }
+
+  function bindChannelLinkSuccess() {
+    var continueBtn = document.getElementById("channel-link-continue-btn");
+    if (!continueBtn) return;
+    continueBtn.addEventListener("click", function() {
+      _channelLinkView = null;
+      _channelLinkToken = null;
+      render();
+    });
   }
 
   // --- Screen: Dashboard (#/) — dynamic menu from subscribed agents ---
@@ -1590,11 +1705,27 @@
   // -- Main render --
   function render() {
     var route = getRoute();
+    var channelLinkToken = getChannelLinkToken();
+    if (channelLinkToken && !_channelLinkConfirmShown) {
+      _channelLinkConfirmShown = true;
+      _channelLinkToken = channelLinkToken;
+      _channelLinkView = "confirm";
+    }
     if (route !== "/" && _channelLinkPollIntervalId !== null) {
       clearChannelLinkPoll();
     }
-    if (state.loading) { $app.innerHTML = renderLoading(); return; }
+    if (_channelLinkView === "success") {
+      $app.innerHTML = renderChannelLinkSuccess();
+      bindChannelLinkSuccess();
+      return;
+    }
+    if (_channelLinkView === "confirm" && !_channelLinkSessionExpired) {
+      $app.innerHTML = renderChannelLinkConfirm();
+      bindChannelLinkConfirm(_channelLinkToken);
+      return;
+    }
     if (state.error) { $app.innerHTML = renderError(); return; }
+    if (state.loading) { $app.innerHTML = renderLoading(); return; }
 
     var html;
     var afterMount = null;
@@ -1717,10 +1848,13 @@
     });
   };
 
-  window._consumeChannelLink = function(rawToken) {
+  window._consumeChannelLink = function(rawToken, opts) {
+    _channelLinkLastErrorMessage = null;
+    var silent = !!(opts && opts.silent);
     var token = (rawToken || "").replace(/^lnk_/, "");
     if (!isValidChannelLinkToken(token)) {
-      showAlert(channelLinkErrorMessage("not_found_or_expired"));
+      _channelLinkLastErrorMessage = channelLinkErrorMessage("not_found_or_expired");
+      if (!silent) showAlert(_channelLinkLastErrorMessage);
       return Promise.resolve(false);
     }
     return channelLinkApiFetch("/miniapp/api/v1/channel-link/consume", {
@@ -1729,12 +1863,36 @@
       body: JSON.stringify({ raw_token: token }),
     }).then(function(res) {
       if (res && res.ok) return true;
-      showAlert(channelLinkErrorMessage(res && res.error));
+      _channelLinkLastErrorMessage = channelLinkErrorMessage(res && res.error);
+      if (!silent) showAlert(_channelLinkLastErrorMessage);
       return false;
     }).catch(function(err) {
       if (err && err.message === "auth_expired") return false;
       var response = (err && err.response) || {};
-      showAlert(channelLinkErrorMessage(response.error || response.detail));
+      _channelLinkLastErrorMessage = channelLinkErrorMessage(response.error || response.detail);
+      if (!silent) showAlert(_channelLinkLastErrorMessage);
+      return false;
+    });
+  };
+
+  window._cancelChannelLink = function(rawToken) {
+    _channelLinkView = null;
+    var token = (rawToken || "").replace(/^lnk_/, "");
+    if (!isValidChannelLinkToken(token)) {
+      showAlert("Не удалось отменить связь. Закрой приложение вручную.");
+      closeMiniAppOrClear();
+      return Promise.resolve(false);
+    }
+    return channelLinkApiFetch("/miniapp/api/v1/channel-link/cancel", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ raw_token: token }),
+    }).then(function() {
+      closeMiniAppOrClear();
+      return true;
+    }).catch(function() {
+      showAlert("Не удалось отменить связь. Закрой приложение вручную.");
+      closeMiniAppOrClear();
       return false;
     });
   };

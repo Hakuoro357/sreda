@@ -57,6 +57,30 @@
         return path + sep + "platform=" + encodeURIComponent(platform);
       };
 
+      function currentMiniApp() {
+        if (platform === "max" && window.WebApp) return window.WebApp;
+        if (window.Telegram && window.Telegram.WebApp) return window.Telegram.WebApp;
+        if (window.WebApp) return window.WebApp;
+        return null;
+      }
+
+      window.bridge = window.bridge || {};
+      window.bridge.initDataUnsafe = function() {
+        var app = currentMiniApp();
+        if (!app || !app.initDataUnsafe) return null;
+        if (typeof app.initDataUnsafe === "function") {
+          try { return app.initDataUnsafe() || null; } catch (e) { return null; }
+        }
+        return app.initDataUnsafe || null;
+      };
+      window.bridge.close = function() {
+        var app = currentMiniApp();
+        if (app && typeof app.close === "function") {
+          try { app.close(); return true; } catch (e) {}
+        }
+        return false;
+      };
+
       // Browser fallback убран — server-side render не отдаёт platform
       // если не задан query, дефолт telegram. Если юзер открыл в чистом
       // браузере без МАКС/TG SDK предоставления initData, TG SDK не
