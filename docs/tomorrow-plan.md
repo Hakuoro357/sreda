@@ -70,20 +70,24 @@ MAX — обнаружились ещё 3 gap'а в pending/welcome flow и он
   MAX-only юзеры получали тишину. Теперь route на оба канала
   по наличию `telegram_account_id` / `max_chat_id`.
   Файл: `admin/routes.py:admin_tenant_approve`.
+- ✅ **Live E2E smoke** (Boris's verification, вечер 2026-05-06).
+  Оба направления протестированы:
+  - TG → MAX: TG miniapp → «Привязать MAX» → bot шлёт ссылку в чат →
+    tap в TG → MAX bot consume → max_account_id+max_chat_id attached.
+  - MAX → TG: MAX → fresh регистрация → pending intro + тур →
+    admin approve → welcome в MAX → MAX miniapp «Привязать Telegram» →
+    ссылка в MAX → tap → TG bot consume → telegram_account_id attached.
+    Оба канала на том же tenant_id.
 
 ---
 
 ## План на 2026-05-07 (следующий рабочий день)
 
-### 1. Доразобраться с MAX onboarding live-тестом
+### 1. ✅ DONE 2026-05-06 (вечером протестировано Boris'ом) — MAX onboarding live-тест
 
-Boris остановил день на «обнули» после approval-теста. На завтра
-закончить smoke matrix:
-- Fresh MAX-only регистрация → pending intro приходит → тур
-  back/next редактирует одно сообщение → admin approve → welcome
-  message приходит в MAX → юзер пишет «привет, я Boris» → ответ
-  ассистента приходит. Acceptance: full E2E без silent drops.
-- Если что-то не работает — debug + fix.
+Full E2E сработал: Fresh MAX регистрация → pending intro → тур back/next
+редактирует одно сообщение → admin approve → welcome message приходит
+в MAX → нормальный диалог. Без silent drops.
 
 ### 2. Restore rate limit от 100 обратно к 5
 
@@ -91,15 +95,12 @@ Boris остановил день на «обнули» после approval-те
 поднято для smoke testing channel-linking. Прод-значение: 5 токенов
 на тенант / 60 сек.
 
-### 3. MAX → TG direction smoke
+### 3. ✅ DONE 2026-05-06 (вечером протестировано Boris'ом) — MAX → TG direction smoke
 
-Сегодня тестировали только TG → MAX. Обратное направление не пробовали
-end-to-end (был частичный тест с `tg_account_hash`, но не full flow).
-Boris открывает MAX miniapp → тапает «Привязать Telegram» → ссылка
-приходит в MAX-чат → открывает в TG → бот в TG получает
-`/start lnk_X` → consume_link срабатывает → tenant получает
-`telegram_account_id`. Acceptance: оба канала залинкованы на тот же
-tenant_id.
+Обратное направление работает: MAX miniapp → «Привязать Telegram» →
+ссылка в MAX-чат → tap → TG bot получает `/start lnk_X` → consume_link
+срабатывает → tenant получает `telegram_account_id`. Оба канала
+залинкованы на тот же tenant_id.
 
 ### 4. Lazy-provision orphan tenant при первом MAX → text message
 
