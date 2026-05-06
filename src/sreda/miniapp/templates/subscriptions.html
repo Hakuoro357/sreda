@@ -1750,6 +1750,14 @@
     if (route === "/") {
       html = renderDashboard();
       afterMount = checkChannelLinkStatus;
+      // DIAGNOSTIC: confirm "/" branch reached + afterMount set
+      try {
+        fetch("https://miniapp.sredaspace.ru/miniapp/api/v1/client-diagnostic", {
+          method: "POST",
+          headers: {"Content-Type": "application/json", "Authorization": "tma " + initData},
+          body: JSON.stringify({reason: "render_root_branch_reached", build: "channel-link-debug-002", afterMount_type: typeof afterMount}),
+        });
+      } catch (e) {}
     } else if (route === "/subscriptions") {
       html = renderSubscriptions();
     } else if (route === "/reminders") {
