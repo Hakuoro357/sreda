@@ -45,13 +45,18 @@
   function _initDataFromHash() {
     try {
       var hash = (window.location.hash || "").replace(/^#/, "");
-      if (!hash || hash.indexOf("tgWebAppData=") < 0) return "";
+      if (!hash) return "";
+      // Try TG format (tgWebAppData=...) first, then MAX format (WebAppData=...).
+      var keys = ["tgWebAppData", "WebAppData"];
       var pairs = hash.split("&");
       for (var i = 0; i < pairs.length; i++) {
         var eq = pairs[i].indexOf("=");
         if (eq < 0) continue;
-        if (pairs[i].substring(0, eq) === "tgWebAppData") {
-          return decodeURIComponent(pairs[i].substring(eq + 1));
+        var key = pairs[i].substring(0, eq);
+        for (var k = 0; k < keys.length; k++) {
+          if (key === keys[k]) {
+            return decodeURIComponent(pairs[i].substring(eq + 1));
+          }
         }
       }
     } catch (e) {}
@@ -59,11 +64,17 @@
   }
 
   function _mainInit() {
-  var tg = window.Telegram && window.Telegram.WebApp;
-  if (tg) { tg.ready(); tg.expand(); }
+  // TG OR MAX SDK detection. MAX exposes window.WebApp (no .Telegram namespace).
+  var tg = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
+  if (tg && typeof tg.ready === "function") {
+    try { tg.ready(); } catch (e) {}
+  }
+  if (tg && typeof tg.expand === "function") {
+    try { tg.expand(); } catch (e) {}
+  }
 
-  // Prefer the SDK-provided initData; fall back to hash extraction if
-  // window.Telegram is unavailable (SDK script failed to inject).
+  // Prefer the SDK-provided initData; fall back to hash extraction.
+  // Hash format: TG = #tgWebAppData=...; MAX = #WebAppData=... (no tg prefix).
   var initData = (tg && tg.initData) ? tg.initData : _initDataFromHash();
   var $app = document.getElementById("app");
 
@@ -109,9 +120,11 @@
   // requests that will all 401 and leave the user staring at a white
   // screen. Inline styles so we don't depend on theme vars.
   if (!initData) {
+    var _isMax = !!(window.WebApp && !window.Telegram);
+    var _appName = _isMax ? "МАКС" : "Telegram";
     var msg = !tg
-      ? "Это приложение открывается только внутри Telegram."
-      : "Не удалось получить данные Telegram. Закройте и откройте приложение через кнопку в чате бота.";
+      ? "Это приложение открывается только внутри Telegram или МАКС."
+      : "Не удалось получить данные " + _appName + ". Закройте и откройте приложение через бота.";
     console.warn("miniapp: initData missing", {hasTg: !!tg, ua: navigator.userAgent});
     if ($app) {
       $app.innerHTML =
