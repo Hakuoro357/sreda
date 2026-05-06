@@ -51,6 +51,76 @@ tenant в 12:17 UTC. Final UX: bot sends deep-link в чат, miniapp
 - Rate limit raised от 5 до 100 для smoke testing —
   TODO restore to 5 production value
 
+### Дополнения вечера 2026-05-06 (MAX-only регистрация)
+
+После того как Boris удалил TG tenant и пошёл регистрироваться через
+MAX — обнаружились ещё 3 gap'а в pending/welcome flow и они закрыты:
+
+- ✅ **Pending welcome для MAX-only юзеров** (commit `2b0c240`).
+  Раньше первый `/start` от fresh MAX-юзера → silent drop из-за
+  `is_approved=False` гарда. Теперь pending tenant получает
+  pending_bot intro + scripted tour (зеркало TG flow).
+  Файл: `services/max_inbound.py:_handle_max_pending_tenant`.
+- ✅ **Edit-in-place на pb:* кнопках** (commit `eb92cce`).
+  Каждый тап «назад/вперёд» в туре присылал новое сообщение в чат —
+  теперь редактируется оригинальное (`PUT /messages?message_id=<mid>`)
+  + acks callback (`POST /answers`) → пропадает loading-spinner.
+- ✅ **Post-approve welcome через MAX** (commit `c0d9b1e`).
+  Раньше approve в админке слал welcome только в TG —
+  MAX-only юзеры получали тишину. Теперь route на оба канала
+  по наличию `telegram_account_id` / `max_chat_id`.
+  Файл: `admin/routes.py:admin_tenant_approve`.
+
+---
+
+## План на 2026-05-07 (следующий рабочий день)
+
+### 1. Доразобраться с MAX onboarding live-тестом
+
+Boris остановил день на «обнули» после approval-теста. На завтра
+закончить smoke matrix:
+- Fresh MAX-only регистрация → pending intro приходит → тур
+  back/next редактирует одно сообщение → admin approve → welcome
+  message приходит в MAX → юзер пишет «привет, я Boris» → ответ
+  ассистента приходит. Acceptance: full E2E без silent drops.
+- Если что-то не работает — debug + fix.
+
+### 2. Restore rate limit от 100 обратно к 5
+
+В `services/channel_linking.py` (или где сейчас live cap) — было
+поднято для smoke testing channel-linking. Прод-значение: 5 токенов
+на тенант / 60 сек.
+
+### 3. MAX → TG direction smoke
+
+Сегодня тестировали только TG → MAX. Обратное направление не пробовали
+end-to-end (был частичный тест с `tg_account_hash`, но не full flow).
+Boris открывает MAX miniapp → тапает «Привязать Telegram» → ссылка
+приходит в MAX-чат → открывает в TG → бот в TG получает
+`/start lnk_X` → consume_link срабатывает → tenant получает
+`telegram_account_id`. Acceptance: оба канала залинкованы на тот же
+tenant_id.
+
+### 4. Lazy-provision orphan tenant при первом MAX → text message
+
+Сейчас если юзер в MAX пишет НЕ `/start lnk_X` (любой текст до
+ссылки) — `ensure_max_user_bundle` создаёт orphan `tenant_max_<id>`,
+который потом блокирует channel-link с error
+«account_already_registered_separately». Решение: либо мигрировать
+orphan в TG-tenant при consume_link (destructive merge — out of MVP
+scope), либо удалить orphan-tenant в момент consume_link вместо
+блокировки. Обсудить с Boris архитектурно.
+
+### 5. Helper-script для test cleanup
+
+Сегодня 4× прогнал ~36-line SQL для wipe orphan tenant. Создать
+`scripts/wipe_tenant.sh <tenant_id>` либо admin-route `/admin/tenant/delete`
+с FK-cascade. UX: одна команда вместо здоровенной транзакции.
+
+### 6. Старый список (из 2026-04-30 секции — нужен ревизия приоритетов)
+
+См. ниже — pending задачи требуют переоценки на свежую голову.
+
 ---
 
 ## План на 2026-04-30 (следующий рабочий день)
