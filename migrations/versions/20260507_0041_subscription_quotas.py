@@ -244,31 +244,47 @@ def upgrade() -> None:
         ON CONFLICT (plan_key) DO NOTHING
     """).bindparams(gf_id=grandfathered_id))
 
-    # 9. Re-point existing housewife_assistant active subscriptions
-    # of approved tenants → housewife_grandfathered.
+    # 9. Mark grandfathered_at flag on existing housewife_assistant active
+    # subscriptions of approved tenants. NB: НЕ repointим plan_id —
+    # Codex MAJOR-6 fix 2026-05-07: prod plan_key оказался
+    # 'housewife_assistant_base' (не 'housewife_assistant' как в плане),
+    # поэтому plan_id-based UPDATE matched 0 rows и пришлось патчить
+    # вручную. EntitlementGate (Phase 2) использует grandfathered_at
+    # IS NOT NULL flag для tier detection, не plan_key — это устойчиво
+    # к расхождениям между legacy plan keys ('housewife_assistant_base'
+    # на prod, 'housewife_assistant' в seed).
+    #
+    # Фактический prod-state achieved 2026-05-07:
+    #   UPDATE tenant_subscriptions
+    #   SET grandfathered_at=NOW(),
+    #       grandfather_reason='Migration 0041: ...'
+    #   WHERE feature_key='housewife_assistant'
+    #     AND status='active'
+    #     AND tenant_id IN (SELECT id FROM tenants WHERE approved_at IS NOT NULL);
+    #
+    # Эта миграция теперь делает то же самое (idempotent через
+    # WHERE grandfathered_at IS NULL).
     if is_pg:
         op.execute(sa.text("""
             UPDATE tenant_subscriptions ts
-            SET plan_id = (SELECT id FROM subscription_plans WHERE plan_key = 'housewife_grandfathered'),
-                grandfathered_at = NOW(),
+            SET grandfathered_at = NOW(),
                 grandfather_reason = 'Migration 0041: existing approved tenants grandfathered before paid pricing introduction'
             FROM tenants t
             WHERE ts.tenant_id = t.id
               AND t.approved_at IS NOT NULL
               AND ts.status = 'active'
               AND ts.feature_key = 'housewife_assistant'
-              AND ts.plan_id = (SELECT id FROM subscription_plans WHERE plan_key = 'housewife_assistant')
+              AND ts.grandfathered_at IS NULL
         """))
     else:
         op.execute(sa.text("""
             UPDATE tenant_subscriptions
-            SET plan_id = (SELECT id FROM subscription_plans WHERE plan_key = 'housewife_grandfathered'),
-                grandfathered_at = (SELECT CURRENT_TIMESTAMP),
+            SET grandfathered_at = CURRENT_TIMESTAMP,
                 grandfather_reason = 'Migration 0041: existing approved tenants grandfathered before paid pricing introduction'
             WHERE tenant_id IN (SELECT id FROM tenants WHERE approved_at IS NOT NULL)
               AND status = 'active'
               AND feature_key = 'housewife_assistant'
-              AND plan_id = (SELECT id FROM subscription_plans WHERE plan_key = 'housewife_assistant')
+              AND grandfathered_at IS NULL
         """))
 
     # 10. Approved tenants без active housewife_assistant sub — создать

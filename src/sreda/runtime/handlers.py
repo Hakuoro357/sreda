@@ -1645,7 +1645,38 @@ def execute_conversation_chat(
     _gate_result = EntitlementGate(session).check(action.tenant_id)
     _plan_key = _gate_result.plan_key
 
-    if _plan_key == "sreda_free" and not _gate_result.is_grandfathered:
+    # Phase 2 (Codex CRITICAL fix 2026-05-07): defense-in-depth fail-closed.
+    # Primary block у нас на inbound (telegram_inbound/max_inbound), но
+    # если что-то bypass'ит inbound (proactive job, scheduled action,
+    # internal trigger) — здесь return заблокировано. Suspended/no-sub
+    # тенант не должен попасть в LLM tool-call loop.
+    if not _gate_result.allowed:
+        logger.info(
+            "conversation.chat blocked by entitlement gate tenant=%s reason=%s",
+            action.tenant_id, _gate_result.reason,
+        )
+        return [
+            RuntimeReply(
+                text=UPGRADE_COPY.get(
+                    _gate_result.reason,
+                    UPGRADE_COPY["no_active_subscription"],
+                ),
+                reply_markup=None,
+                feature_key=feature_key,
+            )
+        ]
+
+    # Phase 2 (Codex MAJOR-2 fix 2026-05-07): если voice helper
+    # уже зарезервировал llm_turns=1 (флаг в payload → dispatcher →
+    # action.params), не списываем ещё раз — иначе один голос =
+    # 2 LLM turns (free user 200/мес → 100 voice/мес фактически).
+    _llm_pre_reserved = bool(action.params.get("_llm_pre_reserved"))
+
+    if (
+        _plan_key == "sreda_free"
+        and not _gate_result.is_grandfathered
+        and not _llm_pre_reserved
+    ):
         _daily_key, _monthly_key = msk_period_keys()
         _ledger = UsageLedgerService(session.get_bind())
         _quota_ok = _ledger.try_consume(

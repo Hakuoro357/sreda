@@ -18,6 +18,41 @@ TG↔MAX верифицированы Boris'ом, post-approve welcome чере�
 
 ## План на 2026-05-07 (следующий рабочий день)
 
+### Pending — Поднять стейджевый контур (приоритет высокий)
+
+Триггер: 2026-05-07 после Codex retroactive review Phase 2 нашлось
+1 CRITICAL + 6 MAJOR в задеплоенном коде. CRITICAL (suspend
+фактически не блокировал) висел на проде несколько часов. Без
+staging-контура каждое нетривиальное изменение тестируется на
+живых юзерах — недопустимо когда юзеров уже больше пары.
+
+**Минимально-жизнеспособный staging:**
+
+- Отдельный VDS (или namespace на текущем) с своим
+  `bot.staging.sredaspace.ru` (TG+MAX) и отдельными бот-токенами.
+- Своя PostgreSQL DB (snapshot `pg_dump` с прод-схемой; данные
+  либо anonymized, либо тестовый seed с 5-10 юзерами).
+- Конфиг через `/etc/sreda/.env.staging` — отдельный `SREDA_DATABASE_URL`,
+  `SREDA_TELEGRAM_BOT_TOKEN`, `SREDA_MAX_BOT_TOKEN`, прочие secrets.
+- Deploy-pipeline: `git push staging` → `ssh staging 'safe_restart.sh'` —
+  то же что прод, но другой хост.
+- Smoke-чеклист, который надо прогонять на staging ПЕРЕД prod-деплоем
+  (новый юзер, голос, suspend/unsuspend, free-tier limits).
+- Мониторинг свой (cheap) — отдельный telegram_api_health и т.п.
+
+**Acceptance:**
+1. Я пишу боту в @sreda_staging_bot и получаю онбординг.
+2. Codex/Xiaomi-найденные CRITICAL/MAJOR можно reproduce на staging
+   ДО prod-деплоя.
+3. `safe_restart.sh` на staging работает идентично проду.
+4. Boris отдельный SSH-доступ к staging-юзеру.
+
+**Не в scope MVP:** load testing, blue/green, DB replication.
+Это статический контур для smoke + replay багов.
+
+**Когда:** после фиксов Phase 2 (текущий релиз) — отдельной задачей.
+Возможно W20.
+
 ### ✅ DONE 2026-05-07 — Admin /admin/users refactor (commits `0412b6a`, `9b55655`)
 
 Per Boris's UX request утром 2026-05-07:

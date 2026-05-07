@@ -768,6 +768,9 @@ async def admin_tenant_suspend(
             status_code=303,
         )
     sub.status = "suspended"
+    # Phase 2 (Codex MINOR fix 2026-05-07): bump updated_at для audit/debug.
+    from datetime import UTC as _UTC
+    sub.updated_at = datetime.now(_UTC)
     audit_event(
         session,
         actor_type="admin",
@@ -809,6 +812,9 @@ async def admin_tenant_unsuspend(
             status_code=303,
         )
     sub.status = "active"
+    # Phase 2 (Codex MINOR fix 2026-05-07): bump updated_at для audit/debug.
+    from datetime import UTC as _UTC
+    sub.updated_at = datetime.now(_UTC)
     audit_event(
         session,
         actor_type="admin",

@@ -1,17 +1,25 @@
 #!/bin/bash
-# Safe restart of Sreda services with webhook reset.
+# Safe restart of Sreda services with webhook/long-poll reset.
 #
 # ВСЕГДА используй этот скрипт вместо `systemctl restart sreda-uvicorn`.
 # Он:
-#   1. Рестартует sreda-uvicorn + sreda-job-runner
+#   1. Рестартует sreda-uvicorn + sreda-job-runner (+ sreda-telegram-poller
+#      если активен в long-poll-режиме)
 #   2. Ждёт пока сервис примет соединения (curl 127.0.0.1:8000)
-#   3. Делает deleteWebhook + setWebhook для всех каналов (TG, MAX когда
-#      подключим) — заставляет messenger переоткрыть TCP-соединение
-#   4. Smoke-test: getWebhookInfo показывает 0 ошибок
+#   3. Auto-detect TG режима:
+#        - long-poll (sreda-telegram-poller active) → ТОЛЬКО deleteWebhook,
+#          никогда не setWebhook (иначе getUpdates даст 409 Conflict).
+#        - webhook → deleteWebhook + setWebhook (force TG переоткрыть TCP)
+#   4. MAX webhook reset (когда подключим)
+#   5. Smoke-test
 #
 # Без шага #3 юзеры на 30-60 сек получают «бот не отвечает» из-за stale
 # keep-alive connections на стороне Telegram (HTTP/1.1 не сигналит graceful
 # close). Прецедент 2026-04-30: 5+ минут timeout на проде после рестарта.
+#
+# Прецедент 2026-05-07: безусловный setWebhook сломал prod long-poll режим
+# (sreda-telegram-poller exited code=3, "409 Conflict: an active webhook
+# is still set"). Auto-detection ниже это предотвращает.
 #
 # Usage:
 #   sudo ./scripts/safe_restart.sh
@@ -41,9 +49,28 @@ if [ -z "$TG_TOKEN" ]; then
     exit 1
 fi
 
+# ============ Detect TG mode: long-poll vs webhook ============
+# Если sreda-telegram-poller enabled+active → long-poll режим. setWebhook
+# в этом случае ломает getUpdates (409 Conflict). См. инцидент 2026-05-07.
+TG_MODE="webhook"  # default
+if systemctl list-unit-files sreda-telegram-poller.service >/dev/null 2>&1; then
+    if systemctl is-enabled sreda-telegram-poller.service >/dev/null 2>&1 \
+       || systemctl is-active sreda-telegram-poller.service >/dev/null 2>&1; then
+        TG_MODE="long-poll"
+    fi
+fi
+log "TG mode detected: ${TG_MODE}"
+
 # ============ Phase 1: restart ============
-log "phase 1: restart sreda-uvicorn + sreda-job-runner"
-systemctl restart sreda-uvicorn sreda-job-runner
+if [ "$TG_MODE" = "long-poll" ]; then
+    log "phase 1: restart sreda-uvicorn + sreda-job-runner + sreda-telegram-poller"
+    systemctl restart sreda-uvicorn sreda-job-runner
+    # poller рестартуем после deleteWebhook (Phase 3a) — иначе он стартует
+    # на 409 Conflict и попадает в restart-loop. См. инцидент 2026-05-07.
+else
+    log "phase 1: restart sreda-uvicorn + sreda-job-runner"
+    systemctl restart sreda-uvicorn sreda-job-runner
+fi
 
 # ============ Phase 2: wait for ready ============
 log "phase 2: ждём пока uvicorn примет соединения (max 30s)"
@@ -66,20 +93,40 @@ for i in $(seq 1 30); do
     fi
 done
 
-# ============ Phase 3: reset Telegram webhook ============
-log "phase 3a: deleteWebhook (TG) — заставляет TG сбросить connection pool"
-del_resp=$(curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/deleteWebhook" 2>&1 | head -c 200)
-log "  → $del_resp"
+# ============ Phase 3: reset Telegram (mode-dependent) ============
+if [ "$TG_MODE" = "long-poll" ]; then
+    log "phase 3a: deleteWebhook (TG, long-poll mode) — обязательно для getUpdates"
+    del_resp=$(curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/deleteWebhook" 2>&1 | head -c 200)
+    log "  → $del_resp"
 
-sleep 2  # дать TG обработать
+    sleep 2  # дать TG обработать deleteWebhook
 
-log "phase 3b: setWebhook (TG)"
-set_resp=$(curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/setWebhook" \
-    -d "url=https://bot.sredaspace.ru/webhooks/telegram/sreda" \
-    -d "secret_token=${TG_SECRET}" \
-    -d "drop_pending_updates=false" \
-    -d 'allowed_updates=["message","edited_message","callback_query"]' 2>&1 | head -c 200)
-log "  → $set_resp"
+    log "phase 3b: restart sreda-telegram-poller (после deleteWebhook, чтобы не словить 409)"
+    systemctl reset-failed sreda-telegram-poller 2>/dev/null || true
+    systemctl restart sreda-telegram-poller
+    sleep 3
+    if systemctl is-active sreda-telegram-poller >/dev/null 2>&1; then
+        log "  → poller активен"
+    else
+        log "FATAL: sreda-telegram-poller не стартанул"
+        systemctl status sreda-telegram-poller --no-pager | tee -a "$LOG"
+        exit 3
+    fi
+else
+    log "phase 3a: deleteWebhook (TG, webhook mode) — заставляет TG сбросить connection pool"
+    del_resp=$(curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/deleteWebhook" 2>&1 | head -c 200)
+    log "  → $del_resp"
+
+    sleep 2  # дать TG обработать
+
+    log "phase 3b: setWebhook (TG)"
+    set_resp=$(curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/setWebhook" \
+        -d "url=https://bot.sredaspace.ru/webhooks/telegram/sreda" \
+        -d "secret_token=${TG_SECRET}" \
+        -d "drop_pending_updates=false" \
+        -d 'allowed_updates=["message","edited_message","callback_query"]' 2>&1 | head -c 200)
+    log "  → $set_resp"
+fi
 
 # ============ Phase 4: reset MAX webhook (если настроен) ============
 if [ -n "$MAX_TOKEN" ]; then
@@ -102,15 +149,32 @@ else
 fi
 
 # ============ Phase 5: verify ============
-log "phase 5: verify webhook health"
+log "phase 5: verify TG health"
 sleep 3
 info=$(curl -sS "https://api.telegram.org/bot${TG_TOKEN}/getWebhookInfo" 2>&1 | head -c 400)
-log "  TG: $info"
+log "  TG getWebhookInfo: $info"
 
-# Проверяем нет recent error
-if echo "$info" | grep -q "last_error_date"; then
-    log "WARN: TG webhook сообщает recent error — это норма после рестарта,"
-    log "      первый легитимный update должен пройти, и last_error_date не будет упоминаться больше"
+if [ "$TG_MODE" = "long-poll" ]; then
+    # В long-poll режиме URL должен быть ПУСТОЙ (иначе getUpdates даст 409).
+    if echo "$info" | grep -q '"url":""'; then
+        log "  ✓ webhook url пустой, long-poll функционирует"
+    else
+        log "FATAL: long-poll режим, но webhook URL не пустой — getUpdates будет 409"
+        exit 4
+    fi
+    # Проверяем что poller всё ещё жив (не upal в restart-loop)
+    if systemctl is-active sreda-telegram-poller >/dev/null 2>&1; then
+        log "  ✓ sreda-telegram-poller active"
+    else
+        log "FATAL: sreda-telegram-poller died после рестарта"
+        exit 5
+    fi
+else
+    # В webhook режиме проверяем нет recent error
+    if echo "$info" | grep -q "last_error_date"; then
+        log "WARN: TG webhook сообщает recent error — это норма после рестарта,"
+        log "      первый легитимный update должен пройти, и last_error_date не будет упоминаться больше"
+    fi
 fi
 
 log "DONE: safe_restart завершён успешно"

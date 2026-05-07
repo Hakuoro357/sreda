@@ -473,6 +473,41 @@ async def handle_telegram_update(
             )
             return result.inbound_message_id
 
+        # Phase 2 (Codex CRITICAL fix 2026-05-07): EntitlementGate enforced
+        # at handler entry — было: gate.check() вызывался в downstream
+        # paths (runtime/voice/tools), но allowed=False не блокировался,
+        # suspended tenants получали полный доступ. Теперь fail-closed
+        # primary point: inbound persisted (audit), gate проверяется,
+        # если blocked → отправляем UPGRADE_COPY и помечаем inbound
+        # как ignored. Allowed tenants проходят далее без изменений.
+        from sreda.services.entitlement_gate import EntitlementGate
+        _gate = EntitlementGate(session).check(onboarding.tenant_id)
+        if not _gate.allowed:
+            logger.info(
+                "telegram inbound: entitlement gate blocked tenant=%s "
+                "reason=%s — drop turn, mark ignored",
+                onboarding.tenant_id, _gate.reason,
+            )
+            if onboarding.chat_id and settings.telegram_bot_token:
+                try:
+                    from sreda.integrations.telegram.client import TelegramClient
+                    client = TelegramClient(token=settings.telegram_bot_token)
+                    await client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=UPGRADE_COPY.get(
+                            _gate.reason,
+                            UPGRADE_COPY["no_active_subscription"],
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "entitlement-blocked notify failed", exc_info=True,
+                    )
+            _set_processing_status(
+                session, result.inbound_message_id, "ignored",
+            )
+            return result.inbound_message_id
+
         tenant = session.get(Tenant, onboarding.tenant_id)
         is_approved = tenant is not None and tenant.approved_at is not None
 

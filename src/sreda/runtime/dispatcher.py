@@ -125,6 +125,13 @@ def dispatch_telegram_action(
     if resolved_command is None:
         return None
     action_type, params = resolved_command
+    # Phase 2 (Codex MAJOR-2 fix 2026-05-07): voice helper уже зарезервировал
+    # llm_turns; пробрасываем флаг в action.params, runtime пропустит
+    # second reserve.
+    if action_type == "conversation.chat":
+        msg = payload.get("message")
+        if isinstance(msg, dict) and msg.get("_llm_pre_reserved"):
+            params = {**params, "_llm_pre_reserved": True}
     return ActionEnvelope(
         action_type=action_type,
         tenant_id=onboarding.tenant_id,
@@ -236,6 +243,12 @@ def dispatch_max_action(
         # Defensive — fallthrough если когда-то семантика поменяется.
         return None
     action_type, params = resolved_command
+    # Phase 2 (Codex MAJOR-2 fix 2026-05-07): voice helper уже зарезервировал
+    # llm_turns; пробрасываем флаг в action.params (см. TG dispatcher).
+    if action_type == "conversation.chat":
+        msg = payload.get("message")
+        if isinstance(msg, dict) and msg.get("_llm_pre_reserved"):
+            params = {**params, "_llm_pre_reserved": True}
     return ActionEnvelope(
         action_type=action_type,
         tenant_id=onboarding.tenant_id,

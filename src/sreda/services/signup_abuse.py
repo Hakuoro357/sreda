@@ -100,12 +100,18 @@ class SignupAbuseGuard:
     DEFAULT_FREE_TIER_ACTIVE_MAX = 70
     DEFAULT_SIGNUP_OPEN = True
 
+    # RuntimeConfig keys (per Codex MAJOR-3 fix 2026-05-07: kill-switch
+    # и committed-cap должны быть live-toggleable, не hardcoded).
+    RUNTIME_KEY_SIGNUP_OPEN = "sreda_signup_open"
+    RUNTIME_KEY_FREE_TIER_MAX = "sreda_free_tier_active_max"
+
     def __init__(
         self,
         free_tier_active_max: int | None = None,
         signup_open: bool | None = None,
     ) -> None:
-        """Args fall back to defaults; production caller pulls from
+        """Args fall back to defaults; production caller should use
+        :meth:`from_runtime_config` который pulls live values из
         RuntimeConfig service.
         """
         self.free_tier_active_max = (
@@ -116,6 +122,47 @@ class SignupAbuseGuard:
         self.signup_open = (
             signup_open if signup_open is not None
             else self.DEFAULT_SIGNUP_OPEN
+        )
+
+    @classmethod
+    def from_runtime_config(cls, session: Session) -> "SignupAbuseGuard":
+        """Construct guard reading kill-switch + committed-cap из
+        RuntimeConfig.
+
+        Phase 2 (Codex MAJOR-3 fix 2026-05-07): без этого Boris не
+        может закрыть signup в abuse-инциденте — оба значения были
+        hardcoded.
+
+        Parsing:
+        - `sreda_signup_open`: 'true' / '1' / 'yes' → True, иначе False.
+          Missing → DEFAULT_SIGNUP_OPEN (True).
+        - `sreda_free_tier_active_max`: int. Missing/parse fail →
+          DEFAULT_FREE_TIER_ACTIVE_MAX (70).
+        """
+        from sreda.services.runtime_config import get_config
+
+        raw_open = get_config(session, cls.RUNTIME_KEY_SIGNUP_OPEN)
+        if raw_open is None:
+            signup_open = cls.DEFAULT_SIGNUP_OPEN
+        else:
+            signup_open = raw_open.strip().lower() in {"true", "1", "yes", "on"}
+
+        raw_max = get_config(session, cls.RUNTIME_KEY_FREE_TIER_MAX)
+        free_tier_active_max = cls.DEFAULT_FREE_TIER_ACTIVE_MAX
+        if raw_max is not None:
+            try:
+                free_tier_active_max = int(raw_max.strip())
+            except (ValueError, AttributeError):
+                logger.warning(
+                    "RuntimeConfig key=%s has unparseable value %r — "
+                    "fallback to default %d",
+                    cls.RUNTIME_KEY_FREE_TIER_MAX, raw_max,
+                    cls.DEFAULT_FREE_TIER_ACTIVE_MAX,
+                )
+
+        return cls(
+            free_tier_active_max=free_tier_active_max,
+            signup_open=signup_open,
         )
 
     def check_inside_tx(

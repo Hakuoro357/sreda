@@ -197,6 +197,15 @@ def ensure_telegram_user_bundle_by_id(
                 .first()
             )
             workspace_id = workspace.id if workspace is not None else None
+        # Phase 2 (Codex MAJOR-8 fix 2026-05-07): existing tenants могут
+        # быть pending (approved_at IS NULL) или без active subscription
+        # на housewife_assistant — например, оставшиеся со старого
+        # manual-approval flow до Phase 2 cutover. Helper идемпотентен:
+        # на здорового tenant'а делает 2 SELECT'а и no-op. На pending
+        # tenant'а — выставляет approved_at + создаёт sreda_free sub
+        # на первом контакте после Phase 2 deploy. Без этого они
+        # застревали бы (admin/approve route → 410, нет fallback'а).
+        _auto_approve_and_grant_free_tier(session, existing_user.tenant_id)
         return TelegramOnboardingResult(
             False,
             telegram_id,
@@ -209,7 +218,7 @@ def ensure_telegram_user_bundle_by_id(
     # Phase 2C: signup abuse guard ПЕРЕД bundle creation. Raises
     # SignupBlocked если kill-switch / global cap / rate-limit hit.
     # Caller (handler) catches SignupBlocked → sends UPGRADE_COPY[reason].
-    guard = SignupAbuseGuard()
+    guard = SignupAbuseGuard.from_runtime_config(session)
     allowed, reason = guard.check_inside_tx(session, "telegram", telegram_id)
     if not allowed:
         raise SignupBlocked(reason)
@@ -404,6 +413,10 @@ def ensure_max_user_bundle(
                 .first()
             )
             workspace_id = workspace.id if workspace is not None else None
+        # Phase 2 (Codex MAJOR-8 fix 2026-05-07): repair pending/no-sub
+        # existing MAX-tenant'а на первом контакте post-Phase-2.
+        # См. подробный коммент в ensure_telegram_user_bundle_by_id.
+        _auto_approve_and_grant_free_tier(session, existing_user.tenant_id)
         return MaxOnboardingResult(
             False,
             aid,
@@ -416,7 +429,7 @@ def ensure_max_user_bundle(
 
     # Phase 2C: signup abuse guard ПЕРЕД bundle creation. Raises
     # SignupBlocked если kill-switch / global cap / rate-limit hit.
-    guard = SignupAbuseGuard()
+    guard = SignupAbuseGuard.from_runtime_config(session)
     allowed, reason = guard.check_inside_tx(session, "max", aid)
     if not allowed:
         raise SignupBlocked(reason)

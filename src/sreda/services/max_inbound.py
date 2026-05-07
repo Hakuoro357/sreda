@@ -159,6 +159,36 @@ async def handle_max_update(
             )
             return result.inbound_message_id
 
+        # Phase 2 (Codex CRITICAL fix 2026-05-07): EntitlementGate enforced
+        # at handler entry. Suspended tenants получают UPGRADE_COPY и
+        # помечаются ignored. См. подробный коммент в telegram_inbound.py.
+        from sreda.services.entitlement_gate import EntitlementGate
+        _gate = EntitlementGate(session).check(onboarding.tenant_id)
+        if not _gate.allowed:
+            logger.info(
+                "max inbound: entitlement gate blocked tenant=%s "
+                "reason=%s — drop turn, mark ignored",
+                onboarding.tenant_id, _gate.reason,
+            )
+            if onboarding.max_chat_id and settings.max_bot_token:
+                try:
+                    client = MaxClient(token=settings.max_bot_token)
+                    await client.send_message(
+                        recipient={"chat_id": onboarding.max_chat_id},
+                        text=UPGRADE_COPY.get(
+                            _gate.reason,
+                            UPGRADE_COPY["no_active_subscription"],
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "max entitlement-blocked notify failed", exc_info=True,
+                    )
+            _set_processing_status(
+                session, result.inbound_message_id, "ignored",
+            )
+            return result.inbound_message_id
+
         tenant = session.get(Tenant, onboarding.tenant_id)
         is_approved = tenant is not None and tenant.approved_at is not None
 
@@ -547,6 +577,12 @@ async def _maybe_transcribe_max_voice(
         body = msg.setdefault("body", {})
         if isinstance(body, dict):
             body["text"] = text
+        # Phase 2 (Codex MAJOR-2 fix 2026-05-07): mark payload-level flag
+        # чтобы dispatch_max_action пробросил его в action.params и
+        # runtime/handlers.py не списал второй llm_turns. См. подробный
+        # коммент в telegram_bot.py._maybe_transcribe_voice.
+        if _is_free:
+            msg["_llm_pre_reserved"] = True
 
     # 8. Record budget usage — после persist'а (codex R5 ordering fix).
     # Если сюда дошли — STT и persist прошли; charge корректно.

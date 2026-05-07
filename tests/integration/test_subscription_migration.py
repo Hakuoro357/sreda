@@ -310,11 +310,20 @@ def test_downgrade_raises():
 
 
 def test_grandfather_repoint_logic_preserves_existing_subs(session):
-    """Migration's re-point step: existing housewife_assistant active sub →
-    housewife_grandfathered. Verify SQL replicated в test."""
-    # Setup pre-migration state
+    """Migration's grandfather step: mark grandfathered_at flag on
+    existing housewife_assistant active subs of approved tenants.
+
+    Codex MAJOR-6 fix 2026-05-07: миграция теперь flag-based,
+    не plan_id-repoint. Prod plan_key оказался 'housewife_assistant_base'
+    вместо 'housewife_assistant', и старый plan_id-based UPDATE
+    matched 0 rows. Flag-based вариант устойчив к расхождениям
+    между legacy plan keys.
+    """
+    # Setup pre-migration state — note plan_key intentionally
+    # 'housewife_assistant_base' чтобы verify устойчивость к legacy
+    # naming (на prod именно так).
     ha_plan = _seed_plan(
-        session, plan_key="housewife_assistant",
+        session, plan_key="housewife_assistant_base",
         feature_key="housewife_assistant", sort_order=10,
     )
     _seed_plan(
@@ -328,23 +337,26 @@ def test_grandfather_repoint_logic_preserves_existing_subs(session):
         tenant_id="t_existing", plan=ha_plan, status="active",
     )
     pre_plan_id = sub.plan_id
+    assert sub.grandfathered_at is None  # pre-migration
 
-    # Replicate migration step 9: re-point active housewife_assistant subs
-    # of approved tenants → housewife_grandfathered (SQLite syntax variant).
+    # Replicate migration step 9 (post-Codex MAJOR-6 fix): set
+    # grandfathered_at flag without re-pointing plan_id. Filter
+    # by feature_key='housewife_assistant' covers both legacy
+    # plan_keys ('housewife_assistant' AND 'housewife_assistant_base').
     session.execute(text("""
         UPDATE tenant_subscriptions
-        SET plan_id = (SELECT id FROM subscription_plans WHERE plan_key = 'housewife_grandfathered'),
-            grandfathered_at = :now,
+        SET grandfathered_at = :now,
             grandfather_reason = 'test grandfather'
         WHERE tenant_id IN (SELECT id FROM tenants WHERE approved_at IS NOT NULL)
           AND status = 'active'
           AND feature_key = 'housewife_assistant'
-          AND plan_id = (SELECT id FROM subscription_plans WHERE plan_key = 'housewife_assistant')
+          AND grandfathered_at IS NULL
     """), {"now": _NOW})
     session.commit()
     session.refresh(sub)
 
-    assert sub.plan_id != pre_plan_id
+    # plan_id preserved (no repoint) — gate uses grandfathered_at flag.
+    assert sub.plan_id == pre_plan_id
     assert sub.grandfathered_at is not None
     assert sub.grandfather_reason == "test grandfather"
 

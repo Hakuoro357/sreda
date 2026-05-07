@@ -275,6 +275,13 @@ async def _maybe_transcribe_voice(
     # Telegram already shows the original voice bubble in chat, so the
     # user can replay it if the transcription looked off.
     message["text"] = text
+    # Phase 2 (Codex MAJOR-2 fix 2026-05-07): mark payload так, чтобы
+    # runtime/handlers.py не списал второй llm_turns. Voice helper
+    # уже зарезервировал llm_turns=1 выше; downstream dispatcher
+    # пробросит этот флаг в action.params, runtime прочитает и
+    # пропустит second reserve. Без этого free user тратил 2 LLM/voice.
+    if _is_free:
+        message["_llm_pre_reserved"] = True
     return payload
 
 
