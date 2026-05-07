@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 
 TOKEN_TTL_MINUTES = 5
-RATE_LIMIT_MAX = 100  # raised от 5 для smoke testing — TODO restore до 5 после full prod rollout
+RATE_LIMIT_MAX = 5
 RATE_LIMIT_WINDOW_MINUTES = 30
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 

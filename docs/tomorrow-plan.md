@@ -18,13 +18,49 @@ TG↔MAX верифицированы Boris'ом, post-approve welcome чере�
 
 ## План на 2026-05-07 (следующий рабочий день)
 
-### 1. Restore rate limit от 100 обратно к 5
+### ✅ DONE 2026-05-07 — Admin /admin/users refactor (commits `0412b6a`, `9b55655`)
 
-В `services/channel_linking.py` (или где сейчас live cap) — было
-поднято для smoke testing channel-linking. Прод-значение: 5 токенов
-на тенант / 60 сек.
+Per Boris's UX request утром 2026-05-07:
+- Drop колонок «ЛК (EDS)» и «Навыки»
+- Сортировка tenants по `created_at` DESC (newest first)
+- Полный `user_id` без truncation
+- Combined column «Каналы»: `TG: <id>, MAX: <id>` (только заполненные)
 
-### 2. Lazy-provision orphan tenant при первом MAX → text message
+`UserRow` shrinks: `eds_accounts`/`skill_states` dropped,
+`max_account_id` added. `queries.py` drops `TenantEDSAccount` /
+`TenantSkillState` bulk lookups.
+
+### ✅ DONE 2026-05-07 — Admin /admin/budget sort by last_used_at (commits `a575ede`, `76b997c`)
+
+`BudgetRow.last_used_at = MAX(skill_ai_executions.created_at)` per
+(tenant, feature_key). Сортировка DESC, subs без активности в
+текущем периоде уезжают вниз. Колонка «Последнее использ.»
+добавлена в template для визуальной верификации порядка.
+
+### ✅ DONE 2026-05-07 — Boris's account merge (manual SQL)
+
+`tenant_tg_352612382` (создан network bug'ом 2026-05-06 22:06 UTC,
+1 inbound + 1 secure_record) → merged в `tenant_max_40921122`.
+TG creds (encrypted `telegram_account_id` + `tg_account_hash`)
+скопированы в `user_max_40921122`, source tenant удалён cascade.
+Pattern: snapshot-then-delete-then-update (защищает от
+unique-constraint violation на `tg_account_hash`).
+
+### ✅ DONE 2026-05-07 — Restore rate limit от 100 обратно к 5
+
+`services/channel_linking.py:RATE_LIMIT_MAX = 5` (was 100 после
+smoke-bump 2026-05-06). Прод-значение восстановлено: 5 successful
+starts / 30min window per tenant.
+
+### ✅ DONE 2026-05-07 — Helper-script wipe_tenant.sh
+
+`scripts/wipe_tenant.sh <tenant_id> [--force]` — cascade-delete
+tenant + все FK children в одной транзакции через SSH к VDS.
+Inventory шоу + interactive confirm by default. Pattern
+`tenant_<channel>_<id>` enforced (SQL-injection guard). Заменяет
+~36-line SQL что прогонялся 4× за день вчера.
+
+### Pending — Lazy-provision orphan tenant при первом MAX → text message
 
 Сейчас если юзер в MAX пишет НЕ `/start lnk_X` (любой текст до
 ссылки) — `ensure_max_user_bundle` создаёт orphan `tenant_max_<id>`,
@@ -32,16 +68,32 @@ TG↔MAX верифицированы Boris'ом, post-approve welcome чере�
 «account_already_registered_separately». Решение: либо мигрировать
 orphan в TG-tenant при consume_link (destructive merge — out of MVP
 scope), либо удалить orphan-tenant в момент consume_link вместо
-блокировки. Обсудить с Boris архитектурно.
+блокировки. **Решение Boris:** скорее всего «удалить orphan» —
+MVP-уровень. Полный destructive merge — после weekly Claude reset.
 
-### 3. Helper-script для test cleanup
+### Pending — Базовая подписка + auto-activate + drop manual approval
 
-Вечером 2026-05-06 4× прогнал ~36-line SQL для wipe orphan tenant.
-Создать `scripts/wipe_tenant.sh <tenant_id>` либо admin-route
-`/admin/tenant/delete` с FK-cascade. UX: одна команда вместо
-здоровенной транзакции.
+Сейчас подписка housewife_assistant ничем не ограничена; admin
+approval — manual gate. Цели:
+- Подобрать лимиты + сроки для базового тира (≥55% gross margin
+  per project memory directive)
+- Auto-activate для всех новых юзеров (без admin интервенции)
+- Drop manual approval flow
 
-### 4. Ревизия legacy backlog
+Перед coding: интервью на 5 вопросов (которые dimensions limit'им
+— LLM ходы / голосовые минуты / проактивные напоминания, periods,
+trial длина, что с pending_bot ритуалом).
+
+### Pending — BudgetService is_subscribed regression (investigate)
+
+5 unit-тестов в `tests/unit/test_budget_service.py` фейлились на
+HEAD до моих admin-правок 2026-05-07. Симптом:
+`get_quota_status()` возвращает `is_subscribed=False` при активной
+подписке. Может быть тестовый regress после некой migration, либо
+real bug в quota enforcement. Investigate before touching billing
+logic в Базовой подписке (выше).
+
+### Pending — Ревизия legacy backlog
 
 Список ниже («План на 2026-04-30», «0. Hot-fix'ы», секции 2-7)
 требует переоценки приоритетов на свежую голову. Многие пункты
