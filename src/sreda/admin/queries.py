@@ -13,9 +13,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
-from sreda.db.models.connect import TenantEDSAccount
 from sreda.db.models.core import Tenant, User
-from sreda.db.models.skill_platform import SkillAIExecution, TenantSkillState
+from sreda.db.models.skill_platform import SkillAIExecution
 from sreda.db.models.user_profile import TenantUserProfile, TenantUserSkillConfig
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.services.budget import BudgetService
@@ -53,11 +52,10 @@ class UserRow:
     tenant_name: str
     user_id: str
     telegram_id: str | None
+    max_account_id: str | None
     display_name: str | None
     timezone: str | None
     subscriptions: list[SubInfo]
-    eds_accounts: list[EDSInfo]
-    skill_states: list[SkillInfo]
     # None = pending approval (new user, admin hasn't clicked "Одобрить"
     # yet). Non-None = approved; admin UI hides the button in that case.
     approved_at: str | None = None
@@ -77,28 +75,19 @@ class SubInfo:
     active_until: str
 
 
-@dataclass
-class EDSInfo:
-    login_masked: str
-    status: str
-    last_poll_at: str
-    last_error: str | None
-
-
-@dataclass
-class SkillInfo:
-    feature_key: str
-    lifecycle_status: str
-    health_status: str
-    last_successful_run_at: str
-
-
 def get_all_users(session: Session) -> list[UserRow]:
-    """All users with their profiles, subscriptions, EDS accounts, skills."""
+    """All users with their profiles + subscriptions.
+
+    Sort: newest tenant first (by ``tenants.created_at`` DESC).
+    """
     tenant_rows = session.query(Tenant).all()
     tenants = {t.id: t.name for t in tenant_rows}
     # Keep approved_at handy for the "Одобрить" button on /admin/users.
     tenants_approved = {t.id: t.approved_at for t in tenant_rows}
+    # Sort key: newest tenants float to the top of the table.
+    tenants_created_at: dict[str, datetime | None] = {
+        t.id: _ensure_utc(t.created_at) for t in tenant_rows
+    }
     users = session.query(User).all()
 
     # Bulk-load related data keyed by tenant_id
@@ -120,26 +109,6 @@ def get_all_users(session: Session) -> list[UserRow]:
             active_until=_fmt_dt(sub.active_until),
         )
         subs_by_tenant.setdefault(sub.tenant_id, []).append(info)
-
-    eds_by_tenant: dict[str, list[EDSInfo]] = {}
-    for acc in session.query(TenantEDSAccount).all():
-        info = EDSInfo(
-            login_masked=acc.login_masked or "—",
-            status=acc.status,
-            last_poll_at=_fmt_dt(acc.last_poll_at),
-            last_error=acc.last_error_code,
-        )
-        eds_by_tenant.setdefault(acc.tenant_id, []).append(info)
-
-    skills_by_tenant: dict[str, list[SkillInfo]] = {}
-    for sk in session.query(TenantSkillState).all():
-        info = SkillInfo(
-            feature_key=sk.feature_key,
-            lifecycle_status=sk.lifecycle_status,
-            health_status=sk.health_status,
-            last_successful_run_at=_fmt_dt(sk.last_successful_run_at),
-        )
-        skills_by_tenant.setdefault(sk.tenant_id, []).append(info)
 
     # Welcome v2 broadcast tour прогресс — читаем из housewife
     # skill_params_json. Bulk: одним запросом по всем (tenant, user).
@@ -174,16 +143,21 @@ def get_all_users(session: Session) -> list[UserRow]:
                 tenant_name=tenants.get(u.tenant_id, u.tenant_id),
                 user_id=u.id,
                 telegram_id=u.telegram_account_id,
+                max_account_id=u.max_account_id,
                 display_name=profile.display_name if profile else None,
                 timezone=profile.timezone if profile else None,
                 subscriptions=subs_by_tenant.get(u.tenant_id, []),
-                eds_accounts=eds_by_tenant.get(u.tenant_id, []),
-                skill_states=skills_by_tenant.get(u.tenant_id, []),
                 approved_at=_fmt_dt(approved_at),
                 is_pending=approved_at is None,
                 welcome_v2_status=welcome_v2_status,
             )
         )
+    # Newest tenants first. None goes to the end.
+    _SENTINEL_OLD = datetime.min.replace(tzinfo=timezone.utc)
+    result.sort(
+        key=lambda r: tenants_created_at.get(r.tenant_id) or _SENTINEL_OLD,
+        reverse=True,
+    )
     return result
 
 
