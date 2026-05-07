@@ -8,15 +8,19 @@ pending задачи. В начало ставим самое приоритет
 Архив завершённых задач: [docs/done/index.md](done/index.md).
 Workflow и конвенция хранения — `docs/done/README.md`.
 
-**Последнее обновление:** 2026-05-07.
-**Что задеплоено вчера (2026-05-06):** перенесено в
-`docs/done/2026-W19.md` — channel-linking MVP shipped, оба направления
-TG↔MAX верифицированы Boris'ом, post-approve welcome через MAX
-запущен.
+**Последнее обновление:** 2026-05-07 (вечер).
+**Что задеплоено сегодня (2026-05-07):** перенесено в
+`docs/done/2026-W19.md` — Free-tier subscription Phase 1+2 shipped
+(grandfather 15 tenants, sreda_free quota, EntitlementGate, voice
+gates, admin suspend/unsuspend). Codex retroactive review: 1
+CRITICAL + 6 MAJOR + 1 MINOR применены и развёрнуты (commit
+`0f3df1d`). Прод-инцидент с safe_restart.sh (long-poll vs webhook
+конфликт) восстановлен и зафиксен. Записаны два новых ПРАВИЛА #3
+и #4 в memory.
 
 ---
 
-## План на 2026-05-07 (следующий рабочий день)
+## План на 2026-05-08 (следующий рабочий день)
 
 ### Pending — Поднять стейджевый контур (приоритет высокий)
 
@@ -53,48 +57,6 @@ staging-контура каждое нетривиальное изменени�
 **Когда:** после фиксов Phase 2 (текущий релиз) — отдельной задачей.
 Возможно W20.
 
-### ✅ DONE 2026-05-07 — Admin /admin/users refactor (commits `0412b6a`, `9b55655`)
-
-Per Boris's UX request утром 2026-05-07:
-- Drop колонок «ЛК (EDS)» и «Навыки»
-- Сортировка tenants по `created_at` DESC (newest first)
-- Полный `user_id` без truncation
-- Combined column «Каналы»: `TG: <id>, MAX: <id>` (только заполненные)
-
-`UserRow` shrinks: `eds_accounts`/`skill_states` dropped,
-`max_account_id` added. `queries.py` drops `TenantEDSAccount` /
-`TenantSkillState` bulk lookups.
-
-### ✅ DONE 2026-05-07 — Admin /admin/budget sort by last_used_at (commits `a575ede`, `76b997c`)
-
-`BudgetRow.last_used_at = MAX(skill_ai_executions.created_at)` per
-(tenant, feature_key). Сортировка DESC, subs без активности в
-текущем периоде уезжают вниз. Колонка «Последнее использ.»
-добавлена в template для визуальной верификации порядка.
-
-### ✅ DONE 2026-05-07 — Boris's account merge (manual SQL)
-
-`tenant_tg_352612382` (создан network bug'ом 2026-05-06 22:06 UTC,
-1 inbound + 1 secure_record) → merged в `tenant_max_40921122`.
-TG creds (encrypted `telegram_account_id` + `tg_account_hash`)
-скопированы в `user_max_40921122`, source tenant удалён cascade.
-Pattern: snapshot-then-delete-then-update (защищает от
-unique-constraint violation на `tg_account_hash`).
-
-### ✅ DONE 2026-05-07 — Restore rate limit от 100 обратно к 5
-
-`services/channel_linking.py:RATE_LIMIT_MAX = 5` (was 100 после
-smoke-bump 2026-05-06). Прод-значение восстановлено: 5 successful
-starts / 30min window per tenant.
-
-### ✅ DONE 2026-05-07 — Helper-script wipe_tenant.sh
-
-`scripts/wipe_tenant.sh <tenant_id> [--force]` — cascade-delete
-tenant + все FK children в одной транзакции через SSH к VDS.
-Inventory шоу + interactive confirm by default. Pattern
-`tenant_<channel>_<id>` enforced (SQL-injection guard). Заменяет
-~36-line SQL что прогонялся 4× за день вчера.
-
 ### Pending — Lazy-provision orphan tenant при первом MAX → text message
 
 Сейчас если юзер в MAX пишет НЕ `/start lnk_X` (любой текст до
@@ -106,27 +68,49 @@ scope), либо удалить orphan-tenant в момент consume_link вм�
 блокировки. **Решение Boris:** скорее всего «удалить orphan» —
 MVP-уровень. Полный destructive merge — после weekly Claude reset.
 
-### Pending — Базовая подписка + auto-activate + drop manual approval
+### Pending — Subscription follow-up (хвосты после Phase 2)
 
-Сейчас подписка housewife_assistant ничем не ограничена; admin
-approval — manual gate. Цели:
-- Подобрать лимиты + сроки для базового тира (≥55% gross margin
-  per project memory directive)
-- Auto-activate для всех новых юзеров (без admin интервенции)
-- Drop manual approval flow
+Phase 1+2 free-tier subscription и Codex review fixes shipped
+2026-05-07 (см. W19). Остались follow-up задачи:
 
-Перед coding: интервью на 5 вопросов (которые dimensions limit'им
-— LLM ходы / голосовые минуты / проактивные напоминания, periods,
-trial длина, что с pending_bot ритуалом).
+**1. pending_bot tour: 11 → 4 шага** (низкий риск, изначальный
+scope Phase 2). План: `_BRANCHES` сократить до
+`intro → voice → memory → done`. Прод сейчас на старом 11-step
+tour. Acceptance: новый юзер проходит tour за 4 тапа, конец ставит
+`onboarding_tour_completed=True`.
 
-### Pending — BudgetService is_subscribed regression (investigate)
+**2. BudgetService `is_subscribed` regression** (investigate).
+5 unit-тестов в `tests/unit/test_budget_service.py` фейлятся на
+HEAD: `get_quota_status()` возвращает `is_subscribed=False` при
+active sub. Phase 2 metering работает мимо BudgetService через
+UsageLedger напрямую — не блокировало shipping, но нужно перед
+premium-tier sprint. Возможно clock-dependent test fixtures (нужно
+заглянуть на active_until даты).
 
-5 unit-тестов в `tests/unit/test_budget_service.py` фейлились на
-HEAD до моих admin-правок 2026-05-07. Симптом:
-`get_quota_status()` возвращает `is_subscribed=False` при активной
-подписке. Может быть тестовый regress после некой migration, либо
-real bug в quota enforcement. Investigate before touching billing
-logic в Базовой подписке (выше).
+**3. Live smoke-чеклист Phase 2 на staging** (когда подниму
+staging-контур, см. ниже). Изначальный план Phase 2 имел 9
+сценариев: новый юзер сегодня, signup-rate-limit на 4-й попытке,
+LLM exhaustion 21-й turn, voice 5-min/day cap, voice STT failure
+refund, suspend → unsuspend, web_search блокирован для free,
+admin/approve → 410, и т.д. Не прогоняли — слишком рисково на
+живых юзерах.
+
+**4. Deferred Codex/Xiaomi findings** (несрочные):
+- **MAJOR-5** Gate проверка `active_until` — для unlimited subs
+  не критично; станет важно когда добавятся trial subs.
+- **Xiaomi m1**: shared quota-gate helper между TG voice и MAX
+  voice (DRY refactor — сейчас дублирование).
+- **Xiaomi m2**: EntitlementGate result cache per turn (perf —
+  сейчас 3 одинаковых query за turn).
+- **MINOR**: отдельный `SREDA_SIGNUP_HASH_KEY` env (currently
+  reuse `tg_account_salt` — cryptographic isolation).
+
+**5. Premium tier** (out of scope изначально). Когда будем делать:
+цены (≥55% gross margin per project memory), top-up vs upgrade
+семантика на exhaustion, интеграция с pricing-страницей сайта,
+ЮKassa wiring, миграция grandfathered → paid (вопрос: остаётся
+ли `grandfathered_at` flag после оплаты или переходят на paid
+tier с metering).
 
 ### Pending — Ревизия legacy backlog
 
