@@ -2,6 +2,7 @@ import base64
 from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from sreda.db.models import AgentRun, AgentThread
@@ -389,6 +390,7 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     assert len(outbox) == 1
 
 
+@pytest.mark.skip(reason="EDS-monitor scrubbed 2026-05-07; obsolete pending code removal")
 def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
     monkeypatch,
     tmp_path: Path,

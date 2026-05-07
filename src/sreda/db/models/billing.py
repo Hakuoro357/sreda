@@ -6,10 +6,12 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     event,
+    text as sql_text,
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -71,13 +73,20 @@ class TenantBillingCycle(Base):
 
 class TenantSubscription(Base):
     __tablename__ = "tenant_subscriptions"
-    # NB: The plan called for partial unique index `(tenant_id, feature_key)
-    # WHERE status='active'`, но это ломает existing eds_monitor multi-slot
-    # billing pattern (base + extra-account subs share feature_key). Phase 1
-    # ships без DB-level uniqueness — single-active-per-(tenant, feature)
-    # invariant enforced на app-level в Phase 2 (EntitlementGate +
-    # SignupAbuseGuard). Tracked as known TODO; full DB-level enforcement
-    # требует refactor of eds_monitor billing model (separate sprint).
+    __table_args__ = (
+        # Partial unique index: at most one active sub per (tenant, feature_key).
+        # Migration 0042 creates this в production schema (после EDS scrub
+        # 2026-05-07 удалил multi-slot eds_monitor active rows). Mirrors
+        # __table_args__ так что Base.metadata.create_all (test DB) stays
+        # in sync с production.
+        Index(
+            "ux_tenant_subs_active_per_feature",
+            "tenant_id", "feature_key",
+            unique=True,
+            postgresql_where=sql_text("status = 'active'"),
+            sqlite_where=sql_text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)

@@ -1,3 +1,20 @@
+"""EDS-monitor billing tests.
+
+Module-level skip 2026-05-07: EDS-monitor scrubbed на проде (2 active
+subs cancelled, plans is_active=false). Эти тесты проверяют
+multi-slot billing flow на eds_monitor (base + extra-account subs
+с тем же feature_key) — несовместимо с partial unique index из
+migration 0042 `(tenant_id, feature_key) WHERE status='active'`.
+
+Tests left in tree pending eds_monitor code removal в follow-up sprint.
+Если EDS-monitor возвращается с другой billing model — тесты
+перерабатываются.
+"""
+
+import pytest
+
+pytestmark = pytest.mark.skip(reason="EDS-monitor scrubbed 2026-05-07; tests obsolete pending code removal")
+
 from datetime import UTC, datetime
 
 from sqlalchemy import create_engine, event

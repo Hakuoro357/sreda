@@ -191,29 +191,47 @@ def test_event_listener_does_not_overwrite_explicit_feature_key(session):
     assert sub.feature_key == "explicit_override"
 
 
-def test_multi_active_subs_per_feature_allowed(session):
-    """eds_monitor billing pattern: tenant has multi active subs same
-    feature_key (base + extra-account slots). Phase 1 НЕ enforces
-    single-active invariant на DB-level — это compatible с existing
-    eds_monitor multi-slot model. Single-active invariant for
-    `housewife_assistant` enforced на app-level в Phase 2 через
-    EntitlementGate + SignupAbuseGuard.
+def test_partial_unique_index_blocks_two_active_per_feature(session):
+    """Migration 0042 partial unique index: tenant cannot have 2 active
+    subs same (tenant_id, feature_key). После EDS scrub 2026-05-07
+    eds_monitor multi-slot pattern dropped — index безопасно introduced.
     """
     plan_a = _seed_plan(
-        session, plan_key="multi_a", feature_key="eds_monitor",
+        session, plan_key="unique_a", feature_key="housewife_assistant",
     )
     plan_b = _seed_plan(
-        session, plan_key="multi_b", feature_key="eds_monitor",
+        session, plan_key="unique_b", feature_key="housewife_assistant",
     )
-    _seed_tenant(session, "t_multi")
+    _seed_tenant(session, "t_unique")
     _seed_subscription(
-        session, sub_id="sub_base",
-        tenant_id="t_multi", plan=plan_a, status="active",
+        session, sub_id="sub_first",
+        tenant_id="t_unique", plan=plan_a, status="active",
     )
-    # Both active — должно работать (no DB constraint blocking)
+    with pytest.raises(IntegrityError):
+        _seed_subscription(
+            session, sub_id="sub_second",
+            tenant_id="t_unique", plan=plan_b, status="active",
+        )
+    session.rollback()
+
+
+def test_partial_unique_index_allows_active_plus_cancelled(session):
+    """Active + cancelled на same (tenant, feature) — OK
+    (partial index только status='active')."""
+    plan_a = _seed_plan(
+        session, plan_key="partial_a", feature_key="housewife_assistant",
+    )
+    plan_b = _seed_plan(
+        session, plan_key="partial_b", feature_key="housewife_assistant",
+    )
+    _seed_tenant(session, "t_partial")
+    _seed_subscription(
+        session, sub_id="sub_old",
+        tenant_id="t_partial", plan=plan_a, status="cancelled",
+    )
     sub2 = _seed_subscription(
-        session, sub_id="sub_extra",
-        tenant_id="t_multi", plan=plan_b, status="active",
+        session, sub_id="sub_new",
+        tenant_id="t_partial", plan=plan_b, status="active",
     )
     assert sub2.status == "active"
 

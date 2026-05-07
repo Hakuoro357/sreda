@@ -4,6 +4,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
 from sreda.db.models import (
@@ -129,6 +131,7 @@ def test_runtime_service_reuses_thread_and_sends_outbox(monkeypatch, tmp_path: P
     assert result_json["outbox_statuses"] == ["sent"]
 
 
+@pytest.mark.skip(reason="EDS-monitor scrubbed 2026-05-07; obsolete pending code removal")
 def test_runtime_service_add_eds_sends_subscription_and_connect_messages(monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "runtime_mutation.db"
     key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
