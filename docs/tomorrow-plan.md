@@ -8,101 +8,23 @@ pending задачи. В начало ставим самое приоритет
 Архив завершённых задач: [docs/done/index.md](done/index.md).
 Workflow и конвенция хранения — `docs/done/README.md`.
 
-**Составлено:** 2026-04-25 (вечер).
-**Ожидаемый горизонт исполнения:** 1 рабочий день с возможным
-растяжением на 2 дня, т.к. пункты 3–6 существенные.
-
----
-
-## ✅ DONE 2026-05-06 — Channel-linking MVP (TG → MAX) shipped
-
-Реализован полным циклом (Codex coder + Claude orchestrator + Xiaomi
-extra reviewer). 8 phases, 85 tests, live E2E verified на Boris's
-tenant в 12:17 UTC. Final UX: bot sends deep-link в чат, miniapp
-закрывается, юзер тапает ссылку → MAX bot chat → inline confirm.
-
-**Что задеплоено** (commits `42b4a80`...`3b12e6b`):
-- Migration 0040 (`channel_link_tokens.source_user_id`)
-- consume_link MVP (atomic UPDATE WHERE, idempotent retry, collision guard)
-- Endpoints: `/start` (sends link к chat), `/consume`, `/cancel`,
-  `/status`, `/account-status`
-- TG initData start_param parsing + miniapp shortname `sreda_app`
-- MAX bot_started intercept (avoids orphan tenant creation)
-- AuditLog + ownership checks
-- 85 unit/integration tests passing
-
-**Известные ограничения / на следующий sprint:**
-- TG-Android `bridge.openLink` quirk → workaround: bot шлёт ссылку в чат
-- MAX `?startapp=` mini-app delivery unreliable → switched to `?start=` chat-based
-- Lazy-provision orphan при first MAX bot interaction (handled для lnk_)
-- **MAX → TG direction not tested** (TG-target chat-based handler probably
-  needs probe — `/start lnk_X` в TG bot работает?)
-- Destructive merge для cross-tenant collision: blocked w/ error
-  «account_already_registered_separately» (manual support merge для MVP)
-
-**Deferred к full plan** (`plans/channel-linking-fix-stalled-r7.md`):
-- Destructive merge + subscription sum-extend
-- Migrations 0041-0044 (channel_identity hash, partial unique indexes)
-- Postgres advisory locks + race deadlock test
-- channel_identity abstraction
-- TenantFeature recompute logic
-
-**Open issue из dev-loop:**
-- Rate limit raised от 5 до 100 для smoke testing —
-  TODO restore to 5 production value
-
-### Дополнения вечера 2026-05-06 (MAX-only регистрация)
-
-После того как Boris удалил TG tenant и пошёл регистрироваться через
-MAX — обнаружились ещё 3 gap'а в pending/welcome flow и они закрыты:
-
-- ✅ **Pending welcome для MAX-only юзеров** (commit `2b0c240`).
-  Раньше первый `/start` от fresh MAX-юзера → silent drop из-за
-  `is_approved=False` гарда. Теперь pending tenant получает
-  pending_bot intro + scripted tour (зеркало TG flow).
-  Файл: `services/max_inbound.py:_handle_max_pending_tenant`.
-- ✅ **Edit-in-place на pb:* кнопках** (commit `eb92cce`).
-  Каждый тап «назад/вперёд» в туре присылал новое сообщение в чат —
-  теперь редактируется оригинальное (`PUT /messages?message_id=<mid>`)
-  + acks callback (`POST /answers`) → пропадает loading-spinner.
-- ✅ **Post-approve welcome через MAX** (commit `c0d9b1e`).
-  Раньше approve в админке слал welcome только в TG —
-  MAX-only юзеры получали тишину. Теперь route на оба канала
-  по наличию `telegram_account_id` / `max_chat_id`.
-  Файл: `admin/routes.py:admin_tenant_approve`.
-- ✅ **Live E2E smoke** (Boris's verification, вечер 2026-05-06).
-  Оба направления протестированы:
-  - TG → MAX: TG miniapp → «Привязать MAX» → bot шлёт ссылку в чат →
-    tap в TG → MAX bot consume → max_account_id+max_chat_id attached.
-  - MAX → TG: MAX → fresh регистрация → pending intro + тур →
-    admin approve → welcome в MAX → MAX miniapp «Привязать Telegram» →
-    ссылка в MAX → tap → TG bot consume → telegram_account_id attached.
-    Оба канала на том же tenant_id.
+**Последнее обновление:** 2026-05-07.
+**Что задеплоено вчера (2026-05-06):** перенесено в
+`docs/done/2026-W19.md` — channel-linking MVP shipped, оба направления
+TG↔MAX верифицированы Boris'ом, post-approve welcome через MAX
+запущен.
 
 ---
 
 ## План на 2026-05-07 (следующий рабочий день)
 
-### 1. ✅ DONE 2026-05-06 (вечером протестировано Boris'ом) — MAX onboarding live-тест
-
-Full E2E сработал: Fresh MAX регистрация → pending intro → тур back/next
-редактирует одно сообщение → admin approve → welcome message приходит
-в MAX → нормальный диалог. Без silent drops.
-
-### 2. Restore rate limit от 100 обратно к 5
+### 1. Restore rate limit от 100 обратно к 5
 
 В `services/channel_linking.py` (или где сейчас live cap) — было
 поднято для smoke testing channel-linking. Прод-значение: 5 токенов
 на тенант / 60 сек.
 
-### 3. ✅ DONE 2026-05-06 (вечером протестировано Boris'ом) — MAX → TG direction smoke
-
-Обратное направление работает: MAX miniapp → «Привязать Telegram» →
-ссылка в MAX-чат → tap → TG bot получает `/start lnk_X` → consume_link
-срабатывает → tenant получает `telegram_account_id`. Оба канала
-залинкованы на тот же tenant_id.
-
-### 4. Lazy-provision orphan tenant при первом MAX → text message
+### 2. Lazy-provision orphan tenant при первом MAX → text message
 
 Сейчас если юзер в MAX пишет НЕ `/start lnk_X` (любой текст до
 ссылки) — `ensure_max_user_bundle` создаёт orphan `tenant_max_<id>`,
@@ -112,15 +34,19 @@ orphan в TG-tenant при consume_link (destructive merge — out of MVP
 scope), либо удалить orphan-tenant в момент consume_link вместо
 блокировки. Обсудить с Boris архитектурно.
 
-### 5. Helper-script для test cleanup
+### 3. Helper-script для test cleanup
 
-Сегодня 4× прогнал ~36-line SQL для wipe orphan tenant. Создать
-`scripts/wipe_tenant.sh <tenant_id>` либо admin-route `/admin/tenant/delete`
-с FK-cascade. UX: одна команда вместо здоровенной транзакции.
+Вечером 2026-05-06 4× прогнал ~36-line SQL для wipe orphan tenant.
+Создать `scripts/wipe_tenant.sh <tenant_id>` либо admin-route
+`/admin/tenant/delete` с FK-cascade. UX: одна команда вместо
+здоровенной транзакции.
 
-### 6. Старый список (из 2026-04-30 секции — нужен ревизия приоритетов)
+### 4. Ревизия legacy backlog
 
-См. ниже — pending задачи требуют переоценки на свежую голову.
+Список ниже («План на 2026-04-30», «0. Hot-fix'ы», секции 2-7)
+требует переоценки приоритетов на свежую голову. Многие пункты
+могут быть уже закрыты предыдущими коммитами но не помечены —
+пройтись грепом, помечать ✅ DONE и переносить в W19/W18 архивы.
 
 ---
 
