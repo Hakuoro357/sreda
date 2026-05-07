@@ -1631,9 +1631,47 @@ def execute_conversation_chat(
             )
         ]
 
-    # --- 2.5. Free-tier daily limit (Часть A плана v2) ------------------
-    # Без активной подписки — ограничен числом LLM-turn'ов в день.
-    # Исчерпан → отдаём отлуп с кнопками, НЕ дёргаем LLM.
+    # --- 2.5a. Free-tier quota (Phase 2C: usage_ledger-based) -----------
+    # sreda_free plan — daily+monthly LLM caps via UsageLedger
+    # (atomic CTE-based UPSERT, all-or-nothing across periods).
+    # Grandfathered/paid юзеры skipped.
+    from sreda.services.entitlement_gate import EntitlementGate
+    from sreda.services.upgrade_copy import UPGRADE_COPY
+    from sreda.services.usage_ledger import (
+        UsageLedgerService, msk_period_keys,
+    )
+
+    _gate_result = EntitlementGate(session).check(action.tenant_id)
+    _plan_key = _gate_result.plan_key
+
+    if _plan_key == "sreda_free" and not _gate_result.is_grandfathered:
+        _daily_key, _monthly_key = msk_period_keys()
+        _ledger = UsageLedgerService(session.get_bind())
+        _quota_ok = _ledger.try_consume(
+            action.tenant_id, "llm_turns", 1,
+            [
+                ("daily", _daily_key, 20),
+                ("monthly", _monthly_key, 200),
+            ],
+        )
+        if not _quota_ok:
+            logger.info(
+                "USAGE_LEDGER_LLM_EXCEEDED tenant=%s plan=sreda_free",
+                action.tenant_id,
+            )
+            return [
+                RuntimeReply(
+                    text=UPGRADE_COPY["llm_daily_or_monthly"],
+                    reply_markup=None,
+                    feature_key=feature_key,
+                )
+            ]
+
+    # --- 2.5b. Free-tier daily limit (legacy FreeTierCounter) -----------
+    # Phase 2C: для sreda_free юзеров usage_ledger выше уже enforced
+    # лимит. FreeTierCounter сейчас skips через is_subscribed=True
+    # (active feature_key). Оставлен для legacy unsubscribed paths
+    # (например тесты, edge case'ы где tenant has no active sub).
     from sreda.services.free_tier import FREE_TIER_DAILY_LIMIT, FreeTierCounter
 
     free_tier = FreeTierCounter(session)

@@ -1,13 +1,87 @@
 from __future__ import annotations
 
+import logging
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from sreda.db.models.core import Assistant, User, Workspace
+from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+from sreda.db.models.core import Assistant, Tenant, User, Workspace
 from sreda.db.repositories.seed import SeedRepository
+from sreda.services.signup_abuse import SignupAbuseGuard, SignupBlocked
+
+logger = logging.getLogger(__name__)
 
 CONNECT_EDS_CALLBACK = "onboarding:connect_eds"
+
+
+# Phase 2C: free-tier subscription auto-grant.
+# `_auto_approve_and_grant_free_tier` вызывается ПОСЛЕ tenant bundle
+# created, mark tenant approved + insert sreda_free subscription.
+# Tenant becomes immediately usable (no manual admin approve).
+
+def _auto_approve_and_grant_free_tier(session: Session, tenant_id: str) -> None:
+    """Idempotent: marks tenant approved + grants sreda_free sub.
+
+    Called после `SeedRepository.ensure_tenant_bundle()` для new tenant.
+    Skip silently если sreda_free plan не существует (например на legacy
+    DB до миграции 0041) — caller log warning.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Mark approved (idempotent — skip if already set)
+    tenant = session.get(Tenant, tenant_id)
+    if tenant is not None and tenant.approved_at is None:
+        tenant.approved_at = now
+
+    # Resolve sreda_free plan
+    free_plan = (
+        session.query(SubscriptionPlan)
+        .filter(SubscriptionPlan.plan_key == "sreda_free")
+        .one_or_none()
+    )
+    if free_plan is None:
+        logger.warning(
+            "auto_approve: sreda_free plan не существует — пропускаю "
+            "subscription grant для tenant=%s. Проверь migration 0041 "
+            "applied.", tenant_id,
+        )
+        session.commit()
+        return
+
+    # Idempotent: skip if tenant уже has active sub on housewife_assistant
+    existing = (
+        session.query(TenantSubscription)
+        .filter(
+            TenantSubscription.tenant_id == tenant_id,
+            TenantSubscription.feature_key == "housewife_assistant",
+            TenantSubscription.status == "active",
+        )
+        .first()
+    )
+    if existing is not None:
+        session.commit()
+        return
+
+    # Insert sreda_free subscription. Event listener
+    # `_sync_subscription_feature_key` populates feature_key из plan.
+    session.add(TenantSubscription(
+        id="sub_" + uuid.uuid4().hex[:24],
+        tenant_id=tenant_id,
+        plan_id=free_plan.id,
+        feature_key=free_plan.feature_key,
+        status="active",
+        starts_at=now,
+        active_until=None,
+        cancel_at_period_end=False,
+        quantity=1,
+        next_cycle_quantity=1,
+        created_at=now,
+        updated_at=now,
+    ))
+    session.commit()
 
 
 def find_user_by_chat_id(session: Session, chat_id: str | int) -> User | None:
@@ -132,6 +206,14 @@ def ensure_telegram_user_bundle_by_id(
             assistant.id if assistant is not None else None,
         )
 
+    # Phase 2C: signup abuse guard ПЕРЕД bundle creation. Raises
+    # SignupBlocked если kill-switch / global cap / rate-limit hit.
+    # Caller (handler) catches SignupBlocked → sends UPGRADE_COPY[reason].
+    guard = SignupAbuseGuard()
+    allowed, reason = guard.check_inside_tx(session, "telegram", telegram_id)
+    if not allowed:
+        raise SignupBlocked(reason)
+
     display_name = display_name or f"Пользователь {telegram_id}"
     tenant_id = f"tenant_tg_{telegram_id}"
     workspace_id = f"workspace_tg_{telegram_id}"
@@ -149,6 +231,10 @@ def ensure_telegram_user_bundle_by_id(
         assistant_name="Среда",
         eds_monitor_enabled=False,
     )
+
+    # Phase 2C: auto-approve + sreda_free grant. Replaces manual
+    # admin /admin/tenant/approve flow. Tenant immediately usable.
+    _auto_approve_and_grant_free_tier(session, tenant_id)
 
     return TelegramOnboardingResult(
         True, telegram_id, tenant_id, workspace_id, user_id, assistant_id
@@ -328,6 +414,13 @@ def ensure_max_user_bundle(
             assistant.id if assistant is not None else None,
         )
 
+    # Phase 2C: signup abuse guard ПЕРЕД bundle creation. Raises
+    # SignupBlocked если kill-switch / global cap / rate-limit hit.
+    guard = SignupAbuseGuard()
+    allowed, reason = guard.check_inside_tx(session, "max", aid)
+    if not allowed:
+        raise SignupBlocked(reason)
+
     display_name = display_name or f"Пользователь {aid}"
     tenant_id = f"tenant_max_{aid}"
     workspace_id = f"workspace_max_{aid}"
@@ -352,6 +445,10 @@ def ensure_max_user_bundle(
         if u is not None:
             u.max_chat_id = chat_id_str
             session.commit()
+
+    # Phase 2C: auto-approve + sreda_free grant. Replaces manual
+    # admin /admin/tenant/approve flow.
+    _auto_approve_and_grant_free_tier(session, tenant_id)
 
     return MaxOnboardingResult(
         True, aid, chat_id_str, tenant_id, workspace_id, user_id, assistant_id
