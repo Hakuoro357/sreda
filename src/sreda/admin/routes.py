@@ -550,19 +550,39 @@ def admin_tenant_reset(
     )
 
 
-@router.post("/tenant/approve", response_class=HTMLResponse)
+@router.post("/tenant/approve")
 async def admin_tenant_approve(
     tenant_id: str = Query(...),
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    """Approve a pending tenant + send the welcome message.
+    """410 Gone — Phase 2D removed manual approval.
 
-    Sets ``tenants.approved_at = NOW()`` so the telegram_webhook stops
-    silent-dropping their messages, and proactively pushes the welcome
-    card (same ``build_welcome_message`` used for the pre-approval
-    flow) so the user knows they can now use the bot.
+    Phase 2 deploy moved auto-grant + auto-approve to onboarding hook
+    (`services/onboarding._auto_approve_and_grant_free_tier`). This
+    route returns 410 для одного релиза чтобы старые форм-bookmarks
+    видели понятный код. Будет полностью удалён в follow-up release.
     """
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        "410 Gone — manual approval removed. Tenants are auto-approved "
+        "on first contact (Phase 2 of free-tier-subscription plan). "
+        "See /admin/tenant/<id>/suspend для отключения abuse.",
+        status_code=410,
+    )
+
+
+# Legacy admin_tenant_approve body preserved as comment в commit history
+# (git show before commit deploying Phase 2D). Restorable если auto-grant
+# нужно roll back. Phase 3 cleanup полностью удалит route.
+
+# --- below is the legacy implementation, no longer reachable ---
+async def _legacy_admin_tenant_approve_unused(
+    tenant_id: str,
+    token: str,
+    session,
+):
+    """Unreachable. Documents legacy semantic for future reference."""
     from datetime import UTC
     from datetime import datetime as _dt
 
@@ -710,5 +730,96 @@ async def admin_tenant_approve(
             f"/admin/users?token={token}&approve=ok&tenant={tenant_id}"
             f"&welcome={delivery_status}&grant={grant_status}"
         ),
+        status_code=303,
+    )
+
+
+# --- Phase 2D: suspend / unsuspend tenant subscription -----------------
+# Single-active-per-feature constraint (migration 0042) makes target
+# row deterministic — filter by feature_key='housewife_assistant'.
+
+@router.post("/tenant/{tenant_id}/suspend", response_class=HTMLResponse)
+async def admin_tenant_suspend(
+    tenant_id: str,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Suspend tenant's housewife_assistant subscription (status='active' → 'suspended').
+
+    Phase 2D — replaces manual approve flow для abuse mitigation.
+    Suspended tenants get UPGRADE_COPY['suspended'] copy from
+    EntitlementGate when they message the bot.
+    """
+    from sreda.db.models.billing import TenantSubscription
+    from sreda.services.audit import audit_event, hash_admin_token
+
+    sub = (
+        session.query(TenantSubscription)
+        .filter(
+            TenantSubscription.tenant_id == tenant_id,
+            TenantSubscription.feature_key == "housewife_assistant",
+            TenantSubscription.status == "active",
+        )
+        .first()
+    )
+    if sub is None:
+        return RedirectResponse(
+            url=f"/admin/users?token={token}&suspend=err&msg=no_active_sub",
+            status_code=303,
+        )
+    sub.status = "suspended"
+    audit_event(
+        session,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        action="admin.tenant.suspend",
+        resource_type="tenant",
+        resource_id=tenant_id,
+        commit=False,
+    )
+    session.commit()
+    return RedirectResponse(
+        url=f"/admin/users?token={token}&suspend=ok&tenant={tenant_id}",
+        status_code=303,
+    )
+
+
+@router.post("/tenant/{tenant_id}/unsuspend", response_class=HTMLResponse)
+async def admin_tenant_unsuspend(
+    tenant_id: str,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Unsuspend (status='suspended' → 'active'). Reverses suspend."""
+    from sreda.db.models.billing import TenantSubscription
+    from sreda.services.audit import audit_event, hash_admin_token
+
+    sub = (
+        session.query(TenantSubscription)
+        .filter(
+            TenantSubscription.tenant_id == tenant_id,
+            TenantSubscription.feature_key == "housewife_assistant",
+            TenantSubscription.status == "suspended",
+        )
+        .first()
+    )
+    if sub is None:
+        return RedirectResponse(
+            url=f"/admin/users?token={token}&unsuspend=err&msg=no_suspended_sub",
+            status_code=303,
+        )
+    sub.status = "active"
+    audit_event(
+        session,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        action="admin.tenant.unsuspend",
+        resource_type="tenant",
+        resource_id=tenant_id,
+        commit=False,
+    )
+    session.commit()
+    return RedirectResponse(
+        url=f"/admin/users?token={token}&unsuspend=ok&tenant={tenant_id}",
         status_code=303,
     )

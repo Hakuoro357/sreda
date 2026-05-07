@@ -122,12 +122,31 @@ async def handle_max_update(
     with SessionLocal() as session:
         # Sender display name (best-effort).
         display_name = _extract_max_display_name(payload)
-        onboarding = ensure_max_user_bundle(
-            session,
-            max_account_id=sender_user_id,
-            max_chat_id=chat_id,
-            display_name=display_name,
-        )
+        # Phase 2C: catch SignupBlocked from abuse guard.
+        from sreda.services.signup_abuse import SignupBlocked
+        from sreda.services.upgrade_copy import UPGRADE_COPY
+        try:
+            onboarding = ensure_max_user_bundle(
+                session,
+                max_account_id=sender_user_id,
+                max_chat_id=chat_id,
+                display_name=display_name,
+            )
+        except SignupBlocked as exc:
+            logger.info(
+                "max inbound: signup blocked reason=%s — drop update",
+                exc.reason,
+            )
+            if chat_id and settings.max_bot_token:
+                try:
+                    client = MaxClient(token=settings.max_bot_token)
+                    await client.send_message(
+                        recipient={"chat_id": chat_id},
+                        text=UPGRADE_COPY.get(exc.reason, UPGRADE_COPY["signups_closed"]),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("max signup-blocked notify failed", exc_info=True)
+            return ""
 
         result = persist_max_inbound_event(
             session, bot_key=bot_key, payload=payload,
@@ -318,6 +337,37 @@ async def _maybe_transcribe_max_voice(
         )
         return None
 
+    # --- Phase 2C: free-tier quota gate (mirror TG) ---
+    from sreda.services.entitlement_gate import EntitlementGate
+    from sreda.services.upgrade_copy import UPGRADE_COPY
+    from sreda.services.usage_ledger import (
+        SREDA_FREE_LLM_DAILY, SREDA_FREE_LLM_MONTHLY,
+        SREDA_FREE_VOICE_SECONDS_DAILY, SREDA_FREE_VOICE_SECONDS_MONTHLY,
+        UsageLedgerService, msk_period_keys,
+    )
+
+    _gate = EntitlementGate(session).check(tenant_id)
+    _is_free = (_gate.plan_key == "sreda_free" and not _gate.is_grandfathered)
+    _ledger: UsageLedgerService | None = None
+    _llm_periods: list[tuple[str, str, int]] | None = None
+    _voice_periods: list[tuple[str, str, int]] | None = None
+    _duration_seconds: float | None = None
+
+    if _is_free:
+        _daily_key, _monthly_key = msk_period_keys()
+        _ledger = UsageLedgerService(session.get_bind())
+        _llm_periods = [
+            ("daily", _daily_key, SREDA_FREE_LLM_DAILY),
+            ("monthly", _monthly_key, SREDA_FREE_LLM_MONTHLY),
+        ]
+        if not _ledger.try_consume(tenant_id, "llm_turns", 1, _llm_periods):
+            await _send_error(UPGRADE_COPY["llm_daily_or_monthly"])
+            return None
+        _voice_periods = [
+            ("daily", _daily_key, SREDA_FREE_VOICE_SECONDS_DAILY),
+            ("monthly", _monthly_key, SREDA_FREE_VOICE_SECONDS_MONTHLY),
+        ]
+
     # 4 + 5: Download + transcribe (same trace steps as TG для cross-channel
     # ops dashboard parity).
     from sreda.services import trace
@@ -343,12 +393,17 @@ async def _maybe_transcribe_max_voice(
                     "Отправь покороче (до ~30 секунд)."
                 )
                 _dl_meta["status"] = "too_long"
+                # Phase 2C M1 fix: refund LLM (reserved before download)
+                if _is_free and _ledger and _llm_periods:
+                    _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
                 return None
             logger.warning("max voice download failed: %s", exc)
             await _send_error(
                 "Не удалось получить голосовое сообщение. Отправь ещё раз."
             )
             _dl_meta["status"] = "download_failed"
+            if _is_free and _ledger and _llm_periods:
+                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
             return None
         except Exception as exc:  # noqa: BLE001
             logger.warning("max voice download crashed: %s", exc)
@@ -356,6 +411,8 @@ async def _maybe_transcribe_max_voice(
                 "Не удалось получить голосовое сообщение. Отправь ещё раз."
             )
             _dl_meta["status"] = "download_crashed"
+            if _is_free and _ledger and _llm_periods:
+                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
             return None
         _dl_meta["bytes_in"] = len(audio_bytes)
         # Codex R2 MAJOR #3 partial fix: capture audio magic bytes для
@@ -391,6 +448,28 @@ async def _maybe_transcribe_max_voice(
                 "Отправь покороче (до ~30 секунд)."
             )
             _dl_meta["status"] = "too_long"
+            # Phase 2C: refund LLM if reserved (we charged at gate)
+            if _is_free and _ledger and _llm_periods:
+                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            return None
+
+    # --- Phase 2C: voice quota reserve via ffprobe duration ---
+    if _is_free and _ledger and _llm_periods and _voice_periods:
+        from sreda.services.audio_probe import FfprobeError, ffprobe_duration
+        try:
+            _duration_seconds = ffprobe_duration(audio_bytes)
+        except FfprobeError as exc:
+            logger.warning("max voice ffprobe failed: %s — refunding LLM", exc)
+            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await _send_error(
+                "Не получилось обработать голосовое — напиши текстом, пожалуйста."
+            )
+            return None
+        if not _ledger.try_consume(
+            tenant_id, "voice_stt_seconds", _duration_seconds, _voice_periods,
+        ):
+            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await _send_error(UPGRADE_COPY["voice_daily_or_monthly"])
             return None
 
     with trace.step("voice.transcribe", provider=provider) as _trace_meta:
@@ -404,6 +483,15 @@ async def _maybe_transcribe_max_voice(
                 "Отправь ещё раз или напиши."
             )
             _trace_meta["status"] = "recognize_failed"
+            # Phase 2C: refund both quotas если reserved
+            if _is_free and _ledger:
+                if _llm_periods:
+                    _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                if _voice_periods and _duration_seconds:
+                    _ledger.refund(
+                        tenant_id, "voice_stt_seconds",
+                        _duration_seconds, _voice_periods,
+                    )
             return None
         _trace_meta["chars_out"] = len(text)
         _trace_meta["status"] = "ok"

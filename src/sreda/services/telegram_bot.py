@@ -143,6 +143,42 @@ async def _maybe_transcribe_voice(
         await _send_error("Голосовые сообщения сейчас не работают. Напиши текстом или попробуй позже.")
         return None
 
+    # --- Phase 2C: free-tier quota gate ---
+    # Reserve LLM turn (1) FIRST — voice eventually triggers LLM.
+    # Voice quota reserved AFTER ffprobe duration known. Both refunded
+    # on STT exception path.
+    from sreda.services.entitlement_gate import EntitlementGate
+    from sreda.services.upgrade_copy import UPGRADE_COPY
+    from sreda.services.usage_ledger import (
+        SREDA_FREE_LLM_DAILY, SREDA_FREE_LLM_MONTHLY,
+        SREDA_FREE_VOICE_SECONDS_DAILY, SREDA_FREE_VOICE_SECONDS_MONTHLY,
+        UsageLedgerService, msk_period_keys,
+    )
+
+    _gate = EntitlementGate(session).check(tenant_id)
+    _is_free = (_gate.plan_key == "sreda_free" and not _gate.is_grandfathered)
+    _ledger: UsageLedgerService | None = None
+    _llm_periods: list[tuple[str, str, int]] | None = None
+    _voice_periods: list[tuple[str, str, int]] | None = None
+    _duration_seconds: float | None = None
+
+    if _is_free:
+        _daily_key, _monthly_key = msk_period_keys()
+        _ledger = UsageLedgerService(session.get_bind())
+        _llm_periods = [
+            ("daily", _daily_key, SREDA_FREE_LLM_DAILY),
+            ("monthly", _monthly_key, SREDA_FREE_LLM_MONTHLY),
+        ]
+        if not _ledger.try_consume(tenant_id, "llm_turns", 1, _llm_periods):
+            await _send_error(UPGRADE_COPY["llm_daily_or_monthly"])
+            return None
+        # Voice quota check happens AFTER duration probed. Set up
+        # periods now, reserve later.
+        _voice_periods = [
+            ("daily", _daily_key, SREDA_FREE_VOICE_SECONDS_DAILY),
+            ("monthly", _monthly_key, SREDA_FREE_VOICE_SECONDS_MONTHLY),
+        ]
+
     # 5 + 6: Download audio + transcribe. Split across two trace
     # steps as of 2026-04-22 — pproxy → VDS tunnel round-trip on the
     # Telegram ``getFile`` + ``download_file`` calls is comparable to
@@ -156,6 +192,8 @@ async def _maybe_transcribe_voice(
         if not file_id:
             await _send_error("Не удалось получить голосовое сообщение. Отправь ещё раз.")
             _dl_meta["status"] = "no_file_id"
+            if _is_free and _ledger and _llm_periods:
+                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
             return None
 
         try:
@@ -168,9 +206,34 @@ async def _maybe_transcribe_voice(
             logger.warning("Voice download failed: %s", exc)
             await _send_error("Не удалось получить голосовое сообщение. Отправь ещё раз.")
             _dl_meta["status"] = "download_failed"
+            # Phase 2C M1 fix: refund LLM if reserved (download failure
+            # ≠ user fault). Юзер не получил value — quota не charge'аем.
+            if _is_free and _ledger and _llm_periods:
+                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
             return None
 
         _dl_meta["bytes_in"] = len(audio_bytes)
+
+    # --- Phase 2C: voice quota reserve via ffprobe duration ---
+    # Free tier only. Refund LLM if ffprobe fails OR voice quota
+    # exceeded (so юзер не charged за text fallback / upgrade rejection).
+    if _is_free and _ledger and _llm_periods and _voice_periods:
+        from sreda.services.audio_probe import FfprobeError, ffprobe_duration
+        try:
+            _duration_seconds = ffprobe_duration(audio_bytes)
+        except FfprobeError as exc:
+            logger.warning("ffprobe failed: %s — refunding LLM, sending text fallback", exc)
+            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await _send_error(
+                "Не получилось обработать голосовое — напиши текстом, пожалуйста."
+            )
+            return None
+        if not _ledger.try_consume(
+            tenant_id, "voice_stt_seconds", _duration_seconds, _voice_periods,
+        ):
+            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await _send_error(UPGRADE_COPY["voice_daily_or_monthly"])
+            return None
 
     with trace.step("voice.transcribe", provider=provider) as _trace_meta:
         _trace_meta["bytes_in"] = len(audio_bytes)
@@ -182,6 +245,15 @@ async def _maybe_transcribe_voice(
             logger.warning("Speech recognition failed: %s", exc)
             await _send_error("Не получилось расшифровать голос. Отправь ещё раз или напиши.")
             _trace_meta["status"] = "recognize_failed"
+            # Phase 2C: refund both quotas если reserved
+            if _is_free and _ledger:
+                if _llm_periods:
+                    _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                if _voice_periods and _duration_seconds:
+                    _ledger.refund(
+                        tenant_id, "voice_stt_seconds",
+                        _duration_seconds, _voice_periods,
+                    )
             return None
 
         _trace_meta["chars_out"] = len(text)

@@ -153,6 +153,7 @@ def _require_miniapp_auth(
                 or (webapp_user.username or "").strip()
                 or None
             )
+            from sreda.services.signup_abuse import SignupBlocked as _SignupBlocked
             try:
                 onboarding = ensure_telegram_user_bundle_by_id(
                     session,
@@ -160,6 +161,19 @@ def _require_miniapp_auth(
                     display_name=display_name,
                 )
                 session.commit()
+            except _SignupBlocked as exc:
+                # Phase 2C: separate except clause (Xiaomi m5 fix —
+                # mirror MAX pattern для consistency и safety —
+                # generic except + isinstance fragile).
+                session.rollback()
+                logger.info(
+                    "miniapp auth: signup blocked tg=%s reason=%s",
+                    account_id, exc.reason,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"signup_blocked:{exc.reason}",
+                )
             except Exception:
                 session.rollback()
                 logger.exception(
@@ -238,6 +252,7 @@ def _require_miniapp_auth(
             # нового MAX-юзера. ``ensure_max_user_bundle`` использует
             # deterministic PK (`f"user_max_{account_id}"`), параллельные
             # INSERT'ы получают IntegrityError. Catch + retry resolve.
+            from sreda.services.signup_abuse import SignupBlocked as _SignupBlocked
             try:
                 onboarding = ensure_max_user_bundle(
                     session,
@@ -246,6 +261,17 @@ def _require_miniapp_auth(
                     display_name=(max_user.first_name or "").strip() or None,
                 )
                 session.commit()
+            except _SignupBlocked as exc:
+                # Phase 2C: signup abuse rejection — 429 с reason
+                session.rollback()
+                logger.info(
+                    "miniapp auth max: signup blocked id=%s reason=%s",
+                    account_id, exc.reason,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"signup_blocked:{exc.reason}",
+                )
             except IntegrityError:
                 session.rollback()
                 logger.info(

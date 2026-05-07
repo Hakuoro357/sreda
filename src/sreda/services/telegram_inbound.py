@@ -435,7 +435,31 @@ async def handle_telegram_update(
     settings = get_settings()
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        onboarding = ensure_telegram_user_bundle(session, payload)
+        # Phase 2C: catch SignupBlocked from abuse guard inside
+        # ensure_telegram_user_bundle. Send UPGRADE_COPY[reason] to user
+        # and drop update (no inbound persisted, no LLM call).
+        from sreda.services.onboarding import _extract_chat_id
+        from sreda.services.signup_abuse import SignupBlocked
+        from sreda.services.upgrade_copy import UPGRADE_COPY
+        try:
+            onboarding = ensure_telegram_user_bundle(session, payload)
+        except SignupBlocked as exc:
+            logger.info(
+                "telegram inbound: signup blocked reason=%s — drop update",
+                exc.reason,
+            )
+            chat_id = _extract_chat_id(payload)
+            if chat_id and settings.telegram_bot_token:
+                try:
+                    from sreda.integrations.telegram.client import TelegramClient
+                    client = TelegramClient(token=settings.telegram_bot_token)
+                    await client.send_message(
+                        chat_id=chat_id,
+                        text=UPGRADE_COPY.get(exc.reason, UPGRADE_COPY["signups_closed"]),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("signup-blocked notify failed", exc_info=True)
+            return None
         result = persist_telegram_inbound_event(
             session, bot_key=bot_key, payload=payload,
         )

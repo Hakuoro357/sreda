@@ -1,0 +1,11 @@
+[Unit]
+Description=Sreda — daily timer for signup_attempts cleanup (Phase 2 retention)
+
+[Timer]
+# 03:30 UTC = 06:30 MSK (after 03:00 UTC backup_postgres run)
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=sreda-cleanup-signup-attempts.service
+
+[Install]
+WantedBy=timers.target

@@ -57,6 +57,16 @@ logger = logging.getLogger(__name__)
 _MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
+# Phase 2 free-tier quota constants — single source of truth.
+# Used by runtime/handlers.py (LLM gate) и services/{telegram_bot,
+# max_inbound}.py (voice gates). Boris adjusts через RuntimeConfig
+# в follow-up sprint (per Open Question #2 в plan); пока hardcoded.
+SREDA_FREE_LLM_DAILY = 20
+SREDA_FREE_LLM_MONTHLY = 200
+SREDA_FREE_VOICE_SECONDS_DAILY = 5 * 60       # 5 minutes
+SREDA_FREE_VOICE_SECONDS_MONTHLY = 30 * 60    # 30 minutes
+
+
 def msk_period_keys(now: datetime | None = None) -> tuple[str, str]:
     """Return ('YYYY-MM-DD', 'YYYY-MM') в Europe/Moscow."""
     if now is None:

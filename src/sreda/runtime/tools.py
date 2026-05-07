@@ -247,12 +247,22 @@ def build_memory_tools(
     fetch_url_tool = build_fetch_url_tool()
     weather_tool = build_weather_tool()
 
-    return [
+    # Phase 2D: web_search disabled for sreda_free tier. Free users
+    # see "веб-поиск доступен в расширенном тарифе" в upgrade copy.
+    # Grandfathered + paid tiers retain web_search.
+    from sreda.services.entitlement_gate import EntitlementGate
+    _gate = EntitlementGate(session).check(tenant_id)
+    _is_free_only = (
+        _gate.plan_key == "sreda_free" and not _gate.is_grandfathered
+    )
+
+    tools_list: list[Callable] = [
         save_core_fact,
         save_episode,
         recall_memory,
         weather_tool,
-        web_search_tool,
-        fetch_url_tool,
-        log_unsupported_request,
     ]
+    if not _is_free_only:
+        tools_list.append(web_search_tool)
+    tools_list.extend([fetch_url_tool, log_unsupported_request])
+    return tools_list

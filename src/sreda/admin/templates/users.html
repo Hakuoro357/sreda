@@ -61,15 +61,33 @@
         {% endfor %}
       </td>
       <td>
-        {% if u.is_pending %}
-        <form method="post" action="/admin/tenant/approve?tenant_id={{ u.tenant_id }}"
+        {# Phase 2D: manual approval removed (auto-grant в onboarding).
+           Show suspend/unsuspend based on housewife_assistant sub status.
+           Filter: subscriptions list has feature_key='housewife_assistant' rows. #}
+        {% set ns = namespace(active=false, suspended=false) %}
+        {% for s in u.subscriptions %}
+          {% if s.feature_key == "housewife_assistant" %}
+            {% if s.status == "active" %}{% set ns.active = true %}{% endif %}
+            {% if s.status == "suspended" %}{% set ns.suspended = true %}{% endif %}
+          {% endif %}
+        {% endfor %}
+        {% if ns.active %}
+        <form method="post" action="/admin/tenant/{{ u.tenant_id }}/suspend"
+              style="display: inline-block; margin-right: .25rem;"
+              onsubmit="return confirm('Приостановить tenant {{ u.tenant_name }}?')">
+          <button type="submit" class="outline" style="padding: .25rem .5rem; font-size: .8rem; border-color: #cc6f00; color: #cc6f00;">
+            Приостановить
+          </button>
+        </form>
+        {% elif ns.suspended %}
+        <form method="post" action="/admin/tenant/{{ u.tenant_id }}/unsuspend"
               style="display: inline-block; margin-right: .25rem;">
           <button type="submit" class="outline" style="padding: .25rem .5rem; font-size: .8rem; border-color: #2ea44f; color: #2ea44f;">
-            Одобрить
+            Возобновить
           </button>
         </form>
         {% else %}
-        <span class="muted" style="font-size: .75rem;" title="одобрено {{ u.approved_at }}">✓ одобрен</span>
+        <span class="muted" style="font-size: .75rem;" title="legacy tenant без active housewife_assistant subscription">— нет sub —</span>
         {% endif %}
         <form method="post" action="/admin/tenant/reset?tenant_id={{ u.tenant_id }}"
               style="display: inline-block;"

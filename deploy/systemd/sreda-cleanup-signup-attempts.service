@@ -1,0 +1,10 @@
+[Unit]
+Description=Sreda — daily cleanup of signup_attempts older than 30 days
+After=network.target
+
+[Service]
+Type=oneshot
+User=sreda
+ExecStart=/opt/sreda/scripts/cron/cleanup_signup_attempts.sh
+StandardOutput=journal
+StandardError=journal

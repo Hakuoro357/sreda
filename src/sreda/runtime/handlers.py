@@ -1638,6 +1638,7 @@ def execute_conversation_chat(
     from sreda.services.entitlement_gate import EntitlementGate
     from sreda.services.upgrade_copy import UPGRADE_COPY
     from sreda.services.usage_ledger import (
+        SREDA_FREE_LLM_DAILY, SREDA_FREE_LLM_MONTHLY,
         UsageLedgerService, msk_period_keys,
     )
 
@@ -1650,8 +1651,8 @@ def execute_conversation_chat(
         _quota_ok = _ledger.try_consume(
             action.tenant_id, "llm_turns", 1,
             [
-                ("daily", _daily_key, 20),
-                ("monthly", _monthly_key, 200),
+                ("daily", _daily_key, SREDA_FREE_LLM_DAILY),
+                ("monthly", _monthly_key, SREDA_FREE_LLM_MONTHLY),
             ],
         )
         if not _quota_ok:
