@@ -17,6 +17,7 @@
       <th>Использование</th>
       <th>Вызовов LLM</th>
       <th>Токенов</th>
+      <th>Последнее использ.</th>
       <th>Период</th>
       <th></th>
     </tr>
@@ -52,6 +53,7 @@
       </td>
       <td>{{ "{:,}".format(r.total_calls) }}</td>
       <td>{{ "{:,}".format(r.total_tokens) }}</td>
+      <td><span class="muted">{{ r.last_used_at }}</span></td>
       <td><span class="muted">{{ r.period_start }} → {{ r.period_end }}</span></td>
       <td>
         <a href="/admin/llm-calls?tenant_id={{ r.tenant_id }}&feature_key={{ r.feature_key }}" role="button" class="outline" style="padding: 4px 10px; font-size: 12px;">

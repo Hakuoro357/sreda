@@ -177,10 +177,15 @@ class BudgetRow:
     total_tokens: int
     period_start: str
     period_end: str
+    last_used_at: str
 
 
 def get_budget_summary(session: Session) -> list[BudgetRow]:
-    """Aggregate budget per (tenant, feature_key) using active subscriptions."""
+    """Aggregate budget per (tenant, feature_key) using active subscriptions.
+
+    Sort: most recent activity first (MAX(skill_ai_executions.created_at)
+    DESC). Subs with no activity in the current period sink to the bottom.
+    """
     tenants = {t.id: t.name for t in session.query(Tenant).all()}
     budget_svc = BudgetService(session)
 
@@ -192,14 +197,15 @@ def get_budget_summary(session: Session) -> list[BudgetRow]:
         .all()
     )
 
-    rows: list[BudgetRow] = []
+    rows_with_sort: list[tuple[datetime | None, BudgetRow]] = []
     for sub, plan in active_subs:
         quota = budget_svc.get_quota_status(sub.tenant_id, plan.feature_key)
 
-        # Aggregate calls + tokens for the period
+        # Aggregate calls + tokens + last-used for the period
         q = session.query(
             func.count(SkillAIExecution.id),
             func.coalesce(func.sum(SkillAIExecution.total_tokens), 0),
+            func.max(SkillAIExecution.created_at),
         ).filter(
             SkillAIExecution.tenant_id == sub.tenant_id,
             SkillAIExecution.feature_key == plan.feature_key,
@@ -208,13 +214,15 @@ def get_budget_summary(session: Session) -> list[BudgetRow]:
             q = q.filter(SkillAIExecution.created_at >= quota.period_start)
         if quota.period_end:
             q = q.filter(SkillAIExecution.created_at <= quota.period_end)
-        total_calls, total_tokens = q.one()
+        total_calls, total_tokens, last_used_dt = q.one()
+        last_used_dt = _ensure_utc(last_used_dt)
 
         usage_pct = None
         if quota.credits_quota and quota.credits_quota > 0:
             usage_pct = round(quota.credits_used / quota.credits_quota * 100, 1)
 
-        rows.append(
+        rows_with_sort.append((
+            last_used_dt,
             BudgetRow(
                 tenant_id=sub.tenant_id,
                 tenant_name=tenants.get(sub.tenant_id, sub.tenant_id),
@@ -227,9 +235,13 @@ def get_budget_summary(session: Session) -> list[BudgetRow]:
                 total_tokens=int(total_tokens),
                 period_start=_fmt_dt(quota.period_start),
                 period_end=_fmt_dt(quota.period_end),
-            )
-        )
-    return rows
+                last_used_at=_fmt_dt(last_used_dt),
+            ),
+        ))
+    # Most-recently-used first. None (no activity in period) sinks last.
+    _SENTINEL_OLD = datetime.min.replace(tzinfo=timezone.utc)
+    rows_with_sort.sort(key=lambda x: x[0] or _SENTINEL_OLD, reverse=True)
+    return [r for _, r in rows_with_sort]
 
 
 # ----------------------------------------------------------- llm calls page
