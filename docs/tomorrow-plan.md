@@ -224,6 +224,75 @@ get_weather вызван с granularity="hourly" а не fetch_url).
 distinct reminder. Тем не менее — для будущей debug'а имеет
 смысл прогнать outbox dedup audit.
 
+### Pending — Latency: follow-up оптимизации после Phase A+B (наблюдения 2026-05-08)
+
+Phase A (prompt batching) + Phase B (parallel dispatch для
+allowlisted I/O tools) задеплоены 2026-05-08 (`b06fae3`, `cd687ff`).
+Verified в проде на `trace_4cf5a9567d3a4c50` — 53s вместо ~110s
+без оптимизации. Ниже — что осталось на столе.
+
+**1. web_search parallel-safe** (MEDIUM, ~1 день).
+
+В trace `trace_4cf5a9567d3a4c50` iter.0 эмитнул `tools=[web_search × 5]`,
+но они исполнились **последовательно** (~10s) потому что web_search
+исключён из `_PARALLEL_SAFE_TOOLS`: пишет в `WebSearchUsageCounter`
+через shared SQLAlchemy session. Если 5 параллельных
+`counter.record_tavily()` сделать thread-safe — экономия 8s на
+research-heavy turns.
+
+**Подходы:**
+- **A.** Каждый поток получает свою session через factory →
+  `record_tavily` коммитит независимо. Простой fix, но ×5 connections
+  на одной iter — пресс на pool.
+- **B.** In-memory counter aggregation внутри turn → один commit
+  в конце через main session. Меньше connections, но нужна
+  consistency на abort.
+- **C.** Использовать atomic UPDATE с RETURNING — один SQL
+  per record_tavily, но на shared session всё равно нужна lock'ом
+  обернуть.
+
+**Acceptance:** unit test где 5 web_search запускаются конкурентно
+через `_dispatch_tool_calls_batch`, assert quota инкрементируется
+ровно 5 раз.
+
+**2. LLM streaming** (BIG UX win, ~2-3 дня).
+
+iter.2 в `trace_4cf5a9567d3a4c50` — synthesis 21695ms на 1286
+output tokens (~60 tok/sec). Сейчас ответ генерится атомарно:
+юзер ждёт 53s полностью молча после ack'а. С streaming:
+- Первые токены через ~3s.
+- Текст подгружается в outbox по мере генерации.
+- Telegram editMessageText обновляет сообщение через 1-2s паузы
+  (TG rate limit на edit'ы).
+
+**Архитектурная боль:** наш текущий path `llm.invoke(...)` →
+полный response. Нужно switching на `llm.stream(...)`. Это
+затрагивает:
+- handlers.py:execute_conversation_chat — collecting chunks vs
+  one shot.
+- outbox emit — заранее create+edit, или делать chunked appends.
+- Anti-hallucination scrubber — сейчас работает на финальном
+  тексте, со streaming нужно либо post-stream scrub либо
+  per-chunk (хуже).
+- Phase B на write turns (когда придёт) — template вместо LLM
+  text, со streaming не сочетается.
+
+**Решение приоритетов:** только для read-only turns (где
+`called_tools` не содержит write tools). Write turns — атомарный
+template (anti-hallucination guarantee). Read turns — streaming
+для UX.
+
+**Acceptance:** 53s turn → юзер видит первый токен через ≤3s,
+финальный edit через 53s. Plus integration тест с fake LLM
+streaming chunks.
+
+**3. weather get_weather hourly granularity** (см. секцию 2 выше
+«Weather: hourly forecast — 78s web research вместо 1-2s tool
+call»). Этот фикс, после Phase A+B, должен убрать **самый
+тяжёлый** observed турн (`trace_2e248c2277d94e47`, 78s) совсем.
+
+---
+
 ### Pending — Ревизия legacy backlog
 
 Список ниже («План на 2026-04-30», «0. Hot-fix'ы», секции 2-7)
