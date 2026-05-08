@@ -306,7 +306,96 @@ _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в поку
                   # Маркер «☐»/«☑»/«☒»/«✗» в выводе = претензия на
                   # отображение чек-листа.
                   "чек-лист", "чек лист", "пункт",
-                  "☐", "☑", "☒", "✗")
+                  "☐", "☑", "☒", "✗",
+                  # 2026-05-08 incident (tenant_tg_755682022): LLM
+                  # написала «Записала в план кроя на пятницу» когда
+                  # был вызван add_shopping_items. Cutting plan tool
+                  # не существует — категория `None` ниже.
+                  # Codex r3 MAJOR #2: only specific phrases — bare
+                  # "крой" matches "раскрой", "покрой" (часть слов
+                  # «раскрой теста», «покрой одежды»).
+                  "план кро", "в крой ", " крой ", "план на крой")
+
+
+# 2026-05-08: object → tool-category mapping. Category=None означает
+# что в системе НЕТ tool'а для этого claim type — любая такая claim
+# = unbacked всегда. Это закрывает 2026-05-08 cutting plan bug.
+#
+# Substrings checked в порядке specificity (длинные первыми) — чтобы
+# «в план кроя» не матчился просто на «в покупк» если оба в окне.
+_OBJECT_TO_CATEGORY: tuple[tuple[str, str | None], ...] = (
+    # Cutting plan — no tool exists. Always unbacked.
+    # ⚠ Codex r3 MAJOR #2: только specific фразы. Bare "крой"
+    # ловит «раскрой», «покрой» (раскрой ткани, покрой одежды) —
+    # false positives. Phrase-based matching tighter.
+    ("план кро", None),       # "план кроя", "план крой"
+    ("план на крой", None),
+    ("в крой ", None),         # "в крой на пятницу"
+    (" крой ", None),          # bare "крой" surrounded by spaces
+    # Recipe
+    ("рецепт", "recipe"),
+    ("в книг", "recipe"),
+    # Shopping
+    ("в покупк", "shopping"),
+    ("в список покуп", "shopping"),
+    ("в твой список", "shopping"),
+    ("в список", "shopping"),
+    # Menu
+    ("в меню", "menu"),
+    ("меню на", "menu"),
+    # Reminder
+    ("напомина", "reminder"),
+    # Family
+    ("семь", "family"),
+    # Task
+    ("задач", "task"),
+    ("в расписан", "task"),
+    ("запланирова", "task"),
+    # Checklist
+    ("чек-лист", "checklist"),
+    ("чек лист", "checklist"),
+    ("пункт", "checklist"),
+    ("☐", "checklist"),
+    ("☑", "checklist"),
+    ("☒", "checklist"),
+    ("✗", "checklist"),
+)
+
+
+# 2026-05-08: tool-name → category. Используется в category-aware
+# проверке detect_unbacked_claim.
+_CATEGORY_TO_TOOLS: dict[str, frozenset[str]] = {
+    "recipe": frozenset({
+        "save_recipe", "save_recipes_batch", "delete_recipe",
+    }),
+    "shopping": frozenset({
+        "add_shopping_items", "remove_shopping_items",
+        "mark_shopping_bought", "update_shopping_item",
+        "update_shopping_items_category", "clear_bought_shopping",
+    }),
+    "menu": frozenset({
+        "plan_week_menu", "update_menu_item",
+        "generate_shopping_from_menu", "clear_menu",
+    }),
+    "reminder": frozenset({
+        "schedule_reminder", "cancel_reminder", "update_reminder",
+        "attach_reminder", "detach_reminder",
+    }),
+    "family": frozenset({
+        "add_family_members", "update_family_member",
+        "remove_family_member",
+    }),
+    "task": frozenset({
+        "add_task", "update_task", "complete_task",
+        "uncomplete_task", "cancel_task", "delete_task",
+    }),
+    "checklist": frozenset({
+        "create_checklist", "add_checklist_items",
+        "move_task_to_checklist", "mark_checklist_item_done",
+        "delete_checklist_item", "archive_checklist",
+    }),
+    "memory": frozenset({"save_core_fact", "save_episode"}),
+}
 
 
 # 2026-04-29: self-asserting verbs — verb itself implies a side-effect,
@@ -319,6 +408,24 @@ _SELF_CLAIMING_VERBS = frozenset({
 })
 
 
+def _identify_claim_category(window: str) -> str | None | bool:
+    """Identify the category of side-effect claimed in the window.
+
+    Returns:
+        - category name (e.g. "shopping", "reminder") if matched
+        - None — claim про несуществующий tool (например cutting plan).
+          Это ВСЕГДА unbacked.
+        - False — нет object match в окне; не a claim вовсе.
+
+    Substrings проверяются в порядке specificity (longer первыми
+    через order в _OBJECT_TO_CATEGORY).
+    """
+    for obj, category in _OBJECT_TO_CATEGORY:
+        if obj in window:
+            return category
+    return False
+
+
 def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
     """Return True when the assistant text claims a side-effect but
     no corresponding write-tool was invoked this turn.
@@ -327,29 +434,51 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
     injects a nudge message and runs one more iteration asking the
     model to ACTUALLY call the tool. Bounded to one retry per turn
     to avoid runaway loops.
+
+    2026-05-08 fix (Codex r2 CRITICAL): category-aware. Previously
+    «any write-tool called → all claims OK» — это пропускало
+    cross-category hallucinations (LLM вызвала shopping.add, но
+    написала про крой). Теперь каждый claim проверяется на
+    соответствие конкретной категории tool'ов.
     """
     if not text:
         return False
-    # Any write-tool call counts as backing — we don't try to map
-    # specific verb → specific tool, that's fragile across wording.
-    if called_tools & _WRITE_TOOL_NAMES:
-        return False
     low = text.lower()
-    # Pass 1: self-asserting verbs — fire on bare presence.
+    # Pass 1: self-asserting verbs — claim про reminder без явного
+    # объекта. Проверяем что reminder-tool был вызван.
+    reminder_tools = _CATEGORY_TO_TOOLS["reminder"]
     for verb in _SELF_CLAIMING_VERBS:
         if verb in low:
-            return True
-    # Pass 2: verb + nearby object pair.
+            if not (called_tools & reminder_tools):
+                return True
+    # Pass 2: verb + nearby object pair. Object → category mapping.
+    # ⚠ Codex r3 MAJOR #1: iterate ВСЕ occurrences каждого verb'а,
+    # не только первое. Иначе «Добавила в покупки. Добавила в план
+    # кроя.» → первое окно shopping-backed → second skipped.
     for verb in _CLAIM_VERBS:
-        verb_idx = low.find(verb)
-        if verb_idx < 0:
-            continue
-        # Limit the object-search window so "я сохранил то что ты
-        # сказала — готово, меню не трогай" doesn't false-fire from
-        # a distant "меню" mention.
-        window = low[max(0, verb_idx - 40): verb_idx + 120]
-        if any(obj in window for obj in _CLAIM_OBJECTS):
-            return True
+        start = 0
+        while True:
+            verb_idx = low.find(verb, start)
+            if verb_idx < 0:
+                break
+            # Advance start for next iteration.
+            start = verb_idx + len(verb)
+            # Limit the object-search window so "я сохранил то что ты
+            # сказала — готово, меню не трогай" doesn't false-fire from
+            # a distant "меню" mention.
+            window = low[max(0, verb_idx - 40): verb_idx + 120]
+            category = _identify_claim_category(window)
+            if category is False:
+                # Verb matched, no recognized object — not a domain claim.
+                continue
+            if category is None:
+                # Object found, no tool exists — always unbacked.
+                # (e.g. «план кроя» — нет cutting_plan tool.)
+                return True
+            # Object found, tool exists — verify matching tool was called.
+            expected_tools = _CATEGORY_TO_TOOLS.get(category, frozenset())
+            if not (called_tools & expected_tools):
+                return True
     return False
 
 

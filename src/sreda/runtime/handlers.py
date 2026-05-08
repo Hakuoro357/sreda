@@ -2392,6 +2392,29 @@ def execute_conversation_chat(
             "Попробуй переформулировать или спросить иначе."
         )
 
+    # Anti-hallucination safety net (Codex r2 CRITICAL fix, 2026-05-08).
+    # Если nudge retry уже использован (_hallucination_nudged=True), и
+    # финальный текст ВСЁ РАВНО содержит unbacked claim (теперь
+    # category-aware) — заменяем на безопасный ack из actually-called
+    # tools. Без этого hallucinated text реально доходит до юзера
+    # (incident 2026-05-08 06:11: LLM вызвала shopping.add, написала
+    # «записала в план кроя на пятницу...» — крой не tool, прошёл).
+    if _hallucination_nudged and detect_unbacked_claim(text, called_tools):
+        safe_ack = _format_safe_ack_from_tools(called_tools)
+        logger.warning(
+            "CHAT_UNBACKED_CLAIM_RETRY_EXHAUSTED tenant=%s feature=%s "
+            "called_tools=%s original_chars=%d — replacing text with safe ack",
+            action.tenant_id, feature_key,
+            sorted(called_tools), len(text),
+        )
+        with trace.step(
+            "chat.hallucination_safety_net",
+            called_tools=",".join(sorted(called_tools)) or "(none)",
+            original_chars=len(text),
+        ):
+            pass
+        text = safe_ack
+
     # Inline-кнопки (Часть 0 плана v2). Если LLM вызывал
     # ``reply_with_buttons`` во время этого turn'а — он положил в
     # state словарь {"text": ..., "buttons": [labels]}. Создаём
@@ -2537,6 +2560,59 @@ _TOOL_TO_DOMAIN: dict[str, str] = {
     # Профиль
     "update_profile_field": "профиль",
 }
+
+
+# ⚠ Codex r3 MINOR: destructive operations (delete/clear/cancel/remove)
+# не должны рапортоваться как «обновила X» — это misleading. Для
+# таких turns используем neutral «Готово».
+_DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
+    "delete_recipe", "remove_shopping_items", "clear_bought_shopping",
+    "clear_menu", "remove_family_member",
+    "cancel_task", "delete_task", "uncomplete_task",
+    "cancel_reminder", "detach_reminder",
+    "delete_checklist_item", "archive_checklist",
+})
+
+
+def _format_safe_ack_from_tools(called_tools: set[str]) -> str:
+    """Generate a safe acknowledgement based on which tools were
+    actually called this turn.
+
+    2026-05-08 (Codex r2 anti-hallucination safety net): when the LLM
+    final text was hallucinated and nudge-retry exhausted, we replace
+    it with this deterministic ack derived from real tool calls.
+
+    Returns a short Russian phrase. Empty / unrecognized tools →
+    generic «Готово». Domain mapping reused from `_TOOL_TO_DOMAIN`.
+
+    ⚠ Codex r3 MINOR: если хотя бы один tool был destructive
+    (delete/clear/cancel) — fall back на generic «Готово», чтобы
+    не сказать «обновила меню» про clear_menu.
+    """
+    if not called_tools:
+        return "Готово."
+
+    # If ANY destructive tool was called → neutral wording (no
+    # confident "обновила" claim).
+    if called_tools & _DESTRUCTIVE_TOOLS:
+        return "Готово."
+
+    domains: set[str] = set()
+    for tool_name in called_tools:
+        domain = _TOOL_TO_DOMAIN.get(tool_name)
+        if domain:
+            domains.add(domain)
+
+    if not domains:
+        return "Готово."
+
+    # Preserve readable order — alphabetic чтобы детерминированно.
+    parts = sorted(domains)
+    if len(parts) == 1:
+        return f"Готово ✅ Обновила {parts[0]}."
+    if len(parts) == 2:
+        return f"Готово ✅ Обновила {parts[0]} и {parts[1]}."
+    return "Готово ✅ Обновила: " + ", ".join(parts) + "."
 
 
 def _format_timeout_summary(tool_counts: dict[str, int]) -> str:
