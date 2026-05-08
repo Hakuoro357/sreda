@@ -147,24 +147,71 @@ tier с metering).
 
 ---
 
-**2. Weather: «недоступен» → «нашла почасовой»** (MINOR UX).
+**2. Weather: hourly forecast — 78s web research вместо 1-2s tool call** (MEDIUM, severity bumped).
 
-Прецедент 2026-05-08 12:18-12:35 MSK. На запрос «прогноз по часам»
-Среда сначала вызвала `get_weather` (Open-Meteo, daily-only) и
-ответила «почасовой мне недоступен — только дневной». Через 16 мин
-после уточняющего вопроса от юзера Среда вызвала `fetch_url` с
-`wttr.in/Москва?...` — wttr.in имеет hourly data — и ответила.
+Прецедент 2026-05-08 12:18-12:35 MSK + повторный 12:34
+(`trace_2e248c2277d94e47`, **78510ms** total, 7 LLM iters).
+Дамп через `scripts/debug_trace_full.py run_bd4101ad6edb42028903b997`:
 
-**Не bug**, но UX-неровность: в первом ответе утверждает
-«недоступен», на retry находит. Юзер думает «значит могла сразу».
+- Запрос: «Почему у тебя нет почасового прогноза или хотя бы более
+  подробного, не почасового, например, день, утро, вечер? Поищи
+  в своих пузах [STT-искажение «источниках»/«базах»]».
+- Среда **проигнорировала собственный `get_weather`** и сделала 6
+  последовательных `fetch_url` к wttr.in за 35s + 18s+18s LLM
+  synthesis = **78s wall-time**.
+- В финальном ответе синтезировала почасовой прогноз с разбивкой
+  «Ночь / Утро / День / Вечер».
 
-**Fix candidate:** в `get_weather` tool description добавить hint
-«если запрашивают hourly и базовый источник без hourly data —
-fall back на `fetch_url` с wttr.in (free, без API key)». Тогда
-LLM сразу пойдёт через wttr.
+**Root cause (architectural):** `services/weather_tool.py` использует
+Open-Meteo **только в daily режиме** (`forecast?daily=...`).
+Open-Meteo бесплатно поддерживает hourly endpoint
+(`&hourly=temperature_2m,precipitation,weathercode,windspeed_10m`).
+Среда **не знает** что hourly доступно, поэтому уходит в web research
+через `fetch_url` к wttr.in.
 
-**Не critical** — может быть deferred до отдельного weather
-sprint'а.
+**Fix (рекомендованный, ~1 день):** расширить `get_weather`:
+
+```python
+def get_weather(
+    location: str,
+    day_offset: int = 0,
+    days_count: int = 1,
+    granularity: Literal["daily", "part_of_day", "hourly"] = "daily",
+):
+    """...
+    granularity:
+      - daily: dawn-to-dusk summary (по умолчанию для общих вопросов)
+      - part_of_day: «утром +5°, днём +12°, вечером +8°»
+        (для запросов «как одеться сегодня»)
+      - hourly: разбивка по часам (для запросов
+        «во сколько пойдёт дождь?»)
+    """
+```
+
+Internally: один HTTP к Open-Meteo с `&hourly=...` параметрами,
+groupby по part_of_day (00-06, 06-12, 12-18, 18-24) или
+непосредственно hourly array.
+
+**Что это даёт:**
+- Latency: 78s → ~1.5s (один tool call).
+- Tokens: 4× iter с 27K→46K context input → 1 iter с 27K. Экономия
+  ~120K токенов на одном слабом запросе.
+- UX: Среда сразу отвечает структурно, не путает юзера фразой
+  «не могу — но могу через web research».
+
+**Кросс-польза с Phase A+B:** Phase A+B оптимизируют
+parallel-fetch для случаев когда web research **реально** нужен
+(новости, рецепты, специфические магазины). Этот фикс убирает
+weather из этого списка совсем.
+
+**Verification:** unit test с mocked Open-Meteo response для
+hourly endpoint + integration test через fake LLM (assert
+get_weather вызван с granularity="hourly" а не fetch_url).
+
+**Когда:** после стабилизации Phase A+B observations (через 1-2
+дня). Слегка приоритетнее чем reminder dedup потому что reminder
+дубль происходит раз в неделю, weather lag — на каждом hourly
+запросе.
 
 ---
 
