@@ -5,33 +5,50 @@
   LLM выкручивался плохо ("сервис показывает только текущую").
 - `web_search` через DDG/Bing блокировался RU egress → ConnectError.
 
-Open-Meteo решает обе проблемы:
+2026-05-08 (incident trace_2e248c2277d94e47, 78510ms):
+- На запрос «почасовой прогноз» Среда игнорировала get_weather (daily-only)
+  и уходила в 6× sequential fetch_url к wttr.in за ~78 секунд.
+- Расширен с поддержкой granularity={daily, part_of_day, hourly}.
+  Open-Meteo бесплатно даёт hourly endpoint — теперь используем его.
+
+Open-Meteo решает проблемы:
 * free, без регистрации (не нужен API key в .env);
-* 16-дневный forecast с гранулярностью «daily» (max/min temp,
-  precipitation, weathercode);
+* до 16 дней forecast в daily / hourly режимах;
 * отдельный geocoding endpoint (city name → lat/lon, RU поддерживается);
 * доступен напрямую с VDS без SOCKS5-прокси (verified 2026-04-29).
 
 Architecture:
-* In-memory geocoding cache (`_GEO_CACHE`) — города повторяются часто
-  (Сходня каждый день для одного юзера). Process-lifetime, без TTL —
-  координаты городов не меняются.
-* WMO weather code → emoji map (`_WEATHER_EMOJI`) — компактный визуал
-  в ответе бота, юзер быстро парсит.
+* In-memory geocoding cache (`_GEO_CACHE`) — города повторяются часто.
+  Process-lifetime, без TTL — координаты не меняются. Lock-protected
+  для thread-safety после Phase B parallel dispatch.
+* `_compute_hourly_window()` — single source of bounds для API
+  start_hour/end_hour И post-filter (consistency).
+* WMO weather code → emoji map + severity ranking (для bucket'инга).
 * F1 формат: одна строка на день («🌧️ ср 29 апр: +3°…+1° · 3.1мм»).
 
 Tool signature:
-    get_weather(location: str, day_offset: int = 0, days_count: int = 1)
+    get_weather(location, day_offset=0, days_count=1, granularity="daily")
 
-LLM сам резолвит «завтра» → day_offset=1 + days_count=1, «на неделю»
-→ days_count=7 и т.п.
+LLM сам резолвит intent → granularity:
+- «во сколько дождь» → granularity="hourly"
+- «как одеться сегодня» → granularity="part_of_day"
+- «погода на неделю» → granularity="daily" (default)
 """
 
 from __future__ import annotations
 
+import datetime as _datetime_module
 import logging
+import threading
 from collections.abc import Callable
-from datetime import date as _date, datetime as _datetime, timedelta as _timedelta
+from datetime import (
+    date as _date,
+    datetime as _datetime,
+    time as _time,
+    timedelta as _timedelta,
+    tzinfo as _tzinfo,
+)
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from langchain_core.tools import tool as lc_tool
@@ -44,10 +61,13 @@ _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 _HTTP_TIMEOUT_SECONDS = 8.0
 _MAX_FORECAST_DAYS = 14  # Open-Meteo поддерживает до 16, но clip 14 для UX
 _DEFAULT_TZ = "Europe/Moscow"
+_HOURLY_CAP_HOURS = 48  # max часов в hourly output (даже если days_count=7)
 
 
 # Process-lifetime cache: name (lowercase, normalised) → (lat, lon, display_name, timezone)
 _GEO_CACHE: dict[str, tuple[float, float, str, str]] = {}
+# Lock-protected чтобы Phase B parallel dispatch не race'ил на dict write.
+_GEO_CACHE_LOCK = threading.Lock()
 
 
 # WMO weathercode → emoji (https://open-meteo.com/en/docs)
@@ -70,6 +90,25 @@ _WEATHER_EMOJI: dict[int, str] = {
 }
 
 
+# WMO weathercode → severity ranking (для dominant code в dry buckets).
+# Используется когда precip всюду 0 — выбираем «характерное» состояние,
+# не первый час. Higher rank = более выраженное явление.
+_WEATHER_SEVERITY: dict[int, int] = {
+    0: 0,    # clear
+    1: 1, 2: 2, 3: 3,                 # mostly clear → overcast
+    45: 4, 48: 4,                     # fog
+    51: 5, 53: 5, 55: 5,              # drizzle
+    56: 6, 57: 6,                     # freezing drizzle
+    61: 7, 63: 7, 65: 7,              # rain
+    66: 8, 67: 8,                     # freezing rain
+    71: 7, 73: 7, 75: 7,              # snow
+    77: 6,                            # snow grains
+    80: 7, 81: 7, 82: 7,              # rain showers
+    85: 7, 86: 7,                     # snow showers
+    95: 9, 96: 9, 99: 9,              # thunderstorm
+}
+
+
 _RU_WEEKDAYS_SHORT: dict[int, str] = {
     0: "пн", 1: "вт", 2: "ср", 3: "чт", 4: "пт", 5: "сб", 6: "вс",
 }
@@ -80,19 +119,293 @@ _RU_MONTHS_GEN: dict[int, str] = {
 }
 
 
+# Granularity normalization — fail-loud (не silent fallback).
+_GRANULARITY_ALIASES: dict[str, str] = {
+    "daily": "daily", "day": "daily", "по дням": "daily",
+    "part_of_day": "part_of_day", "parts": "part_of_day",
+    "part-of-day": "part_of_day", "parts_of_day": "part_of_day",
+    "по частям дня": "part_of_day", "утром-днём-вечером": "part_of_day",
+    "hourly": "hourly", "hour": "hourly", "hours": "hourly",
+    "by_hour": "hourly", "почасовой": "hourly",
+}
+
+
+# Part-of-day buckets: (hour_start_inclusive, hour_end_exclusive, label).
+_PART_OF_DAY_BUCKETS: list[tuple[int, int, str]] = [
+    (0, 6, "ночь"),
+    (6, 12, "утро"),
+    (12, 18, "день"),
+    (18, 24, "вечер"),
+]
+
+
 def _normalize_location(name: str) -> str:
     return " ".join((name or "").lower().split())
 
 
+def _normalize_granularity(value: str | None) -> str | None:
+    """Returns canonical granularity name or None if unknown.
+
+    None → caller возвращает explicit error so LLM может retry с правильным
+    значением. Silent fallback на daily маскирует drift («hour» вместо «hourly»).
+    """
+    return _GRANULARITY_ALIASES.get((value or "").strip().lower())
+
+
+def _resolve_timezone(tz_name: str | None) -> tuple[_tzinfo, str]:
+    """Returns (tzinfo, canonical_request_name).
+
+    Оба нужны: tzinfo для local datetime arithmetic, canonical name для
+    params["timezone"] чтобы API получил valid string, не Junk/Bogus.
+    Fallback chain: tz_name → Europe/Moscow → UTC. Final hard fallback —
+    datetime.timezone.utc (всегда работает, ZoneInfo("UTC") может не быть
+    на Windows без tzdata).
+    """
+    candidates = [tz_name, _DEFAULT_TZ, "UTC"]
+    for tz in candidates:
+        if not tz:
+            continue
+        try:
+            return ZoneInfo(tz), tz
+        except ZoneInfoNotFoundError:
+            logger.warning("invalid timezone %r, falling back", tz)
+    return _datetime_module.timezone.utc, "UTC"
+
+
+def _dominant_weather_code(
+    codes: list[int], precips: list[float],
+) -> int:
+    """Pick the «characteristic» weather code for a bucket.
+
+    Если есть precip > 0.1мм в bucket — код часа с max precip (самый
+    «осадочный» час). Если precip всюду 0 — severity-ranked: max
+    severity среди codes. Это решает case: dry bucket с переменной
+    облачностью → выбирает overcast (3) > partly cloudy (2) > clear (0),
+    не первый час.
+    """
+    if not codes:
+        return 0
+    # Phase 1: max-precip if any wet hour
+    if precips and any(p > 0.1 for p in precips):
+        max_idx = max(range(len(precips)), key=lambda i: precips[i])
+        if max_idx < len(codes):
+            return int(codes[max_idx])
+    # Phase 2: severity-ranked
+    return max(codes, key=lambda c: _WEATHER_SEVERITY.get(int(c), 0))
+
+
+def _bucket_hours_by_part_of_day(
+    times_iso: list[str],
+    temps: list[float],
+    codes: list[int],
+    precips: list[float],
+    winds: list[float],
+) -> list[tuple[_date, str, int, float, float, float]]:
+    """Group hourly arrays into per-day part-of-day buckets.
+
+    Returns list of (day, bucket_label, dominant_code, tavg, precip_sum, wind_avg).
+    Поддерживает несколько дней — buckets группируются по (day, label).
+    """
+    by_key: dict[tuple[_date, str], dict] = {}
+
+    for i, t_iso in enumerate(times_iso):
+        try:
+            dt = _datetime.fromisoformat(t_iso)
+        except (ValueError, TypeError):
+            continue
+        hour = dt.hour
+        # Find bucket
+        label = None
+        for h_start, h_end, name in _PART_OF_DAY_BUCKETS:
+            if h_start <= hour < h_end:
+                label = name
+                break
+        if label is None:
+            continue
+
+        key = (dt.date(), label)
+        bucket = by_key.setdefault(key, {
+            "codes": [], "temps": [], "precips": [], "winds": [],
+        })
+        if i < len(codes):
+            try:
+                bucket["codes"].append(int(codes[i]))
+            except (ValueError, TypeError):
+                pass
+        if i < len(temps):
+            try:
+                bucket["temps"].append(float(temps[i]))
+            except (ValueError, TypeError):
+                pass
+        if i < len(precips):
+            try:
+                bucket["precips"].append(float(precips[i]))
+            except (ValueError, TypeError):
+                pass
+        if i < len(winds):
+            try:
+                bucket["winds"].append(float(winds[i]))
+            except (ValueError, TypeError):
+                pass
+
+    # Build sorted output: by date, then by canonical bucket order.
+    bucket_order = {name: idx for idx, (_, _, name) in enumerate(_PART_OF_DAY_BUCKETS)}
+    sorted_keys = sorted(by_key.keys(), key=lambda k: (k[0], bucket_order[k[1]]))
+
+    out: list[tuple[_date, str, int, float, float, float]] = []
+    for key in sorted_keys:
+        bucket = by_key[key]
+        if not bucket["temps"]:
+            continue
+        code = _dominant_weather_code(bucket["codes"], bucket["precips"])
+        tavg = sum(bucket["temps"]) / len(bucket["temps"])
+        precip_sum = sum(bucket["precips"]) if bucket["precips"] else 0.0
+        wind_avg = (
+            sum(bucket["winds"]) / len(bucket["winds"])
+            if bucket["winds"] else 0.0
+        )
+        out.append((key[0], key[1], code, tavg, precip_sum, wind_avg))
+    return out
+
+
+def _compute_hourly_window(
+    now_local: _datetime,
+    location_tz: _tzinfo,
+    granularity: str,
+    day_offset: int,
+    days_count: int,
+) -> tuple[_datetime, _datetime, str, str, bool, _datetime]:
+    """Compute hourly window in location-local timezone.
+
+    Returns:
+      (start_local, effective_end_local, request_start, request_end, truncated, raw_end_local)
+
+    `effective_end_local` — уже учитывает 48h cap. Используется И для
+    API params, И для post-filter (single source of truth, no drift).
+    `raw_end_local` — uncapped, для truncation marker text.
+
+    Семантика:
+    - hourly + day_offset=0  →  start = current hour (округлённо вниз),
+                                end = последний часовой отметка дня day_offset+days_count-1
+    - hourly + day_offset>0  →  start = 00:00 целевого дня
+    - part_of_day             →  start = 00:00 (полный день для bucket'инга)
+    """
+    base_date = now_local.date() + _timedelta(days=day_offset)
+
+    # ⚠ Codex r3 MAJOR: для hourly+day_offset=0 ВСЕГДА стартуем с now (даже
+    # если days_count>1) — иначе past hours съедают часть 48h cap.
+    if granularity == "hourly" and day_offset == 0:
+        start_local = now_local.replace(minute=0, second=0, microsecond=0)
+    else:
+        start_local = _datetime.combine(base_date, _time(0, 0), tzinfo=location_tz)
+
+    end_date = base_date + _timedelta(days=days_count - 1)
+    end_local = _datetime.combine(end_date, _time(23, 0), tzinfo=location_tz)
+    raw_end_local = end_local
+
+    # Soft cap: 48h независимо от user-requested days_count.
+    delta_hours = int((end_local - start_local).total_seconds() // 3600) + 1
+    if granularity == "hourly" and delta_hours > _HOURLY_CAP_HOURS:
+        # 47 hours offset → 48 inclusive entries (start..start+47h).
+        effective_end_local = start_local + _timedelta(hours=_HOURLY_CAP_HOURS - 1)
+        truncated = True
+    else:
+        effective_end_local = end_local
+        truncated = False
+
+    request_start = start_local.strftime("%Y-%m-%dT%H:%M")
+    request_end = effective_end_local.strftime("%Y-%m-%dT%H:%M")
+    return start_local, effective_end_local, request_start, request_end, truncated, raw_end_local
+
+
+def _format_signed_temp(t: float) -> str:
+    """+3° / 0° / -1°"""
+    val = round(t)
+    if val == 0:
+        return "0°"
+    return f"{val:+d}°"
+
+
+def _format_precip(precip_mm: float) -> str:
+    if precip_mm <= 0.05:
+        return "без осадков"
+    return f"{precip_mm:.1f}мм"
+
+
+def _format_wind(wind_ms: float) -> str:
+    return f"{round(wind_ms)}м/с"
+
+
+def _format_day_line(
+    day: _date, code: int, tmax: float, tmin: float, precip_mm: float,
+) -> str:
+    """F1 format: '🌧️ ср 29 апр: +3°…+1° · 3.1мм'"""
+    emoji = _WEATHER_EMOJI.get(code, "·")
+    weekday = _RU_WEEKDAYS_SHORT.get(day.weekday(), "")
+    month = _RU_MONTHS_GEN.get(day.month, "?")
+    date_part = f"{weekday} {day.day} {month}"
+    temp_part = f"{_format_signed_temp(tmax)}…{_format_signed_temp(tmin)}"
+    precip_part = _format_precip(precip_mm)
+    return f"{emoji} {date_part}: {temp_part} · {precip_part}"
+
+
+def _format_hour_line(
+    dt: _datetime, code: int, temp: float, precip_mm: float, wind_ms: float,
+) -> str:
+    """Format: '☀️ 09:00 +4° · 0мм · 3м/с'"""
+    emoji = _WEATHER_EMOJI.get(code, "·")
+    hh = f"{dt.hour:02d}:00"
+    temp_part = _format_signed_temp(temp)
+    if precip_mm <= 0.05:
+        precip_part = "0мм"
+    else:
+        precip_part = f"{precip_mm:.1f}мм"
+    wind_part = _format_wind(wind_ms)
+    return f"  {emoji} {hh} {temp_part} · {precip_part} · {wind_part}"
+
+
+def _format_part_of_day_line(
+    bucket_label: str, code: int, tavg: float, precip_mm: float, wind_avg: float,
+) -> str:
+    """Format: '🌧️ день 12–18: +6° · 2.1мм · 5м/с'"""
+    emoji = _WEATHER_EMOJI.get(code, "·")
+    # Look up bucket time range
+    h_range = next(
+        (f"{s:02d}–{e:02d}" for s, e, n in _PART_OF_DAY_BUCKETS if n == bucket_label),
+        "",
+    )
+    label_part = f"{bucket_label} {h_range}".rstrip()
+    temp_part = _format_signed_temp(tavg)
+    precip_part = _format_precip(precip_mm)
+    wind_part = _format_wind(wind_avg)
+    return f"{emoji} {label_part}: {temp_part} · {precip_part} · {wind_part}"
+
+
+def _format_day_header(day: _date) -> str:
+    """'ср 8 май' (для hourly multi-day и part_of_day single-day header)."""
+    weekday = _RU_WEEKDAYS_SHORT.get(day.weekday(), "")
+    month = _RU_MONTHS_GEN.get(day.month, "?")
+    return f"{weekday} {day.day} {month}"
+
+
 def _geocode(location: str) -> tuple[float, float, str, str] | None:
-    """Resolve city name → (lat, lon, display_name, tz). Cache hit returns
-    stored tuple. None on lookup failure."""
+    """Resolve city name → (lat, lon, display_name, tz).
+
+    Cache hit returns stored tuple. None on lookup failure.
+    Lock-protected (read под lock, network call ВНЕ lock, write
+    под lock через setdefault).
+    """
     key = _normalize_location(location)
     if not key:
         return None
-    cached = _GEO_CACHE.get(key)
+
+    # Read под lock (Codex Phase B finding — concurrent dispatch может race).
+    with _GEO_CACHE_LOCK:
+        cached = _GEO_CACHE.get(key)
     if cached is not None:
         return cached
+
+    # Network call ВНЕ lock — long, не держим pool.
     try:
         r = httpx.get(
             _GEOCODE_URL,
@@ -104,6 +417,7 @@ def _geocode(location: str) -> tuple[float, float, str, str] | None:
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("weather geocode failed for %r: %s", location, exc)
         return None
+
     results = data.get("results") or []
     if not results:
         return None
@@ -116,72 +430,88 @@ def _geocode(location: str) -> tuple[float, float, str, str] | None:
     display = first.get("name") or location
     tz = first.get("timezone") or _DEFAULT_TZ
     tup = (lat, lon, display, tz)
-    _GEO_CACHE[key] = tup
-    return tup
 
-
-def _format_day_line(
-    day: _date, code: int, tmax: float, tmin: float, precip_mm: float,
-) -> str:
-    """F1 format: '🌧️ ср 29 апр: +3°…+1° · 3.1мм'"""
-    emoji = _WEATHER_EMOJI.get(code, "·")
-    weekday = _RU_WEEKDAYS_SHORT.get(day.weekday(), "")
-    month = _RU_MONTHS_GEN.get(day.month, "?")
-    date_part = f"{weekday} {day.day} {month}"
-    # +3°…+1° (max…min, signed). Round half away from zero для деликатных
-    # значений типа -0.4°/+0.4° (хочется явный знак).
-    tmax_int = round(tmax)
-    tmin_int = round(tmin)
-    sign = lambda x: f"{x:+d}".replace("+0", "0") if x == 0 else f"{x:+d}"
-    temp_part = f"{sign(tmax_int)}°…{sign(tmin_int)}°"
-    # Осадки: «без осадков» если 0, иначе «N.Nмм»
-    if precip_mm <= 0.05:
-        precip_part = "без осадков"
-    else:
-        precip_part = f"{precip_mm:.1f}мм".rstrip("0").rstrip(".") + "мм" if False else f"{precip_mm:.1f}мм"
-    return f"{emoji} {date_part}: {temp_part} · {precip_part}"
+    # Write под lock c setdefault (избегаем lost-update если два thread'а
+    # одновременно cache miss'нули один и тот же key).
+    with _GEO_CACHE_LOCK:
+        return _GEO_CACHE.setdefault(key, tup)
 
 
 def _fetch_forecast(
-    lat: float, lon: float, tz: str, forecast_days: int,
+    lat: float,
+    lon: float,
+    request_tz_name: str,
+    granularity: str,
+    forecast_days: int,
+    request_start_hour: str | None = None,
+    request_end_hour: str | None = None,
 ) -> dict | None:
+    """Fetch Open-Meteo forecast.
+
+    Always requests `daily` summary. Adds `hourly` + `start_hour`/`end_hour`
+    when granularity ∈ {hourly, part_of_day}.
+
+    ⚠ Phase 0 finding (2026-05-08): forecast_days клипает window когда
+    одновременно set'нут start_hour. Поэтому для не-daily granularities —
+    НЕ передаём forecast_days, только hour-window определяет range.
+    """
+    params: dict = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": request_tz_name,
+        "daily": (
+            "temperature_2m_max,temperature_2m_min,"
+            "precipitation_sum,weathercode"
+        ),
+        "wind_speed_unit": "ms",
+    }
+
+    if granularity in ("hourly", "part_of_day"):
+        # Hourly mode: omit forecast_days (Phase 0 — clips start_hour window).
+        params["hourly"] = (
+            "temperature_2m,precipitation,weathercode,windspeed_10m"
+        )
+        if request_start_hour:
+            params["start_hour"] = request_start_hour
+        if request_end_hour:
+            params["end_hour"] = request_end_hour
+    else:
+        # Daily-only: keep forecast_days (legacy behaviour).
+        params["forecast_days"] = forecast_days
+
     try:
         r = httpx.get(
             _FORECAST_URL,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "daily": (
-                    "temperature_2m_max,temperature_2m_min,"
-                    "precipitation_sum,weathercode"
-                ),
-                "timezone": tz,
-                "forecast_days": forecast_days,
-            },
+            params=params,
             timeout=_HTTP_TIMEOUT_SECONDS,
         )
         r.raise_for_status()
         return r.json()
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("weather forecast failed for %.3f,%.3f: %s", lat, lon, exc)
+        logger.warning(
+            "weather forecast failed for %.3f,%.3f granularity=%s: %s",
+            lat, lon, granularity, exc,
+        )
         return None
 
 
 def build_weather_tool() -> Callable:
-    """Return LangChain tool ``get_weather(location, day_offset, days_count)``."""
+    """Return LangChain tool ``get_weather(location, day_offset, days_count, granularity)``."""
 
     @lc_tool
     def get_weather(
         location: str,
         day_offset: int = 0,
         days_count: int = 1,
+        granularity: str = "daily",
     ) -> str:
-        """Прогноз погоды через Open-Meteo (free, без API key, 14 дней вперёд).
+        """Прогноз погоды через Open-Meteo (free, без API key, до 14 дней).
 
-        Используй этот tool для ЛЮБЫХ запросов про погоду — текущую
-        или прогноз. НЕ вызывай ``fetch_url`` на wttr.in или
-        ``web_search`` для погоды — этот tool точнее (структурный
-        forecast вместо HTML-парсинга) и работает с VDS без прокси.
+        Используй этот tool для ЛЮБЫХ запросов про погоду — текущую,
+        прогноз дневной, по частям дня, или почасовой. НЕ вызывай
+        ``fetch_url`` на wttr.in или ``web_search`` для погоды — этот
+        tool точнее (структурный forecast, hourly endpoint) и работает
+        с VDS без прокси.
 
         Args:
             location: Название города на русском или английском. Пример:
@@ -190,22 +520,38 @@ def build_weather_tool() -> Callable:
             day_offset: 0=сегодня, 1=завтра, 2=послезавтра. Default 0.
             days_count: Сколько дней показать начиная с day_offset.
                 1=один день, 7=неделя, 14=максимум. Default 1.
+            granularity: Уровень детализации прогноза:
+                - "daily" (default) — общая сводка день за днём («погода
+                  на неделю», «прогноз завтра»).
+                - "part_of_day" — разбивка на ночь/утро/день/вечер
+                  («как одеться сегодня», «будет ли дождь днём»,
+                  «утром-днём-вечером»).
+                - "hourly" — почасовая разбивка («во сколько начнётся
+                  дождь», «когда стихнет ветер», «почасовой прогноз»).
 
         Examples:
-            «погода завтра в Сходне»  →  get_weather("Сходня", 1, 1)
-            «погода на неделю»        →  get_weather("Москва", 0, 7)
-            «погода в выходные»       →  get_weather("Питер", 5, 2)  # cб+вс если ср
+            «погода завтра в Сходне»          → get_weather("Сходня", 1, 1)
+            «погода на неделю»                → get_weather("Москва", 0, 7)
+            «как одеться сегодня в Питере»   → get_weather("Питер", 0, 1, "part_of_day")
+            «во сколько дождь сегодня?»       → get_weather("Москва", 0, 1, "hourly")
+            «почасовой прогноз на завтра»     → get_weather("Москва", 1, 1, "hourly")
 
         Returns:
-            Multi-line текст:
-                Сходня:
-                🌧️ ср 29 апр: +3°…+1° · 3.1мм
-                ⛅ чт 30 апр: +6°…-2° · без осадков
-            Или короткий ``error: ...`` на сбое.
+            Multi-line текст с погодой согласно granularity. Или короткий
+            ``error: ...`` на сбое (city not found, API timeout, etc.).
         """
         # Validate inputs
         if not (location or "").strip():
             return "error: empty location"
+
+        # Granularity normalization (fail-loud — explicit error для unknown).
+        canonical_granularity = _normalize_granularity(granularity)
+        if canonical_granularity is None:
+            return (
+                f"error: unsupported granularity: {granularity!r}. "
+                "Use daily / part_of_day / hourly."
+            )
+
         try:
             day_offset = int(day_offset)
         except (TypeError, ValueError):
@@ -222,44 +568,212 @@ def build_weather_tool() -> Callable:
             return f"error: не нашла город {location!r} — уточни"
         lat, lon, display, tz = geo
 
+        # Resolve location-local timezone (with fallback chain).
+        location_tz, request_tz_name = _resolve_timezone(tz)
+        now_local = _datetime.now(tz=location_tz)
+
+        # Compute hourly window (used for params + post-filter).
+        request_start_hour: str | None = None
+        request_end_hour: str | None = None
+        start_local: _datetime | None = None
+        effective_end_local: _datetime | None = None
+        truncated = False
+        raw_end_local: _datetime | None = None
+        if canonical_granularity in ("hourly", "part_of_day"):
+            (
+                start_local, effective_end_local,
+                request_start_hour, request_end_hour,
+                truncated, raw_end_local,
+            ) = _compute_hourly_window(
+                now_local, location_tz, canonical_granularity,
+                day_offset, days_count,
+            )
+
         forecast_total_days = day_offset + days_count
-        data = _fetch_forecast(lat, lon, tz, forecast_total_days)
+        data = _fetch_forecast(
+            lat=lat, lon=lon,
+            request_tz_name=request_tz_name,
+            granularity=canonical_granularity,
+            forecast_days=forecast_total_days,
+            request_start_hour=request_start_hour,
+            request_end_hour=request_end_hour,
+        )
         if data is None:
             return "error: сервис погоды не отвечает, попробуй позже"
 
-        daily = data.get("daily") or {}
-        dates = daily.get("time") or []
-        tmax = daily.get("temperature_2m_max") or []
-        tmin = daily.get("temperature_2m_min") or []
-        codes = daily.get("weathercode") or []
-        precip = daily.get("precipitation_sum") or []
-
-        if not dates:
-            return "error: пустой прогноз"
-
-        # Slice [day_offset : day_offset + days_count]
-        end = min(day_offset + days_count, len(dates))
-        lines: list[str] = []
-        for i in range(day_offset, end):
-            try:
-                d = _datetime.fromisoformat(dates[i]).date()
-            except (ValueError, TypeError):
-                continue
-            try:
-                line = _format_day_line(
-                    d,
-                    code=int(codes[i]) if i < len(codes) else -1,
-                    tmax=float(tmax[i]) if i < len(tmax) else 0.0,
-                    tmin=float(tmin[i]) if i < len(tmin) else 0.0,
-                    precip_mm=float(precip[i]) if i < len(precip) else 0.0,
-                )
-            except (ValueError, TypeError, IndexError):
-                continue
-            lines.append(line)
-
-        if not lines:
-            return "error: не удалось распарсить прогноз"
-
-        return f"{display}:\n" + "\n".join(lines)
+        if canonical_granularity == "daily":
+            return _render_daily(data, day_offset, days_count, display)
+        elif canonical_granularity == "part_of_day":
+            return _render_part_of_day(
+                data, display, location_tz, start_local, effective_end_local,
+            )
+        else:  # hourly
+            return _render_hourly(
+                data, display, location_tz,
+                start_local, effective_end_local, raw_end_local, truncated,
+            )
 
     return get_weather
+
+
+def _render_daily(
+    data: dict, day_offset: int, days_count: int, display: str,
+) -> str:
+    """Original F1 format: per-day lines."""
+    daily = data.get("daily") or {}
+    dates = daily.get("time") or []
+    tmax = daily.get("temperature_2m_max") or []
+    tmin = daily.get("temperature_2m_min") or []
+    codes = daily.get("weathercode") or []
+    precip = daily.get("precipitation_sum") or []
+
+    if not dates:
+        return "error: пустой прогноз"
+
+    end = min(day_offset + days_count, len(dates))
+    lines: list[str] = []
+    for i in range(day_offset, end):
+        try:
+            d = _datetime.fromisoformat(dates[i]).date()
+        except (ValueError, TypeError):
+            continue
+        try:
+            line = _format_day_line(
+                d,
+                code=int(codes[i]) if i < len(codes) else -1,
+                tmax=float(tmax[i]) if i < len(tmax) else 0.0,
+                tmin=float(tmin[i]) if i < len(tmin) else 0.0,
+                precip_mm=float(precip[i]) if i < len(precip) else 0.0,
+            )
+        except (ValueError, TypeError, IndexError):
+            continue
+        lines.append(line)
+
+    if not lines:
+        return "error: не удалось распарсить прогноз"
+    return f"{display}:\n" + "\n".join(lines)
+
+
+def _render_part_of_day(
+    data: dict,
+    display: str,
+    location_tz: _tzinfo,
+    start_local: _datetime | None,
+    end_local: _datetime | None,
+) -> str:
+    """Group hourly into 4 buckets/day, render one line per bucket."""
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    codes = hourly.get("weathercode") or []
+    precips = hourly.get("precipitation") or []
+    winds = hourly.get("windspeed_10m") or []
+
+    if not times:
+        return "error: пустой прогноз"
+
+    # Defensive post-filter (Codex r3 Alternative — guardrail vs API quirks/DST).
+    # Code-reviewer MEDIUM: append к filtered массивам атомарно — иначе если API
+    # вернёт mismatched-length arrays, downstream `_bucket_hours_by_part_of_day`
+    # будет misalign индексы. Open-Meteo контракт гарантирует equal-length, но
+    # belt-and-suspenders: skip всю строку если хоть один массив short.
+    if start_local is not None and end_local is not None:
+        f_times, f_temps, f_codes, f_precips, f_winds = [], [], [], [], []
+        for i, t_iso in enumerate(times):
+            try:
+                dt_naive = _datetime.fromisoformat(t_iso)
+                dt = dt_naive.replace(tzinfo=location_tz)
+            except (ValueError, TypeError):
+                continue
+            if not (start_local <= dt <= end_local):
+                continue
+            if not (i < len(temps) and i < len(codes)
+                    and i < len(precips) and i < len(winds)):
+                # Malformed API response — drop row рather than misalign downstream.
+                continue
+            f_times.append(t_iso)
+            f_temps.append(temps[i])
+            f_codes.append(codes[i])
+            f_precips.append(precips[i])
+            f_winds.append(winds[i])
+        times, temps, codes, precips, winds = f_times, f_temps, f_codes, f_precips, f_winds
+
+    if not times:
+        return "error: пустой прогноз"
+
+    buckets = _bucket_hours_by_part_of_day(times, temps, codes, precips, winds)
+    if not buckets:
+        return "error: не удалось распарсить прогноз"
+
+    # Multi-day: group by date with per-date headers; single-day: one header.
+    out: list[str] = []
+    current_date: _date | None = None
+    for day, label, code, tavg, precip_sum, wind_avg in buckets:
+        if day != current_date:
+            if current_date is not None:
+                out.append("")  # blank between days
+            out.append(f"{display}, {_format_day_header(day)}:")
+            current_date = day
+        out.append(_format_part_of_day_line(label, code, tavg, precip_sum, wind_avg))
+
+    return "\n".join(out)
+
+
+def _render_hourly(
+    data: dict,
+    display: str,
+    location_tz: _tzinfo,
+    start_local: _datetime | None,
+    effective_end_local: _datetime | None,
+    raw_end_local: _datetime | None,
+    truncated: bool,
+) -> str:
+    """One line per hour, grouped by date."""
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    codes = hourly.get("weathercode") or []
+    precips = hourly.get("precipitation") or []
+    winds = hourly.get("windspeed_10m") or []
+
+    if not times:
+        return "error: пустой почасовой прогноз"
+
+    out: list[str] = [f"{display}:"]
+    current_date: _date | None = None
+    rendered = 0
+    for i, t_iso in enumerate(times):
+        try:
+            dt_naive = _datetime.fromisoformat(t_iso)
+            dt = dt_naive.replace(tzinfo=location_tz)
+        except (ValueError, TypeError):
+            continue
+        # Defensive post-filter (Codex r3 Alternative — guardrail).
+        if start_local is not None and effective_end_local is not None:
+            if not (start_local <= dt <= effective_end_local):
+                continue
+
+        if dt.date() != current_date:
+            out.append(f"{_format_day_header(dt.date())}:")
+            current_date = dt.date()
+
+        try:
+            line = _format_hour_line(
+                dt,
+                code=int(codes[i]) if i < len(codes) else -1,
+                temp=float(temps[i]) if i < len(temps) else 0.0,
+                precip_mm=float(precips[i]) if i < len(precips) else 0.0,
+                wind_ms=float(winds[i]) if i < len(winds) else 0.0,
+            )
+        except (ValueError, TypeError, IndexError):
+            continue
+        out.append(line)
+        rendered += 1
+
+    if rendered == 0:
+        return "error: пустой почасовой прогноз"
+
+    if truncated and raw_end_local is not None:
+        out.append(f"…(показаны первые {_HOURLY_CAP_HOURS} часов)")
+
+    return "\n".join(out)
