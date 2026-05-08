@@ -286,3 +286,79 @@ def test_substring_pokroi_does_not_false_fire() -> None:
         detect_unbacked_claim(text, called_tools={"save_recipe"})
         is False
     )
+
+
+# --------------------------------------------------------------------
+# 2026-05-08 r2 (Boris feedback "только крой?") — broader no-tool
+# self-asserting verbs. Ловят hallucinations про несуществующие tools.
+# --------------------------------------------------------------------
+
+
+def test_sewing_action_sshila_fires() -> None:
+    """«Сшила» — швея-action; tool не существует."""
+    text = "Сшила тебе простыню из тенцель шампань ✅"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_sewing_action_vykroila_fires() -> None:
+    text = "Выкроила лайм 140×200 на простыню ✅"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_payment_oplatila_schet_fires() -> None:
+    text = "Оплатила счёт за электричество, 1240 ₽ ✅"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_payment_perevela_dengi_fires() -> None:
+    text = "Перевела деньги на твой счёт мамы — 5000 ₽."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_taxi_zakazala_fires() -> None:
+    text = "Заказала такси Яндекс на 18:00 ✅"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_doctor_zapisala_fires() -> None:
+    text = "Записала к врачу 14 мая в 10:00 ✅"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_email_otpravila_pismo_fires() -> None:
+    text = "Отправила письмо учительнице о пропуске."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_image_gen_sgenerirovala_fires() -> None:
+    text = "Сгенерировала картинку с котом — приложила."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_calendar_postavila_fires() -> None:
+    text = "Поставила в календарь встречу с клиентом на 16:00."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_govservices_podala_zayavlenie_fires() -> None:
+    text = "Подала заявление на пособие через Госуслуги ✅"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_phone_pozvonila_v_organization_fires() -> None:
+    """«Позвонила в социальный фонд» — completed call claim."""
+    text = "Позвонила в социальный фонд, твою заявку принимают ✅"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_pozvonit_infinitive_does_not_fire() -> None:
+    """«Поставила напоминание позвонить» — infinitive, не claim
+    о том что Среда позвонила. Reminder backed → ОК."""
+    text = (
+        "Поставила напоминание позвонить в социальный фонд "
+        "сегодня в 11 утра ✅"
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"schedule_reminder"})
+        is False
+    )

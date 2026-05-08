@@ -408,6 +408,54 @@ _SELF_CLAIMING_VERBS = frozenset({
 })
 
 
+# 2026-05-08 r2 (Boris feedback "только крой?"): self-asserting verbs
+# для actions, для которых **NO tool exists**. Любое появление в тексте
+# = unbacked (LLM не может реально выполнить эти действия). Phrase-based
+# чтобы избежать false-positive на benign mentions:
+#  - «оплатила счёт» specific → unbacked. «оплата» одна — не fire.
+#  - «сшила» / «выкроила» specific 1st-person past → unbacked
+#    (швея 755 говорит «я сшила» в дискуссии — false-fire risk
+#    приемлем т.к. мягкий retry, не финальный block).
+#  - «позвонила в»/«позвонил в» — completed call claim. «позвонить»
+#    (infinitive) НЕ совпадает.
+_SELF_CLAIMING_NO_TOOL: frozenset[str] = frozenset({
+    # Sewing actions — power-user 755 risk
+    "сшила", "сшил",
+    "выкроила", "выкроил",
+    "пошила", "пошил",
+    # Payments
+    "оплатила счёт", "оплатил счёт",
+    "оплатила счет", "оплатил счет",
+    "оплатила квитанц", "оплатил квитанц",
+    "перевела деньги", "перевёл деньги",
+    "перевел деньги",
+    "перевела на счёт", "перевел на счет",
+    # Booking / travel
+    "заказала такси", "заказал такси",
+    "вызвала такси", "вызвал такси",
+    "забронировала", "забронировал",
+    "записала к врачу", "записал к врачу",
+    # Communication
+    "отправила письмо", "отправил письмо",
+    "отправила email", "отправил email",
+    "отправила смс", "отправил смс",
+    # Phone calls (completed action, not "напомни позвонить")
+    "позвонила в ", "позвонил в ",
+    "позвонила маме", "позвонил маме",
+    # Image / file gen
+    "сгенерировала картин", "сгенерировал картин",
+    "сгенерировала изображ", "сгенерировал изображ",
+    # Calendar
+    "поставила в календар", "поставил в календар",
+    "добавила в календар", "добавил в календар",
+    "встречу в календар",
+    # Government services
+    "подала заявление", "подал заявление",
+    "оформила документ", "оформил документ",
+    "загрузила в госуслуг", "загрузил в госуслуг",
+})
+
+
 def _identify_claim_category(window: str) -> str | None | bool:
     """Identify the category of side-effect claimed in the window.
 
@@ -451,6 +499,13 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
         if verb in low:
             if not (called_tools & reminder_tools):
                 return True
+    # Pass 1b (2026-05-08 r2): self-asserting actions для которых
+    # НИКАКОГО tool'а не существует — любое упоминание = unbacked.
+    # См. _SELF_CLAIMING_NO_TOOL для полного списка (швейные действия,
+    # платежи, звонки, бронирования, отправка писем, госуслуги).
+    for verb in _SELF_CLAIMING_NO_TOOL:
+        if verb in low:
+            return True
     # Pass 2: verb + nearby object pair. Object → category mapping.
     # ⚠ Codex r3 MAJOR #1: iterate ВСЕ occurrences каждого verb'а,
     # не только первое. Иначе «Добавила в покупки. Добавила в план
