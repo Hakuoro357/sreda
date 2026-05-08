@@ -286,10 +286,45 @@ template (anti-hallucination guarantee). Read turns — streaming
 финальный edit через 53s. Plus integration тест с fake LLM
 streaming chunks.
 
-**3. weather get_weather hourly granularity** (см. секцию 2 выше
-«Weather: hourly forecast — 78s web research вместо 1-2s tool
-call»). Этот фикс, после Phase A+B, должен убрать **самый
-тяжёлый** observed турн (`trace_2e248c2277d94e47`, 78s) совсем.
+**3. weather get_weather hourly granularity** ✅ **DONE 2026-05-08**
+(commit `8706da0`). 6 раундов Codex review до consensus. Phase 0
+API probes verified. 37 тестов pass. Backward-compatible
+расширение с `granularity={daily, part_of_day, hourly}`. Live
+smoke на проде подтвердил: LLM вызывает `get_weather(...,
+granularity="hourly")` на запрос «во сколько дождь» (system
+prompt update эффективен), tool отвечает за 1-2s.
+
+**4. weather: HTTP retry on transient Open-Meteo errors** (LOW,
+recorded 2026-05-08).
+
+Прецедент 2026-05-08 15:00:07 после deploy weather hourly: первый
+тест от Boris — Open-Meteo вернул HTTP 502 Bad Gateway (transient,
+тот же URL через 30s = HTTP 200). Среда сказала «сервис не
+отвечает», fallback'нулась на fetch_url(wttr.in). Юзер видит
+суррогатный ответ.
+
+**Что фиксим:** в `_fetch_forecast` (и `_geocode`) обернуть
+`httpx.get` в retry loop:
+- 2 retry'я максимум
+- Exponential backoff: 0.5s, 1.5s
+- Retry только на 5xx (transient) и timeouts, НЕ на 4xx (наша
+  ошибка params)
+- Total worst-case wall-time: 8s + 0.5s + 8s + 1.5s + 8s = ~26s,
+  но на самом деле успешный second call займёт +1-2s.
+
+**Где:** `services/weather_tool.py`. Можно использовать
+`tenacity` (уже в проекте? — проверить) или ручной try/except loop.
+
+**Размер:** ~15-25 LOC + 2 unit теста (502→retry→200, 4xx→no retry).
+
+**Когда:** при следующем weather sprint'е. Не блокер — fallback
+через web_search/fetch_url работает.
+
+**Plan-mistakes followup:** в Out of scope изначального плана было
+«HTTP retry на timeout (Open-Meteo надёжный)». Это assumption
+оказался слишком оптимистичным — записать в
+`~/.claude/plan-mistakes/python.md` про «не считать external API
+надёжным даже если документация говорит «99.9% uptime»».
 
 ---
 
