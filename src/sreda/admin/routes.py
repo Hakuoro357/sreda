@@ -446,6 +446,90 @@ def _format_bytes(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+# ---------------------------------------------------------------------------
+# /admin/traces — per-stage latency breakdown viewer (Phase 2)
+# ---------------------------------------------------------------------------
+
+@router.get("/traces", response_class=HTMLResponse)
+def admin_traces(
+    request: Request,
+    tail: int = Query(default=50, ge=1, le=500),
+    min_total_ms: int = Query(default=0, ge=0, le=600_000),
+    user_id: str = Query(default="", max_length=64, regex=r"^[a-zA-Z0-9_]*$"),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Per-stage latency breakdown viewer для conversation.chat turns.
+
+    Парсит `/var/log/sreda/trace.log` (tail-only 5MB), показывает
+    последние N blocks с цветовой подсветкой:
+      - total_ms: <10s green / 10-30s yellow / >30s red
+      - per stage: <2s neutral / 2-5s yellow / >5s red
+
+    Query params validated (Codex r1 MAJOR #6):
+      - tail ∈ [1, 500]
+      - min_total_ms ∈ [0, 600_000]
+      - user_id matches `[a-zA-Z0-9_]{0,64}`
+    """
+    from sreda.admin.trace_parser import (
+        parse_trace_log, stage_duration_color, total_ms_color,
+    )
+
+    _audit_admin_view(
+        session, "admin.traces.viewed", token, request,
+        tail=tail, min_total_ms=min_total_ms,
+        user_id=user_id or None,
+    )
+
+    settings = get_settings()
+    trace_log_path = settings.trace_log_path
+
+    error: str | None = None
+    traces: list = []
+    file_meta: dict = {"path": trace_log_path or "(не сконфигурирован)"}
+
+    if not trace_log_path:
+        error = (
+            "SREDA_TRACE_LOG_PATH не сконфигурирован — sreda.trace logger "
+            "пишет только в stderr/journal. Добавь путь в /etc/sreda/.env."
+        )
+    else:
+        try:
+            stat = os.stat(trace_log_path)
+            file_meta["size_human"] = _format_bytes(stat.st_size)
+            file_meta["mtime"] = datetime.fromtimestamp(stat.st_mtime).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            traces = parse_trace_log(
+                trace_log_path,
+                tail_turns=tail,
+                min_total_ms=min_total_ms,
+                user_filter=user_id or None,
+            )
+        except FileNotFoundError:
+            error = f"Файл не найден: {trace_log_path}"
+        except PermissionError as exc:
+            error = f"Нет прав на чтение: {exc}"
+        except OSError as exc:
+            error = f"Ошибка чтения: {exc}"
+
+    return templates.TemplateResponse(
+        request, "traces.html",
+        {
+            "token": token,
+            "section": "traces",
+            "traces": traces,
+            "tail": tail,
+            "min_total_ms": min_total_ms,
+            "user_id": user_id,
+            "file_meta": file_meta,
+            "error": error,
+            "total_ms_color": total_ms_color,
+            "stage_duration_color": stage_duration_color,
+        },
+    )
+
+
 @router.post("/tenant/reset", response_class=HTMLResponse)
 def admin_tenant_reset(
     request: Request,

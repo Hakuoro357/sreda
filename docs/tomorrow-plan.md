@@ -112,6 +112,71 @@ admin/approve → 410, и т.д. Не прогоняли — слишком ри
 ли `grandfathered_at` flag после оплаты или переходят на paid
 tier с metering).
 
+### Pending — Reminder idempotency + weather UX (наблюдения 2026-05-08)
+
+**1. Дубль reminder при повторном context'е** (MEDIUM).
+
+Прецедент 2026-05-08 12:09 MSK (tenant_max_40921122). Boris дважды
+переслал автоматическое сообщение про запись в Колесо.ру (Зеленоград,
+13:10). Между первым и вторым он голосом скорректировал время
+напоминания. Среда:
+1. Создала reminder #1 на 13:00 (за 10 мин до 13:10).
+2. На голос «исправь, ехать долго» — `update_reminder` или
+   `cancel + new` → reminder с trigger 12:20.
+3. На повторное paste'нутое сообщение про запись (09:09 UTC) —
+   создала **второй** reminder с тем же trigger 12:20, не проверив
+   существующий.
+4. **12:20 fired ОБА** → юзер получил дубль уведомления.
+
+**Root cause:** LLM не вызывает `list_reminders` перед
+`schedule_reminder` чтобы проверить semantically-similar duplicate
+(close-in-time + similar title).
+
+**Fix candidates:**
+- App-level: pre-check в `schedule_reminder` — если найден
+  active reminder в окне ±15 мин с похожим title (cosine similarity
+  на embedding или fuzzy matching на keywords) → return existing
+  reminder ID + ack как «обновила существующее».
+- Prompt-level: добавить strict rule «before `schedule_reminder`,
+  ALWAYS call `list_reminders` first; if any active reminder
+  matches the new event by ±15 min trigger window AND similar
+  title — call `update_reminder` or skip, do NOT create duplicate».
+
+**Verification:** repro test — fake conversation с двумя
+повторяющимися paste'ами + assert ровно один reminder создан.
+
+---
+
+**2. Weather: «недоступен» → «нашла почасовой»** (MINOR UX).
+
+Прецедент 2026-05-08 12:18-12:35 MSK. На запрос «прогноз по часам»
+Среда сначала вызвала `get_weather` (Open-Meteo, daily-only) и
+ответила «почасовой мне недоступен — только дневной». Через 16 мин
+после уточняющего вопроса от юзера Среда вызвала `fetch_url` с
+`wttr.in/Москва?...` — wttr.in имеет hourly data — и ответила.
+
+**Не bug**, но UX-неровность: в первом ответе утверждает
+«недоступен», на retry находит. Юзер думает «значит могла сразу».
+
+**Fix candidate:** в `get_weather` tool description добавить hint
+«если запрашивают hourly и базовый источник без hourly data —
+fall back на `fetch_url` с wttr.in (free, без API key)». Тогда
+LLM сразу пойдёт через wttr.
+
+**Не critical** — может быть deferred до отдельного weather
+sprint'а.
+
+---
+
+**3. Двойная отправка тех же reminder'ов через outbox?**
+
+Дополнительная гипотеза для Issue #1: возможно проблема не в
+двух reminder rows, а в outbox emit одного reminder дважды
+(retry race в outbox worker). Пока не проверено — артефакты
+прода (family_reminders 2 row) подтверждают что всё-таки два
+distinct reminder. Тем не менее — для будущей debug'а имеет
+смысл прогнать outbox dedup audit.
+
 ### Pending — Ревизия legacy backlog
 
 Список ниже («План на 2026-04-30», «0. Hot-fix'ы», секции 2-7)
