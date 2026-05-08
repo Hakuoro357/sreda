@@ -211,16 +211,26 @@ def node_load_memories(state: AssistantGraphState, config: RunnableConfig) -> di
 
         embedding_client = get_embeddings_client()
 
-    try:
-        query_vec = embedding_client.embed_query(query_text)
-    except Exception:
-        # Embeddings down → skip, don't block the conversation.
-        return {"memories": []}
+    # Phase 1A trace instrumentation 2026-05-08: split into two
+    # sub-stages (embed vs cosine recall) — embedding HTTP call часто
+    # является bottleneck'ом. См. plans/mellow-discovering-conway.md.
+    with trace.step("chat.memory_recall.embed") as _emb_meta:
+        try:
+            query_vec = embedding_client.embed_query(query_text)
+            _emb_meta["dim"] = len(query_vec) if query_vec else 0
+        except Exception:
+            # Embeddings down → skip, don't block the conversation.
+            _emb_meta["status"] = "failed"
+            return {"memories": []}
 
     repo = MemoryRepository(session)
-    hits, stats = repo.recall_with_stats(
-        action.tenant_id, action.user_id, query_vec, top_k=10, min_score=0.1
-    )
+    with trace.step("chat.memory_recall.cosine") as _rec_meta:
+        hits, stats = repo.recall_with_stats(
+            action.tenant_id, action.user_id, query_vec, top_k=10, min_score=0.1
+        )
+        _rec_meta["candidates"] = stats.candidates_total
+        _rec_meta["with_embedding"] = stats.with_embedding
+        _rec_meta["selected"] = len(hits)
 
     # Stage 2 observability (см. tomorrow-plan пункт 11). Логируем
     # распределение retrieval'а по каждому conversation.chat — это

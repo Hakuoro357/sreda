@@ -662,6 +662,7 @@ async def _process_approved_max_turn(
     # (через type hint). MaxClient теперь module-level (codex R4 fix).
     from sreda.runtime.dispatcher import dispatch_max_action
     from sreda.runtime.executor import ActionRuntimeService
+    from sreda.services import trace
     from sreda.services.tenant_lock import get_tenant_lock
 
     SessionLocal = get_session_factory()
@@ -673,6 +674,30 @@ async def _process_approved_max_turn(
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
         )
+
+        # Phase 1A trace instrumentation 2026-05-08 (parity с TG).
+        # Раньше MAX inbound НЕ открывал trace context — все
+        # `trace.step()` вызовы внутри handlers/graph были no-op.
+        # Теперь MAX channel тоже виден в /var/log/sreda/trace.log
+        # с per-stage breakdown.
+        trace.start_trace(
+            user_id=onboarding.user_id,
+            tenant_id=onboarding.tenant_id,
+            channel="max",
+        )
+        msg = payload.get("message") if isinstance(payload, dict) else None
+        update_type = payload.get("update_type") if isinstance(payload, dict) else "?"
+        msg_kind = "callback" if update_type == "message_callback" else (
+            "voice" if (
+                isinstance(msg, dict)
+                and isinstance(msg.get("body"), dict)
+                and any(
+                    a.get("type") == "audio"
+                    for a in (msg["body"].get("attachments") or [])
+                )
+            ) else "text"
+        )
+        trace.record("webhook.received", type=msg_kind, channel="max")
 
         # Codex R1 MAJOR #5: voice STT идёт ВНУТРИ tenant_lock'а.
         # До рефакторинга STT (1-3s сетевой+CPU) был ДО lock'а — если

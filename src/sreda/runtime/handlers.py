@@ -1600,7 +1600,12 @@ def execute_conversation_chat(
         )
 
     # --- 1. Skill attribution ------------------------------------------
-    feature_key = _resolve_chat_feature_key(session, action.tenant_id)
+    # Phase 1A trace instrumentation 2026-05-08: wrap pre-LLM stages so
+    # `turn_latency_p95` breakdown shows where 30s turns spend their
+    # time. См. план plans/mellow-discovering-conway.md «Часть 1».
+    with trace.step("chat.skill_resolve") as _meta:
+        feature_key = _resolve_chat_feature_key(session, action.tenant_id)
+        _meta["feature_key"] = feature_key or "(none)"
     if feature_key is None:
         return [
             RuntimeReply(
@@ -1613,8 +1618,14 @@ def execute_conversation_chat(
         ]
 
     # --- 2. Budget check (one-shot at turn start) ----------------------
-    budget = BudgetService(session)
-    quota = budget.get_quota_status(action.tenant_id, feature_key)
+    with trace.step("chat.budget_check") as _meta:
+        budget = BudgetService(session)
+        quota = budget.get_quota_status(action.tenant_id, feature_key)
+        _meta["used_pct"] = (
+            int(100 * quota.credits_used / quota.credits_quota)
+            if quota.credits_quota else 0
+        )
+        _meta["exhausted"] = quota.is_exhausted
     if quota.is_exhausted:
         reset_text = _format_quota_reset(quota)
         used = quota.credits_used
@@ -1642,7 +1653,11 @@ def execute_conversation_chat(
         UsageLedgerService, msk_period_keys,
     )
 
-    _gate_result = EntitlementGate(session).check(action.tenant_id)
+    with trace.step("chat.gate.entitlement") as _meta:
+        _gate_result = EntitlementGate(session).check(action.tenant_id)
+        _meta["allowed"] = _gate_result.allowed
+        _meta["plan_key"] = _gate_result.plan_key or "(none)"
+        _meta["is_grandfathered"] = _gate_result.is_grandfathered
     _plan_key = _gate_result.plan_key
 
     # Phase 2 (Codex CRITICAL fix 2026-05-07): defense-in-depth fail-closed.
@@ -1677,15 +1692,17 @@ def execute_conversation_chat(
         and not _gate_result.is_grandfathered
         and not _llm_pre_reserved
     ):
-        _daily_key, _monthly_key = msk_period_keys()
-        _ledger = UsageLedgerService(session.get_bind())
-        _quota_ok = _ledger.try_consume(
-            action.tenant_id, "llm_turns", 1,
-            [
-                ("daily", _daily_key, SREDA_FREE_LLM_DAILY),
-                ("monthly", _monthly_key, SREDA_FREE_LLM_MONTHLY),
-            ],
-        )
+        with trace.step("chat.gate.quota") as _meta:
+            _daily_key, _monthly_key = msk_period_keys()
+            _ledger = UsageLedgerService(session.get_bind())
+            _quota_ok = _ledger.try_consume(
+                action.tenant_id, "llm_turns", 1,
+                [
+                    ("daily", _daily_key, SREDA_FREE_LLM_DAILY),
+                    ("monthly", _monthly_key, SREDA_FREE_LLM_MONTHLY),
+                ],
+            )
+            _meta["consumed"] = _quota_ok
         if not _quota_ok:
             logger.info(
                 "USAGE_LEDGER_LLM_EXCEEDED tenant=%s plan=sreda_free",
@@ -1866,7 +1883,9 @@ def execute_conversation_chat(
     # are billed at 10% of input price after the first call. Providers
     # that don't support the cache_control marker (MiMo, Qwen) receive
     # the content as plain multi-part text and ignore the marker.
-    stable_text = build_system_prompt(feature_key, model_name=model_name)
+    with trace.step("chat.prompt_build") as _meta:
+        stable_text = build_system_prompt(feature_key, model_name=model_name)
+        _meta["stable_chars"] = len(stable_text)
 
     variable_parts: list[str] = []
     if onboarding_prompt_block:
@@ -1898,12 +1917,14 @@ def execute_conversation_chat(
     # structured multi-part content to the LLM below.
     system_text = stable_text + "\n\n" + variable_text
 
-    tools = build_memory_tools(
-        session=session,
-        tenant_id=action.tenant_id,
-        user_id=user_id,
-        embedding_client=embedding_client,
-    )
+    with trace.step("chat.tools_build") as _tools_meta:
+        tools = build_memory_tools(
+            session=session,
+            tenant_id=action.tenant_id,
+            user_id=user_id,
+            embedding_client=embedding_client,
+        )
+        _tools_meta["base_tools"] = len(tools)
     # Feature-specific chat tools. Dispatch by feature_key; default is
     # empty (memory tools alone). Housewife skill adds reminders
     # tooling so the LLM can ``schedule_reminder`` / ``list_reminders``
@@ -1960,7 +1981,9 @@ def execute_conversation_chat(
     # the thing we asked about in the previous turn. Without this,
     # every turn starts from a blank slate and the bot loses context.
     run_id = context.get("_run_id") or "run_unknown"
-    history_turns = _load_chat_history(session, run_id)
+    with trace.step("chat.history_load") as _hist_meta:
+        history_turns = _load_chat_history(session, run_id)
+        _hist_meta["history_turns"] = len(history_turns or [])
     # Multi-part content with Anthropic-style ephemeral cache_control
     # on the stable prefix. Supported providers (Grok 4.1 Fast via
     # OpenRouter, Claude, Gemini) cache the prefix for 5 minutes —
