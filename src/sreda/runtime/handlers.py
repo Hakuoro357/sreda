@@ -19,6 +19,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1194,6 +1195,104 @@ _FEATURE_PROMPTS: dict[str, str] = {
 # тоже галлюцинирует «Готово! ⏰ ... будет напоминание» без вызова
 # schedule_reminder. Tool-discipline нужна всем моделям — её отсутствие
 # показалось бы как Gemma-specific было лишь иллюзией статистики.
+# ---------------------------------------------------------------------------
+# Phase B (parallel tool dispatch) — Conservative allowlist of tools that are
+# safe to invoke concurrently from a ThreadPoolExecutor inside one iter's
+# tool_calls batch.
+#
+# Inclusion criteria (ALL required):
+# 1. Pure I/O network operation (HTTP/external API), no SQLAlchemy session
+#    access. Shared session is NOT thread-safe — concurrent .add() / .commit()
+#    causes data races.
+# 2. No mutable shared state inside the tool's closure (httpx.Client is
+#    constructed locally per-call → fine).
+# 3. Idempotent OR side-effect-free reads (a fetch_url called twice in
+#    parallel for the same URL is harmless).
+#
+# Audit notes (2026-05-08, Phase B v1):
+# - fetch_url   ✓ pure HTTP via httpx.Client(), no DB
+# - get_weather ✓ pure HTTP to Open-Meteo, no DB
+# - web_search  ✗ writes to WebSearchUsageCounter (shared session)
+# - schedule_reminder / save_*  ✗ DB writes
+#
+# When ALL tool_calls in a batch are allowlisted and len >= 2, dispatch in
+# parallel. Otherwise fall back to serial dispatch (the safe default).
+_PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset({
+    "fetch_url",
+    "get_weather",
+})
+
+# Hard cap: never spawn more than this many threads regardless of batch size.
+# Protects against runaway models that emit 20+ tool_calls in one iter.
+_MAX_PARALLEL_DISPATCH = 8
+
+
+def _should_dispatch_in_parallel(
+    tool_calls: list[dict],
+    *,
+    parallel_safe: frozenset[str] = _PARALLEL_SAFE_TOOLS,
+) -> bool:
+    """Return True iff all tool_calls are allowlisted AND batch >= 2.
+
+    Single-tool-call batches do nothing in parallel — overhead of
+    spawning a worker pool exceeds the win. Mixed batches (one DB-tool
+    among I/O-tools) fall back to serial because shared SQLAlchemy
+    session is not thread-safe.
+
+    Pure function — exposed at module level for unit testing.
+    """
+    if len(tool_calls) < 2:
+        return False
+    return all(tc.get("name") in parallel_safe for tc in tool_calls)
+
+
+def _dispatch_one_tool(
+    tc: dict,
+    tools_by_name: dict,
+) -> tuple[str, str | None, str]:
+    """Execute a single tool_call. Returns ``(tc_id, name, result_str)``.
+
+    Pure function (no closures over mutable state) → safe to invoke
+    from worker threads. Caller updates state (called_tools etc.) in
+    deterministic order from collected results.
+    """
+    t_name = tc.get("name")
+    t_args = tc.get("args") or {}
+    t_id = tc.get("id", "")
+    t_tool = tools_by_name.get(t_name)
+    if t_tool is None:
+        return t_id, t_name, f"error:unknown_tool:{t_name}"
+    try:
+        t_result = t_tool.invoke(t_args)
+    except Exception as t_exc:  # noqa: BLE001
+        logger.exception("tool %s failed", t_name)
+        return t_id, t_name, f"error:{type(t_exc).__name__}"
+    return t_id, t_name, str(t_result)
+
+
+def _dispatch_tool_calls_batch(
+    tool_calls: list[dict],
+    tools_by_name: dict,
+    *,
+    parallel_safe: frozenset[str] = _PARALLEL_SAFE_TOOLS,
+    max_workers: int = _MAX_PARALLEL_DISPATCH,
+) -> list[tuple[str, str | None, str]]:
+    """Dispatch a batch of tool_calls; parallel when safe, serial otherwise.
+
+    Returns list of ``(tc_id, name, result_str)`` in **tool_calls order**
+    — caller can rely on this for deterministic ToolMessage emission.
+
+    No state mutation: caller updates called_tools / counters /
+    onboarding flags from the returned results.
+    """
+    if _should_dispatch_in_parallel(tool_calls, parallel_safe=parallel_safe):
+        workers = min(len(tool_calls), max_workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_dispatch_one_tool, tc, tools_by_name) for tc in tool_calls]
+            return [f.result() for f in futures]
+    return [_dispatch_one_tool(tc, tools_by_name) for tc in tool_calls]
+
+
 _TOOL_DISCIPLINE_ADDENDUM = """\
 КРИТИЧЕСКИ ВАЖНО (строгая дисциплина tool-calls — не нарушать):
 - Если хочешь что-то СОХРАНИТЬ / ДОБАВИТЬ / СОЗДАТЬ / УДАЛИТЬ / ПОСТАВИТЬ НАПОМИНАНИЕ / ЗАПЛАНИРОВАТЬ ЗАДАЧУ — это СТРОГО через tool_calls API (JSON-канал). НИКОГДА не пиши tool-call синтаксис (``save_recipe(title=...)``, ``add_shopping_items(...)``) в текстовый ответ пользователю — этот текст попадёт в Telegram как есть и будет выглядеть поломанным.
@@ -2210,22 +2309,23 @@ def execute_conversation_chat(
                 continue
             final_ai = ai_msg
             break
-        for tc in tool_calls:
-            name = tc.get("name")
-            args = tc.get("args") or {}
-            tc_id = tc.get("id", "")
-            tool = tools_by_name.get(name)
-            if tool is None:
-                messages.append(
-                    ToolMessage(content=f"error:unknown_tool:{name}", tool_call_id=tc_id)
-                )
-                continue
-            try:
-                result = tool.invoke(args)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("tool %s failed", name)
-                result = f"error:{type(exc).__name__}"
-            result_str = str(result)
+        # Phase B: parallel dispatch для allowlisted I/O-bound tools.
+        # `_dispatch_tool_calls_batch` решает parallel-vs-serial и
+        # возвращает результаты в порядке `tool_calls` — порядок
+        # ToolMessage.append критичен для контракта LLM (tool_call_id
+        # → tool_result матчинг). State mutation (called_tools /
+        # successful_tool_counts / _onboarding_resolution_called)
+        # выполняется ПОСЛЕ collect, в детерминированном порядке —
+        # без гонок.
+        if _should_dispatch_in_parallel(tool_calls):
+            logger.info(
+                "chat: parallel dispatch tenant=%s iter=%d batch=%d tools=%s",
+                action.tenant_id, _iter, len(tool_calls),
+                [tc.get("name") for tc in tool_calls],
+            )
+        _results = _dispatch_tool_calls_batch(tool_calls, tools_by_name)
+
+        for tc_id, name, result_str in _results:
             if name in _ONBOARDING_RESOLUTION_TOOLS and result_str.startswith("ok:"):
                 _onboarding_resolution_called = True
             if name:
@@ -2235,7 +2335,7 @@ def execute_conversation_chat(
                 # стоит обещать юзеру.
                 if result_str.startswith("ok") or result_str.startswith("saved"):
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
-            messages.append(ToolMessage(content=str(result), tool_call_id=tc_id))
+            messages.append(ToolMessage(content=result_str, tool_call_id=tc_id))
     else:
         # Budget exhausted while still calling tools. Force ONE final
         # completion with NO bind_tools so the model must write plain
