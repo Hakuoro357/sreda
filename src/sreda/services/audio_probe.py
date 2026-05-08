@@ -31,12 +31,40 @@ Errors handling rationale:
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 
 
 class FfprobeError(Exception):
     """Raised когда ffprobe failed extract duration. Caller should
     fallback к text reply, NOT charge voice quota."""
+
+
+# 2026-05-08 prod incident (tenant_max_142322319): MAX отправил
+# OGG/Opus где `format.duration` не записан в container metadata.
+# ffprobe вернул успешный exit code 0, но `data["format"]["duration"]`
+# missing → KeyError → FfprobeError → юзер видел «не получилось
+# обработать голосовое». TG voice работал (TG ставит duration);
+# MAX-Web/Android — нет.
+#
+# Fallback chain:
+#   1. format.duration (container metadata — TG style)
+#   2. streams[*].duration (stream-level — некоторые MAX containers)
+#   3. byte-size estimate (OGG/Opus voice ≈ 16 kbps = 2 KB/s)
+#
+# Codex r4 MAJOR: bitrate denominator 2000 (16 kbps) недооценивает
+# duration для low-bitrate Opus (12 kbps). Real 45s @ 12 kbps =
+# 67500 bytes → 33s estimate → undercharge. Снижено до 1500 bytes/sec
+# (12 kbps) — typical MAX voice Opus rate. Even если real bitrate
+# выше — мы получим conservative over-estimate, а не under-charge.
+#
+# Codex r4 MINOR: cap aligned с free-tier policy. Free tier ceiling
+# 30s/voice (`SREDA_FREE_VOICE_SECONDS_DAILY=300` = 5 min/day, по
+# воспроизведённому MAX-cap'у `_VOICE_MAX_BYTES`). Превышать смысла
+# нет — sandard MAX voice уже отбрасывается на download stage если
+# больше 1MB (~30s).
+_VOICE_BITRATE_BYTES_PER_SEC = 1500  # 12 kbps OGG/Opus voice (conservative)
+_BYTE_ESTIMATE_MAX_SEC = 30.0  # Free-tier per-voice ceiling
 
 
 def ffprobe_duration(audio_bytes: bytes, *, timeout_sec: float = 10.0) -> float:
@@ -53,11 +81,15 @@ def ffprobe_duration(audio_bytes: bytes, *, timeout_sec: float = 10.0) -> float:
 
     Raises:
         FfprobeError: ffprobe missing, audio corrupted, format
-            unsupported, or output unparseable.
+            unsupported, or all fallback paths failed.
     """
     try:
         proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            ["ffprobe", "-v", "error",
+             # 2026-05-08 fix: query format AND stream level. Some
+             # MAX containers don't set format.duration but DO set
+             # stream.duration. Single subprocess call, both checked.
+             "-show_entries", "format=duration:stream=duration",
              "-of", "json", "-i", "pipe:0"],
             input=audio_bytes,
             capture_output=True,
@@ -80,12 +112,54 @@ def ffprobe_duration(audio_bytes: bytes, *, timeout_sec: float = 10.0) -> float:
 
     try:
         data = json.loads(proc.stdout.decode("utf-8", errors="replace"))
-        duration = float(data["format"]["duration"])
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-        raise FfprobeError(
-            f"ffprobe output unparseable: {exc}"
-        ) from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise FfprobeError(f"ffprobe output not JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise FfprobeError(f"ffprobe output not a dict: {type(data).__name__}")
 
-    if duration <= 0:
-        raise FfprobeError(f"ffprobe returned non-positive duration: {duration}")
+    duration: float | None = None
+
+    # Codex r4 MINOR: isfinite guard — protect от inf/nan, которые
+    # формально проходили `d > 0` но ломали quota math downstream.
+
+    # 1) format.duration (TG style — container metadata).
+    fmt = data.get("format") or {}
+    fmt_dur = fmt.get("duration") if isinstance(fmt, dict) else None
+    if fmt_dur:
+        try:
+            d = float(fmt_dur)
+            if math.isfinite(d) and d > 0:
+                duration = d
+        except (TypeError, ValueError):
+            pass
+
+    # 2) streams[*].duration (MAX-Web/Android style).
+    if duration is None:
+        streams = data.get("streams") or []
+        if isinstance(streams, list):
+            for stream in streams:
+                if not isinstance(stream, dict):
+                    continue
+                sd = stream.get("duration")
+                if not sd:
+                    continue
+                try:
+                    d = float(sd)
+                    if math.isfinite(d) and d > 0:
+                        duration = d
+                        break
+                except (TypeError, ValueError):
+                    continue
+
+    # 3) Byte-size estimate for typical voice OGG/Opus.
+    if duration is None:
+        size = len(audio_bytes)
+        estimated = size / _VOICE_BITRATE_BYTES_PER_SEC if size else 0.0
+        if estimated > 0:
+            return min(estimated, _BYTE_ESTIMATE_MAX_SEC)
+        raise FfprobeError(
+            "ffprobe returned no duration in format or streams; "
+            f"byte estimate also failed (size={size})"
+        )
+
     return duration

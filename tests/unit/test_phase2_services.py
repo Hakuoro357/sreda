@@ -160,18 +160,25 @@ def test_audio_probe_non_zero_exit_raises():
             ffprobe_duration(b"junk")
 
 
-def test_audio_probe_unparseable_output_raises():
-    """ffprobe output без duration field → FfprobeError."""
-    from sreda.services.audio_probe import FfprobeError, ffprobe_duration
+def test_audio_probe_missing_duration_uses_byte_estimate():
+    """2026-05-08: ffprobe вывод без format.duration AND streams.duration
+    → fallback на byte-estimate (16 kbps OGG/Opus voice = 2 KB/sec).
+
+    Triggered by tenant_max_142322319 prod incident — MAX containers
+    sometimes don't set duration. Раньше → FfprobeError → юзер видел
+    «не получилось обработать голосовое». Теперь — оценка по размеру.
+    """
+    from sreda.services.audio_probe import ffprobe_duration
 
     class FakeProc:
         returncode = 0
-        stdout = b'{"format": {}}'  # missing duration
+        stdout = b'{"format": {}, "streams": []}'  # both missing
         stderr = b""
 
+    # 4500 bytes / 1500 bytes-per-sec (12 kbps Opus) = 3.0s estimate
     with patch("subprocess.run", return_value=FakeProc):
-        with pytest.raises(FfprobeError, match="unparseable"):
-            ffprobe_duration(b"x")
+        result = ffprobe_duration(b"x" * 4500)
+        assert result == pytest.approx(3.0)
 
 
 def test_audio_probe_returns_float_seconds():
