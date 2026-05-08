@@ -2,6 +2,11 @@
 
 Используется для idempotency-проверки в `telegram_bot._handle_callback`
 (2026-04-28 spam-loop fix tg_1089832184).
+
+2026-05-08: tour сокращён 11 → 4 (intro → voice → memory → done).
+Старые ветки (schedule/reminders/checklists/shopping/recipes/family/
+dont_do) теперь aliases на intro для backwards-compat с in-progress
+tours.
 """
 
 from __future__ import annotations
@@ -15,22 +20,23 @@ def test_branch_order_starts_with_intro_ends_with_done() -> None:
     assert pending_bot.BRANCH_ORDER[-1] == "done"
 
 
-def test_branch_order_contains_all_known_branches() -> None:
-    """Все 11 ветвей из docs/copy/welcome.md есть в BRANCH_ORDER."""
-    expected = {
-        "intro", "voice", "schedule", "reminders", "checklists",
-        "shopping", "recipes", "family", "memory", "dont_do", "done",
-    }
-    assert set(pending_bot.BRANCH_ORDER) == expected
-    # И длина равна — нет дубликатов.
-    assert len(pending_bot.BRANCH_ORDER) == 11
+def test_branch_order_is_4_steps() -> None:
+    """4-step tour: intro → voice → memory → done.
+
+    Цель сокращения (2026-05-08): юзеры устают на 4-5 экране,
+    drop-off ~50% к 6-му тапу. Сокращение до 4 закрывает elevator
+    pitch (кто я → как со мной говорить → что я делаю → жди модератора)
+    и удерживает completion.
+    """
+    expected = ("intro", "voice", "memory", "done")
+    assert pending_bot.BRANCH_ORDER == expected
 
 
 def test_branch_index_returns_position() -> None:
     assert pending_bot.branch_index("intro") == 0
     assert pending_bot.branch_index("voice") == 1
-    assert pending_bot.branch_index("schedule") == 2
-    assert pending_bot.branch_index("done") == 10
+    assert pending_bot.branch_index("memory") == 2
+    assert pending_bot.branch_index("done") == 3
 
 
 def test_branch_index_unknown_returns_minus_one() -> None:
@@ -42,6 +48,14 @@ def test_branch_index_unknown_returns_minus_one() -> None:
     assert pending_bot.branch_index("welcome") == -1
     assert pending_bot.branch_index("what") == -1
     assert pending_bot.branch_index("life") == -1
+    # Дропнутые в 2026-05-08 ветки (теперь aliases) тоже не в ORDER.
+    assert pending_bot.branch_index("schedule") == -1
+    assert pending_bot.branch_index("reminders") == -1
+    assert pending_bot.branch_index("checklists") == -1
+    assert pending_bot.branch_index("shopping") == -1
+    assert pending_bot.branch_index("recipes") == -1
+    assert pending_bot.branch_index("family") == -1
+    assert pending_bot.branch_index("dont_do") == -1
     assert pending_bot.branch_index("nonexistent") == -1
     assert pending_bot.branch_index("") == -1
 
@@ -55,11 +69,25 @@ def test_branch_index_supports_strict_equality_idempotency() -> None:
     Старая семантика `cur_idx <= last_idx` вызывала бы блок prev-таппа
     в wizard'е, что сломало бы B (двустороннюю) навигацию."""
     # Точный повтор — блокируется
-    assert pending_bot.branch_index("schedule") == pending_bot.branch_index("schedule")
+    assert pending_bot.branch_index("voice") == pending_bot.branch_index("voice")
     # «Откат назад» — НЕ блокируется (cur != last)
-    assert pending_bot.branch_index("intro") != pending_bot.branch_index("reminders")
+    assert pending_bot.branch_index("intro") != pending_bot.branch_index("memory")
     # Forward — НЕ блокируется
-    assert pending_bot.branch_index("schedule") != pending_bot.branch_index("voice")
+    assert pending_bot.branch_index("memory") != pending_bot.branch_index("voice")
+
+
+def test_dropped_branches_alias_to_intro() -> None:
+    """2026-05-08: 7 веток сокращены, но `_BRANCHES` всё ещё их знает —
+    map'ятся в intro. In-progress туры из старой версии не падают."""
+    intro_reply = pending_bot.match("pb:intro", is_callback=True)
+    for old_key in (
+        "schedule", "reminders", "checklists", "shopping",
+        "recipes", "family", "dont_do",
+    ):
+        old_reply = pending_bot.match(f"pb:{old_key}", is_callback=True)
+        assert old_reply == intro_reply, (
+            f"alias '{old_key}' should map to intro reply"
+        )
 
 
 def test_navigation_keyboard_intro_has_only_next() -> None:
@@ -74,7 +102,7 @@ def test_navigation_keyboard_intro_has_only_next() -> None:
 
 
 def test_navigation_keyboard_middle_has_prev_and_next() -> None:
-    """Средняя ветка (например voice) — prev + next в одном ряду."""
+    """Средняя ветка (voice) — prev (intro) + next (memory) в одном ряду."""
     kb = pending_bot.build_navigation_keyboard("voice")
     rows = kb["inline_keyboard"]
     assert len(rows) == 1
@@ -83,18 +111,18 @@ def test_navigation_keyboard_middle_has_prev_and_next() -> None:
     assert prev_btn["callback_data"] == "pb:intro"
     assert "←" in prev_btn["text"]
     assert "Привет" in prev_btn["text"]
-    assert next_btn["callback_data"] == "pb:schedule"
-    assert "Расписание" in next_btn["text"]
+    assert next_btn["callback_data"] == "pb:memory"
+    assert "Память" in next_btn["text"]
     assert "→" in next_btn["text"]
 
 
 def test_navigation_keyboard_pre_final_branch_uses_gotovo_label() -> None:
-    """Предпоследняя ветка `dont_do` — next кнопка «Готово ✓»,
+    """Предпоследняя ветка `memory` — next кнопка «Готово ✓»,
     не «Готово →»."""
-    kb = pending_bot.build_navigation_keyboard("dont_do")
+    kb = pending_bot.build_navigation_keyboard("memory")
     rows = kb["inline_keyboard"]
     prev_btn, next_btn = rows[0]
-    assert prev_btn["callback_data"] == "pb:memory"
+    assert prev_btn["callback_data"] == "pb:voice"
     assert next_btn["callback_data"] == "pb:done"
     assert "Готово" in next_btn["text"]
     assert "✓" in next_btn["text"]
@@ -102,18 +130,17 @@ def test_navigation_keyboard_pre_final_branch_uses_gotovo_label() -> None:
 
 
 def test_navigation_keyboard_done_keeps_prev_button() -> None:
-    """2026-04-29: финал `done` остаётся navigable. Раньше keyboard
-    очищался (`inline_keyboard=[]`), теперь prev-кнопка остаётся —
-    tour становится permanent reference, юзер может скроллить
-    обратно через все ветки."""
+    """2026-04-29: финал `done` остаётся navigable. prev-кнопка
+    остаётся — tour становится permanent reference, юзер может
+    скроллить обратно."""
     kb = pending_bot.build_navigation_keyboard("done")
     rows = kb["inline_keyboard"]
     assert len(rows) == 1, f"done: expected 1 row with prev button, got {rows}"
     assert len(rows[0]) == 1, "done: expected only prev (no next)"
     btn = rows[0][0]
-    assert btn["callback_data"] == "pb:dont_do"
+    assert btn["callback_data"] == "pb:memory"
     assert "←" in btn["text"]
-    assert "Чего не делаю" in btn["text"]
+    assert "Память" in btn["text"]
 
 
 def test_navigation_keyboard_unknown_branch_falls_back_to_intro() -> None:
@@ -135,7 +162,7 @@ def test_navigation_keyboard_all_branches_round_trip_consistent() -> None:
         # Prev button (на всех кроме intro)
         if i == 0:
             assert not any(b["text"].startswith("←") for b in flat), (
-                f"intro: should NOT have prev button"
+                "intro: should NOT have prev button"
             )
         else:
             prev_match = [b for b in flat if b["callback_data"] == f"pb:{order[i-1]}"]
@@ -149,5 +176,3 @@ def test_navigation_keyboard_all_branches_round_trip_consistent() -> None:
         else:
             next_match = [b for b in flat if b["callback_data"] == f"pb:{order[i+1]}"]
             assert next_match, f"branch {br}: missing next button to {order[i+1]}"
-
-
