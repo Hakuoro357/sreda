@@ -250,17 +250,62 @@ def ensure_telegram_user_bundle_by_id(
     )
 
 
-def build_post_approve_message() -> str:
-    """Сообщение после admin-approve (2026-04-27 simplified).
+_WELCOME_SENT_KEY = "welcome_sent_at"
+_HOUSEWIFE_FEATURE_KEY = "housewife_assistant"
 
-    Юзер только что прошёл pending-цепочку из 11 сообщений (включая
-    представление Среды и обзор всех функций). Здесь просто
-    подтверждаем что доступ открыт и спрашиваем имя — без кнопок,
-    без расспросов про семью / диеты / другие данные. LLM сама
-    спросит дальше, когда уместно.
+
+def is_welcome_sent(session: Session, tenant_id: str, user_id: str) -> bool:
+    """True если post-approve welcome уже отправлен этому юзеру.
+
+    Phase 2 fix 2026-05-08 (Codex MAJOR): hardened idempotency для
+    welcome-flow. Раньше использовали `is_new_user` flag — но если
+    HTTP-send падал, `is_new_user=False` на retry → welcome потерян.
+    Теперь — флаг в БД (`tenant_user_skill_configs.skill_params_json
+    -> welcome_sent_at`), который выставляется ТОЛЬКО на успешный send.
+    """
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    repo = UserProfileRepository(session)
+    config = repo.get_skill_config(tenant_id, user_id, _HOUSEWIFE_FEATURE_KEY)
+    if config is None:
+        return False
+    params = repo.decode_skill_params(config)
+    return bool(params.get(_WELCOME_SENT_KEY))
+
+
+def mark_welcome_sent(session: Session, tenant_id: str, user_id: str) -> None:
+    """Записать факт успешной отправки welcome (idempotency anchor).
+
+    Должна вызываться ПОСЛЕ успешного `client.send_message`. Если
+    HTTP падает — флаг остаётся False, следующий inbound заретраит.
+    Merge с существующими skill_params (онбординг tour state и др.),
+    чтобы не сбросить их случайно.
+    """
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    repo = UserProfileRepository(session)
+    config = repo.get_skill_config(tenant_id, user_id, _HOUSEWIFE_FEATURE_KEY)
+    existing = repo.decode_skill_params(config) if config is not None else {}
+    existing[_WELCOME_SENT_KEY] = datetime.now(timezone.utc).isoformat()
+    repo.upsert_skill_config(
+        tenant_id, user_id, _HOUSEWIFE_FEATURE_KEY,
+        source="system",
+        skill_params=existing,
+    )
+    session.commit()
+
+
+def build_post_approve_message() -> str:
+    """Welcome после auto-grant'а на signup (Phase 2C).
+
+    Раньше слалось админом через `/admin/tenant/approve` после ручного
+    одобрения; теперь автоматически — поэтому без упоминания
+    «модератор открыл доступ». Просто здороваемся и спрашиваем имя
+    (без кнопок, без расспросов про семью/диеты — LLM сама задаст
+    остальные вопросы по ходу).
     """
     return (
-        "✅ Готово! Модератор открыл доступ — рада знакомству.\n\n"
+        "Привет! Я Среда — помощница для семьи.\n\n"
         "Прежде чем приступим, подскажи, как к тебе обращаться? "
         "Имя или ник, как удобно. Это нужно, чтобы напоминания и "
         "сообщения были по-человечески, а не «уважаемый пользователь»."

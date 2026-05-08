@@ -148,6 +148,43 @@ async def handle_max_update(
                     logger.warning("max signup-blocked notify failed", exc_info=True)
             return ""
 
+        # Phase 2 fix 2026-05-08 (Codex MAJOR hardening): welcome
+        # отправляется на основе `is_welcome_sent` флага в БД, не
+        # `is_new_user`. Если HTTP-send падает, флаг остаётся False —
+        # следующий inbound заретраит. Mark-sent ТОЛЬКО на успешный
+        # send, через `mark_welcome_sent` (commit per call).
+        if (
+            onboarding.tenant_id
+            and onboarding.user_id
+            and onboarding.max_chat_id
+            and settings.max_bot_token
+        ):
+            from sreda.services.onboarding import (
+                build_post_approve_message,
+                is_welcome_sent,
+                mark_welcome_sent,
+            )
+            if not is_welcome_sent(session, onboarding.tenant_id, onboarding.user_id):
+                try:
+                    client = MaxClient(token=settings.max_bot_token)
+                    await client.send_message(
+                        recipient={"chat_id": onboarding.max_chat_id},
+                        text=build_post_approve_message(),
+                    )
+                    mark_welcome_sent(
+                        session, onboarding.tenant_id, onboarding.user_id,
+                    )
+                    logger.info(
+                        "max inbound: post-approve welcome sent tenant=%s",
+                        onboarding.tenant_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "max post-approve welcome failed for tenant=%s "
+                        "(retry on next inbound)",
+                        onboarding.tenant_id, exc_info=True,
+                    )
+
         result = persist_max_inbound_event(
             session, bot_key=bot_key, payload=payload,
         )

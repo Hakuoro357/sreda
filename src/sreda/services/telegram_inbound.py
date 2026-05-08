@@ -460,6 +460,45 @@ async def handle_telegram_update(
                 except Exception:  # noqa: BLE001
                     logger.warning("signup-blocked notify failed", exc_info=True)
             return None
+
+        # Phase 2 fix 2026-05-08 (Codex MAJOR hardening): welcome
+        # отправляется на основе `is_welcome_sent` флага в БД, не
+        # `is_new_user`. Если HTTP-send падает, флаг остаётся False —
+        # следующий inbound заретраит. Mark-sent ТОЛЬКО на успешный
+        # send, через `mark_welcome_sent`.
+        if (
+            onboarding.tenant_id
+            and onboarding.user_id
+            and onboarding.chat_id
+            and settings.telegram_bot_token
+        ):
+            from sreda.services.onboarding import (
+                build_post_approve_message,
+                is_welcome_sent,
+                mark_welcome_sent,
+            )
+            if not is_welcome_sent(session, onboarding.tenant_id, onboarding.user_id):
+                try:
+                    from sreda.integrations.telegram.client import TelegramClient
+                    client = TelegramClient(token=settings.telegram_bot_token)
+                    await client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=build_post_approve_message(),
+                    )
+                    mark_welcome_sent(
+                        session, onboarding.tenant_id, onboarding.user_id,
+                    )
+                    logger.info(
+                        "telegram inbound: post-approve welcome sent tenant=%s",
+                        onboarding.tenant_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "telegram post-approve welcome failed for tenant=%s "
+                        "(retry on next inbound)",
+                        onboarding.tenant_id, exc_info=True,
+                    )
+
         result = persist_telegram_inbound_event(
             session, bot_key=bot_key, payload=payload,
         )
