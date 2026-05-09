@@ -473,6 +473,7 @@ async def handle_telegram_update(
             and settings.telegram_bot_token
         ):
             from sreda.services.onboarding import (
+                build_post_approve_keyboard_tg,
                 build_post_approve_message,
                 is_welcome_sent,
                 mark_welcome_sent,
@@ -484,6 +485,7 @@ async def handle_telegram_update(
                     await client.send_message(
                         chat_id=onboarding.chat_id,
                         text=build_post_approve_message(),
+                        reply_markup=build_post_approve_keyboard_tg(),
                     )
                     mark_welcome_sent(
                         session, onboarding.tenant_id, onboarding.user_id,

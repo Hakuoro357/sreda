@@ -295,6 +295,72 @@ def mark_welcome_sent(session: Session, tenant_id: str, user_id: str) -> None:
     session.commit()
 
 
+# ---------------------------------------------------------------------------
+# Post-tour name prompt idempotency (Codex r2 MINOR — 2026-05-09).
+# Когда юзер на post-approve welcome тапнул «Расскажи поподробнее» и
+# прошёл tour до done step'а, шлём отдельный name prompt. Юзер может
+# back-navigate в done (prev → memory → next done) или re-trigger через
+# повторный pb:done — в обоих случаях не нужно spam'ить prompt.
+_POST_TOUR_NAME_PROMPT_SENT_KEY = "post_tour_name_prompt_sent_at"
+
+
+def is_post_tour_name_prompt_sent(
+    session: Session, tenant_id: str, user_id: str,
+) -> bool:
+    """True если post-tour name prompt уже отправлен этому юзеру."""
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    repo = UserProfileRepository(session)
+    config = repo.get_skill_config(tenant_id, user_id, _HOUSEWIFE_FEATURE_KEY)
+    if config is None:
+        return False
+    params = repo.decode_skill_params(config)
+    return bool(params.get(_POST_TOUR_NAME_PROMPT_SENT_KEY))
+
+
+def mark_post_tour_name_prompt_sent(
+    session: Session, tenant_id: str, user_id: str,
+) -> None:
+    """Записать факт успешной отправки post-tour name prompt'а."""
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    repo = UserProfileRepository(session)
+    config = repo.get_skill_config(tenant_id, user_id, _HOUSEWIFE_FEATURE_KEY)
+    existing = repo.decode_skill_params(config) if config is not None else {}
+    existing[_POST_TOUR_NAME_PROMPT_SENT_KEY] = (
+        datetime.now(timezone.utc).isoformat()
+    )
+    repo.upsert_skill_config(
+        tenant_id, user_id, _HOUSEWIFE_FEATURE_KEY,
+        source="system",
+        skill_params=existing,
+    )
+    session.commit()
+
+
+def is_user_named(session: Session, tenant_id: str, user_id: str) -> bool:
+    """True если у юзера уже выставлен display_name (он представился).
+
+    Используется для skip post-tour name prompt'а: если юзер ответил
+    именем ДО tour'а (Codex r3 MINOR scenario: «welcome → user answers
+    name → later taps tour → done»), повторный prompt будет noise.
+
+    ⚠ Codex r4 prod-breaking fix (2026-05-09): display_name живёт на
+    `TenantUserProfile`, НЕ на `User`. r3 версия упала бы с
+    AttributeError на `user.display_name`. Профиль может отсутствовать
+    для нового юзера — read-only query (без get_or_create).
+    """
+    from sreda.db.models.user_profile import TenantUserProfile
+
+    profile = session.query(TenantUserProfile).filter(
+        TenantUserProfile.tenant_id == tenant_id,
+        TenantUserProfile.user_id == user_id,
+    ).first()
+    if profile is None:
+        return False
+    return bool((profile.display_name or "").strip())
+
+
 def build_post_approve_message() -> str:
     """Welcome после auto-grant'а на signup (Phase 2C).
 
@@ -303,12 +369,76 @@ def build_post_approve_message() -> str:
     «модератор открыл доступ». Просто здороваемся и спрашиваем имя
     (без кнопок, без расспросов про семью/диеты — LLM сама задаст
     остальные вопросы по ходу).
+
+    2026-05-09: к этому welcome message прикрепляется keyboard с
+    кнопкой «Расскажи поподробнее» → `pb:intro` callback. Юзер
+    может либо ответить именем (LLM extract'ит), либо тапнуть
+    кнопку — увидит pending_bot tour (4 шага). На done step'е tour'а
+    шлём follow-up через `build_post_tour_name_prompt()`.
     """
     return (
         "Привет! Я Среда — помощница для семьи.\n\n"
         "Прежде чем приступим, подскажи, как к тебе обращаться? "
         "Имя или ник, как удобно. Это нужно, чтобы напоминания и "
         "сообщения были по-человечески, а не «уважаемый пользователь»."
+    )
+
+
+def build_post_approve_keyboard_tg() -> dict:
+    """Telegram inline_keyboard для post-approve welcome.
+
+    Одна кнопка «Расскажи поподробнее» → `pb:intro` callback. Когда
+    юзер тапает, welcome editMessage'ится в pending_bot tour intro
+    через `telegram_bot._handle_callback` (broadcast pattern,
+    обрабатывает pb:* для approved users).
+    """
+    return {
+        "inline_keyboard": [[
+            {
+                "text": "Расскажи поподробнее",
+                "callback_data": "pb:intro",
+            }
+        ]]
+    }
+
+
+def build_post_approve_keyboard_max() -> list[dict]:
+    """MAX inline_keyboard attachment для post-approve welcome.
+
+    Тот же контент что TG version, но в MAX-формате (attachments
+    list с type='inline_keyboard'). Callback payload: `pb:intro`.
+    """
+    return [{
+        "type": "inline_keyboard",
+        "payload": {
+            "buttons": [[
+                {
+                    "type": "callback",
+                    "text": "Расскажи поподробнее",
+                    "payload": "pb:intro",
+                }
+            ]]
+        },
+    }]
+
+
+def build_post_tour_name_prompt() -> str:
+    """Follow-up message после tour'а — повтор name prompt'а.
+
+    Когда юзер на post-approve welcome тапнул «Расскажи поподробнее»,
+    welcome message editMessage'ится через 4 шага tour'а (intro →
+    voice → memory → done). Done step заканчивается «Пиши голосом
+    или текстом — я тут.» — но изначальный name prompt из welcome
+    уже потерян (was overwritten by tour intro).
+
+    Эта функция возвращает короткое follow-up сообщение, которое
+    шлётся отдельным message ПОСЛЕ done callback. Юзер видит
+    name prompt и отвечает именем → LLM extract'ит через
+    onboarding_answered tool.
+    """
+    return (
+        "А чтобы я могла обращаться по-человечески — подскажи, "
+        "как к тебе обращаться? Имя или ник, как удобно."
     )
 
 

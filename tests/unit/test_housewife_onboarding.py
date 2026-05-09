@@ -591,3 +591,94 @@ def test_record_pb_tour_progress_preserves_other_skill_params():
     assert params.get("unrelated") == "value"
     assert params.get("onboarding") == {"status": "complete"}
     assert params.get("welcome_v2_progress", {}).get("last_branch") == "voice"
+
+
+# ---------------------------------------------------------------------------
+# Post-tour name prompt idempotency (Codex r2-r4 review — 2026-05-09)
+# ---------------------------------------------------------------------------
+
+
+def test_post_tour_name_prompt_sent_starts_false():
+    """Без вызова mark_*, флаг отсутствует → is_*_sent возвращает False."""
+    from sreda.services.onboarding import is_post_tour_name_prompt_sent
+
+    session = _fresh_session()
+    assert is_post_tour_name_prompt_sent(session, "t1", "u1") is False
+
+
+def test_post_tour_name_prompt_mark_sets_flag():
+    """mark_* выставляет флаг, is_*_sent возвращает True. Idempotent
+    повторный mark — flag остаётся True (timestamp обновляется)."""
+    from sreda.services.onboarding import (
+        is_post_tour_name_prompt_sent,
+        mark_post_tour_name_prompt_sent,
+    )
+
+    session = _fresh_session()
+    assert is_post_tour_name_prompt_sent(session, "t1", "u1") is False
+
+    mark_post_tour_name_prompt_sent(session, "t1", "u1")
+    assert is_post_tour_name_prompt_sent(session, "t1", "u1") is True
+
+    # Повторный mark — flag остаётся True (back-navigation case).
+    mark_post_tour_name_prompt_sent(session, "t1", "u1")
+    assert is_post_tour_name_prompt_sent(session, "t1", "u1") is True
+
+
+def test_is_user_named_no_profile_returns_false():
+    """Codex r4 prod fix: новый юзер без TenantUserProfile → не named."""
+    from sreda.services.onboarding import is_user_named
+
+    session = _fresh_session()
+    assert is_user_named(session, "t1", "u1") is False
+
+
+def test_is_user_named_with_display_name_returns_true():
+    """TenantUserProfile.display_name != None → юзер представился."""
+    from sreda.db.models.user_profile import TenantUserProfile
+    from sreda.services.onboarding import is_user_named
+
+    session = _fresh_session()
+    session.add(TenantUserProfile(
+        id="prof_t1_u1", tenant_id="t1", user_id="u1", display_name="Boris",
+    ))
+    session.commit()
+    assert is_user_named(session, "t1", "u1") is True
+
+
+def test_is_user_named_empty_display_name_returns_false():
+    """display_name=None или whitespace-only → не named (юзер не ответил)."""
+    from sreda.db.models.user_profile import TenantUserProfile
+    from sreda.services.onboarding import is_user_named
+
+    session = _fresh_session()
+    session.add(TenantUserProfile(
+        id="prof_t1_u1", tenant_id="t1", user_id="u1", display_name=None,
+    ))
+    session.commit()
+    assert is_user_named(session, "t1", "u1") is False
+
+    # Update to whitespace
+    profile = session.query(TenantUserProfile).filter_by(
+        tenant_id="t1", user_id="u1",
+    ).first()
+    profile.display_name = "   "
+    session.commit()
+    assert is_user_named(session, "t1", "u1") is False
+
+
+def test_post_tour_name_prompt_isolation_per_user():
+    """Флаг per-user — mark одного не влияет на другого."""
+    from sreda.db.models.core import User
+    from sreda.services.onboarding import (
+        is_post_tour_name_prompt_sent,
+        mark_post_tour_name_prompt_sent,
+    )
+
+    session = _fresh_session()
+    session.add(User(id="u2", tenant_id="t1", telegram_account_id="200"))
+    session.commit()
+
+    mark_post_tour_name_prompt_sent(session, "t1", "u1")
+    assert is_post_tour_name_prompt_sent(session, "t1", "u1") is True
+    assert is_post_tour_name_prompt_sent(session, "t1", "u2") is False

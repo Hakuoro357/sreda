@@ -160,6 +160,7 @@ async def handle_max_update(
             and settings.max_bot_token
         ):
             from sreda.services.onboarding import (
+                build_post_approve_keyboard_max,
                 build_post_approve_message,
                 is_welcome_sent,
                 mark_welcome_sent,
@@ -170,6 +171,7 @@ async def handle_max_update(
                     await client.send_message(
                         recipient={"chat_id": onboarding.max_chat_id},
                         text=build_post_approve_message(),
+                        attachments=build_post_approve_keyboard_max(),
                     )
                     mark_welcome_sent(
                         session, onboarding.tenant_id, onboarding.user_id,
@@ -229,15 +231,36 @@ async def handle_max_update(
         tenant = session.get(Tenant, onboarding.tenant_id)
         is_approved = tenant is not None and tenant.approved_at is not None
 
-        if not is_approved:
-            # Pending tenant — send welcome через pending_bot (intro
-            # branch при bot_started; tour branch на pb:* callbacks).
+        # Broadcast pattern (2026-05-09): pb:* callbacks от approved
+        # юзеров тоже должны запускать pending_bot wizard. Это позволяет
+        # post-approve welcome message с кнопкой «Расскажи поподробнее»
+        # → callback `pb:intro` → wizard editMessage flow. Без этой ветки
+        # callback'и от approved юзеров silent-drop'ились.
+        is_pb_callback = (
+            update_type == "message_callback"
+            and isinstance(
+                ((payload.get("callback") or {}).get("payload") or ""),
+                str,
+            )
+            and ((payload.get("callback") or {}).get("payload") or "")
+                .startswith("pb:")
+        )
+
+        if not is_approved or is_pb_callback:
+            # Pending tenant ИЛИ approved юзер с pb:* callback'ом —
+            # send welcome через pending_bot (intro branch при
+            # bot_started; tour branch на pb:* callbacks).
             # Иначе silent (избегаем spam'а при regular messages).
+            #
+            # is_post_approve_tour=True ТОЛЬКО для approved+pb_callback —
+            # включает post-done name prompt. Pending юзеры не получают
+            # name prompt: они не могут ответить именем (text замолчат).
             await _handle_max_pending_tenant(
                 payload=payload,
                 update_type=update_type,
                 onboarding=onboarding,
                 settings=settings,
+                is_post_approve_tour=is_approved and is_pb_callback,
             )
             _set_processing_status(
                 session, result.inbound_message_id, "ignored",
@@ -1308,7 +1331,7 @@ async def _handle_max_link_cancel_cb(
 
 async def _handle_max_pending_tenant(
     *, payload: dict, update_type: str | None, onboarding,
-    settings,
+    settings, is_post_approve_tour: bool = False,
 ) -> None:
     """Send pending welcome message via MaxClient.
 
@@ -1321,6 +1344,13 @@ async def _handle_max_pending_tenant(
     - другое: silent
 
     Errors swallowed — pending welcome это UX sugar, не correctness-critical.
+
+    ``is_post_approve_tour`` — set True когда caller routed approved юзера
+    с pb:* callback'ом (broadcast pattern from post-approve welcome
+    button «Расскажи поподробнее»). Single effect: на pb:done callback
+    шлёт follow-up name prompt. Для truly pending юзеров (False) — НЕ
+    шлёт, потому что pending не сможет на него ответить (text-replies
+    silent-drop в pending phase).
     """
     if not (settings.max_bot_token and onboarding.max_chat_id):
         logger.info(
@@ -1395,6 +1425,7 @@ async def _handle_max_pending_tenant(
                 cb_message_mid, onboarding.tenant_id, exc,
             )
 
+    fallback_sent = False
     if not edited:
         try:
             await client.send_message(
@@ -1402,6 +1433,7 @@ async def _handle_max_pending_tenant(
                 text=reply.text,
                 attachments=attachments,
             )
+            fallback_sent = True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "max pending welcome send failed tenant=%s: %s",
@@ -1414,6 +1446,76 @@ async def _handle_max_pending_tenant(
             await client.answer_callback(callback_id)
         except Exception:  # noqa: BLE001
             pass  # ack failure не critical — ux sugar
+
+    # 2026-05-09: post-tour name prompt. Когда юзер на approved welcome
+    # тапнул «Расскажи поподробнее» → wizard прошёл 4 шага → finished
+    # на done. Изначальный name prompt из welcome потерялся (overwritten
+    # by tour intro through editMessage). Сейчас шлём follow-up с name
+    # prompt'ом отдельным сообщением, чтобы юзер знал «теперь представься».
+    #
+    # Отправляем ТОЛЬКО когда:
+    # - is_post_approve_tour=True (Codex r1 MAJOR — pending юзеры не могут
+    #   ответить именем, для них prompt бессмысленный)
+    # - branch == "done" (финал tour'а)
+    # - done text реально доставлен — edit прошёл ИЛИ fallback send
+    #   прошёл (Codex r1 MINOR — иначе юзер видит только name prompt
+    #   без done text если оба canal'а упали)
+    delivered = edited or fallback_sent
+    if (
+        is_post_approve_tour
+        and is_callback
+        and current_branch == "done"
+        and delivered
+        and onboarding.tenant_id
+        and onboarding.user_id
+    ):
+        # Idempotency check (Codex r2 MINOR — 2026-05-09): юзер может
+        # back-navigate в done step повторно (prev → memory → next done)
+        # или re-trigger через повторный pb:done. Не spam'им prompt.
+        # Plus skip если юзер уже представился (Codex r3 MINOR — сценарий:
+        # welcome → user answers name → later taps tour → done; повторный
+        # prompt будет noise).
+        from sreda.services.onboarding import (
+            build_post_tour_name_prompt,
+            is_post_tour_name_prompt_sent,
+            is_user_named,
+            mark_post_tour_name_prompt_sent,
+        )
+        SessionLocal = get_session_factory()
+        with SessionLocal() as session:
+            already_sent = is_post_tour_name_prompt_sent(
+                session, onboarding.tenant_id, onboarding.user_id,
+            )
+            already_named = is_user_named(
+                session, onboarding.tenant_id, onboarding.user_id,
+            )
+        if already_sent or already_named:
+            logger.info(
+                "max post-tour name prompt skip tenant=%s "
+                "already_sent=%s already_named=%s",
+                onboarding.tenant_id, already_sent, already_named,
+            )
+        else:
+            try:
+                await client.send_message(
+                    recipient={"chat_id": onboarding.max_chat_id},
+                    text=build_post_tour_name_prompt(),
+                )
+                # Mark sent ТОЛЬКО на успешный send (если HTTP падает —
+                # retry получит prompt, юзер не пропустит).
+                with SessionLocal() as session:
+                    mark_post_tour_name_prompt_sent(
+                        session, onboarding.tenant_id, onboarding.user_id,
+                    )
+                logger.info(
+                    "max post-tour name prompt sent tenant=%s",
+                    onboarding.tenant_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "max post-tour name prompt failed tenant=%s: %s",
+                    onboarding.tenant_id, exc,
+                )
 
 
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:

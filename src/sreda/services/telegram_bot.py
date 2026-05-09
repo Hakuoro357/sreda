@@ -434,6 +434,12 @@ async def _handle_callback(
                     exc.status_code, exc,
                 )
 
+        # Codex r3 MAJOR (2026-05-09): инициализируем ДО `if onboarding.chat_id:`
+        # чтобы post-done block ниже не упал с UnboundLocalError если chat_id
+        # отсутствует (graceful skip вместо crash).
+        edited = False
+        fallback_sent = False
+
         if onboarding.chat_id:
             if branch == "done":
                 reply = pending_bot._DONE_BROADCAST
@@ -456,7 +462,6 @@ async def _handle_callback(
                 if isinstance(cb_message, dict) else None
             )
 
-            edited = False
             if msg_id is not None:
                 try:
                     await telegram_client.edit_message_text(
@@ -488,6 +493,7 @@ async def _handle_callback(
                         text=reply.text,
                         reply_markup=keyboard,
                     )
+                    fallback_sent = True
                 except TelegramDeliveryError as exc:
                     # 429 — rate-limited, retries только усугубят. Просто
                     # log + drop. 403 — bot blocked. 400 — bad chat_id.
@@ -510,6 +516,73 @@ async def _handle_callback(
             except Exception:  # noqa: BLE001
                 logger.exception("pb: progress tracking failed for branch=%s", branch)
                 session.rollback()
+
+        # 2026-05-09: post-tour name prompt. Когда юзер на post-approve
+        # welcome тапнул «Расскажи поподробнее» → wizard прошёл 4 шага
+        # → finished на done. Изначальный name prompt из welcome потерялся
+        # (overwritten by tour intro through editMessageText). Шлём
+        # follow-up с name prompt'ом отдельным сообщением.
+        #
+        # Отправляем ТОЛЬКО когда:
+        # - branch == "done" (финал tour'а)
+        # - done text реально доставлен — edit прошёл ИЛИ fallback send
+        #   прошёл (Codex r1 MINOR — иначе юзер видит только name prompt
+        #   без done text если оба canal'а упали)
+        # Note: TG _handle_callback вызывается ТОЛЬКО для approved юзеров
+        # (broadcast pattern). Pending юзеры идут через telegram_webhook.py
+        # ДО approval-gate. Поэтому здесь нет дополнительного approved
+        # check — он implicit.
+        delivered = edited or fallback_sent
+        if (
+            branch == "done"
+            and onboarding.chat_id
+            and onboarding.tenant_id
+            and onboarding.user_id
+            and delivered
+        ):
+            # Idempotency check (Codex r2 MINOR — 2026-05-09): юзер может
+            # back-navigate в done step повторно (prev → memory → next done)
+            # или re-trigger через повторный pb:done. Не spam'им prompt.
+            # Plus skip если юзер уже представился (Codex r3 MINOR —
+            # сценарий: welcome → user answers name → later taps tour
+            # → done; повторный prompt будет noise).
+            from sreda.services.onboarding import (
+                build_post_tour_name_prompt,
+                is_post_tour_name_prompt_sent,
+                is_user_named,
+                mark_post_tour_name_prompt_sent,
+            )
+            already_sent = is_post_tour_name_prompt_sent(
+                session, onboarding.tenant_id, onboarding.user_id,
+            )
+            already_named = is_user_named(
+                session, onboarding.tenant_id, onboarding.user_id,
+            )
+            if already_sent or already_named:
+                logger.info(
+                    "pb: post-tour name prompt skip tenant=%s "
+                    "already_sent=%s already_named=%s",
+                    onboarding.tenant_id, already_sent, already_named,
+                )
+            else:
+                try:
+                    await telegram_client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=build_post_tour_name_prompt(),
+                    )
+                    # Mark sent ТОЛЬКО на успешный send.
+                    mark_post_tour_name_prompt_sent(
+                        session, onboarding.tenant_id, onboarding.user_id,
+                    )
+                    logger.info(
+                        "pb: post-tour name prompt sent tenant=%s",
+                        onboarding.tenant_id,
+                    )
+                except TelegramDeliveryError as exc:
+                    logger.warning(
+                        "pb: post-tour name prompt delivery failed status=%s: %s",
+                        exc.status_code, exc,
+                    )
         return
 
     # Inline-кнопки (Часть 0 плана v2). LLM в прошлом turn'е положил
