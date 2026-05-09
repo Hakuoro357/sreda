@@ -466,6 +466,7 @@ async def handle_telegram_update(
         # `is_new_user`. Если HTTP-send падает, флаг остаётся False —
         # следующий inbound заретраит. Mark-sent ТОЛЬКО на успешный
         # send, через `mark_welcome_sent`.
+        welcome_just_sent = False
         if (
             onboarding.tenant_id
             and onboarding.user_id
@@ -490,6 +491,7 @@ async def handle_telegram_update(
                     mark_welcome_sent(
                         session, onboarding.tenant_id, onboarding.user_id,
                     )
+                    welcome_just_sent = True
                     logger.info(
                         "telegram inbound: post-approve welcome sent tenant=%s",
                         onboarding.tenant_id,
@@ -511,6 +513,22 @@ async def handle_telegram_update(
             logger.info(
                 "telegram inbound: duplicate update_id %s for bot %s — no-op",
                 payload.get("update_id"), bot_key,
+            )
+            return result.inbound_message_id
+
+        # 2026-05-09 fix (Boris feedback): если welcome ТОЛЬКО ЧТО отправлен
+        # этой inbound-message — НЕ передаём её дальше в chat handler.
+        # Иначе юзер получает double-reply на /start: welcome + LLM reply.
+        # Welcome consumes the inbound; следующее сообщение юзера пойдёт
+        # нормально в chat. Применяется ко ВСЕМ inbound types.
+        if welcome_just_sent:
+            logger.info(
+                "telegram inbound: welcome consumed inbound — skip chat "
+                "dispatch tenant=%s inbound_id=%s",
+                onboarding.tenant_id, result.inbound_message_id,
+            )
+            _set_processing_status(
+                session, result.inbound_message_id, "ignored",
             )
             return result.inbound_message_id
 

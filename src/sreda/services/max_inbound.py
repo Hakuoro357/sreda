@@ -153,6 +153,7 @@ async def handle_max_update(
         # `is_new_user`. Если HTTP-send падает, флаг остаётся False —
         # следующий inbound заретраит. Mark-sent ТОЛЬКО на успешный
         # send, через `mark_welcome_sent` (commit per call).
+        welcome_just_sent = False
         if (
             onboarding.tenant_id
             and onboarding.user_id
@@ -176,6 +177,7 @@ async def handle_max_update(
                     mark_welcome_sent(
                         session, onboarding.tenant_id, onboarding.user_id,
                     )
+                    welcome_just_sent = True
                     logger.info(
                         "max inbound: post-approve welcome sent tenant=%s",
                         onboarding.tenant_id,
@@ -190,6 +192,23 @@ async def handle_max_update(
         result = persist_max_inbound_event(
             session, bot_key=bot_key, payload=payload,
         )
+
+        # 2026-05-09 fix (Boris feedback): если welcome ТОЛЬКО ЧТО отправлен
+        # этой inbound-message — НЕ передаём её дальше в chat handler.
+        # Иначе юзер получает double-reply на /start: welcome (с кнопкой)
+        # + LLM chat reply. Welcome consumes the inbound; следующее
+        # сообщение юзера пойдёт нормально в chat. Применяется ко ВСЕМ
+        # inbound types — text/voice/callback/bot_started.
+        if welcome_just_sent:
+            logger.info(
+                "max inbound: welcome consumed inbound — skip chat dispatch "
+                "tenant=%s inbound_id=%s",
+                onboarding.tenant_id, result.inbound_message_id,
+            )
+            _set_processing_status(
+                session, result.inbound_message_id, "ignored",
+            )
+            return result.inbound_message_id
 
         if result.is_duplicate:
             logger.info(
@@ -1425,7 +1444,6 @@ async def _handle_max_pending_tenant(
                 cb_message_mid, onboarding.tenant_id, exc,
             )
 
-    fallback_sent = False
     if not edited:
         try:
             await client.send_message(
@@ -1433,7 +1451,6 @@ async def _handle_max_pending_tenant(
                 text=reply.text,
                 attachments=attachments,
             )
-            fallback_sent = True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "max pending welcome send failed tenant=%s: %s",
@@ -1447,75 +1464,11 @@ async def _handle_max_pending_tenant(
         except Exception:  # noqa: BLE001
             pass  # ack failure не critical — ux sugar
 
-    # 2026-05-09: post-tour name prompt. Когда юзер на approved welcome
-    # тапнул «Расскажи поподробнее» → wizard прошёл 4 шага → finished
-    # на done. Изначальный name prompt из welcome потерялся (overwritten
-    # by tour intro through editMessage). Сейчас шлём follow-up с name
-    # prompt'ом отдельным сообщением, чтобы юзер знал «теперь представься».
-    #
-    # Отправляем ТОЛЬКО когда:
-    # - is_post_approve_tour=True (Codex r1 MAJOR — pending юзеры не могут
-    #   ответить именем, для них prompt бессмысленный)
-    # - branch == "done" (финал tour'а)
-    # - done text реально доставлен — edit прошёл ИЛИ fallback send
-    #   прошёл (Codex r1 MINOR — иначе юзер видит только name prompt
-    #   без done text если оба canal'а упали)
-    delivered = edited or fallback_sent
-    if (
-        is_post_approve_tour
-        and is_callback
-        and current_branch == "done"
-        and delivered
-        and onboarding.tenant_id
-        and onboarding.user_id
-    ):
-        # Idempotency check (Codex r2 MINOR — 2026-05-09): юзер может
-        # back-navigate в done step повторно (prev → memory → next done)
-        # или re-trigger через повторный pb:done. Не spam'им prompt.
-        # Plus skip если юзер уже представился (Codex r3 MINOR — сценарий:
-        # welcome → user answers name → later taps tour → done; повторный
-        # prompt будет noise).
-        from sreda.services.onboarding import (
-            build_post_tour_name_prompt,
-            is_post_tour_name_prompt_sent,
-            is_user_named,
-            mark_post_tour_name_prompt_sent,
-        )
-        SessionLocal = get_session_factory()
-        with SessionLocal() as session:
-            already_sent = is_post_tour_name_prompt_sent(
-                session, onboarding.tenant_id, onboarding.user_id,
-            )
-            already_named = is_user_named(
-                session, onboarding.tenant_id, onboarding.user_id,
-            )
-        if already_sent or already_named:
-            logger.info(
-                "max post-tour name prompt skip tenant=%s "
-                "already_sent=%s already_named=%s",
-                onboarding.tenant_id, already_sent, already_named,
-            )
-        else:
-            try:
-                await client.send_message(
-                    recipient={"chat_id": onboarding.max_chat_id},
-                    text=build_post_tour_name_prompt(),
-                )
-                # Mark sent ТОЛЬКО на успешный send (если HTTP падает —
-                # retry получит prompt, юзер не пропустит).
-                with SessionLocal() as session:
-                    mark_post_tour_name_prompt_sent(
-                        session, onboarding.tenant_id, onboarding.user_id,
-                    )
-                logger.info(
-                    "max post-tour name prompt sent tenant=%s",
-                    onboarding.tenant_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "max post-tour name prompt failed tenant=%s: %s",
-                    onboarding.tenant_id, exc,
-                )
+    # 2026-05-09 (Boris feedback): post-tour name prompt теперь часть
+    # done text inline (см. _DONE в pending_bot.py). Отдельный
+    # follow-up message больше не шлём — снижаем noise (один message
+    # vs два). is_user_named idempotency helpers сохранены для
+    # будущей фичи «conditional name prompt» если потребуется.
 
 
 def _set_processing_status(session, inbound_message_id: str, status: str) -> None:

@@ -364,24 +364,15 @@ def is_user_named(session: Session, tenant_id: str, user_id: str) -> bool:
 def build_post_approve_message() -> str:
     """Welcome после auto-grant'а на signup (Phase 2C).
 
-    Раньше слалось админом через `/admin/tenant/approve` после ручного
-    одобрения; теперь автоматически — поэтому без упоминания
-    «модератор открыл доступ». Просто здороваемся и спрашиваем имя
-    (без кнопок, без расспросов про семью/диеты — LLM сама задаст
-    остальные вопросы по ходу).
-
-    2026-05-09: к этому welcome message прикрепляется keyboard с
-    кнопкой «Расскажи поподробнее» → `pb:intro` callback. Юзер
-    может либо ответить именем (LLM extract'ит), либо тапнуть
-    кнопку — увидит pending_bot tour (4 шага). На done step'е tour'а
-    шлём follow-up через `build_post_tour_name_prompt()`.
+    2026-05-09 (Boris feedback): welcome message сокращён до короткого
+    приветствия + кнопка «Расскажи поподробнее». Name prompt («Прежде
+    чем приступим, подскажи как к тебе обращаться?») перенесён в конец
+    tour'а (done step), чтобы не дублировать «Прежде чем приступим»
+    с финалом tour'а. Юзер либо тапает кнопку (увидит tour + name
+    prompt в конце), либо сразу пишет — LLM спросит имя через системный
+    prompt по ходу chat-flow.
     """
-    return (
-        "Привет! Я Среда — помощница для семьи.\n\n"
-        "Прежде чем приступим, подскажи, как к тебе обращаться? "
-        "Имя или ник, как удобно. Это нужно, чтобы напоминания и "
-        "сообщения были по-человечески, а не «уважаемый пользователь»."
-    )
+    return "Привет! Я Среда — помощница для семьи."
 
 
 def build_post_approve_keyboard_tg() -> dict:
@@ -422,24 +413,10 @@ def build_post_approve_keyboard_max() -> list[dict]:
     }]
 
 
-def build_post_tour_name_prompt() -> str:
-    """Follow-up message после tour'а — повтор name prompt'а.
-
-    Когда юзер на post-approve welcome тапнул «Расскажи поподробнее»,
-    welcome message editMessage'ится через 4 шага tour'а (intro →
-    voice → memory → done). Done step заканчивается «Пиши голосом
-    или текстом — я тут.» — но изначальный name prompt из welcome
-    уже потерян (was overwritten by tour intro).
-
-    Эта функция возвращает короткое follow-up сообщение, которое
-    шлётся отдельным message ПОСЛЕ done callback. Юзер видит
-    name prompt и отвечает именем → LLM extract'ит через
-    onboarding_answered tool.
-    """
-    return (
-        "А чтобы я могла обращаться по-человечески — подскажи, "
-        "как к тебе обращаться? Имя или ник, как удобно."
-    )
+# 2026-05-09 (Boris feedback): build_post_tour_name_prompt() удалён —
+# name prompt теперь часть _DONE text inline (см. pending_bot._DONE).
+# Helpers is_post_tour_name_prompt_sent / mark_post_tour_name_prompt_sent
+# выше остаются для возможной будущей фичи conditional name prompt.
 
 
 def build_connect_eds_message(*, base_active: bool, connected_count: int, allowed_count: int) -> str:
