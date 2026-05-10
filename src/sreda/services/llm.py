@@ -632,6 +632,12 @@ CHAT_PROVIDERS = (
     "openrouter-llama-4-scout",  # meta-llama/llama-4-scout — Llama 4 MoE, 327k ctx
     "openrouter-deepseek",       # deepseek/deepseek-v4-flash — MoE 284B/13B, 1M ctx
     "openrouter-gemini-lite",    # google/gemini-3.1-flash-lite — thinking levels, 1M ctx
+    # 2026-05-10 PM: Nemotron 3 Super — DeepInfra/bf16, hybrid Mamba-Transformer
+    # MoE 117B/12B active, 262k ctx. Bench показал 0.88s avg (10× быстрее mimo,
+    # 3.7× быстрее gemini-lite), $0.0031/turn (+35% от mimo). Прошёл D.tool_error
+    # (gemini/llama не прошли — пустой reply). Soul-v3 пофиксил «вы» → «ты».
+    # Кандидат на primary через runtime_config switcher.
+    "openrouter-nemotron-3-super",
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -653,11 +659,25 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter-qwen": "qwen/qwen3.6-plus",
     # Cost/speed experimental candidates (2026-05-10 A/B vs mimo).
     # See CHAT_PROVIDERS for the matching provider keys + comments.
-    "openrouter-gpt-oss-120b":  "openai/gpt-oss-120b",
-    "openrouter-llama-70b":     "meta-llama/llama-3.3-70b-instruct",
-    "openrouter-llama-4-scout": "meta-llama/llama-4-scout",
-    "openrouter-deepseek":      "deepseek/deepseek-v4-flash",
-    "openrouter-gemini-lite":   "google/gemini-3.1-flash-lite",
+    "openrouter-gpt-oss-120b":      "openai/gpt-oss-120b",
+    "openrouter-llama-70b":         "meta-llama/llama-3.3-70b-instruct",
+    "openrouter-llama-4-scout":     "meta-llama/llama-4-scout",
+    "openrouter-deepseek":          "deepseek/deepseek-v4-flash",
+    "openrouter-gemini-lite":       "google/gemini-3.1-flash-lite",
+    "openrouter-nemotron-3-super":  "nvidia/nemotron-3-super-120b-a12b",
+}
+
+
+# 2026-05-10: Per-provider OpenRouter routing overrides (extra_body).
+# OpenRouter обычно сам выбирает provider'а с лучшей ценой, но иногда
+# нам нужно явно зафиксить конкретный backend (quantization, GPU type,
+# region). Передаётся в ChatOpenAI(extra_body={"provider": {...}}).
+# Docs: https://openrouter.ai/docs/features/provider-routing
+#
+# Nemotron: Boris explicit choice — DeepInfra/bf16 (а не fp8 / другие
+# DeepInfra варианты). Бенч 2026-05-10 проводился именно на этом backend'е.
+_OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    "openrouter-nemotron-3-super": {"provider": {"order": ["DeepInfra/bf16"]}},
 }
 
 
@@ -699,6 +719,20 @@ def _build_chat_llm(
             logger.info("chat LLM disabled: no OpenRouter API key configured")
             return None
         override = _OPENROUTER_MODEL_BY_PROVIDER[provider]
+        # 2026-05-10: per-provider extra_body для forced routing
+        # (например DeepInfra/bf16 на nemotron). Объединяем с любым
+        # extra_body переданным от вызывающего (kwargs.pop), чтобы не
+        # затереть. Caller'ский имеет приоритет.
+        extra_body_default = _OPENROUTER_EXTRA_BODY_BY_PROVIDER.get(provider)
+        caller_extra_body = kwargs.pop("extra_body", None)
+        if extra_body_default and caller_extra_body:
+            # caller overrides: shallow merge, caller wins on key conflict
+            merged = {**extra_body_default, **caller_extra_body}
+            kwargs["extra_body"] = merged
+        elif caller_extra_body:
+            kwargs["extra_body"] = caller_extra_body
+        elif extra_body_default:
+            kwargs["extra_body"] = extra_body_default
         return ChatOpenAI(
             base_url=settings.openrouter_base_url,
             api_key=api_key,

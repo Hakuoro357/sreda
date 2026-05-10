@@ -296,14 +296,19 @@ def test_build_system_prompt_housewife_includes_food_rules():
 
 def test_build_system_prompt_no_feature_returns_core_plus_discipline():
     """Calling without a feature_key (or with an unknown one) must
-    return the core prompt + tool-discipline addendum — no stray
-    feature-addon leaks. 2026-04-29: addendum стал universal,
-    раньше тут проверяли equals _CORE_SYSTEM_PROMPT."""
+    return the core prompt + soul directive + tool-discipline addendum
+    — no stray feature-addon leaks. History:
+    - 2026-04-29: tool-discipline стал universal (раньше equals _CORE)
+    - 2026-05-10: добавлена _SOUL_DIRECTIVE (заботливый стержень).
+    """
     from sreda.runtime.handlers import (
-        _CORE_SYSTEM_PROMPT, _TOOL_DISCIPLINE_ADDENDUM, build_system_prompt,
+        _CORE_SYSTEM_PROMPT, _SOUL_DIRECTIVE, _TOOL_DISCIPLINE_ADDENDUM,
+        build_system_prompt,
     )
 
-    expected = _CORE_SYSTEM_PROMPT + "\n" + _TOOL_DISCIPLINE_ADDENDUM
+    expected = (
+        _CORE_SYSTEM_PROMPT + "\n" + _SOUL_DIRECTIVE + "\n" + _TOOL_DISCIPLINE_ADDENDUM
+    )
     assert build_system_prompt(None) == expected
     assert build_system_prompt("") == expected
     assert build_system_prompt("unknown_feature_xyz") == expected

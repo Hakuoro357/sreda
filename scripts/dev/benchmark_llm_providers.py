@@ -149,6 +149,50 @@ PROVIDERS = [
         "model": "deepseek/deepseek-v4-flash",
         "price_in": 0.14, "price_out": 0.28,
     },
+    # 2026-05-10: Cost/speed candidates — 5 моделей для A/B vs mimo.
+    # Все verified через OpenRouter API на дату добавления:
+    # tools-capable, ≥131k context, output ≤$1.50/M.
+    {
+        "label": "OR/gpt-oss-120b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "openai/gpt-oss-120b",
+        "price_in": 0.039, "price_out": 0.180,
+    },
+    {
+        "label": "OR/llama-3.3-70b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "meta-llama/llama-3.3-70b-instruct",
+        "price_in": 0.10, "price_out": 0.32,
+    },
+    {
+        "label": "OR/llama-4-scout",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "meta-llama/llama-4-scout",
+        "price_in": 0.08, "price_out": 0.30,
+    },
+    {
+        "label": "OR/gemini-3.1-flash-lite",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "google/gemini-3.1-flash-lite",
+        "price_in": 0.25, "price_out": 1.50,
+    },
+    # 2026-05-10: Nemotron 3 Super — NVIDIA hybrid Mamba-Transformer
+    # MoE 120B/12B active, 262k ctx. Через OpenRouter с принудительным
+    # routing на DeepInfra/bf16 (Boris explicit choice).
+    # extra_body forces provider preference; OpenRouter docs:
+    # https://openrouter.ai/docs/features/provider-routing
+    {
+        "label": "OR/nemotron-3-super-120b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "price_in": 0.09, "price_out": 0.45,
+        "extra_body": {"provider": {"order": ["DeepInfra/bf16"]}},
+    },
 ]
 
 
@@ -204,7 +248,28 @@ def save_recipes_batch(recipes: list[dict]) -> str:
     return f"ok:created={len(recipes)}:skipped=0"
 
 
-TOOLS = [list_shopping, list_menu, search_recipes, save_recipes_batch]
+# 2026-05-10: дополнительные tool stubs для edge-case сценариев.
+# delete_recipe всегда возвращает ошибку not_found — проверяем как
+# LLM обрабатывает tool failures (graceful recovery vs crash).
+@tool
+def delete_recipe(title: str) -> str:
+    """Delete a recipe from the user's book by title."""
+    return f"error:not_found:{title}"
+
+
+# log_unsupported_request — реальный production tool. Требуется ДО
+# того как LLM скажет user'у «не умею X». Проверяем что модель
+# его вызывает а не просто отказывает без логирования.
+@tool
+def log_unsupported_request(reason: str) -> str:
+    """Log a request the assistant cannot fulfil. MUST be called BEFORE telling user 'я не могу'."""
+    return f"ok:logged:{reason[:30]}"
+
+
+TOOLS = [
+    list_shopping, list_menu, search_recipes, save_recipes_batch,
+    delete_recipe, log_unsupported_request,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -231,10 +296,48 @@ SCENARIOS = [
         ),
         "expected_tools": ["save_recipes_batch"],
     },
+    # 2026-05-10: edge-case сценарии для оценки soul-директивы под
+    # нестандартными нагрузками. Не покрыты A/B/C.
+    {
+        "name": "D.tool_error",
+        "user_text": "удали из книги рецепт борща",
+        # Ожидаем: delete_recipe вернёт error → LLM объяснит юзеру + подскажет search_recipes
+        "expected_tools": ["delete_recipe"],
+    },
+    {
+        "name": "E.empathy",
+        "user_text": "устала ужасно, чувствую себя плохо. Не знаю что приготовить на ужин",
+        # Ожидаем: эмоциональный ответ ПЕРВЫМ, потом возможно search_recipes
+        # для простого варианта. Не должна спамить сложными tool-вызовами.
+        "expected_tools": [],  # tool optional — главное эмпатия
+    },
+    {
+        "name": "F.capability_reject",
+        "user_text": "следи за курсом доллара и пиши мне когда вырастет на 5%",
+        # Ожидаем: log_unsupported_request → честный отказ. Среда НЕ умеет
+        # background polling. Если ответит «готово, настроила» — fail.
+        "expected_tools": ["log_unsupported_request"],
+    },
 ]
 
 
-SYSTEM_PROMPT = build_system_prompt("housewife_assistant")
+# 2026-05-10: «Душа Среды» — стержень характера, не косметика.
+# 2026-05-10 PM: после triple-review (Claude/Codex/Xiaomi) одна из claims:
+# "bench копия SOUL_DIRECTIVE дрейфует от prod" — фикс через единый
+# источник истины. Импортируем _SOUL_DIRECTIVE из handlers.py.
+#
+# Также: build_system_prompt("housewife_assistant") УЖЕ включает
+# _SOUL_DIRECTIVE в prod (с 2026-05-10). Поэтому --soul сейчас НЕ имеет
+# смысла как «добавить душу к голому промпту» — мы должны наоборот
+# уметь УБРАТЬ душу для baseline-сравнения. Семантика флага инвертирована:
+#   --soul ON  (default): использовать как есть (с soul, как в проде)
+#   --no-soul          : strip soul-блок для apples-to-apples с наследием
+from sreda.runtime.handlers import _SOUL_DIRECTIVE  # canonical source of truth
+
+SOUL_DIRECTIVE = _SOUL_DIRECTIVE  # back-compat alias for older code paths
+
+SYSTEM_PROMPT_BASE = build_system_prompt("housewife_assistant")  # already with soul
+SYSTEM_PROMPT = SYSTEM_PROMPT_BASE  # default
 MAX_ITERS = 4
 
 
@@ -246,13 +349,19 @@ MAX_ITERS = 4
 def _run_one_turn(provider, scenario):
     if not provider["api_key"]:
         return {"error": "no api_key", "provider": provider["label"]}
-    llm = ChatOpenAI(
-        base_url=provider["base_url"],
-        api_key=provider["api_key"],
-        model=provider["model"],
-        temperature=0.2,
-        timeout=60,
-    ).bind_tools(TOOLS)
+    # 2026-05-10: extra_body для OpenRouter provider routing
+    # (например forcing DeepInfra/bf16 на nemotron). Опционально.
+    extra_body = provider.get("extra_body")
+    llm_kwargs = {
+        "base_url": provider["base_url"],
+        "api_key": provider["api_key"],
+        "model": provider["model"],
+        "temperature": 0.2,
+        "timeout": 60,
+    }
+    if extra_body:
+        llm_kwargs["extra_body"] = extra_body
+    llm = ChatOpenAI(**llm_kwargs).bind_tools(TOOLS)
 
     tools_by_name = {t.name: t for t in TOOLS}
     messages = [
@@ -419,6 +528,28 @@ if __name__ == "__main__":
         "--runs", type=int, default=2,
         help="Сколько повторов на каждую (provider, scenario) пару. Default: 2.",
     )
+    parser.add_argument(
+        "--soul", action="store_true",
+        help="DEPRECATED no-op (2026-05-10): _SOUL_DIRECTIVE теперь часть "
+             "production build_system_prompt() из handlers.py — bench по "
+             "default тестирует prompt 1-к-1 с проdом. Флаг сохранён для "
+             "back-compat запусков.",
+    )
+    parser.add_argument(
+        "--no-soul", action="store_true",
+        help="Снять _SOUL_DIRECTIVE из system prompt (для baseline-сравнения "
+             "с дософт версией). Полезно для A/B 'с душой vs без'.",
+    )
     args = parser.parse_args()
     only_labels = args.only.split(",") if args.only else None
+    if args.no_soul:
+        SYSTEM_PROMPT = SYSTEM_PROMPT_BASE.replace(_SOUL_DIRECTIVE + "\n", "")
+        if SYSTEM_PROMPT == SYSTEM_PROMPT_BASE:
+            # Не нашли с trailing \n — пробуем без
+            SYSTEM_PROMPT = SYSTEM_PROMPT_BASE.replace(_SOUL_DIRECTIVE, "")
+        print(f"[no-soul] SYSTEM_PROMPT shrunk by "
+              f"{len(SYSTEM_PROMPT_BASE) - len(SYSTEM_PROMPT)} chars")
+    elif args.soul:
+        print("[soul] flag is a no-op (soul already in production prompt). "
+              "Use --no-soul to strip it.")
     raise SystemExit(main(runs_per_pair=args.runs, only_labels=only_labels))
