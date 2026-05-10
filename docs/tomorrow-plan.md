@@ -1,4 +1,44 @@
-# План на завтра (Сре́да)
+# DEPRECATED — see GitHub Issues
+
+> **2026-05-10:** этот файл больше не source-of-truth для планирования.
+> Roadmap-first restructure перенёс работу в **GitHub Project #2 «Среда»**
+> (https://github.com/users/Hakuoro357/projects/2).
+>
+> ## Где искать что:
+>
+> | Что было здесь | Где теперь |
+> |---|---|
+> | 6 эпиков на Cycle 1+2 | Issues #1-#6 (label `epic`) |
+> | Site execution (S-1a..S-10) | Issues #7-#18 (Epic #1 sub-issues) |
+> | Reliability hard-commits (R-3 streaming, R-4 weather retry) | Issues #19-#20 (Epic #3) |
+> | Onboarding near-term (O-1 lazy-provision, O-2 tour metrics) | Issues #21-#22 (Epic #2) |
+> | Triage stale items (36 items deleted) | `docs/project-restart-triage-2026-05-10.md` |
+>
+> ## Top-5 миграция из этого файла:
+>
+> 1. **Reminder dedup race (R-1)** → создать как child issue Epic #3 (Reliability) когда дойдём (Iter 3-4).
+> 2. **Mobile app planning** → `plans/sredaspace-mobile-app-draft-r3.md` (local), Epic #6 (Cycle 2).
+> 3. **Site execution** → созданы Issues #7-#18 как Site sub-issues.
+> 4. **Voice TTS responses** → Mobile Cycle 2 backlog (M-future placeholder в Epic #6).
+> 5. **Local-first encrypted storage** → C-A1 в Epic #4 (Compliance Design) + Epic #5 (Impl Cycle 2).
+>
+> ## Что осталось в этом файле:
+>
+> Историческая запись в read-only режиме. Новые задачи **НЕ** добавлять
+> сюда — открывать GitHub Issue с правильным label и Project #2 fields.
+>
+> Hot-fix candidates вне roadmap (см. triage doc):
+> - Channel-linking rate limit restore (verify on prod)
+> - Provider content-filter English leaks
+> - Checklist duplicate on single-turn create+add
+>
+> Daily ops cadence: см. issue templates в `.github/ISSUE_TEMPLATE/`.
+
+---
+
+# [archived] План на завтра (Сре́да)
+
+> Контент ниже — снапшот на 2026-05-07. Не редактируй, открывай GitHub Issue.
 
 Живой документ. Задачи добавляем по ходу, завершённые помечаем `✅ DONE
 YYYY-MM-DD` и **переносим в weekly-архив** `docs/done/2026-WNN.md`

@@ -13,6 +13,7 @@ htmlcov/
 !.env.example
 .secrets/
 docs/internal/
+scripts/internal/
 *.db
 *.sqlite
 *.sqlite3
