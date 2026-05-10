@@ -155,6 +155,52 @@ _LLM_PROVIDERS_METADATA = [
         "resolver": "resolve_openrouter_api_key",
         "static_model": "qwen/qwen3.6-plus",
     },
+    # 2026-05-10: Cost/speed candidates added in commit 6bf9821.
+    # Verified through bench (3 providers × 6 scenarios × 3 runs).
+    {
+        "key": "openrouter-gpt-oss-120b",
+        "label": "OpenRouter · GPT-OSS 120B (MoE)",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "openai/gpt-oss-120b",
+    },
+    {
+        "key": "openrouter-llama-70b",
+        "label": "OpenRouter · Llama 3.3 70B",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "meta-llama/llama-3.3-70b-instruct",
+    },
+    {
+        "key": "openrouter-llama-4-scout",
+        "label": "OpenRouter · Llama 4 Scout",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "meta-llama/llama-4-scout",
+    },
+    {
+        "key": "openrouter-deepseek",
+        "label": "OpenRouter · DeepSeek V4 Flash",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "deepseek/deepseek-v4-flash",
+    },
+    {
+        "key": "openrouter-gemini-lite",
+        "label": "OpenRouter · Gemini 3.1 Flash Lite",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "google/gemini-3.1-flash-lite",
+    },
+    # 2026-05-10 PM: Nemotron 3 Super (DeepInfra/bf16) — current
+    # production primary after bench showed 10× speedup over mimo.
+    {
+        "key": "openrouter-nemotron-3-super",
+        "label": "OpenRouter · Nemotron 3 Super 120B (DeepInfra/bf16)",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "nvidia/nemotron-3-super-120b-a12b",
+    },
 ]
 
 
