@@ -677,7 +677,17 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
 # Nemotron: Boris explicit choice — DeepInfra/bf16 (а не fp8 / другие
 # DeepInfra варианты). Бенч 2026-05-10 проводился именно на этом backend'е.
 _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
-    "openrouter-nemotron-3-super": {"provider": {"order": ["DeepInfra/bf16"]}},
+    # 2026-05-11: `order` оказался preference, не forced — OpenRouter
+    # роутил на DekaLLM (нестабильный, 1.9-253 t/s spread) когда
+    # DeepInfra/bf16 был busy. Меняем на `only` + allow_fallbacks=False
+    # чтобы гарантировать DeepInfra/bf16 или 5xx (после которой langchain
+    # автоматом перейдёт на mimo fallback chain).
+    "openrouter-nemotron-3-super": {
+        "provider": {
+            "only": ["DeepInfra/bf16"],
+            "allow_fallbacks": False,
+        },
+    },
 }
 
 

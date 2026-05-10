@@ -191,7 +191,16 @@ PROVIDERS = [
         "api_key": _openrouter_key(),
         "model": "nvidia/nemotron-3-super-120b-a12b",
         "price_in": 0.09, "price_out": 0.45,
-        "extra_body": {"provider": {"order": ["DeepInfra/bf16"]}},
+        # 2026-05-11: `order` это preference (fallback на любой если занят);
+        # `only`+allow_fallbacks=False — жёсткий pin (либо тот провайдер,
+        # либо ошибка). Bench работал на `order` потому что DeepInfra/bf16
+        # был свободен; на проде роуталось на DekaLLM (1.9-253 t/s spread).
+        "extra_body": {
+            "provider": {
+                "only": ["DeepInfra/bf16"],
+                "allow_fallbacks": False,
+            },
+        },
     },
 ]
 
