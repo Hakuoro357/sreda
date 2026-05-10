@@ -197,7 +197,7 @@ PROVIDERS = [
         # был свободен; на проде роуталось на DekaLLM (1.9-253 t/s spread).
         "extra_body": {
             "provider": {
-                "only": ["DeepInfra/bf16"],
+                "only": ["deepinfra/bf16"],  # lowercase slug
                 "allow_fallbacks": False,
             },
         },

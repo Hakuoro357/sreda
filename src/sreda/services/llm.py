@@ -684,7 +684,7 @@ _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
     # автоматом перейдёт на mimo fallback chain).
     "openrouter-nemotron-3-super": {
         "provider": {
-            "only": ["DeepInfra/bf16"],
+            "only": ["deepinfra/bf16"],  # 2026-05-11: lowercase slug per OpenRouter API (was PascalCase → NotFoundError)
             "allow_fallbacks": False,
         },
     },
