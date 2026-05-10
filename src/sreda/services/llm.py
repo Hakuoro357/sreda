@@ -687,6 +687,14 @@ _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
             "only": ["deepinfra/bf16"],  # 2026-05-11: lowercase slug per OpenRouter API (was PascalCase → NotFoundError)
             "allow_fallbacks": False,
         },
+        # 2026-05-11: Nemotron has reasoning ON by default. Probe trace
+        # 2026-05-10 21:15 (Boris reminder request) showed model burned
+        # 1173 reasoning_tokens, then dropped to default English greeting
+        # «Hello! 👋 How can I help you today?» without calling
+        # schedule_reminder. With reasoning OFF, Nemotron makes correct
+        # tool call (schedule_reminder with proper args) in 64 completion
+        # tokens. Soul-v3 + reasoning OFF = production-ready combo.
+        "reasoning": {"enabled": False},
     },
 }
 

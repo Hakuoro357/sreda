@@ -200,6 +200,9 @@ PROVIDERS = [
                 "only": ["deepinfra/bf16"],  # lowercase slug
                 "allow_fallbacks": False,
             },
+            # 2026-05-11: Nemotron reasoning ON eats 1000+ tokens and
+            # drops to English greeting on complex requests. OFF = clean.
+            "reasoning": {"enabled": False},
         },
     },
 ]
