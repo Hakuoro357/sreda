@@ -1384,12 +1384,21 @@ _TOOL_DISCIPLINE_ADDENDUM = """\
 - БАТЧИРУЙ независимые tool_calls ПАРАЛЛЕЛЬНО в ОДНОМ ходе. Если тебе нужно сходить в 5 URL'ов / искать 3 источника / удалить 4 пункта чек-листа / создать 3 напоминания — отправь ВСЕ tool_calls в ОДНОЙ tool_calls array (за один ход), а не по одному в разных итерациях. Параллельный батч исполняется одновременно — пользователь ждёт ~5 секунд вместо 25. Применяй когда вызовы НЕ зависят друг от друга (один не использует результат другого). Примеры правильного батча: ``[fetch_url(A), fetch_url(B), fetch_url(C)]`` для исследования, ``[delete_checklist_item(id1), delete_checklist_item(id2), delete_checklist_item(id3)]`` для массового удаления, ``[web_search(q1), fetch_url(known_url)]`` для смешанного ресёрча. НЕ батчить когда есть зависимость: сначала search → потом fetch_url по найденной ссылке — это два хода.
 - Реминдеры (`schedule_reminder`) всегда требуют RRULE для повторов: «каждый день в 9:00 MSK» = ``recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0"`` (UTC!). Не отвечай «настроила» без реального вызова tool с правильным RRULE.
 
-ЗАПРЕЩЕНО упоминать внутреннюю механику пользователю. Юзер видит ассистента, не код. Нельзя:
-- Говорить «вызвала tool», «tool_call», «функция», «API», «schedule_reminder», «add_checklist_items», «retry», «итерация», «системный промпт», «контекст».
-- Объяснять что именно ты «сейчас сделаешь» в технических терминах. Не «я вызову создание чек-листа» → правильно «создаю список».
+КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО упоминать внутреннюю механику пользователю. Никогда. Ни при каких обстоятельствах. Юзер видит ассистента, не код. Нельзя:
+- Говорить «вызвала tool», «tool_call», «функция», «API», «retry», «итерация», «системный промпт», «контекст».
+- Произносить имена tools: schedule_reminder, list_menu, list_shopping, search_recipes, save_recipe, save_recipes_batch, plan_week_menu, add_shopping_items, remove_shopping_items, mark_shopping_bought, update_menu_item, create_checklist, add_checklist_items, recall_memory, save_core_fact, save_episode, get_weather, web_search, fetch_url, log_unsupported_request — и любые другие.
+- Объяснять что ты «сейчас сделаешь» в технических терминах. Не «я вызову создание чек-листа» / «вызову list_menu» / «сейчас посмотрю что у тебя в `list_menu`» → правильно «сейчас гляну меню».
 - Извиняться за внутренние ошибки в технических терминах. «Не сработал tool» → правильно «не получилось — переформулируй, пожалуйста».
 - Раскрывать имена функций, идентификаторы (``checklist_xxx``, ``rem_xxx``), содержимое tool-result'ов с raw технической информацией.
-Юзеру важен результат, а не как ты его получила. Говори о действиях по-человечески: «создала список», «отметила купленным», «напоминание поставлено», «нашла в книге рецептов» — без упоминания tool-call'ов.
+- НИКОГДА не симулируй tool-call в текстовом ответе. Если решила выполнить действие — отправь tool_call через JSON-канал и дождись результата. Запрещены фразы-симуляторы: «Сейчас вызову X», «(Выполняю X…)», «Подожди секунду, проверю…», «Получила ответ:» с придуманным результатом, «Вызвала X — он вернул Y», «Сейчас обращусь к функции X». Если tool ещё не вызван — НЕ пиши пользователю «секунду, смотрю». Просто вызови tool через JSON tool_calls API и дождись настоящего результата перед текстовым ответом.
+
+Юзеру важен результат, а не как ты его получила. Говори о действиях по-человечески: «создала список», «отметила купленным», «напоминание поставлено», «нашла в книге рецептов», «гляну меню», «загляну в покупки» — без упоминания имён tool-call'ов, без симуляции их в тексте, без пояснений «секунду подожди».
+
+ОБРАЗЕЦ ПРАВИЛЬНОГО ПОВЕДЕНИЯ (запрос «составь меню на сегодня»):
+- WRONG: «Хорошо, сейчас посмотрю твое меню. Вызову list_menu, чтобы увидеть, что запланировано. Подожди секунду… (Выполняю list_menu…) Получила ответ: меню не найдено. Хочешь, чтобы я составила меню с нуля?»
+- RIGHT: [JSON tool_call: list_menu()] → [tool_result: empty] → ТОЛЬКО ТЕПЕРЬ текст: «На сегодня меню ещё не составлено. Хочешь, сделаю с нуля? Скажи, кто будет есть и какие у вас ограничения по еде.»
+
+Разница: WRONG версия рассказывает про процесс в content; RIGHT версия использует JSON-канал для tool-call и отдаёт юзеру ТОЛЬКО финальный осмысленный текст.
 """
 
 
@@ -2611,6 +2620,7 @@ def execute_conversation_chat(
         _is_provider_refusal(text)
         or _is_predominantly_non_russian(text)
         or _is_reasoning_leak_after_tool(text, called_tools)
+        or _mentions_tool_internals(text)
     ):
         logger.warning(
             "CHAT_PROVIDER_REFUSAL tenant=%s feature=%s original_chars=%d original_first=%r",
@@ -2740,6 +2750,86 @@ def _is_synthetic_fallback_reply(text: str) -> bool:
     # без матчинга на любой текст начинающийся со «Прости».
     if stripped.startswith(_REFUSAL_SUBSTITUTE_MESSAGE[:25]):
         return True
+    return False
+
+
+# 2026-05-11 (Boris explicit request after Nemotron incident):
+# Список production tool names — детектируется в bot reply как
+# нарушение _TOOL_DISCIPLINE. Модель прямо нарушила правило,
+# написав «Вызову list_menu... (Выполняю list_menu…) Получила ответ:
+# меню не найдено». Имена tools в content = leak внутренней механики,
+# substitution required.
+_TOOL_NAMES_SET: frozenset[str] = frozenset({
+    # housewife
+    "schedule_reminder", "cancel_reminder", "update_reminder",
+    "attach_reminder", "detach_reminder", "list_reminders",
+    "list_menu", "plan_week_menu", "update_menu_item",
+    "generate_shopping_from_menu", "clear_menu",
+    "list_shopping", "add_shopping_items", "remove_shopping_items",
+    "mark_shopping_bought", "update_shopping_item",
+    "update_shopping_items_category", "clear_bought_shopping",
+    "search_recipes", "save_recipe", "save_recipes_batch",
+    "delete_recipe",
+    "add_family_members", "update_family_member", "remove_family_member",
+    "add_task", "update_task", "complete_task", "uncomplete_task",
+    "cancel_task", "delete_task", "list_tasks",
+    "create_checklist", "add_checklist_items",
+    "move_task_to_checklist", "mark_checklist_item_done",
+    "delete_checklist_item", "archive_checklist",
+    # generic
+    "recall_memory", "save_core_fact", "save_episode",
+    "get_weather", "web_search", "fetch_url",
+    "log_unsupported_request",
+    "reply_with_buttons",
+})
+
+
+# Process-simulation phrases: модель имитирует tool-вызов в content
+# вместо реального JSON tool_calls. См. negative examples в
+# _TOOL_DISCIPLINE_ADDENDUM (после Nemotron incident 2026-05-11).
+_TOOL_SIMULATION_PATTERNS: tuple[str, ...] = (
+    "вызову ",       # "Сейчас вызову list_menu"
+    "вызываю ",      # "Вызываю функцию X"
+    "выполняю ",     # "(Выполняю list_menu…)"
+    "обращусь к функ",
+    "обращаюсь к функ",
+    "(выполняю",
+    "(вызываю",
+    "получила ответ:",
+    "получила ответ от",
+    "вернул ответ:",
+    "вернула ответ:",
+    "tool вернул",
+    "tool вернула",
+    "функция вернула",
+    "функция вернул",
+    "сейчас посмотрю что у тебя в",  # specifically «в list_menu» / «в shopping»
+)
+
+
+def _mentions_tool_internals(text: str) -> bool:
+    """Detect tool-name mentions or process-simulation phrases in bot reply.
+
+    2026-05-11 (Boris explicit request): после Nemotron incident прод-reply
+    содержал «Вызову list_menu, чтобы увидеть, что запланировано. (Выполняю
+    list_menu…) Получила ответ: меню не найдено». Это нарушение
+    _TOOL_DISCIPLINE — юзер видит internal mechanics. Substitution required.
+
+    Trigger conditions:
+    1. Любое вхождение known tool name в text (case-insensitive).
+    2. Любое substring match с _TOOL_SIMULATION_PATTERNS.
+    """
+    if not text:
+        return False
+    lower = text.lower()
+    # Tool name mentions — fast set check
+    for name in _TOOL_NAMES_SET:
+        if name in lower:
+            return True
+    # Process-simulation patterns
+    for pattern in _TOOL_SIMULATION_PATTERNS:
+        if pattern in lower:
+            return True
     return False
 
 
