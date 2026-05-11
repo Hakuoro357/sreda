@@ -2907,6 +2907,21 @@ _CJK_PATTERN = re.compile(
 )
 _MD_BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _MD_UNDERLINE_PATTERN = re.compile(r"__(.+?)__", re.DOTALL)
+# 2026-05-11 (incident user_tg_1089832184): mimo выдала «*Как искать:*»
+# и «* Тип дела:» (single-asterisk italic + markdown bullet). Telegram
+# MAX без parse_mode рендерит звёздочки как есть — юзер видит лишний
+# `*`. Old sanitizer ловил только `**bold**`. Расширяем:
+#
+# `_MD_ITALIC_PATTERN`: одиночные `*text*` italic. Content не должен
+# начинаться/заканчиваться whitespace или `*` — чтобы не матчить
+# bullet «* item» (space после) и арифметику «2 * 3» (space до).
+# DOTALL OFF — italic не пересекает строки.
+_MD_ITALIC_PATTERN = re.compile(r"\*([^\s\*][^\*\n]*?[^\s\*])\*")
+# `_MD_BULLET_PATTERN`: markdown bullet markers `* item` / `*   item` в
+# начале строки → заменяется на «— » (em-dash, наш канонический list-style
+# из _CORE_SYSTEM_PROMPT). Поддерживает leading indentation для nested
+# списков.
+_MD_BULLET_PATTERN = re.compile(r"^([ \t]*)\*[ \t]+", re.MULTILINE)
 
 
 # Mapping tool name → пользовательский домен (на русском). Используется
@@ -3065,7 +3080,12 @@ def _sanitize_chat_reply(text: str) -> tuple[str, dict[str, int]]:
     # lone `**` (e.g. math expressions) — requires a matching closer.
     new_text, md_count_a = _MD_BOLD_PATTERN.subn(r"\1", text)
     new_text, md_count_b = _MD_UNDERLINE_PATTERN.subn(r"\1", new_text)
-    stats["md_stripped"] = md_count_a + md_count_b
+    # 2026-05-11: single-asterisk italic + markdown bullet.
+    # Order matters: BOLD must run FIRST (strips «**x**» → «x»), then
+    # ITALIC won't false-fire on residual `**`. BULLET independent.
+    new_text, md_count_c = _MD_ITALIC_PATTERN.subn(r"\1", new_text)
+    new_text, md_count_d = _MD_BULLET_PATTERN.subn(r"\1— ", new_text)
+    stats["md_stripped"] = md_count_a + md_count_b + md_count_c + md_count_d
 
     # 2) CJK leakage. Matches any run of CJK chars and deletes it along
     # with a trailing space (avoid leaving «слово  слово» double-space).
