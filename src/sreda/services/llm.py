@@ -736,6 +736,26 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
 #
 # Nemotron: Boris explicit choice — DeepInfra/bf16 (а не fp8 / другие
 # DeepInfra варианты). Бенч 2026-05-10 проводился именно на этом backend'е.
+# 2026-05-11 PM: Per-provider temperature override. Default 0.3 (из
+# get_chat_llm signature) подходит для mimo/openrouter generic — модель
+# нормально варьирует ответы. Но reasoning-capable модели (Nemotron)
+# на 0.3 уходят в стохастические drift-режимы (English greeting,
+# tool simulation в content, reasoning leak). Probe с 0.2 работает,
+# 0.3 ломается — снижение усиливает determinism для tool dispatch.
+# Application: _build_chat_llm читает _override_temperature(provider)
+# и заменяет caller-provided value если override установлен.
+_OPENROUTER_TEMPERATURE_BY_PROVIDER: dict[str, float] = {
+    # Nemotron сильно зависит от temperature (probe 0.2 vs prod 0.3 dichotomy).
+    # 0.1 — agressive determinism для повышения tool-dispatch reliability.
+    "openrouter-nemotron-3-super": 0.1,
+}
+
+
+def _override_temperature(provider: str, default: float) -> float:
+    """Return per-provider temperature override or default."""
+    return _OPENROUTER_TEMPERATURE_BY_PROVIDER.get(provider, default)
+
+
 _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
     # 2026-05-11: `order` оказался preference, не forced — OpenRouter
     # роутил на DekaLLM (нестабильный, 1.9-253 t/s spread) когда
@@ -824,7 +844,9 @@ def _build_chat_llm(
             # override beats settings default. Lets one config hit
             # multiple targets without per-variant settings plumbing.
             model=model or override or settings.openrouter_chat_model,
-            temperature=temperature,
+            # 2026-05-11 PM: per-provider temperature override.
+            # Nemotron specifically needs lower temp (0.1) to avoid drift.
+            temperature=_override_temperature(provider, temperature),
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,
         )
