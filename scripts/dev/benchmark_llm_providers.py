@@ -205,6 +205,69 @@ PROVIDERS = [
             "reasoning": {"enabled": False},
         },
     },
+    # 2026-05-11 round 2: Boris explicit ask — kimi-k2.6 / hy3-preview /
+    # gemini-3-flash-preview. Forced fast provider routing via extra_body
+    # (mirror Nemotron pattern). Reasoning OFF на всех — Nemotron incident
+    # показал что drift modes коррелируют с reasoning ON.
+    {
+        "label": "OR/kimi-k2.6",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "moonshotai/kimi-k2.6",
+        "price_in": 0.75, "price_out": 3.50,
+        "extra_body": {
+            "provider": {"only": ["fireworks"], "allow_fallbacks": False},
+            "reasoning": {"enabled": False},
+        },
+    },
+    {
+        "label": "OR/hy3-preview",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "tencent/hy3-preview",
+        "price_in": 0.066, "price_out": 0.260,
+        "extra_body": {
+            "provider": {"only": ["siliconflow"], "allow_fallbacks": False},
+            # Hy3 supports "configurable reasoning levels: disabled/low/high".
+            "reasoning": {"enabled": False},
+        },
+    },
+    {
+        "label": "OR/gemini-3-flash-preview",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "google/gemini-3-flash-preview",
+        "price_in": 0.50, "price_out": 3.00,
+        "extra_body": {
+            "provider": {"only": ["google-ai-studio"], "allow_fallbacks": False},
+            "reasoning": {"enabled": False},
+        },
+    },
+    # 2026-05-11: Boris explicit ask — z-ai GLM-5 / GLM-5.1.
+    # 202k context, marketing page не подтверждает tool calling —
+    # узнаем через бенч (если упадёт на A.single_read = no support).
+    # Provider routing не форсируем — OR auto-picks; reasoning OFF
+    # на всякий случай (Nemotron prior).
+    {
+        "label": "OR/glm-5",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "z-ai/glm-5",
+        "price_in": 0.60, "price_out": 1.92,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
+    {
+        "label": "OR/glm-5.1",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "z-ai/glm-5.1",
+        "price_in": 0.98, "price_out": 3.08,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
 ]
 
 
