@@ -1373,6 +1373,12 @@ User: «сохрани рецепты борща, омлета, плова»
 
 Близкий человек видит больше чем то что спросили — но не давит советами.
 Это делает Среду нужной семье.
+
+ВАЖНОЕ ОГРАНИЧЕНИЕ заботы (не противоречит, дополняет):
+
+Связывай факты ТОЛЬКО из результатов tool calls в ТЕКУЩЕМ turn'е. Никогда не синтезируй stateful данные (содержимое списков, чек-листов, памяти, расписания, погоду) из контекстного окна истории без вызова read-tool в этом же turn'е. Фраза «видит больше чем спросили» относится к ЭМПАТИИ и заботливым уточнениям, НЕ к генерации/придумыванию фактов.
+
+Если тебе нужны конкретные данные (погода на день, состояние списков, чек-листов, память, расписание) — сначала tool call, потом content. Забота не даёт права додумывать факты: если данных нет в свежем tool result этого turn'а — честно скажи «сейчас гляну» (и вызови tool) или «не нашла, проверь сама?». Выдуманные пункты в списке «из заботы» — это вред, не забота.
 """
 
 
@@ -1399,6 +1405,20 @@ _TOOL_DISCIPLINE_ADDENDUM = """\
 - RIGHT: [JSON tool_call: list_menu()] → [tool_result: empty] → ТОЛЬКО ТЕПЕРЬ текст: «На сегодня меню ещё не составлено. Хочешь, сделаю с нуля? Скажи, кто будет есть и какие у вас ограничения по еде.»
 
 Разница: WRONG версия рассказывает про процесс в content; RIGHT версия использует JSON-канал для tool-call и отдаёт юзеру ТОЛЬКО финальный осмысленный текст.
+
+READ-SIDE SOURCE OF TRUTH (это новое правило, дополняет существующее про писательские действия):
+
+Нельзя сообщать пользователю текущую погоду, содержимое памяти, чек-листов, задач, напоминаний, меню, покупок, рецептов, календаря, планов кроя или любого другого сохранённого state БЕЗ соответствующего tool result в ЭТОМ ЖЕ turn'е.
+
+История беседы НЕ ЯВЛЯЕТСЯ источником правды. Что ты говорила в прошлых ходах — не факт, а контекст диалога. Если пользователь спрашивает «продолжение», «что ещё», «откуда взяла», «что висит», «что у меня записано», «какой план», «какая погода завтра» — СНАЧАЛА вызови соответствующий read-tool (`recall_memory` / `list_checklists` / `list_shopping` / `list_menu` / `search_recipes` / `list_tasks` / `list_reminders` / `get_weather`), ТОЛЬКО ПОТОМ текстовый ответ.
+
+ЗАПРЕЩЕНО без tool call в same turn:
+- Цитировать items с конкретикой («простыня 220×240, наволочки 50×70»).
+- Давать прогноз погоды на конкретный день («+14°C, без осадков»).
+- Ссылаться на источник («оттуда и взяла», «висят как pending», «в твоём списке»).
+- Перечислять прошлые факты с числами/датами/именами без `recall_memory`.
+
+Если read-tool недоступен или не нашёл — честно скажи «сейчас проверю» (и сделай tool call) ИЛИ «не нашла в твоих записях, проверь сам?» — но НЕ выдумывай содержимое. История диалога не доказывает, что данные всё ещё актуальны, и не разрешает повторять их без свежего tool result.
 """
 
 
@@ -2616,7 +2636,26 @@ def execute_conversation_chat(
     # — 966 chars, начинается русским, срывается в English thinking.
     # 30% threshold (generic) тоже бы поймал, но 50% threshold с tool
     # context ловит более тонкие случаи.
-    if (
+    # 2026-05-11 (Codex CRITICAL): weather-specific guard. Check BEFORE
+    # the generic refusal block so weather hallucinations get a more
+    # informative substitute («не смогла проверить погоду») instead of
+    # the generic "попробуй переформулировать". Production case 16:18:
+    # user asked «Какая погода на Сходне 17 числа», bot fabricated 6-day
+    # forecast with +14°C/+18°C — get_weather NOT called.
+    if _is_weather_hallucination(user_text, text, called_tools):
+        logger.warning(
+            "CHAT_WEATHER_HALLUCINATION tenant=%s feature=%s original_chars=%d "
+            "user_text=%r reply_first=%r called_tools=%s",
+            action.tenant_id, feature_key, len(text),
+            user_text[:80], text[:80], sorted(called_tools),
+        )
+        with trace.step(
+            "chat.weather_hallucination_substituted",
+            original_chars=len(text),
+        ):
+            pass
+        text = _WEATHER_HALLUCINATION_SUBSTITUTE
+    elif (
         _is_provider_refusal(text)
         or _is_predominantly_non_russian(text)
         or _is_reasoning_leak_after_tool(text, called_tools)
@@ -2718,6 +2757,100 @@ def _is_provider_refusal(text: str) -> bool:
         return False
     lower = text.lower().strip()
     return any(p in lower for p in _PROVIDER_REFUSAL_PATTERNS)
+
+
+# 2026-05-11 (Codex CRITICAL on user_tg_755682022 incident): weather-
+# specific runtime guard. На проде 16:18 модель выдала «В воскресенье
+# 17 мая в Сходне будет +14°C, без осадков, +18°C днём» БЕЗ вызова
+# get_weather — system prompt уже обязывает звать tool, но prompt-only
+# недостаточно. Этот guard ловит спец-случай: текст с weather facts +
+# user asked про погоду + tool НЕ вызван → substitute.
+#
+# Контракт:
+#   user_text contains weather keywords (погода/температура/прогноз/...)
+#   AND reply contains weather facts (temperature, осадки) AND
+#   get_weather NOT in called_tools → substitute.
+_WEATHER_USER_KEYWORDS = (
+    "погод", "температур", "осадк", "дождь", "снег",
+    "ветер", "прогноз", "градус", "облачн",
+)
+# Two-tier weather detection (Codex+Xiaomi r2 impl review consensus):
+#
+# `_WEATHER_REPLY_PATTERN` — broad: temperature OR forecast phrasing.
+# Matches cooking «220°C» too. Used together with `_user_asked_about_weather`
+# gate to avoid cooking false-positives.
+#
+# `_WEATHER_STRONG_MARKER_PATTERN` — narrow: phrases that effectively
+# only appear in real forecasts (precipitation / time-of-day + temp /
+# explicit «прогноз»/«температура воздуха»). Cooking instructions
+# don't naturally contain «без осадков» или «днём +18°C». Used for
+# user_text-bypass path (catches follow-up «А 18-го?» где user_text
+# не содержит keyword).
+#
+# Charset `[+\-−]?` вместо `\+?\-?` covers ASCII + Unicode minus.
+_WEATHER_REPLY_PATTERN = re.compile(
+    r"(?:[+\-−]?\d+\s*°[cс]"
+    r"|[+\-−]?\d+\s*градус"
+    r"|без осадков|с осадками|дождь будет|снег будет"
+    r"|облачно с прояснен|переменная облачн"
+    r"|температура (?:воздуха )?(?:около |от )?[+\-−]?\d+"
+    r"|(?:днём|утром|вечером|ночью)\s+[+\-−]?\d+\s*(?:°[cс]|градус))",
+    re.IGNORECASE,
+)
+_WEATHER_STRONG_MARKER_PATTERN = re.compile(
+    r"(?:без осадков|с осадками|дождь будет|снег будет"
+    r"|облачно с прояснен|переменная облачн"
+    r"|температура воздуха"
+    r"|(?:днём|утром|вечером|ночью)\s+[+\-−]?\d+\s*(?:°[cс]|градус)"
+    r"|прогноз погоды|синоптик)",
+    re.IGNORECASE,
+)
+_WEATHER_HALLUCINATION_SUBSTITUTE = (
+    "Не смогла проверить погоду — попробуй переспросить через минуту."
+)
+
+
+def _user_asked_about_weather(user_text: str) -> bool:
+    if not user_text:
+        return False
+    low = user_text.lower()
+    return any(kw in low for kw in _WEATHER_USER_KEYWORDS)
+
+
+def _reply_has_weather_facts(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_WEATHER_REPLY_PATTERN.search(text))
+
+
+def _is_weather_hallucination(
+    user_text: str, reply: str, called_tools: set[str],
+) -> bool:
+    """True if reply contains weather facts but get_weather wasn't
+    called this turn — i.e. forecast/temperature is fabricated.
+
+    Two-track decision (Codex+Xiaomi r2 impl review):
+      1. Reply contains STRONG weather marker (без осадков / днём +X°C
+         / температура воздуха / прогноз) → fire regardless of user_text.
+         These phrases don't appear in cooking / lab / chemistry.
+      2. Reply contains plain temperature/forecast pattern AND user
+         asked про погоду → fire. user_text gate avoids cooking FP
+         («разогрей до +180°C, потом до +160°C»).
+
+    Multi-temperature-without-strong-marker (e.g. recipe «220°C → 180°C»)
+    no longer bypasses user_text gate — see r2 cooking FP fix.
+    """
+    if "get_weather" in called_tools:
+        return False
+    if not reply:
+        return False
+    # Path 1: strong forecast marker present — clearly weather, fire.
+    if _WEATHER_STRONG_MARKER_PATTERN.search(reply):
+        return True
+    # Path 2: plain temperature/forecast pattern, gate by user_text.
+    if _WEATHER_REPLY_PATTERN.search(reply) and _user_asked_about_weather(user_text):
+        return True
+    return False
 
 
 # 2026-05-11 (Codex+Xiaomi r1 CRITICAL): synthetic fallback texts that

@@ -480,6 +480,113 @@ _SELF_CLAIMING_NO_TOOL: frozenset[str] = frozenset({
 })
 
 
+# 2026-05-11 (Codex+Xiaomi consensus on user_tg_755682022 incident):
+# READ-side claim detection. Production turns 16:18-16:33 — модель
+# зацитировала «у тебя в чек-листе X», «оттуда и взяла», прогноз
+# погоды +14°C на 17 мая, детальный план кроя с размерами 220×240 —
+# всё БЕЗ соответствующего read-tool в same turn (called_tools=[]).
+#
+# Контракт Pass 4 в detect_unbacked_claim:
+#   verb match (read-citation phrase) + object match (domain noun)
+#   + expected read-tool NOT in called_tools → unbacked.
+#
+# Verb list — specific citation phrases, не generic verbs. «есть»/
+# «вижу» одни не fire'ят (слишком много benign occurrences). Phrase
+# «у тебя в», «висят как», «оттуда» — typical reference-to-state.
+_READ_CLAIM_VERBS: tuple[str, ...] = (
+    "взяла из", "взял из", "взяла оттуда", "взял оттуда",
+    "нашла в", "нашёл в", "нашел в",
+    "прочитала", "прочитал",
+    "вижу в", "вижу что",
+    "есть в твоём", "есть в твоем", "есть в твоей",
+    "висят в", "висят как", "висит как",
+    "отмечен как", "отмечена как", "отмечены как",
+    "помечен как", "помечена как", "помечены как",
+    "по записям", "по памяти",
+    "в моей памяти", "в твоей памяти",
+    "у тебя в", "у меня записан",
+    "я помню что", "помню что у тебя",
+    "по плану", "из плана",
+    "оттуда и взяла", "оттуда и взял", "оттуда взяла",
+    "в твоём списке", "в твоем списке", "в твоей книг",
+    "в нашей памяти", "в нашем списке",
+)
+
+
+# 2026-05-11: object → expected read-tool. Чек: если verb match +
+# object match → category determines какой tool ДОЛЖЕН был быть
+# вызван. Если ни один из expected tools НЕ в called_tools — unbacked.
+#
+# Substrings проверяются в порядке specificity (длинные первыми).
+# Каждый entry — (substring, frozenset of expected read-tool names).
+_READ_OBJECT_TO_TOOL: tuple[tuple[str, frozenset[str]], ...] = (
+    # Cutting plan / checklists — stored as checklists or memory.
+    # Все падежи «план кроя»: nom «план кро», instr «плану кро»,
+    # gen «плана кро», loc «плане кро».
+    ("план кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
+    ("плану кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
+    ("плана кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
+    ("плане кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
+    # Checklist. Codex r2 #2: bare «пункт» dropped — false-positives
+    # on «пункт назначения», «сборный пункт», «пункт повестки» where
+    # nothing checklist-related is claimed. Чек-лист/чеклист/чек лист
+    # сами по себе достаточный discriminator.
+    ("чек-лист", frozenset({"list_checklists", "show_checklist"})),
+    ("чеклист", frozenset({"list_checklists", "show_checklist"})),
+    ("чек лист", frozenset({"list_checklists", "show_checklist"})),
+    # Memory
+    ("памят", frozenset({"recall_memory"})),
+    ("в записях", frozenset({"recall_memory"})),
+    ("записан", frozenset({"recall_memory"})),
+    # Shopping — «покуп» — discriminating marker (покрывает все
+    # падежи: «покупки/покупок/покупкам/покупка»). Должен идти
+    # ПЕРЕД generic «в списк», иначе generic match-нёт первым и
+    # засчитает list_menu как достаточный backing для shopping
+    # claim. (Codex+Xiaomi consensus on impl review 2026-05-11.)
+    ("покуп", frozenset({"list_shopping"})),
+    # Generic «в списк» — fallback для cases без «покуп» (мог быть
+    # menu или checklist). Намеренно accepts list_shopping ИЛИ
+    # list_menu — нет способа без context'а сказать который.
+    ("в списк", frozenset({"list_shopping", "list_menu"})),
+    # Menu
+    ("в меню", frozenset({"list_menu"})),
+    ("меню на", frozenset({"list_menu"})),
+    # Recipes
+    ("в книг", frozenset({"search_recipes", "list_recipes"})),
+    ("рецепт", frozenset({"search_recipes", "list_recipes"})),
+    # Tasks
+    ("задач", frozenset({"list_tasks"})),
+    ("в расписан", frozenset({"list_tasks"})),
+    ("в календар", frozenset({"list_tasks"})),
+    # Reminders
+    ("напомина", frozenset({"list_reminders"})),
+    # Weather (special — different verbs, see detect_unbacked_claim
+    # weather-specific path in handlers.py _sanitize_chat_reply).
+    ("погод", frozenset({"get_weather"})),
+    ("температур", frozenset({"get_weather"})),
+    ("прогноз", frozenset({"get_weather"})),
+    # Family
+    ("семь", frozenset({"recall_memory"})),
+)
+
+
+# 2026-05-11 (Codex+Xiaomi r2 impl review): question-skip heuristic
+# для Pass 4 read-side detector. Если "?" появляется в окне N chars
+# ПОСЛЕ verb match — считаем форму вопросительной (бот спрашивает
+# юзера), не lying citation, skip.
+#
+# Tradeoffs:
+#   - 30 chars: пропускает legitimate cite с follow-up «...— хочешь?»
+#     дальше 30 chars от verb. Tight = false-negative risk (claims
+#     прокатывают как questions).
+#   - 40 chars (current): balance. Production case "У тебя в списке
+#     покупок есть мясо?" (34 chars) → skip; "Нашла в книге рецептов
+#     X и Y — хочешь?" ("?" at 63 chars) → don't skip → fire correctly.
+#   - 80+ chars: catches almost any "?" в reply — true-positive
+#     citations прокатывают если есть следующее любой вопрос.
+_READ_QUESTION_SKIP_WINDOW = 40
+
+
 def _identify_claim_category(window: str) -> str | None | bool:
     """Identify the category of side-effect claimed in the window.
 
@@ -594,6 +701,34 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
             expected_tools = _CATEGORY_TO_TOOLS.get(category, frozenset())
             if not (called_tools & expected_tools):
                 return True
+    # Pass 4 (2026-05-11, Codex+Xiaomi consensus): READ-side citation
+    # claims. Production incident user_tg_755682022 — модель цитировала
+    # «у тебя в чек-листе X», «оттуда взяла», +14°C на 17 мая БЕЗ
+    # соответствующего read-tool (called_tools=[]). Pass 1-2 ловили
+    # только WRITE-side claims («сохранила/поставлю»).
+    #
+    # Контракт: read-verb citation phrase + object (domain noun) в окне
+    # → expected read-tool ДОЛЖЕН быть в called_tools. Если нет — unbacked.
+    for verb in _READ_CLAIM_VERBS:
+        start = 0
+        while True:
+            verb_idx = low.find(verb, start)
+            if verb_idx < 0:
+                break
+            start = verb_idx + len(verb)
+            # Skip question/offer context: «у тебя в списке есть мясо?»
+            # — это вопрос бота юзеру, не lying claim. См. constant
+            # `_READ_QUESTION_SKIP_WINDOW` для tradeoffs.
+            after = low[verb_idx: verb_idx + _READ_QUESTION_SKIP_WINDOW]
+            if "?" in after:
+                continue
+            # Find matching object in window around verb.
+            window = low[max(0, verb_idx - 30): verb_idx + 150]
+            for obj, expected_tools in _READ_OBJECT_TO_TOOL:
+                if obj in window:
+                    if not (called_tools & expected_tools):
+                        return True
+                    break  # object matched + tool called → OK, next verb
     return False
 
 

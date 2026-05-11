@@ -362,3 +362,92 @@ def test_pozvonit_infinitive_does_not_fire() -> None:
         detect_unbacked_claim(text, called_tools={"schedule_reminder"})
         is False
     )
+
+
+# --------------------------------------------------------------------
+# Pass 4 (2026-05-11): READ-side citation claims
+# Production incident user_tg_755682022 16:18-16:33 — модель цитировала
+# «у тебя в чек-листе X», «оттуда взяла», прогноз погоды +14°C без
+# соответствующих read-tool calls. См. Codex+Xiaomi consensus review.
+# --------------------------------------------------------------------
+
+
+def test_read_claim_checklist_cite_without_tool_fires() -> None:
+    """Production case 16:33: «висят как незавершённые в чек-листе»
+    без list_checklists/show_checklist — должно сработать."""
+    text = (
+        "Они висят как незавершённые пункты в чек-листе «План кроя». "
+        "Видимо, ты их уже сделала, просто не закрыла."
+    )
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_read_claim_checklist_cite_with_tool_passes() -> None:
+    """Тот же текст, но show_checklist был реально вызван — OK."""
+    text = (
+        "Они висят как незавершённые пункты в чек-листе «План кроя»."
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is False
+    )
+
+
+def test_read_claim_ottuda_vzyala_without_tool_fires() -> None:
+    """Production case 16:33: «оттуда и взяла» — direct false source cite."""
+    text = (
+        "В памяти помечены как выполненные, но в чек-листе висят как "
+        "pending. Оттуда и взяла."
+    )
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_read_claim_u_tebya_v_spiske_without_tool_fires() -> None:
+    """«у тебя в списке X» без list_shopping — fabricated cite."""
+    text = "У тебя в списке покупок только молоко, хлеб и яйца."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_read_claim_u_tebya_v_spiske_with_tool_passes() -> None:
+    """Та же фраза с list_shopping в called_tools — OK."""
+    text = "У тебя в списке покупок только молоко, хлеб и яйца."
+    assert (
+        detect_unbacked_claim(text, called_tools={"list_shopping"})
+        is False
+    )
+
+
+def test_read_claim_v_pamiati_without_tool_fires() -> None:
+    """«В моей памяти записано...» без recall_memory — claim о памяти."""
+    text = "В моей памяти записано, что ты планировала закончить крой к пятнице."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_read_claim_question_does_not_fire() -> None:
+    """«У тебя в списке есть мясо?» — это вопрос юзера/боту, не cite.
+    Должно НЕ срабатывать (skip question context)."""
+    text = "У тебя в списке покупок есть мясо?"
+    # Verb-like phrase «у тебя в» + question mark in close window → skip.
+    # NOTE: bot не должен задавать такой вопрос (он сам должен проверить),
+    # но если задаёт — это не lying claim, false-positive здесь хуже.
+    assert detect_unbacked_claim(text, called_tools=set()) is False
+
+
+def test_read_claim_po_planu_without_tool_fires() -> None:
+    """«По плану у тебя три раскроя» без list_checklists/recall_memory."""
+    text = "По плану кроя у тебя три позиции остались: простыня 220×240, наволочки 50×70."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_read_claim_v_knige_recipes_without_tool_fires() -> None:
+    """«В книге рецептов у тебя борщ и омлет» без search_recipes."""
+    text = "Нашла в твоей книге рецептов борщ и омлет — хочешь приготовить?"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_read_claim_v_knige_recipes_with_tool_passes() -> None:
+    text = "Нашла в твоей книге рецептов борщ и омлет."
+    assert (
+        detect_unbacked_claim(text, called_tools={"search_recipes"})
+        is False
+    )
