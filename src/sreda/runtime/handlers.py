@@ -2878,12 +2878,31 @@ def _is_predominantly_non_russian(text: str, threshold: float = 0.3) -> bool:
 # leak we've seen is exclusively Chinese from the MiMo v2.5 model.
 _CJK_PATTERN = re.compile(
     "["  # character class
+    # CJK family (original 2026-04-23 \u2014 mimo Xiaomi training leak)
     "\u3040-\u309f"  # hiragana
     "\u30a0-\u30ff"  # katakana
     "\u3400-\u4dbf"  # CJK ext A
     "\u4e00-\u9fff"  # CJK unified
     "\uac00-\ud7af"  # hangul syllables
     "\uf900-\ufaff"  # CJK compat
+    # 2026-05-11: expand to other LLM-corpus leak scripts.
+    # Incident user_tg_1089832184 2026-05-10 18:51 \u2014 mimo \u0432\u044b\u0434\u0430\u043b\u0430 reply
+    # \u0441 \u0442\u0430\u0439\u0441\u043a\u0438\u043c\u0438 \u0433\u043b\u0438\u0444\u0430\u043c\u0438 \u00ab\u0e42\u0e06\u0e42\u0e06\u00bb + \u0441\u043c\u0435\u0441\u044c\u044e \u0438\u0432\u0440\u0438\u0442/\u0430\u0440\u0430\u0431\u0441\u043a\u0438\u0445 \u0441\u0438\u043c\u0432\u043e\u043b\u043e\u0432
+    # \u00abh\u1ee3\u05d9\u05d7\u05d4\u00bb \u0432 content. \u0421\u0442\u0430\u0440\u044b\u0439 regex \u043d\u0435 \u043f\u043e\u043a\u0440\u044b\u0432\u0430\u043b \u2192 leak \u0434\u043e\u0448\u0451\u043b \u0434\u043e \u044e\u0437\u0435\u0440\u0430.
+    "\u0590-\u05ff"  # Hebrew
+    "\u0600-\u06ff"  # Arabic
+    "\u0700-\u074f"  # Syriac
+    "\u0900-\u097f"  # Devanagari (Hindi/Sanskrit)
+    "\u0980-\u09ff"  # Bengali
+    "\u0a00-\u0a7f"  # Gurmukhi
+    "\u0a80-\u0aff"  # Gujarati
+    "\u0e00-\u0e7f"  # Thai
+    "\u0e80-\u0eff"  # Lao
+    "\u0f00-\u0fff"  # Tibetan
+    "\u1000-\u109f"  # Myanmar
+    "\u10a0-\u10ff"  # Georgian
+    "\u1100-\u11ff"  # Hangul Jamo (extra hangul)
+    "\u1200-\u137f"  # Ethiopic
     "]+"
 )
 _MD_BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
