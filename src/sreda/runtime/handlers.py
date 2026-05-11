@@ -1635,6 +1635,15 @@ def _load_chat_history(
             bot_text = "\n".join(bot_parts)
             if not bot_text:
                 continue
+            # 2026-05-11 (Codex+Xiaomi r1 CRITICAL): history sanitization.
+            # Refusal-substituted и empty-reply fallback texts — это наши
+            # synthetic injections, не оригинальные LLM-replies. Когда
+            # они попадают в conversation history, модель учится паттерну
+            # «user asks → bot refuses». Production incident 2026-05-10:
+            # 21:15 substituted reply → 21:23-21:24 Nemotron 3 turns
+            # подряд обещал reminder без tool calls.
+            if _is_synthetic_fallback_reply(bot_text):
+                continue
             turns.append(
                 (
                     _truncate_turn_text(user_text),
@@ -2566,7 +2575,7 @@ def execute_conversation_chat(
                 tool_count,
                 last_tools,
             )
-            text = "..."
+            text = _EMPTY_REPLY_FALLBACK
     # Sanitise before handing off to Telegram delivery. Two issues
     # observed 2026-04-23 on MiMo v2.5:
     #   1) Model emits GitHub-Markdown bold «**text**». Telegram is
@@ -2589,7 +2598,20 @@ def execute_conversation_chat(
     # was considered high risk» как content (in_tok=0/out_tok=0 — pre-canned
     # safety message). Если оставить — юзер видит непонятный английский
     # reject. Detect + substitute с русским generic fallback.
-    if _is_provider_refusal(text) or _is_predominantly_non_russian(text):
+    #
+    # 2026-05-11 (Xiaomi r1 MINOR): дополнительная тонкая проверка
+    # `_is_reasoning_leak_after_tool` — длинный reply (>300 chars) после
+    # tool call с cyrillic <50% = reasoning leak. Эта проверка ловит
+    # FM3 production case (trace 10d4256e3c1d47ed): «У тебя пока нет
+    # сохранённых рецепт? Or maybe they're new to this? Or maybe...»
+    # — 966 chars, начинается русским, срывается в English thinking.
+    # 30% threshold (generic) тоже бы поймал, но 50% threshold с tool
+    # context ловит более тонкие случаи.
+    if (
+        _is_provider_refusal(text)
+        or _is_predominantly_non_russian(text)
+        or _is_reasoning_leak_after_tool(text, called_tools)
+    ):
         logger.warning(
             "CHAT_PROVIDER_REFUSAL tenant=%s feature=%s original_chars=%d original_first=%r",
             action.tenant_id, feature_key, len(text), text[:80],
@@ -2598,10 +2620,7 @@ def execute_conversation_chat(
             "llm.refusal_substituted", original_chars=len(text),
         ):
             pass
-        text = (
-            "Прости, не получилось понять запрос. "
-            "Попробуй переформулировать или спросить иначе."
-        )
+        text = _REFUSAL_SUBSTITUTE_MESSAGE
 
     # Anti-hallucination safety net (Codex r2 CRITICAL fix, 2026-05-08).
     # Если nudge retry уже использован (_hallucination_nudged=True), и
@@ -2689,6 +2708,64 @@ def _is_provider_refusal(text: str) -> bool:
         return False
     lower = text.lower().strip()
     return any(p in lower for p in _PROVIDER_REFUSAL_PATTERNS)
+
+
+# 2026-05-11 (Codex+Xiaomi r1 CRITICAL): synthetic fallback texts that
+# our own pipeline injects as user-facing replies when the LLM produces
+# unusable output. These MUST NOT be fed back into the model history
+# on subsequent turns — otherwise the model learns the pattern
+# "user asks for action → assistant refuses" and starts mimicking it
+# (production incident 2026-05-10 21:23-21:24: Nemotron promised
+# reminders без tool calls после 21:15 substitution turn).
+_REFUSAL_SUBSTITUTE_MESSAGE = (
+    "Прости, не получилось понять запрос. "
+    "Попробуй переформулировать или спросить иначе."
+)
+_EMPTY_REPLY_FALLBACK = "..."
+
+
+def _is_synthetic_fallback_reply(text: str) -> bool:
+    """True if the bot reply text was injected by our pipeline
+    (refusal substitution or empty-reply fallback), not produced by
+    the LLM organically. Used by history loader to exclude these
+    turns from the LLM's view of conversation history.
+    """
+    if not text:
+        return True  # empty payload — not a real reply, skip
+    stripped = text.strip()
+    if stripped == _EMPTY_REPLY_FALLBACK:
+        return True
+    # Exact match on refusal substitute. Use startswith on first
+    # 25 chars чтобы tolerate trailing punctuation / whitespace
+    # без матчинга на любой текст начинающийся со «Прости».
+    if stripped.startswith(_REFUSAL_SUBSTITUTE_MESSAGE[:25]):
+        return True
+    return False
+
+
+def _is_reasoning_leak_after_tool(
+    text: str, called_tools: set[str], *, min_len: int = 300, threshold: float = 0.5,
+) -> bool:
+    """Detect reasoning-content leak in post-tool-call reply.
+
+    2026-05-11 (Xiaomi r1 MINOR): когда модель уже вызвала tool в iter.0,
+    ожидаемый iter.1 content — короткий русский confirmation (50-200 chars).
+    Если len > 300 AND cyrillic <50% — это reasoning leak (модель сорвалась
+    в English thinking в content field). Tighter threshold чем generic
+    `_is_predominantly_non_russian` (30%), потому что после tool call
+    semantic baseline уже set — короткое подтверждение на русском.
+
+    Production FM3 (trace 10d4256e3c1d47ed): «У тебя пока нет сохранённых
+    рецепт? Or maybe they're new to this?» — 966 chars, cyrillic ~20%.
+    Сработал generic guard (<30%). Но шире paттерн «короткий русский
+    старт → длинный English» поймали бы и более тонкие случаи (45% cyrillic).
+    """
+    if not text or not called_tools:
+        return False
+    if len(text) < min_len:
+        return False
+    cyrillic = sum(1 for c in text if "Ѐ" <= c <= "ӿ")
+    return (cyrillic / len(text)) < threshold
 
 
 def _is_predominantly_non_russian(text: str, threshold: float = 0.3) -> bool:

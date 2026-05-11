@@ -278,9 +278,35 @@ def log_unsupported_request(reason: str) -> str:
     return f"ok:logged:{reason[:30]}"
 
 
+# 2026-05-11: schedule_reminder + list_reminders для сценариев G/H.
+# Production несколько раз промахнулась на reminder dispatch (Nemotron
+# reasoning ON: tool вызван, English greeting в final reply substituted;
+# reasoning OFF: tools=[] на 3 turns подряд из-за history poisoning).
+# Без покрытия в бенче эти классы багов мы не отлавливаем.
+@tool
+def schedule_reminder(
+    text: str,
+    trigger_iso: str | None = None,
+    recurrence_rule: str | None = None,
+) -> str:
+    """Schedule a reminder for the user. text — what to remind, trigger_iso — UTC ISO datetime,
+    recurrence_rule — optional RRULE string for repeats."""
+    return (
+        f"ok:scheduled:reminder_id=rem_test123:"
+        f"trigger={trigger_iso}:rrule={recurrence_rule}"
+    )
+
+
+@tool
+def list_reminders() -> str:
+    """Return the user's pending reminders."""
+    return "[]"
+
+
 TOOLS = [
     list_shopping, list_menu, search_recipes, save_recipes_batch,
     delete_recipe, log_unsupported_request,
+    schedule_reminder, list_reminders,
 ]
 
 
@@ -330,6 +356,42 @@ SCENARIOS = [
         # background polling. Если ответит «готово, настроила» — fail.
         "expected_tools": ["log_unsupported_request"],
     },
+    # 2026-05-11: reminder-dispatch сценарии. Production smoke 2026-05-10
+    # выявил что Nemotron на «поставь напоминание X» иногда обещает но
+    # НЕ вызывает schedule_reminder (наш _TOOL_DISCIPLINE_ADDENDUM явно
+    # запрещает обещание без tool — но модель его игнорит). Бенч теперь
+    # покрывает 2 разновидности: clean history (G) и poisoned history (H).
+    {
+        "name": "G.schedule_reminder",
+        "user_text": (
+            "Поставь пожалуйста на завтра напоминание в 9 часов утра "
+            "размяться с гирей."
+        ),
+        # Ожидаем: schedule_reminder вызван с text + trigger_iso.
+        # Reply содержит подтверждение в стиле Среды (на русском, с эмодзи).
+        "expected_tools": ["schedule_reminder"],
+    },
+    {
+        "name": "H.poisoned_history",
+        "user_text": (
+            "Хочу завтра выпить воду в 14:00, поставь напоминание."
+        ),
+        # Заражённая история: 4 turns где бот пообещал, не вызвал tool.
+        # Реальный case с production 2026-05-10 21:23-21:24 (Boris).
+        # Модель должна РЕЗИСТИРОВАТЬ паттерну и всё равно вызвать tool.
+        "history": [
+            ("user",
+             "Поставь напоминание на завтра в 10 утра погулять с собакой"),
+            ("assistant",
+             "Хорошо, поставлю напоминание на завтра в 10:00 — погулять "
+             "с собакой. Нужно ли напоминание за сколько-то минут до? 🐕‍🦺"),
+            ("user", "Нет, за сколько ты сама обычно напоминаешь?"),
+            ("assistant",
+             "Уточняю — хочешь напомнить заранее? Например за 10/15/30 мин? "
+             "Если не нужно — скажи «без напоминания»."),
+        ],
+        "expected_tools": ["schedule_reminder"],
+    },
 ]
 
 
@@ -376,10 +438,19 @@ def _run_one_turn(provider, scenario):
     llm = ChatOpenAI(**llm_kwargs).bind_tools(TOOLS)
 
     tools_by_name = {t.name: t for t in TOOLS}
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=scenario["user_text"]),
-    ]
+    # 2026-05-11: support optional `history` field in scenario — list of
+    # (role, content) tuples that go between system and the actual user_text.
+    # Used by H.poisoned_history to simulate the prod situation where prior
+    # turns trained the model into a "promise without tool" pattern.
+    messages: list = [SystemMessage(content=SYSTEM_PROMPT)]
+    for role, content in scenario.get("history", []):
+        if role == "user":
+            messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            messages.append(AIMessage(content=content))
+        else:
+            raise ValueError(f"unknown history role: {role}")
+    messages.append(HumanMessage(content=scenario["user_text"]))
     iters = 0
     observed_tools: list[str] = []
     total_in = 0

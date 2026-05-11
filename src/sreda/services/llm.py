@@ -295,6 +295,30 @@ _CLAIM_VERBS = ("сохранил", "сохранила", "сохранено",
                 "сделано", "выполнено", "установлено", "записано",
                 "зафиксировано", "отмечено", "учтено",
                 "✅", "☑️", "☑")
+
+
+# 2026-05-11 (Codex+Xiaomi r1 на Nemotron incident): 1sg FUT/PRES
+# claim-глаголы. На проде 21:23-21:24 Nemotron 3 turns подряд писал
+# «Хорошо, поставлю напоминание», «ставлю напоминание на 09:50»
+# без tool call'а — detector не сработал, ловил только past-tense.
+#
+# В отличие от past-tense ("поставил" = факт сделал), 1sg FUT/PRES
+# часто появляется в QUESTION / OFFER формах: «Хочешь, поставлю
+# напоминание?» — это offer/вопрос, не claim. Нужен context-check.
+# Pattern fires только если предложение НЕ оканчивается на "?" в
+# окне 80 chars вокруг verb (см. detect_unbacked_claim Pass 1c).
+_CLAIM_VERBS_FUTURE: tuple[str, ...] = (
+    "поставлю", "ставлю",
+    "сохраню", "сохраняю",
+    "добавлю", "добавляю",
+    "создам", "создаю",
+    "запишу", "записываю",
+    "удалю", "удаляю",
+    "запланирую", "планирую",
+    "отмечу", "отмечаю",
+    "обновлю", "обновляю",
+    "напомню", "напоминаю",
+)
 _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в покупк",
                   "в меню", "меню на", "напомина", "семь",
                   "в твою книг", "в твой список",
@@ -506,6 +530,42 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
     for verb in _SELF_CLAIMING_NO_TOOL:
         if verb in low:
             return True
+    # Pass 1c (2026-05-11, Codex+Xiaomi r1 on Nemotron incident):
+    # 1sg FUT/PRES claim verbs ("поставлю/ставлю/добавлю/...") с
+    # category check + question-context skip. Reviewer consensus —
+    # эти формы критично покрыть, т.к. Nemotron в production 3 turns
+    # подряд писал «поставлю напоминание» без tool call'а. НО:
+    # question/offer формы («Хочешь, поставлю?») = НЕ claim. Skip
+    # если sentence ends with "?" в окне 80 chars после verb ИЛИ
+    # contains question-starter ("хочешь", "может", "если", "стоит
+    # ли", "нужно ли", "давай") в окне 30 chars до verb.
+    for verb in _CLAIM_VERBS_FUTURE:
+        start = 0
+        while True:
+            verb_idx = low.find(verb, start)
+            if verb_idx < 0:
+                break
+            start = verb_idx + len(verb)
+            # Question / offer context check.
+            before = low[max(0, verb_idx - 30): verb_idx]
+            after = low[verb_idx: verb_idx + 80]
+            if "?" in after:
+                continue  # question form — not a claim
+            if any(qs in before for qs in (
+                "хочешь", "может", "если ", "стоит ли", "нужно ли",
+                "давай ", "согласн", "ок если", "не против",
+            )):
+                continue  # offer/conditional form — not a claim
+            # Treat as claim — check category via object window.
+            window = low[max(0, verb_idx - 40): verb_idx + 120]
+            category = _identify_claim_category(window)
+            if category is False:
+                continue
+            if category is None:
+                return True
+            expected_tools = _CATEGORY_TO_TOOLS.get(category, frozenset())
+            if not (called_tools & expected_tools):
+                return True
     # Pass 2: verb + nearby object pair. Object → category mapping.
     # ⚠ Codex r3 MAJOR #1: iterate ВСЕ occurrences каждого verb'а,
     # не только первое. Иначе «Добавила в покупки. Добавила в план
@@ -694,7 +754,13 @@ _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
         # schedule_reminder. With reasoning OFF, Nemotron makes correct
         # tool call (schedule_reminder with proper args) in 64 completion
         # tokens. Soul-v3 + reasoning OFF = production-ready combo.
-        "reasoning": {"enabled": False},
+        #
+        # 2026-05-11 PM (Xiaomi r1 MAJOR): добавил max_tokens:0 как
+        # belt-and-suspenders — некоторые backend'ы обрабатывают
+        # `enabled:false` как hint, а `max_tokens:0` как hard limit
+        # на reasoning generation. Уменьшает probability reasoning
+        # leak в content field (FM3 на проде 21:42).
+        "reasoning": {"enabled": False, "max_tokens": 0},
     },
 }
 
