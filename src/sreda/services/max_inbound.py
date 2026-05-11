@@ -286,6 +286,86 @@ async def handle_max_update(
             )
             return result.inbound_message_id
 
+        # 2026-05-11 (Boris explicit Pat 2): MAX channel btn_reply handler.
+        # Mirror telegram_bot._handle_btn_reply_callback: resolve token →
+        # ack callback → mutate payload to look like text-message →
+        # downstream `dispatch_max_action` видит обычный text turn и
+        # инжектит label в action.params как user text. Single-use:
+        # `ReplyButtonService.resolve_token` помечает `used_at`, повторный
+        # клик возвращает None → toast «выбор устарел». Только для
+        # approved tenants — кнопки только им и шлются.
+        _cb_data_btn = (
+            (payload.get("callback") or {}).get("payload") or ""
+            if update_type == "message_callback"
+            else ""
+        )
+        if isinstance(_cb_data_btn, str) and _cb_data_btn.startswith("btn_reply:"):
+            from sreda.services.reply_buttons import ReplyButtonService
+            cb_token = _cb_data_btn.removeprefix("btn_reply:").strip()
+            callback_id = (payload.get("callback") or {}).get("callback_id")
+            label: str | None = None
+            if onboarding.tenant_id and onboarding.user_id and cb_token:
+                try:
+                    label = ReplyButtonService(session).resolve_token(
+                        tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        token=cb_token,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "max btn_reply token resolution failed for "
+                        "tenant=%s token=%s",
+                        onboarding.tenant_id, cb_token, exc_info=True,
+                    )
+                    label = None
+
+            if label is None:
+                # Expired / already used / wrong owner — toast + drop.
+                if callback_id and settings.max_bot_token:
+                    try:
+                        _client = MaxClient(token=settings.max_bot_token)
+                        await _client.answer_callback(
+                            str(callback_id),
+                            notification="Выбор устарел. Напиши что нужно.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "max btn_reply expired-ack failed", exc_info=True,
+                        )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
+
+            # Label resolved — ack callback с toast и мутируем payload в
+            # text-message shape. Downstream `dispatch_max_action` увидит
+            # обычный message_created и injectнет label в action.params.text.
+            if callback_id and settings.max_bot_token:
+                try:
+                    _client = MaxClient(token=settings.max_bot_token)
+                    await _client.answer_callback(
+                        str(callback_id), notification=label,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "max btn_reply ack failed (label=%r)",
+                        label, exc_info=True,
+                    )
+            # Mutate to text-message shape.
+            payload["update_type"] = "message_created"
+            _msg = payload.get("message")
+            if isinstance(_msg, dict):
+                _body = _msg.setdefault("body", {})
+                if isinstance(_body, dict):
+                    _body["text"] = label
+            payload.pop("callback", None)
+            update_type = "message_created"  # update local var for downstream
+            logger.info(
+                "max btn_reply resolved tenant=%s user=%s label=%r — "
+                "dispatching as text-message",
+                onboarding.tenant_id, onboarding.user_id, label,
+            )
+
         if not (settings.max_bot_token and onboarding.max_chat_id):
             logger.info(
                 "approved tenant %s — no MAX token/chat_id, drop "
