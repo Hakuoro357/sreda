@@ -65,6 +65,14 @@ def _openrouter_key() -> str | None:
     return first_line or None
 
 
+def _google_key() -> str | None:
+    # Google AI Studio / Vertex API key — bare key in google.txt.
+    p = Path(".secrets/google.txt")
+    if not p.exists():
+        return None
+    return p.read_text(encoding="utf-8").strip() or None
+
+
 PROVIDERS = [
     # Baseline — legacy MiMo-V2-Pro (Сяоми Preferential rate 2026-04-28:
     # 2 credits / token = $0.08/M на 1x rate, но V2-Pro был 2x → $0.16/M
@@ -346,6 +354,46 @@ PROVIDERS = [
         "extra_body": {
             "reasoning": {"enabled": False},
         },
+    },
+    # 2026-05-12: Google direct via OpenAI-compat endpoint.
+    # OR charges +5.5% markup → direct cheaper. Same pricing per Google
+    # console pricing page. Tier=Standard (we avoid Priority/Flex/Batch
+    # because chat needs sync). Cache discount 90% on stable prefix
+    # тоже available — handlers.py уже emit'ит cache_control marker.
+    {
+        "label": "GG/gemini-2.0-flash-lite",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key": _google_key(),
+        "model": "gemini-2.0-flash-lite",
+        "price_in": 0.075, "price_out": 0.30,
+    },
+    {
+        "label": "GG/gemini-2.5-flash-lite",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key": _google_key(),
+        "model": "gemini-2.5-flash-lite",
+        "price_in": 0.10, "price_out": 0.40,
+    },
+    {
+        "label": "GG/gemini-2.0-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key": _google_key(),
+        "model": "gemini-2.0-flash",
+        "price_in": 0.15, "price_out": 0.60,
+    },
+    {
+        "label": "GG/gemini-2.5-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key": _google_key(),
+        "model": "gemini-2.5-flash",
+        "price_in": 0.30, "price_out": 2.50,
+    },
+    {
+        "label": "GG/gemini-2.5-pro",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key": _google_key(),
+        "model": "gemini-2.5-pro",
+        "price_in": 1.25, "price_out": 10.0,
     },
 ]
 
