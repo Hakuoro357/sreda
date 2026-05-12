@@ -833,6 +833,12 @@ CHAT_PROVIDERS = (
     # (gemini/llama не прошли — пустой reply). Soul-v3 пофиксил «вы» → «ты».
     # Кандидат на primary через runtime_config switcher.
     "openrouter-nemotron-3-super",
+    # 2026-05-12: qwen3.5-flash — Boris choice for primary replacement.
+    # Bench: 2.7s avg wall (5× mimo), $0.0061/turn (18% cheaper than mimo),
+    # tool calling reliable on 7/8 scenarios (H.poisoned_history — fake
+    # «Поставлю напоминание» без schedule_reminder; в проде Pass 1c
+    # detector ловит → nudge retry).
+    "openrouter-qwen-flash",
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -860,6 +866,9 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter-deepseek":          "deepseek/deepseek-v4-flash",
     "openrouter-gemini-lite":       "google/gemini-3.1-flash-lite",
     "openrouter-nemotron-3-super":  "nvidia/nemotron-3-super-120b-a12b",
+    # 2026-05-12: qwen3.5-flash hybrid linear-attention + sparse MoE,
+    # 1M context. Cheapest tool-calling provider в нашем бенче.
+    "openrouter-qwen-flash":        "qwen/qwen3.5-flash-02-23",
 }
 
 
@@ -916,6 +925,12 @@ _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
         # на reasoning generation. Уменьшает probability reasoning
         # leak в content field (FM3 на проде 21:42).
         "reasoning": {"enabled": False, "max_tokens": 0},
+    },
+    # 2026-05-12: qwen3.5-flash. Bench показывал чистое поведение без
+    # reasoning, но Qwen-line has thinking capability — выключаем явно
+    # по тому же принципу что и Nemotron (избегаем drift modes на проде).
+    "openrouter-qwen-flash": {
+        "reasoning": {"enabled": False},
     },
 }
 

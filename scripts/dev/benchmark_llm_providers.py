@@ -268,6 +268,85 @@ PROVIDERS = [
             "reasoning": {"enabled": False},
         },
     },
+    # 2026-05-12: Boris explicit ask — anthropic/claude-haiku-4.5 via OR.
+    # 200k context, tool calling supported. Pricing $1/$5 per 1M
+    # (~16x mimo) — кандидат на quality-tier, не cost-tier.
+    {
+        "label": "OR/claude-haiku-4.5",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "anthropic/claude-haiku-4.5",
+        "price_in": 1.0, "price_out": 5.0,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
+    # 2026-05-12: Boris explicit ask — gpt-4o-mini, gemini-2.5-flash,
+    # gemini-2.5-flash-lite via OR. Comparison-tier среди budget-моделей.
+    {
+        "label": "OR/gpt-4o-mini",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "openai/gpt-4o-mini",
+        "price_in": 0.15, "price_out": 0.60,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
+    {
+        "label": "OR/gemini-2.5-flash",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "google/gemini-2.5-flash",
+        "price_in": 0.30, "price_out": 2.50,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
+    {
+        "label": "OR/gemini-2.5-flash-lite",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "google/gemini-2.5-flash-lite",
+        "price_in": 0.10, "price_out": 0.40,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
+    # 2026-05-12: Boris ask — qwen/qwen3.6-plus. Hybrid linear-attention
+    # + sparse MoE. 1M context. $0.325/$1.95 (~4-6x mimo).
+    {
+        "label": "OR/qwen3.6-plus",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "qwen/qwen3.6-plus",
+        "price_in": 0.325, "price_out": 1.95,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
+    # 2026-05-12: Boris ask — qwen3.5 family. flash (cheap, 1M ctx),
+    # 397B-A17B (large MoE, 262k ctx).
+    {
+        "label": "OR/qwen3.5-flash",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "qwen/qwen3.5-flash-02-23",
+        "price_in": 0.065, "price_out": 0.26,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
+    {
+        "label": "OR/qwen3.5-397b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": _openrouter_key(),
+        "model": "qwen/qwen3.5-397b-a17b",
+        "price_in": 0.39, "price_out": 2.34,
+        "extra_body": {
+            "reasoning": {"enabled": False},
+        },
+    },
 ]
 
 
