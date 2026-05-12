@@ -451,3 +451,378 @@ def test_read_claim_v_knige_recipes_with_tool_passes() -> None:
         detect_unbacked_claim(text, called_tools={"search_recipes"})
         is False
     )
+
+
+# --------------------------------------------------------------------
+# R-12 (sreda#26) regression — intra-sentence object window + question-offer skip
+# Production incident 2026-05-12 09:41 (user_max_40921122):
+# bot reply «Записала на завтра в 13:00 — тренировка с гирей 💪\n\nНужно
+# напоминание перед тренировкой?» с add_task tool вызванным → Pass 2 captured
+# «напомина» из второго предложения → false fire → safe_ack replaced
+# legitimate reply.
+# --------------------------------------------------------------------
+
+
+def test_r12_task_create_with_reminder_offer_question_no_fire() -> None:
+    """Boris prod case 2026-05-12 09:41: add_task created + follow-up
+    offer «Нужно напоминание?» в SLEDующем предложении не должно
+    fire'ить (intra-sentence cut)."""
+    text = (
+        "Записала на завтра в 13:00 — тренировка с гирей 💪\n\n"
+        "Нужно напоминание перед тренировкой?"
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_task"})
+        is False
+    )
+
+
+def test_r12_recipes_save_with_menu_question_no_fire() -> None:
+    """Variant: рецепты сохранены + follow-up «Составить меню?» —
+    «в меню» в next sentence не должно ловить."""
+    text = (
+        "Сохранила 3 рецепта в книгу.\n\n"
+        "Хочешь, составлю меню на неделю на основе них?"
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"save_recipes_batch"})
+        is False
+    )
+
+
+def test_r12_question_offer_in_same_sentence_no_fire() -> None:
+    """Single-sentence claim + offer-question с «?» близко к object —
+    Layer B skip должен сработать (object «напомин» + ? в <15 chars).
+
+    Codex r2 #5 fix: prior test had unused `text` variable + relied на
+    sentence boundary вместо Layer B. Этот тест явно проверяет
+    question-skip path (нет sentence boundary между object и `?`)."""
+    # task создан → add_task backed. Bot offer «Напомнить тебе позже?» —
+    # «напомнить» (≈ «напомин») followed by «?» очень близко. Должно skip.
+    text = "Я записала задачу. Напомнить?"
+    # Window для verb «записала»: до `?` (boundary) = «я записала задачу. напомнить»
+    # Inside iterate: objects — «задач» (backed), «напомин» (would be unbacked
+    # without skip). After object «напомин» + 1 char до `?` → skip ✓.
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_task"}) is False
+    )
+
+
+def test_r12_cross_sentence_genuine_claim_still_fires() -> None:
+    """Don't over-correct: если в РАЗНЫХ предложениях два РЕАЛЬНЫХ
+    claim'а, и хоть один unbacked — должно fire'ить."""
+    # Verb1 + object1 backed, verb2 + object2 unbacked.
+    text = "Сохранила рецепт. Поставила напоминание на завтра."
+    # «Поставила напоминание» = self-claiming reminder, no schedule_reminder tool.
+    # «Сохранила рецепт» — verb «сохранила» в первом предложении, object «рецепт»
+    # в том же предложении → category=recipe → save_recipes_batch in tools → OK.
+    # «Поставила напомин...» во втором предложении: verb «поставила напомин»
+    # match'ит _CLAIM_VERBS «поставила напомин» → reminder claim BUT
+    # called_tools = {save_recipes_batch} doesn't include reminder tools → FIRE.
+    assert (
+        detect_unbacked_claim(text, called_tools={"save_recipes_batch"})
+        is True
+    )
+
+
+def test_r12_legitimate_offer_no_false_fire() -> None:
+    """Bot offers next action: «Список обновлён. Хочешь рецепт?» —
+    «рецепт» в offer-question. tools=[shopping]. Раньше fired (false),
+    после R-12 fix не fire'ит."""
+    text = "Список покупок обновлён.\n\nХочешь, найду рецепт борща?"
+    assert (
+        detect_unbacked_claim(
+            text,
+            called_tools={"add_shopping_items"},
+        )
+        is False
+    )
+
+
+# --------------------------------------------------------------------
+# R-12 r2 (Codex MAJOR review): iterate-all-objects + tighten
+# question-skip + drop `.` boundary
+# --------------------------------------------------------------------
+
+
+def test_r12_r2_split_claim_recipe_backed_reminder_unbacked_fires() -> None:
+    """Codex r2 MAJOR #1: «Сохранила рецепт! Также поставила
+    напоминание на завтра.» — recipe-claim backed, reminder claim
+    unbacked → должно fire.
+
+    R-12 r1 firstly returned object «рецепт» (recipe), backed by
+    save_recipes_batch, skip → reminder never checked. r2 iterates
+    ALL objects."""
+    text = "Сохранила рецепт! Также поставила напоминание на завтра."
+    assert (
+        detect_unbacked_claim(text, called_tools={"save_recipes_batch"})
+        is True
+    )
+
+
+def test_r12_r2_completion_marker_cross_sentence_fires() -> None:
+    """Codex r2 MAJOR #3: «Сохранила. Рецепт в книге.» без
+    save_recipes_batch tool — раньше fired (legit single claim).
+    R-12 r1 с `.` boundary cut'нул бы window до «сохранила.» (object
+    не в окне) → false negative. r2 dropped `.` → fires correctly."""
+    text = "Сохранила. Рецепт в книге."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r2_confirmation_question_after_claim_fires() -> None:
+    """Codex r2 MAJOR #2: «Записала задачу на четверг, верно?» БЕЗ
+    add_task tool — это claim + confirmation, не offer-question.
+    `?` через 17+ chars после «задачу» → не должно skip Layer B."""
+    text = "Записала задачу на четверг, верно?"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r2_dates_in_text_dont_break_window() -> None:
+    """Codex r2 minor: «.» в датах/абсхр не должны cut window.
+    `.` больше не boundary → safe."""
+    # «12.05» в тексте — не должно резать window.
+    text = "Записала на 12.05 задачу — встреча с врачом."
+    # verb «записала» + object «задач» в SAME sentence (no `?`, `\n\n`)
+    # but old `.` boundary fired at «12.» → window cut → no object → no fire.
+    # New: `.` not boundary → window includes «задач» → fire (no add_task).
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r2_xiaomi_verb_at_end_of_sentence_fires() -> None:
+    """Xiaomi review #2: verb at the end of sentence «Рецепт борща
+    сохранила.» — verb is at end, object before."""
+    text = "Рецепт борща сохранила."
+    # verb «сохранила» idx ~12, len 9. Pre-window (-40) от idx 12 = 0
+    # → covers «рецепт борща ». Object «рецепт» found → category=recipe.
+    # No save_recipes tool called → fire.
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r2_distant_mention_does_not_false_fire() -> None:
+    """R-12 r2 closest-object protects: «Сохранила рецепт борща — теперь
+    у тебя 5 рецептов в книге.» с save_recipes_batch tool.
+    verb «сохранила» end at ~9. Objects: «рецепт» idx 11 (dist 2),
+    «в книг» idx ~50 (dist 41). Closest = «рецепт», backed → no fire.
+    Без closest-object iterate-all нашёл бы «в книг» (тоже recipe, тоже backed).
+    Этот тест protect от случая когда distant object был БЫ unbacked."""
+    # Variant с unbacked distant object: «Сохранила рецепт — потом
+    # составлю меню!» с save_recipes_batch.
+    # verb «сохранила» end at 9. «рецепт» idx ~11 (dist 2),
+    # «меню» idx ~40 (dist 31). Closest = «рецепт» backed → no fire.
+    # Без closest: iterate-all нашёл бы «меню» unbacked → false fire.
+    # NB: «составлю» — future verb (Pass 1c) с object «меню» далеко
+    # от verb «составлю». Pass 1c с question-context check: «можно
+    # составлю»? нет, просто «потом составлю» — declarative future
+    # claim, BUT no menu tool → ловится Pass 1c.
+    # Используем variant без future verb для clean isolation:
+    text = "Сохранила рецепт борща, теперь у тебя есть выбор в меню."
+    # verb «сохранила» idx 0 len 9. closest object: «рецепт» idx 10
+    # (dist 1) vs «в меню» idx ~45 (dist 36). «рецепт» wins, backed.
+    # No future verb → no Pass 1c fire.
+    assert (
+        detect_unbacked_claim(text, called_tools={"save_recipes_batch"})
+        is False
+    )
+
+
+def test_r12_r3_question_skip_bounded_to_window() -> None:
+    """Xiaomi r2 MAJOR fix regression: question-skip must search в
+    `window`, не в global `low`. «Сохранила рецепт\\n\\nМеню?» —
+    реальный claim первого предложения. Window cuts на `\\n\\n`,
+    «рецепт» в window. Раньше post_obj глобально находил `?`
+    через 6 chars после object → ошибочно skip. После r3 fix:
+    post_obj в window = «\\n\\n» (рецепт идёт перед `\\n\\n`) →
+    `?` НЕ в local window → не skip → fire ✓."""
+    text = "Сохранила рецепт\n\nМеню?"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r3_paragraph_break_isolates_claim() -> None:
+    """Xiaomi r2 minor #4: positive-fire test с `\\n\\n`.
+    «Сохранила рецепт\\n\\nПоставила напоминание.» — оба предложения
+    реальные claims. Window для verb «сохранила» cuts на `\\n\\n` —
+    «напомина» НЕ в window. Но verb «поставила напомин» в outer loop
+    triggers own iteration → ловит «напомина» (unbacked) → fire ✓.
+    Защищает от accidental cross-paragraph closest-object grab."""
+    text = "Сохранила рецепт\n\nПоставила напоминание."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+# --------------------------------------------------------------------
+# R-12 r3 (Codex r2 MAJOR): iterate-all-with-proximity + drop question-skip
+# --------------------------------------------------------------------
+
+
+def test_r12_r3_codex_multi_object_single_verb_fires() -> None:
+    """Codex r2 MAJOR #1: «Записала задачу и напоминание на завтра»
+    с add_task tool — single verb claims TWO side-effects. add_task
+    backed («задач»), но reminder («напомина») НЕ backed → fire.
+
+    R-12 r2 closest-object выбирал «задач» как ближайший, пропускал
+    «напомина». r3 iterate-all + proximity 30c ловит оба."""
+    text = "Записала задачу и напоминание на завтра."
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_task"})
+        is True
+    )
+
+
+def test_r12_r3_codex_past_claim_with_confirmation_question_fires() -> None:
+    """Codex r2 MAJOR #2: «Записала задачу, ок?» БЕЗ add_task.
+    Past-tense claim сделан, `?` — confirmation. Question-skip
+    больше не маскирует Pass 2 fire."""
+    text = "Записала задачу, ок?"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r3_codex_past_claim_with_offer_question_fires() -> None:
+    """Codex r2 MAJOR #2: «Записала задачу. Напомнить?» БЕЗ add_task.
+    Past-tense «записала задачу» = claim, «Напомнить?» = offer на
+    next action. Без question-skip Pass 2 правильно ловит unbacked
+    «задач»."""
+    text = "Записала задачу. Напомнить?"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r3_mention_beyond_proximity_no_fire() -> None:
+    """R-12 r3 proximity threshold: distant mention НЕ fire-ит.
+    «Сохранила рецепт борща и омлет — теперь у тебя 5 рецептов в
+    книге, можно составить меню!» с save_recipes_batch tool.
+    «рецепт» dist 1 ✓ (backed). «меню» dist 50+ > 30 → mention,
+    ignore. No fire."""
+    text = (
+        "Сохранила рецепт борща и омлет — теперь у тебя 5 рецептов "
+        "в книге, можно составить меню!"
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"save_recipes_batch"})
+        is False
+    )
+
+
+# --------------------------------------------------------------------
+# R-12 r4 (Codex r3 MAJOR): per-object offer-question detection +
+# iterate-all-occurrences
+# --------------------------------------------------------------------
+
+
+def test_r12_r4_codex_offer_question_with_modal_no_fire() -> None:
+    """Codex r3 MAJOR #1: «Записала задачу, нужно напоминание?» с
+    add_task. «задачу» backed → ok. «напомина» — modal «нужно» before
+    + `?` after → offer-question, skip. No fire ✓."""
+    text = "Записала задачу, нужно напоминание?"
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_task"})
+        is False
+    )
+
+
+def test_r12_r4_offer_question_hochesh_modal_no_fire() -> None:
+    """«Сохранила рецепт, хочешь добавить ингредиенты в покупки?»
+    с save_recipes_batch — «хочешь» before «в покупк» + `?` after."""
+    text = "Сохранила рецепт, хочешь добавить ингредиенты в покупки?"
+    assert (
+        detect_unbacked_claim(
+            text, called_tools={"save_recipes_batch"},
+        )
+        is False
+    )
+
+
+def test_r12_r4_offer_question_mojet_modal_no_fire() -> None:
+    """«Готово ✅ Может составить меню?» — «может» before «меню» + `?`."""
+    text = "Готово ✅ Может составить меню?"
+    # «готово» в _CLAIM_VERBS. «меню» found но preceded by «может» (modal).
+    # Should NOT fire — это offer-question.
+    assert detect_unbacked_claim(text, called_tools=set()) is False
+
+
+def test_r12_r4_codex_iterate_all_occurrences_fires() -> None:
+    """Codex r3 MAJOR #2 regression: ALL occurrences of obj iterated.
+    Если first occurrence распознан как mention (dist > 30), но second
+    occurrence proximate (dist < 30) — должно fire."""
+    # Construct: verb + distant FIRST «задач» occurrence (mention),
+    # then close SECOND «задач» (real claim, unbacked).
+    # «у тебя 5 задач в книге, я также записала задачу на завтра»
+    # - verb «записала» idx ~36 (estimated)
+    # - First «задач» occurrence at idx 10 (in «5 задач в книге») —
+    #   dist from verb_end ~ |10 - (36+8)| = 34 > 30 → mention.
+    # - Second «задач» occurrence at idx ~50 («задачу на завтра») —
+    #   dist from verb_end ~ |50 - 44| = 6 < 30 → claim.
+    # called_tools=set() → task NOT backed → fire.
+    text = "у тебя 5 задач в книге, я также записала задачу на завтра"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_r12_r4_confirmation_no_modal_still_fires() -> None:
+    """Защита от over-correction: «Записала задачу, верно?» —
+    confirmation, не offer. БЕЗ modal trigger → не skip. Should fire
+    if no add_task tool."""
+    text = "Записала задачу, верно?"
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+# --------------------------------------------------------------------
+# R-12 r5 (Codex r4 MAJOR): unbounded post-object `?` search +
+# expanded modal list
+# --------------------------------------------------------------------
+
+
+def test_r12_r5_long_offer_question_no_fire() -> None:
+    """Codex r4 MAJOR #1: реальный bot reply «Записала задачу, нужно
+    напоминание перед тренировкой?» — object stem «напомина» at idx ~24,
+    `?` через 35+ chars. R4 15c after окно miss'ило. R5 ищет в rest of
+    window — sentence-bounded, безопасно."""
+    text = "Записала задачу, нужно напоминание перед тренировкой?"
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_task"})
+        is False
+    )
+
+
+def test_r12_r5_modal_davay_no_fire() -> None:
+    """Codex r4 MAJOR #2: «Записала задачу, давай поставлю напоминание?»
+    с add_task — «давай» modal перед «напомин» + `?` after → skip."""
+    text = "Записала задачу, давай поставлю напоминание?"
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_task"})
+        is False
+    )
+
+
+def test_r12_r5_modal_mozhem_no_fire() -> None:
+    """Codex r4 MAJOR #2: «Готово. Можем составить меню?» — modal
+    «можем» перед «меню» + `?`."""
+    text = "Готово. Можем составить меню?"
+    assert detect_unbacked_claim(text, called_tools=set()) is False
+
+
+def test_r12_r5_modal_mozhet_with_comma_no_fire() -> None:
+    """Xiaomi r4 minor #1: «Готово, может, добавить напоминание?» —
+    «может,» с comma вместо space. R4 «может ` requires trailing space —
+    miss'ило. R5 убрали trailing space → catches «может,»."""
+    text = "Готово, может, добавить напоминание?"
+    assert detect_unbacked_claim(text, called_tools=set()) is False
+
+
+def test_r12_r6_modal_mogu_no_fire() -> None:
+    """Codex r5 MAJOR: «Записала задачу, могу поставить напоминание?»
+    с add_task — «могу» modal перед «напомин» + `?` after → skip."""
+    text = "Записала задачу, могу поставить напоминание?"
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_task"})
+        is False
+    )
+
+
+def test_r12_r5_long_modal_phrasing_no_fire() -> None:
+    """Xiaomi r4 minor #3: «Хочешь, чтобы я добавил напоминание?» —
+    «хочешь» на расстоянии ~24 chars от «напомин». R4 20c BEFORE окно
+    miss'ило. R5 расширили до 30c."""
+    text = "Хочешь, чтобы я добавил напоминание?"
+    # No claim verb («хочешь» / «добавил» — let's check)
+    # «добавил» в _CLAIM_VERBS yes. verb_end ~22. «напомина» at idx ~26.
+    # Distance ~4 within proximity. Modal «хочешь» at idx 0, distance to
+    # «напомин» idx 26 = 26 chars. 30c window → matches → skip.
+    # called_tools=set() — would fire без skip, with skip → no fire.
+    assert detect_unbacked_claim(text, called_tools=set()) is False

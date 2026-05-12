@@ -27,7 +27,7 @@ import concurrent.futures
 import logging
 import re
 import threading
-from typing import Any
+from typing import Any, Iterator
 
 from langchain_openai import ChatOpenAI
 
@@ -587,6 +587,166 @@ _READ_OBJECT_TO_TOOL: tuple[tuple[str, frozenset[str]], ...] = (
 _READ_QUESTION_SKIP_WINDOW = 40
 
 
+# 2026-05-12 (R-12 sreda#26): cap object-search window at sentence
+# boundary. Production incident 2026-05-11 17:41 (user_max_40921122):
+# bot reply «Записала на завтра в 13:00 — тренировка с гирей 💪\n\nНужно
+# напоминание перед тренировкой?» — verb «записала» + object «напомина»
+# из ВТОРОГО предложения попали в одно 160-char window → Pass 2 решил
+# что claim про reminder, expected schedule_reminder в called_tools,
+# не нашёл → false positive → safety_net заменил legitimate reply на
+# safe_ack. Юзер потерял follow-up offer-question.
+#
+# Fix: search для object idёт только до конца текущего предложения от
+# verb position (cut на `.`, `!`, `?`, `\n\n`). Если sentence boundary
+# не найдена в +120 chars, оставляем cap +120.
+# Boundaries — only `?` and `\n\n` (R-12 r2 после Codex review).
+#
+# `!` excluded — в RU «Готова! Запись добавлена.» = один claim
+# (expressive emphasis, не sentence break).
+#
+# `.` excluded — Codex MAJOR #3, #4 r2:
+#   1. «Готово. Список покупок обновлён.» without shopping tool —
+#      раньше fired (legit completion-marker + cross-sentence claim),
+#      теперь missed бы.
+#   2. Точка в датах/сокращениях/URL («12.05», «т.к.», «и т.д.»,
+#      «cloud.google.com») fragmentировала бы window.
+#
+# Что остаётся:
+#   `?` — definite claim end. После него идёт offer/question или
+#     новый topic — claim уже cёnut.
+#   `\n\n` — paragraph break. Boris's prod incident 09:41:44 имел
+#     именно `\n\n` между claim и offer-question.
+#
+# Side effect: window больше не cuts на `.`, потому cross-verb cases
+# (Codex MAJOR #1) разрешаются через ALL-objects iteration (см. Pass 2).
+_SENTENCE_BOUNDARY_MARKERS: tuple[str, ...] = ("?", "\n\n")
+
+
+def _intra_sentence_window(
+    low: str, verb_idx: int, verb_len: int,
+    *, max_after: int = 120, pre_chars: int = 40,
+) -> tuple[str, int]:
+    """Return text window covering текущее предложение verb'а.
+
+    Pre-verb: ищет latest sentence boundary в [verb_idx - pre_chars, verb_idx).
+    Если найден — pre_start = после boundary. Иначе verb_idx - pre_chars.
+    Post-verb: ищет earliest sentence boundary в [verb_idx + verb_len,
+    verb_idx + verb_len + max_after). Если найден — end = после boundary.
+    Иначе fallback на полный max_after.
+
+    Защита от cross-sentence spillover: «Сохранила рецепт. Поставила
+    напоминание.» с verb «поставила напомин» — pre-clip отрезает первое
+    предложение, post-clip останавливает на «завтра.» → window содержит
+    только claim про reminder. Если recipe-tool вызван а reminder нет,
+    Pass 2 правильно fire'ит.
+    """
+    # Pre-verb: scan backwards для sentence boundary.
+    pre_search_start = max(0, verb_idx - pre_chars)
+    pre_text = low[pre_search_start:verb_idx]
+    pre_start = pre_search_start  # default: no boundary
+    for marker in _SENTENCE_BOUNDARY_MARKERS:
+        idx = pre_text.rfind(marker)
+        if idx >= 0:
+            candidate = pre_search_start + idx + len(marker)
+            if candidate > pre_start:
+                pre_start = candidate
+
+    # Post-verb: scan forward для sentence boundary.
+    after_start = verb_idx + verb_len
+    after_end_max = min(len(low), after_start + max_after)
+    after_text = low[after_start:after_end_max]
+    end_offset = len(after_text)  # default: no boundary found, use full max_after
+    for marker in _SENTENCE_BOUNDARY_MARKERS:
+        idx = after_text.find(marker)
+        if idx >= 0:
+            candidate = idx + len(marker)
+            if candidate < end_offset:
+                end_offset = candidate
+    return low[pre_start: after_start + end_offset], pre_start
+
+
+# R-12 r4 (Codex r3 MAJOR #1): offer-question detection per object.
+# «Записала задачу, нужно напоминание?» с add_task — reminder это
+# offer-question (modal «нужно» before object + `?` after), не claim.
+# Plain `?` window skip (R-12 r2) был removed в r3 потому что past-
+# tense Pass 2 не должен skip claims «задачу, ок?». Modal-based check
+# distinguishes offer-question form от confirmation tail.
+#
+# Modal triggers: substrings проверяются в pre-object окне (30 chars,
+# wider после Codex r4 / Xiaomi r4 «Хочешь, чтобы я добавил X?» case).
+# При match + `?` в rest of window (anywhere после object up to
+# sentence boundary which ends window) → offer-question, skip.
+#
+# Codex r4 MAJOR #1: window IS already bounded by intra-sentence cut
+# (`?` or `\n\n`), так что unbounded search after object безопасен.
+# Раньше 15c after окно miss'ило «нужно напоминание перед тренировкой?»
+# где `?` 35+ chars after object stem «напомина».
+_OFFER_QUESTION_BEFORE_CHARS = 30
+_OFFER_QUESTION_MODAL_TRIGGERS: tuple[str, ...] = (
+    "нужн",       # нужно/нужен/нужна/нужны
+    "хочеш",      # хочешь
+    "хотите",     # хотите
+    "может",      # может / может быть (no trailing space — handles «может,» too)
+    "можно",      # можно / можно ли (no trailing space)
+    "стоит ли",   # стоит ли
+    "не против",  # не против ли
+    "хорошо ли",  # хорошо ли
+    "будешь",     # будешь?
+    "давай",      # давай / давайте (R-12 r5, Codex r4 MAJOR #2)
+    "можем",      # можем / можем ли (R-12 r5, Codex r4 MAJOR #2)
+    "могу",       # могу / могу ли (R-12 r6, Codex r5 MAJOR — «могу поставить X?»)
+)
+
+
+def _is_offer_question_for_object(
+    window: str, obj_idx: int, obj_len: int,
+) -> bool:
+    """True если object'у предшествует modal trigger (within
+    _OFFER_QUESTION_BEFORE_CHARS) И в REST of window после object
+    есть `?`. Window уже sentence-bounded (intra-sentence cut на `?`
+    или `\\n\\n`), так что unbounded post-search безопасен.
+    """
+    pre_start = max(0, obj_idx - _OFFER_QUESTION_BEFORE_CHARS)
+    pre_text = window[pre_start:obj_idx]
+    has_modal = any(m in pre_text for m in _OFFER_QUESTION_MODAL_TRIGGERS)
+    if not has_modal:
+        return False
+    # `?` в остатке window (window сам ограничен sentence boundary).
+    return "?" in window[obj_idx + obj_len:]
+
+
+# R-12 r3 (Codex r2 MAJOR #1): proximity threshold для iterate-all-objects.
+# Objects within этого расстояния от verb end рассматриваются как
+# claim. Beyond — как mention/offer, ignore. Балансирует:
+#   - «Записала задачу и напоминание» (dist 1, 12) — оба claim ✓
+#   - «Сохранила рецепт — потом можно составить меню!» (dist 1, 40+) —
+#     рецепт claim, меню mention ✗ не fire
+_OBJECT_PROXIMITY_CLAIM_CHARS = 30
+
+
+def _iter_claim_objects_in_window(
+    window: str,
+) -> "Iterator[tuple[str, str | None | bool, int]]":
+    """Yield ALL matching (obj, category, idx) pairs в window
+    (sorted по specificity = order в `_OBJECT_TO_CATEGORY`).
+
+    R-12 r4 (Codex r3 MAJOR #2): yield ВСЕ occurrences каждого obj,
+    не только первое. «Записала на завтра в 13:00 — тренировку, а
+    также — задачу» — first «задач»-like at distance 50+ (mention),
+    но если бы был второй ближе — раньше pass-2 пропустил бы. Now
+    каждое occurrence yields'ится → outer loop проверяет proximity
+    для каждого.
+    """
+    for obj, category in _OBJECT_TO_CATEGORY:
+        start = 0
+        while True:
+            idx = window.find(obj, start)
+            if idx < 0:
+                break
+            yield (obj, category, idx)
+            start = idx + len(obj)
+
+
 def _identify_claim_category(window: str) -> str | None | bool:
     """Identify the category of side-effect claimed in the window.
 
@@ -677,6 +837,13 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
     # ⚠ Codex r3 MAJOR #1: iterate ВСЕ occurrences каждого verb'а,
     # не только первое. Иначе «Добавила в покупки. Добавила в план
     # кроя.» → первое окно shopping-backed → second skipped.
+    #
+    # ⚠ R-12 (2026-05-12, prod incident user_max_40921122 09:41):
+    # window теперь ограничен sentence boundary от verb_idx (см.
+    # `_intra_sentence_window`). Раньше fixed +120 chars ловил object
+    # из следующего предложения (offer-question), → false positive.
+    # Plus: после object match, если в 30 chars после object есть «?» —
+    # это offer/question, skip.
     for verb in _CLAIM_VERBS:
         start = 0
         while True:
@@ -685,22 +852,42 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
                 break
             # Advance start for next iteration.
             start = verb_idx + len(verb)
-            # Limit the object-search window so "я сохранил то что ты
-            # сказала — готово, меню не трогай" doesn't false-fire from
-            # a distant "меню" mention.
-            window = low[max(0, verb_idx - 40): verb_idx + 120]
-            category = _identify_claim_category(window)
-            if category is False:
-                # Verb matched, no recognized object — not a domain claim.
+            # Intra-sentence window: search для object cut'ится на
+            # `?`, `\n\n` от обеих сторон verb'а. Защита от
+            # spillover в offer-question / paragraph break (R-12 r2).
+            window, win_pre_start = _intra_sentence_window(
+                low, verb_idx, len(verb),
+            )
+            # R-12 r4: iterate ALL object occurrences (Codex r3 MAJOR #2)
+            # within proximity 30c, skip offer-question forms (Codex r3
+            # MAJOR #1 — «нужно X?»/«хочешь X?» before object + `?` after).
+            #
+            # Past-tense `_CLAIM_VERBS` make claim regardless of trailing
+            # `?` (confirmation form), но object inside offer-question
+            # construct («нужно напоминание?») — это offer не claim.
+            # Modal-trigger check distinguishes.
+            verb_end_in_window = (verb_idx - win_pre_start) + len(verb)
+            any_proximate_object = False
+            for obj, category, obj_idx in _iter_claim_objects_in_window(window):
+                distance = abs(obj_idx - verb_end_in_window)
+                if distance > _OBJECT_PROXIMITY_CLAIM_CHARS:
+                    continue  # mention/offer, not a claim
+                # Per-object offer-question check: modal before + `?` after.
+                if _is_offer_question_for_object(window, obj_idx, len(obj)):
+                    continue  # offer-question form для этого object
+                any_proximate_object = True
+                if category is None:
+                    # Object found, no tool exists — always unbacked.
+                    # (e.g. «план кроя» — нет cutting_plan tool.)
+                    return True
+                # Object found, tool exists — verify matching tool was called.
+                expected_tools = _CATEGORY_TO_TOOLS.get(category, frozenset())
+                if not (called_tools & expected_tools):
+                    return True
+            # No proximate object — verb matched but objects too far
+            # = mentions/offers, not claims. Skip to next verb occurrence.
+            if not any_proximate_object:
                 continue
-            if category is None:
-                # Object found, no tool exists — always unbacked.
-                # (e.g. «план кроя» — нет cutting_plan tool.)
-                return True
-            # Object found, tool exists — verify matching tool was called.
-            expected_tools = _CATEGORY_TO_TOOLS.get(category, frozenset())
-            if not (called_tools & expected_tools):
-                return True
     # Pass 4 (2026-05-11, Codex+Xiaomi consensus): READ-side citation
     # claims. Production incident user_tg_755682022 — модель цитировала
     # «у тебя в чек-листе X», «оттуда взяла», +14°C на 17 мая БЕЗ
