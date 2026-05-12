@@ -155,43 +155,9 @@ _LLM_PROVIDERS_METADATA = [
         "resolver": "resolve_openrouter_api_key",
         "static_model": "qwen/qwen3.6-plus",
     },
-    # 2026-05-10: Cost/speed candidates added in commit 6bf9821.
-    # Verified through bench (3 providers × 6 scenarios × 3 runs).
-    {
-        "key": "openrouter-gpt-oss-120b",
-        "label": "OpenRouter · GPT-OSS 120B (MoE)",
-        "default_model_attr": None,
-        "resolver": "resolve_openrouter_api_key",
-        "static_model": "openai/gpt-oss-120b",
-    },
-    {
-        "key": "openrouter-llama-70b",
-        "label": "OpenRouter · Llama 3.3 70B",
-        "default_model_attr": None,
-        "resolver": "resolve_openrouter_api_key",
-        "static_model": "meta-llama/llama-3.3-70b-instruct",
-    },
-    {
-        "key": "openrouter-llama-4-scout",
-        "label": "OpenRouter · Llama 4 Scout",
-        "default_model_attr": None,
-        "resolver": "resolve_openrouter_api_key",
-        "static_model": "meta-llama/llama-4-scout",
-    },
-    {
-        "key": "openrouter-deepseek",
-        "label": "OpenRouter · DeepSeek V4 Flash",
-        "default_model_attr": None,
-        "resolver": "resolve_openrouter_api_key",
-        "static_model": "deepseek/deepseek-v4-flash",
-    },
-    {
-        "key": "openrouter-gemini-lite",
-        "label": "OpenRouter · Gemini 3.1 Flash Lite",
-        "default_model_attr": None,
-        "resolver": "resolve_openrouter_api_key",
-        "static_model": "google/gemini-3.1-flash-lite",
-    },
+    # 2026-05-12: 5 экспериментальных провайдеров удалены (gpt-oss-120b,
+    # llama-70b, llama-4-scout, deepseek, gemini-lite). Не показали value
+    # vs mimo/gemini-2.5-flash; держать в UI = риск misconfiguration.
     # 2026-05-10 PM: Nemotron 3 Super (DeepInfra/bf16) — current
     # production primary after bench showed 10× speedup over mimo.
     {
@@ -209,6 +175,15 @@ _LLM_PROVIDERS_METADATA = [
         "default_model_attr": None,
         "resolver": "resolve_openrouter_api_key",
         "static_model": "qwen/qwen3.5-flash-02-23",
+    },
+    # 2026-05-12: Gemini 2.5 Flash — fastest reliable в бенче (1.5s avg,
+    # all 8 scenarios tools clean). Pro tier candidate / mimo fallback.
+    {
+        "key": "openrouter-gemini-2.5-flash",
+        "label": "OpenRouter · Gemini 2.5 Flash",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "google/gemini-2.5-flash",
     },
 ]
 

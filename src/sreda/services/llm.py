@@ -819,14 +819,10 @@ CHAT_PROVIDERS = (
     "openrouter",            # gemma-4-26b-a4b-it (default), verified fast
     "openrouter-grok",       # x-ai/grok-4.1-fast — "lowest hallucination" claim
     "openrouter-qwen",       # qwen/qwen3.6-plus — clean runner-up in bench
-    # Cost/speed experimental candidates (added 2026-05-10 for A/B vs mimo).
-    # All five qualify on tools support, ≥131k context, output ≤$1.50/M.
-    # Test order: llama-70b → llama-4-scout → deepseek → gpt-oss-120b → gemini-lite.
-    "openrouter-gpt-oss-120b",   # openai/gpt-oss-120b — MoE 117B/5.1B, $0.039/$0.180
-    "openrouter-llama-70b",      # meta-llama/llama-3.3-70b-instruct — multilingual baseline
-    "openrouter-llama-4-scout",  # meta-llama/llama-4-scout — Llama 4 MoE, 327k ctx
-    "openrouter-deepseek",       # deepseek/deepseek-v4-flash — MoE 284B/13B, 1M ctx
-    "openrouter-gemini-lite",    # google/gemini-3.1-flash-lite — thinking levels, 1M ctx
+    # 2026-05-12: 5 экспериментальных провайдеров удалены после серии
+    # бенчей и прод-инцидентов (gpt-oss-120b, llama-70b, llama-4-scout,
+    # deepseek-v4-flash, gemini-3.1-flash-lite). Не показали value над
+    # mimo/gemini-2.5-flash; держать их в admin UI = риск misconfiguration.
     # 2026-05-10 PM: Nemotron 3 Super — DeepInfra/bf16, hybrid Mamba-Transformer
     # MoE 117B/12B active, 262k ctx. Bench показал 0.88s avg (10× быстрее mimo,
     # 3.7× быстрее gemini-lite), $0.0031/turn (+35% от mimo). Прошёл D.tool_error
@@ -839,6 +835,10 @@ CHAT_PROVIDERS = (
     # «Поставлю напоминание» без schedule_reminder; в проде Pass 1c
     # detector ловит → nudge retry).
     "openrouter-qwen-flash",
+    # 2026-05-12: Gemini 2.5 Flash via OR — fastest reliable provider в нашем
+    # бенче (1.5s avg, all 8 scenarios tools clean). $0.30/$2.50 per 1M
+    # (OR +5.5% markup vs direct Google). Pro tier candidate / mimo fallback.
+    "openrouter-gemini-2.5-flash",
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -858,17 +858,13 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter": None,  # None = fall back to settings.openrouter_chat_model
     "openrouter-grok": "x-ai/grok-4.1-fast",
     "openrouter-qwen": "qwen/qwen3.6-plus",
-    # Cost/speed experimental candidates (2026-05-10 A/B vs mimo).
-    # See CHAT_PROVIDERS for the matching provider keys + comments.
-    "openrouter-gpt-oss-120b":      "openai/gpt-oss-120b",
-    "openrouter-llama-70b":         "meta-llama/llama-3.3-70b-instruct",
-    "openrouter-llama-4-scout":     "meta-llama/llama-4-scout",
-    "openrouter-deepseek":          "deepseek/deepseek-v4-flash",
-    "openrouter-gemini-lite":       "google/gemini-3.1-flash-lite",
+    # 2026-05-12: stale provider keys removed (gpt-oss-120b, llama-70b,
+    # llama-4-scout, deepseek, gemini-lite). См. CHAT_PROVIDERS comment.
     "openrouter-nemotron-3-super":  "nvidia/nemotron-3-super-120b-a12b",
     # 2026-05-12: qwen3.5-flash hybrid linear-attention + sparse MoE,
     # 1M context. Cheapest tool-calling provider в нашем бенче.
     "openrouter-qwen-flash":        "qwen/qwen3.5-flash-02-23",
+    "openrouter-gemini-2.5-flash":  "google/gemini-2.5-flash",
 }
 
 
