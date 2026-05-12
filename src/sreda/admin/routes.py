@@ -201,6 +201,15 @@ _LLM_PROVIDERS_METADATA = [
         "resolver": "resolve_openrouter_api_key",
         "static_model": "nvidia/nemotron-3-super-120b-a12b",
     },
+    # 2026-05-12: Qwen 3.5 Flash — cheapest tool-calling provider в бенче.
+    # Активирован как primary через runtime_config (А/B vs mimo).
+    {
+        "key": "openrouter-qwen-flash",
+        "label": "OpenRouter · Qwen 3.5 Flash",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "qwen/qwen3.5-flash-02-23",
+    },
 ]
 
 
