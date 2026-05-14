@@ -136,8 +136,22 @@ class ReplyButtonService:
             return None
 
         row.used_at = _utcnow()
-        self.session.flush()
-        return row.label
+        # R-18 r2 (2026-05-13, Codex review): cache `label` ДО commit'а.
+        # SQLAlchemy default `expire_on_commit=True` экспайрит все loaded
+        # instances после commit'а → доступ к `row.label` triggered бы
+        # lazy reload (новый SELECT / transaction). Сохраняем сейчас.
+        label = row.label
+        # R-18 fix (2026-05-13): COMMIT, не flush.
+        # Production incident 2026-05-12 19:46 UTC — 2 connections idle
+        # in transaction 48 минут на UPDATE reply_button_cache (row lock
+        # contention) → DB pool starvation → /admin/users 504. Корень:
+        # `flush()` отправлял UPDATE и держал row lock, но транзакция
+        # оставалась открытой — если caller exception'ил до commit'а
+        # ИЛИ session lifecycle ломался, row lock висел indefinitely.
+        # Аналогичный bug pattern был зафикшен в `create_tokens` ещё
+        # 2026-04-25 (см. комментарий там), но `resolve_token` упустили.
+        self.session.commit()
+        return label
 
     def purge_expired(self, *, older_than_hours: int = 24) -> int:
         """Удаляет протухшие токены. Вызывается из scheduled-worker
