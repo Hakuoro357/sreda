@@ -11,7 +11,12 @@ dependencies = [
   "httpx>=0.28.0",
   "langgraph>=0.6.0",
   "langgraph-checkpoint-postgres>=2.0.0",
-  "langchain-openai>=0.2.0",
+  # R-29: pin langchain-openai к 1.x range. Subclass MimoChatOpenAI
+  # overrides internal underscore methods (_get_request_payload,
+  # _create_chat_result) which являются stable в 1.x но могут drift в
+  # 2.x. Compat-test test_mimo_chat_openai.py::test_langchain_openai_signature_compat
+  # fails loudly если signatures меняются. Update bound when 2.x evaluated.
+  "langchain-openai>=1.1,<2.0",
   "psycopg[binary]>=3.2.0",
   "pydantic-settings>=2.10.0",
   "python-dateutil>=2.9.0",

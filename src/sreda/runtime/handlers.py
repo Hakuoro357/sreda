@@ -2404,11 +2404,6 @@ def execute_conversation_chat(
                 tc.get("name") for tc in (getattr(ai_msg, "tool_calls", None) or [])
             ]
         _record_and_log(ai_msg, iteration=_iter)
-        # R-27: strip mimo's `reasoning_content` before appending to history
-        # — иначе iter.1 send'нёт его обратно в request → mimo direct API
-        # 400 «Param Incorrect» → fallback engaged → confab class. See
-        # _strip_mimo_reasoning_content docstring.
-        _strip_mimo_reasoning_content(ai_msg)
         messages.append(ai_msg)
         tool_calls = getattr(ai_msg, "tool_calls", None) or []
         if not tool_calls:
@@ -3005,49 +3000,6 @@ def _mentions_tool_internals(text: str) -> bool:
         if pattern in lower:
             return True
     return False
-
-
-def _strip_mimo_reasoning_content(ai_msg: object) -> None:
-    """R-27: strip mimo's `reasoning_content` from AIMessage history.
-
-    Production data-loss class 2026-05-12 → 2026-05-14. Mimo-v2.5-pro
-    returns chain-of-thought as `reasoning_content` field в response.
-    LangChain ChatOpenAI puts non-standard field в
-    ``AIMessage.additional_kwargs["reasoning_content"]``. На iter.1
-    этот же ai_msg уходит обратно в messages → LangChain serializes
-    additional_kwargs обратно в request → mimo's own API rejects 400
-    «Param Incorrect: The reasoning_content in the thinking…».
-
-    Fallback engages → fallback model emits empty tool_calls + confab
-    text «Поставила напоминания…» БЕЗ actual tool dispatch — каждый
-    tool-use turn ломается. Affected ≥6 tenants since 2026-05-12.
-
-    Defensive cleanup на ТРИ возможных места хранения (LangChain
-    version differences):
-      1. ``additional_kwargs`` — primary bucket для unknown fields в
-         ChatOpenAI parser. Serializes обратно в request body. **Это
-         наш observed prod failure** (error message подтверждает).
-      2. ``response_metadata`` — provider-side metadata bucket. Обычно
-         НЕ serializes обратно, но защищаемся на случай custom subclass.
-      3. Direct attribute ``ai_msg.reasoning_content`` — на случай
-         LangChain version с typed accessor.
-
-    Mutates ai_msg in-place. No-op если attributes отсутствуют. Idempotent.
-    """
-    # Layer 1: additional_kwargs (primary — confirmed by prod error)
-    kwargs = getattr(ai_msg, "additional_kwargs", None)
-    if isinstance(kwargs, dict):
-        kwargs.pop("reasoning_content", None)
-    # Layer 2: response_metadata (defensive — unlikely to serialize back)
-    metadata = getattr(ai_msg, "response_metadata", None)
-    if isinstance(metadata, dict):
-        metadata.pop("reasoning_content", None)
-    # Layer 3: direct attribute (defensive — version-specific)
-    if hasattr(ai_msg, "reasoning_content"):
-        try:
-            delattr(ai_msg, "reasoning_content")
-        except (AttributeError, TypeError):
-            pass
 
 
 def _is_reasoning_leak_after_tool(

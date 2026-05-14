@@ -1139,7 +1139,13 @@ def _build_chat_llm(
             logger.info("chat LLM disabled: no MiMo API key configured")
             return None
         override = _MIMO_MODEL_BY_PROVIDER[provider]
-        return ChatOpenAI(
+        # R-29: use MimoChatOpenAI subclass to preserve mimo's
+        # `reasoning_content` (thinking mode) per mimo API contract.
+        # Standard ChatOpenAI ignores this field → iter.1+ mimo rejects
+        # 400 «must be passed back» → fallback engaged → confab class.
+        # See sreda.services.mimo_chat_openai for details.
+        from sreda.services.mimo_chat_openai import MimoChatOpenAI
+        return MimoChatOpenAI(
             base_url=settings.mimo_base_url,
             api_key=api_key,
             # Explicit ``model=`` beats per-variant override beats
