@@ -377,6 +377,35 @@ async def handle_max_update(
             )
             return result.inbound_message_id
 
+        # R-19 (2026-05-13): drop unknown-prefix callbacks SYNCHRONOUSLY.
+        # Production incident 2026-05-12 18:58 UTC — 2 callback events
+        # с opaque MAX-generated payload (echo от bot's own outbound
+        # message c inline-кнопками) застряли с processing_status='ingested'
+        # навечно → monitor alert «unprocessed_inbound».
+        #
+        # Корень: `_handle_max_callback` (line 1107) routит только known
+        # prefixes (btn_reply:/pb:/rem_done:/rem_snooze:). Unknown prefix
+        # → returns False → caller спавнит background task → если task
+        # не start'ит (FastAPI BackgroundTasks race / asyncio loop close)
+        # — status НИКОГДА не updates → stuck в 'ingested' → false
+        # positive monitor alert.
+        #
+        # Defensive fix: detect unknown callback prefix СИНХРОННО и mark
+        # 'ignored' до spawning task. Никакого user-facing ответа
+        # (избегаем spam от echo events).
+        if _is_unknown_max_callback_prefix(payload):
+            cb_payload_str = _max_callback_payload(payload) or ""
+            logger.info(
+                "max callback unknown prefix tenant=%s inbound=%s "
+                "payload_first=%r — sync drop (R-19 defensive)",
+                onboarding.tenant_id, result.inbound_message_id,
+                cb_payload_str[:40],
+            )
+            _set_processing_status(
+                session, result.inbound_message_id, "ignored",
+            )
+            return result.inbound_message_id
+
         inbound_message_id = result.inbound_message_id
 
     # Detached approved turn. Phase 6 (outbox routing) обеспечит что
@@ -1559,6 +1588,52 @@ def _set_processing_status(session, inbound_message_id: str, status: str) -> Non
     if row is not None:
         row.processing_status = status
         session.commit()
+
+
+# R-19 (2026-05-13): known MAX callback prefixes that our handlers know
+# how to route. Used for sync detection of unknown-prefix callbacks
+# (echo events from MAX, stale tokens, etc.) → drop with status=ignored
+# instead of spawning a background task that may silently fail to set
+# processing_status (causing monitor stuck-inbound alerts).
+_KNOWN_MAX_CALLBACK_PREFIXES: tuple[str, ...] = (
+    "btn_reply:",   # inline-button label reply (our token-based)
+    "pb:",          # pending_bot tour navigation
+    "rem_done:",    # reminder mark done
+    "rem_snooze:",  # reminder snooze
+    "confirm_link:",  # channel-link confirmation (handled earlier)
+    "cancel_link:",   # channel-link cancellation (handled earlier)
+)
+
+
+def _max_callback_payload(payload: dict) -> str | None:
+    """Extract `callback.payload` string from MAX update. Returns None if
+    not a message_callback или payload format unexpected."""
+    if payload.get("update_type") != "message_callback":
+        return None
+    callback = payload.get("callback")
+    if not isinstance(callback, dict):
+        return None
+    cb_data = callback.get("payload")
+    return cb_data if isinstance(cb_data, str) else None
+
+
+def _is_unknown_max_callback_prefix(payload: dict) -> bool:
+    """True если payload — message_callback с prefix'ом, который не
+    routится ни одним из наших handler'ов. Для таких callback'ов
+    (MAX system-generated echo, stale tokens, etc.) синхронный drop
+    безопаснее spawn'а background task'а.
+
+    False для НЕ message_callback (другие update types should pass through).
+    """
+    if payload.get("update_type") != "message_callback":
+        return False
+    cb_data = _max_callback_payload(payload)
+    if cb_data is None:
+        # message_callback но payload не строка / отсутствует → unknown
+        return True
+    return not any(
+        cb_data.startswith(p) for p in _KNOWN_MAX_CALLBACK_PREFIXES
+    )
 
 
 def _extract_max_display_name(payload: dict) -> str | None:
