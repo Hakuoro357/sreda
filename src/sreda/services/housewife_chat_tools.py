@@ -20,6 +20,51 @@ from pydantic import BeforeValidator
 from sqlalchemy.orm import Session
 
 
+# R-30 (2026-05-15): anti-confab guard для всех mutating tools. Префиксуется
+# к docstring каждого write-tool через ``_write_lc_tool`` — попадает в
+# ``description`` поле LangChain Tool spec'а, видится LLM'ом перед каждым
+# вызовом. Trigger: trace_1be1a4c0f576464e — mimo вызвала
+# ``add_checklist_items × 8`` на чистом read-intent «Покажи мне весь крой
+# на сегодня». R-30 — точечный hotfix до R-20 Stage 1 plan'а.
+#
+# Wording оптимизирован под mimo-v2.5-pro: явный negative example
+# (read-verbs НЕ повод писать), explicit fallback («если сомневаешься —
+# спроси»), русский текст под русскоязычный prompt контекст. Размер
+# ~350 chars × 36 write-tools = ~12KB добавки к tool spec — приемлемо
+# на mimo 1M context window. После R-20 Stage 1 deploy можно откатить
+# (guard станет редундантным с final-output validator'ом).
+WRITE_GUARD = (
+    "[WRITE-TOOL] Вызывай ТОЛЬКО когда пользователь ЯВНО выразил намерение "
+    "что-то записать/добавить/сохранить/создать/изменить/удалить/отменить/"
+    "напомнить/запланировать/отметить/перенести/вычеркнуть — например: "
+    "«добавь», «запиши», «поставь», «сохрани», «создай», «занеси», "
+    "«обнови», «измени», «удали», «отмени», «напомни», «запланируй», "
+    "«отметь», «перенеси», «вычеркни» и подобные write-глаголы. Список "
+    "иллюстративный, НЕ исчерпывающий — определяй intent по смыслу, не по "
+    "точному совпадению слова. Read-команды («покажи», «посмотри», "
+    "«что у меня в...», «какие...», «есть ли», «прочитай») НЕ являются "
+    "поводом вызывать write-tools. Если у пользователя read-намерение и "
+    "список пустой или неполный — отвечай ТЕКСТОМ, НЕ заполняй сам списки "
+    "prior knowledge'ом. Если сомневаешься — спроси «записать?» сначала."
+)
+
+
+def _write_lc_tool(fn):
+    """R-30 write-tool wrapper. Prepends ``WRITE_GUARD`` to the function's
+    docstring (which LangChain's ``@tool`` uses as the description passed
+    to the LLM), then delegates to ``lc_tool``.
+
+    Применяется к каждому mutating tool в ``build_housewife_tools``.
+    Read-only tools (``list_*``, ``show_*``, ``get_*``, ``search_*``,
+    ``reply_with_buttons``) остаются на ``@lc_tool`` без guard'а.
+    """
+    if fn.__doc__:
+        fn.__doc__ = WRITE_GUARD + "\n\n" + fn.__doc__
+    else:
+        fn.__doc__ = WRITE_GUARD
+    return lc_tool(fn)
+
+
 def _coerce_to_list(value: Any) -> Any:
     """Pydantic BeforeValidator: если LLM прислала JSON-строку
     типа ``'["a","b"]'`` (что наблюдалось в проде у MiMo для
@@ -100,7 +145,7 @@ def build_housewife_tools(
 
     service = HousewifeReminderService(session, embedding_client=embedding_client)
 
-    @lc_tool
+    @_write_lc_tool
     def schedule_reminder(
         title: str, trigger_iso: str, recurrence_rule: str | None = None
     ) -> str:
@@ -210,7 +255,7 @@ def build_housewife_tools(
         lines = [_format_reminder_for_llm(r) for r in reminders[:20]]
         return "active reminders:\n" + "\n".join(lines)
 
-    @lc_tool
+    @_write_lc_tool
     def update_reminder(
         reminder_id: str,
         *,
@@ -289,7 +334,7 @@ def build_housewife_tools(
         next_at = rem.next_trigger_at.isoformat() if rem.next_trigger_at else "none"
         return f"ok:updated:{rem.id}:{next_at}"
 
-    @lc_tool
+    @_write_lc_tool
     def cancel_reminder(reminder_id: str) -> str:
         """Cancel a pending reminder by its id.
 
@@ -314,7 +359,7 @@ def build_housewife_tools(
     # ----------------------------------------------------------------
     onboarding_service = HousewifeOnboardingService(session)
 
-    @lc_tool
+    @_write_lc_tool
     def onboarding_answered(topic: str, summary: str) -> str:
         """Mark an onboarding topic as answered and advance to the next one.
 
@@ -360,7 +405,7 @@ def build_housewife_tools(
         next_topic = state.get("current_topic") or "none"
         return f"ok:answered:{topic_norm}:next={next_topic}:status={state.get('status')}"
 
-    @lc_tool
+    @_write_lc_tool
     def onboarding_deferred(topic: str, reason: str) -> str:
         """Mark an onboarding topic as deferred and advance to the next one.
 
@@ -399,7 +444,7 @@ def build_housewife_tools(
             f"next={next_topic}:status={state.get('status')}"
         )
 
-    @lc_tool
+    @_write_lc_tool
     def onboarding_complete() -> str:
         """Explicitly mark onboarding complete.
 
@@ -429,7 +474,7 @@ def build_housewife_tools(
     # ----------------------------------------------------------------
     shopping_service = HousewifeShoppingService(session)
 
-    @lc_tool
+    @_write_lc_tool
     def add_shopping_items(items: list[dict[str, Any]]) -> str:
         """Add items to the user's shopping list.
 
@@ -474,7 +519,7 @@ def build_housewife_tools(
         ids_csv = ",".join(r.id for r in rows)
         return f"ok:added:{len(rows)}:ids=[{ids_csv}]"
 
-    @lc_tool
+    @_write_lc_tool
     def mark_shopping_bought(item_ids: list[str]) -> str:
         """Mark shopping list items as bought (checked off).
 
@@ -502,7 +547,7 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:bought:{n}"
 
-    @lc_tool
+    @_write_lc_tool
     def remove_shopping_items(item_ids: list[str]) -> str:
         """Remove items from the shopping list (cancel without buying).
 
@@ -528,7 +573,7 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:removed:{n}"
 
-    @lc_tool
+    @_write_lc_tool
     def update_shopping_item(
         item_id: str,
         title: str | None = None,
@@ -576,7 +621,7 @@ def build_housewife_tools(
             return f"error: item {item_id!r} not found"
         return f"ok:updated:{row.id}"
 
-    @lc_tool
+    @_write_lc_tool
     def update_shopping_items_category(
         item_ids: list[str],
         category: str,
@@ -650,7 +695,7 @@ def build_housewife_tools(
             lines.append(f"  [{r.id}] {r.title}{qty}")
         return "\n".join(lines)
 
-    @lc_tool
+    @_write_lc_tool
     def clear_bought_shopping() -> str:
         """Cancel all items currently in the ``bought`` state — use as
         bulk housekeeping when the user has finished a shopping trip
@@ -679,7 +724,7 @@ def build_housewife_tools(
     # ----------------------------------------------------------------
     recipe_service = HousewifeRecipeService(session)
 
-    @lc_tool
+    @_write_lc_tool
     def save_recipe(
         title: str,
         ingredients: ListOfDict,
@@ -788,7 +833,7 @@ def build_housewife_tools(
             return f"ok:duplicate:{recipe.id}"
         return f"ok:saved:{recipe.id}"
 
-    @lc_tool
+    @_write_lc_tool
     def save_recipes_batch(recipes: ListOfDict) -> str:
         """Batch-save multiple recipes to the user's recipe book in one call.
 
@@ -951,7 +996,7 @@ def build_housewife_tools(
             lines.append(recipe.instructions_md)
         return "\n".join(lines)
 
-    @lc_tool
+    @_write_lc_tool
     def delete_recipe(recipe_id: str) -> str:
         """Delete a recipe from the user's book. Cascades to ingredients.
 
@@ -982,7 +1027,7 @@ def build_housewife_tools(
     # ----------------------------------------------------------------
     menu_service = HousewifeMenuService(session)
 
-    @lc_tool
+    @_write_lc_tool
     def plan_week_menu(
         week_start: str,
         days: list[dict[str, Any]],
@@ -1075,7 +1120,7 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:plan_created:{plan.id}:{plan.week_start_date.isoformat()}"
 
-    @lc_tool
+    @_write_lc_tool
     def update_menu_item(
         plan_id: str,
         day_of_week: int,
@@ -1192,7 +1237,7 @@ def build_housewife_tools(
     # ----------------------------------------------------------------
     family_service = HousewifeFamilyService(session)
 
-    @lc_tool
+    @_write_lc_tool
     def generate_shopping_from_menu(plan_id: str) -> str:
         """Pull all ingredients from a menu plan's recipes into the
         shopping list, scaled to the user's family size.
@@ -1263,7 +1308,7 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:generated:{len(rows)}:eaters={eaters}"
 
-    @lc_tool
+    @_write_lc_tool
     def add_family_members(members: list[dict[str, Any]]) -> str:
         """Add one or more family members at once.
 
@@ -1352,7 +1397,7 @@ def build_housewife_tools(
             )
         return "\n".join(lines)
 
-    @lc_tool
+    @_write_lc_tool
     def update_family_member(
         member_id: str,
         name: str | None = None,
@@ -1394,7 +1439,7 @@ def build_housewife_tools(
             return "error: internal"
         return "ok:updated" if row else f"error: member {member_id!r} not found"
 
-    @lc_tool
+    @_write_lc_tool
     def remove_family_member(member_id: str) -> str:
         """Delete a family member record. Use only when user explicitly
         says to remove someone (moved out, no longer applicable)."""
@@ -1483,7 +1528,7 @@ def build_housewife_tools(
             bits.append(f"notes={t.notes}")
         return " · ".join(bits)
 
-    @lc_tool
+    @_write_lc_tool
     def add_task(
         title: str,
         scheduled_date: str | None = None,
@@ -1618,7 +1663,7 @@ def build_housewife_tools(
             return "no tasks"
         return "\n".join(_fmt_task_for_llm(t) for t in rows)
 
-    @lc_tool
+    @_write_lc_tool
     def update_task(
         task_id: str,
         title: str | None = None,
@@ -1659,7 +1704,7 @@ def build_housewife_tools(
             return f"error: task {task_id!r} not found"
         return f"ok:updated:{task.id}"
 
-    @lc_tool
+    @_write_lc_tool
     def complete_task(task_id: str) -> str:
         """Mark a task as done. For one-shot tasks with a linked
         reminder, the reminder gets cancelled automatically (no ping
@@ -1678,7 +1723,7 @@ def build_housewife_tools(
             return f"error: task {task_id!r} not found"
         return f"ok:completed:{task.id}"
 
-    @lc_tool
+    @_write_lc_tool
     def uncomplete_task(task_id: str) -> str:
         """Restore a completed task to pending. The linked reminder,
         if it got cancelled on completion, is NOT brought back — the
@@ -1696,7 +1741,7 @@ def build_housewife_tools(
             return f"error: task {task_id!r} not found"
         return f"ok:uncompleted:{task.id}"
 
-    @lc_tool
+    @_write_lc_tool
     def cancel_task(task_id: str) -> str:
         """Soft-cancel a task — row stays in DB with status=cancelled,
         disappears from pending lists. Cancels the linked reminder
@@ -1715,7 +1760,7 @@ def build_housewife_tools(
             return f"error: task {task_id!r} not found"
         return f"ok:cancelled:{task.id}"
 
-    @lc_tool
+    @_write_lc_tool
     def delete_task(task_id: str) -> str:
         """Hard-delete a task (row gone from DB). Cancels the linked
         reminder if any. Use when user says "убери совсем", "удали"."""
@@ -1730,7 +1775,7 @@ def build_housewife_tools(
             return "error: internal"
         return "ok:deleted" if ok else f"error: task {task_id!r} not found"
 
-    @lc_tool
+    @_write_lc_tool
     def attach_reminder(task_id: str, offset_minutes: int) -> str:
         """Attach a reminder to an already-created task. Use when the
         user answered the post-creation "нужно ли напоминание?"
@@ -1756,7 +1801,7 @@ def build_housewife_tools(
             return f"error: task {task_id!r} not found"
         return f"ok:reminder_attached:{task.reminder_id}:за {offset_minutes}мин"
 
-    @lc_tool
+    @_write_lc_tool
     def detach_reminder(task_id: str) -> str:
         """Remove the reminder from a task (cancels the underlying
         FamilyReminder). Use when user says "убери напоминание с
@@ -1774,7 +1819,7 @@ def build_housewife_tools(
             return f"error: task {task_id!r} not found"
         return "ok:reminder_detached"
 
-    @lc_tool
+    @_write_lc_tool
     def clear_menu(week_start: str) -> str:
         """Delete the weekly menu for the given week.
 
@@ -1848,7 +1893,7 @@ def build_housewife_tools(
     # ------------------------------------------------------------------
     checklist_service = ChecklistService(session, embedding_client=embedding_client)
 
-    @lc_tool
+    @_write_lc_tool
     def create_checklist(title: str) -> str:
         """Create a named checklist (todo-list with checkboxes).
 
@@ -1876,7 +1921,7 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:created:{cl.id}:{cl.title}"
 
-    @lc_tool
+    @_write_lc_tool
     def add_checklist_items(list_id_or_title: str, items: list[str]) -> str:
         """Add items to an existing checklist (or create one if missing).
 
@@ -1928,7 +1973,7 @@ def build_housewife_tools(
             )
         return f"ok:added:{len(added)}:list={cl.id}"
 
-    @lc_tool
+    @_write_lc_tool
     def move_task_to_checklist(
         task_id: str, list_id_or_title: str
     ) -> str:
@@ -2066,7 +2111,7 @@ def build_housewife_tools(
             lines.append(f"[{it.id}] {mark} {it.title}")
         return "\n".join(lines)
 
-    @lc_tool
+    @_write_lc_tool
     def mark_checklist_item_done(
         list_id_or_title: str, item_title_match: str,
     ) -> str:
@@ -2098,7 +2143,7 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:done:{done.id}:{done.title}"
 
-    @lc_tool
+    @_write_lc_tool
     def delete_checklist_item(
         list_id_or_title: str, item_title_match: str,
     ) -> str:
@@ -2140,7 +2185,7 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:deleted:{item_id}:{item_title}"
 
-    @lc_tool
+    @_write_lc_tool
     def archive_checklist(list_id_or_title: str) -> str:
         """Archive a checklist (hide from active lists, keep in DB).
 
