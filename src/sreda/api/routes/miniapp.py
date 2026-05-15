@@ -1698,6 +1698,63 @@ def toggle_checklist_item_endpoint(
     return {"ok": True, "status": new_status}
 
 
+@router.post("/api/v1/checklist/{checklist_id}/archive")
+def archive_checklist_endpoint(
+    checklist_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """R-31 (2026-05-15): archive checklist from Mini App.
+
+    User feedback (tg_755682022): «дать возможность удалять списки дел...
+    добавить иконку слева в титул списка. Удалять с подтверждением без
+    перезагрузки страницы».
+
+    Semantics:
+    - «Delete» в UI = soft-archive в backend (status='archived'). Items
+      сохраняются в БД для post-hoc analysis / future restore (Boris's
+      directive: «не удаляй users' data сразу»).
+    - Idempotent: already-archived → 200 ``{"ok": True, "already_archived": True}``
+      (R6 review fix — не возвращаем 404 для idempotent retry).
+    - Ownership guard: checklist должен принадлежать (ctx.tenant_id, ctx.user_id).
+      Чужой / nonexistent → 404.
+
+    R-33 phase will extend: при archive linked checklist → автоматически
+    unlink `task.checklist_id = NULL`. R-31 (этот endpoint) deploys
+    первым; Task.checklist_id column ещё не существует, поэтому unlink
+    логика добавится в R-33.
+    """
+    from sreda.db.models.checklists import Checklist
+    from sreda.services.checklists import ChecklistService
+
+    # Ownership check
+    cl = (
+        session.query(Checklist)
+        .filter(
+            Checklist.id == checklist_id,
+            Checklist.tenant_id == ctx.tenant_id,
+            Checklist.user_id == ctx.user_id,
+        )
+        .one_or_none()
+    )
+    if cl is None:
+        raise HTTPException(status_code=404, detail="checklist_not_found")
+
+    if cl.status == "archived":
+        # R6 review: idempotent — useful for retry / double-click scenarios.
+        return {"ok": True, "already_archived": True}
+
+    svc = ChecklistService(session)
+    archived = svc.archive_list(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, list_id=checklist_id,
+    )
+    if archived is None:
+        # Race condition: archive_list lost it (concurrent delete or status flip)
+        raise HTTPException(status_code=404, detail="checklist_not_found")
+
+    return {"ok": True, "already_archived": False}
+
+
 # ────────────────────────────────────────────────────────────────────
 # Channel linking endpoints (Phase 7 of MAX integration sprint, 2026-05-04)
 #

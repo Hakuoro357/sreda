@@ -563,6 +563,13 @@
     return el.innerHTML;
   }
 
+  // R-31 (2026-05-15, Codex R2 MAJOR fix): escape для HTML attribute context.
+  // `escHtml` использует textContent→innerHTML которое escape'ит `<>&` но НЕ `"`,
+  // т.к. `"` валиден в text node. Для attribute value нужно явно escape кавычки.
+  function escAttr(s) {
+    return escHtml(s).replace(/"/g, "&quot;");
+  }
+
   function findPlan(planKey) {
     if (!state.plans || !state.plans.plans) return null;
     for (var i = 0; i < state.plans.plans.length; i++) {
@@ -1205,11 +1212,22 @@
       // Открытым по умолчанию — если есть pending. Если все done —
       // свернутый, чтобы не отвлекал.
       var openAttr = hasPending ? ' open' : '';
-      html += '<details class="card"' + openAttr + ' style="padding:0">';
+      // R-31 fix (Qwen R1 MAJOR): pass id+title через data-attributes,
+      // не через inline onclick string literal — apostrophes в title
+      // ломали JS parse (escape order issue).
+      html += '<details class="card" data-checklist-id="' + escAttr(cl.id) + '" data-checklist-title="' + escAttr(cl.title) + '"' + openAttr + ' style="padding:0">';
       html += '<summary style="padding:14px 16px;cursor:pointer;list-style:none">';
-      html += '<div style="display:flex;justify-content:space-between;align-items:center">';
-      html += '<div class="card-title" style="margin:0">' + escHtml(cl.title) + '</div>';
-      html += '<div class="card-subtitle" style="margin:0">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px">';
+      // R-31 (2026-05-15): delete-icon в левой части title. Click ловится
+      // through stopPropagation чтобы не toggle'нуть <details>.
+      html += '<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">';
+      html += '<button type="button" class="checklist-archive-btn" ' +
+              'onclick="event.stopPropagation();window._archiveChecklistFromBtn(this);return false;" ' +
+              'style="background:none;border:none;padding:0 4px 0 0;cursor:pointer;font-size:18px;line-height:1;color:var(--tg-theme-destructive-text-color,#e53935);flex-shrink:0" ' +
+              'aria-label="Удалить список">🗑️</button>';
+      html += '<div class="card-title" style="margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(cl.title) + '</div>';
+      html += '</div>';
+      html += '<div class="card-subtitle" style="margin:0;flex-shrink:0">';
       html += cl.pending + ' / ' + cl.total;
       html += '</div></div></summary>';
 
@@ -2036,6 +2054,88 @@
           }
         }).catch(function() { showAlert("Не удалось удалить."); });
     });
+  };
+
+  // R-31 (2026-05-15): button click handler — reads data-attrs from the
+  // <details> ancestor (Qwen R1 MAJOR fix: avoids inline-onclick string-
+  // literal escape issues с apostrophes/backslashes в title).
+  window._archiveChecklistFromBtn = function(btn) {
+    var card = btn.closest('details.card[data-checklist-id]');
+    if (!card) return;
+    var checklistId = card.getAttribute('data-checklist-id');
+    var title = card.getAttribute('data-checklist-title') || '';
+    if (!checklistId) return;
+    window._archiveChecklist(checklistId, title);
+  };
+
+  // R-31 (2026-05-15): archive checklist from Mini App. Soft-delete
+  // через `archive_list` backend (status='archived'). UI animate
+  // fade-out → remove DOM + state prune, без перезагрузки страницы.
+  // Confirmation per user request («Удалять с подтверждением»).
+  window._archiveChecklist = function(checklistId, title) {
+    showPopup(
+      "Удалить список «" + title + "» вместе со всеми пунктами?",
+      function() {
+        apiFetch(
+          "/miniapp/api/v1/checklist/" + encodeURIComponent(checklistId) + "/archive",
+          { method: "POST" }
+        ).then(function(res) {
+          if (res && res.ok) {
+            // Optimistic UI: fade-out card → remove DOM → prune state.
+            // CSS.escape: defensive against IDs с special chars (Qwen MINOR 7).
+            var safeId = (window.CSS && window.CSS.escape)
+              ? window.CSS.escape(checklistId)
+              : checklistId.replace(/(["\\])/g, '\\$1');
+            var card = document.querySelector(
+              'details.card[data-checklist-id="' + safeId + '"]'
+            );
+            if (card) {
+              card.style.transition = "opacity 220ms ease, max-height 220ms ease";
+              card.style.opacity = "0";
+              card.style.maxHeight = card.offsetHeight + "px";
+              setTimeout(function() {
+                card.style.maxHeight = "0";
+                card.style.overflow = "hidden";
+              }, 50);
+              setTimeout(function() {
+                if (card.parentNode) {
+                  card.parentNode.removeChild(card);
+                }
+              }, 280);
+            }
+            // Prune state.checklists.checklists so subsequent renders
+            // не показывают только что удалённый.
+            if (
+              state.checklists &&
+              state.checklists.checklists &&
+              Array.isArray(state.checklists.checklists)
+            ) {
+              state.checklists.checklists = state.checklists.checklists.filter(
+                function(c) { return c.id !== checklistId; }
+              );
+              // Codex R1 MINOR 3: если был последний — full re-render
+              // чтобы показать empty-state placeholder, а не пустой header.
+              if (state.checklists.checklists.length === 0) {
+                setTimeout(function() { render(); }, 320); // после fade animation
+              }
+            }
+            // Haptic confirmation
+            try {
+              if (
+                window.Telegram && window.Telegram.WebApp &&
+                window.Telegram.WebApp.HapticFeedback
+              ) {
+                window.Telegram.WebApp.HapticFeedback.notificationOccurred("success");
+              }
+            } catch (e) {}
+          } else {
+            showAlert("Не удалось удалить список.");
+          }
+        }).catch(function() {
+          showAlert("Не удалось удалить список.");
+        });
+      }
+    );
   };
 
   // Family-member edit modal. Opens with the current row's fields
