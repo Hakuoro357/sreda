@@ -160,6 +160,20 @@ class Settings(BaseSettings):
     # отправлял бы alert'ы в Boris'овский чат вместо своего.
     admin_telegram_chat_id: str | None = None
 
+    # R-28 amendment 2026-05-15: админ-алерты переехали с TG на MAX как
+    # primary channel (Boris directive «пусть прилетает в макс а не в
+    # телегу»). TG остаётся fallback'ом если MAX POST упал (HTTP non-2xx
+    # или timeout) — двойная защита от silent loss.
+    #
+    # Default = None: MAX-канал не используется, fall-through на
+    # admin_telegram_chat_id (legacy path). Для prod выставить
+    # SREDA_ADMIN_MAX_CHAT_ID=320955459 (Boris's MAX chat_id).
+    #
+    # Требует ``max_bot_token`` (см. выше) — без него MAX disabled
+    # и алерт автоматически идёт в TG. Hardcode 320955459 нельзя — те же
+    # OSS-soundsafety причины что и admin_telegram_chat_id.
+    admin_max_chat_id: str | None = None
+
     # CSV list of log files surfaced in the /admin/logs view. Each entry
     # may be a plain path (``/tmp/sreda-uvicorn.log``) or ``label=path``
     # (``Uvicorn=/tmp/sreda-uvicorn.log``) for a friendlier nav label.

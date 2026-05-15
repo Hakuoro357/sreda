@@ -109,39 +109,70 @@ def _release_in_flight(dedupe_key: str) -> None:
 
 
 async def alert_admin_async(text: str) -> bool:
-    """Send a critical alert to the configured admin Telegram chat.
+    """Send a critical alert through admin channel (MAX primary → TG fallback).
 
-    Returns True if message was delivered, False otherwise. Failure
-    never raises — alert system itself failing should not crash the
-    main application.
+    R-28 amendment 2026-05-15 (Codex review MAJOR): этот legacy async helper
+    использовался callers'ами в ``main.py``/``embeddings.py``/``miniapp.py``/
+    ``max_subscription_health.py``/``outbox_delivery.py`` и ходил только в
+    Telegram. После переезда админ-канала на MAX надо чтобы и legacy path
+    использовал MAX-primary + TG-fallback — иначе при removed TG chat_id
+    эти alerts silently уходят в никуда.
 
-    Text может быть многострочным; Telegram примет до 4096 chars.
+    Реализация: async wrapper'ит sync ``_post_max_sync`` / ``_post_telegram_sync``
+    через ``asyncio.to_thread`` (5s timeout each, total ≤10s в worst case).
+    Returns True если **любой** канал доставил.
+
+    Text может быть многострочным; обрезается до 4000 chars (MAX/TG limit).
     """
+    import asyncio
+
     settings = get_settings()
-    chat_id = settings.admin_telegram_chat_id
-    token = settings.telegram_bot_token
+    tg_bot_token = settings.telegram_bot_token
+    tg_chat_id = settings.admin_telegram_chat_id
+    max_bot_token = settings.max_bot_token
+    max_chat_id = settings.admin_max_chat_id
 
-    if not chat_id:
-        logger.warning("alert_admin: admin_telegram_chat_id not configured; skipping")
-        return False
-    if not token:
-        logger.warning("alert_admin: telegram_bot_token not configured; skipping")
+    max_ok = bool(max_bot_token and max_chat_id)
+    tg_ok = bool(tg_bot_token and tg_chat_id)
+    if not (max_ok or tg_ok):
+        logger.warning(
+            "alert_admin: no channel configured (MAX or TG); skipping"
+        )
         return False
 
-    # Truncate если безумно длинный — Telegram limit 4096 chars.
     if len(text) > 4000:
         text = text[:3990] + "\n…[truncated]"
 
-    try:
-        client = TelegramClient(token=token)
-        await client.send_message(chat_id=chat_id, text=text)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "alert_admin: failed to deliver (chat=%s): %s",
-            chat_id, exc,
-        )
-        return False
+    # Try MAX first if configured.
+    if max_ok:
+        try:
+            ok = await asyncio.to_thread(
+                _post_max_sync, max_bot_token, max_chat_id, text,
+            )
+            if ok:
+                logger.info("alert_admin: delivered via MAX")
+                return True
+            logger.warning("alert_admin: MAX failed, falling back to Telegram")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("alert_admin: MAX exception: %s, fallback to TG", exc)
+
+    # Fallback (or primary if MAX unconfigured) — Telegram.
+    if tg_ok:
+        try:
+            ok = await asyncio.to_thread(
+                _post_telegram_sync, tg_bot_token, tg_chat_id, text,
+            )
+            if ok:
+                logger.info("alert_admin: delivered via Telegram")
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "alert_admin: Telegram exception (chat=%s): %s",
+                tg_chat_id, exc,
+            )
+
+    logger.warning("alert_admin: delivery failed across all channels")
+    return False
 
 
 # =====================================================================
@@ -283,6 +314,37 @@ def _post_telegram_sync(bot_token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def _post_max_sync(bot_token: str, chat_id: str, text: str) -> bool:
+    """R-28 amendment 2026-05-15: sync httpx POST к MAX /messages.
+
+    MAX recipient routing (per ``integrations/max/client.py`` probe
+    2026-05-05): ``chat_id`` идёт в **query string**, не в body. Body
+    содержит только ``{"text": "..."}``. Auth header — ``Authorization:
+    <token>`` БЕЗ Bearer-префикса (MAX API contract).
+
+    5s timeout как у TG — bound caller latency. Best-effort, exceptions
+    swallowed → caller (fallback path) попробует TG.
+    """
+    try:
+        resp = httpx.post(
+            "https://platform-api.max.ru/messages",
+            params={"chat_id": chat_id},
+            json={"text": text},
+            headers={"Authorization": bot_token},
+            timeout=5.0,
+        )
+        if 200 <= resp.status_code < 300:
+            return True
+        logger.warning(
+            "admin_alerts: MAX returned %s: %s",
+            resp.status_code, resp.text[:200],
+        )
+        return False
+    except Exception:  # noqa: BLE001 — must never crash caller
+        logger.exception("admin_alerts: MAX POST failed")
+        return False
+
+
 def _deliver_in_thread(
     *,
     dedupe_key: str,
@@ -290,14 +352,23 @@ def _deliver_in_thread(
     title: str,
     body: str,
     extra_context: dict | None,
-    bot_token: str,
-    chat_id: str,
+    tg_bot_token: str | None,
+    tg_chat_id: str | None,
+    max_bot_token: str | None,
+    max_chat_id: str | None,
 ) -> None:
-    """Background-thread payload: dedup check + format + Telegram POST + mark.
+    """Background-thread payload: dedup check + format + POST + mark.
 
     Runs в daemon thread spawned by ``send_admin_alert`` (Xiaomi R1 medium:
     decouples 5s HTTP latency from caller's request path). Exceptions
-    swallowed via _post_telegram_sync/dedup fail-open. Caller never blocks.
+    swallowed via _post_*_sync/dedup fail-open. Caller never blocks.
+
+    R-28 amendment 2026-05-15: **MAX primary + TG fallback**. Boris
+    directive «пусть прилетает в макс а не в телегу». Если MAX configured
+    (max_bot_token + max_chat_id) — пробуем MAX первым; на любой failure
+    (HTTP non-2xx, timeout, exception) — fall through to TG если
+    configured. Mark-sent fires только после первого успешного POST
+    (любого канала) — duplicate suppression работает cross-channel.
     """
     # Phase 1: in-flight lease (Codex R3 MAJOR fix). MUST take BEFORE dedup
     # check — иначе stale-then-release race:
@@ -358,14 +429,43 @@ def _deliver_in_thread(
         text_payload = text_payload[:3950] + "\n\n…(truncated)"
 
     # Phase 4: deliver (sync httpx — already в background thread, no blocking)
+    # R-28 amendment: MAX primary → TG fallback. ok=True если **любой** канал
+    # доставил; mark_sent при первом успехе. delivered_via — для diagnostic
+    # logs (audit какой канал реально сработал).
+    ok = False
+    delivered_via: str | None = None
     try:
-        ok = _post_telegram_sync(bot_token, chat_id, text_payload)
+        if max_bot_token and max_chat_id:
+            if _post_max_sync(max_bot_token, max_chat_id, text_payload):
+                ok = True
+                delivered_via = "max"
+            else:
+                # MAX упал — fallback на TG если configured.
+                if tg_bot_token and tg_chat_id:
+                    logger.warning(
+                        "admin_alerts: MAX delivery failed for key=%s, "
+                        "falling back to Telegram",
+                        dedupe_key,
+                    )
+                    if _post_telegram_sync(tg_bot_token, tg_chat_id, text_payload):
+                        ok = True
+                        delivered_via = "telegram_fallback"
+        elif tg_bot_token and tg_chat_id:
+            # MAX не configured — TG как single channel (legacy behavior).
+            if _post_telegram_sync(tg_bot_token, tg_chat_id, text_payload):
+                ok = True
+                delivered_via = "telegram"
+
         if ok:
+            logger.info(
+                "admin_alerts: delivered via %s (key=%s severity=%s)",
+                delivered_via, dedupe_key, severity,
+            )
             # Phase 5: mark sent (Codex R1 M2: только после successful POST).
             _mark_sent(dedupe_key)
         else:
             logger.warning(
-                "admin_alerts: delivery failed for key=%s, "
+                "admin_alerts: delivery failed across all channels for key=%s, "
                 "last_sent_at unchanged — will retry on next occurrence",
                 dedupe_key,
             )
@@ -411,12 +511,20 @@ def send_admin_alert(
     """
     # Early exit checks на caller thread (no I/O)
     settings = get_settings()
-    bot_token = settings.telegram_bot_token
-    chat_id = settings.admin_telegram_chat_id
-    if not bot_token or not chat_id:
+    tg_bot_token = settings.telegram_bot_token
+    tg_chat_id = settings.admin_telegram_chat_id
+    max_bot_token = settings.max_bot_token
+    max_chat_id = settings.admin_max_chat_id
+
+    # R-28 amendment: at least one channel must be fully configured.
+    # MAX configured = max_bot_token + admin_max_chat_id (primary).
+    # TG configured = telegram_bot_token + admin_telegram_chat_id (fallback or legacy).
+    max_ok = bool(max_bot_token and max_chat_id)
+    tg_ok = bool(tg_bot_token and tg_chat_id)
+    if not (max_ok or tg_ok):
         logger.debug(
-            "admin_alerts: telegram_bot_token or admin_telegram_chat_id "
-            "missing, skipping (severity=%s title=%s)",
+            "admin_alerts: no channel configured (MAX or TG), "
+            "skipping (severity=%s title=%s)",
             severity, title,
         )
         return
@@ -434,8 +542,10 @@ def send_admin_alert(
                 "title": title,
                 "body": body,
                 "extra_context": extra_context,
-                "bot_token": bot_token,
-                "chat_id": chat_id,
+                "tg_bot_token": tg_bot_token if tg_ok else None,
+                "tg_chat_id": tg_chat_id if tg_ok else None,
+                "max_bot_token": max_bot_token if max_ok else None,
+                "max_chat_id": max_chat_id if max_ok else None,
             },
             daemon=True,
             name=f"admin-alert-{severity}",
