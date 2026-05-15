@@ -2531,8 +2531,31 @@ def execute_conversation_chat(
                 # Считаем только успешные вызовы — для timeout-rescue
                 # summary показываем что РЕАЛЬНО сделали в БД. Errors не
                 # стоит обещать юзеру.
-                if result_str.startswith("ok") or result_str.startswith("saved"):
+                is_success = result_str.startswith("ok") or result_str.startswith("saved")
+                if is_success:
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
+
+                # R-30 option C (2026-05-15): soft validator — alert when
+                # mutating tool fired on read-intent user_text. Не блокирует
+                # выполнение, только log + admin alert для мониторинга
+                # частоты confab класса до R-20 Stage 1 deploy. Helper
+                # swallows exceptions internally (Codex R1 R-30 C MINOR 3:
+                # extracted в alert_if_unsolicited_write для testability).
+                if is_success:
+                    from sreda.services.write_intent_validator import (
+                        alert_if_unsolicited_write,
+                    )
+                    _trace_ctx = trace.current()
+                    alert_if_unsolicited_write(
+                        user_text=user_text,
+                        tool_name=name,
+                        result_str=result_str,
+                        tenant_id=action.tenant_id,
+                        feature_key=feature_key,
+                        iter_num=_iter,
+                        user_id=user_id,
+                        trace_id=_trace_ctx.trace_id if _trace_ctx else None,
+                    )
             messages.append(ToolMessage(content=result_str, tool_call_id=tc_id))
     else:
         # Budget exhausted while still calling tools. Force ONE final
