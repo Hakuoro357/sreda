@@ -891,21 +891,54 @@
     if (t.is_recurring) iconsPrefix += "\uD83D\uDD04 ";   // 🔄
     if (t.has_reminder) iconsPrefix += "\uD83D\uDD14 ";   // 🔔
 
-    var h = '<div style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)">';
-    // R-33 (2026-05-15): если task linked с checklist → title becomes clickable link
-    // на detail view + 📋 → button. Иначе обычный текст.
+    // R-33 (2026-05-15, Boris update): если task linked с checklist →
+    // inline accordion прямо в расписании. Tap → раскрывается, items
+    // загружаются lazy через loadChecklistDetail.
     if (t.checklist_id) {
-      var hashLink = "#/checklists/" + encodeURIComponent(t.checklist_id);
-      h += '<div style="font-weight:500;display:flex;align-items:center;gap:6px">'
-        + iconsPrefix
-        + '<a href="' + escAttr(hashLink) + '" style="color:inherit;text-decoration:none;flex:1;min-width:0">'
-        + escHtml(t.title)
-        + '</a>'
-        + '<span style="font-size:14px;flex-shrink:0;opacity:0.7" title="Открыть список дел">📋 →</span>'
-        + '</div>';
-    } else {
-      h += '<div style="font-weight:500">' + iconsPrefix + escHtml(t.title) + '</div>';
+      var counterText = "";
+      if (t.checklist_total != null && t.checklist_total > 0) {
+        counterText = t.checklist_pending + "/" + t.checklist_total;
+      }
+      var hAcc = '<details class="task-card" data-task-id="' + escAttr(t.id) + '" '
+        + 'data-checklist-id="' + escAttr(t.checklist_id) + '" '
+        + 'style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)" '
+        + 'ontoggle="window._onTaskAccordionToggle(this)">';
+      hAcc += '<summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px">';
+      hAcc += '<div style="font-weight:500;flex:1;min-width:0">' + iconsPrefix + escHtml(t.title) + '</div>';
+      // Counter — stable selector .task-cl-counter для DOM patch после item toggle.
+      hAcc += '<span class="task-cl-counter" data-checklist-id="' + escAttr(t.checklist_id) + '" '
+        + 'style="font-size:13px;opacity:0.7;flex-shrink:0' + (counterText ? '' : ';display:none') + '">'
+        + (counterText ? '📋 ' + counterText : '')
+        + '</span>';
+      hAcc += '</summary>';
+      // Items container — lazy filled by _onTaskAccordionToggle на first open.
+      hAcc += '<div class="task-checklist-items" style="margin-top:8px"></div>';
+      // Meta bits (time, reminder, delegated, notes) — те же что для plain row.
+      var metaBitsAcc = [];
+      if (t.time_start) {
+        metaBitsAcc.push(t.time_end
+          ? (t.time_start + "–" + t.time_end)
+          : t.time_start);
+      }
+      if (t.has_reminder && t.reminder_offset_minutes) {
+        metaBitsAcc.push("напомнить за " + t.reminder_offset_minutes + " мин");
+      }
+      if (t.delegated_to) {
+        metaBitsAcc.push("поручено: " + escHtml(t.delegated_to));
+      }
+      if (metaBitsAcc.length > 0) {
+        hAcc += '<div class="card-subtitle" style="margin-top:2px">' + metaBitsAcc.join(" · ") + '</div>';
+      }
+      if (t.notes) {
+        hAcc += '<div class="card-subtitle" style="margin-top:2px;font-style:italic">' + escHtml(t.notes) + '</div>';
+      }
+      hAcc += '</details>';
+      return hAcc;
     }
+
+    // Без linked checklist — простой row.
+    var h = '<div style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)">';
+    h += '<div style="font-weight:500">' + iconsPrefix + escHtml(t.title) + '</div>';
     var metaBits = [];
     if (t.time_start) {
       metaBits.push(t.time_end
@@ -1426,7 +1459,6 @@
           var its = cl.items || [];
           for (var ii = 0; ii < its.length; ii++) {
             if (its[ii].id !== itemId) continue;
-            var prev = its[ii].status;
             its[ii].status = wasDone ? 'pending' : 'done';
             // Recompute aggregates by replaying статусов.
             var pending = 0, done = 0;
@@ -1436,8 +1468,7 @@
             }
             cl.pending = pending;
             cl.done = done;
-            // Patch <summary> counter в DOM (rowEl → ближайший
-            // <details> → <summary> → .card-subtitle).
+            // Patch <summary> counter в DOM — checklist list view (R-31).
             try {
               var det = rowEl.closest('details');
               if (det) {
@@ -1445,10 +1476,53 @@
                 if (sub) sub.textContent = pending + ' / ' + (cl.total || its.length);
               }
             } catch (_e) { /* DOM patch best-effort */ }
-            return;
+            break;
           }
         }
       } catch (_e) { /* state patch best-effort */ }
+
+      // R-33 Boris update 2026-05-15 (Codex+Qwen R1 MEDIUM): also patch
+      // state.checklistDetail (used by schedule accordion + standalone
+      // detail view) + DOM counter в schedule accordion via stable
+      // .task-cl-counter[data-checklist-id] selector. Stale counter
+      // после toggle item был MEDIUM finding обоих reviewers.
+      try {
+        if (state.checklistDetail) {
+          for (var cid in state.checklistDetail) {
+            if (!Object.prototype.hasOwnProperty.call(state.checklistDetail, cid)) continue;
+            var d = state.checklistDetail[cid];
+            if (!d || d._error || !d.items) continue;
+            for (var di = 0; di < d.items.length; di++) {
+              if (d.items[di].id !== itemId) continue;
+              d.items[di].status = wasDone ? 'pending' : 'done';
+              // Recompute aggregates
+              var dPending = 0, dDone = 0;
+              for (var dk = 0; dk < d.items.length; dk++) {
+                if (d.items[dk].status === 'done') dDone += 1;
+                else if (d.items[dk].status !== 'cancelled') dPending += 1;
+              }
+              d.pending = dPending;
+              d.done = dDone;
+              // Patch schedule accordion counter (stable selector).
+              try {
+                var counters = document.querySelectorAll(
+                  '.task-cl-counter[data-checklist-id="' + cid + '"]'
+                );
+                for (var ci = 0; ci < counters.length; ci++) {
+                  if (d.total > 0) {
+                    counters[ci].textContent = '📋 ' + dPending + '/' + d.total;
+                    counters[ci].style.display = '';
+                  } else {
+                    counters[ci].textContent = '';
+                    counters[ci].style.display = 'none';
+                  }
+                }
+              } catch (_de) { /* DOM patch best-effort */ }
+              break;
+            }
+          }
+        }
+      } catch (_e) { /* checklistDetail patch best-effort */ }
     }).catch(function(_err) {
       markEl.textContent = wasDone ? DONE_MARK : TODO_MARK;
       textEl.setAttribute('style', wasDone
@@ -2171,6 +2245,99 @@
     });
   };
 
+  // R-33 (2026-05-15, Boris): inline accordion — fetch + render items
+  // когда юзер раскрыл task с linked checklist'ом прямо в расписании.
+  // Lazy: items загружаются на first open. State cache hit re-renders без fetch.
+  window._onTaskAccordionToggle = function(detailsEl) {
+    if (!detailsEl.open) return;  // collapsed → ничего не делаем
+    var checklistId = detailsEl.getAttribute("data-checklist-id");
+    if (!checklistId) return;
+    var container = detailsEl.querySelector(".task-checklist-items");
+    if (!container) return;
+    // Already rendered? skip refetch (toggle reuses cache).
+    if (container.getAttribute("data-rendered") === "1") return;
+    // Codex R1 LOW (R-33 Boris): race guard. open→close→open fast =
+    // duplicate fetches. data-loading flag prevents second fetch до
+    // первого response. Late response also rejected если accordion
+    // was reopened in the meantime (data-loading увеличивается).
+    if (container.getAttribute("data-loading") === "1") return;
+    container.setAttribute("data-loading", "1");
+    container.innerHTML = '<div class="card-subtitle" style="padding:8px 0">Загружаем...</div>';
+    var cached = state.checklistDetail[checklistId];
+    if (cached && !cached._error) {
+      _renderTaskInlineItems(container, cached, checklistId);
+      container.removeAttribute("data-loading");
+      return;
+    }
+    // Fetch fresh
+    apiFetch(
+      "/miniapp/api/v1/checklist/" + encodeURIComponent(checklistId)
+    ).then(function(detail) {
+      // Drop late response если accordion закрыт (race с close).
+      if (!detailsEl.open) {
+        container.removeAttribute("data-loading");
+        container.innerHTML = "";  // clear "Загружаем..." stub
+        return;
+      }
+      if (!detail || detail._error) {
+        container.innerHTML = '<div class="error-state">Не удалось загрузить список.</div>';
+        container.removeAttribute("data-loading");
+        return;
+      }
+      state.checklistDetail[checklistId] = detail;
+      _renderTaskInlineItems(container, detail, checklistId);
+      container.removeAttribute("data-loading");
+    }).catch(function() {
+      container.innerHTML = '<div class="error-state">Не удалось загрузить список.</div>';
+      container.removeAttribute("data-loading");
+    });
+  };
+
+  // Render checklist items inline под task'ом в расписании. Items
+  // toggle-able (reuse _toggleChecklistItem); + кнопка «✕ Удалить список».
+  function _renderTaskInlineItems(container, detail, checklistId) {
+    var items = detail.items || [];
+    var html = '<div style="background:rgba(0,0,0,0.03);border-radius:6px;padding:10px 12px">';
+    if (items.length === 0) {
+      html += '<div class="card-subtitle" style="padding:6px 0">Пунктов пока нет.</div>';
+    } else {
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var isDone = it.status === 'done';
+        var isCancelled = it.status === 'cancelled';
+        var mark = isDone ? "☑" : (isCancelled ? "✗" : "☐");
+        var textStyle = isDone
+          ? 'text-decoration:line-through;opacity:0.55'
+          : (isCancelled ? 'opacity:0.45;color:var(--tg-theme-hint-color,#999)' : '');
+        var rowStyle = 'display:flex;gap:10px;padding:6px 0;align-items:flex-start';
+        if (!isCancelled && detail.status === "active") {
+          rowStyle += ';cursor:pointer';
+          html += '<div style="' + rowStyle + '" '
+            + 'onclick="window._toggleChecklistItem(this, \'' + escAttr(it.id) + '\')">';
+        } else {
+          html += '<div style="' + rowStyle + '">';
+        }
+        html += '<div class="cl-mark" style="font-size:18px;line-height:1.2;flex-shrink:0;min-width:20px">' + mark + '</div>';
+        html += '<div class="cl-text" style="flex:1;' + textStyle + '">' + escHtml(it.title) + '</div>';
+        html += '</div>';
+      }
+    }
+    // Delete-list button (text variant per Boris choice 2026-05-15)
+    if (detail.status === "active") {
+      html += '<div style="margin-top:10px;text-align:right">';
+      html += '<button type="button" class="checklist-archive-btn" '
+        + 'data-checklist-id="' + escAttr(checklistId) + '" '
+        + 'data-checklist-title="' + escAttr(detail.title) + '" '
+        + 'onclick="event.stopPropagation();window._archiveChecklistFromBtn(this);return false;" '
+        + 'style="background:none;border:1px solid rgba(229,57,53,0.4);border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px;color:var(--tg-theme-destructive-text-color,#e53935)">'
+        + '✕ Удалить список</button>';
+      html += '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+    container.setAttribute("data-rendered", "1");
+  }
+
   // R-31 (2026-05-15): button click handler — reads data-attrs.
   // Priority: button's own data-checklist-id (R-33 detail view),
   // fallback to closest <details> ancestor (R-31 list view).
@@ -2249,6 +2416,17 @@
               setTimeout(function() {
                 location.hash = "#/checklists";
               }, 320);
+            }
+            // R-33 Boris update 2026-05-15: schedule view может содержать
+            // linked task (accordion с этим checklist). После archive
+            // task → unlinked → counter и accordion должны исчезнуть.
+            // Force schedule re-fetch чтобы _task_dict вернул свежий
+            // checklist_id=NULL.
+            if (state.schedule) {
+              state.schedule = null;
+              if (currentRoute === "/schedule") {
+                setTimeout(function() { loadSchedule(); }, 350);
+              }
             }
             // Haptic confirmation
             try {

@@ -1567,27 +1567,52 @@ def build_housewife_tools(
                 ЧЕКЛИСТЕ вместо длинного title. Если передаёшь — создаётся
                 fresh Checklist с тем же title, items добавляются туда,
                 task получает link на этот checklist. В UI расписания
-                показывается короткий title + кнопка «📋 →» открывающая
-                detail view. **PRINCIPLE**: используй details_items ТОЛЬКО
-                для задач-«контейнеров» где состав — distinct items.
-                Простые tasks (купить молоко, позвонить врачу) → НЕ
-                передавай details_items.
+                показывается короткий title + counter «N/M» + раскрывается
+                inline (accordion). **PRINCIPLE**: details_items для
+                задач-«контейнеров» где SAME verb + список ОБЪЕКТОВ.
+                Если несколько РАЗНЫХ verbs — это РАЗНЫЕ tasks → multiple
+                add_task calls, не details_items.
+
+                **КЛЮЧЕВОЕ ПРАВИЛО (Boris 2026-05-15)**:
+                - Same verb + перечисление объектов → 1 task с
+                  details_items. «Купи хлеб, макароны, яйца» →
+                  title="Купить", details_items=["хлеб","макароны","яйца"].
+                - Разные verbs → multiple add_task calls. «Купи хлеб,
+                  помой машину, заедь в банк» → 3 separate add_task
+                  calls (не details_items!).
 
                 POSITIVE EXAMPLES (use details_items):
+                - User: «Купи хлеб, макароны и яйца завтра» →
+                  title="Купить", details_items=["хлеб","макароны","яйца"]
+                  (same verb «купить» + 3 объекта).
                 - User: «Поставь крой на пятницу: страйп белый, ледяная
                   мята, жемчуг» → title="Крой", scheduled_date="2026-05-15",
                   details_items=["страйп белый","ледяная мята","жемчуг"]
+                  (1 cutting session + перечисление тканей).
                 - User: «Сделай задачу уборка на завтра: пропылесосить,
                   мыть пол, окна» → title="Уборка",
                   details_items=["пропылесосить","мыть пол","окна"]
+                  (1 cleaning activity + sub-steps).
+                - User: «На субботу поехать в храм: почитать молитву,
+                  собрать вещи, включить машину» → title="Поехать в храм",
+                  scheduled_date="2026-05-16",
+                  details_items=["почитать молитву","собрать вещи",
+                                 "включить машину"]
+                  (1 trip + подготовительные steps).
 
                 NEGATIVE EXAMPLES (do NOT use details_items):
                 - User: «Купи молоко завтра» → title="Купить молоко",
-                  details_items=None (НЕ создавай checklist с одним item)
+                  details_items=None (один item — НЕ нужен checklist).
+                - User: «Купи хлеб, помой машину, заедь в банк» →
+                  **3 SEPARATE add_task calls** (разные verbs!):
+                    1. add_task(title="Купить хлеб", ...)
+                    2. add_task(title="Помыть машину", ...)
+                    3. add_task(title="Заехать в банк", ...)
+                  НЕ объединять в один details_items.
                 - User: «Позвони врачу в 14:00» → title="Позвонить врачу",
-                  details_items=None
-                - User: «Напомни про лекарство утром» → title="Принять
-                  лекарство", details_items=None
+                  details_items=None.
+                - User: «Напомни про лекарство утром» →
+                  title="Принять лекарство", details_items=None.
 
         Returns ``ok:created:task_<id>`` (possibly с ``+checklist`` suffix
         if details_items привёл к чеклисту) or ``error:<reason>``.

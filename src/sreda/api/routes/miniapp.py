@@ -1337,14 +1337,24 @@ def delete_recipe_endpoint(
 # ---------------------------------------------------------------------------
 
 
-def _task_dict(task) -> dict:
+def _task_dict(task, *, checklist_counts: dict | None = None) -> dict:
     """Serialize one Task row for the /schedule/week response.
 
     Time fields come back as ``"HH:MM"`` strings (LLM tools accept the
     same shape). ``has_reminder`` + ``reminder_offset_minutes`` let
     the Mini App render the 🔔 icon + "напомнить за N мин" label
     without an extra FK fetch per row.
+
+    ``checklist_counts`` (R-33 inline accordion): optional dict
+    {checklist_id: (pending, total)} — позволяет рендерить «N/M» counter
+    рядом с linked task без N+1 query'ев. Caller batch-loads counters
+    для linked checklist_id'ов одним GROUP BY.
     """
+    cl_id = getattr(task, "checklist_id", None)
+    cl_pending = None
+    cl_total = None
+    if cl_id and checklist_counts and cl_id in checklist_counts:
+        cl_pending, cl_total = checklist_counts[cl_id]
     return {
         "id": task.id,
         "title": task.title,
@@ -1356,9 +1366,53 @@ def _task_dict(task) -> dict:
         "reminder_offset_minutes": task.reminder_offset_minutes,
         "delegated_to": task.delegated_to,
         # R-33 (2026-05-15): optional 1-to-1 link к checklist. Mini-app
-        # renders «📋 →» button if not None → opens checklist detail view.
-        "checklist_id": getattr(task, "checklist_id", None),
+        # renders inline accordion с items if not None.
+        "checklist_id": cl_id,
+        "checklist_pending": cl_pending,
+        "checklist_total": cl_total,
     }
+
+
+def _batch_load_checklist_counts(
+    session, *, tenant_id: str, user_id: str, checklist_ids: list[str],
+) -> dict[str, tuple[int, int]]:
+    """R-33 (2026-05-15): batch-fetch (pending, total) для linked checklist'ов.
+
+    Single GROUP BY query вместо N+1 — для inline accordion в расписании,
+    чтобы counter «3/3» был сразу в schedule response.
+
+    Returns {checklist_id: (pending_count, total_count)}.
+    """
+    if not checklist_ids:
+        return {}
+    from sreda.db.models.checklists import Checklist, ChecklistItem
+    from sqlalchemy import func, case
+
+    # Ownership filter via Checklist join — defense-in-depth
+    rows = (
+        session.query(
+            ChecklistItem.checklist_id,
+            func.count().label("total"),
+            func.sum(
+                case((ChecklistItem.status == "pending", 1), else_=0)
+            ).label("pending"),
+        )
+        .join(Checklist, ChecklistItem.checklist_id == Checklist.id)
+        .filter(
+            Checklist.tenant_id == tenant_id,
+            Checklist.user_id == user_id,
+            ChecklistItem.checklist_id.in_(checklist_ids),
+        )
+        .group_by(ChecklistItem.checklist_id)
+        .all()
+    )
+    result: dict[str, tuple[int, int]] = {}
+    for row in rows:
+        result[row.checklist_id] = (int(row.pending or 0), int(row.total or 0))
+    # Defaults для linked-but-empty checklists (no items rows)
+    for cid in checklist_ids:
+        result.setdefault(cid, (0, 0))
+    return result
 
 
 # Human-readable day labels for the schedule screen. Generated server-
@@ -1448,9 +1502,29 @@ def get_week_schedule(
             scheduled_date=None, include_no_date=True,
             status="pending",
         )
-        inbox = [_task_dict(t) for t in inbox_rows]
     else:
-        inbox = []
+        inbox_rows = []
+
+    # R-33 (2026-05-15): batch-load checklist counts для всех linked tasks
+    # одним GROUP BY — для inline accordion counter «N/M» без N+1 queries.
+    all_linked_ids: set[str] = set()
+    for t in inbox_rows:
+        if getattr(t, "checklist_id", None):
+            all_linked_ids.add(t.checklist_id)
+    for day_tasks in per_day.values():
+        for t in day_tasks:
+            if getattr(t, "checklist_id", None):
+                all_linked_ids.add(t.checklist_id)
+    checklist_counts = _batch_load_checklist_counts(
+        session,
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        checklist_ids=list(all_linked_ids),
+    )
+
+    inbox = [
+        _task_dict(t, checklist_counts=checklist_counts) for t in inbox_rows
+    ]
 
     days = []
     cursor = week_start
@@ -1459,7 +1533,10 @@ def get_week_schedule(
             "date": cursor.isoformat(),
             "label": _day_label(cursor),
             "is_past": cursor < today,
-            "tasks": [_task_dict(t) for t in per_day.get(cursor, [])],
+            "tasks": [
+                _task_dict(t, checklist_counts=checklist_counts)
+                for t in per_day.get(cursor, [])
+            ],
         })
         cursor = cursor + timedelta(days=1)
 
