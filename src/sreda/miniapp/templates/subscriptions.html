@@ -1282,15 +1282,10 @@
       html += '<details class="card" data-checklist-id="' + escAttr(cl.id) + '" data-checklist-title="' + escAttr(cl.title) + '"' + openAttr + ' style="padding:0">';
       html += '<summary style="padding:14px 16px;cursor:pointer;list-style:none">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px">';
-      // R-31 (2026-05-15): delete-icon в левой части title. Click ловится
-      // through stopPropagation чтобы не toggle'нуть <details>.
-      html += '<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">';
-      html += '<button type="button" class="checklist-archive-btn" ' +
-              'onclick="event.stopPropagation();window._archiveChecklistFromBtn(this);return false;" ' +
-              'style="background:none;border:none;padding:0 4px 0 0;cursor:pointer;font-size:18px;line-height:1;color:var(--tg-theme-destructive-text-color,#e53935);flex-shrink:0" ' +
-              'aria-label="Удалить список">🗑️</button>';
+      // R-33 Boris update 2026-05-15: убрана 🗑️ icon в header summary;
+      // delete-кнопка теперь «✕ Удалить список» после items (consistent
+      // с inline accordion в Schedule). Header только title + counter.
       html += '<div class="card-title" style="margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(cl.title) + '</div>';
-      html += '</div>';
       html += '<div class="card-subtitle" style="margin:0;flex-shrink:0">';
       html += cl.pending + ' / ' + cl.total;
       html += '</div></div></summary>';
@@ -1318,6 +1313,15 @@
         html += '<div class="cl-text" style="flex:1;' + textStyle + '">' + escHtml(it.title) + '</div>';
         html += '</div>';
       }
+      // R-33 Boris update 2026-05-15: «✕ Удалить список» text button
+      // под items (consistent c Schedule accordion). Reads data-attrs
+      // от <details> через _archiveChecklistFromBtn.
+      html += '<div style="margin-top:10px;text-align:right">';
+      html += '<button type="button" class="checklist-archive-btn" ' +
+              'onclick="event.stopPropagation();window._archiveChecklistFromBtn(this);return false;" ' +
+              'style="background:none;border:1px solid rgba(229,57,53,0.4);border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px;color:var(--tg-theme-destructive-text-color,#e53935)">' +
+              '✕ Удалить список</button>';
+      html += '</div>';
       html += '</div>';
       html += '</details>';
     }
