@@ -1,3 +1,4 @@
+from sreda.db.models.admin_alerts import AdminAlertSeen
 from sreda.db.models.billing import (
     PaymentOrder,
     PaymentOrderItem,
@@ -53,6 +54,7 @@ from sreda.db.models.web_search import WebSearchUsage
 __all__ = [
     "AgentRun",
     "AgentThread",
+    "AdminAlertSeen",
     "Assistant",
     "AssistantMemory",
     "ConnectSession",

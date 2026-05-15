@@ -2382,16 +2382,53 @@ def execute_conversation_chat(
             except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
                 # Любая ошибка primary (timeout / 5xx / rate limit) →
                 # пытаемся fallback если он есть.
+                # R-28: alert admin для **любой** LLM error (Codex R1 M3 —
+                # fallback may be None для some configs, alert before re-raise).
+                exc_type = type(exc).__name__
+                try:
+                    from sreda.services.admin_alerts import send_admin_alert
+                    if _fallback_with_tools is None:
+                        # No fallback configured — error propagates to caller.
+                        # P0 severity: данный turn полностью failed, user видит error.
+                        send_admin_alert(
+                            severity="P0",
+                            title=f"LLM primary failed, NO fallback: {exc_type}",
+                            body=(
+                                f"tenant: {action.tenant_id}\n"
+                                f"feature: {feature_key}\n"
+                                f"iter: {_iter}\n"
+                                f"primary_exc: {exc_type}\n"
+                                f"reason: {str(exc)[:300]}\n"
+                                f"impact: turn re-raised без fallback — user sees error"
+                            ),
+                            dedupe_key=f"llm_primary_no_fallback:{exc_type}:{feature_key}",
+                        )
+                    else:
+                        # Fallback engaged — P1, degraded but turn completes.
+                        send_admin_alert(
+                            severity="P1",
+                            title=f"LLM fallback engaged: {exc_type}",
+                            body=(
+                                f"tenant: {action.tenant_id}\n"
+                                f"feature: {feature_key}\n"
+                                f"iter: {_iter}\n"
+                                f"primary_exc: {exc_type}\n"
+                                f"reason: {str(exc)[:300]}"
+                            ),
+                            dedupe_key=f"llm_fallback:{exc_type}:{feature_key}",
+                        )
+                except Exception:  # noqa: BLE001 — alert must not crash turn
+                    logger.exception("R-28 admin_alert dispatch failed")
                 if _fallback_with_tools is None:
                     raise
                 logger.warning(
                     "LLM_FALLBACK_ENGAGED tenant=%s feature=%s iter=%d "
                     "primary_exc=%s reason=%s — switching to fallback",
                     action.tenant_id, feature_key, _iter,
-                    type(exc).__name__, str(exc)[:120],
+                    exc_type, str(exc)[:120],
                 )
                 _trace_meta["fallback"] = True
-                _trace_meta["primary_exc"] = type(exc).__name__
+                _trace_meta["primary_exc"] = exc_type
                 ai_msg = invoke_with_per_call_timeout(
                     _fallback_with_tools,
                     messages,
