@@ -18,6 +18,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.reply_buttons import ReplyButtonCache
@@ -110,48 +111,100 @@ class ReplyButtonService:
         - младше TTL,
         - ещё не использован (used_at IS NULL).
 
-        При успехе — помечает ``used_at`` (защита от повторного клика).
-        Иначе возвращает None.
+        При успехе — атомарно помечает ``used_at`` через single conditional
+        UPDATE RETURNING. Concurrent callbacks для one token → only first
+        gets label, остальные None (idempotent — same button нельзя
+        обработать дважды).
+
+        R-22 (2026-05-15): R-18 r2 fixed `flush()` → `commit()` row-lock leak,
+        но оставил TOCTOU race window между SELECT и UPDATE:
+          1. Thread A SELECT: used_at=NULL → проходит check
+          2. Thread B SELECT: used_at=NULL → проходит check (parallel)
+          3. Thread A UPDATE used_at=now → commit
+          4. Thread B UPDATE used_at=now → commit (override) → returns label
+        Both calls fire downstream action (duplicate save / mutation).
+        Fix: single conditional UPDATE WHERE used_at IS NULL RETURNING label.
+        DB-level atomic — exactly one caller gets label.
+
+        Tradeoff: lost wrong-owner WARN log (нет SELECT step). Mitigation:
+        emit debug log on None result with raw existence check (read-only,
+        no lock). Frequency низкая (нормальный flow юзер жмёт свою кнопку),
+        debug visibility достаточна.
         """
-        row = self.session.get(ReplyButtonCache, token)
-        if row is None:
-            return None
-
-        # Tenant/user mismatch — подозрительно, тихо отказываем.
-        if row.tenant_id != tenant_id or row.user_id != user_id:
-            logger.warning(
-                "btn_reply token %s accessed by wrong owner "
-                "(expected tenant=%s user=%s, got tenant=%s user=%s)",
-                token, row.tenant_id, row.user_id, tenant_id, user_id,
-            )
-            return None
-
-        # Уже использован — повторный клик, no-op.
-        if row.used_at is not None:
-            return None
-
-        # Проверка TTL.
-        age = (_utcnow() - _coerce_utc(row.created_at)).total_seconds()
-        if age > TOKEN_TTL_SECONDS:
-            return None
-
-        row.used_at = _utcnow()
-        # R-18 r2 (2026-05-13, Codex review): cache `label` ДО commit'а.
-        # SQLAlchemy default `expire_on_commit=True` экспайрит все loaded
-        # instances после commit'а → доступ к `row.label` triggered бы
-        # lazy reload (новый SELECT / transaction). Сохраняем сейчас.
-        label = row.label
-        # R-18 fix (2026-05-13): COMMIT, не flush.
-        # Production incident 2026-05-12 19:46 UTC — 2 connections idle
-        # in transaction 48 минут на UPDATE reply_button_cache (row lock
-        # contention) → DB pool starvation → /admin/users 504. Корень:
-        # `flush()` отправлял UPDATE и держал row lock, но транзакция
-        # оставалась открытой — если caller exception'ил до commit'а
-        # ИЛИ session lifecycle ломался, row lock висел indefinitely.
-        # Аналогичный bug pattern был зафикшен в `create_tokens` ещё
-        # 2026-04-25 (см. комментарий там), но `resolve_token` упустили.
+        now = _utcnow()
+        ttl_cutoff = now - timedelta(seconds=TOKEN_TTL_SECONDS)
+        stmt = (
+            update(ReplyButtonCache)
+            .where(ReplyButtonCache.token == token)
+            .where(ReplyButtonCache.tenant_id == tenant_id)
+            .where(ReplyButtonCache.user_id == user_id)
+            .where(ReplyButtonCache.used_at.is_(None))
+            .where(ReplyButtonCache.created_at >= ttl_cutoff)
+            .values(used_at=now)
+            .returning(ReplyButtonCache.label)
+        )
+        result = self.session.execute(stmt)
+        row = result.first()
+        # COMMIT обязательно (R-18 fix не утрачен — UPDATE держит row lock
+        # до commit'а; без commit'а row lock leak return'нётся).
         self.session.commit()
-        return label
+        if row is None:
+            # Either: token doesn't exist / wrong owner / already used / expired.
+            # All — return None. Optional diagnostic (debug-level, single SELECT,
+            # read-only, no lock) для wrong-owner pattern detection.
+            self._log_resolve_miss(tenant_id, user_id, token)
+            return None
+        return row.label
+
+    def _log_resolve_miss(self, tenant_id: str, user_id: str, token: str) -> None:
+        """R-22: read-only diagnostic для resolve_token miss. Logs why
+        a token didn't match: missing / wrong-owner / already used / expired.
+
+        Debug-level — wrong-owner случаи редкие в normal flow. Не делает
+        UPDATE, не держит row lock. Best-effort: exceptions swallowed.
+
+        Codex+Xiaomi R1 MAJOR/LOW: ``session.get()`` после commit'а открывает
+        new implicit transaction. Без явного ``rollback()`` connection
+        остаётся "idle in transaction" — R-18 incident class. Wrap в
+        try/finally с rollback для гарантированного transaction closure.
+        """
+        try:
+            existing = self.session.get(ReplyButtonCache, token)
+            if existing is None:
+                logger.debug(
+                    "btn_reply resolve miss: token %s does not exist", token,
+                )
+            elif existing.tenant_id != tenant_id or existing.user_id != user_id:
+                # Codex+Xiaomi R1 MINOR: log convention — expected = row's
+                # actual owner (from DB), got = caller's claim (intruder).
+                logger.warning(
+                    "btn_reply token %s accessed by wrong owner "
+                    "(expected tenant=%s user=%s, got tenant=%s user=%s)",
+                    token,
+                    existing.tenant_id, existing.user_id,
+                    tenant_id, user_id,
+                )
+            elif existing.used_at is not None:
+                logger.debug(
+                    "btn_reply resolve miss: token %s already used at %s",
+                    token, existing.used_at,
+                )
+            else:
+                logger.debug(
+                    "btn_reply resolve miss: token %s expired (age=%ds)",
+                    token,
+                    int((_utcnow() - _coerce_utc(existing.created_at)).total_seconds()),
+                )
+        except Exception:  # noqa: BLE001 — diagnostic must not crash caller
+            logger.exception("btn_reply diagnostic lookup failed (token=%s)", token)
+        finally:
+            # Codex R1 MAJOR / Xiaomi R1 #2: implicit read-only tx opened by
+            # session.get() must be closed. Rollback (not commit — nothing to
+            # write) releases connection without R-18-style idle-in-tx leak.
+            try:
+                self.session.rollback()
+            except Exception:  # noqa: BLE001
+                logger.exception("btn_reply diagnostic rollback failed")
 
     def purge_expired(self, *, older_than_hours: int = 24) -> int:
         """Удаляет протухшие токены. Вызывается из scheduled-worker
