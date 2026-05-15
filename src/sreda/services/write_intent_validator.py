@@ -128,6 +128,8 @@ HOUSEWIFE_MUTATING_TOOL_NAMES: frozenset[str] = frozenset({
     # checklists (incl R-30 culprit add_checklist_items)
     "create_checklist", "add_checklist_items", "move_task_to_checklist",
     "mark_checklist_item_done", "delete_checklist_item", "archive_checklist",
+    # R-33 (2026-05-15): task↔checklist link tools
+    "link_task_to_checklist", "unlink_task",
 })
 
 

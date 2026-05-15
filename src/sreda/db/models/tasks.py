@@ -87,6 +87,21 @@ class Task(Base):
         nullable=True,
         index=True,
     )
+    # R-33 (2026-05-15, vex-assistant#42): optional 1-to-1 link к Checklist.
+    # Используется когда у task'a есть «состав/детали» которые лучше показывать
+    # отдельным чеклистом (e.g. «Крой» — task в расписании, items
+    # «страйп белый», «индийская сирень»... — в отдельном чеклисте).
+    # UNIQUE constraint в migration enforces 1-to-1 (one checklist
+    # принадлежит максимум одной task'е). ondelete=SET NULL — при hard
+    # delete checklist'а task survives (becomes orphan task without details).
+    # Soft-archive checklist (R-31 endpoint update в R-33 phase) explicitly
+    # unlinks через UPDATE task.checklist_id=NULL.
+    checklist_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("checklists.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+    )
     # Minutes before ``time_start`` that the reminder fires. Stored
     # separately from the reminder itself for display ("напомнить за
     # 15 мин") without an extra DB round-trip.

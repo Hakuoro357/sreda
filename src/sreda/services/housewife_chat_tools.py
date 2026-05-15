@@ -1537,6 +1537,7 @@ def build_housewife_tools(
         recurrence_rule: str | None = None,
         notes: str | None = None,
         reminder_offset_minutes: int | None = None,
+        details_items: list[str] | None = None,
     ) -> str:
         """Create a task in the user's planner (Расписание).
 
@@ -1561,9 +1562,35 @@ def build_housewife_tools(
                 a reminder at creation time ("с напоминанием за 15
                 минут"). Otherwise leave null and ASK the user AFTER
                 the task is created.
+            details_items: R-33 (2026-05-15) — optional list of
+                "component sub-items" чтобы хранить detals В ОТДЕЛЬНОМ
+                ЧЕКЛИСТЕ вместо длинного title. Если передаёшь — создаётся
+                fresh Checklist с тем же title, items добавляются туда,
+                task получает link на этот checklist. В UI расписания
+                показывается короткий title + кнопка «📋 →» открывающая
+                detail view. **PRINCIPLE**: используй details_items ТОЛЬКО
+                для задач-«контейнеров» где состав — distinct items.
+                Простые tasks (купить молоко, позвонить врачу) → НЕ
+                передавай details_items.
 
-        Returns ``ok:created:task_<id>`` (possibly with ``+reminder``
-        suffix) or ``error:<reason>``.
+                POSITIVE EXAMPLES (use details_items):
+                - User: «Поставь крой на пятницу: страйп белый, ледяная
+                  мята, жемчуг» → title="Крой", scheduled_date="2026-05-15",
+                  details_items=["страйп белый","ледяная мята","жемчуг"]
+                - User: «Сделай задачу уборка на завтра: пропылесосить,
+                  мыть пол, окна» → title="Уборка",
+                  details_items=["пропылесосить","мыть пол","окна"]
+
+                NEGATIVE EXAMPLES (do NOT use details_items):
+                - User: «Купи молоко завтра» → title="Купить молоко",
+                  details_items=None (НЕ создавай checklist с одним item)
+                - User: «Позвони врачу в 14:00» → title="Позвонить врачу",
+                  details_items=None
+                - User: «Напомни про лекарство утром» → title="Принять
+                  лекарство", details_items=None
+
+        Returns ``ok:created:task_<id>`` (possibly с ``+checklist`` suffix
+        if details_items привёл к чеклисту) or ``error:<reason>``.
         """
         if not user_id:
             return "error: no user_id context"
@@ -1576,6 +1603,60 @@ def build_housewife_tools(
                 "error: reminder requires scheduled_date + time_start; "
                 "re-call without reminder_offset_minutes and ask user"
             )
+
+        # R-33 R1 MAJOR (Codex fix): reminder + details_items not supported
+        # together. add_task_with_details composite path doesn't call
+        # _attach_reminder_inner — silent drop would be misleading.
+        # Reject explicitly so LLM uses correct pattern:
+        # 1) add_task с details_items → task + checklist
+        # 2) attach_reminder(task_id, offset_minutes) separately
+        if details_items and reminder_offset_minutes is not None:
+            return (
+                "error: reminder_offset_minutes не поддерживается вместе "
+                "с details_items. Сначала создай task с details_items, "
+                "потом attach_reminder(task_id, offset_minutes) отдельным "
+                "tool_call'ом."
+            )
+
+        # R-33: composite path (details_items != None) needs fresh session
+        # ownership (Codex R4: caller manages TX). Tool opens own session;
+        # default closure session uses commit-per-method pattern (legacy
+        # add_task), composite path uses fresh session + caller commit.
+        if details_items:
+            # Composite create через add_task_with_details (atomic TX).
+            from sreda.db.session import get_session_factory
+            from sreda.services.tasks import TaskService as _TS
+            sf = get_session_factory()
+            with sf() as fresh_session:
+                try:
+                    svc = _TS(fresh_session)
+                    task = svc.add_task_with_details(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        title=title,
+                        scheduled_date=date_obj,
+                        time_start=t_start,
+                        time_end=t_end,
+                        recurrence_rule=recurrence_rule,
+                        notes=notes,
+                        reminder_offset_minutes=reminder_offset_minutes,
+                        details_items=details_items,
+                    )
+                    fresh_session.commit()
+                    chk_suffix = (
+                        f":checklist={task.checklist_id}"
+                        if task.checklist_id else ""
+                    )
+                    return f"ok:created:{task.id}{chk_suffix}"
+                except ValueError as exc:
+                    fresh_session.rollback()
+                    return f"error:{exc}"
+                except Exception:  # noqa: BLE001
+                    fresh_session.rollback()
+                    logger.exception("add_task_with_details failed")
+                    return "error: internal"
+
+        # Legacy path (no details) — existing closure session + commit-per-method
         try:
             task = task_service.add(
                 tenant_id=tenant_id,
@@ -1818,6 +1899,113 @@ def build_housewife_tools(
         if task is None:
             return f"error: task {task_id!r} not found"
         return "ok:reminder_detached"
+
+    @_write_lc_tool
+    def link_task_to_checklist(task_id: str, checklist_id: str) -> str:
+        """R-33 (2026-05-15): explicit 1-to-1 link existing task → existing checklist.
+
+        Use when user wants to **attach** an existing detail-checklist to an
+        existing task. Например, юзер ранее создал task «Уборка» и отдельно
+        checklist «Уборка items» — теперь хочет их связать чтобы расписание
+        показало 📋 button.
+
+        WHEN TO USE:
+        - Both task и checklist уже существуют (созданы отдельно)
+        - User asks «связать задачу X со списком Y», «прикрепи список к
+          задаче»
+
+        WHEN NOT TO USE:
+        - Creating new task with details → use ``add_task(details_items=...)``
+          instead — composite create в одной transaction
+        - Detach link → use ``unlink_task``
+
+        Args:
+            task_id: id task'а (``task_xxx``), от ``list_tasks``
+            checklist_id: id checklist'а (``checklist_xxx``), от
+                ``list_checklists``
+
+        Returns:
+            ``ok:linked:task_xxx:checklist_yyy`` — newly linked
+            ``ok:already_linked:task_xxx:checklist_yyy`` — same pair existed
+            ``error: not found`` — task/checklist missing or wrong owner
+            ``error: archived`` — checklist not active
+            ``error: task_already_linked:task_xxx:checklist_yyy`` — task
+                имеет other checklist, unlink сначала через unlink_task
+            ``error: checklist_already_linked_to_task_xxx`` — checklist
+                принадлежит другой task'е
+        """
+        if not user_id:
+            return "error: no user_id context"
+        from sreda.db.session import get_session_factory
+        from sreda.services.tasks import TaskService as _TS
+        sf = get_session_factory()
+        with sf() as fresh_session:
+            try:
+                svc = _TS(fresh_session)
+                status, info = svc.link_to_checklist(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    task_id=task_id.strip(),
+                    checklist_id=checklist_id.strip(),
+                )
+                if status.startswith("ok"):
+                    fresh_session.commit()
+                    return f"{status}:{task_id.strip()}:{checklist_id.strip()}"
+                fresh_session.rollback()
+                if status == "error:task_already_linked_to_other":
+                    return (
+                        f"error: task_already_linked:{task_id.strip()}:"
+                        f"{info}. Unlink сначала через unlink_task."
+                    )
+                if status == "error:checklist_already_linked_to_other":
+                    return (
+                        f"error: checklist_already_linked_to_task_{info}. "
+                        "Сначала unlink другую задачу через unlink_task."
+                    )
+                return f"{status}: {info or ''}"
+            except Exception:  # noqa: BLE001
+                fresh_session.rollback()
+                logger.exception("link_task_to_checklist failed")
+                return "error: internal"
+
+    @_write_lc_tool
+    def unlink_task(task_id: str) -> str:
+        """R-33 (2026-05-15): unlink task from its checklist (если linked).
+
+        Use when user wants to **detach** detail-checklist from task. Task
+        и checklist оба остаются (separate entities) — только break the link.
+
+        Args:
+            task_id: id task'а (``task_xxx``)
+
+        Returns:
+            ``ok:unlinked:task_xxx:checklist_yyy`` — was linked, now unlinked
+            ``ok:not_linked:task_xxx`` — wasn't linked (idempotent)
+            ``error: not found`` — task missing or wrong owner
+        """
+        if not user_id:
+            return "error: no user_id context"
+        from sreda.db.session import get_session_factory
+        from sreda.services.tasks import TaskService as _TS
+        sf = get_session_factory()
+        with sf() as fresh_session:
+            try:
+                svc = _TS(fresh_session)
+                status, info = svc.unlink_from_checklist(
+                    tenant_id=tenant_id, user_id=user_id, task_id=task_id.strip(),
+                )
+                if status == "ok:unlinked":
+                    fresh_session.commit()
+                    return f"ok:unlinked:{task_id.strip()}:{info}"
+                if status == "ok:not_linked":
+                    fresh_session.commit()
+                    return f"ok:not_linked:{task_id.strip()}"
+                fresh_session.rollback()
+                return f"{status}: {info or ''}"
+            except Exception:  # noqa: BLE001
+                fresh_session.rollback()
+                logger.exception("unlink_task failed")
+                return "error: internal"
 
     @_write_lc_tool
     def clear_menu(week_start: str) -> str:
@@ -2248,6 +2436,9 @@ def build_housewife_tools(
         delete_task,
         attach_reminder,
         detach_reminder,
+        # R-33 (2026-05-15, vex-assistant#42): task↔checklist link
+        link_task_to_checklist,
+        unlink_task,
         # Inline-кнопки (Часть 0 плана v2).
         reply_with_buttons,
         # Чек-листы — именованные списки дел с галочками (план 2026-04-25)

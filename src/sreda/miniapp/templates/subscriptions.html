@@ -152,6 +152,7 @@
     recipeDetail: {},
     schedule: null,
     checklists: null,
+    checklistDetail: {},  // R-33: per-id cache для detail view
     family: null,
     loading: true,
     error: null,
@@ -436,6 +437,23 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.recipeDetail[recipeId] = { _error: true };
+        render();
+      }
+    });
+  }
+
+  // R-33 (2026-05-15): single checklist detail loader (used by
+  // #/checklists/{id} route navigated from schedule task с linked
+  // checklist). Endpoint returns object directly (not wrapped).
+  function loadChecklistDetail(checklistId) {
+    return apiFetch(
+      "/miniapp/api/v1/checklist/" + encodeURIComponent(checklistId)
+    ).then(function(res) {
+      state.checklistDetail[checklistId] = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.checklistDetail[checklistId] = { _error: true };
         render();
       }
     });
@@ -874,7 +892,20 @@
     if (t.has_reminder) iconsPrefix += "\uD83D\uDD14 ";   // 🔔
 
     var h = '<div style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)">';
-    h += '<div style="font-weight:500">' + iconsPrefix + escHtml(t.title) + '</div>';
+    // R-33 (2026-05-15): если task linked с checklist → title becomes clickable link
+    // на detail view + 📋 → button. Иначе обычный текст.
+    if (t.checklist_id) {
+      var hashLink = "#/checklists/" + encodeURIComponent(t.checklist_id);
+      h += '<div style="font-weight:500;display:flex;align-items:center;gap:6px">'
+        + iconsPrefix
+        + '<a href="' + escAttr(hashLink) + '" style="color:inherit;text-decoration:none;flex:1;min-width:0">'
+        + escHtml(t.title)
+        + '</a>'
+        + '<span style="font-size:14px;flex-shrink:0;opacity:0.7" title="Открыть список дел">📋 →</span>'
+        + '</div>';
+    } else {
+      h += '<div style="font-weight:500">' + iconsPrefix + escHtml(t.title) + '</div>';
+    }
     var metaBits = [];
     if (t.time_start) {
       metaBits.push(t.time_end
@@ -1262,6 +1293,85 @@
     html += 'Тапни галочку — отметится как сделанное. Тап ещё раз — снимется. ' +
             'Голосом тоже работает: «купила сахар», «убери из списка X».';
     html += '</div>';
+    return html;
+  }
+
+  // R-33 (2026-05-15): single checklist detail view.
+  // Route: #/checklists/{id}. Used when navigating from schedule task's
+  // 📋 → button. Renders: header (title + back-link if linked_task_id),
+  // items с toggle-able checkboxes, + 🗑️ archive button.
+  function renderChecklistDetail(checklistId) {
+    setupBackButton(true);
+    var detail = state.checklistDetail[checklistId];
+    if (!detail) {
+      loadChecklistDetail(checklistId);
+      return renderLoading();
+    }
+    if (detail._error) {
+      return '<div class="error-state">Список не найден.</div>';
+    }
+
+    var html = '';
+    // Back-link to schedule если task linked
+    if (detail.linked_task_id) {
+      html += '<div style="margin-bottom:10px">';
+      html += '<a href="#/schedule" style="color:var(--tg-theme-link-color,#2481cc);text-decoration:none;font-size:14px">';
+      html += '↩ к расписанию';
+      html += '</a></div>';
+    }
+
+    // Title с archive button
+    html += '<div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:8px">';
+    html += '<h1 style="margin:0;flex:1">' + escHtml(detail.title) + '</h1>';
+    if (detail.status === "active") {
+      // R-33 R1 MAJOR fix: data-attributes pattern (как R-31), не inline
+      // string-literal escape — apostrophes в title ломают JS parse.
+      html += '<button type="button" ' +
+              'data-checklist-id="' + escAttr(detail.id) + '" ' +
+              'data-checklist-title="' + escAttr(detail.title) + '" ' +
+              'onclick="window._archiveChecklistFromBtn(this);return false;" ' +
+              'style="background:none;border:none;cursor:pointer;font-size:22px;line-height:1;color:var(--tg-theme-destructive-text-color,#e53935);padding:6px 4px" ' +
+              'aria-label="Удалить список">🗑️</button>';
+    }
+    html += '</div>';
+
+    if (detail.status === "archived") {
+      html += '<div class="card-subtitle" style="margin-bottom:12px;color:var(--tg-theme-hint-color,#999)">(удалён)</div>';
+    }
+
+    html += '<div class="card-subtitle" style="margin-bottom:16px">';
+    html += detail.pending + ' / ' + detail.total + ' осталось';
+    html += '</div>';
+
+    // Items
+    var items = detail.items || [];
+    if (items.length === 0) {
+      html += '<div class="empty-state">Пунктов пока нет.</div>';
+    } else {
+      html += '<div class="card" style="padding:14px 16px">';
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var isDone = it.status === 'done';
+        var isCancelled = it.status === 'cancelled';
+        var mark = isDone ? '☑' : (isCancelled ? '✗' : '☐');
+        var textStyle = isDone
+          ? 'text-decoration:line-through;opacity:0.55'
+          : (isCancelled ? 'opacity:0.45;color:var(--tg-theme-hint-color,#999)' : '');
+        var rowStyle = 'display:flex;gap:10px;padding:8px 0;align-items:flex-start';
+        if (!isCancelled && detail.status === "active") {
+          rowStyle += ';cursor:pointer';
+          html += '<div style="' + rowStyle + '" ' +
+                  'onclick="window._toggleChecklistItem(this, \'' + escAttr(it.id) + '\')">';
+        } else {
+          html += '<div style="' + rowStyle + '">';
+        }
+        html += '<div class="cl-mark" style="font-size:18px;line-height:1.2;flex-shrink:0;min-width:20px">' + mark + '</div>';
+        html += '<div class="cl-text" style="flex:1;' + textStyle + '">' + escHtml(it.title) + '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
     return html;
   }
 
@@ -1782,6 +1892,11 @@
       html = renderShopping();
     } else if (route === "/checklists") {
       html = renderChecklists();
+    } else if (route.indexOf("/checklists/") === 0) {
+      // R-33 (2026-05-15): single checklist detail view (navigation from
+      // schedule task с linked checklist).
+      var checklistDetailId = route.replace("/checklists/", "");
+      html = renderChecklistDetail(checklistDetailId);
     } else if (route === "/family") {
       html = renderFamily();
     } else if (route === "/recipes") {
@@ -2056,14 +2171,18 @@
     });
   };
 
-  // R-31 (2026-05-15): button click handler — reads data-attrs from the
-  // <details> ancestor (Qwen R1 MAJOR fix: avoids inline-onclick string-
-  // literal escape issues с apostrophes/backslashes в title).
+  // R-31 (2026-05-15): button click handler — reads data-attrs.
+  // Priority: button's own data-checklist-id (R-33 detail view),
+  // fallback to closest <details> ancestor (R-31 list view).
   window._archiveChecklistFromBtn = function(btn) {
-    var card = btn.closest('details.card[data-checklist-id]');
-    if (!card) return;
-    var checklistId = card.getAttribute('data-checklist-id');
-    var title = card.getAttribute('data-checklist-title') || '';
+    var checklistId = btn.getAttribute('data-checklist-id');
+    var title = btn.getAttribute('data-checklist-title') || '';
+    if (!checklistId) {
+      var card = btn.closest('details.card[data-checklist-id]');
+      if (!card) return;
+      checklistId = card.getAttribute('data-checklist-id');
+      title = card.getAttribute('data-checklist-title') || '';
+    }
     if (!checklistId) return;
     window._archiveChecklist(checklistId, title);
   };
@@ -2118,6 +2237,18 @@
               if (state.checklists.checklists.length === 0) {
                 setTimeout(function() { render(); }, 320); // после fade animation
               }
+            }
+            // R-33 R2 MINOR (Codex): if user был в detail view (#/checklists/{id}),
+            // нужно navigate обратно на /checklists list, otherwise страница
+            // остаётся stale (показывает archived checklist).
+            if (state.checklistDetail && state.checklistDetail[checklistId]) {
+              delete state.checklistDetail[checklistId];
+            }
+            var currentRoute = (location.hash || "").replace(/^#/, "");
+            if (currentRoute.indexOf("/checklists/" + checklistId) === 0) {
+              setTimeout(function() {
+                location.hash = "#/checklists";
+              }, 320);
             }
             // Haptic confirmation
             try {

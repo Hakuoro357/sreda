@@ -157,6 +157,163 @@ class ChecklistService:
         self.session.commit()
         return checklist
 
+    def create_list_no_commit(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        title: str,
+        force_new: bool = False,
+    ) -> Checklist:
+        """R-33 (2026-05-15): create_list variant без internal commit.
+
+        Caller MUST own the transaction. Used by ``TaskService.add_task_with_details``
+        для composite atomic create (task + checklist + items + link в одной TX).
+
+        ``force_new=True`` (default False для backward-compat):
+        - Bypass title-dedup. Если существует active list с same title — НЕ reuse,
+          создаём fresh с уникальным suffix («Крой», «Крой (2)», «Крой (3)»).
+        - Required для R-33 composite path: иначе ChecklistService может attach
+          new task к old unlinked checklist'у с тем же title (например, «Крой»
+          существует с 13.05; user 17.05 говорит «крой: ...» — мы хотим NEW
+          checklist для 17.05, не reuse 13.05's items).
+
+        ``force_new=False`` (legacy semantics):
+        - Same dedup as ``create_list``: returns existing active list с same
+          normalized title если найден.
+
+        Returns Checklist (flushed but not committed). Caller commits.
+        """
+        clean = (title or "").strip()
+        if not clean:
+            raise ValueError("title required")
+        if len(clean) > 200:
+            clean = clean[:200]
+
+        if not force_new:
+            # Legacy dedup path
+            norm_target = " ".join(clean.lower().split())
+            existing_lists = (
+                self.session.query(Checklist)
+                .filter(
+                    Checklist.tenant_id == tenant_id,
+                    Checklist.user_id == user_id,
+                    Checklist.status == "active",
+                )
+                .all()
+            )
+            for cl in existing_lists:
+                if " ".join((cl.title or "").lower().split()) == norm_target:
+                    return cl
+
+        if force_new:
+            # Find unique title с suffix on collision
+            norm_target = " ".join(clean.lower().split())
+            existing_titles = {
+                " ".join((cl.title or "").lower().split())
+                for cl in self.session.query(Checklist)
+                .filter(
+                    Checklist.tenant_id == tenant_id,
+                    Checklist.user_id == user_id,
+                    Checklist.status == "active",
+                )
+                .all()
+            }
+            final_title = clean
+            if norm_target in existing_titles:
+                # Append «(N)» suffix until unique
+                for n in range(2, 1000):
+                    candidate = f"{clean} ({n})"
+                    if " ".join(candidate.lower().split()) not in existing_titles:
+                        final_title = candidate
+                        break
+                else:
+                    raise RuntimeError(
+                        f"create_list_no_commit: cannot find unique title "
+                        f"after 1000 suffix attempts (tenant={tenant_id} "
+                        f"base={clean!r})"
+                    )
+        else:
+            final_title = clean
+
+        now = _utcnow()
+        checklist = Checklist(
+            id=f"checklist_{uuid4().hex[:24]}",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            title=final_title,
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        self.session.add(checklist)
+        self.session.flush()  # get id, NO commit — caller owns TX
+        return checklist
+
+    def add_items_no_commit(
+        self, *, list_id: str, items: list[str],
+    ) -> tuple[list[ChecklistItem], list[str]]:
+        """R-33 (2026-05-15): add_items variant без internal commit.
+
+        Caller MUST own the transaction. Same semantics as ``add_items``
+        (skip empty, dedup against existing item titles в той же checklist,
+        return (created, skipped_dup)) но flush'ит без commit.
+
+        Returns (created_items, skipped_duplicate_titles).
+        """
+        cl = self.session.get(Checklist, list_id)
+        if cl is None:
+            raise ValueError(f"checklist {list_id!r} not found")
+
+        cleaned: list[str] = []
+        for raw in items or []:
+            s = (raw or "").strip()
+            if s:
+                cleaned.append(s[:200] if len(s) > 200 else s)
+        if not cleaned:
+            return [], []
+
+        # Existing items для dedup-проверки
+        existing_items = (
+            self.session.query(ChecklistItem)
+            .filter(ChecklistItem.checklist_id == cl.id)
+            .all()
+        )
+        existing_norm = {
+            " ".join((it.title or "").lower().split())
+            for it in existing_items
+        }
+        max_pos = max(
+            (it.position for it in existing_items), default=-1
+        )
+
+        now = _utcnow()
+        created: list[ChecklistItem] = []
+        skipped_dup: list[str] = []
+        position = max_pos + 1
+        for title in cleaned:
+            norm = " ".join(title.lower().split())
+            if norm in existing_norm:
+                skipped_dup.append(title)
+                continue
+            existing_norm.add(norm)
+            item = ChecklistItem(
+                id=f"clitem_{uuid4().hex[:24]}",
+                checklist_id=cl.id,
+                position=position,
+                title=title,
+                status="pending",
+                created_at=now,
+                updated_at=now,
+            )
+            self.session.add(item)
+            created.append(item)
+            position += 1
+
+        cl.updated_at = now
+        self.session.flush()  # no commit
+        return created, skipped_dup
+
     def archive_list(
         self, *, tenant_id: str, user_id: str, list_id: str,
     ) -> Checklist | None:

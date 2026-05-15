@@ -28,6 +28,7 @@ import logging
 from datetime import date, datetime, time, timedelta, timezone
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.housewife import FamilyReminder
@@ -121,6 +122,211 @@ class TaskService:
         else:
             self.session.commit()
         return task
+
+    def add_task_with_details(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        title: str,
+        scheduled_date: date | None = None,
+        time_start: time | None = None,
+        time_end: time | None = None,
+        recurrence_rule: str | None = None,
+        notes: str | None = None,
+        delegated_to: str | None = None,
+        reminder_offset_minutes: int | None = None,
+        details_items: list[str] | None = None,
+    ) -> Task:
+        """R-33 (2026-05-15): atomic composite create (task + checklist + items + link).
+
+        **Fresh-session contract** (Codex R4 prescription): caller MUST own the
+        transaction (open fresh session, manage commit/rollback). Этот метод НЕ
+        вызывает begin/commit/rollback — только session.add + session.flush.
+        Uses _no_commit variants of ChecklistService methods.
+
+        ``details_items``:
+        - None → behaves identically to ``add()`` minus the reminder attachment
+          path (composite не auto-attaches reminder; use ``attach_reminder``
+          в отдельном tool_call если нужно).
+        - list[str] → создаёт fresh Checklist через
+          ``ChecklistService.create_list_no_commit(force_new=True)`` (suffix on
+          title collision), adds items, links task.checklist_id = checklist.id.
+
+        Vendor-locked to 1-to-1 invariant via UNIQUE constraint on
+        ``tasks_items.checklist_id``: каждый checklist linked максимум с
+        одной task'е.
+
+        Used by ``add_task`` LLM tool wrapper когда LLM передаёт details_items
+        для composite create (e.g. «Крой: страйп белый, ледяная мята, ...»
+        → task «Крой» + checklist «Крой» + 6 items + link).
+
+        Returns Task (flushed but not committed). Caller commits.
+        """
+        from sreda.services.checklists import ChecklistService
+
+        title_clean = (title or "").strip()
+        if not title_clean:
+            raise ValueError("title required")
+
+        now = _utcnow()
+        task = Task(
+            id=f"task_{uuid4().hex[:24]}",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            title=title_clean[:500],
+            notes=(notes or "").strip() or None,
+            scheduled_date=scheduled_date,
+            time_start=time_start,
+            time_end=time_end,
+            recurrence_rule=recurrence_rule or None,
+            delegated_to=(delegated_to or "").strip() or None,
+            status="pending",
+            created_at=now,
+            updated_at=now,
+        )
+        self.session.add(task)
+        self.session.flush()  # NO commit — caller owns TX
+
+        # Optional composite: checklist + items + link
+        if details_items:
+            cleaned_items = [s.strip() for s in details_items if (s or "").strip()]
+            if cleaned_items:
+                chk_svc = ChecklistService(self.session)
+                checklist = chk_svc.create_list_no_commit(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    title=title_clean,
+                    force_new=True,  # always fresh для composite path
+                )
+                chk_svc.add_items_no_commit(
+                    list_id=checklist.id,
+                    items=cleaned_items,
+                )
+                task.checklist_id = checklist.id
+                self.session.flush()
+
+        return task
+
+    def link_to_checklist(
+        self, *, tenant_id: str, user_id: str, task_id: str, checklist_id: str,
+    ) -> tuple[str, str | None]:
+        """R-33: explicit link existing task → existing checklist.
+
+        Returns ``(status, error_reason)``:
+        - ``("ok:linked", None)`` — newly linked
+        - ``("ok:already_linked", None)`` — same pair already exists (idempotent)
+        - ``("error:not_found", ...)`` — task / checklist missing or wrong owner
+        - ``("error:archived", ...)`` — checklist is archived
+        - ``("error:task_already_linked_to_other", existing_chk_id)``
+        - ``("error:checklist_already_linked_to_other", existing_task_id)``
+
+        Caller commits / rolls back based on result. Does NOT commit internally.
+        """
+        from sreda.db.models.checklists import Checklist
+
+        task = (
+            self.session.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.tenant_id == tenant_id,
+                Task.user_id == user_id,
+            )
+            .one_or_none()
+        )
+        if task is None:
+            return "error:not_found", "task_not_found"
+
+        chk = (
+            self.session.query(Checklist)
+            .filter(
+                Checklist.id == checklist_id,
+                Checklist.tenant_id == tenant_id,
+                Checklist.user_id == user_id,
+            )
+            .one_or_none()
+        )
+        if chk is None:
+            return "error:not_found", "checklist_not_found"
+        if chk.status != "active":
+            return "error:archived", f"checklist_status={chk.status}"
+
+        # Same pair → idempotent ok
+        if task.checklist_id == checklist_id:
+            return "ok:already_linked", None
+        # Task linked to OTHER checklist
+        if task.checklist_id is not None:
+            return (
+                "error:task_already_linked_to_other",
+                task.checklist_id,
+            )
+        # Checklist already linked to OTHER task. R-33 R2 MINOR (Codex):
+        # defense-in-depth — filter by tenant + user тоже, не только
+        # checklist_id. Хотя service-уровне tenant_id уже ограничен
+        # ownership check'ом checklist выше, явный filter защищает на
+        # case multi-tenant с deleted checklist accidentally re-used.
+        existing_other = (
+            self.session.query(Task)
+            .filter(
+                Task.checklist_id == checklist_id,
+                Task.tenant_id == tenant_id,
+                Task.user_id == user_id,
+            )
+            .first()
+        )
+        if existing_other is not None:
+            return (
+                "error:checklist_already_linked_to_other",
+                existing_other.id,
+            )
+
+        task.checklist_id = checklist_id
+        task.updated_at = _utcnow()
+        try:
+            self.session.flush()
+        except IntegrityError:
+            # R-33 R1 MAJOR fix (Codex): concurrent link race на UNIQUE.
+            # Two tasks linking к same checklist одновременно: both pass
+            # in-app check (existing_other was None for both) → both UPDATE →
+            # second hits UNIQUE constraint. Map to user-friendly conflict.
+            # R2 MINOR (Codex): direct IntegrityError catch, no sys.exc_info.
+            self.session.rollback()
+            return (
+                "error:checklist_already_linked_to_other",
+                "concurrent_race",
+            )
+        return "ok:linked", None
+
+    def unlink_from_checklist(
+        self, *, tenant_id: str, user_id: str, task_id: str,
+    ) -> tuple[str, str | None]:
+        """R-33: unlink task from its checklist (set checklist_id = NULL).
+
+        Returns ``(status, prev_checklist_id_or_reason)``:
+        - ``("ok:unlinked", "<prev_checklist_id>")``
+        - ``("ok:not_linked", None)`` — wasn't linked (idempotent)
+        - ``("error:not_found", "task_not_found")``
+
+        Caller commits. Checklist itself остаётся active независимо.
+        """
+        task = (
+            self.session.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.tenant_id == tenant_id,
+                Task.user_id == user_id,
+            )
+            .one_or_none()
+        )
+        if task is None:
+            return "error:not_found", "task_not_found"
+        if task.checklist_id is None:
+            return "ok:not_linked", None
+        prev = task.checklist_id
+        task.checklist_id = None
+        task.updated_at = _utcnow()
+        self.session.flush()
+        return "ok:unlinked", prev
 
     def update(
         self,

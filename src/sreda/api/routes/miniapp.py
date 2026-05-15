@@ -1355,6 +1355,9 @@ def _task_dict(task) -> dict:
         "has_reminder": bool(task.reminder_id),
         "reminder_offset_minutes": task.reminder_offset_minutes,
         "delegated_to": task.delegated_to,
+        # R-33 (2026-05-15): optional 1-to-1 link к checklist. Mini-app
+        # renders «📋 →» button if not None → opens checklist detail view.
+        "checklist_id": getattr(task, "checklist_id", None),
     }
 
 
@@ -1698,6 +1701,84 @@ def toggle_checklist_item_endpoint(
     return {"ok": True, "status": new_status}
 
 
+@router.get("/api/v1/checklist/{checklist_id}")
+def get_checklist_endpoint(
+    checklist_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """R-33 (2026-05-15): single checklist + items + linked_task_id (если есть).
+
+    Used by Mini App для navigation `#/checklists/{id}` (detail view).
+    Back-link «↩ к расписанию» рендерится если linked_task_id != null.
+
+    Response:
+        {
+          "id": "checklist_xxx",
+          "title": "Крой",
+          "status": "active" | "archived",
+          "pending": 4, "done": 2, "total": 6,
+          "items": [{"id": "clitem_yyy", "title": "...", "status": "...", "position": N}, ...],
+          "linked_task_id": "task_zzz" | null
+        }
+
+    Ownership: 404 if checklist missing or wrong tenant/user.
+    """
+    from sreda.db.models.checklists import Checklist, ChecklistItem
+    from sreda.db.models.tasks import Task
+
+    cl = (
+        session.query(Checklist)
+        .filter(
+            Checklist.id == checklist_id,
+            Checklist.tenant_id == ctx.tenant_id,
+            Checklist.user_id == ctx.user_id,
+        )
+        .one_or_none()
+    )
+    if cl is None:
+        raise HTTPException(status_code=404, detail="checklist_not_found")
+
+    items = (
+        session.query(ChecklistItem)
+        .filter(ChecklistItem.checklist_id == checklist_id)
+        .order_by(ChecklistItem.position, ChecklistItem.created_at)
+        .all()
+    )
+
+    linked_task = (
+        session.query(Task)
+        .filter(
+            Task.checklist_id == checklist_id,
+            Task.tenant_id == ctx.tenant_id,
+            Task.user_id == ctx.user_id,
+        )
+        .one_or_none()
+    )
+
+    pending = sum(1 for it in items if it.status == "pending")
+    done = sum(1 for it in items if it.status == "done")
+
+    return {
+        "id": cl.id,
+        "title": cl.title,
+        "status": cl.status,
+        "pending": pending,
+        "done": done,
+        "total": len(items),
+        "items": [
+            {
+                "id": it.id,
+                "title": it.title,
+                "status": it.status,
+                "position": it.position,
+            }
+            for it in items
+        ],
+        "linked_task_id": linked_task.id if linked_task else None,
+    }
+
+
 @router.post("/api/v1/checklist/{checklist_id}/archive")
 def archive_checklist_endpoint(
     checklist_id: str,
@@ -1743,6 +1824,27 @@ def archive_checklist_endpoint(
     if cl.status == "archived":
         # R6 review: idempotent — useful for retry / double-click scenarios.
         return {"ok": True, "already_archived": True}
+
+    # R-33 (2026-05-15): auto-unlink linked task before archive. После
+    # R-33 migration `Task.checklist_id` существует. Если checklist linked
+    # с task'ом → set task.checklist_id = NULL чтобы task survived (R-31
+    # soft-delete semantics: task → undated, без details checklist).
+    # Mini-app schedule view для unlinked task снова показывает full title
+    # без 📋 button.
+    from sreda.db.models.tasks import Task
+    linked_task = (
+        session.query(Task)
+        .filter(
+            Task.checklist_id == checklist_id,
+            Task.tenant_id == ctx.tenant_id,
+            Task.user_id == ctx.user_id,
+        )
+        .one_or_none()
+    )
+    if linked_task is not None:
+        linked_task.checklist_id = None
+        # Flush before archive_list (which commits) — keeps changes atomic.
+        session.flush()
 
     svc = ChecklistService(session)
     archived = svc.archive_list(
