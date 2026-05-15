@@ -1275,27 +1275,194 @@ def _dispatch_one_tool(
     return t_id, t_name, str(t_result)
 
 
+def _canonical_tool_call_key(tc: dict) -> tuple[str, str]:
+    """R-32 (2026-05-15): canonical (name, args) key для dedup.
+
+    JSON canonicalization обеспечивает byte-equal сравнение независимо от
+    key order в args dict. `sort_keys=True` recursively sorts dict keys
+    (но not list contents — order в list semantic). `ensure_ascii=True`
+    нормализует кириллицу в \\uXXXX. `default=str` coerces datetime /
+    Decimal / UUID / другие non-JSON types.
+
+    `tc_id` (LLM-provided) НЕ участвует в key — оно уникально per call;
+    включение бы defeats dedup.
+    """
+    # Codex R1 MINOR: explicit None check — иначе `or {}` collapses
+    # falsy values ([], "", 0, False). LangChain args обычно dict,
+    # но safety first.
+    args = tc.get("args")
+    if args is None:
+        args = {}
+    return (
+        str(tc.get("name") or ""),
+        json.dumps(
+            args,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+
+
 def _dispatch_tool_calls_batch(
     tool_calls: list[dict],
     tools_by_name: dict,
     *,
     parallel_safe: frozenset[str] = _PARALLEL_SAFE_TOOLS,
     max_workers: int = _MAX_PARALLEL_DISPATCH,
-) -> list[tuple[str, str | None, str]]:
-    """Dispatch a batch of tool_calls; parallel when safe, serial otherwise.
+) -> list[tuple[str, str | None, str, bool]]:
+    """R-32 dispatch with intra-turn dedup (protocol-preserving).
 
-    Returns list of ``(tc_id, name, result_str)`` in **tool_calls order**
-    — caller can rely on this for deterministic ToolMessage emission.
+    Returns ``[(tc_id, name, result_str, is_physical_execution)]`` в
+    **tool_calls order** — deterministic ToolMessage emission.
+
+    `is_physical_execution=True` → этот tc_id вызвал tool физически
+    (первое occurrence canonical_key). `False` → result replicated
+    из earlier physical call с тем же key (duplicate в LLM batch).
+
+    R-32 (2026-05-15): mimo иногда эмитит byte-equal duplicate
+    tool_calls в одном response (e.g., 3× add_task с identical args).
+    Без dedup ThreadPoolExecutor запускает все три параллельно → DB
+    duplicates. Этот fix collapses до 1 physical execution, но возвращает
+    3 result tuples с правильными original tc_id'ами чтобы preserve
+    LangChain tool-call protocol (каждый tool_call_id ДОЛЖЕН иметь
+    matching ToolMessage в next iteration messages).
+
+    Caller выполняет counter increment + R-30 C validator ONLY when
+    `is_physical=True` — avoids alert spam + over-counting на replicated
+    duplicates.
 
     No state mutation: caller updates called_tools / counters /
-    onboarding flags from the returned results.
+    onboarding flags from returned results.
     """
-    if _should_dispatch_in_parallel(tool_calls, parallel_safe=parallel_safe):
-        workers = min(len(tool_calls), max_workers)
+    if not tool_calls:
+        return []
+
+    # Codex R1 MAJOR fix: cache canonical key per tc ДО dispatch — иначе
+    # если tool мутирует args dict mid-execution, recompute даст different
+    # key → KeyError на replication. id() в dict для O(1) lookup
+    # (id() stable in CPython для live objects).
+    keys_by_tc_id: dict[int, tuple[str, str]] = {
+        id(tc): _canonical_tool_call_key(tc) for tc in tool_calls
+    }
+
+    # Identify unique calls для actual execution
+    seen_keys: set[tuple[str, str]] = set()
+    unique_to_dispatch: list[dict] = []
+    for tc in tool_calls:
+        key = keys_by_tc_id[id(tc)]
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_to_dispatch.append(tc)
+
+    n_collapsed = len(tool_calls) - len(unique_to_dispatch)
+    if n_collapsed:
+        # Boris directive 2026-05-15: admin alert при detected duplicates.
+        # Severity=INFO (30min dedup window per UTC-day per «llm_dup_tool_calls»
+        # key) — max 48 alerts/day. Body содержит ВСЕ original calls с
+        # truncated args для post-hoc analysis. Boris = admin owner, OK
+        # видеть own tenant data в alerts.
+        try:
+            from sreda.services.admin_alerts import send_admin_alert
+            from datetime import datetime as _dt, timezone as _tz
+            _utc_date = _dt.now(_tz.utc).date()
+            calls_summary_lines = []
+            for tc in tool_calls:
+                _alert_args = tc.get("args")
+                if _alert_args is None:
+                    _alert_args = {}
+                args_str = json.dumps(
+                    _alert_args, ensure_ascii=False, default=str,
+                )
+                if len(args_str) > 200:
+                    args_str = args_str[:197] + "..."
+                calls_summary_lines.append(
+                    f"  • {tc.get('name')}: {args_str}"
+                )
+            body = (
+                f"LLM эмитнула {len(tool_calls)} tool_calls; после "
+                f"dedup осталось {len(unique_to_dispatch)} unique. "
+                f"{n_collapsed} duplicate(s) collapsed.\n\n"
+                "Original calls:\n" + "\n".join(calls_summary_lines)
+            )
+            send_admin_alert(
+                severity="INFO",
+                title=(
+                    f"LLM duplicate tool_calls collapsed "
+                    f"(batch={len(tool_calls)} unique={len(unique_to_dispatch)})"
+                ),
+                body=body,
+                dedupe_key=(
+                    f"llm_dup_tool_calls:{_utc_date.isoformat()}"
+                ),
+                extra_context={
+                    "batch_size": len(tool_calls),
+                    "unique_after_dedup": len(unique_to_dispatch),
+                    "collapsed_count": n_collapsed,
+                },
+            )
+        except Exception:  # noqa: BLE001 — must not crash turn
+            logger.exception(
+                "R-32 admin alert failed (best-effort, swallowed)",
+            )
+
+        # Batch-level WARN log — args_digests без raw args для privacy.
+        import hashlib as _hashlib
+        digests = sorted({
+            _hashlib.sha256(
+                keys_by_tc_id[id(tc)][1].encode("utf-8")
+            ).hexdigest()[:12]
+            for tc in tool_calls
+        })
+        logger.warning(
+            "tool_call_dedup_intra_turn: batch=%d collapsed=%d unique=%d "
+            "names=%s args_digests=%s",
+            len(tool_calls), n_collapsed, len(unique_to_dispatch),
+            sorted({str(tc.get("name") or "") for tc in tool_calls}),
+            digests,
+        )
+
+    # Dispatch only unique (existing parallel/serial logic)
+    if _should_dispatch_in_parallel(unique_to_dispatch, parallel_safe=parallel_safe):
+        workers = min(len(unique_to_dispatch), max_workers)
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(_dispatch_one_tool, tc, tools_by_name) for tc in tool_calls]
-            return [f.result() for f in futures]
-    return [_dispatch_one_tool(tc, tools_by_name) for tc in tool_calls]
+            futures = [
+                ex.submit(_dispatch_one_tool, tc, tools_by_name)
+                for tc in unique_to_dispatch
+            ]
+            unique_results = [f.result() for f in futures]
+    else:
+        unique_results = [
+            _dispatch_one_tool(tc, tools_by_name)
+            for tc in unique_to_dispatch
+        ]
+    # unique_results: list[(tc_id, name, result_str)] in unique_to_dispatch order
+
+    # Build canonical_key → (name, result_str) map для replication.
+    # Используем cached keys (Codex R1 MAJOR fix) — НЕ recompute после
+    # dispatch, иначе tool mutation args → key drift → KeyError.
+    result_by_key: dict[tuple[str, str], tuple[str | None, str]] = {}
+    for unique_tc, (_tc_id_unused, name, result_str) in zip(
+        unique_to_dispatch, unique_results
+    ):
+        result_by_key[keys_by_tc_id[id(unique_tc)]] = (name, result_str)
+
+    # Iterate ORIGINAL tool_calls, build 4-tuples с is_physical flag.
+    # First occurrence of each canonical key → is_physical=True.
+    # Protocol guarantee: одно (tc_id, ...) tuple per original tool_call_id.
+    final_results: list[tuple[str, str | None, str, bool]] = []
+    key_seen_for_phys: set[tuple[str, str]] = set()
+    for tc in tool_calls:
+        key = keys_by_tc_id[id(tc)]
+        name, result_str = result_by_key[key]
+        is_physical = key not in key_seen_for_phys
+        key_seen_for_phys.add(key)
+        final_results.append((
+            str(tc.get("id") or ""), name, result_str, is_physical,
+        ))
+
+    return final_results
 
 
 # 2026-05-10: «Душа Среды» — стержень характера, не косметика.
@@ -2523,25 +2690,32 @@ def execute_conversation_chat(
             )
         _results = _dispatch_tool_calls_batch(tool_calls, tools_by_name)
 
-        for tc_id, name, result_str in _results:
+        # R-32 (2026-05-15): dispatch returns 4-tuple
+        # `(tc_id, name, result_str, is_physical_execution)` — flag
+        # distinguishes physical executions (1 per unique canonical key)
+        # vs replicated duplicates (same result_str, different tc_id).
+        # Counter + R-30 C validator gated by `is_physical` чтобы avoid
+        # over-counting / alert spam on LLM duplicate batches.
+        for tc_id, name, result_str, is_physical in _results:
             if name in _ONBOARDING_RESOLUTION_TOOLS and result_str.startswith("ok:"):
                 _onboarding_resolution_called = True
             if name:
                 called_tools.add(name)
                 # Считаем только успешные вызовы — для timeout-rescue
                 # summary показываем что РЕАЛЬНО сделали в БД. Errors не
-                # стоит обещать юзеру.
+                # стоит обещать юзеру. R-32: also gate by is_physical
+                # чтобы duplicate-collapsed batches не давали +N counter.
                 is_success = result_str.startswith("ok") or result_str.startswith("saved")
-                if is_success:
+                if is_success and is_physical:
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
 
-                # R-30 option C (2026-05-15): soft validator — alert when
-                # mutating tool fired on read-intent user_text. Не блокирует
-                # выполнение, только log + admin alert для мониторинга
-                # частоты confab класса до R-20 Stage 1 deploy. Helper
-                # swallows exceptions internally (Codex R1 R-30 C MINOR 3:
-                # extracted в alert_if_unsolicited_write для testability).
-                if is_success:
+                    # R-30 option C (2026-05-15): soft validator — alert
+                    # when mutating tool fired on read-intent user_text.
+                    # Не блокирует выполнение, только log + admin alert
+                    # для мониторинга confab класса. Helper swallows
+                    # exceptions. R-32: gated by is_physical (was
+                    # is_success only) — avoid duplicate alerts на
+                    # collapsed batches.
                     from sreda.services.write_intent_validator import (
                         alert_if_unsolicited_write,
                     )
