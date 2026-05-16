@@ -185,52 +185,132 @@ def build_housewife_tools(
 
         Returns short status string with the reminder id.
         """
+        # R-34 (2026-05-16): WARN log per non-ok return path. Forensic
+        # gap из prod incident tg_<X> 2026-05-16 05:44 UTC — bot reply
+        # «12:00 прошло», hypothesis = LLM передала вчерашнюю дату,
+        # но без логирования tool args не подтверждалось.
+        #
+        # WARN fields: tenant_id, user_id, trigger_iso_raw,
+        # parsed_trigger_utc, server_now_utc, exc_type+exc_str (sanitized)
+        # OR late_by_min, title_len. Privacy: no raw title; exception
+        # messages truncated и typed чтобы не leak DB params.
+        #
+        # Codex R1-R4 review fixes:
+        # - logger.warning (NOT logger.exception or exc_info=True) —
+        #   traceback может содержать SQLAlchemy params (incl. raw title);
+        # - exc_type — type name только, guaranteed safe;
+        # - exc_str (truncated 200) ТОЛЬКО на bounded paths (parse-error
+        #   ValueError из datetime.fromisoformat — known format, и service
+        #   ValueError — our raise с controlled message). Generic Exception
+        #   + outer fallback: exc_type only (str(SQLAlchemyError) может
+        #   embed SQL+bound params);
+        # - field names tenant_id/user_id (не tenant/user);
+        # - parse-error path: parsed_trigger_utc=None (uniform queries);
+        # - tz_label dropped (always "UTC" was misleading — server runs
+        #   UTC, user TZ is in profile but not threaded to this scope).
+        _server_now_utc = datetime.now(timezone.utc)
         try:
-            trigger_at = datetime.fromisoformat(trigger_iso)
-        except ValueError:
-            return f"error: cannot parse trigger_iso={trigger_iso!r}"
-
-        # Always work in UTC. Naive ISO is ambiguous — treat as already-UTC
-        # (the docstring says so) rather than guessing user TZ. Aware ISO
-        # with any offset gets converted to UTC so downstream compares are
-        # apples-to-apples. See services/housewife_reminders._coerce_utc
-        # for the SQLite reason this matters.
-        if trigger_at.tzinfo is None:
-            trigger_at = trigger_at.replace(tzinfo=timezone.utc)
-        else:
-            trigger_at = trigger_at.astimezone(timezone.utc)
-
-        # 2026-04-23 «баг 2a»: для one-shot напоминаний — не создаём те
-        # что уже просрочены. Иначе LLM (которая любит расписывать «в
-        # 11:00, 15:00, 20:00 сегодня» при запросе в 20:42) плодит пачку
-        # past-due записей, и воркер их выстреливает скопом. Для
-        # recurring не трогаем: RRULE сам найдёт следующее будущее
-        # срабатывание.
-        from sreda.services.housewife_reminders import (
-            LATE_FIRE_GRACE_MINUTES,
-        )
-        if not recurrence_rule:
-            now_utc = datetime.now(timezone.utc)
-            late_by_min = (now_utc - trigger_at).total_seconds() / 60
-            if late_by_min > LATE_FIRE_GRACE_MINUTES:
-                return (
-                    f"skipped:past:{trigger_iso}:"
-                    f"late_by_{int(late_by_min)}min"
+            try:
+                trigger_at = datetime.fromisoformat(trigger_iso)
+            except ValueError as parse_exc:
+                logger.warning(
+                    "schedule_reminder error: parse trigger_iso "
+                    "tenant_id=%s user_id=%s trigger_iso_raw=%r "
+                    "parsed_trigger_utc=None server_now_utc=%s "
+                    "exc_type=%s exc_str=%.200s title_len=%d",
+                    tenant_id, user_id or "?", trigger_iso,
+                    _server_now_utc.isoformat(),
+                    type(parse_exc).__name__, str(parse_exc),
+                    len(title or ""),
                 )
+                return f"error: cannot parse trigger_iso={trigger_iso!r}"
 
-        try:
-            reminder = service.schedule(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                title=title,
-                trigger_at=trigger_at,
-                recurrence_rule=recurrence_rule or None,
-                source_memo=None,
+            # Always work in UTC. Naive ISO is ambiguous — treat as already-UTC
+            # (the docstring says so) rather than guessing user TZ. Aware ISO
+            # with any offset gets converted to UTC so downstream compares are
+            # apples-to-apples. See services/housewife_reminders._coerce_utc
+            # for the SQLite reason this matters.
+            if trigger_at.tzinfo is None:
+                trigger_at = trigger_at.replace(tzinfo=timezone.utc)
+            else:
+                trigger_at = trigger_at.astimezone(timezone.utc)
+
+            # 2026-04-23 «баг 2a»: для one-shot напоминаний — не создаём те
+            # что уже просрочены. Иначе LLM (которая любит расписывать «в
+            # 11:00, 15:00, 20:00 сегодня» при запросе в 20:42) плодит пачку
+            # past-due записей, и воркер их выстреливает скопом. Для
+            # recurring не трогаем: RRULE сам найдёт следующее будущее
+            # срабатывание.
+            from sreda.services.housewife_reminders import (
+                LATE_FIRE_GRACE_MINUTES,
             )
-        except ValueError as exc:
-            return f"error: {exc}"
-        except Exception:  # noqa: BLE001
-            logger.exception("schedule_reminder failed")
+            if not recurrence_rule:
+                now_utc = datetime.now(timezone.utc)
+                late_by_min = (now_utc - trigger_at).total_seconds() / 60
+                if late_by_min > LATE_FIRE_GRACE_MINUTES:
+                    logger.warning(
+                        "schedule_reminder skipped: past trigger "
+                        "tenant_id=%s user_id=%s trigger_iso_raw=%r "
+                        "parsed_trigger_utc=%s server_now_utc=%s "
+                        "late_by_min=%d title_len=%d",
+                        tenant_id, user_id or "?", trigger_iso,
+                        trigger_at.isoformat(), now_utc.isoformat(),
+                        int(late_by_min), len(title or ""),
+                    )
+                    return (
+                        f"skipped:past:{trigger_iso}:"
+                        f"late_by_{int(late_by_min)}min"
+                    )
+
+            try:
+                reminder = service.schedule(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    title=title,
+                    trigger_at=trigger_at,
+                    recurrence_rule=recurrence_rule or None,
+                    source_memo=None,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "schedule_reminder error: service ValueError "
+                    "tenant_id=%s user_id=%s trigger_iso_raw=%r "
+                    "parsed_trigger_utc=%s server_now_utc=%s "
+                    "exc_type=%s exc_str=%.200s title_len=%d",
+                    tenant_id, user_id or "?", trigger_iso,
+                    trigger_at.isoformat(), _server_now_utc.isoformat(),
+                    type(exc).__name__, str(exc), len(title or ""),
+                )
+                return f"error: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                # Codex R3 MAJOR privacy fix: drop exc_str entirely from
+                # generic Exception paths. str(SQLAlchemyError) может
+                # содержать SQL statement + bound parameter values
+                # (включая raw title). 200-char truncation не guarantee
+                # safety. Только exc_type — type name — гарантированно
+                # safe. Diagnostic loss accepted; deep-dive = local repro.
+                logger.warning(
+                    "schedule_reminder failed: generic exception "
+                    "tenant_id=%s user_id=%s trigger_iso_raw=%r "
+                    "parsed_trigger_utc=%s server_now_utc=%s "
+                    "exc_type=%s title_len=%d",
+                    tenant_id, user_id or "?", trigger_iso,
+                    trigger_at.isoformat(), _server_now_utc.isoformat(),
+                    type(exc).__name__, len(title or ""),
+                )
+                return "error: internal"
+        except Exception as exc:  # noqa: BLE001 — outer fallback
+            # Same privacy treatment as inner generic: exc_type only,
+            # no exc_str.
+            logger.warning(
+                "schedule_reminder unexpected outer exception "
+                "tenant_id=%s user_id=%s trigger_iso_raw=%r "
+                "parsed_trigger_utc=None server_now_utc=%s "
+                "exc_type=%s title_len=%d",
+                tenant_id, user_id or "?", trigger_iso,
+                _server_now_utc.isoformat(),
+                type(exc).__name__, len(title or ""),
+            )
             return "error: internal"
 
         return f"ok:scheduled:{reminder.id}:{reminder.next_trigger_at.isoformat()}"
