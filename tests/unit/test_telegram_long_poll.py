@@ -592,3 +592,130 @@ async def test_amain_returns_0_on_cancellation_during_run_forever(fresh_db):
     assert fake_conn.close.called, (
         "poller.shutdown() must close the lock connection in finally."
     )
+
+
+# ---- R-23: commit after lock/unlock (PG idle-tx-timeout enablement) ----
+
+
+@pytest.mark.asyncio
+async def test_lock_connection_commits_after_acquire(fresh_db):
+    """R-23: after pg_try_advisory_lock succeeds, startup() must call
+    commit() on the dedicated lock connection.
+
+    Without commit(), SQLAlchemy 2.x autobegin leaves the connection
+    in `idle in transaction` state forever. PostgreSQL's
+    `idle_in_transaction_session_timeout` setting (defense-in-depth from
+    R-18) would then kick our singleton poller after the timeout window,
+    breaking the singleton guarantee and allowing duplicate pollers to
+    start.
+
+    The lock itself is session-level (`pg_try_advisory_lock`), so it
+    persists across commit — committing the transaction does NOT release
+    it. Connection returns to `idle` state, PG timeout no longer applies.
+    """
+    poller = TelegramLongPoller("test-token")
+    fake_engine = MagicMock()
+    fake_conn = MagicMock()
+    fake_conn.execute.return_value.scalar.return_value = True  # lock acquired
+
+    fake_engine.connect.return_value = fake_conn
+
+    with patch.object(tlp, "create_engine", return_value=fake_engine):
+        await poller.startup()
+
+    # commit() must have been called at least once after lock acquired
+    # to close the implicit autobegin transaction.
+    assert fake_conn.commit.called, (
+        "startup() must call self._lock_conn.commit() after "
+        "pg_try_advisory_lock to close the implicit autobegin tx. "
+        "Otherwise PG sees the connection as 'idle in transaction' "
+        "and idle_in_transaction_session_timeout would kill it."
+    )
+    # Specifically: commit called BETWEEN lock execute and the return.
+    # Verify the call order: execute (lock) → commit.
+    call_order = [c[0] for c in fake_conn.method_calls if c[0] in ("execute", "commit")]
+    assert "commit" in call_order, "commit() never called"
+    assert call_order.index("execute") < call_order.index("commit"), (
+        "commit() must come AFTER execute(pg_try_advisory_lock), "
+        "not before."
+    )
+
+    # Cleanup
+    await poller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_lock_connection_commits_after_unlock(fresh_db):
+    """R-23: after pg_advisory_unlock, shutdown() must also commit.
+
+    Symmetry with startup: the unlock query also runs under SQLAlchemy
+    2.x autobegin, leaving the connection in 'idle in transaction' state
+    if we don't commit. An explicit commit ends the implicit transaction
+    before close, keeping the lifecycle clean. (Advisory unlock is
+    session-level — the lock is released by the unlock query itself,
+    not by the commit.)
+    """
+    poller = TelegramLongPoller("test-token")
+    fake_engine = MagicMock()
+    fake_conn = MagicMock()
+    # Lock acquire returns True, unlock returns True
+    fake_conn.execute.return_value.scalar.return_value = True
+    fake_engine.connect.return_value = fake_conn
+
+    with patch.object(tlp, "create_engine", return_value=fake_engine):
+        await poller.startup()
+        commit_calls_after_startup = fake_conn.commit.call_count
+        await poller.shutdown()
+
+    # shutdown() must call commit() at least once MORE (after unlock).
+    assert fake_conn.commit.call_count > commit_calls_after_startup, (
+        f"shutdown() must call self._lock_conn.commit() after "
+        f"pg_advisory_unlock. Got {fake_conn.commit.call_count} total "
+        f"commits, expected > {commit_calls_after_startup} "
+        f"(commits after startup)."
+    )
+    # Codex R-23 review MINOR 1: assert ORDER — commit must come AFTER
+    # the unlock execute, not before. Otherwise a future regression could
+    # commit-then-unlock and still pass the count check.
+    method_calls = [c[0] for c in fake_conn.method_calls]
+    # Find indices of last execute (= unlock, since lock was first) and
+    # last commit (= post-unlock commit, since post-acquire commit was first).
+    execute_indices = [i for i, m in enumerate(method_calls) if m == "execute"]
+    commit_indices = [i for i, m in enumerate(method_calls) if m == "commit"]
+    assert execute_indices and commit_indices, "missing execute/commit"
+    last_execute = execute_indices[-1]
+    last_commit = commit_indices[-1]
+    assert last_commit > last_execute, (
+        f"shutdown() commit() must come AFTER pg_advisory_unlock execute() "
+        f"(last_execute idx={last_execute}, last_commit idx={last_commit}). "
+        f"Method order: {method_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_connection_no_commit_when_lock_denied(fresh_db):
+    """R-23 negative: when pg_try_advisory_lock returns False, we
+    raise SingletonLockError WITHOUT committing the failed transaction.
+
+    Rationale: connection is about to be closed unconditionally (lines
+    146-149); commit before close is wasted work and might mask a
+    legitimate error. The connection close itself rolls back the implicit
+    tx.
+    """
+    poller = TelegramLongPoller("test-token")
+    fake_engine = MagicMock()
+    fake_conn = MagicMock()
+    fake_conn.execute.return_value.scalar.return_value = False  # lock NOT granted
+    fake_engine.connect.return_value = fake_conn
+
+    with patch.object(tlp, "create_engine", return_value=fake_engine):
+        with pytest.raises(SingletonLockError):
+            await poller.startup()
+
+    # No commit should have been called — the lock was never acquired so
+    # there's nothing to keep around. close() handles the implicit tx.
+    assert not fake_conn.commit.called, (
+        "When lock acquisition fails, startup() should NOT commit — "
+        "connection is closed unconditionally and an unsuccessful "
+        "acquire has nothing to persist."
+    )

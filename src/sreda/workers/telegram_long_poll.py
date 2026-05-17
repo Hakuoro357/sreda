@@ -142,6 +142,16 @@ class TelegramLongPoller:
             self._lock_conn = None
             self._lock_engine = None
             raise
+        if locked:
+            # R-23: commit the implicit autobegin transaction so the
+            # connection returns to `idle` state. pg_try_advisory_lock is
+            # SESSION-level — lock persists across commit and is released
+            # only on session close or explicit pg_advisory_unlock. Without
+            # this commit, SQLAlchemy 2.x autobegin leaves the connection
+            # in `idle in transaction` state forever, blocking re-enable of
+            # `idle_in_transaction_session_timeout` (defense-in-depth from
+            # R-18, currently reverted on prod).
+            self._lock_conn.commit()
         if not locked:
             self._lock_conn.close()
             self._lock_engine.dispose()
@@ -173,6 +183,20 @@ class TelegramLongPoller:
             )
         except Exception:  # noqa: BLE001
             logger.exception("failed to release advisory lock")
+        else:
+            # R-23 symmetry: end the implicit autobegin transaction after
+            # unlock so the connection does not sit in `idle in transaction`
+            # between unlock and close. Advisory locks are session-level,
+            # so commit does not affect lock state (the unlock above
+            # already released it). Separate from the unlock try/except per
+            # Qwen R-23 review M1: distinguish unlock-failed vs commit-failed
+            # in the logs.
+            try:
+                self._lock_conn.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "failed to commit after advisory unlock (lock already released)",
+                )
         finally:
             try:
                 self._lock_conn.close()
