@@ -98,6 +98,48 @@ class ToolContract:
     supports_partial: bool = False            # отдельный флаг — даёт явный сигнал что partial возможен
 
 
+# ─── Запланированный вызов и план хода ────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """Один запланированный вызов инструмента.
+
+    Выпускается планировщиком (или формируется детерминированной
+    логикой при коррекции) и передаётся исполнителю. После исполнения
+    превращается в ``ToolJournalEntry``.
+
+    Внимание: ``args`` — обычный ``dict`` (frozen-датакласс не делает
+    его иммутабельным). Не мутировать значения после создания вызова —
+    исполнитель полагается на стабильность аргументов между расчётом
+    idempotency-ключа и фактическим вызовом callable. Если planner-у
+    нужна модификация — создавать новый ``ToolCall``.
+    """
+
+    tool_name: str
+    args: dict[str, Any]
+    action_index: int   # 0-based позиция в плане
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """План действий хода — упорядоченный список вызовов.
+
+    Пустой план = NoAction (планировщик решил что mutation не нужен).
+    Один вызов = типичный mutation. Несколько = редкий cancel+schedule
+    или multi-action ход.
+    """
+
+    calls: tuple[ToolCall, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.calls
+
+    def __len__(self) -> int:
+        return len(self.calls)
+
+
 # ─── Запись журнала ───────────────────────────────────────────────────
 
 
