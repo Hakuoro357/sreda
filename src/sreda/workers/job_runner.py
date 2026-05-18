@@ -110,6 +110,14 @@ async def run_job_loop_async() -> None:
         run_health_check_loop(), name="max_subscription_health",
     )
 
+    # SVO «ковёр» monitor (2026-05-18, Boris ad-hoc request): poll
+    # t.me/s/svo_online каждые 60s, alert админу при появлении точной
+    # фразы об ограничениях в воздушном пространстве Шереметьево.
+    from sreda.workers.svo_monitor import run_svo_monitor_loop
+    svo_task = asyncio.create_task(
+        run_svo_monitor_loop(), name="svo_monitor",
+    )
+
     try:
         while True:
             try:
@@ -120,11 +128,12 @@ async def run_job_loop_async() -> None:
             if processed == 0:
                 await asyncio.sleep(interval)
     finally:
-        health_task.cancel()
-        try:
-            await health_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for task in (health_task, svo_task):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def run_job_loop() -> None:
