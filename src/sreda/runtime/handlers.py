@@ -2419,6 +2419,80 @@ def execute_conversation_chat(
     with trace.step("chat.history_load") as _hist_meta:
         history_turns = _load_chat_history(session, run_id)
         _hist_meta["history_turns"] = len(history_turns or [])
+
+    # ─── R-39 integration (Slice 6) ──────────────────────────────────
+    # Per-tenant flag через runtime_config:
+    #   r39_pilot_tenant_ids="<id>"  → live (R-39 заменяет legacy)
+    #   r39_shadow_tenant_ids="<id>" → shadow (R-39 в фоне, legacy отвечает)
+    # Только для feature_key == "housewife_assistant".
+    # Outer try/except — если что-то упало pre-R-39 (config read,
+    # mode resolve и т.п.), безопасный fallback в legacy.
+    #
+    # См. plans/r39-integration-final.md.
+    try:
+        from sreda.agents.r39_mode import resolve_r39_mode
+        _r39_mode = resolve_r39_mode(action.tenant_id, feature_key, session)
+    except Exception:
+        logger.exception(
+            "R-39 mode resolve failed tenant=%s — fallback to legacy",
+            action.tenant_id,
+        )
+        _r39_mode = "off"
+
+    # _user_tz hoisted один раз (DRY) — используется в обеих ветках.
+    _r39_user_tz = (context.get("_profile") or {}).get(
+        "timezone", "Europe/Moscow",
+    )
+
+    if _r39_mode == "live":
+        try:
+            from sreda.agents.r39_live_runner import r39_try_live
+            from sreda.services.admin_alerts import send_admin_alert as _r39_alert
+
+            _live = r39_try_live(
+                session=session,
+                tenant_id=action.tenant_id,
+                user_id=user_id,
+                user_text=user_text,
+                feature_key=feature_key,
+                run_id=run_id,
+                user_tz=_r39_user_tz,
+                tools_list=tools,
+                runtime_reply_cls=RuntimeReply,
+                send_admin_alert_fn=_r39_alert,
+            )
+        except Exception:
+            logger.exception(
+                "R-39 live wrapper failed tenant=%s — fallback to legacy",
+                action.tenant_id,
+            )
+            _live = None
+
+        if _live is not None and _live.proceeded:
+            return [_live.reply]
+        # Иначе fall through в legacy (contract: proceeded=False
+        # гарантирует что mutating tools не запустились → дубля не будет).
+
+    elif _r39_mode == "shadow":
+        try:
+            from sreda.agents.r39_shadow_runner import kick_off_shadow_thread
+
+            kick_off_shadow_thread(
+                user_text=user_text,
+                tenant_id=action.tenant_id,
+                user_id=user_id,
+                run_id=run_id,
+                user_tz=_r39_user_tz,
+                feature_key=feature_key,
+            )
+        except Exception:
+            logger.exception(
+                "R-39 shadow kick-off failed tenant=%s — silent (legacy continues)",
+                action.tenant_id,
+            )
+        # Shadow в фоне; legacy продолжается как обычно.
+    # ─── /R-39 integration ──────────────────────────────────────────
+
     # Multi-part content with Anthropic-style ephemeral cache_control
     # on the stable prefix. Supported providers (Grok 4.1 Fast via
     # OpenRouter, Claude, Gemini) cache the prefix for 5 minutes —
