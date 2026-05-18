@@ -517,6 +517,62 @@ _COMPOSER_TEMP = 0.7
 _PLANNER_TIMEOUT = 12.0
 _COMPOSER_TIMEOUT = 8.0
 
+# Pin под план R-39 (plans/r39-final.md L77, L227, L382-383):
+#   planner+composer на gemini-3.1-flash-lite через OpenRouter,
+#   fallback chain deepseek-v4-flash → mimo-v2.5-pro.
+# Не подчиняется runtime_config.chat_primary_provider — admin
+# live-switcher переключает только legacy путь, R-39 остаётся на
+# измеренной комбинации.
+_R39_PRIMARY_PROVIDER = "openrouter-gemini-lite"
+_R39_FALLBACK_PROVIDERS = ("openrouter-deepseek", "mimo-v2.5")
+
+
+def _build_r39_llm(temperature: float) -> Any | None:
+    """Собрать R-39 LLM с явным pinning'ом на gemini-3.1 + fallback chain.
+
+    Зачем явный provider вместо ``get_chat_llm()`` defaults:
+    - План R-39 пинит конкретные модели чтобы изолировать R-39 от
+      admin live-switcher'а (другие фичи могут переключать primary
+      на mimo/nemotron — R-39 не задевается).
+    - Поведенческие свойства которые мы измерили (gemini thinking
+      levels для planner JSON output) привязаны к gemini-3.1.
+
+    Fallback chain (deepseek → mimo) — если primary OpenRouter down
+    или rate-limited, second try deepseek, последний resort mimo
+    (всегда доступен пока MiMo API key установлен).
+
+    Returns None если ни primary ни fallback'и не сконфигурированы.
+    Caller тогда возвращает None в invoke → R-39 graceful degradation.
+    """
+    from sreda.services.llm import get_chat_llm
+
+    primary = get_chat_llm(
+        provider=_R39_PRIMARY_PROVIDER, temperature=temperature,
+    )
+    fallbacks: list[Any] = []
+    for fb_provider in _R39_FALLBACK_PROVIDERS:
+        fb_llm = get_chat_llm(provider=fb_provider, temperature=temperature)
+        if fb_llm is not None:
+            fallbacks.append(fb_llm)
+
+    if primary is None:
+        if not fallbacks:
+            logger.warning(
+                "R-39: no LLM configured (primary=%s + %d fallbacks all None)",
+                _R39_PRIMARY_PROVIDER, len(_R39_FALLBACK_PROVIDERS),
+            )
+            return None
+        # Primary недоступен — promote первый fallback в primary
+        primary = fallbacks.pop(0)
+        logger.warning(
+            "R-39: primary provider %s unavailable, promoting first fallback",
+            _R39_PRIMARY_PROVIDER,
+        )
+
+    if not fallbacks:
+        return primary
+    return primary.with_fallbacks(fallbacks)
+
 
 def _make_planner_invoker(
     *, feature_key: str, tenant_id: str, session: Session, run_id: str,
@@ -526,13 +582,12 @@ def _make_planner_invoker(
     def invoke(system: str, user: str) -> dict[str, Any] | None:
         from sreda.services.llm import (
             LLMCallTimeout,
-            get_chat_llm,
             invoke_with_per_call_timeout,
         )
 
-        llm = get_chat_llm(temperature=_PLANNER_TEMP, with_fallback=True)
+        llm = _build_r39_llm(_PLANNER_TEMP)
         if llm is None:
-            logger.warning("R-39 planner: get_chat_llm returned None")
+            logger.warning("R-39 planner: _build_r39_llm returned None")
             return None
         messages = [SystemMessage(content=system), HumanMessage(content=user)]
         try:
@@ -565,11 +620,10 @@ def _make_composer_invoker(
     def invoke(system: str, user: str) -> str | None:
         from sreda.services.llm import (
             LLMCallTimeout,
-            get_chat_llm,
             invoke_with_per_call_timeout,
         )
 
-        llm = get_chat_llm(temperature=_COMPOSER_TEMP, with_fallback=True)
+        llm = _build_r39_llm(_COMPOSER_TEMP)
         if llm is None:
             return None
         messages = [SystemMessage(content=system), HumanMessage(content=user)]

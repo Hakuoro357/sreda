@@ -1006,10 +1006,18 @@ CHAT_PROVIDERS = (
     "openrouter",            # gemma-4-26b-a4b-it (default), verified fast
     "openrouter-grok",       # x-ai/grok-4.1-fast — "lowest hallucination" claim
     "openrouter-qwen",       # qwen/qwen3.6-plus — clean runner-up in bench
-    # 2026-05-12: 5 экспериментальных провайдеров удалены после серии
-    # бенчей и прод-инцидентов (gpt-oss-120b, llama-70b, llama-4-scout,
-    # deepseek-v4-flash, gemini-3.1-flash-lite). Не показали value над
-    # mimo/gemini-2.5-flash; держать их в admin UI = риск misconfiguration.
+    # 2026-05-18: gemini-3.1-flash-lite + deepseek-v4-flash восстановлены
+    # (удалялись 2026-05-12 коммитом 94d9335). R-39 plan их явно пинит:
+    # planner+composer на gemini-3.1, fallback deepseek → mimo. См.
+    # plans/r39-final.md L77, L227, L382-383. Admin-UI misconfig risk
+    # closed: эти ключи теперь использует ТОЛЬКО R-39 через явный
+    # provider= в r39_live_runner.py, не admin switcher.
+    "openrouter-gemini-lite",    # google/gemini-3.1-flash-lite — thinking levels, 1M ctx
+    "openrouter-deepseek",       # deepseek/deepseek-v4-flash — MoE 284B/13B, 1M ctx
+    # 2026-05-12: 3 экспериментальных провайдеров удалены после серии
+    # бенчей и прод-инцидентов (gpt-oss-120b, llama-70b, llama-4-scout).
+    # Не показали value над mimo/gemini-2.5-flash; держать их в admin UI =
+    # риск misconfiguration.
     # 2026-05-10 PM: Nemotron 3 Super — DeepInfra/bf16, hybrid Mamba-Transformer
     # MoE 117B/12B active, 262k ctx. Bench показал 0.88s avg (10× быстрее mimo,
     # 3.7× быстрее gemini-lite), $0.0031/turn (+35% от mimo). Прошёл D.tool_error
@@ -1045,8 +1053,11 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter": None,  # None = fall back to settings.openrouter_chat_model
     "openrouter-grok": "x-ai/grok-4.1-fast",
     "openrouter-qwen": "qwen/qwen3.6-plus",
-    # 2026-05-12: stale provider keys removed (gpt-oss-120b, llama-70b,
-    # llama-4-scout, deepseek, gemini-lite). См. CHAT_PROVIDERS comment.
+    # 2026-05-18: восстановлены для R-39 pinning (см. CHAT_PROVIDERS).
+    "openrouter-gemini-lite":       "google/gemini-3.1-flash-lite",
+    "openrouter-deepseek":          "deepseek/deepseek-v4-flash",
+    # 2026-05-12: 3 stale provider keys removed (gpt-oss-120b, llama-70b,
+    # llama-4-scout). См. CHAT_PROVIDERS comment.
     "openrouter-nemotron-3-super":  "nvidia/nemotron-3-super-120b-a12b",
     # 2026-05-12: qwen3.5-flash hybrid linear-attention + sparse MoE,
     # 1M context. Cheapest tool-calling provider в нашем бенче.
