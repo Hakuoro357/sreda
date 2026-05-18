@@ -517,14 +517,23 @@ _COMPOSER_TEMP = 0.7
 _PLANNER_TIMEOUT = 12.0
 _COMPOSER_TIMEOUT = 8.0
 
-# Pin под план R-39 (plans/r39-final.md L77, L227, L382-383):
-#   planner+composer на gemini-3.1-flash-lite через OpenRouter,
-#   fallback chain deepseek-v4-flash → mimo-v2.5-pro.
-# Не подчиняется runtime_config.chat_primary_provider — admin
-# live-switcher переключает только legacy путь, R-39 остаётся на
-# измеренной комбинации.
-_R39_PRIMARY_PROVIDER = "openrouter-gemini-lite"
-_R39_FALLBACK_PROVIDERS = ("openrouter-deepseek", "mimo-v2.5")
+# Rollback 2026-05-18 после shadow data: gemini-3.1 показал
+# regression (0 successful side_effects из 11 runs, hallucinates
+# tool names типа get_weather, missed required fields). Откатываем
+# primary на mimo-v2.5-pro до фиксов P0 (см.
+# plans/tomorrow-plan-2026-05-19.md Bug A/B/C).
+#
+# План R-39 (plans/r39-final.md L77, L227) пинит gemini-3.1 — вернёмся
+# к нему после schema enforcement + tool whitelist + parser fix.
+# Провайдеры `openrouter-gemini-lite` и `openrouter-deepseek` остаются
+# в _OPENROUTER_MODEL_BY_PROVIDER (llm.py) для будущего восстановления.
+#
+# Fallback chain пуст: смысла fall back на gemini/deepseek нет, мы их
+# именно за regressions откатили. При mimo timeout/error → graceful
+# None (в shadow безопасно — пишет halted_early run в журнал, user
+# не видит).
+_R39_PRIMARY_PROVIDER = "mimo-v2.5"
+_R39_FALLBACK_PROVIDERS: tuple[str, ...] = ()
 
 
 def _build_r39_llm(temperature: float) -> Any | None:
