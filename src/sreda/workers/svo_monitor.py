@@ -40,12 +40,17 @@ logger = logging.getLogger(__name__)
 _CHANNEL: Final = "svo_online"
 _PREVIEW_URL: Final = f"https://t.me/s/{_CHANNEL}"
 
-# Точная фраза от Бориса Аркадьевича (2026-05-18). Если канал изменит
-# формулировку — добавим вариант / regex.
-_TARGET_PHRASE: Final = (
-    "Введены временные ограничения в периметре воздушного "
-    "пространства аэропорта Шереметьево в связи с действием "
-    "сигнала «ковёр»."
+# Keyword-based matching (2026-05-18 update): ловим посты содержащие
+# ВСЕ три stem'а — «ковёр»/«ковер», «ограничен*», «введен*». Это
+# покрывает как первичные объявления («Введены ограничения … ковёр»),
+# так и followup'ы при том же event'е («Продолжается действие
+# ограничений … введением сигнала «ковер»»). Verified на истории
+# канала: post 6707 (введ-ены + ограничения + ковёр), post 6708
+# (введ-ением + ограничений + ковер), post 6712 (введены + … + ковёр).
+_KEYWORD_REGEXES: Final = (
+    re.compile(r"\bков(?:ё|е)р\w*\b", re.IGNORECASE),
+    re.compile(r"\bограничен\w+\b", re.IGNORECASE),
+    re.compile(r"\bвведен\w+\b", re.IGNORECASE),
 )
 
 # Извлекаем блоки сообщений: каждый блок имеет data-post id и
@@ -80,8 +85,13 @@ async def _fetch_preview() -> str | None:
         return None
 
 
+def _post_matches(text: str) -> bool:
+    """True если все три keyword regex match'нулись в тексте поста."""
+    return all(rx.search(text) for rx in _KEYWORD_REGEXES)
+
+
 def _extract_matching_post_id(html: str) -> str | None:
-    """Найти самый свежий пост с целевой фразой. Возвращает post_id или None.
+    """Найти самый свежий пост с целевыми keyword'ами. Возвращает post_id или None.
 
     t.me preview возвращает посты в хронологическом порядке (старые
     сверху, новые снизу). Iterate всё и берём последний match — это
@@ -94,7 +104,7 @@ def _extract_matching_post_id(html: str) -> str | None:
         # раскодировать сущности (&quot;, &laquo;, ...).
         text = _TAG_STRIP_RE.sub("", text_html)
         text = html_lib.unescape(text).strip()
-        if _TARGET_PHRASE in text:
+        if _post_matches(text):
             last_match = post_id
     return last_match
 
@@ -136,10 +146,10 @@ async def _tick() -> None:
     # (внутри spawn'ит daemon thread), не блокируется на HTTP timeout.
     send_admin_alert(
         severity="INFO",
-        title="✈️ SVO «ковёр»: ограничения в воздушном пространстве",
+        title="✈️ SVO Шереметьево: сигнал «ковёр»",
         body=(
-            f"Канал @{_CHANNEL} сообщил о введении временных ограничений "
-            f"в воздушном пространстве аэропорта Шереметьево.\n\n"
+            f"Канал @{_CHANNEL} опубликовал сообщение содержащее "
+            f"ключевые слова: ковёр + ограничения + введены.\n\n"
             f"Источник: https://t.me/{post_id}"
         ),
         dedupe_key=f"svo_monitor:{post_id}",
