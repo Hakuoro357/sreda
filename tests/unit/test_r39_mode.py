@@ -146,6 +146,46 @@ def test_runtime_config_shadow_read_error_returns_off(monkeypatch) -> None:
     assert result == "off"
 
 
+# ─── Wildcard "*" support ────────────────────────────────────────────
+
+
+def test_wildcard_shadow_matches_any_tenant(monkeypatch) -> None:
+    """Wildcard '*' в shadow → все housewife тенанты в shadow."""
+    _patch_runtime_config(monkeypatch, shadow="*")
+    for tid in ("42", "tenant_max_40921122", "tenant_tg_882189769", "random_string"):
+        assert resolve_r39_mode(
+            tenant_id=tid, feature_key="housewife_assistant",
+            session=_StubSession(),
+        ) == "shadow", f"failed for {tid}"
+
+
+def test_wildcard_pilot_matches_any_tenant(monkeypatch) -> None:
+    """Wildcard '*' в pilot → все housewife тенанты live."""
+    _patch_runtime_config(monkeypatch, pilot="*")
+    assert resolve_r39_mode(
+        tenant_id="anyone", feature_key="housewife_assistant",
+        session=_StubSession(),
+    ) == "live"
+
+
+def test_wildcard_does_not_bypass_feature_key_gate(monkeypatch) -> None:
+    """'*' shadow не включает для non-housewife skill'ов."""
+    _patch_runtime_config(monkeypatch, shadow="*")
+    assert resolve_r39_mode(
+        tenant_id="any", feature_key="eds_monitor",
+        session=_StubSession(),
+    ) == "off"
+
+
+def test_wildcard_with_other_tokens_works(monkeypatch) -> None:
+    """'*, tenant_xyz' (wildcard + explicit) → wildcard выигрывает."""
+    _patch_runtime_config(monkeypatch, shadow="*, tenant_max_40921122")
+    assert resolve_r39_mode(
+        tenant_id="random", feature_key="housewife_assistant",
+        session=_StubSession(),
+    ) == "shadow"
+
+
 # ─── Pilot tenant сценарий (Boris) ──────────────────────────────────
 
 

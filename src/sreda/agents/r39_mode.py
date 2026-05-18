@@ -65,7 +65,7 @@ def resolve_r39_mode(
     except Exception:
         logger.exception("R-39 mode: pilot allowlist read failed")
         return "off"
-    if tid_str in parse_pilot_tenants(pilot):
+    if _matches_allowlist(tid_str, pilot):
         return "live"
 
     try:
@@ -73,7 +73,25 @@ def resolve_r39_mode(
     except Exception:
         logger.exception("R-39 mode: shadow allowlist read failed")
         return "off"
-    if tid_str in parse_pilot_tenants(shadow):
+    if _matches_allowlist(tid_str, shadow):
         return "shadow"
 
     return "off"
+
+
+def _matches_allowlist(tenant_id: str, raw: str) -> bool:
+    """Allowlist matching с поддержкой wildcard `"*"`.
+
+    Если значение runtime_config содержит токен `"*"` — matches любой
+    tenant (housewife users only — выше есть feature_key gate). Используется
+    для широкого shadow rollout без перечисления всех tenant_ids:
+        UPDATE runtime_config SET value='*' WHERE key='r39_shadow_tenant_ids';
+
+    Пустая строка / None → False.
+    """
+    if not raw:
+        return False
+    parsed = parse_pilot_tenants(raw)
+    if "*" in parsed:
+        return True  # wildcard: все тенанты под housewife_assistant
+    return tenant_id in parsed
