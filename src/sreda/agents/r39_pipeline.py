@@ -97,6 +97,7 @@ def process_turn(
     admin_alert_fn: AdminAlertFn | None = None,
     correction_pending: str | None = None,
     user_tz: str = "Europe/Moscow",
+    correction_target_override: object | None = None,
 ) -> PipelineResult:
     """Полный R-39 pipeline: user_text → final_text.
 
@@ -115,14 +116,23 @@ def process_turn(
         parser_result = parse_natural_time(user_text, user_tz, now_utc)
         trace.append(f"parser={type(parser_result).__name__}")
 
-    # 3. Разрешение коррекции (если применимо)
-    correction_target = None
-    if intent_result.intent in (TurnIntent.MUTATION, TurnIntent.UNCERTAIN):
+    # 3. Разрешение коррекции (если применимо).
+    # R-39 R7-2: caller (handlers _r39_try_live) может precompute target
+    # через _resolve_correction_target_with_db_fallback и передать через
+    # correction_target_override — для случаев когда journal пустой, но
+    # в БД есть pending FamilyReminder который мы хотим найти.
+    if correction_target_override is not None:
+        correction_target = correction_target_override
+        trace.append(f"correction={type(correction_target).__name__} (override)")
+    elif intent_result.intent in (TurnIntent.MUTATION, TurnIntent.UNCERTAIN):
+        correction_target = None
         if conversation_history:
             correction_target = resolve_correction_target(
                 user_text, list(conversation_history)
             )
             trace.append(f"correction={type(correction_target).__name__}")
+    else:
+        correction_target = None
 
     # 4. Планировщик
     request = PlanRequest(
