@@ -232,6 +232,10 @@ def r39_try_live(
         )
         if side_effects_state["started"]:
             # ANY mutating call попытался — НИКОГДА не fallback в legacy
+            # Code-review MINOR (Qwen): не пишем str(exc) в alert body —
+            # может содержать user_text fragments из tool parse failures
+            # (152-ФЗ). Тип exception + run_id достаточно для расследования
+            # в server logs.
             try:
                 send_admin_alert_fn(
                     severity="P0",
@@ -239,19 +243,39 @@ def r39_try_live(
                     body=(
                         f"tenant={tenant_id} run={run_id} "
                         f"effects={side_effects_state['count']} "
-                        f"exc={type(exc).__name__}: {str(exc)[:200]}"
+                        f"exc={type(exc).__name__} (see server logs)"
                     ),
                     dedupe_key=f"r39_post_se:{tenant_id}",
                 )
             except Exception:
                 logger.exception("R-39 post-SE alert failed")
-            return LiveResult(
-                proceeded=True,
-                reply=runtime_reply_cls(
+            # Code-review MINOR (Qwen): degraded apology path должен сам
+            # быть try-safe. Если runtime_reply_cls() raises — outer except
+            # в handlers может попасть в legacy fallback → дубль side effect.
+            # Construct reply под try; на failure возвращаем reply=None
+            # (handler check `if _live is not None and _live.proceeded` →
+            # proceeded=True но reply=None → handler возвращает [None],
+            # которое отфильтровывается / либо мы возвращаем хардкод-fallback).
+            try:
+                degraded_reply = runtime_reply_cls(
                     text="Часть действий могла пройти. Скажи ещё раз — допроверю.",
                     reply_markup=None,
                     feature_key=feature_key,
-                ),
+                )
+            except Exception:
+                logger.exception("R-39 degraded reply construction failed")
+                # Минимальный fallback: даже если cls сломан, мы НЕ должны
+                # вернуть proceeded=False (это пустит legacy → дубль).
+                # Возвращаем proceeded=True с reply=None — caller вернёт
+                # пустой список replies, лучше тишина чем дубль.
+                return LiveResult(
+                    proceeded=True,
+                    reply=None,
+                    side_effects_count=side_effects_state["count"],
+                )
+            return LiveResult(
+                proceeded=True,
+                reply=degraded_reply,
                 side_effects_count=side_effects_state["count"],
             )
         # Pre-side-effect crash — legacy fallback safe
@@ -305,6 +329,22 @@ def _load_r39_thread_history(
 # ─── Correction resolver с DB fallback ───────────────────────────────
 
 
+_CORRECTION_MARKER_RE = re.compile(
+    r"\b(?:"
+    r"нет[,.]\s"
+    r"|не\s+(?:на|в)\s+\d"
+    r"|не\s+правильн"
+    r"|неправильн"
+    r"|не\s+так\b"
+    r"|не\s+туда\b"
+    r"|ошибк"
+    r"|переигра"
+    r"|поменяй\s+на"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _resolve_correction_target_with_db_fallback(
     user_text: str,
     r39_history: tuple[ConversationTurn, ...],
@@ -317,14 +357,30 @@ def _resolve_correction_target_with_db_fallback(
 
     Tools commit'ят сами, R39RunJournal row может не успеть записаться
     при crash. correction_resolver жёстко требует journal — без fallback'а
-    мы упустим target. Поэтому при NoCorrectionTarget от journal —
-    fallback на FamilyReminder.status="pending" последние 24h.
+    мы упустим target.
+
+    Code-review CRIT (Codex): DB fallback должен срабатывать ТОЛЬКО при
+    явном correction signal в user_text. Иначе обычная mutation «поставь
+    напоминание X» матчит pending FamilyReminder → planner update'ит чужое
+    напоминание вместо создания нового.
+
+    Code-review MAJ (Qwen): user_id=None приводит к `IS NULL` query —
+    matches чужие reminders с user_id NULL → cross-user leak. Early return
+    если user_id отсутствует.
     """
     journal_result = resolve_correction_target(user_text, list(r39_history))
     if not isinstance(journal_result, NoCorrectionTarget):
         return journal_result
 
-    # DB fallback
+    # Codex CRIT: DB fallback только при explicit correction marker
+    if not _CORRECTION_MARKER_RE.search(user_text or ""):
+        return journal_result  # NoCorrectionTarget от resolver'а
+
+    # Qwen MAJ: без user_id query может задеть чужие reminders
+    if user_id is None or user_id == "":
+        return NoCorrectionTarget(reason="db_fallback_no_user_id")
+
+    # DB fallback (scoped strictly to current user)
     from sreda.db.models.housewife import FamilyReminder
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -399,12 +455,16 @@ def _r39_admin_alert_adapter(
     Severity=P1, dedup по hash(text) per (tenant, run).
     """
     def alert(text: str) -> None:
+        # Code-review MINOR (Codex): stable sha256 dedupe instead of
+        # process-randomized hash() — иначе при restart'ах dedupe rate
+        # сбрасывается и dedupe эффективность падает.
+        digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:8]
         try:
             send_admin_alert_fn(
                 severity="P1",
                 title="R-39 audit / lock",
                 body=text[:3900],
-                dedupe_key=f"r39:{run_id}:{abs(hash(text)) & 0xffff:04x}",
+                dedupe_key=f"r39:{run_id}:{digest}",
                 extra_context={"tenant": tenant_id, "run_id": run_id},
             )
         except Exception:
@@ -612,7 +672,13 @@ def _persist_r39_journal_row(
     mode: str,
     result: PipelineResult,
 ) -> None:
-    """INSERT в r39_run_journal. Commit будет от graph.py."""
+    """INSERT в r39_run_journal. Commit будет от graph.py.
+
+    Code-review MAJ (Codex): wrap в SAVEPOINT — если FK/duplicate/data
+    error случится на flush, savepoint откатывается без порчи shared
+    transaction'а graph'а. Persist failure non-critical (DB fallback
+    reconcile через FamilyReminder).
+    """
     from sreda.db.models import R39RunJournal
 
     success_count = sum(
@@ -632,7 +698,22 @@ def _persist_r39_journal_row(
         audit_unbacked=result.audit.is_unbacked,
         side_effects_count=success_count,
     )
-    session.add(row)
+    # SAVEPOINT — locally rollback'нем при FK/dup error чтобы graph commit
+    # не пострадал. session.begin_nested() это savepoint в SQLAlchemy.
+    sp = session.begin_nested()
+    try:
+        session.add(row)
+        session.flush()  # форсирует FK check ЗДЕСЬ, не на graph commit
+        sp.commit()
+    except Exception:
+        sp.rollback()
+        logger.exception(
+            "R-39 persist row failed (savepoint rolled back) run=%s mode=%s",
+            run_id, mode,
+        )
+        # Не пробрасываем — caller'у вернёт что persist не удался,
+        # но live ответ уже отправлен, journal восстановится через
+        # DB fallback при следующем correction.
 
 
 # ─── Journal serialize / deserialize ─────────────────────────────────

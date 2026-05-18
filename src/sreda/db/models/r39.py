@@ -30,7 +30,11 @@ class R39RunJournal(Base):
         ForeignKey("agent_runs.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # Composite index ix_r39_run_journal_tenant_created (см. migration 0045)
+    # покрывает single-column tenant_id prefix queries — отдельный index
+    # не нужен. Codе-review MINOR (Qwen): убрали index=True чтобы alembic
+    # autogenerate не emit'ил spurious migration на отсутствующий single-col idx.
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)  # 'live' | 'shadow'
     plan_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     journal_json: Mapped[str | None] = mapped_column(Text, nullable=True)

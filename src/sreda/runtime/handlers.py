@@ -2469,6 +2469,15 @@ def execute_conversation_chat(
             _live = None
 
         if _live is not None and _live.proceeded:
+            # proceeded=True но reply=None (degraded apology construction
+            # crashed после side_effect_started) → возвращаем пустой
+            # список replies. Лучше тишина чем дубль legacy.
+            if _live.reply is None:
+                logger.warning(
+                    "R-39 live proceeded=True но reply=None tenant=%s run=%s",
+                    action.tenant_id, run_id,
+                )
+                return []
             return [_live.reply]
         # Иначе fall through в legacy (contract: proceeded=False
         # гарантирует что mutating tools не запустились → дубля не будет).

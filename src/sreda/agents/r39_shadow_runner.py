@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -60,6 +61,10 @@ def kick_off_shadow_thread(
             передать lambda fn: fn() для синхронного execution.
     """
     def worker() -> None:
+        # Code-review MAJ (Codex): wait for graph to commit AgentRun row
+        # before shadow читает history (FK insert требует existing run_id).
+        # 2 секунды — запас для graph commit; daemon thread не блокирует UX.
+        time.sleep(2.0)
         try:
             sf = session_factory or _default_session_factory()
             if sf is None:
