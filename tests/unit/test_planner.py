@@ -34,7 +34,7 @@ MSK = ZoneInfo("Europe/Moscow")
 
 
 def _ctx() -> TurnContext:
-    return TurnContext(turn_id="t-001", tenant_id=42)
+    return TurnContext(turn_id="t-001", tenant_id="42")
 
 
 def _resolved_time() -> TimeResolved:
@@ -65,10 +65,10 @@ def test_chitchat_returns_no_action_without_llm() -> None:
     assert result.rationale == "chitchat_short_circuit"
 
 
-# ─── Short-circuit: ResolvedCorrection → replace_reminder ────────────
+# ─── Short-circuit: ResolvedCorrection → update_reminder ────────────
 
 
-def test_resolved_correction_builds_replace_plan() -> None:
+def test_resolved_correction_builds_update_plan() -> None:
     """Кати-сценарий: target из истории + parser дал новое время."""
     target = ResolvedCorrection(
         target_entity_id="rem_old",
@@ -88,7 +88,7 @@ def test_resolved_correction_builds_replace_plan() -> None:
     assert isinstance(result, ExecutionPlan)
     assert len(result.calls) == 1
     call = result.calls[0]
-    assert call.tool_name == "replace_reminder"
+    assert call.tool_name == "update_reminder"
     assert call.args["reminder_id"] == "rem_old"
     # parser-resolved trigger_iso подставлен детерминированно
     assert call.args["trigger_iso"].startswith("2026-05-17T14:00")
@@ -373,7 +373,7 @@ def test_kati_correction_full_pipeline() -> None:
     )
     result = plan_action(request)
     assert isinstance(result, ExecutionPlan)
-    assert result.calls[0].tool_name == "replace_reminder"
+    assert result.calls[0].tool_name == "update_reminder"
     assert result.calls[0].args["reminder_id"] == "rem_old"
     # trigger_iso детерминирован, не от LLM
     assert "2026-05-17T14:00" in result.calls[0].args["trigger_iso"]

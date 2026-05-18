@@ -39,7 +39,7 @@ def test_empty_plan_yields_empty_journal() -> None:
     plan = ExecutionPlan()
     result = execute_plan(
         plan,
-        tenant_id=42,
+        tenant_id="42",
         turn_id="t-001",
         tool_callables={},
     )
@@ -57,7 +57,7 @@ def test_single_success_call_recorded() -> None:
     ))
     result = execute_plan(
         plan,
-        tenant_id=42,
+        tenant_id="42",
         turn_id="t-001",
         tool_callables={"schedule_reminder": _ok_schedule},
     )
@@ -77,7 +77,7 @@ def test_unknown_tool_records_failure() -> None:
         ToolCall(tool_name="some_unknown", args={}, action_index=0),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001", tool_callables={},
+        plan, tenant_id="42", turn_id="t-001", tool_callables={},
     )
     assert len(result.journal) == 1
     e = result.journal.entries[0]
@@ -95,7 +95,7 @@ def test_missing_idempotency_field_records_failure() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"schedule_reminder": _ok_schedule},
     )
     assert len(result.journal) == 1
@@ -113,7 +113,7 @@ def test_no_callable_registered_records_failure() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001", tool_callables={},
+        plan, tenant_id="42", turn_id="t-001", tool_callables={},
     )
     assert len(result.journal) == 1
     e = result.journal.entries[0]
@@ -130,7 +130,7 @@ def test_callable_exception_becomes_failure() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"schedule_reminder": _failing_callable},
     )
     assert len(result.journal) == 1
@@ -157,7 +157,7 @@ def test_fail_fast_halts_on_first_failure() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={
             "schedule_reminder": _failing_callable,
             "save_recipe": _ok_save_recipe,
@@ -184,7 +184,7 @@ def test_fail_open_continues_after_failure() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={
             "schedule_reminder": _failing_callable,
             "save_recipe": _ok_save_recipe,
@@ -214,7 +214,7 @@ def test_multi_call_cancel_then_schedule() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-kati",
+        plan, tenant_id="42", turn_id="t-kati",
         tool_callables={
             "cancel_reminder": _ok_cancel,
             "schedule_reminder": _ok_schedule,
@@ -244,7 +244,7 @@ def test_duplicate_call_in_plan_dedupliated() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"schedule_reminder": _ok_schedule},
     )
     assert len(result.journal) == 1  # один реальный вызов
@@ -266,13 +266,13 @@ def test_external_journal_can_dedupe_across_calls() -> None:
     ))
     # Первый прогон
     first = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"schedule_reminder": _ok_schedule},
     )
     assert len(first.journal) == 1
     # Второй прогон с тем же журналом — не должен дублировать
     second = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"schedule_reminder": _ok_schedule},
         journal=first.journal,
     )
@@ -291,7 +291,7 @@ def test_entity_id_extracted_from_args() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"cancel_reminder": _ok_cancel},
     )
     entry = result.journal.entries[0]
@@ -309,7 +309,7 @@ def test_entity_id_extracted_from_result_when_create() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"complete_task": lambda title, task_id: {"task_id": task_id}},
     )
     entry = result.journal.entries[0]
@@ -335,7 +335,7 @@ def test_custom_result_data_extractor() -> None:
         ),
     ))
     result = execute_plan(
-        plan, tenant_id=42, turn_id="t-001",
+        plan, tenant_id="42", turn_id="t-001",
         tool_callables={"schedule_reminder": _ok_schedule},
         result_data_extractor=extractor,
     )

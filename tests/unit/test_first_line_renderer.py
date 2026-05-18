@@ -33,7 +33,7 @@ def test_render_schedule_success_matches_a_variant() -> None:
             "trigger_human": "сегодня в 14:00",
         },
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert "Разбудить Катю" in result
     assert "сегодня в 14:00" in result
@@ -46,7 +46,7 @@ def test_render_cancel_success() -> None:
         result_kind=ResultKind.SUCCESS,
         result_data={"title": "Разбудить"},
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert "Разбудить" in result
 
@@ -58,7 +58,7 @@ def test_render_save_recipe() -> None:
         result_kind=ResultKind.SUCCESS,
         result_data={"title": "Борщ"},
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert "Борщ" in result
 
@@ -74,26 +74,31 @@ def test_render_failure_uses_failure_template() -> None:
         result_data={},
         error_message="db_timeout",
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     # failure-варианты для schedule_reminder содержат «не получилось»/«не сработало»
     assert "не " in result.lower() or "ещё раз" in result.lower()
 
 
 def test_render_partial_when_supports_true() -> None:
-    """replace_reminder: supports_partial=True — partial-вариант возможен."""
+    """add_shopping_items: supports_partial=True — partial-вариант возможен.
+
+    R-39 R4: replace_reminder убран из registry, заменён на update_reminder
+    (no partial). Tест перенесён на add_shopping_items который остаётся
+    с supports_partial=True.
+    """
     entry = ToolJournalEntry(
-        tool_name="replace_reminder",
+        tool_name="add_shopping_items",
         action_index=0,
         result_kind=ResultKind.PARTIAL,
         result_data={},
         error_message="cancel_done_but_schedule_failed",
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert result  # должен что-то отрендерить
-    # partial-варианты для replace_reminder упоминают «старое»/«новое»
-    assert "стар" in result.lower() or "нов" in result.lower()
+    # partial template add_shopping_items упоминает «что-то не записалось»
+    assert "что-то" in result.lower() or "проверь" in result.lower()
 
 
 def test_render_partial_falls_back_when_supports_false() -> None:
@@ -105,7 +110,7 @@ def test_render_partial_falls_back_when_supports_false() -> None:
         result_data={"title": "Разбудить"},
         error_message="weird",
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     # должен взять failure-шаблон, не упасть
     assert result
@@ -125,7 +130,7 @@ def test_seed_stable_for_same_inputs() -> None:
             "trigger_human": "сегодня в 14:00",
         },
     )
-    ctx = TurnContext(turn_id="t-stable-1", tenant_id=42)
+    ctx = TurnContext(turn_id="t-stable-1", tenant_id="42")
     first = render_first_line(entry, ctx)
     second = render_first_line(entry, ctx)
     assert first == second
@@ -144,7 +149,7 @@ def test_seed_varies_with_turn_id() -> None:
     )
     seen: set[str] = set()
     for i in range(20):
-        ctx = TurnContext(turn_id=f"t-{i}", tenant_id=42)
+        ctx = TurnContext(turn_id=f"t-{i}", tenant_id="42")
         seen.add(render_first_line(entry, ctx))
     # на 20 разных turn_id должно встретиться минимум 3 разных варианта (из 7)
     assert len(seen) >= 3
@@ -165,7 +170,7 @@ def test_seed_varies_with_action_index() -> None:
         )
         for i in range(15)
     ]
-    ctx = TurnContext(turn_id="t-multi", tenant_id=42)
+    ctx = TurnContext(turn_id="t-multi", tenant_id="42")
     rendered = {render_first_line(e, ctx) for e in entries}
     assert len(rendered) >= 3
 
@@ -191,7 +196,7 @@ def test_render_journal_joins_with_newlines() -> None:
             },
         ),
     ]
-    ctx = TurnContext(turn_id="t-kati", tenant_id=42)
+    ctx = TurnContext(turn_id="t-kati", tenant_id="42")
     result = render_journal(entries, ctx)
     lines = result.split("\n")
     assert len(lines) == 2
@@ -200,7 +205,7 @@ def test_render_journal_joins_with_newlines() -> None:
 
 
 def test_render_journal_empty_returns_empty() -> None:
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     assert render_journal([], ctx) == ""
 
 
@@ -215,7 +220,7 @@ def test_unknown_tool_returns_generic_acknowledgement() -> None:
         result_kind=ResultKind.SUCCESS,
         result_data={},
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert result  # не пусто
     assert "✓" in result or "готово" in result.lower()
@@ -229,7 +234,7 @@ def test_missing_placeholder_falls_back_gracefully() -> None:
         result_kind=ResultKind.SUCCESS,
         result_data={"title": "Только title"},  # нет trigger_human
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert result  # упало бы → пустая строка из catch
     # generic fallback или partial-render — но не crash
@@ -246,7 +251,7 @@ def test_rendered_line_does_not_contain_newline() -> None:
             "trigger_human": "сегодня в 14:00",
         },
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert "\n" not in result
 
@@ -262,7 +267,7 @@ def test_none_value_renders_as_empty_string() -> None:
         result_kind=ResultKind.SUCCESS,
         result_data={"title": None, "trigger_human": "сегодня в 14:00"},
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert "None" not in result
     assert "сегодня в 14:00" in result
@@ -277,7 +282,7 @@ def test_list_value_does_not_leak_raw_repr() -> None:
         result_kind=ResultKind.SUCCESS,
         result_data={"title": ["a", "b"], "trigger_human": "сегодня в 14:00"},
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     # str(list) выдаёт «['a', 'b']» — пропускаем через sanitize, но проверим
     # что хотя бы не падает и time подставился
@@ -285,14 +290,15 @@ def test_list_value_does_not_leak_raw_repr() -> None:
 
 
 def test_int_value_rendered_as_string() -> None:
-    """int не падает — приводится через str()."""
+    """int не падает — приводится через str() в sanitize."""
+    # schedule_reminder template содержит {title} — подставим int.
     entry = ToolJournalEntry(
-        tool_name="add_shopping_items",
+        tool_name="schedule_reminder",
         action_index=0,
         result_kind=ResultKind.SUCCESS,
-        result_data={"items_summary": 3},  # неправильный тип, но не должен падать
+        result_data={"title": 3, "trigger_human": "сегодня в 14:00"},
     )
-    ctx = TurnContext(turn_id="t-001", tenant_id=42)
+    ctx = TurnContext(turn_id="t-001", tenant_id="42")
     result = render_first_line(entry, ctx)
     assert "3" in result
 
@@ -310,7 +316,7 @@ def test_empty_turn_id_still_renders_deterministic_result(caplog) -> None:
         result_kind=ResultKind.SUCCESS,
         result_data={"title": "X", "trigger_human": "сегодня в 14:00"},
     )
-    ctx = TurnContext(turn_id="", tenant_id=42)
+    ctx = TurnContext(turn_id="", tenant_id="42")
     with caplog.at_level(logging.WARNING):
         result = render_first_line(entry, ctx)
     assert result  # не пусто

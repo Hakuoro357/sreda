@@ -76,7 +76,7 @@ def render_first_line(entry: ToolJournalEntry, context: TurnContext) -> str:
         )
         return _generic_acknowledgement(entry.result_kind)
 
-    variants = _pick_variants(contract, entry.result_kind)
+    variants = _pick_variants(contract, entry)
     if not variants:
         logger.warning(
             "first_line_renderer: пустой список шаблонов tool=%s kind=%s",
@@ -119,13 +119,28 @@ def render_journal(entries: list[ToolJournalEntry], context: TurnContext) -> str
 # ─── Внутренние помощники ─────────────────────────────────────────────
 
 
-def _pick_variants(contract: ToolContract, result_kind: ResultKind) -> tuple[str, ...]:
-    """Выбор подходящего списка вариантов с защитой от PARTIAL без поддержки."""
-    if result_kind is ResultKind.SUCCESS:
+def _pick_variants(contract: ToolContract, entry: ToolJournalEntry) -> tuple[str, ...]:
+    """Выбор подходящего списка вариантов.
+
+    Защита от PARTIAL без поддержки → fallback в failure.
+
+    R-39 R7-3: для FAILURE с явным ``error_code`` (в entry.error_code или
+    result_data["error_code"]) — сначала пробуем ``failure_template_variants_by_code``;
+    если для этого кода вариантов нет, fallback на generic failure_template_variants.
+    """
+    if entry.result_kind is ResultKind.SUCCESS:
         return contract.success_template_variants
-    if result_kind is ResultKind.PARTIAL and contract.supports_partial:
+    if entry.result_kind is ResultKind.PARTIAL and contract.supports_partial:
         return contract.partial_template_variants
     # FAILURE или PARTIAL-fallback
+    error_code = (
+        getattr(entry, "error_code", None)
+        or (entry.result_data or {}).get("error_code")
+    )
+    if error_code:
+        by_code = contract.failure_template_variants_by_code.get(error_code)
+        if by_code:
+            return by_code
     return contract.failure_template_variants
 
 

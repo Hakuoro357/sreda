@@ -110,7 +110,7 @@ def plan_action(
     # 2. Однозначная коррекция → replace_reminder без LLM
     target = request.correction_target
     if isinstance(target, ResolvedCorrection):
-        plan = _build_replace_plan(request, target)
+        plan = _build_update_plan(request, target)
         if plan is not None:
             return plan
         # Если не получилось собрать (нет parser_result) — падаем на LLM ниже.
@@ -159,12 +159,14 @@ def plan_action(
 # ─── Short-circuit построители ────────────────────────────────────────
 
 
-def _build_replace_plan(
+def _build_update_plan(
     request: PlanRequest,
     target: ResolvedCorrection,
 ) -> ExecutionPlan | None:
-    """Собрать replace_reminder план из target + parser_result.
+    """Собрать update_reminder план из target + parser_result.
 
+    R-39 R4: используем in-place update вместо cancel+create — проще,
+    атомарен на стороне FamilyReminder service, сохраняет id.
     Возвращает None если parser_result не дал ``TimeResolved`` (тогда
     нужен LLM-call для извлечения title/времени).
     """
@@ -173,13 +175,12 @@ def _build_replace_plan(
 
     # Новое название берём из user_text по эвристике (последовательность
     # «разбудить Катю», «купить хлеб» и т.п.). Если не удалось — берём
-    # старое из target. Точная LLM-задача парсить новое название в день 5;
-    # здесь fallback на старое название достаточен.
+    # старое из target.
     new_title = _extract_title_hint(request.user_text) or target.target_title or ""
     trigger_iso = request.parser_result.iso_user_tz.isoformat()
 
     call = ToolCall(
-        tool_name="replace_reminder",
+        tool_name="update_reminder",
         args={
             "reminder_id": target.target_entity_id,
             "title": new_title,

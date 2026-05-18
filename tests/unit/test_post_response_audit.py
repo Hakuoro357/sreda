@@ -70,7 +70,7 @@ def test_unbacked_claim_triggers_admin_alert() -> None:
         journal=ToolJournal(),  # пусто — ничего не вызывалось
         detector=_detector_always_unbacked,
         admin_alert_fn=alerts.append,
-        tenant_id=352612382,
+        tenant_id="352612382",
         turn_id="t-001",
     )
     assert result.is_unbacked is True
@@ -102,7 +102,7 @@ def test_admin_alert_excludes_user_text_for_152fz() -> None:
         journal=ToolJournal(),
         detector=_detector_always_unbacked,
         admin_alert_fn=alerts.append,
-        tenant_id=42,
+        tenant_id="42",
     )
     # Preview финальной строки попадёт, но это ответ бота, не user_text.
     # Контракт audit'а: НЕ принимаем user_text вообще.
@@ -215,7 +215,7 @@ def test_kati_caught_when_text_claims_but_no_tool_called() -> None:
         journal=ToolJournal(),  # ПУСТО — точно как было в проде
         detector=realistic_detector,
         admin_alert_fn=alerts.append,
-        tenant_id=352612382,
+        tenant_id="352612382",
         turn_id="t-2026-05-17T13:21",
     )
     assert result.is_unbacked is True

@@ -60,7 +60,7 @@ class ExecutorResult:
 def execute_plan(
     plan: ExecutionPlan,
     *,
-    tenant_id: int,
+    tenant_id: str,
     turn_id: str,
     tool_callables: dict[str, Callable[..., Any]],
     result_data_extractor: ResultDataExtractor | None = None,
@@ -145,9 +145,18 @@ def execute_plan(
                 "executor: tool=%s упал: %s: %s",
                 call.tool_name, type(exc).__name__, exc,
             )
+            # R-39 R7-3: если exception имеет атрибуты `error_code` / `error_message`
+            # (как R39ToolFailure), сохраняем их структурно — для renderer'а
+            # с failure_template_variants_by_code.
+            error_code = getattr(exc, "error_code", None)
+            error_message = (
+                getattr(exc, "error_message", None)
+                or f"{type(exc).__name__}: {exc}"
+            )
             _record_failure(
                 journal, call, key=key,
-                error=f"{type(exc).__name__}: {exc}",
+                error=error_message,
+                error_code=error_code,
             )
             if fail_fast:
                 halted = True
@@ -186,15 +195,25 @@ def _record_failure(
     *,
     key: str | None,
     error: str,
+    error_code: str | None = None,
 ) -> None:
-    """Добавить FAILURE-запись в журнал."""
+    """Добавить FAILURE-запись в журнал.
+
+    R-39 R7-3: ``error_code`` сохраняется и в ``result_data`` (для рендера
+    template-by-code), и в самостоятельное поле ``ToolJournalEntry.error_code``
+    (для аудита и сериализации в r39_run_journal).
+    """
+    result_data: dict[str, Any] = {}
+    if error_code:
+        result_data["error_code"] = error_code
     journal.append(ToolJournalEntry(
         tool_name=call.tool_name,
         action_index=call.action_index,
         result_kind=ResultKind.FAILURE,
-        result_data={},
+        result_data=result_data,
         error_message=error,
         idempotency_key=key,
+        error_code=error_code,
     ))
 
 

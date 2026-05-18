@@ -49,7 +49,7 @@ class MissingIdempotencyField(KeyError):
 
 
 def compute_idempotency_key(
-    tenant_id: int,
+    tenant_id: str,
     turn_id: str,
     contract: ToolContract,
     call: ToolCall,

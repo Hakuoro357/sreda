@@ -97,6 +97,12 @@ class ToolContract:
     partial_template_variants: tuple[str, ...] = ()
     supports_partial: bool = False            # отдельный флаг — даёт явный сигнал что partial возможен
 
+    # R-39 integration R7-3: error_code → специфические варианты failure
+    # шаблона. Renderer сначала смотрит сюда по error_code из ToolJournalEntry,
+    # если не нашёл — fallback на generic failure_template_variants.
+    # Пример: schedule_reminder с error_code="past_date" → фраза «время уже прошло».
+    failure_template_variants_by_code: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
 
 # ─── Запланированный вызов и план хода ────────────────────────────────
 
@@ -193,6 +199,7 @@ class ToolJournalEntry:
     error_message: str | None = None          # текст ошибки если FAILURE/PARTIAL
     entity_id: str | None = None              # id созданной/обновлённой сущности
     idempotency_key: str | None = None        # для аудита и повтора
+    error_code: str | None = None             # R-39 R7-3: код ошибки для специфичных templates (past_date, entity_not_found, ...)
 
 
 # ─── История разговора ───────────────────────────────────────────────
@@ -231,7 +238,7 @@ class TurnContext:
     """
 
     turn_id: str
-    tenant_id: int
+    tenant_id: str  # R-39 R4: real ActionEnvelope.tenant_id is str (max 64), не int
     user_tz: str = "Europe/Moscow"
 
 
@@ -263,6 +270,13 @@ _SCHEDULE_REMINDER = ToolContract(
     ),
     partial_template_variants=(),
     supports_partial=False,
+    # R-39 R7: специфические templates для известных error_code
+    failure_template_variants_by_code={
+        "past_date": (
+            "Это время уже прошло. На какое поставить?",
+            "Указанное время уже прошло — может, на другое время?",
+        ),
+    },
 )
 
 
@@ -287,15 +301,16 @@ _CANCEL_REMINDER = ToolContract(
 )
 
 
-_REPLACE_REMINDER = ToolContract(
+# R-39 integration R4: для коррекций используем update_reminder (in-place
+# UPDATE существующего FamilyReminder) вместо replace_reminder (= cancel+create).
+# Update проще, атомарен, сохраняет id. atomic_replace_reminder остаётся
+# в `agents/replace_reminder.py` как утилита для будущих сценариев когда
+# реально нужна замена сущности.
+_UPDATE_REMINDER = ToolContract(
     mutating=True,
-    mutation_kind=MutationKind.REPLACE,
-    action_type="replace_reminder",
-    required_fields={
-        "reminder_id": "string",
-        "title": "string",
-        "trigger_iso": "datetime",
-    },
+    mutation_kind=MutationKind.WRITE,
+    action_type="update_reminder",
+    required_fields={"reminder_id": "string"},  # title/trigger_iso optional — partial update
     idempotency_strategy=IdempotencyStrategy.PER_ENTITY,
     entity_id_field="reminder_id",
     success_template_variants=(
@@ -305,14 +320,18 @@ _REPLACE_REMINDER = ToolContract(
         "Готово, «{title}» — на {trigger_human}",
     ),
     failure_template_variants=(
-        "Не получилось обновить напоминание. Попробуй заново — отменю старое и поставлю новое.",
-        "Что-то не сработало с заменой. Скажи ещё раз — например «перенеси на 14:00 разбудить Катю».",
+        "Не получилось обновить напоминание. Попробуй ещё раз.",
     ),
-    partial_template_variants=(
-        "Старое снято, но новое не получилось поставить — попробуй сказать ещё раз.",
-        "Новое поставила, но старое не снялось — проверь список напоминаний.",
-    ),
-    supports_partial=True,
+    # R-39 R7: специфические templates по error_code
+    failure_template_variants_by_code={
+        "past_date": (
+            "Это время уже прошло. На какое поставить?",
+            "Указанное время уже прошло — может, на другое?",
+        ),
+        "entity_not_found": (
+            "Не нашла это напоминание. Скажи точнее.",
+        ),
+    },
 )
 
 
@@ -337,43 +356,47 @@ _SAVE_RECIPE = ToolContract(
 )
 
 
+# R-39 integration R4: реальный tool принимает `items: list[dict]`, не строку.
+# Items — backend-only поле (list of {title, quantity_text?, category?}),
+# в templates НЕ упоминается — пользователю показываем generic «добавила в список».
+# extractor может построить items_summary для журнала / диагностики если нужно.
 _ADD_SHOPPING_ITEMS = ToolContract(
     mutating=True,
     mutation_kind=MutationKind.WRITE,
     action_type="add_shopping_items",
-    required_fields={"items_summary": "string"},
+    required_fields={"items": "list_of_dict"},  # backend-only field
     idempotency_strategy=IdempotencyStrategy.PER_TURN,
     success_template_variants=(
-        "Добавила в список: {items_summary} 🛒",
-        "В список покупок — {items_summary} 🛒",
-        "Записала: {items_summary} 🛒",
-        "Готово — {items_summary} в списке",
-        "Положила в список {items_summary}",
+        "Добавила в список покупок 🛒",
+        "В список покупок — записано 🛒",
+        "Готово — в списке покупок",
+        "Записала в список 🛒",
     ),
     failure_template_variants=(
         "Не получилось добавить в список. Скажи ещё раз — например «добавь молоко и хлеб».",
         "Что-то не сработало со списком покупок. Попробуй заново.",
     ),
     partial_template_variants=(
-        "Часть добавила, но {what_failed} — проверь список.",
+        "Часть добавила в список, но что-то не записалось — проверь.",
     ),
     supports_partial=True,
 )
 
 
+# R-39 integration R4: реальный tool принимает только `task_id`, без title.
+# Title недоступен в момент complete_task — показываем generic подтверждение.
 _COMPLETE_TASK = ToolContract(
     mutating=True,
     mutation_kind=MutationKind.WRITE,
     action_type="complete_task",
-    required_fields={"title": "string", "task_id": "string"},
+    required_fields={"task_id": "string"},  # без title — backend-only id
     idempotency_strategy=IdempotencyStrategy.PER_ENTITY,
     entity_id_field="task_id",
     success_template_variants=(
-        "Отметила «{title}» как сделано ✓",
-        "Готово — «{title}» ✓",
-        "Закрыла «{title}» ✓",
-        "Поставила галочку: «{title}» ✓",
-        "«{title}» — выполнено ✓",
+        "Готово ✓",
+        "Отметила выполненной ✓",
+        "Закрыла задачу ✓",
+        "Поставила галочку ✓",
     ),
     failure_template_variants=(
         "Не получилось отметить задачу. Скажи точнее — например «отметь что я погулял с собакой».",
@@ -382,10 +405,12 @@ _COMPLETE_TASK = ToolContract(
 )
 
 
+# R-39 integration R4: registry заменён — replace_reminder убран, update_reminder
+# добавлен. _REPLACE_REMINDER class definition удалён в R7 (см. agents/replace_reminder.py).
 TOOL_CONTRACTS: dict[str, ToolContract] = {
     "schedule_reminder": _SCHEDULE_REMINDER,
     "cancel_reminder": _CANCEL_REMINDER,
-    "replace_reminder": _REPLACE_REMINDER,
+    "update_reminder": _UPDATE_REMINDER,
     "save_recipe": _SAVE_RECIPE,
     "add_shopping_items": _ADD_SHOPPING_ITEMS,
     "complete_task": _COMPLETE_TASK,
@@ -436,7 +461,13 @@ def assert_contracts_well_formed(
                 f"непуст ({len(contract.partial_template_variants)}) — мёртвые шаблоны"
             )
 
-        # required_fields должны встречаться хотя бы в одном success-шаблоне
+        # required_fields должны встречаться хотя бы в одном success-шаблоне.
+        # Исключения — поля чисто backend-ориентированные: пользователю их
+        # показывать не нужно, в template'е им не место.
+        BACKEND_ONLY_FIELDS = frozenset({
+            "task_id", "reminder_id", "items",
+            "ingredients", "instructions_md",  # для save_recipe (когда добавим required)
+        })
         all_success = " ".join(contract.success_template_variants)
         for field_name in contract.required_fields:
             placeholder = "{" + field_name + "}"
@@ -449,10 +480,8 @@ def assert_contracts_well_formed(
                         f"или {{trigger_human}} (производное)"
                     )
                 continue
-            if field_name == "task_id":
-                continue  # task_id обычно для backend, не для пользователя
-            if field_name == "reminder_id":
-                continue  # тоже backend-id
+            if field_name in BACKEND_ONLY_FIELDS:
+                continue  # backend-only поле, в template'е не нужно
             if placeholder not in all_success:
                 errors.append(
                     f"{name}: ни один success-вариант не использует "

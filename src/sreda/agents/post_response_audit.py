@@ -57,7 +57,7 @@ def audit_response(
     journal: ToolJournal,
     detector: Detector,
     admin_alert_fn: AdminAlertFn | None = None,
-    tenant_id: int | None = None,
+    tenant_id: str | None = None,
     turn_id: str | None = None,
 ) -> AuditResult:
     """Прогнать финальный текст через детектор unbacked claim.
@@ -159,7 +159,7 @@ def _build_correction_message() -> str:
 
 def _build_admin_alert(
     *,
-    tenant_id: int | None,
+    tenant_id: str | None,
     turn_id: str | None,
     called_tools: set[str],
     final_text_preview: str,

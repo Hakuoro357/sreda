@@ -65,8 +65,16 @@ class NoCorrectionTarget:
 ResolverResult = Union[ResolvedCorrection, AmbiguousCorrection, NoCorrectionTarget]
 
 
-# Инструменты создающие/изменяющие напоминание — кандидаты на target
-_MUTATING_REMINDER_TOOLS = frozenset({"schedule_reminder", "replace_reminder"})
+# Инструменты создающие/изменяющие напоминание — кандидаты на target.
+# R-39 R7: переход с replace_reminder на update_reminder для коррекций.
+# `replace_reminder` оставлен для backward-compat: старые r39_run_journal
+# rows могут содержать его в journal_entries — мы их распознаём при READ.
+# Planner WRITE генерирует только update_reminder (см. planner._build_update_plan).
+_MUTATING_REMINDER_TOOLS = frozenset({
+    "schedule_reminder",
+    "update_reminder",
+    "replace_reminder",  # legacy READ compat
+})
 
 
 # ─── Главная функция ──────────────────────────────────────────────────

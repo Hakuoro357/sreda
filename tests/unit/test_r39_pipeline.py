@@ -8,7 +8,7 @@ L4 audit. LLM, инструменты, детектор инжектятся к�
    → tool schedule_reminder вызвался → SUCCESS rem_old
 2. Turn 2: «нет, не на 2 а на 14:00 разбудить Катю»
    → planner short-circuit ResolvedCorrection + TimeResolved
-   → replace_reminder rem_old → 14:00 «Разбудить Катю»
+   → update_reminder rem_old → 14:00 «Разбудить Катю»
    → final_text содержит «14:00» и «Катю», не сочиняет
 3. Audit чистый, не unbacked
 """
@@ -59,7 +59,7 @@ def _fake_cancel_reminder(reminder_id: str) -> dict[str, Any]:
     return {"reminder_id": reminder_id, "cancelled": True}
 
 
-def _fake_replace_reminder(reminder_id: str, title: str, trigger_iso: str) -> dict[str, Any]:
+def _fake_update_reminder(reminder_id: str, title: str, trigger_iso: str) -> dict[str, Any]:
     return {
         "reminder_id": reminder_id,
         "title": title,
@@ -72,7 +72,7 @@ def _tool_callables() -> dict:
     return {
         "schedule_reminder": _fake_schedule_reminder,
         "cancel_reminder": _fake_cancel_reminder,
-        "replace_reminder": _fake_replace_reminder,
+        "update_reminder": _fake_update_reminder,
     }
 
 
@@ -132,11 +132,11 @@ def test_ambiguous_time_yields_clarification() -> None:
 
 
 def test_kati_correction_full_e2e_no_llm() -> None:
-    """Главный регрессионный: turn 2 коррекция через replace_reminder.
+    """Главный регрессионный: turn 2 коррекция через update_reminder.
 
     Без LLM-вызова на критической ветке — всё детерминировано:
     correction_resolver находит rem_old, parser даёт 14:00,
-    planner short-circuit → replace_reminder.
+    planner short-circuit → update_reminder.
     """
     # История: turn 1 уже произошёл, поставил rem_old «Разбудить» на 02:00
     history = (
@@ -168,11 +168,11 @@ def test_kati_correction_full_e2e_no_llm() -> None:
         # invoke_planner_llm не передан — short-circuit без LLM
     )
 
-    # Журнал содержит ровно один replace_reminder SUCCESS
+    # Журнал содержит ровно один update_reminder SUCCESS
     assert result.plan_kind == "execution_plan"
     assert len(result.journal) == 1
     entry = result.journal.entries[0]
-    assert entry.tool_name == "replace_reminder"
+    assert entry.tool_name == "update_reminder"
     assert entry.result_kind is ResultKind.SUCCESS
     assert entry.entity_id == "rem_old"
     # final_text содержит ключевые факты
@@ -322,13 +322,13 @@ def test_post_audit_catches_unbacked_claim() -> None:
     def confab_detector(text: str, tools: set[str]) -> bool:
         low = text.lower()
         if "отменяю" in low or "ставлю" in low:
-            return not bool(tools & {"cancel_reminder", "schedule_reminder", "replace_reminder"})
+            return not bool(tools & {"cancel_reminder", "schedule_reminder", "update_reminder"})
         return False
 
     result = process_turn(
         user_text="не правильно, на 14:00 разбудить Катю",
         conversation_history=(),  # пустая история — нет correction target
-        turn_context=_ctx(turn_id="t-broken", tenant_id=352612382),
+        turn_context=_ctx(turn_id="t-broken", tenant_id="352612382"),
         now_utc=_now_utc(),
         tool_callables=_tool_callables(),
         detector=confab_detector,

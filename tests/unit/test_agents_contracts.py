@@ -30,7 +30,7 @@ def test_registry_contains_six_key_tools() -> None:
     expected = {
         "schedule_reminder",
         "cancel_reminder",
-        "replace_reminder",
+        "update_reminder",
         "save_recipe",
         "add_shopping_items",
         "complete_task",
@@ -219,12 +219,18 @@ def test_schedule_reminder_uses_natural_key() -> None:
     assert "trigger_iso" in c.natural_key_fields
 
 
-def test_replace_reminder_supports_partial() -> None:
-    """Атомарный replace может частично сработать → partial templates."""
-    c = TOOL_CONTRACTS["replace_reminder"]
-    assert c.supports_partial is True
-    assert c.partial_template_variants
-    assert c.mutation_kind is MutationKind.REPLACE
+def test_update_reminder_per_entity_partial_update() -> None:
+    """R-39 R4: update_reminder заменил replace_reminder в registry.
+
+    Только reminder_id required; title/trigger_iso опциональны (partial update).
+    """
+    c = TOOL_CONTRACTS["update_reminder"]
+    assert c.idempotency_strategy.value == "per_entity"
+    assert c.entity_id_field == "reminder_id"
+    assert c.required_fields == {"reminder_id": "string"}
+    assert c.mutation_kind is MutationKind.WRITE  # UPDATE, не REPLACE
+    # Error_code-specific templates для past_date
+    assert "past_date" in c.failure_template_variants_by_code
 
 
 def test_cancel_reminder_uses_per_entity() -> None:
@@ -258,11 +264,11 @@ def test_tool_journal_entry_minimum_fields() -> None:
 
 
 def test_turn_context_defaults_to_moscow() -> None:
-    ctx = TurnContext(turn_id="t1", tenant_id=42)
+    ctx = TurnContext(turn_id="t1", tenant_id="42")
     assert ctx.user_tz == "Europe/Moscow"
 
 
 def test_turn_context_is_frozen() -> None:
-    ctx = TurnContext(turn_id="t1", tenant_id=42)
+    ctx = TurnContext(turn_id="t1", tenant_id="42")
     with pytest.raises(Exception):  # FrozenInstanceError, но точное имя зависит от версии
-        ctx.tenant_id = 99  # type: ignore[misc]
+        ctx.tenant_id = "99"  # type: ignore[misc]
