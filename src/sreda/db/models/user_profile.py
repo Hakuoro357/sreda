@@ -60,7 +60,13 @@ class TenantUserProfile(Base):
     # IANA timezone string ("UTC", "Europe/Moscow"). Not validated here; the
     # handlers that write it use zoneinfo lookup to reject bad values at
     # the API boundary.
-    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    # 2026-05-18: default changed UTC → Europe/Moscow — Среда RU-bot,
+    # ~80%+ users в MSK, прежний default UTC давал смещение времени в
+    # напоминаниях. См. migration 20260518_0046.
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Europe/Moscow",
+        server_default="Europe/Moscow",
+    )
     # JSON array of windows: [{"from_hour": 0..23, "to_hour": 0..23,
     # "weekdays": [0..6]}]. from_hour == to_hour means "always quiet on
     # those weekdays"; to_hour < from_hour means "window crosses midnight".
