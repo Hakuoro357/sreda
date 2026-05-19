@@ -569,24 +569,22 @@ _COMPOSER_TIMEOUT = 8.0
 # Структура: list[(provider_name, timeout_seconds)]. Iterate в порядке,
 # при exception или timeout → try next. Каждый получает свой full budget.
 #
-# 2026-05-19 pilot test: gemini-2.5-flash не вытягивает контекстную
-# логику на реальных turn'ах (например voice transcription empty → не
-# попытался расширить контекст из history). Borya feedback после live
-# pilot. Возврат primary на mimo-v2.5-pro (та же модель что legacy
-# успешно делает 1000+ turns/день).
+# 2026-05-19 pilot test показал что gemini-2.5-flash «слишком тупая» —
+# на 4/4 voice turn'ах вернула Clarification вместо action (parser hint
+# «время не распознано» сделал её ультра-осторожной; mimo на тех же
+# текстах в legacy чате нормально извлекает время и эмитит tool_call).
+# Borya decision: убрать gemini/deepseek из cascade полностью, оставить
+# только mimo. Backlog item — найти LLM быстрее чем mimo которая
+# справляется не хуже (см. memory R-39 LLM replacement search).
 #
-# Worst-case wall-clock = sum(timeouts):
-#   Planner: 8+4+4 = 16s
-#   Composer: 5+3+3 = 11s
+# Worst-case wall-clock:
+#   Planner: 12s (mimo only — single candidate, generous timeout)
+#   Composer: 8s
 _PLANNER_CANDIDATES: tuple[tuple[str, float], ...] = (
-    ("mimo-v2.5",                   8.0),
-    ("openrouter-gemini-2.5-flash", 4.0),
-    ("openrouter-deepseek",         4.0),
+    ("mimo-v2.5", 12.0),
 )
 _COMPOSER_CANDIDATES: tuple[tuple[str, float], ...] = (
-    ("mimo-v2.5",                   5.0),
-    ("openrouter-gemini-2.5-flash", 3.0),
-    ("openrouter-deepseek",         3.0),
+    ("mimo-v2.5", 8.0),
 )
 
 # Backward-compat exports (для тестов и diagnostics)
