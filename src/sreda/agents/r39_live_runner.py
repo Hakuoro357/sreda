@@ -547,22 +547,24 @@ _COMPOSER_TEMP = 0.7
 _PLANNER_TIMEOUT = 12.0
 _COMPOSER_TIMEOUT = 8.0
 
-# Rollback 2026-05-18 после shadow data: gemini-3.1 показал
-# regression (0 successful side_effects из 11 runs, hallucinates
-# tool names типа get_weather, missed required fields). Откатываем
-# primary на mimo-v2.5-pro до фиксов P0 (см.
-# plans/tomorrow-plan-2026-05-19.md Bug A/B/C).
+# 2026-05-19: переключили R-39 shadow primary на gemini-2.5-flash
+# после R-39 planner bench (plans/r39-planner-bench-2026-05-19.md):
+# - gemini-2.5-flash: 100% schema, 92% kind, p50=912ms / p95=1943ms
+# - mimo-v2.5-pro: 92% schema, p50=6s, p95=30s timeout
 #
-# План R-39 (plans/r39-final.md L77, L227) пинит gemini-3.1 — вернёмся
-# к нему после schema enforcement + tool whitelist + parser fix.
-# Провайдеры `openrouter-gemini-lite` и `openrouter-deepseek` остаются
-# в _OPENROUTER_MODEL_BY_PROVIDER (llm.py) для будущего восстановления.
+# Это shadow-only: hallucinated tool names (Bug C) пишутся в журнал
+# как failed runs (dry-run callables), пользователь не видит. Это
+# желаемая data collection поведение — увидим в production data
+# насколько 2.5-flash hallucinates по сравнению с lab bench (2 на 12).
 #
-# Fallback chain пуст: смысла fall back на gemini/deepseek нет, мы их
-# именно за regressions откатили. При mimo timeout/error → graceful
-# None (в shadow безопасно — пишет halted_early run в журнал, user
-# не видит).
-_R39_PRIMARY_PROVIDER = "mimo-v2.5"
+# План R-39 говорил 3.1-flash-lite, но bench показал 2.5-flash быстрее
+# (p95 1.9s vs 7.3s) при том же tool accuracy. Возврат к 3.1 — если
+# 2.5 в проде окажется хуже.
+#
+# Fallback chain пуст: при error → graceful None (в shadow ок).
+# Перед live promotion нужен tool whitelist enforcement (Bug C) +
+# timeout chain fix.
+_R39_PRIMARY_PROVIDER = "openrouter-gemini-2.5-flash"
 _R39_FALLBACK_PROVIDERS: tuple[str, ...] = ()
 
 
