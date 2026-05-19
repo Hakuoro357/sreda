@@ -592,9 +592,13 @@ _COMPOSER_TIMEOUT = 8.0
 # Worst-case wall-clock:
 #   Planner:  4+4 = 8s  (cascade gemini → qwen)
 #   Composer: 8s        (single mimo candidate)
+# 2026-05-19 12:21 — second pilot retest: qwen-plus тоже провалился
+# на real voice turns (5/5 Clarification). Часть turn'ов даже не
+# дошла до LLM — parser_ambiguous short-circuit на «два часа» (word
+# numerals + ambiguous phrasing). Откатываемся на mimo-only как
+# stable baseline пока не решён root cause (см. memory backlog).
 _PLANNER_CANDIDATES: tuple[tuple[str, float], ...] = (
-    ("openrouter-qwen-plus",        4.0),
-    ("openrouter-gemini-2.5-flash", 4.0),
+    ("mimo-v2.5", 12.0),
 )
 # Composer cascade — UNCHANGED in этом patch (OpenCode MAJOR M1 fix):
 # нет composer bench data, нет основания менять. Mimo only / 8s timeout

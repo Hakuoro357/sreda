@@ -305,6 +305,14 @@ def test_planner_cascade_falls_through_on_bad_json(monkeypatch) -> None:
     from sreda.agents import r39_live_runner as r39
     from sreda.services import llm as llm_module
 
+    # Skip если cascade сейчас single-provider (mimo-only после 2nd pilot
+    # rollback) — этот test проверяет multi-provider fallback behaviour.
+    if len(r39._PLANNER_CANDIDATES) < 2:
+        pytest.skip(
+            f"_PLANNER_CANDIDATES has {len(r39._PLANNER_CANDIDATES)} entries — "
+            "multi-provider cascade not configured currently"
+        )
+
     # 1. get_chat_llm → возвращает stub per-provider
     def fake_get_chat_llm(*, provider: str, temperature: float):
         return _StubLLM(label=provider)
