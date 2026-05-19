@@ -300,6 +300,32 @@ KNOWN_TOOLS: frozenset[str] = frozenset({
     "reply_with_buttons",
 })
 
+# Required args per tool — для P0.B (2026-05-19). Bug A воспроизведён
+# на gemini-3.1-flash-lite и gemini-2.5-flash в production: LLM эмитит
+# `schedule_reminder` без обязательного `title` → executor fail-closed
+# с `missing_idempotency_field`. Прод инцидент с Borya 2026-05-18 15:41
+# и 2026-05-19 08:22 (стоматолог).
+#
+# Минимальный critical set — только наиболее частые tools и поля без
+# которых tool **точно** падает. Tools не в этом dict не enforce'аются
+# (permissive по умолчанию). Add when prod data shows new failure mode.
+REQUIRED_ARGS_PER_TOOL: dict[str, frozenset[str]] = {
+    # Reminders — title + trigger_iso обязательны для schedule_reminder
+    # (бывшая Bug A). update_reminder / cancel_reminder / replace_reminder
+    # не enforce'аются — там tool сам делает search-by-id или search-by-title.
+    "schedule_reminder": frozenset({"title", "trigger_iso"}),
+    # Memory writes — text content обязателен
+    "save_core_fact": frozenset({"content"}),
+    "save_episode": frozenset({"summary"}),
+    "recall_memory": frozenset({"query"}),
+    # Web
+    "web_search": frozenset({"query"}),
+    "fetch_url": frozenset({"url"}),
+    # Profile updates
+    "update_profile_field": frozenset({"field_name"}),
+}
+
+
 # Soft-aliases: LLM эмитит близкое-но-неверное имя → normalize. Каждый
 # alias verified из bench production logs или logical synonym map.
 TOOL_ALIASES: dict[str, str] = {
@@ -344,6 +370,27 @@ def _build_user_prompt(request: PlanRequest) -> str:
     return "\n".join(parts)
 
 
+_FIELD_HUMAN_NAME: dict[str, str] = {
+    "title": "название",
+    "trigger_iso": "время",
+    "content": "что именно запомнить",
+    "summary": "что произошло",
+    "query": "что искать",
+    "url": "адрес",
+    "field_name": "какое поле менять",
+    "items": "список",
+}
+
+
+def _format_missing_fields_question(tool: str, missing: list[str]) -> str:
+    """Human-friendly clarification question для missing required args."""
+    human = [_FIELD_HUMAN_NAME.get(f, f) for f in missing]
+    if len(human) == 1:
+        return f"Уточни, пожалуйста: {human[0]}?"
+    items = ", ".join(human[:-1]) + f" и {human[-1]}"
+    return f"Уточни, пожалуйста: {items}?"
+
+
 def _parse_llm_output(
     raw: dict[str, Any],
     request: PlanRequest,
@@ -373,6 +420,7 @@ def _parse_llm_output(
         calls: list[ToolCall] = []
         hallucinated: list[str] = []
         aliased: list[tuple[str, str]] = []
+        missing_fields: list[tuple[str, list[str]]] = []
         for i, c in enumerate(raw_calls):
             if not isinstance(c, dict):
                 continue
@@ -395,6 +443,14 @@ def _parse_llm_output(
                 and isinstance(request.parser_result, TimeResolved)
             ):
                 args["trigger_iso"] = request.parser_result.iso_user_tz.isoformat()
+            # P0.B (2026-05-19): required fields enforcement.
+            # Bug A воспроизведён на gemini в production: schedule_reminder
+            # без `title`. Drop вместо fail-closed на executor side.
+            required = REQUIRED_ARGS_PER_TOOL.get(tool, frozenset())
+            missing = required - {k for k, v in args.items() if v}
+            if missing:
+                missing_fields.append((tool, sorted(missing)))
+                continue  # drop call с missing required args
             calls.append(ToolCall(tool_name=tool, args=args, action_index=i))
         if aliased:
             logger.info(
@@ -405,9 +461,24 @@ def _parse_llm_output(
                 "planner: hallucinated tools dropped %s (kept=%d)",
                 hallucinated, len(calls),
             )
+        if missing_fields:
+            logger.warning(
+                "planner: tools dropped due to missing required fields %s "
+                "(kept=%d)",
+                missing_fields, len(calls),
+            )
         if not calls:
-            # Все calls dropped (hallucinated) → fall to clarification
-            # вместо silent NoAction, чтобы user не получил empty reply.
+            # Все calls dropped → Clarification вместо silent NoAction
+            if missing_fields:
+                # Bug A path: модель забыла required поле (title etc.).
+                # Просим конкретно поле которого не хватает.
+                first_tool, first_missing = missing_fields[0]
+                return Clarification(
+                    question=_format_missing_fields_question(
+                        first_tool, first_missing,
+                    ),
+                    rationale=f"missing_required:{first_tool}:{first_missing}",
+                )
             if hallucinated:
                 return Clarification(
                     question="Не уверена что могу помочь с этим запросом. "
