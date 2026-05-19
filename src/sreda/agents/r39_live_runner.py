@@ -564,91 +564,92 @@ _COMPOSER_TIMEOUT = 8.0
 # Fallback chain пуст: при error → graceful None (в shadow ок).
 # Перед live promotion нужен tool whitelist enforcement (Bug C) +
 # timeout chain fix.
-_R39_PRIMARY_PROVIDER = "openrouter-gemini-2.5-flash"
-_R39_FALLBACK_PROVIDERS: tuple[str, ...] = ()
+# P0.C (2026-05-19): per-provider candidates with per-provider timeouts.
+# Замена RunnableWithFallbacks (где outer timeout оборачивал весь chain
+# и fallback'и получали остаток времени — code review CRITICAL).
+#
+# Структура: list[(provider_name, timeout_seconds)]. Iterate в порядке,
+# при exception или timeout → try next. Каждый получает свой full budget.
+#
+# Worst-case wall-clock: sum(timeouts) = 4+4+8 = 16s. С внешним buffer
+# (job timeout) = 20s. Это приемлемо для shadow; для live composer'a
+# можно усугубить (composer timeouts тоньше: 3/3/5 = 11s).
+_PLANNER_CANDIDATES: tuple[tuple[str, float], ...] = (
+    ("openrouter-gemini-2.5-flash", 4.0),
+    ("openrouter-deepseek",         4.0),
+    ("mimo-v2.5",                   8.0),
+)
+_COMPOSER_CANDIDATES: tuple[tuple[str, float], ...] = (
+    ("openrouter-gemini-2.5-flash", 3.0),
+    ("openrouter-deepseek",         3.0),
+    ("mimo-v2.5",                   5.0),
+)
 
-
-def _build_r39_llm(temperature: float) -> Any | None:
-    """Собрать R-39 LLM с явным pinning'ом на gemini-3.1 + fallback chain.
-
-    Зачем явный provider вместо ``get_chat_llm()`` defaults:
-    - План R-39 пинит конкретные модели чтобы изолировать R-39 от
-      admin live-switcher'а (другие фичи могут переключать primary
-      на mimo/nemotron — R-39 не задевается).
-    - Поведенческие свойства которые мы измерили (gemini thinking
-      levels для planner JSON output) привязаны к gemini-3.1.
-
-    Fallback chain (deepseek → mimo) — если primary OpenRouter down
-    или rate-limited, second try deepseek, последний resort mimo
-    (всегда доступен пока MiMo API key установлен).
-
-    Returns None если ни primary ни fallback'и не сконфигурированы.
-    Caller тогда возвращает None в invoke → R-39 graceful degradation.
-    """
-    from sreda.services.llm import get_chat_llm
-
-    primary = get_chat_llm(
-        provider=_R39_PRIMARY_PROVIDER, temperature=temperature,
-    )
-    fallbacks: list[Any] = []
-    for fb_provider in _R39_FALLBACK_PROVIDERS:
-        fb_llm = get_chat_llm(provider=fb_provider, temperature=temperature)
-        if fb_llm is not None:
-            fallbacks.append(fb_llm)
-
-    if primary is None:
-        if not fallbacks:
-            logger.warning(
-                "R-39: no LLM configured (primary=%s + %d fallbacks all None)",
-                _R39_PRIMARY_PROVIDER, len(_R39_FALLBACK_PROVIDERS),
-            )
-            return None
-        # Primary недоступен — promote первый fallback в primary
-        primary = fallbacks.pop(0)
-        logger.warning(
-            "R-39: primary provider %s unavailable, promoting first fallback",
-            _R39_PRIMARY_PROVIDER,
-        )
-
-    if not fallbacks:
-        return primary
-    return primary.with_fallbacks(fallbacks)
+# Backward-compat exports (для тестов и diagnostics)
+_R39_PRIMARY_PROVIDER = _PLANNER_CANDIDATES[0][0]
+_R39_FALLBACK_PROVIDERS: tuple[str, ...] = tuple(c[0] for c in _PLANNER_CANDIDATES[1:])
 
 
 def _make_planner_invoker(
     *, feature_key: str, tenant_id: str, session: Session, run_id: str,
 ) -> Callable[[str, str], dict[str, Any] | None]:
-    """Создать planner invoker. БЕЗ lru_cache (Codex R4 MAJ — provider switcher)."""
+    """Planner invoker с per-provider timeout cascade.
+
+    BugFix code-review CRITICAL: ранее использовали RunnableWithFallbacks
+    + outer timeout 12s. Если primary висит 10s — fallback'и получают
+    2s/0s. Новый подход: явный for-loop по списку (provider, timeout),
+    каждый получает свой full budget.
+    """
 
     def invoke(system: str, user: str) -> dict[str, Any] | None:
         from sreda.services.llm import (
-            LLMCallTimeout,
-            invoke_with_per_call_timeout,
+            LLMCallTimeout, get_chat_llm, invoke_with_per_call_timeout,
         )
-
-        llm = _build_r39_llm(_PLANNER_TEMP)
-        if llm is None:
-            logger.warning("R-39 planner: _build_r39_llm returned None")
-            return None
         messages = [SystemMessage(content=system), HumanMessage(content=user)]
-        try:
-            ai_msg = invoke_with_per_call_timeout(
-                llm, messages, timeout_seconds=_PLANNER_TIMEOUT,
+        last_error: str | None = None
+        for provider, tmo in _PLANNER_CANDIDATES:
+            llm = get_chat_llm(provider=provider, temperature=_PLANNER_TEMP)
+            if llm is None:
+                logger.warning(
+                    "R-39 planner: %s not configured — try next", provider,
+                )
+                continue
+            try:
+                ai_msg = invoke_with_per_call_timeout(
+                    llm, messages, timeout_seconds=tmo,
+                )
+            except LLMCallTimeout:
+                logger.warning(
+                    "R-39 planner: %s timeout (%.1fs) — try next",
+                    provider, tmo,
+                )
+                last_error = f"{provider}:timeout"
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "R-39 planner: %s failed (%s) — try next",
+                    provider, type(exc).__name__,
+                )
+                last_error = f"{provider}:{type(exc).__name__}"
+                continue
+
+            # Success path
+            _log_and_record_usage(
+                ai_msg=ai_msg, session=session, tenant_id=tenant_id,
+                feature_key=feature_key, run_id=run_id,
+                task_type="r39_planner",
             )
-        except LLMCallTimeout:
-            logger.warning("R-39 planner LLM timeout")
-            return None
-        except Exception:
-            logger.exception("R-39 planner LLM failed")
-            return None
+            logger.info(
+                "R-39 planner: %s succeeded in <%.1fs", provider, tmo,
+            )
+            content = getattr(ai_msg, "content", "") or ""
+            return _parse_planner_json(content)
 
-        _log_and_record_usage(
-            ai_msg=ai_msg, session=session, tenant_id=tenant_id,
-            feature_key=feature_key, run_id=run_id, task_type="r39_planner",
+        logger.warning(
+            "R-39 planner: all %d candidates failed (last=%s)",
+            len(_PLANNER_CANDIDATES), last_error,
         )
-
-        content = getattr(ai_msg, "content", "") or ""
-        return _parse_planner_json(content)
+        return None
 
     return invoke
 
@@ -656,34 +657,39 @@ def _make_planner_invoker(
 def _make_composer_invoker(
     *, feature_key: str, tenant_id: str, session: Session, run_id: str,
 ) -> Callable[[str, str], str | None]:
-    """Composer invoker (output=str). Аналогично planner_invoker."""
+    """Composer invoker с per-provider timeout cascade. Same pattern что
+    planner, но без _parse_planner_json — composer возвращает plain str.
+    """
 
     def invoke(system: str, user: str) -> str | None:
         from sreda.services.llm import (
-            LLMCallTimeout,
-            invoke_with_per_call_timeout,
+            LLMCallTimeout, get_chat_llm, invoke_with_per_call_timeout,
         )
-
-        llm = _build_r39_llm(_COMPOSER_TEMP)
-        if llm is None:
-            return None
         messages = [SystemMessage(content=system), HumanMessage(content=user)]
-        try:
-            ai_msg = invoke_with_per_call_timeout(
-                llm, messages, timeout_seconds=_COMPOSER_TIMEOUT,
+        for provider, tmo in _COMPOSER_CANDIDATES:
+            llm = get_chat_llm(provider=provider, temperature=_COMPOSER_TEMP)
+            if llm is None:
+                continue
+            try:
+                ai_msg = invoke_with_per_call_timeout(
+                    llm, messages, timeout_seconds=tmo,
+                )
+            except LLMCallTimeout:
+                continue
+            except Exception:
+                logger.exception(
+                    "R-39 composer: %s failed — try next", provider,
+                )
+                continue
+
+            _log_and_record_usage(
+                ai_msg=ai_msg, session=session, tenant_id=tenant_id,
+                feature_key=feature_key, run_id=run_id,
+                task_type="r39_composer",
             )
-        except LLMCallTimeout:
-            return None
-        except Exception:
-            logger.exception("R-39 composer LLM failed")
-            return None
+            return getattr(ai_msg, "content", "") or None
 
-        _log_and_record_usage(
-            ai_msg=ai_msg, session=session, tenant_id=tenant_id,
-            feature_key=feature_key, run_id=run_id, task_type="r39_composer",
-        )
-
-        return getattr(ai_msg, "content", "") or None
+        return None
 
     return invoke
 
