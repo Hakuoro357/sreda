@@ -38,7 +38,11 @@ def _ctx() -> TurnContext:
 
 
 def _resolved_time() -> TimeResolved:
-    target_utc = datetime(2026, 5, 17, 11, 0, tzinfo=timezone.utc)
+    # 2026-05-19 (R-39 cleanup): bumped 2026-05-17 → 2030-05-17 because
+    # planner._parse_llm_output теперь дропает past trigger_iso через
+    # is_past_iso. Stale fixture даты pre-cleanup ловились этим guard'ом.
+    # 14:00 MSK == 11:00 UTC — фиксируем для assert-stable.
+    target_utc = datetime(2030, 5, 17, 11, 0, tzinfo=timezone.utc)
     target_msk = target_utc.astimezone(MSK)
     return TimeResolved(
         iso_utc=target_utc,
@@ -91,7 +95,7 @@ def test_resolved_correction_builds_update_plan() -> None:
     assert call.tool_name == "update_reminder"
     assert call.args["reminder_id"] == "rem_old"
     # parser-resolved trigger_iso подставлен детерминированно
-    assert call.args["trigger_iso"].startswith("2026-05-17T14:00")
+    assert call.args["trigger_iso"].startswith("2030-05-17T14:00")
     assert "разбудить" in call.args["title"].lower()
 
 
@@ -186,28 +190,69 @@ def test_time_ambiguous_invokes_llm_when_available() -> None:
         invoke_count += 1
         # Verify negative parser hint НЕ в prompt'е
         assert "не распознан" not in user.lower()
-        return {"kind": "action", "calls": [{"tool": "schedule_reminder", "args": {"title": "x", "trigger_iso": "2026-05-19T14:00:00+03:00"}}]}
+        return {"kind": "action", "calls": [{"tool": "schedule_reminder", "args": {"title": "x", "trigger_iso": "2030-05-19T14:00:00+03:00"}}]}
     result = plan_action(request, invoke_llm=fake_llm)
     assert invoke_count == 1, "LLM должна быть вызвана (TimeAmbiguous не short-circuit'ит)"
     assert isinstance(result, ExecutionPlan)
 
 
-def test_time_invalid_past_returns_clarification() -> None:
-    invalid = TimeInvalid(raw="вчера в 9", reason="past_date")
+def test_time_invalid_past_falls_through_to_llm_when_available() -> None:
+    """2026-05-19 cleanup: past_date + invoke_llm → LLM вызывается, может
+    вернуть save_episode (real prod case «Сделала зарядку вчера» — НЕ
+    reminder request). Hardcoded «На какое поставить?» удалён.
+
+    Codex MAJOR R1 lock-in: prevents future re-introduction of short-circuit.
+    OpenCode MINOR R1: assert user_text preserved + no leaked clarification wording.
+    """
+    invalid = TimeInvalid(raw="вчера", reason="past_date")
     request = PlanRequest(
-        user_text="напомни вчера в 9",
+        user_text="Сделала зарядку вчера",
         intent=TurnIntent.MUTATION,
         parser_result=invalid,
         correction_target=None,
         conversation_history=(),
         turn_context=_ctx(),
     )
-    result = plan_action(request)
-    assert isinstance(result, Clarification)
-    assert "прошл" in result.question.lower()
+    invoke_count = 0
+
+    def fake_llm(system: str, user: str) -> dict:
+        nonlocal invoke_count
+        invoke_count += 1
+        # User-text preserved в prompt (OpenCode MINOR R1):
+        assert "Сделала зарядку вчера" in user
+        # NO hardcoded «уже прошло» wording leaked в prompt
+        assert "уже прошло" not in user.lower()
+        return {
+            "kind": "action",
+            "calls": [{"tool": "save_episode", "args": {"summary": "Зарядка"}}],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    assert invoke_count == 1, "LLM должна быть вызвана (past_date не short-circuit'ит)"
+    assert isinstance(result, ExecutionPlan)
+    assert result.calls[0].tool_name == "save_episode"
+
+
+def test_time_invalid_past_without_llm_returns_no_action() -> None:
+    """2026-05-19 cleanup: past_date без invoke_llm → NoAction(no_llm_available),
+    НЕ hardcoded Clarification «уже прошло». Regression на removal."""
+    invalid = TimeInvalid(raw="вчера", reason="past_date")
+    request = PlanRequest(
+        user_text="Сделала зарядку вчера",
+        intent=TurnIntent.MUTATION,
+        parser_result=invalid,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+    result = plan_action(request)  # invoke_llm=None
+    assert isinstance(result, NoAction)
+    assert result.rationale == "no_llm_available"
 
 
 def test_time_invalid_out_of_range_returns_clarification() -> None:
+    """out_of_range остаётся hardcoded — nonsensical input («25:00»), LLM
+    не поможет."""
     invalid = TimeInvalid(raw="в 25:00", reason="out_of_range")
     request = PlanRequest(
         user_text="в 25:00 напомни",
@@ -219,7 +264,124 @@ def test_time_invalid_out_of_range_returns_clarification() -> None:
     )
     result = plan_action(request)
     assert isinstance(result, Clarification)
-    assert "не разобрала" in result.question.lower()
+    assert result.rationale == "parser_invalid:out_of_range"
+    assert "сказать иначе" in result.question.lower()
+
+
+def test_time_invalid_unknown_reason_returns_clarification() -> None:
+    """Codex MAJOR R1: future TimeInvalid.reason values → fail-closed
+    Clarification с distinct rationale (НЕ fall through на LLM —
+    parser failure mode неизвестен, risk-averse path)."""
+    invalid = TimeInvalid(raw="something", reason="future_unknown_reason")
+    request = PlanRequest(
+        user_text="x",
+        intent=TurnIntent.MUTATION,
+        parser_result=invalid,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+    result = plan_action(request)
+    assert isinstance(result, Clarification)
+    assert "unknown" in result.rationale
+    assert "future_unknown_reason" in result.rationale
+
+
+def test_llm_schedule_with_past_trigger_dropped() -> None:
+    """Codex MAJOR R1+R2: LLM попытался schedule_reminder с past trigger_iso
+    → drop по actual ISO check (is_past_iso), не по parser_result. Single-call
+    путь — calls пустой ПОСЛЕ continue, fail на past_trigger_drop_all
+    (НЕ llm_empty_action_plan — Codex R3 ordering note)."""
+    invalid = TimeInvalid(raw="вчера в 9", reason="past_date")
+    request = PlanRequest(
+        user_text="Напомни вчера в 9",
+        intent=TurnIntent.MUTATION,
+        parser_result=invalid,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+    past_iso = "2026-01-01T09:00:00+03:00"  # явно в прошлом
+
+    def fake_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "action",
+            "calls": [{
+                "tool": "schedule_reminder",
+                "args": {"title": "x", "trigger_iso": past_iso},
+            }],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    assert isinstance(result, Clarification)
+    assert "past_trigger_drop_all" in result.rationale
+    assert "уже прошло" in result.question.lower()
+
+
+def test_past_date_marker_but_future_trigger_kept() -> None:
+    """Codex MAJOR R2: «Вчера понял, напомни завтра в 9» — parser выдал
+    past_date marker (из-за «вчера»), но LLM правильно эмитит future
+    trigger. Drop НЕ должен сработать (validate actual ISO, не parser hint)."""
+    from datetime import timedelta
+
+    invalid = TimeInvalid(raw="вчера", reason="past_date")
+    request = PlanRequest(
+        user_text="Вчера понял, напомни завтра в 9",
+        intent=TurnIntent.MUTATION,
+        parser_result=invalid,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+    future_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+
+    def fake_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "action",
+            "calls": [{
+                "tool": "schedule_reminder",
+                "args": {"title": "Понял что-то", "trigger_iso": future_iso},
+            }],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    assert isinstance(result, ExecutionPlan)
+    assert result.calls[0].tool_name == "schedule_reminder"
+
+
+def test_mixed_calls_with_past_trigger_full_clarification() -> None:
+    """Codex MAJOR R2: LLM returns [save_episode(valid), schedule_reminder(past)]
+    → ВСЯ plan rejected (Clarification), НЕ partial ExecutionPlan с save_episode.
+    Silent partial drop = R-39 confab class regression (user думает запрос
+    обработан, а reminder потерян)."""
+    request = PlanRequest(
+        user_text="Сделала зарядку вчера, и напомни вчера же сходить",
+        intent=TurnIntent.MUTATION,
+        parser_result=TimeInvalid(raw="вчера", reason="past_date"),
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+
+    def fake_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "action",
+            "calls": [
+                {"tool": "save_episode", "args": {"summary": "Зарядка вчера"}},
+                {
+                    "tool": "schedule_reminder",
+                    "args": {
+                        "title": "Сходить",
+                        "trigger_iso": "2026-01-01T09:00:00+03:00",
+                    },
+                },
+            ],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    # Whole plan rejected, NOT partial ExecutionPlan
+    assert isinstance(result, Clarification)
+    assert "past_trigger_drop_all" in result.rationale
 
 
 # ─── LLM-вызов и подмена trigger_iso ────────────────────────────────
@@ -249,7 +411,7 @@ def test_llm_action_with_trigger_iso_gets_overwritten_by_parser() -> None:
     )
     result = plan_action(request, invoke_llm=fake_llm)
     assert isinstance(result, ExecutionPlan)
-    assert result.calls[0].args["trigger_iso"].startswith("2026-05-17T14:00")
+    assert result.calls[0].args["trigger_iso"].startswith("2030-05-17T14:00")
 
 
 def test_llm_no_action() -> None:
@@ -404,7 +566,7 @@ def test_kati_correction_full_pipeline() -> None:
     assert result.calls[0].tool_name == "update_reminder"
     assert result.calls[0].args["reminder_id"] == "rem_old"
     # trigger_iso детерминирован, не от LLM
-    assert "2026-05-17T14:00" in result.calls[0].args["trigger_iso"]
+    assert "2030-05-17T14:00" in result.calls[0].args["trigger_iso"]
 
 
 # ─── _build_user_prompt — silent skip negative parser_hint ─────────────
@@ -435,7 +597,7 @@ def test_build_user_prompt_includes_positive_time_hint() -> None:
     assert "Сообщение:" in prompt
     assert "Намерение: mutation" in prompt
     assert "Время (детерминированно):" in prompt
-    assert "2026-05-17T14:00" in prompt  # iso_user_tz
+    assert "2030-05-17T14:00" in prompt  # iso_user_tz
 
 
 def test_build_user_prompt_silent_skip_on_unrecognized() -> None:

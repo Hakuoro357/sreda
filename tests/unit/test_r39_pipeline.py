@@ -37,8 +37,14 @@ def _ctx(turn_id: str = "t-001", tenant_id: int = 352612382) -> TurnContext:
 
 
 def _now_utc() -> datetime:
-    # 2026-05-17 10:21 UTC = 13:21 MSK — момент Кати-инцидента
-    return datetime(2026, 5, 17, 10, 21, 0, tzinfo=timezone.utc)
+    # Исходная Кати-инцидента дата 2026-05-17 13:21 MSK сохранена в
+    # docstring модуля как историческая ссылка. Бамп до 2030-05-17 нужен
+    # потому что planner._parse_llm_output теперь дропает past trigger_iso
+    # через is_past_iso (грубое сравнение с реальным datetime.now()), а
+    # 2026-05-17 уже в прошлом относительно реального clock. Время дня
+    # (10:21 UTC = 13:21 MSK) сохранено, чтобы test scenario оставался
+    # такой же.
+    return datetime(2030, 5, 17, 10, 21, 0, tzinfo=timezone.utc)
 
 
 def _detector_clean(text: str, tools: set[str]) -> bool:
@@ -114,6 +120,16 @@ def test_chitchat_returns_no_action_no_journal() -> None:
 
 
 def test_ambiguous_time_yields_clarification() -> None:
+    """2026-05-19 cleanup: TimeAmbiguous больше не hardcoded short-circuit
+    (был bug «через 2 часа или в 14:00?» на любой ambiguous parser-результат).
+    Теперь fall through к LLM, который сам формулирует contextual вопрос.
+    Тест паттерн: пробрасываем fake_planner_llm возвращающий Clarification."""
+    def fake_planner_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "clarification",
+            "question": "Уточни — через 2 часа или в 14:00?",
+        }
+
     result = process_turn(
         user_text="поставь напоминание на 2 часа разбудить",
         conversation_history=(),
@@ -121,8 +137,10 @@ def test_ambiguous_time_yields_clarification() -> None:
         now_utc=_now_utc(),
         tool_callables=_tool_callables(),
         detector=_detector_clean,
+        invoke_planner_llm=fake_planner_llm,
     )
-    # «на 2 часа» без квалификатора → TimeAmbiguous → Clarification
+    # «на 2 часа» без квалификатора → TimeAmbiguous → fall through → LLM
+    # сама возвращает Clarification из fake_planner_llm
     assert result.plan_kind == "clarification"
     assert result.journal.is_empty
     assert "14:00" in result.final_text or "через" in result.final_text.lower()
@@ -153,7 +171,7 @@ def test_kati_correction_full_e2e_no_llm() -> None:
                 ),
             ),
             turn_id="t-original",
-            timestamp_utc="2026-05-17T10:20:00Z",
+            timestamp_utc="2030-05-17T10:20:00Z",
         ),
     )
 
@@ -218,7 +236,7 @@ def test_simple_schedule_via_llm_with_parser_override() -> None:
     assert len(result.journal) == 1
     entry = result.journal.entries[0]
     # Время от parser-а: 14:00 MSK = 11:00 UTC
-    assert "2026-05-17T14:00" in entry.result_data.get("trigger_iso", "")
+    assert "2030-05-17T14:00" in entry.result_data.get("trigger_iso", "")
 
 
 # ─── Composer + замок ─────────────────────────────────────────────────
@@ -245,7 +263,7 @@ def test_composer_called_when_llm_provided() -> None:
                 ),
             ),
             turn_id="t-prev",
-            timestamp_utc="2026-05-17T10:00:00Z",
+            timestamp_utc="2030-05-17T10:00:00Z",
         ),
     )
 
@@ -286,7 +304,7 @@ def test_composer_blocked_by_lock_yields_first_line_only() -> None:
                 ),
             ),
             turn_id="t-prev",
-            timestamp_utc="2026-05-17T10:00:00Z",
+            timestamp_utc="2030-05-17T10:00:00Z",
         ),
     )
 

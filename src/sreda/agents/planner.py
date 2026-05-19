@@ -12,13 +12,24 @@
    target известен из conversation_history, parser дал новое время.
 3. **AmbiguousCorrection** → ``Clarification`` (несколько активных
    напоминаний, спрашиваем какое).
-4. **TimeAmbiguous** → ``Clarification`` («на 2 часа» = через 2ч или
-   в 14:00?).
-5. **TimeInvalid** → ``Clarification`` (вчера / out_of_range).
+4. **TimeAmbiguous** → fall through к LLM (silent skip). Hardcoded
+   short-circuit (commit 6d383ec) удалён — прилетал в нерелевантный
+   контекст. LLM сама disambig из history/intent.
+5. **TimeInvalid**:
+   - ``past_date`` → fall through к LLM (e.g. «Сделала зарядку вчера»
+     — НЕ reminder request, LLM эмитит ``save_episode``). Post-LLM
+     past-trigger safety enforce'ит actual ``trigger_iso`` через
+     ``is_past_iso`` хелпер.
+   - ``out_of_range`` → ``Clarification`` (nonsensical input типа
+     «25:00» — LLM не поможет).
+   - unknown reason → ``Clarification`` (fail-closed для future parser
+     versions).
 6. Иначе — LLM-вызов с типизированным выводом. Результат проходит
    защитную подмену: если parser нашёл ``TimeResolved``, мы перезаписываем
    ``trigger_iso`` от LLM на детерминированный. Это закрывает класс
-   багов когда LLM «округлила» время.
+   багов когда LLM «округлила» время. Если LLM эмитит past
+   ``trigger_iso`` (по факту, не по parser hint) — drop call'а с
+   fail-whole-plan Clarification (anti-confabulation).
 
 Реальный LLM-клиент инжектится через ``invoke_llm``. В day 5 prod
 интеграция подключит ``get_chat_llm`` с json_schema выводом.
@@ -160,18 +171,40 @@ def plan_action(
     # LLM сама решит: disambig из context (history, intent, time-of-day)
     # или попросит ОСМЫСЛЕННОЕ clarification.
 
-    # 5. Недопустимое время → уточнение
+    # 5. Недопустимое время — разделено по reason (2026-05-19 cleanup).
+    # Старый код hardcoded'ил "Это время уже прошло. На какое поставить?"
+    # для past_date — assumed reminder context. Прод bug: «Сделала зарядку
+    # вчера» НЕ reminder request, но получала «На какое поставить?».
+    # Теперь past_date → fall through к LLM; safety на actual trigger_iso
+    # enforce'ится в _parse_llm_output через is_past_iso.
     if isinstance(request.parser_result, TimeInvalid):
-        logger.info(
-            "planner.decision: TimeInvalid reason=%s → Clarification(parser_invalid)",
-            request.parser_result.reason,
-        )
-        reason_text = {
-            "past_date": "Это время уже прошло. На какое поставить?",
-            "out_of_range": "Не разобрала время — можешь сказать иначе? "
-                            "Например «в 14:00» или «завтра в 9 утра».",
-        }.get(request.parser_result.reason, "Не разобрала время.")
-        return Clarification(question=reason_text, rationale="parser_invalid")
+        reason = request.parser_result.reason
+        if reason == "past_date":
+            logger.info(
+                "planner.decision: TimeInvalid(past_date) → fall through to LLM",
+            )
+            # ничего не return — продолжаем step 6 (LLM)
+        elif reason == "out_of_range":
+            logger.info(
+                "planner.decision: TimeInvalid(out_of_range) → "
+                "Clarification(parser_invalid:out_of_range)",
+            )
+            return Clarification(
+                question="Не разобрала время — можешь сказать иначе? "
+                         "Например «в 14:00» или «завтра в 9 утра».",
+                rationale="parser_invalid:out_of_range",
+            )
+        else:
+            # Unknown reasons (future parser versions) — fail-closed
+            logger.info(
+                "planner.decision: TimeInvalid(unknown:%s) → "
+                "Clarification(parser_invalid:unknown)",
+                reason,
+            )
+            return Clarification(
+                question="Не разобрала время. Уточни, пожалуйста.",
+                rationale=f"parser_invalid:unknown:{reason}",
+            )
 
     # 6. Иначе — LLM
     if invoke_llm is None:
@@ -362,10 +395,18 @@ def _build_user_prompt(request: PlanRequest) -> str:
     """Собрать user-промпт с контекстом для LLM planner call.
 
     Включает positive TimeResolved hint когда parser справился. Для
-    TimeUnrecognized — silent skip (LLM сама извлекает время из текста).
+    остальных parser-результатов:
 
-    TimeAmbiguous / TimeInvalid обрабатываются через short-circuit в
-    `plan_action` ДО LLM call — до этой функции они не доходят.
+    - ``TimeUnrecognized`` → silent skip (LLM сама извлекает из текста).
+    - ``TimeAmbiguous`` → silent skip (после 2026-05-19 cleanup).
+      Раньше был hardcoded short-circuit «через 2 часа или в 14:00?»
+      ДО этой функции — удалён, теперь fall through к LLM.
+    - ``TimeInvalid(past_date)`` → silent skip (после 2026-05-19 cleanup).
+      Раньше был hardcoded short-circuit «На какое поставить?» ДО этой
+      функции — удалён, теперь fall through к LLM. Post-LLM safety
+      enforces actual ``trigger_iso`` через ``is_past_iso``.
+    - ``TimeInvalid(out_of_range)`` и unknown reasons остаются
+      hardcoded short-circuit'ами в ``plan_action`` — LLM там не поможет.
 
     Rationale silent skip см. commit message + bench v4 results
     (plans/r39-planner-bench-2026-05-19.md).
@@ -432,6 +473,7 @@ def _parse_llm_output(
         hallucinated: list[str] = []
         aliased: list[tuple[str, str]] = []
         missing_fields: list[tuple[str, list[str]]] = []
+        past_trigger_drops: list[tuple[str, str]] = []
         for i, c in enumerate(raw_calls):
             if not isinstance(c, dict):
                 continue
@@ -454,6 +496,23 @@ def _parse_llm_output(
                 and isinstance(request.parser_result, TimeResolved)
             ):
                 args["trigger_iso"] = request.parser_result.iso_user_tz.isoformat()
+            # 2026-05-19 cleanup (Codex MAJOR R2): validate actual trigger_iso.
+            # Раньше drop'ал по parser_result.reason — это давало false-positive
+            # (parser past_date + LLM future trigger корректно) и false-negative
+            # (parser Unrecognized + LLM past trigger). Use is_past_iso helper
+            # (sreda.agents.r39_tool_adapter) который сравнивает с now минус
+            # grace_minutes=2 (NTP drift + network latency tolerance).
+            if (
+                "trigger_iso" in args
+                and tool in {"schedule_reminder", "update_reminder", "replace_reminder"}
+            ):
+                from sreda.agents.r39_tool_adapter import is_past_iso
+                trigger_value = args.get("trigger_iso")
+                if isinstance(trigger_value, str) and is_past_iso(
+                    trigger_value, grace_minutes=2
+                ):
+                    past_trigger_drops.append((tool, trigger_value))
+                    continue  # drop call — full-plan reject ниже
             # P0.B (2026-05-19): required fields enforcement.
             # Bug A воспроизведён на gemini в production: schedule_reminder
             # без `title`. Drop вместо fail-closed на executor side.
@@ -477,6 +536,23 @@ def _parse_llm_output(
                 "planner: tools dropped due to missing required fields %s "
                 "(kept=%d)",
                 missing_fields, len(calls),
+            )
+        # 2026-05-19 cleanup (Codex MAJOR R2 + R3 ordering note):
+        # ЛЮБОЙ past_trigger drop → fail whole plan, не partial. Иначе
+        # LLM вернул [save_episode, schedule_reminder(past)] → silent
+        # partial loss (save выполнен, reminder потерян) = R-39 confab
+        # class regression. Whole-plan reject + clarification.
+        # КРИТИЧНО: этот блок ДО `if not calls:` — иначе single-call
+        # past_iso (calls пустой ПОСЛЕ continue) сваливался бы на
+        # llm_empty_action_plan с неверной рационализацией.
+        if past_trigger_drops:
+            logger.warning(
+                "planner: past_trigger drops %s → whole-plan Clarification",
+                past_trigger_drops,
+            )
+            return Clarification(
+                question="Это время уже прошло. Назвать другое?",
+                rationale=f"past_trigger_drop_all:{past_trigger_drops}",
             )
         if not calls:
             # Все calls dropped → Clarification вместо silent NoAction
