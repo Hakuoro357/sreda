@@ -174,6 +174,42 @@ def test_update_with_past_iso_blocked_before_invoke() -> None:
     assert fake.invoke_calls == []
 
 
+def test_schedule_recurring_with_past_anchor_kept() -> None:
+    """Codex MAJOR R2 code-review: recurring reminders с past anchor НЕ должны
+    блокироваться preflight'ом — RRULE сама находит next future occurrence.
+    Mirror'ит service layer (housewife_chat_tools.py:247) логику."""
+    fake = _FakeTool("schedule_reminder", "ok:scheduled:rem_X:Daily")
+    state, callables = _build(fake)
+    # past anchor + recurrence_rule → preflight ДОЛЖЕН skip past-date check
+    result = callables["schedule_reminder"](
+        title="Daily pills",
+        trigger_iso="2020-01-01T09:00:00+00:00",  # явно в прошлом
+        recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+    )
+    # Real tool ДОЛЖЕН быть вызван — preflight not blocking
+    assert len(fake.invoke_calls) == 1
+    assert fake.invoke_calls[0]["recurrence_rule"] == "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"
+    assert result is not None
+
+
+def test_update_with_clear_recurrence_and_past_iso_blocked() -> None:
+    """Codex MINOR R2 code-review: update_reminder с recurrence_rule +
+    clear_recurrence=True → net effect = снятие recurrence → past one-shot
+    reminder. Preflight ДОЛЖЕН блокировать (нельзя skip'ать по recurrence_rule
+    одному — проверять также clear_recurrence)."""
+    fake = _FakeTool("update_reminder", "ok:updated:rem_X:foo")
+    state, callables = _build(fake)
+    with pytest.raises(R39ToolFailure) as exc_info:
+        callables["update_reminder"](
+            reminder_id="rem_X",
+            trigger_iso="2020-01-01T00:00:00+00:00",  # past
+            recurrence_rule="FREQ=DAILY;BYHOUR=6",  # ignored из-за clear_recurrence
+            clear_recurrence=True,  # net: становится one-shot past reminder
+        )
+    assert exc_info.value.error_code == "past_date"
+    assert fake.invoke_calls == []  # real tool НЕ вызывался
+
+
 def test_past_date_preflight_does_not_mark_started() -> None:
     """Critical: started=False после past-date preflight → fallback safe."""
     fake = _FakeTool("update_reminder", "ok:updated:rem_X:foo")

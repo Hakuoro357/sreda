@@ -517,10 +517,19 @@ def _parse_llm_output(
             # тоже skip'ит past-date check для recurrence_rule, потому что
             # RRULE сама находит next future occurrence (e.g. «каждый день
             # в 9» после 09:00 валидно — anchor=today 09:00, next=tomorrow 09:00).
+            #
+            # Codex MINOR R2 code-review: tighten guard через
+            # `clear_recurrence` — если LLM эмитит recurrence_rule +
+            # clear_recurrence=True (update_reminder), net эффект сервиса —
+            # снятие recurrence → past one-shot reminder. Это anti-pattern,
+            # должен быть dropped.
+            has_active_recurrence = bool(
+                args.get("recurrence_rule")
+            ) and not args.get("clear_recurrence")
             if (
                 "trigger_iso" in args
                 and tool in {"schedule_reminder", "update_reminder", "replace_reminder"}
-                and not args.get("recurrence_rule")
+                and not has_active_recurrence
             ):
                 trigger_value = args.get("trigger_iso")
                 if isinstance(trigger_value, str) and is_past_iso(

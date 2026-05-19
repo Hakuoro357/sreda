@@ -120,10 +120,25 @@ def build_r39_tool_callables(
             # Past-date preflight для time-bearing tools (Codex R7 MAJ).
             # ВАЖНО: до side_effects_state["started"]=True, чтобы fallback
             # в legacy остался безопасным если preflight отвергает запрос.
+            #
+            # 2026-05-19 (Codex MAJOR R2 code-review): mirror planner +
+            # service layer (housewife_chat_tools.py:247) — skip past-date
+            # preflight когда recurrence будет реально активна (RRULE
+            # сама находит next future occurrence). Не skip'аем если
+            # update_reminder с `clear_recurrence=True` потому что net
+            # эффект — обнуление recurrence → past one-shot reminder.
             if tool_name in _TIME_BEARING_TOOLS:
                 trigger_iso = kwargs.get("trigger_iso")
-                if trigger_iso and is_past_iso(
-                    str(trigger_iso), grace_minutes=past_date_grace_minutes
+                has_active_recurrence = bool(
+                    kwargs.get("recurrence_rule")
+                ) and not kwargs.get("clear_recurrence")
+                if (
+                    trigger_iso
+                    and not has_active_recurrence
+                    and is_past_iso(
+                        str(trigger_iso),
+                        grace_minutes=past_date_grace_minutes,
+                    )
                 ):
                     raise R39ToolFailure(
                         error_code="past_date",

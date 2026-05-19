@@ -385,6 +385,40 @@ def test_recurring_reminder_with_past_anchor_kept() -> None:
     assert result.calls[0].args["recurrence_rule"] == "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"
 
 
+def test_update_with_clear_recurrence_and_past_trigger_dropped() -> None:
+    """Codex MINOR R2 code-review: net effect important. update_reminder
+    с recurrence_rule + clear_recurrence=True снимает recurrence на стороне
+    сервиса → получаем past one-shot reminder. Planner ДОЛЖЕН drop'нуть
+    (нельзя bypass past-trigger check по recurrence_rule одному)."""
+    request = PlanRequest(
+        user_text="убери повторение, поставь на вчера 9 утра",
+        intent=TurnIntent.MUTATION,
+        parser_result=None,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+
+    def fake_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "action",
+            "calls": [{
+                "tool": "update_reminder",
+                "args": {
+                    "reminder_id": "rem_x",
+                    "trigger_iso": "2026-01-01T09:00:00+03:00",  # past
+                    "recurrence_rule": "FREQ=DAILY;BYHOUR=6",  # ignored
+                    "clear_recurrence": True,  # net: становится one-shot past
+                },
+            }],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    # ДОЛЖЕН drop'нуться: net recurrence отключена + past trigger = anti-pattern
+    assert isinstance(result, Clarification)
+    assert "past_trigger_drop_all" in result.rationale
+
+
 def test_update_reminder_with_past_trigger_dropped() -> None:
     """OpenCode MINOR R1 code-review: tool-set check покрывает не только
     schedule_reminder. Regression test: update_reminder с past trigger_iso
