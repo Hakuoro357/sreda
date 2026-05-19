@@ -192,6 +192,24 @@ def test_schedule_recurring_with_past_anchor_kept() -> None:
     assert result is not None
 
 
+def test_update_recurring_with_past_anchor_kept() -> None:
+    """Codex MINOR R3 code-review: positive coverage для update_reminder
+    happy path. Past trigger + active recurrence_rule (без clear_recurrence)
+    → preflight skip, real tool invoked. Symmetric к schedule_reminder тесту."""
+    fake = _FakeTool("update_reminder", "ok:updated:rem_X:Daily")
+    state, callables = _build(fake)
+    result = callables["update_reminder"](
+        reminder_id="rem_X",
+        trigger_iso="2020-01-01T09:00:00+00:00",  # past anchor
+        recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0",  # активная
+        # clear_recurrence absent — recurrence net остаётся
+    )
+    # Real tool invoked — preflight skip past-date check
+    assert len(fake.invoke_calls) == 1
+    assert fake.invoke_calls[0]["recurrence_rule"] == "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"
+    assert result is not None
+
+
 def test_update_with_clear_recurrence_and_past_iso_blocked() -> None:
     """Codex MINOR R2 code-review: update_reminder с recurrence_rule +
     clear_recurrence=True → net effect = снятие recurrence → past one-shot

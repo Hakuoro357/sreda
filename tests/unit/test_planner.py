@@ -385,6 +385,40 @@ def test_recurring_reminder_with_past_anchor_kept() -> None:
     assert result.calls[0].args["recurrence_rule"] == "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"
 
 
+def test_update_recurring_with_past_anchor_kept() -> None:
+    """Codex MINOR R3 code-review: positive coverage в planner для
+    update_reminder happy path. Past trigger + active recurrence_rule
+    (без clear_recurrence) → ExecutionPlan (НЕ Clarification).
+    Symmetric к test_recurring_reminder_with_past_anchor_kept."""
+    request = PlanRequest(
+        user_text="обнови напоминание про таблетки на каждый день в 9",
+        intent=TurnIntent.MUTATION,
+        parser_result=None,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+
+    def fake_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "action",
+            "calls": [{
+                "tool": "update_reminder",
+                "args": {
+                    "reminder_id": "rem_x",
+                    "trigger_iso": "2026-01-01T09:00:00+03:00",  # past anchor
+                    "recurrence_rule": "FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+                    # clear_recurrence absent — recurrence active остаётся
+                },
+            }],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    assert isinstance(result, ExecutionPlan)
+    assert result.calls[0].tool_name == "update_reminder"
+    assert result.calls[0].args["recurrence_rule"] == "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"
+
+
 def test_update_with_clear_recurrence_and_past_trigger_dropped() -> None:
     """Codex MINOR R2 code-review: net effect important. update_reminder
     с recurrence_rule + clear_recurrence=True снимает recurrence на стороне
