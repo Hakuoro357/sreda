@@ -565,24 +565,28 @@ _COMPOSER_TIMEOUT = 8.0
 # Перед live promotion нужен tool whitelist enforcement (Bug C) +
 # timeout chain fix.
 # P0.C (2026-05-19): per-provider candidates with per-provider timeouts.
-# Замена RunnableWithFallbacks (где outer timeout оборачивал весь chain
-# и fallback'и получали остаток времени — code review CRITICAL).
-#
+# Замена RunnableWithFallbacks (где outer timeout оборачивал весь chain).
 # Структура: list[(provider_name, timeout_seconds)]. Iterate в порядке,
 # при exception или timeout → try next. Каждый получает свой full budget.
 #
-# Worst-case wall-clock: sum(timeouts) = 4+4+8 = 16s. С внешним buffer
-# (job timeout) = 20s. Это приемлемо для shadow; для live composer'a
-# можно усугубить (composer timeouts тоньше: 3/3/5 = 11s).
+# 2026-05-19 pilot test: gemini-2.5-flash не вытягивает контекстную
+# логику на реальных turn'ах (например voice transcription empty → не
+# попытался расширить контекст из history). Borya feedback после live
+# pilot. Возврат primary на mimo-v2.5-pro (та же модель что legacy
+# успешно делает 1000+ turns/день).
+#
+# Worst-case wall-clock = sum(timeouts):
+#   Planner: 8+4+4 = 16s
+#   Composer: 5+3+3 = 11s
 _PLANNER_CANDIDATES: tuple[tuple[str, float], ...] = (
+    ("mimo-v2.5",                   8.0),
     ("openrouter-gemini-2.5-flash", 4.0),
     ("openrouter-deepseek",         4.0),
-    ("mimo-v2.5",                   8.0),
 )
 _COMPOSER_CANDIDATES: tuple[tuple[str, float], ...] = (
+    ("mimo-v2.5",                   5.0),
     ("openrouter-gemini-2.5-flash", 3.0),
     ("openrouter-deepseek",         3.0),
-    ("mimo-v2.5",                   5.0),
 )
 
 # Backward-compat exports (для тестов и diagnostics)
