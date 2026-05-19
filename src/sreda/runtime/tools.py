@@ -34,6 +34,42 @@ from sreda.services.embeddings import EmbeddingClient
 logger = logging.getLogger(__name__)
 
 
+def _log_memory_date_drift(
+    content: str, op_name: str, tenant_id: str, user_id: str,
+) -> None:
+    """Pre-save guard: log WARNING if memory content references past dates.
+
+    Same class бага что post-output date drift (см. handlers.py Layer 2b).
+    Prod incident 2026-05-18: bot записал summary с «17.05.2026, утро —
+    сахар 10.2» когда реально 18 мая. Если drift detected — flag в логе
+    для admin review.
+
+    Не блокируем save: drift может быть legitimate ("вчера записала
+    давление") когда user явно ссылается на past. Без access к user_text
+    в memory tool scope мы не можем carve-out — поэтому log-only.
+    Реальный fix для измерений требует separate structured table; пока
+    memory tools принимают free-form text, ограничиваемся observability.
+    """
+    try:
+        from datetime import datetime, timezone
+        from sreda.services.date_drift_validator import find_drifted_dates
+        # Use UTC date as approximation (TZ edge case при 00:00-02:59 MSK
+        # минорный — acceptable trade-off для logging only).
+        iso_today = datetime.now(timezone.utc).date().isoformat()
+        drifted = find_drifted_dates(
+            content, iso_date_today=iso_today, user_text="",
+        )
+        if drifted:
+            logger.warning(
+                "MEMORY_DATE_DRIFT op=%s tenant=%s user=%s today=%s "
+                "findings=%s",
+                op_name, tenant_id, user_id, iso_today,
+                [f"{d['raw']}({d['days_ago']}d ago)" for d in drifted],
+            )
+    except Exception:
+        logger.exception("memory date drift check failed — skipping")
+
+
 def build_memory_tools(
     *,
     session: Session,
@@ -64,6 +100,7 @@ def build_memory_tools(
         text = (content or "").strip()
         if not text:
             return "error: empty content"
+        _log_memory_date_drift(text, "save_core_fact", tenant_id, user_id)
         try:
             embedding = embedding_client.embed_document(text)
         except Exception as exc:  # noqa: BLE001
@@ -95,6 +132,7 @@ def build_memory_tools(
         text = (summary or "").strip()
         if not text:
             return "error: empty summary"
+        _log_memory_date_drift(text, "save_episode", tenant_id, user_id)
         try:
             embedding = embedding_client.embed_document(text)
         except Exception as exc:  # noqa: BLE001
