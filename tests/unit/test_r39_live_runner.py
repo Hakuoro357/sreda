@@ -314,11 +314,16 @@ def test_planner_cascade_falls_through_on_bad_json(monkeypatch) -> None:
     # 2. invoke_with_per_call_timeout → AI msg based on stub.label
     call_log: list[str] = []
 
+    # Order-independent: первый кандидат → bad JSON, второй → good JSON.
+    # Reads _PLANNER_CANDIDATES в runtime, не hardcoded order.
+    first_provider = r39._PLANNER_CANDIDATES[0][0]
+    second_provider = r39._PLANNER_CANDIDATES[1][0]
+
     def fake_invoke(runnable, messages, *, timeout_seconds):
         call_log.append(runnable.label)
-        if runnable.label == "openrouter-gemini-2.5-flash":
+        if runnable.label == first_provider:
             return _StubAIMessage(content="это не json, провайдер сломался")
-        if runnable.label == "openrouter-qwen-plus":
+        if runnable.label == second_provider:
             return _StubAIMessage(content='{"kind":"action","calls":[{"tool":"schedule_reminder","args":{}}]}')
         raise AssertionError(f"unexpected provider {runnable.label!r}")
 
@@ -338,12 +343,10 @@ def test_planner_cascade_falls_through_on_bad_json(monkeypatch) -> None:
     )
     result = invoker("system prompt", "user prompt")
 
-    # 5. Assertions
-    # Both providers were tried (cascade actually fell through)
-    assert call_log == [
-        "openrouter-gemini-2.5-flash",
-        "openrouter-qwen-plus",
-    ], f"expected cascade gemini→qwen, got {call_log}"
+    # 5. Assertions — оба provider'a tried (cascade fell through)
+    assert call_log == [first_provider, second_provider], (
+        f"expected cascade {first_provider} → {second_provider}, got {call_log}"
+    )
     # Final result is the parsed dict from qwen
     assert isinstance(result, dict)
     assert result.get("kind") == "action"
@@ -370,12 +373,13 @@ def test_planner_cascade_returns_first_valid(monkeypatch) -> None:
     monkeypatch.setattr(llm_module, "invoke_with_per_call_timeout", fake_invoke)
     monkeypatch.setattr(r39, "_log_and_record_usage", lambda **kwargs: None)
 
+    first_provider = r39._PLANNER_CANDIDATES[0][0]
     invoker = r39._make_planner_invoker(
         feature_key="x", tenant_id="42", session=object(), run_id="r",
     )
     result = invoker("s", "u")
 
-    assert call_log == ["openrouter-gemini-2.5-flash"], (
+    assert call_log == [first_provider], (
         f"expected only first provider called, got {call_log}"
     )
     assert result == {"kind": "no_action", "ack_message": "ok"}

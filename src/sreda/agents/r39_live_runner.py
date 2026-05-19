@@ -593,8 +593,8 @@ _COMPOSER_TIMEOUT = 8.0
 #   Planner:  4+4 = 8s  (cascade gemini → qwen)
 #   Composer: 8s        (single mimo candidate)
 _PLANNER_CANDIDATES: tuple[tuple[str, float], ...] = (
+    ("openrouter-qwen-plus",        4.0),
     ("openrouter-gemini-2.5-flash", 4.0),
-    ("openrouter-qwen-plus",         4.0),
 )
 # Composer cascade — UNCHANGED in этом patch (OpenCode MAJOR M1 fix):
 # нет composer bench data, нет основания менять. Mimo only / 8s timeout
