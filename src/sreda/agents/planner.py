@@ -260,6 +260,75 @@ _PLANNER_SYSTEM_PROMPT = (
 )
 
 
+# ─── Tool-name whitelist + aliases (P0.A, 2026-05-19) ─────────────────
+#
+# Bench R-39 planner на 6 моделях (plans/r39-planner-bench-2026-05-19.md)
+# показал 100% hallucination rate на «list_request» сценарии — каждая
+# модель назвала tool по-своему («read_reminders», «get_reminders»).
+# А на «hallucination_trap_weather» 3/6 моделей выдумали `get_weather`.
+# Без whitelist hallucinated tool_name → executor unknown_tool → user
+# видит «технические сбои».
+#
+# Whitelist строится из real registry (housewife_chat_tools.py +
+# runtime/tools.py memory tools). Aliases — soft-correction для очевидных
+# синонимов которые LLM эмитят. Любой tool вне whitelist+aliases →
+# отбрасывается с warning.
+KNOWN_TOOLS: frozenset[str] = frozenset({
+    # Reminders
+    "schedule_reminder", "cancel_reminder", "update_reminder",
+    "replace_reminder", "list_reminders",
+    # Shopping
+    "add_shopping_items", "list_shopping", "remove_shopping_items",
+    "clear_shopping",
+    # Recipes / Menu
+    "save_recipe", "list_recipes", "delete_recipe", "search_recipes",
+    "plan_week_menu", "list_menu", "delete_menu_item",
+    # Tasks
+    "add_task", "list_tasks", "complete_task", "delete_task",
+    # Memory
+    "save_core_fact", "save_episode", "recall_memory",
+    # Web
+    "web_search", "fetch_url",
+    # Family
+    "list_family_members", "add_family_member", "remove_family_member",
+    "update_family_member",
+    # Profile
+    "update_profile_field",
+    # Misc
+    "log_unsupported_request",
+    # R-39 specific
+    "reply_with_buttons",
+})
+
+# Soft-aliases: LLM эмитит близкое-но-неверное имя → normalize. Каждый
+# alias verified из bench production logs или logical synonym map.
+TOOL_ALIASES: dict[str, str] = {
+    # list synonyms
+    "read_reminders": "list_reminders",
+    "get_reminders": "list_reminders",
+    "show_reminders": "list_reminders",
+    "fetch_reminders": "list_reminders",
+    # set/create synonyms
+    "set_reminder": "schedule_reminder",
+    "create_reminder": "schedule_reminder",
+    "add_reminder": "schedule_reminder",
+    # delete synonyms
+    "remove_reminder": "cancel_reminder",
+    "delete_reminder": "cancel_reminder",
+    # shopping synonyms
+    "add_to_shopping_list": "add_shopping_items",
+    "add_to_shopping": "add_shopping_items",
+    "list_shopping_items": "list_shopping",
+    # task synonyms
+    "create_task": "add_task",
+    "set_task": "add_task",
+    # memory synonyms
+    "remember_fact": "save_core_fact",
+    "save_fact": "save_core_fact",
+    "search_memory": "recall_memory",
+}
+
+
 def _build_user_prompt(request: PlanRequest) -> str:
     """Собрать user-промпт с контекстом."""
     parts = [f"Сообщение: «{request.user_text}»", f"Намерение: {request.intent.value}"]
@@ -302,6 +371,8 @@ def _parse_llm_output(
         if not isinstance(raw_calls, list):
             return NoAction(ack_message="", rationale="llm_malformed_calls")
         calls: list[ToolCall] = []
+        hallucinated: list[str] = []
+        aliased: list[tuple[str, str]] = []
         for i, c in enumerate(raw_calls):
             if not isinstance(c, dict):
                 continue
@@ -309,6 +380,15 @@ def _parse_llm_output(
             args = c.get("args") or {}
             if not tool or not isinstance(args, dict):
                 continue
+            # P0.A (2026-05-19): tool whitelist + alias normalization.
+            # bench показал 100% list_request hallucinations и 50%
+            # get_weather hallucinations на gemini.
+            if tool in TOOL_ALIASES:
+                aliased.append((tool, TOOL_ALIASES[tool]))
+                tool = TOOL_ALIASES[tool]
+            if tool not in KNOWN_TOOLS:
+                hallucinated.append(tool)
+                continue  # drop call, не добавляем в plan
             # Защита: если parser дал TimeResolved, перезаписываем trigger_iso
             if (
                 "trigger_iso" in args
@@ -316,7 +396,24 @@ def _parse_llm_output(
             ):
                 args["trigger_iso"] = request.parser_result.iso_user_tz.isoformat()
             calls.append(ToolCall(tool_name=tool, args=args, action_index=i))
+        if aliased:
+            logger.info(
+                "planner: tool aliases normalised %s", aliased,
+            )
+        if hallucinated:
+            logger.warning(
+                "planner: hallucinated tools dropped %s (kept=%d)",
+                hallucinated, len(calls),
+            )
         if not calls:
+            # Все calls dropped (hallucinated) → fall to clarification
+            # вместо silent NoAction, чтобы user не получил empty reply.
+            if hallucinated:
+                return Clarification(
+                    question="Не уверена что могу помочь с этим запросом. "
+                            "Можешь сформулировать иначе?",
+                    rationale=f"all_calls_hallucinated:{hallucinated}",
+                )
             return NoAction(ack_message="", rationale="llm_empty_action_plan")
         return ExecutionPlan(calls=tuple(calls))
     return NoAction(ack_message="", rationale=f"llm_unknown_kind:{kind}")
