@@ -3012,17 +3012,19 @@ def execute_conversation_chat(
             _sanitize_stats["cjk_stripped"],
         )
 
-    # 2026-05-19: time-of-day greeting guard (deterministic post-output).
-    # Codex+Qwen review consensus: prompt-only недостаточен для mimo которая
-    # ~40% игнорирует instructions. Вторым слоем — regex strip mismatched
-    # greetings ("спокойной ночи" в 15:44). Carve-out: user_text проверяется
-    # на explicit request типа «пожелай мне доброго утра».
+    # 2026-05-19: time-of-day greeting + date drift guards (deterministic
+    # post-output). Codex+Qwen review consensus: prompt-only недостаточен
+    # для mimo которая ~40% игнорирует instructions. Вторым слоем —
+    # regex strip mismatched greetings ("спокойной ночи" в 15:44) +
+    # WARNING log for date drift (старые DD.MM.YYYY / «X мая» в reply
+    # которых нет в user_text).
     try:
         from datetime import datetime, timezone as _tz
         from zoneinfo import ZoneInfo
         from sreda.services.time_phrase_validator import (
             classify_period, strip_misaligned_greetings,
         )
+        from sreda.services.date_drift_validator import find_drifted_dates
         _user_tz_name = (context.get("_profile") or {}).get(
             "timezone", "Europe/Moscow",
         ) or "Europe/Moscow"
@@ -3031,6 +3033,9 @@ def execute_conversation_chat(
         except Exception:
             _now_user = datetime.now(_tz.utc)
         _period = classify_period(_now_user.hour)
+        _iso_date_today = _now_user.date().isoformat()
+
+        # Layer 2a: greeting strip
         text, _greeting_stats = strip_misaligned_greetings(
             text, period=_period, user_text=user_text,
         )
@@ -3041,8 +3046,24 @@ def execute_conversation_chat(
                 action.tenant_id, feature_key,
                 _greeting_stats["mismatched_stripped"], _period,
             )
+
+        # Layer 2b: date drift detection (WARNING only — не strip, т.к.
+        # date references часто встроены в осмысленный контекст).
+        # Pre-save validator для structured writes — отдельный commit.
+        _drifted = find_drifted_dates(
+            text, iso_date_today=_iso_date_today, user_text=user_text,
+        )
+        if _drifted:
+            logger.warning(
+                "CHAT_DATE_DRIFT tenant=%s feature=%s today=%s "
+                "findings=%s",
+                action.tenant_id, feature_key, _iso_date_today,
+                [f"{d['raw']}({d['days_ago']}d ago)" for d in _drifted],
+            )
     except Exception:
-        logger.exception("greeting_validator failed — skipping (text unchanged)")
+        logger.exception(
+            "post_output_validators failed — skipping (text unchanged)",
+        )
 
     # 12.7 (incident tg=634496616 2026-05-03): MiMo content-filter
     # иногда возвращает английский «The request was rejected because it
