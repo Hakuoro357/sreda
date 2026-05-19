@@ -101,10 +101,9 @@ def plan_action(
         ExecutionPlan | NoAction | Clarification.
     """
     # Pre-decision trace — какой вход получил planner.
-    # 2026-05-19: temporarily WARNING + stderr print (P0.D diagnostic)
-    # — info-level не появлялся в логах хотя код выполняется. Хотим
-    # разделить «код не доходит» vs «logger фильтрует».
-    import sys as _sys
+    # NB: для TG long-poll R-39 logs идут в /var/log/sreda/telegram-poller.log
+    # (не uvicorn.log) — это process boundary, sreda-telegram-poller
+    # service. Для MAX webhook — в uvicorn.log.
     parser_type = (
         type(request.parser_result).__name__
         if request.parser_result is not None else "None"
@@ -113,13 +112,11 @@ def plan_action(
         type(request.correction_target).__name__
         if request.correction_target is not None else "None"
     )
-    _entry_msg = (
-        f"planner.entry: intent={request.intent.name if hasattr(request.intent, 'name') else str(request.intent)} "
-        f"parser={parser_type} target={target_type} "
-        f"text_snip={(request.user_text or '')[:80]!r}"
+    logger.info(
+        "planner.entry: intent=%s parser=%s target=%s text_snip=%r",
+        request.intent.name if hasattr(request.intent, "name") else str(request.intent),
+        parser_type, target_type, (request.user_text or "")[:80],
     )
-    print(f"PLANNER_STDERR_DIAG: {_entry_msg}", file=_sys.stderr, flush=True)
-    logger.warning("PLANNER_DIAG %s", _entry_msg)
 
     # 1. Чистая болтовня → no-op без LLM
     if request.intent is TurnIntent.CHITCHAT:
