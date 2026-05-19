@@ -55,6 +55,7 @@ from sreda.agents.correction_resolver import (
     NoCorrectionTarget,
     ResolvedCorrection,
 )
+from sreda.agents.r39_tool_adapter import is_past_iso
 from sreda.services.natural_time_parser import (
     ParseResult,
     TimeAmbiguous,
@@ -66,6 +67,14 @@ from sreda.services.turn_intent_classifier import TurnIntent
 
 
 logger = logging.getLogger(__name__)
+
+
+# OpenCode MINOR R1 code-review: named constant вместо magic literal.
+# Policy decision: 2 минуты grace для NTP drift + network latency.
+# Если потребуется тюнить (mobile clients с higher latency) —
+# bump'ить здесь, а не grep'ать по литералам. Совпадает с
+# `is_past_iso(..., grace_minutes=2)` default.
+PAST_TRIGGER_GRACE_MINUTES: int = 2
 
 
 # ─── Запрос к планировщику ────────────────────────────────────────────
@@ -502,14 +511,20 @@ def _parse_llm_output(
             # (parser Unrecognized + LLM past trigger). Use is_past_iso helper
             # (sreda.agents.r39_tool_adapter) который сравнивает с now минус
             # grace_minutes=2 (NTP drift + network latency tolerance).
+            #
+            # Codex MAJOR R1 code-review: skip past-trigger check для
+            # recurring reminders. Service layer (housewife_chat_tools.py:247)
+            # тоже skip'ит past-date check для recurrence_rule, потому что
+            # RRULE сама находит next future occurrence (e.g. «каждый день
+            # в 9» после 09:00 валидно — anchor=today 09:00, next=tomorrow 09:00).
             if (
                 "trigger_iso" in args
                 and tool in {"schedule_reminder", "update_reminder", "replace_reminder"}
+                and not args.get("recurrence_rule")
             ):
-                from sreda.agents.r39_tool_adapter import is_past_iso
                 trigger_value = args.get("trigger_iso")
                 if isinstance(trigger_value, str) and is_past_iso(
-                    trigger_value, grace_minutes=2
+                    trigger_value, grace_minutes=PAST_TRIGGER_GRACE_MINUTES
                 ):
                     past_trigger_drops.append((tool, trigger_value))
                     continue  # drop call — full-plan reject ниже

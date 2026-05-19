@@ -349,6 +349,76 @@ def test_past_date_marker_but_future_trigger_kept() -> None:
     assert result.calls[0].tool_name == "schedule_reminder"
 
 
+def test_recurring_reminder_with_past_anchor_kept() -> None:
+    """Codex MAJOR R1 code-review: recurring reminder (с `recurrence_rule`)
+    может иметь past anchor — RRULE сама находит next future occurrence.
+    Service layer (housewife_chat_tools.py:247) тоже skip'ит past-date
+    check для recurring. Planner ДОЛЖЕН keep'ать такие calls."""
+    request = PlanRequest(
+        user_text="напомни каждый день в 9 утра пить таблетки",
+        intent=TurnIntent.MUTATION,
+        parser_result=None,  # parser не извлёк "каждый день в 9" как single time
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+    # Past anchor (e.g. user сказал утром 10:00 поставить «каждый день в 9»)
+    past_anchor = "2026-01-01T09:00:00+03:00"
+
+    def fake_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "action",
+            "calls": [{
+                "tool": "schedule_reminder",
+                "args": {
+                    "title": "Пить таблетки",
+                    "trigger_iso": past_anchor,  # past, но RRULE найдёт next
+                    "recurrence_rule": "FREQ=DAILY;BYHOUR=6;BYMINUTE=0",  # 09:00 MSK
+                },
+            }],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    # НЕ должен dropped — recurrence_rule валиден, RRULE сама next-future
+    assert isinstance(result, ExecutionPlan)
+    assert result.calls[0].tool_name == "schedule_reminder"
+    assert result.calls[0].args["recurrence_rule"] == "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"
+
+
+def test_update_reminder_with_past_trigger_dropped() -> None:
+    """OpenCode MINOR R1 code-review: tool-set check покрывает не только
+    schedule_reminder. Regression test: update_reminder с past trigger_iso
+    тоже должен dropped (если кто-то поломает tool set frozen frozen{}, sched
+    единственным проверяемым tool'ом, мы бы пропустили это)."""
+    request = PlanRequest(
+        user_text="перенеси таблетки на вчера",  # nonsense, тест на edge case
+        intent=TurnIntent.MUTATION,
+        parser_result=None,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+
+    def fake_llm(_sys: str, _user: str) -> dict:
+        return {
+            "kind": "action",
+            "calls": [{
+                "tool": "update_reminder",
+                "args": {
+                    "reminder_id": "rem_x",
+                    "title": "Таблетки",
+                    "trigger_iso": "2026-01-01T09:00:00+03:00",  # past
+                },
+            }],
+        }
+
+    result = plan_action(request, invoke_llm=fake_llm)
+    assert isinstance(result, Clarification)
+    assert "past_trigger_drop_all" in result.rationale
+    # update_reminder в списке drop'ов:
+    assert "update_reminder" in result.rationale
+
+
 def test_mixed_calls_with_past_trigger_full_clarification() -> None:
     """Codex MAJOR R2: LLM returns [save_episode(valid), schedule_reminder(past)]
     → ВСЯ plan rejected (Clarification), НЕ partial ExecutionPlan с save_episode.
