@@ -149,7 +149,11 @@ def test_ambiguous_correction_returns_clarification() -> None:
 # ─── Short-circuit: TimeAmbiguous / TimeInvalid ──────────────────────
 
 
-def test_time_ambiguous_returns_clarification() -> None:
+def test_time_ambiguous_falls_through_to_llm() -> None:
+    """2026-05-19: removed hardcoded TimeAmbiguous → Clarification(«через 2 часа
+    или в 14:00?»). Hardcoded text прилетал на ЛЮБОЙ TimeAmbiguous (even
+    «пятницу», «два часа дня») — wrong question on voice. Теперь fall through
+    на LLM который сам disambig из context."""
     ambiguous = TimeAmbiguous(candidates=[], reason="через_N_часов_или_в_N")
     request = PlanRequest(
         user_text="на 2 часа",
@@ -159,9 +163,33 @@ def test_time_ambiguous_returns_clarification() -> None:
         conversation_history=(),
         turn_context=_ctx(),
     )
+    # Без invoke_llm — short-circuit нет, проваливается на step 6 (no LLM)
     result = plan_action(request)
-    assert isinstance(result, Clarification)
-    assert "14:00" in result.question or "через" in result.question.lower()
+    assert isinstance(result, NoAction)
+    assert result.rationale == "no_llm_available"
+
+
+def test_time_ambiguous_invokes_llm_when_available() -> None:
+    """TimeAmbiguous с invoke_llm callable — LLM вызывается (не hardcoded)."""
+    ambiguous = TimeAmbiguous(candidates=[], reason="через_N_часов_или_в_N")
+    request = PlanRequest(
+        user_text="на 2 часа дня",
+        intent=TurnIntent.MUTATION,
+        parser_result=ambiguous,
+        correction_target=None,
+        conversation_history=(),
+        turn_context=_ctx(),
+    )
+    invoke_count = 0
+    def fake_llm(system: str, user: str) -> dict:
+        nonlocal invoke_count
+        invoke_count += 1
+        # Verify negative parser hint НЕ в prompt'е
+        assert "не распознан" not in user.lower()
+        return {"kind": "action", "calls": [{"tool": "schedule_reminder", "args": {"title": "x", "trigger_iso": "2026-05-19T14:00:00+03:00"}}]}
+    result = plan_action(request, invoke_llm=fake_llm)
+    assert invoke_count == 1, "LLM должна быть вызвана (TimeAmbiguous не short-circuit'ит)"
+    assert isinstance(result, ExecutionPlan)
 
 
 def test_time_invalid_past_returns_clarification() -> None:

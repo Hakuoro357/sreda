@@ -149,13 +149,16 @@ def plan_action(
         logger.info("planner.decision: AmbiguousCorrection → Clarification(disambig)")
         return _build_disambiguation_question(target)
 
-    # 4. Двусмысленное время → уточнение
-    if isinstance(request.parser_result, TimeAmbiguous):
-        logger.info("planner.decision: TimeAmbiguous → Clarification(parser_ambiguous)")
-        return Clarification(
-            question="Уточни, пожалуйста: ты имеешь в виду через 2 часа или в 14:00?",
-            rationale="parser_ambiguous",
-        )
+    # 4. TimeAmbiguous — удалён hardcoded short-circuit (был bug в R-39
+    # Day 4 design 2026-05-18 commit 082bdbb). Hardcoded вопрос «через 2
+    # часа или в 14:00?» прилетал на ЛЮБОЙ TimeAmbiguous (e.g. parser
+    # ambigous'нул на «пятницу» или «два часа дня»), даже когда вопрос
+    # совершенно нерелевантный. Прод data 2026-05-19 12:20 показала
+    # 3/5 voice turn'ов пилота получали этот же вопрос.
+    #
+    # Сейчас TimeAmbiguous → fall through на LLM (как TimeUnrecognized).
+    # LLM сама решит: disambig из context (history, intent, time-of-day)
+    # или попросит ОСМЫСЛЕННОЕ clarification.
 
     # 5. Недопустимое время → уточнение
     if isinstance(request.parser_result, TimeInvalid):
