@@ -1063,6 +1063,15 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     # 1M context. Cheapest tool-calling provider в нашем бенче.
     "openrouter-qwen-flash":        "qwen/qwen3.5-flash-02-23",
     "openrouter-gemini-2.5-flash":  "google/gemini-2.5-flash",
+    # 2026-05-19: R-39 LLM replacement search candidates (memory b5280561).
+    # Цель — найти быстрее mimo с action_propensity ≥80% на TimeUnrecognized.
+    "openrouter-qwen3-72b":         "qwen/qwen-2.5-72b-instruct",
+    "openrouter-qwq-32b":           "qwen/qwq-32b-preview",
+    "openrouter-qwen-plus":         "qwen/qwen-plus",
+    "openrouter-qwen-max":          "qwen/qwen-max",
+    "openrouter-claude-haiku":      "anthropic/claude-3.5-haiku",
+    "openrouter-mistral-large":     "mistralai/mistral-large",
+    "openrouter-llama-3.3-70b":     "meta-llama/llama-3.3-70b-instruct",
 }
 
 
