@@ -567,22 +567,39 @@ _COMPOSER_TIMEOUT = 8.0
 # P0.C (2026-05-19): per-provider candidates with per-provider timeouts.
 # Замена RunnableWithFallbacks (где outer timeout оборачивал весь chain).
 # Структура: list[(provider_name, timeout_seconds)]. Iterate в порядке,
-# при exception или timeout → try next. Каждый получает свой full budget.
+# при exception/timeout/parse-fail → try next. Каждый получает свой full
+# budget. cascade fix 2026-05-19 (Codex MAJOR): теперь invoker делает
+# `if parsed is None: continue` чтобы реально trigger fallback на bad
+# JSON, а не возвращать первое успешное HTTP с broken parse.
 #
-# 2026-05-19 pilot test показал что gemini-2.5-flash «слишком тупая» —
-# на 4/4 voice turn'ах вернула Clarification вместо action (parser hint
-# «время не распознано» сделал её ультра-осторожной; mimo на тех же
-# текстах в legacy чате нормально извлекает время и эмитит tool_call).
-# Borya decision: убрать gemini/deepseek из cascade полностью, оставить
-# только mimo. Backlog item — найти LLM быстрее чем mimo которая
-# справляется не хуже (см. memory R-39 LLM replacement search).
+# 2026-05-19 bench v4 (25 scenarios × 4 models, hallucinated_time metric):
+#   gemini-2.5-flash: 84% ok, 0 halluc, p50=939ms, p95=3.4s
+#   qwen-plus:        84% ok, 0 halluc, p50=1.5s, p95=2.2s
+#   mimo-v2.5-pro:    80% ok, 0 halluc, p50=8.5s, p95=30s timeout
+#
+# Решение по trio review consensus (Codex + Xiaomi + OpenCode):
+# - gemini-2.5-flash primary (быстрее на p50)
+# - qwen-plus co-primary (более consistent на p95)
+# - mimo УБРАНА из cascade (Xiaomi MAJOR #3, OpenCode MAJOR #2:
+#   dead weight на 6s timeout). Legacy mimo продолжает работать через
+#   admin switcher — это отдельный path.
+#
+# Composer cascade — UNCHANGED в этом patch (Xiaomi MAJOR #5 + OpenCode
+# M1: no composer bench data). Composer остаётся mimo-only 8s — рерайт
+# отдельным patch'ом после composer-specific bench (warmth/persona
+# quality, не tool accuracy).
 #
 # Worst-case wall-clock:
-#   Planner: 12s (mimo only — single candidate, generous timeout)
-#   Composer: 8s
+#   Planner:  4+4 = 8s  (cascade gemini → qwen)
+#   Composer: 8s        (single mimo candidate)
 _PLANNER_CANDIDATES: tuple[tuple[str, float], ...] = (
-    ("mimo-v2.5", 12.0),
+    ("openrouter-gemini-2.5-flash", 4.0),
+    ("openrouter-qwen-plus",         4.0),
 )
+# Composer cascade — UNCHANGED in этом patch (OpenCode MAJOR M1 fix):
+# нет composer bench data, нет основания менять. Mimo only / 8s timeout
+# как и было. Composer cascade rework — отдельный patch после
+# composer-specific bench (warmth/persona quality, не tool accuracy).
 _COMPOSER_CANDIDATES: tuple[tuple[str, float], ...] = (
     ("mimo-v2.5", 8.0),
 )
@@ -635,17 +652,43 @@ def _make_planner_invoker(
                 last_error = f"{provider}:{type(exc).__name__}"
                 continue
 
-            # Success path
+            # Got HTTP success — проверить parse JSON удался.
+            #
+            # 2026-05-19 cascade fix: без этого check'a invoker возвращал
+            # первый "успешный" HTTP даже если parse_planner_json вернул
+            # None (broken JSON output). Cascade фактически не работал
+            # на malformed output. Теперь bad parse → try next.
+            #
+            # Intentional: unexpected `kind` value ({"kind":"weird"}) НЕ
+            # триггерит cascade — `_parse_planner_json` permissive, любой
+            # valid dict считается success. Caller (`_parse_llm_output`)
+            # обрабатывает unknown_kind через NoAction(llm_unknown_kind:X).
+            # Retry с другой моделью на schema-level mismatch вероятнее
+            # вернёт то же и сожжёт 8s бюджета (Codex+OpenCode flagged).
+            #
+            # Usage tracking: вызываем _log_and_record_usage В ОБОИХ случаях
+            # (success + bad_json) — HTTP succeeded, tokens consumed, budget
+            # должен это учесть (Codex MAJOR fix).
+            content = getattr(ai_msg, "content", "") or ""
+            parsed = _parse_planner_json(content)
             _log_and_record_usage(
                 ai_msg=ai_msg, session=session, tenant_id=tenant_id,
                 feature_key=feature_key, run_id=run_id,
-                task_type="r39_planner",
+                task_type="r39_planner" if parsed is not None
+                          else "r39_planner_bad_json",
             )
+            if parsed is None:
+                logger.warning(
+                    "R-39 planner: %s returned unparsable JSON "
+                    "(content_preview=%r) — try next",
+                    provider, content[:120],
+                )
+                last_error = f"{provider}:bad_json"
+                continue
             logger.info(
                 "R-39 planner: %s succeeded in <%.1fs", provider, tmo,
             )
-            content = getattr(ai_msg, "content", "") or ""
-            return _parse_planner_json(content)
+            return parsed
 
         logger.warning(
             "R-39 planner: all %d candidates failed (last=%s)",

@@ -272,3 +272,133 @@ def test_live_result_with_reply() -> None:
     assert r.proceeded is True
     assert r.reply.text == "Готово"
     assert r.side_effects_count == 2
+
+
+# ─── _make_planner_invoker cascade behaviour (Codex MAJOR #2 fix) ─────
+
+
+class _StubAIMessage:
+    """Stub LangChain AIMessage с .content + usage."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.usage_metadata = {"input_tokens": 100, "output_tokens": 50}
+        self.response_metadata = {"token_usage": {"prompt_tokens": 100, "completion_tokens": 50}}
+
+
+class _StubLLM:
+    """Marker object — _make_planner_invoker не вызывает .invoke напрямую,
+    он передаёт llm в invoke_with_per_call_timeout который мы mock'аем.
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+
+
+def test_planner_cascade_falls_through_on_bad_json(monkeypatch) -> None:
+    """Provider1 returns unparsable JSON → cascade tries provider2 → succeeds.
+
+    Pinned behaviour для Codex MAJOR #2 (review 2026-05-19). Без `if parsed
+    is None: continue` invoker возвращал None на первом 'успешном' HTTP
+    и cascade фактически не работал.
+    """
+    from sreda.agents import r39_live_runner as r39
+    from sreda.services import llm as llm_module
+
+    # 1. get_chat_llm → возвращает stub per-provider
+    def fake_get_chat_llm(*, provider: str, temperature: float):
+        return _StubLLM(label=provider)
+
+    monkeypatch.setattr(llm_module, "get_chat_llm", fake_get_chat_llm)
+
+    # 2. invoke_with_per_call_timeout → AI msg based on stub.label
+    call_log: list[str] = []
+
+    def fake_invoke(runnable, messages, *, timeout_seconds):
+        call_log.append(runnable.label)
+        if runnable.label == "openrouter-gemini-2.5-flash":
+            return _StubAIMessage(content="это не json, провайдер сломался")
+        if runnable.label == "openrouter-qwen-plus":
+            return _StubAIMessage(content='{"kind":"action","calls":[{"tool":"schedule_reminder","args":{}}]}')
+        raise AssertionError(f"unexpected provider {runnable.label!r}")
+
+    monkeypatch.setattr(llm_module, "invoke_with_per_call_timeout", fake_invoke)
+
+    # 3. _log_and_record_usage — no-op (avoid DB write paths)
+    monkeypatch.setattr(
+        r39, "_log_and_record_usage", lambda **kwargs: None,
+    )
+
+    # 4. Build invoker и call
+    invoker = r39._make_planner_invoker(
+        feature_key="housewife_assistant",
+        tenant_id="42",
+        session=object(),  # not used after _log_and_record_usage stub
+        run_id="run-test",
+    )
+    result = invoker("system prompt", "user prompt")
+
+    # 5. Assertions
+    # Both providers were tried (cascade actually fell through)
+    assert call_log == [
+        "openrouter-gemini-2.5-flash",
+        "openrouter-qwen-plus",
+    ], f"expected cascade gemini→qwen, got {call_log}"
+    # Final result is the parsed dict from qwen
+    assert isinstance(result, dict)
+    assert result.get("kind") == "action"
+    assert result.get("calls", [{}])[0].get("tool") == "schedule_reminder"
+
+
+def test_planner_cascade_returns_first_valid(monkeypatch) -> None:
+    """Provider1 returns valid JSON → cascade stops, provider2 НЕ вызывается."""
+    from sreda.agents import r39_live_runner as r39
+    from sreda.services import llm as llm_module
+
+    monkeypatch.setattr(
+        llm_module, "get_chat_llm",
+        lambda *, provider, temperature: _StubLLM(label=provider),
+    )
+
+    call_log: list[str] = []
+
+    def fake_invoke(runnable, messages, *, timeout_seconds):
+        call_log.append(runnable.label)
+        # Provider1 returns valid → cascade должен остановиться
+        return _StubAIMessage(content='{"kind":"no_action","ack_message":"ok"}')
+
+    monkeypatch.setattr(llm_module, "invoke_with_per_call_timeout", fake_invoke)
+    monkeypatch.setattr(r39, "_log_and_record_usage", lambda **kwargs: None)
+
+    invoker = r39._make_planner_invoker(
+        feature_key="x", tenant_id="42", session=object(), run_id="r",
+    )
+    result = invoker("s", "u")
+
+    assert call_log == ["openrouter-gemini-2.5-flash"], (
+        f"expected only first provider called, got {call_log}"
+    )
+    assert result == {"kind": "no_action", "ack_message": "ok"}
+
+
+def test_planner_cascade_all_bad_returns_none(monkeypatch) -> None:
+    """ALL providers return bad JSON → cascade exhausted → return None."""
+    from sreda.agents import r39_live_runner as r39
+    from sreda.services import llm as llm_module
+
+    monkeypatch.setattr(
+        llm_module, "get_chat_llm",
+        lambda *, provider, temperature: _StubLLM(label=provider),
+    )
+    monkeypatch.setattr(
+        llm_module, "invoke_with_per_call_timeout",
+        lambda runnable, messages, *, timeout_seconds: _StubAIMessage(content="garbage"),
+    )
+    monkeypatch.setattr(r39, "_log_and_record_usage", lambda **kwargs: None)
+
+    invoker = r39._make_planner_invoker(
+        feature_key="x", tenant_id="42", session=object(), run_id="r",
+    )
+    result = invoker("s", "u")
+
+    assert result is None

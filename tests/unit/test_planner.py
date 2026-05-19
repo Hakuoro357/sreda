@@ -377,3 +377,99 @@ def test_kati_correction_full_pipeline() -> None:
     assert result.calls[0].args["reminder_id"] == "rem_old"
     # trigger_iso детерминирован, не от LLM
     assert "2026-05-17T14:00" in result.calls[0].args["trigger_iso"]
+
+
+# ─── _build_user_prompt — silent skip negative parser_hint ─────────────
+# 2026-05-19: убрали «Время: не распознано парсером.» строку — она
+# триггерила fast LLMs в overly-cautious clarification. Bench v4
+# подтвердил: 0 hallucinated_time на truly_ambiguous turns даже
+# без negative hint.
+
+
+def _build_request(parser_result, user_text="Поставь напоминание на 12", history=()):
+    """Helper для построения PlanRequest с varied parser_result."""
+    from sreda.agents.contracts import TurnContext
+    return PlanRequest(
+        user_text=user_text,
+        intent=TurnIntent.MUTATION,
+        parser_result=parser_result,
+        correction_target=None,
+        conversation_history=history,
+        turn_context=TurnContext(turn_id="t-test", tenant_id="42"),
+    )
+
+
+def test_build_user_prompt_includes_positive_time_hint() -> None:
+    """TimeResolved → положительный hint «Время (детерминированно): ...»"""
+    from sreda.agents.planner import _build_user_prompt
+    request = _build_request(parser_result=_resolved_time())
+    prompt = _build_user_prompt(request)
+    assert "Сообщение:" in prompt
+    assert "Намерение: mutation" in prompt
+    assert "Время (детерминированно):" in prompt
+    assert "2026-05-17T14:00" in prompt  # iso_user_tz
+
+
+def test_build_user_prompt_silent_skip_on_unrecognized() -> None:
+    """TimeUnrecognized → ОТСУТСТВУЕТ строка «не распознано парсером»."""
+    from sreda.agents.planner import _build_user_prompt
+    request = _build_request(parser_result=TimeUnrecognized(raw="на пятницу"))
+    prompt = _build_user_prompt(request)
+    assert "Сообщение:" in prompt
+    assert "Намерение: mutation" in prompt
+    # Критично: НЕ должно быть negative hint строки
+    assert "не распознано" not in prompt
+    assert "не распознан" not in prompt
+    # Time-related guidance отсутствует — LLM сама извлекает
+    assert "Время" not in prompt
+
+
+def test_build_user_prompt_silent_skip_on_ambiguous() -> None:
+    """TimeAmbiguous → silent skip (handled через short-circuit ДО LLM)."""
+    from sreda.agents.planner import _build_user_prompt
+    ambiguous = TimeAmbiguous(candidates=[], reason="через_N_часов_или_в_N")
+    request = _build_request(parser_result=ambiguous)
+    prompt = _build_user_prompt(request)
+    assert "Время" not in prompt
+    assert "не распознан" not in prompt
+
+
+def test_build_user_prompt_silent_skip_on_invalid() -> None:
+    """TimeInvalid → silent skip (handled через short-circuit ДО LLM)."""
+    from sreda.agents.planner import _build_user_prompt
+    invalid = TimeInvalid(raw="вчера", reason="past_date")
+    request = _build_request(parser_result=invalid)
+    prompt = _build_user_prompt(request)
+    assert "Время" not in prompt
+
+
+def test_build_user_prompt_preserves_user_text() -> None:
+    """Original user_text сохраняется в кавычках в prompt."""
+    from sreda.agents.planner import _build_user_prompt
+    request = _build_request(
+        parser_result=TimeUnrecognized(raw=""),
+        user_text="на пятницу на два часа дня поставь напоминание поесть",
+    )
+    prompt = _build_user_prompt(request)
+    assert "на пятницу на два часа дня поставь напоминание поесть" in prompt
+
+
+def test_build_user_prompt_includes_history_when_present() -> None:
+    """conversation_history добавляет «Прошлая реплика пользователя»."""
+    from sreda.agents.planner import _build_user_prompt
+    prior = ConversationTurn(
+        turn_id="t-prev",
+        user_text="Поставь на пятницу 12:00 поесть",
+        timestamp_utc=datetime(2026, 5, 17, 10, 0, tzinfo=timezone.utc),
+        journal_entries=(),
+    )
+    request = _build_request(
+        parser_result=TimeUnrecognized(raw=""),
+        user_text="Ну, на ближайшую, конечно.",
+        history=(prior,),
+    )
+    prompt = _build_user_prompt(request)
+    assert "Прошлая реплика пользователя" in prompt
+    assert "Поставь на пятницу 12:00 поесть" in prompt
+    # Negative hint всё равно не должен появиться
+    assert "не распознан" not in prompt

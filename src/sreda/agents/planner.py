@@ -356,14 +356,22 @@ TOOL_ALIASES: dict[str, str] = {
 
 
 def _build_user_prompt(request: PlanRequest) -> str:
-    """Собрать user-промпт с контекстом."""
+    """Собрать user-промпт с контекстом для LLM planner call.
+
+    Включает positive TimeResolved hint когда parser справился. Для
+    TimeUnrecognized — silent skip (LLM сама извлекает время из текста).
+
+    TimeAmbiguous / TimeInvalid обрабатываются через short-circuit в
+    `plan_action` ДО LLM call — до этой функции они не доходят.
+
+    Rationale silent skip см. commit message + bench v4 results
+    (plans/r39-planner-bench-2026-05-19.md).
+    """
     parts = [f"Сообщение: «{request.user_text}»", f"Намерение: {request.intent.value}"]
     if isinstance(request.parser_result, TimeResolved):
         parts.append(
             f"Время (детерминированно): {request.parser_result.iso_user_tz.isoformat()}"
         )
-    elif isinstance(request.parser_result, TimeUnrecognized):
-        parts.append("Время: не распознано парсером.")
     if request.conversation_history:
         last = request.conversation_history[-1]
         parts.append(f"Прошлая реплика пользователя: «{last.user_text}»")
