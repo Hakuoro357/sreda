@@ -370,14 +370,28 @@ def _resolve_correction_target_with_db_fallback(
     """
     journal_result = resolve_correction_target(user_text, list(r39_history))
     if not isinstance(journal_result, NoCorrectionTarget):
+        logger.info(
+            "R-39 correction: journal_hit tenant=%s user_text_snip=%r → %s",
+            tenant_id, (user_text or "")[:80], type(journal_result).__name__,
+        )
         return journal_result
 
     # Codex CRIT: DB fallback только при explicit correction marker
-    if not _CORRECTION_MARKER_RE.search(user_text or ""):
+    marker_match = _CORRECTION_MARKER_RE.search(user_text or "")
+    if not marker_match:
+        logger.info(
+            "R-39 correction: no_marker tenant=%s user_text_snip=%r → NoCorrectionTarget",
+            tenant_id, (user_text or "")[:80],
+        )
         return journal_result  # NoCorrectionTarget от resolver'а
 
     # Qwen MAJ: без user_id query может задеть чужие reminders
     if user_id is None or user_id == "":
+        logger.info(
+            "R-39 correction: marker_matched but user_id missing tenant=%s "
+            "marker=%r → NoCorrectionTarget(db_fallback_no_user_id)",
+            tenant_id, marker_match.group(0),
+        )
         return NoCorrectionTarget(reason="db_fallback_no_user_id")
 
     # DB fallback (scoped strictly to current user)
@@ -396,14 +410,30 @@ def _resolve_correction_target_with_db_fallback(
         .limit(5)
     ).all()
     if not rows:
+        logger.info(
+            "R-39 correction: db_fallback no pending reminders for tenant=%s user=%s "
+            "marker=%r → NoCorrectionTarget(db_fallback_no_pending_reminders)",
+            tenant_id, user_id, marker_match.group(0),
+        )
         return NoCorrectionTarget(reason="db_fallback_no_pending_reminders")
     if len(rows) == 1:
+        logger.info(
+            "R-39 correction: db_fallback hit tenant=%s user=%s marker=%r "
+            "→ ResolvedCorrection(target=%s title=%r)",
+            tenant_id, user_id, marker_match.group(0),
+            rows[0][0], rows[0][1],
+        )
         return ResolvedCorrection(
             target_entity_id=rows[0][0],
             target_title=rows[0][1],
             target_tool="schedule_reminder",
             source_turn_id="db_fallback",
         )
+    logger.info(
+        "R-39 correction: db_fallback ambiguous tenant=%s user=%s marker=%r "
+        "→ AmbiguousCorrection(n=%d)",
+        tenant_id, user_id, marker_match.group(0), len(rows),
+    )
     return AmbiguousCorrection(
         candidates=tuple(
             ResolvedCorrection(

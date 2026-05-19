@@ -100,8 +100,24 @@ def plan_action(
     Returns:
         ExecutionPlan | NoAction | Clarification.
     """
+    # Pre-decision trace — какой вход получил planner
+    parser_type = (
+        type(request.parser_result).__name__
+        if request.parser_result is not None else "None"
+    )
+    target_type = (
+        type(request.correction_target).__name__
+        if request.correction_target is not None else "None"
+    )
+    logger.info(
+        "planner.entry: intent=%s parser=%s target=%s text_snip=%r",
+        request.intent.name if hasattr(request.intent, "name") else str(request.intent),
+        parser_type, target_type, (request.user_text or "")[:80],
+    )
+
     # 1. Чистая болтовня → no-op без LLM
     if request.intent is TurnIntent.CHITCHAT:
+        logger.info("planner.decision: chitchat_short_circuit → NoAction")
         return NoAction(
             ack_message="",
             rationale="chitchat_short_circuit",
@@ -112,15 +128,27 @@ def plan_action(
     if isinstance(target, ResolvedCorrection):
         plan = _build_update_plan(request, target)
         if plan is not None:
+            logger.info(
+                "planner.decision: ResolvedCorrection → ExecutionPlan(update_reminder) "
+                "target=%s parser=%s",
+                target.target_entity_id, parser_type,
+            )
             return plan
         # Если не получилось собрать (нет parser_result) — падаем на LLM ниже.
+        logger.info(
+            "planner.decision: ResolvedCorrection но _build_update_plan=None "
+            "(parser=%s не TimeResolved) → fall through на LLM",
+            parser_type,
+        )
 
     # 3. Несколько кандидатов на коррекцию → уточнение
     if isinstance(target, AmbiguousCorrection):
+        logger.info("planner.decision: AmbiguousCorrection → Clarification(disambig)")
         return _build_disambiguation_question(target)
 
     # 4. Двусмысленное время → уточнение
     if isinstance(request.parser_result, TimeAmbiguous):
+        logger.info("planner.decision: TimeAmbiguous → Clarification(parser_ambiguous)")
         return Clarification(
             question="Уточни, пожалуйста: ты имеешь в виду через 2 часа или в 14:00?",
             rationale="parser_ambiguous",
@@ -128,6 +156,10 @@ def plan_action(
 
     # 5. Недопустимое время → уточнение
     if isinstance(request.parser_result, TimeInvalid):
+        logger.info(
+            "planner.decision: TimeInvalid reason=%s → Clarification(parser_invalid)",
+            request.parser_result.reason,
+        )
         reason_text = {
             "past_date": "Это время уже прошло. На какое поставить?",
             "out_of_range": "Не разобрала время — можешь сказать иначе? "
@@ -138,9 +170,13 @@ def plan_action(
     # 6. Иначе — LLM
     if invoke_llm is None:
         # Тестовый режим / нет LLM в окружении — ack + лог
-        logger.info("planner: invoke_llm не передан, возвращаю NoAction")
+        logger.info(
+            "planner.decision: no_llm_available → NoAction "
+            "(invoke_llm callable не передан)",
+        )
         return NoAction(ack_message="", rationale="no_llm_available")
 
+    logger.info("planner.decision: invoking LLM (no short-circuit matched)")
     try:
         raw = invoke_llm(_PLANNER_SYSTEM_PROMPT, _build_user_prompt(request))
     except Exception as exc:  # noqa: BLE001 — таймаут/сеть/JSON parse
@@ -151,9 +187,12 @@ def plan_action(
         return NoAction(ack_message="", rationale="llm_exception")
 
     if raw is None:
+        logger.info("planner: invoke_llm вернул None → NoAction(llm_returned_none)")
         return NoAction(ack_message="", rationale="llm_returned_none")
 
-    return _parse_llm_output(raw, request)
+    result = _parse_llm_output(raw, request)
+    logger.info("planner.decision: LLM returned → %s", type(result).__name__)
+    return result
 
 
 # ─── Short-circuit построители ────────────────────────────────────────
