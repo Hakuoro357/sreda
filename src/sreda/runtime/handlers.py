@@ -1705,12 +1705,21 @@ def _format_time_context_for_prompt(profile: dict[str, Any]) -> str:
     human = f"{weekday}, {now_user.day} {month} {now_user.year}, {now_user.strftime('%H:%M')} {tz_label}"
     utc_line = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     iso_date = now_user.date().isoformat()
+
+    # 2026-05-19: time-of-day period injection + carve-out.
+    # Prod incident 2026-05-18 — bot 3× написал «спокойной ночи» в 15:44
+    # MSK (tenant_max_142322319). Codex+Qwen review: prompt-only недостаточен
+    # (mimo игнорирует instructions ~40%), но добавляем как первый слой;
+    # вторым слоем deterministic post-output guard в time_phrase_validator.py.
+    from sreda.services.time_phrase_validator import classify_period
+    period = classify_period(now_user.hour)
+
     # R-34 (2026-05-16): hardened date anchor. Prod incident — LLM emitted
     # вчерашнюю дату в trigger_iso вместо текущей, schedule_reminder вернул
     # skipped:past, LLM написала «12:00 прошло» вместо корректной reminder.
     # ISO date + explicit «не используй из истории» — discriminator.
     return (
-        f"Сейчас: {human}\n"
+        f"Сейчас: {human} (время суток: {period})\n"
         f"В UTC: {utc_line}\n"
         f"ISO дата 'сегодня': {iso_date}\n"
         f"\n"
@@ -1718,7 +1727,14 @@ def _format_time_context_for_prompt(profile: dict[str, Any]) -> str:
         f"диалога могут быть упоминания других дат (старые reminder fired, "
         f"прошлые turns с «На сегодня») — НЕ используй их как текущую "
         f"дату. Если user говорит «сегодня в 12 часов» — это {iso_date} "
-        f"в 12:00 в его часовом поясе ({tz_label})."
+        f"в 12:00 в его часовом поясе ({tz_label}).\n"
+        f"\n"
+        f"Сейчас {period}. НЕ используй приветствия не соответствующие "
+        f"времени суток (например «спокойной ночи» если не ночь, «доброе "
+        f"утро» если не утро, «добрый вечер» если не вечер) — кроме "
+        f"случаев когда пользователь ЯВНО просит такое пожелание. При "
+        f"записи измерений и событий используй ТОЛЬКО {iso_date} — не "
+        f"вчерашние и не позавчерашние даты из истории."
     )
 
 
@@ -2995,6 +3011,38 @@ def execute_conversation_chat(
             action.tenant_id, feature_key,
             _sanitize_stats["cjk_stripped"],
         )
+
+    # 2026-05-19: time-of-day greeting guard (deterministic post-output).
+    # Codex+Qwen review consensus: prompt-only недостаточен для mimo которая
+    # ~40% игнорирует instructions. Вторым слоем — regex strip mismatched
+    # greetings ("спокойной ночи" в 15:44). Carve-out: user_text проверяется
+    # на explicit request типа «пожелай мне доброго утра».
+    try:
+        from datetime import datetime, timezone as _tz
+        from zoneinfo import ZoneInfo
+        from sreda.services.time_phrase_validator import (
+            classify_period, strip_misaligned_greetings,
+        )
+        _user_tz_name = (context.get("_profile") or {}).get(
+            "timezone", "Europe/Moscow",
+        ) or "Europe/Moscow"
+        try:
+            _now_user = datetime.now(_tz.utc).astimezone(ZoneInfo(_user_tz_name))
+        except Exception:
+            _now_user = datetime.now(_tz.utc)
+        _period = classify_period(_now_user.hour)
+        text, _greeting_stats = strip_misaligned_greetings(
+            text, period=_period, user_text=user_text,
+        )
+        if _greeting_stats["mismatched_stripped"]:
+            logger.warning(
+                "CHAT_GREETING_STRIPPED tenant=%s feature=%s count=%d "
+                "period=%s",
+                action.tenant_id, feature_key,
+                _greeting_stats["mismatched_stripped"], _period,
+            )
+    except Exception:
+        logger.exception("greeting_validator failed — skipping (text unchanged)")
 
     # 12.7 (incident tg=634496616 2026-05-03): MiMo content-filter
     # иногда возвращает английский «The request was rejected because it
