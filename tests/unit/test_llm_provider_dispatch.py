@@ -12,8 +12,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from sreda.db.models.runtime_config import RuntimeConfig
 from sreda.services import llm as llm_module
+from sreda.services import runtime_config as rc
 
 
 @dataclass
@@ -83,6 +87,24 @@ def _settings(**overrides: Any):
     }
     clean_defaults.update(overrides)
     return Settings(**clean_defaults)
+
+
+@pytest.fixture
+def runtime_session():
+    engine = create_engine("sqlite:///:memory:")
+    RuntimeConfig.__table__.create(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def _set_runtime_config(session, key: str, value: str) -> None:
+    session.add(RuntimeConfig(key=key, value=value))
+    session.commit()
+    rc.invalidate_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +254,85 @@ def test_with_fallback_primary_missing_returns_none() -> None:
         mimo_api_key="mimo-k",  # fallback would be available, but primary is the lead
     )
     assert llm_module.get_chat_llm(s, with_fallback=True) is None
+
+
+# ---------------------------------------------------------------------------
+# Tenant canary routing
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_override_wins_over_global_provider_pair(runtime_session) -> None:
+    _set_runtime_config(runtime_session, rc.KEY_CHAT_PROVIDER, "mimo")
+    _set_runtime_config(runtime_session, rc.KEY_CHAT_FALLBACK_PROVIDER, "")
+    _set_runtime_config(
+        runtime_session,
+        rc.KEY_CHAT_PROVIDER_TENANT_OVERRIDES,
+        '{"tenant_a": {"primary": "openrouter", "fallback": "mimo"}}',
+    )
+    s = _settings(mimo_api_key="mimo-k", openrouter_api_key="or-k")
+
+    assert llm_module.resolve_provider_pair_for_tenant(
+        runtime_session, "tenant_a", s,
+    ) == ("openrouter", "mimo")
+
+
+def test_tenant_override_bad_provider_falls_back_to_global(runtime_session) -> None:
+    _set_runtime_config(runtime_session, rc.KEY_CHAT_PROVIDER, "mimo")
+    _set_runtime_config(runtime_session, rc.KEY_CHAT_FALLBACK_PROVIDER, "openrouter")
+    _set_runtime_config(
+        runtime_session,
+        rc.KEY_CHAT_PROVIDER_TENANT_OVERRIDES,
+        '{"tenant_a": {"primary": "missing-provider", "fallback": "mimo"}}',
+    )
+    s = _settings(mimo_api_key="mimo-k", openrouter_api_key="or-k")
+
+    assert llm_module.resolve_provider_pair_for_tenant(
+        runtime_session, "tenant_a", s,
+    ) == ("mimo", "openrouter")
+
+
+def test_tenant_override_unavailable_provider_falls_back_to_global(runtime_session) -> None:
+    _set_runtime_config(runtime_session, rc.KEY_CHAT_PROVIDER, "mimo")
+    _set_runtime_config(runtime_session, rc.KEY_CHAT_FALLBACK_PROVIDER, "")
+    _set_runtime_config(
+        runtime_session,
+        rc.KEY_CHAT_PROVIDER_TENANT_OVERRIDES,
+        '{"tenant_a": {"primary": "openrouter", "fallback": "mimo"}}',
+    )
+    s = _settings(mimo_api_key="mimo-k")  # no OpenRouter key
+
+    assert llm_module.resolve_provider_pair_for_tenant(
+        runtime_session, "tenant_a", s,
+    ) == ("mimo", None)
+
+
+def test_provider_pair_session_factory_failure_falls_back_to_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sreda.db import session as db_session
+
+    def _boom():
+        raise RuntimeError("db not ready")
+
+    monkeypatch.setattr(db_session, "get_session_factory", _boom)
+    s = _settings(chat_provider="openrouter", chat_fallback_provider="mimo")
+
+    assert llm_module.resolve_provider_pair(s) == ("openrouter", "mimo")
+
+
+def test_tenant_pair_runtime_config_error_keeps_env_fallback(
+    runtime_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("runtime_config not ready")
+
+    monkeypatch.setattr(rc, "get_config", _boom)
+    s = _settings(chat_provider="mimo", chat_fallback_provider="openrouter")
+
+    assert llm_module.resolve_provider_pair_for_tenant(
+        runtime_session, "tenant_a", s,
+    ) == ("mimo", "openrouter")
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ correction_pending) идут в Slice 6 integration тесты.
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timezone
 from typing import Any
 
@@ -131,6 +132,17 @@ def test_journal_entry_serialize_drops_non_scalar_values() -> None:
     assert serialized["result_data"]["int_ok"] == 42
     assert "bad_list" not in serialized["result_data"]
     assert "bad_dict" not in serialized["result_data"]
+
+
+def test_r39_readers_explicitly_filter_live_mode() -> None:
+    """Legacy journal rows must not leak into live correction/history readers."""
+    from sreda.agents import r39_live_runner
+
+    history_src = inspect.getsource(r39_live_runner._load_r39_thread_history)
+    pending_src = inspect.getsource(r39_live_runner._load_correction_pending)
+
+    assert 'R39RunJournal.mode == "live"' in history_src
+    assert 'R39RunJournal.mode == "live"' in pending_src
 
 
 # ─── _r39_admin_alert_adapter ────────────────────────────────────────

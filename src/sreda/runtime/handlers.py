@@ -50,6 +50,7 @@ from sreda.services.llm import (
     detect_unbacked_claim,
     get_chat_llm,
     invoke_with_per_call_timeout,
+    resolve_provider_pair_for_tenant,
     strip_reasoning_prefix,
 )
 
@@ -61,6 +62,21 @@ logger = logging.getLogger(__name__)
 # constant (not function-local) so tests and admin tooling can import
 # the same value. See ``execute_conversation_chat`` for usage.
 CHAT_TURN_TIMEOUT_SECONDS = 180
+LEGACY_R39_JOURNAL_TENANT_IDS_KEY = "legacy_r39_journal_tenant_ids"
+LEGACY_R39_AUDIT_ENFORCE_TENANT_IDS_KEY = "legacy_r39_audit_enforce_tenant_ids"
+
+
+def _tenant_allowlist_enabled(session: Session, key: str, tenant_id: str) -> bool:
+    try:
+        from sreda.agents.tenant_allowlist import parse_pilot_tenants
+        from sreda.services import runtime_config as rc
+
+        raw = rc.get_config(session, key) or ""
+        parsed = parse_pilot_tenants(raw)
+    except Exception:  # noqa: BLE001
+        logger.exception("runtime allowlist read failed key=%s tenant=%s", key, tenant_id)
+        return False
+    return "*" in parsed or str(tenant_id) in parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -2230,9 +2246,19 @@ def execute_conversation_chat(
     # `invoke_with_per_call_timeout`. Это работает на hangs (когда
     # primary не raises exception, а просто висит — incident 13:27 MSK
     # 2026-04-28, MiMo 131s). Тесты инжектят `_llm_client` для bypass.
-    from sreda.services.llm import resolve_provider_pair
-
-    llm = context.get("_llm_client") or get_chat_llm()
+    _chat_primary_provider = None
+    _chat_fallback_provider = None
+    if context.get("_llm_client") is None:
+        try:
+            _chat_primary_provider, _chat_fallback_provider = (
+                resolve_provider_pair_for_tenant(session, action.tenant_id)
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "chat LLM: tenant provider resolution failed tenant=%s",
+                action.tenant_id,
+            )
+    llm = context.get("_llm_client") or get_chat_llm(provider=_chat_primary_provider)
     if llm is None:
         return [
             RuntimeReply(
@@ -2413,18 +2439,14 @@ def execute_conversation_chat(
             _fallback_with_tools = _fb_llm.bind_tools(tools)
     elif context.get("_llm_client") is None:
         # Только когда не подменяется через _llm_client (= prod path):
-        # spin up отдельный fallback на основе runtime_config / env.
-        try:
-            _, _fb_provider_name = resolve_provider_pair()
-        except Exception:  # noqa: BLE001
-            _fb_provider_name = None
-        if _fb_provider_name:
-            _fb_llm = get_chat_llm(provider=_fb_provider_name)
+        # spin up fallback из provider snapshot resolved at turn start.
+        if _chat_fallback_provider:
+            _fb_llm = get_chat_llm(provider=_chat_fallback_provider)
             if _fb_llm is not None:
                 _fallback_with_tools = _fb_llm.bind_tools(tools)
                 logger.info(
                     "chat: fallback LLM built provider=%s tenant=%s",
-                    _fb_provider_name, action.tenant_id,
+                    _chat_fallback_provider, action.tenant_id,
                 )
 
     # Build the message list with last N turns of history so the LLM
@@ -2517,6 +2539,31 @@ def execute_conversation_chat(
             )
         # Shadow в фоне; legacy продолжается как обычно.
     # ─── /R-39 integration ──────────────────────────────────────────
+
+    _legacy_journal_enabled = (
+        feature_key == "housewife_assistant"
+        and _tenant_allowlist_enabled(
+            session, LEGACY_R39_JOURNAL_TENANT_IDS_KEY, action.tenant_id,
+        )
+    )
+    _legacy_journal_enforce = (
+        feature_key == "housewife_assistant"
+        and _tenant_allowlist_enabled(
+            session, LEGACY_R39_AUDIT_ENFORCE_TENANT_IDS_KEY, action.tenant_id,
+        )
+    )
+    if _legacy_journal_enforce and not _legacy_journal_enabled:
+        logger.warning(
+            "LEGACY_JOURNAL_CONFIG_INVALID tenant=%s enforce_without_journal",
+            action.tenant_id,
+        )
+        _legacy_journal_enforce = False
+    _legacy_journal = None
+    _legacy_journal_unreliable = False
+    if _legacy_journal_enabled:
+        from sreda.agents.journal import ToolJournal
+
+        _legacy_journal = ToolJournal()
 
     # Multi-part content with Anthropic-style ephemeral cache_control
     # on the stable prefix. Supported providers (Grok 4.1 Fast via
@@ -2808,6 +2855,10 @@ def execute_conversation_chat(
                 action.tenant_id, _iter, len(tool_calls),
                 [tc.get("name") for tc in tool_calls],
             )
+        _tool_call_by_id = {
+            str(tc.get("id") or ""): (idx, tc)
+            for idx, tc in enumerate(tool_calls)
+        }
         _results = _dispatch_tool_calls_batch(tool_calls, tools_by_name)
 
         # R-32 (2026-05-15): dispatch returns 4-tuple
@@ -2817,6 +2868,38 @@ def execute_conversation_chat(
         # Counter + R-30 C validator gated by `is_physical` чтобы avoid
         # over-counting / alert spam on LLM duplicate batches.
         for tc_id, name, result_str, is_physical in _results:
+            if _legacy_journal is not None:
+                try:
+                    from sreda.agents.legacy_journal_adapter import (
+                        LegacyToolDispatchRecord,
+                        append_legacy_dispatch,
+                    )
+
+                    batch_index, source_tc = _tool_call_by_id.get(
+                        str(tc_id), (0, {})
+                    )
+                    append_legacy_dispatch(
+                        _legacy_journal,
+                        LegacyToolDispatchRecord(
+                            tool_call_id=str(tc_id),
+                            tool_name=name,
+                            args=dict(source_tc.get("args") or {}),
+                            result_str=result_str,
+                            is_physical=bool(is_physical),
+                            loop_index=_iter,
+                            batch_index=batch_index,
+                            tenant_id=action.tenant_id,
+                            user_id=user_id,
+                            run_id=run_id,
+                            feature_key=feature_key,
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    _legacy_journal_unreliable = True
+                    logger.exception(
+                        "LEGACY_JOURNAL_ADAPTER_FAILED tenant=%s run=%s tool=%s",
+                        action.tenant_id, run_id, name,
+                    )
             if name in _ONBOARDING_RESOLUTION_TOOLS and result_str.startswith("ok:"):
                 _onboarding_resolution_called = True
             if name:
@@ -3174,11 +3257,120 @@ def execute_conversation_chat(
                 )
                 reply_markup = None
 
+    _legacy_audit_unbacked = False
+    if _legacy_journal is not None:
+        try:
+            from sreda.agents.legacy_journal_adapter import (
+                enforce_legacy_journal_response,
+            )
+
+            _enforced = enforce_legacy_journal_response(
+                text=text,
+                reply_markup=reply_markup,
+                journal=_legacy_journal,
+                enforce_enabled=_legacy_journal_enforce,
+                journal_unreliable=_legacy_journal_unreliable,
+                detector=detect_unbacked_claim,
+                safe_ack_fn=_format_safe_ack_from_tools,
+            )
+            if _enforced.replaced:
+                logger.warning(
+                    "LEGACY_JOURNAL_ENFORCE_REPLACED tenant=%s run=%s "
+                    "unreliable=%s original_chars=%d",
+                    action.tenant_id, run_id, _legacy_journal_unreliable, len(text),
+                )
+            text = _enforced.text
+            reply_markup = _enforced.reply_markup
+            _legacy_audit_unbacked = _enforced.audit_unbacked
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "LEGACY_JOURNAL_ENFORCE_FAILED tenant=%s run=%s",
+                action.tenant_id, run_id,
+            )
+
+        # r39_run_journal primary key is run_id, and shadow mode already
+        # writes the same run_id as mode='shadow'. Avoid breaking the
+        # existing shadow flow; legacy observe rows are persisted only when
+        # R39 shadow is not active for this turn.
+        if _should_persist_legacy_journal(_r39_mode):
+            _persist_legacy_journal_row(
+                session=session,
+                run_id=run_id,
+                tenant_id=action.tenant_id,
+                journal=_legacy_journal,
+                audit_unbacked=_legacy_audit_unbacked,
+            )
+
     # Trace breadcrumb — in /admin/logs filtering by trace_id you'll
     # see whether this turn had to rescue an earlier AI message.
     with trace.step("chat.reply", rescued=rescued, chars=len(text)):
         pass
     return [RuntimeReply(text=text, reply_markup=reply_markup, feature_key=feature_key)]
+
+
+def _should_persist_legacy_journal(r39_mode: str) -> bool:
+    return r39_mode != "shadow"
+
+
+def _persist_legacy_journal_row(
+    *,
+    session: Session,
+    run_id: str,
+    tenant_id: str,
+    journal: Any,
+    audit_unbacked: bool,
+) -> None:
+    """Best-effort INSERT of legacy journal into r39_run_journal."""
+
+    try:
+        from sreda.agents.legacy_journal_adapter import side_effects_count
+        from sreda.db.models import R39RunJournal
+
+        row = R39RunJournal(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            mode="legacy",
+            plan_kind="legacy",
+            journal_json=json.dumps(
+                [_serialize_legacy_journal_entry(e) for e in journal.entries],
+                ensure_ascii=False,
+            ),
+            correction_pending=None,
+            audit_unbacked=bool(audit_unbacked),
+            side_effects_count=side_effects_count(journal),
+        )
+        sp = session.begin_nested()
+        try:
+            session.add(row)
+            session.flush()
+            sp.commit()
+        except Exception:
+            sp.rollback()
+            logger.exception(
+                "LEGACY_JOURNAL_PERSIST_FAILED tenant=%s run=%s",
+                tenant_id, run_id,
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "LEGACY_JOURNAL_PERSIST_FAILED tenant=%s run=%s",
+            tenant_id, run_id,
+        )
+
+
+def _serialize_legacy_journal_entry(entry: Any) -> dict[str, Any]:
+    return {
+        "tool_name": entry.tool_name,
+        "action_index": entry.action_index,
+        "result_kind": entry.result_kind.value,
+        "result_data": {
+            k: v for k, v in (entry.result_data or {}).items()
+            if isinstance(v, (str, int, float, bool, type(None)))
+        },
+        "entity_id": entry.entity_id,
+        "idempotency_key": entry.idempotency_key,
+        "error_code": entry.error_code,
+        "error_message": entry.error_message,
+    }
 
 
 # 12.7 (incident tg=634496616 2026-05-03): provider refusal substitution.

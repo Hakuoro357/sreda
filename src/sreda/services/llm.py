@@ -24,6 +24,7 @@ flip; behaviour is default.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import logging
 import re
 import threading
@@ -1232,6 +1233,102 @@ def resolve_provider_pair(settings: Settings | None = None) -> tuple[str, str | 
     return _resolve_provider_overrides(s)
 
 
+def resolve_provider_pair_for_tenant(
+    session: Any,
+    tenant_id: str,
+    settings: Settings | None = None,
+) -> tuple[str, str | None]:
+    """Resolve primary/fallback provider for one tenant.
+
+    Tenant override is intentionally evaluated with the caller's DB session so
+    one chat turn can snapshot provider routing once instead of letting primary
+    and fallback rebuild paths re-read runtime_config through independent
+    sessions.
+    """
+
+    s = settings or get_settings()
+    try:
+        primary, fallback = _resolve_provider_overrides_from_session(session, s)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "chat LLM: global provider overrides unavailable tenant=%s",
+            tenant_id,
+        )
+        return s.chat_provider, s.chat_fallback_provider
+    try:
+        from sreda.services import runtime_config as rc
+
+        raw = rc.get_config(session, rc.KEY_CHAT_PROVIDER_TENANT_OVERRIDES)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "chat LLM: tenant provider overrides unavailable tenant=%s",
+            tenant_id,
+        )
+        return primary, fallback
+    if not raw:
+        return primary, fallback
+    try:
+        overrides = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "chat LLM: invalid tenant provider overrides JSON tenant=%s",
+            tenant_id,
+        )
+        return primary, fallback
+    tenant_override = overrides.get(tenant_id) if isinstance(overrides, dict) else None
+    if not isinstance(tenant_override, dict):
+        return primary, fallback
+    override_primary = str(tenant_override.get("primary") or "").strip()
+    override_fallback_raw = tenant_override.get("fallback")
+    override_fallback = (
+        None if override_fallback_raw is None
+        else str(override_fallback_raw).strip() or None
+    )
+    if not _provider_key_is_known(override_primary):
+        logger.warning(
+            "chat LLM: unknown tenant primary provider tenant=%s provider=%r",
+            tenant_id, override_primary,
+        )
+        return primary, fallback
+    if override_fallback and not _provider_key_is_known(override_fallback):
+        logger.warning(
+            "chat LLM: unknown tenant fallback provider tenant=%s provider=%r",
+            tenant_id, override_fallback,
+        )
+        return primary, fallback
+    if override_fallback == override_primary:
+        logger.warning(
+            "chat LLM: tenant fallback equals primary tenant=%s provider=%s",
+            tenant_id, override_primary,
+        )
+        return primary, fallback
+    if not _provider_key_is_available(override_primary, s):
+        logger.warning(
+            "chat LLM: tenant primary provider unavailable tenant=%s provider=%s",
+            tenant_id, override_primary,
+        )
+        return primary, fallback
+    if override_fallback and not _provider_key_is_available(override_fallback, s):
+        logger.warning(
+            "chat LLM: tenant fallback provider unavailable tenant=%s provider=%s",
+            tenant_id, override_fallback,
+        )
+        return primary, fallback
+    return override_primary, override_fallback
+
+
+def _provider_key_is_known(provider: str) -> bool:
+    return provider in CHAT_PROVIDERS
+
+
+def _provider_key_is_available(provider: str, settings: Settings) -> bool:
+    if provider in _MIMO_MODEL_BY_PROVIDER:
+        return bool(settings.resolve_mimo_api_key())
+    if provider in _OPENROUTER_MODEL_BY_PROVIDER:
+        return bool(settings.resolve_openrouter_api_key())
+    return False
+
+
 def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
     """Consult the admin-switcher DB table for live overrides, falling
     back to env-var-based Settings when a key isn't set. Returns
@@ -1246,23 +1343,19 @@ def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
     """
     global _RUNTIME_CONFIG_WARNED
 
-    primary = settings.chat_provider
-    fallback = settings.chat_fallback_provider
     try:
         from sqlalchemy.exc import OperationalError, ProgrammingError
 
         from sreda.db.session import get_session_factory
-        from sreda.services import runtime_config as rc
     except ImportError:
-        return primary, fallback
+        return settings.chat_provider, settings.chat_fallback_provider
 
     try:
         session = get_session_factory()()
     except Exception:  # noqa: BLE001 — session factory not ready yet
-        return primary, fallback
+        return settings.chat_provider, settings.chat_fallback_provider
     try:
-        db_primary = rc.get_config(session, rc.KEY_CHAT_PROVIDER)
-        db_fallback = rc.get_config(session, rc.KEY_CHAT_FALLBACK_PROVIDER)
+        return _resolve_provider_overrides_from_session(session, settings)
     except (OperationalError, ProgrammingError) as exc:
         if not _RUNTIME_CONFIG_WARNED:
             logger.warning(
@@ -1272,10 +1365,21 @@ def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
                 type(exc).__name__,
             )
             _RUNTIME_CONFIG_WARNED = True
-        return primary, fallback
+        return settings.chat_provider, settings.chat_fallback_provider
     finally:
         session.close()
 
+
+def _resolve_provider_overrides_from_session(
+    session: Any,
+    settings: Settings,
+) -> tuple[str, str | None]:
+    primary = settings.chat_provider
+    fallback = settings.chat_fallback_provider
+    from sreda.services import runtime_config as rc
+
+    db_primary = rc.get_config(session, rc.KEY_CHAT_PROVIDER)
+    db_fallback = rc.get_config(session, rc.KEY_CHAT_FALLBACK_PROVIDER)
     if db_primary:
         primary = db_primary
     if db_fallback is not None:

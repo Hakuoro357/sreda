@@ -81,3 +81,4 @@ def invalidate_cache() -> None:
 # Canonical keys — keep here so callers don't typo them.
 KEY_CHAT_PROVIDER = "chat_primary_provider"
 KEY_CHAT_FALLBACK_PROVIDER = "chat_fallback_provider"
+KEY_CHAT_PROVIDER_TENANT_OVERRIDES = "chat_provider_tenant_overrides_json"

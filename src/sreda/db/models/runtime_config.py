@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, String
+from sqlalchemy import Column, DateTime, String, Text
 
 from sreda.db.base import Base
 
@@ -32,5 +32,5 @@ class RuntimeConfig(Base):
     __tablename__ = "runtime_config"
 
     key = Column(String(64), primary_key=True)
-    value = Column(String(256), nullable=True)
+    value = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)

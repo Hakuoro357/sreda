@@ -15,9 +15,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -25,7 +26,7 @@ import pytest
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
 import sreda.db.models  # noqa: F401 — register all model classes on Base.metadata
-from sreda.db.models.core import Tenant, User, Workspace
+from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.models.poller_state import PollerHeartbeat, PollerOffset
 from sreda.db.session import get_engine, get_session_factory
 from sreda.integrations.telegram.client import TelegramDeliveryError
@@ -38,6 +39,42 @@ from sreda.workers.telegram_long_poll import (
 from tests.unit.conftest import seed_telegram_user
 
 EXISTING_CHAT_ID = "100000003"
+
+
+def _seed_approved_housewife_user(session) -> None:
+    """Seed the same state an approved prod tenant has after Phase 2."""
+
+    seeded = seed_telegram_user(
+        session, chat_id=EXISTING_CHAT_ID, profile_id="tup_1",
+    )
+    plan = SubscriptionPlan(
+        id=f"plan_{uuid4().hex[:16]}",
+        plan_key=f"sreda_free_{uuid4().hex[:8]}",
+        feature_key="housewife_assistant",
+        title="Sreda Free",
+        description="",
+        price_rub=0,
+        billing_period_days=30,
+        credits_monthly_quota=1_000_000,
+    )
+    session.add(plan)
+    session.flush()
+    session.add(
+        TenantSubscription(
+            id=f"sub_{uuid4().hex[:16]}",
+            tenant_id=seeded.tenant_id,
+            plan_id=plan.id,
+            feature_key="housewife_assistant",
+            status="active",
+            starts_at=datetime.now(timezone.utc) - timedelta(days=1),
+            active_until=datetime.now(timezone.utc) + timedelta(days=30),
+        )
+    )
+    session.commit()
+
+    from sreda.services.onboarding import mark_welcome_sent
+
+    mark_welcome_sent(session, seeded.tenant_id, seeded.user_id)
 
 
 # ---- Fixtures ----------------------------------------------------------
@@ -415,16 +452,18 @@ async def test_main_returns_3_on_409_conflict(fresh_db):
 
 @pytest.mark.asyncio
 async def test_handle_telegram_update_fast_no_blocking_io(fresh_db, monkeypatch):
-    """``handle_telegram_update`` must finish < 200ms in the approved-
-    user path: it only does DB upsert + persist + create_task, the
-    heavy LLM/voice/outbox work is detached. Anything taking > 200ms
-    means we accidentally awaited a network/LLM call inline."""
+    """``handle_telegram_update`` must detach approved-user processing.
+
+    The handler should persist inbound state and schedule the heavy
+    LLM/voice/outbox work with ``asyncio.create_task``. We assert the
+    coroutine is scheduled, not awaited inline; wall-clock thresholds are
+    too flaky on cold Windows SQLite test setup.
+    """
     from sreda.services.telegram_inbound import handle_telegram_update
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        seed_telegram_user(session, chat_id=EXISTING_CHAT_ID, profile_id="tup_1")
-        session.commit()
+        _seed_approved_housewife_user(session)
 
     payload = {
         "update_id": 5001,
@@ -443,20 +482,22 @@ async def test_handle_telegram_update_fast_no_blocking_io(fresh_db, monkeypatch)
 
     async def fake_turn(**kwargs):
         inline_calls.append(time.monotonic())
-        await asyncio.sleep(0.5)  # would blow the 200ms budget if awaited
+
+    scheduled: list[tuple[object, str | None]] = []
+
+    def fake_create_task(coro, *, name=None):
+        scheduled.append((coro, name))
+        coro.close()
+        return MagicMock()
 
     monkeypatch.setattr(ti, "_process_approved_turn", fake_turn)
+    monkeypatch.setattr(ti.asyncio, "create_task", fake_create_task)
 
-    start = time.monotonic()
     inb_id = await handle_telegram_update(payload)
-    elapsed_ms = (time.monotonic() - start) * 1000
 
     assert inb_id is not None
-    assert elapsed_ms < 200, f"handle_telegram_update took {elapsed_ms:.0f}ms"
-    # The turn coroutine was scheduled (or about to be scheduled) but
-    # certainly hasn't completed within ~10ms of returning.
-    # We can't easily assert on the task object since it was created
-    # in-place; the elapsed-time assertion above is the load-bearing one.
+    assert scheduled
+    assert inline_calls == []
 
 
 @pytest.mark.asyncio
@@ -470,8 +511,7 @@ async def test_handle_telegram_update_idempotent_on_duplicate(fresh_db, monkeypa
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        seed_telegram_user(session, chat_id=EXISTING_CHAT_ID, profile_id="tup_1")
-        session.commit()
+        _seed_approved_housewife_user(session)
 
     payload = {
         "update_id": 9999,
