@@ -74,6 +74,23 @@ def _coerce_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _initial_next_trigger_at(trigger_at: datetime, recurrence_rule: str | None) -> datetime:
+    """Return the first pending fire time for a newly scheduled reminder."""
+    trigger_at = _coerce_utc(trigger_at)
+    if not recurrence_rule:
+        return trigger_at
+
+    rule = rrulestr(recurrence_rule, dtstart=trigger_at)
+    now = _coerce_utc(_utcnow())
+    if trigger_at > now:
+        return trigger_at
+
+    next_occ = rule.after(now, inc=False)
+    if next_occ is None:
+        raise ValueError("recurrence_rule has no future occurrences")
+    return _coerce_utc(next_occ)
+
+
 @dataclass(slots=True)
 class ReminderSummary:
     id: str
@@ -143,6 +160,7 @@ class HousewifeReminderService:
                 rrulestr(recurrence_rule, dtstart=trigger_at)
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(f"invalid recurrence_rule: {exc}") from exc
+        next_trigger_at = _initial_next_trigger_at(trigger_at, recurrence_rule)
 
         clean_title = title.strip()
         embedding_json, embedding_model = self._embed_title(clean_title)
@@ -153,7 +171,7 @@ class HousewifeReminderService:
             user_id=user_id,
             title=clean_title,
             trigger_at=trigger_at,
-            next_trigger_at=trigger_at,
+            next_trigger_at=next_trigger_at,
             recurrence_rule=recurrence_rule,
             status="pending",
             source_memo=source_memo,
@@ -227,6 +245,14 @@ class HousewifeReminderService:
         else:
             rrule_value = rem.recurrence_rule  # unchanged
 
+        new_trigger_at: datetime | None = None
+        new_next_trigger_at: datetime | None = None
+        if trigger_at is not None:
+            new_trigger_at = _coerce_utc(trigger_at)
+            new_next_trigger_at = _initial_next_trigger_at(new_trigger_at, rrule_value)
+        elif recurrence_rule is not None:
+            new_next_trigger_at = _initial_next_trigger_at(rem.trigger_at, rrule_value)
+
         if title is not None:
             clean = title.strip()
             if clean and clean != rem.title:
@@ -235,11 +261,13 @@ class HousewifeReminderService:
                 rem.embedding_json = emb_json
                 rem.embedding_model = emb_model
 
-        if trigger_at is not None:
-            ts = _coerce_utc(trigger_at)
-            rem.trigger_at = ts
-            rem.next_trigger_at = ts
+        if new_trigger_at is not None:
+            rem.trigger_at = new_trigger_at
+            rem.next_trigger_at = new_next_trigger_at
             rem.escalation_count = 0  # reset escalation cycle on time change
+        elif new_next_trigger_at is not None:
+            rem.next_trigger_at = new_next_trigger_at
+            rem.escalation_count = 0
 
         if clear_recurrence or recurrence_rule is not None:
             rem.recurrence_rule = rrule_value

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -36,7 +34,7 @@ def test_schedule_reminder_creates_row() -> None:
     result = tools["schedule_reminder"].invoke(
         {
             "title": "Купить молоко",
-            "trigger_iso": "2026-05-01T12:00:00+00:00",
+            "trigger_iso": "2099-05-01T12:00:00+00:00",
         }
     )
 
@@ -67,7 +65,7 @@ def test_schedule_reminder_rejects_bad_rrule() -> None:
     result = tools["schedule_reminder"].invoke(
         {
             "title": "X",
-            "trigger_iso": "2026-05-01T12:00:00+00:00",
+            "trigger_iso": "2099-05-01T12:00:00+00:00",
             "recurrence_rule": "TOTALLY_INVALID",
         }
     )
@@ -92,10 +90,10 @@ def test_list_reminders_returns_formatted_lines() -> None:
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
     tools["schedule_reminder"].invoke(
-        {"title": "First", "trigger_iso": "2026-05-01T12:00:00+00:00"}
+        {"title": "First", "trigger_iso": "2099-05-01T12:00:00+00:00"}
     )
     tools["schedule_reminder"].invoke(
-        {"title": "Second", "trigger_iso": "2026-05-02T12:00:00+00:00"}
+        {"title": "Second", "trigger_iso": "2099-05-02T12:00:00+00:00"}
     )
 
     result = tools["list_reminders"].invoke({})
@@ -111,7 +109,7 @@ def test_cancel_reminder_works_then_denies_second_time() -> None:
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
     ok_result = tools["schedule_reminder"].invoke(
-        {"title": "X", "trigger_iso": "2026-05-01T12:00:00+00:00"}
+        {"title": "X", "trigger_iso": "2099-05-01T12:00:00+00:00"}
     )
     # Extract id from "ok:scheduled:rem_XXXXX:TIMESTAMP"
     rid = ok_result.split(":")[2]

@@ -9,9 +9,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
+from sreda.db.models import checklists as _checklists_models  # noqa: F401
 from sreda.db.models.core import Tenant, User
-from sreda.db.models.housewife import FamilyReminder
-from sreda.services.housewife_reminders import HousewifeReminderService, _coerce_utc
+from sreda.services.housewife_reminders import (
+    HousewifeReminderService,
+    _coerce_utc,
+    _initial_next_trigger_at,
+)
 
 
 def _fresh_session():
@@ -59,6 +63,42 @@ def test_schedule_weekly_rrule_preserved() -> None:
     assert reminder.recurrence_rule == "FREQ=WEEKLY;BYDAY=TU;BYHOUR=16;BYMINUTE=0"
 
 
+def test_schedule_recurring_past_anchor_sets_next_future(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recurring reminder with a past dtstart must not become due immediately."""
+    now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    reminder = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Daily pills",
+        trigger_at=datetime(2020, 1, 1, 6, 0, tzinfo=UTC),
+        recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+    )
+
+    assert _coerce_utc(reminder.trigger_at) == datetime(2020, 1, 1, 6, 0, tzinfo=UTC)
+    assert _coerce_utc(reminder.next_trigger_at) == datetime(2026, 5, 21, 6, 0, tzinfo=UTC)
+    assert service.due_now(now=now) == []
+
+
+def test_initial_next_trigger_for_past_recurring_anchor_is_aware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RRULE next occurrence must come back as aware UTC, not naive."""
+    now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
+
+    next_at = _initial_next_trigger_at(
+        datetime(2020, 1, 1, 6, 0, tzinfo=UTC),
+        "FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+    )
+
+    assert next_at == datetime(2026, 5, 21, 6, 0, tzinfo=UTC)
+    assert next_at.tzinfo is UTC
+
+
 def test_schedule_rejects_invalid_rrule() -> None:
     session = _fresh_session()
     service = HousewifeReminderService(session)
@@ -71,6 +111,27 @@ def test_schedule_rejects_invalid_rrule() -> None:
             trigger_at=datetime(2026, 5, 1, tzinfo=UTC),
             recurrence_rule="NOT_A_VALID_RRULE",
         )
+
+
+def test_schedule_recurring_without_future_occurrence_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finite RRULEs whose only occurrence is in the past must not create rows."""
+    now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+
+    with pytest.raises(ValueError, match="no future occurrences"):
+        service.schedule(
+            tenant_id="tenant_1",
+            user_id="user_1",
+            title="Past once",
+            trigger_at=datetime(2020, 1, 1, 6, 0, tzinfo=UTC),
+            recurrence_rule="FREQ=DAILY;COUNT=1",
+        )
+
+    assert service.count_active(tenant_id="tenant_1") == 0
 
 
 def test_due_now_returns_past_pending_only() -> None:
@@ -426,6 +487,89 @@ def test_update_changes_trigger_resets_escalation() -> None:
     assert updated.escalation_count == 0  # reset
     # Title не трогали — остался прежним
     assert updated.title == "X"
+
+
+def test_update_recurring_past_anchor_sets_next_future(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Updating a recurring reminder to a past anchor must keep next_trigger_at future."""
+    now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Daily pills",
+        trigger_at=datetime(2026, 5, 21, 6, 0, tzinfo=UTC),
+        recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+    )
+
+    updated = service.update(
+        tenant_id="tenant_1",
+        reminder_id=rem.id,
+        trigger_at=datetime(2020, 1, 1, 6, 0, tzinfo=UTC),
+    )
+
+    assert updated is not None
+    assert _coerce_utc(updated.trigger_at) == datetime(2020, 1, 1, 6, 0, tzinfo=UTC)
+    assert _coerce_utc(updated.next_trigger_at) == datetime(2026, 5, 21, 6, 0, tzinfo=UTC)
+    assert service.due_now(now=now) == []
+
+
+def test_update_recurring_without_future_occurrence_does_not_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed future-occurrence computation must leave the existing row unchanged."""
+    now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    original_trigger = datetime(2026, 5, 21, 6, 0, tzinfo=UTC)
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Daily pills",
+        trigger_at=original_trigger,
+        recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+    )
+
+    with pytest.raises(ValueError, match="no future occurrences"):
+        service.update(
+            tenant_id="tenant_1",
+            reminder_id=rem.id,
+            trigger_at=datetime(2020, 1, 1, 6, 0, tzinfo=UTC),
+            recurrence_rule="FREQ=DAILY;COUNT=1",
+        )
+
+    assert _coerce_utc(rem.trigger_at) == original_trigger
+    assert _coerce_utc(rem.next_trigger_at) == original_trigger
+    assert rem.recurrence_rule == "FREQ=DAILY;BYHOUR=6;BYMINUTE=0"
+
+
+def test_update_recurrence_rule_only_recomputes_next_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing RRULE without trigger_at must align next_trigger_at to the new rule."""
+    now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
+    session = _fresh_session()
+    service = HousewifeReminderService(session)
+    rem = service.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Daily pills",
+        trigger_at=datetime(2020, 1, 1, 6, 0, tzinfo=UTC),
+        recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+    )
+
+    updated = service.update(
+        tenant_id="tenant_1",
+        reminder_id=rem.id,
+        recurrence_rule="FREQ=WEEKLY;BYDAY=FR;BYHOUR=6;BYMINUTE=0",
+    )
+
+    assert updated is not None
+    assert _coerce_utc(updated.next_trigger_at) == datetime(2026, 5, 22, 6, 0, tzinfo=UTC)
+    assert updated.recurrence_rule == "FREQ=WEEKLY;BYDAY=FR;BYHOUR=6;BYMINUTE=0"
 
 
 def test_update_validates_recurrence_rule() -> None:

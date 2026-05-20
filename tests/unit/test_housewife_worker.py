@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from sreda.db.base import Base
 from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.models.housewife import FamilyReminder
-from sreda.services.housewife_reminders import HousewifeReminderService
+from sreda.services.housewife_reminders import HousewifeReminderService, _coerce_utc
 from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
 
@@ -93,7 +93,7 @@ def test_worker_recurring_first_fire_advances_to_next_week() -> None:
     (next Tuesday), без +2min re-ping'а."""
     session = _fresh_session()
     svc = HousewifeReminderService(session)
-    first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
+    first_tuesday = datetime(2099, 5, 5, 16, 0, tzinfo=UTC)
     reminder = svc.schedule(
         tenant_id="tenant_1", user_id="user_1",
         title="Weekly", trigger_at=first_tuesday,
@@ -111,6 +111,30 @@ def test_worker_recurring_first_fire_advances_to_next_week() -> None:
     if next_at.tzinfo is None:
         next_at = next_at.replace(tzinfo=UTC)
     assert next_at == first_tuesday + timedelta(days=7)
+
+
+def test_worker_does_not_fire_recurring_past_anchor_immediately(monkeypatch) -> None:
+    """A recurring reminder anchored in the past starts at the next future occurrence."""
+    session = _fresh_session()
+    svc = HousewifeReminderService(session)
+    now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
+    reminder = svc.schedule(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        title="Daily",
+        trigger_at=datetime(2020, 1, 1, 6, 0, tzinfo=UTC),
+        recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+    )
+
+    worker = HousewifeReminderWorker(session)
+    fired = asyncio.run(worker.process_pending(now=now))
+
+    session.refresh(reminder)
+    assert fired == 0
+    assert session.query(OutboxMessage).count() == 0
+    assert reminder.status == "pending"
+    assert _coerce_utc(reminder.next_trigger_at) == datetime(2026, 5, 21, 6, 0, tzinfo=UTC)
 
 
 def test_worker_skips_tenant_without_telegram() -> None:
