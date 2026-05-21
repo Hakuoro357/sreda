@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from langchain_core.tools import tool as lc_tool
@@ -108,6 +108,47 @@ from sreda.services.housewife_shopping import HousewifeShoppingService
 from sreda.services.tasks import TaskService
 
 logger = logging.getLogger(__name__)
+
+_MENU_DAY_NAMES_RU = (
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье",
+)
+_MENU_MONTH_NAMES_RU = (
+    "",
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
+_MENU_MEAL_LABELS_RU = {
+    "breakfast": "Завтрак",
+    "lunch": "Обед",
+    "dinner": "Ужин",
+    "snack": "Перекус",
+}
+_MENU_MEAL_ORDER = {
+    "breakfast": 0,
+    "lunch": 1,
+    "dinner": 2,
+    "snack": 3,
+}
+
+
+def _format_menu_date_ru(value: Any) -> str:
+    return f"{value.day} {_MENU_MONTH_NAMES_RU[value.month]}"
 
 
 def _format_reminder_for_llm(reminder: Any) -> str:
@@ -1256,8 +1297,10 @@ def build_housewife_tools(
             week_start: ISO date. If None, returns the user's most
                 recent menu across all weeks.
 
-        Returns a compact text dump grouped by day → meal, with recipe
-        links shown as [rec_...] ids so get_recipe can follow.
+        Returns an LLM-readable weekly menu grouped by dated day blocks.
+        Recipe links are still shown as [rec_...] ids so get_recipe can
+        follow them, but the layout is intentionally close to the
+        user-facing shape to avoid the model gluing days together.
         """
         if not user_id:
             return "error: no user_id context"
@@ -1286,9 +1329,11 @@ def build_housewife_tools(
         if plan is None:
             return "no menu plan for that week"
 
-        day_names = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-        lines = [f"menu plan [{plan.id}] week starting {plan.week_start_date.isoformat()}:"]
-        # Group by day
+        lines = [
+            f"menu_id: {plan.id}",
+            f"week_start: {plan.week_start_date.isoformat()}",
+            "",
+        ]
         by_day: dict[int, list] = {}
         for item in plan.items:
             by_day.setdefault(item.day_of_week, []).append(item)
@@ -1296,15 +1341,25 @@ def build_housewife_tools(
             items = by_day.get(d, [])
             if not items:
                 continue
-            lines.append(f"  {day_names[d]}:")
-            for item in sorted(items, key=lambda x: x.meal_type):
+            day_date = plan.week_start_date + timedelta(days=d)
+            lines.append(
+                f"{_MENU_DAY_NAMES_RU[d]}, {_format_menu_date_ru(day_date)}"
+            )
+            for item in sorted(
+                items,
+                key=lambda x: _MENU_MEAL_ORDER.get(x.meal_type, 99),
+            ):
                 if item.recipe_id and item.recipe is not None:
                     body = f"[{item.recipe_id}] {item.recipe.title}"
                 elif item.free_text:
                     body = item.free_text
                 else:
                     continue
-                lines.append(f"    {item.meal_type}: {body}")
+                meal_label = _MENU_MEAL_LABELS_RU.get(item.meal_type, item.meal_type)
+                lines.append(f"{meal_label}: {body}")
+            lines.append("")
+        while lines and lines[-1] == "":
+            lines.pop()
         return "\n".join(lines)
 
     # ----------------------------------------------------------------
