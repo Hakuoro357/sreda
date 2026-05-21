@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from sreda.db.base import Base
 from sreda.db.models.core import Tenant, User
 from sreda.db.models.housewife import FamilyReminder
 from sreda.services.housewife_chat_tools import build_housewife_tools
 
 
-def _fresh_session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def _seed_fresh_session(session):
     session.add(Tenant(id="tenant_1", name="Test"))
     session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id="100"))
     session.commit()
@@ -25,8 +18,8 @@ def _tools_by_name(tools):
     return {t.name: t for t in tools}
 
 
-def test_schedule_reminder_creates_row() -> None:
-    session = _fresh_session()
+def test_schedule_reminder_creates_row(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     tools = _tools_by_name(
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
@@ -42,8 +35,8 @@ def test_schedule_reminder_creates_row() -> None:
     assert session.query(FamilyReminder).count() == 1
 
 
-def test_schedule_reminder_rejects_bad_datetime() -> None:
-    session = _fresh_session()
+def test_schedule_reminder_rejects_bad_datetime(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     tools = _tools_by_name(
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
@@ -56,8 +49,8 @@ def test_schedule_reminder_rejects_bad_datetime() -> None:
     assert session.query(FamilyReminder).count() == 0
 
 
-def test_schedule_reminder_rejects_bad_rrule() -> None:
-    session = _fresh_session()
+def test_schedule_reminder_rejects_bad_rrule(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     tools = _tools_by_name(
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
@@ -73,8 +66,8 @@ def test_schedule_reminder_rejects_bad_rrule() -> None:
     assert result.startswith("error:")
 
 
-def test_list_reminders_empty() -> None:
-    session = _fresh_session()
+def test_list_reminders_empty(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     tools = _tools_by_name(
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
@@ -84,8 +77,8 @@ def test_list_reminders_empty() -> None:
     assert "no active reminders" in result
 
 
-def test_list_reminders_returns_formatted_lines() -> None:
-    session = _fresh_session()
+def test_list_reminders_returns_formatted_lines(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     tools = _tools_by_name(
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
@@ -103,8 +96,8 @@ def test_list_reminders_returns_formatted_lines() -> None:
     assert "Second" in result
 
 
-def test_cancel_reminder_works_then_denies_second_time() -> None:
-    session = _fresh_session()
+def test_cancel_reminder_works_then_denies_second_time(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     tools = _tools_by_name(
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )
@@ -121,8 +114,8 @@ def test_cancel_reminder_works_then_denies_second_time() -> None:
     assert r2.startswith("error:")
 
 
-def test_cancel_reminder_unknown_id() -> None:
-    session = _fresh_session()
+def test_cancel_reminder_unknown_id(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     tools = _tools_by_name(
         build_housewife_tools(session=session, tenant_id="tenant_1", user_id="user_1")
     )

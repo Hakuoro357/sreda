@@ -5,10 +5,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from sreda.db.base import Base
 from sreda.db.models import checklists as _checklists_models  # noqa: F401
 from sreda.db.models.core import Tenant, User
 from sreda.services.housewife_reminders import (
@@ -18,18 +14,15 @@ from sreda.services.housewife_reminders import (
 )
 
 
-def _fresh_session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def _seed_fresh_session(session):
     session.add(Tenant(id="tenant_1", name="Test"))
     session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id="100"))
     session.commit()
     return session
 
 
-def test_schedule_oneshot_sets_pending_and_next_trigger() -> None:
-    session = _fresh_session()
+def test_schedule_oneshot_sets_pending_and_next_trigger(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     trigger_at = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
 
@@ -47,8 +40,8 @@ def test_schedule_oneshot_sets_pending_and_next_trigger() -> None:
     assert reminder.last_fired_at is None
 
 
-def test_schedule_weekly_rrule_preserved() -> None:
-    session = _fresh_session()
+def test_schedule_weekly_rrule_preserved(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     reminder = service.schedule(
@@ -63,11 +56,11 @@ def test_schedule_weekly_rrule_preserved() -> None:
     assert reminder.recurrence_rule == "FREQ=WEEKLY;BYDAY=TU;BYHOUR=16;BYMINUTE=0"
 
 
-def test_schedule_recurring_past_anchor_sets_next_future(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_schedule_recurring_past_anchor_sets_next_future(monkeypatch: pytest.MonkeyPatch, db_session) -> None:
     """Recurring reminder with a past dtstart must not become due immediately."""
     now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     reminder = service.schedule(
@@ -99,8 +92,8 @@ def test_initial_next_trigger_for_past_recurring_anchor_is_aware(
     assert next_at.tzinfo is UTC
 
 
-def test_schedule_rejects_invalid_rrule() -> None:
-    session = _fresh_session()
+def test_schedule_rejects_invalid_rrule(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     with pytest.raises(ValueError, match="invalid recurrence_rule"):
@@ -114,12 +107,12 @@ def test_schedule_rejects_invalid_rrule() -> None:
 
 
 def test_schedule_recurring_without_future_occurrence_rejects(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, db_session
 ) -> None:
     """Finite RRULEs whose only occurrence is in the past must not create rows."""
     now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     with pytest.raises(ValueError, match="no future occurrences"):
@@ -134,8 +127,8 @@ def test_schedule_recurring_without_future_occurrence_rejects(
     assert service.count_active(tenant_id="tenant_1") == 0
 
 
-def test_due_now_returns_past_pending_only() -> None:
-    session = _fresh_session()
+def test_due_now_returns_past_pending_only(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     service.schedule(
@@ -153,12 +146,12 @@ def test_due_now_returns_past_pending_only() -> None:
     assert due[0].title == "Past"
 
 
-def test_mark_fired_oneshot_first_fire_finalises() -> None:
+def test_mark_fired_oneshot_first_fire_finalises(db_session) -> None:
     """2026-04-23: single-fire mode (ESCALATION_MAX_FIRES=1) — первый и
     единственный fire сразу завершает one-shot reminder со status='fired',
     без re-ping'а через 2 минуты. Юзеры жаловались на дубли при v1.2
     политике, поэтому auto-escalation выключена."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     reminder = service.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -175,12 +168,12 @@ def test_mark_fired_oneshot_first_fire_finalises() -> None:
     assert reminder.escalation_count == 0
 
 
-def test_mark_fired_oneshot_final_fire_transitions_to_fired() -> None:
+def test_mark_fired_oneshot_final_fire_transitions_to_fired(db_session) -> None:
     """After ESCALATION_MAX_FIRES firings, the one-shot closes out:
     status='fired', escalation_count reset, next_trigger_at cleared."""
     from sreda.services.housewife_reminders import ESCALATION_MAX_FIRES
 
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     reminder = service.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -195,10 +188,10 @@ def test_mark_fired_oneshot_final_fire_transitions_to_fired() -> None:
     assert reminder.escalation_count == 0  # reset on finalize
 
 
-def test_acknowledge_oneshot_closes_without_reping() -> None:
+def test_acknowledge_oneshot_closes_without_reping(db_session) -> None:
     """User taps "Сделал ✅" on first ping → reminder goes to 'fired'
     immediately, no re-ping waits."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     reminder = service.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -216,10 +209,10 @@ def test_acknowledge_oneshot_closes_without_reping() -> None:
     assert reminder.escalation_count == 0
 
 
-def test_acknowledge_recurring_advances_without_reping() -> None:
+def test_acknowledge_recurring_advances_without_reping(db_session) -> None:
     """Acking a weekly reminder rolls to the next occurrence and
     clears the escalation counter without waiting for the re-ping."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
     reminder = service.schedule(
@@ -237,12 +230,12 @@ def test_acknowledge_recurring_advances_without_reping() -> None:
     assert reminder.escalation_count == 0
 
 
-def test_snooze_pushes_trigger_out_and_resets_escalation() -> None:
+def test_snooze_pushes_trigger_out_and_resets_escalation(db_session) -> None:
     """User taps "Отложить 10м ⏰" → next_trigger_at = now+10, counter
     resets so fresh escalation starts from re-ping #1 next time."""
     from sreda.services.housewife_reminders import SNOOZE_DEFAULT_MINUTES
 
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     reminder = service.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -260,11 +253,11 @@ def test_snooze_pushes_trigger_out_and_resets_escalation() -> None:
     assert _coerce_utc(reminder.next_trigger_at) == expected
 
 
-def test_mark_fired_recurring_first_fire_advances_to_next_week() -> None:
+def test_mark_fired_recurring_first_fire_advances_to_next_week(db_session) -> None:
     """2026-04-23: single-fire mode — recurring reminder сразу advance'ит
     next_trigger_at до следующей итерации (через RRULE, без +2min re-ping).
     Status остаётся 'pending', потому что recurring никогда не финалится."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
     reminder = service.schedule(
@@ -282,12 +275,12 @@ def test_mark_fired_recurring_first_fire_advances_to_next_week() -> None:
     assert _coerce_utc(reminder.next_trigger_at) == first_tuesday + timedelta(days=7)
 
 
-def test_mark_fired_recurring_final_fire_advances_next_week() -> None:
+def test_mark_fired_recurring_final_fire_advances_next_week(db_session) -> None:
     """After escalation caps out, recurring reminder rolls to next
     occurrence with escalation_count reset."""
     from sreda.services.housewife_reminders import ESCALATION_MAX_FIRES
 
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     first_tuesday = datetime(2026, 5, 5, 16, 0, tzinfo=UTC)
     reminder = service.schedule(
@@ -303,8 +296,8 @@ def test_mark_fired_recurring_final_fire_advances_next_week() -> None:
     assert _coerce_utc(reminder.next_trigger_at) == first_tuesday + timedelta(days=7)
 
 
-def test_cancel_sets_cancelled_status_and_clears_next_trigger() -> None:
-    session = _fresh_session()
+def test_cancel_sets_cancelled_status_and_clears_next_trigger(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     reminder = service.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -319,8 +312,8 @@ def test_cancel_sets_cancelled_status_and_clears_next_trigger() -> None:
     assert reminder.next_trigger_at is None
 
 
-def test_cancel_cross_tenant_denied() -> None:
-    session = _fresh_session()
+def test_cancel_cross_tenant_denied(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     reminder = service.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -332,8 +325,8 @@ def test_cancel_cross_tenant_denied() -> None:
     assert ok is False
 
 
-def test_list_active_excludes_fired_and_cancelled() -> None:
-    session = _fresh_session()
+def test_list_active_excludes_fired_and_cancelled(db_session) -> None:
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     rem1 = service.schedule(
         tenant_id="tenant_1", user_id="user_1",
@@ -391,14 +384,14 @@ def test_coerce_utc_tags_naive_as_utc() -> None:
     assert converted.hour == 10
 
 
-def test_schedule_with_msk_offset_fires_when_utc_due() -> None:
+def test_schedule_with_msk_offset_fires_when_utc_due(db_session) -> None:
     """Regression: MSK-offset reminder must become due at the correct
     UTC instant. Stores 13:30 MSK; worker at 12:30 UTC (=15:30 MSK)
     must see it as due because 10:30 UTC < 12:30 UTC."""
     from datetime import timezone as tz_mod
 
     msk = tz_mod(timedelta(hours=3))
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     service.schedule(
@@ -421,11 +414,11 @@ def test_schedule_with_msk_offset_fires_when_utc_due() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_update_changes_title_and_reembeds() -> None:
+def test_update_changes_title_and_reembeds(db_session) -> None:
     """Title change → row.title updated + embedding regenerated."""
     from unittest.mock import Mock
 
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     fake_ec = Mock()
     fake_ec.embed_document.side_effect = [
         [0.1] * 1024,  # на schedule
@@ -459,9 +452,9 @@ def test_update_changes_title_and_reembeds() -> None:
     assert _coerce_utc(updated.next_trigger_at) == datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
 
 
-def test_update_changes_trigger_resets_escalation() -> None:
+def test_update_changes_trigger_resets_escalation(db_session) -> None:
     """trigger_at change → next_trigger_at пересинхрон + escalation сброс."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     rem = service.schedule(
@@ -489,11 +482,11 @@ def test_update_changes_trigger_resets_escalation() -> None:
     assert updated.title == "X"
 
 
-def test_update_recurring_past_anchor_sets_next_future(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_update_recurring_past_anchor_sets_next_future(monkeypatch: pytest.MonkeyPatch, db_session) -> None:
     """Updating a recurring reminder to a past anchor must keep next_trigger_at future."""
     now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     rem = service.schedule(
         tenant_id="tenant_1",
@@ -516,12 +509,12 @@ def test_update_recurring_past_anchor_sets_next_future(monkeypatch: pytest.Monke
 
 
 def test_update_recurring_without_future_occurrence_does_not_mutate(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, db_session
 ) -> None:
     """Failed future-occurrence computation must leave the existing row unchanged."""
     now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     original_trigger = datetime(2026, 5, 21, 6, 0, tzinfo=UTC)
     rem = service.schedule(
@@ -546,12 +539,12 @@ def test_update_recurring_without_future_occurrence_does_not_mutate(
 
 
 def test_update_recurrence_rule_only_recomputes_next_trigger(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, db_session
 ) -> None:
     """Changing RRULE without trigger_at must align next_trigger_at to the new rule."""
     now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("sreda.services.housewife_reminders._utcnow", lambda: now)
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     rem = service.schedule(
         tenant_id="tenant_1",
@@ -572,9 +565,9 @@ def test_update_recurrence_rule_only_recomputes_next_trigger(
     assert updated.recurrence_rule == "FREQ=WEEKLY;BYDAY=FR;BYHOUR=6;BYMINUTE=0"
 
 
-def test_update_validates_recurrence_rule() -> None:
+def test_update_validates_recurrence_rule(db_session) -> None:
     """invalid RRULE → ValueError, row не меняется."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     rem = service.schedule(
@@ -597,9 +590,9 @@ def test_update_validates_recurrence_rule() -> None:
     assert rem.recurrence_rule == "FREQ=DAILY;BYHOUR=9"
 
 
-def test_update_clear_recurrence_makes_oneshot() -> None:
+def test_update_clear_recurrence_makes_oneshot(db_session) -> None:
     """clear_recurrence=True → recurrence_rule=NULL (one-shot)."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     rem = service.schedule(
@@ -620,9 +613,9 @@ def test_update_clear_recurrence_makes_oneshot() -> None:
     assert updated.recurrence_rule is None
 
 
-def test_update_returns_none_for_unknown_id() -> None:
+def test_update_returns_none_for_unknown_id(db_session) -> None:
     """Unknown reminder_id → None (не raise)."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     result = service.update(
@@ -633,14 +626,14 @@ def test_update_returns_none_for_unknown_id() -> None:
     assert result is None
 
 
-def test_update_rejects_non_pending_reminder() -> None:
+def test_update_rejects_non_pending_reminder(db_session) -> None:
     """fired/cancelled reminder → update returns None (HIGH guard).
 
     Без этой проверки cancel+update вернул бы row в active-like state
     (next_trigger_at + escalation_count=0) при том что worker
     его не подхватит. LLM получает «не найдено», что корректно с UX.
     """
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
 
     rem = service.schedule(
@@ -663,13 +656,13 @@ def test_update_rejects_non_pending_reminder() -> None:
     assert rem.title == "To cancel"  # без изменений
 
 
-def test_update_rejects_blank_title() -> None:
+def test_update_rejects_blank_title(db_session) -> None:
     """Пустая/whitespace-only title — ValueError (MEDIUM guard).
 
     None = «не трогай», явный пустой = программерская ошибка LLM
     (передал empty placeholder вместо реального текста).
     """
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     service = HousewifeReminderService(session)
     rem = service.schedule(
         tenant_id="tenant_1",
@@ -697,9 +690,9 @@ def test_update_rejects_blank_title() -> None:
     assert rem.title == "X"
 
 
-def test_update_isolates_tenants() -> None:
+def test_update_isolates_tenants(db_session) -> None:
     """Reminder из чужого tenant'а — None (security)."""
-    session = _fresh_session()
+    session = _seed_fresh_session(db_session)
     session.add(Tenant(id="tenant_2", name="Other"))
     session.add(User(id="user_2", tenant_id="tenant_2", telegram_account_id="200"))
     session.commit()

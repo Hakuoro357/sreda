@@ -217,3 +217,67 @@ def _clear_module_level_loop_bound_state():
         _CLIENT_POOL.clear()
     except ImportError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped test engine + per-test rollback fixture
+# ---------------------------------------------------------------------------
+# These replace the inline ``create_engine("sqlite:///:memory:")`` +
+# ``Base.metadata.create_all`` pattern that was duplicated in 100+ unit
+# tests and caused ~200-500 ms setup overhead per test.
+
+
+@pytest.fixture(scope="session")
+def _test_engine():
+    """Single :memory: SQLite engine shared across the whole test run.
+
+    ``StaticPool`` is required so that every ``engine.connect()`` returns
+    the *same* underlying DBAPI connection; otherwise each new connection
+    would see a fresh empty :memory: database.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    from sreda.db.base import Base
+
+    import sreda.db.models  # noqa: F401 — registers core tables
+    # These sub-modules are NOT imported by ``sreda.db.models.__init__``,
+    # so their tables would be missing from ``Base.metadata`` unless we
+    # import them explicitly here.
+    import sreda.db.models.audit  # noqa: F401
+    import sreda.db.models.checklists  # noqa: F401
+    import sreda.db.models.free_tier  # noqa: F401
+    import sreda.db.models.reply_buttons  # noqa: F401
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def db_session(_test_engine):
+    """Fresh SQLAlchemy session for each test, rolled back on teardown.
+
+    Uses an outer transaction (``conn.begin()``) owned by the fixture.
+    SQLAlchemy joins that transaction for the bound session; the final
+    ``trans.rollback()`` rewinds the DB to its pre-test state even when
+    code under test calls ``session.commit()``.
+    """
+    from sqlalchemy.orm import sessionmaker
+
+    conn = _test_engine.connect()
+    trans = conn.begin()
+    session = sessionmaker(bind=conn)()
+    try:
+        yield session
+    finally:
+        session.close()
+        trans.rollback()
+        conn.close()

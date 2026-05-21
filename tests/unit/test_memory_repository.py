@@ -3,28 +3,18 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from sreda.db.base import Base
 from sreda.db.models.core import Tenant, User
 from sreda.db.repositories.memory import MemoryRepository
 from sreda.services.embeddings import FakeEmbeddingClient
 
 
 @pytest.fixture()
-def session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    sess = sessionmaker(bind=engine)()
-    sess.add(Tenant(id="t1", name="T"))
-    sess.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
-    sess.add(User(id="u2", tenant_id="t1", telegram_account_id="99"))
-    sess.commit()
-    try:
-        yield sess
-    finally:
-        sess.close()
+def session(db_session):
+    db_session.add(Tenant(id="t1", name="T"))
+    db_session.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
+    db_session.add(User(id="u2", tenant_id="t1", telegram_account_id="99"))
+    db_session.commit()
+    return db_session
 
 
 @pytest.fixture()

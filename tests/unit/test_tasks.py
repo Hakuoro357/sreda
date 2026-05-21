@@ -10,25 +10,17 @@ from __future__ import annotations
 from datetime import date, time
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from sreda.db.base import Base
 from sreda.db.models.core import Tenant, User
 from sreda.db.models.tasks import Task
 from sreda.services.tasks import TaskService
 
 
 @pytest.fixture
-def session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    sess = sessionmaker(bind=engine)()
-    sess.add(Tenant(id="t1", name="Test"))
-    sess.add(User(id="u1", tenant_id="t1", telegram_account_id="100"))
-    sess.commit()
-    yield sess
-    sess.close()
+def session(db_session):
+    db_session.add(Tenant(id="t1", name="Test"))
+    db_session.add(User(id="u1", tenant_id="t1", telegram_account_id="100"))
+    db_session.commit()
+    return db_session
 
 
 # ---------------------------------------------------------------------------
