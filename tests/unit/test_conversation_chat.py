@@ -579,6 +579,263 @@ def test_conversation_uses_structured_menu_render_after_list_menu(
     assert "Ужин: плов Вторник" not in edited_texts[-1]
 
 
+def test_conversation_uses_structured_menu_render_after_plan_week_menu(
+    monkeypatch, tmp_path: Path
+):
+    session = _bootstrap(monkeypatch, tmp_path, "conv_menu_plan_render.db")
+    try:
+        monkeypatch.setattr(
+            "sreda.runtime.handlers._resolve_chat_feature_key",
+            lambda _session, _tenant_id: "housewife_assistant",
+        )
+
+        glued_bad_final = (
+            "Готово, меню составлено ✅ Пятница, 24 апреля:\n"
+            "• Завтрак: блины\n"
+            "• Обед: суп\n"
+            "• Ужин: плов Суббота, 25 апреля:\n"
+            "• Завтрак: творог\n"
+            "• Обед: борщ\n"
+            "• Ужин: рыба Собрать список покупок?"
+        )
+        scripted = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "plan_week_menu",
+                        "args": {
+                            "week_start": "2026-04-20",
+                            "days": [
+                                {
+                                    "day_of_week": 4,
+                                    "meals": {
+                                        "breakfast": {"free_text": "блины"},
+                                        "lunch": {"free_text": "суп"},
+                                        "dinner": {"free_text": "плов"},
+                                    },
+                                },
+                                {
+                                    "day_of_week": 5,
+                                    "meals": {
+                                        "breakfast": {"free_text": "творог"},
+                                        "lunch": {"free_text": "борщ"},
+                                        "dinner": {"free_text": "рыба"},
+                                    },
+                                },
+                            ],
+                        },
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+                additional_kwargs={"reasoning_content": "thinking trace"},
+            ),
+            AIMessage(content=glued_bad_final),
+        ]
+        telegram = FakeTelegram()
+
+        from sreda.services.ack_progress import TelegramAckProgressController
+
+        ack_progress = TelegramAckProgressController(
+            telegram_client=telegram,
+            chat_id="100000001",
+            ack_message_id_future=555,
+            enabled=True,
+        )
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=StreamingFinalFakeLLM(scripted),
+            embedding_client=ConstantEmbeddingClient(),
+            ack_progress_controller=ack_progress,
+        )
+        queued = svc.enqueue_action(_chat_envelope("составь меню на выходные"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    expected = (
+        "Меню на неделю 20–26 апреля:\n\n"
+        "Пятница, 24 апреля\n"
+        "• Завтрак: блины\n"
+        "• Обед: суп\n"
+        "• Ужин: плов\n\n"
+        "Суббота, 25 апреля\n"
+        "• Завтрак: творог\n"
+        "• Обед: борщ\n"
+        "• Ужин: рыба\n\n"
+        "Собрать список покупок?"
+    )
+    edited_texts = [item["text"] for item in telegram.edited]
+    assert telegram.sent == []
+    assert edited_texts[-1] == expected
+    assert "Ужин: плов Суббота" not in edited_texts[-1]
+
+
+def test_conversation_menu_plan_render_allows_family_read_tool(
+    monkeypatch, tmp_path: Path
+):
+    session = _bootstrap(monkeypatch, tmp_path, "conv_menu_plan_family_read.db")
+    try:
+        monkeypatch.setattr(
+            "sreda.runtime.handlers._resolve_chat_feature_key",
+            lambda _session, _tenant_id: "housewife_assistant",
+        )
+
+        scripted = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_family_members",
+                        "args": {},
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "plan_week_menu",
+                        "args": {
+                            "week_start": "2026-04-20",
+                            "days": [
+                                {
+                                    "day_of_week": 4,
+                                    "meals": {
+                                        "breakfast": {"free_text": "блины"},
+                                        "lunch": {"free_text": "суп"},
+                                        "dinner": {"free_text": "плов"},
+                                    },
+                                },
+                            ],
+                        },
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+            ),
+            AIMessage(
+                content=(
+                    "Готово ✅ Пятница, 24 апреля:\n"
+                    "• Завтрак: блины\n"
+                    "• Обед: суп\n"
+                    "• Ужин: плов Собрать список покупок?"
+                )
+            ),
+        ]
+        telegram = FakeTelegram()
+
+        from sreda.services.ack_progress import TelegramAckProgressController
+
+        ack_progress = TelegramAckProgressController(
+            telegram_client=telegram,
+            chat_id="100000001",
+            ack_message_id_future=555,
+            enabled=True,
+        )
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=StreamingFinalFakeLLM(scripted),
+            embedding_client=ConstantEmbeddingClient(),
+            ack_progress_controller=ack_progress,
+        )
+        queued = svc.enqueue_action(_chat_envelope("составь меню на пятницу"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    edited_texts = [item["text"] for item in telegram.edited]
+    assert edited_texts[-1] == (
+        "Меню на неделю 20–26 апреля:\n\n"
+        "Пятница, 24 апреля\n"
+        "• Завтрак: блины\n"
+        "• Обед: суп\n"
+        "• Ужин: плов\n\n"
+        "Собрать список покупок?"
+    )
+
+
+def test_conversation_menu_plan_render_does_not_hide_other_mutations(
+    monkeypatch, tmp_path: Path
+):
+    session = _bootstrap(monkeypatch, tmp_path, "conv_menu_plan_other_mutation.db")
+    try:
+        monkeypatch.setattr(
+            "sreda.runtime.handlers._resolve_chat_feature_key",
+            lambda _session, _tenant_id: "housewife_assistant",
+        )
+
+        final_text = "Готово: меню составлено, молоко добавила в покупки."
+        scripted = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "plan_week_menu",
+                        "args": {
+                            "week_start": "2026-04-20",
+                            "days": [
+                                {
+                                    "day_of_week": 4,
+                                    "meals": {
+                                        "breakfast": {"free_text": "блины"},
+                                        "lunch": {"free_text": "суп"},
+                                        "dinner": {"free_text": "плов"},
+                                    },
+                                },
+                            ],
+                        },
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    },
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "add_shopping_items",
+                        "args": {
+                            "items": [
+                                {"title": "молоко", "category": "молочные"}
+                            ]
+                        },
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    },
+                ],
+            ),
+            AIMessage(content=final_text),
+        ]
+        telegram = FakeTelegram()
+
+        from sreda.services.ack_progress import TelegramAckProgressController
+
+        ack_progress = TelegramAckProgressController(
+            telegram_client=telegram,
+            chat_id="100000001",
+            ack_message_id_future=555,
+            enabled=True,
+        )
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=StreamingFinalFakeLLM(scripted),
+            embedding_client=ConstantEmbeddingClient(),
+            ack_progress_controller=ack_progress,
+        )
+        queued = svc.enqueue_action(
+            _chat_envelope("составь меню на пятницу и добавь молоко")
+        )
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    edited_texts = [item["text"] for item in telegram.edited]
+    assert edited_texts[-1] == final_text
+    assert "Меню на неделю 20–26 апреля" not in edited_texts[-1]
+
+
 def test_menu_display_render_intent_stays_week_scope_only():
     from sreda.runtime.handlers import _is_menu_display_read_intent
 

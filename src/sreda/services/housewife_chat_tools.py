@@ -251,10 +251,9 @@ def build_housewife_tools(
     None falls back to legacy behaviour (items без embedding,
     backfill подхватит позже).
 
-    ``menu_display_state``: optional mutable dict for the read-only
-    ``list_menu`` user-facing renderer. ``execute_conversation_chat``
-    can use it to avoid trusting a post-tool LLM rewrite for menu
-    display turns.
+    ``menu_display_state``: optional mutable dict for user-facing menu
+    rendering. ``execute_conversation_chat`` can use it to avoid
+    trusting a post-tool LLM rewrite for menu display / creation turns.
     """
 
     service = HousewifeReminderService(session, embedding_client=embedding_client)
@@ -1312,6 +1311,13 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("plan_week_menu failed")
             return "error: internal"
+        if menu_display_state is not None:
+            menu_display_state["plan_week_menu_calls"] = (
+                int(menu_display_state.get("plan_week_menu_calls") or 0) + 1
+            )
+            menu_display_state["last_planned_menu_reply_text"] = (
+                _format_menu_plan_for_user(plan)
+            )
         return f"ok:plan_created:{plan.id}:{plan.week_start_date.isoformat()}"
 
     @_write_lc_tool

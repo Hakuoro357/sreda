@@ -3126,6 +3126,34 @@ async def execute_conversation_chat(
     if (
         feature_key == "housewife_assistant"
         and menu_display_state
+        and "plan_week_menu" in called_tools
+        and called_tools <= {
+            "list_menu",
+            "search_recipes",
+            "list_family_members",
+            "recall_memory",
+            "plan_week_menu",
+        }
+        and menu_display_state.get("plan_week_menu_calls") == 1
+    ):
+        rendered_menu_text = menu_display_state.get("last_planned_menu_reply_text")
+        if isinstance(rendered_menu_text, str) and rendered_menu_text.strip():
+            logger.info(
+                "chat: planned menu rendered from structured plan_week_menu "
+                "tenant=%s feature=%s original_chars=%d rendered_chars=%d",
+                action.tenant_id, feature_key, len(text), len(rendered_menu_text),
+            )
+            with trace.step(
+                "chat.menu_plan_rendered",
+                original_chars=len(text),
+                rendered_chars=len(rendered_menu_text),
+            ):
+                pass
+            text = rendered_menu_text
+
+    if (
+        feature_key == "housewife_assistant"
+        and menu_display_state
         and called_tools == {"list_menu"}
         and menu_display_state.get("list_menu_calls") == 1
         and _is_menu_display_read_intent(user_text)
