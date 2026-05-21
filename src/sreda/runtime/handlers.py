@@ -2599,6 +2599,7 @@ async def execute_conversation_chat(
                 if not _stream_visible_text or _ack_progress is None:
                     return
                 try:
+                    text = _format_week_menu_reply(text)
                     _ack_progress.schedule_stream_text(
                         text,
                         min_interval_seconds=(
@@ -2971,6 +2972,7 @@ async def execute_conversation_chat(
     #      reply — artefact of the Xiaomi training corpus. Strip the
     #      offending glyphs and log a warning so we can monitor rate.
     text, _sanitize_stats = _sanitize_chat_reply(text)
+    text = _format_week_menu_reply(text)
     if _sanitize_stats["cjk_stripped"]:
         logger.warning(
             "CHAT_CJK_LEAK tenant=%s feature=%s chars=%d",
@@ -3650,6 +3652,39 @@ def _sanitize_chat_reply(text: str) -> tuple[str, dict[str, int]]:
         stats["cjk_stripped"] = cjk_chars
 
     return new_text, stats
+
+
+_WEEKDAY_HEADING_RE = re.compile(
+    r"(?<!^)(?<!\n)\s+"
+    r"(Понедельник|Вторник|Среда|Четверг|Пятница|Суббота|Воскресенье)"
+    r":?"
+    r"(?=\n[—-]\s*(?:Завтрак|Обед|Ужин)\b)"
+)
+_WEEKDAY_LINE_RE = re.compile(
+    r"(?m)^(Понедельник|Вторник|Среда|Четверг|Пятница|Суббота|Воскресенье):?\s*$"
+)
+_MENU_FOLLOWUP_RE = re.compile(
+    r"(\n[—-]\s*Ужин:[^\n]+?)\s+"
+    r"(?=(?:Хочешь|Если хочешь|Могу|Нужно)\b)"
+)
+
+
+def _format_week_menu_reply(text: str) -> str:
+    """Stabilize week-menu layout for streaming and final ack edits.
+
+    MiMo often returns weekly menus as ``... ужин Вторник\n— Завтрак``.
+    During streaming this can temporarily look separated, then collapse
+    on final edit. Normalize only menu-like replies: day headings start
+    on their own line, with a blank line before each day.
+    """
+    if not text or not re.search(r"[—-]\s*(?:Завтрак|Обед|Ужин)\b", text):
+        return text
+
+    formatted = _WEEKDAY_HEADING_RE.sub(r"\n\n\1:", text)
+    formatted = _WEEKDAY_LINE_RE.sub(r"\1:", formatted)
+    formatted = _MENU_FOLLOWUP_RE.sub(r"\1\n\n", formatted)
+    formatted = re.sub(r"\n{3,}", "\n\n", formatted)
+    return formatted.strip()
 
 
 # ---------------------------------------------------------------------------
