@@ -385,7 +385,7 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             await ack_progress.drain()
             if hasattr(ack_progress, "keep_stream_partial_visible"):
                 await ack_progress.keep_stream_partial_visible(reply["text"])
-            ack_message_id = await ack_progress.ack_message_id()
+            ack_message_id = await ack_progress.ack_message_id(timeout_seconds=10.0)
             if ack_message_id:
                 payload["_ack_edit_message_id"] = str(ack_message_id)
                 if (

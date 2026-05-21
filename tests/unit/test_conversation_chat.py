@@ -37,6 +37,7 @@ from sreda.features.skill_contracts import (
 )
 from sreda.runtime.dispatcher import ActionEnvelope, _resolve_command_action
 from sreda.runtime.executor import ActionRuntimeService
+from sreda.services.ack_messages import FINAL_PROGRESS_TEXT
 
 
 TEST_CHAT_FEATURE_KEY = "test_chat_skill"
@@ -472,6 +473,7 @@ def test_conversation_streams_final_answer_into_ack_after_tool_call(
         for text in edited_texts
     )
     assert edited_texts[-1] == "Запомнил — дочь Маша, 9 лет."
+    assert FINAL_PROGRESS_TEXT not in edited_texts
 
 
 def test_conversation_streams_plain_final_answer_into_ack(
@@ -510,6 +512,7 @@ def test_conversation_streams_plain_final_answer_into_ack(
     )
     assert edited_texts[-1] == "Привет, Борис! Чем могу помочь?"
     assert edited_texts.count("Привет, Борис! Чем могу помочь?") == 1
+    assert FINAL_PROGRESS_TEXT not in edited_texts
 
 
 def test_conversation_max_waits_before_final_ack_edit_outbox(
