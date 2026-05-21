@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from sreda.eval.llm_eval_v2_report import build_json_report, build_markdown_report
-from sreda.eval.llm_eval_v2_runner import FakeLLMResponse, run_scenario_with_fake_llm
+from sreda.eval.llm_eval_v2_runner import (
+    FakeLLMResponse,
+    JournalEntry,
+    run_scenario_with_fake_llm,
+)
 from sreda.eval.llm_eval_v2_scenarios import (
     FROZEN_NOW,
     CoreScenario,
@@ -26,6 +30,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--json-out", required=True)
     parser.add_argument("--markdown-out", required=True)
+    parser.add_argument(
+        "--full-loop",
+        action="store_true",
+        help="After stub tool execution, ask the LLM for a final user-visible reply.",
+    )
     args = parser.parse_args(argv)
 
     if args.runs < 1:
@@ -47,6 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     scenario,
                     fake_llm=provider(scenario),
                     provider=args.only_provider,
+                    full_loop=args.full_loop,
                 )
             )
 
@@ -73,6 +83,9 @@ class _HappyPathFakeLLM:
             text=_happy_text(self._scenario),
         )
 
+    def invoke_final_response(self, _messages, _state, _journal) -> FakeLLMResponse:
+        return FakeLLMResponse(tool_calls=(), text=_happy_text(self._scenario))
+
 
 class _LiveProviderFactory:
     def __init__(self, provider: str) -> None:
@@ -91,6 +104,17 @@ class _LiveScenarioLLM:
 
     def invoke_turn(self, messages, _state) -> FakeLLMResponse:
         response = self._bound_llm.invoke(_messages_for_llm(messages, state=_state))
+        return _coerce_response(response)
+
+    def invoke_final_response(
+        self,
+        messages: tuple[str, ...],
+        state: ExpectedState,
+        journal: tuple[JournalEntry, ...],
+    ) -> FakeLLMResponse:
+        response = self._bound_llm.invoke(
+            _final_messages_for_llm(messages, state=state, journal=journal)
+        )
         return _coerce_response(response)
 
 
@@ -163,6 +187,39 @@ def _messages_for_llm(
     return messages
 
 
+def _final_messages_for_llm(
+    user_messages: tuple[str, ...],
+    *,
+    state: ExpectedState,
+    journal: tuple[JournalEntry, ...],
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                "Ты Среда. Отвечай по-русски. Инструменты уже выполнены. "
+                "Сейчас нельзя вызывать tools: сформулируй только финальный "
+                "ответ пользователю по результатам выполненных инструментов.\n"
+                f"Текущее время: {FROZEN_NOW.isoformat()}.\n"
+                f"Текущее состояние фикстуры: {_state_for_prompt(state)}"
+            ),
+        }
+    ]
+    for message in user_messages:
+        messages.append({"role": "user", "content": message})
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Результаты выполненных инструментов:\n"
+                f"{_journal_for_prompt(journal)}\n"
+                "Сформулируй финальный ответ пользователю."
+            ),
+        }
+    )
+    return messages
+
+
 def _coerce_response(response: Any) -> FakeLLMResponse:
     raw_tool_calls = _get_response_value(response, "tool_calls") or []
     tool_calls: list[dict[str, Any]] = []
@@ -200,6 +257,20 @@ def _state_for_prompt(state: ExpectedState) -> str:
             "reminders": reminders,
             "shopping": list(state.shopping),
         },
+        ensure_ascii=False,
+    )
+
+
+def _journal_for_prompt(journal: tuple[JournalEntry, ...]) -> str:
+    return json.dumps(
+        [
+            {
+                "tool_name": entry.tool_name,
+                "args": entry.args,
+                "result": entry.result,
+            }
+            for entry in journal
+        ],
         ensure_ascii=False,
     )
 

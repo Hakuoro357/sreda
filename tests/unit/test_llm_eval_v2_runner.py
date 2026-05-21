@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from sreda.eval.llm_eval_v2_runner import (
     FakeLLMResponse,
+    JournalEntry,
     run_scenario_with_fake_llm,
 )
 from sreda.eval.llm_eval_v2_scenarios import ExpectedState, ReminderState
@@ -16,6 +17,20 @@ class _FakeLLM:
 
     def invoke_turn(self, _messages, _state):
         return self.responses.pop(0)
+
+
+@dataclass
+class _FullLoopFakeLLM:
+    first_response: FakeLLMResponse
+    final_response: FakeLLMResponse
+    final_calls: list[tuple[tuple[str, ...], ExpectedState, tuple[JournalEntry, ...]]]
+
+    def invoke_turn(self, _messages, _state):
+        return self.first_response
+
+    def invoke_final_response(self, messages, state, journal):
+        self.final_calls.append((messages, state, journal))
+        return self.final_response
 
 
 def schedule_ok_llm() -> _FakeLLM:
@@ -178,6 +193,112 @@ def test_runner_returns_fail_for_invalid_tool_args() -> None:
 
     assert result.verdict == "FAIL"
     assert result.failure_reason == "invalid_tool_args"
+
+
+def test_runner_full_loop_uses_final_response_after_tool_results() -> None:
+    scenario = scenario_by_id("one_shot_reminder")
+    fake_llm = _FullLoopFakeLLM(
+        first_response=FakeLLMResponse(
+            tool_calls=(
+                {
+                    "name": "schedule_reminder",
+                    "args": {
+                        "title": "Поймать ежика",
+                        "trigger_iso": "2026-05-21T11:00:00+03:00",
+                    },
+                },
+            ),
+            text="",
+        ),
+        final_response=FakeLLMResponse(
+            tool_calls=(),
+            text="Готово, поставила напоминание.",
+        ),
+        final_calls=[],
+    )
+
+    result = run_scenario_with_fake_llm(
+        scenario,
+        fake_llm=fake_llm,
+        full_loop=True,
+    )
+
+    assert result.verdict == "PASS"
+    assert result.final_text == "Готово, поставила напоминание."
+    assert len(fake_llm.final_calls) == 1
+    _messages, state, journal = fake_llm.final_calls[0]
+    assert state == scenario.expected_final_state
+    assert journal == (
+        JournalEntry(
+            "schedule_reminder",
+            {
+                "title": "Поймать ежика",
+                "trigger_iso": "2026-05-21T11:00:00+03:00",
+            },
+            "ok:scheduled",
+        ),
+    )
+
+
+def test_runner_default_mode_does_not_invoke_final_response() -> None:
+    scenario = scenario_by_id("one_shot_reminder")
+    fake_llm = _FullLoopFakeLLM(
+        first_response=FakeLLMResponse(
+            tool_calls=(
+                {
+                    "name": "schedule_reminder",
+                    "args": {
+                        "title": "Поймать ежика",
+                        "trigger_iso": "2026-05-21T11:00:00+03:00",
+                    },
+                },
+            ),
+            text="Готово, поставила напоминание.",
+        ),
+        final_response=FakeLLMResponse(
+            tool_calls=(),
+            text="Это не должно использоваться.",
+        ),
+        final_calls=[],
+    )
+
+    result = run_scenario_with_fake_llm(scenario, fake_llm=fake_llm)
+
+    assert result.verdict == "PASS"
+    assert result.final_text == "Готово, поставила напоминание."
+    assert fake_llm.final_calls == []
+
+
+def test_runner_full_loop_rejects_tool_call_in_final_response() -> None:
+    scenario = scenario_by_id("one_shot_reminder")
+    fake_llm = _FullLoopFakeLLM(
+        first_response=FakeLLMResponse(
+            tool_calls=(
+                {
+                    "name": "schedule_reminder",
+                    "args": {
+                        "title": "Поймать ежика",
+                        "trigger_iso": "2026-05-21T11:00:00+03:00",
+                    },
+                },
+            ),
+            text="",
+        ),
+        final_response=FakeLLMResponse(
+            tool_calls=({"name": "list_reminders", "args": {}},),
+            text="Сейчас посмотрю.",
+        ),
+        final_calls=[],
+    )
+
+    result = run_scenario_with_fake_llm(
+        scenario,
+        fake_llm=fake_llm,
+        full_loop=True,
+    )
+
+    assert result.verdict == "FAIL"
+    assert result.failure_reason == "unexpected_final_tool_call"
 
 
 def test_update_reminder_preserves_other_reminders() -> None:

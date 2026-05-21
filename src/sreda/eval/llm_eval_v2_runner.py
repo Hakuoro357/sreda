@@ -45,6 +45,15 @@ class FakeLLM(Protocol):
     def invoke_turn(self, messages: tuple[str, ...], state: ExpectedState) -> FakeLLMResponse:
         ...
 
+    def invoke_final_response(
+        self,
+        messages: tuple[str, ...],
+        state: ExpectedState,
+        journal: tuple[JournalEntry, ...],
+    ) -> FakeLLMResponse:
+        ...
+
+
 def run_scenario_with_fake_llm(
     scenario: CoreScenario,
     *,
@@ -52,6 +61,7 @@ def run_scenario_with_fake_llm(
     provider: str = "fake",
     initial_state: ExpectedState | None = None,
     expected_state: ExpectedState | None = None,
+    full_loop: bool = False,
 ) -> ScenarioResult:
     state = initial_state or _fixture_state(scenario.fixture)
     target_state = expected_state or scenario.expected_final_state
@@ -93,6 +103,26 @@ def run_scenario_with_fake_llm(
                     provider=provider,
                 )
             journal.append(entry)
+        if full_loop and response.tool_calls:
+            final_response = _invoke_final_response(
+                fake_llm,
+                scenario.user_messages[: turn_index + 1],
+                state,
+                tuple(journal),
+            )
+            final_text = final_response.text
+            if final_response.tool_calls:
+                return ScenarioResult(
+                    scenario_id=scenario.id,
+                    verdict="FAIL",
+                    failure_reason="unexpected_final_tool_call",
+                    before_state=before_state,
+                    after_state=state,
+                    tool_calls_per_turn=tuple(observed_calls),
+                    journal=tuple(journal),
+                    final_text=final_text,
+                    provider=provider,
+                )
 
     if state != target_state:
         return ScenarioResult(
@@ -130,6 +160,18 @@ def run_scenario_with_fake_llm(
         final_text=final_text,
         provider=provider,
     )
+
+
+def _invoke_final_response(
+    fake_llm: FakeLLM,
+    messages: tuple[str, ...],
+    state: ExpectedState,
+    journal: tuple[JournalEntry, ...],
+) -> FakeLLMResponse:
+    invoke_final = getattr(fake_llm, "invoke_final_response", None)
+    if invoke_final is None:
+        raise TypeError("full_loop=True requires invoke_final_response")
+    return invoke_final(messages, state, journal)
 
 
 def _fixture_state(fixture: str) -> ExpectedState:

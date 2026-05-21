@@ -33,6 +33,31 @@ def test_cli_fake_provider_writes_reports(tmp_path) -> None:
     assert "## Core LLM Score" in markdown_out.read_text(encoding="utf-8")
 
 
+def test_cli_fake_provider_supports_full_loop(tmp_path) -> None:
+    json_out = tmp_path / "report.json"
+    markdown_out = tmp_path / "report.md"
+
+    exit_code = main(
+        [
+            "--only-provider",
+            "fake",
+            "--only-scenario",
+            "one_shot_reminder",
+            "--full-loop",
+            "--json-out",
+            str(json_out),
+            "--markdown-out",
+            str(markdown_out),
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(json_out.read_text(encoding="utf-8"))
+    assert report["summary"]["core_denominator"] == 1
+    assert report["summary"]["core_passed"] == 1
+    assert report["core_llm"][0]["final_text"] == "Готово."
+
+
 def test_cli_live_provider_uses_get_chat_llm(monkeypatch, tmp_path) -> None:
     calls = []
 
@@ -84,6 +109,60 @@ def test_cli_live_provider_uses_get_chat_llm(monkeypatch, tmp_path) -> None:
     assert report["summary"]["core_denominator"] == 1
     assert report["summary"]["core_passed"] == 1
     assert report["core_llm"][0]["provider"] == "mimo-v2.5"
+
+
+def test_cli_full_loop_live_provider_invokes_final_response(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    class BoundFake:
+        def invoke(self, messages):
+            calls.append(messages)
+            if len(calls) == 1:
+                return {
+                    "tool_calls": [
+                        {
+                            "name": "schedule_reminder",
+                            "args": {
+                                "title": "Поймать ежика",
+                                "trigger_iso": "2026-05-21T11:00:00+03:00",
+                            },
+                        }
+                    ],
+                    "content": "",
+                }
+            return {"tool_calls": [], "content": "Готово, поставила напоминание."}
+
+    class ProviderFake:
+        def bind_tools(self, _tools):
+            return BoundFake()
+
+    def fake_get_chat_llm(*, provider=None, **_kwargs):
+        assert provider == "mimo-v2.5"
+        return ProviderFake()
+
+    monkeypatch.setattr(llm_eval_v2, "get_chat_llm", fake_get_chat_llm)
+    json_out = tmp_path / "report.json"
+    markdown_out = tmp_path / "report.md"
+
+    exit_code = main(
+        [
+            "--only-provider",
+            "mimo-v2.5",
+            "--only-scenario",
+            "one_shot_reminder",
+            "--full-loop",
+            "--json-out",
+            str(json_out),
+            "--markdown-out",
+            str(markdown_out),
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 2
+    assert "Результаты выполненных инструментов" in calls[1][-1]["content"]
+    report = json.loads(json_out.read_text(encoding="utf-8"))
+    assert report["summary"]["core_passed"] == 1
 
 
 def test_cli_rejects_removed_deprecated_negative_flag(tmp_path) -> None:
