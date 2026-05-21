@@ -35,8 +35,6 @@ from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
-logger = logging.getLogger(__name__)
-
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -50,12 +48,14 @@ from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryE
 from sreda.runtime.delivery_policy import DeliveryKind, decide_delivery
 from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.graph_state import AssistantGraphState
-from sreda.runtime.handlers import HANDLERS, ActionRuntimeError, RuntimeReply
+from sreda.runtime.handlers import HANDLERS, ActionRuntimeError
 from sreda.runtime.policy import evaluate_policy
 from sreda.services import trace
 from sreda.services.billing import BillingService
 from sreda.services.embeddings import EmbeddingClient
 from sreda.services.privacy_guard import get_default_privacy_guard
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -81,6 +81,10 @@ def _session(config: dict) -> Session:
 
 def _telegram(config: dict) -> TelegramClient | None:
     return config["configurable"].get("telegram_client")
+
+
+def _ack_progress(config: dict) -> Any | None:
+    return config["configurable"].get("ack_progress_controller")
 
 
 def _action(state: AssistantGraphState) -> ActionEnvelope:
@@ -297,6 +301,7 @@ def node_execute_action(state: AssistantGraphState, config: RunnableConfig) -> d
     context["_memories"] = state.get("memories") or []
     context["_llm_client"] = config["configurable"].get("llm_client")
     context["_embedding_client"] = config["configurable"].get("embedding_client")
+    context["_ack_progress_controller"] = _ack_progress(config)
     # Phase 4.5: run_id flows into context so the conversation handler
     # can attribute LLM usage to this specific AgentRun in
     # skill_ai_executions.
@@ -334,6 +339,7 @@ def node_execute_action(state: AssistantGraphState, config: RunnableConfig) -> d
 async def node_persist_replies(state: AssistantGraphState, config: RunnableConfig) -> dict:
     session = _session(config)
     telegram = _telegram(config)
+    ack_progress = _ack_progress(config)
     action = _action(state)
     run = session.get(AgentRun, state["run_id"])
     job = session.get(Job, state["job_id"])
@@ -368,6 +374,17 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             "text": reply["text"],
             "reply_markup": reply["reply_markup"],
         }
+        if (
+            ack_progress is not None
+            and action.outbox_channel == "max"
+            and getattr(ack_progress, "enabled", False)
+        ):
+            await ack_progress.drain()
+            ack_message_id = await ack_progress.ack_message_id()
+            if ack_message_id:
+                payload["_ack_edit_message_id"] = str(ack_message_id)
+                if hasattr(ack_progress, "mark_final_edit_planned"):
+                    ack_progress.mark_final_edit_planned()
         if _trace_ctx is not None and not _trace_stashed:
             payload["_trace"] = trace.serialize_for_outbox(_trace_ctx)
             _trace_stashed = True
@@ -420,12 +437,24 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             if action.outbox_channel == "telegram":
                 if telegram is not None:
                     try:
-                        response = await telegram.send_message(
-                            chat_id=action.external_chat_id,
-                            text=reply["text"],
-                            reply_markup=reply["reply_markup"],
-                        )
-                        outbox.status = "sent"
+                        if (
+                            ack_progress is not None
+                            and getattr(ack_progress, "enabled", False)
+                        ):
+                            result_status = await ack_progress.edit_final_or_fallback(
+                                reply["text"],
+                                reply_markup=reply["reply_markup"],
+                            )
+                            response = {}
+                            if result_status in {"edited", "fallback_sent"}:
+                                outbox.status = "sent"
+                        else:
+                            response = await telegram.send_message(
+                                chat_id=action.external_chat_id,
+                                text=reply["text"],
+                                reply_markup=reply["reply_markup"],
+                            )
+                            outbox.status = "sent"
                         result = response.get("result") if isinstance(response, dict) else None
                         if isinstance(result, dict):
                             mid = result.get("message_id")
@@ -542,26 +571,35 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
     err_tg_date: int | None = None
     # Inline-send только для telegram (см. node_persist_replies). MAX
     # error-replies идут через worker, status='pending' остаётся.
+    ack_progress = _ack_progress(config)
     if action.outbox_channel == "telegram" and telegram is not None:
         try:
-            err_response = await telegram.send_message(
-                chat_id=action.external_chat_id,
-                text=sanitized_message,
-                reply_markup=reply_markup,
-            )
-            outbox.status = "sent"
-            # Stage 9.1: capture TG-side ids for symmetry with the
-            # success-path. Diagnostic «когда ack приходит после реплая»
-            # должна работать и для error-replies (они редкие, но именно
-            # при инцидентах нужна максимальная видимость).
-            err_result = err_response.get("result") if isinstance(err_response, dict) else None
-            if isinstance(err_result, dict):
-                mid = err_result.get("message_id")
-                date_v = err_result.get("date")
-                if isinstance(mid, int):
-                    err_tg_message_id = mid
-                if isinstance(date_v, int):
-                    err_tg_date = date_v
+            if ack_progress is not None and getattr(ack_progress, "enabled", False):
+                result_status = await ack_progress.edit_final_or_fallback(
+                    sanitized_message,
+                    reply_markup=reply_markup,
+                )
+                if result_status in {"edited", "fallback_sent"}:
+                    outbox.status = "sent"
+            else:
+                err_response = await telegram.send_message(
+                    chat_id=action.external_chat_id,
+                    text=sanitized_message,
+                    reply_markup=reply_markup,
+                )
+                outbox.status = "sent"
+                # Stage 9.1: capture TG-side ids for symmetry with the
+                # success-path. Diagnostic «когда ack приходит после реплая»
+                # должна работать и для error-replies (они редкие, но именно
+                # при инцидентах нужна максимальная видимость).
+                err_result = err_response.get("result") if isinstance(err_response, dict) else None
+                if isinstance(err_result, dict):
+                    mid = err_result.get("message_id")
+                    date_v = err_result.get("date")
+                    if isinstance(mid, int):
+                        err_tg_message_id = mid
+                    if isinstance(date_v, int):
+                        err_tg_date = date_v
         except TelegramDeliveryError:
             outbox.status = "pending"
     outbox_ids.append(outbox.id)

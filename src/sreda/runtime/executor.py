@@ -94,6 +94,7 @@ class ActionRuntimeService:
         telegram_client: TelegramClient | None = None,
         llm_client: object | None = None,
         embedding_client: object | None = None,
+        ack_progress_controller: object | None = None,
     ) -> None:
         self.session = session
         self.telegram_client = telegram_client
@@ -103,6 +104,7 @@ class ActionRuntimeService:
         # fakes here to avoid live provider calls.
         self.llm_client = llm_client
         self.embedding_client = embedding_client
+        self.ack_progress_controller = ack_progress_controller
         self._graph = get_assistant_graph()
 
     # ------------------------------------------------------------- enqueue
@@ -230,6 +232,7 @@ class ActionRuntimeService:
                 "telegram_client": self.telegram_client,
                 "llm_client": self.llm_client,
                 "embedding_client": self.embedding_client,
+                "ack_progress_controller": self.ack_progress_controller,
             }
         }
 

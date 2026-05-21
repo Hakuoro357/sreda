@@ -31,6 +31,35 @@ EXISTING_CHAT_ID = "100000003"
 NEW_USER_CHAT_ID = "100000004"
 
 
+def _mark_existing_user_welcome_sent(session) -> None:
+    """Test fixture helper for existing approved users.
+
+    Existing prod users already have the post-approve welcome flag. These
+    webhook tests exercise downstream command/callback handling, not the
+    welcome-consumes-first-inbound path.
+    """
+    from sreda.services.onboarding import mark_welcome_sent
+
+    session.flush()
+    mark_welcome_sent(session, "tenant_1", "user_1")
+
+
+def _allow_housewife_entitlement(monkeypatch) -> None:
+    """Keep webhook tests focused on routing/delivery, not billing setup."""
+    from sreda.services.entitlement_gate import EntitlementGate, GateResult
+
+    monkeypatch.setattr(
+        EntitlementGate,
+        "check",
+        lambda self, tenant_id: GateResult(
+            allowed=True,
+            reason="ok",
+            plan_key="sreda_free",
+            is_grandfathered=False,
+        ),
+    )
+
+
 # 2026-04-30: после переезда approved-flow в asyncio.create_task() основная
 # обработка идёт в фоне. TestClient уже вернул 202, но background task
 # (LLM/voice/outbox/tracе) только начинается. Хелпер ждёт пока условие
@@ -78,6 +107,7 @@ def test_telegram_webhook_persists_sanitized_and_encrypted_payload(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.commit()
     finally:
         session.close()
@@ -232,6 +262,7 @@ def test_telegram_webhook_handles_status_command(
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
+    _allow_housewife_entitlement(monkeypatch)
 
     get_settings.cache_clear()
     get_engine.cache_clear()
@@ -254,6 +285,7 @@ def test_telegram_webhook_handles_status_command(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.commit()
     finally:
         session.close()
@@ -329,6 +361,7 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
     monkeypatch.setattr(TelegramClient, "answer_callback_query", fake_answer_callback_query)
+    _allow_housewife_entitlement(monkeypatch)
 
     get_settings.cache_clear()
     get_engine.cache_clear()
@@ -351,6 +384,7 @@ def test_telegram_webhook_handles_connect_subscription_callback(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.commit()
     finally:
         session.close()
@@ -443,6 +477,7 @@ def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.commit()
         BillingService(session).start_base_subscription("tenant_1")
     finally:
@@ -511,6 +546,7 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setattr(TelegramClient, "send_message", failing_send_message)
+    _allow_housewife_entitlement(monkeypatch)
 
     get_settings.cache_clear()
     get_engine.cache_clear()
@@ -533,6 +569,7 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.commit()
     finally:
         session.close()
@@ -656,6 +693,7 @@ def test_telegram_webhook_accepts_request_with_matching_secret_token(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.commit()
     finally:
         session.close()
@@ -701,6 +739,7 @@ def test_telegram_webhook_handles_claim_lookup_command(
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
+    _allow_housewife_entitlement(monkeypatch)
 
     get_settings.cache_clear()
     get_engine.cache_clear()
@@ -725,6 +764,7 @@ def test_telegram_webhook_handles_claim_lookup_command(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.add(TenantFeature(id="feature_1", tenant_id="tenant_1", feature_key="eds_monitor", enabled=True))
         session.add(
             EDSAccount(
@@ -849,6 +889,7 @@ def test_telegram_webhook_rate_limits_excess_requests(
             id="tup_test", tenant_id="tenant_1", user_id="user_1",
             display_name="Тестовый Юзер", address_form="ty",
         ))
+        _mark_existing_user_welcome_sent(session)
         session.commit()
     finally:
         session.close()

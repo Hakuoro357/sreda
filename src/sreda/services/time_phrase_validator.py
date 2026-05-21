@@ -1,7 +1,7 @@
 """Post-output deterministic guard для time-of-day greetings.
 
 LLM (особенно mimo-v2.5) известна тем что игнорирует prompt-level instructions
-~40% времени (см. plans/r39-probe-results.md). Реальный prod incident
+в заметной доле проверок. Реальный prod incident
 2026-05-18: bot 3 раза подряд написал «спокойной ночи» в 15:44 MSK
 (time-of-day mismatch).
 

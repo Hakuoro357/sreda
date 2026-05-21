@@ -59,7 +59,7 @@ OpenRouter cost is taken from the eval artifacts. For direct MiMo pricing, Boris
 No tested replacement beats MiMo on the combined price/quality/risk profile.
 
 - Keep MiMo as the production baseline for now.
-- Do not expand R-39 rollout based on these evals.
+- Do not change production routing based on these evals alone.
 - Use Claude Sonnet / GPT-5-mini / Gemma only as research or shadow candidates, not production defaults: Sonnet is best strict score but expensive, GPT-5-mini is slower and still not clean, Gemma is cheap but not materially better than MiMo.
 - Improve `llm_eval_v2` comparator before using strict score as a final vendor-selection metric.
 

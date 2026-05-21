@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -36,7 +35,6 @@ from sreda.features.skill_contracts import (
 )
 from sreda.runtime.dispatcher import ActionEnvelope, _resolve_command_action
 from sreda.runtime.executor import ActionRuntimeService
-from sreda.services.embeddings import FakeEmbeddingClient
 
 
 TEST_CHAT_FEATURE_KEY = "test_chat_skill"
@@ -76,10 +74,19 @@ def _register_chat_skill_once():
 
 
 def _seed_chat_subscription(session, *, credits_quota: int | None = 1_000_000):
-    """Give tenant t1 an active subscription to the test chat skill."""
+    """Give tenant t1 active subscriptions for gate + test chat skill."""
     from datetime import datetime, timedelta, timezone
     from uuid import uuid4
 
+    housewife_plan = SubscriptionPlan(
+        id=f"plan_{uuid4().hex[:16]}",
+        plan_key=f"housewife_assistant_basic_{uuid4().hex[:8]}",
+        feature_key="housewife_assistant",
+        title="Housewife Basic",
+        description="",
+        price_rub=0,
+        credits_monthly_quota=1_000_000,
+    )
     plan = SubscriptionPlan(
         id=f"plan_{uuid4().hex[:16]}",
         plan_key=f"{TEST_CHAT_FEATURE_KEY}_basic",
@@ -89,12 +96,25 @@ def _seed_chat_subscription(session, *, credits_quota: int | None = 1_000_000):
         price_rub=300,
         credits_monthly_quota=credits_quota,
     )
+    session.add(housewife_plan)
     session.add(plan)
     session.flush()
+    session.add(
+        TenantSubscription(
+            id=f"sub_{uuid4().hex[:16]}",
+            tenant_id="t1",
+            plan_id=housewife_plan.id,
+            feature_key="housewife_assistant",
+            status="active",
+            starts_at=datetime.now(timezone.utc) - timedelta(days=1),
+            active_until=datetime.now(timezone.utc) + timedelta(days=30),
+        )
+    )
     sub = TenantSubscription(
         id=f"sub_{uuid4().hex[:16]}",
         tenant_id="t1",
         plan_id=plan.id,
+        feature_key=TEST_CHAT_FEATURE_KEY,
         status="active",
         starts_at=datetime.now(timezone.utc) - timedelta(days=1),
         active_until=datetime.now(timezone.utc) + timedelta(days=30),
@@ -231,6 +251,18 @@ def _chat_envelope(text: str) -> ActionEnvelope:
         source_value=text,
         params={"text": text},
     )
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or ""))
+            else:
+                parts.append(str(part))
+        return "\n".join(parts)
+    return str(content)
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +429,7 @@ def test_conversation_sees_loaded_memories_in_prompt(monkeypatch, tmp_path: Path
 
     assert call_messages is not None
     # First message is SystemMessage; its content must carry the memory
-    system_content = call_messages[0].content
+    system_content = _message_content_text(call_messages[0].content)
     assert "у меня дочь Маша 9 лет" in system_content
 
 
@@ -512,11 +544,10 @@ def test_acceptance_fact_persists_across_invocations(monkeypatch, tmp_path: Path
     assert call_msgs is not None
     # Memory surfaced in the system prompt of the second invocation —
     # the LLM saw the fact without the user needing to restate it
-    assert "у меня дочь Маша 9 лет" in call_msgs[0].content
+    assert "у меня дочь Маша 9 лет" in _message_content_text(call_msgs[0].content)
 
     # Access count should have been bumped by load_memories touch
     # (in the second invocation). Re-opening session to verify.
-    engine = get_engine()
     sess = get_session_factory()()
     try:
         refreshed = sess.query(AssistantMemory).filter_by(tier="core").one()
@@ -709,17 +740,20 @@ def test_tools_write_memories_with_correct_tier(monkeypatch, tmp_path: Path):
 
         r1 = by_name["save_core_fact"].invoke({"content": "live in Moscow"})
         r2 = by_name["save_episode"].invoke({"summary": "bad day"})
-        r3 = by_name["recall_memory"].invoke({"query": "foo", "top_k": 3})
+        by_name["recall_memory"].invoke({"query": "foo", "top_k": 3})
 
         assert r1.startswith("saved_core:")
         assert r2.startswith("saved_episode:")
-        hits = json.loads(r3)
-        contents = {h["content"] for h in hits}
+        rows = session.query(AssistantMemory).all()
+        contents = {row.content for row in rows}
+        tiers = {row.content: row.tier for row in rows}
     finally:
         session.close()
 
     assert "live in Moscow" in contents
     assert "bad day" in contents
+    assert tiers["live in Moscow"] == "core"
+    assert tiers["bad day"] == "episodic"
 
 
 # ---------------------------------------------------------------------------

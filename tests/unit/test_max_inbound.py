@@ -24,6 +24,7 @@ from sreda.services.inbound_messages import (
     _extract_max_sender_user_id,
     persist_max_inbound_event,
 )
+from sreda.services.max_inbound import _should_cleanup_ack_after_runtime
 
 
 # Real probe payload (Phase 0 — 2026-05-04, Boris wrote "Привет")
@@ -45,6 +46,26 @@ SAMPLE_MESSAGE_CREATED = {
     "user_locale": "ru",
     "update_type": "message_created",
 }
+
+
+def test_max_ack_cleanup_runs_when_edit_controller_never_got_ack_handle():
+    class _Controller:
+        final_edit_planned = False
+
+    assert _should_cleanup_ack_after_runtime(
+        ack_task=object(),
+        ack_progress_controller=_Controller(),
+    )
+
+
+def test_max_ack_cleanup_skips_when_final_edit_was_planned():
+    class _Controller:
+        final_edit_planned = True
+
+    assert not _should_cleanup_ack_after_runtime(
+        ack_task=object(),
+        ack_progress_controller=_Controller(),
+    )
 
 SAMPLE_BOT_STARTED = {
     "timestamp": 1777907178400,

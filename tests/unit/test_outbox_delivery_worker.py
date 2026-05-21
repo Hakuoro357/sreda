@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from sreda.db.base import Base
 from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.integrations.max.client import MaxDeliveryError
 from sreda.workers.outbox_delivery import OutboxDeliveryWorker
 
 
@@ -29,6 +30,38 @@ class FakeTelegram:
     async def send_message(self, chat_id: str, text: str, reply_markup=None, **kwargs):
         self.sent.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
         return {"ok": True}
+
+
+class FakeMax:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self.edited: list[dict] = []
+        self.deleted: list[str] = []
+        self.edit_failures = 0
+
+    async def send_message(self, *, recipient, text, format=None, attachments=None):
+        self.sent.append({
+            "recipient": recipient,
+            "text": text,
+            "format": format,
+            "attachments": attachments,
+        })
+        return {"message": {"body": {"mid": "new_mid"}}}
+
+    async def edit_message(self, message_id, *, text, attachments=None):
+        if self.edit_failures > 0:
+            self.edit_failures -= 1
+            raise MaxDeliveryError("temporary edit failure")
+        self.edited.append({
+            "message_id": message_id,
+            "text": text,
+            "attachments": attachments,
+        })
+        return {"message": {"body": {"mid": message_id}}}
+
+    async def delete_message(self, message_id):
+        self.deleted.append(message_id)
+        return {"success": True}
 
 
 @pytest.fixture()
@@ -66,6 +99,27 @@ def _outbox_row(
         status=status,
         scheduled_at=scheduled_at,
         payload_json=json.dumps({"chat_id": "42", "text": text, "reply_markup": None}),
+    )
+
+
+def _max_outbox_row(
+    *,
+    text: str = "hello",
+    ack_message_id: str | None = None,
+) -> OutboxMessage:
+    payload = {"chat_id": "max-chat", "text": text, "reply_markup": None}
+    if ack_message_id:
+        payload["_ack_edit_message_id"] = ack_message_id
+    return OutboxMessage(
+        id=f"out_{uuid4().hex[:16]}",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        channel_type="max",
+        feature_key=None,
+        is_interactive=True,
+        status="pending",
+        payload_json=json.dumps(payload),
     )
 
 
@@ -222,3 +276,46 @@ def test_worker_defer_then_send_after_quiet(session):
     session.refresh(row)
     assert row.status == "sent"
     assert len(telegram.sent) == 1
+
+
+def test_worker_edits_max_ack_message_instead_of_sending_new_message(session):
+    max_client = FakeMax()
+    worker = OutboxDeliveryWorker(session, max_client=max_client)
+    row = _max_outbox_row(text="Финальный ответ", ack_message_id="ack-mid-1")
+    session.add(row)
+    session.commit()
+
+    processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 23, 0)))
+
+    assert processed == 1
+    session.refresh(row)
+    assert row.status == "sent"
+    assert max_client.sent == []
+    assert max_client.edited == [{
+        "message_id": "ack-mid-1",
+        "text": "Финальный ответ",
+        "attachments": None,
+    }]
+
+
+def test_worker_retries_max_ack_edit_then_falls_back_to_send(session):
+    max_client = FakeMax()
+    max_client.edit_failures = 2
+    worker = OutboxDeliveryWorker(session, max_client=max_client)
+    row = _max_outbox_row(text="Финальный ответ", ack_message_id="ack-mid-1")
+    session.add(row)
+    session.commit()
+
+    processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 23, 0)))
+
+    assert processed == 1
+    session.refresh(row)
+    assert row.status == "sent"
+    assert max_client.edited == []
+    assert max_client.sent == [{
+        "recipient": {"chat_id": "max-chat"},
+        "text": "Финальный ответ",
+        "format": None,
+        "attachments": None,
+    }]
+    assert max_client.deleted == ["ack-mid-1"]

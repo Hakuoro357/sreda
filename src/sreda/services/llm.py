@@ -1007,12 +1007,9 @@ CHAT_PROVIDERS = (
     "openrouter",            # gemma-4-26b-a4b-it (default), verified fast
     "openrouter-grok",       # x-ai/grok-4.1-fast — "lowest hallucination" claim
     "openrouter-qwen",       # qwen/qwen3.6-plus — clean runner-up in bench
-    # 2026-05-18: gemini-3.1-flash-lite + deepseek-v4-flash восстановлены
-    # (удалялись 2026-05-12 коммитом 94d9335). R-39 plan их явно пинит:
-    # planner+composer на gemini-3.1, fallback deepseek → mimo. См.
-    # plans/r39-final.md L77, L227, L382-383. Admin-UI misconfig risk
-    # closed: эти ключи теперь использует ТОЛЬКО R-39 через явный
-    # provider= в r39_live_runner.py, не admin switcher.
+    # 2026-05-18: gemini/deepseek variants restored for controlled LLM
+    # comparison runs. Keep them explicit so admin/provider switches do
+    # not rely on ad-hoc model strings.
     "openrouter-gemini-lite",    # google/gemini-3.1-flash-lite — thinking levels, 1M ctx
     "openrouter-deepseek",       # deepseek/deepseek-v4-flash — MoE 284B/13B, 1M ctx
     # 2026-05-12: 3 экспериментальных провайдеров удалены после серии
@@ -1054,7 +1051,6 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter": None,  # None = fall back to settings.openrouter_chat_model
     "openrouter-grok": "x-ai/grok-4.1-fast",
     "openrouter-qwen": "qwen/qwen3.6-plus",
-    # 2026-05-18: восстановлены для R-39 pinning (см. CHAT_PROVIDERS).
     "openrouter-gemini-lite":       "google/gemini-3.1-flash-lite",
     "openrouter-deepseek":          "deepseek/deepseek-v4-flash",
     # 2026-05-12: 3 stale provider keys removed (gpt-oss-120b, llama-70b,
@@ -1064,15 +1060,6 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     # 1M context. Cheapest tool-calling provider в нашем бенче.
     "openrouter-qwen-flash":        "qwen/qwen3.5-flash-02-23",
     "openrouter-gemini-2.5-flash":  "google/gemini-2.5-flash",
-    # 2026-05-19: R-39 LLM replacement search candidates (memory b5280561).
-    # Цель — найти быстрее mimo с action_propensity ≥80% на TimeUnrecognized.
-    "openrouter-qwen3-72b":         "qwen/qwen-2.5-72b-instruct",
-    "openrouter-qwq-32b":           "qwen/qwq-32b-preview",
-    "openrouter-qwen-plus":         "qwen/qwen-plus",
-    "openrouter-qwen-max":          "qwen/qwen-max",
-    "openrouter-claude-haiku":      "anthropic/claude-3.5-haiku",
-    "openrouter-mistral-large":     "mistralai/mistral-large",
-    "openrouter-llama-3.3-70b":     "meta-llama/llama-3.3-70b-instruct",
 }
 
 

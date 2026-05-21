@@ -62,21 +62,6 @@ logger = logging.getLogger(__name__)
 # constant (not function-local) so tests and admin tooling can import
 # the same value. See ``execute_conversation_chat`` for usage.
 CHAT_TURN_TIMEOUT_SECONDS = 180
-LEGACY_R39_JOURNAL_TENANT_IDS_KEY = "legacy_r39_journal_tenant_ids"
-LEGACY_R39_AUDIT_ENFORCE_TENANT_IDS_KEY = "legacy_r39_audit_enforce_tenant_ids"
-
-
-def _tenant_allowlist_enabled(session: Session, key: str, tenant_id: str) -> bool:
-    try:
-        from sreda.agents.tenant_allowlist import parse_pilot_tenants
-        from sreda.services import runtime_config as rc
-
-        raw = rc.get_config(session, key) or ""
-        parsed = parse_pilot_tenants(raw)
-    except Exception:  # noqa: BLE001
-        logger.exception("runtime allowlist read failed key=%s tenant=%s", key, tenant_id)
-        return False
-    return "*" in parsed or str(tenant_id) in parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -2389,11 +2374,6 @@ def execute_conversation_chat(
         "[ПАМЯТЬ — релевантные факты]\n" + _format_memories_for_prompt(memories)
     )
     variable_text = "\n\n".join(variable_parts)
-    # Kept for legacy callers that expect a single ``system_text``
-    # string (e.g. tests, debug logging). The runtime always feeds the
-    # structured multi-part content to the LLM below.
-    system_text = stable_text + "\n\n" + variable_text
-
     with trace.step("chat.tools_build") as _tools_meta:
         tools = build_memory_tools(
             session=session,
@@ -2457,113 +2437,6 @@ def execute_conversation_chat(
     with trace.step("chat.history_load") as _hist_meta:
         history_turns = _load_chat_history(session, run_id)
         _hist_meta["history_turns"] = len(history_turns or [])
-
-    # ─── R-39 integration (Slice 6) ──────────────────────────────────
-    # Per-tenant flag через runtime_config:
-    #   r39_pilot_tenant_ids="<id>"  → live (R-39 заменяет legacy)
-    #   r39_shadow_tenant_ids="<id>" → shadow (R-39 в фоне, legacy отвечает)
-    # Только для feature_key == "housewife_assistant".
-    # Outer try/except — если что-то упало pre-R-39 (config read,
-    # mode resolve и т.п.), безопасный fallback в legacy.
-    #
-    # См. plans/r39-integration-final.md.
-    try:
-        from sreda.agents.r39_mode import resolve_r39_mode
-        _r39_mode = resolve_r39_mode(action.tenant_id, feature_key, session)
-    except Exception:
-        logger.exception(
-            "R-39 mode resolve failed tenant=%s — fallback to legacy",
-            action.tenant_id,
-        )
-        _r39_mode = "off"
-
-    # _user_tz hoisted один раз (DRY) — используется в обеих ветках.
-    _r39_user_tz = (context.get("_profile") or {}).get(
-        "timezone", "Europe/Moscow",
-    )
-
-    if _r39_mode == "live":
-        try:
-            from sreda.agents.r39_live_runner import r39_try_live
-            from sreda.services.admin_alerts import send_admin_alert as _r39_alert
-
-            _live = r39_try_live(
-                session=session,
-                tenant_id=action.tenant_id,
-                user_id=user_id,
-                user_text=user_text,
-                feature_key=feature_key,
-                run_id=run_id,
-                user_tz=_r39_user_tz,
-                tools_list=tools,
-                runtime_reply_cls=RuntimeReply,
-                send_admin_alert_fn=_r39_alert,
-            )
-        except Exception:
-            logger.exception(
-                "R-39 live wrapper failed tenant=%s — fallback to legacy",
-                action.tenant_id,
-            )
-            _live = None
-
-        if _live is not None and _live.proceeded:
-            # proceeded=True но reply=None (degraded apology construction
-            # crashed после side_effect_started) → возвращаем пустой
-            # список replies. Лучше тишина чем дубль legacy.
-            if _live.reply is None:
-                logger.warning(
-                    "R-39 live proceeded=True но reply=None tenant=%s run=%s",
-                    action.tenant_id, run_id,
-                )
-                return []
-            return [_live.reply]
-        # Иначе fall through в legacy (contract: proceeded=False
-        # гарантирует что mutating tools не запустились → дубля не будет).
-
-    elif _r39_mode == "shadow":
-        try:
-            from sreda.agents.r39_shadow_runner import kick_off_shadow_thread
-
-            kick_off_shadow_thread(
-                user_text=user_text,
-                tenant_id=action.tenant_id,
-                user_id=user_id,
-                run_id=run_id,
-                user_tz=_r39_user_tz,
-                feature_key=feature_key,
-            )
-        except Exception:
-            logger.exception(
-                "R-39 shadow kick-off failed tenant=%s — silent (legacy continues)",
-                action.tenant_id,
-            )
-        # Shadow в фоне; legacy продолжается как обычно.
-    # ─── /R-39 integration ──────────────────────────────────────────
-
-    _legacy_journal_enabled = (
-        feature_key == "housewife_assistant"
-        and _tenant_allowlist_enabled(
-            session, LEGACY_R39_JOURNAL_TENANT_IDS_KEY, action.tenant_id,
-        )
-    )
-    _legacy_journal_enforce = (
-        feature_key == "housewife_assistant"
-        and _tenant_allowlist_enabled(
-            session, LEGACY_R39_AUDIT_ENFORCE_TENANT_IDS_KEY, action.tenant_id,
-        )
-    )
-    if _legacy_journal_enforce and not _legacy_journal_enabled:
-        logger.warning(
-            "LEGACY_JOURNAL_CONFIG_INVALID tenant=%s enforce_without_journal",
-            action.tenant_id,
-        )
-        _legacy_journal_enforce = False
-    _legacy_journal = None
-    _legacy_journal_unreliable = False
-    if _legacy_journal_enabled:
-        from sreda.agents.journal import ToolJournal
-
-        _legacy_journal = ToolJournal()
 
     # Multi-part content with Anthropic-style ephemeral cache_control
     # on the stable prefix. Supported providers (Grok 4.1 Fast via
@@ -2672,6 +2545,7 @@ def execute_conversation_chat(
     # — two consecutive empty iterations would otherwise spiral.
     _hallucination_nudged = False
     _turn_timed_out = False
+    _ack_progress = context.get("_ack_progress_controller")
     for _iter in range(_MAX_TOOL_ITERATIONS):
         # Cooperative turn-level timeout. Checked before each iteration
         # (can't interrupt a running LLM call from here — MiMo has its
@@ -2693,6 +2567,11 @@ def execute_conversation_chat(
             )
             _turn_timed_out = True
             break
+        if _ack_progress is not None and _iter > 0:
+            try:
+                _ack_progress.schedule_progress()
+            except Exception:  # noqa: BLE001
+                logger.debug("ack progress schedule failed", exc_info=True)
         _log_llm_invoke(
             tenant_id=action.tenant_id,
             feature_key=feature_key,
@@ -2840,7 +2719,17 @@ def execute_conversation_chat(
                 # blocks a second retry.
                 continue
             final_ai = ai_msg
+            if _ack_progress is not None:
+                try:
+                    _ack_progress.schedule_almost_done()
+                except Exception:  # noqa: BLE001
+                    logger.debug("ack almost-done schedule failed", exc_info=True)
             break
+        if _ack_progress is not None:
+            try:
+                _ack_progress.schedule_progress()
+            except Exception:  # noqa: BLE001
+                logger.debug("ack tool progress schedule failed", exc_info=True)
         # Phase B: parallel dispatch для allowlisted I/O-bound tools.
         # `_dispatch_tool_calls_batch` решает parallel-vs-serial и
         # возвращает результаты в порядке `tool_calls` — порядок
@@ -2855,10 +2744,6 @@ def execute_conversation_chat(
                 action.tenant_id, _iter, len(tool_calls),
                 [tc.get("name") for tc in tool_calls],
             )
-        _tool_call_by_id = {
-            str(tc.get("id") or ""): (idx, tc)
-            for idx, tc in enumerate(tool_calls)
-        }
         _results = _dispatch_tool_calls_batch(tool_calls, tools_by_name)
 
         # R-32 (2026-05-15): dispatch returns 4-tuple
@@ -2868,38 +2753,6 @@ def execute_conversation_chat(
         # Counter + R-30 C validator gated by `is_physical` чтобы avoid
         # over-counting / alert spam on LLM duplicate batches.
         for tc_id, name, result_str, is_physical in _results:
-            if _legacy_journal is not None:
-                try:
-                    from sreda.agents.legacy_journal_adapter import (
-                        LegacyToolDispatchRecord,
-                        append_legacy_dispatch,
-                    )
-
-                    batch_index, source_tc = _tool_call_by_id.get(
-                        str(tc_id), (0, {})
-                    )
-                    append_legacy_dispatch(
-                        _legacy_journal,
-                        LegacyToolDispatchRecord(
-                            tool_call_id=str(tc_id),
-                            tool_name=name,
-                            args=dict(source_tc.get("args") or {}),
-                            result_str=result_str,
-                            is_physical=bool(is_physical),
-                            loop_index=_iter,
-                            batch_index=batch_index,
-                            tenant_id=action.tenant_id,
-                            user_id=user_id,
-                            run_id=run_id,
-                            feature_key=feature_key,
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    _legacy_journal_unreliable = True
-                    logger.exception(
-                        "LEGACY_JOURNAL_ADAPTER_FAILED tenant=%s run=%s tool=%s",
-                        action.tenant_id, run_id, name,
-                    )
             if name in _ONBOARDING_RESOLUTION_TOOLS and result_str.startswith("ok:"):
                 _onboarding_resolution_called = True
             if name:
@@ -3257,120 +3110,11 @@ def execute_conversation_chat(
                 )
                 reply_markup = None
 
-    _legacy_audit_unbacked = False
-    if _legacy_journal is not None:
-        try:
-            from sreda.agents.legacy_journal_adapter import (
-                enforce_legacy_journal_response,
-            )
-
-            _enforced = enforce_legacy_journal_response(
-                text=text,
-                reply_markup=reply_markup,
-                journal=_legacy_journal,
-                enforce_enabled=_legacy_journal_enforce,
-                journal_unreliable=_legacy_journal_unreliable,
-                detector=detect_unbacked_claim,
-                safe_ack_fn=_format_safe_ack_from_tools,
-            )
-            if _enforced.replaced:
-                logger.warning(
-                    "LEGACY_JOURNAL_ENFORCE_REPLACED tenant=%s run=%s "
-                    "unreliable=%s original_chars=%d",
-                    action.tenant_id, run_id, _legacy_journal_unreliable, len(text),
-                )
-            text = _enforced.text
-            reply_markup = _enforced.reply_markup
-            _legacy_audit_unbacked = _enforced.audit_unbacked
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "LEGACY_JOURNAL_ENFORCE_FAILED tenant=%s run=%s",
-                action.tenant_id, run_id,
-            )
-
-        # r39_run_journal primary key is run_id, and shadow mode already
-        # writes the same run_id as mode='shadow'. Avoid breaking the
-        # existing shadow flow; legacy observe rows are persisted only when
-        # R39 shadow is not active for this turn.
-        if _should_persist_legacy_journal(_r39_mode):
-            _persist_legacy_journal_row(
-                session=session,
-                run_id=run_id,
-                tenant_id=action.tenant_id,
-                journal=_legacy_journal,
-                audit_unbacked=_legacy_audit_unbacked,
-            )
-
     # Trace breadcrumb — in /admin/logs filtering by trace_id you'll
     # see whether this turn had to rescue an earlier AI message.
     with trace.step("chat.reply", rescued=rescued, chars=len(text)):
         pass
     return [RuntimeReply(text=text, reply_markup=reply_markup, feature_key=feature_key)]
-
-
-def _should_persist_legacy_journal(r39_mode: str) -> bool:
-    return r39_mode != "shadow"
-
-
-def _persist_legacy_journal_row(
-    *,
-    session: Session,
-    run_id: str,
-    tenant_id: str,
-    journal: Any,
-    audit_unbacked: bool,
-) -> None:
-    """Best-effort INSERT of legacy journal into r39_run_journal."""
-
-    try:
-        from sreda.agents.legacy_journal_adapter import side_effects_count
-        from sreda.db.models import R39RunJournal
-
-        row = R39RunJournal(
-            run_id=run_id,
-            tenant_id=tenant_id,
-            mode="legacy",
-            plan_kind="legacy",
-            journal_json=json.dumps(
-                [_serialize_legacy_journal_entry(e) for e in journal.entries],
-                ensure_ascii=False,
-            ),
-            correction_pending=None,
-            audit_unbacked=bool(audit_unbacked),
-            side_effects_count=side_effects_count(journal),
-        )
-        sp = session.begin_nested()
-        try:
-            session.add(row)
-            session.flush()
-            sp.commit()
-        except Exception:
-            sp.rollback()
-            logger.exception(
-                "LEGACY_JOURNAL_PERSIST_FAILED tenant=%s run=%s",
-                tenant_id, run_id,
-            )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "LEGACY_JOURNAL_PERSIST_FAILED tenant=%s run=%s",
-            tenant_id, run_id,
-        )
-
-
-def _serialize_legacy_journal_entry(entry: Any) -> dict[str, Any]:
-    return {
-        "tool_name": entry.tool_name,
-        "action_index": entry.action_index,
-        "result_kind": entry.result_kind.value,
-        "result_data": {
-            k: v for k, v in (entry.result_data or {}).items()
-            if isinstance(v, (str, int, float, bool, type(None)))
-        },
-        "entity_id": entry.entity_id,
-        "idempotency_key": entry.idempotency_key,
-        "error_code": entry.error_code,
-        "error_message": entry.error_message,
-    }
 
 
 # 12.7 (incident tg=634496616 2026-05-03): provider refusal substitution.

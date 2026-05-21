@@ -31,6 +31,7 @@ from sreda.runtime.executor import ActionRuntimeService
 class FakeTelegramClient:
     def __init__(self) -> None:
         self.sent_messages: list[dict] = []
+        self.edited_messages: list[dict] = []
 
     async def send_message(
         self,
@@ -44,6 +45,24 @@ class FakeTelegramClient:
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": parse_mode,
+                "reply_markup": reply_markup,
+            }
+        )
+        return {"ok": True}
+
+    async def edit_message_text(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        self.edited_messages.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
                 "reply_markup": reply_markup,
             }
         )
@@ -444,6 +463,80 @@ def test_runtime_mark_failed_sanitizes_error_message_before_persisting(monkeypat
     assert "hunter2-PROD" not in telegram_client.sent_messages[0]["text"]
     assert "test@example.com" not in telegram_client.sent_messages[0]["text"]
     assert "[password]" in telegram_client.sent_messages[0]["text"]
+
+
+def test_runtime_error_reply_edits_ack_when_ack_progress_enabled(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime_error_ack.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="Tenant 1"))
+        session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="Workspace 1"))
+        session.flush()
+        session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_1", name="Sreda"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id="100000003"))
+        session.commit()
+
+        telegram_client = FakeTelegramClient()
+
+        from sreda.services.ack_progress import TelegramAckProgressController
+
+        ack_progress = TelegramAckProgressController(
+            telegram_client=telegram_client,
+            chat_id="100000003",
+            ack_message_id_future=321,
+            enabled=True,
+        )
+        service = ActionRuntimeService(
+            session,
+            telegram_client=telegram_client,
+            ack_progress_controller=ack_progress,
+        )
+
+        from sreda.runtime.executor import ActionRuntimeError
+        from sreda.runtime.handlers import HANDLERS
+
+        def _leaky_handler(_session, _action, _context):
+            raise ActionRuntimeError("runtime_unexpected_error", "Не смогла подтвердить действие.")
+
+        monkeypatch.setitem(HANDLERS, "help.show", _leaky_handler)
+
+        queued = service.enqueue_action(
+            ActionEnvelope(
+                action_type="help.show",
+                tenant_id="tenant_1",
+                workspace_id="workspace_1",
+                assistant_id="assistant_1",
+                user_id="user_1",
+                channel_type="telegram_dm",
+                external_chat_id="100000003",
+                bot_key="sreda",
+                inbound_message_id=None,
+                source_type="telegram_message",
+                source_value="/help",
+                params={},
+            )
+        )
+        result = asyncio.run(service.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert result == "failed"
+    assert telegram_client.sent_messages == []
+    assert telegram_client.edited_messages == [{
+        "chat_id": "100000003",
+        "message_id": 321,
+        "text": "Не смогла подтвердить действие.",
+        "reply_markup": None,
+    }]
 
 
 class HangingTelegramClient:
