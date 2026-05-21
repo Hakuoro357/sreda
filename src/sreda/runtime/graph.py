@@ -388,6 +388,12 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             ack_message_id = await ack_progress.ack_message_id()
             if ack_message_id:
                 payload["_ack_edit_message_id"] = str(ack_message_id)
+                if (
+                    reply["reply_markup"] is None
+                    and hasattr(ack_progress, "is_stream_text_current")
+                    and ack_progress.is_stream_text_current(reply["text"])
+                ):
+                    payload["_ack_final_already_visible"] = True
                 if hasattr(ack_progress, "mark_final_edit_planned"):
                     ack_progress.mark_final_edit_planned()
         if _trace_ctx is not None and not _trace_stashed:
