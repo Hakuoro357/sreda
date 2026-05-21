@@ -126,6 +126,55 @@ def test_generate_shopping_from_menu_end_to_end(session):
     assert sources["яйца"] == r2_id
 
 
+def test_list_menu_returns_llm_readable_day_blocks(session):
+    tools = _tools(session)
+
+    recipe_result = tools["save_recipe"].invoke({
+        "title": "Омлет",
+        "ingredients": [{"title": "яйца", "quantity_text": "3 шт"}],
+        "instructions_md": "Жарить 5 минут",
+        "servings": 2,
+        "source": "user_dictated",
+    })
+    recipe_id = recipe_result.split(":")[-1]
+
+    plan = tools["plan_week_menu"].invoke({
+        "week_start": "2026-04-20",
+        "days": [
+            {
+                "day_of_week": 0,
+                "meals": {
+                    "breakfast": {"free_text": "овсянка"},
+                    "lunch": {"free_text": "суп"},
+                    "dinner": {"free_text": "плов"},
+                },
+            },
+            {
+                "day_of_week": 1,
+                "meals": {
+                    "breakfast": {"recipe_id": recipe_id},
+                    "lunch": {"free_text": "борщ"},
+                    "dinner": {"free_text": "рыба"},
+                },
+            },
+        ],
+    })
+    assert plan.startswith("ok:plan_created:")
+
+    result = tools["list_menu"].invoke({"week_start": "2026-04-20"})
+
+    assert "menu_id:" in result
+    assert "week_start: 2026-04-20" in result
+    assert "Понедельник, 20 апреля" in result
+    assert "Вторник, 21 апреля" in result
+    assert "\n\nВторник, 21 апреля\n" in result
+    assert f"[{recipe_id}] Омлет" in result
+    assert result.index("Завтрак: овсянка") < result.index("Обед: суп")
+    assert result.index("Обед: суп") < result.index("Ужин: плов")
+    assert "  пн:" not in result
+    assert "breakfast:" not in result
+
+
 def test_generate_shopping_from_menu_free_text_only_yields_zero(session):
     tools = _tools(session)
 
