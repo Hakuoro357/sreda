@@ -469,6 +469,12 @@ def test_prompt_requires_readable_week_menu_layout():
     assert "пустую строку" in prompt
     assert "не склеивай" in prompt
     assert "markdown-таблицы" in prompt
+    assert "игнорируй старые ответы из истории" in prompt
+    assert "• завтрак:" in prompt
+    assert "• обед:" in prompt
+    assert "• ужин:" in prompt
+    assert "не добавляй технические детали приготовления" in prompt
+    assert "запрещённый формат" in prompt
 
 
 def test_prompt_has_title_morphology_rule():
