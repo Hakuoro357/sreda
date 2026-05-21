@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,6 +22,7 @@ from sreda.db.base import Base
 from sreda.db.models import (
     Assistant,
     AssistantMemory,
+    OutboxMessage,
     Tenant,
     User,
     Workspace,
@@ -282,6 +284,24 @@ def _chat_envelope(text: str) -> ActionEnvelope:
     )
 
 
+def _max_chat_envelope(text: str) -> ActionEnvelope:
+    env = _chat_envelope(text)
+    return ActionEnvelope(
+        action_type=env.action_type,
+        tenant_id=env.tenant_id,
+        workspace_id=env.workspace_id,
+        assistant_id=env.assistant_id,
+        user_id=env.user_id,
+        channel_type="max_dm",
+        external_chat_id="max-chat",
+        bot_key=env.bot_key,
+        inbound_message_id=env.inbound_message_id,
+        source_type="max_message",
+        source_value=env.source_value,
+        params=env.params,
+    )
+
+
 def _message_content_text(content: Any) -> str:
     if isinstance(content, list):
         parts: list[str] = []
@@ -437,6 +457,74 @@ def test_conversation_streams_final_answer_into_ack_after_tool_call(
         for text in edited_texts
     )
     assert edited_texts[-1] == "Запомнил — дочь Маша, 9 лет."
+
+
+def test_conversation_max_waits_before_final_ack_edit_outbox(
+    monkeypatch, tmp_path: Path
+):
+    class _AckController:
+        enabled = True
+        final_edit_planned = False
+
+        def __init__(self) -> None:
+            self.streamed: list[str] = []
+            self.keep_visible_calls: list[str] = []
+
+        def schedule_progress(self, text=None):
+            pass
+
+        def schedule_almost_done(self):
+            pass
+
+        def schedule_stream_text(self, text, *, min_interval_seconds=0.8, force=False):
+            self.streamed.append(text)
+
+        async def drain(self):
+            pass
+
+        async def keep_stream_partial_visible(self, final_text: str):
+            self.keep_visible_calls.append(final_text)
+
+        async def ack_message_id(self, *, timeout_seconds: float = 2.0):
+            return "max-ack-1"
+
+        def mark_final_edit_planned(self):
+            self.final_edit_planned = True
+
+    session = _bootstrap(monkeypatch, tmp_path, "conv_max_stream.db")
+    ack_progress = _AckController()
+    try:
+        scripted = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "save_core_fact",
+                        "args": {"content": "у меня дочь Маша 9 лет"},
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+            ),
+            AIMessage(content="Запомнил — дочь Маша, 9 лет."),
+        ]
+        svc = ActionRuntimeService(
+            session,
+            llm_client=StreamingFinalFakeLLM(scripted),
+            embedding_client=ConstantEmbeddingClient(),
+            ack_progress_controller=ack_progress,
+        )
+        queued = svc.enqueue_action(_max_chat_envelope("у меня дочь Маша 9 лет"))
+        asyncio.run(svc.process_job(queued.job_id))
+
+        outbox = session.query(OutboxMessage).one()
+        payload = json.loads(outbox.payload_json)
+    finally:
+        session.close()
+
+    assert ack_progress.streamed
+    assert ack_progress.keep_visible_calls == ["Запомнил — дочь Маша, 9 лет."]
+    assert ack_progress.final_edit_planned is True
+    assert payload["_ack_edit_message_id"] == "max-ack-1"
 
 
 def test_conversation_saves_episode_via_tool_call(monkeypatch, tmp_path: Path):
