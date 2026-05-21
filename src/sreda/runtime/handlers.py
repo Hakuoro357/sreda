@@ -2743,7 +2743,13 @@ async def execute_conversation_chat(
                 # blocks a second retry.
                 continue
             final_ai = ai_msg
-            if _ack_progress is not None:
+            if (
+                _ack_progress is not None
+                and not (
+                    hasattr(_ack_progress, "has_stream_text")
+                    and _ack_progress.has_stream_text()
+                )
+            ):
                 try:
                     _ack_progress.schedule_almost_done()
                 except Exception:  # noqa: BLE001

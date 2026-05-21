@@ -11,6 +11,8 @@ Lock-in: future probe-revisions of MAX API не должны silently слома
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -25,6 +27,7 @@ from sreda.services.inbound_messages import (
     persist_max_inbound_event,
 )
 from sreda.services.max_inbound import _should_cleanup_ack_after_runtime
+from sreda.services import max_inbound
 
 
 # Real probe payload (Phase 0 — 2026-05-04, Boris wrote "Привет")
@@ -66,6 +69,40 @@ def test_max_ack_cleanup_skips_when_final_edit_was_planned():
         ack_task=object(),
         ack_progress_controller=_Controller(),
     )
+
+
+def test_send_max_ack_extracts_mid_from_known_response_shape(monkeypatch):
+    class _Client:
+        def __init__(self, token):
+            self.token = token
+
+        async def send_message(self, recipient, text):
+            return {"message": {"body": {"mid": "mid.body"}}}
+
+    monkeypatch.setattr(max_inbound, "MaxClient", _Client)
+
+    result = asyncio.run(
+        max_inbound._send_max_ack(token="token", chat_id="123", text="ack")
+    )
+
+    assert result == "mid.body"
+
+
+def test_send_max_ack_extracts_mid_from_flat_response_shape(monkeypatch):
+    class _Client:
+        def __init__(self, token):
+            self.token = token
+
+        async def send_message(self, recipient, text):
+            return {"message": {"message_id": "mid.message"}}
+
+    monkeypatch.setattr(max_inbound, "MaxClient", _Client)
+
+    result = asyncio.run(
+        max_inbound._send_max_ack(token="token", chat_id="123", text="ack")
+    )
+
+    assert result == "mid.message"
 
 SAMPLE_BOT_STARTED = {
     "timestamp": 1777907178400,

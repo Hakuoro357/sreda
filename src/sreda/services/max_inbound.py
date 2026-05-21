@@ -1046,14 +1046,26 @@ async def _send_max_ack(
     except Exception as exc:  # noqa: BLE001
         logger.debug("max ack send failed: %s", exc)
         return None
-    # Probe 2026-05-05 PM: response shape `{"message": {"body": {"mid": ...}, ...}}`
-    msg = response.get("message") if isinstance(response, dict) else None
+    # Probe 2026-05-05 PM: primary response shape
+    # `{"message": {"body": {"mid": ...}, ...}}`. MAX has returned
+    # nearby shapes in probes; parse defensively because losing this mid
+    # silently degrades ack-edit streaming into a separate final send.
+    response_dict = response if isinstance(response, dict) else {}
+    msg = response_dict.get("message")
     if not isinstance(msg, dict):
-        return None
+        msg = response_dict
     body = msg.get("body")
-    if not isinstance(body, dict):
-        return None
-    mid = body.get("mid")
+    body_dict = body if isinstance(body, dict) else {}
+    mid = (
+        body_dict.get("mid")
+        or body_dict.get("message_id")
+        or msg.get("mid")
+        or msg.get("message_id")
+        or msg.get("id")
+        or response_dict.get("mid")
+        or response_dict.get("message_id")
+        or response_dict.get("id")
+    )
     return str(mid) if mid else None
 
 
