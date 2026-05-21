@@ -457,6 +457,20 @@ def test_prompt_has_recipe_to_shopping_intent_rule():
     )
 
 
+def test_prompt_requires_readable_week_menu_layout():
+    """Weekly menu replies should be pleasant by default, not only
+    repaired by runtime formatting after the fact."""
+    from sreda.runtime.handlers import build_system_prompt
+
+    prompt = build_system_prompt("housewife_assistant").lower()
+
+    assert "формат ответа для меню на неделю" in prompt
+    assert "день недели и дату" in prompt
+    assert "пустую строку" in prompt
+    assert "не склеивай" in prompt
+    assert "markdown-таблицы" in prompt
+
+
 def test_prompt_has_title_morphology_rule():
     """2026-04-22 prod: Gemma saved recipe as 'Бараний шурпа' (wrong
     gender) reconstructing nominative from 'бараней шурпы'. Prompt
