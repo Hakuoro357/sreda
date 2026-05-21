@@ -59,6 +59,13 @@ class _StreamingRunnable:
         raise AssertionError("streaming path should not call invoke")
 
 
+class _StreamingMenuRunnable:
+    def stream(self, _messages):
+        yield AIMessageChunk(content="Меню на неделю:\n\nПонедельник:\n")
+        yield AIMessageChunk(content="— Завтрак: Каша\n\nВторник:\n")
+        yield AIMessageChunk(content="— Завтрак: Омлет")
+
+
 class _SlowStreamingRunnable:
     def stream(self, _messages):
         yield AIMessageChunk(content="Поч")
@@ -185,6 +192,50 @@ def test_streaming_helper_emits_incremental_text_and_returns_final_message():
 
     assert result.content == "Привет"
     assert updates == ["При", "Привет"]
+
+
+def test_streaming_helper_uses_exact_stream_text_for_final_message(monkeypatch):
+    """The final answer must match what was streamed into the ack message.
+
+    Some provider/LangChain combinations can expose slightly different text
+    through the chunk callback vs the combined final message. The user sees
+    the streamed text first, so the final edit must not repaint it with a
+    normalized variant.
+    """
+    from langchain_core.messages import AIMessage
+    import sreda.services.llm as llm_service
+
+    updates: list[str] = []
+
+    def _collapsed_final(_combined):
+        return AIMessage(
+            content=(
+                "Меню на неделю: Понедельник:\n"
+                "— Завтрак: Каша Вторник:\n"
+                "— Завтрак: Омлет"
+            )
+        )
+
+    monkeypatch.setattr(llm_service, "message_chunk_to_message", _collapsed_final)
+
+    result = asyncio.run(
+        ainvoke_with_streaming_timeout(
+            _StreamingMenuRunnable(),
+            [],
+            timeout_seconds=5.0,
+            on_text_update=updates.append,
+        )
+    )
+
+    expected = (
+        "Меню на неделю:\n\n"
+        "Понедельник:\n"
+        "— Завтрак: Каша\n\n"
+        "Вторник:\n"
+        "— Завтрак: Омлет"
+    )
+    assert updates[-1] == expected
+    assert result.content == expected
 
 
 def test_streaming_helper_times_out_mid_stream():

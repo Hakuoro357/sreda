@@ -240,6 +240,18 @@ async def ainvoke_with_streaming_timeout(
             messages,
             timeout_seconds=timeout_seconds,
         )
+    if text_so_far and not _message_has_tool_calls(result):
+        # The ack UX streams ``text_so_far`` to the user as the visible
+        # answer. Keep the final message on the same source of truth so
+        # the last edit cannot repaint it with a provider/LangChain
+        # normalized variant.
+        try:
+            result.content = text_so_far
+        except Exception:  # noqa: BLE001
+            if hasattr(result, "model_copy"):
+                result = result.model_copy(update={"content": text_so_far})
+            elif hasattr(result, "copy"):
+                result = result.copy(update={"content": text_so_far})
     return result
 
 
