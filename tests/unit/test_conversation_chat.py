@@ -172,6 +172,7 @@ class _BoundStreamingFinalFakeLLM(_BoundFakeLLM):
             for idx, tc in enumerate(msg.tool_calls):
                 yield AIMessageChunk(
                     content="",
+                    additional_kwargs=msg.additional_kwargs,
                     tool_call_chunks=[{
                         "name": tc.get("name"),
                         "args": json.dumps(tc.get("args") or {}, ensure_ascii=False),
@@ -393,6 +394,7 @@ def test_conversation_saves_core_fact_via_tool_call(monkeypatch, tmp_path: Path)
                         "id": f"tc_{uuid4().hex[:8]}",
                     }
                 ],
+                additional_kwargs={"reasoning_content": "thinking trace"},
             ),
             AIMessage(content="Запомнил — дочь Маша, 9 лет."),
         ]
@@ -436,6 +438,7 @@ def test_conversation_streams_final_answer_into_ack_after_tool_call(
                         "id": f"tc_{uuid4().hex[:8]}",
                     }
                 ],
+                additional_kwargs={"reasoning_content": "thinking trace"},
             ),
             AIMessage(content="Запомнил — дочь Маша, 9 лет."),
         ]

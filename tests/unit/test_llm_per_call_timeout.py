@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 from sreda.services.llm import (
     LLMCallTimeout,
@@ -64,6 +64,34 @@ class _SlowStreamingRunnable:
         yield AIMessageChunk(content="Поч")
         time.sleep(3.0)
         yield AIMessageChunk(content="ти готово")
+
+
+class _StreamingToolCallWithoutReasoningRunnable:
+    def __init__(self) -> None:
+        self.invoke_calls = 0
+
+    def stream(self, _messages):
+        yield AIMessageChunk(
+            content="",
+            tool_call_chunks=[{
+                "name": "add_item",
+                "args": '{"item":"молоко"}',
+                "id": "call_1",
+                "index": 0,
+            }],
+        )
+
+    def invoke(self, _messages):
+        self.invoke_calls += 1
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "add_item",
+                "args": {"item": "молоко"},
+                "id": "call_1",
+            }],
+            additional_kwargs={"reasoning_content": "thinking trace"},
+        )
 
 
 def test_returns_immediately_on_fast_runnable():
@@ -175,3 +203,22 @@ def test_streaming_helper_times_out_mid_stream():
 
     assert time.monotonic() - start < 2.0
     assert updates == ["Поч"]
+
+
+def test_streaming_tool_call_without_reasoning_uses_invoke_result():
+    updates: list[str] = []
+    runnable = _StreamingToolCallWithoutReasoningRunnable()
+
+    result = asyncio.run(
+        ainvoke_with_streaming_timeout(
+            runnable,
+            [],
+            timeout_seconds=5.0,
+            on_text_update=updates.append,
+        )
+    )
+
+    assert runnable.invoke_calls == 1
+    assert result.tool_calls[0]["name"] == "add_item"
+    assert result.additional_kwargs["reasoning_content"] == "thinking trace"
+    assert updates == []

@@ -136,6 +136,18 @@ def _chunk_text(chunk: Any) -> str:
     return ""
 
 
+def _message_reasoning_content(message: Any) -> Any:
+    additional_kwargs = getattr(message, "additional_kwargs", None) or {}
+    return additional_kwargs.get("reasoning_content")
+
+
+def _message_has_tool_calls(message: Any) -> bool:
+    return bool(
+        getattr(message, "tool_calls", None)
+        or getattr(message, "tool_call_chunks", None)
+    )
+
+
 async def ainvoke_with_streaming_timeout(
     runnable: Any,
     messages: list,
@@ -216,7 +228,19 @@ async def ainvoke_with_streaming_timeout(
             messages,
             timeout_seconds=timeout_seconds,
         )
-    return message_chunk_to_message(combined)
+    result = message_chunk_to_message(combined)
+    if (
+        _message_has_tool_calls(result)
+        and not _message_reasoning_content(result)
+        and hasattr(runnable, "invoke")
+    ):
+        return await asyncio.to_thread(
+            invoke_with_per_call_timeout,
+            runnable,
+            messages,
+            timeout_seconds=timeout_seconds,
+        )
+    return result
 
 
 # Models trained on ReAct-style tool-calling data (Gemma-4 family,
