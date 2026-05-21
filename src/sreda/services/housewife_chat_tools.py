@@ -151,6 +151,73 @@ def _format_menu_date_ru(value: Any) -> str:
     return f"{value.day} {_MENU_MONTH_NAMES_RU[value.month]}"
 
 
+def _format_menu_range_ru(week_start: Any) -> str:
+    week_end = week_start + timedelta(days=6)
+    if week_start.month == week_end.month:
+        return (
+            f"{week_start.day}–{week_end.day} "
+            f"{_MENU_MONTH_NAMES_RU[week_start.month]}"
+        )
+    return f"{_format_menu_date_ru(week_start)} – {_format_menu_date_ru(week_end)}"
+
+
+def _menu_item_body(item: Any, *, include_recipe_id: bool) -> str | None:
+    if item.recipe_id and item.recipe is not None:
+        if include_recipe_id:
+            return f"[{item.recipe_id}] {item.recipe.title}"
+        return item.recipe.title
+    if item.free_text:
+        return item.free_text
+    return None
+
+
+def _iter_menu_plan_day_lines(
+    plan: Any,
+    *,
+    include_recipe_ids: bool,
+    bullet_meals: bool,
+) -> list[str]:
+    lines: list[str] = []
+    by_day: dict[int, list] = {}
+    for item in plan.items:
+        by_day.setdefault(item.day_of_week, []).append(item)
+    for d in range(7):
+        items = by_day.get(d, [])
+        if not items:
+            continue
+        day_date = plan.week_start_date + timedelta(days=d)
+        lines.append(f"{_MENU_DAY_NAMES_RU[d]}, {_format_menu_date_ru(day_date)}")
+        for item in sorted(
+            items,
+            key=lambda x: _MENU_MEAL_ORDER.get(x.meal_type, 99),
+        ):
+            body = _menu_item_body(item, include_recipe_id=include_recipe_ids)
+            if body is None:
+                continue
+            meal_label = _MENU_MEAL_LABELS_RU.get(item.meal_type, item.meal_type)
+            prefix = f"• {meal_label}" if bullet_meals else meal_label
+            lines.append(f"{prefix}: {body}")
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _format_menu_plan_for_user(plan: Any) -> str:
+    lines = [f"Меню на неделю {_format_menu_range_ru(plan.week_start_date)}:"]
+    day_lines = _iter_menu_plan_day_lines(
+        plan,
+        include_recipe_ids=False,
+        bullet_meals=True,
+    )
+    if day_lines:
+        lines.extend(["", *day_lines, "", "Собрать список покупок?"])
+    else:
+        lines.append("")
+        lines.append("Пока пусто.")
+    return "\n".join(lines)
+
+
 def _format_reminder_for_llm(reminder: Any) -> str:
     ts = reminder.next_trigger_at
     ts_str = ts.isoformat() if ts else "—"
@@ -164,6 +231,7 @@ def build_housewife_tools(
     tenant_id: str,
     user_id: str | None,
     pending_buttons_state: dict | None = None,
+    menu_display_state: dict | None = None,
     embedding_client: Any = None,
 ) -> list[Any]:
     """Return LLM tools for the housewife skill, bound to the given
@@ -182,6 +250,11 @@ def build_housewife_tools(
     embeds new items for recall-broadcast (Phase 2, 2026-05-04).
     None falls back to legacy behaviour (items без embedding,
     backfill подхватит позже).
+
+    ``menu_display_state``: optional mutable dict for the read-only
+    ``list_menu`` user-facing renderer. ``execute_conversation_chat``
+    can use it to avoid trusting a post-tool LLM rewrite for menu
+    display turns.
     """
 
     service = HousewifeReminderService(session, embedding_client=embedding_client)
@@ -1329,37 +1402,26 @@ def build_housewife_tools(
         if plan is None:
             return "no menu plan for that week"
 
+        if menu_display_state is not None:
+            menu_display_state["list_menu_calls"] = (
+                int(menu_display_state.get("list_menu_calls") or 0) + 1
+            )
+            menu_display_state["last_menu_reply_text"] = _format_menu_plan_for_user(
+                plan
+            )
+
         lines = [
             f"menu_id: {plan.id}",
             f"week_start: {plan.week_start_date.isoformat()}",
             "",
         ]
-        by_day: dict[int, list] = {}
-        for item in plan.items:
-            by_day.setdefault(item.day_of_week, []).append(item)
-        for d in range(7):
-            items = by_day.get(d, [])
-            if not items:
-                continue
-            day_date = plan.week_start_date + timedelta(days=d)
-            lines.append(
-                f"{_MENU_DAY_NAMES_RU[d]}, {_format_menu_date_ru(day_date)}"
+        lines.extend(
+            _iter_menu_plan_day_lines(
+                plan,
+                include_recipe_ids=True,
+                bullet_meals=False,
             )
-            for item in sorted(
-                items,
-                key=lambda x: _MENU_MEAL_ORDER.get(x.meal_type, 99),
-            ):
-                if item.recipe_id and item.recipe is not None:
-                    body = f"[{item.recipe_id}] {item.recipe.title}"
-                elif item.free_text:
-                    body = item.free_text
-                else:
-                    continue
-                meal_label = _MENU_MEAL_LABELS_RU.get(item.meal_type, item.meal_type)
-                lines.append(f"{meal_label}: {body}")
-            lines.append("")
-        while lines and lines[-1] == "":
-            lines.pop()
+        )
         return "\n".join(lines)
 
     # ----------------------------------------------------------------

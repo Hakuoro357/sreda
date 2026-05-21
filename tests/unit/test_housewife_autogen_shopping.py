@@ -28,11 +28,14 @@ def session():
     sess.close()
 
 
-def _tools(session):
+def _tools(session, *, menu_display_state=None):
     return {
         t.name: t
         for t in build_housewife_tools(
-            session=session, tenant_id="t1", user_id="u1"
+            session=session,
+            tenant_id="t1",
+            user_id="u1",
+            menu_display_state=menu_display_state,
         )
     }
 
@@ -127,7 +130,8 @@ def test_generate_shopping_from_menu_end_to_end(session):
 
 
 def test_list_menu_returns_llm_readable_day_blocks(session):
-    tools = _tools(session)
+    menu_display_state = {}
+    tools = _tools(session, menu_display_state=menu_display_state)
 
     recipe_result = tools["save_recipe"].invoke({
         "title": "Омлет",
@@ -173,6 +177,14 @@ def test_list_menu_returns_llm_readable_day_blocks(session):
     assert result.index("Обед: суп") < result.index("Ужин: плов")
     assert "  пн:" not in result
     assert "breakfast:" not in result
+
+    user_text = menu_display_state["last_menu_reply_text"]
+    assert menu_display_state["list_menu_calls"] == 1
+    assert user_text.startswith("Меню на неделю 20–26 апреля:\n\n")
+    assert "\n\nВторник, 21 апреля\n" in user_text
+    assert "• Завтрак: Омлет" in user_text
+    assert f"[{recipe_id}]" not in user_text
+    assert "menu_id:" not in user_text
 
 
 def test_generate_shopping_from_menu_free_text_only_yields_zero(session):

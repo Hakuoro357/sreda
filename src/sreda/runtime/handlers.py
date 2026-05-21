@@ -2412,15 +2412,18 @@ async def execute_conversation_chat(
     # convert it into an inline keyboard via ``ReplyButtonService``.
     # None means buttons not wired for this feature — tool absent.
     pending_buttons_state: dict | None = None
+    menu_display_state: dict | None = None
     if feature_key == "housewife_assistant":
         from sreda.services.housewife_chat_tools import build_housewife_tools
 
         pending_buttons_state = {}
+        menu_display_state = {}
         tools = tools + build_housewife_tools(
             session=session,
             tenant_id=action.tenant_id,
             user_id=user_id,
             pending_buttons_state=pending_buttons_state,
+            menu_display_state=menu_display_state,
             embedding_client=embedding_client,
         )
     tools_by_name = {t.name: t for t in tools}
@@ -3120,6 +3123,28 @@ async def execute_conversation_chat(
             pass
         text = safe_ack
 
+    if (
+        feature_key == "housewife_assistant"
+        and menu_display_state
+        and called_tools == {"list_menu"}
+        and menu_display_state.get("list_menu_calls") == 1
+        and _is_menu_display_read_intent(user_text)
+    ):
+        rendered_menu_text = menu_display_state.get("last_menu_reply_text")
+        if isinstance(rendered_menu_text, str) and rendered_menu_text.strip():
+            logger.info(
+                "chat: menu display rendered from structured list_menu "
+                "tenant=%s feature=%s original_chars=%d rendered_chars=%d",
+                action.tenant_id, feature_key, len(text), len(rendered_menu_text),
+            )
+            with trace.step(
+                "chat.menu_display_rendered",
+                original_chars=len(text),
+                rendered_chars=len(rendered_menu_text),
+            ):
+                pass
+            text = rendered_menu_text
+
     # Inline-кнопки (Часть 0 плана v2). Если LLM вызывал
     # ``reply_with_buttons`` во время этого turn'а — он положил в
     # state словарь {"text": ..., "buttons": [labels]}. Создаём
@@ -3173,6 +3198,43 @@ async def execute_conversation_chat(
     with trace.step("chat.reply", rescued=rescued, chars=len(text)):
         pass
     return [RuntimeReply(text=text, reply_markup=reply_markup, feature_key=feature_key)]
+
+
+_MENU_DISPLAY_WEEK_RE = (
+    r"(?:на )?(?:(?:эту|текущую|следующую|этой|текущей|следующей) )?"
+    r"недел(?:ю|е|и)"
+)
+_MENU_DISPLAY_SIMPLE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        rf"(?:покажи|показать|посмотри|выведи|напиши)(?: мне)? меню"
+        rf"(?: {_MENU_DISPLAY_WEEK_RE})?",
+        rf"(?:покажи|выведи|напиши)(?: мне)? "
+        rf"(?:все|всю|полное|полный) меню(?: {_MENU_DISPLAY_WEEK_RE})?",
+        rf"(?:какое|какой)(?: у меня)? меню(?: {_MENU_DISPLAY_WEEK_RE})?",
+        rf"что(?: у меня)?(?: в меню)? на "
+        rf"(?:этой|текущей|следующей) недел(?:е|и)",
+        rf"что(?: у меня)? на "
+        rf"(?:этой|текущей|следующей) недел(?:е|и)(?: в меню)?",
+    )
+)
+
+
+def _is_menu_display_read_intent(user_text: str) -> bool:
+    """True for read-only menu display requests.
+
+    This gates the structured ``list_menu`` renderer. It deliberately
+    stays narrow: mutating/composite menu turns should keep the normal
+    LLM finalization path.
+    """
+    if not user_text:
+        return False
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[?!.,;:]+", " ", user_text.lower().replace("ё", "е")),
+    ).strip()
+    return any(pattern.fullmatch(normalized) for pattern in _MENU_DISPLAY_SIMPLE_PATTERNS)
 
 
 # 12.7 (incident tg=634496616 2026-05-03): provider refusal substitution.

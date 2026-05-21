@@ -476,6 +476,133 @@ def test_conversation_streams_final_answer_into_ack_after_tool_call(
     assert FINAL_PROGRESS_TEXT not in edited_texts
 
 
+def test_conversation_uses_structured_menu_render_after_list_menu(
+    monkeypatch, tmp_path: Path
+):
+    session = _bootstrap(monkeypatch, tmp_path, "conv_menu_render.db")
+    try:
+        monkeypatch.setattr(
+            "sreda.runtime.handlers._resolve_chat_feature_key",
+            lambda _session, _tenant_id: "housewife_assistant",
+        )
+        from sreda.services.housewife_chat_tools import build_housewife_tools
+
+        tools = {
+            t.name: t
+            for t in build_housewife_tools(
+                session=session, tenant_id="t1", user_id="u1"
+            )
+        }
+        plan = tools["plan_week_menu"].invoke({
+            "week_start": "2026-04-20",
+            "days": [
+                {
+                    "day_of_week": 0,
+                    "meals": {
+                        "breakfast": {"free_text": "овсянка"},
+                        "lunch": {"free_text": "суп"},
+                        "dinner": {"free_text": "плов"},
+                    },
+                },
+                {
+                    "day_of_week": 1,
+                    "meals": {
+                        "breakfast": {"free_text": "творог"},
+                        "lunch": {"free_text": "борщ"},
+                        "dinner": {"free_text": "рыба"},
+                    },
+                },
+            ],
+        })
+        assert plan.startswith("ok:plan_created:")
+
+        glued_bad_final = (
+            "Меню на неделю 20–26 апреля: Понедельник, 20 апреля:\n"
+            "• Завтрак: овсянка\n"
+            "• Обед: суп\n"
+            "• Ужин: плов Вторник, 21 апреля:\n"
+            "• Завтрак: творог\n"
+            "• Обед: борщ\n"
+            "• Ужин: рыба Собрать список покупок?"
+        )
+        scripted = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_menu",
+                        "args": {"week_start": "2026-04-20"},
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+                additional_kwargs={"reasoning_content": "thinking trace"},
+            ),
+            AIMessage(content=glued_bad_final),
+        ]
+        telegram = FakeTelegram()
+
+        from sreda.services.ack_progress import TelegramAckProgressController
+
+        ack_progress = TelegramAckProgressController(
+            telegram_client=telegram,
+            chat_id="100000001",
+            ack_message_id_future=555,
+            enabled=True,
+        )
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=StreamingFinalFakeLLM(scripted),
+            embedding_client=ConstantEmbeddingClient(),
+            ack_progress_controller=ack_progress,
+        )
+        queued = svc.enqueue_action(_chat_envelope("покажи меню на неделю"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    expected = (
+        "Меню на неделю 20–26 апреля:\n\n"
+        "Понедельник, 20 апреля\n"
+        "• Завтрак: овсянка\n"
+        "• Обед: суп\n"
+        "• Ужин: плов\n\n"
+        "Вторник, 21 апреля\n"
+        "• Завтрак: творог\n"
+        "• Обед: борщ\n"
+        "• Ужин: рыба\n\n"
+        "Собрать список покупок?"
+    )
+    edited_texts = [item["text"] for item in telegram.edited]
+    assert telegram.sent == []
+    assert edited_texts[-1] == expected
+    assert "Ужин: плов Вторник" not in edited_texts[-1]
+
+
+def test_menu_display_render_intent_stays_week_scope_only():
+    from sreda.runtime.handlers import _is_menu_display_read_intent
+
+    assert _is_menu_display_read_intent("покажи меню на неделю") is True
+    assert _is_menu_display_read_intent("что на этой неделе?") is True
+    assert _is_menu_display_read_intent("какое меню на следующую неделю") is True
+    assert _is_menu_display_read_intent("что в меню на среду?") is False
+    assert _is_menu_display_read_intent("составь меню на неделю") is False
+    assert _is_menu_display_read_intent("покажи меню и собери список покупок") is False
+    assert (
+        _is_menu_display_read_intent(
+            "покажи меню на неделю и предложи, что улучшить"
+        )
+        is False
+    )
+    assert (
+        _is_menu_display_read_intent(
+            "покажи меню на неделю и скажи, где есть рыба"
+        )
+        is False
+    )
+    assert _is_menu_display_read_intent("покажи меню на неделю без молока") is False
+
+
 def test_conversation_streams_plain_final_answer_into_ack(
     monkeypatch, tmp_path: Path
 ):
