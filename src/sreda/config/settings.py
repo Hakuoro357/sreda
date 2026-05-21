@@ -233,7 +233,7 @@ class Settings(BaseSettings):
         default=True, validation_alias="SREDA_ACK_STREAMING_ENABLED"
     )
     ack_streaming_min_interval_seconds: float = Field(
-        default=0.8, validation_alias="SREDA_ACK_STREAMING_MIN_INTERVAL_SECONDS"
+        default=0.35, validation_alias="SREDA_ACK_STREAMING_MIN_INTERVAL_SECONDS"
     )
 
     # Speech recognition provider:

@@ -35,6 +35,7 @@ class AckProgressController:
         self._final_edit_planned = False
         self._last_stream_edit_at = 0.0
         self._last_stream_text: str | None = None
+        self._last_stream_min_visible_seconds = 0.0
 
     @property
     def final_edit_planned(self) -> bool:
@@ -89,7 +90,19 @@ class AckProgressController:
             return
         self._last_stream_edit_at = now
         self._last_stream_text = normalized
+        self._last_stream_min_visible_seconds = min_interval_seconds
         self._schedule_edit(normalized, event_name="ack.stream_edit")
+
+    async def keep_stream_partial_visible(self, final_text: str) -> None:
+        if not self._last_stream_text or self._last_stream_text == final_text.strip():
+            return
+        min_visible = min(max(self._last_stream_min_visible_seconds, 0.0), 0.5)
+        if min_visible <= 0:
+            return
+        elapsed = time.monotonic() - self._last_stream_edit_at
+        remaining = min_visible - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
     def _schedule_edit(self, text: str, *, event_name: str) -> None:
         try:
@@ -178,6 +191,7 @@ class TelegramAckProgressController(AckProgressController):
     ) -> str:
         if self.enabled:
             await self.drain()
+            await self.keep_stream_partial_visible(text)
             message_id = await self.ack_message_id()
             if message_id:
                 self.mark_final_edit_planned()

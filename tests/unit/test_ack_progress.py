@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from sreda.services.ack_progress import TelegramAckProgressController
 
@@ -135,3 +136,26 @@ def test_telegram_stream_text_updates_ack_message():
     asyncio.run(_run())
 
     assert [item["text"] for item in tg.edits] == ["При", "Привет"]
+
+
+def test_telegram_final_edit_keeps_stream_partial_visible_briefly():
+    tg = _FakeTelegram()
+    controller = TelegramAckProgressController(
+        telegram_client=tg,
+        chat_id="42",
+        ack_message_id_future=123,
+        enabled=True,
+    )
+
+    async def _run():
+        controller.schedule_stream_text("При", min_interval_seconds=0.05)
+        await controller.drain()
+        start = time.monotonic()
+        result = await controller.edit_final_or_fallback("Привет")
+        return result, time.monotonic() - start
+
+    result, elapsed = asyncio.run(_run())
+
+    assert result == "edited"
+    assert [item["text"] for item in tg.edits] == ["При", "Привет"]
+    assert elapsed >= 0.04
