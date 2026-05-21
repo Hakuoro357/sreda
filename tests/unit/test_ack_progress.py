@@ -115,3 +115,23 @@ def test_telegram_progress_disabled_is_noop():
 
     assert tg.edits == []
     assert tg.sent == []
+
+
+def test_telegram_stream_text_updates_ack_message():
+    tg = _FakeTelegram()
+    controller = TelegramAckProgressController(
+        telegram_client=tg,
+        chat_id="42",
+        ack_message_id_future=123,
+        enabled=True,
+    )
+
+    async def _run():
+        controller.schedule_stream_text("При", min_interval_seconds=0)
+        await controller.drain()
+        controller.schedule_stream_text("Привет", min_interval_seconds=0)
+        await controller.drain()
+
+    asyncio.run(_run())
+
+    assert [item["text"] for item in tg.edits] == ["При", "Привет"]

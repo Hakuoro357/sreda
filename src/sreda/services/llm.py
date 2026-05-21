@@ -23,13 +23,14 @@ flip; behaviour is default.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import json
 import logging
 import re
-import threading
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
+from langchain_core.messages.utils import message_chunk_to_message
 from langchain_openai import ChatOpenAI
 
 from sreda.config.settings import Settings, get_settings
@@ -116,6 +117,106 @@ def invoke_with_per_call_timeout(
         # Успех. Cleanup non-blocking.
         executor.shutdown(wait=False, cancel_futures=True)
         return result
+
+
+def _chunk_text(chunk: Any) -> str:
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+async def ainvoke_with_streaming_timeout(
+    runnable: Any,
+    messages: list,
+    *,
+    timeout_seconds: float = _PER_CALL_TIMEOUT_DEFAULT,
+    on_text_update: Callable[[str], None] | None = None,
+) -> Any:
+    """Async stream/invoke wrapper with the same wall-clock timeout contract.
+
+    Uses ``runnable.stream`` when a progress callback is provided and the
+    runnable supports streaming. Otherwise falls back to the existing
+    ``invoke_with_per_call_timeout`` path in a worker thread so the asyncio
+    event loop remains free for ack-message edits.
+    """
+    if on_text_update is None or not hasattr(runnable, "stream"):
+        return await asyncio.to_thread(
+            invoke_with_per_call_timeout,
+            runnable,
+            messages,
+            timeout_seconds=timeout_seconds,
+        )
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="llm-stream"
+    )
+
+    def _worker() -> None:
+        try:
+            for chunk in runnable.stream(messages):
+                loop.call_soon_threadsafe(queue.put_nowait, ("chunk", chunk))
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+        except BaseException as exc:  # noqa: BLE001
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+
+    executor.submit(_worker)
+    deadline = loop.time() + timeout_seconds
+    combined: Any | None = None
+    text_so_far = ""
+    saw_tool_chunk = False
+
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise LLMCallTimeout(
+                    f"LLM stream exceeded {timeout_seconds}s wall time"
+                )
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise LLMCallTimeout(
+                    f"LLM stream exceeded {timeout_seconds}s wall time"
+                ) from exc
+
+            if kind == "error":
+                raise payload
+            if kind == "done":
+                break
+
+            chunk = payload
+            combined = chunk if combined is None else combined + chunk
+            if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
+                saw_tool_chunk = True
+                continue
+            text_piece = _chunk_text(chunk)
+            if text_piece and not saw_tool_chunk:
+                text_so_far += text_piece
+                on_text_update(text_so_far)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    if combined is None:
+        return await asyncio.to_thread(
+            invoke_with_per_call_timeout,
+            runnable,
+            messages,
+            timeout_seconds=timeout_seconds,
+        )
+    return message_chunk_to_message(combined)
 
 
 # Models trained on ReAct-style tool-calling data (Gemma-4 family,
