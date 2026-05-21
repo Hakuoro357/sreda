@@ -18,6 +18,7 @@ retries those pending rows.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -276,6 +277,7 @@ class OutboxDeliveryWorker:
             return
 
         trace_payload = payload.pop("_trace", None)
+        ack_edit_message_id = payload.pop("_ack_edit_message_id", None)
         chat_id = payload.get("chat_id")
         text = payload.get("text", "")
 
@@ -310,12 +312,49 @@ class OutboxDeliveryWorker:
             )
 
         try:
-            await self.max.send_message(
-                recipient={"chat_id": chat_id},
-                text=text,
-                format=payload.get("format"),
-                attachments=attachments,
-            )
+            if ack_edit_message_id:
+                edit_sent = False
+                for attempt in range(2):
+                    try:
+                        await self.max.edit_message(
+                            str(ack_edit_message_id),
+                            text=text,
+                            attachments=attachments,
+                        )
+                        edit_sent = True
+                        break
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "max outbox: ack edit failed on %s attempt=%d",
+                            row.id,
+                            attempt + 1,
+                            exc_info=True,
+                        )
+                        if attempt == 0:
+                            await asyncio.sleep(0.2)
+                if not edit_sent:
+                    await self.max.send_message(
+                        recipient={"chat_id": chat_id},
+                        text=text,
+                        format=payload.get("format"),
+                        attachments=attachments,
+                    )
+                    try:
+                        await self.max.delete_message(str(ack_edit_message_id))
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "max outbox: fallback ack delete failed on %s mid=%s",
+                            row.id,
+                            ack_edit_message_id,
+                            exc_info=True,
+                        )
+            else:
+                await self.max.send_message(
+                    recipient={"chat_id": chat_id},
+                    text=text,
+                    format=payload.get("format"),
+                    attachments=attachments,
+                )
             row.status = "sent"
             self._emit_trace(
                 trace_payload, chat_id=chat_id, status="ok",

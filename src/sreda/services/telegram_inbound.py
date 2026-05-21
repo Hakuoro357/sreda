@@ -43,6 +43,7 @@ from sreda.db.session import get_session_factory
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.services import trace
 from sreda.services.ack_messages import pick_ack
+from sreda.services.ack_progress import TelegramAckProgressController
 from sreda.services.inbound_messages import persist_telegram_inbound_event
 from sreda.services.onboarding import ensure_telegram_user_bundle
 from sreda.services.telegram_bot import handle_telegram_interaction
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 # 2026-05-05 (review R1: cross-module private import был fragile).
 # Re-export для backward compat — старые тесты импортируют ``_TENANT_LOCKS``
 # / ``_get_tenant_lock`` отсюда.
-from sreda.services.tenant_lock import (  # noqa: E402
+from sreda.services.tenant_lock import (  # noqa: E402,F401
     _TENANT_LOCKS,
     get_tenant_lock as _get_tenant_lock,
 )
@@ -222,6 +223,7 @@ async def _process_approved_turn_locked(
             trace.record("webhook.received", type="unknown")
 
         ack_task: asyncio.Task | None = None
+        ack_progress_controller = None
         if (
             message_type in ("text", "voice")
             and not onboarding.is_new_user
@@ -233,6 +235,13 @@ async def _process_approved_turn_locked(
                 ),
                 name=f"ack:{onboarding.chat_id}",
             )
+            if get_settings().ack_edit_telegram_enabled:
+                ack_progress_controller = TelegramAckProgressController(
+                    telegram_client=telegram_client,
+                    chat_id=str(onboarding.chat_id),
+                    ack_message_id_future=ack_task,
+                    enabled=True,
+                )
 
         try:
             await handle_telegram_interaction(
@@ -242,6 +251,7 @@ async def _process_approved_turn_locked(
                 telegram_client=telegram_client,
                 onboarding=onboarding,
                 inbound_message_id=inbound_message_id,
+                ack_progress_controller=ack_progress_controller,
             )
         except TelegramDeliveryError as exc:
             logger.warning(
@@ -272,6 +282,7 @@ async def _process_approved_turn_locked(
             )
             if (
                 ack_message_id is not None
+                and ack_progress_controller is None
                 and reply_delivered_inline
                 and onboarding.chat_id is not None
             ):

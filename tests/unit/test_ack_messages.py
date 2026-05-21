@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import random
 
-from sreda.services.ack_messages import all_phrases, pick_ack
+from sreda.services.ack_messages import (
+    FINAL_PROGRESS_TEXT,
+    all_phrases,
+    all_progress_phrases,
+    pick_ack,
+    pick_progress_ack,
+)
 
 
 def test_all_phrases_reasonable_list_size():
@@ -41,3 +47,24 @@ def test_pick_ack_seeded_rng_is_deterministic():
     seq1 = [pick_ack(rng1) for _ in range(10)]
     seq2 = [pick_ack(rng2) for _ in range(10)]
     assert seq1 == seq2
+
+
+def test_progress_final_text_is_exact_contract():
+    assert FINAL_PROGRESS_TEXT == "Почти готово"
+
+
+def test_progress_phrases_are_separate_reasonable_pool():
+    phrases = all_progress_phrases()
+    assert 6 <= len(phrases) <= 25
+    assert FINAL_PROGRESS_TEXT not in phrases
+    for phrase in phrases:
+        assert isinstance(phrase, str)
+        assert phrase.strip()
+        assert len(phrase) <= 48
+
+
+def test_pick_progress_ack_avoids_immediate_repeat_when_possible():
+    previous = all_progress_phrases()[0]
+    rng = random.Random(0)
+    for _ in range(30):
+        assert pick_progress_ack(previous=previous, rng=rng) != previous

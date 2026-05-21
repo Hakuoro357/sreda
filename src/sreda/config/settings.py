@@ -220,6 +220,16 @@ class Settings(BaseSettings):
     # SQLite and Postgres. Set to 0 to disable the loop (tests only).
     job_poll_interval_seconds: float = 1.0
 
+    # Ack edit UX kill-switches. When disabled, inbound/delivery code
+    # keeps the legacy flow: send quick ack, send final as a separate
+    # message, then clean up the ack where supported.
+    ack_edit_telegram_enabled: bool = Field(
+        default=True, validation_alias="SREDA_ACK_EDIT_TELEGRAM_ENABLED"
+    )
+    ack_edit_max_enabled: bool = Field(
+        default=True, validation_alias="SREDA_ACK_EDIT_MAX_ENABLED"
+    )
+
     # Speech recognition provider:
     #   ``yandex``        — Yandex SpeechKit only (current default).
     #   ``groq``          — Groq Whisper only (~0.3-0.5s vs Yandex ~1-2s).

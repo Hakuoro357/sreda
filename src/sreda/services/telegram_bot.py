@@ -30,6 +30,7 @@ async def handle_telegram_interaction(
     telegram_client: TelegramClient,
     onboarding: TelegramOnboardingResult,
     inbound_message_id: str | None = None,
+    ack_progress_controller=None,
 ) -> None:
     if onboarding.chat_id is None:
         return
@@ -72,6 +73,7 @@ async def handle_telegram_interaction(
         payload=payload,
         onboarding=onboarding,
         inbound_message_id=inbound_message_id,
+        ack_progress_controller=ack_progress_controller,
     )
 
 
@@ -340,7 +342,6 @@ async def _handle_callback(
         #     на edge cases типа aliases).
         # Защищает от incident'a tg_1089832184 19:25 — 361 callback
         # за 6 минут на одну и ту же кнопку pb:schedule.
-        from sreda.services import pending_bot as _pb_mod
         if onboarding.tenant_id and onboarding.user_id:
             try:
                 repo = UserProfileRepository(session)
@@ -722,6 +723,7 @@ async def _handle_command(
     payload: dict,
     onboarding: TelegramOnboardingResult,
     inbound_message_id: str | None,
+    ack_progress_controller=None,
 ) -> None:
     runtime_action = dispatch_telegram_action(
         payload=payload,
@@ -732,7 +734,11 @@ async def _handle_command(
     if runtime_action is None:
         return
 
-    runtime = ActionRuntimeService(session, telegram_client=telegram_client)
+    runtime = ActionRuntimeService(
+        session,
+        telegram_client=telegram_client,
+        ack_progress_controller=ack_progress_controller,
+    )
     queued = runtime.enqueue_action(runtime_action)
     await runtime.process_job(queued.job_id)
 

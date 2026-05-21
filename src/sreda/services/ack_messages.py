@@ -54,7 +54,24 @@ _PHRASES: tuple[str, ...] = (
     "🔍 Смотрю…",
     "⚙️ Обрабатываю…",
     "🌀 Секунду…",
+    "📌 Приняла…",
+    "🧭 Разбираюсь…",
+    "📝 Смотрю запрос…",
+    "🔧 Делаю…",
 )
+
+_PROGRESS_PHRASES: tuple[str, ...] = (
+    "⏳ Еще работаю…",
+    "🔎 Проверяю детали…",
+    "🛠️ Собираю ответ…",
+    "📌 Уточняю по данным…",
+    "⚙️ Обрабатываю шаг…",
+    "🧭 Сверяю контекст…",
+    "📝 Формулирую ответ…",
+    "⌛ Еще немного…",
+)
+
+FINAL_PROGRESS_TEXT = "Почти готово"
 
 
 def pick_ack(rng: random.Random | None = None) -> str:
@@ -67,6 +84,24 @@ def pick_ack(rng: random.Random | None = None) -> str:
     return r.choice(_PHRASES)
 
 
+def pick_progress_ack(
+    *,
+    previous: str | None = None,
+    rng: random.Random | None = None,
+) -> str:
+    """Return a progress phrase, avoiding immediate repeats when possible."""
+    r = rng or random
+    candidates = _PROGRESS_PHRASES
+    if previous is not None and len(candidates) > 1:
+        candidates = tuple(p for p in candidates if p != previous)
+    return r.choice(candidates)
+
+
 def all_phrases() -> tuple[str, ...]:
     """Public accessor for tests / admin diagnostics."""
     return _PHRASES
+
+
+def all_progress_phrases() -> tuple[str, ...]:
+    """Public accessor for progress-edit tests / admin diagnostics."""
+    return _PROGRESS_PHRASES

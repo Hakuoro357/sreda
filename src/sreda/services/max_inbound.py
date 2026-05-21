@@ -931,13 +931,16 @@ async def _process_approved_max_turn(
             # удаляем ack message чтобы chat остался clean (одно
             # bot-message per turn).
             ack_task: asyncio.Task | None = None
+            ack_progress_controller = None
             if (
                 settings.max_bot_token
                 and not is_callback
                 and not onboarding.is_new_user
             ):
                 from sreda.services.ack_messages import pick_ack
+                from sreda.services.ack_progress import MaxAckProgressController
                 ack_text = pick_ack()
+                max_ack_client = MaxClient(token=settings.max_bot_token)
                 ack_task = asyncio.create_task(
                     _send_max_ack(
                         token=settings.max_bot_token,
@@ -946,6 +949,12 @@ async def _process_approved_max_turn(
                     ),
                     name=f"max_ack:{onboarding.max_chat_id}",
                 )
+                if settings.ack_edit_max_enabled:
+                    ack_progress_controller = MaxAckProgressController(
+                        max_client=max_ack_client,
+                        ack_message_id_future=ack_task,
+                        enabled=True,
+                    )
 
             action = dispatch_max_action(
                 payload=payload,
@@ -978,7 +987,11 @@ async def _process_approved_max_turn(
                 )
                 return
 
-            runtime = ActionRuntimeService(bg_session, telegram_client=None)
+            runtime = ActionRuntimeService(
+                bg_session,
+                telegram_client=None,
+                ack_progress_controller=ack_progress_controller,
+            )
             queued = runtime.enqueue_action(action)
             await runtime.process_job(queued.job_id)
 
@@ -986,7 +999,10 @@ async def _process_approved_max_turn(
             # Polls outbox для tenant_id+since (start of turn), max 15s,
             # потом DELETE /messages. Если delivery failed — ack
             # остаётся (юзер видит «⏳ Работаю…», знает что бот пытался).
-            if ack_task is not None:
+            if _should_cleanup_ack_after_runtime(
+                ack_task=ack_task,
+                ack_progress_controller=ack_progress_controller,
+            ):
                 asyncio.create_task(
                     _wait_ack_then_delete(
                         ack_task=ack_task,
@@ -1092,6 +1108,16 @@ async def _wait_ack_then_delete(
         await client.delete_message(ack_mid)
     except Exception as exc:  # noqa: BLE001
         logger.debug("max ack delete failed (mid=%s): %s", ack_mid, exc)
+
+
+def _should_cleanup_ack_after_runtime(
+    *,
+    ack_task: asyncio.Task | None,
+    ack_progress_controller: object | None,
+) -> bool:
+    if ack_task is None:
+        return False
+    return not bool(getattr(ack_progress_controller, "final_edit_planned", False))
 
 
 async def _wait_outbox_delivered_for_tenant(
