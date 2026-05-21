@@ -18,7 +18,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -47,9 +47,9 @@ from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
 from sreda.services.llm import (
     LLMCallTimeout,
+    ainvoke_with_streaming_timeout,
     detect_unbacked_claim,
     get_chat_llm,
-    invoke_with_per_call_timeout,
     resolve_provider_pair_for_tenant,
     strip_reasoning_prefix,
 )
@@ -97,7 +97,10 @@ class ActionRuntimeError(Exception):
         self.reply_markup = reply_markup
 
 
-HandlerFn = Callable[[Session, ActionEnvelope, dict[str, Any]], list[RuntimeReply]]
+HandlerFn = Callable[
+    [Session, ActionEnvelope, dict[str, Any]],
+    list[RuntimeReply] | Coroutine[Any, Any, list[RuntimeReply]],
+]
 
 
 # ---------------------------------------------------------------------------
@@ -2002,7 +2005,7 @@ def _upgrade_reply_markup(feature_key: str) -> dict:
     }
 
 
-def execute_conversation_chat(
+async def execute_conversation_chat(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     """LLM-driven conversational handler with memory tool-loop.
@@ -2586,11 +2589,32 @@ def execute_conversation_chat(
             # внешний timeout + manual fallback на отдельный fallback
             # клиент.
             _per_call_timeout = get_settings().mimo_request_timeout_seconds
+            _stream_final_text = (
+                settings.ack_streaming_enabled
+                and _ack_progress is not None
+                and getattr(_ack_progress, "enabled", False)
+                and _iter > 0
+            )
+
+            def _stream_to_ack(text: str) -> None:
+                if not _stream_final_text or _ack_progress is None:
+                    return
+                try:
+                    _ack_progress.schedule_stream_text(
+                        text,
+                        min_interval_seconds=(
+                            settings.ack_streaming_min_interval_seconds
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("ack stream schedule failed", exc_info=True)
+
             try:
-                ai_msg = invoke_with_per_call_timeout(
+                ai_msg = await ainvoke_with_streaming_timeout(
                     llm_with_tools,
                     messages,
                     timeout_seconds=_per_call_timeout,
+                    on_text_update=_stream_to_ack if _stream_final_text else None,
                 )
             except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
                 # Любая ошибка primary (timeout / 5xx / rate limit) →
@@ -2642,10 +2666,11 @@ def execute_conversation_chat(
                 )
                 _trace_meta["fallback"] = True
                 _trace_meta["primary_exc"] = exc_type
-                ai_msg = invoke_with_per_call_timeout(
+                ai_msg = await ainvoke_with_streaming_timeout(
                     _fallback_with_tools,
                     messages,
                     timeout_seconds=_per_call_timeout,
+                    on_text_update=_stream_to_ack if _stream_final_text else None,
                 )
             usage = getattr(ai_msg, "usage_metadata", None) or {}
             _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)

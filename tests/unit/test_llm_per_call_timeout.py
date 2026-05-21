@@ -10,12 +10,19 @@ Helper кидает LLMCallTimeout (TimeoutError) → langchain ловит и
 
 from __future__ import annotations
 
+import asyncio
 import time
 from unittest.mock import MagicMock
 
 import pytest
 
-from sreda.services.llm import LLMCallTimeout, invoke_with_per_call_timeout
+from langchain_core.messages import AIMessageChunk
+
+from sreda.services.llm import (
+    LLMCallTimeout,
+    ainvoke_with_streaming_timeout,
+    invoke_with_per_call_timeout,
+)
 
 
 class _SlowRunnable:
@@ -41,6 +48,22 @@ class _RaisingRunnable:
 
     def invoke(self, _messages):
         raise self.exc
+
+
+class _StreamingRunnable:
+    def stream(self, _messages):
+        yield AIMessageChunk(content="При")
+        yield AIMessageChunk(content="вет")
+
+    def invoke(self, _messages):
+        raise AssertionError("streaming path should not call invoke")
+
+
+class _SlowStreamingRunnable:
+    def stream(self, _messages):
+        yield AIMessageChunk(content="Поч")
+        time.sleep(3.0)
+        yield AIMessageChunk(content="ти готово")
 
 
 def test_returns_immediately_on_fast_runnable():
@@ -118,3 +141,37 @@ def test_fallback_chain_simulation():
         )
 
     assert result == "fast-result"
+
+
+def test_streaming_helper_emits_incremental_text_and_returns_final_message():
+    updates: list[str] = []
+
+    result = asyncio.run(
+        ainvoke_with_streaming_timeout(
+            _StreamingRunnable(),
+            [],
+            timeout_seconds=5.0,
+            on_text_update=updates.append,
+        )
+    )
+
+    assert result.content == "Привет"
+    assert updates == ["При", "Привет"]
+
+
+def test_streaming_helper_times_out_mid_stream():
+    updates: list[str] = []
+    start = time.monotonic()
+
+    with pytest.raises(LLMCallTimeout):
+        asyncio.run(
+            ainvoke_with_streaming_timeout(
+                _SlowStreamingRunnable(),
+                [],
+                timeout_seconds=0.3,
+                on_text_update=updates.append,
+            )
+        )
+
+    assert time.monotonic() - start < 2.0
+    assert updates == ["Поч"]

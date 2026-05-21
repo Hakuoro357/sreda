@@ -229,6 +229,12 @@ class Settings(BaseSettings):
     ack_edit_max_enabled: bool = Field(
         default=True, validation_alias="SREDA_ACK_EDIT_MAX_ENABLED"
     )
+    ack_streaming_enabled: bool = Field(
+        default=True, validation_alias="SREDA_ACK_STREAMING_ENABLED"
+    )
+    ack_streaming_min_interval_seconds: float = Field(
+        default=0.8, validation_alias="SREDA_ACK_STREAMING_MIN_INTERVAL_SECONDS"
+    )
 
     # Speech recognition provider:
     #   ``yandex``        — Yandex SpeechKit only (current default).

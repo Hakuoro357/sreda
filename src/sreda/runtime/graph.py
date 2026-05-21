@@ -28,6 +28,7 @@ change in ``_make_checkpointer``.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from datetime import UTC, datetime
@@ -287,7 +288,7 @@ def node_policy_guard(state: AssistantGraphState, config: RunnableConfig) -> dic
     }
 
 
-def node_execute_action(state: AssistantGraphState, config: RunnableConfig) -> dict:
+async def node_execute_action(state: AssistantGraphState, config: RunnableConfig) -> dict:
     session = _session(config)
     action = _action(state)
     # Pass state-level snapshots down to the handler via ``context`` so
@@ -317,6 +318,8 @@ def node_execute_action(state: AssistantGraphState, config: RunnableConfig) -> d
 
     try:
         replies = handler(session, action, context)
+        if inspect.isawaitable(replies):
+            replies = await replies
     except ActionRuntimeError as exc:
         return {
             "error_code": exc.code,

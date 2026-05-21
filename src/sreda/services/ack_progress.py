@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import time
 from typing import Any, Awaitable
 
 from sreda.services import trace
@@ -32,6 +33,8 @@ class AckProgressController:
         self._tail: asyncio.Task | None = None
         self._previous_progress: str | None = None
         self._final_edit_planned = False
+        self._last_stream_edit_at = 0.0
+        self._last_stream_text: str | None = None
 
     @property
     def final_edit_planned(self) -> bool:
@@ -64,6 +67,29 @@ class AckProgressController:
 
     def schedule_almost_done(self) -> None:
         self.schedule_progress(FINAL_PROGRESS_TEXT)
+
+    def schedule_stream_text(
+        self,
+        text: str,
+        *,
+        min_interval_seconds: float = 0.8,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+        normalized = text.strip()
+        if not normalized or normalized == self._last_stream_text:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and self._last_stream_edit_at
+            and now - self._last_stream_edit_at < min_interval_seconds
+        ):
+            return
+        self._last_stream_edit_at = now
+        self._last_stream_text = normalized
+        self._schedule_edit(normalized, event_name="ack.stream_edit")
 
     def _schedule_edit(self, text: str, *, event_name: str) -> None:
         try:

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
@@ -163,6 +163,15 @@ class _BoundFakeLLM:
         return msg
 
 
+class _BoundStreamingFinalFakeLLM(_BoundFakeLLM):
+    def stream(self, messages):
+        msg = self.invoke(messages)
+        content = str(msg.content or "")
+        midpoint = max(1, len(content) // 2)
+        yield AIMessageChunk(content=content[:midpoint])
+        yield AIMessageChunk(content=content[midpoint:])
+
+
 class FakeLLM:
     """Duck-types just enough of ChatOpenAI to run our handler.
 
@@ -189,12 +198,32 @@ class FakeLLM:
         return self._bound.calls[-1] if self._bound.calls else None
 
 
+class StreamingFinalFakeLLM(FakeLLM):
+    def __init__(self, responses: list[AIMessage]) -> None:
+        self._bound = _BoundStreamingFinalFakeLLM(responses)
+
+
 class FakeTelegram:
     def __init__(self) -> None:
         self.sent: list[dict] = []
+        self.edited: list[dict] = []
+        self.deleted: list[dict] = []
 
     async def send_message(self, chat_id: str, text: str, reply_markup=None, **kwargs):
         self.sent.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+        return {"ok": True}
+
+    async def edit_message_text(self, *, chat_id, message_id, text, reply_markup=None):
+        self.edited.append({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": reply_markup,
+        })
+        return {"ok": True}
+
+    async def delete_message(self, *, chat_id, message_id):
+        self.deleted.append({"chat_id": chat_id, "message_id": message_id})
         return {"ok": True}
 
 
@@ -358,6 +387,56 @@ def test_conversation_saves_core_fact_via_tool_call(monkeypatch, tmp_path: Path)
 
     assert len(telegram.sent) == 1
     assert "дочь Маша" in telegram.sent[0]["text"]
+
+
+def test_conversation_streams_final_answer_into_ack_after_tool_call(
+    monkeypatch, tmp_path: Path
+):
+    session = _bootstrap(monkeypatch, tmp_path, "conv_stream.db")
+    try:
+        scripted = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "save_core_fact",
+                        "args": {"content": "у меня дочь Маша 9 лет"},
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+            ),
+            AIMessage(content="Запомнил — дочь Маша, 9 лет."),
+        ]
+        fake_llm = StreamingFinalFakeLLM(scripted)
+        telegram = FakeTelegram()
+
+        from sreda.services.ack_progress import TelegramAckProgressController
+
+        ack_progress = TelegramAckProgressController(
+            telegram_client=telegram,
+            chat_id="100000001",
+            ack_message_id_future=555,
+            enabled=True,
+        )
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+            ack_progress_controller=ack_progress,
+        )
+        queued = svc.enqueue_action(_chat_envelope("у меня дочь Маша 9 лет"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    edited_texts = [item["text"] for item in telegram.edited]
+    assert telegram.sent == []
+    assert any(
+        text.startswith("Запомнил") and text != "Запомнил — дочь Маша, 9 лет."
+        for text in edited_texts
+    )
+    assert edited_texts[-1] == "Запомнил — дочь Маша, 9 лет."
 
 
 def test_conversation_saves_episode_via_tool_call(monkeypatch, tmp_path: Path):
