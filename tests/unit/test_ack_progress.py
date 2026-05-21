@@ -159,3 +159,24 @@ def test_telegram_final_edit_keeps_stream_partial_visible_briefly():
     assert result == "edited"
     assert [item["text"] for item in tg.edits] == ["При", "Привет"]
     assert elapsed >= 0.04
+
+
+def test_telegram_final_edit_skips_when_stream_already_has_same_text():
+    tg = _FakeTelegram()
+    controller = TelegramAckProgressController(
+        telegram_client=tg,
+        chat_id="42",
+        ack_message_id_future=123,
+        enabled=True,
+    )
+
+    async def _run():
+        controller.schedule_stream_text("Привет", min_interval_seconds=0)
+        await controller.drain()
+        return await controller.edit_final_or_fallback("Привет")
+
+    result = asyncio.run(_run())
+
+    assert result == "edited"
+    assert [item["text"] for item in tg.edits] == ["Привет"]
+    assert tg.sent == []

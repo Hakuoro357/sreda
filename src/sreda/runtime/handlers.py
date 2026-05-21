@@ -2589,15 +2589,14 @@ async def execute_conversation_chat(
             # внешний timeout + manual fallback на отдельный fallback
             # клиент.
             _per_call_timeout = get_settings().mimo_request_timeout_seconds
-            _stream_final_text = (
+            _stream_visible_text = (
                 settings.ack_streaming_enabled
                 and _ack_progress is not None
                 and getattr(_ack_progress, "enabled", False)
-                and _iter > 0
             )
 
             def _stream_to_ack(text: str) -> None:
-                if not _stream_final_text or _ack_progress is None:
+                if not _stream_visible_text or _ack_progress is None:
                     return
                 try:
                     _ack_progress.schedule_stream_text(
@@ -2614,7 +2613,7 @@ async def execute_conversation_chat(
                     llm_with_tools,
                     messages,
                     timeout_seconds=_per_call_timeout,
-                    on_text_update=_stream_to_ack if _stream_final_text else None,
+                    on_text_update=_stream_to_ack if _stream_visible_text else None,
                 )
             except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
                 # Любая ошибка primary (timeout / 5xx / rate limit) →
@@ -2670,7 +2669,7 @@ async def execute_conversation_chat(
                     _fallback_with_tools,
                     messages,
                     timeout_seconds=_per_call_timeout,
-                    on_text_update=_stream_to_ack if _stream_final_text else None,
+                    on_text_update=_stream_to_ack if _stream_visible_text else None,
                 )
             usage = getattr(ai_msg, "usage_metadata", None) or {}
             _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
@@ -3134,6 +3133,17 @@ async def execute_conversation_chat(
                     action.tenant_id,
                 )
                 reply_markup = None
+
+    if (
+        _ack_progress is not None
+        and getattr(_ack_progress, "enabled", False)
+        and reply_markup is None
+        and hasattr(_ack_progress, "flush_stream_final_text")
+    ):
+        try:
+            await _ack_progress.flush_stream_final_text(text)
+        except Exception:  # noqa: BLE001
+            logger.debug("ack final stream flush failed", exc_info=True)
 
     # Trace breadcrumb — in /admin/logs filtering by trace_id you'll
     # see whether this turn had to rescue an earlier AI message.

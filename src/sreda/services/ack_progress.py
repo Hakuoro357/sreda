@@ -93,6 +93,18 @@ class AckProgressController:
         self._last_stream_min_visible_seconds = min_interval_seconds
         self._schedule_edit(normalized, event_name="ack.stream_edit")
 
+    def has_stream_text(self) -> bool:
+        return bool(self._last_stream_text)
+
+    def is_stream_text_current(self, text: str) -> bool:
+        return bool(self._last_stream_text) and self._last_stream_text == text.strip()
+
+    async def flush_stream_final_text(self, text: str) -> None:
+        if not self.enabled or not self.has_stream_text():
+            return
+        self.schedule_stream_text(text, min_interval_seconds=0, force=True)
+        await self.drain()
+
     async def keep_stream_partial_visible(self, final_text: str) -> None:
         if not self._last_stream_text or self._last_stream_text == final_text.strip():
             return
@@ -195,6 +207,9 @@ class TelegramAckProgressController(AckProgressController):
             message_id = await self.ack_message_id()
             if message_id:
                 self.mark_final_edit_planned()
+                if reply_markup is None and self.is_stream_text_current(text):
+                    trace.record("ack.final_edit", status="skipped_same_text")
+                    return "edited"
                 for attempt in range(2):
                     try:
                         await self._edit_once(

@@ -298,6 +298,26 @@ def test_worker_edits_max_ack_message_instead_of_sending_new_message(session):
     }]
 
 
+def test_worker_skips_max_ack_final_edit_when_already_visible(session):
+    max_client = FakeMax()
+    worker = OutboxDeliveryWorker(session, max_client=max_client)
+    row = _max_outbox_row(text="Финальный ответ", ack_message_id="ack-mid-1")
+    payload = json.loads(row.payload_json)
+    payload["_ack_final_already_visible"] = True
+    row.payload_json = json.dumps(payload, ensure_ascii=False)
+    session.add(row)
+    session.commit()
+
+    processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 23, 0)))
+
+    assert processed == 1
+    session.refresh(row)
+    assert row.status == "sent"
+    assert max_client.edited == []
+    assert max_client.sent == []
+    assert max_client.deleted == []
+
+
 def test_worker_retries_max_ack_edit_then_falls_back_to_send(session):
     max_client = FakeMax()
     max_client.edit_failures = 2

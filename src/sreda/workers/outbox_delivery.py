@@ -278,6 +278,9 @@ class OutboxDeliveryWorker:
 
         trace_payload = payload.pop("_trace", None)
         ack_edit_message_id = payload.pop("_ack_edit_message_id", None)
+        ack_final_already_visible = bool(
+            payload.pop("_ack_final_already_visible", False)
+        )
         chat_id = payload.get("chat_id")
         text = payload.get("text", "")
 
@@ -313,6 +316,15 @@ class OutboxDeliveryWorker:
 
         try:
             if ack_edit_message_id:
+                if ack_final_already_visible and not attachments:
+                    row.status = "sent"
+                    self._emit_trace(
+                        trace_payload,
+                        chat_id=chat_id,
+                        status="sent_ack_already_visible",
+                    )
+                    self.session.commit()
+                    return
                 edit_sent = False
                 for attempt in range(2):
                     try:

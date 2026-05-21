@@ -168,6 +168,18 @@ class _BoundFakeLLM:
 class _BoundStreamingFinalFakeLLM(_BoundFakeLLM):
     def stream(self, messages):
         msg = self.invoke(messages)
+        if getattr(msg, "tool_calls", None):
+            for idx, tc in enumerate(msg.tool_calls):
+                yield AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[{
+                        "name": tc.get("name"),
+                        "args": json.dumps(tc.get("args") or {}, ensure_ascii=False),
+                        "id": tc.get("id"),
+                        "index": idx,
+                    }],
+                )
+            return
         content = str(msg.content or "")
         midpoint = max(1, len(content) // 2)
         yield AIMessageChunk(content=content[:midpoint])
@@ -459,6 +471,44 @@ def test_conversation_streams_final_answer_into_ack_after_tool_call(
     assert edited_texts[-1] == "Запомнил — дочь Маша, 9 лет."
 
 
+def test_conversation_streams_plain_final_answer_into_ack(
+    monkeypatch, tmp_path: Path
+):
+    session = _bootstrap(monkeypatch, tmp_path, "conv_plain_stream.db")
+    try:
+        telegram = FakeTelegram()
+        from sreda.services.ack_progress import TelegramAckProgressController
+
+        ack_progress = TelegramAckProgressController(
+            telegram_client=telegram,
+            chat_id="100000001",
+            ack_message_id_future=555,
+            enabled=True,
+        )
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=StreamingFinalFakeLLM([
+                AIMessage(content="Привет, Борис! Чем могу помочь?"),
+            ]),
+            embedding_client=ConstantEmbeddingClient(),
+            ack_progress_controller=ack_progress,
+        )
+        queued = svc.enqueue_action(_chat_envelope("Привет"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    edited_texts = [item["text"] for item in telegram.edited]
+    assert telegram.sent == []
+    assert any(
+        text.startswith("Привет") and text != "Привет, Борис! Чем могу помочь?"
+        for text in edited_texts
+    )
+    assert edited_texts[-1] == "Привет, Борис! Чем могу помочь?"
+    assert edited_texts.count("Привет, Борис! Чем могу помочь?") == 1
+
+
 def test_conversation_max_waits_before_final_ack_edit_outbox(
     monkeypatch, tmp_path: Path
 ):
@@ -469,6 +519,7 @@ def test_conversation_max_waits_before_final_ack_edit_outbox(
         def __init__(self) -> None:
             self.streamed: list[str] = []
             self.keep_visible_calls: list[str] = []
+            self.current_text: str | None = None
 
         def schedule_progress(self, text=None):
             pass
@@ -478,6 +529,16 @@ def test_conversation_max_waits_before_final_ack_edit_outbox(
 
         def schedule_stream_text(self, text, *, min_interval_seconds=0.8, force=False):
             self.streamed.append(text)
+            self.current_text = text.strip()
+
+        def has_stream_text(self):
+            return self.current_text is not None
+
+        def is_stream_text_current(self, text: str):
+            return self.current_text == text.strip()
+
+        async def flush_stream_final_text(self, text: str):
+            self.schedule_stream_text(text, min_interval_seconds=0, force=True)
 
         async def drain(self):
             pass
@@ -525,6 +586,7 @@ def test_conversation_max_waits_before_final_ack_edit_outbox(
     assert ack_progress.keep_visible_calls == ["Запомнил — дочь Маша, 9 лет."]
     assert ack_progress.final_edit_planned is True
     assert payload["_ack_edit_message_id"] == "max-ack-1"
+    assert payload["_ack_final_already_visible"] is True
 
 
 def test_conversation_saves_episode_via_tool_call(monkeypatch, tmp_path: Path):
