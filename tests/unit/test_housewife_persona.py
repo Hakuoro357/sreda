@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sreda.db.base import Base
 from sreda.db.models.core import Tenant, User
 from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.services.channel_linking import consume_link, start_link
 from sreda.services.housewife_persona import (
     DEFAULT_PERSONA_PRESET,
     PERSONA_TENDER_CARE,
@@ -20,11 +21,21 @@ from sreda.services.housewife_persona import (
     normalize_persona_preset,
     set_persona_preset,
 )
+from sreda.services.onboarding import (
+    ensure_max_user_bundle,
+    ensure_telegram_user_bundle,
+    find_user_by_chat_id,
+    find_user_by_max_account_id,
+)
 
 
 @pytest.fixture()
 def session():
     engine = create_engine("sqlite:///:memory:")
+    import sreda.db.models.audit  # noqa: F401
+    import sreda.db.models.checklists  # noqa: F401
+    import sreda.db.models.free_tier  # noqa: F401
+
     Base.metadata.create_all(engine)
     sess = sessionmaker(bind=engine)()
     sess.add(Tenant(id="t1", name="Tenant 1"))
@@ -90,6 +101,151 @@ def test_set_persona_preset_rejects_unknown_preset(session) -> None:
             user_id="u1",
             preset="too_much_sugar",
         )
+
+
+def test_linked_tg_and_max_channels_share_single_persona(session) -> None:
+    user = session.get(User, "u1")
+    user.max_account_id = "max42"
+    user.max_chat_id = "chat42"
+    session.commit()
+
+    tg_user = find_user_by_chat_id(session, "42")
+    max_user = find_user_by_max_account_id(session, "max42")
+    assert tg_user is not None
+    assert max_user is not None
+    assert tg_user.id == max_user.id == "u1"
+    assert tg_user.tenant_id == max_user.tenant_id == "t1"
+
+    tg_onboarding = ensure_telegram_user_bundle(
+        session,
+        {"message": {"chat": {"id": 42}, "from": {"first_name": "Boris"}}},
+    )
+    max_onboarding = ensure_max_user_bundle(
+        session,
+        max_account_id="max42",
+        max_chat_id="chat42",
+        display_name="Boris",
+    )
+    assert tg_onboarding.user_id == max_onboarding.user_id == "u1"
+    assert tg_onboarding.tenant_id == max_onboarding.tenant_id == "t1"
+
+    set_persona_preset(
+        session,
+        tenant_id=max_onboarding.tenant_id,
+        user_id=max_onboarding.user_id,
+        preset=PERSONA_TENDER_CARE,
+        source="user_command",
+    )
+    session.commit()
+    assert get_persona_preset(
+        session,
+        tenant_id=tg_onboarding.tenant_id,
+        user_id=tg_onboarding.user_id,
+    ) == PERSONA_TENDER_CARE
+
+    set_persona_preset(
+        session,
+        tenant_id=tg_onboarding.tenant_id,
+        user_id=tg_onboarding.user_id,
+        preset=PERSONA_WARM_PRACTICAL,
+        source="user_command",
+    )
+    session.commit()
+    assert get_persona_preset(
+        session,
+        tenant_id=max_onboarding.tenant_id,
+        user_id=max_onboarding.user_id,
+    ) == PERSONA_WARM_PRACTICAL
+
+
+def test_channel_linking_keeps_existing_persona_single_scoped(session) -> None:
+    set_persona_preset(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        preset=PERSONA_TENDER_CARE,
+        source="user_command",
+    )
+    session.commit()
+
+    link = start_link(
+        session,
+        tenant_id="t1",
+        source_channel="telegram",
+        source_user_id="u1",
+    )
+    outcome = consume_link(
+        session,
+        raw_token=link.raw_token,
+        target_channel="max",
+        target_account_id="max42",
+        target_chat_id="chat42",
+    )
+    assert outcome.success is True
+    assert outcome.tenant_id == "t1"
+
+    max_onboarding = ensure_max_user_bundle(
+        session,
+        max_account_id="max42",
+        max_chat_id="chat42",
+        display_name="Boris",
+    )
+    assert max_onboarding.tenant_id == "t1"
+    assert max_onboarding.user_id == "u1"
+    assert get_persona_preset(
+        session,
+        tenant_id=max_onboarding.tenant_id,
+        user_id=max_onboarding.user_id,
+    ) == PERSONA_TENDER_CARE
+
+
+def test_max_to_tg_channel_linking_keeps_existing_persona_single_scoped(
+    session,
+) -> None:
+    user = session.get(User, "u1")
+    user.telegram_account_id = None
+    user.tg_account_hash = None
+    user.max_account_id = "max42"
+    user.max_chat_id = "chat42"
+    session.commit()
+
+    set_persona_preset(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        preset=PERSONA_TENDER_CARE,
+        source="user_command",
+    )
+    session.commit()
+
+    link = start_link(
+        session,
+        tenant_id="t1",
+        source_channel="max",
+        source_user_id="u1",
+        tg_bot_username="sreda_test_bot",
+        tg_miniapp_shortname="app",
+    )
+    outcome = consume_link(
+        session,
+        raw_token=link.raw_token,
+        target_channel="telegram",
+        target_account_id="42",
+    )
+    assert outcome.success is True
+    assert outcome.tenant_id == "t1"
+
+    tg_onboarding = ensure_telegram_user_bundle(
+        session,
+        {"message": {"chat": {"id": 42}, "from": {"first_name": "Boris"}}},
+    )
+    assert tg_onboarding.tenant_id == "t1"
+    assert tg_onboarding.user_id == "u1"
+    assert get_persona_preset(
+        session,
+        tenant_id=tg_onboarding.tenant_id,
+        user_id=tg_onboarding.user_id,
+    ) == PERSONA_TENDER_CARE
 
 
 def test_persona_overlays_are_distinct() -> None:
