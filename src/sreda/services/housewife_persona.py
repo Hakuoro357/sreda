@@ -20,6 +20,7 @@ VALID_PERSONA_PRESETS = frozenset({
 PERSONA_PRESET_PARAM = "persona_preset"
 PERSONA_SELECTED_AT_PARAM = "persona_selected_at"
 PERSONA_SOURCE_PARAM = "persona_source"
+PERSONA_READY_CALLBACK = "persona_ready"
 
 _PERSONA_SETTINGS_PHRASES = (
     "поменяй стиль общения",
@@ -192,12 +193,20 @@ def build_persona_selected_message(preset: str | None) -> str:
     )
 
 
+def build_persona_ready_message() -> str:
+    return "Хорошо. Пиши или говори голосом, что нужно сделать."
+
+
 def build_persona_selected_keyboard_tg() -> dict:
     return {
         "inline_keyboard": [[
             {
-                "text": "Расскажи поподробнее",
+                "text": "Расскажи подробнее",
                 "callback_data": "pb:intro",
+            },
+            {
+                "text": "Давай сразу",
+                "callback_data": PERSONA_READY_CALLBACK,
             }
         ]]
     }
@@ -210,8 +219,13 @@ def build_persona_selected_keyboard_max() -> list[dict]:
             "buttons": [[
                 {
                     "type": "callback",
-                    "text": "Расскажи поподробнее",
+                    "text": "Расскажи подробнее",
                     "payload": "pb:intro",
+                },
+                {
+                    "type": "callback",
+                    "text": "Давай сразу",
+                    "payload": PERSONA_READY_CALLBACK,
                 }
             ]]
         },

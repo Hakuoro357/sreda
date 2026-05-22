@@ -1308,6 +1308,54 @@ async def _handle_max_callback(
 
         return True
 
+    if data == "persona_ready":
+        from sreda.services.housewife_persona import build_persona_ready_message
+
+        if callback_id:
+            try:
+                await max_client.answer_callback(str(callback_id), notification="")
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "max persona_ready callback ack failed — continuing",
+                    exc_info=True,
+                )
+
+        msg = payload.get("message")
+        cb_message_mid: str | None = None
+        if isinstance(msg, dict):
+            body = msg.get("body")
+            if isinstance(body, dict) and body.get("mid"):
+                cb_message_mid = str(body["mid"])
+
+        reply_text = build_persona_ready_message()
+        edited = False
+        if cb_message_mid:
+            try:
+                await max_client.edit_message(
+                    cb_message_mid,
+                    text=reply_text,
+                    attachments=[],
+                )
+                edited = True
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "max persona_ready: edit_message failed mid=%s tenant=%s: %s "
+                    "— fallback to send_message",
+                    cb_message_mid, onboarding.tenant_id, exc,
+                )
+
+        if not edited and getattr(onboarding, "max_chat_id", None):
+            try:
+                await max_client.send_message(
+                    recipient={"chat_id": onboarding.max_chat_id},
+                    text=reply_text,
+                    attachments=[],
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("max persona_ready: delivery failed", exc_info=True)
+
+        return True
+
     # Прочие callbacks (billing/profile/eds/pb/btn_reply) пока — generic ack +
     # дальше через dispatcher. pb:/btn_reply: handlers — TG-specific, для
     # MAX отдельный issue (нет 1:1 editMessageText API parity yet).
@@ -1765,6 +1813,10 @@ _KNOWN_MAX_CALLBACK_PREFIXES: tuple[str, ...] = (
     "cancel_link:",   # channel-link cancellation (handled earlier)
 )
 
+_KNOWN_MAX_CALLBACK_EXACT: frozenset[str] = frozenset({
+    "persona_ready",  # housewife persona onboarding skip
+})
+
 
 def _max_callback_payload(payload: dict) -> str | None:
     """Extract `callback.payload` string from MAX update. Returns None if
@@ -1792,6 +1844,8 @@ def _is_unknown_max_callback_prefix(payload: dict) -> bool:
     if cb_data is None:
         # message_callback но payload не строка / отсутствует → unknown
         return True
+    if cb_data in _KNOWN_MAX_CALLBACK_EXACT:
+        return False
     return not any(
         cb_data.startswith(p) for p in _KNOWN_MAX_CALLBACK_PREFIXES
     )

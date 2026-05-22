@@ -112,9 +112,9 @@ async def test_telegram_persona_callback_stores_preset_and_edits_message(
     assert client.sends == []
     assert client.edits[0]["message_id"] == 100
     assert "ласково" in client.edits[0]["text"]
-    assert client.edits[0]["reply_markup"]["inline_keyboard"][0][0][
-        "callback_data"
-    ] == "pb:intro"
+    buttons = client.edits[0]["reply_markup"]["inline_keyboard"][0]
+    assert buttons[0]["callback_data"] == "pb:intro"
+    assert buttons[1]["callback_data"] == "persona_ready"
 
 
 @pytest.mark.asyncio
@@ -154,10 +154,81 @@ async def test_max_persona_callback_stores_preset_and_edits_message(
     assert client.sends == []
     assert client.edits[0]["message_id"] == "mid1"
     assert "спокойно" in client.edits[0]["text"]
-    assert client.edits[0]["attachments"][0]["payload"]["buttons"][0][0][
-        "payload"
-    ] == "pb:intro"
+    buttons = client.edits[0]["attachments"][0]["payload"]["buttons"][0]
+    assert buttons[0]["payload"] == "pb:intro"
+    assert buttons[1]["payload"] == "persona_ready"
     assert client.answered == [("cb1", "")]
+
+
+@pytest.mark.asyncio
+async def test_telegram_persona_ready_callback_edits_message_and_removes_keyboard(
+    session,
+) -> None:
+    client = FakeTelegramClient()
+    onboarding = TelegramOnboardingResult(
+        is_new_user=False,
+        chat_id="42",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    await _handle_callback(
+        session,
+        telegram_client=client,
+        callback_query={
+            "id": "cb_ready",
+            "data": "persona_ready",
+            "message": {"message_id": 101},
+        },
+        onboarding=onboarding,
+        bot_key="telegram_default",
+        payload={},
+        inbound_message_id=None,
+    )
+
+    assert client.answered == [("cb_ready", "")]
+    assert client.sends == []
+    assert client.edits[0]["message_id"] == 101
+    assert "пиши или говори голосом" in client.edits[0]["text"].lower()
+    assert client.edits[0]["reply_markup"] == {"inline_keyboard": []}
+
+
+@pytest.mark.asyncio
+async def test_max_persona_ready_callback_edits_message_and_removes_keyboard(
+    session,
+) -> None:
+    client = FakeMaxClient()
+    onboarding = MaxOnboardingResult(
+        is_new_user=False,
+        max_account_id="max1",
+        max_chat_id="chat1",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    handled = await _handle_max_callback(
+        session=session,
+        max_client=client,
+        payload={
+            "callback": {
+                "callback_id": "cb_ready",
+                "payload": "persona_ready",
+            },
+            "message": {"body": {"mid": "mid_ready"}},
+        },
+        onboarding=onboarding,
+    )
+
+    assert handled is True
+    assert client.answered == [("cb_ready", "")]
+    assert client.sends == []
+    assert client.edits[0]["message_id"] == "mid_ready"
+    assert "пиши или говори голосом" in client.edits[0]["text"].lower()
+    assert client.edits[0]["attachments"] == []
 
 
 @pytest.mark.asyncio

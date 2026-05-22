@@ -428,6 +428,71 @@ async def _handle_callback(
                     )
         return
 
+    if data == "persona_ready":
+        from sreda.services.housewife_persona import (
+            build_persona_ready_message,
+        )
+
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(str(callback_id), text="")
+            except TelegramDeliveryError as exc:
+                if exc.status_code == 400:
+                    logger.info(
+                        "persona_ready: callback expired (400) tenant=%s — drop",
+                        onboarding.tenant_id,
+                    )
+                    return
+                logger.warning(
+                    "persona_ready: callback ack failed status=%s: %s",
+                    exc.status_code, exc,
+                )
+
+        if onboarding.chat_id:
+            cb_message = (
+                callback_query.get("message")
+                if isinstance(callback_query, dict) else None
+            )
+            msg_id = (
+                cb_message.get("message_id")
+                if isinstance(cb_message, dict) else None
+            )
+            reply_text = build_persona_ready_message()
+            reply_markup = {"inline_keyboard": []}
+            edited = False
+            if msg_id is not None:
+                try:
+                    await telegram_client.edit_message_text(
+                        chat_id=str(onboarding.chat_id),
+                        message_id=int(msg_id),
+                        text=reply_text,
+                        reply_markup=reply_markup,
+                    )
+                    edited = True
+                except TelegramDeliveryError as exc:
+                    if exc.status_code == 400 and "not modified" in (
+                        str(exc) or ""
+                    ).lower():
+                        edited = True
+                    else:
+                        logger.info(
+                            "persona_ready: editMessageText failed status=%s — "
+                            "fallback to send_message",
+                            exc.status_code,
+                        )
+            if not edited:
+                try:
+                    await telegram_client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=reply_text,
+                    )
+                except TelegramDeliveryError as exc:
+                    logger.warning(
+                        "persona_ready: delivery failed status=%s: %s",
+                        exc.status_code, exc,
+                    )
+        return
+
     # Pending-bot tour callbacks (`pb:<branch>`). 2026-04-28: эти кнопки
     # используются ДВАЖДЫ. (1) В pending-фазе (до approve) — обрабатываются
     # в `telegram_webhook.py` ДО approval-gate. (2) После approve, во

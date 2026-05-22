@@ -22,6 +22,7 @@ Fix: sync detection unknown callback prefix через
 from __future__ import annotations
 
 from sreda.services.max_inbound import (
+    _KNOWN_MAX_CALLBACK_EXACT,
     _KNOWN_MAX_CALLBACK_PREFIXES,
     _is_unknown_max_callback_prefix,
     _max_callback_payload,
@@ -48,6 +49,15 @@ def test_known_pb_is_not_unknown() -> None:
     payload = {
         "update_type": "message_callback",
         "callback": {"payload": "pb:intro"},
+    }
+    assert _is_unknown_max_callback_prefix(payload) is False
+
+
+def test_known_persona_ready_is_not_unknown() -> None:
+    """persona_ready routed by persona onboarding skip handler."""
+    payload = {
+        "update_type": "message_callback",
+        "callback": {"payload": "persona_ready"},
     }
     assert _is_unknown_max_callback_prefix(payload) is False
 
@@ -102,6 +112,15 @@ def test_unknown_random_prefix_detected() -> None:
     payload = {
         "update_type": "message_callback",
         "callback": {"payload": "future_feature:42"},
+    }
+    assert _is_unknown_max_callback_prefix(payload) is True
+
+
+def test_unknown_persona_ready_suffix_detected() -> None:
+    """persona_ready is an exact callback, not a broad prefix."""
+    payload = {
+        "update_type": "message_callback",
+        "callback": {"payload": "persona_ready_xyz"},
     }
     assert _is_unknown_max_callback_prefix(payload) is True
 
@@ -191,3 +210,4 @@ def test_known_prefixes_constant_includes_all_handlers() -> None:
     # Length sanity — full match check (set comparison above уже implies
     # equal cardinality для unique-element tuples).
     assert len(_KNOWN_MAX_CALLBACK_PREFIXES) == len(expected)
+    assert _KNOWN_MAX_CALLBACK_EXACT == {"persona_ready"}
