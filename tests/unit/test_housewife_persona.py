@@ -108,6 +108,11 @@ def test_persona_choice_message_and_keyboards() -> None:
     message = build_persona_choice_message()
     assert "Я Среда" in message
     assert "Помогаю с бытовой рутиной" in message
+    assert "• 🎙 понимаю голос" in message
+    assert "• ⏰ напоминаю о делах" in message
+    assert "• 🛒 веду список покупок" in message
+    assert "• 🍽 составляю меню" in message
+    assert "• 🧠 запоминаю важное про семью" in message
     assert "Я понимаю голос" in message
 
     tg = build_persona_choice_keyboard_tg()
