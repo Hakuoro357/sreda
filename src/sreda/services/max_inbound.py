@@ -252,8 +252,8 @@ async def handle_max_update(
 
         # Broadcast pattern (2026-05-09): pb:* callbacks от approved
         # юзеров тоже должны запускать pending_bot wizard. Это позволяет
-        # post-approve welcome message с кнопкой «Расскажи поподробнее»
-        # → callback `pb:intro` → wizard editMessage flow. Без этой ветки
+        # post-approve welcome message с кнопкой «Покажи примеры»
+        # → callback `pb:voice` → wizard editMessage flow. Без этой ветки
         # callback'и от approved юзеров silent-drop'ились.
         is_pb_callback = (
             update_type == "message_callback"
@@ -1718,11 +1718,11 @@ async def _handle_max_pending_tenant(
     """Send pending welcome message via MaxClient.
 
     Mirror TG ``_handle_pending_tenant``:
-    - bot_started: send intro (pending_bot.match(None)) с inline buttons
+    - bot_started: send first tour screen (pending_bot.match(None)) with buttons
     - message_callback с payload "pb:*": **edit** original message
       in place (mirror TG editMessageText flow), fallback to send.
       Also acks the callback to remove "loading" UX.
-    - message_created: silent (юзер видел intro; spam'инг неуместно)
+    - message_created: silent (юзер видел первый экран; spam'инг неуместно)
     - другое: silent
 
     Errors swallowed — pending welcome это UX sugar, не correctness-critical.
@@ -1750,7 +1750,7 @@ async def _handle_max_pending_tenant(
     cb_message_mid: str | None = None
 
     if update_type == "bot_started":
-        # Intro branch — pending_bot.match(None) returns intro reply
+        # First branch — pending_bot.match(None) returns voice reply
         pass  # input_text=None, is_callback=False
     elif update_type == "message_callback":
         callback = payload.get("callback") or {}
@@ -1777,7 +1777,7 @@ async def _handle_max_pending_tenant(
 
     # Determine current branch for navigation keyboard.
     from sreda.services.pending_bot import _BRANCHES as _PB_BRANCHES
-    current_branch = "intro"
+    current_branch = "voice"
     if is_callback and input_text:
         raw = input_text.removeprefix("pb:").strip()
         if raw in _PB_BRANCHES:

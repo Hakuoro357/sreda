@@ -1,18 +1,17 @@
 """Pending-bot — чейнинг приветственных сообщений для юзеров в pending-approve.
 
 Юзер делает /start → `Tenant.approved_at IS NULL` → раньше webhook
-silent-drop'ил. Сейчас pending-бот отвечает цепочкой из 5 сообщений:
+silent-drop'ил. Сейчас pending-бот отвечает цепочкой из 4 сообщений:
 
-  1. intro   → представление + краткий список доменов + «тапай кнопки»
-  2. voice   → блок про голос (основной режим)
-  3. routine → бытовые сценарии
-  4. memory  → запоминаю важное (расписание, дела, покупки, рецепты,
+  1. voice   → блок про голос (основной режим)
+  2. routine → ежедневные дела
+  3. memory  → запоминаю важное (расписание, дела, покупки, рецепты,
                 семью + произвольные факты)
-  5. done    → pending-closing до одобрения
+  4. done    → pending-closing до одобрения
 
 Каждое сообщение, кроме финального, содержит ОДНУ кнопку «следующая
 тема →». Юзер свободен пропустить — следующий /start или текст
-вернёт его в intro. Закрытая ветка (`done`) без кнопок — финал.
+вернёт его в voice. Закрытая ветка (`done`) без кнопок — финал.
 
 История изменений:
 * 2026-04-25: первая версия с 7 ветками демо (welcome + 6 веток).
@@ -23,7 +22,7 @@ silent-drop'ил. Сейчас pending-бот отвечает цепочкой 
 * 2026-05-08: сокращено 11 → 4 (юзеры устают на 4-5 экране, средний
   drop-off ~50% к 6-му тапу). Убраны: schedule, reminders,
   checklists, shopping, recipes, family, dont_do — упомянуты в
-  расширенном memory + intro. Старые ветки aliased на intro для
+  расширенном memory. Старые ветки aliased на voice для
   in-progress tours без потери истории прогресса.
 
 Документация по welcome-сценариям: ``docs/copy/welcome.md``.
@@ -47,40 +46,29 @@ class PendingReply:
 # Branch texts (utterly user-facing; docs/copy/welcome.md indexes flow)
 # ---------------------------------------------------------------------------
 
-_INTRO = PendingReply(
-    text=(
-        "Покажу на примерах, как я помогаю дома.\n\n"
-        "Можно писать текстом или голосом: напоминания, покупки, "
-        "меню, рецепты, чек-листы, семейные дела, погода, "
-        "поиск в интернете.\n\n"
-        "Дальше — несколько коротких примеров."
-    ),
-    buttons=(("🎙️ Голос →", "voice"),),
-)
-
 _VOICE = PendingReply(
     text=(
         "🎙️ Голос\n\n"
-        "Со мной можно просто поговорить, без команд и специальных "
+        "Можешь говорить или писать сообщения без команд и специальных "
         "формулировок.\n\n"
         "Например:\n"
         "«Добавь молоко и яблоки в покупки»\n"
         "«Завтра в 9 напомни про музыкалку»\n"
         "«Составь меню на неделю»\n"
         "«Запомни, что Маша не ест грибы»\n\n"
-        "Я расшифрую голос, пойму задачу и разложу по местам."
+        "Я пойму задачу и разложу по местам."
     ),
-    buttons=(("🏠 Бытовая рутина →", "routine"),),
+    buttons=(("Ежедневные дела →", "routine"),),
 )
 
 _ROUTINE = PendingReply(
     text=(
-        "🏠 Бытовая рутина\n\n"
+        "🏠 Ежедневные дела\n\n"
         "⏰ Напоминания и задачи — поставлю на дату и время, сделаю "
         "повторяющимися, помогу изменить или отменить.\n\n"
         "🛒 Покупки — добавлю продукты, покажу список, отмечу купленное, "
         "соберу продукты из меню.\n\n"
-        "📋 Чек-листы — помогу собрать список дел: сборы на дачу, уборка, "
+        "📋 Списки дел — помогу собрать списки дел: сборы на дачу, уборка, "
         "подготовка к празднику.\n\n"
         "🍽 Меню — составлю меню на неделю, обновлю отдельные дни, "
         "подберу блюда под семью.\n\n"
@@ -95,11 +83,11 @@ _MEMORY = PendingReply(
         "🧠 Память и поиск\n\n"
         "👨‍👩‍👧 Семья — запоминаю состав семьи, привычки, диеты, "
         "аллергии, любимые и нелюбимые продукты.\n\n"
-        "🧠 Факты и договоренности — могу помнить важное: дни рождения, "
-        "расписания, предпочтения, бытовые правила.\n\n"
+        "🧠 Память — могу помнить важное: дни рождения, расписания, "
+        "предпочтения и бытовые правила.\n\n"
         "🌤 Погода — подскажу прогноз, температуру, осадки, что ждать "
         "утром, днем или вечером.\n\n"
-        "🔍 Интернет — найду факты, новости, расписания, адреса и "
+        "🔍 Интернет — найду нужную тебе информацию: новости, расписания, адреса и "
         "ближайшие места вроде аптек или магазинов.\n\n"
         "Можно начать с любой простой задачи."
     ),
@@ -129,7 +117,7 @@ _DONE_BROADCAST = PendingReply(
 
 
 _BRANCHES: dict[str, PendingReply] = {
-    "intro": _INTRO,
+    "intro": _VOICE,
     "voice": _VOICE,
     "routine": _ROUTINE,
     "memory": _MEMORY,
@@ -140,20 +128,20 @@ _BRANCHES: dict[str, PendingReply] = {
     # из прошлой версии) попадают в intro и могут пройти новый короткий
     # tour. Их progress (`last_branch=schedule` etc.) не теряется —
     # `record_pb_tour_progress` запишет последний branch как был.
-    "schedule": _INTRO,
-    "reminders": _INTRO,
-    "checklists": _INTRO,
-    "shopping": _INTRO,
-    "recipes": _INTRO,
-    "family": _INTRO,
-    "dont_do": _INTRO,
+    "schedule": _VOICE,
+    "reminders": _VOICE,
+    "checklists": _VOICE,
+    "shopping": _VOICE,
+    "recipes": _VOICE,
+    "family": _VOICE,
+    "dont_do": _VOICE,
     # Старые aliases с pre-edit-wizard эры — оставляем для совсем
     # старых клиентов которые могут тапнуть `pb:welcome` etc.
-    "welcome": _INTRO,
-    "what": _INTRO,
-    "demo_morning": _INTRO,
-    "menu_example": _INTRO,
-    "life": _INTRO,
+    "welcome": _VOICE,
+    "what": _VOICE,
+    "demo_morning": _VOICE,
+    "menu_example": _VOICE,
+    "life": _VOICE,
 }
 
 
@@ -161,9 +149,9 @@ _BRANCHES: dict[str, PendingReply] = {
 # tap on an "older" branch button after user already advanced is a
 # no-op). Aliases (welcome/what/demo_morning/menu_example/life
 # и устаревшие schedule/reminders/checklists/shopping/recipes/family/
-# dont_do) НЕ В ORDER — они map'ятся в intro сразу.
+# dont_do) НЕ В ORDER — они map'ятся в voice сразу.
 BRANCH_ORDER: tuple[str, ...] = (
-    "intro", "voice", "routine", "memory", "done",
+    "voice", "routine", "memory", "done",
 )
 
 
@@ -231,11 +219,10 @@ def build_inline_keyboard(reply: PendingReply) -> dict | None:
 
 # 2026-04-29 (edit-based wizard rework): короткие лейблы для каждой
 # ветки тура. Используются в `build_navigation_keyboard()` чтобы юзер
-# видел куда ведёт каждая кнопка («← 🎙️ Голос», «🏠 Бытовая рутина →»).
+# видел куда ведёт каждая кнопка («← 🎙️ Голос», «🏠 Ежедневные дела →»).
 _BRANCH_LABELS: dict[str, str] = {
-    "intro":  "Привет",
     "voice":  "🎙️ Голос",
-    "routine": "🏠 Бытовая рутина",
+    "routine": "🏠 Ежедневные дела",
     "memory": "🧠 Память и поиск",
     "done":   "Готово",
 }
@@ -250,17 +237,11 @@ def build_navigation_keyboard(current_branch: str) -> dict:
     основе позиции в ``BRANCH_ORDER``.
 
     Контракт:
-    * `intro` (первая ветка) → одна кнопка: «🎙️ Голос →»
+    * `voice` (первая ветка) → одна кнопка: «Ежедневные дела →»
     * Промежуточные ветки → две кнопки в одном ряду:
       «← <prev_label>» + «<next_label> →»
-    * `memory` (предпоследняя) → «← 🏠 Бытовая рутина» + «Готово ✓»
-    * `done` (финал) → одна кнопка «← 🧠 Память и поиск» —
-      без next, юзер может скроллить тур обратно.
-
-    2026-04-29: tour остаётся permanent reference в чате после
-    прохождения. Юзер может в любой момент вернуться к нему и
-    переглянуть. Раньше на `done` клавиатура пропадала (`inline_keyboard=[]`),
-    теперь там prev-кнопка для отката назад.
+    * `memory` (предпоследняя) → «← 🏠 Ежедневные дела» + «Готово ✓»
+    * `done` (финал) → пустая клавиатура, чтобы убрать кнопки.
 
     Возвращает всегда dict чтобы edit-flow всегда явно прописывал
     состояние клавиатуры — иначе Telegram сохранит старую при edit'е.
@@ -268,8 +249,11 @@ def build_navigation_keyboard(current_branch: str) -> dict:
     try:
         idx = BRANCH_ORDER.index(current_branch)
     except ValueError:
-        # Unknown branch — fallback на intro keyboard
-        return build_navigation_keyboard("intro")
+        # Unknown branch — fallback на первый экран тура
+        return build_navigation_keyboard("voice")
+
+    if current_branch == "done":
+        return {"inline_keyboard": []}
 
     row: list[dict] = []
     # Prev button (если не на первой ветке)

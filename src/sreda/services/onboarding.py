@@ -365,7 +365,7 @@ def build_post_approve_message() -> str:
     """Welcome после auto-grant'а на signup (Phase 2C).
 
     2026-05-22 (#60): первый onboarding step — выбор persona. После
-    выбора юзер может открыть tour через прежний `pb:intro`.
+    выбора юзер может открыть tour через `pb:voice`.
     """
     from sreda.services.housewife_persona import build_persona_choice_message
 
@@ -377,7 +377,7 @@ def build_post_approve_keyboard_tg() -> dict:
 
     Две кнопки выбора persona. После выбора callback-handler сохранит
     preset в `TenantUserSkillConfig.skill_params_json` и покажет кнопку
-    `pb:intro` для прежнего tour.
+    `pb:voice` для tour.
     """
     from sreda.services.housewife_persona import build_persona_choice_keyboard_tg
 
