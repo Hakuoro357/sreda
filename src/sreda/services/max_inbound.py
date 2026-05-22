@@ -930,6 +930,9 @@ async def _process_approved_max_turn(
                     and onboarding.user_id
                 ):
                     from sreda.services.housewife_onboarding import (
+                        enqueue_pb_tour_name_confirmation,
+                        enqueue_pb_tour_name_retry,
+                        extract_pb_tour_display_name_with_llm,
                         is_pb_tour_waiting_for_name,
                         save_pb_tour_display_name,
                     )
@@ -940,28 +943,47 @@ async def _process_approved_max_turn(
                             tenant_id=onboarding.tenant_id,
                             user_id=onboarding.user_id,
                         ):
+                            extracted_name = await asyncio.to_thread(
+                                extract_pb_tour_display_name_with_llm,
+                                message_text,
+                            )
+                            if not extracted_name:
+                                enqueue_pb_tour_name_retry(
+                                    bg_session,
+                                    tenant_id=onboarding.tenant_id,
+                                    workspace_id=onboarding.workspace_id,
+                                    user_id=onboarding.user_id,
+                                    channel_type="max",
+                                    chat_id=str(onboarding.max_chat_id),
+                                )
+                                bg_session.commit()
+                                _set_processing_status(
+                                    bg_session, inbound_message_id, "processed",
+                                )
+                                return
                             display_name = save_pb_tour_display_name(
                                 bg_session,
                                 tenant_id=onboarding.tenant_id,
                                 user_id=onboarding.user_id,
-                                raw_name=message_text,
+                                raw_name=extracted_name,
+                            )
+                            enqueue_pb_tour_name_confirmation(
+                                bg_session,
+                                tenant_id=onboarding.tenant_id,
+                                workspace_id=onboarding.workspace_id,
+                                user_id=onboarding.user_id,
+                                channel_type="max",
+                                chat_id=str(onboarding.max_chat_id),
+                                display_name=display_name,
                             )
                             bg_session.commit()
-                            await max_client.send_message(
-                                recipient={"chat_id": onboarding.max_chat_id},
-                                text=(
-                                    "Запомнила, буду обращаться к тебе: "
-                                    f"{display_name}.\n\n"
-                                    "Есть вопросы ко мне?\n"
-                                    "Или начнём сразу — что будем делать первым?"
-                                ),
-                            )
                             _set_processing_status(
                                 bg_session, inbound_message_id, "processed",
                             )
                             return
-                    except ValueError:
+                    except ValueError as exc:
                         bg_session.rollback()
+                        logger.info("max post-tour name capture skipped: %s", exc)
                     except Exception:  # noqa: BLE001
                         bg_session.rollback()
                         logger.exception("max post-tour name capture failed")

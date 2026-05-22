@@ -16,14 +16,15 @@ Tests use real SQLAlchemy session (in-memory sqlite) для consistency
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
-from sreda.db.models.core import Tenant
+from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.models.user_profile import TenantUserProfile
 from sreda.runtime.dispatcher import (
     ActionEnvelope,
@@ -62,6 +63,8 @@ def db():
 
     setup_sess = SessionLocal()
     setup_sess.add(Tenant(id="t1", name="T1"))
+    setup_sess.add(Workspace(id="w1", tenant_id="t1", name="Home"))
+    setup_sess.add(User(id="u1", tenant_id="t1", max_account_id="40921122"))
     setup_sess.commit()
     setup_sess.close()
 
@@ -568,14 +571,12 @@ async def test_process_approved_max_turn_saves_post_tour_name_without_runtime(
     setup.commit()
     setup.close()
 
-    sends: list[dict] = []
-
     class _Client:
         def __init__(self, token: str) -> None:
             self.token = token
 
         async def send_message(self, **kwargs) -> dict:
-            sends.append(kwargs)
+            raise AssertionError("name confirmation must go through outbox")
             return {"success": True}
 
     class _Settings:
@@ -592,6 +593,10 @@ async def test_process_approved_max_turn_saves_post_tour_name_without_runtime(
     )
     monkeypatch.setattr(max_inbound, "get_settings", lambda: _Settings())
     monkeypatch.setattr(max_inbound, "MaxClient", _Client)
+    monkeypatch.setattr(
+        "sreda.services.housewife_onboarding.extract_pb_tour_display_name_with_llm",
+        lambda text: "Борис Аркадьевич",
+    )
 
     await max_inbound._process_approved_max_turn(
         bot_key="sreda_max",
@@ -601,10 +606,6 @@ async def test_process_approved_max_turn_saves_post_tour_name_without_runtime(
     )
 
     runtime_factory.assert_not_called()
-    assert len(sends) == 1
-    assert sends[0]["recipient"] == {"chat_id": "320955459"}
-    assert "Борис Аркадьевич" in sends[0]["text"]
-    assert "что будем делать первым" in sends[0]["text"]
 
     verify = db.session()
     try:
@@ -612,7 +613,99 @@ async def test_process_approved_max_turn_saves_post_tour_name_without_runtime(
             tenant_id="t1", user_id="u1",
         ).one()
         row = verify.get(InboundMessage, "in_name_max")
+        outbox = verify.query(OutboxMessage).one()
+        payload = json.loads(outbox.payload_json)
         assert profile.display_name == "Борис Аркадьевич"
+        assert row.processing_status == "processed"
+        assert outbox.feature_key == "onboarding_name_confirm"
+        assert outbox.channel_type == "max"
+        assert payload["chat_id"] == "320955459"
+        assert payload["attachments"] == []
+        assert "Борис Аркадьевич" in payload["text"]
+        assert "что будем делать первым" in payload["text"]
+    finally:
+        verify.close()
+
+
+@pytest.mark.asyncio
+async def test_process_approved_max_turn_voice_can_capture_post_tour_name(
+    db, monkeypatch,
+):
+    from sreda.db.models.core import InboundMessage
+    from sreda.services import max_inbound
+
+    setup = db.session()
+    setup.add(
+        InboundMessage(
+            id="in_voice_name_max", tenant_id="t1",
+            bot_key="sreda_max", channel_type="max",
+            external_update_id="mid.voice", status="received",
+            processing_status="ingested",
+        )
+    )
+    record_pb_tour_progress(
+        setup,
+        tenant_id="t1",
+        user_id="u1",
+        branch="done",
+    )
+    setup.commit()
+    setup.close()
+
+    class _Settings:
+        max_bot_token = "max-token"
+        ack_edit_max_enabled = False
+
+    class _Client:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+    async def fake_transcribe(payload, **kwargs):
+        payload["message"]["body"]["text"] = "меня зовут Катя"
+        return payload
+
+    runtime_factory = MagicMock()
+
+    monkeypatch.setattr(
+        "sreda.runtime.executor.ActionRuntimeService",
+        runtime_factory,
+    )
+    monkeypatch.setattr(
+        max_inbound, "get_session_factory",
+        lambda: db.sessionmaker,
+    )
+    monkeypatch.setattr(max_inbound, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(max_inbound, "MaxClient", _Client)
+    monkeypatch.setattr(
+        max_inbound,
+        "_maybe_transcribe_max_voice",
+        fake_transcribe,
+    )
+    monkeypatch.setattr(
+        "sreda.services.housewife_onboarding.extract_pb_tour_display_name_with_llm",
+        lambda text: "Катя",
+    )
+
+    await max_inbound._process_approved_max_turn(
+        bot_key="sreda_max",
+        payload={"update_type": "message_created", "message": {"body": {}}},
+        onboarding=_make_onboarding(),
+        inbound_message_id="in_voice_name_max",
+    )
+
+    runtime_factory.assert_not_called()
+
+    verify = db.session()
+    try:
+        profile = verify.query(TenantUserProfile).filter_by(
+            tenant_id="t1", user_id="u1",
+        ).one()
+        assert profile.display_name == "Катя"
+        outbox = verify.query(OutboxMessage).one()
+        payload = json.loads(outbox.payload_json)
+        assert outbox.feature_key == "onboarding_name_confirm"
+        assert "Катя" in payload["text"]
+        row = verify.get(InboundMessage, "in_voice_name_max")
         assert row.processing_status == "processed"
     finally:
         verify.close()

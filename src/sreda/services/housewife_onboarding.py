@@ -30,14 +30,17 @@ Depth cap:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from sreda.db.models.core import OutboxMessage
 from sreda.db.repositories.user_profile import UserProfileRepository
 
 HOUSEWIFE_FEATURE_KEY = "housewife_assistant"
@@ -596,7 +599,7 @@ _NAME_PREFIX_PATTERNS: tuple[re.Pattern[str], ...] = (
 _TRIM_CHARS = " .,;:!?'\"«»()[]{}—–-"
 
 
-def _extract_short_name(text: str | None) -> str:
+def _extract_short_name(text: str | None, *, max_chars: int | None = 30) -> str:
     """Извлечь короткое имя из произвольной строки от LLM.
 
     Шаги:
@@ -637,7 +640,7 @@ def _extract_short_name(text: str | None) -> str:
 
     # 5. Cap на 30 символов — защита от случаев когда не удалось ничего
     #    вырезать и осталась длинная фраза.
-    return s[:30]
+    return s[:max_chars] if max_chars is not None else s
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +657,163 @@ def _extract_short_name(text: str | None) -> str:
 WELCOME_V2_PROGRESS_KEY = "welcome_v2_progress"
 WELCOME_V2_NAME_WAITING_KEY = "welcome_v2_name_waiting"
 WELCOME_V2_NAME_CAPTURED_AT_KEY = "welcome_v2_name_captured_at"
+
+
+def enqueue_pb_tour_name_confirmation(
+    session: Session,
+    *,
+    tenant_id: str,
+    workspace_id: str,
+    user_id: str,
+    channel_type: str,
+    chat_id: str,
+    display_name: str,
+) -> None:
+    """Queue post-tour name confirmation through outbox for auditability."""
+    if not workspace_id:
+        raise ValueError("missing workspace_id for onboarding name confirm")
+    if not chat_id:
+        raise ValueError("missing chat_id for onboarding name confirm")
+
+    text = (
+        f"Запомнила, буду обращаться к тебе: {display_name}.\n\n"
+        "Есть вопросы ко мне?\n"
+        "Или начнём сразу — что будем делать первым?"
+    )
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if channel_type == "telegram":
+        payload["reply_markup"] = None
+    elif channel_type == "max":
+        payload["attachments"] = []
+    else:
+        raise ValueError(f"unsupported onboarding confirm channel: {channel_type}")
+
+    session.add(
+        OutboxMessage(
+            id=f"out_{uuid4().hex[:24]}",
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            channel_type=channel_type,
+            feature_key="onboarding_name_confirm",
+            is_interactive=True,
+            status="pending",
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        )
+    )
+
+
+def enqueue_pb_tour_name_retry(
+    session: Session,
+    *,
+    tenant_id: str,
+    workspace_id: str,
+    user_id: str,
+    channel_type: str,
+    chat_id: str,
+) -> None:
+    """Queue a retry question when LLM could not extract a display name."""
+    if not workspace_id:
+        raise ValueError("missing workspace_id for onboarding name retry")
+    if not chat_id:
+        raise ValueError("missing chat_id for onboarding name retry")
+
+    text = (
+        "Не поняла, как к тебе обращаться.\n\n"
+        "Напиши или скажи имя ещё раз, например: Катя."
+    )
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if channel_type == "telegram":
+        payload["reply_markup"] = None
+    elif channel_type == "max":
+        payload["attachments"] = []
+    else:
+        raise ValueError(f"unsupported onboarding retry channel: {channel_type}")
+
+    session.add(
+        OutboxMessage(
+            id=f"out_{uuid4().hex[:24]}",
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            channel_type=channel_type,
+            feature_key="onboarding_name_retry",
+            is_interactive=True,
+            status="pending",
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        )
+    )
+
+
+def extract_pb_tour_display_name_with_llm(
+    raw_text: str,
+    *,
+    llm: Any = None,
+) -> str | None:
+    """Ask LLM to extract a display name from the user's name answer."""
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+
+    if llm is None:
+        from sreda.services.llm import get_chat_llm
+
+        llm = get_chat_llm(temperature=0.0)
+    if llm is None:
+        logger.warning("post-tour name extraction: LLM unavailable")
+        return None
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    messages = [
+        SystemMessage(
+            content=(
+                "Ты извлекаешь имя обращения из ответа пользователя на вопрос "
+                "«Как мне к тебе обращаться?». Верни строго JSON: "
+                '{"display_name": "Катя"} или {"display_name": null}. '
+                "Если пользователь не назвал имя, верни null. Не выдумывай имя."
+            )
+        ),
+        HumanMessage(content=f"Ответ пользователя: {text}"),
+    ]
+    try:
+        from sreda.services.llm import invoke_with_per_call_timeout
+
+        response = invoke_with_per_call_timeout(
+            llm,
+            messages,
+            timeout_seconds=15.0,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("post-tour name extraction: LLM invoke failed")
+        return None
+
+    raw = str(getattr(response, "content", "") or "").strip()
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if match is None:
+        logger.warning(
+            "post-tour name extraction: no JSON in response: %r",
+            raw[:200],
+        )
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except (TypeError, ValueError):
+        logger.warning(
+            "post-tour name extraction: malformed JSON: %r",
+            match.group(0)[:200],
+        )
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    extracted = parsed.get("display_name")
+    if extracted is None:
+        return None
+    if not isinstance(extracted, str):
+        return None
+    clean = extracted.strip()
+    return clean or None
 
 
 def record_pb_tour_progress(
@@ -718,19 +878,17 @@ def is_pb_tour_waiting_for_name(
 ) -> bool:
     """True after welcome tour `done` until the next name answer is saved."""
     repo = UserProfileRepository(session)
+    profile = repo.get_profile(tenant_id, user_id)
+    if profile is not None and (profile.display_name or "").strip():
+        return False
+
     config = repo.get_skill_config(tenant_id, user_id, HOUSEWIFE_FEATURE_KEY)
     if config is None:
         return False
     params = UserProfileRepository.decode_skill_params(config)
-    if params.get(WELCOME_V2_NAME_WAITING_KEY) is True:
-        return True
-    progress = params.get(WELCOME_V2_PROGRESS_KEY) or {}
-    if not isinstance(progress, dict):
-        return False
-    return (
-        progress.get("last_branch") == "done"
-        and not params.get(WELCOME_V2_NAME_CAPTURED_AT_KEY)
-    )
+    # Do not infer waiting from legacy `last_branch == done`: that implicit
+    # fallback caused normal chat turns to be stolen as names.
+    return params.get(WELCOME_V2_NAME_WAITING_KEY) is True
 
 
 def save_pb_tour_display_name(
@@ -741,19 +899,20 @@ def save_pb_tour_display_name(
     raw_name: str,
 ) -> str:
     """Persist the post-tour name answer and clear the waiting flag."""
-    clean = _extract_short_name(raw_name)
-    if not clean:
-        clean = raw_name.strip()[:30]
+    clean = (raw_name or "").strip()
     if not clean:
         raise ValueError("empty display name")
 
     repo = UserProfileRepository(session)
+    profile = repo.get_profile(tenant_id, user_id)
+    if profile is not None and (profile.display_name or "").strip():
+        raise ValueError("display name already set")
     repo.update_profile(
         tenant_id,
         user_id,
         source="user_command",
         actor_user_id=user_id,
-        display_name=clean[:120],
+        display_name=clean,
     )
 
     config = repo.get_skill_config(tenant_id, user_id, HOUSEWIFE_FEATURE_KEY)
@@ -770,7 +929,7 @@ def save_pb_tour_display_name(
         actor_user_id=user_id,
         skill_params=params,
     )
-    return clean[:120]
+    return clean
 
 
 def _merge_with_defaults(state: dict[str, Any]) -> dict[str, Any]:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
 from sreda.db.models.user_profile import TenantUserProfile
-from sreda.db.models.core import Tenant, User
+from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.services.housewife_persona import (
     PERSONA_TENDER_CARE,
@@ -27,6 +29,7 @@ def session():
     Base.metadata.create_all(engine)
     sess = sessionmaker(bind=engine)()
     sess.add(Tenant(id="t1", name="Tenant 1"))
+    sess.add(Workspace(id="w1", tenant_id="t1", name="Home"))
     sess.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
     sess.commit()
     try:
@@ -304,7 +307,7 @@ async def test_max_persona_settings_request_sends_choice_keyboard() -> None:
 
 
 @pytest.mark.asyncio
-async def test_telegram_post_tour_name_reply_is_saved_without_llm(
+async def test_telegram_post_tour_name_reply_uses_llm_extractor(
     session, monkeypatch,
 ) -> None:
     client = FakeTelegramClient()
@@ -334,6 +337,10 @@ async def test_telegram_post_tour_name_reply_is_saved_without_llm(
         "sreda.services.telegram_bot._handle_command",
         fail_if_llm_called,
     )
+    monkeypatch.setattr(
+        "sreda.services.housewife_onboarding.extract_pb_tour_display_name_with_llm",
+        lambda text: "Борис Аркадьевич",
+    )
 
     await handle_telegram_interaction(
         session,
@@ -354,11 +361,237 @@ async def test_telegram_post_tour_name_reply_is_saved_without_llm(
     ).one()
     assert profile.display_name == "Борис Аркадьевич"
     assert client.edits == []
-    assert len(client.sends) == 1
-    assert "Запомнила" in client.sends[0]["text"]
-    assert "Борис Аркадьевич" in client.sends[0]["text"]
-    assert "что будем делать первым" in client.sends[0]["text"]
-    assert "reply_markup" not in client.sends[0]
+    assert client.sends == []
+    outbox = session.query(OutboxMessage).one()
+    assert outbox.feature_key == "onboarding_name_confirm"
+    assert outbox.channel_type == "telegram"
+    payload = json.loads(outbox.payload_json)
+    assert payload["chat_id"] == "42"
+    assert "Запомнила" in payload["text"]
+    assert "Борис Аркадьевич" in payload["text"]
+    assert "что будем делать первым" in payload["text"]
+    assert payload["reply_markup"] is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_can_capture_name_after_tour(
+    session, monkeypatch,
+) -> None:
+    from sreda.services.housewife_onboarding import record_pb_tour_progress
+
+    client = FakeTelegramClient()
+    onboarding = TelegramOnboardingResult(
+        is_new_user=False,
+        chat_id="42",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+    record_pb_tour_progress(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        branch="done",
+    )
+    session.commit()
+
+    async def fake_transcribe(payload, **kwargs):
+        payload["message"]["text"] = "Катя"
+        return payload
+
+    async def fake_handle_command(*args, **kwargs):
+        raise AssertionError("name reply must not be routed to LLM")
+
+    monkeypatch.setattr(
+        "sreda.services.telegram_bot._maybe_transcribe_voice",
+        fake_transcribe,
+    )
+    monkeypatch.setattr(
+        "sreda.services.telegram_bot._handle_command",
+        fake_handle_command,
+    )
+    monkeypatch.setattr(
+        "sreda.services.housewife_onboarding.extract_pb_tour_display_name_with_llm",
+        lambda text: "Катя",
+    )
+
+    await handle_telegram_interaction(
+        session,
+        bot_key="telegram_default",
+        payload={"message": {"chat": {"id": 42}, "voice": {"duration": 5}}},
+        telegram_client=client,
+        onboarding=onboarding,
+        inbound_message_id="in_voice",
+    )
+
+    profile = session.query(TenantUserProfile).filter_by(
+        tenant_id="t1", user_id="u1",
+    ).one()
+    assert profile.display_name == "Катя"
+    assert session.query(OutboxMessage).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_name_capture_retries_when_llm_finds_no_name(
+    session, monkeypatch,
+) -> None:
+    from sreda.services.housewife_onboarding import record_pb_tour_progress
+
+    onboarding = TelegramOnboardingResult(
+        is_new_user=False,
+        chat_id="42",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+    record_pb_tour_progress(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        branch="done",
+    )
+    session.commit()
+
+    async def fail_if_llm_called(*args, **kwargs):
+        raise AssertionError("name retry must not route to chat LLM")
+
+    monkeypatch.setattr(
+        "sreda.services.telegram_bot._handle_command",
+        fail_if_llm_called,
+    )
+    monkeypatch.setattr(
+        "sreda.services.housewife_onboarding.extract_pb_tour_display_name_with_llm",
+        lambda text: None,
+    )
+
+    await handle_telegram_interaction(
+        session,
+        bot_key="telegram_default",
+        payload={"message": {"chat": {"id": 42}, "text": "убери сирень"}},
+        telegram_client=FakeTelegramClient(),
+        onboarding=onboarding,
+        inbound_message_id="in_retry",
+    )
+
+    assert session.query(TenantUserProfile).filter_by(
+        tenant_id="t1", user_id="u1",
+    ).one_or_none() is None
+    outbox = session.query(OutboxMessage).one()
+    assert outbox.feature_key == "onboarding_name_retry"
+    payload = json.loads(outbox.payload_json)
+    assert "как к тебе обращаться" in payload["text"]
+
+
+@pytest.mark.asyncio
+async def test_existing_display_name_blocks_post_tour_capture(
+    session, monkeypatch,
+) -> None:
+    from sreda.services.housewife_onboarding import record_pb_tour_progress
+
+    repo = UserProfileRepository(session)
+    repo.update_profile("t1", "u1", source="system", display_name="Повелитель")
+    record_pb_tour_progress(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        branch="done",
+    )
+    session.commit()
+
+    called = {"chat": False}
+
+    async def fake_handle_command(*args, **kwargs):
+        called["chat"] = True
+
+    monkeypatch.setattr(
+        "sreda.services.telegram_bot._handle_command",
+        fake_handle_command,
+    )
+
+    await handle_telegram_interaction(
+        session,
+        bot_key="telegram_default",
+        payload={"message": {"chat": {"id": 42}, "text": "Катя"}},
+        telegram_client=FakeTelegramClient(),
+        onboarding=TelegramOnboardingResult(
+            is_new_user=False,
+            chat_id="42",
+            tenant_id="t1",
+            workspace_id="w1",
+            user_id="u1",
+            assistant_id="a1",
+        ),
+        inbound_message_id="in_text",
+    )
+
+    assert called["chat"] is True
+    assert repo.get_profile("t1", "u1").display_name == "Повелитель"
+    assert session.query(OutboxMessage).count() == 0
+
+
+def test_capture_rejects_empty_name(session) -> None:
+    from sreda.services.housewife_onboarding import save_pb_tour_display_name
+
+    with pytest.raises(ValueError):
+        save_pb_tour_display_name(
+            session,
+            tenant_id="t1",
+            user_id="u1",
+            raw_name="",
+        )
+
+    assert session.query(TenantUserProfile).count() == 0
+
+
+def test_capture_accepts_bare_capitalized_name(
+    session,
+) -> None:
+    from sreda.services.housewife_onboarding import save_pb_tour_display_name
+
+    display_name = save_pb_tour_display_name(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        raw_name="Катя",
+    )
+
+    assert display_name == "Катя"
+
+
+def test_capture_accepts_explicit_name_with_sentence_punctuation(
+    session,
+) -> None:
+    from sreda.services.housewife_onboarding import save_pb_tour_display_name
+
+    display_name = save_pb_tour_display_name(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        raw_name="Меня зовут Катя.",
+    )
+
+    assert display_name == "Меня зовут Катя."
+
+
+def test_capture_does_not_overwrite_existing_display_name(
+    session,
+) -> None:
+    from sreda.services.housewife_onboarding import save_pb_tour_display_name
+
+    repo = UserProfileRepository(session)
+    repo.update_profile("t1", "u1", source="system", display_name="Катя")
+
+    with pytest.raises(ValueError):
+        save_pb_tour_display_name(
+            session,
+            tenant_id="t1",
+            user_id="u1",
+            raw_name="Маша",
+        )
+
+    assert repo.get_profile("t1", "u1").display_name == "Катя"
 
 
 @pytest.mark.asyncio
