@@ -484,8 +484,9 @@ async def _handle_callback(
         return
 
     if data == "persona_ready":
-        from sreda.services.housewife_persona import (
-            build_persona_ready_message,
+        from sreda.services import pending_bot
+        from sreda.services.housewife_onboarding import (
+            record_pb_tour_progress,
         )
 
         if callback_id:
@@ -512,9 +513,9 @@ async def _handle_callback(
                 cb_message.get("message_id")
                 if isinstance(cb_message, dict) else None
             )
-            reply_text = build_persona_ready_message()
+            reply_text = pending_bot.done_broadcast_reply().text
             reply_markup = {"inline_keyboard": []}
-            edited = False
+            delivered = False
             if msg_id is not None:
                 try:
                     await telegram_client.edit_message_text(
@@ -523,29 +524,42 @@ async def _handle_callback(
                         text=reply_text,
                         reply_markup=reply_markup,
                     )
-                    edited = True
+                    delivered = True
                 except TelegramDeliveryError as exc:
                     if exc.status_code == 400 and "not modified" in (
                         str(exc) or ""
                     ).lower():
-                        edited = True
+                        delivered = True
                     else:
                         logger.info(
                             "persona_ready: editMessageText failed status=%s — "
                             "fallback to send_message",
                             exc.status_code,
                         )
-            if not edited:
+            if not delivered:
                 try:
                     await telegram_client.send_message(
                         chat_id=onboarding.chat_id,
                         text=reply_text,
                     )
+                    delivered = True
                 except TelegramDeliveryError as exc:
                     logger.warning(
                         "persona_ready: delivery failed status=%s: %s",
                         exc.status_code, exc,
                     )
+            if delivered and onboarding.tenant_id and onboarding.user_id:
+                try:
+                    record_pb_tour_progress(
+                        session,
+                        tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        branch="done",
+                    )
+                    session.commit()
+                except Exception:  # noqa: BLE001
+                    session.rollback()
+                    logger.exception("persona_ready: progress tracking failed")
         return
 
     # Pending-bot tour callbacks (`pb:<branch>`). 2026-04-28: эти кнопки
@@ -673,7 +687,7 @@ async def _handle_callback(
 
         if onboarding.chat_id:
             if branch == "done":
-                reply = pending_bot._DONE_BROADCAST
+                reply = pending_bot.done_broadcast_reply()
             else:
                 reply = pending_bot.match(data, is_callback=True)
             keyboard = pending_bot.build_navigation_keyboard(branch)

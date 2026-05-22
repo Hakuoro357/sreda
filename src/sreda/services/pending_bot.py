@@ -116,6 +116,11 @@ _DONE_BROADCAST = PendingReply(
 )
 
 
+def done_broadcast_reply() -> PendingReply:
+    """Approved-user tour final screen: ask how to address the user."""
+    return _DONE_BROADCAST
+
+
 _BRANCHES: dict[str, PendingReply] = {
     "intro": _VOICE,
     "voice": _VOICE,

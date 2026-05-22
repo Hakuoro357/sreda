@@ -1377,7 +1377,8 @@ async def _handle_max_callback(
         return True
 
     if data == "persona_ready":
-        from sreda.services.housewife_persona import build_persona_ready_message
+        from sreda.services import pending_bot
+        from sreda.services.housewife_onboarding import record_pb_tour_progress
 
         if callback_id:
             try:
@@ -1395,8 +1396,8 @@ async def _handle_max_callback(
             if isinstance(body, dict) and body.get("mid"):
                 cb_message_mid = str(body["mid"])
 
-        reply_text = build_persona_ready_message()
-        edited = False
+        reply_text = pending_bot.done_broadcast_reply().text
+        delivered = False
         if cb_message_mid:
             try:
                 await max_client.edit_message(
@@ -1404,7 +1405,7 @@ async def _handle_max_callback(
                     text=reply_text,
                     attachments=[],
                 )
-                edited = True
+                delivered = True
             except Exception as exc:  # noqa: BLE001
                 logger.info(
                     "max persona_ready: edit_message failed mid=%s tenant=%s: %s "
@@ -1412,15 +1413,29 @@ async def _handle_max_callback(
                     cb_message_mid, onboarding.tenant_id, exc,
                 )
 
-        if not edited and getattr(onboarding, "max_chat_id", None):
+        if not delivered and getattr(onboarding, "max_chat_id", None):
             try:
                 await max_client.send_message(
                     recipient={"chat_id": onboarding.max_chat_id},
                     text=reply_text,
                     attachments=[],
                 )
+                delivered = True
             except Exception:  # noqa: BLE001
                 logger.warning("max persona_ready: delivery failed", exc_info=True)
+
+        if delivered and onboarding.tenant_id and onboarding.user_id:
+            try:
+                record_pb_tour_progress(
+                    session,
+                    tenant_id=onboarding.tenant_id,
+                    user_id=onboarding.user_id,
+                    branch="done",
+                )
+                session.commit()
+            except Exception:  # noqa: BLE001
+                session.rollback()
+                logger.exception("max persona_ready: progress tracking failed")
 
         return True
 
@@ -1805,7 +1820,7 @@ async def _handle_max_pending_tenant(
         if raw in _PB_BRANCHES:
             current_branch = raw
     if is_post_approve_tour and current_branch == "done":
-        reply = pending_bot._DONE_BROADCAST
+        reply = pending_bot.done_broadcast_reply()
     else:
         reply = pending_bot.match(input_text, is_callback=is_callback)
     keyboard = pending_bot.build_navigation_keyboard(current_branch)

@@ -10,6 +10,7 @@ from sreda.db.base import Base
 from sreda.db.models.user_profile import TenantUserProfile
 from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.integrations.telegram.client import TelegramDeliveryError
 from sreda.services.housewife_persona import (
     PERSONA_TENDER_CARE,
     PERSONA_WARM_PRACTICAL,
@@ -39,10 +40,17 @@ def session():
 
 
 class FakeTelegramClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_edit: bool = False,
+        fail_send: bool = False,
+    ) -> None:
         self.answered: list[tuple[str, str | None]] = []
         self.edits: list[dict] = []
         self.sends: list[dict] = []
+        self.fail_edit = fail_edit
+        self.fail_send = fail_send
 
     async def answer_callback_query(
         self, callback_query_id: str, text: str | None = None,
@@ -52,18 +60,37 @@ class FakeTelegramClient:
 
     async def edit_message_text(self, **kwargs) -> dict:
         self.edits.append(kwargs)
+        if self.fail_edit:
+            raise TelegramDeliveryError(
+                "message to edit not found",
+                method="editMessageText",
+                status_code=400,
+            )
         return {"ok": True}
 
     async def send_message(self, **kwargs) -> dict:
         self.sends.append(kwargs)
+        if self.fail_send:
+            raise TelegramDeliveryError(
+                "chat not found",
+                method="sendMessage",
+                status_code=400,
+            )
         return {"ok": True}
 
 
 class FakeMaxClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_edit: bool = False,
+        fail_send: bool = False,
+    ) -> None:
         self.answered: list[tuple[str, str | None]] = []
         self.edits: list[dict] = []
         self.sends: list[dict] = []
+        self.fail_edit = fail_edit
+        self.fail_send = fail_send
 
     async def answer_callback(
         self, callback_id: str, notification: str | None = None,
@@ -73,11 +100,33 @@ class FakeMaxClient:
 
     async def edit_message(self, message_id: str, **kwargs) -> dict:
         self.edits.append({"message_id": message_id, **kwargs})
+        if self.fail_edit:
+            raise RuntimeError("edit failed")
         return {"success": True}
 
     async def send_message(self, **kwargs) -> dict:
         self.sends.append(kwargs)
+        if self.fail_send:
+            raise RuntimeError("send failed")
         return {"success": True}
+
+
+def _assert_waiting_for_name(session) -> None:
+    repo = UserProfileRepository(session)
+    cfg = repo.get_skill_config("t1", "u1", "housewife_assistant")
+    assert cfg is not None
+    params = UserProfileRepository.decode_skill_params(cfg)
+    assert params["welcome_v2_name_waiting"] is True
+    assert params["welcome_v2_progress"]["last_branch"] == "done"
+
+
+def _assert_not_waiting_for_name(session) -> None:
+    repo = UserProfileRepository(session)
+    cfg = repo.get_skill_config("t1", "u1", "housewife_assistant")
+    if cfg is None:
+        return
+    params = UserProfileRepository.decode_skill_params(cfg)
+    assert params.get("welcome_v2_name_waiting") is not True
 
 
 @pytest.mark.asyncio
@@ -170,7 +219,7 @@ async def test_max_persona_callback_stores_preset_and_edits_message(
 
 
 @pytest.mark.asyncio
-async def test_telegram_persona_ready_callback_edits_message_and_removes_keyboard(
+async def test_telegram_persona_ready_callback_asks_name_and_sets_waiting(
     session,
 ) -> None:
     client = FakeTelegramClient()
@@ -200,12 +249,113 @@ async def test_telegram_persona_ready_callback_edits_message_and_removes_keyboar
     assert client.answered == [("cb_ready", "")]
     assert client.sends == []
     assert client.edits[0]["message_id"] == 101
-    assert "пиши или говори голосом" in client.edits[0]["text"].lower()
+    assert "как мне к тебе обращаться" in client.edits[0]["text"].lower()
     assert client.edits[0]["reply_markup"] == {"inline_keyboard": []}
+    _assert_waiting_for_name(session)
 
 
 @pytest.mark.asyncio
-async def test_max_persona_ready_callback_edits_message_and_removes_keyboard(
+async def test_telegram_persona_ready_fallback_send_sets_waiting(
+    session,
+) -> None:
+    client = FakeTelegramClient(fail_edit=True)
+    onboarding = TelegramOnboardingResult(
+        is_new_user=False,
+        chat_id="42",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    await _handle_callback(
+        session,
+        telegram_client=client,
+        callback_query={
+            "id": "cb_ready",
+            "data": "persona_ready",
+            "message": {"message_id": 101},
+        },
+        onboarding=onboarding,
+        bot_key="telegram_default",
+        payload={},
+        inbound_message_id=None,
+    )
+
+    assert client.edits
+    assert client.sends
+    assert "как мне к тебе обращаться" in client.sends[0]["text"].lower()
+    _assert_waiting_for_name(session)
+
+
+@pytest.mark.asyncio
+async def test_telegram_persona_ready_send_failure_does_not_set_waiting(
+    session,
+) -> None:
+    client = FakeTelegramClient(fail_edit=True, fail_send=True)
+    onboarding = TelegramOnboardingResult(
+        is_new_user=False,
+        chat_id="42",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    await _handle_callback(
+        session,
+        telegram_client=client,
+        callback_query={
+            "id": "cb_ready",
+            "data": "persona_ready",
+            "message": {"message_id": 101},
+        },
+        onboarding=onboarding,
+        bot_key="telegram_default",
+        payload={},
+        inbound_message_id=None,
+    )
+
+    assert client.edits
+    assert client.sends
+    _assert_not_waiting_for_name(session)
+
+
+@pytest.mark.asyncio
+async def test_telegram_persona_ready_without_message_id_sends_and_sets_waiting(
+    session,
+) -> None:
+    client = FakeTelegramClient()
+    onboarding = TelegramOnboardingResult(
+        is_new_user=False,
+        chat_id="42",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    await _handle_callback(
+        session,
+        telegram_client=client,
+        callback_query={
+            "id": "cb_ready",
+            "data": "persona_ready",
+        },
+        onboarding=onboarding,
+        bot_key="telegram_default",
+        payload={},
+        inbound_message_id=None,
+    )
+
+    assert client.edits == []
+    assert client.sends
+    assert "как мне к тебе обращаться" in client.sends[0]["text"].lower()
+    _assert_waiting_for_name(session)
+
+
+@pytest.mark.asyncio
+async def test_max_persona_ready_callback_asks_name_and_sets_waiting(
     session,
 ) -> None:
     client = FakeMaxClient()
@@ -236,8 +386,113 @@ async def test_max_persona_ready_callback_edits_message_and_removes_keyboard(
     assert client.answered == [("cb_ready", "")]
     assert client.sends == []
     assert client.edits[0]["message_id"] == "mid_ready"
-    assert "пиши или говори голосом" in client.edits[0]["text"].lower()
+    assert "как мне к тебе обращаться" in client.edits[0]["text"].lower()
     assert client.edits[0]["attachments"] == []
+    _assert_waiting_for_name(session)
+
+
+@pytest.mark.asyncio
+async def test_max_persona_ready_fallback_send_sets_waiting(
+    session,
+) -> None:
+    client = FakeMaxClient(fail_edit=True)
+    onboarding = MaxOnboardingResult(
+        is_new_user=False,
+        max_account_id="max1",
+        max_chat_id="chat1",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    handled = await _handle_max_callback(
+        session=session,
+        max_client=client,
+        payload={
+            "callback": {
+                "callback_id": "cb_ready",
+                "payload": "persona_ready",
+            },
+            "message": {"body": {"mid": "mid_ready"}},
+        },
+        onboarding=onboarding,
+    )
+
+    assert handled is True
+    assert client.edits
+    assert client.sends
+    assert "как мне к тебе обращаться" in client.sends[0]["text"].lower()
+    _assert_waiting_for_name(session)
+
+
+@pytest.mark.asyncio
+async def test_max_persona_ready_send_failure_does_not_set_waiting(
+    session,
+) -> None:
+    client = FakeMaxClient(fail_edit=True, fail_send=True)
+    onboarding = MaxOnboardingResult(
+        is_new_user=False,
+        max_account_id="max1",
+        max_chat_id="chat1",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    handled = await _handle_max_callback(
+        session=session,
+        max_client=client,
+        payload={
+            "callback": {
+                "callback_id": "cb_ready",
+                "payload": "persona_ready",
+            },
+            "message": {"body": {"mid": "mid_ready"}},
+        },
+        onboarding=onboarding,
+    )
+
+    assert handled is True
+    assert client.edits
+    assert client.sends
+    _assert_not_waiting_for_name(session)
+
+
+@pytest.mark.asyncio
+async def test_max_persona_ready_without_message_id_sends_and_sets_waiting(
+    session,
+) -> None:
+    client = FakeMaxClient()
+    onboarding = MaxOnboardingResult(
+        is_new_user=False,
+        max_account_id="max1",
+        max_chat_id="chat1",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    handled = await _handle_max_callback(
+        session=session,
+        max_client=client,
+        payload={
+            "callback": {
+                "callback_id": "cb_ready",
+                "payload": "persona_ready",
+            },
+            "message": {"body": {}},
+        },
+        onboarding=onboarding,
+    )
+
+    assert handled is True
+    assert client.edits == []
+    assert client.sends
+    assert "как мне к тебе обращаться" in client.sends[0]["text"].lower()
+    _assert_waiting_for_name(session)
 
 
 @pytest.mark.asyncio
