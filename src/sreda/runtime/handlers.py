@@ -2748,6 +2748,20 @@ async def execute_conversation_chat(
             usage = getattr(ai_msg, "usage_metadata", None) or {}
             _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
             _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
+            # 2026-05-22 #65: provider prompt-cache visibility. MiMo
+            # (xiaomimimo.com) returns OpenAI-style ``prompt_tokens_details.
+            # cached_tokens`` which langchain-openai surfaces as
+            # ``usage_metadata.input_token_details.cache_read``. We trace it
+            # so we can see in /admin/trace-viewer whether the stable
+            # prompt is actually getting cached on the provider side.
+            _input_details = usage.get("input_token_details") or {}
+            _cached_tok = int(
+                _input_details.get("cache_read")
+                or _input_details.get("cached")
+                or 0
+            )
+            if _cached_tok:
+                _trace_meta["cached_tok"] = _cached_tok
             _trace_meta["tools"] = [
                 tc.get("name") for tc in (getattr(ai_msg, "tool_calls", None) or [])
             ]
