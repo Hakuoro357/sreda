@@ -3,7 +3,8 @@
 Используется для idempotency-проверки в `telegram_bot._handle_callback`
 (2026-04-28 spam-loop fix tg_1089832184).
 
-2026-05-08: tour сокращён 11 → 4 (intro → voice → memory → done).
+2026-05-22: tour обновлён до 5 экранов
+(intro → voice → routine → memory → done).
 Старые ветки (schedule/reminders/checklists/shopping/recipes/family/
 dont_do) теперь aliases на intro для backwards-compat с in-progress
 tours.
@@ -20,23 +21,18 @@ def test_branch_order_starts_with_intro_ends_with_done() -> None:
     assert pending_bot.BRANCH_ORDER[-1] == "done"
 
 
-def test_branch_order_is_4_steps() -> None:
-    """4-step tour: intro → voice → memory → done.
-
-    Цель сокращения (2026-05-08): юзеры устают на 4-5 экране,
-    drop-off ~50% к 6-му тапу. Сокращение до 4 закрывает elevator
-    pitch (кто я → как со мной говорить → что я делаю → жди модератора)
-    и удерживает completion.
-    """
-    expected = ("intro", "voice", "memory", "done")
+def test_branch_order_is_5_steps() -> None:
+    """5-step tour: intro → voice → routine → memory → done."""
+    expected = ("intro", "voice", "routine", "memory", "done")
     assert pending_bot.BRANCH_ORDER == expected
 
 
 def test_branch_index_returns_position() -> None:
     assert pending_bot.branch_index("intro") == 0
     assert pending_bot.branch_index("voice") == 1
-    assert pending_bot.branch_index("memory") == 2
-    assert pending_bot.branch_index("done") == 3
+    assert pending_bot.branch_index("routine") == 2
+    assert pending_bot.branch_index("memory") == 3
+    assert pending_bot.branch_index("done") == 4
 
 
 def test_branch_index_unknown_returns_minus_one() -> None:
@@ -90,6 +86,28 @@ def test_dropped_branches_alias_to_intro() -> None:
         )
 
 
+def test_tour_texts_match_current_product_copy() -> None:
+    intro = pending_bot.match("pb:intro", is_callback=True).text
+    voice = pending_bot.match("pb:voice", is_callback=True).text
+    routine = pending_bot.match("pb:routine", is_callback=True).text
+    memory = pending_bot.match("pb:memory", is_callback=True).text
+    done = pending_bot.match("pb:done", is_callback=True).text
+
+    assert "Покажу на примерах" in intro
+    assert "Со мной можно просто поговорить" in voice
+    assert "Бытовая рутина" in routine
+    assert "Чек-листы" in routine
+    assert "Память и поиск" in memory
+    assert "Ближайшие места" in memory or "аптек" in memory
+    assert "бета-тестировании" in done
+    assert "Не пишу первой просто так" not in memory
+    assert "не отслеживаю местоположение" not in memory
+
+
+def test_approved_tour_done_asks_for_name() -> None:
+    assert "Как мне к тебе обращаться" in pending_bot._DONE_BROADCAST.text
+
+
 def test_navigation_keyboard_intro_has_only_next() -> None:
     """Первая ветка — только кнопка «next →» (нет prev)."""
     kb = pending_bot.build_navigation_keyboard("intro")
@@ -102,7 +120,7 @@ def test_navigation_keyboard_intro_has_only_next() -> None:
 
 
 def test_navigation_keyboard_middle_has_prev_and_next() -> None:
-    """Средняя ветка (voice) — prev (intro) + next (memory) в одном ряду."""
+    """Средняя ветка (voice) — prev (intro) + next (routine) в одном ряду."""
     kb = pending_bot.build_navigation_keyboard("voice")
     rows = kb["inline_keyboard"]
     assert len(rows) == 1
@@ -111,8 +129,8 @@ def test_navigation_keyboard_middle_has_prev_and_next() -> None:
     assert prev_btn["callback_data"] == "pb:intro"
     assert "←" in prev_btn["text"]
     assert "Привет" in prev_btn["text"]
-    assert next_btn["callback_data"] == "pb:memory"
-    assert "Память" in next_btn["text"]
+    assert next_btn["callback_data"] == "pb:routine"
+    assert "Бытовая" in next_btn["text"]
     assert "→" in next_btn["text"]
 
 
@@ -122,7 +140,7 @@ def test_navigation_keyboard_pre_final_branch_uses_gotovo_label() -> None:
     kb = pending_bot.build_navigation_keyboard("memory")
     rows = kb["inline_keyboard"]
     prev_btn, next_btn = rows[0]
-    assert prev_btn["callback_data"] == "pb:voice"
+    assert prev_btn["callback_data"] == "pb:routine"
     assert next_btn["callback_data"] == "pb:done"
     assert "Готово" in next_btn["text"]
     assert "✓" in next_btn["text"]

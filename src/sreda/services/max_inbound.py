@@ -271,10 +271,11 @@ async def handle_max_update(
             # bot_started; tour branch на pb:* callbacks).
             # Иначе silent (избегаем spam'а при regular messages).
             #
-            # is_post_approve_tour=True ТОЛЬКО для approved+pb_callback —
-            # включает post-done name prompt. Pending юзеры не получают
-            # name prompt: они не могут ответить именем (text замолчат).
+            # is_post_approve_tour=True ТОЛЬКО для approved+pb_callback:
+            # pb:done покажет вопрос имени и запишет waiting-flag.
+            # Pending юзеры получают pending-closing без вопроса имени.
             await _handle_max_pending_tenant(
+                session=session,
                 payload=payload,
                 update_type=update_type,
                 onboarding=onboarding,
@@ -923,6 +924,51 @@ async def _process_approved_max_turn(
                 )
 
                 message_text = _extract_max_message_text(payload)
+                if (
+                    message_text
+                    and onboarding.tenant_id
+                    and onboarding.user_id
+                ):
+                    from sreda.services.housewife_onboarding import (
+                        is_pb_tour_waiting_for_name,
+                        save_pb_tour_display_name,
+                    )
+
+                    try:
+                        if is_pb_tour_waiting_for_name(
+                            bg_session,
+                            tenant_id=onboarding.tenant_id,
+                            user_id=onboarding.user_id,
+                        ):
+                            display_name = save_pb_tour_display_name(
+                                bg_session,
+                                tenant_id=onboarding.tenant_id,
+                                user_id=onboarding.user_id,
+                                raw_name=message_text,
+                            )
+                            bg_session.commit()
+                            await max_client.send_message(
+                                recipient={"chat_id": onboarding.max_chat_id},
+                                text=(
+                                    "Запомнила, буду обращаться к тебе: "
+                                    f"{display_name}.\n\n"
+                                    "Есть вопросы ко мне?\n"
+                                    "Или начнём сразу — что будем делать первым?"
+                                ),
+                            )
+                            _set_processing_status(
+                                bg_session, inbound_message_id, "processed",
+                            )
+                            return
+                    except ValueError:
+                        bg_session.rollback()
+                    except Exception:  # noqa: BLE001
+                        bg_session.rollback()
+                        logger.exception("max post-tour name capture failed")
+                        _set_processing_status(
+                            bg_session, inbound_message_id, "processed",
+                        )
+                        return
                 if message_text and is_persona_settings_request(message_text):
                     await _handle_max_persona_settings_request(
                         max_client=max_client,
@@ -1666,7 +1712,7 @@ async def _handle_max_link_cancel_cb(
 
 
 async def _handle_max_pending_tenant(
-    *, payload: dict, update_type: str | None, onboarding,
+    *, session, payload: dict, update_type: str | None, onboarding,
     settings, is_post_approve_tour: bool = False,
 ) -> None:
     """Send pending welcome message via MaxClient.
@@ -1682,11 +1728,9 @@ async def _handle_max_pending_tenant(
     Errors swallowed — pending welcome это UX sugar, не correctness-critical.
 
     ``is_post_approve_tour`` — set True когда caller routed approved юзера
-    с pb:* callback'ом (broadcast pattern from post-approve welcome
-    button «Расскажи поподробнее»). Single effect: на pb:done callback
-    шлёт follow-up name prompt. Для truly pending юзеров (False) — НЕ
-    шлёт, потому что pending не сможет на него ответить (text-replies
-    silent-drop в pending phase).
+    с pb:* callback'ом. На pb:done показывает вопрос имени и ставит
+    waiting-flag. Для truly pending юзеров (False) показывает closing
+    без вопроса имени: pending text не должен сохраняться как имя.
     """
     if not (settings.max_bot_token and onboarding.max_chat_id):
         logger.info(
@@ -1731,8 +1775,6 @@ async def _handle_max_pending_tenant(
     else:
         return  # message_created / other → silent
 
-    reply = pending_bot.match(input_text, is_callback=is_callback)
-
     # Determine current branch for navigation keyboard.
     from sreda.services.pending_bot import _BRANCHES as _PB_BRANCHES
     current_branch = "intro"
@@ -1740,6 +1782,10 @@ async def _handle_max_pending_tenant(
         raw = input_text.removeprefix("pb:").strip()
         if raw in _PB_BRANCHES:
             current_branch = raw
+    if is_post_approve_tour and current_branch == "done":
+        reply = pending_bot._DONE_BROADCAST
+    else:
+        reply = pending_bot.match(input_text, is_callback=is_callback)
     keyboard = pending_bot.build_navigation_keyboard(current_branch)
     attachments = render_max_inline_keyboard_attachment(keyboard) if keyboard else None
 
@@ -1780,6 +1826,31 @@ async def _handle_max_pending_tenant(
             await client.answer_callback(callback_id)
         except Exception:  # noqa: BLE001
             pass  # ack failure не critical — ux sugar
+
+    if (
+        is_post_approve_tour
+        and is_callback
+        and onboarding.tenant_id
+        and onboarding.user_id
+    ):
+        try:
+            from sreda.services.housewife_onboarding import (
+                record_pb_tour_progress,
+            )
+
+            record_pb_tour_progress(
+                session,
+                tenant_id=onboarding.tenant_id,
+                user_id=onboarding.user_id,
+                branch=current_branch,
+            )
+            session.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "max pb: progress tracking failed for branch=%s",
+                current_branch,
+            )
+            session.rollback()
 
     # 2026-05-09 (Boris feedback): post-tour name prompt теперь часть
     # done text inline (см. _DONE в pending_bot.py). Отдельный

@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
+from sreda.db.models.user_profile import TenantUserProfile
 from sreda.db.models.core import Tenant, User
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.services.housewife_persona import (
@@ -13,6 +14,7 @@ from sreda.services.housewife_persona import (
 )
 from sreda.services.max_inbound import (
     _handle_max_callback,
+    _handle_max_pending_tenant,
     _handle_max_persona_settings_request,
 )
 from sreda.services.onboarding import MaxOnboardingResult, TelegramOnboardingResult
@@ -111,8 +113,10 @@ async def test_telegram_persona_callback_stores_preset_and_edits_message(
     assert client.answered == [("cb1", "")]
     assert client.sends == []
     assert client.edits[0]["message_id"] == 100
-    assert "ласково" in client.edits[0]["text"]
+    assert "ласковый" in client.edits[0]["text"]
+    assert "пару примеров" in client.edits[0]["text"]
     buttons = client.edits[0]["reply_markup"]["inline_keyboard"][0]
+    assert buttons[0]["text"] == "Покажи примеры"
     assert buttons[0]["callback_data"] == "pb:intro"
     assert buttons[1]["callback_data"] == "persona_ready"
 
@@ -153,8 +157,10 @@ async def test_max_persona_callback_stores_preset_and_edits_message(
     assert params["persona_preset"] == PERSONA_WARM_PRACTICAL
     assert client.sends == []
     assert client.edits[0]["message_id"] == "mid1"
-    assert "спокойно" in client.edits[0]["text"]
+    assert "спокойный" in client.edits[0]["text"]
+    assert "пару примеров" in client.edits[0]["text"]
     buttons = client.edits[0]["attachments"][0]["payload"]["buttons"][0]
+    assert buttons[0]["text"] == "Покажи примеры"
     assert buttons[0]["payload"] == "pb:intro"
     assert buttons[1]["payload"] == "persona_ready"
     assert client.answered == [("cb1", "")]
@@ -262,6 +268,8 @@ async def test_telegram_persona_settings_request_sends_choice_keyboard(
     assert client.edits == []
     assert len(client.sends) == 1
     assert "Выбери, как мне с тобой общаться" in client.sends[0]["text"]
+    assert "веду чек-листы дел" in client.sends[0]["text"]
+    assert "ищу в интернете" in client.sends[0]["text"]
     buttons = client.sends[0]["reply_markup"]["inline_keyboard"][0]
     assert buttons[0]["callback_data"] == f"persona:{PERSONA_WARM_PRACTICAL}"
     assert buttons[1]["callback_data"] == f"persona:{PERSONA_TENDER_CARE}"
@@ -289,6 +297,115 @@ async def test_max_persona_settings_request_sends_choice_keyboard() -> None:
     assert len(client.sends) == 1
     assert client.sends[0]["recipient"] == {"chat_id": "chat1"}
     assert "Выбери, как мне с тобой общаться" in client.sends[0]["text"]
+    assert "веду чек-листы дел" in client.sends[0]["text"]
     buttons = client.sends[0]["attachments"][0]["payload"]["buttons"][0]
     assert buttons[0]["payload"] == f"persona:{PERSONA_WARM_PRACTICAL}"
     assert buttons[1]["payload"] == f"persona:{PERSONA_TENDER_CARE}"
+
+
+@pytest.mark.asyncio
+async def test_telegram_post_tour_name_reply_is_saved_without_llm(
+    session, monkeypatch,
+) -> None:
+    client = FakeTelegramClient()
+    onboarding = TelegramOnboardingResult(
+        is_new_user=False,
+        chat_id="42",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    from sreda.services.housewife_onboarding import record_pb_tour_progress
+
+    record_pb_tour_progress(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        branch="done",
+    )
+    session.commit()
+
+    async def fail_if_llm_called(*args, **kwargs):
+        raise AssertionError("name reply must not be routed to LLM")
+
+    monkeypatch.setattr(
+        "sreda.services.telegram_bot._handle_command",
+        fail_if_llm_called,
+    )
+
+    await handle_telegram_interaction(
+        session,
+        bot_key="telegram_default",
+        payload={
+            "message": {
+                "chat": {"id": 42},
+                "text": "Меня зовут Борис Аркадьевич",
+            }
+        },
+        telegram_client=client,
+        onboarding=onboarding,
+        inbound_message_id="in_name",
+    )
+
+    profile = session.query(TenantUserProfile).filter_by(
+        tenant_id="t1", user_id="u1",
+    ).one()
+    assert profile.display_name == "Борис Аркадьевич"
+    assert client.edits == []
+    assert len(client.sends) == 1
+    assert "Запомнила" in client.sends[0]["text"]
+    assert "Борис Аркадьевич" in client.sends[0]["text"]
+    assert "что будем делать первым" in client.sends[0]["text"]
+    assert "reply_markup" not in client.sends[0]
+
+
+@pytest.mark.asyncio
+async def test_max_pb_done_records_name_waiting_flag(
+    session, monkeypatch,
+) -> None:
+    from sreda.services.housewife_onboarding import (
+        is_pb_tour_waiting_for_name,
+    )
+
+    client = FakeMaxClient()
+    onboarding = MaxOnboardingResult(
+        is_new_user=False,
+        max_account_id="max1",
+        max_chat_id="chat1",
+        tenant_id="t1",
+        workspace_id="w1",
+        user_id="u1",
+        assistant_id="a1",
+    )
+
+    class _Settings:
+        max_bot_token = "max-token"
+
+    monkeypatch.setattr(
+        "sreda.integrations.max.client.MaxClient",
+        lambda token: client,
+    )
+
+    await _handle_max_pending_tenant(
+        session=session,
+        payload={
+            "update_type": "message_callback",
+            "callback": {"callback_id": "cb_done", "payload": "pb:done"},
+            "message": {"body": {"mid": "mid_done"}},
+        },
+        update_type="message_callback",
+        onboarding=onboarding,
+        settings=_Settings(),
+        is_post_approve_tour=True,
+    )
+
+    assert client.answered == [("cb_done", None)]
+    assert client.edits[0]["message_id"] == "mid_done"
+    assert "Как мне к тебе обращаться" in client.edits[0]["text"]
+    assert is_pb_tour_waiting_for_name(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+    )

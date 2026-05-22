@@ -557,14 +557,42 @@ def test_record_pb_tour_progress_subsequent_keeps_started_at():
 
 def test_record_pb_tour_progress_done_sets_completed_at():
     """branch='done' → пишет completed_at + остальные поля."""
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
     session = _fresh_session()
     for branch in ("voice", "schedule", "reminders", "done"):
         record_pb_tour_progress(
             session, tenant_id="t1", user_id="u1", branch=branch
         )
     progress = _get_welcome_progress(session, "t1", "u1")
+    config = UserProfileRepository(session).get_skill_config(
+        "t1", "u1", HOUSEWIFE_FEATURE_KEY
+    )
+    params = UserProfileRepository.decode_skill_params(config)
     assert progress["completed_at"] is not None
     assert progress["last_branch"] == "done"
+    assert params["welcome_v2_name_waiting"] is True
+
+
+def test_record_pb_tour_progress_leaving_done_clears_name_waiting():
+    """Если юзер вернулся назад из done, следующий текст не имя."""
+    from sreda.db.repositories.user_profile import UserProfileRepository
+
+    session = _fresh_session()
+    record_pb_tour_progress(
+        session, tenant_id="t1", user_id="u1", branch="done"
+    )
+    record_pb_tour_progress(
+        session, tenant_id="t1", user_id="u1", branch="memory"
+    )
+    config = UserProfileRepository(session).get_skill_config(
+        "t1", "u1", HOUSEWIFE_FEATURE_KEY
+    )
+    params = UserProfileRepository.decode_skill_params(config)
+    progress = params["welcome_v2_progress"]
+
+    assert progress["last_branch"] == "memory"
+    assert params["welcome_v2_name_waiting"] is False
 
 
 def test_record_pb_tour_progress_preserves_other_skill_params():

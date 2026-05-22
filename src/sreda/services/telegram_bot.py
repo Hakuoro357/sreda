@@ -65,6 +65,47 @@ async def handle_telegram_interaction(
     message_text = _extract_message_text(payload)
     if not message_text:
         return
+    if onboarding.tenant_id and onboarding.user_id:
+        from sreda.services.housewife_onboarding import (
+            is_pb_tour_waiting_for_name,
+            save_pb_tour_display_name,
+        )
+
+        try:
+            if is_pb_tour_waiting_for_name(
+                session,
+                tenant_id=onboarding.tenant_id,
+                user_id=onboarding.user_id,
+            ):
+                display_name = save_pb_tour_display_name(
+                    session,
+                    tenant_id=onboarding.tenant_id,
+                    user_id=onboarding.user_id,
+                    raw_name=message_text,
+                )
+                session.commit()
+                await telegram_client.send_message(
+                    chat_id=onboarding.chat_id,
+                    text=(
+                        f"Запомнила, буду обращаться к тебе: {display_name}.\n\n"
+                        "Есть вопросы ко мне?\n"
+                        "Или начнём сразу — что будем делать первым?"
+                    ),
+                )
+                return
+        except ValueError:
+            session.rollback()
+        except TelegramDeliveryError as exc:
+            session.rollback()
+            logger.warning(
+                "post-tour name confirmation failed status=%s: %s",
+                exc.status_code, exc,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            session.rollback()
+            logger.exception("post-tour name capture failed")
+
     from sreda.services.housewife_persona import (
         build_persona_choice_keyboard_tg,
         build_persona_choice_message,

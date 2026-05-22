@@ -644,14 +644,16 @@ def _extract_short_name(text: str | None) -> str:
 # Welcome v2 broadcast tour — progress tracking (2026-04-28)
 # ---------------------------------------------------------------------------
 #
-# Когда existing approved тенанты получают рассылку pending-цепочки
-# (intro → 10 шагов → done), мы хотим знать кто докуда дошёл, без
+# Когда existing approved тенанты проходят welcome/persona tour
+# (intro → voice → routine → memory → done), мы хотим знать кто докуда дошёл, без
 # миграций. Решение: пишем прогресс в TenantUserSkillConfig.skill_params_json
 # под ключом ``welcome_v2_progress`` с полями started_at / last_branch /
 # last_at / completed_at. Админка читает это и показывает emoji-индикатор
 # рядом с telegram_id.
 
 WELCOME_V2_PROGRESS_KEY = "welcome_v2_progress"
+WELCOME_V2_NAME_WAITING_KEY = "welcome_v2_name_waiting"
+WELCOME_V2_NAME_CAPTURED_AT_KEY = "welcome_v2_name_captured_at"
 
 
 def record_pb_tour_progress(
@@ -694,6 +696,9 @@ def record_pb_tour_progress(
     progress["last_at"] = now
     if branch == "done":
         progress["completed_at"] = now
+        params[WELCOME_V2_NAME_WAITING_KEY] = True
+    else:
+        params[WELCOME_V2_NAME_WAITING_KEY] = False
 
     params[WELCOME_V2_PROGRESS_KEY] = progress
     repo.upsert_skill_config(
@@ -703,6 +708,69 @@ def record_pb_tour_progress(
         source="agent_tool_direct",
         skill_params=params,
     )
+
+
+def is_pb_tour_waiting_for_name(
+    session: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+) -> bool:
+    """True after welcome tour `done` until the next name answer is saved."""
+    repo = UserProfileRepository(session)
+    config = repo.get_skill_config(tenant_id, user_id, HOUSEWIFE_FEATURE_KEY)
+    if config is None:
+        return False
+    params = UserProfileRepository.decode_skill_params(config)
+    if params.get(WELCOME_V2_NAME_WAITING_KEY) is True:
+        return True
+    progress = params.get(WELCOME_V2_PROGRESS_KEY) or {}
+    if not isinstance(progress, dict):
+        return False
+    return (
+        progress.get("last_branch") == "done"
+        and not params.get(WELCOME_V2_NAME_CAPTURED_AT_KEY)
+    )
+
+
+def save_pb_tour_display_name(
+    session: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    raw_name: str,
+) -> str:
+    """Persist the post-tour name answer and clear the waiting flag."""
+    clean = _extract_short_name(raw_name)
+    if not clean:
+        clean = raw_name.strip()[:30]
+    if not clean:
+        raise ValueError("empty display name")
+
+    repo = UserProfileRepository(session)
+    repo.update_profile(
+        tenant_id,
+        user_id,
+        source="user_command",
+        actor_user_id=user_id,
+        display_name=clean[:120],
+    )
+
+    config = repo.get_skill_config(tenant_id, user_id, HOUSEWIFE_FEATURE_KEY)
+    params = UserProfileRepository.decode_skill_params(config) if config else {}
+    params[WELCOME_V2_NAME_WAITING_KEY] = False
+    params[WELCOME_V2_NAME_CAPTURED_AT_KEY] = (
+        datetime.now(timezone.utc).isoformat()
+    )
+    repo.upsert_skill_config(
+        tenant_id,
+        user_id,
+        HOUSEWIFE_FEATURE_KEY,
+        source="user_command",
+        actor_user_id=user_id,
+        skill_params=params,
+    )
+    return clean[:120]
 
 
 def _merge_with_defaults(state: dict[str, Any]) -> dict[str, Any]:
