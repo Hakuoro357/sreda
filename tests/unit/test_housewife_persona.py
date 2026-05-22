@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from sreda.db.base import Base
+from sreda.db.models.core import Tenant, User
+from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.services.housewife_persona import (
+    DEFAULT_PERSONA_PRESET,
+    PERSONA_TENDER_CARE,
+    PERSONA_WARM_PRACTICAL,
+    build_persona_choice_keyboard_max,
+    build_persona_choice_keyboard_tg,
+    build_persona_choice_message,
+    build_persona_overlay,
+    get_persona_preset,
+    is_persona_settings_request,
+    normalize_persona_preset,
+    set_persona_preset,
+)
+
+
+@pytest.fixture()
+def session():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    sess = sessionmaker(bind=engine)()
+    sess.add(Tenant(id="t1", name="Tenant 1"))
+    sess.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
+    sess.commit()
+    try:
+        yield sess
+    finally:
+        sess.close()
+
+
+def test_normalize_persona_defaults_unknown_values() -> None:
+    assert normalize_persona_preset(None) == DEFAULT_PERSONA_PRESET
+    assert normalize_persona_preset("") == DEFAULT_PERSONA_PRESET
+    assert normalize_persona_preset("unknown") == DEFAULT_PERSONA_PRESET
+    assert normalize_persona_preset(PERSONA_TENDER_CARE) == PERSONA_TENDER_CARE
+
+
+def test_get_persona_preset_defaults_when_skill_config_missing(session) -> None:
+    assert get_persona_preset(session, tenant_id="t1", user_id="u1") == (
+        PERSONA_WARM_PRACTICAL
+    )
+
+
+def test_set_persona_preset_preserves_existing_skill_params(session) -> None:
+    repo = UserProfileRepository(session)
+    repo.upsert_skill_config(
+        "t1",
+        "u1",
+        "housewife_assistant",
+        skill_params={
+            "onboarding": {"status": "in_progress"},
+            "welcome_sent": True,
+        },
+    )
+    session.commit()
+
+    set_persona_preset(
+        session,
+        tenant_id="t1",
+        user_id="u1",
+        preset=PERSONA_TENDER_CARE,
+        source="user_command",
+    )
+    session.commit()
+
+    cfg = repo.get_skill_config("t1", "u1", "housewife_assistant")
+    assert cfg is not None
+    params = UserProfileRepository.decode_skill_params(cfg)
+    assert params["persona_preset"] == PERSONA_TENDER_CARE
+    assert params["onboarding"] == {"status": "in_progress"}
+    assert params["welcome_sent"] is True
+    assert get_persona_preset(session, tenant_id="t1", user_id="u1") == (
+        PERSONA_TENDER_CARE
+    )
+
+
+def test_set_persona_preset_rejects_unknown_preset(session) -> None:
+    with pytest.raises(ValueError):
+        set_persona_preset(
+            session,
+            tenant_id="t1",
+            user_id="u1",
+            preset="too_much_sugar",
+        )
+
+
+def test_persona_overlays_are_distinct() -> None:
+    warm = build_persona_overlay(PERSONA_WARM_PRACTICAL)
+    tender = build_persona_overlay(PERSONA_TENDER_CARE)
+
+    assert "warm_practical" in warm
+    assert "tender_care" in tender
+    assert "солнышко" not in warm
+    assert "солнышко" in tender
+    assert "базовому характеру" in warm
+    assert "базовому характеру" in tender
+
+
+def test_persona_choice_message_and_keyboards() -> None:
+    message = build_persona_choice_message()
+    assert "Я Среда" in message
+    assert "Помогаю с бытовой рутиной" in message
+    assert "Я понимаю голос" in message
+
+    tg = build_persona_choice_keyboard_tg()
+    tg_buttons = tg["inline_keyboard"][0]
+    assert tg_buttons[0]["callback_data"] == f"persona:{PERSONA_WARM_PRACTICAL}"
+    assert tg_buttons[1]["callback_data"] == f"persona:{PERSONA_TENDER_CARE}"
+
+    max_keyboard = build_persona_choice_keyboard_max()
+    max_buttons = max_keyboard[0]["payload"]["buttons"][0]
+    assert max_buttons[0]["payload"] == f"persona:{PERSONA_WARM_PRACTICAL}"
+    assert max_buttons[1]["payload"] == f"persona:{PERSONA_TENDER_CARE}"
+
+
+def test_persona_settings_request_detection() -> None:
+    assert is_persona_settings_request("поменяй стиль общения")
+    assert is_persona_settings_request("Настрой стиль общения")
+    assert is_persona_settings_request("хочу выбрать личность")
+    assert is_persona_settings_request("сменить личность помощницы")
+    assert not is_persona_settings_request("поставь напоминание на завтра")

@@ -955,6 +955,9 @@ _CORE_SYSTEM_PROMPT = """\
 - ``get_weather`` — ЛЮБЫЕ запросы про погоду (текущую, прогноз дневной/часовой, по частям дня). Args: location (город), day_offset (0=сегодня, 1=завтра), days_count (1=один день, 7=неделя), granularity (уровень детализации). **granularity — критически важный параметр**: «во сколько начнётся дождь / почасовой прогноз / когда стихнет ветер» → granularity="hourly"; «как одеться сегодня / будет ли дождь днём / утром-днём-вечером» → granularity="part_of_day"; общий прогноз на день/неделю → granularity="daily" (default). НЕ используй для погоды ``web_search`` или ``fetch_url(wttr.in)`` — они менее точные и могут не работать; почасовой и part_of_day режимы покрывают всё что раньше требовало web research.
 - ``web_search`` — актуальные данные из интернета (новости, расписания, цены, определения, курсы валют). Короткий запрос на языке поиска. Для погоды НЕ используй — есть отдельный ``get_weather``. Для поиска БЛИЖАЙШИХ мест («аптека рядом», «магазин у дома», «кафе поблизости») — НЕ используй: web_search не индексирует Яндекс.Карты, отдаёт случайные web-страницы. Вместо этого см. правило «Адреса и навигация» ниже.
 - ``fetch_url`` — когда ``web_search`` вернул подходящий URL и нужно прочитать страницу целиком. Для погоды НЕ используй — есть отдельный ``get_weather``.
+- ``add_checklist_items`` / ``show_checklist`` / ``list_checklists`` — управление произвольными списками дел БЕЗ конкретного часа дня («дела по машине», «план кроя», «материалы для ремонта»). Детальные правила в housewife-разделе ниже.
+- ``add_shopping_items`` / ``list_shopping`` — управление списком покупок («купить молоко», «надо в магазин X»). Детали в housewife-разделе.
+- ``schedule_reminder`` / ``add_task`` — напоминания и задачи с конкретным временем дня («напомни в 9 утра», «встреча завтра в 15:00»). Детали в housewife-разделе.
 - ``log_unsupported_request`` — ПЕРЕД тем как сказать пользователю «я не могу X» / «не умею X» / «у меня нет возможности X», обязательно вызывай этот tool. Только после него — дружелюбно отвечаешь пользователю. Если ты НЕ вызвал log_unsupported_request, значит ты можешь это сделать — попробуй сначала разобраться как.
 
 Правила:
@@ -1062,15 +1065,21 @@ _HOUSEWIFE_FOOD_PROMPT = """\
    «врач в среду **14:30**». Попадают в Расписание. Могут быть
    recurring (каждый ПН в 18:30), могут иметь reminder.
 
-3. **Произвольный список дел** → ``create_checklist`` +
-   ``add_checklist_items``. **ПРАВИЛО (2026-04-28):** если юзер НЕ
-   указал точное ВРЕМЯ ДНЯ (часы:минуты) — это checklist, не task.
+3. **Произвольный список дел** → ОДИН вызов
+   ``add_checklist_items(list_id_or_title="<тема>", items=[...])``
+   (tool САМ создаёт checklist если его нет — НЕ делай отдельный
+   ``create_checklist`` если в этом же сообщении даёшь items).
+   **ПРАВИЛО (2026-04-28):** если юзер НЕ указал точное ВРЕМЯ ДНЯ
+   (часы:минуты) — это checklist, не task.
    Триггер: «запиши в список дел X», «найти чек от ноутбука»,
    «купить лампочку», «починить дверь», «полить цветы», «план кроя
-   на эту неделю», «дела на дачу», «материалы для ремонта». Также
-   если есть только дата БЕЗ часа («на сегодня X», «завтра X»,
-   «на выходных X») — всё равно checklist (юзер не привязал к
-   конкретному моменту времени, ему нужно просто отмечать сделано).
+   на эту неделю», «дела на дачу», «дела по машине», «дела по детям»,
+   «дела по работе», «дела по школе», «дела по бабушке»,
+   «список покупок для отпуска», «список к ремонту»,
+   «материалы для ремонта». Также если есть только дата БЕЗ часа
+   («на сегодня X», «завтра X», «на выходных X») — всё равно
+   checklist (юзер не привязал к конкретному моменту времени, ему
+   нужно просто отмечать сделано).
 
 ПРАВИЛО различения tasks vs checklist (2026-04-28, обновлено):
 
@@ -1096,9 +1105,17 @@ _HOUSEWIFE_FOOD_PROMPT = """\
 
 Чек-листы (create_checklist / add_checklist_items / list_checklists / show_checklist / mark_checklist_item_done / archive_checklist):
 - «Запиши план кроя на эту неделю: лаванда 298 простыня 141×200,
-  шампань 202×204, ...» → ``create_checklist(title="План кроя на эту
-  неделю")`` + ``add_checklist_items(list_id_or_title="План кроя на
-  эту неделю", items=["лаванда 298 ТС, простыня 141×200×19", ...])``.
+  шампань 202×204, ...» / «Запиши в дела по машине: колодки, стекло,
+  масло» / «Добавь в дела по даче: лопата, рассада, шланг» → ОДИН
+  вызов ``add_checklist_items(list_id_or_title="План кроя на эту
+  неделю", items=["лаванда 298 ТС, простыня 141×200×19", ...])`` (для
+  «дела по машине» → ``add_checklist_items(list_id_or_title="Дела по
+  машине", items=[...])``). Tool САМ создаст checklist если его нет —
+  НЕ делай отдельный ``create_checklist`` + ``add_checklist_items``,
+  это два шага вместо одного, и LLM рискует «свернуть» multi-step в
+  текстовое подтверждение. ``create_checklist`` зови ТОЛЬКО когда
+  юзер просит пустой список без items («заведи новый список "Дача"
+  без пунктов»).
 - «Закройила лаванду» / «купила сахар» / «сделал X» — найти подходящий
   pending пункт через ``mark_checklist_item_done(list_id_or_title,
   item_title_match)``. Если непонятно в каком списке — сначала
@@ -1581,7 +1598,7 @@ User: «сохрани рецепты борща, омлета, плова»
 _TOOL_DISCIPLINE_ADDENDUM = """\
 КРИТИЧЕСКИ ВАЖНО (строгая дисциплина tool-calls — не нарушать):
 - Если хочешь что-то СОХРАНИТЬ / ДОБАВИТЬ / СОЗДАТЬ / УДАЛИТЬ / ПОСТАВИТЬ НАПОМИНАНИЕ / ЗАПЛАНИРОВАТЬ ЗАДАЧУ — это СТРОГО через tool_calls API (JSON-канал). НИКОГДА не пиши tool-call синтаксис (``save_recipe(title=...)``, ``add_shopping_items(...)``) в текстовый ответ пользователю — этот текст попадёт в Telegram как есть и будет выглядеть поломанным.
-- ЗАПРЕЩЕНО говорить пользователю "Готово" / "Сделала" / "Настроила" / "Запомнила" / "Сохранила" / "Поставила" / "Создала" / "Добавила" / "Напомню" / "Будет напоминание" — пока в этом ЖЕ turn'е не был вызван соответствующий tool-call. Пустая фраза "Готово" без соответствующего tool-call — запрещена. Последовательность всегда: tool-call → дождаться результата → честный отчёт. Если tool вернул ошибку — скажи правду «не получилось», НЕ выдумывай результат.
+- ЗАПРЕЩЕНО говорить пользователю "Готово" / "Сделала" / "Настроила" / "Запомнила" / "Сохранила" / "Записала" / "Записал" / "Записано" / "Внесла" / "Внесено" / "Зафиксировала" / "Зафиксировал" / "Поставила" / "Создала" / "Добавила" / "Отметила" / "Запланировала" / "Обновила" / "Удалила" / "Напомню" / "Будет напоминание" — пока в этом ЖЕ turn'е не был вызван соответствующий tool-call. Пустая фраза "Готово" без соответствующего tool-call — запрещена. Последовательность всегда: tool-call → дождаться результата → честный отчёт. Если tool вернул ошибку — скажи правду «не получилось», НЕ выдумывай результат.
 - Если нужно сделать несколько действий (найти + сохранить) — отправь tool_calls, дождись результатов, ПОТОМ напиши текстовый ответ. Не объясняй свои действия, описывая вызовы текстом.
 - БАТЧИРУЙ независимые tool_calls ПАРАЛЛЕЛЬНО в ОДНОМ ходе. Если тебе нужно сходить в 5 URL'ов / искать 3 источника / удалить 4 пункта чек-листа / создать 3 напоминания — отправь ВСЕ tool_calls в ОДНОЙ tool_calls array (за один ход), а не по одному в разных итерациях. Параллельный батч исполняется одновременно — пользователь ждёт ~5 секунд вместо 25. Применяй когда вызовы НЕ зависят друг от друга (один не использует результат другого). Примеры правильного батча: ``[fetch_url(A), fetch_url(B), fetch_url(C)]`` для исследования, ``[delete_checklist_item(id1), delete_checklist_item(id2), delete_checklist_item(id3)]`` для массового удаления, ``[web_search(q1), fetch_url(known_url)]`` для смешанного ресёрча. НЕ батчить когда есть зависимость: сначала search → потом fetch_url по найденной ссылке — это два хода.
 - Реминдеры (`schedule_reminder`) всегда требуют RRULE для повторов: «каждый день в 9:00 MSK» = ``recurrence_rule="FREQ=DAILY;BYHOUR=6;BYMINUTE=0"`` (UTC!). Не отвечай «настроила» без реального вызова tool с правильным RRULE.
@@ -1615,11 +1632,21 @@ READ-SIDE SOURCE OF TRUTH (это новое правило, дополняет 
 - Перечислять прошлые факты с числами/датами/именами без `recall_memory`.
 
 Если read-tool недоступен или не нашёл — честно скажи «сейчас проверю» (и сделай tool call) ИЛИ «не нашла в твоих записях, проверь сам?» — но НЕ выдумывай содержимое. История диалога не доказывает, что данные всё ещё актуальны, и не разрешает повторять их без свежего tool result.
+
+WRITE INTENT ROUTER (быстрая навигация по самым частым письменным запросам — соблюдай ВСЕГДА):
+- «запиши/добавь/внеси/зафиксируй в дела» / «запиши в список дел» / «дела по <теме>» («дела по машине», «дела по детям», «дела по работе») / «дела на <дату/событие>» («дела на дачу», «дела на выходные») → ОДИН вызов ``add_checklist_items(list_id_or_title="<тема>", items=[...])``. Tool САМ создаст список если его нет. НЕ отвечай «Записала / Добавила / Внесла / Зафиксировала» без этого вызова.
+- «запиши/добавь в список покупок» / «купи X Y Z» / «надо в магазин» / «список покупок для <случай>» → ``add_shopping_items([...])``. НЕ отвечай «Добавила в покупки / в список» без этого вызова.
+- «напомни» / «поставь напоминание» / «не забыть X в <время>» / «каждый день в <час>» → ``schedule_reminder(title, trigger_iso, ...)``. НЕ отвечай «Поставила напоминание» / «Напомню» без этого вызова.
+- «поставь задачу на <время>» / «встреча в <час>» (есть точное время дня) → ``add_task(...)``. НЕ отвечай «Запланировала» / «Поставила задачу» без этого вызова.
+
+Если ты НАЧАЛА писать «Записала / Сохранила / Добавила / Поставила / Зафиксировала / Внесла / Запланировала / Создала / Отметила / Обновила / Удалила ...» — СТОП. Сначала tool_call в JSON-канале. Текстовый ответ — ПОСЛЕ tool_result. Если tool вернул ошибку или ты решила не вызывать tool — НЕ начинай ответ с этих глаголов. Лучше переспроси или признай «не получилось».
 """
 
 
 def build_system_prompt(
-    feature_key: str | None, *, model_name: str | None = None,
+    feature_key: str | None, *,
+    model_name: str | None = None,
+    persona_preset: str | None = None,
 ) -> str:
     """Compose the system prompt for one turn.
 
@@ -1638,6 +1665,10 @@ def build_system_prompt(
     parts = [core]
     if addon:
         parts.append(addon)
+    if feature_key == "housewife_assistant":
+        from sreda.services.housewife_persona import build_persona_overlay
+
+        parts.append(build_persona_overlay(persona_preset))
     # 2026-05-10: «Душа Среды» — заботливый стержень характера. Между
     # addon и tool_discipline чтобы tool-hygiene осталась highest-attention
     # блоком в конце. Применяется ко всем feature_key.
@@ -1757,6 +1788,16 @@ def _format_time_context_for_prompt(profile: dict[str, Any]) -> str:
         f"записи измерений и событий используй ТОЛЬКО {iso_date} — не "
         f"вчерашние и не позавчерашние даты из истории."
     )
+
+
+def _utc_today_iso() -> str:
+    """Текущая UTC-дата в ISO-формате (YYYY-MM-DD).
+
+    Модульный хелпер — чтобы тесты могли monkeypatch'ить детерминированно.
+    Используется в admin_alert dedupe_key (задача #59).
+    """
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _format_memories_for_prompt(memories: list[dict[str, Any]]) -> str:
@@ -2346,7 +2387,20 @@ async def execute_conversation_chat(
     # that don't support the cache_control marker (MiMo, Qwen) receive
     # the content as plain multi-part text and ignore the marker.
     with trace.step("chat.prompt_build") as _meta:
-        stable_text = build_system_prompt(feature_key, model_name=model_name)
+        persona_preset: str | None = None
+        if feature_key == "housewife_assistant" and user_id:
+            from sreda.services.housewife_persona import get_persona_preset
+
+            persona_preset = get_persona_preset(
+                session,
+                tenant_id=action.tenant_id,
+                user_id=user_id,
+            )
+        stable_text = build_system_prompt(
+            feature_key,
+            model_name=model_name,
+            persona_preset=persona_preset,
+        )
         _meta["stable_chars"] = len(stable_text)
 
     variable_parts: list[str] = []
@@ -3109,6 +3163,16 @@ async def execute_conversation_chat(
     # «записала в план кроя на пятницу...» — крой не tool, прошёл).
     if _hallucination_nudged and detect_unbacked_claim(text, called_tools):
         safe_ack = _format_safe_ack_from_tools(called_tools)
+        # 2026-05-22 (задача #59): для пустого called_tools дефолт
+        # «Готово.» подтверждает действие которого не произошло, и
+        # нарушает собственное правило ban-list в _TOOL_DISCIPLINE_ADDENDUM.
+        # Здесь конец пути где LLM явно соврала + retry exhausted — честно
+        # признаём провал вместо слабого ack.
+        if not called_tools:
+            safe_ack = (
+                "Не получилось надёжно записать это. "
+                "Повтори, пожалуйста?"
+            )
         logger.warning(
             "CHAT_UNBACKED_CLAIM_RETRY_EXHAUSTED tenant=%s feature=%s "
             "called_tools=%s original_chars=%d — replacing text with safe ack",
@@ -3121,6 +3185,45 @@ async def execute_conversation_chat(
             original_chars=len(text),
         ):
             pass
+
+        # 2026-05-22 (задача #59): admin alert когда safety_net реально
+        # заменяет текст. dedupe_key гранулярный: tenant + feature +
+        # 8-символьный хеш текста + UTC-дата. Предотвращает suppression
+        # разных галлюцинаций одного tenant-а за день (плюс существующий
+        # P1 throttle 300s блокирует exact-repeat).
+        try:
+            import hashlib
+            from sreda.services.admin_alerts import send_admin_alert
+            _text_preview = (
+                text[:300] + "…" if len(text) > 300 else text
+            )
+            _text_hash = hashlib.md5(
+                text.encode("utf-8"),
+                usedforsecurity=False,
+            ).hexdigest()[:8]
+            send_admin_alert(
+                severity="P1",
+                title=f"Unbacked claim safety_net triggered: {feature_key}",
+                body=(
+                    f"Tenant: {action.tenant_id}\n"
+                    f"Feature: {feature_key}\n"
+                    f"Channel: {action.channel_type or '?'}\n"
+                    f"Called tools: {sorted(called_tools) or '(none)'}\n"
+                    f"Original text preview:\n{_text_preview}"
+                ),
+                dedupe_key=(
+                    f"unbacked_claim:{action.tenant_id}:{feature_key}:"
+                    f"{_text_hash}:{_utc_today_iso()}"
+                ),
+                extra_context={
+                    "user_id": user_id or "?",
+                    "channel": action.channel_type or "?",
+                    "original_chars": len(text),
+                },
+            )
+        except Exception:
+            logger.exception("admin alert send failed (safety_net)")
+
         text = safe_ack
 
     if (

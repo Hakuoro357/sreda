@@ -364,53 +364,34 @@ def is_user_named(session: Session, tenant_id: str, user_id: str) -> bool:
 def build_post_approve_message() -> str:
     """Welcome после auto-grant'а на signup (Phase 2C).
 
-    2026-05-09 (Boris feedback): welcome message сокращён до короткого
-    приветствия + кнопка «Расскажи поподробнее». Name prompt («Прежде
-    чем приступим, подскажи как к тебе обращаться?») перенесён в конец
-    tour'а (done step), чтобы не дублировать «Прежде чем приступим»
-    с финалом tour'а. Юзер либо тапает кнопку (увидит tour + name
-    prompt в конце), либо сразу пишет — LLM спросит имя через системный
-    prompt по ходу chat-flow.
+    2026-05-22 (#60): первый onboarding step — выбор persona. После
+    выбора юзер может открыть tour через прежний `pb:intro`.
     """
-    return "Привет! Я Среда — помощница для семьи."
+    from sreda.services.housewife_persona import build_persona_choice_message
+
+    return build_persona_choice_message()
 
 
 def build_post_approve_keyboard_tg() -> dict:
     """Telegram inline_keyboard для post-approve welcome.
 
-    Одна кнопка «Расскажи поподробнее» → `pb:intro` callback. Когда
-    юзер тапает, welcome editMessage'ится в pending_bot tour intro
-    через `telegram_bot._handle_callback` (broadcast pattern,
-    обрабатывает pb:* для approved users).
+    Две кнопки выбора persona. После выбора callback-handler сохранит
+    preset в `TenantUserSkillConfig.skill_params_json` и покажет кнопку
+    `pb:intro` для прежнего tour.
     """
-    return {
-        "inline_keyboard": [[
-            {
-                "text": "Расскажи поподробнее",
-                "callback_data": "pb:intro",
-            }
-        ]]
-    }
+    from sreda.services.housewife_persona import build_persona_choice_keyboard_tg
+
+    return build_persona_choice_keyboard_tg()
 
 
 def build_post_approve_keyboard_max() -> list[dict]:
     """MAX inline_keyboard attachment для post-approve welcome.
 
-    Тот же контент что TG version, но в MAX-формате (attachments
-    list с type='inline_keyboard'). Callback payload: `pb:intro`.
+    Тот же persona-choice контент что TG version, но в MAX-формате.
     """
-    return [{
-        "type": "inline_keyboard",
-        "payload": {
-            "buttons": [[
-                {
-                    "type": "callback",
-                    "text": "Расскажи поподробнее",
-                    "payload": "pb:intro",
-                }
-            ]]
-        },
-    }]
+    from sreda.services.housewife_persona import build_persona_choice_keyboard_max
+
+    return build_persona_choice_keyboard_max()
 
 
 # 2026-05-09 (Boris feedback): build_post_tour_name_prompt() удалён —

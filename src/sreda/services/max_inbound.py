@@ -917,6 +917,22 @@ async def _process_approved_max_turn(
                     return
                 payload = transcribed
 
+                from sreda.runtime.dispatcher import _extract_max_message_text
+                from sreda.services.housewife_persona import (
+                    is_persona_settings_request,
+                )
+
+                message_text = _extract_max_message_text(payload)
+                if message_text and is_persona_settings_request(message_text):
+                    await _handle_max_persona_settings_request(
+                        max_client=max_client,
+                        onboarding=onboarding,
+                    )
+                    _set_processing_status(
+                        bg_session, inbound_message_id, "processed",
+                    )
+                    return
+
             # Ack message — UX parity с TG: показываем «⏳ Работаю…» как
             # только начали обработку, чтобы юзер не молча ждал 5-15s
             # пока LLM думает + outbox doставляет. Boris directive
@@ -1214,6 +1230,84 @@ async def _handle_max_callback(
         )
         return True
 
+    if data.startswith("persona:"):
+        from sreda.services.housewife_persona import (
+            build_persona_selected_keyboard_max,
+            build_persona_selected_message,
+            set_persona_preset,
+        )
+
+        preset = data.removeprefix("persona:").strip()
+        if callback_id:
+            try:
+                await max_client.answer_callback(str(callback_id), notification="")
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "max persona callback ack failed (data=%r) — continuing",
+                    data, exc_info=True,
+                )
+        if not (onboarding.tenant_id and onboarding.user_id):
+            logger.warning("max persona: no tenant/user in callback context")
+            return True
+        try:
+            set_persona_preset(
+                session,
+                tenant_id=onboarding.tenant_id,
+                user_id=onboarding.user_id,
+                preset=preset,
+                source="user_command",
+                actor_user_id=onboarding.user_id,
+            )
+            session.commit()
+        except ValueError:
+            session.rollback()
+            logger.warning(
+                "max persona: unknown preset tenant=%s preset=%r",
+                onboarding.tenant_id, preset,
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            session.rollback()
+            logger.exception("max persona: failed to store preset")
+            return True
+
+        msg = payload.get("message")
+        cb_message_mid: str | None = None
+        if isinstance(msg, dict):
+            body = msg.get("body")
+            if isinstance(body, dict) and body.get("mid"):
+                cb_message_mid = str(body["mid"])
+
+        reply_text = build_persona_selected_message(preset)
+        attachments = build_persona_selected_keyboard_max()
+        edited = False
+        if cb_message_mid:
+            try:
+                await max_client.edit_message(
+                    cb_message_mid,
+                    text=reply_text,
+                    attachments=attachments,
+                )
+                edited = True
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "max persona: edit_message failed mid=%s tenant=%s: %s "
+                    "— fallback to send_message",
+                    cb_message_mid, onboarding.tenant_id, exc,
+                )
+
+        if not edited and getattr(onboarding, "max_chat_id", None):
+            try:
+                await max_client.send_message(
+                    recipient={"chat_id": onboarding.max_chat_id},
+                    text=reply_text,
+                    attachments=attachments,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("max persona: delivery failed", exc_info=True)
+
+        return True
+
     # Прочие callbacks (billing/profile/eds/pb/btn_reply) пока — generic ack +
     # дальше через dispatcher. pb:/btn_reply: handlers — TG-specific, для
     # MAX отдельный issue (нет 1:1 editMessageText API parity yet).
@@ -1228,6 +1322,34 @@ async def _handle_max_callback(
                 data, exc_info=True,
             )
     return False
+
+
+async def _handle_max_persona_settings_request(
+    *,
+    max_client,
+    onboarding,
+) -> None:
+    """Send persona choice keyboard for deterministic MAX settings intent."""
+    if not getattr(onboarding, "max_chat_id", None):
+        logger.warning(
+            "max persona settings: no chat_id tenant=%s",
+            getattr(onboarding, "tenant_id", None),
+        )
+        return
+
+    from sreda.services.housewife_persona import (
+        build_persona_choice_keyboard_max,
+        build_persona_choice_message,
+    )
+
+    try:
+        await max_client.send_message(
+            recipient={"chat_id": onboarding.max_chat_id},
+            text=build_persona_choice_message(),
+            attachments=build_persona_choice_keyboard_max(),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("max persona settings: delivery failed", exc_info=True)
 
 
 async def _handle_max_reminder_callback(
@@ -1635,6 +1757,7 @@ def _set_processing_status(session, inbound_message_id: str, status: str) -> Non
 # processing_status (causing monitor stuck-inbound alerts).
 _KNOWN_MAX_CALLBACK_PREFIXES: tuple[str, ...] = (
     "btn_reply:",   # inline-button label reply (our token-based)
+    "persona:",     # housewife persona preset choice
     "pb:",          # pending_bot tour navigation
     "rem_done:",    # reminder mark done
     "rem_snooze:",  # reminder snooze

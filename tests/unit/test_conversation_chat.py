@@ -1487,8 +1487,9 @@ def test_no_hallucination_no_retry(monkeypatch, tmp_path: Path):
 
 def test_hallucination_retry_bounded_to_one(monkeypatch, tmp_path: Path):
     """Если LLM повторно галлюцинирует после nudge'а — handler НЕ делает
-    второй retry, а принимает текст как есть. `_hallucination_nudged`
-    флаг не позволяет уйти в бесконечный loop."""
+    второй retry, а safety_net заменяет текст на честный fallback ack
+    (задача #59) вместо «Готово.». `_hallucination_nudged` флаг не
+    позволяет уйти в бесконечный retry-loop."""
     session = _bootstrap(monkeypatch, tmp_path, "halluc_bounded.db")
     try:
         scripted = [
@@ -1528,3 +1529,99 @@ def test_hallucination_retry_bounded_to_one(monkeypatch, tmp_path: Path):
     # Юзер получил второе (последнее) сообщение — handler не блокирует
     # ответ при повторной галлюцинации, иначе юзер останется без reply'я
     assert len(telegram.sent) == 1
+
+
+def test_safety_net_sends_admin_alert_and_honest_ack(monkeypatch, tmp_path: Path):
+    """Задача #59: когда safety_net срабатывает и called_tools пустой —
+    (1) outbound text = честный fallback ack «Не получилось надёжно
+        записать это. Повтори, пожалуйста?»;
+    (2) send_admin_alert вызван с severity=P1 и гранулярным dedupe_key
+        (5 частей: unbacked_claim : tenant : feature : 8-char-hash : date).
+
+    Дополнительно closes Codex MAJOR R3 (datetime monkeypatch через
+    модульный хелпер _utc_today_iso).
+    """
+    captured_alerts: list[dict] = []
+
+    def fake_send(severity, title, body, *, dedupe_key=None, extra_context=None):
+        captured_alerts.append({
+            "severity": severity,
+            "title": title,
+            "body": body,
+            "dedupe_key": dedupe_key,
+            "extra_context": extra_context,
+        })
+
+    # Переопределяем autouse-фикстуру (последний setattr выигрывает в pytest)
+    monkeypatch.setattr(
+        "sreda.services.admin_alerts.send_admin_alert", fake_send,
+    )
+    # Замораживаем UTC-дату через модульный хелпер (R3 fix)
+    monkeypatch.setattr(
+        "sreda.runtime.handlers._utc_today_iso",
+        lambda: "2026-05-22",
+    )
+
+    session = _bootstrap(monkeypatch, tmp_path, "safety_net_alert.db")
+    try:
+        scripted = [
+            # iter 0: claim («Сохранила» + «в книгу» = recipe category)
+            # без tool → detector fires в текущей конфигурации
+            AIMessage(
+                content="Сохранила рецепт борща в книгу.",
+                tool_calls=[],
+            ),
+            # iter 1 (после nudge retry): ОПЯТЬ claim без tool →
+            # RETRY_EXHAUSTED → safety_net + admin alert
+            AIMessage(
+                content="Готово! Записала рецепт борща в книгу.",
+                tool_calls=[],
+            ),
+        ]
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        envelope = _chat_envelope("сохрани рецепт борща")
+        queued = svc.enqueue_action(envelope)
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    # Alert assertions — гранулярный dedupe_key
+    assert len(captured_alerts) >= 1, "send_admin_alert не вызывался"
+    alert = captured_alerts[0]
+    assert alert["severity"] == "P1"
+    assert "Unbacked claim" in alert["title"]
+    # 5 частей через `:` — unbacked_claim : tenant : feature : hash : date
+    parts = alert["dedupe_key"].split(":")
+    assert len(parts) == 5, (
+        f"ожидаем 5 частей dedupe_key, получили {parts}"
+    )
+    assert parts[0] == "unbacked_claim"
+    assert parts[1] == "t1"  # tenant_id из _chat_envelope
+    # parts[2] = feature_key (любой непустой — в тесте может быть test_chat_skill)
+    assert parts[2], f"feature_key пуст в dedupe_key: {parts}"
+    # parts[3] = 8-символьный hex hash
+    assert len(parts[3]) == 8, f"hash должен быть 8 символов, got {parts[3]}"
+    assert all(c in "0123456789abcdef" for c in parts[3])
+    # parts[4] = замороженная дата (из monkeypatch _utc_today_iso)
+    assert parts[4] == "2026-05-22"
+
+    # Outbound: честный fallback ack, НЕ оригинальная ложь
+    assert len(telegram.sent) == 1
+    outbound_text = telegram.sent[0]["text"]
+    assert "Сохранила рецепт" not in outbound_text, (
+        f"оригинальная ложь утекла: {outbound_text!r}"
+    )
+    assert "Записала рецепт" not in outbound_text, (
+        f"вторая итерация лжи утекла: {outbound_text!r}"
+    )
+    # Empty called_tools → честный fallback (R4 fix вместо «Готово.»)
+    assert outbound_text == (
+        "Не получилось надёжно записать это. Повтори, пожалуйста?"
+    )

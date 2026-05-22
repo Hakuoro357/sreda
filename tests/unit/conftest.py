@@ -281,3 +281,24 @@ def db_session(_test_engine):
         session.close()
         trans.rollback()
         conn.close()
+
+
+@pytest.fixture(autouse=True)
+def _disable_admin_alerts_for_unit_tests(monkeypatch):
+    """Глобально no-op'ит send_admin_alert в области unit-тестов.
+
+    Задача #59 добавляет вызов send_admin_alert в hallucination_safety_net
+    path в handlers.py. Существующие тесты, затрагивающие этот path
+    (например test_hallucination_retry_bounded_to_one), иначе рисковали
+    бы отправить реальные P1-алерты или породить daemon-thread
+    side-effect на dev-машинах с настроенными админскими секретами
+    (SREDA_ADMIN_TG_CHAT_ID или MAX-эквивалент).
+
+    Тесты, которым нужно проверить вызов alert, переопределяют эту
+    фикстуру своим собственным monkeypatch.setattr (в pytest действует
+    правило «последний setattr выигрывает» внутри scope теста).
+    """
+    monkeypatch.setattr(
+        "sreda.services.admin_alerts.send_admin_alert",
+        lambda *args, **kwargs: None,
+    )

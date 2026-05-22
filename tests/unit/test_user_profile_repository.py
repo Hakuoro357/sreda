@@ -30,7 +30,7 @@ def test_get_or_create_profile_is_idempotent(session):
     first = repo.get_or_create_profile("t1", "u1")
     second = repo.get_or_create_profile("t1", "u1")
     assert first.id == second.id
-    assert first.timezone == "UTC"
+    assert first.timezone == "Europe/Moscow"
     assert first.communication_style == "casual"
 
 

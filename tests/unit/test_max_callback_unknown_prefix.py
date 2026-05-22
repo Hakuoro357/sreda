@@ -173,6 +173,7 @@ def test_known_prefixes_constant_includes_all_handlers() -> None:
     """
     expected = {
         "btn_reply:",     # _handle_max_callback btn_reply handler (outer scope)
+        "persona:",       # housewife persona preset choice
         "pb:",            # pending_bot tour navigation
         "rem_done:",      # FamilyReminder mark done
         "rem_snooze:",    # FamilyReminder snooze

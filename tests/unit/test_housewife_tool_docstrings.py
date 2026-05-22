@@ -250,13 +250,13 @@ def test_search_recipes_distinguishes_from_menu():
 
 def test_core_prompt_excludes_housewife_food_rules():
     """Generic / non-housewife turns shouldn't pay the food-section
-    token tax. Housewife-specific keywords (list_shopping, plan_week_menu,
-    recipe sources) must NOT appear in the core prompt."""
+    token tax. A short global tool overview may mention common routing
+    tools, but detailed housewife-only rules (menu planning, recipe
+    sources, heat-level rules) must NOT appear in the core prompt."""
     from sreda.runtime.handlers import _CORE_SYSTEM_PROMPT
 
     low = _CORE_SYSTEM_PROMPT.lower()
     for forbidden in (
-        "list_shopping",
         "list_menu",
         "plan_week_menu",
         "save_recipes_batch",

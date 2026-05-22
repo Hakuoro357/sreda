@@ -2339,19 +2339,36 @@ def build_housewife_tools(
 
     @_write_lc_tool
     def add_checklist_items(list_id_or_title: str, items: list[str]) -> str:
-        """Add items to an existing checklist (or create one if missing).
+        """Добавить пункты в чек-лист (создаёт новый если такого нет).
 
-        Resolves ``list_id_or_title`` either by exact id (``checklist_*``)
-        or fuzzy title match against active lists. If no match — creates
-        a NEW checklist with that title and adds items there.
+        Триггеры пользователя (вызывай этот tool сразу, БЕЗ create_checklist):
+        - «запиши в дела по машине: колодки, стекло, масло»
+        - «добавь в дела по даче: привезти лопату, купить рассаду»
+        - «зафиксируй в список покупок для отпуска: палатка, спрей от комаров»
+        - «запиши план кроя на эту неделю: лаванда 298 простыня 141×200, шампань 202×204»
+        - «добавь в дела по детям: репетитор математика, врач стоматолог»
+        - «запиши в материалы для ремонта: краска белая 5л, валик, малярный скотч»
+
+        Tool САМ создаёт чек-лист с таким title если его ещё нет — НЕ
+        нужно делать отдельный create_checklist + add_checklist_items.
+        Это ОДИН вызов на оба действия (create + populate). create_checklist
+        используй ТОЛЬКО когда юзер просит пустой список без items
+        («заведи новый список Дача без пунктов»).
 
         Args:
-            list_id_or_title: id like ``checklist_xxx`` OR a short title
-                that fuzzy-matches an existing active list (e.g. «План кроя»).
-            items: list of item titles, e.g. ["Лаванда 298 ТС, простыня
-                141×200×19", "Шампань страйп, простыня 202×204×26"].
+            list_id_or_title: id вида ``checklist_*`` ИЛИ короткое
+                название (нечёткий поиск среди активных списков, например
+                «План кроя», «Дела по машине», «Дела на дачу»). При
+                отсутствии — создаст новый список с этим title.
+            items: список пунктов как строки, по одному на строку, например:
+                ["Лаванда 298 ТС, простыня 141×200×19",
+                 "Шампань страйп, простыня 202×204×26"]
+                или
+                ["Заменить колодки (скрипит)",
+                 "Проверить водительское стекло",
+                 "Починить пассажирское стекло"].
 
-        Returns: ``ok:added:N:list=<id>`` or ``error:<msg>``.
+        Returns: ``ok:added:N:list=<id>`` или ``error:<msg>``.
         """
         if not user_id:
             return "error: no user_id context"

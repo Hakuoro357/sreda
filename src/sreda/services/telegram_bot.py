@@ -65,6 +65,25 @@ async def handle_telegram_interaction(
     message_text = _extract_message_text(payload)
     if not message_text:
         return
+    from sreda.services.housewife_persona import (
+        build_persona_choice_keyboard_tg,
+        build_persona_choice_message,
+        is_persona_settings_request,
+    )
+
+    if is_persona_settings_request(message_text):
+        try:
+            await telegram_client.send_message(
+                chat_id=onboarding.chat_id,
+                text=build_persona_choice_message(),
+                reply_markup=build_persona_choice_keyboard_tg(),
+            )
+        except TelegramDeliveryError as exc:
+            logger.warning(
+                "persona settings choice delivery failed status=%s: %s",
+                exc.status_code, exc,
+            )
+        return
 
     await _handle_command(
         session,
@@ -312,6 +331,101 @@ async def _handle_callback(
             callback_query=callback_query,
             data=data,
         )
+        return
+
+    if data.startswith("persona:"):
+        from sreda.services.housewife_persona import (
+            build_persona_selected_keyboard_tg,
+            build_persona_selected_message,
+            set_persona_preset,
+        )
+
+        preset = data[len("persona:"):].strip()
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(str(callback_id), text="")
+            except TelegramDeliveryError as exc:
+                if exc.status_code == 400:
+                    logger.info(
+                        "persona: callback expired (400) tenant=%s — drop",
+                        onboarding.tenant_id,
+                    )
+                    return
+                logger.warning(
+                    "persona: callback ack failed status=%s: %s",
+                    exc.status_code, exc,
+                )
+
+        if not (onboarding.tenant_id and onboarding.user_id):
+            logger.warning("persona: no tenant/user in callback context")
+            return
+
+        try:
+            set_persona_preset(
+                session,
+                tenant_id=onboarding.tenant_id,
+                user_id=onboarding.user_id,
+                preset=preset,
+                source="user_command",
+                actor_user_id=onboarding.user_id,
+            )
+            session.commit()
+        except ValueError:
+            session.rollback()
+            logger.warning(
+                "persona: unknown preset tenant=%s preset=%r",
+                onboarding.tenant_id, preset,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            session.rollback()
+            logger.exception("persona: failed to store preset")
+            return
+
+        if onboarding.chat_id:
+            cb_message = (
+                callback_query.get("message")
+                if isinstance(callback_query, dict) else None
+            )
+            msg_id = (
+                cb_message.get("message_id")
+                if isinstance(cb_message, dict) else None
+            )
+            reply_text = build_persona_selected_message(preset)
+            reply_markup = build_persona_selected_keyboard_tg()
+            edited = False
+            if msg_id is not None:
+                try:
+                    await telegram_client.edit_message_text(
+                        chat_id=str(onboarding.chat_id),
+                        message_id=int(msg_id),
+                        text=reply_text,
+                        reply_markup=reply_markup,
+                    )
+                    edited = True
+                except TelegramDeliveryError as exc:
+                    if exc.status_code == 400 and "not modified" in (
+                        str(exc) or ""
+                    ).lower():
+                        edited = True
+                    else:
+                        logger.info(
+                            "persona: editMessageText failed status=%s — "
+                            "fallback to send_message",
+                            exc.status_code,
+                        )
+            if not edited:
+                try:
+                    await telegram_client.send_message(
+                        chat_id=onboarding.chat_id,
+                        text=reply_text,
+                        reply_markup=reply_markup,
+                    )
+                except TelegramDeliveryError as exc:
+                    logger.warning(
+                        "persona: delivery failed status=%s: %s",
+                        exc.status_code, exc,
+                    )
         return
 
     # Pending-bot tour callbacks (`pb:<branch>`). 2026-04-28: эти кнопки
