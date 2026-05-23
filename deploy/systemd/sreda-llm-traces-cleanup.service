@@ -1,0 +1,10 @@
+[Unit]
+Description=Sreda — daily cleanup of llm-trace day-folders older than 5 days
+After=network.target
+
+[Service]
+Type=oneshot
+User=sreda
+ExecStart=/opt/sreda/.venv/bin/python /opt/sreda/scripts/cleanup_llm_traces.py --root /var/lib/sreda/private/llm-traces --keep-days 5
+StandardOutput=journal
+StandardError=journal

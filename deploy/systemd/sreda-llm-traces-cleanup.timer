@@ -1,0 +1,11 @@
+[Unit]
+Description=Sreda — daily timer для llm-trace cleanup (Issue #68 retention)
+
+[Timer]
+# 03:40 UTC = 06:40 MSK (after 03:00 UTC backup_postgres + 03:30 signup cleanup)
+OnCalendar=*-*-* 03:40:00
+Persistent=true
+Unit=sreda-llm-traces-cleanup.service
+
+[Install]
+WantedBy=timers.target
