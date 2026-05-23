@@ -85,6 +85,64 @@ def test_has_exclude_for_missing_returns_false():
     assert has_exclude_for(text, Path("/var/lib/sreda/private/llm-traces")) is False
 
 
+def test_has_exclude_for_ignores_commented_hash_prefix():
+    """Regression: closed Codex PR-48 MAJOR finding (validate_no_backup_leak.py
+    accepts commented-out excludes). Lines starting с ``#`` must NOT count
+    as active exclude — иначе config с ``# exclude=...`` ложно проходит."""
+    text = "path = /var/lib\n# exclude = /var/lib/sreda/private/llm-traces\n"
+    assert has_exclude_for(text, Path("/var/lib/sreda/private/llm-traces")) is False
+
+
+def test_has_exclude_for_ignores_commented_semicolon_prefix():
+    text = "path = /var/lib\n; exclude=/var/lib/sreda/private/llm-traces\n"
+    assert has_exclude_for(text, Path("/var/lib/sreda/private/llm-traces")) is False
+
+
+def test_has_exclude_for_ignores_commented_double_slash():
+    text = "path = /var/lib\n// exclude=/var/lib/sreda/private/llm-traces\n"
+    assert has_exclude_for(text, Path("/var/lib/sreda/private/llm-traces")) is False
+
+
+def test_has_exclude_for_ignores_inline_comment_after_whitespace():
+    """Inline trailing comment after whitespace — exclude inside comment
+    must NOT activate."""
+    text = "path = /var/lib  # exclude=/var/lib/sreda/private/llm-traces\n"
+    assert has_exclude_for(text, Path("/var/lib/sreda/private/llm-traces")) is False
+
+
+def test_has_exclude_for_indented_comment_ignored():
+    """Comment с leading whitespace тоже должен skip-аться."""
+    text = "path = /var/lib\n   # exclude=/var/lib/sreda/private/llm-traces\n"
+    assert has_exclude_for(text, Path("/var/lib/sreda/private/llm-traces")) is False
+
+
+def test_validate_file_leak_when_only_commented_exclude_present(tmp_path):
+    """End-to-end regression: config с ancestor include + только закомментированным
+    exclude → должен быть LEAK."""
+    cfg = tmp_path / "commented_exclude.conf"
+    cfg.write_text(
+        "path=/var/lib\n# exclude=/var/lib/sreda/private/llm-traces\n",
+        encoding="utf-8",
+    )
+    leaks = validate_file(cfg, Path("/var/lib/sreda/private/llm-traces"))
+    assert len(leaks) == 1, f"Expected LEAK for commented-only exclude, got: {leaks}"
+    assert "LEAK" in leaks[0]
+
+
+def test_validate_file_ok_when_real_exclude_present_alongside_comment(tmp_path):
+    """Если есть И активный exclude И закомментированный — ОК (активный
+    spasает)."""
+    cfg = tmp_path / "mixed.conf"
+    cfg.write_text(
+        "path=/var/lib\n"
+        "# exclude=/some/old/path\n"
+        "exclude=/var/lib/sreda/private/llm-traces\n",
+        encoding="utf-8",
+    )
+    leaks = validate_file(cfg, Path("/var/lib/sreda/private/llm-traces"))
+    assert leaks == []
+
+
 def test_validate_file_leak_when_ancestor_no_exclude(tmp_path):
     cfg = tmp_path / "leak.conf"
     cfg.write_text("path=/var/lib\n", encoding="utf-8")

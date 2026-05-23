@@ -163,12 +163,22 @@ def _print_diff(captured_response: dict, replay_response: dict,
                 show_content: bool) -> None:
     print("")
     print("=== Tool calls diff ===")
-    orig_tools = [(tc.get("name"), tc.get("args"))
-                  for tc in (captured_response.get("tool_calls") or [])]
-    replay_tools = [(tc.get("name"), tc.get("args"))
-                    for tc in (replay_response.get("tool_calls") or [])]
-    print(f"  Original tool_calls: {orig_tools}")
-    print(f"  Replay tool_calls:   {replay_tools}")
+    orig_tcs = list(captured_response.get("tool_calls") or [])
+    replay_tcs = list(replay_response.get("tool_calls") or [])
+    # PII gating: tool_call args contain decrypted user text + memories
+    # (the same surface as content). Hide them behind --show-content.
+    # See Codex review on PR #48 (MAJOR — replay_llm_turn.py:164-176).
+    if show_content:
+        orig_tools = [(tc.get("name"), tc.get("args")) for tc in orig_tcs]
+        replay_tools = [(tc.get("name"), tc.get("args")) for tc in replay_tcs]
+        print(f"  Original tool_calls: {orig_tools}")
+        print(f"  Replay tool_calls:   {replay_tools}")
+    else:
+        orig_names = [tc.get("name") for tc in orig_tcs]
+        replay_names = [tc.get("name") for tc in replay_tcs]
+        print(f"  Original tool_calls: count={len(orig_tcs)} names={orig_names}")
+        print(f"  Replay tool_calls:   count={len(replay_tcs)} names={replay_names}")
+        print("  (tool args suppressed — use --show-content to see PII)")
     if not show_content:
         print("")
         print("(content diff suppressed — use --show-content to see PII)")
@@ -266,10 +276,31 @@ def main(argv: list[str] | None = None) -> int:
               f"{target_provider}/{target_model}")
         print(f"⚠ Decrypted PII включая memories будет отправлен NEW provider.")
         print(f"⚠ Если new provider в другой юрисдикции — может нарушить data residency.")
-        if not args.no_confirm:
-            if not _interactive_confirm("Continue?"):
-                logger.error("user declined cross-provider replay")
-                return 5
+        if args.no_confirm:
+            # --no-confirm is a test-only escape hatch. In production CLI
+            # the operator MUST interactively confirm cross-provider PII
+            # transfer (152-ФЗ data residency). Gate via PYTEST env so
+            # the flag works under pytest (which sets it automatically)
+            # but refuses to bypass confirmation on the VDS.
+            # See Codex review on PR #48 (MAJOR — replay_llm_turn.py:224).
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                logger.error(
+                    "--no-confirm is a test-only flag (requires PYTEST_CURRENT_TEST env). "
+                    "Production cross-provider replay must use the interactive prompt; "
+                    "captured=%s/%s target=%s/%s",
+                    captured_provider, captured_model,
+                    target_provider, target_model,
+                )
+                return 8
+            logger.warning(
+                "cross-provider replay auto-approved via --no-confirm (test mode): "
+                "captured=%s/%s target=%s/%s",
+                captured_provider, captured_model,
+                target_provider, target_model,
+            )
+        elif not _interactive_confirm("Continue?"):
+            logger.error("user declined cross-provider replay")
+            return 5
 
     # Now run replay invoke (read-only, no DB)
     messages = _messages_from_envelope(captured_request)
@@ -277,10 +308,49 @@ def main(argv: list[str] | None = None) -> int:
     # tool_schemas — bind as inert dicts (НЕ production callables)
     tool_schemas = captured_request.get("tool_schemas") or []
 
-    # Build standalone LLM
+    # Build standalone LLM. Pass ALL reproducible client kwargs — иначе
+    # replay output может отличаться по причинам не связанным с моделью
+    # (other top_p, missing extra_body, default timeout) и CLI становится
+    # unreliable для debug. See Codex review on PR #48 (MAJOR —
+    # replay_llm_turn.py: replay is not exact replay).
     from sreda.services.llm import get_chat_llm  # lazy import after no-DB guarantee
-    llm = get_chat_llm(provider=target_provider, model=target_model,
-                       temperature=merge_kwargs.get("temperature", 0.3))
+    # Whitelist of constructor-level kwargs accepted by ChatOpenAI /
+    # MimoChatOpenAI. Anything not in this set is per-call (invocation_kwargs).
+    _CONSTRUCTOR_KWARGS = {
+        "temperature", "top_p", "seed", "stop", "max_tokens",
+        "tool_choice", "parallel_tool_calls", "response_format",
+        "extra_body", "timeout_seconds", "request_timeout",
+        "base_url",
+    }
+    chat_llm_kwargs: dict[str, Any] = {}
+    for k, v in merge_kwargs.items():
+        if v is None:
+            continue
+        if k in _CONSTRUCTOR_KWARGS:
+            chat_llm_kwargs[k] = v
+    # Ensure temperature defined даже если captured envelope не имел его.
+    chat_llm_kwargs.setdefault("temperature",
+                               merge_kwargs.get("temperature", 0.3))
+
+    try:
+        llm = get_chat_llm(
+            provider=target_provider,
+            model=target_model,
+            **chat_llm_kwargs,
+        )
+    except TypeError as exc:
+        # Unknown kwarg для current LangChain — fallback с минимумом,
+        # warn пользователя что replay best-effort.
+        logger.warning(
+            "get_chat_llm rejected captured kwargs (%s) — falling back to "
+            "temperature-only (best-effort replay); error: %s",
+            sorted(chat_llm_kwargs.keys()), exc,
+        )
+        llm = get_chat_llm(
+            provider=target_provider,
+            model=target_model,
+            temperature=chat_llm_kwargs.get("temperature", 0.3),
+        )
     if llm is None:
         logger.error("get_chat_llm returned None для provider=%s model=%s — "
                      "check API key configured", target_provider, target_model)
@@ -288,9 +358,16 @@ def main(argv: list[str] | None = None) -> int:
     if tool_schemas:
         llm = llm.bind_tools(tool_schemas)
 
+    # Per-call invocation kwargs (LangChain semantics: ainvoke(messages, **kw)
+    # overrides .bind() and constructor kwargs). Replay must reproduce this.
+    invocation_kwargs = dict(captured_request.get("invocation_kwargs") or {})
+
     # Invoke (sync — debug context)
     try:
-        replay_ai_msg = llm.invoke(messages)
+        if invocation_kwargs:
+            replay_ai_msg = llm.invoke(messages, **invocation_kwargs)
+        else:
+            replay_ai_msg = llm.invoke(messages)
     except Exception as e:
         logger.exception("replay invoke failed: %s", e)
         return 7

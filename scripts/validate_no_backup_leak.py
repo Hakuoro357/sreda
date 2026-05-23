@@ -62,13 +62,37 @@ def canonicalize(p: Path) -> Path:
         return p
 
 
+def _strip_comments(text: str) -> str:
+    """Drop comment lines (``#``, ``;``, ``//`` after lstrip) и inline
+    trailing comments (whitespace-prefixed ``#``/``;``).
+
+    Without this, ``extract_paths`` would pull path-like tokens из
+    commented-out include/exclude lines and produce false-positives or
+    false-negatives in the LEAK check. See Codex review on PR #48
+    (MAJOR — validate_no_backup_leak.py:99-113).
+    """
+    cleaned_lines: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith(("#", ";", "//")):
+            continue
+        for marker in (" #", "\t#", " ;", "\t;"):
+            idx = stripped.find(marker)
+            if idx >= 0:
+                stripped = stripped[:idx]
+                break
+        cleaned_lines.append(stripped)
+    return "\n".join(cleaned_lines)
+
+
 def extract_paths(text: str) -> list[Path]:
     """Conservative path extraction from arbitrary config text.
 
-    Strips trailing slashes (kept ``/`` as-is). Deduplicates.
+    Strips trailing slashes (kept ``/`` as-is). Deduplicates. Skips
+    commented-out lines (see ``_strip_comments``).
     """
     out: set[Path] = set()
-    for tok in PATH_TOKEN_RE.findall(text):
+    for tok in PATH_TOKEN_RE.findall(_strip_comments(text)):
         norm = tok.rstrip("/") or "/"
         try:
             out.add(Path(norm))
@@ -101,14 +125,31 @@ def has_exclude_for(text: str, target: Path) -> bool:
 
     Compares против POSIX form of target — cross-platform safe (configs
     использовать forward-slashes regardless of host OS for validator).
+
+    Skips comment lines (``#``, ``;``, ``//`` prefixes after lstrip) и
+    inline comments (whitespace + ``#``/``;``). Без этого validator
+    давал false-negative — config с ``path=/var/lib`` + закомментированным
+    ``# exclude=/var/lib/sreda/private/llm-traces`` проходил проверку
+    хотя exclude НЕ активен. See Codex review on PR #48
+    (MAJOR — validate_no_backup_leak.py:99-113).
     """
     target_posix = target.as_posix()
     target_alt = target_posix + "/"
-    for line in text.splitlines():
-        lower = line.lower()
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        if not stripped or stripped.startswith(("#", ";", "//")):
+            continue
+        # Strip trailing inline comment (best-effort — only after whitespace
+        # to avoid mangling '#'/';' inside paths or quoted values).
+        for marker in (" #", "\t#", " ;", "\t;"):
+            idx = stripped.find(marker)
+            if idx >= 0:
+                stripped = stripped[:idx]
+                break
+        lower = stripped.lower()
         if not any(kw.lower() in lower for kw in EXCLUDE_KEYWORDS):
             continue
-        if target_posix in line or target_alt in line:
+        if target_posix in stripped or target_alt in stripped:
             return True
     return False
 

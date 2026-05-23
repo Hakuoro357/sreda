@@ -2575,7 +2575,20 @@ async def execute_conversation_chat(
     # Issue #68 — llm-trace envelope helpers. Captures full request+response
     # на диск для replay support. Helpers closure'ят loop variables.
     # Plan: plans/mellow-discovering-conway-final.md
-    _trace_id_value = trace.current() or "trace_unknown"
+    #
+    # NB: trace.current() returns TraceContext|None — extract the string
+    # trace_id explicitly. Dropping the dataclass object directly into
+    # _TRACE_DATES would TypeError (unhashable), and serializing the repr
+    # would leak event metadata into admin alerts. See Codex review
+    # round on PR #48 (handlers.py:2578 CRITICAL).
+    _trace_ctx = trace.current()
+    if _trace_ctx is not None and getattr(_trace_ctx, "trace_id", None):
+        _trace_id_value = _trace_ctx.trace_id
+    else:
+        # Defensive fallback: orphan invocations (CLI / test harness)
+        # still need a stable id for envelope grouping.
+        from uuid import uuid4
+        _trace_id_value = f"trace_{uuid4().hex[:16]}"
     _base_envelope_fields = {
         "schema_version": 1,
         "trace_id": _trace_id_value,
