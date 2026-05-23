@@ -531,6 +531,115 @@ async def persist_response_envelope(envelope: dict) -> None:
         logger.exception("llm-trace response submit failed")
 
 
+def extract_usage(ai_msg: Any) -> dict:
+    """Pull usage_metadata fields from AIMessage в plain dict.
+
+    LangChain stores cache_read как ``usage_metadata.input_token_details.cache_read``
+    (OpenAI-style). MiMo возвращает то же поле — surface'им для replay diff.
+    """
+    usage = getattr(ai_msg, "usage_metadata", None) or {}
+    input_details = usage.get("input_token_details") or {}
+    out: dict[str, Any] = {
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+    }
+    cache_read = input_details.get("cache_read") or input_details.get("cached")
+    if cache_read:
+        out["cache_read"] = int(cache_read)
+    return out
+
+
+def serialize_response(ai_msg: Any, *, latency_ms: int) -> dict:
+    """Convert AIMessage response → JSON-safe dict для phase="response" envelope."""
+    return {
+        "content": _jsonify(getattr(ai_msg, "content", "") or ""),
+        "tool_calls": _jsonify(list(getattr(ai_msg, "tool_calls", None) or [])),
+        "invalid_tool_calls": _jsonify(list(getattr(ai_msg, "invalid_tool_calls", []) or [])),
+        "additional_kwargs": _jsonify(dict(getattr(ai_msg, "additional_kwargs", {}) or {})),
+        "response_metadata": _jsonify(dict(getattr(ai_msg, "response_metadata", {}) or {})),
+        "id": getattr(ai_msg, "id", None),
+        "name": getattr(ai_msg, "name", None),
+        "latency_ms": latency_ms,
+    }
+
+
+def build_request_envelope(
+    *,
+    base_fields: dict,
+    attempt: str,
+    messages: list,
+    tool_schemas: list[dict],
+    llm: Any,
+    provider: str | None,
+    invocation_kwargs: dict | None = None,
+) -> dict:
+    """Build phase="request" envelope ready for persist_request_envelope.
+
+    ``base_fields`` carries trace_id/run_id/iter/tenant_id/user_id/feature_key.
+    ``messages`` serialized via _msg_to_jsonable. ``llm`` introspected via
+    _extract_llm_kwargs (recursive RunnableBinding unwrap).
+    """
+    llm_kwargs = _extract_llm_kwargs(llm)
+    return {
+        **base_fields,
+        "phase": "request",
+        "attempt": attempt,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+              .replace("+00:00", "Z"),
+        "request": {
+            "messages": [_msg_to_jsonable(m) for m in messages],
+            "tool_schemas": tool_schemas,
+            "provider": provider,
+            "model": llm_kwargs["client_kwargs"].get("model"),
+            "client_kwargs": llm_kwargs["client_kwargs"],
+            "bound_layers": llm_kwargs["bound_layers"],
+            "bound_kwargs": llm_kwargs["bound_kwargs"],
+            "invocation_kwargs": _jsonify(invocation_kwargs or {}),
+        },
+    }
+
+
+def build_response_envelope(
+    *,
+    base_fields: dict,
+    attempt: str,
+    ai_msg: Any,
+    latency_ms: int,
+) -> dict:
+    """Build phase="response" envelope. Fire-and-forget submit."""
+    return {
+        **base_fields,
+        "phase": "response",
+        "attempt": attempt,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+              .replace("+00:00", "Z"),
+        "response": serialize_response(ai_msg, latency_ms=latency_ms),
+        "usage": extract_usage(ai_msg),
+    }
+
+
+def build_error_envelope(
+    *,
+    base_fields: dict,
+    attempt: str,
+    exc: BaseException,
+    latency_ms: int,
+) -> dict:
+    """Build phase="error" envelope для failed LLM call."""
+    return {
+        **base_fields,
+        "phase": "error",
+        "attempt": attempt,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+              .replace("+00:00", "Z"),
+        "error": {
+            "type": type(exc).__name__,
+            "sanitized_msg": str(exc)[:500],
+            "latency_ms": latency_ms,
+        },
+    }
+
+
 def persist_envelope_sync(envelope: dict) -> None:
     """Sync path для forced-summary turn (handlers.py:2950) и non-async callers.
 
