@@ -442,6 +442,23 @@ async def _amain(argv: list[str] | None = None) -> int:
         settings.telegram_bot_token, auto_delete_webhook=auto_delete,
     )
 
+    # Issue #68 hotfix: the telegram-poller process runs handlers.chat()
+    # in its OWN asyncio loop — NOT through FastAPI. The lifespan
+    # startup_writer() в main.py covers only uvicorn; without an
+    # equivalent here, every request envelope hits
+    # `_WRITER_READY.is_set() == False` → DROPPED + P1 admin alert.
+    # See post-deploy incident 2026-05-23.
+    try:
+        from sreda.services import llm_trace
+        await llm_trace.startup_writer()
+        logger.info("llm-trace writer initialised в telegram-poller loop")
+    except Exception:  # noqa: BLE001 — additive feature must not break poller boot
+        logger.warning(
+            "llm-trace startup_writer raised в telegram-poller — "
+            "trace persist will degrade fail-open",
+            exc_info=True,
+        )
+
     # Graceful shutdown on SIGTERM / SIGINT — see helper docstring.
     # Falls back silently on platforms that don't support
     # loop.add_signal_handler (Windows tests).
@@ -477,6 +494,16 @@ async def _amain(argv: list[str] | None = None) -> int:
         return 0
     finally:
         await poller.shutdown()
+        # Drain llm-trace queue before exit — same semantics as FastAPI
+        # lifespan shutdown в main.py. 10s timeout matches uvicorn's.
+        try:
+            from sreda.services import llm_trace
+            await llm_trace.shutdown_drain(timeout_seconds=10.0)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "llm-trace shutdown_drain raised в telegram-poller",
+                exc_info=True,
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
