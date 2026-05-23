@@ -36,6 +36,18 @@ async def _lifespan(app: FastAPI):
       keep-alive sockets вовремя).
     """
     settings = get_settings()
+
+    # Issue #68: llm-trace writer task lifecycle. Startup eagerly creates
+    # queue + writer + GC tasks так что persist_request_envelope не получит
+    # cold-start latency на первом turn'е. Shutdown drains queue с 10s
+    # timeout. Defensive: failure to start writer не блокирует app start.
+    # Plan: plans/mellow-discovering-conway-final.md, Section 6.
+    try:
+        from sreda.services.llm_trace import startup_writer as _llm_trace_startup
+        await _llm_trace_startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("llm-trace startup_writer failed")
+
     pinger_task: asyncio.Task | None = None
     if settings.telegram_bot_token:
         pinger_task = asyncio.create_task(
@@ -102,6 +114,15 @@ async def _lifespan(app: FastAPI):
         await close_telegram_pool()
     except Exception:  # noqa: BLE001
         logger.debug("telegram pool close: unexpected error", exc_info=True)
+
+    # Issue #68: drain llm-trace queue + cancel writer/GC tasks.
+    # 10s timeout — типичный turn ≤40s, accumulated backlog маленький.
+    # Если timeout exceeded — log warning, lose tail envelopes (acceptable).
+    try:
+        from sreda.services.llm_trace import shutdown_drain as _llm_trace_shutdown
+        await _llm_trace_shutdown(timeout_seconds=10.0)
+    except Exception:  # noqa: BLE001
+        logger.exception("llm-trace shutdown_drain failed")
 
 
 def create_app() -> FastAPI:

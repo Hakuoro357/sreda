@@ -1,7 +1,7 @@
 from functools import lru_cache
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEV_HOST_SUFFIXES = (".test", ".local", ".localhost")
@@ -236,6 +236,24 @@ class Settings(BaseSettings):
         default=0.35, validation_alias="SREDA_ACK_STREAMING_MIN_INTERVAL_SECONDS"
     )
 
+    # Issue #68 — Full LLM trace logging (request + response + tool_calls)
+    # на диск /var/lib/sreda/private/llm-traces/YYYY-MM-DD/{trace_id}.jsonl
+    # для post-mortem debug и replay в другую LLM. Содержит decrypted PII
+    # (memories, user text, tool args) → 152-ФЗ-sensitive. Default off;
+    # включается явно в prod .env.
+    #
+    # Plan: plans/mellow-discovering-conway-final.md
+    llm_trace_logging_enabled: bool = Field(
+        default=False, validation_alias="SREDA_LLM_TRACE_LOGGING_ENABLED"
+    )
+    # Compliance-strict mode: если =True, бот **не звонит LLM** когда trace
+    # не удалось записать. Гарантирует что нет «секретного» обращения без
+    # аудита. Default fail-open для production stability — request degraded
+    # → admin alert P1 но turn продолжается.
+    llm_trace_require_persist: bool = Field(
+        default=False, validation_alias="SREDA_LLM_TRACE_REQUIRE_PERSIST"
+    )
+
     # Speech recognition provider:
     #   ``yandex``        — Yandex SpeechKit only (current default).
     #   ``groq``          — Groq Whisper only (~0.3-0.5s vs Yandex ~1-2s).
@@ -298,6 +316,24 @@ class Settings(BaseSettings):
     rate_limit_telegram_window_seconds: float = 60.0
     rate_limit_miniapp_max_requests: int = 60
     rate_limit_miniapp_window_seconds: float = 60.0
+
+    @model_validator(mode="after")
+    def _check_llm_trace_compliance_pair(self) -> "Settings":
+        """Issue #68 (R7 M-R6-3): compliance-strict mode (require_persist=true)
+        требует чтобы logging был включён. Misconfig = silent fail-open: caller
+        получит WRITTEN (no-op success), turn продолжится без trace, нарушит
+        compliance гарантию.
+
+        Fail loud at Settings construction time. FastAPI startup упадёт явно
+        вместо тихого деградирования в prod.
+        """
+        if self.llm_trace_require_persist and not self.llm_trace_logging_enabled:
+            raise ValueError(
+                "Misconfiguration: SREDA_LLM_TRACE_REQUIRE_PERSIST=true requires "
+                "SREDA_LLM_TRACE_LOGGING_ENABLED=true. Either enable logging or "
+                "remove require_persist flag."
+            )
+        return self
 
     @field_validator("connect_public_base_url")
     @classmethod

@@ -2495,6 +2495,18 @@ async def execute_conversation_chat(
         )
     tools_by_name = {t.name: t for t in tools}
 
+    # Issue #68 — snapshot OpenAI-style tool schemas для llm-trace replay.
+    # Лениво — только если feature flag включён (избегаем cost
+    # ``convert_to_openai_tool`` на каждом turn'е если logging выключен).
+    # Plan: plans/mellow-discovering-conway-final.md
+    _tool_schemas_for_log: list[dict] = []
+    if get_settings().llm_trace_logging_enabled:
+        try:
+            from langchain_core.utils.function_calling import convert_to_openai_tool
+            _tool_schemas_for_log = [convert_to_openai_tool(t) for t in tools]
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace: tool_schemas snapshot failed")
+
     llm_with_tools = llm.bind_tools(tools)
 
     # 2026-04-28: построим fallback клиент отдельно (без with_fallbacks)
@@ -2559,6 +2571,118 @@ async def execute_conversation_chat(
     # подхватил «Удалила ✅» из turn'а 15:02 как ответ для нового
     # turn'а где LLM вернул empty text).
     _turn_msg_start_idx = len(messages)
+
+    # Issue #68 — llm-trace envelope helpers. Captures full request+response
+    # на диск для replay support. Helpers closure'ят loop variables.
+    # Plan: plans/mellow-discovering-conway-final.md
+    #
+    # NB: trace.current() returns TraceContext|None — extract the string
+    # trace_id explicitly. Dropping the dataclass object directly into
+    # _TRACE_DATES would TypeError (unhashable), and serializing the repr
+    # would leak event metadata into admin alerts. See Codex review
+    # round on PR #48 (handlers.py:2578 CRITICAL).
+    _trace_ctx = trace.current()
+    if _trace_ctx is not None and getattr(_trace_ctx, "trace_id", None):
+        _trace_id_value = _trace_ctx.trace_id
+    else:
+        # Defensive fallback: orphan invocations (CLI / test harness)
+        # still need a stable id for envelope grouping.
+        from uuid import uuid4
+        _trace_id_value = f"trace_{uuid4().hex[:16]}"
+    _base_envelope_fields = {
+        "schema_version": 1,
+        "trace_id": _trace_id_value,
+        "run_id": run_id,
+        "tenant_id": action.tenant_id,
+        "user_id": user_id or "",
+        "feature_key": feature_key,
+    }
+
+    async def _persist_request_with_policy(
+        attempt: str, llm_obj: Any, provider: str | None,
+        iter_n: int, per_call_timeout: float,
+        *, tool_schemas: list[dict] | None = None,
+    ) -> None:
+        """Persist phase=request envelope. Admin alert if degraded;
+        fail-closed raise если SREDA_LLM_TRACE_REQUIRE_PERSIST=true.
+        No-op if logging disabled."""
+        if not get_settings().llm_trace_logging_enabled:
+            return
+        try:
+            from sreda.services.llm_trace import (
+                PersistResult, build_request_envelope, persist_request_envelope,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace import failed (request)")
+            return
+        env = build_request_envelope(
+            base_fields={**_base_envelope_fields, "iter": iter_n},
+            attempt=attempt, messages=messages,
+            tool_schemas=(tool_schemas
+                          if tool_schemas is not None
+                          else _tool_schemas_for_log),
+            llm=llm_obj, provider=provider,
+            invocation_kwargs={"timeout_seconds": per_call_timeout},
+        )
+        try:
+            result = await persist_request_envelope(env)
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace persist_request raised unexpectedly")
+            result = PersistResult.FAILED
+        if result == PersistResult.WRITTEN:
+            return
+        try:
+            from sreda.services.admin_alerts import send_admin_alert
+            send_admin_alert(
+                severity="P1",
+                title=f"llm-trace request persist degraded: {result.value}",
+                body=(
+                    f"trace_id={_trace_id_value} iter={iter_n} "
+                    f"attempt={attempt} result={result.value}"
+                ),
+                dedupe_key=f"llm_trace_persist_degraded:{result.value}",
+            )
+        except Exception:  # noqa: BLE001 — alert must not crash turn
+            logger.exception("admin alert send failed (llm-trace degraded)")
+        if get_settings().llm_trace_require_persist:
+            raise RuntimeError(
+                f"llm-trace persist returned {result.value}; aborting LLM call "
+                f"(SREDA_LLM_TRACE_REQUIRE_PERSIST=true)"
+            )
+
+    async def _persist_response_async(
+        attempt: str, ai_msg_obj: Any, latency_ms: int, iter_n: int,
+    ) -> None:
+        """Fire-and-forget phase=response envelope."""
+        if not get_settings().llm_trace_logging_enabled:
+            return
+        try:
+            from sreda.services.llm_trace import (
+                build_response_envelope, persist_response_envelope,
+            )
+            await persist_response_envelope(build_response_envelope(
+                base_fields={**_base_envelope_fields, "iter": iter_n},
+                attempt=attempt, ai_msg=ai_msg_obj, latency_ms=latency_ms,
+            ))
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace persist_response failed")
+
+    async def _persist_error_async(
+        attempt: str, exc_obj: BaseException, latency_ms: int, iter_n: int,
+    ) -> None:
+        """Fire-and-forget phase=error envelope."""
+        if not get_settings().llm_trace_logging_enabled:
+            return
+        try:
+            from sreda.services.llm_trace import (
+                build_error_envelope, persist_response_envelope,
+            )
+            await persist_response_envelope(build_error_envelope(
+                base_fields={**_base_envelope_fields, "iter": iter_n},
+                attempt=attempt, exc=exc_obj, latency_ms=latency_ms,
+            ))
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace persist_error failed")
 
     # --- 4. Tool-call loop with per-call usage recording --------------
     # Limit tuned to common chains: weather lookup (search→fetch→format
@@ -2695,6 +2819,17 @@ async def execute_conversation_chat(
                 except Exception:  # noqa: BLE001
                     logger.debug("ack stream schedule failed", exc_info=True)
 
+            # Issue #68: persist phase=request envelope BEFORE ainvoke.
+            # Strong semantics — crash-safe: row на диске до того как LLM
+            # стартует. Если require_persist=true и persist degraded — raise
+            # (RuntimeError caught в outer handler).
+            await _persist_request_with_policy(
+                attempt="primary", llm_obj=llm_with_tools,
+                provider=_chat_primary_provider, iter_n=_iter,
+                per_call_timeout=_per_call_timeout,
+            )
+            import time as _time_module
+            _t_primary_started = _time_module.monotonic()
             try:
                 ai_msg = await ainvoke_with_streaming_timeout(
                     llm_with_tools,
@@ -2702,7 +2837,22 @@ async def execute_conversation_chat(
                     timeout_seconds=_per_call_timeout,
                     on_text_update=_stream_to_ack if _stream_visible_text else None,
                 )
+                # Issue #68: fire-and-forget response envelope (primary OK).
+                _lat_ms_primary = int(
+                    (_time_module.monotonic() - _t_primary_started) * 1000
+                )
+                await _persist_response_async(
+                    "primary", ai_msg, _lat_ms_primary, _iter,
+                )
             except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
+                # Issue #68: persist phase=error envelope (primary failed)
+                # — fire-and-forget. Latency measured from request start.
+                _lat_ms_primary_err = int(
+                    (_time_module.monotonic() - _t_primary_started) * 1000
+                )
+                await _persist_error_async(
+                    "primary", exc, _lat_ms_primary_err, _iter,
+                )
                 # Любая ошибка primary (timeout / 5xx / rate limit) →
                 # пытаемся fallback если он есть.
                 # R-28: alert admin для **любой** LLM error (Codex R1 M3 —
@@ -2752,12 +2902,35 @@ async def execute_conversation_chat(
                 )
                 _trace_meta["fallback"] = True
                 _trace_meta["primary_exc"] = exc_type
-                ai_msg = await ainvoke_with_streaming_timeout(
-                    _fallback_with_tools,
-                    messages,
-                    timeout_seconds=_per_call_timeout,
-                    on_text_update=_stream_to_ack if _stream_visible_text else None,
+                # Issue #68: persist phase=request envelope для fallback
+                # — separate config (different provider/model/extra_body).
+                await _persist_request_with_policy(
+                    attempt="fallback", llm_obj=_fallback_with_tools,
+                    provider=_chat_fallback_provider, iter_n=_iter,
+                    per_call_timeout=_per_call_timeout,
                 )
+                _t_fallback_started = _time_module.monotonic()
+                try:
+                    ai_msg = await ainvoke_with_streaming_timeout(
+                        _fallback_with_tools,
+                        messages,
+                        timeout_seconds=_per_call_timeout,
+                        on_text_update=_stream_to_ack if _stream_visible_text else None,
+                    )
+                    _lat_ms_fallback = int(
+                        (_time_module.monotonic() - _t_fallback_started) * 1000
+                    )
+                    await _persist_response_async(
+                        "fallback", ai_msg, _lat_ms_fallback, _iter,
+                    )
+                except Exception as fb_exc:  # noqa: BLE001
+                    _lat_ms_fb_err = int(
+                        (_time_module.monotonic() - _t_fallback_started) * 1000
+                    )
+                    await _persist_error_async(
+                        "fallback", fb_exc, _lat_ms_fb_err, _iter,
+                    )
+                    raise
             usage = getattr(ai_msg, "usage_metadata", None) or {}
             _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
             _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
@@ -2943,6 +3116,17 @@ async def execute_conversation_chat(
             iteration=_MAX_TOOL_ITERATIONS,  # one past the loop
             messages=messages,
         )
+        # Issue #68: persist request envelope для forced summary turn.
+        # Tool schemas = [] потому что invoke без bind_tools (text-only).
+        await _persist_request_with_policy(
+            attempt="primary", llm_obj=llm,
+            provider=_chat_primary_provider,
+            iter_n=_MAX_TOOL_ITERATIONS,
+            per_call_timeout=get_settings().mimo_request_timeout_seconds,
+            tool_schemas=[],
+        )
+        import time as _time_module_summary
+        _t_summary = _time_module_summary.monotonic()
         try:
             with trace.step(
                 f"llm.iter.{_MAX_TOOL_ITERATIONS}.summary", model=model_name
@@ -2953,8 +3137,19 @@ async def execute_conversation_chat(
                 _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
                 _trace_meta["forced"] = True
             _record_and_log(final_ai, iteration=_MAX_TOOL_ITERATIONS)
-        except Exception:  # noqa: BLE001 — must not crash the turn
+            # Issue #68: response envelope для forced summary.
+            await _persist_response_async(
+                "primary", final_ai,
+                int((_time_module_summary.monotonic() - _t_summary) * 1000),
+                _MAX_TOOL_ITERATIONS,
+            )
+        except Exception as _summary_exc:  # noqa: BLE001 — must not crash the turn
             logger.exception("chat: forced-summary invoke failed")
+            await _persist_error_async(
+                "primary", _summary_exc,
+                int((_time_module_summary.monotonic() - _t_summary) * 1000),
+                _MAX_TOOL_ITERATIONS,
+            )
             final_ai = AIMessage(
                 content=(
                     "Я собрал какие-то данные, но не смог сложить их в ответ. "

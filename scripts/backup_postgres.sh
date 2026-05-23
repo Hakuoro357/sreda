@@ -75,3 +75,36 @@ find "$DEST" -name 'sreda-*.dump.gz.enc' -mtime +$RETENTION_DAYS -delete
 SIZE=$(stat -c '%s' "$DUMP_ENC")
 COUNT=$(ls -1 "$DEST"/sreda-*.dump.gz.enc 2>/dev/null | wc -l)
 log "backup ok: sreda-$DATE.dump.gz.enc size=${SIZE}b retained=$COUNT files"
+
+# ============================================================================
+# Issue #68 — backup enforcement: llm-trace PII НЕ должен попадать в backup.
+# /var/lib/sreda/private/llm-traces/ содержит decrypted memories, user text,
+# tool args. NEVER include в pg_dump / tar / rsync backup artefacts.
+# Plan: plans/mellow-discovering-conway-final.md, Section 9.
+# ============================================================================
+# pg_dump is database-only — фундаментально не touches /var/lib/sreda/private.
+# Check is defensive против future drift (e.g. кто-то добавит tar bundle).
+LEAK_ROOTS=("$DEST")
+for root in "${LEAK_ROOTS[@]}"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r artefact; do
+        if tar -tf "$artefact" 2>/dev/null | grep -qE '(^|/)llm-traces/'; then
+            log "CRITICAL: llm-traces leaked into $artefact"
+            python3 -c "
+import sys
+sys.path.insert(0, '/opt/sreda/src')
+try:
+    from sreda.services.admin_alerts import send_admin_alert
+    send_admin_alert(
+        severity='P0',
+        title='Backup leak: llm-traces in $artefact',
+        body='Backup artefact contains /var/lib/sreda/private/llm-traces — CHECK IMMEDIATELY',
+        dedupe_key='backup_llm_traces_leak',
+    )
+except Exception as e:
+    print(f'alert failed: {e}', file=sys.stderr)
+" 2>&1 | head -3
+            exit 1
+        fi
+    done < <(find "$root" -mindepth 1 -maxdepth 2 -mtime -1 -name '*.tar*' 2>/dev/null)
+done
