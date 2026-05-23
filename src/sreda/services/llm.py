@@ -1149,6 +1149,8 @@ CHAT_PROVIDERS = (
     "mimo",
     "mimo-v2.5",             # mimo-v2.5-pro — Xiaomi's next-gen baseline
     "mimo-v2.5-light",       # mimo-v2.5 (no -pro) — lighter variant, ~2x faster
+    "mimo-flash",            # 2026-05-23: mimo-v2-flash — fastest MiMo (v2 series),
+                             # latency test candidate for Boris's account (#65)
     "openrouter",            # gemma-4-26b-a4b-it (default), verified fast
     "openrouter-grok",       # x-ai/grok-4.1-fast — "lowest hallucination" claim
     "openrouter-qwen",       # qwen/qwen3.6-plus — clean runner-up in bench
@@ -1186,6 +1188,8 @@ _MIMO_MODEL_BY_PROVIDER = {
     "mimo": None,                      # None = fall back to settings.mimo_chat_model
     "mimo-v2.5": "mimo-v2.5-pro",
     "mimo-v2.5-light": "mimo-v2.5",    # light variant for simple tasks
+    "mimo-flash": "mimo-v2-flash",     # v2 series, fastest Xiaomi tier — listed
+                                       # on /v1/models 2026-05-23 (token-plan ⇒ pay-per-use endpoint)
 }
 
 # OpenRouter variants share the same base_url + api key — they differ
