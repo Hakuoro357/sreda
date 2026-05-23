@@ -106,16 +106,24 @@ def test_cross_provider_without_flag_exits_4(tmp_path, monkeypatch, capsys):
     assert rc == 4
 
 
-def test_cross_provider_with_flag_and_no_confirm_succeeds(
+def test_cross_provider_with_monkeypatched_confirm_succeeds(
     tmp_path, monkeypatch, capsys,
 ):
-    """С --allow-cross-provider + --no-confirm → success."""
+    """С --allow-cross-provider + monkeypatched confirm → success.
+
+    Test-only bypass goes through ``_interactive_confirm`` substitution
+    (not via env-controlled flag — Codex PR-48 R2 MAJOR ruled out
+    env-spoofable bypass)."""
     _write_synthetic_jsonl(tmp_path)
     import replay_llm_turn
+    # Tests bypass the TTY prompt by replacing the confirm helper.
+    # Production CLI has no such hook — operators see the actual prompt.
+    monkeypatch.setattr(replay_llm_turn, "_interactive_confirm",
+                        lambda _prompt: True)
 
     class _FakeLLM:
         def bind_tools(self, *a, **kw): return self
-        def invoke(self, messages):
+        def invoke(self, messages, **kw):
             from langchain_core.messages import AIMessage
             return AIMessage(content="replay from pro", tool_calls=[])
 
@@ -128,11 +136,26 @@ def test_cross_provider_with_flag_and_no_confirm_succeeds(
         "--root", str(tmp_path),
         "--provider", "mimo-v2.5",
         "--allow-cross-provider",
-        "--no-confirm",
     ])
     captured = capsys.readouterr()
     assert rc == 0
     assert "Cross-provider" in captured.out
+
+
+def test_no_confirm_flag_does_not_exist(tmp_path):
+    """Regression: Codex PR-48 R2 MAJOR. --no-confirm was env-gated
+    bypass — easily spoofed by setting PYTEST_CURRENT_TEST. Flag must
+    not exist at all; tests use monkeypatch instead.
+
+    argparse raises SystemExit on unrecognized argument."""
+    import replay_llm_turn
+    _write_synthetic_jsonl(tmp_path)
+    with pytest.raises(SystemExit):
+        replay_llm_turn.main([
+            "--trace-id", "trace_test",
+            "--root", str(tmp_path),
+            "--no-confirm",  # MUST be rejected as unknown
+        ])
 
 
 def test_diff_output_with_show_content(tmp_path, monkeypatch, capsys):
@@ -309,59 +332,125 @@ def test_diff_with_show_content_includes_tool_args(
     assert "также PII 12345" in captured.out
 
 
-def test_no_confirm_refused_without_pytest_env(
+def test_cross_provider_declined_via_confirm_returns_5(
     tmp_path, monkeypatch, capsys,
 ):
-    """Regression: Codex PR-48 MAJOR (replay_llm_turn.py:224,269-275).
-    --no-confirm + cross-provider must REFUSE если PYTEST_CURRENT_TEST
-    env not set (production deployment защита)."""
+    """Если user отвечает 'no' на cross-provider prompt — replay aborted
+    с rc=5. Verifies that the only path to bypass is the explicit
+    confirm-helper return value (no env / flag escape hatch)."""
     _write_synthetic_jsonl(tmp_path)
-    # Strip pytest's auto-set env to simulate production CLI invocation
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     import replay_llm_turn
-
-    class _FakeLLM:
-        def bind_tools(self, *a, **kw): return self
-        def invoke(self, messages, **kw):
-            from langchain_core.messages import AIMessage
-            return AIMessage(content="should not get here", tool_calls=[])
+    monkeypatch.setattr(replay_llm_turn, "_interactive_confirm",
+                        lambda _prompt: False)
 
     import sreda.services.llm as llm_mod
-    monkeypatch.setattr(llm_mod, "get_chat_llm",
-                        lambda **kw: _FakeLLM())
+    monkeypatch.setattr(
+        llm_mod, "get_chat_llm",
+        lambda **kw: pytest.fail("LLM must not be invoked after user declined"),
+    )
 
     rc = replay_llm_turn.main([
         "--trace-id", "trace_test", "--root", str(tmp_path),
         "--provider", "mimo-v2.5", "--allow-cross-provider",
-        "--no-confirm",
     ])
-    assert rc == 8, "Production CLI must refuse --no-confirm bypass"
+    assert rc == 5
 
 
-def test_no_confirm_allowed_under_pytest_env(tmp_path, monkeypatch, capsys):
-    """Positive control: pytest auto-sets PYTEST_CURRENT_TEST so the
-    flag works in test runs (without needing an interactive operator)."""
-    _write_synthetic_jsonl(tmp_path)
-    # pytest already sets PYTEST_CURRENT_TEST; ensure it stays set
-    assert "PYTEST_CURRENT_TEST" in __import__("os").environ
+def test_replay_strips_timeout_seconds_from_invocation_and_constructor(
+    tmp_path, monkeypatch, capsys,
+):
+    """Regression: Codex PR-48 R2 MAJOR (timeout_seconds wrapper-only).
+
+    handlers.py stores ``invocation_kwargs={"timeout_seconds": per_call_timeout}``
+    но runtime timeout enforced by ``ainvoke_with_streaming_timeout`` wrapper,
+    NOT by LangChain client. Forwarding it to ``ChatOpenAI(**kwargs)`` или
+    ``llm.invoke(**kwargs)`` would raise TypeError (no such parameter).
+
+    Replay must STRIP timeout_seconds from both constructor and invoke
+    kwargs. Other kwargs (top_p, extra_body) must STILL be forwarded."""
+    day = "2026-05-23"
+    folder = tmp_path / day
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "trace_timeout.jsonl"
+    request_row = {
+        "schema_version": 1,
+        "phase": "request", "attempt": "primary",
+        "trace_id": "trace_timeout", "iter": 0,
+        "ts": "2026-05-23T12:00:00.000Z", "trace_started_at_utc": day,
+        "tenant_id": "t", "user_id": "u", "feature_key": "f",
+        "request": {
+            "messages": [
+                {"type": "HumanMessage", "content": "x",
+                 "additional_kwargs": {}, "response_metadata": {},
+                 "id": None, "name": None},
+            ],
+            "tool_schemas": [],
+            "provider": "mimo-flash", "model": "mimo-v2-flash",
+            # client_kwargs: includes timeout_seconds (was captured from
+            # cur.request_timeout) AND a real provider arg (top_p)
+            "client_kwargs": {
+                "temperature": 0.5,
+                "top_p": 0.9,
+                "timeout_seconds": 30.0,  # wrapper-only — must NOT be forwarded
+            },
+            "bound_layers": [],
+            "bound_kwargs": {},
+            # invocation_kwargs: timeout_seconds is what handlers.py stores
+            # (wrapper-only metadata). Must NOT be forwarded to invoke().
+            "invocation_kwargs": {"timeout_seconds": 30.0},
+        },
+    }
+    with path.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(request_row, ensure_ascii=False) + "\n")
+
     import replay_llm_turn
+    captured_constructor_kwargs = {}
+    captured_invoke_kwargs = {}
 
-    class _FakeLLM:
+    class _StrictLLM:
+        """Mimics ChatOpenAI behavior: raises on unknown invoke kwargs."""
+        _ACCEPTED_INVOKE = {"config", "stop"}  # narrow set
         def bind_tools(self, *a, **kw): return self
         def invoke(self, messages, **kw):
+            captured_invoke_kwargs.update(kw)
+            unknown = set(kw) - self._ACCEPTED_INVOKE
+            if unknown:
+                raise TypeError(
+                    f"invoke() got unexpected keyword arguments: {sorted(unknown)}"
+                )
             from langchain_core.messages import AIMessage
-            return AIMessage(content="cross provider ok", tool_calls=[])
+            return AIMessage(content="ok", tool_calls=[])
+
+    def fake_get_chat_llm(**kw):
+        captured_constructor_kwargs.update(kw)
+        # Real get_chat_llm wouldn't TypeError on unknown — it passes
+        # **kwargs through to ChatOpenAI which would. Here we simulate
+        # by rejecting timeout_seconds at construction time.
+        if "timeout_seconds" in kw:
+            raise TypeError(
+                "ChatOpenAI.__init__() got unexpected keyword argument "
+                "'timeout_seconds'"
+            )
+        return _StrictLLM()
 
     import sreda.services.llm as llm_mod
-    monkeypatch.setattr(llm_mod, "get_chat_llm",
-                        lambda **kw: _FakeLLM())
+    monkeypatch.setattr(llm_mod, "get_chat_llm", fake_get_chat_llm)
 
     rc = replay_llm_turn.main([
-        "--trace-id", "trace_test", "--root", str(tmp_path),
-        "--provider", "mimo-v2.5", "--allow-cross-provider",
-        "--no-confirm",
+        "--trace-id", "trace_timeout", "--root", str(tmp_path),
     ])
-    assert rc == 0
+    assert rc == 0, "Replay must succeed despite captured timeout_seconds"
+    # Constructor must NOT receive timeout_seconds
+    assert "timeout_seconds" not in captured_constructor_kwargs, (
+        f"timeout_seconds leaked to get_chat_llm: {captured_constructor_kwargs}"
+    )
+    # Real kwargs still forwarded
+    assert captured_constructor_kwargs.get("top_p") == 0.9
+    assert captured_constructor_kwargs.get("temperature") == 0.5
+    # invoke must NOT receive timeout_seconds either
+    assert "timeout_seconds" not in captured_invoke_kwargs, (
+        f"timeout_seconds leaked to llm.invoke: {captured_invoke_kwargs}"
+    )
 
 
 def test_replay_passes_captured_kwargs_to_get_chat_llm(

@@ -231,8 +231,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show-content", action="store_true",
                         help="Explicit opt-in для PII content в stdout")
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--no-confirm", action="store_true",
-                        help="Skip interactive cross-provider confirm (testing)")
+    # NB: there is intentionally NO `--no-confirm` flag here. Cross-provider
+    # PII replay must always prompt operators in production. Tests bypass
+    # the prompt by monkeypatching ``_interactive_confirm`` — that path
+    # cannot be triggered from an env var an attacker / automation might set.
+    # See Codex review on PR #48 R2 (MAJOR — replay_llm_turn.py --no-confirm
+    # env gate is spoofable).
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -276,29 +280,11 @@ def main(argv: list[str] | None = None) -> int:
               f"{target_provider}/{target_model}")
         print(f"⚠ Decrypted PII включая memories будет отправлен NEW provider.")
         print(f"⚠ Если new provider в другой юрисдикции — может нарушить data residency.")
-        if args.no_confirm:
-            # --no-confirm is a test-only escape hatch. In production CLI
-            # the operator MUST interactively confirm cross-provider PII
-            # transfer (152-ФЗ data residency). Gate via PYTEST env so
-            # the flag works under pytest (which sets it automatically)
-            # but refuses to bypass confirmation on the VDS.
-            # See Codex review on PR #48 (MAJOR — replay_llm_turn.py:224).
-            if not os.environ.get("PYTEST_CURRENT_TEST"):
-                logger.error(
-                    "--no-confirm is a test-only flag (requires PYTEST_CURRENT_TEST env). "
-                    "Production cross-provider replay must use the interactive prompt; "
-                    "captured=%s/%s target=%s/%s",
-                    captured_provider, captured_model,
-                    target_provider, target_model,
-                )
-                return 8
-            logger.warning(
-                "cross-provider replay auto-approved via --no-confirm (test mode): "
-                "captured=%s/%s target=%s/%s",
-                captured_provider, captured_model,
-                target_provider, target_model,
-            )
-        elif not _interactive_confirm("Continue?"):
+        # Always go through _interactive_confirm. Tests monkeypatch it to
+        # return True; production operators see the actual TTY prompt. No
+        # bypass flag — env-gated bypass is spoofable. See Codex review on
+        # PR #48 R2 (MAJOR — --no-confirm env gate is not a real guard).
+        if not _interactive_confirm("Continue?"):
             logger.error("user declined cross-provider replay")
             return 5
 
@@ -316,11 +302,20 @@ def main(argv: list[str] | None = None) -> int:
     from sreda.services.llm import get_chat_llm  # lazy import after no-DB guarantee
     # Whitelist of constructor-level kwargs accepted by ChatOpenAI /
     # MimoChatOpenAI. Anything not in this set is per-call (invocation_kwargs).
+    #
+    # ``timeout_seconds`` intentionally NOT included: the envelope captures
+    # it under that key from ``cur.request_timeout``, but the runtime
+    # timeout is enforced by the local wrapper ``ainvoke_with_streaming_timeout``
+    # (asyncio.wait_for), NOT by the LangChain client. Forwarding it would
+    # land in **kwargs of ChatOpenAI which has no such parameter — best-case
+    # an obvious TypeError, worst-case silent provider-side error. Replay
+    # is "best-effort" for this field; if needed in future, wrap the local
+    # ``llm.invoke`` with a separate asyncio.wait_for. See Codex review on
+    # PR #48 R2 (MAJOR — timeout_seconds replayed as constructor + invoke).
     _CONSTRUCTOR_KWARGS = {
         "temperature", "top_p", "seed", "stop", "max_tokens",
         "tool_choice", "parallel_tool_calls", "response_format",
-        "extra_body", "timeout_seconds", "request_timeout",
-        "base_url",
+        "extra_body", "base_url",
     }
     chat_llm_kwargs: dict[str, Any] = {}
     for k, v in merge_kwargs.items():
@@ -359,8 +354,29 @@ def main(argv: list[str] | None = None) -> int:
         llm = llm.bind_tools(tool_schemas)
 
     # Per-call invocation kwargs (LangChain semantics: ainvoke(messages, **kw)
-    # overrides .bind() and constructor kwargs). Replay must reproduce this.
-    invocation_kwargs = dict(captured_request.get("invocation_kwargs") or {})
+    # overrides .bind() and constructor kwargs). Replay must reproduce this,
+    # BUT some recorded "invocation kwargs" are wrapper-only metadata, not
+    # arguments that the underlying LangChain.invoke() understands:
+    #
+    # * ``timeout_seconds`` — handlers.py stores it in invocation_kwargs for
+    #   trace audit, but at runtime it's consumed by the local
+    #   ``ainvoke_with_streaming_timeout`` wrapper (asyncio.wait_for). It is
+    #   NOT forwarded to ChatOpenAI / MimoChatOpenAI ``invoke``. Passing it
+    #   here would land in **kwargs of the provider client and likely raise.
+    #
+    # Strip wrapper-only keys before invocation. See Codex review on PR #48 R2
+    # (MAJOR — timeout_seconds replayed as both constructor and invoke kwarg).
+    raw_invocation_kwargs = dict(captured_request.get("invocation_kwargs") or {})
+    _WRAPPER_ONLY_KEYS = {"timeout_seconds"}
+    invocation_kwargs = {
+        k: v for k, v in raw_invocation_kwargs.items()
+        if k not in _WRAPPER_ONLY_KEYS
+    }
+    if raw_invocation_kwargs.keys() & _WRAPPER_ONLY_KEYS:
+        logger.debug(
+            "stripped wrapper-only keys from invocation_kwargs before replay: %s",
+            sorted(raw_invocation_kwargs.keys() & _WRAPPER_ONLY_KEYS),
+        )
 
     # Invoke (sync — debug context)
     try:
