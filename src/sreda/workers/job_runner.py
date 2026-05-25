@@ -15,6 +15,7 @@ from sreda.workers.housewife_onboarding_worker import (
     HousewifeOnboardingKickoffWorker,
 )
 from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
+from sreda.workers.message_dispatcher import process_pending as process_message_queue
 from sreda.workers.onboarding_aha_worker import OnboardingAhaWorker
 from sreda.workers.outbox_delivery import OutboxDeliveryWorker
 from sreda.workers.proactive_events import ProactiveEventWorker
@@ -63,7 +64,11 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         retention = RetentionWorker(session)
 
         # Order matters: proactive & housewife workers fill outbox →
-        # delivery drains it within the same tick.
+        # delivery drains it within the same tick. The message queue
+        # consumer (Sub-A2 of Plan-Execute Epic) runs early in the
+        # tick so its dispatched turns can fill outbox along with the
+        # rest before delivery drains.
+        message_queue_processed = await process_message_queue(limit=limit)
         runtime_processed = await runtime_service.process_pending_jobs(limit=limit)
         verification_processed = await verification.process_pending_jobs(limit=limit)
         skill_processed = await skill_platform.process_pending_jobs(limit=limit)
@@ -74,7 +79,8 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         delivery_processed = await delivery.process_pending_messages(limit=limit)
         retention_processed = await retention.process_pending()
         return (
-            runtime_processed
+            message_queue_processed
+            + runtime_processed
             + verification_processed
             + skill_processed
             + proactive_processed

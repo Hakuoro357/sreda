@@ -399,6 +399,37 @@ def mark_failed(
     return bool(result.rowcount)
 
 
+def derive_thread_key(
+    tenant_id: str, channel: str, external_chat_id: str
+) -> str:
+    """Deterministic FIFO key for one chat.
+
+    Two messages from the same (tenant, channel, chat) get the same
+    ``thread_key`` and are therefore serialized by the per-thread FIFO.
+    Different chats of the same tenant produce different keys and can
+    run in parallel.
+
+    The key intentionally does NOT match ``AgentThread.id`` (which is
+    a UUID-based random id) — ``message_jobs.thread_id`` and
+    ``agent_threads.id`` are separate identifiers serving different
+    purposes:
+
+    - ``message_jobs.thread_id`` — queue's FIFO grouping bucket
+    - ``agent_threads.id``       — physical channel container row
+
+    Deriving instead of looking up keeps the enqueue path inside the
+    webhook's 10-ms budget — no DB query just to compute a key.
+
+    Separator invariant (code-review 2026-05-25 MINOR-2): we rely on
+    ``::`` not appearing in any component. Currently safe — tenant_id
+    is ``tenant_{channel_prefix}_{numeric}``, channel is a short ASCII
+    enum (``telegram``/``max``), external_chat_id is a numeric string
+    from the messenger. If any of these formats expand to allow ``::``,
+    switch to a hash or use a control-byte separator.
+    """
+    return f"{tenant_id}::{channel}::{external_chat_id}"
+
+
 def is_queue_enabled_for(tenant_id: str) -> bool:
     """Whether ``tenant_id`` should go through the new FIFO queue.
 
@@ -427,6 +458,7 @@ __all__ = [
     "LEASE_DURATION_SEC",
     "MAX_ATTEMPTS",
     "claim_next_job",
+    "derive_thread_key",
     "enqueue_message",
     "extend_lease",
     "is_queue_enabled_for",

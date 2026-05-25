@@ -605,11 +605,76 @@ async def handle_telegram_update(
 
         inbound_message_id = result.inbound_message_id
 
-    # Detach the heavy turn from the caller. `_process_approved_turn`
-    # opens its own DB session (the session above has been closed by
-    # the `with` block). It is observed only via the inbound row's
-    # processing_status: `processing_started` once it runs, `processed`
-    # on success, or unchanged (=> caught by monitor) if it crashes.
+    # Per-tenant feature flag: SREDA_MESSAGE_QUEUE_ENABLED_TENANTS lets
+    # us route a specific tenant through the new `message_jobs` queue
+    # without disturbing everyone else. Default empty → universal
+    # inline path (current behaviour).
+    from sreda.workers.message_queue import (
+        DuplicateMessageJob,
+        derive_thread_key,
+        enqueue_message,
+        is_queue_enabled_for,
+    )
+
+    if is_queue_enabled_for(onboarding.tenant_id):
+        # Queue path — worker (job_runner tick) picks the job up,
+        # re-derives onboarding via ensure_telegram_user_bundle, and
+        # invokes _process_approved_turn from its own session.
+        external_update_id = str(payload.get("update_id", ""))
+        thread_key = derive_thread_key(
+            tenant_id=onboarding.tenant_id,
+            channel="telegram",
+            external_chat_id=str(onboarding.chat_id),
+        )
+        enqueued_ok = False
+        try:
+            with SessionLocal() as session:
+                with session.begin():
+                    enqueue_message(
+                        session,
+                        tenant_id=onboarding.tenant_id,
+                        thread_id=thread_key,
+                        channel="telegram",
+                        external_update_id=external_update_id,
+                        message_payload={
+                            "kind": "telegram_inbound",
+                            "payload": payload,
+                            "bot_key": bot_key,
+                            "inbound_message_id": inbound_message_id,
+                        },
+                    )
+            enqueued_ok = True
+        except DuplicateMessageJob:
+            # Cross-channel idempotency already swallowed by the
+            # inbound dedup logic upstream — this branch is rare
+            # (race between two simultaneous deliveries of the
+            # same update_id). Treat as ack.
+            logger.info(
+                "queue: duplicate enqueue for update_id=%s tenant=%s — ack",
+                external_update_id, onboarding.tenant_id,
+            )
+            enqueued_ok = True
+        except Exception:  # noqa: BLE001
+            # Transient DB hiccup or other enqueue failure — code-review
+            # 2026-05-25 MAJOR-2 fallback: fall through to the inline
+            # path below instead of bubbling up and dropping the user's
+            # message. Inbound was already persisted, so this is a clean
+            # degradation, not a duplicate.
+            logger.exception(
+                "queue: enqueue failed for update_id=%s tenant=%s — "
+                "falling back to inline path",
+                external_update_id, onboarding.tenant_id,
+            )
+        if enqueued_ok:
+            return inbound_message_id
+        # else: fall through to inline path below as a safety net
+
+    # Inline path (legacy / default). Detach the heavy turn from the
+    # caller. `_process_approved_turn` opens its own DB session (the
+    # session above has been closed by the `with` block). It is
+    # observed only via the inbound row's processing_status:
+    # `processing_started` once it runs, `processed` on success, or
+    # unchanged (=> caught by monitor) if it crashes.
     if background_tasks is not None:
         background_tasks.add_task(
             _process_approved_turn,
