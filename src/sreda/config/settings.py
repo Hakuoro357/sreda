@@ -254,6 +254,46 @@ class Settings(BaseSettings):
         default=False, validation_alias="SREDA_LLM_TRACE_REQUIRE_PERSIST"
     )
 
+    # Plan-execute rollout — two independent per-tenant whitelists
+    # (Hakuoro357/vex-assistant#74). Default empty → everyone stays on
+    # the legacy inline path; existing behaviour is unchanged until a
+    # tenant id appears in the relevant list.
+    #
+    # ``SREDA_MESSAGE_QUEUE_ENABLED_TENANTS`` — tenants whose inbound
+    # messages go through the new ``message_jobs`` per-thread FIFO
+    # queue instead of the inline ``handlers.chat()`` path. Enables
+    # observability + lease-fencing without touching the planner.
+    #
+    # ``SREDA_PLANNER_ENABLED_TENANTS`` — tenants whose worker-side
+    # processing uses the new planner-flow (planner → executor →
+    # composer). Has effect only when the same tenant is also in the
+    # queue whitelist (planner-flow lives inside the worker).
+    #
+    # Rollout pattern: enable queue first for Boris alone, then expand
+    # to test users → all. Planner stays on Boris until graph edge
+    # lands in Sub-A6.
+    message_queue_enabled_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_MESSAGE_QUEUE_ENABLED_TENANTS",
+            "sreda_message_queue_enabled_tenants",
+        ),
+    )
+    planner_mode_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_MODE_ENABLED",
+            "sreda_planner_mode_enabled",
+        ),
+    )
+    planner_enabled_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_ENABLED_TENANTS",
+            "sreda_planner_enabled_tenants",
+        ),
+    )
+
     # Speech recognition provider:
     #   ``yandex``        — Yandex SpeechKit only (current default).
     #   ``groq``          — Groq Whisper only (~0.3-0.5s vs Yandex ~1-2s).
@@ -383,6 +423,33 @@ class Settings(BaseSettings):
         if not raw:
             return []
         return [item.strip() for item in raw.split(",") if item.strip()]
+
+    @property
+    def message_queue_enabled_tenants(self) -> frozenset[str]:
+        """Tenants whose inbound messages go through the new FIFO queue.
+
+        Empty set → universal legacy inline path (current behaviour).
+        Workers and the refactored poller call ``is_queue_enabled_for(...)``
+        which checks membership in this set.
+        """
+        raw = self.message_queue_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def planner_enabled_tenants(self) -> frozenset[str]:
+        """Tenants whose worker-side processing uses the planner-flow.
+
+        Only effective when the same tenant is also in
+        ``message_queue_enabled_tenants`` — the planner runs inside the
+        worker, so a tenant on the legacy inline path cannot reach it.
+        Empty set → everyone stays on legacy ReAct (current behaviour).
+        """
+        raw = self.planner_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
     @property
     def admin_log_files(self) -> list[tuple[str, str]]:

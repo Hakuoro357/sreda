@@ -399,6 +399,28 @@ def mark_failed(
     return bool(result.rowcount)
 
 
+def is_queue_enabled_for(tenant_id: str) -> bool:
+    """Whether ``tenant_id`` should go through the new FIFO queue.
+
+    Reads ``SREDA_MESSAGE_QUEUE_ENABLED_TENANTS`` from settings. Empty
+    whitelist (default) returns ``False`` for everyone — current legacy
+    inline behaviour is preserved.
+
+    The poller calls this on each inbound message:
+        if is_queue_enabled_for(tenant_id):
+            enqueue_message(...)
+        else:
+            # existing handlers.chat() inline path
+            ...
+
+    Same-process import is fine — ``get_settings()`` is cached so this
+    is a frozenset membership check per call.
+    """
+    from sreda.config.settings import get_settings
+
+    return tenant_id in get_settings().message_queue_enabled_tenants
+
+
 __all__ = [
     "DuplicateMessageJob",
     "HEARTBEAT_INTERVAL_SEC",
@@ -407,6 +429,7 @@ __all__ = [
     "claim_next_job",
     "enqueue_message",
     "extend_lease",
+    "is_queue_enabled_for",
     "mark_done",
     "mark_failed",
 ]
