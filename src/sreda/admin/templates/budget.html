@@ -3,12 +3,12 @@
 {% block content %}
 <h2>Бюджет по скилам — {{ selected_date }}</h2>
 
-<nav class="day-nav" style="margin-bottom: 16px;">
-  <a href="/admin/budget?token={{ token }}&date={{ prev_date }}" role="button" class="outline">
+<nav class="day-nav" style="display: flex; gap: 12px; align-items: center; justify-content: flex-start; margin-bottom: 16px;">
+  <a href="/admin/budget?token={{ token }}&date={{ prev_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
     ← Предыдущий день
   </a>
   {% if next_date %}
-  <a href="/admin/budget?token={{ token }}&date={{ next_date }}" role="button" class="outline">
+  <a href="/admin/budget?token={{ token }}&date={{ next_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
     Следующий день →
   </a>
   {% endif %}
