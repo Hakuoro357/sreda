@@ -309,6 +309,11 @@ def get_budget_summary_for_day(
             SkillAIExecution.created_at < day_end_utc,
         )
         total_calls, total_tokens, credits_used, last_used_dt = q.one()
+        # Skip subscriptions with no consumption that day — page becomes
+        # a noise wall otherwise (Boris feedback 2026-05-25 after first
+        # /admin/budget render showed N empty rows).
+        if int(total_calls) == 0:
+            continue
         last_used_dt = _ensure_utc(last_used_dt)
 
         usage_pct: float | None = None
