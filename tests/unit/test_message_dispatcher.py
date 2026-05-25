@@ -20,13 +20,14 @@ needing a full Telegram-side stack.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.orm import Session
 
-from sreda.db.models import MessageJob
+from sreda.db.models import InboundMessage, MessageJob
 from sreda.workers import message_dispatcher
 from sreda.workers.message_queue import (
     derive_thread_key,
@@ -243,6 +244,117 @@ async def test_process_pending_eventually_dead_letters_on_persistent_failure(
 # ---------------------------------------------------------------------------
 # Dispatcher routing
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Codex review 2026-05-25 — silent-crash detection (MAJOR-1)
+# ---------------------------------------------------------------------------
+
+
+def _seed_inbound(db_session: Session, *, status: str) -> str:
+    """Insert a minimal InboundMessage row at the given processing_status.
+
+    We only need ``id`` + ``processing_status`` for the dispatcher's
+    crash detection. Other fields are NULLed or set to sensible test
+    defaults (``bot_key`` is required by schema).
+    """
+    from uuid import uuid4
+
+    inbound_id = f"inbound_{uuid4().hex[:24]}"
+    row = InboundMessage(
+        id=inbound_id,
+        tenant_id="tenant_test",
+        user_id="user_test",
+        channel_type="telegram",
+        bot_key="sreda",
+        sender_chat_id="chat_1",
+        external_update_id="999",
+        processing_status=status,
+    )
+    db_session.add(row)
+    db_session.commit()
+    return inbound_id
+
+
+@pytest.mark.asyncio
+async def test_dispatch_telegram_raises_when_turn_silently_crashes(
+    db_session: Session, _patch_session_factory, monkeypatch
+) -> None:
+    """``_process_approved_turn`` swallows exceptions — dispatcher must
+    notice via processing_status read-back (Codex MAJOR-1)."""
+    inbound_id = _seed_inbound(db_session, status="processing_started")
+
+    fake_bundle = SimpleNamespace(
+        tenant_id="tenant_test",
+        user_id="user_test",
+        chat_id="chat_1",
+    )
+    monkeypatch.setattr(
+        "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
+        lambda session, payload: fake_bundle,
+    )
+    monkeypatch.setattr(
+        "sreda.services.telegram_inbound._process_approved_turn",
+        AsyncMock(return_value=None),
+    )
+
+    job = message_dispatcher._JobSnapshot(
+        id="job_silent",
+        tenant_id="tenant_test",
+        thread_id="thread_x",
+        channel="telegram",
+        external_update_id="999",
+        message_payload={
+            "kind": "telegram_inbound",
+            "payload": {"update_id": 999},
+            "bot_key": "sreda",
+            "inbound_message_id": inbound_id,
+        },
+        attempt=1,
+    )
+    with pytest.raises(RuntimeError) as exc:
+        await message_dispatcher._dispatch_telegram(job)
+    msg = str(exc.value).lower()
+    assert "processing_started" in msg or "silent failure" in msg
+
+
+@pytest.mark.asyncio
+async def test_dispatch_telegram_succeeds_when_status_is_processed(
+    db_session: Session, _patch_session_factory, monkeypatch
+) -> None:
+    """Success path — processing_status='processed' → no exception."""
+    inbound_id = _seed_inbound(db_session, status="processed")
+
+    fake_bundle = SimpleNamespace(
+        tenant_id="tenant_test",
+        user_id="user_test",
+        chat_id="chat_1",
+    )
+    monkeypatch.setattr(
+        "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
+        lambda session, payload: fake_bundle,
+    )
+    monkeypatch.setattr(
+        "sreda.services.telegram_inbound._process_approved_turn",
+        AsyncMock(return_value=None),
+    )
+
+    job = message_dispatcher._JobSnapshot(
+        id="job_ok",
+        tenant_id="tenant_test",
+        thread_id="thread_x",
+        channel="telegram",
+        external_update_id="999",
+        message_payload={
+            "kind": "telegram_inbound",
+            "payload": {"update_id": 999},
+            "bot_key": "sreda",
+            "inbound_message_id": inbound_id,
+        },
+        attempt=1,
+    )
+    # Should NOT raise
+    await message_dispatcher._dispatch_telegram(job)
 
 
 @pytest.mark.asyncio

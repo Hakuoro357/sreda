@@ -655,16 +655,39 @@ async def handle_telegram_update(
             )
             enqueued_ok = True
         except Exception:  # noqa: BLE001
-            # Transient DB hiccup or other enqueue failure — code-review
-            # 2026-05-25 MAJOR-2 fallback: fall through to the inline
-            # path below instead of bubbling up and dropping the user's
-            # message. Inbound was already persisted, so this is a clean
-            # degradation, not a duplicate.
+            # Transient DB hiccup, IntegrityError from a precheck-flush
+            # race, or other unexpected enqueue failure. Code-review
+            # 2026-05-25 MAJOR-2 added a fallback to the inline path —
+            # but Codex follow-up (2026-05-25 MAJOR-3) flagged that as a
+            # double-process risk: if INSERT did commit on this side AND
+            # we fall to inline, the same inbound gets handled twice.
+            # Defensive: re-query (channel, external_update_id) — if a
+            # row already exists, the queue ate the message even though
+            # we got an exception, so we ack instead of double-handling.
             logger.exception(
                 "queue: enqueue failed for update_id=%s tenant=%s — "
-                "falling back to inline path",
+                "verifying whether the row landed before fallback",
                 external_update_id, onboarding.tenant_id,
             )
+            from sqlalchemy import select as _select
+            from sreda.db.models import MessageJob as _MessageJob
+
+            with SessionLocal() as session:
+                existing = session.execute(
+                    _select(_MessageJob).where(
+                        _MessageJob.channel == "telegram",
+                        _MessageJob.external_update_id == external_update_id,
+                    )
+                ).scalar_one_or_none()
+            if existing is not None:
+                logger.warning(
+                    "queue: enqueue raised but row IS present "
+                    "(id=%s); ack to avoid double-process",
+                    existing.id,
+                )
+                enqueued_ok = True
+            # else: row really isn't there — fall through to inline
+            # path as a safety net (zero-message-loss contract).
         if enqueued_ok:
             return inbound_message_id
         # else: fall through to inline path below as a safety net

@@ -67,11 +67,15 @@ async def process_pending(
     The ``now`` parameter is for tests — production passes ``None`` and
     we use ``datetime.now(timezone.utc)``.
     """
-    when = now or datetime.now(timezone.utc)
+    # ``now`` is recomputed per iteration (Codex review MINOR) so a
+    # slow first dispatch doesn't give later jobs in this tick a stale
+    # / shortened lease. The fixture parameter ``now`` (when provided
+    # by tests) overrides only the first iteration's reference point.
     SessionLocal = get_session_factory()
     processed = 0
 
     while processed < limit:
+        when = now or datetime.now(timezone.utc)
         # Short transaction: claim only. Holding the lease implicitly
         # via the row's ``status='processing'`` + ``lease_expires_at``
         # is enough — no need to keep the SQL transaction open while
@@ -86,13 +90,14 @@ async def process_pending(
 
         try:
             await _dispatch(job_snapshot)
+            now_after = now or datetime.now(timezone.utc)
             with SessionLocal() as session, session.begin():
                 landed = mark_done(
                     session,
                     job_id=job_snapshot.id,
                     worker_id=_WORKER_ID,
                     attempt=job_snapshot.attempt,
-                    now=when,
+                    now=now_after,
                 )
                 if not landed:
                     logger.warning(
@@ -115,6 +120,7 @@ async def process_pending(
             # leave the job in ``processing`` with an active lease,
             # blocking the thread's FIFO for the next 300s. Code-review
             # 2026-05-25 MINOR-1.
+            now_after = now or datetime.now(timezone.utc)
             try:
                 with SessionLocal() as session, session.begin():
                     mark_failed(
@@ -123,7 +129,7 @@ async def process_pending(
                         worker_id=_WORKER_ID,
                         attempt=job_snapshot.attempt,
                         error=_truncate_error(repr(exc)),
-                        now=when,
+                        now=now_after,
                     )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -220,8 +226,18 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
     NamedTuple into JSON — the bundle creation is idempotent (handles
     already-existing users gracefully), runs in milliseconds, and keeps
     the queue payload Telegram-shaped (just the raw update dict).
+
+    Crash detection via processing_status (Codex review MAJOR-1):
+    ``_process_approved_turn`` catches all exceptions internally and
+    logs them — it NEVER re-raises. To detect silent crashes the
+    dispatcher reads back the inbound row's ``processing_status`` after
+    the call: ``"processed"`` means the success path completed,
+    anything else (``"processing_started"`` left behind, or unchanged)
+    means the turn crashed and we must report failure to the queue
+    so retry / dead_letter can engage.
     """
     from sreda.config.settings import get_settings
+    from sreda.db.models import InboundMessage
     from sreda.services.telegram_inbound import (
         _process_approved_turn,
         ensure_telegram_user_bundle,
@@ -229,18 +245,16 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
 
     payload = job.message_payload["payload"]
     bot_key = job.message_payload.get("bot_key", "sreda")
+    inbound_message_id = job.message_payload.get("inbound_message_id")
     settings = get_settings()
 
     SessionLocal = get_session_factory()
     # Explicit transaction — ``ensure_telegram_user_bundle`` may create
     # Tenant/Workspace/User rows on first message; without commit those
     # writes get rolled back at ``with`` exit (code-review 2026-05-25
-    # MAJOR-1). For queue-enabled tenants today this is read-only
-    # (they're already provisioned), but future state-restore flows or
-    # broader rollout would silently drop new-user creation.
+    # MAJOR-1).
     with SessionLocal() as session, session.begin():
         onboarding = ensure_telegram_user_bundle(session, payload)
-        inbound_message_id = job.message_payload.get("inbound_message_id")
 
     await _process_approved_turn(
         bot_key=bot_key,
@@ -249,6 +263,19 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
         inbound_message_id=inbound_message_id,
         bot_token=settings.telegram_bot_token,
     )
+
+    # Crash detection — see docstring.
+    if inbound_message_id is not None:
+        with SessionLocal() as session:
+            inbound = session.get(InboundMessage, inbound_message_id)
+            status = getattr(inbound, "processing_status", None) if inbound else None
+        if status != "processed":
+            raise RuntimeError(
+                f"_process_approved_turn left inbound_message_id="
+                f"{inbound_message_id!r} at processing_status={status!r} "
+                f"(expected 'processed'). Treating as silent failure — "
+                f"queue will retry or dead_letter per policy."
+            )
 
 
 __all__ = [
