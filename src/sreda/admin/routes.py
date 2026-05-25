@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from sreda.admin.auth import require_admin_token
-from sreda.admin.queries import get_all_users, get_budget_summary, get_llm_calls
+from sreda.admin.queries import (
+    get_all_users,
+    get_budget_summary_for_day,
+    get_llm_calls,
+)
+
+_MSK_TZ = ZoneInfo("Europe/Moscow")
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
 
@@ -71,14 +78,49 @@ def admin_users(
 @router.get("/budget", response_class=HTMLResponse)
 def admin_budget(
     request: Request,
+    date_str: str | None = Query(None, alias="date"),
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
+    """Per-day budget consumption view.
+
+    ?date=YYYY-MM-DD selects a calendar day in Europe/Moscow. Default is
+    today MSK. Future dates are silently clamped to today; unparseable
+    input also falls back to today (no surfacing — the user can just
+    click a valid date instead of getting an error page).
+
+    Nav links:
+    - "← Previous day" is always shown (admin may go arbitrarily deep).
+    - "→ Next day" is hidden when ``selected == today`` — nothing to see
+      in the future.
+    """
     _audit_admin_view(session, "admin.budget.viewed", token, request)
-    rows = get_budget_summary(session)
+
+    today = datetime.now(_MSK_TZ).date()
+    selected = today
+    if date_str:
+        try:
+            parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if parsed <= today:
+                selected = parsed
+        except ValueError:
+            pass  # malformed query string — fall back to today
+
+    rows = get_budget_summary_for_day(session, selected)
     return templates.TemplateResponse(
         request, "budget.html",
-        {"token": token, "rows": rows, "section": "budget"},
+        {
+            "token": token,
+            "rows": rows,
+            "section": "budget",
+            "selected_date": selected.isoformat(),
+            "prev_date": (selected - timedelta(days=1)).isoformat(),
+            "next_date": (
+                (selected + timedelta(days=1)).isoformat()
+                if selected < today
+                else None
+            ),
+        },
     )
 
 

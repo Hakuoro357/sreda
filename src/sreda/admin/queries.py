@@ -7,7 +7,8 @@ admin views, not domain logic.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -239,6 +240,103 @@ def get_budget_summary(session: Session) -> list[BudgetRow]:
             ),
         ))
     # Most-recently-used first. None (no activity in period) sinks last.
+    _SENTINEL_OLD = datetime.min.replace(tzinfo=timezone.utc)
+    rows_with_sort.sort(key=lambda x: x[0] or _SENTINEL_OLD, reverse=True)
+    return [r for _, r in rows_with_sort]
+
+
+# ---- per-day budget view (admin /budget?date=YYYY-MM-DD) -------------------
+
+MSK_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _msk_day_window_utc(for_date: date) -> tuple[datetime, datetime]:
+    """Convert an MSK calendar date to ``[start_utc, end_utc)`` window.
+
+    Used by ``get_budget_summary_for_day`` and tests. Returns naive-free
+    UTC datetimes so SQLAlchemy comparisons with ``created_at`` (stored
+    UTC, tz-aware in models) work identically.
+    """
+    start_msk = datetime.combine(for_date, time.min, tzinfo=MSK_TZ)
+    end_msk = start_msk + timedelta(days=1)
+    return start_msk.astimezone(timezone.utc), end_msk.astimezone(timezone.utc)
+
+
+def get_budget_summary_for_day(
+    session: Session, for_date: date
+) -> list[BudgetRow]:
+    """Per-day budget aggregate for the admin /budget page.
+
+    Aggregates ``SkillAIExecution`` rows whose ``created_at`` falls into
+    the Europe/Moscow calendar day ``for_date`` — i.e. UTC window
+    ``[for_date 00:00 MSK, for_date+1 00:00 MSK)``. Subscriptions are
+    iterated the same way ``get_budget_summary`` does (one row per
+    active sub) so the table layout stays identical; rows with zero
+    activity for the day are still surfaced so the admin can see "no
+    consumption today" rather than an empty page when the user simply
+    hadn't talked to the bot that day.
+
+    ``credits_used`` here is **day-scoped** (not the full month). The
+    existing monthly ``BudgetService.get_quota_status`` is *not* called
+    because its window is the subscription period, not the day; daily
+    consumption is summed directly from ``credits_consumed``. The
+    monthly quota cap is still rendered so the admin can eyeball
+    "today's burn vs the monthly cap".
+    """
+    tenants = {t.id: t.name for t in session.query(Tenant).all()}
+
+    # Pre-fetch plan quotas once. Cheap, dedup by (tenant_id, feature_key).
+    active_subs = (
+        session.query(TenantSubscription, SubscriptionPlan)
+        .join(SubscriptionPlan, TenantSubscription.plan_id == SubscriptionPlan.id)
+        .filter(TenantSubscription.status == "active")
+        .all()
+    )
+
+    day_start_utc, day_end_utc = _msk_day_window_utc(for_date)
+
+    rows_with_sort: list[tuple[datetime | None, BudgetRow]] = []
+    for sub, plan in active_subs:
+        q = session.query(
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(SkillAIExecution.total_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.credits_consumed), 0),
+            func.max(SkillAIExecution.created_at),
+        ).filter(
+            SkillAIExecution.tenant_id == sub.tenant_id,
+            SkillAIExecution.feature_key == plan.feature_key,
+            SkillAIExecution.created_at >= day_start_utc,
+            SkillAIExecution.created_at < day_end_utc,
+        )
+        total_calls, total_tokens, credits_used, last_used_dt = q.one()
+        last_used_dt = _ensure_utc(last_used_dt)
+
+        usage_pct: float | None = None
+        if plan.credits_monthly_quota and plan.credits_monthly_quota > 0:
+            # Day-share-of-monthly: helpful for "burning quota too fast?"
+            # awareness. May exceed 100% on a hot day — capped only in
+            # the bar width, raw % is reported as-is.
+            usage_pct = round(
+                int(credits_used) / plan.credits_monthly_quota * 100, 1
+            )
+
+        rows_with_sort.append((
+            last_used_dt,
+            BudgetRow(
+                tenant_id=sub.tenant_id,
+                tenant_name=tenants.get(sub.tenant_id, sub.tenant_id),
+                feature_key=plan.feature_key,
+                plan_title=plan.title,
+                credits_used=int(credits_used),
+                credits_quota=plan.credits_monthly_quota,
+                usage_pct=usage_pct,
+                total_calls=int(total_calls),
+                total_tokens=int(total_tokens),
+                period_start=_fmt_dt(day_start_utc),
+                period_end=_fmt_dt(day_end_utc),
+                last_used_at=_fmt_dt(last_used_dt),
+            ),
+        ))
     _SENTINEL_OLD = datetime.min.replace(tzinfo=timezone.utc)
     rows_with_sort.sort(key=lambda x: x[0] or _SENTINEL_OLD, reverse=True)
     return [r for _, r in rows_with_sort]
