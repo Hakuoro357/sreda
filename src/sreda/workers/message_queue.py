@@ -1,0 +1,412 @@
+"""Per-thread FIFO queue primitives (Sub-A2, Epic #74).
+
+This module owns the low-level ``message_jobs`` operations that any
+worker (long-running standalone, or a tick-based job-runner integration)
+will compose into a loop:
+
+* ``enqueue_message`` — webhook handler / poller writes one row at
+  inbound time; cross-channel ``UNIQUE (channel, external_update_id)``
+  collapses redeliveries.
+* ``claim_next_job`` — pick the oldest ``pending`` (or expired-lease
+  ``processing``) job for a thread that has no other worker active.
+  Uses ``FOR UPDATE SKIP LOCKED`` on Postgres for true concurrency;
+  falls back to plain SELECT on SQLite (test path).
+* ``extend_lease`` — heartbeat. Conditional UPDATE: if another worker
+  already took over (via the failover path), our UPDATE rowcount==0 and
+  the caller knows to cancel.
+* ``mark_done`` / ``mark_failed`` — conditional UPDATE keyed by
+  ``(id, worker_id, attempt)``; the ``attempt`` token is the fencing
+  bit — a slow original worker's mark cannot land if a retry worker
+  already incremented ``attempt``.
+
+Lease fencing math (see Group 1 of the architecture plan):
+    lease (300s) > chain timeout (120s) > worst step timeout (90s)
+A worker holds a job for at most ``LEASE_DURATION_SEC``; ``HEARTBEAT_INTERVAL_SEC``
+extends it while the worker is healthy. After ``MAX_ATTEMPTS`` failures
+the job goes to ``dead_letter`` and an admin alert fires.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import uuid4
+
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
+
+from sreda.db.models import MessageJob
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lease / retry constants
+# ---------------------------------------------------------------------------
+
+LEASE_DURATION_SEC = 300
+"""How long a worker holds a job before another may take it via failover.
+
+Must exceed ``chain timeout (120s) + worst step timeout (90s) + cleanup
+grace`` so a healthy worker never has its lease yanked mid-execution.
+"""
+
+HEARTBEAT_INTERVAL_SEC = 60
+"""How often a healthy worker extends its lease (well under LEASE_DURATION_SEC)."""
+
+MAX_ATTEMPTS = 3
+"""After this many failed attempts a job becomes ``dead_letter``."""
+
+
+# ---------------------------------------------------------------------------
+# Enqueue (webhook / poller side)
+# ---------------------------------------------------------------------------
+
+
+class DuplicateMessageJob(Exception):
+    """Inbound event already enqueued via (channel, external_update_id).
+
+    Surfaces the row that won the race so the caller can ack without
+    re-processing — Telegram retry, MAX redelivery, etc.
+    """
+
+    def __init__(self, existing: MessageJob) -> None:
+        super().__init__(
+            f"Job for (channel={existing.channel!r}, "
+            f"external_update_id={existing.external_update_id!r}) "
+            f"already exists as id={existing.id!r}"
+        )
+        self.existing = existing
+
+
+def enqueue_message(
+    session: Session,
+    *,
+    tenant_id: str,
+    thread_id: str,
+    channel: str,
+    external_update_id: str,
+    message_payload: dict[str, Any],
+    now: datetime | None = None,
+) -> MessageJob:
+    """Insert a new pending job.
+
+    Raises ``DuplicateMessageJob`` if the composite
+    ``(channel, external_update_id)`` is already present — the caller
+    treats this as success (ack and move on), no re-processing.
+
+    The session is **not committed** here — the caller controls the
+    transaction boundary so the enqueue can be batched with whatever
+    inbound bookkeeping the webhook handler is doing.
+    """
+    when = now or datetime.now(timezone.utc)
+
+    # Pre-check before INSERT so we can give the caller a clean
+    # DuplicateMessageJob without poisoning the outer transaction. The
+    # composite UNIQUE constraint backs us up against the rare race
+    # between two webhook handlers enqueuing the same (channel, id) at
+    # the same time — in that rare case one will get IntegrityError on
+    # flush and the surrounding transaction will need to be retried.
+    existing = session.execute(
+        select(MessageJob).where(
+            MessageJob.channel == channel,
+            MessageJob.external_update_id == external_update_id,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise DuplicateMessageJob(existing)
+
+    job = MessageJob(
+        id=f"job_{uuid4().hex[:24]}",
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        channel=channel,
+        external_update_id=external_update_id,
+        message_payload=message_payload,
+        status="pending",
+        enqueued_at=when,
+        attempt=0,
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
+# ---------------------------------------------------------------------------
+# Claim (worker side)
+# ---------------------------------------------------------------------------
+
+
+def claim_next_job(
+    session: Session,
+    *,
+    worker_id: str,
+    now: datetime | None = None,
+    lease_seconds: int = LEASE_DURATION_SEC,
+) -> MessageJob | None:
+    """Pick up the next job for a thread no other worker is processing.
+
+    Selection rules:
+
+    1. Job must be ``pending`` OR ``processing`` with an expired lease
+       (the failover path — the original worker is presumed dead).
+    2. No other ``processing`` job exists for that ``thread_id`` with an
+       active lease (FIFO per-thread invariant).
+    3. Oldest ``enqueued_at`` first across threads (fair-ish — newer
+       threads don't starve older ones).
+
+    On claim the row's ``status`` becomes ``processing``, ``worker_id``
+    is set, ``attempt`` is incremented, and ``lease_expires_at`` is set
+    to ``now + lease_seconds``.
+
+    Returns ``None`` when no claimable job is found.
+
+    The session is **not committed** — caller controls the transaction.
+    Tests typically commit immediately so subsequent claims see the
+    update.
+    """
+    when = now or datetime.now(timezone.utc)
+    lease_end = when + timedelta(seconds=lease_seconds)
+
+    dialect = session.bind.dialect.name if session.bind else ""
+
+    # The selection query is dialect-specific only for the ``FOR UPDATE
+    # SKIP LOCKED`` clause. SQLite (test path) skips that — concurrency
+    # there is single-threaded anyway.
+    skip_locked = " FOR UPDATE SKIP LOCKED" if dialect == "postgresql" else ""
+
+    candidate = session.execute(
+        text(
+            f"""
+            SELECT j.id FROM message_jobs j
+            WHERE (j.status = 'pending'
+                   OR (j.status = 'processing' AND j.lease_expires_at < :now))
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_jobs j2
+                  WHERE j2.thread_id = j.thread_id
+                    AND j2.status = 'processing'
+                    AND j2.lease_expires_at >= :now
+                    AND j2.id <> j.id
+              )
+            ORDER BY j.enqueued_at
+            LIMIT 1{skip_locked}
+            """
+        ),
+        {"now": when},
+    ).first()
+    if candidate is None:
+        return None
+    job_id = candidate[0]
+
+    # Conditional UPDATE — increments attempt and sets the lease atomically.
+    # We do it via UPDATE…WHERE id=? so the rowcount tells us whether
+    # someone else swooped in between SELECT and UPDATE (in which case
+    # we treat it as "no claim" and the next loop tick will retry).
+    result = session.execute(
+        text(
+            """
+            UPDATE message_jobs
+            SET status = 'processing',
+                started_at = COALESCE(started_at, :now),
+                worker_id = :worker,
+                attempt = attempt + 1,
+                lease_expires_at = :lease_end
+            WHERE id = :id
+              AND (
+                  status = 'pending'
+                  OR (status = 'processing' AND lease_expires_at < :now)
+              )
+            """
+        ),
+        {
+            "id": job_id,
+            "worker": worker_id,
+            "now": when,
+            "lease_end": lease_end,
+        },
+    )
+    if result.rowcount == 0:
+        # Lost the race — another worker grabbed it. No claim this tick.
+        return None
+
+    # Re-fetch so the ORM-level state is up to date.
+    return session.get(MessageJob, job_id)
+
+
+# ---------------------------------------------------------------------------
+# Lease management
+# ---------------------------------------------------------------------------
+
+
+def extend_lease(
+    session: Session,
+    *,
+    job_id: str,
+    worker_id: str,
+    attempt: int,
+    now: datetime | None = None,
+    lease_seconds: int = LEASE_DURATION_SEC,
+) -> bool:
+    """Heartbeat — push ``lease_expires_at`` forward.
+
+    Conditional on ``(id, worker_id, attempt)`` so if a retry worker has
+    already claimed the job (incrementing ``attempt``), our UPDATE
+    rowcount is 0 and the caller learns the lease was lost.
+
+    Returns ``True`` if the lease was extended, ``False`` if another
+    worker has taken over.
+    """
+    when = now or datetime.now(timezone.utc)
+    lease_end = when + timedelta(seconds=lease_seconds)
+    result = session.execute(
+        text(
+            """
+            UPDATE message_jobs
+            SET lease_expires_at = :lease_end
+            WHERE id = :id
+              AND worker_id = :worker
+              AND attempt = :attempt
+              AND status = 'processing'
+            """
+        ),
+        {
+            "id": job_id,
+            "worker": worker_id,
+            "attempt": attempt,
+            "lease_end": lease_end,
+        },
+    )
+    return bool(result.rowcount)
+
+
+# ---------------------------------------------------------------------------
+# Mark done / failed
+# ---------------------------------------------------------------------------
+
+
+def mark_done(
+    session: Session,
+    *,
+    job_id: str,
+    worker_id: str,
+    attempt: int,
+    now: datetime | None = None,
+) -> bool:
+    """Mark job done. Conditional on the fencing token (worker_id, attempt).
+
+    Returns ``True`` if the row transitioned to ``done``; ``False`` if a
+    retry worker already took over (the caller should NOT trigger any
+    side effects because someone else is in charge now).
+    """
+    when = now or datetime.now(timezone.utc)
+    result = session.execute(
+        text(
+            """
+            UPDATE message_jobs
+            SET status = 'done',
+                finished_at = :now,
+                lease_expires_at = NULL
+            WHERE id = :id
+              AND worker_id = :worker
+              AND attempt = :attempt
+              AND status = 'processing'
+            """
+        ),
+        {
+            "id": job_id,
+            "worker": worker_id,
+            "attempt": attempt,
+            "now": when,
+        },
+    )
+    return bool(result.rowcount)
+
+
+def mark_failed(
+    session: Session,
+    *,
+    job_id: str,
+    worker_id: str,
+    attempt: int,
+    error: str,
+    now: datetime | None = None,
+    max_attempts: int = MAX_ATTEMPTS,
+) -> bool:
+    """Mark this attempt failed. Decides between retryable and dead_letter.
+
+    If ``attempt < max_attempts``: the row goes back to ``pending`` so
+    the next claim tick (or the next worker) can retry. ``started_at`` /
+    ``finished_at`` / ``lease_expires_at`` are cleared because pending
+    rows must satisfy the timestamp CHECK constraint.
+
+    If ``attempt >= max_attempts``: the row is terminal — status
+    ``dead_letter``, ``finished_at`` set, alert the admin.
+
+    Returns ``True`` if the transition happened. ``False`` means a retry
+    worker already took over and our outcome should be discarded.
+    """
+    when = now or datetime.now(timezone.utc)
+    if attempt < max_attempts:
+        # Retry path — back to pending, clear timestamps to satisfy CHECK.
+        result = session.execute(
+            text(
+                """
+                UPDATE message_jobs
+                SET status = 'pending',
+                    started_at = NULL,
+                    finished_at = NULL,
+                    lease_expires_at = NULL,
+                    worker_id = NULL,
+                    last_error = :err
+                WHERE id = :id
+                  AND worker_id = :worker
+                  AND attempt = :attempt
+                  AND status = 'processing'
+                """
+            ),
+            {
+                "id": job_id,
+                "worker": worker_id,
+                "attempt": attempt,
+                "err": error,
+            },
+        )
+    else:
+        # Dead-letter path — terminal.
+        result = session.execute(
+            text(
+                """
+                UPDATE message_jobs
+                SET status = 'dead_letter',
+                    finished_at = :now,
+                    lease_expires_at = NULL,
+                    last_error = :err
+                WHERE id = :id
+                  AND worker_id = :worker
+                  AND attempt = :attempt
+                  AND status = 'processing'
+                """
+            ),
+            {
+                "id": job_id,
+                "worker": worker_id,
+                "attempt": attempt,
+                "now": when,
+                "err": error,
+            },
+        )
+    return bool(result.rowcount)
+
+
+__all__ = [
+    "DuplicateMessageJob",
+    "HEARTBEAT_INTERVAL_SEC",
+    "LEASE_DURATION_SEC",
+    "MAX_ATTEMPTS",
+    "claim_next_job",
+    "enqueue_message",
+    "extend_lease",
+    "mark_done",
+    "mark_failed",
+]
