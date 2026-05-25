@@ -1,7 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Бюджет{% endblock %}
 {% block content %}
-<h2>Бюджет по скилам</h2>
+<h2>Бюджет по скилам — {{ selected_date }}</h2>
+
+<nav class="day-nav" style="margin-bottom: 16px;">
+  <a href="/admin/budget?token={{ token }}&date={{ prev_date }}" role="button" class="outline">
+    ← Предыдущий день
+  </a>
+  {% if next_date %}
+  <a href="/admin/budget?token={{ token }}&date={{ next_date }}" role="button" class="outline">
+    Следующий день →
+  </a>
+  {% endif %}
+</nav>
 
 {% if not rows %}
 <p>Нет активных подписок.</p>
