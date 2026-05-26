@@ -31,6 +31,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text as sql_text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -68,6 +69,22 @@ class Checklist(Base):
             "ix_checklists_active",
             "tenant_id", "user_id", "status",
         ),
+        # Sub-A10 / Group 3.1 — idempotency + semantic-dedup indexes.
+        Index(
+            "ix_checklists_operation_id",
+            "tenant_id",
+            "operation_id",
+            unique=True,
+            postgresql_where=sql_text("operation_id IS NOT NULL"),
+            sqlite_where=sql_text("operation_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_checklists_normalized_title",
+            "tenant_id",
+            "normalized_title_hash",
+            postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
+            sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -88,6 +105,14 @@ class Checklist(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
+    )
+
+    # Sub-A10 / Group 3.1 — idempotency + semantic-dedup columns.
+    operation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    normalized_title_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
     )
 
 

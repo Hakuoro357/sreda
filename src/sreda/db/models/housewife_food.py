@@ -30,6 +30,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text as sql_text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -95,6 +96,30 @@ class ShoppingListItem(Base):
             "status",
         ),
         Index("ix_shopping_list_items_source_recipe", "source_recipe_id"),
+        # Sub-A10 / Group 3.1 — idempotent retry of create operations.
+        # Partial unique on (tenant_id, operation_id) lets
+        # ``INSERT ... ON CONFLICT DO NOTHING`` swallow duplicate
+        # writes from a retry of the same plan-step.
+        Index(
+            "ix_shopping_list_items_operation_id",
+            "tenant_id",
+            "operation_id",
+            unique=True,
+            postgresql_where=sql_text("operation_id IS NOT NULL"),
+            sqlite_where=sql_text("operation_id IS NOT NULL"),
+        ),
+        # Sub-A10 / Group 3.1 — semantic-dedup lookup. Tool-side
+        # add_shopping_items() queries by tenant + normalized_title_hash
+        # to detect "уже есть" before inserting. Hash rather than
+        # plaintext so the index doesn't leak content from the
+        # EncryptedString ``title`` column.
+        Index(
+            "ix_shopping_list_items_normalized_title",
+            "tenant_id",
+            "normalized_title_hash",
+            postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
+            sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -126,6 +151,15 @@ class ShoppingListItem(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
+    # Sub-A10 / Group 3.1 — idempotency + semantic-dedup columns.
+    # See `services/operation_id.py` for the hash computation.
+    operation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    normalized_title_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
 
 # ---------------------------------------------------------------------------
 # Recipe + Ingredients
@@ -143,6 +177,22 @@ class Recipe(Base):
     __tablename__ = "recipes"
     __table_args__ = (
         Index("ix_recipes_tenant_user", "tenant_id", "user_id"),
+        # Sub-A10 / Group 3.1 — idempotency + semantic-dedup indexes.
+        Index(
+            "ix_recipes_operation_id",
+            "tenant_id",
+            "operation_id",
+            unique=True,
+            postgresql_where=sql_text("operation_id IS NOT NULL"),
+            sqlite_where=sql_text("operation_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_recipes_normalized_title",
+            "tenant_id",
+            "normalized_title_hash",
+            postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
+            sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -196,6 +246,14 @@ class Recipe(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    # Sub-A10 / Group 3.1 — idempotency + semantic-dedup columns.
+    operation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    normalized_title_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
     )
 
     ingredients: Mapped[list["RecipeIngredient"]] = relationship(

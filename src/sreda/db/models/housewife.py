@@ -13,7 +13,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text as sql_text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -102,6 +110,14 @@ class FamilyReminder(Base):
         DateTime(timezone=True), default=_utcnow
     )
 
+    # Sub-A10 / Group 3.1 — idempotency + semantic-dedup columns.
+    operation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    normalized_title_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
     __table_args__ = (
         # Composite index for the worker query: find all due rows cheaply
         # without a full scan. Status filter (= 'pending') is cheap enough
@@ -110,6 +126,22 @@ class FamilyReminder(Base):
             "ix_family_reminders_tenant_next_trigger",
             "tenant_id",
             "next_trigger_at",
+        ),
+        # Sub-A10 / Group 3.1 — idempotency + semantic-dedup indexes.
+        Index(
+            "ix_family_reminders_operation_id",
+            "tenant_id",
+            "operation_id",
+            unique=True,
+            postgresql_where=sql_text("operation_id IS NOT NULL"),
+            sqlite_where=sql_text("operation_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_family_reminders_normalized_title",
+            "tenant_id",
+            "normalized_title_hash",
+            postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
+            sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
         ),
     )
 

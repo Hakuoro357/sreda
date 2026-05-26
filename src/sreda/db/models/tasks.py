@@ -23,7 +23,17 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, Integer, String, Text, Time
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    Time,
+    text as sql_text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -125,7 +135,33 @@ class Task(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
+    # Sub-A10 / Group 3.1 — idempotency + semantic-dedup columns.
+    operation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    normalized_title_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
     __table_args__ = (
         Index("ix_tasks_scheduled", "tenant_id", "user_id", "scheduled_date"),
         Index("ix_tasks_status", "tenant_id", "user_id", "status"),
+        # Sub-A10 / Group 3.1 — idempotency + semantic-dedup indexes.
+        # ORM table name is tasks_items so the index name follows
+        # the same convention.
+        Index(
+            "ix_tasks_items_operation_id",
+            "tenant_id",
+            "operation_id",
+            unique=True,
+            postgresql_where=sql_text("operation_id IS NOT NULL"),
+            sqlite_where=sql_text("operation_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_tasks_items_normalized_title",
+            "tenant_id",
+            "normalized_title_hash",
+            postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
+            sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
+        ),
     )
