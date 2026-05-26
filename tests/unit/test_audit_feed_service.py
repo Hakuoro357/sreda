@@ -153,6 +153,80 @@ def test_emit_event_hash_mismatch_raises(db_session: Session) -> None:
     assert excinfo.value.location == "outbox"
 
 
+def test_emit_event_hash_mismatch_with_null_payload(
+    db_session: Session,
+) -> None:
+    """Codex R4 MAJOR — when the existing row has BOTH payload=None
+    AND payload_hash=NULL, conflict detection must still fire if
+    the new emit has a non-NULL payload (their effective hashes
+    differ: "" vs sha256(...)). R3's truthiness-gated check
+    silently collapsed this case."""
+    db_session.add(
+        AuditOutboxEvent(
+            operation_id="op_null_payload",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload=None,         # legacy null payload
+            payload_hash=None,
+            occurred_at=_now(),
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(PayloadHashConflict):
+        emit_event(
+            db_session,
+            operation_id="op_null_payload",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload={"new": "data"},
+        )
+
+
+def test_emit_event_both_null_payloads_no_conflict(
+    db_session: Session,
+) -> None:
+    """Genuine retry with no payload on both sides → no conflict.
+    "" == "" so the equality check passes."""
+    db_session.add(
+        AuditOutboxEvent(
+            operation_id="op_both_null",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload=None,
+            payload_hash=None,
+            occurred_at=_now(),
+        )
+    )
+    db_session.commit()
+
+    # Same op_id, both payload=None — must NOT raise.
+    result = emit_event(
+        db_session,
+        operation_id="op_both_null",
+        tenant_id="t1",
+        user_id="u1",
+        source="среда",
+        entity_type="shopping_list_item",
+        entity_id="sh_1",
+        action="created",
+        payload=None,
+    )
+    assert result.operation_id == "op_both_null"
+
+
 def test_emit_event_hash_mismatch_with_null_stored_hash(
     db_session: Session,
 ) -> None:

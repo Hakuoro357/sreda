@@ -193,12 +193,13 @@ def emit_event(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        # Codex R3 MAJOR #2 — use effective hash so legacy rows with
-        # payload_hash IS NULL still participate in conflict detection
-        # (recomputed from existing.payload at compare time). Closes
-        # the silent-collapse loophole flagged in R2/R3.
+        # Codex R3+R4 MAJOR #2 — direct comparison of effective hashes,
+        # no truthiness gate. `""` (genuinely empty payload on both
+        # sides) matches `""` → no conflict; `""` vs a real hex hash
+        # → conflict. Closes the NULL-payload silent-collapse path
+        # flagged in R4.
         existing_effective = _effective_hash(existing.payload_hash, existing.payload)
-        if existing_effective and new_hash and existing_effective != new_hash:
+        if existing_effective != new_hash:
             raise PayloadHashConflict(
                 operation_id=operation_id,
                 existing_hash=existing_effective,
@@ -216,7 +217,7 @@ def emit_event(
         feed_effective = _effective_hash(
             feed_exists.payload_hash, feed_exists.payload
         )
-        if feed_effective and new_hash and feed_effective != new_hash:
+        if feed_effective != new_hash:
             raise PayloadHashConflict(
                 operation_id=operation_id,
                 existing_hash=feed_effective,
@@ -408,7 +409,8 @@ def relay_outbox(
             outbox_hash = _effective_hash(
                 outbox_event.payload_hash, outbox_event.payload
             )
-            if feed_hash and outbox_hash and feed_hash != outbox_hash:
+            # Codex R4 MAJOR #1 — direct compare, no truthiness gate.
+            if feed_hash != outbox_hash:
                 outbox_event.attempts += 1
                 outbox_event.last_attempt_at = when
                 outbox_event.last_error = (
