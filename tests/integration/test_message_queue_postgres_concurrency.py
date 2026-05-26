@@ -30,7 +30,7 @@ import os
 import queue
 import threading
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -59,28 +59,39 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "postgres", "pg", "db
 
 def _safety_reason(url: str) -> str | None:
     """Return None if the URL is safe to wipe; otherwise a human-readable
-    rejection reason. Codex R5 MAJOR — DB-name check alone is not enough;
-    we also validate scheme, host, and require a stricter DB name pattern.
+    rejection reason.
 
-    Allowed:
-      postgresql://user:pw@<local-host>/<...test...|test_...|..._test|test>
+    Codex R5/R6 MAJOR — DB-name check alone is not enough; we validate:
 
-    Remote hosts require explicit ``SREDA_TEST_POSTGRES_REMOTE_OPT_IN=1``
-    in addition to the destructive opt-in."""
+      1. Scheme: only postgresql / postgres / postgresql+psycopg
+      2. DB name (strict): exact 'test', 'test_*', '*_test', or
+         separator-bounded '*_test_*'. Loose substring like
+         'prod_testing' or 'sreda_testprod' is REJECTED.
+      3. URL host: local-only by default, remote needs opt-in.
+      4. Query-param host: libpq honors ``?host=...`` / ``?hostaddr=...``
+         which can override the URL's hostname. We reject any such
+         override unless the override ALSO passes the host allowlist
+         (or REMOTE_OPT_IN is set). Closes the
+         ``postgresql://...@localhost/test?host=prod-db`` bypass.
+
+    Allowed (without REMOTE_OPT_IN):
+      postgresql://user:pw@<local-host>/<test|test_*|*_test|*_test_*>
+        (with no host/hostaddr override, or override also local)
+
+    Remote hosts (URL or query-param override) require explicit
+    ``SREDA_TEST_POSTGRES_REMOTE_OPT_IN=1`` in addition to destructive
+    opt-in.
+    """
     if not url:
         return "url is empty"
 
     parsed = urlparse(url)
 
-    # Scheme: only Postgres URLs.
+    # 1. Scheme.
     if parsed.scheme not in {"postgresql", "postgres", "postgresql+psycopg"}:
         return f"scheme {parsed.scheme!r} is not postgresql"
 
-    # DB name: must look like a test DB. We require either:
-    #   - exact name "test", OR
-    #   - starts with "test_", OR
-    #   - ends with "_test", OR
-    #   - contains "test" surrounded by separators (e.g. "sreda_test_main")
+    # 2. DB name (strict — no loose substring matching).
     db_name = (parsed.path or "").lstrip("/").lower()
     if not db_name:
         return "DB name missing from URL"
@@ -89,22 +100,44 @@ def _safety_reason(url: str) -> str | None:
         or db_name.startswith("test_")
         or db_name.endswith("_test")
         or "_test_" in db_name
-        or "_test" in db_name
     )
     if not valid_name:
         return (
             f"DB name {db_name!r} doesn't look like a test DB "
-            f"(must be 'test', 'test_*', '*_test', or contain '_test')"
+            f"(must be exactly 'test', 'test_*', '*_test', or "
+            f"'*_test_*' with underscore separators)"
         )
 
-    # Host: local-only by default. Remote needs explicit opt-in.
-    host = (parsed.hostname or "").lower()
-    if host not in _LOCAL_HOSTS and not _REMOTE_OPT_IN:
+    # 3. URL host: local-only by default. Remote needs explicit opt-in.
+    url_host = (parsed.hostname or "").lower()
+    if url_host not in _LOCAL_HOSTS and not _REMOTE_OPT_IN:
         return (
-            f"host {host!r} is not in the local-sandbox allowlist "
-            f"({sorted(_LOCAL_HOSTS)}). Set "
+            f"URL host {url_host!r} is not in the local-sandbox "
+            f"allowlist ({sorted(_LOCAL_HOSTS)}). Set "
             f"SREDA_TEST_POSTGRES_REMOTE_OPT_IN=1 to allow remote hosts."
         )
+
+    # 4. Query-param host overrides. libpq treats ?host=foo and
+    # ?hostaddr=1.2.3.4 as connection targets that supersede the
+    # URL's authority portion. Without checking these, a URL like
+    # ``postgresql://u:p@localhost/test_db?host=prod-db`` would
+    # appear local but connect to prod.
+    query_params = parse_qs(parsed.query or "")
+    for param in ("host", "hostaddr"):
+        for raw_value in query_params.get(param, []):
+            # libpq accepts comma-separated lists for failover.
+            for override in raw_value.split(","):
+                override_host = override.strip().lower()
+                if not override_host:
+                    continue
+                if override_host not in _LOCAL_HOSTS and not _REMOTE_OPT_IN:
+                    return (
+                        f"query param {param}={override_host!r} "
+                        f"would route the connection outside the "
+                        f"local-sandbox allowlist ({sorted(_LOCAL_HOSTS)}). "
+                        f"Set SREDA_TEST_POSTGRES_REMOTE_OPT_IN=1 "
+                        f"if this is intentional."
+                    )
 
     return None
 
