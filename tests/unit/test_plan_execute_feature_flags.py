@@ -106,3 +106,44 @@ def test_is_queue_enabled_for_whitelisted_tenant(monkeypatch) -> None:
         assert is_queue_enabled_for("tenant_other") is False
     finally:
         get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# LangGraph checkpointer settings (Sub-A6 consolidated via Sub-A8)
+# ---------------------------------------------------------------------------
+
+
+def test_langgraph_checkpointer_mode_defaults_to_auto() -> None:
+    s = Settings()
+    assert s.langgraph_checkpointer_mode == "auto"
+
+
+def test_langgraph_checkpointer_mode_accepts_memory_override() -> None:
+    s = Settings(SREDA_LANGGRAPH_CHECKPOINTER="memory")
+    assert s.langgraph_checkpointer_mode == "memory"
+
+
+def test_langgraph_pool_max_size_default_is_10() -> None:
+    s = Settings()
+    assert s.langgraph_pool_max_size == 10
+
+
+def test_langgraph_pool_max_size_respects_env_override() -> None:
+    s = Settings(SREDA_LANGGRAPH_POOL_MAX_SIZE=25)
+    assert s.langgraph_pool_max_size == 25
+
+
+def test_langgraph_pool_max_size_below_1_rejected() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Settings(SREDA_LANGGRAPH_POOL_MAX_SIZE=0)
+
+
+def test_langgraph_pool_max_size_above_100_rejected() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Settings(SREDA_LANGGRAPH_POOL_MAX_SIZE=101)

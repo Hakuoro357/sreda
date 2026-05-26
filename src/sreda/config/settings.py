@@ -294,6 +294,29 @@ class Settings(BaseSettings):
         ),
     )
 
+    # LangGraph PostgresSaver wiring (Sub-A6 — Hakuoro357/vex-assistant#74).
+    # Default behaviour: postgres URL → PostgresSaver, anything else
+    # → InMemorySaver. Override to "memory" to force in-memory even
+    # with a postgres URL (test / dev path).
+    langgraph_checkpointer_mode: str = Field(
+        default="auto",
+        validation_alias=AliasChoices(
+            "SREDA_LANGGRAPH_CHECKPOINTER",
+            "sreda_langgraph_checkpointer",
+        ),
+        description="'auto' (default) selects by database_url; 'memory' forces InMemorySaver.",
+    )
+    langgraph_pool_max_size: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "SREDA_LANGGRAPH_POOL_MAX_SIZE",
+            "sreda_langgraph_pool_max_size",
+        ),
+        description="psycopg ConnectionPool max_size for PostgresSaver. Default 10 fits single-VDS; bump for worker scale-out.",
+    )
+
     # Speech recognition provider:
     #   ``yandex``        — Yandex SpeechKit only (current default).
     #   ``groq``          — Groq Whisper only (~0.3-0.5s vs Yandex ~1-2s).

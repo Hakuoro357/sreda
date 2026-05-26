@@ -713,9 +713,7 @@ def _build_postgres_checkpointer(database_url: str) -> Any:
     from psycopg_pool import ConnectionPool
     from langgraph.checkpoint.postgres import PostgresSaver
 
-    import os as _os
-
-    pool_max = int(_os.environ.get("SREDA_LANGGRAPH_POOL_MAX_SIZE", "10"))
+    pool_max = get_settings().langgraph_pool_max_size
     # SQLAlchemy URLs carry the driver in the scheme — psycopg's
     # ConnectionPool doesn't understand ``postgresql+psycopg://`` and
     # fails with 'missing "=" after ...' in conninfo. Strip the suffix
@@ -763,13 +761,9 @@ def _make_checkpointer() -> Any:
     """
     global _POSTGRES_CHECKPOINTER_SINGLETON
 
-    import os as _os
-
-    override = _os.environ.get("SREDA_LANGGRAPH_CHECKPOINTER", "").strip().lower()
-    if override == "memory":
-        return InMemorySaver()
-
     settings = get_settings()
+    if settings.langgraph_checkpointer_mode.strip().lower() == "memory":
+        return InMemorySaver()
     db_url = (settings.database_url or "").lower()
     if not db_url.startswith(("postgresql", "postgres+", "postgresql+")):
         # SQLite / unrecognized — fall back to in-memory so tests work.
