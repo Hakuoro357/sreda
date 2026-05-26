@@ -38,9 +38,14 @@ from uuid import uuid4
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
+
+# PostgresSaver + connection pool are loaded lazily inside
+# ``_make_checkpointer`` so test environments that monkey-patch
+# the env var don't import psycopg-pool at module load time.
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
+from sreda.config.settings import get_settings
 from sreda.db.models import AgentRun
 from sreda.db.models.core import Job, OutboxMessage, TenantFeature
 from sreda.db.repositories.memory import MemoryRepository
@@ -673,12 +678,108 @@ def _branch_after_execute(state: AssistantGraphState) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _make_checkpointer() -> Any:
-    """Phase 1: in-memory checkpointer. Phase 3 will swap to PostgresSaver.
+_POSTGRES_CHECKPOINTER_SINGLETON: Any | None = None
+"""Process-lifetime PostgresSaver. Held module-level so the underlying
+connection pool isn't torn down between graph compiles.
 
-    Kept as a function so the swap is a one-line change and tests can
-    monkeypatch it if they need a fresh saver per test."""
-    return InMemorySaver()
+Lazily initialized in :func:`_make_checkpointer` to keep psycopg-pool
+out of the import path for sqlite-only tests."""
+
+
+def _build_postgres_checkpointer(database_url: str) -> Any:
+    """Build a PostgresSaver backed by a connection pool.
+
+    Sub-A6 of Plan-Execute Epic (Hakuoro357/vex-assistant#74). Lifted
+    from a one-liner ``InMemorySaver()`` to a real persistent backend
+    so:
+
+    - executor recovery (Sub-A2 / Group 3.4) can read state of an
+      in-flight run after a worker crash
+    - chain timeouts (Group 6.3) can be cleanly aborted without losing
+      progress for the parts that already committed
+    - the ``execution_log_json`` we already write to
+      ``planner_executions`` has a primary checkpointer behind it
+      (defence in depth, both layers see the same truth)
+
+    ``saver.setup()`` is idempotent — uses ``CREATE TABLE IF NOT EXISTS``
+    internally — so calling on every process startup is safe. LangGraph
+    manages its own schema; this is intentionally outside our Alembic
+    surface to avoid version coupling.
+
+    Connection pool sizing: default min=1, max=10 is fine for sreda's
+    current load (housewife_assistant, single VDS). When workers scale
+    out, bump via ``SREDA_LANGGRAPH_POOL_MAX_SIZE`` env.
+    """
+    from psycopg_pool import ConnectionPool
+    from langgraph.checkpoint.postgres import PostgresSaver
+
+    import os as _os
+
+    pool_max = int(_os.environ.get("SREDA_LANGGRAPH_POOL_MAX_SIZE", "10"))
+    # SQLAlchemy URLs carry the driver in the scheme — psycopg's
+    # ConnectionPool doesn't understand ``postgresql+psycopg://`` and
+    # fails with 'missing "=" after ...' in conninfo. Strip the suffix
+    # to get a plain libpq URL.
+    psycopg_url = database_url
+    if psycopg_url.startswith("postgresql+"):
+        # postgresql+psycopg://... → postgresql://...
+        _, _, rest = psycopg_url.partition("://")
+        psycopg_url = f"postgresql://{rest}"
+    elif psycopg_url.startswith("postgres+"):
+        _, _, rest = psycopg_url.partition("://")
+        psycopg_url = f"postgres://{rest}"
+    # autocommit=True is what PostgresSaver expects — it manages
+    # transaction boundaries internally per-operation.
+    pool = ConnectionPool(
+        conninfo=psycopg_url,
+        min_size=1,
+        max_size=pool_max,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+        open=True,
+    )
+    saver = PostgresSaver(conn=pool)
+    saver.setup()
+    return saver
+
+
+def _make_checkpointer() -> Any:
+    """Return the right checkpointer for the current environment.
+
+    Behaviour matrix:
+
+    - ``database_url`` starts with ``postgresql`` AND
+      ``SREDA_LANGGRAPH_CHECKPOINTER`` is not ``"memory"``
+      → :class:`PostgresSaver` (production path, durable state)
+    - anything else → :class:`InMemorySaver` (sqlite / dev / test)
+
+    The PostgresSaver is held in a module-level singleton so the
+    connection pool isn't recreated on every graph compile (compile
+    happens on each ``get_assistant_graph()`` cache miss; pool teardown
+    + setup would crater latency).
+
+    Tests can force the in-memory path by setting
+    ``SREDA_LANGGRAPH_CHECKPOINTER=memory`` even if ``database_url``
+    happens to point at real Postgres.
+    """
+    global _POSTGRES_CHECKPOINTER_SINGLETON
+
+    import os as _os
+
+    override = _os.environ.get("SREDA_LANGGRAPH_CHECKPOINTER", "").strip().lower()
+    if override == "memory":
+        return InMemorySaver()
+
+    settings = get_settings()
+    db_url = (settings.database_url or "").lower()
+    if not db_url.startswith(("postgresql", "postgres+", "postgresql+")):
+        # SQLite / unrecognized — fall back to in-memory so tests work.
+        return InMemorySaver()
+
+    if _POSTGRES_CHECKPOINTER_SINGLETON is None:
+        _POSTGRES_CHECKPOINTER_SINGLETON = _build_postgres_checkpointer(
+            settings.database_url
+        )
+    return _POSTGRES_CHECKPOINTER_SINGLETON
 
 
 def build_assistant_graph(*, checkpointer: Any | None = None):
