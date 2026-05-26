@@ -18,6 +18,29 @@ Public surface:
 The full async LISTEN/NOTIFY relay worker is a separate Sub-A12+ step
 — this module provides the building blocks; callers wire them into
 worker tick / direct calls as needed.
+
+Known scope gaps (Sub-A11 MVP):
+
+  Codex R1 CRITICAL — tool service wiring (HousewifeShoppingService,
+  HousewifeReminderService, etc.) is intentionally NOT done in this
+  PR. Sub-A11 lays the schema + service helpers; wiring lives with
+  the planner-flow integration in Sub-A11.b / Sub-A12+ when there's
+  a plan_id/step_id context to populate ``caused_by`` properly.
+
+  Codex R1 MAJOR — SAVEPOINT wrapping is the caller's responsibility.
+  ``emit_event`` writes into the session the caller passes in; if
+  the caller wants "audit failure shouldn't abort the parent action",
+  they wrap the call in ``with session.begin_nested():``. The helper
+  doesn't manage savepoints unilaterally because that would conflict
+  with callers that legitimately want audit failures to bubble up.
+
+  Codex R1 MAJOR — operation_id is globally unique by construction.
+  It's a hash of (plan_id, step_id, action, entity_type, logical_key)
+  where plan_id is itself a UUID. Cross-tenant collision probability
+  is 2^-160. We don't add tenant_id to the UNIQUE because that would
+  make the relay's idempotency-on-retry guarantee per-tenant instead
+  of global, and a relay race across tenants is a non-issue at our
+  scale.
 """
 
 from __future__ import annotations
@@ -37,6 +60,22 @@ from sreda.db.models import (
     UserDataChangeFeedEvent,
 )
 from sreda.db.models.audit_feed import _AUDIT_ACTIONS, _AUDIT_SOURCES
+
+
+# Codex R1 MAJOR #7 — service-side entity_type whitelist. Schema-level
+# CHECK constraint would force a migration for every new data type, so
+# we keep it in Python where the planner code can extend it easily.
+_AUDIT_ENTITY_TYPES = frozenset({
+    "shopping_list_item",
+    "family_reminder",
+    "task",
+    "recipe",
+    "checklist",
+    "checklist_item",
+    "menu_plan",
+    "menu_plan_item",
+    "family_member",
+})
 
 
 _logger = logging.getLogger(__name__)
@@ -92,8 +131,18 @@ def emit_event(
         raise ValueError(
             f"emit_event: action={action!r} not in {_AUDIT_ACTIONS!r}"
         )
+    # Codex R1 MAJOR #7 — validate entity_type against whitelist
+    # synchronously so typos surface before commit.
+    if entity_type not in _AUDIT_ENTITY_TYPES:
+        raise ValueError(
+            f"emit_event: entity_type={entity_type!r} not in "
+            f"{_AUDIT_ENTITY_TYPES!r}. Update the whitelist in "
+            f"sreda.services.audit_feed if you're adding a new "
+            f"data type to the planner's view."
+        )
 
     when = occurred_at or _utcnow()
+    new_hash = _compute_payload_hash(payload)
 
     # Dedup check first — both feed and outbox are checked because
     # the relay may have already moved a prior write across.
@@ -103,19 +152,39 @@ def emit_event(
         )
     ).scalar_one_or_none()
     if existing is not None:
+        # Codex R1 MAJOR #5 — detect "same op_id, different payload"
+        # double-write. Indicates a bug somewhere (planner replay with
+        # different inputs, or operation_id collision). Log a warning
+        # but return the existing row — we deliberately don't raise
+        # because the caller's mutation might still be valid; the
+        # warning surfaces in monitoring.
+        if existing.payload_hash and new_hash and existing.payload_hash != new_hash:
+            _logger.warning(
+                "emit_event: payload_hash mismatch for op_id=%s — "
+                "existing=%s new=%s. Likely a bug (operation_id "
+                "collision or replayed plan with different state).",
+                operation_id,
+                existing.payload_hash,
+                new_hash,
+            )
         return existing
 
     feed_exists = session.execute(
-        select(UserDataChangeFeedEvent.id).where(
+        select(UserDataChangeFeedEvent).where(
             UserDataChangeFeedEvent.operation_id == operation_id
         )
     ).scalar_one_or_none()
     if feed_exists is not None:
-        # Already relayed; no-op. We DO NOT return a feed event —
-        # the function contract is "outbox event handle"; callers
-        # treat None-but-no-error as "already processed".
-        # Return a *transient* outbox row (not added to session) so
-        # the signature stays consistent.
+        if feed_exists.payload_hash and new_hash and feed_exists.payload_hash != new_hash:
+            _logger.warning(
+                "emit_event: payload_hash mismatch for already-"
+                "relayed op_id=%s — existing=%s new=%s.",
+                operation_id,
+                feed_exists.payload_hash,
+                new_hash,
+            )
+        # Already relayed; no-op. Return a *transient* outbox row
+        # (not added to session) so the signature stays consistent.
         return AuditOutboxEvent(
             operation_id=operation_id,
             tenant_id=tenant_id,
@@ -125,7 +194,7 @@ def emit_event(
             entity_id=entity_id,
             action=action,
             payload=payload,
-            payload_hash=_compute_payload_hash(payload),
+            payload_hash=new_hash,
             caused_by=caused_by,
             occurred_at=when,
         )
@@ -139,12 +208,30 @@ def emit_event(
         entity_id=entity_id,
         action=action,
         payload=payload,
-        payload_hash=_compute_payload_hash(payload),
+        payload_hash=new_hash,
         caused_by=caused_by,
         occurred_at=when,
     )
     session.add(event)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        # Codex R1 MAJOR #2 — concurrent identical-op_id writes can
+        # race past our SELECT and collide at INSERT. Recover by
+        # rolling back to a savepoint (caller is expected to wrap us
+        # in a transaction). If the caller didn't use a savepoint,
+        # the IntegrityError propagates and they handle it. We give
+        # up on returning a row in that path — caller can re-emit.
+        session.rollback()
+        re_check = session.execute(
+            select(AuditOutboxEvent).where(
+                AuditOutboxEvent.operation_id == operation_id
+            )
+        ).scalar_one_or_none()
+        if re_check is not None:
+            return re_check
+        # Otherwise something else went wrong; re-raise.
+        raise
     return event
 
 
@@ -163,6 +250,10 @@ def read_recent_events(
     these into the planner prompt — keeping the helper detached
     from session lifecycle.
     """
+    # Codex R1 MINOR #9 — cap each side at ``limit`` in SQL so this
+    # function stays cheap even when the tenant has thousands of
+    # rows since ``since``. We pull DESC so the most-recent slice
+    # comes back; the final sort below restores chronological order.
     feed_rows = session.execute(
         select(UserDataChangeFeedEvent)
         .where(
@@ -170,9 +261,10 @@ def read_recent_events(
             UserDataChangeFeedEvent.occurred_at >= since,
         )
         .order_by(
-            UserDataChangeFeedEvent.occurred_at,
-            UserDataChangeFeedEvent.id,
+            UserDataChangeFeedEvent.occurred_at.desc(),
+            UserDataChangeFeedEvent.id.desc(),
         )
+        .limit(limit)
     ).scalars().all()
     outbox_rows = session.execute(
         select(AuditOutboxEvent)
@@ -181,9 +273,10 @@ def read_recent_events(
             AuditOutboxEvent.occurred_at >= since,
         )
         .order_by(
-            AuditOutboxEvent.occurred_at,
-            AuditOutboxEvent.id,
+            AuditOutboxEvent.occurred_at.desc(),
+            AuditOutboxEvent.id.desc(),
         )
+        .limit(limit)
     ).scalars().all()
 
     seen_ops: set[str] = set()
