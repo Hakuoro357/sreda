@@ -159,6 +159,43 @@ def test_nfc_unicode_normalization():
     assert normalize_for_dedup(nfc) == normalize_for_dedup(nfd)
 
 
+def test_golden_outputs():
+    """Codex R3 MAJOR #5 — golden outputs for stability across
+    pymorphy3 / dictionary version bumps. If any of these change,
+    bump NORMALIZATION_VERSION (Sub-A10 design) and update this
+    table — that's an intentional drift signal."""
+    # Format: (input, expected_normalized_output)
+    golden = [
+        ("молоко", "молоко"),
+        ("молока", "молоко"),
+        ("молоком", "молоко"),
+        ("куриные крылышки", "куриный крылышко"),
+        ("куриных крылышек", "куриный крылышко"),
+        ("Ёлка", "елка"),
+        ("елка", "елка"),
+        ("молоко.", "молоко"),
+        ("  хлеб ", "хлеб"),
+        ("Coca Cola", "coca cola"),
+        ("", ""),
+        ("...", ""),
+    ]
+    failures = []
+    for input_text, expected in golden:
+        actual = normalize_for_dedup(input_text)
+        if actual != expected:
+            failures.append(
+                f"  {input_text!r:30} → {actual!r} (expected {expected!r})"
+            )
+    if failures:
+        from sreda.services.text_normalization import NORMALIZATION_VERSION
+        pytest.fail(
+            f"normalize_for_dedup golden drift detected (NORMALIZATION_VERSION="
+            f"{NORMALIZATION_VERSION}). If this is intentional (e.g. "
+            f"pymorphy3 upgrade), bump NORMALIZATION_VERSION and update "
+            f"the golden table. Mismatches:\n" + "\n".join(failures)
+        )
+
+
 def test_singleton_morph_analyzer():
     """The MorphAnalyzer should be reused across calls — first call
     can take seconds (loading dictionaries), subsequent calls must

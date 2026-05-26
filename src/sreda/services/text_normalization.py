@@ -43,10 +43,11 @@ Hash stability — Codex Sub-A10 R1 MAJOR #6:
   optionally fold into their hash keys when they need to guarantee
   retries land on the same key across pymorphy3 / dictionary updates.
   Bump this constant whenever the normalization output for known
-  inputs changes (e.g. pymorphy3 major upgrade). The hash helpers in
-  ``services.operation_id`` don't currently include the version in
-  the digest — we treat the dependency as stable for one MVP release
-  and re-evaluate at the first hash drift.
+  inputs changes (e.g. pymorphy3 major upgrade). The version IS
+  folded into ``compute_normalized_title_hash`` HMAC payload
+  (Codex Sub-A10 R2 MAJOR #6) so bumping it produces fresh hashes
+  for the same input — old rows keep working, new lookups use the
+  new key.
 """
 
 from __future__ import annotations
@@ -125,7 +126,10 @@ def normalize_for_dedup(title: str) -> str:
     if not words:
         return ""
     lemmas = [_lemmatize_word(w) for w in words]
-    return " ".join(lemmas)
+    # pymorphy3 lemmas can re-introduce ``ё`` (e.g. "елка" lemma is
+    # "ёлка" in some dict versions). Re-fold post-lemma so the
+    # output is stable regardless of which form the dict carries.
+    return " ".join(lemmas).replace("ё", "е")
 
 
 __all__ = ["NORMALIZATION_VERSION", "normalize_for_dedup"]

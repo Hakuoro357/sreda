@@ -90,12 +90,19 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 
 from sreda.services.text_normalization import (
     NORMALIZATION_VERSION,
     normalize_for_dedup,
 )
+
+
+_logger = logging.getLogger(__name__)
+# Codex Sub-A10 R3 MAJOR #3 — warn once per process when fallback
+# kicks in. Subsequent calls stay quiet so we don't flood the log.
+_fallback_warned = False
 
 
 def _get_hmac_key() -> bytes:
@@ -205,8 +212,18 @@ def compute_normalized_title_hash(
     key = _get_hmac_key()
     if key:
         return hmac.new(key, msg, hashlib.sha256).hexdigest()
-    # Fallback for tests / dev — caller is expected to set the key
-    # before computing hashes that will land in prod data.
+    # Codex R3 MAJOR #3 — log once per process so production
+    # misconfiguration is visible. We don't raise because that
+    # would break dev/test paths that don't set the key.
+    global _fallback_warned
+    if not _fallback_warned:
+        _logger.warning(
+            "compute_normalized_title_hash falling back to plain "
+            "SHA-256 — SREDA_ENCRYPTION_KEY is empty. Dedup hashes "
+            "computed in this state are dictionary-attackable. "
+            "Set the env var in production."
+        )
+        _fallback_warned = True
     return hashlib.sha256(msg).hexdigest()
 
 

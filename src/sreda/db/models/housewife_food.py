@@ -97,11 +97,13 @@ class ShoppingListItem(Base):
         ),
         Index("ix_shopping_list_items_source_recipe", "source_recipe_id"),
         # Sub-A10 / Group 3.1 — idempotent retry of create operations.
-        # Partial unique on (tenant_id, operation_id) lets
-        # ``INSERT ... ON CONFLICT DO NOTHING`` swallow duplicate
-        # writes from a retry of the same plan-step.
-        # Codex Sub-A10 R1 CRITICAL #1 — plain UNIQUE, NOT partial.
-        # Codex R1 MAJOR #3 — index scope includes user_id.
+        # Plain UNIQUE (NOT partial — Codex R1 CRITICAL #1) on
+        # (tenant_id, user_id, operation_id) lets
+        # ``INSERT ... ON CONFLICT (tenant_id, user_id, operation_id)
+        # DO NOTHING`` swallow duplicate writes from a retry of the
+        # same plan-step. Codex R1 MAJOR #3 — index scope includes
+        # user_id so two users in the same tenant don't collide on
+        # the same item name.
         Index(
             "ix_shopping_list_items_operation_id",
             "tenant_id",
