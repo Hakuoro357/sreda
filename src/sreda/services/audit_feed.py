@@ -81,6 +81,37 @@ _AUDIT_ENTITY_TYPES = frozenset({
 _logger = logging.getLogger(__name__)
 
 
+class PayloadHashConflict(RuntimeError):
+    """Raised by ``emit_event`` when an existing row for the same
+    ``operation_id`` has a different ``payload_hash`` than the
+    incoming write.
+
+    Indicates either an ``operation_id`` collision (would be a bug
+    in the hash construction) or a replay of the same plan-step
+    with different real state. Callers MAY catch and downgrade to a
+    log line if they know the conflict is benign; default is to
+    propagate so the bug surfaces in monitoring (Codex Sub-A11 R2
+    MAJOR #3 — was just a warning before, now a hard signal).
+    """
+
+    def __init__(
+        self,
+        *,
+        operation_id: str,
+        existing_hash: str,
+        new_hash: str,
+        location: str,
+    ) -> None:
+        super().__init__(
+            f"payload_hash mismatch for op_id={operation_id!r} "
+            f"({location}): existing={existing_hash!r} new={new_hash!r}"
+        )
+        self.operation_id = operation_id
+        self.existing_hash = existing_hash
+        self.new_hash = new_hash
+        self.location = location
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -159,13 +190,14 @@ def emit_event(
         # because the caller's mutation might still be valid; the
         # warning surfaces in monitoring.
         if existing.payload_hash and new_hash and existing.payload_hash != new_hash:
-            _logger.warning(
-                "emit_event: payload_hash mismatch for op_id=%s — "
-                "existing=%s new=%s. Likely a bug (operation_id "
-                "collision or replayed plan with different state).",
-                operation_id,
-                existing.payload_hash,
-                new_hash,
+            # Codex R2 MAJOR #3 — hard fail instead of silent log so
+            # the bug surfaces immediately. Callers who know the
+            # conflict is benign (rare) catch and downgrade.
+            raise PayloadHashConflict(
+                operation_id=operation_id,
+                existing_hash=existing.payload_hash,
+                new_hash=new_hash,
+                location="outbox",
             )
         return existing
 
@@ -176,12 +208,11 @@ def emit_event(
     ).scalar_one_or_none()
     if feed_exists is not None:
         if feed_exists.payload_hash and new_hash and feed_exists.payload_hash != new_hash:
-            _logger.warning(
-                "emit_event: payload_hash mismatch for already-"
-                "relayed op_id=%s — existing=%s new=%s.",
-                operation_id,
-                feed_exists.payload_hash,
-                new_hash,
+            raise PayloadHashConflict(
+                operation_id=operation_id,
+                existing_hash=feed_exists.payload_hash,
+                new_hash=new_hash,
+                location="feed",
             )
         # Already relayed; no-op. Return a *transient* outbox row
         # (not added to session) so the signature stays consistent.
@@ -199,6 +230,27 @@ def emit_event(
             occurred_at=when,
         )
 
+    # Codex R2 CRITICAL — IntegrityError recovery is the CALLER's
+    # responsibility via SAVEPOINT. The helper does NOT call
+    # session.rollback() (would clobber the parent txn) and does
+    # NOT wrap in session.begin_nested() (interacts poorly with the
+    # test-fixture's outer transaction; SQLAlchemy 2.x nested-txn
+    # semantics depend on `join_transaction_mode`).
+    #
+    # Recommended caller pattern when audit failures should be
+    # isolated from the parent action:
+    #
+    #     with session.begin_nested():
+    #         try:
+    #             emit_event(session, ...)
+    #         except IntegrityError:
+    #             # Concurrent write won; savepoint rolls back.
+    #             pass
+    #
+    # On Postgres a raw IntegrityError without savepoint will poison
+    # the transaction — the caller's commit() will fail. That's
+    # acceptable design: it means "either the audit + the data both
+    # land, or neither does", which is the right default semantics.
     event = AuditOutboxEvent(
         operation_id=operation_id,
         tenant_id=tenant_id,
@@ -213,25 +265,7 @@ def emit_event(
         occurred_at=when,
     )
     session.add(event)
-    try:
-        session.flush()
-    except IntegrityError:
-        # Codex R1 MAJOR #2 — concurrent identical-op_id writes can
-        # race past our SELECT and collide at INSERT. Recover by
-        # rolling back to a savepoint (caller is expected to wrap us
-        # in a transaction). If the caller didn't use a savepoint,
-        # the IntegrityError propagates and they handle it. We give
-        # up on returning a row in that path — caller can re-emit.
-        session.rollback()
-        re_check = session.execute(
-            select(AuditOutboxEvent).where(
-                AuditOutboxEvent.operation_id == operation_id
-            )
-        ).scalar_one_or_none()
-        if re_check is not None:
-            return re_check
-        # Otherwise something else went wrong; re-raise.
-        raise
+    session.flush()
     return event
 
 
@@ -330,23 +364,50 @@ def relay_outbox(
     relayed = 0
     for outbox_event in batch:
         # Pre-check whether the feed already has this op_id (idempotency
-        # under retry — Codex IDEA R1 / Sub-A11 design). If yes, just
-        # drop the outbox row; the previous relay already did the
-        # work. Pre-checking avoids the messy "rollback after
-        # IntegrityError" path which would also rollback the caller's
-        # transaction.
-        feed_exists = session.execute(
-            select(UserDataChangeFeedEvent.id).where(
+        # under retry — Codex IDEA R1 / Sub-A11 design).
+        feed_existing = session.execute(
+            select(UserDataChangeFeedEvent).where(
                 UserDataChangeFeedEvent.operation_id == outbox_event.operation_id
             )
         ).scalar_one_or_none()
 
-        if feed_exists is not None:
+        if feed_existing is not None:
+            # Codex R2 MAJOR #3 — compare payload_hash before dropping
+            # the outbox row. If the feed-side hash differs we'd be
+            # silently losing evidence of a conflict. Leave the row
+            # with last_error set so the conflict surfaces in
+            # monitoring; downstream alerting picks it up.
+            if (
+                feed_existing.payload_hash
+                and outbox_event.payload_hash
+                and feed_existing.payload_hash != outbox_event.payload_hash
+            ):
+                outbox_event.attempts += 1
+                outbox_event.last_attempt_at = when
+                outbox_event.last_error = (
+                    f"payload_hash mismatch: feed={feed_existing.payload_hash!r} "
+                    f"outbox={outbox_event.payload_hash!r}"
+                )
+                session.flush()
+                _logger.error(
+                    "relay_outbox: payload_hash mismatch for op_id=%s "
+                    "(feed already has different content); leaving outbox "
+                    "row with last_error for triage.",
+                    outbox_event.operation_id,
+                )
+                continue
+            # Same hash — already relayed; drop the outbox row.
             session.delete(outbox_event)
             session.flush()
             relayed += 1
             continue
 
+        # Codex R2 CRITICAL — INSERT is plain (no begin_nested) for
+        # the same reason as emit_event: the relay's caller (typically
+        # a background worker tick with its own session lifecycle)
+        # is expected to wrap the relay call in its own SAVEPOINT
+        # if it wants per-row isolation. The pre-check above closes
+        # the common race path (op_id already in feed) cheaply.
         try:
             feed_event = UserDataChangeFeedEvent(
                 operation_id=outbox_event.operation_id,
@@ -368,26 +429,24 @@ def relay_outbox(
             relayed += 1
         except IntegrityError as exc:
             # Race: another worker just relayed this op_id between
-            # our pre-check and our INSERT. Log + bump attempts,
-            # leave the outbox row for next tick (the conflict will
-            # be detected by the pre-check then).
+            # our pre-check and our INSERT. The session is now in
+            # a poisoned state on Postgres — we stop processing
+            # the batch and let the caller's tick handle cleanup.
+            # The outbox row stays; next tick's pre-check sees the
+            # feed row and DELETEs it cleanly.
             _logger.warning(
                 "relay_outbox: race on op_id=%s (concurrent relay?); "
-                "will retry next tick. exc=%r",
+                "stopping batch. exc=%r",
                 outbox_event.operation_id,
                 exc,
             )
-            # Don't rollback — the IntegrityError already poisoned
-            # the txn at the SQL level. Caller is responsible for
-            # detecting and recovering. We just stop processing this
-            # batch.
             break
         except Exception as exc:  # noqa: BLE001
             _logger.exception(
                 "relay_outbox: failed to move op_id=%s; will retry next tick",
                 outbox_event.operation_id,
             )
-            # Mark the row for retry without rolling back the session.
+            # Mark the row for retry — UPDATE lands in same txn.
             outbox_event.attempts += 1
             outbox_event.last_attempt_at = when
             outbox_event.last_error = repr(exc)[:1000]
@@ -397,6 +456,7 @@ def relay_outbox(
 
 
 __all__ = [
+    "PayloadHashConflict",
     "emit_event",
     "read_recent_events",
     "relay_outbox",

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models import AuditOutboxEvent, UserDataChangeFeedEvent
 from sreda.services.audit_feed import (
+    PayloadHashConflict,
     emit_event,
     read_recent_events,
     relay_outbox,
@@ -61,8 +62,8 @@ def test_emit_event_writes_outbox_row(db_session: Session) -> None:
 
 
 def test_emit_event_idempotent_returns_existing(db_session: Session) -> None:
-    """Re-emit with same op_id → returns the existing row without
-    duplicating."""
+    """Re-emit with the SAME op_id AND SAME payload (true retry) →
+    returns the existing row without duplicating."""
     first = emit_event(
         db_session,
         operation_id="op_idem",
@@ -83,13 +84,27 @@ def test_emit_event_idempotent_returns_existing(db_session: Session) -> None:
         user_id="u1",
         source="среда",
         entity_type="shopping_list_item",
-        entity_id="sh_DIFFERENT",
+        entity_id="sh_1",
         action="created",
-        payload={"v": 2},
+        payload={"v": 1},  # IDENTICAL payload — true retry
     )
     assert second.id == first.id
-    # Original payload preserved (no overwrite).
-    assert second.payload == {"v": 1}
+
+
+def test_emit_event_rejects_bad_entity_type(db_session: Session) -> None:
+    """Codex R1 MAJOR #7 — entity_type whitelist enforced
+    synchronously."""
+    with pytest.raises(ValueError, match="entity_type="):
+        emit_event(
+            db_session,
+            operation_id="op_bad_entity",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="not_a_real_entity",
+            entity_id="x",
+            action="created",
+        )
 
 
 def test_emit_event_rejects_bad_source(db_session: Session) -> None:
@@ -104,6 +119,72 @@ def test_emit_event_rejects_bad_source(db_session: Session) -> None:
             entity_id="sh_1",
             action="created",
         )
+
+
+def test_emit_event_hash_mismatch_raises(db_session: Session) -> None:
+    """Codex R2 MAJOR #3 — same op_id with different payload must
+    raise PayloadHashConflict rather than silently collapse."""
+    emit_event(
+        db_session,
+        operation_id="op_hash_conflict",
+        tenant_id="t1",
+        user_id="u1",
+        source="среда",
+        entity_type="shopping_list_item",
+        entity_id="sh_1",
+        action="created",
+        payload={"v": 1},
+    )
+    db_session.commit()
+
+    with pytest.raises(PayloadHashConflict) as excinfo:
+        emit_event(
+            db_session,
+            operation_id="op_hash_conflict",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload={"v": 2},  # different payload, same op_id
+        )
+    assert excinfo.value.operation_id == "op_hash_conflict"
+    assert excinfo.value.location == "outbox"
+
+
+def test_emit_event_hash_mismatch_feed_side_raises(db_session: Session) -> None:
+    """Same conflict, but the prior write is already in the feed
+    (not outbox). Still raises with location='feed'."""
+    db_session.add(
+        UserDataChangeFeedEvent(
+            operation_id="op_hash_feed",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload={"v": 1},
+            payload_hash="hash_v1",
+            occurred_at=_now(),
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(PayloadHashConflict) as excinfo:
+        emit_event(
+            db_session,
+            operation_id="op_hash_feed",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload={"v": 2},
+        )
+    assert excinfo.value.location == "feed"
 
 
 def test_emit_event_rejects_bad_action(db_session: Session) -> None:
