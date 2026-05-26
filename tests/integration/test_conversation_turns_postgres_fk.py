@@ -35,9 +35,24 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
-# Import core models so their tables get registered before create_all.
+# Register all model modules — mirror conftest.py ordering so FK
+# targets like `checklists` (referenced by Task.checklist_id), `audit`,
+# `free_tier`, `reply_buttons` are present. Codex R3 MAJOR — without
+# these extra imports Base.metadata.create_all errors out before any
+# test logic runs.
 import sreda.db.models  # noqa: F401
-from sreda.db.models import AgentRun, AgentThread, ConversationTurn, Tenant, Workspace
+import sreda.db.models.audit  # noqa: F401
+import sreda.db.models.checklists  # noqa: F401
+import sreda.db.models.free_tier  # noqa: F401
+import sreda.db.models.reply_buttons  # noqa: F401
+from sreda.db.models import (
+    AgentRun,
+    AgentThread,
+    ConversationTurn,
+    PlannerExecution,
+    Tenant,
+    Workspace,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +302,134 @@ def test_agent_run_same_thread_turn_accepted(session_factory):
             input_json="{}",
             turn_id=turn.id,
         )
+    )
+    session.commit()
+    session.close()
+
+
+def _make_planner_execution(
+    *,
+    id: str,
+    run_id: str,
+    turn_id: str | None,
+) -> PlannerExecution:
+    """Build a minimal PlannerExecution row with just the FK fields
+    populated — enough to exercise the composite FK constraint."""
+    return PlannerExecution(
+        id=id,
+        run_id=run_id,
+        tenant_id="t1",
+        feature_key="housewife_assistant",
+        planner_prompt_version=1,
+        planner_provider="mimo",
+        planner_model="mimo-v2.5-pro",
+        planner_status="pending",
+        execution_status="pending",
+        execution_log_json=[],
+        turn_id=turn_id,
+        created_at=_now(),
+    )
+
+
+def test_planner_execution_with_matching_run_turn_accepted(session_factory):
+    """Codex R3 MINOR — sister to agent_run happy path: planner_execution
+    referencing run + matching turn must succeed."""
+    session = session_factory()
+    _seed_thread(session, thread_id="thread_a")
+    turn = _seed_turn(session, thread_id="thread_a")
+    session.add(
+        AgentRun(
+            id="run_a",
+            thread_id="thread_a",
+            tenant_id="t1",
+            workspace_id="ws_t1",
+            action_type="chat",
+            status="pending",
+            input_json="{}",
+            turn_id=turn.id,
+        )
+    )
+    session.commit()
+
+    session.add(_make_planner_execution(id="exec_a", run_id="run_a", turn_id=turn.id))
+    session.commit()
+    session.close()
+
+
+def test_planner_execution_with_mismatched_turn_rejected(session_factory):
+    """Codex R2 MAJOR #1 — the core invariant: planner_execution's
+    turn_id MUST match the agent_runs row's turn_id. Pointing at run_A
+    (which carries turn_X) but writing turn_Y must be rejected by the
+    composite FK ``(run_id, turn_id) -> agent_runs(id, turn_id)``."""
+    session = session_factory()
+    _seed_thread(session, thread_id="thread_a")
+    turn_x = _seed_turn(session, thread_id="thread_a")
+
+    # Close turn_x and open turn_y so we have two valid turns to confuse with.
+    turn_x.status = "closed"
+    turn_x.closed_at = _now()
+    session.flush()
+    turn_y = ConversationTurn(
+        id="turn_y",
+        turn_seq=2,
+        thread_id="thread_a",
+        tenant_id="t1",
+        started_at=_now(),
+        status="active",
+        run_count=0,
+        total_tokens=0,
+        total_cost_usd=0,
+    )
+    session.add(turn_y)
+
+    # run_a is bound to turn_x (the run was created while turn_x was active).
+    session.add(
+        AgentRun(
+            id="run_a",
+            thread_id="thread_a",
+            tenant_id="t1",
+            workspace_id="ws_t1",
+            action_type="chat",
+            status="pending",
+            input_json="{}",
+            turn_id=turn_x.id,
+        )
+    )
+    session.commit()
+
+    # Now try to write a planner_execution that says run_a but turn_y.
+    # The composite FK must reject this.
+    session.add(
+        _make_planner_execution(id="exec_bad", run_id="run_a", turn_id=turn_y.id)
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+    session.close()
+
+
+def test_planner_execution_null_turn_id_accepted(session_factory):
+    """Legacy compat: planner_execution.turn_id=NULL is allowed when
+    its agent_run also has turn_id=NULL (composite FK is inert with
+    NULL columns; the simple run_id FK still enforces run existence)."""
+    session = session_factory()
+    _seed_thread(session, thread_id="thread_a")
+    session.add(
+        AgentRun(
+            id="run_legacy",
+            thread_id="thread_a",
+            tenant_id="t1",
+            workspace_id="ws_t1",
+            action_type="chat",
+            status="pending",
+            input_json="{}",
+            turn_id=None,
+        )
+    )
+    session.commit()
+
+    session.add(
+        _make_planner_execution(id="exec_legacy", run_id="run_legacy", turn_id=None)
     )
     session.commit()
     session.close()
