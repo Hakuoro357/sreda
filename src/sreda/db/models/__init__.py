@@ -1,4 +1,5 @@
 from sreda.db.models.admin_alerts import AdminAlertSeen
+from sreda.db.models.audit_feed import AuditOutboxEvent, UserDataChangeFeedEvent
 from sreda.db.models.billing import (
     PaymentOrder,
     PaymentOrderItem,
@@ -58,6 +59,7 @@ __all__ = [
     "AgentRun",
     "AgentThread",
     "AdminAlertSeen",
+    "AuditOutboxEvent",
     "Assistant",
     "AssistantMemory",
     "ConnectSession",
@@ -105,6 +107,7 @@ __all__ = [
     "TenantUserProfileProposal",
     "TenantUserSkillConfig",
     "User",
+    "UserDataChangeFeedEvent",
     "WebSearchUsage",
     "Workspace",
 ]
