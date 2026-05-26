@@ -228,6 +228,32 @@ def test_render_partial_with_compose_error_without_summary() -> None:
     assert ": ." not in out
 
 
+def test_render_partial_with_compose_error_missing_key_entirely() -> None:
+    """Codex 2026-05-26 MEDIUM: even when caller omits
+    ``execution_summary`` from template_data entirely (not just empty),
+    StrictUndefined-safe template should still render. The
+    ``is defined and`` guard handles missing-key case."""
+    out = render("partial_with_compose_error", {})
+    assert "действия выполнены" in out
+
+
+# ---------------------------------------------------------------------------
+# Codex review 2026-05-26 — autoescape OFF for Telegram plain-text delivery
+# ---------------------------------------------------------------------------
+
+
+def test_autoescape_disabled_for_telegram_output() -> None:
+    """Variables containing ``&`` / ``<`` / ``>`` must NOT be entity-
+    encoded — Telegram receives plain text, ``M&amp;M`` reads
+    broken to users. Was MEDIUM Codex finding for Sub-A5."""
+    reg = ComposerRegistry()
+    reg.register("with_special", "Привет, {{ name }}!")
+    out = reg.render("with_special", {"name": "M&M's <best>"})
+    assert "M&M's <best>" in out  # raw, not entity-encoded
+    assert "&amp;" not in out
+    assert "&lt;" not in out
+
+
 # ---------------------------------------------------------------------------
 # Drift guard — each template in HOUSEWIFE_TEMPLATES is wired into REGISTRY
 # ---------------------------------------------------------------------------

@@ -28,7 +28,6 @@ from jinja2 import (
     StrictUndefined,
     Template,
     TemplateError,
-    select_autoescape,
 )
 
 from sreda.services.composer.templates_housewife import HOUSEWIFE_TEMPLATES
@@ -57,14 +56,19 @@ class ComposerRegistry:
     """
 
     def __init__(self) -> None:
-        # autoescape='html'/'xml' is irrelevant for Telegram plain-text
-        # replies (we don't render to HTML); but we keep autoescape ON
-        # for any future HTML admin pages that might reuse templates.
+        # autoescape=False — output goes to Telegram as plain text
+        # (we don't use HTML send_message mode). With autoescape ON,
+        # variables containing ``&`` / ``<`` / ``>`` would render as
+        # HTML entities (``M&amp;M``), which is wrong for plain-text
+        # delivery. Codex review 2026-05-26 MEDIUM fix.
+        # If we ever add HTML admin pages that reuse templates,
+        # they should use their own Environment instance with
+        # ``autoescape=True``.
         # StrictUndefined surfaces template-data typos as exceptions
         # rather than silently rendering empty — aligns with the
         # "no silent fallback" architectural principle.
         self._env = Environment(
-            autoescape=select_autoescape(["html", "xml"]),
+            autoescape=False,
             undefined=StrictUndefined,
             keep_trailing_newline=False,
         )

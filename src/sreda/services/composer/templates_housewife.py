@@ -77,9 +77,15 @@ _GENERIC_TOOL_ERROR = (
 
 _PARTIAL_WITH_COMPOSE_ERROR = (
     "Сделала что просила"
-    "{% if execution_summary %}: {{ execution_summary }}{% endif %}. "
+    "{% if execution_summary is defined and execution_summary %}"
+    ": {{ execution_summary }}"
+    "{% endif %}. "
     "С финальным сообщением что-то пошло не так, но действия выполнены."
 )
+# Codex review 2026-05-26 MEDIUM/LOW fix: StrictUndefined raises on
+# bare ``{% if x %}`` when ``x`` is missing from template_data (not
+# just falsy). Use ``is defined and`` so callers can legitimately
+# omit execution_summary entirely without crashing the partial path.
 """Group 6.5 ``compose_failure_after_execution`` path — used when the
 planner-chosen template_id became invalid between Phase B validation
 and Phase D compose (registry deploy race). Tools already ran; we just
