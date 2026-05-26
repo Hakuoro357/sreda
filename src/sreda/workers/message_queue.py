@@ -171,26 +171,45 @@ def claim_next_job(
 
     dialect = session.bind.dialect.name if session.bind else ""
 
-    # Codex R1 MAJOR 2026-05-26 fix — concurrent workers race.
-    # Old impl was SELECT-then-UPDATE: worker A locks job X via
-    # SKIP LOCKED, worker B then sees a LATER pending job Y for the
-    # same thread_id because A hasn't committed yet (NOT EXISTS
-    # doesn't see A's row as "processing"). Result: out-of-order
-    # processing within same thread = FIFO violation.
+    # Codex R1 MAJOR 2026-05-26 — concurrent workers race on same-thread
+    # FIFO. Old SELECT-then-UPDATE let worker A lock job X (older) while
+    # worker B picked up Y (later) for the same thread because the
+    # NOT EXISTS subquery couldn't see A's uncommitted ``processing``
+    # row. The R1 attempt was a single atomic UPDATE … RETURNING with
+    # SKIP LOCKED on the inner SELECT — that closes the double-claim
+    # window (B's subquery skips A's locked row) but does NOT close the
+    # same-thread FIFO window, because skipping A's row still lets
+    # NOT EXISTS conclude "no processing for thread T" and pick Y.
+    # See ``plans/phase-a-review-r2.md`` for the repro logic.
     #
-    # The fix is one atomic statement: do the predicate + UPDATE in
-    # a single SQL using a subquery + ``FOR UPDATE SKIP LOCKED``
-    # inside the subquery. The UPDATE … RETURNING gives us back the
-    # row id we claimed (or no rows if nothing claimable).
-    #
-    # ``NOT EXISTS`` still relies on visibility — but because the
-    # outer UPDATE runs as part of the same statement and Postgres
-    # holds the row lock through the UPDATE's WHERE re-evaluation,
-    # the window for B to see "no processing for thread T" is closed:
-    # A's row is locked, so B's subquery sees row A as locked → skips
-    # entirely (FOR UPDATE SKIP LOCKED on the inner SELECT), and the
-    # NOT EXISTS now correctly excludes everything in the same thread.
+    # Codex R2 MAJOR 2026-05-26 — proper fix below uses a session-wide
+    # advisory_xact_lock so claim transactions are fully serialized.
+    # SKIP LOCKED is then redundant (no concurrent claim transactions
+    # ever hold message_jobs row locks) and is removed.
     if dialect == "postgresql":
+        # Codex R2 MAJOR 2026-05-26 — true FIFO under concurrent workers.
+        #
+        # Even with UPDATE … RETURNING + FOR UPDATE SKIP LOCKED, two
+        # workers can race on same-thread FIFO:
+        #   t1: Worker A locks job X (older). A's UPDATE not yet committed.
+        #   t2: Worker B's subquery skips locked X, evaluates job Y (later).
+        #       NOT EXISTS doesn't see A's uncommitted ``processing`` row
+        #       for that thread, so Y looks claimable → B grabs Y.
+        #   Result: Y processed before X within the same thread (FIFO violation).
+        #
+        # Fix: take a session-wide advisory lock for the duration of the
+        # claim transaction. Claims are <10ms each so even at 100 workers
+        # the contention window is tiny — the queue throughput we care
+        # about is bounded by dispatch time (5-90s per turn) not claim
+        # time. The lock key is a constant (one global lock for all
+        # claim ops); finer-grained per-thread locking would require
+        # knowing thread_id before SELECT, which we don't.
+        #
+        # The advisory_xact_lock auto-releases at commit/rollback, so
+        # no manual cleanup is needed.
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext('message_jobs_claim'))")
+        )
         sql = """
             UPDATE message_jobs
             SET status = 'processing',
@@ -211,7 +230,6 @@ def claim_next_job(
                   )
                 ORDER BY j.enqueued_at
                 LIMIT 1
-                FOR UPDATE SKIP LOCKED
             )
             RETURNING id
         """
