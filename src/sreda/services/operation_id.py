@@ -7,9 +7,12 @@ Group 3.1:
     logical_key)``. ``logical_key`` is the pre-INSERT canonical form,
     typically ``normalize_for_dedup(title)``. Lets a retry of the
     same plan-step against the same canonical title produce the
-    *same* op_id, which the partial unique index on
-    ``(tenant_id, operation_id)`` makes idempotent via
-    ``INSERT ... ON CONFLICT ... DO NOTHING``.
+    *same* op_id, which the unique index on
+    ``(tenant_id, user_id, operation_id)`` makes idempotent via
+    ``INSERT ... ON CONFLICT (tenant_id, user_id, operation_id)
+    DO NOTHING``. Codex Sub-A10 R1 CRITICAL #1 — full UNIQUE
+    (NOT partial), so the conflict target needs no ``index_where``.
+    Codex R1 MAJOR #3 — scope includes ``user_id``.
 
   - **update / delete**: ``op_id = sha1(plan_id, step_id, action,
     entity_type, entity_id)``. ``entity_id`` is known up front
@@ -58,6 +61,29 @@ pass the result into ``compute_operation_id_create``. We deliberately
 don't bake the recipe into this module — keeping it caller-side lets
 the tool author pick the right grain (e.g. shopping items with units
 might want to include the unit too).
+
+Known scope gaps (acceptable for Sub-A10 MVP, tracked for post-MVP):
+
+  - **Update / delete history loss** (Codex R2 MAJOR #2): the
+    ``operation_id`` column on the target row is overwritten by later
+    updates and erased by hard deletes. A retry of an OLD update
+    after newer state changes isn't catchable. A separate
+    ``tool_operations`` history table (keyed by op_id) would close
+    this — deferred to the Audit Feed work in Group 6.4 / Sub-A11.
+  - **Nullable ``user_id`` in family_reminders** (Codex R2 MAJOR #4):
+    standard SQL treats NULL as distinct in UNIQUE, so two reminders
+    with ``user_id=NULL`` and same op_id won't collide. Planner-flow
+    code MUST pass non-null user_id for idempotent writes. Enforced
+    at the tool-call site, not the schema.
+  - **Backfill for legacy rows** (Codex R2 MAJOR #5): existing rows
+    have both columns NULL; semantic dedup won't catch pre-migration
+    duplicates. Intentional — we'd rather not decrypt + rewrite
+    months of historical data. New rows fully participate.
+  - **pymorphy3 hash drift** (Codex R2 MAJOR #6): NORMALIZATION_VERSION
+    is folded into the hash payload above, so a pin bump produces
+    new hashes for the same input — old hashes stay valid for their
+    rows, new lookups use the new key. No backfill needed; the
+    semantic-dedup index just has lower hit rate for a while.
 """
 
 from __future__ import annotations
@@ -66,7 +92,10 @@ import hashlib
 import hmac
 import os
 
-from sreda.services.text_normalization import normalize_for_dedup
+from sreda.services.text_normalization import (
+    NORMALIZATION_VERSION,
+    normalize_for_dedup,
+)
 
 
 def _get_hmac_key() -> bytes:
@@ -131,22 +160,48 @@ def compute_operation_id_update(
     return f"op_{digest}"
 
 
-def compute_normalized_title_hash(title: str) -> str:
+def compute_normalized_title_hash(
+    title: str,
+    *,
+    entity_type: str = "",
+    tenant_id: str = "",
+    user_id: str = "",
+) -> str:
     """Compute the dedup-hash of a title.
 
-    Returns HMAC-SHA256 hex of ``normalize_for_dedup(title)`` keyed
-    by the ``SREDA_ENCRYPTION_KEY`` env var. If the env var is empty
-    (dev / test path), falls back to plain SHA-256 so the function
-    is always usable — the resulting hash is still a stable equality
-    key, just dictionary-attackable.
+    Returns HMAC-SHA256 hex of a payload that includes:
 
-    Empty input returns an empty string (caller treats as "no dedup
-    possible — accept whatever it is").
+      - ``NORMALIZATION_VERSION`` (cross-version stability marker)
+      - ``entity_type`` (domain separation: a "молоко" shopping item
+        doesn't hash-collide with a "молоко" task)
+      - ``tenant_id`` (per-tenant scope: leak across tenants is broken)
+      - ``user_id`` (per-user scope: same)
+      - ``normalize_for_dedup(title)``
+
+    The HMAC key is ``SREDA_ENCRYPTION_KEY``; falls back to plain
+    SHA-256 over the same payload when the key is empty (dev/test
+    convenience). Codex Sub-A10 R1 MAJOR #4 + R2 MAJOR #3/#5.
+
+    Empty title input → empty string (caller treats as "no dedup
+    possible — accept whatever it is"). Other scope args may be
+    blank (legacy callers / dev), but production callers SHOULD
+    pass entity_type, tenant_id, user_id so cross-domain /
+    cross-tenant equality is impossible.
     """
     normalized = normalize_for_dedup(title)
     if not normalized:
         return ""
-    msg = normalized.encode("utf-8")
+    # Use \x1f (Unit Separator) between fields so values containing
+    # ``|`` / ``:`` / spaces can't cross boundaries.
+    sep = "\x1f"
+    payload = sep.join([
+        f"v{NORMALIZATION_VERSION}",
+        entity_type,
+        tenant_id,
+        user_id,
+        normalized,
+    ])
+    msg = payload.encode("utf-8")
     key = _get_hmac_key()
     if key:
         return hmac.new(key, msg, hashlib.sha256).hexdigest()

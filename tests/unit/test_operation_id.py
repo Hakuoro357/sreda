@@ -8,17 +8,21 @@ duplicate row on retry. Codex IDEA review R1 + plan Group 3.1:
     action, entity_type, logical_key)`` where ``logical_key`` is the
     pre-INSERT canonical form (typically ``normalize_for_dedup(title)``).
     Retries with the same plan + step + title produce the same op_id
-    → ``INSERT ... ON CONFLICT (tenant_id, operation_id) DO NOTHING``
-    is idempotent.
+    → ``INSERT ... ON CONFLICT (tenant_id, user_id, operation_id)
+    DO NOTHING`` is idempotent (full UNIQUE, not partial — Codex
+    Sub-A10 R1 CRITICAL #1).
   - For ``update/delete``: ``op_id = sha1(plan_id, step_id, action,
     entity_type, entity_id)``. ``entity_id`` is known up front so
     retries with the same target produce the same op_id.
 
-The ``normalized_title_hash`` is the SHA-256 hex of the lemmatized
-title. Used for semantic-dedup lookups via SQL ``WHERE
-normalized_title_hash = ?`` — the column is unencrypted so it can
-participate in indexes, but it's a hash so it doesn't leak the
-plaintext content.
+The ``normalized_title_hash`` is HMAC-SHA256 (keyed by
+``SREDA_ENCRYPTION_KEY``) over a scoped payload of
+(NORMALIZATION_VERSION, entity_type, tenant_id, user_id,
+normalize_for_dedup(title)). Used for semantic-dedup lookups via
+SQL ``WHERE normalized_title_hash = ?``. The column is unencrypted
+so it can participate in indexes, but HMAC keying prevents both
+plaintext recovery from dictionary attacks and cross-domain /
+cross-tenant equality leakage. Codex R1 MAJOR #4 + R2 MAJOR #3.
 """
 
 from __future__ import annotations
@@ -223,10 +227,40 @@ def test_normalized_title_hash_keyed_by_env_key(monkeypatch):
 
 def test_normalized_title_hash_fallback_when_key_empty(monkeypatch):
     """When SREDA_ENCRYPTION_KEY is empty (dev / test default), the
-    function falls back to plain SHA-256 so it stays usable. Verify
-    the fallback is deterministic + matches a known SHA-256."""
+    function falls back to plain SHA-256 — but over the *scoped*
+    payload (NORMALIZATION_VERSION + entity_type + tenant + user +
+    normalized), not the bare normalized title. Codex R2 MAJOR #3."""
     import hashlib
+    from sreda.services.text_normalization import NORMALIZATION_VERSION
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", "")
     h = compute_normalized_title_hash("молоко")
-    expected = hashlib.sha256("молоко".encode("utf-8")).hexdigest()
+    sep = "\x1f"
+    expected_payload = sep.join([
+        f"v{NORMALIZATION_VERSION}",
+        "",  # entity_type default
+        "",  # tenant_id default
+        "",  # user_id default
+        "молоко",
+    ])
+    expected = hashlib.sha256(expected_payload.encode("utf-8")).hexdigest()
     assert h == expected
+
+
+def test_normalized_title_hash_entity_type_separates_domains():
+    """Codex R2 MAJOR #3 — same title across different entity types
+    must hash differently to prevent cross-table equality leak."""
+    a = compute_normalized_title_hash("молоко", entity_type="shopping_list_item")
+    b = compute_normalized_title_hash("молоко", entity_type="task")
+    assert a != b
+
+
+def test_normalized_title_hash_tenant_user_scope_separates():
+    """Codex R2 MAJOR #3 — different tenant or user → different hash
+    even for the same title + entity_type."""
+    base = dict(entity_type="shopping_list_item", title="молоко")
+    a = compute_normalized_title_hash(**base, tenant_id="t1", user_id="u1")
+    b = compute_normalized_title_hash(**base, tenant_id="t2", user_id="u1")
+    c = compute_normalized_title_hash(**base, tenant_id="t1", user_id="u2")
+    assert a != b
+    assert a != c
+    assert b != c
