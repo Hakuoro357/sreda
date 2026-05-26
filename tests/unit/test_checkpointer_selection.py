@@ -116,6 +116,10 @@ def test_postgres_url_builds_postgres_saver(monkeypatch) -> None:
         "SREDA_DATABASE_URL", "postgresql://user:pw@host/db"
     )
     monkeypatch.delenv("SREDA_LANGGRAPH_CHECKPOINTER", raising=False)
+    # Codex R1 CRITICAL fix — PostgresSaver requires explicit opt-in
+    # via SREDA_LANGGRAPH_PERSISTENCE_OPTED_IN until encrypted serializer
+    # lands; tests that DO want the postgres path set it.
+    monkeypatch.setenv("SREDA_LANGGRAPH_PERSISTENCE_OPTED_IN", "true")
     from sreda.config.settings import get_settings
 
     get_settings.cache_clear()
@@ -140,6 +144,7 @@ def test_postgres_psycopg_driver_url_also_recognized(monkeypatch) -> None:
         "SREDA_DATABASE_URL", "postgresql+psycopg://u:p@h/d"
     )
     monkeypatch.delenv("SREDA_LANGGRAPH_CHECKPOINTER", raising=False)
+    monkeypatch.setenv("SREDA_LANGGRAPH_PERSISTENCE_OPTED_IN", "true")
     from sreda.config.settings import get_settings
 
     get_settings.cache_clear()
@@ -169,6 +174,7 @@ def test_postgres_saver_is_singleton_across_calls(monkeypatch) -> None:
         "SREDA_DATABASE_URL", "postgresql://user:pw@host/db"
     )
     monkeypatch.delenv("SREDA_LANGGRAPH_CHECKPOINTER", raising=False)
+    monkeypatch.setenv("SREDA_LANGGRAPH_PERSISTENCE_OPTED_IN", "true")
     from sreda.config.settings import get_settings
 
     get_settings.cache_clear()
@@ -192,6 +198,32 @@ def test_postgres_saver_is_singleton_across_calls(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # State persistence (smoke — only sqlite/memory path actually exercises here)
 # ---------------------------------------------------------------------------
+
+
+def test_postgres_url_without_opt_in_falls_back_to_memory(monkeypatch) -> None:
+    """Codex R1 CRITICAL 2026-05-26 — PostgresSaver dumps decrypted PII
+    into LangGraph checkpoint tables outside our EncryptedString
+    controls. Until an encrypted serializer lands, postgres URL alone
+    must NOT enable persistence; explicit
+    SREDA_LANGGRAPH_PERSISTENCE_OPTED_IN=true is the consent gate."""
+    monkeypatch.setenv(
+        "SREDA_DATABASE_URL", "postgresql://user:pw@host/db"
+    )
+    monkeypatch.delenv("SREDA_LANGGRAPH_CHECKPOINTER", raising=False)
+    monkeypatch.delenv("SREDA_LANGGRAPH_PERSISTENCE_OPTED_IN", raising=False)
+    from sreda.config.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        with patch.object(graph_module, "_build_postgres_checkpointer") as builder:
+            saver = graph_module._make_checkpointer()
+        assert isinstance(saver, InMemorySaver), (
+            "postgres URL without explicit opt-in must NOT engage "
+            "PostgresSaver (PII leak risk)"
+        )
+        builder.assert_not_called()
+    finally:
+        get_settings.cache_clear()
 
 
 def test_in_memory_saver_smoke_persists_within_lifetime(monkeypatch) -> None:

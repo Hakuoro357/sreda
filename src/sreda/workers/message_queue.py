@@ -171,14 +171,64 @@ def claim_next_job(
 
     dialect = session.bind.dialect.name if session.bind else ""
 
-    # The selection query is dialect-specific only for the ``FOR UPDATE
-    # SKIP LOCKED`` clause. SQLite (test path) skips that — concurrency
-    # there is single-threaded anyway.
-    skip_locked = " FOR UPDATE SKIP LOCKED" if dialect == "postgresql" else ""
+    # Codex R1 MAJOR 2026-05-26 fix — concurrent workers race.
+    # Old impl was SELECT-then-UPDATE: worker A locks job X via
+    # SKIP LOCKED, worker B then sees a LATER pending job Y for the
+    # same thread_id because A hasn't committed yet (NOT EXISTS
+    # doesn't see A's row as "processing"). Result: out-of-order
+    # processing within same thread = FIFO violation.
+    #
+    # The fix is one atomic statement: do the predicate + UPDATE in
+    # a single SQL using a subquery + ``FOR UPDATE SKIP LOCKED``
+    # inside the subquery. The UPDATE … RETURNING gives us back the
+    # row id we claimed (or no rows if nothing claimable).
+    #
+    # ``NOT EXISTS`` still relies on visibility — but because the
+    # outer UPDATE runs as part of the same statement and Postgres
+    # holds the row lock through the UPDATE's WHERE re-evaluation,
+    # the window for B to see "no processing for thread T" is closed:
+    # A's row is locked, so B's subquery sees row A as locked → skips
+    # entirely (FOR UPDATE SKIP LOCKED on the inner SELECT), and the
+    # NOT EXISTS now correctly excludes everything in the same thread.
+    if dialect == "postgresql":
+        sql = """
+            UPDATE message_jobs
+            SET status = 'processing',
+                started_at = COALESCE(started_at, :now),
+                worker_id = :worker,
+                attempt = attempt + 1,
+                lease_expires_at = :lease_end
+            WHERE id = (
+                SELECT j.id FROM message_jobs j
+                WHERE (j.status = 'pending'
+                       OR (j.status = 'processing' AND j.lease_expires_at < :now))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM message_jobs j2
+                      WHERE j2.thread_id = j.thread_id
+                        AND j2.status = 'processing'
+                        AND j2.lease_expires_at >= :now
+                        AND j2.id <> j.id
+                  )
+                ORDER BY j.enqueued_at
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id
+        """
+        row = session.execute(
+            text(sql),
+            {"now": when, "lease_end": lease_end, "worker": worker_id},
+        ).first()
+        if row is None:
+            return None
+        return session.get(MessageJob, row[0])
 
+    # SQLite test path — no SKIP LOCKED, no concurrent workers. Keep
+    # the simpler SELECT-then-UPDATE for SQLite where tests don't
+    # exercise the concurrency surface.
     candidate = session.execute(
         text(
-            f"""
+            """
             SELECT j.id FROM message_jobs j
             WHERE (j.status = 'pending'
                    OR (j.status = 'processing' AND j.lease_expires_at < :now))
@@ -190,7 +240,7 @@ def claim_next_job(
                     AND j2.id <> j.id
               )
             ORDER BY j.enqueued_at
-            LIMIT 1{skip_locked}
+            LIMIT 1
             """
         ),
         {"now": when},
@@ -198,11 +248,6 @@ def claim_next_job(
     if candidate is None:
         return None
     job_id = candidate[0]
-
-    # Conditional UPDATE — increments attempt and sets the lease atomically.
-    # We do it via UPDATE…WHERE id=? so the rowcount tells us whether
-    # someone else swooped in between SELECT and UPDATE (in which case
-    # we treat it as "no claim" and the next loop tick will retry).
     result = session.execute(
         text(
             """
@@ -219,18 +264,10 @@ def claim_next_job(
               )
             """
         ),
-        {
-            "id": job_id,
-            "worker": worker_id,
-            "now": when,
-            "lease_end": lease_end,
-        },
+        {"id": job_id, "worker": worker_id, "now": when, "lease_end": lease_end},
     )
     if result.rowcount == 0:
-        # Lost the race — another worker grabbed it. No claim this tick.
         return None
-
-    # Re-fetch so the ORM-level state is up to date.
     return session.get(MessageJob, job_id)
 
 

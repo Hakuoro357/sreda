@@ -778,6 +778,13 @@ def _make_checkpointer() -> Any:
     settings = get_settings()
     if settings.langgraph_checkpointer_mode.strip().lower() == "memory":
         return InMemorySaver()
+    # Codex R1 CRITICAL 2026-05-26 — PostgresSaver writes LangGraph state
+    # (profile + memories + replies — decrypted PII) into its own
+    # checkpoint tables. Those bypass our ``EncryptedString`` column type
+    # and project retention controls. Until we add an encrypted
+    # serializer, persistence is OFF unless explicitly opted in.
+    if not settings.langgraph_persistence_opted_in:
+        return InMemorySaver()
     db_url = (settings.database_url or "").lower()
     if not db_url.startswith(("postgresql", "postgres+", "postgresql+")):
         # SQLite / unrecognized — fall back to in-memory so tests work.

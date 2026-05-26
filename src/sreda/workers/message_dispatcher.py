@@ -31,10 +31,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+import asyncio
+
 from sreda.db.models import MessageJob
 from sreda.db.session import get_session_factory
 from sreda.workers.message_queue import (
+    HEARTBEAT_INTERVAL_SEC,
     claim_next_job,
+    extend_lease,
     mark_done,
     mark_failed,
 )
@@ -88,6 +92,22 @@ async def process_pending(
             # object will detach after commit.
             job_snapshot = _snapshot_job(job)
 
+        # Codex R1 MAJOR 2026-05-26 — long dispatches need to extend
+        # their lease. With LEASE_DURATION_SEC=300 and typical turns
+        # in the 5-30s range we never see expiry, but recipe lookups
+        # with web_search + LLM fallback can push 90s+, and a worker
+        # crash mid-dispatch should release the lease only after the
+        # configured timeout — not slip past silently if the loop runs
+        # long. Spawn a heartbeat task that extends the lease every
+        # HEARTBEAT_INTERVAL_SEC; cancel as soon as dispatch finishes.
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_loop(
+                job_id=job_snapshot.id,
+                worker_id=_WORKER_ID,
+                attempt=job_snapshot.attempt,
+            ),
+            name=f"queue_heartbeat:{job_snapshot.id}",
+        )
         try:
             await _dispatch(job_snapshot)
             now_after = now or datetime.now(timezone.utc)
@@ -139,6 +159,12 @@ async def process_pending(
                     job_snapshot.id,
                     300,  # LEASE_DURATION_SEC, hardcoded to avoid import cycle in log
                 )
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
         processed += 1
 
@@ -188,6 +214,57 @@ def _snapshot_job(job: MessageJob) -> _JobSnapshot:
         message_payload=dict(job.message_payload or {}),
         attempt=job.attempt,
     )
+
+
+async def _heartbeat_loop(
+    *, job_id: str, worker_id: str, attempt: int
+) -> None:
+    """Extend the job's lease every ``HEARTBEAT_INTERVAL_SEC``.
+
+    Codex R1 MAJOR 2026-05-26 — if ``_dispatch`` runs longer than
+    ``LEASE_DURATION_SEC`` (default 300s), the lease expires and a
+    failover worker can claim the same job → double-processing. With a
+    healthy heartbeat the lease is continuously pushed forward.
+
+    Conditional UPDATE in ``extend_lease`` returns ``False`` if the row
+    has been taken over (attempt token incremented by a failover claim).
+    In that case we cancel ourselves — the dispatch will still complete
+    but its ``mark_done`` will no-op via the same fencing.
+
+    Cancellation is the normal exit path — the caller cancels this task
+    when ``_dispatch`` returns or raises.
+    """
+    SessionLocal = get_session_factory()
+    while True:
+        try:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            return
+        try:
+            with SessionLocal() as session, session.begin():
+                still_ours = extend_lease(
+                    session,
+                    job_id=job_id,
+                    worker_id=worker_id,
+                    attempt=attempt,
+                    now=datetime.now(timezone.utc),
+                )
+            if not still_ours:
+                logger.warning(
+                    "Lease lost for job_id=%s during dispatch — failover "
+                    "claimed it, our outcome won't land via fencing",
+                    job_id,
+                )
+                return
+        except Exception:  # noqa: BLE001
+            # Heartbeat is best-effort. If the UPDATE itself fails
+            # (DB connection blip), keep trying — short interval means
+            # we recover quickly. We don't want a transient hiccup to
+            # silently drop the lease.
+            logger.exception(
+                "heartbeat UPDATE failed for job_id=%s — retrying next tick",
+                job_id,
+            )
 
 
 def _truncate_error(text: str, limit: int = 4000) -> str:

@@ -68,7 +68,16 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         # consumer (Sub-A2 of Plan-Execute Epic) runs early in the
         # tick so its dispatched turns can fill outbox along with the
         # rest before delivery drains.
-        message_queue_processed = await process_message_queue(limit=limit)
+        #
+        # Codex R1 MAJOR 2026-05-26 — bound queue work per tick to
+        # min(5, limit) so a queue-enabled tenant with backlog can't
+        # monopolize the whole job_runner tick and starve runtime
+        # jobs / reminders / outbox delivery. 5 is enough for typical
+        # webhook bursts; remaining backlog catches up over the next
+        # tick (~5-10s in production).
+        message_queue_processed = await process_message_queue(
+            limit=min(5, limit)
+        )
         runtime_processed = await runtime_service.process_pending_jobs(limit=limit)
         verification_processed = await verification.process_pending_jobs(limit=limit)
         skill_processed = await skill_platform.process_pending_jobs(limit=limit)

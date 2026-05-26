@@ -304,7 +304,21 @@ class Settings(BaseSettings):
             "SREDA_LANGGRAPH_CHECKPOINTER",
             "sreda_langgraph_checkpointer",
         ),
-        description="'auto' (default) selects by database_url; 'memory' forces InMemorySaver.",
+        description="'auto' = memory unless persistence_opted_in; 'memory' = always memory.",
+    )
+    langgraph_persistence_opted_in: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "SREDA_LANGGRAPH_PERSISTENCE_OPTED_IN",
+            "sreda_langgraph_persistence_opted_in",
+        ),
+        description=(
+            "Explicit consent gate for PostgresSaver. LangGraph state "
+            "contains decrypted PII (profile, memories, replies). Until "
+            "we add an encrypted serializer (issue TBD), default is "
+            "False — checkpointer stays in-memory even with postgres "
+            "URL. Codex R1 CRITICAL 2026-05-26."
+        ),
     )
     langgraph_pool_max_size: int = Field(
         default=10,
