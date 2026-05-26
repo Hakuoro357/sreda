@@ -1,6 +1,14 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    String,
+    Text,
+    text as sql_text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -48,6 +56,20 @@ class AgentRun(Base):
         nullable=True,
         index=True,
     )
+    # Sub-A9 (Group 6.6) — pointer to the conversation_turn this run
+    # belongs to. NULL for legacy rows that pre-date the column; new
+    # planner-driven runs always populate it. The composite FK on
+    # (turn_id, thread_id) defined in __table_args__ keeps the run
+    # from accidentally pointing at a turn in another thread.
+    #
+    # Codex Sub-A9 R1 MINOR #6 — index defined explicitly in
+    # __table_args__ (partial WHERE turn_id IS NOT NULL) to match the
+    # Alembic migration; we don't pass ``index=True`` here so the ORM
+    # create_all() schema agrees with the migrated schema.
+    turn_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     action_type: Mapped[str] = mapped_column(String(100), index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     input_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -61,3 +83,26 @@ class AgentRun(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # Sub-A9 / Group 6.6 Codex MAJOR #1 — composite FK so a run
+        # cannot reference a turn in a different thread. NULL-on-either-
+        # column lets the constraint stay inert for legacy rows where
+        # ``turn_id`` is unset (Group 6.6 backfill strategy A).
+        ForeignKeyConstraint(
+            ["turn_id", "thread_id"],
+            ["conversation_turns.id", "conversation_turns.thread_id"],
+            name="fk_agent_runs_turn_thread",
+        ),
+        # Codex Sub-A9 R1 MINOR #6 — partial index matches the Alembic
+        # migration so create_all() and migrate-up produce the same
+        # schema. We only need the index for turn_id IS NOT NULL since
+        # the planner-flow always sets it; legacy NULL rows don't need
+        # to be in the index.
+        Index(
+            "ix_agent_runs_turn_id",
+            "turn_id",
+            postgresql_where=sql_text("turn_id IS NOT NULL"),
+            sqlite_where=sql_text("turn_id IS NOT NULL"),
+        ),
+    )

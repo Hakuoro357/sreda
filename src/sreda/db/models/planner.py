@@ -107,7 +107,16 @@ class PlannerExecution(Base):
     )
 
     # --- Stage 2: turn transition ---------------------------------------
-    turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Sub-A9 Codex MAJOR #4 — once conversation_turns exists, planner_executions.turn_id
+    # is constrained to a real row in that table (or NULL for unset). A simple
+    # one-column FK to conversation_turns.id is correct because the turn↔thread
+    # binding is enforced upstream via agent_runs(turn_id, thread_id) composite FK.
+    turn_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("conversation_turns.id"),
+        nullable=True,
+        index=True,
+    )
     is_new_turn: Mapped[bool | None] = mapped_column(nullable=True)
     turn_classification_reason: Mapped[str | None] = mapped_column(
         String(500), nullable=True

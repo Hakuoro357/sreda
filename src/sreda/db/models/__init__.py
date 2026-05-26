@@ -8,6 +8,7 @@ from sreda.db.models.billing import (
 )
 from sreda.db.models.channel_linking import ChannelLinkToken
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
+from sreda.db.models.conversation_turns import ConversationTurn
 from sreda.db.models.core import (
     Assistant,
     InboundMessage,
@@ -60,6 +61,7 @@ __all__ = [
     "Assistant",
     "AssistantMemory",
     "ConnectSession",
+    "ConversationTurn",
     "PaymentOrder",
     "PaymentOrderItem",
     "InboundMessage",

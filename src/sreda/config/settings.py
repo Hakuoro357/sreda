@@ -331,6 +331,36 @@ class Settings(BaseSettings):
         description="psycopg ConnectionPool max_size for PostgresSaver. Default 10 fits single-VDS; bump for worker scale-out.",
     )
 
+    # Sub-A9 / Group 6.6 — conversation_turn hard close + soft hint thresholds.
+    turn_hard_close_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        validation_alias=AliasChoices(
+            "SREDA_TURN_HARD_CLOSE_DAYS",
+            "sreda_turn_hard_close_days",
+        ),
+        description=(
+            "Group 6.6 Codex MAJOR #7 — deterministic close for active "
+            "turns older than N days. Without this a runaway open turn "
+            "could carry month-old context into a fresh conversation."
+        ),
+    )
+    turn_hint_threshold_hours: int = Field(
+        default=6,
+        ge=1,
+        le=168,
+        validation_alias=AliasChoices(
+            "SREDA_TURN_HINT_THRESHOLD_HOURS",
+            "sreda_turn_hint_threshold_hours",
+        ),
+        description=(
+            "Group 5.1 — soft warning threshold. If the active turn's "
+            "last message is older than this, the planner-prompt builder "
+            "adds a hint suggesting the planner consider is_new_turn=true."
+        ),
+    )
+
     # Speech recognition provider:
     #   ``yandex``        — Yandex SpeechKit only (current default).
     #   ``groq``          — Groq Whisper only (~0.3-0.5s vs Yandex ~1-2s).
