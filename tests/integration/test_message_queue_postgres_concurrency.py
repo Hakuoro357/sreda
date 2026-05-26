@@ -46,29 +46,86 @@ from sreda.workers.message_queue import claim_next_job
 
 _POSTGRES_URL = os.environ.get("SREDA_TEST_POSTGRES_URL")
 _DESTRUCTIVE_OPT_IN = os.environ.get("SREDA_TEST_POSTGRES_DESTRUCTIVE_OPT_IN") == "1"
+_REMOTE_OPT_IN = (
+    os.environ.get("SREDA_TEST_POSTGRES_REMOTE_OPT_IN") == "1"
+)
+
+# Hosts considered "local sandbox" — safe by default. Remote hosts
+# need a separate opt-in even if URL passes other checks (defense
+# in depth against pointing at a remote prod DB whose name happens
+# to contain "test").
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "postgres", "pg", "db"})
 
 
-def _is_safe_test_db(url: str) -> bool:
-    """Refuse to drop tables if the URL doesn't look like a throwaway test
-    DB. We require the database name to contain the string 'test' — this
-    is paranoid but cheap, and catches the worst misconfigurations
-    (e.g. pointing at prod by mistake)."""
+def _safety_reason(url: str) -> str | None:
+    """Return None if the URL is safe to wipe; otherwise a human-readable
+    rejection reason. Codex R5 MAJOR — DB-name check alone is not enough;
+    we also validate scheme, host, and require a stricter DB name pattern.
+
+    Allowed:
+      postgresql://user:pw@<local-host>/<...test...|test_...|..._test|test>
+
+    Remote hosts require explicit ``SREDA_TEST_POSTGRES_REMOTE_OPT_IN=1``
+    in addition to the destructive opt-in."""
     if not url:
-        return False
+        return "url is empty"
+
     parsed = urlparse(url)
-    db_name = (parsed.path or "").lstrip("/")
-    return "test" in db_name.lower()
+
+    # Scheme: only Postgres URLs.
+    if parsed.scheme not in {"postgresql", "postgres", "postgresql+psycopg"}:
+        return f"scheme {parsed.scheme!r} is not postgresql"
+
+    # DB name: must look like a test DB. We require either:
+    #   - exact name "test", OR
+    #   - starts with "test_", OR
+    #   - ends with "_test", OR
+    #   - contains "test" surrounded by separators (e.g. "sreda_test_main")
+    db_name = (parsed.path or "").lstrip("/").lower()
+    if not db_name:
+        return "DB name missing from URL"
+    valid_name = (
+        db_name == "test"
+        or db_name.startswith("test_")
+        or db_name.endswith("_test")
+        or "_test_" in db_name
+        or "_test" in db_name
+    )
+    if not valid_name:
+        return (
+            f"DB name {db_name!r} doesn't look like a test DB "
+            f"(must be 'test', 'test_*', '*_test', or contain '_test')"
+        )
+
+    # Host: local-only by default. Remote needs explicit opt-in.
+    host = (parsed.hostname or "").lower()
+    if host not in _LOCAL_HOSTS and not _REMOTE_OPT_IN:
+        return (
+            f"host {host!r} is not in the local-sandbox allowlist "
+            f"({sorted(_LOCAL_HOSTS)}). Set "
+            f"SREDA_TEST_POSTGRES_REMOTE_OPT_IN=1 to allow remote hosts."
+        )
+
+    return None
 
 
-_SAFETY_OK = bool(_POSTGRES_URL) and _DESTRUCTIVE_OPT_IN and _is_safe_test_db(_POSTGRES_URL or "")
+_SAFETY_FAILURE = _safety_reason(_POSTGRES_URL or "") if _POSTGRES_URL else "URL not set"
+_SAFETY_OK = (
+    bool(_POSTGRES_URL)
+    and _DESTRUCTIVE_OPT_IN
+    and _SAFETY_FAILURE is None
+)
 
 pytestmark = pytest.mark.skipif(
     not _SAFETY_OK,
     reason=(
         "Postgres concurrency tests require BOTH "
-        "SREDA_TEST_POSTGRES_URL (with 'test' in DB name) and "
+        "SREDA_TEST_POSTGRES_URL (scheme=postgresql, host in local "
+        "allowlist OR SREDA_TEST_POSTGRES_REMOTE_OPT_IN=1, DB name "
+        "'test'/'test_*'/'*_test') and "
         "SREDA_TEST_POSTGRES_DESTRUCTIVE_OPT_IN=1 — these tests DROP "
-        "and re-create the message_jobs table."
+        "and re-create the message_jobs table. "
+        f"Current failure: {_SAFETY_FAILURE or 'destructive opt-in missing'}"
     ),
 )
 
@@ -136,21 +193,65 @@ def _enqueue(
 # ---------------------------------------------------------------------------
 
 
+def _start_claim_thread(
+    session_factory,
+    *,
+    worker_id: str,
+    now: datetime,
+) -> tuple[threading.Thread, threading.Event, queue.Queue]:
+    """Spawn a background thread that calls ``claim_next_job`` and
+    captures the result. Returns ``(thread, before_claim_event, result_q)``.
+
+    Codex R5 MINOR — the event is set IMMEDIATELY before
+    ``claim_next_job()`` so the main thread can wait for it before
+    asserting "still blocked". Without the event, a slow thread
+    startup could let the main thread's commit happen BEFORE the
+    background reached the claim call, making the blocking assertion
+    false-pass.
+
+    Caller protocol:
+        t, ready, rq = _start_claim_thread(session_factory, worker_id="w2", now=t0)
+        assert ready.wait(timeout=5.0)        # wait until claim is about to run
+        t.join(timeout=1.0)
+        assert t.is_alive()                   # must be blocked NOW
+        ...  # commit the blocker
+        t.join(timeout=5.0)
+        status, payload = rq.get_nowait()
+    """
+    ready = threading.Event()
+    result_q: queue.Queue = queue.Queue()
+
+    def runner() -> None:
+        sess = session_factory()
+        try:
+            sess.begin()
+            ready.set()  # signal: about to call claim_next_job → block check is now valid
+            claimed = claim_next_job(sess, worker_id=worker_id, now=now)
+            sess.commit()
+            result_q.put(("ok", claimed))
+        except Exception as exc:  # noqa: BLE001
+            result_q.put(("err", repr(exc)))
+        finally:
+            sess.close()
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    return t, ready, result_q
+
+
 def test_same_thread_fifo_under_concurrent_workers(session_factory):
-    """Codex R3/R4 — true FIFO under concurrent workers.
+    """Codex R3/R4/R5 — true FIFO under concurrent workers.
 
     Repro of the original bug:
       Thread T has pending A (older) and pending B (later).
       Without advisory lock + FOR UPDATE, Worker 1 could lock A,
       Worker 2 could simultaneously claim B for the same thread.
 
-    R4 verification: instead of using a statement_timeout as the
-    blocked-signal (weak — broken impl might also timeout for
-    unrelated reasons), we run Worker 2's claim in a background
-    thread, observe it stays blocked while Worker 1 holds the
-    transaction, then commit Worker 1 and assert Worker 2
-    eventually returns ``None`` (no other claimable job exists
-    for that thread).
+    R5 verification: Worker 2 runs in a background thread; we wait
+    on a threading.Event set immediately before claim_next_job()
+    to ensure the worker reached the call site (not just thread
+    startup), then assert it's still blocked, commit Worker 1, and
+    verify Worker 2 unblocks naturally with the correct result.
     """
     setup = session_factory()
     t0 = _now()
@@ -168,35 +269,22 @@ def test_same_thread_fifo_under_concurrent_workers(session_factory):
     assert first.external_update_id == "A"
     # Worker 1 deliberately does NOT commit yet — holds the lock.
 
-    # Worker 2 runs in a background thread. We capture its return value
-    # via a Queue so we can join() with timeout and observe blocking.
-    result_q: queue.Queue = queue.Queue()
+    t2, ready, result_q = _start_claim_thread(
+        session_factory, worker_id="w2", now=t0 + timedelta(seconds=3)
+    )
 
-    def run_worker2() -> None:
-        worker2 = session_factory()
-        try:
-            worker2.begin()
-            claimed = claim_next_job(
-                worker2, worker_id="w2", now=t0 + timedelta(seconds=3)
-            )
-            worker2.commit()
-            result_q.put(("ok", claimed))
-        except Exception as exc:  # noqa: BLE001
-            result_q.put(("err", repr(exc)))
-        finally:
-            worker2.close()
-
-    t2 = threading.Thread(target=run_worker2)
-    t2.start()
-
-    # Worker 2 should be blocked on advisory lock. Wait 1s — if it
-    # returned that means the advisory lock didn't fire (regression).
+    # Wait for Worker 2 to reach the claim call site, then verify it
+    # blocked (Event proves the call started; is_alive proves it's
+    # waiting on the lock).
+    assert ready.wait(timeout=5.0), "Worker 2 thread didn't reach claim_next_job"
     t2.join(timeout=1.0)
     assert t2.is_alive(), (
         "Worker 2 did NOT block on Worker 1's open claim transaction. "
         "advisory_xact_lock is not serializing claim ops — FIFO race "
         "is open."
     )
+    # Result queue must be empty — worker 2 hasn't finished yet.
+    assert result_q.empty(), "Worker 2 returned without blocking — race is open"
 
     # Now commit worker 1, releasing the advisory lock + row lock.
     worker1.commit()
@@ -238,37 +326,25 @@ def test_different_thread_claimable_after_worker1_commits(session_factory):
     assert first is not None
     assert first.thread_id == "thread_a"
 
-    result_q: queue.Queue = queue.Queue()
-
-    def run_worker2() -> None:
-        worker2 = session_factory()
-        try:
-            worker2.begin()
-            claimed = claim_next_job(
-                worker2, worker_id="w2", now=t0 + timedelta(seconds=3)
-            )
-            worker2.commit()
-            result_q.put(("ok", claimed.thread_id if claimed else None))
-        except Exception as exc:  # noqa: BLE001
-            result_q.put(("err", repr(exc)))
-        finally:
-            worker2.close()
-
-    t2 = threading.Thread(target=run_worker2)
-    t2.start()
+    t2, ready, result_q = _start_claim_thread(
+        session_factory, worker_id="w2", now=t0 + timedelta(seconds=3)
+    )
+    assert ready.wait(timeout=5.0), "Worker 2 thread didn't reach claim_next_job"
     t2.join(timeout=1.0)
     assert t2.is_alive(), "Worker 2 should block on advisory lock."
+    assert result_q.empty()
 
     worker1.commit()
     worker1.close()
 
     t2.join(timeout=5.0)
     assert not t2.is_alive()
-    status, thread_claimed = result_q.get_nowait()
+    status, claimed = result_q.get_nowait()
     assert status == "ok"
-    assert thread_claimed == "thread_b", (
+    assert claimed is not None
+    assert claimed.thread_id == "thread_b", (
         f"Worker 2 should have claimed thread_b's job (thread_a is "
-        f"taken). Got thread_id={thread_claimed!r}"
+        f"taken). Got thread_id={claimed.thread_id!r}"
     )
 
 
@@ -316,7 +392,6 @@ def test_heartbeat_race_does_not_resurrect_active_job(session_factory):
     setup.close()
 
     heartbeat_session = session_factory()
-    claim_session = session_factory()
 
     # Step 1+2: heartbeat extends lease, holds row lock.
     heartbeat_session.begin()
@@ -333,25 +408,17 @@ def test_heartbeat_race_does_not_resurrect_active_job(session_factory):
         {"new_lease": new_lease},
     )
 
-    # Step 3: failover claim in background — should block.
-    result_q: queue.Queue = queue.Queue()
-
-    def run_claim() -> None:
-        try:
-            claim_session.begin()
-            claimed = claim_next_job(claim_session, worker_id="w_failover", now=t0)
-            claim_session.commit()
-            result_q.put(("ok", claimed))
-        except Exception as exc:  # noqa: BLE001
-            result_q.put(("err", repr(exc)))
-
-    t_claim = threading.Thread(target=run_claim)
-    t_claim.start()
+    # Step 3: failover claim in background — should block on row lock.
+    t_claim, ready, result_q = _start_claim_thread(
+        session_factory, worker_id="w_failover", now=t0
+    )
+    assert ready.wait(timeout=5.0), "Claim thread didn't reach claim_next_job"
     t_claim.join(timeout=1.0)
     assert t_claim.is_alive(), (
         "Failover claim did NOT block on heartbeat's row lock — "
         "FOR UPDATE protection is missing."
     )
+    assert result_q.empty()
 
     # Step 4: commit heartbeat → row lock released, lease extended.
     heartbeat_session.commit()
@@ -385,7 +452,6 @@ def test_heartbeat_race_does_not_resurrect_active_job(session_factory):
         f"lease. Expected >= {new_lease}, got {final.lease_expires_at}"
     )
     check.close()
-    claim_session.close()
 
 
 def test_mark_done_race_does_not_resurrect_completed_job(session_factory):
@@ -418,7 +484,6 @@ def test_mark_done_race_does_not_resurrect_completed_job(session_factory):
     setup.close()
 
     mark_done_session = session_factory()
-    claim_session = session_factory()
 
     mark_done_session.begin()
     mark_done_session.execute(
@@ -433,21 +498,13 @@ def test_mark_done_race_does_not_resurrect_completed_job(session_factory):
         {"fin": t0},
     )
 
-    result_q: queue.Queue = queue.Queue()
-
-    def run_claim() -> None:
-        try:
-            claim_session.begin()
-            claimed = claim_next_job(claim_session, worker_id="w_failover", now=t0)
-            claim_session.commit()
-            result_q.put(("ok", claimed))
-        except Exception as exc:  # noqa: BLE001
-            result_q.put(("err", repr(exc)))
-
-    t_claim = threading.Thread(target=run_claim)
-    t_claim.start()
+    t_claim, ready, result_q = _start_claim_thread(
+        session_factory, worker_id="w_failover", now=t0
+    )
+    assert ready.wait(timeout=5.0), "Claim thread didn't reach claim_next_job"
     t_claim.join(timeout=1.0)
     assert t_claim.is_alive(), "Failover claim did NOT block on mark_done's row lock."
+    assert result_q.empty()
 
     mark_done_session.commit()
     mark_done_session.close()
@@ -471,4 +528,3 @@ def test_mark_done_race_does_not_resurrect_completed_job(session_factory):
         f"Got {final.worker_id!r}"
     )
     check.close()
-    claim_session.close()
