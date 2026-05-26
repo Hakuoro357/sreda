@@ -19,7 +19,11 @@ dependencies = [
   "langchain-openai>=1.1,<2.0",
   "psycopg[binary]>=3.2.0",
   "pydantic-settings>=2.10.0",
-  "pymorphy3>=2.0",          # Sub-A10 (Group 3.1) — semantic dedup via lemmatization
+  # Sub-A10 (Group 3.1) — semantic dedup via lemmatization.
+  # Codex R1 MAJOR #6: pinned to a narrow range so hash output for
+  # known inputs doesn't drift across deploys. NORMALIZATION_VERSION
+  # in services/text_normalization.py bumps when this pin moves.
+  "pymorphy3>=2.0,<3.0",
   "python-dateutil>=2.9.0",
   "python-multipart>=0.0.26",
   "duckduckgo-search>=6.0.0",

@@ -100,22 +100,23 @@ class ShoppingListItem(Base):
         # Partial unique on (tenant_id, operation_id) lets
         # ``INSERT ... ON CONFLICT DO NOTHING`` swallow duplicate
         # writes from a retry of the same plan-step.
+        # Codex Sub-A10 R1 CRITICAL #1 — plain UNIQUE, NOT partial.
+        # Codex R1 MAJOR #3 — index scope includes user_id.
         Index(
             "ix_shopping_list_items_operation_id",
             "tenant_id",
+            "user_id",
             "operation_id",
             unique=True,
-            postgresql_where=sql_text("operation_id IS NOT NULL"),
-            sqlite_where=sql_text("operation_id IS NOT NULL"),
         ),
         # Sub-A10 / Group 3.1 — semantic-dedup lookup. Tool-side
-        # add_shopping_items() queries by tenant + normalized_title_hash
-        # to detect "уже есть" before inserting. Hash rather than
-        # plaintext so the index doesn't leak content from the
-        # EncryptedString ``title`` column.
+        # add_shopping_items() queries by tenant + user + hash to
+        # detect "уже есть" before inserting. Hash rather than
+        # plaintext so the index doesn't leak content.
         Index(
             "ix_shopping_list_items_normalized_title",
             "tenant_id",
+            "user_id",
             "normalized_title_hash",
             postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
@@ -181,14 +182,14 @@ class Recipe(Base):
         Index(
             "ix_recipes_operation_id",
             "tenant_id",
+            "user_id",
             "operation_id",
             unique=True,
-            postgresql_where=sql_text("operation_id IS NOT NULL"),
-            sqlite_where=sql_text("operation_id IS NOT NULL"),
         ),
         Index(
             "ix_recipes_normalized_title",
             "tenant_id",
+            "user_id",
             "normalized_title_hash",
             postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),

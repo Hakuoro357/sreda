@@ -11,6 +11,10 @@ Pattern:
   True
   >>> normalize_for_dedup("куриные крылышки") == normalize_for_dedup("куриных крылышек")
   True
+  >>> normalize_for_dedup("ёлка") == normalize_for_dedup("елка")
+  True
+  >>> normalize_for_dedup("молоко.") == normalize_for_dedup("молоко")
+  True
   >>> normalize_for_dedup("молоко") == normalize_for_dedup("обезжиренное молоко")
   False
 
@@ -23,17 +27,46 @@ Implementation notes:
     by frequency. For ambiguous tokens (e.g. ``стали`` — verb past-plural
     OR noun genitive-singular "of steel") pymorphy3 picks deterministically
     based on its trained statistics.
-  - We lowercase + strip whitespace; we DON'T strip punctuation, so
-    ``M&M's`` stays distinct from ``MM s``.
-  - Empty / whitespace-only input → empty string (caller decides what
-    to do with it; typically "skip dedup, accept whatever it is").
+  - Codex Sub-A10 R1 MAJOR #7 — Unicode NFC normalization + ``ё→е``
+    folding + boundary punctuation strip. Closes common variant
+    classes: ``ёлка``/``елка``, ``молоко.``/``молоко``,
+    ``хлеб ``/``хлеб``.
+  - We DON'T strip *internal* punctuation, so ``M&M's`` stays
+    distinct from ``MM s``.
+  - Empty / whitespace-only / punctuation-only input → empty string
+    (caller decides what to do with it; typically "skip dedup,
+    accept whatever it is").
+
+Hash stability — Codex Sub-A10 R1 MAJOR #6:
+
+  ``NORMALIZATION_VERSION`` is a monotonic int that callers can
+  optionally fold into their hash keys when they need to guarantee
+  retries land on the same key across pymorphy3 / dictionary updates.
+  Bump this constant whenever the normalization output for known
+  inputs changes (e.g. pymorphy3 major upgrade). The hash helpers in
+  ``services.operation_id`` don't currently include the version in
+  the digest — we treat the dependency as stable for one MVP release
+  and re-evaluate at the first hash drift.
 """
 
 from __future__ import annotations
 
+import string
+import unicodedata
 from functools import lru_cache
 
 import pymorphy3
+
+
+# Codex Sub-A10 R1 MAJOR #6 — monotonic version that bumps whenever
+# normalize_for_dedup output for known inputs changes. Surfaced in
+# logs / debug output so cross-version retries can be detected.
+NORMALIZATION_VERSION = 1
+
+# Codex Sub-A10 R1 MAJOR #7 — boundary punctuation to strip. We keep
+# internal punctuation (so "M&M's" stays "m&m's", different from
+# "ms"); only leading/trailing characters get peeled.
+_BOUNDARY_PUNCT = string.punctuation + " \t\r\n"
 
 
 _morph: pymorphy3.MorphAnalyzer | None = None
@@ -64,17 +97,35 @@ def _lemmatize_word(word: str) -> str:
 def normalize_for_dedup(title: str) -> str:
     """Return a canonical form of ``title`` for semantic dedup.
 
-    See module docstring for the contract. Empty / whitespace-only
-    input returns an empty string.
+    See module docstring for the contract. Empty / whitespace-only /
+    punctuation-only input returns an empty string.
+
+    Pipeline (in order):
+      1. Unicode NFC normalization — composes decomposed forms so
+         ``Ӑ`` (U+0410 + U+0306) and ``Ӑ`` (U+04D0) collapse.
+      2. Lowercase.
+      3. ё → е fold (common Russian convention; planner output is
+         inconsistent on this letter).
+      4. Strip boundary punctuation / whitespace.
+      5. Word split + per-word lemmatization (pymorphy3 singleton).
+      6. Re-join with single spaces.
     """
     if not title:
         return ""
-    text = title.strip().lower()
+    text = unicodedata.normalize("NFC", title)
+    text = text.lower().replace("ё", "е")
+    text = text.strip(_BOUNDARY_PUNCT)
     if not text:
         return ""
     words = text.split()
+    # Strip per-word boundary punctuation too (e.g. "молоко," → "молоко"),
+    # but keep internal punctuation intact ("M&M's").
+    words = [w.strip(_BOUNDARY_PUNCT) for w in words]
+    words = [w for w in words if w]
+    if not words:
+        return ""
     lemmas = [_lemmatize_word(w) for w in words]
     return " ".join(lemmas)
 
 
-__all__ = ["normalize_for_dedup"]
+__all__ = ["NORMALIZATION_VERSION", "normalize_for_dedup"]

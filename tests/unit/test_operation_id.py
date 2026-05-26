@@ -204,3 +204,29 @@ def test_normalized_title_hash_distinct_items_differ():
     a = compute_normalized_title_hash("молоко")
     b = compute_normalized_title_hash("хлеб")
     assert a != b
+
+
+def test_normalized_title_hash_keyed_by_env_key(monkeypatch):
+    """Codex R1 MAJOR #4 — different SREDA_ENCRYPTION_KEY values
+    produce different hashes for the same input, confirming HMAC
+    is in effect (not plain SHA-256)."""
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", "key_alpha_" + "0" * 50)
+    a = compute_normalized_title_hash("молоко")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", "key_beta_" + "f" * 50)
+    b = compute_normalized_title_hash("молоко")
+    assert a != b, (
+        "HMAC keyed by SREDA_ENCRYPTION_KEY should produce distinct "
+        "hashes for the same input under different keys — got identical, "
+        "implying plain SHA-256 fallback is in play."
+    )
+
+
+def test_normalized_title_hash_fallback_when_key_empty(monkeypatch):
+    """When SREDA_ENCRYPTION_KEY is empty (dev / test default), the
+    function falls back to plain SHA-256 so it stays usable. Verify
+    the fallback is deterministic + matches a known SHA-256."""
+    import hashlib
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", "")
+    h = compute_normalized_title_hash("молоко")
+    expected = hashlib.sha256("молоко".encode("utf-8")).hexdigest()
+    assert h == expected

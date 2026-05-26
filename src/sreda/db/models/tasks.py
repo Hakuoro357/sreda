@@ -152,14 +152,14 @@ class Task(Base):
         Index(
             "ix_tasks_items_operation_id",
             "tenant_id",
+            "user_id",
             "operation_id",
             unique=True,
-            postgresql_where=sql_text("operation_id IS NOT NULL"),
-            sqlite_where=sql_text("operation_id IS NOT NULL"),
         ),
         Index(
             "ix_tasks_items_normalized_title",
             "tenant_id",
+            "user_id",
             "normalized_title_hash",
             postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),

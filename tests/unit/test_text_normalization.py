@@ -114,6 +114,51 @@ def test_deterministic():
     assert a == b
 
 
+def test_yo_to_e_normalization():
+    """Codex R1 MAJOR #7 — ёлка / елка normalize to same key."""
+    assert normalize_for_dedup("ёлка") == normalize_for_dedup("елка")
+    assert normalize_for_dedup("Ёлка") == normalize_for_dedup("елка")
+
+
+def test_boundary_punctuation_stripped():
+    """Codex R1 MAJOR #7 — `молоко.` and `молоко` collapse."""
+    assert normalize_for_dedup("молоко.") == normalize_for_dedup("молоко")
+    assert normalize_for_dedup("!!!хлеб!!!") == normalize_for_dedup("хлеб")
+    assert normalize_for_dedup("- молоко -") == normalize_for_dedup("молоко")
+
+
+def test_internal_punctuation_preserved_after_strip():
+    """Internal punctuation (`M&M's`) should still distinguish from
+    plain letters, even after the boundary-punct strip."""
+    assert normalize_for_dedup("M&M's") == normalize_for_dedup("m&m's")
+    assert normalize_for_dedup("M&M's") != normalize_for_dedup("mms")
+
+
+def test_punctuation_only_input_returns_empty():
+    """All-punctuation input → empty string (boundary strip leaves nothing)."""
+    assert normalize_for_dedup("...") == ""
+    assert normalize_for_dedup("!!!") == ""
+    assert normalize_for_dedup("---,,,") == ""
+
+
+def test_normalization_version_exposed():
+    """Codex R1 MAJOR #6 — version constant accessible for callers
+    that need to fold it into hash keys for cross-version safety."""
+    from sreda.services.text_normalization import NORMALIZATION_VERSION
+    assert isinstance(NORMALIZATION_VERSION, int)
+    assert NORMALIZATION_VERSION >= 1
+
+
+def test_nfc_unicode_normalization():
+    """Composed vs decomposed forms collapse. Russian doesn't have
+    many decomposed forms in practice, but Latin diacritics in mixed
+    text (e.g. brand names like ``Häagen-Dazs``) should be safe."""
+    # 'é' as a single character (NFC) vs 'e' + combining accent (NFD)
+    nfc = "café"  # single 'é' codepoint
+    nfd = "café"  # 'e' + combining acute
+    assert normalize_for_dedup(nfc) == normalize_for_dedup(nfd)
+
+
 def test_singleton_morph_analyzer():
     """The MorphAnalyzer should be reused across calls — first call
     can take seconds (loading dictionaries), subsequent calls must

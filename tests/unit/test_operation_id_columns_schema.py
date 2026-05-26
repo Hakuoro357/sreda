@@ -72,7 +72,8 @@ def test_operation_id_index_present(db_session: Session, table: str) -> None:
     assert ix["unique"], (
         f"{name} must be UNIQUE for ON CONFLICT idempotency"
     )
-    assert tuple(ix["column_names"]) == ("tenant_id", "operation_id"), (
+    # Codex R1 MAJOR #3 — scope includes user_id.
+    assert tuple(ix["column_names"]) == ("tenant_id", "user_id", "operation_id"), (
         f"{name} columns wrong: {ix['column_names']}"
     )
 
@@ -91,7 +92,9 @@ def test_normalized_title_index_present(
     ix = matching[0]
     # Non-unique — many rows can share the same lemma (think 5 shopping
     # items "молоко" added one per week).
+    # Codex R1 MAJOR #3 — scope includes user_id.
     assert tuple(ix["column_names"]) == (
         "tenant_id",
+        "user_id",
         "normalized_title_hash",
     ), f"{name} columns wrong: {ix['column_names']}"
