@@ -710,6 +710,7 @@ def _build_postgres_checkpointer(database_url: str) -> Any:
     current load (housewife_assistant, single VDS). When workers scale
     out, bump via ``SREDA_LANGGRAPH_POOL_MAX_SIZE`` env.
     """
+    from psycopg.rows import dict_row
     from psycopg_pool import ConnectionPool
     from langgraph.checkpoint.postgres import PostgresSaver
 
@@ -726,15 +727,28 @@ def _build_postgres_checkpointer(database_url: str) -> Any:
     elif psycopg_url.startswith("postgres+"):
         _, _, rest = psycopg_url.partition("://")
         psycopg_url = f"postgres://{rest}"
-    # autocommit=True is what PostgresSaver expects — it manages
-    # transaction boundaries internally per-operation.
+    # autocommit=True + prepare_threshold=0 + row_factory=dict_row are
+    # what PostgresSaver expects. Codex review 2026-05-26 HIGH:
+    # without dict_row, setup() crashes because it reads rows by key
+    # (``row["v"]``) — default tuple rows raise TypeError.
+    # Source: langgraph-checkpoint-postgres's own from_conn_string().
     pool = ConnectionPool(
         conninfo=psycopg_url,
         min_size=1,
         max_size=pool_max,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+        },
         open=True,
     )
+    # Test hygiene + graceful shutdown — atexit closes the pool so
+    # workers don't leak connections at process exit. Production-side
+    # systemd already SIGTERMs cleanly, but tests + dev runs benefit.
+    import atexit
+
+    atexit.register(pool.close)
     saver = PostgresSaver(conn=pool)
     saver.setup()
     return saver

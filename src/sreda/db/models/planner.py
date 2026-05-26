@@ -119,11 +119,16 @@ class PlannerExecution(Base):
         nullable=False,
         default="pending",
     )
-    execution_log_json: Mapped[dict] = mapped_column(
+    execution_log_json: Mapped[list] = mapped_column(
         _JSONB,
         nullable=False,
-        default=dict,
-        comment="List of per-step results; incrementally persisted (Group 3.2)",
+        default=list,
+        comment=(
+            "List of per-step results; appended-to incrementally per "
+            "Group 3.2 (one entry per executor visit, ordered by visit "
+            "time, each entry is a dict with node_id + status + "
+            "outcome). Codex review 2026-05-26 MEDIUM fix: was dict."
+        ),
     )
     execution_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

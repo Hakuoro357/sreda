@@ -131,6 +131,29 @@ _DEFAULT_TEST_KEY = base64.urlsafe_b64encode(
 
 
 @pytest.fixture(autouse=True)
+def _force_memory_langgraph_checkpointer(monkeypatch):
+    """Force LangGraph checkpointer to InMemorySaver across all unit tests.
+
+    Without this, any test that calls ``_make_checkpointer()`` or
+    compiles the assistant graph picks up the conftest's default
+    ``postgresql+psycopg://sreda:sreda@localhost:5432/sreda`` URL and
+    tries to actually connect to Postgres — which is not running in CI
+    and times out with ugly tracebacks. Codex review 2026-05-26 Sub-A8
+    MEDIUM fix.
+
+    Individual tests that DO want to exercise the PostgresSaver path
+    (e.g. ``test_postgres_url_builds_postgres_saver``) monkeypatch this
+    env var to a different value AFTER the autouse fixture yields, so
+    their setting wins.
+    """
+    # ``setdefault`` semantics — outer env wins so an integration-test
+    # runner with real PG can still opt in via env.
+    if not os.environ.get("SREDA_LANGGRAPH_CHECKPOINTER"):
+        monkeypatch.setenv("SREDA_LANGGRAPH_CHECKPOINTER", "memory")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _default_encryption_key(monkeypatch):
     """Set a stable dummy AES-256 key for the whole test suite.
 

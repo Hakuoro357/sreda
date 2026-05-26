@@ -113,7 +113,11 @@ def test_is_queue_enabled_for_whitelisted_tenant(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_langgraph_checkpointer_mode_defaults_to_auto() -> None:
+def test_langgraph_checkpointer_mode_defaults_to_auto(monkeypatch) -> None:
+    """The conftest autouse fixture force-sets the env var to ``memory``
+    so unit tests don't try to hit real Postgres. Clear it here to
+    verify the actual Settings default."""
+    monkeypatch.delenv("SREDA_LANGGRAPH_CHECKPOINTER", raising=False)
     s = Settings()
     assert s.langgraph_checkpointer_mode == "auto"
 
