@@ -7,6 +7,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
     text as sql_text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -93,6 +94,16 @@ class AgentRun(Base):
             ["turn_id", "thread_id"],
             ["conversation_turns.id", "conversation_turns.thread_id"],
             name="fk_agent_runs_turn_thread",
+        ),
+        # Codex Sub-A9 R2 MAJOR #1 — declared UNIQUE(id, turn_id) so that
+        # ``planner_executions(run_id, turn_id) → agent_runs(id, turn_id)``
+        # composite FK has a valid target. ``id`` is already PK and
+        # globally unique, so this is a no-op for uniqueness; the
+        # constraint exists only to satisfy Postgres's FK-target rule.
+        UniqueConstraint(
+            "id",
+            "turn_id",
+            name="uq_agent_runs_id_turn",
         ),
         # Codex Sub-A9 R1 MINOR #6 — partial index matches the Alembic
         # migration so create_all() and migrate-up produce the same

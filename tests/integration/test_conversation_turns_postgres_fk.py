@@ -35,7 +35,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
-from sreda.db.models import AgentRun, AgentThread, ConversationTurn
+# Import core models so their tables get registered before create_all.
+import sreda.db.models  # noqa: F401
+from sreda.db.models import AgentRun, AgentThread, ConversationTurn, Tenant, Workspace
 
 
 # ---------------------------------------------------------------------------
@@ -109,24 +111,23 @@ def _now() -> datetime:
 
 @pytest.fixture
 def engine():
-    """Per-test engine that drops + recreates the three tables we
-    touch. Tenants/workspaces/etc. are skipped because we're only
-    exercising the FK from agent_runs ↔ conversation_turns; the other
-    FKs on AgentThread (to tenants, workspaces) won't be checked
-    because we never insert orphan rows that violate them — we use
-    DEFER + skip those FKs by creating the agent_threads row first
-    with stub IDs and matching parent rows seeded inline."""
+    """Per-test engine — drops the schema and re-creates ALL registered
+    models so every FK target (tenants, workspaces, jobs, etc.) exists.
+    Codex Sub-A9 R2 MAJOR #2 — earlier draft created only the three
+    tables under test, leaving AgentThread's FKs to tenants/workspaces
+    pointing at missing tables.
+
+    DROP is gated by the safety check at module load (test-only DB
+    name + destructive opt-in)."""
     eng = create_engine(_POSTGRES_URL, echo=False, future=True)
-    # Order matters — agent_runs depends on conversation_turns + agent_threads.
     with eng.begin() as conn:
-        for table in ("agent_runs", "conversation_turns", "agent_threads"):
-            conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
-        for table in (AgentThread, ConversationTurn, AgentRun):
-            table.__table__.create(conn, checkfirst=True)
+        # Drop all metadata-tracked tables in dependency order. The
+        # cascade catches anything left from a prior aborted run.
+        Base.metadata.drop_all(conn)
+        Base.metadata.create_all(conn)
     yield eng
     with eng.begin() as conn:
-        for table in ("agent_runs", "conversation_turns", "agent_threads"):
-            conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+        Base.metadata.drop_all(conn)
     eng.dispose()
 
 
@@ -146,12 +147,22 @@ def session_factory(engine):
 
 
 def _seed_thread(session, *, thread_id: str, tenant_id: str = "t1") -> AgentThread:
+    """Seed AgentThread + its FK targets (Tenant, Workspace) on demand.
+    Postgres has FK enforcement on, so we must create the parent rows
+    before AgentThread (Codex Sub-A9 R2 MAJOR #2)."""
+    if session.get(Tenant, tenant_id) is None:
+        session.add(Tenant(id=tenant_id, name="test_tenant"))
+        session.flush()
+    workspace_id = f"ws_{tenant_id}"
+    if session.get(Workspace, workspace_id) is None:
+        session.add(Workspace(id=workspace_id, tenant_id=tenant_id, name="ws"))
+        session.flush()
     th = AgentThread(
         id=thread_id,
         tenant_id=tenant_id,
-        workspace_id="ws_test",
+        workspace_id=workspace_id,
         channel_type="telegram",
-        external_chat_id="42",
+        external_chat_id=f"chat_{thread_id}",
         status="active",
     )
     session.add(th)
@@ -191,7 +202,7 @@ def test_agent_run_with_null_turn_id_allowed(session_factory):
             id="run_legacy",
             thread_id="thread_a",
             tenant_id="t1",
-            workspace_id="ws_test",
+            workspace_id="ws_t1",
             action_type="chat",
             status="pending",
             input_json="{}",
@@ -213,7 +224,7 @@ def test_agent_run_with_dangling_turn_id_rejected(session_factory):
             id="run_bad",
             thread_id="thread_a",
             tenant_id="t1",
-            workspace_id="ws_test",
+            workspace_id="ws_t1",
             action_type="chat",
             status="pending",
             input_json="{}",
@@ -244,7 +255,7 @@ def test_agent_run_crossing_threads_rejected(session_factory):
             id="run_cross",
             thread_id="thread_b",
             tenant_id="t1",
-            workspace_id="ws_test",
+            workspace_id="ws_t1",
             action_type="chat",
             status="pending",
             input_json="{}",
@@ -270,7 +281,7 @@ def test_agent_run_same_thread_turn_accepted(session_factory):
             id="run_ok",
             thread_id="thread_a",
             tenant_id="t1",
-            workspace_id="ws_test",
+            workspace_id="ws_t1",
             action_type="chat",
             status="pending",
             input_json="{}",

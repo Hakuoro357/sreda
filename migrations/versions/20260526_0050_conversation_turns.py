@@ -143,6 +143,15 @@ def upgrade() -> None:
             ["turn_id", "thread_id"],
             ["id", "thread_id"],
         )
+        # Codex Sub-A9 R2 MAJOR #1 — UNIQUE(id, turn_id) target for
+        # planner_executions composite FK below. ``id`` is already PK
+        # so this adds no real uniqueness; it exists to satisfy
+        # Postgres's FK-target requirement (composite FK must reference
+        # a unique index, not just a PK on a sub-column).
+        batch_op.create_unique_constraint(
+            "uq_agent_runs_id_turn",
+            ["id", "turn_id"],
+        )
     op.create_index(
         "ix_agent_runs_turn_id",
         "agent_runs",
@@ -151,29 +160,37 @@ def upgrade() -> None:
         sqlite_where=sa.text("turn_id IS NOT NULL"),
     )
 
-    # Codex Sub-A9 R1 MAJOR #4 — planner_executions.turn_id is now
-    # constrained to a real conversation_turns row (or NULL). A simple
-    # one-column FK is enough here (not composite) because
-    # planner_executions doesn't have its own thread_id column — the
-    # turn-thread linkage is via agent_runs (run_id → agent_runs.id,
-    # which has its own composite FK on (turn_id, thread_id)).
+    # Codex Sub-A9 R1 MAJOR #4 + R2 MAJOR #1 — planner_executions.turn_id
+    # uses a COMPOSITE FK (run_id, turn_id) → agent_runs(id, turn_id).
+    # This simultaneously enforces:
+    #   - referential integrity on turn_id (via transitive chain through
+    #     agent_runs' own composite FK to conversation_turns).
+    #   - consistency between planner_executions.turn_id and agent_runs.turn_id
+    #     for the same run_id — no more "run_A but turn_B" drift.
+    # The simple FK on planner_executions.run_id → agent_runs.id was
+    # created in migration 0049 and remains; it covers the case where
+    # turn_id is NULL (composite FK is inert with NULL columns).
     with op.batch_alter_table("planner_executions") as batch_op:
         batch_op.create_foreign_key(
-            "fk_planner_executions_turn",
-            "conversation_turns",
-            ["turn_id"],
-            ["id"],
+            "fk_planner_executions_run_turn",
+            "agent_runs",
+            ["run_id", "turn_id"],
+            ["id", "turn_id"],
         )
 
 
 def downgrade() -> None:
     with op.batch_alter_table("planner_executions") as batch_op:
         batch_op.drop_constraint(
-            "fk_planner_executions_turn",
+            "fk_planner_executions_run_turn",
             type_="foreignkey",
         )
     op.drop_index("ix_agent_runs_turn_id", table_name="agent_runs")
     with op.batch_alter_table("agent_runs") as batch_op:
+        batch_op.drop_constraint(
+            "uq_agent_runs_id_turn",
+            type_="unique",
+        )
         batch_op.drop_constraint(
             "fk_agent_runs_turn_thread",
             type_="foreignkey",

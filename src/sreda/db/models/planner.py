@@ -45,6 +45,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -72,6 +73,11 @@ class PlannerExecution(Base):
     __tablename__ = "planner_executions"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # ``run_id`` keeps its simple FK to agent_runs.id — checks even when
+    # turn_id is NULL (composite FK alone is inert with NULL columns).
+    # The composite (run_id, turn_id) FK in __table_args__ adds the
+    # *consistency* invariant on top: when both are set, they must agree
+    # with the agent_runs row's own turn_id (Codex Sub-A9 R2 MAJOR #1).
     run_id: Mapped[str] = mapped_column(
         String(64),
         ForeignKey("agent_runs.id"),
@@ -107,13 +113,18 @@ class PlannerExecution(Base):
     )
 
     # --- Stage 2: turn transition ---------------------------------------
-    # Sub-A9 Codex MAJOR #4 — once conversation_turns exists, planner_executions.turn_id
-    # is constrained to a real row in that table (or NULL for unset). A simple
-    # one-column FK to conversation_turns.id is correct because the turn↔thread
-    # binding is enforced upstream via agent_runs(turn_id, thread_id) composite FK.
+    # Codex Sub-A9 R1 MAJOR #4 + R2 MAJOR #1 — turn_id is constrained
+    # via the composite FK (run_id, turn_id) → agent_runs(id, turn_id)
+    # declared in __table_args__. That FK simultaneously:
+    #   - rejects orphan turn_id (must match some agent_runs row)
+    #   - rejects run/turn mismatch (planner_executions.turn_id MUST
+    #     equal agent_runs.turn_id for the same run_id).
+    # No separate single-column FK to conversation_turns.id is needed —
+    # agent_runs has its own composite FK to conversation_turns, so the
+    # transitive constraint chain is: planner_executions → agent_runs
+    # → conversation_turns.
     turn_id: Mapped[str | None] = mapped_column(
         String(64),
-        ForeignKey("conversation_turns.id"),
         nullable=True,
         index=True,
     )
@@ -181,6 +192,15 @@ class PlannerExecution(Base):
             "'failed','aborted','aborted_partial'"
             ")",
             name="ck_planner_executions_execution_status",
+        ),
+        # Codex Sub-A9 R2 MAJOR #1 — composite FK ensures that for any
+        # planner_executions row, ``turn_id`` matches the ``turn_id`` of
+        # the agent_runs row referenced by ``run_id``. Either both NULL,
+        # or both pointing at the same conversation_turn.
+        ForeignKeyConstraint(
+            ["run_id", "turn_id"],
+            ["agent_runs.id", "agent_runs.turn_id"],
+            name="fk_planner_executions_run_turn",
         ),
         Index(
             "ix_planner_executions_recovery",
