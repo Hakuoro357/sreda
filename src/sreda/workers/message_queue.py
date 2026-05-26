@@ -182,31 +182,32 @@ def claim_next_job(
     # NOT EXISTS conclude "no processing for thread T" and pick Y.
     # See ``plans/phase-a-review-r2.md`` for the repro logic.
     #
-    # Codex R2 MAJOR 2026-05-26 — proper fix below uses a session-wide
-    # advisory_xact_lock so claim transactions are fully serialized.
-    # SKIP LOCKED is then redundant (no concurrent claim transactions
-    # ever hold message_jobs row locks) and is removed.
+    # Codex R2 MAJOR 2026-05-26 — first attempt at proper fix used a
+    # session-wide advisory_xact_lock to serialize claim transactions
+    # and REMOVED ``FOR UPDATE SKIP LOCKED``.
+    #
+    # Codex R3 CRITICAL 2026-05-26 — removing ``FOR UPDATE`` from the
+    # inner SELECT opened a different race: the outer UPDATE only
+    # filters by ``WHERE id = X``, so if a heartbeat or mark_done
+    # commits on row X between SELECT and UPDATE, our UPDATE blindly
+    # overwrites the new state. Concretely: an extending heartbeat for
+    # an active lease could be silently undone (row reset to a fresh
+    # claim by us), or worse, a ``done`` row could be resurrected to
+    # ``processing``. See ``plans/phase-a-review-r3.md``.
+    #
+    # Final fix: advisory_xact_lock for claim/claim serialization PLUS
+    # ``FOR UPDATE`` on the inner SELECT so the candidate row is
+    # row-locked from the moment we identify it until the transaction
+    # commits. Heartbeat / mark_done from other transactions will
+    # block on that row lock; once we commit, their conditional
+    # WHERE clauses (worker_id + attempt) will no-op because we
+    # incremented ``attempt`` — clean fencing. We deliberately do NOT
+    # use ``SKIP LOCKED`` here: with advisory lock holding off other
+    # claim transactions, the only row contention possible is against
+    # heartbeat/mark_done on a single row, which is fast (<10ms) and
+    # waiting is the correct semantic (after their commit, the row's
+    # new state will exclude it from being claimed anyway).
     if dialect == "postgresql":
-        # Codex R2 MAJOR 2026-05-26 — true FIFO under concurrent workers.
-        #
-        # Even with UPDATE … RETURNING + FOR UPDATE SKIP LOCKED, two
-        # workers can race on same-thread FIFO:
-        #   t1: Worker A locks job X (older). A's UPDATE not yet committed.
-        #   t2: Worker B's subquery skips locked X, evaluates job Y (later).
-        #       NOT EXISTS doesn't see A's uncommitted ``processing`` row
-        #       for that thread, so Y looks claimable → B grabs Y.
-        #   Result: Y processed before X within the same thread (FIFO violation).
-        #
-        # Fix: take a session-wide advisory lock for the duration of the
-        # claim transaction. Claims are <10ms each so even at 100 workers
-        # the contention window is tiny — the queue throughput we care
-        # about is bounded by dispatch time (5-90s per turn) not claim
-        # time. The lock key is a constant (one global lock for all
-        # claim ops); finer-grained per-thread locking would require
-        # knowing thread_id before SELECT, which we don't.
-        #
-        # The advisory_xact_lock auto-releases at commit/rollback, so
-        # no manual cleanup is needed.
         session.execute(
             text("SELECT pg_advisory_xact_lock(hashtext('message_jobs_claim'))")
         )
@@ -230,6 +231,7 @@ def claim_next_job(
                   )
                 ORDER BY j.enqueued_at
                 LIMIT 1
+                FOR UPDATE OF j
             )
             RETURNING id
         """
