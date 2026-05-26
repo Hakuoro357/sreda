@@ -62,7 +62,17 @@ import pymorphy3
 # Codex Sub-A10 R1 MAJOR #6 — monotonic version that bumps whenever
 # normalize_for_dedup output for known inputs changes. Surfaced in
 # logs / debug output so cross-version retries can be detected.
-NORMALIZATION_VERSION = 1
+#
+# Change log:
+#   v1 — initial release (Sub-A10).
+#   v2 — Codex R4 fix: post-lemma ``ё → е`` fold added because
+#        pymorphy3 dictionary v2.x sometimes returns lemma with ``ё``
+#        ("елка" → "ёлка"), so the pre-lemma fold alone wasn't enough.
+#        Sub-A10 has no migrated production data yet (feature branch),
+#        so this bump is a free correction; once the branch lands and
+#        rows accumulate, any further normalization changes need a
+#        v3 bump + considered rollout per the docstring above.
+NORMALIZATION_VERSION = 2
 
 # Codex Sub-A10 R1 MAJOR #7 — boundary punctuation to strip. We keep
 # internal punctuation (so "M&M's" stays "m&m's", different from
