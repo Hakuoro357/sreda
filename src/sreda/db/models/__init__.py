@@ -31,6 +31,7 @@ from sreda.db.models.housewife_food import (
 from sreda.db.models.inbound_event import InboundEvent
 from sreda.db.models.memory import AssistantMemory
 from sreda.db.models.message_jobs import MessageJob
+from sreda.db.models.planner import PlannerExecution, PlannerGap
 from sreda.db.models.poller_state import PollerHeartbeat, PollerOffset
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.db.models.runtime_config import RuntimeConfig
@@ -72,6 +73,8 @@ __all__ = [
     "MenuPlan",
     "MenuPlanItem",
     "MessageJob",
+    "PlannerExecution",
+    "PlannerGap",
     "Recipe",
     "RecipeIngredient",
     "RuntimeConfig",
