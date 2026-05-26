@@ -125,6 +125,16 @@ def _compute_payload_hash(payload: dict | None) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _effective_hash(stored_hash: str | None, payload: dict | None) -> str:
+    """Codex R3 MAJOR #2 — return the row's stored hash if present,
+    otherwise recompute from payload. Closes the loophole where
+    legacy/partial-data rows with ``payload_hash IS NULL`` would
+    silently bypass conflict detection."""
+    if stored_hash:
+        return stored_hash
+    return _compute_payload_hash(payload)
+
+
 def emit_event(
     session: Session,
     *,
@@ -183,19 +193,15 @@ def emit_event(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        # Codex R1 MAJOR #5 — detect "same op_id, different payload"
-        # double-write. Indicates a bug somewhere (planner replay with
-        # different inputs, or operation_id collision). Log a warning
-        # but return the existing row — we deliberately don't raise
-        # because the caller's mutation might still be valid; the
-        # warning surfaces in monitoring.
-        if existing.payload_hash and new_hash and existing.payload_hash != new_hash:
-            # Codex R2 MAJOR #3 — hard fail instead of silent log so
-            # the bug surfaces immediately. Callers who know the
-            # conflict is benign (rare) catch and downgrade.
+        # Codex R3 MAJOR #2 — use effective hash so legacy rows with
+        # payload_hash IS NULL still participate in conflict detection
+        # (recomputed from existing.payload at compare time). Closes
+        # the silent-collapse loophole flagged in R2/R3.
+        existing_effective = _effective_hash(existing.payload_hash, existing.payload)
+        if existing_effective and new_hash and existing_effective != new_hash:
             raise PayloadHashConflict(
                 operation_id=operation_id,
-                existing_hash=existing.payload_hash,
+                existing_hash=existing_effective,
                 new_hash=new_hash,
                 location="outbox",
             )
@@ -207,10 +213,13 @@ def emit_event(
         )
     ).scalar_one_or_none()
     if feed_exists is not None:
-        if feed_exists.payload_hash and new_hash and feed_exists.payload_hash != new_hash:
+        feed_effective = _effective_hash(
+            feed_exists.payload_hash, feed_exists.payload
+        )
+        if feed_effective and new_hash and feed_effective != new_hash:
             raise PayloadHashConflict(
                 operation_id=operation_id,
-                existing_hash=feed_exists.payload_hash,
+                existing_hash=feed_effective,
                 new_hash=new_hash,
                 location="feed",
             )
@@ -237,15 +246,16 @@ def emit_event(
     # test-fixture's outer transaction; SQLAlchemy 2.x nested-txn
     # semantics depend on `join_transaction_mode`).
     #
-    # Recommended caller pattern when audit failures should be
-    # isolated from the parent action:
+    # Recommended caller pattern (Codex R3 MINOR — catch OUTSIDE
+    # the begin_nested block so the context manager rolls the
+    # savepoint back before the except runs):
     #
-    #     with session.begin_nested():
-    #         try:
+    #     try:
+    #         with session.begin_nested():
     #             emit_event(session, ...)
-    #         except IntegrityError:
-    #             # Concurrent write won; savepoint rolls back.
-    #             pass
+    #     except IntegrityError:
+    #         # Concurrent write won; savepoint already rolled back.
+    #         pass
     #
     # On Postgres a raw IntegrityError without savepoint will poison
     # the transaction — the caller's commit() will fail. That's
@@ -346,13 +356,28 @@ def relay_outbox(
     ``user_data_change_feed``. Returns count of rows relayed
     successfully.
 
-    Idempotent on retry — ``UNIQUE (operation_id)`` on both tables
-    plus ``ON CONFLICT DO NOTHING`` on the feed-insert means re-running
-    the relay over the same outbox row is a no-op.
+    Idempotent on retry — pre-check by op_id avoids the common
+    redo path; the UNIQUE constraint on feed.operation_id is the
+    safety net for concurrent relays.
 
-    Failures (e.g. transient DB issue) increment ``attempts`` and
-    bump ``last_attempt_at`` on the affected row; the relay leaves
-    the row in outbox for the next tick.
+    Race semantics (Codex Sub-A11 R3 MAJOR #1): if a concurrent
+    relay inserts the same op_id between our pre-check and our
+    INSERT, the IntegrityError propagates out so the caller's
+    SAVEPOINT can roll back. The outbox row stays intact; the
+    next tick's pre-check sees the feed row and DELETEs it
+    cleanly. Caller pattern:
+
+        try:
+            with session.begin_nested():
+                relay_outbox(session, batch_size=100)
+        except IntegrityError:
+            # transient race; next tick will retry
+            pass
+
+    Transient non-IntegrityError failures (e.g. DB connection
+    blip during feed INSERT) increment ``attempts`` and bump
+    ``last_attempt_at`` on the affected row; the relay leaves the
+    row in outbox for the next tick.
     """
     when = now or _utcnow()
     batch = session.execute(
@@ -372,21 +397,23 @@ def relay_outbox(
         ).scalar_one_or_none()
 
         if feed_existing is not None:
-            # Codex R2 MAJOR #3 — compare payload_hash before dropping
-            # the outbox row. If the feed-side hash differs we'd be
-            # silently losing evidence of a conflict. Leave the row
-            # with last_error set so the conflict surfaces in
-            # monitoring; downstream alerting picks it up.
-            if (
-                feed_existing.payload_hash
-                and outbox_event.payload_hash
-                and feed_existing.payload_hash != outbox_event.payload_hash
-            ):
+            # Codex R2 MAJOR #3 + R3 MAJOR #2 — compare effective
+            # hashes (stored OR recomputed) so NULL hashes don't
+            # bypass conflict detection. If they differ, leave the
+            # outbox row with last_error so the conflict surfaces in
+            # monitoring.
+            feed_hash = _effective_hash(
+                feed_existing.payload_hash, feed_existing.payload
+            )
+            outbox_hash = _effective_hash(
+                outbox_event.payload_hash, outbox_event.payload
+            )
+            if feed_hash and outbox_hash and feed_hash != outbox_hash:
                 outbox_event.attempts += 1
                 outbox_event.last_attempt_at = when
                 outbox_event.last_error = (
-                    f"payload_hash mismatch: feed={feed_existing.payload_hash!r} "
-                    f"outbox={outbox_event.payload_hash!r}"
+                    f"payload_hash mismatch: feed={feed_hash!r} "
+                    f"outbox={outbox_hash!r}"
                 )
                 session.flush()
                 _logger.error(
@@ -427,20 +454,22 @@ def relay_outbox(
             session.delete(outbox_event)
             session.flush()
             relayed += 1
-        except IntegrityError as exc:
-            # Race: another worker just relayed this op_id between
-            # our pre-check and our INSERT. The session is now in
-            # a poisoned state on Postgres — we stop processing
-            # the batch and let the caller's tick handle cleanup.
-            # The outbox row stays; next tick's pre-check sees the
-            # feed row and DELETEs it cleanly.
+        except IntegrityError:
+            # Codex R3 MAJOR #1 — propagate so the caller's
+            # SAVEPOINT can roll back and they decide whether to
+            # retry the batch in a new transaction. Swallowing and
+            # returning would leave the session poisoned silently
+            # — caller's commit() would fail later with a confusing
+            # error far from the root cause. The outbox row stays
+            # intact (savepoint rollback restores it); the next
+            # tick's pre-check sees the feed row and DELETEs it
+            # cleanly.
             _logger.warning(
                 "relay_outbox: race on op_id=%s (concurrent relay?); "
-                "stopping batch. exc=%r",
+                "raising for caller's savepoint to handle.",
                 outbox_event.operation_id,
-                exc,
             )
-            break
+            raise
         except Exception as exc:  # noqa: BLE001
             _logger.exception(
                 "relay_outbox: failed to move op_id=%s; will retry next tick",

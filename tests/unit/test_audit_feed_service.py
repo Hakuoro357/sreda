@@ -153,6 +153,45 @@ def test_emit_event_hash_mismatch_raises(db_session: Session) -> None:
     assert excinfo.value.location == "outbox"
 
 
+def test_emit_event_hash_mismatch_with_null_stored_hash(
+    db_session: Session,
+) -> None:
+    """Codex R3 MAJOR #2 — when the existing row's stored payload_hash
+    is NULL (legacy/partial-data path), conflict detection must
+    recompute the hash from the stored payload and still surface
+    the mismatch. Without this, NULL-hash rows would silently
+    swallow different-payload retries."""
+    # Insert an outbox row directly with payload_hash=NULL.
+    db_session.add(
+        AuditOutboxEvent(
+            operation_id="op_null_hash",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload={"v": 1},
+            payload_hash=None,  # legacy state
+            occurred_at=_now(),
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(PayloadHashConflict):
+        emit_event(
+            db_session,
+            operation_id="op_null_hash",
+            tenant_id="t1",
+            user_id="u1",
+            source="среда",
+            entity_type="shopping_list_item",
+            entity_id="sh_1",
+            action="created",
+            payload={"v": 2},  # different — must conflict
+        )
+
+
 def test_emit_event_hash_mismatch_feed_side_raises(db_session: Session) -> None:
     """Same conflict, but the prior write is already in the feed
     (not outbox). Still raises with location='feed'."""
