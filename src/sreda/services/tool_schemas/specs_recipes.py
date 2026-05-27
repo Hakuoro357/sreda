@@ -3,10 +3,12 @@
 5 tools migrated: ``save_recipe``, ``save_recipes_batch``,
 ``search_recipes``, ``get_recipe``, ``delete_recipe``.
 
-``get_recipe_any_source`` is listed in TOOL_FAMILY_MANIFEST as a
-future tool (architecture map TODO-2) but the runtime function does
-not exist yet — it ships in a later sub-issue. The manifest cross-
-check test for this family explicitly excludes it.
+``get_recipe_any_source`` is a future TODO-2 tool (architecture
+map). Codex Sub-A4 recipes R1 MAJOR #6 removed it from
+``TOOL_FAMILY_MANIFEST`` until the runtime function ships — the
+recipes manifest cross-check is exact now (no test exclusion).
+Restore the manifest entry + ToolSpec in the same commit that adds
+the runtime function.
 
 Sources of truth:
 - Tool signatures: ``services/housewife_chat_tools.py:921`` (save),
@@ -262,8 +264,10 @@ class SaveRecipesBatchInput(BaseModel):
         BATCH_CHAR_BUDGET = 200_000
         if total_chars > BATCH_CHAR_BUDGET:
             raise ValueError(
-                f"batch aggregate size {total_chars} chars exceeds "
-                f"{BATCH_CHAR_BUDGET} char budget. Chunk into smaller "
+                f"batch aggregate size {total_chars} Python str chars "
+                f"exceeds {BATCH_CHAR_BUDGET} char budget. NOTE: budget "
+                f"is in characters, not UTF-8 bytes — Cyrillic doubles "
+                f"per char on serialization. Chunk into smaller "
                 f"batches (e.g. 10-20 recipes per call) — the LLM "
                 f"tool-call has a payload ceiling."
             )
@@ -332,11 +336,11 @@ SAVE_RECIPES_BATCH_SPEC = ToolSpec(
     name="save_recipes_batch",
     description=(
         "Сохранить НЕСКОЛЬКО рецептов одним вызовом (до 50 рецептов, "
-        "до ~200KB суммарно). Используй когда юзер просит «запиши N "
-        "рецептов», или когда после планирования меню (группа МЕНЮ) "
-        "свободные блюда стоит превратить в структурированные рецепты. "
-        "Дедупликация per-title; дубликаты внутри одного батча "
-        "отвергаются на схеме."
+        "до ~200k символов суммарно). Используй когда юзер просит "
+        "«запиши N рецептов», или когда после планирования меню "
+        "(группа МЕНЮ) свободные блюда стоит превратить в "
+        "структурированные рецепты. Дедупликация per-title; дубликаты "
+        "внутри одного батча отвергаются на схеме."
     ),
     family="recipes",
     effect="write",
@@ -353,7 +357,7 @@ SAVE_RECIPES_BATCH_SPEC = ToolSpec(
     mutex_notes=[
         "Используй ТОЛЬКО для нескольких рецептов. Для одного — save_recipe.",
         "Перед батч-сохранением полезно search_recipes('') чтобы увидеть что уже в книге и не плодить дубли.",
-        "При >50 рецептах или >200KB суммарного payload — чанкуй на несколько вызовов; иначе схема отвергнет батч до отправки в runtime.",
+        "При >50 рецептах или >200k символов суммарно — чанкуй на несколько вызовов; иначе схема отвергнет батч до отправки в runtime. Контракт — на символах (Python str length), не на байтах payload'а.",
     ],
     timeout_seconds=30,
     side_effect_class="transactional_write",
@@ -457,10 +461,10 @@ RECIPES_SPECS: list[ToolSpec] = [
     GET_RECIPE_SPEC,
     DELETE_RECIPE_SPEC,
 ]
-"""5 migrated recipe specs. ``get_recipe_any_source`` from
-TOOL_FAMILY_MANIFEST is intentionally absent — runtime function not
-yet implemented (architecture map TODO-2). Add to this list when the
-function ships."""
+"""5 migrated recipe specs. ``get_recipe_any_source`` (architecture
+map TODO-2) is intentionally absent from BOTH this list AND
+``TOOL_FAMILY_MANIFEST`` — runtime function not yet implemented.
+Add to both surfaces in the commit that ships the runtime."""
 
 
 __all__ = [

@@ -5,8 +5,9 @@ Mirrors the shopping + reminders patterns (both R7=NSC). Coverage:
 - All 5 RECIPES_SPECS construct without ValidationError
 - assert_production_registry_quality passes strict policy
 - Manifest cross-check: recipes-family entries in TOOL_FAMILY_MANIFEST
-  match the migrated specs (excluding get_recipe_any_source which
-  ships in a later sub-issue)
+  match the migrated specs exactly (Codex R1 MAJOR #6 removed
+  ``get_recipe_any_source`` from both the manifest and this list
+  until the runtime function ships)
 - Per-tool: input_model rejects extra keys, parsers produce
   output_model on canonical "ok:..." strings
 - Tight RecipeId aliases
