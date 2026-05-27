@@ -97,6 +97,7 @@ ListOfDict = Annotated[
 
 from sreda.services.housewife_onboarding import (
     TOPIC_DESCRIPTIONS,
+    TOPIC_ORDER,
     HousewifeOnboardingService,
 )
 from sreda.services.housewife_family import HousewifeFamilyService
@@ -586,6 +587,13 @@ def build_housewife_tools(
         topic_norm = (topic or "").strip().lower()
         if topic_norm not in TOPIC_DESCRIPTIONS:
             return f"error: unknown topic {topic!r}"
+        # Codex Sub-A4 onboarding R5 MAJOR (HIGH catch): TOPIC_DESCRIPTIONS
+        # keeps all 6 legacy topics for backward compat, but TOPIC_ORDER
+        # (the ACTIVE flow) is just `addressing` since 2026-04-27. Reject
+        # inactive topics here so legacy callers can't persist hidden
+        # rows in skill_params_json that no progression engine counts.
+        if topic_norm not in TOPIC_ORDER:
+            return f"error: topic_not_in_active_flow {topic!r}"
         if not user_id:
             return "error: no user_id context"
         text = (summary or "").strip()
@@ -630,6 +638,11 @@ def build_housewife_tools(
         topic_norm = (topic or "").strip().lower()
         if topic_norm not in TOPIC_DESCRIPTIONS:
             return f"error: unknown topic {topic!r}"
+        # Codex Sub-A4 onboarding R5 MAJOR (HIGH catch): see same
+        # guard in onboarding_answered above. Reject inactive topics
+        # so legacy callers can't write hidden rows.
+        if topic_norm not in TOPIC_ORDER:
+            return f"error: topic_not_in_active_flow {topic!r}"
         if not user_id:
             return "error: no user_id context"
         try:

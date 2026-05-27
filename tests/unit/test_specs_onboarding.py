@@ -204,6 +204,27 @@ def test_answered_parser_error_empty_summary() -> None:
     assert parsed.error_code == "empty_summary"
 
 
+def test_answered_parser_topic_not_in_active_flow() -> None:
+    """Codex Sub-A4 onboarding R5 MAJOR (HIGH catch): runtime
+    rejects inactive topics with `error: topic_not_in_active_flow 'X'`.
+    Stable error code for planner branching."""
+    parsed = parse_tool_output(
+        "onboarding_answered",
+        "error: topic_not_in_active_flow 'family'",
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "topic_not_in_active_flow"
+
+
+def test_deferred_parser_topic_not_in_active_flow() -> None:
+    parsed = parse_tool_output(
+        "onboarding_deferred",
+        "error: topic_not_in_active_flow 'diet'",
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "topic_not_in_active_flow"
+
+
 @pytest.mark.parametrize("ts", [
     "pending", "answered", "skipped_once", "skipped",
 ])

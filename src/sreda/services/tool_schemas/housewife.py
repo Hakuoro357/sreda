@@ -126,6 +126,13 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"^item_not_found:.+", re.IGNORECASE),
         "checklist_item_not_found",
     ),
+    # onboarding family — Codex R5 MAJOR (HIGH catch): runtime rejects
+    # non-active topics via `error: topic_not_in_active_flow 'X'`.
+    # Source: ``housewife_chat_tools.py`` onboarding_answered/deferred.
+    (
+        re.compile(r"^topic_not_in_active_flow .+$", re.IGNORECASE),
+        "topic_not_in_active_flow",
+    ),
     # link_task_to_checklist conflict shapes (Codex Sub-A4 tasks R1 MAJOR #5).
     # Source: ``housewife_chat_tools.py:2239-2247``.
     #   "error: task_already_linked:task_X:checklist_Y. Unlink сначала..."
