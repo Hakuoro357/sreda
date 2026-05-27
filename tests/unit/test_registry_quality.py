@@ -551,6 +551,61 @@ def test_null_byte_in_mutex_note_rejected() -> None:
     assert "control char" in msg or "single-line" in msg
 
 
+# ---------------------------------------------------------------------------
+# Codex R7 close-out — effect/write_domains coherence + \x00 in description
+# ---------------------------------------------------------------------------
+
+
+def test_read_effect_with_write_domains_rejected() -> None:
+    """``effect='read'`` with non-empty ``write_domains`` is a
+    contradictory scheduler contract — caught at construction."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(
+            effect="read",
+            read_domains=["shopping"],
+            write_domains=["shopping"],  # contradicts effect=read
+        )
+    msg = str(exc.value).lower()
+    assert "contradictory" in msg or "effect='read'" in msg or "read tools must" in msg
+
+
+def test_read_effect_with_empty_write_domains_ok() -> None:
+    spec = _make_spec(
+        effect="read",
+        read_domains=["shopping"],
+        write_domains=[],
+    )
+    assert spec.effect == "read"
+    assert spec.write_domains == []
+
+
+def test_null_byte_in_description_rejected() -> None:
+    """R7 close-out: description joins trigger_examples/mutex_notes/
+    domains in the unified control-char block list."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(
+            description="Добавить про\x00дукты в список покупок. Используй для запросов «купи X»."
+        )
+    msg = str(exc.value).lower()
+    assert "control char" in msg or "single-line" in msg
+
+
+def test_bypass_read_effect_with_write_domains_caught_by_linter() -> None:
+    """Reconstruct catches the contradictory contract via model_validate."""
+    from sreda.services.tool_schemas.registry_quality import (
+        assert_production_registry_quality,
+    )
+    clean = _make_spec()
+    poisoned = clean.model_copy(update={
+        "effect": "read",
+        # write_domains still set — bypass via model_copy.
+    })
+    with pytest.raises(InvalidRegistryError):
+        assert_production_registry_quality([poisoned])
+
+
 def test_policy_bounds_are_reasonable() -> None:
     assert TRIGGER_EXAMPLES_MIN == 3
     assert TRIGGER_EXAMPLES_MAX == 10

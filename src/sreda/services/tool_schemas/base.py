@@ -180,6 +180,15 @@ ambiguity. Matches every entry in ``TOOL_FAMILY_MANIFEST``.
 """
 
 
+_CONTROL_CHARS = "\n\r\t\x00"
+"""Control chars rejected in every prompt-rendered ToolSpec text
+field: description, trigger_examples, mutex_notes, domain values.
+Codex R7 close-out — single source of truth (was split between
+locations in R5/R6, leading to inconsistent ``description``/``\\x00``
+handling).
+"""
+
+
 class ToolOutput(BaseModel):
     """Base for tool output schemas.
 
@@ -358,21 +367,21 @@ class ToolSpec(BaseModel):
             raise ValueError(
                 f"Tool '{self.name}' description must be non-empty (post-strip)."
             )
-        if "\n" in self.description or "\r" in self.description or "\t" in self.description:
+        if any(c in self.description for c in _CONTROL_CHARS):
             raise ValueError(
-                f"Tool '{self.name}' description contains newline/tab "
-                f"— must be single-line text (renderer puts it in the "
-                f"planner prompt). Multi-line content breaks formatting."
+                f"Tool '{self.name}' description contains control char "
+                f"(\\n/\\r/\\t/\\x00) — must be single-line text "
+                f"(renderer puts it in the planner prompt)."
             )
         if self.description != self.description.strip():
             raise ValueError(
                 f"Tool '{self.name}' description has leading/trailing "
                 f"whitespace — strip before constructing (Codex R2 MINOR #6)."
             )
-        # Codex R6 MINOR: unified control-char block — \n/\r/\t/\x00
-        # across all prompt-rendered text fields (was previously
-        # inconsistent: \x00 blocked only on domains).
-        _CONTROL_CHARS = "\n\r\t\x00"
+        # Codex R6 MINOR + R7 close-out: unified control-char block
+        # `_CONTROL_CHARS` is module-scope (single source of truth) and
+        # applied to description, trigger_examples, mutex_notes, and
+        # every domain value.
         if self.trigger_examples:
             for example in self.trigger_examples:
                 if not example.strip():
@@ -459,7 +468,7 @@ class ToolSpec(BaseModel):
                         f"has leading/trailing whitespace — strip before "
                         f"adding (silent scheduler-isolation bug otherwise)."
                     )
-                if any(c in dom for c in "\n\r\t\x00"):
+                if any(c in dom for c in _CONTROL_CHARS):
                     raise ValueError(
                         f"Tool '{self.name}' {kind}[{idx}]={dom!r} "
                         f"contains control chars (\\n/\\r/\\t/\\x00) — "
@@ -474,6 +483,19 @@ class ToolSpec(BaseModel):
                         f"tool with `write_domains=['shoping']` would "
                         f"look isolated from the real `shopping` domain."
                     )
+        # Codex R7 close-out MAJOR: effect / write_domains coherence —
+        # both directions enforced. `effect='read'` with a non-empty
+        # `write_domains` is a contradictory contract — scheduler
+        # conflict detection would key off `effect` (serialize as read)
+        # or `write_domains` (serialize as write) and either choice
+        # picks one side of an impossibility.
+        if self.effect == "read" and self.write_domains:
+            raise ValueError(
+                f"Tool '{self.name}' has effect='read' but "
+                f"write_domains={self.write_domains!r}. Read tools must "
+                f"have empty write_domains — a non-empty list creates a "
+                f"contradictory scheduler contract."
+            )
         if self.effect == "write" and not self.write_domains:
             raise ValueError(
                 f"Tool '{self.name}' has effect='write' but write_domains "
