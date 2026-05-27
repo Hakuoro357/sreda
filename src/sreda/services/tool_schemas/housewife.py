@@ -33,12 +33,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.common import (
+    ChecklistId,
     FamilyMemberId,
     MenuItemId,
     MenuPlanId,
     RecipeId,
     ReminderId,
     ShoppingItemId,
+    TaskId,
     TriggerIso,
 )
 
@@ -1736,6 +1738,574 @@ def parse_remove_family_member(
 
 
 # ---------------------------------------------------------------------------
+# 26-36. Tasks family (Sub-A4 phase 6) — 11 tools:
+#         add_task / list_tasks / update_task /
+#         complete_task / uncomplete_task / cancel_task / delete_task /
+#         attach_reminder / detach_reminder /
+#         link_task_to_checklist / unlink_task
+#
+# Runtime shapes (see housewife_chat_tools.py:1789-2287):
+#
+#   add_task:
+#     "ok:created:{task_id}"
+#     "ok:created:{task_id}:reminder=за Nмин"
+#     "ok:created:{task_id}:checklist={checklist_id}"
+#     "error: reminder requires scheduled_date + time_start; ..."
+#     "error: reminder_offset_minutes не поддерживается вместе с details_items. ..."
+#     "error:<ValueError>"
+#     "error: internal"
+#
+#   list_tasks: "no tasks" OR multi-line "_fmt_task_for_llm" dump
+#
+#   update_task: "ok:updated:{task_id}" OR "error: task '...' not found"
+#
+#   complete/uncomplete/cancel: "ok:{status}:{task_id}" OR not_found
+#   delete_task: "ok:deleted" OR not_found
+#
+#   attach_reminder:
+#     "ok:reminder_attached:{reminder_id}:за Nмин"
+#     "error: offset_minutes must be a positive integer"
+#     "error:<ValueError>"  (no schedule, etc.)
+#     "error: task '...' not found"
+#
+#   detach_reminder: "ok:reminder_detached" OR not_found
+#
+#   link_task_to_checklist:
+#     "ok:linked:{task_id}:{checklist_id}"
+#     "ok:already_linked:{task_id}:{checklist_id}"
+#     "error: task_already_linked:{task_id}:{other_checklist_id}. ..."
+#     "error: checklist_already_linked_to_task_{other_task_id}. ..."
+#     "error: not found" / "error: archived" / "error: internal"
+#
+#   unlink_task:
+#     "ok:unlinked:{task_id}:{checklist_id}"
+#     "ok:not_linked:{task_id}"
+#     "error: task '...' not found"
+# ---------------------------------------------------------------------------
+
+
+# 26. add_task
+class AddTaskCreated(BaseModel):
+    """Plain happy path — no reminder, no checklist (legacy code path)."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["created"] = "created"
+    task_id: TaskId
+
+
+class AddTaskCreatedWithReminder(BaseModel):
+    """Happy path with auto-attached reminder. ``reminder_offset_minutes``
+    is the integer the planner supplied — runtime echoes it back in the
+    «за Nмин» segment which the parser extracts."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["created_with_reminder"] = "created_with_reminder"
+    task_id: TaskId
+    reminder_offset_minutes: int = Field(ge=1)
+
+
+class AddTaskCreatedWithChecklist(BaseModel):
+    """R-33 details_items composite path — fresh Checklist created in
+    same transaction. ``checklist_id`` is the new checklist's id so
+    the planner can reference it in subsequent calls."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["created_with_checklist"] = "created_with_checklist"
+    task_id: TaskId
+    checklist_id: ChecklistId
+
+
+AddTaskOutput = Annotated[
+    Union[
+        AddTaskCreated,
+        AddTaskCreatedWithReminder,
+        AddTaskCreatedWithChecklist,
+        HousewifeToolError,
+    ],
+    Field(discriminator="status"),
+]
+
+
+_ADD_TASK_RE = re.compile(
+    r"^ok:created:(?P<task_id>task_[0-9a-f]{24})"
+    r"(?::reminder=за\s+(?P<rmins>\d+)мин"
+    r"|:checklist=(?P<chk>checklist_[0-9a-f]{24}))?$"
+)
+
+
+def parse_add_task(
+    raw: str,
+) -> (
+    AddTaskCreated
+    | AddTaskCreatedWithReminder
+    | AddTaskCreatedWithChecklist
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _ADD_TASK_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="add_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        task_id = m.group("task_id")
+        rmins = m.group("rmins")
+        chk = m.group("chk")
+        if rmins is not None:
+            return AddTaskCreatedWithReminder(
+                task_id=task_id, reminder_offset_minutes=int(rmins),
+            )
+        if chk is not None:
+            return AddTaskCreatedWithChecklist(task_id=task_id, checklist_id=chk)
+        return AddTaskCreated(task_id=task_id)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="add_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 27. list_tasks
+class ListTasksEmpty(BaseModel):
+    """Empty path: «no tasks» — planner branches to «нет задач на этот
+    день» / «inbox пустой»."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["empty"] = "empty"
+
+
+class ListTasksOk(BaseModel):
+    """Populated dump. MVP boundary — runtime ``_fmt_task_for_llm``
+    produces human-readable multi-line text; planner consumes raw_text
+    and summarises. Structured rows are a follow-up (same MVP boundary
+    as ListMenuOk pre-promotion). Tasks have wider field-set than
+    family members so structuring is more work; defer."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["ok"] = "ok"
+    raw_text: str = Field(min_length=1)
+
+
+ListTasksOutput = Annotated[
+    Union[ListTasksOk, ListTasksEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_list_tasks(
+    raw: str,
+) -> ListTasksOk | ListTasksEmpty | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "no tasks":
+        return ListTasksEmpty()
+    if stripped:
+        # _fmt_task_for_llm always emits at least one non-empty line
+        # per task. We trust the dump but reject if it accidentally
+        # equals one of the «ok:…» status tokens (which would only
+        # happen on runtime drift).
+        if stripped.startswith("ok:") or stripped.startswith("error:"):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_tasks",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return ListTasksOk(raw_text=stripped)
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="list_tasks",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# 28. update_task
+class UpdateTaskOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["updated"] = "updated"
+    task_id: TaskId
+
+
+UpdateTaskOutput = Annotated[
+    Union[UpdateTaskOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_UPDATE_TASK_RE = re.compile(r"^ok:updated:(?P<task_id>task_[0-9a-f]{24})$")
+
+
+def parse_update_task(
+    raw: str,
+) -> UpdateTaskOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _UPDATE_TASK_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="update_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return UpdateTaskOk(task_id=m.group("task_id"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="update_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 29-32. complete_task / uncomplete_task / cancel_task / delete_task
+#       All share ``ok:<verb>:{task_id}`` shape EXCEPT delete which
+#       emits just ``ok:deleted`` without an id (delete returns bool).
+
+
+class CompleteTaskOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["completed"] = "completed"
+    task_id: TaskId
+
+
+CompleteTaskOutput = Annotated[
+    Union[CompleteTaskOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_COMPLETE_TASK_RE = re.compile(r"^ok:completed:(?P<task_id>task_[0-9a-f]{24})$")
+
+
+def parse_complete_task(
+    raw: str,
+) -> CompleteTaskOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _COMPLETE_TASK_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="complete_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return CompleteTaskOk(task_id=m.group("task_id"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="complete_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class UncompleteTaskOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["uncompleted"] = "uncompleted"
+    task_id: TaskId
+
+
+UncompleteTaskOutput = Annotated[
+    Union[UncompleteTaskOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_UNCOMPLETE_TASK_RE = re.compile(r"^ok:uncompleted:(?P<task_id>task_[0-9a-f]{24})$")
+
+
+def parse_uncomplete_task(
+    raw: str,
+) -> UncompleteTaskOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _UNCOMPLETE_TASK_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="uncomplete_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return UncompleteTaskOk(task_id=m.group("task_id"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="uncomplete_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class CancelTaskOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["cancelled"] = "cancelled"
+    task_id: TaskId
+
+
+CancelTaskOutput = Annotated[
+    Union[CancelTaskOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_CANCEL_TASK_RE = re.compile(r"^ok:cancelled:(?P<task_id>task_[0-9a-f]{24})$")
+
+
+def parse_cancel_task(
+    raw: str,
+) -> CancelTaskOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _CANCEL_TASK_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="cancel_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return CancelTaskOk(task_id=m.group("task_id"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="cancel_task",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class DeleteTaskOk(BaseModel):
+    """Delete differs from complete/cancel/uncomplete — runtime emits
+    just ``ok:deleted`` without a task_id (the row is gone, the id no
+    longer references anything addressable). Planner branches off
+    ``status == 'deleted'`` and doesn't need the id back."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["deleted"] = "deleted"
+
+
+DeleteTaskOutput = Annotated[
+    Union[DeleteTaskOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_delete_task(
+    raw: str,
+) -> DeleteTaskOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    if raw.strip() == "ok:deleted":
+        return DeleteTaskOk()
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="delete_task",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# 33. attach_reminder
+class AttachReminderOk(BaseModel):
+    """Reminder created and linked to task. Runtime echoes the
+    reminder_id and the offset back so the planner can refer to
+    either later."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["reminder_attached"] = "reminder_attached"
+    reminder_id: ReminderId
+    offset_minutes: int = Field(ge=1)
+
+
+AttachReminderOutput = Annotated[
+    Union[AttachReminderOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_ATTACH_REMINDER_RE = re.compile(
+    r"^ok:reminder_attached:(?P<rem_id>rem_[0-9a-f]{24}):за\s+(?P<mins>\d+)мин$"
+)
+
+
+def parse_attach_reminder(
+    raw: str,
+) -> AttachReminderOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _ATTACH_REMINDER_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="attach_reminder",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return AttachReminderOk(
+            reminder_id=m.group("rem_id"),
+            offset_minutes=int(m.group("mins")),
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="attach_reminder",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 34. detach_reminder
+class DetachReminderOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["reminder_detached"] = "reminder_detached"
+
+
+DetachReminderOutput = Annotated[
+    Union[DetachReminderOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_detach_reminder(
+    raw: str,
+) -> DetachReminderOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    if raw.strip() == "ok:reminder_detached":
+        return DetachReminderOk()
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="detach_reminder",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# 35. link_task_to_checklist
+class LinkTaskToChecklistLinked(BaseModel):
+    """Newly linked task↔checklist pair."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["linked"] = "linked"
+    task_id: TaskId
+    checklist_id: ChecklistId
+
+
+class LinkTaskToChecklistAlreadyLinked(BaseModel):
+    """Idempotent re-link — same pair was already linked."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["already_linked"] = "already_linked"
+    task_id: TaskId
+    checklist_id: ChecklistId
+
+
+LinkTaskToChecklistOutput = Annotated[
+    Union[
+        LinkTaskToChecklistLinked,
+        LinkTaskToChecklistAlreadyLinked,
+        HousewifeToolError,
+    ],
+    Field(discriminator="status"),
+]
+
+
+_LINK_TASK_RE = re.compile(
+    r"^ok:(?P<status>linked|already_linked):"
+    r"(?P<task_id>task_[0-9a-f]{24}):"
+    r"(?P<checklist_id>checklist_[0-9a-f]{24})$"
+)
+
+
+def parse_link_task_to_checklist(
+    raw: str,
+) -> (
+    LinkTaskToChecklistLinked
+    | LinkTaskToChecklistAlreadyLinked
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _LINK_TASK_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="link_task_to_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        if m.group("status") == "linked":
+            return LinkTaskToChecklistLinked(
+                task_id=m.group("task_id"),
+                checklist_id=m.group("checklist_id"),
+            )
+        return LinkTaskToChecklistAlreadyLinked(
+            task_id=m.group("task_id"),
+            checklist_id=m.group("checklist_id"),
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="link_task_to_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 36. unlink_task
+class UnlinkTaskUnlinked(BaseModel):
+    """Was linked, now unlinked."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["unlinked"] = "unlinked"
+    task_id: TaskId
+    checklist_id: ChecklistId
+
+
+class UnlinkTaskNotLinked(BaseModel):
+    """Idempotent: task wasn't linked to any checklist. Planner
+    treats both states as success."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["not_linked"] = "not_linked"
+    task_id: TaskId
+
+
+UnlinkTaskOutput = Annotated[
+    Union[
+        UnlinkTaskUnlinked,
+        UnlinkTaskNotLinked,
+        HousewifeToolError,
+    ],
+    Field(discriminator="status"),
+]
+
+
+_UNLINK_TASK_UNLINKED_RE = re.compile(
+    r"^ok:unlinked:(?P<task_id>task_[0-9a-f]{24}):"
+    r"(?P<checklist_id>checklist_[0-9a-f]{24})$"
+)
+_UNLINK_TASK_NOT_LINKED_RE = re.compile(
+    r"^ok:not_linked:(?P<task_id>task_[0-9a-f]{24})$"
+)
+
+
+def parse_unlink_task(
+    raw: str,
+) -> (
+    UnlinkTaskUnlinked
+    | UnlinkTaskNotLinked
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    m_unlinked = _UNLINK_TASK_UNLINKED_RE.match(stripped)
+    if m_unlinked is not None:
+        try:
+            return UnlinkTaskUnlinked(
+                task_id=m_unlinked.group("task_id"),
+                checklist_id=m_unlinked.group("checklist_id"),
+            )
+        except ValidationError:
+            pass
+    m_not_linked = _UNLINK_TASK_NOT_LINKED_RE.match(stripped)
+    if m_not_linked is not None:
+        try:
+            return UnlinkTaskNotLinked(task_id=m_not_linked.group("task_id"))
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="unlink_task",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -1766,6 +2336,17 @@ PARSERS = {
     "list_family_members": parse_list_family_members,
     "update_family_member": parse_update_family_member,
     "remove_family_member": parse_remove_family_member,
+    "add_task": parse_add_task,
+    "list_tasks": parse_list_tasks,
+    "update_task": parse_update_task,
+    "complete_task": parse_complete_task,
+    "uncomplete_task": parse_uncomplete_task,
+    "cancel_task": parse_cancel_task,
+    "delete_task": parse_delete_task,
+    "attach_reminder": parse_attach_reminder,
+    "detach_reminder": parse_detach_reminder,
+    "link_task_to_checklist": parse_link_task_to_checklist,
+    "unlink_task": parse_unlink_task,
 }
 
 
