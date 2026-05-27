@@ -203,13 +203,21 @@ FAMILY_HEADERS: Final[Mapping[Family, FamilyHeader]] = {
             "«через час Y», «в субботу Z». Триггер — конкретный момент."
         ),
         anti_patterns=(
+            # Codex Sub-A4 reminders R3 MAJOR #1: family header is
+            # rendered into the planner prompt. Direct mentions of
+            # ``attach_reminder`` / ``update_task`` / ``detach_reminder``
+            # (from the not-yet-migrated tasks family) would steer
+            # the planner toward unavailable typed tools. Softened to
+            # family-level («группа ЗАДАЧИ») while tasks family is
+            # not migrated; restore exact tool names once the tasks
+            # specs ship.
             "Для повторяющихся дел без жёсткого времени (TODO-список) — см. группу ЗАДАЧИ.",
             "Для длинных чек-листов с шагами «собрать сумку» — см. группу ЧЕК-ЛИСТЫ.",
             "Если в просьбе ЕСТЬ конкретное время «напомни купить хлеб в 18:00» — это НАПОМИНАНИЯ (текст напоминания может включать «купи»). Если времени НЕТ — это ПОКУПКИ.",
-            "Граница с ЗАДАЧАМИ — CREATE: standalone «напомни в 18:00 X» → НАПОМИНАНИЯ.schedule_reminder. Привязать НОВОЕ напоминание к существующей задаче «напомни про задачу T-42 завтра» → ЗАДАЧИ.attach_reminder, не НАПОМИНАНИЯ.",
+            "Граница с ЗАДАЧАМИ — CREATE: standalone «напомни в 18:00 X» → НАПОМИНАНИЯ.schedule_reminder. Привязать НОВОЕ напоминание к существующей задаче «напомни про задачу T-42 завтра» → группа ЗАДАЧИ (привязка напоминания к задаче), не НАПОМИНАНИЯ.",
             "Граница с ЗАДАЧАМИ — UPDATE standalone: для напоминаний БЕЗ привязки к задаче «увеличь до 20:00», «измени текст» → НАПОМИНАНИЯ.update_reminder (берёт reminder_id из list_reminders).",
-            "Граница с ЗАДАЧАМИ — UPDATE task-linked: для напоминания, ПРИВЯЗАННОГО к задаче, время напоминания зависит от task.time_start + reminder_offset_minutes. Изменить время задачи → ЗАДАЧИ.update_task (перепланирует напоминание). Изменить только offset перед задачей → ЗАДАЧИ.attach_reminder с новым offset_minutes (перепривязка). НЕ зови update_reminder напрямую для task-linked — рискуешь рассинхроном offset'а.",
-            "Граница с ЗАДАЧАМИ — REMOVE: «убери напоминание у задачи, оставь саму задачу» → ЗАДАЧИ.detach_reminder (отвязывает И отменяет напоминание; standalone-копия НЕ создаётся). «Отмени напоминание целиком» → НАПОМИНАНИЯ.cancel_reminder. Сейчас обе операции отменяют напоминание; разница только в том, что detach_reminder ещё чистит ссылку в задаче.",
+            "Граница с ЗАДАЧАМИ — UPDATE task-linked: для напоминания, ПРИВЯЗАННОГО к задаче, время напоминания зависит от task.time_start + reminder_offset_minutes. Изменить время задачи → группа ЗАДАЧИ (перепланирует напоминание). Изменить только offset перед задачей → группа ЗАДАЧИ с новым offset_minutes (перепривязка). НЕ зови update_reminder напрямую для task-linked — рискуешь рассинхроном offset'а.",
+            "Граница с ЗАДАЧАМИ — REMOVE: «убери напоминание у задачи, оставь саму задачу» → группа ЗАДАЧИ (отвязка и отмена напоминания; standalone-копия НЕ создаётся). «Отмени напоминание целиком» → НАПОМИНАНИЯ.cancel_reminder. Сейчас обе операции отменяют напоминание; разница только в том, что отвязка ещё чистит ссылку в задаче.",
         ),
     ),
     "recipes": FamilyHeader(

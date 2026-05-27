@@ -362,6 +362,30 @@ prose. Catches ``schedule_reminder`` / ``update_shopping_item`` /
 like ``id`` / ``ok``."""
 
 
+def _iter_family_header_strings(
+    families_in_specs: set[str],
+) -> Iterable[tuple[str, str, str]]:
+    """Codex Sub-A4 reminders R3 MAJOR #1 — yield every prompt-rendered
+    string from ``FAMILY_HEADERS`` for the families present in the
+    migrated specs. Returns ``(family_name, field_path, value)``.
+
+    The family header (``FAMILY_HEADERS[family].purpose`` +
+    ``.anti_patterns``) goes into the planner prompt alongside per-tool
+    descriptions; references to unmigrated tools there steer the
+    planner just like references in mutex_notes do.
+
+    Skip families that aren't represented in the migrated specs — those
+    headers won't be rendered into the active prompt anyway."""
+    from sreda.services.tool_schemas.families import FAMILY_HEADERS
+    for family in families_in_specs:
+        header = FAMILY_HEADERS.get(family)
+        if header is None:
+            continue
+        yield (family, "family_header.purpose", header.purpose)
+        for idx, ap in enumerate(header.anti_patterns):
+            yield (family, f"family_header.anti_patterns[{idx}]", ap)
+
+
 def validate_mutex_note_references(
     specs: Iterable[ToolSpec],
     *,
@@ -407,10 +431,10 @@ def validate_mutex_note_references(
     spec_list = list(specs)
     spec_names = {s.name for s in spec_list}
     violations: list[RegistryQualityViolation] = []
-    # Dedupe key: (offending_spec_name, referenced_tool_name, field_path).
-    # Same token in the same field is a single finding; same token in
-    # different fields should fire separately so the maintainer sees
-    # every surface that needs editing.
+    # Dedupe key: (offending_spec_or_family_name, referenced_tool_name,
+    # field_path). Same token in the same field is a single finding;
+    # same token in different fields should fire separately so the
+    # maintainer sees every surface that needs editing.
     seen: set[tuple[str, str, str]] = set()
     for spec in spec_list:
         for field_name, value in _iter_prompt_rendered_strings(spec):
@@ -438,6 +462,41 @@ def validate_mutex_note_references(
                         f"level guidance without naming the unavailable tool."
                     ),
                 ))
+
+    # Codex Sub-A4 reminders R3 MAJOR #1: family headers are ALSO
+    # rendered into the planner prompt; the reminders family header
+    # itself names ``attach_reminder`` / ``update_task`` etc. Scan
+    # only the families actually represented in the migrated specs
+    # (rendering anyway happens per-spec → per-family).
+    families_in_specs = {s.family for s in spec_list if s.family is not None}
+    for family, field_name, value in _iter_family_header_strings(
+        families_in_specs
+    ):
+        for token_match in _TOOL_NAME_TOKEN_RE.finditer(value):
+            token = token_match.group(1)
+            if token not in manifest:
+                continue
+            if token in spec_names:
+                continue
+            key = (f"family:{family}", token, field_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(RegistryQualityViolation(
+                tool_name=f"family:{family}",
+                field_path=field_name,
+                code="family_header_references_unmigrated_tool",
+                message=(
+                    f"FAMILY_HEADERS[{family!r}].{field_name.split('.', 1)[1]} "
+                    f"references tool {token!r} from family "
+                    f"{manifest[token]!r} — manifest-known but not yet "
+                    f"migrated. Planner prompt prepends the family header "
+                    f"alongside per-tool descriptions; this surface needs "
+                    f"the same hygiene as mutex_notes. Either migrate the "
+                    f"referenced tool or soften the family header to "
+                    f"intent-level guidance without naming the tool."
+                ),
+            ))
     return violations
 
 

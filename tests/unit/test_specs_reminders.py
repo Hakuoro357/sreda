@@ -797,6 +797,141 @@ def test_assert_production_registry_quality_passes_with_generator_input() -> Non
 
 
 # ---------------------------------------------------------------------------
+# Codex R3 follow-up tests
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_reminder_input_rejects_iso_without_seconds() -> None:
+    """Codex R3 MINOR #3: TriggerIso regex now requires seconds —
+    ``2026-05-27T18:00Z`` (minute precision) was previously rejected
+    by min_length but matched the regex. Tightened regex requires
+    ``:SS`` so the two layers agree."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T18:00Z",
+        })
+
+
+def test_schedule_reminder_input_rejects_fractional_iso_without_seconds() -> None:
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T18:00.123Z",  # fractional but no :SS
+        })
+
+
+def test_schedule_reminder_input_accepts_fractional_seconds() -> None:
+    """Microsecond precision is valid ISO-8601 with seconds present."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T18:00:00.123456Z",
+    })
+    assert parsed.trigger_iso == "2026-05-27T18:00:00.123456Z"
+
+
+def test_schedule_reminder_input_rejects_invalid_rrule_parameter_value() -> None:
+    """Codex R3 MINOR #2: ``dateutil.rrulestr`` AfterValidator catches
+    non-numeric ``COUNT`` value that previously passed the coarse
+    parameter-chain regex."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "FREQ=DAILY;COUNT=abc",
+        })
+
+
+def test_schedule_reminder_input_rejects_invalid_byday() -> None:
+    """Codex R3 MINOR #2: ``BYDAY=XX`` not a valid weekday — caught
+    by dateutil where the regex would have accepted."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=XX",
+        })
+
+
+def test_schedule_reminder_input_accepts_compound_valid_rrule() -> None:
+    """Real-world RRULE composed of multiple parameters passes both
+    the regex AND dateutil layers."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": (
+            "FREQ=WEEKLY;BYDAY=MO,TU,WE;BYHOUR=13;BYMINUTE=0;COUNT=10"
+        ),
+    })
+    assert "BYDAY=MO,TU,WE" in parsed.recurrence_rule
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 MAJOR #1 — family header lint surface
+# ---------------------------------------------------------------------------
+
+
+def test_family_header_lint_detects_reminders_attach_reminder_reference() -> None:
+    """Synthetic check: temporarily restore a family-header anti-pattern
+    that names ``attach_reminder``; the linter must surface it."""
+    from sreda.services.tool_schemas.registry_quality import (
+        validate_mutex_note_references,
+    )
+    # Construct a synthetic spec referencing the existing reminders
+    # family header. The linter scans FAMILY_HEADERS["reminders"]
+    # because reminders is the spec's family. We test by mocking
+    # FAMILY_HEADERS temporarily — but model_copy + monkeypatch is
+    # cleaner: just patch the family header for the test scope.
+    import sreda.services.tool_schemas.families as families_mod
+    original = families_mod.FAMILY_HEADERS
+    patched = dict(original)
+    patched["reminders"] = families_mod.FamilyHeader(
+        russian_name="НАПОМИНАНИЯ",
+        purpose=original["reminders"].purpose,
+        anti_patterns=(
+            "Для повторяющихся дел — см. группу ЗАДАЧИ.",
+            "Привязать к существующей задаче → ЗАДАЧИ.attach_reminder.",
+        ),
+    )
+    families_mod.FAMILY_HEADERS = patched  # type: ignore[misc]
+    try:
+        violations = validate_mutex_note_references(
+            REMINDERS_SPECS, manifest=TOOL_FAMILY_MANIFEST
+        )
+    finally:
+        families_mod.FAMILY_HEADERS = original  # type: ignore[misc]
+
+    assert any(
+        v.code == "family_header_references_unmigrated_tool"
+        and "attach_reminder" in v.message
+        for v in violations
+    ), (
+        f"Expected family_header violation for attach_reminder, got: "
+        f"{[(v.code, v.tool_name, v.field_path) for v in violations]}"
+    )
+
+
+def test_family_header_lint_clean_for_current_reminders_header() -> None:
+    """The actual (current) reminders family header was rewritten to
+    avoid naming unmigrated tools — the linter should produce no
+    ``family_header_references_unmigrated_tool`` violations for it."""
+    from sreda.services.tool_schemas.registry_quality import (
+        validate_mutex_note_references,
+    )
+    violations = validate_mutex_note_references(
+        REMINDERS_SPECS, manifest=TOOL_FAMILY_MANIFEST
+    )
+    family_violations = [
+        v for v in violations
+        if v.code == "family_header_references_unmigrated_tool"
+    ]
+    assert not family_violations, (
+        f"reminders family header references unmigrated tools: "
+        f"{[(v.field_path, v.message[:80]) for v in family_violations]}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Central registry aggregator
 # ---------------------------------------------------------------------------
 
