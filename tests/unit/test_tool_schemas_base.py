@@ -79,6 +79,7 @@ def _minimal_read_spec(**overrides: object) -> ToolSpec:
     base = dict(
         name="list_shopping",
         description="Show shopping list",
+        family="shopping",
         effect="read",
         read_domains=["shopping"],
         write_domains=[],
@@ -93,6 +94,7 @@ def _minimal_write_spec(**overrides: object) -> ToolSpec:
     base = dict(
         name="add_shopping_items",
         description="Add items to shopping",
+        family="shopping",
         effect="write",
         read_domains=[],
         write_domains=["shopping"],
@@ -179,6 +181,7 @@ def test_tool_spec_rejects_extra_field() -> None:
         ToolSpec(  # type: ignore[call-arg]
             name="x",
             description="x",
+            family="shopping",
             effect="read",
             read_domains=["shopping"],
             write_domains=[],

@@ -3,6 +3,9 @@
 Sub-A1 (Epic #74): base ``ToolSpec`` + ``ToolOutput`` + contract violation
 sentinel. Per-tool schemas (Sub-A4) and the wrapper that turns legacy
 ``str`` outputs into typed dicts arrive in later sub-issues.
+
+Sub-A-77 item #1: family taxonomy + anti-pattern headers + registry
+text renderer for the planner prompt's cached prefix.
 """
 
 from sreda.services.tool_schemas.base import (
@@ -10,15 +13,31 @@ from sreda.services.tool_schemas.base import (
     ToolOutputContractViolation,
     ToolSpec,
 )
+from sreda.services.tool_schemas.families import (
+    FAMILIES,
+    FAMILY_HEADERS,
+    Family,
+    FamilyHeader,
+)
 from sreda.services.tool_schemas.housewife import (
     PARSERS,
     parse_tool_output,
 )
+from sreda.services.tool_schemas.registry_text import (
+    render_family_header,
+    render_registry_for_planner,
+)
 
 __all__ = [
+    "FAMILIES",
+    "FAMILY_HEADERS",
+    "Family",
+    "FamilyHeader",
     "PARSERS",
     "ToolOutput",
     "ToolOutputContractViolation",
     "ToolSpec",
     "parse_tool_output",
+    "render_family_header",
+    "render_registry_for_planner",
 ]

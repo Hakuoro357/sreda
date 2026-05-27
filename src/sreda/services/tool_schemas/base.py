@@ -27,6 +27,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from sreda.services.tool_schemas.families import FAMILY_HEADERS, Family
+
 _STRICT = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 """Project-wide pydantic config for tool registry schemas.
 
@@ -78,6 +80,21 @@ class ToolSpec(BaseModel):
 
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
+    family: Family | None = None
+    """Closed-taxonomy family for the planner-facing registry text.
+
+    Every production tool SHOULD declare exactly one family from the
+    12-value ``Family`` literal (see ``services/tool_schemas/families.py``).
+    The registry text renderer groups tools by family and prepends
+    anti-pattern headers.
+
+    Optional with default ``None`` to keep this patch genuinely additive
+    while Sub-A4 migrates real ToolSpec definitions (Codex R1 MAJOR #3).
+    Tools without a declared family surface in the rendered registry's
+    final ``ГРУППА: НЕОТНЕСЁННЫЕ (ОШИБКА КОНФИГА)`` block so the gap is
+    visible — never silently dropped. A future Sub-B1 CI check will
+    fail when this block is non-empty in production.
+    """
     effect: Literal["read", "write"]
     read_domains: list[str] = Field(default_factory=list)
     write_domains: list[str] = Field(default_factory=list)
