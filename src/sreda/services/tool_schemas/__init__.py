@@ -13,6 +13,10 @@ from sreda.services.tool_schemas.base import (
     ToolOutputContractViolation,
     ToolSpec,
 )
+from sreda.services.tool_schemas.executor_contract import (
+    PlannerGapError,
+    dispatch_typed_output,
+)
 from sreda.services.tool_schemas.families import (
     FAMILIES,
     FAMILY_HEADERS,
@@ -40,10 +44,12 @@ __all__ = [
     "FamilyHeader",
     "InvalidRegistryError",
     "PARSERS",
+    "PlannerGapError",
     "RegistryQualityViolation",
     "ToolOutput",
     "ToolOutputContractViolation",
     "ToolSpec",
+    "dispatch_typed_output",
     "parse_tool_output",
     "render_family_header",
     "render_registry_for_planner",

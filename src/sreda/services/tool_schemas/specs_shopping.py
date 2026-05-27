@@ -302,6 +302,13 @@ UPDATE_SHOPPING_ITEM_SPEC = ToolSpec(
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
+    # Codex Sub-A4 R4 MAJOR #1: the input_model's @model_validator catches
+    # the no-op fully-literal case, but the planner's refs-present
+    # validation path skips model_validators. Declaring the names here
+    # gates the planner's static validator on top of the model layer:
+    # at least one mutable field must be present and non-null (refs OK,
+    # empty string OK for the «clear» intent on quantity_text).
+    required_any_non_null_args=["title", "quantity_text", "category"],
 )
 
 

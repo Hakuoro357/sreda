@@ -313,6 +313,33 @@ class ToolSpec(BaseModel):
     (mark/remove, complete/cancel/delete). Most standalone tools
     should leave this empty — overpopulating dilutes planner attention.
     """
+    required_any_non_null_args: list[str] | None = None
+    """ToolSpec-level «at-least-one-of these mutable fields must be
+    provided and not None» enforcement (Codex Sub-A4 R4 MAJOR #1).
+
+    Some tools (notably ``update_shopping_item``) have an input shape
+    where every mutable field is optional individually but the call is
+    a silent no-op if all of them are absent / explicit-null. A
+    ``model_validator`` on the input_model catches this for fully-
+    literal args, but the **planner's refs-present validation path
+    skips model_validators** (Codex Sub-A-77 R6 MAJOR #1) — so a plan
+    like ``{"item_id": "${s1.id}"}`` with no mutable fields would
+    pass plan-time validation and ship a no-op tool call.
+
+    Setting ``required_any_non_null_args=["title", "quantity_text",
+    "category"]`` lets the planner's static validator
+    (``validate_args_satisfy_required_any``) reject the no-op even
+    when refs are present. Logic: at least one of the listed names
+    must be present in ``action.args`` AND its value must be
+    «non-null-by-shape» — i.e. either a ``${...}`` ref (planner
+    trusts upstream output shapes are non-null) or a literal that
+    is not Python ``None``.
+
+    Every name in this list MUST be a field on ``input_model`` — the
+    construction-time invariant check enforces that. Empty string
+    values DO count as «non-null» (they may carry meaning, e.g.
+    ``quantity_text=""`` is the shopping clear-quantity intent).
+    """
     allow_field_validators: bool = False
     """Opt-in escape hatch for ``input_model`` with ``@field_validator``
     decorators (Codex Sub-A-77 item #4 R6 MAJOR #1).
@@ -527,7 +554,106 @@ class ToolSpec(BaseModel):
                 f"effect='{self.effect}'. Read-only tools must declare "
                 f"effect='read' for the validator to schedule them correctly."
             )
+        # Codex Sub-A4 R4 MAJOR #1: every name in required_any_non_null_args
+        # must be a declared field on input_model. Typos here would
+        # silently let the no-op call slip through plan validation
+        # (the enforcement helper looks for keys in action.args by name).
+        if self.required_any_non_null_args is not None:
+            if not self.required_any_non_null_args:
+                raise ValueError(
+                    f"Tool '{self.name}' required_any_non_null_args=[] — "
+                    f"either omit (None) or list at least one field name. "
+                    f"An empty list says «accept everything as no-op» which "
+                    f"is the opposite of the field's intent."
+                )
+            input_fields = set(self.input_model.model_fields.keys())
+            for arg_name in self.required_any_non_null_args:
+                if not isinstance(arg_name, str) or not arg_name.strip():
+                    raise ValueError(
+                        f"Tool '{self.name}' required_any_non_null_args "
+                        f"contains blank entry {arg_name!r}."
+                    )
+                if arg_name not in input_fields:
+                    raise ValueError(
+                        f"Tool '{self.name}' required_any_non_null_args "
+                        f"contains {arg_name!r} which is not a field on "
+                        f"input_model {self.input_model.__name__} "
+                        f"(declared fields: {sorted(input_fields)}). The "
+                        f"static validator looks for these by exact name in "
+                        f"action.args — typos silently break the no-op guard."
+                    )
         return self
+
+    # ------------------------------------------------------------------
+    # Codex Sub-A4 R4 MAJOR #1 — refs-aware no-op rejector
+    # ------------------------------------------------------------------
+
+    def process_output(self, raw_output: str) -> Any:
+        """Canonical entry point for converting a tool's raw ``str``
+        output into a typed planner-visible result (Codex Sub-A4 R4
+        MAJOR #2).
+
+        Phase B's executor MUST call this method (not reimplement the
+        parse→sentinel-check→validate ordering). Importing this method
+        is the contract — the boundary tests in
+        ``test_executor_contract.py`` exercise THIS code path, so any
+        regression in the ordering breaks tests automatically.
+
+        Raises ``PlannerGapError`` on unparseable raw output; the
+        executor catches it and records ``planner_gaps(gap_type=
+        'contract_violation')``. Returns the parser-typed instance
+        otherwise.
+
+        Implementation delegates to ``executor_contract.dispatch_typed_output``
+        to keep the contract module the single source of truth — there
+        is no parallel implementation here.
+        """
+        # Local import avoids a base.py → executor_contract.py →
+        # housewife.py → base.py cycle at module load time.
+        from sreda.services.tool_schemas.executor_contract import (
+            dispatch_typed_output,
+        )
+        return dispatch_typed_output(self.name, raw_output, self.output_model)
+
+    def validate_args_satisfy_required_any(
+        self, raw_args: dict[str, Any]
+    ) -> None:
+        """Reject calls where every name in ``required_any_non_null_args``
+        is either absent or explicit ``None``.
+
+        Designed to be called by the planner's static validator
+        (Phase B) BEFORE refs are resolved, so the no-op guard fires
+        on the common ``update_shopping_item(item_id=ref)`` pattern
+        where every mutable field is omitted.
+
+        A field counts as «provided» if both of:
+        - the key is present in ``raw_args``
+        - its value is **not** Python ``None``
+        Note that ``${...}`` ref strings count as non-None (the planner
+        trusts upstream output shapes), and empty strings count as
+        non-None (e.g. shopping ``quantity_text=""`` is the clear
+        intent).
+
+        No-op if ``required_any_non_null_args`` is unset — most tools
+        have a single required field on ``input_model`` and need no
+        cross-field check.
+        """
+        if self.required_any_non_null_args is None:
+            return
+        provided = [
+            name for name in self.required_any_non_null_args
+            if name in raw_args and raw_args[name] is not None
+        ]
+        if not provided:
+            raise ValueError(
+                f"Tool '{self.name}' call requires at least one of "
+                f"{self.required_any_non_null_args} to be provided with "
+                f"a non-null value (refs and empty strings both count as "
+                f"non-null; only explicit ``null`` and missing keys are "
+                f"rejected). Got args with keys "
+                f"{sorted(raw_args.keys())} — this would be a silent "
+                f"no-op call at runtime."
+            )
 
 
 __all__ = [

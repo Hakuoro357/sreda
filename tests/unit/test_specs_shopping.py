@@ -37,7 +37,9 @@ from sreda.services.tool_schemas.registry_quality import (
     validate_tool_registry_quality,
 )
 from sreda.services.tool_schemas.specs_shopping import (
+    ADD_SHOPPING_ITEMS_SPEC,
     SHOPPING_SPECS,
+    UPDATE_SHOPPING_ITEM_SPEC,
     AddShoppingItemsInput,
     ClearBoughtShoppingInput,
     ListShoppingInput,
@@ -649,3 +651,157 @@ def test_migrated_tool_specs_pass_strict_production_quality() -> None:
     """Full aggregate passes the CI acceptance gate."""
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
     assert_production_registry_quality(MIGRATED_TOOL_SPECS)
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 MAJOR #1 — refs-aware no-op rejector via
+# ``ToolSpec.required_any_non_null_args`` + ``.validate_args_satisfy_required_any``
+# Closes the gap where the planner's refs-present validation skips
+# input_model's @model_validator (Codex Sub-A-77 R6 MAJOR #1).
+# ---------------------------------------------------------------------------
+
+
+def test_update_shopping_item_spec_declares_required_any_non_null() -> None:
+    """The spec encodes which fields the planner's static validator
+    must check, independent of the input_model's model_validator."""
+    assert UPDATE_SHOPPING_ITEM_SPEC.required_any_non_null_args == [
+        "title",
+        "quantity_text",
+        "category",
+    ]
+
+
+def test_validate_args_satisfy_required_any_rejects_refs_only_no_mutable() -> None:
+    """Codex R4 MAJOR #1: the common ``update_shopping_item`` flow uses
+    refs for ``item_id`` (from ``list_shopping``). Without any mutable
+    field, the call is a silent no-op — must be rejected even when
+    the input_model's @model_validator is skipped on the refs path."""
+    with pytest.raises(ValueError, match="at least one of"):
+        UPDATE_SHOPPING_ITEM_SPEC.validate_args_satisfy_required_any(
+            {"item_id": "${s1.items[0].item_id}"}
+        )
+
+
+def test_validate_args_satisfy_required_any_accepts_ref_for_mutable_field() -> None:
+    """A ref to a mutable field is non-null-by-shape (planner trusts
+    upstream output schemas). Should pass even though we can't yet
+    see the resolved value."""
+    UPDATE_SHOPPING_ITEM_SPEC.validate_args_satisfy_required_any(
+        {"item_id": SH_A, "title": "${s2.recipe.title}"}
+    )  # no raise
+
+
+def test_validate_args_satisfy_required_any_accepts_literal_mutable() -> None:
+    """At least one mutable field with a literal non-null value
+    satisfies the requirement."""
+    UPDATE_SHOPPING_ITEM_SPEC.validate_args_satisfy_required_any(
+        {"item_id": SH_A, "title": "новое название"}
+    )  # no raise
+
+
+def test_validate_args_satisfy_required_any_accepts_empty_quantity() -> None:
+    """Empty string is non-null — it's the «clear quantity» intent for
+    shopping. Must satisfy the «at least one provided» requirement."""
+    UPDATE_SHOPPING_ITEM_SPEC.validate_args_satisfy_required_any(
+        {"item_id": SH_A, "quantity_text": ""}
+    )  # no raise
+
+
+def test_validate_args_satisfy_required_any_rejects_explicit_null_only() -> None:
+    """All explicit nulls is the same as «nothing provided» — runtime
+    short-circuits on ``X is not None`` for every mutable field."""
+    with pytest.raises(ValueError):
+        UPDATE_SHOPPING_ITEM_SPEC.validate_args_satisfy_required_any(
+            {
+                "item_id": SH_A,
+                "title": None,
+                "quantity_text": None,
+                "category": None,
+            }
+        )
+
+
+def test_validate_args_satisfy_required_any_noop_when_field_unset() -> None:
+    """Tools without the field (e.g. ``add_shopping_items``) do NOT
+    enforce this rule — their input_model already requires a non-empty
+    items list."""
+    ADD_SHOPPING_ITEMS_SPEC.validate_args_satisfy_required_any(
+        {"items": []}
+    )  # no raise — separate concern handled by input_model min_length
+
+
+def test_tool_spec_rejects_required_any_non_null_args_with_unknown_field() -> None:
+    """Codex R4 MAJOR #1 construction-time guard: names in
+    ``required_any_non_null_args`` must exist on ``input_model``. A
+    typo here would silently let no-op calls through the planner's
+    static validator."""
+    with pytest.raises(ValidationError):
+        # Take the canonical spec but try to require a name that
+        # doesn't exist on UpdateShoppingItemInput.
+        UPDATE_SHOPPING_ITEM_SPEC.model_copy(
+            update={
+                "required_any_non_null_args": [
+                    "title",
+                    "missing_typo_field",
+                ]
+            }
+        ).model_validate(
+            UPDATE_SHOPPING_ITEM_SPEC.model_copy(
+                update={
+                    "required_any_non_null_args": [
+                        "title",
+                        "missing_typo_field",
+                    ]
+                }
+            ).model_dump()
+        )
+
+
+def test_tool_spec_rejects_required_any_non_null_args_empty_list() -> None:
+    """Empty list is meaningless («accept everything as no-op») —
+    construction-time reject so the field's intent is preserved."""
+    with pytest.raises(ValidationError):
+        UPDATE_SHOPPING_ITEM_SPEC.model_validate(
+            UPDATE_SHOPPING_ITEM_SPEC.model_copy(
+                update={"required_any_non_null_args": []}
+            ).model_dump()
+        )
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 MAJOR #2 — process_output() as canonical executor entry point
+# Phase B's executor MUST call this method (not reimplement the
+# parse→sentinel→validate ordering).
+# ---------------------------------------------------------------------------
+
+
+def test_tool_spec_process_output_delegates_to_dispatch_typed_output() -> None:
+    """``ToolSpec.process_output(raw)`` is the canonical Phase-B entry
+    point. Internally delegates to ``executor_contract.dispatch_typed_output``
+    so the boundary contract has a single source of truth — any future
+    code that goes through ``spec.process_output(...)`` inherits the
+    correct parse→sentinel→validate ordering automatically."""
+    result = UPDATE_SHOPPING_ITEM_SPEC.process_output(f"ok:updated:{SH_A}")
+    assert result.status == "updated"
+    assert result.item_id == SH_A
+
+
+def test_tool_spec_process_output_raises_planner_gap_on_sentinel() -> None:
+    """Unparseable raw output surfaces as ``PlannerGapError``, NOT as
+    a generic ``ValidationError`` — proves Phase B can rely on
+    catching this specific exception type to record
+    ``planner_gaps(gap_type='contract_violation')``."""
+    from sreda.services.tool_schemas.executor_contract import PlannerGapError
+    with pytest.raises(PlannerGapError):
+        UPDATE_SHOPPING_ITEM_SPEC.process_output("totally unparseable")
+
+
+def test_dispatch_typed_output_exposed_at_package_level() -> None:
+    """Codex R4 MAJOR #2: ``dispatch_typed_output`` and
+    ``PlannerGapError`` are part of the public ``tool_schemas`` API
+    so Phase B imports them directly instead of reimplementing the
+    ordering. The boundary tests then exercise the actual production
+    code path."""
+    from sreda.services import tool_schemas
+    assert hasattr(tool_schemas, "dispatch_typed_output")
+    assert hasattr(tool_schemas, "PlannerGapError")
