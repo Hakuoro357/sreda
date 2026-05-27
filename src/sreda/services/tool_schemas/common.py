@@ -27,9 +27,27 @@ Sources of truth for the exact caps and shapes:
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
-from pydantic import StringConstraints
+from pydantic import AfterValidator, StringConstraints
+
+
+def _validate_iso_datetime_string(value: str) -> str:
+    """Codex Sub-A4 reminders R2 MAJOR #2 — verify the regex-shape
+    string is also a semantically valid datetime via
+    ``datetime.fromisoformat``. Catches impossible timestamps like
+    ``2026-99-99T99:99Z`` that pass the shape regex but would crash
+    runtime parsing.
+
+    Normalizes ``Z`` suffix to ``+00:00`` for Python <3.11
+    compatibility (3.11+ handles ``Z`` natively, but we support both).
+    Re-raises ``ValueError`` on failure; pydantic catches and emits a
+    ``ValidationError``.
+    """
+    candidate = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    datetime.fromisoformat(candidate)  # raises ValueError on bad shape
+    return value  # return original string; runtime owns UTC normalization
 
 
 # ---------------------------------------------------------------------------
@@ -183,41 +201,82 @@ TriggerIso = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True,
-        min_length=10,  # at least YYYY-MM-DD
+        min_length=20,  # ``YYYY-MM-DDTHH:MMZ`` minimum
         max_length=64,
-        # Loose ISO-8601 shape — pydantic does the strict parsing.
-        # Accepts: YYYY-MM-DDTHH:MM:SS, optional fractional seconds,
-        # optional timezone (Z / +HH:MM / -HH:MM). Single-line only.
+        # Codex Sub-A4 reminders R2 MAJOR #1: require explicit Z or
+        # offset. Previously the offset group was optional which
+        # accepted naive timestamps (``2026-05-27T18:00:00``) —
+        # runtime would silently reinterpret as UTC, opening the
+        # timezone-drift class the planner contract is meant to
+        # close. ``Z`` or ``+HH:MM`` / ``-HH:MM`` REQUIRED now.
+        # The colon in offsets is also optional (RFC-3339 allows both
+        # ``+0300`` and ``+03:00``).
         pattern=(
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?"
-            r"(Z|[+-]\d{2}:?\d{2})?$"
+            r"(Z|[+-]\d{2}:?\d{2})$"
         ),
     ),
+    AfterValidator(_validate_iso_datetime_string),
 ]
-"""ISO-8601 datetime string. Runtime parses via
-``datetime.fromisoformat`` and normalizes to UTC
-(``housewife_chat_tools.py:325-349`` for schedule_reminder, :498-508
-for update_reminder). The shape regex catches obvious typos before
-the runtime emits ``cannot_parse_trigger_iso``. Capped at 64 chars —
-the longest legitimate ISO with microseconds + offset is ~32 chars,
-double for breathing room."""
+"""Offset-aware ISO-8601 datetime string. Codex Sub-A4 reminders R2
+MAJOR #1 + #2: two-layer validation:
+
+1. ``StringConstraints.pattern`` enforces shape AND requires explicit
+   timezone (``Z`` / ``+HH:MM`` / ``-HH:MM`` / ``+HHMM``). Naive
+   timestamps are rejected at planner-input level — the runtime's
+   «treat as UTC» fallback exists for legacy callers but the planner
+   contract is stricter, eliminating the timezone-drift class.
+2. ``AfterValidator`` runs ``datetime.fromisoformat`` on the
+   regex-passing string to catch impossible values like
+   ``2026-99-99T99:99Z`` that match the shape but aren't real dates.
+
+Runtime (``housewife_chat_tools.py:325-349`` for schedule_reminder,
+:498-508 for update_reminder) parses + normalizes to UTC. Cap at 64
+chars — the longest legitimate ISO with microseconds + offset is
+~32 chars, double for breathing room."""
+
+
+# RFC-5545 RRULE FREQ values. Codex Sub-A4 reminders R2 MINOR #1:
+# previously the pattern accepted any FREQ=... value, including typos
+# like FREQ=WEKLY. Whitelist catches those at planner-input level.
+_RFC5545_FREQ_VALUES = (
+    "SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY",
+)
+_RFC5545_FREQ_PATTERN = "|".join(_RFC5545_FREQ_VALUES)
 
 
 RecurrenceRule = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True,
-        min_length=4,  # ``FREQ=`` minimum
+        min_length=10,  # ``FREQ=DAILY`` minimum
         max_length=512,
-        # Single-line (no \n/\r); must start with FREQ= (RFC-5545 baseline).
-        pattern=r"^FREQ=[^\r\n]+$",
+        # Single-line (no \n/\r); FREQ= must be one of the 7 RFC-5545
+        # frequency values; followed by any RFC-5545 parameter chain
+        # (BYHOUR, BYDAY, COUNT, INTERVAL, etc.). The runtime's
+        # ``dateutil.rrule`` is still the grammar gatekeeper for the
+        # parameter chain.
+        pattern=(
+            rf"^FREQ=({_RFC5545_FREQ_PATTERN})"
+            r"(;[A-Z]+=[A-Za-z0-9,+\-]+)*$"
+        ),
     ),
 ]
-"""RFC-5545 RRULE string. Runtime hands this to ``dateutil.rrule``
-which is the format gatekeeper. The pattern enforces single-line +
-``FREQ=`` prefix so we catch trivial mistakes (multiline strings,
-empty fragments) at planner time. Capped at 512 — RRULEs longer
-than that are almost certainly malformed."""
+"""RFC-5545 RRULE string. Three-layer validation:
+
+1. ``StringConstraints.pattern`` requires FREQ= one of the 7
+   canonical frequencies (SECONDLY/MINUTELY/HOURLY/DAILY/WEEKLY/
+   MONTHLY/YEARLY), followed by zero or more ``;KEY=VALUE``
+   parameter pairs. Catches typos (``FREQ=WEKLY``) and multiline
+   strings at planner time.
+2. Runtime hands the validated string to ``dateutil.rrule`` which
+   is the parameter-grammar gatekeeper.
+3. Capped at 512 chars — RRULEs longer than that are almost
+   certainly malformed.
+
+Codex Sub-A4 reminders R2 MINOR #1: previously the pattern was the
+permissive ``^FREQ=[^\\r\\n]+$`` which accepted any payload. The
+tightened whitelist catches obvious typos at planner-input time."""
 
 
 __all__ = [

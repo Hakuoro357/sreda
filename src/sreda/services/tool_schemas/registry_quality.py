@@ -367,16 +367,26 @@ def validate_mutex_note_references(
     *,
     manifest: dict[str, str],
 ) -> list[RegistryQualityViolation]:
-    """Codex Sub-A4 reminders R1 MAJOR #6 — scan mutex_notes for
-    references to tool names that exist in ``manifest`` (the full
-    eventual registry) but NOT in ``specs`` (the migrated subset).
+    """Codex Sub-A4 reminders R1 MAJOR #6 + R2 MAJOR #3/#4 — scan
+    every prompt-rendered string field of each ToolSpec for tool-name
+    tokens that exist in ``manifest`` but NOT in the migrated specs.
 
-    Mutex_notes are free Russian text injected into the planner
-    system prompt. When they name a sibling tool (e.g. «для отмены —
-    ``cancel_reminder``» or «привязать к задаче — ``attach_reminder``»),
-    they promise the planner that tool is callable. During Sub-A4's
-    incremental rollout, referencing a not-yet-migrated tool steers
-    the LLM toward a name the typed runtime won't recognize.
+    Mutex_notes, descriptions, and trigger_examples are all injected
+    into the planner system prompt. When any of them names a sibling
+    tool (e.g. «для отмены — ``cancel_reminder``» or «привязать к
+    задаче — ``attach_reminder``»), it promises the planner that tool
+    is callable. During Sub-A4's incremental rollout, referencing a
+    not-yet-migrated tool steers the LLM toward a name the typed
+    runtime won't recognize.
+
+    Codex R2 MAJOR #4: R1 version scanned only ``mutex_notes`` —
+    extended now to ``description`` + ``trigger_examples`` + each
+    mutex_note. Any future prompt-rendered surface should be added
+    to ``_PROMPT_RENDERED_FIELDS``.
+
+    Codex R2 MAJOR #3: ``specs`` is materialised into a list at the
+    top so we can build ``spec_names`` AND iterate it again without
+    consuming a generator twice.
 
     The check is a SOFT lint: emits ``RegistryQualityViolation``
     rows for each cross-reference to an unmigrated tool. Callers
@@ -385,7 +395,7 @@ def validate_mutex_note_references(
 
     Args:
         specs: the migrated ToolSpec list (what the planner can
-            actually call right now).
+            actually call right now). Generator-safe.
         manifest: the full ``{tool_name: family}`` map of every
             housewife tool — typically ``TOOL_FAMILY_MANIFEST``.
 
@@ -393,42 +403,61 @@ def validate_mutex_note_references(
         list of violations; empty == no cross-references to
         unmigrated tools.
     """
-    spec_names = {s.name for s in specs}
+    # Codex R2 MAJOR #3: materialize to support generator callers.
+    spec_list = list(specs)
+    spec_names = {s.name for s in spec_list}
     violations: list[RegistryQualityViolation] = []
-    seen_per_spec: set[tuple[str, str]] = set()
-    for spec in specs:
-        for idx, note in enumerate(spec.mutex_notes):
-            if not isinstance(note, str):
-                # Other lints catch the type-error; we just skip so the
-                # tokeniser doesn't crash on a poisoned spec.
-                continue
-            for token_match in _TOOL_NAME_TOKEN_RE.finditer(note):
+    # Dedupe key: (offending_spec_name, referenced_tool_name, field_path).
+    # Same token in the same field is a single finding; same token in
+    # different fields should fire separately so the maintainer sees
+    # every surface that needs editing.
+    seen: set[tuple[str, str, str]] = set()
+    for spec in spec_list:
+        for field_name, value in _iter_prompt_rendered_strings(spec):
+            for token_match in _TOOL_NAME_TOKEN_RE.finditer(value):
                 token = token_match.group(1)
                 if token not in manifest:
                     continue
                 if token in spec_names:
-                    continue  # referenced tool IS in the migrated set
-                # Dedupe: a single note mentioning ``attach_reminder``
-                # twice should emit one violation, not two.
-                key = (spec.name, token)
-                if key in seen_per_spec:
                     continue
-                seen_per_spec.add(key)
+                key = (spec.name, token, field_name)
+                if key in seen:
+                    continue
+                seen.add(key)
                 violations.append(RegistryQualityViolation(
                     tool_name=spec.name,
-                    field_path=f"mutex_notes[{idx}]",
+                    field_path=field_name,
                     code="mutex_note_references_unmigrated_tool",
                     message=(
-                        f"mutex_note references tool {token!r} from family "
+                        f"{field_name} references tool {token!r} from family "
                         f"{manifest[token]!r} — that family is in "
                         f"TOOL_FAMILY_MANIFEST but NOT in the migrated specs. "
                         f"Planner would be steered toward an unavailable "
                         f"typed tool. Either migrate the referenced tool in "
-                        f"the same phase, or rewrite the note as intent-"
+                        f"the same phase, or rewrite the field as intent-"
                         f"level guidance without naming the unavailable tool."
                     ),
                 ))
     return violations
+
+
+def _iter_prompt_rendered_strings(
+    spec: ToolSpec,
+) -> Iterable[tuple[str, str]]:
+    """Yield ``(field_path, value)`` pairs for every string that the
+    registry text renderer puts into the planner's system prompt.
+    Codex R2 MAJOR #4: scan all of these, not just mutex_notes.
+
+    Skips non-string values defensively (a poisoned spec can carry
+    ints; the schema lint flags those separately)."""
+    if isinstance(spec.description, str):
+        yield ("description", spec.description)
+    for idx, example in enumerate(spec.trigger_examples):
+        if isinstance(example, str):
+            yield (f"trigger_examples[{idx}]", example)
+    for idx, note in enumerate(spec.mutex_notes):
+        if isinstance(note, str):
+            yield (f"mutex_notes[{idx}]", note)
 
 
 def assert_production_registry_quality(specs: Iterable[ToolSpec]) -> None:
@@ -456,14 +485,19 @@ def assert_production_registry_quality(specs: Iterable[ToolSpec]) -> None:
     migrated or the note is rewritten.
     """
 
-    validations = validate_tool_registry_quality(specs, strict=True)
+    # Codex Sub-A4 reminders R2 MAJOR #3: materialize once so the
+    # two passes (per-spec + cross-spec mutex references) can share
+    # the same list. Without this a generator caller silently skips
+    # the second pass.
+    spec_list = list(specs)
+    validations = validate_tool_registry_quality(spec_list, strict=True)
     # Lazy import — registry_quality.py is loaded by ToolSpec
     # construction in some test paths; importing families at module
     # top would create a cycle.
     from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
     validations.extend(
         validate_mutex_note_references(
-            specs, manifest=TOOL_FAMILY_MANIFEST
+            spec_list, manifest=TOOL_FAMILY_MANIFEST
         )
     )
     if validations:

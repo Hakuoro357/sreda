@@ -224,15 +224,16 @@ UPDATE_REMINDER_SPEC = ToolSpec(
     # ``X is None`` for every mutable field — so a call with only
     # ``reminder_id`` is a silent no-op. Phase 1.d in
     # runtime/planner/validator.py emits ``silent_noop_call`` when no
-    # mutable field is provided non-null (refs and empty strings count
-    # as non-null; explicit null and missing keys do not).
+    # mutable field is provided non-null (refs count as non-null;
+    # explicit null and missing keys do not).
     #
-    # ``clear_recurrence=False`` is also «no-op» semantically — the
-    # runtime branch fires only on True. But it's a bool not a None,
-    # so the rule «non-null» admits it; the planner is expected to
-    # only emit ``clear_recurrence`` when it actually means True. If
-    # this becomes a real failure mode in production we'll tighten
-    # to «truthy» semantics; for MVP «non-null» is sufficient.
+    # ``clear_recurrence`` semantics (Codex R1 MAJOR #1 + R2 MINOR #6
+    # comment cleanup): runtime fires only on True. The schema-level
+    # type is ``Literal[True] | None`` — False is REJECTED at
+    # validation time, before this list even gets consulted. So this
+    # list's job for ``clear_recurrence`` is purely «count it as a
+    # mutable-field contribution when present». The «non-null» check
+    # here is the second guard.
     required_any_non_null_args=[
         "title",
         "trigger_iso",

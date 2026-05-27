@@ -627,6 +627,176 @@ def test_mutex_note_reference_linter_detects_unmigrated_reference() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Codex R2 follow-up tests — MAJOR #1 (UTC-only TriggerIso),
+# MAJOR #2 (AfterValidator), MAJOR #3 (generator-safe linter),
+# MAJOR #4 (broadened lint surface), MINOR #1 (FREQ whitelist).
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_reminder_input_rejects_naive_trigger_iso() -> None:
+    """Codex R2 MAJOR #1: naive timestamps (no offset) were previously
+    accepted because the offset group was optional. Tightened to
+    require Z or +/-HH:MM. Naive is now a schema error — planner
+    contract forbids the timezone-drift risk."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T18:00:00",  # no Z, no offset
+        })
+
+
+def test_schedule_reminder_input_rejects_impossible_iso_components() -> None:
+    """Codex R2 MAJOR #2: shape regex alone wasn't enough.
+    ``AfterValidator`` runs ``datetime.fromisoformat`` to catch
+    impossible values like ``2026-99-99T99:99Z``."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-99-99T99:99:00Z",
+        })
+
+
+def test_schedule_reminder_input_accepts_offset_without_colon() -> None:
+    """RFC-3339 allows both ``+0300`` and ``+03:00``. Both shapes are
+    valid in the regex + AfterValidator."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T18:00:00+0300",
+    })
+    assert parsed.trigger_iso == "2026-05-27T18:00:00+0300"
+
+
+def test_update_reminder_output_rejects_impossible_iso() -> None:
+    """Codex R2 MAJOR #2 end-to-end: output parser now validates
+    next_trigger_at_iso semantically, not just by shape."""
+    parsed = parse_tool_output(
+        "update_reminder", f"ok:updated:{REM_A}:2026-99-99T99:99:00Z"
+    )
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+@pytest.mark.parametrize("bad_freq", [
+    "FREQ=WEKLY;BYDAY=TU",         # typo
+    "FREQ=YEAR;BYMONTH=1",         # singular
+    "FREQ=daily;BYHOUR=10",        # lowercase
+    "FREQ=;BYHOUR=10",             # empty freq
+])
+def test_schedule_reminder_input_rejects_unknown_freq_value(bad_freq) -> None:
+    """Codex R2 MINOR #1: ``RecurrenceRule`` whitelist catches typos
+    that previously slipped past ``^FREQ=[^\\r\\n]+$``."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": bad_freq,
+        })
+
+
+@pytest.mark.parametrize("good_freq", [
+    "FREQ=SECONDLY",
+    "FREQ=MINUTELY",
+    "FREQ=HOURLY",
+    "FREQ=DAILY",
+    "FREQ=WEEKLY",
+    "FREQ=MONTHLY",
+    "FREQ=YEARLY",
+    "FREQ=WEEKLY;BYDAY=TU;BYHOUR=13;BYMINUTE=0",
+    "FREQ=DAILY;COUNT=10",
+    "FREQ=MONTHLY;BYDAY=1MO,1TU",
+])
+def test_schedule_reminder_input_accepts_all_rfc_frequencies(good_freq) -> None:
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": good_freq,
+    })
+    assert parsed.recurrence_rule == good_freq
+
+
+def test_mutex_note_reference_linter_is_generator_safe() -> None:
+    """Codex R2 MAJOR #3: generator inputs must not be consumed twice
+    (the first pass builds spec_names, the second pass scans). With
+    materialization the second pass sees the same list."""
+    from sreda.services.tool_schemas.registry_quality import (
+        validate_mutex_note_references,
+    )
+    poisoned = SCHEDULE_REMINDER_SPEC.model_copy(update={
+        "mutex_notes": [
+            "Используй для напоминаний. Не для tasks.attach_reminder, эта семья ещё не мигрирована.",
+        ],
+    })
+    # Pass a generator — should still detect the reference.
+    violations = validate_mutex_note_references(
+        (s for s in [poisoned]),  # generator
+        manifest=TOOL_FAMILY_MANIFEST,
+    )
+    assert violations, "Expected violation when input is a generator"
+    assert any(
+        "attach_reminder" in v.message for v in violations
+    )
+
+
+def test_mutex_note_reference_linter_scans_description() -> None:
+    """Codex R2 MAJOR #4: lint surface now includes ``description``,
+    not just ``mutex_notes``."""
+    from sreda.services.tool_schemas.registry_quality import (
+        validate_mutex_note_references,
+    )
+    poisoned = SCHEDULE_REMINDER_SPEC.model_copy(update={
+        "description": (
+            "Поставить напоминание. Если связано с задачей, используй "
+            "tools.attach_reminder вместо этого инструмента."
+        ),
+    })
+    violations = validate_mutex_note_references(
+        [poisoned], manifest=TOOL_FAMILY_MANIFEST
+    )
+    assert violations, "Expected violation for attach_reminder in description"
+    assert any(
+        v.field_path == "description" and "attach_reminder" in v.message
+        for v in violations
+    )
+
+
+def test_mutex_note_reference_linter_scans_trigger_examples() -> None:
+    """Codex R2 MAJOR #4: lint surface includes ``trigger_examples``
+    too — though unusual for examples to name tools, future families
+    might add «как через attach_reminder» phrases."""
+    from sreda.services.tool_schemas.registry_quality import (
+        validate_mutex_note_references,
+    )
+    # Use a non-Cyrillic example to bypass the strict-mode policy
+    # check that requires Cyrillic — keep trigger_examples count ≥3
+    # to satisfy the strict count rule for assert_production_registry_quality
+    # (but here we're directly calling the lint, not the policy gate).
+    poisoned = SCHEDULE_REMINDER_SPEC.model_copy(update={
+        "trigger_examples": [
+            "напомни купить хлеб",
+            "напомни через attach_reminder про что-то",  # cross-ref
+            "поставь напоминание",
+        ],
+    })
+    violations = validate_mutex_note_references(
+        [poisoned], manifest=TOOL_FAMILY_MANIFEST
+    )
+    assert violations, "Expected violation for attach_reminder in trigger_examples"
+    assert any(
+        v.field_path.startswith("trigger_examples")
+        and "attach_reminder" in v.message
+        for v in violations
+    )
+
+
+def test_assert_production_registry_quality_passes_with_generator_input() -> None:
+    """Codex R2 MAJOR #3: ``assert_production_registry_quality`` was
+    calling ``validate_tool_registry_quality(specs)`` then
+    ``validate_mutex_note_references(specs)`` — generator would be
+    exhausted after the first call. With materialization both passes
+    see the full list."""
+    assert_production_registry_quality((s for s in REMINDERS_SPECS))
+
+
+# ---------------------------------------------------------------------------
 # Central registry aggregator
 # ---------------------------------------------------------------------------
 
