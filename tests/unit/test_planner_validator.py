@@ -1003,3 +1003,161 @@ def test_dict_concrete_int_key_violation_no_refs() -> None:
     assert any(v.step_id == "s1" for v in violations)
 
 
+# ---------------------------------------------------------------------------
+# Codex R4 MAJOR #1 — nested BaseModel walking
+# ---------------------------------------------------------------------------
+
+
+class _Author(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    age: int
+
+
+class _PostInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str
+    author: _Author
+
+
+def test_nested_basemodel_with_ref_walks_concrete_fields() -> None:
+    """``author: _Author`` field receives dict with refs — sub-model's
+    own contract enforced: bad concrete fields surface even when
+    siblings are deferred refs."""
+    plan = _plan_with_actions({
+        "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "post_tool",
+            {
+                "title": "x",
+                "author": {"name": 42, "age": "${s1.title}"},  # name is int (wrong)
+            },
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "schedule_reminder": _spec("schedule_reminder", _ReminderInput),
+        "post_tool": _spec("post_tool", _PostInput),
+    }
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    assert any("author.name" in (v.field_path or "") for v in s2)
+
+
+def test_nested_basemodel_unknown_key_is_reported() -> None:
+    plan = _plan_with_actions({
+        "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "post_tool",
+            {
+                "title": "x",
+                "author": {"name": "Alice", "age": 30, "bogus": "${s1.title}"},
+            },
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "schedule_reminder": _spec("schedule_reminder", _ReminderInput),
+        "post_tool": _spec("post_tool", _PostInput),
+    }
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    assert any(
+        v.code == "unknown_arg" and "author.bogus" in (v.field_path or "")
+        for v in s2
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 MAJOR #2 — container shell constraints under refs
+# ---------------------------------------------------------------------------
+
+
+class _LenConstrainedInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[str] = PydField(min_length=2)
+    trigger: str
+
+
+def test_min_length_caught_on_literal_container_with_refs() -> None:
+    """``items: list[str] = Field(min_length=2)`` with ``["${s1.x}"]`` —
+    length is statically 1, refs don't splice. Validator must catch."""
+    plan = _plan_with_actions({
+        "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "len_tool",
+            {"items": ["${s1.title}"], "trigger": "ok"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "schedule_reminder": _spec("schedule_reminder", _ReminderInput),
+        "len_tool": _spec("len_tool", _LenConstrainedInput),
+    }
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    assert any(v.field_path == "items" for v in s2), f"got: {s2}"
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 MAJOR #3 — alias vs validation_alias precedence
+# ---------------------------------------------------------------------------
+
+
+class _ValidationAliasOnlyInput(BaseModel):
+    """``validation_alias`` set without ``alias`` — pydantic accepts
+    ONLY the validation_alias as input key."""
+    model_config = ConfigDict(extra="forbid")
+    value: str = PydField(alias="serialized_v", validation_alias="v_in")
+
+
+def test_validation_alias_wins_over_alias_for_input() -> None:
+    """When ``validation_alias`` is set, input must use it — plain
+    ``alias`` is for serialization, not validation input. Validator
+    must mirror pydantic semantics exactly."""
+    registry = {"va_tool": _spec("va_tool", _ValidationAliasOnlyInput)}
+
+    # validation_alias accepted:
+    plan_v_in = _plan_with_actions({"s1": _action("va_tool", {"v_in": "x"})})
+    assert validate_plan(plan_v_in, registry) == []
+
+    # plain alias rejected (it's only for serialization):
+    plan_alias = _plan_with_actions({
+        "s1": _action("va_tool", {"serialized_v": "x"}),
+    })
+    violations = validate_plan(plan_alias, registry)
+    assert any(v.code == "unknown_arg" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 MINOR #4 — ref-like dict keys
+# ---------------------------------------------------------------------------
+
+
+class _DictWithRefKeyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    metadata: dict[str, str]
+    trigger: str
+
+
+def test_ref_in_dict_key_is_unsupported_ref_location() -> None:
+    plan = _plan_with_actions({
+        "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "key_tool",
+            {
+                "metadata": {"${s1.title}": "value"},  # ref in KEY
+                "trigger": "${s1.title}",  # other ref to make it refs-present
+            },
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "schedule_reminder": _spec("schedule_reminder", _ReminderInput),
+        "key_tool": _spec("key_tool", _DictWithRefKeyInput),
+    }
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    assert any(v.code == "unsupported_ref_location" for v in s2)
+
+

@@ -188,28 +188,53 @@ def _iter_validation_alias_keys(validation_alias: object) -> Iterator[str]:
         return
 
 
+def _field_validation_keys(finfo: Any) -> list[str]:
+    """Return the keys that pydantic v2 ``model_validate`` accepts as
+    INPUT for this field, in precedence order (Codex R4 MAJOR #3):
+
+    1. If ``validation_alias`` is set → use ONLY that (alias is for
+       SERIALIZATION when alias-only; not consulted as input here).
+    2. Else if ``alias`` is set → that's the validation input key.
+    3. Else → no alias; ``populate_by_name`` doesn't change this.
+
+    Field name itself is added separately based on ``populate_by_name``
+    and the «no-alias-set» case (handled by ``_accepted_field_names``).
+    """
+
+    validation_alias = getattr(finfo, "validation_alias", None)
+    if validation_alias is not None:
+        return list(_iter_validation_alias_keys(validation_alias))
+    alias = getattr(finfo, "alias", None)
+    if alias is not None:
+        return [alias]
+    return []
+
+
 def _accepted_field_names(model: type[BaseModel]) -> set[str]:
     """Set of input keys the planner may legitimately use for this
-    model. Mirrors pydantic semantics exactly:
+    model. Mirrors pydantic v2 input-validation semantics:
 
-    - If ``populate_by_name=True``: field names AND aliases accepted.
-    - If False (pydantic default): when ``alias`` / ``validation_alias``
-      is set, accept ONLY that; otherwise accept the field name.
+    - If ``validation_alias`` is set on a field → accept only that
+      (alias used purely for serialization).
+    - Else if ``alias`` is set → accept the alias.
+    - Else (no alias declared) → accept the field name.
+    - Plus: if ``populate_by_name=True`` is configured, the field name
+      is ALSO accepted alongside the alias/validation_alias.
 
-    Closes Codex R2 MAJOR #3 — was previously over-permissive.
+    Codex R4 MAJOR #3 closes the divergence where validation_alias and
+    alias were both accepted when only validation_alias should be.
     """
 
     by_name = _model_populates_by_name(model)
     names: set[str] = set()
     for fname, finfo in model.model_fields.items():
-        alias = getattr(finfo, "alias", None)
-        validation_alias = getattr(finfo, "validation_alias", None)
-        has_alias = alias is not None or validation_alias is not None
-        if alias:
-            names.add(alias)
-        for key in _iter_validation_alias_keys(validation_alias):
-            names.add(key)
-        if by_name or not has_alias:
+        validation_keys = _field_validation_keys(finfo)
+        if validation_keys:
+            names.update(validation_keys)
+            if by_name:
+                names.add(fname)
+        else:
+            # No alias declared — field name is the canonical input.
             names.add(fname)
     return names
 
@@ -217,25 +242,22 @@ def _accepted_field_names(model: type[BaseModel]) -> set[str]:
 def _normalize_to_field_name(
     key: str, model: type[BaseModel]
 ) -> str | None:
-    """Map a planner-emitted input key (alias or field name) back to
-    the canonical field name in ``model.model_fields``.
-
-    Respects ``populate_by_name`` config so the per-field walk uses
-    the same acceptance rule as ``_accepted_field_names`` — no
-    over-permissive normalisation.
+    """Map a planner-emitted input key back to the canonical field name
+    in ``model.model_fields``. Same precedence rules as
+    ``_accepted_field_names`` so coverage stays in lock-step.
     """
 
     by_name = _model_populates_by_name(model)
     for fname, finfo in model.model_fields.items():
-        alias = getattr(finfo, "alias", None)
-        validation_alias = getattr(finfo, "validation_alias", None)
-        has_alias = alias is not None or validation_alias is not None
-        if alias == key:
-            return fname
-        if any(k == key for k in _iter_validation_alias_keys(validation_alias)):
-            return fname
-        if key == fname and (by_name or not has_alias):
-            return fname
+        validation_keys = _field_validation_keys(finfo)
+        if validation_keys:
+            if key in validation_keys:
+                return fname
+            if by_name and key == fname:
+                return fname
+        else:
+            if key == fname:
+                return fname
     return None
 
 
@@ -398,6 +420,48 @@ def _phase1_check_unknown_keys(
                     f"Accepted: {sorted(accepted)}."
                 ),
             )
+
+
+def _iter_dict_keys_with_refs(value: Any) -> Iterator[str]:
+    """Recursively yield every string DICT KEY (any nesting depth) in
+    ``value`` that contains a ``${...}`` ref. Existing ``contains_ref``
+    / ``iter_refs`` only walk dict values; refs in keys need this
+    separate walk to surface as ``unsupported_ref_location``.
+    Codex R4 MINOR #4.
+    """
+
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if isinstance(k, str) and contains_ref(k):
+                yield k
+            yield from _iter_dict_keys_with_refs(v)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_dict_keys_with_refs(item)
+
+
+def _phase1_check_ref_in_dict_keys(
+    step_id: str, action: Action, tool_spec: ToolSpec | None
+) -> Iterator[Violation]:
+    """Emit ``unsupported_ref_location`` violations for ``${...}``
+    references that appear as DICT KEYS anywhere in ``action.args``.
+    Executor doesn't resolve dict keys; surfacing this at plan time
+    prevents silent planner typos.
+    """
+
+    for ref_key in _iter_dict_keys_with_refs(action.args):
+        yield Violation(
+            step_id=step_id,
+            tool=tool_spec.name if tool_spec else None,
+            field_path=f"<dict key {ref_key!r}>",
+            code="unsupported_ref_location",
+            message=(
+                f"reference {ref_key!r} appears as a DICT KEY in "
+                f"action args. References in dict keys are not "
+                f"resolved by executor — refactor to use the ref as a "
+                f"dict VALUE or top-level field."
+            ),
+        )
 
 
 def _phase1_check_ref_syntax(
@@ -672,6 +736,184 @@ def _phase2_validate_args(
         )
 
 
+def _try_extract_basemodel(annotation: Any) -> type[BaseModel] | None:
+    """If ``annotation`` is (possibly wrapped in Optional/Annotated) a
+    pydantic ``BaseModel`` subclass, return that subclass. Otherwise
+    None. Codex R4 MAJOR #1 — used to detect nested-model fields.
+    """
+
+    bare = _strip_optional_and_annotated(annotation)
+    if isinstance(bare, type) and issubclass(bare, BaseModel):
+        return bare
+    return None
+
+
+def _check_container_shell_constraints(
+    *,
+    step_id: str,
+    tool_spec: ToolSpec,
+    field_name: str,
+    value: Any,
+    annotation: Any,
+) -> Iterator[Violation]:
+    """Check container-level length constraints that are statically
+    knowable even when the container has ref leaves (Codex R4 MAJOR #2).
+
+    Refs substitute in-place inside containers (a ref leaf becomes one
+    element, not a splice), so ``len(literal_container)`` is the final
+    length. ``Field(min_length=2)`` on ``["${s1.x}"]`` is a static
+    violation regardless of what s1.x resolves to.
+
+    Builds an `Annotated[list[Any], *length_metadata]` shell and runs
+    TypeAdapter — extracts ``MinLen``/``MaxLen`` from pydantic
+    metadata. Only checks length-style constraints (not element type),
+    so element walking still has work to do.
+    """
+
+    # Find length-only metadata from the original Annotated wrapper.
+    origin = get_origin(annotation)
+    if origin is not Annotated:
+        return  # No constraints attached at this level.
+    args = get_args(annotation)
+    # args[0] is the inner type, args[1:] are metadata objects.
+    metadata = args[1:]
+    if not metadata:
+        return
+    # Filter to length-style constraints only — using annotated_types
+    # MinLen/MaxLen if present, plus a generic name-check fallback so
+    # we don't depend on the import.
+    length_metadata = [
+        m for m in metadata
+        if type(m).__name__ in {"MinLen", "MaxLen", "Len"}
+    ]
+    if not length_metadata:
+        return
+    # Build a shell type that matches the value's actual container
+    # type with Any elements. ``list``/``dict``/``set``/``frozenset``/
+    # ``tuple`` covered; for unknown container types we skip.
+    if isinstance(value, list):
+        shell = list[Any]
+    elif isinstance(value, tuple):
+        shell = tuple[Any, ...]
+    elif isinstance(value, set):
+        shell = set[Any]
+    elif isinstance(value, frozenset):
+        shell = frozenset[Any]
+    elif isinstance(value, dict):
+        shell = dict[Any, Any]
+    else:
+        return
+    shell_annotation = Annotated[(shell, *length_metadata)]
+    try:
+        TypeAdapter(shell_annotation).validate_python(value)
+    except ValidationError as exc:
+        for err in exc.errors():
+            yield Violation(
+                step_id=step_id,
+                tool=tool_spec.name,
+                field_path=field_name,
+                code=err.get("type", "invalid_arg_type"),
+                message=err.get("msg", "container constraint violated"),
+            )
+
+
+def _validate_nested_basemodel_partial(
+    *,
+    step_id: str,
+    tool_spec: ToolSpec,
+    field_name: str,
+    value: dict[str, Any],
+    nested_model: type[BaseModel],
+) -> Iterator[Violation]:
+    """Recursive partial validation for nested ``BaseModel`` fields.
+
+    Mirrors ``_phase2_validate_args`` logic at the nested level:
+    - Check unknown keys against ``nested_model.model_fields``.
+    - When refs present, do per-field validation respecting
+      pydantic input-key rules + Field constraints.
+    - When no refs in the nested dict, full ``nested_model.model_validate``.
+
+    Field path is prefixed with the parent field name (e.g.
+    ``payload.author.name``) so retry feedback locates errors precisely.
+    Codex R4 MAJOR #1.
+    """
+
+    accepted_names = _accepted_field_names(nested_model)
+    # Phase 1 within the nested model: unknown keys
+    for key in value.keys():
+        if key not in accepted_names:
+            yield Violation(
+                step_id=step_id,
+                tool=tool_spec.name,
+                field_path=f"{field_name}.{key}",
+                code="unknown_arg",
+                message=(
+                    f"nested model {nested_model.__name__} got unknown "
+                    f"key {key!r}. Accepted: {sorted(accepted_names)}."
+                ),
+            )
+
+    if not contains_ref(value):
+        # No refs at this level — full nested model_validate.
+        try:
+            nested_model.model_validate(
+                {k: v for k, v in value.items() if k in accepted_names}
+            )
+        except ValidationError as exc:
+            for err in exc.errors():
+                loc = err.get("loc") or ()
+                loc_tail = ".".join(str(p) for p in loc) if loc else ""
+                full_path = (
+                    f"{field_name}.{loc_tail}" if loc_tail else field_name
+                )
+                code = err.get("type", "invalid_arg_type")
+                if code == "missing":
+                    code = "missing_arg"
+                yield Violation(
+                    step_id=step_id,
+                    tool=tool_spec.name,
+                    field_path=full_path,
+                    code=code,
+                    message=err.get("msg", "invalid value"),
+                )
+        return
+
+    # Refs present — per-field walk with constraints preserved.
+    canonical_value: dict[str, Any] = {}
+    for key, v in value.items():
+        if key not in accepted_names:
+            continue
+        canonical_key = _normalize_to_field_name(key, nested_model)
+        if canonical_key is not None:
+            canonical_value[canonical_key] = v
+    for sub_fname, sub_finfo in nested_model.model_fields.items():
+        if sub_fname not in canonical_value:
+            try:
+                required = sub_finfo.is_required()
+            except AttributeError:  # pragma: no cover
+                required = sub_finfo.default is ...
+            if required:
+                yield Violation(
+                    step_id=step_id,
+                    tool=tool_spec.name,
+                    field_path=f"{field_name}.{sub_fname}",
+                    code="missing_arg",
+                    message=(
+                        f"required nested field {sub_fname!r} of "
+                        f"{nested_model.__name__} is missing"
+                    ),
+                )
+            continue
+        sub_annotation = _annotation_with_constraints(sub_finfo)
+        yield from _validate_field_value(
+            step_id=step_id,
+            tool_spec=tool_spec,
+            field_name=f"{field_name}.{sub_fname}",
+            value=canonical_value[sub_fname],
+            annotation=sub_annotation,
+        )
+
+
 def _validate_field_value(
     *,
     step_id: str,
@@ -719,13 +961,21 @@ def _validate_field_value(
         return
 
     if isinstance(value, (list, tuple, set, frozenset)) and contains_ref(value):
+        # Codex R4 MAJOR #2: container shell length is statically
+        # knowable — refs don't change list length (they substitute
+        # in-place, not splice). Check container-level constraints
+        # like Field(min_length=2) before recursing into elements.
+        yield from _check_container_shell_constraints(
+            step_id=step_id,
+            tool_spec=tool_spec,
+            field_name=field_name,
+            value=value,
+            annotation=annotation,
+        )
         element_annotation = _peel_container_element_annotation(annotation)
         if element_annotation is None:
-            return  # Can't peel — defer.
+            return
         for idx, item in enumerate(value):
-            # Recurse with peeled element annotation — handles nested
-            # containers like ``list[dict[str, str]]`` where the inner
-            # dict may itself contain refs (Codex R3 MAJOR #1).
             yield from _validate_field_value(
                 step_id=step_id,
                 tool_spec=tool_spec,
@@ -736,14 +986,51 @@ def _validate_field_value(
         return
 
     if isinstance(value, dict) and contains_ref(value):
+        # Codex R4 MAJOR #1: nested BaseModel branch. If annotation is
+        # a BaseModel subclass (possibly wrapped in Optional/Annotated),
+        # treat the dict as a sub-model and recurse with model_fields
+        # context — checks unknown/missing/duplicate per the sub-model's
+        # own contract.
+        nested_model = _try_extract_basemodel(annotation)
+        if nested_model is not None:
+            yield from _validate_nested_basemodel_partial(
+                step_id=step_id,
+                tool_spec=tool_spec,
+                field_name=field_name,
+                value=value,
+                nested_model=nested_model,
+            )
+            return
+
+        # Container shell constraints (Codex R4 MAJOR #2).
+        yield from _check_container_shell_constraints(
+            step_id=step_id,
+            tool_spec=tool_spec,
+            field_name=field_name,
+            value=value,
+            annotation=annotation,
+        )
+        # Codex R4 MINOR #4: ref-like dict keys → unsupported_ref_location.
+        for k in value.keys():
+            if isinstance(k, str) and contains_ref(k):
+                yield Violation(
+                    step_id=step_id,
+                    tool=tool_spec.name,
+                    field_path=f"{field_name}.<key {k!r}>",
+                    code="unsupported_ref_location",
+                    message=(
+                        f"reference {k!r} appears as a DICT KEY in field "
+                        f"{field_name!r}. References in dict keys are not "
+                        f"supported — they aren't resolved by executor."
+                    ),
+                )
+        # Recurse into values + concrete keys for plain dict[K, V].
         value_annotation = _peel_container_element_annotation(annotation)
         key_annotation = _peel_dict_key_annotation(annotation)
         if value_annotation is None and key_annotation is None:
-            return  # Can't peel either side — defer.
+            return
         for k, item in value.items():
-            # Walk keys (Codex R3 MINOR #7) — concrete keys only;
-            # refs in keys are unusual but technically possible.
-            if key_annotation is not None and not contains_ref(k):
+            if key_annotation is not None and not (isinstance(k, str) and contains_ref(k)):
                 yield from _validate_field_value(
                     step_id=step_id,
                     tool_spec=tool_spec,
@@ -829,6 +1116,10 @@ def validate_action_args(
     violations.extend(_phase1_check_unknown_keys(step_id, action, tool_spec))
     # Phase 1.b: malformed ${...} tokens (Codex R3 MINOR #5)
     violations.extend(_phase1_check_ref_syntax(step_id, action, tool_spec))
+    # Phase 1.b.2: refs in dict KEYS — unsupported (Codex R4 MINOR #4)
+    violations.extend(
+        _phase1_check_ref_in_dict_keys(step_id, action, tool_spec)
+    )
     # Phase 1.c: ref integrity (requires plan context for target lookup)
     if plan is not None:
         violations.extend(
