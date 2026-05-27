@@ -28,7 +28,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sreda.services.tool_schemas.families import FAMILIES, FAMILY_HEADERS, Family
+from sreda.services.tool_schemas.families import FAMILIES, Family
 
 
 def _direct_field_validator_names(model: type[BaseModel]) -> set[str]:
@@ -74,8 +74,6 @@ def _collect_field_validator_names(
     Cycle-safe via ``_seen`` (handles self-referential nested models).
     """
 
-    import typing
-    from typing import get_args, get_origin
 
     if _seen is None:
         _seen = set()
@@ -349,7 +347,7 @@ class ToolSpec(BaseModel):
         # safety (renderer puts both into the planner prompt).
         if not self.name.strip():
             raise ValueError(
-                f"ToolSpec.name must be a non-empty (post-strip) string."
+                "ToolSpec.name must be a non-empty (post-strip) string."
             )
         if not _TOOL_NAME_PATTERN.fullmatch(self.name):
             raise ValueError(

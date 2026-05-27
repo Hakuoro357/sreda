@@ -8,19 +8,25 @@ Coverage:
   TOOL_FAMILY_MANIFEST has a matching ToolSpec
 - Per-tool: input_model rejects extra keys, parser produces
   output_model on the canonical "ok:..." string
+- Codex Sub-A4 R2: tight ID aliases, string caps match runtime,
+  update quantity_text="" accepted, output ID fail-closed,
+  cannot_parse_trigger_iso stable, sentinel boundary regression.
 """
 
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
+from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
 from sreda.services.tool_schemas.housewife import (
     AddShoppingItemsAdded,
     ClearBoughtShoppingOk,
+    HousewifeToolError,
     ListShoppingEmpty,
     MarkShoppingBoughtOk,
+    PARSERS,
     RemoveShoppingItemsOk,
     UpdateShoppingItemOk,
     UpdateShoppingItemsCategoryOk,
@@ -31,22 +37,25 @@ from sreda.services.tool_schemas.registry_quality import (
     validate_tool_registry_quality,
 )
 from sreda.services.tool_schemas.specs_shopping import (
-    ADD_SHOPPING_ITEMS_SPEC,
-    CLEAR_BOUGHT_SHOPPING_SPEC,
-    LIST_SHOPPING_SPEC,
-    MARK_SHOPPING_BOUGHT_SPEC,
-    REMOVE_SHOPPING_ITEMS_SPEC,
     SHOPPING_SPECS,
-    UPDATE_SHOPPING_ITEM_SPEC,
-    UPDATE_SHOPPING_ITEMS_CATEGORY_SPEC,
     AddShoppingItemsInput,
     ClearBoughtShoppingInput,
     ListShoppingInput,
     MarkShoppingBoughtInput,
-    RemoveShoppingItemsInput,
     UpdateShoppingItemInput,
     UpdateShoppingItemsCategoryInput,
 )
+
+# ---------------------------------------------------------------------------
+# Real-shape test IDs. Codex R2 MAJOR #1 — must match
+# ``^sh_[0-9a-f]{24}$`` etc. exactly (the runtime emits
+# ``f"sh_{uuid4().hex[:24]}"``). Lowercase hex only.
+# ---------------------------------------------------------------------------
+
+SH_A = "sh_aaaaaaaaaaaaaaaaaaaaaaaa"
+SH_B = "sh_bbbbbbbbbbbbbbbbbbbbbbbb"
+SH_C = "sh_cccccccccccccccccccccccc"
+REM_A = "rem_dddddddddddddddddddddddd"
 
 
 # ---------------------------------------------------------------------------
@@ -160,16 +169,46 @@ def test_mark_shopping_bought_input_rejects_whitespace_only_id() -> None:
         MarkShoppingBoughtInput.model_validate({"item_ids": ["   "]})
 
 
+def test_mark_shopping_bought_input_accepts_real_shape_id() -> None:
+    """Codex R2 MAJOR #1: tight ``^sh_[0-9a-f]{24}$`` must accept the
+    real runtime shape produced by ``f"sh_{uuid4().hex[:24]}"``."""
+    parsed = MarkShoppingBoughtInput.model_validate({"item_ids": [SH_A, SH_B]})
+    assert parsed.item_ids == [SH_A, SH_B]
+
+
+def test_mark_shopping_bought_input_rejects_short_id() -> None:
+    """Codex R2 MAJOR #1: ``sh_1`` no longer accepted (was accepted by
+    the loose ``^sh_\\S+$`` pattern in R1)."""
+    with pytest.raises(ValidationError):
+        MarkShoppingBoughtInput.model_validate({"item_ids": ["sh_1"]})
+
+
+def test_mark_shopping_bought_input_rejects_uppercase_hex() -> None:
+    """uuid4().hex emits lowercase only — uppercase is a planner typo."""
+    with pytest.raises(ValidationError):
+        MarkShoppingBoughtInput.model_validate({
+            "item_ids": ["sh_AAAAAAAAAAAAAAAAAAAAAAAA"]
+        })
+
+
+def test_mark_shopping_bought_input_rejects_non_hex_chars() -> None:
+    """Non-hex char in suffix — would never come from uuid4().hex."""
+    with pytest.raises(ValidationError):
+        MarkShoppingBoughtInput.model_validate({
+            "item_ids": ["sh_zzzzzzzzzzzzzzzzzzzzzzzz"]
+        })
+
+
 def test_update_shopping_item_input_requires_at_least_one_mutable_field() -> None:
-    """Codex R1 MAJOR #2: ``{"item_id": "sh_42"}`` with no
+    """Codex R1 MAJOR #2: ``{"item_id": "sh_<id>"}`` with no
     title/quantity/category is a no-op call — rejected by model_validator."""
     with pytest.raises(ValidationError):
-        UpdateShoppingItemInput.model_validate({"item_id": "sh_42"})
+        UpdateShoppingItemInput.model_validate({"item_id": SH_A})
 
 
 def test_update_shopping_item_input_accepts_title_only() -> None:
     parsed = UpdateShoppingItemInput.model_validate({
-        "item_id": "sh_42",
+        "item_id": SH_A,
         "title": "новый хлеб",
     })
     assert parsed.title == "новый хлеб"
@@ -185,10 +224,73 @@ def test_update_shopping_item_input_rejects_typo_id() -> None:
         })
 
 
+def test_update_shopping_item_input_accepts_empty_quantity_text_for_clear() -> None:
+    """Codex R2 MAJOR #3: ``quantity_text=""`` is a legitimate intent
+    («убери количество у молока») — runtime ``housewife_shopping.py:401-402``
+    maps empty string to ``None`` (clears the quantity). Was rejected
+    by R1's ``ShortStr | None`` (min_length=1)."""
+    parsed = UpdateShoppingItemInput.model_validate({
+        "item_id": SH_A,
+        "quantity_text": "",
+    })
+    assert parsed.quantity_text == ""
+
+
+def test_update_shopping_item_input_rejects_empty_only_call() -> None:
+    """Codex R2 MAJOR #3 corner: empty quantity_text DOES count as a
+    mutable field (it's a real clear intent). But submitting NOTHING
+    still fails — the model_validator switched to ``model_fields_set``
+    semantics, so missing fields are different from explicit empty."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemInput.model_validate({"item_id": SH_A})
+
+
+def test_update_shopping_item_input_accepts_long_title_up_to_500() -> None:
+    """Codex R2 MAJOR #2: ``ShoppingTitle`` cap matches runtime
+    ``title[:500]`` (housewife_shopping.py:252). Was capped at 200 by
+    ``ShortStr`` — silently truncated long titles."""
+    long_title = "a" * 500
+    parsed = UpdateShoppingItemInput.model_validate({
+        "item_id": SH_A,
+        "title": long_title,
+    })
+    assert len(parsed.title) == 500
+
+
+def test_update_shopping_item_input_rejects_title_over_500() -> None:
+    """Codex R2 MAJOR #2: just past the runtime cap should fail
+    validation rather than silently truncate downstream."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemInput.model_validate({
+            "item_id": SH_A,
+            "title": "a" * 501,
+        })
+
+
+def test_update_shopping_item_input_rejects_quantity_over_64() -> None:
+    """Codex R2 MAJOR #2: ``QuantityText`` cap matches runtime
+    ``quantity_text=...[:64]`` (housewife_shopping.py:253)."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemInput.model_validate({
+            "item_id": SH_A,
+            "quantity_text": "x" * 65,
+        })
+
+
+def test_update_shopping_item_input_rejects_category_over_64() -> None:
+    """Codex R2 MAJOR #2: ``CategoryName`` cap matches runtime
+    ``_normalize_category`` returning ``[:64]`` (housewife_shopping.py:96)."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemInput.model_validate({
+            "item_id": SH_A,
+            "category": "x" * 65,
+        })
+
+
 def test_update_shopping_items_category_input_requires_category() -> None:
     with pytest.raises(ValidationError):
         UpdateShoppingItemsCategoryInput.model_validate({
-            "item_ids": ["sh_1", "sh_2"],
+            "item_ids": [SH_A, SH_B],
         })
 
 
@@ -197,8 +299,18 @@ def test_update_shopping_items_category_input_rejects_single_id() -> None:
     should use ``update_shopping_item`` (more specific return shape)."""
     with pytest.raises(ValidationError):
         UpdateShoppingItemsCategoryInput.model_validate({
-            "item_ids": ["sh_42"],
+            "item_ids": [SH_A],
             "category": "молочные",
+        })
+
+
+def test_update_shopping_items_category_input_rejects_long_category() -> None:
+    """Codex R2 MAJOR #2: bulk category was ``NonBlankStr`` (uncapped) —
+    now uses ``CategoryName`` (≤64) to match runtime."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemsCategoryInput.model_validate({
+            "item_ids": [SH_A, SH_B],
+            "category": "x" * 65,
         })
 
 
@@ -224,7 +336,7 @@ def test_clear_bought_shopping_input_accepts_empty_dict() -> None:
 
 def test_add_shopping_items_parser_returns_added_variant() -> None:
     parsed = parse_tool_output(
-        "add_shopping_items", "ok:added:2:ids=[sh_1,sh_2]"
+        "add_shopping_items", f"ok:added:2:ids=[{SH_A},{SH_B}]"
     )
     assert isinstance(parsed, AddShoppingItemsAdded)
     assert parsed.added_count == 2
@@ -243,9 +355,9 @@ def test_remove_shopping_items_parser_returns_removed_variant() -> None:
 
 
 def test_update_shopping_item_parser_returns_updated_variant() -> None:
-    parsed = parse_tool_output("update_shopping_item", "ok:updated:sh_42")
+    parsed = parse_tool_output("update_shopping_item", f"ok:updated:{SH_A}")
     assert isinstance(parsed, UpdateShoppingItemOk)
-    assert parsed.item_id == "sh_42"
+    assert parsed.item_id == SH_A
 
 
 def test_update_shopping_items_category_parser_returns_category_variant() -> None:
@@ -276,7 +388,6 @@ def test_update_shopping_item_not_found_has_stable_error_code() -> None:
     """``error: item 'sh_42' not found`` and ``error: item 'sh_7' not
     found`` must produce the SAME error_code so the planner can branch
     on it deterministically (Codex R1 CRITICAL)."""
-    from sreda.services.tool_schemas.housewife import HousewifeToolError
     a = parse_tool_output("update_shopping_item", "error: item 'sh_42' not found")
     b = parse_tool_output("update_shopping_item", "error: item 'sh_7' not found")
     assert isinstance(a, HousewifeToolError)
@@ -286,12 +397,31 @@ def test_update_shopping_item_not_found_has_stable_error_code() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Codex R1 MAJOR #5 — parser output validates against spec.output_model
+# Codex Sub-A4 R2 MAJOR #6 — cannot_parse_trigger_iso stable code
 # ---------------------------------------------------------------------------
 
 
-from pydantic import TypeAdapter  # noqa: E402
-from sreda.services.tool_schemas.housewife import PARSERS  # noqa: E402
+def test_schedule_reminder_cannot_parse_trigger_iso_has_stable_code() -> None:
+    """``error: cannot parse trigger_iso='завтра'`` and
+    ``error: cannot parse trigger_iso='вчера'`` must produce the SAME
+    error_code so reminder-parsing failures branch deterministically
+    (Codex R2 MAJOR #6 — was value-dependent like
+    ``cannot_parse_trigger_iso='завтра'``)."""
+    a = parse_tool_output(
+        "schedule_reminder", "error: cannot parse trigger_iso='завтра'"
+    )
+    b = parse_tool_output(
+        "schedule_reminder", "error: cannot parse trigger_iso='вчера'"
+    )
+    assert isinstance(a, HousewifeToolError)
+    assert isinstance(b, HousewifeToolError)
+    assert a.error_code == "cannot_parse_trigger_iso"
+    assert b.error_code == "cannot_parse_trigger_iso"
+
+
+# ---------------------------------------------------------------------------
+# Codex R1 MAJOR #5 — parser output validates against spec.output_model
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("spec", SHOPPING_SPECS, ids=lambda s: s.name)
@@ -303,10 +433,10 @@ def test_every_shopping_spec_has_a_parser(spec) -> None:
 
 
 _PARSER_HAPPY_PATH = {
-    "add_shopping_items": "ok:added:1:ids=[sh_1]",
+    "add_shopping_items": f"ok:added:1:ids=[{SH_A}]",
     "mark_shopping_bought": "ok:bought:3",
     "remove_shopping_items": "ok:removed:2",
-    "update_shopping_item": "ok:updated:sh_42",
+    "update_shopping_item": f"ok:updated:{SH_A}",
     "update_shopping_items_category": "ok:updated:5",
     "list_shopping": "no shopping items",
     "clear_bought_shopping": "ok:cleared:10",
@@ -326,6 +456,51 @@ def test_parser_output_validates_against_spec_output_model(spec) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Codex R2 MAJOR #4 — output IDs are also tightened; malformed legacy
+# output returns ToolOutputContractViolation (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def test_update_shopping_item_parser_returns_sentinel_for_malformed_id() -> None:
+    """``ok:updated:sh_garbage`` matches the parser regex but fails the
+    tight ``ShoppingItemId`` constraint — must fall through to the
+    sentinel rather than emit a bad id to the planner."""
+    parsed = parse_tool_output("update_shopping_item", "ok:updated:sh_garbage")
+    assert isinstance(parsed, ToolOutputContractViolation)
+    assert parsed.tool_name == "update_shopping_item"
+
+
+def test_add_shopping_items_parser_returns_sentinel_for_malformed_ids() -> None:
+    """``ok:added:2:ids=[sh_1,sh_2]`` was R1's happy-path test fixture —
+    R2 tightening rejects it because the suffixes are not 24-hex."""
+    parsed = parse_tool_output(
+        "add_shopping_items", "ok:added:2:ids=[sh_1,sh_2]"
+    )
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #5 — ToolOutputContractViolation boundary regression
+# The sentinel is intentionally NOT in any output_model union. Executor
+# MUST catch it before output_model validation. This test pins that
+# contract so a future wrapper can't silently accept the sentinel.
+# ---------------------------------------------------------------------------
+
+
+def test_sentinel_is_not_valid_against_any_shopping_output_model() -> None:
+    """``ToolOutputContractViolation`` must FAIL ``TypeAdapter`` validation
+    against every shopping ``output_model`` — proves the executor must
+    catch the sentinel BEFORE output_model validation (Codex R2 MAJOR #5).
+    If a future wrapper accidentally lets it through, this test breaks."""
+    sentinel = parse_tool_output("update_shopping_item", "totally unparseable")
+    assert isinstance(sentinel, ToolOutputContractViolation)
+    sentinel_dump = sentinel.model_dump()
+    for spec in SHOPPING_SPECS:
+        with pytest.raises(ValidationError):
+            TypeAdapter(spec.output_model).validate_python(sentinel_dump)
+
+
+# ---------------------------------------------------------------------------
 # Codex R1 MINOR #9 — error-path tests for new parsers
 # ---------------------------------------------------------------------------
 
@@ -338,7 +513,6 @@ def test_parser_output_validates_against_spec_output_model(spec) -> None:
     ("clear_bought_shopping", "error: internal", "internal"),
 ])
 def test_new_parsers_error_paths(tool_name, raw, expected_code) -> None:
-    from sreda.services.tool_schemas.housewife import HousewifeToolError
     parsed = parse_tool_output(tool_name, raw)
     assert isinstance(parsed, HousewifeToolError), (
         f"Expected HousewifeToolError; got {type(parsed).__name__}"

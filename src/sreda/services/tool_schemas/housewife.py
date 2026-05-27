@@ -29,9 +29,10 @@ import re
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from sreda.services.tool_schemas.base import ToolOutput, ToolOutputContractViolation
+from sreda.services.tool_schemas.base import ToolOutputContractViolation
+from sreda.services.tool_schemas.common import ReminderId, ShoppingItemId
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,15 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"^checklist\s+.+\s+not\s+found$", re.IGNORECASE),
         "checklist_not_found",
+    ),
+    # schedule_reminder / update_reminder: ``error: cannot parse trigger_iso='завтра'``
+    # Codex R2 MAJOR #6: without this, ``_parse_error`` produces a
+    # value-dependent code like ``cannot_parse_trigger_iso='завтра'``
+    # (different per input), making planner branching nondeterministic.
+    # Source: ``housewife_chat_tools.py:339, :504``.
+    (
+        re.compile(r"^cannot\s+parse\s+trigger_iso=.+$", re.IGNORECASE),
+        "cannot_parse_trigger_iso",
     ),
 ]
 
@@ -132,7 +142,12 @@ class AddShoppingItemsAdded(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["added"] = "added"
     added_count: int = Field(ge=1)
-    item_ids: list[str]
+    item_ids: list[ShoppingItemId]
+    """Codex R2 MAJOR #4: was ``list[str]`` — accepted malformed legacy
+    output and let bad ids become planner-visible refs. Now uses the
+    tight ``sh_<24 hex>`` pattern; parsers wrap construction in
+    ``ValidationError`` → ``ToolOutputContractViolation`` so the
+    executor fail-closes on bad raw output."""
 
     @model_validator(mode="after")
     def _validate_count_matches_ids(self) -> AddShoppingItemsAdded:
@@ -181,7 +196,15 @@ def parse_add_shopping_items(
         ids = [x.strip() for x in ids_csv.split(",") if x.strip()]
         if count == 0:
             return AddShoppingItemsEmpty()
-        return AddShoppingItemsAdded(added_count=count, item_ids=ids)
+        # Codex R2 MAJOR #4: tight ShoppingItemId pattern rejects
+        # malformed legacy output (e.g. ``ids=[sh_1,sh_2]`` vs the
+        # ``sh_<24 hex>`` runtime contract). On ValidationError fall
+        # through to ToolOutputContractViolation so the executor
+        # halts the plan instead of letting bad ids reach the planner.
+        try:
+            return AddShoppingItemsAdded(added_count=count, item_ids=ids)
+        except ValidationError:
+            pass
     return ToolOutputContractViolation(
         raw_output=raw,
         tool_name="add_shopping_items",
@@ -200,7 +223,9 @@ def parse_add_shopping_items(
 class ScheduleReminderScheduled(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["scheduled"] = "scheduled"
-    reminder_id: str = Field(min_length=1)
+    reminder_id: ReminderId
+    """Codex R2 MAJOR #4: was ``str(min_length=1)`` — accepted any
+    non-empty token. Now uses the tight ``rem_<24 hex>`` pattern."""
     trigger_at_iso: str = Field(min_length=1)
 
 
@@ -252,10 +277,19 @@ def parse_schedule_reminder(
     stripped = raw.strip()
     m = _SCHEDULE_REMINDER_RE.match(stripped)
     if m is not None:
-        return ScheduleReminderScheduled(
-            reminder_id=m.group("id"),
-            trigger_at_iso=m.group("iso"),
-        )
+        try:
+            return ScheduleReminderScheduled(
+                reminder_id=m.group("id"),
+                trigger_at_iso=m.group("iso"),
+            )
+        except ValidationError:
+            # Codex R2 MAJOR #4: malformed reminder_id (not matching
+            # rem_<24 hex>) — fail-closed via sentinel.
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="schedule_reminder",
+                timestamp=datetime.now(timezone.utc),
+            )
     m = _SCHEDULE_SKIPPED_PAST_RE.match(stripped)
     if m is not None:
         return ScheduleReminderSkippedPast(
@@ -279,7 +313,9 @@ def parse_schedule_reminder(
 
 class ListShoppingItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    item_id: str
+    item_id: ShoppingItemId
+    """Codex R2 MAJOR #4: was ``str`` — accepted any token after the
+    ``[`` bracket. Now uses tight ``sh_<24 hex>`` pattern."""
     category: str
     """Category bucket the legacy tool grouped this item under (e.g.
     ``молочные`` / ``бакалея``). Comes from the surrounding ``[category]``
@@ -376,13 +412,23 @@ def parse_list_shopping(
                 raw_output=raw, tool_name="list_shopping",
                 timestamp=datetime.now(timezone.utc),
             )
-        items.append(
-            ListShoppingItem(
-                item_id=item_match.group("id"),
-                category=current_category,
-                raw_line=clean,
+        try:
+            items.append(
+                ListShoppingItem(
+                    item_id=item_match.group("id"),
+                    category=current_category,
+                    raw_line=clean,
+                )
             )
-        )
+        except ValidationError:
+            # Codex R2 MAJOR #4: regex captured a bracketed token that
+            # starts with ``sh_`` but isn't a valid 24-hex id — fail
+            # the whole list output via sentinel rather than emit a
+            # partial-but-malformed list to the planner.
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_shopping",
+                timestamp=datetime.now(timezone.utc),
+            )
     if not items:
         # Header + categories but no items — malformed for "ok" variant.
         return ToolOutputContractViolation(
@@ -402,7 +448,9 @@ def parse_list_shopping(
 
 class ListRemindersItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    reminder_id: str
+    reminder_id: ReminderId
+    """Codex R2 MAJOR #4: was ``str`` — now uses the tight
+    ``rem_<24 hex>`` pattern."""
     raw_line: str
 
 
@@ -455,7 +503,16 @@ def parse_list_reminders(
                 tool_name="list_reminders",
                 timestamp=datetime.now(timezone.utc),
             )
-        items.append(ListRemindersItem(reminder_id=m.group("id"), raw_line=line))
+        try:
+            items.append(ListRemindersItem(reminder_id=m.group("id"), raw_line=line))
+        except ValidationError:
+            # Codex R2 MAJOR #4: bracketed token isn't a valid
+            # ``rem_<24 hex>`` — fail-closed via sentinel.
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="list_reminders",
+                timestamp=datetime.now(timezone.utc),
+            )
     if not items:
         # Header but no rows — production never emits this (empty state
         # is the ``no active reminders`` short-circuit). Codex Medium #2.
@@ -590,7 +647,9 @@ def parse_remove_shopping_items(
 class UpdateShoppingItemOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["updated"] = "updated"
-    item_id: str = Field(min_length=1)
+    item_id: ShoppingItemId
+    """Codex R2 MAJOR #4: was ``str(min_length=1)`` — accepted any
+    non-blank token. Now uses the tight ``sh_<24 hex>`` pattern."""
 
 
 UpdateShoppingItemOutput = Annotated[
@@ -609,7 +668,11 @@ def parse_update_shopping_item(
         return err
     m = _UPDATE_ITEM_RE.match(raw.strip())
     if m is not None:
-        return UpdateShoppingItemOk(item_id=m.group("id"))
+        try:
+            return UpdateShoppingItemOk(item_id=m.group("id"))
+        except ValidationError:
+            # Codex R2 MAJOR #4: id doesn't match sh_<24 hex>.
+            pass
     return ToolOutputContractViolation(
         raw_output=raw,
         tool_name="update_shopping_item",

@@ -161,9 +161,9 @@ def _check_spec(
             field_path="family",
             code="missing_family",
             message=(
-                f"family is not declared. Every production tool must "
-                f"belong to one of the 12 families — see "
-                f"docs/architecture/tool-family-taxonomy.md."
+                "family is not declared. Every production tool must "
+                "belong to one of the 12 families — see "
+                "docs/architecture/tool-family-taxonomy.md."
             ),
         )
 

@@ -36,6 +36,22 @@ from sreda.services.tool_schemas.housewife import (
     parse_schedule_reminder,
 )
 
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #1: tight ID aliases enforce ``^sh_[0-9a-f]{24}$`` /
+# ``^rem_[0-9a-f]{24}$`` etc. matching the runtime
+# ``f"sh_{uuid4().hex[:24]}"`` factories. Short fakes like ``sh_1``
+# are no longer valid output IDs — they trigger the fail-closed sentinel.
+# ---------------------------------------------------------------------------
+
+SH_A = "sh_aaaaaaaaaaaaaaaaaaaaaaaa"
+SH_B = "sh_bbbbbbbbbbbbbbbbbbbbbbbb"
+SH_C = "sh_cccccccccccccccccccccccc"
+SH_D = "sh_dddddddddddddddddddddddd"
+SH_E = "sh_eeeeeeeeeeeeeeeeeeeeeeee"
+SH_F = "sh_ffffffffffffffffffffffff"
+REM_A = "rem_1111111111111111aaaaaaaa"[:28]  # 'rem_' + 24 chars
+REM_B = "rem_2222222222222222bbbbbbbb"[:28]
+
 
 # ---------------------------------------------------------------------------
 # add_shopping_items
@@ -43,16 +59,23 @@ from sreda.services.tool_schemas.housewife import (
 
 
 def test_add_shopping_items_added_with_ids() -> None:
-    result = parse_add_shopping_items("ok:added:3:ids=[sh_1,sh_2,sh_3]")
+    result = parse_add_shopping_items(f"ok:added:3:ids=[{SH_A},{SH_B},{SH_C}]")
     assert isinstance(result, AddShoppingItemsAdded)
     assert result.added_count == 3
-    assert result.item_ids == ["sh_1", "sh_2", "sh_3"]
+    assert result.item_ids == [SH_A, SH_B, SH_C]
 
 
 def test_add_shopping_items_added_single_id() -> None:
-    result = parse_add_shopping_items("ok:added:1:ids=[sh_abc]")
+    result = parse_add_shopping_items(f"ok:added:1:ids=[{SH_A}]")
     assert isinstance(result, AddShoppingItemsAdded)
     assert result.added_count == 1
+
+
+def test_add_shopping_items_malformed_ids_returns_violation() -> None:
+    """Codex R2 MAJOR #4: short IDs like ``sh_1`` no longer pass the
+    tight ``^sh_[0-9a-f]{24}$`` constraint → fail-closed via sentinel."""
+    result = parse_add_shopping_items("ok:added:2:ids=[sh_1,sh_2]")
+    assert isinstance(result, ToolOutputContractViolation)
 
 
 def test_add_shopping_items_empty_means_all_duplicates() -> None:
@@ -86,20 +109,27 @@ def test_add_shopping_items_unknown_pattern_returns_violation() -> None:
 
 
 def test_schedule_reminder_scheduled() -> None:
-    raw = "ok:scheduled:rem_abc123:2026-05-26T18:00:00+03:00"
+    raw = f"ok:scheduled:{REM_A}:2026-05-26T18:00:00+03:00"
     result = parse_schedule_reminder(raw)
     assert isinstance(result, ScheduleReminderScheduled)
-    assert result.reminder_id == "rem_abc123"
+    assert result.reminder_id == REM_A
     assert result.trigger_at_iso == "2026-05-26T18:00:00+03:00"
 
 
+def test_schedule_reminder_malformed_id_returns_violation() -> None:
+    """Codex R2 MAJOR #4: short reminder id like ``rem_abc123`` no
+    longer satisfies the tight ``^rem_[0-9a-f]{24}$`` constraint."""
+    raw = "ok:scheduled:rem_abc123:2026-05-26T18:00:00+03:00"
+    result = parse_schedule_reminder(raw)
+    assert isinstance(result, ToolOutputContractViolation)
+
+
 def test_schedule_reminder_parse_error() -> None:
+    """Codex R2 MAJOR #6: stable code regardless of dynamic value."""
     raw = "error: cannot parse trigger_iso='завтра'"
     result = parse_schedule_reminder(raw)
     assert isinstance(result, HousewifeToolError)
-    # First token before ":" is the canonical code → "cannot_parse_trigger_iso='завтра'"
-    # is fine but we collapse the equals-style detail too
-    assert "cannot" in result.error_code
+    assert result.error_code == "cannot_parse_trigger_iso"
 
 
 def test_schedule_reminder_internal_error() -> None:
@@ -129,18 +159,30 @@ def test_list_shopping_real_production_format() -> None:
     raw = (
         "pending shopping items:\n"
         "[молочные]\n"
-        "  [sh_abc] молоко (1 л)\n"
-        "  [sh_def] хлеб\n"
+        f"  [{SH_A}] молоко (1 л)\n"
+        f"  [{SH_B}] хлеб\n"
         "[бакалея]\n"
-        "  [sh_xyz] сахар (1 кг)"
+        f"  [{SH_C}] сахар (1 кг)"
     )
     result = parse_list_shopping(raw)
     assert isinstance(result, ListShoppingItems)
     assert len(result.items) == 3
-    assert result.items[0].item_id == "sh_abc"
+    assert result.items[0].item_id == SH_A
     assert result.items[0].category == "молочные"
     assert result.items[1].category == "молочные"
     assert result.items[2].category == "бакалея"
+
+
+def test_list_shopping_malformed_id_returns_violation() -> None:
+    """Codex R2 MAJOR #4: bracketed token starts with ``sh_`` but isn't
+    a valid 24-hex suffix → tight pattern rejects, parser fail-closes."""
+    raw = (
+        "pending shopping items:\n"
+        "[молочные]\n"
+        "  [sh_abc] молоко (1 л)\n"
+    )
+    result = parse_list_shopping(raw)
+    assert isinstance(result, ToolOutputContractViolation)
 
 
 def test_list_shopping_header_only_returns_violation() -> None:
@@ -184,14 +226,23 @@ def test_list_reminders_empty() -> None:
 def test_list_reminders_with_items() -> None:
     raw = (
         "active reminders:\n"
-        "[rem_1] купить хлеб → 2026-05-26 18:00\n"
-        "[rem_2] забрать ребёнка → 2026-05-26 18:30"
+        f"[{REM_A}] купить хлеб → 2026-05-26 18:00\n"
+        f"[{REM_B}] забрать ребёнка → 2026-05-26 18:30"
     )
     result = parse_list_reminders(raw)
     assert isinstance(result, ListRemindersList)
     assert len(result.items) == 2
-    assert result.items[0].reminder_id == "rem_1"
+    assert result.items[0].reminder_id == REM_A
     assert "хлеб" in result.items[0].raw_line
+
+
+def test_list_reminders_malformed_id_returns_violation() -> None:
+    """Codex R2 MAJOR #4: short reminder id like ``rem_1`` no longer
+    passes ``^rem_[0-9a-f]{24}$`` — parser fail-closes via sentinel
+    rather than emit a bad id to the planner."""
+    raw = "active reminders:\n[rem_1] купить хлеб → 2026-05-26 18:00"
+    result = parse_list_reminders(raw)
+    assert isinstance(result, ToolOutputContractViolation)
 
 
 def test_list_reminders_missing_header_returns_violation() -> None:
@@ -266,11 +317,11 @@ def test_schedule_reminder_skipped_past_parsed() -> None:
 
 
 def test_add_shopping_count_ids_mismatch_rejected() -> None:
-    """``ok:added:5:ids=[sh_1,sh_2,sh_3]`` is internally inconsistent —
-    planner uses count for branch decisions and ids for refs (Codex M3 /
+    """``ok:added:5:ids=[<3 ids>]`` is internally inconsistent — planner
+    uses count for branch decisions and ids for refs (Codex M3 /
     code-reviewer MINOR)."""
     with pytest.raises(ValidationError):
-        AddShoppingItemsAdded(added_count=5, item_ids=["sh_1", "sh_2", "sh_3"])
+        AddShoppingItemsAdded(added_count=5, item_ids=[SH_A, SH_B, SH_C])
 
 
 def test_bare_error_normalized_to_unknown() -> None:

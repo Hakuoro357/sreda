@@ -28,9 +28,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.common import (
-    NonBlankStr,
+    CategoryName,
+    QuantityText,
     ShoppingItemId,
-    ShortStr,
+    ShoppingTitle,
 )
 from sreda.services.tool_schemas.housewife import (
     AddShoppingItemsOutput,
@@ -53,19 +54,39 @@ from sreda.services.tool_schemas.housewife import (
 class ShoppingItemInput(BaseModel):
     """One row of an ``add_shopping_items`` batch.
 
-    Only ``title`` is required (stripped, non-blank, ≤200 chars);
-    ``quantity_text`` is free-form short label (no math), ``category``
-    is optional and auto-mapped if unknown.
+    Only ``title`` is required (stripped, non-blank, ≤500 chars to
+    match runtime cap in ``housewife_shopping.py:252``);
+    ``quantity_text`` is free-form short label ≤64 chars,
+    ``category`` is optional ≤64 chars (auto-mapped if unknown).
 
-    Codex R1 MAJOR #2: ``ShortStr`` rejects whitespace-only and
-    over-long values that the previous ``Field(min_length=1)``
-    accepted.
+    Codex R1 MAJOR #2: domain-typed aliases reject whitespace-only and
+    over-long values that the previous ``Field(min_length=1)`` accepted.
+    Codex R2 MAJOR #2: caps now match runtime exactly (was ``ShortStr``
+    at 200 chars — silently truncated long titles, over-permitted
+    qty/cat).
+
+    Note: ``quantity_text`` on the *add* path uses ``QuantityText`` but
+    requires the value, when present, to be non-blank. Runtime's empty
+    string is only meaningful as «clear» on the update path; on add
+    there's nothing to clear, so we require ``min_length=1`` here.
     """
 
     model_config = ConfigDict(extra="forbid")
-    title: ShortStr
-    quantity_text: ShortStr | None = None
-    category: ShortStr | None = None
+    title: ShoppingTitle
+    quantity_text: ShoppingTitle | None = None
+    category: CategoryName | None = None
+
+    @model_validator(mode="after")
+    def _quantity_short(self) -> "ShoppingItemInput":
+        # Borrow ShoppingTitle's non-blank cap but enforce the 64-char
+        # runtime cap for quantity_text (housewife_shopping.py:253).
+        if self.quantity_text is not None and len(self.quantity_text) > 64:
+            raise ValueError(
+                f"quantity_text exceeds runtime cap (64 chars); got "
+                f"{len(self.quantity_text)} chars — runtime would "
+                f"truncate. Shorten before sending."
+            )
+        return self
 
 
 class AddShoppingItemsInput(BaseModel):
@@ -91,21 +112,37 @@ class UpdateShoppingItemInput(BaseModel):
     as a valid no-op call. That wastes a tool round-trip and produces
     a misleading ``ok:updated:sh_42`` for «nothing changed». Reject
     via ``model_validator``.
+
+    Codex R2 MAJOR #3: ``quantity_text=""`` is a legitimate intent
+    («убери количество у молока») — runtime maps it to ``None``
+    (clear quantity) at ``housewife_shopping.py:401-402``. Switch the
+    no-op check from «all None» to «no fields were sent» via
+    ``model_fields_set`` so ``quantity_text=""`` passes through as a
+    real update.
+
+    Field-level types:
+    - ``title`` (when present): non-blank ≤500 (runtime caps to 500
+      and silently no-ops empty at lines 396-399)
+    - ``quantity_text`` (when present): ≤64 (allows empty string to
+      clear — that's the whole point of this field on update)
+    - ``category`` (when present): non-blank ≤64 (runtime
+      ``_coerce_category`` rejects blank, caps to 64)
     """
 
     model_config = ConfigDict(extra="forbid")
     item_id: ShoppingItemId
-    title: ShortStr | None = None
-    quantity_text: ShortStr | None = None
-    category: ShortStr | None = None
+    title: ShoppingTitle | None = None
+    quantity_text: QuantityText | None = None
+    category: CategoryName | None = None
 
     @model_validator(mode="after")
     def _at_least_one_mutable_field(self) -> "UpdateShoppingItemInput":
-        if (
-            self.title is None
-            and self.quantity_text is None
-            and self.category is None
-        ):
+        # Codex R2 MAJOR #3: use ``model_fields_set`` so an explicit
+        # ``quantity_text=""`` counts as «one mutable field provided»
+        # (intent: clear quantity). Fields not sent at all are absent
+        # from this set even when their default is None.
+        mutable = {"title", "quantity_text", "category"}
+        if not (self.model_fields_set & mutable):
             raise ValueError(
                 "update_shopping_item requires at least one of "
                 "title / quantity_text / category — empty update is "
@@ -117,11 +154,17 @@ class UpdateShoppingItemInput(BaseModel):
 class UpdateShoppingItemsCategoryInput(BaseModel):
     """Codex R1 MINOR #8: bulk re-category needs ≥2 item_ids — a
     single-id reassignment should use ``update_shopping_item`` (which
-    surfaces the more-specific ``ok:updated:<id>`` return)."""
+    surfaces the more-specific ``ok:updated:<id>`` return).
+
+    Codex R2 MAJOR #2: ``category`` uses ``CategoryName`` (≤64) to
+    match runtime ``_coerce_category`` behaviour — was ``NonBlankStr``
+    (uncapped), which would let the planner submit a 1000-char string
+    that runtime silently truncates to 64.
+    """
 
     model_config = ConfigDict(extra="forbid")
     item_ids: list[ShoppingItemId] = Field(min_length=2)
-    category: NonBlankStr
+    category: CategoryName
 
 
 class ListShoppingInput(BaseModel):
