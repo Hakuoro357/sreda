@@ -64,6 +64,44 @@ asserts the lists agree.
 """
 
 
+MIXED_MODE_CLARIFICATION_TEMPLATE: str = "partial_with_clarification"
+"""The ONLY template valid when clarity='needs_clarification' AND
+``actions`` is non-empty.
+
+Codex Sub-A-77 #2 R2 MAJOR #1 — narrow templates like
+``ask_when_to_remind`` only render the question; they don't
+acknowledge any actions that already ran. Using them in mixed mode
+leaves the user unaware that mutations were performed. Schema enforces
+that mixed-mode plans go through ``partial_with_clarification`` which
+combines ``done_summary`` + clarification ask.
+"""
+
+
+_TEMPLATE_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
+    # ``ask_when_to_remind`` renders «Хорошо, поставлю напоминание про
+    # «{{ what }}» …» — ``what`` is non-optional, so a plan with empty
+    # template_data would crash the renderer at StrictUndefined time
+    # (Codex R2 new MAJOR — schema-valid but unrenderable).
+    "ask_when_to_remind": frozenset({"what"}),
+    # ``partial_with_clarification`` is mostly StrictUndefined-safe via
+    # ``is defined and`` guards, but a mixed-mode plan must show the
+    # done_summary or the user can't tell anything ran.
+    "partial_with_clarification": frozenset({"done_summary"}),
+    # ``ask_user_for_clarification`` has fallbacks for every variable —
+    # no required fields.
+    "ask_user_for_clarification": frozenset(),
+}
+"""For each clarification template, the keys that MUST be present in
+``compose.template_data`` (non-blank). Codex Sub-A-77 #2 R2 new MAJOR
+— without this check, a schema-valid plan can crash the renderer at
+``StrictUndefined`` time, surfacing far from the cause.
+
+If a template adds/removes required fields, this map is the single
+place to update — CI tests assert per-template happy paths in
+``test_composer_registry.py``.
+"""
+
+
 class TurnClassification(BaseModel):
     """Whether the current user message starts a new conversation turn.
 
@@ -244,12 +282,52 @@ class Plan(BaseModel):
                     "or partial_with_clarification (mixed: some "
                     "actions executed, others need uncertainty resolved)."
                 )
-            # Soft auto-merge — only fills in if caller didn't already
-            # set their own (possibly differently-phrased) value.
-            if "clarity_reason" not in self.compose.template_data:
+            # Codex R2 MAJOR #1 — mixed mode (actions non-empty) MUST
+            # use partial_with_clarification. Narrow templates like
+            # ask_when_to_remind only ask, never acknowledge — using
+            # them with executed actions leaves user unaware of
+            # mutations.
+            if (
+                len(self.actions) > 0
+                and self.compose.template_id != MIXED_MODE_CLARIFICATION_TEMPLATE
+            ):
+                raise ValueError(
+                    f"Plan(clarity='needs_clarification') with non-empty "
+                    f"actions requires compose.template_id="
+                    f"{MIXED_MODE_CLARIFICATION_TEMPLATE!r} so the user "
+                    f"sees both an acknowledgement of completed actions "
+                    f"AND the clarification ask. Got "
+                    f"template_id={self.compose.template_id!r} with "
+                    f"{len(self.actions)} action(s)."
+                )
+            # Codex R2 MAJOR #2 — auto-merge fires on absent-OR-blank
+            # so a planner that emits clarity_reason="" or "   " in
+            # template_data doesn't bypass the merge and fall through
+            # to the generic «Не до конца поняла запрос» opener.
+            existing = self.compose.template_data.get("clarity_reason")
+            if existing is None or not str(existing).strip():
                 self.compose.template_data["clarity_reason"] = (
                     self.clarity_reason
                 )
+            # Codex R2 new MAJOR — per-template required-field check.
+            # Without this, schema-valid plans can crash the renderer
+            # at StrictUndefined time when a narrow template's required
+            # variable wasn't supplied (e.g. ask_when_to_remind without
+            # template_data['what']).
+            required = _TEMPLATE_REQUIRED_FIELDS.get(
+                self.compose.template_id, frozenset()
+            )
+            for field_name in required:
+                value = self.compose.template_data.get(field_name)
+                if value is None or (
+                    isinstance(value, str) and not value.strip()
+                ):
+                    raise ValueError(
+                        f"Plan compose.template_id="
+                        f"{self.compose.template_id!r} requires non-empty "
+                        f"template_data[{field_name!r}] for renderer. "
+                        f"Got: {value!r}."
+                    )
         return self
 
     @model_validator(mode="after")

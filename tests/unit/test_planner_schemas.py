@@ -518,29 +518,56 @@ def test_plan_needs_clarification_blank_reason_rejected() -> None:
     assert "clarity_reason" in str(exc.value).lower()
 
 
-def test_plan_needs_clarification_mixed_mode_accepted() -> None:
-    """Mixed: do what's unambiguous (s1) + ask about the rest.
-    Planner can legitimately partially fulfil and still clarify
-    something else in the same turn."""
-    plan = Plan(
-        turn_classification=_ok_tc(),
-        clarity="needs_clarification",
-        clarity_reason="не указано время для напоминания",
-        actions={
-            "s1": Action(
-                tool="add_shopping_items",
-                args={"items": ["молоко"]},
-                expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+def test_plan_mixed_mode_with_ask_when_to_remind_rejected() -> None:
+    """Codex Sub-A-77 #2 R2 MAJOR #1 — narrow ask templates like
+    ``ask_when_to_remind`` only render the question; they don't
+    acknowledge completed actions. Mixed mode (clarity=needs_clarification
+    + non-empty actions) MUST use partial_with_clarification."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="не указано время для напоминания",
+            actions={
+                "s1": Action(
+                    tool="add_shopping_items",
+                    args={"items": ["молоко"]},
+                    expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+                ),
+            },
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_when_to_remind",
+                template_data={"what": "позвонить врачу"},
             ),
-        },
-        compose=ComposerCall(
-            kind="template",
-            template_id="ask_when_to_remind",
-            template_data={"what": "позвонить врачу"},
-        ),
-    )
-    assert plan.clarity == "needs_clarification"
-    assert len(plan.actions) == 1
+        )
+    msg = str(exc.value)
+    assert "partial_with_clarification" in msg
+
+
+def test_plan_mixed_mode_with_ask_user_for_clarification_rejected() -> None:
+    """Same as above for the generic ask template — it doesn't show
+    done_summary either, so mixed mode forbids it."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="что-то неясное",
+            actions={
+                "s1": Action(
+                    tool="add_shopping_items",
+                    args={"items": ["хлеб"]},
+                    expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+                ),
+            },
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_user_for_clarification",
+                template_data={"missing_fields": ["recipient"]},
+            ),
+        )
+    msg = str(exc.value)
+    assert "partial_with_clarification" in msg
 
 
 def test_plan_clarity_invalid_literal_rejected() -> None:
@@ -716,3 +743,130 @@ def test_clarification_template_ids_constant_shape() -> None:
     assert "ask_user_for_clarification" in CLARIFICATION_TEMPLATE_IDS
     assert "ask_when_to_remind" in CLARIFICATION_TEMPLATE_IDS
     assert "partial_with_clarification" in CLARIFICATION_TEMPLATE_IDS
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 follow-ups — blank-bypass + per-template required-fields
+# ---------------------------------------------------------------------------
+
+
+def test_plan_auto_merge_clarity_reason_when_blank_string() -> None:
+    """Codex R2 MAJOR #2 — auto-merge must fire when caller provided
+    an empty string for clarity_reason, not only when key is absent.
+    Otherwise empty/whitespace bypasses the merge → composer falls
+    back to the generic «Не до конца поняла» opener."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={"clarity_reason": "", "missing_fields": ["time"]},
+        ),
+    )
+    # Empty string → schema fills with the Plan-level reason.
+    assert plan.compose.template_data["clarity_reason"] == "не указано время"
+
+
+def test_plan_auto_merge_clarity_reason_when_whitespace() -> None:
+    """Whitespace-only value treated the same as empty."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="ambig X",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={"clarity_reason": "   ", "missing_fields": ["time"]},
+        ),
+    )
+    assert plan.compose.template_data["clarity_reason"] == "ambig X"
+
+
+def test_plan_ask_when_to_remind_requires_what_field() -> None:
+    """Codex R2 new MAJOR — narrow templates have required template_data
+    fields; without them StrictUndefined crashes at render time. Schema
+    catches it at parse time instead."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="не указано время",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_when_to_remind",
+                # missing "what" — required by template
+                template_data={},
+            ),
+        )
+    msg = str(exc.value)
+    assert "ask_when_to_remind" in msg
+    assert "what" in msg
+
+
+def test_plan_ask_when_to_remind_blank_what_rejected() -> None:
+    """Blank string for required field == missing for this contract."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="не указано время",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_when_to_remind",
+                template_data={"what": "   "},
+            ),
+        )
+    assert "what" in str(exc.value)
+
+
+def test_plan_partial_with_clarification_requires_done_summary() -> None:
+    """Mixed-mode template needs done_summary to acknowledge completed
+    work; without it the user wouldn't know any action ran."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="что-то неясно",
+            actions={
+                "s1": Action(
+                    tool="add_shopping_items",
+                    args={"items": ["молоко"]},
+                    expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+                ),
+            },
+            compose=ComposerCall(
+                kind="template",
+                template_id="partial_with_clarification",
+                # missing "done_summary"
+                template_data={"missing_fields": ["time"]},
+            ),
+        )
+    msg = str(exc.value)
+    assert "partial_with_clarification" in msg
+    assert "done_summary" in msg
+
+
+def test_plan_ask_user_for_clarification_has_no_required_fields() -> None:
+    """Generic ask template has fallbacks for every variable — schema
+    must NOT impose required-field rules on it. Empty template_data
+    is valid (composer template renders generic opener + fallback
+    question)."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="запрос непонятен",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={},
+        ),
+    )
+    # Auto-merge still injects clarity_reason for renderer convenience.
+    assert plan.compose.template_data["clarity_reason"] == "запрос непонятен"
