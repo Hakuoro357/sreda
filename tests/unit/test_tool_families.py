@@ -412,3 +412,194 @@ def test_reminders_does_not_claim_buying_with_time_belongs_to_shopping() -> None
     # Reconciled: if time is present → НАПОМИНАНИЯ; if no time → ПОКУПКИ.
     reminders_text = " ".join(FAMILY_HEADERS["reminders"].anti_patterns).lower()
     assert "время" in reminders_text and "напомин" in reminders_text
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #1 — anti-pattern redirects only target known
+# destinations (family russian_names or NonFamilyRedirect values)
+# ---------------------------------------------------------------------------
+
+
+import re as _re
+
+
+# Russian inflects: «ЗАДАЧИ» (nominative) → «ЗАДАЧАМИ» (instrumental) →
+# «ЗАДАЧАХ» (prepositional) all refer to the same family. The scan test
+# matches all-caps phrases against destination STEMS (the longest unique
+# prefix per destination root word). This is more robust than listing
+# every inflected form by hand.
+def _stem(word: str) -> str:
+    """Return a stable 5-char Cyrillic prefix for stem matching.
+
+    Empirically all 12 family names + 7 non-family redirects share a
+    unique 5-char prefix in their first word, so 5 is enough to
+    disambiguate without false matches between (e.g.) НАПОМИНАНИЯ and
+    ПАМЯТЬ. Words shorter than 5 chars use the whole word.
+    """
+    return word[:5] if len(word) >= 5 else word
+
+
+# Words that look like all-caps Russian phrases but aren't destinations —
+# emphasis on user-input fragments, common qualifier prefixes, generic
+# Russian conjunctions. Whitelisting these prevents false-positives.
+_REDIRECT_SCAN_ALLOWLIST: frozenset[str] = frozenset({
+    "TODO",                     # in «TODO-список»
+    "MVP",                      # in «без MVP-tool»
+    "ЕСТЬ", "НЕТ",              # logical conjunctions in time-rule
+    "ЕСЛИ",                     # leading conditional
+    "СУЩЕСТВУЮЩУЮ",             # qualifier (existing entity)
+    "СУЩЕСТВУЮЩИМ",             # qualifier (existing entity)
+    "Y", "Z", "X",              # placeholder identifiers
+    "T",                        # in «задаче T-42»
+})
+
+
+_ALL_CAPS_CYRILLIC_RE = _re.compile(
+    # Token of 3+ uppercase Cyrillic letters or capital-letter+dash sequences
+    # ("СЕМЬЯ", "ПОКУПКИ", "ЧЕК-ЛИСТЫ", "ДЕНЕЖНЫЕ ОПЕРАЦИИ" — joined later).
+    r"\b[А-ЯЁ][А-ЯЁ\-]{2,}(?:\s+[А-ЯЁ][А-ЯЁ\-]+)*\b"
+)
+
+
+def test_anti_pattern_redirects_resolve_to_known_destinations() -> None:
+    """Codex R2 MAJOR #1: scan every anti-pattern for all-caps tokens and
+    verify each resolves (by 5-char Cyrillic stem match) to either a real
+    family russian_name or a NonFamilyRedirect value. Stray uppercase
+    phrases mean the planner might invent a pseudo-family.
+    """
+    # Build stem set: take first word of each known destination, strip to
+    # 5-char prefix. Multi-word destinations contribute stems for each
+    # of their words.
+    valid_stems: set[str] = set()
+    for h in FAMILY_HEADERS.values():
+        for w in h.russian_name.split():
+            valid_stems.add(_stem(w))
+    for r in NON_FAMILY_REDIRECTS:
+        for w in r.split():
+            valid_stems.add(_stem(w))
+    # Also accept allowlisted full words as-is (no stem) for safety.
+    valid_full_words = set(_REDIRECT_SCAN_ALLOWLIST)
+
+    def _resolves(word: str) -> bool:
+        if word in valid_full_words:
+            return True
+        # Stem match — handles ЗАДАЧАМИ, ЧЕК-ЛИСТАМИ, СБОРЩИКА, etc.
+        return _stem(word) in valid_stems
+
+    failures: list[tuple[str, str, str]] = []
+    for family, header in FAMILY_HEADERS.items():
+        for ap in header.anti_patterns:
+            for token in _ALL_CAPS_CYRILLIC_RE.findall(ap):
+                if _resolves(token):
+                    continue
+                # Multi-word phrase — every word must resolve.
+                if all(_resolves(w) for w in token.split()):
+                    continue
+                failures.append((family, token, ap))
+    assert not failures, (
+        "Anti-patterns reference all-caps destinations that don't "
+        "resolve to known family names or NON_FAMILY_REDIRECTS "
+        "(after stem matching):\n"
+        + "\n".join(
+            f"  family={f!r}: token={t!r} in anti-pattern {ap!r}"
+            for f, t, ap in failures
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #2 — exact tool-set per family in TOOL_FAMILY_MANIFEST
+# (not just per-family counts — stops a miscategorised swap from passing
+# while counts stay equal)
+# ---------------------------------------------------------------------------
+
+
+_EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
+    "shopping": frozenset({
+        "add_shopping_items", "list_shopping", "mark_shopping_bought",
+        "remove_shopping_items", "update_shopping_item",
+        "update_shopping_items_category", "clear_bought_shopping",
+    }),
+    "reminders": frozenset({
+        "schedule_reminder", "list_reminders", "update_reminder",
+        "cancel_reminder",
+    }),
+    "recipes": frozenset({
+        "save_recipe", "save_recipes_batch", "search_recipes",
+        "get_recipe", "delete_recipe", "get_recipe_any_source",
+    }),
+    "menu": frozenset({
+        "plan_week_menu", "update_menu_item", "list_menu",
+        "generate_shopping_from_menu", "clear_menu",
+    }),
+    "household": frozenset({
+        "add_family_members", "list_family_members",
+        "update_family_member", "remove_family_member",
+    }),
+    "tasks": frozenset({
+        "add_task", "list_tasks", "update_task", "complete_task",
+        "uncomplete_task", "cancel_task", "delete_task",
+        "attach_reminder", "detach_reminder", "link_task_to_checklist",
+        "unlink_task",
+    }),
+    "checklists": frozenset({
+        "create_checklist", "add_checklist_items", "list_checklists",
+        "show_checklist", "move_task_to_checklist",
+        "mark_checklist_item_done", "delete_checklist_item",
+        "archive_checklist",
+    }),
+    "onboarding": frozenset({
+        "onboarding_answered", "onboarding_deferred",
+        "onboarding_complete",
+    }),
+    "ui": frozenset({"reply_with_buttons"}),
+    "memory": frozenset({"save_core_fact", "save_episode", "recall_memory"}),
+    "utility": frozenset({"log_unsupported_request"}),
+    "web": frozenset({"weather_tool", "web_search_tool", "fetch_url_tool"}),
+}
+
+
+@pytest.mark.parametrize("family,expected_tools", list(_EXPECTED_BY_FAMILY.items()))
+def test_manifest_exact_tool_set_per_family(
+    family: Family, expected_tools: frozenset[str]
+) -> None:
+    """Each family's tool set in TOOL_FAMILY_MANIFEST must EXACTLY match
+    the spec. Catches a swap (e.g. ``attach_reminder`` mis-moved to
+    ``reminders`` while compensating mismove keeps counts equal).
+    """
+    actual_tools = frozenset(
+        t for t, f in TOOL_FAMILY_MANIFEST.items() if f == family
+    )
+    assert actual_tools == expected_tools, (
+        f"Family {family!r} expected {sorted(expected_tools)} "
+        f"but manifest has {sorted(actual_tools)}. "
+        f"Missing: {expected_tools - actual_tools}. "
+        f"Unexpected: {actual_tools - expected_tools}."
+    )
+
+
+def test_manifest_total_size_is_56() -> None:
+    # 7+4+6+5+4+11+8+3+1+3+1+3 = 56 (55 planned + 1 from TODO-2:
+    # get_recipe_any_source). Reconciles the «4 memory» comment in
+    # R1 review — memory has 3, not 4 (Codex R2 spotted this).
+    assert len(TOOL_FAMILY_MANIFEST) == 56
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #3 — cross-domain boundary rules present in anti-patterns
+# ---------------------------------------------------------------------------
+
+
+def test_reminders_anti_patterns_explain_attach_reminder_boundary() -> None:
+    """When user attaches a reminder to existing task, planner should use
+    tasks.attach_reminder, not reminders.schedule_reminder. Boundary rule
+    must be in anti-patterns so the planner sees it."""
+    text = " ".join(FAMILY_HEADERS["reminders"].anti_patterns)
+    assert "attach_reminder" in text or "существующей задаче" in text.lower()
+
+
+def test_tasks_anti_patterns_explain_checklist_link_boundary() -> None:
+    """link_task_to_checklist (in tasks) vs move_task_to_checklist (in
+    checklists) — boundary rule must surface."""
+    text = " ".join(FAMILY_HEADERS["tasks"].anti_patterns)
+    assert "link_task_to_checklist" in text and "move_task_to_checklist" in text
