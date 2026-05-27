@@ -128,20 +128,14 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"^checklist_already_linked_to_task_.+", re.IGNORECASE),
         "checklist_already_linked",
     ),
-    # link_task_to_checklist generic «not found» branch (line 2248
-    # catch-all `return f"{status}: {info or ''}"` for the
-    # service's «error:not_found» / «error:archived» statuses).
-    #   "error: not_found: task_not_found"  (or similar info)
-    #   "error: archived: <reason>"
-    (
-        re.compile(r"^not_found(:.*)?$", re.IGNORECASE),
-        "link_target_not_found",
-    ),
-    (
-        re.compile(r"^archived(:.*)?$", re.IGNORECASE),
-        "checklist_archived",
-    ),
 ]
+# Codex Sub-A4 tasks R2 MAJOR (new) — link_task_to_checklist
+# «not_found:*» / «archived:*» catch-all patterns are intentionally
+# NOT in the global _STABLE_ERROR_PATTERNS table because they'd
+# match unrelated tools' messages. Instead, `parse_link_task_to_checklist`
+# inspects the parsed `info` payload and remaps to
+# link-task-specific stable codes
+# (link_task_not_found / link_checklist_not_found / checklist_archived).
 
 
 def _parse_error(raw: str) -> HousewifeToolError | None:
@@ -1947,11 +1941,18 @@ class ListTasksEmpty(BaseModel):
 
 
 class ListTasksOk(BaseModel):
-    """Structured list of tasks (R1 MAJOR #3 promotion). ``tasks`` is
-    always non-empty here — empty path goes to ListTasksEmpty."""
+    """Structured list of tasks (R1 MAJOR #3 promotion).
+
+    Codex Sub-A4 tasks R2 MAJOR (new): no ``min_length=1`` on
+    ``tasks``. Runtime currently routes empty rows to the «no tasks»
+    string (parsed as ``ListTasksEmpty``), but defensive contract
+    allows an empty list here too — future runtime drift that emits
+    «N member(s):» with N=0 (analog of household R1 MINOR #1) would
+    still construct cleanly. The parser's job is to disambiguate
+    `ListTasksEmpty` vs `ListTasksOk` via the «no tasks» literal."""
     model_config = ConfigDict(extra="forbid")
     status: Literal["ok"] = "ok"
-    tasks: list[ListTasksRow] = Field(min_length=1)
+    tasks: list[ListTasksRow] = Field(default_factory=list)
 
 
 ListTasksOutput = Annotated[
@@ -1967,79 +1968,114 @@ ListTasksOutput = Annotated[
 # + title). Rest are prefixed key=value or `on ...`.
 
 _LIST_TASKS_ID_RE = re.compile(r"^\[(?P<task_id>task_[0-9a-f]{24})\]$")
+_LIST_TASKS_NOTES_SEP = " · notes="
+_LIST_TASKS_SUFFIX_PREFIXES = ("on ", "recurring=", "reminder=за ", "status=")
 
 
 def _parse_list_tasks_row(line: str) -> ListTasksRow | None:
     """Decompose one ``_fmt_task_for_llm`` line into a typed row.
-    Returns ``None`` on any malformed segment so the caller can
-    fail-closed via ContractViolation."""
-    parts = [p.strip() for p in line.split(" · ")]
+    Returns ``None`` on malformed input so caller fail-closes via
+    ContractViolation.
+
+    Codex Sub-A4 tasks R2 MAJOR (new): naive ``line.split(' · ')``
+    breaks when title or notes contain ` · ` (Russian middot is a
+    legitimate user character). Robust two-phase approach:
+
+    1. Extract trailing notes by splitting on the FIRST occurrence
+       of ` · notes=` — runtime always emits notes last and
+       everything after `notes=` is free-form (could itself contain
+       ` · `).
+    2. Split the remaining prefix on ` · ` to extract id (position 0)
+       + title and known suffix segments. Walk left-to-right
+       consuming known prefixes; everything between id and the
+       first known prefix = title (joined back with ` · ` to
+       preserve user input that contained the separator).
+    """
+    # Phase 1: split off notes from the right.
+    notes: str | None = None
+    notes_split_idx = line.find(_LIST_TASKS_NOTES_SEP)
+    if notes_split_idx >= 0:
+        prefix_part = line[:notes_split_idx]
+        notes = line[notes_split_idx + len(_LIST_TASKS_NOTES_SEP):].strip()
+        if not notes:
+            return None
+    else:
+        prefix_part = line
+
+    parts = [p.strip() for p in prefix_part.split(" · ")]
     if len(parts) < 2:
         return None
     id_match = _LIST_TASKS_ID_RE.match(parts[0])
     if id_match is None:
         return None
     task_id = id_match.group("task_id")
-    title = parts[1]
-    if not title or len(title) > 500:
-        return None
 
+    # Phase 2: walk from position 1 onward; accumulate title until
+    # we hit the first known suffix prefix, then parse suffixes.
     scheduled_date_iso: str | None = None
     time_start: str | None = None
     time_end: str | None = None
     recurrence_rule: str | None = None
     reminder_offset_minutes: int | None = None
     runtime_status: str | None = None
-    notes: str | None = None
 
-    for segment in parts[2:]:
-        if segment.startswith("on "):
-            when = segment[len("on "):].strip()
-            # `on YYYY-MM-DD` OR `on YYYY-MM-DD HH:MM[–HH:MM]` OR
-            # `on HH:MM[–HH:MM]` (inbox tasks have no date).
-            when_parts = when.split(" ")
-            if len(when_parts) == 0:
-                return None
-            head = when_parts[0]
-            if re.match(r"^\d{4}-\d{2}-\d{2}$", head):
-                scheduled_date_iso = head
-                if len(when_parts) > 1:
-                    time_token = when_parts[1]
+    title_segments: list[str] = []
+    suffix_start: int | None = None
+    for idx, segment in enumerate(parts[1:], start=1):
+        if any(segment.startswith(pfx) for pfx in _LIST_TASKS_SUFFIX_PREFIXES):
+            suffix_start = idx
+            break
+        title_segments.append(segment)
+
+    if not title_segments:
+        return None
+    title = " · ".join(title_segments)
+    if len(title) > 500:
+        return None
+
+    if suffix_start is not None:
+        for segment in parts[suffix_start:]:
+            if segment.startswith("on "):
+                when = segment[len("on "):].strip()
+                when_parts = when.split(" ")
+                if not when_parts:
+                    return None
+                head = when_parts[0]
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", head):
+                    scheduled_date_iso = head
+                    time_token = when_parts[1] if len(when_parts) > 1 else None
+                elif re.match(r"^([01]\d|2[0-3]):[0-5]\d", head):
+                    time_token = head
                 else:
-                    time_token = None
-            elif re.match(r"^([01]\d|2[0-3]):[0-5]\d", head):
-                time_token = head
+                    return None
+                if time_token is not None:
+                    if "–" in time_token:
+                        t_parts = time_token.split("–")
+                        if len(t_parts) != 2:
+                            return None
+                        time_start, time_end = t_parts[0], t_parts[1]
+                    else:
+                        time_start = time_token
+            elif segment.startswith("recurring="):
+                recurrence_rule = segment[len("recurring="):].strip()
+            elif segment.startswith("reminder=за "):
+                rest = segment[len("reminder=за "):].strip()
+                if not rest.endswith("мин"):
+                    return None
+                try:
+                    reminder_offset_minutes = int(rest[:-len("мин")].strip())
+                except ValueError:
+                    return None
+            elif segment.startswith("status="):
+                value = segment[len("status="):].strip()
+                if value not in {"completed", "cancelled"}:
+                    return None
+                runtime_status = value
             else:
+                # Already filtered by prefix-match above; any
+                # post-suffix segment that doesn't match a known
+                # prefix means runtime drift — fail closed.
                 return None
-            if time_token is not None:
-                # Split `HH:MM–HH:MM` (en-dash) — emitted by line 1772.
-                if "–" in time_token:
-                    t_parts = time_token.split("–")
-                    if len(t_parts) != 2:
-                        return None
-                    time_start, time_end = t_parts[0], t_parts[1]
-                else:
-                    time_start = time_token
-        elif segment.startswith("recurring="):
-            recurrence_rule = segment[len("recurring="):].strip()
-        elif segment.startswith("reminder=за "):
-            rest = segment[len("reminder=за "):].strip()
-            if not rest.endswith("мин"):
-                return None
-            try:
-                reminder_offset_minutes = int(rest[:-len("мин")].strip())
-            except ValueError:
-                return None
-        elif segment.startswith("status="):
-            value = segment[len("status="):].strip()
-            if value not in {"completed", "cancelled"}:
-                return None
-            runtime_status = value
-        elif segment.startswith("notes="):
-            notes = segment[len("notes="):].strip()
-        else:
-            # Unknown segment — fail closed.
-            return None
 
     try:
         return ListTasksRow(
@@ -2398,6 +2434,38 @@ def parse_link_task_to_checklist(
 ):
     err = _parse_error(raw)
     if err is not None:
+        # Codex Sub-A4 tasks R2 MAJOR (prior-not-closed +
+        # new-introduced): tool-scoped remap of generic «not_found:*»
+        # / «archived:*» catch-alls from line 2248 runtime
+        # (`return f"{status}: {info or ''}"`). Split task vs
+        # checklist distinction so planner can branch to relist
+        # the right collection. NOT in global _STABLE_ERROR_PATTERNS
+        # because other tools' messages must not be remapped.
+        if err.error_code == "unknown" or err.error_code.startswith("not_found"):
+            msg_lower = err.message.lower()
+            if "task" in msg_lower and "checklist" not in msg_lower:
+                return HousewifeToolError(
+                    error_code="link_task_not_found", message=err.message,
+                )
+            if "checklist" in msg_lower and "task" not in msg_lower:
+                return HousewifeToolError(
+                    error_code="link_checklist_not_found", message=err.message,
+                )
+            if err.error_code.startswith("not_found") or (
+                "task" in msg_lower and "checklist" in msg_lower
+            ):
+                # «not_found:» without disambiguation, or both names
+                # present — keep ambiguous but stable.
+                return HousewifeToolError(
+                    error_code="link_target_not_found", message=err.message,
+                )
+        if err.error_code == "archived" or (
+            err.error_code == "unknown"
+            and err.message.lower().startswith("archived")
+        ):
+            return HousewifeToolError(
+                error_code="checklist_archived", message=err.message,
+            )
         return err
     m = _LINK_TASK_RE.match(raw.strip())
     if m is None:

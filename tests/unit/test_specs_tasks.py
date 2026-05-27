@@ -475,9 +475,26 @@ def test_list_tasks_parser_inbox_task_no_date() -> None:
     assert parsed.tasks[0].time_start is None
 
 
-def test_list_tasks_parser_rejects_unknown_segment() -> None:
-    """Malformed segments → ContractViolation (fail-closed)."""
+def test_list_tasks_parser_unknown_segment_becomes_title_part() -> None:
+    """Codex R2 MAJOR (new): robust parser walks title segments
+    until it finds the FIRST known suffix prefix. Unknown segments
+    BEFORE any known prefix are concatenated as part of the title
+    (preserves legitimate ` · ` in user input). To trigger
+    ContractViolation, a known prefix with bad value is needed
+    (see test_list_tasks_parser_rejects_bad_runtime_status)."""
     raw = f"[{TASK_A}] · разминка · totally_weird_segment"
+    parsed = parse_tool_output("list_tasks", raw)
+    assert isinstance(parsed, ListTasksOk)
+    # Unknown segment merged into title.
+    assert parsed.tasks[0].title == "разминка · totally_weird_segment"
+
+
+def test_list_tasks_parser_rejects_segment_after_known_prefix() -> None:
+    """Once a known suffix prefix appears, subsequent unrecognised
+    segments ARE drift (suffix region is structured). For example
+    `on YYYY-MM-DD · foo=bar` — `foo=bar` doesn't match any known
+    prefix and comes AFTER `on` → ContractViolation."""
+    raw = f"[{TASK_A}] · разминка · on 2026-05-28 · weird_segment"
     parsed = parse_tool_output("list_tasks", raw)
     assert isinstance(parsed, ToolOutputContractViolation)
 
@@ -753,11 +770,32 @@ def test_link_task_conflict_error_codes_are_stable(raw, expected_code):
     assert parsed.error_code == expected_code
 
 
-def test_link_task_not_found_stable_code() -> None:
-    """Generic `error: not_found: ...` catch-all from line 2248
-    of link_task_to_checklist runtime."""
+def test_link_task_not_found_remapped_to_task() -> None:
+    """Codex R2 MAJOR (prior-not-closed): generic `not_found` got
+    split into task vs checklist for planner branchability."""
     parsed = parse_tool_output(
-        "link_task_to_checklist", "error: not_found: task_not_found",
+        "link_task_to_checklist",
+        "error: not_found: task X is missing",
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "link_task_not_found"
+
+
+def test_link_task_not_found_remapped_to_checklist() -> None:
+    parsed = parse_tool_output(
+        "link_task_to_checklist",
+        "error: not_found: checklist Y is missing",
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "link_checklist_not_found"
+
+
+def test_link_task_not_found_ambiguous_keeps_generic_code() -> None:
+    """If the info mentions both task AND checklist (or neither),
+    keep the ambiguous code so the planner asks the user."""
+    parsed = parse_tool_output(
+        "link_task_to_checklist",
+        "error: not_found: relation between task X and checklist Y broken",
     )
     assert isinstance(parsed, HousewifeToolError)
     assert parsed.error_code == "link_target_not_found"
@@ -769,3 +807,82 @@ def test_link_task_archived_stable_code() -> None:
     )
     assert isinstance(parsed, HousewifeToolError)
     assert parsed.error_code == "checklist_archived"
+
+
+def test_link_task_remapping_does_not_leak_to_other_tools() -> None:
+    """Codex R2 MAJOR (new-introduced): generic `not_found:*` /
+    `archived:*` patterns are NOT in _STABLE_ERROR_PATTERNS to
+    avoid hijacking other tools' messages. Verify update_task
+    `task '...' not found` still resolves via the
+    `task_not_found` stable pattern, not the link-scoped remap."""
+    parsed = parse_tool_output(
+        "update_task", f"error: task '{TASK_B}' not found",
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "task_not_found"  # NOT link_task_not_found
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR (new) — ListTasksOk robustness
+# ---------------------------------------------------------------------------
+
+
+def test_list_tasks_parser_title_with_middot() -> None:
+    """Codex R2 MAJOR (new): title can contain ` · ` (Russian
+    middot is a legitimate character). Parser walks left-to-right
+    consuming title segments until first known suffix prefix."""
+    raw = f"[{TASK_A}] · купить · хлеб и молоко · on 2026-05-28"
+    parsed = parse_tool_output("list_tasks", raw)
+    assert isinstance(parsed, ListTasksOk)
+    assert parsed.tasks[0].title == "купить · хлеб и молоко"
+    assert parsed.tasks[0].scheduled_date_iso == "2026-05-28"
+
+
+def test_list_tasks_parser_notes_with_middot() -> None:
+    """Notes is always last per `_fmt_task_for_llm`. Everything
+    after the first ` · notes=` token is the notes payload —
+    can contain `·` freely (multi-step note bodies)."""
+    raw = f"[{TASK_A}] · разминка · notes=шаг 1 · шаг 2 · шаг 3"
+    parsed = parse_tool_output("list_tasks", raw)
+    assert isinstance(parsed, ListTasksOk)
+    assert parsed.tasks[0].notes == "шаг 1 · шаг 2 · шаг 3"
+
+
+def test_list_tasks_ok_allows_empty_tasks_list() -> None:
+    """Codex R2 MAJOR (new): ListTasksOk.tasks no longer has
+    min_length=1. Runtime routes empty rows via the «no tasks»
+    string (→ ListTasksEmpty), but defensive contract allows
+    `tasks=[]` here too so future runtime drift doesn't
+    ContractViolation."""
+    parsed = ListTasksOk(tasks=[])
+    assert parsed.tasks == []
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR (new) — non-destructive inbox-update error message
+# ---------------------------------------------------------------------------
+
+
+def test_inbox_update_rejection_does_not_recommend_destructive_action() -> None:
+    """Codex R2 MAJOR (new): R1 error message said «делай
+    delete_task + add_task» which is destructive (loses
+    task_id, reminder, checklist, recurrence). R2 wording must
+    NOT recommend that — only suggest «ask user» / wait for
+    explicit clear-date sentinel."""
+    with pytest.raises(ValidationError) as exc:
+        UpdateTaskInput.model_validate({
+            "task_id": TASK_A, "scheduled_date": "inbox",
+        })
+    msg = str(exc.value)
+    # Must mention asking the user — non-destructive path.
+    assert "ASK" in msg.upper() or "спроси" in msg.lower(), (
+        "Error message must direct the planner to ASK the user "
+        "rather than recommend a destructive workaround"
+    )
+    # Must NOT recommend «delete + add» as a path to follow.
+    # (Allowed to mention it AS the destructive thing to AVOID.)
+    msg_lower = msg.lower()
+    assert "destructive" in msg_lower or "потер" in msg_lower, (
+        "Message must explicitly label the «delete+add» workaround "
+        "as destructive so the planner doesn't follow it"
+    )

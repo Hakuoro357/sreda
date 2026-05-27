@@ -277,22 +277,35 @@ class UpdateTaskInput(BaseModel):
 
     @model_validator(mode="after")
     def _reject_inbox_in_update(self) -> "UpdateTaskInput":
-        """Codex Sub-A4 tasks R1 MAJOR #2: runtime ``TaskService.update``
-        treats ``scheduled_date=None`` as «leave as-is», not «clear
-        date to inbox». Passing ``scheduled_date="inbox"`` here would
-        become a successful no-op — planner thinks it moved the task
-        to inbox, runtime did nothing. Reject explicitly until the
-        runtime gains an explicit clear-date sentinel (analogous to
-        the household ``clear_birth_year`` flag from R3)."""
+        """Codex Sub-A4 tasks R1 MAJOR #2 + R2 MAJOR (new): runtime
+        ``TaskService.update`` treats ``scheduled_date=None`` as
+        «leave as-is», not «clear date to inbox». Passing
+        ``scheduled_date='inbox'`` here would become a successful
+        no-op — planner thinks it moved the task to inbox, runtime
+        did nothing.
+
+        R1 advised «delete_task + add_task (inbox)» as workaround.
+        R2 reviewer flagged this as destructive — would change
+        member_id, lose linked reminder/checklist/recurrence
+        history. Planner could follow the guidance unilaterally.
+        Reject explicitly; recommend asking user OR waiting for
+        future clear-date sentinel (TODO — analogous to household
+        R3 ``clear_birth_year`` flag).
+        """
         if (
             self.scheduled_date is not None
             and self.scheduled_date.strip().lower() == "inbox"
         ):
             raise ValueError(
-                "scheduled_date='inbox' is not supported by update_task — "
-                "runtime cannot clear a task's schedule via this path. "
-                "Either keep the existing date, or delete_task + add_task "
-                "(inbox) to move the task to inbox."
+                "scheduled_date='inbox' is not supported by update_task "
+                "yet — runtime cannot clear a task's schedule via this "
+                "path, and the workaround «delete + re-add» is "
+                "destructive (loses linked reminder, checklist, and "
+                "recurrence history). Either keep the existing date, "
+                "or ASK the user whether the inbox move is required "
+                "given the trade-off. TODO: add explicit clear-date "
+                "sentinel (clear_scheduled_date=True flag) symmetric "
+                "to household.clear_birth_year."
             )
         return self
 
@@ -438,8 +451,10 @@ UPDATE_TASK_SPEC = ToolSpec(
         "сам reminder — attach_reminder/detach_reminder. Если "
         "task_id ещё нет — сначала list_tasks. ВНИМАНИЕ: "
         "scheduled_date='inbox' через update НЕ поддерживается "
-        "(runtime трактует как «оставить как было»). Для переноса "
-        "в inbox — delete_task + add_task без scheduled_date."
+        "(runtime трактует как «оставить как было»). Если юзер "
+        "хочет перенести задачу в inbox — спроси согласия и "
+        "объясни что прямого пути пока нет; альтернатив с "
+        "потерей данных НЕ предлагай."
     ),
     family="tasks",
     effect="write",
