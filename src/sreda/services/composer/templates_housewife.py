@@ -67,6 +67,39 @@ _RECIPE_NOT_FOUND_ASK_ALT = (
 )
 
 # ---------------------------------------------------------------------------
+# Clarification (Plan.clarity=needs_clarification → template, no LLM call)
+# (vex-assistant#77 item #7)
+# ---------------------------------------------------------------------------
+
+_ASK_USER_FOR_CLARIFICATION = (
+    # Codex 2026-05-26 MEDIUM (same gotcha as partial_with_compose_error):
+    # StrictUndefined raises on bare ``{% if x %}`` when ``x`` is
+    # missing from template_data entirely (not just falsy). Use
+    # ``is defined and`` so callers can legitimately omit
+    # ``clarity_reason`` / ``missing_fields`` without crashing.
+    "{% if clarity_reason is defined and clarity_reason %}"
+    "{{ clarity_reason }}.{% else %}Не до конца поняла запрос.{% endif %}"
+    "{% if missing_fields is defined and missing_fields %}"
+    "\n\nУточни{% if missing_fields|length > 1 %} пару моментов{% endif %}:"
+    "{% for field in missing_fields %}"
+    "{% if field == 'time' %}\n— когда (сегодня, завтра, конкретная дата + время)"
+    "{% elif field == 'recipient' %}\n— кому напомнить (тебе или другому)"
+    "{% elif field == 'items' %}\n— что именно (несколько слов для уточнения)"
+    "{% elif field == 'quantity' %}\n— сколько (количество или объём)"
+    "{% else %}\n— {{ field }}"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% else %}"
+    "\n\nСкажи чуть подробнее, что именно нужно?"
+    "{% endif %}"
+)
+
+_ASK_WHEN_TO_REMIND = (
+    "Хорошо, поставлю напоминание про «{{ what }}». "
+    "А когда напомнить — сегодня, завтра, или конкретная дата?"
+)
+
+# ---------------------------------------------------------------------------
 # Error / partial / fallback
 # ---------------------------------------------------------------------------
 
@@ -106,6 +139,9 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     # recipes
     "recipe_show": _RECIPE_SHOW,
     "recipe_not_found_ask_alt": _RECIPE_NOT_FOUND_ASK_ALT,
+    # clarification (Plan.clarity=needs_clarification — vex-assistant#77 #7)
+    "ask_user_for_clarification": _ASK_USER_FOR_CLARIFICATION,
+    "ask_when_to_remind": _ASK_WHEN_TO_REMIND,
     # error / fallback
     "generic_tool_error": _GENERIC_TOOL_ERROR,
     "partial_with_compose_error": _PARTIAL_WITH_COMPOSE_ERROR,

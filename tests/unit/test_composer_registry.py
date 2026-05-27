@@ -127,6 +127,10 @@ def test_default_registry_covers_expected_housewife_ids() -> None:
         "reminders_list_empty",
         "recipe_show",
         "recipe_not_found_ask_alt",
+        # clarification (vex-assistant#77 item #7)
+        "ask_user_for_clarification",
+        "ask_when_to_remind",
+        # error / fallback
         "generic_tool_error",
         "partial_with_compose_error",
     }
@@ -203,6 +207,102 @@ def test_render_recipe_not_found_ask_alt() -> None:
     out = render("recipe_not_found_ask_alt", {"query": "плов с курицей"})
     assert "плов с курицей" in out
     assert "точнее" in out or "другое" in out
+
+
+# ---------------------------------------------------------------------------
+# Clarification — Plan.clarity=needs_clarification → template, no LLM call
+# (vex-assistant#77 item #7)
+# ---------------------------------------------------------------------------
+
+
+def test_render_ask_when_to_remind_happy_path() -> None:
+    """Specific narrow template — used by planner when only the time
+    is missing for a reminder."""
+    out = render("ask_when_to_remind", {"what": "купить подарок Маше"})
+    assert "купить подарок Маше" in out
+    assert "когда" in out
+    # Контракт текста — должно быть предложение временного варианта.
+    assert "сегодня" in out or "завтра" in out
+
+
+def test_render_ask_user_for_clarification_single_known_field() -> None:
+    """One known field (`time`) → uses the field-specific question line."""
+    out = render(
+        "ask_user_for_clarification",
+        {
+            "clarity_reason": "не указано время напоминания",
+            "missing_fields": ["time"],
+        },
+    )
+    assert "не указано время напоминания" in out
+    # Single field path doesn't use plural "пару моментов".
+    assert "пару моментов" not in out
+    assert "когда" in out
+
+
+def test_render_ask_user_for_clarification_multiple_known_fields() -> None:
+    """Two known fields → plural prefix + both field-specific lines."""
+    out = render(
+        "ask_user_for_clarification",
+        {
+            "clarity_reason": "запрос двусмысленный",
+            "missing_fields": ["time", "recipient"],
+        },
+    )
+    assert "запрос двусмысленный" in out
+    assert "пару моментов" in out
+    assert "когда" in out
+    assert "кому напомнить" in out
+
+
+def test_render_ask_user_for_clarification_unknown_field_passthrough() -> None:
+    """Unknown field name → planner can request arbitrary uncatalogued
+    clarification by passing a free-text field name; template includes
+    it verbatim instead of a hardcoded prompt."""
+    out = render(
+        "ask_user_for_clarification",
+        {
+            "clarity_reason": "не понимаю про что речь",
+            "missing_fields": ["продукт_бренд_или_общий"],
+        },
+    )
+    assert "продукт_бренд_или_общий" in out
+
+
+def test_render_ask_user_for_clarification_no_fields() -> None:
+    """No ``missing_fields`` provided → generic fallback question."""
+    out = render(
+        "ask_user_for_clarification",
+        {
+            "clarity_reason": "запрос непонятен",
+            "missing_fields": [],
+        },
+    )
+    assert "запрос непонятен" in out
+    assert "подробнее" in out
+
+
+def test_render_ask_user_for_clarification_no_reason() -> None:
+    """No ``clarity_reason`` key in data → uses generic
+    «Не до конца поняла запрос» opener. Defensive against planner
+    forgetting the reason field. Same StrictUndefined-safe pattern as
+    ``partial_with_compose_error`` (Codex 2026-05-26 MEDIUM)."""
+    out = render(
+        "ask_user_for_clarification",
+        {
+            "missing_fields": ["time"],
+        },
+    )
+    assert "Не до конца поняла" in out
+    assert "когда" in out
+
+
+def test_render_ask_user_for_clarification_empty_data() -> None:
+    """Both ``clarity_reason`` and ``missing_fields`` absent → still
+    renders. Generic opener + fallback question, no crash."""
+    out = render("ask_user_for_clarification", {})
+    assert "Не до конца поняла" in out
+    assert "подробнее" in out
 
 
 def test_render_generic_tool_error() -> None:
