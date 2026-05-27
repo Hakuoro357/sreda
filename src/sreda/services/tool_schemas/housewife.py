@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.common import (
+    RecipeId,
     ReminderId,
     ShoppingItemId,
     TriggerIso,
@@ -92,6 +93,13 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"^cannot\s+parse\s+trigger_iso=.+$", re.IGNORECASE),
         "cannot_parse_trigger_iso",
+    ),
+    # save_recipe / get_recipe / delete_recipe: ``error: recipe 'rec_X' not found``
+    # Sub-A4 recipes phase: same dynamic-id-in-message class as item/
+    # task/reminder not_found. Source: ``housewife_chat_tools.py:1179, :1214``.
+    (
+        re.compile(r"^recipe\s+.+\s+not\s+found$", re.IGNORECASE),
+        "recipe_not_found",
     ),
 ]
 
@@ -567,12 +575,15 @@ def parse_get_recipe(
 ) -> GetRecipeFound | HousewifeToolError | ToolOutputContractViolation:
     err = _parse_error(raw)
     if err is not None:
-        # Special-case ``error: recipe '<id>' not found`` — the recipe_id
-        # is unique per call so the generic first-token code is useless
-        # for the planner to match. Normalize to ``not_found`` so the
-        # plan can branch on it deterministically.
-        if "not found" in err.message:
-            return HousewifeToolError(error_code="not_found", message=err.message)
+        # Codex Sub-A4 recipes phase: the ``recipe X not found`` stable
+        # pattern in ``_STABLE_ERROR_PATTERNS`` already produces
+        # ``error_code='recipe_not_found'``. The old special-case here
+        # was overriding it to ``not_found`` (legacy code-reviewer
+        # 2026-05-26 convention before the stable patterns existed) —
+        # that broke planner branching consistency across families
+        # (item_not_found, task_not_found, reminder_not_found,
+        # checklist_not_found, recipe_not_found all share the same
+        # ``<entity>_not_found`` shape now).
         return err
     stripped = raw.strip()
     if not stripped:
@@ -862,6 +873,237 @@ def parse_cancel_reminder(
 
 
 # ---------------------------------------------------------------------------
+# 13. save_recipe              `ok:saved:rec_<id>` | `ok:duplicate:rec_<id>`
+# ---------------------------------------------------------------------------
+
+
+class SaveRecipeOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["saved", "duplicate"]
+    recipe_id: RecipeId
+    """``saved`` for new rows; ``duplicate`` when title-dedup short-
+    circuited (housewife_chat_tools.py:1022-1027). Both branches are
+    «happy outcomes» — planner branches on status to differentiate
+    «added to book» vs «already in book»."""
+
+
+SaveRecipeOutput = Annotated[
+    Union[SaveRecipeOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_SAVE_RECIPE_RE = re.compile(r"^ok:(?P<status>saved|duplicate):(?P<id>rec_[^\s]+)$")
+
+
+def parse_save_recipe(
+    raw: str,
+) -> SaveRecipeOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _SAVE_RECIPE_RE.match(raw.strip())
+    if m is not None:
+        try:
+            return SaveRecipeOk(
+                status=m.group("status"),
+                recipe_id=m.group("id"),
+            )
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="save_recipe",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 14. save_recipes_batch
+#   `ok:batch_saved:N:skipped_as_duplicate:M:ids=[rec_a,rec_b]`
+#   `ok:batch_saved:0:skipped_as_duplicate:M`  (no ids when 0 created)
+# ---------------------------------------------------------------------------
+
+
+class SaveRecipesBatchOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["batch_saved"] = "batch_saved"
+    created_count: int = Field(ge=0)
+    skipped_as_duplicate: int = Field(ge=0)
+    recipe_ids: list[RecipeId]
+
+    @model_validator(mode="after")
+    def _validate_count_matches_ids(self) -> SaveRecipesBatchOk:
+        if len(self.recipe_ids) != self.created_count:
+            raise ValueError(
+                f"created_count={self.created_count} but recipe_ids has "
+                f"{len(self.recipe_ids)} entries — mismatch."
+            )
+        return self
+
+
+SaveRecipesBatchOutput = Annotated[
+    Union[SaveRecipesBatchOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+# Two forms:
+#   ok:batch_saved:0:skipped_as_duplicate:M
+#   ok:batch_saved:N:skipped_as_duplicate:M:ids=[rec_a,rec_b,...]
+_SAVE_BATCH_RE = re.compile(
+    r"^ok:batch_saved:(?P<n>\d+):skipped_as_duplicate:(?P<m>\d+)"
+    r"(?::ids=\[(?P<ids>[^\]]*)\])?$"
+)
+
+
+def parse_save_recipes_batch(
+    raw: str,
+) -> SaveRecipesBatchOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _SAVE_BATCH_RE.match(raw.strip())
+    if m is not None:
+        n = int(m.group("n"))
+        skipped = int(m.group("m"))
+        ids_csv = m.group("ids") or ""
+        ids = [x.strip() for x in ids_csv.split(",") if x.strip()]
+        # Codex Sub-A4 shopping R3 MINOR analogue: zero-count + ids
+        # mismatch fails closed (legacy emits no ids group when N=0,
+        # so ids should be empty here too).
+        if n == 0 and ids:
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="save_recipes_batch",
+                timestamp=datetime.now(timezone.utc),
+            )
+        try:
+            return SaveRecipesBatchOk(
+                created_count=n,
+                skipped_as_duplicate=skipped,
+                recipe_ids=ids,
+            )
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="save_recipes_batch",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 15. search_recipes      `no recipes found` | `N recipe(s):\n  [rec_id] ...`
+# ---------------------------------------------------------------------------
+
+
+class SearchRecipesItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recipe_id: RecipeId
+    raw_line: str
+    """Raw line text — title + badge + tags blob. Renderer-friendly,
+    parsed forward into ``planner`` references for compose templates."""
+
+
+class SearchRecipesEmpty(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["empty"] = "empty"
+
+
+class SearchRecipesList(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["ok"] = "ok"
+    items: list[SearchRecipesItem] = Field(min_length=1)
+    raw_text: str
+
+
+SearchRecipesOutput = Annotated[
+    Union[SearchRecipesList, SearchRecipesEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_SEARCH_HEADER_RE = re.compile(r"^(?P<n>\d+)\s+recipe\(s\):$")
+_SEARCH_ITEM_RE = re.compile(r"^\[(?P<id>rec_[^\]]+)\]\s+.+$")
+
+
+def parse_search_recipes(
+    raw: str,
+) -> SearchRecipesList | SearchRecipesEmpty | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "no recipes found":
+        return SearchRecipesEmpty()
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if not lines:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="search_recipes",
+            timestamp=datetime.now(timezone.utc),
+        )
+    header = lines[0]
+    if not _SEARCH_HEADER_RE.match(header):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="search_recipes",
+            timestamp=datetime.now(timezone.utc),
+        )
+    items: list[SearchRecipesItem] = []
+    for line in lines[1:]:
+        m = _SEARCH_ITEM_RE.match(line)
+        if m is None:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="search_recipes",
+                timestamp=datetime.now(timezone.utc),
+            )
+        try:
+            items.append(SearchRecipesItem(
+                recipe_id=m.group("id"),
+                raw_line=line,
+            ))
+        except ValidationError:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="search_recipes",
+                timestamp=datetime.now(timezone.utc),
+            )
+    if not items:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="search_recipes",
+            timestamp=datetime.now(timezone.utc),
+        )
+    return SearchRecipesList(items=items, raw_text=stripped)
+
+
+# ---------------------------------------------------------------------------
+# 16. delete_recipe         `ok:deleted` | `error: recipe 'X' not found`
+# ---------------------------------------------------------------------------
+
+
+class DeleteRecipeOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["deleted"] = "deleted"
+
+
+DeleteRecipeOutput = Annotated[
+    Union[DeleteRecipeOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_delete_recipe(
+    raw: str,
+) -> DeleteRecipeOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    if raw.strip() == "ok:deleted":
+        return DeleteRecipeOk()
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="delete_recipe",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -879,6 +1121,10 @@ PARSERS = {
     "clear_bought_shopping": parse_clear_bought_shopping,
     "update_reminder": parse_update_reminder,
     "cancel_reminder": parse_cancel_reminder,
+    "save_recipe": parse_save_recipe,
+    "save_recipes_batch": parse_save_recipes_batch,
+    "search_recipes": parse_search_recipes,
+    "delete_recipe": parse_delete_recipe,
 }
 
 

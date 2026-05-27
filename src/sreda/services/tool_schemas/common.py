@@ -381,6 +381,16 @@ ChecklistId = Annotated[
 """Checklist id — ``checklist_<24 hex chars>`` (``checklists.py:148/241``)."""
 
 
+RecipeId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=rf"^rec_{_HEX24}$",
+    ),
+]
+"""Recipe id — ``rec_<24 hex chars>`` (``housewife_recipes.py:217/353``)."""
+
+
 # ---------------------------------------------------------------------------
 # Reminders family — date/time + recurrence aliases.
 #
@@ -521,6 +531,7 @@ __all__ = [
     "ChecklistId",
     "NonBlankStr",
     "QuantityText",
+    "RecipeId",
     "RecurrenceRule",
     "ReminderId",
     "ShoppingItemId",

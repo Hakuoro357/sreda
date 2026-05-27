@@ -270,11 +270,16 @@ def test_get_recipe_found_returns_raw_text() -> None:
 
 
 def test_get_recipe_not_found_error_is_normalized() -> None:
-    """``error: recipe '<id>' not found`` collapses to error_code='not_found'
-    so the planner can branch on a stable code (the recipe_id varies per call)."""
+    """``error: recipe '<id>' not found`` collapses to
+    error_code='recipe_not_found' via ``_STABLE_ERROR_PATTERNS`` —
+    aligned with the ``<entity>_not_found`` convention shared with
+    item / task / reminder / checklist not-found codes.
+
+    Sub-A4 recipes-family migration replaced the legacy 'not_found'
+    special-case with the stable pattern for consistency."""
     result = parse_get_recipe("error: recipe 'mystery' not found")
     assert isinstance(result, HousewifeToolError)
-    assert result.error_code == "not_found"
+    assert result.error_code == "recipe_not_found"
     assert "not found" in result.message
 
 
