@@ -113,6 +113,34 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"^member\s+.+\s+not\s+found$", re.IGNORECASE),
         "member_not_found",
     ),
+    # link_task_to_checklist conflict shapes (Codex Sub-A4 tasks R1 MAJOR #5).
+    # Source: ``housewife_chat_tools.py:2239-2247``.
+    #   "error: task_already_linked:task_X:checklist_Y. Unlink сначала..."
+    #   "error: checklist_already_linked_to_task_X. Сначала unlink..."
+    # The dynamic ids (task_X / checklist_Y) embedded in the message
+    # would produce per-id error codes via the fallback path; stable
+    # patterns make planner branching deterministic.
+    (
+        re.compile(r"^task_already_linked:.+", re.IGNORECASE),
+        "task_already_linked",
+    ),
+    (
+        re.compile(r"^checklist_already_linked_to_task_.+", re.IGNORECASE),
+        "checklist_already_linked",
+    ),
+    # link_task_to_checklist generic «not found» branch (line 2248
+    # catch-all `return f"{status}: {info or ''}"` for the
+    # service's «error:not_found» / «error:archived» statuses).
+    #   "error: not_found: task_not_found"  (or similar info)
+    #   "error: archived: <reason>"
+    (
+        re.compile(r"^not_found(:.*)?$", re.IGNORECASE),
+        "link_target_not_found",
+    ),
+    (
+        re.compile(r"^archived(:.*)?$", re.IGNORECASE),
+        "checklist_archived",
+    ),
 ]
 
 
@@ -1867,6 +1895,50 @@ def parse_add_task(
 
 
 # 27. list_tasks
+
+
+class ListTasksRow(BaseModel):
+    """Codex Sub-A4 tasks R1 MAJOR #3: structured row replacing
+    raw_text. Tasks are ID-driven (update_task / complete_task /
+    cancel_task / delete_task / attach_reminder / detach_reminder
+    / link_task_to_checklist / unlink_task — 8 of 11 tools take
+    task_id). Pre-R2 raw_text forced the planner to parse the
+    «[task_id] title · on YYYY-MM-DD HH:MM ...» prose to extract
+    task_id. Now parser decomposes ``_fmt_task_for_llm`` output
+    (housewife_chat_tools.py:1758-1787) into typed fields so the
+    planner refers to ``${list_tasks.tasks[i].task_id}`` directly.
+
+    Optional fields mirror runtime emissions:
+    - ``scheduled_date_iso`` — ISO date string when task has a date
+    - ``time_start`` / ``time_end`` — HH:MM strings when present
+    - ``recurrence_rule`` — RFC 5545 RRULE string when task recurs
+    - ``reminder_offset_minutes`` — int when task has linked reminder
+    - ``runtime_status`` — «completed»/«cancelled» (non-«pending»);
+      «pending» is implicit when omitted
+    - ``notes`` — free-form prose
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    task_id: TaskId
+    title: str = Field(min_length=1, max_length=500)
+    scheduled_date_iso: str | None = Field(
+        default=None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    time_start: str | None = Field(
+        default=None,
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
+    time_end: str | None = Field(
+        default=None,
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
+    recurrence_rule: str | None = Field(default=None, max_length=255)
+    reminder_offset_minutes: int | None = Field(default=None, ge=0)
+    runtime_status: Literal["completed", "cancelled"] | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+
+
 class ListTasksEmpty(BaseModel):
     """Empty path: «no tasks» — planner branches to «нет задач на этот
     день» / «inbox пустой»."""
@@ -1875,20 +1947,114 @@ class ListTasksEmpty(BaseModel):
 
 
 class ListTasksOk(BaseModel):
-    """Populated dump. MVP boundary — runtime ``_fmt_task_for_llm``
-    produces human-readable multi-line text; planner consumes raw_text
-    and summarises. Structured rows are a follow-up (same MVP boundary
-    as ListMenuOk pre-promotion). Tasks have wider field-set than
-    family members so structuring is more work; defer."""
+    """Structured list of tasks (R1 MAJOR #3 promotion). ``tasks`` is
+    always non-empty here — empty path goes to ListTasksEmpty."""
     model_config = ConfigDict(extra="forbid")
     status: Literal["ok"] = "ok"
-    raw_text: str = Field(min_length=1)
+    tasks: list[ListTasksRow] = Field(min_length=1)
 
 
 ListTasksOutput = Annotated[
     Union[ListTasksOk, ListTasksEmpty, HousewifeToolError],
     Field(discriminator="status"),
 ]
+
+
+# _fmt_task_for_llm format (housewife_chat_tools.py:1758-1787):
+#   [task_id] title [· on YYYY-MM-DD [HH:MM[–HH:MM]]] [· recurring=RRULE]
+#   [· reminder=за Nмин] [· status=X] [· notes=Y]
+# Segments separated by ` · `. First two are positional (id-bracket
+# + title). Rest are prefixed key=value or `on ...`.
+
+_LIST_TASKS_ID_RE = re.compile(r"^\[(?P<task_id>task_[0-9a-f]{24})\]$")
+
+
+def _parse_list_tasks_row(line: str) -> ListTasksRow | None:
+    """Decompose one ``_fmt_task_for_llm`` line into a typed row.
+    Returns ``None`` on any malformed segment so the caller can
+    fail-closed via ContractViolation."""
+    parts = [p.strip() for p in line.split(" · ")]
+    if len(parts) < 2:
+        return None
+    id_match = _LIST_TASKS_ID_RE.match(parts[0])
+    if id_match is None:
+        return None
+    task_id = id_match.group("task_id")
+    title = parts[1]
+    if not title or len(title) > 500:
+        return None
+
+    scheduled_date_iso: str | None = None
+    time_start: str | None = None
+    time_end: str | None = None
+    recurrence_rule: str | None = None
+    reminder_offset_minutes: int | None = None
+    runtime_status: str | None = None
+    notes: str | None = None
+
+    for segment in parts[2:]:
+        if segment.startswith("on "):
+            when = segment[len("on "):].strip()
+            # `on YYYY-MM-DD` OR `on YYYY-MM-DD HH:MM[–HH:MM]` OR
+            # `on HH:MM[–HH:MM]` (inbox tasks have no date).
+            when_parts = when.split(" ")
+            if len(when_parts) == 0:
+                return None
+            head = when_parts[0]
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", head):
+                scheduled_date_iso = head
+                if len(when_parts) > 1:
+                    time_token = when_parts[1]
+                else:
+                    time_token = None
+            elif re.match(r"^([01]\d|2[0-3]):[0-5]\d", head):
+                time_token = head
+            else:
+                return None
+            if time_token is not None:
+                # Split `HH:MM–HH:MM` (en-dash) — emitted by line 1772.
+                if "–" in time_token:
+                    t_parts = time_token.split("–")
+                    if len(t_parts) != 2:
+                        return None
+                    time_start, time_end = t_parts[0], t_parts[1]
+                else:
+                    time_start = time_token
+        elif segment.startswith("recurring="):
+            recurrence_rule = segment[len("recurring="):].strip()
+        elif segment.startswith("reminder=за "):
+            rest = segment[len("reminder=за "):].strip()
+            if not rest.endswith("мин"):
+                return None
+            try:
+                reminder_offset_minutes = int(rest[:-len("мин")].strip())
+            except ValueError:
+                return None
+        elif segment.startswith("status="):
+            value = segment[len("status="):].strip()
+            if value not in {"completed", "cancelled"}:
+                return None
+            runtime_status = value
+        elif segment.startswith("notes="):
+            notes = segment[len("notes="):].strip()
+        else:
+            # Unknown segment — fail closed.
+            return None
+
+    try:
+        return ListTasksRow(
+            task_id=task_id,
+            title=title,
+            scheduled_date_iso=scheduled_date_iso,
+            time_start=time_start,
+            time_end=time_end,
+            recurrence_rule=recurrence_rule,
+            reminder_offset_minutes=reminder_offset_minutes,
+            runtime_status=runtime_status,
+            notes=notes,
+        )
+    except ValidationError:
+        return None
 
 
 def parse_list_tasks(
@@ -1900,21 +2066,41 @@ def parse_list_tasks(
     stripped = raw.strip()
     if stripped == "no tasks":
         return ListTasksEmpty()
-    if stripped:
-        # _fmt_task_for_llm always emits at least one non-empty line
-        # per task. We trust the dump but reject if it accidentally
-        # equals one of the «ok:…» status tokens (which would only
-        # happen on runtime drift).
-        if stripped.startswith("ok:") or stripped.startswith("error:"):
+    if not stripped:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_tasks",
+            timestamp=datetime.now(timezone.utc),
+        )
+    # Defensive: ok:/error: prefix means runtime is emitting a status
+    # token where a task dump is expected — drift.
+    if stripped.startswith("ok:") or stripped.startswith("error:"):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_tasks",
+            timestamp=datetime.now(timezone.utc),
+        )
+    rows: list[ListTasksRow] = []
+    for line in stripped.splitlines():
+        if not line.strip():
+            continue
+        row = _parse_list_tasks_row(line)
+        if row is None:
             return ToolOutputContractViolation(
                 raw_output=raw, tool_name="list_tasks",
                 timestamp=datetime.now(timezone.utc),
             )
-        return ListTasksOk(raw_text=stripped)
-    return ToolOutputContractViolation(
-        raw_output=raw, tool_name="list_tasks",
-        timestamp=datetime.now(timezone.utc),
-    )
+        rows.append(row)
+    if not rows:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_tasks",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ListTasksOk(tasks=rows)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_tasks",
+            timestamp=datetime.now(timezone.utc),
+        )
 
 
 # 28. update_task

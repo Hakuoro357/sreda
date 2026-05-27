@@ -680,27 +680,40 @@ def test_reminders_anti_patterns_explain_attach_reminder_boundary() -> None:
 
 
 def test_tasks_anti_patterns_explain_checklist_link_boundary() -> None:
-    """Codex Sub-A4 tasks R1 (registry quality cross-family fix):
-    boundary between link_task_to_checklist (tasks) and the
-    «merge task into checklist as item» semantic (checklists) must
-    surface in the tasks family header — but WITHOUT naming the
-    unmigrated checklists-side tool by name (would steer the
-    planner toward an unavailable typed tool until checklists is
-    migrated).
+    """Codex Sub-A4 tasks R1 (registry quality cross-family fix) +
+    R2 MINOR #7 strengthening: boundary between
+    link_task_to_checklist (tasks, migrated) and the «merge task
+    into checklist as item» semantic (checklists, not yet migrated)
+    must surface in the tasks family header WITHOUT naming the
+    unmigrated checklists-side tool by name (steering the planner
+    toward an unavailable typed tool).
 
-    Same pattern as Codex menu R1 MAJOR #6 cross-family hygiene.
-    Pre-tasks-R1 the test required ``move_task_to_checklist`` by
-    name — that's the contract regression. Now we verify the
-    boundary is taught at intent-level."""
+    R2 strengthening:
+    - link_task_to_checklist explicitly named (migrated, safe)
+    - move_task_to_checklist explicitly NOT named (unmigrated)
+    - BOTH semantics ('link existing pair' AND 'move as item')
+      taught so planner can distinguish them.
+    """
     text = " ".join(FAMILY_HEADERS["tasks"].anti_patterns)
+    text_lower = text.lower()
     # Named tool (migrated): MUST appear.
     assert "link_task_to_checklist" in text, (
         "tasks header must teach link_task_to_checklist boundary"
     )
-    # Boundary intent for «move into checklist as item» MUST appear,
-    # even though the specific tool isn't named (it's not migrated yet).
-    assert "пункт" in text.lower() or "переноси" in text.lower() or "перенеси" in text.lower(), (
-        "header must teach the «move task → checklist as item» "
-        "boundary at intent-level (без называния невмигрированного "
-        "инструмента — Codex cross-family hygiene rule)"
+    # Unmigrated tool MUST NOT appear by name — cross-family hygiene.
+    assert "move_task_to_checklist" not in text, (
+        "move_task_to_checklist is not yet migrated; naming it in "
+        "the tasks family header steers the planner toward an "
+        "unavailable typed tool. Use intent-level wording instead."
+    )
+    # Link semantic taught (link existing pair).
+    assert "связ" in text_lower or "связи" in text_lower or "связыва" in text_lower, (
+        "header must teach the link semantic «связать существующую "
+        "задачу с существующим чек-листом»"
+    )
+    # Move-as-item semantic taught (without naming move_task_to_checklist).
+    assert "пункт" in text_lower, (
+        "header must teach the move-as-item semantic «задача "
+        "превращается в пункт чек-листа» (intent-level — without "
+        "naming the unmigrated move_task_to_checklist tool)"
     )

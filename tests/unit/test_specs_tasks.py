@@ -429,11 +429,70 @@ def test_list_tasks_parser_empty() -> None:
     assert isinstance(parsed, ListTasksEmpty)
 
 
-def test_list_tasks_parser_dump() -> None:
-    raw = f"[{TASK_A}] утренняя разминка · today · 07:00"
+def test_list_tasks_parser_structured_row() -> None:
+    """Codex R1 MAJOR #3: structured rows (was raw_text). Parser
+    decomposes ``_fmt_task_for_llm`` output into typed fields so
+    update/complete/cancel/delete can reference ``${list.tasks[i].task_id}``."""
+    from sreda.services.tool_schemas.housewife import ListTasksRow
+    raw = (
+        f"[{TASK_A}] · утренняя разминка · on 2026-05-28 07:00–07:30 "
+        "· recurring=FREQ=DAILY · reminder=за 15мин "
+        "· notes=не забудь воду"
+    )
     parsed = parse_tool_output("list_tasks", raw)
     assert isinstance(parsed, ListTasksOk)
-    assert "разминка" in parsed.raw_text
+    assert len(parsed.tasks) == 1
+    t = parsed.tasks[0]
+    assert isinstance(t, ListTasksRow)
+    assert t.task_id == TASK_A
+    assert t.title == "утренняя разминка"
+    assert t.scheduled_date_iso == "2026-05-28"
+    assert t.time_start == "07:00"
+    assert t.time_end == "07:30"
+    assert t.recurrence_rule == "FREQ=DAILY"
+    assert t.reminder_offset_minutes == 15
+    assert t.notes == "не забудь воду"
+
+
+def test_list_tasks_parser_multiple_rows() -> None:
+    """One task per line."""
+    raw = (
+        f"[{TASK_A}] · разминка · on 2026-05-28 07:00\n"
+        f"[{TASK_B}] · зарядка · status=completed"
+    )
+    parsed = parse_tool_output("list_tasks", raw)
+    assert isinstance(parsed, ListTasksOk)
+    assert len(parsed.tasks) == 2
+    assert parsed.tasks[1].runtime_status == "completed"
+
+
+def test_list_tasks_parser_inbox_task_no_date() -> None:
+    """Inbox tasks have no `on YYYY-MM-DD` segment — runtime
+    suppresses the date when scheduled_date is None."""
+    parsed = parse_tool_output("list_tasks", f"[{TASK_A}] · read book")
+    assert isinstance(parsed, ListTasksOk)
+    assert parsed.tasks[0].scheduled_date_iso is None
+    assert parsed.tasks[0].time_start is None
+
+
+def test_list_tasks_parser_rejects_unknown_segment() -> None:
+    """Malformed segments → ContractViolation (fail-closed)."""
+    raw = f"[{TASK_A}] · разминка · totally_weird_segment"
+    parsed = parse_tool_output("list_tasks", raw)
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_list_tasks_parser_rejects_bad_task_id_shape() -> None:
+    parsed = parse_tool_output("list_tasks", "[task_short] · foo")
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_list_tasks_parser_rejects_bad_runtime_status() -> None:
+    """status=unknown is runtime drift — only completed/cancelled
+    are valid (pending is implicit when omitted)."""
+    raw = f"[{TASK_A}] · разминка · status=unknown"
+    parsed = parse_tool_output("list_tasks", raw)
+    assert isinstance(parsed, ToolOutputContractViolation)
 
 
 def test_list_tasks_parser_rejects_status_token() -> None:
@@ -561,7 +620,7 @@ def test_unlink_task_parser_not_linked() -> None:
     ("add_task", f"ok:created:{TASK_A}:checklist={CHK_A}"),
     ("add_task", "error: reminder requires scheduled_date + time_start"),
     ("list_tasks", "no tasks"),
-    ("list_tasks", f"[{TASK_A}] разминка today 07:00"),
+    ("list_tasks", f"[{TASK_A}] · разминка · on 2026-05-28 07:00"),
     ("update_task", f"ok:updated:{TASK_A}"),
     ("complete_task", f"ok:completed:{TASK_A}"),
     ("uncomplete_task", f"ok:uncompleted:{TASK_A}"),
@@ -614,3 +673,99 @@ def test_migrated_tool_specs_aggregate_includes_tasks() -> None:
 def test_migrated_tool_specs_pass_strict_with_tasks() -> None:
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
     assert_production_registry_quality(MIGRATED_TOOL_SPECS)
+
+
+# ---------------------------------------------------------------------------
+# Codex R1 fixes — boundary tests
+# ---------------------------------------------------------------------------
+
+
+def test_add_task_input_rejects_empty_details_list() -> None:
+    """Codex R1 MAJOR #4: empty details_items list would be a no-op
+    runtime-side (truthy check), but planner thinks it asked for a
+    checklist. Reject at schema time."""
+    with pytest.raises(ValidationError):
+        AddTaskInput.model_validate({
+            "title": "x",
+            "details_items": [],
+        })
+
+
+def test_add_task_input_rejects_reminder_above_week() -> None:
+    """Codex R1 MINOR #6: cap matches AttachReminderInput at 10080
+    (7 days). Inconsistency with AttachReminder was the bug."""
+    with pytest.raises(ValidationError):
+        AddTaskInput.model_validate({
+            "title": "x",
+            "scheduled_date": "tomorrow",
+            "time_start": "08:00",
+            "reminder_offset_minutes": 10081,
+        })
+
+
+def test_update_task_input_rejects_inbox_scheduled_date() -> None:
+    """Codex R1 MAJOR #2: ``scheduled_date='inbox'`` in update is a
+    silent no-op runtime-side (None means «leave as-is»). Reject
+    until runtime gets explicit clear-date sentinel."""
+    with pytest.raises(ValidationError) as exc:
+        UpdateTaskInput.model_validate({
+            "task_id": TASK_A,
+            "scheduled_date": "inbox",
+        })
+    assert "inbox" in str(exc.value).lower()
+
+
+def test_update_task_spec_has_required_any_non_null_args() -> None:
+    """Codex R1 MAJOR #1: validator-driven Phase 1.d guard catches
+    refs-bearing no-op updates that model_validator misses (plan
+    validator skips Pydantic model_validators for ref'd args)."""
+    assert UPDATE_TASK_SPEC.required_any_non_null_args == [
+        "title",
+        "scheduled_date",
+        "time_start",
+        "time_end",
+        "recurrence_rule",
+        "notes",
+    ]
+
+
+@pytest.mark.parametrize("raw,expected_code", [
+    (
+        f"error: task_already_linked:{TASK_A}:checklist_aaaaaaaaaaaaaaaaaaaaaaaa. "
+        "Unlink сначала через unlink_task.",
+        "task_already_linked",
+    ),
+    (
+        "error: checklist_already_linked_to_task_aaaaaaaaaaaaaaaaaaaaaaaaaaaa. "
+        "Сначала unlink другую задачу через unlink_task.",
+        "checklist_already_linked",
+    ),
+])
+def test_link_task_conflict_error_codes_are_stable(raw, expected_code):
+    """Codex R1 MAJOR #5: link/unlink conflict messages embed
+    dynamic task/checklist ids; without stable patterns the
+    fallback `_parse_error` produces per-id codes like
+    `task_already_linked_task_X_checklist_Y` — planner branching
+    becomes nondeterministic. Stable patterns map all dynamic
+    variants to one branch."""
+    parsed = parse_tool_output("link_task_to_checklist", raw)
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == expected_code
+
+
+def test_link_task_not_found_stable_code() -> None:
+    """Generic `error: not_found: ...` catch-all from line 2248
+    of link_task_to_checklist runtime."""
+    parsed = parse_tool_output(
+        "link_task_to_checklist", "error: not_found: task_not_found",
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "link_target_not_found"
+
+
+def test_link_task_archived_stable_code() -> None:
+    parsed = parse_tool_output(
+        "link_task_to_checklist", "error: archived: checklist inactive",
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "checklist_archived"

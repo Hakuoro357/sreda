@@ -176,8 +176,16 @@ class AddTaskInput(BaseModel):
     time_end: HHMM | None = None
     recurrence_rule: RecurrenceRule | None = None
     notes: TaskNotes | None = None
-    reminder_offset_minutes: int | None = Field(default=None, ge=1)
-    details_items: list[DetailItem] | None = Field(default=None, max_length=50)
+    reminder_offset_minutes: int | None = Field(default=None, ge=1, le=10080)
+    """Codex R1 MINOR #6: cap matches AttachReminderInput.offset_minutes
+    (10080 min = 7 days). Reminding for something a week+ out is
+    almost always a planner mistake."""
+    details_items: list[DetailItem] | None = Field(default=None, min_length=1, max_length=50)
+    """Codex R1 MAJOR #4: ``min_length=1`` rejects ``details_items=[]``.
+    Empty list previously slipped through schema then was no-op'd by
+    runtime ``if details_items:`` truthy check — planner couldn't tell
+    «I asked for a checklist but it was dropped». ``None`` (default) is
+    still the «no checklist» path; explicit empty list is malformed."""
 
     @model_validator(mode="after")
     def _validate_reminder_requires_schedule(self) -> "AddTaskInput":
@@ -264,6 +272,27 @@ class UpdateTaskInput(BaseModel):
             raise ValueError(
                 f"time_end={self.time_end!r} must be after "
                 f"time_start={self.time_start!r}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_inbox_in_update(self) -> "UpdateTaskInput":
+        """Codex Sub-A4 tasks R1 MAJOR #2: runtime ``TaskService.update``
+        treats ``scheduled_date=None`` as «leave as-is», not «clear
+        date to inbox». Passing ``scheduled_date="inbox"`` here would
+        become a successful no-op — planner thinks it moved the task
+        to inbox, runtime did nothing. Reject explicitly until the
+        runtime gains an explicit clear-date sentinel (analogous to
+        the household ``clear_birth_year`` flag from R3)."""
+        if (
+            self.scheduled_date is not None
+            and self.scheduled_date.strip().lower() == "inbox"
+        ):
+            raise ValueError(
+                "scheduled_date='inbox' is not supported by update_task — "
+                "runtime cannot clear a task's schedule via this path. "
+                "Either keep the existing date, or delete_task + add_task "
+                "(inbox) to move the task to inbox."
             )
         return self
 
@@ -407,7 +436,10 @@ UPDATE_TASK_SPEC = ToolSpec(
         "scheduled_date/time_start — линкованный reminder "
         "автоматически перепланируется. Чтобы добавить/убрать "
         "сам reminder — attach_reminder/detach_reminder. Если "
-        "task_id ещё нет — сначала list_tasks."
+        "task_id ещё нет — сначала list_tasks. ВНИМАНИЕ: "
+        "scheduled_date='inbox' через update НЕ поддерживается "
+        "(runtime трактует как «оставить как было»). Для переноса "
+        "в inbox — delete_task + add_task без scheduled_date."
     ),
     family="tasks",
     effect="write",
@@ -424,6 +456,22 @@ UPDATE_TASK_SPEC = ToolSpec(
     mutex_notes=[
         "Используй для ИЗМЕНЕНИЯ существующей задачи. Создание → add_task. Отметка готовой → complete_task.",
         "task_id берётся из list_tasks. attach_reminder/detach_reminder для самого факта напоминания (а не его времени).",
+    ],
+    # Codex Sub-A4 tasks R1 MAJOR #1: model_validator
+    # `_validate_at_least_one_field` in UpdateTaskInput catches direct
+    # planner construction, but the plan validator skips Pydantic
+    # model_validators when args contain refs
+    # (${list_tasks.tasks[0].task_id} etc). required_any_non_null_args
+    # runs at the validator-driven Phase 1.d layer BEFORE Pydantic
+    # construction, so refs-bearing no-op updates are caught. Same
+    # pattern as reminders R3 (update_reminder).
+    required_any_non_null_args=[
+        "title",
+        "scheduled_date",
+        "time_start",
+        "time_end",
+        "recurrence_rule",
+        "notes",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
