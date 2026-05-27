@@ -166,9 +166,9 @@ ONBOARDING_DEFERRED_SPEC = ToolSpec(
         "«пропусти»). Первый пропуск оставляет тему в retry-queue "
         "(topic_state=skipped_once) — runtime может re-ask. Второй "
         "пропуск делает skip permanent (topic_state=skipped). "
-        "``reason`` — планировщику нужно зафиксировать почему "
-        "пропускаем (НЕ хранится в БД, но обязательная мотивация "
-        "для аудит-логов плана). Возвращает "
+        "``reason`` — короткое обоснование skip'а; runtime его НЕ "
+        "хранит, но поле обязательное чтобы планировщик явно "
+        "артикулировал решение в plan_json. Возвращает "
         "ok:deferred:addressing:topic_state=...:next=...:status=..."
     ),
     family="onboarding",
