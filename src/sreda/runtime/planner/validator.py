@@ -46,13 +46,36 @@ Closes Codex R1 concerns:
   ``interpolation.py``.
 - MINOR #11 alias handling — normalize via ``model_fields``.
 
-Known deferred limitation (Codex R1 MAJOR #6):
-We do NOT statically check that ``${s1.items}`` into ``items: list[str]``
-matches producer ``output_model.items: list[str]``. Implementing this
-needs walking the producer's output union by ref-path; in MVP we rely
-on executor-time validation (the resolved value gets type-checked when
-the tool actually receives it). Will revisit once Sub-B1 reveals
-how often the static check would have helped.
+Known deferred limitations:
+
+1. Producer/consumer ref-type match (Codex R1 MAJOR #6):
+   We do NOT statically check that ``${s1.items}`` into
+   ``items: list[str]`` matches producer ``output_model.items:
+   list[str]``. Walking the producer's output union by ref-path is
+   beyond MVP scope. Executor-time validation catches the resolved-value
+   mismatch when the tool actually receives the args.
+
+2. ``@field_validator`` decorators (Codex R5 MAJOR #2):
+   When ANY ref is present in ``action.args``, per-field validation
+   uses ``TypeAdapter(annotation)`` which preserves ``Annotated[...]``
+   constraints but NOT ``@field_validator`` decorators attached to the
+   model. A concrete bad value in a field with ``@field_validator``
+   passes plan validation if a sibling field is a ref. **Mitigation**:
+   Sub-A4 ``ToolSpec.input_model`` definitions SHOULD prefer
+   ``Field(...)`` constraints (``ge``, ``max_length``, ``pattern``,
+   ``Annotated[T, ...]``) over ``@field_validator`` for single-field
+   shape rules — those flow through TypeAdapter. Cross-field
+   ``@model_validator`` is harder to handle correctly under refs and
+   is documented-deferred regardless. Tested via
+   ``test_model_validator_does_not_fire_when_refs_present``.
+
+3. Fixed-length heterogeneous tuple fields (Codex R5 MINOR #3):
+   ``tuple[int, str]`` with a ref in one position: concrete sibling
+   positions are NOT statically validated, and arity is not checked
+   (because ``_check_container_shell_constraints`` builds shell as
+   ``tuple[Any, ...]``). In practice planner-emitted JSON has lists,
+   not tuples — no ToolSpec input model is expected to use fixed
+   tuple fields. Accepted limitation.
 """
 
 from __future__ import annotations
@@ -654,47 +677,22 @@ def _phase2_validate_args(
     model = tool_spec.input_model
     accepted_names = _accepted_field_names(model)
 
-    # Two dicts:
-    # - ``known_args_as_emitted`` keeps planner's original keys (possibly
-    #   aliases) — passed to ``model_validate`` so pydantic's own alias
-    #   resolution + ``populate_by_name`` semantics apply unchanged.
-    # - ``canonical_args`` maps each known key to its CANONICAL field
-    #   name; used for the per-field walk so we iterate model_fields
-    #   without alias confusion.
-    known_args_as_emitted: dict[str, Any] = {}
-    canonical_args: dict[str, Any] = {}
-    # Codex R3 MAJOR #3: when two emitted keys map to the same canonical
-    # field (e.g. alias + field name both supplied under
-    # ``populate_by_name=True``), pydantic's precedence rules apply
-    # deterministically. Our last-wins ``canonical_args[k] = v``
-    # silently picks one — we'd validate a value that the executor's
-    # ``model_validate`` won't actually use. Detect + surface as
-    # ``duplicate_arg`` so the planner gets a clear retry signal.
-    canonical_emitted_keys: dict[str, list[str]] = {}
-    for key, value in action.args.items():
-        if key not in accepted_names:
-            continue  # unknown — Phase 1 handled
-        known_args_as_emitted[key] = value
-        canonical_key = _normalize_to_field_name(key, model)
-        if canonical_key is not None:
-            canonical_args[canonical_key] = value
-            canonical_emitted_keys.setdefault(canonical_key, []).append(key)
-
-    for canonical_key, emitted_keys in canonical_emitted_keys.items():
-        if len(emitted_keys) > 1:
-            yield Violation(
-                step_id=step_id,
-                tool=tool_spec.name,
-                field_path=canonical_key,
-                code="duplicate_arg",
-                message=(
-                    f"field {canonical_key!r} supplied under multiple "
-                    f"names: {sorted(emitted_keys)}. Pydantic precedence "
-                    f"would pick one deterministically, but the planner "
-                    f"should emit exactly one. Pick the alias or the "
-                    f"field name, not both."
-                ),
-            )
+    # Use shared normaliser (Codex R5 MAJOR #1) so top-level and nested
+    # paths share alias/duplicate semantics.
+    canonical_args, duplicate_violations = _normalize_model_input(
+        step_id=step_id,
+        tool_or_path=tool_spec.name,
+        model=model,
+        args=action.args,
+        is_nested=False,
+    )
+    yield from duplicate_violations
+    # Original-key dict for full no-refs model_validate (uses pydantic's
+    # own alias resolution semantics — see also test
+    # ``test_arg_under_alias_is_accepted``).
+    known_args_as_emitted = {
+        k: v for k, v in action.args.items() if k in accepted_names
+    }
 
     if not contains_ref(known_args_as_emitted):
         # No refs anywhere — full validation including cross-field rules.
@@ -734,6 +732,62 @@ def _phase2_validate_args(
             value=value,
             annotation=annotation_with_constraints,
         )
+
+
+def _normalize_model_input(
+    *,
+    step_id: str,
+    tool_or_path: str,
+    model: type[BaseModel],
+    args: Mapping[str, Any],
+    is_nested: bool,
+) -> tuple[dict[str, Any], list[Violation]]:
+    """Shared model-input normaliser used by both top-level Phase 2 and
+    nested-BaseModel recursion (Codex R5 MAJOR #1 — extracted to keep
+    alias/duplicate semantics in one place).
+
+    Returns ``(canonical_args, violations)``:
+    - ``canonical_args``: keys remapped to canonical field names. Keys
+      not in ``model.model_fields`` are dropped (Phase 1 reports them
+      separately).
+    - ``violations``: list of ``duplicate_arg`` Violations for fields
+      that received >1 emitted key (alias + name both under
+      ``populate_by_name=True``, or two AliasChoices entries).
+
+    ``tool_or_path`` is the tool name at top level or
+    ``"<tool>:<field_path>"`` for nested calls — controls how the
+    ``field_path`` is built in violations.
+    """
+
+    accepted_names = _accepted_field_names(model)
+    canonical_args: dict[str, Any] = {}
+    canonical_emitted_keys: dict[str, list[str]] = {}
+    for key, value in args.items():
+        if key not in accepted_names:
+            continue
+        canonical_key = _normalize_to_field_name(key, model)
+        if canonical_key is not None:
+            canonical_args[canonical_key] = value
+            canonical_emitted_keys.setdefault(canonical_key, []).append(key)
+
+    violations: list[Violation] = []
+    for canonical_key, emitted_keys in canonical_emitted_keys.items():
+        if len(emitted_keys) > 1:
+            field_path = (
+                f"{tool_or_path}.{canonical_key}" if is_nested else canonical_key
+            )
+            violations.append(Violation(
+                step_id=step_id,
+                tool=tool_or_path.split(":", 1)[0] if is_nested else tool_or_path,
+                field_path=field_path,
+                code="duplicate_arg",
+                message=(
+                    f"field {canonical_key!r} supplied under multiple "
+                    f"names: {sorted(emitted_keys)}. Pick the alias or "
+                    f"the field name, not both."
+                ),
+            ))
+    return canonical_args, violations
 
 
 def _try_extract_basemodel(annotation: Any) -> type[BaseModel] | None:
@@ -853,8 +907,20 @@ def _validate_nested_basemodel_partial(
                 ),
             )
 
+    # Shared canonicalisation + duplicate detection (Codex R5 MAJOR #1).
+    canonical_value, duplicate_violations = _normalize_model_input(
+        step_id=step_id,
+        tool_or_path=f"{tool_spec.name}:{field_name}",
+        model=nested_model,
+        args=value,
+        is_nested=True,
+    )
+    yield from duplicate_violations
+
     if not contains_ref(value):
-        # No refs at this level — full nested model_validate.
+        # No refs at this level — full nested model_validate using
+        # keys as the planner emitted them (so pydantic's own alias
+        # rules apply).
         try:
             nested_model.model_validate(
                 {k: v for k, v in value.items() if k in accepted_names}
@@ -879,13 +945,6 @@ def _validate_nested_basemodel_partial(
         return
 
     # Refs present — per-field walk with constraints preserved.
-    canonical_value: dict[str, Any] = {}
-    for key, v in value.items():
-        if key not in accepted_names:
-            continue
-        canonical_key = _normalize_to_field_name(key, nested_model)
-        if canonical_key is not None:
-            canonical_value[canonical_key] = v
     for sub_fname, sub_finfo in nested_model.model_fields.items():
         if sub_fname not in canonical_value:
             try:

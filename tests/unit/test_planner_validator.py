@@ -1161,3 +1161,53 @@ def test_ref_in_dict_key_is_unsupported_ref_location() -> None:
     assert any(v.code == "unsupported_ref_location" for v in s2)
 
 
+# ---------------------------------------------------------------------------
+# Codex R5 MAJOR #1 — duplicate_arg detection inside nested BaseModel
+# ---------------------------------------------------------------------------
+
+
+class _AuthorPopulate(BaseModel):
+    """Nested model with populate_by_name=True so alias AND field name
+    both accepted — emitting both should trigger duplicate_arg."""
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    full_name: str = PydField(alias="name")
+    age: int
+
+
+class _PostWithPopulate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str
+    author: _AuthorPopulate
+
+
+def test_nested_basemodel_duplicate_arg_detected_under_refs() -> None:
+    """When nested BaseModel uses populate_by_name=True and the planner
+    emits both alias and field-name for the same nested field, surface
+    as duplicate_arg with the nested field_path."""
+    plan = _plan_with_actions({
+        "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "post_pop_tool",
+            {
+                "title": "x",
+                "author": {
+                    "name": "Alice",        # alias
+                    "full_name": "Alicia",  # field name — duplicate
+                    "age": "${s1.title}",   # ref makes it refs-present
+                },
+            },
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "schedule_reminder": _spec("schedule_reminder", _ReminderInput),
+        "post_pop_tool": _spec("post_pop_tool", _PostWithPopulate),
+    }
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    assert any(
+        v.code == "duplicate_arg" and "author.full_name" in (v.field_path or "")
+        for v in s2
+    ), f"got: {s2}"
+
+
