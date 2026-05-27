@@ -281,6 +281,85 @@ def test_move_task_parser_partial_failure_variants(code) -> None:
     assert parsed.error_code == code
 
 
+def test_move_task_chat_tool_wraps_find_list_by_title_exception() -> None:
+    """Codex Sub-A4 checklists R5 MINOR (HIGH catch) + R6 MINOR:
+    pre-R5 the find_list_by_title call after cancel was outside
+    try/except — if it raised, runtime bubbled untyped error.
+    R5 added try/except returning `error: list_resolve_failed`.
+
+    This integration test mocks the checklist service to raise on
+    find_list_by_title and verifies the chat tool emits the typed
+    error (which parser routes to MoveTaskPartialFailure)."""
+    from unittest.mock import patch
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        tools = {
+            t.name: t for t in build_housewife_tools(
+                session=session, tenant_id="t1", user_id="u1",
+            )
+        }
+        # Create a task to cancel
+        task_result = tools["add_task"].invoke({"title": "x", "scheduled_date": "tomorrow"})
+        task_id = task_result.split("ok:created:")[1].split(":")[0]
+
+        # Mock find_list_by_title to raise
+        with patch(
+            "sreda.services.checklists.ChecklistService.find_list_by_title",
+            side_effect=RuntimeError("simulated DB error"),
+        ):
+            result = tools["move_task_to_checklist"].invoke({
+                "task_id": task_id, "list_id_or_title": "Dummy",
+            })
+        # Runtime emits the typed error code
+        assert result == "error: list_resolve_failed"
+        # Parser routes to typed MoveTaskPartialFailure
+        from sreda.services.tool_schemas.housewife import (
+            MoveTaskPartialFailure, parse_tool_output,
+        )
+        parsed = parse_tool_output("move_task_to_checklist", result)
+        assert isinstance(parsed, MoveTaskPartialFailure)
+        assert parsed.error_code == "list_resolve_failed"
+
+
+def test_move_task_chat_tool_create_list_value_error_remaps_to_partial() -> None:
+    """Codex Sub-A4 checklists R6 MINOR (HIGH catch): pre-R6
+    create_list ValueError (e.g. whitespace title triggers
+    'title required') bubbled as `error: title required` →
+    untyped generic. R6 remaps to `error: list_resolve_failed`
+    since task is ALREADY cancelled at that point (partial-failure)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        tools = {
+            t.name: t for t in build_housewife_tools(
+                session=session, tenant_id="t1", user_id="u1",
+            )
+        }
+        task_result = tools["add_task"].invoke({"title": "y", "scheduled_date": "tomorrow"})
+        task_id = task_result.split("ok:created:")[1].split(":")[0]
+
+        # Whitespace-only list_id_or_title — find_list_by_title returns None,
+        # then create_list raises ValueError("title required").
+        result = tools["move_task_to_checklist"].invoke({
+            "task_id": task_id, "list_id_or_title": "   ",
+        })
+        # R6 fix: remap to typed partial-failure code.
+        assert result == "error: list_resolve_failed"
+
+
 def test_move_task_partial_failure_typed_in_output_union() -> None:
     """MoveTaskToChecklistOutput discriminator union must include
     MoveTaskPartialFailure so TypeAdapter accepts it executor-side."""

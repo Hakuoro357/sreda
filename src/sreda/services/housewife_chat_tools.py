@@ -2548,8 +2548,17 @@ def build_housewife_tools(
                     tenant_id=tenant_id, user_id=user_id,
                     title=list_id_or_title,
                 )
-            except ValueError as exc:
-                return f"error: {exc}"
+            except ValueError:
+                # Codex Sub-A4 checklists R6 MINOR (HIGH catch):
+                # ValueError after cancel committed (e.g.
+                # `title required` for whitespace-only list_id_or_title)
+                # used to return `error: {exc}` → untyped generic
+                # error code at parse time. But task is ALREADY
+                # cancelled here — this is a partial-failure scenario.
+                # Remap to `list_resolve_failed` so parser routes to
+                # typed MoveTaskPartialFailure.
+                logger.exception("move_task_to_checklist: create_list ValueError")
+                return "error: list_resolve_failed"
             except Exception:  # noqa: BLE001
                 logger.exception("move_task_to_checklist: create_list failed")
                 return "error: list_resolve_failed"
