@@ -2772,8 +2772,10 @@ class MoveTaskPartialFailure(BaseModel):
     checklist writes commit separately. If the post-cancel step
     fails, the task is already cancelled with no rollback.
 
-    Parser detects three specific runtime error codes that mean
+    Parser detects four specific runtime error codes that mean
     «task cancelled but item not created»:
+    - ``task_has_empty_title`` — cancel succeeded but title was
+      empty (edge case after cancel, housewife_chat_tools.py:2516)
     - ``list_resolve_failed`` — create_list raised after cancel
     - ``internal_add`` — add_items raised after cancel
     - ``nothing_added`` — neither created nor matched existing
@@ -2785,7 +2787,12 @@ class MoveTaskPartialFailure(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
     status: Literal["partial_failure"] = "partial_failure"
-    error_code: Literal["list_resolve_failed", "internal_add", "nothing_added"]
+    error_code: Literal[
+        "task_has_empty_title",
+        "list_resolve_failed",
+        "internal_add",
+        "nothing_added",
+    ]
     message: str = Field(min_length=1)
 
 
@@ -2809,9 +2816,12 @@ _MOVE_TASK_DUP_RE = re.compile(
 )
 
 
-_MOVE_TASK_PARTIAL_FAILURE_CODES = frozenset(
-    {"list_resolve_failed", "internal_add", "nothing_added"}
-)
+_MOVE_TASK_PARTIAL_FAILURE_CODES = frozenset({
+    "task_has_empty_title",
+    "list_resolve_failed",
+    "internal_add",
+    "nothing_added",
+})
 
 
 def parse_move_task_to_checklist(

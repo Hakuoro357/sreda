@@ -1132,10 +1132,12 @@ _HOUSEWIFE_FOOD_PROMPT = """\
 - «Закрой список / убери план Y / уже не нужно» → ``archive_checklist``.
 - «Перенеси X из расписания в дела» / «эта задача без времени, переложи
   её в дела» / «X не на конкретный час, в чек-лист» — ОДИН вызов
-  ``move_task_to_checklist(task_id, list_id_or_title)``. Атомарно
-  cancel'ит task + добавит item в checklist (с dedup). НЕ делай
-  delete_task + add_checklist_items вручную — раньше это создавало
-  дубль (incident tg_634496616 14:35).
+  ``move_task_to_checklist(task_id, list_id_or_title)``. Best-effort
+  стадии (НЕ единая транзакция): сначала cancel task, потом add item
+  в checklist (с dedup). Если на шаге add упало — task уже отменён,
+  тогда статус ``partial_failure`` и юзеру надо честно сказать. НЕ
+  делай delete_task + add_checklist_items вручную — раньше это
+  создавало дубль (incident tg_634496616 14:35).
 
 Планировщик задач (tasks / расписание):
 - «поставь задачу X на 10 утра» / «добавь задачу Y завтра в 15:00» / «запиши задачу Z» → ``add_task``.
