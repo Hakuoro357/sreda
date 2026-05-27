@@ -443,6 +443,51 @@ def test_generate_shopping_from_menu_parser_rejects_eaters_zero() -> None:
     assert isinstance(parsed, ToolOutputContractViolation)
 
 
+def test_generate_shopping_from_menu_parser_plan_no_recipes() -> None:
+    """Codex Sub-A4 menu R3 MAJOR (gen_shopping split): the runtime
+    emits ``ok:plan_no_recipes`` when the menu plan exists but every
+    cell is free_text (no recipe_id) — distinct from
+    ``ok:generated:0:eaters=E`` («recipes exist, conversion dropped
+    everything») and from ``error:plan_not_found`` («plan_id is
+    unknown»). Composer can say «у этого меню нет сохранённых
+    рецептов» rather than the misleading «покупок нет»."""
+    from sreda.services.tool_schemas.housewife import (
+        GenerateShoppingFromMenuPlanNoRecipes,
+    )
+    parsed = parse_tool_output(
+        "generate_shopping_from_menu", "ok:plan_no_recipes"
+    )
+    assert isinstance(parsed, GenerateShoppingFromMenuPlanNoRecipes)
+    assert parsed.status == "plan_no_recipes"
+
+
+def test_generate_shopping_from_menu_parser_error_plan_not_found() -> None:
+    """Codex Sub-A4 menu R3 MAJOR (gen_shopping split): unknown
+    plan_id maps to ``error:plan_not_found`` distinct from
+    ``ok:generated:0``. Planner sees ``HousewifeToolError`` with
+    ``error_code='plan_not_found'`` and can branch to «не нашла
+    такого меню» instead of «покупок нет»."""
+    from sreda.services.tool_schemas.housewife import HousewifeToolError
+    parsed = parse_tool_output(
+        "generate_shopping_from_menu", "error:plan_not_found"
+    )
+    assert isinstance(parsed, HousewifeToolError)
+    assert parsed.error_code == "plan_not_found"
+
+
+def test_generate_shopping_from_menu_parser_empty_conversion_with_eaters() -> None:
+    """Codex Sub-A4 menu R3: ``ok:generated:0:eaters=E`` is the
+    «recipes exist but converter dropped all items» case (e.g. all
+    «по вкусу»). Distinct from plan_no_recipes (no recipe cells)
+    and plan_not_found (unknown plan)."""
+    parsed = parse_tool_output(
+        "generate_shopping_from_menu", "ok:generated:0:eaters=4"
+    )
+    assert isinstance(parsed, GenerateShoppingFromMenuOk)
+    assert parsed.generated_count == 0
+    assert parsed.eaters == 4
+
+
 def test_generate_shopping_from_menu_ok_rejects_nonzero_without_eaters() -> None:
     """Codex Sub-A4 menu R2 MAJOR #2: invariant ``eaters is None ⟺
     generated_count == 0``. Non-zero counts MUST carry an eaters

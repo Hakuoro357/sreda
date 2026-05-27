@@ -1468,12 +1468,45 @@ def build_housewife_tools(
         Args:
             plan_id: id from plan_week_menu / list_menu (``menu_...``).
 
-        Returns ``ok:generated:N:eaters=E`` where N is the items added
-        and E is the family-size factor used. ``ok:generated:0`` if
-        the plan exists but all cells are free-text.
+        Returns one of:
+          - ``ok:generated:N:eaters=E`` — N items added, E = family size
+          - ``ok:generated:0:eaters=E`` — plan exists with recipes, but
+            ingredient→shopping conversion dropped everything (e.g. all
+            «по вкусу»). Eaters is known.
+          - ``ok:plan_no_recipes`` — plan exists but every cell is
+            free_text (no recipe_id) — nothing to extract. Distinct
+            from «empty conversion» because the planner can tell the
+            user «у этого меню нет сохранённых рецептов, я не могу
+            собрать список автоматически».
+          - ``error:plan_not_found`` — plan_id is unknown or doesn't
+            belong to this user. Distinct from «empty» so the planner
+            can tell the user «не нашла такого меню» rather than
+            «покупок нет».
+
+        Codex Sub-A4 menu R3 MAJOR (gen_shopping split): R2 reviewer
+        flagged that unknown plan_id and free_text-only plan both
+        mapped to ``ok:generated:0``, indistinguishable. Split: unknown
+        plan_id → ``error:plan_not_found``; recipe-less plan →
+        ``ok:plan_no_recipes``; empty conversion → ``ok:generated:0:eaters=E``;
+        normal → ``ok:generated:N:eaters=E``.
         """
         if not user_id:
             return "error: no user_id context"
+        # R3 fix: probe plan existence BEFORE aggregating so we can
+        # distinguish unknown plan_id from empty plan downstream.
+        plan = menu_service._get_plan(
+            tenant_id=tenant_id, user_id=user_id, plan_id=plan_id.strip()
+        )
+        if plan is None:
+            return "error:plan_not_found"
+        # R3 fix: distinguish «no recipe_id cells» from «empty conversion».
+        # If the plan has zero recipe_id'd items, aggregation would
+        # return [] anyway — the planner needs to know WHY.
+        has_recipe_cells = any(
+            item.recipe_id is not None for item in plan.items
+        )
+        if not has_recipe_cells:
+            return "ok:plan_no_recipes"
         eaters = family_service.count_eaters(
             tenant_id=tenant_id, user_id=user_id
         )
@@ -1489,7 +1522,11 @@ def build_housewife_tools(
             return "error: internal"
 
         if not ingredients:
-            return "ok:generated:0"
+            # Recipe cells exist but produced no ingredients — recipe
+            # has empty ingredients list. Carry eaters anyway so the
+            # composer can render «масштабировала на N человек, но
+            # рецепты без ингредиентов» honestly.
+            return f"ok:generated:0:eaters={eaters}"
 
         # Convert recipe-level units (стаканы, ст.л., "по вкусу") into
         # buyable shopping units (литры, граммы, пачки) via LLM. Drops

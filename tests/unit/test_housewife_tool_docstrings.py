@@ -154,29 +154,61 @@ def test_system_prompt_anti_hallucination_tool_call_rule():
 
 
 def test_plan_week_menu_docstring_explains_preserve_merge():
-    """Codex Sub-A4 menu R2 MAJOR #1: prior test pinned the WRONG
-    contract (overwrite-week). Actual runtime
-    ``HousewifeMenuService.plan_week`` preserve-merges unspecified
-    slots (housewife_menu.py:105-122). Docstring must teach
-    preserve-merge so planner picks the right tool — overwriting
-    advice would steer the planner to call clear_menu unnecessarily
-    or fear partial payloads. The docstring still must point at
-    update_menu_item for SINGLE-cell edits and clear_menu+plan for
-    full reset, so both alternative paths remain discoverable."""
+    """Codex Sub-A4 menu R2 MAJOR #1 + R3 MINOR #3: prior test pinned
+    the WRONG contract (overwrite-week) — the OR with «перезапиш» was
+    too lax and would silently pass an overwrite-only docstring.
+    Actual runtime ``HousewifeMenuService.plan_week`` preserve-merges
+    unspecified slots (housewife_menu.py:105-122). Docstring must
+    teach preserve-merge so planner picks the right tool —
+    overwriting advice would steer the planner to call clear_menu
+    unnecessarily or fear partial payloads.
+
+    R3 strengthening: positive preserve assertion + explicit ban on
+    the old «сотрёт всю неделю» wording. Single-cell + full-reset
+    alternative paths must also remain discoverable in the
+    docstring so the planner has cheap routes for point edits and
+    explicit wipes."""
     tools = _tools()
-    desc = tools["plan_week_menu"].description.lower()
-    assert "preserve-merge" in desc or "перезапиш" in desc, (
+    desc = tools["plan_week_menu"].description
+    desc_lower = desc.lower()
+    # POSITIVE: must teach preserve-merge semantics. Single literal
+    # phrase OR explicit Russian wording — but NOT the lax OR with
+    # plain «перезапиш» (which could match an overwrite-only doc).
+    assert "preserve-merge" in desc_lower, (
         "plan_week_menu must teach the planner preserve-merge "
-        "semantics (передаваемые ячейки перезаписывают слоты, "
-        "остальные остаются) — runtime does not erase unspecified "
-        "slots."
+        "semantics — the literal token 'preserve-merge' is the "
+        "canonical contract name. Without it the docstring drifts "
+        "back toward the legacy overwrite model."
     )
-    assert "update_menu_item" in desc, (
+    assert "остан" in desc_lower or "не передал" in desc_lower or "не передаёш" in desc_lower, (
+        "Docstring must explicitly say that omitted cells REMAIN "
+        "(остаются / не передал / не передаёшь). Just mentioning "
+        "'preserve-merge' is too implicit for the planner LLM — "
+        "it must see the consequence stated in Russian prose."
+    )
+    # NEGATIVE: ban the old overwrite-week wording that pinned the
+    # wrong contract. «сотрёт всю неделю» / «полностью перезаписывает»
+    # / «replaces the entire week» — these all steer the planner
+    # toward the legacy model and contradict the new spec.
+    assert "сотрёт всю неделю" not in desc_lower, (
+        "Old overwrite warning «сотрёт ВСЮ неделю» must be removed — "
+        "contradicts preserve-merge runtime."
+    )
+    assert "полностью перезапис" not in desc_lower, (
+        "Old «ПОЛНОСТЬЮ ПЕРЕЗАПИСЫВАЕТ» wording must be removed — "
+        "contradicts preserve-merge runtime."
+    )
+    assert "replaces the entire week" not in desc_lower, (
+        "English «replaces the entire week» phrasing must not "
+        "appear — contradicts preserve-merge runtime."
+    )
+    # Alternative paths stay discoverable.
+    assert "update_menu_item" in desc_lower, (
         "Single-cell alternative (update_menu_item) must remain "
         "discoverable in the plan_week_menu docstring so the "
         "planner has a cheaper path for point edits."
     )
-    assert "clear_menu" in desc, (
+    assert "clear_menu" in desc_lower, (
         "Full-reset path (clear_menu, then plan_week_menu) must "
         "remain discoverable — preserve-merge means the only way "
         "to wipe the week is the two-call sequence."

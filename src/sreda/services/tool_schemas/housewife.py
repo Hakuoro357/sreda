@@ -1277,69 +1277,100 @@ def parse_list_menu(
 
 
 class GenerateShoppingFromMenuOk(BaseModel):
+    """Happy-path shape: shopping items extracted from a menu plan.
+
+    Codex Sub-A4 menu R3 MAJOR (gen_shopping split): the «empty» and
+    «scaled-but-zero» cases were previously conflated. Now distinct:
+    - ``status="generated"`` with ``generated_count>=0`` AND
+      ``eaters>=1`` is the recipe-cells-existed-and-aggregated path.
+      ``generated_count=0 + eaters>=1`` represents «recipes exist but
+      conversion dropped everything (e.g. all «по вкусу»)» — the
+      runtime emits ``ok:generated:0:eaters=E`` for this.
+    - Free-text-only plan → ``GenerateShoppingFromMenuPlanNoRecipes``
+      (separate variant; see below).
+    - Unknown plan_id → ``HousewifeToolError`` with
+      ``error_code='plan_not_found'``.
+
+    Eaters invariant (two one-way implications, NOT a biconditional):
+    - ``generated_count > 0`` ⟹ ``eaters >= 1`` (runtime always
+      carries eaters when it did any work).
+    - ``generated_count == 0 && eaters is None`` is currently allowed
+      ONLY for legacy ``ok:generated:0`` outputs — the new runtime
+      after R3 always emits ``:eaters=E`` for this shape. Once R3
+      runtime is fully deployed, this combination becomes unreachable
+      and the model could tighten further; for now the schema accepts
+      both (None and >=1) when count==0 to keep legacy compatibility.
+
+    The forbidden shape is ``generated_count > 0 && eaters is None``
+    — that's malformed runtime output and raises at schema time.
+    """
+
     model_config = ConfigDict(extra="forbid")
     status: Literal["generated"] = "generated"
     generated_count: int = Field(ge=0)
     eaters: int | None = Field(default=None, ge=1)
-    """``eaters`` = headcount from family-members table used as the
-    ingredient-scaling multiplier (housewife_chat_tools.py:1454).
-
-    Codex Sub-A4 menu R1 MAJOR #1: ``None`` for the early-return path
-    (housewife_chat_tools.py:1490 emits ``ok:generated:0`` without
-    ``:eaters=E``) — runtime returns this when the menu plan has no
-    convertible ingredients (free_text-only or unknown plan_id). The
-    happy path always carries ``eaters >= 1``.
-
-    Codex Sub-A4 menu R2 MAJOR #2: ``eaters is None`` is valid ONLY
-    when ``generated_count == 0`` (the early-return shape). A non-
-    None eaters with generated_count == 0 is a bug; a None eaters
-    with generated_count > 0 is malformed runtime output. The
-    @model_validator below enforces the invariant."""
 
     @model_validator(mode="after")
     def _validate_eaters_invariant(self) -> "GenerateShoppingFromMenuOk":
-        if self.generated_count == 0 and self.eaters is not None and self.eaters > 0:
-            # 0 generated + eaters set is the happy-but-empty path
-            # (recipes exist, all items dropped by converter). Allowed.
-            return self
         if self.generated_count > 0 and self.eaters is None:
             raise ValueError(
                 f"generated_count={self.generated_count} but eaters is None "
-                f"— that's only valid when generated_count==0 (early-return "
-                f"path emits 'ok:generated:0' without :eaters=E). Non-zero "
-                f"counts MUST carry an eaters value."
+                f"— non-zero counts MUST carry an eaters value. Only "
+                f"generated_count==0 is allowed to have eaters=None "
+                f"(legacy 'ok:generated:0' shape before R3 runtime split)."
             )
         return self
 
 
+class GenerateShoppingFromMenuPlanNoRecipes(BaseModel):
+    """Codex Sub-A4 menu R3 MAJOR (gen_shopping split): the plan
+    exists but every cell is free_text — there are no recipe_id'd
+    items to extract ingredients from. Runtime emits this distinct
+    from ``ok:generated:0:eaters=E`` so composer can say «у этого
+    меню нет сохранённых рецептов» rather than «покупок нет»."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["plan_no_recipes"] = "plan_no_recipes"
+
+
 GenerateShoppingFromMenuOutput = Annotated[
-    Union[GenerateShoppingFromMenuOk, HousewifeToolError],
+    Union[
+        GenerateShoppingFromMenuOk,
+        GenerateShoppingFromMenuPlanNoRecipes,
+        HousewifeToolError,
+    ],
     Field(discriminator="status"),
 ]
 
 _GEN_SHOPPING_RE = re.compile(
     r"^ok:generated:(?P<n>\d+)(?::eaters=(?P<e>\d+))?$"
 )
-"""Two runtime shapes (housewife_chat_tools.py:1490 vs :1504/1512):
-- ``ok:generated:0`` — early-return path when plan has no ingredients
-  to convert (no eaters segment; recipe-free plan or unknown plan_id).
+"""Runtime shapes (R3 split — housewife_chat_tools.py:1474-1538):
 - ``ok:generated:N:eaters=E`` — happy path with explicit eaters
-  scaling.
-
-The ``ok:generated:0`` shape carries no eaters info — Codex Sub-A4
-menu R1 MAJOR #1: previously rejected as ToolOutputContractViolation.
-Now accepted; ``eaters`` is None in that variant. Composer / planner
-can disambiguate «empty-result» vs «scaled-but-zero-ingredients»
-by inspecting ``eaters is None``."""
+  scaling (N may be 0 for empty-conversion).
+- ``ok:generated:0`` — legacy shape; pre-R3 runtime emitted this
+  for free_text-only / unknown-plan / empty cases. New R3 runtime
+  no longer emits this (those cases go to ``ok:plan_no_recipes``
+  or ``error:plan_not_found``), but parser keeps backward
+  compatibility so in-flight outputs from old runtimes parse cleanly
+  during deploy."""
 
 
 def parse_generate_shopping_from_menu(
     raw: str,
-) -> GenerateShoppingFromMenuOk | HousewifeToolError | ToolOutputContractViolation:
+) -> (
+    GenerateShoppingFromMenuOk
+    | GenerateShoppingFromMenuPlanNoRecipes
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
     err = _parse_error(raw)
     if err is not None:
         return err
-    m = _GEN_SHOPPING_RE.match(raw.strip())
+    stripped = raw.strip()
+    if stripped == "ok:plan_no_recipes":
+        return GenerateShoppingFromMenuPlanNoRecipes()
+    m = _GEN_SHOPPING_RE.match(stripped)
     if m is not None:
         eaters_raw = m.group("e")
         try:
