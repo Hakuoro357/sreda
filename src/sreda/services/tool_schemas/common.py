@@ -551,7 +551,10 @@ RecurrenceRule = Annotated[
     StringConstraints(
         strip_whitespace=True,
         min_length=10,  # ``FREQ=DAILY`` minimum
-        max_length=512,
+        max_length=255,  # A/B-study HIGH catch: matches DB columns
+        # — db/models/housewife.py:62 + db/models/tasks.py:90 both
+        # use String(255). Pre-A/B alias cap was 512 → silent DB
+        # truncation on long RRULEs.
         # Single-line (no \n/\r); FREQ= must be one of the 7 RFC-5545
         # frequency values; followed by any RFC-5545 parameter chain
         # (BYHOUR, BYDAY, COUNT, INTERVAL, etc.).

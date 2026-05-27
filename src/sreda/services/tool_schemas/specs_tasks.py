@@ -222,6 +222,28 @@ class AddTaskInput(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_recurrence_requires_dated_schedule(self) -> "AddTaskInput":
+        """A/B study finding (HIGH-reasoning catch MEDIUM missed):
+        runtime ``TaskService.list_today`` filters recurring tasks by
+        ``scheduled_date.isnot(None)`` (tasks.py:701), so a task
+        created with ``recurrence_rule`` but ``scheduled_date=None`` /
+        ``"inbox"`` becomes an orphan — never expands into any view.
+        Planner-time guard prevents the silent dead-letter."""
+        if self.recurrence_rule is not None:
+            if (
+                self.scheduled_date is None
+                or self.scheduled_date.strip().lower() == "inbox"
+            ):
+                raise ValueError(
+                    "recurrence_rule requires a dated scheduled_date "
+                    "(not None / not 'inbox') — runtime's recurring-task "
+                    "expander filters by scheduled_date IS NOT NULL "
+                    "(tasks.py:701), so an inbox-recurring task would "
+                    "be a silent orphan, never appearing in list_tasks."
+                )
+        return self
+
 
 class ListTasksInput(BaseModel):
     """Filter tasks by date and status. Defaults match runtime

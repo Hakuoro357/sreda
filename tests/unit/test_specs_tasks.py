@@ -910,6 +910,64 @@ def test_list_tasks_ok_allows_empty_tasks_list() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_add_task_rejects_recurrence_without_scheduled_date() -> None:
+    """A/B study finding (HIGH-reasoning catch MEDIUM missed):
+    runtime expander filters recurring tasks by
+    ``scheduled_date.isnot(None)`` (tasks.py:701). A recurring task
+    without a date would be a silent orphan — never expand into
+    any view. Reject at schema time."""
+    with pytest.raises(ValidationError) as exc:
+        AddTaskInput.model_validate({
+            "title": "ежедневная медитация",
+            "recurrence_rule": "FREQ=DAILY",
+        })
+    assert "recurrence_rule" in str(exc.value)
+    assert "scheduled_date" in str(exc.value)
+
+
+def test_add_task_rejects_recurrence_with_inbox() -> None:
+    """inbox-recurring task = same orphan problem."""
+    with pytest.raises(ValidationError):
+        AddTaskInput.model_validate({
+            "title": "ежедневная медитация",
+            "scheduled_date": "inbox",
+            "recurrence_rule": "FREQ=DAILY",
+        })
+
+
+def test_add_task_accepts_recurrence_with_dated_schedule() -> None:
+    """Happy path: recurrence + dated schedule (any concrete date,
+    today, or tomorrow) is the only valid shape for runtime
+    expansion."""
+    for date_val in ("today", "tomorrow", "2026-05-30"):
+        parsed = AddTaskInput.model_validate({
+            "title": "ежедневная медитация",
+            "scheduled_date": date_val,
+            "time_start": "07:00",
+            "recurrence_rule": "FREQ=DAILY",
+        })
+        assert parsed.recurrence_rule == "FREQ=DAILY"
+
+
+def test_recurrence_rule_cap_matches_db_column_255() -> None:
+    """A/B study finding (HIGH-reasoning catch MEDIUM missed):
+    DB columns ``housewife.py:62`` and ``tasks.py:90`` are both
+    String(255). Pre-A/B alias cap was 512 → silent DB truncation
+    on long RRULEs. Verify schema cap is now 255."""
+    from sreda.services.tool_schemas.common import RecurrenceRule
+    from pydantic import TypeAdapter
+    adapter = TypeAdapter(RecurrenceRule)
+    # Construct rule longer than 255 chars — must reject (silent
+    # DB truncation prevented). 30 × INTERVAL=1 = 330 chars > 255.
+    rule_too_long = "FREQ=DAILY" + ";INTERVAL=1" * 30
+    assert len(rule_too_long) > 255
+    with pytest.raises(ValidationError):
+        adapter.validate_python(rule_too_long)
+    # Sanity: short valid rule still works.
+    adapter.validate_python("FREQ=DAILY")
+    adapter.validate_python("FREQ=WEEKLY;BYDAY=MO,WE,FR")
+
+
 def test_inbox_update_rejection_does_not_recommend_destructive_action() -> None:
     """Codex R2 MAJOR (new): R1 error message said «делай
     delete_task + add_task» which is destructive (loses
