@@ -2765,10 +2765,35 @@ class MoveTaskMovedDup(BaseModel):
     checklist_id: ChecklistId
 
 
+class MoveTaskPartialFailure(BaseModel):
+    """Codex Sub-A4 checklists R3 MINOR: typed partial-failure
+    variant — runtime is NOT atomic (see MOVE_TASK_TO_CHECKLIST_SPEC
+    description); ``task_service.cancel`` commits first, then
+    checklist writes commit separately. If the post-cancel step
+    fails, the task is already cancelled with no rollback.
+
+    Parser detects three specific runtime error codes that mean
+    «task cancelled but item not created»:
+    - ``list_resolve_failed`` — create_list raised after cancel
+    - ``internal_add`` — add_items raised after cancel
+    - ``nothing_added`` — neither created nor matched existing
+      (edge case where items list was unexpectedly empty)
+
+    Planner branches on this status to honestly report «задача
+    отменена, но в чек-лист не добавилась — повтори
+    add_checklist_items вручную» instead of «не получилось».
+    """
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["partial_failure"] = "partial_failure"
+    error_code: Literal["list_resolve_failed", "internal_add", "nothing_added"]
+    message: str = Field(min_length=1)
+
+
 MoveTaskToChecklistOutput = Annotated[
     Union[
         MoveTaskMovedOk,
         MoveTaskMovedDup,
+        MoveTaskPartialFailure,
         HousewifeToolError,
     ],
     Field(discriminator="status"),
@@ -2784,16 +2809,33 @@ _MOVE_TASK_DUP_RE = re.compile(
 )
 
 
+_MOVE_TASK_PARTIAL_FAILURE_CODES = frozenset(
+    {"list_resolve_failed", "internal_add", "nothing_added"}
+)
+
+
 def parse_move_task_to_checklist(
     raw: str,
 ) -> (
     MoveTaskMovedOk
     | MoveTaskMovedDup
+    | MoveTaskPartialFailure
     | HousewifeToolError
     | ToolOutputContractViolation
 ):
     err = _parse_error(raw)
     if err is not None:
+        # Codex Sub-A4 checklists R3 MINOR: typed partial-failure
+        # path. Three error codes from housewife_chat_tools.py:2532,
+        # 2541, 2548 all mean «cancel committed but item not created».
+        if err.error_code in _MOVE_TASK_PARTIAL_FAILURE_CODES:
+            try:
+                return MoveTaskPartialFailure(
+                    error_code=err.error_code,
+                    message=err.message,
+                )
+            except ValidationError:
+                pass
         return err
     stripped = raw.strip()
     m_new = _MOVE_TASK_NEW_RE.match(stripped)

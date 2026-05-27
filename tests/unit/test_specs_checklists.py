@@ -262,6 +262,37 @@ def test_move_task_parser_task_not_found() -> None:
     assert parsed.error_code == "task_not_found"
 
 
+@pytest.mark.parametrize("code", [
+    "list_resolve_failed",
+    "internal_add",
+    "nothing_added",
+])
+def test_move_task_parser_partial_failure_variants(code) -> None:
+    """Codex R3 MINOR (prior-not-closed): three runtime error codes
+    mean «task cancelled but item not created». Parser routes them
+    to typed MoveTaskPartialFailure so planner can branch and tell
+    user honestly «задача отменена, но добавление в чек-лист
+    провалилось»."""
+    from sreda.services.tool_schemas.housewife import MoveTaskPartialFailure
+    parsed = parse_tool_output("move_task_to_checklist", f"error: {code}")
+    assert isinstance(parsed, MoveTaskPartialFailure)
+    assert parsed.error_code == code
+
+
+def test_move_task_partial_failure_typed_in_output_union() -> None:
+    """MoveTaskToChecklistOutput discriminator union must include
+    MoveTaskPartialFailure so TypeAdapter accepts it executor-side."""
+    from pydantic import TypeAdapter
+    from sreda.services.tool_schemas.housewife import MoveTaskPartialFailure
+    adapter = TypeAdapter(MOVE_TASK_TO_CHECKLIST_SPEC.output_model)
+    validated = adapter.validate_python({
+        "status": "partial_failure",
+        "error_code": "internal_add",
+        "message": "internal_add",
+    })
+    assert validated.status == "partial_failure"
+
+
 # ---------------------------------------------------------------------------
 # list_checklists structured parsing
 # ---------------------------------------------------------------------------

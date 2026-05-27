@@ -102,8 +102,11 @@ class AddChecklistItemsInput(BaseModel):
 
 
 class MoveTaskToChecklistInput(BaseModel):
-    """Atomic task → checklist move. Cancels source task, dedup-adds
-    to target. Cross-family tool (tasks domain → checklists domain)."""
+    """Task → checklist move (best-effort, not atomic — see
+    MOVE_TASK_TO_CHECKLIST_SPEC.description). Cancels source task,
+    dedup-adds to target. Cross-family tool (tasks domain →
+    checklists domain). Failure between cancel and add returns
+    typed ``MoveTaskPartialFailure``."""
 
     model_config = ConfigDict(extra="forbid")
     task_id: TaskId
