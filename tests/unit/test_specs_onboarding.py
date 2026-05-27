@@ -212,21 +212,26 @@ def test_deferred_parser_rejects_unknown_topic_state() -> None:
 
 
 def test_complete_parser_status_complete() -> None:
+    """Codex R1 MAJOR #2: runtime mark_complete ALWAYS sets
+    STATUS_COMPLETE (housewife_onboarding.py:373). Schema accepts
+    ONLY `complete`."""
     parsed = parse_tool_output("onboarding_complete", "ok:complete:status=complete")
     assert isinstance(parsed, OnboardingCompleteOk)
     assert parsed.onboarding_status == "complete"
 
 
-def test_complete_parser_status_abandoned() -> None:
-    """User explicit drop-out path."""
-    parsed = parse_tool_output("onboarding_complete", "ok:complete:status=abandoned")
-    assert isinstance(parsed, OnboardingCompleteOk)
-    assert parsed.onboarding_status == "abandoned"
-
-
-def test_complete_parser_rejects_unknown_status() -> None:
-    parsed = parse_tool_output("onboarding_complete", "ok:complete:status=weird")
-    assert isinstance(parsed, ToolOutputContractViolation)
+def test_complete_parser_rejects_non_complete_status() -> None:
+    """Codex R1 MAJOR #2: any status besides `complete` is runtime
+    drift → ContractViolation. Even `abandoned` (which we previously
+    allowed) doesn't appear in actual runtime."""
+    for st in ("not_started", "in_progress", "abandoned", "weird"):
+        parsed = parse_tool_output(
+            "onboarding_complete", f"ok:complete:status={st}",
+        )
+        assert isinstance(parsed, ToolOutputContractViolation), (
+            f"status={st!r} should be ContractViolation (runtime "
+            f"only emits 'complete')"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +246,6 @@ def test_complete_parser_rejects_unknown_status() -> None:
     ("onboarding_deferred", "ok:deferred:family:topic_state=skipped_once:next=diet:status=in_progress"),
     ("onboarding_deferred", "ok:deferred:diet:topic_state=skipped:next=routine:status=in_progress"),
     ("onboarding_complete", "ok:complete:status=complete"),
-    ("onboarding_complete", "ok:complete:status=abandoned"),
 ])
 def test_onboarding_parser_outputs_validate_against_spec_output_model(tool, raw):
     spec = next(s for s in ONBOARDING_SPECS if s.name == tool)

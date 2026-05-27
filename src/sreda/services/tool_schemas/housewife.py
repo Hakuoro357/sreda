@@ -3286,6 +3286,15 @@ def parse_archive_checklist(
 OnboardingTopic = Literal[
     "addressing", "self_intro", "family", "diet", "routine", "pain_point",
 ]
+"""Codex Sub-A4 onboarding R1 MAJOR #1: schema mirrors what
+runtime ``TOPIC_DESCRIPTIONS`` validates (all 6 topics — runtime
+accepts them via ``housewife_chat_tools.py:581``). HOWEVER,
+runtime ``TOPIC_ORDER`` is currently reduced to just
+``("addressing",)`` (housewife_onboarding.py:68) — only addressing
+is in the ACTIVE flow as of 2026-04-27. Other 5 topics persist
+as valid identifiers but won't be re-asked or counted by the
+progression engine. Planner should call onboarding_answered/
+deferred ONLY for ``addressing`` until TOPIC_ORDER expands again."""
 OnboardingTopicOrNone = Literal[
     "addressing", "self_intro", "family", "diet", "routine", "pain_point", "none",
 ]
@@ -3403,15 +3412,19 @@ def parse_onboarding_deferred(
 
 
 class OnboardingCompleteOk(BaseModel):
-    """Happy-path response from onboarding_complete. Carries the
-    final onboarding status — runtime allows `mark_complete` from
-    any state, so status reflects what the service ended up in
-    (typically `complete` but could be `abandoned` if user
-    requested explicit drop-out)."""
+    """Happy-path response from onboarding_complete.
+
+    Codex Sub-A4 onboarding R1 MAJOR #2: runtime ``mark_complete``
+    ALWAYS sets status to ``STATUS_COMPLETE`` regardless of prior
+    state (housewife_onboarding.py:373). Pre-R1 schema accepted
+    all 4 status values — too broad. Tightened to
+    ``Literal["complete"]`` so any other value triggers
+    ContractViolation (real runtime drift).
+    """
 
     model_config = ConfigDict(extra="forbid")
     status: Literal["complete"] = "complete"
-    onboarding_status: OnboardingStatus
+    onboarding_status: Literal["complete"]
 
 
 OnboardingCompleteOutput = Annotated[
@@ -3421,7 +3434,7 @@ OnboardingCompleteOutput = Annotated[
 
 
 _ONBOARDING_COMPLETE_RE = re.compile(
-    r"^ok:complete:status=(?P<st>not_started|in_progress|complete|abandoned)$"
+    r"^ok:complete:status=(?P<st>complete)$"
 )
 
 

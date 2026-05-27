@@ -43,8 +43,14 @@ OnboardingDeferReason = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
 ]
-"""Short audit-purpose reason for skip («потом», «не сейчас»,
-«не отвечу»). Not shown to user — only stored for analytics."""
+"""Codex Sub-A4 onboarding R1 MAJOR #3: short reason for skip
+(«потом», «не сейчас», «не отвечу»). Runtime ``mark_deferred``
+does NOT actually store this value (housewife_chat_tools.py:602
+calls service without passing reason). Schema-level: the field
+remains in the planner contract as a forced moment of
+self-reflection («why are we skipping?») — even unstored, the
+planner must justify the skip in plan logs. Per A/B-derived
+docs: «not stored — planner-facing reasoning context»."""
 
 
 # ---------------------------------------------------------------------------
