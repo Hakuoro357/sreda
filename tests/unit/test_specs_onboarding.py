@@ -336,6 +336,36 @@ def test_chat_tool_wrapper_rejects_inactive_topic() -> None:
         assert "topic_not_in_active_flow" in result
 
 
+def test_service_rejects_inactive_topic_directly() -> None:
+    """Codex R7 MEDIUM (final ceiling): direct service-level guard
+    must be testable without the wrapper. Mini App / admin tools
+    that call HousewifeOnboardingService directly should hit the
+    same TOPIC_ORDER guard."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_onboarding import HousewifeOnboardingService
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        svc = HousewifeOnboardingService(session)
+        # mark_answered with inactive topic
+        with pytest.raises(ValueError) as exc:
+            svc.mark_answered(
+                tenant_id="t1", user_id="u1",
+                topic="family", summary="жена и двое детей",
+            )
+        assert "topic_not_in_active_flow" in str(exc.value)
+        # mark_deferred with inactive topic
+        with pytest.raises(ValueError) as exc:
+            svc.mark_deferred(
+                tenant_id="t1", user_id="u1", topic="diet",
+            )
+        assert "topic_not_in_active_flow" in str(exc.value)
+
+
 def test_chat_tool_wrapper_accepts_addressing() -> None:
     """Confirm guard doesn't break the active topic happy path."""
     from sqlalchemy import create_engine
