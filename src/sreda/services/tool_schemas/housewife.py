@@ -476,6 +476,187 @@ def parse_get_recipe(
 
 
 # ---------------------------------------------------------------------------
+# 6. mark_shopping_bought       `ok:bought:N`
+# ---------------------------------------------------------------------------
+
+
+class MarkShoppingBoughtOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["bought"] = "bought"
+    bought_count: int = Field(ge=0)
+
+
+MarkShoppingBoughtOutput = Annotated[
+    Union[MarkShoppingBoughtOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_MARK_BOUGHT_RE = re.compile(r"^ok:bought:(?P<n>\d+)$")
+
+
+def parse_mark_shopping_bought(
+    raw: str,
+) -> MarkShoppingBoughtOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _MARK_BOUGHT_RE.match(raw.strip())
+    if m is not None:
+        return MarkShoppingBoughtOk(bought_count=int(m.group("n")))
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="mark_shopping_bought",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. remove_shopping_items       `ok:removed:N`
+# ---------------------------------------------------------------------------
+
+
+class RemoveShoppingItemsOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["removed"] = "removed"
+    removed_count: int = Field(ge=0)
+
+
+RemoveShoppingItemsOutput = Annotated[
+    Union[RemoveShoppingItemsOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_REMOVE_RE = re.compile(r"^ok:removed:(?P<n>\d+)$")
+
+
+def parse_remove_shopping_items(
+    raw: str,
+) -> RemoveShoppingItemsOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _REMOVE_RE.match(raw.strip())
+    if m is not None:
+        return RemoveShoppingItemsOk(removed_count=int(m.group("n")))
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="remove_shopping_items",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. update_shopping_item        `ok:updated:<id>` | not-found
+# ---------------------------------------------------------------------------
+
+
+class UpdateShoppingItemOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["updated"] = "updated"
+    item_id: str = Field(min_length=1)
+
+
+UpdateShoppingItemOutput = Annotated[
+    Union[UpdateShoppingItemOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_UPDATE_ITEM_RE = re.compile(r"^ok:updated:(?P<id>[^\s]+)$")
+
+
+def parse_update_shopping_item(
+    raw: str,
+) -> UpdateShoppingItemOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _UPDATE_ITEM_RE.match(raw.strip())
+    if m is not None:
+        return UpdateShoppingItemOk(item_id=m.group("id"))
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="update_shopping_item",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. update_shopping_items_category   `ok:updated:N` (count, not id)
+# ---------------------------------------------------------------------------
+
+
+class UpdateShoppingItemsCategoryOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["updated_category"] = "updated_category"
+    updated_count: int = Field(ge=0)
+
+
+UpdateShoppingItemsCategoryOutput = Annotated[
+    Union[UpdateShoppingItemsCategoryOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_UPDATE_CATEGORY_RE = re.compile(r"^ok:updated:(?P<n>\d+)$")
+
+
+def parse_update_shopping_items_category(
+    raw: str,
+) -> (
+    UpdateShoppingItemsCategoryOk
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _UPDATE_CATEGORY_RE.match(raw.strip())
+    if m is not None:
+        return UpdateShoppingItemsCategoryOk(
+            updated_count=int(m.group("n"))
+        )
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="update_shopping_items_category",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. clear_bought_shopping     `ok:cleared:N`
+# ---------------------------------------------------------------------------
+
+
+class ClearBoughtShoppingOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["cleared"] = "cleared"
+    cleared_count: int = Field(ge=0)
+
+
+ClearBoughtShoppingOutput = Annotated[
+    Union[ClearBoughtShoppingOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_CLEAR_BOUGHT_RE = re.compile(r"^ok:cleared:(?P<n>\d+)$")
+
+
+def parse_clear_bought_shopping(
+    raw: str,
+) -> ClearBoughtShoppingOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _CLEAR_BOUGHT_RE.match(raw.strip())
+    if m is not None:
+        return ClearBoughtShoppingOk(cleared_count=int(m.group("n")))
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="clear_bought_shopping",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -486,6 +667,11 @@ PARSERS = {
     "list_shopping": parse_list_shopping,
     "list_reminders": parse_list_reminders,
     "get_recipe": parse_get_recipe,
+    "mark_shopping_bought": parse_mark_shopping_bought,
+    "remove_shopping_items": parse_remove_shopping_items,
+    "update_shopping_item": parse_update_shopping_item,
+    "update_shopping_items_category": parse_update_shopping_items_category,
+    "clear_bought_shopping": parse_clear_bought_shopping,
 }
 
 
@@ -510,6 +696,8 @@ __all__ = [
     "AddShoppingItemsAdded",
     "AddShoppingItemsEmpty",
     "AddShoppingItemsOutput",
+    "ClearBoughtShoppingOk",
+    "ClearBoughtShoppingOutput",
     "GetRecipeFound",
     "GetRecipeOutput",
     "HousewifeToolError",
@@ -521,13 +709,26 @@ __all__ = [
     "ListShoppingItem",
     "ListShoppingItems",
     "ListShoppingOutput",
+    "MarkShoppingBoughtOk",
+    "MarkShoppingBoughtOutput",
     "PARSERS",
+    "RemoveShoppingItemsOk",
+    "RemoveShoppingItemsOutput",
     "ScheduleReminderOutput",
     "ScheduleReminderScheduled",
+    "UpdateShoppingItemOk",
+    "UpdateShoppingItemOutput",
+    "UpdateShoppingItemsCategoryOk",
+    "UpdateShoppingItemsCategoryOutput",
     "parse_add_shopping_items",
+    "parse_clear_bought_shopping",
     "parse_get_recipe",
     "parse_list_reminders",
     "parse_list_shopping",
+    "parse_mark_shopping_bought",
+    "parse_remove_shopping_items",
     "parse_schedule_reminder",
     "parse_tool_output",
+    "parse_update_shopping_item",
+    "parse_update_shopping_items_category",
 ]
