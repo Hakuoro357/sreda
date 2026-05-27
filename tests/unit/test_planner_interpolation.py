@@ -219,3 +219,94 @@ def test_resolve_single_underscore_field_rejected() -> None:
     state = {"s1": {"x": 1}}
     with pytest.raises(InvalidReferenceError):
         resolve_refs("${s1._private}", state)
+
+
+# ---------------------------------------------------------------------------
+# Public ref-introspection helpers (Sub-A-77 item #4 R1 MINOR #10)
+# ---------------------------------------------------------------------------
+
+
+from sreda.runtime.planner.interpolation import (  # noqa: E402
+    contains_ref,
+    extract_step_id,
+    is_full_ref_string,
+    iter_refs,
+)
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("plain text", False),
+    ("${s1.x}", True),
+    ("prefix ${s1.x} suffix", True),
+    ("$not-a-ref", False),
+    ("${123_bad}", False),       # leading digit — regex rejects
+    (42, False),
+    (None, False),
+    ([], False),
+    ([1, 2, "a"], False),
+    (["a", "${s1.x}"], True),
+    ({"k": "v"}, False),
+    ({"k": "${s1.x}"}, True),
+    ({"k": ["nested", "${s1.y}"]}, True),
+    ({"k": {"deep": "${s1.z}"}}, True),
+    ((1, "${s1.x}"), True),
+])
+def test_contains_ref(value: object, expected: bool) -> None:
+    assert contains_ref(value) == expected
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("${s1.x}", True),
+    ("${s1.x.y}", True),
+    ("${s1}", True),
+    (" ${s1.x}", False),           # leading whitespace — not full ref
+    ("${s1.x} ", False),           # trailing whitespace
+    ("prefix${s1.x}", False),
+    ("${s1.x}${s2.y}", False),     # two refs
+    ("plain", False),
+    ("$not-a-ref", False),
+    (42, False),
+    (None, False),
+    (["${s1.x}"], False),          # not a string
+])
+def test_is_full_ref_string(value: object, expected: bool) -> None:
+    assert is_full_ref_string(value) == expected
+
+
+def test_iter_refs_string() -> None:
+    assert list(iter_refs("${s1.x}")) == ["s1.x"]
+
+
+def test_iter_refs_mixed_string() -> None:
+    assert list(iter_refs("a ${s1.x} b ${s2.y}")) == ["s1.x", "s2.y"]
+
+
+def test_iter_refs_nested_dict() -> None:
+    value = {"k": ["${s1.x}", {"deep": "${s2.y.z}"}]}
+    paths = list(iter_refs(value))
+    assert "s1.x" in paths
+    assert "s2.y.z" in paths
+    assert len(paths) == 2
+
+
+def test_iter_refs_no_refs_yields_empty() -> None:
+    assert list(iter_refs("plain text")) == []
+    assert list(iter_refs([1, 2, 3])) == []
+    assert list(iter_refs({"k": "v"})) == []
+
+
+def test_extract_step_id_simple() -> None:
+    assert extract_step_id("s1.field") == "s1"
+
+
+def test_extract_step_id_deep_path() -> None:
+    assert extract_step_id("s1.field.sub.deep") == "s1"
+
+
+def test_extract_step_id_no_dot() -> None:
+    assert extract_step_id("s1") == "s1"
+
+
+def test_extract_step_id_empty_raises() -> None:
+    with pytest.raises(ValueError):
+        extract_step_id("")

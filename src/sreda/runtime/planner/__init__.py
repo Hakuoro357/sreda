@@ -10,6 +10,10 @@ sub-issues.
 
 from sreda.runtime.planner.interpolation import (
     InvalidReferenceError,
+    contains_ref,
+    extract_step_id,
+    is_full_ref_string,
+    iter_refs,
     resolve_refs,
 )
 from sreda.runtime.planner.schemas import (
@@ -21,7 +25,10 @@ from sreda.runtime.planner.schemas import (
 )
 from sreda.runtime.planner.validator import (
     InvalidPlanError,
+    Violation,
+    render_violations,
     validate_action_args,
+    validate_plan,
     validate_plan_args,
     validate_plan_or_raise,
 )
@@ -34,8 +41,15 @@ __all__ = [
     "OutcomeBranch",
     "Plan",
     "TurnClassification",
+    "Violation",
+    "contains_ref",
+    "extract_step_id",
+    "is_full_ref_string",
+    "iter_refs",
+    "render_violations",
     "resolve_refs",
     "validate_action_args",
+    "validate_plan",
     "validate_plan_args",
     "validate_plan_or_raise",
 ]

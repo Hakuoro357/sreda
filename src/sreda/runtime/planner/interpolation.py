@@ -24,7 +24,7 @@ silently flow into a tool.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterator
 
 _REF_PATTERN = re.compile(r"\$\{([A-Za-z_][\w.]*)\}")
 """Pattern for ``${node.field.subfield}`` references.
@@ -37,6 +37,81 @@ have emitted).
 
 class InvalidReferenceError(ValueError):
     """Reference cannot be resolved against the supplied state."""
+
+
+# ---------------------------------------------------------------------------
+# Public ref-introspection helpers (Sub-A-77 item #4 R1 MINOR #10)
+# ---------------------------------------------------------------------------
+
+
+def contains_ref(value: Any) -> bool:
+    """Return True if ``value`` (or any nested str inside it) contains
+    at least one ``${...}`` reference. Recursively walks dicts / lists
+    / tuples; non-string leaves can never contain refs.
+
+    Exposed as a public helper so consumers (validator, executor,
+    test infrastructure) share the same reference-detection semantics
+    as ``resolve_refs``. Underscored ``_REF_PATTERN`` stays private.
+    """
+
+    if isinstance(value, str):
+        return _REF_PATTERN.search(value) is not None
+    if isinstance(value, dict):
+        return any(contains_ref(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(contains_ref(item) for item in value)
+    return False
+
+
+def is_full_ref_string(value: Any) -> bool:
+    """Return True if ``value`` is a string that is EXACTLY one
+    reference with nothing else — i.e. ``"${s1.field}"`` and nothing
+    around it. Such strings resolve to the referenced value with type
+    preserved (list, dict, int, etc.) per ``resolve_refs`` semantics.
+
+    Mixed strings like ``"prefix ${s1.x}"`` are interpolated as ``str``
+    at executor time; they return False here so callers can validate
+    them against a string-typed field instead of deferring.
+    """
+
+    if not isinstance(value, str):
+        return False
+    match = _REF_PATTERN.fullmatch(value)
+    return match is not None
+
+
+def iter_refs(value: Any) -> Iterator[str]:
+    """Yield every reference path (``"step_id.field..."``) found inside
+    ``value`` — recursively walking dicts / lists / tuples. The yielded
+    string is the dotted path, NOT the ``${...}`` wrapper.
+
+    Useful for ref-integrity checks (Sub-A-77 item #4 R1 MAJOR #5):
+    extract refs, verify target step exists, check dependency
+    relationship.
+    """
+
+    if isinstance(value, str):
+        for match in _REF_PATTERN.finditer(value):
+            yield match.group(1)
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from iter_refs(v)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from iter_refs(item)
+
+
+def extract_step_id(ref_path: str) -> str:
+    """Return the leading step-id segment of a ref path.
+
+    ``"s1.recipe.title"`` → ``"s1"``. Empty path raises ``ValueError``;
+    callers should pass paths obtained from ``iter_refs`` which can
+    never be empty by regex construction.
+    """
+
+    if not ref_path:
+        raise ValueError("ref_path is empty")
+    return ref_path.split(".", 1)[0]
 
 
 def resolve_refs(value: Any, state: dict[str, Any]) -> Any:
@@ -136,5 +211,9 @@ def _resolve_path(path: str, state: dict[str, Any]) -> Any:
 
 __all__ = [
     "InvalidReferenceError",
+    "contains_ref",
+    "extract_step_id",
+    "is_full_ref_string",
+    "iter_refs",
     "resolve_refs",
 ]
