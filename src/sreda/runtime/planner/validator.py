@@ -681,10 +681,10 @@ def _phase2_validate_args(
     # paths share alias/duplicate semantics.
     canonical_args, duplicate_violations = _normalize_model_input(
         step_id=step_id,
-        tool_or_path=tool_spec.name,
+        tool_name=tool_spec.name,
+        field_path_prefix=None,
         model=model,
         args=action.args,
-        is_nested=False,
     )
     yield from duplicate_violations
     # Original-key dict for full no-refs model_validate (uses pydantic's
@@ -737,26 +737,29 @@ def _phase2_validate_args(
 def _normalize_model_input(
     *,
     step_id: str,
-    tool_or_path: str,
+    tool_name: str,
+    field_path_prefix: str | None,
     model: type[BaseModel],
     args: Mapping[str, Any],
-    is_nested: bool,
 ) -> tuple[dict[str, Any], list[Violation]]:
     """Shared model-input normaliser used by both top-level Phase 2 and
-    nested-BaseModel recursion (Codex R5 MAJOR #1 — extracted to keep
-    alias/duplicate semantics in one place).
+    nested-BaseModel recursion (Codex R5 MAJOR #1, R6 MINOR #2 — split
+    tool_name and field_path_prefix so violations have clean paths).
 
     Returns ``(canonical_args, violations)``:
     - ``canonical_args``: keys remapped to canonical field names. Keys
-      not in ``model.model_fields`` are dropped (Phase 1 reports them
-      separately).
+      not in ``model.model_fields`` are dropped (Phase 1 reports them).
     - ``violations``: list of ``duplicate_arg`` Violations for fields
-      that received >1 emitted key (alias + name both under
-      ``populate_by_name=True``, or two AliasChoices entries).
+      that received >1 emitted key.
 
-    ``tool_or_path`` is the tool name at top level or
-    ``"<tool>:<field_path>"`` for nested calls — controls how the
-    ``field_path`` is built in violations.
+    Args:
+        tool_name: actual tool name for the Violation's ``tool`` field.
+            Same at all levels — refers to the OUTER plan action's tool.
+        field_path_prefix: ``None`` for top-level (path = canonical_key);
+            ``"author"`` for nested (path = ``"author.canonical_key"``).
+            Renderer prints ``tool`` and ``field_path`` separately, so
+            ``field_path`` must be the JSON-path inside args, NOT a
+            redundant ``tool:path`` string.
     """
 
     accepted_names = _accepted_field_names(model)
@@ -774,11 +777,13 @@ def _normalize_model_input(
     for canonical_key, emitted_keys in canonical_emitted_keys.items():
         if len(emitted_keys) > 1:
             field_path = (
-                f"{tool_or_path}.{canonical_key}" if is_nested else canonical_key
+                f"{field_path_prefix}.{canonical_key}"
+                if field_path_prefix
+                else canonical_key
             )
             violations.append(Violation(
                 step_id=step_id,
-                tool=tool_or_path.split(":", 1)[0] if is_nested else tool_or_path,
+                tool=tool_name,
                 field_path=field_path,
                 code="duplicate_arg",
                 message=(
@@ -907,13 +912,14 @@ def _validate_nested_basemodel_partial(
                 ),
             )
 
-    # Shared canonicalisation + duplicate detection (Codex R5 MAJOR #1).
+    # Shared canonicalisation + duplicate detection (Codex R5 MAJOR #1,
+    # R6 MINOR #2 — clean field_path without tool name redundancy).
     canonical_value, duplicate_violations = _normalize_model_input(
         step_id=step_id,
-        tool_or_path=f"{tool_spec.name}:{field_name}",
+        tool_name=tool_spec.name,
+        field_path_prefix=field_name,
         model=nested_model,
         args=value,
-        is_nested=True,
     )
     yield from duplicate_violations
 

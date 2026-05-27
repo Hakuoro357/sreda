@@ -1180,6 +1180,37 @@ class _PostWithPopulate(BaseModel):
     author: _AuthorPopulate
 
 
+def test_nested_basemodel_duplicate_arg_field_path_is_clean() -> None:
+    """Codex R6 MINOR #2: nested duplicate_arg field_path must be a
+    clean JSON-path (``author.full_name``) without tool-name prefix —
+    the renderer prints ``tool`` separately."""
+    plan = _plan_with_actions({
+        "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "post_pop_tool",
+            {
+                "title": "x",
+                "author": {
+                    "name": "Alice",
+                    "full_name": "Alicia",
+                    "age": "${s1.title}",
+                },
+            },
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "schedule_reminder": _spec("schedule_reminder", _ReminderInput),
+        "post_pop_tool": _spec("post_pop_tool", _PostWithPopulate),
+    }
+    violations = validate_plan(plan, registry)
+    dups = [v for v in violations if v.code == "duplicate_arg"]
+    assert len(dups) == 1
+    # Field path is clean: "author.full_name" — no tool name prefix.
+    assert dups[0].field_path == "author.full_name"
+    assert dups[0].tool == "post_pop_tool"
+
+
 def test_nested_basemodel_duplicate_arg_detected_under_refs() -> None:
     """When nested BaseModel uses populate_by_name=True and the planner
     emits both alias and field-name for the same nested field, surface

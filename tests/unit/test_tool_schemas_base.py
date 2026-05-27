@@ -176,6 +176,61 @@ def test_tool_spec_timeout_in_range_ok() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Codex Sub-A-77 item #4 R6 MAJOR #1 — @field_validator guard at registry
+# ---------------------------------------------------------------------------
+
+
+def test_tool_spec_rejects_input_model_with_field_validator() -> None:
+    """A planner-facing ``input_model`` declaring ``@field_validator``
+    is rejected at ToolSpec construction time unless
+    ``allow_field_validators=True`` is explicitly set. The plan
+    validator's refs-present path cannot enforce those decorators
+    (TypeAdapter doesn't run them) — silent gap; forced explicit
+    acknowledgement is safer."""
+    from pydantic import field_validator
+
+    class _WithFieldValidator(BaseModel):
+        title: str
+
+        @field_validator("title")
+        @classmethod
+        def _check_title(cls, v: str) -> str:
+            if not v:
+                raise ValueError("empty title")
+            return v
+
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(input_model=_WithFieldValidator)
+    msg = str(exc.value).lower()
+    assert "field_validator" in msg or "allow_field_validators" in msg
+
+
+def test_tool_spec_accepts_field_validator_when_explicitly_allowed() -> None:
+    """The escape hatch ``allow_field_validators=True`` permits the
+    same input_model, forcing the operator to acknowledge the gap."""
+    from pydantic import field_validator
+
+    class _WithFieldValidator(BaseModel):
+        title: str
+
+        @field_validator("title")
+        @classmethod
+        def _check_title(cls, v: str) -> str:
+            return v
+
+    spec = _minimal_read_spec(
+        input_model=_WithFieldValidator,
+        allow_field_validators=True,
+    )
+    assert spec.allow_field_validators is True
+
+
+def test_tool_spec_default_allow_field_validators_is_false() -> None:
+    spec = _minimal_read_spec()
+    assert spec.allow_field_validators is False
+
+
 def test_tool_spec_rejects_extra_field() -> None:
     with pytest.raises(ValidationError):
         ToolSpec(  # type: ignore[call-arg]

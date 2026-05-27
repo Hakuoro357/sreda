@@ -29,6 +29,37 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sreda.services.tool_schemas.families import FAMILY_HEADERS, Family
 
+
+def _collect_field_validator_names(model: type[BaseModel]) -> set[str]:
+    """Return the set of fields covered by ``@field_validator`` decorators
+    on ``model``. Empty set when there are none.
+
+    Pydantic v2 stores decorator metadata in
+    ``model.__pydantic_decorators__.field_validators`` — a dict keyed by
+    method name with values carrying ``info.fields`` (tuple of target
+    field names). The introspection is intentionally narrow (only
+    ``field_validators``, not ``model_validators`` — those are
+    cross-field and already documented-deferred via R1 MAJOR #4).
+
+    Returns empty if the model has no ``@field_validator`` or pydantic's
+    internal structure differs from v2.x.
+    """
+
+    decorators = getattr(model, "__pydantic_decorators__", None)
+    if decorators is None:
+        return set()
+    field_validators = getattr(decorators, "field_validators", None)
+    if not field_validators:
+        return set()
+    covered: set[str] = set()
+    for deco in field_validators.values():
+        info = getattr(deco, "info", None)
+        fields = getattr(info, "fields", None) if info is not None else None
+        if fields:
+            covered.update(fields)
+    return covered
+
+
 _STRICT = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 """Project-wide pydantic config for tool registry schemas.
 
@@ -106,6 +137,27 @@ class ToolSpec(BaseModel):
     input_model: type[BaseModel]
     output_model: Any  # Annotated[Union[...], Field(discriminator='status')]
     outcome_examples: list[dict[str, Any]] = Field(default_factory=list)
+    allow_field_validators: bool = False
+    """Opt-in escape hatch for ``input_model`` with ``@field_validator``
+    decorators (Codex Sub-A-77 item #4 R6 MAJOR #1).
+
+    When refs are present in ``action.args``, the plan validator's
+    Phase 2 uses ``TypeAdapter(annotation)`` for per-field checks
+    which does NOT run model-bound ``@field_validator`` decorators.
+    Concrete values that would fail a custom field validator pass
+    plan validation if any sibling field is a ref — silent gap.
+
+    Default ``False`` rejects any ``input_model`` that declares
+    ``@field_validator``. Use ``Annotated[T, ...]`` / ``Field(...)``
+    constraints instead — those flow through TypeAdapter cleanly.
+
+    Set ``True`` only with a code comment explaining why this tool's
+    field validators are acceptable as «executor-time only» checks
+    (e.g. cross-field rules that genuinely don't fit Field metadata
+    AND the planner can't accidentally violate them on a refs-present
+    path). The flag forces explicit acknowledgement of the deferred
+    check, which is safer than implicit.
+    """
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> ToolSpec:
@@ -122,6 +174,20 @@ class ToolSpec(BaseModel):
                 f"design is approved, no tool may make non-rollback-able external "
                 f"calls. Use 'transactional_write' if it's a local DB write."
             )
+        if not self.allow_field_validators:
+            validators = _collect_field_validator_names(self.input_model)
+            if validators:
+                raise ValueError(
+                    f"Tool '{self.name}' input_model "
+                    f"{self.input_model.__name__} declares ``@field_validator`` "
+                    f"on fields: {sorted(validators)}. Plan validator's "
+                    f"refs-present path cannot enforce ``@field_validator`` "
+                    f"(only ``Field(...)`` / ``Annotated[T, ...]`` "
+                    f"constraints flow through TypeAdapter). Either "
+                    f"rewrite the rule as a Field constraint, OR set "
+                    f"allow_field_validators=True with a code comment "
+                    f"explaining why deferred-to-executor is acceptable."
+                )
         if self.side_effect_class == "read_only" and self.effect != "read":
             raise ValueError(
                 f"Tool '{self.name}' has side_effect_class='read_only' but "
