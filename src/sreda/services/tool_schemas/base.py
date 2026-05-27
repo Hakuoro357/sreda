@@ -588,6 +588,38 @@ class ToolSpec(BaseModel):
     # Codex Sub-A4 R4 MAJOR #1 — refs-aware no-op rejector
     # ------------------------------------------------------------------
 
+    def validate_args_at_execute_time(
+        self, resolved_args: dict[str, Any]
+    ) -> Any:
+        """Full ``input_model`` validation of a tool call's args AFTER
+        refs have been resolved (Codex Sub-A4 R5 MAJOR #3).
+
+        Phase B's executor MUST call this right before invoking the
+        legacy tool function. The plan-time validator
+        (``plan_validator.validate_action_args``) defers field-level
+        checks for refs-present args; this method closes the deferred
+        gap. In particular:
+
+        - ``input_model.model_validate(resolved_args)`` runs every
+          ``@field_validator`` and ``@model_validator`` — so the
+          ``update_shopping_item`` no-op rejector fires when refs
+          resolved to all ``None``.
+        - Pattern constraints (``^sh_[0-9a-f]{24}$`` etc.) catch
+          upstream tools that emitted malformed IDs in their output.
+        - Per-field type errors (e.g. string where a list was
+          expected) surface as plain ``pydantic.ValidationError``.
+
+        The executor catches ``ValidationError`` and records it as
+        ``planner_gaps(gap_type='execute_time_arg_violation')`` —
+        distinct from contract violation (sentinel output) so GEPA
+        can train on the planner output shape vs the runtime
+        resolution shape independently.
+
+        Returns the validated instance for convenience (most callers
+        will pass it back into the legacy tool via ``**args``).
+        """
+        return self.input_model.model_validate(resolved_args)
+
     def process_output(self, raw_output: str) -> Any:
         """Canonical entry point for converting a tool's raw ``str``
         output into a typed planner-visible result (Codex Sub-A4 R4
