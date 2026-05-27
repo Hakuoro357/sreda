@@ -21,8 +21,18 @@ from sreda.services.tool_schemas.housewife import (
     OnboardingAnsweredOutput,
     OnboardingCompleteOutput,
     OnboardingDeferredOutput,
-    OnboardingTopic,
 )
+
+
+# Codex Sub-A4 onboarding R2 MAJOR #1: restrict planner-side input
+# to only the topic that's in the ACTIVE flow per
+# housewife_onboarding.py:68. The full ``OnboardingTopic`` Literal
+# (6 vals) lives in housewife.py for OUTPUT validation only (runtime
+# echoes whatever topic was passed in; we keep the wider Literal so
+# legacy clients passing other topics don't fail parsing). But the
+# planner contract here REQUIRES addressing — that's the only topic
+# the LLM should call onboarding_answered / onboarding_deferred on.
+ActiveOnboardingTopic = Literal["addressing"]
 
 
 # ---------------------------------------------------------------------------
@@ -59,36 +69,41 @@ docs: «not stored — planner-facing reasoning context»."""
 
 
 class OnboardingAnsweredInput(BaseModel):
-    """Mark onboarding topic as answered + advance to next.
+    """Mark onboarding addressing topic as answered + advance.
 
     Runtime ``HousewifeOnboardingService.mark_answered`` stores the
-    summary as the user's saved answer, advances current_topic to
-    the next pending topic, and flips onboarding_status to
-    'in_progress' if it was 'not_started'. When all topics close
-    (answered or skipped), status auto-flips to 'complete'.
+    summary as the user's saved answer, advances current_topic, and
+    flips onboarding_status. Since active flow is only `addressing`
+    (R2 MAJOR #1), this typically closes onboarding outright
+    (status flips to 'complete').
 
-    For ``addressing`` topic: summary MUST be ONLY a short
-    name/nickname (1-3 words), WITHOUT prefixes like «Пользователя
-    зовут» / «Меня зовут». Runtime has a backend sanitiser as
-    last-line defense; schema doesn't enforce that pattern because
-    valid addressing answers vary widely (Russian short forms with
+    For ``addressing``: summary MUST be ONLY a short name/nickname
+    (1-3 words), WITHOUT prefixes like «Пользователя зовут» /
+    «Меня зовут». Runtime has a backend sanitiser as last-line
+    defense; schema doesn't enforce that pattern because valid
+    addressing answers vary widely (Russian short forms with
     diminutives, English names, nicknames)."""
 
     model_config = ConfigDict(extra="forbid")
-    topic: OnboardingTopic
+    topic: ActiveOnboardingTopic
     summary: OnboardingSummary
 
 
 class OnboardingDeferredInput(BaseModel):
-    """Mark onboarding topic as deferred + advance to next.
+    """Mark onboarding addressing topic as deferred + advance.
 
     First skip → topic_state=skipped_once (back in retry queue,
     will be re-asked). Second skip on the same topic →
-    topic_state=skipped (permanently dropped). Reason is for
-    audit only."""
+    topic_state=skipped (permanently dropped).
+
+    Codex R2 MAJOR #3: ``reason`` is NOT stored by runtime
+    (housewife_chat_tools.py:602 drops it). Kept in schema as a
+    planner-facing self-reflection field — forces the LLM to
+    justify the skip in its plan logs, even though the value
+    never reaches DB. NOT audit, NOT user-visible."""
 
     model_config = ConfigDict(extra="forbid")
-    topic: OnboardingTopic
+    topic: ActiveOnboardingTopic
     reason: OnboardingDeferReason
 
 
@@ -112,16 +127,15 @@ class OnboardingCompleteInput(BaseModel):
 ONBOARDING_ANSWERED_SPEC = ToolSpec(
     name="onboarding_answered",
     description=(
-        "Отметить тему онбординга как отвеченную и перейти к следующей. "
-        "Вызывай когда юзер дал осмысленный ответ на текущую тему "
-        "(см. [ОНБОРДИНГ] block в системном промпте для current_topic). "
-        "Темы: addressing / self_intro / family / diet / routine / "
-        "pain_point. ``summary`` — 1-2 предложения в собственных "
-        "словах юзера. Для темы addressing — ТОЛЬКО короткое имя/ник "
-        "(1-3 слова, БЕЗ «Пользователя зовут», «Меня зовут»). "
-        "Возвращает ok:answered:topic:next=...:status=... — next "
-        "может быть «none» (все темы закрыты), status флипается на "
-        "in_progress / complete автоматически."
+        "Отметить тему ``addressing`` (имя/обращение) как отвеченную "
+        "и перейти к следующей. Это ЕДИНСТВЕННАЯ активная тема в "
+        "текущем онбординге (housewife_onboarding.py:68 TOPIC_ORDER). "
+        "Вызывай когда юзер дал осмысленный ответ на запрос имени "
+        "из [ОНБОРДИНГ] block в системном промпте. ``summary`` — "
+        "ТОЛЬКО короткое имя/ник (1-3 слова, БЕЗ «Пользователя "
+        "зовут», «Меня зовут»). Возвращает "
+        "ok:answered:addressing:next=none:status=complete — после "
+        "addressing онбординг авто-закрывается."
     ),
     family="onboarding",
     effect="write",
@@ -131,13 +145,13 @@ ONBOARDING_ANSWERED_SPEC = ToolSpec(
     output_model=OnboardingAnsweredOutput,
     trigger_examples=[
         "Меня зовут Борис",
-        "У меня жена и двое детей",
-        "Я веган, мяса не ем",
-        "Готовлю по воскресеньям на всю неделю",
+        "Я Аркадий",
+        "Зови меня Шеф",
+        "Анна, можно просто Аня",
     ],
     mutex_notes=[
-        "Только когда юзер дал ответ на текущую тему онбординга. Для пропуска — onboarding_deferred. Для досрочного закрытия — onboarding_complete.",
-        "topic ОБЯЗАН совпадать с current_topic из [ОНБОРДИНГ] блока — иначе runtime не запишет ответ к правильной теме.",
+        "Только когда юзер дал ответ на текущую тему онбординга (addressing). Для пропуска — onboarding_deferred. Для досрочного закрытия — onboarding_complete.",
+        "topic ОБЯЗАН быть `addressing` — это единственная активная тема в текущем TOPIC_ORDER.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -147,14 +161,15 @@ ONBOARDING_ANSWERED_SPEC = ToolSpec(
 ONBOARDING_DEFERRED_SPEC = ToolSpec(
     name="onboarding_deferred",
     description=(
-        "Отметить тему как отложенную и перейти к следующей. Используй "
+        "Отметить тему ``addressing`` как отложенную. Используй "
         "когда юзер явно просит пропустить («потом», «не сейчас», "
         "«пропусти»). Первый пропуск оставляет тему в retry-queue "
-        "(topic_state=skipped_once), второй пропуск той же темы "
-        "делает skip permanent (topic_state=skipped). ``reason`` — "
-        "короткое объяснение для аудита, юзеру не показывается. "
-        "Возвращает ok:deferred:topic:topic_state=...:next=...:status=... — "
-        "топик_state различает «вернёмся позже» и «забыли совсем»."
+        "(topic_state=skipped_once) — runtime может re-ask. Второй "
+        "пропуск делает skip permanent (topic_state=skipped). "
+        "``reason`` — планировщику нужно зафиксировать почему "
+        "пропускаем (НЕ хранится в БД, но обязательная мотивация "
+        "для аудит-логов плана). Возвращает "
+        "ok:deferred:addressing:topic_state=...:next=...:status=..."
     ),
     family="onboarding",
     effect="write",
@@ -185,9 +200,9 @@ ONBOARDING_COMPLETE_SPEC = ToolSpec(
         "больше отвечать» ДО естественного завершения. Обычно "
         "онбординг авто-закрывается когда все темы закрыты "
         "(answered или permanently skipped) — этот tool НЕ нужен "
-        "для нормального flow. Возвращает ok:complete:status=... "
-        "(обычно `complete`, может быть `abandoned` при явном "
-        "drop-out)."
+        "для нормального flow. Возвращает ok:complete:status=complete "
+        "(runtime mark_complete всегда ставит status=complete, без "
+        "других вариантов)."
     ),
     family="onboarding",
     effect="write",

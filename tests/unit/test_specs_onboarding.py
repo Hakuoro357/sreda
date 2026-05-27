@@ -96,8 +96,9 @@ def test_answered_input_rejects_extra_keys() -> None:
 
 
 def test_deferred_input_minimal() -> None:
+    """Codex R2 MAJOR #1: topic restricted to active-flow «addressing»."""
     parsed = OnboardingDeferredInput.model_validate({
-        "topic": "family", "reason": "потом",
+        "topic": "addressing", "reason": "потом",
     })
     assert parsed.reason == "потом"
 
@@ -107,6 +108,18 @@ def test_deferred_input_rejects_unknown_topic() -> None:
         OnboardingDeferredInput.model_validate({
             "topic": "xxx", "reason": "x",
         })
+
+
+def test_deferred_input_rejects_non_addressing_topic() -> None:
+    """Codex R2 MAJOR #1: non-addressing topics (legacy 5 topics
+    that persist in TOPIC_DESCRIPTIONS for output validation but
+    aren't in active TOPIC_ORDER) must NOT be accepted as planner
+    input — only addressing is in the active flow."""
+    for t in ("self_intro", "family", "diet", "routine", "pain_point"):
+        with pytest.raises(ValidationError):
+            OnboardingDeferredInput.model_validate({
+                "topic": t, "reason": "потом",
+            })
 
 
 def test_complete_input_no_args() -> None:
