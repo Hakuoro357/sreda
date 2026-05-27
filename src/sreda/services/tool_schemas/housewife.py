@@ -195,6 +195,17 @@ def parse_add_shopping_items(
         ids_csv = m.group("ids") or ""
         ids = [x.strip() for x in ids_csv.split(",") if x.strip()]
         if count == 0:
+            # Codex R3 MINOR: ``ok:added:0:ids=[sh_x]`` is internally
+            # inconsistent — count says «nothing added» but ids
+            # claims one row was created. The ``count > 0`` path has
+            # a strict id/count match guard; symmetry demands the
+            # zero path also fail-close on non-empty ids.
+            if ids:
+                return ToolOutputContractViolation(
+                    raw_output=raw,
+                    tool_name="add_shopping_items",
+                    timestamp=datetime.now(timezone.utc),
+                )
             return AddShoppingItemsEmpty()
         # Codex R2 MAJOR #4: tight ShoppingItemId pattern rejects
         # malformed legacy output (e.g. ``ids=[sh_1,sh_2]`` vs the

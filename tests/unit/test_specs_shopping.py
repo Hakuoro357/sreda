@@ -141,6 +141,37 @@ def test_add_shopping_items_input_accepts_minimal_item() -> None:
     assert parsed.items[0].category is None
 
 
+def test_add_shopping_items_input_rejects_quantity_over_64() -> None:
+    """Codex R3 MAJOR #1: ``ShoppingItemInput.quantity_text`` was
+    previously typed as ``ShoppingTitle`` (500-char cap in JSON schema)
+    with a ``model_validator`` enforcing 64. Field-level
+    ``AddQuantityText`` puts the 64 cap in the JSON schema where the
+    planner's refs-present validation path can see it."""
+    with pytest.raises(ValidationError):
+        AddShoppingItemsInput.model_validate({
+            "items": [{"title": "молоко", "quantity_text": "x" * 65}]
+        })
+
+
+def test_add_shopping_items_input_rejects_blank_quantity() -> None:
+    """Codex R3 MAJOR #1: ``AddQuantityText`` requires non-blank on
+    add — empty/whitespace would be silently dropped at runtime
+    (``housewife_shopping.py:253`` strips before saving, ``or None``
+    branch nulls empty)."""
+    with pytest.raises(ValidationError):
+        AddShoppingItemsInput.model_validate({
+            "items": [{"title": "молоко", "quantity_text": ""}]
+        })
+
+
+def test_add_shopping_items_input_accepts_quantity_at_boundary() -> None:
+    """64-char quantity at exact runtime cap is accepted."""
+    parsed = AddShoppingItemsInput.model_validate({
+        "items": [{"title": "молоко", "quantity_text": "x" * 64}]
+    })
+    assert len(parsed.items[0].quantity_text) == 64
+
+
 def test_add_shopping_items_input_rejects_empty_items_list() -> None:
     """Plan validator catches `items=[]` at planning time, but the
     pydantic model also rejects it — defense in depth."""
@@ -204,6 +235,59 @@ def test_update_shopping_item_input_requires_at_least_one_mutable_field() -> Non
     title/quantity/category is a no-op call — rejected by model_validator."""
     with pytest.raises(ValidationError):
         UpdateShoppingItemInput.model_validate({"item_id": SH_A})
+
+
+def test_update_shopping_item_input_rejects_explicit_null_title() -> None:
+    """Codex R3 MAJOR #2: explicit ``"title": null`` was previously
+    accepted because R2's ``model_fields_set`` check counted explicit
+    null as «field provided». Runtime line 396-397 short-circuits on
+    ``title is None`` — null is a silent no-op for the runtime, so the
+    schema must also reject it as a not-actually-provided contribution
+    to the mutable-fields requirement."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemInput.model_validate({
+            "item_id": SH_A,
+            "title": None,
+        })
+
+
+def test_update_shopping_item_input_rejects_explicit_null_quantity_text() -> None:
+    """Codex R3 MAJOR #2: ``"quantity_text": null`` is a no-op at runtime
+    (housewife_shopping.py:400 ``if quantity_text is not None`` skips
+    the assignment block). Must reject as a no-op contribution; empty
+    string is different (means «clear»)."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemInput.model_validate({
+            "item_id": SH_A,
+            "quantity_text": None,
+        })
+
+
+def test_update_shopping_item_input_rejects_all_explicit_nulls() -> None:
+    """Codex R3 MAJOR #2: every mutable field as explicit null →
+    nothing actually mutated at runtime → reject."""
+    with pytest.raises(ValidationError):
+        UpdateShoppingItemInput.model_validate({
+            "item_id": SH_A,
+            "title": None,
+            "quantity_text": None,
+            "category": None,
+        })
+
+
+def test_update_shopping_item_input_accepts_empty_qty_with_null_title() -> None:
+    """Codex R3 MAJOR #2: as long as ONE mutable field is actually
+    provided (non-null OR the empty-string clear-intent), the call is
+    valid even if the others are explicit null."""
+    parsed = UpdateShoppingItemInput.model_validate({
+        "item_id": SH_A,
+        "title": None,
+        "quantity_text": "",
+        "category": None,
+    })
+    assert parsed.quantity_text == ""
+    assert parsed.title is None
+    assert parsed.category is None
 
 
 def test_update_shopping_item_input_accepts_title_only() -> None:
@@ -477,6 +561,26 @@ def test_add_shopping_items_parser_returns_sentinel_for_malformed_ids() -> None:
         "add_shopping_items", "ok:added:2:ids=[sh_1,sh_2]"
     )
     assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_add_shopping_items_parser_rejects_zero_count_with_ids() -> None:
+    """Codex R3 MINOR: ``ok:added:0:ids=[sh_x]`` is internally
+    inconsistent (count says nothing added, ids claims a row was
+    created). Symmetric with the count/id mismatch guard on the
+    count>0 path — fail-closed via sentinel rather than silently
+    treat as ``empty``."""
+    parsed = parse_tool_output(
+        "add_shopping_items", f"ok:added:0:ids=[{SH_A}]"
+    )
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_add_shopping_items_parser_accepts_zero_count_no_ids() -> None:
+    """The all-duplicate case ``ok:added:0`` (no ids group) is the
+    legitimate empty variant — still returns ``AddShoppingItemsEmpty``."""
+    from sreda.services.tool_schemas.housewife import AddShoppingItemsEmpty
+    parsed = parse_tool_output("add_shopping_items", "ok:added:0")
+    assert isinstance(parsed, AddShoppingItemsEmpty)
 
 
 # ---------------------------------------------------------------------------

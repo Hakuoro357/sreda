@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.common import (
+    AddQuantityText,
     CategoryName,
     QuantityText,
     ShoppingItemId,
@@ -54,39 +55,26 @@ from sreda.services.tool_schemas.housewife import (
 class ShoppingItemInput(BaseModel):
     """One row of an ``add_shopping_items`` batch.
 
-    Only ``title`` is required (stripped, non-blank, ≤500 chars to
-    match runtime cap in ``housewife_shopping.py:252``);
-    ``quantity_text`` is free-form short label ≤64 chars,
-    ``category`` is optional ≤64 chars (auto-mapped if unknown).
+    Field types:
+    - ``title``: ``ShoppingTitle`` (non-blank, ≤500) — matches runtime
+      cap (``housewife_shopping.py:252``)
+    - ``quantity_text``: ``AddQuantityText`` (non-blank, ≤64) — matches
+      runtime cap (``housewife_shopping.py:253``)
+    - ``category``: ``CategoryName`` (non-blank, ≤64) — matches runtime
+      ``_normalize_category`` (``housewife_shopping.py:96``)
 
-    Codex R1 MAJOR #2: domain-typed aliases reject whitespace-only and
-    over-long values that the previous ``Field(min_length=1)`` accepted.
-    Codex R2 MAJOR #2: caps now match runtime exactly (was ``ShortStr``
-    at 200 chars — silently truncated long titles, over-permitted
-    qty/cat).
-
-    Note: ``quantity_text`` on the *add* path uses ``QuantityText`` but
-    requires the value, when present, to be non-blank. Runtime's empty
-    string is only meaningful as «clear» on the update path; on add
-    there's nothing to clear, so we require ``min_length=1`` here.
+    Codex R3 MAJOR #1: ``quantity_text`` was previously typed as
+    ``ShoppingTitle | None`` (500-char cap advertised in JSON schema)
+    with a ``model_validator`` enforcing 64. Field-level
+    ``AddQuantityText`` (≤64) makes the cap visible in JSON schema and
+    enforced even when the planner's refs-present validation path
+    skips model_validators.
     """
 
     model_config = ConfigDict(extra="forbid")
     title: ShoppingTitle
-    quantity_text: ShoppingTitle | None = None
+    quantity_text: AddQuantityText | None = None
     category: CategoryName | None = None
-
-    @model_validator(mode="after")
-    def _quantity_short(self) -> "ShoppingItemInput":
-        # Borrow ShoppingTitle's non-blank cap but enforce the 64-char
-        # runtime cap for quantity_text (housewife_shopping.py:253).
-        if self.quantity_text is not None and len(self.quantity_text) > 64:
-            raise ValueError(
-                f"quantity_text exceeds runtime cap (64 chars); got "
-                f"{len(self.quantity_text)} chars — runtime would "
-                f"truncate. Shorten before sending."
-            )
-        return self
 
 
 class AddShoppingItemsInput(BaseModel):
@@ -137,16 +125,35 @@ class UpdateShoppingItemInput(BaseModel):
 
     @model_validator(mode="after")
     def _at_least_one_mutable_field(self) -> "UpdateShoppingItemInput":
-        # Codex R2 MAJOR #3: use ``model_fields_set`` so an explicit
-        # ``quantity_text=""`` counts as «one mutable field provided»
-        # (intent: clear quantity). Fields not sent at all are absent
-        # from this set even when their default is None.
-        mutable = {"title", "quantity_text", "category"}
-        if not (self.model_fields_set & mutable):
+        # Rule: a field is «provided» if it's in ``model_fields_set``
+        # AND its value is not ``None``. Empty string for
+        # ``quantity_text`` counts as provided (clear intent). At least
+        # one mutable field must be provided — otherwise the runtime
+        # ends up with `if X is not None` skipping every branch and
+        # the call is a silent no-op.
+        #
+        # Codex R3 MAJOR #2: R2's plain ``model_fields_set`` check let
+        # ``{"item_id": ..., "title": None}`` through (explicit null
+        # appears in model_fields_set). Runtime line 396-397
+        # short-circuits on ``title is None``, so the call became a
+        # misleading ``ok:updated:<id>`` with no actual mutation.
+        def _is_provided(name: str) -> bool:
+            if name not in self.model_fields_set:
+                return False
+            value = getattr(self, name)
+            # ``quantity_text=""`` is the «clear» intent — runtime
+            # (housewife_shopping.py:401-402) maps it to None on the
+            # row. Empty string IS not None, so it counts as provided
+            # naturally — no special-case needed.
+            return value is not None
+
+        provided = [n for n in ("title", "quantity_text", "category") if _is_provided(n)]
+        if not provided:
             raise ValueError(
                 "update_shopping_item requires at least one of "
-                "title / quantity_text / category — empty update is "
-                "not a meaningful tool call."
+                "title / quantity_text / category with a non-null "
+                "value — explicit nulls and missing fields both "
+                "produce a silent no-op call."
             )
         return self
 

@@ -79,13 +79,24 @@ QuantityText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, max_length=64),
 ]
-"""Shopping item quantity_text. Runtime caps at 64 chars and treats
-empty string as «clear» (``housewife_shopping.py:401-402`` does
-``q or None``). Codex R2 MAJOR #3: empty MUST be accepted as a valid
-update intent («убери количество у молока»), so this alias has
-``min_length`` unset (defaults to 0). For the initial-add path,
-``quantity_text: QuantityText | None`` with default ``None`` keeps the
-no-quantity case representable."""
+"""Shopping item quantity_text on the *update* path. Runtime caps at
+64 chars and treats empty string as «clear» (``housewife_shopping.py:
+401-402`` does ``q or None``). Codex R2 MAJOR #3: empty MUST be
+accepted as a valid update intent («убери количество у молока»), so
+this alias has ``min_length`` unset (defaults to 0)."""
+
+
+AddQuantityText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
+]
+"""Shopping item quantity_text on the *add* path. Codex R3 MAJOR #1:
+``ShoppingItemInput.quantity_text`` was typed as ``ShoppingTitle`` (500)
+with a ``model_validator`` capping to 64 — but JSON schema still
+advertised 500, and the planner's refs-present validation path skips
+model_validators. Field-level type makes the contract visible in the
+JSON schema (max_length=64) and enforced even when refs resolve at
+execute time. On add there's nothing to clear, so non-blank required."""
 
 
 CategoryName = Annotated[
@@ -158,6 +169,7 @@ ChecklistId = Annotated[
 
 
 __all__ = [
+    "AddQuantityText",
     "CategoryName",
     "ChecklistId",
     "NonBlankStr",
