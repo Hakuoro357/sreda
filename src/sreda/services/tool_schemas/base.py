@@ -172,10 +172,11 @@ _RUSSIAN_INFINITIVE_FIRST_WORD = re.compile(
 # vs `add_item`), accidental whitespace in JSON keys, and executor
 # lookup ambiguity.
 _TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
-"""Matches a Russian Cyrillic capitalised first word ending in an
-infinitive suffix. Strict «starts with infinitive» — does NOT enforce
-«infinitive + concrete noun object». Codex R1 MAJOR #7 fix: doc
-narrowed to match what we actually check.
+"""Strict identifier shape for ``ToolSpec.name``: lowercase letter
+followed by lowercase letters / digits / underscores. Codex R2
+MAJOR #2 + R3 MINOR #3 — prevents planner-call typos (``Add_Item``
+vs ``add_item``), whitespace in JSON keys, and executor-lookup
+ambiguity. Matches every entry in ``TOOL_FAMILY_MANIFEST``.
 """
 
 

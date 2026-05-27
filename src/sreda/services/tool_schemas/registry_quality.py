@@ -30,11 +30,10 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from sreda.services.tool_schemas.base import (
     _RUSSIAN_INFINITIVE_FIRST_WORD,
-    _TOOL_NAME_PATTERN,
     ToolSpec,
 )
 
@@ -89,7 +88,7 @@ def validate_tool_registry_quality(
 ) -> list[RegistryQualityViolation]:
     """Run quality checks against ``specs``.
 
-    Two check tiers (Codex R2 MINOR #7):
+    Three check tiers (Codex R2 MINOR #7 + R3 MINOR #4):
 
     **Schema-safety re-check (BOTH modes)** — defensive validation of
     prompt-safety string invariants that ``ToolSpec`` construction
@@ -177,83 +176,69 @@ def _check_spec(
 def _recheck_schema_safety(
     spec: ToolSpec,
 ) -> Iterable[RegistryQualityViolation]:
-    """Defensive re-validation of prompt-safety string invariants —
-    catches ``model_copy(update=...)`` bypasses that skip construction
-    guards (Codex R2 MAJOR #3).
+    """Defensive re-validation of ALL ToolSpec construction invariants
+    — catches ``model_copy(update=...)`` and direct attribute mutation
+    bypasses (Codex R2 MAJOR #3, R3 MAJOR #1+#2).
 
-    Re-checks (mirror of ToolSpec construction guards): non-blank +
-    no \\n / \\r / \\t in name, description, every trigger_example,
-    every mutex_note. mutex_notes must not start with ⚠. Edge
-    whitespace rejected.
+    Strategy: dump and reconstruct via ``ToolSpec.model_validate``.
+    This runs every construction-time guard (prompt-string safety,
+    write_domains for effect=write, external_side_effect ban,
+    read_only/effect coupling, timeout bounds, @field_validator,
+    name regex, etc.) — there's a single source of truth (ToolSpec's
+    own validators) instead of a per-field mirror that drifts as new
+    invariants are added.
+
+    Type-safety bonus (R3 MAJOR #2): pydantic raises ``ValidationError``
+    for wrong types (``description=None``, ``name=123``,
+    ``trigger_examples=[None]``) and we convert that into structured
+    violations. No ``AttributeError``/``TypeError`` leaks through the
+    public API.
     """
 
-    def _is_clean(value: str) -> bool:
-        if not value or not value.strip():
-            return False
-        if value != value.strip():
-            return False
-        if "\n" in value or "\r" in value or "\t" in value:
-            return False
-        return True
+    # Pull a safe tool-name display string for the violation rows
+    # (the spec's name might be None / int / blank after mutation).
+    safe_name = spec.name if isinstance(spec.name, str) and spec.name else "<invalid>"
 
-    if not _is_clean(spec.name) or not _TOOL_NAME_PATTERN.fullmatch(spec.name or ""):
+    try:
+        dumped = spec.model_dump()
+    except Exception as exc:  # noqa: BLE001 — defensive, surface as violation
         yield RegistryQualityViolation(
-            tool_name=spec.name or "<blank>",
-            field_path="name",
+            tool_name=safe_name,
+            field_path=None,
             code="schema_safety_violation",
             message=(
-                f"name {spec.name!r} fails schema-safety re-check — "
-                f"blank, edge-whitespace, control chars, or fails "
-                f"identifier pattern ``[a-z][a-z0-9_]*``. Was the spec "
-                f"built via model_copy(update=...) or direct attribute "
-                f"mutation?"
+                f"spec.model_dump() failed — spec is in an unrecoverable "
+                f"state, probably mutated through non-pydantic paths: {exc!r}."
             ),
         )
-    if not _is_clean(spec.description):
+        return
+
+    try:
+        ToolSpec.model_validate(dumped)
+    except ValidationError as exc:
+        for err in exc.errors():
+            loc = err.get("loc") or ()
+            field_path = ".".join(str(p) for p in loc) if loc else None
+            yield RegistryQualityViolation(
+                tool_name=safe_name,
+                field_path=field_path,
+                code="schema_safety_violation",
+                message=(
+                    f"{err.get('msg', 'schema invariant violated')}. "
+                    f"Was the spec built via model_copy(update=...) or "
+                    f"direct attribute mutation?"
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001 — defensive
         yield RegistryQualityViolation(
-            tool_name=spec.name,
-            field_path="description",
+            tool_name=safe_name,
+            field_path=None,
             code="schema_safety_violation",
             message=(
-                f"description fails schema-safety re-check (blank, "
-                f"edge-whitespace, or control chars). Got: "
-                f"{spec.description[:40]!r}."
+                f"ToolSpec.model_validate raised non-ValidationError "
+                f"{type(exc).__name__}: {exc!r}. Spec is corrupt."
             ),
         )
-    for idx, example in enumerate(spec.trigger_examples):
-        if not _is_clean(example):
-            yield RegistryQualityViolation(
-                tool_name=spec.name,
-                field_path=f"trigger_examples[{idx}]",
-                code="schema_safety_violation",
-                message=(
-                    f"trigger_example {example[:40]!r} fails "
-                    f"schema-safety re-check (blank, edge-whitespace, "
-                    f"or control chars)."
-                ),
-            )
-    for idx, note in enumerate(spec.mutex_notes):
-        if not _is_clean(note):
-            yield RegistryQualityViolation(
-                tool_name=spec.name,
-                field_path=f"mutex_notes[{idx}]",
-                code="schema_safety_violation",
-                message=(
-                    f"mutex_note {note[:40]!r} fails schema-safety "
-                    f"re-check (blank, edge-whitespace, or control chars)."
-                ),
-            )
-            continue
-        if note.lstrip().startswith("⚠"):
-            yield RegistryQualityViolation(
-                tool_name=spec.name,
-                field_path=f"mutex_notes[{idx}]",
-                code="schema_safety_violation",
-                message=(
-                    f"mutex_note starts with ⚠ — renderer adds the "
-                    f"marker, stored text must not. Got: {note[:40]!r}."
-                ),
-            )
 
 
 def _check_description(
