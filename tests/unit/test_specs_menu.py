@@ -173,6 +173,55 @@ def test_menu_cell_input_rejects_bad_recipe_id() -> None:
         MenuCellInput.model_validate({"recipe_id": "rec_1"})
 
 
+def test_menu_cell_input_rejects_both_recipe_id_and_free_text() -> None:
+    """Codex Sub-A4 menu R1 MAJOR #4: XOR — both set means silent
+    drop of free_text. Schema-time rejection."""
+    with pytest.raises(ValidationError) as exc:
+        MenuCellInput.model_validate({
+            "recipe_id": REC_A,
+            "free_text": "овсянка",
+        })
+    assert "EITHER recipe_id OR free_text" in str(exc.value)
+
+
+def test_menu_cell_input_accepts_both_none_as_clear() -> None:
+    """Both ``None`` (no notes either) is a legit explicit-clear cell."""
+    parsed = MenuCellInput.model_validate({})
+    assert parsed.recipe_id is None
+    assert parsed.free_text is None
+    assert parsed.notes is None
+
+
+def test_menu_cell_input_rejects_notes_only_cell() -> None:
+    """Codex Sub-A4 menu R2 MAJOR #4: notes-only cell would clear
+    the meal AND silently drop the notes — planner thinks it added
+    a hint, actually erased the slot. Reject."""
+    with pytest.raises(ValidationError) as exc:
+        MenuCellInput.model_validate({
+            "notes": "после тренировки",
+        })
+    assert "notes-only cell" in str(exc.value)
+
+
+def test_menu_cell_input_accepts_notes_with_recipe_id() -> None:
+    """Notes attached to a real cell are fine."""
+    parsed = MenuCellInput.model_validate({
+        "recipe_id": REC_A,
+        "notes": "после тренировки",
+    })
+    assert parsed.notes == "после тренировки"
+
+
+def test_menu_cell_input_accepts_notes_with_free_text() -> None:
+    """Notes attached to free_text are fine."""
+    parsed = MenuCellInput.model_validate({
+        "free_text": "овсянка",
+        "notes": "с ягодами",
+    })
+    assert parsed.free_text == "овсянка"
+    assert parsed.notes == "с ягодами"
+
+
 def test_update_menu_item_input_accepts_real_ids() -> None:
     parsed = UpdateMenuItemInput.model_validate({
         "plan_id": MENU_A,
@@ -209,6 +258,58 @@ def test_update_menu_item_input_rejects_unknown_meal_type() -> None:
             "day_of_week": 0,
             "meal_type": "elevenses",
         })
+
+
+def test_update_menu_item_input_rejects_both_recipe_id_and_free_text() -> None:
+    """Codex Sub-A4 menu R1 MAJOR #4: same XOR rule as MenuCellInput."""
+    with pytest.raises(ValidationError) as exc:
+        UpdateMenuItemInput.model_validate({
+            "plan_id": MENU_A,
+            "day_of_week": 0,
+            "meal_type": "breakfast",
+            "recipe_id": REC_A,
+            "free_text": "омлет",
+        })
+    assert "EITHER recipe_id OR free_text" in str(exc.value)
+
+
+def test_update_menu_item_input_accepts_both_none_as_clear() -> None:
+    """(None, None, None) is the explicit clear shape — runtime
+    treats it as «erase this cell» (housewife_chat_tools.py:1336)."""
+    parsed = UpdateMenuItemInput.model_validate({
+        "plan_id": MENU_A,
+        "day_of_week": 3,
+        "meal_type": "dinner",
+    })
+    assert parsed.recipe_id is None
+    assert parsed.free_text is None
+    assert parsed.notes is None
+
+
+def test_update_menu_item_input_rejects_notes_only() -> None:
+    """Codex Sub-A4 menu R2 MAJOR #4: notes-only update would clear
+    the cell AND silently drop the notes. Reject at schema time."""
+    with pytest.raises(ValidationError) as exc:
+        UpdateMenuItemInput.model_validate({
+            "plan_id": MENU_A,
+            "day_of_week": 3,
+            "meal_type": "dinner",
+            "notes": "лёгкий ужин",
+        })
+    assert "notes-only update" in str(exc.value)
+
+
+def test_update_menu_item_input_accepts_notes_with_recipe_id() -> None:
+    """Notes attached to a real recipe_id are fine."""
+    parsed = UpdateMenuItemInput.model_validate({
+        "plan_id": MENU_A,
+        "day_of_week": 3,
+        "meal_type": "dinner",
+        "recipe_id": REC_A,
+        "notes": "лёгкий ужин",
+    })
+    assert parsed.recipe_id == REC_A
+    assert parsed.notes == "лёгкий ужин"
 
 
 def test_list_menu_input_accepts_none_week() -> None:
@@ -340,6 +441,46 @@ def test_generate_shopping_from_menu_parser_rejects_eaters_zero() -> None:
         "generate_shopping_from_menu", "ok:generated:5:eaters=0"
     )
     assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_generate_shopping_from_menu_ok_rejects_nonzero_without_eaters() -> None:
+    """Codex Sub-A4 menu R2 MAJOR #2: invariant ``eaters is None ⟺
+    generated_count == 0``. Non-zero counts MUST carry an eaters
+    value — the early-return path that emits ``ok:generated:0``
+    without ``:eaters=E`` is the ONLY valid eaters=None case."""
+    with pytest.raises(ValidationError) as exc:
+        GenerateShoppingFromMenuOk.model_validate({
+            "status": "generated",
+            "generated_count": 5,
+            "eaters": None,
+        })
+    assert "eaters is None" in str(exc.value)
+
+
+def test_generate_shopping_from_menu_ok_allows_zero_with_eaters() -> None:
+    """``generated_count == 0 && eaters > 0`` is allowed — represents
+    «scaled correctly but recipes have no shoppable ingredients».
+    Only ``generated_count > 0 && eaters is None`` is the forbidden
+    shape."""
+    parsed = GenerateShoppingFromMenuOk.model_validate({
+        "status": "generated",
+        "generated_count": 0,
+        "eaters": 3,
+    })
+    assert parsed.generated_count == 0
+    assert parsed.eaters == 3
+
+
+def test_generate_shopping_from_menu_ok_allows_zero_with_none() -> None:
+    """``generated_count == 0 && eaters is None`` — the early-return
+    path that emits ``ok:generated:0``."""
+    parsed = GenerateShoppingFromMenuOk.model_validate({
+        "status": "generated",
+        "generated_count": 0,
+        "eaters": None,
+    })
+    assert parsed.generated_count == 0
+    assert parsed.eaters is None
 
 
 def test_clear_menu_parser_returns_cleared() -> None:

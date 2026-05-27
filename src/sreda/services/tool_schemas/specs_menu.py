@@ -97,6 +97,16 @@ class MenuCellInput(BaseModel):
     silent-drop hides the planner's confusion, so we reject at
     schema time. Both ``None`` is allowed (explicit clear; same
     semantics as ``UpdateMenuItemInput`` with both None).
+
+    Codex Sub-A4 menu R2 MAJOR #4: ``notes`` is a per-cell hint
+    that hangs off ``recipe_id``/``free_text`` — runtime stores it
+    on the MenuPlanItem row and only when the cell has content.
+    ``recipe_id=None + free_text=None + notes='X'`` would clear the
+    cell AND silently drop the notes; the planner could think it
+    added a note when it actually erased the meal. Reject the
+    notes-only shape — planner must either attach notes to a
+    recipe/free_text cell or use the (None, None, None) explicit-
+    clear shape with no notes.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -112,6 +122,25 @@ class MenuCellInput(BaseModel):
                 "not both. Runtime would silently drop free_text and "
                 "the planner would think the free_text version was "
                 "stored. Pick one and omit the other."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_notes_only_cell(self) -> "MenuCellInput":
+        if (
+            self.recipe_id is None
+            and self.free_text is None
+            and self.notes is not None
+        ):
+            raise ValueError(
+                "MenuCellInput rejects a notes-only cell "
+                "(recipe_id=None + free_text=None + notes=...). The "
+                "runtime treats (recipe_id=None, free_text=None) as "
+                "an explicit clear and silently drops the notes — "
+                "the planner could think it added a hint when it "
+                "actually erased the meal. Either attach notes to "
+                "a real recipe_id/free_text, or omit notes entirely "
+                "for the clear case."
             )
         return self
 
@@ -168,6 +197,11 @@ class UpdateMenuItemInput(BaseModel):
     rule as ``MenuCellInput``. Both ``None`` clears the cell
     (housewife_chat_tools.py:1336) — that's the only legit «both
     absent» case.
+
+    Codex Sub-A4 menu R2 MAJOR #4: same notes-only rejection as
+    ``MenuCellInput`` — (None, None, notes) is the silent-drop
+    trap. Either notes hang off a real cell, or the cell is being
+    cleared with no notes.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -185,6 +219,25 @@ class UpdateMenuItemInput(BaseModel):
                 "UpdateMenuItemInput accepts EITHER recipe_id OR "
                 "free_text, not both. Runtime would silently drop "
                 "free_text. Pick one (or both None to clear the cell)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_notes_only_update(self) -> "UpdateMenuItemInput":
+        if (
+            self.recipe_id is None
+            and self.free_text is None
+            and self.notes is not None
+        ):
+            raise ValueError(
+                "UpdateMenuItemInput rejects a notes-only update "
+                "(recipe_id=None + free_text=None + notes=...). The "
+                "runtime treats (recipe_id=None, free_text=None) as "
+                "an explicit clear of the cell and silently drops "
+                "the notes — the planner could think it added a "
+                "hint when it actually erased the meal. Either "
+                "attach notes to a real recipe_id/free_text, or "
+                "omit notes for the clear case."
             )
         return self
 
@@ -269,7 +322,7 @@ UPDATE_MENU_ITEM_SPEC = ToolSpec(
         "поменяй обед в субботу",
     ],
     mutex_notes=[
-        "Используй для ОДНОЙ ячейки. Для перепланирования всей недели — plan_week_menu (он ПЕРЕЗАПИСЫВАЕТ).",
+        "Используй для ОДНОЙ ячейки. Для пере-планирования сразу нескольких ячеек — plan_week_menu (он preserve-merge, не перезаписывает неотправленные слоты).",
         "plan_id берётся из list_menu или из ok:plan_created при создании.",
     ],
     timeout_seconds=10,

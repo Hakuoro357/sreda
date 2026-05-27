@@ -428,10 +428,23 @@ def validate_mutex_note_references(
     informational (partial-migration review).
 
     Args:
-        specs: the migrated ToolSpec list (what the planner can
-            actually call right now). Generator-safe.
+        specs: the ToolSpec scope to LINT — origin of every emitted
+            violation. Usually a per-family subset (e.g. just
+            ``MENU_SPECS``) during incremental rollout, or the full
+            migrated set during the production-gate run.
+            Generator-safe (materialized once internally).
         manifest: the full ``{tool_name: family}`` map of every
             housewife tool — typically ``TOOL_FAMILY_MANIFEST``.
+        migrated_specs: optional override for the «what tool names
+            are AVAILABLE to the planner right now» set. When
+            ``None`` (default), the SCOPE specs are treated as the
+            available set — legacy single-arg behaviour, fine when
+            the caller passes the full registry. When provided
+            (e.g. ``MIGRATED_TOOL_SPECS``), the linter scopes
+            violations to ``specs`` while letting cross-family
+            references to other migrated tools (search_recipes from
+            menu specs, add_shopping_items from menu specs) pass.
+            Generator-safe.
 
     Returns:
         list of violations; empty == no cross-references to
@@ -599,5 +612,6 @@ __all__ = [
     "TRIGGER_EXAMPLES_MIN",
     "TRIGGER_EXAMPLE_MAX_CHARS",
     "assert_production_registry_quality",
+    "validate_mutex_note_references",
     "validate_tool_registry_quality",
 ]

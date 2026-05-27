@@ -1288,7 +1288,28 @@ class GenerateShoppingFromMenuOk(BaseModel):
     (housewife_chat_tools.py:1490 emits ``ok:generated:0`` without
     ``:eaters=E``) — runtime returns this when the menu plan has no
     convertible ingredients (free_text-only or unknown plan_id). The
-    happy path always carries ``eaters >= 1``."""
+    happy path always carries ``eaters >= 1``.
+
+    Codex Sub-A4 menu R2 MAJOR #2: ``eaters is None`` is valid ONLY
+    when ``generated_count == 0`` (the early-return shape). A non-
+    None eaters with generated_count == 0 is a bug; a None eaters
+    with generated_count > 0 is malformed runtime output. The
+    @model_validator below enforces the invariant."""
+
+    @model_validator(mode="after")
+    def _validate_eaters_invariant(self) -> "GenerateShoppingFromMenuOk":
+        if self.generated_count == 0 and self.eaters is not None and self.eaters > 0:
+            # 0 generated + eaters set is the happy-but-empty path
+            # (recipes exist, all items dropped by converter). Allowed.
+            return self
+        if self.generated_count > 0 and self.eaters is None:
+            raise ValueError(
+                f"generated_count={self.generated_count} but eaters is None "
+                f"— that's only valid when generated_count==0 (early-return "
+                f"path emits 'ok:generated:0' without :eaters=E). Non-zero "
+                f"counts MUST carry an eaters value."
+            )
+        return self
 
 
 GenerateShoppingFromMenuOutput = Annotated[
