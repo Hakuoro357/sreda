@@ -1606,9 +1606,15 @@ def build_housewife_tools(
     def list_family_members() -> str:
         """List all recorded household members for the current user.
 
-        Call before ``plan_week_menu`` to know who to cook for, and
-        before ``generate_shopping_from_menu`` so shopping scales
-        correctly. Also handy when user asks "кто у меня в семье".
+        Use cases:
+          - User asks «кто у меня в семье»
+          - You need ``member_id`` to call ``update_family_member`` /
+            ``remove_family_member`` and don't have it yet
+
+        Note: ``plan_week_menu`` and ``generate_shopping_from_menu``
+        DO NOT require this call — both pull household via
+        ``family_service.count_eaters`` internally. Don't add a
+        redundant ``list_family_members`` step before them.
 
         Returns text dump with ids, names, roles, ages, notes.
         """

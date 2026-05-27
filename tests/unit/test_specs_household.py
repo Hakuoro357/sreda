@@ -527,3 +527,154 @@ def test_migrated_tool_specs_aggregate_includes_household() -> None:
 def test_migrated_tool_specs_pass_strict_with_household() -> None:
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
     assert_production_registry_quality(MIGRATED_TOOL_SPECS)
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR (new) — runtime cap parity
+# ---------------------------------------------------------------------------
+
+
+def test_family_member_draft_accepts_200_char_name() -> None:
+    """Codex R2 MAJOR (new): name cap widened to 200 to match
+    runtime truncation at housewife_family.py:99. Legacy Mini App
+    rows with long names must not block list_family_members."""
+    long_name = "А" * 200
+    parsed = FamilyMemberDraft.model_validate({
+        "name": long_name, "role": "other",
+    })
+    assert len(parsed.name) == 200
+
+
+def test_family_member_draft_rejects_201_char_name() -> None:
+    with pytest.raises(ValidationError):
+        FamilyMemberDraft.model_validate({
+            "name": "А" * 201, "role": "other",
+        })
+
+
+def test_family_member_draft_accepts_64_char_age_hint() -> None:
+    """Codex R2 MAJOR (new): age_hint cap widened to 64 to match
+    runtime ``[:64]`` AND DB column ``String(64)``."""
+    parsed = FamilyMemberDraft.model_validate({
+        "name": "Маша", "role": "child", "age_hint": "x" * 64,
+    })
+    assert len(parsed.age_hint) == 64
+
+
+def test_family_member_draft_accepts_500_char_notes() -> None:
+    """Codex R2 MAJOR (new): notes cap widened to 500 to match
+    runtime ``[:500]``."""
+    parsed = FamilyMemberDraft.model_validate({
+        "name": "Маша", "role": "child", "notes": "x" * 500,
+    })
+    assert len(parsed.notes) == 500
+
+
+def test_list_family_members_parser_accepts_long_runtime_values() -> None:
+    """Codex R2 MAJOR (new): row parser must accept name up to 200
+    chars (matches runtime truncation) — pre-R2 the 80-char cap
+    would have ContractViolation'd legacy rows."""
+    long_name = "А" * 200
+    raw = (
+        "1 member(s):\n"
+        f"  [{FM_A}] {long_name} (other, x)"
+    )
+    parsed = parse_tool_output("list_family_members", raw)
+    assert isinstance(parsed, ListFamilyMembersOk)
+    assert len(parsed.members[0].name) == 200
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR (new) — clear_birth_year semantics
+# ---------------------------------------------------------------------------
+
+
+def test_update_family_member_input_accepts_clear_birth_year_true() -> None:
+    """Codex R2 MAJOR (new): clear_birth_year=True is the explicit
+    mechanism to clear the birth_year column — replaces the
+    destructive «remove + re-add» workaround."""
+    parsed = UpdateFamilyMemberInput.model_validate({
+        "member_id": FM_A, "clear_birth_year": True,
+    })
+    assert parsed.clear_birth_year is True
+    assert parsed.birth_year is None
+
+
+def test_update_family_member_input_rejects_birth_year_and_clear_together() -> None:
+    """Mutually exclusive: setting both is a planner mistake."""
+    with pytest.raises(ValidationError) as exc:
+        UpdateFamilyMemberInput.model_validate({
+            "member_id": FM_A,
+            "birth_year": 2010,
+            "clear_birth_year": True,
+        })
+    assert "mutually exclusive" in str(exc.value)
+
+
+def test_update_family_member_input_clear_birth_year_satisfies_at_least_one() -> None:
+    """clear_birth_year=True alone counts as «at least one field
+    set» — no other field is required."""
+    parsed = UpdateFamilyMemberInput.model_validate({
+        "member_id": FM_A, "clear_birth_year": True,
+    })
+    assert parsed.clear_birth_year is True
+
+
+def test_update_family_member_input_clear_birth_year_false_doesnt_count() -> None:
+    """``clear_birth_year=False`` (default) is not «doing something»
+    — must still pass at-least-one-field check via another non-None."""
+    with pytest.raises(ValidationError) as exc:
+        UpdateFamilyMemberInput.model_validate({
+            "member_id": FM_A, "clear_birth_year": False,
+        })
+    assert "at least one" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MINOR (prior-not-closed) — TypeAdapter parser→output_model parity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool,raw", [
+    ("add_family_members", f"ok:added:1:skipped_as_duplicate:0:ids=[{FM_A}]"),
+    ("add_family_members", "ok:added:0:skipped_as_duplicate:2"),
+    ("add_family_members", "error: empty batch"),
+    ("list_family_members", "no family members recorded"),
+    ("list_family_members", f"1 member(s):\n  [{FM_A}] Маша (child, 8 лет)"),
+    ("update_family_member", "ok:updated"),
+    ("update_family_member", f"error: member '{FM_C}' not found"),
+    ("remove_family_member", "ok:removed"),
+    ("remove_family_member", f"error: member '{FM_C}' not found"),
+])
+def test_household_parser_outputs_are_valid_against_spec_output_model(tool, raw):
+    """Codex Sub-A4 household R1 MINOR (prior-not-closed) +
+    R2 MINOR: every parser result must roundtrip through
+    ``TypeAdapter(spec.output_model).validate_python(parsed.model_dump())``.
+    This catches the executor-side failure mode that surfaced as
+    the R1 CRITICAL discriminator collision — TypeAdapter validation
+    is the same path the executor uses to type-check ToolOutput dicts."""
+    from pydantic import TypeAdapter
+    spec = next(s for s in HOUSEHOLD_SPECS if s.name == tool)
+    parsed = parse_tool_output(tool, raw)
+    assert not isinstance(parsed, ToolOutputContractViolation), (
+        f"unexpected violation for {tool} / {raw!r}"
+    )
+    adapter = TypeAdapter(spec.output_model)
+    validated = adapter.validate_python(parsed.model_dump())
+    # Roundtrip must produce the same status discriminator.
+    assert validated.status == parsed.status
+
+
+def test_household_typeadapter_rejects_sentinel() -> None:
+    """ContractViolation must NOT be accepted by any output_model
+    discriminator union — fail-closed semantic."""
+    from pydantic import TypeAdapter
+    for spec in HOUSEHOLD_SPECS:
+        adapter = TypeAdapter(spec.output_model)
+        with pytest.raises(ValidationError):
+            adapter.validate_python({
+                "status": "contract_violation",
+                "raw_output": "garbage",
+                "tool_name": spec.name,
+                "timestamp": "2026-05-27T00:00:00Z",
+            })

@@ -44,50 +44,55 @@ ValidationError instead of a hidden batch shrink."""
 
 FamilyMemberName = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=80),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
 ]
-"""Cyrillic / Latin names — generous 80 char cap for multi-part names
-(«Анна-Мария Кузнецова»). Runtime dedups by case-insensitive
-normalised form (housewife_family.py:26-31)."""
+"""Cyrillic / Latin names. Codex Sub-A4 household R2 MAJOR (new):
+cap widened from 80 → 200 to match runtime truncation
+``clean_name[:200]`` at housewife_family.py:99. Mini App / legacy
+rows may have longer names than the original 80-char limit, which
+would block list_family_members for those tenants. Runtime dedups
+by case-insensitive normalised form (housewife_family.py:26-31)."""
 
 
 AgeHint = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=40),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
 ]
 """Free-form age hint when birth_year unknown («8 лет», «школьник»,
-«пенсионер»). 40 char cap keeps the dump compact for list_members.
-
+«пенсионер»). Codex Sub-A4 household R2 MAJOR (new): cap widened
+from 40 → 64 to match runtime ``[:64]`` at housewife_family.py:102
+AND the DB column ``String(64)`` at db/models/housewife.py:190.
 Add-batch context: empty string is rejected (must have content).
 Update context uses ``AgeHintClearable`` below to support clearing."""
 
 
 AgeHintClearable = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, max_length=40),
+    StringConstraints(strip_whitespace=True, max_length=64),
 ]
-"""Codex Sub-A4 household R1 MAJOR #4: update path needs to support
-clearing the field — runtime ``update_member`` stores whatever the
-caller passes, including empty string. Empty string == clear.
-``min_length`` is intentionally absent (vs ``AgeHint``)."""
+"""Codex Sub-A4 household R1 MAJOR #4 + R2 MAJOR (new): update path
+clearable variant — empty string == clear. ``min_length`` absent
+(vs ``AgeHint``). Cap matches runtime/DB at 64."""
 
 
 FamilyNotes = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=300),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
 """Free-form per-member notes — allergies, dietary preferences,
-chronic conditions. 300 char cap is generous without ballooning
-the prompt that includes list dumps."""
+chronic conditions. Codex Sub-A4 household R2 MAJOR (new): cap
+widened from 300 → 500 to match runtime ``notes[:500]`` at
+housewife_family.py:103. (DB column is EncryptedString with no
+fixed length, but service truncates at 500.)"""
 
 
 FamilyNotesClearable = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, max_length=300),
+    StringConstraints(strip_whitespace=True, max_length=500),
 ]
-"""Codex Sub-A4 household R1 MAJOR #4: clearable variant for the
-update path. Empty string == clear (e.g. «убери аллергию у Никиты»).
-``min_length`` intentionally absent."""
+"""Codex Sub-A4 household R1 MAJOR #4 + R2 MAJOR (new): update path
+clearable variant. Empty string == clear (e.g. «убери аллергию у
+Никиты»). Cap matches runtime at 500."""
 
 
 # Runtime accepts birth_year roughly in [1900, current_year+1]; the
@@ -147,39 +152,61 @@ class UpdateFamilyMemberInput(BaseModel):
     """Point-update one member's fields. ``member_id`` required;
     every other field is optional — pass only what changes.
 
-    Codex Sub-A4 household R1 MAJOR #4: ``age_hint`` and ``notes``
-    use *Clearable* variants (no min_length) so the planner can
-    express «убери аллергию у Никиты» as ``notes=''``. Empty string
-    means CLEAR the field. ``name`` and ``birth_year`` and ``role``
-    cannot be cleared via update — for those use remove + re-add
-    (cleared birth_year would orphan ages computed downstream;
-    cleared name violates the dedup invariant; cleared role has no
-    sensible default).
+    Codex Sub-A4 household R1 MAJOR #4 + R2 MAJOR (new): clear
+    semantics are now unambiguous:
+    - ``age_hint=""`` or ``notes=""`` clears the respective text
+      field (clearable variants below allow empty string).
+    - ``clear_birth_year=True`` clears the birth_year column —
+      explicit boolean instead of relying on ``birth_year=None``
+      which already means «no change». This avoids the «remove +
+      re-add» destructive workaround (would change member_id and
+      orphan notes/role).
+    - ``name`` and ``role`` cannot be cleared via update (cleared
+      name violates dedup; cleared role has no sensible default).
 
-    Codex Sub-A4 household R1 (pre-CRITICAL): at least ONE updatable
-    field must be non-None. Empty update payload is a planner
-    mistake (would be a no-op at runtime); reject so the planner
-    notices."""
+    ``birth_year=N`` and ``clear_birth_year=True`` are mutually
+    exclusive — set ONE or NEITHER; both raises.
+
+    At least ONE updatable field/flag must be non-None/non-False.
+    Empty update payload is a planner mistake (would be a no-op at
+    runtime); reject so the planner notices.
+    """
 
     model_config = ConfigDict(extra="forbid")
     member_id: FamilyMemberId
     name: FamilyMemberName | None = None
     role: FamilyRole | None = None
     birth_year: BirthYear | None = None
+    clear_birth_year: bool = False
     age_hint: AgeHintClearable | None = None
     notes: FamilyNotesClearable | None = None
 
     @model_validator(mode="after")
+    def _validate_birth_year_xor_clear(self) -> "UpdateFamilyMemberInput":
+        if self.birth_year is not None and self.clear_birth_year:
+            raise ValueError(
+                "birth_year and clear_birth_year are mutually exclusive — "
+                "set birth_year to update, OR clear_birth_year=True to clear, "
+                "but not both. Pick one."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_at_least_one_field(self) -> "UpdateFamilyMemberInput":
-        if all(
-            getattr(self, f) is None
-            for f in ("name", "role", "birth_year", "age_hint", "notes")
-        ):
+        all_unset = (
+            all(
+                getattr(self, f) is None
+                for f in ("name", "role", "birth_year", "age_hint", "notes")
+            )
+            and not self.clear_birth_year
+        )
+        if all_unset:
             raise ValueError(
                 "UpdateFamilyMemberInput requires at least one "
-                "updatable field (name/role/birth_year/age_hint/notes). "
-                "An empty update is a no-op at runtime — if the goal "
-                "is to remove the member, use remove_family_member."
+                "updatable field (name/role/birth_year/clear_birth_year/"
+                "age_hint/notes). An empty update is a no-op at "
+                "runtime — if the goal is to remove the member, use "
+                "remove_family_member."
             )
         return self
 
@@ -284,11 +311,16 @@ UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
         "переспроси юзера. Передавай ТОЛЬКО те поля что меняются — "
         "остальные оставь None. Минимум одно поле должно быть "
         "non-None (пустой апдейт = no-op runtime = ошибка). "
-        "Codex R1 MAJOR #4: очистить notes/age_hint можно передав "
-        "пустую строку только если поле явно поддерживает clear (см. "
-        "input_model description); birth_year не очищается через "
-        "update — для этого remove + re-add. Возвращает ok:updated "
-        "или error:member_not_found."
+        "Codex R2 MAJOR (new) — при правке role те же правила что и "
+        "в add_family_members: spouse=муж/жена, child=сын/дочь, "
+        "parent=мама/папа, self=сам пользователь; остальное (сестра, "
+        "брат, бабушка) → role='other' + отношение в notes. "
+        "Codex R2 MAJOR (new) — clear-семантика: notes='' и "
+        "age_hint='' очищают соответствующее поле; для birth_year — "
+        "explicit clear_birth_year=True (не передавай birth_year=N с "
+        "clear_birth_year=True одновременно). name и role очистить "
+        "нельзя (нет sensible default). Возвращает ok:updated или "
+        "error:member_not_found."
     ),
     family="household",
     effect="write",

@@ -1556,10 +1556,16 @@ class ListFamilyMembersRow(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     member_id: FamilyMemberId
-    name: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=200)
     role: Literal["self", "spouse", "child", "parent", "other"]
-    age_text: str | None = Field(default=None, max_length=40)
-    notes: str | None = Field(default=None, max_length=300)
+    age_text: str | None = Field(default=None, max_length=64)
+    notes: str | None = Field(default=None, max_length=500)
+    """Codex Sub-A4 household R2 MAJOR (new): caps widened to match
+    runtime truncation (housewife_family.py:99,102,103). Pre-R2
+    schema rejected legacy/Mini-App rows longer than 80/40/300 —
+    that would block list_family_members for affected tenants and
+    deny update/remove since the planner has no other source of
+    member_id."""
 
 
 class ListFamilyMembersOk(BaseModel):
