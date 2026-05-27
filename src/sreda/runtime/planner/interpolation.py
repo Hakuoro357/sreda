@@ -117,6 +117,52 @@ def extract_step_id(ref_path: str) -> str:
     return ref_path.split(".", 1)[0]
 
 
+# Broad pattern: any ``${...}`` non-greedy capture, regardless of
+# whether the content is a valid path. Used to detect malformed
+# references (Codex Sub-A-77 item #4 R3 MINOR #5).
+_BROAD_REF_TOKEN_PATTERN = re.compile(r"\$\{[^}]*\}")
+
+# Strict-path validator — segments must be non-empty, start with
+# letter/underscore, no double dots, no trailing dots, no leading dots,
+# AND no underscore-prefixed segments (private/dunder guard mirrors
+# ``_resolve_path``).
+_STRICT_REF_PATH_PATTERN = re.compile(
+    r"^[A-Za-z][\w]*(?:\.[A-Za-z][\w]*)*$"
+)
+
+
+def iter_malformed_ref_tokens(value: Any) -> Iterator[str]:
+    """Yield every ``${...}`` token found anywhere in ``value`` (any
+    nested str inside dict/list/tuple) that is NOT a valid reference
+    by the strict grammar — empty path, trailing/double dots, private
+    underscore-prefixed segments, leading digits, etc.
+
+    Yields the FULL token (with ``${}``) so callers can include it in
+    the error message.
+
+    Used by the validator to emit ``invalid_ref_syntax`` violations
+    BEFORE the executor's ``resolve_refs`` would crash on the same
+    input. Matches `_resolve_path`'s underscore-prefix rejection.
+    """
+
+    if isinstance(value, str):
+        for match in _BROAD_REF_TOKEN_PATTERN.finditer(value):
+            inner = match.group(0)[2:-1]  # strip ${ ... }
+            if _STRICT_REF_PATH_PATTERN.fullmatch(inner) is None:
+                yield match.group(0)
+                continue
+            # Strict path also forbids underscore-prefixed segments
+            # (the executor's _resolve_path raises on these).
+            if any(seg.startswith("_") for seg in inner.split(".")):
+                yield match.group(0)
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from iter_malformed_ref_tokens(v)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from iter_malformed_ref_tokens(item)
+
+
 def resolve_refs(value: Any, state: dict[str, Any]) -> Any:
     """Recursively resolve ``${node.field}`` references inside ``value``.
 
@@ -217,6 +263,7 @@ __all__ = [
     "contains_ref",
     "extract_step_id",
     "is_full_ref_string",
+    "iter_malformed_ref_tokens",
     "iter_refs",
     "resolve_refs",
 ]

@@ -33,7 +33,8 @@ Coverage layers:
 
 from __future__ import annotations
 
-from typing import Literal
+import typing
+from typing import Literal, NewType
 
 import pytest
 from pydantic import (
@@ -828,3 +829,177 @@ def test_malformed_ref_trailing_dot_not_matched() -> None:
 def test_malformed_ref_double_dot_not_matched() -> None:
     from sreda.runtime.planner.interpolation import iter_refs
     assert list(iter_refs("${s1..x}")) == []
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 MAJOR #1 — nested container element walking
+# ---------------------------------------------------------------------------
+
+
+class _NestedListInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    rows: list[dict[str, str]]
+
+
+def test_nested_list_of_dict_walks_concrete_inner_leaves() -> None:
+    """``list[dict[str, str]]`` — when outer list has refs, recurse
+    into each dict and check inner concrete values."""
+    plan = _plan_with_actions({
+        "s1": _action("nested_tool", {"rows": [{"a": "1"}]}),
+        "s2": _action(
+            "nested_tool",
+            {"rows": [{"a": "1", "b": 42}, "${s1.rows}"]},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {"nested_tool": _spec("nested_tool", _NestedListInput)}
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    # Inner dict value 'b'=42 (int) should be flagged — that path is
+    # rows[0]['b'] (or similar).
+    assert any("rows[0]" in (v.field_path or "") for v in s2), f"got: {s2}"
+
+
+class _OptionalListInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[str] | None = None
+    trigger: str
+
+
+def test_optional_list_peels_correctly() -> None:
+    """``Optional[list[str]]`` — peel must strip the Optional wrapper."""
+    plan = _plan_with_actions({
+        "s1": _action("opt_tool", {"items": ["a"], "trigger": "x"}),
+        "s2": _action(
+            "opt_tool",
+            {"items": ["ok", 42, "${s1.trigger}"], "trigger": "y"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {"opt_tool": _spec("opt_tool", _OptionalListInput)}
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    # Int 42 at index 1 must be flagged.
+    assert any("items[1]" in (v.field_path or "") for v in s2)
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 MAJOR #3 — duplicate canonical field (alias + name both)
+# ---------------------------------------------------------------------------
+
+
+def test_alias_and_field_name_both_supplied_under_populate_by_name() -> None:
+    """``populate_by_name=True`` accepts both — but emitting both is
+    a planner bug. Surface as duplicate_arg."""
+    plan = _plan_with_actions({
+        "s1": _action(
+            "populate_tool",
+            {"items": ["a"], "items_internal": ["b"]},  # both, conflicting
+        ),
+    })
+    registry = {"populate_tool": _spec("populate_tool", _PopulateByNameInput)}
+    violations = validate_plan(plan, registry)
+    assert any(v.code == "duplicate_arg" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 MINOR #5 — invalid_ref_syntax violations
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_ref_in_string_field_reports_invalid_ref_syntax() -> None:
+    plan = _plan_with_actions({
+        "s1": _action(
+            "schedule_reminder",
+            {"title": "напоминание ${s1.}", "trigger_iso": "iso"},
+        ),
+    })
+    registry = {"schedule_reminder": _spec("schedule_reminder", _ReminderInput)}
+    violations = validate_plan(plan, registry)
+    assert any(v.code == "invalid_ref_syntax" for v in violations)
+
+
+def test_double_dot_ref_reports_invalid_ref_syntax() -> None:
+    plan = _plan_with_actions({
+        "s1": _action(
+            "schedule_reminder",
+            {"title": "${s1..x}", "trigger_iso": "iso"},
+        ),
+    })
+    registry = {"schedule_reminder": _spec("schedule_reminder", _ReminderInput)}
+    violations = validate_plan(plan, registry)
+    assert any(v.code == "invalid_ref_syntax" for v in violations)
+
+
+def test_private_segment_ref_reports_invalid_ref_syntax() -> None:
+    """``${s1._private}`` would crash executor's resolve_refs;
+    validator must catch."""
+    plan = _plan_with_actions({
+        "s1": _action(
+            "schedule_reminder",
+            {"title": "x", "trigger_iso": "iso"},
+        ),
+        "s2": _action(
+            "schedule_reminder",
+            {"title": "${s1._private}", "trigger_iso": "iso"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {"schedule_reminder": _spec("schedule_reminder", _ReminderInput)}
+    violations = validate_plan(plan, registry)
+    assert any(
+        v.code == "invalid_ref_syntax" and v.step_id == "s2"
+        for v in violations
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 MINOR #6 — _annotation_accepts_string is conservative on unknowns
+# ---------------------------------------------------------------------------
+
+
+def test_annotation_accepts_string_concrete_int_returns_false() -> None:
+    from sreda.runtime.planner.validator import _annotation_accepts_string
+    assert _annotation_accepts_string(int) is False
+    assert _annotation_accepts_string(float) is False
+    assert _annotation_accepts_string(bool) is False
+    assert _annotation_accepts_string(bytes) is False
+    assert _annotation_accepts_string(list[str]) is False
+    assert _annotation_accepts_string(dict[str, int]) is False
+
+
+def test_annotation_accepts_string_concrete_str_returns_true() -> None:
+    from sreda.runtime.planner.validator import _annotation_accepts_string
+    assert _annotation_accepts_string(str) is True
+    assert _annotation_accepts_string(str | None) is True
+    assert _annotation_accepts_string(typing.Optional[str]) is True  # type: ignore[arg-type]
+
+
+def test_annotation_accepts_string_unknown_custom_type_returns_true() -> None:
+    """Custom validator classes (NewType, pydantic types, etc.) — defer
+    to executor, do not over-reject."""
+    from sreda.runtime.planner.validator import _annotation_accepts_string
+
+    UserId = NewType("UserId", str)
+    assert _annotation_accepts_string(UserId) is True
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 MINOR #7 — dict key annotation walking
+# ---------------------------------------------------------------------------
+
+
+class _ConstrainedKeyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    counts: dict[int, str]  # keys are int — string key is wrong type
+
+
+def test_dict_concrete_int_key_violation_no_refs() -> None:
+    plan = _plan_with_actions({
+        "s1": _action("ck_tool", {"counts": {"not-int": "x"}}),
+    })
+    registry = {"ck_tool": _spec("ck_tool", _ConstrainedKeyInput)}
+    violations = validate_plan(plan, registry)
+    assert any(v.step_id == "s1" for v in violations)
+
+

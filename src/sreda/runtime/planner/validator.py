@@ -75,6 +75,7 @@ from sreda.runtime.planner.interpolation import (
     contains_ref,
     extract_step_id,
     is_full_ref_string,
+    iter_malformed_ref_tokens,
     iter_refs,
 )
 from sreda.runtime.planner.schemas import Action, Plan
@@ -259,17 +260,24 @@ def _annotation_with_constraints(finfo: Any) -> Any:
     return Annotated[(annotation, *metadata)]
 
 
-def _annotation_accepts_string(annotation: Any) -> bool:
-    """Return True if a value of type ``str`` could be accepted by
-    ``annotation`` (a typing hint or pydantic-compatible type).
+_DEFINITELY_NOT_STRING: tuple[type, ...] = (
+    int, float, bool, bytes, list, tuple, set, frozenset, dict,
+)
 
-    Walks Optional / Union / Annotated wrappers. Conservative: returns
-    True for ``Any`` and unknown types so we don't over-reject mixed
-    interpolated strings against custom string-like fields
-    (Codex R2 MINOR #5).
+
+def _annotation_accepts_string(annotation: Any) -> bool:
+    """Return True if a value of type ``str`` could plausibly be
+    accepted by ``annotation``.
+
+    Conservative semantics (Codex R3 MINOR #6): we ONLY return False
+    when we can prove the annotation cannot accept a string —
+    primitive non-str types (int/float/bool/bytes) and built-in
+    containers. NewType, pydantic-validated strings, custom validators,
+    and other unknown types pass through to executor-time validation
+    (the eventual tool call will see the resolved string and decide).
     """
 
-    if annotation is None:
+    if annotation is None or annotation is type(None):
         return False
     if annotation is Any:
         return True
@@ -281,41 +289,91 @@ def _annotation_accepts_string(annotation: Any) -> bool:
         inner = get_args(annotation)[0]
         return _annotation_accepts_string(inner)
     if origin is Union or origin is types.UnionType:
-        return any(_annotation_accepts_string(arg) for arg in get_args(annotation))
-    # str subclass / Literal[str_value, ...] / typing.NewType / etc.
-    if isinstance(annotation, type) and issubclass(annotation, str):
-        return True
+        return any(
+            _annotation_accepts_string(arg) for arg in get_args(annotation)
+        )
     if origin is typing.Literal:
         return all(isinstance(arg, str) for arg in get_args(annotation))
-    return False
+
+    # Concrete classes: str / str-subclass → True; primitives + builtin
+    # containers → False; everything else (NewType, custom validators,
+    # pydantic types, etc.) → True (conservative defer).
+    if isinstance(annotation, type):
+        if issubclass(annotation, str):
+            return True
+        if issubclass(annotation, _DEFINITELY_NOT_STRING):
+            return False
+        return True  # unknown class — defer to executor
+
+    # Container origin (list/dict/etc.) — concrete non-string.
+    if origin in _DEFINITELY_NOT_STRING:
+        return False
+
+    # Anything else (NewType, ParamSpec, etc.) — defer.
+    return True
 
 
-def _peel_container_element_annotation(annotation: Any) -> Any | None:
-    """For ``list[T]`` / ``tuple[T, ...]`` / ``set[T]`` return the
-    element annotation ``T``. For ``dict[K, V]`` return the value
-    annotation ``V``. Return None when the container shape is not
-    statically peelable (e.g. ``list`` without type param, custom
-    classes). Closes Codex R2 MAJOR #1 — element-walk for mixed-ref
-    containers.
+def _strip_optional_and_annotated(annotation: Any) -> Any:
+    """Unwrap ``Annotated[T, ...]`` and ``T | None`` / ``Optional[T]``
+    layers, returning the innermost non-Optional type.
+
+    For multi-arm unions like ``int | str | None``, returns the first
+    non-None arm; this is a pragmatic choice — real planner ToolSpec
+    inputs rarely have unions other than Optional, and the executor
+    will resolve refs and try the actual value against the original
+    annotation eventually.
     """
 
     origin = get_origin(annotation)
-    # Strip Annotated wrapper.
     if origin is Annotated:
-        return _peel_container_element_annotation(get_args(annotation)[0])
+        return _strip_optional_and_annotated(get_args(annotation)[0])
+    if origin is Union or origin is types.UnionType:
+        non_none = [a for a in get_args(annotation) if a is not type(None)]
+        if len(non_none) == 1:
+            return _strip_optional_and_annotated(non_none[0])
+        # Multi-arm: return the first non-None for container/dict probes;
+        # callers that need full union semantics handle it themselves.
+        if non_none:
+            return _strip_optional_and_annotated(non_none[0])
+    return annotation
+
+
+def _peel_container_element_annotation(
+    annotation: Any,
+) -> Any | None:
+    """For ``list[T]`` / ``tuple[T, ...]`` / ``set[T]`` / ``frozenset[T]``
+    return element annotation ``T``. For ``dict[K, V]`` return ``V``.
+    For non-peelable shapes return None.
+
+    Strips ``Annotated`` and ``Optional`` wrappers so
+    ``Optional[list[str]]`` and ``Annotated[list[str], Field(min_length=2)]``
+    peel to ``str`` (Codex R3 MAJOR #1).
+    """
+
+    bare = _strip_optional_and_annotated(annotation)
+    origin = get_origin(bare)
     if origin in (list, set, frozenset):
-        args = get_args(annotation)
+        args = get_args(bare)
         return args[0] if args else None
     if origin is tuple:
-        args = get_args(annotation)
+        args = get_args(bare)
         if len(args) == 2 and args[1] is Ellipsis:
-            return args[0]  # tuple[T, ...]
-        # Heterogeneous tuple — element-walk isn't homogeneous; caller
-        # falls back to whole-value defer.
+            return args[0]
         return None
     if origin is dict:
-        args = get_args(annotation)
+        args = get_args(bare)
         return args[1] if len(args) >= 2 else None
+    return None
+
+
+def _peel_dict_key_annotation(annotation: Any) -> Any | None:
+    """Return the key annotation ``K`` for ``dict[K, V]`` (Codex R3
+    MINOR #7). None for non-dict or untyped dict."""
+
+    bare = _strip_optional_and_annotated(annotation)
+    if get_origin(bare) is dict:
+        args = get_args(bare)
+        return args[0] if args else None
     return None
 
 
@@ -340,6 +398,36 @@ def _phase1_check_unknown_keys(
                     f"Accepted: {sorted(accepted)}."
                 ),
             )
+
+
+def _phase1_check_ref_syntax(
+    step_id: str,
+    action: Action,
+    tool_spec: ToolSpec | None,
+) -> Iterator[Violation]:
+    """Yield ``invalid_ref_syntax`` violations for any ``${...}`` token
+    in ``action.args`` that doesn't match the strict ref grammar OR
+    contains underscore-prefixed (private) segments.
+
+    Codex R3 MINOR #5: malformed tokens like ``${s1.}``, ``${s1..x}``,
+    ``${s1._private}`` previously passed validator and either survived
+    into the tool as literal text or crashed executor's
+    ``resolve_refs``. This check catches them at plan time.
+    """
+
+    for malformed in iter_malformed_ref_tokens(action.args):
+        yield Violation(
+            step_id=step_id,
+            tool=tool_spec.name if tool_spec else None,
+            field_path=None,
+            code="invalid_ref_syntax",
+            message=(
+                f"malformed reference {malformed!r}. Refs must be of "
+                f"the form ``${{step_id.field.subfield}}`` — segments "
+                f"non-empty, no underscore-prefixed segments, no "
+                f"consecutive or trailing dots."
+            ),
+        )
 
 
 def _phase1_check_refs(
@@ -511,6 +599,14 @@ def _phase2_validate_args(
     #   without alias confusion.
     known_args_as_emitted: dict[str, Any] = {}
     canonical_args: dict[str, Any] = {}
+    # Codex R3 MAJOR #3: when two emitted keys map to the same canonical
+    # field (e.g. alias + field name both supplied under
+    # ``populate_by_name=True``), pydantic's precedence rules apply
+    # deterministically. Our last-wins ``canonical_args[k] = v``
+    # silently picks one — we'd validate a value that the executor's
+    # ``model_validate`` won't actually use. Detect + surface as
+    # ``duplicate_arg`` so the planner gets a clear retry signal.
+    canonical_emitted_keys: dict[str, list[str]] = {}
     for key, value in action.args.items():
         if key not in accepted_names:
             continue  # unknown — Phase 1 handled
@@ -518,6 +614,23 @@ def _phase2_validate_args(
         canonical_key = _normalize_to_field_name(key, model)
         if canonical_key is not None:
             canonical_args[canonical_key] = value
+            canonical_emitted_keys.setdefault(canonical_key, []).append(key)
+
+    for canonical_key, emitted_keys in canonical_emitted_keys.items():
+        if len(emitted_keys) > 1:
+            yield Violation(
+                step_id=step_id,
+                tool=tool_spec.name,
+                field_path=canonical_key,
+                code="duplicate_arg",
+                message=(
+                    f"field {canonical_key!r} supplied under multiple "
+                    f"names: {sorted(emitted_keys)}. Pydantic precedence "
+                    f"would pick one deterministically, but the planner "
+                    f"should emit exactly one. Pick the alias or the "
+                    f"field name, not both."
+                ),
+            )
 
     if not contains_ref(known_args_as_emitted):
         # No refs anywhere — full validation including cross-field rules.
@@ -610,8 +723,9 @@ def _validate_field_value(
         if element_annotation is None:
             return  # Can't peel — defer.
         for idx, item in enumerate(value):
-            if contains_ref(item):
-                continue
+            # Recurse with peeled element annotation — handles nested
+            # containers like ``list[dict[str, str]]`` where the inner
+            # dict may itself contain refs (Codex R3 MAJOR #1).
             yield from _validate_field_value(
                 step_id=step_id,
                 tool_spec=tool_spec,
@@ -622,19 +736,29 @@ def _validate_field_value(
         return
 
     if isinstance(value, dict) and contains_ref(value):
-        element_annotation = _peel_container_element_annotation(annotation)
-        if element_annotation is None:
-            return  # Can't peel — defer.
+        value_annotation = _peel_container_element_annotation(annotation)
+        key_annotation = _peel_dict_key_annotation(annotation)
+        if value_annotation is None and key_annotation is None:
+            return  # Can't peel either side — defer.
         for k, item in value.items():
-            if contains_ref(item):
-                continue
-            yield from _validate_field_value(
-                step_id=step_id,
-                tool_spec=tool_spec,
-                field_name=f"{field_name}[{k!r}]",
-                value=item,
-                annotation=element_annotation,
-            )
+            # Walk keys (Codex R3 MINOR #7) — concrete keys only;
+            # refs in keys are unusual but technically possible.
+            if key_annotation is not None and not contains_ref(k):
+                yield from _validate_field_value(
+                    step_id=step_id,
+                    tool_spec=tool_spec,
+                    field_name=f"{field_name}.<key {k!r}>",
+                    value=k,
+                    annotation=key_annotation,
+                )
+            if value_annotation is not None:
+                yield from _validate_field_value(
+                    step_id=step_id,
+                    tool_spec=tool_spec,
+                    field_name=f"{field_name}[{k!r}]",
+                    value=item,
+                    annotation=value_annotation,
+                )
         return
 
     # All-concrete value: full TypeAdapter check (annotation already
@@ -703,7 +827,9 @@ def validate_action_args(
     violations: list[Violation] = []
     # Phase 1.a: unknown args (independent of refs)
     violations.extend(_phase1_check_unknown_keys(step_id, action, tool_spec))
-    # Phase 1.b: ref integrity (requires plan context for target lookup)
+    # Phase 1.b: malformed ${...} tokens (Codex R3 MINOR #5)
+    violations.extend(_phase1_check_ref_syntax(step_id, action, tool_spec))
+    # Phase 1.c: ref integrity (requires plan context for target lookup)
     if plan is not None:
         violations.extend(
             _phase1_check_refs(step_id, action, plan, tool_spec)
