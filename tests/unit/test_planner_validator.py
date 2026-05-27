@@ -56,7 +56,6 @@ from sreda.runtime.planner.validator import (
     InvalidPlanError,
     Violation,
     render_violations,
-    validate_action_args,
     validate_plan,
     validate_plan_args,
     validate_plan_or_raise,
@@ -1240,5 +1239,209 @@ def test_nested_basemodel_duplicate_arg_detected_under_refs() -> None:
         v.code == "duplicate_arg" and "author.full_name" in (v.field_path or "")
         for v in s2
     ), f"got: {s2}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.d — required_any_non_null_args (Codex Sub-A4 R5/R6 MAJOR #1)
+# ---------------------------------------------------------------------------
+
+
+class _UpdateLikeInput(BaseModel):
+    """Mimics ``UpdateShoppingItemInput`` shape: required id + optional
+    mutable fields (title/qty/category). Used in this test file to keep
+    the validator tests independent of the shopping spec."""
+
+    model_config = ConfigDict(extra="forbid")
+    item_id: str
+    title: str | None = None
+    quantity_text: str | None = None
+    category: str | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_mutable(self) -> "_UpdateLikeInput":
+        provided = (
+            ("title" in self.model_fields_set and self.title is not None)
+            or ("quantity_text" in self.model_fields_set)
+            or ("category" in self.model_fields_set and self.category is not None)
+        )
+        if not provided:
+            raise ValueError("no mutable field provided")
+        return self
+
+
+def _update_spec_with_required_any(name: str = "update_like") -> ToolSpec:
+    return ToolSpec(  # type: ignore[arg-type]
+        name=name,
+        description=f"Test spec for {name}",
+        family="shopping",
+        effect="write",
+        read_domains=[],
+        write_domains=["shopping"],
+        input_model=_UpdateLikeInput,
+        output_model=_OkOutput,
+        required_any_non_null_args=["title", "quantity_text", "category"],
+    )
+
+
+def test_required_any_rejects_refs_only_no_mutable() -> None:
+    """**Codex R5/R6 MAJOR #1 closure test**.
+
+    Plan with ``update_like(item_id="${s1.items[0].item_id}")`` — only
+    ``item_id`` provided, no mutable fields. Phase 2 skips model_validator
+    on the refs-present path; the new Phase 1.d
+    ``_phase1_check_required_any_non_null`` MUST fire and emit
+    ``silent_noop_call`` so the planner retries with a real update."""
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["x"]}),
+        "s2": _action(
+            "update_like",
+            {"item_id": "${s1.items[0]}"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "add_shopping_items": _spec("add_shopping_items", _ShoppingInput),
+        "update_like": _update_spec_with_required_any(),
+    }
+    violations = validate_plan(plan, registry)
+    silent_noop = [
+        v for v in violations
+        if v.code == "silent_noop_call" and v.step_id == "s2"
+    ]
+    assert silent_noop, (
+        f"Expected silent_noop_call on s2 but got: {violations}"
+    )
+
+
+def test_required_any_accepts_ref_on_mutable_field() -> None:
+    """Ref to a mutable field satisfies the «non-null-by-shape» rule
+    at plan time. Execute-time validation re-checks resolution via
+    ``spec.validate_args_at_execute_time``."""
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["x"]}),
+        "s2": _action(
+            "update_like",
+            {"item_id": "${s1.items[0]}", "title": "${s1.category}"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "add_shopping_items": _spec("add_shopping_items", _ShoppingInput),
+        "update_like": _update_spec_with_required_any(),
+    }
+    violations = validate_plan(plan, registry)
+    silent_noop = [v for v in violations if v.code == "silent_noop_call"]
+    assert not silent_noop, f"unexpected silent_noop_call: {silent_noop}"
+
+
+def test_required_any_accepts_literal_mutable() -> None:
+    """All-literal call with at least one mutable field — no
+    silent_noop violation. The input_model's @model_validator runs
+    on the no-refs path; this test exercises the «happy literal» case."""
+    plan = _plan_with_actions({
+        "s1": _action(
+            "update_like",
+            {"item_id": "sh_abc", "title": "новое название"},
+        ),
+    })
+    registry = {"update_like": _update_spec_with_required_any()}
+    violations = validate_plan(plan, registry)
+    silent_noop = [v for v in violations if v.code == "silent_noop_call"]
+    assert not silent_noop
+
+
+def test_required_any_rejects_all_explicit_nulls() -> None:
+    """All mutable fields explicit-null with refs to suppress
+    model_validator — Phase 1.d still rejects because explicit null
+    is not «provided» under the rule."""
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["x"]}),
+        "s2": _action(
+            "update_like",
+            {
+                "item_id": "${s1.items[0]}",
+                "title": None,
+                "quantity_text": None,
+                "category": None,
+            },
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "add_shopping_items": _spec("add_shopping_items", _ShoppingInput),
+        "update_like": _update_spec_with_required_any(),
+    }
+    violations = validate_plan(plan, registry)
+    s2_silent_noop = [
+        v for v in violations
+        if v.code == "silent_noop_call" and v.step_id == "s2"
+    ]
+    assert s2_silent_noop
+
+
+def test_required_any_accepts_empty_string_for_clear_intent() -> None:
+    """Empty string is non-null — shopping ``quantity_text=""`` is the
+    clear-intent. Phase 1.d must accept it as «provided»."""
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["x"]}),
+        "s2": _action(
+            "update_like",
+            {"item_id": "${s1.items[0]}", "quantity_text": ""},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "add_shopping_items": _spec("add_shopping_items", _ShoppingInput),
+        "update_like": _update_spec_with_required_any(),
+    }
+    violations = validate_plan(plan, registry)
+    silent_noop = [v for v in violations if v.code == "silent_noop_call"]
+    assert not silent_noop
+
+
+def test_required_any_does_not_false_positive_for_specs_without_setting() -> None:
+    """Specs without ``required_any_non_null_args`` set must NOT
+    surface ``silent_noop_call``. The check is opt-in per spec."""
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["x"]}),
+    })
+    registry = {"add_shopping_items": _spec("add_shopping_items", _ShoppingInput)}
+    violations = validate_plan(plan, registry)
+    silent_noop = [v for v in violations if v.code == "silent_noop_call"]
+    assert not silent_noop
+
+
+def test_required_any_real_update_shopping_item_spec_integration() -> None:
+    """End-to-end with the REAL ``UPDATE_SHOPPING_ITEM_SPEC`` from
+    ``specs_shopping.py``. Verifies the production spec's declaration
+    of ``required_any_non_null_args`` flows through the production
+    validator (Codex R6 explicit ask)."""
+    from sreda.services.tool_schemas.specs_shopping import (
+        ADD_SHOPPING_ITEMS_SPEC,
+        LIST_SHOPPING_SPEC,
+        UPDATE_SHOPPING_ITEM_SPEC,
+    )
+    plan = _plan_with_actions({
+        "s1": _action("list_shopping", {}),
+        "s2": _action(
+            "update_shopping_item",
+            {"item_id": "${s1.items[0].item_id}"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "list_shopping": LIST_SHOPPING_SPEC,
+        "update_shopping_item": UPDATE_SHOPPING_ITEM_SPEC,
+        "add_shopping_items": ADD_SHOPPING_ITEMS_SPEC,
+    }
+    violations = validate_plan(plan, registry)
+    silent_noop = [
+        v for v in violations
+        if v.code == "silent_noop_call" and v.step_id == "s2"
+    ]
+    assert silent_noop, (
+        f"Expected silent_noop_call on s2 with real UPDATE_SHOPPING_ITEM_SPEC "
+        f"but got: {[(v.code, v.message[:80]) for v in violations]}"
+    )
 
 

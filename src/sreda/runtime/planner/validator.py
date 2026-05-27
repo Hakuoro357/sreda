@@ -655,6 +655,62 @@ def _phase1_detect_ref_cycles(plan: Plan) -> Iterator[Violation]:
 # ---------------------------------------------------------------------------
 
 
+def _phase1_check_required_any_non_null(
+    step_id: str, action: Action, tool_spec: ToolSpec
+) -> Iterator[Violation]:
+    """Codex Sub-A4 R5/R6 MAJOR #1 — enforce ``ToolSpec.required_any_non_null_args``.
+
+    Some tools (notably ``update_shopping_item``) have an input shape
+    where every mutable field is individually optional but the call is
+    a silent no-op if all of them are absent or explicit-null. The
+    ``input_model``'s ``@model_validator`` catches this for fully-
+    literal args, but Phase 2's refs-present path uses per-field
+    ``TypeAdapter`` checks which skip model_validators. So a plan like
+    ``{"item_id": "${s1.items[0].item_id}"}`` with no mutable fields
+    passes Phase 2 unchecked and ships a no-op tool call.
+
+    This phase 1 check fires INDEPENDENT of refs — it operates on the
+    raw ``action.args`` keys and values. Rules:
+
+    - A field counts as «provided» if its key is in ``action.args``
+      AND its value is **not Python ``None``**.
+    - Refs (``${...}``) count as non-null-by-shape (planner trusts
+      upstream output_model shapes; if the resolved value is ``None``
+      at execute time, the executor's
+      ``spec.validate_args_at_execute_time(resolved)`` catches it via
+      full ``input_model.model_validate``).
+    - Empty strings count as non-null (e.g. shopping
+      ``quantity_text=""`` is the legitimate clear-quantity intent).
+    - Explicit ``null`` (Python ``None``) and missing keys do NOT
+      count as provided — both are no-op contributions at runtime.
+
+    No-op when ``required_any_non_null_args`` is unset (most tools).
+    """
+
+    if tool_spec.required_any_non_null_args is None:
+        return
+    provided = [
+        name
+        for name in tool_spec.required_any_non_null_args
+        if name in action.args and action.args[name] is not None
+    ]
+    if provided:
+        return
+    yield Violation(
+        step_id=step_id,
+        tool=tool_spec.name,
+        code="silent_noop_call",
+        message=(
+            f"call must provide at least one of "
+            f"{tool_spec.required_any_non_null_args} with a non-null "
+            f"value (refs and empty strings count as non-null; "
+            f"explicit null and missing keys do not). Got args with "
+            f"keys {sorted(action.args.keys())} — this would be a "
+            f"silent no-op call at runtime."
+        ),
+    )
+
+
 def _phase2_validate_args(
     step_id: str, action: Action, tool_spec: ToolSpec
 ) -> Iterator[Violation]:
@@ -1190,6 +1246,13 @@ def validate_action_args(
         violations.extend(
             _phase1_check_refs(step_id, action, plan, tool_spec)
         )
+    # Phase 1.d: ToolSpec-declared «at least one of these mutable fields
+    # must be provided non-null» — Codex Sub-A4 R5/R6 MAJOR #1. Fires
+    # regardless of refs (the rule is structural: are the keys present
+    # with non-null values, not «what would they resolve to»).
+    violations.extend(
+        _phase1_check_required_any_non_null(step_id, action, tool_spec)
+    )
     # Phase 2: schema-aware partial
     violations.extend(_phase2_validate_args(step_id, action, tool_spec))
     return violations

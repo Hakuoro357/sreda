@@ -590,15 +590,15 @@ class ToolSpec(BaseModel):
 
     def validate_args_at_execute_time(
         self, resolved_args: dict[str, Any]
-    ) -> Any:
+    ) -> dict[str, Any]:
         """Full ``input_model`` validation of a tool call's args AFTER
-        refs have been resolved (Codex Sub-A4 R5 MAJOR #3).
+        refs have been resolved (Codex Sub-A4 R5 MAJOR #3 + R6 MINOR).
 
         Phase B's executor MUST call this right before invoking the
         legacy tool function. The plan-time validator
-        (``plan_validator.validate_action_args``) defers field-level
-        checks for refs-present args; this method closes the deferred
-        gap. In particular:
+        (``runtime/planner/validator.py::validate_action_args``)
+        defers per-field checks for refs-present args; this method
+        closes the deferred gap. In particular:
 
         - ``input_model.model_validate(resolved_args)`` runs every
           ``@field_validator`` and ``@model_validator`` — so the
@@ -615,10 +615,16 @@ class ToolSpec(BaseModel):
         can train on the planner output shape vs the runtime
         resolution shape independently.
 
-        Returns the validated instance for convenience (most callers
-        will pass it back into the legacy tool via ``**args``).
+        Returns a ``dict[str, Any]`` ready to splat into the legacy
+        tool as ``legacy_tool(**validated)`` — Codex R6 MINOR: the
+        prior version returned a Pydantic instance and the docstring
+        said «splat with **», but ``**ModelInstance`` raises
+        ``TypeError``. Dict return removes the integration footgun.
+        Callers needing the typed instance can recompute via
+        ``spec.input_model.model_validate(validated)``.
         """
-        return self.input_model.model_validate(resolved_args)
+        instance = self.input_model.model_validate(resolved_args)
+        return instance.model_dump()
 
     def process_output(self, raw_output: str) -> Any:
         """Canonical entry point for converting a tool's raw ``str``

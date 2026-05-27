@@ -17,10 +17,6 @@ from sreda.services.tool_schemas.executor_contract import (
     PlannerGapError,
     dispatch_typed_output,
 )
-from sreda.services.tool_schemas.plan_validator import (
-    is_ref,
-    validate_action_args,
-)
 from sreda.services.tool_schemas.families import (
     FAMILIES,
     FAMILY_HEADERS,
@@ -54,10 +50,8 @@ __all__ = [
     "ToolOutputContractViolation",
     "ToolSpec",
     "dispatch_typed_output",
-    "is_ref",
     "parse_tool_output",
     "render_family_header",
     "render_registry_for_planner",
-    "validate_action_args",
     "validate_tool_registry_quality",
 ]
