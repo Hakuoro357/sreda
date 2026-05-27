@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.common import (
+    FamilyMemberId,
     MenuItemId,
     MenuPlanId,
     RecipeId,
@@ -102,6 +103,13 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"^recipe\s+.+\s+not\s+found$", re.IGNORECASE),
         "recipe_not_found",
+    ),
+    # update_family_member / remove_family_member: ``error: member 'fm_X' not found``
+    # Sub-A4 household phase: same dynamic-id-in-message class.
+    # Source: ``housewife_chat_tools.py:1682, :1697``.
+    (
+        re.compile(r"^member\s+.+\s+not\s+found$", re.IGNORECASE),
+        "member_not_found",
     ),
 ]
 
@@ -1421,6 +1429,221 @@ def parse_clear_menu(
 
 
 # ---------------------------------------------------------------------------
+# 22-25. Household family (Sub-A4 phase 5):
+#         add_family_members / list_family_members /
+#         update_family_member / remove_family_member
+#
+# Runtime shapes:
+#   add:    "ok:added:0:skipped_as_duplicate:M"
+#           "ok:added:N:skipped_as_duplicate:M:ids=[fm_...,...]"
+#   list:   "no family members recorded"
+#           "N member(s):\n  [fm_...] name (role, age) — notes\n..."
+#   update: "ok:updated" / error
+#   remove: "ok:removed" / error
+# ---------------------------------------------------------------------------
+
+
+class AddFamilyMembersAdded(BaseModel):
+    """Happy path: at least one member persisted. Mirrors
+    ``SaveRecipesBatchOk`` shape — created_count + skipped_as_duplicate
+    + tight ID list with cross-field count consistency."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["added"] = "added"
+    added_count: int = Field(ge=1)
+    skipped_as_duplicate: int = Field(ge=0)
+    member_ids: list[FamilyMemberId]
+
+    @model_validator(mode="after")
+    def _validate_count_matches_ids(self) -> "AddFamilyMembersAdded":
+        if len(self.member_ids) != self.added_count:
+            raise ValueError(
+                f"added_count={self.added_count} but member_ids has "
+                f"{len(self.member_ids)} entries — mismatch."
+            )
+        return self
+
+
+class AddFamilyMembersAllDuplicate(BaseModel):
+    """Every member in the batch matched a normalised-name existing
+    row. ``added_count=0`` and no ids segment in the runtime output —
+    distinct shape because the planner can say «эти уже есть, ничего
+    не добавила»."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["added"] = "added"
+    added_count: Literal[0] = 0
+    skipped_as_duplicate: int = Field(ge=1)
+    member_ids: list[FamilyMemberId] = Field(default_factory=list, max_length=0)
+
+
+AddFamilyMembersOutput = Annotated[
+    Union[
+        AddFamilyMembersAdded,
+        AddFamilyMembersAllDuplicate,
+        HousewifeToolError,
+    ],
+    Field(discriminator="status"),
+]
+
+# Two runtime shapes:
+#   ok:added:0:skipped_as_duplicate:M             — all-duplicate batch
+#   ok:added:N:skipped_as_duplicate:M:ids=[fm_,...] — happy path
+_ADD_FAMILY_RE = re.compile(
+    r"^ok:added:(?P<n>\d+):skipped_as_duplicate:(?P<m>\d+)"
+    r"(?::ids=\[(?P<ids>[^\]]*)\])?$"
+)
+
+
+def parse_add_family_members(
+    raw: str,
+) -> (
+    AddFamilyMembersAdded
+    | AddFamilyMembersAllDuplicate
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _ADD_FAMILY_RE.match(raw.strip())
+    if m is not None:
+        n = int(m.group("n"))
+        skipped = int(m.group("m"))
+        ids_csv = m.group("ids") or ""
+        ids = [x.strip() for x in ids_csv.split(",") if x.strip()]
+        try:
+            if n == 0:
+                # All-duplicate branch — must have at least one
+                # skipped AND no ids in runtime output.
+                if ids:
+                    return ToolOutputContractViolation(
+                        raw_output=raw,
+                        tool_name="add_family_members",
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                return AddFamilyMembersAllDuplicate(
+                    skipped_as_duplicate=skipped,
+                )
+            return AddFamilyMembersAdded(
+                added_count=n,
+                skipped_as_duplicate=skipped,
+                member_ids=ids,
+            )
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="add_family_members",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+class ListFamilyMembersOk(BaseModel):
+    """Plan-execute MVP boundary (same approach as ListMenuOk /
+    ListShoppingOk): the runtime dump is human-formatted; the
+    planner consumes ``raw_text`` and shows or summarises. A
+    structured ``members`` list is post-MVP (see Phase B
+    follow-ups). ``raw_text`` carries the full dump for now."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["ok"] = "ok"
+    raw_text: str = Field(min_length=1)
+
+
+class ListFamilyMembersEmpty(BaseModel):
+    """Distinct variant for the «no members recorded» path so the
+    planner branches cleanly («у тебя пока нет записанной семьи —
+    хочешь добавить?» vs «вот члены семьи»)."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["empty"] = "empty"
+
+
+ListFamilyMembersOutput = Annotated[
+    Union[ListFamilyMembersOk, ListFamilyMembersEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_list_family_members(
+    raw: str,
+) -> (
+    ListFamilyMembersOk
+    | ListFamilyMembersEmpty
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "no family members recorded":
+        return ListFamilyMembersEmpty()
+    # Sanity: list dumps start with "N member(s):" — without that
+    # header the output isn't from this tool's known shape.
+    if re.match(r"^\d+\s+member\(s\):", stripped):
+        return ListFamilyMembersOk(raw_text=stripped)
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="list_family_members",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+class UpdateFamilyMemberOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["updated"] = "updated"
+
+
+UpdateFamilyMemberOutput = Annotated[
+    Union[UpdateFamilyMemberOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_update_family_member(
+    raw: str,
+) -> UpdateFamilyMemberOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    if raw.strip() == "ok:updated":
+        return UpdateFamilyMemberOk()
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="update_family_member",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+class RemoveFamilyMemberOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["removed"] = "removed"
+
+
+RemoveFamilyMemberOutput = Annotated[
+    Union[RemoveFamilyMemberOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_remove_family_member(
+    raw: str,
+) -> RemoveFamilyMemberOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    if raw.strip() == "ok:removed":
+        return RemoveFamilyMemberOk()
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="remove_family_member",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -1447,6 +1670,10 @@ PARSERS = {
     "list_menu": parse_list_menu,
     "generate_shopping_from_menu": parse_generate_shopping_from_menu,
     "clear_menu": parse_clear_menu,
+    "add_family_members": parse_add_family_members,
+    "list_family_members": parse_list_family_members,
+    "update_family_member": parse_update_family_member,
+    "remove_family_member": parse_remove_family_member,
 }
 
 
@@ -1468,6 +1695,9 @@ def parse_tool_output(tool_name: str, raw: str) -> BaseModel:
 
 
 __all__ = [
+    "AddFamilyMembersAdded",
+    "AddFamilyMembersAllDuplicate",
+    "AddFamilyMembersOutput",
     "AddShoppingItemsAdded",
     "AddShoppingItemsEmpty",
     "AddShoppingItemsOutput",

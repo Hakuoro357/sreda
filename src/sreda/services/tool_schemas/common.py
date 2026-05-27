@@ -444,6 +444,18 @@ MenuItemId = Annotated[
 (``housewife_menu.py:164,182,243``)."""
 
 
+FamilyMemberId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=rf"^fm_{_HEX24}$",
+    ),
+]
+"""Family member id — ``fm_<24 hex chars>`` (``housewife_family.py:96``).
+Matches the ``uuid4().hex[:24]`` runtime token. Tight regex shape
+catches malformed planner refs at validation time."""
+
+
 # ---------------------------------------------------------------------------
 # Reminders family — date/time + recurrence aliases.
 #
