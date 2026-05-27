@@ -981,18 +981,111 @@ def test_schedule_reminder_accepts_in_range_rrule_params(good_rrule) -> None:
     assert parsed.recurrence_rule == good_rrule
 
 
-def test_update_reminder_input_partial_rrule_only_skips_validation() -> None:
-    """When the update sends ``recurrence_rule`` but not ``trigger_iso``,
-    the runtime will fetch the persisted dtstart at execute time. The
-    schema-side validator skips dateutil validation (no trigger_iso
-    to use as dtstart). Numeric-range checks via the regex alias
-    still fire — but those live in the alias path."""
+def test_update_reminder_input_partial_rrule_runs_static_checks() -> None:
+    """Codex Sub-A4 reminders R5 MAJOR #1 closure: when the update
+    sends ``recurrence_rule`` without ``trigger_iso``, the schema-side
+    validator runs ``validate_rrule_static`` (numeric ranges + cross-
+    param feasibility) but skips dateutil dtstart validation. The
+    executor MUST fetch persisted trigger_iso and re-validate
+    (per ``_executor_validation_contract`` on UpdateReminderInput)."""
     parsed = UpdateReminderInput.model_validate({
         "reminder_id": REM_A,
         "recurrence_rule": "FREQ=HOURLY;INTERVAL=4;BYHOUR=13",
     })
-    # No raise — partial update is valid; validation deferred.
+    # Static checks pass (INTERVAL=4 valid, BYHOUR=13 in [0,23]).
+    # dateutil-with-dtstart deferred to executor.
     assert parsed.recurrence_rule == "FREQ=HOURLY;INTERVAL=4;BYHOUR=13"
+
+
+@pytest.mark.parametrize("bad_rrule", [
+    "FREQ=DAILY;INTERVAL=0",       # static range — INTERVAL≥1
+    "FREQ=DAILY;COUNT=0",          # static range — COUNT≥1
+    "FREQ=DAILY;BYHOUR=99",        # static range — BYHOUR≤23
+    "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30",  # cross-param feasibility
+])
+def test_update_reminder_input_partial_rrule_rejects_static_bad(bad_rrule) -> None:
+    """Codex R5 MAJOR #1 critical regression: partial updates must
+    surface obvious RRULE errors at planner-input time even without
+    trigger_iso. Previously these slipped through to runtime."""
+    with pytest.raises(ValidationError):
+        UpdateReminderInput.model_validate({
+            "reminder_id": REM_A,
+            "recurrence_rule": bad_rrule,
+        })
+
+
+def test_schedule_reminder_rejects_byomonth_byomonthday_infeasible() -> None:
+    """Codex R5 MAJOR #3: ``FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30`` —
+    Feb has 28-29 days, recurrence never fires. Accept-at-schema /
+    never-schedule is a production bug for reminders. Caught at
+    planner-input time."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30",
+        })
+
+
+def test_schedule_reminder_accepts_byomonth_byomonthday_feasible() -> None:
+    """``BYMONTH=2;BYMONTHDAY=29`` — Feb 29 exists in leap years; the
+    leap-tolerant feasibility check accepts since «at least one year
+    fires» suffices for recurring reminders."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29",
+    })
+    assert "BYMONTHDAY=29" in parsed.recurrence_rule
+
+
+def test_schedule_reminder_rejects_multi_month_all_too_short() -> None:
+    """``BYMONTH=4,6,9;BYMONTHDAY=31`` — Apr/Jun/Sep all have 30
+    days. Recurrence never fires."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "FREQ=YEARLY;BYMONTH=4,6,9;BYMONTHDAY=31",
+        })
+
+
+def test_schedule_reminder_accepts_multi_month_at_least_one_fits() -> None:
+    """``BYMONTH=2,3;BYMONTHDAY=30`` — Feb doesn't fit but Mar does;
+    feasibility check accepts since at least one combo works."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": "FREQ=YEARLY;BYMONTH=2,3;BYMONTHDAY=30",
+    })
+    assert parsed.recurrence_rule == "FREQ=YEARLY;BYMONTH=2,3;BYMONTHDAY=30"
+
+
+def test_schedule_reminder_accepts_negative_bymonthday_with_short_month() -> None:
+    """``BYMONTH=2;BYMONTHDAY=-1`` («last day of February») is always
+    feasible — every month has at least 28 days. Negative day
+    semantics skip feasibility check by design."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-1",
+    })
+    assert "BYMONTHDAY=-1" in parsed.recurrence_rule
+
+
+def test_update_reminder_input_documents_executor_contract() -> None:
+    """Codex R5 MAJOR #2: schema-side validation defers dtstart-aware
+    checks to the executor for partial-update-of-rrule. The contract
+    is documented as a private ``_executor_validation_contract``
+    attribute (pydantic wraps it as ``ModelPrivateAttr``) so future
+    Phase B work has a single anchor for the rule."""
+    contract_attr = UpdateReminderInput._executor_validation_contract
+    contract = (
+        contract_attr.default if hasattr(contract_attr, "default")
+        else contract_attr
+    )
+    assert "fetch persisted trigger_iso" in contract.lower()
+    assert "validate_rrule_with_trigger" in contract
 
 
 def test_update_reminder_input_full_update_validates_rrule_with_trigger() -> None:

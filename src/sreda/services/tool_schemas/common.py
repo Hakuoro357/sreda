@@ -50,22 +50,44 @@ def _validate_iso_datetime_string(value: str) -> str:
     return value  # return original string; runtime owns UTC normalization
 
 
-def validate_rrule_with_trigger(rrule_str: str, trigger_iso: str) -> None:
-    """Codex Sub-A4 reminders R3 MINOR #2 + R4 MAJOR #1 — full RRULE
-    validation that uses the ACTUAL ``trigger_iso`` as the dtstart for
-    ``dateutil.rrulestr``. The alias-level R3 version used a fixed
-    dummy dtstart (``2026-01-01T00:00:00Z``) which would false-reject
-    legitimate RRULEs like ``FREQ=HOURLY;INTERVAL=4;BYHOUR=13`` whose
-    validity depends on the dtstart's hour component.
+def validate_rrule_static(rrule_str: str) -> None:
+    """Codex Sub-A4 reminders R5 MAJOR #1 — dtstart-independent RRULE
+    checks that run on ANY non-ref recurrence_rule, including partial
+    updates that don't carry trigger_iso.
 
-    Also explicitly checks Codex R4 MAJOR #2 numeric ranges that
-    ``dateutil`` parses without complaint but that would cause runtime
-    hang / division-by-zero / non-progressing recurrence:
-      - ``INTERVAL >= 1``
-      - ``COUNT >= 1``
-      - ``BYHOUR ∈ [0, 23]`` / ``BYMINUTE ∈ [0, 59]`` /
-        ``BYSECOND ∈ [0, 59]`` (range checks)
-      - ``BYMONTH ∈ [1, 12]`` / ``BYMONTHDAY ∈ [-31, -1] ∪ [1, 31]``
+    Checks:
+    1. Numeric ranges (INTERVAL≥1, COUNT≥1, BYHOUR/BYMINUTE/BYSECOND
+       bounds, BYMONTH/BYMONTHDAY bounds) — dateutil parses these
+       without bounds-checking so we enforce explicitly.
+    2. Cross-param feasibility for BYMONTH + BYMONTHDAY (Codex R5
+       MAJOR #3) — ``FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30`` would never
+       fire (Feb has 28-29 days); accept-at-schema, never-schedule
+       is a production bug for reminders.
+
+    Skipped for ``${...}`` refs (planner validator defers refs-
+    present paths to execute time).
+    """
+    if _is_ref(rrule_str):
+        return
+    params = _parse_rrule_int_params(rrule_str)
+    _check_rrule_numeric_ranges(params)
+    _check_month_day_feasibility(params)
+
+
+def validate_rrule_with_trigger(rrule_str: str, trigger_iso: str) -> None:
+    """Codex Sub-A4 reminders R3 MINOR #2 + R4 MAJOR #1 + R5 MAJOR #1
+    — full RRULE validation including dateutil parse with the ACTUAL
+    ``trigger_iso`` as dtstart.
+
+    Runs in this order:
+    1. ``validate_rrule_static(rrule_str)`` — numeric ranges +
+       cross-param feasibility. Pure RRULE checks that don't need
+       dtstart. (Also reachable directly from partial-update paths.)
+    2. ``dateutil.rrulestr(rrule_str, dtstart=trigger_iso)`` — full
+       RFC-5545 grammar with the planner-supplied dtstart. Catches
+       rules whose validity depends on the dtstart's hour/minute
+       components (e.g. ``FREQ=HOURLY;BYHOUR=13`` must align with
+       dtstart's hour to fire at all).
 
     Called from the ``@model_validator`` on ``ScheduleReminderInput``
     and ``UpdateReminderInput`` where both ``recurrence_rule`` and
@@ -78,7 +100,10 @@ def validate_rrule_with_trigger(rrule_str: str, trigger_iso: str) -> None:
     if _is_ref(rrule_str) or _is_ref(trigger_iso):
         return  # deferred — executor validates after refs resolve
 
-    # First parse with the actual trigger_iso as dtstart.
+    # STEP 1 — dtstart-independent checks (numeric ranges + feasibility).
+    validate_rrule_static(rrule_str)
+
+    # STEP 2 — full dateutil parse with the actual dtstart.
     from dateutil.rrule import rrulestr  # lazy import — heavy module
     candidate = (
         trigger_iso.replace("Z", "+00:00")
@@ -94,13 +119,6 @@ def validate_rrule_with_trigger(rrule_str: str, trigger_iso: str) -> None:
         rrulestr(rrule_str, dtstart=dtstart)
     except (ValueError, KeyError, TypeError) as exc:
         raise ValueError(f"invalid RRULE: {exc}") from exc
-
-    # Explicit numeric-range checks. dateutil parses these values into
-    # ints without bounds-checking — INTERVAL=0 would hang at iteration
-    # rather than fail at construction. Source:
-    # https://dateutil.readthedocs.io/en/stable/_modules/dateutil/rrule.html
-    params: dict[str, list[int]] = _parse_rrule_int_params(rrule_str)
-    _check_rrule_numeric_ranges(params)
 
 
 def _is_ref(value: str) -> bool:
@@ -169,6 +187,58 @@ def _check_rrule_numeric_ranges(params: dict[str, list[int]]) -> None:
                     f"BYMONTHDAY must be in [-31, -1] ∪ [1, 31] "
                     f"(got BYMONTHDAY={v}; zero invalid per RFC-5545)"
                 )
+
+
+# Maximum days for each month (leap-friendly: Feb caps at 29 because
+# recurring rules span multiple years and we want at least ONE year
+# where the combo fires).
+_MONTH_MAX_DAY = {
+    1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
+    7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31,
+}
+
+
+def _check_month_day_feasibility(params: dict[str, list[int]]) -> None:
+    """Codex Sub-A4 reminders R5 MAJOR #3 — cross-param impossibility
+    check for ``BYMONTH`` + ``BYMONTHDAY`` combinations.
+
+    Example impossible combos:
+      - ``FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30`` — Feb has 28-29 days
+      - ``FREQ=YEARLY;BYMONTH=4,6;BYMONTHDAY=31`` — Apr/Jun have 30
+
+    «Accepted but never schedulable» is a production bug for
+    reminders — the proactive worker would scan forever and never
+    fire. Catch at planner-input time.
+
+    Rule: at least ONE (BYMONTH, BYMONTHDAY) pair must be feasible,
+    i.e. there exists a month in BYMONTH whose max-day is ≥ the
+    absolute BYMONTHDAY value. Feb caps at 29 (leap-tolerant — we
+    only need ONE year where the recurrence can fire).
+
+    Negative BYMONTHDAY (e.g. -1 = last day) is always feasible because
+    every month has at least 28 days; skip the check.
+
+    Only fires when BOTH BYMONTH and BYMONTHDAY are present.
+    """
+    if "BYMONTH" not in params or "BYMONTHDAY" not in params:
+        return
+    months = params["BYMONTH"]
+    days = params["BYMONTHDAY"]
+    # Negative BYMONTHDAY counts from end-of-month — always feasible
+    # (every month has at least 28 days, so -1..-28 always fire).
+    if any(d > 0 for d in days):
+        positive_days = [d for d in days if d > 0]
+        max_day_available = max(
+            _MONTH_MAX_DAY.get(m, 31) for m in months
+        )
+        min_required = min(positive_days)
+        if max_day_available < min_required:
+            raise ValueError(
+                f"BYMONTH={months} + BYMONTHDAY={days} is infeasible: "
+                f"the largest selected month has {max_day_available} days, "
+                f"smallest selected day-of-month is {min_required}. "
+                f"Recurrence would never fire. Re-check months/days."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -434,5 +504,6 @@ __all__ = [
     "ShortStr",
     "TaskId",
     "TriggerIso",
+    "validate_rrule_static",
     "validate_rrule_with_trigger",
 ]

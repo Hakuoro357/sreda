@@ -44,6 +44,7 @@ from sreda.services.tool_schemas.common import (
     ReminderId,
     ShortStr,
     TriggerIso,
+    validate_rrule_static,
     validate_rrule_with_trigger,
 )
 from sreda.services.tool_schemas.housewife import (
@@ -138,21 +139,58 @@ class UpdateReminderInput(BaseModel):
     clear_recurrence: Literal[True] | None = None
 
     @model_validator(mode="after")
-    def _validate_rrule_against_trigger(self) -> "UpdateReminderInput":
-        # Codex Sub-A4 reminders R4 MAJOR #1 + #2 — see
-        # ScheduleReminderInput for full context. The update path
-        # only validates when BOTH recurrence_rule AND trigger_iso
-        # are provided in the same call; partial updates that change
-        # one without the other defer dateutil validation to execute
-        # time where the runtime fetches the persisted dtstart.
-        if (
-            self.recurrence_rule is not None
-            and self.trigger_iso is not None
-        ):
+    def _validate_rrule(self) -> "UpdateReminderInput":
+        # Codex Sub-A4 reminders R4 MAJOR #1+#2 + R5 MAJOR #1:
+        # split validation into static (always runs) + dtstart-aware
+        # (only when trigger_iso present).
+        if self.recurrence_rule is None:
+            return self
+        # STEP 1 — dtstart-independent checks ALWAYS run for any
+        # non-ref recurrence_rule. Closes R5 MAJOR #1: previously a
+        # partial update {recurrence_rule: "FREQ=DAILY;INTERVAL=0"}
+        # alone would pass because range checks lived inside
+        # validate_rrule_with_trigger which skipped when trigger_iso
+        # was None.
+        validate_rrule_static(self.recurrence_rule)
+        # STEP 2 — dtstart-aware checks only when both fields present.
+        # Partial-update-of-rrule-only defers dtstart validation to
+        # the executor's update path, which MUST fetch persisted
+        # trigger_iso and re-validate the effective pair before
+        # writing (Codex R5 MAJOR #2 — Phase B executor contract;
+        # documented on `_executor_validation_contract` below).
+        if self.trigger_iso is not None:
             validate_rrule_with_trigger(
                 self.recurrence_rule, self.trigger_iso
             )
         return self
+
+    # Codex Sub-A4 reminders R5 MAJOR #2 — executor contract for
+    # partial updates.
+    #
+    # The schema layer cannot know the persisted trigger_iso for an
+    # existing reminder. When the planner sends only
+    # ``recurrence_rule`` (without trigger_iso), schema-side validation
+    # does the dtstart-independent checks (validate_rrule_static)
+    # and DEFERS the dtstart-aware dateutil parse to the executor.
+    #
+    # Phase B executor MUST, before writing to housewife_reminders:
+    # 1. Fetch the persisted reminder row to get its current
+    #    trigger_at.
+    # 2. Compute the effective pair:
+    #       effective_rrule    = new.recurrence_rule or persisted_rule
+    #       effective_trigger  = new.trigger_iso   or persisted_trigger
+    # 3. Call ``validate_rrule_with_trigger(effective_rrule,
+    #    effective_trigger.isoformat())`` and abort on ValueError.
+    # 4. Only then persist the update.
+    #
+    # This closes the «recurrence persisted without dtstart check»
+    # class. See ``housewife_reminders.py:update`` for the integration
+    # point — Phase B adds the validation call there.
+    _executor_validation_contract = (
+        "Partial update with recurrence_rule only: executor MUST fetch "
+        "persisted trigger_iso and run validate_rrule_with_trigger "
+        "before writing. See class docstring above."
+    )
 
 
 class CancelReminderInput(BaseModel):
