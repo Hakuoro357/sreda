@@ -91,22 +91,39 @@ def render_family_header(family: Family, tool_count: int) -> str:
 
 
 def _format_tool_line(spec: ToolSpec) -> str:
-    """One-line summary of a ToolSpec for the family body.
+    """Tool-block render for the planner-facing family body.
 
-    Format: ``<name>(<short args summary>) — <description first line>``
+    Format (Sub-A-77 item #6 — extended with trigger examples and
+    mutex notes):
+
+    ```
+      <name>(<args>) — <description first line>
+        Примеры: «купи молоко», «добавь хлеб», «нужно купить картошки»
+        ⚠ <mutex_note_1>
+        ⚠ <mutex_note_2>
+    ```
 
     Args summary is intentionally short — the planner gets the full
     input schema from the JSON-Schema in the structured-output contract
     (Sub-B1 ``response_format``). This text registry is for fast
-    semantic routing ("which family / tool fits this user message?"),
-    not exhaustive parameter docs.
+    semantic routing.
+
+    Trigger examples are listed inline (comma-separated, «-quoted) so
+    the LLM sees the lexical patterns immediately under the tool name.
+    Mutex notes get the ``⚠`` marker (mirrors family-level anti-pattern
+    style) and only render when explicitly populated.
     """
 
-    # ``description`` may contain multi-line content; keep only the
-    # first line for the registry text to stay compact.
     summary = spec.description.splitlines()[0].strip()
     args_hint = _summarize_input_model(spec)
-    return f"  {spec.name}({args_hint}) — {summary}"
+    lines = [f"  {spec.name}({args_hint}) — {summary}"]
+    triggers = list(spec.trigger_examples)
+    if triggers:
+        quoted = ", ".join(f"«{t}»" for t in triggers)
+        lines.append(f"    Примеры: {quoted}")
+    for note in spec.mutex_notes:
+        lines.append(f"    ⚠ {note}")
+    return "\n".join(lines)
 
 
 def _summarize_input_model(spec: ToolSpec) -> str:

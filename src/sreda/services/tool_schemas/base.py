@@ -22,6 +22,7 @@ Invariants enforced here at construction time:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -154,6 +155,21 @@ pydantic cannot fully introspect as field types in v2).
 """
 
 
+# Russian-infinitive verb-start check for ToolSpec.description.
+# Required infinitive endings: -ть, -ться, -ти, -чь (covers
+# «добавить», «отметиться», «найти», «беречь»). Sub-A-77 item #6:
+# planner-facing descriptions must START with an infinitive verb +
+# concrete noun object — measurably improves planner tool selection
+# vs ambiguous third-person/abstract openings.
+_RUSSIAN_INFINITIVE_FIRST_WORD = re.compile(
+    r"^[А-ЯЁA-Z][А-ЯЁA-Zа-яёa-z\-]*?(?:ть|ться|ти|чь)\b"
+)
+"""Matches a Russian capitalised first word that ends in an infinitive
+suffix. ``A-Z`` included so transliterated tool descriptions don't
+falsely trip (no real description should be Latin-only, but defensive).
+"""
+
+
 class ToolOutput(BaseModel):
     """Base for tool output schemas.
 
@@ -222,6 +238,35 @@ class ToolSpec(BaseModel):
     input_model: type[BaseModel]
     output_model: Any  # Annotated[Union[...], Field(discriminator='status')]
     outcome_examples: list[dict[str, Any]] = Field(default_factory=list)
+    trigger_examples: list[str] = Field(default_factory=list)
+    """Typical user phrases that should route to this tool (3-10 short
+    Russian utterances). Used in the planner system prompt to teach
+    the LLM lexical patterns that map onto this tool. Sub-A-77 item #6.
+
+    Examples: ``["купи молоко и хлеб", "добавь в покупки яйца",
+    "надо купить картошки"]``.
+
+    Validation: must be ≥3 items, each non-empty after strip.
+    Empty by default for backward-compat (existing test fixtures, the
+    Sub-A4 migration adds real values).
+
+    Why ≥3: covers the «typical», «slight rewording», «follow-up»
+    cases — single-example schemas don't teach the LLM the variation
+    space (Codex E-14 — few-shot examples are most useful in clusters).
+    """
+    mutex_notes: list[str] = Field(default_factory=list)
+    """Optional short notes for disambiguation with close-sibling
+    tools (Codex E-15). Each note ≤200 chars, format:
+    ``«⚠ Используй ТОЛЬКО для X. Для Y — sibling_tool_name.»``.
+
+    Example for ``mark_shopping_bought``:
+    ``["Используй ТОЛЬКО для купленных. Для удаления/коррекции — remove_shopping_items."]``
+
+    Apply ONLY to tool families with close siblings that the planner
+    routinely confuses (mark/remove, complete/cancel/delete). Most
+    standalone tools should leave this empty — overpopulating it
+    bloats the prompt and dilutes attention.
+    """
     allow_field_validators: bool = False
     """Opt-in escape hatch for ``input_model`` with ``@field_validator``
     decorators (Codex Sub-A-77 item #4 R6 MAJOR #1).
@@ -246,6 +291,46 @@ class ToolSpec(BaseModel):
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> ToolSpec:
+        # Sub-A-77 item #6: planner-facing description shape.
+        # Description ≥80 chars + starts with a Russian infinitive verb.
+        # SOFT defaults (no enforcement) when the description is short
+        # — placeholder-style ``"Test spec for X"`` used in fixtures
+        # stays valid. Production tools fill via _enforce_description_quality.
+        if len(self.description.strip()) >= 80 and not _RUSSIAN_INFINITIVE_FIRST_WORD.match(
+            self.description
+        ):
+            raise ValueError(
+                f"Tool '{self.name}' description must start with a Russian "
+                f"infinitive verb (-ть / -ться / -ти / -чь): «Добавить...», "
+                f"«Найти...», «Отметить...». Got: {self.description[:60]!r}. "
+                f"Planner LLM picks tools better when the first word is the "
+                f"action verb."
+            )
+        if self.trigger_examples:
+            if len(self.trigger_examples) < 3:
+                raise ValueError(
+                    f"Tool '{self.name}' trigger_examples has "
+                    f"{len(self.trigger_examples)} item(s) — need ≥3 to "
+                    f"teach the planner the variation space. Add typical + "
+                    f"slight rewording + follow-up examples."
+                )
+            for example in self.trigger_examples:
+                if not example.strip():
+                    raise ValueError(
+                        f"Tool '{self.name}' has empty/blank trigger_example. "
+                        f"Each example must be a non-empty user phrase."
+                    )
+        for note in self.mutex_notes:
+            if not note.strip():
+                raise ValueError(
+                    f"Tool '{self.name}' has empty/blank mutex_note."
+                )
+            if len(note) > 200:
+                raise ValueError(
+                    f"Tool '{self.name}' mutex_note {note!r} exceeds 200 "
+                    f"chars. Keep disambiguation notes terse — long notes "
+                    f"dilute planner attention."
+                )
         if self.effect == "write" and not self.write_domains:
             raise ValueError(
                 f"Tool '{self.name}' has effect='write' but write_domains "

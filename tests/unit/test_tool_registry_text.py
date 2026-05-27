@@ -446,6 +446,68 @@ def test_tool_spec_without_family_surfaces_in_unfamilied_block() -> None:
     assert "unassigned_tool" in text
 
 
+# ---------------------------------------------------------------------------
+# Sub-A-77 item #6 — trigger_examples + mutex_notes rendering
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_examples_render_inline_with_quotes() -> None:
+    """Trigger examples appear as a single «Примеры:» line with each
+    example «-quoted and comma-separated."""
+    specs = [_spec(
+        "add_shopping_items", "shopping", effect="write",
+        description="Добавить продукты в список покупок.",
+    )]
+    specs[0] = specs[0].model_copy(update={
+        "trigger_examples": [
+            "купи молоко и хлеб",
+            "добавь в покупки яйца",
+            "нужно купить картошки",
+        ],
+    })
+    text = render_registry_for_planner(specs)
+    assert "Примеры:" in text
+    assert "«купи молоко и хлеб»" in text
+    assert "«добавь в покупки яйца»" in text
+    assert "«нужно купить картошки»" in text
+
+
+def test_mutex_notes_render_with_warning_marker() -> None:
+    spec = _spec("mark_shopping_bought", "shopping", effect="write",
+                 description="Отметить продукт как купленный.")
+    spec = spec.model_copy(update={
+        "mutex_notes": [
+            "Используй ТОЛЬКО для купленных. Для удаления — remove_shopping_items.",
+        ],
+    })
+    text = render_registry_for_planner([spec])
+    # Mutex notes share the ⚠ warning marker with family anti-patterns.
+    assert "⚠" in text
+    assert "remove_shopping_items" in text
+
+
+def test_tool_without_trigger_examples_renders_normally() -> None:
+    """Tools with no trigger_examples (default empty list) render as
+    the legacy 1-line summary — no «Примеры:» line and no tool-level
+    ⚠ marker (family-level ⚠ in the header is independent)."""
+    specs = [_spec("legacy_tool", "shopping")]
+    text = render_registry_for_planner(specs)
+    assert "Примеры:" not in text
+    # Tool-level lines start with 2-space indent + tool name; check that
+    # neither the tool line nor any line under it (4-space indent —
+    # mutex_notes / examples) contains a ⚠.
+    tool_lines = [
+        line for line in text.splitlines()
+        if line.startswith("  legacy_tool") or line.startswith("    ")
+    ]
+    assert tool_lines  # sanity — tool line present
+    for line in tool_lines:
+        assert "⚠" not in line, (
+            f"Tool line should not have ⚠ marker without mutex_notes: "
+            f"{line!r}"
+        )
+
+
 def test_tool_spec_without_family_does_not_pollute_known_families() -> None:
     # An untyped tool should not accidentally land in the shopping block.
     spec_no_family = ToolSpec(  # type: ignore[arg-type]
