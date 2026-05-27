@@ -975,3 +975,198 @@ def test_clarification_required_fields_covers_allowlist() -> None:
         f"must equal CLARIFICATION_TEMPLATE_IDS {sorted(CLARIFICATION_TEMPLATE_IDS)}. "
         f"Add a (possibly-empty) entry when extending the allowlist."
     )
+
+
+def test_clarification_optional_str_list_fields_covers_allowlist() -> None:
+    """Codex R4 MAJOR — _TEMPLATE_OPTIONAL_STR_LIST_FIELDS same
+    coverage invariant: every CLARIFICATION_TEMPLATE_IDS member
+    needs an explicit entry (even if empty)."""
+    from sreda.runtime.planner.schemas import (
+        CLARIFICATION_TEMPLATE_IDS,
+        _TEMPLATE_OPTIONAL_STR_LIST_FIELDS,
+    )
+    assert (
+        set(_TEMPLATE_OPTIONAL_STR_LIST_FIELDS.keys())
+        == CLARIFICATION_TEMPLATE_IDS
+    ), (
+        f"_TEMPLATE_OPTIONAL_STR_LIST_FIELDS keys "
+        f"{sorted(_TEMPLATE_OPTIONAL_STR_LIST_FIELDS.keys())} must equal "
+        f"CLARIFICATION_TEMPLATE_IDS {sorted(CLARIFICATION_TEMPLATE_IDS)}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 follow-ups — optional list-of-strings field type checks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        1,
+        True,
+        "time",  # string, not list-of-string
+        {"time": True},  # dict
+        42.5,
+    ],
+    ids=["int", "bool", "string", "dict", "float"],
+)
+def test_plan_missing_fields_non_list_rejected(bad_value) -> None:
+    """Codex R4 MAJOR — ``missing_fields`` must be a list/tuple if
+    present. Non-iterable or wrong-iterable type → schema-valid plan
+    that crashes render or produces garbage (e.g. iterating string
+    yields per-character bullets)."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="не указано время",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_user_for_clarification",
+                template_data={"missing_fields": bad_value},
+            ),
+        )
+    assert "missing_fields" in str(exc.value)
+
+
+def test_plan_missing_fields_non_string_element_rejected() -> None:
+    """List shape is right but element types wrong — must catch."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="что-то неясное",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_user_for_clarification",
+                template_data={"missing_fields": ["time", 42, "items"]},
+            ),
+        )
+    msg = str(exc.value)
+    assert "missing_fields" in msg
+    # Index of bad element surfaced for diagnostic clarity.
+    assert "[1]" in msg
+
+
+def test_plan_missing_fields_blank_element_rejected() -> None:
+    """Blank string element invalid — would render an empty bullet line."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="неясно",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_user_for_clarification",
+                template_data={"missing_fields": ["time", "   "]},
+            ),
+        )
+    assert "missing_fields" in str(exc.value)
+
+
+def test_plan_missing_fields_valid_list_accepted() -> None:
+    """Sanity — proper list[str] of non-blank values goes through."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={"missing_fields": ["time", "recipient"]},
+        ),
+    )
+    assert plan.compose.template_data["missing_fields"] == ["time", "recipient"]
+
+
+def test_plan_missing_fields_tuple_also_accepted() -> None:
+    """Tuple is a valid Sequence — accept it too. Some planner
+    output paths may emit tuples (e.g. through pydantic coercion)."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={"missing_fields": ("time", "recipient")},
+        ),
+    )
+    # Persisted as the tuple caller gave us; renderer iterates either way.
+    assert tuple(plan.compose.template_data["missing_fields"]) == (
+        "time",
+        "recipient",
+    )
+
+
+def test_plan_missing_fields_omitted_no_check() -> None:
+    """Optional — absence is fine. Template falls back to generic
+    «Скажи чуть подробнее»."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="что-то неясное",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={},
+        ),
+    )
+    assert "missing_fields" not in plan.compose.template_data
+
+
+def test_plan_partial_with_clarification_missing_fields_validated_too() -> None:
+    """Same check fires for partial_with_clarification — both templates
+    iterate missing_fields the same way."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="нужно ещё уточнить",
+            actions={
+                "s1": Action(
+                    tool="add_shopping_items",
+                    args={"items": ["хлеб"]},
+                    expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+                ),
+            },
+            compose=ComposerCall(
+                kind="template",
+                template_id="partial_with_clarification",
+                template_data={
+                    "done_summary": "записала хлеб",
+                    "missing_fields": "time",  # string, not list
+                },
+            ),
+        )
+    assert "missing_fields" in str(exc.value)
+
+
+def test_plan_ask_when_to_remind_missing_fields_not_checked() -> None:
+    """ask_when_to_remind has empty entry in
+    _TEMPLATE_OPTIONAL_STR_LIST_FIELDS — passing a weird
+    missing_fields value is harmless because template doesn't use
+    it. Validator should NOT reject."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_when_to_remind",
+            template_data={
+                "what": "позвонить врачу",
+                "missing_fields": 42,  # weird, but template doesn't use it
+            },
+        ),
+    )
+    # No exception — template_data preserved verbatim.
+    assert plan.compose.template_data["missing_fields"] == 42

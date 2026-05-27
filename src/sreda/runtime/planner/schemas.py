@@ -110,6 +110,32 @@ place to update — CI tests assert per-template happy paths in
 """
 
 
+_TEMPLATE_OPTIONAL_STR_LIST_FIELDS: dict[str, frozenset[str]] = {
+    # Both templates iterate ``missing_fields`` and call ``|length`` —
+    # ``missing_fields=1`` or ``"time"`` would crash with TypeError at
+    # render time. Codex Sub-A-77 #2 R4 MAJOR.
+    "ask_user_for_clarification": frozenset({"missing_fields"}),
+    "partial_with_clarification": frozenset({"missing_fields"}),
+    # ``ask_when_to_remind`` doesn't use any list-shaped variables.
+    "ask_when_to_remind": frozenset(),
+}
+"""For each clarification template, OPTIONAL keys that — IF present
+in ``compose.template_data`` — must be ``list[str]`` / ``tuple[str]``
+of non-blank strings.
+
+Same coverage invariant as ``_TEMPLATE_REQUIRED_FIELDS``: every
+template in the allowlist must have an explicit entry (even if
+empty) so the ``.get(..., frozenset())`` default can't silently
+pass an unknown future template.
+
+Codex Sub-A-77 #2 R4 MAJOR — without this check, ``missing_fields=1``,
+``missing_fields=True``, ``missing_fields="time"``, ``missing_fields={...}``
+all pass the schema but crash Jinja at render time (``|length`` /
+``for in`` fail on non-iterable or string-iteration produces garbage
+single-char bullets).
+"""
+
+
 def _is_non_blank_string(value: object) -> bool:
     """True iff ``value`` is a ``str`` AND has at least one non-whitespace
     character.
@@ -352,6 +378,36 @@ class Plan(BaseModel):
                         f"for renderer. Got: {value!r} (type "
                         f"{type(value).__name__})."
                     )
+            # Codex R4 MAJOR — optional list-of-strings fields.
+            # If present in template_data, must be list/tuple of
+            # non-blank strings. Templates use ``|length`` and ``for``
+            # over them; non-iterable / wrong-element-type would
+            # either crash render or produce garbage output (e.g.
+            # iterating a string yields single chars).
+            optional_str_lists = _TEMPLATE_OPTIONAL_STR_LIST_FIELDS.get(
+                self.compose.template_id, frozenset()
+            )
+            for field_name in optional_str_lists:
+                if field_name not in self.compose.template_data:
+                    continue
+                value = self.compose.template_data[field_name]
+                if not isinstance(value, (list, tuple)):
+                    raise ValueError(
+                        f"Plan compose.template_id="
+                        f"{self.compose.template_id!r} "
+                        f"template_data[{field_name!r}] must be a "
+                        f"list/tuple of non-blank strings when present. "
+                        f"Got: {value!r} (type {type(value).__name__})."
+                    )
+                for i, item in enumerate(value):
+                    if not _is_non_blank_string(item):
+                        raise ValueError(
+                            f"Plan compose.template_id="
+                            f"{self.compose.template_id!r} "
+                            f"template_data[{field_name!r}][{i}] "
+                            f"must be a non-blank string. Got: "
+                            f"{item!r} (type {type(item).__name__})."
+                        )
         return self
 
     @model_validator(mode="after")
