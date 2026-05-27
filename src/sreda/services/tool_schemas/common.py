@@ -27,7 +27,7 @@ Sources of truth for the exact caps and shapes:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Annotated
 
 from pydantic import AfterValidator, StringConstraints
@@ -50,28 +50,125 @@ def _validate_iso_datetime_string(value: str) -> str:
     return value  # return original string; runtime owns UTC normalization
 
 
-def _validate_rrule_string(value: str) -> str:
-    """Codex Sub-A4 reminders R3 MINOR #2 — verify the RRULE string
-    parses successfully via ``dateutil.rrulestr``. Catches malformed
-    parameter values like ``FREQ=DAILY;COUNT=abc`` or
-    ``FREQ=WEEKLY;BYDAY=XX`` that pass the coarse ``;KEY=VALUE``
-    pattern but fail downstream at runtime.
+def validate_rrule_with_trigger(rrule_str: str, trigger_iso: str) -> None:
+    """Codex Sub-A4 reminders R3 MINOR #2 + R4 MAJOR #1 — full RRULE
+    validation that uses the ACTUAL ``trigger_iso`` as the dtstart for
+    ``dateutil.rrulestr``. The alias-level R3 version used a fixed
+    dummy dtstart (``2026-01-01T00:00:00Z``) which would false-reject
+    legitimate RRULEs like ``FREQ=HOURLY;INTERVAL=4;BYHOUR=13`` whose
+    validity depends on the dtstart's hour component.
 
-    Needs a dummy ``dtstart`` because ``rrulestr`` requires one to
-    construct the rule, but the value isn't used for validation
-    semantics — just for parse success.
+    Also explicitly checks Codex R4 MAJOR #2 numeric ranges that
+    ``dateutil`` parses without complaint but that would cause runtime
+    hang / division-by-zero / non-progressing recurrence:
+      - ``INTERVAL >= 1``
+      - ``COUNT >= 1``
+      - ``BYHOUR ∈ [0, 23]`` / ``BYMINUTE ∈ [0, 59]`` /
+        ``BYSECOND ∈ [0, 59]`` (range checks)
+      - ``BYMONTH ∈ [1, 12]`` / ``BYMONTHDAY ∈ [-31, -1] ∪ [1, 31]``
 
-    Re-raises ``ValueError`` on failure; pydantic catches and emits
-    a ``ValidationError``.
+    Called from the ``@model_validator`` on ``ScheduleReminderInput``
+    and ``UpdateReminderInput`` where both ``recurrence_rule`` and
+    ``trigger_iso`` are available together. Re-raises ``ValueError``
+    on failure; pydantic catches and emits ``ValidationError``.
+
+    Skips entirely if either value is a ``${...}`` ref — the planner
+    validator defers refs-present paths to execute time.
     """
+    if _is_ref(rrule_str) or _is_ref(trigger_iso):
+        return  # deferred — executor validates after refs resolve
+
+    # First parse with the actual trigger_iso as dtstart.
     from dateutil.rrule import rrulestr  # lazy import — heavy module
+    candidate = (
+        trigger_iso.replace("Z", "+00:00")
+        if trigger_iso.endswith("Z") else trigger_iso
+    )
     try:
-        rrulestr(value, dtstart=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        dtstart = datetime.fromisoformat(candidate)
+    except ValueError:
+        # If trigger_iso doesn't parse, the dedicated TriggerIso
+        # validator already raised. Skip here to avoid double-report.
+        return  # pragma: no cover
+    try:
+        rrulestr(rrule_str, dtstart=dtstart)
     except (ValueError, KeyError, TypeError) as exc:
-        # rrulestr can raise multiple types depending on the failure;
-        # normalize to ValueError so pydantic surfaces a clean error.
         raise ValueError(f"invalid RRULE: {exc}") from exc
-    return value
+
+    # Explicit numeric-range checks. dateutil parses these values into
+    # ints without bounds-checking — INTERVAL=0 would hang at iteration
+    # rather than fail at construction. Source:
+    # https://dateutil.readthedocs.io/en/stable/_modules/dateutil/rrule.html
+    params: dict[str, list[int]] = _parse_rrule_int_params(rrule_str)
+    _check_rrule_numeric_ranges(params)
+
+
+def _is_ref(value: str) -> bool:
+    """Loose check for plan-time ``${...}`` reference placeholders."""
+    return value.startswith("${") and value.endswith("}")
+
+
+def _parse_rrule_int_params(rrule_str: str) -> dict[str, list[int]]:
+    """Extract integer params from an RRULE string. Returns
+    ``{KEY: [int, ...]}`` for the params we range-check.
+
+    Tolerates non-integer values (e.g. ``BYDAY=MO,TU``) by skipping
+    them — only collects keys whose values parse as int(s).
+    """
+    out: dict[str, list[int]] = {}
+    # Drop the FREQ= prefix; iterate the rest.
+    parts = rrule_str.split(";")
+    for part in parts[1:]:  # skip FREQ=
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        ints: list[int] = []
+        for token in value.split(","):
+            token = token.strip()
+            try:
+                ints.append(int(token))
+            except ValueError:
+                # Token like "MO" or "1MO" — not a pure int; skip.
+                # BYDAY may have "1MO" / "-1FR" forms — those go
+                # through dateutil's grammar and bypass range check.
+                continue
+        if ints:
+            out[key] = ints
+    return out
+
+
+_RRULE_RANGE_CHECKS = {
+    "INTERVAL": (1, None, "INTERVAL must be ≥ 1 (zero/negative produces non-progressing recurrence)"),
+    "COUNT":    (1, None, "COUNT must be ≥ 1 (zero produces empty recurrence)"),
+    "BYHOUR":   (0, 23,   "BYHOUR must be in [0, 23]"),
+    "BYMINUTE": (0, 59,   "BYMINUTE must be in [0, 59]"),
+    "BYSECOND": (0, 59,   "BYSECOND must be in [0, 59]"),
+    "BYMONTH":  (1, 12,   "BYMONTH must be in [1, 12]"),
+}
+
+
+def _check_rrule_numeric_ranges(params: dict[str, list[int]]) -> None:
+    """Codex Sub-A4 reminders R4 MAJOR #2 — RFC-5545 numeric range
+    enforcement. dateutil parses int values without bounds-checking;
+    values like ``INTERVAL=0`` would hang at iteration rather than
+    fail at construction. Raise ValueError eagerly here.
+
+    BYMONTHDAY allows negative values for «N days from end of month»
+    (RFC-5545); range is ``[-31, -1] ∪ [1, 31]``. Handled separately.
+    """
+    for key, (low, high, message) in _RRULE_RANGE_CHECKS.items():
+        if key not in params:
+            continue
+        for v in params[key]:
+            if v < low or (high is not None and v > high):
+                raise ValueError(f"{message} (got {key}={v})")
+    if "BYMONTHDAY" in params:
+        for v in params["BYMONTHDAY"]:
+            if v == 0 or v < -31 or v > 31:
+                raise ValueError(
+                    f"BYMONTHDAY must be in [-31, -1] ∪ [1, 31] "
+                    f"(got BYMONTHDAY={v}; zero invalid per RFC-5545)"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +394,15 @@ RecurrenceRule = Annotated[
             r"(;[A-Z]+=[A-Za-z0-9,+\-]+)*$"
         ),
     ),
-    # Codex Sub-A4 reminders R3 MINOR #2: parameter-chain regex
-    # alone admits typos like ``FREQ=DAILY;COUNT=abc`` (non-numeric
-    # COUNT) or ``FREQ=WEEKLY;BYDAY=XX`` (invalid weekday). Run
-    # ``dateutil.rrulestr`` for literal RRULEs to catch the grammar
-    # at planner-input time. Refs (``${...}``) bypass — pydantic's
-    # planner-side validator handles refs separately.
-    AfterValidator(_validate_rrule_string),
+    # Codex Sub-A4 reminders R3 MINOR #2 + R4 MAJOR #1 — dateutil
+    # validation requires the actual ``trigger_iso`` as dtstart (a
+    # fixed dummy can false-reject ``FREQ=HOURLY;INTERVAL=4;BYHOUR=13``
+    # type rules whose validity depends on the dtstart's hour
+    # component). The alias keeps only the regex shape check; full
+    # grammar + numeric-range validation lives in
+    # ``validate_rrule_with_trigger`` called from the
+    # ``@model_validator`` on ScheduleReminderInput / UpdateReminderInput
+    # where both fields are available together.
 ]
 """RFC-5545 RRULE string. Three-layer validation:
 
@@ -335,4 +434,5 @@ __all__ = [
     "ShortStr",
     "TaskId",
     "TriggerIso",
+    "validate_rrule_with_trigger",
 ]

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.common import (
@@ -44,6 +44,7 @@ from sreda.services.tool_schemas.common import (
     ReminderId,
     ShortStr,
     TriggerIso,
+    validate_rrule_with_trigger,
 )
 from sreda.services.tool_schemas.housewife import (
     CancelReminderOutput,
@@ -84,6 +85,22 @@ class ScheduleReminderInput(BaseModel):
     trigger_iso: TriggerIso
     recurrence_rule: RecurrenceRule | None = None
 
+    @model_validator(mode="after")
+    def _validate_rrule_against_trigger(self) -> "ScheduleReminderInput":
+        # Codex Sub-A4 reminders R4 MAJOR #1 + #2: full RRULE
+        # validation requires the actual trigger_iso as dtstart
+        # (a fixed dummy dtstart can false-reject legitimate RRULEs
+        # whose validity depends on dtstart's hour/minute). Numeric
+        # range checks (INTERVAL/COUNT/BYxxx) also fire here. Refs
+        # in either field skip — execute-time
+        # validate_args_at_execute_time re-runs the full model_validate
+        # after refs resolve.
+        if self.recurrence_rule is not None:
+            validate_rrule_with_trigger(
+                self.recurrence_rule, self.trigger_iso
+            )
+        return self
+
 
 class ListRemindersInput(BaseModel):
     """No args — lists all pending reminders for the calling tenant."""
@@ -119,6 +136,23 @@ class UpdateReminderInput(BaseModel):
     trigger_iso: TriggerIso | None = None
     recurrence_rule: RecurrenceRule | None = None
     clear_recurrence: Literal[True] | None = None
+
+    @model_validator(mode="after")
+    def _validate_rrule_against_trigger(self) -> "UpdateReminderInput":
+        # Codex Sub-A4 reminders R4 MAJOR #1 + #2 — see
+        # ScheduleReminderInput for full context. The update path
+        # only validates when BOTH recurrence_rule AND trigger_iso
+        # are provided in the same call; partial updates that change
+        # one without the other defer dateutil validation to execute
+        # time where the runtime fetches the persisted dtstart.
+        if (
+            self.recurrence_rule is not None
+            and self.trigger_iso is not None
+        ):
+            validate_rrule_with_trigger(
+                self.recurrence_rule, self.trigger_iso
+            )
+        return self
 
 
 class CancelReminderInput(BaseModel):

@@ -911,6 +911,111 @@ def test_family_header_lint_detects_reminders_attach_reminder_reference() -> Non
     )
 
 
+# ---------------------------------------------------------------------------
+# Codex R4 follow-up tests — MAJOR #1 (dtstart-aware RRULE) + MAJOR #2
+# (numeric range enforcement)
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_reminder_accepts_hourly_byhour_with_matching_dtstart() -> None:
+    """Codex R4 MAJOR #1: previously the alias-level ``_validate_rrule_string``
+    used a fixed dummy dtstart (2026-01-01T00:00:00Z), which can false-
+    reject legitimate RRULEs like ``FREQ=HOURLY;INTERVAL=4;BYHOUR=13``
+    whose dateutil construction depends on dtstart's hour. Now the
+    model_validator uses the actual trigger_iso — this passes."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T13:00:00Z",
+        "recurrence_rule": "FREQ=HOURLY;INTERVAL=4;BYHOUR=13",
+    })
+    assert parsed.recurrence_rule == "FREQ=HOURLY;INTERVAL=4;BYHOUR=13"
+
+
+@pytest.mark.parametrize("bad_rrule,reason", [
+    ("FREQ=DAILY;INTERVAL=0", "INTERVAL=0 produces non-progressing recurrence"),
+    ("FREQ=DAILY;INTERVAL=-1", "negative INTERVAL"),
+    ("FREQ=DAILY;COUNT=0", "COUNT=0 produces empty recurrence"),
+    ("FREQ=DAILY;BYHOUR=24", "BYHOUR out of [0,23]"),
+    ("FREQ=DAILY;BYHOUR=-1", "negative BYHOUR"),
+    ("FREQ=DAILY;BYMINUTE=60", "BYMINUTE out of [0,59]"),
+    ("FREQ=DAILY;BYSECOND=99", "BYSECOND out of [0,59]"),
+    ("FREQ=YEARLY;BYMONTH=13", "BYMONTH out of [1,12]"),
+    ("FREQ=YEARLY;BYMONTH=0", "BYMONTH zero invalid"),
+    ("FREQ=MONTHLY;BYMONTHDAY=0", "BYMONTHDAY zero invalid"),
+    ("FREQ=MONTHLY;BYMONTHDAY=32", "BYMONTHDAY out of range"),
+    ("FREQ=MONTHLY;BYMONTHDAY=-32", "BYMONTHDAY negative out of range"),
+])
+def test_schedule_reminder_rejects_out_of_range_rrule_params(bad_rrule, reason) -> None:
+    """Codex R4 MAJOR #2: dateutil parses INTERVAL=0 / BYHOUR=99 etc.
+    without complaint — would hang/divide-by-zero at iteration. Explicit
+    range checks reject at planner-input time."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": bad_rrule,
+        })
+
+
+@pytest.mark.parametrize("good_rrule", [
+    "FREQ=DAILY;INTERVAL=1",
+    "FREQ=DAILY;INTERVAL=7",
+    "FREQ=DAILY;COUNT=10",
+    "FREQ=DAILY;BYHOUR=0",
+    "FREQ=DAILY;BYHOUR=23",
+    "FREQ=HOURLY;BYMINUTE=0",
+    "FREQ=HOURLY;BYMINUTE=59",
+    "FREQ=YEARLY;BYMONTH=1",
+    "FREQ=YEARLY;BYMONTH=12",
+    "FREQ=MONTHLY;BYMONTHDAY=1",
+    "FREQ=MONTHLY;BYMONTHDAY=31",
+    "FREQ=MONTHLY;BYMONTHDAY=-1",   # «last day of month» — RFC-5545 valid
+    "FREQ=MONTHLY;BYMONTHDAY=-31",  # «31 days from end» — edge but valid
+])
+def test_schedule_reminder_accepts_in_range_rrule_params(good_rrule) -> None:
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": good_rrule,
+    })
+    assert parsed.recurrence_rule == good_rrule
+
+
+def test_update_reminder_input_partial_rrule_only_skips_validation() -> None:
+    """When the update sends ``recurrence_rule`` but not ``trigger_iso``,
+    the runtime will fetch the persisted dtstart at execute time. The
+    schema-side validator skips dateutil validation (no trigger_iso
+    to use as dtstart). Numeric-range checks via the regex alias
+    still fire — but those live in the alias path."""
+    parsed = UpdateReminderInput.model_validate({
+        "reminder_id": REM_A,
+        "recurrence_rule": "FREQ=HOURLY;INTERVAL=4;BYHOUR=13",
+    })
+    # No raise — partial update is valid; validation deferred.
+    assert parsed.recurrence_rule == "FREQ=HOURLY;INTERVAL=4;BYHOUR=13"
+
+
+def test_update_reminder_input_full_update_validates_rrule_with_trigger() -> None:
+    """If the update sends BOTH recurrence_rule AND trigger_iso, the
+    pair is validated together — same path as schedule_reminder."""
+    parsed = UpdateReminderInput.model_validate({
+        "reminder_id": REM_A,
+        "trigger_iso": "2026-05-27T13:00:00Z",
+        "recurrence_rule": "FREQ=HOURLY;INTERVAL=4;BYHOUR=13",
+    })
+    assert parsed.recurrence_rule == "FREQ=HOURLY;INTERVAL=4;BYHOUR=13"
+
+
+def test_update_reminder_input_full_update_rejects_bad_rrule() -> None:
+    """Same path: full update with bad RRULE rejects."""
+    with pytest.raises(ValidationError):
+        UpdateReminderInput.model_validate({
+            "reminder_id": REM_A,
+            "trigger_iso": "2026-05-27T13:00:00Z",
+            "recurrence_rule": "FREQ=DAILY;INTERVAL=0",
+        })
+
+
 def test_family_header_lint_clean_for_current_reminders_header() -> None:
     """The actual (current) reminders family header was rewritten to
     avoid naming unmigrated tools — the linter should produce no
