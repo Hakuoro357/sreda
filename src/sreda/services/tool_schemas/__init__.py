@@ -23,6 +23,11 @@ from sreda.services.tool_schemas.housewife import (
     PARSERS,
     parse_tool_output,
 )
+from sreda.services.tool_schemas.registry_quality import (
+    InvalidRegistryError,
+    RegistryQualityViolation,
+    validate_tool_registry_quality,
+)
 from sreda.services.tool_schemas.registry_text import (
     render_family_header,
     render_registry_for_planner,
@@ -33,11 +38,14 @@ __all__ = [
     "FAMILY_HEADERS",
     "Family",
     "FamilyHeader",
+    "InvalidRegistryError",
     "PARSERS",
+    "RegistryQualityViolation",
     "ToolOutput",
     "ToolOutputContractViolation",
     "ToolSpec",
     "parse_tool_output",
     "render_family_header",
     "render_registry_for_planner",
+    "validate_tool_registry_quality",
 ]

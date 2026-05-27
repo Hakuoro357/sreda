@@ -454,18 +454,28 @@ def test_tool_spec_without_family_surfaces_in_unfamilied_block() -> None:
 def test_trigger_examples_render_inline_with_quotes() -> None:
     """Trigger examples appear as a single «Примеры:» line with each
     example «-quoted and comma-separated."""
-    specs = [_spec(
+    # Codex R1 MAJOR #5 fix: construct real ToolSpec (model_copy bypasses
+    # validation) — proves both render output and schema acceptance.
+    spec = _spec(
         "add_shopping_items", "shopping", effect="write",
         description="Добавить продукты в список покупок.",
-    )]
-    specs[0] = specs[0].model_copy(update={
-        "trigger_examples": [
+    )
+    spec = ToolSpec(
+        name=spec.name,
+        description=spec.description,
+        family=spec.family,
+        effect=spec.effect,
+        read_domains=spec.read_domains,
+        write_domains=spec.write_domains,
+        input_model=spec.input_model,
+        output_model=spec.output_model,
+        trigger_examples=[
             "купи молоко и хлеб",
             "добавь в покупки яйца",
             "нужно купить картошки",
         ],
-    })
-    text = render_registry_for_planner(specs)
+    )
+    text = render_registry_for_planner([spec])
     assert "Примеры:" in text
     assert "«купи молоко и хлеб»" in text
     assert "«добавь в покупки яйца»" in text
@@ -473,17 +483,30 @@ def test_trigger_examples_render_inline_with_quotes() -> None:
 
 
 def test_mutex_notes_render_with_warning_marker() -> None:
+    """Codex R1 MAJOR #5 + MINOR #11: construct real ToolSpec; assert
+    the exact tool-level ⚠-prefixed line, not just substring."""
     spec = _spec("mark_shopping_bought", "shopping", effect="write",
                  description="Отметить продукт как купленный.")
-    spec = spec.model_copy(update={
-        "mutex_notes": [
+    spec = ToolSpec(
+        name=spec.name,
+        description=spec.description,
+        family=spec.family,
+        effect=spec.effect,
+        read_domains=spec.read_domains,
+        write_domains=spec.write_domains,
+        input_model=spec.input_model,
+        output_model=spec.output_model,
+        mutex_notes=[
             "Используй ТОЛЬКО для купленных. Для удаления — remove_shopping_items.",
         ],
-    })
+    )
     text = render_registry_for_planner([spec])
-    # Mutex notes share the ⚠ warning marker with family anti-patterns.
-    assert "⚠" in text
-    assert "remove_shopping_items" in text
+    # Exact tool-level ⚠ line (4-space indent, ⚠ marker, note text).
+    expected_line = (
+        "    ⚠ Используй ТОЛЬКО для купленных. "
+        "Для удаления — remove_shopping_items."
+    )
+    assert expected_line in text
 
 
 def test_tool_without_trigger_examples_renders_normally() -> None:

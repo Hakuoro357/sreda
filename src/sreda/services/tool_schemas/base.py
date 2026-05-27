@@ -155,18 +155,20 @@ pydantic cannot fully introspect as field types in v2).
 """
 
 
-# Russian-infinitive verb-start check for ToolSpec.description.
-# Required infinitive endings: -ть, -ться, -ти, -чь (covers
-# «добавить», «отметиться», «найти», «беречь»). Sub-A-77 item #6:
-# planner-facing descriptions must START with an infinitive verb +
-# concrete noun object — measurably improves planner tool selection
-# vs ambiguous third-person/abstract openings.
+# Russian-infinitive verb-start check for production ToolSpec.description.
+# Required suffixes: -ть, -ться, -ти, -чь (covers «добавить»,
+# «отметиться», «найти», «беречь»). Cyrillic-only — Latin would
+# require its own ruleset (Codex R1 MINOR #8 fix).
+# Used by registry_quality.validate_tool_registry_quality, NOT by
+# ToolSpec construction (Codex R1 alternative — separate schema
+# from quality policy).
 _RUSSIAN_INFINITIVE_FIRST_WORD = re.compile(
-    r"^[А-ЯЁA-Z][А-ЯЁA-Zа-яёa-z\-]*?(?:ть|ться|ти|чь)\b"
+    r"^[А-ЯЁ][а-яё\-]*?(?:ть|ться|ти|чь)\b"
 )
-"""Matches a Russian capitalised first word that ends in an infinitive
-suffix. ``A-Z`` included so transliterated tool descriptions don't
-falsely trip (no real description should be Latin-only, but defensive).
+"""Matches a Russian Cyrillic capitalised first word ending in an
+infinitive suffix. Strict «starts with infinitive» — does NOT enforce
+«infinitive + concrete noun object». Codex R1 MAJOR #7 fix: doc
+narrowed to match what we actually check.
 """
 
 
@@ -291,45 +293,46 @@ class ToolSpec(BaseModel):
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> ToolSpec:
-        # Sub-A-77 item #6: planner-facing description shape.
-        # Description ≥80 chars + starts with a Russian infinitive verb.
-        # SOFT defaults (no enforcement) when the description is short
-        # — placeholder-style ``"Test spec for X"`` used in fixtures
-        # stays valid. Production tools fill via _enforce_description_quality.
-        if len(self.description.strip()) >= 80 and not _RUSSIAN_INFINITIVE_FIRST_WORD.match(
-            self.description
-        ):
+        # Sub-A-77 item #6: ToolSpec construction-time guards are now
+        # SCHEMA-level only (basic shape + safety-critical). Production
+        # quality policy lives in
+        # ``services.tool_schemas.registry_quality.validate_tool_registry_quality``
+        # so Sub-A4 / Sub-B1 / CI can opt in with strict=True.
+        # Codex R1 alternative: separate schema from quality policy.
+        if not self.name.strip():
             raise ValueError(
-                f"Tool '{self.name}' description must start with a Russian "
-                f"infinitive verb (-ть / -ться / -ти / -чь): «Добавить...», "
-                f"«Найти...», «Отметить...». Got: {self.description[:60]!r}. "
-                f"Planner LLM picks tools better when the first word is the "
-                f"action verb."
+                f"ToolSpec.name must be a non-empty (post-strip) string."
+            )
+        if not self.description.strip():
+            raise ValueError(
+                f"Tool '{self.name}' description must be non-empty (post-strip)."
             )
         if self.trigger_examples:
-            if len(self.trigger_examples) < 3:
-                raise ValueError(
-                    f"Tool '{self.name}' trigger_examples has "
-                    f"{len(self.trigger_examples)} item(s) — need ≥3 to "
-                    f"teach the planner the variation space. Add typical + "
-                    f"slight rewording + follow-up examples."
-                )
             for example in self.trigger_examples:
                 if not example.strip():
                     raise ValueError(
-                        f"Tool '{self.name}' has empty/blank trigger_example. "
-                        f"Each example must be a non-empty user phrase."
+                        f"Tool '{self.name}' has empty/blank trigger_example."
+                    )
+                if "\n" in example or "\r" in example or "\t" in example:
+                    raise ValueError(
+                        f"Tool '{self.name}' trigger_example contains "
+                        f"newline/tab — must be single-line text "
+                        f"(prompt formatting safety)."
                     )
         for note in self.mutex_notes:
             if not note.strip():
                 raise ValueError(
                     f"Tool '{self.name}' has empty/blank mutex_note."
                 )
-            if len(note) > 200:
+            if "\n" in note or "\r" in note or "\t" in note:
                 raise ValueError(
-                    f"Tool '{self.name}' mutex_note {note!r} exceeds 200 "
-                    f"chars. Keep disambiguation notes terse — long notes "
-                    f"dilute planner attention."
+                    f"Tool '{self.name}' mutex_note contains newline/tab "
+                    f"— must be single-line text (prompt formatting safety)."
+                )
+            if note.lstrip().startswith("⚠"):
+                raise ValueError(
+                    f"Tool '{self.name}' mutex_note must NOT start with "
+                    f"⚠ — the renderer prepends the marker. Got: {note[:60]!r}."
                 )
         if self.effect == "write" and not self.write_domains:
             raise ValueError(

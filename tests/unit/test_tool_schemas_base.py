@@ -323,11 +323,11 @@ def test_tool_spec_accepts_three_trigger_examples() -> None:
     assert len(spec.trigger_examples) == 3
 
 
-def test_tool_spec_rejects_fewer_than_three_trigger_examples() -> None:
-    with pytest.raises(ValidationError) as exc:
-        _minimal_read_spec(trigger_examples=["купи молоко", "добавь хлеб"])
-    msg = str(exc.value).lower()
-    assert "trigger_examples" in msg or "≥3" in msg or ">=3" in msg
+# NOTE: policy-level checks (count caps, length caps, verb-start,
+# Cyrillic requirement) moved to ``tests/unit/test_registry_quality.py``
+# per Codex R1 alternative — schema vs policy separation. Construction-
+# time guards here cover only safety-critical invariants (non-blank,
+# control-char rejection, ⚠ prefix rejection).
 
 
 def test_tool_spec_rejects_empty_trigger_example() -> None:
@@ -339,21 +339,6 @@ def test_tool_spec_rejects_empty_trigger_example() -> None:
     assert "empty" in msg or "blank" in msg
 
 
-def test_tool_spec_accepts_mutex_notes_within_length_limit() -> None:
-    spec = _minimal_read_spec(mutex_notes=[
-        "Используй ТОЛЬКО для купленных. Для удаления — remove_shopping_items.",
-    ])
-    assert len(spec.mutex_notes) == 1
-
-
-def test_tool_spec_rejects_mutex_note_over_200_chars() -> None:
-    long_note = "X" * 201
-    with pytest.raises(ValidationError) as exc:
-        _minimal_read_spec(mutex_notes=[long_note])
-    msg = str(exc.value).lower()
-    assert "200" in msg
-
-
 def test_tool_spec_rejects_blank_mutex_note() -> None:
     with pytest.raises(ValidationError) as exc:
         _minimal_read_spec(mutex_notes=["   "])
@@ -361,58 +346,41 @@ def test_tool_spec_rejects_blank_mutex_note() -> None:
     assert "empty" in msg or "blank" in msg
 
 
-# Description-shape rules apply only when description is "real" length
-# (≥80 chars). Short placeholder descriptions stay valid for fixtures.
-
-def test_tool_spec_description_short_skips_verb_check() -> None:
-    # Short test-fixture description doesn't need to start with verb.
-    spec = _minimal_read_spec(description="Show shopping list")
-    assert spec.description == "Show shopping list"
-
-
-def test_tool_spec_real_description_must_start_with_russian_infinitive() -> None:
-    good = (
-        "Добавить продукты в список покупок. Используй для запросов "
-        "вида «купи X», «добавь Y в покупки», «надо купить Z»."
-    )
-    spec = _minimal_read_spec(description=good)
-    assert spec.description.startswith("Добавить")
-
-
-@pytest.mark.parametrize("description", [
-    (
-        "Этот инструмент добавляет продукты в список покупок. Используй "
-        "его для запросов типа «купи X», «добавь Y в покупки»."
-    ),  # starts with «Этот» — not infinitive
-    (
-        "Adds shopping items to the user's list. Triggered by phrases "
-        "like 'buy X', 'add Y to shopping', 'I need to buy Z'."
-    ),  # English present-tense — not Russian infinitive
-    (
-        "Команда для добавления продуктов в список покупок. Используется "
-        "для запросов «купи X», «добавь Y», «надо купить Z»."
-    ),  # starts with «Команда» (noun) — not verb
-])
-def test_tool_spec_real_description_rejects_non_infinitive_starts(
-    description: str,
-) -> None:
+def test_tool_spec_rejects_whitespace_only_name() -> None:
     with pytest.raises(ValidationError) as exc:
-        _minimal_read_spec(description=description)
+        _minimal_read_spec(name="   ")
     msg = str(exc.value).lower()
-    assert "infinitive" in msg or "verb" in msg or "глагол" in msg
+    assert "name" in msg
 
 
-@pytest.mark.parametrize("verb_start", [
-    "Добавить", "Найти", "Отметить", "Удалить", "Создать",
-    "Записать", "Показать", "Изменить",
-])
-def test_tool_spec_common_action_verbs_accepted(verb_start: str) -> None:
-    description = (
-        f"{verb_start} некий объект в системе. Используй для запросов "
-        f"типа «X», «Y», «Z», когда юзер хочет это действие."
-    )
-    spec = _minimal_read_spec(description=description)
-    assert spec.description.startswith(verb_start)
+def test_tool_spec_rejects_whitespace_only_description() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(description="   ")
+    msg = str(exc.value).lower()
+    assert "description" in msg
+
+
+def test_tool_spec_rejects_newline_in_trigger_example() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(trigger_examples=[
+            "купи молоко", "добавь\nхлеб", "нужно картошки",
+        ])
+    msg = str(exc.value).lower()
+    assert "newline" in msg or "tab" in msg or "single-line" in msg
+
+
+def test_tool_spec_rejects_tab_in_mutex_note() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(mutex_notes=["Используй\tТОЛЬКО для X."])
+    msg = str(exc.value).lower()
+    assert "newline" in msg or "tab" in msg or "single-line" in msg
+
+
+def test_tool_spec_rejects_mutex_note_with_warning_prefix() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(mutex_notes=["⚠ Уже есть префикс"])
+    msg = str(exc.value).lower()
+    assert "⚠" in msg or "must not start" in msg.lower() or "prepend" in msg
 
 
 def test_tool_spec_rejects_extra_field() -> None:
