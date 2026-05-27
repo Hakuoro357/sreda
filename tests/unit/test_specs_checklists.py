@@ -263,16 +263,18 @@ def test_move_task_parser_task_not_found() -> None:
 
 
 @pytest.mark.parametrize("code", [
+    "task_has_empty_title",  # Codex R4 MINOR (HIGH catch) — added
     "list_resolve_failed",
     "internal_add",
     "nothing_added",
 ])
 def test_move_task_parser_partial_failure_variants(code) -> None:
-    """Codex R3 MINOR (prior-not-closed): three runtime error codes
-    mean «task cancelled but item not created». Parser routes them
-    to typed MoveTaskPartialFailure so planner can branch and tell
-    user honestly «задача отменена, но добавление в чек-лист
-    провалилось»."""
+    """Codex R3 MINOR (prior-not-closed) + R4 MINOR (task_has_empty_title
+    added) + R5 MINOR (test coverage for the R4 addition): all four
+    runtime error codes mean «task cancelled but item not created».
+    Parser routes them to typed MoveTaskPartialFailure so planner can
+    branch and tell user honestly «задача отменена, но добавление в
+    чек-лист провалилось»."""
     from sreda.services.tool_schemas.housewife import MoveTaskPartialFailure
     parsed = parse_tool_output("move_task_to_checklist", f"error: {code}")
     assert isinstance(parsed, MoveTaskPartialFailure)

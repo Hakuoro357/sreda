@@ -2528,9 +2528,20 @@ def build_housewife_tools(
             return "error: task_has_empty_title"
 
         # Step 2: resolve target checklist
-        cl = checklist_service.find_list_by_title(
-            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
-        )
+        # Codex Sub-A4 checklists R5 MINOR (HIGH-reasoning catch):
+        # this lookup was outside try/except — if find_list_by_title
+        # raised after task_service.cancel() committed, runtime
+        # would bubble the exception as untyped error, hiding the
+        # partial-failure semantic (task cancelled but list not
+        # resolved). Now wraps to emit `error: list_resolve_failed`
+        # which parser maps to typed MoveTaskPartialFailure.
+        try:
+            cl = checklist_service.find_list_by_title(
+                tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("move_task_to_checklist: find_list_by_title failed")
+            return "error: list_resolve_failed"
         if cl is None:
             try:
                 cl = checklist_service.create_list(
