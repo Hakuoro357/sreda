@@ -206,7 +206,9 @@ FAMILY_HEADERS: Final[Mapping[Family, FamilyHeader]] = {
             "Для повторяющихся дел без жёсткого времени (TODO-список) — см. группу ЗАДАЧИ.",
             "Для длинных чек-листов с шагами «собрать сумку» — см. группу ЧЕК-ЛИСТЫ.",
             "Если в просьбе ЕСТЬ конкретное время «напомни купить хлеб в 18:00» — это НАПОМИНАНИЯ (текст напоминания может включать «купи»). Если времени НЕТ — это ПОКУПКИ.",
-            "Граница с ЗАДАЧАМИ: standalone «напомни в 18:00 X» → НАПОМИНАНИЯ (schedule_reminder). Привязать новое напоминание к существующей задаче «напомни про задачу T-42 завтра» → ЗАДАЧИ (attach_reminder), не НАПОМИНАНИЯ.",
+            "Граница с ЗАДАЧАМИ — CREATE: standalone «напомни в 18:00 X» → НАПОМИНАНИЯ.schedule_reminder. Привязать НОВОЕ напоминание к существующей задаче «напомни про задачу T-42 завтра» → ЗАДАЧИ.attach_reminder, не НАПОМИНАНИЯ.",
+            "Граница с ЗАДАЧАМИ — UPDATE: «перенеси напоминание по задаче на завтра», «измени время напоминания», «поменяй текст напоминания» → НАПОМИНАНИЯ.update_reminder (редактируется существующее напоминание); НЕ создавай новое через attach_reminder/schedule_reminder — это даст дубль.",
+            "Граница с ЗАДАЧАМИ — REMOVE: «убери напоминание у задачи, оставь саму задачу» → ЗАДАЧИ.detach_reminder (рвём связь, напоминание остаётся как standalone). «Отмени само напоминание» → НАПОМИНАНИЯ.cancel_reminder. Не путай: detach сохраняет напоминание, cancel удаляет.",
         ),
     ),
     "recipes": FamilyHeader(
@@ -486,6 +488,79 @@ entry. Test ``test_manifest_covers_all_55_tools`` enforces the count
 """
 
 
+# ---------------------------------------------------------------------------
+# Runtime bridge: real ToolSpec set ↔ TOOL_FAMILY_MANIFEST agreement
+# ---------------------------------------------------------------------------
+
+
+def assert_manifest_matches_specs(specs: object) -> None:
+    """Verify a collection of real ``ToolSpec`` instances matches the
+    audited ``TOOL_FAMILY_MANIFEST`` exactly. Codex R3 MAJOR #1 — without
+    this bridge, a real spec could declare the wrong family and still
+    pass the ``НЕОТНЕСЁННЫЕ`` CI guard.
+
+    Sub-A4 should call this from a CI test once real specs are wired
+    in (one call passing all tenant tools). The check is here (not in
+    Sub-A4 tests) so the invariant lives next to ``TOOL_FAMILY_MANIFEST``
+    — if anyone edits the manifest, this function and its consumers
+    enforce the bridge automatically.
+
+    Raises ``AssertionError`` with a structured diff so CI output points
+    directly at the offending tool(s).
+
+    The ``specs`` argument is typed ``object`` to avoid a circular
+    import on ``ToolSpec`` at module load — at call time we duck-type
+    on ``.name`` and ``.family``.
+    """
+
+    # Build the actual map; tolerate iterables that are not lists.
+    actual: dict[str, Family | None] = {}
+    for spec in specs:  # type: ignore[attr-defined]
+        name = getattr(spec, "name", None)
+        family = getattr(spec, "family", None)
+        if name is None:
+            raise AssertionError(
+                f"assert_manifest_matches_specs: spec {spec!r} has no "
+                f"`name` attribute — not a valid ToolSpec."
+            )
+        if name in actual:
+            raise AssertionError(
+                f"assert_manifest_matches_specs: duplicate tool name "
+                f"{name!r} in specs — every ToolSpec name must be unique."
+            )
+        actual[name] = family
+
+    expected_names = set(TOOL_FAMILY_MANIFEST.keys())
+    actual_names = set(actual.keys())
+    missing = expected_names - actual_names
+    extra = actual_names - expected_names
+    family_mismatches = [
+        (name, actual[name], TOOL_FAMILY_MANIFEST[name])
+        for name in expected_names & actual_names
+        if actual[name] != TOOL_FAMILY_MANIFEST[name]
+    ]
+
+    if missing or extra or family_mismatches:
+        msgs = []
+        if missing:
+            msgs.append(f"  Missing from specs (in manifest): {sorted(missing)}")
+        if extra:
+            msgs.append(f"  Extra in specs (not in manifest): {sorted(extra)}")
+        if family_mismatches:
+            msgs.append("  Family mismatches (spec ≠ manifest):")
+            for name, actual_fam, expected_fam in family_mismatches:
+                msgs.append(
+                    f"    {name!r}: spec={actual_fam!r} manifest={expected_fam!r}"
+                )
+        raise AssertionError(
+            "Runtime ToolSpec set diverges from TOOL_FAMILY_MANIFEST:\n"
+            + "\n".join(msgs)
+            + "\n\nFix: update the manifest to match the new tool, or "
+            "fix the spec's family declaration. See "
+            "docs/architecture/tool-family-taxonomy.md."
+        )
+
+
 __all__ = [
     "FAMILIES",
     "FAMILY_HEADERS",
@@ -494,4 +569,5 @@ __all__ = [
     "NON_FAMILY_REDIRECTS",
     "NonFamilyRedirect",
     "TOOL_FAMILY_MANIFEST",
+    "assert_manifest_matches_specs",
 ]

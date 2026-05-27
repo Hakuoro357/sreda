@@ -33,6 +33,7 @@ from sreda.services.tool_schemas.families import (
     FamilyHeader,
     NonFamilyRedirect,
     _validate_anti_pattern_strings,
+    assert_manifest_matches_specs,
 )
 
 
@@ -449,6 +450,8 @@ _REDIRECT_SCAN_ALLOWLIST: frozenset[str] = frozenset({
     "ЕСЛИ",                     # leading conditional
     "СУЩЕСТВУЮЩУЮ",             # qualifier (existing entity)
     "СУЩЕСТВУЮЩИМ",             # qualifier (existing entity)
+    "СУЩЕСТВУЮЩЕЙ",             # qualifier (existing entity, dative)
+    "НОВОЕ",                    # emphasis marker in CREATE boundary rule
     "Y", "Z", "X",              # placeholder identifiers
     "T",                        # in «задаче T-42»
 })
@@ -462,14 +465,14 @@ _ALL_CAPS_CYRILLIC_RE = _re.compile(
 
 
 def test_anti_pattern_redirects_resolve_to_known_destinations() -> None:
-    """Codex R2 MAJOR #1: scan every anti-pattern for all-caps tokens and
-    verify each resolves (by 5-char Cyrillic stem match) to either a real
-    family russian_name or a NonFamilyRedirect value. Stray uppercase
-    phrases mean the planner might invent a pseudo-family.
+    """Codex R2 MAJOR #1 + R3 MINOR #3: scan every anti-pattern for
+    all-caps Cyrillic tokens. For SINGLE-word tokens, the word must
+    resolve to a known destination (family russian_name or
+    NonFamilyRedirect) by 5-char stem match or full-word allowlist.
+    For MULTI-word tokens (e.g. «ДЕНЕЖНЫЕ ОПЕРАЦИИ»), EVERY word must
+    resolve — Codex R3 caught that single-token stem match would
+    accept «ДЕНЕЖНЫЕ ЛЕВОЕ-СЛОВО» because the first stem is valid.
     """
-    # Build stem set: take first word of each known destination, strip to
-    # 5-char prefix. Multi-word destinations contribute stems for each
-    # of their words.
     valid_stems: set[str] = set()
     for h in FAMILY_HEADERS.values():
         for w in h.russian_name.split():
@@ -477,32 +480,60 @@ def test_anti_pattern_redirects_resolve_to_known_destinations() -> None:
     for r in NON_FAMILY_REDIRECTS:
         for w in r.split():
             valid_stems.add(_stem(w))
-    # Also accept allowlisted full words as-is (no stem) for safety.
     valid_full_words = set(_REDIRECT_SCAN_ALLOWLIST)
 
-    def _resolves(word: str) -> bool:
+    def _word_resolves(word: str) -> bool:
+        """Resolution check for a SINGLE word — exactly what Codex asked.
+        No phrase-level shortcut that could miss a bad second word."""
         if word in valid_full_words:
             return True
-        # Stem match — handles ЗАДАЧАМИ, ЧЕК-ЛИСТАМИ, СБОРЩИКА, etc.
         return _stem(word) in valid_stems
 
     failures: list[tuple[str, str, str]] = []
     for family, header in FAMILY_HEADERS.items():
         for ap in header.anti_patterns:
             for token in _ALL_CAPS_CYRILLIC_RE.findall(ap):
-                if _resolves(token):
-                    continue
-                # Multi-word phrase — every word must resolve.
-                if all(_resolves(w) for w in token.split()):
+                # Decompose multi-word phrases unconditionally; never
+                # short-circuit on whole-phrase stem match.
+                words = token.split()
+                if all(_word_resolves(w) for w in words):
                     continue
                 failures.append((family, token, ap))
     assert not failures, (
         "Anti-patterns reference all-caps destinations that don't "
         "resolve to known family names or NON_FAMILY_REDIRECTS "
-        "(after stem matching):\n"
+        "(per-word stem check):\n"
         + "\n".join(
             f"  family={f!r}: token={t!r} in anti-pattern {ap!r}"
             for f, t, ap in failures
+        )
+    )
+
+
+# Codex R3 MINOR #3 — explicit guard against «группа <NonFamilyRedirect>»
+# wording (regressed in R2 utility anti-pattern).
+
+_GROUP_NONFAMILY_RE = _re.compile(
+    r"групп\w*\s+(" + "|".join(_re.escape(r) for r in NON_FAMILY_REDIRECTS) + r")",
+    flags=_re.IGNORECASE,
+)
+
+
+def test_no_anti_pattern_calls_non_family_redirect_a_group() -> None:
+    """Anti-patterns must NOT use phrases like «группа СБОРЩИК ОТВЕТА» —
+    that would imply СБОРЩИК ОТВЕТА is a tool family. Codex R3 MINOR #3.
+    """
+    failures: list[tuple[str, str, str]] = []
+    for family, header in FAMILY_HEADERS.items():
+        for ap in header.anti_patterns:
+            m = _GROUP_NONFAMILY_RE.search(ap)
+            if m is not None:
+                failures.append((family, m.group(0), ap))
+    assert not failures, (
+        "Anti-patterns refer to NonFamilyRedirect values as «группа»:\n"
+        + "\n".join(
+            f"  family={f!r}: match={m!r} in {ap!r}"
+            for f, m, ap in failures
         )
     )
 
