@@ -24,9 +24,14 @@ calls that to fail builds that ship incomplete shopping ToolSpecs.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sreda.services.tool_schemas.base import ToolSpec
+from sreda.services.tool_schemas.common import (
+    NonBlankStr,
+    ShoppingItemId,
+    ShortStr,
+)
 from sreda.services.tool_schemas.housewife import (
     AddShoppingItemsOutput,
     ClearBoughtShoppingOutput,
@@ -48,14 +53,19 @@ from sreda.services.tool_schemas.housewife import (
 class ShoppingItemInput(BaseModel):
     """One row of an ``add_shopping_items`` batch.
 
-    Only ``title`` is required; ``quantity_text`` is free-form
-    (no math), ``category`` is optional and auto-mapped if unknown.
+    Only ``title`` is required (stripped, non-blank, ≤200 chars);
+    ``quantity_text`` is free-form short label (no math), ``category``
+    is optional and auto-mapped if unknown.
+
+    Codex R1 MAJOR #2: ``ShortStr`` rejects whitespace-only and
+    over-long values that the previous ``Field(min_length=1)``
+    accepted.
     """
 
     model_config = ConfigDict(extra="forbid")
-    title: str = Field(min_length=1)
-    quantity_text: str | None = None
-    category: str | None = None
+    title: ShortStr
+    quantity_text: ShortStr | None = None
+    category: ShortStr | None = None
 
 
 class AddShoppingItemsInput(BaseModel):
@@ -65,26 +75,53 @@ class AddShoppingItemsInput(BaseModel):
 
 class MarkShoppingBoughtInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    item_ids: list[str] = Field(min_length=1)
+    item_ids: list[ShoppingItemId] = Field(min_length=1)
 
 
 class RemoveShoppingItemsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    item_ids: list[str] = Field(min_length=1)
+    item_ids: list[ShoppingItemId] = Field(min_length=1)
 
 
 class UpdateShoppingItemInput(BaseModel):
+    """Update a single shopping item in place.
+
+    Codex R1 MAJOR #2: the original schema accepted
+    ``{"item_id": "sh_42"}`` with all three mutable fields missing
+    as a valid no-op call. That wastes a tool round-trip and produces
+    a misleading ``ok:updated:sh_42`` for «nothing changed». Reject
+    via ``model_validator``.
+    """
+
     model_config = ConfigDict(extra="forbid")
-    item_id: str = Field(min_length=1)
-    title: str | None = None
-    quantity_text: str | None = None
-    category: str | None = None
+    item_id: ShoppingItemId
+    title: ShortStr | None = None
+    quantity_text: ShortStr | None = None
+    category: ShortStr | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_mutable_field(self) -> "UpdateShoppingItemInput":
+        if (
+            self.title is None
+            and self.quantity_text is None
+            and self.category is None
+        ):
+            raise ValueError(
+                "update_shopping_item requires at least one of "
+                "title / quantity_text / category — empty update is "
+                "not a meaningful tool call."
+            )
+        return self
 
 
 class UpdateShoppingItemsCategoryInput(BaseModel):
+    """Codex R1 MINOR #8: bulk re-category needs ≥2 item_ids — a
+    single-id reassignment should use ``update_shopping_item`` (which
+    surfaces the more-specific ``ok:updated:<id>`` return)."""
+
     model_config = ConfigDict(extra="forbid")
-    item_ids: list[str] = Field(min_length=1)
-    category: str = Field(min_length=1)
+    item_ids: list[ShoppingItemId] = Field(min_length=2)
+    category: NonBlankStr
 
 
 class ListShoppingInput(BaseModel):
@@ -149,10 +186,11 @@ MARK_SHOPPING_BOUGHT_SPEC = ToolSpec(
         "молоко купил",
         "отметь хлеб как купленный",
         "купил молоко и яйца",
-        "сделал покупки в Пятёрочке",
+        "хлеб и творог куплены",
     ],
     mutex_notes=[
-        "Используй ТОЛЬКО для купленного. Для удаления / отмены (не покупал) — remove_shopping_items.",
+        "Используй ТОЛЬКО для купленного (требует конкретные item_ids из list_shopping). Для удаления / отмены (не покупал) — remove_shopping_items.",
+        "Для «купил всё из списка» — сначала list_shopping, потом mark_shopping_bought с полученными ids.",
         "Не вызывай add_shopping_items + mark — для batch-добавления-и-сразу-отметки сделай две отдельные операции последовательно.",
     ],
     timeout_seconds=10,
@@ -285,11 +323,12 @@ CLEAR_BOUGHT_SHOPPING_SPEC = ToolSpec(
     trigger_examples=[
         "очисти купленные",
         "убери уже купленное",
-        "почисть список после магазина",
-        "сделай список чистым",
+        "почисти историю покупок",
+        "убери купленное из истории",
     ],
     mutex_notes=[
-        "Используй ТОЛЬКО для bought-строк. Для отмены pending-строк — remove_shopping_items.",
+        "Используй ТОЛЬКО для bought-строк (история). Для отмены pending-строк (текущий список) — remove_shopping_items.",
+        "Не вызывай при запросе «очисти весь список» без уточнения у юзера — есть риск удалить непрочитанные pending; уточни сначала.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",

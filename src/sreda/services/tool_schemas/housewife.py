@@ -55,16 +55,48 @@ class HousewifeToolError(BaseModel):
     message: str = Field(min_length=1)
 
 
+# ---------------------------------------------------------------------------
+# Stable error-code patterns — mapped BEFORE the generic dynamic-code
+# fallback in ``_parse_error``. Without this layer, messages that embed
+# a dynamic value (item id, reminder id, etc.) produce a different
+# ``error_code`` for every call (e.g. ``item_'sh_42'_not_found``,
+# ``item_'sh_7'_not_found``), making planner branching non-deterministic.
+# Codex Sub-A4 R1 CRITICAL.
+#
+# Add patterns here as new dynamic-message errors are discovered in tool
+# implementations. Order matters — first match wins.
+# ---------------------------------------------------------------------------
+
+_STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # update_shopping_item: ``error: item 'sh_42' not found``
+    (re.compile(r"^item\s+.+\s+not\s+found$", re.IGNORECASE), "item_not_found"),
+    # task_chat_tools: ``error: task 'task_42' not found``
+    (re.compile(r"^task\s+.+\s+not\s+found$", re.IGNORECASE), "task_not_found"),
+    # reminders: ``error: reminder 'rem_42' not found``
+    (re.compile(r"^reminder\s+.+\s+not\s+found$", re.IGNORECASE), "reminder_not_found"),
+    # checklists: ``error: checklist 'cl_42' not found``
+    (
+        re.compile(r"^checklist\s+.+\s+not\s+found$", re.IGNORECASE),
+        "checklist_not_found",
+    ),
+]
+
+
 def _parse_error(raw: str) -> HousewifeToolError | None:
     """Normalize ``error: <code>[: <detail>]`` into HousewifeToolError.
 
     Returns ``None`` if ``raw`` isn't an error line so callers can
     distinguish "not an error" from "unparseable error".
 
-    Codex 2026-05-26 Low: handles missing-space (``error:internal``) and
-    pathological ``error: : detail`` by collapsing to ``unknown`` rather
-    than raising pydantic ValidationError. error_code is lowercase
-    (matches planner's deterministic match-on-code rule).
+    Behaviour layers (Codex Sub-A4 R1 CRITICAL fix — stable codes):
+    1. Match against ``_STABLE_ERROR_PATTERNS`` first — produces a
+       fixed ``error_code`` ignoring dynamic id/value content. Lets
+       the planner branch deterministically on
+       ``error_code=='item_not_found'`` regardless of which specific
+       id triggered.
+    2. Fallback to dynamic code derivation (lowercase, spaces→
+       underscores). Handles ``error:internal`` (no space) and
+       ``error: : detail`` (collapses to ``unknown``).
     """
     if not raw.startswith("error:"):
         return None
@@ -73,6 +105,11 @@ def _parse_error(raw: str) -> HousewifeToolError | None:
         # Bare ``error:`` with no payload — treat as unknown so the
         # planner branch can still match deterministically.
         return HousewifeToolError(error_code="unknown", message="unknown")
+    # Stable-code lookup — first match wins.
+    for pattern, stable_code in _STABLE_ERROR_PATTERNS:
+        if pattern.match(rest):
+            return HousewifeToolError(error_code=stable_code, message=rest)
+    # Fallback to dynamic code derivation.
     if ":" in rest:
         code_part, _detail = rest.split(":", 1)
         code = code_part.strip().lower().replace(" ", "_") or "unknown"
