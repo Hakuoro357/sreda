@@ -433,3 +433,156 @@ def test_plan_realistic_recipe_to_shopping() -> None:
     )
     assert len(plan.actions) == 2
     assert plan.actions["s2"].depends_on == ["s1"]
+
+
+# ---------------------------------------------------------------------------
+# Plan.clarity contract (vex-assistant#77 item #2)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_clarity_defaults_to_clear() -> None:
+    """Existing plans (no clarity field) parse as clarity='clear'.
+    Backward-compat guarantee for already-deployed planner output."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        actions={"s1": _ok_action()},
+        compose=_ok_compose(),
+    )
+    assert plan.clarity == "clear"
+    assert plan.clarity_reason is None
+
+
+def test_plan_clarity_clear_with_empty_actions_rejected() -> None:
+    """clarity='clear' + empty actions = no-op plan; nonsense for the
+    executor. Must reject — caller should set
+    clarity='needs_clarification' instead."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="clear",
+            actions={},
+            compose=_ok_compose(),
+        )
+    assert "at least one action" in str(exc.value).lower()
+
+
+def test_plan_needs_clarification_with_empty_actions_accepted() -> None:
+    """The point of clarity='needs_clarification' — planner caught
+    ambiguity, wants to ask back without dispatching tools."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время напоминания",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+        ),
+    )
+    assert plan.clarity == "needs_clarification"
+    assert plan.clarity_reason == "не указано время напоминания"
+    assert plan.actions == {}
+
+
+def test_plan_needs_clarification_requires_reason() -> None:
+    """The composer template needs clarity_reason to render the ask.
+    Empty/None/whitespace-only all rejected."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            # clarity_reason omitted entirely
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_user_for_clarification",
+            ),
+        )
+    assert "clarity_reason" in str(exc.value)
+
+
+def test_plan_needs_clarification_blank_reason_rejected() -> None:
+    """Whitespace-only reason is the same as missing — composer
+    can't render a useful ask from empty text."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="   ",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_user_for_clarification",
+            ),
+        )
+    assert "clarity_reason" in str(exc.value).lower()
+
+
+def test_plan_needs_clarification_mixed_mode_accepted() -> None:
+    """Mixed: do what's unambiguous (s1) + ask about the rest.
+    Planner can legitimately partially fulfil and still clarify
+    something else in the same turn."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время для напоминания",
+        actions={
+            "s1": Action(
+                tool="add_shopping_items",
+                args={"items": ["молоко"]},
+                expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+            ),
+        },
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_when_to_remind",
+            template_data={"what": "позвонить врачу"},
+        ),
+    )
+    assert plan.clarity == "needs_clarification"
+    assert len(plan.actions) == 1
+
+
+def test_plan_clarity_invalid_literal_rejected() -> None:
+    """clarity is a closed enum — typos like 'unclear' or 'partial'
+    must be caught at parse time."""
+    with pytest.raises(ValidationError):
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="partially_clear",  # invalid literal
+            actions={"s1": _ok_action()},
+            compose=_ok_compose(),
+        )
+
+
+def test_plan_clarity_reason_max_length_enforced() -> None:
+    """500-char ceiling matches turn_classification.reason — planner
+    should give a SHORT explanation, not a paragraph. Long reason
+    would mean the planner is using clarity_reason as a fallback
+    response channel (wrong layer)."""
+    with pytest.raises(ValidationError):
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="x" * 501,
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_user_for_clarification",
+            ),
+        )
+
+
+def test_plan_clarity_reason_with_clear_is_allowed_but_unused() -> None:
+    """A planner might emit clarity_reason for telemetry even when
+    clarity='clear'. We don't error — just don't surface it. Forward
+    compatibility for future "soft clarification" telemetry feature."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="clear",
+        clarity_reason="for telemetry only — request was actually clear",
+        actions={"s1": _ok_action()},
+        compose=_ok_compose(),
+    )
+    assert plan.clarity == "clear"
+    assert plan.clarity_reason is not None

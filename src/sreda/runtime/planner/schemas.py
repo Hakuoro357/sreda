@@ -16,6 +16,17 @@ Plan-level validation responsibilities live in ``Plan._validate_graph``:
 - ``depends_on`` must not be self-referential
 - ``depends_on`` must form a DAG (no cycles)
 - ``expected_outcomes[].next`` must point at existing action ids
+
+Two operating modes for a Plan (vex-assistant#77 item #2 — clarity):
+
+  ``clarity='clear'`` (default) — normal execution plan. ``actions``
+    MUST be non-empty; the validator + executor run the DAG.
+  ``clarity='needs_clarification'`` — planner caught ambiguity in the
+    user request and wants to ask back. ``clarity_reason`` MUST be
+    populated. ``actions`` MAY be empty (typical case — pure ask)
+    or partially filled (mixed: do what's safe, ask about the rest).
+    Executor renders ``compose`` directly without dispatching tools
+    when ``actions`` is empty.
 """
 
 from __future__ import annotations
@@ -135,14 +146,55 @@ class Plan(BaseModel):
     a final composer call. The validator infers topological layers, joins,
     and fail_modes from action metadata; the planner does not declare
     parallelism explicitly.
+
+    ``clarity`` (vex-assistant#77 item #2) lets the planner proactively
+    signal that it caught ambiguity in the user request and wants to ask
+    back instead of guessing. ``clarity='needs_clarification'`` requires
+    ``clarity_reason`` to be populated and allows ``actions`` to be empty
+    (the typical "pure ask" case). See module docstring for the full
+    operating-mode contract.
     """
 
     model_config = _STRICT
 
     schema_version: int = 1
     turn_classification: TurnClassification
-    actions: dict[str, Action] = Field(min_length=1)
+    clarity: Literal["clear", "needs_clarification"] = "clear"
+    clarity_reason: str | None = Field(default=None, max_length=500)
+    # NOT ``min_length=1`` — clarity='needs_clarification' allows empty
+    # actions (pure ask path). The clear-vs-needs_clarification consistency
+    # check below enforces that ``clarity='clear'`` still requires at least
+    # one action.
+    actions: dict[str, Action] = Field(default_factory=dict)
     compose: ComposerCall
+
+    @model_validator(mode="after")
+    def _validate_clarity(self) -> Plan:
+        """Enforce the clarity operating-mode contract:
+
+        - ``clarity='clear'`` (default normal-plan mode) requires
+          non-empty ``actions``. Empty actions with clear=clarity would
+          mean "I have nothing to do AND I'm not asking" — a no-op
+          plan that produces no user-visible work.
+        - ``clarity='needs_clarification'`` requires a non-empty
+          ``clarity_reason`` so the composer can surface WHY we're
+          asking (template-rendered, no LLM call).
+        """
+        if self.clarity == "clear" and len(self.actions) == 0:
+            raise ValueError(
+                "Plan(clarity='clear') requires at least one action. "
+                "If the planner has nothing to do, set "
+                "clarity='needs_clarification' with a clarity_reason "
+                "explaining what to ask the user."
+            )
+        if self.clarity == "needs_clarification":
+            if self.clarity_reason is None or not self.clarity_reason.strip():
+                raise ValueError(
+                    "Plan(clarity='needs_clarification') requires a "
+                    "non-empty clarity_reason explaining what's "
+                    "ambiguous about the user request."
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_graph(self) -> Plan:
