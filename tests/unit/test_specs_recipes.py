@@ -262,8 +262,9 @@ def test_save_recipes_batch_input_rejects_duplicate_normalized_titles() -> None:
 
 
 def test_save_recipes_batch_input_rejects_oversize_payload() -> None:
-    """Codex R1 MAJOR #5: aggregate char budget — 50 recipes × 8000-char
-    instructions = 400KB worst case. Cap at 200_000 chars."""
+    """Codex R1 MAJOR #5 + R3/R4 cleanup: aggregate char budget — 50
+    recipes × 8000-char instructions = 400_000 chars worst case
+    (Python str len, NOT UTF-8 bytes). Cap at 200_000 chars."""
     huge_instructions = "x" * 8000
     recipes = [
         {**_VALID_RECIPE, "title": f"Рецепт #{i}", "instructions_md": huge_instructions}
