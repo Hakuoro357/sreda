@@ -304,6 +304,60 @@ def test_onboarding_typeadapter_rejects_sentinel() -> None:
             })
 
 
+def test_chat_tool_wrapper_rejects_inactive_topic() -> None:
+    """Codex R5 MAJOR + R6 MAJOR: wrapper-level + service-level
+    defense-in-depth. Verify the LangChain tool wrapper rejects
+    `family` (legacy topic, not in TOPIC_ORDER) with the stable
+    error code BEFORE reaching the service."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        tools = {
+            t.name: t for t in build_housewife_tools(
+                session=session, tenant_id="t1", user_id="u1",
+            )
+        }
+        result = tools["onboarding_answered"].invoke({
+            "topic": "family", "summary": "жена и двое детей",
+        })
+        assert "topic_not_in_active_flow" in result, (
+            f"wrapper must reject inactive topic, got {result!r}"
+        )
+
+        result = tools["onboarding_deferred"].invoke({
+            "topic": "diet", "reason": "потом",
+        })
+        assert "topic_not_in_active_flow" in result
+
+
+def test_chat_tool_wrapper_accepts_addressing() -> None:
+    """Confirm guard doesn't break the active topic happy path."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        tools = {
+            t.name: t for t in build_housewife_tools(
+                session=session, tenant_id="t1", user_id="u1",
+            )
+        }
+        result = tools["onboarding_answered"].invoke({
+            "topic": "addressing", "summary": "Борис",
+        })
+        assert result.startswith("ok:answered:addressing:"), result
+
+
 def test_migrated_tool_specs_aggregate_includes_onboarding() -> None:
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
     onboarding_names = {s.name for s in ONBOARDING_SPECS}

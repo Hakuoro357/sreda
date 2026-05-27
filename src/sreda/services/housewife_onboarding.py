@@ -291,6 +291,14 @@ class HousewifeOnboardingService:
         """
         if topic not in TOPIC_DESCRIPTIONS:
             raise ValueError(f"unknown topic: {topic!r}")
+        # Codex Sub-A4 onboarding R6 MAJOR (HIGH catch): defense-in-depth.
+        # TOPIC_DESCRIPTIONS keeps all 6 legacy IDs for backward compat,
+        # but TOPIC_ORDER is the ACTIVE flow ("addressing",) since
+        # 2026-04-27. Reject inactive topics at the service boundary so
+        # direct callers (Mini App / admin tools) can't bypass the
+        # wrapper guard and persist hidden rows.
+        if topic not in TOPIC_ORDER:
+            raise ValueError(f"topic_not_in_active_flow: {topic!r}")
         state = self.get_raw_state(tenant_id=tenant_id, user_id=user_id)
         topic_row = state["topics"].get(topic) or {}
         topic_row["state"] = STATE_ANSWERED
@@ -325,6 +333,14 @@ class HousewifeOnboardingService:
         (topic comes back at end of list). Second → ``skipped`` (done)."""
         if topic not in TOPIC_DESCRIPTIONS:
             raise ValueError(f"unknown topic: {topic!r}")
+        # Codex Sub-A4 onboarding R6 MAJOR (HIGH catch): defense-in-depth.
+        # TOPIC_DESCRIPTIONS keeps all 6 legacy IDs for backward compat,
+        # but TOPIC_ORDER is the ACTIVE flow ("addressing",) since
+        # 2026-04-27. Reject inactive topics at the service boundary so
+        # direct callers (Mini App / admin tools) can't bypass the
+        # wrapper guard and persist hidden rows.
+        if topic not in TOPIC_ORDER:
+            raise ValueError(f"topic_not_in_active_flow: {topic!r}")
         state = self.get_raw_state(tenant_id=tenant_id, user_id=user_id)
         topic_row = state["topics"].get(topic) or {}
         current = topic_row.get("state")
