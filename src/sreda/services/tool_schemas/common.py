@@ -456,6 +456,18 @@ Matches the ``uuid4().hex[:24]`` runtime token. Tight regex shape
 catches malformed planner refs at validation time."""
 
 
+ChecklistItemId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=rf"^clitem_{_HEX24}$",
+    ),
+]
+"""Checklist item id — ``clitem_<24 hex chars>`` (``checklists.py:301,471``).
+Items inside a checklist (separate from `ChecklistId` for the list
+itself). Tight regex catches malformed planner refs."""
+
+
 # ---------------------------------------------------------------------------
 # Reminders family — date/time + recurrence aliases.
 #

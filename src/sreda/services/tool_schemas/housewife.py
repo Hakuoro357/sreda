@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.common import (
     ChecklistId,
+    ChecklistItemId,
     FamilyMemberId,
     MenuItemId,
     MenuPlanId,
@@ -112,6 +113,18 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"^member\s+.+\s+not\s+found$", re.IGNORECASE),
         "member_not_found",
+    ),
+    # checklist family — list_not_found / item_not_found with embedded
+    # repr'd needle: ``error: list_not_found: 'дача'`` /
+    # ``error: item_not_found: 'молоко'`` / ``error: not_found: 'X'``.
+    # Source: ``housewife_chat_tools.py:2590,2623,2628,2662,2668,2692``.
+    (
+        re.compile(r"^list_not_found:.+", re.IGNORECASE),
+        "checklist_list_not_found",
+    ),
+    (
+        re.compile(r"^item_not_found:.+", re.IGNORECASE),
+        "checklist_item_not_found",
     ),
     # link_task_to_checklist conflict shapes (Codex Sub-A4 tasks R1 MAJOR #5).
     # Source: ``housewife_chat_tools.py:2239-2247``.
@@ -2560,6 +2573,642 @@ def parse_unlink_task(
 
 
 # ---------------------------------------------------------------------------
+# 37-44. Checklists family (Sub-A4 phase 7) — 8 tools:
+#         create_checklist / add_checklist_items / move_task_to_checklist /
+#         list_checklists / show_checklist /
+#         mark_checklist_item_done / delete_checklist_item / archive_checklist
+#
+# Runtime shapes (housewife_chat_tools.py:2368-2698):
+#
+#   create_checklist:
+#     "ok:created:{checklist_id}:{title}"
+#     error:<msg>
+#
+#   add_checklist_items:
+#     "ok:added:N:list={checklist_id}"
+#     "ok:added:N:dups:M:list={checklist_id}"
+#     "error: empty items"
+#     error:<msg>
+#
+#   move_task_to_checklist:
+#     "ok:moved:item_id={clitem_id}:list={checklist_id}"
+#     "ok:moved:item_id=existing:list={checklist_id}:dup"  (idempotent)
+#     "error: task_not_found"
+#     "error: task_has_empty_title"
+#     "error: list_resolve_failed"
+#     "error: nothing_added"
+#     "error: internal" / "error: internal_cancel" / "error: internal_add"
+#
+#   list_checklists:
+#     "no checklists"  (empty)
+#     multi-line "[{id}] · {title} · {p} pending, {d} done, {t} total"
+#
+#   show_checklist:
+#     "error: not_found: '<needle>'"  (list not found)
+#     "empty: list={id} title='<title>'"  (list exists but no items)
+#     "# {title} ({id})\n[{item_id}] ☐ {title}\n..."  (populated)
+#
+#   mark_checklist_item_done:
+#     "ok:done:{clitem_id}:{title}"
+#     "error: list_not_found: '<needle>'"
+#     "error: item_not_found: '<needle>'"
+#
+#   delete_checklist_item:
+#     "ok:deleted:{clitem_id}:{title}"
+#     "error: list_not_found: '<needle>'"
+#     "error: item_not_found: '<needle>'"
+#
+#   archive_checklist:
+#     "ok:archived:{checklist_id}"
+#     "error: not_found: '<needle>'"
+# ---------------------------------------------------------------------------
+
+
+# 37. create_checklist
+class CreateChecklistOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["created"] = "created"
+    checklist_id: ChecklistId
+    title: str = Field(min_length=1, max_length=500)
+
+
+CreateChecklistOutput = Annotated[
+    Union[CreateChecklistOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_CREATE_CHECKLIST_RE = re.compile(
+    r"^ok:created:(?P<cid>checklist_[0-9a-f]{24}):(?P<title>.+)$"
+)
+
+
+def parse_create_checklist(
+    raw: str,
+) -> CreateChecklistOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _CREATE_CHECKLIST_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="create_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return CreateChecklistOk(
+            checklist_id=m.group("cid"),
+            title=m.group("title").strip(),
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="create_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 38. add_checklist_items
+class AddChecklistItemsOk(BaseModel):
+    """Variant 1: ``ok:added:N:list=<id>`` (no dups segment).
+    All items new, no duplicates skipped."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["added"] = "added"
+    added_count: int = Field(ge=0)
+    duplicate_count: int = 0
+    checklist_id: ChecklistId
+
+
+class AddChecklistItemsWithDups(BaseModel):
+    """Variant 2: ``ok:added:N:dups:M:list=<id>``. Some items
+    matched existing pending items in the list — runtime
+    dedup-skipped them."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["added_with_dups"] = "added_with_dups"
+    added_count: int = Field(ge=0)
+    duplicate_count: int = Field(ge=1)
+    checklist_id: ChecklistId
+
+
+AddChecklistItemsOutput = Annotated[
+    Union[
+        AddChecklistItemsOk,
+        AddChecklistItemsWithDups,
+        HousewifeToolError,
+    ],
+    Field(discriminator="status"),
+]
+
+
+_ADD_CHECKLIST_ITEMS_NODUPS_RE = re.compile(
+    r"^ok:added:(?P<n>\d+):list=(?P<cid>checklist_[0-9a-f]{24})$"
+)
+_ADD_CHECKLIST_ITEMS_WITHDUPS_RE = re.compile(
+    r"^ok:added:(?P<n>\d+):dups:(?P<m>\d+):"
+    r"list=(?P<cid>checklist_[0-9a-f]{24})$"
+)
+
+
+def parse_add_checklist_items(
+    raw: str,
+) -> (
+    AddChecklistItemsOk
+    | AddChecklistItemsWithDups
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    m_with = _ADD_CHECKLIST_ITEMS_WITHDUPS_RE.match(stripped)
+    if m_with is not None:
+        try:
+            return AddChecklistItemsWithDups(
+                added_count=int(m_with.group("n")),
+                duplicate_count=int(m_with.group("m")),
+                checklist_id=m_with.group("cid"),
+            )
+        except ValidationError:
+            pass
+    m_no = _ADD_CHECKLIST_ITEMS_NODUPS_RE.match(stripped)
+    if m_no is not None:
+        try:
+            return AddChecklistItemsOk(
+                added_count=int(m_no.group("n")),
+                checklist_id=m_no.group("cid"),
+            )
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="add_checklist_items",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# 39. move_task_to_checklist
+class MoveTaskMovedOk(BaseModel):
+    """Happy path: task cancelled + new checklist item created."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["moved"] = "moved"
+    item_id: ChecklistItemId
+    checklist_id: ChecklistId
+
+
+class MoveTaskMovedDup(BaseModel):
+    """Idempotent path: task cancelled but checklist already had
+    a matching item — no new item created. ``item_id`` is the
+    sentinel literal ``"existing"`` (not a real clitem_<24 hex>
+    because runtime doesn't echo the matched item's id, only
+    that one existed)."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["moved_dup"] = "moved_dup"
+    checklist_id: ChecklistId
+
+
+MoveTaskToChecklistOutput = Annotated[
+    Union[
+        MoveTaskMovedOk,
+        MoveTaskMovedDup,
+        HousewifeToolError,
+    ],
+    Field(discriminator="status"),
+]
+
+
+_MOVE_TASK_NEW_RE = re.compile(
+    r"^ok:moved:item_id=(?P<item_id>clitem_[0-9a-f]{24}):"
+    r"list=(?P<cid>checklist_[0-9a-f]{24})$"
+)
+_MOVE_TASK_DUP_RE = re.compile(
+    r"^ok:moved:item_id=existing:list=(?P<cid>checklist_[0-9a-f]{24}):dup$"
+)
+
+
+def parse_move_task_to_checklist(
+    raw: str,
+) -> (
+    MoveTaskMovedOk
+    | MoveTaskMovedDup
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    m_new = _MOVE_TASK_NEW_RE.match(stripped)
+    if m_new is not None:
+        try:
+            return MoveTaskMovedOk(
+                item_id=m_new.group("item_id"),
+                checklist_id=m_new.group("cid"),
+            )
+        except ValidationError:
+            pass
+    m_dup = _MOVE_TASK_DUP_RE.match(stripped)
+    if m_dup is not None:
+        try:
+            return MoveTaskMovedDup(checklist_id=m_dup.group("cid"))
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="move_task_to_checklist",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# 40. list_checklists
+class ListChecklistsRow(BaseModel):
+    """One checklist line in ``list_checklists`` output."""
+    model_config = ConfigDict(extra="forbid")
+    checklist_id: ChecklistId
+    title: str = Field(min_length=1, max_length=500)
+    pending_count: int = Field(ge=0)
+    done_count: int = Field(ge=0)
+    total_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_counts(self) -> "ListChecklistsRow":
+        # Runtime emits pending + done + total separately; total can
+        # legitimately be ≥ pending+done (cancelled items don't fall
+        # into either bucket but count toward total). Just sanity-
+        # check non-negative + counts make sense.
+        if self.total_count < self.pending_count + self.done_count:
+            raise ValueError(
+                f"total_count={self.total_count} less than "
+                f"pending_count={self.pending_count} + "
+                f"done_count={self.done_count} — runtime drift."
+            )
+        return self
+
+
+class ListChecklistsEmpty(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["empty"] = "empty"
+
+
+class ListChecklistsOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["ok"] = "ok"
+    checklists: list[ListChecklistsRow] = Field(default_factory=list)
+
+
+ListChecklistsOutput = Annotated[
+    Union[ListChecklistsOk, ListChecklistsEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+# Per-row: `[checklist_id] · title · N pending, M done, T total`
+_LIST_CHECKLISTS_ROW_RE = re.compile(
+    r"^\[(?P<cid>checklist_[0-9a-f]{24})\]\s*·\s*"
+    r"(?P<title>.+?)\s*·\s*"
+    r"(?P<p>\d+)\s+pending,\s*(?P<d>\d+)\s+done,\s*(?P<t>\d+)\s+total$"
+)
+
+
+def parse_list_checklists(
+    raw: str,
+) -> (
+    ListChecklistsOk
+    | ListChecklistsEmpty
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "no checklists":
+        return ListChecklistsEmpty()
+    if not stripped or stripped.startswith("error:") or stripped.startswith("ok:"):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_checklists",
+            timestamp=datetime.now(timezone.utc),
+        )
+    rows: list[ListChecklistsRow] = []
+    for line in stripped.splitlines():
+        if not line.strip():
+            continue
+        m = _LIST_CHECKLISTS_ROW_RE.match(line)
+        if m is None:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_checklists",
+                timestamp=datetime.now(timezone.utc),
+            )
+        try:
+            rows.append(ListChecklistsRow(
+                checklist_id=m.group("cid"),
+                title=m.group("title").strip(),
+                pending_count=int(m.group("p")),
+                done_count=int(m.group("d")),
+                total_count=int(m.group("t")),
+            ))
+        except ValidationError:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_checklists",
+                timestamp=datetime.now(timezone.utc),
+            )
+    if not rows:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_checklists",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ListChecklistsOk(checklists=rows)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_checklists",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 41. show_checklist
+class ShowChecklistItem(BaseModel):
+    """One item line inside a checklist."""
+    model_config = ConfigDict(extra="forbid")
+    item_id: ChecklistItemId
+    item_status: Literal["pending", "done", "cancelled"]
+    title: str = Field(min_length=1, max_length=500)
+
+
+class ShowChecklistEmpty(BaseModel):
+    """List exists but has no items."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["empty"] = "empty"
+    checklist_id: ChecklistId
+    title: str = Field(min_length=1, max_length=500)
+
+
+class ShowChecklistOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["ok"] = "ok"
+    checklist_id: ChecklistId
+    title: str = Field(min_length=1, max_length=500)
+    items: list[ShowChecklistItem] = Field(min_length=1)
+
+
+ShowChecklistOutput = Annotated[
+    Union[ShowChecklistOk, ShowChecklistEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+# Header: `# {title} ({checklist_id})`
+_SHOW_CHECKLIST_HEADER_RE = re.compile(
+    r"^#\s+(?P<title>.+?)\s+\((?P<cid>checklist_[0-9a-f]{24})\)$"
+)
+# Item: `[{clitem_id}] ☐ {title}` / `☑` / `✗`
+_SHOW_CHECKLIST_ITEM_RE = re.compile(
+    r"^\[(?P<iid>clitem_[0-9a-f]{24})\]\s+(?P<mark>[☐☑✗])\s+(?P<title>.+)$"
+)
+# Empty: `empty: list={id} title='{title}'`
+_SHOW_CHECKLIST_EMPTY_RE = re.compile(
+    r"^empty:\s+list=(?P<cid>checklist_[0-9a-f]{24})\s+title=(?P<title>.+)$"
+)
+_MARK_TO_STATUS = {"☐": "pending", "☑": "done", "✗": "cancelled"}
+
+
+def parse_show_checklist(
+    raw: str,
+) -> (
+    ShowChecklistOk
+    | ShowChecklistEmpty
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        # Codex Sub-A4 checklists R1 (preempt): runtime emits
+        # `error: not_found: '<needle>'` for list lookup miss in
+        # show_checklist + archive_checklist (housewife_chat_tools.py
+        # :2590, :2692). Other tools (mark/delete) use the more
+        # explicit `list_not_found:`. Remap both to one stable code
+        # so planner branching is uniform.
+        if err.error_code == "not_found" or (
+            err.error_code == "unknown"
+            and err.message.lower().startswith("not_found")
+        ):
+            return HousewifeToolError(
+                error_code="checklist_list_not_found", message=err.message,
+            )
+        return err
+    stripped = raw.strip()
+    # Empty path
+    m_empty = _SHOW_CHECKLIST_EMPTY_RE.match(stripped.splitlines()[0] if stripped else "")
+    if m_empty is not None:
+        # Title in runtime is `repr()` quoted (e.g. `'Дача'`) — strip quotes.
+        title_raw = m_empty.group("title").strip()
+        if (title_raw.startswith("'") and title_raw.endswith("'")) or (
+            title_raw.startswith('"') and title_raw.endswith('"')
+        ):
+            title_raw = title_raw[1:-1]
+        try:
+            return ShowChecklistEmpty(
+                checklist_id=m_empty.group("cid"),
+                title=title_raw,
+            )
+        except ValidationError:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="show_checklist",
+                timestamp=datetime.now(timezone.utc),
+            )
+    # Populated path
+    lines = stripped.splitlines()
+    if not lines:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="show_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+    m_header = _SHOW_CHECKLIST_HEADER_RE.match(lines[0])
+    if m_header is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="show_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+    items: list[ShowChecklistItem] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        m_item = _SHOW_CHECKLIST_ITEM_RE.match(line)
+        if m_item is None:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="show_checklist",
+                timestamp=datetime.now(timezone.utc),
+            )
+        mark = m_item.group("mark")
+        item_status = _MARK_TO_STATUS.get(mark)
+        if item_status is None:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="show_checklist",
+                timestamp=datetime.now(timezone.utc),
+            )
+        try:
+            items.append(ShowChecklistItem(
+                item_id=m_item.group("iid"),
+                item_status=item_status,
+                title=m_item.group("title").strip(),
+            ))
+        except ValidationError:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="show_checklist",
+                timestamp=datetime.now(timezone.utc),
+            )
+    if not items:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="show_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ShowChecklistOk(
+            checklist_id=m_header.group("cid"),
+            title=m_header.group("title").strip(),
+            items=items,
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="show_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 42. mark_checklist_item_done
+class MarkChecklistItemDoneOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["done"] = "done"
+    item_id: ChecklistItemId
+    title: str = Field(min_length=1, max_length=500)
+
+
+MarkChecklistItemDoneOutput = Annotated[
+    Union[MarkChecklistItemDoneOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_MARK_DONE_RE = re.compile(
+    r"^ok:done:(?P<iid>clitem_[0-9a-f]{24}):(?P<title>.+)$"
+)
+
+
+def parse_mark_checklist_item_done(
+    raw: str,
+) -> MarkChecklistItemDoneOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _MARK_DONE_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="mark_checklist_item_done",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return MarkChecklistItemDoneOk(
+            item_id=m.group("iid"),
+            title=m.group("title").strip(),
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="mark_checklist_item_done",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 43. delete_checklist_item
+class DeleteChecklistItemOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["deleted"] = "deleted"
+    item_id: ChecklistItemId
+    title: str = Field(min_length=1, max_length=500)
+
+
+DeleteChecklistItemOutput = Annotated[
+    Union[DeleteChecklistItemOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_DELETE_ITEM_RE = re.compile(
+    r"^ok:deleted:(?P<iid>clitem_[0-9a-f]{24}):(?P<title>.+)$"
+)
+
+
+def parse_delete_checklist_item(
+    raw: str,
+) -> DeleteChecklistItemOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _DELETE_ITEM_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="delete_checklist_item",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return DeleteChecklistItemOk(
+            item_id=m.group("iid"),
+            title=m.group("title").strip(),
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="delete_checklist_item",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 44. archive_checklist
+class ArchiveChecklistOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["archived"] = "archived"
+    checklist_id: ChecklistId
+
+
+ArchiveChecklistOutput = Annotated[
+    Union[ArchiveChecklistOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_ARCHIVE_CHECKLIST_RE = re.compile(
+    r"^ok:archived:(?P<cid>checklist_[0-9a-f]{24})$"
+)
+
+
+def parse_archive_checklist(
+    raw: str,
+) -> ArchiveChecklistOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        # Codex Sub-A4 checklists R1 (preempting reviewer): runtime
+        # at housewife_chat_tools.py:2692 emits `error: not_found:
+        # '<needle>'` for list lookup miss. Remap to the same stable
+        # code mark/delete use for list-not-found.
+        if err.error_code == "not_found" or (
+            err.error_code == "unknown"
+            and err.message.lower().startswith("not_found")
+        ):
+            return HousewifeToolError(
+                error_code="checklist_list_not_found", message=err.message,
+            )
+        return err
+    m = _ARCHIVE_CHECKLIST_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="archive_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ArchiveChecklistOk(checklist_id=m.group("cid"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="archive_checklist",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -2601,6 +3250,14 @@ PARSERS = {
     "detach_reminder": parse_detach_reminder,
     "link_task_to_checklist": parse_link_task_to_checklist,
     "unlink_task": parse_unlink_task,
+    "create_checklist": parse_create_checklist,
+    "add_checklist_items": parse_add_checklist_items,
+    "move_task_to_checklist": parse_move_task_to_checklist,
+    "list_checklists": parse_list_checklists,
+    "show_checklist": parse_show_checklist,
+    "mark_checklist_item_done": parse_mark_checklist_item_done,
+    "delete_checklist_item": parse_delete_checklist_item,
+    "archive_checklist": parse_archive_checklist,
 }
 
 

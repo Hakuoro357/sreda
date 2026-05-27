@@ -680,40 +680,28 @@ def test_reminders_anti_patterns_explain_attach_reminder_boundary() -> None:
 
 
 def test_tasks_anti_patterns_explain_checklist_link_boundary() -> None:
-    """Codex Sub-A4 tasks R1 (registry quality cross-family fix) +
-    R2 MINOR #7 strengthening: boundary between
-    link_task_to_checklist (tasks, migrated) and the «merge task
-    into checklist as item» semantic (checklists, not yet migrated)
-    must surface in the tasks family header WITHOUT naming the
-    unmigrated checklists-side tool by name (steering the planner
-    toward an unavailable typed tool).
-
-    R2 strengthening:
-    - link_task_to_checklist explicitly named (migrated, safe)
-    - move_task_to_checklist explicitly NOT named (unmigrated)
-    - BOTH semantics ('link existing pair' AND 'move as item')
-      taught so planner can distinguish them.
+    """Codex Sub-A4 checklists R1 — re-strengthened test now that
+    move_task_to_checklist IS migrated (was relaxed in tasks R1
+    when only link_task_to_checklist was migrated). Both tools
+    should now be named explicitly so planner can distinguish them.
     """
     text = " ".join(FAMILY_HEADERS["tasks"].anti_patterns)
     text_lower = text.lower()
-    # Named tool (migrated): MUST appear.
+    # Both migrated tools MUST be named.
     assert "link_task_to_checklist" in text, (
         "tasks header must teach link_task_to_checklist boundary"
     )
-    # Unmigrated tool MUST NOT appear by name — cross-family hygiene.
-    assert "move_task_to_checklist" not in text, (
-        "move_task_to_checklist is not yet migrated; naming it in "
-        "the tasks family header steers the planner toward an "
-        "unavailable typed tool. Use intent-level wording instead."
+    assert "move_task_to_checklist" in text, (
+        "tasks header must teach move_task_to_checklist boundary "
+        "(now migrated in checklists family)"
     )
     # Link semantic taught (link existing pair).
-    assert "связ" in text_lower or "связи" in text_lower or "связыва" in text_lower, (
+    assert "связ" in text_lower, (
         "header must teach the link semantic «связать существующую "
         "задачу с существующим чек-листом»"
     )
-    # Move-as-item semantic taught (without naming move_task_to_checklist).
+    # Move-as-item semantic taught.
     assert "пункт" in text_lower, (
         "header must teach the move-as-item semantic «задача "
-        "превращается в пункт чек-листа» (intent-level — without "
-        "naming the unmigrated move_task_to_checklist tool)"
+        "превращается в пункт чек-листа»"
     )

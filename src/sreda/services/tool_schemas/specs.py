@@ -39,6 +39,7 @@ patterns for that tool. This sentinel is **intentionally not** in any
 from __future__ import annotations
 
 from sreda.services.tool_schemas.base import ToolSpec
+from sreda.services.tool_schemas.specs_checklists import CHECKLISTS_SPECS
 from sreda.services.tool_schemas.specs_household import HOUSEHOLD_SPECS
 from sreda.services.tool_schemas.specs_menu import MENU_SPECS
 from sreda.services.tool_schemas.specs_recipes import RECIPES_SPECS
@@ -54,8 +55,8 @@ MIGRATED_TOOL_SPECS: list[ToolSpec] = [
     *MENU_SPECS,
     *HOUSEHOLD_SPECS,
     *TASKS_SPECS,
-    # Sub-A4 phase 7 will add:
-    # *CHECKLISTS_SPECS,
+    *CHECKLISTS_SPECS,
+    # Sub-A4 phase 8 will add:
     # *ONBOARDING_SPECS,
     # *UI_SPECS,
     # *MEMORY_SPECS,
