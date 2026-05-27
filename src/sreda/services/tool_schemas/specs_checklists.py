@@ -222,19 +222,23 @@ ADD_CHECKLIST_ITEMS_SPEC = ToolSpec(
 MOVE_TASK_TO_CHECKLIST_SPEC = ToolSpec(
     name="move_task_to_checklist",
     description=(
-        "Перенести задачу из Расписания в чек-лист как ПУНКТ — атомарно "
-        "(задача сворачивается). ОДИН вызов вместо cancel_task + "
-        "add_checklist_items (безопаснее: невозможно потерять task "
-        "частично или задвоить). Используй когда юзер: «перенеси X "
-        "из расписания в дела/чек-лист Y», «это не на конкретное "
-        "время — переложи в дела». В одной транзакции: cancel task "
-        "(с reminder если был) + add item с title задачи в target "
-        "checklist (с dedup). Target создаётся если не найден. "
-        "Возвращает ok:moved:item_id=<clitem>:list=<cid> или "
-        "ok:moved:item_id=existing:list=<cid>:dup (если такой пункт "
-        "уже был — идемпотентно). Граница vs link_task_to_checklist: "
-        "тот СВЯЗЫВАЕТ task ↔ checklist (оба остаются), этот "
-        "ПРЕВРАЩАЕТ task В пункт (task cancelled)."
+        "Перенести задачу из Расписания в чек-лист как ПУНКТ — ОДИН "
+        "вызов вместо cancel_task + add_checklist_items. Шаги "
+        "выполняются последовательно (best-effort, НЕ одна "
+        "транзакция — task_service.cancel/create_list/add_items "
+        "коммитят раздельно). Если на шаге add_item упало — task "
+        "уже отменён; планировщик должен честно сказать юзеру что "
+        "перенос частично завершён (task в cancelled, item не "
+        "создан). Используй когда юзер: «перенеси X из расписания "
+        "в дела/чек-лист Y», «это не на конкретное время — переложи "
+        "в дела». Последовательно: cancel task (с reminder если был) "
+        "→ add item с title задачи в target checklist (с dedup). "
+        "Target создаётся если не найден. Возвращает "
+        "ok:moved:item_id=<clitem>:list=<cid> или "
+        "ok:moved:item_id=existing:list=<cid>:dup (idempotent). "
+        "Граница vs link_task_to_checklist: тот СВЯЗЫВАЕТ task ↔ "
+        "checklist (оба остаются), этот ПРЕВРАЩАЕТ task В пункт "
+        "(task cancelled)."
     ),
     family="checklists",
     effect="write",
@@ -394,7 +398,11 @@ ARCHIVE_CHECKLIST_SPEC = ToolSpec(
     ),
     family="checklists",
     effect="write",
-    read_domains=[],
+    # Codex Sub-A4 checklists R1 MINOR #2: runtime fuzzy-resolves
+    # list_id_or_title via find_list_by_title BEFORE archiving
+    # (housewife_chat_tools.py:2688), so checklists is in read_domains
+    # for accurate concurrency tracking.
+    read_domains=["checklists"],
     write_domains=["checklists"],
     input_model=ArchiveChecklistInput,
     output_model=ArchiveChecklistOutput,
