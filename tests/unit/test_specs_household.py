@@ -665,6 +665,133 @@ def test_household_parser_outputs_are_valid_against_spec_output_model(tool, raw)
     assert validated.status == parsed.status
 
 
+# ---------------------------------------------------------------------------
+# Codex R3 MAJOR (prior-not-closed) — clear_birth_year runtime parity
+# ---------------------------------------------------------------------------
+
+
+def test_update_member_service_clears_birth_year_when_flag_set():
+    """Codex Sub-A4 household R3 MAJOR: schema-side flag must
+    actually clear the column. Integration test against real
+    SQLAlchemy session + HousewifeFamilyService."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base, FamilyMember
+    from sreda.services.housewife_family import HousewifeFamilyService
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        svc = HousewifeFamilyService(session)
+        created = svc.add_members_batch(
+            tenant_id="t1", user_id="u1",
+            members=[{"name": "Маша", "role": "child", "birth_year": 2017}],
+        )
+        member_id = created[0].id
+
+        # Confirm baseline
+        assert created[0].birth_year == 2017
+
+        # Clear via flag
+        row = svc.update_member(
+            tenant_id="t1", user_id="u1", member_id=member_id,
+            clear_birth_year=True,
+        )
+        assert row is not None
+        assert row.birth_year is None
+
+
+def test_update_member_service_rejects_birth_year_and_clear_together():
+    """Service-level mutual-exclusion guard mirrors the schema one
+    so direct service callers (Mini App, admin endpoints) get the
+    same protection."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_family import HousewifeFamilyService
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        svc = HousewifeFamilyService(session)
+        created = svc.add_members_batch(
+            tenant_id="t1", user_id="u1",
+            members=[{"name": "Маша", "role": "child"}],
+        )
+        with pytest.raises(ValueError) as exc:
+            svc.update_member(
+                tenant_id="t1", user_id="u1", member_id=created[0].id,
+                birth_year=2010, clear_birth_year=True,
+            )
+        assert "mutually exclusive" in str(exc.value)
+
+
+def test_update_family_member_chat_tool_propagates_clear_birth_year():
+    """End-to-end: LangChain tool accepts clear_birth_year and
+    plumbs it through to service. Catches the R3 schema-vs-runtime
+    gap that the prior R2 commit left open."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        tools = {
+            t.name: t for t in build_housewife_tools(
+                session=session, tenant_id="t1", user_id="u1",
+            )
+        }
+        result = tools["add_family_members"].invoke({
+            "members": [{
+                "name": "Маша", "role": "child", "birth_year": 2017,
+            }],
+        })
+        # Parse fm_id from "ok:added:1:skipped_as_duplicate:0:ids=[fm_...]"
+        member_id = result.split("ids=[")[1].rstrip("]")
+
+        # Clear via the chat tool
+        out = tools["update_family_member"].invoke({
+            "member_id": member_id, "clear_birth_year": True,
+        })
+        assert out == "ok:updated"
+
+
+def test_update_family_member_chat_tool_rejects_birth_year_and_clear_together():
+    """End-to-end: mutual-exclusion surfaces as ``error: ...``
+    rather than silently picking one."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sreda.db.models.housewife import Base
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        tools = {
+            t.name: t for t in build_housewife_tools(
+                session=session, tenant_id="t1", user_id="u1",
+            )
+        }
+        result = tools["add_family_members"].invoke({
+            "members": [{"name": "Маша", "role": "child"}],
+        })
+        member_id = result.split("ids=[")[1].rstrip("]")
+
+        out = tools["update_family_member"].invoke({
+            "member_id": member_id,
+            "birth_year": 2010,
+            "clear_birth_year": True,
+        })
+        assert out.startswith("error:")
+        assert "mutually exclusive" in out
+
+
 def test_household_typeadapter_rejects_sentinel() -> None:
     """ContractViolation must NOT be accepted by any output_model
     discriminator union — fail-closed semantic."""

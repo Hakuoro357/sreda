@@ -1651,6 +1651,7 @@ def build_housewife_tools(
         name: str | None = None,
         role: str | None = None,
         birth_year: int | None = None,
+        clear_birth_year: bool = False,
         age_hint: str | None = None,
         notes: str | None = None,
     ) -> str:
@@ -1660,10 +1661,18 @@ def build_housewife_tools(
         user corrects info: "Маше 9 уже" → set birth_year or age_hint;
         "у Никиты аллергия на молоко теперь" → set notes.
 
+        Codex Sub-A4 household R3 MAJOR: pass ``clear_birth_year=True``
+        to null the birth_year column (e.g. «убери год рождения»).
+        Mutually exclusive with ``birth_year=N`` — passing both
+        returns ``error: birth_year and clear_birth_year are mutually
+        exclusive ...``. age_hint / notes are cleared by passing an
+        empty string ``""``.
+
         Args:
             member_id: id from list_family_members (``fm_...``).
             name / role / birth_year / age_hint / notes: new values.
                 Roles: self | spouse | child | parent | other.
+            clear_birth_year: when True, nulls birth_year column.
 
         Returns ok:updated or error.
         """
@@ -1677,6 +1686,7 @@ def build_housewife_tools(
                 name=name,
                 role=role,
                 birth_year=birth_year,
+                clear_birth_year=clear_birth_year,
                 age_hint=age_hint,
                 notes=notes,
             )

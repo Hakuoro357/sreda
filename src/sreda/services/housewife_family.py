@@ -117,11 +117,22 @@ class HousewifeFamilyService:
         name: str | None = None,
         role: str | None = None,
         birth_year: int | None = None,
+        clear_birth_year: bool = False,
         age_hint: str | None = None,
         notes: str | None = None,
     ) -> FamilyMember | None:
         """Update individual fields. Pass None to leave unchanged.
-        Returns None if member not found / cross-tenant."""
+        Returns None if member not found / cross-tenant.
+
+        Codex Sub-A4 household R3 MAJOR: ``clear_birth_year=True``
+        explicitly nulls the column (replaces destructive remove +
+        re-add workaround). Mutually exclusive with ``birth_year=N``
+        — passing both raises ``ValueError``."""
+        if birth_year is not None and clear_birth_year:
+            raise ValueError(
+                "birth_year and clear_birth_year are mutually exclusive "
+                "— set one or neither, not both."
+            )
         row = self._get_member(tenant_id, user_id, member_id)
         if row is None:
             return None
@@ -139,6 +150,8 @@ class HousewifeFamilyService:
             if not 1900 <= int(birth_year) <= 2100:
                 raise ValueError(f"implausible birth_year: {birth_year}")
             row.birth_year = int(birth_year)
+        elif clear_birth_year:
+            row.birth_year = None
         if age_hint is not None:
             row.age_hint = age_hint.strip()[:64] or None
         if notes is not None:
