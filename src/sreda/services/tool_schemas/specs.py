@@ -42,6 +42,7 @@ from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.specs_checklists import CHECKLISTS_SPECS
 from sreda.services.tool_schemas.specs_household import HOUSEHOLD_SPECS
 from sreda.services.tool_schemas.specs_menu import MENU_SPECS
+from sreda.services.tool_schemas.specs_onboarding import ONBOARDING_SPECS
 from sreda.services.tool_schemas.specs_recipes import RECIPES_SPECS
 from sreda.services.tool_schemas.specs_reminders import REMINDERS_SPECS
 from sreda.services.tool_schemas.specs_shopping import SHOPPING_SPECS
@@ -56,8 +57,8 @@ MIGRATED_TOOL_SPECS: list[ToolSpec] = [
     *HOUSEHOLD_SPECS,
     *TASKS_SPECS,
     *CHECKLISTS_SPECS,
-    # Sub-A4 phase 8 will add:
-    # *ONBOARDING_SPECS,
+    *ONBOARDING_SPECS,
+    # Sub-A4 phase 9 will add:
     # *UI_SPECS,
     # *MEMORY_SPECS,
     # *UTILITY_SPECS,

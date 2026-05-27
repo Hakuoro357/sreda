@@ -3266,6 +3266,187 @@ def parse_archive_checklist(
 
 
 # ---------------------------------------------------------------------------
+# 45-47. Onboarding family (Sub-A4 phase 8) — 3 tools:
+#         onboarding_answered / onboarding_deferred / onboarding_complete
+#
+# Sources of truth: housewife_chat_tools.py:555-660,
+# housewife_onboarding.py:85-93 for state/status constants.
+#
+# 6 topics: addressing, self_intro, family, diet, routine, pain_point.
+# 4 topic states: pending, answered, skipped_once, skipped.
+# 4 onboarding statuses: not_started, in_progress, complete, abandoned.
+#
+# Runtime shapes:
+#   answered: "ok:answered:<topic>:next=<topic|none>:status=<status>"
+#   deferred: "ok:deferred:<topic>:topic_state=<state>:next=<topic|none>:status=<status>"
+#   complete: "ok:complete:status=<status>"
+# ---------------------------------------------------------------------------
+
+
+OnboardingTopic = Literal[
+    "addressing", "self_intro", "family", "diet", "routine", "pain_point",
+]
+OnboardingTopicOrNone = Literal[
+    "addressing", "self_intro", "family", "diet", "routine", "pain_point", "none",
+]
+OnboardingStatus = Literal["not_started", "in_progress", "complete", "abandoned"]
+OnboardingTopicState = Literal[
+    "pending", "answered", "skipped_once", "skipped",
+]
+
+
+class OnboardingAnsweredOk(BaseModel):
+    """Happy-path response from onboarding_answered. Carries the
+    next-topic pointer (or 'none' when all topics closed) AND the
+    overall onboarding status so the planner can branch on
+    «продолжать опрос» vs «уже закончили»."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["answered"] = "answered"
+    topic: OnboardingTopic
+    next_topic: OnboardingTopicOrNone
+    onboarding_status: OnboardingStatus
+
+
+OnboardingAnsweredOutput = Annotated[
+    Union[OnboardingAnsweredOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_ONBOARDING_ANSWERED_RE = re.compile(
+    r"^ok:answered:"
+    r"(?P<topic>addressing|self_intro|family|diet|routine|pain_point):"
+    r"next=(?P<next>addressing|self_intro|family|diet|routine|pain_point|none):"
+    r"status=(?P<st>not_started|in_progress|complete|abandoned)$"
+)
+
+
+def parse_onboarding_answered(
+    raw: str,
+) -> OnboardingAnsweredOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _ONBOARDING_ANSWERED_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="onboarding_answered",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return OnboardingAnsweredOk(
+            topic=m.group("topic"),
+            next_topic=m.group("next"),
+            onboarding_status=m.group("st"),
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="onboarding_answered",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class OnboardingDeferredOk(BaseModel):
+    """Happy-path response from onboarding_deferred. Topic state
+    distinguishes «first skip — still in retry queue» (skipped_once)
+    from «second skip — permanently dropped» (skipped). Planner
+    branches on this to know whether to re-ask later."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["deferred"] = "deferred"
+    topic: OnboardingTopic
+    topic_state: OnboardingTopicState
+    next_topic: OnboardingTopicOrNone
+    onboarding_status: OnboardingStatus
+
+
+OnboardingDeferredOutput = Annotated[
+    Union[OnboardingDeferredOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_ONBOARDING_DEFERRED_RE = re.compile(
+    r"^ok:deferred:"
+    r"(?P<topic>addressing|self_intro|family|diet|routine|pain_point):"
+    r"topic_state=(?P<ts>pending|answered|skipped_once|skipped):"
+    r"next=(?P<next>addressing|self_intro|family|diet|routine|pain_point|none):"
+    r"status=(?P<st>not_started|in_progress|complete|abandoned)$"
+)
+
+
+def parse_onboarding_deferred(
+    raw: str,
+) -> OnboardingDeferredOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _ONBOARDING_DEFERRED_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="onboarding_deferred",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return OnboardingDeferredOk(
+            topic=m.group("topic"),
+            topic_state=m.group("ts"),
+            next_topic=m.group("next"),
+            onboarding_status=m.group("st"),
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="onboarding_deferred",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class OnboardingCompleteOk(BaseModel):
+    """Happy-path response from onboarding_complete. Carries the
+    final onboarding status — runtime allows `mark_complete` from
+    any state, so status reflects what the service ended up in
+    (typically `complete` but could be `abandoned` if user
+    requested explicit drop-out)."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["complete"] = "complete"
+    onboarding_status: OnboardingStatus
+
+
+OnboardingCompleteOutput = Annotated[
+    Union[OnboardingCompleteOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_ONBOARDING_COMPLETE_RE = re.compile(
+    r"^ok:complete:status=(?P<st>not_started|in_progress|complete|abandoned)$"
+)
+
+
+def parse_onboarding_complete(
+    raw: str,
+) -> OnboardingCompleteOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _ONBOARDING_COMPLETE_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="onboarding_complete",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return OnboardingCompleteOk(onboarding_status=m.group("st"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="onboarding_complete",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -3315,6 +3496,9 @@ PARSERS = {
     "mark_checklist_item_done": parse_mark_checklist_item_done,
     "delete_checklist_item": parse_delete_checklist_item,
     "archive_checklist": parse_archive_checklist,
+    "onboarding_answered": parse_onboarding_answered,
+    "onboarding_deferred": parse_onboarding_deferred,
+    "onboarding_complete": parse_onboarding_complete,
 }
 
 
