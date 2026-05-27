@@ -165,6 +165,13 @@ pydantic cannot fully introspect as field types in v2).
 _RUSSIAN_INFINITIVE_FIRST_WORD = re.compile(
     r"^[А-ЯЁ][а-яё\-]*?(?:ть|ться|ти|чь)\b"
 )
+
+
+# Tool name shape: lowercase identifier, digits/underscores after first
+# letter. Codex R2 MAJOR #2 — prevents planner-call typos (`Add_Item`
+# vs `add_item`), accidental whitespace in JSON keys, and executor
+# lookup ambiguity.
+_TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 """Matches a Russian Cyrillic capitalised first word ending in an
 infinitive suffix. Strict «starts with infinitive» — does NOT enforce
 «infinitive + concrete noun object». Codex R1 MAJOR #7 fix: doc
@@ -241,33 +248,43 @@ class ToolSpec(BaseModel):
     output_model: Any  # Annotated[Union[...], Field(discriminator='status')]
     outcome_examples: list[dict[str, Any]] = Field(default_factory=list)
     trigger_examples: list[str] = Field(default_factory=list)
-    """Typical user phrases that should route to this tool (3-10 short
-    Russian utterances). Used in the planner system prompt to teach
-    the LLM lexical patterns that map onto this tool. Sub-A-77 item #6.
+    """Typical user phrases that should route to this tool. Used in
+    the planner system prompt to teach the LLM lexical patterns that
+    map onto this tool. Sub-A-77 item #6.
 
     Examples: ``["купи молоко и хлеб", "добавь в покупки яйца",
     "надо купить картошки"]``.
 
-    Validation: must be ≥3 items, each non-empty after strip.
-    Empty by default for backward-compat (existing test fixtures, the
-    Sub-A4 migration adds real values).
+    **Schema-level validation** (ToolSpec construction): each item
+    non-empty (post-strip), no leading/trailing whitespace, no
+    ``\\n``/``\\r``/``\\t``. Empty list allowed.
 
-    Why ≥3: covers the «typical», «slight rewording», «follow-up»
-    cases — single-example schemas don't teach the LLM the variation
-    space (Codex E-14 — few-shot examples are most useful in clusters).
+    **Production policy validation** (``validate_tool_registry_quality
+    (strict=True)``): count ∈ [3, 10], each ≤120 chars, at least one
+    Cyrillic character per example.
+
+    Empty list as default keeps test fixtures and partial-migration
+    ToolSpecs valid; Sub-A4 populates real values + CI calls the
+    quality linter to enforce production policy.
     """
     mutex_notes: list[str] = Field(default_factory=list)
     """Optional short notes for disambiguation with close-sibling
-    tools (Codex E-15). Each note ≤200 chars, format:
-    ``«⚠ Используй ТОЛЬКО для X. Для Y — sibling_tool_name.»``.
+    tools (Codex E-15). Renderer prepends the ⚠ marker — store the
+    text WITHOUT it.
 
     Example for ``mark_shopping_bought``:
     ``["Используй ТОЛЬКО для купленных. Для удаления/коррекции — remove_shopping_items."]``
 
-    Apply ONLY to tool families with close siblings that the planner
-    routinely confuses (mark/remove, complete/cancel/delete). Most
-    standalone tools should leave this empty — overpopulating it
-    bloats the prompt and dilutes attention.
+    **Schema-level validation**: each item non-empty (post-strip),
+    no leading/trailing whitespace, no ``\\n``/``\\r``/``\\t``, does
+    NOT start with ``⚠`` (renderer owns the marker).
+
+    **Production policy validation** (``strict=True``): count ≤3,
+    each ≤200 chars.
+
+    Apply ONLY to tool families with close-sibling confusion
+    (mark/remove, complete/cancel/delete). Most standalone tools
+    should leave this empty — overpopulating dilutes planner attention.
     """
     allow_field_validators: bool = False
     """Opt-in escape hatch for ``input_model`` with ``@field_validator``
@@ -293,19 +310,44 @@ class ToolSpec(BaseModel):
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> ToolSpec:
-        # Sub-A-77 item #6: ToolSpec construction-time guards are now
+        # Sub-A-77 item #6: ToolSpec construction-time guards are
         # SCHEMA-level only (basic shape + safety-critical). Production
         # quality policy lives in
         # ``services.tool_schemas.registry_quality.validate_tool_registry_quality``
-        # so Sub-A4 / Sub-B1 / CI can opt in with strict=True.
+        # so Sub-A4 / Sub-B1 / CI opt in with strict=True.
         # Codex R1 alternative: separate schema from quality policy.
+        # Codex R2 MAJOR #2: name and description ALSO need control-char
+        # safety (renderer puts both into the planner prompt).
         if not self.name.strip():
             raise ValueError(
                 f"ToolSpec.name must be a non-empty (post-strip) string."
             )
+        if not _TOOL_NAME_PATTERN.fullmatch(self.name):
+            raise ValueError(
+                f"ToolSpec.name {self.name!r} must match "
+                f"``[a-z][a-z0-9_]*`` — lowercase identifier, digits / "
+                f"underscores allowed after leading letter. Strict shape "
+                f"prevents planner-call typos and executor-lookup ambiguity."
+            )
+        if self.name != self.name.strip():
+            raise ValueError(
+                f"ToolSpec.name {self.name!r} has leading/trailing "
+                f"whitespace — strip before constructing (Codex R2 MINOR #6)."
+            )
         if not self.description.strip():
             raise ValueError(
                 f"Tool '{self.name}' description must be non-empty (post-strip)."
+            )
+        if "\n" in self.description or "\r" in self.description or "\t" in self.description:
+            raise ValueError(
+                f"Tool '{self.name}' description contains newline/tab "
+                f"— must be single-line text (renderer puts it in the "
+                f"planner prompt). Multi-line content breaks formatting."
+            )
+        if self.description != self.description.strip():
+            raise ValueError(
+                f"Tool '{self.name}' description has leading/trailing "
+                f"whitespace — strip before constructing (Codex R2 MINOR #6)."
             )
         if self.trigger_examples:
             for example in self.trigger_examples:
@@ -319,6 +361,12 @@ class ToolSpec(BaseModel):
                         f"newline/tab — must be single-line text "
                         f"(prompt formatting safety)."
                     )
+                if example != example.strip():
+                    raise ValueError(
+                        f"Tool '{self.name}' trigger_example {example!r} "
+                        f"has leading/trailing whitespace — strip before "
+                        f"adding (renders with awkward spaces in prompt)."
+                    )
         for note in self.mutex_notes:
             if not note.strip():
                 raise ValueError(
@@ -328,6 +376,11 @@ class ToolSpec(BaseModel):
                 raise ValueError(
                     f"Tool '{self.name}' mutex_note contains newline/tab "
                     f"— must be single-line text (prompt formatting safety)."
+                )
+            if note != note.strip():
+                raise ValueError(
+                    f"Tool '{self.name}' mutex_note {note!r} has "
+                    f"leading/trailing whitespace — strip before adding."
                 )
             if note.lstrip().startswith("⚠"):
                 raise ValueError(

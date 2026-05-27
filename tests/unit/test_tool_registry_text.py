@@ -256,17 +256,18 @@ def test_tool_line_with_many_fields_truncates_with_ellipsis() -> None:
     assert "complex_tool(a, b, c, d, ...) — Много параметров." in text
 
 
-def test_tool_line_uses_first_line_of_multiline_description() -> None:
-    # Some legacy descriptions have multi-line docstrings; the registry
-    # only shows the first line so the planner doesn't see formatting
-    # noise.
-    specs = [_spec(
-        "verbose_tool", "memory",
-        description="Главная строка описания.\nВторая строка с деталями.\nТретья.",
-    )]
-    text = render_registry_for_planner(specs)
-    assert "verbose_tool(title) — Главная строка описания." in text
-    assert "Вторая строка" not in text
+def test_multiline_description_rejected_at_construction() -> None:
+    # Sub-A-77 item #6 R2 MAJOR #2: description with \n is now banned
+    # at ToolSpec construction (would break planner prompt formatting).
+    # The renderer's «first line only» defense is moot — the schema
+    # guard prevents the bad input from existing in the first place.
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _spec(
+            "verbose_tool", "memory",
+            description="Главная строка описания.\nВторая строка с деталями.",
+        )
+    assert "newline" in str(exc.value).lower() or "single-line" in str(exc.value).lower()
 
 
 # ---------------------------------------------------------------------------

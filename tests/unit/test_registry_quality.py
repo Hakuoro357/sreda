@@ -169,7 +169,9 @@ def test_too_many_trigger_examples() -> None:
 
 
 def test_trigger_example_too_long() -> None:
-    long_example = "купи " + "молока " * 50  # > 120 chars
+    # Build a >120-char string with no trailing whitespace (the
+    # construction edge-whitespace check would reject otherwise).
+    long_example = "купи " + ("молока" * 50)  # no trailing space
     spec = _make_spec(trigger_examples=[
         "купи молоко", "добавь хлеб", long_example,
     ])
@@ -208,7 +210,7 @@ def test_too_many_mutex_notes() -> None:
 
 
 def test_mutex_note_too_long() -> None:
-    long_note = "Используй " + "ТОЛЬКО " * 50  # > 200 chars
+    long_note = "Используй " + ("ТОЛЬКО" * 50)  # > 200 chars, no trailing ws
     spec = _make_spec(mutex_notes=[long_note])
     violations = validate_tool_registry_quality([spec], strict=True)
     assert any(v.code == "mutex_note_too_long" for v in violations)
@@ -279,6 +281,71 @@ def test_aggregates_violations_across_specs() -> None:
 # ---------------------------------------------------------------------------
 # Bounds module export
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #3 — defensive re-check catches model_copy(update=...) bypass
+# ---------------------------------------------------------------------------
+
+
+def test_model_copy_update_bypass_is_caught_by_linter() -> None:
+    """``model_copy(update=...)`` skips pydantic validators — the
+    linter's re-check is the last line of defense."""
+    clean_spec = _make_spec()
+    # Inject a bad value via model_copy (no validation runs).
+    poisoned = clean_spec.model_copy(update={"name": "Bad Name With Space"})
+    violations = validate_tool_registry_quality([poisoned], strict=False)
+    assert any(
+        v.code == "schema_safety_violation" and v.field_path == "name"
+        for v in violations
+    )
+
+
+def test_model_copy_update_newline_in_description_caught() -> None:
+    clean_spec = _make_spec()
+    poisoned = clean_spec.model_copy(update={
+        "description": "Добавить нечто.\nВторая строка."
+    })
+    violations = validate_tool_registry_quality([poisoned], strict=False)
+    assert any(
+        v.code == "schema_safety_violation"
+        and v.field_path == "description"
+        for v in violations
+    )
+
+
+def test_model_copy_update_warning_prefix_mutex_note_caught() -> None:
+    clean_spec = _make_spec()
+    poisoned = clean_spec.model_copy(update={
+        "mutex_notes": ["⚠ Already has the marker"]
+    })
+    violations = validate_tool_registry_quality([poisoned], strict=False)
+    assert any(
+        v.code == "schema_safety_violation"
+        and "mutex_notes" in (v.field_path or "")
+        for v in violations
+    )
+
+
+def test_assert_production_registry_quality_raises_on_bypass() -> None:
+    """The CI acceptance gate (``assert_production_registry_quality``)
+    raises ``InvalidRegistryError`` when any spec was constructed via
+    bypass."""
+    from sreda.services.tool_schemas.registry_quality import (
+        assert_production_registry_quality,
+    )
+    clean_spec = _make_spec()
+    poisoned = clean_spec.model_copy(update={"name": ""})
+    with pytest.raises(InvalidRegistryError):
+        assert_production_registry_quality([poisoned])
+
+
+def test_assert_production_registry_quality_silent_on_clean_spec() -> None:
+    from sreda.services.tool_schemas.registry_quality import (
+        assert_production_registry_quality,
+    )
+    spec = _make_spec()
+    assert_production_registry_quality([spec])  # no exception
 
 
 def test_policy_bounds_are_reasonable() -> None:

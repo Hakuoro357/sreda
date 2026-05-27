@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from sreda.services.tool_schemas.base import (
     _RUSSIAN_INFINITIVE_FIRST_WORD,
+    _TOOL_NAME_PATTERN,
     ToolSpec,
 )
 
@@ -86,13 +87,33 @@ def validate_tool_registry_quality(
     strict: bool = True,
     raise_on_error: bool = False,
 ) -> list[RegistryQualityViolation]:
-    """Run all production-quality checks against ``specs``.
+    """Run quality checks against ``specs``.
+
+    Two check tiers (Codex R2 MINOR #7):
+
+    **Schema-safety re-check (BOTH modes)** — defensive validation of
+    prompt-safety string invariants that ``ToolSpec`` construction
+    enforces. Catches ``model_copy(update=...)`` bypasses and direct
+    attribute mutation. Always runs.
+
+    **Production policy (strict mode only)** — completeness +
+    prompt-budget rules:
+    - description ≥60 chars + Russian infinitive verb start
+    - trigger_examples count ∈ [3, 10]
+    - trigger_examples each ≥1 Cyrillic character
+    - family populated
+
+    **Prompt-budget caps (BOTH modes)** — length caps that prevent
+    blowing out the cached prefix even in soft mode:
+    - trigger_examples each ≤120 chars
+    - mutex_notes count ≤3, each ≤200 chars
 
     Args:
-        specs: iterable of fully-populated ToolSpecs to lint.
-        strict: when True (default), full policy applies. When False,
-            only safety-critical checks run (used for partial-migration
-            inspection without false alarms during Sub-A4 transition).
+        specs: iterable of ToolSpecs to lint.
+        strict: when True (default), full production policy applies.
+            When False, only schema-safety + budget caps run — used
+            during Sub-A4 partial migration so an in-progress registry
+            doesn't false-alarm on completeness rules.
         raise_on_error: when True, raise ``InvalidRegistryError`` if
             any violation found. When False (default), return the list.
 
@@ -117,7 +138,18 @@ def validate_tool_registry_quality(
 def _check_spec(
     spec: ToolSpec, *, strict: bool
 ) -> Iterable[RegistryQualityViolation]:
-    """Yield all policy violations for one ToolSpec."""
+    """Yield all policy violations for one ToolSpec.
+
+    Includes defensive schema-safety re-checks (Codex R2 MAJOR #3)
+    — model_copy(update=...) and direct attribute mutation bypass
+    construction-time guards; the linter is the last line of defense
+    before the spec hits the planner prompt.
+    """
+
+    # Defensive schema-safety re-check — applies in BOTH strict and
+    # non-strict modes since these are prompt-breaking issues, not
+    # production-policy quality.
+    yield from _recheck_schema_safety(spec)
 
     # Family must be declared in production (Sub-A4 migration target).
     if strict and spec.family is None:
@@ -140,6 +172,88 @@ def _check_spec(
 
     # Mutex notes policy.
     yield from _check_mutex_notes(spec, strict=strict)
+
+
+def _recheck_schema_safety(
+    spec: ToolSpec,
+) -> Iterable[RegistryQualityViolation]:
+    """Defensive re-validation of prompt-safety string invariants —
+    catches ``model_copy(update=...)`` bypasses that skip construction
+    guards (Codex R2 MAJOR #3).
+
+    Re-checks (mirror of ToolSpec construction guards): non-blank +
+    no \\n / \\r / \\t in name, description, every trigger_example,
+    every mutex_note. mutex_notes must not start with ⚠. Edge
+    whitespace rejected.
+    """
+
+    def _is_clean(value: str) -> bool:
+        if not value or not value.strip():
+            return False
+        if value != value.strip():
+            return False
+        if "\n" in value or "\r" in value or "\t" in value:
+            return False
+        return True
+
+    if not _is_clean(spec.name) or not _TOOL_NAME_PATTERN.fullmatch(spec.name or ""):
+        yield RegistryQualityViolation(
+            tool_name=spec.name or "<blank>",
+            field_path="name",
+            code="schema_safety_violation",
+            message=(
+                f"name {spec.name!r} fails schema-safety re-check — "
+                f"blank, edge-whitespace, control chars, or fails "
+                f"identifier pattern ``[a-z][a-z0-9_]*``. Was the spec "
+                f"built via model_copy(update=...) or direct attribute "
+                f"mutation?"
+            ),
+        )
+    if not _is_clean(spec.description):
+        yield RegistryQualityViolation(
+            tool_name=spec.name,
+            field_path="description",
+            code="schema_safety_violation",
+            message=(
+                f"description fails schema-safety re-check (blank, "
+                f"edge-whitespace, or control chars). Got: "
+                f"{spec.description[:40]!r}."
+            ),
+        )
+    for idx, example in enumerate(spec.trigger_examples):
+        if not _is_clean(example):
+            yield RegistryQualityViolation(
+                tool_name=spec.name,
+                field_path=f"trigger_examples[{idx}]",
+                code="schema_safety_violation",
+                message=(
+                    f"trigger_example {example[:40]!r} fails "
+                    f"schema-safety re-check (blank, edge-whitespace, "
+                    f"or control chars)."
+                ),
+            )
+    for idx, note in enumerate(spec.mutex_notes):
+        if not _is_clean(note):
+            yield RegistryQualityViolation(
+                tool_name=spec.name,
+                field_path=f"mutex_notes[{idx}]",
+                code="schema_safety_violation",
+                message=(
+                    f"mutex_note {note[:40]!r} fails schema-safety "
+                    f"re-check (blank, edge-whitespace, or control chars)."
+                ),
+            )
+            continue
+        if note.lstrip().startswith("⚠"):
+            yield RegistryQualityViolation(
+                tool_name=spec.name,
+                field_path=f"mutex_notes[{idx}]",
+                code="schema_safety_violation",
+                message=(
+                    f"mutex_note starts with ⚠ — renderer adds the "
+                    f"marker, stored text must not. Got: {note[:40]!r}."
+                ),
+            )
 
 
 def _check_description(
@@ -251,6 +365,30 @@ def _check_mutex_notes(
             )
 
 
+def assert_production_registry_quality(specs: Iterable[ToolSpec]) -> None:
+    """Sub-A4 / Sub-B1 / CI acceptance gate (Codex R2 MAJOR #1).
+
+    Convenience wrapper for the strict + raise-on-error path. The
+    production tool-registry build pipeline calls this before
+    committing the registry to the planner system prompt. CI uses it
+    to fail builds when a tool ships without trigger_examples, with
+    a short description, or with an unfamilied/invalid shape.
+
+    Sub-A4 will wire this into the build step that assembles real
+    ToolSpec instances from the housewife_chat_tools migration. Until
+    Sub-A4 lands, the function is callable but has no production
+    callsite — explicit invocation by Sub-A4 author is the acceptance
+    blocker, documented in ``docs/architecture/tool-family-taxonomy.md``.
+
+    Use ``validate_tool_registry_quality`` directly for inspection
+    flows (returning a list) or partial-migration soft mode (strict=False).
+    """
+
+    validate_tool_registry_quality(
+        specs, strict=True, raise_on_error=True
+    )
+
+
 __all__ = [
     "DESCRIPTION_MIN_CHARS",
     "InvalidRegistryError",
@@ -260,5 +398,6 @@ __all__ = [
     "TRIGGER_EXAMPLES_MAX",
     "TRIGGER_EXAMPLES_MIN",
     "TRIGGER_EXAMPLE_MAX_CHARS",
+    "assert_production_registry_quality",
     "validate_tool_registry_quality",
 ]

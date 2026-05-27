@@ -383,6 +383,45 @@ def test_tool_spec_rejects_mutex_note_with_warning_prefix() -> None:
     assert "⚠" in msg or "must not start" in msg.lower() or "prepend" in msg
 
 
+# Codex R2 MAJOR #2 / MINOR #6 — name pattern + edge whitespace
+# rejection for name + description + examples + notes.
+
+def test_tool_spec_name_must_match_identifier_pattern() -> None:
+    # Bad names: uppercase, leading digit, special chars, spaces.
+    for bad in ["BadName", "1leading_digit", "with space", "with-dash"]:
+        with pytest.raises(ValidationError):
+            _minimal_read_spec(name=bad)
+
+
+def test_tool_spec_name_accepts_canonical_identifier() -> None:
+    for good in ["add_shopping_items", "x", "tool_42", "snake_case_name"]:
+        spec = _minimal_read_spec(name=good)
+        assert spec.name == good
+
+
+def test_tool_spec_rejects_description_with_newline() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(description="Линия 1.\nЛиния 2.")
+    msg = str(exc.value).lower()
+    assert "newline" in msg or "single-line" in msg
+
+
+def test_tool_spec_rejects_description_with_edge_whitespace() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(description="  с краёв пробелы  ")
+    msg = str(exc.value).lower()
+    assert "leading/trailing whitespace" in msg or "strip" in msg
+
+
+def test_tool_spec_rejects_trigger_example_with_edge_whitespace() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(trigger_examples=[
+            "купи молоко", " добавь хлеб", "нужно картошки",
+        ])
+    msg = str(exc.value).lower()
+    assert "leading/trailing whitespace" in msg or "strip" in msg
+
+
 def test_tool_spec_rejects_extra_field() -> None:
     with pytest.raises(ValidationError):
         ToolSpec(  # type: ignore[call-arg]
