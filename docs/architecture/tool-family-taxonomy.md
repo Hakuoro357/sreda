@@ -37,8 +37,10 @@ relying on the model to infer it from descriptions.
 | `utility` | СЛУЖЕБНОЕ | 1 | СБОРЩИК ОТВЕТА, АВТОМАТИЧЕСКИЙ АУДИТ, ИНТЕРФЕЙС |
 | `web` | ВЕБ | 3 | РЕЦЕПТЫ, КАЛЕНДАРЬ ЮЗЕРА, ДЕНЕЖНЫЕ ОПЕРАЦИИ |
 
-Total: 56 tools (55 planned for MVP + 1 future `get_recipe_any_source`
-from TODO-2 in the architecture plan).
+Total: 55 implemented tools. The future `get_recipe_any_source`
+(architecture-plan TODO-2) will bump this to 56 when the runtime
+function ships — currently NOT in `TOOL_FAMILY_MANIFEST` per Codex
+Sub-A4 recipes R1 MAJOR #6.
 
 The taxonomy is **closed** — adding a 13th family requires:
 1. Adding the literal value to `Family` in `families.py`.

@@ -72,16 +72,17 @@ def test_recipes_specs_pass_assert_production_gate() -> None:
     assert_production_registry_quality(RECIPES_SPECS)
 
 
-def test_recipes_specs_match_tool_family_manifest_minus_future_tools() -> None:
-    """Every TOOL_FAMILY_MANIFEST entry mapped to 'recipes' (EXCLUDING
-    the future ``get_recipe_any_source``) must have a corresponding
-    ToolSpec with matching ``spec.family``."""
+def test_recipes_specs_match_tool_family_manifest() -> None:
+    """Every TOOL_FAMILY_MANIFEST entry mapped to 'recipes' must have
+    a corresponding ToolSpec with matching ``spec.family``. Codex
+    Sub-A4 recipes R2 closure: ``get_recipe_any_source`` was removed
+    from the manifest in R1; cross-check is now exact (no test
+    exclusion). When the tool ships, the same commit re-adds it to
+    both the manifest and RECIPES_SPECS."""
     manifest_recipes = {
         name for name, family in TOOL_FAMILY_MANIFEST.items()
         if family == "recipes"
     }
-    # Future tool — runtime function not yet implemented.
-    manifest_recipes.discard("get_recipe_any_source")
     spec_names = {s.name for s in RECIPES_SPECS}
     assert spec_names == manifest_recipes, (
         f"Mismatch.\nIn manifest only: {manifest_recipes - spec_names}\n"

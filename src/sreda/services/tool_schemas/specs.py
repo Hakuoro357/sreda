@@ -13,7 +13,9 @@ This module imports every per-family ``specs_<family>.py`` and exposes:
   mutable list alias which let callers accidentally mutate either
   name. Tuple makes the «forward compatibility» contract
   enforceable. Final count (post-migration) is **55 tools** (47
-  housewife + 4 memory + 3 web + 1 ``get_recipe_any_source``).
+  housewife + 4 memory + 3 web + 1 utility). The future
+  ``get_recipe_any_source`` (architecture-map TODO-2) will bump
+  this to 56 when the runtime function ships.
 
 **ToolOutputContractViolation contract** (Codex Sub-A4 R1 MAJOR #6):
 
@@ -66,7 +68,9 @@ ALL_TOOL_SPECS: tuple[ToolSpec, ...] = tuple(MIGRATED_TOOL_SPECS)
 ``MIGRATED_TOOL_SPECS`` (as a tuple). Will diverge once incremental
 Sub-A4 work creates a distinction between «known to the planner»
 and «known to the migration plan». Final count post-migration is
-55 tools (47 housewife + 4 memory + 3 web + 1 ``get_recipe_any_source``).
+**55 tools** (47 housewife + 4 memory + 3 web + 1 utility), with the
+future ``get_recipe_any_source`` (architecture-map TODO-2) bumping
+this to 56 when the runtime function ships.
 
 Codex Sub-A4 reminders R1 MINOR #10: was ``list[ToolSpec]`` aliasing
 ``MIGRATED_TOOL_SPECS`` directly — any mutation on either name would

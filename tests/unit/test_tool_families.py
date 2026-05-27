@@ -279,9 +279,11 @@ def test_family_literal_and_family_headers_agree() -> None:
 
 
 def test_manifest_covers_at_least_55_tools() -> None:
-    # The plan-execute architecture spec lists 55 tools (47 housewife +
-    # 4 memory + 3 web + 1 get_recipe_any_source). Adding one is fine,
-    # silently dropping below 55 is not.
+    # The plan-execute architecture spec lists 55 tools (47 housewife
+    # + 4 memory + 3 web + 1 utility). ``get_recipe_any_source``
+    # (architecture-map TODO-2) is NOT yet in the manifest — removed
+    # in Codex Sub-A4 recipes R1 MAJOR #6 until the runtime function
+    # ships. Adding tools is fine, silently dropping below 55 is not.
     assert len(TOOL_FAMILY_MANIFEST) >= 55
 
 
@@ -328,7 +330,7 @@ def test_manifest_assigns_expected_checklists_count() -> None:
     "add_shopping_items", "schedule_reminder", "get_recipe", "list_shopping",
     "list_reminders", "save_recipe", "plan_week_menu", "add_family_members",
     "add_task", "create_checklist", "reply_with_buttons", "save_core_fact",
-    "log_unsupported_request", "weather_tool", "get_recipe_any_source",
+    "log_unsupported_request", "weather_tool",
 ])
 def test_manifest_includes_expected_canonical_tools(tool_name: str) -> None:
     # Spot-check the tools most likely to be referenced in tests, runbooks,
@@ -600,8 +602,11 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
         "cancel_reminder",
     }),
     "recipes": frozenset({
+        # Codex Sub-A4 recipes R1 MAJOR #6: ``get_recipe_any_source``
+        # removed from manifest until the runtime function ships.
+        # Restore here when the spec lands.
         "save_recipe", "save_recipes_batch", "search_recipes",
-        "get_recipe", "delete_recipe", "get_recipe_any_source",
+        "get_recipe", "delete_recipe",
     }),
     "menu": frozenset({
         "plan_week_menu", "update_menu_item", "list_menu",
@@ -653,11 +658,12 @@ def test_manifest_exact_tool_set_per_family(
     )
 
 
-def test_manifest_total_size_is_56() -> None:
-    # 7+4+6+5+4+11+8+3+1+3+1+3 = 56 (55 planned + 1 from TODO-2:
-    # get_recipe_any_source). Reconciles the «4 memory» comment in
-    # R1 review — memory has 3, not 4 (Codex R2 spotted this).
-    assert len(TOOL_FAMILY_MANIFEST) == 56
+def test_manifest_total_size_is_55() -> None:
+    # 7+4+5+5+4+11+8+3+1+3+1+3 = 55. Codex Sub-A4 recipes R1 MAJOR #6
+    # removed ``get_recipe_any_source`` from manifest (architecture-map
+    # TODO-2 — runtime function not yet implemented). Restore to 56
+    # in the commit that lands the tool.
+    assert len(TOOL_FAMILY_MANIFEST) == 55
 
 
 # ---------------------------------------------------------------------------

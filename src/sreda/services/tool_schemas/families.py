@@ -406,11 +406,15 @@ that the planner might mistake for a family name.
 
 
 # ---------------------------------------------------------------------------
-# Tool family manifest — every planned tool name → exactly one family.
+# Tool family manifest — every implemented tool name → exactly one family.
 # Source: ``plans/mellow-discovering-conway.md`` section "Реестр
-# инструментов" + TODO-2 add of get_recipe_any_source. Total 55 + 1.
+# инструментов". Total 55 implemented tools.
 # Codex R1 MAJOR #4 — proves taxonomy completeness against the real
 # 55-tool universe before any ToolSpec is migrated to declare family.
+# Codex Sub-A4 recipes R1 MAJOR #6: ``get_recipe_any_source``
+# (architecture-map TODO-2) is intentionally NOT in this manifest
+# until the runtime function ships — restore in the commit that adds
+# the spec.
 # ---------------------------------------------------------------------------
 
 
