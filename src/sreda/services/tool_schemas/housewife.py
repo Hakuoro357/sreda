@@ -27,9 +27,16 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.common import (
@@ -3467,6 +3474,214 @@ def parse_onboarding_complete(
 
 
 # ---------------------------------------------------------------------------
+# 48-50. Memory family (cross-skill; available to all skills via runtime/tools.py).
+#         save_core_fact / save_episode / recall_memory
+#
+# Runtime shapes (runtime/tools.py:89-224):
+#   save_core_fact: "saved_core:<memory_id>" / "error: empty content"
+#   save_episode:   "saved_episode:<memory_id>" / "error: empty summary"
+#   recall_memory:  JSON string `[{content, source, score, metadata}, ...]`
+#                   or `[]`. NOT a status-prefixed format.
+#
+# Memory IDs are `mem_<32 hex>` per AssistantMemory model — let parser use
+# tight pattern.
+# ---------------------------------------------------------------------------
+
+
+import json as _json  # local import to keep top-of-file clean
+
+
+MemoryId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=r"^[a-zA-Z0-9_-]+$",
+        min_length=1,
+        max_length=64,
+    ),
+]
+"""Memory row id — relaxed pattern since runtime uses ``AssistantMemory.id``
+which is a generic primary key string (no enforced prefix). Generous
+upper bound covers UUIDs and any future format."""
+
+
+class SaveCoreFactOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["saved_core"] = "saved_core"
+    memory_id: MemoryId
+
+
+SaveCoreFactOutput = Annotated[
+    Union[SaveCoreFactOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_SAVE_CORE_FACT_RE = re.compile(r"^saved_core:(?P<mid>[a-zA-Z0-9_-]+)$")
+
+
+def parse_save_core_fact(
+    raw: str,
+) -> SaveCoreFactOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _SAVE_CORE_FACT_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="save_core_fact",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return SaveCoreFactOk(memory_id=m.group("mid"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="save_core_fact",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class SaveEpisodeOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["saved_episode"] = "saved_episode"
+    memory_id: MemoryId
+
+
+SaveEpisodeOutput = Annotated[
+    Union[SaveEpisodeOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_SAVE_EPISODE_RE = re.compile(r"^saved_episode:(?P<mid>[a-zA-Z0-9_-]+)$")
+
+
+def parse_save_episode(
+    raw: str,
+) -> SaveEpisodeOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _SAVE_EPISODE_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="save_episode",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return SaveEpisodeOk(memory_id=m.group("mid"))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="save_episode",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class RecallMemoryHit(BaseModel):
+    """One row in the recall_memory JSON response. Source format is
+    free-form (memory:core / memory:episodic / checklist:<id> /
+    reminder:<id>) per runtime documentation
+    (runtime/tools.py:168-176)."""
+
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=10_000)
+    source: str = Field(min_length=1, max_length=200)
+    score: float = Field(ge=0.0, le=1.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecallMemoryOk(BaseModel):
+    """Codex Sub-A4 memory R0: recall_memory returns JSON array,
+    NOT a status-prefixed text. Parser deserializes the JSON and
+    wraps in this typed envelope so the planner gets uniform
+    discriminator-union access alongside other family outputs."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["recalled"] = "recalled"
+    hits: list[RecallMemoryHit] = Field(default_factory=list)
+
+
+RecallMemoryOutput = Annotated[
+    Union[RecallMemoryOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_recall_memory(
+    raw: str,
+) -> RecallMemoryOk | HousewifeToolError | ToolOutputContractViolation:
+    # recall_memory does NOT emit `error:` prefix; instead returns
+    # `[]` on empty / error paths (runtime/tools.py:201-208).
+    stripped = raw.strip()
+    if not stripped:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="recall_memory",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        payload = _json.loads(stripped)
+    except _json.JSONDecodeError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="recall_memory",
+            timestamp=datetime.now(timezone.utc),
+        )
+    if not isinstance(payload, list):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="recall_memory",
+            timestamp=datetime.now(timezone.utc),
+        )
+    hits: list[RecallMemoryHit] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="recall_memory",
+                timestamp=datetime.now(timezone.utc),
+            )
+        try:
+            hits.append(RecallMemoryHit.model_validate(item))
+        except ValidationError:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="recall_memory",
+                timestamp=datetime.now(timezone.utc),
+            )
+    try:
+        return RecallMemoryOk(hits=hits)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="recall_memory",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# 51. utility — log_unsupported_request
+class LogUnsupportedRequestOk(BaseModel):
+    """Returns ``ok:logged`` on success. No content surfaced to user."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["logged"] = "logged"
+
+
+LogUnsupportedRequestOutput = Annotated[
+    Union[LogUnsupportedRequestOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_log_unsupported_request(
+    raw: str,
+) -> LogUnsupportedRequestOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    if raw.strip() == "ok:logged":
+        return LogUnsupportedRequestOk()
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="log_unsupported_request",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -3519,6 +3734,10 @@ PARSERS = {
     "onboarding_answered": parse_onboarding_answered,
     "onboarding_deferred": parse_onboarding_deferred,
     "onboarding_complete": parse_onboarding_complete,
+    "save_core_fact": parse_save_core_fact,
+    "save_episode": parse_save_episode,
+    "recall_memory": parse_recall_memory,
+    "log_unsupported_request": parse_log_unsupported_request,
 }
 
 
