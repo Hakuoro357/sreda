@@ -153,14 +153,33 @@ def test_system_prompt_anti_hallucination_tool_call_rule():
     )
 
 
-def test_plan_week_menu_docstring_warns_about_overwrite():
+def test_plan_week_menu_docstring_explains_preserve_merge():
+    """Codex Sub-A4 menu R2 MAJOR #1: prior test pinned the WRONG
+    contract (overwrite-week). Actual runtime
+    ``HousewifeMenuService.plan_week`` preserve-merges unspecified
+    slots (housewife_menu.py:105-122). Docstring must teach
+    preserve-merge so planner picks the right tool — overwriting
+    advice would steer the planner to call clear_menu unnecessarily
+    or fear partial payloads. The docstring still must point at
+    update_menu_item for SINGLE-cell edits and clear_menu+plan for
+    full reset, so both alternative paths remain discoverable."""
     tools = _tools()
     desc = tools["plan_week_menu"].description.lower()
-    assert "перезапис" in desc or "overwrite" in desc or "replaces" in desc, (
-        "plan_week_menu REPLACES the entire week's plan — if the user "
-        "incrementally adds one day, the other days get wiped. "
-        "Docstring must warn and point to update_menu_item for "
-        "incremental changes."
+    assert "preserve-merge" in desc or "перезапиш" in desc, (
+        "plan_week_menu must teach the planner preserve-merge "
+        "semantics (передаваемые ячейки перезаписывают слоты, "
+        "остальные остаются) — runtime does not erase unspecified "
+        "slots."
+    )
+    assert "update_menu_item" in desc, (
+        "Single-cell alternative (update_menu_item) must remain "
+        "discoverable in the plan_week_menu docstring so the "
+        "planner has a cheaper path for point edits."
+    )
+    assert "clear_menu" in desc, (
+        "Full-reset path (clear_menu, then plan_week_menu) must "
+        "remain discoverable — preserve-merge means the only way "
+        "to wipe the week is the two-call sequence."
     )
 
 

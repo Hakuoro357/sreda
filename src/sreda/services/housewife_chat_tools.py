@@ -1226,14 +1226,16 @@ def build_housewife_tools(
         days: list[dict[str, Any]],
         notes: str | None = None,
     ) -> str:
-        """Create (or replace) the weekly menu for the user.
+        """Create (or update) the weekly menu for the user.
 
-        ⚠️ **ПЕРЕЗАПИСЫВАЕТ всю неделю.** Если для week_start уже есть
-        план, он ПОЛНОСТЬЮ заменяется переданными днями. Если user
-        просит инкрементально добавить ОДИН день (а другие дни
-        остаются) — НЕ вызывай plan_week_menu с одним днём, иначе
-        сотрёшь остальное. Вместо этого используй ``update_menu_item``
-        (по одной ячейке) для точечной вставки.
+        ⚠️ **PRESERVE-MERGE.** Если для week_start уже есть план,
+        переданные ячейки ПЕРЕЗАПИШУТ соответствующие слоты, а ячейки,
+        которые ты НЕ передал, ОСТАНУТСЯ как были. Чтобы стереть один
+        слот — передай его с пустыми полями (recipe_id=None +
+        free_text=None — это явный clear). Чтобы стереть всю неделю
+        и собрать заново — сначала ``clear_menu``, потом
+        ``plan_week_menu``. Для точечной правки ОДНОЙ ячейки
+        используй ``update_menu_item``.
 
         Heavy composite call: YOU generate 21 meal cells (7 days ×
         breakfast/lunch/dinner) and pass them as structured data. Before
