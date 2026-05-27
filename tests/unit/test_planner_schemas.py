@@ -870,3 +870,108 @@ def test_plan_ask_user_for_clarification_has_no_required_fields() -> None:
     )
     # Auto-merge still injects clarity_reason for renderer convenience.
     assert plan.compose.template_data["clarity_reason"] == "запрос непонятен"
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 follow-ups — strict string-type checks + allowlist coverage
+# ---------------------------------------------------------------------------
+
+
+def test_plan_clarity_reason_non_string_replaced_by_merge() -> None:
+    """Codex R3 MAJOR — template_data is dict[str, Any] so caller
+    could pass [], False, 0 etc. for clarity_reason. Pure
+    truthiness lets [] / 0 / False through; pure str-check lets
+    blank "" through. Schema requires non-blank STRING; if not,
+    auto-merge replaces with Plan-level reason."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="proper reason",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={"clarity_reason": [], "missing_fields": ["time"]},
+        ),
+    )
+    # List replaced by string from Plan-level.
+    assert plan.compose.template_data["clarity_reason"] == "proper reason"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        None,
+        "",
+        "   ",
+        [],
+        {},
+        False,
+        0,
+        123,
+        ["what?"],
+    ],
+    ids=["none", "empty", "whitespace", "empty_list", "empty_dict", "false", "zero", "int", "list_of_str"],
+)
+def test_plan_ask_when_to_remind_what_must_be_non_blank_string(bad_value) -> None:
+    """Required template_data fields must be non-blank STRINGS.
+    Various non-string types and blank strings all rejected so
+    StrictUndefined doesn't crash and renderer gets sane input."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="не указано время",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="ask_when_to_remind",
+                template_data={"what": bad_value},
+            ),
+        )
+    assert "what" in str(exc.value)
+
+
+def test_plan_done_summary_non_string_rejected() -> None:
+    """Codex R3 MAJOR — same for partial_with_clarification's
+    done_summary. List/bool/etc. must reject."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="нужно уточнить",
+            actions={
+                "s1": Action(
+                    tool="add_shopping_items",
+                    args={"items": ["молоко"]},
+                    expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+                ),
+            },
+            compose=ComposerCall(
+                kind="template",
+                template_id="partial_with_clarification",
+                template_data={
+                    "done_summary": ["item1", "item2"],  # list, not str
+                    "missing_fields": ["time"],
+                },
+            ),
+        )
+    msg = str(exc.value)
+    assert "done_summary" in msg
+
+
+def test_clarification_required_fields_covers_allowlist() -> None:
+    """Codex R3 MINOR — _TEMPLATE_REQUIRED_FIELDS must have an entry
+    for every CLARIFICATION_TEMPLATE_IDS member, even if empty.
+    Otherwise a future template added to the allowlist gets a free
+    pass via the validator's .get(..., frozenset()) default —
+    reintroducing schema-valid-but-render-invalid plans."""
+    from sreda.runtime.planner.schemas import (
+        CLARIFICATION_TEMPLATE_IDS,
+        _TEMPLATE_REQUIRED_FIELDS,
+    )
+    assert set(_TEMPLATE_REQUIRED_FIELDS.keys()) == CLARIFICATION_TEMPLATE_IDS, (
+        f"_TEMPLATE_REQUIRED_FIELDS keys {sorted(_TEMPLATE_REQUIRED_FIELDS.keys())} "
+        f"must equal CLARIFICATION_TEMPLATE_IDS {sorted(CLARIFICATION_TEMPLATE_IDS)}. "
+        f"Add a (possibly-empty) entry when extending the allowlist."
+    )

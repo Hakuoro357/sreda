@@ -92,14 +92,36 @@ _TEMPLATE_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "ask_user_for_clarification": frozenset(),
 }
 """For each clarification template, the keys that MUST be present in
-``compose.template_data`` (non-blank). Codex Sub-A-77 #2 R2 new MAJOR
-— without this check, a schema-valid plan can crash the renderer at
-``StrictUndefined`` time, surfacing far from the cause.
+``compose.template_data`` (non-blank string). Codex Sub-A-77 #2 R2
+new MAJOR + R3 MINOR — without this check, a schema-valid plan can
+crash the renderer at ``StrictUndefined`` time, surfacing far from
+the cause.
+
+INVARIANT: ``set(_TEMPLATE_REQUIRED_FIELDS) == CLARIFICATION_TEMPLATE_IDS``
+— every allowlisted clarification template must have an explicit
+required-fields entry (even if empty). The ``.get(..., frozenset())``
+default in the validator would otherwise silently pass a future
+template through with no checks. CI test
+``test_clarification_required_fields_covers_allowlist`` asserts this.
 
 If a template adds/removes required fields, this map is the single
 place to update — CI tests assert per-template happy paths in
 ``test_composer_registry.py``.
 """
+
+
+def _is_non_blank_string(value: object) -> bool:
+    """True iff ``value`` is a ``str`` AND has at least one non-whitespace
+    character.
+
+    Codex Sub-A-77 #2 R3 MAJOR — ``compose.template_data`` is
+    ``dict[str, Any]``, so a planner could put non-string types
+    (``[]``, ``False``, ``0``) where the renderer expects text.
+    Pure ``not value`` truthiness misses ``"   "``; ``str``-checking
+    misses falsy non-str. Combine both: must be a string, and the
+    stripped form must be non-empty.
+    """
+    return isinstance(value, str) and bool(value.strip())
 
 
 class TurnClassification(BaseModel):
@@ -300,33 +322,35 @@ class Plan(BaseModel):
                     f"template_id={self.compose.template_id!r} with "
                     f"{len(self.actions)} action(s)."
                 )
-            # Codex R2 MAJOR #2 — auto-merge fires on absent-OR-blank
-            # so a planner that emits clarity_reason="" or "   " in
-            # template_data doesn't bypass the merge and fall through
-            # to the generic «Не до конца поняла запрос» opener.
+            # Codex R2 MAJOR #2 + R3 MAJOR — auto-merge fires on
+            # absent, blank-string, OR non-string-type. ``template_data``
+            # is dict[str, Any] so a planner could put a list, bool,
+            # number etc. as ``clarity_reason``; Jinja truthiness for
+            # ``[]`` / ``0`` / ``False`` would drop us to the generic
+            # «Не до конца поняла запрос» opener. We coerce anything
+            # not-non-blank-string back to the Plan-level reason.
             existing = self.compose.template_data.get("clarity_reason")
-            if existing is None or not str(existing).strip():
+            if not _is_non_blank_string(existing):
                 self.compose.template_data["clarity_reason"] = (
                     self.clarity_reason
                 )
-            # Codex R2 new MAJOR — per-template required-field check.
-            # Without this, schema-valid plans can crash the renderer
-            # at StrictUndefined time when a narrow template's required
-            # variable wasn't supplied (e.g. ask_when_to_remind without
-            # template_data['what']).
+            # Codex R2 new MAJOR + R3 MAJOR — per-template required-
+            # field check. Field must be a non-blank STRING. Without
+            # the type guard, ``what=[]`` / ``done_summary=False`` pass
+            # the previous truthiness check but render to empty/wrong
+            # text and confuse the user.
             required = _TEMPLATE_REQUIRED_FIELDS.get(
                 self.compose.template_id, frozenset()
             )
             for field_name in required:
                 value = self.compose.template_data.get(field_name)
-                if value is None or (
-                    isinstance(value, str) and not value.strip()
-                ):
+                if not _is_non_blank_string(value):
                     raise ValueError(
                         f"Plan compose.template_id="
-                        f"{self.compose.template_id!r} requires non-empty "
-                        f"template_data[{field_name!r}] for renderer. "
-                        f"Got: {value!r}."
+                        f"{self.compose.template_id!r} requires "
+                        f"non-blank string template_data[{field_name!r}] "
+                        f"for renderer. Got: {value!r} (type "
+                        f"{type(value).__name__})."
                     )
         return self
 
