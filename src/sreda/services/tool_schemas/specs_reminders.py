@@ -34,13 +34,16 @@ calls it to fail builds that ship incomplete reminders ToolSpecs.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.common import (
-    NonBlankStr,
+    RecurrenceRule,
     ReminderId,
     ShortStr,
+    TriggerIso,
 )
 from sreda.services.tool_schemas.housewife import (
     CancelReminderOutput,
@@ -60,22 +63,26 @@ class ScheduleReminderInput(BaseModel):
     """Schedule a new proactive reminder.
 
     Field caps (source: ``housewife_chat_tools.py:262``):
-    - ``title``: non-blank short label (≤200 — matches the
-      «под 200 chars» docstring contract).
-    - ``trigger_iso``: ISO-8601 datetime, parsed via
-      ``datetime.fromisoformat``. ``NonBlankStr`` (no length cap
-      because legitimate ISO strings vary by precision; the
-      ``cannot_parse_trigger_iso`` stable error code handles malformed
-      values).
-    - ``recurrence_rule``: optional RFC-5545 RRULE string (BYHOUR /
-      BYMINUTE MUST be in UTC). Same lax non-blank constraint —
-      grammar is checked downstream by ``dateutil.rrule``.
+    - ``title``: non-blank short label ≤200 (matches the «под 200
+      chars» docstring contract).
+    - ``trigger_iso``: ``TriggerIso`` — ISO-8601 shape regex + ≤64
+      chars. Runtime parses via ``datetime.fromisoformat`` and
+      normalizes to UTC (offset-aware accepted; naive treated as
+      UTC — see ``housewife_chat_tools.py:325-349``).
+    - ``recurrence_rule``: optional ``RecurrenceRule`` — must start
+      with ``FREQ=``, single-line, ≤512. Runtime hands to
+      ``dateutil.rrule`` for full RFC-5545 validation.
+
+    Codex Sub-A4 reminders R1 MAJOR #2 + #3: previously ``NonBlankStr``
+    (unbounded, no shape constraint) — planner could emit huge or
+    multiline values that surprised the runtime parser. Bounded
+    aliases catch obvious mistakes at schema validation time.
     """
 
     model_config = ConfigDict(extra="forbid")
     title: ShortStr
-    trigger_iso: NonBlankStr
-    recurrence_rule: NonBlankStr | None = None
+    trigger_iso: TriggerIso
+    recurrence_rule: RecurrenceRule | None = None
 
 
 class ListRemindersInput(BaseModel):
@@ -93,18 +100,25 @@ class UpdateReminderInput(BaseModel):
     ``X is None`` for each mutable field, so a call with only
     ``reminder_id`` is a silent no-op.
 
-    Note on ``clear_recurrence``: this is a boolean flag, distinct
-    from passing ``recurrence_rule=None``. The runtime branch fires
-    only when ``clear_recurrence=True``. ``False`` is a no-op
-    contribution — same logic as «explicit null on a mutable field».
+    Codex Sub-A4 reminders R1 MAJOR #1: ``clear_recurrence`` was
+    typed ``bool | None`` which let ``clear_recurrence=False`` slip
+    past the no-op guard (False is non-null but runtime branches
+    only on True). Tightened to ``Literal[True] | None = None`` —
+    planner must either omit it or send True. Sending False is now
+    a schema error.
+
+    Codex Sub-A4 reminders R1 MAJOR #2 + #3: ``trigger_iso`` and
+    ``recurrence_rule`` now use bounded shape-validated aliases
+    (``TriggerIso`` / ``RecurrenceRule``) instead of the previous
+    unbounded ``NonBlankStr``.
     """
 
     model_config = ConfigDict(extra="forbid")
     reminder_id: ReminderId
     title: ShortStr | None = None
-    trigger_iso: NonBlankStr | None = None
-    recurrence_rule: NonBlankStr | None = None
-    clear_recurrence: bool | None = None
+    trigger_iso: TriggerIso | None = None
+    recurrence_rule: RecurrenceRule | None = None
+    clear_recurrence: Literal[True] | None = None
 
 
 class CancelReminderInput(BaseModel):
@@ -141,7 +155,12 @@ SCHEDULE_REMINDER_SPEC = ToolSpec(
         "напомни через полчаса проверить почту",
     ],
     mutex_notes=[
-        "Используй ТОЛЬКО для standalone-напоминаний. Если юзер просит «напомни про задачу T-X» — это tasks.attach_reminder, не schedule_reminder.",
+        # Codex Sub-A4 reminders R1 MAJOR #5: previously referenced
+        # ``tasks.attach_reminder`` which is not yet in the typed
+        # registry — planner would have been steered toward an
+        # unavailable tool. Reword as intent-level guidance; restore
+        # the cross-tool reference once tasks family migrates.
+        "Используй для standalone-напоминаний (НЕ привязанных к существующей задаче). Если юзер просит «напомни про задачу T-X» — задача должна сама подцепить напоминание (legacy router пока).",
         "НЕ вызывай для уточнения существующего напоминания — это update_reminder, не schedule + cancel.",
         "Для отмены — cancel_reminder. Для проверки активных — list_reminders.",
     ],

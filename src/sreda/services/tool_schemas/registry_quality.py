@@ -354,6 +354,83 @@ def _check_mutex_notes(
             )
 
 
+_TOOL_NAME_TOKEN_RE = re.compile(r"\b([a-z][a-z0-9_]{2,})\b")
+"""Loose token matcher for tool-name-like words inside free Russian
+prose. Catches ``schedule_reminder`` / ``update_shopping_item`` /
+``attach_reminder`` etc. without flagging genuine Russian words
+(which use Cyrillic). Min 3 chars to avoid trivial false positives
+like ``id`` / ``ok``."""
+
+
+def validate_mutex_note_references(
+    specs: Iterable[ToolSpec],
+    *,
+    manifest: dict[str, str],
+) -> list[RegistryQualityViolation]:
+    """Codex Sub-A4 reminders R1 MAJOR #6 — scan mutex_notes for
+    references to tool names that exist in ``manifest`` (the full
+    eventual registry) but NOT in ``specs`` (the migrated subset).
+
+    Mutex_notes are free Russian text injected into the planner
+    system prompt. When they name a sibling tool (e.g. «для отмены —
+    ``cancel_reminder``» or «привязать к задаче — ``attach_reminder``»),
+    they promise the planner that tool is callable. During Sub-A4's
+    incremental rollout, referencing a not-yet-migrated tool steers
+    the LLM toward a name the typed runtime won't recognize.
+
+    The check is a SOFT lint: emits ``RegistryQualityViolation``
+    rows for each cross-reference to an unmigrated tool. Callers
+    decide whether to treat as hard error (production build) or
+    informational (partial-migration review).
+
+    Args:
+        specs: the migrated ToolSpec list (what the planner can
+            actually call right now).
+        manifest: the full ``{tool_name: family}`` map of every
+            housewife tool — typically ``TOOL_FAMILY_MANIFEST``.
+
+    Returns:
+        list of violations; empty == no cross-references to
+        unmigrated tools.
+    """
+    spec_names = {s.name for s in specs}
+    violations: list[RegistryQualityViolation] = []
+    seen_per_spec: set[tuple[str, str]] = set()
+    for spec in specs:
+        for idx, note in enumerate(spec.mutex_notes):
+            if not isinstance(note, str):
+                # Other lints catch the type-error; we just skip so the
+                # tokeniser doesn't crash on a poisoned spec.
+                continue
+            for token_match in _TOOL_NAME_TOKEN_RE.finditer(note):
+                token = token_match.group(1)
+                if token not in manifest:
+                    continue
+                if token in spec_names:
+                    continue  # referenced tool IS in the migrated set
+                # Dedupe: a single note mentioning ``attach_reminder``
+                # twice should emit one violation, not two.
+                key = (spec.name, token)
+                if key in seen_per_spec:
+                    continue
+                seen_per_spec.add(key)
+                violations.append(RegistryQualityViolation(
+                    tool_name=spec.name,
+                    field_path=f"mutex_notes[{idx}]",
+                    code="mutex_note_references_unmigrated_tool",
+                    message=(
+                        f"mutex_note references tool {token!r} from family "
+                        f"{manifest[token]!r} — that family is in "
+                        f"TOOL_FAMILY_MANIFEST but NOT in the migrated specs. "
+                        f"Planner would be steered toward an unavailable "
+                        f"typed tool. Either migrate the referenced tool in "
+                        f"the same phase, or rewrite the note as intent-"
+                        f"level guidance without naming the unavailable tool."
+                    ),
+                ))
+    return violations
+
+
 def assert_production_registry_quality(specs: Iterable[ToolSpec]) -> None:
     """Sub-A4 / Sub-B1 / CI acceptance gate (Codex R2 MAJOR #1).
 
@@ -371,11 +448,26 @@ def assert_production_registry_quality(specs: Iterable[ToolSpec]) -> None:
 
     Use ``validate_tool_registry_quality`` directly for inspection
     flows (returning a list) or partial-migration soft mode (strict=False).
+
+    Codex Sub-A4 reminders R1 MAJOR #6: ALSO runs
+    ``validate_mutex_note_references`` against
+    ``TOOL_FAMILY_MANIFEST`` so cross-family prose references to
+    unmigrated tools fail the build until either the dependency is
+    migrated or the note is rewritten.
     """
 
-    validate_tool_registry_quality(
-        specs, strict=True, raise_on_error=True
+    validations = validate_tool_registry_quality(specs, strict=True)
+    # Lazy import — registry_quality.py is loaded by ToolSpec
+    # construction in some test paths; importing families at module
+    # top would create a cycle.
+    from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+    validations.extend(
+        validate_mutex_note_references(
+            specs, manifest=TOOL_FAMILY_MANIFEST
+        )
     )
+    if validations:
+        raise InvalidRegistryError(validations)
 
 
 __all__ = [

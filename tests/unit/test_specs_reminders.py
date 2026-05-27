@@ -336,11 +336,22 @@ def _plan_with_actions(actions: dict[str, Action]) -> Plan:
     )
 
 
-def _action(tool: str, args: dict, *, depends_on: list[str] | None = None) -> Action:
+def _action(
+    tool: str,
+    args: dict,
+    *,
+    depends_on: list[str] | None = None,
+    outcome_status: str = "ok",
+) -> Action:
+    """Build an Action with an outcome branch that matches the tool's
+    likely happy-status. Codex R1 MINOR #7: previously hard-coded
+    ``"updated"`` for every action, which made ``list_reminders``
+    actions semantically dirty (list returns ``ok`` / ``empty`` /
+    ``error``)."""
     return Action(
         tool=tool,
         args=args,
-        expected_outcomes=[OutcomeBranch(match={"status": "updated"})],
+        expected_outcomes=[OutcomeBranch(match={"status": outcome_status})],
         depends_on=depends_on or [],
     )
 
@@ -361,11 +372,12 @@ def test_update_reminder_rejects_refs_only_no_mutable_in_real_validator() -> Non
     no mutable fields → Phase 1.d ``_phase1_check_required_any_non_null``
     must emit ``silent_noop_call``."""
     plan = _plan_with_actions({
-        "s1": _action("list_reminders", {}),
+        "s1": _action("list_reminders", {}, outcome_status="ok"),
         "s2": _action(
             "update_reminder",
             {"reminder_id": "${s1.items[0].reminder_id}"},
             depends_on=["s1"],
+            outcome_status="updated",
         ),
     })
     registry = {
@@ -387,7 +399,7 @@ def test_update_reminder_rejects_refs_only_no_mutable_in_real_validator() -> Non
 
 def test_update_reminder_accepts_ref_on_mutable_field() -> None:
     plan = _plan_with_actions({
-        "s1": _action("list_reminders", {}),
+        "s1": _action("list_reminders", {}, outcome_status="ok"),
         "s2": _action(
             "update_reminder",
             {
@@ -395,6 +407,7 @@ def test_update_reminder_accepts_ref_on_mutable_field() -> None:
                 "trigger_iso": "${s1.items[0].next_trigger_at_iso}",
             },
             depends_on=["s1"],
+            outcome_status="updated",
         ),
     })
     registry = {
@@ -404,6 +417,213 @@ def test_update_reminder_accepts_ref_on_mutable_field() -> None:
     violations = validate_plan(plan, registry)
     silent_noop = [v for v in violations if v.code == "silent_noop_call"]
     assert not silent_noop
+
+
+# ---------------------------------------------------------------------------
+# Codex R1 follow-up tests (R2 candidates) — MAJOR #1/#2/#3/#4 + MINOR #8
+# ---------------------------------------------------------------------------
+
+
+def test_update_reminder_input_rejects_clear_recurrence_false() -> None:
+    """Codex R1 MAJOR #1: ``clear_recurrence=False`` is a semantic
+    no-op (runtime branches only on True). ``Literal[True] | None``
+    rejects False explicitly."""
+    with pytest.raises(ValidationError):
+        UpdateReminderInput.model_validate({
+            "reminder_id": REM_A,
+            "clear_recurrence": False,
+        })
+
+
+def test_update_reminder_input_accepts_clear_recurrence_true() -> None:
+    """``clear_recurrence=True`` is the real «turn off recurrence»
+    intent — accepted."""
+    parsed = UpdateReminderInput.model_validate({
+        "reminder_id": REM_A,
+        "clear_recurrence": True,
+    })
+    assert parsed.clear_recurrence is True
+
+
+def test_update_reminder_validator_rejects_false_only(monkeypatch) -> None:
+    """Codex R1 MAJOR #1: end-to-end via the real validator. A plan
+    that sends only ``{reminder_id, clear_recurrence: False}`` must
+    be rejected — both at the schema level AND at the planner
+    validator level (defense-in-depth)."""
+    # The schema rejects directly; validator path also catches via
+    # Phase 2's input_model.model_validate when no refs are present.
+    plan = _plan_with_actions({
+        "s1": _action(
+            "update_reminder",
+            {"reminder_id": REM_A, "clear_recurrence": False},
+            outcome_status="updated",
+        ),
+    })
+    registry = {"update_reminder": UPDATE_REMINDER_SPEC}
+    violations = validate_plan(plan, registry)
+    assert violations, "Expected validation violations for clear_recurrence=False"
+
+
+def test_schedule_reminder_input_rejects_malformed_trigger_iso() -> None:
+    """Codex R1 MAJOR #2 + #3: ``TriggerIso`` regex rejects obvious
+    non-ISO strings at plan time."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "купить хлеб",
+            "trigger_iso": "tomorrow",
+        })
+
+
+def test_schedule_reminder_input_rejects_huge_trigger_iso() -> None:
+    """Codex R1 MAJOR #3: ``TriggerIso`` caps at 64 chars."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "купить хлеб",
+            "trigger_iso": "2026-05-27T18:00:00+03:00" + "x" * 100,
+        })
+
+
+def test_schedule_reminder_input_accepts_offset_aware_iso() -> None:
+    """``+03:00`` accepted — runtime converts to UTC. UTC enforcement
+    is the runtime's responsibility per docstring."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T18:00:00+03:00",
+    })
+    assert parsed.trigger_iso == "2026-05-27T18:00:00+03:00"
+
+
+def test_schedule_reminder_input_accepts_z_suffix() -> None:
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+    })
+    assert parsed.trigger_iso == "2026-05-27T15:00:00Z"
+
+
+def test_schedule_reminder_input_rejects_malformed_recurrence_rule() -> None:
+    """Codex R1 MAJOR #3: ``RecurrenceRule`` requires ``FREQ=`` start."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "weekly_tuesday",
+        })
+
+
+def test_schedule_reminder_input_rejects_multiline_recurrence_rule() -> None:
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "FREQ=WEEKLY\nBYDAY=TU",
+        })
+
+
+def test_schedule_reminder_input_accepts_valid_rrule() -> None:
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU;BYHOUR=13;BYMINUTE=0",
+    })
+    assert parsed.recurrence_rule == "FREQ=WEEKLY;BYDAY=TU;BYHOUR=13;BYMINUTE=0"
+
+
+def test_update_reminder_parser_rejects_malformed_next_trigger() -> None:
+    """Codex R1 MAJOR #4: parser previously accepted any non-``none``
+    payload as ``next_trigger_at_iso``. With ``TriggerIso`` validation
+    on the output model, malformed values fall through to sentinel."""
+    parsed = parse_tool_output(
+        "update_reminder", f"ok:updated:{REM_A}:tomorrow"
+    )
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_update_reminder_parser_accepts_real_iso_next_trigger() -> None:
+    """ISO-shaped next_trigger continues to work."""
+    parsed = parse_tool_output(
+        "update_reminder", f"ok:updated:{REM_A}:2026-05-27T18:00:00Z"
+    )
+    assert isinstance(parsed, UpdateReminderOk)
+    assert parsed.next_trigger_at_iso == "2026-05-27T18:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# Codex R1 MINOR #8 — explicit blank-input coverage
+# ---------------------------------------------------------------------------
+
+
+def test_update_reminder_input_rejects_blank_title() -> None:
+    with pytest.raises(ValidationError):
+        UpdateReminderInput.model_validate({
+            "reminder_id": REM_A,
+            "title": "   ",
+        })
+
+
+def test_update_reminder_input_rejects_blank_trigger_iso() -> None:
+    with pytest.raises(ValidationError):
+        UpdateReminderInput.model_validate({
+            "reminder_id": REM_A,
+            "trigger_iso": "",
+        })
+
+
+def test_update_reminder_input_rejects_blank_recurrence_rule() -> None:
+    with pytest.raises(ValidationError):
+        UpdateReminderInput.model_validate({
+            "reminder_id": REM_A,
+            "recurrence_rule": "",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Codex R1 MAJOR #6 — registry-level mutex-note reference linter
+# ---------------------------------------------------------------------------
+
+
+def test_reminders_mutex_notes_do_not_reference_unmigrated_tools() -> None:
+    """Codex R1 MAJOR #6: the new registry linter
+    ``validate_mutex_note_references`` would catch a mutex_note
+    that names a tool from ``TOOL_FAMILY_MANIFEST`` which isn't in
+    the migrated specs. Reminders specs were rewritten to avoid
+    naming ``tasks.attach_reminder`` (not yet migrated)."""
+    from sreda.services.tool_schemas.registry_quality import (
+        validate_mutex_note_references,
+    )
+    violations = validate_mutex_note_references(
+        REMINDERS_SPECS, manifest=TOOL_FAMILY_MANIFEST
+    )
+    assert violations == [], (
+        f"reminders mutex_notes reference unmigrated tools: "
+        f"{[(v.tool_name, v.code, v.message[:80]) for v in violations]}"
+    )
+
+
+def test_mutex_note_reference_linter_detects_unmigrated_reference() -> None:
+    """Synthetic check: a mutex_note that names a tool from
+    ``TOOL_FAMILY_MANIFEST`` but not in the migrated specs surfaces
+    a violation."""
+    from sreda.services.tool_schemas.registry_quality import (
+        validate_mutex_note_references,
+    )
+    # SCHEDULE_REMINDER_SPEC is in the migrated set. Build a
+    # synthetic «poisoned» spec that names an unmigrated tool by
+    # using model_copy.
+    poisoned = SCHEDULE_REMINDER_SPEC.model_copy(update={
+        "mutex_notes": [
+            "Используй для standalone-напоминаний. Если юзер просит «напомни про задачу T-X» — это tasks.attach_reminder, не schedule_reminder.",
+        ],
+    })
+    violations = validate_mutex_note_references(
+        [poisoned], manifest=TOOL_FAMILY_MANIFEST
+    )
+    assert violations, "Expected violation for attach_reminder reference"
+    assert any(
+        v.code == "mutex_note_references_unmigrated_tool"
+        and "attach_reminder" in v.message
+        for v in violations
+    )
 
 
 # ---------------------------------------------------------------------------

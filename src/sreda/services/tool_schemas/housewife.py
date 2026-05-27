@@ -32,7 +32,11 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
-from sreda.services.tool_schemas.common import ReminderId, ShoppingItemId
+from sreda.services.tool_schemas.common import (
+    ReminderId,
+    ShoppingItemId,
+    TriggerIso,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -778,10 +782,17 @@ class UpdateReminderOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["updated"] = "updated"
     reminder_id: ReminderId
-    next_trigger_at_iso: str | None = None
+    next_trigger_at_iso: TriggerIso | None = None
     """ISO-8601 of the next scheduled fire after the update. ``None``
     when the recurrence was cleared and no future trigger remains
-    (legacy emits the literal ``"none"`` which the parser maps here)."""
+    (legacy emits the literal ``"none"`` which the parser maps here).
+
+    Codex Sub-A4 reminders R1 MAJOR #4: previously typed ``str | None``
+    which accepted any non-``none`` payload — a malformed legacy
+    output like ``ok:updated:rem_xxx:tomorrow`` would have surfaced
+    as typed success. Now uses ``TriggerIso`` (ISO-shape regex +
+    ≤64 chars); the parser catches the ValidationError and routes
+    to ``ToolOutputContractViolation`` (fail-closed)."""
 
 
 UpdateReminderOutput = Annotated[

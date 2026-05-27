@@ -168,15 +168,69 @@ ChecklistId = Annotated[
 """Checklist id — ``checklist_<24 hex chars>`` (``checklists.py:148/241``)."""
 
 
+# ---------------------------------------------------------------------------
+# Reminders family — date/time + recurrence aliases.
+# Codex Sub-A4 reminders R1 MAJOR #2 + #3: ``NonBlankStr`` (unbounded)
+# accepted huge or malformed values before the runtime parser saw them;
+# bounded ISO/RRULE aliases catch the obvious shape issues at planner
+# validation time. UTC is a separate runtime concern (the runtime
+# converts ``+03:00`` to UTC and treats naive as UTC — schema accepts
+# both since rejecting offset-aware ISO would break planner usage).
+# ---------------------------------------------------------------------------
+
+
+TriggerIso = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=10,  # at least YYYY-MM-DD
+        max_length=64,
+        # Loose ISO-8601 shape — pydantic does the strict parsing.
+        # Accepts: YYYY-MM-DDTHH:MM:SS, optional fractional seconds,
+        # optional timezone (Z / +HH:MM / -HH:MM). Single-line only.
+        pattern=(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?"
+            r"(Z|[+-]\d{2}:?\d{2})?$"
+        ),
+    ),
+]
+"""ISO-8601 datetime string. Runtime parses via
+``datetime.fromisoformat`` and normalizes to UTC
+(``housewife_chat_tools.py:325-349`` for schedule_reminder, :498-508
+for update_reminder). The shape regex catches obvious typos before
+the runtime emits ``cannot_parse_trigger_iso``. Capped at 64 chars —
+the longest legitimate ISO with microseconds + offset is ~32 chars,
+double for breathing room."""
+
+
+RecurrenceRule = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=4,  # ``FREQ=`` minimum
+        max_length=512,
+        # Single-line (no \n/\r); must start with FREQ= (RFC-5545 baseline).
+        pattern=r"^FREQ=[^\r\n]+$",
+    ),
+]
+"""RFC-5545 RRULE string. Runtime hands this to ``dateutil.rrule``
+which is the format gatekeeper. The pattern enforces single-line +
+``FREQ=`` prefix so we catch trivial mistakes (multiline strings,
+empty fragments) at planner time. Capped at 512 — RRULEs longer
+than that are almost certainly malformed."""
+
+
 __all__ = [
     "AddQuantityText",
     "CategoryName",
     "ChecklistId",
     "NonBlankStr",
     "QuantityText",
+    "RecurrenceRule",
     "ReminderId",
     "ShoppingItemId",
     "ShoppingTitle",
     "ShortStr",
     "TaskId",
+    "TriggerIso",
 ]

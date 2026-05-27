@@ -8,9 +8,12 @@ This module imports every per-family ``specs_<family>.py`` and exposes:
   acceptance gate, by the planner system prompt builder (Sub-B1),
   and by anyone who needs «every typed tool we know about right now».
 
-- ``ALL_TOOL_SPECS`` — alias kept for forward compatibility; will
-  equal the full 56-spec list once Sub-A4 completes. For now it's
-  the same as ``MIGRATED_TOOL_SPECS``.
+- ``ALL_TOOL_SPECS`` — read-only view (tuple) of every migrated
+  ToolSpec. Codex Sub-A4 reminders R1 MINOR #10: previously a
+  mutable list alias which let callers accidentally mutate either
+  name. Tuple makes the «forward compatibility» contract
+  enforceable. Final count (post-migration) is **55 tools** (47
+  housewife + 4 memory + 3 web + 1 ``get_recipe_any_source``).
 
 **ToolOutputContractViolation contract** (Codex Sub-A4 R1 MAJOR #6):
 
@@ -57,11 +60,17 @@ MIGRATED_TOOL_SPECS: list[ToolSpec] = [
 is the 7-tool shopping family; expand as each subsequent family ships."""
 
 
-ALL_TOOL_SPECS: list[ToolSpec] = MIGRATED_TOOL_SPECS
-"""Forward-compatible alias for the full 56-tool registry. Currently
-equals ``MIGRATED_TOOL_SPECS``; will diverge once incremental Sub-A4
-work creates a distinction between «known to the planner» and «known
-to the migration plan»."""
+ALL_TOOL_SPECS: tuple[ToolSpec, ...] = tuple(MIGRATED_TOOL_SPECS)
+"""Read-only view of every migrated ToolSpec. Currently equals
+``MIGRATED_TOOL_SPECS`` (as a tuple). Will diverge once incremental
+Sub-A4 work creates a distinction between «known to the planner»
+and «known to the migration plan». Final count post-migration is
+55 tools (47 housewife + 4 memory + 3 web + 1 ``get_recipe_any_source``).
+
+Codex Sub-A4 reminders R1 MINOR #10: was ``list[ToolSpec]`` aliasing
+``MIGRATED_TOOL_SPECS`` directly — any mutation on either name would
+silently mutate both. ``tuple`` makes the read-only intent
+enforceable at the type level."""
 
 
 __all__ = [

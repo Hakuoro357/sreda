@@ -644,7 +644,12 @@ def test_migrated_tool_specs_aggregate_includes_shopping() -> None:
         f"Missing from MIGRATED_TOOL_SPECS: "
         f"{shopping_names - migrated_names}"
     )
-    assert ALL_TOOL_SPECS == MIGRATED_TOOL_SPECS  # alias for now
+    # Codex Sub-A4 reminders R1 MINOR #10: ``ALL_TOOL_SPECS`` is now a
+    # read-only tuple view of the same content (was a mutable list
+    # alias). Tuple makes the «forward compatibility» contract
+    # enforceable but means direct equality is False against the
+    # list — compare by element.
+    assert tuple(MIGRATED_TOOL_SPECS) == ALL_TOOL_SPECS
 
 
 def test_migrated_tool_specs_pass_strict_production_quality() -> None:
