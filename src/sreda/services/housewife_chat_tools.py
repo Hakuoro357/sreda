@@ -2465,24 +2465,36 @@ def build_housewife_tools(
     def move_task_to_checklist(
         task_id: str, list_id_or_title: str
     ) -> str:
-        """Atomically move a task from schedule to a checklist.
+        """Move a task from schedule to a checklist (best-effort staged writes).
+
+        Codex Sub-A4 checklists R2 MAJOR (prior-not-closed): pre-R2
+        docstring claimed «atomically», «one transaction», «cannot
+        lose partially». Runtime is NOT actually atomic — cancel
+        commits at tasks.py:444, then checklist writes commit
+        separately (checklists.py:157,484). If add_item fails after
+        cancel, the task is already cancelled with no rollback.
+        Docstring rewritten to honestly expose the partial-failure
+        risk (true transactional refactor is Phase B work).
 
         ОДИН вызов вместо двух (cancel_task + add_checklist_items) —
-        безопаснее, так как невозможно «потерять» task частично или
-        задвоить пункт. Используй когда:
+        короче для LLM. Используй когда:
 
         * Юзер просит «перенеси X из расписания в дела/чек-лист Y»
         * Понял что в прошлом turn'е ошибочно создал task вместо
           add_checklist_items, и хочешь перенести
         * Юзер уточнил «это не на конкретное время — переложи в дела»
 
-        Что делает (атомарно, в одной транзакции):
-        1. Cancel task (status='cancelled' — soft delete, audit
-           trail сохраняется, retention worker подчистит позже)
-        2. Если у task'а был reminder — он тоже отменяется
-        3. Add item с title задачи в target checklist (с dedup
-           защитой — если такой пункт уже есть, не задвоит)
-        4. Если target checklist не найден — создаёт его с этим title
+        Что делает (последовательно, БЕЗ единой транзакции —
+        each step commits independently):
+        1. Cancel task (status='cancelled', commit). Linked reminder
+           тоже отменяется.
+        2. Resolve / create target checklist (commit).
+        3. Add item с title задачи в target checklist с dedup
+           защитой (commit). Если на этом шаге упало — task уже
+           отменён, item не создан. Честно сообщи юзеру что перенос
+           завершился частично.
+        4. Если target checklist не найден — создаст его с title
+           = list_id_or_title.
 
         Args:
             task_id: id задачи (формат ``task_*``).

@@ -168,7 +168,12 @@ CREATE_CHECKLIST_SPEC = ToolSpec(
     ),
     family="checklists",
     effect="write",
-    read_domains=[],
+    # Codex Sub-A4 checklists R2 MINOR (new): runtime
+    # ChecklistService.create_list reads active checklists to dedup
+    # by title before writing (checklists.py:133). read_domains
+    # declares «every mutable data store touched» — checklists is
+    # read for dedup even though the read isn't a separate tool call.
+    read_domains=["checklists"],
     write_domains=["checklists"],
     input_model=CreateChecklistInput,
     output_model=CreateChecklistOutput,
