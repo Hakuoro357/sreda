@@ -134,11 +134,13 @@ def test_save_recipe_input_rejects_unknown_source() -> None:
         SaveRecipeInput.model_validate({**_VALID_RECIPE, "source": "made_up"})
 
 
-def test_save_recipe_input_rejects_empty_ingredients() -> None:
-    """Service contract requires at least one ingredient — recipes without
-    ingredients are useless to the planner."""
-    with pytest.raises(ValidationError):
-        SaveRecipeInput.model_validate({**_VALID_RECIPE, "ingredients": []})
+def test_save_recipe_input_accepts_empty_ingredients() -> None:
+    """Codex R1 MAJOR #3: runtime explicitly allows recipes with zero
+    structured ingredients («a free-form instructions-only recipe» —
+    housewife_recipes.py:160-163). Schema should match — previously
+    rejected at min_length=1."""
+    parsed = SaveRecipeInput.model_validate({**_VALID_RECIPE, "ingredients": []})
+    assert parsed.ingredients == []
 
 
 def test_save_recipe_input_rejects_zero_servings() -> None:
@@ -151,9 +153,17 @@ def test_save_recipe_input_rejects_blank_title() -> None:
         SaveRecipeInput.model_validate({**_VALID_RECIPE, "title": "   "})
 
 
-def test_save_recipe_input_rejects_over_200_title() -> None:
+def test_save_recipe_input_accepts_title_at_500() -> None:
+    """Codex R1 MINOR: RecipeTitle bumped from 200 to 500 to match
+    DB column (EncryptedString, no cap) — 200 was overly strict for
+    web-imported titles."""
+    parsed = SaveRecipeInput.model_validate({**_VALID_RECIPE, "title": "x" * 500})
+    assert len(parsed.title) == 500
+
+
+def test_save_recipe_input_rejects_over_500_title() -> None:
     with pytest.raises(ValidationError):
-        SaveRecipeInput.model_validate({**_VALID_RECIPE, "title": "x" * 201})
+        SaveRecipeInput.model_validate({**_VALID_RECIPE, "title": "x" * 501})
 
 
 def test_save_recipe_input_rejects_too_many_tags() -> None:
@@ -164,23 +174,112 @@ def test_save_recipe_input_rejects_too_many_tags() -> None:
         })
 
 
+def test_save_recipe_input_rejects_web_found_without_url() -> None:
+    """Codex R1 MAJOR #2: source=web_found requires source_url."""
+    with pytest.raises(ValidationError, match="requires source_url"):
+        SaveRecipeInput.model_validate({
+            **_VALID_RECIPE,
+            "source": "web_found",
+        })
+
+
+def test_save_recipe_input_rejects_non_web_with_url() -> None:
+    """source != web_found forbids source_url."""
+    with pytest.raises(ValidationError, match="must NOT carry source_url"):
+        SaveRecipeInput.model_validate({
+            **_VALID_RECIPE,
+            "source": "ai_generated",
+            "source_url": "https://example.com/recipe/borscht",
+        })
+
+
+def test_save_recipe_input_rejects_web_found_with_malformed_url() -> None:
+    """Codex R1 MAJOR #2: URL shape regex catches «не URL»."""
+    with pytest.raises(ValidationError, match="valid http/https URL"):
+        SaveRecipeInput.model_validate({
+            **_VALID_RECIPE,
+            "source": "web_found",
+            "source_url": "yes please",
+        })
+
+
+def test_save_recipe_input_accepts_web_found_with_valid_url() -> None:
+    parsed = SaveRecipeInput.model_validate({
+        **_VALID_RECIPE,
+        "source": "web_found",
+        "source_url": "https://example.com/recipes/borscht",
+    })
+    assert parsed.source_url == "https://example.com/recipes/borscht"
+
+
+def test_save_recipe_input_rejects_source_url_over_500() -> None:
+    """Codex R1 MAJOR #1: SourceUrl caps at 500 (DB column constraint)."""
+    long_url = "https://example.com/" + "x" * 500
+    with pytest.raises(ValidationError):
+        SaveRecipeInput.model_validate({
+            **_VALID_RECIPE,
+            "source": "web_found",
+            "source_url": long_url,
+        })
+
+
 def test_save_recipes_batch_input_rejects_empty() -> None:
     with pytest.raises(ValidationError):
         SaveRecipesBatchInput.model_validate({"recipes": []})
 
 
 def test_save_recipes_batch_input_rejects_over_50() -> None:
+    """Build 51 distinct recipes (titles differ) to avoid the dup guard
+    firing first."""
+    recipes = [
+        {**_VALID_RECIPE, "title": f"Рецепт #{i}"} for i in range(51)
+    ]
     with pytest.raises(ValidationError):
-        SaveRecipesBatchInput.model_validate({
-            "recipes": [_VALID_RECIPE] * 51,
-        })
+        SaveRecipesBatchInput.model_validate({"recipes": recipes})
 
 
-def test_save_recipes_batch_input_accepts_max_50() -> None:
-    parsed = SaveRecipesBatchInput.model_validate({
-        "recipes": [_VALID_RECIPE] * 50,
-    })
+def test_save_recipes_batch_input_accepts_max_50_distinct() -> None:
+    """50 DISTINCT recipes (distinct titles) is the upper bound."""
+    recipes = [
+        {**_VALID_RECIPE, "title": f"Рецепт #{i}"} for i in range(50)
+    ]
+    parsed = SaveRecipesBatchInput.model_validate({"recipes": recipes})
     assert len(parsed.recipes) == 50
+
+
+def test_save_recipes_batch_input_rejects_duplicate_normalized_titles() -> None:
+    """Codex R1 MAJOR #4: runtime silently drops later duplicates and
+    doesn't count them in skipped_as_duplicate. Schema rejects so the
+    planner knows it sent dups."""
+    recipes = [
+        {**_VALID_RECIPE, "title": "Борщ"},
+        {**_VALID_RECIPE, "title": "  БОРЩ  "},  # normalizes to same
+    ]
+    with pytest.raises(ValidationError):
+        SaveRecipesBatchInput.model_validate({"recipes": recipes})
+
+
+def test_save_recipes_batch_input_rejects_oversize_payload() -> None:
+    """Codex R1 MAJOR #5: aggregate char budget — 50 recipes × 8000-char
+    instructions = 400KB worst case. Cap at 200_000 chars."""
+    huge_instructions = "x" * 8000
+    recipes = [
+        {**_VALID_RECIPE, "title": f"Рецепт #{i}", "instructions_md": huge_instructions}
+        for i in range(50)
+    ]
+    with pytest.raises(ValidationError):
+        SaveRecipesBatchInput.model_validate({"recipes": recipes})
+
+
+def test_save_recipes_batch_input_accepts_normal_payload() -> None:
+    """Realistic 20-recipe batch under the budget passes."""
+    recipes = [
+        {**_VALID_RECIPE, "title": f"Рецепт #{i}",
+         "instructions_md": "1. Сварить.\n2. Подать."}
+        for i in range(20)
+    ]
+    parsed = SaveRecipesBatchInput.model_validate({"recipes": recipes})
+    assert len(parsed.recipes) == 20
 
 
 def test_search_recipes_input_accepts_empty_query() -> None:

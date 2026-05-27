@@ -434,7 +434,12 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "search_recipes": "recipes",
     "get_recipe": "recipes",
     "delete_recipe": "recipes",
-    "get_recipe_any_source": "recipes",
+    # Codex Sub-A4 recipes R1 MAJOR #6: ``get_recipe_any_source`` removed
+    # from the manifest until the runtime function actually ships
+    # (architecture-map TODO-2). A manifest that lists not-yet-built
+    # tools risks leaking those names into planner-facing surfaces.
+    # Restore this entry in the same commit that adds the tool's
+    # ToolSpec + parser.
     # ---- menu (5) ---------------------------------------------------------
     "plan_week_menu": "menu",
     "update_menu_item": "menu",

@@ -24,9 +24,10 @@ Sources of truth:
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.common import (
@@ -43,6 +44,23 @@ from sreda.services.tool_schemas.housewife import (
 )
 
 
+_HTTPS_URL_RE = re.compile(r"^https?://[^\s/$.?#].\S*$", re.IGNORECASE)
+"""Loose http/https URL shape. Runtime doesn't fetch — this only
+catches obviously-not-a-URL strings like ``"yes"`` getting into
+``source_url`` slot. dateutil's ``rrulestr`` analogue."""
+
+
+def _normalize_title_for_dedup(title: str) -> str:
+    """Mirror of ``housewife_recipes._normalise_title``: lowercase +
+    whitespace-collapse. Used here so the batch validator catches the
+    same duplicates the runtime would silently drop.
+
+    Source: ``services/housewife_recipes.py`` (private; reimplemented
+    here because import would create a cycle through the planner).
+    """
+    return " ".join(title.lower().split())
+
+
 # ---------------------------------------------------------------------------
 # Recipes-specific aliases — caps from the docstring contracts in
 # housewife_chat_tools.py and the recipe_service implementation.
@@ -51,11 +69,14 @@ from sreda.services.tool_schemas.housewife import (
 
 RecipeTitle = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
-"""Recipe title. Service-layer caps via SQLAlchemy column length; the
-200-char cap matches the «short name» convention in the docstring
-contract and prevents accidentally serializing a paragraph as a title."""
+"""Recipe title. Codex Sub-A4 recipes R1 MINOR: bumped from 200 to 500
+to match the DB column behaviour (``Recipe.title`` is EncryptedString
+with no length cap; runtime is unbounded). 200 was overly strict —
+some imported web-sourced recipe titles legitimately exceed it. 500
+keeps the «short name» spirit of the docstring while accepting real-
+world variability."""
 
 
 InstructionsMd = Annotated[
@@ -63,8 +84,9 @@ InstructionsMd = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=8000),
 ]
 """Recipe instructions in markdown. 8000-char cap is generous (a
-multi-step recipe rarely exceeds 2000) but bounds the prompt size for
-``save_recipes_batch`` calls that send many recipes."""
+multi-step recipe rarely exceeds 2000) but bounds individual recipe
+size; aggregate batch payload is additionally bounded in
+``SaveRecipesBatchInput`` (Codex R1 MAJOR #5)."""
 
 
 RecipeSource = Literal[
@@ -85,11 +107,16 @@ SearchQuery = Annotated[
 
 SourceUrl = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=4, max_length=2048),
+    StringConstraints(strip_whitespace=True, min_length=10, max_length=500),
 ]
-"""HTTPS source URL when source == 'web_found'. Cap at 2048 (typical
-browser URL limit). Format not validated at schema — runtime does its
-own httpx check."""
+"""HTTPS source URL when source == 'web_found'. Codex Sub-A4 recipes
+R1 MAJOR #1: capped at 500 to match ``Recipe.source_url: String(500)``
+(``db/models/housewife_food.py:243``). Was 2048 — would generate
+schema-valid payloads that fail/truncate at insert.
+
+Format additionally validated by ``SaveRecipeInput.@model_validator``
+to require ``https?://...`` shape AND that source_url is set IFF
+source=='web_found' (Codex R1 MAJOR #2)."""
 
 
 TagsList = Annotated[
@@ -114,11 +141,22 @@ class RecipeIngredientInput(BaseModel):
 
 
 class SaveRecipeInput(BaseModel):
-    """Save a single recipe. Field caps per ``housewife_chat_tools.py:921``."""
+    """Save a single recipe. Field caps per ``housewife_chat_tools.py:921``
+    and the underlying ``Recipe`` SQLAlchemy model.
+
+    Codex Sub-A4 recipes R1:
+    - MAJOR #2: source / source_url invariant enforced via
+      ``@model_validator`` — source==web_found ⇔ source_url present
+      with ``https?://...`` shape.
+    - MAJOR #3: ``ingredients`` ``min_length`` relaxed from 1 to 0 —
+      runtime (``housewife_recipes.py:160-163``) explicitly allows
+      «a free-form instructions-only recipe» with zero structured
+      ingredient rows.
+    """
 
     model_config = ConfigDict(extra="forbid")
     title: RecipeTitle
-    ingredients: list[RecipeIngredientInput] = Field(min_length=1, max_length=100)
+    ingredients: list[RecipeIngredientInput] = Field(min_length=0, max_length=100)
     instructions_md: InstructionsMd
     servings: int = Field(ge=1, le=100)
     source: RecipeSource
@@ -130,14 +168,106 @@ class SaveRecipeInput(BaseModel):
     fat_per_serving: float | None = Field(default=None, ge=0, le=1000)
     carbs_per_serving: float | None = Field(default=None, ge=0, le=1000)
 
+    @model_validator(mode="after")
+    def _validate_source_url_invariant(self) -> "SaveRecipeInput":
+        """Codex R1 MAJOR #2: bind ``source`` and ``source_url`` together.
+
+        Runtime stores the URL when source==web_found, but the schema
+        previously accepted any combo (URL with source=ai_generated,
+        web_found without URL, malformed URL string). Now:
+
+        - source == "web_found" → source_url REQUIRED and ``https?://``
+        - source != "web_found" → source_url FORBIDDEN (or explicit null)
+
+        Strict at planner time so bad provenance metadata never reaches
+        storage. Empty/blank source_url on web_found rejected too."""
+        if self.source == "web_found":
+            if self.source_url is None or not self.source_url.strip():
+                raise ValueError(
+                    "source='web_found' requires source_url with a "
+                    "valid https?:// URL. Either omit source_url and "
+                    "use a different source, or provide the origin URL."
+                )
+            if not _HTTPS_URL_RE.match(self.source_url):
+                raise ValueError(
+                    f"source_url={self.source_url!r} doesn't look like "
+                    f"a valid http/https URL. Required when "
+                    f"source='web_found'."
+                )
+        else:
+            if self.source_url is not None:
+                raise ValueError(
+                    f"source={self.source!r} must NOT carry source_url "
+                    f"(got {self.source_url!r}). source_url is only "
+                    f"meaningful for source='web_found' — runtime "
+                    f"would store stale/wrong provenance metadata "
+                    f"otherwise."
+                )
+        return self
+
 
 class SaveRecipesBatchInput(BaseModel):
-    """Batch-save N recipes."""
+    """Batch-save N recipes.
+
+    Codex Sub-A4 recipes R1 MAJOR #4 + #5:
+    - Duplicate normalized titles within ONE batch are now rejected
+      at the schema level (runtime silently dropped them without
+      counting in ``skipped_as_duplicate``, hiding work the user
+      asked for).
+    - Aggregate char budget across all recipes capped at 200_000
+      to prevent a 50×8000-char-instructions explosion from blowing
+      planner / tool-call payload size before validation can help.
+    """
 
     model_config = ConfigDict(extra="forbid")
     recipes: list[SaveRecipeInput] = Field(min_length=1, max_length=50)
     """Up to 50 recipes per batch — keeps the LLM tool-call payload
     bounded; for «save my whole book» flows the planner can chunk."""
+
+    @model_validator(mode="after")
+    def _validate_batch_invariants(self) -> "SaveRecipesBatchInput":
+        # Duplicate-title guard — same normalization runtime uses.
+        # Mirrors ``housewife_recipes._normalise_title``.
+        seen_titles: dict[str, int] = {}
+        for idx, recipe in enumerate(self.recipes):
+            normalized = _normalize_title_for_dedup(recipe.title)
+            if normalized in seen_titles:
+                first_idx = seen_titles[normalized]
+                raise ValueError(
+                    f"recipes[{idx}].title={recipe.title!r} duplicates "
+                    f"recipes[{first_idx}] under case/whitespace "
+                    f"normalization. Runtime would silently drop the "
+                    f"later occurrence without counting it in "
+                    f"skipped_as_duplicate — caller wouldn't see "
+                    f"work was lost. Deduplicate before sending."
+                )
+            seen_titles[normalized] = idx
+
+        # Aggregate char budget. Each recipe's instructions_md alone
+        # can be 8000 chars; 50 recipes worst-case = 400KB before
+        # ingredients/tags. Cap at 200_000 chars total (≈4× a typical
+        # batch) so accidental «save 50 enormous recipes» doesn't
+        # blow the LLM tool-call payload.
+        total_chars = sum(
+            len(r.title)
+            + len(r.instructions_md)
+            + sum(
+                len(i.title) + len(i.quantity_text or "")
+                for i in r.ingredients
+            )
+            + (len(r.source_url) if r.source_url else 0)
+            + sum(len(t) for t in (r.tags or []))
+            for r in self.recipes
+        )
+        BATCH_CHAR_BUDGET = 200_000
+        if total_chars > BATCH_CHAR_BUDGET:
+            raise ValueError(
+                f"batch aggregate size {total_chars} chars exceeds "
+                f"{BATCH_CHAR_BUDGET} char budget. Chunk into smaller "
+                f"batches (e.g. 10-20 recipes per call) — the LLM "
+                f"tool-call has a payload ceiling."
+            )
+        return self
 
 
 class SearchRecipesInput(BaseModel):
