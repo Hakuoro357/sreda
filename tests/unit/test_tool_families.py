@@ -452,6 +452,8 @@ _REDIRECT_SCAN_ALLOWLIST: frozenset[str] = frozenset({
     "СУЩЕСТВУЮЩИМ",             # qualifier (existing entity)
     "СУЩЕСТВУЮЩЕЙ",             # qualifier (existing entity, dative)
     "НОВОЕ",                    # emphasis marker in CREATE boundary rule
+    "БЕЗ",                      # emphasis in UPDATE standalone rule
+    "ПРИВЯЗАННОГО",             # emphasis in UPDATE task-linked rule
     "Y", "Z", "X",              # placeholder identifiers
     "T",                        # in «задаче T-42»
 })
@@ -534,6 +536,48 @@ def test_no_anti_pattern_calls_non_family_redirect_a_group() -> None:
         + "\n".join(
             f"  family={f!r}: match={m!r} in {ap!r}"
             for f, m, ap in failures
+        )
+    )
+
+
+# Codex R4 MINOR #3 — every NonFamilyRedirect mention must have a nearby
+# qualifier indicating it's not a tool family. Otherwise the planner might
+# read «см. СБОРЩИК ОТВЕТА» and treat it as a routable destination.
+
+_NON_FAMILY_QUALIFIERS: tuple[str, ...] = (
+    "не tool",
+    "не семья",
+    "не семьЯ",
+    "без MVP-tool",
+    "ответ юзеру",
+    "ответь юзеру",
+    "юзеру не виден",
+    "юзеру невидим",
+)
+
+
+def test_non_family_redirect_mentions_have_qualifier_nearby() -> None:
+    """For every anti-pattern that mentions a NonFamilyRedirect value,
+    the same anti-pattern must contain at least one qualifier phrase
+    that says «this is NOT a tool family». Otherwise the planner could
+    misread «см. СБОРЩИК ОТВЕТА» as routable.
+    """
+    failures: list[tuple[str, str, str]] = []
+    for family, header in FAMILY_HEADERS.items():
+        for ap in header.anti_patterns:
+            ap_lower = ap.lower()
+            for redirect in NON_FAMILY_REDIRECTS:
+                if redirect not in ap:
+                    continue
+                if not any(q.lower() in ap_lower for q in _NON_FAMILY_QUALIFIERS):
+                    failures.append((family, redirect, ap))
+    assert not failures, (
+        "Anti-patterns mention NonFamilyRedirect values without a "
+        "nearby qualifier («не tool», «не семья», «без MVP-tool», "
+        "«ответ юзеру», etc.):\n"
+        + "\n".join(
+            f"  family={f!r}: redirect={r!r} in {ap!r}"
+            for f, r, ap in failures
         )
     )
 
