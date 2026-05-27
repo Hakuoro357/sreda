@@ -2981,7 +2981,7 @@ class ShowChecklistItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     item_id: ChecklistItemId
     item_status: Literal["pending", "done", "cancelled"]
-    title: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=1, max_length=1000)
 
 
 class ShowChecklistEmpty(BaseModel):
@@ -3129,7 +3129,11 @@ class MarkChecklistItemDoneOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["done"] = "done"
     item_id: ChecklistItemId
-    title: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=1, max_length=1000)
+    """Codex Sub-A4 checklists R7 MINOR (HIGH catch): runtime
+    add_items caps title at 1000 (checklists.py:463). Pre-R7
+    schema cap of 500 would ContractViolation legacy rows with
+    501-1000 char titles."""
 
 
 MarkChecklistItemDoneOutput = Annotated[
@@ -3172,7 +3176,8 @@ class DeleteChecklistItemOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["deleted"] = "deleted"
     item_id: ChecklistItemId
-    title: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=1, max_length=1000)
+    """Codex R7 MINOR: cap matches runtime add_items (checklists.py:463)."""
 
 
 DeleteChecklistItemOutput = Annotated[

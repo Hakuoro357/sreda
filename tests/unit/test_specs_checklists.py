@@ -505,6 +505,47 @@ def test_archive_parser_ok() -> None:
     assert parsed.checklist_id == CL_A
 
 
+def test_long_item_title_1000_chars_accepted() -> None:
+    """Codex Sub-A4 checklists R7 MINOR (HIGH catch): runtime caps
+    item title at 1000 chars (checklists.py:463). Pre-R7 schema cap
+    of 500 would ContractViolation 501-1000 char legacy rows. Verify
+    schemas accept up to 1000 across show/mark/delete."""
+    from sreda.services.tool_schemas.housewife import (
+        DeleteChecklistItemOk,
+        MarkChecklistItemDoneOk,
+        ShowChecklistItem,
+    )
+    long_title = "A" * 1000
+    # ShowChecklistItem
+    parsed = parse_tool_output(
+        "show_checklist",
+        f"# X ({CL_A})\n[{IT_A}] ☐ {long_title}",
+    )
+    assert isinstance(parsed, ShowChecklistOk)
+    assert len(parsed.items[0].title) == 1000
+    # MarkChecklistItemDoneOk
+    parsed = parse_tool_output(
+        "mark_checklist_item_done", f"ok:done:{IT_A}:{long_title}",
+    )
+    assert isinstance(parsed, MarkChecklistItemDoneOk)
+    assert len(parsed.title) == 1000
+    # DeleteChecklistItemOk
+    parsed = parse_tool_output(
+        "delete_checklist_item", f"ok:deleted:{IT_A}:{long_title}",
+    )
+    assert isinstance(parsed, DeleteChecklistItemOk)
+    assert len(parsed.title) == 1000
+
+
+def test_long_item_title_1001_chars_rejected() -> None:
+    """1001 char is over runtime cap — ContractViolation."""
+    long_title = "A" * 1001
+    parsed = parse_tool_output(
+        "mark_checklist_item_done", f"ok:done:{IT_A}:{long_title}",
+    )
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
 def test_archive_parser_not_found_remapped() -> None:
     """Codex Sub-A4 checklists R1 (preempt): same generic `not_found:'<X>'`
     runtime shape (housewife_chat_tools.py:2692). Remap to
