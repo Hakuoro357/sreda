@@ -1073,6 +1073,111 @@ def test_schedule_reminder_accepts_negative_bymonthday_with_short_month() -> Non
     assert "BYMONTHDAY=-1" in parsed.recurrence_rule
 
 
+# ---------------------------------------------------------------------------
+# Codex R6 follow-up tests
+# ---------------------------------------------------------------------------
+
+
+def test_recurrence_rule_alias_runs_static_checks_via_after_validator() -> None:
+    """Codex Sub-A4 reminders R6 MAJOR #1: ``RecurrenceRule`` now has
+    an ``AfterValidator(_alias_static_rrule_check)`` so the planner's
+    refs-present per-field validation path catches bad RRULE numeric
+    ranges. Verify by validating the alias directly (TypeAdapter)."""
+    from pydantic import TypeAdapter
+
+    from sreda.services.tool_schemas.common import RecurrenceRule
+
+    adapter = TypeAdapter(RecurrenceRule)
+    # Valid RRULE passes.
+    assert adapter.validate_python("FREQ=DAILY;INTERVAL=4") == "FREQ=DAILY;INTERVAL=4"
+    # INTERVAL=0 fails at the alias level (no model_validator needed).
+    with pytest.raises(ValidationError):
+        adapter.validate_python("FREQ=DAILY;INTERVAL=0")
+
+
+def test_update_reminder_refs_present_still_rejects_bad_rrule_literal() -> None:
+    """Codex R6 MAJOR #1 — the common shape: ``reminder_id`` is a ref
+    (skips ``@model_validator`` in the refs-present validator path),
+    but ``recurrence_rule`` is a concrete literal. Previously the
+    static check lived only in ``@model_validator`` so a bad RRULE
+    slipped through. Now the alias-level ``AfterValidator`` catches it
+    via Phase 2's per-field TypeAdapter path.
+
+    We exercise the REAL ``runtime/planner/validator.py:validate_plan``
+    here to prove the integration."""
+    plan = _plan_with_actions({
+        "s1": _action("list_reminders", {}, outcome_status="ok"),
+        "s2": _action(
+            "update_reminder",
+            {
+                "reminder_id": "${s1.items[0].reminder_id}",
+                "recurrence_rule": "FREQ=DAILY;INTERVAL=0",
+            },
+            depends_on=["s1"],
+            outcome_status="updated",
+        ),
+    })
+    registry = {
+        "list_reminders": LIST_REMINDERS_SPEC,
+        "update_reminder": UPDATE_REMINDER_SPEC,
+    }
+    violations = validate_plan(plan, registry)
+    bad_arg_violations = [
+        v for v in violations
+        if v.step_id == "s2" and v.field_path == "recurrence_rule"
+    ]
+    assert bad_arg_violations, (
+        f"Expected a recurrence_rule violation on s2 (refs-present path "
+        f"with bad literal) but got: "
+        f"{[(v.code, v.field_path, v.message[:60]) for v in violations]}"
+    )
+
+
+def test_feasibility_rejects_negative_bymonthday_for_short_months() -> None:
+    """Codex R6 MAJOR #2: ``BYMONTH=2;BYMONTHDAY=-31`` requires a
+    31-day month for «31 days from end of month» to fire — but Feb
+    has 28-29 days. Previously R5's feasibility skipped all negative
+    days as «always feasible», accidentally accepting this."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-31",
+        })
+
+
+def test_feasibility_rejects_negative_bymonthday_for_30_day_month() -> None:
+    """``BYMONTH=4;BYMONTHDAY=-30`` — April has 30 days, ``-30`` =
+    1 April (30 days from end). Feasible. ``BYMONTH=4;BYMONTHDAY=-31``
+    — needs 31 days, April has 30. Infeasible."""
+    with pytest.raises(ValidationError):
+        ScheduleReminderInput.model_validate({
+            "title": "x",
+            "trigger_iso": "2026-05-27T15:00:00Z",
+            "recurrence_rule": "FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=-31",
+        })
+
+
+def test_feasibility_accepts_negative_bymonthday_within_short_month() -> None:
+    """``BYMONTH=2;BYMONTHDAY=-29`` — Feb has 29 days in leap years.
+    Feasible (one year fires).
+
+    ``BYMONTH=1;BYMONTHDAY=-31`` — Jan has 31 days. Feasible."""
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-29",
+    })
+    assert "BYMONTHDAY=-29" in parsed.recurrence_rule
+
+    parsed = ScheduleReminderInput.model_validate({
+        "title": "x",
+        "trigger_iso": "2026-05-27T15:00:00Z",
+        "recurrence_rule": "FREQ=YEARLY;BYMONTH=1;BYMONTHDAY=-31",
+    })
+    assert "BYMONTHDAY=-31" in parsed.recurrence_rule
+
+
 def test_update_reminder_input_documents_executor_contract() -> None:
     """Codex R5 MAJOR #2: schema-side validation defers dtstart-aware
     checks to the executor for partial-update-of-rrule. The contract

@@ -224,21 +224,25 @@ def _check_month_day_feasibility(params: dict[str, list[int]]) -> None:
         return
     months = params["BYMONTH"]
     days = params["BYMONTHDAY"]
-    # Negative BYMONTHDAY counts from end-of-month — always feasible
-    # (every month has at least 28 days, so -1..-28 always fire).
-    if any(d > 0 for d in days):
-        positive_days = [d for d in days if d > 0]
-        max_day_available = max(
-            _MONTH_MAX_DAY.get(m, 31) for m in months
+    # Codex Sub-A4 reminders R6 MAJOR #2: treat positive and negative
+    # BYMONTHDAY uniformly via abs(). R5's fix skipped all negative
+    # days, accidentally accepting ``BYMONTH=2;BYMONTHDAY=-31`` (which
+    # would never fire — Feb has 28-29 days, so «31 days from end of
+    # Feb» is impossible). Per RFC-5545 semantics: ``-N`` means «N
+    # days from end of month», requires month with ≥N days.
+    #
+    # ``-1..-28`` are universal (every month has ≥28 days), so they
+    # always fire. ``-29..-31`` need progressively longer months.
+    # Same as positive: the abs value is the «N days required».
+    max_day_available = max(_MONTH_MAX_DAY.get(m, 31) for m in months)
+    min_required = min(abs(d) for d in days)
+    if max_day_available < min_required:
+        raise ValueError(
+            f"BYMONTH={months} + BYMONTHDAY={days} is infeasible: "
+            f"the largest selected month has {max_day_available} days, "
+            f"smallest required (by abs value) is {min_required}. "
+            f"Recurrence would never fire. Re-check months/days."
         )
-        min_required = min(positive_days)
-        if max_day_available < min_required:
-            raise ValueError(
-                f"BYMONTH={months} + BYMONTHDAY={days} is infeasible: "
-                f"the largest selected month has {max_day_available} days, "
-                f"smallest selected day-of-month is {min_required}. "
-                f"Recurrence would never fire. Re-check months/days."
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +454,23 @@ _RFC5545_FREQ_VALUES = (
 _RFC5545_FREQ_PATTERN = "|".join(_RFC5545_FREQ_VALUES)
 
 
+def _alias_static_rrule_check(value: str) -> str:
+    """AfterValidator wrapper around ``validate_rrule_static`` for the
+    ``RecurrenceRule`` alias. Codex Sub-A4 reminders R6 MAJOR #1: the
+    planner validator's refs-present Phase 2 uses per-field
+    ``TypeAdapter(annotation_with_constraints)`` which DOES run
+    ``AfterValidator`` on each concrete field — but skips
+    ``@model_validator`` on the parent model. Putting the static
+    checks on the alias makes them fire on the common
+    ``update_reminder(reminder_id=ref, recurrence_rule=literal)`` shape
+    where the model-level validator wouldn't run.
+
+    Returns the original value (per AfterValidator convention).
+    """
+    validate_rrule_static(value)
+    return value
+
+
 RecurrenceRule = Annotated[
     str,
     StringConstraints(
@@ -464,15 +485,18 @@ RecurrenceRule = Annotated[
             r"(;[A-Z]+=[A-Za-z0-9,+\-]+)*$"
         ),
     ),
-    # Codex Sub-A4 reminders R3 MINOR #2 + R4 MAJOR #1 — dateutil
-    # validation requires the actual ``trigger_iso`` as dtstart (a
-    # fixed dummy can false-reject ``FREQ=HOURLY;INTERVAL=4;BYHOUR=13``
-    # type rules whose validity depends on the dtstart's hour
-    # component). The alias keeps only the regex shape check; full
-    # grammar + numeric-range validation lives in
-    # ``validate_rrule_with_trigger`` called from the
-    # ``@model_validator`` on ScheduleReminderInput / UpdateReminderInput
-    # where both fields are available together.
+    # Codex Sub-A4 reminders R3 MINOR #2 + R4 MAJOR #1 + R6 MAJOR #1:
+    # static (dtstart-INDEPENDENT) checks run here so the planner's
+    # refs-present per-field validation path catches INTERVAL=0 /
+    # BYHOUR=99 / BYMONTH=2;BYMONTHDAY=30 etc. on the common
+    # ``update_reminder(reminder_id=ref, recurrence_rule=literal)``
+    # shape where ``@model_validator`` is skipped.
+    #
+    # Full dtstart-aware dateutil validation stays in the
+    # ``@model_validator`` on ScheduleReminderInput /
+    # UpdateReminderInput where both fields are available together
+    # — alias-level can't do that without knowing the trigger_iso.
+    AfterValidator(_alias_static_rrule_check),
 ]
 """RFC-5545 RRULE string. Three-layer validation:
 
