@@ -359,6 +359,92 @@ def test_assert_production_registry_quality_silent_on_clean_spec() -> None:
     assert_production_registry_quality([spec])  # no exception
 
 
+# ---------------------------------------------------------------------------
+# Codex R4 MAJOR #1 — schema-safety violations short-circuit policy
+# checks. With the bypass produced by model_copy(update={"description":
+# None}) or trigger_examples=[None], policy code would crash on raw
+# fields if it ran. Linter must return structured violations + stop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("update,reason", [
+    ({"description": None}, "description=None"),
+    ({"trigger_examples": [None]}, "trigger_examples=[None]"),
+    ({"mutex_notes": [123]}, "mutex_notes=[123]"),
+    ({"name": 123}, "name=123"),
+    ({"description": ""}, "description=blank"),
+])
+def test_malformed_bypass_does_not_crash_linter(update, reason) -> None:
+    from sreda.services.tool_schemas.registry_quality import (
+        assert_production_registry_quality,
+    )
+    clean_spec = _make_spec()
+    poisoned = clean_spec.model_copy(update=update)
+    # Linter should return structured violations (not raise raw
+    # AttributeError/TypeError). assert_production_registry_quality
+    # raises InvalidRegistryError, which IS the structured outcome.
+    with pytest.raises(InvalidRegistryError) as exc_info:
+        assert_production_registry_quality([poisoned])
+    # All violations are RegistryQualityViolation (no leaked exceptions).
+    assert all(
+        isinstance(v, RegistryQualityViolation)
+        for v in exc_info.value.violations
+    ), f"Non-violation leaked through for {reason}"
+    # At least one violation is the schema_safety_violation code.
+    assert any(
+        v.code == "schema_safety_violation"
+        for v in exc_info.value.violations
+    ), f"No schema_safety_violation surfaced for {reason}"
+
+
+# ---------------------------------------------------------------------------
+# Codex R4 MAJOR #2 — domain list items validated at construction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_domains", [
+    [""],
+    ["  "],
+    ["valid", ""],
+    ["valid", " "],
+    [" trailing"],
+    ["leading "],
+])
+def test_blank_or_edge_whitespace_domain_rejected_at_construction(
+    bad_domains,
+) -> None:
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(write_domains=bad_domains)
+    msg = str(exc.value).lower()
+    assert "domain" in msg or "non-empty" in msg or "whitespace" in msg
+
+
+@pytest.mark.parametrize("bad_domain", [
+    "shopping\n",
+    "shop\tping",
+    "sho\rping",
+])
+def test_domain_with_control_chars_rejected_at_construction(
+    bad_domain,
+) -> None:
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(write_domains=[bad_domain])
+    msg = str(exc.value).lower()
+    assert "newline" in msg or "single-line" in msg or "\\n" in msg
+
+
+def test_bypass_blank_domain_caught_by_linter() -> None:
+    from sreda.services.tool_schemas.registry_quality import (
+        assert_production_registry_quality,
+    )
+    clean = _make_spec()
+    poisoned = clean.model_copy(update={"write_domains": ["shopping", ""]})
+    with pytest.raises(InvalidRegistryError):
+        assert_production_registry_quality([poisoned])
+
+
 def test_policy_bounds_are_reasonable() -> None:
     assert TRIGGER_EXAMPLES_MIN == 3
     assert TRIGGER_EXAMPLES_MAX == 10

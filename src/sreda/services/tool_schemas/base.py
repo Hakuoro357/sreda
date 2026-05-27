@@ -388,6 +388,32 @@ class ToolSpec(BaseModel):
                     f"Tool '{self.name}' mutex_note must NOT start with "
                     f"⚠ — the renderer prepends the marker. Got: {note[:60]!r}."
                 )
+        # Domain list contents (Codex R4 MAJOR #2): blank/whitespace
+        # domain values make scheduler conflict detection silently
+        # ineffective. Each domain must be a non-empty stripped string
+        # with no control chars.
+        for kind, domains in (
+            ("read_domains", self.read_domains),
+            ("write_domains", self.write_domains),
+        ):
+            for idx, dom in enumerate(domains):
+                if not isinstance(dom, str) or not dom.strip():
+                    raise ValueError(
+                        f"Tool '{self.name}' {kind}[{idx}]={dom!r} "
+                        f"must be a non-empty string."
+                    )
+                if dom != dom.strip():
+                    raise ValueError(
+                        f"Tool '{self.name}' {kind}[{idx}]={dom!r} "
+                        f"has leading/trailing whitespace — strip before "
+                        f"adding (silent scheduler-isolation bug otherwise)."
+                    )
+                if "\n" in dom or "\r" in dom or "\t" in dom:
+                    raise ValueError(
+                        f"Tool '{self.name}' {kind}[{idx}]={dom!r} "
+                        f"contains \\n/\\r/\\t — domain names must be "
+                        f"single-line identifiers."
+                    )
         if self.effect == "write" and not self.write_domains:
             raise ValueError(
                 f"Tool '{self.name}' has effect='write' but write_domains "

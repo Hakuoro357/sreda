@@ -139,16 +139,20 @@ def _check_spec(
 ) -> Iterable[RegistryQualityViolation]:
     """Yield all policy violations for one ToolSpec.
 
-    Includes defensive schema-safety re-checks (Codex R2 MAJOR #3)
-    — model_copy(update=...) and direct attribute mutation bypass
-    construction-time guards; the linter is the last line of defense
-    before the spec hits the planner prompt.
+    Codex R4 MAJOR #1: schema-safety re-check is TERMINAL for the spec
+    — if any schema violation surfaces (the spec was bypassed via
+    model_copy / direct mutation), policy checks would dereference
+    raw fields and crash with AttributeError / TypeError before the
+    public API returns. Short-circuit instead.
     """
 
-    # Defensive schema-safety re-check — applies in BOTH strict and
-    # non-strict modes since these are prompt-breaking issues, not
-    # production-policy quality.
-    yield from _recheck_schema_safety(spec)
+    # Schema-safety re-check — applies in BOTH strict and non-strict
+    # modes since these are prompt-breaking issues, not production-
+    # policy quality.
+    schema_violations = list(_recheck_schema_safety(spec))
+    if schema_violations:
+        yield from schema_violations
+        return  # spec is unsafe — policy checks would crash on raw fields
 
     # Family must be declared in production (Sub-A4 migration target).
     if strict and spec.family is None:
