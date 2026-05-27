@@ -445,6 +445,57 @@ def test_bypass_blank_domain_caught_by_linter() -> None:
         assert_production_registry_quality([poisoned])
 
 
+# ---------------------------------------------------------------------------
+# Codex R5 MAJOR — domain membership against closed Family taxonomy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("typo", [
+    "shoping",           # missing letter
+    "shoppin",           # missing letter
+    "Shopping",          # case
+    "shopping_items",    # similar-but-distinct
+    "weather",           # not in 12-family taxonomy (would be "web")
+])
+def test_typo_domain_rejected_at_construction(typo) -> None:
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(write_domains=[typo])
+    msg = str(exc.value).lower()
+    assert "family taxonomy" in msg or "not in" in msg
+
+
+def test_null_byte_domain_rejected() -> None:
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(write_domains=["shopping\x00"])
+    msg = str(exc.value).lower()
+    assert "control chars" in msg or "single-line" in msg
+
+
+def test_bypass_typo_domain_caught_by_linter() -> None:
+    from sreda.services.tool_schemas.registry_quality import (
+        assert_production_registry_quality,
+    )
+    clean = _make_spec()
+    # Bypass construction via model_copy → reconstruct catches typo.
+    poisoned = clean.model_copy(update={"write_domains": ["shoping"]})
+    with pytest.raises(InvalidRegistryError):
+        assert_production_registry_quality([poisoned])
+
+
+def test_all_12_families_accepted_as_domains() -> None:
+    """Sanity: every value from the closed taxonomy is a valid domain."""
+    from sreda.services.tool_schemas.families import FAMILIES
+    for family in FAMILIES:
+        # Use read effect so we don't require write_domains.
+        _make_spec(
+            effect="read",
+            read_domains=[family],
+            write_domains=[],
+        )
+
+
 def test_policy_bounds_are_reasonable() -> None:
     assert TRIGGER_EXAMPLES_MIN == 3
     assert TRIGGER_EXAMPLES_MAX == 10

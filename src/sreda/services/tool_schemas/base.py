@@ -28,7 +28,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sreda.services.tool_schemas.families import FAMILY_HEADERS, Family
+from sreda.services.tool_schemas.families import FAMILIES, FAMILY_HEADERS, Family
 
 
 def _direct_field_validator_names(model: type[BaseModel]) -> set[str]:
@@ -388,10 +388,15 @@ class ToolSpec(BaseModel):
                     f"Tool '{self.name}' mutex_note must NOT start with "
                     f"⚠ — the renderer prepends the marker. Got: {note[:60]!r}."
                 )
-        # Domain list contents (Codex R4 MAJOR #2): blank/whitespace
-        # domain values make scheduler conflict detection silently
-        # ineffective. Each domain must be a non-empty stripped string
-        # with no control chars.
+        # Domain list contents (Codex R4 MAJOR #2 + R5 MAJOR):
+        # blank/whitespace/typo domains silently break scheduler
+        # conflict detection. Each domain must be a non-empty string
+        # AND a member of the closed Family taxonomy (FAMILIES tuple)
+        # — typo `"shoping"` would otherwise look isolated from the
+        # real `shopping` domain. For MVP the scheduler-domain
+        # namespace and the planner-prompt Family namespace are the
+        # same; can split into separate `ToolDomain` literal later if
+        # needed (Codex R5 alternative).
         for kind, domains in (
             ("read_domains", self.read_domains),
             ("write_domains", self.write_domains),
@@ -408,11 +413,20 @@ class ToolSpec(BaseModel):
                         f"has leading/trailing whitespace — strip before "
                         f"adding (silent scheduler-isolation bug otherwise)."
                     )
-                if "\n" in dom or "\r" in dom or "\t" in dom:
+                if any(c in dom for c in "\n\r\t\x00"):
                     raise ValueError(
                         f"Tool '{self.name}' {kind}[{idx}]={dom!r} "
-                        f"contains \\n/\\r/\\t — domain names must be "
-                        f"single-line identifiers."
+                        f"contains control chars (\\n/\\r/\\t/\\x00) — "
+                        f"domain names must be single-line identifiers."
+                    )
+                if dom not in FAMILIES:
+                    raise ValueError(
+                        f"Tool '{self.name}' {kind}[{idx}]={dom!r} "
+                        f"is not in the closed Family taxonomy "
+                        f"{list(FAMILIES)}. Typos in domains silently "
+                        f"break scheduler conflict detection — a write "
+                        f"tool with `write_domains=['shoping']` would "
+                        f"look isolated from the real `shopping` domain."
                     )
         if self.effect == "write" and not self.write_domains:
             raise ValueError(
