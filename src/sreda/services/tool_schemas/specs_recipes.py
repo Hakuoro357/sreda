@@ -246,10 +246,12 @@ class SaveRecipesBatchInput(BaseModel):
             seen_titles[normalized] = idx
 
         # Aggregate char budget. Each recipe's instructions_md alone
-        # can be 8000 chars; 50 recipes worst-case = 400KB before
-        # ingredients/tags. Cap at 200_000 chars total (≈4× a typical
-        # batch) so accidental «save 50 enormous recipes» doesn't
-        # blow the LLM tool-call payload.
+        # can be 8000 chars; 50 recipes worst-case = 400_000 chars
+        # before ingredients/tags (Python str ``len``, NOT UTF-8
+        # bytes — Cyrillic doubles per char on serialization). Cap
+        # at 200_000 chars total (≈4× a typical batch) so accidental
+        # «save 50 enormous recipes» doesn't blow the LLM tool-call
+        # payload.
         total_chars = sum(
             len(r.title)
             + len(r.instructions_md)
@@ -414,11 +416,15 @@ GET_RECIPE_SPEC = ToolSpec(
         "распиши шаги по этому рецепту",
     ],
     mutex_notes=[
-        # Codex Sub-A4 recipes phase: `get_recipe_any_source` is listed
-        # in TOOL_FAMILY_MANIFEST as a future tool (architecture map
-        # TODO-2). Naming it directly here would trigger the family-
-        # header/mutex-note linter for unmigrated references. Softened
-        # to intent-level until the tool ships.
+        # Codex Sub-A4 recipes R1 MAJOR #6 + R4 cleanup: the future
+        # ``get_recipe_any_source`` (architecture-map TODO-2) is NOT
+        # in TOOL_FAMILY_MANIFEST until the runtime function ships.
+        # Keep this mutex_note intent-level («отдельный композитный
+        # tool в группе РЕЦЕПТЫ») without naming the tool — that
+        # avoids steering the planner toward an unbuilt typed tool
+        # AND keeps the registry-quality linter clean. When the tool
+        # ships, restore the manifest entry, ToolSpec, AND the
+        # explicit name here in one commit.
         "Берёт ТОЛЬКО из личной книги юзера. Для поиска без сохранения / fallback на ллм — будет отдельный композитный tool в этой же группе РЕЦЕПТЫ (пока в дорожной карте).",
     ],
     timeout_seconds=10,
