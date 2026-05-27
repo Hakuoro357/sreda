@@ -57,9 +57,19 @@ how often the static check would have helped.
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Mapping
+import types
+import typing
+from typing import Annotated, Any, Iterator, Mapping, Union, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+)
 
 from sreda.runtime.planner.interpolation import (
     contains_ref,
@@ -136,42 +146,176 @@ def render_violations(violations: list[Violation]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _accepted_field_names(model: type[BaseModel]) -> set[str]:
-    """Union of attribute names AND aliases for ``model_validate``
-    input. The planner may emit either form — both must pass key
-    membership and both map back to the same field for suppression.
+def _model_populates_by_name(model: type[BaseModel]) -> bool:
+    """Read ``populate_by_name`` from the model config — pydantic v2
+    accepts field names alongside aliases ONLY when this is True.
+    Default False matches pydantic's default.
     """
 
+    cfg = getattr(model, "model_config", None)
+    if cfg is None:
+        return False
+    if isinstance(cfg, dict):
+        return bool(cfg.get("populate_by_name", False))
+    # ConfigDict subclass instance (rare path)
+    return bool(getattr(cfg, "populate_by_name", False))
+
+
+def _iter_validation_alias_keys(validation_alias: object) -> Iterator[str]:
+    """Yield every accepted input key from a pydantic v2
+    ``validation_alias`` value. Handles ``str`` / ``AliasChoices`` /
+    ``AliasPath`` (Codex R2 MAJOR #3).
+
+    For ``AliasPath``, only the first segment is keyable at the top
+    level — sub-segments would need walking into nested dicts which is
+    out of scope for arg validation in this MVP.
+    """
+
+    if validation_alias is None:
+        return
+    if isinstance(validation_alias, str):
+        yield validation_alias
+        return
+    if isinstance(validation_alias, AliasChoices):
+        for choice in validation_alias.choices:
+            yield from _iter_validation_alias_keys(choice)
+        return
+    if isinstance(validation_alias, AliasPath):
+        first = validation_alias.path[0] if validation_alias.path else None
+        if isinstance(first, str):
+            yield first
+        return
+
+
+def _accepted_field_names(model: type[BaseModel]) -> set[str]:
+    """Set of input keys the planner may legitimately use for this
+    model. Mirrors pydantic semantics exactly:
+
+    - If ``populate_by_name=True``: field names AND aliases accepted.
+    - If False (pydantic default): when ``alias`` / ``validation_alias``
+      is set, accept ONLY that; otherwise accept the field name.
+
+    Closes Codex R2 MAJOR #3 — was previously over-permissive.
+    """
+
+    by_name = _model_populates_by_name(model)
     names: set[str] = set()
     for fname, finfo in model.model_fields.items():
-        names.add(fname)
         alias = getattr(finfo, "alias", None)
+        validation_alias = getattr(finfo, "validation_alias", None)
+        has_alias = alias is not None or validation_alias is not None
         if alias:
             names.add(alias)
-        # Validation aliases (pydantic v2): may be a single AliasChoices.
-        validation_alias = getattr(finfo, "validation_alias", None)
-        if isinstance(validation_alias, str):
-            names.add(validation_alias)
+        for key in _iter_validation_alias_keys(validation_alias):
+            names.add(key)
+        if by_name or not has_alias:
+            names.add(fname)
     return names
 
 
 def _normalize_to_field_name(
     key: str, model: type[BaseModel]
 ) -> str | None:
-    """Given a key that the planner used (may be alias), return the
-    canonical field name in ``model.model_fields``. None if not
-    recognised.
+    """Map a planner-emitted input key (alias or field name) back to
+    the canonical field name in ``model.model_fields``.
+
+    Respects ``populate_by_name`` config so the per-field walk uses
+    the same acceptance rule as ``_accepted_field_names`` — no
+    over-permissive normalisation.
     """
 
-    if key in model.model_fields:
-        return key
+    by_name = _model_populates_by_name(model)
     for fname, finfo in model.model_fields.items():
         alias = getattr(finfo, "alias", None)
+        validation_alias = getattr(finfo, "validation_alias", None)
+        has_alias = alias is not None or validation_alias is not None
         if alias == key:
             return fname
-        validation_alias = getattr(finfo, "validation_alias", None)
-        if isinstance(validation_alias, str) and validation_alias == key:
+        if any(k == key for k in _iter_validation_alias_keys(validation_alias)):
             return fname
+        if key == fname and (by_name or not has_alias):
+            return fname
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Annotation helpers (Codex R2 MAJOR #2 + #1)
+# ---------------------------------------------------------------------------
+
+
+def _annotation_with_constraints(finfo: Any) -> Any:
+    """Build a TypeAdapter-friendly annotation that PRESERVES
+    pydantic Field constraints (``ge``, ``le``, ``max_length``, custom
+    validators in ``finfo.metadata``).
+
+    Plain ``TypeAdapter(finfo.annotation)`` drops these — closing
+    Codex R2 MAJOR #2.
+    """
+
+    annotation = finfo.annotation
+    metadata = getattr(finfo, "metadata", None) or []
+    if not metadata:
+        return annotation
+    return Annotated[(annotation, *metadata)]
+
+
+def _annotation_accepts_string(annotation: Any) -> bool:
+    """Return True if a value of type ``str`` could be accepted by
+    ``annotation`` (a typing hint or pydantic-compatible type).
+
+    Walks Optional / Union / Annotated wrappers. Conservative: returns
+    True for ``Any`` and unknown types so we don't over-reject mixed
+    interpolated strings against custom string-like fields
+    (Codex R2 MINOR #5).
+    """
+
+    if annotation is None:
+        return False
+    if annotation is Any:
+        return True
+    if annotation is str:
+        return True
+
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        inner = get_args(annotation)[0]
+        return _annotation_accepts_string(inner)
+    if origin is Union or origin is types.UnionType:
+        return any(_annotation_accepts_string(arg) for arg in get_args(annotation))
+    # str subclass / Literal[str_value, ...] / typing.NewType / etc.
+    if isinstance(annotation, type) and issubclass(annotation, str):
+        return True
+    if origin is typing.Literal:
+        return all(isinstance(arg, str) for arg in get_args(annotation))
+    return False
+
+
+def _peel_container_element_annotation(annotation: Any) -> Any | None:
+    """For ``list[T]`` / ``tuple[T, ...]`` / ``set[T]`` return the
+    element annotation ``T``. For ``dict[K, V]`` return the value
+    annotation ``V``. Return None when the container shape is not
+    statically peelable (e.g. ``list`` without type param, custom
+    classes). Closes Codex R2 MAJOR #1 — element-walk for mixed-ref
+    containers.
+    """
+
+    origin = get_origin(annotation)
+    # Strip Annotated wrapper.
+    if origin is Annotated:
+        return _peel_container_element_annotation(get_args(annotation)[0])
+    if origin in (list, set, frozenset):
+        args = get_args(annotation)
+        return args[0] if args else None
+    if origin is tuple:
+        args = get_args(annotation)
+        if len(args) == 2 and args[1] is Ellipsis:
+            return args[0]  # tuple[T, ...]
+        # Heterogeneous tuple — element-walk isn't homogeneous; caller
+        # falls back to whole-value defer.
+        return None
+    if origin is dict:
+        args = get_args(annotation)
+        return args[1] if len(args) >= 2 else None
     return None
 
 
@@ -254,11 +398,81 @@ def _phase1_check_refs(
     # see ``schemas.py:_validate_actions``. No duplicate work here.
 
 
-# NOTE: Predecessor/topology graph construction lives in Group 2's
-# validator (topological_layers builder) — this module does not need
-# its own copy. Cycle detection happens there. Here we only check
-# per-action ref-target / self-ref / unknown-depends-on, which don't
-# need graph context.
+# ---------------------------------------------------------------------------
+# Ref-dependency graph + cycle detection (Codex R2 MAJOR #4)
+# ---------------------------------------------------------------------------
+
+
+def _build_dep_graph(plan: Plan) -> dict[str, set[str]]:
+    """Return adjacency ``consumer → {producer_step_ids}`` combining
+    ref-derived edges (from ``iter_refs(action.args)``) and explicit
+    ``depends_on`` edges.
+
+    Self-refs and edges to non-existent steps are excluded — they're
+    already reported as per-action violations and shouldn't poison
+    the cycle search.
+
+    Used by ``_phase1_detect_ref_cycles`` to surface cycles that
+    Plan-schema's depends_on cycle detection misses (refs in args
+    aren't visible to it).
+    """
+
+    graph: dict[str, set[str]] = {}
+    for step_id, action in plan.actions.items():
+        producers: set[str] = set()
+        for ref_path in iter_refs(action.args):
+            target = extract_step_id(ref_path)
+            if target != step_id and target in plan.actions:
+                producers.add(target)
+        for dep in action.depends_on:
+            if dep != step_id and dep in plan.actions:
+                producers.add(dep)
+        graph[step_id] = producers
+    return graph
+
+
+def _phase1_detect_ref_cycles(plan: Plan) -> Iterator[Violation]:
+    """Detect cycles formed by ref-derived edges (which Plan schema
+    cannot see — it only walks ``depends_on``).
+
+    Emits one ``cycle`` Violation per step participating in any cycle
+    so the planner-retry feedback can name each offender.
+    """
+
+    graph = _build_dep_graph(plan)
+    cycle_nodes: set[str] = set()
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {step_id: WHITE for step_id in graph}
+
+    def _dfs(node: str, stack: list[str]) -> None:
+        color[node] = GRAY
+        stack.append(node)
+        for nbr in graph.get(node, ()):
+            if color.get(nbr, WHITE) == GRAY:
+                # Back edge — every node from `stack[stack.index(nbr):]`
+                # up to current is in the cycle.
+                cycle_nodes.update(stack[stack.index(nbr):])
+            elif color.get(nbr, WHITE) == WHITE:
+                _dfs(nbr, stack)
+        stack.pop()
+        color[node] = BLACK
+
+    for step_id in graph:
+        if color[step_id] == WHITE:
+            _dfs(step_id, [])
+
+    for step_id in sorted(cycle_nodes):
+        yield Violation(
+            step_id=step_id,
+            tool=plan.actions[step_id].tool,
+            code="cycle",
+            message=(
+                f"step {step_id!r} participates in a reference cycle. "
+                f"The plan has a circular dependency formed via "
+                f"``${{...}}`` refs and/or ``depends_on`` — executor "
+                f"cannot order it. Cycle members: {sorted(cycle_nodes)}."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -320,9 +534,6 @@ def _phase2_validate_args(
     # Refs present — validate per-field, avoid model_validator.
     for fname, finfo in model.model_fields.items():
         if fname not in canonical_args:
-            # Missing: only a violation if the field is required AND
-            # not provided under any alias. (Aliases already normalised
-            # to canonical name, so absence here is real absence.)
             try:
                 required = finfo.is_required()
             except AttributeError:  # pragma: no cover — pydantic v1 fallback
@@ -337,12 +548,14 @@ def _phase2_validate_args(
                 )
             continue
         value = canonical_args[fname]
+        # Annotation WITH Field(...) constraints (Codex R2 MAJOR #2).
+        annotation_with_constraints = _annotation_with_constraints(finfo)
         yield from _validate_field_value(
             step_id=step_id,
             tool_spec=tool_spec,
             field_name=fname,
             value=value,
-            annotation=finfo.annotation,
+            annotation=annotation_with_constraints,
         )
 
 
@@ -357,28 +570,28 @@ def _validate_field_value(
     """Validate one field's value against its annotation, given that
     the surrounding ``action.args`` contains refs somewhere.
 
-    Recursion strategy: walk the value structure; concrete leaves go
-    through ``TypeAdapter(annotation).validate_python(value)``; pure
-    full-ref strings defer; mixed-string refs validate as ``str``;
-    containers recurse into elements.
-
-    For ``dict[K, V]`` and ``list[V]`` annotations we use TypeAdapter to
-    validate elements where possible. Where we can't peel the
-    annotation (deeply nested Union, custom validators), we fall back
-    to whole-value TypeAdapter — which conservatively errors on
-    legit-but-deferred shapes. Tests pin this behaviour.
+    Strategy:
+    - Pure full-ref string (``"${s1.x}"``): defer — type resolves at
+      executor time from the producer's output.
+    - Mixed interpolated string (``"prefix ${s1.x}"``): the resolved
+      value will be ``str``; reject if the annotation can't accept str
+      (Codex R2 MINOR #5 — switched to annotation introspection
+      instead of TypeAdapter-with-placeholder which over-rejected
+      constrained-string custom types).
+    - Container with refs: peel the element annotation via
+      ``get_origin/get_args`` and validate every concrete leaf
+      (Codex R2 MAJOR #1). Ref leaves defer. If annotation can't be
+      peeled (custom class, missing type params), fall back to defer.
+    - All-concrete leaf or container: full ``TypeAdapter`` with
+      annotation that PRESERVES ``Field(...)`` constraints
+      (Codex R2 MAJOR #2 — pulled in by caller).
     """
 
-    # Pure full-ref string: defer.
     if is_full_ref_string(value):
         return
 
-    # Mixed-string ref: value WILL be str at executor time.
     if isinstance(value, str) and contains_ref(value):
-        # Validate that field annotation accepts strings.
-        try:
-            TypeAdapter(annotation).validate_python("interpolated-placeholder")
-        except ValidationError:
+        if not _annotation_accepts_string(annotation):
             yield Violation(
                 step_id=step_id,
                 tool=tool_spec.name,
@@ -392,28 +605,40 @@ def _validate_field_value(
             )
         return
 
-    # Container with mixed refs: try to validate elements.
-    if isinstance(value, (list, tuple)) and contains_ref(value):
-        # Attempt element-wise validation. We don't have the element
-        # annotation peeled here for arbitrary annotations; we use
-        # TypeAdapter on each concrete element with the SAME outer
-        # annotation wrapped (list[T] etc.). Pragmatic fallback:
-        # validate the WHOLE container after replacing ref leaves with
-        # ``None``. That tells us whether the surviving concrete shape
-        # is acceptable — non-None Nones would fail per-leaf
-        # validation. For lists of str we accept None? No — we
-        # substitute a placeholder string and rely on TypeAdapter to
-        # surface type errors on the concrete leaves.
-        return  # CONSERVATIVE: deferred; per-leaf validation in MVP would
-                # need annotation peeling. Document & test the limitation;
-                # executor-time resolve_refs + tool call will catch concrete
-                # bad leaves.
-
-    if isinstance(value, dict) and contains_ref(value):
-        # Same conservative deferral as list case.
+    if isinstance(value, (list, tuple, set, frozenset)) and contains_ref(value):
+        element_annotation = _peel_container_element_annotation(annotation)
+        if element_annotation is None:
+            return  # Can't peel — defer.
+        for idx, item in enumerate(value):
+            if contains_ref(item):
+                continue
+            yield from _validate_field_value(
+                step_id=step_id,
+                tool_spec=tool_spec,
+                field_name=f"{field_name}[{idx}]",
+                value=item,
+                annotation=element_annotation,
+            )
         return
 
-    # All-concrete field: validate via TypeAdapter (no model-level rules).
+    if isinstance(value, dict) and contains_ref(value):
+        element_annotation = _peel_container_element_annotation(annotation)
+        if element_annotation is None:
+            return  # Can't peel — defer.
+        for k, item in value.items():
+            if contains_ref(item):
+                continue
+            yield from _validate_field_value(
+                step_id=step_id,
+                tool_spec=tool_spec,
+                field_name=f"{field_name}[{k!r}]",
+                value=item,
+                annotation=element_annotation,
+            )
+        return
+
+    # All-concrete value: full TypeAdapter check (annotation already
+    # carries Field constraints from caller).
     try:
         TypeAdapter(annotation).validate_python(value)
     except ValidationError as exc:
@@ -517,6 +742,9 @@ def validate_plan(
                 plan=plan,
             )
         )
+    # Cross-action cycle check via ref edges + depends_on
+    # (Codex R2 MAJOR #4 — Plan schema only sees depends_on edges).
+    violations.extend(_phase1_detect_ref_cycles(plan))
     return violations
 
 

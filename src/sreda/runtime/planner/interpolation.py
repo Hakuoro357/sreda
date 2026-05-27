@@ -26,12 +26,15 @@ from __future__ import annotations
 import re
 from typing import Any, Iterator
 
-_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][\w.]*)\}")
+_REF_PATTERN = re.compile(r"\$\{([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\}")
 """Pattern for ``${node.field.subfield}`` references.
 
-The leading character must be a letter or underscore (no ``${123...}``
-to avoid grabbing random ``${``-prefixed strings the planner shouldn't
-have emitted).
+Path consists of non-empty dotted segments. Each segment starts with
+a letter or underscore (no ``${123...}``) and contains word chars.
+Trailing dots (``${s1.}``) and consecutive dots (``${s1..x}``) are
+REJECTED — Codex R2 MINOR #6 spotted these as fall-through cases that
+passed Phase 1 and failed only inside ``_resolve_path`` at executor
+time.
 """
 
 

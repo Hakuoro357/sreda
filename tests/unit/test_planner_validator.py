@@ -36,7 +36,13 @@ from __future__ import annotations
 from typing import Literal
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field as PydField, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field as PydField,
+    model_validator,
+)
 
 from sreda.runtime.planner.schemas import (
     Action,
@@ -570,3 +576,255 @@ def test_violations_aggregated_across_steps() -> None:
     violations = validate_plan(plan, registry)
     step_ids = {v.step_id for v in violations}
     assert step_ids == {"s1", "s2"}
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #1 — container element walking (was deferred in R1)
+# ---------------------------------------------------------------------------
+
+
+def test_list_with_mixed_concrete_and_ref_validates_concrete_leaves() -> None:
+    """Mixed list ``["ok", 123, "${s1.x}"]`` against ``list[str]``:
+    the concrete int leaf gets caught even though one element is a
+    deferred ref."""
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["x"]}),
+        "s2": _action(
+            "add_shopping_items",
+            {"items": ["ok", 123, "${s1.x}"]},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {"add_shopping_items": _spec("add_shopping_items", _ShoppingInput)}
+    violations = validate_plan(plan, registry)
+    s2_violations = [v for v in violations if v.step_id == "s2"]
+    # The int leaf at index 1 must be flagged.
+    assert any(
+        "items[1]" in (v.field_path or "") for v in s2_violations
+    ), f"expected items[1] violation; got: {s2_violations}"
+
+
+def test_list_with_only_concrete_validates_normally() -> None:
+    """Same as above but without refs — no-refs path's full
+    ``model_validate`` already covers this. Sanity check that
+    element-walk doesn't break that path."""
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["ok", 123]}),
+    })
+    registry = {"add_shopping_items": _spec("add_shopping_items", _ShoppingInput)}
+    violations = validate_plan(plan, registry)
+    assert any(v.step_id == "s1" for v in violations)
+
+
+class _DictFieldInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    metadata: dict[str, str]
+
+
+def test_dict_with_mixed_ref_and_concrete_validates_concrete_values() -> None:
+    plan = _plan_with_actions({
+        "s1": _action("dict_tool", {"metadata": {"a": "1"}}),
+        "s2": _action(
+            "dict_tool",
+            {"metadata": {"a": "1", "b": 42, "c": "${s1.x}"}},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {"dict_tool": _spec("dict_tool", _DictFieldInput)}
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    # The int value for key 'b' must be flagged.
+    assert any("metadata['b']" in (v.field_path or "") for v in s2)
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #2 — Field constraints preserved on refs-present path
+# ---------------------------------------------------------------------------
+
+
+class _ConstrainedInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    count: int = PydField(ge=1)
+    other: str
+
+
+def test_field_constraint_caught_on_refs_present_path() -> None:
+    """``count: int = Field(ge=1)``. With another field as a ref, the
+    refs-present per-field path would previously drop the ``ge=1``
+    constraint. Now annotation is wrapped ``Annotated[int, Ge(1)]``."""
+    plan = _plan_with_actions({
+        "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "constrained_tool",
+            {"count": 0, "other": "${s1.title}"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {
+        "schedule_reminder": _spec("schedule_reminder", _ReminderInput),
+        "constrained_tool": _spec("constrained_tool", _ConstrainedInput),
+    }
+    violations = validate_plan(plan, registry)
+    s2 = [v for v in violations if v.step_id == "s2"]
+    # count=0 violates ge=1 — must be reported.
+    assert any(v.field_path == "count" for v in s2), f"got: {s2}"
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #3 — alias-only when populate_by_name=False
+# ---------------------------------------------------------------------------
+
+
+class _AliasOnlyInput(BaseModel):
+    # populate_by_name not set → defaults to False; only alias accepted.
+    model_config = ConfigDict(extra="forbid")
+    items_internal: list[str] = PydField(alias="items")
+
+
+def test_field_name_rejected_when_populate_by_name_false() -> None:
+    """If model uses alias and ``populate_by_name=False`` (default),
+    field name should NOT be accepted — pydantic itself would reject
+    it. Our validator must mirror that semantics (Codex R2 MAJOR #3)."""
+    plan = _plan_with_actions({
+        "s1": _action("alias_only_tool", {"items_internal": ["x"]}),
+    })
+    registry = {"alias_only_tool": _spec("alias_only_tool", _AliasOnlyInput)}
+    violations = validate_plan(plan, registry)
+    # Field name `items_internal` should surface as unknown_arg.
+    assert any(
+        v.code == "unknown_arg" and v.field_path == "items_internal"
+        for v in violations
+    )
+
+
+class _PopulateByNameInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    items_internal: list[str] = PydField(alias="items")
+
+
+def test_field_name_accepted_when_populate_by_name_true() -> None:
+    """With ``populate_by_name=True``, BOTH the alias and the field
+    name are valid input keys — validator must accept both."""
+    plan = _plan_with_actions({
+        "s1": _action("populate_tool", {"items_internal": ["x"]}),
+        "s2": _action("populate_tool", {"items": ["y"]}),
+    })
+    registry = {"populate_tool": _spec("populate_tool", _PopulateByNameInput)}
+    violations = validate_plan(plan, registry)
+    assert violations == []
+
+
+class _ValidationAliasInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    value: str = PydField(validation_alias=AliasChoices("v", "value_input"))
+
+
+def test_alias_choices_keys_accepted() -> None:
+    """``AliasChoices('v', 'value_input')`` should accept both 'v' and
+    'value_input' but NOT 'value' (field name) since pop_by_name=False."""
+    registry = {"choice_tool": _spec("choice_tool", _ValidationAliasInput)}
+
+    # 'v' accepted
+    plan_v = _plan_with_actions({"s1": _action("choice_tool", {"v": "x"})})
+    assert validate_plan(plan_v, registry) == []
+
+    # 'value_input' accepted
+    plan_vi = _plan_with_actions({"s1": _action("choice_tool", {"value_input": "x"})})
+    assert validate_plan(plan_vi, registry) == []
+
+    # 'value' (field name) rejected
+    plan_field = _plan_with_actions({"s1": _action("choice_tool", {"value": "x"})})
+    violations = validate_plan(plan_field, registry)
+    assert any(v.code == "unknown_arg" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MAJOR #4 — ref-cycle detection
+# ---------------------------------------------------------------------------
+
+
+def test_ref_cycle_two_steps_is_detected() -> None:
+    plan = _plan_with_actions({
+        # s1 refs s2, s2 refs s1 — closed loop via args.
+        "s1": _action("add_shopping_items", {"items": "${s2.items}"}),
+        "s2": _action("add_shopping_items", {"items": "${s1.items}"}),
+    })
+    registry = {"add_shopping_items": _spec("add_shopping_items", _ShoppingInput)}
+    violations = validate_plan(plan, registry)
+    cycle_violations = [v for v in violations if v.code == "cycle"]
+    assert len(cycle_violations) >= 2
+    step_ids = {v.step_id for v in cycle_violations}
+    assert step_ids == {"s1", "s2"}
+
+
+def test_ref_cycle_three_steps_is_detected() -> None:
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": "${s3.items}"}),
+        "s2": _action("add_shopping_items", {"items": "${s1.items}"}),
+        "s3": _action("add_shopping_items", {"items": "${s2.items}"}),
+    })
+    registry = {"add_shopping_items": _spec("add_shopping_items", _ShoppingInput)}
+    violations = validate_plan(plan, registry)
+    cycle_violations = [v for v in violations if v.code == "cycle"]
+    step_ids = {v.step_id for v in cycle_violations}
+    assert step_ids == {"s1", "s2", "s3"}
+
+
+def test_no_cycle_in_linear_chain() -> None:
+    plan = _plan_with_actions({
+        "s1": _action("add_shopping_items", {"items": ["a"]}),
+        "s2": _action("add_shopping_items", {"items": "${s1.items}"}),
+        "s3": _action("add_shopping_items", {"items": "${s2.items}"}),
+    })
+    registry = {"add_shopping_items": _spec("add_shopping_items", _ShoppingInput)}
+    violations = validate_plan(plan, registry)
+    assert not any(v.code == "cycle" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MINOR #5 — annotation introspection for mixed-string refs
+# ---------------------------------------------------------------------------
+
+
+class _OptionalStrInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = None
+    trigger_iso: str
+
+
+def test_mixed_string_into_optional_str_field_passes() -> None:
+    """``str | None`` accepts strings — mixed-string ref must not
+    trigger ``invalid_arg_type``."""
+    plan = _plan_with_actions({
+        "s1": _action("optional_tool", {"title": "x", "trigger_iso": "iso"}),
+        "s2": _action(
+            "optional_tool",
+            {"title": "prefix ${s1.title}", "trigger_iso": "iso"},
+            depends_on=["s1"],
+        ),
+    })
+    registry = {"optional_tool": _spec("optional_tool", _OptionalStrInput)}
+    violations = validate_plan(plan, registry)
+    s2 = [
+        v for v in violations
+        if v.step_id == "s2" and v.code == "invalid_arg_type"
+    ]
+    assert s2 == []
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 MINOR #6 — ref regex rejects malformed dotted paths
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_ref_trailing_dot_not_matched() -> None:
+    """``${s1.}`` is not a valid ref → not picked up by iter_refs →
+    not validated as a ref. (Treated as a plain string with weird
+    text — pydantic str validator will accept it.)"""
+    from sreda.runtime.planner.interpolation import iter_refs
+    assert list(iter_refs("${s1.}")) == []
+
+
+def test_malformed_ref_double_dot_not_matched() -> None:
+    from sreda.runtime.planner.interpolation import iter_refs
+    assert list(iter_refs("${s1..x}")) == []
