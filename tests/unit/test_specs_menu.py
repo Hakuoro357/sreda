@@ -608,3 +608,61 @@ def test_migrated_tool_specs_aggregate_includes_menu() -> None:
 def test_migrated_tool_specs_pass_strict_with_menu() -> None:
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
     assert_production_registry_quality(MIGRATED_TOOL_SPECS)
+
+
+def test_generate_shopping_planner_prompt_lists_three_outcomes() -> None:
+    """Codex Sub-A4 menu R4 MAJOR (planner-surface visibility): the
+    runtime now emits three distinct shapes (ok:generated:*,
+    ok:plan_no_recipes, error:plan_not_found), but the planner sees
+    only description + trigger_examples + mutex_notes via the
+    registry renderer (registry_text._format_tool_line). Pydantic
+    output_model docstrings are NOT prompt-rendered. So the planner
+    must see the branch contract in the registry-visible fields,
+    not just in the schema docs.
+
+    Asserts that all three outcomes are mentioned in either the
+    description or mutex_notes of GENERATE_SHOPPING_FROM_MENU_SPEC."""
+    from sreda.services.tool_schemas.specs_menu import (
+        GENERATE_SHOPPING_FROM_MENU_SPEC,
+    )
+    surfaces = [GENERATE_SHOPPING_FROM_MENU_SPEC.description, *GENERATE_SHOPPING_FROM_MENU_SPEC.mutex_notes]
+    surface_text = " ".join(surfaces)
+    assert "ok:generated:" in surface_text, (
+        "happy-path shape ok:generated:N:eaters=E must be visible "
+        "to the planner via description/mutex_notes"
+    )
+    assert "ok:plan_no_recipes" in surface_text, (
+        "free_text-only outcome ok:plan_no_recipes must be visible "
+        "to the planner — without it the LLM won't know how to "
+        "branch when the runtime returns this distinct status"
+    )
+    assert "error:plan_not_found" in surface_text, (
+        "unknown-plan outcome error:plan_not_found must be visible "
+        "to the planner — without it the LLM might fall back to "
+        "the generic «не нашла» phrasing instead of the specific "
+        "«не нашла такого меню»"
+    )
+
+
+def test_generate_shopping_outcomes_visible_in_rendered_registry_text() -> None:
+    """Codex Sub-A4 menu R4 MAJOR (planner-surface visibility): the
+    actual rendered registry text (what the planner sees in the
+    system prompt) must include all three outcomes. This is a
+    stricter check than just inspecting the ToolSpec — it confirms
+    that _format_tool_line + render_registry_for_planner don't
+    truncate the relevant fields away."""
+    from sreda.services.tool_schemas.registry_text import (
+        render_registry_for_planner,
+    )
+    from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
+
+    rendered = render_registry_for_planner(MIGRATED_TOOL_SPECS)
+    assert "ok:plan_no_recipes" in rendered, (
+        "rendered registry prompt must surface ok:plan_no_recipes "
+        "for the planner — checked the canonical registry-rendering "
+        "path that goes into the system prompt"
+    )
+    assert "error:plan_not_found" in rendered, (
+        "rendered registry prompt must surface error:plan_not_found "
+        "for the planner"
+    )
