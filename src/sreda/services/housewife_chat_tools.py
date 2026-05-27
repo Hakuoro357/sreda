@@ -554,16 +554,22 @@ def build_housewife_tools(
 
     @_write_lc_tool
     def onboarding_answered(topic: str, summary: str) -> str:
-        """Mark an onboarding topic as answered and advance to the next one.
+        """Mark the addressing onboarding topic as answered.
+
+        Codex Sub-A4 onboarding R4 MAJOR (prompt-surface): pre-R4 the
+        docstring advertised all 6 legacy topics, but TOPIC_ORDER
+        (housewife_onboarding.py:68) was reduced to only `addressing`
+        in 2026-04-27. Other 5 topics are valid IDs in TOPIC_DESCRIPTIONS
+        but not in active flow.
 
         Call this when the user has given you a meaningful answer to the
-        current onboarding topic (see [ОНБОРДИНГ] in the system prompt
-        for which topic is current). The ``summary`` is what will be
-        stored — a 1–2 sentence paraphrase in the user's own words.
+        addressing prompt (see [ОНБОРДИНГ] in the system prompt). The
+        ``summary`` is what will be stored — a 1–2 sentence paraphrase
+        in the user's own words.
 
         Args:
-            topic: One of: addressing, self_intro, family, diet, routine,
-                pain_point. Match the [ОНБОРДИНГ] block's current_topic.
+            topic: Must be `addressing` (only active topic). Match the
+                [ОНБОРДИНГ] block's current_topic.
             summary: The answer in 1–2 sentences, preserving user wording.
                 For the ``addressing`` topic — ТОЛЬКО короткое имя/ник
                 (1-3 слова), БЕЗ префиксов «Пользователя зовут»,
@@ -600,17 +606,24 @@ def build_housewife_tools(
 
     @_write_lc_tool
     def onboarding_deferred(topic: str, reason: str) -> str:
-        """Mark an onboarding topic as deferred and advance to the next one.
+        """Mark the addressing onboarding topic as deferred.
 
-        Call this when the user explicitly wants to skip the current topic
-        ("потом", "не сейчас", "пропусти"). First skip keeps the topic in
-        a retry queue; second skip on the same topic makes the skip
-        permanent.
+        Codex Sub-A4 onboarding R4 MAJOR (prompt-surface): pre-R4
+        docstring listed all 6 legacy topics and called reason
+        «for audit». Active flow is only `addressing` per TOPIC_ORDER
+        (housewife_onboarding.py:68). Reason is NOT stored — kept as
+        planner-facing self-reflection field.
+
+        Call this when the user explicitly wants to skip the current
+        topic ("потом", "не сейчас", "пропусти"). First skip keeps
+        the topic in a retry queue; second skip on the same topic
+        makes the skip permanent.
 
         Args:
-            topic: One of: addressing, self_intro, family, diet, routine,
-                pain_point.
-            reason: Short explanation of why skipping — for audit.
+            topic: Must be `addressing` (only active topic).
+            reason: Short rationale for skipping — runtime does NOT
+                store this value; planner is asked to articulate
+                its skip decision in plan_json for transparency.
 
         Returns short status string.
         """
