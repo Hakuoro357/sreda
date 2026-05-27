@@ -294,6 +294,43 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Plan-Execute LLM provider split (Hakuoro357/vex-assistant#77 item #5).
+    # Planner needs heavyweight reasoning + structured-output compliance —
+    # composer just renders free text from execution_log. Separating them
+    # lets us pay light-model price on every reply while keeping plan
+    # quality on the planner side.
+    #
+    # Provider keys follow ``services/llm.py`` registry (e.g. ``mimo-v2.5``
+    # resolves to ``mimo-v2.5-pro``, ``mimo-flash`` is the cheap+fast tier).
+    planner_provider: str = Field(
+        default="mimo-v2.5-pro",
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_PROVIDER",
+            "sreda_planner_provider",
+        ),
+        description=(
+            "LLM provider for the planner node (heavyweight model — needs "
+            "multi-step reasoning + json-schema-strict output). Cheaper "
+            "variants may break Plan schema compliance on edge cases; "
+            "benchmark before downgrading."
+        ),
+    )
+    composer_provider: str = Field(
+        default="mimo-flash",
+        validation_alias=AliasChoices(
+            "SREDA_COMPOSER_PROVIDER",
+            "sreda_composer_provider",
+        ),
+        description=(
+            "LLM provider for the composer LLM-path (ComposerCall.kind='llm'). "
+            "Composer writes free-text replies from a finished execution_log "
+            "— no tool selection, no multi-step reasoning — so a light model "
+            "is fine. Default mimo-flash is ~3x cheaper and ~5x faster than "
+            "the planner tier. Template-path composer calls don't touch any "
+            "LLM at all."
+        ),
+    )
+
     # LangGraph PostgresSaver wiring (Sub-A6 — Hakuoro357/vex-assistant#74).
     # Default behaviour: postgres URL → PostgresSaver, anything else
     # → InMemorySaver. Override to "memory" to force in-memory even

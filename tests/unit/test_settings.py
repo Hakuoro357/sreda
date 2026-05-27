@@ -57,3 +57,59 @@ def test_connect_public_base_url_rejects_missing_host() -> None:
 def test_connect_public_base_url_rejects_garbage() -> None:
     with pytest.raises(ValueError):
         Settings(connect_public_base_url="not a url")
+
+
+# ---------------------------------------------------------------------------
+# Plan-Execute LLM provider split (vex-assistant#77 item #5)
+# ---------------------------------------------------------------------------
+
+
+def test_planner_provider_default() -> None:
+    """Planner needs heavyweight reasoning + json-schema compliance —
+    default tier is mimo-v2.5-pro."""
+    settings = Settings()
+    assert settings.planner_provider == "mimo-v2.5-pro"
+
+
+def test_planner_provider_override_via_env_alias(monkeypatch) -> None:
+    """SREDA_PLANNER_PROVIDER env var overrides the default."""
+    monkeypatch.setenv("SREDA_PLANNER_PROVIDER", "mimo-v2.5")
+    settings = Settings()
+    assert settings.planner_provider == "mimo-v2.5"
+
+
+def test_composer_provider_default() -> None:
+    """Composer LLM-path writes free text — a light model is fine.
+    Default mimo-flash is ~3x cheaper than the planner tier."""
+    settings = Settings()
+    assert settings.composer_provider == "mimo-flash"
+
+
+def test_composer_provider_override_via_env_alias(monkeypatch) -> None:
+    """SREDA_COMPOSER_PROVIDER env var overrides the default."""
+    monkeypatch.setenv("SREDA_COMPOSER_PROVIDER", "mimo-v2.5-light")
+    settings = Settings()
+    assert settings.composer_provider == "mimo-v2.5-light"
+
+
+def test_planner_and_composer_providers_are_independent(monkeypatch) -> None:
+    """Setting one shouldn't affect the other — they're independent
+    knobs (whole point of the split)."""
+    monkeypatch.setenv("SREDA_PLANNER_PROVIDER", "mimo-v2.5-pro")
+    monkeypatch.setenv("SREDA_COMPOSER_PROVIDER", "mimo-flash")
+    settings = Settings()
+    assert settings.planner_provider == "mimo-v2.5-pro"
+    assert settings.composer_provider == "mimo-flash"
+
+
+def test_providers_accept_arbitrary_string(monkeypatch) -> None:
+    """No validation on provider values — registry resolution happens
+    at get_chat_llm() call time. Lets us hot-swap providers via env
+    var without settings schema churn (e.g. add 'qwen-turbo' as future
+    fallback). Validated through env var since the field uses
+    ``AliasChoices`` (kwargs-init bypasses the alias)."""
+    monkeypatch.setenv("SREDA_PLANNER_PROVIDER", "future-provider-xyz")
+    monkeypatch.setenv("SREDA_COMPOSER_PROVIDER", "another-future-provider")
+    settings = Settings()
+    assert settings.planner_provider == "future-provider-xyz"
+    assert settings.composer_provider == "another-future-provider"
