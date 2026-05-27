@@ -1443,44 +1443,49 @@ def parse_clear_menu(
 # ---------------------------------------------------------------------------
 
 
-class AddFamilyMembersAdded(BaseModel):
-    """Happy path: at least one member persisted. Mirrors
-    ``SaveRecipesBatchOk`` shape — created_count + skipped_as_duplicate
-    + tight ID list with cross-field count consistency."""
+class AddFamilyMembersOk(BaseModel):
+    """Codex Sub-A4 household R1 CRITICAL #1 + Acceptable Alternative:
+    collapsed shape (was AddFamilyMembersAdded + AddFamilyMembersAllDuplicate
+    — both with status='added' which broke the Pydantic v2 discriminator
+    union requirement). One model now covers both runtime shapes:
+
+    - ``ok:added:N:skipped_as_duplicate:M:ids=[fm_,...]`` (N >= 1)
+      → ``added_count=N, member_ids=[N items]``
+    - ``ok:added:0:skipped_as_duplicate:M`` (no ids segment, M >= 1)
+      → ``added_count=0, member_ids=[]``
+
+    Planner branches on ``added_count == 0`` to say «эти уже есть»
+    vs «добавила N (M уже было)». Cross-field invariant:
+    ``len(member_ids) == added_count``."""
 
     model_config = ConfigDict(extra="forbid")
     status: Literal["added"] = "added"
-    added_count: int = Field(ge=1)
+    added_count: int = Field(ge=0)
     skipped_as_duplicate: int = Field(ge=0)
     member_ids: list[FamilyMemberId]
 
     @model_validator(mode="after")
-    def _validate_count_matches_ids(self) -> "AddFamilyMembersAdded":
+    def _validate_count_matches_ids(self) -> "AddFamilyMembersOk":
         if len(self.member_ids) != self.added_count:
             raise ValueError(
                 f"added_count={self.added_count} but member_ids has "
                 f"{len(self.member_ids)} entries — mismatch."
             )
+        if self.added_count == 0 and self.skipped_as_duplicate == 0:
+            # Runtime never emits both zeros (empty batch is rejected
+            # upstream with error: empty batch). Reject the malformed
+            # shape so the executor fail-closes.
+            raise ValueError(
+                "added_count=0 AND skipped_as_duplicate=0 — runtime "
+                "never emits this shape (empty batch returns "
+                "'error: empty batch' instead)."
+            )
         return self
-
-
-class AddFamilyMembersAllDuplicate(BaseModel):
-    """Every member in the batch matched a normalised-name existing
-    row. ``added_count=0`` and no ids segment in the runtime output —
-    distinct shape because the planner can say «эти уже есть, ничего
-    не добавила»."""
-
-    model_config = ConfigDict(extra="forbid")
-    status: Literal["added"] = "added"
-    added_count: Literal[0] = 0
-    skipped_as_duplicate: int = Field(ge=1)
-    member_ids: list[FamilyMemberId] = Field(default_factory=list, max_length=0)
 
 
 AddFamilyMembersOutput = Annotated[
     Union[
-        AddFamilyMembersAdded,
-        AddFamilyMembersAllDuplicate,
+        AddFamilyMembersOk,
         HousewifeToolError,
     ],
     Field(discriminator="status"),
@@ -1497,12 +1502,7 @@ _ADD_FAMILY_RE = re.compile(
 
 def parse_add_family_members(
     raw: str,
-) -> (
-    AddFamilyMembersAdded
-    | AddFamilyMembersAllDuplicate
-    | HousewifeToolError
-    | ToolOutputContractViolation
-):
+) -> AddFamilyMembersOk | HousewifeToolError | ToolOutputContractViolation:
     err = _parse_error(raw)
     if err is not None:
         return err
@@ -1512,20 +1512,19 @@ def parse_add_family_members(
         skipped = int(m.group("m"))
         ids_csv = m.group("ids") or ""
         ids = [x.strip() for x in ids_csv.split(",") if x.strip()]
+        # Codex Sub-A4 household R1 CRITICAL #1: pre-check the
+        # «zero count + ids» drift before construction. The model
+        # validator catches it via count/ids mismatch, but emitting
+        # ContractViolation directly is faster and gives a clearer
+        # tool_name in the gap log.
+        if n == 0 and ids:
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="add_family_members",
+                timestamp=datetime.now(timezone.utc),
+            )
         try:
-            if n == 0:
-                # All-duplicate branch — must have at least one
-                # skipped AND no ids in runtime output.
-                if ids:
-                    return ToolOutputContractViolation(
-                        raw_output=raw,
-                        tool_name="add_family_members",
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                return AddFamilyMembersAllDuplicate(
-                    skipped_as_duplicate=skipped,
-                )
-            return AddFamilyMembersAdded(
+            return AddFamilyMembersOk(
                 added_count=n,
                 skipped_as_duplicate=skipped,
                 member_ids=ids,
@@ -1539,16 +1538,39 @@ def parse_add_family_members(
     )
 
 
+class ListFamilyMembersRow(BaseModel):
+    """One row in the structured list_family_members output.
+
+    Codex Sub-A4 household R1 MAJOR #7: household is ID-driven —
+    update_family_member / remove_family_member both need an
+    ``fm_<24 hex>`` id. Pre-R2 the list returned only ``raw_text``
+    forcing the planner to parse «[fm_X] name (role, age) — notes»
+    from prose. Now the parser deconstructs the dump into typed
+    rows so the planner refers to ``${list_step.members[i].member_id}``
+    directly.
+
+    ``age_text`` is the free-form age blob from the dump («8 лет»
+    or «школьник») — keeps the originally-recorded distinction
+    between birth_year-derived ages and age_hint without forcing
+    the planner to disambiguate at this layer."""
+
+    model_config = ConfigDict(extra="forbid")
+    member_id: FamilyMemberId
+    name: str = Field(min_length=1, max_length=80)
+    role: Literal["self", "spouse", "child", "parent", "other"]
+    age_text: str | None = Field(default=None, max_length=40)
+    notes: str | None = Field(default=None, max_length=300)
+
+
 class ListFamilyMembersOk(BaseModel):
-    """Plan-execute MVP boundary (same approach as ListMenuOk /
-    ListShoppingOk): the runtime dump is human-formatted; the
-    planner consumes ``raw_text`` and shows or summarises. A
-    structured ``members`` list is post-MVP (see Phase B
-    follow-ups). ``raw_text`` carries the full dump for now."""
+    """Structured list of household members (R1 MAJOR #7 promotion
+    from raw_text). ``members`` always non-empty here — the
+    «no family members recorded» path goes to
+    ``ListFamilyMembersEmpty``."""
 
     model_config = ConfigDict(extra="forbid")
     status: Literal["ok"] = "ok"
-    raw_text: str = Field(min_length=1)
+    members: list[ListFamilyMembersRow] = Field(min_length=1)
 
 
 class ListFamilyMembersEmpty(BaseModel):
@@ -1566,6 +1588,19 @@ ListFamilyMembersOutput = Annotated[
 ]
 
 
+# Runtime list rendering at housewife_chat_tools.py:1626-1640. Per-row format:
+#   "  [fm_<24hex>] <name> (<role>, <age_text>) — <notes>"
+#   age_text and "— notes" are optional segments.
+_LIST_FAMILY_HEADER_RE = re.compile(r"^(?P<n>[1-9]\d*)\s+member\(s\):$")
+_LIST_FAMILY_ROW_RE = re.compile(
+    r"^\s+\[(?P<id>fm_[0-9a-f]{24})\]\s+(?P<name>[^()\n]+?)\s+\("
+    r"(?P<role>self|spouse|child|parent|other)"
+    r"(?:,\s+(?P<age>[^)]+))?"
+    r"\)"
+    r"(?:\s+—\s+(?P<notes>.+))?$"
+)
+
+
 def parse_list_family_members(
     raw: str,
 ) -> (
@@ -1580,15 +1615,66 @@ def parse_list_family_members(
     stripped = raw.strip()
     if stripped == "no family members recorded":
         return ListFamilyMembersEmpty()
-    # Sanity: list dumps start with "N member(s):" — without that
-    # header the output isn't from this tool's known shape.
-    if re.match(r"^\d+\s+member\(s\):", stripped):
-        return ListFamilyMembersOk(raw_text=stripped)
-    return ToolOutputContractViolation(
-        raw_output=raw,
-        tool_name="list_family_members",
-        timestamp=datetime.now(timezone.utc),
-    )
+    # Codex Sub-A4 household R1 MINOR #1: tighten header regex to
+    # reject ``0 member(s):`` — runtime emits the empty-string shape
+    # «no family members recorded» for zero count, so a numeric 0
+    # header is contract drift.
+    lines = stripped.splitlines()
+    if not lines:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_family_members",
+            timestamp=datetime.now(timezone.utc),
+        )
+    header_match = _LIST_FAMILY_HEADER_RE.match(lines[0].strip())
+    if header_match is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_family_members",
+            timestamp=datetime.now(timezone.utc),
+        )
+    expected_count = int(header_match.group("n"))
+    rows: list[ListFamilyMembersRow] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        rmatch = _LIST_FAMILY_ROW_RE.match(line)
+        if rmatch is None:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_family_members",
+                timestamp=datetime.now(timezone.utc),
+            )
+        try:
+            rows.append(
+                ListFamilyMembersRow(
+                    member_id=rmatch.group("id"),
+                    name=rmatch.group("name").strip(),
+                    role=rmatch.group("role"),
+                    age_text=(
+                        rmatch.group("age").strip()
+                        if rmatch.group("age") else None
+                    ),
+                    notes=(
+                        rmatch.group("notes").strip()
+                        if rmatch.group("notes") else None
+                    ),
+                )
+            )
+        except ValidationError:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_family_members",
+                timestamp=datetime.now(timezone.utc),
+            )
+    if len(rows) != expected_count:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_family_members",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ListFamilyMembersOk(members=rows)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_family_members",
+            timestamp=datetime.now(timezone.utc),
+        )
 
 
 class UpdateFamilyMemberOk(BaseModel):
@@ -1695,8 +1781,7 @@ def parse_tool_output(tool_name: str, raw: str) -> BaseModel:
 
 
 __all__ = [
-    "AddFamilyMembersAdded",
-    "AddFamilyMembersAllDuplicate",
+    "AddFamilyMembersOk",
     "AddFamilyMembersOutput",
     "AddShoppingItemsAdded",
     "AddShoppingItemsEmpty",

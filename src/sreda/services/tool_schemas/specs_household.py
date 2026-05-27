@@ -56,7 +56,20 @@ AgeHint = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=40),
 ]
 """Free-form age hint when birth_year unknown («8 лет», «школьник»,
-«пенсионер»). 40 char cap keeps the dump compact for list_members."""
+«пенсионер»). 40 char cap keeps the dump compact for list_members.
+
+Add-batch context: empty string is rejected (must have content).
+Update context uses ``AgeHintClearable`` below to support clearing."""
+
+
+AgeHintClearable = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=40),
+]
+"""Codex Sub-A4 household R1 MAJOR #4: update path needs to support
+clearing the field — runtime ``update_member`` stores whatever the
+caller passes, including empty string. Empty string == clear.
+``min_length`` is intentionally absent (vs ``AgeHint``)."""
 
 
 FamilyNotes = Annotated[
@@ -66,6 +79,15 @@ FamilyNotes = Annotated[
 """Free-form per-member notes — allergies, dietary preferences,
 chronic conditions. 300 char cap is generous without ballooning
 the prompt that includes list dumps."""
+
+
+FamilyNotesClearable = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=300),
+]
+"""Codex Sub-A4 household R1 MAJOR #4: clearable variant for the
+update path. Empty string == clear (e.g. «убери аллергию у Никиты»).
+``min_length`` intentionally absent."""
 
 
 # Runtime accepts birth_year roughly in [1900, current_year+1]; the
@@ -125,17 +147,27 @@ class UpdateFamilyMemberInput(BaseModel):
     """Point-update one member's fields. ``member_id`` required;
     every other field is optional — pass only what changes.
 
-    Codex Sub-A4 household: at least ONE updatable field must be
-    non-None. Empty update payload is a planner mistake (would be
-    a no-op at runtime); reject so the planner notices."""
+    Codex Sub-A4 household R1 MAJOR #4: ``age_hint`` and ``notes``
+    use *Clearable* variants (no min_length) so the planner can
+    express «убери аллергию у Никиты» as ``notes=''``. Empty string
+    means CLEAR the field. ``name`` and ``birth_year`` and ``role``
+    cannot be cleared via update — for those use remove + re-add
+    (cleared birth_year would orphan ages computed downstream;
+    cleared name violates the dedup invariant; cleared role has no
+    sensible default).
+
+    Codex Sub-A4 household R1 (pre-CRITICAL): at least ONE updatable
+    field must be non-None. Empty update payload is a planner
+    mistake (would be a no-op at runtime); reject so the planner
+    notices."""
 
     model_config = ConfigDict(extra="forbid")
     member_id: FamilyMemberId
     name: FamilyMemberName | None = None
     role: FamilyRole | None = None
     birth_year: BirthYear | None = None
-    age_hint: AgeHint | None = None
-    notes: FamilyNotes | None = None
+    age_hint: AgeHintClearable | None = None
+    notes: FamilyNotesClearable | None = None
 
     @model_validator(mode="after")
     def _validate_at_least_one_field(self) -> "UpdateFamilyMemberInput":
@@ -170,12 +202,19 @@ ADD_FAMILY_MEMBERS_SPEC = ToolSpec(
     description=(
         "Добавить одного или нескольких членов семьи за раз. "
         "Используй когда юзер описывает семью одной фразой («у меня "
-        "жена Катя, сын Никита 10 лет»). Имена дедуплицируются по "
-        "нормализованному виду (case-insensitive) — если имя уже есть, "
-        "записываем в skipped_as_duplicate. Если все имена уже есть — "
-        "статус ok:added:0:skipped_as_duplicate:M (без ids), иначе "
-        "ok:added:N:skipped_as_duplicate:M:ids=[fm_,...]. Перед "
-        "вызовом, если не уверен есть ли уже записи — list_family_members."
+        "жена Катя, сын Никита 10 лет»). Codex R1 MAJOR #5 — возраст: "
+        "используй birth_year ТОЛЬКО когда юзер назвал явный год "
+        "рождения («Никита 2015 года рождения»); фразы вида «10 лет» / "
+        "«школьник» / «пенсионер» иди в age_hint, чтобы не угадывать "
+        "год по текущему — на границе дня рождения это смещается. "
+        "Codex R1 MAJOR #6 — роли: spouse=муж/жена, child=сын/дочь, "
+        "parent=мама/папа, self=сам пользователь; всё остальное "
+        "(сестра, брат, бабушка, дядя) → role='other' + точное "
+        "отношение в notes. Имена дедуплицируются по нормализованному "
+        "виду (case-insensitive); если все имена уже есть — статус "
+        "ok:added:0:skipped_as_duplicate:M, иначе "
+        "ok:added:N:skipped_as_duplicate:M:ids=[fm_,...]. Если не "
+        "уверен что записи уже есть — list_family_members сначала."
     ),
     family="household",
     effect="write",
@@ -185,9 +224,9 @@ ADD_FAMILY_MEMBERS_SPEC = ToolSpec(
     output_model=AddFamilyMembersOutput,
     trigger_examples=[
         "у меня жена Катя, сын Никита 10 лет",
-        "добавь сестру Машу",
         "запиши семью: муж и двое детей",
         "запомни что у меня сын-школьник",
+        "у меня брат Серёжа",
     ],
     mutex_notes=[
         "Используй ДЛЯ ДОБАВЛЕНИЯ. Для правки существующего — update_family_member. Для удаления — remove_family_member.",
@@ -202,11 +241,15 @@ LIST_FAMILY_MEMBERS_SPEC = ToolSpec(
     name="list_family_members",
     description=(
         "Показать всех записанных членов семьи юзера: имя, роль, "
-        "возраст и заметки. Вызывай ПЕРЕД plan_week_menu (понять "
-        "кого кормить) и ПЕРЕД generate_shopping_from_menu (для "
-        "корректного масштабирования количеств). Возвращает раздельные "
-        "статусы: ok (есть записи) и empty (никого нет — предложи "
-        "юзеру add_family_members)."
+        "возраст и заметки. Возвращает СТРУКТУРИРОВАННЫЙ список с "
+        "member_id для каждого члена — используй эти id для "
+        "update_family_member и remove_family_member (имена-в-промпте "
+        "не выдумывай). Codex R1 MAJOR #2: меню/покупки используют "
+        "household автоматически — НЕ нужно звать этот tool «для "
+        "масштабирования», только когда юзер сам спрашивает про "
+        "семью или когда тебе нужны member_id для правки/удаления. "
+        "Возвращает раздельные статусы: ok (есть записи) и empty "
+        "(никого нет — предложи юзеру add_family_members)."
     ),
     family="household",
     effect="read",
@@ -221,7 +264,8 @@ LIST_FAMILY_MEMBERS_SPEC = ToolSpec(
         "есть ли уже Маша в семье",
     ],
     mutex_notes=[
-        "Возвращает СЕМЬЮ юзера, не рецепты/покупки/задачи. Для масштабирования меню — generate_shopping_from_menu сам подтянет через household.",
+        "Возвращает СЕМЬЮ юзера, не рецепты/покупки/задачи. Меню/покупки уже подтягивают household внутренне — звать list тут не нужно.",
+        "Использует структурированный вывод (members[].member_id) — ссылайся на эти id при обновлении/удалении вместо парсинга prose.",
     ],
     timeout_seconds=5,
     side_effect_class="read_only",
@@ -233,10 +277,18 @@ UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
     description=(
         "Обновить поля одного члена семьи. Используй когда юзер "
         "корректирует данные: «Маше 9 уже», «у Никиты теперь аллергия "
-        "на молоко». Передавай ТОЛЬКО те поля что меняются — остальные "
-        "оставь None. Минимум одно поле должно быть non-None (пустой "
-        "апдейт = no-op runtime = ошибка). Возвращает ok:updated или "
-        "error:member_not_found."
+        "на молоко». Codex R1 MAJOR #3: если юзер называет члена по "
+        "имени/роли, а member_id у тебя ещё нет — сначала вызови "
+        "list_family_members, найди нужного по name, потом обновляй. "
+        "Если несколько совпадений (двое детей с одним именем) — "
+        "переспроси юзера. Передавай ТОЛЬКО те поля что меняются — "
+        "остальные оставь None. Минимум одно поле должно быть "
+        "non-None (пустой апдейт = no-op runtime = ошибка). "
+        "Codex R1 MAJOR #4: очистить notes/age_hint можно передав "
+        "пустую строку только если поле явно поддерживает clear (см. "
+        "input_model description); birth_year не очищается через "
+        "update — для этого remove + re-add. Возвращает ok:updated "
+        "или error:member_not_found."
     ),
     family="household",
     effect="write",
@@ -247,12 +299,12 @@ UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
     trigger_examples=[
         "Маше 9 уже",
         "у Никиты аллергия на молоко",
-        "поменяй роль Кати с child на spouse",
-        "у мамы теперь день рождения 1985",
+        "Катя теперь не ребёнок, это жена",
+        "у мамы день рождения 1985",
     ],
     mutex_notes=[
         "Используй ДЛЯ ПРАВКИ. Для добавления нового члена — add_family_members. Для удаления — remove_family_member.",
-        "member_id берётся из list_family_members ([fm_...]).",
+        "member_id берётся из list_family_members.members[i].member_id (СТРУКТУРИРОВАННЫЙ вывод, не парсить из prose).",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -264,8 +316,11 @@ REMOVE_FAMILY_MEMBER_SPEC = ToolSpec(
     description=(
         "Удалить запись члена семьи. Используй ТОЛЬКО когда юзер явно "
         "просит убрать («Маша переехала, удали»), а не для коррекции "
-        "(коррекция — update_family_member). Возвращает ok:removed "
-        "или error:member_not_found."
+        "(коррекция — update_family_member). Codex R1 MAJOR #3: если "
+        "юзер называет члена по имени, а member_id у тебя ещё нет — "
+        "сначала вызови list_family_members, найди нужного по name, "
+        "потом удаляй. При нескольких совпадениях — переспроси юзера. "
+        "Возвращает ok:removed или error:member_not_found."
     ),
     family="household",
     effect="write",
@@ -281,7 +336,7 @@ REMOVE_FAMILY_MEMBER_SPEC = ToolSpec(
     ],
     mutex_notes=[
         "Используй ТОЛЬКО для удаления. Коррекция полей — update_family_member.",
-        "member_id берётся из list_family_members ([fm_...]).",
+        "member_id берётся из list_family_members.members[i].member_id (СТРУКТУРИРОВАННЫЙ вывод).",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -300,10 +355,12 @@ __all__ = [
     "ADD_FAMILY_MEMBERS_SPEC",
     "AddFamilyMembersInput",
     "AgeHint",
+    "AgeHintClearable",
     "BirthYear",
     "FamilyMemberDraft",
     "FamilyMemberName",
     "FamilyNotes",
+    "FamilyNotesClearable",
     "FamilyRole",
     "HOUSEHOLD_SPECS",
     "LIST_FAMILY_MEMBERS_SPEC",

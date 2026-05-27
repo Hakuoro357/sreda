@@ -24,11 +24,11 @@ from pydantic import ValidationError
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
 from sreda.services.tool_schemas.housewife import (
-    AddFamilyMembersAdded,
-    AddFamilyMembersAllDuplicate,
+    AddFamilyMembersOk,
     HousewifeToolError,
     ListFamilyMembersEmpty,
     ListFamilyMembersOk,
+    ListFamilyMembersRow,
     PARSERS,
     RemoveFamilyMemberOk,
     UpdateFamilyMemberOk,
@@ -239,6 +239,35 @@ def test_update_family_member_input_rejects_unknown_role() -> None:
         })
 
 
+def test_update_family_member_input_accepts_empty_notes_as_clear() -> None:
+    """Codex Sub-A4 household R1 MAJOR #4: empty string in
+    ``notes`` represents «clear the notes field» («убери аллергию
+    у Никиты»). The clearable variant (no min_length) allows it
+    while the add-path FamilyMemberDraft.notes still requires
+    min_length=1."""
+    parsed = UpdateFamilyMemberInput.model_validate({
+        "member_id": FM_A, "notes": "",
+    })
+    assert parsed.notes == ""
+
+
+def test_update_family_member_input_accepts_empty_age_hint_as_clear() -> None:
+    """Same clearable semantics for age_hint."""
+    parsed = UpdateFamilyMemberInput.model_validate({
+        "member_id": FM_A, "age_hint": "",
+    })
+    assert parsed.age_hint == ""
+
+
+def test_update_family_member_input_rejects_empty_name() -> None:
+    """name is NOT clearable — empty would break the dedup invariant
+    (normalised-name uniqueness). Empty string rejected."""
+    with pytest.raises(ValidationError):
+        UpdateFamilyMemberInput.model_validate({
+            "member_id": FM_A, "name": "",
+        })
+
+
 # ---------------------------------------------------------------------------
 # Input model — RemoveFamilyMemberInput / ListFamilyMembersInput
 # ---------------------------------------------------------------------------
@@ -277,28 +306,42 @@ def test_list_family_members_input_rejects_extra_keys() -> None:
 
 
 def test_add_family_members_parser_returns_added() -> None:
+    """Codex Sub-A4 household R1 CRITICAL #1: collapsed shape —
+    both happy path and all-duplicate use ``AddFamilyMembersOk``
+    discriminated by ``added_count``."""
     parsed = parse_tool_output(
         "add_family_members",
         f"ok:added:2:skipped_as_duplicate:1:ids=[{FM_A},{FM_B}]",
     )
-    assert isinstance(parsed, AddFamilyMembersAdded)
+    assert isinstance(parsed, AddFamilyMembersOk)
     assert parsed.added_count == 2
     assert parsed.skipped_as_duplicate == 1
     assert parsed.member_ids == [FM_A, FM_B]
 
 
-def test_add_family_members_parser_returns_all_duplicate() -> None:
+def test_add_family_members_parser_all_duplicate_path() -> None:
     """``ok:added:0:skipped_as_duplicate:N`` (no ids segment) →
-    AddFamilyMembersAllDuplicate. Planner can branch to «эти уже
-    есть, ничего не добавила» without conflating with «empty batch
-    rejected»."""
+    same ``AddFamilyMembersOk`` model with ``added_count=0``.
+    Planner branches on ``added_count == 0`` to say «эти уже
+    есть, ничего не добавила»."""
     parsed = parse_tool_output(
         "add_family_members", "ok:added:0:skipped_as_duplicate:3"
     )
-    assert isinstance(parsed, AddFamilyMembersAllDuplicate)
+    assert isinstance(parsed, AddFamilyMembersOk)
     assert parsed.added_count == 0
     assert parsed.skipped_as_duplicate == 3
     assert parsed.member_ids == []
+
+
+def test_add_family_members_parser_rejects_both_zeros() -> None:
+    """Codex Sub-A4 household R1 (validator addition): runtime never
+    emits ``ok:added:0:skipped_as_duplicate:0`` — empty batch is
+    rejected upstream with ``error: empty batch``. The malformed
+    both-zeros shape fails the model validator → ContractViolation."""
+    parsed = parse_tool_output(
+        "add_family_members", "ok:added:0:skipped_as_duplicate:0"
+    )
+    assert isinstance(parsed, ToolOutputContractViolation)
 
 
 def test_add_family_members_parser_zero_count_with_ids_is_violation() -> None:
@@ -345,7 +388,11 @@ def test_list_family_members_parser_empty_path() -> None:
     assert parsed.status == "empty"
 
 
-def test_list_family_members_parser_returns_dump() -> None:
+def test_list_family_members_parser_returns_structured_rows() -> None:
+    """Codex Sub-A4 household R1 MAJOR #7: list now returns
+    structured rows with member_id, name, role, age_text, notes —
+    the planner uses ``members[i].member_id`` directly for
+    update/remove rather than parsing prose."""
     raw = (
         "2 member(s):\n"
         f"  [{FM_A}] Маша (child, 8 лет) — аллергия на горчицу\n"
@@ -353,8 +400,68 @@ def test_list_family_members_parser_returns_dump() -> None:
     )
     parsed = parse_tool_output("list_family_members", raw)
     assert isinstance(parsed, ListFamilyMembersOk)
-    assert "Маша" in parsed.raw_text
-    assert "Никита" in parsed.raw_text
+    assert len(parsed.members) == 2
+    assert parsed.members[0] == ListFamilyMembersRow(
+        member_id=FM_A,
+        name="Маша",
+        role="child",
+        age_text="8 лет",
+        notes="аллергия на горчицу",
+    )
+    assert parsed.members[1] == ListFamilyMembersRow(
+        member_id=FM_B,
+        name="Никита",
+        role="child",
+        age_text="10 лет",
+        notes=None,
+    )
+
+
+def test_list_family_members_parser_handles_minimal_row() -> None:
+    """Member with no age, no notes — runtime emits just
+    ``[fm_id] name (role)``."""
+    raw = (
+        "1 member(s):\n"
+        f"  [{FM_A}] Маша (self)"
+    )
+    parsed = parse_tool_output("list_family_members", raw)
+    assert isinstance(parsed, ListFamilyMembersOk)
+    assert parsed.members[0].member_id == FM_A
+    assert parsed.members[0].name == "Маша"
+    assert parsed.members[0].role == "self"
+    assert parsed.members[0].age_text is None
+    assert parsed.members[0].notes is None
+
+
+def test_list_family_members_parser_rejects_zero_header() -> None:
+    """Codex Sub-A4 household R1 MINOR #1: ``0 member(s):`` is
+    contract drift — the runtime emits ``no family members
+    recorded`` for the empty path. Tightened regex rejects the
+    numeric-zero header → ContractViolation."""
+    parsed = parse_tool_output("list_family_members", "0 member(s):")
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_list_family_members_parser_rejects_count_mismatch() -> None:
+    """Header says 2 but only 1 row → ContractViolation. Catches
+    runtime dump-format drift."""
+    raw = (
+        "2 member(s):\n"
+        f"  [{FM_A}] Маша (child, 8 лет)"
+    )
+    parsed = parse_tool_output("list_family_members", raw)
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+def test_list_family_members_parser_rejects_bad_role() -> None:
+    """Row with role outside the FAMILY_ROLES whitelist →
+    ContractViolation. Catches runtime drift."""
+    raw = (
+        "1 member(s):\n"
+        f"  [{FM_A}] Маша (sister, 8 лет)"
+    )
+    parsed = parse_tool_output("list_family_members", raw)
+    assert isinstance(parsed, ToolOutputContractViolation)
 
 
 def test_list_family_members_parser_garbage_is_violation() -> None:
