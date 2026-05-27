@@ -496,6 +496,61 @@ def test_all_12_families_accepted_as_domains() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Codex R6 MAJOR — multi-domain (cross-family) tools must be expressible
+# ---------------------------------------------------------------------------
+
+
+def test_cross_family_tool_can_declare_multiple_write_domains() -> None:
+    """``attach_reminder`` style: family=`tasks` but writes both
+    `tasks` and `reminders`. Must construct without error."""
+    spec = _make_spec(
+        family="tasks",
+        effect="write",
+        read_domains=["tasks"],
+        write_domains=["tasks", "reminders"],
+    )
+    assert "tasks" in spec.write_domains
+    assert "reminders" in spec.write_domains
+
+
+def test_write_domain_may_differ_from_family() -> None:
+    """``generate_shopping_from_menu``: family=`menu`, reads `menu`,
+    writes `shopping`. Domain ≠ family is mandatory for the scheduler
+    to detect parallel-write conflicts (Codex R6 MAJOR)."""
+    spec = _make_spec(
+        family="menu",
+        effect="write",
+        read_domains=["menu"],
+        write_domains=["shopping"],
+    )
+    assert spec.family == "menu"
+    assert spec.write_domains == ["shopping"]
+
+
+# ---------------------------------------------------------------------------
+# Codex R6 MINOR — \x00 blocked in trigger_examples + mutex_notes too
+# ---------------------------------------------------------------------------
+
+
+def test_null_byte_in_trigger_example_rejected() -> None:
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(trigger_examples=[
+            "купи молоко", "добавь\x00хлеб", "нужно картошки",
+        ])
+    msg = str(exc.value).lower()
+    assert "control char" in msg or "single-line" in msg
+
+
+def test_null_byte_in_mutex_note_rejected() -> None:
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        _make_spec(mutex_notes=["Используй\x00ТОЛЬКО для X."])
+    msg = str(exc.value).lower()
+    assert "control char" in msg or "single-line" in msg
+
+
 def test_policy_bounds_are_reasonable() -> None:
     assert TRIGGER_EXAMPLES_MIN == 3
     assert TRIGGER_EXAMPLES_MAX == 10

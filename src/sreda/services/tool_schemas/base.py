@@ -239,7 +239,26 @@ class ToolSpec(BaseModel):
     """
     effect: Literal["read", "write"]
     read_domains: list[str] = Field(default_factory=list)
+    """Every mutable data domain the tool READS from. Each item must
+    be a member of the closed Family taxonomy (FAMILIES tuple).
+
+    May contain multiple values when the tool spans families. May
+    differ from ``spec.family`` — the latter is purely planner-prompt
+    grouping, while domains describe the scheduler's view of what
+    data the tool touches (Codex R6 MAJOR).
+
+    Example: ``generate_shopping_from_menu`` has family=`menu`,
+    read_domains=[`menu`], write_domains=[`shopping`]."""
     write_domains: list[str] = Field(default_factory=list)
+    """Every mutable data domain the tool WRITES to. Each item must
+    be a member of FAMILIES. Multi-domain values are mandatory for
+    cross-family tools — Sub-A4 must NOT mechanically set
+    ``write_domains=[spec.family]`` (would miss real parallel-write
+    conflicts).
+
+    Example: ``attach_reminder`` has family=`tasks`,
+    write_domains=[`tasks`, `reminders`] — both data stores are
+    mutated."""
     parallel_safe: bool = False
     timeout_seconds: int = Field(default=15, ge=1, le=600)
     side_effect_class: Literal[
@@ -350,17 +369,21 @@ class ToolSpec(BaseModel):
                 f"Tool '{self.name}' description has leading/trailing "
                 f"whitespace — strip before constructing (Codex R2 MINOR #6)."
             )
+        # Codex R6 MINOR: unified control-char block — \n/\r/\t/\x00
+        # across all prompt-rendered text fields (was previously
+        # inconsistent: \x00 blocked only on domains).
+        _CONTROL_CHARS = "\n\r\t\x00"
         if self.trigger_examples:
             for example in self.trigger_examples:
                 if not example.strip():
                     raise ValueError(
                         f"Tool '{self.name}' has empty/blank trigger_example."
                     )
-                if "\n" in example or "\r" in example or "\t" in example:
+                if any(c in example for c in _CONTROL_CHARS):
                     raise ValueError(
                         f"Tool '{self.name}' trigger_example contains "
-                        f"newline/tab — must be single-line text "
-                        f"(prompt formatting safety)."
+                        f"control char (\\n/\\r/\\t/\\x00) — must be "
+                        f"single-line text (prompt formatting safety)."
                     )
                 if example != example.strip():
                     raise ValueError(
@@ -373,10 +396,11 @@ class ToolSpec(BaseModel):
                 raise ValueError(
                     f"Tool '{self.name}' has empty/blank mutex_note."
                 )
-            if "\n" in note or "\r" in note or "\t" in note:
+            if any(c in note for c in _CONTROL_CHARS):
                 raise ValueError(
-                    f"Tool '{self.name}' mutex_note contains newline/tab "
-                    f"— must be single-line text (prompt formatting safety)."
+                    f"Tool '{self.name}' mutex_note contains control char "
+                    f"(\\n/\\r/\\t/\\x00) — must be single-line text "
+                    f"(prompt formatting safety)."
                 )
             if note != note.strip():
                 raise ValueError(
@@ -388,15 +412,37 @@ class ToolSpec(BaseModel):
                     f"Tool '{self.name}' mutex_note must NOT start with "
                     f"⚠ — the renderer prepends the marker. Got: {note[:60]!r}."
                 )
-        # Domain list contents (Codex R4 MAJOR #2 + R5 MAJOR):
+        # Domain list contents (Codex R4 MAJOR #2 + R5 MAJOR + R6 MAJOR):
         # blank/whitespace/typo domains silently break scheduler
         # conflict detection. Each domain must be a non-empty string
         # AND a member of the closed Family taxonomy (FAMILIES tuple)
         # — typo `"shoping"` would otherwise look isolated from the
-        # real `shopping` domain. For MVP the scheduler-domain
-        # namespace and the planner-prompt Family namespace are the
-        # same; can split into separate `ToolDomain` literal later if
-        # needed (Codex R5 alternative).
+        # real `shopping` domain.
+        #
+        # ``read_domains`` / ``write_domains`` describe **every mutable
+        # data store the tool touches**, NOT the tool's planner
+        # routing family. They are independent dimensions:
+        #
+        # - ``spec.family`` — single value, planner-prompt grouping
+        #   (e.g. ``add_shopping_items`` lives in family `shopping`).
+        # - ``spec.write_domains`` — list of touched mutable domains,
+        #   may include multiple Family values, may differ from
+        #   ``spec.family``.
+        #
+        # Cross-family examples (Codex R6 MAJOR — must be encoded by
+        # Sub-A4 when migrating real ToolSpecs):
+        # - ``generate_shopping_from_menu``: family=`menu`,
+        #   read_domains=[`menu`], write_domains=[`shopping`].
+        # - ``attach_reminder``: family=`tasks`,
+        #   write_domains=[`tasks`, `reminders`].
+        #
+        # Mechanically setting ``write_domains=[spec.family]`` would
+        # miss real conflicts (parallel `generate_shopping_from_menu`
+        # + `add_shopping_items` would both write `shopping` without
+        # the scheduler knowing).
+        #
+        # For MVP the domain value SET equals FAMILIES; split into a
+        # separate `ToolDomain` literal later if needed (Codex R5 alt).
         for kind, domains in (
             ("read_domains", self.read_domains),
             ("write_domains", self.write_domains),
