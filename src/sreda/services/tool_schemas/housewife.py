@@ -33,6 +33,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.common import (
+    MenuItemId,
+    MenuPlanId,
     RecipeId,
     ReminderId,
     ShoppingItemId,
@@ -1104,6 +1106,249 @@ def parse_delete_recipe(
 
 
 # ---------------------------------------------------------------------------
+# 17. plan_week_menu       `ok:plan_created:menu_<id>:<week_iso>`
+# ---------------------------------------------------------------------------
+
+
+class PlanWeekMenuOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["plan_created"] = "plan_created"
+    menu_id: MenuPlanId
+    week_start_iso: str = Field(min_length=10)
+    """Monday-normalised week start date (YYYY-MM-DD). Service writes
+    via ``plan.week_start_date.isoformat()``."""
+
+
+PlanWeekMenuOutput = Annotated[
+    Union[PlanWeekMenuOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_PLAN_WEEK_MENU_RE = re.compile(
+    r"^ok:plan_created:(?P<id>menu_[^:]+):(?P<week>.+)$"
+)
+
+
+def parse_plan_week_menu(
+    raw: str,
+) -> PlanWeekMenuOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _PLAN_WEEK_MENU_RE.match(raw.strip())
+    if m is not None:
+        try:
+            return PlanWeekMenuOk(
+                menu_id=m.group("id"),
+                week_start_iso=m.group("week"),
+            )
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="plan_week_menu",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 18. update_menu_item     `ok:updated:mpi_<id>` | `ok:cleared_or_not_found`
+# ---------------------------------------------------------------------------
+
+
+class UpdateMenuItemUpdated(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["updated"] = "updated"
+    item_id: MenuItemId
+
+
+class UpdateMenuItemClearedOrNotFound(BaseModel):
+    """Runtime emits this when the cell was cleared (both recipe_id
+    AND free_text None) OR when the plan_id doesn't exist. Two
+    semantics collapsed into one output — planner has to branch on
+    context to disambiguate. Documented for the future split if
+    needed."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["cleared_or_not_found"] = "cleared_or_not_found"
+
+
+UpdateMenuItemOutput = Annotated[
+    Union[UpdateMenuItemUpdated, UpdateMenuItemClearedOrNotFound, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_UPDATE_MENU_ITEM_RE = re.compile(r"^ok:updated:(?P<id>mpi_[^\s]+)$")
+
+
+def parse_update_menu_item(
+    raw: str,
+) -> (
+    UpdateMenuItemUpdated
+    | UpdateMenuItemClearedOrNotFound
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "ok:cleared_or_not_found":
+        return UpdateMenuItemClearedOrNotFound()
+    m = _UPDATE_MENU_ITEM_RE.match(stripped)
+    if m is not None:
+        try:
+            return UpdateMenuItemUpdated(item_id=m.group("id"))
+        except ValidationError:
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="update_menu_item",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 19. list_menu      `no menu plan for that week` | multiline grid
+# ---------------------------------------------------------------------------
+
+
+class ListMenuEmpty(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["empty"] = "empty"
+
+
+class ListMenuOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["ok"] = "ok"
+    menu_id: MenuPlanId
+    week_start_iso: str = Field(min_length=10)
+    raw_text: str
+    """Full multi-line grid as emitted by ``_iter_menu_plan_day_lines``.
+    Composer templates can pull structured data later; for MVP the raw
+    text is passed through verbatim."""
+
+
+ListMenuOutput = Annotated[
+    Union[ListMenuOk, ListMenuEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_LIST_MENU_ID_RE = re.compile(r"^menu_id:\s+(?P<id>menu_[^\s]+)$")
+_LIST_MENU_WEEK_RE = re.compile(r"^week_start:\s+(?P<week>.+)$")
+
+
+def parse_list_menu(
+    raw: str,
+) -> ListMenuOk | ListMenuEmpty | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "no menu plan for that week":
+        return ListMenuEmpty()
+    lines = [ln for ln in stripped.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_menu",
+            timestamp=datetime.now(timezone.utc),
+        )
+    id_match = _LIST_MENU_ID_RE.match(lines[0].strip())
+    week_match = _LIST_MENU_WEEK_RE.match(lines[1].strip())
+    if id_match is None or week_match is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_menu",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ListMenuOk(
+            menu_id=id_match.group("id"),
+            week_start_iso=week_match.group("week"),
+            raw_text=stripped,
+        )
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_menu",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 20. generate_shopping_from_menu  `ok:generated:N:eaters=E`
+# ---------------------------------------------------------------------------
+
+
+class GenerateShoppingFromMenuOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["generated"] = "generated"
+    generated_count: int = Field(ge=0)
+    eaters: int = Field(ge=0)
+    """``eaters`` = headcount from family-members table used as the
+    ingredient-scaling multiplier (housewife_chat_tools.py:1454). 0 is
+    the «no family configured» fallback path."""
+
+
+GenerateShoppingFromMenuOutput = Annotated[
+    Union[GenerateShoppingFromMenuOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_GEN_SHOPPING_RE = re.compile(
+    r"^ok:generated:(?P<n>\d+):eaters=(?P<e>\d+)$"
+)
+
+
+def parse_generate_shopping_from_menu(
+    raw: str,
+) -> GenerateShoppingFromMenuOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _GEN_SHOPPING_RE.match(raw.strip())
+    if m is not None:
+        return GenerateShoppingFromMenuOk(
+            generated_count=int(m.group("n")),
+            eaters=int(m.group("e")),
+        )
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="generate_shopping_from_menu",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 21. clear_menu     `ok:cleared:N`
+# ---------------------------------------------------------------------------
+
+
+class ClearMenuOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["cleared"] = "cleared"
+    cleared_count: int = Field(ge=0)
+
+
+ClearMenuOutput = Annotated[
+    Union[ClearMenuOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_CLEAR_MENU_RE = re.compile(r"^ok:cleared:(?P<n>\d+)$")
+
+
+def parse_clear_menu(
+    raw: str,
+) -> ClearMenuOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _CLEAR_MENU_RE.match(raw.strip())
+    if m is not None:
+        return ClearMenuOk(cleared_count=int(m.group("n")))
+    return ToolOutputContractViolation(
+        raw_output=raw, tool_name="clear_menu",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -1125,6 +1370,11 @@ PARSERS = {
     "save_recipes_batch": parse_save_recipes_batch,
     "search_recipes": parse_search_recipes,
     "delete_recipe": parse_delete_recipe,
+    "plan_week_menu": parse_plan_week_menu,
+    "update_menu_item": parse_update_menu_item,
+    "list_menu": parse_list_menu,
+    "generate_shopping_from_menu": parse_generate_shopping_from_menu,
+    "clear_menu": parse_clear_menu,
 }
 
 

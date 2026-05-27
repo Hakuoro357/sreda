@@ -391,6 +391,28 @@ RecipeId = Annotated[
 """Recipe id — ``rec_<24 hex chars>`` (``housewife_recipes.py:217/353``)."""
 
 
+MenuPlanId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=rf"^menu_{_HEX24}$",
+    ),
+]
+"""Weekly menu plan id — ``menu_<24 hex chars>``
+(``housewife_menu.py:138``)."""
+
+
+MenuItemId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=rf"^mpi_{_HEX24}$",
+    ),
+]
+"""Menu plan item id (one cell = day×meal) — ``mpi_<24 hex chars>``
+(``housewife_menu.py:164,182,243``)."""
+
+
 # ---------------------------------------------------------------------------
 # Reminders family — date/time + recurrence aliases.
 #
@@ -529,6 +551,8 @@ __all__ = [
     "AddQuantityText",
     "CategoryName",
     "ChecklistId",
+    "MenuItemId",
+    "MenuPlanId",
     "NonBlankStr",
     "QuantityText",
     "RecipeId",
