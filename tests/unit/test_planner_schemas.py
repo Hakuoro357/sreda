@@ -586,3 +586,133 @@ def test_plan_clarity_reason_with_clear_is_allowed_but_unused() -> None:
     )
     assert plan.clarity == "clear"
     assert plan.clarity_reason is not None
+
+
+# ---------------------------------------------------------------------------
+# Plan.clarity stricter validation — Codex Sub-A-77 #2 R1 fixes
+# ---------------------------------------------------------------------------
+
+
+def test_plan_needs_clarification_with_llm_compose_rejected() -> None:
+    """LLM-path compose would let the model free-text its own reply,
+    undermining the deterministic clarification ask. Must reject."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="не указано время",
+            actions={},
+            compose=ComposerCall(
+                kind="llm",
+                llm_prompt_key="generic_followup",
+            ),
+        )
+    assert "kind" in str(exc.value)
+
+
+def test_plan_needs_clarification_with_non_clarification_template_rejected() -> None:
+    """Pointing the composer at a success/error template while
+    claiming needs_clarification = lying to the executor. Allowlist
+    catches it (Codex R1 MAJOR #2)."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="needs_clarification",
+            clarity_reason="что-то непонятное",
+            actions={},
+            compose=ComposerCall(
+                kind="template",
+                template_id="recipe_show",  # success template, not an ask
+            ),
+        )
+    msg = str(exc.value)
+    assert "template_id" in msg
+    # Allowlist contents leaked into error message for caller hints.
+    assert "ask_user_for_clarification" in msg
+
+
+def test_plan_needs_clarification_with_partial_with_clarification_accepted() -> None:
+    """Mixed-mode template — explicitly added to handle the "some
+    actions ran, others need clarification" case the simpler
+    ask_when_to_remind doesn't acknowledge."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время для напоминания",
+        actions={
+            "s1": Action(
+                tool="add_shopping_items",
+                args={"items": ["молоко"]},
+                expected_outcomes=[OutcomeBranch(match={"status": "added"})],
+            ),
+        },
+        compose=ComposerCall(
+            kind="template",
+            template_id="partial_with_clarification",
+            template_data={
+                "done_summary": "добавила молоко в покупки",
+                "missing_fields": ["time"],
+            },
+        ),
+    )
+    assert plan.compose.template_id == "partial_with_clarification"
+
+
+def test_plan_clarity_reason_auto_merged_into_template_data() -> None:
+    """Codex R1 MAJOR #1 — if planner sets Plan.clarity_reason but
+    forgets compose.template_data['clarity_reason'], schema fills it
+    in automatically so composer template doesn't fall back to the
+    generic «Не до конца поняла запрос»."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="не указано время напоминания",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={"missing_fields": ["time"]},  # no clarity_reason
+        ),
+    )
+    assert plan.compose.template_data["clarity_reason"] == (
+        "не указано время напоминания"
+    )
+
+
+def test_plan_caller_can_override_clarity_reason_in_template_data() -> None:
+    """Auto-merge is a SOFT default — if caller wants a softer
+    user-facing phrasing distinct from the machine-facing internal
+    reason, their value wins."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="needs_clarification",
+        clarity_reason="missing required argument time_iso",
+        actions={},
+        compose=ComposerCall(
+            kind="template",
+            template_id="ask_user_for_clarification",
+            template_data={
+                "clarity_reason": "не успела расслышать время",
+                "missing_fields": ["time"],
+            },
+        ),
+    )
+    # Caller override preserved, NOT overwritten with the machine-facing
+    # Plan-level reason.
+    assert plan.compose.template_data["clarity_reason"] == (
+        "не успела расслышать время"
+    )
+    # Plan-level reason still available for telemetry / GEPA.
+    assert plan.clarity_reason == "missing required argument time_iso"
+
+
+def test_clarification_template_ids_constant_shape() -> None:
+    """CLARIFICATION_TEMPLATE_IDS is the single source of truth —
+    keep it as a frozenset so callers can't accidentally mutate it
+    at runtime."""
+    from sreda.runtime.planner.schemas import CLARIFICATION_TEMPLATE_IDS
+    assert isinstance(CLARIFICATION_TEMPLATE_IDS, frozenset)
+    # Specific elements verified — if anyone removes one, CI catches it.
+    assert "ask_user_for_clarification" in CLARIFICATION_TEMPLATE_IDS
+    assert "ask_when_to_remind" in CLARIFICATION_TEMPLATE_IDS
+    assert "partial_with_clarification" in CLARIFICATION_TEMPLATE_IDS

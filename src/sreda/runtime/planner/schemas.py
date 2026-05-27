@@ -46,6 +46,24 @@ default), only field-level type checks remain strict.
 """
 
 
+CLARIFICATION_TEMPLATE_IDS: frozenset[str] = frozenset({
+    "ask_user_for_clarification",
+    "ask_when_to_remind",
+    "partial_with_clarification",
+})
+"""Composer templates that are valid for ``clarity='needs_clarification'``.
+
+Codex Sub-A-77 #2 R1 MAJOR #2 — without an allowlist, planner could
+emit ``clarity='needs_clarification'`` while pointing the composer at a
+success/error/LLM-narrative template, defeating the whole point of the
+clarification contract (user wouldn't see the ask). This set is the
+single source of truth — kept in sync with templates registered in
+``services/composer/templates_housewife.py``. CI test
+``test_composer_registry.py::test_clarification_template_ids_match_schemas``
+asserts the lists agree.
+"""
+
+
 class TurnClassification(BaseModel):
     """Whether the current user message starts a new conversation turn.
 
@@ -176,9 +194,22 @@ class Plan(BaseModel):
           non-empty ``actions``. Empty actions with clear=clarity would
           mean "I have nothing to do AND I'm not asking" — a no-op
           plan that produces no user-visible work.
-        - ``clarity='needs_clarification'`` requires a non-empty
-          ``clarity_reason`` so the composer can surface WHY we're
-          asking (template-rendered, no LLM call).
+        - ``clarity='needs_clarification'`` requires:
+          * non-empty ``clarity_reason`` (composer renders it as the ask)
+          * ``compose.kind == 'template'`` (LLM-path would let the model
+            free-text its own reply, undermining the deterministic ask)
+          * ``compose.template_id`` ∈ CLARIFICATION_TEMPLATE_IDS
+            (Codex Sub-A-77 #2 R1 MAJOR #2 — without allowlist, planner
+            could emit needs_clarification while pointing at a success
+            template, defeating the contract)
+
+        Also auto-merges ``clarity_reason`` into
+        ``compose.template_data['clarity_reason']`` if not already set
+        (Codex Sub-A-77 #2 R1 MAJOR #1 — without auto-merge, planner
+        had to remember to duplicate the reason in two places; missing
+        either left the user with the generic fallback opener).
+        Caller can still override by setting their own value in
+        ``template_data`` — auto-merge is soft default, not magic.
         """
         if self.clarity == "clear" and len(self.actions) == 0:
             raise ValueError(
@@ -193,6 +224,31 @@ class Plan(BaseModel):
                     "Plan(clarity='needs_clarification') requires a "
                     "non-empty clarity_reason explaining what's "
                     "ambiguous about the user request."
+                )
+            if self.compose.kind != "template":
+                raise ValueError(
+                    "Plan(clarity='needs_clarification') requires "
+                    "compose.kind='template' — the clarification ask "
+                    "must be a deterministic template render, not an "
+                    "LLM-generated response. Got kind="
+                    f"{self.compose.kind!r}."
+                )
+            if self.compose.template_id not in CLARIFICATION_TEMPLATE_IDS:
+                raise ValueError(
+                    f"Plan(clarity='needs_clarification') requires "
+                    f"compose.template_id in "
+                    f"{sorted(CLARIFICATION_TEMPLATE_IDS)}. "
+                    f"Got template_id={self.compose.template_id!r}. "
+                    "Use ask_user_for_clarification (generic), "
+                    "ask_when_to_remind (reminder-specific time ask), "
+                    "or partial_with_clarification (mixed: some "
+                    "actions executed, others need uncertainty resolved)."
+                )
+            # Soft auto-merge — only fills in if caller didn't already
+            # set their own (possibly differently-phrased) value.
+            if "clarity_reason" not in self.compose.template_data:
+                self.compose.template_data["clarity_reason"] = (
+                    self.clarity_reason
                 )
         return self
 

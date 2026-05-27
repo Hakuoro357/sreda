@@ -99,6 +99,30 @@ _ASK_WHEN_TO_REMIND = (
     "А когда напомнить — сегодня, завтра, или конкретная дата?"
 )
 
+# Mixed mode — some actions ran successfully, others need clarification.
+# Codex Sub-A-77 #2 R1 MAJOR #3 — without this template, mixed-mode plans
+# would silently drop the acknowledgement of completed actions, leaving
+# the user wondering whether their request was processed.
+_PARTIAL_WITH_CLARIFICATION = (
+    "{% if done_summary is defined and done_summary %}"
+    "Сделала: {{ done_summary }}.\n\n"
+    "{% endif %}"
+    "{% if clarity_reason is defined and clarity_reason %}"
+    "{{ clarity_reason }}.{% else %}"
+    "Не до конца поняла остальное.{% endif %}"
+    "{% if missing_fields is defined and missing_fields %}"
+    "\n\nУточни{% if missing_fields|length > 1 %} пару моментов{% endif %}:"
+    "{% for field in missing_fields %}"
+    "{% if field == 'time' %}\n— когда (сегодня, завтра, конкретная дата + время)"
+    "{% elif field == 'recipient' %}\n— кому напомнить (тебе или другому)"
+    "{% elif field == 'items' %}\n— что именно (несколько слов для уточнения)"
+    "{% elif field == 'quantity' %}\n— сколько (количество или объём)"
+    "{% else %}\n— {{ field }}"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% endif %}"
+)
+
 # ---------------------------------------------------------------------------
 # Error / partial / fallback
 # ---------------------------------------------------------------------------
@@ -139,9 +163,10 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     # recipes
     "recipe_show": _RECIPE_SHOW,
     "recipe_not_found_ask_alt": _RECIPE_NOT_FOUND_ASK_ALT,
-    # clarification (Plan.clarity=needs_clarification — vex-assistant#77 #7)
+    # clarification (Plan.clarity=needs_clarification — vex-assistant#77 #7 + #2)
     "ask_user_for_clarification": _ASK_USER_FOR_CLARIFICATION,
     "ask_when_to_remind": _ASK_WHEN_TO_REMIND,
+    "partial_with_clarification": _PARTIAL_WITH_CLARIFICATION,
     # error / fallback
     "generic_tool_error": _GENERIC_TOOL_ERROR,
     "partial_with_compose_error": _PARTIAL_WITH_COMPOSE_ERROR,

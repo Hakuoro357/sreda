@@ -130,11 +130,29 @@ def test_default_registry_covers_expected_housewife_ids() -> None:
         # clarification (vex-assistant#77 item #7)
         "ask_user_for_clarification",
         "ask_when_to_remind",
+        "partial_with_clarification",
         # error / fallback
         "generic_tool_error",
         "partial_with_compose_error",
     }
     assert set(REGISTRY.template_ids()) >= expected
+
+
+def test_clarification_template_ids_match_schema_allowlist() -> None:
+    """Codex Sub-A-77 #2 R1 — schema's CLARIFICATION_TEMPLATE_IDS
+    allowlist and the actual registered templates must agree. If they
+    drift, a planner emitting clarity='needs_clarification' could
+    point at a template name in the allowlist that isn't registered
+    → UnknownTemplateError at render time instead of validation time."""
+    from sreda.runtime.planner.schemas import CLARIFICATION_TEMPLATE_IDS
+
+    registered = set(REGISTRY.template_ids())
+    for tid in CLARIFICATION_TEMPLATE_IDS:
+        assert tid in registered, (
+            f"CLARIFICATION_TEMPLATE_IDS lists {tid!r} but composer "
+            f"registry does not have it. Register the template in "
+            f"templates_housewife.py or remove from the allowlist."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +321,73 @@ def test_render_ask_user_for_clarification_empty_data() -> None:
     out = render("ask_user_for_clarification", {})
     assert "Не до конца поняла" in out
     assert "подробнее" in out
+
+
+# ---------------------------------------------------------------------------
+# Mixed-mode clarification: done_summary + ask in the same reply
+# (Codex Sub-A-77 #2 R1 MAJOR #3 — without this, mixed-mode plans
+# dropped acknowledgement of completed actions)
+# ---------------------------------------------------------------------------
+
+
+def test_render_partial_with_clarification_full() -> None:
+    """Happy path — actions executed AND clarification needed for the rest."""
+    out = render(
+        "partial_with_clarification",
+        {
+            "done_summary": "добавила молоко в покупки",
+            "clarity_reason": "не указано время для напоминания",
+            "missing_fields": ["time"],
+        },
+    )
+    assert "Сделала: добавила молоко в покупки" in out
+    assert "не указано время для напоминания" in out
+    assert "когда" in out
+
+
+def test_render_partial_with_clarification_done_only() -> None:
+    """Edge case — done_summary present but no clarification fields.
+    Weird usage (probably planner bug — why use this template?) but
+    should still render without crash."""
+    out = render(
+        "partial_with_clarification",
+        {"done_summary": "добавила хлеб"},
+    )
+    assert "Сделала: добавила хлеб" in out
+    # Generic opener falls back when clarity_reason missing.
+    assert "Не до конца поняла" in out
+
+
+def test_render_partial_with_clarification_clarify_only() -> None:
+    """Edge case — no actions ran (executor short-circuited or planner
+    used wrong template), only the clarification part renders. Should
+    behave like ask_user_for_clarification."""
+    out = render(
+        "partial_with_clarification",
+        {
+            "clarity_reason": "не указано время",
+            "missing_fields": ["time"],
+        },
+    )
+    assert "Сделала:" not in out
+    assert "не указано время" in out
+    assert "когда" in out
+
+
+def test_render_partial_with_clarification_multiple_fields() -> None:
+    """Two+ missing fields → plural «пару моментов»."""
+    out = render(
+        "partial_with_clarification",
+        {
+            "done_summary": "записала молоко",
+            "clarity_reason": "уточни ещё пару вещей",
+            "missing_fields": ["time", "recipient"],
+        },
+    )
+    assert "Сделала: записала молоко" in out
+    assert "пару моментов" in out
+    assert "когда" in out
+    assert "кому напомнить" in out
 
 
 def test_render_generic_tool_error() -> None:
