@@ -771,39 +771,48 @@ def test_link_task_conflict_error_codes_are_stable(raw, expected_code):
 
 
 def test_link_task_not_found_remapped_to_task() -> None:
-    """Codex R2 MAJOR (prior-not-closed): generic `not_found` got
-    split into task vs checklist for planner branchability."""
+    """Codex R3 MINOR: use ACTUAL runtime shape from
+    ``TaskService.link_to_checklist`` (tasks.py:238) — emits
+    ``("error:not_found", "task_not_found")`` → chat_tool wraps to
+    ``error:not_found: task_not_found``. Pre-R3 test used a fictional
+    prose string; brittle to runtime wording changes."""
     parsed = parse_tool_output(
         "link_task_to_checklist",
-        "error: not_found: task X is missing",
+        "error:not_found: task_not_found",
     )
     assert isinstance(parsed, HousewifeToolError)
     assert parsed.error_code == "link_task_not_found"
 
 
 def test_link_task_not_found_remapped_to_checklist() -> None:
+    """Actual runtime shape from tasks.py:250 — ``("error:not_found",
+    "checklist_not_found")`` → ``error:not_found: checklist_not_found``."""
     parsed = parse_tool_output(
         "link_task_to_checklist",
-        "error: not_found: checklist Y is missing",
+        "error:not_found: checklist_not_found",
     )
     assert isinstance(parsed, HousewifeToolError)
     assert parsed.error_code == "link_checklist_not_found"
 
 
 def test_link_task_not_found_ambiguous_keeps_generic_code() -> None:
-    """If the info mentions both task AND checklist (or neither),
-    keep the ambiguous code so the planner asks the user."""
+    """Fictional shape — if runtime ever emits a both-keywords or
+    no-keyword `not_found:...`, planner gets the ambiguous code
+    and asks the user. Defensive coverage."""
     parsed = parse_tool_output(
         "link_task_to_checklist",
-        "error: not_found: relation between task X and checklist Y broken",
+        "error:not_found: relation between task X and checklist Y broken",
     )
     assert isinstance(parsed, HousewifeToolError)
     assert parsed.error_code == "link_target_not_found"
 
 
 def test_link_task_archived_stable_code() -> None:
+    """Actual runtime shape from tasks.py:252 — ``("error:archived",
+    f"checklist_status={chk.status}")`` → ``error:archived:
+    checklist_status=archived``."""
     parsed = parse_tool_output(
-        "link_task_to_checklist", "error: archived: checklist inactive",
+        "link_task_to_checklist", "error:archived: checklist_status=archived",
     )
     assert isinstance(parsed, HousewifeToolError)
     assert parsed.error_code == "checklist_archived"
@@ -846,6 +855,44 @@ def test_list_tasks_parser_notes_with_middot() -> None:
     parsed = parse_tool_output("list_tasks", raw)
     assert isinstance(parsed, ListTasksOk)
     assert parsed.tasks[0].notes == "шаг 1 · шаг 2 · шаг 3"
+
+
+def test_list_tasks_parser_documented_limitation_title_lookalike() -> None:
+    """Codex R3 MAJOR (acknowledged fundamental limitation):
+    `_fmt_task_for_llm` emits unescaped ` · ` between segments
+    AND title comes from free-form user input. If a real user
+    types «купить · status=blocked» as a title, the parser
+    cannot tell user content from a real `status=blocked` segment.
+
+    This is the same class of ambiguity Codex R2 #4 raised — solving
+    it fully requires either machine-readable output (JSON / TLV) or
+    escaping `·` in user content at runtime. Both are runtime
+    changes; Sub-A4 boundary stops at planner contracts.
+
+    DOCUMENTED LIMITATION (Phase B follow-up):
+    - If title ENDS with ` · status=...` (or any known suffix
+      prefix), the parser claims that suffix and shortens title.
+    - The planner may receive runtime_status=`blocked` (rejected
+      as bad-runtime-status → ContractViolation) for a task that
+      really had pending status and user-typed title.
+
+    This test pins the current behavior so future fixes are
+    explicit. Fix path: emit `_fmt_task_for_llm` as JSON, OR
+    escape `·` in title/notes at runtime, OR add explicit
+    segment markers.
+    """
+    # User-typed title that LOOKS LIKE a status segment.
+    raw = f"[{TASK_A}] · купить · status=completed"
+    parsed = parse_tool_output("list_tasks", raw)
+    # Current (limited) behavior: parses as status=completed,
+    # title='купить'. The planner sees runtime_status=completed
+    # for what was actually a pending task with funny title.
+    assert isinstance(parsed, ListTasksOk)
+    assert parsed.tasks[0].title == "купить"
+    assert parsed.tasks[0].runtime_status == "completed"
+    # When this test starts failing because the fix landed, update
+    # it to assert ContractViolation OR the correct interpretation
+    # (title='купить · status=completed', runtime_status=None).
 
 
 def test_list_tasks_ok_allows_empty_tasks_list() -> None:
