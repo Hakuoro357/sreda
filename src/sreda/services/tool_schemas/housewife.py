@@ -768,6 +768,89 @@ def parse_clear_bought_shopping(
 
 
 # ---------------------------------------------------------------------------
+# 11. update_reminder           `ok:updated:rem_<id>:<iso>` | `:none`
+#                               | error: reminder 'X' not found
+#                               | error: cannot parse trigger_iso=...
+# ---------------------------------------------------------------------------
+
+
+class UpdateReminderOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["updated"] = "updated"
+    reminder_id: ReminderId
+    next_trigger_at_iso: str | None = None
+    """ISO-8601 of the next scheduled fire after the update. ``None``
+    when the recurrence was cleared and no future trigger remains
+    (legacy emits the literal ``"none"`` which the parser maps here)."""
+
+
+UpdateReminderOutput = Annotated[
+    Union[UpdateReminderOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+_UPDATE_REMINDER_RE = re.compile(
+    r"^ok:updated:(?P<id>rem_[^:\s]+):(?P<next>.+)$"
+)
+
+
+def parse_update_reminder(
+    raw: str,
+) -> UpdateReminderOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _UPDATE_REMINDER_RE.match(raw.strip())
+    if m is not None:
+        next_at_raw = m.group("next").strip()
+        next_at = None if next_at_raw == "none" else next_at_raw
+        try:
+            return UpdateReminderOk(
+                reminder_id=m.group("id"),
+                next_trigger_at_iso=next_at,
+            )
+        except ValidationError:
+            # Tight rem_<24 hex> alias rejected — fail-closed.
+            pass
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="update_reminder",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. cancel_reminder           `ok:cancelled` | error: reminder 'X' not found
+# ---------------------------------------------------------------------------
+
+
+class CancelReminderOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["cancelled"] = "cancelled"
+
+
+CancelReminderOutput = Annotated[
+    Union[CancelReminderOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_cancel_reminder(
+    raw: str,
+) -> CancelReminderOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    if raw.strip() == "ok:cancelled":
+        return CancelReminderOk()
+    return ToolOutputContractViolation(
+        raw_output=raw,
+        tool_name="cancel_reminder",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -783,6 +866,8 @@ PARSERS = {
     "update_shopping_item": parse_update_shopping_item,
     "update_shopping_items_category": parse_update_shopping_items_category,
     "clear_bought_shopping": parse_clear_bought_shopping,
+    "update_reminder": parse_update_reminder,
+    "cancel_reminder": parse_cancel_reminder,
 }
 
 
