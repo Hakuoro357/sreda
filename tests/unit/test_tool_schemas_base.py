@@ -231,6 +231,76 @@ def test_tool_spec_default_allow_field_validators_is_false() -> None:
     assert spec.allow_field_validators is False
 
 
+# Codex R7 close-out: the @field_validator guard must walk NESTED
+# BaseModel input fields too. ``_validate_nested_basemodel_partial`` in
+# validator.py exercises the same TypeAdapter-bypass path on nested
+# models — a nested @field_validator would silently miss enforcement.
+
+def test_tool_spec_rejects_nested_basemodel_with_field_validator() -> None:
+    from pydantic import field_validator
+
+    class _Author(BaseModel):
+        name: str
+
+        @field_validator("name")
+        @classmethod
+        def _check_name(cls, v: str) -> str:
+            return v
+
+    class _Post(BaseModel):
+        title: str
+        author: _Author
+
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(input_model=_Post)
+    msg = str(exc.value).lower()
+    # The path should mention the nested path (author.name).
+    assert "author" in msg
+
+
+def test_tool_spec_rejects_list_of_nested_with_field_validator() -> None:
+    from pydantic import field_validator
+
+    class _Tag(BaseModel):
+        slug: str
+
+        @field_validator("slug")
+        @classmethod
+        def _check_slug(cls, v: str) -> str:
+            return v
+
+    class _Post(BaseModel):
+        title: str
+        tags: list[_Tag]
+
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(input_model=_Post)
+    msg = str(exc.value).lower()
+    # Validator should walk list[Tag] and find the nested validator.
+    assert "tags" in msg or "slug" in msg
+
+
+def test_tool_spec_rejects_optional_nested_with_field_validator() -> None:
+    from pydantic import field_validator
+
+    class _Author(BaseModel):
+        name: str
+
+        @field_validator("name")
+        @classmethod
+        def _check_name(cls, v: str) -> str:
+            return v
+
+    class _Post(BaseModel):
+        title: str
+        author: _Author | None = None
+
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(input_model=_Post)
+    msg = str(exc.value).lower()
+    assert "author" in msg
+
+
 def test_tool_spec_rejects_extra_field() -> None:
     with pytest.raises(ValidationError):
         ToolSpec(  # type: ignore[call-arg]

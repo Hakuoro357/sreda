@@ -30,19 +30,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sreda.services.tool_schemas.families import FAMILY_HEADERS, Family
 
 
-def _collect_field_validator_names(model: type[BaseModel]) -> set[str]:
-    """Return the set of fields covered by ``@field_validator`` decorators
-    on ``model``. Empty set when there are none.
-
-    Pydantic v2 stores decorator metadata in
-    ``model.__pydantic_decorators__.field_validators`` — a dict keyed by
-    method name with values carrying ``info.fields`` (tuple of target
-    field names). The introspection is intentionally narrow (only
-    ``field_validators``, not ``model_validators`` — those are
-    cross-field and already documented-deferred via R1 MAJOR #4).
-
-    Returns empty if the model has no ``@field_validator`` or pydantic's
-    internal structure differs from v2.x.
+def _direct_field_validator_names(model: type[BaseModel]) -> set[str]:
+    """Field names covered by ``@field_validator`` decorators on
+    ``model`` itself (NOT recursive). Helper for the public recursive
+    walker.
     """
 
     decorators = getattr(model, "__pydantic_decorators__", None)
@@ -58,6 +49,100 @@ def _collect_field_validator_names(model: type[BaseModel]) -> set[str]:
         if fields:
             covered.update(fields)
     return covered
+
+
+def _collect_field_validator_names(
+    model: type[BaseModel],
+    _prefix: str = "",
+    _seen: set[type] | None = None,
+) -> set[str]:
+    """Recursively collect dotted paths to fields covered by
+    ``@field_validator`` decorators anywhere in ``model``'s field
+    graph — top-level, in nested ``BaseModel`` subclasses, wrapped in
+    ``Optional`` / ``Annotated`` / containers.
+
+    Codex Sub-A-77 item #4 R7 MAJOR: the validator's
+    ``_validate_nested_basemodel_partial`` path uses TypeAdapter and
+    bypasses ``@field_validator`` declared on nested models too. Guard
+    must walk every nested ``BaseModel`` to be effective.
+
+    Returns paths like ``"author.full_name"`` so the error message
+    points the operator at the exact nested field. Empty set when
+    nothing is found.
+
+    Cycle-safe via ``_seen`` (handles self-referential nested models).
+    """
+
+    import typing
+    from typing import get_args, get_origin
+
+    if _seen is None:
+        _seen = set()
+    if model in _seen:
+        return set()
+    _seen = _seen | {model}
+
+    paths: set[str] = set()
+    for direct in _direct_field_validator_names(model):
+        paths.add(f"{_prefix}{direct}" if _prefix else direct)
+
+    for fname, finfo in model.model_fields.items():
+        annotation = finfo.annotation
+        for nested_cls in _iter_nested_basemodel_types(annotation):
+            sub_prefix = f"{_prefix}{fname}." if not _prefix else f"{_prefix}{fname}."
+            paths.update(
+                _collect_field_validator_names(
+                    nested_cls, _prefix=sub_prefix, _seen=_seen
+                )
+            )
+    return paths
+
+
+def _iter_nested_basemodel_types(annotation: Any):
+    """Yield every ``BaseModel`` subclass found by unwrapping
+    ``Annotated`` / ``Optional`` / ``Union`` and peeling builtin
+    containers (``list[T]`` / ``dict[K,V]`` / ``tuple[T,...]`` / ``set[T]``).
+
+    Used by ``_collect_field_validator_names`` to walk the nested-model
+    graph. Stops at non-BaseModel concrete types (won't recurse into
+    int, str, etc.). Returns concrete classes only (not generic origins).
+    """
+
+    import types as _types
+    import typing as _typing
+    from typing import get_args, get_origin
+
+    origin = get_origin(annotation)
+    if origin is _typing.Annotated:
+        for nested in _iter_nested_basemodel_types(get_args(annotation)[0]):
+            yield nested
+        return
+    if origin is _typing.Union or origin is _types.UnionType:
+        for arg in get_args(annotation):
+            if arg is type(None):
+                continue
+            yield from _iter_nested_basemodel_types(arg)
+        return
+    if origin in (list, set, frozenset):
+        args = get_args(annotation)
+        if args:
+            yield from _iter_nested_basemodel_types(args[0])
+        return
+    if origin is tuple:
+        for arg in get_args(annotation):
+            if arg is Ellipsis:
+                continue
+            yield from _iter_nested_basemodel_types(arg)
+        return
+    if origin is dict:
+        args = get_args(annotation)
+        if len(args) >= 2:
+            # Both K and V — yield BaseModels found in either.
+            yield from _iter_nested_basemodel_types(args[0])
+            yield from _iter_nested_basemodel_types(args[1])
+        return
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        yield annotation
 
 
 _STRICT = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
