@@ -27,10 +27,41 @@ Sources of truth for the exact caps and shapes:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated
 
 from pydantic import AfterValidator, StringConstraints
+
+
+def _validate_iso_date_string(value: str) -> str:
+    """Codex Sub-A4 menu R1 MAJOR #6 — verify the regex-shape calendar
+    date is also a semantically valid date via ``date.fromisoformat``.
+
+    Catches ``2026-02-31`` / ``2026-13-01`` etc. that pass the
+    ``YYYY-MM-DD`` shape regex but would crash at runtime
+    ``_coerce_monday`` parsing.
+
+    Re-raises ``ValueError`` on failure; pydantic catches and emits
+    a ``ValidationError``.
+    """
+    date.fromisoformat(value)  # raises ValueError on impossible dates
+    return value
+
+
+IsoDateStr = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=10,
+        max_length=10,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    ),
+    AfterValidator(_validate_iso_date_string),
+]
+"""Shared ISO calendar date alias (``YYYY-MM-DD``). Use for any
+date-only field across families. Codex Sub-A4 menu R1 MAJOR #6 + MINOR #1
+fix — two-layer validation: regex shape + ``date.fromisoformat``
+semantic check catches impossible dates like ``2026-02-31``."""
 
 
 def _validate_iso_datetime_string(value: str) -> str:
@@ -551,6 +582,7 @@ __all__ = [
     "AddQuantityText",
     "CategoryName",
     "ChecklistId",
+    "IsoDateStr",
     "MenuItemId",
     "MenuPlanId",
     "NonBlankStr",

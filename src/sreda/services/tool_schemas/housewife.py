@@ -1280,10 +1280,15 @@ class GenerateShoppingFromMenuOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["generated"] = "generated"
     generated_count: int = Field(ge=0)
-    eaters: int = Field(ge=0)
+    eaters: int | None = Field(default=None, ge=1)
     """``eaters`` = headcount from family-members table used as the
-    ingredient-scaling multiplier (housewife_chat_tools.py:1454). 0 is
-    the «no family configured» fallback path."""
+    ingredient-scaling multiplier (housewife_chat_tools.py:1454).
+
+    Codex Sub-A4 menu R1 MAJOR #1: ``None`` for the early-return path
+    (housewife_chat_tools.py:1490 emits ``ok:generated:0`` without
+    ``:eaters=E``) — runtime returns this when the menu plan has no
+    convertible ingredients (free_text-only or unknown plan_id). The
+    happy path always carries ``eaters >= 1``."""
 
 
 GenerateShoppingFromMenuOutput = Annotated[
@@ -1292,8 +1297,19 @@ GenerateShoppingFromMenuOutput = Annotated[
 ]
 
 _GEN_SHOPPING_RE = re.compile(
-    r"^ok:generated:(?P<n>\d+):eaters=(?P<e>\d+)$"
+    r"^ok:generated:(?P<n>\d+)(?::eaters=(?P<e>\d+))?$"
 )
+"""Two runtime shapes (housewife_chat_tools.py:1490 vs :1504/1512):
+- ``ok:generated:0`` — early-return path when plan has no ingredients
+  to convert (no eaters segment; recipe-free plan or unknown plan_id).
+- ``ok:generated:N:eaters=E`` — happy path with explicit eaters
+  scaling.
+
+The ``ok:generated:0`` shape carries no eaters info — Codex Sub-A4
+menu R1 MAJOR #1: previously rejected as ToolOutputContractViolation.
+Now accepted; ``eaters`` is None in that variant. Composer / planner
+can disambiguate «empty-result» vs «scaled-but-zero-ingredients»
+by inspecting ``eaters is None``."""
 
 
 def parse_generate_shopping_from_menu(
@@ -1304,10 +1320,14 @@ def parse_generate_shopping_from_menu(
         return err
     m = _GEN_SHOPPING_RE.match(raw.strip())
     if m is not None:
-        return GenerateShoppingFromMenuOk(
-            generated_count=int(m.group("n")),
-            eaters=int(m.group("e")),
-        )
+        eaters_raw = m.group("e")
+        try:
+            return GenerateShoppingFromMenuOk(
+                generated_count=int(m.group("n")),
+                eaters=int(eaters_raw) if eaters_raw is not None else None,
+            )
+        except ValidationError:
+            pass
     return ToolOutputContractViolation(
         raw_output=raw, tool_name="generate_shopping_from_menu",
         timestamp=datetime.now(timezone.utc),

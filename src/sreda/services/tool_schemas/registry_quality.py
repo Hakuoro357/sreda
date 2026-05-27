@@ -390,10 +390,20 @@ def validate_mutex_note_references(
     specs: Iterable[ToolSpec],
     *,
     manifest: dict[str, str],
+    migrated_specs: Iterable[ToolSpec] | None = None,
 ) -> list[RegistryQualityViolation]:
-    """Codex Sub-A4 reminders R1 MAJOR #6 + R2 MAJOR #3/#4 — scan
-    every prompt-rendered string field of each ToolSpec for tool-name
-    tokens that exist in ``manifest`` but NOT in the migrated specs.
+    """Codex Sub-A4 reminders R1 MAJOR #6 + R2 MAJOR #3/#4 + menu R1 MAJOR #2
+    — scan every prompt-rendered string field of each ToolSpec for
+    tool-name tokens that exist in ``manifest`` but NOT in the
+    migrated specs.
+
+    Codex Sub-A4 menu R1 MAJOR #2: split «what specs are we LINTING»
+    from «what specs are MIGRATED». When ``migrated_specs`` is None,
+    falls back to old behaviour (specs ARE the migrated set). When
+    provided, ``specs`` is the per-family scope to lint and
+    ``migrated_specs`` is the full known registry — references to
+    cross-family migrated tools (e.g. menu naming
+    ``search_recipes`` from RECIPES) no longer false-positive.
 
     Mutex_notes, descriptions, and trigger_examples are all injected
     into the planner system prompt. When any of them names a sibling
@@ -427,9 +437,17 @@ def validate_mutex_note_references(
         list of violations; empty == no cross-references to
         unmigrated tools.
     """
-    # Codex R2 MAJOR #3: materialize to support generator callers.
+    # Codex R2 MAJOR #3 + menu R1 MAJOR #2: materialize once to support
+    # generator callers. ``spec_list`` is the SCOPE (what's being
+    # linted = origin of violations); ``known_names`` is the set of
+    # «available» tool names that don't trigger «unmigrated» warnings.
+    # When ``migrated_specs`` is None, the scope IS the known set
+    # (legacy single-arg behaviour).
     spec_list = list(specs)
-    spec_names = {s.name for s in spec_list}
+    if migrated_specs is None:
+        known_names = {s.name for s in spec_list}
+    else:
+        known_names = {s.name for s in migrated_specs}
     violations: list[RegistryQualityViolation] = []
     # Dedupe key: (offending_spec_or_family_name, referenced_tool_name,
     # field_path). Same token in the same field is a single finding;
@@ -442,7 +460,7 @@ def validate_mutex_note_references(
                 token = token_match.group(1)
                 if token not in manifest:
                     continue
-                if token in spec_names:
+                if token in known_names:
                     continue
                 key = (spec.name, token, field_name)
                 if key in seen:
@@ -476,7 +494,7 @@ def validate_mutex_note_references(
             token = token_match.group(1)
             if token not in manifest:
                 continue
-            if token in spec_names:
+            if token in known_names:
                 continue
             key = (f"family:{family}", token, field_name)
             if key in seen:
@@ -554,9 +572,17 @@ def assert_production_registry_quality(specs: Iterable[ToolSpec]) -> None:
     # construction in some test paths; importing families at module
     # top would create a cycle.
     from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+    from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
+    # Codex Sub-A4 menu R1 MAJOR #2: when callers pass a per-family
+    # subset (e.g. ``assert_production_registry_quality(MENU_SPECS)``),
+    # treat MIGRATED_TOOL_SPECS as the «known available» set so cross-
+    # family references don't false-positive. When the caller passes
+    # the full MIGRATED set, that's its own known set.
     validations.extend(
         validate_mutex_note_references(
-            spec_list, manifest=TOOL_FAMILY_MANIFEST
+            spec_list,
+            manifest=TOOL_FAMILY_MANIFEST,
+            migrated_specs=MIGRATED_TOOL_SPECS,
         )
     )
     if validations:

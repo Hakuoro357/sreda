@@ -17,10 +17,11 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.common import (
+    IsoDateStr,
     MenuPlanId,
     RecipeId,
 )
@@ -38,22 +39,17 @@ from sreda.services.tool_schemas.housewife import (
 # ---------------------------------------------------------------------------
 
 
-WeekStartIso = Annotated[
-    str,
-    # YYYY-MM-DD shape. Service normalises ANY day-of-week in the
-    # target week to its Monday, so we accept any ISO date and let
-    # the runtime do the snap-to-Monday.
-    StringConstraints(
-        strip_whitespace=True,
-        min_length=10,
-        max_length=10,
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-    ),
-]
-"""ISO calendar date ``YYYY-MM-DD``. ``plan_week_menu`` /
-``update_menu_item`` / ``list_menu`` / ``clear_menu`` accept ANY day
-within the target week — runtime snaps to Monday. We validate shape
-at planner time; the snap-to-Monday stays runtime business."""
+WeekStartIso = IsoDateStr
+"""ISO calendar date ``YYYY-MM-DD`` for the target week. ``plan_week_menu``
+/ ``update_menu_item`` / ``list_menu`` / ``clear_menu`` accept ANY
+day within the target week — runtime ``_coerce_monday`` snaps to
+Monday.
+
+Codex Sub-A4 menu R1 MAJOR #6: previously a local regex-only alias
+that accepted impossible dates like ``2026-02-31``. Now uses the
+shared ``IsoDateStr`` from common.py which adds an
+``AfterValidator(date.fromisoformat)`` to catch semantic errors at
+planner-input time."""
 
 
 DayOfWeek = Annotated[int, Field(ge=0, le=6)]
@@ -93,15 +89,31 @@ WeekNotes = Annotated[
 
 
 class MenuCellInput(BaseModel):
-    """One cell in the weekly grid — meal type × day. EITHER
-    ``recipe_id`` OR ``free_text``, not both (docstring contract at
-    housewife_chat_tools.py:1268-1269 — runtime drops free_text when
-    recipe_id is set, but we enforce exclusivity at planner time)."""
+    """One cell in the weekly grid — meal type × day.
+
+    Codex Sub-A4 menu R1 MAJOR #4: EITHER ``recipe_id`` OR
+    ``free_text``, NOT both. Runtime silently drops free_text when
+    recipe_id is set (housewife_chat_tools.py:1268-1269) — the
+    silent-drop hides the planner's confusion, so we reject at
+    schema time. Both ``None`` is allowed (explicit clear; same
+    semantics as ``UpdateMenuItemInput`` with both None).
+    """
 
     model_config = ConfigDict(extra="forbid")
     recipe_id: RecipeId | None = None
     free_text: FreeText | None = None
     notes: CellNotes | None = None
+
+    @model_validator(mode="after")
+    def _validate_recipe_xor_free_text(self) -> "MenuCellInput":
+        if self.recipe_id is not None and self.free_text is not None:
+            raise ValueError(
+                "MenuCellInput accepts EITHER recipe_id OR free_text, "
+                "not both. Runtime would silently drop free_text and "
+                "the planner would think the free_text version was "
+                "stored. Pick one and omit the other."
+            )
+        return self
 
 
 class MenuDayInput(BaseModel):
@@ -115,11 +127,17 @@ class MenuDayInput(BaseModel):
 
 
 class PlanWeekMenuInput(BaseModel):
-    """Create (or REPLACE) the weekly menu.
+    """Upsert the weekly menu — preserve-merge semantics.
 
-    Heavy composite call — planner generates up to 28 cells (7×4) in
-    one shot. Runtime overwrites any existing plan for ``week_start``
-    completely (docstring contract).
+    Codex Sub-A4 menu R1 MAJOR #3: the chat_tools docstring said
+    «ПОЛНОСТЬЮ ПЕРЕЗАПИСЫВАЕТ» but the underlying service
+    (``HousewifeMenuService.plan_week`` at housewife_menu.py:105-122)
+    actually preserves unspecified slots — partial payloads only
+    overwrite the slots they mention. Aligned wording with runtime.
+
+    Codex Sub-A4 menu R1 MAJOR #5: ``day_of_week`` must be unique
+    across the days list — duplicates would create double
+    MenuPlanItems (no DB unique constraint on (plan, day, meal)).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -127,10 +145,30 @@ class PlanWeekMenuInput(BaseModel):
     days: list[MenuDayInput] = Field(min_length=1, max_length=7)
     notes: WeekNotes | None = None
 
+    @model_validator(mode="after")
+    def _validate_unique_day_of_week(self) -> "PlanWeekMenuInput":
+        seen: dict[int, int] = {}
+        for idx, day in enumerate(self.days):
+            if day.day_of_week in seen:
+                first = seen[day.day_of_week]
+                raise ValueError(
+                    f"days[{idx}].day_of_week={day.day_of_week} duplicates "
+                    f"days[{first}]. Each day of the week may appear at "
+                    f"most once — runtime would create duplicate "
+                    f"MenuPlanItems and break list/render."
+                )
+            seen[day.day_of_week] = idx
+        return self
+
 
 class UpdateMenuItemInput(BaseModel):
-    """Point-edit a single cell. ``recipe_id`` / ``free_text`` both
-    ``None`` clears the cell (housewife_chat_tools.py:1336)."""
+    """Point-edit a single cell.
+
+    Codex Sub-A4 menu R1 MAJOR #4: same recipe_id XOR free_text
+    rule as ``MenuCellInput``. Both ``None`` clears the cell
+    (housewife_chat_tools.py:1336) — that's the only legit «both
+    absent» case.
+    """
 
     model_config = ConfigDict(extra="forbid")
     plan_id: MenuPlanId
@@ -139,6 +177,16 @@ class UpdateMenuItemInput(BaseModel):
     recipe_id: RecipeId | None = None
     free_text: FreeText | None = None
     notes: CellNotes | None = None
+
+    @model_validator(mode="after")
+    def _validate_recipe_xor_free_text(self) -> "UpdateMenuItemInput":
+        if self.recipe_id is not None and self.free_text is not None:
+            raise ValueError(
+                "UpdateMenuItemInput accepts EITHER recipe_id OR "
+                "free_text, not both. Runtime would silently drop "
+                "free_text. Pick one (or both None to clear the cell)."
+            )
+        return self
 
 
 class ListMenuInput(BaseModel):
@@ -172,12 +220,12 @@ class ClearMenuInput(BaseModel):
 PLAN_WEEK_MENU_SPEC = ToolSpec(
     name="plan_week_menu",
     description=(
-        "Создать (или ПЕРЕЗАПИСАТЬ) недельное меню юзера: 7 дней × до 4 "
-        "приёмов пищи (breakfast/lunch/dinner/snack). ПЕРЕД вызовом "
-        "поищи в книге рецептов чтобы ≥50% ячеек ссылались на recipe_id "
-        "(а не free_text). Если уже есть план на week_start — полностью "
-        "перезапишется. Для точечной правки одной ячейки — "
-        "update_menu_item."
+        "Создать или ОБНОВИТЬ недельное меню юзера: 7 дней × до 4 "
+        "приёмов пищи (breakfast/lunch/dinner/snack). PRESERVE-MERGE: "
+        "ячейки, которые ты ПЕРЕДАЁШЬ, переписываются; ячейки, которые "
+        "ты НЕ передаёшь, остаются как были. Для полной очистки старого "
+        "меню сначала clear_menu, потом plan_week_menu. ПЕРЕД вызовом "
+        "поищи в книге рецептов чтобы ≥50% ячеек ссылались на recipe_id."
     ),
     family="menu",
     effect="write",
@@ -192,9 +240,9 @@ PLAN_WEEK_MENU_SPEC = ToolSpec(
         "сделай план питания на неделю",
     ],
     mutex_notes=[
-        "ПЕРЕЗАПИСЫВАЕТ всю неделю. Для одной ячейки — update_menu_item, не plan_week_menu с одним днём.",
+        "PRESERVE-MERGE: переданные ячейки перезаписываются, остальные сохраняются. Для одной ячейки — update_menu_item. Для полной очистки — clear_menu, затем заново plan_week_menu.",
         "Перед вызовом — search_recipes('') чтобы видеть книгу и ссылаться на recipe_id.",
-        "Для генерации списка покупок из меню — generate_shopping_from_menu (после plan_week_menu).",
+        "Для генерации покупок из меню — generate_shopping_from_menu.",
     ],
     timeout_seconds=30,
     side_effect_class="transactional_write",

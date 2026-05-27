@@ -67,23 +67,13 @@ def test_menu_specs_pass_strict_quality_lint() -> None:
 
 
 def test_menu_specs_pass_assert_production_gate() -> None:
-    """Menu specs legitimately reference cross-family tools by name
-    (search_recipes from RECIPES, add_shopping_items from SHOPPING)
-    in mutex_notes. ``assert_production_registry_quality`` calls the
-    mutex-note linter scoped to the passed-in spec list, so calling
-    it with MENU_SPECS alone surfaces false-positive «unmigrated»
-    violations for the cross-family references. Use the family-
-    scoped policy check (``validate_tool_registry_quality``) here;
-    the cross-family lint is exercised by
-    ``test_migrated_tool_specs_pass_strict_with_menu``."""
-    from sreda.services.tool_schemas.registry_quality import (
-        InvalidRegistryError,
-    )
-    violations = validate_tool_registry_quality(
-        MENU_SPECS, strict=True
-    )
-    if violations:
-        raise InvalidRegistryError(violations)
+    """Codex Sub-A4 menu R1 MAJOR #2 closure: with the
+    ``migrated_specs`` API extension on
+    ``validate_mutex_note_references``, ``assert_production_registry_quality``
+    now treats MIGRATED_TOOL_SPECS as the «known available» set when
+    linting a per-family subset. Cross-family references (menu →
+    search_recipes/add_shopping_items) no longer false-positive."""
+    assert_production_registry_quality(MENU_SPECS)
 
 
 def test_menu_specs_no_intra_family_unmigrated_references() -> None:
@@ -328,13 +318,28 @@ def test_generate_shopping_from_menu_parser_returns_generated() -> None:
     assert parsed.eaters == 4
 
 
-def test_generate_shopping_from_menu_parser_zero_eaters_path() -> None:
+def test_generate_shopping_from_menu_parser_eaters_none_path() -> None:
+    """Codex Sub-A4 menu R1 MAJOR #1: runtime emits ``ok:generated:0``
+    (without ``:eaters=E``) for the free_text-only / unknown-plan
+    early-return path (housewife_chat_tools.py:1490). Parser maps
+    the missing eaters segment to ``eaters=None`` so composer can
+    disambiguate from the «scaled but zero ingredients» case
+    (which carries an explicit eaters >= 1)."""
     parsed = parse_tool_output(
-        "generate_shopping_from_menu", "ok:generated:0:eaters=0"
+        "generate_shopping_from_menu", "ok:generated:0"
     )
     assert isinstance(parsed, GenerateShoppingFromMenuOk)
     assert parsed.generated_count == 0
-    assert parsed.eaters == 0
+    assert parsed.eaters is None
+
+
+def test_generate_shopping_from_menu_parser_rejects_eaters_zero() -> None:
+    """Runtime ``count_eaters`` minimum is 1 — ``ok:generated:N:eaters=0``
+    is malformed legacy output. Parser fail-closes via sentinel."""
+    parsed = parse_tool_output(
+        "generate_shopping_from_menu", "ok:generated:5:eaters=0"
+    )
+    assert isinstance(parsed, ToolOutputContractViolation)
 
 
 def test_clear_menu_parser_returns_cleared() -> None:
