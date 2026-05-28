@@ -1,0 +1,229 @@
+"""ToolSpec instances for the MEMORY family (Sub-A4 phase 9).
+
+3 tools migrated: save_core_fact, save_episode, recall_memory.
+
+Sources of truth:
+- Tool signatures: ``runtime/tools.py:89-224`` (cross-skill tools,
+  not housewife-specific — also available to other skills)
+- Output schemas + parsers: ``services/tool_schemas/housewife.py``
+  — SaveCoreFactOk, SaveEpisodeOk, RecallMemoryOk + RecallMemoryHit
+- Repository: ``db/repositories/memory.py:MemoryRepository``
+  — embedding via bge-m3, cosine-similarity recall
+- ``recall_memory`` searches THREE stores: core+episodic memory,
+  active checklist items, pending reminders
+  (runtime/tools.py:168-176 recall-broadcast, 2026-05-04)
+"""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+from sreda.services.tool_schemas.base import ToolSpec
+from sreda.services.tool_schemas.housewife import (
+    RecallMemoryOutput,
+    SaveCoreFactOutput,
+    SaveEpisodeOutput,
+)
+
+
+# ---------------------------------------------------------------------------
+# Memory-specific aliases
+# ---------------------------------------------------------------------------
+
+
+CoreFactContent = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=1000),
+]
+"""Stable long-term fact about user — family, work, location,
+long-term preferences. 1000 char cap is generous for multi-fact
+sentences; runtime stores via EncryptedString without further
+truncation. Embedding via bge-m3 (1024-dim)."""
+
+
+EpisodeSummary = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+]
+"""Short-term event/conversation summary (1-2 sentences).
+Episodic memories are subject to retention cleanup over time
+(unlike core facts which are stable). 500 char cap matches typical
+2-sentence summary length."""
+
+
+RecallQuery = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+]
+"""Search query for recall_memory. Best practices per
+runtime/tools.py:189-192: use user's exact phrasing OR specific
+keywords («ткани характеристики», «дети возраст», «адреса»).
+500 char cap covers typical query lengths."""
+
+
+# ---------------------------------------------------------------------------
+# Input models
+# ---------------------------------------------------------------------------
+
+
+class SaveCoreFactInput(BaseModel):
+    """Save a durable truth about the user (core tier).
+
+    Use ONLY for stable facts that won't change next week —
+    family composition, work, location, long-term preferences.
+    NOT for moods, transient events, or shifting opinions."""
+
+    model_config = ConfigDict(extra="forbid")
+    content: CoreFactContent
+
+
+class SaveEpisodeInput(BaseModel):
+    """Save a recent event/state summary (episodic tier).
+
+    Use for «what's been happening lately» context — recent
+    events, feelings, situations. Subject to retention cleanup
+    (unlike core facts). If the thing is actually durable,
+    use ``save_core_fact`` instead."""
+
+    model_config = ConfigDict(extra="forbid")
+    summary: EpisodeSummary
+
+
+class RecallMemoryInput(BaseModel):
+    """Recall-broadcast search across memory + active checklists +
+    pending reminders.
+
+    Per runtime/tools.py:158-187 — ALWAYS call before claiming
+    «у меня нет данных» / «я этого не помню». ``top_k`` defaults
+    to 3, max 10 (runtime clamps internally)."""
+
+    model_config = ConfigDict(extra="forbid")
+    query: RecallQuery
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+# ---------------------------------------------------------------------------
+# ToolSpec instances
+# ---------------------------------------------------------------------------
+
+
+SAVE_CORE_FACT_SPEC = ToolSpec(
+    name="save_core_fact",
+    description=(
+        "Сохранить СТАБИЛЬНЫЙ долгосрочный факт о юзере в core "
+        "memory (семья, работа, проживание, долгосрочные предпочтения). "
+        "ТОЛЬКО для durable truths — те которые будут актуальны и "
+        "через год, не только сейчас. НЕ для настроения, transient "
+        "событий, мимолётных мнений (для них → save_episode). "
+        "Embedding через bge-m3, dedup при cosine > 0.95 — runtime "
+        "сам отбросит почти-дубль. Возвращает saved_core:<memory_id>."
+    ),
+    family="memory",
+    effect="write",
+    read_domains=[],
+    write_domains=["memory"],
+    input_model=SaveCoreFactInput,
+    output_model=SaveCoreFactOutput,
+    trigger_examples=[
+        "у меня двое детей: Маша 7 лет и Петя 4",
+        "запомни что я работаю в банке",
+        "живу в Москве, центр",
+        "у мужа аллергия на орехи",
+    ],
+    mutex_notes=[
+        "ТОЛЬКО для стабильных фактов. Для recent events / mood → save_episode.",
+        "Не дублирует факт если cosine > 0.95 (runtime dedup) — спокойно вызывай повторно.",
+    ],
+    timeout_seconds=15,
+    side_effect_class="transactional_write",
+)
+
+
+SAVE_EPISODE_SPEC = ToolSpec(
+    name="save_episode",
+    description=(
+        "Сохранить КРАТКОСРОЧНЫЙ episode/состояние в episodic memory "
+        "(recent events, feelings, context «что было на этой неделе»). "
+        "Subject to retention cleanup — episodic уйдёт через какое-то "
+        "время, не для долгосрочных фактов (для них → save_core_fact). "
+        "1-2 предложения. Возвращает saved_episode:<memory_id>."
+    ),
+    family="memory",
+    effect="write",
+    read_domains=[],
+    write_domains=["memory"],
+    input_model=SaveEpisodeInput,
+    output_model=SaveEpisodeOutput,
+    trigger_examples=[
+        "сегодня устала, поздно легла",
+        "вчера спорили с мужем из-за выходных",
+        "на этой неделе много работы",
+        "ребёнок плохо спал ночью",
+    ],
+    mutex_notes=[
+        "ТОЛЬКО для recent state / events. Для долгосрочных фактов → save_core_fact.",
+        "Subject to retention — episodic не вечный, не клади сюда что хочешь помнить навсегда.",
+    ],
+    timeout_seconds=15,
+    side_effect_class="transactional_write",
+)
+
+
+RECALL_MEMORY_SPEC = ToolSpec(
+    name="recall_memory",
+    description=(
+        "Найти данные broadcast-поиском по ТРЁМ хранилищам: core/episodic memory + "
+        "active checklist items + pending reminders. ВСЕГДА вызывай "
+        "ПЕРЕД ответом «у меня нет данных» / «не помню» / «ты не "
+        "записывала Y» — сначала проверить, потом ответить. Также "
+        "вызывай когда юзер просит list/все/перечисление («покажи "
+        "все X», «что у меня про Y», «в переписке было Z»). "
+        "Возвращает структурированный список hits с content + "
+        "source (memory:core / memory:episodic / checklist:<id> / "
+        "reminder:<id>) + score + metadata. При cite hit'а юзеру: "
+        "«у тебя в чек-листе X» / «в напоминании на дату Y» — "
+        "источник на русском по смыслу, НЕ техжаргоном (НЕ говори "
+        "«в core памяти», «в long-term store»)."
+    ),
+    family="memory",
+    effect="read",
+    read_domains=["memory", "checklists", "reminders"],
+    write_domains=[],
+    input_model=RecallMemoryInput,
+    output_model=RecallMemoryOutput,
+    trigger_examples=[
+        "помнишь я про детей рассказывала",
+        "что у меня про работу было",
+        "покажи все мои аллергии",
+        "что я планировала на выходные",
+    ],
+    mutex_notes=[
+        "ВСЕГДА перед claim'ом отсутствия данных. Source указывай по смыслу для юзера: чек-лист / напоминание / память.",
+        "top_k=3 default; 10 для list-style запросов «покажи все X».",
+    ],
+    timeout_seconds=10,
+    side_effect_class="read_only",
+)
+
+
+MEMORY_SPECS: list[ToolSpec] = [
+    SAVE_CORE_FACT_SPEC,
+    SAVE_EPISODE_SPEC,
+    RECALL_MEMORY_SPEC,
+]
+
+
+__all__ = [
+    "CoreFactContent",
+    "EpisodeSummary",
+    "MEMORY_SPECS",
+    "RECALL_MEMORY_SPEC",
+    "RecallMemoryInput",
+    "RecallQuery",
+    "SAVE_CORE_FACT_SPEC",
+    "SAVE_EPISODE_SPEC",
+    "SaveCoreFactInput",
+    "SaveEpisodeInput",
+]

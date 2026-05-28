@@ -41,12 +41,16 @@ from __future__ import annotations
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.specs_checklists import CHECKLISTS_SPECS
 from sreda.services.tool_schemas.specs_household import HOUSEHOLD_SPECS
+from sreda.services.tool_schemas.specs_memory import MEMORY_SPECS
 from sreda.services.tool_schemas.specs_menu import MENU_SPECS
 from sreda.services.tool_schemas.specs_onboarding import ONBOARDING_SPECS
 from sreda.services.tool_schemas.specs_recipes import RECIPES_SPECS
 from sreda.services.tool_schemas.specs_reminders import REMINDERS_SPECS
 from sreda.services.tool_schemas.specs_shopping import SHOPPING_SPECS
 from sreda.services.tool_schemas.specs_tasks import TASKS_SPECS
+from sreda.services.tool_schemas.specs_ui import UI_SPECS
+from sreda.services.tool_schemas.specs_utility import UTILITY_SPECS
+from sreda.services.tool_schemas.specs_web import WEB_SPECS
 
 
 MIGRATED_TOOL_SPECS: list[ToolSpec] = [
@@ -58,12 +62,15 @@ MIGRATED_TOOL_SPECS: list[ToolSpec] = [
     *TASKS_SPECS,
     *CHECKLISTS_SPECS,
     *ONBOARDING_SPECS,
-    # Sub-A4 phase 9 will add:
-    # *UI_SPECS,
-    # *MEMORY_SPECS,
-    # *UTILITY_SPECS,
-    # *WEB_SPECS,
+    *MEMORY_SPECS,
+    *UTILITY_SPECS,
+    *UI_SPECS,
+    *WEB_SPECS,
 ]
+"""All 12 families migrated to typed planner layer. 55 tools total
+(47 housewife + 4 memory/utility cross-skill + 3 web + 1
+reply_with_buttons UI). Sub-A4 100% complete after Codex review
+cycles for memory/utility/ui/web."""
 """Every ToolSpec migrated to the typed registry so far. Initial set
 is the 7-tool shopping family; expand as each subsequent family ships."""
 

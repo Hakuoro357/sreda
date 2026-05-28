@@ -3682,6 +3682,202 @@ def parse_log_unsupported_request(
 
 
 # ---------------------------------------------------------------------------
+# 52. ui — reply_with_buttons (Sub-A4 phase 10)
+#
+# Runtime shapes (housewife_chat_tools.py:2349-2386):
+#   "ok:buttons:N"  (N = number of accepted buttons, 2-4)
+#   "error: buttons disabled in this context"
+#   "error: need at least 2 buttons"
+# ---------------------------------------------------------------------------
+
+
+class ReplyWithButtonsOk(BaseModel):
+    """Inline-buttons reply accepted. ``button_count`` is what runtime
+    actually stored after dedup/clamp (max 4, min 2)."""
+
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["buttons_set"] = "buttons_set"
+    button_count: int = Field(ge=2, le=4)
+
+
+ReplyWithButtonsOutput = Annotated[
+    Union[ReplyWithButtonsOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+_REPLY_WITH_BUTTONS_RE = re.compile(r"^ok:buttons:(?P<n>[2-4])$")
+
+
+def parse_reply_with_buttons(
+    raw: str,
+) -> ReplyWithButtonsOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    m = _REPLY_WITH_BUTTONS_RE.match(raw.strip())
+    if m is None:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="reply_with_buttons",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ReplyWithButtonsOk(button_count=int(m.group("n")))
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="reply_with_buttons",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 53-55. Web family (Sub-A4 phase 10):
+#         weather_tool / web_search_tool / fetch_url_tool
+#
+# All three return free-form text (forecast / search results / page
+# content) — typed output is `raw_text` MVP boundary (same shape as
+# ListMenuOk pre-promotion). Planner sees text + branches on
+# error: prefix detection.
+#
+# Runtime shapes:
+#   weather_tool:
+#     forecast text (multi-line, emoji + temps + precip)
+#     "error: empty location"
+#     "error: не нашла город ... — уточни"
+#     "error: сервис погоды не отвечает, попробуй позже"
+#     "error: пустой прогноз"
+#
+#   web_search_tool:
+#     "no results"  (empty path)
+#     multi-line title + URL + snippet
+#     "error: empty query"
+#
+#   fetch_url_tool:
+#     free-form page content (extracted via readability-lxml)
+#     "error: empty url"
+#     "error: <reason>"
+#     "error: timeout after Ns"
+#     "error: http NNN"
+# ---------------------------------------------------------------------------
+
+
+class WeatherToolOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["forecast"] = "forecast"
+    raw_text: str = Field(min_length=1, max_length=10_000)
+
+
+WeatherToolOutput = Annotated[
+    Union[WeatherToolOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_weather_tool(
+    raw: str,
+) -> WeatherToolOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if not stripped:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="weather_tool",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return WeatherToolOk(raw_text=stripped)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="weather_tool",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class WebSearchToolOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["results"] = "results"
+    raw_text: str = Field(min_length=1, max_length=10_000)
+
+
+class WebSearchToolEmpty(BaseModel):
+    """Empty path — runtime emits literal «no results» when search
+    returned 0 hits (web_search_tool.py:160)."""
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["empty"] = "empty"
+
+
+WebSearchToolOutput = Annotated[
+    Union[WebSearchToolOk, WebSearchToolEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_web_search_tool(
+    raw: str,
+) -> (
+    WebSearchToolOk
+    | WebSearchToolEmpty
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "no results":
+        return WebSearchToolEmpty()
+    if not stripped:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="web_search_tool",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return WebSearchToolOk(raw_text=stripped)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="web_search_tool",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+class FetchUrlToolOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["fetched"] = "fetched"
+    raw_text: str = Field(min_length=1, max_length=50_000)
+    """Pages can be larger than search snippets or forecast — 50k
+    char cap accommodates a long article extracted by readability-lxml.
+    Beyond that runtime caller typically truncates anyway."""
+
+
+FetchUrlToolOutput = Annotated[
+    Union[FetchUrlToolOk, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+def parse_fetch_url_tool(
+    raw: str,
+) -> FetchUrlToolOk | HousewifeToolError | ToolOutputContractViolation:
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if not stripped:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="fetch_url_tool",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return FetchUrlToolOk(raw_text=stripped)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="fetch_url_tool",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Parser registry — wrapper looks tool_name up here
 # ---------------------------------------------------------------------------
 
@@ -3738,6 +3934,10 @@ PARSERS = {
     "save_episode": parse_save_episode,
     "recall_memory": parse_recall_memory,
     "log_unsupported_request": parse_log_unsupported_request,
+    "reply_with_buttons": parse_reply_with_buttons,
+    "weather_tool": parse_weather_tool,
+    "web_search_tool": parse_web_search_tool,
+    "fetch_url_tool": parse_fetch_url_tool,
 }
 
 
