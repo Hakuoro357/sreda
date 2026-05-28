@@ -1,0 +1,614 @@
+"""Planner orchestrator — single async entry point.
+
+Sub-A12 Phase B.4. Wires together B.1 (prompt) + B.2 (LLM) + B.3
+(compile) + Sub-A1 (schemas, validator, interpolation) + Sub-A7
+(planner_executions persistence).
+
+This is a **library function**, not a LangGraph node. Phase E will
+wrap ``run()`` in a graph node when integration time comes; for now
+the orchestrator is callable from anywhere (worker, eval script,
+snapshot test).
+
+Lifecycle (Codex R7 final design — committed-claim pattern)
+============================================================
+
+::
+
+    1. caller calls run(ctx)
+    2. insert_pending  — own session, COMMIT before LLM
+    3. call_planner    — slow; no DB transaction held during LLM call
+    4. mark_received   — own session, COMMIT
+    5. parse JSON → Plan.model_validate
+       failure → mark_invalid (+ retry with feedback OR final)
+    6. validate_plan(plan, registry) → if violations → invalid path
+    7. compile(plan, registry) → ExecutionPlan
+    8. mark_valid      — own session, COMMIT
+    9. return PlannerResult(success=True, plan, execution_plan, ...)
+
+Retry policy
+============
+
+One retry on parse/validate failure with explicit error feedback in
+the prompt suffix. After two failures: PlannerResult(success=False)
++ redacted admin alert.
+
+Out of scope for Phase B.4 (deferred):
+
+* Idempotency-key based replay (needs schema migration)
+* Stale reconciler (post-MVP)
+* GEPA gap recording — orchestrator writes a planner_gaps row in a
+  later phase; for now we just return the failure structure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping
+
+from pydantic import ValidationError
+from sqlalchemy.orm import Session
+
+from sreda.runtime.planner.llm import (
+    PlannerCallResult,
+    PlannerProviderUnavailable,
+    PlannerTimeoutError,
+    call_planner,
+)
+from sreda.runtime.planner.persistence import (
+    insert_pending,
+    make_execution_id,
+    mark_invalid,
+    mark_received,
+    mark_valid,
+)
+from sreda.runtime.planner.plan_compiler import (
+    ExecutionPlan,
+    PlanCompileError,
+    compile as compile_plan,
+)
+from sreda.runtime.planner.prompt_builder import (
+    NowMoment,
+    ProfileSnapshot,
+    PromptBudget,
+    PromptBudgetExceeded,
+    PromptBuildArgs,
+    TurnSnapshot,
+    VoiceMeta,
+    build_prompt,
+    MemorySnapshot,
+)
+from sreda.runtime.planner.schemas import Plan
+from sreda.runtime.planner.validator import render_violations, validate_plan
+from sreda.services.tool_schemas.base import ToolSpec
+
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Context + Result
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlannerContext:
+    """Everything orchestrator needs to produce a Plan. Immutable so the
+    caller can be sure orchestration doesn't mutate inputs."""
+
+    # Identity
+    tenant_id: str
+    run_id: str
+    feature_key: str
+    user_message: str
+    voice_meta: VoiceMeta | None
+
+    # Prompt inputs
+    now: NowMoment
+    profile: ProfileSnapshot
+    memories: tuple[MemorySnapshot, ...]
+    active_turn: TurnSnapshot | None
+    closed_turns: tuple[TurnSnapshot, ...]
+
+    # Registry handles (compiler needs ToolSpec map; prompt needs
+    # template_ids + llm_prompt_keys allowlists)
+    available_tools: tuple[ToolSpec, ...]
+    composer_template_ids: tuple[str, ...]
+    composer_llm_prompt_keys: tuple[str, ...]
+    composer_registry_snapshot_hash: str
+    tool_registry_version: str = "v1"
+
+    # Prompt assembly
+    few_shot_block: str = ""
+    budget: PromptBudget = field(default_factory=PromptBudget)
+
+    # LLM call shape (overrides — usually None → use settings)
+    planner_provider: str | None = None
+    planner_timeout_seconds: float | None = None
+    planner_prompt_version: int = 1
+
+
+@dataclass(frozen=True)
+class PlannerResult:
+    """Outcome of one orchestrator run. Caller maps to executor invocation
+    (success path) or composer fallback (failure path)."""
+
+    success: bool
+    execution_id: str
+    final_attempt_no: int
+
+    # Success-path payload
+    plan: Plan | None = None
+    execution_plan: ExecutionPlan | None = None
+
+    # Failure-path metadata
+    error_summary: str | None = None
+    raw_responses: tuple[str, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# PII redaction for admin alerts
+# ---------------------------------------------------------------------------
+
+
+# Codex Sub-A12 B.4 R1 MEDIUM: tighten regexes for real-world inputs.
+# Phone: optional country code, optional spaces / dashes / parens.
+# Email: dotted local with +/-/_, multi-label TLD (e.g. .co.uk).
+_PHONE_RE = re.compile(
+    r"\+?[78][\s\-()]*(?:\d[\s\-()]*){10}"
+)
+_USERNAME_RE = re.compile(r"@\w{5,}")
+_NUMBER_RE = re.compile(r"\b\d{4,}\b")
+_EMAIL_RE = re.compile(
+    r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+)
+
+
+def _redact_for_alert(text_value: str, *, max_chars: int = 500) -> str:
+    """Codex Sub-A12 R3 #9: redact PII before sending to admin channel.
+
+    Order: email first (more specific), then phone, then username, then
+    raw numbers (catches chat_ids). After redaction, hard-cap length."""
+    out = _EMAIL_RE.sub("[EMAIL]", text_value)
+    out = _PHONE_RE.sub("[PHONE]", out)
+    out = _USERNAME_RE.sub("[USERNAME]", out)
+    out = _NUMBER_RE.sub("[NUMBER]", out)
+    return out[:max_chars]
+
+
+# ---------------------------------------------------------------------------
+# Retry feedback prompt
+# ---------------------------------------------------------------------------
+
+
+def _build_retry_feedback(previous_response: str, errors: str) -> str:
+    """Short error feedback appended to the user message for retry.
+
+    Kept short so retry input doesn't bloat the prompt budget."""
+    excerpt = previous_response[:500]
+    err_excerpt = errors[:500]
+    return (
+        f"\n\n[АВТОМАТИЧЕСКИЙ РЕТРАЙ]\n"
+        f"Предыдущий ответ невалиден. Извлечение:\n"
+        f"<<<\n{excerpt}\n>>>\n"
+        f"Ошибки:\n{err_excerpt}\n"
+        f"Сгенерируй новый план в строгом JSON-формате, без markdown."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main entry
+# ---------------------------------------------------------------------------
+
+
+async def run(
+    ctx: PlannerContext,
+    *,
+    session_factory: Callable[[], Session],
+    invalid_retry_enabled: bool = True,
+    call_planner_fn: Callable[..., PlannerCallResult] = call_planner,
+    admin_alert_fn: Callable[..., None] | None = None,
+) -> PlannerResult:
+    """Drive one planner turn end-to-end.
+
+    Parameters
+    ----------
+    ctx :
+        Immutable input snapshot (profile, memories, history, message,
+        registry handles).
+    session_factory :
+        Callable returning a fresh SQLAlchemy Session per stage. Each
+        stage (insert_pending, mark_received, mark_valid/invalid)
+        opens its OWN session and COMMITs before returning — no
+        transaction is held across the LLM call (Codex R7 design).
+    invalid_retry_enabled :
+        Toggle for the one-shot retry on parse/validate failure. Off
+        in tests that need to assert single-attempt behavior.
+    call_planner_fn :
+        Injectable for tests. Default uses runtime.planner.llm.call_planner.
+    admin_alert_fn :
+        Injectable redacted-alert hook. None → no alerts (offline mode,
+        eval scripts, etc.).
+
+    Returns
+    -------
+    PlannerResult :
+        success=True on valid plan; success=False on retry exhaustion
+        or unrecoverable failure (provider unavailable, etc.).
+    """
+    execution_id = make_execution_id()
+
+    # Stage 1: persist 'pending' (own session, COMMIT immediately)
+    try:
+        with session_factory() as s:
+            with s.begin():
+                insert_pending(
+                    s,
+                    execution_id=execution_id,
+                    run_id=ctx.run_id,
+                    tenant_id=ctx.tenant_id,
+                    feature_key=ctx.feature_key,
+                    planner_prompt_version=ctx.planner_prompt_version,
+                    planner_provider=ctx.planner_provider or "",
+                    planner_model="",  # filled in by mark_received? No, we need it now
+                    tool_registry_version=ctx.tool_registry_version,
+                    composer_registry_snapshot_hash=(
+                        ctx.composer_registry_snapshot_hash
+                    ),
+                )
+    except Exception as exc:  # noqa: BLE001 — persistence failures are operational
+        logger.exception("planner orchestrator: insert_pending failed")
+        err_msg = f"persistence:insert_pending:{type(exc).__name__}: {exc}"
+        # Codex Sub-A12 B.4 R2 MEDIUM: every terminal failure produces
+        # an admin alert (when alert_fn provided), not just LLM/invalid
+        # paths. Persistence outages need to surface too.
+        _maybe_alert(admin_alert_fn, execution_id, ctx, errors=err_msg)
+        return PlannerResult(
+            success=False,
+            execution_id=execution_id,
+            final_attempt_no=0,
+            error_summary=f"persistence:insert_pending:{type(exc).__name__}",
+        )
+
+    cumulative_latency_ms = 0
+    raw_responses: list[str] = []
+    last_errors = ""
+    last_raw = ""
+
+    max_attempts = 2 if invalid_retry_enabled else 1
+    for attempt_no in range(1, max_attempts + 1):
+        # Codex Sub-A12 R1 MAJOR (HIGH): retry feedback goes THROUGH
+        # prompt_builder so the previous raw response is fenced as
+        # UNTRUSTED_DATA and the total still respects PromptBudget.
+        retry_feedback = None
+        if attempt_no > 1:
+            retry_feedback = _build_retry_feedback(last_raw, last_errors)
+        try:
+            prompt = _build_prompt_or_raise(ctx, retry_feedback=retry_feedback)
+        except PromptBudgetExceeded as exc:
+            _terminate_invalid(
+                session_factory, execution_id,
+                errors=f"prompt_budget_exceeded: {exc}",
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx,
+                errors=f"prompt_budget_exceeded: {exc}",
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no - 1,
+                error_summary="prompt_budget_exceeded",
+                raw_responses=tuple(raw_responses),
+            )
+
+        # Stage 2: call LLM (no DB transaction held).
+        # Codex Sub-A12 R1 MAJOR (medium): call_planner is sync — wrap in
+        # asyncio.to_thread so the event loop isn't blocked for 30-60s
+        # while the LLM responds. If caller provides an async test stub,
+        # await it directly.
+        try:
+            kwargs = dict(
+                provider=ctx.planner_provider,
+                timeout_seconds=ctx.planner_timeout_seconds,
+                attempt_no=attempt_no,
+            )
+            if inspect.iscoroutinefunction(call_planner_fn):
+                call_result = await call_planner_fn(prompt, **kwargs)
+            else:
+                call_result = await asyncio.to_thread(
+                    call_planner_fn, prompt, **kwargs,
+                )
+        except PlannerProviderUnavailable as exc:
+            _terminate_invalid(
+                session_factory, execution_id,
+                errors=f"provider_unavailable: {exc}",
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx,
+                errors=f"provider_unavailable: {exc}",
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary="provider_unavailable",
+                raw_responses=tuple(raw_responses),
+            )
+        except PlannerTimeoutError as exc:
+            _terminate_invalid(
+                session_factory, execution_id,
+                errors=f"timeout: {exc}",
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx, errors=f"timeout: {exc}",
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary="timeout",
+                raw_responses=tuple(raw_responses),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "planner orchestrator: LLM call failed attempt=%d", attempt_no,
+            )
+            err_msg = f"llm_call:{type(exc).__name__}: {exc}"
+            _terminate_invalid(
+                session_factory, execution_id,
+                errors=err_msg,
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx, errors=err_msg,
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary=f"llm_call:{type(exc).__name__}",
+                raw_responses=tuple(raw_responses),
+            )
+
+        cumulative_latency_ms += call_result.latency_ms
+        raw_responses.append(call_result.raw_text)
+        last_raw = call_result.raw_text
+
+        # Stage 3: persist 'received' (own session) + audit provider/model
+        try:
+            with session_factory() as s:
+                with s.begin():
+                    mark_received(
+                        s,
+                        execution_id=execution_id,
+                        raw_response=call_result.raw_text,
+                        latency_ms=cumulative_latency_ms,
+                        planner_provider=call_result.provider,
+                        planner_model=call_result.model,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("planner orchestrator: mark_received failed")
+            err_msg = f"persistence:mark_received:{type(exc).__name__}: {exc}"
+            _maybe_alert(admin_alert_fn, execution_id, ctx, errors=err_msg)
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary=f"persistence:mark_received:{type(exc).__name__}",
+                raw_responses=tuple(raw_responses),
+            )
+
+        # Stage 4: parse JSON
+        try:
+            payload = json.loads(call_result.raw_text)
+        except json.JSONDecodeError as exc:
+            last_errors = f"json_decode_error: {exc}"
+            if attempt_no < max_attempts:
+                continue
+            _terminate_invalid(
+                session_factory, execution_id, errors=last_errors,
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx, errors=last_errors,
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary="invalid_plan_after_retry",
+                raw_responses=tuple(raw_responses),
+            )
+
+        # Stage 5: pydantic validate
+        try:
+            plan = Plan.model_validate(payload)
+        except ValidationError as exc:
+            last_errors = f"plan_schema_error: {exc}"
+            if attempt_no < max_attempts:
+                continue
+            _terminate_invalid(
+                session_factory, execution_id, errors=last_errors,
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx, errors=last_errors,
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary="invalid_plan_after_retry",
+                raw_responses=tuple(raw_responses),
+            )
+
+        # Stage 6: validator (registry-aware semantic checks)
+        registry_map = {s.name: s for s in ctx.available_tools}
+        violations = validate_plan(plan, registry=registry_map)
+        if violations:
+            last_errors = "validator_violations: " + "; ".join(
+                render_violations(violations)[:5]
+            )
+            if attempt_no < max_attempts:
+                continue
+            _terminate_invalid(
+                session_factory, execution_id, errors=last_errors,
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx, errors=last_errors,
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary="invalid_plan_after_retry",
+                raw_responses=tuple(raw_responses),
+            )
+
+        # Stage 7: compile to ExecutionPlan
+        try:
+            execution_plan = compile_plan(plan, registry_map)
+        except PlanCompileError as exc:
+            last_errors = f"plan_compile_error: {exc}"
+            if attempt_no < max_attempts:
+                continue
+            _terminate_invalid(
+                session_factory, execution_id, errors=last_errors,
+            )
+            _maybe_alert(
+                admin_alert_fn, execution_id, ctx, errors=last_errors,
+            )
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary="invalid_plan_after_retry",
+                raw_responses=tuple(raw_responses),
+            )
+
+        # Stage 8: persist 'valid'
+        try:
+            with session_factory() as s:
+                with s.begin():
+                    mark_valid(
+                        s,
+                        execution_id=execution_id,
+                        plan_json=plan.model_dump(mode="json"),
+                        execution_plan_json=_execution_plan_to_json(execution_plan),
+                        is_new_turn=plan.turn_classification.is_new_turn,
+                        turn_classification_reason=plan.turn_classification.reason,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("planner orchestrator: mark_valid failed")
+            err_msg = f"persistence:mark_valid:{type(exc).__name__}: {exc}"
+            _maybe_alert(admin_alert_fn, execution_id, ctx, errors=err_msg)
+            return PlannerResult(
+                success=False, execution_id=execution_id,
+                final_attempt_no=attempt_no,
+                error_summary=f"persistence:mark_valid:{type(exc).__name__}",
+                raw_responses=tuple(raw_responses),
+            )
+
+        return PlannerResult(
+            success=True,
+            execution_id=execution_id,
+            final_attempt_no=attempt_no,
+            plan=plan,
+            execution_plan=execution_plan,
+            raw_responses=tuple(raw_responses),
+        )
+
+    # Loop fell through — shouldn't happen
+    return PlannerResult(
+        success=False, execution_id=execution_id,
+        final_attempt_no=max_attempts,
+        error_summary="unexpected_loop_exit",
+        raw_responses=tuple(raw_responses),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_prompt_or_raise(
+    ctx: PlannerContext, *, retry_feedback: str | None,
+) -> str:
+    """Render base prompt via prompt_builder.build_prompt."""
+    args = PromptBuildArgs(
+        tool_specs=ctx.available_tools,
+        composer_template_ids=ctx.composer_template_ids,
+        composer_llm_prompt_keys=ctx.composer_llm_prompt_keys,
+        few_shot_block=ctx.few_shot_block,
+        profile=ctx.profile,
+        memories=ctx.memories,
+        active_turn=ctx.active_turn,
+        closed_turns=ctx.closed_turns,
+        now=ctx.now,
+        user_message=ctx.user_message + (retry_feedback or ""),
+        voice_meta=ctx.voice_meta,
+        budget=ctx.budget,
+    )
+    return build_prompt(args)
+
+
+def _terminate_invalid(
+    session_factory: Callable[[], Session],
+    execution_id: str,
+    *,
+    errors: str,
+) -> None:
+    """Best-effort persist invalid status. Failure here is logged but
+    doesn't override the original failure mode."""
+    try:
+        with session_factory() as s:
+            with s.begin():
+                mark_invalid(
+                    s, execution_id=execution_id,
+                    validation_errors=errors[:2000],
+                )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "planner orchestrator: failed to mark_invalid for %s", execution_id,
+        )
+
+
+def _maybe_alert(
+    alert_fn: Callable[..., None] | None,
+    execution_id: str,
+    ctx: PlannerContext,
+    *,
+    errors: str,
+) -> None:
+    """Send P1 admin alert with PII redaction. No-op if alert_fn is None."""
+    if alert_fn is None:
+        return
+    redacted_user = _redact_for_alert(ctx.user_message, max_chars=200)
+    redacted_errors = _redact_for_alert(errors, max_chars=500)
+    try:
+        alert_fn(
+            severity="P1",
+            title="planner: invalid plan after retry",
+            body=(
+                f"execution_id={execution_id}\n"
+                f"tenant_id=[REDACTED]\n"
+                f"user excerpt: {redacted_user}\n"
+                f"errors: {redacted_errors}\n"
+                f"trace: see #68 LLM traces by execution_id"
+            ),
+            dedupe_key=f"planner_invalid:{execution_id[:16]}",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("planner orchestrator: admin alert failed")
+
+
+def _execution_plan_to_json(ep: ExecutionPlan) -> dict:
+    """ExecutionPlan dataclass → JSON-serialisable dict for storage.
+
+    Layers as list-of-lists; fail_modes as plain dict. Don't include the
+    embedded Plan (already stored in plan_json column separately)."""
+    return {
+        "layers": [list(layer) for layer in ep.layers],
+        "fail_modes": dict(ep.fail_modes),
+    }
+
+
+__all__ = [
+    "PlannerContext",
+    "PlannerResult",
+    "run",
+]
