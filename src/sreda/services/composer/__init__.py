@@ -15,6 +15,13 @@ no inline strings, no "if id == 'x'" routing anywhere else in the
 codebase.
 """
 
+from sreda.services.composer.compose import (
+    ComposeResult,
+    ComposerContext,
+    FallbackUsed,
+    LLMComposer,
+    compose,
+)
 from sreda.services.composer.registry import (
     REGISTRY,
     ComposerRegistry,
@@ -23,8 +30,13 @@ from sreda.services.composer.registry import (
 )
 
 __all__ = [
+    "ComposeResult",
+    "ComposerContext",
     "ComposerRegistry",
+    "FallbackUsed",
+    "LLMComposer",
     "REGISTRY",
     "UnknownTemplateError",
+    "compose",
     "render",
 ]
