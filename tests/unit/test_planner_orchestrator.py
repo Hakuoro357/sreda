@@ -524,6 +524,30 @@ def test_orchestrator_no_alert_when_admin_alert_fn_is_none(
 # ---------------------------------------------------------------------------
 
 
+def test_orchestrator_ephemeral_mode_skips_persistence(db_session: Session) -> None:
+    """Codex B.7 R1 MAJOR fix: session_factory=None → no DB writes.
+    Used by live eval script which lacks a real agent_runs FK target.
+
+    Verify: success path runs end-to-end, returns plan + execution_plan,
+    but no row appears in planner_executions."""
+    ctx = _make_ctx()
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return _make_call_result(json.dumps(_make_valid_plan_payload()))
+
+    result = asyncio.run(run(
+        ctx, session_factory=None, call_planner_fn=fake_call,
+    ))
+
+    assert result.success
+    assert result.plan is not None
+    assert result.execution_plan is not None
+
+    # No row written
+    row = _row(db_session, result.execution_id)
+    assert row == {}
+
+
 def test_redact_phone_ru() -> None:
     assert "[PHONE]" in _redact_for_alert("позвони +79991234567")
     assert "+79991234567" not in _redact_for_alert("позвони +79991234567")

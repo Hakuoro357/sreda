@@ -208,7 +208,7 @@ def _build_retry_feedback(previous_response: str, errors: str) -> str:
 async def run(
     ctx: PlannerContext,
     *,
-    session_factory: Callable[[], Session],
+    session_factory: Callable[[], Session] | None,
     invalid_retry_enabled: bool = True,
     call_planner_fn: Callable[..., PlannerCallResult] = call_planner,
     admin_alert_fn: Callable[..., None] | None = None,
@@ -221,10 +221,17 @@ async def run(
         Immutable input snapshot (profile, memories, history, message,
         registry handles).
     session_factory :
-        Callable returning a fresh SQLAlchemy Session per stage. Each
-        stage (insert_pending, mark_received, mark_valid/invalid)
-        opens its OWN session and COMMITs before returning — no
-        transaction is held across the LLM call (Codex R7 design).
+        Callable returning a fresh SQLAlchemy Session per stage, OR
+        ``None`` for **ephemeral mode** (Codex B.7 R1 MAJOR fix):
+        skip all DB writes. Used by the live eval script which doesn't
+        have a real ``agent_runs`` row to FK against; in ephemeral mode
+        the orchestrator still returns a typed PlannerResult so callers
+        can aggregate metrics without per-scenario persistence overhead.
+
+        When set: each stage (insert_pending, mark_received,
+        mark_valid/invalid) opens its OWN session and COMMITs before
+        returning — no transaction is held across the LLM call (Codex
+        R7 design).
     invalid_retry_enabled :
         Toggle for the one-shot retry on parse/validate failure. Off
         in tests that need to assert single-attempt behavior.
@@ -242,24 +249,27 @@ async def run(
     """
     execution_id = make_execution_id()
 
-    # Stage 1: persist 'pending' (own session, COMMIT immediately)
+    # Stage 1: persist 'pending' (own session, COMMIT immediately).
+    # Ephemeral mode (session_factory=None) skips DB writes — used by
+    # live eval script which lacks a real agent_runs FK target.
     try:
-        with session_factory() as s:
-            with s.begin():
-                insert_pending(
-                    s,
-                    execution_id=execution_id,
-                    run_id=ctx.run_id,
-                    tenant_id=ctx.tenant_id,
-                    feature_key=ctx.feature_key,
-                    planner_prompt_version=ctx.planner_prompt_version,
-                    planner_provider=ctx.planner_provider or "",
-                    planner_model="",  # filled in by mark_received? No, we need it now
-                    tool_registry_version=ctx.tool_registry_version,
-                    composer_registry_snapshot_hash=(
-                        ctx.composer_registry_snapshot_hash
-                    ),
-                )
+        if session_factory is not None:
+            with session_factory() as s:
+                with s.begin():
+                    insert_pending(
+                        s,
+                        execution_id=execution_id,
+                        run_id=ctx.run_id,
+                        tenant_id=ctx.tenant_id,
+                        feature_key=ctx.feature_key,
+                        planner_prompt_version=ctx.planner_prompt_version,
+                        planner_provider=ctx.planner_provider or "",
+                        planner_model="",  # mark_received writes actual
+                        tool_registry_version=ctx.tool_registry_version,
+                        composer_registry_snapshot_hash=(
+                            ctx.composer_registry_snapshot_hash
+                        ),
+                    )
     except Exception as exc:  # noqa: BLE001 — persistence failures are operational
         logger.exception("planner orchestrator: insert_pending failed")
         err_msg = f"persistence:insert_pending:{type(exc).__name__}: {exc}"
@@ -376,16 +386,17 @@ async def run(
 
         # Stage 3: persist 'received' (own session) + audit provider/model
         try:
-            with session_factory() as s:
-                with s.begin():
-                    mark_received(
-                        s,
-                        execution_id=execution_id,
-                        raw_response=call_result.raw_text,
-                        latency_ms=cumulative_latency_ms,
-                        planner_provider=call_result.provider,
-                        planner_model=call_result.model,
-                    )
+            if session_factory is not None:
+                with session_factory() as s:
+                    with s.begin():
+                        mark_received(
+                            s,
+                            execution_id=execution_id,
+                            raw_response=call_result.raw_text,
+                            latency_ms=cumulative_latency_ms,
+                            planner_provider=call_result.provider,
+                            planner_model=call_result.model,
+                        )
         except Exception as exc:  # noqa: BLE001
             logger.exception("planner orchestrator: mark_received failed")
             err_msg = f"persistence:mark_received:{type(exc).__name__}: {exc}"
@@ -481,16 +492,17 @@ async def run(
 
         # Stage 8: persist 'valid'
         try:
-            with session_factory() as s:
-                with s.begin():
-                    mark_valid(
-                        s,
-                        execution_id=execution_id,
-                        plan_json=plan.model_dump(mode="json"),
-                        execution_plan_json=_execution_plan_to_json(execution_plan),
-                        is_new_turn=plan.turn_classification.is_new_turn,
-                        turn_classification_reason=plan.turn_classification.reason,
-                    )
+            if session_factory is not None:
+                with session_factory() as s:
+                    with s.begin():
+                        mark_valid(
+                            s,
+                            execution_id=execution_id,
+                            plan_json=plan.model_dump(mode="json"),
+                            execution_plan_json=_execution_plan_to_json(execution_plan),
+                            is_new_turn=plan.turn_classification.is_new_turn,
+                            turn_classification_reason=plan.turn_classification.reason,
+                        )
         except Exception as exc:  # noqa: BLE001
             logger.exception("planner orchestrator: mark_valid failed")
             err_msg = f"persistence:mark_valid:{type(exc).__name__}: {exc}"
@@ -547,13 +559,16 @@ def _build_prompt_or_raise(
 
 
 def _terminate_invalid(
-    session_factory: Callable[[], Session],
+    session_factory: Callable[[], Session] | None,
     execution_id: str,
     *,
     errors: str,
 ) -> None:
     """Best-effort persist invalid status. Failure here is logged but
-    doesn't override the original failure mode."""
+    doesn't override the original failure mode. Ephemeral mode
+    (session_factory=None) skips DB writes."""
+    if session_factory is None:
+        return
     try:
         with session_factory() as s:
             with s.begin():
