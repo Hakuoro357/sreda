@@ -1,24 +1,40 @@
 """ToolSpec instances for the WEB family (Sub-A4 phase 10) —
 FINAL family closing 55/55.
 
-3 tools migrated: weather_tool, web_search_tool, fetch_url_tool.
+3 tools migrated: get_weather, web_search, fetch_url.
 
 Sources of truth:
-- Tool signatures: ``services/weather_tool.py:498``,
-  ``services/web_search_tool.py:244,338``
-- Output schemas + parsers: ``services/tool_schemas/housewife.py``
-  — WeatherToolOk, WebSearchToolOk/Empty, FetchUrlToolOk
-- Output is raw_text MVP boundary (same as ListMenuOk pre-promotion)
-  — runtime emits free-form forecast/results/page content
-- Optional per-tariff (build_*_tool factories aren't always wired
-  depending on subscription level)
+- Tool signatures: ``services/weather_tool.py:498-507``
+  (get_weather location + day_offset + days_count + granularity),
+  ``services/web_search_tool.py:244, 338`` (web_search query,
+  fetch_url url)
+- Codex R1 CRITICAL (both branches): names MUST match the
+  ``@lc_tool``-decorated runtime function names exactly, not
+  the build_*_tool factory names. specs/manifest/parsers ALL
+  use the runtime callable name.
+- Codex R1 MAJOR (HIGH): get_weather has 3 extra args planner
+  must be able to use (tomorrow / week / hourly / part_of_day).
+- Codex R1 MEDIUM (HIGH catch): fetch_url returns JSON envelope
+  ``{url, final_url, status, extractor, truncated, length, text}``
+  (web_search_tool.py:419) — NOT raw text. Schema must reflect.
+- Codex R1 MAJOR (medium): fetch_url runtime rejects localhost /
+  private / link-local hosts (web_search_tool.py:73 _validate_url).
 """
 
 from __future__ import annotations
 
-from typing import Annotated
+from ipaddress import ip_address
+from typing import Annotated, Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.housewife import (
@@ -37,29 +53,57 @@ WeatherLocation = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
 ]
-"""City name or place description («Москва», «Питер центр», «Бали»).
-Open-Meteo geocoder handles fuzzy match; cap matches runtime."""
+"""City name. Open-Meteo geocoder handles fuzzy match."""
 
 
 SearchQuery = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
-"""Search query for web_search_tool. Free-form; Tavily/DDG handles
-tokenization. 500 char cap covers complex multi-keyword queries."""
+
+
+def _validate_safe_url(value: str) -> str:
+    """Codex R1 MAJOR: mirror runtime SSRF guard from
+    web_search_tool.py:73. Reject localhost / private / link-local
+    /reserved hosts at planner-input time so the planner sees the
+    constraint instead of waiting for runtime to fail."""
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"only http/https URLs allowed, got {parsed.scheme!r}")
+    if not parsed.hostname:
+        raise ValueError("URL has no hostname")
+    host = parsed.hostname.lower()
+    if host in ("localhost", "0.0.0.0", "::1"):
+        raise ValueError(f"localhost host {host!r} is blocked (SSRF guard)")
+    # IPv4 literal check
+    try:
+        ip = ip_address(host)
+    except ValueError:
+        pass
+    else:
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError(
+                f"IP {host!r} is in a blocked range (SSRF guard: "
+                f"private/loopback/link-local/reserved)"
+            )
+    return value
 
 
 FetchUrl = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True,
-        min_length=10,  # min `http://x.y` ≈ 10 chars
-        max_length=2000,  # browsers typically support 2k char URLs
+        min_length=10,
+        max_length=2000,
         pattern=r"^https?://[^\s]+$",
     ),
+    AfterValidator(_validate_safe_url),
 ]
-"""HTTP(S) URL for fetch_url_tool. Strict regex catches malformed
-URLs at planner time before runtime hits httpx."""
+
+
+WeatherGranularity = Literal["daily", "part_of_day", "hourly"]
+"""Per get_weather signature at weather_tool.py:506. Matches three
+runtime-supported detail levels."""
 
 
 # ---------------------------------------------------------------------------
@@ -68,29 +112,44 @@ URLs at planner time before runtime hits httpx."""
 
 
 class WeatherToolInput(BaseModel):
-    """Get weather forecast via Open-Meteo (free, no API key, 14d).
-    Replaces wttr.in which only gave current weather. Returns text
-    summary suitable for direct quotation to the user."""
+    """Codex R1 MAJOR: schema mirrors full runtime signature
+    (weather_tool.py:502) — location + day_offset (0-13, 0=today)
+    + days_count (1-14, how many days to show) + granularity
+    (daily / part_of_day / hourly).
+
+    Cross-field: day_offset + days_count must fit within 14-day
+    forecast window per Open-Meteo cap."""
 
     model_config = ConfigDict(extra="forbid")
     location: WeatherLocation
+    day_offset: int = Field(default=0, ge=0, le=13)
+    """0=today, 1=tomorrow, 2=day after tomorrow. Cap 13 because
+    max forecast horizon is 14 days (day_offset 13 + days_count 1)."""
+    days_count: int = Field(default=1, ge=1, le=14)
+    granularity: WeatherGranularity = "daily"
+
+    @model_validator(mode="after")
+    def _validate_horizon(self) -> "WeatherToolInput":
+        if self.day_offset + self.days_count > 14:
+            raise ValueError(
+                f"day_offset={self.day_offset} + days_count="
+                f"{self.days_count} exceeds 14-day Open-Meteo forecast "
+                f"window. Pick start+count that fit in 14 days."
+            )
+        return self
 
 
 class WebSearchToolInput(BaseModel):
     """Web search via Tavily (30/user/мес + 950 global quota) with
-    DDG fallback. Quota tracking is automatic via session/tenant/user.
-    Returns title + URL + snippet for top hits, or «no results»
-    when search returned 0 hits."""
+    DDG fallback."""
 
     model_config = ConfigDict(extra="forbid")
     query: SearchQuery
 
 
 class FetchUrlToolInput(BaseModel):
-    """Fetch + extract readable content from one HTTP(S) URL via
-    readability-lxml. Use ONLY for URLs the user provided or that
-    web_search_tool returned — don't crawl arbitrary URLs. Hard
-    timeout 30s, fails closed with typed error variants."""
+    """Fetch + extract content from one HTTP(S) URL. SSRF-safe URL
+    validator mirrors runtime guard (web_search_tool.py:73)."""
 
     model_config = ConfigDict(extra="forbid")
     url: FetchUrl
@@ -101,17 +160,19 @@ class FetchUrlToolInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-WEATHER_TOOL_SPEC = ToolSpec(
-    name="weather_tool",
+GET_WEATHER_SPEC = ToolSpec(
+    name="get_weather",
     description=(
-        "Получить прогноз погоды для города/места через Open-Meteo "
-        "(бесплатный, без API key, до 14 дней). Возвращает текстовую "
-        "сводку готовую к цитированию юзеру: emoji + температура + "
-        "осадки + ветер по дням. ИСПОЛЬЗУЙ когда юзер прямо просит "
-        "погоду («какая погода завтра», «прогноз на неделю»). НЕ "
-        "вызывай для общих вопросов о климате (это знание из модели). "
-        "Если geocoder не нашёл город — runtime вернёт error: не "
-        "нашла город, переспроси юзера уточнить."
+        "Получить прогноз погоды через Open-Meteo (free, до 14 дней). "
+        "Аргументы: location (город), day_offset (0=сегодня, "
+        "1=завтра, ..., 13=через 13 дней; default 0), days_count "
+        "(1..14, сколько дней показать; default 1), granularity "
+        "(daily | part_of_day | hourly; default daily). "
+        "Примеры: «погода завтра» → day_offset=1, days_count=1; "
+        "«на неделю» → day_offset=0, days_count=7; «почасовой» → "
+        "granularity=hourly; «как одеться сегодня» → "
+        "granularity=part_of_day. Cross-field cap: "
+        "day_offset+days_count ≤14. Возвращает текстовую сводку."
     ),
     family="web",
     effect="read",
@@ -122,11 +183,11 @@ WEATHER_TOOL_SPEC = ToolSpec(
     trigger_examples=[
         "какая погода завтра в Москве",
         "прогноз на неделю в Питере",
-        "что с погодой на выходных",
-        "будет ли дождь в субботу",
+        "почасовой прогноз на завтра",
+        "как одеться сегодня",
     ],
     mutex_notes=[
-        "Только для запросов о ПОГОДЕ конкретного места. Для общих климатических вопросов — знание из модели.",
+        "Только для запросов о ПОГОДЕ. НЕ вызывай fetch_url на wttr.in и НЕ web_search для погоды — этот точнее (Open-Meteo).",
         "Если location не определён — переспроси юзера, не подставляй default.",
     ],
     timeout_seconds=20,
@@ -134,16 +195,14 @@ WEATHER_TOOL_SPEC = ToolSpec(
 )
 
 
-WEB_SEARCH_TOOL_SPEC = ToolSpec(
-    name="web_search_tool",
+WEB_SEARCH_SPEC = ToolSpec(
+    name="web_search",
     description=(
         "Найти информацию в интернете через Tavily search (с DDG "
-        "fallback при исчерпании квоты). Возвращает топ-3 hit'а с "
-        "title + URL + snippet, либо статус empty («no results»). "
-        "ИСПОЛЬЗУЙ когда нужна свежая информация которой нет в "
-        "модели: новости / актуальные цены / расписания / "
-        "specific factual lookup. НЕ вызывай для общих вопросов "
-        "которые модель уже знает (история, наука, культура). "
+        "fallback при исчерпании квоты). Возвращает топ hits с "
+        "title + URL + snippet, либо status=empty («no results»). "
+        "ИСПОЛЬЗУЙ для свежей информации: новости / актуальные "
+        "цены / расписания. НЕ для общих знаний (модель уже знает). "
         "Quota: 30/user/мес + 950 global — не злоупотребляй."
     ),
     family="web",
@@ -159,25 +218,24 @@ WEB_SEARCH_TOOL_SPEC = ToolSpec(
         "сколько стоит билет в Питер",
     ],
     mutex_notes=[
-        "Только для свежей информации. Для общих знаний (история, наука) — отвечай из модели.",
-        "Для извлечения контента с конкретной страницы → fetch_url_tool (после получения URL из этого search).",
-        "Для прогноза погоды — отдельный weather_tool (не web search).",
+        "Только для свежей информации. Для общих знаний — отвечай из модели.",
+        "Для извлечения контента с конкретной страницы → fetch_url. Для погоды → get_weather.",
     ],
     timeout_seconds=30,
     side_effect_class="read_only",
 )
 
 
-FETCH_URL_TOOL_SPEC = ToolSpec(
-    name="fetch_url_tool",
+FETCH_URL_SPEC = ToolSpec(
+    name="fetch_url",
     description=(
         "Скачать и извлечь читабельный контент с одной HTTP(S) "
-        "страницы (через readability-lxml — удаляет nav/ads/sidebar). "
-        "ИСПОЛЬЗУЙ ТОЛЬКО для URL'ов которые ЮЗЕР дал ИЛИ которые "
-        "вернул web_search_tool — НЕ ходи по произвольным URL'ам. "
-        "Hard timeout 30 сек, fail-closed с typed error variants "
-        "(empty url / timeout / http NNN). Возвращает чистый текст "
-        "статьи готовый к цитированию или summary."
+        "страницы. SSRF-safe: localhost / private / link-local "
+        "адреса rejected. ИСПОЛЬЗУЙ ТОЛЬКО для URL'ов которые ЮЗЕР "
+        "дал ИЛИ которые вернул web_search — НЕ для arbitrary "
+        "crawling. Runtime возвращает JSON envelope с полями "
+        "url/final_url/status/extractor/truncated/length/text — "
+        "planner работает со структурированным FetchUrlToolOk."
     ),
     family="web",
     effect="read",
@@ -192,8 +250,8 @@ FETCH_URL_TOOL_SPEC = ToolSpec(
         "почитай эту статью",
     ],
     mutex_notes=[
-        "ТОЛЬКО для user-provided ИЛИ search-returned URL'ов. НЕ для arbitrary crawling.",
-        "Для поиска информации (без конкретного URL) → web_search_tool.",
+        "ТОЛЬКО для user-provided ИЛИ search-returned URL'ов. НЕ для crawling.",
+        "Для поиска (без URL) → web_search. Для погоды → get_weather.",
     ],
     timeout_seconds=45,
     side_effect_class="read_only",
@@ -201,20 +259,21 @@ FETCH_URL_TOOL_SPEC = ToolSpec(
 
 
 WEB_SPECS: list[ToolSpec] = [
-    WEATHER_TOOL_SPEC,
-    WEB_SEARCH_TOOL_SPEC,
-    FETCH_URL_TOOL_SPEC,
+    GET_WEATHER_SPEC,
+    WEB_SEARCH_SPEC,
+    FETCH_URL_SPEC,
 ]
 
 
 __all__ = [
-    "FETCH_URL_TOOL_SPEC",
+    "FETCH_URL_SPEC",
     "FetchUrl",
     "FetchUrlToolInput",
+    "GET_WEATHER_SPEC",
     "SearchQuery",
-    "WEATHER_TOOL_SPEC",
-    "WEB_SEARCH_TOOL_SPEC",
+    "WEB_SEARCH_SPEC",
     "WEB_SPECS",
+    "WeatherGranularity",
     "WeatherLocation",
     "WeatherToolInput",
     "WebSearchToolInput",

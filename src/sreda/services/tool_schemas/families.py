@@ -491,9 +491,11 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     # ---- utility (1) ------------------------------------------------------
     "log_unsupported_request": "utility",
     # ---- web (3) ----------------------------------------------------------
-    "weather_tool": "web",
-    "web_search_tool": "web",
-    "fetch_url_tool": "web",
+    # Codex R1 CRITICAL (both branches): names match @lc_tool-decorated
+    # runtime function names, NOT build_*_tool factory names.
+    "get_weather": "web",
+    "web_search": "web",
+    "fetch_url": "web",
 })
 """Static mapping of every planned MVP tool name to its family.
 

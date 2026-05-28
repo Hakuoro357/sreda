@@ -330,7 +330,7 @@ def test_manifest_assigns_expected_checklists_count() -> None:
     "add_shopping_items", "schedule_reminder", "get_recipe", "list_shopping",
     "list_reminders", "save_recipe", "plan_week_menu", "add_family_members",
     "add_task", "create_checklist", "reply_with_buttons", "save_core_fact",
-    "log_unsupported_request", "weather_tool",
+    "log_unsupported_request", "get_weather",
 ])
 def test_manifest_includes_expected_canonical_tools(tool_name: str) -> None:
     # Spot-check the tools most likely to be referenced in tests, runbooks,
@@ -635,7 +635,7 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
     "ui": frozenset({"reply_with_buttons"}),
     "memory": frozenset({"save_core_fact", "save_episode", "recall_memory"}),
     "utility": frozenset({"log_unsupported_request"}),
-    "web": frozenset({"weather_tool", "web_search_tool", "fetch_url_tool"}),
+    "web": frozenset({"get_weather", "web_search", "fetch_url"}),
 }
 
 

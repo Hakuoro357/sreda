@@ -117,8 +117,12 @@ SAVE_CORE_FACT_SPEC = ToolSpec(
         "ТОЛЬКО для durable truths — те которые будут актуальны и "
         "через год, не только сейчас. НЕ для настроения, transient "
         "событий, мимолётных мнений (для них → save_episode). "
-        "Embedding через bge-m3, dedup при cosine > 0.95 — runtime "
-        "сам отбросит почти-дубль. Возвращает saved_core:<memory_id>."
+        "Embedding через bge-m3. ВНИМАНИЕ: runtime НЕ дедуплицирует "
+        "при сохранении — каждый вызов вставит новую строку, даже "
+        "почти-дубль. Дедупликация работает только при recall "
+        "(_dedup_pairwise по парам). Не вызывай повторно «на всякий "
+        "случай» — recall_memory покажет и без дубля. Возвращает "
+        "saved_core:<memory_id>."
     ),
     family="memory",
     effect="write",
@@ -134,7 +138,7 @@ SAVE_CORE_FACT_SPEC = ToolSpec(
     ],
     mutex_notes=[
         "ТОЛЬКО для стабильных фактов. Для recent events / mood → save_episode.",
-        "Не дублирует факт если cosine > 0.95 (runtime dedup) — спокойно вызывай повторно.",
+        "Runtime НЕ дедупит save-time — каждый вызов = новая строка. НЕ вызывай повторно по тому же факту.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",

@@ -140,6 +140,14 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"^topic_not_in_active_flow .+$", re.IGNORECASE),
         "topic_not_in_active_flow",
     ),
+    # weather (get_weather): Codex Sub-A4 web R1 HIGH catch — runtime
+    # emits ``error: не нашла город 'XXX' — уточни`` with the user-
+    # supplied location embedded (dynamic). Source:
+    # ``services/weather_tool.py:568``.
+    (
+        re.compile(r"^не\s+нашла\s+город\s+.+$", re.IGNORECASE),
+        "city_not_found",
+    ),
     # link_task_to_checklist conflict shapes (Codex Sub-A4 tasks R1 MAJOR #5).
     # Source: ``housewife_chat_tools.py:2239-2247``.
     #   "error: task_already_linked:task_X:checklist_Y. Unlink сначала..."
@@ -3731,29 +3739,35 @@ def parse_reply_with_buttons(
 
 
 # ---------------------------------------------------------------------------
-# 53-55. Web family (Sub-A4 phase 10):
-#         weather_tool / web_search_tool / fetch_url_tool
+# 53-55. Web family (Sub-A4 phase 10, R3 doc refresh):
+#         get_weather / web_search / fetch_url
 #
-# All three return free-form text (forecast / search results / page
-# content) — typed output is `raw_text` MVP boundary (same shape as
-# ListMenuOk pre-promotion). Planner sees text + branches on
-# error: prefix detection.
+# Names match the @lc_tool runtime callables in
+# services/weather_tool.py:501 and services/web_search_tool.py:269/348
+# — NOT the build_*_tool factory names. Codex Sub-A4 R1 CRITICAL.
+#
+# Two return free-form text (forecast / search results); ``fetch_url``
+# returns a JSON envelope per web_search_tool.py:418-427.
 #
 # Runtime shapes:
-#   weather_tool:
+#   get_weather:
 #     forecast text (multi-line, emoji + temps + precip)
 #     "error: empty location"
-#     "error: не нашла город ... — уточни"
+#     "error: не нашла город ... — уточни"   (→ stable code city_not_found)
 #     "error: сервис погоды не отвечает, попробуй позже"
 #     "error: пустой прогноз"
 #
-#   web_search_tool:
+#   web_search:
 #     "no results"  (empty path)
 #     multi-line title + URL + snippet
 #     "error: empty query"
 #
-#   fetch_url_tool:
-#     free-form page content (extracted via readability-lxml)
+#   fetch_url:
+#     JSON envelope (NOT raw page text) — Codex Sub-A4 web R1 MEDIUM/HIGH:
+#       {"url", "final_url", "status", "extractor" ∈ {html, json, raw},
+#        "truncated", "length", "text"}
+#     where extractor="html" is produced via readability-lxml internally,
+#     extractor="json" via json content-type, extractor="raw" otherwise.
 #     "error: empty url"
 #     "error: <reason>"
 #     "error: timeout after Ns"
@@ -3782,14 +3796,14 @@ def parse_weather_tool(
     stripped = raw.strip()
     if not stripped:
         return ToolOutputContractViolation(
-            raw_output=raw, tool_name="weather_tool",
+            raw_output=raw, tool_name="get_weather",
             timestamp=datetime.now(timezone.utc),
         )
     try:
         return WeatherToolOk(raw_text=stripped)
     except ValidationError:
         return ToolOutputContractViolation(
-            raw_output=raw, tool_name="weather_tool",
+            raw_output=raw, tool_name="get_weather",
             timestamp=datetime.now(timezone.utc),
         )
 
@@ -3829,25 +3843,72 @@ def parse_web_search_tool(
         return WebSearchToolEmpty()
     if not stripped:
         return ToolOutputContractViolation(
-            raw_output=raw, tool_name="web_search_tool",
+            raw_output=raw, tool_name="web_search",
             timestamp=datetime.now(timezone.utc),
         )
     try:
         return WebSearchToolOk(raw_text=stripped)
     except ValidationError:
         return ToolOutputContractViolation(
-            raw_output=raw, tool_name="web_search_tool",
+            raw_output=raw, tool_name="web_search",
             timestamp=datetime.now(timezone.utc),
         )
 
 
 class FetchUrlToolOk(BaseModel):
+    """Codex Sub-A4 web R1 MEDIUM (HIGH catch) + R2 MAJOR: runtime
+    fetch_url returns JSON envelope, NOT raw text. Runtime emits
+    ``{"url", "final_url", "status", "extractor", "truncated",
+       "length", "text"}`` per web_search_tool.py:418-427.
+
+    R2 corrections (Codex MEDIUM):
+    - ``extractor`` ∈ {"html", "json", "raw"} per actual runtime
+      assignments (web_search_tool.py:404/406/410/412). Readability-
+      lxml drives the HTML branch internally but is NEVER surfaced
+      as an extractor literal.
+    - ``text`` cap = _MAX_FETCH_CHARS = 12000 per
+      web_search_tool.py:43, NOT 50000.
+    """
+
     model_config = ConfigDict(extra="forbid")
     status: Literal["fetched"] = "fetched"
-    raw_text: str = Field(min_length=1, max_length=50_000)
-    """Pages can be larger than search snippets or forecast — 50k
-    char cap accommodates a long article extracted by readability-lxml.
-    Beyond that runtime caller typically truncates anyway."""
+    url: str = Field(min_length=1, max_length=2000)
+    """URL the user/planner requested (echoed back)."""
+    final_url: str = Field(min_length=1, max_length=2000)
+    """Final URL after redirects."""
+    http_status: int = Field(ge=100, le=599)
+    extractor: Literal["html", "json", "raw"]
+    """Which extractor ran:
+    - ``html``: readability-lxml (or tag strip) produced markdown
+    - ``json``: response had a JSON content-type, body serialised
+    - ``raw``: text/plain or other non-HTML, non-JSON content
+    """
+    truncated: bool
+    """True iff source body was >_MAX_FETCH_CHARS before clipping."""
+    length: int = Field(ge=0, le=13_000)
+    """Codex R2 MINOR: documented correctly — this is the length of
+    the FINAL ``text`` field (banner + truncated body), NOT the
+    pre-truncation source length. Computed as ``len(text)`` at
+    web_search_tool.py:426 after banner prepend.
+    Upper bound = _MAX_FETCH_CHARS (12000) + banner (~75) + 2 newlines."""
+    text: str = Field(min_length=1, max_length=13_000)
+    """Extracted readable content. Runtime caps source body at
+    _MAX_FETCH_CHARS (12k per web_search_tool.py:43), then prepends
+    ``_UNTRUSTED_BANNER`` (~75 chars). Final text ≤ ~12080 chars;
+    schema gives a small cushion above that."""
+
+    @model_validator(mode="after")
+    def _validate_length_matches_text(self) -> "FetchUrlToolOk":
+        """Codex Sub-A4 web R3 MINOR (medium): runtime defines
+        ``length = len(text)`` at web_search_tool.py:426. Schema
+        enforces the same invariant so a tampered envelope where
+        ``length`` and ``len(text)`` disagree fails contract."""
+        if self.length != len(self.text):
+            raise ValueError(
+                f"length={self.length} does not match len(text)="
+                f"{len(self.text)} — envelope tampering or stale field"
+            )
+        return self
 
 
 FetchUrlToolOutput = Annotated[
@@ -3865,14 +3926,45 @@ def parse_fetch_url_tool(
     stripped = raw.strip()
     if not stripped:
         return ToolOutputContractViolation(
-            raw_output=raw, tool_name="fetch_url_tool",
+            raw_output=raw, tool_name="fetch_url",
+            timestamp=datetime.now(timezone.utc),
+        )
+    # Codex R1 MEDIUM (HIGH catch): parse JSON envelope from runtime
+    try:
+        payload = _json.loads(stripped)
+    except _json.JSONDecodeError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="fetch_url",
+            timestamp=datetime.now(timezone.utc),
+        )
+    if not isinstance(payload, dict):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="fetch_url",
+            timestamp=datetime.now(timezone.utc),
+        )
+    # Codex R2 MINOR: validate required envelope keys explicitly
+    # — parser-side defaults would mask malformed runtime output
+    # and weaken the contract this migration enforces.
+    required_keys = ("url", "final_url", "status", "extractor",
+                     "truncated", "length", "text")
+    if not all(k in payload for k in required_keys):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="fetch_url",
             timestamp=datetime.now(timezone.utc),
         )
     try:
-        return FetchUrlToolOk(raw_text=stripped)
+        return FetchUrlToolOk(
+            url=payload["url"],
+            final_url=payload["final_url"],
+            http_status=payload["status"],
+            extractor=payload["extractor"],
+            truncated=payload["truncated"],
+            length=payload["length"],
+            text=payload["text"],
+        )
     except ValidationError:
         return ToolOutputContractViolation(
-            raw_output=raw, tool_name="fetch_url_tool",
+            raw_output=raw, tool_name="fetch_url",
             timestamp=datetime.now(timezone.utc),
         )
 
@@ -3935,9 +4027,9 @@ PARSERS = {
     "recall_memory": parse_recall_memory,
     "log_unsupported_request": parse_log_unsupported_request,
     "reply_with_buttons": parse_reply_with_buttons,
-    "weather_tool": parse_weather_tool,
-    "web_search_tool": parse_web_search_tool,
-    "fetch_url_tool": parse_fetch_url_tool,
+    "get_weather": parse_weather_tool,
+    "web_search": parse_web_search_tool,
+    "fetch_url": parse_fetch_url_tool,
 }
 
 
