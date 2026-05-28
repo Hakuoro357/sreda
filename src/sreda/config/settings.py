@@ -303,16 +303,36 @@ class Settings(BaseSettings):
     # Provider keys follow ``services/llm.py`` registry (e.g. ``mimo-v2.5``
     # resolves to ``mimo-v2.5-pro``, ``mimo-flash`` is the cheap+fast tier).
     planner_provider: str = Field(
-        default="mimo-v2.5-pro",
+        # Codex Sub-A12 R1 CRITICAL fix: ``mimo-v2.5`` (provider key) maps
+        # to ``mimo-v2.5-pro`` model per services/llm.py:1189. Earlier default
+        # ``mimo-v2.5-pro`` was a MODEL name, not a provider key — get_chat_llm
+        # would have returned None at runtime.
+        default="mimo-v2.5",
         validation_alias=AliasChoices(
             "SREDA_PLANNER_PROVIDER",
             "sreda_planner_provider",
         ),
         description=(
-            "LLM provider for the planner node (heavyweight model — needs "
+            "LLM provider key for the planner node (heavyweight model — needs "
             "multi-step reasoning + json-schema-strict output). Cheaper "
             "variants may break Plan schema compliance on edge cases; "
-            "benchmark before downgrading."
+            "benchmark before downgrading. Must be a provider key from "
+            "services/llm.py registry (e.g. ``mimo-v2.5`` → model "
+            "``mimo-v2.5-pro``), NOT a raw model name."
+        ),
+    )
+    planner_timeout_sec: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_TIMEOUT_SEC",
+            "sreda_planner_timeout_sec",
+        ),
+        description=(
+            "Wall-clock cap for a single planner LLM call, in seconds. "
+            "Default 60s matches the legacy ``invoke_with_per_call_timeout`` "
+            "default. Sub-A12 Phase B.2 (planner LLM wrapper)."
         ),
     )
     composer_provider: str = Field(

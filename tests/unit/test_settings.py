@@ -66,9 +66,14 @@ def test_connect_public_base_url_rejects_garbage() -> None:
 
 def test_planner_provider_default() -> None:
     """Planner needs heavyweight reasoning + json-schema compliance —
-    default tier is mimo-v2.5-pro."""
+    default tier is mimo-v2.5 (provider key) which resolves to
+    mimo-v2.5-pro model (services/llm.py:1187 ``_MIMO_MODEL_BY_PROVIDER``).
+
+    Codex Sub-A12 R1 CRITICAL: earlier default was the MODEL name
+    ``"mimo-v2.5-pro"``, but ``get_chat_llm`` expects PROVIDER KEY.
+    Returns None for any non-key value → planner runtime hard-fails."""
     settings = Settings()
-    assert settings.planner_provider == "mimo-v2.5-pro"
+    assert settings.planner_provider == "mimo-v2.5"
 
 
 def test_planner_provider_override_via_env_alias(monkeypatch) -> None:
