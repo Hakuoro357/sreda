@@ -335,6 +335,47 @@ class Settings(BaseSettings):
             "default. Sub-A12 Phase B.2 (planner LLM wrapper)."
         ),
     )
+    planner_prompt_version: int = Field(
+        default=1,
+        ge=1,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_PROMPT_VERSION",
+            "sreda_planner_prompt_version",
+        ),
+        description=(
+            "Active planner system-prompt revision. Stored in "
+            "``planner_executions.planner_prompt_version`` so audit/replay "
+            "can pin which prompt produced a given plan. Bump when "
+            "system prompt changes meaningfully (not on cosmetic edits)."
+        ),
+    )
+    planner_invalid_retry_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_INVALID_RETRY_ENABLED",
+            "sreda_planner_invalid_retry_enabled",
+        ),
+        description=(
+            "Whether the orchestrator should retry once with explicit "
+            "error feedback when parse/validate/compile fails. Default "
+            "True (production). Set False in tests/eval that assert "
+            "single-attempt behavior. Sub-A12 Phase B.4."
+        ),
+    )
+    planner_alerts_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_ALERTS_ENABLED",
+            "sreda_planner_alerts_enabled",
+        ),
+        description=(
+            "Whether orchestrator sends P1 admin alerts on final failure "
+            "(invalid plan after retry, provider unavailable, timeout, "
+            "persistence outage). Default False — offline/library mode "
+            "and eval scripts don't spam admin channels. Enable on "
+            "production rollout via env. Sub-A12 R3 #9."
+        ),
+    )
     composer_provider: str = Field(
         default="mimo-flash",
         validation_alias=AliasChoices(

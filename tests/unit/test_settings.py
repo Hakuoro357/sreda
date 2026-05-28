@@ -83,6 +83,56 @@ def test_planner_provider_override_via_env_alias(monkeypatch) -> None:
     assert settings.planner_provider == "mimo-v2.5"
 
 
+# ---------------------------------------------------------------------------
+# Sub-A12 Phase B.5 — new planner-orchestrator settings
+# ---------------------------------------------------------------------------
+
+
+def test_planner_prompt_version_default() -> None:
+    """Default prompt version = 1; pinned in planner_executions rows."""
+    settings = Settings()
+    assert settings.planner_prompt_version == 1
+
+
+def test_planner_prompt_version_override_via_env(monkeypatch) -> None:
+    monkeypatch.setenv("SREDA_PLANNER_PROMPT_VERSION", "3")
+    settings = Settings()
+    assert settings.planner_prompt_version == 3
+
+
+def test_planner_prompt_version_rejects_zero(monkeypatch) -> None:
+    """Version must be >=1 (Field ge=1)."""
+    import pytest
+    monkeypatch.setenv("SREDA_PLANNER_PROMPT_VERSION", "0")
+    with pytest.raises(Exception):  # noqa: BLE001 — pydantic ValidationError
+        Settings()
+
+
+def test_planner_invalid_retry_enabled_default() -> None:
+    """Production default: retry on parse/validate failure once."""
+    settings = Settings()
+    assert settings.planner_invalid_retry_enabled is True
+
+
+def test_planner_invalid_retry_disabled_via_env(monkeypatch) -> None:
+    monkeypatch.setenv("SREDA_PLANNER_INVALID_RETRY_ENABLED", "false")
+    settings = Settings()
+    assert settings.planner_invalid_retry_enabled is False
+
+
+def test_planner_alerts_enabled_default_off() -> None:
+    """Default OFF — library/offline mode + eval scripts don't spam
+    admin channels. Production rollout sets the env var explicitly."""
+    settings = Settings()
+    assert settings.planner_alerts_enabled is False
+
+
+def test_planner_alerts_enabled_via_env(monkeypatch) -> None:
+    monkeypatch.setenv("SREDA_PLANNER_ALERTS_ENABLED", "true")
+    settings = Settings()
+    assert settings.planner_alerts_enabled is True
+
+
 def test_composer_provider_default() -> None:
     """Composer LLM-path writes free text — a light model is fine.
     Default mimo-flash is ~3x cheaper than the planner tier."""
