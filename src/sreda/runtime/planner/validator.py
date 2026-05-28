@@ -578,7 +578,52 @@ def _phase1_check_refs(
 # ---------------------------------------------------------------------------
 
 
+def build_full_dep_graph(plan: Plan) -> dict[str, set[str]]:
+    """Codex Sub-A12 B.3 R2 MAJOR (HIGH): single source of truth for the
+    plan's dependency graph. Used by:
+
+    1. ``_phase1_detect_ref_cycles`` — cycle detection at validate_plan
+       time, so cycles via ``next`` edges or branch compose refs surface
+       as validator violations (not later as compiler PlanCompileError).
+    2. ``plan_compiler.compile`` — topological layer building.
+
+    Edge sources:
+    - ``action.args`` refs (``${stepN.field}``)
+    - ``action.depends_on`` explicit deps
+    - ``expected_outcomes[].next`` control-flow edges
+    - ``expected_outcomes[].compose.template_data`` refs (branch compose)
+
+    Excludes self-refs and edges to non-existent steps (those are
+    reported separately by other phases; including them here would
+    poison cycle detection)."""
+    graph = _build_args_dep_graph(plan)
+    for step_id, action in plan.actions.items():
+        for branch in action.expected_outcomes:
+            # next-edges: s1.next="s2" → s2 depends on s1
+            if branch.next and branch.next != step_id and branch.next in plan.actions:
+                graph.setdefault(branch.next, set()).add(step_id)
+            # branch compose ref-edges: host depends on referenced steps
+            if branch.compose is None:
+                continue
+            for ref_path in iter_refs(branch.compose.template_data):
+                target = extract_step_id(ref_path)
+                if target != step_id and target in plan.actions:
+                    graph.setdefault(step_id, set()).add(target)
+    return graph
+
+
 def _build_dep_graph(plan: Plan) -> dict[str, set[str]]:
+    """Legacy alias — kept for backwards compat with plan_compiler.
+
+    Codex Sub-A12 B.3 R2: returns the FULL graph (args + depends_on +
+    next + branch compose refs) so validator cycle detection and
+    compiler topo sort see the same edges. Earlier this only had
+    args + depends_on, which let cycles via next/compose slip past
+    validate_plan and surface later as compiler PlanCompileError."""
+    return build_full_dep_graph(plan)
+
+
+def _build_args_dep_graph(plan: Plan) -> dict[str, set[str]]:
     """Return adjacency ``consumer → {producer_step_ids}`` combining
     ref-derived edges (from ``iter_refs(action.args)``) and explicit
     ``depends_on`` edges.
