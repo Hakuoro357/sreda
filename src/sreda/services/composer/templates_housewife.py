@@ -149,6 +149,23 @@ and Phase D compose (registry deploy race). Tools already ran; we just
 need to acknowledge without re-running."""
 
 
+_INVALID_PLAN_FALLBACK = (
+    "{% if attempt_count is defined and attempt_count == 2 %}"
+    "Не получилось разобрать что ты хочешь. Попробуй переформулировать, "
+    "например: «купи молоко» или «покажи список покупок»."
+    "{% else %}"
+    "Не получилось обработать запрос, попробуй ещё раз."
+    "{% endif %}"
+)
+"""Sub-A12 Phase B.1 — used when planner returns invalid plan after
+all retries are exhausted (orchestrator.run returns success=False).
+NO tools have been called — this is the entry-point failure path.
+
+``attempt_count``: 1 = first attempt failed only (single-shot
+no-retry mode); 2 = after one explicit retry. Default branch covers
+non-2 values (no validation crash; honest message)."""
+
+
 HOUSEWIFE_TEMPLATES: dict[str, str] = {
     # shopping
     "shopping_added_ok": _SHOPPING_ADDED_OK,
@@ -170,6 +187,8 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     # error / fallback
     "generic_tool_error": _GENERIC_TOOL_ERROR,
     "partial_with_compose_error": _PARTIAL_WITH_COMPOSE_ERROR,
+    # Sub-A12 Phase B.1 — planner-side invalid-plan fallback
+    "invalid_plan_fallback": _INVALID_PLAN_FALLBACK,
 }
 
 

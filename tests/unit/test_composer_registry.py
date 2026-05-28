@@ -134,6 +134,8 @@ def test_default_registry_covers_expected_housewife_ids() -> None:
         # error / fallback
         "generic_tool_error",
         "partial_with_compose_error",
+        # Sub-A12 Phase B.1 — planner-side invalid-plan fallback
+        "invalid_plan_fallback",
     }
     assert set(REGISTRY.template_ids()) >= expected
 
@@ -451,3 +453,37 @@ def test_every_template_in_dict_is_in_registry() -> None:
             f"template_id={template_id!r} in HOUSEWIFE_TEMPLATES "
             f"but not in REGISTRY"
         )
+
+
+# ---------------------------------------------------------------------------
+# Sub-A12 Phase B.1 — invalid_plan_fallback (planner-side failure)
+# ---------------------------------------------------------------------------
+
+
+def test_render_invalid_plan_fallback_after_retry() -> None:
+    """attempt_count=2 → fuller message with reformulation hint."""
+    out = render("invalid_plan_fallback", {"attempt_count": 2})
+    assert "переформулировать" in out
+    assert "купи молоко" in out
+    assert "покажи список покупок" in out
+
+
+def test_render_invalid_plan_fallback_single_shot() -> None:
+    """attempt_count=1 → short retry-ask message."""
+    out = render("invalid_plan_fallback", {"attempt_count": 1})
+    assert "Не получилось обработать запрос" in out
+    assert "попробуй ещё раз" in out
+
+
+def test_render_invalid_plan_fallback_without_attempt_count() -> None:
+    """No attempt_count provided — must not crash (StrictUndefined guard
+    via ``is defined``). Falls through to default short message."""
+    out = render("invalid_plan_fallback", {})
+    assert "Не получилось обработать запрос" in out
+
+
+def test_render_invalid_plan_fallback_attempt_count_other_value() -> None:
+    """attempt_count=3 (defensive — should never happen but template
+    must not crash) — falls through to default branch."""
+    out = render("invalid_plan_fallback", {"attempt_count": 3})
+    assert "Не получилось обработать запрос" in out

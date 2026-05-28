@@ -1219,6 +1219,75 @@ def _violation_from_pydantic_error(
 # ---------------------------------------------------------------------------
 
 
+def _allowed_status_literals(output_model: Any) -> set[str]:
+    """Codex Sub-A12 Phase B.1 R3 MAJOR: extract every Literal value the
+    ``status`` discriminator can take across the discriminated union.
+
+    Used by Phase 3 branch-match validation. Returns empty set if the
+    output_model shape is unrecognised (e.g. plain model without a
+    ``status`` Literal); callers treat empty set as "skip the check"
+    so legacy/edge-case tools don't trip on branch validation."""
+    statuses: set[str] = set()
+    try:
+        from typing import get_args
+        union_t = get_args(output_model)[0] if get_args(output_model) else output_model
+        for member in get_args(union_t):
+            status_field = getattr(member, "model_fields", {}).get("status")
+            if status_field is None:
+                continue
+            for lit_value in get_args(status_field.annotation):
+                statuses.add(str(lit_value))
+    except Exception:  # noqa: BLE001 — defensive against unusual shapes
+        return set()
+    return statuses
+
+
+def _phase3_validate_branch_matches(
+    step_id: str,
+    action: Action,
+    tool_spec: ToolSpec,
+) -> Iterator[Violation]:
+    """Codex Sub-A12 Phase B.1 R3 MAJOR: validate every
+    ``expected_outcomes[].match`` value against the tool's output_model.
+
+    Currently checks just the ``status`` field (the planner's primary
+    branching dimension) — ``status`` MUST be one of the Literal values
+    declared in the discriminated union. Catches invented statuses like
+    ``all_duplicate`` (does not exist in add_shopping_items output)."""
+    allowed = _allowed_status_literals(tool_spec.output_model)
+    if not allowed:
+        # Output model has no status Literal we can introspect — skip check.
+        return
+    for branch_idx, branch in enumerate(action.expected_outcomes):
+        match_dict = branch.match or {}
+        status_value = match_dict.get("status")
+        if status_value is None:
+            continue  # branch matches on other fields; not validated here
+        if not isinstance(status_value, str):
+            yield Violation(
+                step_id=step_id,
+                tool=action.tool,
+                code="branch_match_status_wrong_type",
+                message=(
+                    f"expected_outcomes[{branch_idx}].match.status must be "
+                    f"a string Literal value; got {type(status_value).__name__}"
+                ),
+            )
+            continue
+        if status_value not in allowed:
+            yield Violation(
+                step_id=step_id,
+                tool=action.tool,
+                code="branch_match_status_invented",
+                message=(
+                    f"expected_outcomes[{branch_idx}].match.status="
+                    f"{status_value!r} is NOT a real Literal in "
+                    f"{action.tool}.output_model. Allowed: "
+                    f"{sorted(allowed)}"
+                ),
+            )
+
+
 def validate_action_args(
     step_id: str,
     action: Action,
@@ -1255,7 +1324,287 @@ def validate_action_args(
     )
     # Phase 2: schema-aware partial
     violations.extend(_phase2_validate_args(step_id, action, tool_spec))
+    # Phase 3: branch-match status validation against output_model.
+    # Codex Sub-A12 Phase B.1 R3 MAJOR — catches invented statuses
+    # (e.g. ``all_duplicate``) at validation time, not at run-time.
+    violations.extend(_phase3_validate_branch_matches(step_id, action, tool_spec))
     return violations
+
+
+def _output_union_members(output_model: Any) -> tuple[type, ...]:
+    """Extract the tuple of pydantic BaseModel members from an
+    Annotated[Union[A, B, ...], Field(discriminator=...)] type.
+
+    Returns empty tuple if shape is not a discriminated union (e.g.
+    a plain BaseModel — caller treats that as "single-member union")."""
+    try:
+        from typing import get_args
+        # Annotated wraps Union — first arg is the Union itself
+        anno_args = get_args(output_model)
+        if not anno_args:
+            # Plain class — treat as single member
+            return (output_model,) if isinstance(output_model, type) else ()
+        union_t = anno_args[0]
+        members = get_args(union_t)
+        return tuple(m for m in members if isinstance(m, type))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def _filter_members_by_status(
+    members: tuple[type, ...], status_value: str | None,
+) -> tuple[type, ...]:
+    """Codex Sub-A12 Phase B.1 R7 MAJOR: narrow union members to those
+    whose ``status`` Literal contains ``status_value``. Used for
+    branch-compose ref validation where the branch only fires when
+    ``status == status_value`` — so refs must resolve against ONLY
+    that member, not the whole union.
+
+    If ``status_value`` is None (root compose, no specific status) —
+    returns all members."""
+    from typing import get_args
+    if status_value is None:
+        return members
+    matched: list[type] = []
+    for member in members:
+        try:
+            sf = member.model_fields.get("status")
+            if sf is None:
+                continue
+            lit_values = get_args(sf.annotation)
+            if status_value in (str(v) for v in lit_values):
+                matched.append(member)
+        except Exception:  # noqa: BLE001
+            continue
+    return tuple(matched)
+
+
+def _ref_field_exists_in_output(
+    output_model: Any,
+    segments: list[str],
+    *,
+    narrow_to_status: str | None = None,
+) -> bool | None:
+    """Walk ``segments`` against ``output_model``. Returns True if the
+    path is valid in AT LEAST ONE relevant union member; False if no
+    member has the first segment; None if introspection cannot decide
+    (treated as "skip the check" so legacy/edge-case models don't trip).
+
+    If ``narrow_to_status`` is set (branch compose case), only union
+    members whose status Literal == narrow_to_status are considered —
+    this catches the R6→R7 bug where branch compose for status='error'
+    refs a field that only exists on the success variant.
+
+    For multi-segment paths only the first segment is checked deeply;
+    nested-field validation is best-effort. The first-segment check is
+    enough to catch the common bug."""
+    members = _output_union_members(output_model)
+    if not members:
+        return None  # opaque shape — caller skips check
+
+    if narrow_to_status is not None:
+        members = _filter_members_by_status(members, narrow_to_status)
+        if not members:
+            return None  # no member matches this status — skip
+                         # (status validity is checked elsewhere by phase 3)
+
+    if not segments:
+        return True  # no path to walk (shouldn't happen for refs)
+
+    first = segments[0]
+    if first.startswith("_"):
+        # Dunder/private — separately caught by resolve_refs at runtime;
+        # not a structural concern here.
+        return True
+
+    for member in members:
+        try:
+            field_names = set(member.model_fields.keys())
+        except Exception:  # noqa: BLE001
+            continue
+        if first in field_names:
+            # First segment matches this member — accept; deeper
+            # validation deferred to run-time resolve_refs (output
+            # objects may be dicts that don't carry full type info).
+            return True
+    return False
+
+
+def _parse_ref_segments(ref_path: str) -> list[str]:
+    """Split ``s1.field1.field2`` into ``[field1, field2]`` (drops step
+    id which is consumed via extract_step_id)."""
+    parts = ref_path.split(".")
+    if len(parts) <= 1:
+        return []
+    return parts[1:]
+
+
+def _phase1_check_compose_refs(
+    plan: Plan, registry: Mapping[str, ToolSpec] | None = None,
+) -> Iterator[Violation]:
+    """Codex Sub-A12 Phase B.1 R4/R5/R7 MAJOR: validate ``${...}`` refs
+    that live in ``compose.template_data`` — both root-level Plan compose
+    and per-branch composes inside each action's ``expected_outcomes``.
+
+    R4: catch refs to non-existent steps (``${s99.foo}``).
+    R5: catch refs to existing step but non-existent top-level output
+        field (``${s1.items}`` where add_shopping_items has only
+        ``added_count``/``item_ids``).
+    R7: variant-aware narrowing for branch composes — when a branch
+        fires on ``{status: "X"}``, host-step refs are validated only
+        against the union member with that status.
+
+    Known TODO (Phase B.6 — Codex R7 high MAJOR open):
+        Root compose refs are validated union-wide. When a branch with
+        ``next=None`` AND ``compose=None`` falls through to root compose,
+        a ref like ``${s1.added_count}`` in root.template_data can pass
+        (added_count exists on success variants) but blow up at runtime
+        if the actual outcome was an error variant. Closing this needs
+        fallthrough-statuses analysis — out of scope for B.1. For now:
+        planner must use refs in root compose that work across all
+        statuses, or use literals.
+
+    Self-ref check applies to branch composes (inside a host action):
+    a branch compose cannot reference its own host step's pre-execution
+    state but CAN reference its own output (the branch fires post-output).
+    Per Sub-A12 B.1: self-ref allowed in branch composes."""
+    # Root compose — refs may target any step, no self-ref scope
+    for ref_path in iter_refs(plan.compose.template_data):
+        target = extract_step_id(ref_path)
+        if target not in plan.actions:
+            yield Violation(
+                step_id=None,
+                tool=None,
+                code="compose_ref_unknown_target",
+                message=(
+                    f"root compose ref '${{{ref_path}}}' targets unknown "
+                    f"step {target!r}. Available: "
+                    f"{sorted(plan.actions.keys())}"
+                ),
+            )
+            continue
+        if registry is not None:
+            yield from _maybe_check_field_path(
+                ref_path=ref_path,
+                target_step_id=target,
+                plan=plan,
+                registry=registry,
+                location="root compose",
+                host_step_id=None,
+                host_tool=None,
+            )
+
+    # Branch composes — owned by a host action; self-ref forbidden
+    for host_step_id, action in plan.actions.items():
+        for branch_idx, branch in enumerate(action.expected_outcomes):
+            if branch.compose is None:
+                continue
+            for ref_path in iter_refs(branch.compose.template_data):
+                target = extract_step_id(ref_path)
+                location = (
+                    f"{host_step_id}.expected_outcomes[{branch_idx}].compose"
+                )
+                if target not in plan.actions:
+                    yield Violation(
+                        step_id=host_step_id,
+                        tool=action.tool,
+                        code="compose_ref_unknown_target",
+                        message=(
+                            f"branch compose at {location} ref "
+                            f"'${{{ref_path}}}' targets unknown step "
+                            f"{target!r}. Available: "
+                            f"{sorted(plan.actions.keys())}"
+                        ),
+                    )
+                    continue
+                if registry is not None:
+                    # R7 MAJOR fix — narrow union members to those
+                    # matching the branch's status. Branch compose at
+                    # {status: "error"} can only reference fields from
+                    # the error variant of the HOST step (the one that
+                    # fired the branch).
+                    #
+                    # R7 medium follow-up (post-ceiling fix): narrowing
+                    # ONLY applies when ref points back at the host
+                    # step itself. Cross-step refs (e.g. branch on s2
+                    # with status="ok" ref'ing ${s1.foo}) carry no
+                    # status info about s1 — narrowing would silently
+                    # skip the check because no s1 member has
+                    # status="ok". Use union-wide check for cross-step.
+                    branch_status = (branch.match or {}).get("status")
+                    narrow = (
+                        branch_status
+                        if (isinstance(branch_status, str) and target == host_step_id)
+                        else None
+                    )
+                    yield from _maybe_check_field_path(
+                        ref_path=ref_path,
+                        target_step_id=target,
+                        plan=plan,
+                        registry=registry,
+                        location=f"branch compose at {location}",
+                        host_step_id=host_step_id,
+                        host_tool=action.tool,
+                        narrow_to_status=narrow,
+                    )
+
+
+def _maybe_check_field_path(
+    *,
+    ref_path: str,
+    target_step_id: str,
+    plan: Plan,
+    registry: Mapping[str, ToolSpec],
+    location: str,
+    host_step_id: str | None,
+    host_tool: str | None,
+    narrow_to_status: str | None = None,
+) -> Iterator[Violation]:
+    """Helper: yield a violation if ref's top-level field doesn't exist
+    in target tool's output_model. Skip silently if the output_model
+    shape is opaque (e.g. test stubs without proper Union shape).
+
+    If ``narrow_to_status`` is set (branch compose), validate refs
+    against ONLY the union member whose status Literal matches —
+    catches Codex R7 case where branch for status='error' refs a
+    field that only exists on the success variant."""
+    target_action = plan.actions[target_step_id]
+    target_spec = registry.get(target_action.tool)
+    if target_spec is None:
+        return  # unknown_tool already reported separately
+    segments = _parse_ref_segments(ref_path)
+    if not segments:
+        return  # bare ${stepN} — nothing to validate
+    result = _ref_field_exists_in_output(
+        target_spec.output_model, segments, narrow_to_status=narrow_to_status,
+    )
+    if result is False:
+        members = _output_union_members(target_spec.output_model)
+        if narrow_to_status is not None:
+            members = _filter_members_by_status(members, narrow_to_status)
+        # Collect available top-level fields across the relevant union members
+        available: set[str] = set()
+        for m in members:
+            try:
+                available.update(m.model_fields.keys())
+            except Exception:  # noqa: BLE001
+                continue
+        status_note = (
+            f" (narrowed to status={narrow_to_status!r})"
+            if narrow_to_status is not None
+            else ""
+        )
+        yield Violation(
+            step_id=host_step_id,
+            tool=host_tool,
+            code="compose_ref_unknown_field",
+            message=(
+                f"{location} ref '${{{ref_path}}}': field {segments[0]!r} "
+                f"is NOT in {target_action.tool}.output_model{status_note}. "
+                f"Available top-level fields: "
+                f"{sorted(available) or '(none)'}"
+            ),
+        )
 
 
 def validate_plan(
@@ -1290,6 +1639,10 @@ def validate_plan(
     # Cross-action cycle check via ref edges + depends_on
     # (Codex R2 MAJOR #4 — Plan schema only sees depends_on edges).
     violations.extend(_phase1_detect_ref_cycles(plan))
+    # Codex Sub-A12 Phase B.1 R4/R5 MAJOR — compose template_data refs
+    # are now checked for: (R4) target step existence + (R5) top-level
+    # field existence in target tool's output_model.
+    violations.extend(_phase1_check_compose_refs(plan, registry=registry))
     return violations
 
 
