@@ -80,6 +80,7 @@ Known deferred limitations:
 
 from __future__ import annotations
 
+import collections.abc
 import types
 import typing
 from typing import Annotated, Any, Iterator, Mapping, Union, get_args, get_origin
@@ -1424,6 +1425,122 @@ def _filter_members_by_status(
     return tuple(matched)
 
 
+def _flatten_union_arms(annotation: Any) -> list[Any] | None:
+    """If ``annotation`` (after stripping an outer ``Annotated``) is a
+    ``Union`` / ``X | Y``, return its non-None arms with NESTED unions
+    flattened and per-arm ``Annotated`` stripped; otherwise None.
+
+    Handles the shapes a flat distinct-model count missed (Codex #36 R2
+    MAJOR): ``Optional[A | B]`` (= ``Union[A | B, None]`` — a nested-union
+    arg) and ``Annotated[A, ...] | Annotated[B, ...]`` (per-arm Annotated)."""
+    inner = annotation
+    while get_origin(inner) is Annotated:
+        inner = get_args(inner)[0]
+    if get_origin(inner) not in (Union, types.UnionType):
+        return None
+    arms: list[Any] = []
+    for arm in get_args(inner):
+        if arm is type(None):
+            continue
+        nested = _flatten_union_arms(arm)
+        if nested is not None:
+            arms.extend(nested)
+            continue
+        stripped = arm
+        while get_origin(stripped) is Annotated:
+            stripped = get_args(stripped)[0]
+        arms.append(stripped)
+    return arms
+
+
+def _is_sequence_origin(origin: Any) -> bool:
+    """True for concrete ``list``/``set``/``frozenset``/``tuple`` AND
+    abstract ``collections.abc.Sequence``/``Set`` parameterizations (e.g.
+    ``Sequence[Model]`` — Codex #36 R2 MEDIUM). The runtime resolver never
+    projects through any of these. ``str``/``bytes`` are excluded — they
+    aren't field-bearing containers."""
+    if origin in (list, set, frozenset, tuple):
+        return True
+    if isinstance(origin, type) and origin not in (str, bytes):
+        return issubclass(
+            origin, (collections.abc.Sequence, collections.abc.Set)
+        )
+    return False
+
+
+def _annotation_path_status(annotation: Any, segments: list[str]) -> bool | None:
+    """Can the runtime ref resolver walk the remaining ``segments`` into a
+    value of ``annotation``? (#36)
+
+    Mirrors ``interpolation._resolve_path`` EXACTLY: a segment is resolved
+    by dict-key lookup OR attribute access — sequences are NEVER projected.
+
+    - ``True``  : resolvable against an introspectable nested BaseModel.
+    - ``False`` : guaranteed runtime failure (a segment remains after a
+      sequence — e.g. ``${s1.recipe.ingredients.name}``).
+    - ``None``  : indeterminate (dynamic dict keys, scalar-with-attrs like
+      ``datetime.year``, ``Any``, or an ambiguous union arm) → defer.
+
+    Unions are combined tri-state across ALL flattened, Annotated-stripped
+    arms — never collapsed to a single arm (Codex #36 MAJOR #2)."""
+    if not segments:
+        return True  # ref ends at this value — any type acceptable
+
+    arms = _flatten_union_arms(annotation)
+    if arms is not None:
+        saw_true = saw_indeterminate = False
+        for arm in arms:
+            r = _annotation_path_status(arm, segments)
+            if r is True:
+                saw_true = True
+            elif r is None:
+                saw_indeterminate = True
+        if saw_true:
+            return True  # valid against at least one arm
+        if saw_indeterminate:
+            return None  # can't disprove on some arm → defer
+        return False  # every arm definitively rejects
+
+    bare = _strip_optional_and_annotated(annotation)
+    nested = _try_extract_basemodel(bare)
+    if nested is not None:
+        return _member_path_status(nested, segments)
+    if _is_sequence_origin(get_origin(bare)):
+        # Runtime cannot project a remaining segment through a sequence.
+        return False
+    # dict (dynamic keys) / scalar-with-attrs / Any / custom — not
+    # statically decidable → defer to runtime.
+    return None
+
+
+def _member_path_status(model: Any, segments: list[str]) -> bool | None:
+    """Walk ``segments`` against a single BaseModel ``model`` (#36).
+
+    - ``True``  — first segment is a field and the deeper path (if any)
+      resolves.
+    - ``False`` — a segment is definitively absent on this introspectable
+      model: a real bug worth flagging.
+    - ``None``  — indeterminate (model not introspectable / deeper shape
+      opaque or ambiguous) → defer to runtime.
+
+    Recursion is bounded by ``len(segments)`` (each level consumes one
+    segment), so self-referential model graphs cannot loop forever."""
+    if not segments:
+        return True
+    first = segments[0]
+    if first.startswith("_"):
+        return True  # dunder/private — runtime owns this (separate guard)
+    try:
+        fields = model.model_fields
+    except Exception:  # noqa: BLE001
+        return None  # not introspectable — skip
+    if first not in fields:
+        return False
+    if len(segments) == 1:
+        return True
+    return _annotation_path_status(fields[first].annotation, segments[1:])
+
+
 def _ref_field_exists_in_output(
     output_model: Any,
     segments: list[str],
@@ -1431,18 +1548,21 @@ def _ref_field_exists_in_output(
     narrow_to_status: str | None = None,
 ) -> bool | None:
     """Walk ``segments`` against ``output_model``. Returns True if the
-    path is valid in AT LEAST ONE relevant union member; False if no
-    member has the first segment; None if introspection cannot decide
-    (treated as "skip the check" so legacy/edge-case models don't trip).
+    path is valid in AT LEAST ONE relevant union member; False if every
+    relevant member definitively rejects it; None if introspection cannot
+    decide (treated as "skip the check" so legacy/edge-case models don't
+    trip).
 
     If ``narrow_to_status`` is set (branch compose case), only union
     members whose status Literal == narrow_to_status are considered —
     this catches the R6→R7 bug where branch compose for status='error'
     refs a field that only exists on the success variant.
 
-    For multi-segment paths only the first segment is checked deeply;
-    nested-field validation is best-effort. The first-segment check is
-    enough to catch the common bug."""
+    #36: nested segments ARE walked — for ``${s1.recipe.bogus}`` where
+    ``recipe`` is a nested ``BaseModel`` without a ``bogus`` field, this
+    returns False. Walking stops (returns None → no violation) the moment
+    a field is opaque (dict/Any/primitive), so unseeable shapes never
+    false-positive."""
     members = _output_union_members(output_model)
     if not members:
         return None  # opaque shape — caller skips check
@@ -1462,17 +1582,22 @@ def _ref_field_exists_in_output(
         # not a structural concern here.
         return True
 
+    # Union semantics: True if ANY member fully validates the path; else
+    # None if at least one member is indeterminate (defer, don't
+    # false-positive); else False (every member definitively rejects it).
+    saw_indeterminate = False
+    saw_definitive_reject = False
     for member in members:
-        try:
-            field_names = set(member.model_fields.keys())
-        except Exception:  # noqa: BLE001
-            continue
-        if first in field_names:
-            # First segment matches this member — accept; deeper
-            # validation deferred to run-time resolve_refs (output
-            # objects may be dicts that don't carry full type info).
+        status = _member_path_status(member, segments)
+        if status is True:
             return True
-    return False
+        if status is None:
+            saw_indeterminate = True
+        else:
+            saw_definitive_reject = True
+    if saw_indeterminate:
+        return None
+    return False if saw_definitive_reject else None
 
 
 def _parse_ref_segments(ref_path: str) -> list[str]:

@@ -33,8 +33,9 @@ Coverage layers:
 
 from __future__ import annotations
 
+import collections.abc
 import typing
-from typing import Literal, NewType
+from typing import Annotated, Literal, NewType
 
 import pytest
 from pydantic import (
@@ -1603,3 +1604,290 @@ def test_llm_required_keys_skipped_when_map_none() -> None:
         llm_prompt_required_keys=None,
     )
     assert not [v for v in violations if v.code == "llm_compose_missing_data"]
+
+
+# ---------------------------------------------------------------------------
+# #36 — nested-path ref validation in compose template_data.
+# `_ref_field_exists_in_output` previously checked ONLY the first ref
+# segment; `${s1.recipe.bogus}` (recipe = nested BaseModel) passed plan
+# validation and blew up at runtime resolve_refs. Now nested segments are
+# walked when the field is an introspectable nested BaseModel (peeling
+# Optional/Annotated/list); opaque shapes (dict/Any) stay deferred.
+# ---------------------------------------------------------------------------
+
+
+class _RecipeIngredient(BaseModel):
+    name: str
+    qty: str
+
+
+class _RecipeData(BaseModel):
+    title: str
+    ingredients: list[_RecipeIngredient]
+
+
+class _RecipeFoundOutput(ToolOutput):
+    status: Literal["found"] = "found"
+    recipe: _RecipeData
+    extras: dict = {}  # opaque deeper shape — must stay deferred
+
+
+def _recipe_spec() -> ToolSpec:
+    return ToolSpec(  # type: ignore[arg-type]
+        name="get_recipe_any_source",
+        description="test recipe spec",
+        family="recipes",
+        effect="read",
+        read_domains=["recipes"],
+        write_domains=[],
+        input_model=_ShoppingInput,
+        output_model=_RecipeFoundOutput,
+    )
+
+
+def _recipe_plan(ref: str) -> Plan:
+    """Single read step whose ROOT compose holds the ref under test."""
+    return Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={
+            "s1": Action(
+                tool="get_recipe_any_source",
+                args={"items": ["x"]},
+                expected_outcomes=[OutcomeBranch(match={"status": "found"})],
+            )
+        },
+        compose=ComposerCall(
+            kind="llm",
+            llm_prompt_key="recipe_narrative",
+            template_data={"text": ref},
+        ),
+    )
+
+
+def test_nested_compose_ref_valid_subfield_passes() -> None:
+    plan = _recipe_plan("${s1.recipe.title}")
+    violations = validate_plan(plan, {"get_recipe_any_source": _recipe_spec()})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_nested_compose_ref_invalid_subfield_flagged() -> None:
+    plan = _recipe_plan("${s1.recipe.bogus}")
+    violations = validate_plan(plan, {"get_recipe_any_source": _recipe_spec()})
+    bad = [v for v in violations if v.code == "compose_ref_unknown_field"]
+    assert bad and "bogus" in bad[0].message
+
+
+def test_compose_ref_terminal_list_passes() -> None:
+    """Referencing the whole list (no further segment) is fine — the
+    executor resolves `${s1.recipe.ingredients}` to the list value."""
+    plan = _recipe_plan("${s1.recipe.ingredients}")
+    violations = validate_plan(plan, {"get_recipe_any_source": _recipe_spec()})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_compose_ref_through_list_flagged() -> None:
+    """Codex #36 MAJOR #1: the runtime resolver (interpolation._resolve_path)
+    walks dict-keys/attrs only — it NEVER projects through a sequence. So
+    `${s1.recipe.ingredients.name}` is a guaranteed runtime failure and must
+    be flagged at plan time, NOT blessed by peeling the list element."""
+    plan = _recipe_plan("${s1.recipe.ingredients.name}")
+    violations = validate_plan(plan, {"get_recipe_any_source": _recipe_spec()})
+    assert [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_compose_ref_through_list_invalid_inner_also_flagged() -> None:
+    plan = _recipe_plan("${s1.recipe.ingredients.bogus}")
+    violations = validate_plan(plan, {"get_recipe_any_source": _recipe_spec()})
+    assert [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_nested_compose_ref_opaque_field_deferred() -> None:
+    """`extras` is a plain dict — deeper path not introspectable, must
+    NOT be flagged (defer to runtime resolve_refs)."""
+    plan = _recipe_plan("${s1.extras.whatever.deep}")
+    violations = validate_plan(plan, {"get_recipe_any_source": _recipe_spec()})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_first_level_compose_ref_unknown_field_still_flagged() -> None:
+    """Regression: existing first-segment check keeps working."""
+    plan = _recipe_plan("${s1.nonexistent}")
+    violations = validate_plan(plan, {"get_recipe_any_source": _recipe_spec()})
+    bad = [v for v in violations if v.code == "compose_ref_unknown_field"]
+    assert bad and "nonexistent" in bad[0].message
+
+
+# ---------------------------------------------------------------------------
+# Latent-trap guard: a nested field typed `Union[ModelA, ModelB]` (two
+# distinct BaseModels) must NOT be walked against a single arm.
+# `_strip_optional_and_annotated` collapses such a union to its FIRST arm,
+# so a ref to a field that only exists on the SECOND arm would have been
+# spuriously rejected with compose_ref_unknown_field. The fix defers such
+# ambiguous unions to runtime resolve_refs. No production output model has
+# this shape yet (all nested unions are `Model | None` or `list[Model]`),
+# but the guard prevents a future model from tripping the validator.
+# ---------------------------------------------------------------------------
+
+
+class _PayloadVariantA(BaseModel):
+    kind_a_field: str
+
+
+class _PayloadVariantB(BaseModel):
+    kind_b_field: str
+
+
+class _UnionPayloadOutput(ToolOutput):
+    status: Literal["found"] = "found"
+    payload: _PayloadVariantA | _PayloadVariantB
+
+
+def _union_payload_spec() -> ToolSpec:
+    return ToolSpec(  # type: ignore[arg-type]
+        name="get_union_payload",
+        description="test union payload spec",
+        family="recipes",
+        effect="read",
+        read_domains=["recipes"],
+        write_domains=[],
+        input_model=_ShoppingInput,
+        output_model=_UnionPayloadOutput,
+    )
+
+
+def _union_payload_plan(ref: str) -> Plan:
+    return Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={
+            "s1": Action(
+                tool="get_union_payload",
+                args={"items": ["x"]},
+                expected_outcomes=[OutcomeBranch(match={"status": "found"})],
+            )
+        },
+        compose=ComposerCall(
+            kind="llm",
+            llm_prompt_key="recipe_narrative",
+            template_data={"text": ref},
+        ),
+    )
+
+
+def test_nested_union_of_distinct_models_subfield_deferred() -> None:
+    """Ref to a field that exists ONLY on the second union arm must be
+    deferred (no compose_ref_unknown_field), not walked against the first
+    arm. Previously `payload` collapsed to `_PayloadVariantA`, so the
+    `_PayloadVariantB`-only `kind_b_field` was spuriously flagged."""
+    plan = _union_payload_plan("${s1.payload.kind_b_field}")
+    violations = validate_plan(plan, {"get_union_payload": _union_payload_spec()})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_nested_union_of_distinct_models_first_arm_subfield_deferred() -> None:
+    """Symmetry: a field present on the FIRST arm also resolves (valid via
+    that arm), so no compose_ref_unknown_field."""
+    plan = _union_payload_plan("${s1.payload.kind_a_field}")
+    violations = validate_plan(plan, {"get_union_payload": _union_payload_spec()})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_nested_union_subfield_on_neither_arm_flagged() -> None:
+    """Precision (tri-state walker): a field that exists on NEITHER union
+    arm is a real bug — every arm rejects it → flagged."""
+    plan = _union_payload_plan("${s1.payload.on_no_arm}")
+    violations = validate_plan(plan, {"get_union_payload": _union_payload_spec()})
+    assert [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+# ---------------------------------------------------------------------------
+# #36 R2 — union/sequence shapes a flat distinct-model count missed
+# (Codex R2 MAJOR/MEDIUM): Optional[A|B], Annotated-per-arm unions, and
+# abstract Sequence[Model]. Now handled by the tri-state walker.
+# ---------------------------------------------------------------------------
+
+class _OptUnionOutput(ToolOutput):
+    status: Literal["found"] = "found"
+    payload: _PayloadVariantA | _PayloadVariantB | None = None
+
+
+class _AnnotatedArmsOutput(ToolOutput):
+    status: Literal["found"] = "found"
+    payload: (
+        Annotated[_PayloadVariantA, "a"]
+        | Annotated[_PayloadVariantB, "b"]
+    )
+
+
+class _AbstractSeqOutput(ToolOutput):
+    status: Literal["found"] = "found"
+    rows: collections.abc.Sequence[_PayloadVariantA]
+
+
+def _spec_with_output(name: str, output_model: type) -> ToolSpec:
+    return ToolSpec(  # type: ignore[arg-type]
+        name=name,
+        description=f"test spec {name}",
+        family="recipes",
+        effect="read",
+        read_domains=["recipes"],
+        write_domains=[],
+        input_model=_ShoppingInput,
+        output_model=output_model,
+    )
+
+
+def _plan_for(tool: str, ref: str) -> Plan:
+    return Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={
+            "s1": Action(
+                tool=tool, args={"items": ["x"]},
+                expected_outcomes=[OutcomeBranch(match={"status": "found"})],
+            )
+        },
+        compose=ComposerCall(
+            kind="llm", llm_prompt_key="recipe_narrative",
+            template_data={"text": ref},
+        ),
+    )
+
+
+def test_optional_union_subfield_resolves_via_arm() -> None:
+    """Optional[A|B] is a nested union arg the flat count missed; the
+    walker still resolves a B-only field through arm B (no violation)."""
+    spec = _spec_with_output("get_opt_union", _OptUnionOutput)
+    plan = _plan_for("get_opt_union", "${s1.payload.kind_b_field}")
+    violations = validate_plan(plan, {"get_opt_union": spec})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_optional_union_subfield_on_neither_arm_flagged() -> None:
+    spec = _spec_with_output("get_opt_union", _OptUnionOutput)
+    plan = _plan_for("get_opt_union", "${s1.payload.on_no_arm}")
+    violations = validate_plan(plan, {"get_opt_union": spec})
+    assert [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_annotated_per_arm_union_resolves_via_arm() -> None:
+    """`Annotated[A,...] | Annotated[B,...]` — per-arm Annotated the flat
+    count missed; walker strips Annotated per arm and resolves via B."""
+    spec = _spec_with_output("get_annot_union", _AnnotatedArmsOutput)
+    plan = _plan_for("get_annot_union", "${s1.payload.kind_b_field}")
+    violations = validate_plan(plan, {"get_annot_union": spec})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_abstract_sequence_through_flagged() -> None:
+    """Abstract `collections.abc.Sequence[Model]` — runtime still can't
+    project it, so a segment after it is flagged (Codex R2 MEDIUM)."""
+    spec = _spec_with_output("get_abstract_seq", _AbstractSeqOutput)
+    plan = _plan_for("get_abstract_seq", "${s1.rows.kind_a_field}")
+    violations = validate_plan(plan, {"get_abstract_seq": spec})
+    assert [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+def test_abstract_sequence_terminal_passes() -> None:
+    spec = _spec_with_output("get_abstract_seq", _AbstractSeqOutput)
+    plan = _plan_for("get_abstract_seq", "${s1.rows}")
+    violations = validate_plan(plan, {"get_abstract_seq": spec})
+    assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
