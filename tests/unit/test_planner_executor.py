@@ -26,8 +26,10 @@ from pydantic import BaseModel
 
 from sreda.runtime.planner.executor import (
     ExecutorError,
+    StepResult,
     _match_branch,
     _output_as_dict,
+    _summarise_outcome,
     execute_plan,
 )
 from sreda.runtime.planner.plan_compiler import compile as compile_plan
@@ -1312,3 +1314,115 @@ def test_same_layer_steps_see_only_pre_layer_outputs() -> None:
     assert by_id["s1"].status == "ok"
     assert by_id["s2"].status == "ok"
     assert log.outcome == "completed"
+
+
+# ---------------------------------------------------------------------------
+# #29 — committed_statuses: precise aborted vs aborted_partial. A write tool
+# whose matched 'ok' status is an idempotent no-op (add_shopping_items→empty,
+# link_task_to_checklist→already_linked, ...) did NOT commit, so an abort
+# after it stays plain `aborted`, not `aborted_partial`. Tests target
+# _summarise_outcome directly with the real registry (now annotated).
+# ---------------------------------------------------------------------------
+
+
+def _sr(
+    tool: str,
+    status: str,
+    parsed_status: str | None = None,
+    *,
+    matched_status: str | None = None,
+) -> StepResult:
+    """Build a StepResult. ``parsed_status`` populates parsed_output['status']
+    (the REAL tool status the classifier reads); ``matched_status`` is the
+    branch-match status (deliberately independent — a catch-all/non-status
+    branch leaves it None even for a real write)."""
+    return StepResult(
+        step_id="s1",
+        tool=tool,
+        status=status,
+        parsed_output={"status": parsed_status} if parsed_status else None,
+        matched_status=matched_status,
+    )
+
+
+def test_29_no_op_write_status_stays_aborted() -> None:
+    """add_shopping_items parsed 'empty' (count=0) → not in
+    committed_statuses={'added'} → no committed write → plain aborted."""
+    results = [_sr("add_shopping_items", "ok", "empty")]
+    assert _summarise_outcome(results, aborted=True, registry=REGISTRY) == "aborted"
+
+
+def test_29_real_write_status_is_aborted_partial() -> None:
+    """add_shopping_items parsed 'added' ∈ committed_statuses → committed
+    write before abort → aborted_partial."""
+    results = [_sr("add_shopping_items", "ok", "added")]
+    assert (
+        _summarise_outcome(results, aborted=True, registry=REGISTRY)
+        == "aborted_partial"
+    )
+
+
+def test_29_catch_all_branch_real_write_still_committed() -> None:
+    """Codex #29 R1 high MAJOR: a real write matched via a catch-all ({}) or
+    non-status branch has matched_status=None, but parsed_output.status is
+    'added'. The classifier MUST key on parsed status, not matched_status —
+    else a real committed write is under-reported as plain aborted."""
+    results = [_sr("add_shopping_items", "ok", "added", matched_status=None)]
+    assert (
+        _summarise_outcome(results, aborted=True, registry=REGISTRY)
+        == "aborted_partial"
+    )
+
+
+def test_29_unreadable_parsed_status_fails_closed() -> None:
+    """ok write step with no parsed status → fail closed (may have
+    committed) → aborted_partial."""
+    results = [_sr("add_shopping_items", "ok", None)]
+    assert (
+        _summarise_outcome(results, aborted=True, registry=REGISTRY)
+        == "aborted_partial"
+    )
+
+
+def test_29_link_already_linked_noop_stays_aborted() -> None:
+    results = [_sr("link_task_to_checklist", "ok", "already_linked")]
+    assert _summarise_outcome(results, aborted=True, registry=REGISTRY) == "aborted"
+
+
+def test_29_unlink_not_linked_noop_stays_aborted() -> None:
+    results = [_sr("unlink_task", "ok", "not_linked")]
+    assert _summarise_outcome(results, aborted=True, registry=REGISTRY) == "aborted"
+
+
+def test_29_schedule_reminder_skipped_past_stays_aborted() -> None:
+    results = [_sr("schedule_reminder", "ok", "skipped_past")]
+    assert _summarise_outcome(results, aborted=True, registry=REGISTRY) == "aborted"
+
+
+def test_29_save_recipe_duplicate_noop_stays_aborted() -> None:
+    """save_recipe parsed 'duplicate' (recipe already exists) inserts
+    nothing → not in committed_statuses={'saved'} → plain aborted."""
+    results = [_sr("save_recipe", "ok", "duplicate")]
+    assert _summarise_outcome(results, aborted=True, registry=REGISTRY) == "aborted"
+
+
+def test_29_unannotated_write_over_approximates() -> None:
+    """mark_shopping_bought has no committed_statuses (None) → safe
+    over-approximation preserved: any 'ok' write → aborted_partial."""
+    results = [_sr("mark_shopping_bought", "ok", "bought")]
+    assert (
+        _summarise_outcome(results, aborted=True, registry=REGISTRY)
+        == "aborted_partial"
+    )
+
+
+def test_29_unknown_outcome_on_annotated_write_still_committed() -> None:
+    """R6 preserved: committed_statuses refines ONLY the 'ok' case. An
+    annotated write tool with status='unknown_outcome' stays fail-closed
+    may-have-committed → aborted_partial (even though parsed status, if
+    any, is irrelevant for non-'ok' statuses)."""
+    results = [_sr("add_shopping_items", "unknown_outcome", "added")]
+    assert (
+        _summarise_outcome(results, aborted=True, registry=REGISTRY)
+        == "aborted_partial"
+    )

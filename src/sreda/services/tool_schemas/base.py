@@ -271,6 +271,37 @@ class ToolSpec(BaseModel):
     side_effect_class: Literal[
         "read_only", "transactional_write", "external_side_effect"
     ] = "transactional_write"
+    committed_statuses: frozenset[str] | None = None
+    """Sub-A12 #29 — the set of ``status`` Literal values from this tool's
+    output_model that signal a REAL DB mutation was committed. Used by the
+    executor's abort classifier (``_is_committed_write``) to distinguish a
+    genuine committed write from an idempotent no-op success path.
+
+    Many write tools have ``ok`` success variants that did NOT mutate:
+    ``add_shopping_items → empty`` (count=0), ``link_task_to_checklist →
+    already_linked``, ``unlink_task → not_linked``. Without this metadata
+    the classifier over-approximates every ``ok`` from an ``effect='write'``
+    tool as committed, surfacing ``aborted_partial`` when plain ``aborted``
+    is more precise.
+
+    Semantics:
+    - ``None`` (default) → unannotated: the classifier falls back to the
+      safe over-approximation (any ``ok`` from a write tool counts as
+      committed). Keeps this field additive — only tools WITH no-op success
+      paths need to declare it.
+    - ``frozenset({...})`` → an ``ok`` step counts as committed ONLY when its
+      PARSED output ``status`` (``parsed_output["status"]``) is in this set;
+      other ok statuses are treated as non-mutating no-ops. (The classifier
+      keys on the parsed status, NOT ``matched_status`` — the latter is None
+      when the step matched via a catch-all/non-status branch, which would
+      under-report a real write; Codex #29 R1 MAJOR.)
+
+    Applies only to the ``ok`` (branch-matched) case. Non-``ok`` post-invoke
+    statuses (``unknown_outcome``/``plan_gap``/``timeout``) keep fail-closed
+    "may have committed" semantics — their matched_status is unreliable, and
+    under-reporting a real commit is the dangerous direction (recovery would
+    skip verification). False positives only add extra verification.
+    """
     input_model: type[BaseModel]
     output_model: Any  # Annotated[Union[...], Field(discriminator='status')]
     outcome_examples: list[dict[str, Any]] = Field(default_factory=list)

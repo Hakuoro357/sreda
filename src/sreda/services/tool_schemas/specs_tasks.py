@@ -34,7 +34,6 @@ from sreda.services.tool_schemas.common import (
     ChecklistId,
     RecurrenceRule,
     TaskId,
-    validate_rrule_static,
 )
 from sreda.services.tool_schemas.housewife import (
     AddTaskOutput,
@@ -707,6 +706,8 @@ LINK_TASK_TO_CHECKLIST_SPEC = ToolSpec(
     write_domains=["tasks", "checklists"],
     input_model=LinkTaskToChecklistInput,
     output_model=LinkTaskToChecklistOutput,
+    # #29: "already_linked" is an idempotent no-op — no new link written.
+    committed_statuses=frozenset({"linked"}),
     trigger_examples=[
         "прикрепи список покупок к задаче поход в магазин",
         "свяжи checklist уборка с задачей субботняя уборка",
@@ -736,6 +737,8 @@ UNLINK_TASK_SPEC = ToolSpec(
     write_domains=["tasks", "checklists"],
     input_model=UnlinkTaskInput,
     output_model=UnlinkTaskOutput,
+    # #29: "not_linked" is an idempotent no-op — nothing was unlinked.
+    committed_statuses=frozenset({"unlinked"}),
     trigger_examples=[
         "отвяжи список от задачи",
         "убери связь между задачей и checklist",

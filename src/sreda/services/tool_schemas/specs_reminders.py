@@ -219,6 +219,8 @@ SCHEDULE_REMINDER_SPEC = ToolSpec(
     write_domains=["reminders"],
     input_model=ScheduleReminderInput,
     output_model=ScheduleReminderOutput,
+    # #29: "skipped_past" (trigger time already passed) writes nothing.
+    committed_statuses=frozenset({"scheduled"}),
     trigger_examples=[
         "напомни через 2 часа купить хлеб",
         "напомни завтра в 9 утра позвонить врачу",

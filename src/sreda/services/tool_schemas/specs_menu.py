@@ -377,6 +377,12 @@ GENERATE_SHOPPING_FROM_MENU_SPEC = ToolSpec(
     write_domains=["shopping"],
     input_model=GenerateShoppingFromMenuInput,
     output_model=GenerateShoppingFromMenuOutput,
+    # #29: "plan_no_recipes" (menu has no recipes) generates nothing → excluded.
+    # NB: "generated" still over-reports the generated_count=0 sub-case (menu
+    # has recipes but yielded 0 new shopping rows) — that's the SAFE direction
+    # (false positive → extra recovery verification) and isn't expressible with
+    # status-only metadata (would need count-aware classification).
+    committed_statuses=frozenset({"generated"}),
     trigger_examples=[
         "собери список покупок из меню",
         "добавь ингредиенты меню в покупки",

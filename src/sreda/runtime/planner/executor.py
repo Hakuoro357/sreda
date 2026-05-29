@@ -965,7 +965,30 @@ def _summarise_outcome(
         if spec is None:
             # Unknown tool — fail-closed, assume it could have written.
             return True
-        return spec.effect == "write"
+        if spec.effect != "write":
+            return False
+        # Sub-A12 #29: for a cleanly-matched 'ok' step, consult the tool's
+        # committed_statuses (when declared) to exclude idempotent no-op
+        # success paths (add_shopping_items→empty, link_task_to_checklist→
+        # already_linked, unlink_task→not_linked). Non-'ok' post-invoke
+        # statuses (unknown_outcome/plan_gap/timeout) keep fail-closed
+        # semantics — matched_status is unreliable there, and under-reporting
+        # a real commit is the dangerous direction (would skip recovery
+        # verification; cf. the R6 false-negative fix above).
+        if r.status == "ok" and spec.committed_statuses is not None:
+            # Use the tool's ACTUAL parsed output status — NOT matched_status.
+            # matched_status comes from the matched branch's match["status"]
+            # and is None when the step matched via a catch-all ({}) or a
+            # non-status branch; keying on it would UNDER-report a real
+            # mutation (Codex #29 R1 high MAJOR — the dangerous direction).
+            # Fail closed (may have committed) if the parsed status is not a
+            # readable string.
+            parsed = r.parsed_output if isinstance(r.parsed_output, dict) else {}
+            parsed_status = parsed.get("status")
+            if not isinstance(parsed_status, str):
+                return True
+            return parsed_status in spec.committed_statuses
+        return True
 
     has_committed_write = any(_may_have_committed_write(r) for r in results)
     if aborted:

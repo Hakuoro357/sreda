@@ -319,6 +319,8 @@ SAVE_RECIPE_SPEC = ToolSpec(
     write_domains=["recipes"],
     input_model=SaveRecipeInput,
     output_model=SaveRecipeOutput,
+    # #29: "duplicate" (recipe already exists) inserts nothing.
+    committed_statuses=frozenset({"saved"}),
     trigger_examples=[
         "сохрани рецепт борща",
         "запиши этот рецепт в книгу",

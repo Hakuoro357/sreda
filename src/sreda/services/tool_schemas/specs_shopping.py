@@ -202,6 +202,8 @@ ADD_SHOPPING_ITEMS_SPEC = ToolSpec(
     write_domains=["shopping"],
     input_model=AddShoppingItemsInput,
     output_model=AddShoppingItemsOutput,
+    # #29: "empty" (count=0) is an idempotent no-op — nothing written.
+    committed_statuses=frozenset({"added"}),
     trigger_examples=[
         "купи молоко и хлеб",
         "добавь в покупки яйца",
