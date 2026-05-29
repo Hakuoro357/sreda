@@ -22,6 +22,19 @@ from sreda.services.composer.compose import (
     LLMComposer,
     compose,
 )
+from sreda.services.composer.llm_composer import (
+    DEFAULT_LLM_COMPOSER,
+    ComposerEmptyOutput,
+    ComposerProviderUnavailable,
+    ComposerTimeoutError,
+    make_llm_composer,
+)
+from sreda.services.composer.prompts_registry import (
+    LLM_PROMPT_REGISTRY,
+    ComposerInputError,
+    LLMPromptRegistry,
+    UnknownLLMPromptError,
+)
 from sreda.services.composer.registry import (
     REGISTRY,
     ComposerRegistry,
@@ -30,13 +43,22 @@ from sreda.services.composer.registry import (
 )
 
 __all__ = [
+    "DEFAULT_LLM_COMPOSER",
     "ComposeResult",
     "ComposerContext",
+    "ComposerEmptyOutput",
+    "ComposerInputError",
+    "ComposerProviderUnavailable",
     "ComposerRegistry",
+    "ComposerTimeoutError",
     "FallbackUsed",
+    "LLM_PROMPT_REGISTRY",
     "LLMComposer",
+    "LLMPromptRegistry",
     "REGISTRY",
+    "UnknownLLMPromptError",
     "UnknownTemplateError",
     "compose",
+    "make_llm_composer",
     "render",
 ]

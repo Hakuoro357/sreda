@@ -77,6 +77,10 @@ from jinja2 import TemplateError
 from sreda.runtime.planner.executor import ExecutionLog
 from sreda.runtime.planner.interpolation import resolve_refs
 from sreda.runtime.planner.schemas import ComposerCall
+from sreda.services.composer.prompts_registry import (
+    LLM_PROMPT_REGISTRY,
+    LLMPromptRegistry,
+)
 from sreda.services.composer.registry import (
     REGISTRY,
     ComposerRegistry,
@@ -164,6 +168,19 @@ class ComposeResult:
     """The ``llm_prompt_key`` actually used. None when ``kind='template'``
     was effective."""
 
+    # Codex Phase D.2 R1 MAJOR A#8/B#3 — composer LLM cost metadata for
+    # Phase E persistence. Populated only when the LLM path ran AND the
+    # composer returned an LLMComposerResult (None for template path,
+    # for str-returning test stubs, and for fallbacks).
+    composer_provider: str | None = None
+    """LLM provider used by the composer (kind='llm' success only)."""
+
+    composer_model: str | None = None
+    """Resolved model name of the composer call (kind='llm' success only)."""
+
+    composer_latency_ms: int | None = None
+    """Wall-clock latency of the composer LLM call (kind='llm' success only)."""
+
 
 class LLMComposer(Protocol):
     """Phase D.2 callable interface — invoked when the chosen
@@ -172,6 +189,13 @@ class LLMComposer(Protocol):
     Codex Phase D.1 R1 MEDIUM #5: added ``ctx`` parameter so D.2 can
     access tenant/run/profile/locale without reaching into orchestrator
     globals.
+
+    Return type (Codex D.2 R1 MAJOR A#8/B#3): the production composer
+    returns an ``LLMComposerResult`` (text + provider/model/latency for
+    Phase E observability). compose() duck-types the return — it reads
+    ``.text`` if present, else treats the value as the reply string —
+    so lightweight test stubs may still return a bare ``str``. Declared
+    as ``Any`` here to avoid a compose→llm_composer import cycle.
     """
 
     def __call__(
@@ -181,7 +205,7 @@ class LLMComposer(Protocol):
         template_data: dict[str, Any],
         execution_log: ExecutionLog,
         ctx: ComposerContext,
-    ) -> str: ...
+    ) -> Any: ...
 
 
 # Fallback template ids — used when the primary compose path raises.
@@ -195,9 +219,11 @@ def compose(
     execution_log: ExecutionLog,
     *,
     registry: ComposerRegistry = REGISTRY,
-    llm_composer: LLMComposer | Callable[..., str] | None = None,
+    llm_composer: LLMComposer | Callable[..., Any] | None = None,
     ctx: ComposerContext | None = None,
     expected_registry_snapshot_hash: str | None = None,
+    llm_prompt_registry: LLMPromptRegistry = LLM_PROMPT_REGISTRY,
+    expected_llm_prompt_registry_snapshot_hash: str | None = None,
 ) -> ComposeResult:
     """Render the final user-facing reply.
 
@@ -329,6 +355,31 @@ def compose(
             return _result_generic_error(
                 registry, error_code="invalid_llm_call",
             )
+        # Codex Phase D.2 R1 MAJOR A#3/B#1 — LLM prompt registry race
+        # guard, symmetric to the template hash check above. Phase B
+        # records the LLM registry hash at validation; if a prompt was
+        # edited/removed between then and now, the system prompt the
+        # planner validated against no longer matches → fall through to
+        # compose_error rather than narrate on a changed prompt. Same
+        # planner-owned-outcome gate as the template check.
+        if (
+            expected_llm_prompt_registry_snapshot_hash is not None
+            and execution_log.outcome in _PLANNER_OWNED_OUTCOMES
+        ):
+            actual_llm_hash = llm_prompt_registry.snapshot_hash()
+            if actual_llm_hash != expected_llm_prompt_registry_snapshot_hash:
+                logger.warning(
+                    "composer: LLM prompt registry snapshot mismatch — "
+                    "Phase B recorded hash=%s but current=%s. Falling "
+                    "through to %s.",
+                    expected_llm_prompt_registry_snapshot_hash[:12],
+                    actual_llm_hash[:12], _FALLBACK_COMPOSE_ERROR,
+                )
+                return _result_compose_error(
+                    registry, execution_log,
+                    error_code="llm_registry_hash_mismatch",
+                    effective_llm_prompt_key=effective_call.llm_prompt_key,
+                )
 
     # 4. Build step_outputs view for ref resolution
     step_outputs = _step_outputs_for_refs(execution_log)
@@ -570,17 +621,46 @@ def _render_llm_result(
             effective_llm_prompt_key=llm_prompt_key,
         )
     try:
-        text = llm_composer(
+        raw = llm_composer(
             llm_prompt_key=llm_prompt_key,
             template_data=data,
             execution_log=execution_log,
             ctx=ctx,
         )
+        # Codex Phase D.2 R1 MAJOR A#8/B#3 — duck-type the composer
+        # return: production composer yields an LLMComposerResult (has
+        # .text + provider/model/latency_ms); test stubs may return a
+        # bare str. Pull metadata when present for Phase E persistence.
+        if isinstance(raw, str):
+            text = raw
+            provider = model = None
+            latency_ms = None
+        else:
+            text = getattr(raw, "text", "")
+            provider = getattr(raw, "provider", None)
+            model = getattr(raw, "model", None)
+            latency_ms = getattr(raw, "latency_ms", None)
+        # A composer that returns blank text is a contract breach —
+        # the production composer raises ComposerEmptyOutput instead,
+        # but a stub might not. Treat blank as generic_error.
+        if not text or not text.strip():
+            logger.warning(
+                "composer: llm_composer returned blank text for "
+                "prompt_key=%r — falling through to %s",
+                llm_prompt_key, _FALLBACK_GENERIC_ERROR,
+            )
+            return _result_generic_error(
+                registry, error_code="llm_composer_blank_output",
+                effective_llm_prompt_key=llm_prompt_key,
+            )
         return ComposeResult(
             text=text,
             fallback_used=None,
             error_code=None,
             effective_llm_prompt_key=llm_prompt_key,
+            composer_provider=provider,
+            composer_model=model,
+            composer_latency_ms=latency_ms,
         )
     except Exception as exc:  # noqa: BLE001 — LLM call can fail many ways
         logger.exception(

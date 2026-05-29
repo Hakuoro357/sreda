@@ -391,6 +391,23 @@ class Settings(BaseSettings):
             "LLM at all."
         ),
     )
+    composer_timeout_sec: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_COMPOSER_TIMEOUT_SEC",
+            "sreda_composer_timeout_sec",
+        ),
+        description=(
+            "Wall-clock cap for a single composer LLM call (kind='llm'), "
+            "in seconds. Default 30s — half the planner cap because the "
+            "composer does no tool selection / multi-step reasoning, just "
+            "free-text narration over a finished execution_log on a light "
+            "model (mimo-flash). Template-path composer calls don't touch "
+            "any LLM and ignore this. Sub-A12 Phase D.2."
+        ),
+    )
 
     # LangGraph PostgresSaver wiring (Sub-A6 — Hakuoro357/vex-assistant#74).
     # Default behaviour: postgres URL → PostgresSaver, anything else
