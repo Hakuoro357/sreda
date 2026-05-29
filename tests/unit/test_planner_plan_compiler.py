@@ -15,8 +15,6 @@ from typing import Any
 import pytest
 
 from sreda.runtime.planner.plan_compiler import (
-    ExecutionPlan,
-    FailMode,
     PlanCompileError,
     can_run_parallel,
     compile,
@@ -465,13 +463,15 @@ def test_compile_respects_next_control_flow_dependency() -> None:
     assert ep.layers[1] == ("s2",)
 
 
-def test_compile_respects_branch_compose_ref_as_dependency() -> None:
-    """Codex B.3 R1 MAJOR (medium): branch compose refs are real
-    cross-step dependencies — if s1's branch compose references
-    ${s2.foo}, then s1 cannot complete its branch until s2 has output.
-
-    Two pure reads, both same intent_group: without compose ref they'd
-    be parallel. With branch ref from s1 → s2: s2 must precede s1."""
+def test_branch_compose_ref_is_not_an_ordering_dependency() -> None:
+    """#28 (supersedes the earlier B.3 R1 "compose ref = ordering dep"): a
+    branch compose ref is NOT an execution-ordering dependency. s1's
+    terminal branch compose references ${s2.items}, but the Phase D
+    composer renders it AFTER the whole execution completes (the executor
+    only records selected_compose, never renders inline) — so s2 need NOT
+    run before s1. Two independent pure reads stay parallel (one layer);
+    the compose ref imposes no s2-before-s1 ordering. Mirrors the executor's
+    _build_data_dep_graph, which already excludes compose-template refs."""
     plan = _plan({
         "s1": _action(
             "list_shopping",
@@ -482,7 +482,6 @@ def test_compile_respects_branch_compose_ref_as_dependency() -> None:
                 "compose": {
                     "kind": "template",
                     "template_id": "shopping_list_show",
-                    # Refs s2 — s1's branch needs s2's output to render
                     "template_data": {"items": "${s2.items}"},
                 },
             }],
@@ -490,10 +489,10 @@ def test_compile_respects_branch_compose_ref_as_dependency() -> None:
         "s2": _action("list_reminders"),
     })
     ep = compile(plan, REGISTRY)
-    flat = ep.all_step_ids()
-    # s2 must complete before s1 can run its branch compose
-    assert flat.index("s2") < flat.index("s1"), (
-        f"expected s2 before s1 (branch compose ref), got layers={ep.layers}"
+    layer_of = {sid: i for i, layer in enumerate(ep.layers) for sid in layer}
+    assert layer_of["s1"] == layer_of["s2"], (
+        f"expected s1 and s2 in the same parallel layer — a compose ref is "
+        f"not an ordering dep (#28); got layers={ep.layers}"
     )
 
 
@@ -549,10 +548,14 @@ def test_validate_plan_catches_cycle_via_next_edges() -> None:
     )
 
 
-def test_validate_plan_catches_cycle_via_branch_compose_refs() -> None:
-    """Codex B.3 R3 polish: complete the cycle detection negative-test
-    coverage. s1's branch compose refs s2.foo; s2's branch compose refs
-    s1.bar → mutual dependency → cycle. Validator must reject."""
+def test_mutual_branch_compose_refs_are_not_a_cycle() -> None:
+    """#28 (supersedes the earlier B.3 R3 "mutual compose refs = cycle"):
+    mutual branch compose refs are NOT an execution cycle. s1's terminal
+    compose refs ${s2.items} and s2's refs ${s1.items}; both are
+    independent pure reads that both run to completion before the Phase D
+    compose phase, so there is no execution-ordering cycle — compose refs
+    are post-execution render reads, not ordering deps. The validator must
+    NOT report a cycle (doing so would reject a valid plan)."""
     from sreda.runtime.planner.validator import validate_plan
 
     plan = _plan({
@@ -584,10 +587,53 @@ def test_validate_plan_catches_cycle_via_branch_compose_refs() -> None:
         ),
     })
     violations = validate_plan(plan, registry=REGISTRY)
-    codes = [v.code for v in violations]
-    assert any("cycle" in c for c in codes), (
-        f"validator must report cycle through branch-compose refs; "
-        f"got codes: {codes}"
+    # Fully valid plan (#28): no cycle AND no other violations — both field
+    # refs (${s1.items}/${s2.items}) exist on the ok output variant.
+    assert not violations, (
+        f"mutual branch-compose refs must NOT be a cycle and the plan must be "
+        f"fully valid (#28); got: {[v.code for v in violations]}"
+    )
+
+
+def test_branch_compose_ref_to_conditional_step_is_not_a_cycle() -> None:
+    """#28 + Codex high R1 follow-up: a terminal branch's compose may
+    reference a step reachable only via a DIFFERENT branch's ``next``. The
+    validator accepts it (no static cycle — compose refs are not ordering
+    deps). s1 branch A (status=ok) → next s2; s1 branch B (status=empty) is
+    terminal and its compose refs ${s2.items}.
+
+    NOTE (known gap, tracked as a follow-up — branch-reachability-aware
+    compose validation): if branch B fires at runtime, s2 is never enabled,
+    so ${s2.items} is unavailable at compose time. That is a COMPOSE-TIME
+    availability concern (Phase D / Phase B.6 TODO), NOT a static execution
+    cycle — the old compose-ordering edge only caught it accidentally as a
+    bogus cycle (and did not make s2 run either). #28 keeps the validator
+    honest: no false cycle here."""
+    from sreda.runtime.planner.validator import validate_plan
+
+    plan = _plan({
+        "s1": _action(
+            "list_shopping",
+            args={},
+            outcomes=[
+                {"match": {"status": "ok"}, "next": "s2", "compose": None},
+                {
+                    "match": {"status": "empty"},
+                    "next": None,
+                    "compose": {
+                        "kind": "template",
+                        "template_id": "shopping_list_show",
+                        "template_data": {"items": "${s2.items}"},
+                    },
+                },
+            ],
+        ),
+        "s2": _action("list_reminders"),
+    })
+    violations = validate_plan(plan, registry=REGISTRY)
+    assert not any("cycle" in v.code for v in violations), (
+        f"compose ref to a conditional step must not be a static cycle (#28); "
+        f"got: {[v.code for v in violations]}"
     )
 
 
