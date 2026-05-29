@@ -1891,3 +1891,87 @@ def test_abstract_sequence_terminal_passes() -> None:
     plan = _plan_for("get_abstract_seq", "${s1.rows}")
     violations = validate_plan(plan, {"get_abstract_seq": spec})
     assert not [v for v in violations if v.code == "compose_ref_unknown_field"]
+
+
+# ---------------------------------------------------------------------------
+# #26 — misplaced catch-all branch (empty match at non-final index). The
+# executor's first-match scan never reaches branches after a catch-all, so
+# they are unreachable; the validator must reject it at plan time instead of
+# letting the executor silently ignore it at runtime.
+# ---------------------------------------------------------------------------
+
+
+def _plan_one_action_outcomes(outcomes: list[OutcomeBranch]) -> Plan:
+    return _plan_with_actions({
+        "s1": Action(
+            tool="add_shopping_items",
+            args={"items": ["x"]},
+            expected_outcomes=outcomes,
+        )
+    })
+
+
+def test_catch_all_as_last_branch_ok() -> None:
+    plan = _plan_one_action_outcomes([
+        OutcomeBranch(match={"status": "ok"}),
+        OutcomeBranch(match={}),  # catch-all LAST — valid
+    ])
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    assert not [v for v in violations if v.code == "misplaced_catch_all_branch"]
+
+
+def test_catch_all_sole_branch_ok() -> None:
+    plan = _plan_one_action_outcomes([OutcomeBranch(match={})])
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    assert not [v for v in violations if v.code == "misplaced_catch_all_branch"]
+
+
+def test_catch_all_at_non_final_index_flagged() -> None:
+    plan = _plan_one_action_outcomes([
+        OutcomeBranch(match={}),  # catch-all FIRST — later branch dead
+        OutcomeBranch(match={"status": "ok"}),
+    ])
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    bad = [v for v in violations if v.code == "misplaced_catch_all_branch"]
+    assert bad and bad[0].step_id == "s1"
+    assert "[0]" in bad[0].message
+
+
+def test_catch_all_in_middle_flagged() -> None:
+    plan = _plan_one_action_outcomes([
+        OutcomeBranch(match={"status": "ok"}),
+        OutcomeBranch(match={}),  # middle catch-all
+        OutcomeBranch(match={"status": "ok"}),
+    ])
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    bad = [v for v in violations if v.code == "misplaced_catch_all_branch"]
+    assert bad and "[1]" in bad[0].message
+
+
+def test_no_catch_all_branches_ok() -> None:
+    plan = _plan_one_action_outcomes([
+        OutcomeBranch(match={"status": "ok"}),
+    ])
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    assert not [v for v in violations if v.code == "misplaced_catch_all_branch"]
+
+
+def test_multiple_catch_alls_only_nonfinal_flagged() -> None:
+    """Two catch-alls: the non-final one is flagged, the final one is not."""
+    plan = _plan_one_action_outcomes([
+        OutcomeBranch(match={}),  # idx 0 — flagged
+        OutcomeBranch(match={}),  # idx 1 (last) — valid
+    ])
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    bad = [v for v in violations if v.code == "misplaced_catch_all_branch"]
+    assert len(bad) == 1 and "[0]" in bad[0].message
+
+
+def test_catch_all_last_in_three_branches_ok() -> None:
+    plan = _plan_one_action_outcomes([
+        OutcomeBranch(match={"status": "ok"}),
+        OutcomeBranch(match={"status": "ok"}),
+        OutcomeBranch(match={}),  # catch-all last of 3 — valid
+    ])
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    assert not [v for v in violations if v.code == "misplaced_catch_all_branch"]

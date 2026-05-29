@@ -1334,6 +1334,39 @@ def _phase3_validate_branch_matches(
             )
 
 
+def _phase3_check_catch_all_position(
+    step_id: str,
+    action: Action,
+) -> Iterator[Violation]:
+    """#26 — reject a misplaced catch-all branch (empty ``match: {}``).
+
+    A catch-all matches ANY tool output, so the executor's first-match scan
+    (``_match_branch``) would never reach branches AFTER it — they are dead
+    code. The executor defensively ignores a non-final catch-all at runtime
+    (and logs a warning), but per the «catch it at validation, not silently
+    at runtime» contract (same rationale as the #36 ref checks) we reject it
+    up front so the planner gets a normal invalid-plan retry. A catch-all is
+    valid ONLY as the final branch (or as the sole branch).
+
+    Structural check — independent of the tool's output_model, so it runs
+    even when status Literals can't be introspected."""
+    outcomes = action.expected_outcomes
+    last_idx = len(outcomes) - 1
+    for idx, branch in enumerate(outcomes):
+        if not branch.match and idx != last_idx:
+            yield Violation(
+                step_id=step_id,
+                tool=action.tool,
+                code="misplaced_catch_all_branch",
+                message=(
+                    f"expected_outcomes[{idx}] is a catch-all (empty match) "
+                    f"but is not the last of {last_idx + 1} branches — every "
+                    f"branch after it is unreachable. Move the catch-all to "
+                    f"the final position or give it explicit match fields."
+                ),
+            )
+
+
 def validate_action_args(
     step_id: str,
     action: Action,
@@ -1374,6 +1407,9 @@ def validate_action_args(
     # Codex Sub-A12 Phase B.1 R3 MAJOR — catches invented statuses
     # (e.g. ``all_duplicate``) at validation time, not at run-time.
     violations.extend(_phase3_validate_branch_matches(step_id, action, tool_spec))
+    # Phase 3.b: structural branch-ordering — a catch-all (empty match)
+    # must be the last branch, else later branches are unreachable (#26).
+    violations.extend(_phase3_check_catch_all_position(step_id, action))
     return violations
 
 
