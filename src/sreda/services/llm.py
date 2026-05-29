@@ -513,8 +513,11 @@ _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в поку
                   "☐", "☑", "☒", "✗",
                   # 2026-05-08 incident (tenant_tg_755682022): LLM
                   # написала «Записала в план кроя на пятницу» когда
-                  # был вызван add_shopping_items. Cutting plan tool
-                  # не существует — категория `None` ниже.
+                  # был вызван add_shopping_items.
+                  # 2026-05-29: «План кроя» — это чек-лист по имени,
+                  # категория поправлена на "checklist" в
+                  # _OBJECT_TO_CATEGORY (см. ниже). Швейный процесс
+                  # «в крой» / « крой » остаётся None — tool'а нет.
                   # Codex r3 MAJOR #2: only specific phrases — bare
                   # "крой" matches "раскрой", "покрой" (часть слов
                   # «раскрой теста», «покрой одежды»).
@@ -528,12 +531,22 @@ _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в поку
 # Substrings checked в порядке specificity (длинные первыми) — чтобы
 # «в план кроя» не матчился просто на «в покупк» если оба в окне.
 _OBJECT_TO_CATEGORY: tuple[tuple[str, str | None], ...] = (
-    # Cutting plan — no tool exists. Always unbacked.
+    # «План кроя» — это чек-лист по имени (юзер хранит позиции
+    # раскроя как пункты чек-листа). 2026-05-29 incident
+    # tenant_tg_755682022: LLM вызвал add_checklist_items с
+    # list_id_or_title="План кроя", получил ok, но safety_net
+    # отверг это как unbacked (категория была None) → retry-нудж →
+    # двойной add_checklist_items → дубль "Муслин зелёный широкий"
+    # и в "План кроя", и в "Дела по ткани". Маппим в "checklist",
+    # чтобы add_checklist_items / create_checklist принимались как
+    # валидный backing. См. trace_73c9fe5786b04838 16:33 UTC.
+    ("план кро", "checklist"),     # "план кроя", "план крой"
+    ("план на крой", "checklist"),
+    # Сам процесс кроя (швейная операция) — tool'а нет. Любая claim
+    # «в крой ...» / « крой ...» остаётся unbacked.
     # ⚠ Codex r3 MAJOR #2: только specific фразы. Bare "крой"
     # ловит «раскрой», «покрой» (раскрой ткани, покрой одежды) —
     # false positives. Phrase-based matching tighter.
-    ("план кро", None),       # "план кроя", "план крой"
-    ("план на крой", None),
     ("в крой ", None),         # "в крой на пятницу"
     (" крой ", None),          # bare "крой" surrounded by spaces
     # Recipe
