@@ -443,6 +443,40 @@ _CLAIM_VERBS = ("сохранил", "сохранила", "сохранено",
                 "✅", "☑️", "☑")
 
 
+# 2026-05-29 (incident user_tg_755682022, vex-assistant#79): READ-tools
+# that render a checklist emit completion markers (☑/☐/✗ from
+# `show_checklist` in housewife_chat_tools.py, plus the word «выполнено»
+# as a section header). Those markers double as claim-verbs (_CLAIM_VERBS)
+# whose checklist-category expected_tools are WRITE-only — so every display
+# of a checklist with done items false-fired detect_unbacked_claim, and the
+# handler then REPLACED the correct reply with a safe-ack (handlers.py:3451).
+#
+# Fix is category-scoped, NOT a blanket text strip (Codex r1 MAJOR #1/#2):
+# when a checklist DISPLAY tool was actually called AND the matched claim
+# verb is a checklist STATE marker (not a write verb), the «checklist»
+# category is also backed by that read tool. So:
+#   • «☑ X» / «Выполнено: ☑ X» + show_checklist → backed (state marker).
+#   • «Добавила пункт X» + only show_checklist → still fires (write verb,
+#     read tool does not back a mutation claim).
+#   • «✅ В список покупок: молоко» + show_checklist → still fires (object
+#     is shopping, not checklist — display backing never applies).
+_CHECKLIST_DISPLAY_TOOLS: frozenset[str] = frozenset({"show_checklist"})
+# Subset of _CLAIM_VERBS that describe rendered checklist item STATE rather
+# than a mutation. Only these get the read-tool backing for the «checklist»
+# category. Deliberately narrow (Codex r2 high MAJOR/MEDIUM):
+#   • «☑»/«☑️» — the exact done-glyph `show_checklist` renders.
+#   • «выполнено» — the section header used to present done items.
+# EXCLUDED on purpose:
+#   • «✅» — a generic completion affirmation `show_checklist` never emits;
+#     keeping it would mask a real write claim like «✅ В чек-лист: молоко».
+#   • «отмечено» — reads as a passive write-ack («[я] отметила»), not a
+#     tool-rendered state; not emitted by `show_checklist`.
+#   • write verbs (добавил/удалил/создал/...) — mutations, never read-backed.
+_CHECKLIST_STATE_MARKER_VERBS: frozenset[str] = frozenset({
+    "☑️", "☑", "выполнено",
+})
+
+
 # 2026-05-11 (Codex+Xiaomi r1 на Nemotron incident): 1sg FUT/PRES
 # claim-глаголы. На проде 21:23-21:24 Nemotron 3 turns подряд писал
 # «Хорошо, поставлю напоминание», «ставлю напоминание на 09:50»
@@ -929,6 +963,10 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
     if not text:
         return False
     low = text.lower()
+    # 2026-05-29 (vex-assistant#79): when a checklist DISPLAY read tool was
+    # called, checklist STATE-marker claims (☑/«выполнено») are backed by
+    # that tool's render. Computed once, applied in Pass 2 category check.
+    checklist_display_called = bool(called_tools & _CHECKLIST_DISPLAY_TOOLS)
     # Pass 1: self-asserting verbs — claim про reminder без явного
     # объекта. Проверяем что reminder-tool был вызван.
     reminder_tools = _CATEGORY_TO_TOOLS["reminder"]
@@ -1028,6 +1066,15 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
                     return True
                 # Object found, tool exists — verify matching tool was called.
                 expected_tools = _CATEGORY_TO_TOOLS.get(category, frozenset())
+                # 2026-05-29 (vex-assistant#79): a checklist STATE-marker
+                # claim (☑/«выполнено») is backed by a checklist DISPLAY
+                # read tool — its render IS the source of the marker. Only
+                # for the «checklist» category and only for state-marker
+                # verbs; write verbs and other categories stay write-backed.
+                if (category == "checklist"
+                        and checklist_display_called
+                        and verb in _CHECKLIST_STATE_MARKER_VERBS):
+                    expected_tools = expected_tools | _CHECKLIST_DISPLAY_TOOLS
                 if not (called_tools & expected_tools):
                     return True
             # No proximate object — verb matched but objects too far

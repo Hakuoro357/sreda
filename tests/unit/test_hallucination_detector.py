@@ -815,6 +815,130 @@ def test_r12_r6_modal_mogu_no_fire() -> None:
     )
 
 
+# --------------------------------------------------------------------
+# 2026-05-29 (vex-assistant#79) — show_checklist render false-positive.
+# Production incident user_tg_755682022 [SREDA P1]: юзер попросил
+# показать чек-лист «Дела по машине». show_checklist отрендерил
+# выполненные пункты с глифами ☑ («Выполнено: ☑ Получить справку …»).
+# Глифы ☑/☐/✗ одновременно входят в _CLAIM_VERBS И в _OBJECT_TO_CATEGORY
+# (→ "checklist", expected_tools = только WRITE), а show_checklist —
+# READ-tool, его в write-наборе нет → detect_unbacked_claim вернул True
+# → safety_net ЗАМЕНИЛ корректный чек-лист на safe-ack (handlers.py).
+# Фикс: когда вызван checklist-render READ-tool, глифы — это backed
+# display-маркеры, нейтрализуем их до claim-скана. Word-based claim'ы
+# («добавила», «пункт») остаются, чтобы реальная write-галлюцинация
+# с одним лишь read-tool по-прежнему ловилась.
+# --------------------------------------------------------------------
+
+
+def test_checklist_render_done_items_with_show_checklist_no_fire() -> None:
+    """Точный кейс инцидента: рендер выполненных пунктов через
+    show_checklist не должен fire'ить."""
+    text = (
+        "Дела по машине:\n"
+        "☐ Поменять масло\n"
+        "☐ Записаться на ТО\n\n"
+        "Выполнено:\n"
+        "☑ Принести маме пакетики с пшеном\n"
+        "☑ Отнести маме пакетики с пшеном\n"
+        "☑ Получить справку"
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is False
+    )
+
+
+def test_single_done_checkbox_with_show_checklist_no_fire() -> None:
+    text = "☑ Получить справку"
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is False
+    )
+
+
+def test_checklist_render_done_items_without_tool_still_fires() -> None:
+    """True-positive сохраняется: те же ☑-пункты, но БЕЗ show_checklist
+    (LLM выдумала рендер) — должно fire'ить (incident tg_634496616)."""
+    text = (
+        "Удалила ✅\n"
+        "☑ Получить справку\n"
+        "☐ Поменять масло"
+    )
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_word_write_claim_not_masked_by_show_checklist() -> None:
+    """Фикс НЕ должен маскировать word-based write-claim: бот сказал
+    «Добавила пункт» но вызвал только READ show_checklist (без
+    add_checklist_items) — это реальная галлюцинация, fire."""
+    text = "Добавила пункт «купить антифриз» в чек-лист."
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is True
+    )
+
+
+def test_word_state_marker_vyfolneno_with_show_checklist_no_fire() -> None:
+    """Codex r1 MAJOR #2: словесный путь. «В чек-листе ... Выполнено:
+    ☑ X» — verb «выполнено» (state marker) + объект «чек-лист» в одном
+    окне (single \\n не режет _intra_sentence_window). При вызванном
+    show_checklist это backed display, не должно fire'ить."""
+    text = (
+        "В чек-листе «Дела по машине»:\n"
+        "Выполнено:\n"
+        "☑ Получить справку"
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is False
+    )
+
+
+def test_shopping_checkmark_claim_with_show_checklist_still_fires() -> None:
+    """Codex r1 MAJOR #1 (false-negative guard): «✅ В список покупок:
+    молоко» при вызванном ТОЛЬКО show_checklist. Объект — shopping, не
+    checklist, поэтому display-backing не применяется → реальный
+    shopping-claim без add_shopping_items должен fire'ить."""
+    text = "✅ В список покупок: молоко"
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is True
+    )
+
+
+def test_write_claim_checklist_with_only_show_checklist_fires() -> None:
+    """Write-verb + checklist объект + только READ show_checklist (без
+    create_checklist/add_checklist_items) — мутация не backed read'ом."""
+    text = "Создала чек-лист и добавила туда пункт."
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is True
+    )
+
+
+def test_checkmark_emoji_checklist_claim_with_show_checklist_fires() -> None:
+    """Codex r2 high MAJOR: «✅ В чек-лист: молоко» — ✅ это generic
+    write-affirmation, show_checklist его НЕ рендерит. Не должен быть
+    display-backed → реальный checklist write-claim без write-tool fire."""
+    text = "✅ В чек-лист «Дела»: молоко"
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is True
+    )
+
+
+def test_otmecheno_checklist_claim_with_show_checklist_fires() -> None:
+    """Codex r2 high MEDIUM: «Отмечено в чек-листе: X» — «отмечено» это
+    пассивный write-ack («[я] отметила»), не tool-rendered state. Не
+    backed read'ом → fire (без mark_checklist_item_done)."""
+    text = "Отмечено в чек-листе: купить антифриз."
+    assert (
+        detect_unbacked_claim(text, called_tools={"show_checklist"})
+        is True
+    )
+
+
 def test_r12_r5_long_modal_phrasing_no_fire() -> None:
     """Xiaomi r4 minor #3: «Хочешь, чтобы я добавил напоминание?» —
     «хочешь» на расстоянии ~24 chars от «напомин». R4 20c BEFORE окно
