@@ -1445,3 +1445,161 @@ def test_required_any_real_update_shopping_item_spec_integration() -> None:
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# Sub-A12 Phase D.2-enable — composer allowlist membership
+# ---------------------------------------------------------------------------
+
+
+def _plan_with_compose(compose: ComposerCall) -> Plan:
+    """A clear single-action plan whose ROOT compose we control, for
+    isolating the composer-allowlist check."""
+    return Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={"s1": _action("add_shopping_items", {"items": ["x"]})},
+        compose=compose,
+    )
+
+
+_ALLOWLIST_REGISTRY = {"add_shopping_items": _spec("add_shopping_items", _ShoppingInput)}
+
+
+def test_allowlist_skipped_when_none() -> None:
+    """Back-compat: no allowlists passed → no membership check (existing
+    callers/tests keep working)."""
+    plan = _plan_with_compose(
+        ComposerCall(kind="template", template_id="anything_goes")
+    )
+    violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
+    assert not [v for v in violations if v.code == "unknown_template_id"]
+
+
+def test_unknown_template_id_flagged_when_allowlist_given() -> None:
+    plan = _plan_with_compose(
+        ComposerCall(kind="template", template_id="not_in_registry")
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset(),
+    )
+    bad = [v for v in violations if v.code == "unknown_template_id"]
+    assert bad and "not_in_registry" in bad[0].message
+
+
+def test_known_template_id_passes() -> None:
+    plan = _plan_with_compose(
+        ComposerCall(kind="template", template_id="shopping_added_ok")
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset(),
+    )
+    assert not [v for v in violations if v.code == "unknown_template_id"]
+
+
+def test_unknown_llm_prompt_key_flagged() -> None:
+    plan = _plan_with_compose(
+        ComposerCall(kind="llm", llm_prompt_key="not_a_real_key")
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset({"recipe_narrative"}),
+    )
+    bad = [v for v in violations if v.code == "unknown_llm_prompt_key"]
+    assert bad and "not_a_real_key" in bad[0].message
+
+
+def test_known_llm_prompt_key_passes() -> None:
+    plan = _plan_with_compose(
+        ComposerCall(kind="llm", llm_prompt_key="recipe_narrative")
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset({"recipe_narrative"}),
+    )
+    assert not [v for v in violations if v.code == "unknown_llm_prompt_key"]
+
+
+def test_branch_compose_llm_key_also_checked() -> None:
+    """The allowlist check covers branch composes, not just root."""
+    plan = Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={
+            "s1": Action(
+                tool="add_shopping_items",
+                args={"items": ["x"]},
+                expected_outcomes=[
+                    OutcomeBranch(
+                        match={"status": "ok"},
+                        compose=ComposerCall(
+                            kind="llm", llm_prompt_key="bad_branch_key"
+                        ),
+                    ),
+                ],
+            ),
+        },
+        compose=ComposerCall(kind="template", template_id="shopping_added_ok"),
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset({"recipe_narrative"}),
+    )
+    bad = [v for v in violations if v.code == "unknown_llm_prompt_key"]
+    assert bad and "bad_branch_key" in bad[0].message
+    assert bad[0].step_id == "s1"
+
+
+def test_llm_compose_missing_required_data_flagged() -> None:
+    """Sub-A12 D.2-enable — a registered llm_prompt_key whose required
+    template_data is missing is caught at PLAN time (before execution),
+    not as a late compose-time failure."""
+    plan = _plan_with_compose(
+        ComposerCall(kind="llm", llm_prompt_key="recipe_narrative",
+                     template_data={})  # missing required keys
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset({"recipe_narrative"}),
+        llm_prompt_required_keys={"recipe_narrative": frozenset({"recipe_title", "ingredients"})},
+    )
+    bad = [v for v in violations if v.code == "llm_compose_missing_data"]
+    assert bad and "recipe_title" in bad[0].message
+
+
+def test_llm_compose_refs_count_as_present() -> None:
+    """A ${...} ref satisfies a required key at plan time (executor
+    resolves it later) — no missing-data violation."""
+    plan = _plan_with_compose(
+        ComposerCall(kind="llm", llm_prompt_key="recipe_narrative",
+                     template_data={"recipe_title": "${s1.title}",
+                                    "ingredients": "${s1.items}"})
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset({"recipe_narrative"}),
+        llm_prompt_required_keys={"recipe_narrative": frozenset({"recipe_title", "ingredients"})},
+    )
+    assert not [v for v in violations if v.code == "llm_compose_missing_data"]
+
+
+def test_llm_required_keys_skipped_when_map_none() -> None:
+    """Back-compat: no required-keys map → no data check."""
+    plan = _plan_with_compose(
+        ComposerCall(kind="llm", llm_prompt_key="recipe_narrative",
+                     template_data={})
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=frozenset({"recipe_narrative"}),
+        llm_prompt_required_keys=None,
+    )
+    assert not [v for v in violations if v.code == "llm_compose_missing_data"]

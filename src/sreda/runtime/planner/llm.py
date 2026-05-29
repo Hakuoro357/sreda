@@ -102,8 +102,9 @@ def call_planner(
         Wrapped in a single LangChain ``HumanMessage`` for invoke.
     provider :
         Override the configured planner provider. Default uses
-        ``settings.planner_provider`` (= ``"mimo-v2.5"`` → maps to
-        ``mimo-v2.5-pro`` model per services/llm.py:1189).
+        ``settings.planner_provider`` (= ``"mimo-v2.5-pro"`` → model
+        mimo-v2.5-pro; provider key == model name after the 2026-05-29
+        rename).
     timeout_seconds :
         Wall-clock cap for the LLM call. Default uses
         ``settings.planner_timeout_sec`` (60). Hard timeout via

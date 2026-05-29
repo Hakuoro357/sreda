@@ -15,7 +15,6 @@ import json
 from datetime import datetime
 from typing import Any
 
-import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -26,7 +25,6 @@ from sreda.runtime.planner.llm import (
 )
 from sreda.runtime.planner.orchestrator import (
     PlannerContext,
-    PlannerResult,
     _redact_for_alert,
     run,
 )
@@ -591,3 +589,122 @@ def test_redact_username() -> None:
 
 def test_redact_caps_length() -> None:
     assert len(_redact_for_alert("x" * 1000, max_chars=200)) == 200
+
+
+# ---------------------------------------------------------------------------
+# Sub-A12 D.2-enable R2 — non-bypassable composer-LLM gate
+# ---------------------------------------------------------------------------
+
+
+def _llm_plan_payload() -> dict:
+    """Plan whose ROOT compose is kind='llm' recipe_narrative with all
+    required template_data present (so only the gate, not required-keys,
+    decides acceptance)."""
+    return {
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {"match": {"status": "added"}, "next": None},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "llm",
+            "llm_prompt_key": "recipe_narrative",
+            "template_data": {
+                "recipe_title": "борщ",
+                "ingredients": ["свёкла", "капуста"],
+                "steps": ["варить"],
+                "source": "generated",
+            },
+        },
+    }
+
+
+def _settings_stub(enabled_keys: set[str]):
+    from types import SimpleNamespace
+    return lambda: SimpleNamespace(
+        composer_llm_enabled_keys=frozenset(enabled_keys)
+    )
+
+
+def _ctx_proposing_llm_keys(keys: tuple[str, ...]):
+    from sreda.runtime.planner.orchestrator import PlannerContext
+    base = _make_ctx()
+    return PlannerContext(**{**base.__dict__, "composer_llm_prompt_keys": keys})
+
+
+def test_llm_compose_rejected_when_key_not_enabled(db_session: Session) -> None:
+    """Gate: settings enable NO keys → even though the caller proposes
+    recipe_narrative and the planner emits kind='llm', effective keys = ()
+    → validate_plan rejects it → invalid_plan (non-bypassable)."""
+    ctx = _ctx_proposing_llm_keys(("recipe_narrative",))
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return PlannerCallResult(
+            raw_text=json.dumps(_llm_plan_payload(), ensure_ascii=False),
+            latency_ms=1, provider="p", model="m", attempt_no=1,
+        )
+
+    result = asyncio.run(run(
+        ctx, session_factory=factory, call_planner_fn=fake_call,
+        invalid_retry_enabled=False,
+        settings_factory=_settings_stub(set()),  # no keys enabled
+    ))
+    db_session.commit()
+    assert result.success is False
+    assert result.error_summary == "invalid_plan_after_retry"
+
+
+def test_llm_compose_accepted_when_key_enabled(db_session: Session) -> None:
+    """Gate: settings enable recipe_narrative + caller proposes it +
+    required data present → effective includes it → plan validates."""
+    ctx = _ctx_proposing_llm_keys(("recipe_narrative",))
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return PlannerCallResult(
+            raw_text=json.dumps(_llm_plan_payload(), ensure_ascii=False),
+            latency_ms=1, provider="p", model="m", attempt_no=1,
+        )
+
+    result = asyncio.run(run(
+        ctx, session_factory=factory, call_planner_fn=fake_call,
+        invalid_retry_enabled=False,
+        settings_factory=_settings_stub({"recipe_narrative"}),
+    ))
+    db_session.commit()
+    assert result.success is True, (
+        f"expected success, got error={result.error_summary!r}"
+    )
+
+
+def test_llm_gate_drops_stale_key_not_in_registry(db_session: Session) -> None:
+    """Even if settings AND caller name a key absent from the registry,
+    it's dropped (effective = ∩ registry) → kind='llm' using it rejected.
+    Here the caller proposes a ghost key; the plan uses recipe_narrative
+    which settings did NOT enable → rejected."""
+    ctx = _ctx_proposing_llm_keys(("ghost_key", "recipe_narrative"))
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return PlannerCallResult(
+            raw_text=json.dumps(_llm_plan_payload(), ensure_ascii=False),
+            latency_ms=1, provider="p", model="m", attempt_no=1,
+        )
+
+    result = asyncio.run(run(
+        ctx, session_factory=factory, call_planner_fn=fake_call,
+        invalid_retry_enabled=False,
+        settings_factory=_settings_stub({"ghost_key"}),  # ghost not in registry
+    ))
+    db_session.commit()
+    assert result.success is False

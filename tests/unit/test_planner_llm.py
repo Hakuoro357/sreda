@@ -378,13 +378,13 @@ def test_call_planner_resolves_model_from_registry_for_opaque_runnable() -> None
 
     result = call_planner(
         "x",
-        provider="mimo-v2.5",
+        provider="mimo-v2.5-pro",
         settings_factory=lambda: _make_settings(),
         chat_llm_factory=fake_factory,
         invoke=fake_invoke,
         now_ms=lambda: 0,
     )
-    # _MIMO_MODEL_BY_PROVIDER["mimo-v2.5"] = "mimo-v2.5-pro"
+    # 2026-05-29 rename: _MIMO_MODEL_BY_PROVIDER["mimo-v2.5-pro"] = "mimo-v2.5-pro"
     assert result.model == "mimo-v2.5-pro"
 
 
@@ -394,11 +394,11 @@ def test_call_planner_resolves_model_from_registry_for_opaque_runnable() -> None
 
 
 def test_settings_has_planner_provider_default_mimo_v2_5() -> None:
-    """Codex Sub-A12 R1 CRITICAL — default provider key must be
-    ``mimo-v2.5`` (provider key, maps to model ``mimo-v2.5-pro``),
-    not the model name itself. Verifies the R3 fix landed."""
+    """Default planner provider key is the pro tier. After the
+    2026-05-29 rename the pro key == model name ``mimo-v2.5-pro``
+    (was the confusing ``mimo-v2.5`` which secretly mapped to -pro)."""
     s = Settings()  # all defaults
-    assert s.planner_provider == "mimo-v2.5"
+    assert s.planner_provider == "mimo-v2.5-pro"
 
 
 def test_settings_has_planner_timeout_sec() -> None:

@@ -300,14 +300,14 @@ class Settings(BaseSettings):
     # lets us pay light-model price on every reply while keeping plan
     # quality on the planner side.
     #
-    # Provider keys follow ``services/llm.py`` registry (e.g. ``mimo-v2.5``
-    # resolves to ``mimo-v2.5-pro``, ``mimo-flash`` is the cheap+fast tier).
+    # Provider keys follow ``services/llm.py`` registry. After the
+    # 2026-05-29 rename, provider key == model name (``mimo-v2.5-pro`` →
+    # model mimo-v2.5-pro; ``mimo-v2.5`` → plain mimo-v2.5).
     planner_provider: str = Field(
-        # Codex Sub-A12 R1 CRITICAL fix: ``mimo-v2.5`` (provider key) maps
-        # to ``mimo-v2.5-pro`` model per services/llm.py:1189. Earlier default
-        # ``mimo-v2.5-pro`` was a MODEL name, not a provider key — get_chat_llm
-        # would have returned None at runtime.
-        default="mimo-v2.5",
+        # 2026-05-29 rename (Boris): the planner stays on the PRO model.
+        # The provider key for pro is now ``mimo-v2.5-pro`` (was the
+        # confusingly-named ``mimo-v2.5`` which silently mapped to -pro).
+        default="mimo-v2.5-pro",
         validation_alias=AliasChoices(
             "SREDA_PLANNER_PROVIDER",
             "sreda_planner_provider",
@@ -317,8 +317,9 @@ class Settings(BaseSettings):
             "multi-step reasoning + json-schema-strict output). Cheaper "
             "variants may break Plan schema compliance on edge cases; "
             "benchmark before downgrading. Must be a provider key from "
-            "services/llm.py registry (e.g. ``mimo-v2.5`` → model "
-            "``mimo-v2.5-pro``), NOT a raw model name."
+            "services/llm.py registry. Default 'mimo-v2.5-pro' → model "
+            "mimo-v2.5-pro. (Plain 'mimo-v2.5' is the lighter model, used by "
+            "the composer.)"
         ),
     )
     planner_timeout_sec: float = Field(
@@ -376,8 +377,30 @@ class Settings(BaseSettings):
             "production rollout via env. Sub-A12 R3 #9."
         ),
     )
+    composer_llm_enabled_keys_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_COMPOSER_LLM_ENABLED_KEYS",
+            "sreda_composer_llm_enabled_keys",
+        ),
+        description=(
+            "Per-key allow-list for the composer LLM-path (kind='llm'), "
+            "comma-separated llm_prompt_keys. Default EMPTY → the "
+            "planner-flow ships TEMPLATE-ONLY (structurally safe, no "
+            "free-text generation). The orchestrator intersects this with "
+            "the LLM prompt registry and the caller's proposed keys, then "
+            "uses the result for BOTH the planner prompt AND validate_plan "
+            "— so a caller cannot bypass the gate (Codex D.2-enable R2 "
+            "HIGH). Roll out ONE curated key at a time (e.g. "
+            "'recipe_narrative'); each key needs its provenance contract "
+            "(Task #34) before it goes live. Empty → planner never sees a "
+            "key AND validate_plan rejects any kind='llm'. Decoupled from "
+            "planner_mode so enabling planner-flow does NOT implicitly "
+            "enable free-text compose."
+        ),
+    )
     composer_provider: str = Field(
-        default="mimo-flash",
+        default="mimo-v2.5",
         validation_alias=AliasChoices(
             "SREDA_COMPOSER_PROVIDER",
             "sreda_composer_provider",
@@ -385,10 +408,12 @@ class Settings(BaseSettings):
         description=(
             "LLM provider for the composer LLM-path (ComposerCall.kind='llm'). "
             "Composer writes free-text replies from a finished execution_log "
-            "— no tool selection, no multi-step reasoning — so a light model "
-            "is fine. Default mimo-flash is ~3x cheaper and ~5x faster than "
-            "the planner tier. Template-path composer calls don't touch any "
-            "LLM at all."
+            "— no tool selection, no multi-step reasoning — so a lighter "
+            "model is fine. Default 'mimo-v2.5' = the plain mimo-v2.5 model "
+            "(~2x faster than the planner's 'mimo-v2.5-pro'). Provider key == "
+            "model name after the 2026-05-29 rename. mimo-flash is NOT on our "
+            "subscription tier. Later: benchmark gemini / gemma. Template-path "
+            "composer calls don't touch any LLM at all."
         ),
     )
     composer_timeout_sec: float = Field(
@@ -403,9 +428,10 @@ class Settings(BaseSettings):
             "Wall-clock cap for a single composer LLM call (kind='llm'), "
             "in seconds. Default 30s — half the planner cap because the "
             "composer does no tool selection / multi-step reasoning, just "
-            "free-text narration over a finished execution_log on a light "
-            "model (mimo-flash). Template-path composer calls don't touch "
-            "any LLM and ignore this. Sub-A12 Phase D.2."
+            "free-text narration over a finished execution_log on a lighter "
+            "model (mimo-v2.5, the plain non-pro tier). Template-path "
+            "composer calls don't "
+            "touch any LLM and ignore this. Sub-A12 Phase D.2."
         ),
     )
 
@@ -615,6 +641,19 @@ class Settings(BaseSettings):
         which checks membership in this set.
         """
         raw = self.message_queue_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def composer_llm_enabled_keys(self) -> frozenset[str]:
+        """Allow-listed composer ``llm_prompt_key`` values (kind='llm').
+
+        Empty → composer LLM-path OFF (template-only). The orchestrator
+        intersects this with the LLM prompt registry + the caller's
+        proposed keys and uses the result for prompt + validation, so
+        the gate is non-bypassable. Sub-A12 D.2-enable R2."""
+        raw = self.composer_llm_enabled_keys_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())

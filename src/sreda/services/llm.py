@@ -1147,8 +1147,11 @@ def detect_hallucinated_checklist_items(
 # "LLM disabled" rather than crashing the turn.
 CHAT_PROVIDERS = (
     "mimo",
-    "mimo-v2.5",             # mimo-v2.5-pro — Xiaomi's next-gen baseline
-    "mimo-v2.5-light",       # mimo-v2.5 (no -pro) — lighter variant, ~2x faster
+    # 2026-05-29 rename (Boris) — provider key now == model name, no more
+    # "mimo-v2.5 secretly means -pro" trap. OLD "mimo-v2.5"→-pro became
+    # "mimo-v2.5-pro"; OLD "mimo-v2.5-light"→plain became "mimo-v2.5".
+    "mimo-v2.5-pro",         # mimo-v2.5-pro — Xiaomi's next-gen baseline (was key "mimo-v2.5")
+    "mimo-v2.5",             # plain mimo-v2.5 — lighter, ~2x faster (was key "mimo-v2.5-light")
     "mimo-flash",            # 2026-05-23: mimo-v2-flash — fastest MiMo (v2 series),
                              # latency test candidate for Boris's account (#65)
     "openrouter",            # gemma-4-26b-a4b-it (default), verified fast
@@ -1186,8 +1189,9 @@ CHAT_PROVIDERS = (
 # entry per exposed provider key.
 _MIMO_MODEL_BY_PROVIDER = {
     "mimo": None,                      # None = fall back to settings.mimo_chat_model
-    "mimo-v2.5": "mimo-v2.5-pro",
-    "mimo-v2.5-light": "mimo-v2.5",    # light variant for simple tasks
+    # 2026-05-29 rename (Boris): provider key == model name (1:1).
+    "mimo-v2.5-pro": "mimo-v2.5-pro",  # pro tier (was key "mimo-v2.5")
+    "mimo-v2.5": "mimo-v2.5",          # plain/light, simple tasks (was key "mimo-v2.5-light")
     "mimo-flash": "mimo-v2-flash",     # v2 series, fastest Xiaomi tier — listed
                                        # on /v1/models 2026-05-23 (token-plan ⇒ pay-per-use endpoint)
 }

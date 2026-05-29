@@ -66,21 +66,18 @@ def test_connect_public_base_url_rejects_garbage() -> None:
 
 def test_planner_provider_default() -> None:
     """Planner needs heavyweight reasoning + json-schema compliance —
-    default tier is mimo-v2.5 (provider key) which resolves to
-    mimo-v2.5-pro model (services/llm.py:1187 ``_MIMO_MODEL_BY_PROVIDER``).
-
-    Codex Sub-A12 R1 CRITICAL: earlier default was the MODEL name
-    ``"mimo-v2.5-pro"``, but ``get_chat_llm`` expects PROVIDER KEY.
-    Returns None for any non-key value → planner runtime hard-fails."""
+    default is the pro tier. After the 2026-05-29 rename the provider
+    key == model name, so the pro key is ``"mimo-v2.5-pro"`` (was the
+    confusing ``"mimo-v2.5"`` which silently mapped to -pro)."""
     settings = Settings()
-    assert settings.planner_provider == "mimo-v2.5"
+    assert settings.planner_provider == "mimo-v2.5-pro"
 
 
 def test_planner_provider_override_via_env_alias(monkeypatch) -> None:
     """SREDA_PLANNER_PROVIDER env var overrides the default."""
-    monkeypatch.setenv("SREDA_PLANNER_PROVIDER", "mimo-v2.5")
+    monkeypatch.setenv("SREDA_PLANNER_PROVIDER", "mimo-v2.5-pro")
     settings = Settings()
-    assert settings.planner_provider == "mimo-v2.5"
+    assert settings.planner_provider == "mimo-v2.5-pro"
 
 
 # ---------------------------------------------------------------------------
@@ -134,17 +131,41 @@ def test_planner_alerts_enabled_via_env(monkeypatch) -> None:
 
 
 def test_composer_provider_default() -> None:
-    """Composer LLM-path writes free text — a light model is fine.
-    Default mimo-flash is ~3x cheaper than the planner tier."""
+    """Composer LLM-path writes free text — a lighter model is fine.
+    After the 2026-05-29 rename the default is the plain 'mimo-v2.5'
+    (provider key == model; not the pro tier, not the unavailable
+    mimo-flash)."""
     settings = Settings()
-    assert settings.composer_provider == "mimo-flash"
+    assert settings.composer_provider == "mimo-v2.5"
 
 
 def test_composer_provider_override_via_env_alias(monkeypatch) -> None:
     """SREDA_COMPOSER_PROVIDER env var overrides the default."""
-    monkeypatch.setenv("SREDA_COMPOSER_PROVIDER", "mimo-v2.5-light")
+    monkeypatch.setenv("SREDA_COMPOSER_PROVIDER", "mimo-v2.5-pro")
     settings = Settings()
-    assert settings.composer_provider == "mimo-v2.5-light"
+    assert settings.composer_provider == "mimo-v2.5-pro"
+
+
+def test_composer_llm_enabled_keys_default_empty() -> None:
+    """Per-key allow-list default EMPTY — planner-flow ships
+    template-only; LLM keys are enabled one at a time (Codex
+    D.2-enable R2)."""
+    assert Settings().composer_llm_enabled_keys == frozenset()
+
+
+def test_composer_llm_enabled_keys_via_env(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "SREDA_COMPOSER_LLM_ENABLED_KEYS",
+        "recipe_narrative, cooking_explanation",
+    )
+    assert Settings().composer_llm_enabled_keys == frozenset(
+        {"recipe_narrative", "cooking_explanation"}
+    )
+
+
+def test_composer_llm_enabled_keys_blank_is_empty(monkeypatch) -> None:
+    monkeypatch.setenv("SREDA_COMPOSER_LLM_ENABLED_KEYS", "  ,  ")
+    assert Settings().composer_llm_enabled_keys == frozenset()
 
 
 def test_planner_and_composer_providers_are_independent(monkeypatch) -> None:

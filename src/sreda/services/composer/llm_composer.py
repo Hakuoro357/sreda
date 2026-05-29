@@ -48,7 +48,8 @@ can only *instruct* against it. Defenses, hardened after Codex D.2 R1:
 
 The template path sends NOTHING to an LLM. This LLM path sends the
 user message + resolved execution outputs (item titles, recipe text)
-to ``composer_provider`` (default ``mimo-flash``). That is a NEW data
+to ``composer_provider`` (default ``mimo-v2.5``, the plain non-pro
+tier). That is a NEW data
 egress vs the template path. Before the planner is allowed to emit
 ``kind='llm'`` (a deliberate Phase B planner-prompt change), confirm
 ``composer_provider`` is an approved RU-compliant processor and record
@@ -57,7 +58,7 @@ the trust boundary. Codex D.2 R1 MINOR B#4.
 No tools, light model
 =====================
 
-Runs on ``settings.composer_provider`` (default ``mimo-flash``) with
+Runs on ``settings.composer_provider`` (default ``mimo-v2.5``) with
 ``settings.composer_timeout_sec`` (default 30s).
 """
 

@@ -131,6 +131,9 @@ def _make_ctx(user_message: str) -> PlannerContext:
         closed_turns=(),
         available_tools=tuple(MIGRATED_TOOL_SPECS),
         composer_template_ids=tuple(COMPOSER_REGISTRY.template_ids()),
+        # LLM compose path is behind a kill-switch (default off) and no
+        # few-shot uses kind='llm' yet → empty allowlist here, matching
+        # the default template-only production posture.
         composer_llm_prompt_keys=(),
         composer_registry_snapshot_hash=COMPOSER_REGISTRY.snapshot_hash(),
         tool_registry_version="snap-v1",

@@ -398,6 +398,13 @@ _EXAMPLES: list[FewShotExample] = [
             },
         },
     ),
+    # NOTE: no kind='llm' few-shot here on purpose. The composer LLM
+    # path ships behind a kill-switch (SREDA_COMPOSER_LLM_ENABLED,
+    # default off) and is rolled out one key at a time. A curated
+    # kind='llm' example is added together with the key it demonstrates
+    # at enablement time — teaching the shape before then would
+    # contradict the (empty) LLM-key registry block the planner sees
+    # while the switch is off. Codex Sub-A12 D.2-enable R1-high MEDIUM #1.
 ]
 
 

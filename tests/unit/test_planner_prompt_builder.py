@@ -536,10 +536,22 @@ def test_every_few_shot_plan_passes_validator_against_real_registry() -> None:
         validate_plan,
     )
 
+    from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
+    from sreda.services.composer.registry import REGISTRY as COMPOSER_REGISTRY
+
     registry = {s.name: s for s in MIGRATED_TOOL_SPECS}
+    # Sub-A12 D.2-enable: also enforce composer id allowlists so a
+    # few-shot example using an unknown template_id / llm_prompt_key
+    # is caught (parity with production orchestrator).
+    template_ids = frozenset(COMPOSER_REGISTRY.template_ids())
+    llm_keys = frozenset(LLM_PROMPT_REGISTRY.prompt_keys())
     for i, ex in enumerate(all_examples(), start=1):
         plan = Plan.model_validate(ex.plan)
-        violations = validate_plan(plan, registry=registry)
+        violations = validate_plan(
+            plan, registry=registry,
+            composer_template_ids=template_ids,
+            composer_llm_prompt_keys=llm_keys,
+        )
         if violations:
             rendered = "\n".join(render_violations(violations))
             pytest.fail(
@@ -619,6 +631,48 @@ def test_every_few_shot_compose_template_renders_without_undefined() -> None:
                     f"few-shot example #{i} ({ex.user_message!r}) "
                     f"compose at {label} failed to render: {e}\n"
                     f"template_data={template_data!r}"
+                )
+
+
+def test_every_few_shot_llm_compose_key_and_required_data_valid() -> None:
+    """Sub-A12 D.2-enable — for every ``kind='llm'`` compose (root or
+    branch), the ``llm_prompt_key`` must be registered AND the prompt's
+    ``required_keys`` must be present in ``template_data`` (so the
+    composer won't fail-fast at runtime on missing facts)."""
+    from sreda.runtime.planner.few_shot_examples import all_examples
+    from sreda.services.composer.prompts_registry import (
+        LLM_PROMPT_REGISTRY,
+        ComposerInputError,
+    )
+
+    def _llm_composes(plan: dict) -> list[tuple[str, dict]]:
+        out: list[tuple[str, dict]] = []
+        root = plan.get("compose", {})
+        if root.get("kind") == "llm":
+            out.append(("root", root))
+        for sid, action in plan.get("actions", {}).items():
+            for j, branch in enumerate(action.get("expected_outcomes", [])):
+                bc = branch.get("compose")
+                if bc and bc.get("kind") == "llm":
+                    out.append((f"{sid}.branch[{j}]", bc))
+        return out
+
+    valid_keys = set(LLM_PROMPT_REGISTRY.prompt_keys())
+    for i, ex in enumerate(all_examples(), start=1):
+        for label, compose_obj in _llm_composes(ex.plan):
+            key = compose_obj.get("llm_prompt_key")
+            assert key in valid_keys, (
+                f"few-shot #{i} ({ex.user_message!r}) {label}: "
+                f"llm_prompt_key {key!r} not in registry {sorted(valid_keys)}"
+            )
+            # required_keys must be satisfiable by the example's data
+            data = _stub_refs(dict(compose_obj.get("template_data", {})))
+            try:
+                LLM_PROMPT_REGISTRY.validate_data(key, data)
+            except ComposerInputError as e:  # noqa: PERF203
+                pytest.fail(
+                    f"few-shot #{i} ({ex.user_message!r}) {label}: "
+                    f"llm compose missing required data: {e}"
                 )
 
 

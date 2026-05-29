@@ -100,7 +100,7 @@ _CANDIDATES = [
     ),
     ModelCandidate(
         label="mimo-v2.5-pro",
-        provider="mimo-v2.5",
+        provider="mimo-v2.5-pro",  # 2026-05-29 rename: key == model
         model="mimo-v2.5-pro",
     ),
 ]

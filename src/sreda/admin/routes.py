@@ -163,14 +163,15 @@ _LLM_PROVIDERS_METADATA = [
         "static_model": None,
     },
     {
-        "key": "mimo-v2.5",
+        # 2026-05-29 rename: provider key == model name.
+        "key": "mimo-v2.5-pro",
         "label": "MiMo-V2.5-Pro",
         "default_model_attr": None,
         "resolver": "resolve_mimo_api_key",
         "static_model": "mimo-v2.5-pro",
     },
     {
-        "key": "mimo-v2.5-light",
+        "key": "mimo-v2.5",
         "label": "MiMo-V2.5 (light, для простых задач)",
         "default_model_attr": None,
         "resolver": "resolve_mimo_api_key",

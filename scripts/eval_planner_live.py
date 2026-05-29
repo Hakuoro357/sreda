@@ -47,6 +47,7 @@ from sreda.runtime.planner.orchestrator import (
     run as orchestrator_run,
 )
 from sreda.runtime.planner.prompt_builder import NowMoment, ProfileSnapshot
+from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
 from sreda.services.composer.registry import REGISTRY as COMPOSER_REGISTRY
 from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
 
@@ -181,7 +182,11 @@ def _make_ctx(user_message: str, *, tenant_id: str, run_id: str) -> PlannerConte
         closed_turns=(),
         available_tools=tuple(MIGRATED_TOOL_SPECS),
         composer_template_ids=tuple(COMPOSER_REGISTRY.template_ids()),
-        composer_llm_prompt_keys=(),
+        # Sub-A12 Phase D.2-enable R2 — pass the full registry as the
+        # PROPOSED key set; the orchestrator gates it down to
+        # settings.composer_llm_enabled_keys (default empty → none), so
+        # the kill-switch is enforced centrally, not here.
+        composer_llm_prompt_keys=tuple(LLM_PROMPT_REGISTRY.prompt_keys()),
         composer_registry_snapshot_hash=COMPOSER_REGISTRY.snapshot_hash(),
         tool_registry_version="live-eval",
         few_shot_block="",

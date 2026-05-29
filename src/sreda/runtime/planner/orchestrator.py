@@ -48,11 +48,12 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Callable
 
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from sreda.config.settings import Settings, get_settings
 from sreda.runtime.planner.llm import (
     PlannerCallResult,
     PlannerProviderUnavailable,
@@ -212,6 +213,7 @@ async def run(
     invalid_retry_enabled: bool = True,
     call_planner_fn: Callable[..., PlannerCallResult] = call_planner,
     admin_alert_fn: Callable[..., None] | None = None,
+    settings_factory: Callable[[], Settings] = get_settings,
 ) -> PlannerResult:
     """Drive one planner turn end-to-end.
 
@@ -248,6 +250,26 @@ async def run(
         or unrecoverable failure (provider unavailable, etc.).
     """
     execution_id = make_execution_id()
+
+    # Sub-A12 D.2-enable R2 (Codex HIGH) — NON-BYPASSABLE composer-LLM
+    # gate. Effective LLM keys = caller-proposed ∩ registry ∩
+    # settings-enabled. Computed centrally HERE (not at the caller) so a
+    # Phase E / prod caller that passes registry keys cannot bypass the
+    # kill-switch, and stale keys absent from the registry are dropped
+    # (Codex R2-medium MAJOR #1). Empty settings allow-list → () →
+    # planner is shown no LLM key AND validate_plan rejects any
+    # kind='llm'. Used for BOTH the prompt and validation below.
+    from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
+    _registry_llm_keys = set(LLM_PROMPT_REGISTRY.prompt_keys())
+    _enabled_llm_keys = settings_factory().composer_llm_enabled_keys
+    effective_llm_keys = tuple(sorted(
+        set(ctx.composer_llm_prompt_keys)
+        & _registry_llm_keys
+        & _enabled_llm_keys
+    ))
+    effective_llm_required = {
+        k: LLM_PROMPT_REGISTRY.get(k).required_keys for k in effective_llm_keys
+    }
 
     # Stage 1: persist 'pending' (own session, COMMIT immediately).
     # Ephemeral mode (session_factory=None) skips DB writes — used by
@@ -298,7 +320,10 @@ async def run(
         if attempt_no > 1:
             retry_feedback = _build_retry_feedback(last_raw, last_errors)
         try:
-            prompt = _build_prompt_or_raise(ctx, retry_feedback=retry_feedback)
+            prompt = _build_prompt_or_raise(
+                ctx, retry_feedback=retry_feedback,
+                composer_llm_prompt_keys=effective_llm_keys,
+            )
         except PromptBudgetExceeded as exc:
             _terminate_invalid(
                 session_factory, execution_id,
@@ -449,8 +474,21 @@ async def run(
             )
 
         # Stage 6: validator (registry-aware semantic checks)
+        # Sub-A12 Phase D.2-enable — pass composer allowlists so an
+        # unknown template_id / llm_prompt_key OR a kind='llm' compose
+        # missing required template_data is caught here (before any tool
+        # runs) rather than as a late compose-time fallback. Uses the
+        # GATED ``effective_llm_keys`` (computed once at run() start), so
+        # a key the caller proposed but settings didn't enable → not in
+        # the allowlist → any kind='llm' using it is rejected here.
         registry_map = {s.name: s for s in ctx.available_tools}
-        violations = validate_plan(plan, registry=registry_map)
+        violations = validate_plan(
+            plan,
+            registry=registry_map,
+            composer_template_ids=frozenset(ctx.composer_template_ids),
+            composer_llm_prompt_keys=frozenset(effective_llm_keys),
+            llm_prompt_required_keys=effective_llm_required,
+        )
         if violations:
             last_errors = "validator_violations: " + "; ".join(
                 render_violations(violations)[:5]
@@ -539,12 +577,18 @@ async def run(
 
 def _build_prompt_or_raise(
     ctx: PlannerContext, *, retry_feedback: str | None,
+    composer_llm_prompt_keys: tuple[str, ...],
 ) -> str:
-    """Render base prompt via prompt_builder.build_prompt."""
+    """Render base prompt via prompt_builder.build_prompt.
+
+    ``composer_llm_prompt_keys`` is the GATED effective set (Sub-A12
+    D.2-enable R2) — NOT ``ctx.composer_llm_prompt_keys`` — so the
+    planner is only ever shown keys that settings actually enabled.
+    Empty → the LLM-key registry block renders "пусто, не используй"."""
     args = PromptBuildArgs(
         tool_specs=ctx.available_tools,
         composer_template_ids=ctx.composer_template_ids,
-        composer_llm_prompt_keys=ctx.composer_llm_prompt_keys,
+        composer_llm_prompt_keys=composer_llm_prompt_keys,
         few_shot_block=ctx.few_shot_block,
         profile=ctx.profile,
         memories=ctx.memories,

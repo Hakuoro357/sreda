@@ -1652,12 +1652,144 @@ def _maybe_check_field_path(
         )
 
 
+def _iter_all_composes(plan: Plan) -> Iterator[tuple[str | None, str, Any]]:
+    """Yield every ``ComposerCall`` in a plan as
+    ``(host_step_id, location_label, compose)``.
+
+    Covers the root ``plan.compose`` (host_step_id=None) and every
+    branch compose inside each action's ``expected_outcomes``. Skips
+    branches with ``compose is None`` (those fall through to root)."""
+    yield (None, "root compose", plan.compose)
+    for host_step_id, action in plan.actions.items():
+        for branch_idx, branch in enumerate(action.expected_outcomes):
+            if branch.compose is None:
+                continue
+            location = (
+                f"{host_step_id}.expected_outcomes[{branch_idx}].compose"
+            )
+            yield (host_step_id, location, branch.compose)
+
+
+def _llm_required_key_present(value: Any) -> bool:
+    """A required ``template_data`` value counts as present at PLAN time
+    if it's a ``${...}`` ref (executor resolves it later) or a non-blank
+    literal. Mirrors ``LLMPromptRegistry.validate_data`` blank-logic but
+    treats unresolved refs as present (they're non-blank strings, but be
+    explicit). 0 / False are valid; None / ""/"  " / []/{} are blank."""
+    if isinstance(value, str):
+        return bool(value.strip())  # refs are non-blank → present
+    return value is not None and value != [] and value != {}
+
+
+def _check_composer_allowlist(
+    plan: Plan,
+    *,
+    composer_template_ids: frozenset[str] | None,
+    composer_llm_prompt_keys: frozenset[str] | None,
+    llm_prompt_required_keys: Mapping[str, frozenset[str]] | None = None,
+) -> Iterator[Violation]:
+    """Sub-A12 Phase D.2-enable — plan-time membership check for every
+    ComposerCall's ``template_id`` / ``llm_prompt_key`` against the
+    registries the planner was shown.
+
+    Why plan-time (not just compose-time runtime fallback): once the
+    planner can emit ``kind='llm'`` (D.2-enable), an unknown/stale
+    ``llm_prompt_key`` would otherwise pass validation, the plan's
+    actions would EXECUTE (committing side effects), and only THEN
+    would compose() fail late into a fallback reply. Catching it at
+    validate_plan turns it into a normal invalid-plan retry BEFORE any
+    tool runs. Same parity now applied to ``template_id`` (Codex
+    D.2 R2 — previously template_id was also only runtime-checked).
+
+    Allowlists are ``None`` → skip the check (back-compat: callers that
+    only pass plan+registry, and the many existing tests, keep working
+    unchanged). When provided, membership is enforced.
+
+    Note: schema already guarantees kind='template' ⇒ template_id set
+    and kind='llm' ⇒ llm_prompt_key set (ComposerCall validator), so
+    we only check membership here, not presence.
+    """
+    for host_step_id, location, compose in _iter_all_composes(plan):
+        if compose.kind == "template":
+            if (
+                composer_template_ids is not None
+                and compose.template_id not in composer_template_ids
+            ):
+                yield Violation(
+                    step_id=host_step_id,
+                    tool=None,
+                    code="unknown_template_id",
+                    message=(
+                        f"{location}: template_id "
+                        f"{compose.template_id!r} not in composer registry. "
+                        f"Available: {sorted(composer_template_ids)}"
+                    ),
+                )
+        elif compose.kind == "llm":
+            key = compose.llm_prompt_key
+            if (
+                composer_llm_prompt_keys is not None
+                and key not in composer_llm_prompt_keys
+            ):
+                yield Violation(
+                    step_id=host_step_id,
+                    tool=None,
+                    code="unknown_llm_prompt_key",
+                    message=(
+                        f"{location}: llm_prompt_key "
+                        f"{key!r} not in LLM prompt "
+                        f"registry. Available: "
+                        f"{sorted(composer_llm_prompt_keys)}"
+                    ),
+                )
+                continue
+            # Sub-A12 D.2-enable (Codex R1 medium MAJOR + high HIGH #2)
+            # — required-data check at PLAN time. Without it, a plan with
+            # a valid llm_prompt_key but missing required template_data
+            # passes validation, executes write tools, then fails late in
+            # the composer (registry.validate_data) into a fallback reply
+            # — recreating the "side effects committed, then late compose
+            # failure" class the allowlist exists to remove. Refs count
+            # as present (executor resolves them).
+            if llm_prompt_required_keys is not None and key is not None:
+                required = llm_prompt_required_keys.get(key)
+                if required:
+                    data = compose.template_data or {}
+                    missing = sorted(
+                        rk for rk in required
+                        if not _llm_required_key_present(data.get(rk))
+                    )
+                    if missing:
+                        yield Violation(
+                            step_id=host_step_id,
+                            tool=None,
+                            code="llm_compose_missing_data",
+                            message=(
+                                f"{location}: llm_prompt_key {key!r} requires "
+                                f"template_data keys {missing} (missing/blank). "
+                                f"Present: {sorted(data.keys())}"
+                            ),
+                        )
+
+
 def validate_plan(
-    plan: Plan, registry: Mapping[str, ToolSpec]
+    plan: Plan,
+    registry: Mapping[str, ToolSpec],
+    *,
+    composer_template_ids: frozenset[str] | None = None,
+    composer_llm_prompt_keys: frozenset[str] | None = None,
+    llm_prompt_required_keys: Mapping[str, frozenset[str]] | None = None,
 ) -> list[Violation]:
     """Walk every Action and aggregate violations. Returns structured
     list — empty == plan ready to execute. Callers convert to strings
     via ``render_violations`` for retry feedback.
+
+    Sub-A12 Phase D.2-enable: optional ``composer_template_ids`` /
+    ``composer_llm_prompt_keys`` allowlists. When provided, every
+    ComposerCall's id is checked for membership (so an unknown
+    template_id / llm_prompt_key is caught BEFORE the plan executes,
+    not as a late compose-time fallback). When omitted (None) the
+    check is skipped — back-compat for plan+registry-only callers/tests.
     """
 
     violations: list[Violation] = []
@@ -1688,6 +1820,13 @@ def validate_plan(
     # are now checked for: (R4) target step existence + (R5) top-level
     # field existence in target tool's output_model.
     violations.extend(_phase1_check_compose_refs(plan, registry=registry))
+    # Sub-A12 Phase D.2-enable — composer id allowlist membership.
+    violations.extend(_check_composer_allowlist(
+        plan,
+        composer_template_ids=composer_template_ids,
+        composer_llm_prompt_keys=composer_llm_prompt_keys,
+        llm_prompt_required_keys=llm_prompt_required_keys,
+    ))
     return violations
 
 
