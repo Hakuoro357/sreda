@@ -2785,6 +2785,12 @@ async def _chat_preflight(
     no-subscription / exhausted-budget / gate-blocked / quota-exceeded /
     no-llm cases).  All behaviour is verbatim from the original inline
     block; no logic changes.
+
+    ``async`` is intentional even though the body has no ``await`` today
+    (preflight I/O is synchronous): PR-2b adds async preflight steps
+    (planner gate / LLM-call accounting), and ``_run_legacy_react_loop`` /
+    ``finalize_chat_reply`` are already async — kept async here to avoid a
+    sync→async churn then. (Codex review 2026-05-31, MEDIUM.)
     """
     from langchain_core.messages import (  # local import — LLM path only
         AIMessage,
