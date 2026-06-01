@@ -1625,3 +1625,142 @@ def test_safety_net_sends_admin_alert_and_honest_ack(monkeypatch, tmp_path: Path
     assert outbound_text == (
         "Не получилось надёжно записать это. Повтори, пожалуйста?"
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-1 golden-regression gap tests (Sub-A12 Phase E)
+# ---------------------------------------------------------------------------
+# Characterise post-loop OUTPUT guards that the existing suite did not pin.
+# These must stay green through the shared-spine refactor — finalize_chat_reply
+# (seam 3) must reproduce them byte-for-byte. Time-dependent guards
+# (greeting-strip) and WARNING-only guards (date-drift) are covered by their
+# own helper unit tests, not re-pinned here (avoids flaky time-based handler
+# tests).
+
+
+def test_reply_with_buttons_renders_inline_keyboard(monkeypatch, tmp_path: Path):
+    """LLM calls reply_with_buttons → outbound text = the tool's text and
+    reply_markup carries an inline keyboard with callback_data btn_reply:<tok>.
+    Pins the side-channel render (pending_buttons_state) — the highest-risk
+    coupling for the finalize_chat_reply extraction."""
+    import sreda.db.models.reply_buttons  # noqa: F401 — register table for _bootstrap
+
+    session = _bootstrap(monkeypatch, tmp_path, "pr1_buttons.db")
+    try:
+        # Force housewife feature so build_housewife_tools (with the
+        # reply_with_buttons tool + pending_buttons_state) is wired —
+        # mirrors the menu-render tests above.
+        monkeypatch.setattr(
+            "sreda.runtime.handlers._resolve_chat_feature_key",
+            lambda _session, _tenant_id: "housewife_assistant",
+        )
+        scripted = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "reply_with_buttons",
+                        "args": {
+                            "text": "Какой вариант выберешь?",
+                            "buttons": ["Вариант А", "Вариант Б"],
+                        },
+                        "id": f"tc_{uuid4().hex[:8]}",
+                    }
+                ],
+            ),
+            AIMessage(content="(финальный текст LLM — должен быть перезаписан)"),
+        ]
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("предложи варианты"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    sent = telegram.sent[0]
+    # tool text overrides whatever the LLM wrote in its final AI message
+    assert sent["text"] == "Какой вариант выберешь?"
+    markup = sent["reply_markup"]
+    assert markup is not None, "reply_with_buttons must produce an inline keyboard"
+    rows = markup["inline_keyboard"]
+    labels = [btn["text"] for row in rows for btn in row]
+    assert labels == ["Вариант А", "Вариант Б"]
+    for row in rows:
+        for btn in row:
+            assert btn["callback_data"].startswith("btn_reply:")
+
+
+def test_weather_hallucination_substituted_when_get_weather_not_called(
+    monkeypatch, tmp_path: Path
+):
+    """User asks about weather, LLM fabricates a forecast WITHOUT calling
+    get_weather → reply replaced with the weather-hallucination substitute.
+    Pins the _is_weather_hallucination post-loop guard."""
+    from sreda.runtime.handlers import _WEATHER_HALLUCINATION_SUBSTITUTE
+
+    session = _bootstrap(monkeypatch, tmp_path, "pr1_weather.db")
+    try:
+        scripted = [
+            AIMessage(
+                content="Завтра в Москве +18°C днём, без осадков, ветер слабый.",
+                tool_calls=[],
+            ),
+        ]
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(
+            _chat_envelope("какая погода завтра в Москве")
+        )
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    assert telegram.sent[0]["text"] == _WEATHER_HALLUCINATION_SUBSTITUTE
+
+
+def test_provider_refusal_text_substituted(monkeypatch, tmp_path: Path):
+    """LLM final reply is a provider safety-refusal string → replaced with the
+    Russian refusal substitute. Pins the _is_provider_refusal /
+    _is_predominantly_non_russian post-loop guard."""
+    from sreda.runtime.handlers import _REFUSAL_SUBSTITUTE_MESSAGE
+
+    session = _bootstrap(monkeypatch, tmp_path, "pr1_refusal.db")
+    try:
+        scripted = [
+            AIMessage(
+                content=(
+                    "The request was rejected because it was considered "
+                    "high risk."
+                ),
+                tool_calls=[],
+            ),
+        ]
+        fake_llm = FakeLLM(scripted)
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=fake_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("привет"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    assert telegram.sent[0]["text"] == _REFUSAL_SUBSTITUTE_MESSAGE
