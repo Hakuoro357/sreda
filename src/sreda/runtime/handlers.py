@@ -46,8 +46,6 @@ from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
 from sreda.services.llm import (
-    LLMCallTimeout,
-    ainvoke_with_streaming_timeout,
     detect_unbacked_claim,
     get_chat_llm,
     resolve_provider_pair_for_tenant,
@@ -2428,117 +2426,32 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
                 except Exception:  # noqa: BLE001
                     logger.debug("ack stream schedule failed", exc_info=True)
 
-            # Issue #68: persist phase=request envelope BEFORE ainvoke.
-            # Strong semantics — crash-safe: row на диске до того как LLM
-            # стартует. Если require_persist=true и persist degraded — raise
-            # (RuntimeError caught в outer handler).
-            await _persist_request_with_policy(
-                attempt="primary", llm_obj=llm_with_tools,
-                provider=_chat_primary_provider, iter_n=_iter,
+            # LlmCaller: transparent-passthrough seam (PR-1).
+            # Constructed per-iteration so _per_call_timeout (re-read from
+            # settings each iteration) is captured correctly. primary/fallback
+            # llms and providers are stable across the loop but cheap to pass.
+            from sreda.runtime.llm_caller import LlmCaller  # noqa: PLC0415
+            _llm_caller = LlmCaller(
+                primary_llm=llm_with_tools,
+                fallback_llm=_fallback_with_tools,
+                primary_provider=_chat_primary_provider,
+                fallback_provider=_chat_fallback_provider,
                 per_call_timeout=_per_call_timeout,
+                tenant_id=action.tenant_id,
+                feature_key=feature_key,
+                # Preserve original log identity (sreda.runtime.handlers) so the
+                # extracted kernel's warning/exception lines stay byte-for-byte.
+                logger=logger,
             )
-            _t_primary_started = _time_module.monotonic()
-            try:
-                ai_msg = await ainvoke_with_streaming_timeout(
-                    llm_with_tools,
-                    messages,
-                    timeout_seconds=_per_call_timeout,
-                    on_text_update=_stream_to_ack if _stream_visible_text else None,
-                )
-                # Issue #68: fire-and-forget response envelope (primary OK).
-                _lat_ms_primary = int(
-                    (_time_module.monotonic() - _t_primary_started) * 1000
-                )
-                await _persist_response_async(
-                    "primary", ai_msg, _lat_ms_primary, _iter,
-                )
-            except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
-                # Issue #68: persist phase=error envelope (primary failed)
-                # — fire-and-forget. Latency measured from request start.
-                _lat_ms_primary_err = int(
-                    (_time_module.monotonic() - _t_primary_started) * 1000
-                )
-                await _persist_error_async(
-                    "primary", exc, _lat_ms_primary_err, _iter,
-                )
-                # Любая ошибка primary (timeout / 5xx / rate limit) →
-                # пытаемся fallback если он есть.
-                # R-28: alert admin для **любой** LLM error (Codex R1 M3 —
-                # fallback may be None для some configs, alert before re-raise).
-                exc_type = type(exc).__name__
-                try:
-                    from sreda.services.admin_alerts import send_admin_alert
-                    if _fallback_with_tools is None:
-                        # No fallback configured — error propagates to caller.
-                        # P0 severity: данный turn полностью failed, user видит error.
-                        send_admin_alert(
-                            severity="P0",
-                            title=f"LLM primary failed, NO fallback: {exc_type}",
-                            body=(
-                                f"tenant: {action.tenant_id}\n"
-                                f"feature: {feature_key}\n"
-                                f"iter: {_iter}\n"
-                                f"primary_exc: {exc_type}\n"
-                                f"reason: {str(exc)[:300]}\n"
-                                f"impact: turn re-raised без fallback — user sees error"
-                            ),
-                            dedupe_key=f"llm_primary_no_fallback:{exc_type}:{feature_key}",
-                        )
-                    else:
-                        # Fallback engaged — P1, degraded but turn completes.
-                        send_admin_alert(
-                            severity="P1",
-                            title=f"LLM fallback engaged: {exc_type}",
-                            body=(
-                                f"tenant: {action.tenant_id}\n"
-                                f"feature: {feature_key}\n"
-                                f"iter: {_iter}\n"
-                                f"primary_exc: {exc_type}\n"
-                                f"reason: {str(exc)[:300]}"
-                            ),
-                            dedupe_key=f"llm_fallback:{exc_type}:{feature_key}",
-                        )
-                except Exception:  # noqa: BLE001 — alert must not crash turn
-                    logger.exception("R-28 admin_alert dispatch failed")
-                if _fallback_with_tools is None:
-                    raise
-                logger.warning(
-                    "LLM_FALLBACK_ENGAGED tenant=%s feature=%s iter=%d "
-                    "primary_exc=%s reason=%s — switching to fallback",
-                    action.tenant_id, feature_key, _iter,
-                    exc_type, str(exc)[:120],
-                )
-                _trace_meta["fallback"] = True
-                _trace_meta["primary_exc"] = exc_type
-                # Issue #68: persist phase=request envelope для fallback
-                # — separate config (different provider/model/extra_body).
-                await _persist_request_with_policy(
-                    attempt="fallback", llm_obj=_fallback_with_tools,
-                    provider=_chat_fallback_provider, iter_n=_iter,
-                    per_call_timeout=_per_call_timeout,
-                )
-                _t_fallback_started = _time_module.monotonic()
-                try:
-                    ai_msg = await ainvoke_with_streaming_timeout(
-                        _fallback_with_tools,
-                        messages,
-                        timeout_seconds=_per_call_timeout,
-                        on_text_update=_stream_to_ack if _stream_visible_text else None,
-                    )
-                    _lat_ms_fallback = int(
-                        (_time_module.monotonic() - _t_fallback_started) * 1000
-                    )
-                    await _persist_response_async(
-                        "fallback", ai_msg, _lat_ms_fallback, _iter,
-                    )
-                except Exception as fb_exc:  # noqa: BLE001
-                    _lat_ms_fb_err = int(
-                        (_time_module.monotonic() - _t_fallback_started) * 1000
-                    )
-                    await _persist_error_async(
-                        "fallback", fb_exc, _lat_ms_fb_err, _iter,
-                    )
-                    raise
+            ai_msg = await _llm_caller.ainvoke_with_fallback(
+                messages,
+                iter_n=_iter,
+                trace_meta=_trace_meta,
+                on_text_update=_stream_to_ack if _stream_visible_text else None,
+                persist_request=_persist_request_with_policy,
+                persist_response=_persist_response_async,
+                persist_error=_persist_error_async,
+            )
             usage = getattr(ai_msg, "usage_metadata", None) or {}
             _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
             _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
