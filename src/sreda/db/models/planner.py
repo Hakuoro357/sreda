@@ -58,6 +58,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
 from sreda.db.base import Base
+from sreda.db.types import EncryptedString, JSONEncryptedString
 
 
 _JSONB = JSON().with_variant(JSONB(), "postgresql")
@@ -157,6 +158,45 @@ class PlannerExecution(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # --- Encrypted mirrors (PR-2a expand step — additive only) ---------
+    raw_planner_response_enc: Mapped[str | None] = mapped_column(
+        EncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of raw_planner_response (PR-2a)",
+    )
+    plan_json_enc: Mapped[dict | list | None] = mapped_column(
+        JSONEncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of plan_json (PR-2a)",
+    )
+    execution_plan_json_enc: Mapped[dict | list | None] = mapped_column(
+        JSONEncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of execution_plan_json (PR-2a)",
+    )
+    execution_log_json_enc: Mapped[list | None] = mapped_column(
+        JSONEncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of execution_log_json (PR-2a; nullable unlike original)",
+    )
+    validation_errors_enc: Mapped[str | None] = mapped_column(
+        EncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of validation_errors (PR-2a; ValidationError text can embed rejected payload snippets)",
+    )
+    turn_classification_reason_enc: Mapped[str | None] = mapped_column(
+        EncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of turn_classification_reason (PR-2a; LLM free-text rationale, PII-capable — conservative)",
+    )
+    # PR-2a PII audit (2026-06-01): the 6 columns mirrored above are the FULL
+    # PII set on planner_executions — raw_planner_response, plan_json,
+    # validation_errors, execution_plan_json, execution_log_json,
+    # turn_classification_reason. Every other column (ids / enums / timestamps /
+    # hashes / counters: planner_status, execution_status, composer_path,
+    # *_snapshot_hash, tool_registry_version, *_latency_ms, final_reply_chars,
+    # turn_id/is_new_turn, *_at) is non-PII and intentionally NOT mirrored.
+
     # --- Compose stage --------------------------------------------------
     composer_path: Mapped[str | None] = mapped_column(
         String(128),
@@ -245,10 +285,43 @@ class PlannerGap(Base):
     user_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     plan_json: Mapped[dict | None] = mapped_column(_JSONB, nullable=True)
     step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # PR-2a PII audit (Codex R3): step_id mirrors a ``Plan.actions`` KEY,
+    # which the LLM currently generates freely. Treated as non-PII (not
+    # mirrored) ONLY because task #8 enforces an action-id format
+    # ``^s[1-9]\d*$`` in the planner schema — keys become structural
+    # s1/s2/s3, never user content. Until #8 lands there is ZERO exposure:
+    # planner_gaps has no writer yet. Decision: Boris, 2026-06-01.
     tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     tool_args_json: Mapped[dict | None] = mapped_column(_JSONB, nullable=True)
     actual_result_json: Mapped[dict | None] = mapped_column(_JSONB, nullable=True)
     error_details: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- Encrypted mirrors (PR-2a expand step — additive only) ---------
+    user_message_enc: Mapped[str | None] = mapped_column(
+        EncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of user_message (PR-2a)",
+    )
+    plan_json_enc: Mapped[dict | list | None] = mapped_column(
+        JSONEncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of plan_json (PR-2a)",
+    )
+    tool_args_json_enc: Mapped[dict | list | None] = mapped_column(
+        JSONEncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of tool_args_json (PR-2a)",
+    )
+    actual_result_json_enc: Mapped[dict | list | None] = mapped_column(
+        JSONEncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of actual_result_json (PR-2a)",
+    )
+    error_details_enc: Mapped[str | None] = mapped_column(
+        EncryptedString(),
+        nullable=True,
+        comment="Encrypted mirror of error_details (PR-2a)",
+    )
 
     # --- Group 6.5: composer-side gap metadata -------------------------
     template_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
