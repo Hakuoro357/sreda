@@ -34,9 +34,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from sreda.db.models.planner import PlannerExecution
 from sreda.runtime.planner.few_shot_examples import all_examples
 from sreda.runtime.planner.llm import PlannerCallResult
 from sreda.runtime.planner.orchestrator import PlannerContext, run
+from sreda.runtime.planner.persistence import read_planner_pii
 from sreda.runtime.planner.prompt_builder import NowMoment, ProfileSnapshot
 from sreda.services.composer.registry import REGISTRY as COMPOSER_REGISTRY
 from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
@@ -213,20 +215,19 @@ def test_planner_snapshot_runs_through_orchestrator(
     # Codex B.6 R1 MEDIUM fix: persistence checks must STRICTLY compare
     # stored JSON to the planner-result snapshot, not just "non-null".
     # If mark_valid wrote wrong/truncated JSON, this surfaces it.
+    db_session.expire_all()
+    pe_row = db_session.get(PlannerExecution, result.execution_id)
     row = _row(db_session, result.execution_id)
     assert row["planner_status"] == "valid"
 
-    stored_plan = row["plan_json"]
-    if isinstance(stored_plan, str):
-        stored_plan = json.loads(stored_plan)  # SQLite stores JSON as TEXT
+    # PR-2a encrypted_only: plaintext columns are NULL; read via dual-read accessor.
+    stored_plan = read_planner_pii(pe_row, "plan_json")
     expected_plan_dump = result.plan.model_dump(mode="json")
     assert stored_plan == expected_plan_dump, (
         f"snapshot {label!r}: stored plan_json drifted from result.plan"
     )
 
-    stored_exec_plan = row["execution_plan_json"]
-    if isinstance(stored_exec_plan, str):
-        stored_exec_plan = json.loads(stored_exec_plan)
+    stored_exec_plan = read_planner_pii(pe_row, "execution_plan_json")
     assert stored_exec_plan == {
         "layers": [list(layer) for layer in result.execution_plan.layers],
         "fail_modes": dict(result.execution_plan.fail_modes),

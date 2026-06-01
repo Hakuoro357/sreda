@@ -22,6 +22,19 @@ Sub-A12 Phase E — PR-2a #9b: adds ``create_or_resume_execution`` for
 turn-key resume: a re-delivered Telegram update re-attaches to the
 existing PlannerExecution instead of creating a duplicate, preserving
 stable operation_ids on the step_execution_ledger.
+
+Sub-A12 Phase E — PR-2a #10a: PII write-mode enum + ``_write_pii``
+helper + ``read_planner_pii`` dual-read accessor.  The pre-LIVE default
+is ``encrypted_only``: plaintext PII columns are left NULL; the
+``*_enc`` mirrors receive the ciphertext.  PR-2b will flip the default
+to ``dual_write`` and later ``encrypted_only`` (post-migration).
+
+PII columns in scope for #10a (5 fields):
+    raw_planner_response, plan_json, execution_plan_json,
+    validation_errors, turn_classification_reason
+Out of scope for #10a (wired later):
+    execution_log_json / execution_log_json_enc  (no writer yet)
+    planner_gaps PII columns                     (no writer yet)
 """
 
 from __future__ import annotations
@@ -29,12 +42,141 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.planner import PlannerExecution
+
+# ---------------------------------------------------------------------------
+# PII write-mode — three-phase dual-write / expand / contract policy
+# ---------------------------------------------------------------------------
+
+PlannerPiiWriteMode = Literal["plaintext_only", "dual_write", "encrypted_only"]
+"""Three-phase write policy for planner PII columns.
+
+plaintext_only
+    Legacy / transition-source mode.  Writes the plaintext column only;
+    the ``*_enc`` mirror is left NULL.  Used when migrating FROM
+    encrypted_only back to plaintext is needed (break-glass) or before
+    any encrypted column existed.
+
+dual_write
+    Expand-window mode.  Writes BOTH the plaintext column AND the
+    ``*_enc`` mirror on every write.  Allows a safe rollout: old readers
+    still use the plaintext column, new readers prefer ``*_enc``.
+    PR-2b will flip the default to this mode.
+
+encrypted_only
+    Pre-LIVE mode (current default, per Sub-A12 Phase E plan §5).
+    Writes the ``*_enc`` mirror only; the plaintext column is set to
+    NULL.  After the backfill migration (PR-2c) there will be no rows
+    with plaintext PII, so this mode is safe for new rows immediately.
+"""
+
+_PLANNER_PII_WRITE_MODE: PlannerPiiWriteMode = "encrypted_only"
+"""Active write mode for this process.  Change at import time for tests
+or via PR-2b deployment toggle; do NOT mutate at runtime."""
+
+
+# ---------------------------------------------------------------------------
+# PII write / read helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_pii(
+    row: Any,
+    *,
+    plain_attr: str,
+    enc_attr: str,
+    value: Any,
+    mode: PlannerPiiWriteMode | None = None,
+) -> None:
+    """Write a single PII field according to *mode*.
+
+    For ``EncryptedString`` columns *value* must be a ``str`` (or
+    ``None``); for ``JSONEncryptedString`` columns it must be a
+    JSON-serialisable ``dict`` / ``list`` (or ``None``).  The
+    TypeDecorators in ``sreda.db.types`` handle the actual
+    encrypt/decrypt — this helper only decides WHICH attribute(s) to set.
+
+    *mode* is resolved at CALL TIME from ``_PLANNER_PII_WRITE_MODE`` when not
+    passed (Codex A/B #10a R1) — so a PR-2b deployment toggle of the module
+    constant actually changes mark_received / mark_invalid / mark_valid
+    behaviour, rather than being frozen at function-definition time.
+
+    Each mode sets BOTH attributes to a defined state (the other is NULLed)
+    so there is never a stale mirror that ``read_planner_pii`` could prefer:
+      plaintext_only → sets *plain_attr*; NULLs *enc_attr*.
+      encrypted_only → sets *enc_attr*; NULLs *plain_attr*.
+      dual_write     → sets BOTH *plain_attr* AND *enc_attr*.
+
+    FAIL-CLOSED (Codex A/B #10a R1 high MAJOR): an unrecognised *mode* raises
+    rather than falling through to dual_write — a config typo like
+    ``"encrypted-only"`` must NOT silently write the plaintext column and leak
+    PII.
+    """
+    if mode is None:
+        mode = _PLANNER_PII_WRITE_MODE
+    if mode == "plaintext_only":
+        setattr(row, plain_attr, value)
+        setattr(row, enc_attr, None)
+    elif mode == "encrypted_only":
+        setattr(row, enc_attr, value)
+        setattr(row, plain_attr, None)
+    elif mode == "dual_write":
+        setattr(row, plain_attr, value)
+        setattr(row, enc_attr, value)
+    else:
+        raise ValueError(
+            f"_write_pii: unknown PlannerPiiWriteMode {mode!r}; expected one "
+            f"of 'plaintext_only' / 'dual_write' / 'encrypted_only'"
+        )
+
+
+def read_planner_pii(
+    row: PlannerExecution,
+    field: str,
+) -> Any:
+    """Dual-read accessor for the five in-scope PII fields.
+
+    *field* must be one of::
+
+        raw_planner_response
+        validation_errors
+        plan_json
+        execution_plan_json
+        turn_classification_reason
+
+    Returns the decrypted ``*_enc`` value when it is not ``None``
+    (preferred path for ``encrypted_only`` / ``dual_write`` rows),
+    falling back to the plaintext column for legacy rows written under
+    ``plaintext_only`` mode.
+
+    The TypeDecorators on the ORM model handle all decryption
+    transparently — this function just implements the "prefer enc"
+    precedence rule.
+    """
+    _VALID_FIELDS = frozenset(
+        {
+            "raw_planner_response",
+            "validation_errors",
+            "plan_json",
+            "execution_plan_json",
+            "turn_classification_reason",
+        }
+    )
+    if field not in _VALID_FIELDS:
+        raise ValueError(
+            f"read_planner_pii: unknown field {field!r}; "
+            f"valid fields: {sorted(_VALID_FIELDS)}"
+        )
+    enc_val = getattr(row, f"{field}_enc")
+    if enc_val is not None:
+        return enc_val
+    return getattr(row, field)
 
 
 @dataclass(frozen=True)
@@ -251,7 +393,12 @@ def mark_received(
     row = session.get(PlannerExecution, execution_id)
     if row is None:
         raise LookupError(f"planner_execution {execution_id!r} not found")
-    row.raw_planner_response = raw_response
+    _write_pii(
+        row,
+        plain_attr="raw_planner_response",
+        enc_attr="raw_planner_response_enc",
+        value=raw_response,
+    )
     row.planner_latency_ms = latency_ms
     row.planner_status = "received"
     if planner_provider is not None:
@@ -277,7 +424,12 @@ def mark_invalid(
     if row is None:
         raise LookupError(f"planner_execution {execution_id!r} not found")
     row.planner_status = "invalid"
-    row.validation_errors = validation_errors
+    _write_pii(
+        row,
+        plain_attr="validation_errors",
+        enc_attr="validation_errors_enc",
+        value=validation_errors,
+    )
     session.flush()
 
 
@@ -298,15 +450,31 @@ def mark_valid(
     row = session.get(PlannerExecution, execution_id)
     if row is None:
         raise LookupError(f"planner_execution {execution_id!r} not found")
-    row.plan_json = plan_json
-    row.execution_plan_json = execution_plan_json
+    _write_pii(
+        row,
+        plain_attr="plan_json",
+        enc_attr="plan_json_enc",
+        value=plan_json,
+    )
+    _write_pii(
+        row,
+        plain_attr="execution_plan_json",
+        enc_attr="execution_plan_json_enc",
+        value=execution_plan_json,
+    )
     row.planner_status = "valid"
     row.is_new_turn = is_new_turn
-    row.turn_classification_reason = turn_classification_reason
+    _write_pii(
+        row,
+        plain_attr="turn_classification_reason",
+        enc_attr="turn_classification_reason_enc",
+        value=turn_classification_reason,
+    )
     session.flush()
 
 
 __all__ = [
+    "PlannerPiiWriteMode",
     "ResumeResult",
     "create_or_resume_execution",
     "insert_pending",
@@ -314,4 +482,5 @@ __all__ = [
     "mark_invalid",
     "mark_received",
     "mark_valid",
+    "read_planner_pii",
 ]

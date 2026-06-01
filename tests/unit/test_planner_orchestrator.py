@@ -18,6 +18,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from sreda.db.models.planner import PlannerExecution
 from sreda.runtime.planner.llm import (
     PlannerCallResult,
     PlannerProviderUnavailable,
@@ -28,6 +29,7 @@ from sreda.runtime.planner.orchestrator import (
     _redact_for_alert,
     run,
 )
+from sreda.runtime.planner.persistence import read_planner_pii
 from sreda.runtime.planner.prompt_builder import (
     NowMoment,
     ProfileSnapshot,
@@ -188,10 +190,12 @@ def test_orchestrator_happy_path_persists_valid_status(db_session: Session) -> N
     result = asyncio.run(run(ctx, session_factory=factory, call_planner_fn=fake_call))
     db_session.commit()  # ensure proxy-committed data is visible
 
+    db_session.expire_all()
+    pe_row = db_session.get(PlannerExecution, result.execution_id)
     row = _row(db_session, result.execution_id)
     assert row["planner_status"] == "valid"
-    assert row["plan_json"] is not None
-    assert row["execution_plan_json"] is not None
+    assert read_planner_pii(pe_row, "plan_json") is not None
+    assert read_planner_pii(pe_row, "execution_plan_json") is not None
     # SQLite stores bool as int 1/0; cast for portability
     assert bool(row["is_new_turn"]) is True
 
@@ -287,9 +291,11 @@ def test_orchestrator_gives_up_after_two_invalid(db_session: Session) -> None:
     assert result.error_summary == "invalid_plan_after_retry"
     assert len(result.raw_responses) == 2
 
+    db_session.expire_all()
+    pe_row = db_session.get(PlannerExecution, result.execution_id)
     row = _row(db_session, result.execution_id)
     assert row["planner_status"] == "invalid"
-    assert "json_decode_error" in row["validation_errors"]
+    assert "json_decode_error" in read_planner_pii(pe_row, "validation_errors")
 
 
 def test_orchestrator_no_retry_when_invalid_retry_disabled(db_session: Session) -> None:
