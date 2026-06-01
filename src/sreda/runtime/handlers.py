@@ -2229,7 +2229,6 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
     # empty-reply rescue / "..." fallback so the user at least sees
     # an error.
     _CHAT_TURN_TIMEOUT_SECONDS = CHAT_TURN_TIMEOUT_SECONDS
-    _turn_start_monotonic = time.monotonic()
 
     def _record_and_log(ai_msg: Any, *, iteration: int) -> None:
         usage = getattr(ai_msg, "usage_metadata", None) or {}
@@ -2366,6 +2365,10 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
     # — two consecutive empty iterations would otherwise spiral.
     _hallucination_nudged = False
     _turn_timed_out = False
+    # Turn-timeout clock captured HERE — after all helper closures are
+    # defined, just before the loop — to match the original capture point
+    # (not before the closures). Codex code-review R1 MINOR.
+    _turn_start_monotonic = time.monotonic()
     for _iter in range(_MAX_TOOL_ITERATIONS):
         # Cooperative turn-level timeout. Checked before each iteration
         # (can't interrupt a running LLM call from here — MiMo has its
@@ -3361,6 +3364,11 @@ async def execute_conversation_chat(
     if isinstance(pf, list):      # short-circuit reply (no-sub / quota / no-llm)
         return pf
 
+    # Capture the ack-progress controller ONCE so the loop and finalize use
+    # the SAME object even if ``context`` is mutated mid-turn (matches the
+    # original single local). Codex code-review R1 MINOR.
+    _ack_progress = context.get("_ack_progress_controller")
+
     # --- 4. Tool-call loop (extracted to _run_legacy_react_loop) --------
     _loop_result = await _run_legacy_react_loop(
         llm=pf.llm,
@@ -3380,7 +3388,7 @@ async def execute_conversation_chat(
         budget=pf.budget,
         session=session,
         trace=trace,
-        _ack_progress=context.get("_ack_progress_controller"),
+        _ack_progress=_ack_progress,
         _base_envelope_fields=pf._base_envelope_fields,
         _trace_id_value=pf._trace_id_value,
         _tool_schemas_for_log=pf._tool_schemas_for_log,
@@ -3425,7 +3433,7 @@ async def execute_conversation_chat(
         pending_buttons_state=pf.pending_buttons_state,
         menu_display_state=pf.menu_display_state,
         session=session,
-        ack_progress=context.get("_ack_progress_controller"),
+        ack_progress=_ack_progress,
         user_text=pf.user_text,
     ))
 
