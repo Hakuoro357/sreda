@@ -24,6 +24,7 @@ format and the rotation story.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from sqlalchemy import Text
@@ -87,3 +88,65 @@ class EncryptedString(TypeDecorator):
         from sreda.services.encryption import decrypt_value
 
         return decrypt_value(value)
+
+
+class JSONEncryptedString(TypeDecorator):
+    """``Text``-compatible column that stores a JSON-serializable value
+    (``dict`` / ``list``) encrypted at rest.
+
+    This is the JSON-aware sibling of :class:`EncryptedString`.  The same
+    encrypt/decrypt path is used (``services.encryption.encrypt_value`` /
+    ``decrypt_value``) so key-rotation and envelope handling stay identical.
+
+    Usage::
+
+        from sreda.db.types import JSONEncryptedString
+
+        class Thing(Base):
+            metadata_json: Mapped[dict] = mapped_column(
+                JSONEncryptedString(), nullable=True
+            )
+
+    On write the value is ``json.dumps``'d then encrypted (→ ``v2:`` blob).
+    On read the blob is decrypted then ``json.loads``'d back to the original
+    Python object.
+
+    Backward compatibility with pre-migration JSONB rows: a row whose stored
+    text has no encryption prefix is assumed to be raw JSON text (e.g. written
+    before this decorator was applied) and is passed directly to
+    ``json.loads``.
+
+    Non-serialisable input raises ``TypeError`` from ``json.dumps`` — it is
+    never silently coerced.  This is intentional: the type exists precisely to
+    catch dict/list values that EncryptedString would have silently
+    ``str()``-coerced.
+    """
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(
+        self, value: Any, dialect: Any
+    ) -> str | None:  # noqa: ARG002 — dialect unused
+        if value is None:
+            return None
+        # Raises TypeError for non-serialisable input — let it propagate.
+        serialised = json.dumps(value, ensure_ascii=False)
+        from sreda.services.encryption import encrypt_value
+
+        return encrypt_value(serialised)
+
+    def process_result_value(
+        self, value: Any, dialect: Any
+    ) -> Any:  # noqa: ARG002
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        # Decrypt if the value carries an encryption envelope; otherwise
+        # treat as legacy raw-JSON text (pre-migration row).
+        if value.startswith(_ENCRYPTED_PREFIXES):
+            from sreda.services.encryption import decrypt_value
+
+            value = decrypt_value(value)
+        return json.loads(value)
