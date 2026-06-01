@@ -11,18 +11,19 @@ Design constraints (accepted plan §PR-2a.1):
 - The legacy full registry (``MIGRATED_TOOL_SPECS`` / ``ALL_TOOL_SPECS`` in
   ``services.tool_schemas.specs``) is NEVER modified here.  This module reads
   from it as a library consumer.
-- Per-tenant ``enabled_names`` selection and the durable-write ⇒ adapter
-  fail-closed invariant are **out of scope** for this module.  They land in
-  PR-2b (tenant config wiring) and issue #8b-3 (adapter enforcement) respectively.
+- Per-tenant ``enabled_names`` selection is **out of scope** for this module —
+  it lands in PR-2b (tenant config wiring).
 - Pure: no I/O, no settings reads, no global mutation, fully deterministic.
 
-#8b-3 adapter-invariant hook (future, do NOT implement here):
+#8b-3 adapter invariant (IMPLEMENTED — :func:`assert_durable_write_adapters`):
     ``manifest.durable_write_names`` is the set of tool names where
-    ``spec.is_durable_write`` is True.  The #8b-3 fail-closed adapter check
-    will consume this set to assert that every durable-write tool has a
-    registered recovery adapter before accepting the manifest at startup.
-    The field is populated here so #8b-3 can be a pure reader with no
-    manifest changes.
+    ``spec.is_durable_write`` is True.  ``assert_durable_write_adapters``
+    consumes that set to assert every durable-write tool declares a recovery
+    idempotency adapter (``has_idempotency_adapter=True``), else it raises.
+    :func:`build_planner_manifest` calls it automatically at build, so no
+    planner-exposed manifest can contain an unadapted durable-write tool; the
+    function is also public so a manually-assembled manifest can be validated
+    explicitly.  It is a pure reader — it does not mutate the manifest.
 
 PR-2b wiring note (future, do NOT implement here):
     ``build_planner_manifest`` should be called once per tenant at
@@ -145,10 +146,9 @@ class PlannerManifest:
     def durable_write_names(self) -> frozenset[str]:
         """Names of durable-write tools (``spec.is_durable_write`` is True).
 
-        Informational for callers.  The #8b-3 fail-closed adapter invariant
-        will consume this to assert that every name here has a registered
-        recovery adapter — do NOT enforce adapter presence in this module,
-        that is #8b-3's job.
+        Consumed by :func:`assert_durable_write_adapters` (#8b-3) to assert that
+        every name here declares a recovery idempotency adapter; that gate runs
+        automatically inside :func:`build_planner_manifest`.
 
         A durable write satisfies: ``effect='write'``,
         ``side_effect_class='transactional_write'``, and
@@ -174,6 +174,9 @@ def build_planner_manifest(
     3. Among the specs whose name is in ``enabled_names``, two share the
        same ``.name`` (defensive: ambiguous — cannot build a correct
        ``by_name`` map).
+    4. Any enabled durable-write tool lacks a recovery idempotency adapter
+       (the #8b-3 invariant — see :func:`assert_durable_write_adapters`,
+       which this builder calls after constructing the manifest).
 
     Parameters
     ----------
@@ -233,10 +236,61 @@ def build_planner_manifest(
             f"Fix the enabled-name list (typo?) or add the missing specs."
         )
 
-    return PlannerManifest(specs=tuple(selected))
+    manifest = PlannerManifest(specs=tuple(selected))
+    # #8b-3 fail-closed adapter invariant — enforced HERE, at the registry-build
+    # chokepoint, so no planner-exposed manifest can ever contain a durable-write
+    # tool that lacks a recovery idempotency adapter. (Direct PlannerManifest()
+    # construction is intentionally NOT gated — see assert_durable_write_adapters.)
+    assert_durable_write_adapters(manifest)
+    return manifest
+
+
+def assert_durable_write_adapters(manifest: PlannerManifest) -> None:
+    """Fail-closed: every durable-write tool in *manifest* MUST declare a
+    recovery idempotency adapter (``has_idempotency_adapter=True``).
+
+    Sub-A12 Phase E PR-2a #8b-3.  A durable-write tool exposed to the planner
+    that has no recovery adapter cannot be made crash-safe: after a crash the
+    recovery scanner has no idempotent way to re-probe / re-apply its effect,
+    so a late or replayed commit could duplicate user data.  We therefore
+    refuse such a manifest outright rather than expose the tool.
+
+    This is the gate that keeps option-(b) tools (menu delete-recreate /
+    multi-row mutations) BLOCKED from the planner until their adapter lands
+    (plan §PR-2a.1): they are ``is_durable_write`` but
+    ``has_idempotency_adapter`` is False, so any manifest that enables them
+    raises here.
+
+    Pure reader: consumes ``manifest.durable_write_names`` + ``manifest.by_name``
+    (both already computed by #10b); it does NOT mutate the manifest.  Called
+    automatically by :func:`build_planner_manifest`; also exposed so a caller
+    that assembles a manifest by other means can validate it explicitly.
+
+    Raises
+    ------
+    ValueError
+        If any durable-write tool in the manifest lacks an idempotency adapter.
+        The message lists ALL offenders (sorted) so a misconfiguration surfaces
+        them at once, not one-per-rebuild.
+    """
+    missing = sorted(
+        name
+        for name in manifest.durable_write_names
+        if not manifest.by_name[name].has_idempotency_adapter
+    )
+    if missing:
+        raise ValueError(
+            "Planner manifest fail-closed (#8b-3): durable-write tool(s) "
+            f"{missing!r} have no recovery idempotency adapter "
+            "(has_idempotency_adapter=False). A durable write without an "
+            "adapter cannot be made crash-safe — its option-(a)/(b) adapter "
+            "must land (and the spec marked) before it can be exposed to the "
+            "planner. Remove it from enabled_names or implement its adapter."
+        )
 
 
 __all__ = [
     "PlannerManifest",
+    "assert_durable_write_adapters",
     "build_planner_manifest",
 ]

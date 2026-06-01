@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from sreda.runtime.planner.registry_manifest import (
     PlannerManifest,
+    assert_durable_write_adapters,
     build_planner_manifest,
 )
 from sreda.services.tool_schemas.base import ToolSpec
@@ -242,3 +243,91 @@ def test_by_name_is_read_only_mapping_proxy() -> None:
         m.by_name.clear()  # type: ignore[attr-defined]
     # State intact after the failed mutations.
     assert m.names == _ENABLED
+
+
+# ---------------------------------------------------------------------------
+# #8b-3: fail-closed durable-write ⇒ idempotency adapter invariant
+# ---------------------------------------------------------------------------
+
+
+def test_build_allows_adapted_durable_write_tool() -> None:
+    """A manifest whose only durable-write tool (add_shopping_items) HAS an
+    idempotency adapter builds successfully — the #8b-3 gate passes."""
+    m = _build_two()  # {list_shopping (read), add_shopping_items (adapted write)}
+    assert m.durable_write_names == {"add_shopping_items"}
+    assert m.by_name["add_shopping_items"].has_idempotency_adapter is True
+    # Explicit gate call is a no-op (does not raise) for an all-adapted manifest.
+    assert assert_durable_write_adapters(m) is None
+
+
+def test_build_blocks_unadapted_durable_write_tool() -> None:
+    """A durable-write tool WITHOUT an idempotency adapter (schedule_reminder)
+    must make build_planner_manifest fail closed — the #8b-3 invariant raises
+    at registry build, naming the offender."""
+    # Sanity: the tool is durable-write and currently has NO adapter.
+    assert _ALL_BY_NAME["schedule_reminder"].is_durable_write is True
+    assert _ALL_BY_NAME["schedule_reminder"].has_idempotency_adapter is False
+
+    with pytest.raises(ValueError, match="schedule_reminder") as exc_info:
+        build_planner_manifest(
+            all_specs=MIGRATED_TOOL_SPECS,
+            enabled_names={"list_shopping", "schedule_reminder"},
+        )
+    # Message mentions the adapter invariant, not just the name.
+    assert "adapter" in str(exc_info.value).lower()
+
+
+def test_build_blocks_menu_option_b_tool_until_adapter_lands() -> None:
+    """Menu / delete-recreate tools (option-(b)) stay fail-closed-blocked from
+    the planner manifest until their adapter lands (plan §PR-2a.1)."""
+    assert _ALL_BY_NAME["plan_week_menu"].is_durable_write is True
+    assert _ALL_BY_NAME["plan_week_menu"].has_idempotency_adapter is False
+    with pytest.raises(ValueError, match="adapter"):
+        build_planner_manifest(
+            all_specs=MIGRATED_TOOL_SPECS,
+            enabled_names={"list_shopping", "plan_week_menu"},
+        )
+
+
+def test_build_error_lists_all_unadapted_offenders_sorted() -> None:
+    """When several durable-write tools lack adapters, the error names ALL of
+    them (sorted) so the misconfiguration surfaces at once."""
+    with pytest.raises(ValueError) as exc_info:
+        build_planner_manifest(
+            all_specs=MIGRATED_TOOL_SPECS,
+            enabled_names={"add_shopping_items", "schedule_reminder", "save_recipe"},
+        )
+    msg = str(exc_info.value)
+    # The offender list is the exact sorted repr of the unadapted durable writes.
+    assert "['save_recipe', 'schedule_reminder']" in msg, (
+        f"expected exact sorted offender list in message, got: {msg}"
+    )
+    # add_shopping_items IS adapted → it must NOT be flagged as an offender
+    # (Codex A/B #8b-3 R1, both MINOR: assert absence explicitly, not just order).
+    assert "add_shopping_items" not in msg, (
+        "adapted tool add_shopping_items must not appear in the offender list"
+    )
+
+
+def test_read_only_manifest_passes_gate() -> None:
+    """A manifest with only read tools has no durable writes → gate is a no-op."""
+    m = build_planner_manifest(
+        all_specs=MIGRATED_TOOL_SPECS,
+        enabled_names={"list_shopping"},
+    )
+    assert m.durable_write_names == frozenset()
+    assert assert_durable_write_adapters(m) is None
+
+
+def test_standalone_gate_raises_on_directly_constructed_unadapted_manifest() -> None:
+    """The standalone reader raises on a manifest constructed directly (bypassing
+    build) that contains an unadapted durable-write tool. Direct construction is
+    intentionally NOT adapter-gated (it's for testing manifest mechanics); the
+    explicit gate is how a manually-assembled manifest is validated."""
+    m = PlannerManifest(
+        specs=(_ALL_BY_NAME["list_shopping"], _ALL_BY_NAME["schedule_reminder"]),
+    )
+    # Direct construction succeeded (no adapter gate in __post_init__).
+    assert "schedule_reminder" in m.names
+    with pytest.raises(ValueError, match="adapter"):
+        assert_durable_write_adapters(m)
