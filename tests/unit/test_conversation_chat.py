@@ -1764,3 +1764,232 @@ def test_provider_refusal_text_substituted(monkeypatch, tmp_path: Path):
 
     assert len(telegram.sent) == 1
     assert telegram.sent[0]["text"] == _REFUSAL_SUBSTITUTE_MESSAGE
+
+
+# ---------------------------------------------------------------------------
+# PR-1 loop-seam gap tests (Sub-A12 Phase E)
+# ---------------------------------------------------------------------------
+# Characterise two uncovered paths through _run_legacy_react_loop that the
+# independent review flagged.  A NameError in a moved closure would only
+# surface on these paths; pinning them here protects the seam extraction.
+
+
+def test_primary_llm_raises_fallback_engages_and_replies(
+    monkeypatch, tmp_path: Path
+):
+    """Primary invoke raises → fallback client engages and produces the reply.
+
+    Mechanism: execute_conversation_chat reads context["_fallback_llm_client"]
+    and calls .bind_tools(tools) on it if present (handlers.py:3236-3239).
+    We inject a separate FakeLLM as the fallback via node_execute_action
+    (the graph node that builds context before calling the handler).
+
+    Primary _BoundFakeLLM is patched to raise LLMCallTimeout on invoke.
+    Fallback FakeLLM returns a plain-text reply.
+    Guard: the admin-alert call for "fallback engaged" is suppressed so the
+    test doesn't fail on missing SREDA_ADMIN_* env vars.
+    """
+    from sreda.services.llm import LLMCallTimeout
+    import sreda.runtime.graph as _graph_module
+
+    session = _bootstrap(monkeypatch, tmp_path, "pr1_fallback.db")
+
+    # Suppress admin alerts — the fallback path fires send_admin_alert
+    # with severity P1; swallow it so the test is self-contained.
+    monkeypatch.setattr(
+        "sreda.services.admin_alerts.send_admin_alert",
+        lambda *_a, **_kw: None,
+    )
+
+    # Primary LLM: raises LLMCallTimeout on every invoke.
+    class _RaisingBound:
+        tools: list = []
+
+        def invoke(self, messages):
+            raise LLMCallTimeout("primary timed out (test)")
+
+        def stream(self, messages):
+            raise LLMCallTimeout("primary timed out (test)")
+
+    class _RaisingLLM:
+        def bind_tools(self, tools):
+            b = _RaisingBound()
+            b.tools = list(tools)
+            return b
+
+        def invoke(self, messages):
+            raise LLMCallTimeout("primary timed out (test)")
+
+    primary_llm = _RaisingLLM()
+
+    # Fallback LLM: returns a plain reply immediately.
+    fallback_llm = FakeLLM([
+        AIMessage(content="Fallback ответил — первичный упал."),
+    ])
+
+    # Inject fallback into context by wrapping node_execute_action.
+    _orig_node = _graph_module.node_execute_action
+
+    async def _patched_node(state, config):
+        config["configurable"]["_fallback_llm_client"] = fallback_llm.bind_tools([])
+        return await _orig_node(state, config)
+
+    monkeypatch.setattr(_graph_module, "node_execute_action", _patched_node)
+
+    # But the handler checks context["_fallback_llm_client"] not
+    # config["configurable"]["_fallback_llm_client"] — we need to also
+    # patch node_execute_action to inject into the context dict it builds.
+    # Simpler: patch execute_conversation_chat's context read directly by
+    # wrapping node_execute_action to add the key to the context dict:
+    async def _patched_node2(state, config):
+        result = await _orig_node(state, config)
+        return result
+
+    # Actually the cleaner injection is to monkeypatch _graph_module so that
+    # node_execute_action adds "_fallback_llm_client" to the context dict
+    # BEFORE calling the handler.  Let's wrap it properly:
+    async def _inject_fallback_node(state, config):
+        # Build the context that the node would build, then inject our key.
+        # We do this by temporarily patching the module-level dict lookup.
+        import sreda.runtime.graph as _g
+        orig = _g.node_execute_action
+        # Wrap the context dict after it's built inside the node.
+        # Since we can't easily intercept the dict mid-function, we patch
+        # execute_conversation_chat in handlers to intercept its context arg.
+        return await orig(state, config)
+
+    # The cleanest approach: monkeypatch execute_conversation_chat to wrap
+    # the context dict and insert _fallback_llm_client before it runs.
+    import sreda.runtime.handlers as _handlers
+
+    _orig_handler = _handlers.execute_conversation_chat
+
+    async def _wrapped_handler(session_arg, action, context):
+        context["_fallback_llm_client"] = fallback_llm
+        return await _orig_handler(session_arg, action, context)
+
+    monkeypatch.setattr(_handlers, "execute_conversation_chat", _wrapped_handler)
+    # Also route the HANDLERS registry to our wrapper. Use monkeypatch.setitem
+    # (auto-restored at teardown) rather than direct dict assignment + manual
+    # finally-restore — avoids the module-state-leak trap
+    # (feedback_pytest_monkeypatch_required).
+    monkeypatch.setitem(_handlers.HANDLERS, "conversation.chat", _wrapped_handler)
+
+    try:
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=primary_llm,
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("привет"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    assert "Fallback ответил" in telegram.sent[0]["text"]
+
+
+def test_turn_timeout_with_successful_tools_returns_summary(
+    monkeypatch, tmp_path: Path
+):
+    """Turn timeout fires after iter=0 succeeds → reply is _format_timeout_summary.
+
+    Mechanism (handlers.py:3523-3531):
+        if _turn_timed_out:
+            if successful_tool_counts:
+                text = _format_timeout_summary(successful_tool_counts)
+            else:
+                text = "Не успел(а) обдумать..."
+
+    We need successful_tool_counts to be non-empty when the timeout fires.
+    The timeout check is at the TOP of each loop iteration.  So:
+      - iter=0 check: elapsed must NOT exceed the cap → passes normally
+      - iter=0 body: tool call (save_core_fact) executes → successful_tool_counts populated
+      - iter=1 check: elapsed DOES exceed the cap → _turn_timed_out=True, break
+
+    We achieve this by monkeypatching the monotonic clock so that
+    _turn_start_monotonic = 0, first elapsed check returns 0 (iter=0 passes),
+    second elapsed check returns a large value (iter=1 times out).
+    """
+    import time as _real_time
+    from sreda.runtime.handlers import _format_timeout_summary
+
+    session = _bootstrap(monkeypatch, tmp_path, "pr1_timeout_tools.db")
+
+    # Script: iter=0 emits save_core_fact (succeeds); there is no iter=1 reply
+    # because the timeout fires before the LLM is called again.
+    scripted = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "save_core_fact",
+                    "args": {"content": "люблю кофе по утрам"},
+                    "id": f"tc_{uuid4().hex[:8]}",
+                }
+            ],
+        ),
+        # This response would be used only if the loop reaches iter=1, which
+        # it must NOT (timeout fires at the iter=1 check). Having it here
+        # guards against accidental use.
+        AIMessage(content="(не должно быть отправлено — timeout должен сработать)"),
+    ]
+
+    # Strategy: replace the module-level ``time`` binding in
+    # sreda.runtime.handlers with a controlled fake object so that only
+    # the handler's own time.monotonic() calls are intercepted.  asyncio
+    # and the executor-level asyncio.wait_for use their own time references
+    # and are unaffected.
+    #
+    # Clock sequence for _run_legacy_react_loop:
+    #   call 0 → 0.0   (_turn_start_monotonic = time.monotonic(), before loop)
+    #   call 1 → 0.0   (iter=0 check: elapsed = 0.0 - 0.0 = 0.0; NOT > cap=0 → passes)
+    #   call 2 → 999.0 (iter=1 check: elapsed = 999.0 - 0.0 = 999.0; > 0 → fires)
+    # Additional calls return 999.0 (logging path inside the timeout branch).
+    _mono_seq = [0.0, 0.0, 999.0]
+    _mono_idx = [0]
+
+    import types as _types
+    import time as _real_time
+
+    _fake_time = _types.SimpleNamespace(
+        **{k: getattr(_real_time, k) for k in dir(_real_time) if not k.startswith("__")},
+    )
+
+    def _fake_monotonic() -> float:
+        val = _mono_seq[min(_mono_idx[0], len(_mono_seq) - 1)]
+        _mono_idx[0] += 1
+        return val
+
+    _fake_time.monotonic = _fake_monotonic
+
+    import sreda.runtime.handlers as _h
+    monkeypatch.setattr(_h, "time", _fake_time)
+    monkeypatch.setattr(_h, "CHAT_TURN_TIMEOUT_SECONDS", 0)
+
+    try:
+        telegram = FakeTelegram()
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=telegram,
+            llm_client=FakeLLM(scripted),
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("запомни про кофе"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(telegram.sent) == 1
+    reply = telegram.sent[0]["text"]
+    # The reply must be the timeout-summary path (not the generic
+    # "не успел обдумать" and not a normal LLM reply).
+    # _format_timeout_summary({"save_core_fact": 1}) →
+    #   "Успела сделать (память). Открой Mini App..."
+    expected_summary = _format_timeout_summary({"save_core_fact": 1})
+    assert reply == expected_summary, (
+        f"Expected timeout summary {expected_summary!r}, got {reply!r}"
+    )
