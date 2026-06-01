@@ -500,3 +500,107 @@ def test_discriminator_union_unknown_status_rejected() -> None:
 
     with pytest.raises(ValidationError):
         adapter.validate_python({"status": "weird_unknown", "anything": True})
+
+
+# ---------------------------------------------------------------------------
+# Sub-A12 Phase E — request_local marker + derived is_durable_write predicate
+# (accepted plan §PR-2a.1: durable-write detection = write &
+#  transactional_write & not request_local — NO free-floating recovery_class
+#  enum; the r5→r6 plan review explicitly rejected a second enum.)
+# ---------------------------------------------------------------------------
+
+
+def test_request_local_defaults_false() -> None:
+    """request_local defaults to False — only genuine request-local writes
+    (reply_with_buttons) set it."""
+    assert _minimal_read_spec().request_local is False
+    assert _minimal_write_spec().request_local is False
+
+
+def test_is_durable_write_read_tool_is_false() -> None:
+    """A read tool is never a durable write."""
+    assert _minimal_read_spec().is_durable_write is False
+
+
+def test_is_durable_write_read_only_side_effect_is_false() -> None:
+    """effect='read' + side_effect_class='read_only' → not a durable write."""
+    assert _minimal_read_spec(side_effect_class="read_only").is_durable_write is False
+
+
+def test_is_durable_write_transactional_write_is_true() -> None:
+    """A write tool with the default (transactional_write) side_effect_class
+    and request_local=False IS a durable write — needs a recovery adapter."""
+    assert _minimal_write_spec().is_durable_write is True
+
+
+def test_is_durable_write_request_local_write_is_false() -> None:
+    """A request-local write (request_local=True) is NOT a durable write —
+    its mutation never reaches the user-data DB, so no recovery adapter."""
+    spec = _minimal_write_spec(request_local=True)
+    assert spec.request_local is True
+    assert spec.is_durable_write is False
+
+
+def test_request_local_on_read_tool_rejected() -> None:
+    """request_local=True is meaningless on a read tool — a read has no
+    in-process mutation to be request-local about. Must be rejected so a
+    mis-set flag can't quietly suppress is_durable_write."""
+    with pytest.raises(ValidationError) as exc:
+        _minimal_read_spec(request_local=True)
+    msg = str(exc.value).lower()
+    assert "request_local" in msg and "read" in msg
+
+
+def test_reply_with_buttons_is_request_local_not_durable() -> None:
+    """reply_with_buttons must carry request_local=True — it writes to an
+    in-memory state dict, not a user-data DB table — so is_durable_write
+    is False and the registry build won't demand a recovery adapter."""
+    from sreda.services.tool_schemas.specs_ui import REPLY_WITH_BUTTONS_SPEC
+    assert REPLY_WITH_BUTTONS_SPEC.request_local is True
+    assert REPLY_WITH_BUTTONS_SPEC.is_durable_write is False
+
+
+def test_schedule_reminder_is_durable_write() -> None:
+    """schedule_reminder is a genuine durable DB write → is_durable_write."""
+    from sreda.services.tool_schemas.specs_reminders import SCHEDULE_REMINDER_SPEC
+    assert SCHEDULE_REMINDER_SPEC.is_durable_write is True
+
+
+def test_menu_crud_is_durable_write() -> None:
+    """Menu CRUD tools are durable writes → is_durable_write True (they
+    fail-closed-block until their option-(b) adapter lands)."""
+    from sreda.services.tool_schemas.specs_menu import (
+        CLEAR_MENU_SPEC,
+        PLAN_WEEK_MENU_SPEC,
+        UPDATE_MENU_ITEM_SPEC,
+    )
+    for spec in (PLAN_WEEK_MENU_SPEC, UPDATE_MENU_ITEM_SPEC, CLEAR_MENU_SPEC):
+        assert spec.is_durable_write is True, (
+            f"{spec.name} expected is_durable_write=True"
+        )
+
+
+def test_is_durable_write_invariant_holds_across_full_registry() -> None:
+    """Every registered ToolSpec must have a coherent is_durable_write:
+    read tools and request-local writes are NOT durable; plain
+    transactional writes ARE. Also asserts request_local is never set on a
+    read tool (the validator already enforces this — belt-and-braces over
+    the live registry)."""
+    from sreda.services.tool_schemas.specs import ALL_TOOL_SPECS
+
+    assert ALL_TOOL_SPECS, "registry is empty — sanity guard"
+    for spec in ALL_TOOL_SPECS:
+        if spec.request_local:
+            assert spec.effect == "write", (
+                f"{spec.name}: request_local=True on a non-write tool"
+            )
+        expected = (
+            spec.effect == "write"
+            and spec.side_effect_class == "transactional_write"
+            and not spec.request_local
+        )
+        assert spec.is_durable_write is expected, (
+            f"{spec.name}: is_durable_write={spec.is_durable_write} but "
+            f"effect={spec.effect!r} side_effect_class={spec.side_effect_class!r} "
+            f"request_local={spec.request_local}"
+        )

@@ -101,6 +101,14 @@ REPLY_WITH_BUTTONS_SPEC = ToolSpec(
     ],
     timeout_seconds=5,
     side_effect_class="transactional_write",
+    # request_local marker: reply_with_buttons is REQUEST-LOCAL. It writes
+    # to an in-memory state dict consumed by the post-loop renderer, NOT to
+    # any user-data DB table. Without this flag the derived is_durable_write
+    # predicate (effect='write' + side_effect_class='transactional_write')
+    # would classify it as a durable write and the registry build would
+    # demand a recovery adapter for a UI render call. (Sub-A12 Phase E,
+    # accepted plan §PR-2a.1 — request_local bool, not a recovery_class enum.)
+    request_local=True,
 )
 
 

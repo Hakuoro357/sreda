@@ -271,6 +271,25 @@ class ToolSpec(BaseModel):
     side_effect_class: Literal[
         "read_only", "transactional_write", "external_side_effect"
     ] = "transactional_write"
+    request_local: bool = False
+    """Sub-A12 Phase E — marks a write-ish tool whose mutation is
+    *request-local*: it populates an in-memory state dict consumed later
+    in the SAME turn (e.g. ``reply_with_buttons`` staging inline
+    keyboards), never reaching the user-data DB. Such a tool needs NO
+    recovery adapter even though ``effect='write'``.
+
+    Durable-write detection is DERIVED from existing fields, NOT a second
+    free-floating enum: the accepted plan (sub-a12-phase-e-final §PR-2a.1)
+    explicitly rejected a parallel ``recovery_class`` enum in the r5→r6
+    review (decision-log-r6: "no second enum"). See
+    :pyattr:`is_durable_write` = ``effect=='write' and
+    side_effect_class=='transactional_write' and not request_local``.
+
+    Default ``False``. Set ``True`` (with a code comment) ONLY for a
+    genuine request-local write like ``reply_with_buttons``. Invalid on a
+    read tool — the validator rejects ``request_local=True`` unless
+    ``effect='write'`` (a read tool has no local mutation to be
+    request-local about)."""
     committed_statuses: frozenset[str] | None = None
     """Sub-A12 #29 — the set of ``status`` Literal values from this tool's
     output_model that signal a REAL DB mutation was committed. Used by the
@@ -392,6 +411,27 @@ class ToolSpec(BaseModel):
     path). The flag forces explicit acknowledgement of the deferred
     check, which is safer than implicit.
     """
+
+    @property
+    def is_durable_write(self) -> bool:
+        """Whether this tool commits a real, recoverable DB write.
+
+        The executor's recovery adapter (Sub-A12 #8b) is MANDATORY for
+        these tools and the planner-safe registry build fails closed if
+        one is missing. Read tools and request-local writes (e.g.
+        ``reply_with_buttons``) return ``False`` — they need no adapter.
+
+        Derived, NOT stored (accepted plan §PR-2a.1 — no free-floating
+        ``recovery_class`` enum): a durable write is a transactional write
+        that is not request-local. ``external_side_effect`` is forbidden in
+        MVP and ``side_effect_class='read_only'`` implies ``effect='read'``,
+        so this reduces to the plan's
+        ``write & transactional_write & not request_local``."""
+        return (
+            self.effect == "write"
+            and self.side_effect_class == "transactional_write"
+            and not self.request_local
+        )
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> ToolSpec:
@@ -564,6 +604,21 @@ class ToolSpec(BaseModel):
                 f"which is FORBIDDEN in MVP (Group 6.3). Until compensation/abort "
                 f"design is approved, no tool may make non-rollback-able external "
                 f"calls. Use 'transactional_write' if it's a local DB write."
+            )
+        # Sub-A12 Phase E — request_local is only meaningful for a write
+        # tool: it marks a write-ish effect whose mutation stays in-process
+        # (e.g. reply_with_buttons). A read tool has nothing to be
+        # request-local about. Durable-write detection itself is the derived
+        # `is_durable_write` predicate (accepted plan §PR-2a.1 — the r5→r6
+        # review rejected a second free-floating recovery_class enum), so the
+        # only contradiction to guard here is request_local on a non-write.
+        if self.request_local and self.effect != "write":
+            raise ValueError(
+                f"Tool '{self.name}' has request_local=True but "
+                f"effect='{self.effect}'. request_local marks a write-ish "
+                f"tool whose mutation stays in-process (e.g. "
+                f"reply_with_buttons) — it is meaningless on a read tool. "
+                f"Either set effect='write' or drop request_local."
             )
         if not self.allow_field_validators:
             validators = _collect_field_validator_names(self.input_model)
