@@ -112,6 +112,24 @@ class FinalizeInput:
     user_text: str
 
 
+@dataclass
+class ChatLoopResult:
+    """Outputs of the tool-call loop returned to ``execute_conversation_chat``.
+
+    Carries exactly the locals produced by the loop that the code after it
+    (onboarding bookkeeping + ``finalize_chat_reply``) consumes.
+    """
+
+    final_ai: Any  # AIMessage | None
+    messages: list[Any]  # mutated in-place during the loop
+    turn_msg_start_idx: int  # unchanged from the value passed in
+    called_tools: set[str]
+    hallucination_nudged: bool  # from _hallucination_nudged
+    turn_timed_out: bool  # from _turn_timed_out
+    successful_tool_counts: dict[str, int]
+    onboarding_resolution_called: bool  # from _onboarding_resolution_called
+
+
 class ActionRuntimeError(Exception):
     """Structured failure from a handler or policy-guard.
 
@@ -2094,6 +2112,616 @@ def _upgrade_reply_markup(feature_key: str) -> dict:
     }
 
 
+async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by design
+    *,
+    # LLM clients
+    llm: Any,
+    llm_with_tools: Any,
+    _fallback_with_tools: Any,
+    # Routing / identity
+    action: Any,  # ActionEnvelope
+    feature_key: str | None,
+    user_id: str | None,
+    model_name: str,
+    run_id: str,
+    # Provider labels (for llm-trace envelopes)
+    _chat_primary_provider: str | None,
+    _chat_fallback_provider: str | None,
+    # Tool registry
+    tools_by_name: dict[str, Any],
+    # Message list (mutated in-place)
+    messages: list[Any],
+    _turn_msg_start_idx: int,
+    # Settings / services
+    settings: Any,
+    budget: Any,  # BudgetService
+    session: Any,  # sqlalchemy Session
+    # Trace / ack
+    trace: Any,
+    _ack_progress: Any,
+    # llm-trace closure inputs
+    _base_envelope_fields: dict[str, Any],
+    _trace_id_value: str,
+    _tool_schemas_for_log: list[dict],
+    # Anti-hallucination
+    user_text: str,
+    # Onboarding
+    _onboarding_resolution_tools: set[str],
+) -> ChatLoopResult:
+    """Tool-call loop extracted from ``execute_conversation_chat`` (seam 2).
+
+    Runs the ReAct loop capped at ``_MAX_TOOL_ITERATIONS``, handles
+    primary/fallback LLM switching, anti-hallucination nudge, timeout,
+    and forced summary turn.  All behaviour is verbatim from the original
+    inline block; no logic changes.
+    """
+    import time as _time_module  # local import mirrors original inline import
+
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: PLC0415
+
+    # --- 4. Tool-call loop with per-call usage recording --------------
+    # Limit tuned to common chains: weather lookup (search→fetch→format
+    # switch) ~ 4-5; "сохрани 18 рецептов" batches require ≤ 2 since
+    # save_recipes_batch consolidates; plan_week + search_recipes +
+    # generate_shopping_from_menu ~ 3-4. Bumped 8→12 in 2026-04-20
+    # after pilot exhaustion on a 18-recipe batch ended up partial.
+    # If still exhausted, one final tools-less invoke forces a summary
+    # so the user always gets a real reply (not a "budget exhausted" stub).
+    _MAX_TOOL_ITERATIONS = 12
+
+    # Hard ceiling on total turn time. Observed 2026-04-22: a single
+    # turn hung for 1198 seconds (20 minutes) with iters=0, starving a
+    # worker thread and leaving the user waiting forever. 90s is a
+    # generous cap — normal turns finish in 10–40s, pathological in
+    # 60–90s. Beyond that we abort, surface a loud CHAT_TURN_TIMEOUT
+    # warning (admin /logs quick-filter), and fall through to the
+    # empty-reply rescue / "..." fallback so the user at least sees
+    # an error.
+    _CHAT_TURN_TIMEOUT_SECONDS = CHAT_TURN_TIMEOUT_SECONDS
+    _turn_start_monotonic = time.monotonic()
+
+    def _record_and_log(ai_msg: Any, *, iteration: int) -> None:
+        usage = getattr(ai_msg, "usage_metadata", None) or {}
+        prompt_tokens = int(usage.get("input_tokens") or 0)
+        completion_tokens = int(usage.get("output_tokens") or 0)
+        _log_llm_response(
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            iteration=iteration,
+            ai_msg=ai_msg,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+        if prompt_tokens or completion_tokens:
+            try:
+                budget.record_llm_usage(
+                    tenant_id=action.tenant_id,
+                    feature_key=feature_key,
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    run_id=run_id,
+                    task_type="conversation.chat",
+                )
+                session.commit()
+            except Exception:  # noqa: BLE001 — usage tracking must not kill the turn
+                logger.exception("budget: failed to record LLM usage")
+
+    async def _persist_request_with_policy(
+        attempt: str, llm_obj: Any, provider: str | None,
+        iter_n: int, per_call_timeout: float,
+        *, tool_schemas: list[dict] | None = None,
+    ) -> None:
+        """Persist phase=request envelope. Admin alert if degraded;
+        fail-closed raise если SREDA_LLM_TRACE_REQUIRE_PERSIST=true.
+        No-op if logging disabled."""
+        if not get_settings().llm_trace_logging_enabled:
+            return
+        try:
+            from sreda.services.llm_trace import (
+                PersistResult, build_request_envelope, persist_request_envelope,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace import failed (request)")
+            return
+        env = build_request_envelope(
+            base_fields={**_base_envelope_fields, "iter": iter_n},
+            attempt=attempt, messages=messages,
+            tool_schemas=(tool_schemas
+                          if tool_schemas is not None
+                          else _tool_schemas_for_log),
+            llm=llm_obj, provider=provider,
+            invocation_kwargs={"timeout_seconds": per_call_timeout},
+        )
+        try:
+            result = await persist_request_envelope(env)
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace persist_request raised unexpectedly")
+            result = PersistResult.FAILED
+        if result == PersistResult.WRITTEN:
+            return
+        try:
+            from sreda.services.admin_alerts import send_admin_alert
+            send_admin_alert(
+                severity="P1",
+                title=f"llm-trace request persist degraded: {result.value}",
+                body=(
+                    f"trace_id={_trace_id_value} iter={iter_n} "
+                    f"attempt={attempt} result={result.value}"
+                ),
+                dedupe_key=f"llm_trace_persist_degraded:{result.value}",
+            )
+        except Exception:  # noqa: BLE001 — alert must not crash turn
+            logger.exception("admin alert send failed (llm-trace degraded)")
+        if get_settings().llm_trace_require_persist:
+            raise RuntimeError(
+                f"llm-trace persist returned {result.value}; aborting LLM call "
+                f"(SREDA_LLM_TRACE_REQUIRE_PERSIST=true)"
+            )
+
+    async def _persist_response_async(
+        attempt: str, ai_msg_obj: Any, latency_ms: int, iter_n: int,
+    ) -> None:
+        """Fire-and-forget phase=response envelope."""
+        if not get_settings().llm_trace_logging_enabled:
+            return
+        try:
+            from sreda.services.llm_trace import (
+                build_response_envelope, persist_response_envelope,
+            )
+            await persist_response_envelope(build_response_envelope(
+                base_fields={**_base_envelope_fields, "iter": iter_n},
+                attempt=attempt, ai_msg=ai_msg_obj, latency_ms=latency_ms,
+            ))
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace persist_response failed")
+
+    async def _persist_error_async(
+        attempt: str, exc_obj: BaseException, latency_ms: int, iter_n: int,
+    ) -> None:
+        """Fire-and-forget phase=error envelope."""
+        if not get_settings().llm_trace_logging_enabled:
+            return
+        try:
+            from sreda.services.llm_trace import (
+                build_error_envelope, persist_response_envelope,
+            )
+            await persist_response_envelope(build_error_envelope(
+                base_fields={**_base_envelope_fields, "iter": iter_n},
+                attempt=attempt, exc=exc_obj, latency_ms=latency_ms,
+            ))
+        except Exception:  # noqa: BLE001
+            logger.exception("llm-trace persist_error failed")
+
+    final_ai: Any = None  # AIMessage | None
+    # Track whether the LLM resolved the current onboarding topic this
+    # turn (via answered/deferred/complete). If not, the post-turn hook
+    # increments topic depth so next turn's prompt forces a resolution
+    # after the cap.
+    _onboarding_resolution_called = False
+    # Union of tool names actually invoked across all iterations of
+    # this turn. Used post-loop to detect Gemma-style "я сохранила
+    # рецепт" narrations that weren't backed by a save_recipe call
+    # (see ``detect_unbacked_claim``). Populated below inside the
+    # tool-execution block.
+    called_tools: set[str] = set()
+    # 2026-04-28: track successful tool execution counts for timeout-
+    # rescue summary. If turn aborts after tools already wrote to DB,
+    # we surface a short "что успела сделать" message instead of generic
+    # «не успел обдумать» — иначе юзер не знает что задачи реально
+    # созданы (incident с tg_634496616 13:27 MSK).
+    successful_tool_counts: dict[str, int] = {}
+    # Guard so the anti-hallucination nudge runs at most once per turn
+    # — two consecutive empty iterations would otherwise spiral.
+    _hallucination_nudged = False
+    _turn_timed_out = False
+    for _iter in range(_MAX_TOOL_ITERATIONS):
+        # Cooperative turn-level timeout. Checked before each iteration
+        # (can't interrupt a running LLM call from here — MiMo has its
+        # own per-request timeout via settings.mimo_request_timeout_seconds).
+        # Catches cases where the turn spends too long in aggregate, or
+        # where the first LLM call itself hangs past the per-request cap.
+        _elapsed = time.monotonic() - _turn_start_monotonic
+        if _elapsed > _CHAT_TURN_TIMEOUT_SECONDS:
+            logger.warning(
+                "CHAT_TURN_TIMEOUT tenant=%s user=%s feature=%s iter=%d "
+                "elapsed=%.1fs cap=%ds — aborting turn, falling back to "
+                "rescue/empty-reply path",
+                action.tenant_id,
+                user_id or "?",
+                feature_key,
+                _iter,
+                _elapsed,
+                _CHAT_TURN_TIMEOUT_SECONDS,
+            )
+            _turn_timed_out = True
+            break
+        if _ack_progress is not None and _iter > 0:
+            try:
+                _ack_progress.schedule_progress()
+            except Exception:  # noqa: BLE001
+                logger.debug("ack progress schedule failed", exc_info=True)
+        _log_llm_invoke(
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            iteration=_iter,
+            messages=messages,
+        )
+        with trace.step(f"llm.iter.{_iter}", model=model_name) as _trace_meta:
+            # 2026-04-28: per-call timeout через ThreadPoolExecutor +
+            # ручная fallback логика. Langchain .with_fallbacks() ловит
+            # exceptions ВНУТРИ thread'а primary — на hangs не работает
+            # (incident 13:27 MSK: MiMo 131s без exception). Делаем
+            # внешний timeout + manual fallback на отдельный fallback
+            # клиент.
+            _per_call_timeout = get_settings().mimo_request_timeout_seconds
+            _stream_visible_text = (
+                settings.ack_streaming_enabled
+                and _ack_progress is not None
+                and getattr(_ack_progress, "enabled", False)
+            )
+
+            def _stream_to_ack(text: str) -> None:
+                if not _stream_visible_text or _ack_progress is None:
+                    return
+                try:
+                    _ack_progress.schedule_stream_text(
+                        text,
+                        min_interval_seconds=(
+                            settings.ack_streaming_min_interval_seconds
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("ack stream schedule failed", exc_info=True)
+
+            # Issue #68: persist phase=request envelope BEFORE ainvoke.
+            # Strong semantics — crash-safe: row на диске до того как LLM
+            # стартует. Если require_persist=true и persist degraded — raise
+            # (RuntimeError caught в outer handler).
+            await _persist_request_with_policy(
+                attempt="primary", llm_obj=llm_with_tools,
+                provider=_chat_primary_provider, iter_n=_iter,
+                per_call_timeout=_per_call_timeout,
+            )
+            _t_primary_started = _time_module.monotonic()
+            try:
+                ai_msg = await ainvoke_with_streaming_timeout(
+                    llm_with_tools,
+                    messages,
+                    timeout_seconds=_per_call_timeout,
+                    on_text_update=_stream_to_ack if _stream_visible_text else None,
+                )
+                # Issue #68: fire-and-forget response envelope (primary OK).
+                _lat_ms_primary = int(
+                    (_time_module.monotonic() - _t_primary_started) * 1000
+                )
+                await _persist_response_async(
+                    "primary", ai_msg, _lat_ms_primary, _iter,
+                )
+            except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
+                # Issue #68: persist phase=error envelope (primary failed)
+                # — fire-and-forget. Latency measured from request start.
+                _lat_ms_primary_err = int(
+                    (_time_module.monotonic() - _t_primary_started) * 1000
+                )
+                await _persist_error_async(
+                    "primary", exc, _lat_ms_primary_err, _iter,
+                )
+                # Любая ошибка primary (timeout / 5xx / rate limit) →
+                # пытаемся fallback если он есть.
+                # R-28: alert admin для **любой** LLM error (Codex R1 M3 —
+                # fallback may be None для some configs, alert before re-raise).
+                exc_type = type(exc).__name__
+                try:
+                    from sreda.services.admin_alerts import send_admin_alert
+                    if _fallback_with_tools is None:
+                        # No fallback configured — error propagates to caller.
+                        # P0 severity: данный turn полностью failed, user видит error.
+                        send_admin_alert(
+                            severity="P0",
+                            title=f"LLM primary failed, NO fallback: {exc_type}",
+                            body=(
+                                f"tenant: {action.tenant_id}\n"
+                                f"feature: {feature_key}\n"
+                                f"iter: {_iter}\n"
+                                f"primary_exc: {exc_type}\n"
+                                f"reason: {str(exc)[:300]}\n"
+                                f"impact: turn re-raised без fallback — user sees error"
+                            ),
+                            dedupe_key=f"llm_primary_no_fallback:{exc_type}:{feature_key}",
+                        )
+                    else:
+                        # Fallback engaged — P1, degraded but turn completes.
+                        send_admin_alert(
+                            severity="P1",
+                            title=f"LLM fallback engaged: {exc_type}",
+                            body=(
+                                f"tenant: {action.tenant_id}\n"
+                                f"feature: {feature_key}\n"
+                                f"iter: {_iter}\n"
+                                f"primary_exc: {exc_type}\n"
+                                f"reason: {str(exc)[:300]}"
+                            ),
+                            dedupe_key=f"llm_fallback:{exc_type}:{feature_key}",
+                        )
+                except Exception:  # noqa: BLE001 — alert must not crash turn
+                    logger.exception("R-28 admin_alert dispatch failed")
+                if _fallback_with_tools is None:
+                    raise
+                logger.warning(
+                    "LLM_FALLBACK_ENGAGED tenant=%s feature=%s iter=%d "
+                    "primary_exc=%s reason=%s — switching to fallback",
+                    action.tenant_id, feature_key, _iter,
+                    exc_type, str(exc)[:120],
+                )
+                _trace_meta["fallback"] = True
+                _trace_meta["primary_exc"] = exc_type
+                # Issue #68: persist phase=request envelope для fallback
+                # — separate config (different provider/model/extra_body).
+                await _persist_request_with_policy(
+                    attempt="fallback", llm_obj=_fallback_with_tools,
+                    provider=_chat_fallback_provider, iter_n=_iter,
+                    per_call_timeout=_per_call_timeout,
+                )
+                _t_fallback_started = _time_module.monotonic()
+                try:
+                    ai_msg = await ainvoke_with_streaming_timeout(
+                        _fallback_with_tools,
+                        messages,
+                        timeout_seconds=_per_call_timeout,
+                        on_text_update=_stream_to_ack if _stream_visible_text else None,
+                    )
+                    _lat_ms_fallback = int(
+                        (_time_module.monotonic() - _t_fallback_started) * 1000
+                    )
+                    await _persist_response_async(
+                        "fallback", ai_msg, _lat_ms_fallback, _iter,
+                    )
+                except Exception as fb_exc:  # noqa: BLE001
+                    _lat_ms_fb_err = int(
+                        (_time_module.monotonic() - _t_fallback_started) * 1000
+                    )
+                    await _persist_error_async(
+                        "fallback", fb_exc, _lat_ms_fb_err, _iter,
+                    )
+                    raise
+            usage = getattr(ai_msg, "usage_metadata", None) or {}
+            _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
+            _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
+            # 2026-05-22 #65: provider prompt-cache visibility. MiMo
+            # (xiaomimimo.com) returns OpenAI-style ``prompt_tokens_details.
+            # cached_tokens`` which langchain-openai surfaces as
+            # ``usage_metadata.input_token_details.cache_read``. We trace it
+            # so we can see in /admin/trace-viewer whether the stable
+            # prompt is actually getting cached on the provider side.
+            _input_details = usage.get("input_token_details") or {}
+            _cached_tok = int(
+                _input_details.get("cache_read")
+                or _input_details.get("cached")
+                or 0
+            )
+            if _cached_tok:
+                _trace_meta["cached_tok"] = _cached_tok
+            _trace_meta["tools"] = [
+                tc.get("name") for tc in (getattr(ai_msg, "tool_calls", None) or [])
+            ]
+        _record_and_log(ai_msg, iteration=_iter)
+        messages.append(ai_msg)
+        tool_calls = getattr(ai_msg, "tool_calls", None) or []
+        if not tool_calls:
+            # Anti-hallucination retry (Gemma-4 prod case 2026-04-22):
+            # model emits a confident narration ("я сохранила рецепт в
+            # твою книгу") with tools=[]. One nudge injection is worth
+            # the extra round-trip because it actually lands the save
+            # — without it the user has to notice the missing state
+            # and re-ask, doubling frustration + LLM cost anyway.
+            ai_text = str(getattr(ai_msg, "content", "") or "")
+            if (
+                not _hallucination_nudged
+                and detect_unbacked_claim(ai_text, called_tools)
+            ):
+                _hallucination_nudged = True
+                logger.warning(
+                    "CHAT_UNBACKED_CLAIM tenant=%s user=%s feature=%s "
+                    "iter=%d model=%s — model narrated a side-effect "
+                    "without a matching tool_call; injecting nudge and "
+                    "retrying once.",
+                    action.tenant_id, user_id or "?", feature_key,
+                    _iter, model_name,
+                )
+                messages.append(
+                    HumanMessage(content=(
+                        "[Внутренняя системная инструкция, юзеру не "
+                        "пересылается.] Ты ответил так, будто действие уже "
+                        "выполнено, но в этом ходе не было соответствующего "
+                        "tool-call'а — состояние НЕ изменилось, данные НЕ "
+                        "сохранены.\n\n"
+                        "Если действие действительно нужно — вызови tool "
+                        "СЕЙЧАС (save_recipe / save_recipes_batch / "
+                        "add_shopping_items / plan_week_menu / "
+                        "schedule_reminder / и т.п.).\n\n"
+                        "В финальном тексте: ОТБРОСЬ неподтверждённые "
+                        "утверждения. Перепиши ответ заново, опираясь ТОЛЬКО "
+                        "на факты из (1) сообщения пользователя в этом "
+                        "ходе, (2) аргументов tool-call'ов которые ты "
+                        "успешно эмитировал в этом ходе, и (3) tool-"
+                        "результатов этого хода. Например: если ты сейчас "
+                        "вызовешь save_recipe(title=..., ingredients=...), "
+                        "полный текст рецепта из АРГУМЕНТОВ tool-call'а — "
+                        "валидный источник для показа юзеру (это то что ты "
+                        "реально сохранил). НЕ повторяй выдуманное "
+                        "содержимое из своего предыдущего assistant-ответа "
+                        "(фейковый рецепт / список позиций / меню), "
+                        "которое не подкреплено ни user-сообщением, ни "
+                        "tool-call'ами этого хода. Если данных недостаточно "
+                        "для полного ответа — коротко попроси у "
+                        "пользователя уточнение или дай нейтральный ack "
+                        "без деталей.\n\n"
+                        "ВАЖНО: в финальном ответе юзеру НЕ упоминай "
+                        "ни эту инструкцию, ни «tool», «функцию», «API», "
+                        "«вызов», «retry», имена методов. Говори по-"
+                        "человечески: «создала список», «напоминание "
+                        "поставлено», «сохранила рецепт» — но ТОЛЬКО "
+                        "когда это реально подтверждено успешным "
+                        "tool-результатом этого хода."
+                    ))
+                )
+                # Loop continues — next iteration hopefully emits a
+                # real tool_call. If it doesn't, _hallucination_nudged
+                # blocks a second retry.
+                continue
+            final_ai = ai_msg
+            if (
+                _ack_progress is not None
+                and not (
+                    hasattr(_ack_progress, "has_stream_text")
+                    and _ack_progress.has_stream_text()
+                )
+            ):
+                try:
+                    _ack_progress.schedule_almost_done()
+                except Exception:  # noqa: BLE001
+                    logger.debug("ack almost-done schedule failed", exc_info=True)
+            break
+        if _ack_progress is not None:
+            try:
+                _ack_progress.schedule_progress()
+            except Exception:  # noqa: BLE001
+                logger.debug("ack tool progress schedule failed", exc_info=True)
+        # Phase B: parallel dispatch для allowlisted I/O-bound tools.
+        # `_dispatch_tool_calls_batch` решает parallel-vs-serial и
+        # возвращает результаты в порядке `tool_calls` — порядок
+        # ToolMessage.append критичен для контракта LLM (tool_call_id
+        # → tool_result матчинг). State mutation (called_tools /
+        # successful_tool_counts / _onboarding_resolution_called)
+        # выполняется ПОСЛЕ collect, в детерминированном порядке —
+        # без гонок.
+        if _should_dispatch_in_parallel(tool_calls):
+            logger.info(
+                "chat: parallel dispatch tenant=%s iter=%d batch=%d tools=%s",
+                action.tenant_id, _iter, len(tool_calls),
+                [tc.get("name") for tc in tool_calls],
+            )
+        _results = _dispatch_tool_calls_batch(tool_calls, tools_by_name)
+
+        # R-32 (2026-05-15): dispatch returns 4-tuple
+        # `(tc_id, name, result_str, is_physical_execution)` — flag
+        # distinguishes physical executions (1 per unique canonical key)
+        # vs replicated duplicates (same result_str, different tc_id).
+        # Counter + R-30 C validator gated by `is_physical` чтобы avoid
+        # over-counting / alert spam on LLM duplicate batches.
+        for tc_id, name, result_str, is_physical in _results:
+            if name in _onboarding_resolution_tools and result_str.startswith("ok:"):
+                _onboarding_resolution_called = True
+            if name:
+                called_tools.add(name)
+                # Считаем только успешные вызовы — для timeout-rescue
+                # summary показываем что РЕАЛЬНО сделали в БД. Errors не
+                # стоит обещать юзеру. R-32: also gate by is_physical
+                # чтобы duplicate-collapsed batches не давали +N counter.
+                is_success = result_str.startswith("ok") or result_str.startswith("saved")
+                if is_success and is_physical:
+                    successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
+
+                    # R-30 option C (2026-05-15): soft validator — alert
+                    # when mutating tool fired on read-intent user_text.
+                    # Не блокирует выполнение, только log + admin alert
+                    # для мониторинга confab класса. Helper swallows
+                    # exceptions. R-32: gated by is_physical (was
+                    # is_success only) — avoid duplicate alerts на
+                    # collapsed batches.
+                    from sreda.services.write_intent_validator import (
+                        alert_if_unsolicited_write,
+                    )
+                    _trace_ctx = trace.current()
+                    alert_if_unsolicited_write(
+                        user_text=user_text,
+                        tool_name=name,
+                        result_str=result_str,
+                        tenant_id=action.tenant_id,
+                        feature_key=feature_key,
+                        iter_num=_iter,
+                        user_id=user_id,
+                        trace_id=_trace_ctx.trace_id if _trace_ctx else None,
+                    )
+            messages.append(ToolMessage(content=result_str, tool_call_id=tc_id))
+    else:
+        # Budget exhausted while still calling tools. Force ONE final
+        # completion with NO bind_tools so the model must write plain
+        # text using whatever it collected. Keeps the user from seeing
+        # a "couldn't form answer" stub when the data was actually there.
+        logger.warning(
+            "chat tool-loop exhausted at iter=%d; forcing summary turn for tenant=%s",
+            _MAX_TOOL_ITERATIONS,
+            action.tenant_id,
+        )
+        summary_nudge = HumanMessage(
+            content=(
+                "Инструменты больше вызывать нельзя — бюджет шагов исчерпан. "
+                "Сформулируй лучший возможный ответ пользователю на основе "
+                "данных, которые ты уже получил выше. Если чего-то не хватает — "
+                "честно скажи, чего именно."
+            )
+        )
+        messages.append(summary_nudge)
+        _log_llm_invoke(
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            iteration=_MAX_TOOL_ITERATIONS,  # one past the loop
+            messages=messages,
+        )
+        # Issue #68: persist request envelope для forced summary turn.
+        # Tool schemas = [] потому что invoke без bind_tools (text-only).
+        await _persist_request_with_policy(
+            attempt="primary", llm_obj=llm,
+            provider=_chat_primary_provider,
+            iter_n=_MAX_TOOL_ITERATIONS,
+            per_call_timeout=get_settings().mimo_request_timeout_seconds,
+            tool_schemas=[],
+        )
+        _t_summary = _time_module.monotonic()
+        try:
+            with trace.step(
+                f"llm.iter.{_MAX_TOOL_ITERATIONS}.summary", model=model_name
+            ) as _trace_meta:
+                final_ai = llm.invoke(messages)  # NOTE: no bind_tools
+                usage = getattr(final_ai, "usage_metadata", None) or {}
+                _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
+                _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
+                _trace_meta["forced"] = True
+            _record_and_log(final_ai, iteration=_MAX_TOOL_ITERATIONS)
+            # Issue #68: response envelope для forced summary.
+            await _persist_response_async(
+                "primary", final_ai,
+                int((_time_module.monotonic() - _t_summary) * 1000),
+                _MAX_TOOL_ITERATIONS,
+            )
+        except Exception as _summary_exc:  # noqa: BLE001 — must not crash the turn
+            logger.exception("chat: forced-summary invoke failed")
+            await _persist_error_async(
+                "primary", _summary_exc,
+                int((_time_module.monotonic() - _t_summary) * 1000),
+                _MAX_TOOL_ITERATIONS,
+            )
+            final_ai = AIMessage(
+                content=(
+                    "Я собрал какие-то данные, но не смог сложить их в ответ. "
+                    "Попробуй переформулировать вопрос покороче."
+                )
+            )
+
+    return ChatLoopResult(
+        final_ai=final_ai,
+        messages=messages,
+        turn_msg_start_idx=_turn_msg_start_idx,
+        called_tools=called_tools,
+        hallucination_nudged=_hallucination_nudged,
+        turn_timed_out=_turn_timed_out,
+        successful_tool_counts=successful_tool_counts,
+        onboarding_resolution_called=_onboarding_resolution_called,
+    )
+
+
 async def execute_conversation_chat(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
@@ -2629,564 +3257,36 @@ async def execute_conversation_chat(
         "feature_key": feature_key,
     }
 
-    async def _persist_request_with_policy(
-        attempt: str, llm_obj: Any, provider: str | None,
-        iter_n: int, per_call_timeout: float,
-        *, tool_schemas: list[dict] | None = None,
-    ) -> None:
-        """Persist phase=request envelope. Admin alert if degraded;
-        fail-closed raise если SREDA_LLM_TRACE_REQUIRE_PERSIST=true.
-        No-op if logging disabled."""
-        if not get_settings().llm_trace_logging_enabled:
-            return
-        try:
-            from sreda.services.llm_trace import (
-                PersistResult, build_request_envelope, persist_request_envelope,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("llm-trace import failed (request)")
-            return
-        env = build_request_envelope(
-            base_fields={**_base_envelope_fields, "iter": iter_n},
-            attempt=attempt, messages=messages,
-            tool_schemas=(tool_schemas
-                          if tool_schemas is not None
-                          else _tool_schemas_for_log),
-            llm=llm_obj, provider=provider,
-            invocation_kwargs={"timeout_seconds": per_call_timeout},
-        )
-        try:
-            result = await persist_request_envelope(env)
-        except Exception:  # noqa: BLE001
-            logger.exception("llm-trace persist_request raised unexpectedly")
-            result = PersistResult.FAILED
-        if result == PersistResult.WRITTEN:
-            return
-        try:
-            from sreda.services.admin_alerts import send_admin_alert
-            send_admin_alert(
-                severity="P1",
-                title=f"llm-trace request persist degraded: {result.value}",
-                body=(
-                    f"trace_id={_trace_id_value} iter={iter_n} "
-                    f"attempt={attempt} result={result.value}"
-                ),
-                dedupe_key=f"llm_trace_persist_degraded:{result.value}",
-            )
-        except Exception:  # noqa: BLE001 — alert must not crash turn
-            logger.exception("admin alert send failed (llm-trace degraded)")
-        if get_settings().llm_trace_require_persist:
-            raise RuntimeError(
-                f"llm-trace persist returned {result.value}; aborting LLM call "
-                f"(SREDA_LLM_TRACE_REQUIRE_PERSIST=true)"
-            )
-
-    async def _persist_response_async(
-        attempt: str, ai_msg_obj: Any, latency_ms: int, iter_n: int,
-    ) -> None:
-        """Fire-and-forget phase=response envelope."""
-        if not get_settings().llm_trace_logging_enabled:
-            return
-        try:
-            from sreda.services.llm_trace import (
-                build_response_envelope, persist_response_envelope,
-            )
-            await persist_response_envelope(build_response_envelope(
-                base_fields={**_base_envelope_fields, "iter": iter_n},
-                attempt=attempt, ai_msg=ai_msg_obj, latency_ms=latency_ms,
-            ))
-        except Exception:  # noqa: BLE001
-            logger.exception("llm-trace persist_response failed")
-
-    async def _persist_error_async(
-        attempt: str, exc_obj: BaseException, latency_ms: int, iter_n: int,
-    ) -> None:
-        """Fire-and-forget phase=error envelope."""
-        if not get_settings().llm_trace_logging_enabled:
-            return
-        try:
-            from sreda.services.llm_trace import (
-                build_error_envelope, persist_response_envelope,
-            )
-            await persist_response_envelope(build_error_envelope(
-                base_fields={**_base_envelope_fields, "iter": iter_n},
-                attempt=attempt, exc=exc_obj, latency_ms=latency_ms,
-            ))
-        except Exception:  # noqa: BLE001
-            logger.exception("llm-trace persist_error failed")
-
-    # --- 4. Tool-call loop with per-call usage recording --------------
-    # Limit tuned to common chains: weather lookup (search→fetch→format
-    # switch) ~ 4-5; "сохрани 18 рецептов" batches require ≤ 2 since
-    # save_recipes_batch consolidates; plan_week + search_recipes +
-    # generate_shopping_from_menu ~ 3-4. Bumped 8→12 in 2026-04-20
-    # after pilot exhaustion on a 18-recipe batch ended up partial.
-    # If still exhausted, one final tools-less invoke forces a summary
-    # so the user always gets a real reply (not a "budget exhausted" stub).
-    _MAX_TOOL_ITERATIONS = 12
-
-    # Hard ceiling on total turn time. Observed 2026-04-22: a single
-    # turn hung for 1198 seconds (20 minutes) with iters=0, starving a
-    # worker thread and leaving the user waiting forever. 90s is a
-    # generous cap — normal turns finish in 10–40s, pathological in
-    # 60–90s. Beyond that we abort, surface a loud CHAT_TURN_TIMEOUT
-    # warning (admin /logs quick-filter), and fall through to the
-    # empty-reply rescue / "..." fallback so the user at least sees
-    # an error.
-    _CHAT_TURN_TIMEOUT_SECONDS = CHAT_TURN_TIMEOUT_SECONDS
-    _turn_start_monotonic = time.monotonic()
-
-    def _record_and_log(ai_msg: AIMessage, *, iteration: int) -> None:
-        usage = getattr(ai_msg, "usage_metadata", None) or {}
-        prompt_tokens = int(usage.get("input_tokens") or 0)
-        completion_tokens = int(usage.get("output_tokens") or 0)
-        _log_llm_response(
-            tenant_id=action.tenant_id,
-            feature_key=feature_key,
-            iteration=iteration,
-            ai_msg=ai_msg,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
-        if prompt_tokens or completion_tokens:
-            try:
-                budget.record_llm_usage(
-                    tenant_id=action.tenant_id,
-                    feature_key=feature_key,
-                    model=model_name,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    run_id=run_id,
-                    task_type="conversation.chat",
-                )
-                session.commit()
-            except Exception:  # noqa: BLE001 — usage tracking must not kill the turn
-                logger.exception("budget: failed to record LLM usage")
-
-    final_ai: AIMessage | None = None
-    # Track whether the LLM resolved the current onboarding topic this
-    # turn (via answered/deferred/complete). If not, the post-turn hook
-    # increments topic depth so next turn's prompt forces a resolution
-    # after the cap.
-    _onboarding_resolution_called = False
-    _ONBOARDING_RESOLUTION_TOOLS = {
-        "onboarding_answered",
-        "onboarding_deferred",
-        "onboarding_complete",
-    }
-    # Union of tool names actually invoked across all iterations of
-    # this turn. Used post-loop to detect Gemma-style "я сохранила
-    # рецепт" narrations that weren't backed by a save_recipe call
-    # (see ``detect_unbacked_claim``). Populated below inside the
-    # tool-execution block.
-    called_tools: set[str] = set()
-    # 2026-04-28: track successful tool execution counts for timeout-
-    # rescue summary. If turn aborts after tools already wrote to DB,
-    # we surface a short "что успела сделать" message instead of generic
-    # «не успел обдумать» — иначе юзер не знает что задачи реально
-    # созданы (incident с tg_634496616 13:27 MSK).
-    successful_tool_counts: dict[str, int] = {}
-    # Guard so the anti-hallucination nudge runs at most once per turn
-    # — two consecutive empty iterations would otherwise spiral.
-    _hallucination_nudged = False
-    _turn_timed_out = False
-    _ack_progress = context.get("_ack_progress_controller")
-    for _iter in range(_MAX_TOOL_ITERATIONS):
-        # Cooperative turn-level timeout. Checked before each iteration
-        # (can't interrupt a running LLM call from here — MiMo has its
-        # own per-request timeout via settings.mimo_request_timeout_seconds).
-        # Catches cases where the turn spends too long in aggregate, or
-        # where the first LLM call itself hangs past the per-request cap.
-        _elapsed = time.monotonic() - _turn_start_monotonic
-        if _elapsed > _CHAT_TURN_TIMEOUT_SECONDS:
-            logger.warning(
-                "CHAT_TURN_TIMEOUT tenant=%s user=%s feature=%s iter=%d "
-                "elapsed=%.1fs cap=%ds — aborting turn, falling back to "
-                "rescue/empty-reply path",
-                action.tenant_id,
-                user_id or "?",
-                feature_key,
-                _iter,
-                _elapsed,
-                _CHAT_TURN_TIMEOUT_SECONDS,
-            )
-            _turn_timed_out = True
-            break
-        if _ack_progress is not None and _iter > 0:
-            try:
-                _ack_progress.schedule_progress()
-            except Exception:  # noqa: BLE001
-                logger.debug("ack progress schedule failed", exc_info=True)
-        _log_llm_invoke(
-            tenant_id=action.tenant_id,
-            feature_key=feature_key,
-            iteration=_iter,
-            messages=messages,
-        )
-        with trace.step(f"llm.iter.{_iter}", model=model_name) as _trace_meta:
-            # 2026-04-28: per-call timeout через ThreadPoolExecutor +
-            # ручная fallback логика. Langchain .with_fallbacks() ловит
-            # exceptions ВНУТРИ thread'а primary — на hangs не работает
-            # (incident 13:27 MSK: MiMo 131s без exception). Делаем
-            # внешний timeout + manual fallback на отдельный fallback
-            # клиент.
-            _per_call_timeout = get_settings().mimo_request_timeout_seconds
-            _stream_visible_text = (
-                settings.ack_streaming_enabled
-                and _ack_progress is not None
-                and getattr(_ack_progress, "enabled", False)
-            )
-
-            def _stream_to_ack(text: str) -> None:
-                if not _stream_visible_text or _ack_progress is None:
-                    return
-                try:
-                    _ack_progress.schedule_stream_text(
-                        text,
-                        min_interval_seconds=(
-                            settings.ack_streaming_min_interval_seconds
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.debug("ack stream schedule failed", exc_info=True)
-
-            # Issue #68: persist phase=request envelope BEFORE ainvoke.
-            # Strong semantics — crash-safe: row на диске до того как LLM
-            # стартует. Если require_persist=true и persist degraded — raise
-            # (RuntimeError caught в outer handler).
-            await _persist_request_with_policy(
-                attempt="primary", llm_obj=llm_with_tools,
-                provider=_chat_primary_provider, iter_n=_iter,
-                per_call_timeout=_per_call_timeout,
-            )
-            import time as _time_module
-            _t_primary_started = _time_module.monotonic()
-            try:
-                ai_msg = await ainvoke_with_streaming_timeout(
-                    llm_with_tools,
-                    messages,
-                    timeout_seconds=_per_call_timeout,
-                    on_text_update=_stream_to_ack if _stream_visible_text else None,
-                )
-                # Issue #68: fire-and-forget response envelope (primary OK).
-                _lat_ms_primary = int(
-                    (_time_module.monotonic() - _t_primary_started) * 1000
-                )
-                await _persist_response_async(
-                    "primary", ai_msg, _lat_ms_primary, _iter,
-                )
-            except (LLMCallTimeout, Exception) as exc:  # noqa: BLE001
-                # Issue #68: persist phase=error envelope (primary failed)
-                # — fire-and-forget. Latency measured from request start.
-                _lat_ms_primary_err = int(
-                    (_time_module.monotonic() - _t_primary_started) * 1000
-                )
-                await _persist_error_async(
-                    "primary", exc, _lat_ms_primary_err, _iter,
-                )
-                # Любая ошибка primary (timeout / 5xx / rate limit) →
-                # пытаемся fallback если он есть.
-                # R-28: alert admin для **любой** LLM error (Codex R1 M3 —
-                # fallback may be None для some configs, alert before re-raise).
-                exc_type = type(exc).__name__
-                try:
-                    from sreda.services.admin_alerts import send_admin_alert
-                    if _fallback_with_tools is None:
-                        # No fallback configured — error propagates to caller.
-                        # P0 severity: данный turn полностью failed, user видит error.
-                        send_admin_alert(
-                            severity="P0",
-                            title=f"LLM primary failed, NO fallback: {exc_type}",
-                            body=(
-                                f"tenant: {action.tenant_id}\n"
-                                f"feature: {feature_key}\n"
-                                f"iter: {_iter}\n"
-                                f"primary_exc: {exc_type}\n"
-                                f"reason: {str(exc)[:300]}\n"
-                                f"impact: turn re-raised без fallback — user sees error"
-                            ),
-                            dedupe_key=f"llm_primary_no_fallback:{exc_type}:{feature_key}",
-                        )
-                    else:
-                        # Fallback engaged — P1, degraded but turn completes.
-                        send_admin_alert(
-                            severity="P1",
-                            title=f"LLM fallback engaged: {exc_type}",
-                            body=(
-                                f"tenant: {action.tenant_id}\n"
-                                f"feature: {feature_key}\n"
-                                f"iter: {_iter}\n"
-                                f"primary_exc: {exc_type}\n"
-                                f"reason: {str(exc)[:300]}"
-                            ),
-                            dedupe_key=f"llm_fallback:{exc_type}:{feature_key}",
-                        )
-                except Exception:  # noqa: BLE001 — alert must not crash turn
-                    logger.exception("R-28 admin_alert dispatch failed")
-                if _fallback_with_tools is None:
-                    raise
-                logger.warning(
-                    "LLM_FALLBACK_ENGAGED tenant=%s feature=%s iter=%d "
-                    "primary_exc=%s reason=%s — switching to fallback",
-                    action.tenant_id, feature_key, _iter,
-                    exc_type, str(exc)[:120],
-                )
-                _trace_meta["fallback"] = True
-                _trace_meta["primary_exc"] = exc_type
-                # Issue #68: persist phase=request envelope для fallback
-                # — separate config (different provider/model/extra_body).
-                await _persist_request_with_policy(
-                    attempt="fallback", llm_obj=_fallback_with_tools,
-                    provider=_chat_fallback_provider, iter_n=_iter,
-                    per_call_timeout=_per_call_timeout,
-                )
-                _t_fallback_started = _time_module.monotonic()
-                try:
-                    ai_msg = await ainvoke_with_streaming_timeout(
-                        _fallback_with_tools,
-                        messages,
-                        timeout_seconds=_per_call_timeout,
-                        on_text_update=_stream_to_ack if _stream_visible_text else None,
-                    )
-                    _lat_ms_fallback = int(
-                        (_time_module.monotonic() - _t_fallback_started) * 1000
-                    )
-                    await _persist_response_async(
-                        "fallback", ai_msg, _lat_ms_fallback, _iter,
-                    )
-                except Exception as fb_exc:  # noqa: BLE001
-                    _lat_ms_fb_err = int(
-                        (_time_module.monotonic() - _t_fallback_started) * 1000
-                    )
-                    await _persist_error_async(
-                        "fallback", fb_exc, _lat_ms_fb_err, _iter,
-                    )
-                    raise
-            usage = getattr(ai_msg, "usage_metadata", None) or {}
-            _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
-            _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
-            # 2026-05-22 #65: provider prompt-cache visibility. MiMo
-            # (xiaomimimo.com) returns OpenAI-style ``prompt_tokens_details.
-            # cached_tokens`` which langchain-openai surfaces as
-            # ``usage_metadata.input_token_details.cache_read``. We trace it
-            # so we can see in /admin/trace-viewer whether the stable
-            # prompt is actually getting cached on the provider side.
-            _input_details = usage.get("input_token_details") or {}
-            _cached_tok = int(
-                _input_details.get("cache_read")
-                or _input_details.get("cached")
-                or 0
-            )
-            if _cached_tok:
-                _trace_meta["cached_tok"] = _cached_tok
-            _trace_meta["tools"] = [
-                tc.get("name") for tc in (getattr(ai_msg, "tool_calls", None) or [])
-            ]
-        _record_and_log(ai_msg, iteration=_iter)
-        messages.append(ai_msg)
-        tool_calls = getattr(ai_msg, "tool_calls", None) or []
-        if not tool_calls:
-            # Anti-hallucination retry (Gemma-4 prod case 2026-04-22):
-            # model emits a confident narration ("я сохранила рецепт в
-            # твою книгу") with tools=[]. One nudge injection is worth
-            # the extra round-trip because it actually lands the save
-            # — without it the user has to notice the missing state
-            # and re-ask, doubling frustration + LLM cost anyway.
-            ai_text = str(getattr(ai_msg, "content", "") or "")
-            if (
-                not _hallucination_nudged
-                and detect_unbacked_claim(ai_text, called_tools)
-            ):
-                _hallucination_nudged = True
-                logger.warning(
-                    "CHAT_UNBACKED_CLAIM tenant=%s user=%s feature=%s "
-                    "iter=%d model=%s — model narrated a side-effect "
-                    "without a matching tool_call; injecting nudge and "
-                    "retrying once.",
-                    action.tenant_id, user_id or "?", feature_key,
-                    _iter, model_name,
-                )
-                messages.append(
-                    HumanMessage(content=(
-                        "[Внутренняя системная инструкция, юзеру не "
-                        "пересылается.] Ты ответил так, будто действие уже "
-                        "выполнено, но в этом ходе не было соответствующего "
-                        "tool-call'а — состояние НЕ изменилось, данные НЕ "
-                        "сохранены.\n\n"
-                        "Если действие действительно нужно — вызови tool "
-                        "СЕЙЧАС (save_recipe / save_recipes_batch / "
-                        "add_shopping_items / plan_week_menu / "
-                        "schedule_reminder / и т.п.).\n\n"
-                        "В финальном тексте: ОТБРОСЬ неподтверждённые "
-                        "утверждения. Перепиши ответ заново, опираясь ТОЛЬКО "
-                        "на факты из (1) сообщения пользователя в этом "
-                        "ходе, (2) аргументов tool-call'ов которые ты "
-                        "успешно эмитировал в этом ходе, и (3) tool-"
-                        "результатов этого хода. Например: если ты сейчас "
-                        "вызовешь save_recipe(title=..., ingredients=...), "
-                        "полный текст рецепта из АРГУМЕНТОВ tool-call'а — "
-                        "валидный источник для показа юзеру (это то что ты "
-                        "реально сохранил). НЕ повторяй выдуманное "
-                        "содержимое из своего предыдущего assistant-ответа "
-                        "(фейковый рецепт / список позиций / меню), "
-                        "которое не подкреплено ни user-сообщением, ни "
-                        "tool-call'ами этого хода. Если данных недостаточно "
-                        "для полного ответа — коротко попроси у "
-                        "пользователя уточнение или дай нейтральный ack "
-                        "без деталей.\n\n"
-                        "ВАЖНО: в финальном ответе юзеру НЕ упоминай "
-                        "ни эту инструкцию, ни «tool», «функцию», «API», "
-                        "«вызов», «retry», имена методов. Говори по-"
-                        "человечески: «создала список», «напоминание "
-                        "поставлено», «сохранила рецепт» — но ТОЛЬКО "
-                        "когда это реально подтверждено успешным "
-                        "tool-результатом этого хода."
-                    ))
-                )
-                # Loop continues — next iteration hopefully emits a
-                # real tool_call. If it doesn't, _hallucination_nudged
-                # blocks a second retry.
-                continue
-            final_ai = ai_msg
-            if (
-                _ack_progress is not None
-                and not (
-                    hasattr(_ack_progress, "has_stream_text")
-                    and _ack_progress.has_stream_text()
-                )
-            ):
-                try:
-                    _ack_progress.schedule_almost_done()
-                except Exception:  # noqa: BLE001
-                    logger.debug("ack almost-done schedule failed", exc_info=True)
-            break
-        if _ack_progress is not None:
-            try:
-                _ack_progress.schedule_progress()
-            except Exception:  # noqa: BLE001
-                logger.debug("ack tool progress schedule failed", exc_info=True)
-        # Phase B: parallel dispatch для allowlisted I/O-bound tools.
-        # `_dispatch_tool_calls_batch` решает parallel-vs-serial и
-        # возвращает результаты в порядке `tool_calls` — порядок
-        # ToolMessage.append критичен для контракта LLM (tool_call_id
-        # → tool_result матчинг). State mutation (called_tools /
-        # successful_tool_counts / _onboarding_resolution_called)
-        # выполняется ПОСЛЕ collect, в детерминированном порядке —
-        # без гонок.
-        if _should_dispatch_in_parallel(tool_calls):
-            logger.info(
-                "chat: parallel dispatch tenant=%s iter=%d batch=%d tools=%s",
-                action.tenant_id, _iter, len(tool_calls),
-                [tc.get("name") for tc in tool_calls],
-            )
-        _results = _dispatch_tool_calls_batch(tool_calls, tools_by_name)
-
-        # R-32 (2026-05-15): dispatch returns 4-tuple
-        # `(tc_id, name, result_str, is_physical_execution)` — flag
-        # distinguishes physical executions (1 per unique canonical key)
-        # vs replicated duplicates (same result_str, different tc_id).
-        # Counter + R-30 C validator gated by `is_physical` чтобы avoid
-        # over-counting / alert spam on LLM duplicate batches.
-        for tc_id, name, result_str, is_physical in _results:
-            if name in _ONBOARDING_RESOLUTION_TOOLS and result_str.startswith("ok:"):
-                _onboarding_resolution_called = True
-            if name:
-                called_tools.add(name)
-                # Считаем только успешные вызовы — для timeout-rescue
-                # summary показываем что РЕАЛЬНО сделали в БД. Errors не
-                # стоит обещать юзеру. R-32: also gate by is_physical
-                # чтобы duplicate-collapsed batches не давали +N counter.
-                is_success = result_str.startswith("ok") or result_str.startswith("saved")
-                if is_success and is_physical:
-                    successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
-
-                    # R-30 option C (2026-05-15): soft validator — alert
-                    # when mutating tool fired on read-intent user_text.
-                    # Не блокирует выполнение, только log + admin alert
-                    # для мониторинга confab класса. Helper swallows
-                    # exceptions. R-32: gated by is_physical (was
-                    # is_success only) — avoid duplicate alerts на
-                    # collapsed batches.
-                    from sreda.services.write_intent_validator import (
-                        alert_if_unsolicited_write,
-                    )
-                    _trace_ctx = trace.current()
-                    alert_if_unsolicited_write(
-                        user_text=user_text,
-                        tool_name=name,
-                        result_str=result_str,
-                        tenant_id=action.tenant_id,
-                        feature_key=feature_key,
-                        iter_num=_iter,
-                        user_id=user_id,
-                        trace_id=_trace_ctx.trace_id if _trace_ctx else None,
-                    )
-            messages.append(ToolMessage(content=result_str, tool_call_id=tc_id))
-    else:
-        # Budget exhausted while still calling tools. Force ONE final
-        # completion with NO bind_tools so the model must write plain
-        # text using whatever it collected. Keeps the user from seeing
-        # a "couldn't form answer" stub when the data was actually there.
-        logger.warning(
-            "chat tool-loop exhausted at iter=%d; forcing summary turn for tenant=%s",
-            _MAX_TOOL_ITERATIONS,
-            action.tenant_id,
-        )
-        summary_nudge = HumanMessage(
-            content=(
-                "Инструменты больше вызывать нельзя — бюджет шагов исчерпан. "
-                "Сформулируй лучший возможный ответ пользователю на основе "
-                "данных, которые ты уже получил выше. Если чего-то не хватает — "
-                "честно скажи, чего именно."
-            )
-        )
-        messages.append(summary_nudge)
-        _log_llm_invoke(
-            tenant_id=action.tenant_id,
-            feature_key=feature_key,
-            iteration=_MAX_TOOL_ITERATIONS,  # one past the loop
-            messages=messages,
-        )
-        # Issue #68: persist request envelope для forced summary turn.
-        # Tool schemas = [] потому что invoke без bind_tools (text-only).
-        await _persist_request_with_policy(
-            attempt="primary", llm_obj=llm,
-            provider=_chat_primary_provider,
-            iter_n=_MAX_TOOL_ITERATIONS,
-            per_call_timeout=get_settings().mimo_request_timeout_seconds,
-            tool_schemas=[],
-        )
-        import time as _time_module_summary
-        _t_summary = _time_module_summary.monotonic()
-        try:
-            with trace.step(
-                f"llm.iter.{_MAX_TOOL_ITERATIONS}.summary", model=model_name
-            ) as _trace_meta:
-                final_ai = llm.invoke(messages)  # NOTE: no bind_tools
-                usage = getattr(final_ai, "usage_metadata", None) or {}
-                _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
-                _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)
-                _trace_meta["forced"] = True
-            _record_and_log(final_ai, iteration=_MAX_TOOL_ITERATIONS)
-            # Issue #68: response envelope для forced summary.
-            await _persist_response_async(
-                "primary", final_ai,
-                int((_time_module_summary.monotonic() - _t_summary) * 1000),
-                _MAX_TOOL_ITERATIONS,
-            )
-        except Exception as _summary_exc:  # noqa: BLE001 — must not crash the turn
-            logger.exception("chat: forced-summary invoke failed")
-            await _persist_error_async(
-                "primary", _summary_exc,
-                int((_time_module_summary.monotonic() - _t_summary) * 1000),
-                _MAX_TOOL_ITERATIONS,
-            )
-            final_ai = AIMessage(
-                content=(
-                    "Я собрал какие-то данные, но не смог сложить их в ответ. "
-                    "Попробуй переформулировать вопрос покороче."
-                )
-            )
+    # --- 4. Tool-call loop (extracted to _run_legacy_react_loop) --------
+    _loop_result = await _run_legacy_react_loop(
+        llm=llm,
+        llm_with_tools=llm_with_tools,
+        _fallback_with_tools=_fallback_with_tools,
+        action=action,
+        feature_key=feature_key,
+        user_id=user_id,
+        model_name=model_name,
+        run_id=run_id,
+        _chat_primary_provider=_chat_primary_provider,
+        _chat_fallback_provider=_chat_fallback_provider,
+        tools_by_name=tools_by_name,
+        messages=messages,
+        _turn_msg_start_idx=_turn_msg_start_idx,
+        settings=settings,
+        budget=budget,
+        session=session,
+        trace=trace,
+        _ack_progress=context.get("_ack_progress_controller"),
+        _base_envelope_fields=_base_envelope_fields,
+        _trace_id_value=_trace_id_value,
+        _tool_schemas_for_log=_tool_schemas_for_log,
+        user_text=user_text,
+        _onboarding_resolution_tools={
+            "onboarding_answered",
+            "onboarding_deferred",
+            "onboarding_complete",
+        },
+    )
 
     # Onboarding depth bookkeeping: if we're still in onboarding AND the
     # LLM didn't resolve the topic (answered / deferred / complete), it
@@ -3194,7 +3294,7 @@ async def execute_conversation_chat(
     # Bump depth so next turn's prompt tightens the screw.
     if (
         onboarding_follow_up_needed
-        and not _onboarding_resolution_called
+        and not _loop_result.onboarding_resolution_called
         and feature_key == "housewife_assistant"
         and user_id
     ):
@@ -3210,22 +3310,22 @@ async def execute_conversation_chat(
             logger.exception("onboarding depth bookkeeping failed")
 
     return await finalize_chat_reply(FinalizeInput(
-        final_ai=final_ai,
-        messages=messages,
-        turn_msg_start_idx=_turn_msg_start_idx,
+        final_ai=_loop_result.final_ai,
+        messages=_loop_result.messages,
+        turn_msg_start_idx=_loop_result.turn_msg_start_idx,
         action=action,
         feature_key=feature_key,
         user_id=user_id,
         model_name=model_name,
-        turn_timed_out=_turn_timed_out,
-        successful_tool_counts=successful_tool_counts,
+        turn_timed_out=_loop_result.turn_timed_out,
+        successful_tool_counts=_loop_result.successful_tool_counts,
         context=context,
-        called_tools=called_tools,
-        hallucination_nudged=_hallucination_nudged,
+        called_tools=_loop_result.called_tools,
+        hallucination_nudged=_loop_result.hallucination_nudged,
         pending_buttons_state=pending_buttons_state,
         menu_display_state=menu_display_state,
         session=session,
-        ack_progress=_ack_progress,
+        ack_progress=context.get("_ack_progress_controller"),
         user_text=user_text,
     ))
 
