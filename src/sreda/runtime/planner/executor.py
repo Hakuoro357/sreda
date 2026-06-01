@@ -74,10 +74,13 @@ import asyncio
 import inspect
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.orm import Session
 
 from sreda.runtime.planner.interpolation import (
     extract_step_id,
@@ -90,6 +93,12 @@ from sreda.runtime.planner.schemas import (
     ComposerCall,
     OutcomeBranch,
     Plan,
+)
+from sreda.runtime.planner.step_ledger import mark_step_status, open_step
+from sreda.runtime.planner.tool_runtime import (
+    ToolRuntimeContext,
+    allocate_operation_id,
+    bind_tool_runtime,
 )
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.executor_contract import PlannerGapError
@@ -425,12 +434,24 @@ async def _execute_one_step(
     tool: Any,
     step_outputs_snapshot: Mapping[str, dict],
     timeout_seconds: float,
+    # Ledger wiring — all None when ledger is disabled (backward-compat).
+    ledger_enabled: bool = False,
+    execution_id: str | None = None,
+    tenant_id: str | None = None,
+    turn_key: str | None = None,
+    ledger_session_factory: Callable[[], Session] | None = None,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> StepResult:
     """Run one Action: resolve refs → validate args → ainvoke → process_output
     → match branch.
 
-    Pure: doesn't mutate any shared state. Caller decides whether to
-    register the output in ``state.step_outputs`` (only on success).
+    Pure when ledger_enabled=False (backward-compat). When ledger_enabled=True,
+    writes 'started' to a fresh ledger session before invoking the tool, binds
+    ToolRuntimeContext around the tool call, then marks terminal status after.
+
+    Sub-A12 Phase E #8b-2: ledger wiring is ADDITIVE — no existing behaviour
+    changes when ledger_enabled=False.
+
     The ``step_outputs_snapshot`` is intentionally a Mapping (read-only
     view) — Codex Phase C R1 MINOR #9 wants per-layer immutability for
     refs so concurrent same-layer steps see a deterministic view."""
@@ -470,13 +491,82 @@ async def _execute_one_step(
             error_summary=f"arg_validation_internal: {type(exc).__name__}: {exc}",
         )
 
+    # 3a. Ledger: open 'started' row BEFORE invoking the tool so that a crash
+    #     mid-invocation leaves a recoverable record. This is the crash-resume
+    #     guarantee: the '#9 scanner' can detect steps that started but never
+    #     reached a terminal status.
+    operation_id: str | None = None
+    if ledger_enabled:
+        # ledger_enabled=True guarantees these are all non-None (checked at
+        # execute_plan entry), but we assert types here for the type checker.
+        assert execution_id is not None
+        assert turn_key is not None
+        assert ledger_session_factory is not None
+        assert now_fn is not None
+        operation_id = allocate_operation_id(
+            turn_key=turn_key,
+            step_id=step_id,
+            tool_name=action.tool,
+        )
+        ls = ledger_session_factory()
+        try:
+            # FAIL-FAST precondition: open_step / commit are deliberately NOT
+            # guarded — if the 'started' row can't be persisted we must NOT run
+            # the (possibly durable) tool, since the write would be unledgered
+            # and unrecoverable. Raising aborts the step fail-closed.
+            open_step(
+                ls,
+                execution_id=execution_id,
+                step_id=step_id,
+                tool=action.tool,
+                operation_id=operation_id,
+                now=now_fn(),
+            )
+            ls.commit()
+        finally:
+            # close() itself must not mask the (intended) open/commit exception
+            # nor raise on its own (Codex A/B #8b-2 R2 MINOR — consistency).
+            try:
+                ls.close()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "executor: ledger 'started' session close failed for "
+                    "step %s", step_id,
+                )
+
     started = time.monotonic()
 
-    # 3. Invoke tool with timeout
-    try:
-        raw_output = await _ainvoke_tool(
-            tool, validated_args, timeout_seconds=timeout_seconds,
+    # 3b. Build runtime context for durable tools (used by emit_event).
+    #     Bound INSIDE _execute_one_step (per-step) so asyncio.gather siblings
+    #     each get their own contextvar binding — a ContextVar.set() inside
+    #     one gathered coro does NOT leak to siblings (verified fact #8b-2).
+    ctx: ToolRuntimeContext | None = None
+    if ledger_enabled and operation_id is not None:
+        assert execution_id is not None
+        assert turn_key is not None
+        ctx = ToolRuntimeContext(
+            operation_id=operation_id,
+            execution_id=execution_id,
+            step_id=step_id,
+            tool_name=action.tool,
+            tenant_id=tenant_id or "",
+            user_id=None,
+            turn_key=turn_key,
         )
+
+    # 3c. Invoke tool with timeout, binding runtime context around the call.
+    #     bind_tool_runtime is a sync contextmanager wrapping the await — the
+    #     contextvar is set before the tool fires and reset in a finally clause.
+    try:
+        if ctx is not None:
+            with bind_tool_runtime(ctx):
+                raw_output = await _ainvoke_tool(
+                    tool, validated_args, timeout_seconds=timeout_seconds,
+                )
+        else:
+            raw_output = await _ainvoke_tool(
+                tool, validated_args, timeout_seconds=timeout_seconds,
+            )
     except asyncio.TimeoutError:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         # Codex Phase C R1 MAJOR #7 — for sync tools wrapped via
@@ -495,25 +585,62 @@ async def _execute_one_step(
                 "— underlying thread may still complete and commit",
                 action.tool, step_id, timeout_seconds,
             )
-        return StepResult(
+        result = StepResult(
             step_id=step_id,
             tool=action.tool,
             status="timeout",
             latency_ms=elapsed_ms,
             error_summary=f"timeout after {timeout_seconds}s",
         )
+        # Ledger terminal mark for timeout:
+        # - durable write: mark 'unknown_pending' — the sync thread may still
+        #   commit (settle-window semantics, plan §PR-2a.3). Recovery scanner
+        #   must probe audit_outbox before deciding to retry.
+        # - non-durable tool: no terminal mark. The 'started' row records the
+        #   attempt; there is no commit to recover, so no recovery obligation.
+        #   Leaving 'started' signals the scanner: "ran but no terminal status
+        #   — check is_durable_write to decide whether to probe".
+        if ledger_enabled and operation_id is not None:
+            terminal_status: str | None = None
+            if tool_spec.is_durable_write:
+                terminal_status = "unknown_pending"
+            # non-durable timeout: leave 'started' (no obligation)
+            if terminal_status is not None:
+                _best_effort_mark(
+                    ledger_session_factory,  # type: ignore[arg-type]
+                    execution_id=execution_id,  # type: ignore[arg-type]
+                    step_id=step_id,
+                    status=terminal_status,
+                    now_fn=now_fn,  # type: ignore[arg-type]
+                )
+        return result
     except Exception as exc:  # noqa: BLE001
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.exception(
             "executor: tool %s raised at step %s", action.tool, step_id,
         )
-        return StepResult(
+        result = StepResult(
             step_id=step_id,
             tool=action.tool,
             status="error",
             latency_ms=elapsed_ms,
             error_summary=f"tool_exception:{type(exc).__name__}: {exc}",
         )
+        # Ledger terminal mark for error:
+        # - durable write: mark 'unknown' — the tool may have committed before
+        #   raising (e.g. exception from post-commit cleanup). Recovery scanner
+        #   must probe.
+        # - non-durable tool: no terminal mark. No commit risk; leave 'started'.
+        if ledger_enabled and operation_id is not None:
+            if tool_spec.is_durable_write:
+                _best_effort_mark(
+                    ledger_session_factory,  # type: ignore[arg-type]
+                    execution_id=execution_id,  # type: ignore[arg-type]
+                    step_id=step_id,
+                    status="unknown",
+                    now_fn=now_fn,  # type: ignore[arg-type]
+                )
+        return result
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
@@ -522,7 +649,7 @@ async def _execute_one_step(
         parsed = tool_spec.process_output(raw_output)
     except PlannerGapError as exc:
         # Sentinel contract violation — planner_gaps candidate. Halt.
-        return StepResult(
+        result = StepResult(
             step_id=step_id,
             tool=action.tool,
             status="plan_gap",
@@ -530,10 +657,23 @@ async def _execute_one_step(
             latency_ms=elapsed_ms,
             error_summary=f"contract_violation: {exc!s}",
         )
+        # plan_gap: tool may have committed (output was produced but contract
+        # was violated). Treat same as 'error' for ledger: unknown for durable,
+        # leave 'started' for non-durable.
+        if ledger_enabled and operation_id is not None:
+            if tool_spec.is_durable_write:
+                _best_effort_mark(
+                    ledger_session_factory,  # type: ignore[arg-type]
+                    execution_id=execution_id,  # type: ignore[arg-type]
+                    step_id=step_id,
+                    status="unknown",
+                    now_fn=now_fn,  # type: ignore[arg-type]
+                )
+        return result
     except Exception as exc:  # noqa: BLE001
         # Parse/validation crashed unexpectedly → treat as plan_gap too;
         # we don't trust downstream branch matching against broken output.
-        return StepResult(
+        result = StepResult(
             step_id=step_id,
             tool=action.tool,
             status="plan_gap",
@@ -541,12 +681,22 @@ async def _execute_one_step(
             latency_ms=elapsed_ms,
             error_summary=f"process_output_failure: {type(exc).__name__}: {exc}",
         )
+        if ledger_enabled and operation_id is not None:
+            if tool_spec.is_durable_write:
+                _best_effort_mark(
+                    ledger_session_factory,  # type: ignore[arg-type]
+                    execution_id=execution_id,  # type: ignore[arg-type]
+                    step_id=step_id,
+                    status="unknown",
+                    now_fn=now_fn,  # type: ignore[arg-type]
+                )
+        return result
     parsed_dict = _output_as_dict(parsed)
 
     # 5. Match to expected_outcomes branch
     match = _match_branch(action.expected_outcomes, parsed_dict)
     if match is None:
-        return StepResult(
+        result = StepResult(
             step_id=step_id,
             tool=action.tool,
             status="unknown_outcome",
@@ -558,11 +708,23 @@ async def _execute_one_step(
                 f"with status={parsed_dict.get('status')!r}"
             ),
         )
+        # unknown_outcome: tool invoked and returned; for durable writes the
+        # commit may have happened. Mark 'unknown' so recovery can probe.
+        if ledger_enabled and operation_id is not None:
+            if tool_spec.is_durable_write:
+                _best_effort_mark(
+                    ledger_session_factory,  # type: ignore[arg-type]
+                    execution_id=execution_id,  # type: ignore[arg-type]
+                    step_id=step_id,
+                    status="unknown",
+                    now_fn=now_fn,  # type: ignore[arg-type]
+                )
+        return result
 
     branch_idx, matched_branch = match
     matched_status = matched_branch.match.get("status") if matched_branch.match else None
 
-    return StepResult(
+    result = StepResult(
         step_id=step_id,
         tool=action.tool,
         status="ok",
@@ -573,6 +735,71 @@ async def _execute_one_step(
         matched_status=matched_status if isinstance(matched_status, str) else None,
         selected_compose=matched_branch.compose,
     )
+    # Successful branch match: commit is confirmed. Mark 'committed' for both
+    # durable and non-durable writes (a non-durable 'ok' is request-local, no
+    # recovery needed, but marking it is harmless and consistent).
+    # For read tools, marking 'committed' is accurate (no write happened, but
+    # "step completed without error" is the intent). Kept simple per spec.
+    if ledger_enabled and operation_id is not None:
+        _best_effort_mark(
+            ledger_session_factory,  # type: ignore[arg-type]
+            execution_id=execution_id,  # type: ignore[arg-type]
+            step_id=step_id,
+            status="committed",
+            now_fn=now_fn,  # type: ignore[arg-type]
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Ledger best-effort terminal mark (Sub-A12 Phase E #8b-2)
+# ---------------------------------------------------------------------------
+
+
+def _best_effort_mark(
+    ledger_session_factory: Callable[[], Session],
+    *,
+    execution_id: str,
+    step_id: str,
+    status: str,
+    now_fn: Callable[[], datetime],
+) -> None:
+    """Mark the ledger row terminal status in a fresh session.
+
+    This is BEST-EFFORT and MUST NEVER raise (Codex A/B #8b-2 R1, both MAJOR):
+    a failure here must not propagate out of ``_execute_one_step`` — under
+    ``asyncio.gather(return_exceptions=False)`` a raise would abort the whole
+    ``execute_plan`` and drop the StepResult. EVERY path is guarded: factory
+    creation, mark, commit, AND close. The 'started' row already records the
+    attempt; a failed terminal-mark is recoverable by the #9 scanner (it
+    treats rows stuck at 'started' past a settle-window as probe candidates).
+    """
+    ls: Session | None = None
+    try:
+        ls = ledger_session_factory()
+        mark_step_status(
+            ls,
+            execution_id=execution_id,
+            step_id=step_id,
+            status=status,
+            now=now_fn(),
+        )
+        ls.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "executor: ledger terminal mark failed for step %s "
+            "(status=%r) — 'started' row remains; #9 scanner will recover",
+            step_id,
+            status,
+        )
+    finally:
+        if ls is not None:
+            try:
+                ls.close()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "executor: ledger session close failed for step %s", step_id,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +861,14 @@ async def execute_plan(
     registry: Mapping[str, ToolSpec],
     *,
     timeout_seconds_default: float = 15.0,
+    # Sub-A12 Phase E #8b-2 — optional ledger wiring.
+    # LEDGER ENABLED := execution_id is not None and ledger_session_factory is not None.
+    # When disabled (default), behaviour is byte-for-byte as today.
+    execution_id: str | None = None,
+    turn_key: str | None = None,
+    tenant_id: str | None = None,
+    ledger_session_factory: Callable[[], Session] | None = None,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> ExecutionLog:
     """Execute a compiled plan layer by layer (branch-driven).
 
@@ -653,6 +888,23 @@ async def execute_plan(
     timeout_seconds_default :
         Fallback step timeout when ``ToolSpec.timeout_seconds`` is
         unset (shouldn't normally happen).
+    execution_id :
+        PlannerExecution.id for the running execution. When provided
+        together with ``ledger_session_factory``, enables ledger wiring.
+    turn_key :
+        Stable key for the conversation turn; used as the primary input
+        to ``allocate_operation_id``. Required when ledger is enabled.
+    tenant_id :
+        Tenant scope; threaded into ``ToolRuntimeContext`` for
+        ``emit_event`` wiring (#8b-3). Required when ledger is enabled.
+    ledger_session_factory :
+        Zero-arg callable returning a fresh ``Session`` bound to the
+        ledger DB. Each step opens and closes its OWN session — a
+        SQLAlchemy Session is NOT concurrency-safe for concurrent
+        ``asyncio.gather`` steps.
+    now_fn :
+        Clock override for testing. Defaults to
+        ``lambda: datetime.now(timezone.utc)``.
 
     Returns
     -------
@@ -660,6 +912,36 @@ async def execute_plan(
         Per-step results + overall outcome
         (``completed`` / ``partial_failure`` / ``failed`` / ``aborted``).
     """
+    ledger_enabled = execution_id is not None and ledger_session_factory is not None
+
+    # Resolve clock once at entry (consistent timestamp baseline).
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+
+    # Fail fast on unusable ledger identity (precondition check).
+    # The full durable-write ⇒ adapter-registry invariant is deferred to #8b-3.
+    if ledger_enabled:
+        if not turn_key:
+            raise ExecutorError(
+                "execute_plan: ledger is enabled (execution_id set) but turn_key "
+                "is empty or None. turn_key is part of the globally-unique "
+                "idempotency identity — a blank value would collide across "
+                "unrelated executions. System turns must mint an explicit stable key."
+            )
+        if not execution_id:
+            raise ExecutorError(
+                "execute_plan: ledger is enabled but execution_id is empty. "
+                "Pass a non-empty PlannerExecution.id."
+            )
+        # tenant_id is optional-but-carried; blank string is acceptable for
+        # now (emit_event wiring added in #8b-3). Warn rather than hard-fail
+        # so callers can introduce it incrementally.
+        if not tenant_id:
+            logger.warning(
+                "execute_plan: ledger enabled but tenant_id is empty — "
+                "ToolRuntimeContext.tenant_id will be ''. emit_event wiring "
+                "(#8b-3) requires a real tenant_id."
+            )
+
     plan = execution_plan.plan
     state = _MutableState(enabled=_compute_enabled_initial(plan))
     data_deps = _build_data_dep_graph(plan)
@@ -782,6 +1064,12 @@ async def execute_plan(
                     tool=tool,
                     step_outputs_snapshot=snapshot,
                     timeout_seconds=timeout,
+                    ledger_enabled=ledger_enabled,
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    turn_key=turn_key,
+                    ledger_session_factory=ledger_session_factory,
+                    now_fn=now_fn,
                 ))
 
             batch_results = await asyncio.gather(*coros, return_exceptions=False)
