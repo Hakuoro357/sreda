@@ -42,6 +42,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -51,6 +52,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     text as sql_text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -136,7 +138,7 @@ class PlannerExecution(Base):
 
     # --- Stage 3: execution --------------------------------------------
     execution_status: Mapped[str] = mapped_column(
-        String(24),
+        String(32),
         nullable=False,
         default="pending",
     )
@@ -221,17 +223,63 @@ class PlannerExecution(Base):
         nullable=False,
     )
 
+    # --- Sub-A12 Phase E: crash-safety / recovery lease (mirror message_jobs) ---
+    # Allows a watchdog to reclaim stuck executions via a conditional-UPDATE
+    # pattern (same fencing as MessageJob.worker_id / attempt / lease_expires_at).
+    recovery_worker_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    recovery_attempt: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    recovery_lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # --- Sub-A12 Phase E: whole-turn resume key ---
+    # Caller sets to f"{tenant_id}:{channel}:{external_update_id}".
+    # UNIQUE allows idempotent "did we already complete this turn?" check.
+    # String(256): format {tenant_id}:{channel}:{external_update_id} can
+    # reach ~226 chars with max-length components; 256 provides headroom.
+    turn_key: Mapped[str | None] = mapped_column(
+        String(256),
+        nullable=True,
+    )
+
+    # --- Sub-A12 Phase E: PII-free derived diagnostic columns ----------
+    failure_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    failure_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    retryable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    step_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unknown_outcome_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    write_committed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
     __table_args__ = (
         CheckConstraint(
             "planner_status IN ('pending','received','invalid','valid')",
             name="ck_planner_executions_planner_status",
         ),
+        # Extended in Sub-A12 Phase E to include failed_needs_manual +
+        # committed_unserved_needs_manual (new terminal states for crash-safety).
+        # Migration 0054 replaces the existing CHECK in-migration via
+        # batch_alter_table (drop_constraint + create_check_constraint), which
+        # works on both SQLite and PostgreSQL — no manual DDL step required.
         CheckConstraint(
             "execution_status IN ("
             "'pending','in_progress','completed','partial_failure',"
-            "'failed','aborted','aborted_partial'"
+            "'failed','aborted','aborted_partial',"
+            "'failed_needs_manual','committed_unserved_needs_manual'"
             ")",
             name="ck_planner_executions_execution_status",
+        ),
+        UniqueConstraint(
+            "turn_key",
+            name="uq_planner_executions_turn_key",
         ),
         # Codex Sub-A9 R2 MAJOR #1 — composite FK ensures that for any
         # planner_executions row, ``turn_id`` matches the ``turn_id`` of
@@ -251,6 +299,13 @@ class PlannerExecution(Base):
             "ix_planner_executions_tenant_created",
             "tenant_id",
             "created_at",
+        ),
+        # Stale-lease scan for the crash-safety watchdog.  Plain (non-partial)
+        # index for SQLite portability; on PostgreSQL a partial index
+        # ``WHERE recovery_lease_until IS NOT NULL`` would be tighter.
+        Index(
+            "ix_planner_executions_recovery_lease",
+            "recovery_lease_until",
         ),
     )
 
@@ -377,5 +432,152 @@ class PlannerGap(Base):
             "ix_planner_gaps_tenant_recent",
             "tenant_id",
             "created_at",
+        ),
+    )
+
+
+class StepExecutionLedger(Base):
+    """Crash-safety core — one row per tool-step execution attempt.
+
+    Tracks whether each step in a planner execution has been
+    ``started``, ``committed``, or ended in an ``unknown`` / ``unknown_pending``
+    outcome.  The UNIQUE ``(execution_id, step_id)`` constraint means
+    only one ledger entry per step per execution exists; a second attempt
+    after a crash MUST find an existing row and resolve its status.
+
+    ``operation_id`` is the idempotency key passed to external tools.
+    It is PII-free (opaque, e.g. a UUID or hash), GLOBALLY unique
+    across the keyspace (mirrors audit_outbox.operation_id design
+    rationale — see audit_feed.py).
+
+    Sub-A12 Phase E — crash-safety substrate.  No write logic here;
+    that lands in a later task.
+    """
+
+    __tablename__ = "step_execution_ledger"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    execution_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("planner_executions.id"),
+        nullable=False,
+        index=True,
+    )
+    step_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # PII-free opaque idempotency key (e.g. sha256 of execution+step context).
+    # GLOBAL uniqueness matches audit_outbox.operation_id keyspace.
+    # String(64): aligned with audit_outbox.operation_id keyspace width.
+    operation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="started",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_id",
+            "step_id",
+            name="uq_step_execution_ledger_execution_step",
+        ),
+        # Global operation_id uniqueness — matches audit_outbox's global-unique
+        # operation_id keyspace so idempotency checks work across tables.
+        UniqueConstraint(
+            "operation_id",
+            name="uq_step_execution_ledger_operation_id",
+        ),
+        CheckConstraint(
+            "status IN ('started','committed','unknown','unknown_pending')",
+            name="ck_step_execution_ledger_status",
+        ),
+    )
+
+
+class PlannerLlmReservation(Base):
+    """Billing reservation ledger — one row per LLM call budget reservation.
+
+    Lifecycle: ``reserved`` (pre-call budget hold) → ``charged`` (actual
+    tokens billed) | ``released`` (call cancelled) | ``expired`` (TTL
+    elapsed without resolution) | ``unknown_provider_outcome`` (API
+    returned no usage data).
+
+    ``llm_call_id`` is a stable caller-generated key:
+    ``{turn_or_execution_id}:{phase}:{call_seq}:{model}``; UNIQUE so
+    a retry cannot double-reserve.
+
+    ``expires_at`` is a TTL sentinel — the billing reconciler uses it
+    to expire reservations that were never charged or released
+    (e.g. worker crashed after the LLM call but before writing the
+    result).
+
+    Sub-A12 Phase E — billing substrate.  No write logic here.
+    """
+
+    __tablename__ = "planner_llm_reservations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    llm_call_id: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    execution_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("planner_executions.id"),
+        nullable=True,
+        index=True,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    feature_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="reserved",
+    )
+    reserved_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "llm_call_id",
+            name="uq_planner_llm_reservations_llm_call_id",
+        ),
+        CheckConstraint(
+            "state IN ("
+            "'reserved','charged','released','expired',"
+            "'unknown_provider_outcome'"
+            ")",
+            name="ck_planner_llm_reservations_state",
+        ),
+        # Composite index for the billing reconciler's expire scan
+        # (WHERE state='reserved' AND expires_at < now()).
+        # Plain (non-partial) index for SQLite portability.
+        Index(
+            "ix_planner_llm_reservations_state_expires",
+            "state",
+            "expires_at",
         ),
     )

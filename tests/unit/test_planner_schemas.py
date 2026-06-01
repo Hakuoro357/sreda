@@ -199,7 +199,7 @@ def test_plan_with_single_action_ok() -> None:
 
 
 def test_plan_with_ten_actions_ok() -> None:
-    actions = {f"s{i}": _ok_action() for i in range(10)}
+    actions = {f"s{i}": _ok_action() for i in range(1, 11)}  # s1..s10 (s0 invalid per action-id format)
     plan = Plan(
         turn_classification=_ok_tc(),
         actions=actions,

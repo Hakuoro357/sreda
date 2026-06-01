@@ -680,21 +680,21 @@ def test_outcome_aborted_partial_requires_committed_write() -> None:
 
 
 def test_branch_next_selects_only_matched_path() -> None:
-    """s1 has two branches: added → s2_added; (fallback) → s2_error.
-    s1 returns status='added' → s2_added MUST run, s2_error MUST be
+    """s1 has two branches: added → s2 (was s2_added); (fallback) → s3 (was s2_error).
+    s1 returns status='added' → s2 MUST run, s3 MUST be
     skipped with reason 'branch_not_selected'."""
     plan = _plan({
         "s1": {
             "tool": "add_shopping_items",
             "args": {"items": [{"title": "x"}]},
             "expected_outcomes": [
-                {"match": {"status": "added"}, "next": "s2_added"},
-                {"match": {"status": "empty"}, "next": "s2_error"},
+                {"match": {"status": "added"}, "next": "s2"},   # was s2_added: the 'added' branch
+                {"match": {"status": "empty"}, "next": "s3"},   # was s2_error: the 'error' branch
             ],
             "intent_group": "g_path",
             "depends_on": [],
         },
-        "s2_added": _action(
+        "s2": _action(  # was s2_added: the 'added' branch
             "schedule_reminder", intent_group="g_path",
             args={"title": "ok", "trigger_iso": "2026-12-31T18:00:00+00:00"},
             outcomes=[{"match": {"status": "scheduled"}, "next": None,
@@ -703,7 +703,7 @@ def test_branch_next_selects_only_matched_path() -> None:
                                    "template_data": {"what": "x",
                                                      "when_phrase": "y"}}}],
         ),
-        "s2_error": _action(
+        "s3": _action(  # was s2_error: the 'error' branch
             "schedule_reminder", intent_group="g_path",
             args={"title": "err", "trigger_iso": "2026-12-31T19:00:00+00:00"},
             outcomes=[{"match": {"status": "scheduled"}, "next": None,
@@ -727,9 +727,9 @@ def test_branch_next_selects_only_matched_path() -> None:
 
     by_id = log.by_step_id()
     assert by_id["s1"].status == "ok"
-    assert by_id["s2_added"].status == "ok"
-    assert by_id["s2_error"].status == "skipped"
-    assert by_id["s2_error"].error_summary == "branch_not_selected"
+    assert by_id["s2"].status == "ok"    # was s2_added
+    assert by_id["s3"].status == "skipped"  # was s2_error
+    assert by_id["s3"].error_summary == "branch_not_selected"
 
 
 def test_terminal_branch_compose_override_surfaces_via_step_result() -> None:
@@ -990,13 +990,13 @@ def test_step_with_skipped_upstream_dep_is_cascade_skipped() -> None:
             "tool": "add_shopping_items",
             "args": {"items": [{"title": "x"}]},
             "expected_outcomes": [
-                # Only matches 'added'; next='s_unreached'.
-                {"match": {"status": "added"}, "next": "s_unreached"},
+                # Only matches 'added'; next='s2' (was s_unreached).
+                {"match": {"status": "added"}, "next": "s2"},  # was s_unreached
             ],
             "intent_group": "default",
             "depends_on": [],
         },
-        "s_unreached": {
+        "s2": {  # was s_unreached
             "tool": "add_shopping_items",
             "args": {"items": [{"title": "y"}]},
             "expected_outcomes": [
@@ -1008,8 +1008,8 @@ def test_step_with_skipped_upstream_dep_is_cascade_skipped() -> None:
             "intent_group": "default",
             "depends_on": [],
         },
-        # s_downstream uses depends_on=s_unreached → should cascade skip
-        "s_downstream": {
+        # s3 (was s_downstream) uses depends_on=s2 → should cascade skip
+        "s3": {  # was s_downstream
             "tool": "list_shopping",
             "args": {},
             "expected_outcomes": [
@@ -1019,23 +1019,23 @@ def test_step_with_skipped_upstream_dep_is_cascade_skipped() -> None:
                              "template_data": {}}},
             ],
             "intent_group": "default",
-            "depends_on": ["s_unreached"],
+            "depends_on": ["s2"],  # was s_unreached
         },
     })
     ep = compile_plan(plan, REGISTRY)
 
     # s1 returns 'empty' (count=0) → status='empty' but branches only
     # have 'added' → unknown_outcome → aborts. But our test target
-    # is whether s_downstream gets cascade-skipped via upstream rule.
-    # Use raw='ok:added:1:...' so s1 succeeds + enables s_unreached.
-    # Then s_unreached returns empty → unknown_outcome → abort.
-    # In that case s_downstream would also be drained as halted, not
+    # is whether s3 (was s_downstream) gets cascade-skipped via upstream rule.
+    # Use raw='ok:added:1:...' so s1 succeeds + enables s2 (was s_unreached).
+    # Then s2 returns empty → unknown_outcome → abort.
+    # In that case s3 would also be drained as halted, not
     # cascade-skipped. So instead make s1 succeed with a status NOT
-    # matching → unknown_outcome on s1 directly → s_unreached and
-    # s_downstream both get drained as halted.
-    # For cascade test specifically, we need s_unreached to be
+    # matching → unknown_outcome on s1 directly → s2 and
+    # s3 both get drained as halted.
+    # For cascade test specifically, we need s2 to be
     # branch_not_selected (not aborted). Setup s1 with two branches:
-    # 'added' → enable nothing; 'empty' → enable s_unreached.
+    # 'added' → enable nothing; 'empty' → enable s2 (was s_unreached).
     plan = _plan({
         "s1": {
             "tool": "add_shopping_items",
@@ -1045,12 +1045,12 @@ def test_step_with_skipped_upstream_dep_is_cascade_skipped() -> None:
                  "compose": {"kind": "template",
                              "template_id": "shopping_added_ok",
                              "template_data": {"items": ["x"]}}},
-                {"match": {"status": "empty"}, "next": "s_unreached"},
+                {"match": {"status": "empty"}, "next": "s2"},  # was s_unreached
             ],
             "intent_group": "default",
             "depends_on": [],
         },
-        "s_unreached": {
+        "s2": {  # was s_unreached
             "tool": "add_shopping_items",
             "args": {"items": [{"title": "y"}]},
             "expected_outcomes": [
@@ -1062,7 +1062,7 @@ def test_step_with_skipped_upstream_dep_is_cascade_skipped() -> None:
             "intent_group": "default",
             "depends_on": [],
         },
-        "s_downstream": {
+        "s3": {  # was s_downstream
             "tool": "list_shopping",
             "args": {},
             "expected_outcomes": [
@@ -1072,13 +1072,13 @@ def test_step_with_skipped_upstream_dep_is_cascade_skipped() -> None:
                              "template_data": {}}},
             ],
             "intent_group": "default",
-            "depends_on": ["s_unreached"],
+            "depends_on": ["s2"],  # was s_unreached
         },
     })
     ep = compile_plan(plan, REGISTRY)
 
-    # s1 returns 'added' → matches first branch → s_unreached NOT enabled
-    # → s_downstream depends_on s_unreached → cascade skip
+    # s1 returns 'added' → matches first branch → s2 (was s_unreached) NOT enabled
+    # → s3 (was s_downstream) depends_on s2 → cascade skip
     fake_add = _FakeTool("add_shopping_items",
                          return_raw='ok:added:1:ids=[sh_aaaaaaaaaaaaaaaaaaaaaaaa]')
     fake_list = _FakeTool("list_shopping", return_raw='no shopping items')
@@ -1089,12 +1089,12 @@ def test_step_with_skipped_upstream_dep_is_cascade_skipped() -> None:
 
     by_id = log.by_step_id()
     assert by_id["s1"].status == "ok"
-    assert by_id["s_unreached"].status == "skipped"
-    assert by_id["s_unreached"].error_summary == "branch_not_selected"
-    assert by_id["s_downstream"].status == "skipped"
-    # Cascade reason mentions s_unreached as the missing upstream
-    assert "upstream_skipped" in (by_id["s_downstream"].error_summary or "")
-    assert "s_unreached" in (by_id["s_downstream"].error_summary or "")
+    assert by_id["s2"].status == "skipped"               # was s_unreached
+    assert by_id["s2"].error_summary == "branch_not_selected"
+    assert by_id["s3"].status == "skipped"               # was s_downstream
+    # Cascade reason mentions s2 (was s_unreached) as the missing upstream
+    assert "upstream_skipped" in (by_id["s3"].error_summary or "")
+    assert "s2" in (by_id["s3"].error_summary or "")     # was "s_unreached"
 
 
 # ---------------------------------------------------------------------------

@@ -1119,6 +1119,126 @@ def test_validate_plan_accepts_real_branch_statuses() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Plan.actions key format validator (Sub-A12 Phase E PR-2a)
+# ---------------------------------------------------------------------------
+
+
+def _minimal_plan(actions: dict) -> dict:
+    """Return a minimal schema-valid Plan dict with the given ``actions``."""
+    return {
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "test"},
+        "clarity": "clear",
+        "actions": actions,
+        "compose": {
+            "kind": "template",
+            "template_id": "shopping_added_ok",
+            "template_data": {"items": ["молоко"]},
+        },
+    }
+
+
+def _minimal_action() -> dict:
+    return {
+        "tool": "add_shopping_items",
+        "args": {"items": [{"title": "молоко"}]},
+        "expected_outcomes": [
+            {
+                "match": {"status": "added"},
+                "next": None,
+                "compose": {
+                    "kind": "template",
+                    "template_id": "shopping_added_ok",
+                    "template_data": {"items": ["молоко"]},
+                },
+            }
+        ],
+        "intent_group": "default",
+        "depends_on": [],
+    }
+
+
+def test_action_keys_s1_s2_s10_are_valid() -> None:
+    """Keys matching ^s[1-9][0-9]*$ pass validation."""
+    from sreda.runtime.planner.schemas import Plan
+
+    plan_dict = _minimal_plan(
+        {
+            "s1": _minimal_action(),
+            "s2": {**_minimal_action(), "depends_on": ["s1"]},
+            "s10": {**_minimal_action(), "depends_on": ["s2"]},
+        }
+    )
+    plan = Plan.model_validate(plan_dict)
+    assert set(plan.actions.keys()) == {"s1", "s2", "s10"}
+
+
+def test_action_key_semantic_raises() -> None:
+    """A semantic key like ``remind_boris_medication`` raises ValidationError."""
+    import pytest
+    from pydantic import ValidationError
+    from sreda.runtime.planner.schemas import Plan
+
+    with pytest.raises(ValidationError, match="remind_boris_medication"):
+        Plan.model_validate(_minimal_plan({"remind_boris_medication": _minimal_action()}))
+
+
+def test_action_key_s0_raises() -> None:
+    """``s0`` (zero base) is rejected."""
+    import pytest
+    from pydantic import ValidationError
+    from sreda.runtime.planner.schemas import Plan
+
+    with pytest.raises(ValidationError, match=r"s0"):
+        Plan.model_validate(_minimal_plan({"s0": _minimal_action()}))
+
+
+def test_action_key_leading_zero_raises() -> None:
+    """``s01`` (leading zero) is rejected."""
+    import pytest
+    from pydantic import ValidationError
+    from sreda.runtime.planner.schemas import Plan
+
+    with pytest.raises(ValidationError, match=r"s01"):
+        Plan.model_validate(_minimal_plan({"s01": _minimal_action()}))
+
+
+def test_empty_actions_needs_clarification_passes() -> None:
+    """Empty actions with ``clarity='needs_clarification'`` — no keys to check, passes."""
+    from sreda.runtime.planner.schemas import Plan
+
+    plan_dict = {
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "test"},
+        "clarity": "needs_clarification",
+        "clarity_reason": "не указано время",
+        "actions": {},
+        "compose": {
+            "kind": "template",
+            "template_id": "ask_when_to_remind",
+            "template_data": {"what": "купить хлеб"},
+        },
+    }
+    plan = Plan.model_validate(plan_dict)
+    assert plan.actions == {}
+
+
+def test_few_shot_examples_pass_action_key_validator() -> None:
+    """All curated few-shot examples use s1/s2/s3 keys and pass the new validator."""
+    from sreda.runtime.planner.schemas import Plan
+    from sreda.runtime.planner.few_shot_examples import all_examples
+
+    for i, ex in enumerate(all_examples(), start=1):
+        try:
+            Plan.model_validate(ex.plan)
+        except Exception as e:  # noqa: BLE001
+            pytest.fail(
+                f"few-shot example #{i} ({ex.user_message!r}) failed "
+                f"Plan.model_validate (action key validator): {e}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Fence injection regression (Codex R1 MAJOR — escapable sentinels)
 # ---------------------------------------------------------------------------
 

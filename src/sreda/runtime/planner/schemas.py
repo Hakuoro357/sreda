@@ -31,11 +31,21 @@ Two operating modes for a Plan (vex-assistant#77 item #2 — clarity):
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+
+_ACTION_KEY_RE = re.compile(r"^s[1-9][0-9]*$")
+"""Regex that every key in ``Plan.actions`` must match.
+
+Enforces the ``s1`` / ``s2`` / ``s10`` format the planner prompt requests.
+Rejects semantic keys like ``remind_boris_medication`` (which embed user
+PII and make the derived idempotency operation_id non-deterministic) as
+well as ``s0`` and ``s01`` (leading-zero or zero-base variants).
+"""
 
 _STRICT = ConfigDict(extra="forbid", strict=False)
 """Project-wide pydantic config for planner schemas.
@@ -408,6 +418,30 @@ class Plan(BaseModel):
                             f"must be a non-blank string. Got: "
                             f"{item!r} (type {type(item).__name__})."
                         )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_action_key_format(self) -> Plan:
+        """Require every key in ``actions`` to match ``^s[1-9][0-9]*$``.
+
+        The planner prompt requests ``s1``/``s2``/``s3`` … keys. Without
+        schema enforcement the LLM can emit semantic keys like
+        ``remind_boris_medication`` (embeds user PII) or ``s0``/``s01``
+        (non-canonical). Such keys flow into ``planner_gaps.step_id``
+        (plaintext column) and make the derived idempotency
+        ``operation_id`` non-deterministic.
+
+        Empty ``actions`` (``clarity='needs_clarification'`` pure-ask
+        path) has no keys to check and always passes.
+        """
+        bad_keys = [k for k in self.actions if not _ACTION_KEY_RE.match(k)]
+        if bad_keys:
+            raise ValueError(
+                f"Plan.actions keys must match '{_ACTION_KEY_RE.pattern}' "
+                f"(e.g. s1, s2, s10). Invalid key(s): {sorted(bad_keys)}. "
+                "Semantic keys embed user PII in plaintext columns and make "
+                "operation_id non-deterministic."
+            )
         return self
 
     @model_validator(mode="after")
