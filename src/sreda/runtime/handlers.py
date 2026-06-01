@@ -83,6 +83,35 @@ class RuntimeReply:
     extra_payload: dict | None = None
 
 
+@dataclass
+class FinalizeInput:
+    """Inputs for the post-loop finalization block of execute_conversation_chat.
+
+    Carries exactly the local variables that the extracted
+    ``finalize_chat_reply`` function reads.  All names match the locals
+    in ``execute_conversation_chat``; underscore-prefixed originals are
+    mapped to plain names (e.g. ``_turn_timed_out`` → ``turn_timed_out``).
+    """
+
+    final_ai: Any  # AIMessage | None
+    messages: list[Any]
+    turn_msg_start_idx: int  # from _turn_msg_start_idx
+    action: Any  # ActionEnvelope
+    feature_key: str | None
+    user_id: str | None
+    model_name: str
+    turn_timed_out: bool  # from _turn_timed_out
+    successful_tool_counts: dict[str, int]
+    context: dict[str, Any]
+    called_tools: set[str]
+    hallucination_nudged: bool  # from _hallucination_nudged
+    pending_buttons_state: dict | None
+    menu_display_state: dict | None
+    session: Any  # sqlalchemy Session
+    ack_progress: Any  # from _ack_progress; controller or None
+    user_text: str
+
+
 class ActionRuntimeError(Exception):
     """Structured failure from a handler or policy-guard.
 
@@ -3179,6 +3208,56 @@ async def execute_conversation_chat(
             )
         except Exception:  # noqa: BLE001
             logger.exception("onboarding depth bookkeeping failed")
+
+    return await finalize_chat_reply(FinalizeInput(
+        final_ai=final_ai,
+        messages=messages,
+        turn_msg_start_idx=_turn_msg_start_idx,
+        action=action,
+        feature_key=feature_key,
+        user_id=user_id,
+        model_name=model_name,
+        turn_timed_out=_turn_timed_out,
+        successful_tool_counts=successful_tool_counts,
+        context=context,
+        called_tools=called_tools,
+        hallucination_nudged=_hallucination_nudged,
+        pending_buttons_state=pending_buttons_state,
+        menu_display_state=menu_display_state,
+        session=session,
+        ack_progress=_ack_progress,
+        user_text=user_text,
+    ))
+
+
+async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
+    """Post-loop finalization extracted from ``execute_conversation_chat``.
+
+    Reads locals carried in *fin*, applies all post-processing layers
+    (rescue, sanitise, greeting/date validators, refusal/hallucination
+    guards, menu rendering, reply-buttons, ack-stream flush) and returns
+    the final ``RuntimeReply`` list.  Behaviour is byte-for-byte
+    identical to the original inline block.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage  # noqa: PLC0415
+
+    final_ai = fin.final_ai
+    messages = fin.messages
+    _turn_msg_start_idx = fin.turn_msg_start_idx
+    action = fin.action
+    feature_key = fin.feature_key
+    user_id = fin.user_id
+    model_name = fin.model_name
+    _turn_timed_out = fin.turn_timed_out
+    successful_tool_counts = fin.successful_tool_counts
+    context = fin.context
+    called_tools = fin.called_tools
+    _hallucination_nudged = fin.hallucination_nudged
+    pending_buttons_state = fin.pending_buttons_state
+    menu_display_state = fin.menu_display_state
+    session = fin.session
+    _ack_progress = fin.ack_progress
+    user_text = fin.user_text
 
     # final_ai is None when the turn aborted via _turn_timed_out before
     # any iter produced a result — guard the content read.
