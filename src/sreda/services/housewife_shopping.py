@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.housewife_food import (
@@ -31,6 +32,13 @@ from sreda.db.models.housewife_food import (
     SHOPPING_STATUSES,
     ShoppingListItem,
 )
+from sreda.runtime.planner.tool_runtime import current_tool_runtime
+from sreda.services.audit_feed import emit_event
+from sreda.services.operation_id import (
+    compute_normalized_title_hash,
+    compute_operation_id_create,
+)
+from sreda.services.text_normalization import normalize_for_dedup
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +244,41 @@ class HousewifeShoppingService:
         created rows in order.
 
         Empty title is rejected at the item level (returns with a warning
-        log) — we don't want silently-created empty placeholder rows."""
+        log) — we don't want silently-created empty placeholder rows.
+
+        **Idempotency branching (Sub-A12 Phase E PR-2a)**:
+
+        - ``current_tool_runtime() is None`` (legacy / chat path — THE
+          LIVE PATH TODAY): behaviour is byte-for-byte identical to the
+          pre-PR code. No operation_id, no normalized_title_hash, no
+          emit_event.  This is the only branch that runs outside the
+          planner.
+
+        - ``current_tool_runtime() is not None`` (planner path): each
+          inserted row gets a stable PER-ITEM operation_id (hash of
+          execution_id + step_id + "create" + "shopping_list_item" +
+          normalize_for_dedup(title)) via ``INSERT ... ON CONFLICT
+          (tenant_id, user_id, operation_id) DO NOTHING`` — that is the
+          ROW's uniqueness key (a step inserting N items needs N keys).
+          Exactly ONE audit event is emitted per step, keyed by the
+          PER-STEP ``ctx.operation_id`` (the ledger id recovery probes),
+          in the same transaction — even when every item was
+          title-deduped — so no durable-write step is invisible to crash
+          recovery.  A re-run with the same ctx produces the same
+          per-item op_ids (ON CONFLICT no-ops) and the same
+          ctx.operation_id (emit_event dedups) — no duplicate row, no
+          duplicate audit.
+
+        Return contract: same shape in both branches — a list of
+        ``ShoppingListItem`` rows.  In the legacy path that is exactly
+        the newly-created rows.  In the planner path it additionally
+        includes already-pending rows that title-dedup matched (fetched
+        from the pending map) so the planner sees a valid id; a row that
+        ON-CONFLICT-skipped is fetched by its per-item operation_id.
+        Note: ``len(rows)`` therefore is NOT a reliable "newly added"
+        count in the planner path — a wrapper that needs a user-facing
+        count must compute it separately (PR-2b concern).
+        """
         normalised: list[ShoppingItemInput] = []
         for raw in items or []:
             if isinstance(raw, ShoppingItemInput):
@@ -257,54 +299,232 @@ class HousewifeShoppingService:
                 )
             )
 
-        # Dedup: skip items whose normalised title already exists as
-        # a PENDING row for this (tenant, user). Prevents the "Friday
-        # menu re-adds Thursday's ingredients" duplicate flood. Bought
-        # / cancelled rows don't count — if user bought 'молоко'
-        # yesterday, re-adding today is a legitimate new need.
-        existing_titles: set[str] = set()
-        for existing in self._list_by_status(
-            tenant_id, user_id, ("pending",)
-        ):
-            existing_titles.add(_normalise_title(existing.title))
+        ctx = current_tool_runtime()
+
+        if ctx is None:
+            # ------------------------------------------------------------------
+            # LEGACY PATH — unchanged from pre-PR.  Must remain byte-for-byte
+            # identical so the live chat path is unaffected.
+            # ------------------------------------------------------------------
+            # Dedup: skip items whose normalised title already exists as
+            # a PENDING row for this (tenant, user). Prevents the "Friday
+            # menu re-adds Thursday's ingredients" duplicate flood. Bought
+            # / cancelled rows don't count — if user bought 'молоко'
+            # yesterday, re-adding today is a legitimate new need.
+            existing_titles: set[str] = set()
+            for existing in self._list_by_status(
+                tenant_id, user_id, ("pending",)
+            ):
+                existing_titles.add(_normalise_title(existing.title))
+
+            now = _utcnow()
+            rows: list[ShoppingListItem] = []
+            for item in normalised:
+                norm = _normalise_title(item.title)
+                if norm in existing_titles:
+                    # Skip — already on the list.
+                    continue
+                # Track this one so a later item within the same batch
+                # with the same normalised title also gets deduped.
+                existing_titles.add(norm)
+                # When the caller supplies an explicit category, respect it
+                # (LLM in chat may know context the heuristic doesn't).
+                # When it's missing — common for generate_shopping_from_menu
+                # which passes None — guess from the title so the item
+                # lands in a real bucket rather than piling into "другое".
+                if item.category:
+                    resolved_category = _coerce_category(item.category)
+                else:
+                    resolved_category = _guess_category(item.title)
+                row = ShoppingListItem(
+                    id=f"sh_{uuid4().hex[:24]}",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    title=item.title,
+                    quantity_text=item.quantity_text,
+                    category=resolved_category,
+                    status="pending",
+                    source_recipe_id=item.source_recipe_id,
+                    added_at=now,
+                    updated_at=now,
+                )
+                self.session.add(row)
+                rows.append(row)
+
+            if rows:
+                self.session.commit()
+            return rows
+
+        # ------------------------------------------------------------------
+        # PLANNER PATH — option-(a) idempotency adapter (Sub-A12 Phase E).
+        # ------------------------------------------------------------------
+        # Fail-closed wiring guard: the runtime context's tenant MUST match the
+        # tenant this call writes for.  A mismatch means the contextvar leaked
+        # across a tenant boundary (a wiring bug) — refuse rather than write
+        # cross-tenant rows.  ctx.user_id is intentionally NOT asserted: the
+        # executor binds user_id=None today; the authoritative user scope is
+        # the explicit `user_id` argument, used for BOTH the row and the hash.
+        if ctx.tenant_id and ctx.tenant_id != tenant_id:
+            raise ValueError(
+                "add_items planner path: ctx.tenant_id="
+                f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — "
+                "ToolRuntimeContext leaked across a tenant boundary."
+            )
+
+        # Title-dedup is an AUTHORITATIVE business rule (NOT a "fast
+        # non-authoritative pre-filter"): a title already PENDING for this
+        # (tenant, user) is not re-added — the legacy UX ("Friday menu doesn't
+        # re-add Thursday's still-pending ingredients").  This is independent
+        # of, and complementary to, the crash-safety idempotency:
+        #   * title-dedup   — cross-operation UX rule (don't flood duplicates)
+        #   * operation_id  — same-operation retry idempotency (DB ON CONFLICT)
+        # Build a normalised-title -> existing pending row map ONCE so the loop
+        # is O(items + pending), not O(items x pending).
+        pending_by_title: dict[str, ShoppingListItem] = {}
+        for existing in self._list_by_status(tenant_id, user_id, ("pending",)):
+            pending_by_title.setdefault(_normalise_title(existing.title), existing)
 
         now = _utcnow()
-        rows: list[ShoppingListItem] = []
+
+        # Choose the dialect-aware insert constructor.
+        dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
+        if dialect_name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _insert
+        else:
+            # SQLite (tests) + any other dialect with SQLAlchemy upsert support.
+            from sqlalchemy.dialects.sqlite import insert as _insert  # type: ignore[no-redef]
+
+        rows_p: list[ShoppingListItem] = []
+        seen: set[str] = set(pending_by_title.keys())
         for item in normalised:
             norm = _normalise_title(item.title)
-            if norm in existing_titles:
-                # Skip — already on the list.
+            # Already pending (cross-call) OR already handled earlier in this
+            # batch (intra-batch dedup, mirrors the legacy single-set logic).
+            if norm in seen:
+                existing_row = pending_by_title.get(norm)
+                if existing_row is not None:
+                    # Return the existing row so the planner sees a valid id.
+                    # The per-step audit footprint below is emitted regardless,
+                    # so a fully-deduped step is still visible to recovery.
+                    rows_p.append(existing_row)
                 continue
-            # Track this one so a later item within the same batch
-            # with the same normalised title also gets deduped.
-            existing_titles.add(norm)
-            # When the caller supplies an explicit category, respect it
-            # (LLM in chat may know context the heuristic doesn't).
-            # When it's missing — common for generate_shopping_from_menu
-            # which passes None — guess from the title so the item
-            # lands in a real bucket rather than piling into "другое".
+            seen.add(norm)
+
             if item.category:
                 resolved_category = _coerce_category(item.category)
             else:
                 resolved_category = _guess_category(item.title)
-            row = ShoppingListItem(
-                id=f"sh_{uuid4().hex[:24]}",
+
+            # Per-ITEM operation_id — the ROW's idempotency key for the UNIQUE
+            # (tenant, user, operation_id) index.  A step inserting N items
+            # needs N distinct keys, so this is derived per item (includes the
+            # normalised title).  It is DELIBERATELY different from the per-STEP
+            # ctx.operation_id used for the recovery-probe audit event below
+            # (a single global op_id on one row is not sufficient for multi-row
+            # — plan item #1).
+            op_id = compute_operation_id_create(
+                plan_id=ctx.execution_id,
+                step_id=ctx.step_id,
+                action="create",
+                entity_type="shopping_list_item",
+                logical_key=normalize_for_dedup(item.title),
+            )
+            # Hash scoped to the AUTHORITATIVE user (the `user_id` argument),
+            # never ctx.user_id (the executor binds that to None today, which
+            # would scope the hash to a blank user and break future lookups +
+            # leak cross-user correlation within a tenant — Codex A/B R1).
+            nhash = compute_normalized_title_hash(
+                item.title,
+                entity_type="shopping_list_item",
                 tenant_id=tenant_id,
                 user_id=user_id,
-                title=item.title,
-                quantity_text=item.quantity_text,
-                category=resolved_category,
-                status="pending",
-                source_recipe_id=item.source_recipe_id,
-                added_at=now,
-                updated_at=now,
             )
-            self.session.add(row)
-            rows.append(row)
+            row_id = f"sh_{uuid4().hex[:24]}"
 
-        if rows:
+            stmt = (
+                _insert(ShoppingListItem)
+                .values(
+                    id=row_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    title=item.title,
+                    quantity_text=item.quantity_text,
+                    category=resolved_category,
+                    status="pending",
+                    source_recipe_id=item.source_recipe_id,
+                    added_at=now,
+                    updated_at=now,
+                    operation_id=op_id,
+                    normalized_title_hash=nhash,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["tenant_id", "user_id", "operation_id"]
+                )
+            )
+            self.session.execute(stmt)
+
+            # Fetch the row by operation_id — covers both "inserted just now"
+            # and "ON CONFLICT fired because a concurrent racer / earlier retry
+            # of THIS step already inserted the same op_id".
+            actual_row = (
+                self.session.query(ShoppingListItem)
+                .filter(
+                    ShoppingListItem.tenant_id == tenant_id,
+                    ShoppingListItem.user_id == user_id,
+                    ShoppingListItem.operation_id == op_id,
+                )
+                .one_or_none()
+            )
+            if actual_row is None:
+                # Should not happen: either insert landed or conflict existed.
+                logger.error(
+                    "add_items planner path: row not found after insert "
+                    "for op_id=%s (tenant=%s user=%s title=%r)",
+                    op_id, tenant_id, user_id, item.title,
+                )
+                continue
+            rows_p.append(actual_row)
+
+        # ------------------------------------------------------------------
+        # ONE per-step audit footprint — the crash-recovery PROBE SURFACE.
+        # ------------------------------------------------------------------
+        # Keyed by ctx.operation_id (the LEDGER operation_id the executor
+        # persisted BEFORE execution and that recovery.probe_operation() looks
+        # up — recovery "never recomputes from args", plan item #1).  Emitted
+        # ONCE per step, in the SAME transaction as the row writes, whenever the
+        # step attempted a durable write (normalised non-empty) — even if every
+        # item was title-deduped — so NO durable-write step is invisible to
+        # crash recovery.  The per-item op_ids are the rows' uniqueness keys,
+        # NOT the probe surface (recovery cannot reconstruct per-item titles).
+        #
+        # SAVEPOINT per emit_event's contract: a concurrent racer emitting the
+        # same ctx.operation_id raises IntegrityError on flush; begin_nested()
+        # rolls the savepoint back (parent txn survives) and we treat the
+        # racer's row as the winner.
+        if normalised:
+            try:
+                with self.session.begin_nested():
+                    emit_event(
+                        self.session,
+                        operation_id=ctx.operation_id,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        source="среда",
+                        entity_type="shopping_list_item",
+                        entity_id=None,
+                        action="created",
+                        payload=None,
+                    )
+            except IntegrityError:
+                # Concurrent racer already wrote this step's audit row; the
+                # savepoint is rolled back and the parent txn is intact.
+                logger.info(
+                    "add_items planner path: audit row for op_id=%s already "
+                    "written by a concurrent racer; continuing.",
+                    ctx.operation_id,
+                )
             self.session.commit()
-        return rows
+        return rows_p
 
     def mark_bought(
         self, *, tenant_id: str, user_id: str, ids: list[str]

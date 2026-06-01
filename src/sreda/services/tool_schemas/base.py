@@ -390,6 +390,16 @@ class ToolSpec(BaseModel):
     values DO count as «non-null» (they may carry meaning, e.g.
     ``quantity_text=""`` is the shopping clear-quantity intent).
     """
+    has_idempotency_adapter: bool = False
+    """True ONLY for a durable-write tool whose service writes a stable
+    operation_id + ON CONFLICT DO NOTHING + emit_event in the same
+    transaction (option-(a)/(b) idempotency adapter).
+
+    The #8b-3 fail-closed registry invariant requires every
+    is_durable_write tool in the planner-safe manifest to have this True.
+    Default False. A non-durable tool with it True is harmless; #8b-3
+    only checks durable tools.
+    """
     allow_field_validators: bool = False
     """Opt-in escape hatch for ``input_model`` with ``@field_validator``
     decorators (Codex Sub-A-77 item #4 R6 MAJOR #1).

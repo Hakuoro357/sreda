@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
+from sreda.db.models.audit_feed import AuditOutboxEvent
 from sreda.db.models.core import Tenant, User
 from sreda.db.models.housewife_food import SHOPPING_CATEGORIES, ShoppingListItem
 from sreda.services.encryption import get_encryption_service
@@ -766,3 +767,38 @@ def test_delete_by_source_recipe_returns_zero_when_no_match(session):
         tenant_id="t1", user_id="u1", recipe_id="rec_NONEXISTENT"
     ) == 0
     assert session.query(ShoppingListItem).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Legacy path — Sub-A12 Phase E PR-2a invariant
+# ---------------------------------------------------------------------------
+
+
+def test_add_items_legacy_path_no_operation_id_no_audit(session):
+    """When current_tool_runtime() is None (legacy chat path), add_items
+    MUST NOT set operation_id or normalized_title_hash on the row, and
+    MUST NOT write any AuditOutboxEvent.
+
+    This guards the #1 invariant: outside the planner, behaviour is
+    byte-for-byte identical to pre-PR code.
+    """
+    # No bind_tool_runtime() call — ctx is None.
+    svc = HousewifeShoppingService(session)
+    rows = svc.add_items(
+        tenant_id="t1",
+        user_id="u1",
+        items=[{"title": "молоко", "category": "молочные"}],
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.operation_id is None, (
+        "Legacy path must not populate operation_id"
+    )
+    assert row.normalized_title_hash is None, (
+        "Legacy path must not populate normalized_title_hash"
+    )
+    # No AuditOutboxEvent written.
+    audit_count = session.query(AuditOutboxEvent).count()
+    assert audit_count == 0, (
+        f"Legacy path must not write audit events, got {audit_count}"
+    )

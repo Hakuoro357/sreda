@@ -218,6 +218,11 @@ ADD_SHOPPING_ITEMS_SPEC = ToolSpec(
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
+    # Sub-A12 Phase E PR-2a: option-(a) idempotency adapter wired in
+    # HousewifeShoppingService.add_items (housewife_shopping.py) — writes
+    # operation_id + normalized_title_hash + ON CONFLICT DO NOTHING + emit_event
+    # atomically when running under the planner (ctx is not None).
+    has_idempotency_adapter=True,
 )
 
 
