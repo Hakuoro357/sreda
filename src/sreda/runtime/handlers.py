@@ -130,6 +130,57 @@ class ChatLoopResult:
     onboarding_resolution_called: bool  # from _onboarding_resolution_called
 
 
+@dataclass
+class ChatPreflight:
+    """Locals produced by the preflight block of ``execute_conversation_chat``.
+
+    Carries exactly what the code after the preflight (``_run_legacy_react_loop``
+    call, onboarding bookkeeping, ``finalize_chat_reply``) consumes.
+    The function parameters ``action``, ``session``, and ``context`` are
+    already available at the call site and are NOT duplicated here.
+    """
+
+    # --- Routing / identity ---
+    user_id: str | None
+    user_text: str
+    feature_key: str | None
+
+    # --- LLM clients ---
+    llm: Any
+    llm_with_tools: Any
+    _fallback_with_tools: Any
+
+    # --- Provider labels (for llm-trace envelopes) ---
+    _chat_primary_provider: str | None
+    _chat_fallback_provider: str | None
+
+    # --- Settings / services ---
+    settings: Any
+    budget: Any  # BudgetService
+    model_name: str
+
+    # --- Tool registry ---
+    tools_by_name: dict[str, Any]
+
+    # --- Message list + history index ---
+    messages: list[Any]
+    _turn_msg_start_idx: int
+
+    # --- llm-trace closure inputs ---
+    run_id: str
+    _base_envelope_fields: dict[str, Any]
+    _trace_id_value: str
+    _tool_schemas_for_log: list[dict]
+
+    # --- Onboarding ---
+    onboarding_follow_up_needed: bool
+    _onboarding_resolution_tools: set[str]
+
+    # --- Reply-buttons / menu state ---
+    pending_buttons_state: dict | None
+    menu_display_state: dict | None
+
+
 class ActionRuntimeError(Exception):
     """Structured failure from a handler or policy-guard.
 
@@ -2722,19 +2773,18 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
     )
 
 
-async def execute_conversation_chat(
+async def _chat_preflight(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
-) -> list[RuntimeReply]:
-    """LLM-driven conversational handler with memory tool-loop.
+) -> ChatPreflight | list[RuntimeReply]:
+    """Preflight block extracted from ``execute_conversation_chat`` (seam 1).
 
-    Flow:
-      1. Resolve which chat-capable skill is active for this tenant.
-         No subscription → upsell reply, no LLM.
-      2. Check the skill's LLM budget. Exhausted → fallback + /buy_extra.
-      3. Build system prompt from profile + memories.
-      4. Run LLM tool-call loop (capped at 5 iterations); record each
-         call's usage against the skill's budget.
-      5. Return the final assistant message.
+    Performs skill attribution, budget check, free-tier quota enforcement,
+    LLM/embedding client resolution, prompt + tool construction, and
+    message-list assembly.  Returns either a populated ``ChatPreflight``
+    (happy path) or a ``list[RuntimeReply]`` (short-circuit reply for
+    no-subscription / exhausted-budget / gate-blocked / quota-exceeded /
+    no-llm cases).  All behaviour is verbatim from the original inline
+    block; no logic changes.
     """
     from langchain_core.messages import (  # local import — LLM path only
         AIMessage,
@@ -3257,35 +3307,79 @@ async def execute_conversation_chat(
         "feature_key": feature_key,
     }
 
-    # --- 4. Tool-call loop (extracted to _run_legacy_react_loop) --------
-    _loop_result = await _run_legacy_react_loop(
+    return ChatPreflight(
+        user_id=user_id,
+        user_text=user_text,
+        feature_key=feature_key,
         llm=llm,
         llm_with_tools=llm_with_tools,
         _fallback_with_tools=_fallback_with_tools,
-        action=action,
-        feature_key=feature_key,
-        user_id=user_id,
-        model_name=model_name,
-        run_id=run_id,
         _chat_primary_provider=_chat_primary_provider,
         _chat_fallback_provider=_chat_fallback_provider,
+        settings=settings,
+        budget=budget,
+        model_name=model_name,
         tools_by_name=tools_by_name,
         messages=messages,
         _turn_msg_start_idx=_turn_msg_start_idx,
-        settings=settings,
-        budget=budget,
-        session=session,
-        trace=trace,
-        _ack_progress=context.get("_ack_progress_controller"),
+        run_id=run_id,
         _base_envelope_fields=_base_envelope_fields,
         _trace_id_value=_trace_id_value,
         _tool_schemas_for_log=_tool_schemas_for_log,
-        user_text=user_text,
+        onboarding_follow_up_needed=onboarding_follow_up_needed,
         _onboarding_resolution_tools={
             "onboarding_answered",
             "onboarding_deferred",
             "onboarding_complete",
         },
+        pending_buttons_state=pending_buttons_state,
+        menu_display_state=menu_display_state,
+    )
+
+
+async def execute_conversation_chat(
+    session: Session, action: ActionEnvelope, context: dict[str, Any]
+) -> list[RuntimeReply]:
+    """LLM-driven conversational handler with memory tool-loop.
+
+    Flow:
+      1. Resolve which chat-capable skill is active for this tenant.
+         No subscription → upsell reply, no LLM.
+      2. Check the skill's LLM budget. Exhausted → fallback + /buy_extra.
+      3. Build system prompt from profile + memories.
+      4. Run LLM tool-call loop (capped at 5 iterations); record each
+         call's usage against the skill's budget.
+      5. Return the final assistant message.
+    """
+    pf = await _chat_preflight(session, action, context)
+    if isinstance(pf, list):      # short-circuit reply (no-sub / quota / no-llm)
+        return pf
+
+    # --- 4. Tool-call loop (extracted to _run_legacy_react_loop) --------
+    _loop_result = await _run_legacy_react_loop(
+        llm=pf.llm,
+        llm_with_tools=pf.llm_with_tools,
+        _fallback_with_tools=pf._fallback_with_tools,
+        action=action,
+        feature_key=pf.feature_key,
+        user_id=pf.user_id,
+        model_name=pf.model_name,
+        run_id=pf.run_id,
+        _chat_primary_provider=pf._chat_primary_provider,
+        _chat_fallback_provider=pf._chat_fallback_provider,
+        tools_by_name=pf.tools_by_name,
+        messages=pf.messages,
+        _turn_msg_start_idx=pf._turn_msg_start_idx,
+        settings=pf.settings,
+        budget=pf.budget,
+        session=session,
+        trace=trace,
+        _ack_progress=context.get("_ack_progress_controller"),
+        _base_envelope_fields=pf._base_envelope_fields,
+        _trace_id_value=pf._trace_id_value,
+        _tool_schemas_for_log=pf._tool_schemas_for_log,
+        user_text=pf.user_text,
+        _onboarding_resolution_tools=pf._onboarding_resolution_tools,
     )
 
     # Onboarding depth bookkeeping: if we're still in onboarding AND the
@@ -3293,10 +3387,10 @@ async def execute_conversation_chat(
     # means it followed up with another question on the same topic.
     # Bump depth so next turn's prompt tightens the screw.
     if (
-        onboarding_follow_up_needed
+        pf.onboarding_follow_up_needed
         and not _loop_result.onboarding_resolution_called
-        and feature_key == "housewife_assistant"
-        and user_id
+        and pf.feature_key == "housewife_assistant"
+        and pf.user_id
     ):
         try:
             from sreda.services.housewife_onboarding import (
@@ -3304,7 +3398,7 @@ async def execute_conversation_chat(
             )
 
             HousewifeOnboardingService(session).record_follow_up(
-                tenant_id=action.tenant_id, user_id=user_id
+                tenant_id=action.tenant_id, user_id=pf.user_id
             )
         except Exception:  # noqa: BLE001
             logger.exception("onboarding depth bookkeeping failed")
@@ -3314,19 +3408,19 @@ async def execute_conversation_chat(
         messages=_loop_result.messages,
         turn_msg_start_idx=_loop_result.turn_msg_start_idx,
         action=action,
-        feature_key=feature_key,
-        user_id=user_id,
-        model_name=model_name,
+        feature_key=pf.feature_key,
+        user_id=pf.user_id,
+        model_name=pf.model_name,
         turn_timed_out=_loop_result.turn_timed_out,
         successful_tool_counts=_loop_result.successful_tool_counts,
         context=context,
         called_tools=_loop_result.called_tools,
         hallucination_nudged=_loop_result.hallucination_nudged,
-        pending_buttons_state=pending_buttons_state,
-        menu_display_state=menu_display_state,
+        pending_buttons_state=pf.pending_buttons_state,
+        menu_display_state=pf.menu_display_state,
         session=session,
         ack_progress=context.get("_ack_progress_controller"),
-        user_text=user_text,
+        user_text=pf.user_text,
     ))
 
 
