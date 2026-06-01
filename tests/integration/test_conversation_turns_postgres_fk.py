@@ -30,19 +30,17 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
-# Register all model modules — mirror conftest.py ordering so FK
-# targets like `checklists` (referenced by Task.checklist_id), `audit`,
-# `free_tier`, `reply_buttons` are present. Codex R3 MAJOR — without
-# these extra imports Base.metadata.create_all errors out before any
-# test logic runs.
+# Register all model modules. `sreda.db.models.__init__` registers the core
+# tables (incl. `checklists`, the FK target of Task.checklist_id — issue #86).
+# `audit`, `free_tier`, `reply_buttons` are NOT in __init__, so import them
+# explicitly or Base.metadata.create_all errors out before any test logic runs.
 import sreda.db.models  # noqa: F401
 import sreda.db.models.audit  # noqa: F401
-import sreda.db.models.checklists  # noqa: F401
 import sreda.db.models.free_tier  # noqa: F401
 import sreda.db.models.reply_buttons  # noqa: F401
 from sreda.db.models import (

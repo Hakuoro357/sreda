@@ -5,11 +5,6 @@ Uses an in-memory SQLite engine.  Each test class gets a clean DB
 
 FK chain required by PlannerExecution:
     Tenant → Workspace → AgentThread → AgentRun → PlannerExecution
-
-The checklists import is a known temporary workaround: tasks.py's FK
-target ``checklists.id`` lives in checklists.py which is not yet wired
-into sreda.db.models.__init__.  Without it Base.metadata.create_all
-raises ``NoReferencedTableError``.
 """
 
 from __future__ import annotations
@@ -25,8 +20,7 @@ from sqlalchemy.pool import StaticPool
 
 # Register ALL FK-target tables before create_all.
 from sreda.db.base import Base
-import sreda.db.models  # noqa: F401 — Tenant, Workspace, AgentThread, AgentRun, ...
-import sreda.db.models.checklists  # noqa: F401 — tasks_items FK target (workaround)
+import sreda.db.models  # noqa: F401 — registers all ORM tables incl. checklists (#86)
 import sreda.db.models.planner  # noqa: F401 — PlannerExecution, StepExecutionLedger
 import sreda.db.models.audit_feed  # noqa: F401 — AuditOutboxEvent
 

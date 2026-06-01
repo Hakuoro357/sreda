@@ -27,15 +27,12 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-# Register ALL tables: FK chain Tenant→Workspace→AgentThread→AgentRun→
-# PlannerExecution→StepExecutionLedger must all exist before create_all.
-# sreda.db.models.__init__ imports most tables but misses checklists.py
-# (which tasks.py's FK target 'checklists.id' lives in).  Without it,
-# create_all raises NoReferencedTableError on the tasks_items FK.
+# Register ALL tables (FK chain Tenant→…→StepExecutionLedger + tasks_items'
+# checklists.id FK target) before create_all. db.models.__init__ now imports
+# checklists (issue #86), so importing the package is sufficient.
 from sreda.db.base import Base
-import sreda.db.models  # noqa: F401 — registers core tables
-import sreda.db.models.checklists  # noqa: F401 — registers checklists table (FK target for tasks)
-import sreda.db.models.planner  # noqa: F401 — registers planner tables
+import sreda.db.models  # noqa: F401 — registers all ORM tables incl. checklists
+import sreda.db.models.planner  # noqa: F401 — PlannerExecution, StepExecutionLedger
 
 from sreda.db.models import (
     AgentRun,

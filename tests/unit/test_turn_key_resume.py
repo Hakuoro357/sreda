@@ -22,8 +22,7 @@ from sqlalchemy.pool import StaticPool
 
 # Register ALL tables so FK targets are present in Base.metadata.
 from sreda.db.base import Base
-import sreda.db.models  # noqa: F401 — registers core tables (Tenant, AgentRun …)
-import sreda.db.models.checklists  # noqa: F401 — tasks_items FKs checklists.id (not in __init__ yet)
+import sreda.db.models  # noqa: F401 — registers all ORM tables incl. checklists (#86)
 import sreda.db.models.planner  # noqa: F401 — registers planner tables
 
 from sreda.db.models import (

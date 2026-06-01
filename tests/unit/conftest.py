@@ -263,12 +263,11 @@ def _test_engine():
 
     from sreda.db.base import Base
 
-    import sreda.db.models  # noqa: F401 — registers core tables
+    import sreda.db.models  # noqa: F401 — registers core tables (incl. checklists, #86)
     # These sub-modules are NOT imported by ``sreda.db.models.__init__``,
     # so their tables would be missing from ``Base.metadata`` unless we
-    # import them explicitly here.
+    # import them explicitly here. (checklists IS now in __init__ — issue #86.)
     import sreda.db.models.audit  # noqa: F401
-    import sreda.db.models.checklists  # noqa: F401
     import sreda.db.models.free_tier  # noqa: F401
     import sreda.db.models.reply_buttons  # noqa: F401
 

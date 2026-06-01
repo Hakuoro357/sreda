@@ -8,6 +8,7 @@ from sreda.db.models.billing import (
     TenantSubscription,
 )
 from sreda.db.models.channel_linking import ChannelLinkToken
+from sreda.db.models.checklists import Checklist, ChecklistItem
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.conversation_turns import ConversationTurn
 from sreda.db.models.core import (
@@ -67,6 +68,9 @@ __all__ = [
     "AuditOutboxEvent",
     "Assistant",
     "AssistantMemory",
+    "ChannelLinkToken",
+    "Checklist",
+    "ChecklistItem",
     "ConnectSession",
     "ConversationTurn",
     "PaymentOrder",
