@@ -170,6 +170,25 @@ no-retry mode); 2 = after one explicit retry. Default branch covers
 non-2 values (no validation crash; honest message)."""
 
 
+# ---------------------------------------------------------------------------
+# Conversational / identity — rot-enablement Phase 1 (issue #88)
+# ---------------------------------------------------------------------------
+
+# Deterministic witty reply for «кто ты / на каком LLM / что ты за модель»
+# questions. MUST NOT name the real model/provider (MiMo, OpenAI, Anthropic,
+# GPT, Claude, Qwen, mimo — case-insensitive denylist tested in
+# test_planner_schemas_reply_only.py::test_identity_template_denylist).
+# Reliable and cheap — no LLM call, can't hallucinate the real model.
+# Per R2 decision: deterministic template preferred over LLM for identity.
+_IDENTITY_PLAYFUL = (
+    "Я Среда — твоя помощница по дому и делам 🏠✨ "
+    "Слежу за списком покупок, напоминаниями, рецептами и всем, "
+    "что нужно по хозяйству.\n\n"
+    "А что у меня «под капотом» — маленький секрет 😄 "
+    "Скажем так: магия и немного технологий."
+)
+
+
 HOUSEWIFE_TEMPLATES: dict[str, str] = {
     # shopping
     "shopping_added_ok": _SHOPPING_ADDED_OK,
@@ -193,6 +212,8 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     "partial_with_compose_error": _PARTIAL_WITH_COMPOSE_ERROR,
     # Sub-A12 Phase B.1 — planner-side invalid-plan fallback
     "invalid_plan_fallback": _INVALID_PLAN_FALLBACK,
+    # rot-enablement Phase 1 (issue #88) — conversational / identity
+    "identity_playful": _IDENTITY_PLAYFUL,
 }
 
 

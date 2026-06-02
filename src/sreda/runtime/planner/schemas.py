@@ -17,7 +17,7 @@ Plan-level validation responsibilities live in ``Plan._validate_graph``:
 - ``depends_on`` must form a DAG (no cycles)
 - ``expected_outcomes[].next`` must point at existing action ids
 
-Two operating modes for a Plan (vex-assistant#77 item #2 — clarity):
+Three operating modes for a Plan (vex-assistant#77 item #2 — clarity):
 
   ``clarity='clear'`` (default) — normal execution plan. ``actions``
     MUST be non-empty; the validator + executor run the DAG.
@@ -27,6 +27,18 @@ Two operating modes for a Plan (vex-assistant#77 item #2 — clarity):
     or partially filled (mixed: do what's safe, ask about the rest).
     Executor renders ``compose`` directly without dispatching tools
     when ``actions`` is empty.
+  ``clarity='reply_only'`` — conversational reply mode (issue #88
+    rot-enablement Phase 1). ``actions`` MUST be empty; ``compose``
+    MUST be ``kind='llm'`` with ``llm_prompt_key`` in
+    ``CONVERSATIONAL_LLM_PROMPT_KEYS`` OR ``kind='template'`` with
+    ``template_id`` in ``CONVERSATIONAL_TEMPLATE_IDS``. Used for
+    greetings, chit-chat, and identity questions where no tool call is
+    needed and the reply comes entirely from a conversational prompt or
+    deterministic template. This is the ONLY mode where 0 actions is
+    valid for a non-clarification path. NOTE: semantic misclassification
+    (e.g. "добавь молоко" emitted as reply_only) is a planner-prompt
+    concern (Phase 3), not a schema concern — the schema only enforces
+    shape (0 actions + conversational compose target).
 """
 
 from __future__ import annotations
@@ -61,6 +73,39 @@ CLARIFICATION_TEMPLATE_IDS: frozenset[str] = frozenset({
     "ask_when_to_remind",
     "partial_with_clarification",
 })
+
+
+CONVERSATIONAL_LLM_PROMPT_KEYS: frozenset[str] = frozenset({
+    "smalltalk",
+})
+"""LLM prompt keys valid for ``clarity='reply_only'`` compose.
+
+These are the ONLY ``llm_prompt_key`` values that may appear in a
+``reply_only`` plan. Any other key (e.g. ``recipe_narrative``,
+``multi_action_summary``, ``identity``) implies tool results need to
+be narrated OR is better served by the deterministic template path.
+Single source of truth: CI test asserts this set matches the
+conversational keys registered in ``llm_prompts_housewife.py``.
+
+Note: the identity LLM path (``_IDENTITY`` spec) is deliberately NOT
+in this set. The deterministic ``identity_playful`` template (in
+``CONVERSATIONAL_TEMPLATE_IDS``) is the canonical identity reply —
+cheaper, reliable, and guaranteed never to leak the real model name.
+The ``_IDENTITY`` LLM spec remains unregistered in ``CONVERSATIONAL``
+so no plan can point at it. See FIX 4, rot-enablement Phase 1 R1.
+"""
+
+
+CONVERSATIONAL_TEMPLATE_IDS: frozenset[str] = frozenset({
+    "identity_playful",
+})
+"""Template IDs valid for ``clarity='reply_only'`` compose.
+
+Deterministic templates (no LLM call) that are valid conversational
+compose targets. ``identity_playful`` is the reliable witty reply for
+«кто ты / на каком LLM» — cheaper and more reliable than an LLM call,
+and guaranteed to never leak the real model name.
+"""
 """Composer templates that are valid for ``clarity='needs_clarification'``.
 
 Codex Sub-A-77 #2 R1 MAJOR #2 — without an allowlist, planner could
@@ -158,6 +203,46 @@ def _is_non_blank_string(value: object) -> bool:
     stripped form must be non-empty.
     """
     return isinstance(value, str) and bool(value.strip())
+
+
+def _reject_conversational_compose(
+    compose: "ComposerCall",
+    location: str,
+) -> None:
+    """Raise ``ValueError`` if ``compose`` targets a conversational endpoint.
+
+    Conversational compose targets (``CONVERSATIONAL_LLM_PROMPT_KEYS`` and
+    ``CONVERSATIONAL_TEMPLATE_IDS``) are ONLY valid for ``reply_only``
+    plan-level compose. Using them anywhere else — in ``clear`` /
+    ``needs_clarification`` plan-level compose, or in any branch-level
+    compose — would run actions and then render a conversational reply that
+    ignores the tool results (mis-routing loophole, rot-enablement Phase 1
+    R1 FIX 1).
+
+    Called from ``Plan._validate_clarity`` for:
+    - plan-level compose when clarity != 'reply_only'
+    - every expected_outcomes[i].compose regardless of clarity
+    """
+    if compose.kind == "llm":
+        key = compose.llm_prompt_key
+        if key in CONVERSATIONAL_LLM_PROMPT_KEYS:
+            raise ValueError(
+                f"{location}: llm_prompt_key={key!r} is a conversational "
+                f"target and is only valid for clarity='reply_only' at the "
+                f"plan level. Using it with actions present (or in a branch "
+                f"compose) would discard tool results. Use a non-conversational "
+                f"LLM prompt key or a result-aware template instead."
+            )
+    elif compose.kind == "template":
+        tid = compose.template_id
+        if tid in CONVERSATIONAL_TEMPLATE_IDS:
+            raise ValueError(
+                f"{location}: template_id={tid!r} is a conversational "
+                f"target and is only valid for clarity='reply_only' at the "
+                f"plan level. Using it with actions present (or in a branch "
+                f"compose) would discard tool results. Use a result-aware "
+                f"template instead."
+            )
 
 
 class TurnClassification(BaseModel):
@@ -273,7 +358,7 @@ class Plan(BaseModel):
 
     schema_version: int = 1
     turn_classification: TurnClassification
-    clarity: Literal["clear", "needs_clarification"] = "clear"
+    clarity: Literal["clear", "needs_clarification", "reply_only"] = "clear"
     clarity_reason: str | None = Field(default=None, max_length=500)
     # NOT ``min_length=1`` — clarity='needs_clarification' allows empty
     # actions (pure ask path). The clear-vs-needs_clarification consistency
@@ -306,14 +391,76 @@ class Plan(BaseModel):
         either left the user with the generic fallback opener).
         Caller can still override by setting their own value in
         ``template_data`` — auto-merge is soft default, not magic.
+
+        INVERSE MIS-ROUTING GUARD (rot-enablement Phase 1 R1 FIX 1):
+        Conversational compose targets (``CONVERSATIONAL_LLM_PROMPT_KEYS``
+        + ``CONVERSATIONAL_TEMPLATE_IDS``) are ONLY valid when
+        ``clarity='reply_only'`` at the PLAN level. Using them in a
+        ``clear`` or ``needs_clarification`` plan would execute actions
+        and then render a conversational reply that ignores tool results.
+        Additionally, branch-level ``compose`` (inside
+        ``expected_outcomes``) must never target a conversational compose
+        regardless of plan-level clarity, since branches fire AFTER tools
+        have run.
         """
         if self.clarity == "clear" and len(self.actions) == 0:
             raise ValueError(
                 "Plan(clarity='clear') requires at least one action. "
                 "If the planner has nothing to do, set "
                 "clarity='needs_clarification' with a clarity_reason "
-                "explaining what to ask the user."
+                "explaining what to ask the user, or clarity='reply_only' "
+                "if this is a conversational reply (greeting/chit-chat/"
+                "identity) with no tool calls needed."
             )
+        # INVERSE MIS-ROUTING: conversational targets must NOT appear in
+        # non-reply_only plan-level compose.
+        if self.clarity in ("clear", "needs_clarification"):
+            _reject_conversational_compose(
+                compose=self.compose,
+                location=f"Plan(clarity={self.clarity!r}).compose",
+            )
+        # Branch-level composes are ALWAYS non-conversational (they fire
+        # after tool execution, regardless of plan-level clarity).
+        for action_id, action in self.actions.items():
+            for i, branch in enumerate(action.expected_outcomes):
+                if branch.compose is not None:
+                    _reject_conversational_compose(
+                        compose=branch.compose,
+                        location=(
+                            f"Plan.actions[{action_id!r}]"
+                            f".expected_outcomes[{i}].compose"
+                        ),
+                    )
+        if self.clarity == "reply_only":
+            # reply_only: 0 actions, conversational compose target only.
+            if len(self.actions) > 0:
+                raise ValueError(
+                    f"Plan(clarity='reply_only') must have empty actions "
+                    f"(got {len(self.actions)} action(s)). reply_only is for "
+                    f"conversational replies (greetings, chit-chat, identity) "
+                    f"that require no tool calls. If you need to call a tool, "
+                    f"use clarity='clear' instead."
+                )
+            # compose must target a valid conversational endpoint
+            if self.compose.kind == "llm":
+                key = self.compose.llm_prompt_key
+                if key not in CONVERSATIONAL_LLM_PROMPT_KEYS:
+                    raise ValueError(
+                        f"Plan(clarity='reply_only') requires compose.llm_prompt_key "
+                        f"in {sorted(CONVERSATIONAL_LLM_PROMPT_KEYS)}. "
+                        f"Got llm_prompt_key={key!r}. Non-conversational LLM prompts "
+                        f"(e.g. recipe_narrative, multi_action_summary) require tool "
+                        f"results — use clarity='clear' with actions instead."
+                    )
+            elif self.compose.kind == "template":
+                tid = self.compose.template_id
+                if tid not in CONVERSATIONAL_TEMPLATE_IDS:
+                    raise ValueError(
+                        f"Plan(clarity='reply_only') with compose.kind='template' "
+                        f"requires template_id in {sorted(CONVERSATIONAL_TEMPLATE_IDS)}. "
+                        f"Got template_id={tid!r}. Only deterministic conversational "
+                        f"templates are valid for reply_only."
+                    )
         if self.clarity == "needs_clarification":
             if self.clarity_reason is None or not self.clarity_reason.strip():
                 raise ValueError(
@@ -543,6 +690,9 @@ def _detect_cycle_in_depends_on(actions: dict[str, Action]) -> set[str]:
 
 __all__ = [
     "Action",
+    "CLARIFICATION_TEMPLATE_IDS",
+    "CONVERSATIONAL_LLM_PROMPT_KEYS",
+    "CONVERSATIONAL_TEMPLATE_IDS",
     "ComposerCall",
     "OutcomeBranch",
     "Plan",

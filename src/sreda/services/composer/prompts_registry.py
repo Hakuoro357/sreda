@@ -24,10 +24,27 @@ from __future__ import annotations
 
 import hashlib
 
+from sreda.services.composer_contracts import validate_humanize_result_payload
 from sreda.services.composer.llm_prompts_housewife import (
     HOUSEWIFE_LLM_PROMPTS,
     LLMPromptSpec,
 )
+
+
+def _validate_humanize_result_data(data: dict[str, object]) -> None:
+    """Enforce the strict data contract for ``humanize_result`` at runtime.
+
+    Raises ``ComposerInputError`` on any violation.  Delegates to the
+    shared ``validate_humanize_result_payload`` with ``allow_refs=False``
+    (all values are fully resolved at runtime — no unresolved ``${...}``
+    refs should remain).
+
+    Called from ``LLMPromptRegistry.validate_data`` after the standard
+    required-keys check passes.
+    """
+    errors = validate_humanize_result_payload(data, allow_refs=False)
+    if errors:
+        raise ComposerInputError(" | ".join(errors))
 
 
 class UnknownLLMPromptError(KeyError):
@@ -90,6 +107,16 @@ class LLMPromptRegistry:
         "Blank" = None, empty string, empty list/dict. A required field
         present but empty is as useless to the narrator as an absent
         one — both invite gap-filling.
+
+        For ``humanize_result`` an additional STRICT data contract is
+        enforced (rot-enablement Phase 1 R1 FIX 3):
+
+        - Only ``{intent, actions}`` are allowed at the top level; any
+          extra key is rejected to prevent PII / internal fields
+          (execution ids, raw errors, tool names) from reaching the LLM.
+        - Each item in ``actions`` must be exactly
+          ``{user_visible_summary: str (non-empty), status: str (non-empty)}``.
+          Raw fields like ``tool``, ``execution_id``, ``error`` are rejected.
         """
         spec = self.get(llm_prompt_key)
         missing: list[str] = []
@@ -109,6 +136,9 @@ class LLMPromptRegistry:
                 f"llm_prompt_key={llm_prompt_key!r} missing/blank required "
                 f"data keys: {missing}. Present keys: {sorted(data.keys())}"
             )
+        # Per-key strict data contract checks.
+        if llm_prompt_key == "humanize_result":
+            _validate_humanize_result_data(data)
 
     def prompt_keys(self) -> list[str]:
         """Sorted registered keys — builds the planner allowlist block +

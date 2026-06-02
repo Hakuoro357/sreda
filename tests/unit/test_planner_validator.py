@@ -1975,3 +1975,304 @@ def test_catch_all_last_in_three_branches_ok() -> None:
     ])
     violations = validate_plan(plan, _ALLOWLIST_REGISTRY)
     assert not [v for v in violations if v.code == "misplaced_catch_all_branch"]
+
+
+# ---------------------------------------------------------------------------
+# Phase-B humanize_result key-allowlist (rot-enablement Phase 1 Codex R2
+# MAJOR) — validate_plan MUST reject a clear plan whose
+# compose.llm_prompt_key='humanize_result' carries extra/internal keys
+# BEFORE execution (side effects are committed on execute, compose fails
+# late — the window this check closes).
+# ---------------------------------------------------------------------------
+
+_HR_ALLOWLIST_KEYS = frozenset({"humanize_result"})
+
+
+def _plan_hr_compose(template_data: dict) -> Plan:
+    """Clear single-action plan with a root humanize_result LLM compose."""
+    return Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={"s1": _action("add_shopping_items", {"items": ["x"]})},
+        compose=ComposerCall(
+            kind="llm",
+            llm_prompt_key="humanize_result",
+            template_data=template_data,
+        ),
+    )
+
+
+def test_humanize_result_valid_static_actions_passes_phase_b() -> None:
+    """Well-formed {intent, actions:[{user_visible_summary, status}]} passes."""
+    plan = _plan_hr_compose({
+        "intent": "додати покупки",
+        "actions": [
+            {"user_visible_summary": "Додано 3 товари", "status": "ok"},
+        ],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [
+        v for v in violations
+        if v.code in ("humanize_result_extra_top_keys", "humanize_result_extra_action_keys")
+    ]
+    assert not bad, f"Unexpected violations: {bad}"
+
+
+def test_humanize_result_extra_top_key_rejected_phase_b() -> None:
+    """Extra top-level key (execution_id) is rejected at Phase B."""
+    plan = _plan_hr_compose({
+        "intent": "додати покупки",
+        "actions": [{"user_visible_summary": "Додано", "status": "ok"}],
+        "execution_id": "abc-123",  # internal field — must be rejected
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_extra_top_keys"]
+    assert bad, "Expected humanize_result_extra_top_keys violation"
+    assert "execution_id" in bad[0].message
+
+
+def test_humanize_result_extra_action_key_rejected_phase_b() -> None:
+    """Action item with extra key (tool) is rejected at Phase B."""
+    plan = _plan_hr_compose({
+        "intent": "оновити список",
+        "actions": [
+            {
+                "user_visible_summary": "Оновлено",
+                "status": "ok",
+                "tool": "add_shopping_items",  # raw internal field — must be rejected
+            }
+        ],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_extra_action_keys"]
+    assert bad, "Expected humanize_result_extra_action_keys violation"
+    assert "tool" in bad[0].message
+    assert "[0]" in bad[0].message
+
+
+def test_humanize_result_action_error_key_rejected_phase_b() -> None:
+    """Action item with 'error' key is rejected at Phase B."""
+    plan = _plan_hr_compose({
+        "intent": "запит",
+        "actions": [
+            {
+                "user_visible_summary": "Помилка",
+                "status": "error",
+                "error": "timeout",  # must not reach LLM
+            }
+        ],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_extra_action_keys"]
+    assert bad, "Expected humanize_result_extra_action_keys violation"
+    assert "error" in bad[0].message
+
+
+def test_humanize_result_ref_string_actions_skips_item_check() -> None:
+    """When actions is an unresolved ref string, per-item check is skipped
+    (value resolves post-execution), but top-level allowlist is still enforced."""
+    plan = _plan_hr_compose({
+        "intent": "виконати",
+        "actions": "${s1.result_items}",  # unresolved ref — not a list yet
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    # No per-item violation expected (actions is a ref, not an inspectable list)
+    bad = [v for v in violations if v.code == "humanize_result_extra_action_keys"]
+    assert not bad, f"Unexpected item violations for ref-string actions: {bad}"
+    # Top-level check still runs: no extra top-level keys → no top-level violation
+    top_bad = [v for v in violations if v.code == "humanize_result_extra_top_keys"]
+    assert not top_bad
+
+
+def test_humanize_result_extra_top_key_still_caught_with_ref_actions() -> None:
+    """Extra top-level key is rejected even when actions is a ref string."""
+    plan = _plan_hr_compose({
+        "intent": "виконати",
+        "actions": "${s1.result_items}",
+        "execution_id": "xyz",  # disallowed regardless of actions being a ref
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_extra_top_keys"]
+    assert bad, "Expected humanize_result_extra_top_keys even with ref-string actions"
+    assert "execution_id" in bad[0].message
+
+
+def test_humanize_result_check_runs_without_llm_prompt_required_keys() -> None:
+    """The key-allowlist check is NOT gated on llm_prompt_required_keys being
+    provided — it runs whenever llm_prompt_key == 'humanize_result'."""
+    plan = _plan_hr_compose({
+        "intent": "тест",
+        "actions": [{"user_visible_summary": "x", "status": "ok", "tool": "boom"}],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+        llm_prompt_required_keys=None,  # explicitly omitted
+    )
+    bad = [v for v in violations if v.code == "humanize_result_extra_action_keys"]
+    assert bad, "Key-allowlist check must run even when llm_prompt_required_keys=None"
+
+
+# ---------------------------------------------------------------------------
+# Phase-B humanize_result FULL static contract (rot-enablement Phase 1 Codex
+# R3 MAJOR) — single source of truth, all structural rules enforced at plan
+# time, not just extra-key check.
+# ---------------------------------------------------------------------------
+
+
+def _validate_hr(template_data: dict) -> list:  # type: ignore[type-arg]
+    """Run validate_plan for a root humanize_result compose and return
+    all humanize_result-prefixed violations."""
+    plan = _plan_hr_compose(template_data)
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    return [v for v in violations if v.code.startswith("humanize_result")]
+
+
+def test_hr_static_missing_status_rejected_phase_b() -> None:
+    """actions=[{user_visible_summary only}] — missing status is rejected."""
+    violations = _validate_hr({
+        "intent": "тест",
+        "actions": [{"user_visible_summary": "Зроблено"}],
+    })
+    assert violations, "Expected violation for missing status"
+    codes = [v.code for v in violations]
+    assert any("missing" in c or "action" in c for c in codes), codes
+
+
+def test_hr_static_extra_key_on_item_rejected_phase_b() -> None:
+    """actions=[{user_visible_summary, status, tool}] — extra item key rejected."""
+    violations = _validate_hr({
+        "intent": "тест",
+        "actions": [{"user_visible_summary": "x", "status": "ok", "tool": "boom"}],
+    })
+    bad = [v for v in violations if v.code == "humanize_result_extra_action_keys"]
+    assert bad, "Expected humanize_result_extra_action_keys"
+    assert "tool" in bad[0].message
+
+
+def test_hr_static_non_dict_item_rejected_phase_b() -> None:
+    """actions=[42] — non-dict item is rejected."""
+    violations = _validate_hr({
+        "intent": "тест",
+        "actions": [42],
+    })
+    assert violations, "Expected violation for non-dict action item"
+    codes = [v.code for v in violations]
+    assert any("not_dict" in c or "action" in c for c in codes), codes
+
+
+def test_hr_static_non_list_non_ref_actions_rejected_phase_b() -> None:
+    """actions='not-a-ref' — non-list, non-ref string is rejected."""
+    violations = _validate_hr({
+        "intent": "тест",
+        "actions": "not-a-ref",
+    })
+    assert violations, "Expected violation for non-list non-ref actions"
+    codes = [v.code for v in violations]
+    assert any("list" in c or "action" in c for c in codes), codes
+
+
+def test_hr_static_empty_list_actions_rejected_phase_b() -> None:
+    """actions=[] — empty list is rejected."""
+    violations = _validate_hr({
+        "intent": "тест",
+        "actions": [],
+    })
+    assert violations, "Expected violation for empty actions list"
+    codes = [v.code for v in violations]
+    assert any("list" in c or "action" in c for c in codes), codes
+
+
+def test_hr_static_blank_status_rejected_phase_b() -> None:
+    """actions=[{user_visible_summary, status=''}] — blank status rejected."""
+    violations = _validate_hr({
+        "intent": "тест",
+        "actions": [{"user_visible_summary": "ok text", "status": ""}],
+    })
+    assert violations, "Expected violation for blank status"
+    codes = [v.code for v in violations]
+    assert any("action" in c or "invalid" in c for c in codes), codes
+
+
+def test_hr_branch_compose_malformed_extra_key_rejected_phase_b() -> None:
+    """expected_outcomes[].compose with humanize_result + extra item key is
+    rejected at Phase B (branch compose, not root compose)."""
+    plan = Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={"s1": Action(
+            tool="add_shopping_items",
+            args={"items": ["x"]},
+            expected_outcomes=[
+                OutcomeBranch(
+                    match={"status": "ok"},
+                    compose=ComposerCall(
+                        kind="llm",
+                        llm_prompt_key="humanize_result",
+                        template_data={
+                            "intent": "додати",
+                            "actions": [
+                                {
+                                    "user_visible_summary": "Зроблено",
+                                    "status": "ok",
+                                    "execution_id": "123",  # disallowed
+                                }
+                            ],
+                        },
+                    ),
+                ),
+            ],
+        )},
+        compose=ComposerCall(
+            kind="llm",
+            llm_prompt_key="humanize_result",
+            template_data={"intent": "root", "actions": [{"user_visible_summary": "x", "status": "ok"}]},
+        ),
+    )
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_extra_action_keys"]
+    assert bad, "Branch compose must also enforce per-item key allowlist"
+    assert "execution_id" in bad[0].message
+
+
+def test_hr_ref_string_actions_passes_phase_b() -> None:
+    """actions='${s1.x}' (full ref) with allow_refs=True → accepted at Phase B."""
+    violations = _validate_hr({
+        "intent": "виконати",
+        "actions": "${s1.result_items}",
+    })
+    assert not violations, f"Full-ref actions must pass Phase B: {violations}"
+
+
+def test_hr_well_formed_static_passes_phase_b() -> None:
+    """Well-formed static payload passes all Phase-B checks."""
+    violations = _validate_hr({
+        "intent": "замовити продукти",
+        "actions": [
+            {"user_visible_summary": "Додано молоко", "status": "ok"},
+            {"user_visible_summary": "Хліб вже є", "status": "duplicate"},
+        ],
+    })
+    assert not violations, f"Well-formed payload must pass: {violations}"

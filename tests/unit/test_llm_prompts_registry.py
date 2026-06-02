@@ -189,6 +189,12 @@ def test_default_registry_covers_expected_housewife_keys() -> None:
         "recipe_added_to_shopping_narrative",
         "multi_action_summary",
         "cooking_explanation",
+        # rot-enablement Phase 1 (issue #88)
+        # NOTE: "identity" LLM key intentionally NOT registered — the
+        # deterministic identity_playful template is the canonical path
+        # (FIX 4, Phase 1 R1).
+        "smalltalk",
+        "humanize_result",
     }
     assert set(LLM_PROMPT_REGISTRY.prompt_keys()) == expected
 
@@ -199,10 +205,23 @@ def test_default_registry_matches_housewife_prompts_dict() -> None:
 
 
 def test_every_prompt_has_anti_fabrication_guard() -> None:
-    """Every prompt's system text MUST carry the «только факты из ДАННЫХ»
-    guard — the LLM-path's one defense against додумывание. A prompt
-    without it is a latent hallucination hole."""
+    """Every data-grounded prompt's system text MUST carry the «только факты
+    из ДАННЫХ» guard — the LLM-path's one defense against додумывание.
+
+    Exception: conversational prompts (``smalltalk``, ``identity``) have NO
+    ДАННЫЕ block — they operate from persona alone. Requiring the guard
+    there would be nonsensical («опирайся на факты из блока ДАННЫЕ» when
+    ДАННЫЕ is absent). They are explicitly exempt; their hallucination
+    surface is bounded by having no structured input to distort.
+    """
+    # Conversational prompts operate from persona alone — no ДАННЫЕ block.
+    # The anti-fabrication guard is inapplicable and intentionally absent.
+    # NOTE: "identity" LLM key is no longer registered (FIX 4, Phase 1 R1)
+    # so it won't appear in HOUSEWIFE_LLM_PROMPTS iteration below.
+    _CONVERSATIONAL_EXEMPT = frozenset({"smalltalk"})
     for key, spec in HOUSEWIFE_LLM_PROMPTS.items():
+        if key in _CONVERSATIONAL_EXEMPT:
+            continue
         low = spec.system_prompt.lower()
         assert "только на факты" in low, (
             f"prompt {key!r} missing anti-fabrication guard"
@@ -210,6 +229,93 @@ def test_every_prompt_has_anti_fabrication_guard() -> None:
         assert "ничего не придумывай" in low, (
             f"prompt {key!r} missing 'ничего не придумывай' instruction"
         )
+
+
+# ---------------------------------------------------------------------------
+# humanize_result runtime contract (validate_data delegates to the shared
+# validate_humanize_result_payload with allow_refs=False — full enforcement)
+# ---------------------------------------------------------------------------
+
+
+def _hr_reg() -> LLMPromptRegistry:
+    """Registry with only humanize_result registered (uses the real housewife
+    spec so required_keys are intact)."""
+    from sreda.services.composer.llm_prompts_housewife import HOUSEWIFE_LLM_PROMPTS
+    reg = LLMPromptRegistry()
+    reg.register("humanize_result", HOUSEWIFE_LLM_PROMPTS["humanize_result"])
+    return reg
+
+
+def test_hr_runtime_well_formed_passes() -> None:
+    """Well-formed payload validates without error at runtime."""
+    _hr_reg().validate_data("humanize_result", {
+        "intent": "замовити продукти",
+        "actions": [{"user_visible_summary": "Молоко додано", "status": "ok"}],
+    })
+
+
+def test_hr_runtime_missing_status_raises() -> None:
+    """actions=[{user_visible_summary only}] → ComposerInputError at runtime."""
+    with pytest.raises(ComposerInputError, match="status"):
+        _hr_reg().validate_data("humanize_result", {
+            "intent": "тест",
+            "actions": [{"user_visible_summary": "Зроблено"}],
+        })
+
+
+def test_hr_runtime_extra_item_key_raises() -> None:
+    """actions=[{user_visible_summary, status, tool}] → ComposerInputError."""
+    with pytest.raises(ComposerInputError, match="tool"):
+        _hr_reg().validate_data("humanize_result", {
+            "intent": "тест",
+            "actions": [{"user_visible_summary": "x", "status": "ok", "tool": "boom"}],
+        })
+
+
+def test_hr_runtime_non_dict_item_raises() -> None:
+    """actions=[42] → ComposerInputError."""
+    with pytest.raises(ComposerInputError):
+        _hr_reg().validate_data("humanize_result", {
+            "intent": "тест",
+            "actions": [42],
+        })
+
+
+def test_hr_runtime_non_list_actions_raises() -> None:
+    """actions='not-a-ref' → ComposerInputError (not a list)."""
+    with pytest.raises(ComposerInputError, match="non-empty list"):
+        _hr_reg().validate_data("humanize_result", {
+            "intent": "тест",
+            "actions": "not-a-ref",
+        })
+
+
+def test_hr_runtime_empty_list_actions_raises() -> None:
+    """actions=[] → ComposerInputError (caught as blank required key or non-empty list)."""
+    with pytest.raises(ComposerInputError):
+        _hr_reg().validate_data("humanize_result", {
+            "intent": "тест",
+            "actions": [],
+        })
+
+
+def test_hr_runtime_blank_status_raises() -> None:
+    """actions=[{user_visible_summary, status=''}] → ComposerInputError."""
+    with pytest.raises(ComposerInputError, match="status"):
+        _hr_reg().validate_data("humanize_result", {
+            "intent": "тест",
+            "actions": [{"user_visible_summary": "ok", "status": ""}],
+        })
+
+
+def test_hr_runtime_extra_top_key_raises() -> None:
+    """Extra top-level key → ComposerInputError at runtime."""
+    with pytest.raises(ComposerInputError, match="execution_id"):
+        _hr_reg().validate_data("humanize_result", {
+            "intent": "тест",
+            "actions": [{"user_visible_summary": "x", "status": "ok"}],
+            "execution_id": "abc",
+        })
 
 
 def test_cooking_explanation_requires_facts_not_just_question() -> None:

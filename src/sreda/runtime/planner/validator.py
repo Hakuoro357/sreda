@@ -103,6 +103,7 @@ from sreda.runtime.planner.interpolation import (
     iter_refs,
 )
 from sreda.runtime.planner.schemas import Action, Plan
+from sreda.services.composer_contracts import validate_humanize_result_payload
 from sreda.services.tool_schemas.base import ToolSpec
 
 
@@ -1937,6 +1938,45 @@ def _check_composer_allowlist(
                                 f"Present: {sorted(data.keys())}"
                             ),
                         )
+            # Sub-A12 Phase E (rot-enablement Phase 1 Codex R3 MAJOR) —
+            # full static contract for humanize_result at PLAN time.
+            # Single source of truth: delegate to validate_humanize_result_payload
+            # with allow_refs=True so unresolved ${...} ref strings are
+            # accepted (they will be resolved post-execution). This enforces
+            # the COMPLETE contract (top-level keys, intent, actions shape,
+            # per-item keys, per-item value non-emptiness) BEFORE execution
+            # — not just the extra-key subset that the previous partial block
+            # checked. No duplication with the runtime path in prompts_registry
+            # (which calls the same function with allow_refs=False).
+            if key == "humanize_result":
+                template_data = compose.template_data or {}
+                for error_msg in validate_humanize_result_payload(
+                    template_data, allow_refs=True
+                ):
+                    # Map error messages to Violation codes so existing tests
+                    # (and the Phase-B allowlist contract) still match codes.
+                    if "disallowed top-level keys" in error_msg:
+                        code = "humanize_result_extra_top_keys"
+                    elif "disallowed\nkeys" in error_msg or "disallowed keys" in error_msg:
+                        code = "humanize_result_extra_action_keys"
+                    elif "must be a non-empty list" in error_msg:
+                        code = "humanize_result_actions_not_list"
+                    elif "must be a dict" in error_msg:
+                        code = "humanize_result_action_not_dict"
+                    elif "missing required key 'intent'" in error_msg:
+                        code = "humanize_result_missing_intent"
+                    elif "intent" in error_msg:
+                        code = "humanize_result_blank_intent"
+                    elif "is missing" in error_msg:
+                        code = "humanize_result_action_missing_key"
+                    else:
+                        code = "humanize_result_invalid_data"
+                    yield Violation(
+                        step_id=host_step_id,
+                        tool=None,
+                        code=code,
+                        message=f"{location}: {error_msg}",
+                    )
 
 
 def validate_plan(
