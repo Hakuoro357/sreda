@@ -288,7 +288,9 @@ def test_llm_path_without_composer_falls_through_to_generic_error() -> None:
         tenant_id="t_test", run_id="r_test"))
     assert res.fallback_used == "generic_error"
     assert res.error_code == "llm_composer_not_wired"
-    assert "llm_composer_not_wired" in res.text
+    # issue #88: diagnostic code stays in res.error_code (logs/triage), NOT in user text.
+    assert "llm_composer_not_wired" not in res.text
+    assert res.text  # clean canned generic message
     assert res.effective_llm_prompt_key == "recipe_narrative"
 
 
@@ -326,8 +328,9 @@ def test_llm_path_dispatches_to_injected_composer_with_ctx() -> None:
 
 
 def test_llm_composer_exception_falls_through_to_generic_error() -> None:
-    """LLM call raises → swallow + render generic_tool_error with
-    diagnostic code embedded."""
+    """LLM call raises → swallow + render generic_tool_error. The diagnostic
+    code lives in res.error_code (logs/triage), NOT in the user-facing text
+    (issue #88: no internal-detail leak to the user)."""
     def boom(**_: Any) -> str:
         raise RuntimeError("connection refused")
 
@@ -337,7 +340,8 @@ def test_llm_composer_exception_falls_through_to_generic_error() -> None:
                   ctx=ComposerContext(tenant_id="t_test", run_id="r_test"))
     assert res.fallback_used == "generic_error"
     assert res.error_code == "llm_composer_error:RuntimeError"
-    assert "llm_composer_error:RuntimeError" in res.text
+    assert "llm_composer_error:RuntimeError" not in res.text
+    assert res.text  # clean canned generic message
 
 
 def test_llm_path_requires_explicit_ctx_in_production() -> None:

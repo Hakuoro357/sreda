@@ -254,7 +254,7 @@ def test_render_ask_user_for_clarification_single_known_field() -> None:
             "missing_fields": ["time"],
         },
     )
-    assert "не указано время напоминания" in out
+    assert "не указано время напоминания" not in out  # issue #88: clarity_reason NOT leaked
     # Single field path doesn't use plural "пару моментов".
     assert "пару моментов" not in out
     assert "когда" in out
@@ -269,7 +269,7 @@ def test_render_ask_user_for_clarification_multiple_known_fields() -> None:
             "missing_fields": ["time", "recipient"],
         },
     )
-    assert "запрос двусмысленный" in out
+    assert "запрос двусмысленный" not in out  # issue #88: clarity_reason NOT leaked to user
     assert "пару моментов" in out
     assert "когда" in out
     assert "кому напомнить" in out
@@ -298,7 +298,7 @@ def test_render_ask_user_for_clarification_no_fields() -> None:
             "missing_fields": [],
         },
     )
-    assert "запрос непонятен" in out
+    assert "запрос непонятен" not in out  # issue #88: clarity_reason NOT leaked to user
     assert "подробнее" in out
 
 
@@ -313,7 +313,8 @@ def test_render_ask_user_for_clarification_no_reason() -> None:
             "missing_fields": ["time"],
         },
     )
-    assert "Не до конца поняла" in out
+    # issue #88: with missing_fields present, the ask is built from the
+    # structured field (no generic opener, no leaked clarity_reason).
     assert "когда" in out
 
 
@@ -343,7 +344,7 @@ def test_render_partial_with_clarification_full() -> None:
         },
     )
     assert "Сделала: добавила молоко в покупки" in out
-    assert "не указано время для напоминания" in out
+    assert "не указано время для напоминания" not in out  # issue #88: clarity_reason NOT leaked
     assert "когда" in out
 
 
@@ -372,7 +373,7 @@ def test_render_partial_with_clarification_clarify_only() -> None:
         },
     )
     assert "Сделала:" not in out
-    assert "не указано время" in out
+    assert "не указано время" not in out  # issue #88: clarity_reason NOT leaked
     assert "когда" in out
 
 
@@ -394,7 +395,9 @@ def test_render_partial_with_clarification_multiple_fields() -> None:
 
 def test_render_generic_tool_error() -> None:
     out = render("generic_tool_error", {"error_code": "internal"})
-    assert "internal" in out
+    # issue #88: error_code must NOT leak to the user — clean canned message only.
+    assert "internal" not in out
+    assert "Попробуй ещё раз" in out
 
 
 def test_render_partial_with_compose_error_with_summary() -> None:

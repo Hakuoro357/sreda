@@ -72,15 +72,15 @@ _RECIPE_NOT_FOUND_ASK_ALT = (
 # ---------------------------------------------------------------------------
 
 _ASK_USER_FOR_CLARIFICATION = (
-    # Codex 2026-05-26 MEDIUM (same gotcha as partial_with_compose_error):
-    # StrictUndefined raises on bare ``{% if x %}`` when ``x`` is
-    # missing from template_data entirely (not just falsy). Use
-    # ``is defined and`` so callers can legitimately omit
-    # ``clarity_reason`` / ``missing_fields`` without crashing.
-    "{% if clarity_reason is defined and clarity_reason %}"
-    "{{ clarity_reason }}.{% else %}Не до конца поняла запрос.{% endif %}"
+    # issue #88 Root-Cause-B: DO NOT echo the planner's internal
+    # ``clarity_reason`` to the user — it leaks as raw reasoning
+    # ("приветствие — не указано, чем могу помочь"). The user-facing ask is
+    # built from the structured ``missing_fields`` (rendered into friendly
+    # bullet prompts) plus a clean canned question. ``clarity_reason`` stays
+    # internal (logged / trace only), never rendered to the user.
+    # (StrictUndefined: use ``is defined and`` so callers may omit fields.)
     "{% if missing_fields is defined and missing_fields %}"
-    "\n\nУточни{% if missing_fields|length > 1 %} пару моментов{% endif %}:"
+    "Уточни{% if missing_fields|length > 1 %} пару моментов{% endif %}:"
     "{% for field in missing_fields %}"
     "{% if field == 'time' %}\n— когда (сегодня, завтра, конкретная дата + время)"
     "{% elif field == 'recipient' %}\n— кому напомнить (тебе или другому)"
@@ -90,7 +90,7 @@ _ASK_USER_FOR_CLARIFICATION = (
     "{% endif %}"
     "{% endfor %}"
     "{% else %}"
-    "\n\nСкажи чуть подробнее, что именно нужно?"
+    "Не до конца поняла запрос. Скажи чуть подробнее, что именно нужно?"
     "{% endif %}"
 )
 
@@ -104,12 +104,13 @@ _ASK_WHEN_TO_REMIND = (
 # would silently drop the acknowledgement of completed actions, leaving
 # the user wondering whether their request was processed.
 _PARTIAL_WITH_CLARIFICATION = (
+    # issue #88 Root-Cause-B: same fix as ask_user_for_clarification —
+    # never echo the internal ``clarity_reason`` to the user; build the ask
+    # from ``missing_fields`` + a clean canned line. Keep the done_summary ack.
     "{% if done_summary is defined and done_summary %}"
     "Сделала: {{ done_summary }}.\n\n"
     "{% endif %}"
-    "{% if clarity_reason is defined and clarity_reason %}"
-    "{{ clarity_reason }}.{% else %}"
-    "Не до конца поняла остальное.{% endif %}"
+    "Не до конца поняла остальное."
     "{% if missing_fields is defined and missing_fields %}"
     "\n\nУточни{% if missing_fields|length > 1 %} пару моментов{% endif %}:"
     "{% for field in missing_fields %}"
@@ -128,8 +129,11 @@ _PARTIAL_WITH_CLARIFICATION = (
 # ---------------------------------------------------------------------------
 
 _GENERIC_TOOL_ERROR = (
-    "Что-то пошло не так с моей внутренней логикой "
-    "({{ error_code }}). Попробуй ещё раз через минуту."
+    # issue #88 (Codex fix-B R1): do NOT leak the internal ``error_code``
+    # (e.g. "identity_question", "llm_composer_error:RuntimeError") to the
+    # user — it reads as a broken internal diagnostic. Render a clean canned
+    # message; ``error_code`` stays in ComposeResult / logs for triage.
+    "Ой, не получилось обработать запрос. Попробуй ещё раз через минуту."
 )
 
 _PARTIAL_WITH_COMPOSE_ERROR = (
