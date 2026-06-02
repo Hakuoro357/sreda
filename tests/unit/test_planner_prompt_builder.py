@@ -486,6 +486,54 @@ def test_few_shot_block_is_deterministic() -> None:
     assert b1 == b2
 
 
+# ---------------------------------------------------------------------------
+# Few-shot LLM-key gate (Codex rot-enablement #88 Phase-2 R1 MAJOR-1)
+# ---------------------------------------------------------------------------
+
+
+def test_few_shot_gate_off_drops_llm_examples() -> None:
+    """With an EMPTY effective LLM-key set, no ``kind='llm'`` example may be
+    shown — otherwise a gate-off run teaches the planner ``reply_only+smalltalk``
+    which the validator then rejects (greetings → invalid-plan fallback)."""
+    block = render_few_shot_block(effective_llm_keys=frozenset())
+    assert '"kind": "llm"' not in block
+    assert '"smalltalk"' not in block
+
+
+def test_few_shot_gate_on_keeps_smalltalk_example() -> None:
+    """When smalltalk IS enabled, the greeting LLM example is taught."""
+    block = render_few_shot_block(effective_llm_keys=frozenset({"smalltalk"}))
+    assert '"llm_prompt_key": "smalltalk"' in block
+
+
+def test_few_shot_gate_none_is_backcompat_full_render() -> None:
+    """Default (no gate) renders ALL examples, including the smalltalk LLM
+    one — back-compat for callers that don't gate (legacy tests)."""
+    full = render_few_shot_block()
+    assert '"llm_prompt_key": "smalltalk"' in full
+
+
+def test_few_shot_gate_drops_only_disabled_llm_examples() -> None:
+    """Gating off smalltalk must NOT drop template-only examples — only the
+    LLM example referencing the disabled key disappears."""
+    full = render_few_shot_block()
+    gated = render_few_shot_block(effective_llm_keys=frozenset())
+    # Template-only example content survives (e.g. shopping add).
+    assert "add_shopping_items" in full
+    assert "add_shopping_items" in gated
+    # But the smalltalk LLM example is gone.
+    assert '"smalltalk"' in full
+    assert '"smalltalk"' not in gated
+
+
+def test_few_shot_gate_is_deterministic_per_keyset() -> None:
+    """Stable per (keyset) — cache still hits when keys are fixed."""
+    k = frozenset({"smalltalk"})
+    assert render_few_shot_block(effective_llm_keys=k) == render_few_shot_block(
+        effective_llm_keys=k
+    )
+
+
 def test_few_shot_block_does_not_contain_real_pii() -> None:
     """Phase B.1 ships synthetic-only examples. Real Boris tenant or
     phone must not appear in committed code."""

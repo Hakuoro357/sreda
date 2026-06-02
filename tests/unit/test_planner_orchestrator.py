@@ -30,6 +30,7 @@ from sreda.runtime.planner.orchestrator import (
     run,
 )
 from sreda.runtime.planner.persistence import read_planner_pii
+from sreda.runtime.planner.few_shot_examples import render_few_shot_block
 from sreda.runtime.planner.prompt_builder import (
     NowMoment,
     ProfileSnapshot,
@@ -714,3 +715,96 @@ def test_llm_gate_drops_stale_key_not_in_registry(db_session: Session) -> None:
     ))
     db_session.commit()
     assert result.success is False
+
+
+# ---------------------------------------------------------------------------
+# Codex rot-enablement #88 Phase-2 R2 MAJOR-1 — few-shot gate is centralized
+# in run(): a caller that pre-rendered an UNGATED few-shot block must NOT
+# leak a kind='llm'/smalltalk example into the prompt when the effective
+# LLM-key set is empty. The orchestrator re-renders the few-shot gated.
+# ---------------------------------------------------------------------------
+
+
+def _ctx_with_few_shot(block: str, keys: tuple[str, ...]):
+    from sreda.runtime.planner.orchestrator import PlannerContext
+    base = _make_ctx()
+    return PlannerContext(**{
+        **base.__dict__,
+        "few_shot_block": block,
+        "composer_llm_prompt_keys": keys,
+    })
+
+
+def test_few_shot_gate_centralized_in_run_drops_smalltalk_when_disabled(
+    db_session: Session,
+) -> None:
+    """ctx.few_shot_block was pre-rendered UNGATED (full, contains smalltalk),
+    but no LLM key is effective (caller proposes none, settings enable none).
+    The prompt the orchestrator builds must contain NO smalltalk / kind='llm'
+    example — the gate is enforced centrally, not trusted from ctx."""
+    full_ungated = render_few_shot_block()  # contains smalltalk LLM example
+    # Precondition: the EXAMPLE (JSON form, leading-quote key) is present.
+    assert '"llm_prompt_key": "smalltalk"' in full_ungated
+    ctx = _ctx_with_few_shot(full_ungated, keys=())  # effective will be ()
+    factory = _make_session_factory(db_session)
+
+    captured: dict[str, str] = {}
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        captured["prompt"] = prompt
+        return _make_call_result(json.dumps(_make_valid_plan_payload()))
+
+    asyncio.run(run(
+        ctx, session_factory=factory, call_planner_fn=fake_call,
+        invalid_retry_enabled=False,
+        settings_factory=_settings_stub(set()),  # no keys enabled
+    ))
+    assert "prompt" in captured, "fake call_planner was not invoked"
+    # The few-shot EXAMPLE that teaches kind='llm'/smalltalk must be gone.
+    # (The prompt INSTRUCTIONS still mention smalltalk conditionally — that's
+    # the markdown form `llm_prompt_key: "smalltalk"` without a leading quote,
+    # which is fine; only the example JSON must be gated out.)
+    assert '"llm_prompt_key": "smalltalk"' not in captured["prompt"]
+    assert "### Пример" in captured["prompt"]  # other examples still render
+
+
+def test_few_shot_gate_centralized_in_run_keeps_smalltalk_when_enabled(
+    db_session: Session,
+) -> None:
+    """Counterpart: when smalltalk IS effective (proposed + settings-enabled),
+    the orchestrator-rendered few-shot DOES teach the smalltalk example."""
+    ctx = _ctx_with_few_shot("x", keys=("smalltalk",))  # truthy toggle
+    factory = _make_session_factory(db_session)
+
+    captured: dict[str, str] = {}
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        captured["prompt"] = prompt
+        return _make_call_result(json.dumps(_make_valid_plan_payload()))
+
+    asyncio.run(run(
+        ctx, session_factory=factory, call_planner_fn=fake_call,
+        invalid_retry_enabled=False,
+        settings_factory=_settings_stub({"smalltalk"}),
+    ))
+    assert '"llm_prompt_key": "smalltalk"' in captured["prompt"]
+
+
+def test_few_shot_toggle_off_yields_no_examples(db_session: Session) -> None:
+    """Falsy ctx.few_shot_block → no few-shot section rendered at all."""
+    ctx = _ctx_with_few_shot("", keys=("smalltalk",))
+    factory = _make_session_factory(db_session)
+
+    captured: dict[str, str] = {}
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        captured["prompt"] = prompt
+        return _make_call_result(json.dumps(_make_valid_plan_payload()))
+
+    asyncio.run(run(
+        ctx, session_factory=factory, call_planner_fn=fake_call,
+        invalid_retry_enabled=False,
+        settings_factory=_settings_stub({"smalltalk"}),
+    ))
+    # No curated example headers in the prompt.
+    assert "### Пример" not in captured["prompt"]

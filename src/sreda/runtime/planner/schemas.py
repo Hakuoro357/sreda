@@ -98,6 +98,7 @@ so no plan can point at it. See FIX 4, rot-enablement Phase 1 R1.
 
 CONVERSATIONAL_TEMPLATE_IDS: frozenset[str] = frozenset({
     "identity_playful",
+    "smalltalk_fallback",
 })
 """Template IDs valid for ``clarity='reply_only'`` compose.
 
@@ -105,6 +106,15 @@ Deterministic templates (no LLM call) that are valid conversational
 compose targets. ``identity_playful`` is the reliable witty reply for
 «кто ты / на каком LLM» — cheaper and more reliable than an LLM call,
 and guaranteed to never leak the real model name.
+
+``smalltalk_fallback`` is the deterministic warm greeting. It is the
+gate-OFF greeting path (Codex rot-enablement #88 Phase-2 R2 MAJOR): when
+the ``smalltalk`` LLM key is NOT in the effective allow-list, a pure
+greeting still has a clean, valid ``reply_only`` shape
+(``kind='template'`` + ``smalltalk_fallback``) instead of degrading to an
+invalid plan or an awkward clarification. When ``smalltalk`` IS enabled,
+the planner prefers the LLM ``smalltalk`` path; this template is also the
+runtime fallback the composer renders if that LLM call fails.
 """
 """Composer templates that are valid for ``clarity='needs_clarification'``.
 

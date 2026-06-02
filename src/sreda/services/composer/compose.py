@@ -39,8 +39,13 @@ What this owns
 
 5. **Failure fall-through** — UnknownTemplateError (race against
    registry deploy) and Jinja TemplateError surface as
-   ``partial_with_compose_error``. Missing ``llm_composer`` /
-   ``llm_composer`` raise / unsupported kind → ``generic_tool_error``.
+   ``partial_with_compose_error``. For ``kind='llm'`` failures (missing
+   ``llm_composer`` / ``llm_composer`` raise / blank output) the fallback
+   is per-key: a ``smalltalk`` reply_only turn falls through to the
+   deterministic ``smalltalk_fallback`` template with
+   ``fallback_used='conversational_fallback'`` (a clean warm reply, not the
+   error banner — Codex #88 R1 MINOR); any other LLM key (and unsupported
+   ``kind``) → ``generic_tool_error`` with ``fallback_used='generic_error'``.
    ``template_id`` missing on kind='template' → ``generic_tool_error``
    (Codex Phase D.1 R1 LOW #6 — invalid internal ComposerCall, not a
    registry race).
@@ -87,6 +92,13 @@ from sreda.services.composer.registry import (
     UnknownTemplateError,
 )
 
+# Per-type fallback template for conversational LLM failures.
+# When kind='llm' fails on a reply_only+smalltalk turn, fall through to a
+# deterministic warm greeting rather than generic_tool_error (Phase 2,
+# rot-enablement issue #88). Identity is already deterministic (template path).
+_SMALLTALK_PROMPT_KEY = "smalltalk"
+_SMALLTALK_LLM_FALLBACK_TEMPLATE = "smalltalk_fallback"
+
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +137,9 @@ class ComposerContext:
 # ---------------------------------------------------------------------------
 
 
-FallbackUsed = Literal[None, "compose_error", "generic_error"]
+FallbackUsed = Literal[
+    None, "compose_error", "generic_error", "conversational_fallback"
+]
 
 
 @dataclass(frozen=True)
@@ -151,7 +165,12 @@ class ComposeResult:
     fell through to ``partial_with_compose_error`` (UnknownTemplateError
     / TemplateError / ref-resolve failure / registry hash mismatch).
     ``'generic_error'`` = fell through to ``generic_tool_error``
-    (missing template_id / LLM composer not wired / unsupported kind)."""
+    (missing template_id / LLM composer not wired / unsupported kind).
+    ``'conversational_fallback'`` = a conversational reply_only LLM path
+    (e.g. smalltalk) failed and fell through to its per-type deterministic
+    template (``smalltalk_fallback``) — UX is a clean warm reply, NOT the
+    generic error banner; tracked distinctly so metrics don't conflate it
+    with a real tool-compose failure (Codex rot-enablement #88 R1 MINOR)."""
 
     error_code: str | None = None
     """Diagnostic identifier for the fallback path (e.g.
@@ -241,9 +260,14 @@ def compose(
         Defaults to module-level singleton. Tests inject a custom
         registry to verify failure paths.
     llm_composer :
-        Phase D.2 callable for ``kind='llm'``. If None, the LLM path
-        returns ``ComposeResult(fallback_used='generic_error')`` so
-        D.1 can ship without D.2 being wired.
+        Phase D.2 callable for ``kind='llm'``. If None (or it fails /
+        returns blank), the LLM path degrades:
+        - a ``smalltalk`` reply_only turn → ``smalltalk_fallback`` template
+          with ``fallback_used='conversational_fallback'`` (a clean warm
+          reply, NOT the generic error banner — Codex #88 R1 MINOR);
+        - any other (non-smalltalk) LLM key → ``generic_tool_error`` with
+          ``fallback_used='generic_error'``.
+        So D.1 can ship without D.2 being wired.
     ctx :
         Per-request metadata for the LLM composer. Defaults to
         ``ComposerContext()`` for D.1 unit tests; Phase E orchestrator
@@ -414,14 +438,24 @@ def compose(
             execution_log=execution_log,
         )
     if effective_call.kind == "llm":
+        # Phase 2 (rot-enablement #88): smalltalk failures fall through to the
+        # deterministic smalltalk_fallback template instead of generic_tool_error,
+        # so the user always gets a warm reply even when the composer is down.
+        llm_key = effective_call.llm_prompt_key or ""
+        conv_fallback = (
+            _SMALLTALK_LLM_FALLBACK_TEMPLATE
+            if llm_key == _SMALLTALK_PROMPT_KEY
+            else None
+        )
         return _render_llm_result(
             llm_composer,
             registry=registry,
-            llm_prompt_key=effective_call.llm_prompt_key or "",
+            llm_prompt_key=llm_key,
             data=resolved_data,
             execution_log=execution_log,
             ctx=ctx,
             ctx_provided=ctx_provided,
+            conversational_fallback_template=conv_fallback,
         )
     # Schema only allows {template, llm}; defensive guard for future
     # kinds that might land without a renderer.
@@ -588,14 +622,22 @@ def _render_llm_result(
     execution_log: ExecutionLog,
     ctx: ComposerContext,
     ctx_provided: bool,
+    conversational_fallback_template: str | None = None,
 ) -> ComposeResult:
-    """Dispatch to the injected LLM composer; fall through to generic
-    error if not wired (D.1 ships without LLM composer; D.2 wires it).
+    """Dispatch to the injected LLM composer; fall through to per-type
+    fallback or generic error if not wired / fails.
 
     The pre-dispatch caller (compose() main flow) already enforces
     ctx_provided + non-default identity per Codex Phase D.1 R3 MED #1
     + R3 MED #3. The redundant check below is defense-in-depth in case
     a future refactor calls _render_llm_result directly.
+
+    ``conversational_fallback_template`` (Phase 2, rot-enablement #88):
+    when set, LLM failures on a conversational reply_only turn fall
+    through to this deterministic template instead of generic_tool_error.
+    This ensures the user gets a warm reply even when the composer is
+    down, rather than the generic error message. Only used for smalltalk
+    (identity is already deterministic via identity_playful template).
     """
     if not ctx_provided or _ctx_has_unknown_identity(ctx):
         # Defense-in-depth — main flow should have caught this.
@@ -614,8 +656,16 @@ def _render_llm_result(
         logger.warning(
             "composer: kind='llm' with llm_prompt_key=%r but no llm_composer "
             "injected — falling through to %s",
-            llm_prompt_key, _FALLBACK_GENERIC_ERROR,
+            llm_prompt_key,
+            conversational_fallback_template or _FALLBACK_GENERIC_ERROR,
         )
+        if conversational_fallback_template:
+            return _result_conversational_fallback(
+                registry,
+                fallback_template_id=conversational_fallback_template,
+                error_code="llm_composer_not_wired",
+                effective_llm_prompt_key=llm_prompt_key,
+            )
         return _result_generic_error(
             registry, error_code="llm_composer_not_wired",
             effective_llm_prompt_key=llm_prompt_key,
@@ -642,13 +692,22 @@ def _render_llm_result(
             latency_ms = getattr(raw, "latency_ms", None)
         # A composer that returns blank text is a contract breach —
         # the production composer raises ComposerEmptyOutput instead,
-        # but a stub might not. Treat blank as generic_error.
+        # but a stub might not. Treat blank as conversational fallback
+        # (if wired) or generic_error.
         if not text or not text.strip():
             logger.warning(
                 "composer: llm_composer returned blank text for "
                 "prompt_key=%r — falling through to %s",
-                llm_prompt_key, _FALLBACK_GENERIC_ERROR,
+                llm_prompt_key,
+                conversational_fallback_template or _FALLBACK_GENERIC_ERROR,
             )
+            if conversational_fallback_template:
+                return _result_conversational_fallback(
+                    registry,
+                    fallback_template_id=conversational_fallback_template,
+                    error_code="llm_composer_blank_output",
+                    effective_llm_prompt_key=llm_prompt_key,
+                )
             return _result_generic_error(
                 registry, error_code="llm_composer_blank_output",
                 effective_llm_prompt_key=llm_prompt_key,
@@ -666,8 +725,16 @@ def _render_llm_result(
         logger.exception(
             "composer: llm_composer raised for prompt_key=%r — falling "
             "through to %s",
-            llm_prompt_key, _FALLBACK_GENERIC_ERROR,
+            llm_prompt_key,
+            conversational_fallback_template or _FALLBACK_GENERIC_ERROR,
         )
+        if conversational_fallback_template:
+            return _result_conversational_fallback(
+                registry,
+                fallback_template_id=conversational_fallback_template,
+                error_code=f"llm_composer_error:{type(exc).__name__}",
+                effective_llm_prompt_key=llm_prompt_key,
+            )
         return _result_generic_error(
             registry,
             error_code=f"llm_composer_error:{type(exc).__name__}",
@@ -678,6 +745,46 @@ def _render_llm_result(
 # ---------------------------------------------------------------------------
 # Internals — fallback rendering
 # ---------------------------------------------------------------------------
+
+
+def _result_conversational_fallback(
+    registry: ComposerRegistry,
+    *,
+    fallback_template_id: str,
+    error_code: str,
+    effective_llm_prompt_key: str | None = None,
+) -> ComposeResult:
+    """Per-type fallback for conversational reply_only LLM failures.
+
+    Phase 2 (rot-enablement #88): smalltalk LLM failure → deterministic
+    warm greeting (smalltalk_fallback template) instead of generic_tool_error.
+    The user gets a usable reply even when the composer is unavailable.
+
+    ``fallback_used='conversational_fallback'`` so Phase E records the
+    degradation as a conversational-path failure distinct from a tool
+    compose error (Codex rot-enablement #88 R1 MINOR — the rendered text is
+    a warm reply, not the generic error banner).
+    """
+    try:
+        text = registry.render(fallback_template_id, {})
+    except (UnknownTemplateError, TemplateError) as exc:
+        logger.exception(
+            "composer: conversational fallback template %r also failed: %s",
+            fallback_template_id, exc,
+        )
+        # Last resort: use generic_tool_error as final backstop.
+        return _result_generic_error(
+            registry,
+            error_code=f"conversational_fallback_render_error:{type(exc).__name__}",
+            effective_llm_prompt_key=effective_llm_prompt_key,
+        )
+    return ComposeResult(
+        text=text,
+        fallback_used="conversational_fallback",
+        error_code=error_code,
+        effective_template_id=fallback_template_id,
+        effective_llm_prompt_key=effective_llm_prompt_key,
+    )
 
 
 def _result_compose_error(

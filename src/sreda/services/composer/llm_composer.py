@@ -20,9 +20,13 @@ By the time ``compose()`` calls us:
   compose() extracts ``.text`` and copies the metadata into
   ``ComposeResult``. compose() also still accepts a bare ``str`` so
   lightweight test stubs don't have to build a result object.
-- any exception we raise is caught by compose() and turned into the
-  ``generic_tool_error`` fallback with ``error_code`` = our exception
-  type name, so we raise *specific* exceptions for diagnosability.
+- any exception we raise is caught by compose() and turned into a
+  fallback with ``error_code`` = our exception type name, so we raise
+  *specific* exceptions for diagnosability. The fallback is per-key
+  (Codex #88): a ``smalltalk`` reply_only turn falls through to the
+  deterministic ``smalltalk_fallback`` template
+  (``fallback_used='conversational_fallback'``); any other LLM key →
+  ``generic_tool_error`` (``fallback_used='generic_error'``).
 
 Anti-fabrication (the architectural crux)
 =========================================
@@ -107,8 +111,12 @@ class LLMComposerResult:
 
 
 # ---------------------------------------------------------------------------
-# Exceptions — all propagate to compose() which maps to generic_tool_error
-# with error_code = type name. Specific types → diagnosable composer_path.
+# Exceptions — all propagate to compose(), which maps them to a fallback with
+# error_code = type name. Per-key fallback (Codex #88): a ``smalltalk``
+# reply_only turn → deterministic ``smalltalk_fallback`` template
+# (fallback_used='conversational_fallback'); any other LLM key →
+# ``generic_tool_error`` (fallback_used='generic_error'). Specific exception
+# types → diagnosable composer_path.
 # ---------------------------------------------------------------------------
 
 
@@ -124,8 +132,10 @@ class ComposerTimeoutError(LLMCallTimeout):
 
 class ComposerEmptyOutput(RuntimeError):
     """LLM returned blank/unparseable text — useless as a reply. Better
-    to fall through to the generic error than send the user an empty
-    message (or an opaque ``repr``)."""
+    to fall through to the per-key fallback than send the user an empty
+    message (or an opaque ``repr``): ``smalltalk`` → ``smalltalk_fallback``
+    template (``conversational_fallback``), other LLM keys →
+    ``generic_tool_error`` (``generic_error``)."""
 
 
 # ---------------------------------------------------------------------------

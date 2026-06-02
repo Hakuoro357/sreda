@@ -72,6 +72,7 @@ from sreda.runtime.planner.plan_compiler import (
     PlanCompileError,
     compile as compile_plan,
 )
+from sreda.runtime.planner.few_shot_examples import render_few_shot_block
 from sreda.runtime.planner.prompt_builder import (
     NowMoment,
     ProfileSnapshot,
@@ -123,7 +124,20 @@ class PlannerContext:
     composer_registry_snapshot_hash: str
     tool_registry_version: str = "v1"
 
-    # Prompt assembly
+    # Prompt assembly.
+    #
+    # ``few_shot_block`` is an OPT-IN TOGGLE, not a verbatim payload
+    # (Codex rot-enablement #88 Phase-2 R2 MAJOR-1). The orchestrator does
+    # NOT trust a pre-rendered string for the LLM-key gate — a caller that
+    # rendered examples before ``effective_llm_keys`` was known could leak a
+    # ``kind='llm'`` example for a disabled key, and the validator would then
+    # reject greetings as ``unknown_llm_prompt_key``. Instead:
+    #   * empty/falsy  → no few-shot examples in the prompt;
+    #   * non-empty    → the orchestrator renders the canonical few-shot
+    #     block ITSELF, gated to the computed ``effective_llm_keys`` (see
+    #     ``_build_prompt_or_raise``). The string's content is ignored; only
+    #     its truthiness matters. This guarantees the gate is always enforced
+    #     centrally, regardless of what the caller passed.
     few_shot_block: str = ""
     budget: PromptBudget = field(default_factory=PromptBudget)
 
@@ -584,12 +598,25 @@ def _build_prompt_or_raise(
     ``composer_llm_prompt_keys`` is the GATED effective set (Sub-A12
     D.2-enable R2) — NOT ``ctx.composer_llm_prompt_keys`` — so the
     planner is only ever shown keys that settings actually enabled.
-    Empty → the LLM-key registry block renders "пусто, не используй"."""
+    Empty → the LLM-key registry block renders "пусто, не используй".
+
+    Few-shot gating (Codex rot-enablement #88 Phase-2 R2 MAJOR-1): the
+    orchestrator renders the canonical few-shot block ITSELF here, gated to
+    the same effective ``composer_llm_prompt_keys``, instead of trusting
+    ``ctx.few_shot_block`` verbatim. ``ctx.few_shot_block`` is an opt-in
+    toggle (truthy → include examples; falsy → none); its content is not
+    used. This guarantees no ``kind='llm'`` example for a disabled key ever
+    reaches the prompt, regardless of how the caller built the context."""
+    few_shot_block = (
+        render_few_shot_block(effective_llm_keys=composer_llm_prompt_keys)
+        if ctx.few_shot_block
+        else ""
+    )
     args = PromptBuildArgs(
         tool_specs=ctx.available_tools,
         composer_template_ids=ctx.composer_template_ids,
         composer_llm_prompt_keys=composer_llm_prompt_keys,
-        few_shot_block=ctx.few_shot_block,
+        few_shot_block=few_shot_block,
         profile=ctx.profile,
         memories=ctx.memories,
         active_turn=ctx.active_turn,

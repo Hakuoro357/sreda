@@ -1018,3 +1018,159 @@ def test_identity_template_expanded_denylist() -> None:
             f"identity_playful template contains denylist term {term!r} "
             f"(after normalization). Must not reveal real model/provider names."
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase-2 R1 MINOR-2 — boundary eval fixtures (pure action / mixed / identity)
+# These assert the SHAPE the planner SHOULD emit for the three boundary
+# utterance classes Codex flagged, complementing the rejection tests above
+# (silent no-op + branch conversational compose). Schema has no NLU, so this
+# documents the target shapes; planner-prompt quality is what routes there.
+# ---------------------------------------------------------------------------
+
+
+def _action_with_result_compose() -> Action:
+    """An action whose terminal branch uses a result-aware template (the
+    correct shape — NEVER smalltalk/identity_playful in a branch)."""
+    return Action(
+        tool="add_shopping_items",
+        args={"items": [{"title": "молоко"}]},
+        expected_outcomes=[
+            OutcomeBranch(
+                match={"status": "added"},
+                compose=ComposerCall(
+                    kind="template",
+                    template_id="shopping_added_ok",
+                    template_data={"items": ["молоко"]},
+                ),
+            )
+        ],
+    )
+
+
+def test_pure_action_is_clear_with_result_template() -> None:
+    """«добавь молоко» → clear + action + result-aware compose. Valid shape."""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="clear",
+        actions={"s1": _action_with_result_compose()},
+        compose=ComposerCall(
+            kind="template",
+            template_id="shopping_added_ok",
+            template_data={"items": ["молоко"]},
+        ),
+    )
+    assert plan.clarity == "clear"
+    assert plan.actions  # >= 1 action
+    # No conversational compose anywhere.
+    assert plan.compose.template_id == "shopping_added_ok"
+
+
+def test_mixed_greeting_plus_action_is_clear_not_reply_only() -> None:
+    """«привет! добавь молоко» — the greeting must be ignored: the plan is
+    clear with the action, NOT reply_only. (Models few-shot ex10.)"""
+    plan = Plan(
+        turn_classification=_ok_tc(),
+        clarity="clear",
+        actions={"s1": _action_with_result_compose()},
+        compose=ComposerCall(
+            kind="template",
+            template_id="shopping_added_ok",
+            template_data={"items": ["молоко"]},
+        ),
+    )
+    assert plan.clarity == "clear"
+    assert plan.compose.llm_prompt_key is None  # not a conversational reply
+
+
+def test_mixed_greeting_plus_action_as_reply_only_is_rejected() -> None:
+    """The WRONG shape for «привет! добавь молоко» — reply_only+smalltalk with
+    an action — is the silent no-op the schema rejects (the result would be
+    discarded). Confirms the boundary is enforced, not just documented."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="reply_only",
+            actions={"s1": _action_with_result_compose()},
+            compose=ComposerCall(kind="llm", llm_prompt_key="smalltalk"),
+        )
+    msg = str(exc.value)
+    assert "reply_only" in msg and "action" in msg.lower()
+
+
+def test_identity_question_is_reply_only_template_zero_actions() -> None:
+    """«кто ты?» → reply_only + identity_playful template + 0 actions."""
+    plan = _reply_only_template("identity_playful")
+    assert plan.clarity == "reply_only"
+    assert plan.actions == {}
+    assert plan.compose.template_id == "identity_playful"
+
+
+# ---------------------------------------------------------------------------
+# Phase-2 R2 MAJOR — gate-OFF greeting shape (Codex high R2).
+# When the smalltalk LLM key is disabled, a pure greeting must still have a
+# clean valid reply_only shape: kind='template' + smalltalk_fallback. This
+# is the deterministic warm greeting (no LLM), so greetings never degrade to
+# an invalid plan or an awkward clarification when rot is off.
+# ---------------------------------------------------------------------------
+
+
+def test_smalltalk_fallback_in_conversational_template_ids() -> None:
+    """smalltalk_fallback must be an allowed reply_only template target."""
+    assert "smalltalk_fallback" in CONVERSATIONAL_TEMPLATE_IDS
+
+
+def test_reply_only_smalltalk_fallback_template_accepted() -> None:
+    """clarity='reply_only' + kind='template' + smalltalk_fallback → valid
+    (gate-off greeting path)."""
+    plan = _reply_only_template("smalltalk_fallback")
+    assert plan.clarity == "reply_only"
+    assert plan.actions == {}
+    assert plan.compose.template_id == "smalltalk_fallback"
+
+
+def test_smalltalk_fallback_registered_in_registry() -> None:
+    """smalltalk_fallback must be a real template the composer can render."""
+    from sreda.services.composer import REGISTRY
+
+    assert "smalltalk_fallback" in REGISTRY.template_ids()
+
+
+def test_clear_plan_with_smalltalk_fallback_compose_rejected() -> None:
+    """smalltalk_fallback is conversational — banned in a clear action plan
+    (would discard tool results), same guard as smalltalk/identity_playful."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="clear",
+            actions={"s1": _ok_action()},
+            compose=ComposerCall(kind="template", template_id="smalltalk_fallback"),
+        )
+    msg = str(exc.value)
+    assert "conversational" in msg.lower() or "smalltalk_fallback" in msg
+
+
+def test_branch_compose_smalltalk_fallback_rejected() -> None:
+    """Branch-level compose pointing at smalltalk_fallback → rejected."""
+    with pytest.raises(ValidationError) as exc:
+        Plan(
+            turn_classification=_ok_tc(),
+            clarity="clear",
+            actions={
+                "s1": Action(
+                    tool="list_shopping",
+                    args={},
+                    expected_outcomes=[
+                        OutcomeBranch(
+                            match={"status": "ok"},
+                            compose=ComposerCall(
+                                kind="template", template_id="smalltalk_fallback"
+                            ),
+                        )
+                    ],
+                )
+            },
+            compose=ComposerCall(kind="template", template_id="shopping_list_show"),
+        )
+    msg = str(exc.value)
+    assert "conversational" in msg.lower() or "smalltalk_fallback" in msg

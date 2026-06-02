@@ -604,3 +604,79 @@ def test_compose_result_carries_diagnostic_on_fallback() -> None:
     assert res.fallback_used == "compose_error"
     assert res.error_code == "unknown_template"
     assert res.effective_template_id == "nonexistent_xyz"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (rot-enablement #88): smalltalk fallback on LLM failure
+# ---------------------------------------------------------------------------
+
+
+def _real_ctx(user_message: str = "привет") -> ComposerContext:
+    """Real (non-default) ctx — required for kind='llm' path."""
+    return ComposerContext(tenant_id="t_real", run_id="r_real",
+                          user_message=user_message)
+
+
+def test_smalltalk_fallback_on_composer_not_wired() -> None:
+    """kind='llm' + smalltalk key with no llm_composer → smalltalk_fallback
+    template rendered instead of generic_tool_error (per-type fallback).
+    fallback_used='conversational_fallback' (distinct from a tool compose
+    error) so Phase E records degradation — Codex #88 R1 MINOR."""
+    call = _llm_call("smalltalk", {"user_message": "привет"})
+    log = _log([])
+    res = compose(call, log, llm_composer=None, ctx=_real_ctx("привет"))
+    # Should fall through to smalltalk_fallback, not generic_tool_error
+    assert res.fallback_used == "conversational_fallback"
+    assert res.error_code == "llm_composer_not_wired"
+    assert res.text == "Я здесь и рада помочь 😊"
+    # Must NOT be the generic tool error message
+    assert "Ой, не получилось" not in res.text
+
+
+def test_smalltalk_fallback_on_composer_exception() -> None:
+    """kind='llm' + smalltalk key, composer raises → smalltalk_fallback
+    rendered instead of generic_tool_error."""
+    def bad_composer(**_kw: Any) -> str:
+        raise RuntimeError("LLM down")
+
+    call = _llm_call("smalltalk", {"user_message": "как дела"})
+    log = _log([])
+    res = compose(call, log, llm_composer=bad_composer, ctx=_real_ctx("как дела"))
+    assert res.fallback_used == "conversational_fallback"
+    assert "llm_composer_error" in (res.error_code or "")
+    assert res.text == "Я здесь и рада помочь 😊"
+    assert "Ой, не получилось" not in res.text
+
+
+def test_smalltalk_fallback_on_blank_output() -> None:
+    """kind='llm' + smalltalk key, composer returns blank → smalltalk_fallback."""
+    def blank_composer(**_kw: Any) -> str:
+        return "   "
+
+    call = _llm_call("smalltalk", {"user_message": "привет"})
+    log = _log([])
+    res = compose(call, log, llm_composer=blank_composer, ctx=_real_ctx())
+    assert res.fallback_used == "conversational_fallback"
+    assert res.error_code == "llm_composer_blank_output"
+    assert res.text == "Я здесь и рада помочь 😊"
+
+
+def test_non_smalltalk_llm_failure_still_uses_generic_error() -> None:
+    """For non-smalltalk LLM prompt keys, failure still → generic_tool_error
+    (per-type fallback only applies to smalltalk)."""
+    call = _llm_call("recipe_narrative", {"recipe": "борщ"})
+    log = _log([_step(parsed_output={"status": "found"})])
+    res = compose(call, log, llm_composer=None, ctx=_real_ctx())
+    assert res.fallback_used == "generic_error"
+    assert res.error_code == "llm_composer_not_wired"
+    # generic_tool_error template used — does NOT say "Привет"
+    assert "Привет" not in res.text
+    assert res.text  # still has some clean user-facing message
+
+
+def test_harness_make_llm_composer_is_callable() -> None:
+    """make_llm_composer() returns a callable that satisfies the LLMComposer
+    protocol — harness can inject it directly into compose()."""
+    from sreda.services.composer.llm_composer import make_llm_composer
+    composer = make_llm_composer()
+    assert callable(composer)

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -398,18 +399,160 @@ _EXAMPLES: list[FewShotExample] = [
             },
         },
     ),
-    # NOTE: no kind='llm' few-shot here on purpose. The composer LLM
-    # path ships behind a kill-switch (SREDA_COMPOSER_LLM_ENABLED,
-    # default off) and is rolled out one key at a time. A curated
-    # kind='llm' example is added together with the key it demonstrates
-    # at enablement time — teaching the shape before then would
-    # contradict the (empty) LLM-key registry block the planner sees
-    # while the switch is off. Codex Sub-A12 D.2-enable R1-high MEDIUM #1.
+    # ──────────────────────────────────────────────────────────────────
+    # 8. Pure greeting → reply_only + smalltalk LLM
+    # rot-enablement Phase 2 (issue #88): planner classifies pure
+    # greetings/chit-chat as reply_only with kind='llm', key='smalltalk'.
+    # actions MUST be empty. template_data MUST have user_message.
+    # ──────────────────────────────────────────────────────────────────
+    FewShotExample(
+        user_message="привет",
+        context_brief="",
+        plan={
+            "schema_version": 1,
+            "turn_classification": {
+                "is_new_turn": True,
+                "reason": "чистое приветствие без задачи",
+            },
+            "clarity": "reply_only",
+            "clarity_reason": None,
+            "actions": {},
+            "compose": {
+                "kind": "llm",
+                "llm_prompt_key": "smalltalk",
+                "template_data": {"user_message": "привет"},
+            },
+        },
+    ),
+    # ──────────────────────────────────────────────────────────────────
+    # 9. Identity question → reply_only + identity_playful template
+    # rot-enablement Phase 2 (issue #88): identity questions get the
+    # deterministic template (never leaks real model name, cheaper,
+    # always consistent).
+    # ──────────────────────────────────────────────────────────────────
+    FewShotExample(
+        user_message="кто ты?",
+        context_brief="",
+        plan={
+            "schema_version": 1,
+            "turn_classification": {
+                "is_new_turn": True,
+                "reason": "вопрос об идентичности ассистента",
+            },
+            "clarity": "reply_only",
+            "clarity_reason": None,
+            "actions": {},
+            "compose": {
+                "kind": "template",
+                "template_id": "identity_playful",
+                "template_data": {},
+            },
+        },
+    ),
+    # ──────────────────────────────────────────────────────────────────
+    # 10. Mixed greeting+action → clear with actions (NOT reply_only)
+    # Guard example: a request that looks conversational but contains a
+    # real task MUST route through clarity='clear' with tool calls.
+    # reply_only is NEVER correct when there is a task intent.
+    # ──────────────────────────────────────────────────────────────────
+    FewShotExample(
+        user_message="привет! добавь молоко в список",
+        context_brief="",
+        plan={
+            "schema_version": 1,
+            "turn_classification": {
+                "is_new_turn": True,
+                "reason": "есть конкретная задача — добавить в покупки",
+            },
+            "clarity": "clear",
+            "clarity_reason": None,
+            "actions": {
+                "s1": {
+                    "tool": "add_shopping_items",
+                    "args": {"items": [{"title": "молоко"}]},
+                    "expected_outcomes": [
+                        {
+                            "match": {"status": "added"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "shopping_added_ok",
+                                "template_data": {"items": ["молоко"]},
+                            },
+                        },
+                        {
+                            "match": {"status": "empty"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "shopping_added_empty",
+                                "template_data": {"duplicates": ["молоко"]},
+                            },
+                        },
+                        {
+                            "match": {"status": "error"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "generic_tool_error",
+                                "template_data": {"error_code": "${s1.error_code}"},
+                            },
+                        },
+                    ],
+                    "intent_group": "default",
+                    "depends_on": [],
+                },
+            },
+            "compose": {
+                "kind": "template",
+                "template_id": "shopping_added_ok",
+                "template_data": {"items": ["молоко"]},
+            },
+        },
+    ),
 ]
 
 
-def render_few_shot_block(*, indent: int = 2) -> str:
-    """Render all examples as a markdown block for the system prompt.
+def _iter_example_composes(plan: dict) -> list[dict]:
+    """Yield every compose dict in a plan: the plan-level ``compose`` plus
+    each ``actions[*].expected_outcomes[*].compose``. Used to discover
+    which LLM-prompt keys an example would teach the planner to emit."""
+    composes: list[dict] = []
+    root = plan.get("compose")
+    if isinstance(root, dict):
+        composes.append(root)
+    actions = plan.get("actions")
+    if isinstance(actions, dict):
+        for step in actions.values():
+            if not isinstance(step, dict):
+                continue
+            for outcome in step.get("expected_outcomes", []) or []:
+                if not isinstance(outcome, dict):
+                    continue
+                c = outcome.get("compose")
+                if isinstance(c, dict):
+                    composes.append(c)
+    return composes
+
+
+def _example_referenced_llm_keys(plan: dict) -> set[str]:
+    """All ``llm_prompt_key`` values used by any ``kind="llm"`` compose in
+    the example (plan-level or branch). Empty set ⇒ template-only example."""
+    keys: set[str] = set()
+    for compose in _iter_example_composes(plan):
+        if compose.get("kind") == "llm":
+            key = compose.get("llm_prompt_key")
+            if isinstance(key, str) and key:
+                keys.add(key)
+    return keys
+
+
+def render_few_shot_block(
+    *,
+    indent: int = 2,
+    effective_llm_keys: Iterable[str] | None = None,
+) -> str:
+    """Render examples as a markdown block for the system prompt.
 
     Output format:
     ```
@@ -420,10 +563,32 @@ def render_few_shot_block(*, indent: int = 2) -> str:
     ```
 
     Used by `prompt_builder.build_cached_prefix(...)`. Returns deterministic
-    string so prompt cache hits across requests."""
+    string so prompt cache hits across requests.
+
+    ``effective_llm_keys`` (rot-enablement #88, Codex Phase-2 R1 MAJOR-1):
+    the GATED set of composer LLM-prompt keys actually enabled for this
+    run (caller-proposed ∩ registry ∩ settings-enabled — same set the
+    orchestrator renders into ``composer_llm_prompt_keys_block`` and the
+    validator enforces). When provided, any example that teaches a
+    ``kind="llm"`` compose whose ``llm_prompt_key`` is NOT in this set is
+    DROPPED — otherwise a gate-off run would still teach the planner to
+    emit (e.g.) ``reply_only+smalltalk``, which the validator then rejects
+    as ``unknown_llm_prompt_key``, turning greetings into invalid-plan
+    fallbacks. ``None`` (default) renders ALL examples (back-compat for
+    callers that don't gate, e.g. legacy tests)."""
+    gate: set[str] | None = (
+        None if effective_llm_keys is None else set(effective_llm_keys)
+    )
     parts: list[str] = []
-    for i, ex in enumerate(_EXAMPLES, start=1):
-        parts.append(f"### Пример {i}: {ex.user_message}")
+    shown = 0
+    for ex in _EXAMPLES:
+        if gate is not None:
+            needed = _example_referenced_llm_keys(ex.plan)
+            if needed - gate:
+                # Example teaches an LLM key not enabled for this run → skip.
+                continue
+        shown += 1
+        parts.append(f"### Пример {shown}: {ex.user_message}")
         if ex.context_brief:
             parts.append(f"Контекст: {ex.context_brief}")
         parts.append("План:")

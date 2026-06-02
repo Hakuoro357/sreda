@@ -174,6 +174,17 @@ non-2 values (no validation crash; honest message)."""
 # Conversational / identity — rot-enablement Phase 1 (issue #88)
 # ---------------------------------------------------------------------------
 
+# Fallback for smalltalk turns when the LLM composer fails/times-out/blanks,
+# AND the deterministic gate-OFF greeting path (when the smalltalk LLM key is
+# disabled). Never blank — a warm reply without any LLM call.
+# Registered so compose() can fall through to it on llm_composer failure for
+# reply_only+smalltalk turns (per-type fallback, not generic_tool_error).
+# Codex #88 Phase-2 R3 (medium MINOR): kept GREETING-AGNOSTIC on purpose —
+# the boundary covers «привет», «спасибо», «как дела», «что нового», so the
+# text must not presume a greeting (a «Привет!» reply to «спасибо» is wrong).
+# A neutral warm "I'm here to help" reads fine across all of them.
+_SMALLTALK_FALLBACK = "Я здесь и рада помочь 😊"
+
 # Deterministic witty reply for «кто ты / на каком LLM / что ты за модель»
 # questions. MUST NOT name the real model/provider (MiMo, OpenAI, Anthropic,
 # GPT, Claude, Qwen, mimo — case-insensitive denylist tested in
@@ -214,6 +225,9 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     "invalid_plan_fallback": _INVALID_PLAN_FALLBACK,
     # rot-enablement Phase 1 (issue #88) — conversational / identity
     "identity_playful": _IDENTITY_PLAYFUL,
+    # Smalltalk LLM fallback — used when llm_composer fails on reply_only+smalltalk.
+    # Deterministic warm greeting, never calls an LLM.
+    "smalltalk_fallback": _SMALLTALK_FALLBACK,
 }
 
 

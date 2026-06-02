@@ -34,6 +34,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from sreda.config.settings import Settings
 from sreda.db.models.planner import PlannerExecution
 from sreda.runtime.planner.few_shot_examples import all_examples
 from sreda.runtime.planner.llm import PlannerCallResult
@@ -133,10 +134,11 @@ def _make_ctx(user_message: str) -> PlannerContext:
         closed_turns=(),
         available_tools=tuple(MIGRATED_TOOL_SPECS),
         composer_template_ids=tuple(COMPOSER_REGISTRY.template_ids()),
-        # LLM compose path is behind a kill-switch (default off) and no
-        # few-shot uses kind='llm' yet → empty allowlist here, matching
-        # the default template-only production posture.
-        composer_llm_prompt_keys=(),
+        # Phase 2 (rot-enablement #88): enable "smalltalk" so the new
+        # few-shot examples (greeting → reply_only + kind='llm' + smalltalk)
+        # pass the validator. The snapshot corpus mirrors what the planner
+        # sees in the real cached prefix — must match the harness allowlist.
+        composer_llm_prompt_keys=("smalltalk",),
         composer_registry_snapshot_hash=COMPOSER_REGISTRY.snapshot_hash(),
         tool_registry_version="snap-v1",
         few_shot_block="",
@@ -200,9 +202,26 @@ def test_planner_snapshot_runs_through_orchestrator(
             attempt_no=1,
         )
 
+    # Phase 2 (rot-enablement #88): the orchestrator intersects
+    # ctx.composer_llm_prompt_keys with settings.composer_llm_enabled_keys.
+    # For fixtures that use kind='llm' (e.g. reply_only+smalltalk), build a
+    # settings_factory that enables the keys declared in the fixture so the
+    # gate passes. The snapshot test is not a live-prod gating test — it
+    # validates that plan shapes accepted by the validator + schema round-trip
+    # correctly through the orchestrator.
+    _fixture_llm_keys = frozenset(ctx.composer_llm_prompt_keys)
+
+    def _settings_factory() -> Settings:
+        return Settings(
+            sreda_composer_llm_enabled_keys=",".join(sorted(_fixture_llm_keys))
+            if _fixture_llm_keys
+            else None,
+        )
+
     result = asyncio.run(run(
         ctx, session_factory=session_factory, call_planner_fn=fake_call,
         invalid_retry_enabled=False,  # one-shot — fixture data is canonical
+        settings_factory=_settings_factory,
     ))
     db_session.commit()
 
