@@ -42,6 +42,10 @@ class OutboxRouting:
 
     channel: str  # 'telegram' | 'max'
     chat_id: str  # recipient id в этом channel
+    # Phase 5 (second-tg-bot): bot that should deliver this outbox row.
+    # Callers (proactive workers, reminder worker) set outbox.bot_key from
+    # this field. None means caller will use its own fallback (LEGACY_NULL_BOT_KEY).
+    bot_key: str | None = None
 
 
 def resolve_outbox_routings(

@@ -172,11 +172,15 @@ class OutboxMessage(Base):
         String(64), nullable=True, index=True
     )
     # Phase 4a (second-tg-bot): which bot should deliver this outbox row.
-    # NULL during the migration window — the delivery worker falls back to
-    # LEGACY_NULL_BOT_KEY ("sreda").  Will be made NOT NULL after Phase 5
-    # once every producer sets this field.
-    bot_key: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, index=True
+    # Made NOT NULL in Phase 5 (migration 20260603_0052) once every
+    # producer was updated to set this field.
+    bot_key: Mapped[str] = mapped_column(
+        # NOT NULL + legacy default ("sreda" = LEGACY_NULL_BOT_KEY): production
+        # producers set bot_key EXPLICITLY (guarded by the allowlist/AST
+        # enforcement test); this default is only a safety net so a non-producer
+        # insert (tests, future code) can never violate NOT NULL.
+        String(64), nullable=False, default="sreda",
+        server_default=sa_text("'sreda'"), index=True
     )
 
 

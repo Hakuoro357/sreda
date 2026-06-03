@@ -2492,6 +2492,7 @@ async def execute_conversation_chat(
             pending_buttons_state=pending_buttons_state,
             menu_display_state=menu_display_state,
             embedding_client=embedding_client,
+            bot_key=action.bot_key,
         )
     tools_by_name = {t.name: t for t in tools}
 

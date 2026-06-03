@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
+from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
+
 from sreda.db.base import Base
 from sreda.db.types import EncryptedString
 
@@ -93,6 +95,14 @@ class FamilyReminder(Base):
     embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(
         String(32), nullable=True,
+    )
+
+    # Which bot was used when this reminder was created (Phase 5).
+    # NULL for legacy rows; proactive worker falls back to LEGACY_NULL_BOT_KEY.
+    # Written at creation time so the reminder always fires via the originating
+    # bot — "bot_key fixed at creation" rule (second-tg-bot-final.md Phase 5).
+    bot_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=LEGACY_NULL_BOT_KEY
     )
 
     created_at: Mapped[datetime] = mapped_column(

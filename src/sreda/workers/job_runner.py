@@ -51,10 +51,13 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         runtime_service = ActionRuntimeService(session, telegram_client=telegram_client)
         verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
         skill_platform = SkillPlatformJobProcessor(session, registry)
-        proactive = ProactiveEventWorker(session)
+        _sys_bot_key = bot_registry.system_default_bot_key
+        proactive = ProactiveEventWorker(session, system_bot_key=_sys_bot_key)
         housewife_reminders = HousewifeReminderWorker(session)
-        housewife_onboarding = HousewifeOnboardingKickoffWorker(session)
-        onboarding_aha = OnboardingAhaWorker(session)
+        housewife_onboarding = HousewifeOnboardingKickoffWorker(
+            session, system_bot_key=_sys_bot_key
+        )
+        onboarding_aha = OnboardingAhaWorker(session, system_bot_key=_sys_bot_key)
         delivery = OutboxDeliveryWorker(
             session,
             telegram_client=telegram_client,

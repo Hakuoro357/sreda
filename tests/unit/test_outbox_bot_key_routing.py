@@ -147,13 +147,20 @@ async def test_sreda_home_row_delivered_via_sreda_home_client(session, registry,
 
 @pytest.mark.asyncio
 async def test_null_bot_key_falls_back_to_legacy(session, registry, monkeypatch):
-    """bot_key=NULL → fallback to LEGACY_NULL_BOT_KEY='sreda'."""
+    """bot_key=LEGACY_NULL_BOT_KEY → delivered via 'sreda' client.
+
+    Phase 5 update: outbox_messages.bot_key is NOT NULL after migration
+    20260603_0052.  Legacy rows that were backfilled during Phase 4a have
+    bot_key='sreda' (LEGACY_NULL_BOT_KEY) — not NULL.  This test verifies
+    that those backfilled rows are still routed correctly through the
+    sreda client.
+    """
     factory = FakeTelegramClientFactory()
     monkeypatch.setattr(
         "sreda.workers.outbox_delivery.telegram_client_for", factory
     )
 
-    row = _make_row(session, bot_key=None)
+    row = _make_row(session, bot_key=LEGACY_NULL_BOT_KEY)
     worker = OutboxDeliveryWorker(session, registry=registry)
     await worker._send_now(row)
 

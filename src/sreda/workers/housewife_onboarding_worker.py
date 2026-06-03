@@ -31,6 +31,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage, User, Workspace
 from sreda.db.models.user_profile import TenantUserSkillConfig
 from sreda.db.repositories.user_profile import UserProfileRepository
@@ -66,9 +67,12 @@ class HousewifeOnboardingKickoffWorker:
     anything here.
     """
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, system_bot_key: str | None = None) -> None:
         self.session = session
         self.service = HousewifeOnboardingService(session)
+        # Phase 5: bot_key for system-generated outbox rows (no reminder
+        # origin). Sourced from registry.system_default_bot_key in job_runner.
+        self._system_bot_key = system_bot_key or LEGACY_NULL_BOT_KEY
         self.repo = UserProfileRepository(session)
 
     async def process_pending(
@@ -175,7 +179,7 @@ class HousewifeOnboardingKickoffWorker:
                 "text": _INTRO_MESSAGE,
                 "reply_markup": None,
             }
-            outbox = OutboxMessage(  # outbox-bot-key-enforcement: skip — Phase 5: bot_key comes from family_reminders.bot_key (not yet wired); uses LEGACY_NULL_BOT_KEY fallback in delivery worker during migration window.
+            outbox = OutboxMessage(
                 id=f"out_{uuid4().hex[:24]}",
                 tenant_id=tenant_id,
                 workspace_id=workspace_id,
@@ -183,6 +187,7 @@ class HousewifeOnboardingKickoffWorker:
                 feature_key=HOUSEWIFE_FEATURE_KEY,
                 status="pending",
                 payload_json=json.dumps(payload, ensure_ascii=False),
+                bot_key=self._system_bot_key,
             )
             if hasattr(OutboxMessage, "user_id"):
                 outbox.user_id = user_id

@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage, User, Workspace
 from sreda.db.models.housewife import FamilyReminder
 from sreda.services.housewife_reminders import (
@@ -150,7 +151,7 @@ class HousewifeReminderWorker:
                 "text": text,
                 "reply_markup": reply_markup,
             }
-            outbox = OutboxMessage(  # outbox-bot-key-enforcement: skip — Phase 5: bot_key comes from family_reminders.bot_key (not yet wired); uses LEGACY_NULL_BOT_KEY fallback in delivery worker during migration window.
+            outbox = OutboxMessage(
                 id=f"out_{uuid4().hex[:24]}",
                 tenant_id=reminder.tenant_id,
                 workspace_id=workspace_id,
@@ -158,6 +159,7 @@ class HousewifeReminderWorker:
                 feature_key=HOUSEWIFE_FEATURE_KEY,
                 status="pending",
                 payload_json=json.dumps(payload, ensure_ascii=False),
+                bot_key=reminder.bot_key or LEGACY_NULL_BOT_KEY,
             )
             if hasattr(OutboxMessage, "user_id"):
                 outbox.user_id = reminder.user_id
