@@ -1,7 +1,8 @@
 """FreeTierCounter — счётчик LLM-вызовов в день для free-tier.
 
-Часть A плана v2 нового клиентского пути. Лимит 20 turn'ов в день;
-на 21-й — отлуп с кнопками «Оформить подписку» / «Напомнить утром» /
+Часть A плана v2 нового клиентского пути. Лимит =
+``usage_ledger.SREDA_FREE_LLM_DAILY`` turn'ов в день (single source); на
+превышении — отлуп с кнопками «Оформить подписку» / «Напомнить утром» /
 «Понятно». Подписчики (``housewife_assistant`` в
 ``active_feature_keys``) не трогаются — без лимитов.
 
@@ -27,10 +28,17 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.free_tier import FreeTierUsage
 from sreda.services.agent_capabilities import active_feature_keys
+from sreda.services.usage_ledger import SREDA_FREE_LLM_DAILY
 
 logger = logging.getLogger(__name__)
 
-FREE_TIER_DAILY_LIMIT = 20  # LLM-turn'ов в сутки без подписки
+# Single source of truth = ``usage_ledger.SREDA_FREE_LLM_DAILY`` (the Phase 2
+# gate). This legacy FreeTierCounter skips ALL subscribed users — sreda_free,
+# paid AND grandfathered all hold an active feature_key, so ``is_subscribed``
+# is True for everyone who reaches it — i.e. it is effectively dead in the live
+# handler path. We derive (not re-hardcode) so there is no second daily cap to
+# drift out of sync (Codex limit-review R1, both reviewers).
+FREE_TIER_DAILY_LIMIT = SREDA_FREE_LLM_DAILY  # LLM-turn'ов в сутки без подписки
 
 
 def _utcnow() -> datetime:

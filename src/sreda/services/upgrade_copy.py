@@ -17,16 +17,24 @@ Usage:
 
 from __future__ import annotations
 
+from sreda.services.usage_ledger import (
+    SREDA_FREE_LLM_DAILY,
+    SREDA_FREE_LLM_MONTHLY,
+)
+
 
 UPGRADE_CONTACT = "@sreda_support"
 
 
 UPGRADE_COPY: dict[str, str] = {
-    # Free tier quota exhaustion
+    # Free tier quota exhaustion. Caps are interpolated from the single source
+    # of truth (usage_ledger) so this copy can never drift from the actual gate
+    # (Codex limit-review R1, both reviewers: stale "20" must not survive a cap
+    # change).
     "llm_daily_or_monthly": (
-        f"Лимит общения исчерпан. Если 20 ходов в день / 200 в "
-        f"месяц мало — напиши {UPGRADE_CONTACT} про расширенный "
-        f"тариф (включает безлимитный чат + веб-поиск)."
+        f"Лимит общения исчерпан. Если {SREDA_FREE_LLM_DAILY} ходов в день / "
+        f"{SREDA_FREE_LLM_MONTHLY} в месяц мало — напиши {UPGRADE_CONTACT} про "
+        f"расширенный тариф (включает безлимитный чат + веб-поиск)."
     ),
     "voice_daily_or_monthly": (
         f"Лимит голосовых исчерпан. Можем продолжить текстом — или "
