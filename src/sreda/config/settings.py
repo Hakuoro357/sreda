@@ -34,6 +34,8 @@ _SECRET_FIELD_NAMES = frozenset({
     "yandex_speechkit_api_key",
     "groq_api_key",
     "tavily_api_key",
+    # Phase 1: second Telegram bot (sreda_home) token
+    "home_bot_token",
     # database_url содержит пароль PG в DSN — тоже маскируем
     "database_url",
 })
@@ -54,6 +56,29 @@ class Settings(BaseSettings):
     telegram_webhook_secret_token: str | None = None
     telegram_bot_username: str | None = None
     telegram_miniapp_shortname: str | None = None
+
+    # --- Second Telegram bot: @sreda_home_bot (Phase 1) -----------------
+    # Env names (env_prefix="SREDA_"): field home_bot_token → SREDA_HOME_BOT_TOKEN
+    # etc.  Using plain field names (no alias) so pydantic-settings applies
+    # the prefix automatically, giving the EXACT names:
+    #   SREDA_HOME_BOT_TOKEN / SREDA_HOME_BOT_USERNAME / SREDA_HOME_MINIAPP_SHORTNAME
+    # (NOT "SREDA_SREDA_HOME_BOT_TOKEN" which would happen with a field named
+    # "sreda_home_bot_token").
+    home_bot_token: str | None = None
+    home_bot_username: str | None = None
+    home_miniapp_shortname: str | None = None
+    # When True the sreda_home bot auto-approves new users (no tenant moderation).
+    # anti-abuse (rate-limit, capacity) still applies.  Default True = open signup.
+    home_bot_signup_open: bool = True
+
+    # --- Bot-key routing constants (env-driven; default = legacy "sreda") ----
+    # system_default_bot_key: bot used for system broadcasts + outbox rows with
+    #   no explicit bot_key during the migration window.
+    # admin_bot_key: bot used for admin alerts to the operator.
+    # Both default to "sreda" so existing behaviour is unchanged until an
+    # operator explicitly sets them via env.
+    system_default_bot_key: str = "sreda"
+    admin_bot_key: str = "sreda"
 
     # MAX (российский мессенджер) channel — Phase 5 of MAX integration
     # sprint, 2026-05-04. ``max_bot_token`` доступен через

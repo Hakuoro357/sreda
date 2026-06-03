@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
 import httpx
 
@@ -343,7 +342,7 @@ class TelegramClient:
 _PINGER_INTERVAL_SECONDS = 45.0
 
 
-async def run_keepalive_pinger(token: str) -> None:
+async def run_keepalive_pinger(token: str, *, bot_key: str = "sreda") -> None:
     """Бесконечная task: getMe → sleep 45s → repeat.
 
     Запускается на FastAPI lifespan startup, отменяется на shutdown
@@ -351,11 +350,13 @@ async def run_keepalive_pinger(token: str) -> None:
     egress down) не пробрасываются — просто log + продолжаем тикать.
     Когда egress поднимется обратно, следующий пинг прогреет
     connection заново.
+
+    ``bot_key`` идентифицирует бота в логах (никогда не суффикс токена).
     """
     client = TelegramClient(token)
     logger.info(
-        "telegram keepalive pinger started: interval=%.0fs token=...%s",
-        _PINGER_INTERVAL_SECONDS, token[-6:] if len(token) > 6 else "?",
+        "telegram keepalive pinger started: bot_key=%s interval=%.0fs",
+        bot_key, _PINGER_INTERVAL_SECONDS,
     )
     try:
         while True:

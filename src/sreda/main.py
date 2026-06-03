@@ -51,7 +51,7 @@ async def _lifespan(app: FastAPI):
     pinger_task: asyncio.Task | None = None
     if settings.telegram_bot_token:
         pinger_task = asyncio.create_task(
-            run_keepalive_pinger(settings.telegram_bot_token),
+            run_keepalive_pinger(settings.telegram_bot_token, bot_key="sreda"),
             name="telegram-keepalive-pinger",
         )
 
