@@ -414,6 +414,29 @@ def _peel_container_element_annotation(
     return None
 
 
+def _peel_list_element_annotation(annotation: Any) -> Any | None:
+    """For ``list[T]`` only, return element annotation ``T``.
+    For any other container (set, frozenset, tuple, dict) or non-container
+    type, return ``None``.
+
+    Used exclusively for the ``.only`` selector segment (FIX 4, PR-b rule 2h)
+    so that static validation matches the runtime ``_resolve_only_ref``
+    behaviour, which only accepts ``list`` — not dict/set/tuple/frozenset.
+    ``_peel_container_element_annotation`` is broader and must NOT be used
+    for ``.only`` validation.
+
+    Strips ``Annotated`` and ``Optional`` wrappers identically to
+    ``_peel_container_element_annotation``.
+    """
+
+    bare = _strip_optional_and_annotated(annotation)
+    origin = get_origin(bare)
+    if origin is list:
+        args = get_args(bare)
+        return args[0] if args else None
+    return None
+
+
 def _peel_dict_key_annotation(annotation: Any) -> Any | None:
     """Return the key annotation ``K`` for ``dict[K, V]`` (Codex R3
     MINOR #7). None for non-dict or untyped dict."""
@@ -1512,16 +1535,25 @@ def _is_sequence_origin(origin: Any) -> bool:
     return False
 
 
+_ONLY_SELECTOR = "only"
+"""The single selector segment implemented in PR-b.  When encountered
+during static path validation, it is treated as consuming one ``list[T]``
+level and continuing with element type ``T``.  A ``.only`` on a non-list
+field is a static Violation (rule 2h)."""
+
+
 def _annotation_path_status(annotation: Any, segments: list[str]) -> bool | None:
     """Can the runtime ref resolver walk the remaining ``segments`` into a
     value of ``annotation``? (#36)
 
     Mirrors ``interpolation._resolve_path`` EXACTLY: a segment is resolved
-    by dict-key lookup OR attribute access — sequences are NEVER projected.
+    by dict-key lookup OR attribute access — sequences are NEVER projected
+    UNLESS the segment is the ``.only`` selector (PR-b rule 2h): ``.only``
+    consumes a ``list[T]`` and continues with element type ``T``.
 
     - ``True``  : resolvable against an introspectable nested BaseModel.
-    - ``False`` : guaranteed runtime failure (a segment remains after a
-      sequence — e.g. ``${s1.recipe.ingredients.name}``).
+    - ``False`` : guaranteed runtime failure (e.g. a plain segment after a
+      sequence, or ``.only`` on a non-list field).
     - ``None``  : indeterminate (dynamic dict keys, scalar-with-attrs like
       ``datetime.year``, ``Any``, or an ambiguous union arm) → defer.
 
@@ -1546,11 +1578,25 @@ def _annotation_path_status(annotation: Any, segments: list[str]) -> bool | None
         return False  # every arm definitively rejects
 
     bare = _strip_optional_and_annotated(annotation)
+
+    # PR-b rule 2h: if the next segment is the .only selector, it is valid
+    # only when the current annotation is list[T] (NOT set/frozenset/tuple/dict).
+    # Use _peel_list_element_annotation (FIX 4) instead of the broader
+    # _peel_container_element_annotation so static validation matches the
+    # runtime _resolve_only_ref which only accepts list.
+    if segments[0] == _ONLY_SELECTOR:
+        elem_annotation = _peel_list_element_annotation(bare)
+        if elem_annotation is None:
+            # .only on a non-list field (including dict/set/tuple) → static failure.
+            return False
+        # Consume the .only segment and recurse with the element type.
+        return _annotation_path_status(elem_annotation, segments[1:])
+
     nested = _try_extract_basemodel(bare)
     if nested is not None:
         return _member_path_status(nested, segments)
     if _is_sequence_origin(get_origin(bare)):
-        # Runtime cannot project a remaining segment through a sequence.
+        # Runtime cannot project a remaining plain segment through a sequence.
         return False
     # dict (dynamic keys) / scalar-with-attrs / Any / custom — not
     # statically decidable → defer to runtime.
@@ -1568,10 +1614,25 @@ def _member_path_status(model: Any, segments: list[str]) -> bool | None:
       opaque or ambiguous) → defer to runtime.
 
     Recursion is bounded by ``len(segments)`` (each level consumes one
-    segment), so self-referential model graphs cannot loop forever."""
+    segment), so self-referential model graphs cannot loop forever.
+
+    PR-b rule 2h: the ``.only`` selector is handled by
+    ``_annotation_path_status`` (it consumes a list level) — if ``.only``
+    appears as the FIRST segment here that means the output model itself
+    is being walked and the step-level output is not a list, so we defer
+    to the annotation path logic which will return False for non-list."""
     if not segments:
         return True
     first = segments[0]
+    # .only selector — let _annotation_path_status decide; pass through
+    # by returning None (defer) so the caller's union logic works correctly.
+    # In practice _member_path_status is called with the model AFTER its
+    # field has been peeled; .only at this level means the model itself
+    # should be a list-typed value — indeterminate (the model is a BaseModel
+    # instance, not a list — runtime will fail, but that's a type-level
+    # mismatch caught elsewhere).
+    if first == _ONLY_SELECTOR:
+        return None  # indeterminate — defer
     if first.startswith("_"):
         return True  # dunder/private — runtime owns this (separate guard)
     try:
@@ -1850,6 +1911,112 @@ def _llm_required_key_present(value: Any) -> bool:
     return value is not None and value != [] and value != {}
 
 
+def _ref_path_contains_only(ref_path: str) -> bool:
+    """True if ``ref_path`` (the inner content of ``${...}``) contains a
+    segment literally equal to ``'only'`` (the PR-b selector)."""
+    return "only" in ref_path.split(".")
+
+
+def _phase1_check_only_in_compose(plan: Plan) -> Iterator[Violation]:
+    """PR-b rule 2f — ``.only`` selectors are FORBIDDEN inside any
+    ``ComposerCall.template_data`` reference.
+
+    Compose is rendered POST-execution, AFTER writes have been committed.
+    An ambiguity there (0 or >1 items) could surface only after side
+    effects were already applied — the executor cannot roll them back.
+    ``.only`` belongs exclusively in action args (pre-invoke) where
+    ``SelectorAmbiguityError`` causes a safe pre-invoke abort.
+
+    Checked for BOTH root compose and every branch compose via
+    ``_iter_all_composes``.
+    """
+    for host_step_id, location, compose in _iter_all_composes(plan):
+        for ref_path in iter_refs(compose.template_data):
+            if _ref_path_contains_only(ref_path):
+                yield Violation(
+                    step_id=host_step_id,
+                    tool=None,
+                    code="only_selector_in_compose",
+                    message=(
+                        f"{location}: ref '${{{ref_path}}}' contains a "
+                        f"'.only' selector, which is FORBIDDEN in compose "
+                        f"template_data. Compose resolves post-execution "
+                        f"(after writes are committed); a '.only' ambiguity "
+                        f"there cannot be recovered safely. Use '.only' only "
+                        f"in action args, and reference the resolved field "
+                        f"directly in compose (e.g. '${{{ref_path.replace('.only.', '.')}}}'). "
+                        f"See plan §PR-b rule 2f."
+                    ),
+                )
+
+
+def _action_has_empty_branch(action: "Action") -> bool:
+    """True if any of ``action.expected_outcomes`` matches ``status='empty'``
+    AND the branch is terminal (``next is None``).
+
+    Rule 2e requires a TERMINAL empty branch so that the zero-items case is
+    fully handled at that branch (no forwarding to another step).  A non-
+    terminal empty branch (``next: "s2"``) does not satisfy the requirement
+    because it does not handle the zero-items case in place — the
+    SelectorAmbiguityError from the consumer step would still abort the plan
+    without the producer having routed it cleanly.
+    """
+    for branch in action.expected_outcomes:
+        match_dict = branch.match or {}
+        if match_dict.get("status") == "empty" and branch.next is None:
+            return True
+    return False
+
+
+def _phase1_check_only_empty_branch(
+    plan: Plan, registry: "Mapping[str, ToolSpec] | None" = None
+) -> Iterator[Violation]:
+    """PR-b rule 2e — when a step's arg uses ``.only`` on a producer's
+    list field (``${sX.items.only.field}``), the producer step ``sX``
+    MUST declare a terminal ``expected_outcomes`` branch with
+    ``status='empty'`` to handle the zero-items case.
+
+    Without the empty branch, a list_reminders returning 0 results
+    would hit the selector's 0-items path (``SelectorAmbiguityError``
+    with count=0) and abort — but the «no reminders» path was supposed
+    to be handled by the producer's own branch routing.  Requiring the
+    empty branch at static validation time enforces the plan shape
+    before execution.
+
+    Detection: for each action, scan all arg refs.  For any ref path
+    that contains ``.only``, extract the producer step id and check
+    for an empty branch on it.
+    """
+    for consumer_step_id, action in plan.actions.items():
+        for ref_path in iter_refs(action.args):
+            if not _ref_path_contains_only(ref_path):
+                continue
+            # Extract producer step id (first segment of ref_path).
+            parts = ref_path.split(".")
+            if not parts:
+                continue
+            producer_id = parts[0]
+            producer_action = plan.actions.get(producer_id)
+            if producer_action is None:
+                continue  # unknown_ref_target reported elsewhere
+            if not _action_has_empty_branch(producer_action):
+                yield Violation(
+                    step_id=consumer_step_id,
+                    tool=action.tool,
+                    code="only_selector_missing_empty_branch",
+                    message=(
+                        f"arg ref '${{{ref_path}}}' uses the '.only' "
+                        f"selector on step '{producer_id}', but that "
+                        f"producer step has no expected_outcomes branch "
+                        f"with match={{status: 'empty'}}. The zero-results "
+                        f"case must be handled explicitly by the producer's "
+                        f"empty branch (rule 2e). Add a branch with "
+                        f"{{match: {{status: 'empty'}}}} to step "
+                        f"'{producer_id}'."
+                    ),
+                )
+
+
 def _check_composer_allowlist(
     plan: Plan,
     *,
@@ -2052,6 +2219,11 @@ def validate_plan(
     # are now checked for: (R4) target step existence + (R5) top-level
     # field existence in target tool's output_model.
     violations.extend(_phase1_check_compose_refs(plan, registry=registry))
+    # PR-b rule 2f — .only selector is forbidden inside compose refs.
+    violations.extend(_phase1_check_only_in_compose(plan))
+    # PR-b rule 2e — when .only is used in action args, the producer
+    # step must have an expected_outcomes branch matching status='empty'.
+    violations.extend(_phase1_check_only_empty_branch(plan, registry))
     # Sub-A12 Phase D.2-enable — composer id allowlist membership.
     violations.extend(_check_composer_allowlist(
         plan,

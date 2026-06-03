@@ -87,6 +87,11 @@ from sreda.runtime.planner.interpolation import (
     iter_refs,
     resolve_refs,
 )
+from sreda.runtime.planner.selector import (
+    SelectorAmbiguityError,
+    resolve_selector_refs,
+    unwrap_resolved,
+)
 from sreda.runtime.planner.plan_compiler import ExecutionPlan
 from sreda.runtime.planner.schemas import (
     Action,
@@ -455,9 +460,33 @@ async def _execute_one_step(
     The ``step_outputs_snapshot`` is intentionally a Mapping (read-only
     view) — Codex Phase C R1 MINOR #9 wants per-layer immutability for
     refs so concurrent same-layer steps see a deterministic view."""
-    # 1. Resolve refs in args
+    # 1. Resolve refs in args.
+    #    1a. Selector pre-pass: rewrite ${sX.f.only.g} refs first (PR-b).
+    #        SelectorAmbiguityError is treated as a pre-invoke abort —
+    #        identical to arg_violation: no tool call, no ledger row.
+    #        InvalidReferenceError from a bad path before/after .only
+    #        falls through to the same arg_violation handler below.
+    state_snapshot = dict(step_outputs_snapshot)
     try:
-        resolved_args = resolve_refs(action.args, dict(step_outputs_snapshot))
+        selector_resolved_args = resolve_selector_refs(action.args, state_snapshot)
+    except SelectorAmbiguityError as exc:
+        # Pre-invoke abort — safe, no side effects, no ledger row.
+        return StepResult(
+            step_id=step_id,
+            tool=action.tool,
+            status="arg_violation",
+            error_summary=f"selector_ambiguity: {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return StepResult(
+            step_id=step_id,
+            tool=action.tool,
+            status="arg_violation",
+            error_summary=f"selector_resolve_error: {exc}",
+        )
+    #    1b. Plain ref resolution (interpolation stays pure, no selector logic).
+    try:
+        resolved_args = resolve_refs(selector_resolved_args, state_snapshot)
     except Exception as exc:  # noqa: BLE001
         # Codex Phase C R1-high MAJOR #3: unresolved refs at execute
         # time are a planner/runtime contract failure, not a user-level
@@ -470,6 +499,12 @@ async def _execute_one_step(
             status="arg_violation",
             error_summary=f"ref_resolve_error: {exc}",
         )
+    #    1c. Unwrap _ResolvedLiteral sentinels (PR-b FIX 1).
+    #        Sentinels wrap selector-resolved values so resolve_refs cannot
+    #        re-interpret their content as planner refs.  Now that
+    #        resolve_refs has finished, peel the wrappers to recover the
+    #        plain Python values before arg validation and tool invocation.
+    resolved_args = unwrap_resolved(resolved_args)
 
     # 2. Execute-time arg validation (Codex Phase C R1 CRITICAL #2)
     try:
