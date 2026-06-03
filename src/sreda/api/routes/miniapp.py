@@ -2114,12 +2114,19 @@ async def channel_link_start(
     # Mini App from — they should land back in the same bot's Mini App.
     _bot_registry = TelegramBotRegistry.from_settings(settings)
     if target_channel == "telegram":
-        _link_bot_cfg = _bot_registry.resolve(source_bot_key)
+        # Telegram source → land back in the SAME bot the user opened from.
+        # MAX source → there is no per-bot Telegram context, so use the SYSTEM
+        # DEFAULT Telegram bot (honors a future primary flip; Codex R2 high —
+        # do NOT hardcode "sreda").
+        _tg_bot_key = (
+            source_bot_key if platform == "telegram"
+            else _bot_registry.system_default_bot_key
+        )
+        _link_bot_cfg = _bot_registry.resolve(_tg_bot_key)
         _tg_link_username = _link_bot_cfg.username
         _tg_link_shortname = _link_bot_cfg.miniapp_shortname
     else:
-        # Source is MAX → target is telegram; pick the bot whose Mini App
-        # will receive the linking initData (system default).
+        # Target is MAX (source telegram) — Telegram username/shortname unused.
         _link_bot_cfg = _bot_registry.resolve(_bot_registry.system_default_bot_key)
         _tg_link_username = _link_bot_cfg.username
         _tg_link_shortname = _link_bot_cfg.miniapp_shortname

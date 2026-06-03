@@ -205,9 +205,13 @@ def probe_telegram_poller_alive() -> ProbeResult:
       2. ``poller_heartbeats.last_attempt_at`` для channel 'telegram:<key>'
          свежее 2 минут.
 
-    Если templated unit не установлен (not-found) для bot_key который НЕ
-    настроен токеном — игнорируем. Если не установлен для настроенного бота
-    — предупреждаем.
+    Если токен бота настроен, поллер ОБЯЗАН быть активен — отсутствие
+    или неактивность юнита является CRITICAL. «Not installed» не является
+    OK для бота с настроенным токеном (inbound от него идёт через long-poll;
+    сервис мёртв для пользователей).
+
+    Если токен не настроен — bot_key в _configured_bot_keys() не попадёт,
+    проба его не проверяет.
 
     Используем ``last_attempt_at`` (не ``last_ok_at``) — он ставится
     после КАЖДОГО getUpdates, в том числе при `200 []` и при сетевых
@@ -234,25 +238,31 @@ def probe_telegram_poller_alive() -> ProbeResult:
                 if legacy_state == "active":
                     active = True
                     unit = legacy_unit  # report which unit is active
-                elif legacy_state in ("inactive", "unknown"):
-                    # Check if neither unit is installed at all
+                else:
+                    # Token is configured: both template and legacy unit are
+                    # not active (whether not-found or inactive) — CRITICAL.
                     enabled = _poller_unit_enabled_state(unit)
                     legacy_enabled = _poller_unit_enabled_state(legacy_unit)
                     if "not-found" in enabled.lower() and "not-found" in legacy_enabled.lower():
-                        ok_parts.append(f"{bot_key}:(unit not installed yet — pre-cutover)")
-                        continue
-                    issues.append(f"{bot_key}: systemd state={state} (legacy={legacy_state})")
-                    continue
-                else:
-                    issues.append(f"{bot_key}: systemd {unit} state={state}")
+                        issues.append(
+                            f"{bot_key}: token configured but neither "
+                            f"{unit} nor {legacy_unit} is installed — "
+                            f"inbound is dead"
+                        )
+                    else:
+                        issues.append(f"{bot_key}: systemd state={state} (legacy={legacy_state})")
                     continue
             else:
-                # Non-primary bot: if unit not found, treat as not-yet-deployed (ok)
+                # Token is configured: unit must be active.
+                # Not-found is no longer OK — inbound is dead for this bot.
                 enabled = _poller_unit_enabled_state(unit)
                 if "not-found" in enabled.lower():
-                    ok_parts.append(f"{bot_key}:(unit not installed yet)")
-                    continue
-                issues.append(f"{bot_key}: systemd {unit} state={state}")
+                    issues.append(
+                        f"{bot_key}: token configured but {unit} is not installed — "
+                        f"inbound is dead"
+                    )
+                else:
+                    issues.append(f"{bot_key}: systemd {unit} state={state}")
                 continue
 
         # --- 2. heartbeat in DB -----------------------------------------

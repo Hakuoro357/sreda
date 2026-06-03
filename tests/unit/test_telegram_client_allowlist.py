@@ -80,6 +80,13 @@ _SCRIPTS_ALLOWLIST: set[str] = {
     "monitor_health.py",
 }
 
+# Allowlist for top-level scripts/*.sh (relative to _SCRIPTS_ROOT).
+_SCRIPTS_SH_ALLOWLIST: set[str] = {
+    # Long-poll restart: legitimately calls api.telegram.org deleteWebhook /
+    # getWebhookInfo per bot (webhook-management; no token send to users).
+    "safe_restart.sh",
+}
+
 # Pattern: TelegramClient( followed by anything containing a raw token
 # expression (settings.telegram_bot_token / settings.home_bot_token /
 # bot_token=... etc.) without going through telegram_client_for.
@@ -130,6 +137,15 @@ def _iter_scripts_py_files():
         return
     for f in _SCRIPTS_ROOT.rglob("*.py"):
         if not _is_scripts_allowlisted(f):
+            yield f
+
+
+def _iter_scripts_sh_files():
+    """Yield non-allowlisted .sh files from the top-level scripts/ directory."""
+    if not _SCRIPTS_ROOT.is_dir():
+        return
+    for f in _SCRIPTS_ROOT.rglob("*.sh"):
+        if _scripts_relative(f) not in _SCRIPTS_SH_ALLOWLIST:
             yield f
 
 
@@ -322,6 +338,12 @@ def test_no_raw_telegram_api_urls():
         except OSError:
             continue
         all_violations.extend(_find_raw_tg_api_urls(source, pyfile, rel_fn=_scripts_relative))
+    for shfile in _iter_scripts_sh_files():
+        try:
+            source = shfile.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        all_violations.extend(_find_raw_tg_api_urls(source, shfile, rel_fn=_scripts_relative))
 
     if all_violations:
         msg = (

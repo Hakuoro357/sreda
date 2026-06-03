@@ -223,10 +223,11 @@ def validate_telegram_init_data_any_bot(
         raise TelegramInitDataError(
             "No bots with a non-empty token are configured; cannot validate initData."
         )
-    candidates = [b for b in all_bots if b.miniapp_shortname is not None]
-    if not candidates:
-        candidates = all_bots
-    candidates = candidates[:_MAX_MINIAPP_BOTS]
+    # AUTH must HMAC-check ALL non-empty-token bots: initData can be signed by
+    # ANY registered bot's token. ``miniapp_shortname`` is only for LINK
+    # generation — filtering auth by it would break a token-valid bot whose
+    # shortname is unset while another bot has one (Codex R2 high).
+    candidates = all_bots[:_MAX_MINIAPP_BOTS]
 
     # 3. Compute HMAC for ALL candidates (no early exit on match) to ensure
     #    the wall-clock time is the same regardless of which bot matched.

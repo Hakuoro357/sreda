@@ -41,6 +41,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.db.models import AgentRun
 from sreda.db.models.core import Job, OutboxMessage, TenantFeature
 from sreda.db.repositories.memory import MemoryRepository
@@ -82,6 +83,21 @@ def _session(config: dict) -> Session:
 
 def _telegram(config: dict) -> TelegramClient | None:
     return config["configurable"].get("telegram_client")
+
+
+def _telegram_for(config: dict, bot_key: str) -> TelegramClient | None:
+    """Return a ``TelegramClient`` routed to the correct bot for *bot_key*.
+
+    When a ``TelegramBotRegistry`` is present in config (prod path), resolves
+    the client for the given key so replies from a sreda_home turn are sent
+    by the sreda_home bot, not the default one.  When no registry is available
+    (tests / legacy callers that inject a single client), falls back to the
+    single client from ``_telegram`` for backward-compat.
+    """
+    registry: TelegramBotRegistry | None = config["configurable"].get("bot_registry")
+    if registry is not None:
+        return telegram_client_for(bot_key, registry)
+    return _telegram(config)
 
 
 def _ack_progress(config: dict) -> Any | None:
@@ -341,9 +357,9 @@ async def node_execute_action(state: AssistantGraphState, config: RunnableConfig
 
 async def node_persist_replies(state: AssistantGraphState, config: RunnableConfig) -> dict:
     session = _session(config)
-    telegram = _telegram(config)
-    ack_progress = _ack_progress(config)
     action = _action(state)
+    telegram = _telegram_for(config, action.bot_key)
+    ack_progress = _ack_progress(config)
     run = session.get(AgentRun, state["run_id"])
     job = session.get(Job, state["job_id"])
     context = state.get("context") or {}
@@ -536,8 +552,8 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
 
 async def node_persist_error(state: AssistantGraphState, config: RunnableConfig) -> dict:
     session = _session(config)
-    telegram = _telegram(config)
     action = _action(state)
+    telegram = _telegram_for(config, action.bot_key)
     run = session.get(AgentRun, state["run_id"])
     job = session.get(Job, state["job_id"])
     context = state.get("context")

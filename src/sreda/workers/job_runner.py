@@ -48,7 +48,11 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             if settings.max_bot_token
             else None
         )
-        runtime_service = ActionRuntimeService(session, telegram_client=telegram_client)
+        runtime_service = ActionRuntimeService(
+            session,
+            telegram_client=telegram_client,
+            bot_registry=bot_registry,
+        )
         verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
         skill_platform = SkillPlatformJobProcessor(session, registry)
         _sys_bot_key = bot_registry.system_default_bot_key

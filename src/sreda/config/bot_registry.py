@@ -108,6 +108,20 @@ class TelegramBotRegistry:
             raise ValueError(
                 f"TelegramBotRegistry: duplicate bot keys: {sorted(set(duplicates))}"
             )
+        # Fail-closed: the routing keys MUST reference real registered bots.
+        # Otherwise a typo or a premature primary-flip (e.g.
+        # SREDA_SYSTEM_DEFAULT_BOT_KEY=sreda_home before that bot is configured)
+        # would crash job_runner / broadcast / admin-alerts at first resolve,
+        # and --check-config would not catch it (Codex R2 high).
+        for _label, _key in (
+            ("system_default_bot_key", system_default_bot_key),
+            ("admin_bot_key", admin_bot_key),
+        ):
+            if _key not in self._bots:
+                raise ValueError(
+                    f"TelegramBotRegistry: {_label}={_key!r} is not a registered "
+                    f"bot. Known keys: {sorted(self._bots)}."
+                )
         self._system_default_bot_key = system_default_bot_key
         self._admin_bot_key = admin_bot_key
 

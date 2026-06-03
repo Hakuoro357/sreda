@@ -202,7 +202,9 @@ if [ "$all_ok" = "false" ]; then
     exit 4
 fi
 
-# Проверяем что поллеры живы (per-bot)
+# Проверяем что поллеры живы (per-bot).
+# Токен присутствует → поллер ОБЯЗАН быть активен.
+# «Не установлен» для бота с токеном — FATAL: inbound мёртв.
 for bot_key in $BOT_KEYS; do
     unit="sreda-telegram-poller@${bot_key}.service"
     legacy_unit="sreda-telegram-poller.service"
@@ -219,13 +221,9 @@ for bot_key in $BOT_KEYS; do
         continue
     fi
 
-    # Юнит не установлен — не критично (sreda_home может быть не развёрнут)
-    if ! systemctl list-unit-files "$unit" >/dev/null 2>&1; then
-        log "  INFO: ${unit} не установлен — OK (не развёрнут для ${bot_key})"
-        continue
-    fi
-
-    log "FATAL: поллер для ${bot_key} не активен после рестарта"
+    # Токен настроен → поллер обязан быть активен.
+    # Отсутствие или неактивность юнита = FATAL (inbound мёртв для этого бота).
+    log "FATAL: поллер для ${bot_key} не активен после рестарта (токен настроен, поллер обязателен)"
     exit 5
 done
 
