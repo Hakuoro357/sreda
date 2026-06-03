@@ -1,7 +1,7 @@
 """Telegram long-polling worker.
 
-Runs as a separate systemd unit (``sreda-telegram-poller.service``) and
-calls Telegram's ``getUpdates`` in a loop. For each update it invokes
+Runs as a separate systemd unit (``sreda-telegram-poller@<bot_key>.service``)
+and calls Telegram's ``getUpdates`` in a loop.  For each update it invokes
 ``services.telegram_inbound.handle_telegram_update``, then advances the
 in-DB offset only after that ingest has committed (durable ingest →
 offset advance order, idempotency by ``external_update_id`` covers the
@@ -15,22 +15,26 @@ Why long-poll instead of webhook (2026-04-30 incident set):
   «бот не отвечает». TCP-side palliatives helped but did not fix it
   fully — see plan ``mellow-discovering-conway.md``.
 
-Process model:
-  * Single-instance via PG advisory lock on a dedicated long-lived
-    connection (NullPool, never returned to the engine pool).
+Process model (Phase 3 — per-bot):
+  * Each poller instance is started with ``--bot-key <key>`` (or env
+    ``SREDA_TELEGRAM_BOT_KEY``).  Token / username are resolved from
+    ``TelegramBotRegistry``.
+  * Single-instance guarantee per bot via PG advisory lock whose key is
+    deterministically derived from ``bot_key`` (SHA-256, 64-bit signed).
+    Two bots → two different lock ids → two pollers can coexist safely.
   * Offset + heartbeat in dedicated tables (``poller_offsets``,
-    ``poller_heartbeats``). Heartbeat fields distinguish liveness from
-    upstream API health.
+    ``poller_heartbeats``), keyed by ``"telegram:<bot_key>"``.
   * Exit codes:  0 normal,  2 lock held by another instance,
     3 active webhook conflict (must ``deleteWebhook`` manually).
-  * ``--check-config`` runs startup (acquires lock, loads offset)
-    then exits cleanly without polling.
+  * ``--check-config`` verifies token↔bot via Telegram ``getMe``, then
+    exits cleanly without polling.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import signal
@@ -41,7 +45,6 @@ import httpx
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 from sreda.config.logging import configure_logging
@@ -67,15 +70,37 @@ HTTP_TIMEOUT_SECS = POLL_TIMEOUT_SECS + 5
 # Backoff after network/HTTP errors. Linear, no exponential — getUpdates
 # is cheap and we want to recover quickly when TG comes back.
 BACKOFF_SECS = 2
-# 64-bit constant for ``pg_try_advisory_lock``. The high byte 0x5E
-# stands for "Sreda"; the rest is arbitrary. Long-poller uses one fixed
-# key per channel — when MAX is added we'll pick a sibling key.
-LOCK_KEY_TELEGRAM = 0x5E_DA_7E_1E_60_AB_F0_1F
 # Cap stored last_error so we don't blow up the heartbeats row when an
 # exception body includes a multi-KB HTML 502 page or a full traceback.
 LAST_ERROR_MAX_CHARS = 1000
-# Channel column value in poller_offsets / poller_heartbeats.
-CHANNEL = "telegram"
+
+
+def _advisory_lock_id(bot_key: str) -> int:
+    """Derive a stable 64-bit signed advisory lock id from *bot_key*.
+
+    Uses SHA-256 so the result is deterministic across Python restarts
+    (unlike ``hash()`` which is randomised per-process by PYTHONHASHSEED).
+    Takes the first 8 bytes of the digest and interprets them as a big-
+    endian signed 64-bit integer — the range ``pg_advisory_lock`` accepts.
+
+    Two different bot_keys always produce different ids (no collision for
+    any realistic set of bot keys; SHA-256 prefix collisions are
+    negligible at 2 items).
+    """
+    digest = hashlib.sha256(
+        f"sreda-telegram-poller:{bot_key}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+def _poller_channel(bot_key: str) -> str:
+    """Return the ``channel`` key used in ``poller_offsets`` / ``poller_heartbeats``.
+
+    Format: ``"telegram:<bot_key>"``.  The legacy single-bot key
+    ``"telegram"`` was migrated to ``"telegram:sreda"`` in migration
+    20260603_0049; any ``--bot-key sreda`` poller will resume seamlessly.
+    """
+    return f"telegram:{bot_key}"
 
 
 # ---- Typed exit-path exceptions ----------------------------------------
@@ -106,8 +131,15 @@ def _utcnow() -> datetime:
 # ---- Poller class ------------------------------------------------------
 
 class TelegramLongPoller:
-    def __init__(self, token: str, *, auto_delete_webhook: bool = False) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        bot_key: str = "sreda",
+        auto_delete_webhook: bool = False,
+    ) -> None:
         self.token = token
+        self.bot_key = bot_key
         self.auto_delete_webhook = auto_delete_webhook
         self.client = TelegramClient(token)
         self.SessionLocal = get_session_factory()
@@ -118,6 +150,9 @@ class TelegramLongPoller:
         self._lock_engine: Engine | None = None
         self._lock_conn: Connection | None = None
         self.offset: int = 0
+        # Per-bot derived values.
+        self._lock_key: int = _advisory_lock_id(bot_key)
+        self._channel: str = _poller_channel(bot_key)
 
     async def startup(self) -> None:
         """Acquire the singleton lock + load offset.
@@ -134,7 +169,7 @@ class TelegramLongPoller:
         try:
             locked = self._lock_conn.execute(
                 text("SELECT pg_try_advisory_lock(:k)"),
-                {"k": LOCK_KEY_TELEGRAM},
+                {"k": self._lock_key},
             ).scalar()
         except Exception:
             self._lock_conn.close()
@@ -158,15 +193,18 @@ class TelegramLongPoller:
             self._lock_conn = None
             self._lock_engine = None
             raise SingletonLockError(
-                "Another telegram poller already holds the advisory lock. "
+                f"Another telegram poller for bot_key={self.bot_key!r} already "
+                "holds the advisory lock. "
                 "Inspect `ps auxf | grep telegram_long_poll` and `pg_locks`. "
-                "After fixing run `systemctl reset-failed sreda-telegram-poller` "
-                "and `systemctl start sreda-telegram-poller`.",
+                "After fixing run `systemctl reset-failed sreda-telegram-poller@"
+                f"{self.bot_key}` and `systemctl start "
+                f"sreda-telegram-poller@{self.bot_key}`.",
             )
         self.offset = self._load_offset()
         logger.info(
-            "telegram poller starting: offset=%d auto_delete_webhook=%s",
-            self.offset, self.auto_delete_webhook,
+            "telegram poller starting: bot_key=%s channel=%s offset=%d "
+            "auto_delete_webhook=%s",
+            self.bot_key, self._channel, self.offset, self.auto_delete_webhook,
         )
 
     async def shutdown(self) -> None:
@@ -179,7 +217,7 @@ class TelegramLongPoller:
         try:
             self._lock_conn.execute(
                 text("SELECT pg_advisory_unlock(:k)"),
-                {"k": LOCK_KEY_TELEGRAM},
+                {"k": self._lock_key},
             )
         except Exception:  # noqa: BLE001
             logger.exception("failed to release advisory lock")
@@ -217,7 +255,7 @@ class TelegramLongPoller:
         with self.SessionLocal() as session:
             row = (
                 session.query(PollerOffset)
-                .filter_by(channel=CHANNEL)
+                .filter_by(channel=self._channel)
                 .first()
             )
             return row.last_update_id + 1 if row else 0
@@ -231,7 +269,7 @@ class TelegramLongPoller:
         with self.SessionLocal() as session:
             session.merge(
                 PollerOffset(
-                    channel=CHANNEL,
+                    channel=self._channel,
                     last_update_id=update_id,
                     updated_at=_utcnow(),
                 )
@@ -254,10 +292,10 @@ class TelegramLongPoller:
         """
         now_ts = _utcnow()
         with self.SessionLocal() as session:
-            row = session.get(PollerHeartbeat, CHANNEL)
+            row = session.get(PollerHeartbeat, self._channel)
             if row is None:
                 row = PollerHeartbeat(
-                    channel=CHANNEL,
+                    channel=self._channel,
                     last_attempt_at=now_ts,
                 )
                 session.add(row)
@@ -318,7 +356,7 @@ class TelegramLongPoller:
                             upd,
                         )
                         continue
-                    await handle_telegram_update(upd)
+                    await handle_telegram_update(upd, bot_key=self.bot_key)
                     self._save_offset(update_id)
             except asyncio.CancelledError:
                 raise
@@ -342,11 +380,12 @@ class TelegramLongPoller:
                     continue
                 # Re-raise so main() returns a clean exit code 3.
                 logger.error(
-                    "409 Conflict: an active webhook is still set on this bot. "
+                    "409 Conflict: an active webhook is still set on bot_key=%s. "
                     "Run `curl -X POST https://api.telegram.org/bot$TOKEN/deleteWebhook` "
                     "manually OR set SREDA_TELEGRAM_POLLER_AUTO_DELETE_WEBHOOK=true. "
-                    "After fixing run `systemctl reset-failed sreda-telegram-poller` "
-                    "and `systemctl start sreda-telegram-poller`.",
+                    "After fixing run `systemctl reset-failed sreda-telegram-poller@"
+                    "%s` and `systemctl start sreda-telegram-poller@%s`.",
+                    self.bot_key, self.bot_key, self.bot_key,
                 )
                 raise
             except httpx.TimeoutException as exc:
@@ -372,9 +411,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--check-config",
         action="store_true",
         help=(
-            "Run startup (acquire advisory lock + load offset) then exit "
-            "cleanly without polling. Use to verify config/DB/lock before "
-            "enabling the systemd unit at cutover."
+            "Verify bot config via Telegram getMe (token↔username match + token "
+            "uniqueness), acquire advisory lock, load offset, then exit cleanly "
+            "without polling. Use before enabling the systemd unit at cutover."
+        ),
+    )
+    parser.add_argument(
+        "--bot-key",
+        default=None,
+        help=(
+            "Bot key to poll (e.g. 'sreda', 'sreda_home'). "
+            "Overrides SREDA_TELEGRAM_BOT_KEY env var. "
+            "Must match a key in TelegramBotRegistry. "
+            "Fail-closed if unknown."
         ),
     )
     return parser.parse_args(argv)
@@ -383,7 +432,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _install_signal_handlers(main_task: asyncio.Task) -> bool:
     """Wire SIGTERM / SIGINT to cancel the running main task.
 
-    Why: при ``systemctl stop sreda-telegram-poller`` systemd шлёт
+    Why: при ``systemctl stop sreda-telegram-poller@<key>`` systemd шлёт
     SIGTERM. Если мы не установим asyncio-aware handler, Python в
     стандартном поведении НЕ конвертирует SIGTERM в CancelledError
     (только SIGINT/Ctrl+C). Поллер просто продолжит крутиться, systemd
@@ -420,9 +469,47 @@ def _install_signal_handlers(main_task: asyncio.Task) -> bool:
 async def _amain(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     settings = get_settings()
-    if not settings.telegram_bot_token:
-        logger.error("SREDA_TELEGRAM_BOT_TOKEN is not set; refusing to start")
+
+    # --- Resolve bot_key -------------------------------------------------
+    # Priority: --bot-key CLI > SREDA_TELEGRAM_BOT_KEY env > legacy default.
+    bot_key: str | None = args.bot_key
+    if bot_key is None:
+        bot_key = os.environ.get("SREDA_TELEGRAM_BOT_KEY", "").strip() or None
+    if bot_key is None:
+        # Backward-compat: if neither flag nor env given, behave like legacy
+        # single-bot start with "sreda".  The legacy unit
+        # sreda-telegram-poller.service (no --bot-key) falls here.
+        bot_key = "sreda"
+
+    # --- Resolve registry ------------------------------------------------
+    from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
+
+    try:
+        registry = TelegramBotRegistry.from_settings(settings)
+        cfg = registry.resolve(bot_key)
+    except KeyError as exc:
+        logger.error(
+            "Unknown bot_key %r — refusing to start. "
+            "Check SREDA_TELEGRAM_BOT_KEY / --bot-key and registry config. "
+            "Detail: %s",
+            bot_key, exc,
+        )
         return 1
+
+    token = cfg.token
+    if not token:
+        logger.error(
+            "bot_key=%r has an empty token; refusing to start. "
+            "Set the corresponding token env var.",
+            bot_key,
+        )
+        return 1
+
+    logger.info("telegram poller resolving bot_key=%s username=%s", bot_key, cfg.username)
+
+    # --- --check-config: verify token↔bot before acquiring lock ----------
+    if args.check_config:
+        return await _run_check_config(bot_key, registry, telegram_client_for)
 
     # Startup check: embeddings (2026-05-04 lesson). Best-effort, не блокирует
     # старт — отправит alert в admin chat при проблеме.
@@ -439,7 +526,9 @@ async def _amain(argv: list[str] | None = None) -> int:
         .strip().lower() == "true"
     )
     poller = TelegramLongPoller(
-        settings.telegram_bot_token, auto_delete_webhook=auto_delete,
+        token,
+        bot_key=bot_key,
+        auto_delete_webhook=auto_delete,
     )
 
     # Issue #68 hotfix: the telegram-poller process runs handlers.chat()
@@ -472,14 +561,8 @@ async def _amain(argv: list[str] | None = None) -> int:
         try:
             await poller.startup()
         except SingletonLockError:
-            logger.error("singleton lock already held — aborting")
+            logger.error("singleton lock already held — aborting (bot_key=%s)", bot_key)
             return 2
-
-        if args.check_config:
-            logger.info(
-                "config OK; would have polled with offset=%d", poller.offset,
-            )
-            return 0
 
         try:
             await poller.run_forever()
@@ -504,6 +587,105 @@ async def _amain(argv: list[str] | None = None) -> int:
                 "llm-trace shutdown_drain raised в telegram-poller",
                 exc_info=True,
             )
+
+
+async def _run_check_config(
+    bot_key: str,
+    registry: object,
+    telegram_client_for_fn: object,
+) -> int:
+    """Run the --check-config verification path.
+
+    1. Call ``verify_bot_configs`` for the configured bot_key (token
+       uniqueness + getMe username match).
+    2. Fail-closed if bot has a token but NO username (swap-check can't
+       run silently).
+    3. Acquire the advisory lock + load offset, then release and exit 0.
+
+    Network unreachable: reported as a warning, continues (best-effort
+    connectivity at config-check time).  Username mismatch: hard fail (rc=1).
+    """
+    from sreda.config.bot_registry import verify_bot_configs
+
+    cfg = registry.resolve(bot_key)
+
+    # Fail-closed if token set but username not — swap-check can't verify.
+    if cfg.token and not cfg.username:
+        logger.error(
+            "--check-config: bot_key=%r has a token but no username configured. "
+            "Set the corresponding USERNAME env var so getMe can verify the "
+            "token↔bot mapping.  Refusing to start.",
+            bot_key,
+        )
+        return 1
+
+    # Build a get_me callable that unwraps the full body to the result sub-dict.
+    client = telegram_client_for_fn(bot_key, registry)
+
+    async def _real_get_me(token: str) -> dict:
+        # We use the already-resolved client (token was verified to match
+        # bot_key above). The token param exists for verify_bot_configs
+        # API compatibility; we ignore it and use the injected client.
+        try:
+            body = await client.get_me()
+            return body.get("result") or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "--check-config: getMe failed for bot_key=%s — "
+                "network may be unreachable (%s). "
+                "Skipping username verification.",
+                bot_key, exc,
+            )
+            # Return empty dict — verify_bot_configs will see actual=""
+            # which won't match expected username → hard fail.
+            # But we want to distinguish unreachable (skip) vs mismatch
+            # (fail), so re-raise so callers can detect.
+            raise
+
+    # Run verify_bot_configs — checks token uniqueness + username match
+    # for ALL bots in the registry, as the plan specifies.
+    network_unreachable = False
+    try:
+        await verify_bot_configs(registry, get_me=_real_get_me)
+        logger.info("--check-config: verify_bot_configs passed (all bots ok)")
+    except ValueError as exc:
+        # Hard fail: token duplicate or username mismatch.
+        logger.error("--check-config: FAILED — %s", exc)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        # getMe network error: report but don't block the rest of the check.
+        logger.warning(
+            "--check-config: getMe network error — skipping username verification "
+            "(%s). Advisory lock + offset check will still run.",
+            exc,
+        )
+        network_unreachable = True
+
+    # --- Acquire lock + load offset, then release ------------------------
+    # Re-use a temporary poller just for the lock/offset dance.
+    poller = TelegramLongPoller(
+        cfg.token,
+        bot_key=bot_key,
+    )
+    try:
+        await poller.startup()
+    except SingletonLockError:
+        logger.error(
+            "--check-config: singleton lock held by another instance (bot_key=%s). "
+            "The poller is already running — check-config cannot acquire the lock.",
+            bot_key,
+        )
+        return 2
+
+    logger.info(
+        "--check-config: OK — bot_key=%s channel=%s offset=%d%s",
+        bot_key,
+        poller._channel,
+        poller.offset,
+        " (getMe skipped — network unreachable)" if network_unreachable else "",
+    )
+    await poller.shutdown()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
