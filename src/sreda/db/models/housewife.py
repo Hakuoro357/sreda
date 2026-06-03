@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text as sa_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
@@ -98,11 +98,14 @@ class FamilyReminder(Base):
     )
 
     # Which bot was used when this reminder was created (Phase 5).
-    # NULL for legacy rows; proactive worker falls back to LEGACY_NULL_BOT_KEY.
     # Written at creation time so the reminder always fires via the originating
     # bot — "bot_key fixed at creation" rule (second-tg-bot-final.md Phase 5).
-    bot_key: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, default=LEGACY_NULL_BOT_KEY
+    # NOT NULL after migration 20260603_0053; server_default='sreda' as safety net.
+    bot_key: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default=LEGACY_NULL_BOT_KEY,
+        server_default=sa_text("'sreda'"),
     )
 
     created_at: Mapped[datetime] = mapped_column(

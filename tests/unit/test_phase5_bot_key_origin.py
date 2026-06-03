@@ -164,15 +164,17 @@ async def test_reminder_worker_legacy_reminder_uses_legacy_bot_key(session):
 
 
 @pytest.mark.asyncio
-async def test_reminder_worker_null_reminder_falls_back_to_legacy(session):
-    """A reminder with bot_key=NULL falls back to LEGACY_NULL_BOT_KEY in the worker."""
+async def test_reminder_worker_legacy_bot_key_reminder_routes_to_legacy(session):
+    """A reminder with bot_key=LEGACY_NULL_BOT_KEY routes via the legacy bot.
+
+    After migration 20260603_0053, family_reminders.bot_key is NOT NULL so
+    true NULL rows can no longer exist in the DB. The equivalent post-migration
+    case is a row with bot_key=LEGACY_NULL_BOT_KEY ('sreda'), which is what
+    the migration 0051 backfill wrote for all pre-existing rows.
+    """
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
-    # Force NULL past the service default via direct model insert
-    reminder = _make_reminder(session, bot_key=None)
-    # Clear the default set by model so it's truly NULL in DB
-    reminder.bot_key = None
-    session.commit()
+    _make_reminder(session, bot_key=LEGACY_NULL_BOT_KEY)
 
     worker = HousewifeReminderWorker(session)
     await worker.process_pending()
@@ -180,7 +182,7 @@ async def test_reminder_worker_null_reminder_falls_back_to_legacy(session):
     outbox_rows = session.query(OutboxMessage).all()
     assert outbox_rows, "No outbox rows were created"
     assert all(r.bot_key == LEGACY_NULL_BOT_KEY for r in outbox_rows), (
-        f"Expected bot_key={LEGACY_NULL_BOT_KEY!r} for NULL reminder, "
+        f"Expected bot_key={LEGACY_NULL_BOT_KEY!r} for legacy reminder, "
         f"got: {[r.bot_key for r in outbox_rows]}"
     )
 
@@ -237,15 +239,18 @@ def test_attach_reminder_no_bot_key_uses_legacy(session):
 # ---------------------------------------------------------------------------
 
 def test_family_reminders_has_bot_key_column(engine):
-    """family_reminders table must have a bot_key column after migration model."""
+    """family_reminders table must have a NOT NULL bot_key column after migration 0053."""
     insp = inspect(engine)
     cols = {c["name"]: c for c in insp.get_columns("family_reminders")}
     assert "bot_key" in cols, (
         "family_reminders.bot_key column is missing — "
-        "check FamilyReminder model and migration 20260603_0051"
+        "check FamilyReminder model and migration 20260603_0053"
     )
-    # Column is nullable (read-fallback in migration window)
-    assert cols["bot_key"]["nullable"] is True
+    # Column is NOT NULL after migration 20260603_0053.
+    assert cols["bot_key"]["nullable"] is False, (
+        "family_reminders.bot_key must be NOT NULL — "
+        "check FamilyReminder model and migration 20260603_0053"
+    )
 
 
 def test_outbox_messages_bot_key_not_null(engine):

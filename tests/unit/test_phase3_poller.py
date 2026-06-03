@@ -213,7 +213,7 @@ async def test_check_config_username_mismatch_returns_exit_1(fresh_db, monkeypat
     # inside _amain picks up the mock.
     with patch("sreda.config.bot_registry.TelegramBotRegistry") as mock_reg_cls:
         mock_reg_cls.from_settings.return_value = registry
-        with patch("sreda.config.bot_registry.telegram_client_for", return_value=fake_client):
+        with patch("sreda.workers.telegram_long_poll.TelegramClient", return_value=fake_client):
             rc = await tlp._amain(["--check-config", "--bot-key", "sreda"])
 
     assert rc == 1
@@ -254,7 +254,7 @@ async def test_check_config_all_ok_returns_0(fresh_db, monkeypatch):
 
     with patch("sreda.config.bot_registry.TelegramBotRegistry") as mock_reg_cls:
         mock_reg_cls.from_settings.return_value = registry
-        with patch("sreda.config.bot_registry.telegram_client_for", return_value=fake_client):
+        with patch("sreda.workers.telegram_long_poll.TelegramClient", return_value=fake_client):
             with patch.object(tlp, "create_engine", return_value=fake_engine):
                 rc = await tlp._amain(["--check-config", "--bot-key", "sreda"])
 
@@ -283,7 +283,7 @@ async def test_check_config_duplicate_token_returns_exit_1(fresh_db, monkeypatch
 
     with patch("sreda.config.bot_registry.TelegramBotRegistry") as mock_reg_cls:
         mock_reg_cls.from_settings.return_value = registry
-        with patch("sreda.config.bot_registry.telegram_client_for", return_value=fake_client):
+        with patch("sreda.workers.telegram_long_poll.TelegramClient", return_value=fake_client):
             rc = await tlp._amain(["--check-config", "--bot-key", "sreda"])
 
     assert rc == 1

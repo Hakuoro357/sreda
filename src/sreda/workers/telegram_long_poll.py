@@ -619,28 +619,25 @@ async def _run_check_config(
         )
         return 1
 
-    # Build a get_me callable that unwraps the full body to the result sub-dict.
-    client = telegram_client_for_fn(bot_key, registry)
-
+    # Build a get_me callable that builds a fresh client per token so
+    # verify_bot_configs compares the right bot's getMe to its username
+    # (not the currently-selected bot_key's client for every bot).
     async def _real_get_me(token: str) -> dict:
-        # We use the already-resolved client (token was verified to match
-        # bot_key above). The token param exists for verify_bot_configs
-        # API compatibility; we ignore it and use the injected client.
+        per_token_client = TelegramClient(token)
         try:
-            body = await client.get_me()
+            body = await per_token_client.get_me()
             return body.get("result") or {}
-        except Exception as exc:  # noqa: BLE001
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            # True network error (TCP/DNS/SOCKS unreachable) — re-raise so
+            # the outer handler can treat it as transient and skip.
             logger.warning(
-                "--check-config: getMe failed for bot_key=%s — "
-                "network may be unreachable (%s). "
+                "--check-config: getMe network error for token=*** (%s). "
                 "Skipping username verification.",
-                bot_key, exc,
+                exc,
             )
-            # Return empty dict — verify_bot_configs will see actual=""
-            # which won't match expected username → hard fail.
-            # But we want to distinguish unreachable (skip) vs mismatch
-            # (fail), so re-raise so callers can detect.
             raise
+        # Any other exception (TelegramDeliveryError for ok=false / 4xx / 5xx,
+        # bad-token 401, etc.) propagates as-is → outer handler hard-fails.
 
     # Run verify_bot_configs — checks token uniqueness + username match
     # for ALL bots in the registry, as the plan specifies.
@@ -652,7 +649,7 @@ async def _run_check_config(
         # Hard fail: token duplicate or username mismatch.
         logger.error("--check-config: FAILED — %s", exc)
         return 1
-    except Exception as exc:  # noqa: BLE001
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
         # getMe network error: report but don't block the rest of the check.
         logger.warning(
             "--check-config: getMe network error — skipping username verification "
@@ -660,6 +657,14 @@ async def _run_check_config(
             exc,
         )
         network_unreachable = True
+    except Exception as exc:  # noqa: BLE001
+        # Telegram API error / bad token / ok=false — hard config fail.
+        logger.error(
+            "--check-config: FAILED — getMe returned a config error "
+            "(bad token, Telegram API rejection, or ok=false): %s",
+            exc,
+        )
+        return 1
 
     # --- Acquire lock + load offset, then release ------------------------
     # Re-use a temporary poller just for the lock/offset dance.

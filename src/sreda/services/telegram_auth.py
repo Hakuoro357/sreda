@@ -216,7 +216,13 @@ def validate_telegram_init_data_any_bot(
     received_hash, data_pairs, data_check_string = _parse_init_data(init_data_raw)
 
     # 2. Build candidate list: prefer bots with a Mini App; fallback to all.
-    all_bots = registry.all_bots()
+    #    SECURITY: exclude bots with an empty/missing token — an empty token
+    #    produces a forgeable HMAC (key="") that any attacker can replicate.
+    all_bots = [b for b in registry.all_bots() if b.token]
+    if not all_bots:
+        raise TelegramInitDataError(
+            "No bots with a non-empty token are configured; cannot validate initData."
+        )
     candidates = [b for b in all_bots if b.miniapp_shortname is not None]
     if not candidates:
         candidates = all_bots

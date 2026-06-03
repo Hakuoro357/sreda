@@ -206,3 +206,33 @@ async def test_no_registry_falls_back_to_injected_client(session):
 
     assert row.status == "sent"
     assert len(legacy.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_non_null_bot_key_fails_closed(session, registry, monkeypatch):
+    """Fix 3: an explicit unknown bot_key must NOT fall back to sreda.
+
+    A row with bot_key='ghost_bot' (not in registry) must be marked
+    failed/unknown_bot_key and NOT delivered via any client.
+    """
+    factory = FakeTelegramClientFactory()
+    monkeypatch.setattr(
+        "sreda.workers.outbox_delivery.telegram_client_for", factory
+    )
+
+    row = _make_row(session, bot_key="ghost_bot")
+    worker = OutboxDeliveryWorker(session, registry=registry)
+    await worker._send_now(row)
+
+    # Row must be marked failed, not sent.
+    assert row.status == "failed", f"Expected 'failed', got {row.status!r}"
+    assert row.drop_reason == "unknown_bot_key", (
+        f"Expected drop_reason='unknown_bot_key', got {row.drop_reason!r}"
+    )
+
+    # No message must have been sent via any client.
+    for key in ("sreda", "sreda_home", "ghost_bot"):
+        client = factory.client_for(key)
+        assert client is None or len(client.sent) == 0, (
+            f"Unexpected send via client for {key!r}"
+        )

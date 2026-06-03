@@ -36,6 +36,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -44,6 +45,11 @@ import pytest
 # ---------------------------------------------------------------------------
 
 _SRC_ROOT = Path(__file__).parent.parent.parent / "src" / "sreda"
+
+# Top-level scripts directory (broadcast / maintenance scripts).
+# Separate scan root with its own allowlist so any future raw-token
+# regression in a new script is caught.
+_SCRIPTS_ROOT = Path(__file__).parent.parent.parent / "scripts"
 
 # Relative to _SRC_ROOT.  Files here are exempt from all three checks.
 _ALLOWLIST: set[str] = {
@@ -60,6 +66,18 @@ _ALLOWLIST: set[str] = {
     # Webhook-management operational script. Phase 8 gates/archives it
     # (--force-webhook-mode + fail-if-poller-active). TODO: re-evaluate at Phase 8.
     "scripts/restore_webhook.py",
+}
+
+# Allowlist for top-level scripts/ (relative to _SCRIPTS_ROOT).
+# broadcast_welcome_v2.py uses telegram_client_for — no raw token construction.
+_SCRIPTS_ALLOWLIST: set[str] = {
+    # Uses telegram_client_for(bot_key, registry) — approved factory pattern.
+    "broadcast_welcome_v2.py",
+    # Health/latency monitoring script. Uses raw httpx.get/post to
+    # api.telegram.org/bot for getMe/getWebhookInfo/sendMessage probes —
+    # the same rationale as admin_alerts.py in the src/sreda allowlist
+    # (sync/monitoring context where TelegramClient cannot be used).
+    "monitor_health.py",
 }
 
 # Pattern: TelegramClient( followed by anything containing a raw token
@@ -97,11 +115,33 @@ def _iter_py_files():
             yield f
 
 
+def _scripts_relative(path: Path) -> str:
+    """Return POSIX-style path relative to _SCRIPTS_ROOT."""
+    return path.relative_to(_SCRIPTS_ROOT).as_posix()
+
+
+def _is_scripts_allowlisted(path: Path) -> bool:
+    return _scripts_relative(path) in _SCRIPTS_ALLOWLIST
+
+
+def _iter_scripts_py_files():
+    """Yield non-allowlisted .py files from the top-level scripts/ directory."""
+    if not _SCRIPTS_ROOT.is_dir():
+        return
+    for f in _SCRIPTS_ROOT.rglob("*.py"):
+        if not _is_scripts_allowlisted(f):
+            yield f
+
+
 # ---------------------------------------------------------------------------
 # Check 1: TelegramClient( constructed with raw settings token
 # ---------------------------------------------------------------------------
 
-def _find_raw_telegram_client_calls(source: str, filepath: Path) -> list[str]:
+def _find_raw_telegram_client_calls(
+    source: str,
+    filepath: Path,
+    rel_fn: Callable[[Path], str] = _relative,
+) -> list[str]:
     """Return violation messages for TelegramClient calls with raw token args."""
     violations: list[str] = []
     try:
@@ -127,7 +167,7 @@ def _find_raw_telegram_client_calls(source: str, filepath: Path) -> list[str]:
             arg_src = ast.get_source_segment(source, arg) or ""
             if _RAW_TOKEN_ATTRS.search(arg_src):
                 violations.append(
-                    f"{_relative(filepath)}:{node.lineno}: "
+                    f"{rel_fn(filepath)}:{node.lineno}: "
                     f"TelegramClient( called with raw token arg: {arg_src!r}. "
                     f"Use telegram_client_for(bot_key, registry) instead."
                 )
@@ -138,7 +178,11 @@ def _find_raw_telegram_client_calls(source: str, filepath: Path) -> list[str]:
 # Check 2: raw os.environ / getenv reads for token env vars
 # ---------------------------------------------------------------------------
 
-def _find_raw_env_token_reads(source: str, filepath: Path) -> list[str]:
+def _find_raw_env_token_reads(
+    source: str,
+    filepath: Path,
+    rel_fn: Callable[[Path], str] = _relative,
+) -> list[str]:
     """Return violations for raw os.environ reads of token env vars."""
     violations: list[str] = []
     for i, line in enumerate(source.splitlines(), start=1):
@@ -152,7 +196,7 @@ def _find_raw_env_token_reads(source: str, filepath: Path) -> list[str]:
             # Heuristic: violation only if os.environ[ or getenv( also present.
             if "os.environ" in line or "getenv(" in line:
                 violations.append(
-                    f"{_relative(filepath)}:{i}: "
+                    f"{rel_fn(filepath)}:{i}: "
                     f"Raw os.environ/getenv read of Telegram token env var. "
                     f"Use TelegramBotRegistry.from_settings(get_settings()) instead."
                 )
@@ -163,7 +207,11 @@ def _find_raw_env_token_reads(source: str, filepath: Path) -> list[str]:
 # Check 3: direct api.telegram.org URL
 # ---------------------------------------------------------------------------
 
-def _find_raw_tg_api_urls(source: str, filepath: Path) -> list[str]:
+def _find_raw_tg_api_urls(
+    source: str,
+    filepath: Path,
+    rel_fn: Callable[[Path], str] = _relative,
+) -> list[str]:
     """Return violations for raw api.telegram.org/bot URL construction."""
     violations: list[str] = []
     for i, line in enumerate(source.splitlines(), start=1):
@@ -172,7 +220,7 @@ def _find_raw_tg_api_urls(source: str, filepath: Path) -> list[str]:
             continue
         if _TELEGRAM_API_URL in line:
             violations.append(
-                f"{_relative(filepath)}:{i}: "
+                f"{rel_fn(filepath)}:{i}: "
                 f"Direct Telegram Bot API URL outside approved client module. "
                 f"Use TelegramClient (from integrations/telegram/client.py) instead."
             )
@@ -183,8 +231,27 @@ def _find_raw_tg_api_urls(source: str, filepath: Path) -> list[str]:
 # Main test
 # ---------------------------------------------------------------------------
 
+def _collect_violations(
+    iter_files,
+    *checkers,
+) -> list[str]:
+    """Run all checker functions over all files from iter_files."""
+    violations: list[str] = []
+    for pyfile in iter_files():
+        try:
+            source = pyfile.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for checker in checkers:
+            violations.extend(checker(source, pyfile))
+    return violations
+
+
 def test_no_hardcoded_telegram_token_sends():
-    """Fail if any non-allowlisted file builds TelegramClient from raw token."""
+    """Fail if any non-allowlisted file builds TelegramClient from raw token.
+
+    Scans both src/sreda/ and the top-level scripts/ directory.
+    """
     all_violations: list[str] = []
     for pyfile in _iter_py_files():
         try:
@@ -192,6 +259,12 @@ def test_no_hardcoded_telegram_token_sends():
         except OSError:
             continue
         all_violations.extend(_find_raw_telegram_client_calls(source, pyfile))
+    for pyfile in _iter_scripts_py_files():
+        try:
+            source = pyfile.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        all_violations.extend(_find_raw_telegram_client_calls(source, pyfile, rel_fn=_scripts_relative))
 
     if all_violations:
         msg = (
@@ -203,7 +276,10 @@ def test_no_hardcoded_telegram_token_sends():
 
 
 def test_no_raw_token_env_reads():
-    """Fail if any non-allowlisted file reads raw Telegram token env vars."""
+    """Fail if any non-allowlisted file reads raw Telegram token env vars.
+
+    Scans both src/sreda/ and the top-level scripts/ directory.
+    """
     all_violations: list[str] = []
     for pyfile in _iter_py_files():
         try:
@@ -211,6 +287,12 @@ def test_no_raw_token_env_reads():
         except OSError:
             continue
         all_violations.extend(_find_raw_env_token_reads(source, pyfile))
+    for pyfile in _iter_scripts_py_files():
+        try:
+            source = pyfile.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        all_violations.extend(_find_raw_env_token_reads(source, pyfile, rel_fn=_scripts_relative))
 
     if all_violations:
         msg = (
@@ -223,7 +305,10 @@ def test_no_raw_token_env_reads():
 
 
 def test_no_raw_telegram_api_urls():
-    """Fail if any non-allowlisted file contains a raw api.telegram.org/bot URL."""
+    """Fail if any non-allowlisted file contains a raw api.telegram.org/bot URL.
+
+    Scans both src/sreda/ and the top-level scripts/ directory.
+    """
     all_violations: list[str] = []
     for pyfile in _iter_py_files():
         try:
@@ -231,6 +316,12 @@ def test_no_raw_telegram_api_urls():
         except OSError:
             continue
         all_violations.extend(_find_raw_tg_api_urls(source, pyfile))
+    for pyfile in _iter_scripts_py_files():
+        try:
+            source = pyfile.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        all_violations.extend(_find_raw_tg_api_urls(source, pyfile, rel_fn=_scripts_relative))
 
     if all_violations:
         msg = (

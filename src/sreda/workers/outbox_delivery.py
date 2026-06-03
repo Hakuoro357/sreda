@@ -154,13 +154,27 @@ class OutboxDeliveryWorker:
             try:
                 tg_client = telegram_client_for(effective_bot_key, self.registry)
             except KeyError:
-                logger.warning(
-                    "outbox delivery: unknown bot_key %r on row %s, "
-                    "falling back to LEGACY_NULL_BOT_KEY",
-                    effective_bot_key,
-                    row.id,
-                )
-                tg_client = telegram_client_for(LEGACY_NULL_BOT_KEY, self.registry)
+                if row.bot_key is None:
+                    # NULL bot_key: migration-window row — safe to fall back.
+                    logger.warning(
+                        "outbox delivery: NULL bot_key on row %s, "
+                        "falling back to LEGACY_NULL_BOT_KEY",
+                        row.id,
+                    )
+                    tg_client = telegram_client_for(LEGACY_NULL_BOT_KEY, self.registry)
+                else:
+                    # Explicit unknown key: corruption / stale config — fail
+                    # closed, do NOT route through the wrong bot.
+                    logger.error(
+                        "outbox delivery: unknown bot_key %r on row %s "
+                        "(not a NULL legacy row). Marking failed.",
+                        row.bot_key,
+                        row.id,
+                    )
+                    row.status = "failed"
+                    row.drop_reason = "unknown_bot_key"
+                    self.session.commit()
+                    return
         else:
             tg_client = self.telegram
 
