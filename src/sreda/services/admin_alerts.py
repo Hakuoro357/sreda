@@ -43,7 +43,6 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import SQLAlchemyError
 
 from sreda.config.settings import get_settings
-from sreda.integrations.telegram.client import TelegramClient
 
 
 logger = logging.getLogger(__name__)
@@ -127,7 +126,10 @@ async def alert_admin_async(text: str) -> bool:
     import asyncio
 
     settings = get_settings()
-    tg_bot_token = settings.telegram_bot_token
+    from sreda.config.bot_registry import TelegramBotRegistry
+    _registry = TelegramBotRegistry.from_settings(settings)
+    _admin_cfg = _registry.resolve(_registry.admin_bot_key)
+    tg_bot_token = _admin_cfg.token or None
     tg_chat_id = settings.admin_telegram_chat_id
     max_bot_token = settings.max_bot_token
     max_chat_id = settings.admin_max_chat_id
@@ -511,14 +513,17 @@ def send_admin_alert(
     """
     # Early exit checks на caller thread (no I/O)
     settings = get_settings()
-    tg_bot_token = settings.telegram_bot_token
+    from sreda.config.bot_registry import TelegramBotRegistry
+    _registry = TelegramBotRegistry.from_settings(settings)
+    _admin_cfg = _registry.resolve(_registry.admin_bot_key)
+    tg_bot_token = _admin_cfg.token or None
     tg_chat_id = settings.admin_telegram_chat_id
     max_bot_token = settings.max_bot_token
     max_chat_id = settings.admin_max_chat_id
 
     # R-28 amendment: at least one channel must be fully configured.
     # MAX configured = max_bot_token + admin_max_chat_id (primary).
-    # TG configured = telegram_bot_token + admin_telegram_chat_id (fallback or legacy).
+    # TG configured = admin_bot_key token + admin_telegram_chat_id (fallback or legacy).
     max_ok = bool(max_bot_token and max_chat_id)
     tg_ok = bool(tg_bot_token and tg_chat_id)
     if not (max_ok or tg_ok):

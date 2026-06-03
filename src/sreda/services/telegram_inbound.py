@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import get_settings
 from sreda.db.models.core import InboundMessage, Tenant
 from sreda.db.session import get_session_factory
@@ -141,7 +142,6 @@ async def _process_approved_turn(
     payload: dict,
     onboarding,
     inbound_message_id: str,
-    bot_token: str,
 ) -> None:
     """Run full approved-user processing detached from caller.
 
@@ -165,7 +165,6 @@ async def _process_approved_turn(
             payload=payload,
             onboarding=onboarding,
             inbound_message_id=inbound_message_id,
-            bot_token=bot_token,
         )
 
 
@@ -175,7 +174,6 @@ async def _process_approved_turn_locked(
     payload: dict,
     onboarding,
     inbound_message_id: str,
-    bot_token: str,
 ) -> None:
     """Inner — runs under the per-tenant lock.
 
@@ -193,7 +191,8 @@ async def _process_approved_turn_locked(
             bg_session, inbound_message_id, "processing_started",
         )
 
-        telegram_client = TelegramClient(bot_token)
+        registry = TelegramBotRegistry.from_settings(get_settings())
+        telegram_client = telegram_client_for(bot_key, registry)
         trace_ctx = trace.start_trace(
             user_id=onboarding.user_id,
             tenant_id=onboarding.tenant_id,
@@ -312,6 +311,7 @@ async def _process_approved_turn_locked(
 async def _handle_pending_tenant(
     session: Session,
     *,
+    bot_key: str,
     payload: dict,
     onboarding,
 ) -> None:
@@ -354,7 +354,8 @@ async def _handle_pending_tenant(
         input_text = str(message.get("text"))
 
     reply = pending_bot.match(input_text, is_callback=is_callback)
-    pending_client = TelegramClient(settings.telegram_bot_token)
+    registry = TelegramBotRegistry.from_settings(settings)
+    pending_client = telegram_client_for(bot_key, registry)
 
     cb_id = (
         str(callback_query.get("id") or "")
@@ -462,8 +463,8 @@ async def handle_telegram_update(
             chat_id = _extract_chat_id(payload)
             if chat_id and settings.telegram_bot_token:
                 try:
-                    from sreda.integrations.telegram.client import TelegramClient
-                    client = TelegramClient(token=settings.telegram_bot_token)
+                    _registry = TelegramBotRegistry.from_settings(settings)
+                    client = telegram_client_for(bot_key, _registry)
                     await client.send_message(
                         chat_id=chat_id,
                         text=UPGRADE_COPY.get(exc.reason, UPGRADE_COPY["signups_closed"]),
@@ -492,8 +493,8 @@ async def handle_telegram_update(
             )
             if not is_welcome_sent(session, onboarding.tenant_id, onboarding.user_id):
                 try:
-                    from sreda.integrations.telegram.client import TelegramClient
-                    client = TelegramClient(token=settings.telegram_bot_token)
+                    _registry = TelegramBotRegistry.from_settings(settings)
+                    client = telegram_client_for(bot_key, _registry)
                     await client.send_message(
                         chat_id=onboarding.chat_id,
                         text=build_post_approve_message(),
@@ -560,8 +561,8 @@ async def handle_telegram_update(
             )
             if onboarding.chat_id and settings.telegram_bot_token:
                 try:
-                    from sreda.integrations.telegram.client import TelegramClient
-                    client = TelegramClient(token=settings.telegram_bot_token)
+                    _registry = TelegramBotRegistry.from_settings(settings)
+                    client = telegram_client_for(bot_key, _registry)
                     await client.send_message(
                         chat_id=onboarding.chat_id,
                         text=UPGRADE_COPY.get(
@@ -583,7 +584,7 @@ async def handle_telegram_update(
 
         if not is_approved:
             await _handle_pending_tenant(
-                session, payload=payload, onboarding=onboarding,
+                session, bot_key=bot_key, payload=payload, onboarding=onboarding,
             )
             _set_processing_status(
                 session, result.inbound_message_id, "ignored",
@@ -617,7 +618,6 @@ async def handle_telegram_update(
             payload=payload,
             onboarding=onboarding,
             inbound_message_id=inbound_message_id,
-            bot_token=settings.telegram_bot_token,
         )
     else:
         asyncio.create_task(
@@ -626,7 +626,6 @@ async def handle_telegram_update(
                 payload=payload,
                 onboarding=onboarding,
                 inbound_message_id=inbound_message_id,
-                bot_token=settings.telegram_bot_token,
             ),
             name=f"approved_turn:{onboarding.tenant_id}:{inbound_message_id}",
         )

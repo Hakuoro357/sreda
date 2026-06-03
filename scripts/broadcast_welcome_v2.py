@@ -38,11 +38,11 @@ import argparse
 import asyncio
 import logging
 import sys
-import time
 from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import get_settings
 from sreda.db.models.core import Tenant, User
 from sreda.db.session import get_db_session
@@ -169,7 +169,8 @@ async def _run(args: argparse.Namespace) -> int:
         _log("ERROR: SREDA_TELEGRAM_BOT_TOKEN not set; cannot send")
         return 2
 
-    client = TelegramClient(settings.telegram_bot_token)
+    _registry = TelegramBotRegistry.from_settings(settings)
+    client = telegram_client_for(_registry.system_default_bot_key, _registry)
 
     # Open one session for the whole pass — list, then send.
     session_gen = get_db_session()
