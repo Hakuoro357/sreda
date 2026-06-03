@@ -113,8 +113,13 @@ sleep 2  # дать TG обработать deleteWebhook для всех бот
 for bot_key in $BOT_KEYS; do
     unit="sreda-telegram-poller@${bot_key}.service"
 
-    # Проверяем что юнит существует и был enabled/active до рестарта
-    if ! systemctl list-unit-files "$unit" >/dev/null 2>&1; then
+    # Проверяем что юнит существует и был enabled/active до рестарта.
+    # ВАЖНО: `systemctl cat` резолвит TEMPLATE-инстанс (например
+    # sreda-telegram-poller@sreda.service) через его @.service-файл.
+    # `list-unit-files <instance>` НЕ матчит имя инстанса (только сам
+    # template-файл) → раньше установленные инстансы ошибочно считались
+    # «не установлен» и поллеры НЕ рестартовались при каждом прогоне.
+    if ! systemctl cat "$unit" >/dev/null 2>&1; then
         log "  phase 3b [${bot_key}]: юнит ${unit} не установлен — пропускаем"
         continue
     fi

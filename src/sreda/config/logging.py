@@ -105,6 +105,15 @@ def _build_config(
             "uvicorn": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
             "uvicorn.error": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
             "uvicorn.access": {"level": logging.INFO, "handlers": ["access"], "propagate": False},
+            # SECURITY: httpx logs every request as "HTTP Request: POST <url>"
+            # at INFO, and Telegram API URLs embed the bot token
+            # (https://api.telegram.org/bot<id>:<token>/getUpdates ...). At the
+            # poller's INFO level those tokens were written in cleartext to
+            # /var/log/sreda/telegram-poller-*.log. Pin httpx/httpcore to
+            # WARNING so request URLs (and the tokens in them) are never logged;
+            # genuine httpx warnings/errors still propagate to root.
+            "httpx": {"level": logging.WARNING},
+            "httpcore": {"level": logging.WARNING},
             # sreda.llm — request/response traces for the conversational
             # handler. Pinned at INFO so traces survive prod WARNING.
             # Troubleshooting "bot forgot context" / "LLM hallucinated"

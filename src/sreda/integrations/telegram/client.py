@@ -224,8 +224,11 @@ class TelegramClient:
             response = await client.get(url, timeout=15.0)
             response.raise_for_status()
             return response.content
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
-            raise TelegramDeliveryError(f"Failed to download file: {file_path}") from exc
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError):
+            # SECURITY: `from None` — never chain the httpx exc; its traceback/str
+            # embeds the token-bearing request URL (bot<id>:<token>/...), which
+            # would surface via any upstream logger.exception()/exc_info=True.
+            raise TelegramDeliveryError(f"Failed to download file: {file_path}") from None
 
     async def _post_json(self, method: str, payload: dict, *, timeout: float) -> dict:
         return await self._post_request(
@@ -293,9 +296,13 @@ class TelegramClient:
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 last_status = exc.response.status_code
+                # SECURITY: never log the httpx exception object — its __str__
+                # embeds the full request URL, and Telegram URLs contain the bot
+                # token (bot<id>:<token>/...). Log only the exception class name;
+                # the actionable detail (status) is already captured separately.
                 logger.warning(
                     "Telegram request failed: method=%s attempt=%s status=%s error=%s",
-                    method, attempt, last_status, exc,
+                    method, attempt, last_status, type(exc).__name__,
                 )
                 # 2026-04-28: 4xx — non-retryable. 400 (callback expired,
                 # bad request), 403 (bot blocked), 404 (chat not found),
@@ -303,27 +310,33 @@ class TelegramClient:
                 # rate-limit и не приведут к успеху. Failing fast убирает
                 # spam loops при tap-flood / истёкших callback'ах.
                 if 400 <= last_status < 500:
+                    # SECURITY: from None — don't chain the token-bearing httpx exc.
                     raise TelegramDeliveryError(
                         f"Telegram {method} non-retryable {last_status}",
                         method=method,
                         status_code=last_status,
-                    ) from exc
+                    ) from None
                 # 5xx — retryable, продолжаем
                 if attempt < 3:
                     await asyncio.sleep(0.5 * attempt)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
+                # SECURITY: log only the class name — the exception text can
+                # include the token-bearing request URL (see note above).
                 logger.warning(
                     "Telegram request failed: method=%s attempt=%s error=%s",
-                    method, attempt, exc,
+                    method, attempt, type(exc).__name__,
                 )
                 if attempt < 3:
                     await asyncio.sleep(0.5 * attempt)
+        # SECURITY: from None + only the exception class — never chain or render
+        # last_error (httpx exc); its traceback/str embeds the token URL.
         raise TelegramDeliveryError(
-            f"Telegram request failed for {method}",
+            f"Telegram request failed for {method} "
+            f"(last_error={type(last_error).__name__})",
             method=method,
             status_code=last_status,
-        ) from last_error
+        ) from None
 
 
 # 2026-04-29: keepalive pinger — фоновая task которая раз в 45с пингует

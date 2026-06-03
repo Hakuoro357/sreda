@@ -311,8 +311,13 @@ def _post_telegram_sync(bot_token: str, chat_id: str, text: str) -> bool:
             resp.status_code, resp.text[:200],
         )
         return False
-    except Exception:  # noqa: BLE001 — must never crash caller
-        logger.exception("admin_alerts: Telegram POST failed")
+    except Exception as exc:  # noqa: BLE001 — must never crash caller
+        # SECURITY: log only the exception class — logger.exception() would emit
+        # the full traceback, and an httpx error's repr embeds the token-bearing
+        # Telegram URL. (This path uses raw httpx.post, not TelegramClient.)
+        logger.warning(
+            "admin_alerts: Telegram POST failed: %s", type(exc).__name__
+        )
         return False
 
 
