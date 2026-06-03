@@ -45,6 +45,10 @@
 - `compose.kind` ДОЛЖНО быть `"template"` (не `"llm"`)
 - `compose.template_id` ДОЛЖНО быть из: `ask_user_for_clarification` (общий переспрос), `ask_when_to_remind` (переспрос времени для напоминания), `partial_with_clarification` (когда есть выполненные действия + переспрос)
 - Если `actions` непустой → `template_id` ОБЯЗАТЕЛЬНО `partial_with_clarification` с `template_data.done_summary: "<что сделано>"`
+- `template_data.missing_fields` (опционально, только для `ask_user_for_clarification` и `partial_with_clarification`): список кодов недостающих параметров. Коды — СТРОГО из закрытого списка:
+  `reminder_subject` | `time` | `date` | `recipient` | `items` | `quantity` | `recipe_name` | `query` | `details`
+  Произвольные строки и коды вне списка отклоняются валидатором. Пустой список `[]` допустим (шаблон покажет универсальный вопрос).
+  **Важно**: `ask_when_to_remind` НЕ использует `missing_fields` — он использует своё собственное поле `what`. Не смешивай контракты.
 
 Контракт `clarity="reply_only"`:
 - `actions` ДОЛЖЕН быть пустым `{}`

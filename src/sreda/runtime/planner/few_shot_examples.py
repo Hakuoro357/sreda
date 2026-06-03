@@ -510,6 +510,35 @@ _EXAMPLES: list[FewShotExample] = [
             },
         },
     ),
+    # ──────────────────────────────────────────────────────────────────
+    # 11. Structured clarification — missing_fields with enum codes
+    # Shows the closed-enum contract: missing_fields must contain only
+    # recognised codes from the CLARIFICATION_FIELDS set.
+    # Planner heard "напомни про встречу" — knows the subject but not the
+    # time, and the user said "в пятницу" (ambiguous — no clock time).
+    # ──────────────────────────────────────────────────────────────────
+    FewShotExample(
+        user_message="напомни про встречу в пятницу",
+        context_brief="",
+        plan={
+            "schema_version": 1,
+            "turn_classification": {
+                "is_new_turn": True,
+                "reason": "просьба напомнить — дата частично указана, время не названо",
+            },
+            "clarity": "needs_clarification",
+            "clarity_reason": "не указано точное время напоминания",
+            "actions": {},
+            "compose": {
+                "kind": "template",
+                "template_id": "ask_user_for_clarification",
+                "template_data": {
+                    "missing_fields": ["time"],
+                    "clarity_reason": "не указано точное время напоминания",
+                },
+            },
+        },
+    ),
 ]
 
 

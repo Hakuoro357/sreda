@@ -575,6 +575,10 @@ class Plan(BaseModel):
                             f"must be a non-blank string. Got: "
                             f"{item!r} (type {type(item).__name__})."
                         )
+            # Note: clarification payload validation (missing_fields codes,
+            # done_summary literal check) is handled by
+            # validator._check_composer_allowlist, which covers BOTH root and
+            # branch composes via _iter_all_composes. No duplicate check here.
         return self
 
     @model_validator(mode="after")

@@ -30,6 +30,7 @@ from jinja2 import (
     TemplateError,
 )
 
+from sreda.services.clarification_contract import clarification_field_ru
 from sreda.services.composer.templates_housewife import HOUSEWIFE_TEMPLATES
 
 
@@ -72,6 +73,10 @@ class ComposerRegistry:
             undefined=StrictUndefined,
             keep_trailing_newline=False,
         )
+        # Register the ``clarify_ru`` filter so clarification templates can
+        # render ``{{ field | clarify_ru }}`` instead of an inline if/elif chain.
+        # Imported from the zero-intra-project-import leaf module — cycle-safe.
+        self._env.filters["clarify_ru"] = clarification_field_ru
         self._entries: dict[str, TemplateEntry] = {}
 
     def register(self, template_id: str, source: str) -> None:

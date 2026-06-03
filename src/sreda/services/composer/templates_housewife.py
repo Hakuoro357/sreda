@@ -76,18 +76,17 @@ _ASK_USER_FOR_CLARIFICATION = (
     # ``clarity_reason`` to the user — it leaks as raw reasoning
     # ("приветствие — не указано, чем могу помочь"). The user-facing ask is
     # built from the structured ``missing_fields`` (rendered into friendly
-    # bullet prompts) plus a clean canned question. ``clarity_reason`` stays
-    # internal (logged / trace only), never rendered to the user.
+    # bullet prompts via ``clarify_ru`` filter) plus a clean canned question.
+    # ``clarity_reason`` stays internal (logged / trace only), never rendered.
     # (StrictUndefined: use ``is defined and`` so callers may omit fields.)
+    # issue #88 PR-a: raw ``{{ field }}`` else-branch removed. All field codes
+    # now go through the ``clarify_ru`` Jinja filter which maps each closed-
+    # enum code to its Russian question fragment, falling back to the generic
+    # phrase for any unknown code — the raw English code never reaches the user.
     "{% if missing_fields is defined and missing_fields %}"
     "Уточни{% if missing_fields|length > 1 %} пару моментов{% endif %}:"
     "{% for field in missing_fields %}"
-    "{% if field == 'time' %}\n— когда (сегодня, завтра, конкретная дата + время)"
-    "{% elif field == 'recipient' %}\n— кому напомнить (тебе или другому)"
-    "{% elif field == 'items' %}\n— что именно (несколько слов для уточнения)"
-    "{% elif field == 'quantity' %}\n— сколько (количество или объём)"
-    "{% else %}\n— {{ field }}"
-    "{% endif %}"
+    "\n— {{ field | clarify_ru }}"
     "{% endfor %}"
     "{% else %}"
     "Не до конца поняла запрос. Скажи чуть подробнее, что именно нужно?"
@@ -107,6 +106,9 @@ _PARTIAL_WITH_CLARIFICATION = (
     # issue #88 Root-Cause-B: same fix as ask_user_for_clarification —
     # never echo the internal ``clarity_reason`` to the user; build the ask
     # from ``missing_fields`` + a clean canned line. Keep the done_summary ack.
+    # issue #88 PR-a: raw ``{{ field }}`` else-branch removed. All field codes
+    # now go through the ``clarify_ru`` Jinja filter (same as
+    # ask_user_for_clarification) — the raw English code never reaches the user.
     "{% if done_summary is defined and done_summary %}"
     "Сделала: {{ done_summary }}.\n\n"
     "{% endif %}"
@@ -114,12 +116,7 @@ _PARTIAL_WITH_CLARIFICATION = (
     "{% if missing_fields is defined and missing_fields %}"
     "\n\nУточни{% if missing_fields|length > 1 %} пару моментов{% endif %}:"
     "{% for field in missing_fields %}"
-    "{% if field == 'time' %}\n— когда (сегодня, завтра, конкретная дата + время)"
-    "{% elif field == 'recipient' %}\n— кому напомнить (тебе или другому)"
-    "{% elif field == 'items' %}\n— что именно (несколько слов для уточнения)"
-    "{% elif field == 'quantity' %}\n— сколько (количество или объём)"
-    "{% else %}\n— {{ field }}"
-    "{% endif %}"
+    "\n— {{ field | clarify_ru }}"
     "{% endfor %}"
     "{% endif %}"
 )

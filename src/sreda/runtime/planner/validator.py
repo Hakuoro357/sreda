@@ -103,6 +103,7 @@ from sreda.runtime.planner.interpolation import (
     iter_refs,
 )
 from sreda.runtime.planner.schemas import Action, Plan
+from sreda.services.clarification_contract import validate_clarification_payload
 from sreda.services.composer_contracts import validate_humanize_result_payload
 from sreda.services.tool_schemas.base import ToolSpec
 
@@ -1877,6 +1878,15 @@ def _check_composer_allowlist(
     and kind='llm' ⇒ llm_prompt_key set (ComposerCall validator), so
     we only check membership here, not presence.
     """
+    # Template IDs that carry a clarification payload (missing_fields,
+    # done_summary, clarity_reason). Validated here — covering root AND
+    # all branch composes via _iter_all_composes — so unknown field codes
+    # in branch composes are caught at plan-time (FIX 3).
+    _CLARIFICATION_TEMPLATE_IDS: frozenset[str] = frozenset({
+        "ask_user_for_clarification",
+        "partial_with_clarification",
+    })
+
     for host_step_id, location, compose in _iter_all_composes(plan):
         if compose.kind == "template":
             if (
@@ -1893,6 +1903,21 @@ def _check_composer_allowlist(
                         f"Available: {sorted(composer_template_ids)}"
                     ),
                 )
+            # FIX 3: validate clarification payload for ALL composes that use
+            # the clarification contract (root + every branch). This covers
+            # unknown missing_fields codes in branch composes that schemas.py's
+            # root-only check missed. Single source of truth: validator.py.
+            if compose.template_id in _CLARIFICATION_TEMPLATE_IDS:
+                template_data = compose.template_data or {}
+                for error_msg in validate_clarification_payload(
+                    template_data, allow_refs=True
+                ):
+                    yield Violation(
+                        step_id=host_step_id,
+                        tool=None,
+                        code="clarification_payload_invalid",
+                        message=f"{location}: {error_msg}",
+                    )
         elif compose.kind == "llm":
             key = compose.llm_prompt_key
             if (

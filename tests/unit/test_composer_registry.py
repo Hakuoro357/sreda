@@ -275,10 +275,19 @@ def test_render_ask_user_for_clarification_multiple_known_fields() -> None:
     assert "кому напомнить" in out
 
 
-def test_render_ask_user_for_clarification_unknown_field_passthrough() -> None:
-    """Unknown field name → planner can request arbitrary uncatalogued
-    clarification by passing a free-text field name; template includes
-    it verbatim instead of a hardcoded prompt."""
+def test_render_ask_user_for_clarification_unknown_field_no_raw_echo() -> None:
+    """Unknown field code → ``clarify_ru`` filter returns the generic phrase;
+    the raw English/internal code is NEVER echoed to the user.
+
+    issue #88 PR-a: the old else-branch (``— {{ field }}``) that echoed
+    the raw code was replaced by ``{{ field | clarify_ru }}``. The filter
+    returns ``GENERIC_CLARIFICATION`` for any code not in the closed enum,
+    so the user always sees a friendly Russian phrase — never the planner's
+    internal field name.  Unknown codes are also rejected by the schema at
+    plan-time (``validate_clarification_payload``), so this path is an
+    additional defense-in-depth guard at the render layer.
+    """
+    # Render directly (bypassing schema validation) to test filter fallback.
     out = render(
         "ask_user_for_clarification",
         {
@@ -286,7 +295,10 @@ def test_render_ask_user_for_clarification_unknown_field_passthrough() -> None:
             "missing_fields": ["продукт_бренд_или_общий"],
         },
     )
-    assert "продукт_бренд_или_общий" in out
+    # Raw code must NOT appear in output.
+    assert "продукт_бренд_или_общий" not in out
+    # Generic fallback phrase must be present.
+    assert "Уточни" in out or "пожалуйста" in out
 
 
 def test_render_ask_user_for_clarification_no_fields() -> None:
