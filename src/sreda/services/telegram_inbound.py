@@ -454,7 +454,7 @@ async def handle_telegram_update(
         from sreda.services.signup_abuse import SignupBlocked
         from sreda.services.upgrade_copy import UPGRADE_COPY
         try:
-            onboarding = ensure_telegram_user_bundle(session, payload)
+            onboarding = ensure_telegram_user_bundle(session, payload, bot_key=bot_key)
         except SignupBlocked as exc:
             logger.info(
                 "telegram inbound: signup blocked reason=%s — drop update",

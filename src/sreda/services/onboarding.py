@@ -123,7 +123,17 @@ class TelegramOnboardingResult:
     assistant_id: str | None
 
 
-def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnboardingResult:
+def ensure_telegram_user_bundle(
+    session: Session,
+    payload: dict,
+    *,
+    bot_key: str = "sreda",
+) -> TelegramOnboardingResult:
+    """Ensure bundle for a Telegram update payload.
+
+    Phase 6: ``bot_key`` threaded through to apply per-bot onboarding
+    policy (signup_open). Defaults to ``"sreda"`` for backward-compat.
+    """
     chat_id = _extract_chat_id(payload)
     if chat_id is None:
         return TelegramOnboardingResult(False, None, None, None, None, None)
@@ -156,7 +166,7 @@ def ensure_telegram_user_bundle(session: Session, payload: dict) -> TelegramOnbo
 
     display_name = _extract_display_name(payload) or f"Пользователь {chat_id}"
     return ensure_telegram_user_bundle_by_id(
-        session, telegram_id=chat_id, display_name=display_name
+        session, telegram_id=chat_id, display_name=display_name, bot_key=bot_key,
     )
 
 
@@ -165,6 +175,7 @@ def ensure_telegram_user_bundle_by_id(
     *,
     telegram_id: str,
     display_name: str | None = None,
+    bot_key: str = "sreda",
 ) -> TelegramOnboardingResult:
     """Ensure a tenant/user/assistant bundle exists for a Telegram account.
 
@@ -173,6 +184,11 @@ def ensure_telegram_user_bundle_by_id(
     when the user opens the WebApp before ever sending /start. The
     WebApp's initData hash is signed by Telegram, so the telegram_id is
     trustworthy at this point.
+
+    Phase 6: ``bot_key`` resolves the per-bot ``signup_open`` policy from
+    ``TelegramBotRegistry``. Unknown ``bot_key`` → fail-closed (KeyError
+    from registry propagates). Existing tenants are always served
+    regardless of ``bot_key`` (Model B shared tenant).
 
     Returns the same ``TelegramOnboardingResult`` shape. ``is_new_user``
     is True only when a new bundle was actually created.
@@ -218,7 +234,27 @@ def ensure_telegram_user_bundle_by_id(
     # Phase 2C: signup abuse guard ПЕРЕД bundle creation. Raises
     # SignupBlocked если kill-switch / global cap / rate-limit hit.
     # Caller (handler) catches SignupBlocked → sends UPGRADE_COPY[reason].
-    guard = SignupAbuseGuard.from_runtime_config(session)
+    #
+    # Phase 6: resolve per-bot signup_open from registry. Fail-closed on
+    # unknown bot_key (KeyError from registry propagates to caller).
+    # Existing tenants (found above) are NOT gated — only new signups.
+    from sreda.config.bot_registry import TelegramBotRegistry
+    from sreda.config.settings import get_settings as _get_settings
+    _bot_signup_open: bool = True
+    try:
+        _registry = TelegramBotRegistry.from_settings(_get_settings())
+        _bot_signup_open = _registry.resolve(bot_key).signup_open
+    except KeyError:
+        # Unknown bot_key → fail-closed: block the signup.
+        logger.warning(
+            "ensure_telegram_user_bundle_by_id: unknown bot_key=%r — "
+            "failing closed (signup blocked)", bot_key,
+        )
+        raise SignupBlocked("signups_closed")
+
+    guard = SignupAbuseGuard.from_runtime_config(
+        session, bot_signup_open=_bot_signup_open,
+    )
     allowed, reason = guard.check_inside_tx(session, "telegram", telegram_id)
     if not allowed:
         raise SignupBlocked(reason)

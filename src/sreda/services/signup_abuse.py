@@ -94,6 +94,18 @@ class SignupAbuseGuard:
     subscription creation. Guard acquires advisory lock и does
     checks/inserts inside caller's tx — lock released только on
     caller's commit, после tenant + sub inserted.
+
+    Phase 6 (second-bot): per-bot signup_open semantics.
+
+    Precedence:
+    1. Global kill-switch (``signup_open`` from RuntimeConfig key
+       ``sreda_signup_open``): if False → ALL bots blocked regardless
+       of per-bot config. Emergency lever for Boris.
+    2. Per-bot ``bot_signup_open`` (from ``BotConfig.signup_open``):
+       if False for this bot → bot's new signups blocked; other bots
+       unaffected. Defaults to True (no change for old behaviour when
+       not supplied).
+    3. Capacity cap and rate-limit: always checked, bot-agnostic.
     """
 
     # Defaults — overridden via RuntimeConfig в production.
@@ -109,10 +121,23 @@ class SignupAbuseGuard:
         self,
         free_tier_active_max: int | None = None,
         signup_open: bool | None = None,
+        bot_signup_open: bool = True,
     ) -> None:
         """Args fall back to defaults; production caller should use
         :meth:`from_runtime_config` который pulls live values из
         RuntimeConfig service.
+
+        Parameters
+        ----------
+        free_tier_active_max:
+            Global capacity cap (active free subscriptions allowed).
+        signup_open:
+            Global kill-switch from RuntimeConfig. False → all bots
+            blocked immediately (emergency lever).
+        bot_signup_open:
+            Per-bot flag from ``BotConfig.signup_open``. False → this
+            bot's new signups blocked; global kill-switch still applies
+            first. Defaults to True (backward-compatible).
         """
         self.free_tier_active_max = (
             free_tier_active_max
@@ -123,15 +148,28 @@ class SignupAbuseGuard:
             signup_open if signup_open is not None
             else self.DEFAULT_SIGNUP_OPEN
         )
+        self.bot_signup_open = bot_signup_open
 
     @classmethod
-    def from_runtime_config(cls, session: Session) -> "SignupAbuseGuard":
+    def from_runtime_config(
+        cls,
+        session: Session,
+        *,
+        bot_signup_open: bool = True,
+    ) -> "SignupAbuseGuard":
         """Construct guard reading kill-switch + committed-cap из
         RuntimeConfig.
 
         Phase 2 (Codex MAJOR-3 fix 2026-05-07): без этого Boris не
         может закрыть signup в abuse-инциденте — оба значения были
         hardcoded.
+
+        Phase 6: added ``bot_signup_open`` parameter for per-bot
+        signup_open policy. Caller resolves this from
+        ``TelegramBotRegistry.resolve(bot_key).signup_open`` and
+        passes it here. The global RuntimeConfig kill-switch
+        (``sreda_signup_open``) is still checked first — it blocks
+        all bots regardless of per-bot setting.
 
         Parsing:
         - `sreda_signup_open`: 'true' / '1' / 'yes' → True, иначе False.
@@ -163,6 +201,7 @@ class SignupAbuseGuard:
         return cls(
             free_tier_active_max=free_tier_active_max,
             signup_open=signup_open,
+            bot_signup_open=bot_signup_open,
         )
 
     def check_inside_tx(
@@ -188,11 +227,17 @@ class SignupAbuseGuard:
                 "SELECT pg_advisory_xact_lock(hashtext('sreda_signup_lock'))"
             ))
 
-        # 2. Kill-switch
+        # 2. Global kill-switch (emergency lever — blocks ALL bots).
         if not self.signup_open:
             return (False, "signups_closed")
 
-        # 3. Committed liability cap (active free subscriptions count)
+        # 3. Per-bot signup_open (bot closed → this bot's signups blocked).
+        if not self.bot_signup_open:
+            return (False, "signups_closed")
+
+        # 4. Committed liability cap (active free subscriptions count).
+        # Bot-agnostic: shared global capacity across all bots (Model B
+        # shared tenant — limits are per-tenant, not per-bot).
         active_count = session.execute(text("""
             SELECT COUNT(*) FROM tenant_subscriptions ts
             JOIN subscription_plans sp ON ts.plan_id = sp.id
@@ -202,8 +247,9 @@ class SignupAbuseGuard:
         if (active_count or 0) >= self.free_tier_active_max:
             return (False, "free_tier_full")
 
-        # 4. Per-source rate limit. Python-side timestamp avoids
+        # 5. Per-source rate limit. Python-side timestamp avoids
         # PG INTERVAL vs SQLite datetime() syntax mismatch.
+        # Bot-agnostic: rate-limit tracks the source identity, not the bot.
         source_id_hash = hmac_signup_source(source_id)
         cutoff = datetime.now(timezone.utc) - timedelta(hours=_RATE_WINDOW_HOURS)
         recent = session.execute(text("""
@@ -215,7 +261,7 @@ class SignupAbuseGuard:
         if (recent or 0) >= _RATE_LIMIT_MAX:
             return (False, "rate_limited")
 
-        # 5. Record attempt. Python-side timestamp ensures recorded
+        # 6. Record attempt. Python-side timestamp ensures recorded
         # value matches что rate-limit query expects.
         session.execute(text("""
             INSERT INTO signup_attempts (channel, source_id_hash, attempted_at)

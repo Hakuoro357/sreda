@@ -159,6 +159,9 @@ def _require_miniapp_auth(
                     session,
                     telegram_id=account_id,
                     display_name=display_name,
+                    # Phase 6: default to "sreda" until Phase 7 wires
+                    # per-bot miniapp auth (multi-bot HMAC dispatch).
+                    bot_key="sreda",
                 )
                 session.commit()
             except _SignupBlocked as exc:
