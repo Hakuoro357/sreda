@@ -164,6 +164,23 @@ class ExecutionLog:
       this distinct from plain ``aborted`` (matches
       ``planner_executions.execution_status`` enum — see Group 6.3
       ``aborted_partial`` state). Codex Phase C R3-high MAJOR.
+
+    PR-c — ``abort_kind`` discriminator:
+
+    When ``outcome`` is ``aborted`` or ``aborted_partial`` AND the cause
+    is a ``.only`` selector that found 0 or >1 items, the executor sets:
+
+    - ``abort_kind = "selector_ambiguity"`` — stable string key
+      consumers switch on. ``None`` for all other abort causes.
+    - ``abort_details_public`` — sanitized info safe to surface to the
+      user: ``{"options": [<id-stripped labels>], "count": N}``.
+      ``options`` may be shorter than ``count`` (0-item case has no
+      labels). Never contains internal ids.
+    - ``abort_details_internal`` — diagnostics for logging/triage:
+      ``{"source_step_id": "s1", "target_tool": "...", "arg_path": "..."}``.
+
+    No new DB ``execution_status`` enum value — ``aborted``/``aborted_partial``
+    cover persistence; ``abort_kind`` is the in-memory discriminator.
     """
 
     steps: tuple[StepResult, ...]
@@ -174,6 +191,10 @@ class ExecutionLog:
         "aborted",
         "aborted_partial",
     ]
+    # PR-c 2c — structured abort discriminator (None for non-selector aborts).
+    abort_kind: str | None = None
+    abort_details_public: dict | None = None
+    abort_details_internal: dict | None = None
 
     def by_step_id(self) -> dict[str, StepResult]:
         return {s.step_id: s for s in self.steps}
@@ -987,6 +1008,10 @@ async def execute_plan(
 
     aborted = False
     abort_reason: str | None = None
+    # PR-c 2c — selector_ambiguity structured carrier (None = non-selector abort).
+    _abort_kind: str | None = None
+    _abort_details_public: dict | None = None
+    _abort_details_internal: dict | None = None
 
     def _record_skip(sid: str, reason: str) -> None:
         """Append a skip result AND track in skipped_step_ids so cascade
@@ -1072,6 +1097,64 @@ async def execute_plan(
                 batch_filtered.append(sid)
             if not batch_filtered:
                 continue
+
+            # PR-c 2g — per-batch selector barrier.
+            # After the per-batch re-filter and BEFORE opening any ledger
+            # row or creating coroutines, pre-resolve all ``.only`` refs
+            # for every step in this batch.  If any step is ambiguous
+            # (>1 or 0 items), halt the ENTIRE batch before any sibling
+            # commits.  Earlier-batch committed writes will be detected
+            # by _summarise_outcome → aborted_partial + done_summary.
+            if not aborted:
+                barrier_snapshot = dict(snapshot)  # same as what steps use
+                for sid in batch_filtered:
+                    action = plan.actions[sid]
+                    try:
+                        resolve_selector_refs(action.args, barrier_snapshot)
+                    except SelectorAmbiguityError as _barrier_exc:
+                        # Mark ALL batch steps as aborted-skipped (no ledger row).
+                        aborted = True
+                        abort_reason = "arg_violation"
+                        # Capture structured abort info for ExecutionLog (2c).
+                        _abort_kind = "selector_ambiguity"
+                        _abort_details_public = {
+                            "options": _barrier_exc.options_public,
+                            "count": _barrier_exc.count,
+                        }
+                        _abort_details_internal = {
+                            "source_step_id": (
+                                _barrier_exc.ref_path.split(".")[0]
+                                if _barrier_exc.ref_path else sid
+                            ),
+                            "target_tool": action.tool,
+                            "arg_path": _barrier_exc.ref_path,
+                        }
+                        # Record a pre-invoke abort result for this step (no ledger).
+                        state.results.append(StepResult(
+                            step_id=sid,
+                            tool=action.tool,
+                            status="arg_violation",
+                            error_summary=(
+                                f"selector_barrier_ambiguity: {_barrier_exc}"
+                            ),
+                        ))
+                        # Drain the rest of the batch as halted skips.
+                        remaining = [
+                            s for s in batch_filtered if s != sid
+                        ]
+                        for later_sid in remaining:
+                            _record_skip(later_sid, "halted_arg_violation")
+                        # Drain subsequent batches in this layer.
+                        for later_batch in batches[batch_idx + 1:]:
+                            for later_sid in later_batch:
+                                _record_skip(later_sid, "halted_arg_violation")
+                        break  # stop iterating batch_filtered; break to outer
+                    except Exception:  # noqa: BLE001
+                        # Non-ambiguity errors (bad path etc.) fall through to
+                        # the per-step handler in _execute_one_step below.
+                        pass
+                if aborted:
+                    break  # break the batch loop; outer layer loop will skip
 
             coros = []
             for sid in batch_filtered:
@@ -1184,7 +1267,13 @@ async def execute_plan(
         state.step_outputs.update(per_layer_new_outputs)
 
     outcome = _summarise_outcome(state.results, aborted, registry)
-    return ExecutionLog(steps=tuple(state.results), outcome=outcome)
+    return ExecutionLog(
+        steps=tuple(state.results),
+        outcome=outcome,
+        abort_kind=_abort_kind,
+        abort_details_public=_abort_details_public,
+        abort_details_internal=_abort_details_internal,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -511,7 +511,7 @@ _EXAMPLES: list[FewShotExample] = [
         },
     ),
     # ──────────────────────────────────────────────────────────────────
-    # 11. Structured clarification — missing_fields with enum codes
+    # 11 (was 12). Structured clarification — missing_fields with enum codes
     # Shows the closed-enum contract: missing_fields must contain only
     # recognised codes from the CLARIFICATION_FIELDS set.
     # Planner heard "напомни про встречу" — knows the subject but not the
@@ -540,6 +540,71 @@ _EXAMPLES: list[FewShotExample] = [
         },
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# PR-c: .only selector example (advertised to the planner)
+# ---------------------------------------------------------------------------
+# Appended to _EXAMPLES below so render_few_shot_block() actually teaches the
+# planner the .only pattern (Codex PR-c R1: prose-only advertising without an
+# example is half-baked). Pattern: list_reminders (s1) → update_reminder (s2)
+# via ${s1.items.only.field}. s1 MUST have a terminal empty branch; .only only
+# in args, not compose. Validated by the few-shot contract tests.
+_ONLY_SELECTOR_EXAMPLE = FewShotExample(
+    user_message="перенеси напоминание про молоко на 10:00",
+    context_brief="",
+    plan={
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "изменить напоминание"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_reminders",
+                "args": {},
+                "expected_outcomes": [
+                    {"match": {"status": "ok"}, "next": "s2"},
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "reminders_list_empty",
+                                 "template_data": {}}},
+                    {"match": {"status": "error"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "generic_tool_error",
+                                 "template_data": {"error_code": "${s1.error_code}"}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+            "s2": {
+                "tool": "update_reminder",
+                "args": {
+                    "reminder_id": "${s1.items.only.reminder_id}",
+                    "trigger_iso": "2026-06-03T10:00:00+03:00",
+                },
+                "expected_outcomes": [
+                    {"match": {"status": "updated"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "reminder_set_ok",
+                                 "template_data": {"what": "молоко", "when_phrase": "в 10:00"}}},
+                    {"match": {"status": "error"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "generic_tool_error",
+                                 "template_data": {"error_code": "${s2.error_code}"}}},
+                ],
+                "intent_group": "default",
+                "depends_on": ["s1"],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "reminder_set_ok",
+            "template_data": {"what": "молоко", "when_phrase": "в 10:00"},
+        },
+    },
+)
+
+# Advertise the .only pattern to the planner (Codex PR-c R1).
+_EXAMPLES.append(_ONLY_SELECTOR_EXAMPLE)
 
 
 def _iter_example_composes(plan: dict) -> list[dict]:

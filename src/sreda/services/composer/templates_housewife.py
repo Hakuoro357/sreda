@@ -122,6 +122,44 @@ _PARTIAL_WITH_CLARIFICATION = (
 )
 
 # ---------------------------------------------------------------------------
+# PR-c 2d — Selector ambiguity clarification
+# ---------------------------------------------------------------------------
+# Rendered by the execute→compose consumer (replay harness / future PR-2b node)
+# when ExecutionLog.abort_kind == "selector_ambiguity".  The template receives:
+#   options  : list[str]  — id-stripped public labels (may be empty for 0-case)
+#   count    : int        — actual number of items found (0 or >1)
+#   partial  : bool       — True when aborted_partial (earlier writes committed)
+#   done_summary : str    — (only when partial=True) what was already done
+#
+# Voice: на «ты», terse, matching Среда style.
+# ``is defined and`` guards: template_data keys may be absent in edge cases.
+_SELECTOR_AMBIGUITY_CLARIFICATION = (
+    # RUNTIME-ONLY template (Codex PR-c R1): produced by
+    # selector.clarification_compose_for_abort() AFTER execution for a `.only`
+    # ambiguity (>1 matches) — NEVER emitted by the planner, so it is NOT in
+    # CLARIFICATION_TEMPLATE_IDS. Handles BOTH abort cases (Codex PR-c R4 high):
+    #   - plain aborted (no prior writes, partial=False): option labels + count.
+    #   - aborted_partial (prior writes committed, partial=True): a GENERIC
+    #     literal done_summary acknowledgement ("Сделала: …") THEN the same
+    #     option labels + count — so the partial user still sees WHAT to
+    #     disambiguate (partial_with_clarification has no options slot). The
+    #     done_summary is a generic literal built in selector.py, NEVER raw tool
+    #     names (the PR-c R1 leak class stays closed).
+    # ``options`` are pre-sanitized (id-stripped) public labels.
+    "{% if partial is defined and partial and done_summary is defined and done_summary %}"
+    "Сделала: {{ done_summary }}.\n\n"
+    "{% endif %}"
+    "{% if options is defined and options %}"
+    "Уточни, какое из {{ count }}:"
+    "{% for opt in options %}"
+    "\n— {{ opt }}"
+    "{% endfor %}"
+    "{% else %}"
+    "Нашла {{ count }} вариантов — уточни словами, какой именно."
+    "{% endif %}"
+)
+
+# ---------------------------------------------------------------------------
 # Error / partial / fallback
 # ---------------------------------------------------------------------------
 
@@ -215,6 +253,8 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     "ask_user_for_clarification": _ASK_USER_FOR_CLARIFICATION,
     "ask_when_to_remind": _ASK_WHEN_TO_REMIND,
     "partial_with_clarification": _PARTIAL_WITH_CLARIFICATION,
+    # PR-c 2d — selector ambiguity clarification (runtime-generated, not plan-time)
+    "selector_ambiguity_clarification": _SELECTOR_AMBIGUITY_CLARIFICATION,
     # error / fallback
     "generic_tool_error": _GENERIC_TOOL_ERROR,
     "partial_with_compose_error": _PARTIAL_WITH_COMPOSE_ERROR,

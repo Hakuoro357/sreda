@@ -38,10 +38,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 from jinja2 import Environment, StrictUndefined
 
+from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
 from sreda.services.tool_schemas.base import ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -70,8 +71,13 @@ class PromptBudget:
     just enforce a realistic ceiling so accidental registry doubling
     (e.g. forgotten dedup, or test fixture pollution) is caught."""
 
-    max_total_chars: int = 70_000
-    max_prefix_chars: int = 60_000
+    # Bumped 2026-06-03 (PR-c, issue #88): adding the `.only` few-shot example
+    # (+~2k) pushed the measured prefix from ~60k to ~62k (registry 37.7k + 12
+    # few-shot examples 14.5k + template). 66k chars ≈ 22k tokens — still well
+    # within mimo-v2.5-pro's ~32k window, leaving room for the response. The
+    # cap remains a guard against accidental registry/example doubling.
+    max_total_chars: int = 76_000
+    max_prefix_chars: int = 66_000
     max_suffix_chars: int = 10_000
     max_user_message_chars: int = 4_096      # Telegram message cap
     max_history_chars: int = 4_500
@@ -218,8 +224,18 @@ def render_tool_registry_block(specs: Iterable[ToolSpec]) -> str:
 
 
 def render_composer_template_ids_block(template_ids: Iterable[str]) -> str:
-    """Sorted bullet-list of template_ids — for the planner reference."""
-    sorted_ids = sorted(set(template_ids))
+    """Sorted bullet-list of template_ids — for the planner reference.
+
+    Runtime-only template ids (``RUNTIME_ONLY_TEMPLATE_IDS``) are
+    excluded: advertising them would let the planner emit them in a
+    plan, which ``validate_plan`` rejects as
+    ``runtime_only_template_in_plan``.  The templates remain in
+    ``REGISTRY`` so the executor can render them at runtime.
+    """
+    sorted_ids = sorted(
+        tid for tid in set(template_ids)
+        if tid not in RUNTIME_ONLY_TEMPLATE_IDS
+    )
     return "\n".join(f"- `{tid}`" for tid in sorted_ids)
 
 

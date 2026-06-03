@@ -26,6 +26,30 @@ import re
 _CONTAINS_REF_RE = re.compile(r"\$\{[^}]*\}")
 
 
+RUNTIME_ONLY_TEMPLATE_IDS: frozenset[str] = frozenset({
+    "selector_ambiguity_clarification",
+})
+"""Template ids that are produced AT RUNTIME ONLY (e.g. by
+``selector.clarification_compose_for_abort()`` after execution).
+
+The planner must NEVER emit these ids in a plan compose — they are not
+advertised in the planner prompt (``composer_template_ids_block``) and
+``validate_plan`` rejects them with ``runtime_only_template_in_plan``.
+
+Kept here (zero intra-project imports) so both
+``sreda.runtime.planner.validator`` and
+``sreda.runtime.planner.prompt_builder`` can import the constant
+without introducing a circular dependency.
+
+The cycle to avoid:
+  validator → composer/__init__ → compose → executor → plan_compiler → validator
+  (same as the original cycle that motivated this module's extraction)
+
+These ids MUST remain registered in ``HOUSEWIFE_TEMPLATES`` /
+``REGISTRY`` so ``compose()`` can render them at runtime.
+"""
+
+
 CLARIFICATION_FIELDS: frozenset[str] = frozenset({
     "reminder_subject",
     "time",
@@ -191,6 +215,7 @@ __all__ = [
     "CLARIFICATION_FIELD_RU",
     "CLARIFICATION_FIELDS",
     "GENERIC_CLARIFICATION",
+    "RUNTIME_ONLY_TEMPLATE_IDS",
     "clarification_field_ru",
     "validate_clarification_payload",
 ]

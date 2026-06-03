@@ -191,6 +191,9 @@ def test_render_tool_spec_includes_name_and_args() -> None:
 
 
 def test_prefix_includes_all_composer_template_ids() -> None:
+    """All planner-visible (non-runtime-only) template_ids appear in prefix."""
+    from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
+
     prefix = build_cached_prefix(
         tool_specs=MIGRATED_TOOL_SPECS,
         composer_template_ids=REGISTRY.template_ids(),
@@ -198,7 +201,40 @@ def test_prefix_includes_all_composer_template_ids() -> None:
         few_shot_block=render_few_shot_block(),
     )
     for tid in REGISTRY.template_ids():
+        if tid in RUNTIME_ONLY_TEMPLATE_IDS:
+            continue  # runtime-only ids are intentionally excluded from prefix
         assert f"`{tid}`" in prefix, f"template_id {tid!r} not in prefix"
+
+
+def test_runtime_only_template_ids_absent_from_prefix() -> None:
+    """Runtime-only template ids must NOT appear in the rendered
+    composer_template_ids_block — the planner must never see them as options."""
+    from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
+
+    prefix = build_cached_prefix(
+        tool_specs=MIGRATED_TOOL_SPECS,
+        composer_template_ids=REGISTRY.template_ids(),
+        composer_llm_prompt_keys=frozenset(),
+        few_shot_block=render_few_shot_block(),
+    )
+    for tid in RUNTIME_ONLY_TEMPLATE_IDS:
+        assert f"`{tid}`" not in prefix, (
+            f"runtime-only template_id {tid!r} must NOT appear in the "
+            f"planner prefix — it would teach the planner to emit it"
+        )
+
+
+def test_render_composer_template_ids_block_excludes_runtime_only() -> None:
+    """render_composer_template_ids_block filters RUNTIME_ONLY_TEMPLATE_IDS
+    from the rendered output, regardless of what was passed in."""
+    from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
+
+    all_ids = list(REGISTRY.template_ids())
+    block = render_composer_template_ids_block(all_ids)
+    for tid in RUNTIME_ONLY_TEMPLATE_IDS:
+        assert f"`{tid}`" not in block, (
+            f"runtime-only id {tid!r} must be absent from the rendered block"
+        )
 
 
 def test_render_composer_template_ids_block_sorted() -> None:
@@ -1425,3 +1461,159 @@ def test_oversized_memory_is_trimmed_not_dropped() -> None:
     # Both memories survive — the huge one in trimmed form
     assert "малый факт" in suffix
     assert "xxx" in suffix       # huge content trimmed but visible
+
+
+# ---------------------------------------------------------------------------
+# Runtime-only template enforcement (Codex PR-c R2 MAJOR)
+# ---------------------------------------------------------------------------
+
+
+def _minimal_plan_dict(template_id: str, template_data: dict) -> dict:
+    """Return a minimal schema-valid Plan dict whose ROOT compose uses
+    the given template_id."""
+    return {
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "test"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {
+                        "match": {"status": "added"},
+                        "next": None,
+                        "compose": {
+                            "kind": "template",
+                            "template_id": "shopping_added_ok",
+                            "template_data": {"items": ["молоко"]},
+                        },
+                    }
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            }
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": template_id,
+            "template_data": template_data,
+        },
+    }
+
+
+def test_validate_plan_rejects_runtime_only_template_in_root_compose() -> None:
+    """validate_plan must reject a plan whose ROOT compose uses a
+    runtime-only template_id (e.g. selector_ambiguity_clarification).
+    The planner must never emit these — only the runtime can produce
+    them post-execution."""
+    from sreda.runtime.planner.schemas import Plan
+    from sreda.runtime.planner.validator import validate_plan
+
+    plan = Plan.model_validate(
+        _minimal_plan_dict(
+            "selector_ambiguity_clarification",
+            {"options": ["вариант А"], "count": 1, "partial": False},
+        )
+    )
+    registry = {s.name: s for s in MIGRATED_TOOL_SPECS}
+    violations = validate_plan(
+        plan, registry=registry,
+        composer_template_ids=frozenset(REGISTRY.template_ids()),
+    )
+    codes = [v.code for v in violations]
+    assert "runtime_only_template_in_plan" in codes, (
+        f"validate_plan must reject selector_ambiguity_clarification in root "
+        f"compose; got violations: {[(v.code, v.message) for v in violations]}"
+    )
+
+
+def test_validate_plan_rejects_runtime_only_template_in_branch_compose() -> None:
+    """validate_plan must reject a plan whose BRANCH compose uses a
+    runtime-only template_id."""
+    from sreda.runtime.planner.schemas import Plan
+    from sreda.runtime.planner.validator import validate_plan
+
+    plan_dict = {
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "test"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {
+                        "match": {"status": "added"},
+                        "next": None,
+                        # Branch uses runtime-only template — must be rejected
+                        "compose": {
+                            "kind": "template",
+                            "template_id": "selector_ambiguity_clarification",
+                            "template_data": {
+                                "options": ["вариант А"],
+                                "count": 1,
+                                "partial": False,
+                            },
+                        },
+                    }
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            }
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "shopping_added_ok",
+            "template_data": {"items": ["молоко"]},
+        },
+    }
+    plan = Plan.model_validate(plan_dict)
+    registry = {s.name: s for s in MIGRATED_TOOL_SPECS}
+    violations = validate_plan(
+        plan, registry=registry,
+        composer_template_ids=frozenset(REGISTRY.template_ids()),
+    )
+    codes = [v.code for v in violations]
+    assert "runtime_only_template_in_plan" in codes, (
+        f"validate_plan must reject selector_ambiguity_clarification in branch "
+        f"compose; got violations: {[(v.code, v.message) for v in violations]}"
+    )
+
+
+def test_validate_plan_no_false_positive_for_normal_template() -> None:
+    """Positive case: a normal (non-runtime-only) template in root compose
+    must NOT trigger runtime_only_template_in_plan."""
+    from sreda.runtime.planner.schemas import Plan
+    from sreda.runtime.planner.validator import validate_plan
+
+    plan = Plan.model_validate(
+        _minimal_plan_dict("shopping_added_ok", {"items": ["молоко"]})
+    )
+    registry = {s.name: s for s in MIGRATED_TOOL_SPECS}
+    violations = validate_plan(
+        plan, registry=registry,
+        composer_template_ids=frozenset(REGISTRY.template_ids()),
+    )
+    runtime_only_violations = [
+        v for v in violations if v.code == "runtime_only_template_in_plan"
+    ]
+    assert not runtime_only_violations, (
+        f"shopping_added_ok is not runtime-only — no such violation expected; "
+        f"got: {[(v.code, v.message) for v in runtime_only_violations]}"
+    )
+
+
+def test_registry_still_renders_selector_ambiguity_clarification() -> None:
+    """The template must remain renderable at runtime — removing it from
+    the planner prompt and validator allowlist must NOT break compose()."""
+    template_data = {
+        "options": ["молоко", "сливки"],
+        "count": 2,
+        "partial": False,
+    }
+    rendered = REGISTRY.render("selector_ambiguity_clarification", template_data)
+    assert rendered and rendered.strip()
+    # Spot-check: both option labels appear in the output
+    assert "молоко" in rendered
+    assert "сливки" in rendered

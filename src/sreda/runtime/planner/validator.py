@@ -103,7 +103,10 @@ from sreda.runtime.planner.interpolation import (
     iter_refs,
 )
 from sreda.runtime.planner.schemas import Action, Plan
-from sreda.services.clarification_contract import validate_clarification_payload
+from sreda.services.clarification_contract import (
+    RUNTIME_ONLY_TEMPLATE_IDS,
+    validate_clarification_payload,
+)
 from sreda.services.composer_contracts import validate_humanize_result_payload
 from sreda.services.tool_schemas.base import ToolSpec
 
@@ -2056,6 +2059,26 @@ def _check_composer_allowlist(
 
     for host_step_id, location, compose in _iter_all_composes(plan):
         if compose.kind == "template":
+            # Centrally reject runtime-only templates in any planner-emitted
+            # compose — root OR branch.  These templates are produced post-
+            # execution by the runtime (e.g. selector.clarification_compose_for_abort)
+            # and must never appear in a plan.  Keeping them out of
+            # CLARIFICATION_TEMPLATE_IDS is insufficient because they are still
+            # in REGISTRY.template_ids() which feeds the allowlist check and the
+            # planner prompt — this is the authoritative enforcement point.
+            if compose.template_id in RUNTIME_ONLY_TEMPLATE_IDS:
+                yield Violation(
+                    step_id=host_step_id,
+                    tool=None,
+                    code="runtime_only_template_in_plan",
+                    message=(
+                        f"{location}: template_id "
+                        f"{compose.template_id!r} is a RUNTIME-ONLY template "
+                        f"— produced by the executor after execution, never "
+                        f"by the planner. Remove it from the plan."
+                    ),
+                )
+                continue
             if (
                 composer_template_ids is not None
                 and compose.template_id not in composer_template_ids

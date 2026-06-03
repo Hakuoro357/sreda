@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sreda.runtime.planner.interpolation import (
     InvalidReferenceError,
@@ -454,8 +454,139 @@ def _resolve_selector_in_string(text: str, state: dict[str, Any]) -> Any:
     return _ResolvedLiteral(_REF_PATTERN.sub(replace, text))
 
 
+# ---------------------------------------------------------------------------
+# PR-c 2d — consumer routing helper
+# ---------------------------------------------------------------------------
+#
+# This helper is intentionally in selector.py (not executor.py) so that:
+# 1. It can be imported by consumers (replay harness, future PR-2b node)
+#    without pulling in the full executor module.
+# 2. It stays co-located with the selector logic it describes.
+# 3. ExecutionLog is imported lazily (TYPE_CHECKING guard) to avoid a
+#    circular import: executor → selector is fine; selector → executor
+#    would create a cycle (executor imports selector at the top level).
+#
+# The TYPE_CHECKING guard means the annotation uses a string forward ref
+# at runtime and is resolved only by type checkers.
+if TYPE_CHECKING:
+    from sreda.runtime.planner.executor import ExecutionLog
+    from sreda.runtime.planner.schemas import ComposerCall
+    from sreda.services.composer.compose import ComposeResult
+
+
+def clarification_compose_for_abort(
+    execution_log: "ExecutionLog",
+) -> "ComposerCall | None":
+    """Given an ExecutionLog with ``abort_kind=="selector_ambiguity"``,
+    return the appropriate ComposerCall for the consumer to use instead
+    of calling ``compose()`` with the plan-level compose.
+
+    Routing (BOTH cases use the runtime-only ``selector_ambiguity_clarification``
+    template, which renders the sanitized option labels + count):
+    - ``outcome == "aborted"`` (no prior writes) → ``partial=False``: just the
+      option labels + count.
+    - ``outcome == "aborted_partial"`` (prior writes committed) → ``partial=True``
+      plus a GENERIC literal ``done_summary`` acknowledging that some actions were
+      performed (NEVER raw tool names — the PR-c R1 leak class), THEN the same
+      option labels + count so the partial user still sees what to disambiguate
+      (Codex PR-c R4 high).
+
+    Returns ``None`` when there is no ``abort_kind`` to route (caller
+    falls through to normal ``compose()`` as usual).
+
+    Most consumers should NOT call this directly — use
+    ``compose_for_execution(plan.compose, execution_log, ...)`` (below), which
+    wraps this routing decision + ``compose()`` into a single seam so the
+    abort→clarification swap can never be skipped. This function stays public
+    for callers that need the routing decision on its own.
+
+    Routing decision (what ``compose_for_execution`` applies)::
+
+        abort_call = clarification_compose_for_abort(execution_log)
+        effective_call = abort_call if abort_call is not None else plan.compose
+        result = compose(effective_call, execution_log, ...)
+    """
+    # Import here to avoid circular dependency (selector is imported by executor).
+    from sreda.runtime.planner.schemas import ComposerCall  # noqa: PLC0415
+
+    if execution_log.abort_kind != "selector_ambiguity":
+        return None
+
+    public = execution_log.abort_details_public or {}
+    options: list[str] = public.get("options", [])
+    count: int = public.get("count", 0)
+
+    if execution_log.outcome == "aborted_partial":
+        # Some earlier steps committed writes — acknowledge them, THEN show the
+        # ambiguous options so the partial user still knows WHAT to disambiguate.
+        # Codex PR-c R4 (high) MAJOR: the prior routing to
+        # ``partial_with_clarification`` had no options slot, so the partial user
+        # was told "did part of it" but never shown the choices — asymmetric with
+        # the plain-aborted path. Use the selector template with ``partial=True``
+        # (it carries both the acknowledgement and the option list).
+        # done_summary MUST be a GENERIC literal — NEVER built from raw tool
+        # names (the PR-c R1 leak class stays closed).
+        return ComposerCall.model_validate({
+            "kind": "template",
+            "template_id": "selector_ambiguity_clarification",
+            "template_data": {
+                "options": options,
+                "count": count,
+                "partial": True,
+                "done_summary": "часть действий уже выполнила",
+            },
+        })
+
+    # Plain aborted — no prior writes.
+    return ComposerCall.model_validate({
+        "kind": "template",
+        "template_id": "selector_ambiguity_clarification",
+        "template_data": {
+            "options": options,
+            "count": count,
+            "partial": False,
+        },
+    })
+
+
+def compose_for_execution(
+    plan_compose_call: "ComposerCall",
+    execution_log: "ExecutionLog",
+    **compose_kwargs: Any,
+) -> "ComposeResult":
+    """THE single seam every execute->compose consumer must use.
+
+    Routes a selector-ambiguity abort to its runtime clarification compose;
+    otherwise falls through to the planner's plan-level ``ComposerCall``. All
+    remaining keyword args (``registry``, ``llm_composer``, ``ctx``,
+    snapshot-hash checks, ...) are forwarded verbatim to ``compose()``.
+
+    Why this exists (Codex PR-c R3 medium MAJOR): ``compose()`` deliberately
+    "trusts what it's given" and IGNORES branch overrides for non-``completed``
+    outcomes (see ``compose._pick_effective_call`` and the ``compose`` docstring
+    note on aborted plans). So a consumer that called
+    ``compose(plan.compose, execution_log)`` directly on a selector abort would
+    silently render the ORIGINAL plan compose instead of the ambiguity
+    clarification. The abort->clarification swap is therefore a consumer
+    responsibility; centralising it in ONE tracked, tested function means every
+    consumer — the replay harness today, the live Phase-E wiring (PR-2b)
+    tomorrow — routes aborts correctly and cannot forget the swap (g-035:
+    thread new pipeline status through ALL consumers).
+    """
+    # Deferred import: this is the planner -> composer dependency edge. Kept
+    # inside the function (not module-level) to avoid the import cycle
+    # validator -> composer/__init__ -> compose -> executor -> ... -> selector.
+    from sreda.services.composer import compose  # noqa: PLC0415
+
+    abort_call = clarification_compose_for_abort(execution_log)
+    effective_call = abort_call if abort_call is not None else plan_compose_call
+    return compose(effective_call, execution_log, **compose_kwargs)
+
+
 __all__ = [
     "SelectorAmbiguityError",
+    "clarification_compose_for_abort",
+    "compose_for_execution",
     "selector_public_label",
     "resolve_selector_refs",
     "unwrap_resolved",
