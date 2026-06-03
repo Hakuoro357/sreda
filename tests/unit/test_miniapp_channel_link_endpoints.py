@@ -58,6 +58,13 @@ def _settings(**overrides):
         "max_bot_token": "MAX_TOKEN",
         "telegram_bot_username": "sreda01_bot",
         "telegram_miniapp_shortname": "sreda_app",
+        # Phase 7: TelegramBotRegistry.from_settings needs these fields.
+        "home_bot_token": None,
+        "home_bot_username": None,
+        "home_miniapp_shortname": None,
+        "home_bot_signup_open": True,
+        "system_default_bot_key": "sreda",
+        "admin_bot_key": "sreda",
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

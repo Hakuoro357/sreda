@@ -60,10 +60,6 @@ _ALLOWLIST: set[str] = {
     # Webhook-management operational script. Phase 8 gates/archives it
     # (--force-webhook-mode + fail-if-poller-active). TODO: re-evaluate at Phase 8.
     "scripts/restore_webhook.py",
-    # Mini App initData validation still uses the global token. Phase 7 rewires
-    # it per-bot (parse-once/try-each-token). TODO: REMOVE from allowlist when
-    # Phase 7 lands.
-    "api/routes/miniapp.py",
 }
 
 # Pattern: TelegramClient( followed by anything containing a raw token
