@@ -22,6 +22,30 @@ class TelegramInboundPersistResult:
     is_duplicate: bool = False
 
 
+def _find_duplicate_inbound(
+    session: Session,
+    channel_type: str,
+    bot_key: str,
+    external_update_id: str,
+) -> "InboundMessage | None":
+    """Return an existing InboundMessage that matches the composite dedup key.
+
+    The key is ``(channel_type, bot_key, external_update_id)``.  Keying on
+    all three columns prevents two different bots from colliding on the same
+    numeric update_id (Telegram counters are per-bot, MAX ids are per-bot).
+    Returns ``None`` when no duplicate exists.
+    """
+    return (
+        session.query(InboundMessage)
+        .filter(
+            InboundMessage.channel_type == channel_type,
+            InboundMessage.bot_key == bot_key,
+            InboundMessage.external_update_id == external_update_id,
+        )
+        .first()
+    )
+
+
 def persist_telegram_inbound_event(
     session: Session,
     *,
@@ -74,14 +98,13 @@ def persist_telegram_inbound_event(
     update_id = _extract_update_id(payload)
 
     # M8: idempotency — if we already persisted an inbound message for
-    # this ``update_id``, return the existing record instead of creating
-    # a duplicate. Telegram may retry webhook delivery on network hiccups.
+    # this (channel_type, bot_key, update_id) triple, return the existing
+    # record instead of creating a duplicate.  Keying on the triple (not
+    # just update_id) prevents cross-bot collisions: Telegram update_id
+    # counters are independent per-bot, so bot-A's update 42 and bot-B's
+    # update 42 are distinct events.
     if update_id is not None:
-        existing = (
-            session.query(InboundMessage)
-            .filter(InboundMessage.external_update_id == update_id)
-            .first()
-        )
+        existing = _find_duplicate_inbound(session, "telegram", bot_key, update_id)
         if existing is not None:
             return TelegramInboundPersistResult(
                 inbound_message_id=existing.id,
@@ -217,13 +240,11 @@ def persist_max_inbound_event(
             workspace_id = workspace.id
 
     # Idempotency check ДО создания secure_record (не платим encryption
-    # на duplicate retries).
+    # на duplicate retries).  Keyed on (channel_type, bot_key,
+    # external_update_id) so MAX and Telegram id-spaces don't collide, and
+    # multiple MAX bots (if ever added) stay independent.
     if external_update_id is not None:
-        existing = (
-            session.query(InboundMessage)
-            .filter(InboundMessage.external_update_id == external_update_id)
-            .first()
-        )
+        existing = _find_duplicate_inbound(session, "max", bot_key, external_update_id)
         if existing is not None:
             return MaxInboundPersistResult(
                 inbound_message_id=existing.id,

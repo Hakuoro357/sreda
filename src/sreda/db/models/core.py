@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, event
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text, event, text as sa_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -225,6 +225,24 @@ class InboundMessage(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        # Partial unique index: one inbound record per (channel_type, bot_key,
+        # external_update_id) — prevents cross-bot dedup collisions when two
+        # Telegram bots share the same update_id counter space (they're
+        # independent per-bot sequences).  NULL update_ids are excluded so
+        # synthetic / no-id events are still insertable freely.
+        # NOTE: where-clauses must be sa.text() objects, not bare strings.
+        Index(
+            "ux_inbound_dedup_channel_bot_update",
+            "channel_type",
+            "bot_key",
+            "external_update_id",
+            unique=True,
+            postgresql_where=sa_text("external_update_id IS NOT NULL"),
+            sqlite_where=sa_text("external_update_id IS NOT NULL"),
+        ),
     )
 
 
