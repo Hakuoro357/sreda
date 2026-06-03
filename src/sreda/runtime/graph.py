@@ -415,6 +415,9 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             status="pending",
             scheduled_at=decision.defer_until_utc,
             payload_json=json.dumps(payload, ensure_ascii=False),
+            # Phase 4a: carry the turn's bot_key so the delivery worker
+            # routes via the correct TelegramClient.
+            bot_key=action.bot_key,
         )
         session.add(outbox)
         session.flush()
@@ -568,6 +571,9 @@ async def node_persist_error(state: AssistantGraphState, config: RunnableConfig)
         is_interactive=action.inbound_message_id is not None,
         status="pending",
         payload_json=json.dumps(error_payload, ensure_ascii=False),
+        # Phase 4a: carry the turn's bot_key so the delivery worker
+        # routes via the correct TelegramClient.
+        bot_key=action.bot_key,
     )
     session.add(outbox)
     session.flush()

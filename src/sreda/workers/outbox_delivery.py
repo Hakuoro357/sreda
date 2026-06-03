@@ -26,6 +26,11 @@ from datetime import datetime, timezone
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import (
+    LEGACY_NULL_BOT_KEY,
+    TelegramBotRegistry,
+    telegram_client_for,
+)
 from sreda.db.models.core import OutboxMessage
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.features.app_registry import get_feature_registry
@@ -43,6 +48,7 @@ class OutboxDeliveryWorker:
         session: Session,
         telegram_client: TelegramClient | None = None,
         max_client: "MaxClient | None" = None,
+        registry: TelegramBotRegistry | None = None,
     ) -> None:
         self.session = session
         self.telegram = telegram_client
@@ -50,6 +56,11 @@ class OutboxDeliveryWorker:
         # None — MAX channel delivery будет skip'аться (fallback chain
         # попробует TG если у юзера есть и telegram_account_id).
         self.max = max_client
+        # Phase 4a: bot registry for multi-bot routing.  When set,
+        # _send_now resolves the client via telegram_client_for(row.bot_key).
+        # None falls back to self.telegram (backward-compat / tests that
+        # don't wire a registry).
+        self.registry = registry
 
     async def process_pending_messages(
         self, *, now: datetime | None = None, limit: int = 50
@@ -132,8 +143,28 @@ class OutboxDeliveryWorker:
             await self._send_now_max(row)
             return
 
-        # Default: Telegram path (legacy code, не трогаем).
-        if self.telegram is None:
+        # Default: Telegram path.
+        # Phase 4a: resolve client via registry when available so each row
+        # is delivered through the bot that originally received the turn.
+        # Falls back to self.telegram for backward-compat (legacy wiring,
+        # tests that don't pass a registry).
+        tg_client: TelegramClient | None
+        if self.registry is not None:
+            effective_bot_key = row.bot_key or LEGACY_NULL_BOT_KEY
+            try:
+                tg_client = telegram_client_for(effective_bot_key, self.registry)
+            except KeyError:
+                logger.warning(
+                    "outbox delivery: unknown bot_key %r on row %s, "
+                    "falling back to LEGACY_NULL_BOT_KEY",
+                    effective_bot_key,
+                    row.id,
+                )
+                tg_client = telegram_client_for(LEGACY_NULL_BOT_KEY, self.registry)
+        else:
+            tg_client = self.telegram
+
+        if tg_client is None:
             # Dev/test path with no Telegram wired — just mark sent so
             # tests can assert policy without a client mock.
             row.status = "sent"
@@ -157,7 +188,7 @@ class OutboxDeliveryWorker:
         trace_payload = payload.pop("_trace", None)
 
         try:
-            send_response = await self.telegram.send_message(
+            send_response = await tg_client.send_message(
                 chat_id=payload.get("chat_id"),
                 text=payload.get("text", ""),
                 reply_markup=payload.get("reply_markup"),
@@ -183,7 +214,7 @@ class OutboxDeliveryWorker:
                     try:
                         await hook(
                             session=self.session,
-                            telegram_client=self.telegram,
+                            telegram_client=tg_client,
                             outbox_row=row,
                             payload=payload,
                         )

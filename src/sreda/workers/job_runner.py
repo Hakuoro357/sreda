@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from sreda.config.bot_registry import TelegramBotRegistry
 from sreda.config.logging import configure_logging
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
@@ -45,6 +46,9 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             if settings.max_bot_token
             else None
         )
+        # Phase 4a: build bot registry so OutboxDeliveryWorker can route
+        # each telegram row through the correct bot's TelegramClient.
+        bot_registry = TelegramBotRegistry.from_settings(settings)
         runtime_service = ActionRuntimeService(session, telegram_client=telegram_client)
         verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
         skill_platform = SkillPlatformJobProcessor(session, registry)
@@ -56,6 +60,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             session,
             telegram_client=telegram_client,
             max_client=max_client,
+            registry=bot_registry,
         )
         # Retention worker — внутренне throttle'ит до 1 раза в 24 часа,
         # state в /tmp/sreda-retention-state.json. На каждом tick

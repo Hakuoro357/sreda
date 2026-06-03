@@ -171,6 +171,13 @@ class OutboxMessage(Base):
     drop_reason: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )
+    # Phase 4a (second-tg-bot): which bot should deliver this outbox row.
+    # NULL during the migration window — the delivery worker falls back to
+    # LEGACY_NULL_BOT_KEY ("sreda").  Will be made NOT NULL after Phase 5
+    # once every producer sets this field.
+    bot_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
 
 
 class SecureRecord(Base):

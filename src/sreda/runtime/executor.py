@@ -397,6 +397,9 @@ class ActionRuntimeService:
                 },
                 ensure_ascii=False,
             ),
+            # Phase 4a: carry the turn's bot_key so the delivery worker
+            # routes via the correct TelegramClient.
+            bot_key=action.bot_key,
         )
         self.session.add(outbox)
         self.session.flush()

@@ -184,7 +184,7 @@ class OnboardingAhaWorker:
                 "text": text,
                 "reply_markup": reply_markup,
             }
-            outbox = OutboxMessage(
+            outbox = OutboxMessage(  # outbox-bot-key-enforcement: skip — Phase 5: bot_key comes from family_reminders.bot_key (not yet wired); uses LEGACY_NULL_BOT_KEY fallback in delivery worker during migration window.
                 id=f"out_{uuid4().hex[:24]}",
                 tenant_id=tenant.id,
                 workspace_id=workspace_id,
