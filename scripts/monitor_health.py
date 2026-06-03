@@ -164,143 +164,200 @@ def probe_webhook_health() -> ProbeResult:
         return ProbeResult("webhook_health", "critical", f"getWebhookInfo failed: {e}")
 
 
-def probe_telegram_poller_alive() -> ProbeResult:
-    """Liveness — процесс long-poller'а жив И тикает.
-
-    Двухсторонняя проверка:
-      1. ``systemctl is-active sreda-telegram-poller`` == "active"
-      2. ``poller_heartbeats.last_attempt_at`` свежее 2 минут.
-
-    Используем именно ``last_attempt_at`` (не ``last_ok_at``) — он ставится
-    после КАЖДОГО getUpdates, в том числе при `200 []` и при сетевых
-    ошибках. То есть liveness не зависит от того, отвечает ли сейчас
-    Telegram API; для этого есть отдельная `telegram_api_health`.
-
-    Если systemd-юнит ещё не установлен (loaded=not-found), пробу
-    игнорируем (status=ok с пометкой) — пока мы на webhook-режиме это
-    нормально. Удалить эту ветку после cutover.
-    """
+def _poller_unit_state(unit: str) -> str:
+    """Return systemd active state string for *unit*, or 'unknown'."""
     rc = subprocess.run(
-        ["systemctl", "is-active", "sreda-telegram-poller"],
+        ["systemctl", "is-active", unit],
         capture_output=True, text=True, timeout=5,
     )
-    state = rc.stdout.strip()
-    if state == "inactive":
-        # Может быть либо «не установлен» либо «остановлен». Различим
-        # через is-enabled — если disabled И not-found, юнит просто
-        # ещё не существует на этой машине.
-        rc2 = subprocess.run(
-            ["systemctl", "is-enabled", "sreda-telegram-poller"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if "not-found" in (rc2.stdout + rc2.stderr).lower():
-            return ProbeResult(
-                "telegram_poller_alive", "ok",
-                "(unit not installed yet — pre-cutover)",
-            )
-        return ProbeResult(
-            "telegram_poller_alive", "critical",
-            "sreda-telegram-poller systemd state=inactive",
-        )
-    if state != "active":
-        return ProbeResult(
-            "telegram_poller_alive", "critical",
-            f"sreda-telegram-poller systemd state={state or 'unknown'}",
-        )
+    return rc.stdout.strip() or "unknown"
 
-    # Юнит активен — проверяем heartbeat в БД.
-    last_attempt = _pg_query(
-        "SELECT EXTRACT(EPOCH FROM (NOW() - last_attempt_at))::int "
-        "FROM poller_heartbeats WHERE channel = 'telegram'"
+
+def _poller_unit_enabled_state(unit: str) -> str:
+    """Return systemd enabled state string for *unit*, or 'unknown'."""
+    rc = subprocess.run(
+        ["systemctl", "is-enabled", unit],
+        capture_output=True, text=True, timeout=5,
     )
-    if last_attempt is None or last_attempt == "":
+    return (rc.stdout + rc.stderr).strip() or "unknown"
+
+
+def _configured_bot_keys() -> list[str]:
+    """Return the list of bot_keys that have tokens configured in /etc/sreda/.env.
+
+    Always includes 'sreda' (primary bot). Adds 'sreda_home' only when
+    SREDA_HOME_BOT_TOKEN is present and non-empty. This matches the logic in
+    TelegramBotRegistry.from_settings so the monitor tracks exactly the bots
+    the application knows about.
+    """
+    keys = ["sreda"]
+    if _ENV.get("SREDA_HOME_BOT_TOKEN"):
+        keys.append("sreda_home")
+    return keys
+
+
+def probe_telegram_poller_alive() -> ProbeResult:
+    """Liveness — все сконфигурированные long-poller'ы живы и тикают.
+
+    Для каждого bot_key (sreda + sreda_home если настроен):
+      1. ``systemctl is-active sreda-telegram-poller@<key>`` == "active"
+         (с fallback на legacy non-template unit для sreda, pre-cutover).
+      2. ``poller_heartbeats.last_attempt_at`` для channel 'telegram:<key>'
+         свежее 2 минут.
+
+    Если templated unit не установлен (not-found) для bot_key который НЕ
+    настроен токеном — игнорируем. Если не установлен для настроенного бота
+    — предупреждаем.
+
+    Используем ``last_attempt_at`` (не ``last_ok_at``) — он ставится
+    после КАЖДОГО getUpdates, в том числе при `200 []` и при сетевых
+    ошибках. Liveness не зависит от того, отвечает ли Telegram API —
+    для этого есть `telegram_api_health`.
+    """
+    bot_keys = _configured_bot_keys()
+    issues: list[str] = []
+    ok_parts: list[str] = []
+
+    for bot_key in bot_keys:
+        unit = f"sreda-telegram-poller@{bot_key}.service"
+        legacy_unit = "sreda-telegram-poller.service"
+        channel = f"telegram:{bot_key}"
+
+        # --- 1. systemd state -------------------------------------------
+        state = _poller_unit_state(unit)
+        active = state == "active"
+
+        if not active:
+            # Fallback: legacy non-template unit for 'sreda' (pre-cutover)
+            if bot_key == "sreda":
+                legacy_state = _poller_unit_state(legacy_unit)
+                if legacy_state == "active":
+                    active = True
+                    unit = legacy_unit  # report which unit is active
+                elif legacy_state in ("inactive", "unknown"):
+                    # Check if neither unit is installed at all
+                    enabled = _poller_unit_enabled_state(unit)
+                    legacy_enabled = _poller_unit_enabled_state(legacy_unit)
+                    if "not-found" in enabled.lower() and "not-found" in legacy_enabled.lower():
+                        ok_parts.append(f"{bot_key}:(unit not installed yet — pre-cutover)")
+                        continue
+                    issues.append(f"{bot_key}: systemd state={state} (legacy={legacy_state})")
+                    continue
+                else:
+                    issues.append(f"{bot_key}: systemd {unit} state={state}")
+                    continue
+            else:
+                # Non-primary bot: if unit not found, treat as not-yet-deployed (ok)
+                enabled = _poller_unit_enabled_state(unit)
+                if "not-found" in enabled.lower():
+                    ok_parts.append(f"{bot_key}:(unit not installed yet)")
+                    continue
+                issues.append(f"{bot_key}: systemd {unit} state={state}")
+                continue
+
+        # --- 2. heartbeat in DB -----------------------------------------
+        last_attempt = _pg_query(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - last_attempt_at))::int "
+            f"FROM poller_heartbeats WHERE channel = '{channel}'"
+        )
+        if last_attempt is None or last_attempt == "":
+            issues.append(
+                f"{bot_key}: systemd active but no heartbeat row for channel='{channel}' "
+                f"(poller never ticked?)"
+            )
+            continue
+        try:
+            secs = int(last_attempt)
+        except ValueError:
+            issues.append(f"{bot_key}: heartbeat parse fail: {last_attempt!r}")
+            continue
+        if secs > 120:
+            issues.append(f"{bot_key}: last_attempt_at {secs}s ago (>120s threshold)")
+            continue
+        ok_parts.append(f"{bot_key}:heartbeat {secs}s ago")
+
+    if issues:
         return ProbeResult(
             "telegram_poller_alive", "critical",
-            "no heartbeat row for channel='telegram' (poller never ticked?)",
-        )
-    try:
-        secs = int(last_attempt)
-    except ValueError:
-        return ProbeResult(
-            "telegram_poller_alive", "warning",
-            f"heartbeat parse fail: {last_attempt!r}",
-        )
-    if secs > 120:
-        return ProbeResult(
-            "telegram_poller_alive", "critical",
-            f"last_attempt_at {secs}s ago (>120s threshold)",
+            "poller issues: " + "; ".join(issues),
         )
     return ProbeResult(
         "telegram_poller_alive", "ok",
-        f"systemd active, heartbeat {secs}s ago",
+        "all pollers active — " + ", ".join(ok_parts),
     )
 
 
 def probe_telegram_api_health() -> ProbeResult:
-    """Health — отвечает ли Telegram API на наши getUpdates.
+    """Health — отвечает ли Telegram API на getUpdates для каждого бота.
 
-    Считаем разницу между `last_attempt_at` и `last_ok_at`. Если
-    last_ok_at старее 5 минут, но last_attempt_at свежий → upstream
-    проблема (TG API down / rate-limit / network issue), не наша.
-    Severity: warning (не critical), плюс показываем `last_error`
-    для диагностики.
+    Для каждого настроенного bot_key проверяем разницу между
+    ``last_attempt_at`` и ``last_ok_at`` в poller_heartbeats (channel
+    = 'telegram:<key>'). Если last_ok_at старее 5 минут но
+    last_attempt_at свежий → upstream проблема (TG API / network),
+    не наша. Severity: warning.
 
-    Если поллер ещё не установлен — игнорим как и в `_alive` пробе.
+    Если templated unit не установлен для данного bot_key — пропускаем
+    (аналогично _alive пробе).
     """
-    rc = subprocess.run(
-        ["systemctl", "is-enabled", "sreda-telegram-poller"],
-        capture_output=True, text=True, timeout=5,
-    )
-    if "not-found" in (rc.stdout + rc.stderr).lower():
-        return ProbeResult(
-            "telegram_api_health", "ok",
-            "(unit not installed yet — pre-cutover)",
-        )
+    bot_keys = _configured_bot_keys()
+    warnings: list[str] = []
+    ok_parts: list[str] = []
 
-    row = _pg_query(
-        "SELECT "
-        "  COALESCE(EXTRACT(EPOCH FROM (NOW() - last_ok_at))::int, -1), "
-        "  COALESCE(last_error, '') "
-        "FROM poller_heartbeats WHERE channel = 'telegram'"
-    )
-    if row is None or row == "":
-        # Heartbeat row отсутствует — это поймает _alive проба, тут ok.
-        return ProbeResult(
-            "telegram_api_health", "ok",
-            "(no heartbeat row yet)",
-        )
-    parts = row.split("|", 1)
-    if len(parts) != 2:
-        return ProbeResult(
-            "telegram_api_health", "warning",
-            f"heartbeat parse fail: {row!r}",
-        )
-    try:
-        ok_secs = int(parts[0])
-    except ValueError:
-        return ProbeResult(
-            "telegram_api_health", "warning",
-            f"last_ok_at parse fail: {parts[0]!r}",
-        )
-    last_err = parts[1].strip()
+    for bot_key in bot_keys:
+        unit = f"sreda-telegram-poller@{bot_key}.service"
+        legacy_unit = "sreda-telegram-poller.service"
+        channel = f"telegram:{bot_key}"
 
-    if ok_secs == -1:
-        # last_ok_at IS NULL — поллер запустился но ни разу не получил
-        # успешный ответ. Может быть на холодном старте, может быть
-        # реальная проблема. Warning.
-        return ProbeResult(
-            "telegram_api_health", "warning",
-            f"last_ok_at NULL (no successful getUpdates yet); "
-            f"last_error={last_err[:200] or 'none'}",
+        # Проверяем что хотя бы один из юнитов известен systemd
+        enabled = _poller_unit_enabled_state(unit)
+        legacy_enabled = _poller_unit_enabled_state(legacy_unit) if bot_key == "sreda" else "not-found"
+        if "not-found" in enabled.lower() and "not-found" in legacy_enabled.lower():
+            ok_parts.append(f"{bot_key}:(unit not installed yet — pre-cutover)")
+            continue
+
+        row = _pg_query(
+            "SELECT "
+            "  COALESCE(EXTRACT(EPOCH FROM (NOW() - last_ok_at))::int, -1), "
+            f"  COALESCE(last_error, '') "
+            f"FROM poller_heartbeats WHERE channel = '{channel}'"
         )
-    if ok_secs > 300:
+        if row is None or row == "":
+            # Heartbeat row отсутствует — _alive проба поймает, тут ok.
+            ok_parts.append(f"{bot_key}:(no heartbeat row yet)")
+            continue
+
+        parts = row.split("|", 1)
+        if len(parts) != 2:
+            warnings.append(f"{bot_key}: heartbeat parse fail: {row!r}")
+            continue
+        try:
+            ok_secs = int(parts[0])
+        except ValueError:
+            warnings.append(f"{bot_key}: last_ok_at parse fail: {parts[0]!r}")
+            continue
+        last_err = parts[1].strip()
+
+        if ok_secs == -1:
+            warnings.append(
+                f"{bot_key}: last_ok_at NULL (no successful getUpdates yet); "
+                f"last_error={last_err[:100] or 'none'}"
+            )
+        elif ok_secs > 300:
+            warnings.append(
+                f"{bot_key}: last_ok_at {ok_secs}s ago (>300s); "
+                f"last_error={last_err[:100] or 'none'}"
+            )
+        else:
+            ok_parts.append(f"{bot_key}:last_ok {ok_secs}s ago")
+
+    if warnings:
         return ProbeResult(
             "telegram_api_health", "warning",
-            f"last_ok_at {ok_secs}s ago (>300s); last_error={last_err[:200] or 'none'}",
+            "TG API issues: " + "; ".join(warnings),
         )
     return ProbeResult(
         "telegram_api_health", "ok",
-        f"last_ok_at {ok_secs}s ago",
+        ", ".join(ok_parts) if ok_parts else "(all ok)",
     )
 
 

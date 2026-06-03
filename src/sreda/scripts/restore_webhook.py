@@ -1,11 +1,24 @@
-"""Re-arm the Telegram webhook on rollback.
+"""Re-arm the Telegram webhook — EMERGENCY / rollback tool only.
 
-Usage during rollback from long-poll → webhook (см. plan
-mellow-discovering-conway.md):
+WARNING: This script sets a Telegram webhook, which DISABLES long-poll
+(getUpdates returns 409 Conflict). The production inbound path is long-poll
+via sreda-telegram-poller@*.service. Running this accidentally will break
+prod for all users until the poller is manually restarted.
 
-    sudo systemctl stop sreda-telegram-poller
-    sudo systemctl disable sreda-telegram-poller
-    sudo /opt/sreda/.venv/bin/python -m sreda.scripts.restore_webhook
+This script REFUSES to run if any sreda-telegram-poller@*.service or the
+legacy sreda-telegram-poller.service is enabled or active on the system.
+Use --force-webhook-mode to override the guard (ONLY when intentionally
+switching the entire system from long-poll to webhook mode).
+
+Typical rollback sequence (long-poll → webhook):
+
+    sudo systemctl disable --now sreda-telegram-poller@sreda.service
+    sudo systemctl disable --now sreda-telegram-poller@sreda_home.service
+    # verify both are inactive:
+    systemctl is-active sreda-telegram-poller@sreda.service
+    systemctl is-active sreda-telegram-poller@sreda_home.service
+    # then set webhook:
+    sudo /opt/sreda/.venv/bin/python -m sreda.scripts.restore_webhook --force-webhook-mode
 
 Why a Python helper instead of inline ``curl + grep | cut``:
 
@@ -20,6 +33,7 @@ Why a Python helper instead of inline ``curl + grep | cut``:
 
 from __future__ import annotations
 
+import subprocess
 import sys
 
 import httpx
@@ -32,8 +46,79 @@ TELEGRAM_IP = "62.113.41.104"
 ALLOWED_UPDATES = '["message","edited_message","callback_query"]'
 MAX_CONNECTIONS = "4"
 
+# All systemd units (templated + legacy) that run long-poll polling.
+# If any of these is enabled OR active, we refuse to set a webhook by default.
+_POLLER_UNITS = [
+    "sreda-telegram-poller@sreda.service",
+    "sreda-telegram-poller@sreda_home.service",
+    "sreda-telegram-poller.service",  # legacy non-template unit (pre-cutover)
+]
+
+
+def _is_unit_enabled_or_active(unit: str) -> bool:
+    """Return True if the systemd unit is enabled OR active."""
+    for sub in ("is-enabled", "is-active"):
+        rc = subprocess.run(
+            ["systemctl", sub, unit],
+            capture_output=True, text=True,
+        )
+        result = (rc.stdout + rc.stderr).lower()
+        # 'not-found' means the unit file doesn't exist at all — not enabled/active.
+        if "not-found" in result:
+            continue
+        if rc.returncode == 0:
+            return True
+    return False
+
+
+def _any_poller_active() -> list[str]:
+    """Return list of poller units that are currently enabled or active."""
+    active: list[str] = []
+    for unit in _POLLER_UNITS:
+        if _is_unit_enabled_or_active(unit):
+            active.append(unit)
+    return active
+
 
 def main() -> int:
+    force_webhook = "--force-webhook-mode" in sys.argv[1:]
+
+    # ------------------------------------------------------------------
+    # Guard: refuse if any long-poll poller is running
+    # ------------------------------------------------------------------
+    active_pollers = _any_poller_active()
+    if active_pollers and not force_webhook:
+        print(
+            "\n"
+            "ERROR: The following Telegram long-poll units are enabled or active:\n"
+            + "".join(f"  - {u}\n" for u in active_pollers)
+            + "\n"
+            "Setting a webhook while long-poll is running will cause getUpdates\n"
+            "to return 409 Conflict, breaking all inbound messages.\n"
+            "\n"
+            "To set webhook intentionally:\n"
+            "  1. Stop and disable all poller units:\n"
+            "       sudo systemctl disable --now sreda-telegram-poller@sreda.service\n"
+            "       sudo systemctl disable --now sreda-telegram-poller@sreda_home.service\n"
+            "  2. Verify both are inactive:\n"
+            "       systemctl is-active sreda-telegram-poller@sreda.service\n"
+            "       systemctl is-active sreda-telegram-poller@sreda_home.service\n"
+            "  3. Re-run with --force-webhook-mode:\n"
+            "       python -m sreda.scripts.restore_webhook --force-webhook-mode\n",
+            file=sys.stderr,
+        )
+        return 1
+
+    if force_webhook and active_pollers:
+        print(
+            f"WARNING: --force-webhook-mode set but pollers still active: {active_pollers}\n"
+            "Proceeding anyway — this WILL cause 409 Conflict on the pollers.",
+            file=sys.stderr,
+        )
+
+    # ------------------------------------------------------------------
+    # Validate settings
+    # ------------------------------------------------------------------
     settings = get_settings()
     if not settings.telegram_bot_token:
         print("SREDA_TELEGRAM_BOT_TOKEN is not set", file=sys.stderr)
@@ -46,6 +131,9 @@ def main() -> int:
         )
         return 1
 
+    # ------------------------------------------------------------------
+    # Set webhook
+    # ------------------------------------------------------------------
     response = httpx.post(
         f"https://api.telegram.org/bot{settings.telegram_bot_token}/setWebhook",
         data={

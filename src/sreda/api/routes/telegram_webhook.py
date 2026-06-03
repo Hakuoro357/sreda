@@ -4,12 +4,43 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 
 from sreda.api.deps import enforce_telegram_rate_limit
+from sreda.config.bot_registry import TelegramBotRegistry
 from sreda.config.settings import get_settings
 from sreda.schemas.api import TelegramWebhookAccepted
 from sreda.services.telegram_inbound import handle_telegram_update
 
 router = APIRouter(prefix="/webhooks/telegram", tags=["telegram"])
 logger = logging.getLogger(__name__)
+
+
+def _resolve_bot_key(bot_key: str) -> str:
+    """Fail-closed bot_key validation against the registry.
+
+    Rejects unknown bot_keys with HTTP 404 BEFORE any secret-token check or
+    processing.  This prevents arbitrary-bot_key spoofing where an attacker
+    crafts a URL like ``/webhooks/telegram/evil_bot`` and (if the secret
+    check were bypassed or absent) routes inbound traffic to an unregistered
+    bot_key.
+
+    Per-bot webhook secrets are out of scope (BotConfig has no
+    webhook_secret field; webhook is not the prod inbound path).  The goal
+    here is solely to stop unknown bot_key strings from reaching the handler.
+
+    Raises
+    ------
+    HTTPException(404)
+        When *bot_key* is not in the registry built from current settings.
+    """
+    registry = TelegramBotRegistry.from_settings(get_settings())
+    try:
+        registry.resolve(bot_key)
+    except KeyError:
+        logger.warning("telegram webhook rejected: unknown bot_key=%r", bot_key)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown bot_key: {bot_key!r}",
+        )
+    return bot_key
 
 
 def _verify_telegram_secret_token(
@@ -36,9 +67,11 @@ def _verify_telegram_secret_token(
     "/{bot_key}",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=TelegramWebhookAccepted,
-    # Rate-limit runs FIRST — it must reject hostile traffic before we
-    # spend CPU on the ``hmac.compare_digest`` secret check, otherwise
-    # an attacker without the secret can still tie up the event loop.
+    # Dependency order matters:
+    #   1. Rate-limit — reject hostile traffic cheaply before any crypto work.
+    #   2. Secret-token check — HMAC comparison (inexpensive but auth-critical).
+    # bot_key registry check runs inside the handler via _resolve_bot_key
+    # (path parameter dependency), which is evaluated before the handler body.
     dependencies=[
         Depends(enforce_telegram_rate_limit),
         Depends(_verify_telegram_secret_token),
@@ -48,6 +81,7 @@ async def telegram_webhook(
     bot_key: str,
     payload: dict,
     background_tasks: BackgroundTasks,
+    _validated_bot_key: str = Depends(_resolve_bot_key),
 ) -> TelegramWebhookAccepted:
     """Thin wrapper over the channel-agnostic durable-ingest handler.
 
@@ -64,6 +98,9 @@ async def telegram_webhook(
     update from ``getUpdates``, which is the path we are migrating to
     in spring 2026 to escape the inbound-TCP fragility we saw on
     bot.sredaspace.ru.
+
+    ``bot_key`` is validated against the registry by ``_resolve_bot_key``
+    before this handler body runs (Phase 9 fail-closed anti-spoof guard).
     """
     inbound_message_id = await handle_telegram_update(
         payload, bot_key=bot_key, background_tasks=background_tasks,
