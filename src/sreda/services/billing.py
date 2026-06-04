@@ -124,6 +124,15 @@ class BillingService:
         self.session = session
 
     def ensure_default_plans(self) -> None:
+        # 2026-06-04 (vex-assistant#99/#100): write ONLY when a plan is missing
+        # or a field actually differs from the seed. This method runs on the
+        # Mini App HOT READ paths (get_plans + get_summary via this service), and
+        # the previous blind per-call UPDATE took a row lock on the shared plan
+        # rows on EVERY open. Concurrent opens then serialized on those locks and
+        # timed out (prod 2026-06-04: /plans + /summary returned 499 under the
+        # migration broadcast burst). In steady state (plans already match the
+        # seeds) this is now read-only — no UPDATE, no flush, no row lock.
+        changed = False
         for seed in PLAN_SEEDS:
             plan = (
                 self.session.query(SubscriptionPlan)
@@ -145,7 +154,18 @@ class BillingService:
                         sort_order=seed.sort_order,
                     )
                 )
+                changed = True
                 continue
+            if (
+                plan.title == seed.title
+                and plan.description == seed.description
+                and plan.price_rub == seed.price_rub
+                and plan.billing_period_days == seed.billing_period_days
+                and plan.is_public == seed.is_public
+                and plan.is_active == seed.is_active
+                and plan.sort_order == seed.sort_order
+            ):
+                continue  # unchanged — skip the UPDATE (and its row lock)
             plan.title = seed.title
             plan.description = seed.description
             plan.price_rub = seed.price_rub
@@ -154,7 +174,9 @@ class BillingService:
             plan.is_active = seed.is_active
             plan.sort_order = seed.sort_order
             plan.updated_at = _utcnow()
-        self.session.flush()
+            changed = True
+        if changed:
+            self.session.flush()
 
     def build_help_message(self) -> tuple[str, dict]:
         text = (
