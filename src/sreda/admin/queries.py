@@ -66,6 +66,9 @@ class UserRow:
     # "in_progress" = есть started_at но нет completed_at, "not_started"
     # = ничего не записано в skill_params.welcome_v2_progress.
     welcome_v2_status: str = "not_started"
+    # Дата регистрации = tenants.created_at (момент создания аккаунта).
+    # Formatted UTC через _fmt_dt (как approved_at); None → "—".
+    registered_at: str | None = None
 
 
 @dataclass
@@ -151,6 +154,7 @@ def get_all_users(session: Session) -> list[UserRow]:
                 approved_at=_fmt_dt(approved_at),
                 is_pending=approved_at is None,
                 welcome_v2_status=welcome_v2_status,
+                registered_at=_fmt_dt(tenants_created_at.get(u.tenant_id)),
             )
         )
     # Newest tenants first. None goes to the end.
