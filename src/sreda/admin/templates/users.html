@@ -21,6 +21,7 @@
       <th>Каналы</th>
       <th>Имя</th>
       <th>TZ</th>
+      <th>Дата регистрации</th>
       <th>Подписки</th>
       <th></th>
     </tr>
@@ -43,6 +44,7 @@
       </td>
       <td>{{ u.display_name or "—" }}</td>
       <td>{{ u.timezone or "—" }}</td>
+      <td><span class="muted">{{ u.registered_at }}</span></td>
       <td>
         {% for s in u.subscriptions %}
         <div>

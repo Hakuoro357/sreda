@@ -3,6 +3,8 @@ import base64
 import json
 import threading
 
+import pytest
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -222,6 +224,19 @@ def test_verification_process_job_fails_fast_when_adapter_hangs(monkeypatch, tmp
     assert tenant_accounts == []
 
 
+@pytest.mark.skip(
+    reason=(
+        "#103: exercises obsolete multi-slot EDS billing. add_extra_eds_account "
+        "creates a SECOND active subscription with feature_key='eds_monitor' "
+        "(base + extra), which is incompatible with migration 0042's partial "
+        "unique index `(tenant_id, feature_key) WHERE status='active'`. Same "
+        "documented incompatibility that already module-skips "
+        "test_billing_service.py (EDS-monitor scrubbed на проде 2026-05-07; "
+        "plans is_active=false). Obsolete pending EDS-monitor code removal — "
+        "not a fresh regression. The sibling non-billing EDS verification "
+        "tests in this file still run."
+    )
+)
 def test_duplicate_login_does_not_create_second_active_account(monkeypatch, tmp_path) -> None:
     session = _build_session(monkeypatch, tmp_path)
     telegram_client = FakeTelegramClient()

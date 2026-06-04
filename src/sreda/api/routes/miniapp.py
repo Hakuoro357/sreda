@@ -47,10 +47,11 @@ from sreda.services.onboarding import (
     ensure_max_user_bundle,
     ensure_telegram_user_bundle_by_id,
 )
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     resolve_tenant_from_telegram_id,
-    validate_init_data,
+    validate_telegram_init_data_any_bot,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,14 +131,11 @@ def _require_miniapp_auth(
         )
 
     if channel == "telegram":
-        bot_token = settings.telegram_bot_token
-        if not bot_token:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="telegram_bot_token_not_configured",
-            )
+        _bot_registry = TelegramBotRegistry.from_settings(settings)
         try:
-            webapp_user = validate_init_data(init_data_raw, bot_token)
+            resolved_bot_key, webapp_user = validate_telegram_init_data_any_bot(
+                init_data_raw, _bot_registry,
+            )
         except TelegramInitDataError as exc:
             logger.warning("miniapp auth failed (tg): %s", exc)
             raise HTTPException(
@@ -159,6 +157,7 @@ def _require_miniapp_auth(
                     session,
                     telegram_id=account_id,
                     display_name=display_name,
+                    bot_key=resolved_bot_key,
                 )
                 session.commit()
             except _SignupBlocked as exc:
@@ -1979,10 +1978,11 @@ def _resolve_platform_auth(
     init_data_raw = auth_header[4:]
 
     if platform == "telegram":
-        if not settings.telegram_bot_token:
-            raise HTTPException(status_code=500, detail="bot_token_not_configured")
+        _bot_registry = TelegramBotRegistry.from_settings(settings)
         try:
-            tg_user = validate_init_data(init_data_raw, settings.telegram_bot_token)
+            _resolved_bot_key, tg_user = validate_telegram_init_data_any_bot(
+                init_data_raw, _bot_registry,
+            )
         except TelegramInitDataError as exc:
             raise HTTPException(status_code=401, detail="invalid_init_data") from exc
         payload = {
@@ -1990,6 +1990,7 @@ def _resolve_platform_auth(
             "first_name": tg_user.first_name,
             "username": tg_user.username,
             "start_param": tg_user.start_param,
+            "bot_key": _resolved_bot_key,
         }
         if session is not None:
             resolved = resolve_tenant_from_telegram_id(session, tg_user.telegram_id)
@@ -2079,6 +2080,8 @@ async def channel_link_start(
     if platform == "telegram":
         tenant_id = payload.get("tenant_id")
         source_user_id = payload.get("user_id")
+        # bot_key is set by _resolve_platform_auth for the telegram branch.
+        source_bot_key: str = payload.get("bot_key") or "sreda"
         if tenant_id is None or source_user_id is None:
             raise HTTPException(status_code=404, detail="tenant_not_found")
     else:  # max
@@ -2088,6 +2091,7 @@ async def channel_link_start(
             raise HTTPException(status_code=404, detail="tenant_not_found")
         tenant_id = user.tenant_id
         source_user_id = user.id
+        source_bot_key = "sreda"  # MAX platform; no per-bot dispatch here
 
     from sreda.services.channel_linking import (
         ChannelLinkRateLimitedError, start_link,
@@ -2105,14 +2109,36 @@ async def channel_link_start(
                                  target_channel=target_channel):
         raise HTTPException(409, "already_linked")
 
+    # Resolve per-bot username/shortname for the deep-link.
+    # When the target is telegram we use the SAME bot the user opened the
+    # Mini App from — they should land back in the same bot's Mini App.
+    _bot_registry = TelegramBotRegistry.from_settings(settings)
+    if target_channel == "telegram":
+        # Telegram source → land back in the SAME bot the user opened from.
+        # MAX source → there is no per-bot Telegram context, so use the SYSTEM
+        # DEFAULT Telegram bot (honors a future primary flip; Codex R2 high —
+        # do NOT hardcode "sreda").
+        _tg_bot_key = (
+            source_bot_key if platform == "telegram"
+            else _bot_registry.system_default_bot_key
+        )
+        _link_bot_cfg = _bot_registry.resolve(_tg_bot_key)
+        _tg_link_username = _link_bot_cfg.username
+        _tg_link_shortname = _link_bot_cfg.miniapp_shortname
+    else:
+        # Target is MAX (source telegram) — Telegram username/shortname unused.
+        _link_bot_cfg = _bot_registry.resolve(_bot_registry.system_default_bot_key)
+        _tg_link_username = _link_bot_cfg.username
+        _tg_link_shortname = _link_bot_cfg.miniapp_shortname
+
     try:
         result = start_link(
             session,
             tenant_id=tenant_id,
             source_channel=platform,
             source_user_id=source_user_id,
-            tg_bot_username=settings.telegram_bot_username,
-            tg_miniapp_shortname=settings.telegram_miniapp_shortname,
+            tg_bot_username=_tg_link_username,
+            tg_miniapp_shortname=_tg_link_shortname,
         )
     except ChannelLinkRateLimitedError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
@@ -2144,11 +2170,10 @@ async def channel_link_start(
     try:
         from sreda.db.models.core import User as _User
         if platform == "telegram":
-            from sreda.integrations.telegram.client import TelegramClient
             source_user_row = session.get(_User, source_user_id)
             tg_chat_id = source_user_row.telegram_account_id if source_user_row else None
-            if tg_chat_id and settings.telegram_bot_token:
-                tg_client = TelegramClient(token=settings.telegram_bot_token)
+            if tg_chat_id:
+                tg_client = telegram_client_for(source_bot_key, _bot_registry)
                 await tg_client.send_message(chat_id=str(tg_chat_id), text=msg_text)
         else:  # platform == "max"
             from sreda.integrations.max.client import MaxClient

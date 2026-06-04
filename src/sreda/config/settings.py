@@ -34,6 +34,8 @@ _SECRET_FIELD_NAMES = frozenset({
     "yandex_speechkit_api_key",
     "groq_api_key",
     "tavily_api_key",
+    # Phase 1: second Telegram bot (sreda_home) token
+    "home_bot_token",
     # database_url содержит пароль PG в DSN — тоже маскируем
     "database_url",
 })
@@ -50,10 +52,50 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     database_url: str = Field(default="postgresql+psycopg://sreda:sreda@localhost:5432/sreda")
+    # SQLAlchemy connection-pool sizing (PostgreSQL only; SQLite uses its own
+    # pool). Defaults are intentionally SMALL: the background processes
+    # (pollers, job-runner) are low-concurrency (~3-4 pooled conns each; the
+    # poller's advisory lock uses a separate NullPool conn), so a 3+7 pool
+    # leaves PG's 100-connection budget free for the API. The uvicorn process
+    # RAISES these via env (SREDA_DB_POOL_SIZE / SREDA_DB_MAX_OVERFLOW in its
+    # systemd unit) to cover its sync-handler threadpool concurrency under Mini
+    # App open-bursts. Keep the total across all processes within PG
+    # max_connections (minus superuser_reserved + the advisory-lock conns).
+    # NB: the capacity budget assumes a SINGLE uvicorn worker (ExecStart has no
+    # --workers). With N workers, uvicorn's pool multiplies by N — re-check the
+    # PG budget before adding workers. le= caps stop an env typo
+    # (e.g. SREDA_DB_MAX_OVERFLOW=300) from silently exhausting PG.
+    db_pool_size: int = Field(default=3, ge=1, le=50)
+    db_max_overflow: int = Field(default=7, ge=0, le=100)
+    db_pool_timeout: int = Field(default=30, ge=1, le=120)
+    db_pool_pre_ping: bool = True
     telegram_bot_token: str | None = None
     telegram_webhook_secret_token: str | None = None
     telegram_bot_username: str | None = None
     telegram_miniapp_shortname: str | None = None
+
+    # --- Second Telegram bot: @sreda_home_bot (Phase 1) -----------------
+    # Env names (env_prefix="SREDA_"): field home_bot_token → SREDA_HOME_BOT_TOKEN
+    # etc.  Using plain field names (no alias) so pydantic-settings applies
+    # the prefix automatically, giving the EXACT names:
+    #   SREDA_HOME_BOT_TOKEN / SREDA_HOME_BOT_USERNAME / SREDA_HOME_MINIAPP_SHORTNAME
+    # (NOT "SREDA_SREDA_HOME_BOT_TOKEN" which would happen with a field named
+    # "sreda_home_bot_token").
+    home_bot_token: str | None = None
+    home_bot_username: str | None = None
+    home_miniapp_shortname: str | None = None
+    # When True the sreda_home bot auto-approves new users (no tenant moderation).
+    # anti-abuse (rate-limit, capacity) still applies.  Default True = open signup.
+    home_bot_signup_open: bool = True
+
+    # --- Bot-key routing constants (env-driven; default = legacy "sreda") ----
+    # system_default_bot_key: bot used for system broadcasts + outbox rows with
+    #   no explicit bot_key during the migration window.
+    # admin_bot_key: bot used for admin alerts to the operator.
+    # Both default to "sreda" so existing behaviour is unchanged until an
+    # operator explicitly sets them via env.
+    system_default_bot_key: str = "sreda"
+    admin_bot_key: str = "sreda"
 
     # MAX (российский мессенджер) channel — Phase 5 of MAX integration
     # sprint, 2026-05-04. ``max_bot_token`` доступен через

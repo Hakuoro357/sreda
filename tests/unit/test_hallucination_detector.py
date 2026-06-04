@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from sreda.services.llm import detect_unbacked_claim
+from sreda.services.llm import detect_unbacked_claim, is_capability_question
 
 
 # --------------------------------------------------------------------
@@ -950,3 +950,147 @@ def test_r12_r5_long_modal_phrasing_no_fire() -> None:
     # «напомин» idx 26 = 26 chars. 30c window → matches → skip.
     # called_tools=set() — would fire без skip, with skip → no fire.
     assert detect_unbacked_claim(text, called_tools=set()) is False
+
+
+# --------------------------------------------------------------------
+# 2026-05-29 (vex-assistant) — «План кроя» — это чек-лист по имени.
+# Production incident tenant_tg_755682022 16:33 UTC (trace
+# trace_73c9fe5786b04838):
+#   iter.0 add_checklist_items(list_id_or_title="План кроя",
+#                              items=["Муслин зелёный широкий…"]) → ok
+#   iter.1 AIMessage "Записала в план кроя: Муслин…" (без tool_calls)
+#   safety_net fired → category для «план кро» = None → unbacked
+#   iter.2 retry-нудж → LLM сделал ВТОРОЙ add_checklist_items
+#          (list_id_or_title="Дела по ткани") → дубль "Муслин…"
+#          и в "План кроя", и в "Дела по ткани".
+#
+# Фикс: «план кро» / «план на крой» → category="checklist".
+# add_checklist_items теперь backing'ит claim. Bare " крой " / "в крой "
+# (швейный процесс) остаются None — для них tool'а нет.
+# --------------------------------------------------------------------
+
+
+def test_2026_05_29_zapisala_v_plan_kroya_with_add_checklist_items_no_fire() -> None:
+    """Точный кейс инцидента: «Записала в план кроя: Муслин зелёный
+    широкий — расход 1,57 м + 1,57 м.» при вызванном add_checklist_items
+    больше НЕ должно fire'ить."""
+    text = (
+        "✅ Записала в план кроя: Муслин зелёный широкий — расход "
+        "1,57 м + 1,57 м."
+    )
+    assert (
+        detect_unbacked_claim(text, called_tools={"add_checklist_items"})
+        is False
+    ), (
+        "add_checklist_items должен backing'ить claim про «план кроя» — "
+        "это чек-лист по имени, не отдельная сущность."
+    )
+
+
+def test_2026_05_29_plan_kroya_with_create_checklist_no_fire() -> None:
+    """create_checklist тоже валидный backing для «план кроя» claim."""
+    text = "Создала чек-лист «План кроя» и записала туда муслин."
+    assert (
+        detect_unbacked_claim(
+            text,
+            called_tools={"create_checklist", "add_checklist_items"},
+        )
+        is False
+    )
+
+
+def test_2026_05_29_plan_kroya_with_shopping_tool_still_fires() -> None:
+    """Regression guard: cross-category по-прежнему ловится. Если LLM
+    сказал «в план кроя» но вызвал ТОЛЬКО add_shopping_items — это
+    реальная wrong-tool галлюцинация (как 2026-05-08 incident)."""
+    text = "Записала в план кроя на пятницу ✅: тенцель шампань."
+    assert (
+        detect_unbacked_claim(
+            text, called_tools={"add_shopping_items"},
+        )
+        is True
+    ), (
+        "Cross-category: shopping tool НЕ backing'ит checklist claim — "
+        "должно остаться unbacked (защищает 2026-05-08 fix)."
+    )
+
+
+def test_2026_05_29_plan_kroya_without_any_tool_still_fires() -> None:
+    """Regression guard: claim про «план кроя» при tools=[] — голая
+    галлюцинация, должно fire'ить."""
+    text = "Добавила в план кроя на понедельник тенцель аквамарин."
+    assert detect_unbacked_claim(text, called_tools=set()) is True
+
+
+def test_2026_05_29_bare_kroy_still_unbacked() -> None:
+    """Bare «в крой» / « крой » (швейный процесс, не имя чек-листа) —
+    tool'а нет, остаётся unbacked даже с add_checklist_items."""
+    # «в крой на пятницу» — швейная операция, не чек-лист по имени.
+    text = "Записала в крой на пятницу муслин зелёный."
+    # Даже если LLM на всякий случай вызвала add_checklist_items —
+    # claim про швейную операцию remains unbacked (None category).
+    assert (
+        detect_unbacked_claim(
+            text, called_tools={"add_checklist_items"},
+        )
+        is True
+    )
+
+
+# --------------------------------------------------------------------
+# 2026-06-04 (vex-assistant#100): capability-question gate. The
+# unbacked-claim guard is SKIPPED (at the handler) when the USER asked
+# "что ты умеешь?" — the reply is an ability description, not a
+# side-effect claim. We gate on user intent, not on parsing the reply.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("q", [
+    "Что ты умеешь?",
+    "что умеешь",
+    "Что ты можешь делать?",
+    "Кто ты?",
+    "ты кто?",
+    "Расскажи о себе",
+    "Расскажи про себя, пожалуйста",
+    "Какие у тебя возможности?",
+    "Чем ты можешь помочь?",
+    "Что ты такое?",
+    # canonical capability questions the old verb-blocklist wrongly rejected
+    "Что ты можешь сделать?",
+    "Что можешь сделать?",
+    "Что ты делаешь?",
+    # filler-word tolerance (normalization drops а/ну/вообще/пожалуйста/скажи)
+    "А что ты вообще умеешь?",
+    "Ну скажи, что ты умеешь?",
+    "Расскажи, пожалуйста, о себе",
+])
+def test_is_capability_question_true(q: str) -> None:
+    assert is_capability_question(q) is True
+
+
+@pytest.mark.parametrize("q", [
+    "Поставь напоминание на 9:00",
+    "Добавь молоко в список",
+    "Напомни завтра принять лекарства",
+    # capability phrase BUT also an explicit action imperative -> not pure
+    "Что ты умеешь? И поставь напоминание на завтра в 9 утра",
+    "Составь меню на неделю",
+    "Запиши рецепт борща в книгу",
+    "Привет, как дела?",
+    "",
+    # long message -> not a short pure question
+    "Слушай, мне тут нужно разобраться с кучей дел на неделю, "
+    "что ты вообще умеешь полезного по хозяйству и быту?",
+    # Codex A/B (#100): action-adjacent meta questions must NOT skip the guard.
+    # Exact-match handles these WITHOUT any verb blocklist — the action verb
+    # need not be enumerated anywhere (очистить/отменить are not listed).
+    "Что ты делаешь с моим списком?",
+    "Что можешь добавить в список?",
+    "Что ты можешь сохранить в рецепты?",
+    "Что можешь поставить на завтра?",
+    "Что можешь очистить список?",
+    "Что ты можешь отменить напоминание?",
+])
+def test_is_capability_question_false(q: str) -> None:
+    assert is_capability_question(q) is False

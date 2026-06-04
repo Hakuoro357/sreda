@@ -234,6 +234,7 @@ def build_housewife_tools(
     pending_buttons_state: dict | None = None,
     menu_display_state: dict | None = None,
     embedding_client: Any = None,
+    bot_key: str | None = None,
 ) -> list[Any]:
     """Return LLM tools for the housewife skill, bound to the given
     tenant/user. Called from ``execute_conversation_chat`` when the
@@ -255,6 +256,12 @@ def build_housewife_tools(
     ``menu_display_state``: optional mutable dict for user-facing menu
     rendering. ``execute_conversation_chat`` can use it to avoid
     trusting a post-tool LLM rewrite for menu display / creation turns.
+
+    ``bot_key``: the turn's bot_key (from ActionEnvelope.bot_key).
+    Passed to schedule_reminder and task_service so new reminders and
+    task-linked reminders are stored with the originating bot (Phase 5:
+    bot_key fixed at creation).  Falls back to LEGACY_NULL_BOT_KEY when
+    not provided (backward-compat).
     """
 
     service = HousewifeReminderService(session, embedding_client=embedding_client)
@@ -384,6 +391,7 @@ def build_housewife_tools(
                     trigger_at=trigger_at,
                     recurrence_rule=recurrence_rule or None,
                     source_memo=None,
+                    bot_key=bot_key,
                 )
             except ValueError as exc:
                 logger.warning(
@@ -1742,7 +1750,7 @@ def build_housewife_tools(
     # Task scheduler («Расписание») — MVP tools
     # ------------------------------------------------------------------
 
-    task_service = TaskService(session, reminder_service=service)
+    task_service = TaskService(session, reminder_service=service, bot_key=bot_key)
 
     def _parse_task_date(raw: str | None) -> "date | None":
         """Parse the date argument accepted by add_task/update_task/list_tasks.
@@ -1938,7 +1946,7 @@ def build_housewife_tools(
             sf = get_session_factory()
             with sf() as fresh_session:
                 try:
-                    svc = _TS(fresh_session)
+                    svc = _TS(fresh_session, bot_key=bot_key)
                     task = svc.add_task_with_details(
                         tenant_id=tenant_id,
                         user_id=user_id,

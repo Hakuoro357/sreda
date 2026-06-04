@@ -40,6 +40,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage
 from sreda.db.repositories.user_profile import UserProfileRepository
 
@@ -684,6 +685,7 @@ def enqueue_pb_tour_name_confirmation(
     channel_type: str,
     chat_id: str,
     display_name: str,
+    bot_key: str = LEGACY_NULL_BOT_KEY,
 ) -> None:
     """Queue post-tour name confirmation through outbox for auditability."""
     if not workspace_id:
@@ -715,6 +717,8 @@ def enqueue_pb_tour_name_confirmation(
             is_interactive=True,
             status="pending",
             payload_json=json.dumps(payload, ensure_ascii=False),
+            # Phase 4a: route delivery via the correct bot.
+            bot_key=bot_key,
         )
     )
 
@@ -727,6 +731,7 @@ def enqueue_pb_tour_name_retry(
     user_id: str,
     channel_type: str,
     chat_id: str,
+    bot_key: str = LEGACY_NULL_BOT_KEY,
 ) -> None:
     """Queue a retry question when LLM could not extract a display name."""
     if not workspace_id:
@@ -757,6 +762,8 @@ def enqueue_pb_tour_name_retry(
             is_interactive=True,
             status="pending",
             payload_json=json.dumps(payload, ensure_ascii=False),
+            # Phase 4a: route delivery via the correct bot.
+            bot_key=bot_key,
         )
     )
 

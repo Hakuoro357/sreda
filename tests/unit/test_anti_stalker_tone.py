@@ -159,10 +159,14 @@ def test_housewife_prompt_has_sreda_feminine_rule() -> None:
         "В _HOUSEWIFE_FOOD_PROMPT должен быть раздел про обязательный "
         "женский род самонарратива Среды (бренд)."
     )
-    # Явные примеры правильного и запрещённого
-    assert "запомнила" in text and "помог" in text, (
+    # Явные примеры правильного и запрещённого.
+    # #103 (stale-test fix): the canonical example pair drifted — the prompt no
+    # longer uses «запомнила»; it now lists ❌ masculine → ✅ feminine pairs like
+    # «нашёл» → «помогла»/«нашла». Intent preserved: the ж.р. section must carry
+    # a correct (feminine) and a forbidden (masculine) example.
+    assert "помогла" in text and "нашёл" in text, (
         "Раздел про ж.р. должен содержать примеры правильного "
-        "(«запомнила») и запрещённого («помог»)."
+        "(«помогла») и запрещённого («нашёл»)."
     )
 
 

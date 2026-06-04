@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage, User, Workspace
 from sreda.db.models.housewife import FamilyReminder
 from sreda.services.housewife_reminders import (
@@ -158,6 +159,7 @@ class HousewifeReminderWorker:
                 feature_key=HOUSEWIFE_FEATURE_KEY,
                 status="pending",
                 payload_json=json.dumps(payload, ensure_ascii=False),
+                bot_key=reminder.bot_key or LEGACY_NULL_BOT_KEY,
             )
             if hasattr(OutboxMessage, "user_id"):
                 outbox.user_id = reminder.user_id

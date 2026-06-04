@@ -16,7 +16,7 @@ Phase 1 of free-tier-subscription plan
   DO UPDATE WHERE quota check (см. `UsageLedgerService.try_consume`).
 
 Sample rows:
-  ('tenant_X', 'llm_turns', 'daily', '2026-05-07', 5, 20)
+  ('tenant_X', 'llm_turns', 'daily', '2026-05-07', 5, 10)
   ('tenant_X', 'llm_turns', 'monthly', '2026-05', 47, 200)
   ('tenant_X', 'voice_stt_seconds', 'monthly', '2026-05', 432, 1800)
 

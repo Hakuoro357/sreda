@@ -116,7 +116,12 @@ class TestMiniAppAuth:
         assert resp.status_code == 401
 
     def test_expired_init_data_returns_401(self, seeded_client):
-        old_date = int(time.time()) - 7200
+        # #103 (stale-test fix): the expiry window widened to 24h
+        # (telegram_auth max_age_seconds=86400, industry standard). The old
+        # 2h-ago (-7200) auth_date is now VALID → 200, so it no longer
+        # exercised the 401 path. Use an age clearly beyond 24h (25h) so the
+        # initData is genuinely expired.
+        old_date = int(time.time()) - 90000  # 25h ago, > 24h max_age
         init_data = _make_init_data(auth_date=old_date)
         resp = seeded_client.get(
             "/miniapp/api/v1/summary",

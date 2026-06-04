@@ -64,13 +64,17 @@ def _seed_subscription(
     active_until: datetime | None = None,
     status: str = "active",
 ) -> TenantSubscription:
+    # Default active window straddles "now" so the sub is currently active.
+    # (Was hardcoded 2026-04-01 → 2026-05-01, which silently expired once real
+    # time passed May 2026 and broke every "active subscription" assertion.)
+    _now = datetime.now(timezone.utc)
     sub = TenantSubscription(
         id=f"sub_{uuid4().hex[:16]}",
         tenant_id=tenant_id,
         plan_id=plan.id,
         status=status,
-        starts_at=starts_at or _utc(2026, 4, 1),
-        active_until=active_until or _utc(2026, 5, 1),
+        starts_at=starts_at or (_now - timedelta(days=15)),
+        active_until=active_until or (_now + timedelta(days=15)),
     )
     session.add(sub)
     session.flush()
@@ -221,7 +225,8 @@ def test_usage_outside_period_not_counted(session):
         completion_tokens=500,
         total_tokens=1000,
         credits_consumed=5000,  # deliberately huge
-        created_at=_utc(2026, 3, 15),  # BEFORE period_start
+        # BEFORE period_start (sub now starts 15d ago) — back-date well past it
+        created_at=datetime.now(timezone.utc) - timedelta(days=60),
     )
     session.add(old_row)
     session.commit()

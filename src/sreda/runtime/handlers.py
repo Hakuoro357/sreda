@@ -48,6 +48,7 @@ from sreda.services.embeddings import get_embeddings_client
 from sreda.services.llm import (
     detect_unbacked_claim,
     get_chat_llm,
+    is_capability_question,
     resolve_provider_pair_for_tenant,
     strip_reasoning_prefix,
 )
@@ -2485,6 +2486,11 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
             ai_text = str(getattr(ai_msg, "content", "") or "")
             if (
                 not _hallucination_nudged
+                # Skip the guard when the user asked a capability/meta question
+                # ("что ты умеешь?") — the reply is an ability description, not
+                # a side-effect claim, so a nudge here just breaks the answer
+                # (vex-assistant#100).
+                and not is_capability_question(user_text)
                 and detect_unbacked_claim(ai_text, called_tools)
             ):
                 _hallucination_nudged = True
@@ -2499,14 +2505,24 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
                 messages.append(
                     HumanMessage(content=(
                         "[Внутренняя системная инструкция, юзеру не "
-                        "пересылается.] Ты ответил так, будто действие уже "
-                        "выполнено, но в этом ходе не было соответствующего "
-                        "tool-call'а — состояние НЕ изменилось, данные НЕ "
-                        "сохранены.\n\n"
+                        "пересылается.] СНАЧАЛА проверь предыдущие итерации "
+                        "этого хода: если соответствующий tool УЖЕ был "
+                        "успешно вызван (ToolMessage с `ok:...`) — НЕ "
+                        "вызывай его повторно. Дублирование = double-write "
+                        "в БД (дубли пунктов в списках/чек-листах, "
+                        "повторные напоминания, дубли задач в расписании). "
+                        "Просто переформулируй финальный ответ юзеру "
+                        "опираясь на ТОТ уже-полученный ok-результат, без "
+                        "нового tool-call'а.\n\n"
+                        "Если же tool в этом ходе ещё не вызван — ты "
+                        "ответил так, будто действие уже выполнено, но в "
+                        "этом ходе не было соответствующего tool-call'а — "
+                        "состояние НЕ изменилось, данные НЕ сохранены.\n\n"
                         "Если действие действительно нужно — вызови tool "
                         "СЕЙЧАС (save_recipe / save_recipes_batch / "
                         "add_shopping_items / plan_week_menu / "
-                        "schedule_reminder / и т.п.).\n\n"
+                        "schedule_reminder / add_checklist_items / и "
+                        "т.п.).\n\n"
                         "В финальном тексте: ОТБРОСЬ неподтверждённые "
                         "утверждения. Перепиши ответ заново, опираясь ТОЛЬКО "
                         "на факты из (1) сообщения пользователя в этом "
@@ -3123,6 +3139,7 @@ async def _chat_preflight(
             pending_buttons_state=pending_buttons_state,
             menu_display_state=menu_display_state,
             embedding_client=embedding_client,
+            bot_key=action.bot_key,
         )
     tools_by_name = {t.name: t for t in tools}
 

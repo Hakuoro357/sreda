@@ -43,7 +43,6 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import SQLAlchemyError
 
 from sreda.config.settings import get_settings
-from sreda.integrations.telegram.client import TelegramClient
 
 
 logger = logging.getLogger(__name__)
@@ -127,7 +126,10 @@ async def alert_admin_async(text: str) -> bool:
     import asyncio
 
     settings = get_settings()
-    tg_bot_token = settings.telegram_bot_token
+    from sreda.config.bot_registry import TelegramBotRegistry
+    _registry = TelegramBotRegistry.from_settings(settings)
+    _admin_cfg = _registry.resolve(_registry.admin_bot_key)
+    tg_bot_token = _admin_cfg.token or None
     tg_chat_id = settings.admin_telegram_chat_id
     max_bot_token = settings.max_bot_token
     max_chat_id = settings.admin_max_chat_id
@@ -309,8 +311,13 @@ def _post_telegram_sync(bot_token: str, chat_id: str, text: str) -> bool:
             resp.status_code, resp.text[:200],
         )
         return False
-    except Exception:  # noqa: BLE001 — must never crash caller
-        logger.exception("admin_alerts: Telegram POST failed")
+    except Exception as exc:  # noqa: BLE001 — must never crash caller
+        # SECURITY: log only the exception class — logger.exception() would emit
+        # the full traceback, and an httpx error's repr embeds the token-bearing
+        # Telegram URL. (This path uses raw httpx.post, not TelegramClient.)
+        logger.warning(
+            "admin_alerts: Telegram POST failed: %s", type(exc).__name__
+        )
         return False
 
 
@@ -511,14 +518,17 @@ def send_admin_alert(
     """
     # Early exit checks на caller thread (no I/O)
     settings = get_settings()
-    tg_bot_token = settings.telegram_bot_token
+    from sreda.config.bot_registry import TelegramBotRegistry
+    _registry = TelegramBotRegistry.from_settings(settings)
+    _admin_cfg = _registry.resolve(_registry.admin_bot_key)
+    tg_bot_token = _admin_cfg.token or None
     tg_chat_id = settings.admin_telegram_chat_id
     max_bot_token = settings.max_bot_token
     max_chat_id = settings.admin_max_chat_id
 
     # R-28 amendment: at least one channel must be fully configured.
     # MAX configured = max_bot_token + admin_max_chat_id (primary).
-    # TG configured = telegram_bot_token + admin_telegram_chat_id (fallback or legacy).
+    # TG configured = admin_bot_key token + admin_telegram_chat_id (fallback or legacy).
     max_ok = bool(max_bot_token and max_chat_id)
     tg_ok = bool(tg_bot_token and tg_chat_id)
     if not (max_ok or tg_ok):

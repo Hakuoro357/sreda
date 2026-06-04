@@ -240,10 +240,21 @@ def test_default_platform_telegram_backward_compat(db_session, monkeypatch):
     def _raise(*a, **k):
         raise TelegramInitDataError("test bad sig")
 
-    monkeypatch.setattr(mi, "validate_init_data", _raise)
+    # Phase 7: miniapp now uses validate_telegram_init_data_any_bot (multi-bot)
+    monkeypatch.setattr(mi, "validate_telegram_init_data_any_bot", _raise)
     monkeypatch.setattr(
         "sreda.api.routes.miniapp.get_settings",
-        lambda: MagicMock(telegram_bot_token="TG_TOK"),
+        lambda: MagicMock(
+            telegram_bot_token="TG_TOK",
+            home_bot_token=None,
+            telegram_bot_username=None,
+            telegram_miniapp_shortname=None,
+            home_bot_username=None,
+            home_miniapp_shortname=None,
+            home_bot_signup_open=True,
+            system_default_bot_key="sreda",
+            admin_bot_key="sreda",
+        ),
     )
 
     with pytest.raises(HTTPException) as exc:

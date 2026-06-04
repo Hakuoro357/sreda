@@ -31,7 +31,7 @@ from sreda.db.base import Base
 class PollerOffset(Base):
     __tablename__ = "poller_offsets"
 
-    channel: Mapped[str] = mapped_column(String(16), primary_key=True)
+    channel: Mapped[str] = mapped_column(String(64), primary_key=True)
     last_update_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
@@ -41,7 +41,7 @@ class PollerOffset(Base):
 class PollerHeartbeat(Base):
     __tablename__ = "poller_heartbeats"
 
-    channel: Mapped[str] = mapped_column(String(16), primary_key=True)
+    channel: Mapped[str] = mapped_column(String(64), primary_key=True)
     last_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
     )

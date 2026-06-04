@@ -1,0 +1,54 @@
+# sreda-telegram-poller@.service — per-bot Telegram long-poll worker.
+#
+# The instance specifier %i is the bot_key (e.g. "sreda", "sreda_home").
+# Start both bots:
+#   sudo systemctl enable --now sreda-telegram-poller@sreda.service
+#   sudo systemctl enable --now sreda-telegram-poller@sreda_home.service
+#
+# Phase 8 cutover replaces the legacy non-template unit with these:
+#   sudo systemctl disable --now sreda-telegram-poller.service
+#   sudo systemctl enable --now sreda-telegram-poller@sreda.service
+#   sudo systemctl enable --now sreda-telegram-poller@sreda_home.service
+#
+# Pre-start check (verify token↔bot before enabling):
+#   sudo -u sreda /opt/sreda/.venv/bin/python \
+#     -m sreda.workers.telegram_long_poll --bot-key sreda --check-config
+#
+# Exit codes (см. RestartPreventExitStatus ниже):
+#   0 — clean shutdown (SIGTERM)
+#   1 — fatal config error (unknown bot_key, missing token)
+#   2 — singleton lock held by another instance
+#   3 — Telegram 409 Conflict (active webhook blocks getUpdates)
+#
+# При exit code 2/3 systemd НЕ рестартует автоматически — это требует
+# ручного действия:
+#   systemctl reset-failed sreda-telegram-poller@%i
+#   systemctl start sreda-telegram-poller@%i
+
+[Unit]
+Description=Sreda Telegram long-poller (%i)
+After=network-online.target
+Wants=network-online.target
+# Если БД локально через systemd — добавить `postgresql.service` в After.
+# Сейчас PG на этом же VDS, но poller сам ретраит при ConnectionError,
+# а advisory lock освобождается атомарно при разрыве connection. Безопасно
+# оставить только network-online.target.
+
+[Service]
+Type=simple
+User=sreda
+Group=sreda
+WorkingDirectory=/opt/sreda
+EnvironmentFile=/etc/sreda/.env
+Environment=SREDA_TELEGRAM_BOT_KEY=%i
+ExecStart=/opt/sreda/.venv/bin/python -m sreda.workers.telegram_long_poll --bot-key %i
+Restart=on-failure
+RestartSec=5
+# 2 (singleton lock) и 3 (409 Conflict) требуют ручного действия —
+# auto-restart только спамил бы логи. См. runbook в plan.
+RestartPreventExitStatus=2 3
+StandardOutput=append:/var/log/sreda/telegram-poller-%i.log
+StandardError=append:/var/log/sreda/telegram-poller-%i.log
+
+[Install]
+WantedBy=multi-user.target

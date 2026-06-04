@@ -93,6 +93,7 @@ async def handle_telegram_interaction(
                         user_id=onboarding.user_id,
                         channel_type="telegram",
                         chat_id=str(onboarding.chat_id),
+                        bot_key=bot_key,
                     )
                     session.commit()
                     return
@@ -110,6 +111,7 @@ async def handle_telegram_interaction(
                     channel_type="telegram",
                     chat_id=str(onboarding.chat_id),
                     display_name=display_name,
+                    bot_key=bot_key,
                 )
                 session.commit()
                 return

@@ -845,6 +845,169 @@ def test_telegram_webhook_handles_claim_lookup_command(
     assert len(outbox) == 1
 
 
+def test_telegram_webhook_rejects_unknown_bot_key(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Phase 9: unknown bot_key must be rejected with 404 before any processing."""
+    db_path = tmp_path / "unknown_bot_key.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    # Only 'sreda' bot is configured — no SREDA_HOME_BOT_TOKEN.
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            "text": "hi",
+        },
+    }
+
+    response = client.post("/webhooks/telegram/evil_bot", json=payload)
+
+    assert response.status_code == 404
+    # Nothing must be persisted — the request must be rejected before ingest.
+    session = get_session_factory()()
+    try:
+        assert session.query(InboundMessage).count() == 0
+    finally:
+        session.close()
+
+
+def test_telegram_webhook_accepts_known_bot_key_sreda(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Phase 9: the primary 'sreda' bot_key must pass registry resolution."""
+    db_path = tmp_path / "known_bot_key.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="T1", approved_at=_dt.now(_tz.utc)))
+        session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="W1"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_p9", tenant_id="tenant_1", user_id="user_1",
+            display_name="Test User", address_form="ty",
+        ))
+        _mark_existing_user_welcome_sent(session)
+        session.commit()
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 100,
+        "message": {
+            "message_id": 1,
+            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            "text": "hi",
+        },
+    }
+
+    response = client.post("/webhooks/telegram/sreda", json=payload)
+
+    # 202 means the known bot_key was accepted and ingest ran.
+    assert response.status_code == 202
+
+
+def test_telegram_webhook_accepts_sreda_home_when_configured(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Phase 9: 'sreda_home' bot_key is accepted when SREDA_HOME_BOT_TOKEN is set."""
+    db_path = tmp_path / "home_bot_key.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    monkeypatch.setenv("SREDA_HOME_BOT_TOKEN", "home-test-token-xyz")
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    session = get_session_factory()()
+    try:
+        session.add(Tenant(id="tenant_1", name="T1", approved_at=_dt.now(_tz.utc)))
+        session.add(Workspace(id="workspace_1", tenant_id="tenant_1", name="W1"))
+        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
+        from sreda.db.models.user_profile import TenantUserProfile as _TUP
+        session.add(_TUP(
+            id="tup_home", tenant_id="tenant_1", user_id="user_1",
+            display_name="Test User", address_form="ty",
+        ))
+        _mark_existing_user_welcome_sent(session)
+        session.commit()
+    finally:
+        session.close()
+
+    client = TestClient(create_app())
+    payload = {
+        "update_id": 200,
+        "message": {
+            "message_id": 2,
+            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
+            "text": "hello from home",
+        },
+    }
+
+    response = client.post("/webhooks/telegram/sreda_home", json=payload)
+
+    # 202 means 'sreda_home' resolved in the registry and ingest ran.
+    assert response.status_code == 202
+
+
+def test_telegram_webhook_rejects_sreda_home_when_not_configured(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Phase 9: 'sreda_home' is rejected with 404 when SREDA_HOME_BOT_TOKEN is absent."""
+    db_path = tmp_path / "home_not_configured.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
+    # Explicitly unset HOME_BOT_TOKEN to ensure it's absent even if set in environment.
+    monkeypatch.delenv("SREDA_HOME_BOT_TOKEN", raising=False)
+
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    Base.metadata.create_all(get_engine())
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/webhooks/telegram/sreda_home",
+        json={"update_id": 300, "message": {"message_id": 3,
+              "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"}, "text": "x"}},
+    )
+
+    assert response.status_code == 404
+    session = get_session_factory()()
+    try:
+        assert session.query(InboundMessage).count() == 0
+    finally:
+        session.close()
+
+
 def test_telegram_webhook_rate_limits_excess_requests(
     monkeypatch,
     tmp_path: Path,

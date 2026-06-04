@@ -513,8 +513,11 @@ _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в поку
                   "☐", "☑", "☒", "✗",
                   # 2026-05-08 incident (tenant_tg_755682022): LLM
                   # написала «Записала в план кроя на пятницу» когда
-                  # был вызван add_shopping_items. Cutting plan tool
-                  # не существует — категория `None` ниже.
+                  # был вызван add_shopping_items.
+                  # 2026-05-29: «План кроя» — это чек-лист по имени,
+                  # категория поправлена на "checklist" в
+                  # _OBJECT_TO_CATEGORY (см. ниже). Швейный процесс
+                  # «в крой» / « крой » остаётся None — tool'а нет.
                   # Codex r3 MAJOR #2: only specific phrases — bare
                   # "крой" matches "раскрой", "покрой" (часть слов
                   # «раскрой теста», «покрой одежды»).
@@ -528,12 +531,22 @@ _CLAIM_OBJECTS = ("рецепт", "в книг", "в список", "в поку
 # Substrings checked в порядке specificity (длинные первыми) — чтобы
 # «в план кроя» не матчился просто на «в покупк» если оба в окне.
 _OBJECT_TO_CATEGORY: tuple[tuple[str, str | None], ...] = (
-    # Cutting plan — no tool exists. Always unbacked.
+    # «План кроя» — это чек-лист по имени (юзер хранит позиции
+    # раскроя как пункты чек-листа). 2026-05-29 incident
+    # tenant_tg_755682022: LLM вызвал add_checklist_items с
+    # list_id_or_title="План кроя", получил ok, но safety_net
+    # отверг это как unbacked (категория была None) → retry-нудж →
+    # двойной add_checklist_items → дубль "Муслин зелёный широкий"
+    # и в "План кроя", и в "Дела по ткани". Маппим в "checklist",
+    # чтобы add_checklist_items / create_checklist принимались как
+    # валидный backing. См. trace_73c9fe5786b04838 16:33 UTC.
+    ("план кро", "checklist"),     # "план кроя", "план крой"
+    ("план на крой", "checklist"),
+    # Сам процесс кроя (швейная операция) — tool'а нет. Любая claim
+    # «в крой ...» / « крой ...» остаётся unbacked.
     # ⚠ Codex r3 MAJOR #2: только specific фразы. Bare "крой"
     # ловит «раскрой», «покрой» (раскрой ткани, покрой одежды) —
     # false positives. Phrase-based matching tighter.
-    ("план кро", None),       # "план кроя", "план крой"
-    ("план на крой", None),
     ("в крой ", None),         # "в крой на пятницу"
     (" крой ", None),          # bare "крой" surrounded by spaces
     # Recipe
@@ -943,6 +956,65 @@ def _identify_claim_category(window: str) -> str | None | bool:
         if obj in window:
             return category
     return False
+
+
+# 2026-06-04 (vex-assistant#100): a capability/meta QUESTION from the user —
+# "что ты умеешь?", "кто ты?", "расскажи о себе". On such a turn the assistant
+# is EXPECTED to describe its abilities ("ставлю напоминания, составляю меню,
+# веду списки") with NO tool call, so the unbacked-claim guard must NOT fire —
+# otherwise the capability answer is flagged, nudged, and collapses into the
+# error fallback (prod 2026-06-04, tenant_tg_702229240: "Что ты умеешь?" ->
+# "Не получилось надёжно записать это"). We gate on the USER's intent: match is
+# EXACT after normalization (lowercase, ё→е, punctuation→space, filler words
+# dropped), NOT substring. "что можешь сделать?" matches; "что можешь добавить в
+# список?" carries an action object so it does NOT match (the guard still runs);
+# "ну а вообще скажи что ты умеешь?" → fillers dropped → matches. No action-verb
+# blocklist (whack-a-mole + it false-negated the canonical "что можешь сделать").
+_CAPABILITY_QUESTION_PHRASES: frozenset[str] = frozenset({
+    "что ты умеешь", "что умеешь", "что ты умеешь делать", "что умеешь делать",
+    "что ты можешь", "что можешь", "что ты можешь делать", "что можешь делать",
+    "что ты можешь сделать", "что можешь сделать", "что ты можешь сделать для меня",
+    "что ты делаешь",
+    "что ты за бот", "что ты за ассистент", "что ты за помощник",
+    "что ты такое", "что ты такая", "что это за бот",
+    "кто ты", "ты кто", "кто ты такой", "кто ты такая",
+    "расскажи о себе", "расскажи про себя", "расскажи кто ты",
+    "какие у тебя функции", "какие у тебя возможности",
+    "какие функции", "какие возможности", "какие у тебя навыки",
+    "твои возможности", "твои функции", "твои навыки", "твои умения",
+    "чем ты можешь помочь", "чем можешь помочь", "чем поможешь",
+    "чем ты можешь быть полезна", "чем ты можешь быть полезен",
+    "для чего ты", "для чего ты нужна", "зачем ты", "зачем ты нужна",
+    "зачем ты нужен", "как ты можешь помочь", "как ты работаешь",
+    "как работаешь", "что ты предлагаешь",
+})
+# Filler tokens dropped before the exact match. MUST stay disjoint from any
+# token used in the phrases above (else a real phrase would be mangled).
+_CAPABILITY_QUESTION_FILLERS: frozenset[str] = frozenset({
+    "а", "ну", "вообще", "пожалуйста", "плиз", "скажи", "мне",
+    "эй", "слушай", "привет", "интересно", "короче", "же", "ка", "блин",
+})
+
+
+def is_capability_question(user_text: str) -> bool:
+    """True when the user's message is a capability/meta question.
+
+    On such a turn the assistant describes its abilities (no side-effect, no
+    tool), so detect_unbacked_claim should be skipped. Matching is EXACT after
+    normalization (see _CAPABILITY_QUESTION_PHRASES) — a message that carries an
+    action ("что можешь добавить в список") does NOT match, so real action
+    claims keep being checked.
+    """
+    if not user_text:
+        return False
+    low = user_text.lower().replace("ё", "е")
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch.isspace()) else " " for ch in low
+    )
+    tokens = [t for t in cleaned.split() if t not in _CAPABILITY_QUESTION_FILLERS]
+    if not tokens:
+        return False
+    return " ".join(tokens) in _CAPABILITY_QUESTION_PHRASES
 
 
 def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:

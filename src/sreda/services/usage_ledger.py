@@ -9,7 +9,7 @@ Phase 2 of free-tier-subscription plan
     daily_key = msk_now.strftime("%Y-%m-%d")
     monthly_key = msk_now.strftime("%Y-%m")
     periods = [
-        ("daily", daily_key, 20),
+        ("daily", daily_key, 10),
         ("monthly", monthly_key, 200),
     ]
     if not ledger.try_consume(tenant_id, "llm_turns", 1, periods):
@@ -61,7 +61,8 @@ _MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 # Used by runtime/handlers.py (LLM gate) и services/{telegram_bot,
 # max_inbound}.py (voice gates). Boris adjusts через RuntimeConfig
 # в follow-up sprint (per Open Question #2 в plan); пока hardcoded.
-SREDA_FREE_LLM_DAILY = 20
+# 2026-06-03 (Boris): free-tier daily LLM cap lowered 20 → 10.
+SREDA_FREE_LLM_DAILY = 10
 SREDA_FREE_LLM_MONTHLY = 200
 SREDA_FREE_VOICE_SECONDS_DAILY = 5 * 60       # 5 minutes
 SREDA_FREE_VOICE_SECONDS_MONTHLY = 30 * 60    # 30 minutes

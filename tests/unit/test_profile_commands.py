@@ -101,7 +101,10 @@ def test_profile_show_creates_profile_and_renders(monkeypatch, tmp_path: Path) -
         asyncio.run(service.process_job(queued.job_id))
 
         profile = session.query(TenantUserProfile).one()
-        assert profile.timezone == "UTC"
+        # #103 (stale-test fix): default timezone changed UTC → Europe/Moscow
+        # (migration 20260518_0046; ~80%+ users in MSK — UTC default was
+        # shifting reminder times). See TenantUserProfile.timezone default.
+        assert profile.timezone == "Europe/Moscow"
         assert profile.communication_style == "casual"
     finally:
         session.close()
@@ -109,7 +112,7 @@ def test_profile_show_creates_profile_and_renders(monkeypatch, tmp_path: Path) -
     assert len(telegram.sent_messages) == 1
     text = telegram.sent_messages[0]["text"]
     assert "Профиль" in text
-    assert "UTC" in text
+    assert "Europe/Moscow" in text
     assert "casual" in text
 
 

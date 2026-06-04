@@ -65,9 +65,15 @@ class TaskService:
         self,
         session: Session,
         reminder_service: HousewifeReminderService | None = None,
+        bot_key: str | None = None,
     ) -> None:
         self.session = session
         self.reminders = reminder_service or HousewifeReminderService(session)
+        # bot_key for new reminders created via _attach_reminder_inner.
+        # Sourced from the turn's ActionEnvelope.bot_key (Phase 5).
+        # Falls back to LEGACY_NULL_BOT_KEY when not provided (task-linked
+        # reminders created outside a turn context, e.g. system jobs).
+        self._bot_key = bot_key
 
     # ------------------------------------------------------------------
     # Create / update / delete
@@ -557,6 +563,8 @@ class TaskService:
 
         trigger_dt = trigger_dt - timedelta(minutes=offset_minutes)
         # Copy RRULE over so a recurring task gets a recurring reminder.
+        # Pass self._bot_key so the reminder fires via the same bot the
+        # task was created from (Phase 5: bot_key fixed at creation).
         reminder = self.reminders.schedule(
             tenant_id=task.tenant_id,
             user_id=task.user_id,
@@ -564,6 +572,7 @@ class TaskService:
             trigger_at=trigger_dt,
             recurrence_rule=task.recurrence_rule,
             source_memo=f"task:{task.id}",
+            bot_key=self._bot_key,
         )
         task.reminder_id = reminder.id
         task.reminder_offset_minutes = offset_minutes

@@ -10,10 +10,12 @@ from urllib.parse import urlencode
 
 import pytest
 
+from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     TelegramWebAppUser,
     validate_init_data,
+    validate_telegram_init_data_any_bot,
 )
 
 BOT_TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
@@ -131,3 +133,88 @@ class TestValidateInitData:
         init_data = _make_init_data(extra_params={"query_id": "AAHQ1234"})
         result = validate_init_data(init_data, BOT_TOKEN)
         assert result.telegram_id == "12345"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 security tests: empty-token bots must not be used as HMAC candidates
+# ---------------------------------------------------------------------------
+
+def _compute_empty_token_hmac(data_check_string: str) -> str:
+    """Produce the HMAC an attacker would compute using an empty-string token."""
+    secret_key = hmac.new(b"WebAppData", b"", hashlib.sha256).digest()
+    return hmac.new(
+        secret_key, data_check_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def _make_init_data_with_hash(*, user_id: int = 99999, auth_date: int | None = None,
+                               forced_hash: str) -> str:
+    """Build initData string with a specific (possibly forged) hash."""
+    if auth_date is None:
+        auth_date = int(time.time())
+    user_json = json.dumps({"id": user_id, "first_name": "Attacker"}, separators=(",", ":"))
+    params = {"auth_date": str(auth_date), "user": user_json}
+    sorted_pairs = sorted(params.items())
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted_pairs)
+    params["hash"] = forced_hash
+    return urlencode(params), data_check_string
+
+
+class TestEmptyTokenSecurity:
+    """Fix 1: validate_telegram_init_data_any_bot must reject empty-token forgeries."""
+
+    def _make_registry(self, *, real_token: str, empty_token: str = "") -> TelegramBotRegistry:
+        """Registry with one real-token bot and one empty-token bot."""
+        bots = [
+            BotConfig(key="sreda", token=real_token, miniapp_shortname="sreda_app"),
+            BotConfig(key="empty_bot", token=empty_token, miniapp_shortname="empty_app"),
+        ]
+        return TelegramBotRegistry(
+            bots=bots,
+            system_default_bot_key="sreda",
+            admin_bot_key="sreda",
+        )
+
+    def test_empty_token_forged_initdata_is_rejected(self):
+        """An attacker forging initData with the empty-string HMAC must be rejected."""
+        real_token = BOT_TOKEN
+        registry = self._make_registry(real_token=real_token, empty_token="")
+
+        # Forge initData signed with the empty token
+        user_id = 99999
+        auth_date = int(time.time())
+        user_json = json.dumps({"id": user_id, "first_name": "Attacker"}, separators=(",", ":"))
+        params: dict[str, str] = {"auth_date": str(auth_date), "user": user_json}
+        sorted_pairs = sorted(params.items())
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted_pairs)
+        forged_hash = _compute_empty_token_hmac(data_check_string)
+        params["hash"] = forged_hash
+        init_data = urlencode(params)
+
+        with pytest.raises(TelegramInitDataError, match="invalid hash"):
+            validate_telegram_init_data_any_bot(init_data, registry)
+
+    def test_real_token_still_validates_after_fix(self):
+        """A legitimately signed initData from the real bot still validates."""
+        real_token = BOT_TOKEN
+        registry = self._make_registry(real_token=real_token, empty_token="")
+        init_data = _make_init_data(bot_token=real_token)
+        bot_key, user = validate_telegram_init_data_any_bot(init_data, registry)
+        assert bot_key == "sreda"
+        assert user.telegram_id == "12345"
+
+    def test_all_empty_tokens_raises_config_error(self):
+        """If ALL bots have empty tokens, validation must raise (no silent empty HMAC)."""
+        bots = [
+            BotConfig(key="bot1", token="", miniapp_shortname="app1"),
+            BotConfig(key="bot2", token="", miniapp_shortname="app2"),
+        ]
+        registry = TelegramBotRegistry(
+            bots=bots,
+            system_default_bot_key="bot1",
+            admin_bot_key="bot1",
+        )
+        # Any initData should raise — no valid candidates
+        init_data = _make_init_data(bot_token="irrelevant")
+        with pytest.raises(TelegramInitDataError):
+            validate_telegram_init_data_any_bot(init_data, registry)

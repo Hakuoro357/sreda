@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,10 +17,10 @@ from sreda.admin.queries import (
     get_budget_summary_for_day,
     get_llm_calls,
 )
-
-_MSK_TZ = ZoneInfo("Europe/Moscow")
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
+
+_MSK_TZ = ZoneInfo("Europe/Moscow")
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
@@ -743,11 +743,9 @@ async def _legacy_admin_tenant_approve_unused(
     from datetime import UTC
     from datetime import datetime as _dt
 
+    from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
     from sreda.db.models.core import Tenant, User
-    from sreda.integrations.telegram.client import (
-        TelegramClient,
-        TelegramDeliveryError,
-    )
+    from sreda.integrations.telegram.client import TelegramDeliveryError
     from sreda.services.onboarding import build_post_approve_message
 
     tenant = session.get(Tenant, tenant_id)
@@ -856,7 +854,8 @@ async def _legacy_admin_tenant_approve_unused(
         delivery_results: list[str] = []
 
         if settings.telegram_bot_token and user.telegram_account_id:
-            client = TelegramClient(settings.telegram_bot_token)
+            _registry = TelegramBotRegistry.from_settings(settings)
+            client = telegram_client_for(_registry.system_default_bot_key, _registry)
             try:
                 await client.send_message(
                     chat_id=user.telegram_account_id,

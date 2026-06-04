@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, event
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text, event, text as sa_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -171,6 +171,17 @@ class OutboxMessage(Base):
     drop_reason: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )
+    # Phase 4a (second-tg-bot): which bot should deliver this outbox row.
+    # Made NOT NULL in Phase 5 (migration 20260603_0052) once every
+    # producer was updated to set this field.
+    bot_key: Mapped[str] = mapped_column(
+        # NOT NULL + legacy default ("sreda" = LEGACY_NULL_BOT_KEY): production
+        # producers set bot_key EXPLICITLY (guarded by the allowlist/AST
+        # enforcement test); this default is only a safety net so a non-producer
+        # insert (tests, future code) can never violate NOT NULL.
+        String(64), nullable=False, default="sreda",
+        server_default=sa_text("'sreda'"), index=True
+    )
 
 
 class SecureRecord(Base):
@@ -225,6 +236,24 @@ class InboundMessage(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        # Partial unique index: one inbound record per (channel_type, bot_key,
+        # external_update_id) — prevents cross-bot dedup collisions when two
+        # Telegram bots share the same update_id counter space (they're
+        # independent per-bot sequences).  NULL update_ids are excluded so
+        # synthetic / no-id events are still insertable freely.
+        # NOTE: where-clauses must be sa.text() objects, not bare strings.
+        Index(
+            "ux_inbound_dedup_channel_bot_update",
+            "channel_type",
+            "bot_key",
+            "external_update_id",
+            unique=True,
+            postgresql_where=sa_text("external_update_id IS NOT NULL"),
+            sqlite_where=sa_text("external_update_id IS NOT NULL"),
+        ),
     )
 
 

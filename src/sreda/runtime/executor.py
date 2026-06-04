@@ -30,6 +30,7 @@ from uuid import uuid4
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import get_settings
 from sreda.db.models import AgentRun, AgentThread
 from sreda.db.models.core import Job, OutboxMessage
@@ -92,12 +93,19 @@ class ActionRuntimeService:
         session: Session,
         *,
         telegram_client: TelegramClient | None = None,
+        bot_registry: TelegramBotRegistry | None = None,
         llm_client: object | None = None,
         embedding_client: object | None = None,
         ack_progress_controller: object | None = None,
     ) -> None:
         self.session = session
         self.telegram_client = telegram_client
+        # When ``bot_registry`` is supplied, inline sends resolve the client
+        # per ``action.bot_key`` so a sreda_home turn is delivered by the
+        # sreda_home bot, not the default one.  Tests that inject a single
+        # fake client can leave ``bot_registry=None`` — the single-client
+        # fallback still works.
+        self.bot_registry = bot_registry
         # ``llm_client`` / ``embedding_client`` are optional — when
         # ``None``, handlers fall through to the settings-based factories
         # (``get_chat_llm`` / ``get_embeddings_client``). Tests inject
@@ -230,6 +238,7 @@ class ActionRuntimeService:
                 "thread_id": thread_id,
                 "session": self.session,
                 "telegram_client": self.telegram_client,
+                "bot_registry": self.bot_registry,
                 "llm_client": self.llm_client,
                 "embedding_client": self.embedding_client,
                 "ack_progress_controller": self.ack_progress_controller,
@@ -397,22 +406,33 @@ class ActionRuntimeService:
                 },
                 ensure_ascii=False,
             ),
+            # Phase 4a: carry the turn's bot_key so the delivery worker
+            # routes via the correct TelegramClient.
+            bot_key=action.bot_key,
         )
         self.session.add(outbox)
         self.session.flush()
 
         # Inline-send только для telegram (см. graph.py rationale). MAX
         # failure rows подхватит OutboxDeliveryWorker._send_now_max.
-        if action.outbox_channel == "telegram" and self.telegram_client is not None:
-            try:
-                await self.telegram_client.send_message(
-                    chat_id=action.external_chat_id,
-                    text=sanitized_message,
-                    reply_markup=reply_markup,
-                )
-                outbox.status = "sent"
-            except TelegramDeliveryError:
-                outbox.status = "pending"
+        # Resolve the correct client per action.bot_key when a registry is
+        # available; fall back to the injected single client for tests /
+        # backward-compat callers that pass bot_registry=None.
+        if action.outbox_channel == "telegram":
+            if self.bot_registry is not None:
+                _tg_client = telegram_client_for(action.bot_key, self.bot_registry)
+            else:
+                _tg_client = self.telegram_client
+            if _tg_client is not None:
+                try:
+                    await _tg_client.send_message(
+                        chat_id=action.external_chat_id,
+                        text=sanitized_message,
+                        reply_markup=reply_markup,
+                    )
+                    outbox.status = "sent"
+                except TelegramDeliveryError:
+                    outbox.status = "pending"
 
         now = _utcnow()
         job.status = "failed"

@@ -151,6 +151,7 @@ class HousewifeReminderService:
         trigger_at: datetime,
         recurrence_rule: str | None = None,
         source_memo: str | None = None,
+        bot_key: str | None = None,
     ) -> FamilyReminder:
         trigger_at = _coerce_utc(trigger_at)
         # Validate rrule upfront — silently accepting a bad RRULE would
@@ -165,6 +166,7 @@ class HousewifeReminderService:
         clean_title = title.strip()
         embedding_json, embedding_model = self._embed_title(clean_title)
 
+        from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
         reminder = FamilyReminder(
             id=f"rem_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -177,6 +179,7 @@ class HousewifeReminderService:
             source_memo=source_memo,
             embedding_json=embedding_json,
             embedding_model=embedding_model,
+            bot_key=bot_key if bot_key is not None else LEGACY_NULL_BOT_KEY,
         )
         self.session.add(reminder)
         self.session.commit()

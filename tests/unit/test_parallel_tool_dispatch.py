@@ -210,8 +210,13 @@ def test_batch_parallel_uses_separate_threads():
             sleep_s=0.1, result="r", record_thread_into=threads_seen,
         ),
     }
+    # #103 (stale-test fix): args must be DISTINCT. R-32 added intra-turn dedup
+    # (`_canonical_tool_call_key` on name+args) — 3 identical calls with empty
+    # args collapse to 1 physical execution → only 1 thread → false negative.
+    # Distinct args keep all 3 as unique physical calls so the ThreadPoolExecutor
+    # genuinely fans them out. Parallelism itself is unchanged.
     tcs = [
-        {"name": "fetch_url", "id": f"id_{i}", "args": {}}
+        {"name": "fetch_url", "id": f"id_{i}", "args": {"url": f"https://ex/{i}"}}
         for i in range(3)
     ]
     _dispatch_tool_calls_batch(tcs, tools)
@@ -231,8 +236,13 @@ def test_batch_one_tool_exception_doesnt_fail_siblings():
         {"name": "get_weather", "id": "2", "args": {}},
     ]
     results = _dispatch_tool_calls_batch(tcs, tools)
-    assert results[0] == ("1", "fetch_url", "ok_a")
-    assert results[1] == ("2", "get_weather", "error:ValueError")
+    # #103 (stale-test fix): R-32 dedup made the result a 4-tuple
+    # (tc_id, name, result_str, is_physical_execution). Both calls here are
+    # unique, so each is a physical execution → trailing True. Intent preserved:
+    # one tool's exception does not fail its sibling; per-call results map to
+    # the right tc_id in order.
+    assert results[0] == ("1", "fetch_url", "ok_a", True)
+    assert results[1] == ("2", "get_weather", "error:ValueError", True)
 
 
 def test_batch_max_workers_capped():

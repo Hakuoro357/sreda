@@ -10,9 +10,9 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_connect_rate_limit
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import Settings, get_settings
 from sreda.db.session import get_db_session
-from sreda.integrations.telegram.client import TelegramClient
 from sreda.services.eds_account_verification import EDSAccountVerificationService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 
@@ -104,7 +104,8 @@ async def submit_eds_connect_form(
         if exc.code == "session_used":
             return HTMLResponse(_render_submitted_page(already_started=True), status_code=200)
         return HTMLResponse(_render_error_page(exc.message), status_code=exc.status_code)
-    telegram_client = TelegramClient(settings.telegram_bot_token) if settings.telegram_bot_token else None
+    _registry = TelegramBotRegistry.from_settings(settings)
+    telegram_client = telegram_client_for(_registry.system_default_bot_key, _registry) if settings.telegram_bot_token else None
     verifier = EDSAccountVerificationService(session, telegram_client=telegram_client)
     inline_result: str | None = None
     try:

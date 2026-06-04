@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.logging import configure_logging
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
 from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.max import MaxClient
-from sreda.integrations.telegram.client import TelegramClient
 from sreda.runtime.executor import ActionRuntimeService
 from sreda.services.eds_account_verification import EDSAccountVerificationService
 from sreda.workers.housewife_onboarding_worker import (
@@ -30,8 +30,11 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
     registry = get_feature_registry()
     session = get_session_factory()()
     try:
+        # Phase 4b: build registry first; resolve clients through it so every
+        # send goes via the correct bot (not the hardcoded global token).
+        bot_registry = TelegramBotRegistry.from_settings(settings)
         telegram_client = (
-            TelegramClient(settings.telegram_bot_token)
+            telegram_client_for(bot_registry.system_default_bot_key, bot_registry)
             if settings.telegram_bot_token
             else None
         )
@@ -46,17 +49,25 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             if settings.max_bot_token
             else None
         )
-        runtime_service = ActionRuntimeService(session, telegram_client=telegram_client)
+        runtime_service = ActionRuntimeService(
+            session,
+            telegram_client=telegram_client,
+            bot_registry=bot_registry,
+        )
         verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
         skill_platform = SkillPlatformJobProcessor(session, registry)
-        proactive = ProactiveEventWorker(session)
+        _sys_bot_key = bot_registry.system_default_bot_key
+        proactive = ProactiveEventWorker(session, system_bot_key=_sys_bot_key)
         housewife_reminders = HousewifeReminderWorker(session)
-        housewife_onboarding = HousewifeOnboardingKickoffWorker(session)
-        onboarding_aha = OnboardingAhaWorker(session)
+        housewife_onboarding = HousewifeOnboardingKickoffWorker(
+            session, system_bot_key=_sys_bot_key
+        )
+        onboarding_aha = OnboardingAhaWorker(session, system_bot_key=_sys_bot_key)
         delivery = OutboxDeliveryWorker(
             session,
             telegram_client=telegram_client,
             max_client=max_client,
+            registry=bot_registry,
         )
         # Retention worker — внутренне throttle'ит до 1 раза в 24 часа,
         # state в /tmp/sreda-retention-state.json. На каждом tick

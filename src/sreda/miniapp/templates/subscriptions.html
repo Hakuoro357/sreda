@@ -66,12 +66,11 @@
   function _mainInit() {
   // TG OR MAX SDK detection. MAX exposes window.WebApp (no .Telegram namespace).
   var tg = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
-  if (tg && typeof tg.ready === "function") {
-    try { tg.ready(); } catch (e) {}
-  }
-  if (tg && typeof tg.expand === "function") {
-    try { tg.expand(); } catch (e) {}
-  }
+  // ready()/expand() are driven by the late-SDK poll (_callSdkReadyOnce, defined
+  // below) so the Telegram loading overlay lifts even when the async SDK arrives
+  // AFTER this hash-fallback bootstrap ran (vex-assistant#102: blank-on-first-
+  // open, works-on-refresh).
+  _callSdkReadyOnce();
 
   // Prefer the SDK-provided initData; fall back to hash extraction.
   // Hash format: TG = #tgWebAppData=...; MAX = #WebAppData=... (no tg prefix).
@@ -2755,6 +2754,37 @@
   loadData();
   }  // end of _mainInit
 
+  // 2026-06-04 (vex-assistant#102): with the SDK loaded async, on a COLD first
+  // open window.Telegram can appear AFTER the bootstrap already proceeded via
+  // the hash fallback, so tg.ready()/expand() never fired and Telegram kept its
+  // loading overlay over the already-rendered content → blank on first open,
+  // fine on refresh (SDK cached). Poll for the SDK and signal ready()/expand()
+  // the moment it appears, regardless of bootstrap timing. (function decl is
+  // hoisted, so _mainInit above can call it.)
+  var _sdkReadyCalled = false;
+  function _callSdkReadyOnce() {
+    if (_sdkReadyCalled) return true;
+    var app = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
+    if (!(app && typeof app.ready === "function")) return false;
+    // Set the one-shot flag only AFTER ready() actually succeeds, so a thrown
+    // ready() leaves the poll free to retry (Codex MINOR).
+    try { app.ready(); } catch (e) { return false; }
+    _sdkReadyCalled = true;
+    try { if (typeof app.expand === "function") app.expand(); } catch (e) {}
+    return true;
+  }
+  if (!_callSdkReadyOnce()) {
+    var _sdkPollTries = 0;
+    var _sdkPollTimer = setInterval(function () {
+      _sdkPollTries += 1;
+      // ~60s of 100ms polls — generous even for a very slow async SDK load;
+      // beyond that the network is broken and the API calls fail anyway.
+      if (_callSdkReadyOnce() || _sdkPollTries > 600) clearInterval(_sdkPollTimer);
+    }, 100);
+    // Belt-and-suspenders: also signal on window 'load', in case the async SDK
+    // resolves around/after it and outside the poll window (Codex MAJOR).
+    try { window.addEventListener("load", _callSdkReadyOnce); } catch (e) {}
+  }
   _bootstrap();
 })();
 </script>

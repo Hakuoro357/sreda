@@ -23,6 +23,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
 import sreda.db.models  # noqa: F401 — register all model classes on Base.metadata
@@ -35,6 +36,7 @@ from sreda.workers.telegram_long_poll import (
     SingletonLockError,
     TelegramConflictError,
     TelegramLongPoller,
+    _run_check_config,
 )
 from tests.unit.conftest import seed_telegram_user
 
@@ -189,9 +191,10 @@ async def test_offset_advances_only_after_handle_succeeds(fresh_db):
     assert handled == [42]
 
     # Offset row reflects the consumed update.
+    # Phase 3: channel key is now "telegram:sreda" (per-bot namespace).
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        row = session.query(PollerOffset).filter_by(channel="telegram").first()
+        row = session.query(PollerOffset).filter_by(channel="telegram:sreda").first()
         assert row is not None
         assert row.last_update_id == 42
     assert poller.offset == 43
@@ -214,7 +217,7 @@ async def test_offset_not_advanced_on_handle_failure(fresh_db):
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        row = session.query(PollerOffset).filter_by(channel="telegram").first()
+        row = session.query(PollerOffset).filter_by(channel="telegram:sreda").first()
         # Either no row at all (we never advanced) or row with the
         # previous offset — never the failed update_id.
         if row is not None:
@@ -238,9 +241,10 @@ async def test_empty_long_poll_updates_heartbeat_not_offset(fresh_db):
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        offset_row = session.query(PollerOffset).filter_by(channel="telegram").first()
+        # Phase 3: channel key is now "telegram:sreda" (per-bot namespace).
+        offset_row = session.query(PollerOffset).filter_by(channel="telegram:sreda").first()
         assert offset_row is None  # never advanced
-        hb = session.query(PollerHeartbeat).filter_by(channel="telegram").first()
+        hb = session.query(PollerHeartbeat).filter_by(channel="telegram:sreda").first()
         assert hb is not None
         assert hb.last_attempt_at is not None
         assert hb.last_ok_at is not None
@@ -267,7 +271,7 @@ async def test_timeout_updates_heartbeat_with_error(fresh_db):
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        hb = session.query(PollerHeartbeat).filter_by(channel="telegram").first()
+        hb = session.query(PollerHeartbeat).filter_by(channel="telegram:sreda").first()
         assert hb is not None
         assert hb.last_attempt_at is not None
         assert hb.last_ok_at is None
@@ -296,7 +300,7 @@ async def test_last_error_truncated_to_max_chars(fresh_db):
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        hb = session.query(PollerHeartbeat).filter_by(channel="telegram").first()
+        hb = session.query(PollerHeartbeat).filter_by(channel="telegram:sreda").first()
         assert hb is not None
         assert hb.last_error is not None
         assert len(hb.last_error) <= tlp.LAST_ERROR_MAX_CHARS
@@ -377,10 +381,33 @@ async def test_singleton_lock_failure_raises_typed_exception(fresh_db):
 
 
 @pytest.mark.asyncio
-async def test_check_config_releases_lock(fresh_db):
+async def test_check_config_releases_lock(fresh_db, monkeypatch):
     """`--check-config` acquires the lock, then releases it so a real
     start can grab it. Without this, pre-cutover sanity-check would
-    leave the bot unable to launch its own poller."""
+    leave the bot unable to launch its own poller.
+
+    Phase 3: --check-config now also calls getMe to verify the token↔bot
+    mapping.  We stub the registry to supply a username and stub getMe to
+    return the matching username so the verification passes before the lock
+    acquire/release dance is exercised.
+    """
+    from unittest.mock import patch as _patch
+    from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
+
+    # Registry with a username so the no-username guard doesn't trip.
+    registry = TelegramBotRegistry(
+        [BotConfig(key="sreda", token="test-token", username="TestBot")],
+        system_default_bot_key="sreda",
+        admin_bot_key="sreda",
+    )
+
+    # getMe returns the correct username → verification passes.
+    async def fake_get_me() -> dict:
+        return {"ok": True, "result": {"username": "TestBot", "id": 1}}
+
+    fake_client = MagicMock()
+    fake_client.get_me = fake_get_me
+
     acquired_count = {"n": 0}
     released_count = {"n": 0}
 
@@ -402,8 +429,20 @@ async def test_check_config_releases_lock(fresh_db):
     fake_conn.execute.side_effect = execute_side_effect
     fake_engine.connect.return_value = fake_conn
 
-    with patch.object(tlp, "create_engine", return_value=fake_engine):
-        rc = await tlp._amain(["--check-config"])
+    # Fix 2: _run_check_config now builds TelegramClient(token) per-token
+    # inside _real_get_me. Patch TelegramClient in the worker module so the
+    # fake client is used instead of making a real HTTP call.
+    class _FakeTelegramClient:
+        def __init__(self, token: str) -> None:
+            pass
+        async def get_me(self) -> dict:  # noqa: E301
+            return {"ok": True, "result": {"username": "TestBot", "id": 1}}
+
+    with _patch("sreda.config.bot_registry.TelegramBotRegistry") as mock_reg_cls:
+        mock_reg_cls.from_settings.return_value = registry
+        with patch.object(tlp, "TelegramClient", _FakeTelegramClient):
+            with patch.object(tlp, "create_engine", return_value=fake_engine):
+                rc = await tlp._amain(["--check-config"])
 
     assert rc == 0
     assert acquired_count["n"] == 1
@@ -759,3 +798,119 @@ async def test_lock_connection_no_commit_when_lock_denied(fresh_db):
         "connection is closed unconditionally and an unsuccessful "
         "acquire has nothing to persist."
     )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 tests: _run_check_config must build per-token getMe client and
+# distinguish network errors from API/auth errors.
+# ---------------------------------------------------------------------------
+
+
+def _make_two_bot_registry() -> TelegramBotRegistry:
+    """Registry with two distinct bots, each with a username for swap-check."""
+    return TelegramBotRegistry(
+        bots=[
+            BotConfig(key="sreda", token="token-sreda", username="SredaBot"),
+            BotConfig(key="sreda_home", token="token-sreda-home", username="SredaHomeBot"),
+        ],
+        system_default_bot_key="sreda",
+        admin_bot_key="sreda",
+    )
+
+
+def _make_fake_telegram_client_cls(token_to_username: dict[str, str]):
+    """Return a TelegramClient replacement whose get_me returns per-token username."""
+
+    class _FakeClient:
+        def __init__(self, token: str) -> None:
+            self._token = token
+
+        async def get_me(self) -> dict:
+            username = token_to_username.get(self._token)
+            if username is None:
+                from sreda.integrations.telegram.client import TelegramDeliveryError
+                raise TelegramDeliveryError(
+                    f"getMe: bad token (no username for token ...{self._token[-4:]})"
+                )
+            return {"ok": True, "result": {"username": username, "id": 1}}
+
+    return _FakeClient
+
+
+@pytest.mark.asyncio
+async def test_check_config_two_bots_correct_tokens_passes(monkeypatch):
+    """Fix 2: with two bots and correct per-token usernames, check-config passes."""
+    registry = _make_two_bot_registry()
+
+    fake_cls = _make_fake_telegram_client_cls({
+        "token-sreda": "SredaBot",
+        "token-sreda-home": "SredaHomeBot",
+    })
+    monkeypatch.setattr(tlp, "TelegramClient", fake_cls)
+
+    # Bypass the lock/offset dance.
+    monkeypatch.setattr(TelegramLongPoller, "startup", AsyncMock())
+    monkeypatch.setattr(TelegramLongPoller, "shutdown", AsyncMock())
+    monkeypatch.setattr(TelegramLongPoller, "_channel", "telegram:sreda", raising=False)
+    monkeypatch.setattr(TelegramLongPoller, "offset", 0, raising=False)
+
+    rc = await _run_check_config("sreda", registry, None)
+    assert rc == 0, f"Expected rc=0 (pass), got {rc}"
+
+
+@pytest.mark.asyncio
+async def test_check_config_swapped_token_hard_fails(monkeypatch):
+    """Fix 2: when a bot's token returns the wrong username, check-config hard-fails (rc=1)."""
+    registry = _make_two_bot_registry()
+
+    # Swap: token-sreda returns SredaHomeBot's username and vice versa.
+    fake_cls = _make_fake_telegram_client_cls({
+        "token-sreda": "SredaHomeBot",      # wrong username for sreda
+        "token-sreda-home": "SredaBot",     # wrong username for sreda_home
+    })
+    monkeypatch.setattr(tlp, "TelegramClient", fake_cls)
+
+    monkeypatch.setattr(TelegramLongPoller, "startup", AsyncMock())
+    monkeypatch.setattr(TelegramLongPoller, "shutdown", AsyncMock())
+
+    rc = await _run_check_config("sreda", registry, None)
+    assert rc == 1, f"Expected rc=1 (hard fail on username mismatch), got {rc}"
+
+
+@pytest.mark.asyncio
+async def test_check_config_bad_token_hard_fails(monkeypatch):
+    """Fix 2: a TelegramDeliveryError (bad token / ok=false) causes rc=1, not skip."""
+    registry = _make_two_bot_registry()
+
+    # No token resolves → every getMe raises TelegramDeliveryError.
+    fake_cls = _make_fake_telegram_client_cls({})
+    monkeypatch.setattr(tlp, "TelegramClient", fake_cls)
+
+    monkeypatch.setattr(TelegramLongPoller, "startup", AsyncMock())
+    monkeypatch.setattr(TelegramLongPoller, "shutdown", AsyncMock())
+
+    rc = await _run_check_config("sreda", registry, None)
+    assert rc == 1, f"Expected rc=1 (hard fail on bad token), got {rc}"
+
+
+@pytest.mark.asyncio
+async def test_check_config_network_error_is_skipped(monkeypatch):
+    """Fix 2: a genuine network error (httpx.NetworkError) skips verification, rc=0."""
+    registry = _make_two_bot_registry()
+
+    class _NetworkErrorClient:
+        def __init__(self, token: str) -> None:
+            pass
+
+        async def get_me(self) -> dict:
+            raise httpx.NetworkError("connection refused")
+
+    monkeypatch.setattr(tlp, "TelegramClient", _NetworkErrorClient)
+
+    monkeypatch.setattr(TelegramLongPoller, "startup", AsyncMock())
+    monkeypatch.setattr(TelegramLongPoller, "shutdown", AsyncMock())
+    monkeypatch.setattr(TelegramLongPoller, "_channel", "telegram:sreda", raising=False)
+    monkeypatch.setattr(TelegramLongPoller, "offset", 0, raising=False)
+
+    rc = await _run_check_config("sreda", registry, None)
+    assert rc == 0, f"Expected rc=0 (network skip), got {rc}"

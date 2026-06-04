@@ -32,6 +32,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage
 from sreda.db.models.inbound_event import InboundEvent
 from sreda.db.repositories.inbound_event import InboundEventRepository
@@ -73,6 +74,7 @@ class ProactiveEventWorker:
         session: Session,
         *,
         embedding_client: EmbeddingClient | None = None,
+        system_bot_key: str | None = None,
     ) -> None:
         self.session = session
         self.repo = InboundEventRepository(session)
@@ -81,6 +83,9 @@ class ProactiveEventWorker:
         # Falls back to settings-based factory so production deployments
         # get real embeddings without extra wiring.
         self.embedding_client = embedding_client
+        # Phase 5: bot_key for system-generated outbox rows (no reminder
+        # origin). Sourced from registry.system_default_bot_key in job_runner.
+        self._system_bot_key = system_bot_key or LEGACY_NULL_BOT_KEY
 
     async def process_pending(
         self, *, limit: int = 50, min_score: float = 0.5
@@ -264,6 +269,7 @@ class ProactiveEventWorker:
             scheduled_at=scheduled_at,
             drop_reason=row_drop_reason,
             payload_json=json.dumps(payload, ensure_ascii=False),
+            bot_key=self._system_bot_key,
         )
         self.session.add(outbox)
         self.session.flush()

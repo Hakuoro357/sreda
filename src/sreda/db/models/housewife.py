@@ -13,16 +13,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import (
-    DateTime,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    Text,
-    text as sql_text,
-)
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text as sa_text
 from sqlalchemy.orm import Mapped, mapped_column
+
+from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 
 from sreda.db.base import Base
 from sreda.db.types import EncryptedString
@@ -103,6 +97,17 @@ class FamilyReminder(Base):
         String(32), nullable=True,
     )
 
+    # Which bot was used when this reminder was created (Phase 5).
+    # Written at creation time so the reminder always fires via the originating
+    # bot — "bot_key fixed at creation" rule (second-tg-bot-final.md Phase 5).
+    # NOT NULL after migration 20260603_0053; server_default='sreda' as safety net.
+    bot_key: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default=LEGACY_NULL_BOT_KEY,
+        server_default=sa_text("'sreda'"),
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -143,8 +148,8 @@ class FamilyReminder(Base):
             "tenant_id",
             "user_id",
             "normalized_title_hash",
-            postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
-            sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
+            postgresql_where=sa_text("normalized_title_hash IS NOT NULL"),
+            sqlite_where=sa_text("normalized_title_hash IS NOT NULL"),
         ),
     )
 
