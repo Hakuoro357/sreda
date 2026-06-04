@@ -607,6 +607,122 @@ _ONLY_SELECTOR_EXAMPLE = FewShotExample(
 _EXAMPLES.append(_ONLY_SELECTOR_EXAMPLE)
 
 
+# ---------------------------------------------------------------------------
+# PR-d (Piece 3): INVALID-case examples — "так НЕ делай"
+# ---------------------------------------------------------------------------
+# Shown to the planner as a SEPARATE "do NOT do this" block — deliberately NOT
+# added to ``_EXAMPLES`` (which is the taught-as-valid set the contract tests
+# in test_planner_prompt_builder.py iterate and assert pass validate_plan).
+# Each entry pairs a one-line "почему нельзя" with the validator violation it
+# triggers, so the model learns the boundary, not a pattern to copy.
+#
+# These are intentionally small fragments (not full schema-valid Plans) — a
+# couple are not even Plan-parsable (that IS the point). The invalid-case GUARD
+# tests in test_planner_validator.py build the corresponding full plans and
+# assert validate_plan rejects each with the named violation.
+
+
+@dataclass(frozen=True)
+class InvalidExample:
+    """One anti-pattern. ``bad_fragment`` is a short JSON-ish snippet shown to
+    the planner; ``why`` is a one-line reason; ``violation`` is the validator
+    code (or schema rule) the full form triggers."""
+
+    title: str
+    bad_fragment: str
+    why: str
+    violation: str
+
+
+_INVALID_EXAMPLES: list[InvalidExample] = [
+    InvalidExample(
+        title="смолток в clear",
+        bad_fragment=(
+            '{"clarity": "clear", "actions": {}, '
+            '"compose": {"kind": "template", "template_id": "smalltalk_fallback", '
+            '"template_data": {}}}'
+        ),
+        why=(
+            "«привет»/«спасибо» — это reply_only с пустым actions, а не clear. "
+            "В clear обязателен хотя бы один шаг, и разговорные шаблоны "
+            "(smalltalk_fallback/identity_playful) там запрещены."
+        ),
+        violation="schema: Plan(clarity='clear') requires at least one action / "
+        "conversational template only valid for reply_only",
+    ),
+    InvalidExample(
+        title="индексная ссылка [0]",
+        bad_fragment='{"reminder_id": "${s1.items[0].reminder_id}"}',
+        why=(
+            "Грамматика ссылок НЕ поддерживает скобочную индексацию `[0]`. "
+            "Чтобы выбрать единственный элемент списка, используй селектор "
+            "`.only` (например `${s1.items.only.reminder_id}`) и добавь шагу-"
+            "источнику терминальную ветку status='empty'."
+        ),
+        violation="invalid_ref_syntax",
+    ),
+    InvalidExample(
+        title="выдуманное выходное поле",
+        bad_fragment=(
+            '{"compose": {"template_id": "shopping_added_ok", '
+            '"template_data": {"items": "${s1.items}"}}}  '
+            "// add_shopping_items НЕ возвращает поле items"
+        ),
+        why=(
+            "Нельзя ссылаться на поле, которого нет в output_model инструмента. "
+            "У add_shopping_items есть added_count / item_ids, но НЕТ items. "
+            "Сверяйся со списком полей в карточке инструмента."
+        ),
+        violation="compose_ref_unknown_field",
+    ),
+    InvalidExample(
+        title=".only в compose",
+        bad_fragment=(
+            '{"compose": {"template_id": "reminder_set_ok", '
+            '"template_data": {"what": "${s1.items.only.title}"}}}'
+        ),
+        why=(
+            "`.only` допустим ТОЛЬКО в args шага (до вызова инструмента), где "
+            "неоднозначность безопасно прерывает план. В compose он ЗАПРЕЩён: "
+            "compose рендерится ПОСЛЕ записи, откатить уже нельзя. Ссылайся на "
+            "уже разрешённое поле напрямую (например `${s2.reminder_id}`)."
+        ),
+        violation="only_selector_in_compose",
+    ),
+]
+
+
+def render_invalid_examples_block(*, indent: int = 2) -> str:
+    """Render the INVALID-case anti-patterns as a markdown "так НЕ делай"
+    block for the planner prompt. Deterministic (prompt-cache safe).
+
+    Kept separate from ``render_few_shot_block`` content shape: the valid
+    examples teach plan shape; this block teaches the four boundaries the
+    validator enforces (PR-d Piece 3). Appended by ``render_few_shot_block``
+    so the single ``few_shot_block`` prompt slot carries both."""
+    parts: list[str] = [
+        "### ПРИМЕРЫ ОШИБОК — так НЕ делай",
+        "",
+        "Ниже — частые неверные планы. НЕ копируй их; каждый отвергается "
+        "валидатором.",
+        "",
+    ]
+    for n, ex in enumerate(_INVALID_EXAMPLES, start=1):
+        parts.append(f"#### Ошибка {n}: {ex.title}")
+        parts.append(f"НЕВЕРНО: {ex.bad_fragment}")
+        parts.append(f"Почему нельзя: {ex.why}")
+        parts.append(f"Нарушение: {ex.violation}")
+        parts.append("")
+    return "\n".join(parts).rstrip()
+
+
+def all_invalid_examples() -> tuple[InvalidExample, ...]:
+    """Public accessor for the invalid-case anti-patterns — used by the
+    invalid-case guard tests so they assert against the same set the prompt
+    teaches."""
+    return tuple(_INVALID_EXAMPLES)
+
+
 def _iter_example_composes(plan: dict) -> list[dict]:
     """Yield every compose dict in a plan: the plan-level ``compose`` plus
     each ``actions[*].expected_outcomes[*].compose``. Used to discover
@@ -690,6 +806,12 @@ def render_few_shot_block(
             json.dumps(ex.plan, ensure_ascii=False, indent=indent, sort_keys=False)
         )
         parts.append("")  # blank line between examples
+    # PR-d (Piece 3): append the INVALID-case "так НЕ делай" block so the
+    # single few_shot prompt slot teaches both the valid shapes and the four
+    # boundaries the validator enforces. The gate above only filters VALID
+    # LLM-key examples; the invalid block has no kind='llm' composes so it is
+    # always shown.
+    parts.append(render_invalid_examples_block(indent=indent))
     return "\n".join(parts).rstrip()
 
 
@@ -704,4 +826,12 @@ def all_examples() -> tuple[FewShotExample, ...]:
     return tuple(_EXAMPLES)
 
 
-__all__ = ["FewShotExample", "all_examples", "example_count", "render_few_shot_block"]
+__all__ = [
+    "FewShotExample",
+    "InvalidExample",
+    "all_examples",
+    "all_invalid_examples",
+    "example_count",
+    "render_few_shot_block",
+    "render_invalid_examples_block",
+]

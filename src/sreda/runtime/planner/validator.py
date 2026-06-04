@@ -103,11 +103,12 @@ from sreda.runtime.planner.interpolation import (
     iter_refs,
 )
 from sreda.runtime.planner.schemas import Action, Plan
-from sreda.services.clarification_contract import (
-    RUNTIME_ONLY_TEMPLATE_IDS,
-    validate_clarification_payload,
+from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
+from sreda.services.composer_contracts import (
+    NO_CONTRACT,
+    get_composer_contract,
+    validate_humanize_result_payload,
 )
-from sreda.services.composer_contracts import validate_humanize_result_payload
 from sreda.services.tool_schemas.base import ToolSpec
 
 
@@ -2020,6 +2021,36 @@ def _phase1_check_only_empty_branch(
                 )
 
 
+def _phase1_check_compose_ref_syntax(plan: Plan) -> Iterator[Violation]:
+    """PR-d (Piece 3) — malformed ``${...}`` token check over EVERY
+    ``ComposerCall.template_data`` (root + branch composes).
+
+    ``_phase1_check_ref_syntax`` already runs ``iter_malformed_ref_tokens``
+    over action ARGS; this extends the same strict-grammar check to compose
+    template_data so a malformed ref like ``${s1..bad}`` / ``${s1.}`` /
+    ``${s1._private}`` inside a compose payload is caught at plan-time with
+    the SAME ``invalid_ref_syntax`` code — BEFORE both the semantic compose-ref
+    check (``_phase1_check_compose_refs``) and the per-template contract
+    dispatch (plan g-026 ordering: catch syntactically-broken refs first,
+    otherwise the semantic walk emits a confusing "step/field not found" for
+    the garbled token, or the contract walk / executor resolve_refs chokes).
+    """
+    for host_step_id, location, compose in _iter_all_composes(plan):
+        for malformed in iter_malformed_ref_tokens(compose.template_data):
+            yield Violation(
+                step_id=host_step_id,
+                tool=None,
+                field_path=None,
+                code="invalid_ref_syntax",
+                message=(
+                    f"{location}: malformed reference {malformed!r}. Refs "
+                    f"must be of the form ``${{step_id.field.subfield}}`` — "
+                    f"segments non-empty, no underscore-prefixed segments, "
+                    f"no consecutive or trailing dots."
+                ),
+            )
+
+
 def _check_composer_allowlist(
     plan: Plan,
     *,
@@ -2052,6 +2083,14 @@ def _check_composer_allowlist(
     # done_summary, clarity_reason). Validated here — covering root AND
     # all branch composes via _iter_all_composes — so unknown field codes
     # in branch composes are caught at plan-time (FIX 3).
+    #
+    # PR-d (Piece 3): dispatch is now driven by the central per-template
+    # contract registry (composer_contracts.get_composer_contract) instead of a
+    # hardcoded clarification set. The registry returns the clarification
+    # validator for the clarification family, NO_CONTRACT for templates that
+    # legitimately need none, and None for unknown ids. This makes adding a new
+    # contracted template a one-line registry change (no validator edit) and is
+    # the same map the coverage test asserts is exhaustive.
     _CLARIFICATION_TEMPLATE_IDS: frozenset[str] = frozenset({
         "ask_user_for_clarification",
         "partial_with_clarification",
@@ -2093,19 +2132,32 @@ def _check_composer_allowlist(
                         f"Available: {sorted(composer_template_ids)}"
                     ),
                 )
-            # FIX 3: validate clarification payload for ALL composes that use
-            # the clarification contract (root + every branch). This covers
-            # unknown missing_fields codes in branch composes that schemas.py's
-            # root-only check missed. Single source of truth: validator.py.
-            if compose.template_id in _CLARIFICATION_TEMPLATE_IDS:
+            # PR-d (Piece 3): per-template contract dispatch via the registry.
+            # FIX 3 (PR-a) is subsumed here: clarification composes (root +
+            # every branch) are validated for unknown missing_fields codes /
+            # ref'd done_summary; the registry returns the same
+            # validate_clarification_payload for them. NO_CONTRACT templates and
+            # unknown ids (None) are skipped (the latter already flagged
+            # unknown_template_id above — g-026 ordering: specific contract
+            # violations come AFTER the generic membership check, BEFORE
+            # fall-through). The static stage uses allow_refs=True so unresolved
+            # ${...} strings defer to post-execution resolution.
+            contract = get_composer_contract(compose.template_id or "")
+            if contract is not None and contract is not NO_CONTRACT:
                 template_data = compose.template_data or {}
-                for error_msg in validate_clarification_payload(
-                    template_data, allow_refs=True
-                ):
+                # Preserve the original clarification violation code so existing
+                # callers/tests keep matching; any other contracted template
+                # uses the generic composer_contract_invalid code.
+                code = (
+                    "clarification_payload_invalid"
+                    if compose.template_id in _CLARIFICATION_TEMPLATE_IDS
+                    else "composer_contract_invalid"
+                )
+                for error_msg in contract(template_data, allow_refs=True):
                     yield Violation(
                         step_id=host_step_id,
                         tool=None,
-                        code="clarification_payload_invalid",
+                        code=code,
                         message=f"{location}: {error_msg}",
                     )
         elif compose.kind == "llm":
@@ -2238,6 +2290,14 @@ def validate_plan(
     # Cross-action cycle check via ref edges + depends_on
     # (Codex R2 MAJOR #4 — Plan schema only sees depends_on edges).
     violations.extend(_phase1_detect_ref_cycles(plan))
+    # PR-d (Piece 3) — malformed ${...} tokens in compose template_data
+    # (root + branch), same invalid_ref_syntax code as the action-args check.
+    # Runs BEFORE the semantic compose-ref check (_phase1_check_compose_refs)
+    # AND the per-template contract dispatch (g-026 ordering): a syntactically-
+    # broken ref like ${s1..bad} must surface as invalid_ref_syntax first,
+    # otherwise the semantic walk would emit a confusing "target step/field not
+    # found" for the garbled token, or the contract walk would choke on it.
+    violations.extend(_phase1_check_compose_ref_syntax(plan))
     # Codex Sub-A12 Phase B.1 R4/R5 MAJOR — compose template_data refs
     # are now checked for: (R4) target step existence + (R5) top-level
     # field existence in target tool's output_model.

@@ -26,6 +26,7 @@ from sreda.runtime.planner.llm import (
 )
 from sreda.runtime.planner.orchestrator import (
     PlannerContext,
+    _build_retry_feedback,
     _redact_for_alert,
     run,
 )
@@ -808,3 +809,71 @@ def test_few_shot_toggle_off_yields_no_examples(db_session: Session) -> None:
     ))
     # No curated example headers in the prompt.
     assert "### Пример" not in captured["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# PR-d (Piece 3) — retry-feedback guard
+# ---------------------------------------------------------------------------
+
+
+def test_retry_feedback_includes_errors_and_affirm_marker() -> None:
+    """_build_retry_feedback must surface (a) the validator errors verbatim and
+    (b) an affirm/instruction marker that re-states the strict-JSON contract,
+    so the retry attempt knows WHAT was wrong and HOW to respond."""
+    errors = (
+        "validator_violations: root compose: malformed reference '${s1..bad}'; "
+        "s1: only_selector_in_compose"
+    )
+    feedback = _build_retry_feedback("предыдущий невалидный ответ", errors)
+    # Errors are carried into the feedback.
+    assert "only_selector_in_compose" in feedback
+    assert "${s1..bad}" in feedback
+    assert "Ошибки:" in feedback
+    # Affirm / instruction marker (re-asserts the strict-JSON contract).
+    assert "[АВТОМАТИЧЕСКИЙ РЕТРАЙ]" in feedback
+    assert "строгом JSON" in feedback
+    # The previous (bad) response excerpt is echoed back for context.
+    assert "предыдущий невалидный ответ" in feedback
+
+
+def test_retry_feedback_truncates_long_inputs() -> None:
+    """Both the previous-response excerpt and the errors are bounded so the
+    retry input can't bloat the prompt budget."""
+    feedback = _build_retry_feedback("x" * 5000, "y" * 5000)
+    # 500-char caps on each, plus fixed scaffolding — well under any budget.
+    assert feedback.count("x") <= 500
+    assert feedback.count("y") <= 500
+
+
+def test_invalid_plan_triggers_retry_with_feedback_in_prompt(
+    db_session: Session,
+) -> None:
+    """End-to-end wiring: a first invalid plan (.only in compose) makes the
+    orchestrator retry, and the SECOND call's prompt carries the retry
+    feedback (errors + affirm marker)."""
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    prompts: list[str] = []
+
+    bad_payload = _make_valid_plan_payload()
+    # Inject a .only-in-compose violation into the root compose.
+    bad_payload["compose"]["template_data"] = {"items": "${s1.items.only.title}"}
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return _make_call_result(json.dumps(bad_payload))
+        # Second attempt: a clean valid plan.
+        return _make_call_result(json.dumps(_make_valid_plan_payload()))
+
+    asyncio.run(run(
+        ctx, session_factory=factory, call_planner_fn=fake_call,
+        invalid_retry_enabled=True,
+        settings_factory=_settings_stub(set()),
+    ))
+
+    assert len(prompts) == 2, "expected exactly one retry"
+    retry_prompt = prompts[1]
+    assert "[АВТОМАТИЧЕСКИЙ РЕТРАЙ]" in retry_prompt
+    assert "validator_violations" in retry_prompt

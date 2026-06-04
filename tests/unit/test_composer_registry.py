@@ -471,6 +471,82 @@ def test_every_template_in_dict_is_in_registry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# PR-d (Piece 3) — per-template contract registry COVERAGE
+# ---------------------------------------------------------------------------
+
+
+def test_every_exposed_template_is_contracted_or_explicit_no_contract() -> None:
+    """Every planner-exposed template_id in the live composer REGISTRY must be
+    classified in composer_contracts._COMPOSER_CONTRACTS as EITHER a contract
+    callable OR the explicit NO_CONTRACT marker. None (unknown to the registry)
+    means a template was added without a contract decision — fail loudly.
+
+    Runtime-only templates (selector_ambiguity_clarification) are excluded:
+    the planner never emits them, the validator rejects them upstream, so they
+    carry no plan-time contract.
+    """
+    from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
+    from sreda.services.composer_contracts import (
+        NO_CONTRACT,
+        get_composer_contract,
+    )
+
+    unclassified: list[str] = []
+    for tid in REGISTRY.template_ids():
+        if tid in RUNTIME_ONLY_TEMPLATE_IDS:
+            continue
+        contract = get_composer_contract(tid)
+        if contract is None:
+            unclassified.append(tid)
+        else:
+            # Must be either NO_CONTRACT or a callable contract.
+            assert contract is NO_CONTRACT or callable(contract), (
+                f"template_id={tid!r} mapped to a non-callable, non-NO_CONTRACT "
+                f"value {contract!r}"
+            )
+    assert not unclassified, (
+        f"template_id(s) {unclassified} are exposed in the composer REGISTRY "
+        f"but NOT classified in composer_contracts._COMPOSER_CONTRACTS. Add a "
+        f"contract validator OR the explicit NO_CONTRACT marker for each — "
+        f"every exposed template must have a contract decision (PR-d Piece 3)."
+    )
+
+
+def test_contract_registry_has_no_stale_or_runtime_only_keys() -> None:
+    """Inverse guard: every key in the contract registry must be a real,
+    planner-exposed template_id (not a typo, not a removed template, not a
+    runtime-only id). Keeps the registry from drifting away from REGISTRY."""
+    from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
+    from sreda.services.composer_contracts import _COMPOSER_CONTRACTS
+
+    registered = set(REGISTRY.template_ids())
+    for tid in _COMPOSER_CONTRACTS:
+        assert tid in registered, (
+            f"contract registry key {tid!r} is not a registered composer "
+            f"template — remove it or fix the typo."
+        )
+        assert tid not in RUNTIME_ONLY_TEMPLATE_IDS, (
+            f"contract registry must not contain runtime-only id {tid!r}"
+        )
+
+
+def test_clarification_family_is_contracted_not_no_contract() -> None:
+    """The two clarification templates must map to the clarification validator
+    (a callable), NOT NO_CONTRACT — they carry the closed missing_fields enum +
+    literal done_summary contract."""
+    from sreda.services.composer_contracts import (
+        NO_CONTRACT,
+        get_composer_contract,
+    )
+
+    for tid in ("ask_user_for_clarification", "partial_with_clarification"):
+        contract = get_composer_contract(tid)
+        assert callable(contract) and contract is not NO_CONTRACT, (
+            f"{tid!r} must be a contract callable, got {contract!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Sub-A12 Phase B.1 — invalid_plan_fallback (planner-side failure)
 # ---------------------------------------------------------------------------
 

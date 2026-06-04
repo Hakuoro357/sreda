@@ -2114,6 +2114,55 @@ def test_humanize_result_extra_top_key_still_caught_with_ref_actions() -> None:
     assert "execution_id" in bad[0].message
 
 
+def test_humanize_result_field_level_refs_deferred_under_allow_refs() -> None:
+    """A full ${...} ref in a humanize_result action FIELD (user_visible_summary
+    / status) or in `intent` is DEFERRED at the static stage (allow_refs=True):
+    it resolves post-execution, so it must NOT trip the per-item non-empty
+    string check. Distinct from test_humanize_result_ref_string_actions_skips_
+    item_check, which defers the whole `actions` value — here `actions` is an
+    inspectable list and the refs live INSIDE its items.
+
+    Contrast assertion: a LITERAL blank in the same field position still trips
+    the check — proving the pass above is genuine ref deferral, not the check
+    silently accepting everything. Violations are filtered to the
+    humanize_result_* family (a ref to a non-existent output field may also
+    raise compose_ref_* codes, which are orthogonal to contract deferral)."""
+    # All per-item fields + intent are full refs → every value deferred.
+    plan = _plan_hr_compose({
+        "intent": "${s1.intent}",
+        "actions": [
+            {"user_visible_summary": "${s1.summary}", "status": "${s1.status}"},
+        ],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    deferred = [v for v in violations if v.code.startswith("humanize_result")]
+    assert not deferred, (
+        f"full ${{...}} refs in item fields must defer at the static stage; "
+        f"got {[(v.code, v.message) for v in deferred]}"
+    )
+
+    # Contrast: a literal blank status (NOT a ref) is still rejected — proves
+    # the per-item value check is live, so the deferral above is real.
+    plan_blank = _plan_hr_compose({
+        "intent": "выполнить",
+        "actions": [
+            {"user_visible_summary": "готово", "status": "   "},  # blank, not a ref
+        ],
+    })
+    blank_violations = validate_plan(
+        plan_blank, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    blank_bad = [v for v in blank_violations if v.code.startswith("humanize_result")]
+    assert blank_bad, (
+        "a literal blank status must still be rejected — the per-item check is "
+        "live, confirming the ref case above is genuine deferral"
+    )
+
+
 def test_humanize_result_check_runs_without_llm_prompt_required_keys() -> None:
     """The key-allowlist check is NOT gated on llm_prompt_required_keys being
     provided — it runs whenever llm_prompt_key == 'humanize_result'."""
@@ -2276,3 +2325,429 @@ def test_hr_well_formed_static_passes_phase_b() -> None:
         ],
     })
     assert not violations, f"Well-formed payload must pass: {violations}"
+
+
+# ===========================================================================
+# PR-d (Piece 3) — malformed-ref over compose template_data,
+# per-template contract dispatch, invalid-case guards
+# ===========================================================================
+
+from sreda.services.composer.registry import REGISTRY as _COMPOSER_REGISTRY  # noqa: E402
+from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS  # noqa: E402
+
+_REAL_REGISTRY = {s.name: s for s in MIGRATED_TOOL_SPECS}
+_REAL_TEMPLATE_IDS = frozenset(_COMPOSER_REGISTRY.template_ids())
+
+
+def _real_plan(plan_dict: dict) -> Plan:
+    return Plan.model_validate(plan_dict)
+
+
+# ---------------------------------------------------------------------------
+# malformed-ref over compose template_data (root + branch)
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_ref_in_root_compose_template_data_flagged() -> None:
+    """A ${..bad..} token in ROOT compose template_data is caught with the
+    same invalid_ref_syntax code as malformed action-arg refs."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {"match": {"status": "added"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "shopping_added_ok",
+                                 "template_data": {"items": ["молоко"]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "recipe_show",
+            # double-dot malformed ref
+            "template_data": {"recipe_text": "${s1..raw_text}"},
+        },
+    })
+    violations = validate_plan(plan, _REAL_REGISTRY)
+    bad = [v for v in violations if v.code == "invalid_ref_syntax"]
+    assert bad, f"expected invalid_ref_syntax; got {[(v.code, v.message) for v in violations]}"
+    assert "${s1..raw_text}" in bad[0].message
+    assert "root compose" in bad[0].message
+
+
+def test_malformed_ref_in_branch_compose_template_data_flagged() -> None:
+    """A ${..bad..} token in a BRANCH compose template_data is caught."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {"match": {"status": "error"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "generic_tool_error",
+                                 # trailing-dot malformed ref
+                                 "template_data": {"error_code": "${s1.}"}}},
+                    {"match": {"status": "added"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "shopping_added_ok",
+                                 "template_data": {"items": ["молоко"]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "shopping_added_ok",
+            "template_data": {"items": ["молоко"]},
+        },
+    })
+    violations = validate_plan(plan, _REAL_REGISTRY)
+    bad = [v for v in violations if v.code == "invalid_ref_syntax"]
+    assert bad, f"expected invalid_ref_syntax; got {[(v.code, v.message) for v in violations]}"
+    assert any(v.step_id == "s1" for v in bad)
+
+
+def test_well_formed_ref_in_compose_template_data_not_flagged() -> None:
+    """A well-formed compose ref must NOT trip invalid_ref_syntax — and, being
+    a real output field of the matched variant, must not trip the semantic
+    compose-ref check either. Exercises the POSITIVE path of
+    _phase1_check_compose_ref_syntax (medium R2 MINOR: the prior version had no
+    actual ${...} ref, so a regression that wrongly rejected valid compose refs
+    would have gone uncaught)."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "schedule_reminder",
+                "args": {"title": "x", "trigger_iso": "2026-06-05T10:00:00+03:00"},
+                "expected_outcomes": [
+                    # ${s1.trigger_at_iso} is a real field of the 'scheduled'
+                    # output variant (ScheduleReminderScheduled) — a well-formed,
+                    # semantically valid compose ref.
+                    {"match": {"status": "scheduled"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "reminder_set_ok",
+                                 "template_data": {"what": "x",
+                                                   "when_phrase": "${s1.trigger_at_iso}"}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "reminder_set_ok",
+            "template_data": {"what": "x", "when_phrase": "в 10:00"},
+        },
+    })
+    violations = validate_plan(plan, _REAL_REGISTRY)
+    # Positive path: a well-formed, real-field ref produces NO ref violation of
+    # any kind (neither syntax nor semantic).
+    ref_bad = [
+        v for v in violations
+        if v.code in ("invalid_ref_syntax", "compose_ref_unknown_field",
+                      "compose_ref_unknown_target")
+    ]
+    assert not ref_bad, f"valid compose ref must not be flagged; got {ref_bad}"
+
+
+# ---------------------------------------------------------------------------
+# per-template contract dispatch via the registry
+# ---------------------------------------------------------------------------
+
+
+def test_contracted_template_bad_payload_rejected_via_registry() -> None:
+    """A bad payload for a CONTRACTED template (clarification family: unknown
+    missing_fields code) is rejected — dispatched through the per-template
+    contract registry."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "needs_clarification",
+        "clarity_reason": "не указано время",
+        "actions": {},
+        "compose": {
+            "kind": "template",
+            "template_id": "ask_user_for_clarification",
+            # 'totally_made_up' is NOT in CLARIFICATION_FIELDS
+            "template_data": {"missing_fields": ["totally_made_up"],
+                              "clarity_reason": "не указано время"},
+        },
+    })
+    violations = validate_plan(
+        plan, _REAL_REGISTRY, composer_template_ids=_REAL_TEMPLATE_IDS,
+    )
+    bad = [v for v in violations if v.code == "clarification_payload_invalid"]
+    assert bad, (
+        f"contracted template with bad payload must be rejected; got "
+        f"{[(v.code, v.message) for v in violations]}"
+    )
+    assert "totally_made_up" in bad[0].message
+
+
+def test_valid_clarification_payload_passes_via_registry() -> None:
+    """A well-formed clarification payload (known missing_fields codes +
+    literal done_summary) passes the per-template registry dispatch at the
+    static stage. NOTE: the clarification contract has no ref-deferring field
+    (done_summary must be literal; missing_fields are closed-enum codes), so
+    allow_refs deferral is proved separately against humanize_result — see
+    ``test_humanize_result_field_level_refs_deferred_under_allow_refs``."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "needs_clarification",
+        "clarity_reason": "уточнение",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {"match": {"status": "added"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "partial_with_clarification",
+                                 "template_data": {
+                                     "done_summary": "добавила молоко",
+                                     "missing_fields": ["time"]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "partial_with_clarification",
+            "template_data": {"done_summary": "добавила молоко",
+                              "missing_fields": ["time"]},
+        },
+    })
+    violations = validate_plan(
+        plan, _REAL_REGISTRY, composer_template_ids=_REAL_TEMPLATE_IDS,
+    )
+    assert not [v for v in violations if v.code == "clarification_payload_invalid"], (
+        f"valid clarification payload must pass; got "
+        f"{[(v.code, v.message) for v in violations]}"
+    )
+
+
+def test_no_contract_template_payload_not_dispatched() -> None:
+    """A NO_CONTRACT template (shopping_added_ok) with an arbitrary extra key
+    must NOT be rejected by the contract dispatch (there is no contract)."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {"match": {"status": "added"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "shopping_added_ok",
+                                 "template_data": {"items": ["молоко"]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "shopping_added_ok",
+            "template_data": {"items": ["молоко"], "extra_key": "whatever"},
+        },
+    })
+    violations = validate_plan(
+        plan, _REAL_REGISTRY, composer_template_ids=_REAL_TEMPLATE_IDS,
+    )
+    assert not [
+        v for v in violations
+        if v.code in ("clarification_payload_invalid", "composer_contract_invalid")
+    ], f"NO_CONTRACT template must not be contract-dispatched; got {violations}"
+
+
+# ---------------------------------------------------------------------------
+# Invalid-case GUARD tests — each of the 4 invalid few-shot cases, when fed
+# as a plan, is rejected by the validator with the expected violation.
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_case_index_ref_bracket_rejected() -> None:
+    """Invalid few-shot #2: `[0]` bracket index ref in args → invalid_ref_syntax.
+    (Bracket indexing is not in the ref grammar; .only is the sanctioned way.)"""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_reminders",
+                "args": {},
+                "expected_outcomes": [
+                    {"match": {"status": "ok"}, "next": "s2"},
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "reminders_list_empty",
+                                 "template_data": {}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+            "s2": {
+                "tool": "update_reminder",
+                "args": {
+                    # bracket index — malformed ref
+                    "reminder_id": "${s1.items[0].reminder_id}",
+                    "trigger_iso": "2026-06-05T10:00:00+03:00",
+                },
+                "expected_outcomes": [
+                    {"match": {"status": "updated"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "reminder_set_ok",
+                                 "template_data": {"what": "x",
+                                                   "when_phrase": "в 10:00"}}},
+                ],
+                "intent_group": "default",
+                "depends_on": ["s1"],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "reminder_set_ok",
+            "template_data": {"what": "x", "when_phrase": "в 10:00"},
+        },
+    })
+    violations = validate_plan(
+        plan, _REAL_REGISTRY, composer_template_ids=_REAL_TEMPLATE_IDS,
+    )
+    assert any(v.code == "invalid_ref_syntax" for v in violations), (
+        f"bracket index ref must be rejected as invalid_ref_syntax; got "
+        f"{[(v.code, v.message) for v in violations]}"
+    )
+
+
+def test_invalid_case_guessed_output_field_rejected() -> None:
+    """Invalid few-shot #3: guessed/undeclared output field
+    (add_shopping_items has no `items`) → compose_ref_unknown_field."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "add_shopping_items",
+                "args": {"items": [{"title": "молоко"}]},
+                "expected_outcomes": [
+                    {"match": {"status": "added"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "shopping_added_ok",
+                                 # add_shopping_items has no `items` output field
+                                 "template_data": {"items": "${s1.items}"}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "shopping_added_ok",
+            "template_data": {"items": ["литерал"]},
+        },
+    })
+    violations = validate_plan(
+        plan, _REAL_REGISTRY, composer_template_ids=_REAL_TEMPLATE_IDS,
+    )
+    assert any(v.code == "compose_ref_unknown_field" for v in violations), (
+        f"guessed output field must be rejected as compose_ref_unknown_field; "
+        f"got {[(v.code, v.message) for v in violations]}"
+    )
+
+
+def test_invalid_case_only_in_compose_rejected() -> None:
+    """Invalid few-shot #4: `.only` inside a compose ref → only_selector_in_compose."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_reminders",
+                "args": {},
+                "expected_outcomes": [
+                    {"match": {"status": "ok"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "reminder_set_ok",
+                                 # .only forbidden in compose
+                                 "template_data": {
+                                     "what": "${s1.items.only.title}",
+                                     "when_phrase": "в 10:00"}}},
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "reminders_list_empty",
+                                 "template_data": {}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": "reminder_set_ok",
+            "template_data": {"what": "x", "when_phrase": "в 10:00"},
+        },
+    })
+    violations = validate_plan(
+        plan, _REAL_REGISTRY, composer_template_ids=_REAL_TEMPLATE_IDS,
+    )
+    assert any(v.code == "only_selector_in_compose" for v in violations), (
+        f".only in compose must be rejected; got "
+        f"{[(v.code, v.message) for v in violations]}"
+    )
+
+
+def test_invalid_case_smalltalk_in_clear_rejected() -> None:
+    """Invalid few-shot #1: a conversational template (smalltalk_fallback) in a
+    'clear' plan is rejected at the SCHEMA layer (Plan.model_validate raises)
+    — conversational targets are reply_only-only, and clear needs ≥1 action."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Plan.model_validate({
+            "schema_version": 1,
+            "turn_classification": {"is_new_turn": True, "reason": "t"},
+            "clarity": "clear",
+            "actions": {},
+            "compose": {
+                "kind": "template",
+                "template_id": "smalltalk_fallback",
+                "template_data": {},
+            },
+        })
+
+
+def test_all_invalid_few_shot_cases_have_expected_violation_markers() -> None:
+    """Cross-check: the documented violation markers on the invalid few-shot
+    anti-patterns are exactly the four PR-d boundaries, so the prompt and the
+    guard tests above stay in lock-step."""
+    from sreda.runtime.planner.few_shot_examples import all_invalid_examples
+
+    violations = {e.violation for e in all_invalid_examples()}
+    assert "invalid_ref_syntax" in violations
+    assert "compose_ref_unknown_field" in violations
+    assert "only_selector_in_compose" in violations
+    # smalltalk-in-clear is a schema-level rejection (prefixed "schema:").
+    assert any(v.startswith("schema:") for v in violations)

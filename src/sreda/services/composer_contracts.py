@@ -1,10 +1,12 @@
 """Shared key-allowlist constants and validation logic for ``humanize_result``
 LLM prompt data.
 
-Kept in a standalone module with zero intra-project imports so that both
-``sreda.services.composer.prompts_registry`` (services layer) and
+Kept in a standalone module that avoids importing the ``composer`` package so
+that both ``sreda.services.composer.prompts_registry`` (services layer) and
 ``sreda.runtime.planner.validator`` (planner layer) can import from here
-without creating a circular dependency.
+without creating a circular dependency. Its ONLY intra-project import is the
+``sreda.services.clarification_contract`` leaf (itself zero-intra-project-import),
+referenced by the per-template contract registry below — see the import note.
 
 The cycle that motivated extraction:
   validator → composer/__init__ → compose → executor → plan_compiler → validator
@@ -17,6 +19,19 @@ module is a sibling of the ``composer`` package directory, not inside it.
 from __future__ import annotations
 
 import re
+from typing import Protocol
+
+# The ONLY intra-project import allowed here (plan §"NEW leaf module" R3
+# MINOR): ``clarification_contract`` is a true zero-intra-project-import leaf,
+# so importing it cannot reintroduce the
+#   validator → composer/__init__ → compose → executor → plan_compiler → validator
+# cycle that motivated extracting this module as a sibling of the composer
+# package. Used by the per-template contract registry below so the
+# clarification family is referenced — not duplicated.
+from sreda.services.clarification_contract import (
+    RUNTIME_ONLY_TEMPLATE_IDS,
+    validate_clarification_payload,
+)
 
 _HUMANIZE_RESULT_ALLOWED_TOP_KEYS: frozenset[str] = frozenset({"intent", "actions"})
 """Strict top-level key allowlist for ``humanize_result`` template_data.
@@ -171,9 +186,117 @@ def validate_humanize_result_payload(
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Per-template contract registry (issue #88 PR-d, Piece 3)
+# ---------------------------------------------------------------------------
+# A central, machine-checkable map from ``template_id`` → its payload-validator
+# (a ``ComposerContract``) OR the explicit ``NO_CONTRACT`` marker for templates
+# that legitimately need none. This makes "every exposed template_id is either
+# contracted or explicitly no-contract" testable (the coverage test in
+# test_composer_registry.py iterates the live composer REGISTRY and asserts no
+# template falls through unclassified).
+#
+# MOST templates need NO contract: their template_data is either empty, a
+# single literal string the renderer prints verbatim, or a shape with no
+# leak/crash surface that the schema + StrictUndefined already guard. We do NOT
+# invent contracts for those — over-constraining would reject valid planner
+# outputs. Within THIS template-id registry the only real contract is:
+#   - the clarification family (ask_user_for_clarification /
+#     partial_with_clarification) → validate_clarification_payload, referenced
+#     from the clarification_contract leaf (NOT duplicated here).
+#
+# ``humanize_result`` ALSO has a real contract (validate_humanize_result_payload,
+# defined in this module) but it is NOT a registry entry: it is an LLM-prompt
+# KEY, not a template_id, so the validator dispatches it from the kind='llm'
+# branch (unchanged) rather than via get_composer_contract. The validator is
+# kept in this module so both paths share one source of truth. The registry's
+# template-id keys below are the deterministic Jinja templates only.
+
+
+class ComposerContract(Protocol):
+    """A contract validator: ``(data, *, allow_refs) -> list[str]`` of human-
+    readable error strings (empty == valid). Both
+    ``validate_humanize_result_payload`` and ``validate_clarification_payload``
+    satisfy this shape."""
+
+    def __call__(
+        self,
+        data: dict,  # type: ignore[type-arg]
+        *,
+        allow_refs: bool,
+    ) -> list[str]: ...
+
+
+# Sentinel meaning "this template_id was deliberately classified as needing no
+# payload contract" — distinct from ``None`` returned for an UNKNOWN id (which
+# the coverage test treats as an unclassified failure).
+NO_CONTRACT: object = object()
+
+
+# Authoritative classification of every planner-exposed ``template_id`` in
+# ``HOUSEWIFE_TEMPLATES`` (services/composer/templates_housewife.py). Keep in
+# sync: the coverage test fails if the composer registry grows a template that
+# is neither here nor in RUNTIME_ONLY_TEMPLATE_IDS.
+_COMPOSER_CONTRACTS: dict[str, ComposerContract | object] = {
+    # ---- real contracts ----------------------------------------------------
+    # Clarification family — referenced from the leaf, not duplicated.
+    "ask_user_for_clarification": validate_clarification_payload,
+    "partial_with_clarification": validate_clarification_payload,
+    # ---- explicit "no contract" --------------------------------------------
+    # shopping: literal item lists / counts; no leak or crash surface beyond
+    # what schema + StrictUndefined already cover.
+    "shopping_added_ok": NO_CONTRACT,
+    "shopping_added_empty": NO_CONTRACT,
+    "shopping_list_show": NO_CONTRACT,
+    "shopping_list_empty": NO_CONTRACT,
+    # reminders: literal phrases / counts.
+    "reminder_set_ok": NO_CONTRACT,
+    "reminder_skipped_past": NO_CONTRACT,
+    "reminders_list_show": NO_CONTRACT,
+    "reminders_list_empty": NO_CONTRACT,
+    # recipes: passthrough text / query echo.
+    "recipe_show": NO_CONTRACT,
+    "recipe_not_found_ask_alt": NO_CONTRACT,
+    # clarification — reminder-time ask. Only renders ``what`` (a literal the
+    # schema already requires non-blank); no closed-enum payload.
+    "ask_when_to_remind": NO_CONTRACT,
+    # error / fallback — fixed canned text, error_code never rendered.
+    "generic_tool_error": NO_CONTRACT,
+    "partial_with_compose_error": NO_CONTRACT,
+    "invalid_plan_fallback": NO_CONTRACT,
+    # conversational / identity — fixed canned text.
+    "identity_playful": NO_CONTRACT,
+    "smalltalk_fallback": NO_CONTRACT,
+}
+
+
+def get_composer_contract(template_id: str) -> ComposerContract | object | None:
+    """Return the per-template payload contract for ``template_id``.
+
+    Returns one of:
+    - a ``ComposerContract`` callable — the template carries a structured
+      payload that must be validated (call it with ``allow_refs=True`` at
+      plan-time, ``allow_refs=False`` at resolved-render time).
+    - ``NO_CONTRACT`` (sentinel) — the template was deliberately classified as
+      needing no payload contract.
+    - ``None`` — the ``template_id`` is UNKNOWN to the registry (NOT the same
+      as NO_CONTRACT). Callers/coverage tests treat this as "unclassified".
+
+    RUNTIME-ONLY templates (``RUNTIME_ONLY_TEMPLATE_IDS``) are NOT in this
+    registry — they are never planner-emitted, and the validator rejects them
+    upstream (``runtime_only_template_in_plan``). The coverage test excludes
+    them from the contracted-vs-no-contract requirement for the same reason.
+    """
+    return _COMPOSER_CONTRACTS.get(template_id)
+
+
 __all__ = [
+    "NO_CONTRACT",
+    "RUNTIME_ONLY_TEMPLATE_IDS",
+    "ComposerContract",
     "_HUMANIZE_RESULT_ACTION_ALLOWED_KEYS",
     "_HUMANIZE_RESULT_ALLOWED_TOP_KEYS",
     "_is_full_ref",
+    "get_composer_contract",
     "validate_humanize_result_payload",
 ]
