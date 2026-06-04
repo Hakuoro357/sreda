@@ -50,6 +50,7 @@ from sreda.services.llm import (
     ainvoke_with_streaming_timeout,
     detect_unbacked_claim,
     get_chat_llm,
+    is_capability_question,
     resolve_provider_pair_for_tenant,
     strip_reasoning_prefix,
 )
@@ -2965,6 +2966,11 @@ async def execute_conversation_chat(
             ai_text = str(getattr(ai_msg, "content", "") or "")
             if (
                 not _hallucination_nudged
+                # Skip the guard when the user asked a capability/meta question
+                # ("что ты умеешь?") — the reply is an ability description, not
+                # a side-effect claim, so a nudge here just breaks the answer
+                # (vex-assistant#100).
+                and not is_capability_question(user_text)
                 and detect_unbacked_claim(ai_text, called_tools)
             ):
                 _hallucination_nudged = True

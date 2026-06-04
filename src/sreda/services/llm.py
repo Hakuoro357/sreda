@@ -958,6 +958,65 @@ def _identify_claim_category(window: str) -> str | None | bool:
     return False
 
 
+# 2026-06-04 (vex-assistant#100): a capability/meta QUESTION from the user —
+# "что ты умеешь?", "кто ты?", "расскажи о себе". On such a turn the assistant
+# is EXPECTED to describe its abilities ("ставлю напоминания, составляю меню,
+# веду списки") with NO tool call, so the unbacked-claim guard must NOT fire —
+# otherwise the capability answer is flagged, nudged, and collapses into the
+# error fallback (prod 2026-06-04, tenant_tg_702229240: "Что ты умеешь?" ->
+# "Не получилось надёжно записать это"). We gate on the USER's intent: match is
+# EXACT after normalization (lowercase, ё→е, punctuation→space, filler words
+# dropped), NOT substring. "что можешь сделать?" matches; "что можешь добавить в
+# список?" carries an action object so it does NOT match (the guard still runs);
+# "ну а вообще скажи что ты умеешь?" → fillers dropped → matches. No action-verb
+# blocklist (whack-a-mole + it false-negated the canonical "что можешь сделать").
+_CAPABILITY_QUESTION_PHRASES: frozenset[str] = frozenset({
+    "что ты умеешь", "что умеешь", "что ты умеешь делать", "что умеешь делать",
+    "что ты можешь", "что можешь", "что ты можешь делать", "что можешь делать",
+    "что ты можешь сделать", "что можешь сделать", "что ты можешь сделать для меня",
+    "что ты делаешь",
+    "что ты за бот", "что ты за ассистент", "что ты за помощник",
+    "что ты такое", "что ты такая", "что это за бот",
+    "кто ты", "ты кто", "кто ты такой", "кто ты такая",
+    "расскажи о себе", "расскажи про себя", "расскажи кто ты",
+    "какие у тебя функции", "какие у тебя возможности",
+    "какие функции", "какие возможности", "какие у тебя навыки",
+    "твои возможности", "твои функции", "твои навыки", "твои умения",
+    "чем ты можешь помочь", "чем можешь помочь", "чем поможешь",
+    "чем ты можешь быть полезна", "чем ты можешь быть полезен",
+    "для чего ты", "для чего ты нужна", "зачем ты", "зачем ты нужна",
+    "зачем ты нужен", "как ты можешь помочь", "как ты работаешь",
+    "как работаешь", "что ты предлагаешь",
+})
+# Filler tokens dropped before the exact match. MUST stay disjoint from any
+# token used in the phrases above (else a real phrase would be mangled).
+_CAPABILITY_QUESTION_FILLERS: frozenset[str] = frozenset({
+    "а", "ну", "вообще", "пожалуйста", "плиз", "скажи", "мне",
+    "эй", "слушай", "привет", "интересно", "короче", "же", "ка", "блин",
+})
+
+
+def is_capability_question(user_text: str) -> bool:
+    """True when the user's message is a capability/meta question.
+
+    On such a turn the assistant describes its abilities (no side-effect, no
+    tool), so detect_unbacked_claim should be skipped. Matching is EXACT after
+    normalization (see _CAPABILITY_QUESTION_PHRASES) — a message that carries an
+    action ("что можешь добавить в список") does NOT match, so real action
+    claims keep being checked.
+    """
+    if not user_text:
+        return False
+    low = user_text.lower().replace("ё", "е")
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch.isspace()) else " " for ch in low
+    )
+    tokens = [t for t in cleaned.split() if t not in _CAPABILITY_QUESTION_FILLERS]
+    if not tokens:
+        return False
+    return " ".join(tokens) in _CAPABILITY_QUESTION_PHRASES
+
+
 def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
     """Return True when the assistant text claims a side-effect but
     no corresponding write-tool was invoked this turn.

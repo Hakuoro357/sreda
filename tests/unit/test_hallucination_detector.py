@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from sreda.services.llm import detect_unbacked_claim
+from sreda.services.llm import detect_unbacked_claim, is_capability_question
 
 
 # --------------------------------------------------------------------
@@ -1035,3 +1035,62 @@ def test_2026_05_29_bare_kroy_still_unbacked() -> None:
         )
         is True
     )
+
+
+# --------------------------------------------------------------------
+# 2026-06-04 (vex-assistant#100): capability-question gate. The
+# unbacked-claim guard is SKIPPED (at the handler) when the USER asked
+# "что ты умеешь?" — the reply is an ability description, not a
+# side-effect claim. We gate on user intent, not on parsing the reply.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("q", [
+    "Что ты умеешь?",
+    "что умеешь",
+    "Что ты можешь делать?",
+    "Кто ты?",
+    "ты кто?",
+    "Расскажи о себе",
+    "Расскажи про себя, пожалуйста",
+    "Какие у тебя возможности?",
+    "Чем ты можешь помочь?",
+    "Что ты такое?",
+    # canonical capability questions the old verb-blocklist wrongly rejected
+    "Что ты можешь сделать?",
+    "Что можешь сделать?",
+    "Что ты делаешь?",
+    # filler-word tolerance (normalization drops а/ну/вообще/пожалуйста/скажи)
+    "А что ты вообще умеешь?",
+    "Ну скажи, что ты умеешь?",
+    "Расскажи, пожалуйста, о себе",
+])
+def test_is_capability_question_true(q: str) -> None:
+    assert is_capability_question(q) is True
+
+
+@pytest.mark.parametrize("q", [
+    "Поставь напоминание на 9:00",
+    "Добавь молоко в список",
+    "Напомни завтра принять лекарства",
+    # capability phrase BUT also an explicit action imperative -> not pure
+    "Что ты умеешь? И поставь напоминание на завтра в 9 утра",
+    "Составь меню на неделю",
+    "Запиши рецепт борща в книгу",
+    "Привет, как дела?",
+    "",
+    # long message -> not a short pure question
+    "Слушай, мне тут нужно разобраться с кучей дел на неделю, "
+    "что ты вообще умеешь полезного по хозяйству и быту?",
+    # Codex A/B (#100): action-adjacent meta questions must NOT skip the guard.
+    # Exact-match handles these WITHOUT any verb blocklist — the action verb
+    # need not be enumerated anywhere (очистить/отменить are not listed).
+    "Что ты делаешь с моим списком?",
+    "Что можешь добавить в список?",
+    "Что ты можешь сохранить в рецепты?",
+    "Что можешь поставить на завтра?",
+    "Что можешь очистить список?",
+    "Что ты можешь отменить напоминание?",
+])
+def test_is_capability_question_false(q: str) -> None:
+    assert is_capability_question(q) is False
