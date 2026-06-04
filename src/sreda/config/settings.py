@@ -52,6 +52,23 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     database_url: str = Field(default="postgresql+psycopg://sreda:sreda@localhost:5432/sreda")
+    # SQLAlchemy connection-pool sizing (PostgreSQL only; SQLite uses its own
+    # pool). Defaults are intentionally SMALL: the background processes
+    # (pollers, job-runner) are low-concurrency (~3-4 pooled conns each; the
+    # poller's advisory lock uses a separate NullPool conn), so a 3+7 pool
+    # leaves PG's 100-connection budget free for the API. The uvicorn process
+    # RAISES these via env (SREDA_DB_POOL_SIZE / SREDA_DB_MAX_OVERFLOW in its
+    # systemd unit) to cover its sync-handler threadpool concurrency under Mini
+    # App open-bursts. Keep the total across all processes within PG
+    # max_connections (minus superuser_reserved + the advisory-lock conns).
+    # NB: the capacity budget assumes a SINGLE uvicorn worker (ExecStart has no
+    # --workers). With N workers, uvicorn's pool multiplies by N — re-check the
+    # PG budget before adding workers. le= caps stop an env typo
+    # (e.g. SREDA_DB_MAX_OVERFLOW=300) from silently exhausting PG.
+    db_pool_size: int = Field(default=3, ge=1, le=50)
+    db_max_overflow: int = Field(default=7, ge=0, le=100)
+    db_pool_timeout: int = Field(default=30, ge=1, le=120)
+    db_pool_pre_ping: bool = True
     telegram_bot_token: str | None = None
     telegram_webhook_secret_token: str | None = None
     telegram_bot_username: str | None = None
