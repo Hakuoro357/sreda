@@ -2012,6 +2012,19 @@
       html = renderDashboard();
     }
 
+    // 2026-06-04 (vex-assistant#102) TEMP diagnostic — remove after.
+    // Render-state beacon: reports the chosen route, the produced html length,
+    // and which data slots are populated, right before mount. Pinpoints the
+    // "blank screen" cause — hlen=0/null means the view produced no markup;
+    // a large hlen with a still-blank screen points at CSS/DOM, not render.
+    try {
+      (new Image()).src = "/miniapp/api/v1/client-diagnostic?beacon=render"
+        + "&route=" + encodeURIComponent(route)
+        + "&hlen=" + (html == null ? "null" : String(html).length)
+        + "&data=" + (state.summary ? "s" : "-") + (state.plans ? "p" : "-") + (state.menu ? "m" : "-")
+        + "&err=" + (state.error ? "1" : "0") + "&load=" + (state.loading ? "1" : "0")
+        + "&t=" + (new Date()).getTime();
+    } catch (e) {}
     $app.innerHTML = html;
     if (typeof afterMount === "function") {
       try { afterMount(); }
