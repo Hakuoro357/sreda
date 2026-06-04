@@ -17,6 +17,22 @@
 
   var BUILD_STAMP = "{{ build_stamp }}";
 
+  // 2026-06-04 (vex-assistant#102) TEMPORARY DIAGNOSTIC — remove after.
+  // GET beacon via Image() (NOT fetch), fired before any other logic, so the
+  // server can tell whether this inline script executes at all on a given
+  // client (Telegram-Android 12.7.3 shows a hung spinner with zero JS network
+  // activity). client-diagnostic is POST-only → a GET returns 405, which nginx
+  // still logs — that 405 line is all we need. Wrapped so it never throws.
+  function _diagBeacon(stage) {
+    try {
+      var img = new Image();
+      img.src = "{{ base_url }}/miniapp/api/v1/client-diagnostic?beacon=" + stage
+        + "&build=" + encodeURIComponent(BUILD_STAMP)
+        + "&t=" + (new Date()).getTime();
+    } catch (e) {}
+  }
+  _diagBeacon("script_start");
+
   // Wait for telegram-web-app.js to finish injecting window.Telegram.
   // On Android Telegram 12.6+ (observed on Samsung SM-A566B) this
   // inline script runs BEFORE the head <script src=telegram-web-app>
@@ -2755,6 +2771,7 @@
   loadData();
   }  // end of _mainInit
 
+  _diagBeacon("before_bootstrap");  // TEMPORARY DIAGNOSTIC (vex-assistant#102)
   _bootstrap();
 })();
 </script>
