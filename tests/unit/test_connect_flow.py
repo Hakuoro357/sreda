@@ -59,6 +59,22 @@ def test_connect_callback_creates_one_time_link(
     try:
         _seed_bundle(session)
         BillingService(session).start_base_subscription("tenant_1")
+        # #103 (stale-test fix): a post-approve welcome flow (telegram_inbound,
+        # gated on is_welcome_sent) now intercepts the FIRST inbound from an
+        # approved tenant, sends the welcome, and CONSUMES the inbound (skips
+        # chat dispatch). That swallowed the connect_eds callback → 0 answered
+        # callbacks. Pre-mark welcome as already sent so this established-user
+        # inbound flows through to the connect handler, as it does in steady
+        # state. Intent preserved: the connect callback creates the one-time link.
+        from sreda.services.onboarding import mark_welcome_sent
+        mark_welcome_sent(session, "tenant_1", "user_1")
+        # #103 (stale-test fix): the EntitlementGate (Codex CRITICAL 2026-05-07)
+        # now drops any inbound from a tenant without an active
+        # `housewife_assistant` subscription. In production every tenant gets a
+        # free `sreda_free` sub auto-granted by ensure_telegram_user_bundle; the
+        # manual seed here bypasses that, so grant it explicitly to mirror the
+        # real post-bundle state. Without it the callback is dropped pre-handler.
+        _grant_free_tier_sub(session, "tenant_1")
     finally:
         session.close()
 
@@ -326,6 +342,15 @@ def test_connect_callback_uses_existing_legacy_workspace_and_assistant(
         ))
         session.commit()
         BillingService(session).start_base_subscription("tenant_eds")
+        # #103 (stale-test fix): pre-mark post-approve welcome as sent so the
+        # gated welcome flow (telegram_inbound) does not consume this inbound
+        # before the connect_eds callback reaches the connect handler. See the
+        # sibling test for the full rationale. Intent preserved.
+        from sreda.services.onboarding import mark_welcome_sent
+        mark_welcome_sent(session, "tenant_eds", "user_eds")
+        # #103 (stale-test fix): grant free housewife_assistant sub so the
+        # EntitlementGate lets the inbound through (see sibling test rationale).
+        _grant_free_tier_sub(session, "tenant_eds")
     finally:
         session.close()
 
@@ -739,6 +764,55 @@ def test_submit_form_shows_neutral_message_when_inline_verification_raises(
     assert response.status_code == 200
     assert "Кабинет EDS подключ" not in response.text
     assert "Результат проверки появится в приложении" in response.text
+
+
+def _grant_free_tier_sub(session, tenant_id: str) -> None:
+    """#103 (stale-test fix): replicate production's free-tier auto-grant.
+
+    Seeds the ``sreda_free`` plan (normally created by migration 0041, which
+    Base.metadata.create_all does not run) plus an active
+    ``housewife_assistant`` subscription, matching what
+    ``ensure_telegram_user_bundle`` grants every real tenant. Required so the
+    EntitlementGate (checks for an active housewife_assistant sub) lets the
+    inbound reach the connect-eds handler.
+    """
+    import uuid as _uuid
+    from datetime import datetime as _dt, timezone as _tz
+
+    from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+
+    now = _dt.now(_tz.utc)
+    plan = (
+        session.query(SubscriptionPlan)
+        .filter(SubscriptionPlan.plan_key == "sreda_free")
+        .one_or_none()
+    )
+    if plan is None:
+        plan = SubscriptionPlan(
+            id="plan_sreda_free",
+            plan_key="sreda_free",
+            feature_key="housewife_assistant",
+            title="Free",
+            description="Free tier",
+            price_rub=0,
+        )
+        session.add(plan)
+        session.flush()
+    session.add(TenantSubscription(
+        id="sub_" + _uuid.uuid4().hex[:24],
+        tenant_id=tenant_id,
+        plan_id=plan.id,
+        feature_key="housewife_assistant",
+        status="active",
+        starts_at=now,
+        active_until=None,
+        cancel_at_period_end=False,
+        quantity=1,
+        next_cycle_quantity=1,
+        created_at=now,
+        updated_at=now,
+    ))
+    session.commit()
 
 
 def _seed_bundle(session) -> None:

@@ -72,9 +72,17 @@ def test_no_profile_falls_back_to_utc() -> None:
     assert today_utc in out
 
 
-def test_placement_first_in_variable_parts() -> None:
-    """R-34 Codex R2 MAJOR 3: [ТЕКУЩЕЕ ВРЕМЯ] должно быть FIRST в
-    variable_parts (раньше anti-injection guard и onboarding).
+def test_placement_last_in_variable_parts() -> None:
+    """#103 (stale-test fix): ordering was intentionally REVERSED.
+
+    R-34 (2026-05-16) originally put [ТЕКУЩЕЕ ВРЕМЯ] FIRST as an attention
+    anchor. Commit #65 (2026-05-22) deliberately moved it LAST: variable_parts
+    are now sorted most-stable → most-dynamic for provider prefix-caching (the
+    anti-injection guard is an absolute constant, so it leads; time changes
+    every minute, so it trails). History still follows variable_text, so
+    time-last remains a strong recency anchor. See the documented hierarchy in
+    handlers.execute_conversation_chat. This test now locks in the CURRENT
+    (cache-optimised) order: guard and [ПРОФИЛЬ] appear BEFORE [ТЕКУЩЕЕ ВРЕМЯ].
 
     Repro-style: build full prompt assembly через source inspection,
     verify order. Strict text test — source-level.
@@ -91,11 +99,12 @@ def test_placement_first_in_variable_parts() -> None:
     assert pos_time > 0, "[ТЕКУЩЕЕ ВРЕМЯ] append not found in source"
     assert pos_guard > 0, "[ДАННЫЕ ХОДА] append not found"
     assert pos_profile > 0, "[ПРОФИЛЬ] append not found"
-    assert pos_time < pos_guard, (
-        f"Time context must appear before anti-injection guard "
-        f"(time at {pos_time}, guard at {pos_guard})"
+    assert pos_guard < pos_time, (
+        f"Anti-injection guard (most-stable) must appear before time context "
+        f"(most-dynamic) for prefix caching (guard at {pos_guard}, "
+        f"time at {pos_time})"
     )
-    assert pos_time < pos_profile, (
-        f"Time context must appear before [ПРОФИЛЬ] "
-        f"(time at {pos_time}, profile at {pos_profile})"
+    assert pos_profile < pos_time, (
+        f"[ПРОФИЛЬ] must appear before [ТЕКУЩЕЕ ВРЕМЯ] "
+        f"(profile at {pos_profile}, time at {pos_time})"
     )

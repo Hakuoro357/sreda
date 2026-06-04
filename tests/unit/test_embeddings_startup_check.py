@@ -39,7 +39,12 @@ async def test_alert_admin_no_chat_id_skips(monkeypatch, caplog):
         result = await admin_alerts.alert_admin_async("test")
 
     assert result is False
-    assert any("admin_telegram_chat_id not configured" in r.message
+    # #103 (stale-test fix): admin_alerts was refactored (39fbf40) to a
+    # MAX-primary + TG-fallback model; with neither channel configured it now
+    # logs "no channel configured (MAX or TG)" instead of the old
+    # "admin_telegram_chat_id not configured". Intent preserved: no channel →
+    # return False + a skip warning, no exception.
+    assert any("no channel configured" in r.message
                for r in caplog.records)
 
 
@@ -59,23 +64,30 @@ async def test_alert_admin_no_bot_token_skips(monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_alert_admin_swallows_send_errors(monkeypatch, caplog):
-    """TelegramClient.send_message raises → return False, log warning,
-    NO exception."""
+    """Telegram POST raises → return False, log warning, NO exception."""
     monkeypatch.setenv("SREDA_ADMIN_TELEGRAM_CHAT_ID", "352612382")
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "fake-token")
+    # No MAX channel configured → TG is the only path (legacy behaviour).
+    monkeypatch.delenv("SREDA_MAX_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SREDA_ADMIN_MAX_CHAT_ID", raising=False)
     from sreda.config.settings import get_settings
     get_settings.cache_clear()
 
-    fake_client_send = AsyncMock(side_effect=RuntimeError("network down"))
-    with patch(
-        "sreda.services.admin_alerts.TelegramClient",
-    ) as mock_client_cls:
-        mock_client_cls.return_value.send_message = fake_client_send
+    # #103 (stale-test fix): admin_alerts no longer uses TelegramClient
+    # (removed in refactor 39fbf40). alert_admin_async now offloads the TG
+    # send to a sync helper `_post_telegram_sync` via asyncio.to_thread. Patch
+    # that helper to raise. Intent preserved: a delivery error is swallowed →
+    # return False, warning logged, no exception escapes.
+    with patch.object(
+        admin_alerts,
+        "_post_telegram_sync",
+        side_effect=RuntimeError("network down"),
+    ):
         with caplog.at_level(logging.WARNING):
             result = await admin_alerts.alert_admin_async("test")
 
     assert result is False
-    assert any("failed to deliver" in r.message for r in caplog.records)
+    assert any("Telegram exception" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -83,18 +95,23 @@ async def test_alert_admin_truncates_long_text(monkeypatch):
     """>4000 chars text → truncated с маркером."""
     monkeypatch.setenv("SREDA_ADMIN_TELEGRAM_CHAT_ID", "352612382")
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "fake")
+    # No MAX channel → TG-only path, so _post_telegram_sync receives the text.
+    monkeypatch.delenv("SREDA_MAX_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SREDA_ADMIN_MAX_CHAT_ID", raising=False)
     from sreda.config.settings import get_settings
     get_settings.cache_clear()
 
-    fake_send = AsyncMock(return_value={"ok": True})
-    with patch(
-        "sreda.services.admin_alerts.TelegramClient",
-    ) as mock_cls:
-        mock_cls.return_value.send_message = fake_send
+    # #103 (stale-test fix): patch the current sync sender `_post_telegram_sync`
+    # (signature: bot_token, chat_id, text) instead of the removed
+    # TelegramClient. Intent preserved: oversized text is truncated with a
+    # marker before it reaches the transport.
+    from unittest.mock import MagicMock
+    fake_send = MagicMock(return_value=True)
+    with patch.object(admin_alerts, "_post_telegram_sync", fake_send):
         big = "x" * 5000
         await admin_alerts.alert_admin_async(big)
 
-    sent_text = fake_send.call_args.kwargs.get("text") or fake_send.call_args.args[1]
+    sent_text = fake_send.call_args.kwargs.get("text") or fake_send.call_args.args[2]
     # 3990 head + "\n…[truncated]" marker = ~4003. Должно влезть в TG limit 4096.
     assert len(sent_text) < 4096
     assert "[truncated]" in sent_text

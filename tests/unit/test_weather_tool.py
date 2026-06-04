@@ -526,7 +526,12 @@ def test_part_of_day_groups_into_4_buckets_with_wind():
     """24h fixture → 4 bucket-строки, каждая содержит «м/с»."""
     wt._GEO_CACHE.clear()
     geo = _mk_geo_response("Москва", 55.75, 37.62)
-    times, temps, codes, precips, winds = _mk_24h_hourly("2026-05-08")
+    # #103 (stale-test fix): use TODAY dynamically. part_of_day with the
+    # default day_offset=0 windows 00:00..23:00 of now_local.date(); a
+    # hardcoded past date (was "2026-05-08") gets dropped by the tool's
+    # defensive post-filter → "error: пустой прогноз".
+    today = _datetime.now(tz=ZoneInfo("Europe/Moscow")).date()
+    times, temps, codes, precips, winds = _mk_24h_hourly(today.isoformat())
     fc = _mk_forecast_response_with_hourly(
         hourly_times=times, hourly_temps=temps, hourly_codes=codes,
         hourly_precips=precips, hourly_winds=winds,
@@ -570,10 +575,14 @@ def test_hourly_caps_at_48_with_truncation_marker():
     """168h fixture → ≤48 hour rows + truncation marker."""
     wt._GEO_CACHE.clear()
     geo = _mk_geo_response("Москва", 55.75, 37.62)
+    # #103 (stale-test fix): base the 7-day fixture on TOMORROW dynamically
+    # (day_offset=1). A hardcoded past start date (was 2026-05-08) is dropped
+    # by the tool's defensive hour-window post-filter → "error: пустой прогноз".
+    base_day = (_datetime.now(tz=ZoneInfo("Europe/Moscow")) + _timedelta_days(1)).date()
     # 168 hours over 7 days
     times, temps, codes, precips, winds = [], [], [], [], []
     for day_offset in range(7):
-        d = _date(2026, 5, 8) + _timedelta_days(day_offset)
+        d = base_day + _timedelta_days(day_offset)
         ts, te, tc, tp, tw = _mk_24h_hourly(d.isoformat())
         times += ts
         temps += te
