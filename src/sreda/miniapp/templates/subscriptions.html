@@ -17,22 +17,6 @@
 
   var BUILD_STAMP = "{{ build_stamp }}";
 
-  // 2026-06-04 (vex-assistant#102) TEMPORARY DIAGNOSTIC — remove after.
-  // GET beacon via Image() (NOT fetch), fired before any other logic, so the
-  // server can tell whether this inline script executes at all on a given
-  // client (Telegram-Android 12.7.3 shows a hung spinner with zero JS network
-  // activity). client-diagnostic is POST-only → a GET returns 405, which nginx
-  // still logs — that 405 line is all we need. Wrapped so it never throws.
-  function _diagBeacon(stage) {
-    try {
-      var img = new Image();
-      img.src = "{{ base_url }}/miniapp/api/v1/client-diagnostic?beacon=" + stage
-        + "&build=" + encodeURIComponent(BUILD_STAMP)
-        + "&t=" + (new Date()).getTime();
-    } catch (e) {}
-  }
-  _diagBeacon("script_start");
-
   // Wait for telegram-web-app.js to finish injecting window.Telegram.
   // On Android Telegram 12.6+ (observed on Samsung SM-A566B) this
   // inline script runs BEFORE the head <script src=telegram-web-app>
@@ -82,12 +66,11 @@
   function _mainInit() {
   // TG OR MAX SDK detection. MAX exposes window.WebApp (no .Telegram namespace).
   var tg = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
-  if (tg && typeof tg.ready === "function") {
-    try { tg.ready(); } catch (e) {}
-  }
-  if (tg && typeof tg.expand === "function") {
-    try { tg.expand(); } catch (e) {}
-  }
+  // ready()/expand() are driven by the late-SDK poll (_callSdkReadyOnce, defined
+  // below) so the Telegram loading overlay lifts even when the async SDK arrives
+  // AFTER this hash-fallback bootstrap ran (vex-assistant#102: blank-on-first-
+  // open, works-on-refresh).
+  _callSdkReadyOnce();
 
   // Prefer the SDK-provided initData; fall back to hash extraction.
   // Hash format: TG = #tgWebAppData=...; MAX = #WebAppData=... (no tg prefix).
@@ -2012,19 +1995,6 @@
       html = renderDashboard();
     }
 
-    // 2026-06-04 (vex-assistant#102) TEMP diagnostic — remove after.
-    // Render-state beacon: reports the chosen route, the produced html length,
-    // and which data slots are populated, right before mount. Pinpoints the
-    // "blank screen" cause — hlen=0/null means the view produced no markup;
-    // a large hlen with a still-blank screen points at CSS/DOM, not render.
-    try {
-      (new Image()).src = "/miniapp/api/v1/client-diagnostic?beacon=render"
-        + "&route=" + encodeURIComponent(route)
-        + "&hlen=" + (html == null ? "null" : String(html).length)
-        + "&data=" + (state.summary ? "s" : "-") + (state.plans ? "p" : "-") + (state.menu ? "m" : "-")
-        + "&err=" + (state.error ? "1" : "0") + "&load=" + (state.loading ? "1" : "0")
-        + "&t=" + (new Date()).getTime();
-    } catch (e) {}
     $app.innerHTML = html;
     if (typeof afterMount === "function") {
       try { afterMount(); }
@@ -2784,7 +2754,37 @@
   loadData();
   }  // end of _mainInit
 
-  _diagBeacon("before_bootstrap");  // TEMPORARY DIAGNOSTIC (vex-assistant#102)
+  // 2026-06-04 (vex-assistant#102): with the SDK loaded async, on a COLD first
+  // open window.Telegram can appear AFTER the bootstrap already proceeded via
+  // the hash fallback, so tg.ready()/expand() never fired and Telegram kept its
+  // loading overlay over the already-rendered content → blank on first open,
+  // fine on refresh (SDK cached). Poll for the SDK and signal ready()/expand()
+  // the moment it appears, regardless of bootstrap timing. (function decl is
+  // hoisted, so _mainInit above can call it.)
+  var _sdkReadyCalled = false;
+  function _callSdkReadyOnce() {
+    if (_sdkReadyCalled) return true;
+    var app = (window.Telegram && window.Telegram.WebApp) || window.WebApp;
+    if (!(app && typeof app.ready === "function")) return false;
+    // Set the one-shot flag only AFTER ready() actually succeeds, so a thrown
+    // ready() leaves the poll free to retry (Codex MINOR).
+    try { app.ready(); } catch (e) { return false; }
+    _sdkReadyCalled = true;
+    try { if (typeof app.expand === "function") app.expand(); } catch (e) {}
+    return true;
+  }
+  if (!_callSdkReadyOnce()) {
+    var _sdkPollTries = 0;
+    var _sdkPollTimer = setInterval(function () {
+      _sdkPollTries += 1;
+      // ~60s of 100ms polls — generous even for a very slow async SDK load;
+      // beyond that the network is broken and the API calls fail anyway.
+      if (_callSdkReadyOnce() || _sdkPollTries > 600) clearInterval(_sdkPollTimer);
+    }, 100);
+    // Belt-and-suspenders: also signal on window 'load', in case the async SDK
+    // resolves around/after it and outside the poll window (Codex MAJOR).
+    try { window.addEventListener("load", _callSdkReadyOnce); } catch (e) {}
+  }
   _bootstrap();
 })();
 </script>
