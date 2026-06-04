@@ -10,10 +10,25 @@
      cold-start time, убирает cross-origin connection latency. ``platform``
      приходит из server-side render (subscription.show GET handler читает
      ``?platform=`` из query). #}
+  <script>
+    // 2026-06-04 (vex-assistant#102) TEMP diagnostic — remove after.
+    // js_before_sdk beacon: fires via Image() BEFORE the platform SDK <script>
+    // below, so the server can tell whether inline JS runs even when the
+    // (now async) external SDK is slow/blocked on a given WebView. GET hits a
+    // POST-only route → 405, still logged by nginx. Never throws.
+    try { (new Image()).src = "/miniapp/api/v1/client-diagnostic?beacon=js_before_sdk&t=" + (new Date()).getTime(); } catch (e) {}
+  </script>
+  {# 2026-06-04 (vex-assistant#102): the Telegram SDK is loaded ASYNC so a
+     slow/blocked telegram.org on the Android Telegram WebView no longer
+     parser-blocks the inline bootstrap (the suspected cause of the hung
+     spinner + zero JS network). Safe because the bootstrap already retries
+     for window.Telegram.WebApp (~3s) and falls back to initData parsed from
+     location.hash. MAX SDK stays synchronous — its polyfill (below) reads
+     window.WebApp at parse time, and the MAX path is unaffected by the bug. #}
   {% if platform == "max" %}
   <script src="https://st.max.ru/js/max-web-app.js"></script>
   {% else %}
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://telegram.org/js/telegram-web-app.js" async></script>
   {% endif %}
   <script>
     // Phase 8 of MAX integration: platform_bridge — sets globals +
@@ -359,6 +374,13 @@
   </style>
 </head>
 <body>
+  <!-- 2026-06-04 (vex-assistant#102) TEMP diagnostic — remove after.
+       HTML-only beacon: the browser GETs this image on document render with
+       NO JavaScript, so the server can confirm the device actually loaded our
+       page (vs being stuck on Telegram's own loading UI / serving a cached
+       shell). GET hits a POST-only route → 405, still logged by nginx. -->
+  <img src="/miniapp/api/v1/client-diagnostic?beacon=html_render&b={{ build_stamp }}" alt=""
+       width="1" height="1" style="position:absolute;left:-9999px;top:-9999px;">
   <div id="app">
     <div class="loading"><div class="spinner"></div></div>
   </div>
