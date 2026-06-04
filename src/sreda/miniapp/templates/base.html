@@ -12,10 +12,30 @@
      ``?platform=`` из query). #}
   <script>
     // 2026-06-04 (vex-assistant#102) TEMP diagnostic — remove after.
+    // Registered FIRST so it captures every later error. Global error +
+    // unhandledrejection beacons report message+line via Image() GET, so a
+    // render crash AFTER the API data loads (the "blank screen" symptom) shows
+    // up in nginx as ?beacon=js_error&m=<message>&x=<line:col>. Never throws.
+    (function () {
+      function send(kind, msg, extra) {
+        try {
+          (new Image()).src = "/miniapp/api/v1/client-diagnostic?beacon=" + kind
+            + "&m=" + encodeURIComponent(String(msg == null ? "" : msg).slice(0, 200))
+            + (extra ? "&x=" + encodeURIComponent(extra) : "")
+            + "&t=" + (new Date()).getTime();
+        } catch (e) {}
+      }
+      window.addEventListener("error", function (e) {
+        send("js_error", e && e.message, (e && (e.lineno || 0)) + ":" + (e && (e.colno || 0)));
+      });
+      window.addEventListener("unhandledrejection", function (e) {
+        var r = e && e.reason;
+        send("js_reject", (r && (r.message || (r.toString && r.toString()))) || r);
+      });
+    })();
     // js_before_sdk beacon: fires via Image() BEFORE the platform SDK <script>
     // below, so the server can tell whether inline JS runs even when the
-    // (now async) external SDK is slow/blocked on a given WebView. GET hits a
-    // POST-only route → 405, still logged by nginx. Never throws.
+    // (now async) external SDK is slow/blocked on a given WebView.
     try { (new Image()).src = "/miniapp/api/v1/client-diagnostic?beacon=js_before_sdk&t=" + (new Date()).getTime(); } catch (e) {}
   </script>
   {# 2026-06-04 (vex-assistant#102): the Telegram SDK is loaded ASYNC so a
