@@ -56,6 +56,22 @@ _REMINDERS_LIST_SHOW = (
 _REMINDERS_LIST_EMPTY = "Активных напоминаний нет."
 
 # ---------------------------------------------------------------------------
+# Checklists (show_checklist → ShowChecklistOk / ShowChecklistEmpty)
+# ---------------------------------------------------------------------------
+# Mirrors the shopping-list pair. Fields come from ShowChecklistOk:
+# ``title`` (str) + ``items`` (list of ShowChecklistItem{title, item_status}).
+# A done item gets a ✅; pending/cancelled render plain.
+
+_CHECKLIST_SHOW = (
+    "{{ title }}:"
+    "{% for it in items %}"
+    "\n• {{ it.title }}{% if it.item_status == 'done' %} ✅{% endif %}"
+    "{% endfor %}"
+)
+
+_CHECKLIST_EMPTY = "Список «{{ title }}» пока пустой."
+
+# ---------------------------------------------------------------------------
 # Recipes
 # ---------------------------------------------------------------------------
 
@@ -246,6 +262,9 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     "reminder_skipped_past": _REMINDER_SKIPPED_PAST,
     "reminders_list_show": _REMINDERS_LIST_SHOW,
     "reminders_list_empty": _REMINDERS_LIST_EMPTY,
+    # checklists (show_checklist)
+    "checklist_show": _CHECKLIST_SHOW,
+    "checklist_empty": _CHECKLIST_EMPTY,
     # recipes
     "recipe_show": _RECIPE_SHOW,
     "recipe_not_found_ask_alt": _RECIPE_NOT_FOUND_ASK_ALT,

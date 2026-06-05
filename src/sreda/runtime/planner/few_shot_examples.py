@@ -539,6 +539,163 @@ _EXAMPLES: list[FewShotExample] = [
             },
         },
     ),
+    # ──────────────────────────────────────────────────────────────────
+    # 12. web_search → humanize_result (Family A + C fix)
+    # statuses: results | empty | error
+    # web_search puts content in ``raw_text`` (NOT a ``results`` field). The
+    # success branch hands that text to the ``humanize_result`` LLM composer.
+    # template_data MUST be EXACTLY {intent, actions[{user_visible_summary,
+    # status}]} — no other top-level/action key (the contract rejects them).
+    # empty/error fall back to the safe canned generic_tool_error.
+    # ──────────────────────────────────────────────────────────────────
+    FewShotExample(
+        user_message="найди телефон ветклиники на Ленина",
+        context_brief="",
+        plan={
+            "schema_version": 1,
+            "turn_classification": {
+                "is_new_turn": True,
+                "reason": "запрос свежей инфы из интернета — web_search",
+            },
+            "clarity": "clear",
+            "actions": {
+                "s1": {
+                    "tool": "web_search",
+                    "args": {"query": "телефон ветклиника Ленина"},
+                    "expected_outcomes": [
+                        {
+                            "match": {"status": "results"},
+                            "next": None,
+                            "compose": {
+                                "kind": "llm",
+                                "llm_prompt_key": "humanize_result",
+                                "template_data": {
+                                    "intent": "найти телефон ветклиники",
+                                    "actions": [
+                                        {
+                                            "user_visible_summary": "${s1.raw_text}",
+                                            "status": "${s1.status}",
+                                        }
+                                    ],
+                                },
+                            },
+                        },
+                        {
+                            "match": {"status": "empty"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "generic_tool_error",
+                                "template_data": {},
+                            },
+                        },
+                        {
+                            "match": {"status": "error"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "generic_tool_error",
+                                "template_data": {"error_code": "${s1.error_code}"},
+                            },
+                        },
+                    ],
+                    "intent_group": "default",
+                    "depends_on": [],
+                },
+            },
+            "compose": {
+                "kind": "llm",
+                "llm_prompt_key": "humanize_result",
+                "template_data": {
+                    "intent": "найти телефон ветклиники",
+                    "actions": [
+                        {
+                            "user_visible_summary": "${s1.raw_text}",
+                            "status": "${s1.status}",
+                        }
+                    ],
+                },
+            },
+        },
+    ),
+    # ──────────────────────────────────────────────────────────────────
+    # 13. show_checklist → checklist_show / checklist_empty (Family B fix)
+    # statuses: ok | empty | error
+    # show_checklist returns ShowChecklistOk{title, items[{title,
+    # item_status}]} / ShowChecklistEmpty{title}. The ``ok`` branch renders
+    # the structured items via checklist_show; ``empty`` uses checklist_empty.
+    # Field names ``title`` / ``items`` / ``item_status`` match the
+    # output_model; a done item gets a ✅.
+    #
+    # show_checklist is a READ tool — the compose MUST reference the REAL
+    # tool output (``${s1.title}`` / ``${s1.items}``), NOT literal list
+    # contents. Hardcoding sample items here would teach the planner to
+    # invent/fabricate checklist contents at plan time (a valid-but-wrong
+    # regression). Mirrors the web_search example, which passes its output
+    # through ``${s1.raw_text}``. ``${s1.items}`` is a full-ref string →
+    # ``resolve_refs`` preserves the list type, so the template iterates the
+    # REAL items at run time.
+    # ──────────────────────────────────────────────────────────────────
+    FewShotExample(
+        user_message="покажи список дача",
+        context_brief="",
+        plan={
+            "schema_version": 1,
+            "turn_classification": {
+                "is_new_turn": True,
+                "reason": "показать пункты конкретного чек-листа",
+            },
+            "clarity": "clear",
+            "actions": {
+                "s1": {
+                    "tool": "show_checklist",
+                    "args": {"list_id_or_title": "дача"},
+                    "expected_outcomes": [
+                        {
+                            "match": {"status": "ok"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "checklist_show",
+                                "template_data": {
+                                    "title": "${s1.title}",
+                                    "items": "${s1.items}",
+                                },
+                            },
+                        },
+                        {
+                            "match": {"status": "empty"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "checklist_empty",
+                                "template_data": {"title": "${s1.title}"},
+                            },
+                        },
+                        {
+                            "match": {"status": "error"},
+                            "next": None,
+                            "compose": {
+                                "kind": "template",
+                                "template_id": "generic_tool_error",
+                                "template_data": {"error_code": "${s1.error_code}"},
+                            },
+                        },
+                    ],
+                    "intent_group": "default",
+                    "depends_on": [],
+                },
+            },
+            "compose": {
+                "kind": "template",
+                "template_id": "checklist_show",
+                "template_data": {
+                    "title": "${s1.title}",
+                    "items": "${s1.items}",
+                },
+            },
+        },
+    ),
 ]
 
 

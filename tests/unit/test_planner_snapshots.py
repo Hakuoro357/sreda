@@ -138,7 +138,9 @@ def _make_ctx(user_message: str) -> PlannerContext:
         # few-shot examples (greeting → reply_only + kind='llm' + smalltalk)
         # pass the validator. The snapshot corpus mirrors what the planner
         # sees in the real cached prefix — must match the harness allowlist.
-        composer_llm_prompt_keys=("smalltalk",),
+        # #87 (2026-06-05): also enable "humanize_result" — the new web_search
+        # few-shot example composes search results via that LLM key.
+        composer_llm_prompt_keys=("smalltalk", "humanize_result"),
         composer_registry_snapshot_hash=COMPOSER_REGISTRY.snapshot_hash(),
         tool_registry_version="snap-v1",
         few_shot_block="",

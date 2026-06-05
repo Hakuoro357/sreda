@@ -644,16 +644,50 @@ def test_every_few_shot_plan_passes_validator_against_real_registry() -> None:
             )
 
 
+# Leaf names that, when referenced as a full-ref string (e.g. "${s1.items}"),
+# resolve at run time to a LIST of objects — not a scalar string. The render
+# test stubs each such ref to a small sample list so the template's
+# ``{% for it in items %}`` loop iterates objects (not the characters of a
+# placeholder string) and per-item attribute access (``it.title`` /
+# ``it.item_status``) succeeds under StrictUndefined.
+#
+# ``resolve_refs`` (runtime) already preserves full-ref list values, so
+# production iterates the REAL tool output; this map only feeds the stub.
+_LIST_REF_LEAF_SAMPLES: dict[str, list[dict]] = {
+    "items": [
+        {"title": "купить рассаду", "item_status": "pending"},
+        {"title": "починить забор", "item_status": "done"},
+    ],
+}
+
+
 def _stub_refs(template_data: dict) -> dict:
     """Stub remaining ${...} refs with placeholder values. Refs in
     Phase B examples mean "executor resolves at run time" — for the
     render test we just need ANY value of the right shape so Jinja
-    doesn't see undefined."""
-    from sreda.runtime.planner.interpolation import contains_ref
+    doesn't see undefined.
+
+    A full-ref string whose leaf name is a known LIST ref (e.g.
+    ``"${s1.items}"``) is stubbed to a small sample list of objects
+    (see ``_LIST_REF_LEAF_SAMPLES``) rather than a flat placeholder
+    string — otherwise a ``{% for it in items %}`` loop would iterate
+    the characters of the placeholder and per-item attribute access
+    (``it.item_status``) would raise StrictUndefined."""
+    from sreda.runtime.planner.interpolation import (
+        contains_ref,
+        is_full_ref_string,
+    )
 
     out = dict(template_data)
     for k, v in list(out.items()):
         if isinstance(v, str) and contains_ref(v):
+            # Full-ref string to a known list leaf → resolve to a sample
+            # list of objects so loop/attribute access renders.
+            if is_full_ref_string(v):
+                leaf = v.strip("${}").rsplit(".", 1)[-1]
+                if leaf in _LIST_REF_LEAF_SAMPLES:
+                    out[k] = [dict(item) for item in _LIST_REF_LEAF_SAMPLES[leaf]]
+                    continue
             out[k] = f"<resolved:{k}>"
         elif isinstance(v, list):
             out[k] = [

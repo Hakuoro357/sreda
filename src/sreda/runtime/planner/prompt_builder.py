@@ -76,8 +76,14 @@ class PromptBudget:
     # few-shot examples 14.5k + template). 66k chars ≈ 22k tokens — still well
     # within mimo-v2.5-pro's ~32k window, leaving room for the response. The
     # cap remains a guard against accidental registry/example doubling.
-    max_total_chars: int = 76_000
-    max_prefix_chars: int = 66_000
+    # Bumped 2026-06-05 (#87 replay fixes): added web_search + show_checklist
+    # few-shot examples (+~4k) to fix planner emitting invalid compose refs/
+    # templates on search & "show list" intents. Prefix was already ~98% full
+    # (64.5k/66k); raised cap to fit. The prefix is CACHED, so the +~1.5k tokens
+    # cost little on cache hits. FOLLOW-UP: compress the per-tool block (deferred
+    # bloat reduction) to claw back headroom — tracked separately.
+    max_total_chars: int = 80_000
+    max_prefix_chars: int = 70_000
     max_suffix_chars: int = 10_000
     max_user_message_chars: int = 4_096      # Telegram message cap
     max_history_chars: int = 4_500

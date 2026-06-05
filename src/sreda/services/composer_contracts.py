@@ -254,6 +254,11 @@ _COMPOSER_CONTRACTS: dict[str, ComposerContract | object] = {
     "reminder_skipped_past": NO_CONTRACT,
     "reminders_list_show": NO_CONTRACT,
     "reminders_list_empty": NO_CONTRACT,
+    # checklists: title + literal item lines (title / item_status from the
+    # show_checklist output_model); no leak/crash surface beyond schema +
+    # StrictUndefined.
+    "checklist_show": NO_CONTRACT,
+    "checklist_empty": NO_CONTRACT,
     # recipes: passthrough text / query echo.
     "recipe_show": NO_CONTRACT,
     "recipe_not_found_ask_alt": NO_CONTRACT,
