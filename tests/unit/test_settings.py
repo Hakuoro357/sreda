@@ -131,12 +131,11 @@ def test_planner_alerts_enabled_via_env(monkeypatch) -> None:
 
 
 def test_composer_provider_default() -> None:
-    """Composer LLM-path writes free text — a lighter model is fine.
-    After the 2026-05-29 rename the default is the plain 'mimo-v2.5'
-    (provider key == model; not the pro tier, not the unavailable
-    mimo-flash)."""
+    """Composer LLM-path default. Boris decision 2026-06-06: run the composer
+    on the pro tier ('mimo-v2.5-pro') for higher reply quality (previously the
+    lighter plain 'mimo-v2.5' was used for ~2x speed). Provider key == model."""
     settings = Settings()
-    assert settings.composer_provider == "mimo-v2.5"
+    assert settings.composer_provider == "mimo-v2.5-pro"
 
 
 def test_composer_provider_override_via_env_alias(monkeypatch) -> None:

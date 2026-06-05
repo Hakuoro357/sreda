@@ -442,7 +442,7 @@ class Settings(BaseSettings):
         ),
     )
     composer_provider: str = Field(
-        default="mimo-v2.5",
+        default="mimo-v2.5-pro",
         validation_alias=AliasChoices(
             "SREDA_COMPOSER_PROVIDER",
             "sreda_composer_provider",
@@ -450,12 +450,14 @@ class Settings(BaseSettings):
         description=(
             "LLM provider for the composer LLM-path (ComposerCall.kind='llm'). "
             "Composer writes free-text replies from a finished execution_log "
-            "— no tool selection, no multi-step reasoning — so a lighter "
-            "model is fine. Default 'mimo-v2.5' = the plain mimo-v2.5 model "
-            "(~2x faster than the planner's 'mimo-v2.5-pro'). Provider key == "
-            "model name after the 2026-05-29 rename. mimo-flash is NOT on our "
-            "subscription tier. Later: benchmark gemini / gemma. Template-path "
-            "composer calls don't touch any LLM at all."
+            "— no tool selection, no multi-step reasoning. Default "
+            "'mimo-v2.5-pro' (Boris decision 2026-06-06: run the composer on the "
+            "pro tier for higher reply quality; previously the lighter plain "
+            "'mimo-v2.5' was used for ~2x speed). Provider key == model name "
+            "after the 2026-05-29 rename. mimo-flash is NOT on our subscription "
+            "tier. Template-path composer calls don't touch any LLM at all. "
+            "NOTE: pro is ~2x slower than plain mimo-v2.5 — watch "
+            "composer_timeout_sec (still 30s)."
         ),
     )
     composer_timeout_sec: float = Field(
