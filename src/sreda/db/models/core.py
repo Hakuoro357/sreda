@@ -89,6 +89,18 @@ class User(Base):
     max_chat_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True,
     )
+    # bot_key последнего inbound'а от этого юзера (#109, migration 0054).
+    # Захватывается в `ensure_telegram_user_bundle` на каждом TG inbound.
+    # Async producers (reminder / proactive / onboarding workers) читают
+    # это поле через `resolve_outbox_routings`, чтобы доставлять нотификации
+    # на ТЕКУЩИЙ бот юзера, а не на тот, где напоминание было создано.
+    # Нужно для миграции с `sreda01_bot` (key `sreda`) на новый
+    # `sreda_home_bot` (key `sreda_home`): без этого pending reminders
+    # уходили на старый бот и терялись. NULL = legacy/non-migrated → producers
+    # используют свои существующие fallback'и (back-compat).
+    last_bot_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
 
 
 class Assistant(Base):

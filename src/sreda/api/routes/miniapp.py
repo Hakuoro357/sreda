@@ -44,6 +44,7 @@ from sreda.services.max_auth import (
     validate_max_init_data,
 )
 from sreda.services.onboarding import (
+    _stamp_last_bot_key,
     ensure_max_user_bundle,
     ensure_telegram_user_bundle_by_id,
 )
@@ -197,6 +198,20 @@ def _require_miniapp_auth(
             user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
+            # #109 (Codex MAJOR): existing TG-юзер открыл Mini App, но
+            # /start не слал — здесь НЕ вызывается
+            # ensure_telegram_user_bundle_by_id, поэтому _stamp_last_bot_key
+            # не сработал бы. Мигрировавший юзер, который пользуется только
+            # Mini App'ом @sreda_home_bot, остался бы со stale/NULL
+            # last_bot_key → async-уведомления mis-route. Штампуем текущий
+            # (Telegram) bot_key напрямую: helper идемпотентен (no-op +
+            # без commit'а если значение не изменилось), пропускает пустой
+            # bot_key. resolved_bot_key в TG-ветке всегда зарегистрированный
+            # TG bot_key.
+            from sreda.db.models.core import User as _User
+            _user_row = session.get(_User, user_id)
+            if _user_row is not None:
+                _stamp_last_bot_key(session, _user_row, resolved_bot_key)
 
     else:  # channel == "max"
         if not settings.max_bot_token:
