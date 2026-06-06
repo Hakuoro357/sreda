@@ -33,6 +33,7 @@ from sreda.runtime.planner.prompt_builder import (
     TurnMessage,
     TurnSnapshot,
     VoiceMeta,
+    _render_output_fields,
     build_cached_prefix,
     build_prompt,
     build_variable_suffix,
@@ -43,6 +44,7 @@ from sreda.runtime.planner.prompt_builder import (
     render_tool_registry_block,
     render_tool_spec_for_prompt,
 )
+from sreda.runtime.planner.validator import output_field_names
 from sreda.services.composer.registry import REGISTRY
 from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
 
@@ -183,6 +185,83 @@ def test_render_tool_spec_includes_name_and_args() -> None:
     assert sample.name in out
     assert "args:" in out
     assert f"family={sample.family}" in out
+
+
+# ---------------------------------------------------------------------------
+# Output-field line (issue #108 — stop the planner guessing ${sN.field})
+# ---------------------------------------------------------------------------
+
+
+def _spec(name: str):
+    return next(s for s in MIGRATED_TOOL_SPECS if s.name == name)
+
+
+def test_render_tool_spec_includes_output_line() -> None:
+    """Every tool block carries an ``output:`` line so the planner knows
+    the legal ``${sN.field}`` names (issue #108)."""
+    out = render_tool_spec_for_prompt(_spec("web_search"))
+    assert "output:" in out
+    # Ordering: the output line comes right after the outcomes line.
+    lines = out.splitlines()
+    out_idx = next(i for i, ln in enumerate(lines) if ln.startswith("output:"))
+    outcomes_idx = next(
+        i for i, ln in enumerate(lines) if ln.startswith("outcomes:")
+    )
+    assert out_idx == outcomes_idx + 1, (
+        "output: line must immediately follow outcomes: line"
+    )
+
+
+def test_output_line_is_alphabetically_sorted() -> None:
+    """Fields are sorted for cache-prefix stability."""
+    line = _render_output_fields(_spec("list_reminders"))
+    fields = line[len("output: "):].split(" | ")
+    assert fields == sorted(fields), f"output fields not sorted: {fields}"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["web_search", "recall_memory", "list_reminders"],
+)
+def test_output_line_matches_validator_accepted_fields(tool_name: str) -> None:
+    """PARITY GUARD (issue #108): the prompt's listed output fields must
+    EQUAL the validator's accepted top-level field set for a compose ref
+    — never a superset that mis-teaches, never a subset that under-teaches.
+
+    Both come from ``validator.output_field_names`` (the union of
+    ``model_fields`` across all status variants), so parity is by
+    construction; this test pins it against accidental divergence."""
+    spec = _spec(tool_name)
+    line = _render_output_fields(spec)
+    listed = set(line[len("output: "):].split(" | "))
+    accepted = output_field_names(spec.output_model)
+    assert listed == accepted, (
+        f"{tool_name}: prompt-listed {sorted(listed)} != "
+        f"validator-accepted {sorted(accepted)}"
+    )
+
+
+def test_web_search_output_fields_are_real_not_guessed() -> None:
+    """web_search real output is ``raw_text`` (+ status / error fields),
+    NOT ``results`` — the field name the planner used to guess."""
+    fields = output_field_names(_spec("web_search").output_model)
+    assert "raw_text" in fields
+    assert "status" in fields
+    assert "results" not in fields
+
+
+def test_recall_memory_output_fields_do_not_include_guessed_names() -> None:
+    """The #87 replay bug: planner emitted ``${s1.raw_text}`` / ``${s1.items}``
+    for recall_memory, but its real list field is ``hits``."""
+    fields = output_field_names(_spec("recall_memory").output_model)
+    assert "hits" in fields
+    assert "raw_text" not in fields
+    assert "items" not in fields
+
+
+def test_list_reminders_output_fields_are_real() -> None:
+    fields = output_field_names(_spec("list_reminders").output_model)
+    assert {"items", "raw_text", "status"} <= fields
 
 
 # ---------------------------------------------------------------------------

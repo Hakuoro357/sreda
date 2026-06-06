@@ -42,6 +42,7 @@ from typing import Iterable
 
 from jinja2 import Environment, StrictUndefined
 
+from sreda.runtime.planner.validator import output_field_names
 from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
 from sreda.services.tool_schemas.base import ToolSpec
 
@@ -82,8 +83,15 @@ class PromptBudget:
     # (64.5k/66k); raised cap to fit. The prefix is CACHED, so the +~1.5k tokens
     # cost little on cache hits. FOLLOW-UP: compress the per-tool block (deferred
     # bloat reduction) to claw back headroom — tracked separately.
+    # Bumped 2026-06-06 (#108): render_tool_spec_for_prompt now lists each tool's
+    # output_model field names (`output: ...`) so the planner stops GUESSING
+    # ${sN.field} refs (root fix for the compose_ref_unknown_field class — it had
+    # migrated to recall_memory/list_reminders after the per-tool few-shot patch).
+    # +~3.2k chars → prefix ~71.1k; raised cap 70k→73k (Boris approved). Cached
+    # prefix ⟹ cheap on hits. The per-tool compression follow-up is still the
+    # right long-term lever to claw this back.
     max_total_chars: int = 80_000
-    max_prefix_chars: int = 70_000
+    max_prefix_chars: int = 73_000
     max_suffix_chars: int = 10_000
     max_user_message_chars: int = 4_096      # Telegram message cap
     max_history_chars: int = 4_500
@@ -187,6 +195,30 @@ def _render_tool_args_hint(spec: ToolSpec) -> str:
         return f"<{spec.input_model.__name__}>"
 
 
+def _render_output_fields(spec: ToolSpec) -> str:
+    """Render the tool's referenceable OUTPUT field names as a compact
+    line: ``output: <f1> | <f2> | ...``.
+
+    Issue #108 root fix: without this the planner GUESSES output field
+    names per tool and emits invalid compose refs ``${sN.field}`` →
+    ``compose_ref_unknown_field`` (seen on ``recall_memory`` 14× /
+    ``list_reminders`` in the #87 replay). Listing the real field names
+    teaches the planner exactly which ``${sN.field}`` paths are legal.
+
+    Field NAMES only — no types/descriptions (keeps the cached prefix
+    small). Sorted alphabetically for cache-prefix stability. The set is
+    the validator's own ``output_field_names`` (union of top-level
+    ``model_fields`` across all status variants), so the prompt equals
+    the validator-accepted set — never a superset that mis-teaches.
+
+    Empty/opaque output_model → returns ``""`` and the caller omits the
+    line."""
+    names = output_field_names(spec.output_model)
+    if not names:
+        return ""
+    return "output: " + " | ".join(sorted(names))
+
+
 def render_tool_spec_for_prompt(spec: ToolSpec) -> str:
     """Render one ToolSpec as compact planner-readable block.
 
@@ -196,6 +228,7 @@ def render_tool_spec_for_prompt(spec: ToolSpec) -> str:
     <description>
     args: <hint>
     outcomes: <status> | <status>
+    output: <f1> | <f2> | ...
     mutex: <line1>; <line2>
     ```
     """
@@ -207,6 +240,9 @@ def render_tool_spec_for_prompt(spec: ToolSpec) -> str:
     outcomes = _render_outcome_examples(spec)
     if outcomes:
         lines.append(f"outcomes: {outcomes}")
+    output_fields = _render_output_fields(spec)
+    if output_fields:
+        lines.append(output_fields)
     if spec.mutex_notes:
         lines.append("mutex: " + "; ".join(spec.mutex_notes))
     return "\n".join(lines)

@@ -1468,6 +1468,40 @@ def _output_union_members(output_model: Any) -> tuple[type, ...]:
         return ()
 
 
+def output_field_names(output_model: Any) -> set[str]:
+    """Top-level field names the validator accepts for a ``${sN.field}``
+    compose-ref against this ``output_model``.
+
+    This is the UNION of declared ``model_fields`` across every status
+    variant of the discriminated union (see ``_output_union_members``).
+    It mirrors EXACTLY what the compose-ref check accepts: the first ref
+    segment is validated by ``_member_path_status`` via
+    ``first in model.model_fields`` (line ~1646), and a ref is accepted
+    if ANY union member declares the field. So the referenceable
+    top-level set is precisely this union of ``model_fields`` keys.
+
+    Used by BOTH the planner prompt (``prompt_builder`` lists these so
+    the LLM stops guessing field names like ``raw_text`` for
+    ``recall_memory``) and by ``_maybe_check_field_path`` to enumerate
+    the «Available top-level fields» in the violation message — single
+    source so prompt ⊇/= validator-accepted set, never a superset that
+    mis-teaches.
+
+    Dunder/private names are NOT included: the ref check defers on
+    ``first.startswith("_")`` (always-pass escape, not a declared
+    field), and advertising them would mis-teach the planner.
+
+    Returns an empty set for opaque shapes (no introspectable members) —
+    callers omit the line / fall back to «(none)»."""
+    names: set[str] = set()
+    for member in _output_union_members(output_model):
+        try:
+            names.update(member.model_fields.keys())
+        except Exception:  # noqa: BLE001 — opaque/stub member, skip
+            continue
+    return names
+
+
 def _filter_members_by_status(
     members: tuple[type, ...], status_value: str | None,
 ) -> tuple[type, ...]:
@@ -1858,16 +1892,25 @@ def _maybe_check_field_path(
         target_spec.output_model, segments, narrow_to_status=narrow_to_status,
     )
     if result is False:
-        members = _output_union_members(target_spec.output_model)
+        # Collect available top-level fields across the relevant union
+        # members. For the union-wide case this is exactly
+        # ``output_field_names`` (the same set the planner prompt
+        # advertises — single source guarantees parity). For the
+        # status-narrowed branch-compose case we restrict to the
+        # matching member(s) first.
         if narrow_to_status is not None:
-            members = _filter_members_by_status(members, narrow_to_status)
-        # Collect available top-level fields across the relevant union members
-        available: set[str] = set()
-        for m in members:
-            try:
-                available.update(m.model_fields.keys())
-            except Exception:  # noqa: BLE001
-                continue
+            members = _filter_members_by_status(
+                _output_union_members(target_spec.output_model),
+                narrow_to_status,
+            )
+            available = set()
+            for m in members:
+                try:
+                    available.update(m.model_fields.keys())
+                except Exception:  # noqa: BLE001
+                    continue
+        else:
+            available = output_field_names(target_spec.output_model)
         status_note = (
             f" (narrowed to status={narrow_to_status!r})"
             if narrow_to_status is not None
@@ -2343,6 +2386,7 @@ def validate_plan_or_raise(
 __all__ = [
     "InvalidPlanError",
     "Violation",
+    "output_field_names",
     "render_violations",
     "validate_action_args",
     "validate_plan",
