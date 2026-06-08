@@ -295,6 +295,30 @@ def test_list_of_dicts_coerced_as_json_not_python_repr() -> None:
     assert rendered == '{"a":1}\n{"b":2}'  # recursive JSON coercion, not str(dict) repr
 
 
+def test_real_registry_annotations_populate_map() -> None:
+    # Phase 2b regression guard: the live ToolSpec registry's __display_field__
+    # annotations must resolve to the expected narration fields.
+    from sreda.services.tool_schemas.specs import ALL_TOOL_SPECS
+
+    m = build_display_field_map(ALL_TOOL_SPECS)
+    # Only free-text content fields (no embedded ids) are safe to project directly.
+    assert m[("get_recipe", "found")] == "raw_text"
+    assert m[("get_weather", "forecast")] == "raw_text"
+    assert m[("fetch_url", "fetched")] == "text"
+    # List/structured outputs carry internal ids (raw_text has `[sh_..]`/`menu_..`;
+    # rows have task_id/member_id/...) → NOT annotated; deny-by-default until a
+    # sanitized per-tool override lands (Phase 2b code-review MAJOR, both Codex).
+    for unsafe in [
+        ("list_shopping", "ok"), ("list_reminders", "ok"), ("list_menu", "ok"),
+        ("search_recipes", "ok"), ("list_tasks", "ok"), ("list_family_members", "ok"),
+        ("list_checklists", "ok"), ("show_checklist", "ok"),
+    ]:
+        assert unsafe not in m, f"{unsafe} leaks ids — must stay deny-by-default"
+    # error/empty/confirmation also stay unmapped → deny-by-default
+    assert ("list_shopping", "error") not in m
+    assert ("add_task", "created") not in m
+
+
 @pytest.mark.parametrize(
     ("exec_status", "expected"),
     [

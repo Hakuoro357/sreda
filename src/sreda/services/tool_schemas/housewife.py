@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, ClassVar, Literal, Union
 
 from pydantic import (
     BaseModel,
@@ -626,6 +626,7 @@ def parse_list_reminders(
 
 class GetRecipeFound(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "raw_text"  # #110 narration field
     status: Literal["found"] = "found"
     raw_text: str
     """Recipe body is free-form multi-line — the planner gets it verbatim
@@ -3777,6 +3778,7 @@ def parse_reply_with_buttons(
 
 class WeatherToolOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "raw_text"  # #110 narration field
     status: Literal["forecast"] = "forecast"
     raw_text: str = Field(min_length=1, max_length=10_000)
 
@@ -3871,6 +3873,7 @@ class FetchUrlToolOk(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "text"  # #110 narration field
     status: Literal["fetched"] = "fetched"
     url: str = Field(min_length=1, max_length=2000)
     """URL the user/planner requested (echoed back)."""
