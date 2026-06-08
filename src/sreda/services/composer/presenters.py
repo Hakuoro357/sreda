@@ -185,6 +185,61 @@ def _display_field_map() -> dict[tuple[str, str], str]:
 
 
 # ---------------------------------------------------------------------------
+# valid-status allowlist — every declared Literal `status` per tool output model
+# ---------------------------------------------------------------------------
+# Sanitizes the OUTGOING action status the composer puts in the LLM payload:
+# only a schema-declared status value is forwarded; anything else (id-like,
+# oversized, malformed) is downgraded by the caller. VALUE-based, not shape-based
+# — `member_id_755682022` is alnum/underscore yet NOT a declared status → rejected.
+
+
+def build_valid_status_map(specs: Iterable[Any]) -> dict[str, frozenset[str]]:
+    """Introspect ToolSpecs → ``tool_name -> frozenset(declared status literals)``."""
+    mapping: dict[str, frozenset[str]] = {}
+    for spec in specs:
+        name = getattr(spec, "name", None)
+        output_model = getattr(spec, "output_model", None)
+        if not isinstance(name, str) or output_model is None:
+            continue
+        statuses: set[str] = set()
+        for variant in _union_members(output_model):
+            statuses.update(_status_literals(variant))
+        if statuses:
+            mapping[name] = frozenset(statuses)
+    return mapping
+
+
+_VALID_STATUS_MAP: dict[str, frozenset[str]] | None = None
+
+
+def set_valid_status_map(mapping: dict[str, frozenset[str]]) -> None:
+    """Install the tool → valid-status-set map (app startup or tests)."""
+    global _VALID_STATUS_MAP
+    _VALID_STATUS_MAP = dict(mapping)
+
+
+def _valid_status_map() -> dict[str, frozenset[str]]:
+    global _VALID_STATUS_MAP
+    if _VALID_STATUS_MAP is None:
+        try:
+            from sreda.services.tool_schemas.specs import ALL_TOOL_SPECS  # lazy
+
+            _VALID_STATUS_MAP = build_valid_status_map(ALL_TOOL_SPECS)
+        except Exception:  # noqa: BLE001 — never let registry import break composing
+            logger.exception("presenter: failed to build valid-status map from registry")
+            _VALID_STATUS_MAP = {}
+    return _VALID_STATUS_MAP
+
+
+def is_known_domain_status(tool_name: str, status: str) -> bool:
+    """True iff ``status`` is a declared Literal status of ``tool_name``'s output
+    model — a schema-defined enum value safe to forward to the LLM, never an
+    internal id. Tools/statuses absent from the registry → False (caller
+    downgrades to a safe sentinel)."""
+    return status in _valid_status_map().get(tool_name, frozenset())
+
+
+# ---------------------------------------------------------------------------
 # override registry — tools whose narration is more than one literal field
 # ---------------------------------------------------------------------------
 

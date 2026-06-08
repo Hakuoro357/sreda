@@ -80,8 +80,13 @@ from typing import Any, Callable, Literal, Protocol
 from jinja2 import TemplateError
 
 from sreda.runtime.planner.executor import ExecutionLog
-from sreda.runtime.planner.interpolation import resolve_refs
+from sreda.runtime.planner.interpolation import contains_ref, resolve_refs
 from sreda.runtime.planner.schemas import ComposerCall
+from sreda.services.composer.presenters import (
+    is_known_domain_status,
+    render_display_text,
+    render_execution_failure,
+)
 from sreda.services.composer.prompts_registry import (
     LLM_PROMPT_REGISTRY,
     LLMPromptRegistry,
@@ -91,6 +96,7 @@ from sreda.services.composer.registry import (
     ComposerRegistry,
     UnknownTemplateError,
 )
+from sreda.services.composer_contracts import _HUMANIZE_RESULT_ALLOWED_TOP_KEYS
 
 # Per-type fallback template for conversational LLM failures.
 # When kind='llm' fails on a reply_only+smalltalk turn, fall through to a
@@ -98,6 +104,41 @@ from sreda.services.composer.registry import (
 # rot-enablement issue #88). Identity is already deterministic (template path).
 _SMALLTALK_PROMPT_KEY = "smalltalk"
 _SMALLTALK_LLM_FALLBACK_TEMPLATE = "smalltalk_fallback"
+
+# ---------------------------------------------------------------------------
+# #110 Phase 3 — humanize_result Layer-2 normalizer (conservative interceptor)
+# ---------------------------------------------------------------------------
+# The planner references a STEP (``actions:[{step_id}]``) for narration instead
+# of hand-picking ``${sN.field}``; the user-visible summary is built in code by
+# the presenter (safe-field projection). This wires the presenter into the LLM
+# compose boundary (fixes #110 R2 CRITICAL) for the new form, while EVERY other
+# (current) form stays on the unchanged resolve_refs path → zero regression.
+_HUMANIZE_RESULT_KEY = "humanize_result"
+
+# Appended once when ≥1 referenced step was omitted due to a real failure
+# (halted / upstream-unavailable / honest_partial group failed) while other
+# steps DID narrate. Branch-not-selected omits add nothing (not an error).
+_HUMANIZE_PARTIAL_DISCLAIMER = "Часть действий выполнить не удалось."
+
+# Observability for the normalizer (parallel to PRESENTER_FALLBACK_COUNTS).
+# ``silent_omit_rate`` is 0 by construction: every omit is counted here.
+HUMANIZE_NORMALIZER_METRICS: dict[str, int] = {}
+
+
+def _bump_normalizer_metric(event: str) -> None:
+    HUMANIZE_NORMALIZER_METRICS[event] = HUMANIZE_NORMALIZER_METRICS.get(event, 0) + 1
+
+
+def _safe_public_status(tool: str, domain_status: str) -> str:
+    """Sanitize the status placed in the LLM payload — kept SEPARATE from the real
+    domain status used for the presenter lookup. VALUE-based allowlist: only a
+    schema-declared status for this tool is forwarded; anything else (id-like,
+    oversized, malformed) → ``unknown`` + metric. (Codex Phase 3 R2 MAJOR, A/B — a
+    shape regex still leaked alnum/underscore ids like ``member_id_755682022``.)"""
+    if is_known_domain_status(tool, domain_status):
+        return domain_status
+    _bump_normalizer_metric("status_sanitized")
+    return "unknown"
 
 
 logger = logging.getLogger(__name__)
@@ -405,6 +446,45 @@ def compose(
                     effective_llm_prompt_key=effective_call.llm_prompt_key,
                 )
 
+        # #110 Phase 3 — humanize_result Layer-2 normalizer. Runs HERE, before
+        # ref resolution + the strict LLM-contract validation, so the new
+        # ``actions:[{step_id}]`` narration form is turned into safe
+        # presenter-built text and the LLM composer never receives raw
+        # ``${sN.field}`` tool output. Any other (current) form → fall-through
+        # to the unchanged resolve_refs path below (no regression).
+        if effective_call.llm_prompt_key == _HUMANIZE_RESULT_KEY:
+            norm_outcome, norm_data = _normalize_humanize_result(
+                effective_call.template_data, execution_log,
+            )
+            if norm_outcome == "short_circuit":
+                logger.info(
+                    "composer: humanize_result short-circuit — all referenced "
+                    "steps omitted; deterministic degraded reply, LLM composer "
+                    "NOT invoked (avoid hallucination on empty context)."
+                )
+                return _result_generic_error(
+                    registry,
+                    error_code="humanize_all_actions_omitted",
+                    effective_llm_prompt_key=effective_call.llm_prompt_key,
+                )
+            if norm_outcome == "normalized":
+                # Normalized actions are literal strings + a literal intent →
+                # resolve_refs is a no-op (and would risk mangling presenter
+                # text that may legitimately contain "${...}", e.g. fetched web
+                # content), so skip it and dispatch the SAFE per-action
+                # summaries straight to the LLM composer.
+                return _render_llm_result(
+                    llm_composer,
+                    registry=registry,
+                    llm_prompt_key=effective_call.llm_prompt_key,
+                    data=norm_data,
+                    execution_log=execution_log,
+                    ctx=ctx,
+                    ctx_provided=ctx_provided,
+                    conversational_fallback_template=None,
+                )
+            # norm_outcome == "fall_through" → continue to the normal path below.
+
     # 4. Build step_outputs view for ref resolution
     step_outputs = _step_outputs_for_refs(execution_log)
 
@@ -542,6 +622,155 @@ def _step_outputs_for_refs(execution_log: ExecutionLog) -> dict[str, Any]:
         for step in execution_log.steps
         if step.status == "ok" and step.parsed_output is not None
     }
+
+
+def _is_step_id_action(item: Any) -> bool:
+    """True iff ``item`` is the new narration form ``{"step_id": "s1"}`` — a
+    dict whose ONLY key is ``step_id`` with a non-empty string value.
+
+    Everything else (literal summaries, ``${...}`` full-refs, item-refs, the
+    old ``{user_visible_summary: "${sN.field}"}`` form, mixed dicts) is NOT this
+    form, so the call falls through to the unchanged resolve_refs path. The
+    old full-ref repair is a separate slice (Phase 3b) reachable in prod only
+    after the validator deferral (Phase 4)."""
+    return (
+        isinstance(item, dict)
+        and set(item.keys()) == {"step_id"}
+        and isinstance(item.get("step_id"), str)
+        and bool(item["step_id"].strip())
+    )
+
+
+def _normalize_humanize_result(
+    template_data: Any, execution_log: ExecutionLog,
+) -> tuple[str, dict[str, Any] | None]:
+    """#110 Phase 3 — conservative Layer-2 interceptor for ``humanize_result``.
+
+    Recognizes ONLY the new ``actions:[{step_id}, ...]`` form (EVERY item must
+    be ``{step_id}``). For it, builds the strict internal form
+    ``{intent, actions:[{user_visible_summary, status}]}`` in code via the
+    presenter, branching strictly by ``StepResult.status`` (NOT by presence of
+    ``parsed_output`` — ``unknown_outcome`` carries both a non-ok status AND a
+    ``parsed_output``). Anything else → fall-through, untouched.
+
+    Returns ``(outcome, payload)``:
+      * ``("fall_through", None)`` — not the new form; caller keeps the original
+        ``template_data`` and runs the unchanged resolve_refs → strict path.
+      * ``("normalized", data)`` — strict literal form; caller dispatches it
+        straight to the LLM composer (resolve_refs skipped — see call site).
+      * ``("short_circuit", None)`` — every referenced step was omitted; caller
+        returns a deterministic degraded reply WITHOUT calling the LLM.
+    """
+    if not isinstance(template_data, dict):
+        return ("fall_through", None)
+    # New-form recognition is STRICT (Codex Phase 3 R1/R2, both A/B): top-level
+    # keys EXACTLY {intent, actions} and ``intent`` a non-empty literal string
+    # with NO ``${...}`` ref — full OR embedded (``contains_ref``, not just
+    # whole-string ``_is_full_ref``; R2 MAJOR). A ref / blank / missing / non-str
+    # intent, or any extra top-level key, falls through to the unchanged
+    # resolve_refs + strict-validation path — so we never skip resolve_refs on a
+    # payload whose ``intent`` still needs resolving, nor feed an unresolved ref
+    # to the LLM.
+    if set(template_data.keys()) != _HUMANIZE_RESULT_ALLOWED_TOP_KEYS:
+        return ("fall_through", None)
+    intent = template_data.get("intent")
+    if not isinstance(intent, str) or not intent.strip() or contains_ref(intent):
+        return ("fall_through", None)
+    actions = template_data.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return ("fall_through", None)
+    if not all(_is_step_id_action(item) for item in actions):
+        return ("fall_through", None)
+
+    by_id = execution_log.by_step_id()
+    new_actions: list[dict[str, str]] = []
+    omit_failure_seen = False
+
+    for item in actions:
+        sid = item["step_id"]
+        step = by_id.get(sid)
+        if step is None:
+            # Runtime-missing step (static-missing is a Phase-4 validation
+            # violation). Deny-by-default: a safe phrase, never invented text.
+            new_actions.append({
+                "user_visible_summary": render_execution_failure(sid, "error", None),
+                "status": "fallback",
+            })
+            _bump_normalizer_metric("deny_fallback_missing_step")
+            continue
+
+        status = step.status
+        if status == "ok":
+            # Branch-matched expected domain error/empty arrive as
+            # StepResult.status == "ok" with a domain status ∈ {error, empty,
+            # …}; the presenter narrates them. Domain status read defensively.
+            parsed = step.parsed_output
+            raw_status = parsed.get("status") if isinstance(parsed, dict) else None
+            if isinstance(raw_status, str) and raw_status.strip():
+                domain_status = raw_status  # real value → drives presenter lookup
+                public_status = _safe_public_status(step.tool, domain_status)
+            else:
+                # missing/non-str status → safe sentinel for BOTH the lookup and
+                # the payload (don't run the sentinel through the allowlist).
+                domain_status = "unknown"
+                public_status = "unknown"
+            new_actions.append({
+                "user_visible_summary": render_display_text(
+                    step.tool, parsed, domain_status=domain_status,
+                ),
+                # Outgoing status: schema-declared value only (value-based
+                # allowlist), separate from the lookup status (R2 MAJOR, A/B).
+                "status": public_status,
+            })
+            _bump_normalizer_metric("new_form_ok")
+        elif status == "skipped":
+            reason = step.error_summary or ""
+            if reason == "branch_not_selected":
+                # Not an error — the planner offered a branch that wasn't taken.
+                # EXACT match (R1 MAJOR/MINOR, A/B): a prefixed unknown variant
+                # like "branch_not_selected_after_halt" must NOT be silently
+                # omitted — it falls to the failure-omit default below.
+                _bump_normalizer_metric("omit_branch_not_selected")
+            elif reason.startswith(
+                ("halted_", "upstream_", "honest_partial_group_failed")
+            ):
+                omit_failure_seen = True
+                _bump_normalizer_metric("omit_failure")
+            else:
+                # Unknown skip reason → treat as a failure-omit; never silently
+                # drop a step we can't classify.
+                omit_failure_seen = True
+                _bump_normalizer_metric("omit_skip_unknown_reason")
+            # omit: contribute no narration entry
+        else:
+            # error / timeout / arg_violation / plan_gap / unknown_outcome (+ any
+            # future non-ok/non-skipped status). Public-safe failure phrase EVEN
+            # IF parsed_output is present (unknown_outcome carries it).
+            new_actions.append({
+                "user_visible_summary": render_execution_failure(
+                    step.tool, status, step.error_summary,
+                ),
+                "status": "error",
+            })
+            _bump_normalizer_metric("new_form_failure")
+
+    if not new_actions:
+        # Every referenced step was omitted → nothing to narrate. Short-circuit
+        # to a deterministic degraded reply; NEVER feed empty context to the LLM.
+        _bump_normalizer_metric(
+            "short_circuit_failure" if omit_failure_seen else "short_circuit_neutral"
+        )
+        return ("short_circuit", None)
+
+    if omit_failure_seen:
+        new_actions.append({
+            "user_visible_summary": _HUMANIZE_PARTIAL_DISCLAIMER,
+            "status": "fallback",
+        })
+        _bump_normalizer_metric("partial_disclaimer")
+
+    _bump_normalizer_metric("normalized")
+    return ("normalized", {"intent": intent, "actions": new_actions})
 
 
 def _render_template_result(
