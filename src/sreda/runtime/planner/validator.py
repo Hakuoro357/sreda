@@ -107,6 +107,7 @@ from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
 from sreda.services.composer_contracts import (
     NO_CONTRACT,
     get_composer_contract,
+    is_step_id_narration_form,
     validate_humanize_result_payload,
 )
 from sreda.services.tool_schemas.base import ToolSpec
@@ -2291,6 +2292,26 @@ def _check_composer_allowlist(
                         code=code,
                         message=f"{location}: {error_msg}",
                     )
+                # #110 Phase 4b — new {step_id} narration form: each referenced
+                # step must EXIST in the plan (static target-existence check,
+                # parallel to compose_ref_unknown_target for ${...} refs). Without
+                # it the composer's Layer-2 normalizer only catches a missing step
+                # at runtime (deny-fallback); catching it here turns it into a
+                # normal invalid-plan retry BEFORE any tool executes.
+                if is_step_id_narration_form(template_data):
+                    for item in template_data["actions"]:
+                        sid = item["step_id"]
+                        if sid not in plan.actions:
+                            yield Violation(
+                                step_id=host_step_id,
+                                tool=None,
+                                code="humanize_result_unknown_step",
+                                message=(
+                                    f"{location}: humanize_result references "
+                                    f"unknown step {sid!r}. Available: "
+                                    f"{sorted(plan.actions.keys())}"
+                                ),
+                            )
 
 
 def validate_plan(

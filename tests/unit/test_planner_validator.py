@@ -2055,6 +2055,95 @@ def test_humanize_result_mixed_step_id_form_rejected_phase_b() -> None:
     assert bad, f"Expected nonuniform violation, got: {[v.code for v in violations]}"
 
 
+def test_humanize_result_step_id_unknown_target_rejected_phase_b() -> None:
+    """#110 Phase 4b — a {step_id} referencing a step NOT in the plan is rejected
+    at Phase B (static target-existence), so the planner retries instead of the
+    normalizer hitting a runtime deny-fallback (the valid-target path is covered
+    by test_humanize_result_step_id_form_passes_phase_b, which would fail if this
+    check mis-fired on the real step s1)."""
+    plan = _plan_hr_compose({
+        "intent": "показати",
+        "actions": [{"step_id": "s99"}],  # s99 not in the plan (only s1 exists)
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_unknown_step"]
+    assert bad, f"Expected humanize_result_unknown_step, got: {[v.code for v in violations]}"
+    assert "s99" in bad[0].message
+
+
+def _plan_branch_hr(step_id: str) -> Plan:
+    """Plan whose s1 has a BRANCH humanize_result compose referencing ``step_id``."""
+    return Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="t"),
+        actions={
+            "s1": Action(
+                tool="add_shopping_items",
+                args={"items": ["x"]},
+                expected_outcomes=[
+                    OutcomeBranch(
+                        match={"status": "ok"},
+                        compose=ComposerCall(
+                            kind="llm",
+                            llm_prompt_key="humanize_result",
+                            template_data={
+                                "intent": "готово",
+                                "actions": [{"step_id": step_id}],
+                            },
+                        ),
+                    ),
+                ],
+            ),
+        },
+        compose=ComposerCall(kind="template", template_id="shopping_added_ok"),
+    )
+
+
+def test_humanize_result_step_id_unknown_target_in_branch_compose_phase_b() -> None:
+    """#110 Phase 4b — the step-existence check covers BRANCH composes too (via
+    _iter_all_composes), with host-step attribution (Codex Phase 4b R1 MINOR, A/B)."""
+    violations = validate_plan(
+        _plan_branch_hr("s99"), _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_unknown_step"]
+    assert bad, f"Expected humanize_result_unknown_step, got: {[v.code for v in violations]}"
+    assert "s99" in bad[0].message
+    assert bad[0].step_id == "s1"  # host-step attribution
+
+
+def test_humanize_result_step_id_branch_self_reference_is_valid_phase_b() -> None:
+    """A branch compose referencing its OWN host step ({step_id:"s1"} inside
+    s1.expected_outcomes[].compose) is legitimate (the branch runs after the host
+    output exists) → must NOT raise humanize_result_unknown_step (Codex 4b R1 A/B)."""
+    violations = validate_plan(
+        _plan_branch_hr("s1"), _ALLOWLIST_REGISTRY,
+        composer_template_ids=frozenset({"shopping_added_ok"}),
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    assert not [v for v in violations if v.code == "humanize_result_unknown_step"]
+
+
+def test_humanize_result_mixed_form_does_not_emit_unknown_step_phase_b() -> None:
+    """A mixed payload (new {step_id} + old action) is rejected as nonuniform, NOT
+    as unknown-step — the step-existence check is gated on the PURE new form, so a
+    future refactor can't conflate the two paths (Codex Phase 4b R1 MINOR high)."""
+    plan = _plan_hr_compose({
+        "intent": "показати",
+        "actions": [{"step_id": "s99"}, {"user_visible_summary": "x", "status": "ok"}],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    codes = [v.code for v in violations]
+    assert "humanize_result_nonuniform_step_id_form" in codes
+    assert "humanize_result_unknown_step" not in codes
+
+
 def test_humanize_result_extra_top_key_rejected_phase_b() -> None:
     """Extra top-level key (execution_id) is rejected at Phase B."""
     plan = _plan_hr_compose({
