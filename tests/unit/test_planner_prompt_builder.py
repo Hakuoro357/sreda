@@ -841,6 +841,10 @@ def test_every_few_shot_llm_compose_key_and_required_data_valid() -> None:
         LLM_PROMPT_REGISTRY,
         ComposerInputError,
     )
+    from sreda.services.composer_contracts import (
+        is_step_id_narration_form,
+        validate_humanize_result_payload,
+    )
 
     def _llm_composes(plan: dict) -> list[tuple[str, dict]]:
         out: list[tuple[str, dict]] = []
@@ -862,8 +866,33 @@ def test_every_few_shot_llm_compose_key_and_required_data_valid() -> None:
                 f"few-shot #{i} ({ex.user_message!r}) {label}: "
                 f"llm_prompt_key {key!r} not in registry {sorted(valid_keys)}"
             )
-            # required_keys must be satisfiable by the example's data
-            data = _stub_refs(dict(compose_obj.get("template_data", {})))
+            raw = dict(compose_obj.get("template_data", {}))
+            if key == "humanize_result":
+                # #110 — humanize_result few-shots are PLAN-time artifacts: the
+                # new {step_id} form is normalized in CODE before the runtime
+                # contract ever sees it. Validate against the PLAN-time contract
+                # (allow_refs=True, which accepts {step_id} and defers ${...}),
+                # NOT the runtime validate_data (allow_refs=False, on the
+                # normalized output).
+                errors = validate_humanize_result_payload(raw, allow_refs=True)
+                if errors:
+                    pytest.fail(
+                        f"few-shot #{i} ({ex.user_message!r}) {label}: "
+                        f"humanize_result plan-time contract rejected example: {errors}"
+                    )
+                # #110 Phase 5 — few-shots must TEACH the new {step_id} narration
+                # form, not just any plan-valid shape (the contract still accepts
+                # the old {user_visible_summary,status} form for back-compat). This
+                # guards against a few-shot silently reverting to field-picking —
+                # the exact regression Phase 5 exists to prevent (Codex Phase 5 R1
+                # MINOR, both A/B).
+                assert is_step_id_narration_form(raw), (
+                    f"few-shot #{i} ({ex.user_message!r}) {label}: humanize_result "
+                    f"example must use the new {{step_id}} form, got {raw!r}"
+                )
+                continue
+            # Other LLM keys: required_keys must be satisfiable (runtime contract).
+            data = _stub_refs(raw)
             try:
                 LLM_PROMPT_REGISTRY.validate_data(key, data)
             except ComposerInputError as e:  # noqa: PERF203

@@ -540,12 +540,13 @@ _EXAMPLES: list[FewShotExample] = [
         },
     ),
     # ──────────────────────────────────────────────────────────────────
-    # 12. web_search → humanize_result (Family A + C fix)
+    # 12. web_search → humanize_result (Family A + C fix; #110 new {step_id} form)
     # statuses: results | empty | error
-    # web_search puts content in ``raw_text`` (NOT a ``results`` field). The
-    # success branch hands that text to the ``humanize_result`` LLM composer.
-    # template_data MUST be EXACTLY {intent, actions[{user_visible_summary,
-    # status}]} — no other top-level/action key (the contract rejects them).
+    # The success branch hands the STEP to the humanize_result composer; the
+    # user-visible text is built in CODE by the presenter (#110) — the planner
+    # does NOT write user_visible_summary or pick an output field. template_data
+    # MUST be EXACTLY {intent, actions[{step_id}]} — no other top-level/action
+    # key (the contract rejects them).
     # empty/error fall back to the safe canned generic_tool_error.
     # ──────────────────────────────────────────────────────────────────
     FewShotExample(
@@ -571,12 +572,7 @@ _EXAMPLES: list[FewShotExample] = [
                                 "llm_prompt_key": "humanize_result",
                                 "template_data": {
                                     "intent": "найти телефон ветклиники",
-                                    "actions": [
-                                        {
-                                            "user_visible_summary": "${s1.raw_text}",
-                                            "status": "${s1.status}",
-                                        }
-                                    ],
+                                    "actions": [{"step_id": "s1"}],
                                 },
                             },
                         },
@@ -608,12 +604,7 @@ _EXAMPLES: list[FewShotExample] = [
                 "llm_prompt_key": "humanize_result",
                 "template_data": {
                     "intent": "найти телефон ветклиники",
-                    "actions": [
-                        {
-                            "user_visible_summary": "${s1.raw_text}",
-                            "status": "${s1.status}",
-                        }
-                    ],
+                    "actions": [{"step_id": "s1"}],
                 },
             },
         },
@@ -631,10 +622,11 @@ _EXAMPLES: list[FewShotExample] = [
     # tool output (``${s1.title}`` / ``${s1.items}``), NOT literal list
     # contents. Hardcoding sample items here would teach the planner to
     # invent/fabricate checklist contents at plan time (a valid-but-wrong
-    # regression). Mirrors the web_search example, which passes its output
-    # through ``${s1.raw_text}``. ``${s1.items}`` is a full-ref string →
-    # ``resolve_refs`` preserves the list type, so the template iterates the
-    # REAL items at run time.
+    # regression). This is a TEMPLATE compose: structural ``${sN.field}`` refs are
+    # still the right tool here — ``${s1.items}`` is a full-ref string →
+    # ``resolve_refs`` preserves the list type, so the template iterates the REAL
+    # items at run time. (Narration via ``humanize_result`` no longer uses
+    # ``${sN.field}``; it references the step by ``{step_id}`` — #110 Phase 5.)
     # ──────────────────────────────────────────────────────────────────
     FewShotExample(
         user_message="покажи список дача",
