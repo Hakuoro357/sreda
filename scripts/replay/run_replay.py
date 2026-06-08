@@ -709,6 +709,7 @@ def replay_one_turn(
     # imports cleanly even when sreda is unavailable (the recall/budget/safety
     # paths above + their unit tests do not need sreda).
     from sreda.runtime.planner.prompt_builder import build_prompt
+    from sreda.runtime.planner.json_parse import parse_planner_json
     from sreda.runtime.planner.schemas import Plan
     from sreda.runtime.planner.validator import validate_plan
     from sreda.runtime.planner import plan_compiler
@@ -759,7 +760,7 @@ def replay_one_turn(
     # --- parse + validate ---------------------------------------------------
     valid_plan = False
     try:
-        payload = json.loads(raw_text)
+        payload = parse_planner_json(raw_text)  # strict envelope-strip (#113)
         plan = Plan.model_validate(payload)
     except Exception as exc:  # noqa: BLE001 — any parse/schema error → invalid plan
         return TurnReplayResult(

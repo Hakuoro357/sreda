@@ -73,6 +73,7 @@ from sreda.runtime.planner.plan_compiler import (
     compile as compile_plan,
 )
 from sreda.runtime.planner.few_shot_examples import render_few_shot_block
+from sreda.runtime.planner.json_parse import parse_planner_json
 from sreda.runtime.planner.prompt_builder import (
     NowMoment,
     ProfileSnapshot,
@@ -447,9 +448,10 @@ async def run(
                 raw_responses=tuple(raw_responses),
             )
 
-        # Stage 4: parse JSON
+        # Stage 4: parse JSON (strict envelope-strip — tolerates a single outer
+        # ```json fence the planner sometimes adds despite the prompt; #113).
         try:
-            payload = json.loads(call_result.raw_text)
+            payload = parse_planner_json(call_result.raw_text)
         except json.JSONDecodeError as exc:
             last_errors = f"json_decode_error: {exc}"
             if attempt_no < max_attempts:
