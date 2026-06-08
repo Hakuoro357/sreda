@@ -318,6 +318,125 @@ def test_hr_runtime_extra_top_key_raises() -> None:
         })
 
 
+# ---------------------------------------------------------------------------
+# #110 Phase 4a — planner-input contract accepts the new {step_id} narration
+# form at plan time (allow_refs=True); the strict runtime contract
+# (allow_refs=False, validating the NORMALIZED output) still rejects it.
+# ---------------------------------------------------------------------------
+
+
+def test_hr_planb_accepts_step_id_action_form() -> None:
+    from sreda.services.composer_contracts import validate_humanize_result_payload
+
+    errors = validate_humanize_result_payload(
+        {"intent": "показать", "actions": [{"step_id": "s1"}, {"step_id": "s2"}]},
+        allow_refs=True,
+    )
+    assert errors == []
+
+
+def test_hr_runtime_rejects_step_id_action_form() -> None:
+    from sreda.services.composer_contracts import validate_humanize_result_payload
+
+    # allow_refs=False (post-normalization runtime contract) must NOT accept
+    # step_id — only the resolved {user_visible_summary, status} form.
+    errors = validate_humanize_result_payload(
+        {"intent": "показать", "actions": [{"step_id": "s1"}]},
+        allow_refs=False,
+    )
+    # step_id is rejected SPECIFICALLY as a disallowed action key (not merely as
+    # a missing user_visible_summary/status) — Codex Phase 4a R1 MINOR high.
+    assert errors
+    joined = " ".join(errors)
+    assert "disallowed" in joined and "step_id" in joined
+    with pytest.raises(ComposerInputError):
+        _hr_reg().validate_data(
+            "humanize_result",
+            {"intent": "показать", "actions": [{"step_id": "s1"}]},
+        )
+
+
+def test_hr_planb_step_id_form_must_be_uniform() -> None:
+    """Codex Phase 4a R1 MAJOR high — if ANY action is {step_id}, the WHOLE
+    payload must be the uniform new form (matching the normalizer's
+    recognition); mixed / ref-intent payloads are rejected at plan time so they
+    can't pass Phase B and degrade at compose."""
+    from sreda.services.composer_contracts import validate_humanize_result_payload
+
+    # mixed {step_id} + old full-ref item → not uniform → error
+    assert validate_humanize_result_payload(
+        {"intent": "x", "actions": [{"step_id": "s1"}, {"user_visible_summary": "${s2.t}", "status": "ok"}]},
+        allow_refs=True,
+    )
+    # {step_id} + literal item → not uniform → error
+    assert validate_humanize_result_payload(
+        {"intent": "x", "actions": [{"step_id": "s1"}, {"user_visible_summary": "lit", "status": "ok"}]},
+        allow_refs=True,
+    )
+    # all-{step_id} but FULL-ref intent → not a literal intent → error
+    assert validate_humanize_result_payload(
+        {"intent": "${s1.intent}", "actions": [{"step_id": "s1"}]},
+        allow_refs=True,
+    )
+    # all-{step_id} but EMBEDDED-ref intent → error (matches normalizer contains_ref)
+    assert validate_humanize_result_payload(
+        {"intent": "найди ${s1.x}", "actions": [{"step_id": "s1"}]},
+        allow_refs=True,
+    )
+    # all-{step_id} but EMPTY malformed token ${} in intent → error (Codex Phase
+    # 4a R3 MAJOR medium — the broad detector must catch ${} too, not just ${x}).
+    assert validate_humanize_result_payload(
+        {"intent": "глянь ${}", "actions": [{"step_id": "s1"}]},
+        allow_refs=True,
+    )
+    # all-{step_id} + literal intent → uniform → OK
+    assert validate_humanize_result_payload(
+        {"intent": "показать", "actions": [{"step_id": "s1"}, {"step_id": "s2"}]},
+        allow_refs=True,
+    ) == []
+
+
+def test_hr_planb_step_id_must_be_pure_and_nonempty() -> None:
+    from sreda.services.composer_contracts import validate_humanize_result_payload
+
+    # blank step_id → not the form → standard item validation → error
+    assert validate_humanize_result_payload(
+        {"intent": "x", "actions": [{"step_id": ""}]}, allow_refs=True
+    )
+    # extra key alongside step_id → not the pure form → error
+    assert validate_humanize_result_payload(
+        {"intent": "x", "actions": [{"step_id": "s1", "status": "ok"}]}, allow_refs=True
+    )
+    # non-str step_id → error
+    assert validate_humanize_result_payload(
+        {"intent": "x", "actions": [{"step_id": 5}]}, allow_refs=True
+    )
+
+
+def test_is_step_id_action_item_helper() -> None:
+    from sreda.services.composer_contracts import is_step_id_action_item
+
+    assert is_step_id_action_item({"step_id": "s1"}) is True
+    assert is_step_id_action_item({"step_id": "s1", "status": "ok"}) is False
+    assert is_step_id_action_item({"step_id": ""}) is False
+    assert is_step_id_action_item({"step_id": 5}) is False
+    assert is_step_id_action_item({"user_visible_summary": "x", "status": "ok"}) is False
+    assert is_step_id_action_item("${s1}") is False
+
+
+def test_is_step_id_narration_form_rejects_any_ref_token_in_intent() -> None:
+    """Codex Phase 4a R3 MAJOR medium — the shared new-form detector must reject
+    intents containing ANY ${...}-looking token, including the empty ${}."""
+    from sreda.services.composer_contracts import is_step_id_narration_form
+
+    ok = {"intent": "показать", "actions": [{"step_id": "s1"}]}
+    assert is_step_id_narration_form(ok) is True
+    for bad_intent in ("${s1.x}", "найди ${s1.x}", "${}", "пусто ${} тут", "${HOME}"):
+        assert is_step_id_narration_form(
+            {"intent": bad_intent, "actions": [{"step_id": "s1"}]}
+        ) is False, f"intent {bad_intent!r} must be rejected as ref-bearing"
+
+
 def test_cooking_explanation_requires_facts_not_just_question() -> None:
     """Codex D.2 R1 MAJOR A#1 — cooking_explanation must require BOTH
     question AND facts, else the model answers from priors."""
@@ -337,3 +456,26 @@ def test_every_prompt_has_required_keys_and_description() -> None:
     for key, spec in HOUSEWIFE_LLM_PROMPTS.items():
         assert spec.required_keys, f"prompt {key!r} has no required_keys"
         assert spec.description, f"prompt {key!r} has no description"
+
+
+def test_composer_contracts_clean_process_import_has_no_cycle() -> None:
+    """Codex Phase 4a R2 CRITICAL (medium) / MAJOR (high) regression guard — a
+    FRESH ``import sreda.services.composer_contracts`` (and prompts_registry)
+    must not hit the runtime.planner import cycle. Run in a clean subprocess
+    because within THIS pytest process the modules are already imported, which
+    is exactly what masked the cycle during development."""
+    import subprocess
+    import sys
+
+    for mod in (
+        "sreda.services.composer_contracts",
+        "sreda.services.composer.prompts_registry",
+    ):
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {mod}"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"clean-process import of {mod} failed (circular import?):\n{result.stderr}"
+        )

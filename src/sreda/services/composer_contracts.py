@@ -28,6 +28,14 @@ from typing import Protocol
 # cycle that motivated extracting this module as a sibling of the composer
 # package. Used by the per-template contract registry below so the
 # clarification family is referenced — not duplicated.
+#
+# ⚠️ Do NOT import from ``sreda.runtime.planner.*`` here (e.g. interpolation's
+# ``contains_ref``). Even though ``interpolation.py`` itself is a pure leaf,
+# importing it executes the ``sreda.runtime.planner`` PACKAGE __init__ first,
+# which pulls in ``validator``, which imports this module while it is only
+# partially initialized → ImportError. ${...}-ref detection for the new
+# {step_id} form is therefore done LOCALLY below (Codex Phase 4a R2 CRITICAL —
+# a fresh ``import sreda.services.composer_contracts`` broke on this exact cycle).
 from sreda.services.clarification_contract import (
     RUNTIME_ONLY_TEMPLATE_IDS,
     validate_clarification_payload,
@@ -54,6 +62,17 @@ are rejected — callers must curate public summaries before passing data here.
 # Full-ref pattern: a string that is exactly "${...}" with no surrounding text.
 _FULL_REF_RE = re.compile(r"^\$\{[^}]+\}$")
 
+# Broad ${...}-token detector (embedded OR whole-string). Intentionally LOCAL
+# (not ``interpolation.contains_ref``) to avoid the runtime.planner import cycle
+# noted above. Broader than the planner's strict ref grammar — for a recognition
+# GATE that is the safe direction: anything ${...}-looking in a new-form intent
+# → reject → fall through to the old resolve_refs path (never feed an unresolved
+# ref to the LLM). ``[^}]*`` (zero-or-more) so even the EMPTY malformed token
+# ``${}`` is caught (Codex Phase 4a R3 MAJOR medium — ``[^}]+`` missed it).
+# Both the contract and the normalizer share THIS detector via
+# ``is_step_id_narration_form``, so they agree on what "the new form" is.
+_EMBEDDED_REF_RE = re.compile(r"\$\{[^}]*\}")
+
 
 def _is_full_ref(v: object) -> bool:
     """Return True if ``v`` is a string that is exactly one ``${...}`` ref.
@@ -62,6 +81,59 @@ def _is_full_ref(v: object) -> bool:
     values that will only be resolved post-execution.
     """
     return isinstance(v, str) and _FULL_REF_RE.match(v) is not None
+
+
+def is_step_id_action_item(item: object) -> bool:
+    """True iff ``item`` is the NEW ``humanize_result`` narration form
+    ``{"step_id": "s1"}`` — a dict whose ONLY key is ``step_id`` with a
+    non-empty string value.
+
+    #110 Phase 4: at plan-validation time the planner references a STEP; the
+    composer's Layer-2 normalizer (#110 Phase 3) builds ``user_visible_summary``
+    in code from that step's result post-execution. SINGLE SOURCE OF TRUTH for
+    the new-form shape, shared by the contract here and the compose-time
+    normalizer (``compose._is_step_id_action`` delegates to this). Valid ONLY
+    when ``allow_refs=True`` (plan time); the strict runtime contract
+    (``allow_refs=False``, validating the NORMALIZED output) requires the
+    resolved ``{user_visible_summary, status}`` form and rejects ``step_id``.
+    """
+    return (
+        isinstance(item, dict)
+        and set(item.keys()) == {"step_id"}
+        and isinstance(item.get("step_id"), str)
+        and bool(item["step_id"].strip())
+    )
+
+
+def is_step_id_narration_form(data: object) -> bool:
+    """True iff ``data`` is the COMPLETE new ``humanize_result`` narration form:
+    a dict with top-level keys EXACTLY ``{intent, actions}``, ``intent`` a
+    non-empty string with NO ``${...}`` reference (full OR embedded), and
+    ``actions`` a non-empty list whose EVERY item is ``is_step_id_action_item``.
+
+    #110 Phase 4 — SINGLE SOURCE OF TRUTH for "the new form", shared by the
+    plan-time contract (``validate_humanize_result_payload``, allow_refs=True)
+    and the compose-time normalizer (``compose._normalize_humanize_result``), so
+    a plan is accepted at validation iff the normalizer will recognize it — no
+    plan-valid/runtime-invalid gap (Codex Phase 4a R1 MAJOR). ${...}-ref detection
+    is LOCAL (``_EMBEDDED_REF_RE``), kept out of ``interpolation`` to avoid the
+    runtime.planner import cycle (Codex Phase 4a R2 CRITICAL)."""
+    if (
+        not isinstance(data, dict)
+        or set(data.keys()) != _HUMANIZE_RESULT_ALLOWED_TOP_KEYS
+    ):
+        return False
+    intent = data.get("intent")
+    if (
+        not isinstance(intent, str)
+        or not intent.strip()
+        or _EMBEDDED_REF_RE.search(intent) is not None
+    ):
+        return False
+    actions = data.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return False
+    return all(is_step_id_action_item(item) for item in actions)
 
 
 def validate_humanize_result_payload(
@@ -141,6 +213,23 @@ def validate_humanize_result_payload(
         errors.append(
             "humanize_result template_data['actions'] must be a non-empty list."
         )
+        return errors
+
+    # #110 Phase 4 — the NEW {step_id} narration form is ALL-OR-NOTHING and
+    # accepted ONLY at plan time (allow_refs=True). If ANY action item is a
+    # {step_id} item, the WHOLE payload must be the uniform new form (every action
+    # {step_id}, 'intent' a non-empty literal with NO ${...} ref) — EXACTLY what
+    # the composer's Layer-2 normalizer recognizes, so plan-valid ⟺ normalizer-
+    # recognized (no plan-valid/runtime-invalid gap; Codex Phase 4a R1 MAJOR high).
+    # The strict runtime contract (allow_refs=False) never takes this branch, so
+    # {step_id} stays a disallowed action key there.
+    if allow_refs and any(is_step_id_action_item(item) for item in actions):
+        if not is_step_id_narration_form(data):
+            errors.append(
+                "humanize_result: the new {step_id} narration form must be uniform "
+                "— every action must be {step_id} and 'intent' a non-empty literal "
+                "string with no ${...} reference."
+            )
         return errors
 
     for i, item in enumerate(actions):

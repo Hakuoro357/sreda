@@ -364,6 +364,7 @@ def test_compose_fall_through_passes_original_data_to_llm() -> None:
         {"intent": 5, "actions": [{"step_id": "s1"}]},  # non-str intent
         {"intent": "${s1.intent}", "actions": [{"step_id": "s1"}]},  # full-ref intent
         {"intent": "покажи ${s1.raw_text}", "actions": [{"step_id": "s1"}]},  # EMBEDDED ref (R2)
+        {"intent": "глянь ${}", "actions": [{"step_id": "s1"}]},  # EMPTY ${} token (R3 MAJOR medium)
         {"intent": "ok", "actions": [{"step_id": "s1"}], "extra": "x"},  # extra top key
     ],
 )

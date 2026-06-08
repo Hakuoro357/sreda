@@ -2265,7 +2265,11 @@ def _check_composer_allowlist(
                 ):
                     # Map error messages to Violation codes so existing tests
                     # (and the Phase-B allowlist contract) still match codes.
-                    if "disallowed top-level keys" in error_msg:
+                    if "must be uniform" in error_msg:
+                        # #110 Phase 4a — new {step_id} form mixed with old forms
+                        # / ref intent (not what the normalizer recognizes).
+                        code = "humanize_result_nonuniform_step_id_form"
+                    elif "disallowed top-level keys" in error_msg:
                         code = "humanize_result_extra_top_keys"
                     elif "disallowed\nkeys" in error_msg or "disallowed keys" in error_msg:
                         code = "humanize_result_extra_action_keys"

@@ -80,7 +80,7 @@ from typing import Any, Callable, Literal, Protocol
 from jinja2 import TemplateError
 
 from sreda.runtime.planner.executor import ExecutionLog
-from sreda.runtime.planner.interpolation import contains_ref, resolve_refs
+from sreda.runtime.planner.interpolation import resolve_refs
 from sreda.runtime.planner.schemas import ComposerCall
 from sreda.services.composer.presenters import (
     is_known_domain_status,
@@ -96,7 +96,10 @@ from sreda.services.composer.registry import (
     ComposerRegistry,
     UnknownTemplateError,
 )
-from sreda.services.composer_contracts import _HUMANIZE_RESULT_ALLOWED_TOP_KEYS
+from sreda.services.composer_contracts import (
+    is_step_id_action_item,
+    is_step_id_narration_form,
+)
 
 # Per-type fallback template for conversational LLM failures.
 # When kind='llm' fails on a reply_only+smalltalk turn, fall through to a
@@ -625,20 +628,16 @@ def _step_outputs_for_refs(execution_log: ExecutionLog) -> dict[str, Any]:
 
 
 def _is_step_id_action(item: Any) -> bool:
-    """True iff ``item`` is the new narration form ``{"step_id": "s1"}`` — a
-    dict whose ONLY key is ``step_id`` with a non-empty string value.
+    """True iff ``item`` is the new narration form ``{"step_id": "s1"}``.
 
-    Everything else (literal summaries, ``${...}`` full-refs, item-refs, the
-    old ``{user_visible_summary: "${sN.field}"}`` form, mixed dicts) is NOT this
-    form, so the call falls through to the unchanged resolve_refs path. The
-    old full-ref repair is a separate slice (Phase 3b) reachable in prod only
-    after the validator deferral (Phase 4)."""
-    return (
-        isinstance(item, dict)
-        and set(item.keys()) == {"step_id"}
-        and isinstance(item.get("step_id"), str)
-        and bool(item["step_id"].strip())
-    )
+    Thin delegate to the SINGLE SOURCE OF TRUTH
+    ``composer_contracts.is_step_id_action_item`` (#110 Phase 4), so the
+    compose-time normalizer and the plan-time contract can never drift on what
+    "the new form" is. Everything else (literal summaries, ``${...}`` full-refs,
+    item-refs, the old ``{user_visible_summary: "${sN.field}"}`` form, mixed
+    dicts) is NOT this form → the call falls through to the unchanged
+    resolve_refs path."""
+    return is_step_id_action_item(item)
 
 
 def _normalize_humanize_result(
@@ -661,26 +660,17 @@ def _normalize_humanize_result(
       * ``("short_circuit", None)`` — every referenced step was omitted; caller
         returns a deterministic degraded reply WITHOUT calling the LLM.
     """
-    if not isinstance(template_data, dict):
+    # Recognition = SINGLE SOURCE OF TRUTH shared with the plan-time contract
+    # (``composer_contracts.is_step_id_narration_form``), so a plan accepted at
+    # validation is EXACTLY one the normalizer recognizes here — no plan-valid/
+    # runtime-invalid gap (Codex Phase 4a R1 MAJOR high). It requires top-level
+    # keys {intent, actions}, ``intent`` a non-empty literal with NO ${...} ref
+    # (full or embedded), and EVERY action a pure {step_id}. Anything else →
+    # fall-through to the unchanged resolve_refs + strict-validation path.
+    if not is_step_id_narration_form(template_data):
         return ("fall_through", None)
-    # New-form recognition is STRICT (Codex Phase 3 R1/R2, both A/B): top-level
-    # keys EXACTLY {intent, actions} and ``intent`` a non-empty literal string
-    # with NO ``${...}`` ref — full OR embedded (``contains_ref``, not just
-    # whole-string ``_is_full_ref``; R2 MAJOR). A ref / blank / missing / non-str
-    # intent, or any extra top-level key, falls through to the unchanged
-    # resolve_refs + strict-validation path — so we never skip resolve_refs on a
-    # payload whose ``intent`` still needs resolving, nor feed an unresolved ref
-    # to the LLM.
-    if set(template_data.keys()) != _HUMANIZE_RESULT_ALLOWED_TOP_KEYS:
-        return ("fall_through", None)
-    intent = template_data.get("intent")
-    if not isinstance(intent, str) or not intent.strip() or contains_ref(intent):
-        return ("fall_through", None)
-    actions = template_data.get("actions")
-    if not isinstance(actions, list) or not actions:
-        return ("fall_through", None)
-    if not all(_is_step_id_action(item) for item in actions):
-        return ("fall_through", None)
+    intent = template_data["intent"]
+    actions = template_data["actions"]
 
     by_id = execution_log.by_step_id()
     new_actions: list[dict[str, str]] = []

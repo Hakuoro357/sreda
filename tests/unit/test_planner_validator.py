@@ -2020,6 +2020,41 @@ def test_humanize_result_valid_static_actions_passes_phase_b() -> None:
     assert not bad, f"Unexpected violations: {bad}"
 
 
+def test_humanize_result_step_id_form_passes_phase_b() -> None:
+    """#110 Phase 4a — the new {step_id} narration form passes Phase-B
+    validation through the REAL validate_plan() entrypoint, not just the
+    contract helper (Codex Phase 4a R1 MINOR medium)."""
+    plan = _plan_hr_compose({
+        "intent": "показати результат",
+        "actions": [{"step_id": "s1"}],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    hr = [v for v in violations if v.code.startswith("humanize_result")]
+    assert not hr, f"Unexpected humanize_result violations: {hr}"
+
+
+def test_humanize_result_mixed_step_id_form_rejected_phase_b() -> None:
+    """Mixed new {step_id} + old form is rejected at Phase B with a dedicated
+    code (Codex Phase 4a R1 MAJOR high) — it must not pass validation and then
+    degrade at compose time."""
+    plan = _plan_hr_compose({
+        "intent": "показати",
+        "actions": [
+            {"step_id": "s1"},
+            {"user_visible_summary": "літерал", "status": "ok"},
+        ],
+    })
+    violations = validate_plan(
+        plan, _ALLOWLIST_REGISTRY,
+        composer_llm_prompt_keys=_HR_ALLOWLIST_KEYS,
+    )
+    bad = [v for v in violations if v.code == "humanize_result_nonuniform_step_id_form"]
+    assert bad, f"Expected nonuniform violation, got: {[v.code for v in violations]}"
+
+
 def test_humanize_result_extra_top_key_rejected_phase_b() -> None:
     """Extra top-level key (execution_id) is rejected at Phase B."""
     plan = _plan_hr_compose({
