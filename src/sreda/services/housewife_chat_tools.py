@@ -2123,7 +2123,7 @@ def build_housewife_tools(
             return "error: internal"
         if task is None:
             return f"error: task {task_id!r} not found"
-        return f"ok:updated:{task.id}"
+        return encode_tool_ok("updated", {"task_id": task.id, "title": task.title})  # #115
 
     @_write_lc_tool
     def complete_task(task_id: str) -> str:
@@ -2142,7 +2142,7 @@ def build_housewife_tools(
             return "error: internal"
         if task is None:
             return f"error: task {task_id!r} not found"
-        return f"ok:completed:{task.id}"
+        return encode_tool_ok("completed", {"task_id": task.id, "title": task.title})  # #115
 
     @_write_lc_tool
     def uncomplete_task(task_id: str) -> str:
@@ -2160,7 +2160,7 @@ def build_housewife_tools(
             return "error: internal"
         if task is None:
             return f"error: task {task_id!r} not found"
-        return f"ok:uncompleted:{task.id}"
+        return encode_tool_ok("uncompleted", {"task_id": task.id, "title": task.title})  # #115
 
     @_write_lc_tool
     def cancel_task(task_id: str) -> str:
@@ -2179,7 +2179,7 @@ def build_housewife_tools(
             return "error: internal"
         if task is None:
             return f"error: task {task_id!r} not found"
-        return f"ok:cancelled:{task.id}"
+        return encode_tool_ok("cancelled", {"task_id": task.id, "title": task.title})  # #115
 
     @_write_lc_tool
     def delete_task(task_id: str) -> str:

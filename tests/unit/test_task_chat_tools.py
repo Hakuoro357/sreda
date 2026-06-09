@@ -20,6 +20,7 @@ from sreda.db.models.core import Tenant, User
 from sreda.db.models.housewife import FamilyReminder
 from sreda.db.models.tasks import Task
 from sreda.services.housewife_chat_tools import build_housewife_tools
+from sreda.services.tool_schemas.housewife import parse_tool_output  # #115
 
 
 @pytest.fixture
@@ -199,7 +200,8 @@ def _add_today_task(tools, title="X") -> str:
 def test_complete_task_marks_completed(tools):
     task_id = _add_today_task(tools)
     res = tools["complete_task"].invoke({"task_id": task_id})
-    assert res == f"ok:completed:{task_id}"
+    parsed = parse_tool_output("complete_task", res)  # #115 okv2 carries the name
+    assert parsed.status == "completed" and parsed.task_id == task_id
     sess = _get_session(tools)
     assert sess.query(Task).one().status == "completed"
 
@@ -208,7 +210,8 @@ def test_uncomplete_task_restores_pending(tools):
     task_id = _add_today_task(tools)
     tools["complete_task"].invoke({"task_id": task_id})
     res = tools["uncomplete_task"].invoke({"task_id": task_id})
-    assert res == f"ok:uncompleted:{task_id}"
+    parsed = parse_tool_output("uncomplete_task", res)  # #115
+    assert parsed.status == "uncompleted" and parsed.task_id == task_id
     sess = _get_session(tools)
     assert sess.query(Task).one().status == "pending"
 
@@ -216,7 +219,8 @@ def test_uncomplete_task_restores_pending(tools):
 def test_cancel_task_soft(tools):
     task_id = _add_today_task(tools)
     res = tools["cancel_task"].invoke({"task_id": task_id})
-    assert res == f"ok:cancelled:{task_id}"
+    parsed = parse_tool_output("cancel_task", res)  # #115
+    assert parsed.status == "cancelled" and parsed.task_id == task_id
     sess = _get_session(tools)
     assert sess.query(Task).count() == 1  # row still there
     assert sess.query(Task).one().status == "cancelled"
@@ -245,7 +249,8 @@ def test_update_task_title(tools):
     res = tools["update_task"].invoke({
         "task_id": task_id, "title": "new title",
     })
-    assert res == f"ok:updated:{task_id}"
+    parsed = parse_tool_output("update_task", res)  # #115
+    assert parsed.status == "updated" and parsed.task_id == task_id and parsed.title == "new title"
     sess = _get_session(tools)
     assert sess.query(Task).one().title == "new title"
 

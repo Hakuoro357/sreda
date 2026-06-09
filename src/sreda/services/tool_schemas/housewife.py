@@ -232,6 +232,24 @@ def _all_names_usable(*name_lists: list[str]) -> bool:
     return True
 
 
+def _parse_okv2_named_task(raw, status_literal, tool_name, model_cls):
+    """#115 shared okv2 parse for the simple single-name task tools
+    (update/complete/uncomplete/cancel_task): build the variant, fail closed on
+    malformed payload or an unusable ``title``."""
+    try:
+        status, payload = parse_tool_ok(raw, frozenset({status_literal}))
+        model = model_cls(status=status, **payload)
+    except (ToolOkParseError, ValidationError, TypeError):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name=tool_name, timestamp=datetime.now(timezone.utc),
+        )
+    if not _all_names_usable([model.title]):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name=tool_name, timestamp=datetime.now(timezone.utc),
+        )
+    return model
+
+
 # ---------------------------------------------------------------------------
 # 1. add_shopping_items
 #    ok:added:0                       → AddShoppingItemsEmptyOutput
@@ -2376,8 +2394,17 @@ def parse_list_tasks(
 # 28. update_task
 class UpdateTaskOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["updated"] = "updated"
     task_id: TaskId
+    title: str | None = None  # #115 task NAME (okv2); None on legacy positional
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.title:
+            return "Готово."
+        return build_display_summary([("Обновила задачу", [self.title])])
 
 
 UpdateTaskOutput = Annotated[
@@ -2395,6 +2422,8 @@ def parse_update_task(
     err = _parse_error(raw)
     if err is not None:
         return err
+    if is_okv2(raw):  # #115: okv2 carries the task name; legacy positional stays
+        return _parse_okv2_named_task(raw, "updated", "update_task", UpdateTaskOk)
     m = _UPDATE_TASK_RE.match(raw.strip())
     if m is None:
         return ToolOutputContractViolation(
@@ -2417,8 +2446,17 @@ def parse_update_task(
 
 class CompleteTaskOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["completed"] = "completed"
     task_id: TaskId
+    title: str | None = None  # #115
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.title:
+            return "Готово."
+        return build_display_summary([("Выполнила", [self.title])])
 
 
 CompleteTaskOutput = Annotated[
@@ -2436,6 +2474,8 @@ def parse_complete_task(
     err = _parse_error(raw)
     if err is not None:
         return err
+    if is_okv2(raw):  # #115
+        return _parse_okv2_named_task(raw, "completed", "complete_task", CompleteTaskOk)
     m = _COMPLETE_TASK_RE.match(raw.strip())
     if m is None:
         return ToolOutputContractViolation(
@@ -2453,8 +2493,17 @@ def parse_complete_task(
 
 class UncompleteTaskOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["uncompleted"] = "uncompleted"
     task_id: TaskId
+    title: str | None = None  # #115
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.title:
+            return "Готово."
+        return build_display_summary([("Вернула в работу", [self.title])])
 
 
 UncompleteTaskOutput = Annotated[
@@ -2472,6 +2521,8 @@ def parse_uncomplete_task(
     err = _parse_error(raw)
     if err is not None:
         return err
+    if is_okv2(raw):  # #115
+        return _parse_okv2_named_task(raw, "uncompleted", "uncomplete_task", UncompleteTaskOk)
     m = _UNCOMPLETE_TASK_RE.match(raw.strip())
     if m is None:
         return ToolOutputContractViolation(
@@ -2489,8 +2540,17 @@ def parse_uncomplete_task(
 
 class CancelTaskOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["cancelled"] = "cancelled"
     task_id: TaskId
+    title: str | None = None  # #115
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.title:
+            return "Готово."
+        return build_display_summary([("Отменила", [self.title])])
 
 
 CancelTaskOutput = Annotated[
@@ -2508,6 +2568,8 @@ def parse_cancel_task(
     err = _parse_error(raw)
     if err is not None:
         return err
+    if is_okv2(raw):  # #115
+        return _parse_okv2_named_task(raw, "cancelled", "cancel_task", CancelTaskOk)
     m = _CANCEL_TASK_RE.match(raw.strip())
     if m is None:
         return ToolOutputContractViolation(
