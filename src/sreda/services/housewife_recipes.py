@@ -109,6 +109,12 @@ class SaveRecipesBatchResult:
 
     created: list[Recipe] = field(default_factory=list)
     skipped_existing: list[Recipe] = field(default_factory=list)
+    # #115: by-name outcome buckets so the live voice can confirm what happened.
+    duplicates_in_batch: list[str] = field(default_factory=list)
+    """Titles collapsed as duplicates WITHIN the input batch (first kept)."""
+    invalid: list[str] = field(default_factory=list)
+    """Titles dropped on validation (e.g. bad ``source``). Untitled/non-dict
+    rows have no name and are not reported here."""
 
 
 class HousewifeRecipeService:
@@ -290,6 +296,7 @@ class HousewifeRecipeService:
                 continue
             source = raw.get("source") or "user_dictated"
             if source not in RECIPE_SOURCES:
+                result.invalid.append(title)  # #115: nameable validation drop
                 continue
             servings = max(1, int(raw.get("servings") or 2))
 
@@ -301,6 +308,7 @@ class HousewifeRecipeService:
                     "save_recipes_batch: in-batch duplicate title=%r skipped",
                     title,
                 )
+                result.duplicates_in_batch.append(title)  # #115
                 continue
             seen_in_batch.add(normal_key)
 

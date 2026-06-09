@@ -1031,10 +1031,16 @@ def parse_save_recipe(
 
 class SaveRecipesBatchOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["batch_saved"] = "batch_saved"
     created_count: int = Field(ge=0)
     skipped_as_duplicate: int = Field(ge=0)
     recipe_ids: list[RecipeId]
+    # #115 by-name outcome buckets (okv2 path); empty on the legacy positional path.
+    created: list[str] = Field(default_factory=list)
+    duplicates_existing: list[str] = Field(default_factory=list)
+    duplicates_in_batch: list[str] = Field(default_factory=list)
+    invalid: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_count_matches_ids(self) -> SaveRecipesBatchOk:
@@ -1044,6 +1050,19 @@ class SaveRecipesBatchOk(BaseModel):
                 f"{len(self.recipe_ids)} entries — mismatch."
             )
         return self
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        """#115: by-name outcome for the live voice (ids never shown)."""
+        return build_display_summary(
+            [
+                ("Сохранила", self.created),
+                ("Уже было", self.duplicates_existing),
+                ("Повтор в списке", self.duplicates_in_batch),
+                ("Не получилось", self.invalid),
+            ]
+        )
 
 
 SaveRecipesBatchOutput = Annotated[
@@ -1066,6 +1085,31 @@ def parse_save_recipes_batch(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries by-name outcome buckets; legacy positional (counts/ids
+    # only) stays supported for historical/replay (legacy_compat=yes).
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(raw, frozenset({"batch_saved"}))
+            model = SaveRecipesBatchOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="save_recipes_batch",
+                timestamp=datetime.now(timezone.utc),
+            )
+        # Codex #115 [MAJOR]: on okv2 the by-name buckets MUST match their counts
+        # (legacy positional is exempt — it carries empty name lists by design).
+        # A mismatch means the voice would under/over-report → fail closed.
+        if (
+            len(model.created) != model.created_count
+            or len(model.duplicates_existing) != model.skipped_as_duplicate
+        ):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="save_recipes_batch",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     m = _SAVE_BATCH_RE.match(raw.strip())
     if m is not None:
         n = int(m.group("n"))

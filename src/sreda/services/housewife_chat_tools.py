@@ -982,7 +982,7 @@ def build_housewife_tools(
 
         **Dedup.** Recipe titles are unique per user (case /
         whitespace-insensitive). If a recipe with the same title
-        already exists, this returns ``ok:duplicate:<id>`` WITHOUT
+        already exists, this signals status ``duplicate`` WITHOUT
         inserting a new row — tell the user the recipe is already
         in the book. Don't call save_recipe with a near-identical
         title variation ("борщ" after already saving "Борщ
@@ -1028,7 +1028,7 @@ def build_housewife_tools(
                 гуляш 120+. Cap 1..600. Можно None если совсем
                 непонятно — но старайся проставлять.
 
-        Returns status string with the new recipe id.
+        Returns a status envelope carrying the recipe name and id.
         """
         if not user_id:
             return "error: no user_id context"
@@ -1109,9 +1109,10 @@ def build_housewife_tools(
         Before a big batch-save where you're unsure what's already
         saved, call ``search_recipes("")`` first to see the book.
 
-        Returns ``ok:batch_saved:N:skipped_as_duplicate:M:ids=[...]``
-        where N is newly-created and M is how many were short-circuited
-        because the title already existed.
+        Returns a ``batch_saved`` status envelope carrying the affected recipe
+        NAMES grouped as created / already-existing / repeated-in-batch / invalid
+        (plus created_count + ids for branching). (Legacy positional
+        ``ok:batch_saved:...`` is still parsed for historical replay.)
         """
         if not user_id:
             return "error: no user_id context"
@@ -1126,13 +1127,19 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("save_recipes_batch failed")
             return "error: internal"
-        skipped_n = len(outcome.skipped_existing)
-        if not outcome.created:
-            return f"ok:batch_saved:0:skipped_as_duplicate:{skipped_n}"
-        ids_csv = ",".join(r.id for r in outcome.created)
-        return (
-            f"ok:batch_saved:{len(outcome.created)}:"
-            f"skipped_as_duplicate:{skipped_n}:ids=[{ids_csv}]"
+        # #115: okv2 envelope carrying by-name outcome buckets so the live voice
+        # can confirm what was saved / was already there / repeated / failed.
+        return encode_tool_ok(
+            "batch_saved",
+            {
+                "created_count": len(outcome.created),
+                "skipped_as_duplicate": len(outcome.skipped_existing),
+                "recipe_ids": [r.id for r in outcome.created],
+                "created": [r.title for r in outcome.created],
+                "duplicates_existing": [r.title for r in outcome.skipped_existing],
+                "duplicates_in_batch": list(outcome.duplicates_in_batch),
+                "invalid": list(outcome.invalid),
+            },
         )
 
     @lc_tool
