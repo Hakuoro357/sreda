@@ -107,6 +107,7 @@ from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.checklists import ChecklistService
 from sreda.services.housewife_shopping import HousewifeShoppingService
 from sreda.services.tasks import TaskService
+from sreda.services.tool_schemas.tool_ok_codec import encode_tool_ok  # #115
 
 logger = logging.getLogger(__name__)
 
@@ -1053,12 +1054,14 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("save_recipe failed")
             return "error: internal"
+        # #115: emit okv2 envelope carrying the recipe NAME so the live voice
+        # can confirm by name (was id-only `ok:saved:<id>` — Sub-A4 drop).
         if not is_new:
             # Title already existed for this user — tell the LLM so it
             # can surface "рецепт уже был в книге" to the user instead
             # of claiming it just created one.
-            return f"ok:duplicate:{recipe.id}"
-        return f"ok:saved:{recipe.id}"
+            return encode_tool_ok("duplicate", {"recipe_id": recipe.id, "title": recipe.title})
+        return encode_tool_ok("saved", {"recipe_id": recipe.id, "title": recipe.title})
 
     @_write_lc_tool
     def save_recipes_batch(recipes: ListOfDict) -> str:

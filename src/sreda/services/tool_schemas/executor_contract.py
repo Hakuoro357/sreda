@@ -117,7 +117,14 @@ def dispatch_typed_output(
     if isinstance(parsed, ToolOutputContractViolation):
         raise PlannerGapError(parsed)
     # STEP 3 — defensive output_model revalidation.
-    return TypeAdapter(output_model).validate_python(parsed.model_dump())
+    # #115: exclude @computed_field values (e.g. ``display_summary``) from the
+    # round-trip dump. Computed fields are output-only — feeding them back as
+    # INPUT to a variant with ``extra='forbid'`` raises ``extra_forbidden``.
+    # The re-validated model recomputes them, so the returned instance (and the
+    # executor's ``model_dump`` for the presenter) still carries them.
+    computed = set(getattr(type(parsed), "model_computed_fields", {}))
+    dumped = parsed.model_dump(exclude=computed) if computed else parsed.model_dump()
+    return TypeAdapter(output_model).validate_python(dumped)
 
 
 __all__ = [

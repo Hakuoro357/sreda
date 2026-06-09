@@ -474,7 +474,11 @@ def test_every_recipes_spec_has_a_parser(spec) -> None:
 def test_parser_output_validates_against_spec_output_model(spec) -> None:
     raw = _PARSER_HAPPY_PATH[spec.name]
     parsed = parse_tool_output(spec.name, raw)
-    TypeAdapter(spec.output_model).validate_python(parsed.model_dump())
+    # #115: exclude @computed_field (output-only, e.g. display_summary) from the
+    # round-trip — mirrors dispatch_typed_output; computed fields are not parser
+    # input and a variant with extra='forbid' would reject them.
+    computed = set(getattr(type(parsed), "model_computed_fields", {}))
+    TypeAdapter(spec.output_model).validate_python(parsed.model_dump(exclude=computed))
 
 
 # ---------------------------------------------------------------------------

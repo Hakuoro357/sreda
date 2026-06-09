@@ -35,10 +35,17 @@ from pydantic import (
     Field,
     StringConstraints,
     ValidationError,
+    computed_field,
     model_validator,
 )
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
+from sreda.services.tool_schemas.display_summary import build_display_summary
+from sreda.services.tool_schemas.tool_ok_codec import (
+    ToolOkParseError,
+    is_okv2,
+    parse_tool_ok,
+)
 from sreda.services.tool_schemas.common import (
     ChecklistId,
     ChecklistItemId,
@@ -949,12 +956,25 @@ def parse_cancel_reminder(
 
 class SaveRecipeOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["saved", "duplicate"]
     recipe_id: RecipeId
     """``saved`` for new rows; ``duplicate`` when title-dedup short-
     circuited (housewife_chat_tools.py:1022-1027). Both branches are
     «happy outcomes» — planner branches on status to differentiate
     «added to book» vs «already in book»."""
+    title: str | None = None
+    """#115: the saved/duplicate recipe NAME (okv2 path). ``None`` on the legacy
+    positional path (historical ``ok:saved:rec_x`` carried only the id)."""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        """#115 safe field handed to the live voice — the recipe name, never the id."""
+        if not self.title:
+            return "Готово."
+        label = "Сохранила рецепт" if self.status == "saved" else "Рецепт уже был"
+        return build_display_summary([(label, [self.title])])
 
 
 SaveRecipeOutput = Annotated[
@@ -965,12 +985,27 @@ SaveRecipeOutput = Annotated[
 _SAVE_RECIPE_RE = re.compile(r"^ok:(?P<status>saved|duplicate):(?P<id>rec_[^\s]+)$")
 
 
+_SAVE_RECIPE_STATUSES = frozenset({"saved", "duplicate"})
+
+
 def parse_save_recipe(
     raw: str,
 ) -> SaveRecipeOk | HousewifeToolError | ToolOutputContractViolation:
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: new okv2 path carries the recipe NAME; legacy positional path (no
+    # name) stays supported for historical/replay outputs (legacy_compat=yes).
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(raw, _SAVE_RECIPE_STATUSES)
+            return SaveRecipeOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="save_recipe",
+                timestamp=datetime.now(timezone.utc),
+            )
     m = _SAVE_RECIPE_RE.match(raw.strip())
     if m is not None:
         try:

@@ -8,7 +8,7 @@ fixed neutral phrase, not_found_count appended as count.
 
 from __future__ import annotations
 
-from sreda.services.composer.display_summary import (
+from sreda.services.tool_schemas.display_summary import (
     MAX_NAME_LEN,
     build_display_summary,
     sanitize_name,
