@@ -1631,19 +1631,28 @@ def build_housewife_tools(
         if not members:
             return "error: empty batch"
         try:
-            created = family_service.add_members_batch(
+            outcome = family_service.add_members_batch_detailed(
                 tenant_id=tenant_id, user_id=user_id, members=members
             )
         except Exception:  # noqa: BLE001
             logger.exception("add_family_members failed")
             return "error: internal"
+        # #115: keep `skipped_as_duplicate` as the legacy aggregate count
+        # (members − created) so the existing validator invariant holds; the
+        # by-name buckets below carry the precise breakdown for the live voice.
+        created = outcome.created
         skipped = max(0, len(members) - len(created))
-        if not created:
-            return f"ok:added:0:skipped_as_duplicate:{skipped}"
-        ids_csv = ",".join(m.id for m in created)
-        return (
-            f"ok:added:{len(created)}:skipped_as_duplicate:{skipped}"
-            f":ids=[{ids_csv}]"
+        return encode_tool_ok(
+            "added",
+            {
+                "added_count": len(created),
+                "skipped_as_duplicate": skipped,
+                "member_ids": [m.id for m in created],
+                "created": [m.name for m in created],
+                "duplicates_existing": list(outcome.duplicates_existing),
+                "duplicates_in_batch": list(outcome.duplicates_in_batch),
+                "invalid": list(outcome.invalid),
+            },
         )
 
     @lc_tool
@@ -1739,7 +1748,11 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("update_family_member failed")
             return "error: internal"
-        return "ok:updated" if row else f"error: member {member_id!r} not found"
+        # #115: okv2 carries the updated member NAME for the live voice; not-found
+        # stays the existing error path (no name to show — functionally "not_found").
+        if row is None:
+            return f"error: member {member_id!r} not found"
+        return encode_tool_ok("updated", {"name": row.name})
 
     @_write_lc_tool
     def remove_family_member(member_id: str) -> str:

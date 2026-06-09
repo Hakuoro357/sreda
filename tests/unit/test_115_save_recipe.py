@@ -93,6 +93,12 @@ def test_malformed_okv2_is_contract_violation():
     assert isinstance(parsed, ToolOutputContractViolation)
 
 
+def test_okv2_blank_title_fails_closed():
+    # Codex #115 R2 [MAJOR]: blank name passes length but voice drops it → fail closed
+    raw = encode_tool_ok("saved", {"recipe_id": REC, "title": "   "})
+    assert isinstance(parse_save_recipe(raw), ToolOutputContractViolation)
+
+
 def test_okv2_name_with_separators_survives():
     raw = encode_tool_ok("saved", {"recipe_id": REC, "title": "Салат: оливье, праздничный"})
     parsed = parse_save_recipe(raw)

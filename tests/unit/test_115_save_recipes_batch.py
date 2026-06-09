@@ -145,6 +145,23 @@ def test_duplicates_names_count_mismatch_fails_closed():
     assert isinstance(parse_save_recipes_batch(raw), ToolOutputContractViolation)
 
 
+def test_blank_name_fails_closed():
+    # Codex #115 R2 [MAJOR]: blank bucket name → fail closed (voice would drop it)
+    raw = encode_tool_ok(
+        "batch_saved",
+        {
+            "created_count": 1,
+            "skipped_as_duplicate": 0,
+            "recipe_ids": [R1],
+            "created": ["  "],  # blank
+            "duplicates_existing": [],
+            "duplicates_in_batch": [],
+            "invalid": [],
+        },
+    )
+    assert isinstance(parse_save_recipes_batch(raw), ToolOutputContractViolation)
+
+
 def test_count_id_mismatch_fails_closed():
     # created_count must match recipe_ids length (existing invariant preserved)
     raw = encode_tool_ok(

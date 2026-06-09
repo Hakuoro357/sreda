@@ -40,7 +40,7 @@ from pydantic import (
 )
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
-from sreda.services.tool_schemas.display_summary import build_display_summary
+from sreda.services.tool_schemas.display_summary import build_display_summary, sanitize_name
 from sreda.services.tool_schemas.tool_ok_codec import (
     ToolOkParseError,
     is_okv2,
@@ -216,6 +216,20 @@ def _parse_error(raw: str) -> HousewifeToolError | None:
         code = rest.strip().lower().replace(" ", "_") or "unknown"
         message = rest.strip() or "unknown"
     return HousewifeToolError(error_code=code, message=message)
+
+
+def _all_names_usable(*name_lists: list[str]) -> bool:
+    """#115: every okv2 bucket name must survive the SAME sanitizer the renderer
+    uses (``sanitize_name`` strips control chars + guillemets, not just
+    whitespace). A name that sanitizes to empty would be silently dropped from
+    ``display_summary`` → under-report. Validating against ``sanitize_name``
+    truthiness (not raw ``strip()``) keeps the guard aligned with the renderer
+    (Codex #115 R3). Fail closed so the live voice never loses an affected name."""
+    for names in name_lists:
+        for n in names:
+            if not (isinstance(n, str) and sanitize_name(n)):
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -999,13 +1013,21 @@ def parse_save_recipe(
     if is_okv2(raw):
         try:
             status, payload = parse_tool_ok(raw, _SAVE_RECIPE_STATUSES)
-            return SaveRecipeOk(status=status, **payload)
+            model = SaveRecipeOk(status=status, **payload)
         except (ToolOkParseError, ValidationError, TypeError):
             return ToolOutputContractViolation(
                 raw_output=raw,
                 tool_name="save_recipe",
                 timestamp=datetime.now(timezone.utc),
             )
+        # #115: okv2 must carry a usable recipe name (blank → silent voice drop).
+        if not _all_names_usable([model.title] if model.title is not None else [""]):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="save_recipe",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     m = _SAVE_RECIPE_RE.match(raw.strip())
     if m is not None:
         try:
@@ -1103,6 +1125,12 @@ def parse_save_recipes_batch(
         if (
             len(model.created) != model.created_count
             or len(model.duplicates_existing) != model.skipped_as_duplicate
+            or not _all_names_usable(
+                model.created,
+                model.duplicates_existing,
+                model.duplicates_in_batch,
+                model.invalid,
+            )
         ):
             return ToolOutputContractViolation(
                 raw_output=raw,
@@ -1598,10 +1626,16 @@ class AddFamilyMembersOk(BaseModel):
     ``len(member_ids) == added_count``."""
 
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["added"] = "added"
     added_count: int = Field(ge=0)
     skipped_as_duplicate: int = Field(ge=0)
     member_ids: list[FamilyMemberId]
+    # #115 by-name buckets (okv2 path); empty on legacy positional.
+    created: list[str] = Field(default_factory=list)
+    duplicates_existing: list[str] = Field(default_factory=list)
+    duplicates_in_batch: list[str] = Field(default_factory=list)
+    invalid: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_count_matches_ids(self) -> "AddFamilyMembersOk":
@@ -1620,6 +1654,19 @@ class AddFamilyMembersOk(BaseModel):
                 "'error: empty batch' instead)."
             )
         return self
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        """#115: by-name outcome for the live voice (ids never shown)."""
+        return build_display_summary(
+            [
+                ("Добавила", self.created),
+                ("Уже были", self.duplicates_existing),
+                ("Повтор", self.duplicates_in_batch),
+                ("Не получилось", self.invalid),
+            ]
+        )
 
 
 AddFamilyMembersOutput = Annotated[
@@ -1645,6 +1692,46 @@ def parse_add_family_members(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries by-name buckets; legacy positional (names empty) stays.
+    if is_okv2(raw):
+        _BUCKET_KEYS = {"created", "duplicates_existing", "duplicates_in_batch", "invalid"}
+        try:
+            status, payload = parse_tool_ok(raw, frozenset({"added"}))
+            # Codex #115 [MAJOR]: okv2 producers MUST send all four name buckets
+            # (legacy positional keeps the defaults). A missing key = malformed.
+            if not _BUCKET_KEYS.issubset(payload):
+                raise ToolOkParseError("add_family_members okv2 missing name buckets")
+            model = AddFamilyMembersOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="add_family_members",
+                timestamp=datetime.now(timezone.utc),
+            )
+        # created names match added_count; named skipped buckets cannot EXCEED the
+        # aggregate skipped count (nameless/untitled rows are intentionally
+        # unreported, so <= not == — Codex #115 [MAJOR]).
+        named_skipped = (
+            len(model.duplicates_existing)
+            + len(model.duplicates_in_batch)
+            + len(model.invalid)
+        )
+        if (
+            len(model.created) != model.added_count
+            or named_skipped > model.skipped_as_duplicate
+            or not _all_names_usable(
+                model.created,
+                model.duplicates_existing,
+                model.duplicates_in_batch,
+                model.invalid,
+            )
+        ):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="add_family_members",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     m = _ADD_FAMILY_RE.match(raw.strip())
     if m is not None:
         n = int(m.group("n"))
@@ -1824,7 +1911,17 @@ def parse_list_family_members(
 
 class UpdateFamilyMemberOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["updated"] = "updated"
+    name: str | None = None
+    """#115: updated member NAME (okv2 path). None on legacy ``ok:updated``."""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.name:
+            return "Готово."
+        return build_display_summary([("Обновила", [self.name])])
 
 
 UpdateFamilyMemberOutput = Annotated[
@@ -1839,6 +1936,28 @@ def parse_update_family_member(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries the updated name; legacy bare "ok:updated" stays (name=None).
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(raw, frozenset({"updated"}))
+            model = UpdateFamilyMemberOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="update_family_member",
+                timestamp=datetime.now(timezone.utc),
+            )
+        # Codex #115 [MAJOR]: okv2 MUST carry a usable name (only legacy
+        # "ok:updated" is nameless). Validate against the SAME sanitizer the
+        # renderer uses (Codex #115 R4) — a control/guillemet-only name would
+        # otherwise pass strip() then vanish from display_summary.
+        if not _all_names_usable([model.name]):
+            return ToolOutputContractViolation(
+                raw_output=raw,
+                tool_name="update_family_member",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     if raw.strip() == "ok:updated":
         return UpdateFamilyMemberOk()
     return ToolOutputContractViolation(

@@ -660,7 +660,10 @@ def test_household_parser_outputs_are_valid_against_spec_output_model(tool, raw)
         f"unexpected violation for {tool} / {raw!r}"
     )
     adapter = TypeAdapter(spec.output_model)
-    validated = adapter.validate_python(parsed.model_dump())
+    # #115: exclude @computed_field (output-only, e.g. display_summary) — mirrors
+    # dispatch_typed_output; extra='forbid' variants reject them as input.
+    computed = set(getattr(type(parsed), "model_computed_fields", {}))
+    validated = adapter.validate_python(parsed.model_dump(exclude=computed))
     # Roundtrip must produce the same status discriminator.
     assert validated.status == parsed.status
 

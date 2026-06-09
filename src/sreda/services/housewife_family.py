@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -44,6 +44,17 @@ class FamilyMemberInput:
     birth_year: int | None = None
     age_hint: str | None = None
     notes: str | None = None
+
+
+@dataclass(slots=True)
+class AddFamilyMembersResult:
+    """#115 by-name outcome for ``add_members_batch_detailed`` so the live voice
+    can confirm who was added / already existed / repeated / was invalid."""
+
+    created: list["FamilyMember"] = field(default_factory=list)
+    duplicates_existing: list[str] = field(default_factory=list)  # names
+    duplicates_in_batch: list[str] = field(default_factory=list)  # names
+    invalid: list[str] = field(default_factory=list)  # nameable validation drops
 
 
 class HousewifeFamilyService:
@@ -189,10 +200,24 @@ class HousewifeFamilyService:
           2. Against DB: if a member with the same normalised name
              already exists, skip (previous turn already added them).
         """
-        created: list[FamilyMember] = []
+        # Back-compat: existing callers/tests expect the list of created rows.
+        return self.add_members_batch_detailed(
+            tenant_id=tenant_id, user_id=user_id, members=members
+        ).created
+
+    def add_members_batch_detailed(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        members: list[dict[str, Any]],
+    ) -> AddFamilyMembersResult:
+        """#115: same logic as ``add_members_batch`` but returns the full by-name
+        outcome (created / duplicates_existing / duplicates_in_batch / invalid) so
+        the live voice can confirm who landed vs was already there vs repeated vs
+        dropped. Untitled / non-dict rows have no name and are not reported."""
+        result = AddFamilyMembersResult()
         seen_in_batch: set[str] = set()
-        # Snapshot the existing book once; we'll augment the set as we
-        # insert so two "Катя" entries inside the batch also collapse.
         existing_keys = {
             _normalise_name(m.name)
             for m in self.list_members(tenant_id=tenant_id, user_id=user_id)
@@ -205,10 +230,12 @@ class HousewifeFamilyService:
                 continue
             key = _normalise_name(name)
             if key in seen_in_batch:
+                result.duplicates_in_batch.append(name)  # #115
                 continue
             seen_in_batch.add(key)
             if key in existing_keys:
-                continue  # already in DB from an earlier call
+                result.duplicates_existing.append(name)  # #115 (already in DB)
+                continue
             try:
                 row = self.add_member(
                     tenant_id=tenant_id,
@@ -220,12 +247,11 @@ class HousewifeFamilyService:
                     notes=raw.get("notes"),
                 )
             except (ValueError, TypeError):
+                result.invalid.append(name)  # #115 nameable validation drop
                 continue
-            # Track the newly-inserted key so a later entry in the
-            # same batch with the same normalised name is deduped too.
             existing_keys.add(key)
-            created.append(row)
-        return created
+            result.created.append(row)
+        return result
 
     # ------------------------------------------------------------------
     # Read
