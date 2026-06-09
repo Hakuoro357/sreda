@@ -1970,7 +1970,7 @@ def build_housewife_tools(
             with sf() as fresh_session:
                 try:
                     svc = _TS(fresh_session, bot_key=bot_key)
-                    task = svc.add_task_with_details(
+                    task, created_details = svc.add_task_with_details(
                         tenant_id=tenant_id,
                         user_id=user_id,
                         title=title,
@@ -1983,11 +1983,22 @@ def build_housewife_tools(
                         details_items=details_items,
                     )
                     fresh_session.commit()
-                    chk_suffix = (
-                        f":checklist={task.checklist_id}"
-                        if task.checklist_id else ""
+                    # #115: okv2 carries the task name + the ACTUALLY-created
+                    # checklist item names (within-batch dedup already applied —
+                    # no over-reporting of duplicate inputs).
+                    if task.checklist_id:
+                        return encode_tool_ok(
+                            "created_with_checklist",
+                            {
+                                "task_id": task.id,
+                                "checklist_id": task.checklist_id,
+                                "task_title": task.title,
+                                "details_added": created_details,
+                            },
+                        )
+                    return encode_tool_ok(
+                        "created", {"task_id": task.id, "task_title": task.title}
                     )
-                    return f"ok:created:{task.id}{chk_suffix}"
                 except ValueError as exc:
                     fresh_session.rollback()
                     return f"error:{exc}"
@@ -2014,10 +2025,17 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("add_task failed")
             return "error: internal"
-        suffix = ""
+        # #115: okv2 carries the task name (+ reminder offset on the reminder path).
         if task.reminder_id:
-            suffix = f":reminder=за {task.reminder_offset_minutes}мин"
-        return f"ok:created:{task.id}{suffix}"
+            return encode_tool_ok(
+                "created_with_reminder",
+                {
+                    "task_id": task.id,
+                    "reminder_offset_minutes": task.reminder_offset_minutes,
+                    "task_title": task.title,
+                },
+            )
+        return encode_tool_ok("created", {"task_id": task.id, "task_title": task.title})
 
     @lc_tool
     def list_tasks(date: str = "today", status: str = "pending") -> str:

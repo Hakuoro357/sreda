@@ -53,7 +53,7 @@ def _get_session(tools):
 
 def test_add_task_minimal(tools):
     res = tools["add_task"].invoke({"title": "разминка"})
-    assert res.startswith("ok:created:task_")
+    assert res.startswith("okv2:created")  # #115 okv2 wire
 
     sess = _get_session(tools)
     row = sess.query(Task).one()
@@ -69,7 +69,7 @@ def test_add_task_with_today_and_time(tools):
         "time_start": "07:00",
         "time_end": "07:30",
     })
-    assert res.startswith("ok:created:task_")
+    assert res.startswith("okv2:created")  # #115 okv2 wire
     sess = _get_session(tools)
     row = sess.query(Task).one()
     assert row.scheduled_date is not None
@@ -85,7 +85,7 @@ def test_add_task_with_recurrence(tools):
         "time_start": "07:00",
         "recurrence_rule": rrule,
     })
-    assert res.startswith("ok:created:task_")
+    assert res.startswith("okv2:created")  # #115 okv2 wire
     sess = _get_session(tools)
     assert sess.query(Task).one().recurrence_rule == rrule
 
@@ -97,8 +97,8 @@ def test_add_task_inline_reminder_creates_reminder_row(tools):
         "time_start": "10:00",
         "reminder_offset_minutes": 15,
     })
-    assert res.startswith("ok:created:")
-    assert "reminder=за 15мин" in res
+    parsed = parse_tool_output("add_task", res)  # #115 okv2
+    assert parsed.status == "created_with_reminder" and parsed.reminder_offset_minutes == 15
     sess = _get_session(tools)
     assert sess.query(FamilyReminder).count() == 1
 
@@ -194,7 +194,7 @@ def _add_today_task(tools, title="X") -> str:
     res = tools["add_task"].invoke({
         "title": title, "scheduled_date": "today", "time_start": "10:00",
     })
-    return res.split(":")[2].split(":")[0]  # extract task_<id>
+    return parse_tool_output("add_task", res).task_id  # extract task_<id>
 
 
 def test_complete_task_marks_completed(tools):
@@ -287,7 +287,7 @@ def test_detach_reminder(tools):
         "title": "X", "scheduled_date": "today",
         "time_start": "10:00", "reminder_offset_minutes": 15,
     })
-    task_id = res.split(":")[2].split(":")[0]
+    task_id = parse_tool_output("add_task", res).task_id
     assert tools["detach_reminder"].invoke({"task_id": task_id}) == "ok:reminder_detached"
     sess = _get_session(tools)
     task = sess.query(Task).one()

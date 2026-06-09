@@ -143,7 +143,7 @@ class TaskService:
         delegated_to: str | None = None,
         reminder_offset_minutes: int | None = None,
         details_items: list[str] | None = None,
-    ) -> Task:
+    ) -> tuple[Task, list[str]]:
         """R-33 (2026-05-15): atomic composite create (task + checklist + items + link).
 
         **Fresh-session contract** (Codex R4 prescription): caller MUST own the
@@ -167,7 +167,10 @@ class TaskService:
         для composite create (e.g. «Крой: страйп белый, ледяная мята, ...»
         → task «Крой» + checklist «Крой» + 6 items + link).
 
-        Returns Task (flushed but not committed). Caller commits.
+        Returns ``(task, created_item_titles)`` — flushed but not committed; caller
+        commits. ``created_item_titles`` (#115) are the checklist items ACTUALLY
+        created (after within-batch dedup), not the raw input, so the live voice
+        never over-reports duplicates. Empty when no details/checklist.
         """
         from sreda.services.checklists import ChecklistService
 
@@ -195,6 +198,7 @@ class TaskService:
         self.session.flush()  # NO commit — caller owns TX
 
         # Optional composite: checklist + items + link
+        created_item_titles: list[str] = []
         if details_items:
             cleaned_items = [s.strip() for s in details_items if (s or "").strip()]
             if cleaned_items:
@@ -205,14 +209,17 @@ class TaskService:
                     title=title_clean,
                     force_new=True,  # always fresh для composite path
                 )
-                chk_svc.add_items_no_commit(
+                # #115: capture the ACTUALLY-created item titles (within-batch dedup
+                # already applied) — not the raw input — so we never over-report.
+                created_items, _skipped = chk_svc.add_items_no_commit(
                     list_id=checklist.id,
                     items=cleaned_items,
                 )
+                created_item_titles = [it.title for it in created_items]
                 task.checklist_id = checklist.id
                 self.session.flush()
 
-        return task
+        return task, created_item_titles
 
     def link_to_checklist(
         self, *, tenant_id: str, user_id: str, task_id: str, checklist_id: str,

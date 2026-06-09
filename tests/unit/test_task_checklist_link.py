@@ -71,7 +71,7 @@ def test_add_task_with_details_none_creates_plain_task() -> None:
     """details_items=None → ordinary task, no checklist linked."""
     s = _setup_session()
     svc = TaskService(s)
-    task = svc.add_task_with_details(
+    task, _created = svc.add_task_with_details(  # #115 returns (task, created_titles)
         tenant_id="t1",
         user_id="u1",
         title="Купить молоко",
@@ -95,7 +95,7 @@ def test_add_task_with_details_creates_fresh_checklist_with_items() -> None:
     """details_items=[...] → creates fresh checklist + items + links task atomically."""
     s = _setup_session()
     svc = TaskService(s)
-    task = svc.add_task_with_details(
+    task, _created = svc.add_task_with_details(  # #115 returns (task, created_titles)
         tenant_id="t1",
         user_id="u1",
         title="Крой",
@@ -123,12 +123,38 @@ def test_add_task_with_details_creates_fresh_checklist_with_items() -> None:
     assert titles == sorted(["страйп белый", "ледяная мята", "жемчуг"])
 
 
+def test_add_task_with_details_dedups_and_reports_actual_created_titles() -> None:
+    """#115: duplicate input items collapse to one row, and the returned
+    created_titles reflect what was ACTUALLY created (no over-report — Codex MAJOR)."""
+    s = _setup_session()
+    svc = TaskService(s)
+    task, created = svc.add_task_with_details(
+        tenant_id="t1",
+        user_id="u1",
+        title="Сборы",
+        scheduled_date=None,
+        time_start=None,
+        time_end=None,
+        recurrence_rule=None,
+        notes=None,
+        delegated_to=None,
+        reminder_offset_minutes=None,
+        details_items=["паспорт", " паспорт ", "билеты"],  # 1st≡2nd after strip
+    )
+    s.commit()
+    assert sorted(created) == sorted(["паспорт", "билеты"])  # NOT 3 — dedup applied
+    items = s.query(ChecklistItem).filter(
+        ChecklistItem.checklist_id == task.checklist_id
+    ).all()
+    assert len(items) == 2
+
+
 def test_add_task_with_details_force_new_suffix_on_collision() -> None:
     """If active checklist с same title уже существует → fresh с suffix «(2)»."""
     s = _setup_session()
     svc = TaskService(s)
     # First create
-    t1 = svc.add_task_with_details(
+    t1, _c1 = svc.add_task_with_details(  # #115
         tenant_id="t1", user_id="u1", title="Крой",
         scheduled_date=date(2026, 5, 15),
         time_start=None, time_end=None,
@@ -138,7 +164,7 @@ def test_add_task_with_details_force_new_suffix_on_collision() -> None:
     )
     s.commit()
     # Second create — same title
-    t2 = svc.add_task_with_details(
+    t2, _c2 = svc.add_task_with_details(  # #115
         tenant_id="t1", user_id="u1", title="Крой",
         scheduled_date=date(2026, 5, 16),
         time_start=None, time_end=None,

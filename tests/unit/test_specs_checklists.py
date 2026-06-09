@@ -307,7 +307,7 @@ def test_move_task_chat_tool_wraps_find_list_by_title_exception() -> None:
         }
         # Create a task to cancel
         task_result = tools["add_task"].invoke({"title": "x", "scheduled_date": "tomorrow"})
-        task_id = task_result.split("ok:created:")[1].split(":")[0]
+        task_id = parse_tool_output("add_task", task_result).task_id  # #115 okv2
 
         # Mock find_list_by_title to raise
         with patch(
@@ -349,7 +349,7 @@ def test_move_task_chat_tool_create_list_value_error_remaps_to_partial() -> None
             )
         }
         task_result = tools["add_task"].invoke({"title": "y", "scheduled_date": "tomorrow"})
-        task_id = task_result.split("ok:created:")[1].split(":")[0]
+        task_id = parse_tool_output("add_task", task_result).task_id  # #115 okv2
 
         # Whitespace-only list_id_or_title — find_list_by_title returns None,
         # then create_list raises ValueError("title required").

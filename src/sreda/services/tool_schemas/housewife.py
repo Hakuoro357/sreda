@@ -2062,8 +2062,17 @@ def parse_remove_family_member(
 class AddTaskCreated(BaseModel):
     """Plain happy path — no reminder, no checklist (legacy code path)."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["created"] = "created"
     task_id: TaskId
+    task_title: str | None = None  # #115 task NAME (okv2); None on legacy positional
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.task_title:
+            return "Готово."
+        return build_display_summary([("Создала задачу", [self.task_title])])
 
 
 class AddTaskCreatedWithReminder(BaseModel):
@@ -2071,9 +2080,18 @@ class AddTaskCreatedWithReminder(BaseModel):
     is the integer the planner supplied — runtime echoes it back in the
     «за Nмин» segment which the parser extracts."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["created_with_reminder"] = "created_with_reminder"
     task_id: TaskId
     reminder_offset_minutes: int = Field(ge=1)
+    task_title: str | None = None  # #115
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.task_title:
+            return "Готово."
+        return build_display_summary([("Создала задачу", [self.task_title])])
 
 
 class AddTaskCreatedWithChecklist(BaseModel):
@@ -2081,9 +2099,21 @@ class AddTaskCreatedWithChecklist(BaseModel):
     same transaction. ``checklist_id`` is the new checklist's id so
     the planner can reference it in subsequent calls."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["created_with_checklist"] = "created_with_checklist"
     task_id: TaskId
     checklist_id: ChecklistId
+    task_title: str | None = None  # #115
+    details_added: list[str] = Field(default_factory=list)  # #115 checklist item names
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.task_title:
+            return "Готово."
+        return build_display_summary(
+            [("Создала задачу", [self.task_title]), ("Пункты", self.details_added)]
+        )
 
 
 AddTaskOutput = Annotated[
@@ -2116,6 +2146,37 @@ def parse_add_task(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries the task name (+ container item names); legacy positional stays.
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(
+                raw,
+                frozenset({"created", "created_with_reminder", "created_with_checklist"}),
+            )
+            if status == "created_with_reminder":
+                t_model: (
+                    AddTaskCreated | AddTaskCreatedWithReminder | AddTaskCreatedWithChecklist
+                ) = AddTaskCreatedWithReminder(status=status, **payload)
+            elif status == "created_with_checklist":
+                t_model = AddTaskCreatedWithChecklist(status=status, **payload)
+            else:
+                t_model = AddTaskCreated(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="add_task",
+                timestamp=datetime.now(timezone.utc),
+            )
+        bad = not _all_names_usable([t_model.task_title])
+        if isinstance(t_model, AddTaskCreatedWithChecklist):
+            # okv2 container MUST carry non-empty, usable item names (legacy
+            # positional `:checklist=<id>` keeps details_added=[] and is exempt).
+            bad = bad or not t_model.details_added or not _all_names_usable(t_model.details_added)
+        if bad:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="add_task",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return t_model
     m = _ADD_TASK_RE.match(raw.strip())
     if m is None:
         return ToolOutputContractViolation(
