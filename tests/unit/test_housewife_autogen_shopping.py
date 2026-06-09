@@ -14,6 +14,7 @@ from sreda.db.base import Base
 from sreda.db.models.core import Tenant, User
 from sreda.db.models.housewife_food import ShoppingListItem
 from sreda.services.housewife_chat_tools import build_housewife_tools
+from sreda.services.tool_schemas.housewife import parse_tool_output  # #115
 
 
 @pytest.fixture
@@ -54,7 +55,7 @@ def test_generate_shopping_from_menu_end_to_end(session):
         "servings": 4,
         "source": "user_dictated",
     })
-    r1_id = r1.split(":")[-1]
+    r1_id = parse_tool_output("save_recipe", r1).recipe_id  # #115 okv2
 
     r2 = tools["save_recipe"].invoke({
         "title": "Омлет",
@@ -63,7 +64,7 @@ def test_generate_shopping_from_menu_end_to_end(session):
         "servings": 2,
         "source": "ai_generated",
     })
-    r2_id = r2.split(":")[-1]
+    r2_id = parse_tool_output("save_recipe", r2).recipe_id  # #115 okv2
 
     # 2. Plan a week referencing both
     plan_result = tools["plan_week_menu"].invoke({
@@ -140,7 +141,7 @@ def test_list_menu_returns_llm_readable_day_blocks(session):
         "servings": 2,
         "source": "user_dictated",
     })
-    recipe_id = recipe_result.split(":")[-1]
+    recipe_id = parse_tool_output("save_recipe", recipe_result).recipe_id  # #115 okv2
 
     plan = tools["plan_week_menu"].invoke({
         "week_start": "2026-04-20",
@@ -255,7 +256,7 @@ def test_generate_shopping_from_menu_recipe_cells_empty_conversion_yields_zero_e
         "servings": 1,
         "source": "user_dictated",
     })
-    r1_id = r1.split(":")[-1]
+    r1_id = parse_tool_output("save_recipe", r1).recipe_id  # #115 okv2
 
     plan = tools["plan_week_menu"].invoke({
         "week_start": "2026-04-20",

@@ -754,14 +754,14 @@ def test_update_family_member_chat_tool_propagates_clear_birth_year():
                 "name": "Маша", "role": "child", "birth_year": 2017,
             }],
         })
-        # Parse fm_id from "ok:added:1:skipped_as_duplicate:0:ids=[fm_...]"
-        member_id = result.split("ids=[")[1].rstrip("]")
+        # #115: add_family_members now emits okv2 — parse to get the member id.
+        member_id = parse_tool_output("add_family_members", result).member_ids[0]  # #115 okv2
 
         # Clear via the chat tool
         out = tools["update_family_member"].invoke({
             "member_id": member_id, "clear_birth_year": True,
         })
-        assert out == "ok:updated"
+        assert out.startswith("okv2:updated:")  # #115 okv2 wire carries the name
 
 
 def test_update_family_member_chat_tool_rejects_birth_year_and_clear_together():
@@ -784,7 +784,7 @@ def test_update_family_member_chat_tool_rejects_birth_year_and_clear_together():
         result = tools["add_family_members"].invoke({
             "members": [{"name": "Маша", "role": "child"}],
         })
-        member_id = result.split("ids=[")[1].rstrip("]")
+        member_id = parse_tool_output("add_family_members", result).member_ids[0]  # #115 okv2
 
         out = tools["update_family_member"].invoke({
             "member_id": member_id,

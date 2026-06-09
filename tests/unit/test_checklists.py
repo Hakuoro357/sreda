@@ -351,7 +351,7 @@ def test_tool_add_items_implicit_create(tools):
         "list_id_or_title": "Новый список",
         "items": ["a", "b"],
     })
-    assert r.startswith("ok:added:2:list=checklist_")
+    assert r.startswith("okv2:added:") and "a" in r and "b" in r  # #115 okv2 + names
 
 
 def test_tool_add_items_resolves_existing_by_title(tools):
@@ -360,7 +360,7 @@ def test_tool_add_items_resolves_existing_by_title(tools):
         "list_id_or_title": "план кроя",  # case-insensitive substring
         "items": ["x"],
     })
-    assert r.startswith("ok:added:1:list=checklist_")
+    assert r.startswith("okv2:added:") and "x" in r  # #115 okv2 + name
 
 
 def test_tool_show_checklist_marks(tools, session):
@@ -486,7 +486,7 @@ def test_save_recipe_with_str_tags_does_not_fail(tools, session):
         "source": "user_dictated",
         "tags": '["sup","obed"]',
     })
-    assert r.startswith("ok:saved:rec_"), f"unexpected: {r}"
+    assert r.startswith("okv2:saved:"), f"unexpected: {r}"  # #115 okv2 wire
 
 
 # ---------------------------------------------------------------------------

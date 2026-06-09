@@ -2511,12 +2511,28 @@ def build_housewife_tools(
         # 2026-04-28: возвращаем и dup count чтобы LLM мог сказать
         # юзеру «3 пункта добавлены, 2 уже были» вместо тихого
         # удвоения (incident tg_634496616 — move task создал дубль).
+        # #115: okv2 carries the added item NAMES (+ skipped duplicate names) so
+        # the live voice can say «добавила: X, Y; уже было: Z» (was count-only).
         if skipped_dup:
-            return (
-                f"ok:added:{len(added)}:dups:{len(skipped_dup)}:"
-                f"list={cl.id}"
+            return encode_tool_ok(
+                "added_with_dups",
+                {
+                    "added_count": len(added),
+                    "duplicate_count": len(skipped_dup),
+                    "checklist_id": cl.id,
+                    "created": [i.title for i in added],
+                    "duplicates_existing": list(skipped_dup),
+                },
             )
-        return f"ok:added:{len(added)}:list={cl.id}"
+        return encode_tool_ok(
+            "added",
+            {
+                "added_count": len(added),
+                "duplicate_count": 0,
+                "checklist_id": cl.id,
+                "created": [i.title for i in added],
+            },
+        )
 
     @_write_lc_tool
     def move_task_to_checklist(

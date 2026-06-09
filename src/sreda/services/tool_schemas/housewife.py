@@ -2900,10 +2900,20 @@ class AddChecklistItemsOk(BaseModel):
     """Variant 1: ``ok:added:N:list=<id>`` (no dups segment).
     All items new, no duplicates skipped."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["added"] = "added"
     added_count: int = Field(ge=0)
-    duplicate_count: int = 0
+    # Codex #115 [MAJOR]: the no-dups variant MUST have zero duplicates — a
+    # non-zero value belongs to AddChecklistItemsWithDups. Literal[0] fail-closes
+    # a malformed okv2 `added` payload carrying duplicate_count>0.
+    duplicate_count: Literal[0] = 0
     checklist_id: ChecklistId
+    created: list[str] = Field(default_factory=list)  # #115 added item names (okv2)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return build_display_summary([("Добавила", self.created)])
 
 
 class AddChecklistItemsWithDups(BaseModel):
@@ -2911,10 +2921,20 @@ class AddChecklistItemsWithDups(BaseModel):
     matched existing pending items in the list — runtime
     dedup-skipped them."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["added_with_dups"] = "added_with_dups"
     added_count: int = Field(ge=0)
     duplicate_count: int = Field(ge=1)
     checklist_id: ChecklistId
+    created: list[str] = Field(default_factory=list)  # #115 added item names (okv2)
+    duplicates_existing: list[str] = Field(default_factory=list)  # #115 skipped dup names
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return build_display_summary(
+            [("Добавила", self.created), ("Уже было", self.duplicates_existing)]
+        )
 
 
 AddChecklistItemsOutput = Annotated[
@@ -2947,6 +2967,35 @@ def parse_add_checklist_items(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries item names; legacy positional (counts only) stays.
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(
+                raw, frozenset({"added", "added_with_dups"})
+            )
+            if status == "added_with_dups":
+                model: AddChecklistItemsOk | AddChecklistItemsWithDups = (
+                    AddChecklistItemsWithDups(status=status, **payload)
+                )
+            else:
+                model = AddChecklistItemsOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="add_checklist_items",
+                timestamp=datetime.now(timezone.utc),
+            )
+        bad = len(model.created) != model.added_count or not _all_names_usable(model.created)
+        if isinstance(model, AddChecklistItemsWithDups):
+            bad = bad or (
+                len(model.duplicates_existing) != model.duplicate_count
+                or not _all_names_usable(model.duplicates_existing)
+            )
+        if bad:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="add_checklist_items",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     stripped = raw.strip()
     m_with = _ADD_CHECKLIST_ITEMS_WITHDUPS_RE.match(stripped)
     if m_with is not None:
