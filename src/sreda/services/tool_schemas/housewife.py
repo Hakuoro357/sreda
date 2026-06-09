@@ -2685,9 +2685,16 @@ def parse_unlink_task(
 # 37. create_checklist
 class CreateChecklistOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["created"] = "created"
     checklist_id: ChecklistId
     title: str = Field(min_length=1, max_length=500)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        """#115: список NAME для живого голоса (id скрыт)."""
+        return build_display_summary([("Создала список", [self.title])])
 
 
 CreateChecklistOutput = Annotated[
@@ -3185,6 +3192,7 @@ def parse_show_checklist(
 # 42. mark_checklist_item_done
 class MarkChecklistItemDoneOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["done"] = "done"
     item_id: ChecklistItemId
     title: str = Field(min_length=1, max_length=1000)
@@ -3192,6 +3200,12 @@ class MarkChecklistItemDoneOk(BaseModel):
     add_items caps title at 1000 (checklists.py:463). Pre-R7
     schema cap of 500 would ContractViolation legacy rows with
     501-1000 char titles."""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        """#115: отмеченный пункт NAME для живого голоса (id скрыт)."""
+        return build_display_summary([("Отметила", [self.title])])
 
 
 MarkChecklistItemDoneOutput = Annotated[
@@ -3232,10 +3246,17 @@ def parse_mark_checklist_item_done(
 # 43. delete_checklist_item
 class DeleteChecklistItemOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["deleted"] = "deleted"
     item_id: ChecklistItemId
     title: str = Field(min_length=1, max_length=1000)
     """Codex R7 MINOR: cap matches runtime add_items (checklists.py:463)."""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        """#115: удалённый пункт NAME для живого голоса (id скрыт)."""
+        return build_display_summary([("Удалила пункт", [self.title])])
 
 
 DeleteChecklistItemOutput = Annotated[
