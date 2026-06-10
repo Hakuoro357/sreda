@@ -338,10 +338,13 @@ NO_CONTRACT: object = object()
 TEMPLATE_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "shopping_added_ok": ("items",),
     "shopping_added_empty": ("duplicates",),
-    "shopping_list_show": ("count", "items"),
+    # count ОПЦИОНАЛЕН (#118 R4): требуемый ключ обязан быть УДОВЛЕТВОРИМ
+    # ссылкой на поле выдачи инструмента — у list_shopping/list_reminders
+    # поля count нет, обязательность делала шаблон неиспользуемым.
+    "shopping_list_show": ("items",),
     "reminder_set_ok": ("when_phrase", "what"),
     "reminder_skipped_past": ("trigger_at_local", "late_by_minutes"),
-    "reminders_list_show": ("count", "items"),
+    "reminders_list_show": ("items",),
     "checklist_show": ("title", "items"),
     "checklist_empty": ("title",),
     "recipe_show": ("recipe_text",),
@@ -360,6 +363,9 @@ TEMPLATE_OPTIONAL_KEYS: dict[str, tuple[str, ...]] = {
     "partial_with_clarification": ("done_summary", "missing_fields"),
     "partial_with_compose_error": ("execution_summary",),
     "invalid_plan_fallback": ("attempt_count",),
+    # #118 R4 — count сторожится ``is defined`` (см. TEMPLATE_REQUIRED_KEYS)
+    "shopping_list_show": ("count",),
+    "reminders_list_show": ("count",),
 }
 
 # RUNTIME-ONLY templates (never planner-emitted; the validator rejects them
@@ -446,11 +452,21 @@ def _make_required_keys_contract(
             for i, item in enumerate(val):
                 if allow_refs and _is_full_ref(item):
                     continue
+                # #118 R3: templates render BOTH shapes — an object (mapping
+                # branch, per-item fields below) or a plain non-blank string
+                # (e.g. ${sN.created} resolves to list[str] post-execution).
+                if isinstance(item, str):
+                    if not item.strip():
+                        errors.append(
+                            f"{template_id} template_data[{list_key!r}][{i}] "
+                            f"is a blank string."
+                        )
+                    continue
                 if not isinstance(item, dict):
                     errors.append(
                         f"{template_id} template_data[{list_key!r}][{i}] must "
-                        f"be an object with {sorted(fields)} (the template "
-                        f"renders these per-item fields), got "
+                        f"be an object with {sorted(fields)} or a non-blank "
+                        f"string (the template renders either shape), got "
                         f"{type(item).__name__!r}."
                     )
                     continue

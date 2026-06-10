@@ -119,13 +119,94 @@ def test_data_templates_require_their_keys(template_id: str, missing_key: str):
 # --- вложенная форма элементов списков (Codex #118 R1 MAJOR) -----------------
 
 
-def test_list_template_str_items_rejected():
-    # шаблон рендерит it.raw_line — строковый элемент гарантированно роняет рендер
+def test_list_template_str_items_accepted_and_render():
+    # #118 R3: план вправе привязать ${sN.created} → список строк; шаблоны
+    # терпимы к обеим формам элемента — строка рендерится как есть
     plan = _plan_with_compose(
         "shopping_list_show", {"count": 1, "items": ["молоко"]},
     )
-    violations = _contract_violations(plan)
-    assert violations and any("raw_line" in v.message for v in violations)
+    assert _contract_violations(plan) == []
+    out = _COMPOSER_REGISTRY.render(
+        "shopping_list_show", {"count": 1, "items": ["молоко"]},
+    )
+    assert "молоко" in out
+    out2 = _COMPOSER_REGISTRY.render(
+        "checklist_show", {"title": "Дача", "items": ["грабли"]},
+    )
+    assert "грабли" in out2
+
+
+def _read_plan(tool: str, template_id: str) -> Plan:
+    """План естественной пары «читающий инструмент → его show-шаблон»
+    с привязкой items=${s1.items} — ровно живой путь, умиравший в R2-R4
+    (Codex R4 MAJOR: тест обязан доказывать полную валидность, а не только
+    отсутствие контрактных нарушений)."""
+    return Plan.model_validate({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": tool,
+                "args": {},
+                "expected_outcomes": [
+                    {"match": {"status": "ok"}, "next": None},
+                    {"match": {"status": "empty"}, "next": None},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "template",
+            "template_id": template_id,
+            "template_data": {"items": "${s1.items}"},
+        },
+    })
+
+
+@pytest.mark.parametrize(
+    "tool, template_id",
+    [("list_shopping", "shopping_list_show"),
+     ("list_reminders", "reminders_list_show")],
+)
+def test_read_plan_items_only_fully_valid(tool: str, template_id: str):
+    # #118 R4: у читающих инструментов нет поля count → требовать его нельзя
+    # (требуемый ключ обязан быть удовлетворим ссылкой на реальное поле
+    # выдачи). ПОЛНАЯ валидация — ноль нарушений любого кода.
+    violations = list(validate_plan(
+        _read_plan(tool, template_id), _REAL_REGISTRY,
+        composer_template_ids=_REAL_TEMPLATE_IDS,
+    ))
+    assert violations == [], [
+        (v.code, v.message[:90]) for v in violations
+    ]
+
+
+def test_list_show_without_count_renders():
+    out = _COMPOSER_REGISTRY.render("shopping_list_show", {"items": ["молоко"]})
+    assert "молоко" in out and "(" not in out.splitlines()[0]
+    out2 = _COMPOSER_REGISTRY.render(
+        "shopping_list_show", {"count": 1, "items": ["молоко"]},
+    )
+    assert "(1)" in out2  # с count — прежний вид
+
+
+def test_list_show_blank_count_renders_clean():
+    # Codex R4 MINOR: count=None/'' не должен рендерить «(None)» / «()»
+    for bad in (None, ""):
+        out = _COMPOSER_REGISTRY.render(
+            "shopping_list_show", {"count": bad, "items": ["молоко"]},
+        )
+        head = out.splitlines()[0]
+        assert "(" not in head and "None" not in head, repr(head)
+
+
+def test_list_template_blank_str_item_rejected():
+    plan = _plan_with_compose(
+        "shopping_list_show", {"count": 1, "items": ["  "]},
+    )
+    assert _contract_violations(plan), "пустая строка-элемент обязана отклоняться"
 
 
 def test_checklist_item_missing_status_rejected():

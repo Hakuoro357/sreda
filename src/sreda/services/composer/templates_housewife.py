@@ -26,10 +26,20 @@ _SHOPPING_ADDED_EMPTY = (
     "Ничего нового не добавила."
 )
 
+# #118: элемент может быть объектом ({raw_line}) ИЛИ плоской строкой — план
+# вправе привязать ${sN.created} (список строк из write-выдачи #115); строгая
+# форма роняла рендер уже ПОСЛЕ исполнения («'str object' has no attribute…»),
+# где повтора планировщика больше нет. Терпимый рендер отдаёт имена в обоих
+# случаях; формы элементов поверяет контракт (composer_contracts).
+# #118 R4: ``count`` ОПЦИОНАЛЕН — у list_shopping в выдаче нет такого поля,
+# планировщик не может удовлетворить его ссылкой (только неизвестным до
+# исполнения литералом) → обязательный count делал шаблон неиспользуемым
+# (диагноз: 3/3 проб модель привязывала items, но не count).
+# истинностный сторож (R4 MINOR): count=None/'' /0 не рендерит «(None)»/«()»
 _SHOPPING_LIST_SHOW = (
-    "В списке покупок ({{ count }}):"
+    "В списке покупок{% if count is defined and count %} ({{ count }}){% endif %}:"
     "{% for it in items %}"
-    "\n• {{ it.raw_line }}"
+    "\n• {% if it is mapping %}{{ it.raw_line }}{% else %}{{ it }}{% endif %}"
     "{% endfor %}"
 )
 
@@ -47,9 +57,9 @@ _REMINDER_SKIPPED_PAST = (
 )
 
 _REMINDERS_LIST_SHOW = (
-    "Напоминания ({{ count }}):"
+    "Напоминания{% if count is defined and count %} ({{ count }}){% endif %}:"
     "{% for it in items %}"
-    "\n• {{ it.raw_line }}"
+    "\n• {% if it is mapping %}{{ it.raw_line }}{% else %}{{ it }}{% endif %}"
     "{% endfor %}"
 )
 
@@ -62,10 +72,13 @@ _REMINDERS_LIST_EMPTY = "Активных напоминаний нет."
 # ``title`` (str) + ``items`` (list of ShowChecklistItem{title, item_status}).
 # A done item gets a ✅; pending/cancelled render plain.
 
+# #118: то же — объект ({title, item_status}) ИЛИ плоская строка (см. выше).
 _CHECKLIST_SHOW = (
     "{{ title }}:"
     "{% for it in items %}"
-    "\n• {{ it.title }}{% if it.item_status == 'done' %} ✅{% endif %}"
+    "\n• {% if it is mapping %}{{ it.title }}"
+    "{% if it.item_status == 'done' %} ✅{% endif %}"
+    "{% else %}{{ it }}{% endif %}"
     "{% endfor %}"
 )
 
