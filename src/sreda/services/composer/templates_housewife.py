@@ -26,7 +26,8 @@ _SHOPPING_ADDED_EMPTY = (
     "Ничего нового не добавила."
 )
 
-# #118: элемент может быть объектом ({raw_line}) ИЛИ плоской строкой — план
+# #118/#119: элемент — объект ({display_line} — ЧИСТАЯ строка без [id]; raw_line
+# планировщику не для показа) ИЛИ плоская строка — план
 # вправе привязать ${sN.created} (список строк из write-выдачи #115); строгая
 # форма роняла рендер уже ПОСЛЕ исполнения («'str object' has no attribute…»),
 # где повтора планировщика больше нет. Терпимый рендер отдаёт имена в обоих
@@ -39,7 +40,7 @@ _SHOPPING_ADDED_EMPTY = (
 _SHOPPING_LIST_SHOW = (
     "В списке покупок{% if count is defined and count %} ({{ count }}){% endif %}:"
     "{% for it in items %}"
-    "\n• {% if it is mapping %}{{ it.raw_line }}{% else %}{{ it }}{% endif %}"
+    "\n• {% if it is mapping %}{{ it.display_line }}{% else %}{{ it }}{% endif %}"
     "{% endfor %}"
 )
 
@@ -59,7 +60,7 @@ _REMINDER_SKIPPED_PAST = (
 _REMINDERS_LIST_SHOW = (
     "Напоминания{% if count is defined and count %} ({{ count }}){% endif %}:"
     "{% for it in items %}"
-    "\n• {% if it is mapping %}{{ it.raw_line }}{% else %}{{ it }}{% endif %}"
+    "\n• {% if it is mapping %}{{ it.display_line }}{% else %}{{ it }}{% endif %}"
     "{% endfor %}"
 )
 

@@ -238,9 +238,9 @@ def test_list_template_item_field_ref_accepted():
 def test_item_field_empty_container_rejected():
     # Codex R2 medium MINOR: пустые []/{} во вложенном поле — тоже «пусто»
     plan = _plan_with_compose(
-        "shopping_list_show", {"count": 1, "items": [{"raw_line": []}]},
+        "shopping_list_show", {"count": 1, "items": [{"display_line": []}]},
     )
-    assert _contract_violations(plan), "raw_line=[] обязан отклоняться"
+    assert _contract_violations(plan), "display_line=[] обязан отклоняться"
     plan2 = _plan_with_compose(
         "checklist_show",
         {"title": "Дача", "items": [{"title": {}, "item_status": "pending"}]},
@@ -271,7 +271,7 @@ def test_item_fields_map_not_stale():
 def test_list_template_good_literal_items_accepted():
     plan = _plan_with_compose(
         "shopping_list_show",
-        {"count": 1, "items": [{"raw_line": "молоко"}]},
+        {"count": 1, "items": [{"display_line": "молоко"}]},
     )
     assert _contract_violations(plan) == []
 

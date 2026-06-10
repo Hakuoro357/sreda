@@ -625,6 +625,11 @@ class ListShoppingItem(BaseModel):
     raw_line: str
     """Original line — title / qty parsing varies tool-version-by-version,
     so the planner gets the raw text and the structured id for refs."""
+    display_line: str = Field(min_length=1)
+    """#119: user-safe line — the same text WITHOUT the bracketed id prefix.
+    Show templates render THIS field; ``raw_line`` is planner-facing only
+    (an id leaked to the user via the show templates on the #118 acceptance
+    regression — real turn of tenant_tg_755682022)."""
 
 
 class ListShoppingEmpty(BaseModel):
@@ -720,6 +725,7 @@ def parse_list_shopping(
                     item_id=item_match.group("id"),
                     category=current_category,
                     raw_line=clean,
+                    display_line=item_match.group("rest").strip(),
                 )
             )
         except ValidationError:
@@ -754,6 +760,11 @@ class ListRemindersItem(BaseModel):
     """Codex R2 MAJOR #4: was ``str`` — now uses the tight
     ``rem_<24 hex>`` pattern."""
     raw_line: str
+    display_line: str = Field(min_length=1)
+    """#119: user-safe line — the same text WITHOUT the bracketed id prefix.
+    Show templates render THIS field; ``raw_line`` is planner-facing only
+    (an id leaked to the user via the show templates on the #118 acceptance
+    regression — real turn of tenant_tg_755682022)."""
 
 
 class ListRemindersEmpty(BaseModel):
@@ -806,7 +817,11 @@ def parse_list_reminders(
                 timestamp=datetime.now(timezone.utc),
             )
         try:
-            items.append(ListRemindersItem(reminder_id=m.group("id"), raw_line=line))
+            items.append(ListRemindersItem(
+                reminder_id=m.group("id"),
+                raw_line=line,
+                display_line=m.group("rest").strip(),
+            ))
         except ValidationError:
             # Codex R2 MAJOR #4: bracketed token isn't a valid
             # ``rem_<24 hex>`` — fail-closed via sentinel.
@@ -1511,6 +1526,11 @@ class SearchRecipesItem(BaseModel):
     raw_line: str
     """Raw line text — title + badge + tags blob. Renderer-friendly,
     parsed forward into ``planner`` references for compose templates."""
+    display_line: str = Field(min_length=1)
+    """#119: user-safe line — the same text WITHOUT the bracketed id prefix.
+    Show templates render THIS field; ``raw_line`` is planner-facing only
+    (an id leaked to the user via the show templates on the #118 acceptance
+    regression — real turn of tenant_tg_755682022)."""
 
 
 class SearchRecipesEmpty(BaseModel):
@@ -1531,7 +1551,7 @@ SearchRecipesOutput = Annotated[
 ]
 
 _SEARCH_HEADER_RE = re.compile(r"^(?P<n>\d+)\s+recipe\(s\):$")
-_SEARCH_ITEM_RE = re.compile(r"^\[(?P<id>rec_[^\]]+)\]\s+.+$")
+_SEARCH_ITEM_RE = re.compile(r"^\[(?P<id>rec_[^\]]+)\]\s+(?P<rest>.+)$")
 
 
 def parse_search_recipes(
@@ -1567,6 +1587,7 @@ def parse_search_recipes(
             items.append(SearchRecipesItem(
                 recipe_id=m.group("id"),
                 raw_line=line,
+                display_line=m.group("rest").strip(),
             ))
         except ValidationError:
             return ToolOutputContractViolation(

@@ -379,16 +379,33 @@ RUNTIME_ONLY_TEMPLATE_KEYS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Per-item fields the list templates render UNGUARDED on each element of a
-# LITERAL ``items`` list (``it.raw_line`` / ``it.title`` / ``it.item_status``).
-# Verified empirically: a str element or a dict missing the field crashes
-# StrictUndefined at render (Codex #118 R1 MAJOR — top-level checks alone
-# leave the validate-pass/render-fail class open one level deeper).
+# Per-item fields the MAPPING branch renders on each LITERAL object element
+# of ``items`` (``it.display_line`` / ``it.title`` / ``it.item_status``) — a
+# dict missing the field crashes StrictUndefined at render (Codex #118 R1
+# MAJOR). Plain non-blank STRING elements are accepted (#118 R3) and render
+# verbatim, so they must be user-safe already — refs ending in ``.raw_line``
+# are rejected lexically (#119: raw_line carries the bracketed id).
 _TEMPLATE_ITEM_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
-    "shopping_list_show": {"items": ("raw_line",)},
-    "reminders_list_show": {"items": ("raw_line",)},
+    "shopping_list_show": {"items": ("display_line",)},
+    "reminders_list_show": {"items": ("display_line",)},
     "checklist_show": {"items": ("title", "item_status")},
 }
+
+
+def _is_raw_line_ref(v: object) -> bool:
+    """True для полной ``${...}``-ссылки, чей путь оканчивается на
+    ``.raw_line`` — поле для планировщика с ``[id]``-префиксом, которое
+    нельзя показывать пользователю (#119)."""
+    return _is_full_ref(v) and v[2:-1].strip().endswith(".raw_line")  # type: ignore[index]
+
+
+def _raw_line_ref_error(template_id: str, list_key: str, ref: object) -> str:
+    return (
+        f"{template_id} template_data[{list_key!r}]: ref {ref!r} points at "
+        f"the planner-facing raw_line (carries the bracketed id and must not "
+        f"reach the user). Bind .display_line or the whole ${{sN.{list_key}}} "
+        f"instead."
+    )
 
 
 def _make_required_keys_contract(
@@ -401,7 +418,7 @@ def _make_required_keys_contract(
 
     ``item_fields`` (Codex #118 R1 MAJOR): for list templates, each element
     of a LITERAL list value must be an object carrying the per-item fields
-    the template renders unguarded (``it.raw_line`` etc.) — a str element or
+    the MAPPING branch renders (``it.display_line`` etc.) — a dict missing the field, or
     a dict missing the field is a guaranteed StrictUndefined render crash.
     Full ``${sN.field}`` refs (the whole list, an element, or a field value)
     defer to post-execution resolution when ``allow_refs``."""
@@ -440,8 +457,12 @@ def _make_required_keys_contract(
                 )
         for list_key, fields in (item_fields or {}).items():
             val = data.get(list_key)
-            if val is None or (allow_refs and _is_full_ref(val)):
-                continue  # missing/blank already flagged above; ref deferred
+            if val is None:
+                continue  # missing/blank already flagged above
+            if allow_refs and _is_full_ref(val):
+                if _is_raw_line_ref(val):
+                    errors.append(_raw_line_ref_error(template_id, list_key, val))
+                continue  # ref deferred (resolves post-execution)
             if not isinstance(val, list):
                 errors.append(
                     f"{template_id} template_data[{list_key!r}] must be a "
@@ -451,10 +472,19 @@ def _make_required_keys_contract(
                 continue
             for i, item in enumerate(val):
                 if allow_refs and _is_full_ref(item):
+                    # #119 (Codex MAJOR): ссылка-элемент на .raw_line после
+                    # исполнения становится строкой С [id]-префиксом, а
+                    # строковая ветка рендерит её как есть — лазейка уровнем
+                    # глубже. Отклоняем лексически.
+                    if _is_raw_line_ref(item):
+                        errors.append(
+                            _raw_line_ref_error(template_id, list_key, item)
+                        )
                     continue
-                # #118 R3: templates render BOTH shapes — an object (mapping
-                # branch, per-item fields below) or a plain non-blank string
-                # (e.g. ${sN.created} resolves to list[str] post-execution).
+                # #118 R3 / #119: шаблон рендерит ОБЕ формы — объект (mapping-
+                # ветка ТРЕБУЕТ чистых per-item полей, напр. display_line) или
+                # непустую строку как есть (значит она обязана быть уже
+                # пользовательски-чистой; ссылки на raw_line отрезаны выше).
                 if isinstance(item, str):
                     if not item.strip():
                         errors.append(
@@ -480,6 +510,10 @@ def _make_required_keys_contract(
                         continue
                     fv = item[f]
                     if allow_refs and _is_full_ref(fv):
+                        if _is_raw_line_ref(fv):
+                            errors.append(
+                                _raw_line_ref_error(template_id, list_key, fv)
+                            )
                         continue
                     if _blank(fv):
                         errors.append(
@@ -500,7 +534,7 @@ SAMPLE_TEMPLATE_DATA: dict[str, dict] = {
     "shopping_added_empty": {"duplicates": ["молоко"]},
     "shopping_list_show": {
         "count": 2,
-        "items": [{"raw_line": "молоко"}, {"raw_line": "хлеб (2 шт)"}],
+        "items": [{"display_line": "молоко"}, {"display_line": "хлеб (2 шт)"}],
     },
     "shopping_list_empty": {},
     "reminder_set_ok": {"when_phrase": "завтра в 8:00", "what": "отправить образцы"},
@@ -508,7 +542,7 @@ SAMPLE_TEMPLATE_DATA: dict[str, dict] = {
         "trigger_at_local": "сегодня 09:00", "late_by_minutes": 42,
     },
     "reminders_list_show": {
-        "count": 1, "items": [{"raw_line": "завтра 08:00 — образцы"}],
+        "count": 1, "items": [{"display_line": "завтра 08:00 — образцы"}],
     },
     "reminders_list_empty": {},
     "checklist_show": {

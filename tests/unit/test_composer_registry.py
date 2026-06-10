@@ -175,14 +175,17 @@ def test_render_shopping_added_empty() -> None:
 
 
 def test_render_shopping_list_show() -> None:
+    # #119: шаблон рендерит ЧИСТОЕ поле display_line — прежний снимок кормил
+    # raw_line с [sh_…]-префиксом и закреплял утечку внутренних номеров.
     items = [
-        {"raw_line": "[sh_abc] молоко (1 л)"},
-        {"raw_line": "[sh_def] хлеб"},
+        {"display_line": "молоко (1 л)"},
+        {"display_line": "хлеб"},
     ]
     out = render("shopping_list_show", {"count": 2, "items": items})
     assert "(2)" in out
     assert "молоко" in out
     assert "хлеб" in out
+    assert "sh_" not in out
 
 
 def test_render_shopping_list_empty() -> None:
@@ -208,10 +211,11 @@ def test_render_reminder_skipped_past() -> None:
 
 
 def test_render_reminders_list_show() -> None:
-    items = [{"raw_line": "[rem_1] купить хлеб → 18:00"}]
+    items = [{"display_line": "купить хлеб → 18:00"}]  # #119: чистое поле
     out = render("reminders_list_show", {"count": 1, "items": items})
     assert "(1)" in out
     assert "купить хлеб" in out
+    assert "rem_" not in out
 
 
 def test_render_reminders_list_empty() -> None:
