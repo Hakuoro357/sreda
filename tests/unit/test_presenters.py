@@ -316,7 +316,11 @@ def test_real_registry_annotations_populate_map() -> None:
         assert unsafe not in m, f"{unsafe} leaks ids — must stay deny-by-default"
     # error/empty/confirmation also stay unmapped → deny-by-default
     assert ("list_shopping", "error") not in m
-    assert ("add_task", "created") not in m
+    # #115: write tools are now annotated with the SAFE computed display_summary
+    # (names only, never ids) — the Phase 2b "no annotation" state was exactly
+    # the silently-dropped #74 deliverable this guard used to enshrine.
+    assert m[("add_task", "created")] == "display_summary"
+    assert m[("mark_shopping_bought", "bought")] == "display_summary"
 
 
 @pytest.mark.parametrize(

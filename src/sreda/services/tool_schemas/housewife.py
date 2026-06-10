@@ -711,8 +711,23 @@ def parse_get_recipe(
 
 class MarkShoppingBoughtOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["bought"] = "bought"
     bought_count: int = Field(ge=0)
+    # #115 by-name outcome (okv2 path); empty on legacy positional.
+    marked: list[str] = Field(default_factory=list)
+    not_eligible: list[str] = Field(default_factory=list)  # owned, wrong status
+    not_found_count: int = Field(default=0, ge=0)  # unknown/foreign ids
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.marked and not self.not_eligible and not self.not_found_count:
+            return "Готово."  # legacy positional path (counts only)
+        return build_display_summary(
+            [("Отметила купленным", self.marked), ("Не получилось", self.not_eligible)],
+            not_found_count=self.not_found_count,
+        )
 
 
 MarkShoppingBoughtOutput = Annotated[
@@ -729,6 +744,25 @@ def parse_mark_shopping_bought(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries the affected names; legacy positional stays.
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(raw, frozenset({"bought"}))
+            model = MarkShoppingBoughtOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="mark_shopping_bought",
+                timestamp=datetime.now(timezone.utc),
+            )
+        if (
+            len(model.marked) != model.bought_count
+            or not _all_names_usable(model.marked, model.not_eligible)
+        ):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="mark_shopping_bought",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     m = _MARK_BOUGHT_RE.match(raw.strip())
     if m is not None:
         return MarkShoppingBoughtOk(bought_count=int(m.group("n")))
@@ -746,8 +780,23 @@ def parse_mark_shopping_bought(
 
 class RemoveShoppingItemsOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["removed"] = "removed"
     removed_count: int = Field(ge=0)
+    # #115 by-name outcome (okv2 path); empty on legacy positional.
+    removed: list[str] = Field(default_factory=list)
+    not_eligible: list[str] = Field(default_factory=list)
+    not_found_count: int = Field(default=0, ge=0)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.removed and not self.not_eligible and not self.not_found_count:
+            return "Готово."  # legacy positional path
+        return build_display_summary(
+            [("Убрала", self.removed), ("Не получилось", self.not_eligible)],
+            not_found_count=self.not_found_count,
+        )
 
 
 RemoveShoppingItemsOutput = Annotated[
@@ -764,6 +813,25 @@ def parse_remove_shopping_items(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries the affected names; legacy positional stays.
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(raw, frozenset({"removed"}))
+            model = RemoveShoppingItemsOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="remove_shopping_items",
+                timestamp=datetime.now(timezone.utc),
+            )
+        if (
+            len(model.removed) != model.removed_count
+            or not _all_names_usable(model.removed, model.not_eligible)
+        ):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="remove_shopping_items",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     m = _REMOVE_RE.match(raw.strip())
     if m is not None:
         return RemoveShoppingItemsOk(removed_count=int(m.group("n")))
@@ -781,10 +849,26 @@ def parse_remove_shopping_items(
 
 class UpdateShoppingItemOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["updated"] = "updated"
     item_id: ShoppingItemId
     """Codex R2 MAJOR #4: was ``str(min_length=1)`` — accepted any
     non-blank token. Now uses the tight ``sh_<24 hex>`` pattern."""
+    # #115: item name before/after the update (equal unless renamed).
+    # None on the legacy positional path.
+    previous_name: str | None = None
+    new_name: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.new_name:
+            return "Готово."  # legacy positional path
+        if self.previous_name and self.previous_name != self.new_name:
+            return build_display_summary(
+                [("Переименовала", [f"{self.previous_name} → {self.new_name}"])]
+            )
+        return build_display_summary([("Обновила", [self.new_name])])
 
 
 UpdateShoppingItemOutput = Annotated[
@@ -801,6 +885,22 @@ def parse_update_shopping_item(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries previous/new name; legacy positional stays.
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(raw, frozenset({"updated"}))
+            model = UpdateShoppingItemOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="update_shopping_item",
+                timestamp=datetime.now(timezone.utc),
+            )
+        if not _all_names_usable([model.previous_name], [model.new_name]):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="update_shopping_item",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     m = _UPDATE_ITEM_RE.match(raw.strip())
     if m is not None:
         try:
@@ -822,8 +922,28 @@ def parse_update_shopping_item(
 
 class UpdateShoppingItemsCategoryOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["updated_category"] = "updated_category"
     updated_count: int = Field(ge=0)
+    # #115 by-name outcome (okv2 path); empty/None on legacy positional.
+    updated: list[str] = Field(default_factory=list)
+    not_eligible: list[str] = Field(default_factory=list)
+    """Empty by construction today (re-categorisation has no status predicate);
+    kept in the contract so a future eligibility rule surfaces names, not counts."""
+    category: str | None = None
+    not_found_count: int = Field(default=0, ge=0)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.updated and not self.not_eligible and not self.not_found_count:
+            return "Готово."  # legacy positional path
+        cat = sanitize_name(self.category) if self.category else ""
+        label = f"Перенесла в «{cat}»" if cat else "Перенесла"
+        return build_display_summary(
+            [(label, self.updated), ("Не получилось", self.not_eligible)],
+            not_found_count=self.not_found_count,
+        )
 
 
 UpdateShoppingItemsCategoryOutput = Annotated[
@@ -844,6 +964,29 @@ def parse_update_shopping_items_category(
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries the affected names; legacy positional stays.
+    if is_okv2(raw):
+        try:
+            status, payload = parse_tool_ok(raw, frozenset({"updated_category"}))
+            model = UpdateShoppingItemsCategoryOk(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="update_shopping_items_category",
+                timestamp=datetime.now(timezone.utc),
+            )
+        # okv2 MUST carry a usable target category — legacy positional is the
+        # only nameless path. A missing/sanitizer-empty category would silently
+        # drop the bucket from the voice (Codex #115).
+        if (
+            len(model.updated) != model.updated_count
+            or not _all_names_usable(model.updated, model.not_eligible)
+            or not (model.category and sanitize_name(model.category))
+        ):
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="update_shopping_items_category",
+                timestamp=datetime.now(timezone.utc),
+            )
+        return model
     m = _UPDATE_CATEGORY_RE.match(raw.strip())
     if m is not None:
         return UpdateShoppingItemsCategoryOk(

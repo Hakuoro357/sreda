@@ -538,7 +538,10 @@ def test_parser_output_validates_against_spec_output_model(spec) -> None:
     parsed = parse_tool_output(spec.name, raw)
     # Dump-then-validate via the spec's output_model TypeAdapter —
     # exercises the discriminator routing end-to-end.
-    TypeAdapter(spec.output_model).validate_python(parsed.model_dump())
+    # #115: exclude @computed_field (output-only, e.g. display_summary) — mirrors
+    # dispatch_typed_output; extra='forbid' variants reject them as input.
+    computed = set(getattr(type(parsed), "model_computed_fields", {}))
+    TypeAdapter(spec.output_model).validate_python(parsed.model_dump(exclude=computed))
 
 
 # ---------------------------------------------------------------------------

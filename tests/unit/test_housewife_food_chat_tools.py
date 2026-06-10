@@ -13,6 +13,7 @@ from sreda.db.base import Base
 from sreda.db.models.core import Tenant, User
 from sreda.db.models.housewife_food import ShoppingListItem
 from sreda.services.housewife_chat_tools import build_housewife_tools
+from sreda.services.tool_schemas.housewife import parse_tool_output  # #115
 
 
 @pytest.fixture
@@ -154,7 +155,9 @@ def test_mark_shopping_bought_updates_status(session):
     ids = result.split("ids=[")[1].rstrip("]").split(",")
 
     out = tools["mark_shopping_bought"].invoke({"item_ids": ids})
-    assert out == "ok:bought:2"
+    parsed = parse_tool_output("mark_shopping_bought", out)  # #115 okv2 + names
+    assert parsed.bought_count == 2
+    assert sorted(parsed.marked) == ["молоко", "хлеб"]
     for item_id in ids:
         assert session.get(ShoppingListItem, item_id).status == "bought"
 
@@ -167,7 +170,8 @@ def test_remove_shopping_items_cancels(session):
     item_id = result.split("ids=[")[1].rstrip("]")
 
     out = tools["remove_shopping_items"].invoke({"item_ids": [item_id]})
-    assert out == "ok:removed:1"
+    parsed = parse_tool_output("remove_shopping_items", out)  # #115 okv2 + names
+    assert parsed.removed_count == 1 and parsed.removed == ["молоко"]
     assert session.get(ShoppingListItem, item_id).status == "cancelled"
 
 

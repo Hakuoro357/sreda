@@ -19,7 +19,7 @@ turn.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -215,6 +215,22 @@ def _guess_category(title: str) -> str:
             if kw in low:
                 return cat
     return DEFAULT_CATEGORY
+
+
+@dataclass(slots=True)
+class BulkStatusResult:
+    """#115 by-name outcome for bulk status flips (mark_bought / remove_items)
+    so the live voice can confirm what happened.
+
+    ``affected`` — rows actually mutated (names via ``.title``).
+    ``not_eligible`` — titles of OWNED rows skipped because their status wasn't
+    in ``only_from`` (name knowable → reported by name).
+    ``not_found_count`` — requested unique ids with no owned row (foreign or
+    nonexistent → no name knowable, count only)."""
+
+    affected: list[ShoppingListItem] = field(default_factory=list)
+    not_eligible: list[str] = field(default_factory=list)
+    not_found_count: int = 0
 
 
 class HousewifeShoppingService:
@@ -533,7 +549,18 @@ class HousewifeShoppingService:
         count of rows actually updated — ids we didn't own / didn't
         exist are silently skipped (no LLM-visible error; the LLM already
         sees the list via ``list_pending``)."""
-        return self._bulk_update_status(
+        return len(
+            self.mark_bought_detailed(
+                tenant_id=tenant_id, user_id=user_id, ids=ids
+            ).affected
+        )
+
+    def mark_bought_detailed(
+        self, *, tenant_id: str, user_id: str, ids: list[str]
+    ) -> "BulkStatusResult":
+        """#115: like ``mark_bought`` but returns the by-name outcome so the
+        live voice can confirm WHAT was marked vs skipped."""
+        return self._bulk_update_status_detailed(
             tenant_id=tenant_id,
             user_id=user_id,
             ids=ids,
@@ -546,7 +573,17 @@ class HousewifeShoppingService:
     ) -> int:
         """Flip ``status='cancelled'``. Hides from ``list_pending``;
         row stays for history."""
-        return self._bulk_update_status(
+        return len(
+            self.remove_items_detailed(
+                tenant_id=tenant_id, user_id=user_id, ids=ids
+            ).affected
+        )
+
+    def remove_items_detailed(
+        self, *, tenant_id: str, user_id: str, ids: list[str]
+    ) -> "BulkStatusResult":
+        """#115: like ``remove_items`` but returns the by-name outcome."""
+        return self._bulk_update_status_detailed(
             tenant_id=tenant_id,
             user_id=user_id,
             ids=ids,
@@ -602,6 +639,25 @@ class HousewifeShoppingService:
         quantity_text). Returns the updated row, or None if the item
         doesn't exist or belongs to another tenant.
         """
+        detailed = self.update_item_detailed(
+            tenant_id=tenant_id, user_id=user_id, item_id=item_id,
+            title=title, quantity_text=quantity_text, category=category,
+        )
+        return None if detailed is None else detailed[0]
+
+    def update_item_detailed(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        item_id: str,
+        title: str | None = None,
+        quantity_text: str | None = None,
+        category: str | None = None,
+    ) -> tuple[ShoppingListItem, str] | None:
+        """#115: like ``update_item`` but returns ``(row, previous_title)`` —
+        the title captured BEFORE mutation, so the voice can say
+        «переименовала X → Y». ``None`` if not found / cross-tenant."""
         row = (
             self.session.query(ShoppingListItem)
             .filter(
@@ -613,6 +669,7 @@ class HousewifeShoppingService:
         )
         if row is None:
             return None
+        previous_title = row.title
         if title is not None:
             clean = (title or "").strip()
             if clean:
@@ -624,7 +681,7 @@ class HousewifeShoppingService:
             row.category = _coerce_category(category)
         row.updated_at = _utcnow()
         self.session.commit()
-        return row
+        return row, previous_title
 
     def update_items_category(
         self,
@@ -641,23 +698,52 @@ class HousewifeShoppingService:
         Keeps the LLM's tool-budget down — one call instead of one
         per item via ``update_item`` or a remove+add cycle.
         """
-        if not ids:
-            return 0
-        new_cat = _coerce_category(category)
-        q = self.session.query(ShoppingListItem).filter(
-            ShoppingListItem.tenant_id == tenant_id,
-            ShoppingListItem.user_id == user_id,
-            ShoppingListItem.id.in_(ids),
+        outcome, _cat = self.update_items_category_detailed(
+            tenant_id=tenant_id, user_id=user_id, ids=ids, category=category
         )
+        return len(outcome.affected)
+
+    def update_items_category_detailed(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        ids: list[str],
+        category: str,
+    ) -> tuple["BulkStatusResult", str]:
+        """#115: like ``update_items_category`` but returns
+        ``(by-name outcome, coerced_category)`` — the second element is the
+        category actually stored (``_coerce_category`` lowercases/maps/caps), so
+        the wire/display never advertises a bucket different from the DB row
+        (Codex #115). Re-categorisation has no status predicate (any owned row
+        qualifies), so ``not_eligible`` is empty by construction; unknown/
+        foreign ids surface as ``not_found_count``. Requested ids deduped."""
+        result = BulkStatusResult()
+        new_cat = _coerce_category(category)
+        if not ids:
+            return result, new_cat
+        # Dedup WITHOUT dropping falsey tokens — a blank/invalid requested id
+        # must still count as not_found (Codex #115: filtering it out
+        # under-reported failures as a silent "Готово.").
+        unique_ids = list(dict.fromkeys(ids))
+        rows = (
+            self.session.query(ShoppingListItem)
+            .filter(
+                ShoppingListItem.tenant_id == tenant_id,
+                ShoppingListItem.user_id == user_id,
+                ShoppingListItem.id.in_(unique_ids),
+            )
+            .all()
+        )
+        result.not_found_count = len(unique_ids) - len(rows)
         now = _utcnow()
-        updated = 0
-        for row in q.all():
+        for row in rows:
             row.category = new_cat
             row.updated_at = now
-            updated += 1
-        if updated:
+            result.affected.append(row)
+        if result.affected:
             self.session.commit()
-        return updated
+        return result, new_cat
 
     def clear_pending(self, *, tenant_id: str, user_id: str) -> int:
         """Mark every pending item as cancelled — the "Очистить всё"
@@ -712,28 +798,60 @@ class HousewifeShoppingService:
         new_status: str,
         only_from: tuple[str, ...],
     ) -> int:
+        return len(
+            self._bulk_update_status_detailed(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                ids=ids,
+                new_status=new_status,
+                only_from=only_from,
+            ).affected
+        )
+
+    def _bulk_update_status_detailed(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        ids: list[str],
+        new_status: str,
+        only_from: tuple[str, ...],
+    ) -> "BulkStatusResult":
+        """#115: single SELECT over the owned requested rows WITHOUT the status
+        predicate, then split in code — so the affected NAMES come from exactly
+        the rows we mutate (same query, same transaction), owned-but-wrong-status
+        rows surface by name (``not_eligible``), and unknown/foreign ids surface
+        as a count only (no name knowable). Requested ids are de-duplicated."""
+        result = BulkStatusResult()
         if not ids:
-            return 0
+            return result
         if new_status not in SHOPPING_STATUSES:
             raise ValueError(f"bad status: {new_status!r}")
-        q = (
+        # Dedup WITHOUT dropping falsey tokens — a blank/invalid requested id
+        # must still count as not_found (Codex #115: filtering it out
+        # under-reported failures as a silent "Готово.").
+        unique_ids = list(dict.fromkeys(ids))
+        rows = (
             self.session.query(ShoppingListItem)
             .filter(
                 ShoppingListItem.tenant_id == tenant_id,
                 ShoppingListItem.user_id == user_id,
-                ShoppingListItem.id.in_(ids),
-                ShoppingListItem.status.in_(only_from),
+                ShoppingListItem.id.in_(unique_ids),
             )
+            .all()
         )
+        result.not_found_count = len(unique_ids) - len(rows)
         now = _utcnow()
-        updated = 0
-        for row in q.all():
-            row.status = new_status
-            row.updated_at = now
-            updated += 1
-        if updated:
+        for row in rows:
+            if row.status in only_from:
+                row.status = new_status
+                row.updated_at = now
+                result.affected.append(row)
+            else:
+                result.not_eligible.append(row.title)
+        if result.affected:
             self.session.commit()
-        return updated
+        return result
 
     # ------------------------------------------------------------------
     # Read

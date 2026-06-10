@@ -760,20 +760,30 @@ def build_housewife_tools(
                 bought. Get the ids from the most recent ``list_shopping``
                 output or from an earlier ``add_shopping_items`` return.
 
-        Returns ``ok:bought:N`` with the count actually updated.
+        Returns a ``bought`` envelope with the affected item NAMES, the
+        names of owned-but-ineligible rows, and a count of unknown ids.
         """
         if not user_id:
             return "error: no user_id context"
         if not item_ids:
             return "error: empty item_ids"
         try:
-            n = shopping_service.mark_bought(
+            outcome = shopping_service.mark_bought_detailed(
                 tenant_id=tenant_id, user_id=user_id, ids=item_ids
             )
         except Exception:  # noqa: BLE001
             logger.exception("mark_shopping_bought failed")
             return "error: internal"
-        return f"ok:bought:{n}"
+        # #115: okv2 carries the affected NAMES (+ skipped/unknown breakdown).
+        return encode_tool_ok(
+            "bought",
+            {
+                "bought_count": len(outcome.affected),
+                "marked": [r.title for r in outcome.affected],
+                "not_eligible": list(outcome.not_eligible),
+                "not_found_count": outcome.not_found_count,
+            },
+        )
 
     @_write_lc_tool
     def remove_shopping_items(item_ids: list[str]) -> str:
@@ -786,20 +796,30 @@ def build_housewife_tools(
         Args:
             item_ids: List of ids to cancel.
 
-        Returns ``ok:removed:N``.
+        Returns a ``removed`` envelope with the affected item NAMES, the
+        names of owned-but-ineligible rows, and a count of unknown ids.
         """
         if not user_id:
             return "error: no user_id context"
         if not item_ids:
             return "error: empty item_ids"
         try:
-            n = shopping_service.remove_items(
+            outcome = shopping_service.remove_items_detailed(
                 tenant_id=tenant_id, user_id=user_id, ids=item_ids
             )
         except Exception:  # noqa: BLE001
             logger.exception("remove_shopping_items failed")
             return "error: internal"
-        return f"ok:removed:{n}"
+        # #115: okv2 carries the affected NAMES (+ skipped/unknown breakdown).
+        return encode_tool_ok(
+            "removed",
+            {
+                "removed_count": len(outcome.affected),
+                "removed": [r.title for r in outcome.affected],
+                "not_eligible": list(outcome.not_eligible),
+                "not_found_count": outcome.not_found_count,
+            },
+        )
 
     @_write_lc_tool
     def update_shopping_item(
@@ -829,14 +849,15 @@ def build_housewife_tools(
                 custom label the user prefers ("специи", "детское
                 питание", "канцелярия").
 
-        Returns ``ok:updated:<id>`` or error message.
+        Returns an ``updated`` envelope with the item name before/after
+        the update, or an error message if the item is not found.
         """
         if not user_id:
             return "error: no user_id context"
         if not item_id or not item_id.strip():
             return "error: empty item_id"
         try:
-            row = shopping_service.update_item(
+            detailed = shopping_service.update_item_detailed(
                 tenant_id=tenant_id, user_id=user_id,
                 item_id=item_id.strip(),
                 title=title, quantity_text=quantity_text,
@@ -845,9 +866,14 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("update_shopping_item failed")
             return "error: internal"
-        if row is None:
+        if detailed is None:
             return f"error: item {item_id!r} not found"
-        return f"ok:updated:{row.id}"
+        row, previous_title = detailed
+        # #115: okv2 carries the item name before/after (voice can say «X → Y»).
+        return encode_tool_ok(
+            "updated",
+            {"item_id": row.id, "previous_name": previous_title, "new_name": row.title},
+        )
 
     @_write_lc_tool
     def update_shopping_items_category(
@@ -868,9 +894,8 @@ def build_housewife_tools(
             category: target bucket — any string (same contract as
                 ``update_shopping_item.category``).
 
-        Returns ``ok:updated:N`` where N is the number of rows
-        actually changed (ids that don't exist or belong to other
-        tenants are silently skipped).
+        Returns an ``updated_category`` envelope with the affected item
+        NAMES, the target category, and a count of unknown/foreign ids.
         """
         if not user_id:
             return "error: no user_id context"
@@ -879,14 +904,25 @@ def build_housewife_tools(
         if not category or not category.strip():
             return "error: empty category"
         try:
-            n = shopping_service.update_items_category(
+            outcome, stored_category = shopping_service.update_items_category_detailed(
                 tenant_id=tenant_id, user_id=user_id,
                 ids=item_ids, category=category,
             )
         except Exception:  # noqa: BLE001
             logger.exception("update_shopping_items_category failed")
             return "error: internal"
-        return f"ok:updated:{n}"
+        # #115: okv2 carries the affected NAMES + the category ACTUALLY stored
+        # (coerced), so the voice never advertises a bucket the DB doesn't have.
+        return encode_tool_ok(
+            "updated_category",
+            {
+                "updated_count": len(outcome.affected),
+                "updated": [r.title for r in outcome.affected],
+                "not_eligible": list(outcome.not_eligible),
+                "category": stored_category,
+                "not_found_count": outcome.not_found_count,
+            },
+        )
 
     @lc_tool
     def list_shopping() -> str:
