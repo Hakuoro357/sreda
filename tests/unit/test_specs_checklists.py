@@ -295,6 +295,9 @@ def test_move_task_chat_tool_wraps_find_list_by_title_exception() -> None:
     from sqlalchemy.orm import sessionmaker
     from sreda.db.models.housewife import Base
     from sreda.services.housewife_chat_tools import build_housewife_tools
+    from sreda.services.tool_schemas.housewife import (
+        MoveTaskPartialFailure, parse_tool_output,
+    )
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -320,9 +323,6 @@ def test_move_task_chat_tool_wraps_find_list_by_title_exception() -> None:
         # Runtime emits the typed error code
         assert result == "error: list_resolve_failed"
         # Parser routes to typed MoveTaskPartialFailure
-        from sreda.services.tool_schemas.housewife import (
-            MoveTaskPartialFailure, parse_tool_output,
-        )
         parsed = parse_tool_output("move_task_to_checklist", result)
         assert isinstance(parsed, MoveTaskPartialFailure)
         assert parsed.error_code == "list_resolve_failed"
