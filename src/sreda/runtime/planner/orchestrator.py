@@ -201,6 +201,25 @@ def _redact_for_alert(text_value: str, *, max_chars: int = 500) -> str:
 # ---------------------------------------------------------------------------
 
 
+_FEEDBACK_PRIORITY_CODES: frozenset[str] = frozenset({
+    # #114: нарушения, чьи тексты несут корректирующий словарь — модель может
+    # исправиться, только если эта подсказка ДОЕЗЖАЕТ до повтора. Без
+    # приоритизации срезы (первые 5 нарушений + 500 знаков) глотали её за
+    # многословным шумом (ошибки типов и т.п.) — ход #75 прогона r3.
+    "branch_match_status_invented",   # «... Allowed: [настоящие статусы]»
+    "compose_ref_unknown_field",      # «... Available top-level fields: [...]»
+    "composer_contract_invalid",      # «... Bind a literal or a ${sN.field} ref»
+})
+
+
+def _prioritize_for_feedback(violations: list) -> list:
+    """Нарушения с корректирующей подсказкой — вперёд (стабильно), ДО срезов.
+
+    Семантика валидации не меняется (план отвергается тем же набором) —
+    меняется только порядок в тексте обратной связи повтора."""
+    return sorted(violations, key=lambda v: v.code not in _FEEDBACK_PRIORITY_CODES)
+
+
 def _build_retry_feedback(previous_response: str, errors: str) -> str:
     """Short error feedback appended to the user message for retry.
 
@@ -507,7 +526,7 @@ async def run(
         )
         if violations:
             last_errors = "validator_violations: " + "; ".join(
-                render_violations(violations)[:5]
+                render_violations(_prioritize_for_feedback(violations))[:5]
             )
             if attempt_no < max_attempts:
                 continue
