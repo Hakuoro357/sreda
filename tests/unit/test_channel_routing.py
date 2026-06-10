@@ -147,6 +147,259 @@ def test_routings_no_tenant_defaults_to_tg_first(session):
 
 
 # ---------------------------------------------------------------------------
+# #109: last_bot_key → routing.bot_key (current-bot routing, TG-only)
+# ---------------------------------------------------------------------------
+
+
+def test_routings_last_bot_key_set_on_telegram_when_registered(session):
+    """last_bot_key='sreda_home' + registry has sreda/sreda_home →
+    telegram routing.bot_key == 'sreda_home' (deliver to current bot)."""
+    tenant, user = _add_user(
+        session, telegram_account_id="111", last_bot_key="sreda_home",
+    )
+    routings = resolve_outbox_routings(
+        session, tenant=tenant, user=user,
+        telegram_bot_keys=["sreda", "sreda_home"],
+    )
+    tg = [r for r in routings if r.channel == "telegram"]
+    assert len(tg) == 1
+    assert tg[0].bot_key == "sreda_home"
+
+
+def test_routings_last_bot_key_none_leaves_bot_key_none(session):
+    """last_bot_key=None → telegram routing.bot_key is None (back-compat)."""
+    tenant, user = _add_user(
+        session, telegram_account_id="111", last_bot_key=None,
+    )
+    routings = resolve_outbox_routings(
+        session, tenant=tenant, user=user,
+        telegram_bot_keys=["sreda", "sreda_home"],
+    )
+    tg = [r for r in routings if r.channel == "telegram"]
+    assert len(tg) == 1
+    assert tg[0].bot_key is None
+
+
+def test_routings_last_bot_key_non_tg_key_guarded(session):
+    """last_bot_key='sreda_max' (not a registered TG key) → bot_key None.
+
+    Guards against a MAX/stale bot_key leaking into TG routing."""
+    tenant, user = _add_user(
+        session, telegram_account_id="111", last_bot_key="sreda_max",
+    )
+    routings = resolve_outbox_routings(
+        session, tenant=tenant, user=user,
+        telegram_bot_keys=["sreda", "sreda_home"],
+    )
+    tg = [r for r in routings if r.channel == "telegram"]
+    assert len(tg) == 1
+    assert tg[0].bot_key is None
+
+
+def test_routings_no_registry_leaves_bot_key_none(session):
+    """telegram_bot_keys not passed → bot_key None even with last_bot_key
+    set (full back-compat for callers that don't thread a registry)."""
+    tenant, user = _add_user(
+        session, telegram_account_id="111", last_bot_key="sreda_home",
+    )
+    routings = resolve_outbox_routings(session, tenant=tenant, user=user)
+    tg = [r for r in routings if r.channel == "telegram"]
+    assert len(tg) == 1
+    assert tg[0].bot_key is None
+
+
+def test_routings_max_routing_bot_key_always_none(session):
+    """MAX routing always has bot_key=None even when last_bot_key is a TG key
+    (MAX behaviour is never changed by #109)."""
+    tenant, user = _add_user(
+        session, telegram_account_id="111",
+        max_account_id="222", max_chat_id="999",
+        last_bot_key="sreda_home",
+    )
+    routings = resolve_outbox_routings(
+        session, tenant=tenant, user=user,
+        telegram_bot_keys=["sreda", "sreda_home"],
+    )
+    max_routings = [r for r in routings if r.channel == "max"]
+    assert len(max_routings) == 1
+    assert max_routings[0].bot_key is None
+    tg = [r for r in routings if r.channel == "telegram"]
+    assert tg[0].bot_key == "sreda_home"
+
+
+def test_routings_accepts_registry_object_via_all_bots(session):
+    """telegram_bot_keys may be a TelegramBotRegistry — read via all_bots()."""
+    from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
+
+    registry = TelegramBotRegistry([
+        BotConfig(key="sreda", token="t1", username="SredaBot"),
+        BotConfig(key="sreda_home", token="t2", username="SredaHomeBot"),
+    ])
+    tenant, user = _add_user(
+        session, telegram_account_id="111", last_bot_key="sreda_home",
+    )
+    routings = resolve_outbox_routings(
+        session, tenant=tenant, user=user, telegram_bot_keys=registry,
+    )
+    tg = [r for r in routings if r.channel == "telegram"]
+    assert tg[0].bot_key == "sreda_home"
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_routes_to_current_bot_via_last_bot_key(session):
+    """#109 producer-level: a reminder frozen on 'sreda' is delivered to the
+    user's CURRENT bot ('sreda_home') when last_bot_key is set + registry
+    passed. Without last_bot_key the outbox keeps the reminder's bot_key."""
+    from datetime import datetime, timezone
+    from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
+    from sreda.db.models.core import OutboxMessage, Workspace
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
+
+    registry = TelegramBotRegistry([
+        BotConfig(key="sreda", token="t1", username="SredaBot"),
+        BotConfig(key="sreda_home", token="t2", username="SredaHomeBot"),
+    ])
+    tenant, user = _add_user(
+        session, telegram_account_id="tg_chat_migrated",
+        last_bot_key="sreda_home",
+    )
+    session.add(Workspace(id="ws_mig", tenant_id=tenant.id, name="WS"))
+    now = datetime.now(timezone.utc)
+    session.add(FamilyReminder(
+        id="rem_migrated", tenant_id=tenant.id, user_id=user.id,
+        title="Старое напоминание на sreda",
+        trigger_at=now, next_trigger_at=now, status="pending",
+        bot_key="sreda",  # frozen on the OLD bot
+    ))
+    session.commit()
+
+    worker = HousewifeReminderWorker(session, registry=registry)
+    await worker.process_pending(limit=10, now=now)
+
+    rows = (
+        session.query(OutboxMessage)
+        .filter(OutboxMessage.tenant_id == tenant.id)
+        .all()
+    )
+    assert len(rows) == 1
+    # Delivered to the CURRENT bot, NOT the reminder's frozen 'sreda'.
+    assert rows[0].bot_key == "sreda_home"
+
+
+@pytest.mark.asyncio
+async def test_onboarding_kickoff_routes_to_current_bot_via_last_bot_key(session):
+    """#109 producer-level (onboarding): the kickoff intro is delivered to the
+    user's CURRENT bot ('sreda_home') when last_bot_key is set + registry
+    passed; falls back to system_bot_key when last_bot_key is NULL.
+
+    Mirrors the reminder-worker producer test above, but for the
+    HousewifeOnboardingKickoffWorker._fire() path. Stubs service.start so the
+    test stays focused on outbox routing / bot_key resolution."""
+    from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
+    from sreda.db.models.core import OutboxMessage, Workspace
+    from sreda.workers.housewife_onboarding_worker import (
+        HousewifeOnboardingKickoffWorker,
+    )
+
+    registry = TelegramBotRegistry([
+        BotConfig(key="sreda", token="t1", username="SredaBot"),
+        BotConfig(key="sreda_home", token="t2", username="SredaHomeBot"),
+    ])
+
+    # --- Case 1: last_bot_key set → outbox bot_key == current bot ---------
+    tenant, user = _add_user(
+        session, tenant_id="t_oh_cur",
+        telegram_account_id="tg_chat_oh_migrated",
+        last_bot_key="sreda_home",
+    )
+    session.add(Workspace(id="ws_oh_cur", tenant_id=tenant.id, name="WS"))
+    session.commit()
+
+    worker = HousewifeOnboardingKickoffWorker.__new__(
+        HousewifeOnboardingKickoffWorker,
+    )
+    worker.session = session
+    worker.service = type("S", (), {"start": lambda self, **kw: None})()
+    worker._system_bot_key = "sreda"
+    worker._registry = registry
+
+    fired = worker._fire(tenant.id, user.id)
+    assert fired is True
+    session.flush()
+
+    rows = (
+        session.query(OutboxMessage)
+        .filter(OutboxMessage.tenant_id == tenant.id)
+        .all()
+    )
+    assert len(rows) == 1
+    # Delivered to the CURRENT bot, NOT the system default 'sreda'.
+    assert rows[0].bot_key == "sreda_home"
+
+    # --- Case 2: last_bot_key NULL → fall back to system_bot_key ----------
+    tenant2, user2 = _add_user(
+        session, tenant_id="t_oh_null",
+        telegram_account_id="tg_chat_oh_legacy",
+        last_bot_key=None,
+    )
+    session.add(Workspace(id="ws_oh_null", tenant_id=tenant2.id, name="WS"))
+    session.commit()
+
+    fired2 = worker._fire(tenant2.id, user2.id)
+    assert fired2 is True
+    session.flush()
+
+    rows2 = (
+        session.query(OutboxMessage)
+        .filter(OutboxMessage.tenant_id == tenant2.id)
+        .all()
+    )
+    assert len(rows2) == 1
+    # No last_bot_key → routing.bot_key None → system default.
+    assert rows2[0].bot_key == "sreda"
+
+
+@pytest.mark.asyncio
+async def test_reminder_worker_falls_back_to_reminder_bot_key_without_last(session):
+    """Without last_bot_key, the outbox bot_key is the reminder's frozen
+    value (pre-#109 fallback preserved)."""
+    from datetime import datetime, timezone
+    from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
+    from sreda.db.models.core import OutboxMessage, Workspace
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
+
+    registry = TelegramBotRegistry([
+        BotConfig(key="sreda", token="t1", username="SredaBot"),
+        BotConfig(key="sreda_home", token="t2", username="SredaHomeBot"),
+    ])
+    tenant, user = _add_user(
+        session, telegram_account_id="tg_chat_legacy", last_bot_key=None,
+    )
+    session.add(Workspace(id="ws_leg", tenant_id=tenant.id, name="WS"))
+    now = datetime.now(timezone.utc)
+    session.add(FamilyReminder(
+        id="rem_legacy", tenant_id=tenant.id, user_id=user.id,
+        title="Напоминание без current-bot",
+        trigger_at=now, next_trigger_at=now, status="pending",
+        bot_key="sreda_home",
+    ))
+    session.commit()
+
+    worker = HousewifeReminderWorker(session, registry=registry)
+    await worker.process_pending(limit=10, now=now)
+
+    rows = (
+        session.query(OutboxMessage)
+        .filter(OutboxMessage.tenant_id == tenant.id)
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].bot_key == "sreda_home"  # reminder's frozen value
+
+
+# ---------------------------------------------------------------------------
 # resolve_outbox_routing (singular, backward-compat) — first routing only
 # ---------------------------------------------------------------------------
 

@@ -525,6 +525,59 @@ class TestOnboardingMatrix:
         assert result.is_new_user is False
         assert result.tenant_id == tenant_id
 
+    def test_inbound_stamps_last_bot_key_on_existing_user(self, session):
+        """#109: existing migrated user contacting sreda_home gets
+        user.last_bot_key='sreda_home' so async producers route to it."""
+        from sreda.db.models.core import User, Workspace, Assistant
+        from sreda.services.onboarding import ensure_telegram_user_bundle
+        from sreda.services.tg_account_hash import hash_tg_account
+
+        tenant_id = "tenant_mig_109"
+        chat_id = "755682022"
+        tg_hash = hash_tg_account(chat_id)
+        session.add(Tenant(id=tenant_id, name="Migrated", created_at=_NOW, approved_at=_NOW))
+        session.add(Workspace(id="ws_mig_109", tenant_id=tenant_id, name="W"))
+        session.add(User(
+            id="user_mig_109", tenant_id=tenant_id,
+            tg_account_hash=tg_hash,
+            last_bot_key="sreda",  # was last on the OLD bot
+        ))
+        session.add(Assistant(
+            id="ast_mig_109", tenant_id=tenant_id, workspace_id="ws_mig_109",
+            name="Среда",
+        ))
+        session.commit()
+
+        payload = {"message": {"chat": {"id": int(chat_id)}, "text": "привет"}}
+        with self._patch_registry():
+            result = ensure_telegram_user_bundle(
+                session, payload, bot_key="sreda_home",
+            )
+
+        assert result.is_new_user is False
+        session.expire_all()
+        user = session.get(User, "user_mig_109")
+        assert user.last_bot_key == "sreda_home"
+
+    def test_inbound_stamps_last_bot_key_on_new_user(self, session):
+        """#109: a brand-new user's first inbound stamps last_bot_key."""
+        from sreda.db.models.core import User
+        from sreda.services.onboarding import ensure_telegram_user_bundle_by_id
+
+        _seed_plan(session)
+        with self._patch_registry(sreda_home_signup_open=True), \
+             self._patch_runtime_config(session):
+            result = ensure_telegram_user_bundle_by_id(
+                session,
+                telegram_id="709109109",
+                display_name="Fresh User",
+                bot_key="sreda_home",
+            )
+
+        assert result.is_new_user is True
+        user = session.get(User, result.user_id)
+        assert user.last_bot_key == "sreda_home"
+
     def test_unknown_bot_key_fails_closed(self, session):
         """Unknown bot_key → SignupBlocked (fail-closed, not KeyError bubble)."""
         from sreda.services.onboarding import ensure_telegram_user_bundle_by_id

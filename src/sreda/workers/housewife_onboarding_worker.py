@@ -67,12 +67,18 @@ class HousewifeOnboardingKickoffWorker:
     anything here.
     """
 
-    def __init__(self, session: Session, *, system_bot_key: str | None = None) -> None:
+    def __init__(
+        self, session: Session, *, system_bot_key: str | None = None, registry=None,
+    ) -> None:
         self.session = session
         self.service = HousewifeOnboardingService(session)
         # Phase 5: bot_key for system-generated outbox rows (no reminder
         # origin). Sourced from registry.system_default_bot_key in job_runner.
         self._system_bot_key = system_bot_key or LEGACY_NULL_BOT_KEY
+        # #109: TelegramBotRegistry so resolve_outbox_routings can route to the
+        # user's CURRENT bot (user.last_bot_key). Optional — None → fall back
+        # to _system_bot_key (pre-#109 behaviour).
+        self._registry = registry
         self.repo = UserProfileRepository(session)
 
     async def process_pending(
@@ -151,7 +157,10 @@ class HousewifeOnboardingKickoffWorker:
                 user_id, user.tenant_id, tenant_id,
             )
             return False
-        routings = resolve_outbox_routings(self.session, tenant=tenant, user=user)
+        routings = resolve_outbox_routings(
+            self.session, tenant=tenant, user=user,
+            telegram_bot_keys=self._registry,
+        )
 
         if not routings:
             logger.warning(
@@ -187,7 +196,9 @@ class HousewifeOnboardingKickoffWorker:
                 feature_key=HOUSEWIFE_FEATURE_KEY,
                 status="pending",
                 payload_json=json.dumps(payload, ensure_ascii=False),
-                bot_key=self._system_bot_key,
+                # #109: route to the user's CURRENT bot (routing.bot_key) when
+                # known; else the system default.
+                bot_key=routing.bot_key or self._system_bot_key,
             )
             if hasattr(OutboxMessage, "user_id"):
                 outbox.user_id = user_id

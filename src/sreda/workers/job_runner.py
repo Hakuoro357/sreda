@@ -57,12 +57,20 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
         skill_platform = SkillPlatformJobProcessor(session, registry)
         _sys_bot_key = bot_registry.system_default_bot_key
-        proactive = ProactiveEventWorker(session, system_bot_key=_sys_bot_key)
-        housewife_reminders = HousewifeReminderWorker(session)
-        housewife_onboarding = HousewifeOnboardingKickoffWorker(
-            session, system_bot_key=_sys_bot_key
+        # #109: pass bot_registry so resolve_outbox_routings can route async
+        # notifications to the user's CURRENT bot (user.last_bot_key).
+        proactive = ProactiveEventWorker(
+            session, system_bot_key=_sys_bot_key, registry=bot_registry,
         )
-        onboarding_aha = OnboardingAhaWorker(session, system_bot_key=_sys_bot_key)
+        housewife_reminders = HousewifeReminderWorker(
+            session, registry=bot_registry,
+        )
+        housewife_onboarding = HousewifeOnboardingKickoffWorker(
+            session, system_bot_key=_sys_bot_key, registry=bot_registry,
+        )
+        onboarding_aha = OnboardingAhaWorker(
+            session, system_bot_key=_sys_bot_key, registry=bot_registry,
+        )
         delivery = OutboxDeliveryWorker(
             session,
             telegram_client=telegram_client,

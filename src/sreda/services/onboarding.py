@@ -84,6 +84,29 @@ def _auto_approve_and_grant_free_tier(session: Session, tenant_id: str) -> None:
     session.commit()
 
 
+def _stamp_last_bot_key(session: Session, user: User, bot_key: str | None) -> None:
+    """Record the bot the user is CURRENTLY messaging on (#109).
+
+    Async producers (reminder / proactive / onboarding workers) read
+    ``user.last_bot_key`` via ``resolve_outbox_routings`` to deliver
+    notifications to the user's current bot rather than the bot frozen at
+    reminder-creation time. Without this, users who migrated from
+    ``@sreda01_bot`` (``"sreda"``) to ``@sreda_home_bot`` (``"sreda_home"``)
+    lost their async notifications on the abandoned bot.
+
+    Only writes (and commits) when the value actually changes — keeps the
+    happy path a single SELECT + no-op for users who stay on one bot.
+    Caller passes the TG ``bot_key`` of the inbound; MAX inbound paths do
+    not call this (bug is TG-specific; the routing guard ignores non-TG
+    keys anyway).
+    """
+    if not bot_key:
+        return
+    if user.last_bot_key != bot_key:
+        user.last_bot_key = bot_key
+        session.commit()
+
+
 def find_user_by_chat_id(session: Session, chat_id: str | int) -> User | None:
     """Резолв юзера по telegram chat_id через hash-lookup.
 
@@ -140,6 +163,9 @@ def ensure_telegram_user_bundle(
 
     existing_user = find_user_by_chat_id(session, chat_id)
     if existing_user is not None:
+        # #109: capture the bot the user is currently on so async producers
+        # route notifications here (handles sreda → sreda_home migration).
+        _stamp_last_bot_key(session, existing_user, bot_key)
         assistant = (
             session.query(Assistant)
             .filter(Assistant.tenant_id == existing_user.tenant_id)
@@ -198,6 +224,9 @@ def ensure_telegram_user_bundle_by_id(
 
     existing_user = find_user_by_chat_id(session, telegram_id)
     if existing_user is not None:
+        # #109: capture the user's current bot (Mini App / by-id entrypoint
+        # too — keeps last_bot_key fresh even if they never send /start).
+        _stamp_last_bot_key(session, existing_user, bot_key)
         assistant = (
             session.query(Assistant)
             .filter(Assistant.tenant_id == existing_user.tenant_id)
@@ -280,6 +309,12 @@ def ensure_telegram_user_bundle_by_id(
     # Phase 2C: auto-approve + sreda_free grant. Replaces manual
     # admin /admin/tenant/approve flow. Tenant immediately usable.
     _auto_approve_and_grant_free_tier(session, tenant_id)
+
+    # #109: stamp current bot on the freshly-created user too, so a brand-new
+    # user's async notifications route to the bot they signed up on.
+    new_user = session.get(User, user_id)
+    if new_user is not None:
+        _stamp_last_bot_key(session, new_user, bot_key)
 
     return TelegramOnboardingResult(
         True, telegram_id, tenant_id, workspace_id, user_id, assistant_id

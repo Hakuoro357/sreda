@@ -75,6 +75,7 @@ class ProactiveEventWorker:
         *,
         embedding_client: EmbeddingClient | None = None,
         system_bot_key: str | None = None,
+        registry=None,
     ) -> None:
         self.session = session
         self.repo = InboundEventRepository(session)
@@ -86,6 +87,10 @@ class ProactiveEventWorker:
         # Phase 5: bot_key for system-generated outbox rows (no reminder
         # origin). Sourced from registry.system_default_bot_key in job_runner.
         self._system_bot_key = system_bot_key or LEGACY_NULL_BOT_KEY
+        # #109: TelegramBotRegistry so resolve_outbox_routings can route to the
+        # user's CURRENT bot (user.last_bot_key). Optional — when None,
+        # routing.bot_key stays None and we fall back to _system_bot_key.
+        self._registry = registry
 
     async def process_pending(
         self, *, limit: int = 50, min_score: float = 0.5
@@ -215,7 +220,10 @@ class ProactiveEventWorker:
         if user is None or user.tenant_id != event.tenant_id:
             return []
         tenant = self.session.get(_Tenant, event.tenant_id)
-        return resolve_outbox_routings(self.session, tenant=tenant, user=user)
+        return resolve_outbox_routings(
+            self.session, tenant=tenant, user=user,
+            telegram_bot_keys=self._registry,
+        )
 
     def _write_outbox_with_decision(
         self,
@@ -269,7 +277,9 @@ class ProactiveEventWorker:
             scheduled_at=scheduled_at,
             drop_reason=row_drop_reason,
             payload_json=json.dumps(payload, ensure_ascii=False),
-            bot_key=self._system_bot_key,
+            # #109: deliver to the user's CURRENT bot (routing.bot_key from
+            # user.last_bot_key) when known; else the system default.
+            bot_key=routing.bot_key or self._system_bot_key,
         )
         self.session.add(outbox)
         self.session.flush()

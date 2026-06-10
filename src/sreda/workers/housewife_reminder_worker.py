@@ -36,9 +36,15 @@ HOUSEWIFE_FEATURE_KEY = "housewife_assistant"
 class HousewifeReminderWorker:
     """Fires due ``FamilyReminder`` rows as outbox messages."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, registry=None) -> None:
         self.session = session
         self.service = HousewifeReminderService(session)
+        # #109: TelegramBotRegistry so resolve_outbox_routings can route a
+        # reminder to the user's CURRENT bot (user.last_bot_key). Optional —
+        # when None, resolve_outbox_routings leaves bot_key None and we fall
+        # back to reminder.bot_key (pre-#109 behaviour). job_runner injects
+        # the real registry; tests may omit it.
+        self._registry = registry
 
     async def process_pending(
         self, *, limit: int = 50, now: datetime | None = None
@@ -159,7 +165,10 @@ class HousewifeReminderWorker:
                 feature_key=HOUSEWIFE_FEATURE_KEY,
                 status="pending",
                 payload_json=json.dumps(payload, ensure_ascii=False),
-                bot_key=reminder.bot_key or LEGACY_NULL_BOT_KEY,
+                # #109: deliver to the user's CURRENT bot (routing.bot_key,
+                # populated from user.last_bot_key) when known; else fall
+                # back to the reminder's frozen bot_key, then legacy default.
+                bot_key=routing.bot_key or reminder.bot_key or LEGACY_NULL_BOT_KEY,
             )
             if hasattr(OutboxMessage, "user_id"):
                 outbox.user_id = reminder.user_id
@@ -206,6 +215,7 @@ class HousewifeReminderWorker:
                 return []
             return resolve_outbox_routings(
                 self.session, tenant=tenant, user=user,
+                telegram_bot_keys=self._registry,
             )
 
         # Tenant-wide reminder (user_id=None): берём любого юзера с
@@ -224,7 +234,10 @@ class HousewifeReminderWorker:
         )
         if user is None:
             return []
-        return resolve_outbox_routings(self.session, tenant=tenant, user=user)
+        return resolve_outbox_routings(
+            self.session, tenant=tenant, user=user,
+            telegram_bot_keys=self._registry,
+        )
 
     def _resolve_workspace_id(self, tenant_id: str) -> str | None:
         ws = (
