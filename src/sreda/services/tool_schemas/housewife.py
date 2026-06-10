@@ -260,6 +260,7 @@ def _parse_okv2_named_task(raw, status_literal, tool_name, model_cls):
 
 class AddShoppingItemsAdded(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["added"] = "added"
     added_count: int = Field(ge=1)
     item_ids: list[ShoppingItemId]
@@ -268,6 +269,20 @@ class AddShoppingItemsAdded(BaseModel):
     tight ``sh_<24 hex>`` pattern; parsers wrap construction in
     ``ValidationError`` → ``ToolOutputContractViolation`` so the
     executor fail-closes on bad raw output."""
+    # #115 by-name outcome buckets (okv2 path); empty on legacy positional.
+    # ``created`` are the names behind ``item_ids`` (created rows only — the
+    # legacy planner-path lie where duplicates inflated the count is gone).
+    created: list[str] = Field(default_factory=list)
+    duplicates_existing: list[str] = Field(default_factory=list)
+    duplicates_in_batch: list[str] = Field(default_factory=list)
+    replayed: list[str] = Field(default_factory=list)
+    invalid: list[str] = Field(default_factory=list)
+    """Nameable validation drops. Empty by construction today (shopping
+    invalid rows are untitled/non-dict → no name knowable); kept so a future
+    nameable-invalid path surfaces names, not silence."""
+    duplicate_item_ids: list[ShoppingItemId] = Field(default_factory=list)
+    """Ids of the existing pending rows behind ``duplicates_existing`` —
+    planner-visible so follow-up writes can reference them."""
 
     @model_validator(mode="after")
     def _validate_count_matches_ids(self) -> AddShoppingItemsAdded:
@@ -282,17 +297,92 @@ class AddShoppingItemsAdded(BaseModel):
             )
         return self
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.created and not self.duplicates_existing:
+            return "Готово."  # legacy positional path (counts/ids only)
+        return build_display_summary(
+            [
+                ("Добавила", self.created),
+                ("Уже было", self.duplicates_existing),
+                ("Повтор в списке", self.duplicates_in_batch),
+                ("Уже добавляла раньше", self.replayed),
+                ("Не получилось", self.invalid),
+            ]
+        )
+
 
 class AddShoppingItemsEmpty(BaseModel):
     """``ok:added:0`` — every requested item was a duplicate of existing row."""
 
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #115
     status: Literal["empty"] = "empty"
     added_count: Literal[0] = 0
+    # #115 (Codex plan-review B3): duplicate-only outcomes must surface the
+    # duplicate NAMES too — «ничего нового, уже было: X, Y».
+    duplicates_existing: list[str] = Field(default_factory=list)
+    duplicates_in_batch: list[str] = Field(default_factory=list)
+    duplicate_item_ids: list[ShoppingItemId] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        if not self.duplicates_existing and not self.duplicates_in_batch:
+            return "Готово."  # legacy positional path
+        return build_display_summary(
+            [
+                ("Уже было", self.duplicates_existing),
+                ("Повтор в списке", self.duplicates_in_batch),
+            ]
+        )
+
+
+class AddShoppingItemsReplay(BaseModel):
+    """#115, okv2-only (legacy_compat=no): every non-duplicate item hit
+    ON CONFLICT on its per-item operation_id — an earlier retry of THIS SAME
+    step already inserted the rows. Idempotent replay, NOT a user-facing
+    duplicate: the voice says «уже добавляла раньше», never «дубль»."""
+
+    model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"
+    status: Literal["replay"] = "replay"
+    replayed: list[str] = Field(min_length=1)
+    item_ids: list[ShoppingItemId]
+    """Ids of the replayed rows (planner refs work across retries)."""
+    duplicates_existing: list[str] = Field(default_factory=list)
+    duplicates_in_batch: list[str] = Field(default_factory=list)
+    duplicate_item_ids: list[ShoppingItemId] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_replay_ids(self) -> AddShoppingItemsReplay:
+        if len(self.item_ids) != len(self.replayed):
+            raise ValueError(
+                f"replayed has {len(self.replayed)} names but item_ids has "
+                f"{len(self.item_ids)} entries — mismatch."
+            )
+        return self
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return build_display_summary(
+            [
+                ("Уже добавляла раньше", self.replayed),
+                ("Уже было", self.duplicates_existing),
+                ("Повтор в списке", self.duplicates_in_batch),
+            ]
+        )
 
 
 AddShoppingItemsOutput = Annotated[
-    Union[AddShoppingItemsAdded, AddShoppingItemsEmpty, HousewifeToolError],
+    Union[
+        AddShoppingItemsAdded,
+        AddShoppingItemsEmpty,
+        AddShoppingItemsReplay,
+        HousewifeToolError,
+    ],
     Field(discriminator="status"),
 ]
 
@@ -304,11 +394,92 @@ _ADD_SHOPPING_RE = re.compile(
 
 def parse_add_shopping_items(
     raw: str,
-) -> AddShoppingItemsAdded | AddShoppingItemsEmpty | HousewifeToolError | ToolOutputContractViolation:
+) -> (
+    AddShoppingItemsAdded
+    | AddShoppingItemsEmpty
+    | AddShoppingItemsReplay
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
     """Parse a raw add_shopping_items output line."""
     err = _parse_error(raw)
     if err is not None:
         return err
+    # #115: okv2 carries by-name outcome buckets; legacy positional stays.
+    if is_okv2(raw):
+        _sentinel = ToolOutputContractViolation(
+            raw_output=raw, tool_name="add_shopping_items",
+            timestamp=datetime.now(timezone.utc),
+        )
+        # okv2 producers MUST send every bucket key for the status (legacy
+        # positional keeps the model defaults) — a producer regression that
+        # drops a bucket must fail closed, not silently parse (Codex #115,
+        # mirrors the add_family_members key check).
+        _REQUIRED_KEYS = {
+            "added": {
+                "added_count", "item_ids", "created", "duplicates_existing",
+                "duplicates_in_batch", "replayed", "invalid", "duplicate_item_ids",
+            },
+            "replay": {
+                "replayed", "item_ids", "duplicates_existing",
+                "duplicates_in_batch", "duplicate_item_ids",
+            },
+            "empty": {
+                "added_count", "duplicates_existing", "duplicates_in_batch",
+                "duplicate_item_ids",
+            },
+        }
+        try:
+            status, payload = parse_tool_ok(
+                raw, frozenset({"added", "empty", "replay"})
+            )
+            if not _REQUIRED_KEYS[status].issubset(payload):
+                raise ToolOkParseError("add_shopping_items okv2 missing bucket keys")
+            model: (
+                AddShoppingItemsAdded | AddShoppingItemsEmpty | AddShoppingItemsReplay
+            )
+            if status == "added":
+                model = AddShoppingItemsAdded(status=status, **payload)
+            elif status == "replay":
+                model = AddShoppingItemsReplay(status=status, **payload)
+            else:
+                model = AddShoppingItemsEmpty(status=status, **payload)
+        except (ToolOkParseError, ValidationError, TypeError):
+            return _sentinel
+        if isinstance(model, AddShoppingItemsAdded):
+            # created names must match the count/ids; all buckets usable.
+            if (
+                len(model.created) != model.added_count
+                or len(model.duplicate_item_ids) != len(model.duplicates_existing)
+                or not _all_names_usable(
+                    model.created,
+                    model.duplicates_existing,
+                    model.duplicates_in_batch,
+                    model.replayed,
+                    model.invalid,
+                )
+            ):
+                return _sentinel
+        elif isinstance(model, AddShoppingItemsReplay):
+            if (
+                len(model.duplicate_item_ids) != len(model.duplicates_existing)
+                or not _all_names_usable(
+                    model.replayed,
+                    model.duplicates_existing,
+                    model.duplicates_in_batch,
+                )
+            ):
+                return _sentinel
+        else:  # empty — okv2 MUST carry the duplicate names (legacy is exempt)
+            if (
+                not (model.duplicates_existing or model.duplicates_in_batch)
+                or len(model.duplicate_item_ids) != len(model.duplicates_existing)
+                or not _all_names_usable(
+                    model.duplicates_existing, model.duplicates_in_batch
+                )
+            ):
+                return _sentinel
+        return model
     m = _ADD_SHOPPING_RE.match(raw.strip())
     if m is not None:
         count = int(m.group("count"))

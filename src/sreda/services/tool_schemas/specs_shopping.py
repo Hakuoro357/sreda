@@ -203,7 +203,10 @@ ADD_SHOPPING_ITEMS_SPEC = ToolSpec(
     input_model=AddShoppingItemsInput,
     output_model=AddShoppingItemsOutput,
     # #29: "empty" (count=0) is an idempotent no-op — nothing written.
-    committed_statuses=frozenset({"added"}),
+    # #115: "replay" means the rows EXIST — an earlier retry of this same step
+    # inserted them (ON CONFLICT on the per-item operation_id). The durable
+    # write is committed from recovery's point of view, just not by this call.
+    committed_statuses=frozenset({"added", "replay"}),
     trigger_examples=[
         "купи молоко и хлеб",
         "добавь в покупки яйца",

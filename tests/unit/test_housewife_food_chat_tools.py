@@ -66,9 +66,10 @@ def test_add_shopping_items_creates_rows(session):
             {"title": "хлеб", "category": "хлеб"},
         ]
     })
-    assert result.startswith("ok:added:2")
-    # ids included in result
-    assert "ids=[sh_" in result
+    parsed = parse_tool_output("add_shopping_items", result)  # #115 okv2
+    assert parsed.added_count == 2
+    assert sorted(parsed.created) == sorted(["молоко", "хлеб"])
+    assert all(i.startswith("sh_") for i in parsed.item_ids)
 
     rows = session.query(ShoppingListItem).all()
     assert len(rows) == 2
@@ -87,7 +88,7 @@ def test_add_shopping_items_skips_empty_titles(session):
         "items": [{"title": ""}, {"title": "хлеб"}]
     })
     # Only one actually inserted despite 2 in the payload
-    assert result.startswith("ok:added:1")
+    assert parse_tool_output("add_shopping_items", result).added_count == 1  # #115
     assert session.query(ShoppingListItem).count() == 1
 
 
@@ -131,10 +132,7 @@ def test_list_shopping_omits_bought_and_cancelled(session):
         ]
     })
     # Pull ids back out of the ok:... string
-    ids = [
-        s for s in
-        result.split("ids=[")[1].rstrip("]").split(",")
-    ]
+    ids = list(parse_tool_output("add_shopping_items", result).item_ids)  # #115
     tools["mark_shopping_bought"].invoke({"item_ids": [ids[0]]})
     listing = tools["list_shopping"].invoke({})
     # "молоко" bought → gone; "хлеб" pending → shown
@@ -152,7 +150,7 @@ def test_mark_shopping_bought_updates_status(session):
     result = tools["add_shopping_items"].invoke({
         "items": [{"title": "молоко"}, {"title": "хлеб"}]
     })
-    ids = result.split("ids=[")[1].rstrip("]").split(",")
+    ids = list(parse_tool_output("add_shopping_items", result).item_ids)  # #115
 
     out = tools["mark_shopping_bought"].invoke({"item_ids": ids})
     parsed = parse_tool_output("mark_shopping_bought", out)  # #115 okv2 + names
@@ -167,7 +165,7 @@ def test_remove_shopping_items_cancels(session):
     result = tools["add_shopping_items"].invoke({
         "items": [{"title": "молоко"}]
     })
-    item_id = result.split("ids=[")[1].rstrip("]")
+    item_id = parse_tool_output("add_shopping_items", result).item_ids[0]  # #115
 
     out = tools["remove_shopping_items"].invoke({"item_ids": [item_id]})
     parsed = parse_tool_output("remove_shopping_items", out)  # #115 okv2 + names
@@ -190,7 +188,7 @@ def test_clear_bought_moves_to_cancelled(session):
     result = tools["add_shopping_items"].invoke({
         "items": [{"title": "молоко"}, {"title": "хлеб"}, {"title": "сыр"}]
     })
-    ids = result.split("ids=[")[1].rstrip("]").split(",")
+    ids = list(parse_tool_output("add_shopping_items", result).item_ids)  # #115
 
     # Mark first two bought, third stays pending
     tools["mark_shopping_bought"].invoke({"item_ids": ids[:2]})

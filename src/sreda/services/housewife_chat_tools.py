@@ -727,25 +727,57 @@ def build_housewife_tools(
                 {"title": "помидоры", "quantity_text": "1 кг", "category": "овощи_фрукты"},
             ])
 
-        Returns a short status string with how many rows were inserted
-        and the ids (needed if the user immediately changes their mind
-        and you need to remove_shopping_items the last add).
+        Returns a status envelope with the added item NAMES (plus names of
+        items that were already on the list / repeated in the batch) and the
+        new row ids (needed if the user immediately changes their mind and
+        you need to remove_shopping_items the last add).
         """
         if not user_id:
             return "error: no user_id context"
         if not items:
             return "error: empty items list"
         try:
-            rows = shopping_service.add_items(
+            outcome = shopping_service.add_items_detailed(
                 tenant_id=tenant_id, user_id=user_id, items=items
             )
         except Exception:  # noqa: BLE001
             logger.exception("add_shopping_items failed")
             return "error: internal"
-        if not rows:
-            return "ok:added:0"
-        ids_csv = ",".join(r.id for r in rows)
-        return f"ok:added:{len(rows)}:ids=[{ids_csv}]"
+        # #115: okv2 carries by-name outcome buckets. Status routing:
+        #   created>0            → added   (the honest count — duplicates no
+        #                          longer inflate it on the planner path)
+        #   created=0, replay>0  → replay  (same-operation retry; idempotent)
+        #   otherwise            → empty   (all-duplicate / nothing insertable)
+        dup_fields = {
+            "duplicates_existing": list(outcome.duplicates_existing),
+            "duplicates_in_batch": list(outcome.duplicates_in_batch),
+            "duplicate_item_ids": list(outcome.duplicate_item_ids),
+        }
+        if outcome.created:
+            return encode_tool_ok(
+                "added",
+                {
+                    "added_count": len(outcome.created),
+                    "item_ids": [r.id for r in outcome.created],
+                    "created": [r.title for r in outcome.created],
+                    "replayed": [r.title for r in outcome.replayed],
+                    "invalid": [],
+                    **dup_fields,
+                },
+            )
+        if outcome.replayed:
+            return encode_tool_ok(
+                "replay",
+                {
+                    "replayed": [r.title for r in outcome.replayed],
+                    "item_ids": [r.id for r in outcome.replayed],
+                    **dup_fields,
+                },
+            )
+        if outcome.duplicates_existing or outcome.duplicates_in_batch:
+            return encode_tool_ok("empty", {"added_count": 0, **dup_fields})
+        # Nothing insertable and nothing nameable (e.g. all titles blank).
+        return "ok:added:0"
 
     @_write_lc_tool
     def mark_shopping_bought(item_ids: list[str]) -> str:

@@ -218,6 +218,33 @@ def _guess_category(title: str) -> str:
 
 
 @dataclass(slots=True)
+class AddItemsResult:
+    """#115 by-name outcome for ``add_items_detailed``.
+
+    ``ordered_rows`` is EXACTLY the legacy ``add_items`` return value (created
+    rows in legacy path; created + existing-pending + replayed rows in planner
+    path) — the thin ``add_items`` delegate returns it so every existing caller
+    (miniapp, menu autogen) keeps byte-identical behaviour.
+
+    ``created`` — rows actually INSERTED by THIS call.
+    ``duplicates_existing`` — titles of already-PENDING rows that title-dedup
+    matched (cross-call UX rule; name = the existing row's title).
+    ``duplicates_in_batch`` — input titles repeated within this batch.
+    ``replayed`` — planner path only: rows whose INSERT hit ON CONFLICT on the
+    per-item operation_id, i.e. an earlier retry of THIS SAME step already
+    inserted them (idempotent replay — NOT a user-facing duplicate).
+    ``duplicate_item_ids`` — ids of the existing pending rows behind
+    ``duplicates_existing`` (planner may reference them in follow-ups)."""
+
+    ordered_rows: list[ShoppingListItem] = field(default_factory=list)
+    created: list[ShoppingListItem] = field(default_factory=list)
+    duplicates_existing: list[str] = field(default_factory=list)
+    duplicates_in_batch: list[str] = field(default_factory=list)
+    replayed: list[ShoppingListItem] = field(default_factory=list)
+    duplicate_item_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class BulkStatusResult:
     """#115 by-name outcome for bulk status flips (mark_bought / remove_items)
     so the live voice can confirm what happened.
@@ -256,8 +283,23 @@ class HousewifeShoppingService:
         user_id: str,
         items: list[ShoppingItemInput] | list[dict[str, Any]],
     ) -> list[ShoppingListItem]:
-        """Batch-insert items with ``status='pending'``. Returns the
-        created rows in order.
+        """Thin back-compat delegate — EXACT legacy return shape (see
+        ``add_items_detailed.ordered_rows``). Existing callers (miniapp, menu
+        autogen, chat) keep byte-identical behaviour."""
+        return self.add_items_detailed(
+            tenant_id=tenant_id, user_id=user_id, items=items
+        ).ordered_rows
+
+    def add_items_detailed(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        items: list[ShoppingItemInput] | list[dict[str, Any]],
+    ) -> AddItemsResult:
+        """Batch-insert items with ``status='pending'``. #115: returns the full
+        by-name outcome (created / duplicates_existing / duplicates_in_batch /
+        replayed) plus ``ordered_rows`` — the exact legacy return value.
 
         Empty title is rejected at the item level (returns with a warning
         log) — we don't want silently-created empty placeholder rows.
@@ -327,18 +369,31 @@ class HousewifeShoppingService:
             # menu re-adds Thursday's ingredients" duplicate flood. Bought
             # / cancelled rows don't count — if user bought 'молоко'
             # yesterday, re-adding today is a legitimate new need.
-            existing_titles: set[str] = set()
+            # #115: keep a SNAPSHOT map of the pre-existing pending rows so a
+            # cross-call duplicate (already on the list) is distinguishable from
+            # an in-batch repeat — both were a single opaque `continue` before.
+            pending_by_title_legacy: dict[str, ShoppingListItem] = {}
             for existing in self._list_by_status(
                 tenant_id, user_id, ("pending",)
             ):
-                existing_titles.add(_normalise_title(existing.title))
+                pending_by_title_legacy.setdefault(
+                    _normalise_title(existing.title), existing
+                )
+            existing_titles: set[str] = set(pending_by_title_legacy.keys())
 
+            result = AddItemsResult()
             now = _utcnow()
             rows: list[ShoppingListItem] = []
             for item in normalised:
                 norm = _normalise_title(item.title)
                 if norm in existing_titles:
-                    # Skip — already on the list.
+                    # Already on the list (cross-call) or repeated in this batch.
+                    pre = pending_by_title_legacy.get(norm)
+                    if pre is not None:
+                        result.duplicates_existing.append(pre.title)
+                        result.duplicate_item_ids.append(pre.id)
+                    else:
+                        result.duplicates_in_batch.append(item.title)
                     continue
                 # Track this one so a later item within the same batch
                 # with the same normalised title also gets deduped.
@@ -369,7 +424,9 @@ class HousewifeShoppingService:
 
             if rows:
                 self.session.commit()
-            return rows
+            result.created = rows
+            result.ordered_rows = rows  # legacy return shape: created only
+            return result
 
         # ------------------------------------------------------------------
         # PLANNER PATH — option-(a) idempotency adapter (Sub-A12 Phase E).
@@ -410,10 +467,30 @@ class HousewifeShoppingService:
             # SQLite (tests) + any other dialect with SQLAlchemy upsert support.
             from sqlalchemy.dialects.sqlite import insert as _insert  # type: ignore[no-redef]
 
+        result = AddItemsResult()
         rows_p: list[ShoppingListItem] = []
         seen: set[str] = set(pending_by_title.keys())
         for item in normalised:
             norm = _normalise_title(item.title)
+            # Per-ITEM operation_id — the ROW's idempotency key for the UNIQUE
+            # (tenant, user, operation_id) index.  A step inserting N items
+            # needs N distinct keys, so this is derived per item (includes the
+            # normalised title).  It is DELIBERATELY different from the per-STEP
+            # ctx.operation_id used for the recovery-probe audit event below
+            # (a single global op_id on one row is not sufficient for multi-row
+            # — plan item #1).  Computed BEFORE the title-dedup decision (#115
+            # Codex CRITICAL): a pending row carrying THIS op_id was inserted by
+            # an earlier retry of THIS SAME step — that's an idempotent REPLAY,
+            # not a user-facing duplicate, and must not degrade to `empty`
+            # (which sits outside committed_statuses and would make recovery
+            # treat the durable write as never committed).
+            op_id = compute_operation_id_create(
+                plan_id=ctx.execution_id,
+                step_id=ctx.step_id,
+                action="create",
+                entity_type="shopping_list_item",
+                logical_key=normalize_for_dedup(item.title),
+            )
             # Already pending (cross-call) OR already handled earlier in this
             # batch (intra-batch dedup, mirrors the legacy single-set logic).
             if norm in seen:
@@ -423,6 +500,14 @@ class HousewifeShoppingService:
                     # The per-step audit footprint below is emitted regardless,
                     # so a fully-deduped step is still visible to recovery.
                     rows_p.append(existing_row)
+                    if existing_row.operation_id == op_id:
+                        # Same-step retry: row exists because WE inserted it.
+                        result.replayed.append(existing_row)  # #115
+                    else:
+                        result.duplicates_existing.append(existing_row.title)  # #115
+                        result.duplicate_item_ids.append(existing_row.id)
+                else:
+                    result.duplicates_in_batch.append(item.title)  # #115
                 continue
             seen.add(norm)
 
@@ -430,21 +515,6 @@ class HousewifeShoppingService:
                 resolved_category = _coerce_category(item.category)
             else:
                 resolved_category = _guess_category(item.title)
-
-            # Per-ITEM operation_id — the ROW's idempotency key for the UNIQUE
-            # (tenant, user, operation_id) index.  A step inserting N items
-            # needs N distinct keys, so this is derived per item (includes the
-            # normalised title).  It is DELIBERATELY different from the per-STEP
-            # ctx.operation_id used for the recovery-probe audit event below
-            # (a single global op_id on one row is not sufficient for multi-row
-            # — plan item #1).
-            op_id = compute_operation_id_create(
-                plan_id=ctx.execution_id,
-                step_id=ctx.step_id,
-                action="create",
-                entity_type="shopping_list_item",
-                logical_key=normalize_for_dedup(item.title),
-            )
             # Hash scoped to the AUTHORITATIVE user (the `user_id` argument),
             # never ctx.user_id (the executor binds that to None today, which
             # would scope the hash to a blank user and break future lookups +
@@ -477,7 +547,12 @@ class HousewifeShoppingService:
                     index_elements=["tenant_id", "user_id", "operation_id"]
                 )
             )
-            self.session.execute(stmt)
+            insert_res = self.session.execute(stmt)
+            # #115: rowcount==1 → THIS call inserted the row (created);
+            # rowcount==0 → ON CONFLICT fired (an earlier retry of this same
+            # step already inserted it) → idempotent REPLAY, not a user-facing
+            # duplicate. Works on both postgresql and sqlite single-row inserts.
+            was_inserted = bool(getattr(insert_res, "rowcount", 0) == 1)
 
             # Fetch the row by operation_id — covers both "inserted just now"
             # and "ON CONFLICT fired because a concurrent racer / earlier retry
@@ -500,6 +575,10 @@ class HousewifeShoppingService:
                 )
                 continue
             rows_p.append(actual_row)
+            if was_inserted:
+                result.created.append(actual_row)  # #115
+            else:
+                result.replayed.append(actual_row)  # #115 same-operation replay
 
         # ------------------------------------------------------------------
         # ONE per-step audit footprint — the crash-recovery PROBE SURFACE.
@@ -540,7 +619,8 @@ class HousewifeShoppingService:
                     ctx.operation_id,
                 )
             self.session.commit()
-        return rows_p
+        result.ordered_rows = rows_p  # legacy planner return shape
+        return result
 
     def mark_bought(
         self, *, tenant_id: str, user_id: str, ids: list[str]
