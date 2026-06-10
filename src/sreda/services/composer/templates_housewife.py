@@ -37,10 +37,34 @@ _SHOPPING_ADDED_EMPTY = (
 # исполнения литералом) → обязательный count делал шаблон неиспользуемым
 # (диагноз: 3/3 проб модель привязывала items, но не count).
 # истинностный сторож (R4 MINOR): count=None/'' /0 не рендерит «(None)»/«()»
+# #123: группировка по категориям — сырьё для рта обязано нести структуру
+# (заголовок группы своей строкой, пункты под ним), иначе голосу нечего
+# сохранять. Категория у элемента ОПЦИОНАЛЬНА (контракт требует только
+# display_line); элементы приходят от сервиса уже отсортированными по
+# категориям. Строковые элементы (#118 R3) рендерятся без группировки.
 _SHOPPING_LIST_SHOW = (
+    "{% set ns = namespace(cat=none) %}"
     "В списке покупок{% if count is defined and count %} ({{ count }}){% endif %}:"
     "{% for it in items %}"
-    "\n• {% if it is mapping %}{{ it.display_line }}{% else %}{{ it }}{% endif %}"
+    "{% if it is mapping %}"
+    "{% if it.category is defined and it.category %}"
+    "{% if (it.category|lower) != ((ns.cat or '')|lower) %}"
+    "{% set ns.cat = it.category %}"
+    # агент-ревьюер #123: первая буква вверх, хвост НЕ трогаем (категории
+    # бывают пользовательскими: «СВЧ Товары»); сравнение — без регистра
+    "\n\n{{ ns.cat[:1]|upper ~ ns.cat[1:] }}:"
+    "{% endif %}"
+    "\n• {{ it.display_line }}"
+    "{% else %}"
+    # бескатегорийный объект ПОСЛЕ группы — не «приклеивать» к чужому
+    # заголовку: пустая строка-разделитель + сброс трекера (Codex R1 MINOR)
+    "{% if ns.cat %}{% set ns.cat = none %}\n{% endif %}"
+    "\n• {{ it.display_line }}"
+    "{% endif %}"
+    "{% else %}"
+    "{% if ns.cat %}{% set ns.cat = none %}\n{% endif %}"
+    "\n• {{ it }}"
+    "{% endif %}"
     "{% endfor %}"
 )
 
