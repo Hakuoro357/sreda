@@ -31,7 +31,10 @@ from jinja2 import (
 )
 
 from sreda.services.clarification_contract import clarification_field_ru
-from sreda.services.composer.templates_housewife import HOUSEWIFE_TEMPLATES
+from sreda.services.composer.templates_housewife import (
+    HOUSEWIFE_TEMPLATES,
+    category_label_ru,
+)
 
 
 class UnknownTemplateError(KeyError):
@@ -77,6 +80,10 @@ class ComposerRegistry:
         # render ``{{ field | clarify_ru }}`` instead of an inline if/elif chain.
         # Imported from the zero-intra-project-import leaf module — cycle-safe.
         self._env.filters["clarify_ru"] = clarification_field_ru
+        # #123-добив: человеческие ярлыки категорий покупок для заголовков
+        # групп («овощи_фрукты» → «Овощи и фрукты»; пользовательские — без
+        # калечащей капитализации). Модуль шаблонов уже импортируется выше.
+        self._env.filters["ru_category"] = category_label_ru
         self._entries: dict[str, TemplateEntry] = {}
 
     def register(self, template_id: str, source: str) -> None:

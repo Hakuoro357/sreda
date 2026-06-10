@@ -21,7 +21,7 @@ def test_shopping_show_groups_by_category():
     lines = out.split("\n")
     # заголовки групп — своей строкой, пункты — под ними
     assert "Молочные:" in lines
-    assert "Овощи_фрукты:" in lines
+    assert "Овощи и фрукты:" in lines  # #123-добив: ярлык вместо кода
     i_cat = lines.index("Молочные:")
     assert lines[i_cat + 1] == "• молоко"
     assert lines[i_cat + 2] == "• сливочное масло (200 г)"
@@ -93,3 +93,48 @@ def test_category_capitalization_preserves_tail():
         {"display_line": "тарелки", "category": "СВЧ Товары"},
     ]})
     assert "СВЧ Товары:" in out and "Свч товары:" not in out
+
+
+def test_category_labels_ru():
+    """#123-добив: внутренние коды таксономии → человеческие ярлыки;
+    неизвестные пользовательские — подчёркивания в пробелы, хвост не калечим."""
+    from sreda.services.composer.templates_housewife import category_label_ru
+
+    assert category_label_ru("овощи_фрукты") == "Овощи и фрукты"
+    assert category_label_ru("мясо_рыба") == "Мясо и рыба"
+    assert category_label_ru("бытовая_химия") == "Бытовая химия"
+    assert category_label_ru("СВЧ Товары") == "СВЧ Товары"
+    assert category_label_ru("моя_полка") == "Моя полка"
+    out = REGISTRY.render("shopping_list_show", {"items": [
+        {"display_line": "морковь", "category": "овощи_фрукты"},
+    ]})
+    assert "Овощи и фрукты:" in out and "Овощи_фрукты" not in out
+
+
+def test_humanize_prompt_has_anti_glue_examples():
+    from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
+
+    sp = LLM_PROMPT_REGISTRY.get("humanize_result").system_prompt
+    assert "НЕПРАВИЛЬНО: «— хлеб Бакалея:»" in sp
+    assert "НЕПРАВИЛЬНО: «— яйца Если нужно" in sp
+
+
+def test_gemini_flash_lite_provider_registered():
+    """(б) #107: кандидат в рот подключён в реестр провайдеров."""
+    from sreda.services.llm import CHAT_PROVIDERS, _OPENROUTER_MODEL_BY_PROVIDER
+
+    assert "openrouter-gemini-2.5-flash-lite" in CHAT_PROVIDERS
+    assert _OPENROUTER_MODEL_BY_PROVIDER["openrouter-gemini-2.5-flash-lite"] == (
+        "google/gemini-2.5-flash-lite"
+    )
+
+
+def test_category_labels_pinned_to_service_taxonomy():
+    """Codex #123b R1 MINOR (оба): карта ярлыков покрывает ВСЮ фиксированную
+    таксономию сервиса и не содержит чужих ключей (анти-дрейф)."""
+    from sreda.db.models.housewife_food import SHOPPING_CATEGORIES
+    from sreda.services.composer.templates_housewife import CATEGORY_LABELS_RU
+
+    assert set(CATEGORY_LABELS_RU) == set(SHOPPING_CATEGORIES), (
+        "карта ярлыков разъехалась с таксономией сервиса"
+    )

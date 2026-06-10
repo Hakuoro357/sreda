@@ -228,6 +228,14 @@ _LLM_PROVIDERS_METADATA = [
         "resolver": "resolve_openrouter_api_key",
         "static_model": "google/gemini-2.5-flash",
     },
+    # 2026-06-10 (#107, выбор Бориса): кандидат в РОТ против лёгкой mimo-v2.5.
+    {
+        "key": "openrouter-gemini-2.5-flash-lite",
+        "label": "OpenRouter · Gemini 2.5 Flash Lite",
+        "default_model_attr": None,
+        "resolver": "resolve_openrouter_api_key",
+        "static_model": "google/gemini-2.5-flash-lite",
+    },
 ]
 
 

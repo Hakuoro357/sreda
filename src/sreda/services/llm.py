@@ -1301,6 +1301,9 @@ CHAT_PROVIDERS = (
     # бенче (1.5s avg, all 8 scenarios tools clean). $0.30/$2.50 per 1M
     # (OR +5.5% markup vs direct Google). Pro tier candidate / mimo fallback.
     "openrouter-gemini-2.5-flash",
+    # 2026-06-10 (#107, выбор Бориса): кандидат в РОТ против лёгкой mimo-v2.5
+    # — сверхдешёвый lite-вариант 2.5 flash.
+    "openrouter-gemini-2.5-flash-lite",
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1332,6 +1335,7 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     # 1M context. Cheapest tool-calling provider в нашем бенче.
     "openrouter-qwen-flash":        "qwen/qwen3.5-flash-02-23",
     "openrouter-gemini-2.5-flash":  "google/gemini-2.5-flash",
+    "openrouter-gemini-2.5-flash-lite": "google/gemini-2.5-flash-lite",
 }
 
 
