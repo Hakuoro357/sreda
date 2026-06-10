@@ -258,21 +258,30 @@ async def run_planner_chat_loop(
 
     # --- стадия 3: голос ------------------------------------------------------
     try:
+        from sreda.services.composer import llm_composer as _voice_mod
         from sreda.services.composer.compose import ComposerContext, compose
-        from sreda.services.composer.llm_composer import DEFAULT_LLM_COMPOSER
+
+        # #121: отмечаем, вызывался ли живой голос ВНУТРИ сборки — чтобы
+        # шаблонные ветки потом прогнать через рот (правило владельца:
+        # ВСЕ ответы через живой голос; шаблон — сырьё и страховка).
+        _voice_used = {"v": False}
+
+        def _tracking_voice(**kw):
+            _voice_used["v"] = True
+            return _voice_mod.DEFAULT_LLM_COMPOSER(**kw)
 
         with trace.step("planner.compose") as _meta:
             reply = compose(
                 plan_result.plan.compose,
                 exec_log,
-                llm_composer=DEFAULT_LLM_COMPOSER,
-                ctx=ComposerContext(
+                llm_composer=_tracking_voice,
+                ctx=(ctx2 := ComposerContext(
                     tenant_id=action.tenant_id,
                     run_id=pf.run_id,
                     user_message=pf.user_text,
                     locale="ru-RU",
                     timezone="Europe/Moscow",
-                ),
+                )),
                 # тот же снимок, что видел планировщик при валидации (Codex R1
                 # MINOR: хэш «на момент сборки» делает проверку гонки тавтологией)
                 expected_registry_snapshot_hash=registry_snapshot_hash,
@@ -281,10 +290,63 @@ async def run_planner_chat_loop(
         text = (reply.text or "").strip()
         if not text:
             raise RuntimeError("composer returned blank text")
+        # Падение самого ГОЛОСА внутри сборки — прихорашивать тем же сломанным
+        # голосом бессмысленно: остаёмся на детерминированной страховке.
+        # Codex R2 (medium): прод-compose() кладёт голосовой сбой в error_code
+        # («llm_composer_error:…»), а fallback_used становится generic_error /
+        # conversational_fallback — классифицируем по ОБОИМ полям.
+        _voice_broken = (
+            str(getattr(reply, "error_code", "") or "").startswith("llm_composer")
+            or str(reply.fallback_used or "").startswith("llm_composer")
+        )
         if reply.fallback_used:
-            _alert("голос", action, str(reply.fallback_used),
+            _alert("голос" if _voice_broken else "сборка", action,
+                   str(reply.fallback_used),
                    f"деградация сборки; план={getattr(plan_result.plan.compose, 'template_id', None)}"
                    f"/{getattr(plan_result.plan.compose, 'llm_prompt_key', None)}")
+        # Codex #121 R1 (оба, MAJOR): рот обязателен и после НЕголосовой
+        # деградации сборки (шаблон/реестр) — её текст тоже сырьё, не финал.
+        # Предикат шагов = called (без skipped и до-вызовных arg_violation).
+        if not _voice_used["v"] and not _voice_broken and called:
+            # #121 (правило владельца, скриншоты 2026-06-10): шаблонный рендер
+            # НЕ финал — отдаём его рту как факт-сырьё («сделай красиво, не
+            # теряя ни одной позиции» — Ф4-промпт humanize_result). Сбой
+            # голоса → пользователю уходит детерминированный текст (страховка)
+            # + алерт владельцу. Ходы без исполненных шагов (уточнения,
+            # болтовня, identity) не прихорашиваются — там перефраз вредит.
+            with trace.step("planner.voice") as _vmeta:
+                try:
+                    voiced = _voice_mod.DEFAULT_LLM_COMPOSER(
+                        llm_prompt_key="humanize_result",
+                        template_data={
+                            "intent": (pf.user_text or "запрос пользователя")[:300],
+                            "actions": [{
+                                "user_visible_summary": text,
+                                "status": "ok",
+                            }],
+                        },
+                        execution_log=exec_log,
+                        ctx=ctx2,
+                    )
+                    voiced_text = (getattr(voiced, "text", "") or "").strip()
+                    _vmeta["ok"] = bool(voiced_text)
+                    _vmeta["latency_ms"] = getattr(voiced, "latency_ms", None)
+                    if voiced_text:
+                        text = voiced_text
+                    else:
+                        # Codex R1 (оба): пустой голос = сбой по контракту —
+                        # алерт владельцу, пользователю — страховка шаблоном
+                        _alert("голос-прихорашивание", action, "blank_output",
+                               "рот вернул пустой текст; ушла страховка")
+                except Exception as exc:  # noqa: BLE001 — страховка шаблоном
+                    _vmeta["ok"] = False
+                    logger.warning(
+                        "planner_chat: voice beautify failed (%s) — "
+                        "falling back to template text",
+                        type(exc).__name__,
+                    )
+                    _alert("голос-прихорашивание", action,
+                           type(exc).__name__, str(exc))
         return _result(text, called=called, counts=counts)
     except Exception as exc:  # noqa: BLE001
         logger.exception("planner_chat: compose stage crashed")
