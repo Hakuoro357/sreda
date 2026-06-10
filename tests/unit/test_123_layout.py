@@ -54,10 +54,25 @@ def test_humanize_prompt_has_layout_rules():
     sp = spec.system_prompt
     assert "ВЁРСТКА" in sp
     assert "ПО ОДНОМУ пункту на строку" in sp
-    assert "ОТДЕЛЬНОЙ строкой ДО" in sp
+    assert "отдельной строкой ДО" in sp
     assert "ПОСЛЕ перечня" in sp
     assert "заголовки групп" in sp
-    assert "НЕ у каждого пункта" in sp
+    # консультация Кодекса 2026-06-10 (правка рта): запрет разметки,
+    # запрет приветствия, буквальное копирование, источники, правила>голос
+    assert "без Markdown/HTML" in sp
+    assert "Не здоровайся" in sp
+    assert "копируй буквально" in sp
+    assert "только для тона" in sp
+    # Codex medium R1 MAJOR: приоритет «правила > голос» — ПОСЛЕДНЯЯ
+    # инструкция промпта (после _VOICE), пин позиции, не только наличия
+    assert sp.rstrip().endswith(
+        "Если правила и голос конфликтуют — выполняй правила выше "
+        "(ПРАВИЛА и ВЁРСТКА)."
+    )
+    # Claude-субагент R1 MAJOR: ✅-маркеры чеклистов — данные, не «эмодзи от
+    # себя»; перечисление через запятую тоже под «назови КАЖДУЮ»
+    assert "уже есть в ДАННЫХ" in sp
+    assert "через запятую" in sp
 
 
 def test_categoryless_after_group_not_glued():
