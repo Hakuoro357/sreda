@@ -3299,6 +3299,78 @@ async def execute_conversation_chat(
     # original single local). Codex code-review R1 MINOR.
     _ack_progress = context.get("_ack_progress_controller")
 
+    # --- #120: planner-loop gate (семейные тенанты) ----------------------
+    # Для тенантов из SREDA_PLANNER_ENABLED_TENANTS ход обслуживает плановый
+    # контур (план→исполнение→голос) вместо легаси-цикла. Для остальных —
+    # байт-в-байт прежний путь: ниже одна проверка принадлежности множеству.
+    # Решение владельца (#120): БЕЗ отката в легаси — сбои планового пути
+    # отвечают честным шаблоном и шлют алерт владельцу (внутри модуля).
+    if (
+        action.tenant_id in pf.settings.planner_enabled_tenants
+        # Codex #120 R2 MEDIUM: онбординг-ходы остаются за легаси ЯВНО —
+        # плановый контур онбордингу не обучен (нет онбординг-инструментов в
+        # планах) и не ведёт учёт глубины follow-up. Это продуктовое
+        # исключение из гейта, НЕ откат-на-ошибке (решение #120 про сбои
+        # не нарушается). Семейные тенанты онбординг давно прошли — ветка
+        # практически мертва, но поведение зафиксировано кодом и тестом.
+        and not pf.onboarding_follow_up_needed
+    ):
+        # Codex #120 R1 MAJOR: «никогда не падает» обязан покрывать и сам
+        # импорт/вход в модуль — иначе гейченный пользователь останется без
+        # ответа и без алерта. Охрана здесь, на границе ветки.
+        try:
+            from sreda.runtime.planner_chat import run_planner_chat_loop
+
+            _loop_result = await run_planner_chat_loop(
+                session=session, action=action, pf=pf, context=context,
+            )
+        except Exception as exc:  # noqa: BLE001 — без отката в легаси (#120)
+            logger.exception("planner branch crashed at the seam boundary")
+            try:
+                from sreda.services.admin_alerts import send_admin_alert
+                send_admin_alert(
+                    "P1",
+                    "планировщик: сбой на границе ветки",
+                    f"tenant={action.tenant_id} stage=вход code={type(exc).__name__}",
+                    dedupe_key=f"planner_chat:{action.tenant_id}:вход",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("planner branch: boundary alert failed")
+            from langchain_core.messages import AIMessage as _AIMessage
+            _canned = _AIMessage(content=(
+                "Ой, не получилось обработать запрос. "
+                "Попробуй ещё раз через минуту."
+            ))
+            _loop_result = ChatLoopResult(
+                final_ai=_canned,
+                messages=[*pf.messages, _canned],
+                turn_msg_start_idx=pf._turn_msg_start_idx,
+                called_tools=set(),
+                hallucination_nudged=False,
+                turn_timed_out=False,
+                successful_tool_counts={},
+                onboarding_resolution_called=False,
+            )
+        return await finalize_chat_reply(FinalizeInput(
+            final_ai=_loop_result.final_ai,
+            messages=_loop_result.messages,
+            turn_msg_start_idx=_loop_result.turn_msg_start_idx,
+            action=action,
+            feature_key=pf.feature_key,
+            user_id=pf.user_id,
+            model_name=pf.model_name,
+            turn_timed_out=_loop_result.turn_timed_out,
+            successful_tool_counts=_loop_result.successful_tool_counts,
+            context=context,
+            called_tools=_loop_result.called_tools,
+            hallucination_nudged=_loop_result.hallucination_nudged,
+            pending_buttons_state=pf.pending_buttons_state,
+            menu_display_state=pf.menu_display_state,
+            session=session,
+            ack_progress=_ack_progress,
+            user_text=pf.user_text,
+        ))
+
     # --- 4. Tool-call loop (extracted to _run_legacy_react_loop) --------
     _loop_result = await _run_legacy_react_loop(
         llm=pf.llm,
