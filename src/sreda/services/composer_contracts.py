@@ -322,6 +322,203 @@ class ComposerContract(Protocol):
 NO_CONTRACT: object = object()
 
 
+# ---------------------------------------------------------------------------
+# #118 — required-keys contracts for data-carrying templates
+# ---------------------------------------------------------------------------
+# The original classification marked these NO_CONTRACT («no leak or crash
+# surface beyond what schema + StrictUndefined already cover») — but the
+# StrictUndefined crash IS the failure mode: a plan that picks the template
+# without binding its variables passes validation, then dies at render time
+# and degrades to the ``partial_with_compose_error`` stub. Seen live on the
+# #115 r3 replay (199 real turns of tenant_tg_755682022): 6 turns hit
+# «'items' is undefined». A plan-time completeness check turns that into a
+# ``composer_contract_invalid`` violation, which flows into the orchestrator's
+# one-shot retry feedback — the planner self-corrects instead of stubbing.
+
+TEMPLATE_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    "shopping_added_ok": ("items",),
+    "shopping_added_empty": ("duplicates",),
+    "shopping_list_show": ("count", "items"),
+    "reminder_set_ok": ("when_phrase", "what"),
+    "reminder_skipped_past": ("trigger_at_local", "late_by_minutes"),
+    "reminders_list_show": ("count", "items"),
+    "checklist_show": ("title", "items"),
+    "checklist_empty": ("title",),
+    "recipe_show": ("recipe_text",),
+    "recipe_not_found_ask_alt": ("query",),
+    "ask_when_to_remind": ("what",),
+}
+"""Per-template variables the Jinja source renders UNGUARDED (no ``is
+defined``): absent → guaranteed StrictUndefined crash at render time. The
+anti-drift test (test_118_template_contracts) parses each template and fails
+when a template gains a variable not covered here or in
+``TEMPLATE_OPTIONAL_KEYS``."""
+
+TEMPLATE_OPTIONAL_KEYS: dict[str, tuple[str, ...]] = {
+    # guarded with ``is defined`` in the template source — legal to omit
+    "ask_user_for_clarification": ("missing_fields",),
+    "partial_with_clarification": ("done_summary", "missing_fields"),
+    "partial_with_compose_error": ("execution_summary",),
+    "invalid_plan_fallback": ("attempt_count",),
+}
+
+# RUNTIME-ONLY templates (never planner-emitted; the validator rejects them
+# upstream as ``runtime_only_template_in_plan``; the runtime producer —
+# selector.py — guarantees the payload). Accounted separately from
+# TEMPLATE_OPTIONAL_KEYS so render-required runtime variables (``count``)
+# don't masquerade as "optional" in the anti-drift vocabulary (Codex #118 R1).
+RUNTIME_ONLY_TEMPLATE_KEYS: dict[str, tuple[str, ...]] = {
+    "selector_ambiguity_clarification": (
+        "count", "partial", "done_summary", "options",
+    ),
+}
+
+# Per-item fields the list templates render UNGUARDED on each element of a
+# LITERAL ``items`` list (``it.raw_line`` / ``it.title`` / ``it.item_status``).
+# Verified empirically: a str element or a dict missing the field crashes
+# StrictUndefined at render (Codex #118 R1 MAJOR — top-level checks alone
+# leave the validate-pass/render-fail class open one level deeper).
+_TEMPLATE_ITEM_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "shopping_list_show": {"items": ("raw_line",)},
+    "reminders_list_show": {"items": ("raw_line",)},
+    "checklist_show": {"items": ("title", "item_status")},
+}
+
+
+def _make_required_keys_contract(
+    template_id: str,
+    required: tuple[str, ...],
+    item_fields: dict[str, tuple[str, ...]] | None = None,
+) -> "ComposerContract":
+    """Build a completeness contract: every ``required`` key must be present
+    and non-blank (a ``${sN.field}`` ref counts as present at plan time).
+
+    ``item_fields`` (Codex #118 R1 MAJOR): for list templates, each element
+    of a LITERAL list value must be an object carrying the per-item fields
+    the template renders unguarded (``it.raw_line`` etc.) — a str element or
+    a dict missing the field is a guaranteed StrictUndefined render crash.
+    Full ``${sN.field}`` refs (the whole list, an element, or a field value)
+    defer to post-execution resolution when ``allow_refs``."""
+
+    def _blank(val: object) -> bool:
+        # one predicate for BOTH levels (Codex #118 R2 medium MINOR —
+        # nested values must reject empty []/{} too, not just None/whitespace)
+        return (
+            val is None
+            or (isinstance(val, str) and not val.strip())
+            or (isinstance(val, (list, dict)) and not val)
+        )
+
+    def _contract(data: dict, *, allow_refs: bool) -> list[str]:
+        if not isinstance(data, dict):
+            return [
+                f"{template_id} template_data must be a dict, "
+                f"got {type(data).__name__!r}."
+            ]
+        errors: list[str] = []
+        for key in required:
+            if key not in data:
+                errors.append(
+                    f"{template_id} template_data[{key!r}] is missing — the "
+                    f"template cannot render without it. Bind a literal or a "
+                    f"${{sN.field}} ref (e.g. from the step's output fields)."
+                )
+                continue
+            val = data[key]
+            if allow_refs and _is_full_ref(val):
+                continue
+            if _blank(val):
+                errors.append(
+                    f"{template_id} template_data[{key!r}] is blank "
+                    f"({val!r}) — would render an empty/meaningless reply."
+                )
+        for list_key, fields in (item_fields or {}).items():
+            val = data.get(list_key)
+            if val is None or (allow_refs and _is_full_ref(val)):
+                continue  # missing/blank already flagged above; ref deferred
+            if not isinstance(val, list):
+                errors.append(
+                    f"{template_id} template_data[{list_key!r}] must be a "
+                    f"list of objects or a ${{sN.field}} ref, got "
+                    f"{type(val).__name__!r}."
+                )
+                continue
+            for i, item in enumerate(val):
+                if allow_refs and _is_full_ref(item):
+                    continue
+                if not isinstance(item, dict):
+                    errors.append(
+                        f"{template_id} template_data[{list_key!r}][{i}] must "
+                        f"be an object with {sorted(fields)} (the template "
+                        f"renders these per-item fields), got "
+                        f"{type(item).__name__!r}."
+                    )
+                    continue
+                for f in fields:
+                    if f not in item:
+                        errors.append(
+                            f"{template_id} template_data[{list_key!r}][{i}]"
+                            f"[{f!r}] is missing — the template renders it "
+                            f"and crashes without it."
+                        )
+                        continue
+                    fv = item[f]
+                    if allow_refs and _is_full_ref(fv):
+                        continue
+                    if _blank(fv):
+                        errors.append(
+                            f"{template_id} template_data[{list_key!r}][{i}]"
+                            f"[{f!r}] is blank ({fv!r})."
+                        )
+        return errors
+
+    return _contract
+
+
+# Render samples — one per template in HOUSEWIFE_TEMPLATES. Single source of
+# truth for the registry render test (every template renders on its sample
+# without StrictUndefined) AND contract self-consistency (each sample passes
+# its own contract). Values are realistic, PII-free.
+SAMPLE_TEMPLATE_DATA: dict[str, dict] = {
+    "shopping_added_ok": {"items": ["молоко", "хлеб"]},
+    "shopping_added_empty": {"duplicates": ["молоко"]},
+    "shopping_list_show": {
+        "count": 2,
+        "items": [{"raw_line": "молоко"}, {"raw_line": "хлеб (2 шт)"}],
+    },
+    "shopping_list_empty": {},
+    "reminder_set_ok": {"when_phrase": "завтра в 8:00", "what": "отправить образцы"},
+    "reminder_skipped_past": {
+        "trigger_at_local": "сегодня 09:00", "late_by_minutes": 42,
+    },
+    "reminders_list_show": {
+        "count": 1, "items": [{"raw_line": "завтра 08:00 — образцы"}],
+    },
+    "reminders_list_empty": {},
+    "checklist_show": {
+        "title": "Дача",
+        "items": [
+            {"title": "грабли", "item_status": "pending"},
+            {"title": "перчатки", "item_status": "done"},
+        ],
+    },
+    "checklist_empty": {"title": "Дача"},
+    "recipe_show": {"recipe_text": "Борщ: свёкла, капуста, говядина."},
+    "recipe_not_found_ask_alt": {"query": "борщ"},
+    "ask_user_for_clarification": {"missing_fields": ["time"]},
+    "ask_when_to_remind": {"what": "позвонить сантехнику"},
+    "partial_with_clarification": {
+        "done_summary": "добавила молоко", "missing_fields": ["time"],
+    },
+    "selector_ambiguity_clarification": {"count": 2, "options": ["Дача", "Дом"]},
+    "generic_tool_error": {},
+    "partial_with_compose_error": {"execution_summary": "add_checklist_items"},
+    "invalid_plan_fallback": {"attempt_count": 2},
+    "identity_playful": {},
+    "smalltalk_fallback": {},
+}
+
+
 # Authoritative classification of every planner-exposed ``template_id`` in
 # ``HOUSEWIFE_TEMPLATES`` (services/composer/templates_housewife.py). Keep in
 # sync: the coverage test fails if the composer registry grows a template that
@@ -331,30 +528,24 @@ _COMPOSER_CONTRACTS: dict[str, ComposerContract | object] = {
     # Clarification family — referenced from the leaf, not duplicated.
     "ask_user_for_clarification": validate_clarification_payload,
     "partial_with_clarification": validate_clarification_payload,
+    # ---- required-keys contracts (#118) -------------------------------------
+    # Data-carrying templates: a plan that picks them MUST bind the unguarded
+    # variables, or render is a guaranteed StrictUndefined crash → stub reply.
+    # Built from TEMPLATE_REQUIRED_KEYS (one source of truth with the
+    # anti-drift test in test_118_template_contracts.py).
+    **{
+        tid: _make_required_keys_contract(
+            tid, keys, _TEMPLATE_ITEM_FIELDS.get(tid)
+        )
+        for tid, keys in TEMPLATE_REQUIRED_KEYS.items()
+    },
     # ---- explicit "no contract" --------------------------------------------
-    # shopping: literal item lists / counts; no leak or crash surface beyond
-    # what schema + StrictUndefined already cover.
-    "shopping_added_ok": NO_CONTRACT,
-    "shopping_added_empty": NO_CONTRACT,
-    "shopping_list_show": NO_CONTRACT,
+    # Templates with no variables at all, or only ``is defined``-guarded
+    # optional ones (see TEMPLATE_OPTIONAL_KEYS).
     "shopping_list_empty": NO_CONTRACT,
-    # reminders: literal phrases / counts.
-    "reminder_set_ok": NO_CONTRACT,
-    "reminder_skipped_past": NO_CONTRACT,
-    "reminders_list_show": NO_CONTRACT,
     "reminders_list_empty": NO_CONTRACT,
-    # checklists: title + literal item lines (title / item_status from the
-    # show_checklist output_model); no leak/crash surface beyond schema +
-    # StrictUndefined.
-    "checklist_show": NO_CONTRACT,
-    "checklist_empty": NO_CONTRACT,
-    # recipes: passthrough text / query echo.
-    "recipe_show": NO_CONTRACT,
-    "recipe_not_found_ask_alt": NO_CONTRACT,
-    # clarification — reminder-time ask. Only renders ``what`` (a literal the
-    # schema already requires non-blank); no closed-enum payload.
-    "ask_when_to_remind": NO_CONTRACT,
-    # error / fallback — fixed canned text, error_code never rendered.
+    # error / fallback — fixed canned text, error_code never rendered;
+    # execution_summary / attempt_count are optional-guarded.
     "generic_tool_error": NO_CONTRACT,
     "partial_with_compose_error": NO_CONTRACT,
     "invalid_plan_fallback": NO_CONTRACT,
@@ -387,6 +578,10 @@ def get_composer_contract(template_id: str) -> ComposerContract | object | None:
 __all__ = [
     "NO_CONTRACT",
     "RUNTIME_ONLY_TEMPLATE_IDS",
+    "RUNTIME_ONLY_TEMPLATE_KEYS",
+    "SAMPLE_TEMPLATE_DATA",
+    "TEMPLATE_OPTIONAL_KEYS",
+    "TEMPLATE_REQUIRED_KEYS",
     "ComposerContract",
     "_HUMANIZE_RESULT_ACTION_ALLOWED_KEYS",
     "_HUMANIZE_RESULT_ALLOWED_TOP_KEYS",

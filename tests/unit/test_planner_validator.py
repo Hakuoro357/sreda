@@ -2668,9 +2668,12 @@ def test_valid_clarification_payload_passes_via_registry() -> None:
     )
 
 
-def test_no_contract_template_payload_not_dispatched() -> None:
-    """A NO_CONTRACT template (shopping_added_ok) with an arbitrary extra key
-    must NOT be rejected by the contract dispatch (there is no contract)."""
+def test_contracted_template_allows_extra_keys() -> None:
+    """#118: shopping_added_ok is now CONTRACTED (required key ``items``).
+    The contract checks COMPLETENESS, not a closed key set — a satisfied
+    required key + an arbitrary extra key must pass (StrictUndefined ignores
+    extras at render). Reworded from the pre-#118
+    ``test_no_contract_template_payload_not_dispatched`` (Codex #118 R1)."""
     plan = _real_plan({
         "schema_version": 1,
         "turn_classification": {"is_new_turn": True, "reason": "t"},
@@ -2693,6 +2696,29 @@ def test_no_contract_template_payload_not_dispatched() -> None:
             "kind": "template",
             "template_id": "shopping_added_ok",
             "template_data": {"items": ["молоко"], "extra_key": "whatever"},
+        },
+    })
+    violations = validate_plan(
+        plan, _REAL_REGISTRY, composer_template_ids=_REAL_TEMPLATE_IDS,
+    )
+    assert not [
+        v for v in violations
+        if v.code in ("clarification_payload_invalid", "composer_contract_invalid")
+    ], f"satisfied contract + extra key must pass; got {violations}"
+
+
+def test_no_contract_template_payload_not_dispatched() -> None:
+    """A genuinely NO_CONTRACT template (smalltalk_fallback) with an arbitrary
+    payload must NOT be contract-dispatched (there is no contract)."""
+    plan = _real_plan({
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "t"},
+        "clarity": "reply_only",
+        "actions": {},
+        "compose": {
+            "kind": "template",
+            "template_id": "smalltalk_fallback",
+            "template_data": {"extra_key": "whatever"},
         },
     })
     violations = validate_plan(
