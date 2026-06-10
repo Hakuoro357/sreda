@@ -251,6 +251,9 @@ class ListTasksInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     date: ListTasksDate = "today"
     status: ListTasksStatus = "pending"
+    title_match: str | None = None
+    """#122: подстрока названия (регистр/ё неважны) — для «выполнена/
+    отмени задачу X» используй date="all" + title_match, дальше .only."""
 
 
 class UpdateTaskInput(BaseModel):
@@ -437,7 +440,11 @@ LIST_TASKS_SPEC = ToolSpec(
         "dump с task_id для последующих update/complete/cancel. "
         "Пусто → «no tasks» (статус=empty). Используй ПЕРЕД "
         "update_task/complete_task/cancel_task/delete_task если "
-        "юзер называет задачу по имени, а не по id."
+        "юзер называет задачу по имени, а не по id. #122: для операции "
+        "ПО ИМЕНИ передавай date=\"all\" + title_match=<подстрока названия, "
+        "регистр/ё неважны> (если юзер явно не назвал дату), дальше бери "
+        "ровно-одну через ${sN.items.only....}. filter()/where() в ссылках "
+        "НЕ существует."
     ),
     family="tasks",
     effect="read",

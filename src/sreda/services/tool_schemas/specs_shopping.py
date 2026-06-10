@@ -175,8 +175,13 @@ class UpdateShoppingItemsCategoryInput(BaseModel):
 
 
 class ListShoppingInput(BaseModel):
-    """No args — reads the current pending list for the calling tenant."""
+    """Reads the current pending list for the calling tenant.
+
+    #122: ``title_match`` — подстрока названия (регистр/ё неважны) для
+    «удали/отметь X по имени»: список возвращается уже отфильтрованным,
+    дальше ``${sN.items.only.item_id}`` берёт ровно-один."""
     model_config = ConfigDict(extra="forbid")
+    title_match: str | None = None
 
 
 class ClearBoughtShoppingInput(BaseModel):
@@ -354,7 +359,12 @@ LIST_SHOPPING_SPEC = ToolSpec(
     description=(
         "Показать текущий pending-список покупок юзера, сгруппированный "
         "по категориям. Использовать когда юзер спрашивает «что в "
-        "списке?», «что покупать?», «сколько ещё осталось?»."
+        "списке?», «что покупать?», «сколько ещё осталось?». #122: для "
+        "«удали/отметь X по имени» передавай title_match=<подстрока "
+        "названия, регистр/ё неважны> — вернутся только совпадающие, "
+        "дальше бери ровно-один через ${sN.items.only.item_id} (в списковых "
+        "аргументах оборачивай: [\"${...}\"]). filter()/where() в ссылках "
+        "НЕ существует."
     ),
     family="shopping",
     effect="read",

@@ -709,7 +709,9 @@ _ONLY_SELECTOR_EXAMPLE = FewShotExample(
         "actions": {
             "s1": {
                 "tool": "list_reminders",
-                "args": {},
+                # #122: выбор по имени — фильтр аргументом читающего шага,
+                # дальше штатный .only по уже отфильтрованным
+                "args": {"title_match": "молоко"},
                 "expected_outcomes": [
                     {"match": {"status": "ok"}, "next": "s2"},
                     {"match": {"status": "empty"}, "next": None,
@@ -756,6 +758,7 @@ _ONLY_SELECTOR_EXAMPLE = FewShotExample(
 _EXAMPLES.append(_ONLY_SELECTOR_EXAMPLE)
 
 
+
 # ---------------------------------------------------------------------------
 # PR-d (Piece 3): INVALID-case examples — "так НЕ делай"
 # ---------------------------------------------------------------------------
@@ -798,6 +801,20 @@ _INVALID_EXAMPLES: list[InvalidExample] = [
         ),
         violation="schema: Plan(clarity='clear') requires at least one action / "
         "conversational template only valid for reply_only",
+    ),
+    InvalidExample(
+        title="выдуманный filter()/where() в ссылке",
+        bad_fragment=(
+            '{"item_ids": "${s1.items.filter('
+            "title_contains='масло').only.item_id}\"}"
+        ),
+        why=(
+            "filter()/where() в ${...}-ссылках НЕ существует. Фильтруй "
+            "аргументом ЧИТАЮЩЕГО шага: list_shopping(title_match='масло'), "
+            "затем `[\"${s1.items.only.item_id}\"]` — списковые аргументы "
+            "оборачивай в [...]. (Прод-инцидент 2026-06-10.)"
+        ),
+        violation="invalid_ref_syntax",
     ),
     InvalidExample(
         title="индексная ссылка [0]",

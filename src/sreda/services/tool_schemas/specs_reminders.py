@@ -104,8 +104,12 @@ class ScheduleReminderInput(BaseModel):
 
 
 class ListRemindersInput(BaseModel):
-    """No args — lists all pending reminders for the calling tenant."""
+    """Lists pending reminders for the calling tenant.
+
+    #122: ``title_match`` — подстрока названия (регистр/ё неважны) для
+    «отмени/перенеси напоминание про X» — дальше ``.only``."""
     model_config = ConfigDict(extra="forbid")
+    title_match: str | None = None
 
 
 class UpdateReminderInput(BaseModel):
@@ -248,7 +252,11 @@ LIST_REMINDERS_SPEC = ToolSpec(
     description=(
         "Показать все активные (pending) напоминания юзера со временем "
         "следующего срабатывания и recurrence. Используй когда юзер "
-        "спрашивает «какие у меня напоминания?», «что я просил напомнить?»."
+        "спрашивает «какие у меня напоминания?», «что я просил напомнить?». "
+        "#122: для «отмени/перенеси напоминание про X» передавай "
+        "title_match=<подстрока названия> — дальше ровно-одно через "
+        "${sN.items.only.reminder_id}. filter()/where() в ссылках "
+        "НЕ существует."
     ),
     family="reminders",
     effect="read",

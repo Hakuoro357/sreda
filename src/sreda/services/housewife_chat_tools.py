@@ -111,6 +111,23 @@ from sreda.services.tool_schemas.tool_ok_codec import encode_tool_ok  # #115
 
 logger = logging.getLogger(__name__)
 
+
+def _title_matches(needle: str | None, hay: str | None) -> bool:
+    """#122: подстрочное совпадение названий без учёта регистра и ё.
+
+    Для «удали/отметь X по имени»: читающие инструменты фильтруют список
+    этим помощником, дальше штатный ``.only`` выбирает ровно-один (или даёт
+    честное уточнение из УЖЕ отфильтрованных кандидатов). Пустой/None
+    needle = «без фильтра» (обратная совместимость планов без аргумента)."""
+    if not needle:
+        return True
+
+    def _norm(s: str | None) -> str:
+        return " ".join(str(s or "").casefold().replace("ё", "е").split())
+
+    return _norm(needle) in _norm(hay)
+
+
 _MENU_DAY_NAMES_RU = (
     "Понедельник",
     "Вторник",
@@ -439,8 +456,13 @@ def build_housewife_tools(
         return f"ok:scheduled:{reminder.id}:{reminder.next_trigger_at.isoformat()}"
 
     @lc_tool
-    def list_reminders() -> str:
+    def list_reminders(title_match: str | None = None) -> str:
         """List all pending reminders for the current user.
+
+        Args:
+            title_match: подстрока названия (регистр/ё неважны) — для
+                «отмени напоминание про X»: вернутся только совпадающие,
+                дальше бери ровно-одно через ``.only``.
 
         Call when the user asks "что у меня в напоминаниях?",
         "какие напоминания?", etc. Returns up to 20 reminders ordered
@@ -453,6 +475,10 @@ def build_housewife_tools(
             logger.exception("list_reminders failed")
             return "error: internal"
 
+        if title_match:  # #122: выбор по имени
+            reminders = [
+                r for r in reminders if _title_matches(title_match, r.title)
+            ]
         if not reminders:
             return "no active reminders"
         lines = [_format_reminder_for_llm(r) for r in reminders[:20]]
@@ -957,16 +983,22 @@ def build_housewife_tools(
         )
 
     @lc_tool
-    def list_shopping() -> str:
+    def list_shopping(title_match: str | None = None) -> str:
         """List the user's pending (not-yet-bought, not-cancelled)
         shopping items.
+
+        Args:
+            title_match: подстрока названия (регистр/ё неважны) — фильтр
+                для «удали/отметь X по имени»: вернутся только совпадающие
+                пункты, дальше бери ровно-один через ``.only``.
 
         Returns a compact text dump grouped by category with ids so
         subsequent mark_shopping_bought / remove_shopping_items can
         reference rows. Use when the user asks "что в списке?",
         "что покупать?", "сколько осталось?".
 
-        Empty list returns the exact string ``no shopping items``.
+        Empty list (или ничего не совпало под title_match) returns the
+        exact string ``no shopping items``.
         """
         if not user_id:
             return "error: no user_id context"
@@ -977,6 +1009,8 @@ def build_housewife_tools(
         except Exception:  # noqa: BLE001
             logger.exception("list_shopping failed")
             return "error: internal"
+        if title_match:  # #122: выбор по имени
+            rows = [r for r in rows if _title_matches(title_match, r.title)]
         if not rows:
             return "no shopping items"
 
@@ -2106,13 +2140,17 @@ def build_housewife_tools(
         return encode_tool_ok("created", {"task_id": task.id, "task_title": task.title})
 
     @lc_tool
-    def list_tasks(date: str = "today", status: str = "pending") -> str:
+    def list_tasks(date: str = "today", status: str = "pending",
+                   title_match: str | None = None) -> str:
         """List tasks filtered by date and status.
 
         Args:
             date: ``"today"`` (default) / ``"tomorrow"`` / ISO date /
                 ``"inbox"`` (tasks without a date) / ``"all"`` (no
                 date filter).
+            title_match: подстрока названия (регистр/ё неважны) — для
+                «выполнена/отмени/измени задачу X»: используй date="all"
+                + title_match, дальше ``.only``.
             status: ``"pending"`` (default) / ``"completed"`` /
                 ``"all"``.
 
@@ -2166,6 +2204,8 @@ def build_housewife_tools(
                 scheduled_date=date_obj, include_no_date=include_no_date,
                 status=status_arg,
             )
+        if title_match:  # #122: выбор по имени
+            rows = [t for t in rows if _title_matches(title_match, t.title)]
         if not rows:
             return "no tasks"
         return "\n".join(_fmt_task_for_llm(t) for t in rows)
