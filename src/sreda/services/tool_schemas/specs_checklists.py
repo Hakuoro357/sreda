@@ -330,11 +330,14 @@ SHOW_CHECKLIST_SPEC = ToolSpec(
     description=(
         "Показать ПУНКТЫ одного чек-листа со статусами (pending/done/cancelled). "
         "Используй когда юзер «покажи план кроя», «что осталось в списке X», "
-        "«что я ещё не сделал из плана». Поддерживает либо checklist_<id> "
-        "либо нечёткий поиск по title. Возвращает СТРУКТУРИРОВАННЫЕ items "
-        "с item_id для последующих mark_checklist_item_done / "
-        "delete_checklist_item. Список без пунктов → статус empty (но сам "
-        "список существует — отличается от not_found)."
+        "«покажи дела», «что я ещё не сделал из плана». Поддерживает либо "
+        "checklist_<id> либо нечёткий поиск по title. Возвращает items "
+        "с item_id для mark_checklist_item_done / delete_checklist_item. "
+        "Пунктов нет → статус empty (сам список есть — это НЕ not_found). "
+        # P1 2026-06-11: items чек-листа собрали reminders_list_show →
+        # crash рендера (нет display_line). Показ — ТОЛЬКО checklist_show.
+        "Показ — checklist_show: {\"title\": \"${sN.title}\", \"items\": "
+        "\"${sN.items}\"} (НЕ reminders_list_show/shopping_list_show)."
     ),
     family="checklists",
     effect="read",

@@ -54,12 +54,12 @@ _SHOPPING_LIST_SHOW = (
     # не показываем пользователю — «овощи_фрукты» → «Овощи и фрукты»)
     "\n\n{{ ns.cat|ru_category }}:"
     "{% endif %}"
-    "\n• {{ it.display_line }}"
+    "\n• {{ it.display_line | default(it.title, true) | default('(пункт)', true) }}"
     "{% else %}"
     # бескатегорийный объект ПОСЛЕ группы — не «приклеивать» к чужому
     # заголовку: пустая строка-разделитель + сброс трекера (Codex R1 MINOR)
     "{% if ns.cat %}{% set ns.cat = none %}\n{% endif %}"
-    "\n• {{ it.display_line }}"
+    "\n• {{ it.display_line | default(it.title, true) | default('(пункт)', true) }}"
     "{% endif %}"
     "{% else %}"
     "{% if ns.cat %}{% set ns.cat = none %}\n{% endif %}"
@@ -81,10 +81,14 @@ _REMINDER_SKIPPED_PAST = (
     "Назначить на завтра в это же время?"
 )
 
+# P1 2026-06-11: чужая форма словаря (без display_line) не должна валить
+# рендер — деградация display_line → title → маркер (рот сгладит).
 _REMINDERS_LIST_SHOW = (
     "Напоминания{% if count is defined and count %} ({{ count }}){% endif %}:"
     "{% for it in items %}"
-    "\n• {% if it is mapping %}{{ it.display_line }}{% else %}{{ it }}{% endif %}"
+    "\n• {% if it is mapping %}"
+    "{{ it.display_line | default(it.title, true) | default('(пункт)', true) }}"
+    "{% else %}{{ it }}{% endif %}"
     "{% endfor %}"
 )
 
@@ -98,11 +102,14 @@ _REMINDERS_LIST_EMPTY = "Активных напоминаний нет."
 # A done item gets a ✅; pending/cancelled render plain.
 
 # #118: то же — объект ({title, item_status}) ИЛИ плоская строка (см. выше).
+# P1 2026-06-11: симметричная броня — title → display_line → маркер;
+# item_status сравниваем только если поле есть (StrictUndefined).
 _CHECKLIST_SHOW = (
     "{{ title }}:"
     "{% for it in items %}"
-    "\n• {% if it is mapping %}{{ it.title }}"
-    "{% if it.item_status == 'done' %} ✅{% endif %}"
+    "\n• {% if it is mapping %}"
+    "{{ it.title | default(it.display_line, true) | default('(пункт)', true) }}"
+    "{% if it.item_status is defined and it.item_status == 'done' %} ✅{% endif %}"
     "{% else %}{{ it }}{% endif %}"
     "{% endfor %}"
 )

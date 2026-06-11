@@ -258,14 +258,27 @@ def test_item_fields_map_not_stale():
 
     from sreda.services.composer_contracts import _TEMPLATE_ITEM_FIELDS
 
+    # P1 2026-06-11: show-шаблоны стали ТОЛЕРАНТНЫ к чужой форме словаря
+    # (деградация display_line → title → маркер вместо краха) — теперь
+    # «не устарело» значит «поле всё ещё ВЛИЯЕТ на вывод», а не «рендер
+    # падает без поля». Плановый контракт сознательно строже рендера:
+    # он учит ретраем на литеральных данных; рендер страхует ссылки.
     for tid, by_key in _TEMPLATE_ITEM_FIELDS.items():
         for list_key, fields in by_key.items():
             for f in fields:
                 data = copy.deepcopy(SAMPLE_TEMPLATE_DATA[tid])
                 assert data[list_key] and isinstance(data[list_key][0], dict)
-                data[list_key][0].pop(f, None)
-                with pytest.raises(Exception, match=f):
-                    _COMPOSER_REGISTRY.render(tid, data)
+                with_field = _COMPOSER_REGISTRY.render(tid, data)
+                # поле снимаем со ВСЕХ элементов: у первого оно может быть
+                # не несущим (item_status='pending' ничего не рендерит)
+                for it in data[list_key]:
+                    if isinstance(it, dict):
+                        it.pop(f, None)
+                without_field = _COMPOSER_REGISTRY.render(tid, data)
+                assert with_field != without_field, (
+                    f"{tid}: поле {f!r} больше не влияет на рендер — "
+                    f"контракт устарел (режет валидные планы)"
+                )
 
 
 def test_list_template_good_literal_items_accepted():
@@ -352,3 +365,17 @@ def test_contracted_templates_match_required_keys_map():
         assert contract is not None and contract is not NO_CONTRACT, (
             f"{tid}: в TEMPLATE_REQUIRED_KEYS, но без контракта"
         )
+
+
+def test_item_fields_map_pinned_content():
+    """Субагент (срез 7) MINOR: после толерантного рендера stale-тест выше
+    не отличает «обязательное по замыслу» от «случайно вписанного
+    опционального» (например category). Пин содержимого: расширение карты —
+    только осознанным апдейтом этого теста (см. #118/#130)."""
+    from sreda.services.composer_contracts import _TEMPLATE_ITEM_FIELDS
+
+    assert _TEMPLATE_ITEM_FIELDS == {
+        "shopping_list_show": {"items": ("display_line",)},
+        "reminders_list_show": {"items": ("display_line",)},
+        "checklist_show": {"items": ("title", "item_status")},
+    }

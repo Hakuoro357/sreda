@@ -132,6 +132,47 @@ def _bump_normalizer_metric(event: str) -> None:
     HUMANIZE_NORMALIZER_METRICS[event] = HUMANIZE_NORMALIZER_METRICS.get(event, 0) + 1
 
 
+# P1 2026-06-11: show-шаблоны переживают чужую форму элементов (деградация
+# display_line→title→маркер вместо краха StrictUndefined). Этот счётчик +
+# warning — чтобы деградация не стала невидимой: раньше неправильный выбор
+# шаблона давал compose_error и сигнал в телеметрию, теперь рендер успешен.
+TEMPLATE_SHAPE_DEGRADED_METRICS: dict[str, int] = {}
+
+
+def _note_foreign_item_shapes(template_id: str, data: dict[str, Any]) -> None:
+    """Warning + счётчик, если mapping-элементы items не несут родного
+    поля show-шаблона. Текст пользователю НЕ меняется и рендер НЕ валится
+    — только наблюдаемость (Codex R1 high/medium + субагент по фиксу
+    брони шаблонов)."""
+    native_field = _SHOW_TEMPLATE_NATIVE_FIELD.get(template_id)
+    if native_field is None:
+        return
+    items = data.get("items")
+    if not isinstance(items, list):
+        return
+    foreign = sum(
+        1 for it in items
+        if isinstance(it, dict) and native_field not in it
+    )
+    if foreign:
+        TEMPLATE_SHAPE_DEGRADED_METRICS[template_id] = (
+            TEMPLATE_SHAPE_DEGRADED_METRICS.get(template_id, 0) + 1
+        )
+        logger.warning(
+            "composer: template %r получил чужую форму items "
+            "(нет %r в %d из %d элементов) — деградированный рендер; "
+            "проверь выбор шаблона планировщиком",
+            template_id, native_field, foreign, len(items),
+        )
+
+
+_SHOW_TEMPLATE_NATIVE_FIELD: dict[str, str] = {
+    "reminders_list_show": "display_line",
+    "shopping_list_show": "display_line",
+    "checklist_show": "title",
+}
+
+
 def _safe_public_status(tool: str, domain_status: str) -> str:
     """Sanitize the status placed in the LLM payload — kept SEPARATE from the real
     domain status used for the presenter lookup. VALUE-based allowlist: only a
@@ -793,6 +834,11 @@ def _render_template_result(
 
     try:
         text = registry.render(template_id, data)
+        # P1 2026-06-11 («покажи дела»): show-шаблоны теперь ПЕРЕЖИВАЮТ
+        # чужую форму словаря (деградация вместо краха) — но деградация
+        # не должна быть невидимой (Codex R1 оба + субагент). Маркер:
+        # warning + счётчик, текст пользователю не меняем.
+        _note_foreign_item_shapes(template_id, data)
         return ComposeResult(
             text=text,
             fallback_used=None,

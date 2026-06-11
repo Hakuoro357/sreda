@@ -1948,6 +1948,65 @@ def _iter_all_composes(plan: Plan) -> Iterator[tuple[str | None, str, Any]]:
             yield (host_step_id, location, branch.compose)
 
 
+# P1 2026-06-11 («покажи дела»): чек-листовые items собрали шаблоном
+# reminders_list_show → у элементов нет display_line → крах рендера.
+# Пары «show-шаблон ← инструменты-источники items» (Codex R1 medium по
+# фиксу брони): ловим на ПЛАНЕ с ретрай-фидбеком, а не телеметрией.
+# Codex R2 high MAJOR: пара = (инструмент, ПОЛЕ-носитель списка) — иначе
+# items="${s1.title}" от родного инструмента проходит, а в рантайме шаблон
+# итерирует строку посимвольно.
+_SHOW_TEMPLATE_ITEM_SOURCES: dict[str, frozenset[tuple[str, str]]] = {
+    "reminders_list_show": frozenset({("list_reminders", "items")}),
+    "shopping_list_show": frozenset({("list_shopping", "items")}),
+    "checklist_show": frozenset({
+        ("show_checklist", "items"),
+        ("add_checklist_items", "created"),
+    }),
+}
+
+
+def _phase1_check_show_template_sources(plan: Plan) -> Iterator[Violation]:
+    """items show-шаблона, привязанные ссылкой, должны идти из родного
+    инструмента И его поля-носителя списка — чужая форма словарей
+    рендерится деградацией, строка итерируется посимвольно (#130-сосед).
+    Литеральные items проверяет контракт #118 (validate_composer_contracts)."""
+    for host_step_id, location, compose in _iter_all_composes(plan):
+        if compose is None or getattr(compose, "kind", None) != "template":
+            continue
+        allowed = _SHOW_TEMPLATE_ITEM_SOURCES.get(compose.template_id or "")
+        if allowed is None:
+            continue
+        items_val = (compose.template_data or {}).get("items")
+        if not isinstance(items_val, str):
+            continue
+        ref = items_val.strip()
+        if not (ref.startswith("${") and ref.endswith("}")):
+            continue
+        inner = ref[2:-1]
+        target = extract_step_id(inner)
+        action = plan.actions.get(target)
+        if action is None:
+            continue  # unknown target репортится compose-ref проверкой
+        segments = _parse_ref_segments(inner)
+        field = segments[0] if segments else ""
+        if (action.tool, field) not in allowed:
+            allowed_str = ", ".join(
+                f"${{sN.{f}}} из {t}" for t, f in sorted(allowed)
+            )
+            yield Violation(
+                step_id=host_step_id,
+                tool=action.tool,
+                code="show_template_source_mismatch",
+                message=(
+                    f"{location}: шаблон {compose.template_id!r} ожидает "
+                    f"items как {allowed_str}; ссылка ведёт на "
+                    f"{action.tool!r}.{field or '?'} ({target}) — чужая "
+                    f"форма отрендерится деградацией. Возьми родной шаблон "
+                    f"или родное поле-список."
+                ),
+            )
+
+
 def _llm_required_key_present(value: Any) -> bool:
     """A required ``template_data`` value counts as present at PLAN time
     if it's a ``${...}`` ref (executor resolves it later) or a non-blank
@@ -2370,6 +2429,8 @@ def validate_plan(
     # are now checked for: (R4) target step existence + (R5) top-level
     # field existence in target tool's output_model.
     violations.extend(_phase1_check_compose_refs(plan, registry=registry))
+    # P1 2026-06-11 — пары «show-шаблон ← родной источник items» (по ссылке).
+    violations.extend(_phase1_check_show_template_sources(plan))
     # PR-b rule 2f — .only selector is forbidden inside compose refs.
     violations.extend(_phase1_check_only_in_compose(plan))
     # PR-b rule 2e — when .only is used in action args, the producer
