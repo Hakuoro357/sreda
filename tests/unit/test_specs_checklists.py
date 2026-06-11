@@ -134,6 +134,34 @@ def test_add_checklist_items_input_real() -> None:
     assert len(parsed.items) == 2
 
 
+def test_add_checklist_items_coerces_title_objects() -> None:
+    """#124 ход 1: планировщик кладёт items объектами {"title": …} —
+    коэрцируем в строки вместо 10 нарушений валидатора."""
+    parsed = AddChecklistItemsInput.model_validate({
+        "list_id_or_title": "Вещи в поездку",
+        "items": [{"title": "Обувь"}, "Кроссовки", {"title": "Носки 4-5 пар"}],
+    })
+    assert parsed.items == ["Обувь", "Кроссовки", "Носки 4-5 пар"]
+
+
+def test_add_checklist_items_rejects_title_object_with_extra_keys() -> None:
+    """{"title": "Носки", "count": 5} НЕ коэрцируем — молчаливый дроп
+    count = потеря данных; пусть ретрай-фидбек научит строкам."""
+    with pytest.raises(ValidationError):
+        AddChecklistItemsInput.model_validate({
+            "list_id_or_title": "x",
+            "items": [{"title": "Носки", "count": 5}],
+        })
+
+
+def test_add_checklist_items_rejects_non_string_title_object() -> None:
+    with pytest.raises(ValidationError):
+        AddChecklistItemsInput.model_validate({
+            "list_id_or_title": "x",
+            "items": [{"title": 123}],
+        })
+
+
 def test_add_checklist_items_input_accepts_id() -> None:
     parsed = AddChecklistItemsInput.model_validate({
         "list_id_or_title": CL_A,

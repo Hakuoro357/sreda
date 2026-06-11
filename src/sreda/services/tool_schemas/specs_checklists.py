@@ -21,7 +21,13 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+)
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.common import ChecklistId, TaskId
@@ -50,12 +56,34 @@ ChecklistTitle = Annotated[
 по машине»). 200 char cap matches typical user dictation length."""
 
 
+def _coerce_title_object(v: object) -> object:
+    """#124 ход 1 (прод-сессия 2026-06-10): планировщик кладёт пункты
+    чек-листа объектами ``{"title": "Обувь"}`` вместо строк → нарушения
+    валидатора → invalid_plan_after_retry → семья без чек-листа.
+    Коэрцируем ТОЛЬКО чистую форму ``{"title": str}`` (единственный
+    ключ): объект с дополнительными ключами (``{"title": …, "count": 5}``)
+    оставляем как есть — молчаливый дроп лишних полей был бы потерей
+    данных, пусть ретрай-фидбек учит модель строкам.
+
+    Живёт В АННОТАЦИИ (BeforeValidator), а не ``@field_validator`` модели:
+    плановый валидатор гоняет поля через ``TypeAdapter(annotation)`` —
+    модельные валидаторы туда не попадают (страж в ToolSpec это
+    запрещает), а метаданные Annotated проходят оба пути."""
+    if isinstance(v, dict) and set(v.keys()) == {"title"} and isinstance(
+        v["title"], str
+    ):
+        return v["title"]
+    return v
+
+
 ChecklistItemTitle = Annotated[
     str,
+    BeforeValidator(_coerce_title_object),
     StringConstraints(strip_whitespace=True, min_length=1, max_length=300),
 ]
 """One item inside a checklist. Wider than title cap because items
-can carry more detail («Лаванда 298 ТС, простыня 141×200×19»)."""
+can carry more detail («Лаванда 298 ТС, простыня 141×200×19»).
+Принимает и ``{"title": str}`` (коэрция, см. ``_coerce_title_object``)."""
 
 
 ListIdOrTitle = Annotated[
@@ -204,7 +232,13 @@ ADD_CHECKLIST_ITEMS_SPEC = ToolSpec(
         "в дела на дачу: лопата, рассада», «план кроя на неделю: "
         "лаванда, шампань, жемчуг». Дедуп против существующих "
         "pending items — дубли идут в dups count. Возвращает "
-        "ok:added:N:list=<id> или ok:added:N:dups:M:list=<id>."
+        "ok:added:N:list=<id> или ok:added:N:dups:M:list=<id>. "
+        # #124 ход 1; бюджет префикса исчерпан — только выжимка.
+        # Привязка эха ТОЛЬКО для status=added: при added_with_dups
+        # created может быть пуст (всё дубли) — checklist_show спрятал бы
+        # «уже было» (Codex R2 MAJOR).
+        "items: строки. status=added → checklist_show: "
+        "{\"title\": <имя>, \"items\": \"${sN.created}\"}."
     ),
     family="checklists",
     effect="write",
