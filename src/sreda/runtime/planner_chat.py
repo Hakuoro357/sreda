@@ -39,11 +39,30 @@ logger = logging.getLogger(__name__)
 _MSK = ZoneInfo("Europe/Moscow")
 
 # Честные тексты на случай, если даже реестр шаблонов недоступен.
-_FALLBACK_INVALID = (
-    "Не получилось разобрать что ты хочешь. Попробуй переформулировать, "
-    "например: «купи молоко» или «покажи список покупок»."
+# Правило Бориса 2026-06-11: любой технический отказ — живая «поломка»
+# из пула (случайная), не сухой канцелярит. Модульная косвенность через
+# функции — чтобы каждый показ был свежим случайным выбором.
+from sreda.services.composer.breakdown_messages import (  # noqa: E402
+    breakdown_phrase as _breakdown_phrase,
 )
-_FALLBACK_ERROR = "Ой, не получилось обработать запрос. Попробуй ещё раз через минуту."
+
+
+_BREAKDOWN_LAST_RESORT = ("Ой… у меня внутри что-то сломалось. "
+                          "Создатели уже чинят — попробуй чуть позже!")
+
+
+def _fallback_invalid() -> str:
+    try:
+        return _breakdown_phrase()
+    except Exception:  # noqa: BLE001 — контракт «никогда не поднимаем»
+        return _BREAKDOWN_LAST_RESORT
+
+
+def _fallback_error() -> str:
+    try:
+        return _breakdown_phrase()
+    except Exception:  # noqa: BLE001
+        return _BREAKDOWN_LAST_RESORT
 _FALLBACK_UNCERTAIN = (
     "Не уверена, что всё получилось сохранить — проверь, пожалуйста, "
     "и повтори при необходимости."
@@ -145,6 +164,20 @@ async def run_planner_chat_loop(
 
     def _result(text: str, *, called: set[str] | None = None,
                 counts: dict[str, int] | None = None) -> ChatLoopResult:
+        # Codex R2 high (срез поломок): ИНВАРИАНТ «каждый показ поломки
+        # записан» держим в единой точке выхода ответа — любой текст из
+        # пула фиксируется ERROR-логом (alert=False: ранние пути уже
+        # алертят через _alert стадии; branch_compose алертит отдельно).
+        try:
+            from sreda.services.composer.breakdown_messages import (
+                BREAKDOWN_POOL as _bp, note_breakdown as _nb,
+            )
+            if text in _bp or text == _BREAKDOWN_LAST_RESORT:
+                _nb(f"planner_chat:final:{action.tenant_id}",
+                    "пользователю ушла «поломка» (единая точка выхода)",
+                    alert=False)
+        except Exception:  # noqa: BLE001 — фиксация не валит ответ
+            logger.exception("planner_chat: breakdown note failed")
         final = AIMessage(content=text)
         return ChatLoopResult(
             final_ai=final,
@@ -204,7 +237,7 @@ async def run_planner_chat_loop(
     except Exception as exc:  # noqa: BLE001
         logger.exception("planner_chat: plan stage crashed")
         _alert("план", action, type(exc).__name__, str(exc))
-        return _result(_FALLBACK_ERROR)
+        return _result(_fallback_error())
 
     if not plan_result.success or plan_result.execution_plan is None:
         _alert("план", action, plan_result.error_summary or "invalid",
@@ -212,7 +245,7 @@ async def run_planner_chat_loop(
         return _result(_render_or(
             "invalid_plan_fallback",
             {"attempt_count": plan_result.final_attempt_no},
-            _FALLBACK_INVALID,
+            _fallback_invalid(),
         ))
 
     # --- стадия 2: исполнение настоящими инструментами ----------------------
@@ -229,7 +262,7 @@ async def run_planner_chat_loop(
     except Exception as exc:  # noqa: BLE001
         logger.exception("planner_chat: execute stage crashed")
         _alert("исполнение", action, type(exc).__name__, str(exc))
-        return _result(_FALLBACK_ERROR)
+        return _result(_fallback_error())
 
     # called_tools = физически ВЫЗВАННЫЕ инструменты (семантика легаси и
     # стража честности): error/timeout/unknown_outcome/plan_gap — пост-вызовные
@@ -250,7 +283,7 @@ async def run_planner_chat_loop(
                "; ".join(f"{st.step_id}:{st.tool}:{st.status}"
                          for st in exec_log.steps)[:300])
         # aborted ДО первой записи / все шаги упали → честная ошибка
-        return _result(_FALLBACK_ERROR, called=called, counts=counts)
+        return _result(_fallback_error(), called=called, counts=counts)
 
     if exec_log.outcome == "aborted_partial":
         # Контракт compose(): aborted_partial обязан быть подменён честным
@@ -266,8 +299,8 @@ async def run_planner_chat_loop(
             return _result(_FALLBACK_UNCERTAIN, called=called, counts=counts)
         return _result(
             _render_or("partial_with_compose_error",
-                       {"execution_summary": ", ".join(ok_tools)},
-                       _FALLBACK_ERROR),
+                       {},  # имена инструментов — внутренние (аудит 2026-06-11); D.3 даст человеческие сводки
+                       _fallback_error()),
             called=called, counts=counts,
         )
 
@@ -320,10 +353,30 @@ async def run_planner_chat_loop(
                    str(reply.fallback_used),
                    f"деградация сборки; план={getattr(plan_result.plan.compose, 'template_id', None)}"
                    f"/{getattr(plan_result.plan.compose, 'llm_prompt_key', None)}")
+        # Субагент R1 MAJOR (срез «поломок»): плановая ветка ошибки
+        # (generic_tool_error терминальной веткой — few-shot этому УЧИТ)
+        # для конвейера «успех»: fallback_used пуст, алерта выше нет —
+        # ровно класс тихого 15:08. Фиксируем по членству финального
+        # текста в пуле; и поломку НЕ отдаём рту (иначе «я сломалась»
+        # прихорашивается как успешное действие).
+        from sreda.services.composer.breakdown_messages import (
+            BREAKDOWN_POOL as _POOL,
+            note_breakdown as _note_breakdown,
+        )
+        _breakdown_shown = text in _POOL
+        if _breakdown_shown and not reply.fallback_used:
+            _note_breakdown(
+                f"branch_compose:"
+                f"{getattr(reply, 'effective_template_id', None)}"
+                f":{action.tenant_id}",
+                "плановая ветка ошибки отдала «поломку» при успешном "
+                "конвейере — фиксация по тексту",
+            )
         # Codex #121 R1 (оба, MAJOR): рот обязателен и после НЕголосовой
         # деградации сборки (шаблон/реестр) — её текст тоже сырьё, не финал.
         # Предикат шагов = called (без skipped и до-вызовных arg_violation).
-        if not _voice_used["v"] and not _voice_broken and called:
+        if (not _voice_used["v"] and not _voice_broken and called
+                and not _breakdown_shown):
             # #121 (правило владельца, скриншоты 2026-06-10): шаблонный рендер
             # НЕ финал — отдаём его рту как факт-сырьё («сделай красиво, не
             # теряя ни одной позиции» — Ф4-промпт humanize_result). Сбой
@@ -371,8 +424,8 @@ async def run_planner_chat_loop(
             # записи совершены — честно признать действия без красивого текста
             return _result(
                 _render_or("partial_with_compose_error",
-                           {"execution_summary": ", ".join(ok_tools)},
-                           _FALLBACK_ERROR),
+                           {},  # имена инструментов — внутренние (аудит 2026-06-11); D.3 даст человеческие сводки
+                           _fallback_error()),
                 called=called, counts=counts,
             )
-        return _result(_FALLBACK_ERROR, called=called, counts=counts)
+        return _result(_fallback_error(), called=called, counts=counts)

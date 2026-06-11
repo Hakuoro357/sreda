@@ -1962,6 +1962,8 @@ _SHOW_TEMPLATE_ITEM_SOURCES: dict[str, frozenset[tuple[str, str]]] = {
         ("show_checklist", "items"),
         ("add_checklist_items", "created"),
     }),
+    # #131: показ всех списков
+    "checklists_list_show": frozenset({("list_checklists", "checklists")}),
 }
 
 

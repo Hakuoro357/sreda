@@ -22,7 +22,7 @@ from __future__ import annotations
 _SHOPPING_ADDED_OK = "Записала: {{ items | join(', ') }}."
 
 _SHOPPING_ADDED_EMPTY = (
-    "Все уже было в списке — {{ duplicates | join(', ') }}. "
+    "Всё уже было в списке — {{ duplicates | join(', ') }}. "
     "Ничего нового не добавила."
 )
 
@@ -77,7 +77,7 @@ _SHOPPING_LIST_EMPTY = "Список покупок пуст."
 _REMINDER_SET_OK = "Напомню {{ when_phrase }}: {{ what }}."
 
 _REMINDER_SKIPPED_PAST = (
-    "Это время уже прошло ({{ trigger_at_local }}, {{ late_by_minutes }} минут назад). "
+    "Это время уже прошло ({{ trigger_at_local }}, {{ late_by_minutes }} мин назад). "
     "Назначить на завтра в это же время?"
 )
 
@@ -115,6 +115,27 @@ _CHECKLIST_SHOW = (
 )
 
 _CHECKLIST_EMPTY = "Список «{{ title }}» пока пустой."
+
+# #131: показ ВСЕХ чек-листов (list_checklists) — шаблона не существовало,
+# и «покажи дела» было нечем собрать: модель брала чужой reminders_list_show
+# (P1 вчера), llm-путь упирался в презентерный запрет («не могу безопасно
+# показать»), либо план падал. Строки — ListChecklistsRow {title,
+# pending_count, done_count, total_count}; счётчики опциональны в рендере.
+_CHECKLISTS_LIST_SHOW = (
+    "Твои списки:"
+    "{% for it in items %}"
+    "\n• {% if it is mapping %}"
+    "{{ it.title | default('(список)', true) }}"
+    "{% if it.pending_count is defined and it.pending_count is not none %}"
+    " — осталось {{ it.pending_count }}"
+    "{% if it.done_count is defined and it.done_count %}"
+    ", сделано {{ it.done_count }}{% endif %}"
+    "{% endif %}"
+    "{% else %}{{ it }}{% endif %}"
+    "{% endfor %}"
+)
+
+_CHECKLISTS_LIST_EMPTY = "Активных списков пока нет. Хочешь — заведём первый."
 
 # ---------------------------------------------------------------------------
 # Recipes
@@ -227,9 +248,10 @@ _SELECTOR_AMBIGUITY_CLARIFICATION = (
 _GENERIC_TOOL_ERROR = (
     # issue #88 (Codex fix-B R1): do NOT leak the internal ``error_code``
     # (e.g. "identity_question", "llm_composer_error:RuntimeError") to the
-    # user — it reads as a broken internal diagnostic. Render a clean canned
-    # message; ``error_code`` stays in ComposeResult / logs for triage.
-    "Ой, не получилось обработать запрос. Попробуй ещё раз через минуту."
+    # user — it reads as a broken internal diagnostic. ``error_code`` stays
+    # in ComposeResult / logs for triage.
+    # Правило Бориса 2026-06-11: отказ — живая «поломка» из пула.
+    "{{ breakdown_phrase() }}"
 )
 
 _PARTIAL_WITH_COMPOSE_ERROR = (
@@ -249,14 +271,9 @@ and Phase D compose (registry deploy race). Tools already ran; we just
 need to acknowledge without re-running."""
 
 
-_INVALID_PLAN_FALLBACK = (
-    "{% if attempt_count is defined and attempt_count == 2 %}"
-    "Не получилось разобрать что ты хочешь. Попробуй переформулировать, "
-    "например: «купи молоко» или «покажи список покупок»."
-    "{% else %}"
-    "Не получилось обработать запрос, попробуй ещё раз."
-    "{% endif %}"
-)
+# Правило Бориса 2026-06-11: обе ветки — живая «поломка» из пула
+# (attempt_count остаётся легальным опциональным ключом для логов).
+_INVALID_PLAN_FALLBACK = "{{ breakdown_phrase() }}"
 """Sub-A12 Phase B.1 — used when planner returns invalid plan after
 all retries are exhausted (orchestrator.run returns success=False).
 NO tools have been called — this is the entry-point failure path.
@@ -346,6 +363,9 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     # checklists (show_checklist)
     "checklist_show": _CHECKLIST_SHOW,
     "checklist_empty": _CHECKLIST_EMPTY,
+    # #131: показ всех списков (list_checklists)
+    "checklists_list_show": _CHECKLISTS_LIST_SHOW,
+    "checklists_list_empty": _CHECKLISTS_LIST_EMPTY,
     # recipes
     "recipe_show": _RECIPE_SHOW,
     "recipe_not_found_ask_alt": _RECIPE_NOT_FOUND_ASK_ALT,

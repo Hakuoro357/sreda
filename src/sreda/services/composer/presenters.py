@@ -27,10 +27,12 @@ At startup :func:`build_display_field_map` introspects every ToolSpec's output_m
 union, reading each variant's ``__display_field__`` + its ``status`` literal(s), into
 a ``(tool_name, domain_status) -> field`` map. ``render_display_text`` consumes that
 map plus the runtime ``dict``. Variants WITHOUT the annotation → deny-by-default
-(a fixed safe phrase + a fallback metric) — we never guess a field. A small override
+(«поломка» из пула + фиксация + метрика) — we never guess a field. A small override
 registry handles the few tools whose narration is more than one literal field.
 
-All functions are pure (no I/O, DB, or network).
+Functions are pure EXCEPT the deny path: показ запрета фиксируется
+(note_breakdown → ERROR-лог + admin-алерт, fire-and-forget) — правило
+Бориса 2026-06-11 «пользователь увидел ошибку → она записана у нас».
 """
 
 from __future__ import annotations
@@ -43,7 +45,6 @@ logger = logging.getLogger(__name__)
 
 DISPLAY_TEXT_MAX_CHARS = 2000
 
-_DENY_BY_DEFAULT = "Не могу безопасно показать результат."
 _EMPTY_DISPLAY = "Нет данных для показа."
 
 # Observability: deny-by-default fires keyed by (tool_name, domain_status). A non-empty
@@ -292,13 +293,18 @@ def render_display_text(tool_name: str, output: Any, *, domain_status: str) -> s
     if field is None:
         key = (tool_name, domain_status)
         PRESENTER_FALLBACK_COUNTS[key] = PRESENTER_FALLBACK_COUNTS.get(key, 0) + 1
-        logger.warning(
-            "presenter: no display_field/override for tool=%s status=%s — "
-            "deny-by-default fallback",
-            tool_name,
-            domain_status,
+        # Правило Бориса 2026-06-11 (после тихого 15:08): пользователь
+        # увидел отказ → отказ ЗАПИСАН у нас (ERROR + admin-алерт с
+        # дедупом), а текст — живая «поломка» из пула, не канцелярит.
+        from sreda.services.composer.breakdown_messages import (
+            breakdown_phrase, note_breakdown,
         )
-        return _DENY_BY_DEFAULT
+        note_breakdown(
+            f"presenter_deny:{tool_name}:{domain_status}",
+            "нет display_field/override — показ запрещён, пользователю "
+            "ушла «поломка»",
+        )
+        return breakdown_phrase()
 
     return _finalize(mapping.get(field))
 

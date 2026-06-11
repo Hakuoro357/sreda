@@ -139,7 +139,8 @@ def test_new_form_unmapped_tool_denies_by_default_and_metrics() -> None:
     outcome, data = _normalize_humanize_result(_td([{"step_id": "s1"}]), log)
     assert outcome == "normalized"
     summary = data["actions"][0]["user_visible_summary"]
-    assert summary == "Не могу безопасно показать результат."
+    from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
+    assert summary in BREAKDOWN_POOL
     assert "СКРЫТО" not in summary and "iid-9" not in summary
     # presenter lookup uses the REAL status "ok"; the OUTGOING status is sanitized
     # — mystery_tool's "ok" is not a schema-declared status → "unknown".
@@ -152,7 +153,8 @@ def test_new_form_non_str_domain_status_coerced_to_unknown_then_denied() -> None
     outcome, data = _normalize_humanize_result(_td([{"step_id": "s1"}]), log)
     assert outcome == "normalized"
     assert data["actions"][0]["status"] == "unknown"
-    assert data["actions"][0]["user_visible_summary"] == "Не могу безопасно показать результат."
+    from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
+    assert data["actions"][0]["user_visible_summary"] in BREAKDOWN_POOL
     assert PRESENTER_FALLBACK_COUNTS[("mystery_tool", "unknown")] == 1
 
 

@@ -166,3 +166,66 @@ def test_degraded_render_is_observable() -> None:
         "reminders_list_show", {"items": [{"display_line": "x"}]},
     )
     assert TEMPLATE_SHAPE_DEGRADED_METRICS["reminders_list_show"] == before + 1
+
+
+# --- #131: показ всех чек-листов ------------------------------------------
+
+
+def test_checklists_list_show_renders_rows() -> None:
+    out = render("checklists_list_show", {"items": [
+        {"checklist_id": "checklist_" + "0" * 24, "title": "Дела на сегодня",
+         "pending_count": 3, "done_count": 2, "total_count": 5},
+        {"checklist_id": "checklist_" + "1" * 24, "title": "Поход",
+         "pending_count": 1, "done_count": 0, "total_count": 1},
+    ]})
+    assert "Дела на сегодня — осталось 3, сделано 2" in out
+    assert "Поход — осталось 1" in out
+    assert "сделано 0" not in out  # нулевое «сделано» не показываем
+
+
+def test_checklists_list_show_survives_foreign_and_none() -> None:
+    out = render("checklists_list_show", {"items": [
+        {"display_line": "чужая форма"},
+        {"title": None},
+        "плоская строка",
+    ]})
+    assert "None" not in out
+    assert "(список)" in out
+    assert "плоская строка" in out
+
+
+def test_checklists_list_guard_pair() -> None:
+    """${s1.checklists} от list_checklists — родная пара; в чужой шаблон
+    (reminders_list_show) — нарушение."""
+    from sreda.runtime.planner.schemas import (
+        Action, ComposerCall, OutcomeBranch, Plan, TurnClassification,
+    )
+    from sreda.runtime.planner.validator import validate_plan
+    from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
+
+    registry = {s.name: s for s in MIGRATED_TOOL_SPECS}
+
+    def _plan(template_id: str) -> Plan:
+        return Plan(
+            turn_classification=TurnClassification(
+                is_new_turn=True, reason="покажи дела"
+            ),
+            actions={
+                "s1": Action(
+                    tool="list_checklists", args={},
+                    expected_outcomes=[OutcomeBranch(match={"status": "ok"})],
+                    depends_on=[],
+                ),
+            },
+            compose=ComposerCall(
+                kind="template", template_id=template_id,
+                template_data={"items": "${s1.checklists}"},
+            ),
+        )
+
+    good = validate_plan(_plan("checklists_list_show"), registry)
+    assert not [v for v in good if v.code == "show_template_source_mismatch"], [
+        f"{v.code}:{v.message[:80]}" for v in good
+    ]
+    bad = {v.code for v in validate_plan(_plan("reminders_list_show"), registry)}
+    assert "show_template_source_mismatch" in bad

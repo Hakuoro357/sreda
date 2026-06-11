@@ -559,6 +559,9 @@ def test_mutual_branch_compose_refs_are_not_a_cycle() -> None:
     from sreda.runtime.planner.validator import validate_plan
 
     plan = _plan({
+        # Перекрёстные ссылки (суть теста о циклах) с РОДНЫМИ парами
+        # «источник → шаблон» (страж #130: s1-ветка показывает данные s2
+        # шаблоном напоминаний — родным для list_reminders, и наоборот).
         "s1": _action(
             "list_shopping",
             args={},
@@ -567,7 +570,7 @@ def test_mutual_branch_compose_refs_are_not_a_cycle() -> None:
                 "next": None,
                 "compose": {
                     "kind": "template",
-                    "template_id": "shopping_list_show",
+                    "template_id": "reminders_list_show",
                     "template_data": {"items": "${s2.items}"},
                 },
             }],
@@ -580,7 +583,7 @@ def test_mutual_branch_compose_refs_are_not_a_cycle() -> None:
                 "next": None,
                 "compose": {
                     "kind": "template",
-                    "template_id": "reminders_list_show",
+                    "template_id": "shopping_list_show",
                     "template_data": {"items": "${s1.items}"},
                 },
             }],

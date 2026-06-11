@@ -170,7 +170,7 @@ def test_render_shopping_added_empty() -> None:
     out = render(
         "shopping_added_empty", {"duplicates": ["хлеб", "молоко"]}
     )
-    assert "Все уже было" in out
+    assert "Всё уже было" in out
     assert "хлеб, молоко" in out
 
 
@@ -411,9 +411,11 @@ def test_render_partial_with_clarification_multiple_fields() -> None:
 
 def test_render_generic_tool_error() -> None:
     out = render("generic_tool_error", {"error_code": "internal"})
-    # issue #88: error_code must NOT leak to the user — clean canned message only.
+    # issue #88: error_code must NOT leak to the user. Правило Бориса
+    # 2026-06-11: текст — живая «поломка» из пула.
+    from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
     assert "internal" not in out
-    assert "Попробуй ещё раз" in out
+    assert out in BREAKDOWN_POOL
 
 
 def test_render_partial_with_compose_error_with_summary() -> None:
@@ -555,30 +557,12 @@ def test_clarification_family_is_contracted_not_no_contract() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_render_invalid_plan_fallback_after_retry() -> None:
-    """attempt_count=2 → fuller message with reformulation hint."""
-    out = render("invalid_plan_fallback", {"attempt_count": 2})
-    assert "переформулировать" in out
-    assert "купи молоко" in out
-    assert "покажи список покупок" in out
+def test_render_invalid_plan_fallback_any_attempt_count_pool() -> None:
+    """Правило Бориса 2026-06-11: невалидный план = «поломка» из пула при
+    ЛЮБОМ attempt_count (ключ остаётся легальным опциональным — для логов)."""
+    from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
 
-
-def test_render_invalid_plan_fallback_single_shot() -> None:
-    """attempt_count=1 → short retry-ask message."""
-    out = render("invalid_plan_fallback", {"attempt_count": 1})
-    assert "Не получилось обработать запрос" in out
-    assert "попробуй ещё раз" in out
-
-
-def test_render_invalid_plan_fallback_without_attempt_count() -> None:
-    """No attempt_count provided — must not crash (StrictUndefined guard
-    via ``is defined``). Falls through to default short message."""
-    out = render("invalid_plan_fallback", {})
-    assert "Не получилось обработать запрос" in out
-
-
-def test_render_invalid_plan_fallback_attempt_count_other_value() -> None:
-    """attempt_count=3 (defensive — should never happen but template
-    must not crash) — falls through to default branch."""
-    out = render("invalid_plan_fallback", {"attempt_count": 3})
-    assert "Не получилось обработать запрос" in out
+    for data in ({"attempt_count": 2}, {"attempt_count": 1}, {},
+                 {"attempt_count": 3}):
+        out = render("invalid_plan_fallback", data)
+        assert out in BREAKDOWN_POOL, (data, out)

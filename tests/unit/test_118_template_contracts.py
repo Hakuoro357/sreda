@@ -341,7 +341,9 @@ def test_required_keys_cover_all_non_optional_template_vars():
         required = set(TEMPLATE_REQUIRED_KEYS.get(tid, ()))
         optional = set(TEMPLATE_OPTIONAL_KEYS.get(tid, ()))
         runtime_only = set(RUNTIME_ONLY_TEMPLATE_KEYS.get(tid, ()))
-        uncovered = declared - required - optional - runtime_only
+        # глобалы среды реестра — не данные плана (пул «поломок» Бориса)
+        env_globals = {"breakdown_phrase"}
+        uncovered = declared - required - optional - runtime_only - env_globals
         assert not uncovered, (
             f"{tid}: переменные {sorted(uncovered)} не покрыты ни "
             f"TEMPLATE_REQUIRED_KEYS, ни TEMPLATE_OPTIONAL_KEYS, ни "
@@ -378,4 +380,6 @@ def test_item_fields_map_pinned_content():
         "shopping_list_show": {"items": ("display_line",)},
         "reminders_list_show": {"items": ("display_line",)},
         "checklist_show": {"items": ("title", "item_status")},
+        # #131: показ всех списков (осознанное расширение пина)
+        "checklists_list_show": {"items": ("title", "pending_count")},
     }

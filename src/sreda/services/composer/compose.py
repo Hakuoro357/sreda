@@ -170,6 +170,7 @@ _SHOW_TEMPLATE_NATIVE_FIELD: dict[str, str] = {
     "reminders_list_show": "display_line",
     "shopping_list_show": "display_line",
     "checklist_show": "title",
+    "checklists_list_show": "title",  # #131
 }
 
 
@@ -1129,12 +1130,12 @@ def _execution_summary(execution_log: ExecutionLog) -> str:
     D.3 (Task: future): richer per-tool natural-language summaries
     («добавила X, поставила Y») via a mapping or per-tool summary hook.
     """
-    ok_tools = [step.tool for step in execution_log.steps if step.status == "ok"]
-    if not ok_tools:
-        return ""
-    if len(ok_tools) == 1:
-        return ok_tools[0]
-    return ", ".join(ok_tools[:-1]) + " и " + ok_tools[-1]
+    # Аудит 2026-06-11 (Борис: пройтись по всем шаблонам): имена
+    # инструментов — внутренние идентификаторы, пользователю их видеть
+    # нельзя («Сделала что просила: add_checklist_items»). До D.3
+    # (человеческие пер-инструментные сводки) сводку не отдаём — шаблон
+    # честно скажет «Сделала что просила» без перечисления.
+    return ""
 
 
 __all__ = [

@@ -299,11 +299,13 @@ LIST_CHECKLISTS_SPEC = ToolSpec(
     description=(
         "Показать все активные чек-листы юзера со счётчиками pending/done/total. "
         "Используй когда юзер «какие у меня списки», «покажи все мои планы», "
-        "«что у меня в чек-листах». Возвращает СТРУКТУРИРОВАННЫЙ список — "
-        "переходи к ${list_checklists.checklists[i].checklist_id} для "
-        "show_checklist / mark_checklist_item_done / archive_checklist. "
-        "Пусто → статус empty (предложи юзеру create_checklist или "
-        "add_checklist_items)."
+        "«покажи дела», «что у меня в чек-листах». Возвращает список — "
+        "checklist_id строк годен для show_checklist / "
+        "mark_checklist_item_done / archive_checklist. "
+        "Пусто → статус empty (предложи create_checklist/add_checklist_items). "
+        # #131: «покажи дела» было нечем собрать — шаблон существует теперь
+        "Показ — checklists_list_show: {\"items\": \"${sN.checklists}\"}; "
+        "пусто → checklists_list_empty."
     ),
     family="checklists",
     effect="read",

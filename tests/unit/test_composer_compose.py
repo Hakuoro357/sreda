@@ -249,7 +249,10 @@ def test_unknown_template_id_falls_through_to_compose_error() -> None:
     assert res.error_code == "unknown_template"
     assert "С финальным сообщением что-то пошло не так" in res.text
     assert "Сделала что просила" in res.text
-    assert "add_shopping_items" in res.text
+    # аудит 2026-06-11: имена инструментов — внутренние, в тексте их БЫТЬ
+    # НЕ ДОЛЖНО (раньше тест закреплял утечку «Сделала: add_shopping_items»)
+    assert "add_shopping_items" not in res.text
+    assert "Сделала что просила" in res.text
     assert res.effective_template_id == "nonexistent_template_xyz"
 
 

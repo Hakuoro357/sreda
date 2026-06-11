@@ -3337,10 +3337,25 @@ async def execute_conversation_chat(
             except Exception:  # noqa: BLE001
                 logger.exception("planner branch: boundary alert failed")
             from langchain_core.messages import AIMessage as _AIMessage
-            _canned = _AIMessage(content=(
-                "Ой, не получилось обработать запрос. "
-                "Попробуй ещё раз через минуту."
-            ))
+            # Правило Бориса 2026-06-11: и граничный крах шва — «поломка»
+            # из пула (фиксация уже есть — alert стадии «вход» выше).
+            try:
+                from sreda.services.composer.breakdown_messages import (
+                    breakdown_phrase as _breakdown_phrase,
+                    note_breakdown as _note_breakdown,
+                )
+                _canned_text = _breakdown_phrase()
+                # Codex R2 high: инвариант «показ поломки = запись»;
+                # алерт стадии «вход» уже ушёл выше → только ERROR-лог.
+                _note_breakdown(
+                    f"boundary:{action.tenant_id}",
+                    "граничный крах шва — пользователю ушла «поломка»",
+                    alert=False,
+                )
+            except Exception:  # noqa: BLE001 — даже пул не должен добить ход
+                _canned_text = ("Ой… у меня внутри что-то сломалось. "
+                                "Создатели уже чинят — попробуй чуть позже!")
+            _canned = _AIMessage(content=_canned_text)
             _loop_result = ChatLoopResult(
                 final_ai=_canned,
                 messages=[*pf.messages, _canned],

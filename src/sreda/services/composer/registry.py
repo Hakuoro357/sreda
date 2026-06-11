@@ -84,6 +84,10 @@ class ComposerRegistry:
         # групп («овощи_фрукты» → «Овощи и фрукты»; пользовательские — без
         # калечащей капитализации). Модуль шаблонов уже импортируется выше.
         self._env.filters["ru_category"] = category_label_ru
+        # Правило Бориса 2026-06-11: технические отказы — живые «поломки»
+        # из пула; глобал отдаёт свежую случайную фразу на каждый рендер.
+        from sreda.services.composer.breakdown_messages import breakdown_phrase
+        self._env.globals["breakdown_phrase"] = breakdown_phrase
         self._entries: dict[str, TemplateEntry] = {}
 
     def register(self, template_id: str, source: str) -> None:

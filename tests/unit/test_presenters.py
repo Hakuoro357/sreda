@@ -153,7 +153,8 @@ def test_deny_by_default_never_guesses_fields_and_increments_metric() -> None:
         {"status": "ok", "raw_text": "Не показывать", "internal_id": "secret-id"},
         domain_status="ok",
     )
-    assert rendered == "Не могу безопасно показать результат."
+    from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
+    assert rendered in BREAKDOWN_POOL
     assert "Не показывать" not in rendered
     assert "secret-id" not in rendered
     assert PRESENTER_FALLBACK_COUNTS[("unannotated_tool", "ok")] == 1
@@ -163,7 +164,8 @@ def test_unmapped_tool_denies_and_increments_metric() -> None:
     rendered = render_display_text(
         "tool_not_in_registry", {"status": "ok", "x": 1}, domain_status="ok"
     )
-    assert rendered == "Не могу безопасно показать результат."
+    from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
+    assert rendered in BREAKDOWN_POOL
     assert PRESENTER_FALLBACK_COUNTS[("tool_not_in_registry", "ok")] == 1
 
 
@@ -236,7 +238,8 @@ def test_non_string_domain_status_denies_without_crashing() -> None:
     rendered = render_display_text(
         "text_tool", {"status": "ok", "summary": "x"}, domain_status=[]  # type: ignore[arg-type]
     )
-    assert rendered == "Не могу безопасно показать результат."
+    from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
+    assert rendered in BREAKDOWN_POOL
     assert PRESENTER_FALLBACK_COUNTS[("text_tool", "unknown")] == 1
 
 

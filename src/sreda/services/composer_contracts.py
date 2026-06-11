@@ -347,6 +347,9 @@ TEMPLATE_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "reminders_list_show": ("items",),
     "checklist_show": ("title", "items"),
     "checklist_empty": ("title",),
+    # #131: показ всех списков — единственный обязательный ключ items
+    # (счётчики строк опциональны в рендере)
+    "checklists_list_show": ("items",),
     "recipe_show": ("recipe_text",),
     "recipe_not_found_ask_alt": ("query",),
     "ask_when_to_remind": ("what",),
@@ -389,6 +392,9 @@ _TEMPLATE_ITEM_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
     "shopping_list_show": {"items": ("display_line",)},
     "reminders_list_show": {"items": ("display_line",)},
     "checklist_show": {"items": ("title", "item_status")},
+    # #131: строки list_checklists; счётчики опциональны в рендере, но
+    # для литеральных данных требуем главное смысловое поле + остаток
+    "checklists_list_show": {"items": ("title", "pending_count")},
 }
 
 
@@ -553,6 +559,16 @@ SAMPLE_TEMPLATE_DATA: dict[str, dict] = {
         ],
     },
     "checklist_empty": {"title": "Дача"},
+    # #131
+    "checklists_list_show": {
+        "items": [
+            {"checklist_id": "checklist_" + "0" * 24, "title": "Дела на сегодня",
+             "pending_count": 3, "done_count": 2, "total_count": 5},
+            {"checklist_id": "checklist_" + "1" * 24, "title": "Поход",
+             "pending_count": 1, "done_count": 0, "total_count": 1},
+        ],
+    },
+    "checklists_list_empty": {},
     "recipe_show": {"recipe_text": "Борщ: свёкла, капуста, говядина."},
     "recipe_not_found_ask_alt": {"query": "борщ"},
     "ask_user_for_clarification": {"missing_fields": ["time"]},
@@ -562,7 +578,8 @@ SAMPLE_TEMPLATE_DATA: dict[str, dict] = {
     },
     "selector_ambiguity_clarification": {"count": 2, "options": ["Дача", "Дом"]},
     "generic_tool_error": {},
-    "partial_with_compose_error": {"execution_summary": "add_checklist_items"},
+    # аудит 2026-06-11: образец — человеческий текст, не tool-имя
+    "partial_with_compose_error": {"execution_summary": "добавила покупки"},
     "invalid_plan_fallback": {"attempt_count": 2},
     "identity_playful": {},
     "smalltalk_fallback": {},
@@ -594,6 +611,7 @@ _COMPOSER_CONTRACTS: dict[str, ComposerContract | object] = {
     # optional ones (see TEMPLATE_OPTIONAL_KEYS).
     "shopping_list_empty": NO_CONTRACT,
     "reminders_list_empty": NO_CONTRACT,
+    "checklists_list_empty": NO_CONTRACT,  # #131: фиксированный текст
     # error / fallback — fixed canned text, error_code never rendered;
     # execution_summary / attempt_count are optional-guarded.
     "generic_tool_error": NO_CONTRACT,

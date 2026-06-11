@@ -106,7 +106,8 @@ def test_planner_failure_honest_reply_and_alert_no_legacy(monkeypatch, tmp_path:
     try:
         assert telegram.sent, "пользователь обязан получить ответ"
         text = telegram.sent[0]["text"]
-        assert "не получилось" in text.lower(), text
+        from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
+        assert text in BREAKDOWN_POOL, text  # «поломка» из пула (Борис 2026-06-11)
         assert not fake_llm._bound.calls, "отката в легаси быть не должно"
         assert alerts and "план" in alerts[0][1], alerts
         assert "t1" in alerts[0][2]
@@ -136,7 +137,8 @@ def test_boundary_crash_canned_reply_and_alert(monkeypatch, tmp_path: Path):
         monkeypatch, tmp_path, f"g4_{uuid4().hex[:6]}.db", gate="t1",
     )
     try:
-        assert telegram.sent and "не получилось" in telegram.sent[0]["text"].lower()
+        from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
+        assert telegram.sent and telegram.sent[0]["text"] in BREAKDOWN_POOL
         assert not fake_llm._bound.calls
         assert alerts and "границе" in alerts[0][1]
     finally:
