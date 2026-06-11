@@ -359,17 +359,14 @@ LIST_MENU_SPEC = ToolSpec(
 
 GENERATE_SHOPPING_FROM_MENU_SPEC = ToolSpec(
     name="generate_shopping_from_menu",
+    # #128: ужато без потери исходов
     description=(
-        "Извлечь все ингредиенты рецептов недельного меню в список "
-        "покупок, масштабированные под количество едоков семьи "
-        "(eaters / recipe.servings). Использует source_recipe_id "
-        "для будущей связки «купил для X». Три исхода ПО ПЛАНУ: "
-        "(1) ok:generated:N:eaters=E — добавила N товаров; "
-        "(2) ok:plan_no_recipes — план есть, но все ячейки free_text "
-        "(скажи юзеру «в меню нет сохранённых рецептов, нечего "
-        "извлекать»); (3) error:plan_not_found — план с таким id не "
-        "существует или не принадлежит юзеру (скажи «не нашла такого "
-        "меню», предложи list_menu)."
+        "Извлечь ингредиенты рецептов недельного меню в покупки, "
+        "масштабируя под едоков (eaters / recipe.servings). Исходы: "
+        "(1) ok:generated:N:eaters=E; (2) ok:plan_no_recipes — все "
+        "ячейки free_text («в меню нет сохранённых рецептов»); "
+        "(3) error:plan_not_found — нет такого плана у юзера "
+        "(предложи list_menu)."
     ),
     family="menu",
     effect="write",

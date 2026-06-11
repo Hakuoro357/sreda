@@ -395,19 +395,16 @@ class UnlinkTaskInput(BaseModel):
 
 ADD_TASK_SPEC = ToolSpec(
     name="add_task",
+    # #128: дубли с mutex_notes вырезаны — планировщик видит обе секции
     description=(
         "Создать задачу в Расписании юзера: «поставь задачу X», "
         "«добавь Y в расписание», «запиши на завтра Z». Поля: title "
         "(краткое имя), scheduled_date (today/tomorrow/ISO/inbox), "
         "time_start/time_end (HH:MM в зоне юзера), recurrence_rule "
         "(RRULE с UTC BYHOUR), notes, reminder_offset_minutes "
-        "(минуты ДО time_start), details_items (под-чеклист). ВАЖНО: "
-        "reminder требует scheduled_date+time_start; reminder + "
-        "details_items НЕ совместимы (сначала add_task с details, "
-        "потом attach_reminder отдельным вызовом). details_items "
-        "только если один verb + список объектов: «купи хлеб, "
-        "макароны, яйца» → title=«Купить», details=[...]. Разные "
-        "verbs («купи X, помой Y») → ОТДЕЛЬНЫЕ add_task calls."
+        "(минуты ДО time_start; требует scheduled_date+time_start), "
+        "details_items (под-чеклист; пример: «купи хлеб, макароны, "
+        "яйца» → title=«Купить», details=[…])."
     ),
     family="tasks",
     effect="write",
@@ -433,14 +430,13 @@ ADD_TASK_SPEC = ToolSpec(
 
 LIST_TASKS_SPEC = ToolSpec(
     name="list_tasks",
+    # #128: ужато; рецепт #122 (title_match/.only) сохранён дословно
     description=(
         "Показать задачи юзера. Фильтры: date (today/tomorrow/ISO/"
         "inbox/all) — default «today»; status (pending/completed/all) "
-        "— default «pending». Возвращает многострочный текстовый "
-        "dump с task_id для последующих update/complete/cancel. "
-        "Пусто → «no tasks» (статус=empty). Используй ПЕРЕД "
-        "update_task/complete_task/cancel_task/delete_task если "
-        "юзер называет задачу по имени, а не по id. #122: для операции "
+        "— default «pending». Возвращает dump с task_id; пусто → "
+        "статус empty. Перед update/complete/cancel/delete, если "
+        "задача названа по имени. #122: для операции "
         "ПО ИМЕНИ передавай date=\"all\" + title_match=<подстрока названия, "
         "регистр/ё неважны> (если юзер явно не назвал дату), дальше бери "
         "ровно-одну через ${sN.items.only....}. filter()/where() в ссылках "
@@ -469,20 +465,18 @@ LIST_TASKS_SPEC = ToolSpec(
 
 UPDATE_TASK_SPEC = ToolSpec(
     name="update_task",
+    # #128: ужато без потери контрактов (inbox-ограничение сохранено)
     description=(
         "Изменить поля существующей задачи: «перенеси на завтра», "
         "«сделай ежедневной», «поменяй время на 8:00». Передавай "
-        "ТОЛЬКО те поля что меняются. Минимум одно поле должно быть "
-        "non-None (пустой апдейт = no-op runtime). Если меняешь "
-        "scheduled_date/time_start — линкованный reminder "
-        "автоматически перепланируется. Чтобы добавить/убрать "
-        "сам reminder — attach_reminder/detach_reminder. Если "
-        "task_id ещё нет — сначала list_tasks. ВНИМАНИЕ: "
-        "scheduled_date='inbox' через update НЕ поддерживается "
-        "(runtime трактует как «оставить как было»). Если юзер "
-        "хочет перенести задачу в inbox — спроси согласия и "
-        "объясни что прямого пути пока нет; альтернатив с "
-        "потерей данных НЕ предлагай."
+        "ТОЛЬКО меняющиеся поля, минимум одно non-None (пустой "
+        "апдейт = no-op). Смена scheduled_date/time_start "
+        "перепланирует линкованный reminder; добавить/убрать сам "
+        "reminder — attach_reminder/detach_reminder. Нет task_id — "
+        "сначала list_tasks. scheduled_date='inbox' через update НЕ "
+        "работает (трактуется «оставить как было») — честно скажи, "
+        "что прямого пути нет; альтернатив с потерей данных не "
+        "предлагай."
     ),
     family="tasks",
     effect="write",

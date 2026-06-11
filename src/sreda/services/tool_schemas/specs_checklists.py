@@ -261,24 +261,17 @@ ADD_CHECKLIST_ITEMS_SPEC = ToolSpec(
 
 MOVE_TASK_TO_CHECKLIST_SPEC = ToolSpec(
     name="move_task_to_checklist",
+    # #128: ужато; граница с link_task_to_checklist — в mutex_notes
     description=(
-        "Перенести задачу из Расписания в чек-лист как ПУНКТ — ОДИН "
-        "вызов вместо cancel_task + add_checklist_items. Шаги "
-        "выполняются последовательно (best-effort, НЕ одна "
-        "транзакция — task_service.cancel/create_list/add_items "
-        "коммитят раздельно). Если на шаге add_item упало — task "
-        "уже отменён; планировщик должен честно сказать юзеру что "
-        "перенос частично завершён (task в cancelled, item не "
-        "создан). Используй когда юзер: «перенеси X из расписания "
-        "в дела/чек-лист Y», «это не на конкретное время — переложи "
-        "в дела». Последовательно: cancel task (с reminder если был) "
-        "→ add item с title задачи в target checklist (с dedup). "
-        "Target создаётся если не найден. Возвращает "
+        "Перенести задачу из Расписания в чек-лист как ПУНКТ — один "
+        "вызов вместо cancel_task + add_checklist_items: «перенеси X "
+        "из расписания в дела Y», «это не на время — переложи в "
+        "дела». Шаги best-effort, НЕ одна транзакция: cancel task (с "
+        "reminder) → add item (с dedup; target создаётся, если нет). "
+        "Если add_item упал — task уже отменён: честно скажи юзеру о "
+        "частичном переносе. Возвращает "
         "ok:moved:item_id=<clitem>:list=<cid> или "
-        "ok:moved:item_id=existing:list=<cid>:dup (idempotent). "
-        "Граница vs link_task_to_checklist: тот СВЯЗЫВАЕТ task ↔ "
-        "checklist (оба остаются), этот ПРЕВРАЩАЕТ task В пункт "
-        "(task cancelled)."
+        "ok:moved:item_id=existing:list=<cid>:dup (идемпотентно)."
     ),
     family="checklists",
     effect="write",

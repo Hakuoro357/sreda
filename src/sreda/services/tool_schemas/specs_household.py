@@ -226,22 +226,20 @@ class RemoveFamilyMemberInput(BaseModel):
 
 ADD_FAMILY_MEMBERS_SPEC = ToolSpec(
     name="add_family_members",
+    # #128: ревью-метки (Codex R1 MAJOR #N) вырезаны — это шум для модели
     description=(
         "Добавить одного или нескольких членов семьи за раз. "
         "Используй когда юзер описывает семью одной фразой («у меня "
-        "жена Катя, сын Никита 10 лет»). Codex R1 MAJOR #5 — возраст: "
-        "используй birth_year ТОЛЬКО когда юзер назвал явный год "
-        "рождения («Никита 2015 года рождения»); фразы вида «10 лет» / "
-        "«школьник» / «пенсионер» иди в age_hint, чтобы не угадывать "
-        "год по текущему — на границе дня рождения это смещается. "
-        "Codex R1 MAJOR #6 — роли: spouse=муж/жена, child=сын/дочь, "
-        "parent=мама/папа, self=сам пользователь; всё остальное "
-        "(сестра, брат, бабушка, дядя) → role='other' + точное "
-        "отношение в notes. Имена дедуплицируются по нормализованному "
-        "виду (case-insensitive); если все имена уже есть — статус "
+        "жена Катя, сын Никита 10 лет»). Возраст: birth_year ТОЛЬКО "
+        "при явном годе рождения («Никита 2015 года рождения»); "
+        "«10 лет» / «школьник» / «пенсионер» → age_hint (год не "
+        "угадывать). Роли: spouse=муж/жена, child=сын/дочь, "
+        "parent=мама/папа, self=сам пользователь; остальное (сестра, "
+        "бабушка, дядя) → role='other' + отношение в notes. Имена "
+        "дедуплицируются (case-insensitive); все уже есть → "
         "ok:added:0:skipped_as_duplicate:M, иначе "
-        "ok:added:N:skipped_as_duplicate:M:ids=[fm_,...]. Если не "
-        "уверен что записи уже есть — list_family_members сначала."
+        "ok:added:N:skipped_as_duplicate:M:ids=[fm_,...]. Не уверен, "
+        "что записи новые — list_family_members сначала."
     ),
     family="household",
     effect="write",
@@ -267,16 +265,12 @@ ADD_FAMILY_MEMBERS_SPEC = ToolSpec(
 LIST_FAMILY_MEMBERS_SPEC = ToolSpec(
     name="list_family_members",
     description=(
-        "Показать всех записанных членов семьи юзера: имя, роль, "
-        "возраст и заметки. Возвращает СТРУКТУРИРОВАННЫЙ список с "
-        "member_id для каждого члена — используй эти id для "
-        "update_family_member и remove_family_member (имена-в-промпте "
-        "не выдумывай). Codex R1 MAJOR #2: меню/покупки используют "
-        "household автоматически — НЕ нужно звать этот tool «для "
-        "масштабирования», только когда юзер сам спрашивает про "
-        "семью или когда тебе нужны member_id для правки/удаления. "
-        "Возвращает раздельные статусы: ok (есть записи) и empty "
-        "(никого нет — предложи юзеру add_family_members)."
+        "Показать всех членов семьи: имя, роль, возраст, заметки; "
+        "member_id каждого — для update/remove_family_member (id не "
+        "выдумывай). Меню/покупки используют household автоматически "
+        "— зови только когда юзер спрашивает про семью или нужны "
+        "member_id. Статусы: ok и empty (никого — предложи "
+        "add_family_members)."
     ),
     family="household",
     effect="read",
@@ -301,26 +295,18 @@ LIST_FAMILY_MEMBERS_SPEC = ToolSpec(
 
 UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
     name="update_family_member",
+    # #128: ревью-метки вырезаны; ролевые правила — ссылкой на
+    # add_family_members (рендерятся в том же реестре, дубль не нужен)
     description=(
-        "Обновить поля одного члена семьи. Используй когда юзер "
-        "корректирует данные: «Маше 9 уже», «у Никиты теперь аллергия "
-        "на молоко». Codex R1 MAJOR #3: если юзер называет члена по "
-        "имени/роли, а member_id у тебя ещё нет — сначала вызови "
-        "list_family_members, найди нужного по name, потом обновляй. "
-        "Если несколько совпадений (двое детей с одним именем) — "
-        "переспроси юзера. Передавай ТОЛЬКО те поля что меняются — "
-        "остальные оставь None. Минимум одно поле должно быть "
-        "non-None (пустой апдейт = no-op runtime = ошибка). "
-        "Codex R2 MAJOR (new) — при правке role те же правила что и "
-        "в add_family_members: spouse=муж/жена, child=сын/дочь, "
-        "parent=мама/папа, self=сам пользователь; остальное (сестра, "
-        "брат, бабушка) → role='other' + отношение в notes. "
-        "Codex R2 MAJOR (new) — clear-семантика: notes='' и "
-        "age_hint='' очищают соответствующее поле; для birth_year — "
-        "explicit clear_birth_year=True (не передавай birth_year=N с "
-        "clear_birth_year=True одновременно). name и role очистить "
-        "нельзя (нет sensible default). Возвращает ok:updated или "
-        "error:member_not_found."
+        "Обновить поля одного члена семьи: «Маше 9 уже», «у Никиты "
+        "теперь аллергия на молоко». Нет member_id — сначала "
+        "list_family_members, найди по name; несколько совпадений — "
+        "переспроси юзера. Передавай ТОЛЬКО меняющиеся поля, минимум "
+        "одно non-None (пустой апдейт = ошибка). Правила role — как в "
+        "add_family_members. Clear-семантика: notes='' и age_hint='' "
+        "очищают поле; birth_year — только clear_birth_year=True (не "
+        "вместе с birth_year=N). name и role очистить нельзя. "
+        "Возвращает ok:updated или error:member_not_found."
     ),
     family="household",
     effect="write",
@@ -346,12 +332,10 @@ UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
 REMOVE_FAMILY_MEMBER_SPEC = ToolSpec(
     name="remove_family_member",
     description=(
-        "Удалить запись члена семьи. Используй ТОЛЬКО когда юзер явно "
-        "просит убрать («Маша переехала, удали»), а не для коррекции "
-        "(коррекция — update_family_member). Codex R1 MAJOR #3: если "
-        "юзер называет члена по имени, а member_id у тебя ещё нет — "
-        "сначала вызови list_family_members, найди нужного по name, "
-        "потом удаляй. При нескольких совпадениях — переспроси юзера. "
+        "Удалить запись члена семьи. ТОЛЬКО когда юзер явно просит "
+        "убрать («Маша переехала, удали»); коррекция — "
+        "update_family_member. Нет member_id — сначала "
+        "list_family_members; несколько совпадений — переспроси. "
         "Возвращает ok:removed или error:member_not_found."
     ),
     family="household",
