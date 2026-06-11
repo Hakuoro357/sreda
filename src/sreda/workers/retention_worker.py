@@ -32,6 +32,7 @@ from sreda.maintenance.retention_cleanup import (
     RetentionCleanupResult,
     cleanup_runtime_retention,
 )
+from sreda.services.admin_alerts import send_admin_alert
 
 
 logger = logging.getLogger("sreda.retention")
@@ -43,6 +44,13 @@ DEFAULT_STATE_FILE = "/tmp/sreda-retention-state.json"
 
 # Интервал между прогонами. 24 часа — стандарт для retention.
 DEFAULT_INTERVAL = timedelta(hours=24)
+
+# #127: состояние писалось только при УСПЕХЕ → провал повторялся на
+# каждом тике джоб-раннера (раз в секунду, 264k ошибок/сутки, трое суток).
+# Откат после провала + P1-алерт после серии (тихое гниение запрещено —
+# правило «ошибка должна быть записана у нас»).
+FAILURE_BACKOFF = timedelta(minutes=30)
+ALERT_AFTER_CONSECUTIVE_FAILURES = 3
 
 
 class RetentionWorker:
@@ -69,6 +77,12 @@ class RetentionWorker:
             return 0
         try:
             result = cleanup_runtime_retention(self.session, now=now)
+            # #127 CRITICAL (Codex R1 оба): cleanup делает только flush(),
+            # а job_runner закрывает сессию БЕЗ commit — удаления тихо
+            # откатывались, state говорил «успех», ретеншн молчал сутки.
+            # Коммитим ЗДЕСЬ, до записи успешного state; провал коммита —
+            # это провал прогона (rollback + запись провала ниже).
+            self.session.commit()
         except Exception:  # noqa: BLE001 — никогда не убиваем job_runner
             logger.exception("retention cleanup failed")
             # 2026-04-28: rollback чтобы транзакция не висела в bad state
@@ -78,43 +92,96 @@ class RetentionWorker:
                 self.session.rollback()
             except Exception:  # noqa: BLE001
                 pass
+            self._record_failure(now)
             return 0
         self._record_run(now, result)
         self._log_result(now, result)
         return result.total
 
     def _should_run(self, now: datetime) -> bool:
-        """True если последний прогон был >= `interval` назад
-        (или state-файл отсутствует / некорректен)."""
-        last = self._read_last_run()
-        if last is None:
-            return True
-        return (now - last) >= self.interval
+        """True если пора: успешный прогон >= interval назад И провал
+        (если был) >= FAILURE_BACKOFF назад (#127: без отката провал
+        повторялся на каждом тике)."""
+        state = self._read_state()
+        last = self._parse_ts(state.get("last_run_at"))
+        if last is not None and (now - last) < self.interval:
+            return False
+        last_failure = self._parse_ts(state.get("last_failure_at"))
+        if last_failure is not None and (now - last_failure) < FAILURE_BACKOFF:
+            return False
+        return True
 
-    def _read_last_run(self) -> datetime | None:
+    def _record_failure(self, now: datetime) -> None:
+        """#127: зафиксировать провал (откат + счётчик) и алертить серию."""
+        state = self._read_state()
+        # защитный парс: мусор в state-файле не должен ронять
+        # обработчик провала (мы и так внутри except)
+        try:
+            failures = int(state.get("failure_count") or 0) + 1
+        except (TypeError, ValueError):
+            failures = 1
+        state["last_failure_at"] = now.isoformat()
+        state["failure_count"] = failures
+        self._write_state(state)
+        if failures >= ALERT_AFTER_CONSECUTIVE_FAILURES:
+            try:
+                send_admin_alert(
+                    "P1",
+                    "ретеншн-чистка падает серией",
+                    f"{failures} провалов подряд; последний "
+                    f"{now.isoformat(timespec='seconds')} — см. лог "
+                    f"sreda.retention (чистка стоит, строки копятся)",
+                    dedupe_key="retention:consecutive_failures",
+                )
+            except Exception:  # noqa: BLE001 — алерт не валит воркер
+                logger.exception("retention: alert delivery failed")
+
+    def _read_state(self) -> dict:
         if not self.state_file.exists():
-            return None
+            return {}
         try:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            ts = data.get("last_run_at")
-            if not isinstance(ts, str):
-                return None
-            return datetime.fromisoformat(ts)
+            return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, ValueError, OSError):
             # Corrupt state file — игнорируем, прогон случится.
-            return None
+            return {}
 
-    def _record_run(self, now: datetime, result: RetentionCleanupResult) -> None:
+    @staticmethod
+    def _parse_ts(raw: object) -> datetime | None:
+        if not isinstance(raw, str):
+            return None
+        try:
+            ts = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        # наивный ts в state-файле (ручная правка) дал бы TypeError на
+        # `now - ts` ВНЕ try в process_pending — считаем его UTC
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+
+    def _write_state(self, state: dict) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             self.state_file.write_text(
-                json.dumps(
-                    {
-                        "last_run_at": now.isoformat(),
-                        "total_deleted": result.total,
-                    },
-                    ensure_ascii=False,
-                ),
+                json.dumps(state, ensure_ascii=False), encoding="utf-8",
+            )
+        except OSError:
+            logger.warning(
+                "could not write retention state file %s", self.state_file
+            )
+
+    def _record_run(self, now: datetime, result: RetentionCleanupResult) -> None:
+        # успех сбрасывает серию провалов (#127)
+        state = self._read_state()
+        state["last_run_at"] = now.isoformat()
+        state["total_deleted"] = result.total
+        state["failure_count"] = 0
+        state.pop("last_failure_at", None)
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.state_file.write_text(
+                json.dumps(state, ensure_ascii=False),
                 encoding="utf-8",
             )
         except OSError:

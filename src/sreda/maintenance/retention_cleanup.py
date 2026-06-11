@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, delete, or_, select, union_all
+from sqlalchemy import and_, delete, or_, select, union_all, update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
@@ -54,6 +54,10 @@ class RetentionCleanupResult:
     """Row counts deleted per table. Useful for log/metrics."""
 
     agent_runs: int = 0
+    # #127: прогоны, у которых обнулили ссылку на удаляемое входящее /
+    # удаляемый job (не входят в total — это UPDATE, не удаление)
+    agent_runs_unlinked: int = 0
+    agent_runs_job_unlinked: int = 0
     inbound_messages: int = 0
     jobs: int = 0
     outbox_messages_sent: int = 0
@@ -97,6 +101,9 @@ SKILL_EVENTS_WARN_ERROR_DAYS = 90
 SKILL_ATTEMPTS_DAYS = 90
 SKILL_RUNS_DAYS = 90
 
+# #127: размер порции для unlink+delete входящих (см. блок inbound ниже)
+INBOUND_CHUNK_SIZE = 5000
+
 TERMINAL_RUN_STATUSES = ("succeeded", "failed", "cancelled")
 TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled")
 TERMINAL_AGENT_RUN_STATUSES = ("completed", "failed")
@@ -111,6 +118,45 @@ def _delete_returning_count(session: Session, stmt) -> int:
     result = session.execute(stmt)
     count = getattr(result, "rowcount", 0) or 0
     return max(0, count)
+
+
+def _unlink_then_delete_chunked(
+    session: Session,
+    *,
+    select_ids,
+    make_unlink,
+    make_delete,
+    chunk_size: int,
+) -> tuple[int, int]:
+    """#127: удалить строки порциями, предварительно обнулив ссылки на них.
+
+    Паттерн «короткое окно у родителя, длинное у ссылающегося ребёнка»
+    (inbound_messages 30д vs agent_runs 90д; jobs 30д vs agent_runs 90д):
+    окно родителя соблюдаем строго (PII), ссылка nullable — обнуляем её
+    ПЕРЕД удалением. Чанками с commit на каждый: без этого row-локи
+    копятся до конца всей чистки (Codex R2), а бэклог после простоя —
+    длинная транзакция поверх живого трафика. Частичный прогресс
+    безопасен: чистка идемпотентна, повтор доберёт остаток.
+
+    ``select_ids`` — Select по id просроченных строк (с ORDER BY, без
+    limit); ``make_unlink(chunk_ids)`` — Update, обнуляющий ссылки;
+    ``make_delete(chunk_ids)`` — Delete по чанку.
+    Возвращает (unlinked, deleted).
+    """
+    unlinked_total = 0
+    deleted_total = 0
+    while True:
+        chunk_ids = session.execute(
+            select_ids.limit(chunk_size)
+        ).scalars().all()
+        if not chunk_ids:
+            break
+        unlinked = session.execute(make_unlink(chunk_ids)).rowcount
+        # как в _delete_returning_count: драйвер может вернуть -1/None
+        unlinked_total += max(0, unlinked or 0)
+        deleted_total += _delete_returning_count(session, make_delete(chunk_ids))
+        session.commit()
+    return unlinked_total, deleted_total
 
 
 def cleanup_runtime_retention(
@@ -189,22 +235,64 @@ def cleanup_runtime_retention(
     )
 
     # ---------- inbound_messages ----------
+    # #127 (прод 2026-06-09..11): agent_runs живут 90 дней и держат FK
+    # inbound_message_id — слепое удаление 30-дневных входящих взрывалось
+    # на ссылках живых прогонов (264k ошибок/сутки, чистка стояла трое
+    # суток). Окно 30 дней соблюдаем СТРОГО (персональные данные):
+    # сначала обнуляем ссылки прогонов (колонка nullable), потом удаляем.
+    # Чанками (Codex R1 medium): бэклог после простоя — один мега-UPDATE/
+    # DELETE держал бы длинный лок; порциями statement'ы короткие.
     inbound_cutoff = now - timedelta(days=INBOUND_MESSAGES_DAYS)
-    result.inbound_messages = _delete_returning_count(
-        session,
-        delete(InboundMessage).where(InboundMessage.created_at < inbound_cutoff),
+    result.agent_runs_unlinked, result.inbound_messages = (
+        _unlink_then_delete_chunked(
+            session,
+            select_ids=(
+                select(InboundMessage.id)
+                .where(InboundMessage.created_at < inbound_cutoff)
+                # детерминированный порядок + дружит с индексом created_at
+                .order_by(InboundMessage.created_at, InboundMessage.id)
+            ),
+            make_unlink=lambda ids: (
+                update(AgentRun)
+                .where(AgentRun.inbound_message_id.in_(ids))
+                .values(inbound_message_id=None)
+                .execution_options(synchronize_session=False)
+            ),
+            make_delete=lambda ids: (
+                delete(InboundMessage).where(InboundMessage.id.in_(ids))
+            ),
+            chunk_size=INBOUND_CHUNK_SIZE,
+        )
     )
 
     # ---------- jobs ----------
+    # #127 (калибровочный субагент, подтверждено зондом на проде:
+    # 556/557 просроченных jobs держались живыми прогонами): тот же
+    # FK-класс, что у inbound — agent_runs.job_id (90д) ссылается на jobs
+    # (30д). payload_json содержит PII → окно 30 дней строгое, держать
+    # job дольше нельзя; колонка job_id nullable — обнуляем перед
+    # удалением, прогон выживает.
     jobs_cutoff = now - timedelta(days=JOBS_DAYS)
-    result.jobs = _delete_returning_count(
+    result.agent_runs_job_unlinked, result.jobs = _unlink_then_delete_chunked(
         session,
-        delete(Job).where(
-            and_(
-                Job.status.in_(TERMINAL_JOB_STATUSES),
-                Job.created_at < jobs_cutoff,
+        select_ids=(
+            select(Job.id)
+            .where(
+                and_(
+                    Job.status.in_(TERMINAL_JOB_STATUSES),
+                    Job.created_at < jobs_cutoff,
+                )
             )
+            .order_by(Job.created_at, Job.id)
         ),
+        make_unlink=lambda ids: (
+            update(AgentRun)
+            .where(AgentRun.job_id.in_(ids))
+            .values(job_id=None)
+            .execution_options(synchronize_session=False)
+        ),
+        make_delete=lambda ids: delete(Job).where(Job.id.in_(ids)),
+        chunk_size=INBOUND_CHUNK_SIZE,
     )
 
     # ---------- outbox_messages ----------

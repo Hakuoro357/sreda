@@ -124,8 +124,10 @@ async def test_corrupt_state_file_treated_as_missing(state_path: Path, cleanup_m
 async def test_cleanup_failure_does_not_crash_worker(
     state_path: Path, monkeypatch
 ):
-    """Если cleanup упал — worker возвращает 0, не пишет state, но
-    не пробрасывает исключение (мы никогда не убиваем job_runner)."""
+    """Если cleanup упал — worker возвращает 0 и не пробрасывает
+    исключение (мы никогда не убиваем job_runner). #127: провал теперь
+    ЗАПИСЫВАЕТСЯ в state (failure_count + last_failure_at) — раньше
+    отсутствие записи давало шторм повторов раз в секунду."""
     fail = MagicMock(side_effect=RuntimeError("boom"))
     monkeypatch.setattr(rw_module, "cleanup_runtime_retention", fail)
 
@@ -134,7 +136,9 @@ async def test_cleanup_failure_does_not_crash_worker(
     deleted = await worker.process_pending()
 
     assert deleted == 0
-    assert not state_path.exists()
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert data["failure_count"] == 1 and "last_failure_at" in data
+    assert "last_run_at" not in data  # успешный прогон не подделан
 
 
 @pytest.mark.asyncio

@@ -245,9 +245,12 @@ class InboundMessage(Base):
     processing_status: Mapped[str] = mapped_column(
         String(32), default="ingested", server_default="ingested", index=True,
     )
+    # #127: ретеншн чистит чанками с фильтром по created_at — без индекса
+    # каждый чанк = полный скан таблицы (миграция 20260611_0055).
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
+        index=True,
     )
 
     __table_args__ = (
