@@ -129,12 +129,27 @@ async def handle_telegram_interaction(
     )
 
     if is_persona_settings_request(message_text):
+        # #130: перехваченная команда оставляла висеть «⚙️ Обрабатываю…»
+        # (ack без финализации — трасса 2026-06-11 11:25:06). Превращаем
+        # сам ack в сообщение выбора стиля; нет ack'а — шлём новое.
+        # Codex R2 high: штатный edit_final_or_fallback сам правит ack,
+        # а при провале правки шлёт новое сообщение И УДАЛЯЕТ ack —
+        # ручная связка оставляла «Обрабатываю…» при failed-edit.
+        _choice_text = build_persona_choice_message()
+        _choice_kb = build_persona_choice_keyboard_tg(settings=True)
         try:
-            await telegram_client.send_message(
-                chat_id=onboarding.chat_id,
-                text=build_persona_choice_message(),
-                reply_markup=build_persona_choice_keyboard_tg(),
-            )
+            if ack_progress_controller is not None and hasattr(
+                ack_progress_controller, "edit_final_or_fallback"
+            ):
+                await ack_progress_controller.edit_final_or_fallback(
+                    _choice_text, reply_markup=_choice_kb,
+                )
+            else:
+                await telegram_client.send_message(
+                    chat_id=onboarding.chat_id,
+                    text=_choice_text,
+                    reply_markup=_choice_kb,
+                )
         except TelegramDeliveryError as exc:
             logger.warning(
                 "persona settings choice delivery failed status=%s: %s",
@@ -390,14 +405,23 @@ async def _handle_callback(
         )
         return
 
-    if data.startswith("persona:"):
+    if data.startswith("persona:") or data.startswith("personaset:"):
         from sreda.services.housewife_persona import (
+            PERSONA_SETTINGS_CALLBACK_PREFIX,
             build_persona_selected_keyboard_tg,
             build_persona_selected_message,
             set_persona_preset,
         )
 
-        preset = data[len("persona:"):].strip()
+        # #130 (Codex R2 medium): источник различаем ПРЕФИКСОМ колбэка —
+        # personaset: = команда настроек в середине жизни; persona: =
+        # онбординг/welcome (статус онбординга ненадёжен: post-approve
+        # welcome шлёт persona: и при complete).
+        _mid_life = data.startswith(PERSONA_SETTINGS_CALLBACK_PREFIX)
+        preset = (
+            data[len(PERSONA_SETTINGS_CALLBACK_PREFIX):]
+            if _mid_life else data[len("persona:"):]
+        ).strip()
         if callback_id:
             try:
                 await telegram_client.answer_callback_query(str(callback_id), text="")
@@ -448,8 +472,17 @@ async def _handle_callback(
                 cb_message.get("message_id")
                 if isinstance(cb_message, dict) else None
             )
-            reply_text = build_persona_selected_message(preset)
-            reply_markup = build_persona_selected_keyboard_tg()
+            # #130: смена стиля в середине жизни — короткое подтверждение
+            # без онбординг-хвоста и без кнопок примеров.
+            reply_text = build_persona_selected_message(
+                preset, in_onboarding=not _mid_life,
+            )
+            # Codex R1 (оба): None НЕ снимает клавиатуру — клиент просто
+            # не шлёт поле; снятие = пустой inline_keyboard.
+            reply_markup = (
+                {"inline_keyboard": []} if _mid_life
+                else build_persona_selected_keyboard_tg()
+            )
             edited = False
             if msg_id is not None:
                 try:

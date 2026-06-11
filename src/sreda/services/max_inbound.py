@@ -1298,14 +1298,20 @@ async def _handle_max_callback(
         )
         return True
 
-    if data.startswith("persona:"):
+    if data.startswith("persona:") or data.startswith("personaset:"):
         from sreda.services.housewife_persona import (
+            PERSONA_SETTINGS_CALLBACK_PREFIX,
             build_persona_selected_keyboard_max,
             build_persona_selected_message,
             set_persona_preset,
         )
 
-        preset = data.removeprefix("persona:").strip()
+        # #130: источник — префиксом (см. TG-ветку)
+        _mid_life = data.startswith(PERSONA_SETTINGS_CALLBACK_PREFIX)
+        preset = (
+            data.removeprefix(PERSONA_SETTINGS_CALLBACK_PREFIX)
+            if _mid_life else data.removeprefix("persona:")
+        ).strip()
         if callback_id:
             try:
                 await max_client.answer_callback(str(callback_id), notification="")
@@ -1346,8 +1352,15 @@ async def _handle_max_callback(
             if isinstance(body, dict) and body.get("mid"):
                 cb_message_mid = str(body["mid"])
 
-        reply_text = build_persona_selected_message(preset)
-        attachments = build_persona_selected_keyboard_max()
+        # #130: смена стиля в середине жизни — короткое подтверждение
+        # без онбординг-хвоста и кнопок (зеркало TG-ветки).
+        reply_text = build_persona_selected_message(
+            preset, in_onboarding=not _mid_life,
+        )
+        # Codex R1 (оба): None не снимает кнопки в MAX — снятие = [].
+        attachments = (
+            [] if _mid_life else build_persona_selected_keyboard_max()
+        )
         edited = False
         if cb_message_mid:
             try:
@@ -1477,7 +1490,7 @@ async def _handle_max_persona_settings_request(
         await max_client.send_message(
             recipient={"chat_id": onboarding.max_chat_id},
             text=build_persona_choice_message(),
-            attachments=build_persona_choice_keyboard_max(),
+            attachments=build_persona_choice_keyboard_max(settings=True),
         )
     except Exception:  # noqa: BLE001
         logger.warning("max persona settings: delivery failed", exc_info=True)

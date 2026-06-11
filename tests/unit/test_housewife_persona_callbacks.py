@@ -529,8 +529,9 @@ async def test_telegram_persona_settings_request_sends_choice_keyboard(
     assert "веду списки твоих дел" in client.sends[0]["text"]
     assert "ищу в интернете нужную тебе информацию" in client.sends[0]["text"]
     buttons = client.sends[0]["reply_markup"]["inline_keyboard"][0]
-    assert buttons[0]["callback_data"] == f"persona:{PERSONA_WARM_PRACTICAL}"
-    assert buttons[1]["callback_data"] == f"persona:{PERSONA_TENDER_CARE}"
+    # #130: путь НАСТРОЕК шлёт колбэки с выделенным префиксом personaset:
+    assert buttons[0]["callback_data"] == f"personaset:{PERSONA_WARM_PRACTICAL}"
+    assert buttons[1]["callback_data"] == f"personaset:{PERSONA_TENDER_CARE}"
 
 
 @pytest.mark.asyncio
@@ -557,8 +558,9 @@ async def test_max_persona_settings_request_sends_choice_keyboard() -> None:
     assert "Выбери, как мне с тобой общаться" in client.sends[0]["text"]
     assert "веду списки твоих дел" in client.sends[0]["text"]
     buttons = client.sends[0]["attachments"][0]["payload"]["buttons"][0]
-    assert buttons[0]["payload"] == f"persona:{PERSONA_WARM_PRACTICAL}"
-    assert buttons[1]["payload"] == f"persona:{PERSONA_TENDER_CARE}"
+    # #130: путь НАСТРОЕК шлёт колбэки с выделенным префиксом personaset:
+    assert buttons[0]["payload"] == f"personaset:{PERSONA_WARM_PRACTICAL}"
+    assert buttons[1]["payload"] == f"personaset:{PERSONA_TENDER_CARE}"
 
 
 @pytest.mark.asyncio

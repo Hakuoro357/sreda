@@ -148,22 +148,31 @@ def build_persona_choice_message() -> str:
     )
 
 
-def build_persona_choice_keyboard_tg() -> dict:
+# #130 (Codex R2 medium): у колбэка persona: ДВА источника — онбординг-
+# приветствие и команда настроек в середине жизни; статус онбординга их
+# не различает (post-approve welcome шлёт тот же колбэк при complete).
+# Честный дискриминатор — отдельный префикс у клавиатуры настроек.
+PERSONA_SETTINGS_CALLBACK_PREFIX = "personaset:"
+
+
+def build_persona_choice_keyboard_tg(*, settings: bool = False) -> dict:
+    prefix = PERSONA_SETTINGS_CALLBACK_PREFIX if settings else "persona:"
     return {
         "inline_keyboard": [[
             {
                 "text": "Спокойно и по делу",
-                "callback_data": f"persona:{PERSONA_WARM_PRACTICAL}",
+                "callback_data": f"{prefix}{PERSONA_WARM_PRACTICAL}",
             },
             {
                 "text": "Ласково и тепло",
-                "callback_data": f"persona:{PERSONA_TENDER_CARE}",
+                "callback_data": f"{prefix}{PERSONA_TENDER_CARE}",
             },
         ]]
     }
 
 
-def build_persona_choice_keyboard_max() -> list[dict]:
+def build_persona_choice_keyboard_max(*, settings: bool = False) -> list[dict]:
+    prefix = PERSONA_SETTINGS_CALLBACK_PREFIX if settings else "persona:"
     return [{
         "type": "inline_keyboard",
         "payload": {
@@ -171,20 +180,31 @@ def build_persona_choice_keyboard_max() -> list[dict]:
                 {
                     "type": "callback",
                     "text": "Спокойно и по делу",
-                    "payload": f"persona:{PERSONA_WARM_PRACTICAL}",
+                    "payload": f"{prefix}{PERSONA_WARM_PRACTICAL}",
                 },
                 {
                     "type": "callback",
                     "text": "Ласково и тепло",
-                    "payload": f"persona:{PERSONA_TENDER_CARE}",
+                    "payload": f"{prefix}{PERSONA_TENDER_CARE}",
                 },
             ]]
         },
     }]
 
 
-def build_persona_selected_message(preset: str | None) -> str:
+def build_persona_selected_message(
+    preset: str | None, *, in_onboarding: bool = True
+) -> str:
+    """#130: текст после выбора стиля зависит от контекста. Онбординг —
+    прежний хвост с приглашением к примерам; смена стиля В СЕРЕДИНЕ
+    жизни — короткое подтверждение без «давай познакомимся» (прецедент
+    Бориса 2026-06-11: команда «поменяй стиль общения» уводила в конец
+    онбординга)."""
     normalized = normalize_persona_preset(preset)
+    if not in_onboarding:
+        if normalized == PERSONA_TENDER_CARE:
+            return "Готово — теперь говорю ласково и тепло 😊"
+        return "Готово — теперь спокойно и по делу 👌"
     if normalized == PERSONA_TENDER_CARE:
         return (
             "Выбрала ласковый и тёплый стиль.\n\n"
@@ -196,6 +216,7 @@ def build_persona_selected_message(preset: str | None) -> str:
         "Дальше можно сразу дать мне задачу — текстом или голосом.\n"
         "А можно сначала посмотреть пару примеров, чем я могу помочь."
     )
+
 
 
 def build_persona_ready_message() -> str:
