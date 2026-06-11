@@ -225,18 +225,16 @@ CREATE_CHECKLIST_SPEC = ToolSpec(
 ADD_CHECKLIST_ITEMS_SPEC = ToolSpec(
     name="add_checklist_items",
     description=(
-        "Добавить пункты в чек-лист. ВАЖНО: автоматически создаст "
-        "новый список с этим title если такого ещё нет — один вызов "
-        "вместо create_checklist + add_checklist_items. Триггеры: "
-        "«запиши в дела по машине: колодки, стекло, масло», «добавь "
-        "в дела на дачу: лопата, рассада», «план кроя на неделю: "
-        "лаванда, шампань, жемчуг». Дедуп против существующих "
-        "pending items — дубли идут в dups count. Возвращает "
+        # P1 2026-06-11 prompt_budget_exceeded (прод -8 симв.): описание
+        # ужато; смысловые потери — только дубль mutex-note про
+        # create_checklist. Привязка эха ТОЛЬКО для status=added: при
+        # added_with_dups created может быть пуст (всё дубли) —
+        # checklist_show спрятал бы «уже было» (Codex R2 MAJOR).
+        "Добавить пункты в чек-лист (сам создаст список, если такого "
+        "нет). Триггеры: «запиши в дела по машине: колодки, масло», "
+        "«добавь в дела на дачу: лопата», «план кроя: лаванда, шампань». "
+        "Дубли не ошибка — идут в dups count. Возвращает "
         "ok:added:N:list=<id> или ok:added:N:dups:M:list=<id>. "
-        # #124 ход 1; бюджет префикса исчерпан — только выжимка.
-        # Привязка эха ТОЛЬКО для status=added: при added_with_dups
-        # created может быть пуст (всё дубли) — checklist_show спрятал бы
-        # «уже было» (Codex R2 MAJOR).
         "items: строки. status=added → checklist_show: "
         "{\"title\": <имя>, \"items\": \"${sN.created}\"}."
     ),
