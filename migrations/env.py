@@ -25,7 +25,12 @@ from sreda.db.models import inbound_event as _inbound_event_models  # noqa: F401
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: дефолт True ОТКЛЮЧАЕТ все уже
+    # созданные логгеры процесса. В тестах это глушило логгеры модулей,
+    # импортированных до alembic-прогона (issue #129: предупреждение
+    # housewife_reminder_worker молча пропадало в полном прогоне);
+    # при программном вызове из приложения симптом был бы тот же.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 settings = get_settings()
 config.set_main_option("sqlalchemy.url", settings.database_url)
