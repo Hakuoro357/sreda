@@ -35,6 +35,7 @@ Char hard-cap is deterministic and prevents context-window overrun.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,8 @@ from jinja2 import Environment, StrictUndefined
 from sreda.runtime.planner.validator import output_field_names
 from sreda.services.clarification_contract import RUNTIME_ONLY_TEMPLATE_IDS
 from sreda.services.tool_schemas.base import ToolSpec
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Budget
@@ -698,6 +701,16 @@ def build_prompt(args: PromptBuildArgs) -> str:
         raise PromptBudgetExceeded(
             f"cached prefix={len(prefix)} chars > "
             f"{args.budget.max_prefix_chars} cap — registry/few-shot bloat"
+        )
+    # P1 2026-06-11: прод упал с перебором в 8 символов, а CI молчал
+    # (рендерил с пустыми llm-ключами). Мягкий порог за 100 символов до
+    # потолка — громкое предупреждение в логе ДО того, как начнёт падать.
+    if len(prefix) > args.budget.max_prefix_chars - 100:
+        logger.warning(
+            "planner prompt prefix у потолка: %d из %d (запас %d) — "
+            "сжимай реестр (#128) до добавления текста",
+            len(prefix), args.budget.max_prefix_chars,
+            args.budget.max_prefix_chars - len(prefix),
         )
     suffix = build_variable_suffix(
         profile=args.profile,

@@ -108,6 +108,28 @@ def test_cached_prefix_fits_budget() -> None:
     )
 
 
+def test_cached_prefix_headroom_gate_prod_like() -> None:
+    """P1 2026-06-11 (prompt_budget_exceeded на проде): этот файл проверял
+    префикс с ПУСТЫМИ llm-ключами, прод рендерит с включёнными — CI зелёный,
+    прод -8 символов. Страж: прод-подобный рендер (ВСЕ ключи + гейтованный
+    few-shot) обязан держать запас ≥100 символов до потолка 73000.
+    Codex high+medium (хотфикс-ревью): порог 72_900 СЕЙЧАС, опустить до
+    ~72_500 после сжатия реестра (#128) — не поднимать без решения владельца."""
+    from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
+
+    all_keys = frozenset(LLM_PROMPT_REGISTRY.prompt_keys())
+    prefix = build_cached_prefix(
+        tool_specs=MIGRATED_TOOL_SPECS,
+        composer_template_ids=REGISTRY.template_ids(),
+        composer_llm_prompt_keys=all_keys,
+        few_shot_block=render_few_shot_block(effective_llm_keys=all_keys),
+    )
+    assert len(prefix) <= 72_900, (
+        f"prod-like prefix={len(prefix)} > 72_900 — последние ~100 символов "
+        f"запаса съедены; сжимай реестр (#128), НЕ поднимай порог"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Suffix changes per call (test 2)
 # ---------------------------------------------------------------------------
