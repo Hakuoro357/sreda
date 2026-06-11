@@ -174,6 +174,10 @@ class ComposerContext:
     user_message: str = ""
     locale: str = "ru-RU"
     timezone: str = "Europe/Moscow"
+    # #126 п.3: выбранный пользователем тон персоны (warm_practical /
+    # tender_care). None/warm_practical → промпт рта без изменений;
+    # tender_care → llm_composer добавляет композерную накладку тона.
+    persona_preset: str | None = None
 
 
 # ---------------------------------------------------------------------------

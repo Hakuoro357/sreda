@@ -16,6 +16,9 @@ os.environ["SREDA_TG_ACCOUNT_SALT"] = "x"
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 PROVIDER = sys.argv[1]
+TONE = sys.argv[2] if len(sys.argv) > 2 else None  # #126: тон персоны
+if TONE is not None and TONE not in ("warm_practical", "tender_care"):
+    sys.exit(f"неизвестный тон: {TONE!r} (warm_practical | tender_care)")
 os.environ["SREDA_COMPOSER_PROVIDER"] = PROVIDER
 from sreda.config.settings import get_settings
 get_settings.cache_clear()
@@ -50,8 +53,9 @@ CASES = [
 ]
 
 ctx = ComposerContext(tenant_id="bench", run_id="bench", user_message="",
-                      locale="ru-RU", timezone="Europe/Moscow")
-print(f"### ПРОВАЙДЕР: {PROVIDER}")
+                      locale="ru-RU", timezone="Europe/Moscow",
+                      persona_preset=TONE)
+print(f"### ПРОВАЙДЕР: {PROVIDER} ТОН: {TONE or 'дефолт'}")
 for i, (intent, raw) in enumerate(CASES, 1):
     t0 = time.monotonic()
     try:

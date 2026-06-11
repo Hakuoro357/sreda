@@ -269,8 +269,18 @@ def make_llm_composer(
         # 3. Build messages — lazy langchain import (mirrors call_planner)
         from langchain_core.messages import HumanMessage, SystemMessage
 
+        # #126 п.3: тон персоны. ТОЛЬКО tender_care меняет промпт
+        # (накладка последней строкой, с оговоркой «правила важнее
+        # тона»); warm_practical/None → байт-в-байт прежний промпт.
+        system_text = spec.system_prompt
+        if ctx.persona_preset == "tender_care":
+            from sreda.services.composer.llm_prompts_housewife import (
+                TENDER_CARE_COMPOSER_OVERLAY,
+            )
+            system_text = system_text + TENDER_CARE_COMPOSER_OVERLAY
+
         messages = [
-            SystemMessage(content=spec.system_prompt),
+            SystemMessage(content=system_text),
             HumanMessage(content=_build_human_message(
                 template_data=template_data,
                 execution_log=execution_log,

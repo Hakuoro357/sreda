@@ -71,6 +71,21 @@ def _alert(stage: str, action: Any, code: str, detail: str) -> None:
         logger.exception("planner_chat: alert delivery failed")
 
 
+def _persona_preset_or_none(session: Any, action: Any, pf: Any) -> str | None:
+    """#126 п.3: тон персоны для рта. Сбой чтения НИКОГДА не валит ход —
+    None означает «дефолтный голос» (warm_practical-поведение)."""
+    if not getattr(pf, "user_id", None):
+        return None
+    try:
+        from sreda.services.housewife_persona import get_persona_preset
+        return get_persona_preset(
+            session, tenant_id=action.tenant_id, user_id=pf.user_id,
+        )
+    except Exception:  # noqa: BLE001 — тон не стоит ошибки хода
+        logger.warning("planner_chat: persona preset read failed", exc_info=True)
+        return None
+
+
 def _history_snapshots(messages: list[Any], limit: int = 6) -> tuple:
     """Дословные пары (юзер/среда) из preflight-сообщений → TurnSnapshot'ы.
 
@@ -281,6 +296,7 @@ async def run_planner_chat_loop(
                     user_message=pf.user_text,
                     locale="ru-RU",
                     timezone="Europe/Moscow",
+                    persona_preset=_persona_preset_or_none(session, action, pf),
                 )),
                 # тот же снимок, что видел планировщик при валидации (Codex R1
                 # MINOR: хэш «на момент сборки» делает проверку гонки тавтологией)
