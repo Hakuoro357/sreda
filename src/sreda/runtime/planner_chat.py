@@ -114,7 +114,12 @@ def _persona_preset_or_none(session: Any, action: Any, pf: Any) -> str | None:
         return None
 
 
-def _history_snapshots(messages: list[Any], limit: int = 6) -> tuple:
+# #124 (Codex R1 medium CRITICAL): было limit=6 — прод обрезал историю
+# ДО блока ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА, и 10 надиктованных пунктов физически
+# не доходили (тест блока зелёный, прод-путь другой). Поднято до 10 —
+# совпадает с budget.max_recent_utterances; _render_history режет
+# отдельно своим max_history_turns.
+def _history_snapshots(messages: list[Any], limit: int = 10) -> tuple:
     """Дословные пары (юзер/среда) из preflight-сообщений → TurnSnapshot'ы.
 
     Берём те же данные, что видит легаси (без повторного чтения базы):

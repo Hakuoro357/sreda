@@ -603,7 +603,6 @@ def _render_history(
 def build_recent_utterances_block(
     *,
     closed_turns: list[TurnSnapshot],
-    current_user_message: str | None = None,
     max_utterances: int = 10,
     max_utterance_chars: int = 180,
     max_block_chars: int = 2_100,
@@ -615,17 +614,19 @@ def build_recent_utterances_block(
     выводит только ``summary``, поэтому надиктованные пункты не доходят до
     планировщика. Здесь — отдельный блок именно user-реплик.
 
-    Текущий ход (``current_user_message``) ИСКЛЮЧАЕТСЯ: его обрабатывает
-    отдельная ветка гейта (срез 2). Обрезка «новее важнее» — берём хвост.
+    Текущий ход исключён ПО КОНТРАКТУ источника: ``closed_turns`` —
+    это ЗАКРЫТЫЕ ходы (пары юзер+среда), текущее сообщение в них не
+    входит. Codex R1 (оба) MAJOR: текстовое исключение было контент-
+    дедупом и теряло легитимно повторённый пункт («Хлеб» дважды) —
+    убрано. Обрезка «новее важнее» — берём хвост.
     """
-    norm_current = (current_user_message or "").strip()
     utterances: list[str] = []
     for turn in closed_turns:
         for msg in turn.messages:
             if msg.role != "юзер":
                 continue
             text = (msg.text or "").strip()
-            if not text or text == norm_current:
+            if not text:
                 continue
             utterances.append(text[:max_utterance_chars])
     if not utterances:
@@ -638,9 +639,11 @@ def build_recent_utterances_block(
     lines.extend(f"- {u}" for u in recent)
     out = "\n".join(lines)
     if len(out) > max_block_chars:
-        # детерминированно: режем с НАЧАЛА (новые реплики важнее)
-        out = "[… начало опущено по бюджету]\n" + \
-            out[-(max_block_chars - 40):]
+        # детерминированно: режем с НАЧАЛА (новые реплики важнее).
+        # tail >=0 даже при крошечном бюджете (R2: бюджет может быть ~0).
+        marker = "[… начало опущено по бюджету]\n"
+        tail = max(0, max_block_chars - len(marker))
+        out = marker + out[-tail:] if tail else out[:max_block_chars]
     return out
 
 
@@ -684,23 +687,38 @@ def build_variable_suffix(
             max_closed_turns=budget.max_history_turns,
         ),
     )
-    # #124: детерминированный блок последних реплик юзера (источник для
-    # сбора надиктованного). Текущее сообщение исключаем.
-    recent_block = fence_untrusted(
-        "ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА",
-        build_recent_utterances_block(
-            closed_turns=closed_turns,
-            current_user_message=user_message,
-            max_utterances=budget.max_recent_utterances,
-            max_utterance_chars=budget.max_recent_utterance_chars,
-            max_block_chars=budget.max_recent_utterances_block_chars,
-        ),
-    )
     now_block = "МОМЕНТ:\n" + now.render()
 
     user_block = fence_untrusted(
         "ТЕКУЩЕЕ_СООБЩЕНИЕ",
         f"Текст: {user_message}",
+    )
+
+    # #124: детерминированный блок последних реплик юзера (источник для
+    # сбора надиктованного). Codex R1 (оба) MAJOR: сумма секций могла
+    # превышать max_suffix_chars и кидать PromptBudgetExceeded на входах,
+    # каждый из которых в своём cap'е. Рендерим блок из ОСТАВШЕГОСЯ
+    # бюджета суффикса (после обязательных блоков) — деградация (меньше
+    # реплик/пусто), а не отказ хода.
+    _required = [profile_block, memories_block, history_block, now_block,
+                 user_block]
+    if voice_meta and voice_meta.is_voice:
+        _required_overhead = 200  # запас на VOICE_META, добавится ниже
+    else:
+        _required_overhead = 0
+    _used = sum(len(b) for b in _required) + 6 * len("\n\n") \
+        + _required_overhead
+    _recent_budget = max(
+        0, min(budget.max_recent_utterances_block_chars,
+               budget.max_suffix_chars - _used - 64))  # 64 на рамку fence
+    recent_block = fence_untrusted(
+        "ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА",
+        build_recent_utterances_block(
+            closed_turns=closed_turns,
+            max_utterances=budget.max_recent_utterances,
+            max_utterance_chars=budget.max_recent_utterance_chars,
+            max_block_chars=_recent_budget,
+        ) if _recent_budget > 0 else "_(опущено по бюджету)_",
     )
 
     # R2 fix (Codex MINOR): voice_meta gets its OWN labelled fenced
