@@ -140,3 +140,33 @@ def test_recent_block_omitted_when_no_room() -> None:
     )
     assert len(suffix) <= budget.max_suffix_chars
     # секция могла быть опущена — это легально; падать не должно
+
+
+
+def test_empty_block_respects_tiny_budget() -> None:
+    """Codex R3 (оба): пустой результат не превышает max_block_chars."""
+    assert build_recent_utterances_block(closed_turns=[], max_block_chars=3) == ""
+    assert build_recent_utterances_block(
+        closed_turns=[], max_block_chars=50) == "_(пусто)_"
+
+
+def test_no_utterances_tight_boundary_no_overflow() -> None:
+    """Узкая граница БЕЗ user-реплик: суффикс не превышает cap и не падает."""
+    from sreda.runtime.planner.prompt_builder import (
+        MemorySnapshot, PromptBudget, TurnMessage, TurnSnapshot,
+    )
+    budget = PromptBudget()
+    memories = [MemorySnapshot(content="m" * 290, source="memory:core",
+                               score=0.9) for _ in range(5)]
+    closed = [TurnSnapshot(turn_id=f"t{i}", started_at="2026-06-12T10:00:00",
+                           summary=None,
+                           messages=[TurnMessage(role="среда", text="ок",
+                                                 ts="2026-06-12T10:00:00")])
+              for i in range(5)]
+    suffix = build_variable_suffix(
+        profile=ProfileSnapshot(address="ты"),
+        memories=memories, active_turn=None, closed_turns=closed,
+        now=NowMoment(__import__("datetime").datetime(2026, 6, 12, 10, 0)),
+        user_message="х" * (budget.max_user_message_chars - 200),
+    )
+    assert len(suffix) <= budget.max_suffix_chars

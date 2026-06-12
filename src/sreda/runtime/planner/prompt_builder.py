@@ -630,7 +630,9 @@ def build_recent_utterances_block(
                 continue
             utterances.append(text[:max_utterance_chars])
     if not utterances:
-        return "_(пусто)_"
+        # R3 (оба): пустой результат тоже обязан уважать max_block_chars —
+        # иначе на узкой границе «_(пусто)_» (9 симв.) толкал суффикс за cap
+        return "_(пусто)_" if len("_(пусто)_") <= max_block_chars else ""
     recent = utterances[-max_utterances:]
     skipped = len(utterances) - len(recent)
     lines: list[str] = []
