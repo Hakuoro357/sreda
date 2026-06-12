@@ -19,17 +19,37 @@ import pytest_asyncio
 
 # --- запрет внешней сети на ВСЮ сюиту (чеклист п.8) ------------------------
 
+# Субагент R1 MAJOR (доказано запуском): ProactorEventLoop (дефолт Windows)
+# соединяется через ConnectEx МИМО socket.connect — форсируем selector-loop
+# на всю сюиту, гард снова ловит async-соединения.
+if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+    @pytest.fixture(scope="session")
+    def event_loop_policy():
+        return asyncio.WindowsSelectorEventLoopPolicy()
+
+
+_ALLOWED_HOSTS = ("127.0.0.1", "::1", "localhost", "test")
+
+
 @pytest.fixture(autouse=True)
 def _no_external_network(monkeypatch):
     real_connect = socket.socket.connect
+    real_gai = socket.getaddrinfo
 
     def guarded(self, addr):
         host = addr[0] if isinstance(addr, tuple) else str(addr)
-        if str(host) not in ("127.0.0.1", "::1", "localhost"):
+        if str(host) not in _ALLOWED_HOSTS:
             raise AssertionError(f"внешняя сеть запрещена в functional: {addr!r}")
         return real_connect(self, addr)
 
+    def guarded_gai(host, *a, **kw):
+        # резолв чужих имён — тоже наружу (субагент: getaddrinfo не ловился)
+        if str(host) not in _ALLOWED_HOSTS:
+            raise AssertionError(f"DNS наружу запрещён в functional: {host!r}")
+        return real_gai(host, *a, **kw)
+
     monkeypatch.setattr(socket.socket, "connect", guarded)
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_gai)
 
 
 # --- фейковый ТГ-клиент (повышен из test_housewife_persona_callbacks) ------
@@ -206,6 +226,11 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(bm, "send_admin_alert",
                         lambda *a, **kw: alerts.append((a, kw)),
                         raising=False)
+    # note_breakdown импортирует send_admin_alert ВНУТРИ функции из
+    # admin_alerts (Codex R1 high) — глушим и первоисточник
+    import sreda.services.admin_alerts as aa
+    monkeypatch.setattr(aa, "send_admin_alert",
+                        lambda *a, **kw: alerts.append((a, kw)))
 
     # стаб НИЖНЕГО вызова рта (реальный composer работает) — пишет, что
     # до него дошло, и возвращает детерминированный текст с фактами
@@ -232,6 +257,8 @@ def harness(monkeypatch, tmp_path):
         return t
 
     monkeypatch.setattr(ti, "_create_task", tracking_create_task)
+    import sreda.services.max_inbound as mi
+    monkeypatch.setattr(mi, "_create_task", tracking_create_task)
 
     h = SimpleNamespace(
         tg=fake_tg, alerts=alerts, voice_calls=voice_calls,
@@ -239,6 +266,7 @@ def harness(monkeypatch, tmp_path):
         tenant=TENANT, chat_id=CHAT_ID,
     )
     yield h
+    engine.dispose()  # Codex R1 (оба): WAL/SHM-хэндлы Windows
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -308,6 +336,11 @@ async def run_turn(harness):
         if pending:
             done, not_done = await asyncio.wait(pending, timeout=5)
             assert not not_done, f"незавершённые задачи хода: {not_done}"
+        # Codex R1 high: упавшая УЖЕ-done задача не должна проходить тихо
+        for t in harness.tracked_tasks:
+            assert not t.cancelled(), f"задача хода отменена: {t}"
+            exc = t.exception()
+            assert exc is None, f"задача хода упала: {t} -> {exc!r}"
         assert guard_called["v"], (
             f"записанный планировщик не был вызван; sends="
             f"{harness.tg.final_texts!r} edits="
@@ -334,10 +367,29 @@ def assert_happy_invariants(harness, *, must_contain=()):
         assert leak not in final, f"утечка «{leak}» в ответе: {final!r}"
     from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
     assert final not in BREAKDOWN_POOL, "happy-путь отдал «поломку»"
+    # ровно ОДИН финальный ответ: либо одна правка ack, либо один non-ack send
+    finals = len(harness.tg.edits) + max(0, len(harness.tg.sends) - 1)
+    assert finals == 1, (
+        f"финальных сообщений {finals} (edits={len(harness.tg.edits)}, "
+        f"sends={len(harness.tg.sends)}) — должен быть ровно один"
+    )
+    # рот (нижний вызов) обязан был участвовать и видеть факты (#121)
+    assert harness.voice_calls, "humanize-рот не вызывался на happy-пути"
+    vc = harness.voice_calls[-1]
+    assert vc.get("llm_prompt_key") == "humanize_result"
+    vc_payload = json.dumps(vc.get("template_data", {}), ensure_ascii=False)
+    for needle in must_contain:
+        assert needle in vc_payload, f"факт «{needle}» не дошёл до рта"
     sess = db_session(harness)
     try:
-        from sreda.db.models.core import InboundMessage
+        from sreda.db.models.core import InboundMessage, OutboxMessage
         rows = sess.query(InboundMessage).all()
         assert rows and all(r.processing_status == "processed" for r in rows)
+        ob = sess.query(OutboxMessage).all()
+        assert ob, "outbox пуст на happy-пути"
+        assert all(o.status == "sent" for o in ob), (
+            f"outbox-статусы: {[o.status for o in ob]}"
+        )
+        assert len(ob) == 1, f"дубль в outbox: {len(ob)} строк"
     finally:
         sess.close()

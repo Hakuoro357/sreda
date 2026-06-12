@@ -10,6 +10,28 @@ from tests.functional.conftest import (  # noqa: F401
 )
 
 
+import contextlib
+import logging as _logging
+
+
+@contextlib.contextmanager
+def _caplog_ctx():
+    """Захват записей sreda-логгеров без pytest-фикстуры (async-тесты)."""
+    records: list = []
+
+    class _H(_logging.Handler):
+        def emit(self, record):  # noqa: ANN001
+            records.append(record)
+
+    h = _H(level=_logging.WARNING)
+    root = _logging.getLogger()
+    root.addHandler(h)
+    try:
+        yield records
+    finally:
+        root.removeHandler(h)
+
+
 def _plan_one_step(tool: str, args: dict, compose: dict,
                    match: dict | None = None) -> dict:
     return {
@@ -74,17 +96,19 @@ async def test_checklists_show_lists_item_names(harness, run_turn) -> None:
     assert_happy_invariants(
         harness, must_contain=("Полить рассаду", "Купить шланг"),
     )
-    # «Обрабатываю…» не висит: каждый ack либо удалён, либо отредактирован
-    ack_mids = [s["_mid"] for s in harness.tg.sends
-                if s is harness.tg.sends[0]]
-    if ack_mids:
-        finalized = (
-            {d.get("message_id") for d in harness.tg.deletes}
-            | {e.get("message_id") for e in harness.tg.edits}
-        )
-        assert set(ack_mids) <= finalized or len(harness.tg.sends) >= 2, (
-            "ack-сообщение осталось висеть без финализации"
-        )
+    # «Обрабатываю…» не висит: ack (первый send) ОБЯЗАН быть отредактирован
+    # или удалён — без люков (Codex R1 medium + субагент: ветка
+    # `or len(sends)>=2` пропускала ровно регрессию «финал новым сообщением,
+    # ack висит»)
+    assert harness.tg.sends, "ack не отправлялся"
+    ack_mid = harness.tg.sends[0]["_mid"]
+    finalized = (
+        {d.get("message_id") for d in harness.tg.deletes}
+        | {e.get("message_id") for e in harness.tg.edits}
+    )
+    assert ack_mid in finalized, (
+        f"ack message_id={ack_mid} не финализирован (deletes/edits: {finalized})"
+    )
 
 
 @pytest.mark.asyncio
@@ -96,13 +120,19 @@ async def test_invalid_plan_retry_exhausted_visible(harness, run_turn) -> None:
 
     queue = make_planner_queue("это не json", "{однозначно мусор")
     logging.disable(logging.NOTSET)
-    await run_turn("покажи дела", queue, update_id=2)
+    import pytest as _pytest
+    with _caplog_ctx() as records:
+        await run_turn("покажи дела", queue, update_id=2)
     assert queue.calls["n"] >= 2, "повтор невалидного плана не случился"
     final = harness.tg.user_visible_final
     assert final, "пользователь остался без ответа"
     pool_or_fallback = final in BREAKDOWN_POOL or "не получилось" in final.lower()
     assert pool_or_fallback, f"отказ не честный: {final!r}"
     assert harness.alerts, "сбой плана обязан алертить владельцу"
+    assert any(r.levelno >= logging.WARNING and r.name.startswith("sreda")
+               for r in records), (
+        "провал плана обязан быть записан в наш лог (WARNING/ERROR)"
+    )
 
 
 @pytest.mark.asyncio
@@ -152,3 +182,37 @@ async def test_compose_breakdown_visible(harness, run_turn, caplog) -> None:
         assert any("ПОЛОМКА" in r.message for r in caplog.records), (
             "показ «поломки» обязан фиксироваться ERROR-логом"
         )
+
+
+
+@pytest.mark.asyncio
+async def test_network_ban_blocks_external_http(harness) -> None:
+    """Чеклист п.8: тест блокировщика — наружу нельзя (включая DNS)."""
+    import httpx
+    with pytest.raises((AssertionError, httpx.ConnectError, httpx.TransportError)):
+        async with httpx.AsyncClient(timeout=2) as c:
+            await c.get("http://example.com/")
+
+
+@pytest.mark.asyncio
+async def test_reminder_create_persists_and_replies(harness, run_turn) -> None:
+    """Фаза A: write-семейство — напоминание создано В БД, имя и время
+    в ответе (явная дата в args: механизм, не разбор времени)."""
+    plan = _plan_one_step(
+        "schedule_reminder",
+        {"title": "Полить рассаду", "trigger_iso": "2027-07-01T09:00:00+03:00"},
+        {"kind": "template", "template_id": "reminder_set_ok",
+         "template_data": {"when_phrase": "1 июля в 9:00",
+                            "what": "Полить рассаду"}},
+        match={"status": "scheduled"},
+    )
+    await run_turn("напомни полить рассаду", make_planner_queue(plan),
+                   update_id=5)
+    assert_happy_invariants(harness, must_contain=("Полить рассаду",))
+    sess = db_session(harness)
+    try:
+        from sreda.db.models.housewife import FamilyReminder
+        rows = sess.query(FamilyReminder).all()
+        assert len(rows) == 1 and "рассад" in (rows[0].title or "")
+    finally:
+        sess.close()
