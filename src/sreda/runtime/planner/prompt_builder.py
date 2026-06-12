@@ -101,6 +101,11 @@ class PromptBudget:
     max_memories_chars: int = 1_500
     max_memories_count: int = 5
     max_history_turns: int = 5
+    # #124: блок последних реплик юзера (детерминированный источник для
+    # сбора надиктованного). 10 реплик ×180 + рамка ≈300 = ≤2100 (план r3).
+    max_recent_utterances: int = 10
+    max_recent_utterance_chars: int = 180
+    max_recent_utterances_block_chars: int = 2_100
     # Token estimation — char count / chars_per_token. Approximate, used
     # only for logging. Russian + JSON mix at mimo-v2.5-pro lands around
     # 3.0 chars/token empirically. NOT enforced.
@@ -595,6 +600,50 @@ def _render_history(
     return out or "_(пусто)_"
 
 
+def build_recent_utterances_block(
+    *,
+    closed_turns: list[TurnSnapshot],
+    current_user_message: str | None = None,
+    max_utterances: int = 10,
+    max_utterance_chars: int = 180,
+    max_block_chars: int = 2_100,
+) -> str:
+    """#124: последние ≤N реплик ЮЗЕРА из закрытых ходов — детерминированный
+    источник для сбора надиктованного.
+
+    Корень (Codex R1 CRITICAL): ``_render_history`` для закрытых ходов
+    выводит только ``summary``, поэтому надиктованные пункты не доходят до
+    планировщика. Здесь — отдельный блок именно user-реплик.
+
+    Текущий ход (``current_user_message``) ИСКЛЮЧАЕТСЯ: его обрабатывает
+    отдельная ветка гейта (срез 2). Обрезка «новее важнее» — берём хвост.
+    """
+    norm_current = (current_user_message or "").strip()
+    utterances: list[str] = []
+    for turn in closed_turns:
+        for msg in turn.messages:
+            if msg.role != "юзер":
+                continue
+            text = (msg.text or "").strip()
+            if not text or text == norm_current:
+                continue
+            utterances.append(text[:max_utterance_chars])
+    if not utterances:
+        return "_(пусто)_"
+    recent = utterances[-max_utterances:]
+    skipped = len(utterances) - len(recent)
+    lines: list[str] = []
+    if skipped > 0:
+        lines.append(f"[… {skipped} более старых реплик опущено]")
+    lines.extend(f"- {u}" for u in recent)
+    out = "\n".join(lines)
+    if len(out) > max_block_chars:
+        # детерминированно: режем с НАЧАЛА (новые реплики важнее)
+        out = "[… начало опущено по бюджету]\n" + \
+            out[-(max_block_chars - 40):]
+    return out
+
+
 def build_variable_suffix(
     *,
     profile: ProfileSnapshot,
@@ -635,6 +684,18 @@ def build_variable_suffix(
             max_closed_turns=budget.max_history_turns,
         ),
     )
+    # #124: детерминированный блок последних реплик юзера (источник для
+    # сбора надиктованного). Текущее сообщение исключаем.
+    recent_block = fence_untrusted(
+        "ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА",
+        build_recent_utterances_block(
+            closed_turns=closed_turns,
+            current_user_message=user_message,
+            max_utterances=budget.max_recent_utterances,
+            max_utterance_chars=budget.max_recent_utterance_chars,
+            max_block_chars=budget.max_recent_utterances_block_chars,
+        ),
+    )
     now_block = "МОМЕНТ:\n" + now.render()
 
     user_block = fence_untrusted(
@@ -646,7 +707,8 @@ def build_variable_suffix(
     # block so the planner's policy section can refer to "voice_meta"
     # consistently instead of having voice metadata smuggled inside
     # ТЕКУЩЕЕ_СООБЩЕНИЕ. Block is only emitted when message is voice.
-    sections = [profile_block, memories_block, history_block, now_block]
+    sections = [profile_block, memories_block, history_block,
+                recent_block, now_block]
     if voice_meta and voice_meta.is_voice:
         voice_content = (
             f"is_voice: true\n"
