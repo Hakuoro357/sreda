@@ -20,6 +20,21 @@ def _utc(y, mo, d, h=0) -> datetime:
     return datetime(y, mo, d, h, tzinfo=timezone.utc)
 
 
+# #105: формула кредитов даёт off-peak-скидку 0.8 в окне 16:00–24:00 UTC.
+# Тесты считают точные кредиты по пиковому rate (×2 без скидки), поэтому
+# замораживаем budget._utcnow на ПИК — иначе после 16:00 UTC «бомба»
+# (480 вместо 600). Замысел тестов — проверять rate, не время суток.
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _freeze_budget_clock_to_peak(monkeypatch):
+    import sreda.services.budget as _b
+    monkeypatch.setattr(
+        _b, "_utcnow",
+        lambda: datetime(2026, 6, 12, 10, 0, tzinfo=timezone.utc))
+
+
 @pytest.fixture()
 def session():
     engine = create_engine("sqlite:///:memory:")
