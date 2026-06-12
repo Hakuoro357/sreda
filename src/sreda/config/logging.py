@@ -88,7 +88,12 @@ def _build_config(
         "version": 1,
         "disable_existing_loggers": False,
         "formatters": {
+            # #95: фабрика — редактирующий форматтер (финальная строка,
+            # включая traceback/stack). Прописан В КОНФИГЕ, поэтому
+            # покрывает все хендлеры И копию cfg, которую переприменяет
+            # uvicorn (Codex R1: пост-фактум фильтр на root этого не давал).
             "default": {
+                "()": "sreda.config.log_redaction.RedactingFormatter",
                 "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
                 "datefmt": "%Y-%m-%d %H:%M:%S",
             },

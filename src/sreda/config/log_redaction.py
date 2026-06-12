@@ -12,9 +12,12 @@ from __future__ import annotations
 import logging
 import re
 
-# Telegram bot-токен в URL: bot<id>:<secret>/method
+# Telegram bot-токен: URL-форма bot<id>:<secret> И сырая <id>:<secret>
+# (Codex R1: конфиг-ошибки/env могут логировать токен без префикса).
 # id — 6+ цифр, secret — base64url-подобный, 20+ символов.
-_BOT_TOKEN_RE = re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}")
+_BOT_TOKEN_RE = re.compile(
+    r"bot\d{6,}:[A-Za-z0-9_-]{20,}"          # URL-форма
+    r"|(?<![A-Za-z0-9_-])\d{6,}:[A-Za-z0-9_-]{20,}")  # сырая форма
 _REDACTED = "bot<redacted>"
 
 
@@ -24,6 +27,19 @@ def redact_secrets(text: str) -> str:
     if not text:
         return text
     return _BOT_TOKEN_RE.sub(_REDACTED, text)
+
+
+class RedactingFormatter(logging.Formatter):
+    """Редактирует ФИНАЛЬНУЮ отформатированную строку записи — покрывает
+    msg%args, traceback из exc_info и stack_info разом (Codex R1: фильтры
+    выполняются ДО форматтера, exc_text строится позже)."""
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+        out = super().format(record)
+        try:
+            return redact_secrets(out)
+        except Exception:  # noqa: BLE001 — форматтер не роняет логи
+            return out
 
 
 class SecretRedactingFilter(logging.Filter):

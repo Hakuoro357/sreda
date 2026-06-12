@@ -75,3 +75,57 @@ def test_configure_logging_attaches_filter() -> None:
     finally:
         lg.removeHandler(h)
     assert _TOKEN not in buf.getvalue()
+
+
+def test_raw_token_without_bot_prefix_redacted() -> None:
+    """Codex R1: сырая форма <id>:<secret> (конфиг/env в логе)."""
+    raw = "token=8123456:AA_super_secret_token_DO_NOT_LOG_xx oops"
+    out = redact_secrets(raw)
+    assert "AA_super_secret" not in out
+
+
+def test_real_logger_exception_traceback_redacted() -> None:
+    """Codex R1 CRITICAL-путь: настоящий logger.exception — traceback
+    строится форматтером ИЗ exc_info ПОСЛЕ фильтров; редактирует
+    RedactingFormatter на финальной строке."""
+    import io as _io
+
+    from sreda.config.log_redaction import RedactingFormatter
+    buf = _io.StringIO()
+    h = logging.StreamHandler(buf)
+    h.setFormatter(RedactingFormatter("%(levelname)s %(message)s"))
+    lg = logging.getLogger("sreda.test.exc_redaction")
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+    try:
+        try:
+            raise RuntimeError(f"connect failed for {_URL}")
+        except RuntimeError:
+            lg.exception("poller iteration error")
+        import traceback as _tb  # stack_info-путь тем же форматтером
+        lg.warning("with stack %s", _URL, stack_info=True)
+    finally:
+        lg.removeHandler(h)
+    blob = buf.getvalue()
+    assert _TOKEN not in blob, "токен утёк через traceback/stack"
+    assert "bot<redacted>" in blob
+
+
+def test_heartbeat_truncation_after_redaction() -> None:
+    """Обрезка не должна резать токен в неузнаваемый хвост."""
+    from sreda.workers.telegram_long_poll import LAST_ERROR_MAX_CHARS
+    long_prefix = "x" * (LAST_ERROR_MAX_CHARS - 20)
+    s = redact_secrets(long_prefix + _URL)[:LAST_ERROR_MAX_CHARS]
+    assert _TOKEN[:12] not in s
+
+
+def test_configured_default_formatter_redacts() -> None:
+    """Форматтер из dictConfig — редактирующий (покрывает uvicorn-копию)."""
+    import io as _io
+
+    from sreda.config.log_redaction import RedactingFormatter
+    from sreda.config.logging import configure_logging
+    configure_logging("INFO")
+    root = logging.getLogger()
+    assert any(isinstance(h.formatter, RedactingFormatter)
+               for h in root.handlers if h.formatter is not None)
