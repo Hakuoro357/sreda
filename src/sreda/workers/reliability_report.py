@@ -269,16 +269,29 @@ class ReliabilityReportWorker:
         return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
 
     def _read_state(self) -> dict:
+        # high R3: основной может быть ЧИТАЕМ, но устаревшим (записи шли
+        # в запасной) — читаем оба и берём свежайший по отметкам времени
+        candidates: list[dict] = []
         for path in (self.state_file, self.fallback_state_file):
             try:
                 if not path.exists():
                     continue
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    return data
+                    candidates.append(data)
             except (json.JSONDecodeError, ValueError, OSError):
                 continue
-        return {}
+        if not candidates:
+            return {}
+
+        def freshness(d: dict):
+            stamps = [self._parse_ts(d.get(k))
+                      for k in ("last_run_at", "last_failure_at")]
+            stamps = [t for t in stamps if t is not None]
+            return max(stamps) if stamps else datetime.min.replace(
+                tzinfo=timezone.utc)
+
+        return max(candidates, key=freshness)
 
     def _write_state(self, state: dict) -> bool:
         payload = json.dumps(state, ensure_ascii=False)

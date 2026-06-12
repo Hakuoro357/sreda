@@ -263,3 +263,20 @@ def test_breakdown_scans_rotated_log(tmp_path: Path) -> None:
         since=datetime(2026, 6, 12, 0, 0, tzinfo=timezone.utc),
         until=datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc))
     assert n == 2
+
+
+def test_stale_readable_primary_does_not_shadow_fallback(tmp_path: Path) -> None:
+    """Codex R3 high: основной читаем, но устарел (записи шли в запасной)
+    → чтение берёт свежайший state, повторной отправки нет."""
+    w = ReliabilityReportWorker(MagicMock(),
+                                state_file=str(tmp_path / "st.json"))
+    w.fallback_state_file = tmp_path / "fb.json"
+    today = datetime.now(timezone.utc)
+    (tmp_path / "st.json").write_text(json.dumps(
+        {"last_run_at": (today - timedelta(days=3)).isoformat()}),
+        encoding="utf-8")
+    w.fallback_state_file.write_text(json.dumps(
+        {"last_run_at": today.isoformat()}), encoding="utf-8")
+    state = w._read_state()
+    assert state["last_run_at"] == today.isoformat()
+    assert not w._should_run(today, state), "сегодня уже отправлено (fallback)"
