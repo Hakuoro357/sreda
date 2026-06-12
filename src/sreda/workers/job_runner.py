@@ -19,6 +19,7 @@ from sreda.workers.message_dispatcher import process_pending as process_message_
 from sreda.workers.onboarding_aha_worker import OnboardingAhaWorker
 from sreda.workers.outbox_delivery import OutboxDeliveryWorker
 from sreda.workers.proactive_events import ProactiveEventWorker
+from sreda.workers.reliability_report import ReliabilityReportWorker
 from sreda.workers.retention_worker import RetentionWorker
 from sreda.workers.skill_platform_processor import SkillPlatformJobProcessor
 
@@ -83,7 +84,6 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         retention = RetentionWorker(session)
         # #139: суточная сводка надёжности (этап 0 программы) — тот же
         # каденс-паттерн (state-файл, раз в сутки, откат после провала)
-        from sreda.workers.reliability_report import ReliabilityReportWorker
         reliability = ReliabilityReportWorker(session)
 
         # Order matters: proactive & housewife workers fill outbox →

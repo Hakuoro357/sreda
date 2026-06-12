@@ -140,3 +140,83 @@ async def test_reliability_report_backoff(tmp_path: Path, monkeypatch) -> None:
     assert await w2.process_pending() == 0
     assert await w2.process_pending() == 0
     assert boom.call_count == 1, "повтор до отката — шторм"
+
+
+def test_kpi_zero_turns_with_failures_is_alarm() -> None:
+    """Codex R1 medium: сигналы без ходов ≠ «100% чистых»."""
+    counts = SimpleNamespace(turns_total=0, runs_failed=0, inbound_stuck=2,
+                             outbox_failed=0, breakdowns_shown=0)
+    text = format_report(counts, [{"date": "2026-06-12", "total": 0,
+                                   "failures": 2}])
+    assert "0.0%" in text and "ниже порога" in text
+
+
+def test_kpi_clamp_failures_above_total() -> None:
+    """Субагент: классы пересекаются — провалов может быть больше ходов."""
+    counts = SimpleNamespace(turns_total=1, runs_failed=1, inbound_stuck=1,
+                             outbox_failed=1, breakdowns_shown=1)
+    text = format_report(counts, [{"date": "2026-06-12", "total": 1,
+                                   "failures": 4}])
+    assert "0.0%" in text  # clamp: не уходит в минус
+
+
+def test_history_dedupe_and_calendar_window(tmp_path: Path, monkeypatch) -> None:
+    """Субагент (мутация показала дыру): повтор той же даты не задваивает
+    день; окно — календарные 14 дней, не «последние 14 записей»."""
+    sent: list = []
+    monkeypatch.setattr(rr_module, "send_admin_alert",
+                        lambda *a, **kw: sent.append(a))
+    from sreda.workers.reliability_report import DayCounts
+    monkeypatch.setattr(rr_module, "gather_day_counts",
+                        MagicMock(return_value=DayCounts(5, 0, 0, 0, 0)))
+    monkeypatch.setattr(rr_module, "count_breakdown_lines",
+                        MagicMock(return_value=0))
+    state = tmp_path / "st.json"
+    today = datetime.now(timezone.utc).date()
+    old = (today - timedelta(days=30)).isoformat()
+    state.write_text(json.dumps({
+        "history": [
+            {"date": old, "total": 9, "failures": 9},          # старше окна
+            {"date": today.isoformat(), "total": 1, "failures": 1},  # дубль дня
+        ],
+    }), encoding="utf-8")
+    w = ReliabilityReportWorker(MagicMock(), state_file=str(state))
+    import asyncio as _a
+    assert _a.get_event_loop_policy() is not None
+    assert _a.run(w.process_pending()) == 1
+    data = json.loads(state.read_text(encoding="utf-8"))
+    dates = [h["date"] for h in data["history"]]
+    assert dates.count(today.isoformat()) == 1, "дубль дня в истории"
+    assert old not in dates, "запись старше 14 календарных дней не вычищена"
+    assert data["history"][-1]["total"] == 5  # свежий прогон победил
+
+
+def test_breakdown_glob_scans_all_logs(tmp_path: Path) -> None:
+    """Субагент CRITICAL: поломки пишут РАЗНЫЕ процессы — glob по всем."""
+    from sreda.workers.reliability_report import count_breakdown_lines
+    (tmp_path / "telegram-poller.log").write_text(
+        "2026-06-12 06:00:00 ERROR x ПОЛОМКА показана пользователю: a\n",
+        encoding="utf-8")
+    (tmp_path / "job-runner.log").write_text(
+        "2026-06-12 06:30:00 ERROR x ПОЛОМКА показана пользователю: b\n"
+        "мусор без даты ПОЛОМКА показана пользователю: не считаем\n",
+        encoding="utf-8")
+    n = count_breakdown_lines(
+        str(tmp_path / "*.log"),
+        since=datetime(2026, 6, 12, 0, 0, tzinfo=timezone.utc),
+        until=datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc))
+    assert n == 2  # обе из двух логов; строка без даты НЕ учтена
+
+
+def test_breakdown_msk_timestamps_converted(tmp_path: Path) -> None:
+    """Субагент MAJOR: лог в MSK — 23:30 MSK 11-го = 20:30 UTC 11-го,
+    в окно «12-е UTC» не попадает; 02:00 MSK 12-го = 23:00 UTC 11-го."""
+    from sreda.workers.reliability_report import count_breakdown_lines
+    (tmp_path / "a.log").write_text(
+        "2026-06-12 02:00:00 ERROR x ПОЛОМКА показана пользователю: y\n",
+        encoding="utf-8")
+    in_11th_utc = count_breakdown_lines(
+        str(tmp_path / "*.log"),
+        since=datetime(2026, 6, 11, 0, 0, tzinfo=timezone.utc),
+        until=datetime(2026, 6, 12, 0, 0, tzinfo=timezone.utc))
+    assert in_11th_utc == 1, "02:00 MSK 12-го — это ещё 11-е UTC"

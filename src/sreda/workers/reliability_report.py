@@ -22,7 +22,9 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from glob import glob as _glob
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
@@ -33,14 +35,21 @@ from sreda.services.admin_alerts import send_admin_alert
 
 logger = logging.getLogger("sreda.reliability")
 
-DEFAULT_STATE_FILE = "/tmp/sreda-reliability-report-state.json"
-DEFAULT_LOG_PATH = "/var/log/sreda/job-runner.log"
+# state — САМА метрика (история KPI), /tmp стирается ребутом (субагент R1)
+DEFAULT_STATE_FILE = "/var/lib/sreda/reliability-state.json"
+# поломки пишут ВСЕ процессы (поллер/uvicorn/job-runner) — каждый в свой
+# лог (субагент R1 CRITICAL: интерактивные ходы идут в поллере)
+DEFAULT_LOG_GLOB = "/var/log/sreda/*.log"
 REPORT_WINDOW = timedelta(hours=24)
 STUCK_GRACE = timedelta(minutes=10)
 FAILURE_BACKOFF = timedelta(minutes=30)
 KPI_DAYS = 14
 KPI_THRESHOLD_PCT = 95.0
+ALERT_AFTER_CONSECUTIVE_FAILURES = 3
 _BREAKDOWN_MARKER = "ПОЛОМКА показана пользователю"
+# логи пишутся локальным временем сервера (config/logging.py, datefmt
+# без tz) — операционная зона проекта MSK
+_LOG_TZ = ZoneInfo("Europe/Moscow")
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,7 @@ def _count(session: Session, stmt) -> int:
 
 def gather_day_counts(
     session: Session, *, now: datetime, log_path: str | None = None,
+    breakdowns_precounted: int | None = None,
 ) -> DayCounts:
     since = now - REPORT_WINDOW
     turns_total = _count(session, select(func.count(AgentRun.id)).where(
@@ -72,9 +82,11 @@ def gather_day_counts(
     runs_failed = _count(session, select(func.count(AgentRun.id)).where(
         and_(AgentRun.created_at >= since, AgentRun.created_at < now,
              AgentRun.status == "failed")))
+    # окно сдвинуто целиком на grace — иначе последние 10 минут каждых
+    # суток не проверяются никогда (субагент R1 MINOR)
     inbound_stuck = _count(
         session, select(func.count(InboundMessage.id)).where(and_(
-            InboundMessage.created_at >= since,
+            InboundMessage.created_at >= since - STUCK_GRACE,
             InboundMessage.created_at < now - STUCK_GRACE,
             InboundMessage.processing_status.notin_(("processed", "ignored")),
         )))
@@ -84,44 +96,65 @@ def gather_day_counts(
             OutboxMessage.created_at < now,
             OutboxMessage.status == "failed",
         )))
-    breakdowns = _count_breakdown_lines(
-        log_path or DEFAULT_LOG_PATH, since=since, until=now)
+    breakdowns = (breakdowns_precounted if breakdowns_precounted is not None
+                  else count_breakdown_lines(
+                      log_path or DEFAULT_LOG_GLOB, since=since, until=now))
     return DayCounts(turns_total, runs_failed, inbound_stuck,
                      outbox_failed, breakdowns)
 
 
-def _count_breakdown_lines(
-    log_path: str, *, since: datetime, until: datetime,
+def count_breakdown_lines(
+    log_glob: str, *, since: datetime, until: datetime,
 ) -> int:
-    """Считаем маркер по датам в начале строк. Лог недоступен → 0
-    (fail-soft: отчёт ценнее идеальности; источник продублирован алертами)."""
-    try:
-        n = 0
-        with open(log_path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if _BREAKDOWN_MARKER not in line:
-                    continue
-                try:
-                    ts = datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    n += 1  # маркер есть, дата не распарсилась — считаем
-                    continue
-                ts = ts.replace(tzinfo=timezone.utc)
-                if since <= ts < until:
-                    n += 1
-        return n
-    except OSError:
-        logger.warning("reliability: лог %s недоступен — breakdowns=0",
-                       log_path)
+    """Маркер по ВСЕМ логам glob-шаблона (поллер/uvicorn/job-runner —
+    каждый процесс пишет в свой; субагент R1 CRITICAL). Времена строк —
+    локальные (MSK) → в UTC. Строки без парсящейся даты НЕ считаются
+    (раздув истории при смене формата), но логируются скопом.
+    Недоступность файлов — fail-soft 0 + warning."""
+    n = 0
+    unparsed = 0
+    paths = (sorted(_glob(log_glob))
+             if any(c in log_glob for c in "*?[") else [log_glob])
+    if not paths:
+        logger.warning("reliability: логи по %s не найдены — breakdowns=0",
+                       log_glob)
         return 0
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if _BREAKDOWN_MARKER not in line:
+                        continue
+                    try:
+                        ts = datetime.strptime(line[:19],
+                                               "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        unparsed += 1
+                        continue
+                    ts = ts.replace(tzinfo=_LOG_TZ).astimezone(timezone.utc)
+                    if since <= ts < until:
+                        n += 1
+        except OSError:
+            logger.warning("reliability: лог %s недоступен", path)
+    if unparsed:
+        logger.warning("reliability: %d строк с маркером без парсящейся "
+                       "даты — НЕ учтены", unparsed)
+    return n
 
 
 def format_report(counts, history: list[dict],
                   *, kpi_threshold_pct: float = KPI_THRESHOLD_PCT) -> str:
     total = sum(int(h.get("total") or 0) for h in history)
     failures = sum(int(h.get("failures") or 0) for h in history)
-    pct = 100.0 if total == 0 else 100.0 * (1 - min(failures, total) / total)
-    kpi_line = f"KPI-14д: {pct:.1f}% чистых"
+    if total == 0:
+        # сигналы без единого хода не могут давать «100% чистых»
+        # (Codex R1 medium)
+        pct = 0.0 if failures > 0 else 100.0
+    else:
+        pct = 100.0 * (1 - min(failures, total) / total)
+    days = len(history)
+    kpi_line = (f"KPI за {days} дн: {pct:.1f}% чистых "
+                f"(по сигналам; классы могут пересекаться)")
     if pct < kpi_threshold_pct:
         kpi_line += f" — ниже порога {kpi_threshold_pct:g}%! 🔴"
     else:
@@ -144,7 +177,7 @@ class ReliabilityReportWorker:
                  log_path: str | None = None) -> None:
         self.session = session
         self.state_file = Path(state_file or DEFAULT_STATE_FILE)
-        self.log_path = log_path or DEFAULT_LOG_PATH
+        self.log_path = log_path or DEFAULT_LOG_GLOB
 
     async def process_pending(self) -> int:
         now = datetime.now(timezone.utc)
@@ -152,15 +185,24 @@ class ReliabilityReportWorker:
         if not self._should_run(now, state):
             return 0
         try:
+            # скан логов — в поток и ДО DB-запросов (не держать транзакцию
+            # на время чтения файлов — субагент R1)
+            import asyncio as _aio
+            breakdowns = await _aio.to_thread(
+                count_breakdown_lines, self.log_path,
+                since=now - REPORT_WINDOW, until=now)
             counts = gather_day_counts(
-                self.session, now=now, log_path=self.log_path)
+                self.session, now=now,
+                breakdowns_precounted=breakdowns)
             day = {"date": now.date().isoformat(),
                    "total": counts.turns_total,
                    "failures": counts.failures_total}
             history = [h for h in state.get("history", [])
                        if h.get("date") != day["date"]]
             history.append(day)
-            history = history[-KPI_DAYS:]
+            # 14 КАЛЕНДАРНЫХ дней, не «последние 14 отчётов» (субагент)
+            cutoff = (now.date() - timedelta(days=KPI_DAYS - 1)).isoformat()
+            history = [h for h in history if str(h.get("date")) >= cutoff]
             send_admin_alert(
                 "INFO", "надёжность диалога — суточная сводка",
                 format_report(counts, history),
@@ -168,13 +210,31 @@ class ReliabilityReportWorker:
             )
         except Exception:  # noqa: BLE001 — не валим job_runner
             logger.exception("reliability report failed")
+            failures = int(state.get("failure_count") or 0) + 1
             state["last_failure_at"] = now.isoformat()
+            state["failure_count"] = failures
             self._write_state(state)
+            if failures >= ALERT_AFTER_CONSECUTIVE_FAILURES:
+                try:  # серия провалов — не тихое гниение (#127-паттерн)
+                    send_admin_alert(
+                        "P1", "сводка надёжности падает серией",
+                        f"{failures} провалов подряд — лог sreda.reliability",
+                        dedupe_key="reliability:consecutive_failures")
+                except Exception:  # noqa: BLE001
+                    logger.exception("reliability: alert delivery failed")
             return 0
         state["last_run_at"] = now.isoformat()
         state.pop("last_failure_at", None)
+        state["failure_count"] = 0
         state["history"] = history
-        self._write_state(state)
+        if not self._write_state(state):
+            # state не записан → день НЕ зачтён: без durable-отметки
+            # возможны и потеря истории KPI, и повторные отправки
+            # (Codex R1 оба) — уходим в откат как провал
+            state.pop("last_run_at", None)
+            state["last_failure_at"] = now.isoformat()
+            self._write_state(state)
+            return 0
         logger.info("reliability report sent: %s", day)
         return 1
 
@@ -207,11 +267,13 @@ class ReliabilityReportWorker:
         except (json.JSONDecodeError, ValueError, OSError):
             return {}
 
-    def _write_state(self, state: dict) -> None:
+    def _write_state(self, state: dict) -> bool:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             self.state_file.write_text(
                 json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            return True
         except OSError:
             logger.warning("reliability: state file %s недоступен",
                            self.state_file)
+            return False

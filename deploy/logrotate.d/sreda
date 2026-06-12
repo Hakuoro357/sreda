@@ -1,0 +1,13 @@
+# /etc/logrotate.d/sreda — ротация логов Среды (#139: суточный скан
+# reliability-воркера не должен читать бесконечно растущие файлы).
+# Установка: cp deploy/logrotate.d/sreda /etc/logrotate.d/sreda
+/var/log/sreda/*.log {
+    weekly
+    rotate 6
+    maxsize 200M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
