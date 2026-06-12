@@ -432,6 +432,20 @@ async def run_planner_chat_loop(
                     )
                     _alert("голос-прихорашивание", action,
                            type(exc).__name__, str(exc))
+        # #135 (за гейтом, отсоединённо): успешный ход — кандидат в
+        # библиотеку планов + теневой отбор. Вне гейта — ноль побочек.
+        try:
+            from sreda.runtime.planner.plan_library import (
+                schedule_candidate_recording,
+            )
+            schedule_candidate_recording(
+                tenant_id=action.tenant_id, run_id=pf.run_id,
+                plan=plan_result.plan, exec_outcome=exec_log.outcome,
+                fallback_used=reply.fallback_used,
+                breakdown_shown=_breakdown_shown,
+            )
+        except Exception:  # noqa: BLE001 — библиотека не валит ход
+            logger.warning("plan_library: schedule failed", exc_info=True)
         return _result(text, called=called, counts=counts)
     except Exception as exc:  # noqa: BLE001
         logger.exception("planner_chat: compose stage crashed")

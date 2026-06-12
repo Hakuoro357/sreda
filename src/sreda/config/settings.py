@@ -328,6 +328,11 @@ class Settings(BaseSettings):
             "sreda_planner_mode_enabled",
         ),
     )
+    # #135: гейт памяти планов (сбор+тень). Пусто = выключено для всех.
+    plan_library_enabled_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_PLAN_LIBRARY_ENABLED_TENANTS",
+    )
     planner_enabled_tenants_raw: str | None = Field(
         default=None,
         validation_alias=AliasChoices(

@@ -68,6 +68,7 @@ class RetentionCleanupResult:
     skill_events_warn_error: int = 0
     skill_run_attempts: int = 0
     skill_runs: int = 0
+    plan_library_entries: int = 0
     deleted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -360,6 +361,15 @@ def cleanup_runtime_retention(
             )
         ),
     )
+
+    # ---------- plan_library (#135: TTL всем статусам, без PII) ----------
+    try:
+        from sreda.runtime.planner.plan_library import cleanup_plan_library
+        result.plan_library_entries = cleanup_plan_library(session, now=now)
+    except Exception:  # noqa: BLE001 — новая таблица не валит чистку
+        import logging
+        logging.getLogger(__name__).warning(
+            "plan_library cleanup failed", exc_info=True)
 
     session.flush()
     return result

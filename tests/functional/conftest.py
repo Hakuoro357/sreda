@@ -133,6 +133,7 @@ def harness(monkeypatch, tmp_path):
     from sreda.db.base import Base
     import sreda.db.models  # noqa: F401 — наполняет metadata ДО create_all
     import sreda.db.models.checklists  # noqa: F401 — #86: не в __init__
+    import sreda.db.models.plan_library  # noqa: F401 — #135, тот же класс
     engine = get_engine()
 
     @event.listens_for(engine, "connect")
