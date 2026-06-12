@@ -77,3 +77,10 @@ def test_decomposed_yo_and_iy_normalize() -> None:
     assert item_grounded_in_sources("ёлка", ["поставь ёлку"]) is False
     # (форма слова разная — это ОК; точное слово грунтуется:)
     assert item_grounded_in_sources("ёлка", ["поставь ёлка"])
+
+
+def test_casefold_introduced_combining_mark_stripped() -> None:
+    """Codex R2 high: casefold САМ вводит Mn (İ → i+◌̇); снятие Cf/Mn
+    ПОСЛЕ casefold не даёт выдуманному «tem» обосноваться в «İtem»."""
+    assert not item_grounded_in_sources("tem", ["İtem"])
+    assert item_grounded_in_sources("item", ["İtem"])  # целое слово грунтуется

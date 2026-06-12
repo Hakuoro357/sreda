@@ -29,13 +29,15 @@ def normalize_for_match(text: str) -> str:
     if not text:
         return ""
     # NFKC сперва — компонует разложенные ё/й (е+◌̈ → ё, и+◌̆ → й).
+    # NFKC сперва — компонует разложенные ё/й (е+◌̈ → ё, и+◌̆ → й).
     t = unicodedata.normalize("NFKC", text)
-    # удалить невидимые формат-символы (Cf: zero-width) и оставшиеся
-    # комбинирующие знаки (Mn) — иначе разрывают токен (Codex R1 оба
-    # MAJOR: невидимый разрыв внутри слова обосновывал фрагмент).
+    t = t.casefold().replace("ё", "е")
+    # удалить невидимые формат-символы (Cf: zero-width) и комбинирующие
+    # знаки (Mn) ПОСЛЕ casefold — он сам вводит Mn (İ → i+◌̇), который
+    # иначе рвёт токен (Codex R2 high). Легитимные ё/й уже скомпонованы
+    # NFKC выше, так что их строка к этому моменту не теряет.
     t = "".join(ch for ch in t
                 if unicodedata.category(ch) not in ("Cf", "Mn"))
-    t = t.casefold().replace("ё", "е")
     t = re.sub(r"\s+", " ", t).strip()       # \s в Unicode ловит NBSP
     t = t.strip(".,!?;:…\"'«»()[]—–")          # краевая пунктуация (не дефис)
     return t.strip()
