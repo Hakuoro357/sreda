@@ -530,7 +530,9 @@ async def test_handle_telegram_update_fast_no_blocking_io(fresh_db, monkeypatch)
         return MagicMock()
 
     monkeypatch.setattr(ti, "_process_approved_turn", fake_turn)
-    monkeypatch.setattr(ti.asyncio, "create_task", fake_create_task)
+    # #133: точки вызова идут через локальный шов _create_task (патч
+    # атрибута модуля asyncio был бы глобальным для процесса)
+    monkeypatch.setattr(ti, "_create_task", fake_create_task)
 
     inb_id = await handle_telegram_update(payload)
 

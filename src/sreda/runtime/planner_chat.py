@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -35,6 +36,14 @@ from sreda.services import trace
 from sreda.services.admin_alerts import send_admin_alert
 
 logger = logging.getLogger(__name__)
+
+# #133: тестовый шов планировщика. Функциональный харнес кладёт сюда
+# очередь записанных ответов (call_planner_fn-совместимую); в проде —
+# всегда None. ContextVar, а не модульная переменная: не течёт между
+# конкурентными запросами/сценариями (Codex R3/R4 плана #133).
+_planner_call_override: ContextVar[Any] = ContextVar(
+    "planner_call_override", default=None,
+)
 
 _MSK = ZoneInfo("Europe/Moscow")
 
@@ -224,6 +233,12 @@ async def run_planner_chat_loop(
                 effective_llm_keys=frozenset(proposed_llm_keys)
             ),
         )
+        # #133: дефолтный аргумент call_planner_fn связан при определении
+        # run() — прокидываем override явно, только когда он установлен
+        _planner_kwargs: dict[str, Any] = {}
+        _override = _planner_call_override.get()
+        if _override is not None:
+            _planner_kwargs["call_planner_fn"] = _override
         with trace.step("planner.plan") as _meta:
             plan_result = await orchestrator_run(
                 ctx,
@@ -231,6 +246,7 @@ async def run_planner_chat_loop(
                 # FK run_id↔agent_runs требует строки текущего run'а ДО хода;
                 # включается следующим срезом вместе с ledger
                 admin_alert_fn=None,
+                **_planner_kwargs,
             )
             _meta["attempts"] = plan_result.final_attempt_no
             _meta["ok"] = plan_result.success

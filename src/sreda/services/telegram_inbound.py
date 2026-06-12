@@ -64,6 +64,11 @@ from sreda.services.tenant_lock import (  # noqa: E402,F401
     get_tenant_lock as _get_tenant_lock,
 )
 
+# #133: локальный шов для функционального харнеса — патчится
+# именно этот символ модуля (подмена asyncio.create_task была бы
+# глобальной для всего процесса).
+_create_task = asyncio.create_task
+
 
 async def _fire_and_forget_ack(
     client: TelegramClient, chat_id: str, text: str,
@@ -228,7 +233,7 @@ async def _process_approved_turn_locked(
             and not onboarding.is_new_user
         ):
             ack_text = pick_ack()
-            ack_task = asyncio.create_task(
+            ack_task = _create_task(
                 _fire_and_forget_ack(
                     telegram_client, onboarding.chat_id, ack_text,
                 ),
@@ -285,7 +290,7 @@ async def _process_approved_turn_locked(
                 and reply_delivered_inline
                 and onboarding.chat_id is not None
             ):
-                asyncio.create_task(
+                _create_task(
                     _delete_ack_after_reply(
                         telegram_client,
                         str(onboarding.chat_id),
@@ -708,7 +713,7 @@ async def handle_telegram_update(
             inbound_message_id=inbound_message_id,
         )
     else:
-        asyncio.create_task(
+        _create_task(
             _process_approved_turn(
                 bot_key=bot_key,
                 payload=payload,

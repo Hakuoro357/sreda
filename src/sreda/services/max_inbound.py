@@ -30,6 +30,13 @@ from sreda.integrations.max.client import MaxDeliveryError
 from sreda.services.inbound_messages import persist_max_inbound_event
 from sreda.services.onboarding import ensure_max_user_bundle
 
+
+# #133: локальный шов для функционального харнеса — патчится
+# именно этот символ модуля (подмена asyncio.create_task была бы
+# глобальной для всего процесса).
+_create_task = asyncio.create_task
+
+
 if TYPE_CHECKING:
     from fastapi import BackgroundTasks
 
@@ -420,7 +427,7 @@ async def handle_max_update(
             inbound_message_id=inbound_message_id,
         )
     else:
-        asyncio.create_task(
+        _create_task(
             _process_approved_max_turn(
                 bot_key=bot_key,
                 payload=payload,
@@ -1025,7 +1032,7 @@ async def _process_approved_max_turn(
                 from sreda.services.ack_progress import MaxAckProgressController
                 ack_text = pick_ack()
                 max_ack_client = MaxClient(token=settings.max_bot_token)
-                ack_task = asyncio.create_task(
+                ack_task = _create_task(
                     _send_max_ack(
                         token=settings.max_bot_token,
                         chat_id=str(onboarding.max_chat_id),
@@ -1056,7 +1063,7 @@ async def _process_approved_max_turn(
                 # Не оставляем ack-message в чате если turn оказался
                 # ignored — юзер увидит «⏳ Работаю…» и пустоту.
                 if ack_task is not None:
-                    asyncio.create_task(
+                    _create_task(
                         _wait_ack_then_delete(
                             ack_task=ack_task,
                             token=settings.max_bot_token,
@@ -1087,7 +1094,7 @@ async def _process_approved_max_turn(
                 ack_task=ack_task,
                 ack_progress_controller=ack_progress_controller,
             ):
-                asyncio.create_task(
+                _create_task(
                     _wait_ack_then_delete(
                         ack_task=ack_task,
                         token=settings.max_bot_token,
