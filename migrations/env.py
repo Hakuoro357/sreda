@@ -15,6 +15,7 @@ if str(SRC_DIR) not in sys.path:
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
 from sreda.db.models import core as _core_models  # noqa: F401
+import sreda.db.models.plan_library  # noqa: F401  (#135)
 from sreda.db.models import eds_monitor as _eds_models  # noqa: F401
 from sreda.db.models import housewife as _housewife_models  # noqa: F401
 from sreda.db.models import skill_platform as _skill_platform_models  # noqa: F401

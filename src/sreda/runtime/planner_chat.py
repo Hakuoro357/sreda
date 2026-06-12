@@ -329,6 +329,7 @@ async def run_planner_chat_loop(
         # шаблонные ветки потом прогнать через рот (правило владельца:
         # ВСЕ ответы через живой голос; шаблон — сырьё и страховка).
         _voice_used = {"v": False}
+        _beautify_failed = {"v": False}  # R1 medium: не выставляет fallback_used
 
         def _tracking_voice(**kw):
             _voice_used["v"] = True
@@ -421,6 +422,7 @@ async def run_planner_chat_loop(
                     else:
                         # Codex R1 (оба): пустой голос = сбой по контракту —
                         # алерт владельцу, пользователю — страховка шаблоном
+                        _beautify_failed["v"] = True
                         _alert("голос-прихорашивание", action, "blank_output",
                                "рот вернул пустой текст; ушла страховка")
                 except Exception as exc:  # noqa: BLE001 — страховка шаблоном
@@ -430,6 +432,7 @@ async def run_planner_chat_loop(
                         "falling back to template text",
                         type(exc).__name__,
                     )
+                    _beautify_failed["v"] = True
                     _alert("голос-прихорашивание", action,
                            type(exc).__name__, str(exc))
         # #135 (за гейтом, отсоединённо): успешный ход — кандидат в
@@ -441,7 +444,9 @@ async def run_planner_chat_loop(
             schedule_candidate_recording(
                 tenant_id=action.tenant_id, run_id=pf.run_id,
                 plan=plan_result.plan, exec_outcome=exec_log.outcome,
-                fallback_used=reply.fallback_used,
+                fallback_used=(reply.fallback_used
+                               or ("voice_beautify_failed"
+                                   if _beautify_failed["v"] else None)),
                 breakdown_shown=_breakdown_shown,
             )
         except Exception:  # noqa: BLE001 — библиотека не валит ход

@@ -44,10 +44,12 @@ def upgrade() -> None:
                     ["tenant_id", "status", "created_at"])
     op.create_index("ux_plan_library_tenant_run", "plan_library_entries",
                     ["tenant_id", "run_id"], unique=True,
-                    postgresql_where=sa.text("run_id IS NOT NULL"))
+                    postgresql_where=sa.text("run_id IS NOT NULL"),
+                    sqlite_where=sa.text("run_id IS NOT NULL"))
     op.create_index("ux_plan_library_tenant_case", "plan_library_entries",
                     ["tenant_id", "case_id", "case_variant"], unique=True,
-                    postgresql_where=sa.text("case_id IS NOT NULL"))
+                    postgresql_where=sa.text("case_id IS NOT NULL"),
+                    sqlite_where=sa.text("case_id IS NOT NULL"))
 
 
 def downgrade() -> None:

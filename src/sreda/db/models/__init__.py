@@ -122,3 +122,4 @@ __all__ = [
     "WebSearchUsage",
     "Workspace",
 ]
+from sreda.db.models import plan_library  # noqa: F401  (#135)

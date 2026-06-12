@@ -19,15 +19,18 @@ from sreda.runtime.planner.plan_library import (
 )
 
 
-def _plan(args=None, title="Купить лекарство от давления для мамы"):
+def _plan(args=None, intent_group="default", tool="schedule_reminder"):
     oc = SimpleNamespace(
         match={"status": "ok"}, next=None,
-        compose=SimpleNamespace(kind="template",
-                                template_id="checklists_list_show",
-                                llm_prompt_key=None))
-    a = SimpleNamespace(tool="list_checklists",
-                        args=args or {"query": title, "limit": 5},
-                        expected_outcomes=[oc], intent_group="default",
+        compose=SimpleNamespace(
+            kind="template", template_id="checklists_list_show",
+            llm_prompt_key=None,
+            template_data={"items": "${s1.checklists}",
+                           "mama_lekarstva": "скрытое"}))
+    a = SimpleNamespace(tool=tool,
+                        args=args or {"title": "лекарство маме",
+                                      "trigger_iso": "2027-01-01T09:00:00"},
+                        expected_outcomes=[oc], intent_group=intent_group,
                         depends_on=[])
     return SimpleNamespace(clarity="clear", actions={"s1": a},
                            compose=oc.compose)
@@ -36,18 +39,24 @@ def _plan(args=None, title="Купить лекарство от давлени�
 def test_form_projection_no_pii() -> None:
     """Чеклист п.2: ни один пользовательский литерал не проходит в форму
     (плейсхолдеры); ссылки ${sN.field} — остаются."""
-    plan = _plan(args={"query": "Лаванда 298 ТС, простыня 141×200",
-                       "items": ["позвонить маме", "${s1.items}"],
-                       "n": 7, "flag": True})
+    plan = _plan(
+        args={"title": "Лаванда 298 ТС, простыня 141×200",
+              "trigger_iso": "${s1.when}",
+              "mama_phone_89261234567": "позвонить",
+              "nested": {"ivan_petrov": ["долг 5000"]}},
+        intent_group="dolg_marii_sidorovoy_5000_rub",  # субагент: транслит
+    )
     form = project_plan_form(plan)
     blob = json.dumps(form, ensure_ascii=False)
-    for leak in ("Лаванда", "маме", "простыня", "141", "298", '"7"', " 7"):
+    for leak in ("Лаванда", "простыня", "141", "298", "5000",
+                 "mama_phone", "ivan_petrov", "dolg_marii",
+                 "mama_lekarstva", "скрытое"):
         assert leak not in blob, f"утечка литерала: {leak}"
     shape = form["steps"][0]["args_shape"]
-    assert shape["query"] == ARG_PLACEHOLDER
-    assert shape["items"] == [ARG_PLACEHOLDER, "${s1.items}"]
-    assert shape["n"] == ARG_PLACEHOLDER
-    assert shape["flag"] is True  # тип-сигнал, не PII
+    assert shape["title"] == ARG_PLACEHOLDER          # ключ из input_model
+    assert shape["trigger_iso"] == "${s1.when}"        # ref-связь живёт
+    assert shape["n_extra_keys"] == 2                  # чужие ключи скрыты
+    assert form["steps"][0]["intent_group"] == ARG_PLACEHOLDER
     # вход эмбеддера = form_json + form_tags — тоже чистый
     tags_blob = json.dumps(build_form_tags(form), ensure_ascii=False)
     assert "Лаванда" not in tags_blob and "маме" not in tags_blob
@@ -60,9 +69,9 @@ def test_form_projection_no_pii() -> None:
 def test_form_tags_allowlist_only() -> None:
     form = project_plan_form(_plan())
     tags = build_form_tags(form)
-    assert "single" in tags and "list_checklists" in tags
+    assert "single" in tags and "schedule_reminder" in tags
     allowed = {"single", "chain", "empty", "branching", "dependent",
-               "clarify", "list_checklists"}
+               "clarify", "schedule_reminder"}
     assert set(tags) <= allowed
 
 
@@ -119,7 +128,8 @@ def test_shadow_selects_only_approved(session, monkeypatch) -> None:
     from sreda.runtime.planner.plan_library import _shadow_select
     _entry(session, "a1", "approved", 5)
     session.query(PlanLibraryEntry).filter_by(id="a1").update(
-        {"form_tags": json.dumps(["single", "list_checklists"])})
+        {"form_tags": json.dumps(["single", "list_checklists"]),
+         "registry_version": "planner-chat-v1"})
     _entry(session, "c1", "candidate", 5)
     session.commit()
     out = _shadow_select(session, "t1",

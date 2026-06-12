@@ -365,7 +365,11 @@ def cleanup_runtime_retention(
     # ---------- plan_library (#135: TTL всем статусам, без PII) ----------
     try:
         from sreda.runtime.planner.plan_library import cleanup_plan_library
-        result.plan_library_entries = cleanup_plan_library(session, now=now)
+        # SAVEPOINT (Codex R1 high): голый try оставил бы транзакцию
+        # PG в aborted-состоянии — последующий flush упал бы
+        with session.begin_nested():
+            result.plan_library_entries = cleanup_plan_library(
+                session, now=now)
     except Exception:  # noqa: BLE001 — новая таблица не валит чистку
         import logging
         logging.getLogger(__name__).warning(

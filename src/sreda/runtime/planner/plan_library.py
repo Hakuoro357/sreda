@@ -37,9 +37,27 @@ CANDIDATE_TTL_DAYS = 90
 APPROVED_TTL_DAYS = 180
 
 
+KEY_PLACEHOLDER = "<k>"
+
+
+def _tool_arg_fields(tool: str) -> frozenset[str]:
+    """Allowlist ключей верхнего уровня args = поля input_model
+    инструмента из реестра (Codex R1 CRITICAL: _IDENT_RE пропускал
+    ASCII-литералы вроде mama_phone)."""
+    try:
+        from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
+        for spec in MIGRATED_TOOL_SPECS:
+            if spec.name == tool:
+                return frozenset(spec.input_model.model_fields.keys())
+    except Exception:  # noqa: BLE001 — fail-closed: пустой allowlist
+        pass
+    return frozenset()
+
+
 def _redact_value(v: Any) -> Any:
     """Литерал → плейсхолдер; ссылки ${sN.field} — структурная связь,
-    остаются (allowlist-паттерн); контейнеры — рекурсивно."""
+    остаются; контейнеры — рекурсивно; ВСЕ ключи словарей глубже
+    верхнего уровня args — плейсхолдеры (PII в ключах)."""
     if isinstance(v, str):
         return v if _REF_RE.match(v) else ARG_PLACEHOLDER
     if isinstance(v, bool) or v is None:
@@ -49,9 +67,23 @@ def _redact_value(v: Any) -> Any:
     if isinstance(v, list):
         return [_redact_value(x) for x in v[:5]]
     if isinstance(v, dict):
-        return {k: _redact_value(val) for k, val in sorted(v.items())
-                if _IDENT_RE.match(str(k))}
+        return {KEY_PLACEHOLDER: [_redact_value(val)
+                                  for _, val in sorted(v.items())][:5],
+                "n_keys": len(v)} if v else {}
     return ARG_PLACEHOLDER
+
+
+def _redact_args(args: dict, allowed_keys: frozenset[str]) -> dict:
+    out: dict[str, Any] = {}
+    extra = 0
+    for k in sorted(args):
+        if str(k) in allowed_keys:
+            out[str(k)] = _redact_value(args[k])
+        else:
+            extra += 1
+    if extra:
+        out["n_extra_keys"] = extra
+    return out
 
 
 def _compose_form(compose: Any) -> dict:
@@ -63,6 +95,11 @@ def _compose_form(compose: Any) -> dict:
                if not isinstance(compose, dict) else compose.get(attr))
         if val is not None and _IDENT_RE.match(str(val)):
             out[attr] = str(val)
+    # high R1: форма данных сборки (арность + ref-связи), ключи скрыты
+    data = (getattr(compose, "template_data", None)
+            if not isinstance(compose, dict) else compose.get("template_data"))
+    if isinstance(data, dict) and data:
+        out["template_data_shape"] = _redact_value(data)
     return out
 
 
@@ -89,12 +126,15 @@ def project_plan_form(plan: Any) -> dict:
         steps.append({
             "id": sid if re.match(r"^s\d+$", sid) else ARG_PLACEHOLDER,
             "tool": tool,
-            "args_shape": _redact_value(dict(getattr(a, "args", None) or {})),
+            "args_shape": _redact_args(
+                dict(getattr(a, "args", None) or {}),
+                _tool_arg_fields(tool)),
             "depends_on": [d for d in (getattr(a, "depends_on", None) or [])
                            if re.match(r"^s\d+$", str(d))],
-            "intent_group": (str(getattr(a, "intent_group", ""))
-                             if _IDENT_RE.match(
-                                 str(getattr(a, "intent_group", "")))
+            # субагент R1 (e2e): свободная строка схемы — транслит-PII
+            # проходила _IDENT_RE; храним только факт «не default»
+            "intent_group": ("default"
+                             if str(getattr(a, "intent_group", "")) == "default"
                              else ARG_PLACEHOLDER),
             "outcomes": outcomes,
         })
@@ -147,26 +187,21 @@ def schedule_candidate_recording(
         return  # вне гейта: ноль побочек (чеклист п.1)
     if exec_outcome != "completed" or fallback_used or breakdown_shown:
         return  # строгие признаки кандидата (план: только чистый успех)
-    try:
-        form = project_plan_form(plan)
-        tags = build_form_tags(form)
-    except Exception:  # noqa: BLE001 — проекция не валит ход
-        logger.warning("plan_library: проекция формы не удалась run=%s",
-                       run_id, exc_info=True)
-        return
+    # проекция — ТОЖЕ в отсоединённой задаче (оба Codex R1 MAJOR:
+    # «целиком вне request path» — без работы до return)
     _create_task(
-        _record_and_shadow(tenant_id=tenant_id, run_id=run_id,
-                           form=form, tags=tags),
+        _record_and_shadow(tenant_id=tenant_id, run_id=run_id, plan=plan),
         name=f"plan_library:{run_id}",
     )
 
 
 async def _record_and_shadow(*, tenant_id: str, run_id: str,
-                             form: dict, tags: list[str]) -> None:
+                             plan: Any) -> None:
     try:
         async with _BG_SEMAPHORE:
             await asyncio.wait_for(
-                asyncio.to_thread(_record_sync, tenant_id, run_id, form, tags),
+                asyncio.to_thread(_project_and_record, tenant_id, run_id,
+                                  plan),
                 timeout=_BG_TIMEOUT_SEC)
     except asyncio.TimeoutError:
         logger.warning("plan_library: запись run=%s превысила таймаут — дроп",
@@ -174,6 +209,12 @@ async def _record_and_shadow(*, tenant_id: str, run_id: str,
     except Exception:  # noqa: BLE001
         logger.warning("plan_library: запись run=%s не удалась",
                        run_id, exc_info=True)
+
+
+def _project_and_record(tenant_id: str, run_id: str, plan: Any) -> None:
+    form = project_plan_form(plan)
+    tags = build_form_tags(form)
+    _record_sync(tenant_id, run_id, form, tags)
 
 
 def _record_sync(tenant_id: str, run_id: str, form: dict,
@@ -188,6 +229,7 @@ def _record_sync(tenant_id: str, run_id: str, form: dict,
                   .filter_by(tenant_id=tenant_id, run_id=run_id).first())
         if exists is None:
             import uuid
+            from sqlalchemy.exc import IntegrityError
             session.add(PlanLibraryEntry(
                 id=f"plib_{uuid.uuid4().hex[:24]}",
                 tenant_id=tenant_id, run_id=run_id,
@@ -198,7 +240,10 @@ def _record_sync(tenant_id: str, run_id: str, form: dict,
                 outcome_json=json.dumps({"outcome": "completed"}),
                 registry_version="planner-chat-v1",
             ))
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:  # гонка двух задач одного run_id
+                session.rollback()
         shadow = _shadow_select(session, tenant_id, form, tags,
                                 exclude_run_id=run_id)
         logger.info(
@@ -217,7 +262,8 @@ def _shadow_select(session, tenant_id: str, form: dict, tags: list[str],
     воркером позже; форма-теги дают консервативный отбор)."""
     from sreda.db.models.plan_library import PlanLibraryEntry
     rows = (session.query(PlanLibraryEntry)
-            .filter_by(tenant_id=tenant_id, status="approved")
+            .filter_by(tenant_id=tenant_id, status="approved",
+                       registry_version="planner-chat-v1")
             .order_by(PlanLibraryEntry.created_at.desc())
             .limit(200).all())
     me = set(tags)
@@ -227,7 +273,7 @@ def _shadow_select(session, tenant_id: str, form: dict, tags: list[str],
             continue
         try:
             their = set(json.loads(r.form_tags or "[]"))
-        except ValueError:
+        except (ValueError, TypeError):  # субагент: json.loads(None)
             continue
         overlap = len(me & their)
         if overlap:
