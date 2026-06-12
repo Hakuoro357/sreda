@@ -695,44 +695,51 @@ def build_variable_suffix(
     )
 
     # #124: детерминированный блок последних реплик юзера (источник для
-    # сбора надиктованного). Codex R1 (оба) MAJOR: сумма секций могла
-    # превышать max_suffix_chars и кидать PromptBudgetExceeded на входах,
-    # каждый из которых в своём cap'е. Рендерим блок из ОСТАВШЕГОСЯ
-    # бюджета суффикса (после обязательных блоков) — деградация (меньше
-    # реплик/пусто), а не отказ хода.
+    # сбора надиктованного). Codex R1/R2 (оба): сумма секций могла
+    # превышать max_suffix_chars и кидать PromptBudgetExceeded. Рендерим
+    # из ОСТАВШЕГОСЯ бюджета суффикса; если не влезает даже ПУСТАЯ
+    # ограждённая секция — ОПУСКАЕМ её целиком (R2: пустой плейсхолдер
+    # сам стоит ~180 символов и мог толкнуть за cap).
     _required = [profile_block, memories_block, history_block, now_block,
                  user_block]
+    _sep_count = len(_required)  # "\n\n" перед каждой доп.секцией
+    _voice_block = None
     if voice_meta and voice_meta.is_voice:
-        _required_overhead = 200  # запас на VOICE_META, добавится ниже
-    else:
-        _required_overhead = 0
-    _used = sum(len(b) for b in _required) + 6 * len("\n\n") \
-        + _required_overhead
-    _recent_budget = max(
-        0, min(budget.max_recent_utterances_block_chars,
-               budget.max_suffix_chars - _used - 64))  # 64 на рамку fence
-    recent_block = fence_untrusted(
-        "ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА",
-        build_recent_utterances_block(
-            closed_turns=closed_turns,
-            max_utterances=budget.max_recent_utterances,
-            max_utterance_chars=budget.max_recent_utterance_chars,
-            max_block_chars=_recent_budget,
-        ) if _recent_budget > 0 else "_(опущено по бюджету)_",
-    )
+        _voice_block = fence_untrusted(
+            "VOICE_META",
+            f"is_voice: true\nconfidence: {voice_meta.confidence:.2f}")
+        _required.append(_voice_block)
+        _sep_count += 1
+    _used = sum(len(b) for b in _required) + (_sep_count) * len("\n\n")
+    # точный оверхед собственной рамки (R2: было 64, реально ~159)
+    _fence_overhead = len(fence_untrusted("ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА", ""))
+    _room = budget.max_suffix_chars - _used - _fence_overhead - len("\n\n")
+    recent_block = None
+    if _room > 0:
+        _recent_budget = min(budget.max_recent_utterances_block_chars, _room)
+        recent_block = fence_untrusted(
+            "ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА",
+            build_recent_utterances_block(
+                closed_turns=closed_turns,
+                max_utterances=budget.max_recent_utterances,
+                max_utterance_chars=budget.max_recent_utterance_chars,
+                max_block_chars=_recent_budget,
+            ),
+        )
 
     # R2 fix (Codex MINOR): voice_meta gets its OWN labelled fenced
     # block so the planner's policy section can refer to "voice_meta"
     # consistently instead of having voice metadata smuggled inside
     # ТЕКУЩЕЕ_СООБЩЕНИЕ. Block is only emitted when message is voice.
-    sections = [profile_block, memories_block, history_block,
-                recent_block, now_block]
-    if voice_meta and voice_meta.is_voice:
-        voice_content = (
-            f"is_voice: true\n"
-            f"confidence: {voice_meta.confidence:.2f}"
-        )
-        sections.append(fence_untrusted("VOICE_META", voice_content))
+    # порядок: профиль, воспоминания, история, [реплики, если влезли],
+    # момент, [voice_meta], сообщение. recent_block/_voice_block уже
+    # построены выше (с учётом бюджета).
+    sections = [profile_block, memories_block, history_block]
+    if recent_block is not None:
+        sections.append(recent_block)
+    sections.append(now_block)
+    if _voice_block is not None:
+        sections.append(_voice_block)
     sections.append(user_block)
     suffix = "\n\n".join(sections)
     if len(suffix) > budget.max_suffix_chars:

@@ -119,3 +119,24 @@ def test_malicious_utterance_is_fenced() -> None:
         user_message="ok",
     )
     assert "UNTRUSTED_DATA" in suffix or "ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА" in suffix
+
+
+
+def test_recent_block_omitted_when_no_room() -> None:
+    """Codex R2 (оба): на узкой границе #124 сам не должен толкать суффикс
+    за cap — секция ОПУСКАЕТСЯ целиком, если не влезает даже пустая рамка
+    (а не эмитит ~180-символьный плейсхолдер)."""
+    from sreda.runtime.planner.prompt_builder import MemorySnapshot, PromptBudget
+    budget = PromptBudget()
+    # обязательные блоки забивают почти весь суффикс
+    memories = [MemorySnapshot(content="m" * 290, source="memory:core",
+                               score=0.9) for _ in range(5)]
+    closed = [_closed(f"t{i}", "реплика" * 10) for i in range(30)]
+    suffix = build_variable_suffix(
+        profile=ProfileSnapshot(address="ты"),
+        memories=memories, active_turn=None, closed_turns=closed,
+        now=NowMoment(__import__("datetime").datetime(2026, 6, 12, 10, 0)),
+        user_message="х" * (budget.max_user_message_chars - 100),
+    )
+    assert len(suffix) <= budget.max_suffix_chars
+    # секция могла быть опущена — это легально; падать не должно
