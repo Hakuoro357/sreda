@@ -120,7 +120,6 @@ async def test_invalid_plan_retry_exhausted_visible(harness, run_turn) -> None:
 
     queue = make_planner_queue("это не json", "{однозначно мусор")
     logging.disable(logging.NOTSET)
-    import pytest as _pytest
     with _caplog_ctx() as records:
         await run_turn("покажи дела", queue, update_id=2)
     assert queue.calls["n"] >= 2, "повтор невалидного плана не случился"
@@ -188,10 +187,23 @@ async def test_compose_breakdown_visible(harness, run_turn, caplog) -> None:
 @pytest.mark.asyncio
 async def test_network_ban_blocks_external_http(harness) -> None:
     """Чеклист п.8: тест блокировщика — наружу нельзя (включая DNS)."""
+    import socket
+    # Codex R2 high: ловим ИМЕННО гардовый AssertionError (generic
+    # ConnectError мог бы означать «в CI просто нет сети»)
+    with pytest.raises(AssertionError, match="запрещ"):
+        socket.getaddrinfo("example.com", 443)
     import httpx
-    with pytest.raises((AssertionError, httpx.ConnectError, httpx.TransportError)):
+    with pytest.raises(BaseException) as ei:
         async with httpx.AsyncClient(timeout=2) as c:
             await c.get("http://example.com/")
+    root = ei.value
+    seen = set()
+    while root is not None and id(root) not in seen:
+        seen.add(id(root))
+        if isinstance(root, AssertionError) and "запрещ" in str(root):
+            break
+        root = root.__cause__ or root.__context__
+    assert root is not None, f"httpx упал не от гарда: {ei.value!r}"
 
 
 @pytest.mark.asyncio
@@ -208,11 +220,23 @@ async def test_reminder_create_persists_and_replies(harness, run_turn) -> None:
     )
     await run_turn("напомни полить рассаду", make_planner_queue(plan),
                    update_id=5)
-    assert_happy_invariants(harness, must_contain=("Полить рассаду",))
+    assert_happy_invariants(
+        harness, must_contain=("Полить рассаду", "1 июля в 9:00"),
+    )
     sess = db_session(harness)
     try:
         from sreda.db.models.housewife import FamilyReminder
         rows = sess.query(FamilyReminder).all()
         assert len(rows) == 1 and "рассад" in (rows[0].title or "")
+        # Codex R2 high: контракт целиком — статус и время персистнуты
+        r = rows[0]
+        r_status = getattr(r, "status", None)
+        assert r_status in ("scheduled", "active", "pending"), (
+            f"статус напоминания: {r_status!r}"
+        )
+        trig = getattr(r, "trigger_at", None) or getattr(r, "trigger_at_utc", None)
+        assert trig is not None and "2027-07-01" in str(trig), (
+            f"время триггера не персистнуто: {trig!r}"
+        )
     finally:
         sess.close()
