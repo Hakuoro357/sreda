@@ -51,3 +51,29 @@ def test_fabricated_item_not_grounded() -> None:
 def test_empty_item_not_grounded() -> None:
     assert not item_grounded_in_sources("", ["что угодно"])
     assert not item_grounded_in_sources("   ", ["что угодно"])
+
+
+def test_zero_width_split_rejected() -> None:
+    """Codex R1 (оба) MAJOR: невидимый zero-width внутри слова не должен
+    рождать токен-границу — выдуманный «соль» НЕ обоснован в «фа​соль»."""
+    assert not item_grounded_in_sources("соль", ["возьми фа​соль"])
+    assert not item_grounded_in_sources("рис", ["купи и​рис"])
+    # и не ложно-отрицательный: «молоко» с невидимым внутри = «молоко»
+    assert item_grounded_in_sources("молоко", ["нужно мо​локо"])
+
+
+def test_hyphen_internal_not_boundary() -> None:
+    """Codex R1: внутрисловный дефис не граница — «песок» НЕ обоснован
+    в «сахар-песок», но «сахар-песок» обоснован целиком."""
+    assert not item_grounded_in_sources("песок", ["купи сахар-песок"])
+    assert not item_grounded_in_sources("то", ["сделай что-то"])
+    assert item_grounded_in_sources("сахар-песок", ["купи сахар-песок"])
+
+
+def test_decomposed_yo_and_iy_normalize() -> None:
+    """Codex R1 MINOR: разложенные ё (е+◌̈) и й (и+◌̆) сводятся NFKC."""
+    assert normalize_for_match("ёлка") == normalize_for_match("ёлка")
+    assert normalize_for_match("йогурт") == normalize_for_match("йогурт")
+    assert item_grounded_in_sources("ёлка", ["поставь ёлку"]) is False
+    # (форма слова разная — это ОК; точное слово грунтуется:)
+    assert item_grounded_in_sources("ёлка", ["поставь ёлка"])

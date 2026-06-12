@@ -17,7 +17,10 @@ import re
 import unicodedata
 
 # токен = последовательность букв/цифр; пунктуация и пробелы — границы
-_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# внутрисловный дефис — НЕ граница токена (Codex R1: иначе выдуманный
+# «песок» обосновывался в «сахар-песок», «то» в «что-то»)
+_TOKEN_RE = re.compile(r"[^\W_]+(?:[-‐‒–—][^\W_]+)*",
+                       re.UNICODE)
 
 
 def normalize_for_match(text: str) -> str:
@@ -25,12 +28,16 @@ def normalize_for_match(text: str) -> str:
     ё→е, краевая пунктуация убрана. БЕЗ семантических синонимов."""
     if not text:
         return ""
+    # NFKC сперва — компонует разложенные ё/й (е+◌̈ → ё, и+◌̆ → й).
     t = unicodedata.normalize("NFKC", text)
-    t = t.replace(" ", " ").replace(" ", " ")
+    # удалить невидимые формат-символы (Cf: zero-width) и оставшиеся
+    # комбинирующие знаки (Mn) — иначе разрывают токен (Codex R1 оба
+    # MAJOR: невидимый разрыв внутри слова обосновывал фрагмент).
+    t = "".join(ch for ch in t
+                if unicodedata.category(ch) not in ("Cf", "Mn"))
     t = t.casefold().replace("ё", "е")
-    t = re.sub(r"\s+", " ", t).strip()
-    # краевая пунктуация
-    t = t.strip(".,!?;:…\"'«»()[]-—–")
+    t = re.sub(r"\s+", " ", t).strip()       # \s в Unicode ловит NBSP
+    t = t.strip(".,!?;:…\"'«»()[]—–")          # краевая пунктуация (не дефис)
     return t.strip()
 
 
