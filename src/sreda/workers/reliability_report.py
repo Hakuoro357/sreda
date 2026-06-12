@@ -113,8 +113,12 @@ def count_breakdown_lines(
     Недоступность файлов — fail-soft 0 + warning."""
     n = 0
     unparsed = 0
-    paths = (sorted(_glob(log_glob))
-             if any(c in log_glob for c in "*?[") else [log_glob])
+    if any(c in log_glob for c in "*?["):
+        # + .1 от logrotate (delaycompress): маркеры до ротации внутри
+        # 24ч-окна не должны теряться (high R2)
+        paths = sorted(set(_glob(log_glob)) | set(_glob(log_glob + ".1")))
+    else:
+        paths = [log_glob]
     if not paths:
         logger.warning("reliability: логи по %s не найдены — breakdowns=0",
                        log_glob)
@@ -177,6 +181,11 @@ class ReliabilityReportWorker:
                  log_path: str | None = None) -> None:
         self.session = session
         self.state_file = Path(state_file or DEFAULT_STATE_FILE)
+        # Codex R2 (оба): при неписабельном основном каталоге провальная
+        # отметка писалась тем же сломанным писателем → бесконечные
+        # повторные отправки. Запасной путь в /tmp держит хотя бы откат.
+        self.fallback_state_file = Path(
+            "/tmp/sreda-reliability-state-fallback.json")
         self.log_path = log_path or DEFAULT_LOG_GLOB
 
     async def process_pending(self) -> int:
@@ -228,11 +237,12 @@ class ReliabilityReportWorker:
         state["failure_count"] = 0
         state["history"] = history
         if not self._write_state(state):
-            # state не записан → день НЕ зачтён: без durable-отметки
-            # возможны и потеря истории KPI, и повторные отправки
-            # (Codex R1 оба) — уходим в откат как провал
+            # state не записан → день НЕ зачтён: уходим в откат как провал,
+            # СО счётчиком серии (high R2: иначе P1 по этому пути не
+            # сработает); запись пойдёт в запасной /tmp-путь
             state.pop("last_run_at", None)
             state["last_failure_at"] = now.isoformat()
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
             self._write_state(state)
             return 0
         logger.info("reliability report sent: %s", day)
@@ -259,21 +269,30 @@ class ReliabilityReportWorker:
         return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
 
     def _read_state(self) -> dict:
-        if not self.state_file.exists():
-            return {}
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, ValueError, OSError):
-            return {}
+        for path in (self.state_file, self.fallback_state_file):
+            try:
+                if not path.exists():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except (json.JSONDecodeError, ValueError, OSError):
+                continue
+        return {}
 
     def _write_state(self, state: dict) -> bool:
+        payload = json.dumps(state, ensure_ascii=False)
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(
-                json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            self.state_file.write_text(payload, encoding="utf-8")
             return True
         except OSError:
-            logger.warning("reliability: state file %s недоступен",
-                           self.state_file)
+            logger.warning("reliability: state file %s недоступен — "
+                           "пробую запасной", self.state_file)
+        try:
+            self.fallback_state_file.write_text(payload, encoding="utf-8")
+            return True
+        except OSError:
+            logger.warning("reliability: запасной state %s тоже недоступен",
+                           self.fallback_state_file)
             return False

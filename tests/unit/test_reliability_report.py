@@ -220,3 +220,46 @@ def test_breakdown_msk_timestamps_converted(tmp_path: Path) -> None:
         since=datetime(2026, 6, 11, 0, 0, tzinfo=timezone.utc),
         until=datetime(2026, 6, 12, 0, 0, tzinfo=timezone.utc))
     assert in_11th_utc == 1, "02:00 MSK 12-го — это ещё 11-е UTC"
+
+
+@pytest.mark.asyncio
+async def test_unwritable_state_falls_back_and_backs_off(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Codex R2 (оба): основной state-путь недоступен → запасной /tmp
+    держит откат и счётчик серии (нет повторных отправок)."""
+    sent: list = []
+    monkeypatch.setattr(rr_module, "send_admin_alert",
+                        lambda *a, **kw: sent.append(a))
+    from sreda.workers.reliability_report import DayCounts
+    monkeypatch.setattr(rr_module, "gather_day_counts",
+                        MagicMock(return_value=DayCounts(1, 0, 0, 0, 0)))
+    monkeypatch.setattr(rr_module, "count_breakdown_lines",
+                        MagicMock(return_value=0))
+    w = ReliabilityReportWorker(MagicMock(),
+                                state_file=str(tmp_path / "nodir" / "st.json"))
+    # основной путь сломан: каталог-файл
+    (tmp_path / "nodir").write_text("файл вместо каталога", encoding="utf-8")
+    w.fallback_state_file = tmp_path / "fb.json"
+    assert await w.process_pending() in (0, 1)
+    first_sent = len(sent)
+    # второй тик: состояние читается из запасного → НЕ повторная отправка
+    assert await w.process_pending() == 0
+    assert len(sent) == first_sent, "повторная отправка при сломанном state"
+    assert w.fallback_state_file.exists()
+
+
+def test_breakdown_scans_rotated_log(tmp_path: Path) -> None:
+    """Codex R2 high: маркеры из .log.1 (ротация внутри окна) учитываются."""
+    from sreda.workers.reliability_report import count_breakdown_lines
+    (tmp_path / "a.log").write_text(
+        "2026-06-12 06:00:00 ERROR x ПОЛОМКА показана пользователю: a\n",
+        encoding="utf-8")
+    (tmp_path / "a.log.1").write_text(
+        "2026-06-12 05:00:00 ERROR x ПОЛОМКА показана пользователю: b\n",
+        encoding="utf-8")
+    n = count_breakdown_lines(
+        str(tmp_path / "*.log"),
+        since=datetime(2026, 6, 12, 0, 0, tzinfo=timezone.utc),
+        until=datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc))
+    assert n == 2
