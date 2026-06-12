@@ -81,6 +81,10 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         # state в /tmp/sreda-retention-state.json. На каждом tick
         # просто проверяет «пора ли». 152-ФЗ Часть 2.
         retention = RetentionWorker(session)
+        # #139: суточная сводка надёжности (этап 0 программы) — тот же
+        # каденс-паттерн (state-файл, раз в сутки, откат после провала)
+        from sreda.workers.reliability_report import ReliabilityReportWorker
+        reliability = ReliabilityReportWorker(session)
 
         # Order matters: proactive & housewife workers fill outbox →
         # delivery drains it within the same tick. The message queue
@@ -106,6 +110,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         aha_processed = await onboarding_aha.process_pending(limit=limit)
         delivery_processed = await delivery.process_pending_messages(limit=limit)
         retention_processed = await retention.process_pending()
+        reliability_processed = await reliability.process_pending()
         return (
             message_queue_processed
             + runtime_processed
@@ -117,6 +122,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             + aha_processed
             + delivery_processed
             + retention_processed
+            + reliability_processed
         )
     finally:
         session.close()
