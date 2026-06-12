@@ -157,6 +157,17 @@ def configure_logging(
     )
     dictConfig(cfg)
 
+    # #95 defense-in-depth: навесить редактор секретов на ВСЕ корневые
+    # хендлеры — закрывает остаточные пути утечки токена (наш
+    # logger.exception, heartbeat-строки, будущие логгеры), которые пин
+    # httpx→WARNING не покрывает (урок g-039).
+    from sreda.config.log_redaction import SecretRedactingFilter
+
+    _redactor = SecretRedactingFilter()
+    for _h in logging.getLogger().handlers:
+        if not any(isinstance(f, SecretRedactingFilter) for f in _h.filters):
+            _h.addFilter(_redactor)
+
     # Mutate uvicorn's module-level config so its `Config.configure_logging`
     # (called after app import) applies OUR config instead of its defaults.
     try:

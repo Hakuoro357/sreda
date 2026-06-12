@@ -304,7 +304,11 @@ class TelegramLongPoller:
                 row.last_ok_at = now_ts
                 row.last_error = None
             else:
-                row.last_error = (error or "")[:LAST_ERROR_MAX_CHARS]
+                # #95: last_error виден в админке/БД — редактируем токен
+                # (heartbeat не проходит через лог-фильтр)
+                from sreda.config.log_redaction import redact_secrets
+                row.last_error = redact_secrets(
+                    (error or "")[:LAST_ERROR_MAX_CHARS])
             session.commit()
 
     async def _fetch_updates(self) -> list[dict]:
