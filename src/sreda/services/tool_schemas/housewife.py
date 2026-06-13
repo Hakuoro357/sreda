@@ -634,17 +634,38 @@ class ListShoppingItem(BaseModel):
 
 class ListShoppingEmpty(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "Список покупок пуст."
 
 
 class ListShoppingItems(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     items: list[ListShoppingItem] = Field(min_length=1)
     """Non-empty by contract — empty list is the ``no shopping items``
     variant which routes to ``ListShoppingEmpty`` instead. Codex review
     Medium #1 — empty here would fail-open."""
     raw_text: str
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141/#119: display_line — БЕЗ sh_<id>. Метка СТАТИЧНАЯ (Codex R2 MAJOR:
+        # динамическая категория-метка шла вне «»-границы данных); категорию
+        # переносим ВНУТРЬ «»-обёрнутого элемента. Порядок ввода.
+        names: list[str] = []
+        for i in self.items:
+            cat = (i.category or "").strip()
+            # товар ПЕРВЫМ (Codex R3 MAJOR): длинная категория не должна обрезать
+            # название товара под общим лимитом длины элемента.
+            names.append(f"{i.display_line} ({cat})" if cat else i.display_line)
+        return build_display_summary([("Покупки", names)], preserve_order=True)
 
 
 ListShoppingOutput = Annotated[
@@ -769,16 +790,30 @@ class ListRemindersItem(BaseModel):
 
 class ListRemindersEmpty(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "Активных напоминаний нет."
 
 
 class ListRemindersList(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     items: list[ListRemindersItem] = Field(min_length=1)
     """Non-empty by contract — empty list is the ``no active reminders``
     variant (ListRemindersEmpty). Codex review Medium #2."""
     raw_text: str
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141/#119: display_line — БЕЗ rem_<id>; порядок выдачи.
+        names = [i.display_line for i in self.items]
+        return build_display_summary([("Напоминания", names)], preserve_order=True)
 
 
 ListRemindersOutput = Annotated[
@@ -1535,14 +1570,28 @@ class SearchRecipesItem(BaseModel):
 
 class SearchRecipesEmpty(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "По запросу ничего не нашла."
 
 
 class SearchRecipesList(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     items: list[SearchRecipesItem] = Field(min_length=1)
     raw_text: str
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141/#119: display_line — БЕЗ rec_<id>; порядок выдачи.
+        names = [i.display_line for i in self.items]
+        return build_display_summary([("Нашла рецепты", names)], preserve_order=True)
 
 
 SearchRecipesOutput = Annotated[
@@ -1741,11 +1790,18 @@ def parse_update_menu_item(
 
 class ListMenuEmpty(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "Меню на эту неделю ещё не составлено."
 
 
 class ListMenuOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     menu_id: MenuPlanId
     week_start_iso: str = Field(min_length=10)
@@ -1753,6 +1809,28 @@ class ListMenuOk(BaseModel):
     """Full multi-line grid as emitted by ``_iter_menu_plan_day_lines``.
     Composer templates can pull structured data later; for MVP the raw
     text is passed through verbatim."""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141/#119: raw_text планнер-facing — «menu_id: …» + «[recipe_id] title»
+        # (include_recipe_ids=True). Отдаём id-free версию: убираем заголовочные
+        # id-строки и [<тип>_<24hex>]-префиксы. Codex high+medium MAJOR: строки
+        # меню (названия блюд / free-text — пользовательские) рендерим как ИМЕНА
+        # через build_display_summary — та же защита, что у прочих списков
+        # (обёртка в «»-границу + sanitize_name: control/«»/коллапс/лимит). Так
+        # free-text c \n не сможет сфорджить лишнюю строку вне границы данных.
+        names: list[str] = []
+        for ln in self.raw_text.splitlines():
+            s = ln.strip()
+            if not s or s.startswith(("menu_id:", "week_start:")):
+                continue
+            s = re.sub(r"\[\w+_[0-9a-f]{24}\]\s*", "", s).strip()
+            if s:
+                names.append(s)
+        if not names:
+            return "Меню на эту неделю ещё не составлено."
+        return build_display_summary([("Меню на неделю", names)], preserve_order=True)
 
 
 ListMenuOutput = Annotated[
@@ -2154,8 +2232,21 @@ class ListFamilyMembersOk(BaseModel):
     ``ListFamilyMembersEmpty``."""
 
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     members: list[ListFamilyMembersRow] = Field(min_length=1)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141: имена + роль/возраст в порядке выдачи; member_id скрыт.
+        _ROLE = {"spouse": "супруг(а)", "child": "ребёнок",
+                 "parent": "родитель", "other": "родственник"}
+        names: list[str] = []
+        for m in self.members:
+            extra = [x for x in (_ROLE.get(m.role), m.age_text) if x]
+            names.append(f"{m.name} ({', '.join(extra)})" if extra else m.name)
+        return build_display_summary([("Семья", names)], preserve_order=True)
 
 
 class ListFamilyMembersEmpty(BaseModel):
@@ -2164,7 +2255,13 @@ class ListFamilyMembersEmpty(BaseModel):
     хочешь добавить?» vs «вот члены семьи»)."""
 
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "Пока никого не записано в семью."
 
 
 ListFamilyMembersOutput = Annotated[
@@ -2585,7 +2682,13 @@ class ListTasksEmpty(BaseModel):
     """Empty path: «no tasks» — planner branches to «нет задач на этот
     день» / «inbox пустой»."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "Задач нет."
 
 
 class ListTasksOk(BaseModel):
@@ -2599,8 +2702,25 @@ class ListTasksOk(BaseModel):
     still construct cleanly. The parser's job is to disambiguate
     `ListTasksEmpty` vs `ListTasksOk` via the «no tasks» literal."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     tasks: list[ListTasksRow] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141: задачи в ПОРЯДКЕ ВВОДА (Codex high MAJOR — НЕ группируем по
+        # статусу, иначе сквозной порядок переставляется); task_id скрыт,
+        # статус не-pending — суффиксом, чтобы рот не выдал отменённое за активное.
+        if not self.tasks:
+            return "Задач нет."
+        _MARK = {"completed": " ✓", "cancelled": " ✗"}
+        names: list[str] = []
+        for r in self.tasks:
+            base = (f"{r.title} ({r.scheduled_date_iso})"
+                    if r.scheduled_date_iso else r.title)
+            names.append(base + _MARK.get(r.runtime_status or "", ""))
+        return build_display_summary([("Задачи", names)], preserve_order=True)
 
 
 ListTasksOutput = Annotated[
@@ -3631,13 +3751,32 @@ class ListChecklistsRow(BaseModel):
 
 class ListChecklistsEmpty(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "Списков пока нет."
 
 
 class ListChecklistsOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     checklists: list[ListChecklistsRow] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141: названия списков + сколько осталось, в порядке выдачи; id скрыт.
+        names = [
+            f"{c.title} (осталось {c.pending_count})" if c.pending_count else c.title
+            for c in self.checklists
+        ]
+        if not names:
+            return "Списков пока нет."
+        return build_display_summary([("Списки", names)], preserve_order=True)
 
 
 ListChecklistsOutput = Annotated[
@@ -3722,17 +3861,35 @@ class ShowChecklistItem(BaseModel):
 class ShowChecklistEmpty(BaseModel):
     """List exists but has no items."""
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["empty"] = "empty"
     checklist_id: ChecklistId
     title: str = Field(min_length=1, max_length=500)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return f"Список «{sanitize_name(self.title)}» пока пуст."
+
 
 class ShowChecklistOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
     status: Literal["ok"] = "ok"
     checklist_id: ChecklistId
     title: str = Field(min_length=1, max_length=500)
     items: list[ShowChecklistItem] = Field(min_length=1)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141: пункты в ПОРЯДКЕ ВВОДА, статус — суффиксом, id скрыты. Метки
+        # СТАТИЧНЫЕ (Codex R2 MAJOR: заголовок-метка шёл вне «»-границы) —
+        # заголовок выносим отдельной «»-обёрнутой группой «Список».
+        _MARK = {"done": " ✓", "cancelled": " ✗"}
+        names = [i.title + _MARK.get(i.item_status, "") for i in self.items]
+        return build_display_summary(
+            [("Список", [self.title]), ("Пункты", names)], preserve_order=True)
 
 
 ShowChecklistOutput = Annotated[

@@ -557,7 +557,10 @@ def test_every_menu_spec_has_a_parser(spec) -> None:
 def test_parser_output_validates_against_spec_output_model(spec) -> None:
     raw = _PARSER_HAPPY_PATH[spec.name]
     parsed = parse_tool_output(spec.name, raw)
-    TypeAdapter(spec.output_model).validate_python(parsed.model_dump())
+    # #115/#141: exclude @computed_field (output-only, e.g. display_summary) —
+    # extra='forbid' variants reject them as input on re-validation.
+    computed = set(getattr(type(parsed), "model_computed_fields", {}))
+    TypeAdapter(spec.output_model).validate_python(parsed.model_dump(exclude=computed))
 
 
 def test_sentinel_is_not_valid_against_any_menu_output_model() -> None:
