@@ -262,10 +262,94 @@ def _present_recall_memory(output: Mapping[str, Any], domain_status: str) -> Any
     )
 
 
+# #141 — подтверждающие фразы для мутаций (короткое безопасное сырьё для рта,
+# БЕЗ id; рот перефразирует в тон Среды). Списки-показы покрыты на самих моделях
+# (display_summary / raw_text); здесь — мутации без отображаемых данных.
+# Значение: строка ИЛИ callable(output_mapping) -> str (для счётчиков/ветвлений).
+_CONFIRM_PHRASES: dict[tuple[str, str], Any] = {
+    ("archive_checklist", "archived"): "Список заархивирован.",
+    ("attach_reminder", "reminder_attached"): "Напоминание прикреплено к задаче.",
+    ("cancel_reminder", "cancelled"): "Напоминание отменено.",
+    ("clear_bought_shopping", "cleared"): lambda o: (
+        f"Убрала купленные позиции: {o.get('cleared_count')}."
+        if o.get("cleared_count") else "Купленных позиций не было."
+    ),
+    ("clear_menu", "cleared"): lambda o: (
+        f"Очистила меню ({o.get('cleared_count')})."
+        if o.get("cleared_count") else "Меню уже было пустым."
+    ),
+    ("delete_recipe", "deleted"): "Рецепт удалён.",
+    ("delete_task", "deleted"): "Задача удалена.",
+    ("detach_reminder", "reminder_detached"): "Напоминание откреплено от задачи.",
+    ("generate_shopping_from_menu", "generated"): lambda o: (
+        f"Собрала покупки из меню: {o.get('generated_count', 0)}."
+    ),
+    ("generate_shopping_from_menu", "plan_no_recipes"):
+        "В меню нет рецептов с ингредиентами — собирать нечего.",
+    ("link_task_to_checklist", "linked"): "Связала задачу со списком.",
+    ("link_task_to_checklist", "already_linked"): "Задача уже в этом списке.",
+    ("log_unsupported_request", "logged"):
+        "Пока такого не умею — записала пожелание создателям.",
+    ("move_task_to_checklist", "moved"): "Перенесла задачу в список.",
+    ("move_task_to_checklist", "moved_dup"):
+        "Перенесла — в списке уже была похожая задача.",
+    ("move_task_to_checklist", "partial_failure"):
+        "Перенесла не всё — часть не получилось.",
+    ("onboarding_answered", "answered"): "Записала.",
+    ("onboarding_complete", "complete"): "Знакомство завершено.",
+    ("onboarding_deferred", "deferred"): "Хорошо, вернёмся к этому позже.",
+    ("plan_week_menu", "plan_created"): "Меню на неделю готово.",
+    ("remove_family_member", "removed"): "Удалила из семьи.",
+    ("reply_with_buttons", "buttons_set"): "Готово.",
+    ("save_core_fact", "saved_core"): "Запомнила.",
+    ("save_episode", "saved_episode"): "Запомнила.",
+    ("schedule_reminder", "scheduled"): "Напоминание поставила.",
+    ("schedule_reminder", "skipped_past"):
+        "Это время уже прошло — напоминание не ставлю.",
+    ("unlink_task", "unlinked"): "Отвязала задачу от списка.",
+    ("unlink_task", "not_linked"): "Задача и так не была привязана к списку.",
+    ("update_menu_item", "updated"): "Обновила пункт меню.",
+    ("update_menu_item", "cleared_or_not_found"): "Пункт меню очищён.",
+    ("update_reminder", "updated"): "Напоминание обновила.",
+}
+
+
+def _confirm_override(tool: str) -> Callable[[Mapping[str, Any], str], Any]:
+    """Per-tool override (#141): короткая безопасная фраза по (tool, status).
+
+    Неизвестный статус (дрейф схемы) НЕ маскируем тихим «Готово.» — идём тем же
+    deny/metric-путём, что и отсутствующий display_field (Codex high+medium
+    MAJOR: тихий нейтрал прятал бы регрессию в проде). Известные статусы всех
+    confirm-инструментов покрыты явно — гарантирует test_presenter_coverage_141.
+    """
+
+    def fn(output: Mapping[str, Any], domain_status: str) -> Any:
+        entry = _CONFIRM_PHRASES.get((tool, domain_status))
+        if entry is not None:
+            return entry(output) if callable(entry) else entry
+        # fail-loud: запись в ту же метрику + «поломка» (как deny-by-default).
+        from sreda.services.composer.breakdown_messages import (
+            breakdown_phrase,
+            note_breakdown,
+        )
+        key = (tool, domain_status)
+        PRESENTER_FALLBACK_COUNTS[key] = PRESENTER_FALLBACK_COUNTS.get(key, 0) + 1
+        note_breakdown(
+            f"presenter_deny:{tool}:{domain_status}",
+            "confirm-инструмент: статус без явной фразы в _CONFIRM_PHRASES — fail-loud",
+        )
+        return breakdown_phrase()
+
+    return fn
+
+
 _OVERRIDES: dict[str, Callable[[Mapping[str, Any], str], Any]] = {
     "web_search": _present_web_search,
     "recall_memory": _present_recall_memory,
 }
+# #141: подтверждения мутаций — один override на инструмент, ветвление по статусу.
+for _confirm_tool in {_t for (_t, _s) in _CONFIRM_PHRASES}:
+    _OVERRIDES[_confirm_tool] = _confirm_override(_confirm_tool)
 
 
 # ---------------------------------------------------------------------------

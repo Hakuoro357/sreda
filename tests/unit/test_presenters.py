@@ -308,15 +308,19 @@ def test_real_registry_annotations_populate_map() -> None:
     assert m[("get_recipe", "found")] == "raw_text"
     assert m[("get_weather", "forecast")] == "raw_text"
     assert m[("fetch_url", "fetched")] == "text"
-    # List/structured outputs carry internal ids (raw_text has `[sh_..]`/`menu_..`;
-    # rows have task_id/member_id/...) → NOT annotated; deny-by-default until a
-    # sanitized per-tool override lands (Phase 2b code-review MAJOR, both Codex).
-    for unsafe in [
+    # #141: the "sanitized per-tool override" the Phase 2b guard waited for has
+    # landed. List/structured outputs now project a SANITIZED display_summary
+    # (display_line — id-free per #119; rows render name/title/date only; menu
+    # strips id-brackets). The id-free guarantee is verified POSITIVELY by
+    # test_no_id_leak_in_list_displays below + test_presenter_coverage_141.
+    for now_safe in [
         ("list_shopping", "ok"), ("list_reminders", "ok"), ("list_menu", "ok"),
         ("search_recipes", "ok"), ("list_tasks", "ok"), ("list_family_members", "ok"),
         ("list_checklists", "ok"), ("show_checklist", "ok"),
     ]:
-        assert unsafe not in m, f"{unsafe} leaks ids — must stay deny-by-default"
+        assert m[now_safe] == "display_summary", (
+            f"{now_safe} must project the sanitized display_summary (#141)"
+        )
     # error/empty/confirmation also stay unmapped → deny-by-default
     assert ("list_shopping", "error") not in m
     # #115: write tools are now annotated with the SAFE computed display_summary

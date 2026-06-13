@@ -48,10 +48,20 @@ def sanitize_name(name: object, *, max_len: int = MAX_NAME_LEN) -> str:
     return text
 
 
-def _render_group(names: Sequence[str], *, max_names: int, max_name_len: int) -> str:
+def _render_group(
+    names: Sequence[str],
+    *,
+    max_names: int,
+    max_name_len: int,
+    preserve_order: bool = False,
+) -> str:
     cleaned = [sanitize_name(n, max_len=max_name_len) for n in names]
     cleaned = [n for n in cleaned if n]
-    cleaned.sort()
+    # #141: показы списков сохраняют ПОРЯДОК ВВОДА пользователя (Boris 2026-06-13);
+    # мутации (#115) по-прежнему сортируют — порядок затронутых имён не важен.
+    # Детерминизм тестов сохраняется: на вход подаётся стабильный runtime-порядок.
+    if not preserve_order:
+        cleaned.sort()
     if not cleaned:
         return ""
     # Wrap each name in guillemets so a name containing ',', ':' or '.' (the whole
@@ -69,6 +79,7 @@ def build_display_summary(
     not_found_count: int = 0,
     max_names: int = MAX_NAMES,
     max_name_len: int = MAX_NAME_LEN,
+    preserve_order: bool = False,
 ) -> str:
     """Build the safe ``display_summary`` string handed to the live voice.
 
@@ -76,11 +87,24 @@ def build_display_summary(
     rendered, as ``"<label>: a, b, c"``. ``not_found_count`` (ids that don't exist /
     aren't owned — no name knowable) appends ``"N не нашла."``. Empty everything →
     a fixed neutral phrase (no names).
+
+    ``preserve_order=True`` (#141, list/show tools) keeps the user's entry order
+    instead of sorting names — мутации (#115) оставляют сортировку по умолчанию.
     """
     segments: list[str] = []
     for label, names in parts:
-        rendered = _render_group(names, max_names=max_names, max_name_len=max_name_len)
+        rendered = _render_group(
+            names, max_names=max_names, max_name_len=max_name_len,
+            preserve_order=preserve_order,
+        )
         if rendered:
+            # КОНТРАКТ МЕТКИ (#141, Codex R3): label НЕ санитизируется здесь —
+            # это стёрло бы «»-границы, которые некоторые callers сами навешивают
+            # на динамику (напр. update_shopping_items_category: «Перенесла в
+            # «{sanitize_name(cat)}»»). Поэтому label ДОЛЖЕН быть СТАТИЧЕСКИМ
+            # (developer-controlled) ЛИБО caller сам оборачивает пользовательскую
+            # часть в «» через sanitize_name. Динамику-без-обёртки в label —
+            # НЕЛЬЗЯ (инъекция вне границы данных).
             segments.append(f"{label}: {rendered}.")
     if not_found_count and not_found_count > 0:
         segments.append(f"{not_found_count} не нашла.")
