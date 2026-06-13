@@ -37,12 +37,14 @@ from pathlib import Path
 FAMILY_PHRASES: dict[str, list[str]] = {
     "shopping": [
         "добавь в покупки молоко и хлеб",
+        "ещё запиши 2 кг картошки и пачку соли",
         "что у меня в списке покупок",
         "купила молоко, убери из списка",
-        "добавь 2 кг картошки",
+        "очисти купленное",
     ],
     "reminders": [
         "напомни завтра в 9 позвонить маме",
+        "напомни каждый понедельник выносить мусор",
         "какие у меня напоминания",
         "перенеси напоминание про маму на 10 утра",
         "отмени напоминание про маму",
@@ -50,38 +52,89 @@ FAMILY_PHRASES: dict[str, list[str]] = {
     "checklists": [
         "запиши в дела на дачу: лопата, секатор, перчатки",
         "покажи дела",
+        "что в списке дела на дачу",
         "отметь лопату сделанной",
+        "добавь в дела на дачу ещё грабли",
     ],
     "tasks": [
         "добавь задачу позвонить врачу завтра",
+        "поставь задачу оплатить интернет сегодня",
         "покажи мои задачи",
         "выполнил задачу про врача",
+        "отмени задачу про интернет",
     ],
     "recipes": [
-        "сохрани рецепт борща: свёкла, капуста, варить 40 минут",
+        "сохрани рецепт борща: свёкла, капуста, картошка, варить 40 минут",
         "найди рецепт борща",
+        "покажи рецепт борща",
     ],
     "menu": [
         "составь меню на неделю",
         "покажи меню на эту неделю",
+        "поменяй обед в среду на суп",
     ],
     "household": [
         "запомни: у меня дочь Маша 7 лет и муж Иван",
         "кто у меня в семье",
+        "у Маши день рождения 15 марта",
     ],
     "memory": [
         "запомни, что у нас аллергия на орехи",
         "что ты помнишь про мою семью",
+        "что ты знаешь про наши аллергии",
     ],
     "web": [
         "какая погода завтра в Москве",
         "найди в интернете когда сажать рассаду томатов",
     ],
+    "utility_unsupported": [
+        "переведи фразу hello world на французский",
+        "сколько будет 2347 умножить на 891",
+    ],
     "smalltalk_identity": [
         "привет",
         "что ты умеешь",
+        "спасибо, ты супер",
     ],
 }
+
+
+def _load_env_file(path: str) -> None:
+    """g-046: читаем env-файл ПИТОНОМ (шелл-sourcing ломается на спецсимволах
+    и под чужим пользователем). Заполняем только нужные ключи и только если
+    они ещё не заданы. Значения в кавычках — снимаем кавычки."""
+    # Цель (Boris 2026-06-13): окружение прогона ИДЕНТИЧНО проду — мозг,
+    # эмбеддинги, поисковый провайдер, погода, ключи композера, фичефлаги —
+    # ВСЁ. Поэтому грузим ВЕСЬ прод-конфиг (все SREDA_*), а не выборку.
+    # Не затираем уже заданное (env запуска имеет приоритет над файлом).
+    file_vars: dict[str, str] = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if not k.startswith("SREDA_"):
+                continue
+            file_vars[k] = v.strip().strip('"').strip("'")
+            if not os.environ.get(k):
+                os.environ[k] = file_vars[k]
+    except OSError:
+        return
+    # косвенность *_FILE (паттерн systemd-секретов: в проде ключ мозга задан
+    # как SREDA_MIMO_API_KEY_FILE=/путь). Прочитать путь → прочитать файл →
+    # подставить базовый ключ.
+    for fkey, fval in list(file_vars.items()):
+        if not fkey.endswith("_FILE"):
+            continue
+        base = fkey[: -len("_FILE")]
+        if os.environ.get(base):
+            continue
+        try:
+            os.environ[base] = open(fval, encoding="utf-8").read().strip()
+        except OSError:
+            pass
 
 
 def _load_mimo_key() -> str | None:
@@ -142,19 +195,45 @@ class _TraceCapture(logging.Handler):
 
 
 def _setup_env(tmp: Path, mimo_key: str) -> None:
-    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode()
+    # ПРИНУДИТЕЛЬНО переопределяем ТОЛЬКО то, что нельзя брать с прода:
+    #   - БД: тесты создают/удаляют данные → нельзя в боевую базу. Это
+    #     единственное неизбежное отклонение от прода (см. оговорку в шапке).
+    #   - канал: бот-токен фейковый, реальная отправка замокана.
+    #   - очередь сообщений: выкл — детерминизм прогона.
+    #   - планировщик: ДОБАВЛЯЕМ eval-тенанта к прод-списку (не затираем).
     os.environ["SREDA_DATABASE_URL"] = f"sqlite:///{(tmp / 'eval.db').as_posix()}"
-    os.environ["SREDA_ENCRYPTION_KEY"] = key
-    os.environ["SREDA_PLANNER_ENABLED_TENANTS"] = TENANT
-    os.environ["SREDA_MESSAGE_QUEUE_ENABLED_TENANTS"] = ""
     os.environ["SREDA_TELEGRAM_BOT_TOKEN"] = "100:eval-token"
-    os.environ["SREDA_TG_ACCOUNT_SALT"] = "f" * 64
+    os.environ["SREDA_MESSAGE_QUEUE_ENABLED_TENANTS"] = ""
+    # секрет вебхука — транспорт (канал и так замокан). Пусто → dev-fallback
+    # принимает все запросы (telegram_webhook.py:53). Иначе прод-секрет
+    # отклоняет POST стенда без заголовка («secret token mismatch»).
+    os.environ["SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN"] = ""
+    os.environ["SREDA_MAX_WEBHOOK_SECRET_TOKEN"] = ""
+    # ИЗОЛЯЦИЯ НАБЛЮДАЕМОСТИ (критично): прогон НЕ должен писать в боевой
+    # trace.log / feature-requests-log и НЕ должен слать админ-алерты — иначе
+    # тестовые «поломки» попадают в монитор failed_turns_rate и поднимают
+    # ложный CRITICAL (прецедент 2026-06-13). Пути логов пустые → file-handler
+    # не создаётся (logging.py:73); пустой admin-chat → алерт некуда слать.
+    os.environ["SREDA_TRACE_LOG_PATH"] = ""
+    os.environ["SREDA_FEATURE_REQUESTS_LOG_PATH"] = ""
+    os.environ["SREDA_ADMIN_TG_CHAT_ID"] = ""
     os.environ["SREDA_MIMO_API_KEY"] = mimo_key  # ЖИВОЙ мозг + рот
-    os.environ["SREDA_FEATURE_MODULES"] = (
-        "sreda_feature_housewife_assistant.plugin")
-    from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
-    os.environ["SREDA_COMPOSER_LLM_ENABLED_KEYS"] = ",".join(
-        sorted(LLM_PROMPT_REGISTRY.prompt_keys()))
+    prod_planner = os.environ.get("SREDA_PLANNER_ENABLED_TENANTS", "")
+    tenants = [t.strip() for t in prod_planner.split(",") if t.strip()]
+    if TENANT not in tenants:
+        tenants.append(TENANT)
+    os.environ["SREDA_PLANNER_ENABLED_TENANTS"] = ",".join(tenants)
+    # Остальное — БЕРЁМ ПРОД (загружен из /etc/sreda/.env). setdefault даёт
+    # тестовый запас только если прод-значения нет (прогон вне VDS).
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode()
+    os.environ.setdefault("SREDA_ENCRYPTION_KEY", key)
+    os.environ.setdefault("SREDA_TG_ACCOUNT_SALT", "f" * 64)
+    os.environ.setdefault(
+        "SREDA_FEATURE_MODULES", "sreda_feature_housewife_assistant.plugin")
+    if not os.environ.get("SREDA_COMPOSER_LLM_ENABLED_KEYS"):
+        from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
+        os.environ["SREDA_COMPOSER_LLM_ENABLED_KEYS"] = ",".join(
+            sorted(LLM_PROMPT_REGISTRY.prompt_keys()))
 
 
 def _seed_tenant() -> None:
@@ -258,6 +337,9 @@ def _steps_from_trace(block: str) -> str:
 
 
 async def _main_async(families: list[str], out_path: Path) -> None:
+    # на VDS — подтянуть прод-эмбеддинги/ключи из /etc/sreda/.env (питоном)
+    if os.path.exists("/etc/sreda/.env"):
+        _load_env_file("/etc/sreda/.env")
     mimo_key = _load_mimo_key()
     if not mimo_key:
         print("НЕТ ключа мозга: задай SREDA_MIMO_API_KEY или "

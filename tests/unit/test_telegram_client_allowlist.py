@@ -78,6 +78,10 @@ _SCRIPTS_ALLOWLIST: set[str] = {
     # the same rationale as admin_alerts.py in the src/sreda allowlist
     # (sync/monitoring context where TelegramClient cannot be used).
     "monitor_health.py",
+    # #133 eval harness: sets a FAKE bot token into env so create_app() boots;
+    # the channel is fully mocked (no real Telegram traffic). Isolation-only env
+    # override, not a real token read.
+    "eval_family_phrases.py",
 }
 
 # Allowlist for top-level scripts/*.sh (relative to _SCRIPTS_ROOT).

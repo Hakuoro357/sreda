@@ -115,6 +115,12 @@ def harness(monkeypatch, tmp_path):
     # ключ фиктивный — клиент только конструируется, вызовы перехвачены
     # (планировщик — ContextVar-шов, рот — стаб, сеть — блокировщик)
     monkeypatch.setenv("SREDA_MIMO_API_KEY", "func-test-not-a-key")
+    # #133 фаза B: kind="llm" compose-ветки гейтятся settings-allowlist'ом
+    # (orchestrator effective_llm_keys). Включаем все ключи реестра —
+    # как предлагает planner_chat; рот всё равно застаблен.
+    from sreda.services.composer.prompts_registry import LLM_PROMPT_REGISTRY
+    monkeypatch.setenv("SREDA_COMPOSER_LLM_ENABLED_KEYS",
+                       ",".join(sorted(LLM_PROMPT_REGISTRY.prompt_keys())))
     # chat-скил приходит ПЛАГИНОМ (как на проде); реестр фич — lru_cache,
     # сбрасываем на сценарий, иначе протечка между тестами
     monkeypatch.setenv(
