@@ -300,6 +300,41 @@ def _seed_tenant() -> None:
         sess.close()
 
 
+_SEEN_EXEC_IDS: set[str] = set()
+
+
+def _capture_new_plans() -> list[dict]:
+    """#143: выгрузить НОВЫЕ planner_executions из БД стенда — увидеть, что
+    планировщик РЕАЛЬНО выдал (план / сырой ответ LLM / ошибки валидации /
+    исход исполнения). У стенда БД одноразовая, поэтому читаем по ходу."""
+    try:
+        from sreda.db.models.planner import PlannerExecution
+        from sreda.db.session import get_session_factory
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[dict] = []
+    try:
+        with get_session_factory()() as s:
+            rows = (s.query(PlannerExecution)
+                    .order_by(PlannerExecution.created_at.asc())
+                    .all())
+            for r in rows:
+                if r.id in _SEEN_EXEC_IDS:
+                    continue
+                _SEEN_EXEC_IDS.add(r.id)
+                out.append({
+                    "planner_status": r.planner_status,
+                    "execution_status": r.execution_status,
+                    "validation_errors": r.validation_errors,
+                    "raw_planner_response": (r.raw_planner_response or "")[:4000],
+                    "plan_json": r.plan_json,
+                    "execution_log_json": r.execution_log_json,
+                })
+    except Exception as exc:  # noqa: BLE001 — захват не должен валить прогон
+        out.append({"capture_error": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
 async def _run_phrase(app, channel: _CapturingChannel,
                       trace_cap: _TraceCapture, text: str,
                       update_id: int) -> dict:
@@ -323,7 +358,8 @@ async def _run_phrase(app, channel: _CapturingChannel,
         await asyncio.wait(pending, timeout=60)
     total_ms = int((time.monotonic() - t0) * 1000)
     return {"phrase": text, "answer": channel.final_text(),
-            "trace": trace_cap.last_block, "total_ms": total_ms}
+            "trace": trace_cap.last_block, "total_ms": total_ms,
+            "plans": _capture_new_plans()}
 
 
 def _steps_from_trace(block: str) -> str:
@@ -368,6 +404,22 @@ async def _main_async(families: list[str], out_path: Path) -> None:
     UsageLedgerService.try_consume = (  # type: ignore
         lambda self, tenant_id, metric, amount, periods: True)
 
+    # ИЗОЛЯЦИЯ АДМИН-АЛЕРТОВ (критично): «поломки» стенда НЕ должны слать P1 в
+    # личку владельцу. Зануление SREDA_ADMIN_TG_CHAT_ID не помогало — алерты
+    # идут через MAX (прецедент 2026-06-13). Глушим сетевые примитивы доставки
+    # (последний рубеж — любой путь: note_breakdown / planner / async/sync).
+    import sreda.services.admin_alerts as _aa
+
+    def _intercept_alert(_chan):  # печатает перехват, в сеть НЕ ходит
+        def _fn(*a, **k):
+            print(f"[EVAL] admin-alert ПЕРЕХВАЧЕН ({_chan}), в сеть не ушёл",
+                  file=sys.stderr)
+            return True
+        return _fn
+
+    _aa._post_max_sync = _intercept_alert("max")        # type: ignore
+    _aa._post_telegram_sync = _intercept_alert("tg")    # type: ignore
+
     from sreda.main import create_app
     app = create_app()  # вызывает configure_logging → dictConfig
 
@@ -404,6 +456,42 @@ async def _main_async(families: list[str], out_path: Path) -> None:
                      f"{steps} | {r['total_ms']}ms |")
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"\nТаблица: {out_path}  ({len(rows)} фраз)")
+
+    # #143: дамп реальных планов (plan_json / сырой ответ LLM / ошибки) по ходам.
+    plan_path = out_path.with_suffix(".plans.md")
+    plines = ["# Eval #133 — дамп планов планировщика (plan_json из БД стенда)", ""]
+    for r in rows:
+        plans = r.get("plans") or []
+        plines.append(f"## [{r.get('family')}] {r['phrase']}")
+        plines.append(f"Ответ: {r['answer'][:200]!r}")
+        if not plans:
+            plines.append("_(planner_executions не найдены — не плановый путь?)_\n")
+            continue
+        for i, p in enumerate(plans, 1):
+            if "capture_error" in p:
+                plines.append(f"- capture_error: {p['capture_error']}")
+                continue
+            plines.append(f"### exec {i}: planner={p['planner_status']} "
+                          f"execution={p['execution_status']}")
+            if p.get("validation_errors"):
+                plines.append(f"- validation_errors: {p['validation_errors']}")
+            plines.append("- plan_json:")
+            plines.append("```json")
+            plines.append(json.dumps(p.get("plan_json"), ensure_ascii=False, indent=2))
+            plines.append("```")
+            if p.get("execution_log_json"):
+                plines.append("- execution_log_json:")
+                plines.append("```json")
+                plines.append(json.dumps(p["execution_log_json"], ensure_ascii=False, indent=2)[:3000])
+                plines.append("```")
+            if p.get("raw_planner_response"):
+                plines.append("- raw_planner_response (cap 4k):")
+                plines.append("```")
+                plines.append(p["raw_planner_response"])
+                plines.append("```")
+        plines.append("")
+    plan_path.write_text("\n".join(plines) + "\n", encoding="utf-8")
+    print(f"Дамп планов: {plan_path}")
 
 
 def main() -> None:
