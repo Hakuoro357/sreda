@@ -81,6 +81,10 @@ class TraceContext:
     started_at: datetime
     started_monotonic: float
     events: list[TraceEvent] = field(default_factory=list)
+    # #140: исход хода для строки TOTAL. Монитор failed_turns_rate считает
+    # провалом outcome=='breakdown' (а не iters==0 — у планировщика iters
+    # всегда 0 даже на успехе). Ставится в единой точке показа «поломки».
+    outcome: str = "ok"
     _emitted: bool = False
 
 
@@ -138,6 +142,21 @@ def set_current(ctx: TraceContext | None) -> None:
     so the final ``outbox.delivered`` event is recorded into the same
     buffer before emission."""
     _current_trace.set(ctx)
+
+
+def mark_outcome(value: str) -> None:
+    """#140: пометить исход текущего хода (напр. ``'breakdown'``) — он
+    попадёт в строку TOTAL, и монитор failed_turns_rate считает провалом
+    именно ``outcome=='breakdown'`` (а не ``iters==0``: у планировщика iters
+    всегда 0 даже на успехе). Без активного trace-контекста — no-op."""
+    ctx = _current_trace.get()
+    if ctx is None:
+        return
+    # breakdown «липкий» (Codex MINOR): однажды показанная поломка не
+    # понижается последующим 'ok' до эмита TOTAL.
+    if ctx.outcome == "breakdown" and value != "breakdown":
+        return
+    ctx.outcome = value
 
 
 @contextmanager
@@ -216,6 +235,10 @@ def serialize_for_outbox(ctx: TraceContext) -> dict[str, Any]:
         "channel": ctx.channel,
         "started_at": ctx.started_at.isoformat(),
         "started_monotonic": ctx.started_monotonic,
+        # #140 (Codex CRITICAL): без этого воркер эмитит TOTAL из
+        # десериализованного ctx с outcome='ok' даже для поломок → проба
+        # failed_turns_rate ложно-негативит (поломки идут через outbox).
+        "outcome": ctx.outcome,
         "events": [
             {
                 "at_ms": e.at_ms,
@@ -242,6 +265,8 @@ def deserialize_from_outbox(payload_trace: dict[str, Any]) -> TraceContext:
         # the worker land AFTER the last event (which still has its
         # original at_ms from the uvicorn side).
         started_monotonic=time.monotonic(),
+        # #140: переносим исход хода (поломка), иначе воркер затрёт его 'ok'.
+        outcome=str(payload_trace.get("outcome") or "ok"),
     )
     for raw in payload_trace.get("events") or []:
         ctx.events.append(
@@ -330,7 +355,8 @@ def emit_block(
     summary = (
         f"------- TOTAL {total_ms}ms "
         f"iters={len(llm_events)} "
-        f"tok_in={in_tok} tok_out={out_tok}"
+        f"tok_in={in_tok} tok_out={out_tok} "
+        f"outcome={ctx.outcome}"  # #140: failed_turns_rate смотрит сюда
     )
     lines.append(summary)
 

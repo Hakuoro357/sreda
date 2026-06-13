@@ -49,6 +49,14 @@ def note_breakdown(source: str, detail: str = "", *, alert: bool = True) -> None
     второй алерт владельцу — дубль. Никогда не поднимает исключений —
     фиксация не должна добавить второй сбой к первому."""
     logger.error("ПОЛОМКА показана пользователю: %s %s", source, detail[:200])
+    # #140: единая точка показа поломки → помечаем трейс, чтобы монитор
+    # failed_turns_rate считал провалом outcome=='breakdown' (а не iters==0;
+    # у планировщика iters всегда 0). Ленивый импорт — без цикла; no-op без ctx.
+    try:
+        from sreda.services.trace import mark_outcome
+        mark_outcome("breakdown")
+    except Exception:  # noqa: BLE001 — пометка не должна валить фиксацию
+        logger.exception("note_breakdown: trace mark_outcome failed")
     if not alert:
         return
     try:
