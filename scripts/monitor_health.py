@@ -600,7 +600,7 @@ def _recent_traces(window_min: int = 30) -> list[dict]:
                     if len(parts) >= 5:
                         try:
                             ts = datetime.fromisoformat(parts[3] + "T" + parts[4]).replace(tzinfo=timezone.utc)
-                            current = {"ts": ts, "iters": 0, "total_ms": 0, "ack_ms": None, "type": None}
+                            current = {"ts": ts, "iters": 0, "total_ms": 0, "ack_ms": None, "type": None, "outcome": "ok"}
                         except Exception:
                             current = None
                 elif "webhook.received" in line and current is not None:
@@ -626,6 +626,10 @@ def _recent_traces(window_min: int = 30) -> list[dict]:
                         iters = int(line.split("iters=")[1].split()[0])
                         current["total_ms"] = ms
                         current["iters"] = iters
+                        # #140: исход хода ('breakdown' = провал; у планировщика
+                        # iters всегда 0, поэтому считаем по outcome, а не iters).
+                        if "outcome=" in line:
+                            current["outcome"] = line.split("outcome=")[1].split()[0]
                         if current["ts"] >= cutoff:
                             traces.append(current)
                     except Exception:
@@ -672,12 +676,16 @@ def probe_turn_latency_p95() -> ProbeResult:
 def probe_failed_turns_rate() -> ProbeResult:
     traces = _recent_traces(window_min=30)
     # Считаем только text/voice (где LLM ОБЯЗАН отработать). Callback'и и
-    # pending-bot ведут к iters=0 by design.
+    # pending-bot — отдельные пути.
     chat_traces = [t for t in traces if t.get("type") in ("text", "voice")]
     if not chat_traces:
         return ProbeResult("failed_turns_rate", "ok", "(no chat turns in 30m)")
     n = len(chat_traces)
-    failed = sum(1 for t in chat_traces if t["iters"] == 0)
+    # #140: провал = «ход отдал поломку» (outcome=='breakdown'), НЕ iters==0.
+    # iters — счётчик старого tool-loop; у планировщика он всегда 0 даже на
+    # успехе, и iters==0 ложно метил успешные ходы провалами (ломало KPI на
+    # трафике планировщика). Старые трейсы без outcome= → 'ok' (не провал).
+    failed = sum(1 for t in chat_traces if t.get("outcome") == "breakdown")
     pct = 100 * failed / n if n else 0
     if n >= 5 and pct > 20:
         return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} chat-turns failed ({pct:.0f}%)")
