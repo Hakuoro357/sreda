@@ -295,6 +295,20 @@ def _seed_tenant() -> None:
         st["status"] = STATUS_COMPLETE
         ob._persist(tenant_id=TENANT, user_id="user_eval", state=st,
                     source="system")
+        # #144: засеять НЕПУСТОЕ меню на текущую неделю — чтобы проверить показ/
+        # правку на реальном меню (стенд иначе пуст; пустое vs непустое — Boris).
+        from sreda.services.housewife_menu import (
+            HousewifeMenuService, MenuCellInput as _MenuCell,
+        )
+        _monday = now.date() - timedelta(days=now.weekday())
+        HousewifeMenuService(sess).plan_week(
+            tenant_id=TENANT, user_id="user_eval", week_start=_monday,
+            cells=[
+                _MenuCell(day_of_week=2, meal_type="lunch", free_text="борщ"),
+                _MenuCell(day_of_week=3, meal_type="dinner",
+                          free_text="курица с рисом"),
+            ],
+        )
         sess.commit()
     finally:
         sess.close()
