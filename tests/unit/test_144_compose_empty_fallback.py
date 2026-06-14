@@ -27,15 +27,35 @@ RED-before-impl: тесты фиксируют именно НАБЛЮДАЕМЫ
 
 from __future__ import annotations
 
+import pytest
+
 from sreda.runtime.planner.executor import ExecutionLog, StepResult
 from sreda.runtime.planner.schemas import ComposerCall
+from sreda.services.composer import presenters as _p
 from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
 from sreda.services.composer.compose import (
     PRESENTER_DISPLAY_FALLBACK_COUNTS,
     ComposeResult,
     compose,
 )
-from sreda.services.tool_schemas.housewife import ListMenuEmpty
+from sreda.services.tool_schemas.housewife import ListMenuEmpty, ListShoppingEmpty
+from sreda.services.tool_schemas.specs import ALL_TOOL_SPECS
+
+
+@pytest.fixture(autouse=True)
+def _real_display_field_map():
+    """``presenters._DISPLAY_FIELD_MAP`` — module-level singleton; фикстуры
+    test_115_* оставляют его в ``{}`` (``set_display_field_map({})``), отчего
+    ``render_display_text`` для пустого показа уходил бы в deny/«поломку» при
+    определённом порядке тестов и #144-A фоллбэк не срабатывал. Явно строим
+    карту из ALL_TOOL_SPECS, затем сбрасываем в None — пусть другие модули
+    лениво пересоберут (паттерн test_143_checklist_by_id / test_presenters;
+    см. feedback_pytest_monkeypatch_required)."""
+    _p.set_display_field_map(_p.build_display_field_map(ALL_TOOL_SPECS))
+    try:
+        yield
+    finally:
+        _p._DISPLAY_FIELD_MAP = None  # пусть другие модули лениво пересоберут
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +101,27 @@ def _empty_menu_step(step_id: str = "s1") -> StepResult:
     )
 
 
+def _empty_shopping_step(step_id: str = "s1") -> StepResult:
+    """list_shopping, исполнитель=ok, доменный статус=empty (ListShoppingEmpty).
+
+    #144 (Задача 1): механизм пост-фоллбэка #144-A теперь демонстрируется на
+    НЕ-меню инструменте, потому что для list_menu empty действует более сильный
+    ДЕТЕРМИНИРОВАННЫЙ override (см. test_144_menu_empty_override.py), который
+    перекрыл бы #144-A. list_shopping empty — displayable, не-меню, не из пула —
+    идеален, чтобы изолированно проверять именно #144-A."""
+    return _step(
+        step_id=step_id,
+        tool="list_shopping",
+        status="ok",
+        parsed_output=ListShoppingEmpty().model_dump(),
+    )
+
+
 # Текст-показ пустого меню (то, что должно уйти пользователю вместо «поломки»).
 _EMPTY_MENU_DISPLAY = "Меню на эту неделю ещё не составлено. Составить?"
+
+# Текст-показ пустого списка покупок (для изолированных #144-A кейсов).
+_EMPTY_SHOPPING_DISPLAY = "Список покупок пуст."
 
 
 # generic_tool_error рендерит фразу-«поломку» из пула (error_code не печатается);
@@ -101,18 +140,21 @@ def _breakdown_call_ref_s1(step_id: str = "s1") -> ComposerCall:
 # ---------------------------------------------------------------------------
 
 
-def test_breakdown_with_empty_menu_step_falls_back_to_presenter_display() -> None:
+def test_breakdown_with_empty_step_falls_back_to_presenter_display() -> None:
     """compose() свёлся к «поломке» (generic_tool_error рендерит breakdown_phrase),
-    эффективная компоновка ссылается на s1, последний шаг = list_menu со статусом
-    empty (ListMenuEmpty) → итог = display_summary «…не составлено. Составить?»,
-    НЕ «поломка», fallback_used=presenter_display_fallback."""
+    эффективная компоновка ссылается на s1, шаг = list_shopping со статусом empty
+    (ListShoppingEmpty) → итог = display_summary «Список покупок пуст.», НЕ
+    «поломка», fallback_used=presenter_display_fallback.
+
+    #144 (Задача 1): кейс переведён с list_menu на list_shopping, т.к. для
+    пустого меню действует более сильный override (другой файл тестов)."""
     call = _breakdown_call_ref_s1("s1")
-    log = _log([_empty_menu_step("s1")])
+    log = _log([_empty_shopping_step("s1")])
 
     res = compose(call, log)
 
     assert isinstance(res, ComposeResult)
-    assert res.text == _EMPTY_MENU_DISPLAY
+    assert res.text == _EMPTY_SHOPPING_DISPLAY
     assert res.text not in BREAKDOWN_POOL
     assert res.fallback_used == "presenter_display_fallback"
 
@@ -120,10 +162,10 @@ def test_breakdown_with_empty_menu_step_falls_back_to_presenter_display() -> Non
 def test_presenter_fallback_bumps_observability_counter() -> None:
     """Счётчик наблюдаемости PRESENTER_DISPLAY_FALLBACK_COUNTS растёт по
     имени инструмента при срабатывании фоллбэка."""
-    before = PRESENTER_DISPLAY_FALLBACK_COUNTS.get("list_menu", 0)
-    res = compose(_breakdown_call_ref_s1("s1"), _log([_empty_menu_step("s1")]))
+    before = PRESENTER_DISPLAY_FALLBACK_COUNTS.get("list_shopping", 0)
+    res = compose(_breakdown_call_ref_s1("s1"), _log([_empty_shopping_step("s1")]))
     assert res.fallback_used == "presenter_display_fallback"
-    after = PRESENTER_DISPLAY_FALLBACK_COUNTS.get("list_menu", 0)
+    after = PRESENTER_DISPLAY_FALLBACK_COUNTS.get("list_shopping", 0)
     assert after == before + 1
 
 
@@ -160,35 +202,35 @@ def test_m1_no_fallback_on_aborted_partial_outcome() -> None:
 
 
 def test_m2_does_not_show_wrong_step_when_ref_points_at_other_step() -> None:
-    """completed-план, ДВА успешных шага: s1 (list_menu empty, displayable) и s2
-    (другой инструмент, ok, тоже displayable). Эффективная компоновка ссылается
-    на s1 → фоллбэк показывает ИМЕННО s1 (меню), НЕ последний displayable s2.
+    """completed-план, ДВА успешных шага: s1 (list_shopping empty, displayable) и
+    s2 (другой инструмент, ok, тоже displayable). Эффективная компоновка ссылается
+    на s1 → фоллбэк показывает ИМЕННО s1 (покупки), НЕ последний displayable s2.
     Без M2 (старое «последний ok/empty») показали бы s2 — неверный ответ."""
     log = _log([
-        _empty_menu_step("s1"),
+        _empty_shopping_step("s1"),
         # поздний успешный шаг другого инструмента — НЕ должен победить
-        _step("s2", tool="list_shopping", status="ok",
+        _step("s2", tool="list_reminders", status="ok",
               parsed_output={"status": "empty"}),
     ])
     call = _breakdown_call_ref_s1("s1")  # ссылка только на s1
     res = compose(call, log)
     assert res.fallback_used == "presenter_display_fallback"
-    assert res.text == _EMPTY_MENU_DISPLAY
+    assert res.text == _EMPTY_SHOPPING_DISPLAY
     assert res.text not in BREAKDOWN_POOL
 
 
 def test_m2_single_referenced_step_fires_fallback() -> None:
     """Обратный кейс: РОВНО ОДИН реф-шаг (s2), он же единственный displayable
-    кандидат → фоллбэк срабатывает на него (s2 = меню), хотя в логе есть и s1."""
+    кандидат → фоллбэк срабатывает на него (s2 = покупки), хотя в логе есть и s1."""
     log = _log([
-        _step("s1", tool="list_shopping", status="ok",
+        _step("s1", tool="list_reminders", status="ok",
               parsed_output={"status": "empty"}),
-        _empty_menu_step("s2"),
+        _empty_shopping_step("s2"),
     ])
-    call = _breakdown_call_ref_s1("s2")  # ссылка только на s2 (меню)
+    call = _breakdown_call_ref_s1("s2")  # ссылка только на s2 (покупки)
     res = compose(call, log)
     assert res.fallback_used == "presenter_display_fallback"
-    assert res.text == _EMPTY_MENU_DISPLAY
+    assert res.text == _EMPTY_SHOPPING_DISPLAY
 
 
 def test_m2_no_fallback_when_referenced_step_not_displayable() -> None:
@@ -210,10 +252,14 @@ def test_m2_no_fallback_when_referenced_step_not_displayable() -> None:
 
 def test_m2_no_fallback_when_two_referenced_displayable_candidates() -> None:
     """Эффективная компоновка ссылается на ДВА шага, оба displayable
-    (ok/empty) → кандидатов 2 → неоднозначно → фоллбэк НЕ срабатывает."""
+    (ok/empty) → кандидатов 2 → неоднозначно → фоллбэк НЕ срабатывает.
+
+    #144 (Задача 1): шаги — НЕ list_menu (иначе сработал бы более сильный
+    menu-override на первом реф-шаге); берём list_shopping + list_reminders."""
     log = _log([
-        _empty_menu_step("s1"),
-        _empty_menu_step("s2"),
+        _empty_shopping_step("s1"),
+        _step("s2", tool="list_reminders", status="ok",
+              parsed_output={"status": "empty"}),
     ])
     # реф на оба: s1.status И s2.status (оба резолвятся в "empty")
     call = _template_call(
@@ -248,13 +294,16 @@ def test_minor_no_fallback_when_template_not_breakdown_origin() -> None:
 
     Воспроизводим через шаблон recipe_show, который печатает recipe_text как
     есть: кладём в recipe_text фразу из пула + реф на s1 → текст == «поломка»,
-    но origin легитимный (успешный рендер не-поломочного шаблона)."""
+    но origin легитимный (успешный рендер не-поломочного шаблона).
+
+    #144 (Задача 1): s1 — list_shopping empty, НЕ list_menu (для меню сработал бы
+    более сильный override, который НЕ смотрит на origin)."""
     pool_phrase = BREAKDOWN_POOL[0]
     call = _template_call(
         "recipe_show",
         {"recipe_text": pool_phrase, "_anchor": "${s1.status}"},
     )
-    log = _log([_empty_menu_step("s1")])
+    log = _log([_empty_shopping_step("s1")])
     res = compose(call, log)
     # текст == фраза пула, НО фоллбэк не сработал (origin не поломочный)
     assert res.text in BREAKDOWN_POOL

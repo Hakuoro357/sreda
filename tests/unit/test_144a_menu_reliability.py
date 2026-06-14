@@ -26,13 +26,29 @@ import pytest
 
 from sreda.runtime.planner.schemas import Plan
 from sreda.runtime.planner.validator import validate_plan
+from sreda.services.composer import presenters as _p
 from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
 from sreda.services.composer.presenters import render_display_text
 from sreda.services.tool_schemas.housewife import ListMenuEmpty
-from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
+from sreda.services.tool_schemas.specs import ALL_TOOL_SPECS, MIGRATED_TOOL_SPECS
 
 
 _REGISTRY = {s.name: s for s in MIGRATED_TOOL_SPECS}
+
+
+@pytest.fixture(autouse=True)
+def _real_display_field_map():
+    """``presenters._DISPLAY_FIELD_MAP`` — module-level singleton; фикстуры
+    test_115_* оставляют его в ``{}`` (``set_display_field_map({})``), отчего
+    ``render_display_text("list_menu","empty")`` уходил бы в deny/«поломку» при
+    определённом порядке тестов. Явно строим карту из ALL_TOOL_SPECS, затем
+    сбрасываем в None — пусть другие модули лениво пересоберут (паттерн
+    test_143_checklist_by_id / test_presenters; feedback_pytest_monkeypatch_required)."""
+    _p.set_display_field_map(_p.build_display_field_map(ALL_TOOL_SPECS))
+    try:
+        yield
+    finally:
+        _p._DISPLAY_FIELD_MAP = None  # пусть другие модули лениво пересоберут
 
 # Шаблон без контракта template_data — изолирует тест от композер-контрактов;
 # проверяем ИМЕННО арг-ссылку правки, а не рендер веток.

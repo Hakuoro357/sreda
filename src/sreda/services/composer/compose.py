@@ -241,6 +241,12 @@ FallbackUsed = Literal[
     # (ok/empty) умеет показать себя через презентер (#141) — отдаём показ
     # инструмента вместо «поломки». См. _maybe_presenter_display_fallback.
     "presenter_display_fallback",
+    # #144 (Задача 1): ДЕТЕРМИНИРОВАННЫЙ override пустого list_menu — для
+    # пустого меню «не составлено» ВСЕГДА верный ответ, а любая компоновка
+    # планировщика (рецепт/покупки/поломка) — мисроут. Перекрывает её всегда.
+    # СИЛЬНЕЕ presenter_display_fallback: срабатывает и на УСПЕШНОЙ (не-поломочной)
+    # компоновке. См. _maybe_menu_empty_override.
+    "menu_empty_override",
 ]
 
 
@@ -249,6 +255,14 @@ FallbackUsed = Literal[
 # имя инструмента релевантного шага; ненулевое значение в телеметрии = планировщик
 # построил компоновку «в расчёте на непустой результат», а композер спас показ.
 PRESENTER_DISPLAY_FALLBACK_COUNTS: dict[str, int] = {}
+
+
+# #144 (Задача 1): наблюдаемость ДЕТЕРМИНИРОВАННОГО override пустого list_menu.
+# Ключ — имя инструмента ("list_menu"). Ненулевое значение в телеметрии =
+# планировщик построил для ПУСТОГО меню НЕВЕРНУЮ компоновку (мисроут «рецепт»/
+# «покупки» ИЛИ «поломка»), а override детерминированно подменил её на
+# ListMenuEmpty.display_summary. См. _maybe_menu_empty_override.
+MENU_EMPTY_OVERRIDE_COUNTS: dict[str, int] = {}
 
 
 @dataclass(frozen=True)
@@ -374,12 +388,22 @@ def compose(
             expected_llm_prompt_registry_snapshot_hash
         ),
     )
-    # #144-A R1 fix (M2): фоллбэк выбирает шаг по РЕФАМ эффективной компоновки,
-    # не по «последнему ok/empty». Эффективную ComposerCall пересчитываем здесь
-    # ДЕТЕРМИНИРОВАННО тем же _pick_effective_call, что и _compose_impl (чистая
-    # функция от call+execution_log — повторный вызов даёт тот же результат),
-    # и передаём в фоллбэк.
+    # Эффективную ComposerCall пересчитываем здесь ДЕТЕРМИНИРОВАННО тем же
+    # _pick_effective_call, что и _compose_impl (чистая функция от
+    # call+execution_log — повторный вызов даёт тот же результат). Нужна и
+    # override'у (#144 Задача 1: якорь по рефам), и #144-A.
     effective_call = _pick_effective_call(call, execution_log)
+    # #144 (Задача 1) — ДЕТЕРМИНИРОВАННЫЙ override пустого list_menu. Запускается
+    # ПЕРВЫМ, потому что он СИЛЬНЕЕ #144-A: для пустого меню, на которое СОБИРАЛАСЬ
+    # ССЫЛАТЬСЯ компоновка, «не составлено» — ВСЕГДА верный ответ, поэтому он
+    # перекрывает ЛЮБУЮ компоновку планировщика (включая УСПЕШНУЮ-но-неверную:
+    # «Не нашла рецепт „меню"», «список покупок пуст»), а не только текст-
+    # «поломку», как #144-A. Если override сработал — возвращаем сразу.
+    overridden = _maybe_menu_empty_override(result, execution_log, effective_call)
+    if overridden is not None:
+        return overridden
+    # #144-A R1 fix (M2): фоллбэк выбирает шаг по РЕФАМ эффективной компоновки,
+    # не по «последнему ok/empty».
     return _maybe_presenter_display_fallback(result, execution_log, effective_call)
 
 
@@ -654,6 +678,133 @@ def _compose_impl(
     )
     return _result_generic_error(
         registry, error_code=f"unsupported_kind:{effective_call.kind}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# #144 (Задача 1) — детерминированный override пустого list_menu
+# ---------------------------------------------------------------------------
+
+# Узкий, жёстко заданный контракт override (анти-перехлёст с легитимными
+# показами):
+#   - инструмент — РОВНО ``list_menu`` (специфичен; другие пустые показы
+#     —  list_shopping, list_reminders и т.п. — НЕ затрагиваются);
+#   - доменный статус шага — РОВНО ``empty`` (``parsed_output["status"]``);
+#   - executor-статус шага — ``ok`` (реальный сбой исполнения — НЕ кандидат);
+#   - ``execution_log.outcome == "completed"`` (на провальном плане «поломка»
+#     честная, не маскируем).
+_MENU_TOOL = "list_menu"
+_MENU_EMPTY_DOMAIN_STATUS = "empty"
+
+
+def _maybe_menu_empty_override(
+    result: ComposeResult,
+    execution_log: ExecutionLog,
+    effective_call: ComposerCall,
+) -> ComposeResult | None:
+    """#144 (Задача 1) — ДЕТЕРМИНИРОВАННЫЙ override пустого ``list_menu``.
+
+    Если эффективная компоновка ССЫЛАЕТСЯ на шаг ``tool == "list_menu"`` с
+    executor-статусом ``ok`` и ДОМЕННЫМ статусом ``empty``
+    (``parsed_output["status"] == "empty"``) И план завершён
+    (``outcome == "completed"``) → ВСЕГДА вернуть показ
+    ``render_display_text("list_menu", parsed_output, domain_status="empty")``
+    (= ``ListMenuEmpty.display_summary`` «Меню на эту неделю ещё не составлено.
+    Составить?»), ПЕРЕКРЫВАЯ любую компоновку планировщика (рецепт / покупки /
+    поломку).
+
+    Зачем СИЛЬНЕЕ #144-A: пост-фоллбэк #144-A подменяет только текст-«поломку»,
+    и лишь когда среди РЕФОВ ровно один displayable-кандидат. Но на проде пустое
+    меню чаще сводилось к УСПЕШНОЙ-но-неверной компоновке («Не нашла рецепт
+    „меню"», «Твой список покупок пуст») — #144-A её НЕ ловит. Для пустого меню
+    «не составлено» — единственный верный ответ, мисроут ВСЕГДА неверен, поэтому
+    override детерминированно перекрывает компоновку независимо от её
+    «поломочности».
+
+    Якорь по РЕФАМ (а не «есть ли где-то в логе пустое list_menu») — критично:
+    в плане может быть НЕ-меню-интент с попутным preflight'ом меню (напр. «купи
+    молоко», где меню читалось вторым шагом и оказалось пустым). Тогда верный
+    ответ — про покупки, и слепой override испортил бы его. Override срабатывает
+    ТОЛЬКО когда компоновка СОБИРАЛАСЬ строить ответ ИЗ пустого меню (ссылается
+    на этот шаг) — тот же якорь M2, что у #144-A.
+
+    Узость/безопасность — см. _MENU_TOOL / _MENU_EMPTY_DOMAIN_STATUS. Реальные
+    сбои (executor error/timeout, доменный error/unknown) НЕ кандидаты → их
+    честная «поломка»/диагностика остаётся.
+
+    Возвращает новый ``ComposeResult`` (с ``fallback_used="menu_empty_override"``)
+    если override сработал, иначе ``None`` (вызывающий продолжает к #144-A).
+    """
+    # M1: только честно завершённый план.
+    if execution_log.outcome != "completed":
+        return None
+
+    # Якорь: шаги, на которые СТРУКТУРНО ссылается эффективная компоновка
+    # (${sN...}-рефы + humanize_result actions:[{step_id}]). Тот же разбор, что
+    # у #144-A — единый источник истины, не разъезжается.
+    referenced = _effective_call_referenced_step_ids(effective_call)
+    if not referenced:
+        return None
+
+    # Ищем СРЕДИ РЕФОВ шаг пустого меню: list_menu + executor-ok + доменный empty.
+    target = None
+    for step in execution_log.steps:
+        if step.step_id not in referenced:
+            continue
+        if step.tool != _MENU_TOOL:
+            continue
+        if step.status != "ok":
+            continue
+        parsed = step.parsed_output if isinstance(step.parsed_output, dict) else None
+        if parsed is None:
+            continue
+        if parsed.get("status") != _MENU_EMPTY_DOMAIN_STATUS:
+            continue
+        target = step
+        break
+    if target is None:
+        return None
+
+    # Override срабатывает ВСЕГДА для пустого меню — даже если компоновка УЖЕ
+    # верна (показала бы тот же «не составлено»). Это детерминированно и
+    # безопасно: текст идентичен, метрика растёт, телеметрия фиксирует, что
+    # планировщик столкнулся с пустым меню.
+    try:
+        display = render_display_text(
+            target.tool, target.parsed_output,
+            domain_status=_MENU_EMPTY_DOMAIN_STATUS,
+        )
+    except Exception:  # noqa: BLE001 — показ не должен добавить второй сбой
+        logger.exception(
+            "composer: #144 menu_empty override render failed for step %r "
+            "— оставляю исходную компоновку", target.step_id,
+        )
+        return None
+
+    # Презентер сам мог вернуть «поломку» (теоретически: дрейф ListMenuEmpty без
+    # display_field). Тогда override НЕ улучшает ответ → откатываемся к исходной
+    # компоновке (и #144-A ниже).
+    if not display or _is_breakdown_text(display):
+        return None
+
+    MENU_EMPTY_OVERRIDE_COUNTS[target.tool] = (
+        MENU_EMPTY_OVERRIDE_COUNTS.get(target.tool, 0) + 1
+    )
+    logger.info(
+        "composer: #144 menu_empty override — пустое меню (шаг %r), компоновка "
+        "планировщика перекрыта детерминированным показом «не составлено» "
+        "(исходный fallback_used=%r).",
+        target.step_id, result.fallback_used,
+    )
+    return ComposeResult(
+        text=display,
+        fallback_used="menu_empty_override",
+        error_code=result.error_code,
+        effective_template_id=result.effective_template_id,
+        effective_llm_prompt_key=result.effective_llm_prompt_key,
+        composer_provider=result.composer_provider,
+        composer_model=result.composer_model,
+        composer_latency_ms=result.composer_latency_ms,
     )
 
 
@@ -1435,6 +1586,7 @@ def _execution_summary(execution_log: ExecutionLog) -> str:
 
 
 __all__ = [
+    "MENU_EMPTY_OVERRIDE_COUNTS",
     "PRESENTER_DISPLAY_FALLBACK_COUNTS",
     "ComposeResult",
     "ComposerContext",

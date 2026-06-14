@@ -162,17 +162,15 @@ class FetchUrlToolInput(BaseModel):
 
 GET_WEATHER_SPEC = ToolSpec(
     name="get_weather",
+    # #144: ужато — перечисление примеров свёрнуто (аргументы самодокументны)
     description=(
         "Получить прогноз погоды через Open-Meteo (free, до 14 дней). "
-        "Аргументы: location (город), day_offset (0=сегодня, "
-        "1=завтра, ..., 13=через 13 дней; default 0), days_count "
-        "(1..14, сколько дней показать; default 1), granularity "
-        "(daily | part_of_day | hourly; default daily). "
-        "Примеры: «погода завтра» → day_offset=1, days_count=1; "
-        "«на неделю» → day_offset=0, days_count=7; «почасовой» → "
-        "granularity=hourly; «как одеться сегодня» → "
-        "granularity=part_of_day. Cross-field cap: "
-        "day_offset+days_count ≤14. Возвращает текстовую сводку."
+        "Аргументы: location (город), day_offset (0=сегодня, 1=завтра, "
+        "…13; default 0), days_count (1..14; default 1), granularity "
+        "(daily | part_of_day | hourly; default daily). Примеры: «завтра» "
+        "→ day_offset=1; «на неделю» → days_count=7; «почасовой» → "
+        "hourly; «как одеться» → part_of_day. Cross-field cap: "
+        "day_offset+days_count ≤14."
     ),
     family="web",
     effect="read",

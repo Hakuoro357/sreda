@@ -226,20 +226,15 @@ class RemoveFamilyMemberInput(BaseModel):
 
 ADD_FAMILY_MEMBERS_SPEC = ToolSpec(
     name="add_family_members",
-    # #128: ревью-метки (Codex R1 MAJOR #N) вырезаны — это шум для модели
+    # #128/#144: ужато — статус-форматы дублировались с output-строкой/mutex
     description=(
-        "Добавить одного или нескольких членов семьи за раз. "
-        "Используй когда юзер описывает семью одной фразой («у меня "
-        "жена Катя, сын Никита 10 лет»). Возраст: birth_year ТОЛЬКО "
-        "при явном годе рождения («Никита 2015 года рождения»); "
-        "«10 лет» / «школьник» / «пенсионер» → age_hint (год не "
-        "угадывать). Роли: spouse=муж/жена, child=сын/дочь, "
-        "parent=мама/папа, self=сам пользователь; остальное (сестра, "
-        "бабушка, дядя) → role='other' + отношение в notes. Имена "
-        "дедуплицируются (case-insensitive); все уже есть → "
-        "ok:added:0:skipped_as_duplicate:M, иначе "
-        "ok:added:N:skipped_as_duplicate:M:ids=[fm_,...]. Не уверен, "
-        "что записи новые — list_family_members сначала."
+        "Добавить одного или нескольких членов семьи за раз («у меня "
+        "жена Катя, сын Никита 10 лет»). Возраст: birth_year ТОЛЬКО при "
+        "явном годе рождения; «10 лет» / «школьник» → age_hint (год не "
+        "угадывать). Роли: spouse=муж/жена, child=сын/дочь, parent=мама/"
+        "папа, self=сам юзер; прочее (сестра, бабушка) → role='other' + "
+        "отношение в notes. Имена дедуплицируются (case-insensitive). Не "
+        "уверен, что записи новые — сначала list_family_members."
     ),
     family="household",
     effect="write",
@@ -295,18 +290,15 @@ LIST_FAMILY_MEMBERS_SPEC = ToolSpec(
 
 UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
     name="update_family_member",
-    # #128: ревью-метки вырезаны; ролевые правила — ссылкой на
-    # add_family_members (рендерятся в том же реестре, дубль не нужен)
+    # #128/#144: ужато; ролевые правила — ссылкой на add_family_members
     description=(
         "Обновить поля одного члена семьи: «Маше 9 уже», «у Никиты "
-        "теперь аллергия на молоко». Нет member_id — сначала "
-        "list_family_members, найди по name; несколько совпадений — "
-        "переспроси юзера. Передавай ТОЛЬКО меняющиеся поля, минимум "
-        "одно non-None (пустой апдейт = ошибка). Правила role — как в "
-        "add_family_members. Clear-семантика: notes='' и age_hint='' "
-        "очищают поле; birth_year — только clear_birth_year=True (не "
-        "вместе с birth_year=N). name и role очистить нельзя. "
-        "Возвращает ok:updated или error:member_not_found."
+        "аллергия на молоко». Нет member_id — сначала list_family_members "
+        "по name; несколько совпадений — переспроси. Передавай ТОЛЬКО "
+        "меняющиеся поля, минимум одно non-None. Правила role — как в "
+        "add_family_members. Clear: notes='' и age_hint='' очищают поле; "
+        "birth_year — только clear_birth_year=True (не вместе с "
+        "birth_year=N). name и role очистить нельзя."
     ),
     family="household",
     effect="write",

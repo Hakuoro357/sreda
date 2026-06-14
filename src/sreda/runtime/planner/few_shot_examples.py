@@ -824,6 +824,66 @@ _EXAMPLES.append(_ONLY_SELECTOR_TASK_EXAMPLE)
 
 
 # ---------------------------------------------------------------------------
+# #144 (Задача 2): показ меню — маршрут list_menu + дружелюбный пустой исход.
+# ---------------------------------------------------------------------------
+# Прод-инцидент (#144, живой N=5): «покажи меню»/«поменяй обед» на ПУСТОМ меню
+# давало мисроут («Не нашла рецепт „меню"», «список покупок пуст») или «поломку»,
+# и лишь иногда верное «не составлено». Основной фикс — детерминированный override
+# в composer (#144 Задача 1); этот few-shot — ПОДКРЕПЛЕНИЕ на стороне планировщика:
+# учит, что «покажи меню» → ВСЕГДА list_menu (НЕ search_recipes/get_recipe), а
+# пустой исход озвучивается через рот (humanize_result «не составлено, предложить
+# составить»), НЕ через generic_tool_error (тот = «поломка»/алерт).
+#
+# Компактно ради бюджета префикса (#128): ветка ok БЕЗ своего compose — падает в
+# root humanize_result (идентичен); явная только ветка empty (новое поведение).
+# Зеркалит форму _ONLY_SELECTOR_TASK_EXAMPLE (empty-исход → humanize, не «поломка»).
+_MENU_SHOW_EXAMPLE = FewShotExample(
+    user_message="покажи меню",
+    context_brief="",
+    plan={
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "показать меню"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_menu",
+                # week_start опускаем → runtime вернёт свежее меню (под «на эту
+                # неделю» планировщик подставил бы понедельник текущей недели).
+                "args": {},
+                "expected_outcomes": [
+                    # ok — без своего compose: падает в root humanize_result
+                    # (root ссылается на s1). Экономит префикс (#128).
+                    {"match": {"status": "ok"}, "next": None},
+                    # ПУСТО — ОЖИДАЕМЫЙ исход «не составлено», НЕ «поломка»
+                    # (#144). Мягко через рот: humanize_result сообщает, что
+                    # меню не составлено, и предлагает составить — НЕ
+                    # generic_tool_error (он рендерится «поломкой»/алертом).
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "llm",
+                                 "llm_prompt_key": "humanize_result",
+                                 "template_data": {
+                                     "intent": "сообщить, что меню не составлено, предложить составить",
+                                     "actions": [{"step_id": "s1"}]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "llm",
+            "llm_prompt_key": "humanize_result",
+            "template_data": {
+                "intent": "показать меню на неделю",
+                "actions": [{"step_id": "s1"}],
+            },
+        },
+    },
+)
+
+_EXAMPLES.append(_MENU_SHOW_EXAMPLE)
+
+
+# ---------------------------------------------------------------------------
 # PR-d (Piece 3): INVALID-case examples — "так НЕ делай"
 # ---------------------------------------------------------------------------
 # Shown to the planner as a SEPARATE "do NOT do this" block — deliberately NOT

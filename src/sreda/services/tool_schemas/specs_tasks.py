@@ -395,16 +395,14 @@ class UnlinkTaskInput(BaseModel):
 
 ADD_TASK_SPEC = ToolSpec(
     name="add_task",
-    # #128: дубли с mutex_notes вырезаны — планировщик видит обе секции
+    # #128/#144: дубли с mutex_notes вырезаны — планировщик видит обе секции
     description=(
-        "Создать задачу в Расписании юзера: «поставь задачу X», "
-        "«добавь Y в расписание», «запиши на завтра Z». Поля: title "
-        "(краткое имя), scheduled_date (today/tomorrow/ISO/inbox), "
-        "time_start/time_end (HH:MM в зоне юзера), recurrence_rule "
-        "(RRULE с UTC BYHOUR), notes, reminder_offset_minutes "
-        "(минуты ДО time_start; требует scheduled_date+time_start), "
-        "details_items (под-чеклист; пример: «купи хлеб, макароны, "
-        "яйца» → title=«Купить», details=[…])."
+        "Создать задачу в Расписании юзера: «поставь задачу X», «запиши "
+        "на завтра Z». Поля: title, scheduled_date (today/tomorrow/ISO/"
+        "inbox), time_start/time_end (HH:MM в зоне юзера), recurrence_rule "
+        "(RRULE с UTC BYHOUR), notes, reminder_offset_minutes (минуты ДО "
+        "time_start; требует scheduled_date+time_start), details_items "
+        "(под-чеклист: «купи хлеб, макароны» → title=«Купить», details=[…])."
     ),
     family="tasks",
     effect="write",
@@ -430,17 +428,15 @@ ADD_TASK_SPEC = ToolSpec(
 
 LIST_TASKS_SPEC = ToolSpec(
     name="list_tasks",
-    # #128: ужато; рецепт #122 (title_match/.only) сохранён дословно
+    # #128/#144: ужато; рецепт #122 (title_match/.only) сохранён дословно
     description=(
-        "Показать задачи юзера. Фильтры: date (today/tomorrow/ISO/"
-        "inbox/all) — default «today»; status (pending/completed/all) "
-        "— default «pending». Возвращает dump с task_id; пусто → "
-        "статус empty. Перед update/complete/cancel/delete, если "
-        "задача названа по имени. #122: для операции "
-        "ПО ИМЕНИ передавай date=\"all\" + title_match=<подстрока названия, "
-        "регистр/ё неважны> (если юзер явно не назвал дату), дальше бери "
-        "ровно-одну через ${sN.tasks.only.task_id}. поле выдачи list_tasks "
-        "называется tasks (НЕ items). filter()/where() в ссылках НЕ существует."
+        "Показать задачи юзера. Фильтры: date (today/tomorrow/ISO/inbox/"
+        "all) — default «today»; status (pending/completed/all) — default "
+        "«pending». Возвращает dump с task_id; пусто → empty. #122: для "
+        "операции ПО ИМЕНИ передавай date=\"all\" + title_match=<подстрока, "
+        "регистр/ё неважны> (если юзер не назвал дату), дальше ровно-одну "
+        "через ${sN.tasks.only.task_id}. Поле выдачи — tasks (НЕ items). "
+        "filter()/where() в ссылках НЕ существует."
     ),
     family="tasks",
     effect="read",
@@ -465,18 +461,15 @@ LIST_TASKS_SPEC = ToolSpec(
 
 UPDATE_TASK_SPEC = ToolSpec(
     name="update_task",
-    # #128: ужато без потери контрактов (inbox-ограничение сохранено)
+    # #128/#144: ужато без потери контрактов (inbox-ограничение сохранено)
     description=(
-        "Изменить поля существующей задачи: «перенеси на завтра», "
-        "«сделай ежедневной», «поменяй время на 8:00». Передавай "
-        "ТОЛЬКО меняющиеся поля, минимум одно non-None (пустой "
-        "апдейт = no-op). Смена scheduled_date/time_start "
-        "перепланирует линкованный reminder; добавить/убрать сам "
-        "reminder — attach_reminder/detach_reminder. Нет task_id — "
-        "сначала list_tasks. scheduled_date='inbox' через update НЕ "
-        "работает (трактуется «оставить как было») — честно скажи, "
-        "что прямого пути нет; альтернатив с потерей данных не "
-        "предлагай."
+        "Изменить поля существующей задачи: «перенеси на завтра», «сделай "
+        "ежедневной», «поменяй время на 8:00». Передавай ТОЛЬКО меняющиеся "
+        "поля, минимум одно non-None. Смена scheduled_date/time_start "
+        "перепланирует линкованный reminder; сам reminder — attach_reminder/"
+        "detach_reminder. Нет task_id — сначала list_tasks. "
+        "scheduled_date='inbox' через update НЕ работает («оставить как "
+        "было») — честно скажи, что прямого пути нет."
     ),
     family="tasks",
     effect="write",
@@ -689,17 +682,15 @@ DETACH_REMINDER_SPEC = ToolSpec(
 
 LINK_TASK_TO_CHECKLIST_SPEC = ToolSpec(
     name="link_task_to_checklist",
+    # #144: ужато — статусы дублировались с output-строкой
     description=(
-        "Связать существующую задачу с существующим чек-листом "
-        "(R-33: явная 1-to-1 связь). Используй когда оба уже "
-        "созданы отдельно и юзер просит связать («прикрепи список Y "
-        "к задаче X»). Для создания НОВОЙ task с деталями в одной "
-        "транзакции → add_task(details_items=...) вместо этого tool. "
-        "Возможные статусы: linked (новая связь), already_linked (та "
-        "же пара уже была — идемпотентно), error: "
-        "task_already_linked (задача связана с другим checklist'ом, "
-        "unlink сначала), error: checklist_already_linked (checklist "
-        "на другой задаче)."
+        "Связать существующую задачу с существующим чек-листом (явная "
+        "1-to-1 связь). Используй когда оба уже созданы отдельно и юзер "
+        "просит связать («прикрепи список Y к задаче X»). Для НОВОЙ task с "
+        "деталями в одной транзакции → add_task(details_items=...). "
+        "Статусы: linked / already_linked (идемпотентно) / "
+        "error:task_already_linked или checklist_already_linked (связь с "
+        "другим — нужен unlink)."
     ),
     family="tasks",
     effect="write",

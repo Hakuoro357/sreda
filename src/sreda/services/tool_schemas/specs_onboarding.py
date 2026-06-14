@@ -126,16 +126,14 @@ class OnboardingCompleteInput(BaseModel):
 
 ONBOARDING_ANSWERED_SPEC = ToolSpec(
     name="onboarding_answered",
+    # #144: ужато — статус-эхо (есть в output-строке) и цитата кода вырезаны
     description=(
-        "Отметить тему ``addressing`` (имя/обращение) как отвеченную "
-        "и перейти к следующей. Это ЕДИНСТВЕННАЯ активная тема в "
-        "текущем онбординге (housewife_onboarding.py:68 TOPIC_ORDER). "
-        "Вызывай когда юзер дал осмысленный ответ на запрос имени "
-        "из [ОНБОРДИНГ] block в системном промпте. ``summary`` — "
-        "ТОЛЬКО короткое имя/ник (1-3 слова, БЕЗ «Пользователя "
-        "зовут», «Меня зовут»). Возвращает "
-        "ok:answered:addressing:next=none:status=complete — после "
-        "addressing онбординг авто-закрывается."
+        "Отметить тему ``addressing`` (имя/обращение) как отвеченную и "
+        "перейти к следующей — это ЕДИНСТВЕННАЯ активная тема онбординга. "
+        "Вызывай когда юзер дал осмысленный ответ на запрос имени из "
+        "[ОНБОРДИНГ] block системного промпта. ``summary`` — ТОЛЬКО "
+        "короткое имя/ник (1-3 слова, БЕЗ «Пользователя зовут», «Меня "
+        "зовут»). После addressing онбординг авто-закрывается."
     ),
     family="onboarding",
     effect="write",
@@ -160,16 +158,14 @@ ONBOARDING_ANSWERED_SPEC = ToolSpec(
 
 ONBOARDING_DEFERRED_SPEC = ToolSpec(
     name="onboarding_deferred",
+    # #144: ужато — статус-эхо (есть в output-строке) вырезано
     description=(
-        "Отметить тему ``addressing`` как отложенную. Используй "
-        "когда юзер явно просит пропустить («потом», «не сейчас», "
-        "«пропусти»). Первый пропуск оставляет тему в retry-queue "
-        "(topic_state=skipped_once) — runtime может re-ask. Второй "
-        "пропуск делает skip permanent (topic_state=skipped). "
-        "``reason`` — короткое обоснование skip'а; runtime его НЕ "
-        "хранит, но поле обязательное чтобы планировщик явно "
-        "артикулировал решение в plan_json. Возвращает "
-        "ok:deferred:addressing:topic_state=...:next=...:status=..."
+        "Отметить тему ``addressing`` как отложенную. Используй когда юзер "
+        "явно просит пропустить («потом», «не сейчас», «пропусти»). Первый "
+        "пропуск оставляет тему в retry-queue (skipped_once) — runtime "
+        "может re-ask; второй делает skip permanent (skipped). ``reason`` "
+        "— короткое обоснование skip'а; runtime его НЕ хранит, но поле "
+        "обязательно, чтобы планировщик явно артикулировал решение."
     ),
     family="onboarding",
     effect="write",
