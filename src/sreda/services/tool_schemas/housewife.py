@@ -1807,7 +1807,9 @@ class ListMenuEmpty(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def display_summary(self) -> str:
-        return "Меню на эту неделю ещё не составлено."
+        # #144: добавлено предложение действия («Составить?» — прямая просьба
+        # Бориса), чтобы пустое меню звало составить, а не выглядело тупиком.
+        return "Меню на эту неделю ещё не составлено. Составить?"
 
 
 class ListMenuOk(BaseModel):
