@@ -548,11 +548,44 @@ def _phase1_check_ref_syntax(
         )
 
 
+def _reachable_producer_statuses(
+    plan: Plan, *, producer_step_id: str, consumer_step_id: str,
+) -> set[str]:
+    """#143 Phase B (Codex review MAJOR-3): статусы продюсера, при которых
+    управление переходит к потребителю.
+
+    Возвращает множество ``match.status`` веток ``producer_step_id``, у
+    которых ``next == consumer_step_id``. Это в точности те выходные
+    варианты продюсера, на которых потребитель РЕАЛЬНО запускается — а
+    значит его args-ссылки на поля продюсера должны резолвиться именно в
+    этих вариантах.
+
+    Пустое множество ⇒ продюсер не маршрутизирует управление к
+    потребителю через ``next`` (например, потребитель — корневой шаг, а
+    target указан только как data-dependency). Тогда caller оставляет
+    union-wide проверку (narrow_to_status=None) — сузить не по чему.
+
+    Ветки без ``status`` в ``match`` (теоретически — catch-all) и ветки с
+    нестроковым статусом игнорируются: для них сужение неопределимо."""
+    statuses: set[str] = set()
+    producer = plan.actions.get(producer_step_id)
+    if producer is None:
+        return statuses
+    for branch in producer.expected_outcomes:
+        if branch.next != consumer_step_id:
+            continue
+        status = (branch.match or {}).get("status")
+        if isinstance(status, str) and status:
+            statuses.add(status)
+    return statuses
+
+
 def _phase1_check_refs(
     step_id: str,
     action: Action,
     plan: Plan,
     tool_spec: ToolSpec | None,
+    registry: Mapping[str, ToolSpec] | None = None,
 ) -> Iterator[Violation]:
     """Yield ref-integrity violations (Codex R1 MAJOR #5):
 
@@ -598,6 +631,52 @@ def _phase1_check_refs(
                     f"— a step cannot consume its own output."
                 ),
             )
+            continue
+        # #143: validate the ref's field path against the PRODUCER's output
+        # schema — same machinery as compose refs (.only-aware via
+        # _peel_list_element_annotation, union/branch-aware). Catches
+        # ${s1.items.only.task_id} where list_tasks output field is `tasks`
+        # AT VALIDATION (→ retry with internal hint), not as a runtime
+        # arg_violation/«поломка».
+        #
+        # #143 Phase B (Codex review MAJOR-3): branch-AWARE narrowing.
+        # Раньше тут всегда стоял narrow_to_status=None (union-wide): поле,
+        # существующее ТОЛЬКО в error-варианте продюсера, проходило, даже
+        # если потребитель запускается лишь из status=ok → runtime
+        # interpolation failure. Теперь вычисляем ДОСТИЖИМЫЕ статусы
+        # продюсера для ЭТОГО потребителя — статусы веток продюсера, у
+        # которых next == step_id (consumer). Если набор непуст — ссылка
+        # обязана быть валидна в КАЖДОМ достижимом статусе (проверяем по
+        # очереди с narrow_to_status=<status>). Если связи next нет (target
+        # — просто dependency, не маршрутизатор сюда) — union-wide fallback.
+        if registry is not None:
+            reachable = _reachable_producer_statuses(
+                plan, producer_step_id=target, consumer_step_id=step_id,
+            )
+            if reachable:
+                for status in sorted(reachable):
+                    yield from _maybe_check_field_path(
+                        ref_path=ref_path,
+                        target_step_id=target,
+                        plan=plan,
+                        registry=registry,
+                        location="arg",
+                        host_step_id=step_id,
+                        host_tool=tool_spec.name if tool_spec else None,
+                        code="arg_ref_unknown_field",
+                        narrow_to_status=status,
+                    )
+            else:
+                yield from _maybe_check_field_path(
+                    ref_path=ref_path,
+                    target_step_id=target,
+                    plan=plan,
+                    registry=registry,
+                    location="arg",
+                    host_step_id=step_id,
+                    host_tool=tool_spec.name if tool_spec else None,
+                    code="arg_ref_unknown_field",
+                )
 
     # ``depends_on`` integrity (self-reference, unknown target, cycles)
     # is already enforced by ``Plan`` schema at construction time —
@@ -1408,6 +1487,7 @@ def validate_action_args(
     action: Action,
     tool_spec: ToolSpec,
     plan: Plan | None = None,
+    registry: Mapping[str, ToolSpec] | None = None,
 ) -> list[Violation]:
     """Run both phases against one Action. Returns structured violations.
 
@@ -1428,7 +1508,7 @@ def validate_action_args(
     # Phase 1.c: ref integrity (requires plan context for target lookup)
     if plan is not None:
         violations.extend(
-            _phase1_check_refs(step_id, action, plan, tool_spec)
+            _phase1_check_refs(step_id, action, plan, tool_spec, registry=registry)
         )
     # Phase 1.d: ToolSpec-declared «at least one of these mutable fields
     # must be provided non-null» — Codex Sub-A4 R5/R6 MAJOR #1. Fires
@@ -1873,6 +1953,7 @@ def _maybe_check_field_path(
     host_step_id: str | None,
     host_tool: str | None,
     narrow_to_status: str | None = None,
+    code: str = "compose_ref_unknown_field",
 ) -> Iterator[Violation]:
     """Helper: yield a violation if ref's top-level field doesn't exist
     in target tool's output_model. Skip silently if the output_model
@@ -1920,7 +2001,7 @@ def _maybe_check_field_path(
         yield Violation(
             step_id=host_step_id,
             tool=host_tool,
-            code="compose_ref_unknown_field",
+            code=code,
             message=(
                 f"{location} ref '${{{ref_path}}}': field {segments[0]!r} "
                 f"is NOT in {target_action.tool}.output_model{status_note}. "
@@ -2414,6 +2495,7 @@ def validate_plan(
                 action=action,
                 tool_spec=spec,
                 plan=plan,
+                registry=registry,
             )
         )
     # Cross-action cycle check via ref edges + depends_on

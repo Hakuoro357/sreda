@@ -369,10 +369,11 @@ def test_tool_show_checklist_marks(tools, session):
         "list_id_or_title": "X",
         "items": ["a", "b"],
     })
-    tools["mark_checklist_item_done"].invoke({
-        "list_id_or_title": "X",
-        "item_title_match": "a",
-    })
+    # #143 Phase B: mark теперь по item_id; id берём через сервис.
+    svc = ChecklistService(session)
+    list_id = svc.list_active(tenant_id="t1", user_id="u1")[0].id
+    item_a = [i for i in svc.list_items(list_id=list_id) if i.title == "a"][0]
+    tools["mark_checklist_item_done"].invoke({"item_id": item_a.id})
     r = tools["show_checklist"].invoke({"list_id_or_title": "X"})
     # Должно быть ☑ для done, ☐ для pending
     assert "\u2611" in r and "\u2610" in r
@@ -406,10 +407,12 @@ def test_tool_delete_checklist_item_happy(tools, session):
         "items": ["Покрасить дом", "Чинить забор", "Сделать забор",
                   "Собрать кучу глины", "Разобрать кучу глины"],
     })
-    r = tools["delete_checklist_item"].invoke({
-        "list_id_or_title": "Стройка",
-        "item_title_match": "Собрать кучу глины",
-    })
+    # #143 Phase B: delete по item_id; id берём через сервис.
+    svc = ChecklistService(session)
+    list_id = svc.list_active(tenant_id="t1", user_id="u1")[0].id
+    bad = [i for i in svc.list_items(list_id=list_id)
+           if i.title == "Собрать кучу глины"][0]
+    r = tools["delete_checklist_item"].invoke({"item_id": bad.id})
     assert r.startswith("ok:deleted:clitem_"), r
 
     # Проверим что осталось 4 пункта без «Собрать кучу глины».
@@ -420,12 +423,12 @@ def test_tool_delete_checklist_item_happy(tools, session):
 
 
 def test_tool_delete_checklist_item_not_found(tools):
+    # #143 Phase B: несуществующий item_id → item_not_found.
     tools["create_checklist"].invoke({"title": "X"})
     r = tools["delete_checklist_item"].invoke({
-        "list_id_or_title": "X",
-        "item_title_match": "несуществующее",
+        "item_id": "clitem_ffffffffffffffffffffffff",
     })
-    assert r.startswith("error: item_not_found")
+    assert r == "error: item_not_found", r
 
 
 def test_tool_archive_checklist(tools):

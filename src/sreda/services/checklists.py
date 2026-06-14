@@ -26,6 +26,7 @@ import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from sqlalchemy import delete as sa_delete, select as sa_select, update as sa_update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.checklists import (
@@ -634,3 +635,103 @@ class ChecklistService:
             )
             .one_or_none()
         )
+
+    def get_owned_item(
+        self, *, item_id: str, tenant_id: str, user_id: str,
+    ) -> ChecklistItem | None:
+        """#143 Phase B: достать пункт, ПОДТВЕРДИВ владельца через
+        родительский список И что список АКТИВЕН.
+
+        У ``ChecklistItem`` нет собственных ``tenant_id``/``user_id`` —
+        принадлежность определяется родительским ``Checklist``. JOIN'им и
+        фильтруем по tenant И user, поэтому чужой пункт (другая семья /
+        другой пользователь) НИКОГДА не вернётся. Это страж изоляции
+        семей для id-пути mark/delete (launch-инвариант): планировщик
+        получает item_id из ``list_checklist_items`` (где выдача УЖЕ
+        ограничена контекстом), но мутирующий рантайм всё равно
+        перепроверяет владельца ДО изменения — id мог прийти из старого
+        плана / другого turn'а.
+
+        Фильтр ``Checklist.status == "active"`` (Codex review #143 B):
+        ``list_checklist_items`` показывает пункты ТОЛЬКО активных
+        списков, значит mutate-инвариант — «менять можно лишь то, что мог
+        выбрать читающий шаг». По stale id из АРХИВНОГО списка пункт не
+        вернётся (и не будет изменён/удалён)."""
+        return (
+            self.session.query(ChecklistItem)
+            .join(Checklist, ChecklistItem.checklist_id == Checklist.id)
+            .filter(
+                ChecklistItem.id == item_id,
+                Checklist.tenant_id == tenant_id,
+                Checklist.user_id == user_id,
+                Checklist.status == "active",
+            )
+            .one_or_none()
+        )
+
+    def _owned_active_item_exists(self, *, tenant_id: str, user_id: str):
+        """Коррелированный EXISTS: пункт принадлежит tenant+user и его список
+        АКТИВЕН. Встраивается прямо в WHERE мутации (одно выражение — нет
+        окна гонки между проверкой и изменением)."""
+        return (
+            sa_select(Checklist.id)
+            .where(
+                Checklist.id == ChecklistItem.checklist_id,
+                Checklist.tenant_id == tenant_id,
+                Checklist.user_id == user_id,
+                Checklist.status == "active",
+            )
+            .exists()
+        )
+
+    def mark_owned_item_done(
+        self, *, item_id: str, tenant_id: str, user_id: str,
+    ) -> tuple[str, str] | None:
+        """#143 Phase B (Codex review R2, MAJOR): АТОМАРНАЯ отметка «сделано»
+        ОДНИМ ``UPDATE ... WHERE id AND EXISTS(active owned checklist)
+        RETURNING``.
+
+        Прежняя версия делала ``get_owned_item`` (SELECT) → мутация ORM →
+        commit: между SELECT и UPDATE список могли архивировать или пункт
+        удалить (active-фильтр уже НЕ участвовал в самой мутации) → гонка
+        могла изменить пункт архивного списка либо уйти в StaleDataError/
+        internal вместо мягкого not_found (критерий #8). Теперь ownership +
+        активность + мутация — в ОДНОМ выражении; пустой RETURNING → ``None``.
+
+        Возвращает ``(item_id, title)`` обновлённого пункта или ``None``
+        (чужой / архивный / исчезнувший — мутации НЕ происходит)."""
+        now = _utcnow()
+        stmt = (
+            sa_update(ChecklistItem)
+            .where(
+                ChecklistItem.id == item_id,
+                self._owned_active_item_exists(tenant_id=tenant_id, user_id=user_id),
+            )
+            .values(status="done", done_at=now, updated_at=now)
+            .returning(ChecklistItem.id, ChecklistItem.title)
+            .execution_options(synchronize_session=False)
+        )
+        row = self.session.execute(stmt).first()
+        self.session.commit()
+        return (row[0], row[1]) if row is not None else None
+
+    def delete_owned_item(
+        self, *, item_id: str, tenant_id: str, user_id: str,
+    ) -> tuple[str, str] | None:
+        """#143 Phase B (Codex review R2, MAJOR): АТОМАРНОЕ удаление ОДНИМ
+        ``DELETE ... WHERE id AND EXISTS(active owned checklist) RETURNING``
+        (см. ``mark_owned_item_done`` про окно гонки). Возвращает
+        ``(item_id, title)`` удалённого пункта (чтобы собрать ответ без
+        pre-fetch) или ``None`` (чужой / архивный / исчезнувший)."""
+        stmt = (
+            sa_delete(ChecklistItem)
+            .where(
+                ChecklistItem.id == item_id,
+                self._owned_active_item_exists(tenant_id=tenant_id, user_id=user_id),
+            )
+            .returning(ChecklistItem.id, ChecklistItem.title)
+            .execution_options(synchronize_session=False)
+        )
+        row = self.session.execute(stmt).first()
+        self.session.commit()
+        return (row[0], row[1]) if row is not None else None

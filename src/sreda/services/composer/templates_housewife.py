@@ -137,6 +137,24 @@ _CHECKLISTS_LIST_SHOW = (
 
 _CHECKLISTS_LIST_EMPTY = "Активных списков пока нет. Хочешь — заведём первый."
 
+# #143 Phase B: показ найденных «по описанию» пунктов (list_checklist_items).
+# Строки — ListChecklistItemsRow {item_title, list_title, item_status}; пункты
+# могут быть из РАЗНЫХ списков, поэтому показываем контекст списка. Симметрично
+# _CHECKLIST_SHOW: объект (mapping) ИЛИ плоская строка; done → ✅.
+_CHECKLIST_ITEMS_SHOW = (
+    "Нашла:"
+    "{% for it in items %}"
+    "\n• {% if it is mapping %}"
+    "{{ it.item_title | default('(пункт)', true) }}"
+    "{% if it.list_title is defined and it.list_title %}"
+    " (список «{{ it.list_title }}»){% endif %}"
+    "{% if it.item_status is defined and it.item_status == 'done' %} ✅{% endif %}"
+    "{% else %}{{ it }}{% endif %}"
+    "{% endfor %}"
+)
+
+_CHECKLIST_ITEMS_EMPTY = "Не нашла такого пункта."
+
 # ---------------------------------------------------------------------------
 # Recipes
 # ---------------------------------------------------------------------------
@@ -366,6 +384,9 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     # #131: показ всех списков (list_checklists)
     "checklists_list_show": _CHECKLISTS_LIST_SHOW,
     "checklists_list_empty": _CHECKLISTS_LIST_EMPTY,
+    # #143 Phase B: показ найденных «по описанию» пунктов (list_checklist_items)
+    "checklist_items_show": _CHECKLIST_ITEMS_SHOW,
+    "checklist_items_empty": _CHECKLIST_ITEMS_EMPTY,
     # recipes
     "recipe_show": _RECIPE_SHOW,
     "recipe_not_found_ask_alt": _RECIPE_NOT_FOUND_ASK_ALT,

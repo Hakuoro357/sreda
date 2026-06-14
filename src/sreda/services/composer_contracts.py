@@ -350,6 +350,8 @@ TEMPLATE_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     # #131: показ всех списков — единственный обязательный ключ items
     # (счётчики строк опциональны в рендере)
     "checklists_list_show": ("items",),
+    # #143 Phase B: показ найденных «по описанию» пунктов — обязателен items
+    "checklist_items_show": ("items",),
     "recipe_show": ("recipe_text",),
     "recipe_not_found_ask_alt": ("query",),
     "ask_when_to_remind": ("what",),
@@ -395,6 +397,9 @@ _TEMPLATE_ITEM_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
     # #131: строки list_checklists; счётчики опциональны в рендере, но
     # для литеральных данных требуем главное смысловое поле + остаток
     "checklists_list_show": {"items": ("title", "pending_count")},
+    # #143 Phase B: строки list_checklist_items — название пункта + контекст
+    # списка; item_status сторожится ``is defined`` в шаблоне (как в _CHECKLIST_SHOW)
+    "checklist_items_show": {"items": ("item_title", "list_title")},
 }
 
 
@@ -569,6 +574,15 @@ SAMPLE_TEMPLATE_DATA: dict[str, dict] = {
         ],
     },
     "checklists_list_empty": {},
+    # #143 Phase B
+    "checklist_items_show": {
+        "items": [
+            {"item_title": "лопата", "list_title": "Дача", "item_status": "pending"},
+            {"item_title": "лопата снегоуборочная", "list_title": "Гараж",
+             "item_status": "done"},
+        ],
+    },
+    "checklist_items_empty": {},
     "recipe_show": {"recipe_text": "Борщ: свёкла, капуста, говядина."},
     "recipe_not_found_ask_alt": {"query": "борщ"},
     "ask_user_for_clarification": {"missing_fields": ["time"]},
@@ -612,6 +626,7 @@ _COMPOSER_CONTRACTS: dict[str, ComposerContract | object] = {
     "shopping_list_empty": NO_CONTRACT,
     "reminders_list_empty": NO_CONTRACT,
     "checklists_list_empty": NO_CONTRACT,  # #131: фиксированный текст
+    "checklist_items_empty": NO_CONTRACT,  # #143 Phase B: фиксированный текст
     # error / fallback — fixed canned text, error_code never rendered;
     # execution_summary / attempt_count are optional-guarded.
     "generic_tool_error": NO_CONTRACT,

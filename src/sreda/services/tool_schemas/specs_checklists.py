@@ -30,12 +30,13 @@ from pydantic import (
 )
 
 from sreda.services.tool_schemas.base import ToolSpec
-from sreda.services.tool_schemas.common import ChecklistId, TaskId
+from sreda.services.tool_schemas.common import ChecklistItemId, ChecklistId, TaskId
 from sreda.services.tool_schemas.housewife import (
     AddChecklistItemsOutput,
     ArchiveChecklistOutput,
     CreateChecklistOutput,
     DeleteChecklistItemOutput,
+    ListChecklistItemsOutput,
     ListChecklistsOutput,
     MarkChecklistItemDoneOutput,
     MoveTaskToChecklistOutput,
@@ -100,8 +101,8 @@ ItemTitleMatch = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
 ]
-"""Substring used by mark_checklist_item_done / delete_checklist_item
-to fuzzy-locate an item within a list (housewife_chat_tools.py:2624,2663)."""
+"""Substring used by list_checklist_items to fuzzy-locate items by title
+ACROSS active lists (#143 Phase B читающий шаг → .only → mark/delete по id)."""
 
 
 # ---------------------------------------------------------------------------
@@ -155,23 +156,33 @@ class ShowChecklistInput(BaseModel):
     list_id_or_title: ListIdOrTitle
 
 
-class MarkChecklistItemDoneInput(BaseModel):
-    """Mark one item as done — runtime fuzzy-matches item by title
-    substring within the resolved list."""
+class ListChecklistItemsInput(BaseModel):
+    """#143 Phase B: найти пункты по фрагменту названия СРАЗУ ВО ВСЕХ
+    активных списках (или в списках, чьё название матчит
+    ``list_title_match``). Читающий шаг под id-путь mark/delete: выдача —
+    ВСЕ совпадения, дальше штатный ``.only`` выбирает ровно один."""
 
     model_config = ConfigDict(extra="forbid")
-    list_id_or_title: ListIdOrTitle
-    item_title_match: ItemTitleMatch
+    title_match: ItemTitleMatch
+    list_title_match: ListIdOrTitle | None = None
+
+
+class MarkChecklistItemDoneInput(BaseModel):
+    """#143 Phase B: отметить пункт «сделано» строго по ``item_id``.
+    Планировщик получает id из list_checklist_items (``.only.item_id``) —
+    title-пути у планировщика больше НЕТ (отрицательная гарантия)."""
+
+    model_config = ConfigDict(extra="forbid")
+    item_id: ChecklistItemId
 
 
 class DeleteChecklistItemInput(BaseModel):
-    """Hard-delete one item — runtime searches across ALL statuses
-    (pending/done) since user may want to remove already-completed
-    items too (housewife_chat_tools.py:2665 ``only_pending=False``)."""
+    """#143 Phase B: жёстко удалить пункт строго по ``item_id``.
+    Планировщик получает id из list_checklist_items (``.only.item_id``) —
+    title-пути у планировщика больше НЕТ (отрицательная гарантия)."""
 
     model_config = ConfigDict(extra="forbid")
-    list_id_or_title: ListIdOrTitle
-    item_title_match: ItemTitleMatch
+    item_id: ChecklistItemId
 
 
 class ArchiveChecklistInput(BaseModel):
@@ -191,11 +202,9 @@ CREATE_CHECKLIST_SPEC = ToolSpec(
     name="create_checklist",
     description=(
         "Создать ИМЕНОВАННЫЙ чек-лист (todo с галочками) БЕЗ пунктов. "
-        "Используй ТОЛЬКО когда юзер явно «заведи пустой список Y». "
-        "В 90% случаев юзер хочет сразу записать список С ПУНКТАМИ — "
-        "тогда используй add_checklist_items (он сам создаст список "
-        "если такого нет). НЕ для покупок (add_shopping_items) и НЕ "
-        "для задач с датой (add_task). Возвращает ok:created:checklist_X:title."
+        "ТОЛЬКО когда юзер явно «заведи пустой список Y». Обычно юзер хочет "
+        "сразу С ПУНКТАМИ — тогда add_checklist_items (сам создаст список). "
+        "Возвращает ok:created:checklist_X:title."
     ),
     family="checklists",
     effect="write",
@@ -215,7 +224,7 @@ CREATE_CHECKLIST_SPEC = ToolSpec(
         "сделай пустой checklist для ремонта",
     ],
     mutex_notes=[
-        "ТОЛЬКО для пустого списка. С пунктами сразу — add_checklist_items. Для покупок — add_shopping_items. Для задач с временем — add_task.",
+        "ТОЛЬКО пустой список. С пунктами — add_checklist_items. Покупки — add_shopping_items. Задачи с временем — add_task.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -231,8 +240,7 @@ ADD_CHECKLIST_ITEMS_SPEC = ToolSpec(
         # added_with_dups created может быть пуст (всё дубли) —
         # checklist_show спрятал бы «уже было» (Codex R2 MAJOR).
         "Добавить пункты в чек-лист (сам создаст список, если такого "
-        "нет). Триггеры: «запиши в дела по машине: колодки, масло», "
-        "«добавь в дела на дачу: лопата», «план кроя: лаванда, шампань». "
+        "нет). Триггеры: «запиши в дела по машине: …», «план кроя: …». "
         "Дубли не ошибка — идут в dups count. Возвращает "
         "ok:added:N:list=<id> или ok:added:N:dups:M:list=<id>. "
         "items: строки. status=added → checklist_show: "
@@ -251,8 +259,7 @@ ADD_CHECKLIST_ITEMS_SPEC = ToolSpec(
         "запиши в материалы для ремонта: краска, валик, скотч",
     ],
     mutex_notes=[
-        "Auto-create + populate в одном вызове. Для пустого списка → create_checklist. Для покупок → add_shopping_items. Для задач с датой → add_task.",
-        "Дубли — runtime НЕ ошибка, идут в dups count. План не должен ретраить.",
+        "Auto-create + populate. Пустой список → create_checklist. Покупки → add_shopping_items. Задачи с датой → add_task. Дубли НЕ ошибка (dups count), не ретраить.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -264,14 +271,12 @@ MOVE_TASK_TO_CHECKLIST_SPEC = ToolSpec(
     # #128: ужато; граница с link_task_to_checklist — в mutex_notes
     description=(
         "Перенести задачу из Расписания в чек-лист как ПУНКТ — один "
-        "вызов вместо cancel_task + add_checklist_items: «перенеси X "
-        "из расписания в дела Y», «это не на время — переложи в "
-        "дела». Шаги best-effort, НЕ одна транзакция: cancel task (с "
-        "reminder) → add item (с dedup; target создаётся, если нет). "
-        "Если add_item упал — task уже отменён: честно скажи юзеру о "
-        "частичном переносе. Возвращает "
-        "ok:moved:item_id=<clitem>:list=<cid> или "
-        "ok:moved:item_id=existing:list=<cid>:dup (идемпотентно)."
+        "вызов вместо cancel_task + add_checklist_items: «перенеси X в "
+        "дела Y», «это не на время — переложи в дела». Best-effort (НЕ "
+        "одна транзакция): cancel task → add item (target создаётся, если "
+        "нет). Если add упал — task уже отменён: скажи о частичном "
+        "переносе. Возвращает ok:moved:item_id=<clitem>:list=<cid> или "
+        "…:dup (идемпотентно)."
     ),
     family="checklists",
     effect="write",
@@ -286,8 +291,7 @@ MOVE_TASK_TO_CHECKLIST_SPEC = ToolSpec(
         "сделай эту задачу пунктом в плане кроя",
     ],
     mutex_notes=[
-        "Превращение task → пункт чек-листа (task cancelled). Для логической СВЯЗИ task ↔ checklist оба остаются — link_task_to_checklist из группы ЗАДАЧИ.",
-        "Идемпотентно по item: если пункт уже был, runtime НЕ создаёт дубль (status=moved_dup).",
+        "task → пункт чек-листа (task cancelled). Логическая СВЯЗЬ (оба остаются) — link_task_to_checklist. Идемпотентно: дубль не создаётся (moved_dup).",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -298,14 +302,10 @@ LIST_CHECKLISTS_SPEC = ToolSpec(
     name="list_checklists",
     description=(
         "Показать все активные чек-листы юзера со счётчиками pending/done/total. "
-        "Используй когда юзер «какие у меня списки», «покажи все мои планы», "
-        "«покажи дела», «что у меня в чек-листах». Возвращает список — "
-        "checklist_id строк годен для show_checklist / "
-        "mark_checklist_item_done / archive_checklist. "
-        "Пусто → статус empty (предложи create_checklist/add_checklist_items). "
-        # #131: «покажи дела» было нечем собрать — шаблон существует теперь
-        "Показ — checklists_list_show: {\"items\": \"${sN.checklists}\"}; "
-        "пусто → checklists_list_empty."
+        "Триггеры: «какие у меня списки», «покажи все мои планы», «покажи дела». "
+        "checklist_id годен для show_checklist / archive_checklist. Пусто → "
+        "empty. Показ — checklists_list_show: {\"items\": "
+        "\"${sN.checklists}\"}; пусто → checklists_list_empty."
     ),
     family="checklists",
     effect="read",
@@ -331,11 +331,9 @@ SHOW_CHECKLIST_SPEC = ToolSpec(
     name="show_checklist",
     description=(
         "Показать ПУНКТЫ одного чек-листа со статусами (pending/done/cancelled). "
-        "Используй когда юзер «покажи план кроя», «что осталось в списке X», "
-        "«покажи дела», «что я ещё не сделал из плана». Поддерживает либо "
-        "checklist_<id> либо нечёткий поиск по title. Возвращает items "
-        "с item_id для mark_checklist_item_done / delete_checklist_item. "
-        "Пунктов нет → статус empty (сам список есть — это НЕ not_found). "
+        "Триггеры: «покажи план кроя», «что осталось в списке X», «что я ещё "
+        "не сделал». Принимает checklist_<id> или нечёткий title. Пунктов нет "
+        "→ empty (список есть — это НЕ not_found). "
         # P1 2026-06-11: items чек-листа собрали reminders_list_show →
         # crash рендера (нет display_line). Показ — ТОЛЬКО checklist_show.
         "Показ — checklist_show: {\"title\": \"${sN.title}\", \"items\": "
@@ -354,8 +352,37 @@ SHOW_CHECKLIST_SPEC = ToolSpec(
         "открой checklist по машине",
     ],
     mutex_notes=[
-        "Возвращает ПУНКТЫ одного списка. Для списка ВСЕХ списков — list_checklists.",
-        "Используй чтобы получить item_id перед mark_checklist_item_done / delete_checklist_item когда юзер назвал пункт.",
+        "Пункты ОДНОГО названного списка. Все списки — list_checklists. Пункт по описанию для mark/delete — list_checklist_items.",
+    ],
+    timeout_seconds=5,
+    side_effect_class="read_only",
+)
+
+
+LIST_CHECKLIST_ITEMS_SPEC = ToolSpec(
+    name="list_checklist_items",
+    description=(
+        "Найти пункты по фрагменту названия во ВСЕХ активных списках "
+        "(сузь list_title_match). Читающий шаг под mark/delete ПО ИМЕНИ "
+        "(«отметь лопату», «удали стекло»): передай ${sN.items.only.item_id} "
+        "в mark_checklist_item_done / delete_checklist_item. Отдаёт ВСЕ "
+        "совпадения (не топ-1), .only выберет один. Пусто → empty. "
+        "Показ — checklist_items_show / _empty."
+    ),
+    family="checklists",
+    effect="read",
+    read_domains=["checklists"],
+    write_domains=[],
+    input_model=ListChecklistItemsInput,
+    output_model=ListChecklistItemsOutput,
+    trigger_examples=[
+        "найди пункт лопата в моих списках",
+        "в каком списке у меня лаванда",
+        "найди пункт стекло чтобы удалить",
+        "покажи где записана колодка",
+    ],
+    mutex_notes=[
+        "Пункты по имени из РАЗНЫХ списков (.only → mark/delete по item_id). Пункты ОДНОГО названного списка — show_checklist; список списков — list_checklists.",
     ],
     timeout_seconds=5,
     side_effect_class="read_only",
@@ -365,12 +392,10 @@ SHOW_CHECKLIST_SPEC = ToolSpec(
 MARK_CHECKLIST_ITEM_DONE_SPEC = ToolSpec(
     name="mark_checklist_item_done",
     description=(
-        "Отметить пункт чек-листа как сделанный. Используй когда юзер: "
-        "«сделал X», «купила Y», «закройла лаванду». Runtime fuzzy-matches "
-        "item по title substring внутри resolved list. Если list_id_or_title "
-        "ещё не известен (юзер назвал по имени) — сначала list_checklists "
-        "/ show_checklist для resolve'а. Возвращает ok:done:<item>:title "
-        "или error:checklist_list_not_found / error:checklist_item_not_found."
+        "Отметить пункт чек-листа сделанным по item_id (id из "
+        "list_checklist_items → ${sN.items.only.item_id}). Триггеры: "
+        "«сделал X», «купила Y», «закройла лаванду». Возвращает "
+        "ok:done:<item>:title или error:checklist_item_not_found."
     ),
     family="checklists",
     effect="write",
@@ -385,7 +410,7 @@ MARK_CHECKLIST_ITEM_DONE_SPEC = ToolSpec(
         "выполнила пункт про лопату",
     ],
     mutex_notes=[
-        "Только для отметки «сделано». Удаление пункта — delete_checklist_item. Отмена через статус нельзя — для повторного открытия используется отдельная операция (не migrated).",
+        "«Сделано» по item_id (из list_checklist_items → .only). Удаление пункта — delete_checklist_item.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -395,15 +420,11 @@ MARK_CHECKLIST_ITEM_DONE_SPEC = ToolSpec(
 DELETE_CHECKLIST_ITEM_SPEC = ToolSpec(
     name="delete_checklist_item",
     description=(
-        "Удалить один пункт из чек-листа жёстко (item ИСЧЕЗАЕТ). "
-        "Используй когда юзер: «удали пункт X», «убери из списка Y», "
-        "«не то записала, удали» — pure correction. Особенно полезно "
-        "когда ТЫ (LLM) ошибочно записал не то в прошлом turn'е и юзер "
-        "просит убрать неправильный пункт — остаётся только исправленный. "
-        "Ищет и по pending И по done items (runtime "
-        "only_pending=False). Отличается от mark_checklist_item_done "
-        "(status=done, пункт остаётся ☑) и от archive_checklist (весь "
-        "список из активных)."
+        "Удалить пункт жёстко по item_id (item ИСЧЕЗАЕТ; id из "
+        "list_checklist_items → ${sN.items.only.item_id}). Триггеры: "
+        "«удали пункт X», «не то записала, удали» — в т.ч. когда ТЫ (LLM) "
+        "записала не то. Отличается от mark_checklist_item_done (done, ☑) "
+        "и archive_checklist."
     ),
     family="checklists",
     effect="write",
@@ -418,7 +439,7 @@ DELETE_CHECKLIST_ITEM_SPEC = ToolSpec(
         "вычеркни пункт про рассаду",
     ],
     mutex_notes=[
-        "Только для УДАЛЕНИЯ ПУНКТА. Для «сделано» — mark_checklist_item_done. Для убрать ВЕСЬ список — archive_checklist.",
+        "Удаление ПУНКТА по item_id (из list_checklist_items → .only). «Сделано» — mark_checklist_item_done. Весь список — archive_checklist.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -428,11 +449,11 @@ DELETE_CHECKLIST_ITEM_SPEC = ToolSpec(
 ARCHIVE_CHECKLIST_SPEC = ToolSpec(
     name="archive_checklist",
     description=(
-        "Архивировать ВЕСЬ чек-лист — скрыть из list_checklists и Mini App, "
-        "но строки остаются в БД для recall истории. Используй когда юзер: "
-        "«закрой список X», «убери план кроя», «архивируй». Возвращает "
-        "ok:archived:<id> или error:checklist_list_not_found. Отличается "
-        "от delete_checklist_item (удаление ОДНОГО пункта)."
+        "Архивировать ВЕСЬ чек-лист — скрыть из list_checklists и Mini App "
+        "(строки остаются в БД). Триггеры: «закрой список X», «убери план "
+        "кроя», «архивируй». Возвращает ok:archived:<id> или "
+        "error:checklist_list_not_found. Отличается от delete_checklist_item "
+        "(удаление ОДНОГО пункта)."
     ),
     family="checklists",
     effect="write",
@@ -464,6 +485,7 @@ CHECKLISTS_SPECS: list[ToolSpec] = [
     MOVE_TASK_TO_CHECKLIST_SPEC,
     LIST_CHECKLISTS_SPEC,
     SHOW_CHECKLIST_SPEC,
+    LIST_CHECKLIST_ITEMS_SPEC,
     MARK_CHECKLIST_ITEM_DONE_SPEC,
     DELETE_CHECKLIST_ITEM_SPEC,
     ARCHIVE_CHECKLIST_SPEC,
@@ -483,7 +505,9 @@ __all__ = [
     "DELETE_CHECKLIST_ITEM_SPEC",
     "DeleteChecklistItemInput",
     "ItemTitleMatch",
+    "LIST_CHECKLIST_ITEMS_SPEC",
     "LIST_CHECKLISTS_SPEC",
+    "ListChecklistItemsInput",
     "ListChecklistsInput",
     "ListIdOrTitle",
     "MARK_CHECKLIST_ITEM_DONE_SPEC",
