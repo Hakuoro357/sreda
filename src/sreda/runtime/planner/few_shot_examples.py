@@ -824,6 +824,148 @@ _EXAMPLES.append(_ONLY_SELECTOR_TASK_EXAMPLE)
 
 
 # ---------------------------------------------------------------------------
+# #144 (Задача 2): показ меню — маршрут list_menu + дружелюбный пустой исход.
+# ---------------------------------------------------------------------------
+# Прод-инцидент (#144, живой N=5): «покажи меню»/«поменяй обед» на ПУСТОМ меню
+# давало мисроут («Не нашла рецепт „меню"», «список покупок пуст») или «поломку»,
+# и лишь иногда верное «не составлено». Основной фикс — детерминированный override
+# в composer (#144 Задача 1); этот few-shot — ПОДКРЕПЛЕНИЕ на стороне планировщика:
+# учит, что «покажи меню» → ВСЕГДА list_menu (НЕ search_recipes/get_recipe), а
+# пустой исход озвучивается через рот (humanize_result «не составлено, предложить
+# составить»), НЕ через generic_tool_error (тот = «поломка»/алерт).
+#
+# Компактно ради бюджета префикса (#128): ветка ok БЕЗ своего compose — падает в
+# root humanize_result (идентичен); явная только ветка empty (новое поведение).
+# Зеркалит форму _ONLY_SELECTOR_TASK_EXAMPLE (empty-исход → humanize, не «поломка»).
+_MENU_SHOW_EXAMPLE = FewShotExample(
+    user_message="покажи меню",
+    context_brief="",
+    plan={
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "показать меню"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_menu",
+                # week_start опускаем → runtime вернёт свежее меню (под «на эту
+                # неделю» планировщик подставил бы понедельник текущей недели).
+                "args": {},
+                "expected_outcomes": [
+                    # ok — без своего compose: падает в root humanize_result
+                    # (root ссылается на s1). Экономит префикс (#128).
+                    {"match": {"status": "ok"}, "next": None},
+                    # ПУСТО — ОЖИДАЕМЫЙ исход «не составлено», НЕ «поломка»
+                    # (#144). Мягко через рот: humanize_result сообщает, что
+                    # меню не составлено, и предлагает составить — НЕ
+                    # generic_tool_error (он рендерится «поломкой»/алертом).
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "llm",
+                                 "llm_prompt_key": "humanize_result",
+                                 "template_data": {
+                                     "intent": "сообщить, что меню не составлено, предложить составить",
+                                     "actions": [{"step_id": "s1"}]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+        },
+        "compose": {
+            "kind": "llm",
+            "llm_prompt_key": "humanize_result",
+            "template_data": {
+                "intent": "показать меню на неделю",
+                "actions": [{"step_id": "s1"}],
+            },
+        },
+    },
+)
+
+_EXAMPLES.append(_MENU_SHOW_EXAMPLE)
+
+
+# ---------------------------------------------------------------------------
+# #144 (Задача 1): ПРАВКА меню — preflight list_menu → update_menu_item.
+# ---------------------------------------------------------------------------
+# Прод-инцидент (#144, живой N=5): «поменяй обед в среду на суп» на ПУСТОМ меню.
+# Планировщик строил preflight s1=list_menu → s2=update_menu_item, НО ветка empty
+# у s1 не была терминальной → s2 пропускался (branch_not_selected) → план НЕ
+# завершался чисто (outcome≠completed) → «поломка»; либо шёл прямо в update и
+# ложно «Обновила». Этот пример учит ПРАВИЛЬНОЙ форме edit-плана:
+#   - s1=list_menu с ДВУМЯ исходами: ok → next='s2' (меню есть → правим),
+#     empty → ТЕРМИНАЛ (next=None) с дружелюбным humanize «не составлено,
+#     предложить составить» — НЕ generic_tool_error (тот = «поломка»/алерт),
+#     НЕ branch_not_selected. Это ключевой фикс (пустое меню НЕ ведёт в write).
+#   - s2=update_menu_item ссылается на ПРАВИЛЬНОЕ поле выдачи list_menu —
+#     ${s1.menu_id} (НЕ ${s1.plan_id}: поле list_menu называется menu_id,
+#     валидатор C #143 отклонит plan_id с arg_ref_unknown_field).
+# Branch-aware: ссылка ${s1.menu_id} в s2 валидируется против варианта ListMenuOk
+# (ветка ok маршрутизирует в s2), где поле menu_id есть.
+# Компактно ради бюджета префикса (#128): success-путь s2 БЕЗ своего compose —
+# падает в root humanize_result (root ссылается на успешный s2); явные только
+# empty у s1 (новое поведение) и error у s2 (мягко).
+_MENU_EDIT_EXAMPLE = FewShotExample(
+    user_message="поменяй обед в среду на суп",
+    context_brief="",
+    plan={
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "правка ячейки меню — preflight через list_menu"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_menu",
+                # week_start опускаем → runtime вернёт свежее меню.
+                "args": {},
+                "expected_outcomes": [
+                    # меню ЕСТЬ → правим (управление в s2).
+                    {"match": {"status": "ok"}, "next": "s2"},
+                    # ПУСТО → ТЕРМИНАЛ (#144): пустое меню НЕ ведёт в write.
+                    # Мягко через рот: humanize_result сообщает, что меню не
+                    # составлено, и предлагает составить — НЕ generic_tool_error
+                    # (он = «поломка»/алерт), НЕ branch_not_selected.
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "llm",
+                                 "llm_prompt_key": "humanize_result",
+                                 "template_data": {
+                                     "intent": "сообщить, что меню не составлено, предложить составить",
+                                     "actions": [{"step_id": "s1"}]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+            "s2": {
+                "tool": "update_menu_item",
+                # ПОЛЕ ВЫДАЧИ list_menu — ``menu_id`` (НЕ plan_id!).
+                # day_of_week: 2 = среда (Пн=0); free_text вместо recipe_id.
+                "args": {"plan_id": "${s1.menu_id}", "day_of_week": 2,
+                         "meal_type": "lunch", "free_text": "суп"},
+                "expected_outcomes": [
+                    # Успех — без своего compose: падает в root humanize_result
+                    # (root ссылается на успешный s2). Экономит префикс (#128).
+                    {"match": {"status": "updated"}, "next": None},
+                    {"match": {"status": "error"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "generic_tool_error",
+                                 "template_data": {"error_code": "${s2.error_code}"}}},
+                ],
+                "intent_group": "default",
+                "depends_on": ["s1"],
+            },
+        },
+        "compose": {
+            "kind": "llm",
+            "llm_prompt_key": "humanize_result",
+            "template_data": {
+                "intent": "подтвердить, что обед в среду заменён",
+                "actions": [{"step_id": "s2"}],
+            },
+        },
+    },
+)
+
+_EXAMPLES.append(_MENU_EDIT_EXAMPLE)
+
+
+# ---------------------------------------------------------------------------
 # PR-d (Piece 3): INVALID-case examples — "так НЕ делай"
 # ---------------------------------------------------------------------------
 # Shown to the planner as a SEPARATE "do NOT do this" block — deliberately NOT

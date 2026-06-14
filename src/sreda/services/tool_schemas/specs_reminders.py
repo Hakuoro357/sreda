@@ -238,9 +238,9 @@ SCHEDULE_REMINDER_SPEC = ToolSpec(
         # registry — planner would have been steered toward an
         # unavailable tool. Reword as intent-level guidance; restore
         # the cross-tool reference once tasks family migrates.
-        "Используй для standalone-напоминаний (НЕ привязанных к существующей задаче). Если юзер просит «напомни про задачу T-X» — задача должна сама подцепить напоминание (legacy router пока).",
-        "НЕ вызывай для уточнения существующего напоминания — это update_reminder, не schedule + cancel.",
-        "Для отмены — cancel_reminder. Для проверки активных — list_reminders.",
+        "Для standalone-напоминаний (НЕ привязанных к задаче). «Напомни про задачу T-X» — задача сама подцепит напоминание (legacy router).",
+        "Правка существующего — update_reminder, не schedule + cancel.",
+        "Отмена — cancel_reminder; проверка активных — list_reminders.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -296,9 +296,9 @@ UPDATE_REMINDER_SPEC = ToolSpec(
         "убери повтор у напоминания",
     ],
     mutex_notes=[
-        "Используй для in-place правки. НЕ вызывай cancel + schedule — это две LLM-итерации и потеря recurrence-state.",
-        "Сначала list_reminders чтобы получить reminder_id.",
-        "Для отмены — cancel_reminder, не update с clear-всего.",
+        "Для in-place правки. НЕ cancel + schedule — лишние итерации и потеря recurrence-state.",
+        "Сначала list_reminders — получить reminder_id.",
+        "Отмена — cancel_reminder, не update с clear-всего.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -328,9 +328,8 @@ UPDATE_REMINDER_SPEC = ToolSpec(
 CANCEL_REMINDER_SPEC = ToolSpec(
     name="cancel_reminder",
     description=(
-        "Отменить активное напоминание по id. Используй когда юзер "
-        "говорит «отмени напоминание про X», «убери напоминание про Y», "
-        "«не надо больше напоминать про Z»."
+        "Отменить активное напоминание по id. Когда юзер говорит «отмени "
+        "напоминание про X», «не надо больше напоминать про Z»."
     ),
     family="reminders",
     effect="write",
@@ -345,8 +344,8 @@ CANCEL_REMINDER_SPEC = ToolSpec(
         "удали напоминание про кружок",
     ],
     mutex_notes=[
-        "Используй для полной отмены. Для in-place правки — update_reminder, не cancel + schedule.",
-        "Сначала list_reminders чтобы получить reminder_id.",
+        "Для полной отмены. In-place правка — update_reminder, не cancel + schedule.",
+        "Сначала list_reminders — получить reminder_id.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",

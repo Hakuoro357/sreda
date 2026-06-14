@@ -162,17 +162,14 @@ class FetchUrlToolInput(BaseModel):
 
 GET_WEATHER_SPEC = ToolSpec(
     name="get_weather",
+    # #144: ужато — перечисление примеров свёрнуто (аргументы самодокументны)
     description=(
         "Получить прогноз погоды через Open-Meteo (free, до 14 дней). "
-        "Аргументы: location (город), day_offset (0=сегодня, "
-        "1=завтра, ..., 13=через 13 дней; default 0), days_count "
-        "(1..14, сколько дней показать; default 1), granularity "
-        "(daily | part_of_day | hourly; default daily). "
-        "Примеры: «погода завтра» → day_offset=1, days_count=1; "
-        "«на неделю» → day_offset=0, days_count=7; «почасовой» → "
-        "granularity=hourly; «как одеться сегодня» → "
-        "granularity=part_of_day. Cross-field cap: "
-        "day_offset+days_count ≤14. Возвращает текстовую сводку."
+        "Аргументы: location (город), day_offset (0=сегодня…13; default "
+        "0), days_count (1..14; default 1), granularity (daily | "
+        "part_of_day | hourly; default daily). «завтра»→day_offset=1; "
+        "«на неделю»→days_count=7; «почасовой»→hourly; «как "
+        "одеться»→part_of_day. Cap: day_offset+days_count ≤14."
     ),
     family="web",
     effect="read",
@@ -198,11 +195,10 @@ GET_WEATHER_SPEC = ToolSpec(
 WEB_SEARCH_SPEC = ToolSpec(
     name="web_search",
     description=(
-        "Найти информацию в интернете через Tavily search (с DDG "
-        "fallback при исчерпании квоты). Возвращает топ hits с "
-        "title + URL + snippet, либо status=empty («no results»). "
-        "ИСПОЛЬЗУЙ для свежей информации: новости / актуальные "
-        "цены / расписания. НЕ для общих знаний (модель уже знает). "
+        "Найти информацию в интернете через Tavily search (DDG fallback "
+        "при исчерпании квоты). Возвращает топ hits (title + URL + "
+        "snippet) либо status=empty («no results»). Для свежего: "
+        "новости/цены/расписания. НЕ для общих знаний (модель знает). "
         "Quota: 30/user/мес + 950 global — не злоупотребляй."
     ),
     family="web",
@@ -230,12 +226,11 @@ FETCH_URL_SPEC = ToolSpec(
     name="fetch_url",
     description=(
         "Скачать и извлечь читабельный контент с одной HTTP(S) "
-        "страницы. SSRF-safe: localhost / private / link-local "
-        "адреса rejected. ИСПОЛЬЗУЙ ТОЛЬКО для URL'ов которые ЮЗЕР "
-        "дал ИЛИ которые вернул web_search — НЕ для arbitrary "
-        "crawling. Runtime возвращает JSON envelope с полями "
-        "url/final_url/status/extractor/truncated/length/text — "
-        "planner работает со структурированным FetchUrlToolOk."
+        "страницы. SSRF-safe: localhost/private/link-local rejected. "
+        "ТОЛЬКО для URL'ов, которые дал ЮЗЕР ИЛИ вернул web_search — НЕ "
+        "для arbitrary crawling. Runtime возвращает JSON envelope (поля "
+        "url/final_url/status/extractor/truncated/length/text) — planner "
+        "работает со структурированным FetchUrlToolOk."
     ),
     family="web",
     effect="read",

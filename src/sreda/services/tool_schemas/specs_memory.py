@@ -179,15 +179,14 @@ RECALL_MEMORY_SPEC = ToolSpec(
     # лексическая подсказка жанра — trigger_examples в промпт НЕ рендерятся,
     # находка субагента) и metadata в составе hits (Codex medium).
     description=(
-        "Найти данные поиском по трём хранилищам: core/episodic "
-        "memory + active checklist items + pending reminders. ВСЕГДА "
-        "вызывай ПЕРЕД ответом «нет данных»/«не помню», и когда юзер "
-        "просит перечисление («покажи все X», «что у меня про Y», "
-        "«что было в переписке про Z»). Возвращает hits: content + "
-        "source (memory:core / memory:episodic / checklist:<id> / "
-        "reminder:<id>) + score + metadata (детали источника). "
-        "Источник юзеру называй по-русски («у тебя в чек-листе»), "
-        "не техжаргоном."
+        "Найти данные по трём хранилищам: core/episodic memory + "
+        "active checklist items + pending reminders. ВСЕГДА вызывай "
+        "ПЕРЕД ответом «нет данных»/«не помню», и когда юзер просит "
+        "перечисление («покажи все X», «что у меня про Y», «что было в "
+        "переписке про Z»). Возвращает hits: content + source "
+        "(memory:core/memory:episodic/checklist:<id>/reminder:<id>) + "
+        "score + metadata. Источник юзеру называй по-русски («у тебя в "
+        "чек-листе»), не техжаргоном."
     ),
     family="memory",
     effect="read",

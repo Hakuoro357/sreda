@@ -273,12 +273,12 @@ class ClearMenuInput(BaseModel):
 PLAN_WEEK_MENU_SPEC = ToolSpec(
     name="plan_week_menu",
     description=(
-        "Создать или ОБНОВИТЬ недельное меню юзера: 7 дней × до 4 "
-        "приёмов пищи (breakfast/lunch/dinner/snack). PRESERVE-MERGE: "
-        "ячейки, которые ты ПЕРЕДАЁШЬ, переписываются; ячейки, которые "
-        "ты НЕ передаёшь, остаются как были. Для полной очистки старого "
-        "меню сначала clear_menu, потом plan_week_menu. ПЕРЕД вызовом "
-        "поищи в книге рецептов чтобы ≥50% ячеек ссылались на recipe_id."
+        "Создать или ОБНОВИТЬ недельное меню: 7 дней × до 4 приёмов "
+        "(breakfast/lunch/dinner/snack). PRESERVE-MERGE: переданные "
+        "ячейки переписываются, непереданные остаются как были. Полная "
+        "очистка — сначала clear_menu, потом plan_week_menu. ПЕРЕД "
+        "вызовом поищи в книге рецептов, чтобы ≥50% ячеек ссылались на "
+        "recipe_id."
     ),
     family="menu",
     effect="write",
@@ -293,9 +293,9 @@ PLAN_WEEK_MENU_SPEC = ToolSpec(
         "сделай план питания на неделю",
     ],
     mutex_notes=[
-        "PRESERVE-MERGE: переданные ячейки перезаписываются, остальные сохраняются. Для одной ячейки — update_menu_item. Для полной очистки — clear_menu, затем заново plan_week_menu.",
+        "PRESERVE-MERGE. Одна ячейка — update_menu_item. Полная очистка — clear_menu, затем plan_week_menu.",
         "Перед вызовом — search_recipes('') чтобы видеть книгу и ссылаться на recipe_id.",
-        "Для генерации покупок из меню — generate_shopping_from_menu.",
+        "Покупки из меню — generate_shopping_from_menu.",
     ],
     timeout_seconds=30,
     side_effect_class="transactional_write",
@@ -304,10 +304,16 @@ PLAN_WEEK_MENU_SPEC = ToolSpec(
 
 UPDATE_MENU_ITEM_SPEC = ToolSpec(
     name="update_menu_item",
+    # #144-A: канонический edit-preflight через СЖАТИЕ (бюджет префикса #128).
+    # ВАЖНО: поле выдачи list_menu называется menu_id, НЕ plan_id (валидатор C
+    # #143 отклонит ${s1.plan_id}). Пустое меню → не write, а предложение
+    # составить; «поменяй обед» без замены → УТОЧНИТЬ, без write-tool.
     description=(
-        "Обновить одну ячейку в существующем меню — точечная правка "
-        "вида «замени ужин в среду на пасту». Если ячейки нет — "
-        "создаст её. Оба recipe_id и free_text None очищают ячейку."
+        "Обновить ОДНУ ячейку меню («замени ужин в среду на пасту»). "
+        "Preflight: нет plan_id → сначала list_menu; пусто → «не "
+        "составлено. Составить?»; есть замена → plan_id=${s1.menu_id} "
+        "(поле list_menu — menu_id, НЕ plan_id); замены НЕТ → УТОЧНИ, "
+        "без write. Оба None очищают ячейку."
     ),
     family="menu",
     effect="write",
@@ -322,8 +328,7 @@ UPDATE_MENU_ITEM_SPEC = ToolSpec(
         "поменяй обед в субботу",
     ],
     mutex_notes=[
-        "Используй для ОДНОЙ ячейки. Для пере-планирования сразу нескольких ячеек — plan_week_menu (он preserve-merge, не перезаписывает неотправленные слоты).",
-        "plan_id берётся из list_menu или из ok:plan_created при создании.",
+        "Для ОДНОЙ ячейки; для нескольких — plan_week_menu (preserve-merge).",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -332,10 +337,12 @@ UPDATE_MENU_ITEM_SPEC = ToolSpec(
 
 LIST_MENU_SPEC = ToolSpec(
     name="list_menu",
+    # #144-A: гайд-строки показа через СЖАТИЕ (бюджет префикса #128 ~ed.). Маршрут
+    # показа меню всегда сюда (не search_recipes); week_start / пустой исход явно.
     description=(
-        "Показать недельное меню юзера. Если week_start не указан — "
-        "вернёт самый свежий план юзера. Возвращает плоский текст с "
-        "menu_id и днями для дальнейшей точечной правки."
+        "Показать меню/план питания — ВСЕГДА это, НЕ search_recipes. "
+        "«на эту неделю» → week_start=текущий понедельник; без даты → "
+        "свежий; пусто → presenter «не составлено»."
     ),
     family="menu",
     effect="read",
@@ -350,7 +357,7 @@ LIST_MENU_SPEC = ToolSpec(
         "какой у меня план питания",
     ],
     mutex_notes=[
-        "Возвращает МЕНЮ, не книгу рецептов. Для рецептов — search_recipes из группы РЕЦЕПТЫ.",
+        "Возвращает МЕНЮ, не рецепты (для рецептов — search_recipes из РЕЦЕПТЫ). Поле выдачи — menu_id, НЕ plan_id.",
     ],
     timeout_seconds=10,
     side_effect_class="read_only",
@@ -387,9 +394,8 @@ GENERATE_SHOPPING_FROM_MENU_SPEC = ToolSpec(
         "сгенерируй покупки из плана меню",
     ],
     mutex_notes=[
-        "Использует ТОЛЬКО рецепты с recipe_id в ячейках; free_text-ячейки игнорирует.",
-        "Три исхода: ok:generated:N:eaters=E (норма) / ok:plan_no_recipes (план free_text-only) / error:plan_not_found (нет такого плана).",
-        "Для добавления одной строки в покупки — add_shopping_items из группы ПОКУПКИ.",
+        "Использует ТОЛЬКО рецепты с recipe_id; free_text-ячейки игнорирует.",
+        "Одна строка в покупки — add_shopping_items из группы ПОКУПКИ.",
     ],
     timeout_seconds=30,
     side_effect_class="transactional_write",

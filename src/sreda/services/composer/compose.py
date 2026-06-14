@@ -80,8 +80,13 @@ from typing import Any, Callable, Literal, Protocol
 from jinja2 import TemplateError
 
 from sreda.runtime.planner.executor import ExecutionLog
-from sreda.runtime.planner.interpolation import resolve_refs
+from sreda.runtime.planner.interpolation import (
+    extract_step_id,
+    iter_refs,
+    resolve_refs,
+)
 from sreda.runtime.planner.schemas import ComposerCall
+from sreda.services.composer.breakdown_messages import BREAKDOWN_POOL
 from sreda.services.composer.presenters import (
     is_known_domain_status,
     render_display_text,
@@ -228,8 +233,36 @@ class ComposerContext:
 
 
 FallbackUsed = Literal[
-    None, "compose_error", "generic_error", "conversational_fallback"
+    None,
+    "compose_error",
+    "generic_error",
+    "conversational_fallback",
+    # #144-A: итоговая компоновка свелась к «поломке», но релевантный шаг
+    # (ok/empty) умеет показать себя через презентер (#141) — отдаём показ
+    # инструмента вместо «поломки». См. _maybe_presenter_display_fallback.
+    "presenter_display_fallback",
+    # #144 (Задача 1): ДЕТЕРМИНИРОВАННЫЙ override пустого list_menu — для
+    # пустого меню «не составлено» ВСЕГДА верный ответ, а любая компоновка
+    # планировщика (рецепт/покупки/поломка) — мисроут. Перекрывает её всегда.
+    # СИЛЬНЕЕ presenter_display_fallback: срабатывает и на УСПЕШНОЙ (не-поломочной)
+    # компоновке. См. _maybe_menu_empty_override.
+    "menu_empty_override",
 ]
+
+
+# #144-A: наблюдаемость пост-фоллбэка «поломка → показ инструмента»
+# (рядом с PRESENTER_FALLBACK_COUNTS / HUMANIZE_NORMALIZER_METRICS). Ключ —
+# имя инструмента релевантного шага; ненулевое значение в телеметрии = планировщик
+# построил компоновку «в расчёте на непустой результат», а композер спас показ.
+PRESENTER_DISPLAY_FALLBACK_COUNTS: dict[str, int] = {}
+
+
+# #144 (Задача 1): наблюдаемость ДЕТЕРМИНИРОВАННОГО override пустого list_menu.
+# Ключ — имя инструмента ("list_menu"). Ненулевое значение в телеметрии =
+# планировщик построил для ПУСТОГО меню НЕВЕРНУЮ компоновку (мисроут «рецепт»/
+# «покупки» ИЛИ «поломка»), а override детерминированно подменил её на
+# ListMenuEmpty.display_summary. См. _maybe_menu_empty_override.
+MENU_EMPTY_OVERRIDE_COUNTS: dict[str, int] = {}
 
 
 @dataclass(frozen=True)
@@ -324,6 +357,57 @@ _FALLBACK_GENERIC_ERROR = "generic_tool_error"
 
 
 def compose(
+    call: ComposerCall,
+    execution_log: ExecutionLog,
+    *,
+    registry: ComposerRegistry = REGISTRY,
+    llm_composer: LLMComposer | Callable[..., Any] | None = None,
+    ctx: ComposerContext | None = None,
+    expected_registry_snapshot_hash: str | None = None,
+    llm_prompt_registry: LLMPromptRegistry = LLM_PROMPT_REGISTRY,
+    expected_llm_prompt_registry_snapshot_hash: str | None = None,
+) -> ComposeResult:
+    """Render the final user-facing reply, then apply the #144-A
+    presenter-display post-fallback.
+
+    The heavy lifting lives in :func:`_compose_impl`; this wrapper is a
+    single chokepoint so EVERY return path (template, llm, all fallbacks)
+    passes through :func:`_maybe_presenter_display_fallback`. See that
+    helper for the safety contract (only ok/empty steps; real errors stay
+    breakdowns; successful composes untouched).
+    """
+    result = _compose_impl(
+        call,
+        execution_log,
+        registry=registry,
+        llm_composer=llm_composer,
+        ctx=ctx,
+        expected_registry_snapshot_hash=expected_registry_snapshot_hash,
+        llm_prompt_registry=llm_prompt_registry,
+        expected_llm_prompt_registry_snapshot_hash=(
+            expected_llm_prompt_registry_snapshot_hash
+        ),
+    )
+    # Эффективную ComposerCall пересчитываем здесь ДЕТЕРМИНИРОВАННО тем же
+    # _pick_effective_call, что и _compose_impl (чистая функция от
+    # call+execution_log — повторный вызов даёт тот же результат). Нужна и
+    # override'у (#144 Задача 1: якорь по рефам), и #144-A.
+    effective_call = _pick_effective_call(call, execution_log)
+    # #144 (Задача 1) — ДЕТЕРМИНИРОВАННЫЙ override пустого list_menu. Запускается
+    # ПЕРВЫМ, потому что он СИЛЬНЕЕ #144-A: для пустого меню, на которое СОБИРАЛАСЬ
+    # ССЫЛАТЬСЯ компоновка, «не составлено» — ВСЕГДА верный ответ, поэтому он
+    # перекрывает ЛЮБУЮ компоновку планировщика (включая УСПЕШНУЮ-но-неверную:
+    # «Не нашла рецепт „меню"», «список покупок пуст»), а не только текст-
+    # «поломку», как #144-A. Если override сработал — возвращаем сразу.
+    overridden = _maybe_menu_empty_override(result, execution_log, effective_call)
+    if overridden is not None:
+        return overridden
+    # #144-A R1 fix (M2): фоллбэк выбирает шаг по РЕФАМ эффективной компоновки,
+    # не по «последнему ok/empty».
+    return _maybe_presenter_display_fallback(result, execution_log, effective_call)
+
+
+def _compose_impl(
     call: ComposerCall,
     execution_log: ExecutionLog,
     *,
@@ -594,6 +678,388 @@ def compose(
     )
     return _result_generic_error(
         registry, error_code=f"unsupported_kind:{effective_call.kind}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# #144 (Задача 1) — детерминированный override пустого list_menu
+# ---------------------------------------------------------------------------
+
+# Узкий, жёстко заданный контракт override (анти-перехлёст с легитимными
+# показами):
+#   - инструмент — РОВНО ``list_menu`` (специфичен; другие пустые показы
+#     —  list_shopping, list_reminders и т.п. — НЕ затрагиваются);
+#   - доменный статус шага — РОВНО ``empty`` (``parsed_output["status"]``);
+#   - executor-статус шага — ``ok`` (реальный сбой исполнения — НЕ кандидат);
+#   - ``execution_log.outcome == "completed"`` (на провальном плане «поломка»
+#     честная, не маскируем).
+_MENU_TOOL = "list_menu"
+_MENU_EMPTY_DOMAIN_STATUS = "empty"
+
+
+def _maybe_menu_empty_override(
+    result: ComposeResult,
+    execution_log: ExecutionLog,
+    effective_call: ComposerCall,
+) -> ComposeResult | None:
+    """#144 (Задача 1) — ДЕТЕРМИНИРОВАННЫЙ override пустого ``list_menu``.
+
+    Если эффективная компоновка ССЫЛАЕТСЯ на шаг ``tool == "list_menu"`` с
+    executor-статусом ``ok`` и ДОМЕННЫМ статусом ``empty``
+    (``parsed_output["status"] == "empty"``) И план завершён
+    (``outcome == "completed"``) → ВСЕГДА вернуть показ
+    ``render_display_text("list_menu", parsed_output, domain_status="empty")``
+    (= ``ListMenuEmpty.display_summary`` «Меню на эту неделю ещё не составлено.
+    Составить?»), ПЕРЕКРЫВАЯ любую компоновку планировщика (рецепт / покупки /
+    поломку).
+
+    Зачем СИЛЬНЕЕ #144-A: пост-фоллбэк #144-A подменяет только текст-«поломку»,
+    и лишь когда среди РЕФОВ ровно один displayable-кандидат. Но на проде пустое
+    меню чаще сводилось к УСПЕШНОЙ-но-неверной компоновке («Не нашла рецепт
+    „меню"», «Твой список покупок пуст») — #144-A её НЕ ловит. Для пустого меню
+    «не составлено» — единственный верный ответ, мисроут ВСЕГДА неверен, поэтому
+    override детерминированно перекрывает компоновку независимо от её
+    «поломочности».
+
+    Якорь по РЕФАМ (а не «есть ли где-то в логе пустое list_menu») — критично:
+    в плане может быть НЕ-меню-интент с попутным preflight'ом меню (напр. «купи
+    молоко», где меню читалось вторым шагом и оказалось пустым). Тогда верный
+    ответ — про покупки, и слепой override испортил бы его. Override срабатывает
+    ТОЛЬКО когда компоновка СОБИРАЛАСЬ строить ответ ИЗ пустого меню (ссылается
+    на этот шаг) — тот же якорь M2, что у #144-A.
+
+    Узость/безопасность — см. _MENU_TOOL / _MENU_EMPTY_DOMAIN_STATUS. Реальные
+    сбои (executor error/timeout, доменный error/unknown) НЕ кандидаты → их
+    честная «поломка»/диагностика остаётся.
+
+    Возвращает новый ``ComposeResult`` (с ``fallback_used="menu_empty_override"``)
+    если override сработал, иначе ``None`` (вызывающий продолжает к #144-A).
+    """
+    # M1: только честно завершённый план.
+    if execution_log.outcome != "completed":
+        return None
+
+    # Якорь: шаги, на которые СТРУКТУРНО ссылается эффективная компоновка
+    # (${sN...}-рефы + humanize_result actions:[{step_id}]). Тот же разбор, что
+    # у #144-A — единый источник истины, не разъезжается.
+    referenced = _effective_call_referenced_step_ids(effective_call)
+    if not referenced:
+        return None
+
+    # Ищем СРЕДИ РЕФОВ шаг пустого меню: list_menu + executor-ok + доменный empty.
+    target = None
+    for step in execution_log.steps:
+        if step.step_id not in referenced:
+            continue
+        if step.tool != _MENU_TOOL:
+            continue
+        if step.status != "ok":
+            continue
+        parsed = step.parsed_output if isinstance(step.parsed_output, dict) else None
+        if parsed is None:
+            continue
+        if parsed.get("status") != _MENU_EMPTY_DOMAIN_STATUS:
+            continue
+        target = step
+        break
+    if target is None:
+        return None
+
+    # Code-review #144 R1 (Codex high+medium, MAJOR): guard «единственный видимый
+    # кандидат» (как у #144-A). Если компоновка ссылается ЕЩЁ на один успешный
+    # видимый результат (мульти-интент, напр. «добавь молоко и покажи меню» →
+    # humanize_result actions=[s1=add_shopping ok, s2=list_menu empty]), слепой
+    # override стёр бы подтверждение покупки. Срабатываем ТОЛЬКО когда пустое
+    # меню — единственный referenced executor-ok шаг; иначе отдаём компоновку
+    # планировщику (и #144-A ниже).
+    for step in execution_log.steps:
+        if step.step_id == target.step_id:
+            continue
+        if step.step_id in referenced and step.status == "ok":
+            return None
+
+    # Override срабатывает для пустого меню, даже если компоновка УЖЕ показала бы
+    # тот же «не составлено» (детерминированно, безопасно). Но метрика
+    # инкрементится ТОЛЬКО при РЕАЛЬНОЙ подмене (см. ниже, R1 MINOR): счётчик =
+    # «мисроут/поломка перехвачена», а не «override применён».
+    try:
+        display = render_display_text(
+            target.tool, target.parsed_output,
+            domain_status=_MENU_EMPTY_DOMAIN_STATUS,
+        )
+    except Exception:  # noqa: BLE001 — показ не должен добавить второй сбой
+        logger.exception(
+            "composer: #144 menu_empty override render failed for step %r "
+            "— оставляю исходную компоновку", target.step_id,
+        )
+        return None
+
+    # Презентер сам мог вернуть «поломку» (теоретически: дрейф ListMenuEmpty без
+    # display_field). Тогда override НЕ улучшает ответ → откатываемся к исходной
+    # компоновке (и #144-A ниже).
+    if not display or _is_breakdown_text(display):
+        return None
+
+    # R1 MINOR (medium): метрика растёт ТОЛЬКО когда override реально подменил
+    # ответ (исходная компоновка ≠ детерминированный показ) — тогда счётчик
+    # означает «перехвачен мисроут/поломка планировщика», а не просто «пустое
+    # меню встретилось». Если компоновка уже была идентична — override
+    # прозрачен, метрику не трогаем.
+    if (result.text or "").strip() != display.strip():
+        MENU_EMPTY_OVERRIDE_COUNTS[target.tool] = (
+            MENU_EMPTY_OVERRIDE_COUNTS.get(target.tool, 0) + 1
+        )
+    logger.info(
+        "composer: #144 menu_empty override — пустое меню (шаг %r), компоновка "
+        "планировщика перекрыта детерминированным показом «не составлено» "
+        "(исходный fallback_used=%r).",
+        target.step_id, result.fallback_used,
+    )
+    return ComposeResult(
+        text=display,
+        fallback_used="menu_empty_override",
+        error_code=result.error_code,
+        effective_template_id=result.effective_template_id,
+        effective_llm_prompt_key=result.effective_llm_prompt_key,
+        composer_provider=result.composer_provider,
+        composer_model=result.composer_model,
+        composer_latency_ms=result.composer_latency_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# #144-A — presenter-display post-fallback («поломка» → показ инструмента)
+# ---------------------------------------------------------------------------
+
+# Доменные статусы шага, при которых пост-фоллбэк РАЗРЕШЁН. Только «нормальные»
+# исходы инструмента: успешный показ (ok) и дружелюбная пустота (empty). Любой
+# реальный сбой инструмента (error/unknown/…) НЕ входит сюда → «поломка»
+# остаётся, мы не маскируем настоящие ошибки.
+_PRESENTER_FALLBACK_OK_STATUSES = frozenset({"ok", "empty"})
+
+# #144-A R1 fix (MINOR): origin-признак «поломочной» компоновки. Фоллбэк
+# срабатывает ТОЛЬКО когда «поломка» — это РЕАЛЬНЫЙ поломочный исход компоновки,
+# а не легитимный текст, случайно совпавший с фразой пула. Два машинных origin:
+#   1. Шаблонный путь: эффективная ComposerCall — шаблон-«поломка»
+#      (generic_tool_error / invalid_plan_fallback). Чистый рендер этого
+#      шаблона даёт breakdown_phrase() с fallback_used=None.
+#   2. LLM-путь: kind='llm' (напр. humanize_result) упал/вернул пусто →
+#      _render_llm_result свалился в generic_tool_error → fallback_used=
+#      'generic_error'. Эффективная ComposerCall при этом остаётся llm-вызовом
+#      (фоллбэк-шаблон выбирается внутри _render_llm_result, не _pick_effective_call).
+_BREAKDOWN_ORIGIN_TEMPLATE_IDS = frozenset(
+    {"generic_tool_error", "invalid_plan_fallback"}
+)
+
+
+def _is_breakdown_origin(
+    result: ComposeResult, effective_call: ComposerCall,
+) -> bool:
+    """True, если «поломочный» текст пришёл реальным поломочным путём компоновки
+    (а не случайным совпадением строки). См. _BREAKDOWN_ORIGIN_TEMPLATE_IDS."""
+    # (1) Шаблон-«поломка» как эффективная компоновка (чистый рендер шаблона).
+    if (
+        effective_call.kind == "template"
+        and effective_call.template_id in _BREAKDOWN_ORIGIN_TEMPLATE_IDS
+    ):
+        return True
+    # (2) LLM-путь упал в generic_tool_error: fallback_used='generic_error'
+    # машинно помечает это. Этот fallback_used выставляется ТОЛЬКО при рендере
+    # _FALLBACK_GENERIC_ERROR ('generic_tool_error'), т.е. текст гарантированно
+    # поломочного происхождения. (effective_template_id на LLM-пути не
+    # проставляется — там заполнен effective_llm_prompt_key, — поэтому опираемся
+    # на сам машинный признак fallback_used.)
+    if result.fallback_used == "generic_error":
+        return True
+    return False
+
+
+# Множество фраз-«поломок» для быстрой проверки членства. Шаблоны
+# generic_tool_error / invalid_plan_fallback рендерят ровно ``breakdown_phrase()``
+# (без обёрток), поэтому равенство строки одному из элементов пула —
+# надёжный признак, что пользователю ушла «поломка».
+_BREAKDOWN_SET = frozenset(BREAKDOWN_POOL)
+
+
+def _is_breakdown_text(text: str) -> bool:
+    """True, если итоговый текст компоновки — фраза-«поломка» из пула."""
+    return text in _BREAKDOWN_SET
+
+
+def _effective_call_referenced_step_ids(effective_call: ComposerCall) -> set[str]:
+    """#144-A R1 fix (M2) — step_id'ы, на которые СТРУКТУРНО ссылается эффективная
+    компоновка. Это якорь выбора шага для показа: показываем ровно тот шаг,
+    результат которого планировщик пытался отрендерить, а не «последний ok».
+
+    Источники ссылок (объединяются):
+    1. ``${sN...}``-рефы в любом значении ``template_data`` — через общие
+       утилиты ``iter_refs`` + ``extract_step_id`` (тот же разбор, что у
+       исполнителя/валидатора, чтобы не разъехаться). Покрывает шаблоны-показы
+       (``checklist_show`` ``items=${s1.items}``) И фоллбэки с диагностикой
+       (``generic_tool_error`` ``error_code=${s1.error_code}``).
+    2. Форма ``humanize_result`` ``actions=[{"step_id": "sN"}]`` — там шаги
+       заданы НЕ ``${...}``-рефом, а полем ``step_id`` (см.
+       ``is_step_id_narration_form``). Извлекаем ``step_id`` каждого пункта.
+
+    Возвращает множество step_id (без дублей). Пустое множество → у компоновки
+    нет ссылок на шаги → нечем заякорить выбор → фоллбэк не сработает.
+    """
+    step_ids: set[str] = set()
+
+    # (1) ${sN...}-рефы в template_data.
+    for ref_path in iter_refs(effective_call.template_data):
+        try:
+            step_ids.add(extract_step_id(ref_path))
+        except ValueError:
+            # iter_refs не отдаёт пустые пути по построению regex; на всякий
+            # случай молча пропускаем — лишний кандидат опаснее пропуска.
+            continue
+
+    # (2) humanize_result actions:[{step_id}] (форма #110 Phase 4/5).
+    if effective_call.kind == "llm" and is_step_id_narration_form(
+        effective_call.template_data
+    ):
+        for item in effective_call.template_data["actions"]:
+            # is_step_id_narration_form уже гарантировал, что каждый item —
+            # {step_id: непустая строка}; читаем напрямую.
+            step_ids.add(item["step_id"])
+
+    return step_ids
+
+
+def _presenter_fallback_target_step(
+    execution_log: ExecutionLog, referenced_step_ids: set[str],
+):
+    """#144-A R1 fix (M2) — target-шаг для показа, выбранный по РЕФАМ эффективной
+    компоновки, а не по «последнему ok/empty».
+
+    Кандидат = шаг, который ОДНОВРЕМЕННО:
+    - входит в ``referenced_step_ids`` (на него ссылается эффективная компоновка);
+    - executor-статус ``ok``;
+    - доменный статус ∈ {ok, empty} (реальные сбои инструмента — executor
+      error/timeout или доменный error/unknown — НЕ кандидаты, «поломка»
+      для них честная).
+
+    Контракт однозначности: фоллбэк осмыслен только если есть РОВНО ОДИН такой
+    кандидат. Если 0 — компоновка ссылается на провалившийся/неотображаемый
+    шаг (или вообще не ссылается на шаги) → не маскируем. Если >1 — какой из
+    нескольких показать неясно → не угадываем, оставляем «поломку».
+
+    Возвращает ``(StepResult, domain_status)`` ровно для единственного
+    кандидата, иначе ``None``.
+    """
+    if not referenced_step_ids:
+        return None
+    candidates: list[tuple[Any, str]] = []
+    for step in execution_log.steps:
+        if step.step_id not in referenced_step_ids:
+            continue
+        if step.status != "ok":
+            continue
+        parsed = step.parsed_output if isinstance(step.parsed_output, dict) else None
+        if parsed is None:
+            continue
+        raw_status = parsed.get("status")
+        if not isinstance(raw_status, str):
+            continue
+        if raw_status not in _PRESENTER_FALLBACK_OK_STATUSES:
+            continue
+        candidates.append((step, raw_status))
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _maybe_presenter_display_fallback(
+    result: ComposeResult,
+    execution_log: ExecutionLog,
+    effective_call: ComposerCall,
+) -> ComposeResult:
+    """#144-A — пост-фоллбэк «поломка → показ инструмента».
+
+    Если итоговая компоновка свелась к фразе-«поломке», НО у шага, на который
+    ССЫЛАЕТСЯ эффективная компоновка (executor-ok + доменный статус ok/empty),
+    есть готовый показ через ``render_display_text`` (#141), отдаём этот показ
+    вместо «поломки».
+
+    Прецедент (#144): «покажи меню на эту неделю» на ПУСТОМ меню. Исполнитель
+    отработал (list_menu → ListMenuEmpty, status=empty), но компоновка показа
+    построена «в расчёте на непустое меню» и сорвалась в «поломку», хотя у
+    ListMenuEmpty уже есть дружелюбный display_summary.
+
+    Границы безопасности (НЕ маскировать реальные сбои; все условия — гейты,
+    проверяются в этом порядке):
+    - **M1 — только завершённый план**: ``execution_log.outcome == "completed"``.
+      На ``partial_failure`` / ``aborted_partial`` ранний ok/empty-шаг есть, но
+      компоновка ЧЕСТНО ушла в провал (реальный сбой плана) — показ раннего шага
+      замаскировал бы провал, поэтому «поломка» остаётся.
+    - текст == «поломка» из пула (не-поломочный текст не трогаем);
+    - **MINOR — origin-признак**: «поломка» пришла реальным поломочным путём —
+      шаблон ``generic_tool_error`` / ``invalid_plan_fallback`` ЛИБО провал
+      llm-композера (``fallback_used='generic_error'``). Легитимный текст,
+      случайно совпавший с фразой пула, за «поломку» не принимаем.
+    - **M2 — выбор шага по рефам**: target-шаг определяется ССЫЛКАМИ эффективной
+      компоновки, и таких кандидатов (executor-ok + доменный ok/empty) должно
+      быть РОВНО ОДИН (0 или >1 → не маскируем);
+    - если у target-шага показ сам вернул «поломку» (deny-by-default
+      презентера) — оставляем «поломку» как есть.
+    """
+    # M1: фоллбэк только на честно завершённом плане. Провал (partial_failure /
+    # aborted* / failed) остаётся «поломкой» — не маскируем реальный сбой.
+    if execution_log.outcome != "completed":
+        return result
+
+    # Успешную (не-поломочную по тексту) компоновку не трогаем.
+    if not _is_breakdown_text(result.text):
+        return result
+
+    # MINOR (origin): только если «поломка» пришла реальным поломочным путём
+    # (шаблон generic_tool_error/invalid_plan_fallback или провал llm-композера),
+    # а не случайным совпадением строки с пулом.
+    if not _is_breakdown_origin(result, effective_call):
+        return result
+
+    # M2: target-шаг — единственный displayable-кандидат среди РЕФОВ компоновки.
+    referenced = _effective_call_referenced_step_ids(effective_call)
+    found = _presenter_fallback_target_step(execution_log, referenced)
+    if found is None:
+        return result
+    step, domain_status = found
+
+    try:
+        display = render_display_text(
+            step.tool, step.parsed_output, domain_status=domain_status,
+        )
+    except Exception:  # noqa: BLE001 — показ не должен добавить второй сбой
+        logger.exception(
+            "composer: presenter fallback render failed for tool=%r "
+            "status=%r — оставляю «поломку»", step.tool, domain_status,
+        )
+        return result
+
+    # Презентер сам мог вернуть «поломку» (deny-by-default: нет display_field/
+    # override). Тогда показывать нечего — «поломка» остаётся.
+    if not display or _is_breakdown_text(display):
+        return result
+
+    PRESENTER_DISPLAY_FALLBACK_COUNTS[step.tool] = (
+        PRESENTER_DISPLAY_FALLBACK_COUNTS.get(step.tool, 0) + 1
+    )
+    logger.info(
+        "composer: #144-A presenter-display fallback — компоновка свелась к "
+        "«поломке», но шаг %r (%s, статус %r) умеет показать себя; отдаю показ "
+        "инструмента вместо «поломки».",
+        step.step_id, step.tool, domain_status,
+    )
+    return ComposeResult(
+        text=display,
+        fallback_used="presenter_display_fallback",
+        error_code=result.error_code,
+        effective_template_id=result.effective_template_id,
+        effective_llm_prompt_key=result.effective_llm_prompt_key,
+        composer_provider=result.composer_provider,
+        composer_model=result.composer_model,
+        composer_latency_ms=result.composer_latency_ms,
     )
 
 
@@ -1139,6 +1605,8 @@ def _execution_summary(execution_log: ExecutionLog) -> str:
 
 
 __all__ = [
+    "MENU_EMPTY_OVERRIDE_COUNTS",
+    "PRESENTER_DISPLAY_FALLBACK_COUNTS",
     "ComposeResult",
     "ComposerContext",
     "FallbackUsed",
