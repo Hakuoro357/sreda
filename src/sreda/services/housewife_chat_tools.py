@@ -2830,43 +2830,81 @@ def build_housewife_tools(
             lines.append(f"[{it.id}] {mark} {it.title}")
         return "\n".join(lines)
 
-    @_write_lc_tool
-    def mark_checklist_item_done(
-        list_id_or_title: str, item_title_match: str,
+    @lc_tool
+    def list_checklist_items(
+        title_match: str, list_title_match: str | None = None,
     ) -> str:
-        """Mark one item inside a checklist as done.
+        """List checklist items matching a title fragment, ACROSS lists.
 
-        Use when user says «закройила лаванду», «купила сахар»,
-        «сделал X» — find the matching pending item and flip status.
+        #143 Phase B: единообразно с задачами — читающий шаг возвращает
+        ВСЕ подходящие пункты (фильтр-оставить-всех, НЕ top-1), дальше
+        штатный ``.only`` выбирает ровно один (или честное уточнение
+        из УЖЕ отфильтрованных кандидатов), а mark/delete мутируют по
+        ``item_id``.
 
         Args:
-            list_id_or_title: which list to look in (id or fuzzy title).
-            item_title_match: substring of the item to mark done.
+            title_match: substring of the item title (case/ё-insensitive).
+            list_title_match: optional — ограничить поиск списками, чьё
+                название матчит этот фрагмент.
 
-        Returns: ``ok:done:<item_id>:<title>`` or ``error:not_found``.
+        Returns: multi-line listing or ``empty``. Per row:
+        ``[<item_id>] <mark> <item_title> @ [<list_id>] <list_title>``.
         """
         if not user_id:
             return "error: no user_id context"
-        cl = checklist_service.find_list_by_title(
-            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        lists = checklist_service.list_active(
+            tenant_id=tenant_id, user_id=user_id,
         )
-        if cl is None:
-            return f"error: list_not_found: {list_id_or_title!r}"
-        item = checklist_service.find_item_by_title(
-            list_id=cl.id, needle=item_title_match,
-        )
-        if item is None:
-            return f"error: item_not_found: {item_title_match!r}"
-        done = checklist_service.mark_done(item_id=item.id)
-        if done is None:
-            return "error: internal"
-        return f"ok:done:{done.id}:{done.title}"
+        if list_title_match:
+            lists = [cl for cl in lists if _title_matches(list_title_match, cl.title)]
+        lines: list[str] = []
+        for cl in lists:
+            for it in checklist_service.list_items(list_id=cl.id):
+                if not _title_matches(title_match, it.title):
+                    continue
+                mark = {"pending": "☐", "done": "☑", "cancelled": "✗"}.get(
+                    it.status, "?"
+                )
+                lines.append(
+                    f"[{it.id}] {mark} {it.title} @ [{cl.id}] {cl.title}"
+                )
+        if not lines:
+            return "empty"
+        return "\n".join(lines)
 
     @_write_lc_tool
-    def delete_checklist_item(
-        list_id_or_title: str, item_title_match: str,
-    ) -> str:
-        """Hard-delete one item from a checklist (item is GONE).
+    def mark_checklist_item_done(item_id: str) -> str:
+        """Mark one checklist item as done BY item_id.
+
+        Use when user says «закройила лаванду», «купила сахар»,
+        «сделал X». Сначала вызови list_checklist_items, чтобы получить
+        item_id (``.only.item_id``), потом передай его сюда.
+
+        Args:
+            item_id: ``clitem_xxx`` id пункта (из list_checklist_items).
+
+        Returns: ``ok:done:<item_id>:<title>`` or ``error:item_not_found``.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        # АТОМАРНАЯ мутация: ownership (tenant+user) + активность списка +
+        # mark в одном сервисном вызове (Codex review #143 B, MAJOR-1+2).
+        # Раньше делали get_owned_item → mark_done двумя шагами: пункт мог
+        # исчезнуть МЕЖДУ ними (гонка) → mark_done вернул None → отдавали
+        # «error: internal» = «поломка»/неверный алертинг для класса
+        # stale/not_found (критерий приёмки #8). Теперь None → мягкий
+        # item_not_found. id не светим. Чужой/архивный/исчезнувший → None.
+        done = checklist_service.mark_owned_item_done(
+            item_id=(item_id or "").strip(), tenant_id=tenant_id, user_id=user_id,
+        )
+        if done is None:
+            return "error: item_not_found"
+        done_id, done_title = done
+        return f"ok:done:{done_id}:{done_title}"
+
+    @_write_lc_tool
+    def delete_checklist_item(item_id: str) -> str:
+        """Hard-delete one checklist item BY item_id (item is GONE).
 
         Use when user says «удали пункт X», «убери из списка Y»,
         «не то записала, удали» — pure correction, item disappears
@@ -2878,31 +2916,27 @@ def build_housewife_tools(
         to remove that wrong record — the previous bad item is gone,
         only the corrected one stays.
 
-        Args:
-            list_id_or_title: id or fuzzy title of the checklist.
-            item_title_match: substring of the item title to remove.
+        Сначала вызови list_checklist_items, чтобы получить item_id
+        (``.only.item_id``), потом передай его сюда.
 
-        Returns: ``ok:deleted:<item_id>:<title>`` or ``error:not_found``.
+        Args:
+            item_id: ``clitem_xxx`` id пункта (из list_checklist_items).
+
+        Returns: ``ok:deleted:<item_id>:<title>`` or ``error:item_not_found``.
         """
         if not user_id:
             return "error: no user_id context"
-        cl = checklist_service.find_list_by_title(
-            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+        # АТОМАРНОЕ удаление (см. mark_checklist_item_done): ownership +
+        # активность + delete в одном вызове, без гонки check→delete.
+        # None (чужой/архивный/исчезнувший) → мягкий item_not_found, НЕ
+        # «error: internal» (Codex review #143 B, MAJOR-1+2).
+        deleted = checklist_service.delete_owned_item(
+            item_id=(item_id or "").strip(), tenant_id=tenant_id, user_id=user_id,
         )
-        if cl is None:
-            return f"error: list_not_found: {list_id_or_title!r}"
-        item = checklist_service.find_item_by_title(
-            list_id=cl.id, needle=item_title_match,
-            only_pending=False,  # ищем по всем — может удалять и done
-        )
-        if item is None:
-            return f"error: item_not_found: {item_title_match!r}"
-        item_id = item.id
-        item_title = item.title
-        ok = checklist_service.delete_item(item_id=item_id)
-        if not ok:
-            return "error: internal"
-        return f"ok:deleted:{item_id}:{item_title}"
+        if deleted is None:
+            return "error: item_not_found"
+        item_id_resolved, item_title = deleted
+        return f"ok:deleted:{item_id_resolved}:{item_title}"
 
     @_write_lc_tool
     def archive_checklist(list_id_or_title: str) -> str:
@@ -2977,6 +3011,8 @@ def build_housewife_tools(
         add_checklist_items,
         list_checklists,
         show_checklist,
+        # #143 Phase B: читающий шаг «по описанию» → .only → mark/delete по id
+        list_checklist_items,
         mark_checklist_item_done,
         delete_checklist_item,
         archive_checklist,

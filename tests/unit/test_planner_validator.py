@@ -361,7 +361,7 @@ def test_mixed_string_in_str_field_passes() -> None:
         "s1": _action("schedule_reminder", {"title": "x", "trigger_iso": "iso"}),
         "s2": _action(
             "schedule_reminder",
-            {"title": "напомни про ${s1.title}", "trigger_iso": "iso"},
+            {"title": "напомни про ${s1.status}", "trigger_iso": "iso"},
             depends_on=["s1"],
         ),
     })

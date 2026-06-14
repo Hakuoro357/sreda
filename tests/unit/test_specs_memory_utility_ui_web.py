@@ -731,11 +731,12 @@ def test_typeadapter_rejects_sentinel() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_migrated_count_is_55() -> None:
-    """Sub-A4 closure: every housewife + cross-skill tool typed."""
+def test_migrated_count_is_56() -> None:
+    """Sub-A4 closure: every housewife + cross-skill tool typed.
+    #143 Phase B добавил list_checklist_items → 56."""
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
-    assert len(MIGRATED_TOOL_SPECS) == 55, (
-        f"Expected 55 typed ToolSpec, got {len(MIGRATED_TOOL_SPECS)}. "
+    assert len(MIGRATED_TOOL_SPECS) == 56, (
+        f"Expected 56 typed ToolSpec, got {len(MIGRATED_TOOL_SPECS)}. "
         f"Sub-A4 migration target was 100% — recount expected after "
         f"manifest changes."
     )

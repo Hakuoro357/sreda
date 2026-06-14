@@ -474,6 +474,7 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "add_checklist_items": "checklists",
     "list_checklists": "checklists",
     "show_checklist": "checklists",
+    "list_checklist_items": "checklists",
     "move_task_to_checklist": "checklists",
     "mark_checklist_item_done": "checklists",
     "delete_checklist_item": "checklists",

@@ -322,8 +322,9 @@ def test_manifest_assigns_expected_tasks_count() -> None:
 
 
 def test_manifest_assigns_expected_checklists_count() -> None:
+    # #143 Phase B: +list_checklist_items → 9.
     checklists_tools = [t for t, f in TOOL_FAMILY_MANIFEST.items() if f == "checklists"]
-    assert len(checklists_tools) == 8
+    assert len(checklists_tools) == 9
 
 
 @pytest.mark.parametrize("tool_name", [
@@ -624,7 +625,7 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
     }),
     "checklists": frozenset({
         "create_checklist", "add_checklist_items", "list_checklists",
-        "show_checklist", "move_task_to_checklist",
+        "show_checklist", "list_checklist_items", "move_task_to_checklist",
         "mark_checklist_item_done", "delete_checklist_item",
         "archive_checklist",
     }),
@@ -658,12 +659,10 @@ def test_manifest_exact_tool_set_per_family(
     )
 
 
-def test_manifest_total_size_is_55() -> None:
-    # 7+4+5+5+4+11+8+3+1+3+1+3 = 55. Codex Sub-A4 recipes R1 MAJOR #6
-    # removed ``get_recipe_any_source`` from manifest (architecture-map
-    # TODO-2 — runtime function not yet implemented). Restore to 56
-    # in the commit that lands the tool.
-    assert len(TOOL_FAMILY_MANIFEST) == 55
+def test_manifest_total_size_is_56() -> None:
+    # 7+4+5+5+4+11+9+3+1+3+1+3 = 56. #143 Phase B добавил
+    # list_checklist_items (checklists 8→9), итог 55→56.
+    assert len(TOOL_FAMILY_MANIFEST) == 56
 
 
 # ---------------------------------------------------------------------------

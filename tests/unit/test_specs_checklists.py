@@ -30,6 +30,9 @@ from sreda.services.tool_schemas.housewife import (
     CreateChecklistOk,
     DeleteChecklistItemOk,
     HousewifeToolError,
+    ListChecklistItemsEmpty,
+    ListChecklistItemsOk,
+    ListChecklistItemsRow,
     ListChecklistsEmpty,
     ListChecklistsOk,
     ListChecklistsRow,
@@ -55,7 +58,9 @@ from sreda.services.tool_schemas.specs_checklists import (
     CreateChecklistInput,
     DELETE_CHECKLIST_ITEM_SPEC,
     DeleteChecklistItemInput,
+    LIST_CHECKLIST_ITEMS_SPEC,
     LIST_CHECKLISTS_SPEC,
+    ListChecklistItemsInput,
     ListChecklistsInput,
     MARK_CHECKLIST_ITEM_DONE_SPEC,
     MOVE_TASK_TO_CHECKLIST_SPEC,
@@ -79,11 +84,11 @@ TASK_A = "task_cccccccccccccccccccccccc"
 
 
 def test_all_checklists_specs_construct() -> None:
-    assert len(CHECKLISTS_SPECS) == 8
+    assert len(CHECKLISTS_SPECS) == 9
     names = {s.name for s in CHECKLISTS_SPECS}
     assert names == {
         "create_checklist", "add_checklist_items", "move_task_to_checklist",
-        "list_checklists", "show_checklist",
+        "list_checklists", "show_checklist", "list_checklist_items",
         "mark_checklist_item_done", "delete_checklist_item", "archive_checklist",
     }
 
@@ -215,17 +220,54 @@ def test_show_checklist_input_real() -> None:
 
 
 def test_mark_checklist_item_done_input_real() -> None:
-    parsed = MarkChecklistItemDoneInput.model_validate({
-        "list_id_or_title": "План кроя", "item_title_match": "Лаванда",
-    })
-    assert parsed.item_title_match == "Лаванда"
+    # #143 Phase B: planner-facing input — только item_id.
+    parsed = MarkChecklistItemDoneInput.model_validate({"item_id": IT_A})
+    assert parsed.item_id == IT_A
+
+
+def test_mark_checklist_item_done_input_rejects_title_path() -> None:
+    """Отрицательная гарантия (high R6): у планировщика НЕТ title-пути."""
+    with pytest.raises(ValidationError):
+        MarkChecklistItemDoneInput.model_validate({
+            "list_id_or_title": "План кроя", "item_title_match": "Лаванда",
+        })
+
+
+def test_mark_checklist_item_done_input_rejects_bad_id() -> None:
+    with pytest.raises(ValidationError):
+        MarkChecklistItemDoneInput.model_validate({"item_id": "clitem_short"})
 
 
 def test_delete_checklist_item_input_real() -> None:
-    parsed = DeleteChecklistItemInput.model_validate({
-        "list_id_or_title": "План кроя", "item_title_match": "Шампань",
+    parsed = DeleteChecklistItemInput.model_validate({"item_id": IT_B})
+    assert parsed.item_id == IT_B
+
+
+def test_delete_checklist_item_input_rejects_title_path() -> None:
+    with pytest.raises(ValidationError):
+        DeleteChecklistItemInput.model_validate({
+            "list_id_or_title": "План кроя", "item_title_match": "Шампань",
+        })
+
+
+def test_list_checklist_items_input_real() -> None:
+    parsed = ListChecklistItemsInput.model_validate({"title_match": "лопата"})
+    assert parsed.title_match == "лопата"
+    assert parsed.list_title_match is None
+
+
+def test_list_checklist_items_input_with_list_filter() -> None:
+    parsed = ListChecklistItemsInput.model_validate({
+        "title_match": "лопата", "list_title_match": "дача",
     })
-    assert parsed is not None
+    assert parsed.list_title_match == "дача"
+
+
+def test_list_checklist_items_input_rejects_extra() -> None:
+    with pytest.raises(ValidationError):
+        ListChecklistItemsInput.model_validate({
+            "title_match": "x", "extra": "y",
+        })
 
 
 def test_archive_checklist_input_real() -> None:
@@ -490,6 +532,38 @@ def test_show_checklist_parser_list_not_found_remapped() -> None:
 
 
 # ---------------------------------------------------------------------------
+# list_checklist_items structured parsing (#143 Phase B)
+# ---------------------------------------------------------------------------
+
+
+def test_list_checklist_items_parser_empty() -> None:
+    parsed = parse_tool_output("list_checklist_items", "empty")
+    assert isinstance(parsed, ListChecklistItemsEmpty)
+
+
+def test_list_checklist_items_parser_multiple_rows_across_lists() -> None:
+    raw = (
+        f"[{IT_A}] ☐ Лопата @ [{CL_A}] Дача\n"
+        f"[{IT_B}] ☑ Лопата снегоуборочная @ [{CL_B}] Гараж"
+    )
+    parsed = parse_tool_output("list_checklist_items", raw)
+    assert isinstance(parsed, ListChecklistItemsOk)
+    assert len(parsed.items) == 2
+    assert parsed.items[0].item_id == IT_A
+    assert parsed.items[0].item_title == "Лопата"
+    assert parsed.items[0].list_title == "Дача"
+    assert parsed.items[0].list_id == CL_A
+    assert parsed.items[0].item_status == "pending"
+    assert parsed.items[1].item_status == "done"
+    assert parsed.items[1].list_title == "Гараж"
+
+
+def test_list_checklist_items_parser_garbage_is_violation() -> None:
+    parsed = parse_tool_output("list_checklist_items", "ok:something weird")
+    assert isinstance(parsed, ToolOutputContractViolation)
+
+
+# ---------------------------------------------------------------------------
 # mark / delete / archive
 # ---------------------------------------------------------------------------
 
@@ -602,6 +676,8 @@ def test_archive_parser_not_found_remapped() -> None:
     ("show_checklist", f"empty: list={CL_A} title='X'"),
     ("show_checklist", f"# X ({CL_A})\n[{IT_A}] ☐ Y"),
     ("show_checklist", "error: not_found: 'X'"),
+    ("list_checklist_items", "empty"),
+    ("list_checklist_items", f"[{IT_A}] ☐ Y @ [{CL_A}] Дача"),
     ("mark_checklist_item_done", f"ok:done:{IT_A}:Y"),
     ("mark_checklist_item_done", "error: list_not_found: 'X'"),
     ("delete_checklist_item", f"ok:deleted:{IT_A}:Y"),

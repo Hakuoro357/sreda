@@ -140,6 +140,17 @@ _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"^item_not_found:.+", re.IGNORECASE),
         "checklist_item_not_found",
     ),
+    # #143 Phase B (Codex review MINOR): id-путь mark/delete отдаёт ГОЛОЕ
+    # ``error: item_not_found`` (без ``: '<needle>'`` — id не светим). Без
+    # этого паттерна голая форма уходила бы в fallback с кодом
+    # ``item_not_found``, расходясь с динамической формой выше и со spec-
+    # описаниями (которые обещают ``checklist_item_not_found``). Приводим
+    # обе формы к ОДНОМУ стабильному коду, чтобы ветки планировщика и
+    # few-shot error-ветки матчились детерминированно.
+    (
+        re.compile(r"^item_not_found$", re.IGNORECASE),
+        "checklist_item_not_found",
+    ),
     # onboarding family — Codex R5 MAJOR (HIGH catch): runtime rejects
     # non-active topics via `error: topic_not_in_active_flow 'X'`.
     # Source: ``housewife_chat_tools.py`` onboarding_answered/deferred.
@@ -4016,6 +4027,150 @@ def parse_show_checklist(
         )
 
 
+# 41b. list_checklist_items (#143 Phase B — читающий шаг под id-путь mark/delete)
+class ListChecklistItemsRow(BaseModel):
+    """Один найденный пункт С КОНТЕКСТОМ родительского списка.
+
+    В отличие от ``ShowChecklistItem`` (один список) тут пункты МОГУТ
+    приходить из РАЗНЫХ списков (поиск «по описанию» через все активные
+    списки), поэтому каждая строка несёт ``list_title`` / ``list_id``."""
+    model_config = ConfigDict(extra="forbid")
+    item_id: ChecklistItemId
+    item_title: str = Field(min_length=1, max_length=1000)
+    list_title: str = Field(min_length=1, max_length=500)
+    list_id: ChecklistId
+    item_status: Literal["pending", "done", "cancelled"]
+
+
+class ListChecklistItemsEmpty(BaseModel):
+    """Ни один пункт активных списков не подошёл под фильтр."""
+    model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
+    status: Literal["empty"] = "empty"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        return "Не нашла такого пункта."
+
+
+class ListChecklistItemsOk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    __display_field__: ClassVar[str | None] = "display_summary"  # #141
+    status: Literal["ok"] = "ok"
+    items: list[ListChecklistItemsRow] = Field(min_length=1)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def display_summary(self) -> str:
+        # #141: id-free, РАЗЛИЧИМЫЕ метки — каждый пункт показываем как
+        # «пункт» в списке «список», чтобы юзер мог выбрать ровно один,
+        # когда совпадений несколько (фильтр-оставить-всех, не top-1).
+        # Через build_display_summary: пользовательские части (title/list_title)
+        # сами оборачиваем в «» (sanitize_name), метка статична.
+        _MARK = {"done": " ✓", "cancelled": " ✗"}
+        labels: list[str] = []
+        seen: dict[str, int] = {}
+        for it in self.items:
+            base = (
+                f"«{sanitize_name(it.item_title)}» в списке "
+                f"«{sanitize_name(it.list_title)}»"
+            )
+            # При полном совпадении меток добавляем порядковый + статус,
+            # чтобы строки оставались различимыми (два «молоко» в одном
+            # списке — иначе голос не различит, какой выбрать).
+            if base in seen:
+                seen[base] += 1
+                suffix = _MARK.get(it.item_status, "")
+                base = f"{base} (#{seen[base]}{suffix})"
+            else:
+                seen[base] = 1
+            labels.append(base)
+        return build_display_summary(
+            [("Пункты", labels)], preserve_order=True)
+
+
+ListChecklistItemsOutput = Annotated[
+    Union[ListChecklistItemsOk, ListChecklistItemsEmpty, HousewifeToolError],
+    Field(discriminator="status"),
+]
+
+
+# Row: `[{clitem_id}] {mark} {item_title} @ [{checklist_id}] {list_title}`
+_LIST_CHECKLIST_ITEMS_ROW_RE = re.compile(
+    r"^\[(?P<iid>clitem_[0-9a-f]{24})\]\s+(?P<mark>[☐☑✗])\s+"
+    r"(?P<ititle>.+?)\s+@\s+"
+    r"\[(?P<cid>checklist_[0-9a-f]{24})\]\s+(?P<ltitle>.+)$"
+)
+
+
+def parse_list_checklist_items(
+    raw: str,
+) -> (
+    ListChecklistItemsOk
+    | ListChecklistItemsEmpty
+    | HousewifeToolError
+    | ToolOutputContractViolation
+):
+    """Зеркало parse_show_checklist для read-tool list_checklist_items.
+
+    Сырьё — много строк вида ``[iid] {mark} {item_title} @ [cid] {list_title}``
+    (пункты из РАЗНЫХ списков). ``empty`` → ListChecklistItemsEmpty. Любой
+    нераспознанный вывод → ToolOutputContractViolation."""
+    err = _parse_error(raw)
+    if err is not None:
+        return err
+    stripped = raw.strip()
+    if stripped == "empty":
+        return ListChecklistItemsEmpty()
+    if not stripped or stripped.startswith("error:") or stripped.startswith("ok:"):
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_checklist_items",
+            timestamp=datetime.now(timezone.utc),
+        )
+    rows: list[ListChecklistItemsRow] = []
+    for line in stripped.splitlines():
+        if not line.strip():
+            continue
+        m = _LIST_CHECKLIST_ITEMS_ROW_RE.match(line)
+        if m is None:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_checklist_items",
+                timestamp=datetime.now(timezone.utc),
+            )
+        item_status = _MARK_TO_STATUS.get(m.group("mark"))
+        if item_status is None:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_checklist_items",
+                timestamp=datetime.now(timezone.utc),
+            )
+        try:
+            rows.append(ListChecklistItemsRow(
+                item_id=m.group("iid"),
+                item_title=m.group("ititle").strip(),
+                list_title=m.group("ltitle").strip(),
+                list_id=m.group("cid"),
+                item_status=item_status,
+            ))
+        except ValidationError:
+            return ToolOutputContractViolation(
+                raw_output=raw, tool_name="list_checklist_items",
+                timestamp=datetime.now(timezone.utc),
+            )
+    if not rows:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_checklist_items",
+            timestamp=datetime.now(timezone.utc),
+        )
+    try:
+        return ListChecklistItemsOk(items=rows)
+    except ValidationError:
+        return ToolOutputContractViolation(
+            raw_output=raw, tool_name="list_checklist_items",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+
 # 42. mark_checklist_item_done
 class MarkChecklistItemDoneOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -4902,6 +5057,7 @@ PARSERS = {
     "move_task_to_checklist": parse_move_task_to_checklist,
     "list_checklists": parse_list_checklists,
     "show_checklist": parse_show_checklist,
+    "list_checklist_items": parse_list_checklist_items,
     "mark_checklist_item_done": parse_mark_checklist_item_done,
     "delete_checklist_item": parse_delete_checklist_item,
     "archive_checklist": parse_archive_checklist,

@@ -1,0 +1,89 @@
+# Ручной слой карты возможностей Среды (внутренний тулинг, lean v1).
+#
+# 5-10 СКВОЗНЫХ механизмов, которые не выводятся из реестра инструментов, но важно
+# знать ПЕРЕД планом/реализацией (чтобы не строить уже существующее — урок #143).
+#
+# Каждый механизм: id, summary, why_use, known_traps, anchors[].
+# Якорь = {path, symbol, required_snippet}. Генератор резолвит symbol по AST и
+# проверяет, что required_snippet есть в ТЕЛЕ символа — иначе ПАДАЕТ (fail-loud).
+# Номер строки НЕ хранится здесь (advisory): он перегенерится сам.
+#
+# Снимать запись можно, только если механизм реально удалён из кода.
+
+[[mechanism]]
+id = "brain_to_voice"
+summary = "«Мозг → рот»: после плана/исполнения ответ пользователю проходит через LLM-очеловечиватель (composer), а не отдаётся сухим шаблоном. Правило #121: ВСЕ ответы планового контура — через рот."
+why_use = "Если нужно изменить тон/формулировку ответа — это здесь, а не в шаблонах композера (шаблон = сырьё + страховка)."
+known_traps = "Сухой шаблон в проде = регрессия (Борис, скриншоты 2026-06-10). Пустые facts → запрет до LLM-вызова (фабрикация)."
+[[mechanism.anchors]]
+path = "src/sreda/services/composer/llm_composer.py"
+symbol = "make_llm_composer"
+required_snippet = "Build a ``LLMComposer`` callable"
+
+[[mechanism]]
+id = "selector_only"
+summary = "Селектор `.only` в ссылках плана: `${s1.tasks.only.task_id}` берёт ЕДИНСТВЕННЫЙ элемент списка. 0 или >1 → SelectorAmbiguityError → мягкий переспрос. `.first`/`.latest`/`.where` НЕ существуют."
+why_use = "Выбор одного объекта из списка-кандидатов делается этим, а не новым механизмом. Неоднозначность уже даёт мягкий переспрос — не надо строить отдельный."
+known_traps = "При 2+ совпадениях `.only` обрывается (это фича, не баг). Имя поля-списка должно быть реальным (#143: `items` у list_tasks нет, есть `tasks`)."
+[[mechanism.anchors]]
+path = "src/sreda/runtime/planner/selector.py"
+symbol = "_resolve_only_ref"
+required_snippet = "SelectorAmbiguityError"
+
+[[mechanism]]
+id = "ref_interpolation"
+summary = "Рантайм-подстановка ссылок `${node.field}` между шагами плана: выход шага sN подставляется в аргументы шага sM. Сохраняет тип (не только строки)."
+why_use = "Передача данных между шагами уже есть — не нужен отдельный «контекст». Неизвестный узел/поле → InvalidReferenceError."
+known_traps = "Поле должно существовать в выходной схеме продюсера (#143 / урок g-043: обязательная ссылка должна быть удовлетворима реальными полями)."
+[[mechanism.anchors]]
+path = "src/sreda/runtime/planner/interpolation.py"
+symbol = "resolve_refs"
+required_snippet = "Recursively resolve ``${node.field}`` references"
+
+[[mechanism]]
+id = "plan_validator"
+summary = "Статическая валидация плана ДО исполнения: обходит все Action, агрегирует Violation. Пустой список = план готов. Невалидный → ретрай планировщика с подсказкой (а не краш на исполнении)."
+why_use = "Новые проверки плана добавляются сюда (а не в исполнитель). Это точка «гейта» #124."
+known_traps = "Refs-present путь пропускает model_validator'ы — для at-least-one-of используется required_any_non_null_args на ToolSpec."
+[[mechanism.anchors]]
+path = "src/sreda/runtime/planner/validator.py"
+symbol = "validate_plan"
+required_snippet = "empty == plan ready to execute"
+
+[[mechanism]]
+id = "presenters_deny_by_default"
+summary = "Показ результата инструмента — deny-by-default (#141): поле для показа берётся только у вариантов с аннотацией `__display_field__` (или из _OVERRIDES); иначе — поломка, чтобы не утёк внутренний id."
+why_use = "Добавляя новый инструмент со списком/подтверждением, нужно аннотировать вывод, иначе показ упадёт в поломку. Анти-утечка id — здесь."
+known_traps = "Отсутствие аннотации = тихая поломка показа (ловится тестом полноты test_presenter_coverage_141)."
+[[mechanism.anchors]]
+path = "src/sreda/services/composer/presenters.py"
+symbol = "build_display_field_map"
+required_snippet = "deny-by-default by omission"
+
+[[mechanism]]
+id = "object_finders"
+summary = "Object-finders: резолв доменного объекта по названию/фрагменту. tasks.find_by_title (подстрока, регистронезависимо), checklists.find_list_by_title / find_item_by_title (подстрока + точный id). Чек-лист-инструменты принимают title_match и резолвят сами."
+why_use = "ПЕРЕД тем как строить resolver «объект по описанию» — проверь эти (прецедент #143: и я, и Codex прозевали, что finder уже есть)."
+known_traps = "Finder'ы молча берут ПЕРВОЕ при нескольких совпадениях (зазор безопасности — адресуется в #143 D2 tri-state)."
+[[mechanism.anchors]]
+path = "src/sreda/services/tasks.py"
+symbol = "find_by_title"
+required_snippet = "Case-insensitive substring match"
+[[mechanism.anchors]]
+path = "src/sreda/services/checklists.py"
+symbol = "find_list_by_title"
+required_snippet = "Fuzzy match: substring"
+
+[[mechanism]]
+id = "trace_outcome"
+summary = "Исход хода в трейсе (#140): trace.mark_outcome('breakdown') ставит outcome в строку TOTAL; проба failed_turns_rate считает провалом именно outcome=='breakdown', а НЕ iters==0 (у планировщика iters всегда 0). outcome переживает сериализацию в outbox-воркер."
+why_use = "Если нужно пометить ход как провальный для мониторинга надёжности — это единая точка (через note_breakdown)."
+known_traps = "breakdown «липкий»: после него 'ok' не понижает исход. Финальный трейс эмитит ВОРКЕР из десериализованного ctx — outcome обязан пережить roundtrip."
+[[mechanism.anchors]]
+path = "src/sreda/services/trace.py"
+symbol = "mark_outcome"
+required_snippet = "breakdown"
+[[mechanism.anchors]]
+path = "src/sreda/services/trace.py"
+symbol = "emit_block"
+required_snippet = "outcome={ctx.outcome}"

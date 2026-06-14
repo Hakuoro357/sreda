@@ -382,4 +382,6 @@ def test_item_fields_map_pinned_content():
         "checklist_show": {"items": ("title", "item_status")},
         # #131: показ всех списков (осознанное расширение пина)
         "checklists_list_show": {"items": ("title", "pending_count")},
+        # #143 Phase B: показ найденных «по описанию» пунктов (осознанное расширение)
+        "checklist_items_show": {"items": ("item_title", "list_title")},
     }

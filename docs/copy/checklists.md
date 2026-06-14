@@ -90,12 +90,31 @@ title. Это упрощает LLM-flow: один вызов вместо дву
 Используется когда юзер просит «покажи план», «что осталось»,
 «что я ещё не сделал».
 
-### `mark_checklist_item_done(list_id_or_title, item_title_match)`
+### `list_checklist_items(title_match, list_title_match=None)`
 
-Найти pending пункт по подстроке, поставить done. Если в pending не
-нашлось — fallback по всем (включая cancelled).
+#143 Phase B: читающий шаг для операций «по описанию». Находит ВСЕ
+пункты, чьё название содержит `title_match`, сразу во всех активных
+списках (можно сузить `list_title_match`). Дальше `${sN.items.only.item_id}`
+выбирает ровно один (или честное уточнение из кандидатов), и его id
+передаётся в `mark_checklist_item_done` / `delete_checklist_item`.
 
-**Возврат:** `ok:done:<item_id>:<title>` / `error:item_not_found:<needle>`
+**Возврат (multi-line):** `[<item_id>] <mark> <item_title> @ [<list_id>] <list_title>` / `empty`
+
+### `mark_checklist_item_done(item_id)`
+
+#143 Phase B: поставить пункт в `done` СТРОГО по `item_id` (id из
+`list_checklist_items`). Проверка владельца + активности списка ДО
+мутации (изоляция семей; пункт архивного списка не меняется). Названия
+сам НЕ резолвит.
+
+**Возврат:** `ok:done:<item_id>:<title>` / `error:item_not_found`
+
+### `delete_checklist_item(item_id)`
+
+#143 Phase B: жёстко удалить пункт по `item_id` (id из
+`list_checklist_items`). Та же атомарная проверка владельца + активности.
+
+**Возврат:** `ok:deleted:<item_id>:<title>` / `error:item_not_found`
 
 ### `archive_checklist(list_id_or_title)`
 
@@ -147,10 +166,10 @@ LLM ответ: «Добавила в «План кроя на эту недел
 ```
 Юзер: «Закройила лаванду»
 
-LLM tool: list_checklists()                 # понять в каком списке
+# #143: пункт «по описанию» — читающий шаг с фильтром → .only → mark по item_id.
+LLM tool: list_checklist_items(title_match="лаванда")   # все совпадения во всех списках
 LLM tool: mark_checklist_item_done(
-    list_id_or_title="План кроя",
-    item_title_match="лаванда",
+    item_id="${s1.items.only.item_id}",   # ровно один; если 2+ — мягкий переспрос
 )
 LLM ответ: «Отметила: Лаванда 298 ТС ☑»
 ```

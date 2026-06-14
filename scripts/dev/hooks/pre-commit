@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Карта возможностей Среды — pre-commit hook (УДОБСТВО, не гарантия).
+#
+# Падает, если SREDA_CAPABILITIES.md разошёлся с кодом, с инструкцией перегенерить.
+# НЕ делает молчаливый `git add` — разработчик сам перегенерит и застейджит
+# (иначе хук правит индекс за спиной, и stale-карта тихо коммитится).
+#
+# Гарантия свежести — `--check` в CI/review-gate, а НЕ этот хук (он локален и
+# обходится `--no-verify`).
+#
+# Разовая установка (из корня репозитория sreda):
+#   git config core.hooksPath scripts/dev/hooks
+# Снять:
+#   git config --unset core.hooksPath
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+if ! python scripts/dev/gen_capabilities.py --check; then
+  echo ""
+  echo "✗ Карта возможностей устарела (docs/internal/dev/SREDA_CAPABILITIES.md)."
+  echo "  Перегенери и застейдж:"
+  echo "    python scripts/dev/gen_capabilities.py"
+  echo "    git add docs/internal/dev/SREDA_CAPABILITIES.md"
+  echo "  (или закоммить с --no-verify, если осознанно — но CI всё равно проверит)"
+  exit 1
+fi

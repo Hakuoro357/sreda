@@ -74,15 +74,9 @@ _EXAMPLES: list[FewShotExample] = [
                     "tool": "add_shopping_items",
                     "args": {"items": [{"title": "молоко"}, {"title": "хлеб"}]},
                     "expected_outcomes": [
-                        {
-                            "match": {"status": "added"},
-                            "next": None,
-                            "compose": {
-                                "kind": "template",
-                                "template_id": "shopping_added_ok",
-                                "template_data": {"items": ["молоко", "хлеб"]},
-                            },
-                        },
+                        # added — без своего compose: совпадает с root
+                        # shopping_added_ok, падает туда (экономия префикса #128).
+                        {"match": {"status": "added"}, "next": None},
                         {
                             "match": {"status": "empty"},
                             "next": None,
@@ -471,15 +465,9 @@ _EXAMPLES: list[FewShotExample] = [
                     "tool": "add_shopping_items",
                     "args": {"items": [{"title": "молоко"}]},
                     "expected_outcomes": [
-                        {
-                            "match": {"status": "added"},
-                            "next": None,
-                            "compose": {
-                                "kind": "template",
-                                "template_id": "shopping_added_ok",
-                                "template_data": {"items": ["молоко"]},
-                            },
-                        },
+                        # added — без своего compose: падает в root
+                        # shopping_added_ok (идентичен). Экономия префикса #128.
+                        {"match": {"status": "added"}, "next": None},
                         {
                             "match": {"status": "empty"},
                             "next": None,
@@ -692,64 +680,69 @@ _EXAMPLES: list[FewShotExample] = [
 
 
 # ---------------------------------------------------------------------------
-# PR-c: .only selector example (advertised to the planner)
+# PR-c / #143 Phase B: .only selector example (advertised to the planner).
 # ---------------------------------------------------------------------------
 # Appended to _EXAMPLES below so render_few_shot_block() actually teaches the
 # planner the .only pattern (Codex PR-c R1: prose-only advertising without an
-# example is half-baked). Pattern: list_reminders (s1) → update_reminder (s2)
-# via ${s1.items.only.field}. s1 MUST have a terminal empty branch; .only only
-# in args, not compose. Validated by the few-shot contract tests.
+# example is half-baked). s1 MUST have a terminal empty branch; .only only in
+# args, not compose. Validated by the few-shot contract tests.
+#
+# #143 Phase B (2026-06-14): пример переведён с reminders на ЧЕК-ЛИСТЫ «по
+# описанию» — читающий list_checklist_items (s1) → ${s1.items.only.item_id} →
+# mark_checklist_item_done (s2). Тот же канон .only, но демонстрирует id-путь
+# чек-листов (у планировщика title-пути для mark/delete больше НЕТ). Замена, а
+# не добавление — бюджет префикса (#128) headroom мал; reminders.only учился
+# тем же шаблоном. Компактно: только success-путь + обязательная empty-ветка
+# (error падает в общий invalid-plan fallback).
 _ONLY_SELECTOR_EXAMPLE = FewShotExample(
-    user_message="перенеси напоминание про молоко на 10:00",
+    user_message="отметь лопату в списке дача",
     context_brief="",
     plan={
         "schema_version": 1,
-        "turn_classification": {"is_new_turn": True, "reason": "изменить напоминание"},
+        "turn_classification": {"is_new_turn": True, "reason": "отметить пункт чек-листа"},
         "clarity": "clear",
         "actions": {
             "s1": {
-                "tool": "list_reminders",
-                # #122: выбор по имени — фильтр аргументом читающего шага,
-                # дальше штатный .only по уже отфильтрованным
-                "args": {"title_match": "молоко"},
+                "tool": "list_checklist_items",
+                # #122/#143: выбор по имени — фильтр аргументом читающего шага,
+                # дальше штатный .only по уже отфильтрованным кандидатам.
+                "args": {"title_match": "лопата", "list_title_match": "дача"},
                 "expected_outcomes": [
                     {"match": {"status": "ok"}, "next": "s2"},
                     {"match": {"status": "empty"}, "next": None,
                      "compose": {"kind": "template",
-                                 "template_id": "reminders_list_empty",
+                                 "template_id": "checklist_items_empty",
                                  "template_data": {}}},
-                    {"match": {"status": "error"}, "next": None,
-                     "compose": {"kind": "template",
-                                 "template_id": "generic_tool_error",
-                                 "template_data": {"error_code": "${s1.error_code}"}}},
                 ],
                 "intent_group": "default",
                 "depends_on": [],
             },
             "s2": {
-                "tool": "update_reminder",
-                "args": {
-                    "reminder_id": "${s1.items.only.reminder_id}",
-                    "trigger_iso": "2026-06-03T10:00:00+03:00",
-                },
+                "tool": "mark_checklist_item_done",
+                "args": {"item_id": "${s1.items.only.item_id}"},
                 "expected_outcomes": [
-                    {"match": {"status": "updated"}, "next": None,
-                     "compose": {"kind": "template",
-                                 "template_id": "reminder_set_ok",
-                                 "template_data": {"what": "молоко", "when_phrase": "в 10:00"}}},
+                    # Успех — без своего compose: падает в root humanize_result.
+                    {"match": {"status": "done"}, "next": None},
+                    # #143 Phase B (Codex CRITICAL): stale/исчезнувший
+                    # item_id → status=error. Без этой ветки executor не
+                    # нашёл бы branch → unknown_outcome → «поломка»/алерт
+                    # (критерий приёмки #8). Мягкий id-free ответ.
                     {"match": {"status": "error"}, "next": None,
                      "compose": {"kind": "template",
-                                 "template_id": "generic_tool_error",
-                                 "template_data": {"error_code": "${s2.error_code}"}}},
+                                 "template_id": "checklist_items_empty",
+                                 "template_data": {}}},
                 ],
                 "intent_group": "default",
                 "depends_on": ["s1"],
             },
         },
         "compose": {
-            "kind": "template",
-            "template_id": "reminder_set_ok",
-            "template_data": {"what": "молоко", "when_phrase": "в 10:00"},
+            "kind": "llm",
+            "llm_prompt_key": "humanize_result",
+            "template_data": {
+                "intent": "отметить пункт списка сделанным",
+                "actions": [{"step_id": "s2"}],
+            },
         },
     },
 )
@@ -757,6 +750,77 @@ _ONLY_SELECTOR_EXAMPLE = FewShotExample(
 # Advertise the .only pattern to the planner (Codex PR-c R1).
 _EXAMPLES.append(_ONLY_SELECTOR_EXAMPLE)
 
+
+# ---------------------------------------------------------------------------
+# #143 Phase B (Codex review MAJOR-5): positive .only пример для ЗАДАЧ.
+# ---------------------------------------------------------------------------
+# Исходный инцидент (#133, прод): «отмени задачу про интернет» →
+# ${s1.items.only.task_id}, но у list_tasks поле ВЫДАЧИ — ``tasks``, не
+# ``items`` → arg_violation на исполнении → «поломка». Чек-листовый .only
+# пример учит item_id и мог КОСВЕННО закрепить неверный перенос (items) на
+# задачи. Этот пример демонстрирует ПРАВИЛЬНОЕ поле ``tasks`` напрямую:
+# list_tasks(date="all", title_match=…) → ${s1.tasks.only.task_id} →
+# cancel_task. Компактно ради бюджета префикса (#128): success-путь + empty
+# у продюсера (обязательно для .only) + error-ветка у мутатора (мягко).
+_ONLY_SELECTOR_TASK_EXAMPLE = FewShotExample(
+    user_message="отмени задачу про интернет",
+    context_brief="",
+    plan={
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "отменить задачу по описанию"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_tasks",
+                # date="all" + title_match — фильтр аргументом ЧИТАЮЩЕГО шага
+                # (#122), дальше .only по уже отфильтрованным кандидатам.
+                # status опускаем — runtime default уже "pending".
+                "args": {"date": "all", "title_match": "интернет"},
+                "expected_outcomes": [
+                    {"match": {"status": "ok"}, "next": "s2"},
+                    # 0 совпадений — ОЖИДАЕМЫЙ исход «не нашла такую задачу»,
+                    # НЕ «поломка» (критерий #8). Мягко через рот (humanize_result
+                    # очеловечивает пустую выдачу s1), НЕ generic_tool_error
+                    # (тот рендерится через breakdown pool = «поломка»/алерт).
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "llm",
+                                 "llm_prompt_key": "humanize_result",
+                                 "template_data": {
+                                     "intent": "сообщить, что задача не найдена",
+                                     "actions": [{"step_id": "s1"}]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+            "s2": {
+                "tool": "cancel_task",
+                # ПОЛЕ ВЫДАЧИ list_tasks — ``tasks`` (НЕ items!).
+                "args": {"task_id": "${s1.tasks.only.task_id}"},
+                "expected_outcomes": [
+                    # Успех — без своего compose: падает в root humanize_result
+                    # (root ссылается на успешный s2). Экономит префикс (#128).
+                    {"match": {"status": "cancelled"}, "next": None},
+                    {"match": {"status": "error"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "generic_tool_error",
+                                 "template_data": {}}},
+                ],
+                "intent_group": "default",
+                "depends_on": ["s1"],
+            },
+        },
+        "compose": {
+            "kind": "llm",
+            "llm_prompt_key": "humanize_result",
+            "template_data": {
+                "intent": "отменить задачу",
+                "actions": [{"step_id": "s2"}],
+            },
+        },
+    },
+)
+
+_EXAMPLES.append(_ONLY_SELECTOR_TASK_EXAMPLE)
 
 
 # ---------------------------------------------------------------------------
