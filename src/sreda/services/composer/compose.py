@@ -765,10 +765,23 @@ def _maybe_menu_empty_override(
     if target is None:
         return None
 
-    # Override срабатывает ВСЕГДА для пустого меню — даже если компоновка УЖЕ
-    # верна (показала бы тот же «не составлено»). Это детерминированно и
-    # безопасно: текст идентичен, метрика растёт, телеметрия фиксирует, что
-    # планировщик столкнулся с пустым меню.
+    # Code-review #144 R1 (Codex high+medium, MAJOR): guard «единственный видимый
+    # кандидат» (как у #144-A). Если компоновка ссылается ЕЩЁ на один успешный
+    # видимый результат (мульти-интент, напр. «добавь молоко и покажи меню» →
+    # humanize_result actions=[s1=add_shopping ok, s2=list_menu empty]), слепой
+    # override стёр бы подтверждение покупки. Срабатываем ТОЛЬКО когда пустое
+    # меню — единственный referenced executor-ok шаг; иначе отдаём компоновку
+    # планировщику (и #144-A ниже).
+    for step in execution_log.steps:
+        if step.step_id == target.step_id:
+            continue
+        if step.step_id in referenced and step.status == "ok":
+            return None
+
+    # Override срабатывает для пустого меню, даже если компоновка УЖЕ показала бы
+    # тот же «не составлено» (детерминированно, безопасно). Но метрика
+    # инкрементится ТОЛЬКО при РЕАЛЬНОЙ подмене (см. ниже, R1 MINOR): счётчик =
+    # «мисроут/поломка перехвачена», а не «override применён».
     try:
         display = render_display_text(
             target.tool, target.parsed_output,
@@ -787,9 +800,15 @@ def _maybe_menu_empty_override(
     if not display or _is_breakdown_text(display):
         return None
 
-    MENU_EMPTY_OVERRIDE_COUNTS[target.tool] = (
-        MENU_EMPTY_OVERRIDE_COUNTS.get(target.tool, 0) + 1
-    )
+    # R1 MINOR (medium): метрика растёт ТОЛЬКО когда override реально подменил
+    # ответ (исходная компоновка ≠ детерминированный показ) — тогда счётчик
+    # означает «перехвачен мисроут/поломка планировщика», а не просто «пустое
+    # меню встретилось». Если компоновка уже была идентична — override
+    # прозрачен, метрику не трогаем.
+    if (result.text or "").strip() != display.strip():
+        MENU_EMPTY_OVERRIDE_COUNTS[target.tool] = (
+            MENU_EMPTY_OVERRIDE_COUNTS.get(target.tool, 0) + 1
+        )
     logger.info(
         "composer: #144 menu_empty override — пустое меню (шаг %r), компоновка "
         "планировщика перекрыта детерминированным показом «не составлено» "

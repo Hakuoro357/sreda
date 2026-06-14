@@ -243,6 +243,30 @@ def test_safety_unreferenced_empty_menu_step_not_overridden() -> None:
     assert res.fallback_used is None
 
 
+def test_safety_multi_intent_referenced_other_ok_step_not_overridden() -> None:
+    """🔴 Code-review #144 R1 MAJOR (Codex high+medium): компоновка ссылается
+    И на пустое меню, И на ДРУГОЙ успешный видимый шаг (мульти-интент «добавь
+    молоко и покажи меню» → humanize actions=[s1=add_shopping ok, s2=list_menu
+    empty]). Слепой override стёр бы подтверждение покупки. Guard «единственный
+    видимый кандидат»: пустое меню — НЕ единственный referenced ok-шаг → override
+    НЕ срабатывает, компоновка планировщика (оба интента) сохраняется."""
+    log = _log([
+        _step("s1", tool="add_shopping_items", status="ok",
+              parsed_output={"status": "added"}),
+        _empty_menu_step("s2"),
+    ])
+    # компоновка ссылается на ОБА шага (${s1.status} и ${s2.status})
+    call = _template_call(
+        "shopping_added_ok",
+        {"items": ["молоко"], "_a1": "${s1.status}", "_a2": "${s2.status}"},
+    )
+    res = compose(call, log)
+    assert res.text == "Записала: молоко.", (
+        "мульти-интент: подтверждение покупки НЕ должно быть стёрто override'ом"
+    )
+    assert res.fallback_used is None
+
+
 # Литеральная «поломка» без рефов — для error-safety кейсов, где шаг провалился
 # и ${sN.status} не зарезолвился бы (compose_error вместо breakdown).
 def _breakdown_call_literal() -> ComposerCall:
