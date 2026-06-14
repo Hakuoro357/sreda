@@ -273,12 +273,12 @@ class ClearMenuInput(BaseModel):
 PLAN_WEEK_MENU_SPEC = ToolSpec(
     name="plan_week_menu",
     description=(
-        "Создать или ОБНОВИТЬ недельное меню юзера: 7 дней × до 4 "
-        "приёмов пищи (breakfast/lunch/dinner/snack). PRESERVE-MERGE: "
-        "ячейки, которые ты ПЕРЕДАЁШЬ, переписываются; ячейки, которые "
-        "ты НЕ передаёшь, остаются как были. Для полной очистки старого "
-        "меню сначала clear_menu, потом plan_week_menu. ПЕРЕД вызовом "
-        "поищи в книге рецептов чтобы ≥50% ячеек ссылались на recipe_id."
+        "Создать или ОБНОВИТЬ недельное меню: 7 дней × до 4 приёмов "
+        "(breakfast/lunch/dinner/snack). PRESERVE-MERGE: переданные "
+        "ячейки переписываются, непереданные остаются как были. Полная "
+        "очистка — сначала clear_menu, потом plan_week_menu. ПЕРЕД "
+        "вызовом поищи в книге рецептов, чтобы ≥50% ячеек ссылались на "
+        "recipe_id."
     ),
     family="menu",
     effect="write",
@@ -293,9 +293,9 @@ PLAN_WEEK_MENU_SPEC = ToolSpec(
         "сделай план питания на неделю",
     ],
     mutex_notes=[
-        "PRESERVE-MERGE: переданные ячейки перезаписываются, остальные сохраняются. Для одной ячейки — update_menu_item. Для полной очистки — clear_menu, затем заново plan_week_menu.",
+        "PRESERVE-MERGE. Одна ячейка — update_menu_item. Полная очистка — clear_menu, затем plan_week_menu.",
         "Перед вызовом — search_recipes('') чтобы видеть книгу и ссылаться на recipe_id.",
-        "Для генерации покупок из меню — generate_shopping_from_menu.",
+        "Покупки из меню — generate_shopping_from_menu.",
     ],
     timeout_seconds=30,
     side_effect_class="transactional_write",
@@ -394,9 +394,8 @@ GENERATE_SHOPPING_FROM_MENU_SPEC = ToolSpec(
         "сгенерируй покупки из плана меню",
     ],
     mutex_notes=[
-        "Использует ТОЛЬКО рецепты с recipe_id в ячейках; free_text-ячейки игнорирует.",
-        "Три исхода: ok:generated:N:eaters=E (норма) / ok:plan_no_recipes (план free_text-only) / error:plan_not_found (нет такого плана).",
-        "Для добавления одной строки в покупки — add_shopping_items из группы ПОКУПКИ.",
+        "Использует ТОЛЬКО рецепты с recipe_id; free_text-ячейки игнорирует.",
+        "Одна строка в покупки — add_shopping_items из группы ПОКУПКИ.",
     ],
     timeout_seconds=30,
     side_effect_class="transactional_write",

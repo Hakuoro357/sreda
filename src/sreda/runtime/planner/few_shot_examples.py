@@ -884,6 +884,88 @@ _EXAMPLES.append(_MENU_SHOW_EXAMPLE)
 
 
 # ---------------------------------------------------------------------------
+# #144 (Задача 1): ПРАВКА меню — preflight list_menu → update_menu_item.
+# ---------------------------------------------------------------------------
+# Прод-инцидент (#144, живой N=5): «поменяй обед в среду на суп» на ПУСТОМ меню.
+# Планировщик строил preflight s1=list_menu → s2=update_menu_item, НО ветка empty
+# у s1 не была терминальной → s2 пропускался (branch_not_selected) → план НЕ
+# завершался чисто (outcome≠completed) → «поломка»; либо шёл прямо в update и
+# ложно «Обновила». Этот пример учит ПРАВИЛЬНОЙ форме edit-плана:
+#   - s1=list_menu с ДВУМЯ исходами: ok → next='s2' (меню есть → правим),
+#     empty → ТЕРМИНАЛ (next=None) с дружелюбным humanize «не составлено,
+#     предложить составить» — НЕ generic_tool_error (тот = «поломка»/алерт),
+#     НЕ branch_not_selected. Это ключевой фикс (пустое меню НЕ ведёт в write).
+#   - s2=update_menu_item ссылается на ПРАВИЛЬНОЕ поле выдачи list_menu —
+#     ${s1.menu_id} (НЕ ${s1.plan_id}: поле list_menu называется menu_id,
+#     валидатор C #143 отклонит plan_id с arg_ref_unknown_field).
+# Branch-aware: ссылка ${s1.menu_id} в s2 валидируется против варианта ListMenuOk
+# (ветка ok маршрутизирует в s2), где поле menu_id есть.
+# Компактно ради бюджета префикса (#128): success-путь s2 БЕЗ своего compose —
+# падает в root humanize_result (root ссылается на успешный s2); явные только
+# empty у s1 (новое поведение) и error у s2 (мягко).
+_MENU_EDIT_EXAMPLE = FewShotExample(
+    user_message="поменяй обед в среду на суп",
+    context_brief="",
+    plan={
+        "schema_version": 1,
+        "turn_classification": {"is_new_turn": True, "reason": "правка ячейки меню — preflight через list_menu"},
+        "clarity": "clear",
+        "actions": {
+            "s1": {
+                "tool": "list_menu",
+                # week_start опускаем → runtime вернёт свежее меню.
+                "args": {},
+                "expected_outcomes": [
+                    # меню ЕСТЬ → правим (управление в s2).
+                    {"match": {"status": "ok"}, "next": "s2"},
+                    # ПУСТО → ТЕРМИНАЛ (#144): пустое меню НЕ ведёт в write.
+                    # Мягко через рот: humanize_result сообщает, что меню не
+                    # составлено, и предлагает составить — НЕ generic_tool_error
+                    # (он = «поломка»/алерт), НЕ branch_not_selected.
+                    {"match": {"status": "empty"}, "next": None,
+                     "compose": {"kind": "llm",
+                                 "llm_prompt_key": "humanize_result",
+                                 "template_data": {
+                                     "intent": "сообщить, что меню не составлено, предложить составить",
+                                     "actions": [{"step_id": "s1"}]}}},
+                ],
+                "intent_group": "default",
+                "depends_on": [],
+            },
+            "s2": {
+                "tool": "update_menu_item",
+                # ПОЛЕ ВЫДАЧИ list_menu — ``menu_id`` (НЕ plan_id!).
+                # day_of_week: 2 = среда (Пн=0); free_text вместо recipe_id.
+                "args": {"plan_id": "${s1.menu_id}", "day_of_week": 2,
+                         "meal_type": "lunch", "free_text": "суп"},
+                "expected_outcomes": [
+                    # Успех — без своего compose: падает в root humanize_result
+                    # (root ссылается на успешный s2). Экономит префикс (#128).
+                    {"match": {"status": "updated"}, "next": None},
+                    {"match": {"status": "error"}, "next": None,
+                     "compose": {"kind": "template",
+                                 "template_id": "generic_tool_error",
+                                 "template_data": {"error_code": "${s2.error_code}"}}},
+                ],
+                "intent_group": "default",
+                "depends_on": ["s1"],
+            },
+        },
+        "compose": {
+            "kind": "llm",
+            "llm_prompt_key": "humanize_result",
+            "template_data": {
+                "intent": "подтвердить, что обед в среду заменён",
+                "actions": [{"step_id": "s2"}],
+            },
+        },
+    },
+)
+
+_EXAMPLES.append(_MENU_EDIT_EXAMPLE)
+
+
+# ---------------------------------------------------------------------------
 # PR-d (Piece 3): INVALID-case examples — "так НЕ делай"
 # ---------------------------------------------------------------------------
 # Shown to the planner as a SEPARATE "do NOT do this" block — deliberately NOT

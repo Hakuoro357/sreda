@@ -128,12 +128,12 @@ ONBOARDING_ANSWERED_SPEC = ToolSpec(
     name="onboarding_answered",
     # #144: ужато — статус-эхо (есть в output-строке) и цитата кода вырезаны
     description=(
-        "Отметить тему ``addressing`` (имя/обращение) как отвеченную и "
-        "перейти к следующей — это ЕДИНСТВЕННАЯ активная тема онбординга. "
-        "Вызывай когда юзер дал осмысленный ответ на запрос имени из "
-        "[ОНБОРДИНГ] block системного промпта. ``summary`` — ТОЛЬКО "
-        "короткое имя/ник (1-3 слова, БЕЗ «Пользователя зовут», «Меня "
-        "зовут»). После addressing онбординг авто-закрывается."
+        "Отметить тему ``addressing`` (имя/обращение) как отвеченную — "
+        "это ЕДИНСТВЕННАЯ активная тема онбординга. Вызывай когда юзер "
+        "дал осмысленный ответ на запрос имени из [ОНБОРДИНГ] блока "
+        "промпта. ``summary`` — ТОЛЬКО короткое имя/ник (1-3 слова, БЕЗ "
+        "«Пользователя зовут», «Меня зовут»). После addressing онбординг "
+        "авто-закрывается."
     ),
     family="onboarding",
     effect="write",
@@ -148,8 +148,8 @@ ONBOARDING_ANSWERED_SPEC = ToolSpec(
         "Анна, можно просто Аня",
     ],
     mutex_notes=[
-        "Только когда юзер дал ответ на текущую тему онбординга (addressing). Для пропуска — onboarding_deferred. Для досрочного закрытия — onboarding_complete.",
-        "topic ОБЯЗАН быть `addressing` — это единственная активная тема в текущем TOPIC_ORDER.",
+        "Только когда юзер ответил на тему addressing. Пропуск → onboarding_deferred; досрочно закрыть → onboarding_complete.",
+        "topic ОБЯЗАН быть `addressing` — единственная активная тема в TOPIC_ORDER.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -160,12 +160,12 @@ ONBOARDING_DEFERRED_SPEC = ToolSpec(
     name="onboarding_deferred",
     # #144: ужато — статус-эхо (есть в output-строке) вырезано
     description=(
-        "Отметить тему ``addressing`` как отложенную. Используй когда юзер "
-        "явно просит пропустить («потом», «не сейчас», «пропусти»). Первый "
-        "пропуск оставляет тему в retry-queue (skipped_once) — runtime "
-        "может re-ask; второй делает skip permanent (skipped). ``reason`` "
-        "— короткое обоснование skip'а; runtime его НЕ хранит, но поле "
-        "обязательно, чтобы планировщик явно артикулировал решение."
+        "Отметить тему ``addressing`` отложенной. Когда юзер явно просит "
+        "пропустить («потом», «не сейчас», «пропусти»). Первый пропуск — "
+        "в retry-queue (skipped_once), runtime может re-ask; второй — "
+        "permanent (skipped). ``reason`` — короткое обоснование; runtime "
+        "его НЕ хранит, но поле обязательно (планировщик артикулирует "
+        "решение)."
     ),
     family="onboarding",
     effect="write",
@@ -180,8 +180,8 @@ ONBOARDING_DEFERRED_SPEC = ToolSpec(
         "давай в другой раз",
     ],
     mutex_notes=[
-        "Только когда юзер ЯВНО просит пропустить. Если юзер ответил уклончиво но всё же ответил — onboarding_answered с paraphrased summary.",
-        "Первый skip — мягкий (вернёмся), второй — жёсткий. Различай в реакции на topic_state.",
+        "Только когда юзер ЯВНО просит пропустить. Ответил уклончиво но ответил — onboarding_answered с paraphrased summary.",
+        "Первый skip — мягкий (вернёмся), второй — жёсткий. Различай по topic_state.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -191,14 +191,12 @@ ONBOARDING_DEFERRED_SPEC = ToolSpec(
 ONBOARDING_COMPLETE_SPEC = ToolSpec(
     name="onboarding_complete",
     description=(
-        "Закрыть онбординг принудительно. Используй ТОЛЬКО когда "
-        "юзер чётко говорит «всё, хватит, мне надоело» / «не хочу "
-        "больше отвечать» ДО естественного завершения. Обычно "
-        "онбординг авто-закрывается когда все темы закрыты "
-        "(answered или permanently skipped) — этот tool НЕ нужен "
-        "для нормального flow. Возвращает ok:complete:status=complete "
-        "(runtime mark_complete всегда ставит status=complete, без "
-        "других вариантов)."
+        "Закрыть онбординг принудительно. ТОЛЬКО когда юзер чётко "
+        "говорит «всё, хватит, надоело» / «не хочу больше отвечать» ДО "
+        "естественного завершения. Обычно онбординг авто-закрывается "
+        "когда все темы закрыты (answered/permanently skipped) — для "
+        "нормального flow НЕ нужен. Возвращает ok:complete:status="
+        "complete (всегда complete, без вариантов)."
     ),
     family="onboarding",
     effect="write",

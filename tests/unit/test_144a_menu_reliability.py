@@ -202,3 +202,79 @@ def test_empty_menu_display_summary_is_canonical_text() -> None:
         ListMenuEmpty().display_summary
         == "Меню на эту неделю ещё не составлено. Составить?"
     )
+
+
+# ---------------------------------------------------------------------------
+# #144 (Задача 1) — few-shot edit-пример: ПРАВИЛЬНАЯ форма edit-плана
+# ---------------------------------------------------------------------------
+# Якорный контракт-тест ИМЕННО для _MENU_EDIT_EXAMPLE (НАЗВАН пунктом приёмки
+# #144). Generic-цикл test_planner_prompt_builder уже гоняет validate_plan по
+# ВСЕМ примерам; здесь — узкая привязка фикса #144: пример зарегистрирован,
+# его пустая ветка s1 ТЕРМИНАЛЬНА (next=None) и не уходит в generic_tool_error,
+# а правка ссылается на ${s1.menu_id} (НЕ plan_id). Это не дубль валидаторных
+# тестов выше (те — на синтетическом плане), а проверка САМОГО обучающего
+# примера, который видит планировщик.
+
+
+def test_menu_edit_few_shot_example_is_registered_and_valid() -> None:
+    """Edit-пример «поменяй обед в среду на суп» зарегистрирован в few-shot
+    наборе, проходит validate_plan против реального реестра, и его форма —
+    та, что чинит #144: s1=list_menu (ok→s2 / empty→ТЕРМИНАЛ humanize),
+    s2=update_menu_item(plan_id=${s1.menu_id})."""
+    from sreda.runtime.planner.few_shot_examples import (
+        _MENU_EDIT_EXAMPLE,
+        all_examples,
+    )
+
+    assert _MENU_EDIT_EXAMPLE in all_examples(), (
+        "edit-пример #144 должен быть зарегистрирован в _EXAMPLES "
+        "(иначе планировщик его не увидит)"
+    )
+
+    plan_dict = _MENU_EDIT_EXAMPLE.plan
+    plan = Plan.model_validate(plan_dict)
+    violations = validate_plan(plan, registry=_REGISTRY)
+    assert violations == [], (
+        "few-shot edit-пример должен проходить validate_plan чист; "
+        f"нарушения: {[(v.code, v.message) for v in violations]}"
+    )
+
+    # s1: ветка ok маршрутизирует в s2; ветка empty ТЕРМИНАЛЬНА и НЕ
+    # generic_tool_error (ключевой фикс — пустое меню НЕ «поломка»).
+    s1 = plan_dict["actions"]["s1"]
+    assert s1["tool"] == "list_menu"
+    branches = {
+        (b["match"].get("status")): b for b in s1["expected_outcomes"]
+    }
+    assert branches["ok"]["next"] == "s2", "ветка ok должна вести в правку s2"
+    empty_branch = branches["empty"]
+    assert empty_branch["next"] is None, "пустое меню → ТЕРМИНАЛ (не write)"
+    assert empty_branch["compose"]["kind"] == "llm", (
+        "пустой исход озвучивается через рот (humanize_result), не шаблоном"
+    )
+    assert empty_branch["compose"]["llm_prompt_key"] == "humanize_result"
+
+    # s2: правка ссылается на ПРАВИЛЬНОЕ поле выдачи list_menu — menu_id.
+    s2 = plan_dict["actions"]["s2"]
+    assert s2["tool"] == "update_menu_item"
+    assert s2["args"]["plan_id"] == "${s1.menu_id}", (
+        "edit-пример ОБЯЗАН ссылаться на ${s1.menu_id} (НЕ ${s1.plan_id} — "
+        "валидатор C #143 отклонил бы plan_id)"
+    )
+
+
+def test_menu_edit_few_shot_serializes_into_block_with_menu_id() -> None:
+    """Контракт few-shot блока (как у show-примера): edit-пример
+    сериализуется в текст блока, ссылка — ${s1.menu_id}, а НЕ ${s1.plan_id}."""
+    from sreda.runtime.planner.few_shot_examples import render_few_shot_block
+
+    block = render_few_shot_block()
+    assert "поменяй обед в среду на суп" in block, (
+        "edit-пример должен попадать в few-shot блок промпта"
+    )
+    assert "${s1.menu_id}" in block, (
+        "в блоке должна быть ПРАВИЛЬНАЯ ссылка ${s1.menu_id}"
+    )
+    assert "${s1.plan_id}" not in block, (
+        "НЕВЕРНОЙ ссылки ${s1.plan_id} в блоке быть не должно"
+    )

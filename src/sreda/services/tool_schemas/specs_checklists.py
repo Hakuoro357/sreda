@@ -273,10 +273,9 @@ MOVE_TASK_TO_CHECKLIST_SPEC = ToolSpec(
         "Перенести задачу из Расписания в чек-лист как ПУНКТ — один "
         "вызов вместо cancel_task + add_checklist_items: «перенеси X в "
         "дела Y», «это не на время — переложи в дела». Best-effort (НЕ "
-        "одна транзакция): cancel task → add item (target создаётся, если "
-        "нет). Если add упал — task уже отменён: скажи о частичном "
-        "переносе. Возвращает ok:moved:item_id=<clitem>:list=<cid> или "
-        "…:dup (идемпотентно)."
+        "одна транзакция): cancel task → add item (target создаётся, "
+        "если нет). Если add упал — task уже отменён: скажи о частичном "
+        "переносе. Идемпотентно (повтор → moved_dup)."
     ),
     family="checklists",
     effect="write",

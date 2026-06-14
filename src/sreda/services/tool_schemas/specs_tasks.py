@@ -397,8 +397,8 @@ ADD_TASK_SPEC = ToolSpec(
     name="add_task",
     # #128/#144: дубли с mutex_notes вырезаны — планировщик видит обе секции
     description=(
-        "Создать задачу в Расписании юзера: «поставь задачу X», «запиши "
-        "на завтра Z». Поля: title, scheduled_date (today/tomorrow/ISO/"
+        "Создать задачу в Расписании: «поставь задачу X», «запиши на "
+        "завтра Z». Поля: title, scheduled_date (today/tomorrow/ISO/"
         "inbox), time_start/time_end (HH:MM в зоне юзера), recurrence_rule "
         "(RRULE с UTC BYHOUR), notes, reminder_offset_minutes (минуты ДО "
         "time_start; требует scheduled_date+time_start), details_items "
@@ -417,9 +417,9 @@ ADD_TASK_SPEC = ToolSpec(
         "запиши встречу с врачом на пятницу 15:00 с напоминанием за 30 минут",
     ],
     mutex_notes=[
-        "Создание. Для правки → update_task. Для отметки выполненной → complete_task. Для отмены → cancel_task. Для удаления → delete_task.",
-        "details_items только для same-verb + список объектов. Разные действия → несколько add_task calls.",
-        "reminder + details_items НЕ совместимы — сначала add_task с details, потом attach_reminder отдельно.",
+        "Создание. Правка → update_task; отметить готовой → complete_task; отмена → cancel_task; удаление → delete_task.",
+        "details_items — только same-verb + список объектов. Разные действия → несколько add_task.",
+        "reminder + details_items несовместимы: сначала add_task с details, потом attach_reminder.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -451,8 +451,8 @@ LIST_TASKS_SPEC = ToolSpec(
         "какие задачи выполнены",
     ],
     mutex_notes=[
-        "Возвращает только Расписание — не покупки, не меню, не семью. Для покупок → list_shopping, для меню → list_menu.",
-        "Используй чтобы получить task_id перед update/complete/cancel/delete когда юзер назвал задачу по имени.",
+        "Возвращает только Расписание — не покупки/меню/семью. Покупки → list_shopping; меню → list_menu.",
+        "Чтобы получить task_id перед update/complete/cancel/delete когда юзер назвал задачу по имени.",
     ],
     timeout_seconds=5,
     side_effect_class="read_only",
@@ -484,8 +484,8 @@ UPDATE_TASK_SPEC = ToolSpec(
         "добавь заметку к задаче — взять документы",
     ],
     mutex_notes=[
-        "Используй для ИЗМЕНЕНИЯ существующей задачи. Создание → add_task. Отметка готовой → complete_task.",
-        "task_id берётся из list_tasks. attach_reminder/detach_reminder для самого факта напоминания (а не его времени).",
+        "Для ИЗМЕНЕНИЯ существующей задачи. Создание → add_task; отметить готовой → complete_task.",
+        "task_id — из list_tasks. attach_reminder/detach_reminder для самого факта напоминания (не его времени).",
     ],
     # Codex Sub-A4 tasks R1 MAJOR #1: model_validator
     # `_validate_at_least_one_field` in UpdateTaskInput catches direct
@@ -685,12 +685,11 @@ LINK_TASK_TO_CHECKLIST_SPEC = ToolSpec(
     # #144: ужато — статусы дублировались с output-строкой
     description=(
         "Связать существующую задачу с существующим чек-листом (явная "
-        "1-to-1 связь). Используй когда оба уже созданы отдельно и юзер "
-        "просит связать («прикрепи список Y к задаче X»). Для НОВОЙ task с "
+        "1-to-1 связь). Когда оба уже созданы отдельно и юзер просит "
+        "связать («прикрепи список Y к задаче X»). Для НОВОЙ task с "
         "деталями в одной транзакции → add_task(details_items=...). "
         "Статусы: linked / already_linked (идемпотентно) / "
-        "error:task_already_linked или checklist_already_linked (связь с "
-        "другим — нужен unlink)."
+        "error:*_already_linked (связь с другим — нужен unlink)."
     ),
     family="tasks",
     effect="write",
@@ -707,7 +706,7 @@ LINK_TASK_TO_CHECKLIST_SPEC = ToolSpec(
         "привяжи задачу к чеклисту с шагами",
     ],
     mutex_notes=[
-        "Используй для СВЯЗКИ существующих task+checklist. Для создания task с deталями сразу → add_task(details_items=...). Для разрыва связи → unlink_task.",
+        "Для СВЯЗКИ существующих task+checklist. Новая task с деталями → add_task(details_items=...); разрыв связи → unlink_task.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",

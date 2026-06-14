@@ -228,13 +228,13 @@ ADD_FAMILY_MEMBERS_SPEC = ToolSpec(
     name="add_family_members",
     # #128/#144: ужато — статус-форматы дублировались с output-строкой/mutex
     description=(
-        "Добавить одного или нескольких членов семьи за раз («у меня "
-        "жена Катя, сын Никита 10 лет»). Возраст: birth_year ТОЛЬКО при "
-        "явном годе рождения; «10 лет» / «школьник» → age_hint (год не "
-        "угадывать). Роли: spouse=муж/жена, child=сын/дочь, parent=мама/"
-        "папа, self=сам юзер; прочее (сестра, бабушка) → role='other' + "
-        "отношение в notes. Имена дедуплицируются (case-insensitive). Не "
-        "уверен, что записи новые — сначала list_family_members."
+        "Добавить одного или нескольких членов семьи за раз («жена "
+        "Катя, сын Никита 10 лет»). Возраст: birth_year ТОЛЬКО при "
+        "явном годе; «10 лет»/«школьник» → age_hint (год не угадывать). "
+        "Роли: spouse=муж/жена, child=сын/дочь, parent=мама/папа, "
+        "self=сам юзер; прочее (сестра, бабушка) → role='other' + "
+        "отношение в notes. Имена дедуп (case-insensitive). Не уверен, "
+        "что записи новые — сначала list_family_members."
     ),
     family="household",
     effect="write",
@@ -249,8 +249,8 @@ ADD_FAMILY_MEMBERS_SPEC = ToolSpec(
         "у меня брат Серёжа",
     ],
     mutex_notes=[
-        "Используй ДЛЯ ДОБАВЛЕНИЯ. Для правки существующего — update_family_member. Для удаления — remove_family_member.",
-        "Дубликаты по нормализованному имени — runtime НЕ ошибка, они идут в skipped_as_duplicate. План не должен ретраить.",
+        "ДЛЯ ДОБАВЛЕНИЯ. Правка → update_family_member; удаление → remove_family_member.",
+        "Дубли по нормализованному имени — НЕ ошибка, идут в skipped_as_duplicate. План не ретраит.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -262,10 +262,9 @@ LIST_FAMILY_MEMBERS_SPEC = ToolSpec(
     description=(
         "Показать всех членов семьи: имя, роль, возраст, заметки; "
         "member_id каждого — для update/remove_family_member (id не "
-        "выдумывай). Меню/покупки используют household автоматически "
-        "— зови только когда юзер спрашивает про семью или нужны "
-        "member_id. Статусы: ok и empty (никого — предложи "
-        "add_family_members)."
+        "выдумывай). Меню/покупки берут household сами — зови только "
+        "когда юзер спрашивает про семью или нужны member_id. Статусы: "
+        "ok и empty (никого — предложи add_family_members)."
     ),
     family="household",
     effect="read",
@@ -280,8 +279,8 @@ LIST_FAMILY_MEMBERS_SPEC = ToolSpec(
         "есть ли уже Маша в семье",
     ],
     mutex_notes=[
-        "Возвращает СЕМЬЮ юзера, не рецепты/покупки/задачи. Меню/покупки уже подтягивают household внутренне — звать list тут не нужно.",
-        "Использует структурированный вывод (members[].member_id) — ссылайся на эти id при обновлении/удалении вместо парсинга prose.",
+        "Возвращает СЕМЬЮ, не рецепты/покупки/задачи. Меню/покупки берут household сами — list тут не нужен.",
+        "Структурированный вывод (members[].member_id) — ссылайся на эти id при update/remove, не парсь prose.",
     ],
     timeout_seconds=5,
     side_effect_class="read_only",
@@ -294,11 +293,11 @@ UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
     description=(
         "Обновить поля одного члена семьи: «Маше 9 уже», «у Никиты "
         "аллергия на молоко». Нет member_id — сначала list_family_members "
-        "по name; несколько совпадений — переспроси. Передавай ТОЛЬКО "
-        "меняющиеся поля, минимум одно non-None. Правила role — как в "
-        "add_family_members. Clear: notes='' и age_hint='' очищают поле; "
-        "birth_year — только clear_birth_year=True (не вместе с "
-        "birth_year=N). name и role очистить нельзя."
+        "по name; несколько совпадений — переспроси. Только меняющиеся "
+        "поля, минимум одно non-None. Правила role — как в "
+        "add_family_members. Clear: notes='' и age_hint='' очищают; "
+        "birth_year — только clear_birth_year=True (не с birth_year=N). "
+        "name и role очистить нельзя."
     ),
     family="household",
     effect="write",
@@ -313,8 +312,8 @@ UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
         "у мамы день рождения 1985",
     ],
     mutex_notes=[
-        "Используй ДЛЯ ПРАВКИ. Для добавления нового члена — add_family_members. Для удаления — remove_family_member.",
-        "member_id берётся из list_family_members.members[i].member_id (СТРУКТУРИРОВАННЫЙ вывод, не парсить из prose).",
+        "ДЛЯ ПРАВКИ. Добавить нового → add_family_members; удаление → remove_family_member.",
+        "member_id — из list_family_members.members[i].member_id (структурированный вывод, не prose).",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -343,8 +342,8 @@ REMOVE_FAMILY_MEMBER_SPEC = ToolSpec(
         "вычеркни папу",
     ],
     mutex_notes=[
-        "Используй ТОЛЬКО для удаления. Коррекция полей — update_family_member.",
-        "member_id берётся из list_family_members.members[i].member_id (СТРУКТУРИРОВАННЫЙ вывод).",
+        "ТОЛЬКО для удаления. Коррекция полей — update_family_member.",
+        "member_id — из list_family_members.members[i].member_id (структурированный вывод).",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
