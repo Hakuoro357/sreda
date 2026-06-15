@@ -222,13 +222,19 @@ def _resolve_model_name(runnable: Any, settings: Settings, provider: str) -> str
         if isinstance(value, str) and value:
             return value
     # services/llm.py provider→model alias maps are the next-best fallback.
-    # Two maps because providers split by family (mimo / openrouter).
+    # One map per provider family (mimo / openrouter / inception) — needed
+    # only for opaque runnables (.with_fallbacks()) that hide .model_name.
     try:
         from sreda.services.llm import (  # type: ignore[attr-defined]
+            _INCEPTION_MODEL_BY_PROVIDER,
             _MIMO_MODEL_BY_PROVIDER,
             _OPENROUTER_MODEL_BY_PROVIDER,
         )
-        for table in (_MIMO_MODEL_BY_PROVIDER, _OPENROUTER_MODEL_BY_PROVIDER):
+        for table in (
+            _MIMO_MODEL_BY_PROVIDER,
+            _OPENROUTER_MODEL_BY_PROVIDER,
+            _INCEPTION_MODEL_BY_PROVIDER,
+        ):
             if isinstance(table, dict):
                 mapped = table.get(provider)
                 if isinstance(mapped, str) and mapped:

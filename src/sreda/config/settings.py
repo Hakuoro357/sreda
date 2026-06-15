@@ -25,6 +25,7 @@ _SECRET_FIELD_NAMES = frozenset({
     "openai_api_key",
     "mimo_api_key",
     "openrouter_api_key",
+    "inception_api_key",
     "embeddings_api_key",
     "encryption_key",
     "encryption_key_salt",
@@ -123,6 +124,12 @@ class Settings(BaseSettings):
     mimo_api_key_file: str | None = None
     mimo_chat_model: str = "mimo-v2-pro"
     mimo_request_timeout_seconds: float = 60.0
+    # Inception (api.inceptionlabs.ai) — OpenAI-compatible. Прямой провайдер
+    # Mercury-2 (диффузионная LLM, 1000+ tps, cached input, tool-use). Ключ:
+    # env → file → None, как у mimo. Переезд планировщика с MiMo (#60).
+    inception_base_url: str = "https://api.inceptionlabs.ai/v1"
+    inception_api_key: str | None = None
+    inception_api_key_file: str | None = None
     # Cheap-model hook for per-event relevance classification + future
     # ``decide_to_speak`` LLM layer. When set (e.g. ``mimo-v2-omni`` or
     # the yet-unreleased ``mimo-v2-flash``), the classifier worker starts
@@ -757,6 +764,19 @@ class Settings(BaseSettings):
             from pathlib import Path
 
             path = Path(self.mimo_api_key_file)
+            if path.exists() and path.is_file():
+                value = path.read_text(encoding="utf-8").strip()
+                return value or None
+        return None
+
+    def resolve_inception_api_key(self) -> str | None:
+        """Resolve Inception (Mercury) API key, env→file→None — как mimo."""
+        if self.inception_api_key:
+            return self.inception_api_key.strip()
+        if self.inception_api_key_file:
+            from pathlib import Path
+
+            path = Path(self.inception_api_key_file)
             if path.exists() and path.is_file():
                 value = path.read_text(encoding="utf-8").strip()
                 return value or None

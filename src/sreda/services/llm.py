@@ -1304,6 +1304,9 @@ CHAT_PROVIDERS = (
     # 2026-06-10 (#107, выбор Бориса): кандидат в РОТ против лёгкой mimo-v2.5
     # — сверхдешёвый lite-вариант 2.5 flash.
     "openrouter-gemini-2.5-flash-lite",
+    # 2026-06-15 (#60): Inception Mercury-2 (прямой api.inceptionlabs.ai) —
+    # диффузионная LLM, 1000+ tps + cached input. Переезд планировщика с MiMo.
+    "inception-mercury2",         # mercury-2
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1339,6 +1342,12 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
 }
 
 
+# Inception (прямой) — Mercury-2. id сверен по /v1/models на ключе 2026-06-15.
+_INCEPTION_MODEL_BY_PROVIDER = {
+    "inception-mercury2": "mercury-2",
+}
+
+
 # 2026-05-10: Per-provider OpenRouter routing overrides (extra_body).
 # OpenRouter обычно сам выбирает provider'а с лучшей ценой, но иногда
 # нам нужно явно зафиксить конкретный backend (quantization, GPU type,
@@ -1359,6 +1368,9 @@ _OPENROUTER_TEMPERATURE_BY_PROVIDER: dict[str, float] = {
     # Nemotron сильно зависит от temperature (probe 0.2 vs prod 0.3 dichotomy).
     # 0.1 — agressive determinism для повышения tool-dispatch reliability.
     "openrouter-nemotron-3-super": 0.1,
+    # 2026-06-15: Mercury ОТВЕРГАЕТ temp<0.5 («not within [0.5,1]» → форсит 0.75).
+    # 0.6 = минимум допустимого диапазона + чуть детерминизма для планировщика.
+    "inception-mercury2": 0.6,
 }
 
 
@@ -1469,6 +1481,20 @@ def _build_chat_llm(
             model=model or override or settings.openrouter_chat_model,
             # 2026-05-11 PM: per-provider temperature override.
             # Nemotron specifically needs lower temp (0.1) to avoid drift.
+            temperature=_override_temperature(provider, temperature),
+            timeout=settings.mimo_request_timeout_seconds,
+            **kwargs,
+        )
+    if provider in _INCEPTION_MODEL_BY_PROVIDER:
+        api_key = settings.resolve_inception_api_key()
+        if not api_key:
+            logger.info("chat LLM disabled: no Inception API key configured")
+            return None
+        override = _INCEPTION_MODEL_BY_PROVIDER[provider]
+        return ChatOpenAI(
+            base_url=settings.inception_base_url,
+            api_key=api_key,
+            model=model or override,
             temperature=_override_temperature(provider, temperature),
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,
@@ -1589,6 +1615,8 @@ def _provider_key_is_available(provider: str, settings: Settings) -> bool:
         return bool(settings.resolve_mimo_api_key())
     if provider in _OPENROUTER_MODEL_BY_PROVIDER:
         return bool(settings.resolve_openrouter_api_key())
+    if provider in _INCEPTION_MODEL_BY_PROVIDER:
+        return bool(settings.resolve_inception_api_key())
     return False
 
 
