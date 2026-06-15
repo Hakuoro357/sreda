@@ -376,6 +376,23 @@ class Settings(BaseSettings):
             "the composer.)"
         ),
     )
+    planner_verbose_log: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_VERBOSE_LOG",
+            "sreda_planner_verbose_log",
+        ),
+        description=(
+            "When True, the planner orchestrator logs per-attempt provider+model, "
+            "the resolved plan (tool names + args + clarity + compose target), and "
+            "validator/parse violations to the app logger (job-runner.log) — "
+            "observability for the plan path. Plan args may contain user content "
+            "(same as agent_runs.input_json), logged as-is; secret-redaction (#95) "
+            "covers Telegram bot-tokens only, not arbitrary user secrets. "
+            "Default True (planner runs only for the small planner-enabled tenant "
+            "set). Set False to silence."
+        ),
+    )
     planner_timeout_sec: float = Field(
         default=60.0,
         ge=1.0,

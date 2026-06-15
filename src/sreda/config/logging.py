@@ -133,6 +133,16 @@ def _build_config(
             # (entry → voice → LLM iters → outbox → delivery).
             # Block-per-turn, one logger.info call = one atomic block.
             "sreda.trace": trace_logger,
+            # sreda.runtime.planner — plan/model/violations observability
+            # (planner_verbose_log). Pinned at INFO so it survives prod
+            # WARNING, same rationale as sreda.llm: a wrong plan must be
+            # diagnosable from the log. Catches the orchestrator's
+            # planner.call / planner.valid / planner.invalid lines.
+            "sreda.runtime.planner": {
+                "level": logging.INFO,
+                "handlers": ["access"],
+                "propagate": False,
+            },
         },
     }
 

@@ -877,3 +877,230 @@ def test_invalid_plan_triggers_retry_with_feedback_in_prompt(
     retry_prompt = prompts[1]
     assert "[АВТОМАТИЧЕСКИЙ РЕТРАЙ]" in retry_prompt
     assert "validator_violations" in retry_prompt
+
+
+# ---------------------------------------------------------------------------
+# Observability logging (planner_verbose_log) — plan/model/violations → logger
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_plan_includes_tool_clarity_and_compose() -> None:
+    """_summarize_plan surfaces clarity + each action's tool + the compose
+    target — the line that lands in job-runner.log for a valid plan."""
+    from sreda.runtime.planner.orchestrator import _summarize_plan
+    from sreda.runtime.planner.schemas import Plan
+
+    summary = _summarize_plan(Plan.model_validate(_make_valid_plan_payload()))
+    assert "clarity=clear" in summary
+    assert "s1=add_shopping_items" in summary
+    assert "shopping_added_ok" in summary
+
+
+def test_verbose_log_emits_model_and_plan(db_session: Session, caplog: Any) -> None:
+    """planner_verbose_log on (prod default) → turn logs planner.call
+    (provider+model) and planner.valid (resolved plan: tools + clarity +
+    compose). This is the observability the plan path was missing."""
+    import logging as _logging
+
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return _make_call_result(json.dumps(_make_valid_plan_payload()))
+
+    with caplog.at_level(_logging.INFO, logger="sreda.runtime.planner.orchestrator"):
+        result = asyncio.run(
+            run(ctx, session_factory=factory, call_planner_fn=fake_call)
+        )
+
+    assert result.success
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "planner.call" in text
+    assert "provider=mimo-v2.5" in text and "model=mimo-v2.5-pro" in text
+    assert "planner.valid" in text
+    assert "add_shopping_items" in text  # the plan's tool is logged
+    assert "clarity=clear" in text
+
+
+def test_verbose_log_off_suppresses(db_session: Session, caplog: Any) -> None:
+    """planner_verbose_log=False → no planner.call / planner.valid lines."""
+    import logging as _logging
+
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return _make_call_result(json.dumps(_make_valid_plan_payload()))
+
+    from types import SimpleNamespace
+
+    def _sf_quiet():
+        return SimpleNamespace(
+            composer_llm_enabled_keys=frozenset(),
+            planner_verbose_log=False,
+        )
+
+    with caplog.at_level(_logging.INFO, logger="sreda.runtime.planner.orchestrator"):
+        result = asyncio.run(run(
+            ctx, session_factory=factory, call_planner_fn=fake_call,
+            settings_factory=_sf_quiet,
+        ))
+
+    assert result.success
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "planner.call" not in text
+    assert "planner.valid" not in text
+
+
+def test_verbose_log_emits_invalid_json_reason(db_session: Session, caplog: Any) -> None:
+    """planner.invalid logs the (capped) reject reason on a json parse failure."""
+    import logging as _logging
+
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return _make_call_result("this is not json at all")
+
+    with caplog.at_level(_logging.INFO, logger="sreda.runtime.planner.orchestrator"):
+        result = asyncio.run(
+            run(ctx, session_factory=factory, call_planner_fn=fake_call)
+        )
+
+    assert not result.success
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "planner.invalid" in text
+    assert "json_decode_error" in text
+
+
+def test_verbose_log_emits_invalid_schema_reason(db_session: Session, caplog: Any) -> None:
+    """planner.invalid logs plan_schema_error when the JSON is valid but the
+    Plan schema is not (missing required fields)."""
+    import logging as _logging
+
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return _make_call_result("{}")  # valid json, invalid Plan
+
+    with caplog.at_level(_logging.INFO, logger="sreda.runtime.planner.orchestrator"):
+        result = asyncio.run(
+            run(ctx, session_factory=factory, call_planner_fn=fake_call)
+        )
+
+    assert not result.success
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "planner.invalid" in text
+    assert "plan_schema_error" in text
+
+
+def test_verbose_log_off_suppresses_invalid(db_session: Session, caplog: Any) -> None:
+    """planner_verbose_log=False → no planner.invalid lines even on a bad plan."""
+    import logging as _logging
+    from types import SimpleNamespace
+
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        return _make_call_result("not json")
+
+    def _sf_quiet():
+        return SimpleNamespace(
+            composer_llm_enabled_keys=frozenset(),
+            planner_verbose_log=False,
+        )
+
+    with caplog.at_level(_logging.INFO, logger="sreda.runtime.planner.orchestrator"):
+        asyncio.run(run(
+            ctx, session_factory=factory, call_planner_fn=fake_call,
+            settings_factory=_sf_quiet,
+        ))
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "planner.invalid" not in text
+
+
+def test_summarize_plan_caps_huge_args_keeps_head_and_marker() -> None:
+    """A huge args payload is capped (per-action) with a truncation marker,
+    and clarity/compose in the head are never truncated away."""
+    from sreda.runtime.planner.orchestrator import _summarize_plan
+    from sreda.runtime.planner.schemas import Plan
+
+    payload = _make_valid_plan_payload()
+    payload["actions"]["s1"]["args"] = {"items": [{"title": "м" * 5000}]}
+    summary = _summarize_plan(Plan.model_validate(payload))
+
+    assert "clarity=clear" in summary           # head preserved
+    assert "compose=shopping_added_ok" in summary  # compose target preserved
+    assert "..." in summary                     # reprlib truncated the huge arg
+    assert ("м" * 300) not in summary           # full 5000-char run is gone
+    assert "\n" not in summary                  # newlines collapsed
+    assert len(summary) <= 1820                 # bounded
+
+
+def test_verbose_log_emits_invalid_validator_reason(db_session: Session, caplog: Any) -> None:
+    """planner.invalid (validator path) logs violations=<count> + the reason
+    when the plan is schema-valid but the validator rejects it (unknown tool)."""
+    import logging as _logging
+
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        payload = _make_valid_plan_payload()
+        payload["actions"]["s1"]["tool"] = "definitely_not_a_real_tool"
+        return _make_call_result(json.dumps(payload))
+
+    with caplog.at_level(_logging.INFO, logger="sreda.runtime.planner.orchestrator"):
+        result = asyncio.run(
+            run(ctx, session_factory=factory, call_planner_fn=fake_call)
+        )
+
+    assert not result.success
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "planner.invalid" in text
+    assert "violations=" in text
+    assert "validator_violations" in text
+
+
+def test_verbose_log_emits_call_error_on_timeout(db_session: Session, caplog: Any) -> None:
+    """planner.call_error logs kind=timeout when the provider call times out."""
+    import logging as _logging
+    from sreda.runtime.planner.llm import PlannerTimeoutError
+
+    ctx = _make_ctx()
+    factory = _make_session_factory(db_session)
+
+    def fake_call(prompt: str, **_kw: Any) -> PlannerCallResult:
+        raise PlannerTimeoutError("simulated timeout")
+
+    with caplog.at_level(_logging.INFO, logger="sreda.runtime.planner.orchestrator"):
+        result = asyncio.run(
+            run(ctx, session_factory=factory, call_planner_fn=fake_call)
+        )
+
+    assert not result.success
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "planner.call_error" in text
+    assert "kind=timeout" in text
+
+
+def test_summarize_plan_redacts_secret_inside_long_arg() -> None:
+    """A bot-token inside a long arg is redacted BEFORE reprlib shortening, so
+    no token fragment can leak past the truncation (Codex obs-review R3)."""
+    from sreda.config.log_redaction import redact_secrets
+    from sreda.runtime.planner.orchestrator import _summarize_plan
+    from sreda.runtime.planner.schemas import Plan
+
+    token = "1234567890:AAHdummytokendummytokendummytoken12345"
+    assert redact_secrets(token) == "bot<redacted>"  # precondition: this shape redacts
+    payload = _make_valid_plan_payload()
+    # token at the head so it survives reprlib head/tail truncation; trailing
+    # filler forces truncation to actually run.
+    payload["actions"]["s1"]["args"] = {"note": token + " " + "x" * 500}
+    summary = _summarize_plan(Plan.model_validate(payload))
+
+    assert "bot<redacted>" in summary        # redaction applied
+    assert "1234567890:AAH" not in summary   # no token / fragment leaked

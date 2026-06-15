@@ -47,12 +47,14 @@ import inspect
 import json
 import logging
 import re
+import reprlib
 from dataclasses import dataclass, field
 from typing import Callable
 
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from sreda.config.log_redaction import redact_secrets
 from sreda.config.settings import Settings, get_settings
 from sreda.runtime.planner.llm import (
     PlannerCallResult,
@@ -240,6 +242,54 @@ def _build_retry_feedback(previous_response: str, errors: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Bounded repr for plan args — caps strings/containers WHILE walking, so a
+# pathological args payload never materializes its full repr before truncation
+# (Codex obs-review R2). Each string is redacted BEFORE it is shortened (R3) so a
+# secret near a reprlib cut boundary can't leak as a fragment the log-layer regex
+# would miss. Structural limits below still bound the walk.
+class _RedactingRepr(reprlib.Repr):
+    def repr_str(self, x, level):  # type: ignore[override]
+        return super().repr_str(redact_secrets(x), level)
+
+
+_ARG_REPR = _RedactingRepr()
+_ARG_REPR.maxstring = 200
+_ARG_REPR.maxother = 200
+_ARG_REPR.maxlist = 12
+_ARG_REPR.maxdict = 12
+_ARG_REPR.maxlevel = 5
+
+
+def _cap_for_log(text: str, limit: int = 1500) -> str:
+    """Make a value safe for a single observability log line: redact known
+    secrets FIRST (so a bot-token can't survive truncation as a partial),
+    collapse all whitespace/newlines to single spaces, then cap with an
+    explicit marker. NB: redaction (#95) currently covers Telegram bot-tokens
+    only — other free-text user content is logged as-is (intentional for the
+    internal planner-enabled tenant set)."""
+    red = " ".join(redact_secrets(text or "").split())
+    if len(red) <= limit:
+        return red
+    return red[:limit] + f"…[+{len(red) - limit}c]"
+
+
+def _summarize_plan(plan: Plan) -> str:
+    """Compact one-line plan summary for observability logging: clarity +
+    action count + each action (tool + args) + the composer target. Budgeted
+    PER ACTION (a huge args payload can't blow up the line or the build cost),
+    secrets redacted, newlines collapsed. clarity/count/compose live in the
+    head so truncation never drops them."""
+    comp = plan.compose
+    target = comp.template_id or comp.llm_prompt_key or "?"
+    head = f"clarity={plan.clarity} actions={len(plan.actions)} compose={target}"
+    parts = [
+        _cap_for_log(f"{sid}={a.tool}({_ARG_REPR.repr(a.args)})", 300)
+        for sid, a in plan.actions.items()
+    ]
+    body = "; ".join(parts) if parts else "(none)"
+    return _cap_for_log(f"{head} [{body}]", 1800)
+
+
 async def run(
     ctx: PlannerContext,
     *,
@@ -284,6 +334,9 @@ async def run(
         or unrecoverable failure (provider unavailable, etc.).
     """
     execution_id = make_execution_id()
+    # getattr-default so lightweight test stubs (SimpleNamespace settings)
+    # don't need the field; prod Settings always has it (default True).
+    _verbose_log = getattr(settings_factory(), "planner_verbose_log", True)
 
     # Sub-A12 D.2-enable R2 (Codex HIGH) — NON-BYPASSABLE composer-LLM
     # gate. Effective LLM keys = caller-proposed ∩ registry ∩
@@ -392,6 +445,11 @@ async def run(
                     call_planner_fn, prompt, **kwargs,
                 )
         except PlannerProviderUnavailable as exc:
+            if _verbose_log:
+                logger.info(
+                    "planner.call_error exec=%s attempt=%d kind=provider_unavailable %s",
+                    execution_id, attempt_no, _cap_for_log(str(exc)),
+                )
             _terminate_invalid(
                 session_factory, execution_id,
                 errors=f"provider_unavailable: {exc}",
@@ -407,6 +465,11 @@ async def run(
                 raw_responses=tuple(raw_responses),
             )
         except PlannerTimeoutError as exc:
+            if _verbose_log:
+                logger.info(
+                    "planner.call_error exec=%s attempt=%d kind=timeout %s",
+                    execution_id, attempt_no, _cap_for_log(str(exc)),
+                )
             _terminate_invalid(
                 session_factory, execution_id,
                 errors=f"timeout: {exc}",
@@ -442,6 +505,14 @@ async def run(
         cumulative_latency_ms += call_result.latency_ms
         raw_responses.append(call_result.raw_text)
         last_raw = call_result.raw_text
+        if _verbose_log:
+            logger.info(
+                "planner.call exec=%s attempt=%d provider=%s model=%s "
+                "latency_ms=%d chars=%d",
+                execution_id, attempt_no, call_result.provider,
+                call_result.model, call_result.latency_ms,
+                len(call_result.raw_text or ""),
+            )
 
         # Stage 3: persist 'received' (own session) + audit provider/model
         try:
@@ -473,6 +544,9 @@ async def run(
             payload = parse_planner_json(call_result.raw_text)
         except json.JSONDecodeError as exc:
             last_errors = f"json_decode_error: {exc}"
+            if _verbose_log:
+                logger.info("planner.invalid exec=%s attempt=%d %s",
+                            execution_id, attempt_no, _cap_for_log(last_errors))
             if attempt_no < max_attempts:
                 continue
             _terminate_invalid(
@@ -492,7 +566,10 @@ async def run(
         try:
             plan = Plan.model_validate(payload)
         except ValidationError as exc:
-            last_errors = f"plan_schema_error: {exc}"
+            last_errors = f"plan_schema_error: {exc.errors(include_input=False)}"
+            if _verbose_log:
+                logger.info("planner.invalid exec=%s attempt=%d %s",
+                            execution_id, attempt_no, _cap_for_log(last_errors))
             if attempt_no < max_attempts:
                 continue
             _terminate_invalid(
@@ -528,6 +605,10 @@ async def run(
             last_errors = "validator_violations: " + "; ".join(
                 render_violations(_prioritize_for_feedback(violations))[:5]
             )
+            if _verbose_log:
+                logger.info("planner.invalid exec=%s attempt=%d violations=%d %s",
+                            execution_id, attempt_no, len(violations),
+                            _cap_for_log(last_errors))
             if attempt_no < max_attempts:
                 continue
             _terminate_invalid(
@@ -548,6 +629,9 @@ async def run(
             execution_plan = compile_plan(plan, registry_map)
         except PlanCompileError as exc:
             last_errors = f"plan_compile_error: {exc}"
+            if _verbose_log:
+                logger.info("planner.invalid exec=%s attempt=%d %s",
+                            execution_id, attempt_no, _cap_for_log(last_errors))
             if attempt_no < max_attempts:
                 continue
             _terminate_invalid(
@@ -587,6 +671,12 @@ async def run(
                 raw_responses=tuple(raw_responses),
             )
 
+        if _verbose_log:
+            logger.info(
+                "planner.valid exec=%s attempt=%d model=%s %s",
+                execution_id, attempt_no, call_result.model,
+                _summarize_plan(plan),
+            )
         return PlannerResult(
             success=True,
             execution_id=execution_id,
