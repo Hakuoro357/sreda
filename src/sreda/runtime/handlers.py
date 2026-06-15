@@ -3685,7 +3685,7 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         # Логгер sreda.runtime.* на проде нем, текст не персистится → файл.
         try:
             import json as _probe_json
-            with open("/tmp/rot_probe.jsonl", "a", encoding="utf-8") as _probe_f:
+            with open("/var/log/sreda/rot_probe.jsonl", "a", encoding="utf-8") as _probe_f:
                 _probe_f.write(_probe_json.dumps({
                     "tenant": action.tenant_id,
                     "chars": len(text),
