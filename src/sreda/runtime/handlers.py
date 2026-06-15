@@ -3669,37 +3669,43 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         text = _WEATHER_HALLUCINATION_SUBSTITUTE
     elif (
         _is_provider_refusal(text)
-        # 2026-06-15 (Boris): временно убран `or _is_predominantly_non_russian(text)`.
-        # %-эвристика «<30% кириллицы» ложно глушила ЛЕГАЛЬНЫЕ русские ответы с
-        # большой долей ASCII — список напоминаний с ISO-датами + RRULE
-        # («разминка -> 2026-06-17 06:00 FREQ=WEEKLY;BYDAY=MO,WE,FR») выходит ~26%
-        # кириллицы → подмена → юзер не видел список (прод-разбор tenant_max_40921122).
-        # Реальные иноязычные утечки (CJK/тайский/иврит) всё равно ВЫРЕЗАЮТСЯ в
-        # _sanitize_chat_reply выше → защита сохраняется. Вернуть умнее: флагать по
-        # наличию иностранной ПИСЬМЕННОСТИ (_CJK_PATTERN), не по доле кириллицы.
+        or _is_predominantly_non_russian(text)
         or _is_reasoning_leak_after_tool(text, called_tools)
         or _mentions_tool_internals(text)
     ):
-        # TEMP PROBE 2026-06-15 (УДАЛИТЬ после диагноза): дамп текста рта +
-        # вердиктов всех 4 гардов — какой именно глушит список напоминаний.
-        # Логгер sreda.runtime.* на проде нем, текст не персистится → файл.
+        # #149: name which guard(s) fired so the alert + WARNING are
+        # actionable (pure, cheap re-checks on a ≤1KB string).
+        _fired = []
+        if _is_provider_refusal(text):
+            _fired.append("refusal")
+        if _is_predominantly_non_russian(text):
+            _fired.append("non_russian")
+        if _is_reasoning_leak_after_tool(text, called_tools):
+            _fired.append("reasoning_leak")
+        if _mentions_tool_internals(text):
+            _fired.append("tool_internals")
+        _fired_str = "+".join(_fired) or "unknown"
+        # #149: substitution used to be SILENT (only WARNING + trace) — admin
+        # never learned the rot was blanked. Alert on every substitution
+        # (INFO, deduped per guard+feature so a storm collapses to ~1/30min).
         try:
-            import json as _probe_json
-            with open("/var/log/sreda/rot_probe.jsonl", "a", encoding="utf-8") as _probe_f:
-                _probe_f.write(_probe_json.dumps({
-                    "tenant": action.tenant_id,
-                    "chars": len(text),
-                    "refusal": _is_provider_refusal(text),
-                    "non_russian": _is_predominantly_non_russian(text),
-                    "reasoning_leak": _is_reasoning_leak_after_tool(text, called_tools),
-                    "tool_internals": _mentions_tool_internals(text),
-                    "text": text,
-                }, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+            from sreda.services.admin_alerts import send_admin_alert
+
+            send_admin_alert(
+                severity="INFO",
+                title=f"Рот заглушён гардом: {_fired_str}",
+                body=(
+                    f"tenant={action.tenant_id} feature={feature_key}\n"
+                    f"гарды={_fired_str} chars={len(text)}\n"
+                    f"текст[:120]={text[:120]!r}"
+                ),
+                dedupe_key=f"rot_substituted:{_fired_str}:{feature_key}",
+            )
+        except Exception:  # noqa: BLE001 — alerting must never break the reply
+            logger.debug("admin alert (rot substitution) failed", exc_info=True)
         logger.warning(
-            "CHAT_PROVIDER_REFUSAL tenant=%s feature=%s original_chars=%d original_first=%r",
-            action.tenant_id, feature_key, len(text), text[:80],
+            "CHAT_PROVIDER_REFUSAL tenant=%s feature=%s guards=%s original_chars=%d original_first=%r",
+            action.tenant_id, feature_key, _fired_str, len(text), text[:80],
         )
         with trace.step(
             "llm.refusal_substituted", original_chars=len(text),

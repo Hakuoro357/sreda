@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 from langchain_core.tools import tool as lc_tool
 from pydantic import BeforeValidator
@@ -237,11 +239,105 @@ def _format_menu_plan_for_user(plan: Any) -> str:
     return "\n".join(lines)
 
 
-def _format_reminder_for_llm(reminder: Any) -> str:
+_BYDAY_RU = {
+    "MO": "пн", "TU": "вт", "WE": "ср", "TH": "чт",
+    "FR": "пт", "SA": "сб", "SU": "вс",
+}
+_FREQ_RU = {
+    "DAILY": "ежедневно", "WEEKLY": "еженедельно",
+    "MONTHLY": "ежемесячно", "YEARLY": "ежегодно",
+}
+
+
+def _parse_rrule(rrule: str) -> dict[str, str]:
+    parts: dict[str, str] = {}
+    for tok in rrule.split(";"):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            parts[k.strip().upper()] = v.strip()
+    return parts
+
+
+def _humanize_recurrence_ru(rrule: str | None) -> str:
+    """RRULE → short Russian phrase; '' for one-shot / unknown.
+
+    ``FREQ=WEEKLY;BYDAY=MO,WE,FR`` → «по пн, ср и пт»;
+    ``FREQ=DAILY`` → «ежедневно»; ``FREQ=WEEKLY`` (no BYDAY) → «еженедельно».
+    Time/BYHOUR/BYMINUTE are ignored here — the clock comes from
+    ``next_trigger_at`` (already the correct next occurrence).
+    """
+    if not rrule:
+        return ""
+    parts = _parse_rrule(rrule)
+    byday = parts.get("BYDAY")
+    if byday:
+        days = [_BYDAY_RU[d] for d in byday.split(",") if d in _BYDAY_RU]
+        if len(days) == 1:
+            return f"по {days[0]}"
+        if days:
+            return "по " + ", ".join(days[:-1]) + f" и {days[-1]}"
+    return _FREQ_RU.get(parts.get("FREQ", "").upper(), "")
+
+
+def _humanize_until_ru(rrule: str | None) -> str:
+    """``UNTIL=20261231T...`` → « (до 31 декабря)»; '' if absent/bad."""
+    if not rrule:
+        return ""
+    m = re.search(r"UNTIL=(\d{4})(\d{2})(\d{2})", rrule)
+    if not m:
+        return ""
+    month = int(m.group(2))
+    if 1 <= month <= 12:
+        return f" (до {int(m.group(3))} {_MENU_MONTH_NAMES_RU[month]})"
+    return ""
+
+
+def _resolve_user_tz(
+    session: Session, tenant_id: str, user_id: str | None
+) -> ZoneInfo:
+    """User's IANA timezone from profile; Europe/Moscow when no profile
+    (system-wide assumption — ``schedule_reminder`` works in MSK). #149."""
+    tz_name = "Europe/Moscow"
+    if user_id:
+        try:
+            from sreda.db.repositories.user_profile import UserProfileRepository
+
+            profile = UserProfileRepository(session).get_profile(tenant_id, user_id)
+            if profile and profile.timezone:
+                tz_name = profile.timezone
+        except Exception:  # noqa: BLE001 — display fallback, never block the list
+            logger.debug("reminder tz lookup failed; default MSK", exc_info=True)
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        return ZoneInfo("Europe/Moscow")
+
+
+def _format_reminder_for_llm(reminder: Any, tz: ZoneInfo) -> str:
+    """LLM-facing reminder line.
+
+    Keeps the ``[rem_…]`` id (the planner reads it from this output to call
+    ``update_reminder``) but humanizes the trigger time → ``tz`` and the
+    recurrence → Russian. Raw ISO timestamps / RRULE strings used to drop
+    the rot's echo below the cyrillic-ratio substitution guards, blanking
+    the whole list (#149); humanized text keeps it predominantly cyrillic.
+    The rot strips the id for the user per the brain prompt.
+    """
     ts = reminder.next_trigger_at
-    ts_str = ts.isoformat() if ts else "—"
-    rec = f" (recurring: {reminder.recurrence_rule})" if reminder.recurrence_rule else ""
-    return f"[{reminder.id}] {reminder.title} → {ts_str}{rec}"
+    rrule = reminder.recurrence_rule
+    if ts is None:
+        when = "время не задано"
+    else:
+        if ts.tzinfo is None:  # SQLite strips tzinfo on store
+            ts = ts.replace(tzinfo=timezone.utc)
+        local = ts.astimezone(tz)
+        hhmm = f"{local.hour:02d}:{local.minute:02d}"
+        rec = _humanize_recurrence_ru(rrule)
+        if rec:
+            when = f"{rec} в {hhmm}{_humanize_until_ru(rrule)}"
+        else:
+            when = f"{local.day} {_MENU_MONTH_NAMES_RU[local.month]} в {hhmm}"
+    return f"[{reminder.id}] {reminder.title} — {when}"
 
 
 def build_housewife_tools(
@@ -481,7 +577,8 @@ def build_housewife_tools(
             ]
         if not reminders:
             return "no active reminders"
-        lines = [_format_reminder_for_llm(r) for r in reminders[:20]]
+        _tz = _resolve_user_tz(session, tenant_id, user_id)
+        lines = [_format_reminder_for_llm(r, _tz) for r in reminders[:20]]
         return "active reminders:\n" + "\n".join(lines)
 
     @_write_lc_tool

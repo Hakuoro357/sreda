@@ -1772,6 +1772,54 @@ def test_provider_refusal_text_substituted(monkeypatch, tmp_path: Path):
     assert telegram.sent[0]["text"] == _REFUSAL_SUBSTITUTE_MESSAGE
 
 
+def test_rot_substitution_alerts_admin(monkeypatch, tmp_path: Path):
+    """#149: every guard substitution fires an admin alert that names the
+    guard. The substitution used to be silent (WARNING + trace only)."""
+    from sreda.runtime.handlers import _REFUSAL_SUBSTITUTE_MESSAGE
+
+    captured: list[dict] = []
+
+    def _fake_alert(severity, title, body, *, dedupe_key=None, extra_context=None):
+        captured.append(
+            {"severity": severity, "title": title, "body": body,
+             "dedupe_key": dedupe_key}
+        )
+
+    import sreda.services.admin_alerts as _aa
+
+    monkeypatch.setattr(_aa, "send_admin_alert", _fake_alert)
+
+    session = _bootstrap(monkeypatch, tmp_path, "pr1_alert.db")
+    try:
+        scripted = [
+            AIMessage(
+                content=(
+                    "The request was rejected because it was considered "
+                    "high risk."
+                ),
+                tool_calls=[],
+            ),
+        ]
+        svc = ActionRuntimeService(
+            session,
+            telegram_client=FakeTelegram(),
+            llm_client=FakeLLM(scripted),
+            embedding_client=ConstantEmbeddingClient(),
+        )
+        queued = svc.enqueue_action(_chat_envelope("привет"))
+        asyncio.run(svc.process_job(queued.job_id))
+    finally:
+        session.close()
+
+    assert len(captured) == 1
+    alert = captured[0]
+    assert alert["severity"] == "INFO"
+    # English refusal text is 0% cyrillic → non_russian guard fires for sure.
+    assert "non_russian" in alert["title"]
+    assert (alert["dedupe_key"] or "").startswith("rot_substituted:")
+    assert "tenant=" in alert["body"]
+
+
 # ---------------------------------------------------------------------------
 # PR-1 loop-seam gap tests (Sub-A12 Phase E)
 # ---------------------------------------------------------------------------
