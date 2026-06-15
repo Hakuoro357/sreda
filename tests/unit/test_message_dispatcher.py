@@ -291,7 +291,7 @@ async def test_dispatch_telegram_raises_when_turn_silently_crashes(
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
-        lambda session, payload: fake_bundle,
+        lambda session, payload, bot_key="sreda": fake_bundle,
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound._process_approved_turn",
@@ -332,7 +332,7 @@ async def test_dispatch_telegram_succeeds_when_status_is_processed(
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
-        lambda session, payload: fake_bundle,
+        lambda session, payload, bot_key="sreda": fake_bundle,
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound._process_approved_turn",
@@ -355,6 +355,73 @@ async def test_dispatch_telegram_succeeds_when_status_is_processed(
     )
     # Should NOT raise
     await message_dispatcher._dispatch_telegram(job)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_telegram_calls_process_turn_with_accepted_kwargs_only(
+    db_session: Session, _patch_session_factory, monkeypatch
+) -> None:
+    """#136 regression: the dispatcher must call ``_process_approved_turn``
+    with ONLY the kwargs its signature accepts (bot_key / payload /
+    onboarding / inbound_message_id). A stray ``bot_token=`` kwarg →
+    ``TypeError`` on EVERY queue job (latent while the queue is off, but
+    blocks ever enabling it).
+
+    The other dispatch tests mock ``_process_approved_turn`` with an
+    ``AsyncMock`` that swallows any kwargs — which is exactly why the
+    mismatch went unnoticed. Here the stub mirrors the REAL signature, so
+    an extra kwarg raises, just like the real call would."""
+    inbound_id = _seed_inbound(db_session, status="processed")
+
+    fake_bundle = SimpleNamespace(
+        tenant_id="tenant_test",
+        user_id="user_test",
+        chat_id="chat_1",
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_bundle_fn(session, payload, *, bot_key):
+        # #136 R2: dispatcher MUST pass bot_key (kw-only, no default here) —
+        # mirrors the inline path. An omitted bot_key raises TypeError, just
+        # like a non-default bot would be mis-onboarded under "sreda".
+        captured["onboard_bot_key"] = bot_key
+        return fake_bundle
+
+    monkeypatch.setattr(
+        "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
+        fake_bundle_fn,
+    )
+
+    async def fake_turn(*, bot_key, payload, onboarding, inbound_message_id):
+        # Signature-faithful: NO bot_token. A stray kwarg from the
+        # dispatcher raises TypeError before this body runs.
+        captured["bot_key"] = bot_key
+        captured["inbound_message_id"] = inbound_message_id
+
+    monkeypatch.setattr(
+        "sreda.services.telegram_inbound._process_approved_turn", fake_turn
+    )
+
+    job = message_dispatcher._JobSnapshot(
+        id="job_136",
+        tenant_id="tenant_test",
+        thread_id="thread_x",
+        channel="telegram",
+        external_update_id="999",
+        message_payload={
+            "kind": "telegram_inbound",
+            "payload": {"update_id": 999},
+            "bot_key": "sreda",
+            "inbound_message_id": inbound_id,
+        },
+        attempt=1,
+    )
+    # RED before fix: dispatcher passes bot_token= → TypeError here.
+    await message_dispatcher._dispatch_telegram(job)
+    assert captured["bot_key"] == "sreda"
+    assert captured["inbound_message_id"] == inbound_id
+    # #136 R2: dispatcher mirrors inline path — bot_key forwarded to onboarding.
+    assert captured["onboard_bot_key"] == "sreda"
 
 
 @pytest.mark.asyncio
