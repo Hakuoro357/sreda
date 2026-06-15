@@ -330,7 +330,7 @@ SAVE_RECIPE_SPEC = ToolSpec(
     mutex_notes=[
         "Для >1 рецепта — save_recipes_batch; для правки — delete_recipe + save_recipe.",
         # #146: юзер диктует рецепт без всех полей → НЕ уточняй, заполни сам.
-        "Юзер дал не все поля → НЕ уточняй: servings=4, source=user_dictated, способ→instructions_md, продукты→ingredients (пусто ок). Подтверди через ${s1.title}, НЕ raw_text. Сохраняй сразу.",
+        "Поля не даны → НЕ уточняй: servings из текста иначе 4; source=user_dictated (source_url НЕ ставь); способ→instructions_md; продукты→ingredients. Подтверди ${s1.title}, не raw_text.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
