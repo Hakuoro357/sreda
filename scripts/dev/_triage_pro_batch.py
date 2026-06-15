@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,6 +30,7 @@ os.environ["SREDA_ENCRYPTION_KEY"] = base64.urlsafe_b64encode(
     b"0123456789abcdef0123456789abcdef"
 ).decode()
 os.environ["SREDA_MIMO_API_KEY_FILE"] = str(_REPO / ".secrets" / "mimo_api_key.txt")
+os.environ["SREDA_NVIDIA_API_KEY_FILE"] = str(_REPO / ".secrets" / "nvidia.txt")
 os.environ["SREDA_TG_ACCOUNT_SALT"] = "x"
 os.environ["SREDA_CHAT_PROVIDER"] = _PROVIDER
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -112,20 +114,31 @@ async def _run_one(msg, closed):
 
 async def _main():
     print(f"### ТРИАЖ provider={_PROVIDER} N={_N}")
+    all_lat = []
+    tot_succ = tot_runs = 0
     for issue, msg, closed in SCENARIOS:
         if _FILTER and _FILTER not in issue:
             continue
         succ = 0
         details = []
+        lats = []
         for _ in range(_N):
+            t0 = time.monotonic()
             r = await _run_one(msg, closed)
+            dt = time.monotonic() - t0
+            lats.append(dt); all_lat.append(dt)
+            tot_runs += 1
             if r.success:
-                succ += 1
+                succ += 1; tot_succ += 1
             tools, flags = _analyze(r)
-            details.append(f"succ={r.success} tools={tools} {flags}")
-        print(f"\n[{issue}] «{msg[:42]}» → success {succ}/{_N}")
+            details.append(f"succ={r.success} {dt:.1f}s tools={tools} {flags}")
+        avg = sum(lats) / len(lats) if lats else 0
+        print(f"\n[{issue}] «{msg[:42]}» → success {succ}/{_N} | avg {avg:.1f}s")
         for d in details:
             print(f"    {d}")
+    ov = sum(all_lat) / len(all_lat) if all_lat else 0
+    mx = max(all_lat) if all_lat else 0
+    print(f"\n### ИТОГ {_PROVIDER}: success {tot_succ}/{tot_runs} | avg {ov:.1f}s | max {mx:.1f}s")
 
 
 asyncio.run(_main())

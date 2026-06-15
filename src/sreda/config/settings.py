@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     mimo_api_key_file: str | None = None
     mimo_chat_model: str = "mimo-v2-pro"
     mimo_request_timeout_seconds: float = 60.0
+    # NVIDIA NIM (integrate.api.nvidia.com) — OpenAI-compatible. Прямой
+    # провайдер для Nemotron/Llama/Qwen на оптимизированной инфре NVIDIA
+    # (высокий tps). Ключ (nvapi-…): env → file → None, как у mimo.
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_api_key: str | None = None
+    nvidia_api_key_file: str | None = None
     # Cheap-model hook for per-event relevance classification + future
     # ``decide_to_speak`` LLM layer. When set (e.g. ``mimo-v2-omni`` or
     # the yet-unreleased ``mimo-v2-flash``), the classifier worker starts
@@ -757,6 +763,20 @@ class Settings(BaseSettings):
             from pathlib import Path
 
             path = Path(self.mimo_api_key_file)
+            if path.exists() and path.is_file():
+                value = path.read_text(encoding="utf-8").strip()
+                return value or None
+        return None
+
+    def resolve_nvidia_api_key(self) -> str | None:
+        """Resolve NVIDIA NIM API key (nvapi-…), env→file→None — та же
+        очерёдность, что ``resolve_mimo_api_key``."""
+        if self.nvidia_api_key:
+            return self.nvidia_api_key.strip()
+        if self.nvidia_api_key_file:
+            from pathlib import Path
+
+            path = Path(self.nvidia_api_key_file)
             if path.exists() and path.is_file():
                 value = path.read_text(encoding="utf-8").strip()
                 return value or None

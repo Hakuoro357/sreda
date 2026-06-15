@@ -1304,6 +1304,12 @@ CHAT_PROVIDERS = (
     # 2026-06-10 (#107, выбор Бориса): кандидат в РОТ против лёгкой mimo-v2.5
     # — сверхдешёвый lite-вариант 2.5 flash.
     "openrouter-gemini-2.5-flash-lite",
+    # 2026-06-15: NVIDIA NIM (прямой, integrate.api.nvidia.com) — кандидаты на
+    # замену MiMo в планировщике (Nemotron нативно, MoE = быстрый инференс).
+    # Оценка против baseline MiMo-pro перед флипом (план миграции планировщика).
+    "nvidia-nemotron-super",      # nvidia/nemotron-3-super-120b-a12b (12B active)
+    "nvidia-llama-nemotron-49b",  # nvidia/llama-3.3-nemotron-super-49b-v1.5
+    "nvidia-nemotron-nano",       # nvidia/nemotron-3-nano-30b-a3b (3B active, fastest)
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1338,6 +1344,15 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter-gemini-2.5-flash-lite": "google/gemini-2.5-flash-lite",
 }
 
+# NVIDIA NIM variants — share nvidia_base_url + nvidia api key, differ by model.
+# Model id'ы взяты из /v1/models на ключе Бориса 2026-06-15 (authoritative, не
+# угаданы). Кандидаты на замену MiMo в планировщике (план миграции).
+_NVIDIA_MODEL_BY_PROVIDER = {
+    "nvidia-nemotron-super":     "nvidia/nemotron-3-super-120b-a12b",
+    "nvidia-llama-nemotron-49b": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    "nvidia-nemotron-nano":      "nvidia/nemotron-3-nano-30b-a3b",
+}
+
 
 # 2026-05-10: Per-provider OpenRouter routing overrides (extra_body).
 # OpenRouter обычно сам выбирает provider'а с лучшей ценой, но иногда
@@ -1359,6 +1374,21 @@ _OPENROUTER_TEMPERATURE_BY_PROVIDER: dict[str, float] = {
     # Nemotron сильно зависит от temperature (probe 0.2 vs prod 0.3 dichotomy).
     # 0.1 — agressive determinism для повышения tool-dispatch reliability.
     "openrouter-nemotron-3-super": 0.1,
+    # 2026-06-15: NVIDIA Nemotron (прямой NIM) — тот же drift-риск, тот же 0.1.
+    "nvidia-nemotron-super": 0.1,
+    "nvidia-llama-nemotron-49b": 0.1,
+    "nvidia-nemotron-nano": 0.1,
+}
+
+# 2026-06-15: NIM reasoning-off для Nemotron. Smoke 2026-06-15 подтвердил, что
+# chat_template_kwargs.thinking=false реально гасит thinking (механизм B; модель
+# и так не сыпала reasoning на коротком промпте, но явно глушим — у Nemotron
+# документированы drift-инциденты при reasoning ON, см. openrouter-nemotron выше).
+# Чисто, без OpenRouter-обёртки `reasoning:{}` — это NATIVE NIM-параметр.
+_NVIDIA_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    "nvidia-nemotron-super":     {"chat_template_kwargs": {"thinking": False}},
+    "nvidia-llama-nemotron-49b": {"chat_template_kwargs": {"thinking": False}},
+    "nvidia-nemotron-nano":      {"chat_template_kwargs": {"thinking": False}},
 }
 
 
@@ -1469,6 +1499,30 @@ def _build_chat_llm(
             model=model or override or settings.openrouter_chat_model,
             # 2026-05-11 PM: per-provider temperature override.
             # Nemotron specifically needs lower temp (0.1) to avoid drift.
+            temperature=_override_temperature(provider, temperature),
+            timeout=settings.mimo_request_timeout_seconds,
+            **kwargs,
+        )
+    if provider in _NVIDIA_MODEL_BY_PROVIDER:
+        api_key = settings.resolve_nvidia_api_key()
+        if not api_key:
+            logger.info("chat LLM disabled: no NVIDIA API key configured")
+            return None
+        override = _NVIDIA_MODEL_BY_PROVIDER[provider]
+        # reasoning-off (chat_template_kwargs) — merge с caller'ским extra_body,
+        # caller wins на конфликте ключей (как у openrouter-ветки выше).
+        nvidia_extra = _NVIDIA_EXTRA_BODY_BY_PROVIDER.get(provider)
+        caller_extra_body = kwargs.pop("extra_body", None)
+        if nvidia_extra and caller_extra_body:
+            kwargs["extra_body"] = {**nvidia_extra, **caller_extra_body}
+        elif caller_extra_body:
+            kwargs["extra_body"] = caller_extra_body
+        elif nvidia_extra:
+            kwargs["extra_body"] = nvidia_extra
+        return ChatOpenAI(
+            base_url=settings.nvidia_base_url,
+            api_key=api_key,
+            model=model or override,
             temperature=_override_temperature(provider, temperature),
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,
@@ -1589,6 +1643,8 @@ def _provider_key_is_available(provider: str, settings: Settings) -> bool:
         return bool(settings.resolve_mimo_api_key())
     if provider in _OPENROUTER_MODEL_BY_PROVIDER:
         return bool(settings.resolve_openrouter_api_key())
+    if provider in _NVIDIA_MODEL_BY_PROVIDER:
+        return bool(settings.resolve_nvidia_api_key())
     return False
 
 
