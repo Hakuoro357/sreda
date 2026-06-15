@@ -291,7 +291,7 @@ async def test_dispatch_telegram_raises_when_turn_silently_crashes(
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
-        lambda session, payload: fake_bundle,
+        lambda session, payload, bot_key="sreda": fake_bundle,
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound._process_approved_turn",
@@ -332,7 +332,7 @@ async def test_dispatch_telegram_succeeds_when_status_is_processed(
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
-        lambda session, payload: fake_bundle,
+        lambda session, payload, bot_key="sreda": fake_bundle,
     )
     monkeypatch.setattr(
         "sreda.services.telegram_inbound._process_approved_turn",
@@ -378,12 +378,19 @@ async def test_dispatch_telegram_calls_process_turn_with_accepted_kwargs_only(
         user_id="user_test",
         chat_id="chat_1",
     )
+    captured: dict[str, Any] = {}
+
+    def fake_bundle_fn(session, payload, *, bot_key):
+        # #136 R2: dispatcher MUST pass bot_key (kw-only, no default here) —
+        # mirrors the inline path. An omitted bot_key raises TypeError, just
+        # like a non-default bot would be mis-onboarded under "sreda".
+        captured["onboard_bot_key"] = bot_key
+        return fake_bundle
+
     monkeypatch.setattr(
         "sreda.services.telegram_inbound.ensure_telegram_user_bundle",
-        lambda session, payload: fake_bundle,
+        fake_bundle_fn,
     )
-
-    captured: dict[str, Any] = {}
 
     async def fake_turn(*, bot_key, payload, onboarding, inbound_message_id):
         # Signature-faithful: NO bot_token. A stray kwarg from the
@@ -413,6 +420,8 @@ async def test_dispatch_telegram_calls_process_turn_with_accepted_kwargs_only(
     await message_dispatcher._dispatch_telegram(job)
     assert captured["bot_key"] == "sreda"
     assert captured["inbound_message_id"] == inbound_id
+    # #136 R2: dispatcher mirrors inline path — bot_key forwarded to onboarding.
+    assert captured["onboard_bot_key"] == "sreda"
 
 
 @pytest.mark.asyncio

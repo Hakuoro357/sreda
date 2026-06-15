@@ -329,7 +329,10 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
     # writes get rolled back at ``with`` exit (code-review 2026-05-25
     # MAJOR-1).
     with SessionLocal() as session, session.begin():
-        onboarding = ensure_telegram_user_bundle(session, payload)
+        # #136 R2: зеркалим inline path (telegram_inbound.py:462) — передаём
+        # bot_key. Без него non-default бот (sreda_home) onboard'ится под
+        # дефолтным "sreda": неверная per-bot signup policy + last_bot_key.
+        onboarding = ensure_telegram_user_bundle(session, payload, bot_key=bot_key)
 
     # #136: dispatcher MUST mirror the inline path's call shape exactly —
     # ``_process_approved_turn`` is kw-only (bot_key/payload/onboarding/
