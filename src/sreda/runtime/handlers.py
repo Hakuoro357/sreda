@@ -4155,6 +4155,36 @@ def _mentions_tool_internals(text: str) -> bool:
     return False
 
 
+# #149 (Codex M4): structural ASCII (internal ids, urls, ISO/clock
+# timestamps, bare numbers) is NOT language — a Russian reply full of
+# reminder dates or rec_/menu_ ids must not be misread as non-Russian and
+# blanked. Strip it before measuring the cyrillic share of actual prose.
+_STRUCTURAL_ASCII_RE = re.compile(
+    r"\[?[a-z]{2,12}_[0-9a-f]{6,}\]?"        # internal ids: rem_…/rec_…/menu_…
+    r"|https?://\S+"                          # urls
+    r"|\d{4}-\d{2}-\d{2}(?:t[\d:+\-.]*z?)?"   # ISO date / datetime
+    r"|\b\d{1,2}:\d{2}\b"                     # clock times
+    r"|[0-9]+",                               # bare numbers
+    re.IGNORECASE,
+)
+
+
+def _foreign_letter_ratio_below(text: str, threshold: float) -> bool:
+    """True if the cyrillic share of ALPHABETIC chars — after stripping
+    structural ASCII (ids/urls/ISO/clock/numbers) — is below ``threshold``.
+
+    Computing over letters (not total length) and excluding technical tokens
+    makes the guard track actual language, not punctuation/dates/ids (#149).
+    Returns False when there is too little prose to judge.
+    """
+    probe = _STRUCTURAL_ASCII_RE.sub(" ", text)
+    letters = [c for c in probe if c.isalpha()]
+    if len(letters) < 10:
+        return False
+    cyrillic = sum(1 for c in letters if "Ѐ" <= c <= "ӿ")
+    return (cyrillic / len(letters)) < threshold
+
+
 def _is_reasoning_leak_after_tool(
     text: str, called_tools: set[str], *, min_len: int = 300, threshold: float = 0.5,
 ) -> bool:
@@ -4176,8 +4206,7 @@ def _is_reasoning_leak_after_tool(
         return False
     if len(text) < min_len:
         return False
-    cyrillic = sum(1 for c in text if "Ѐ" <= c <= "ӿ")
-    return (cyrillic / len(text)) < threshold
+    return _foreign_letter_ratio_below(text, threshold)
 
 
 def _is_predominantly_non_russian(text: str, threshold: float = 0.3) -> bool:
@@ -4190,8 +4219,7 @@ def _is_predominantly_non_russian(text: str, threshold: float = 0.3) -> bool:
     """
     if not text or len(text) < 20:
         return False
-    cyrillic = sum(1 for c in text if "Ѐ" <= c <= "ӿ")
-    return (cyrillic / len(text)) < threshold
+    return _foreign_letter_ratio_below(text, threshold)
 
 
 # Unicode ranges for CJK + Japanese kana. Matches Chinese Hanzi, Japanese

@@ -243,10 +243,36 @@ _BYDAY_RU = {
     "MO": "пн", "TU": "вт", "WE": "ср", "TH": "чт",
     "FR": "пт", "SA": "сб", "SU": "вс",
 }
-_FREQ_RU = {
-    "DAILY": "ежедневно", "WEEKLY": "еженедельно",
-    "MONTHLY": "ежемесячно", "YEARLY": "ежегодно",
+# INTERVAL == 1 → fixed adverb.
+_FREQ_EVERY1_RU = {
+    "MINUTELY": "ежеминутно", "HOURLY": "ежечасно", "DAILY": "ежедневно",
+    "WEEKLY": "еженедельно", "MONTHLY": "ежемесячно", "YEARLY": "ежегодно",
 }
+# INTERVAL > 1 → «каждые N <unit>» — (one, few, many) plural forms.
+_FREQ_UNIT_RU = {
+    "MINUTELY": ("минуту", "минуты", "минут"),
+    "HOURLY": ("час", "часа", "часов"),
+    "DAILY": ("день", "дня", "дней"),
+    "WEEKLY": ("неделю", "недели", "недель"),
+    "MONTHLY": ("месяц", "месяца", "месяцев"),
+    "YEARLY": ("год", "года", "лет"),
+}
+# Sub-hour frequencies have no meaningful clock — don't append «в HH:MM».
+_SUBHOUR_FREQ = {"MINUTELY", "HOURLY"}
+
+
+def _plural_ru(n: int, forms: tuple[str, str, str]) -> str:
+    """Russian plural: forms = (one, few, many). 1→one, 2-4→few, else many
+    (with the 11-14 exception that always takes ``many``)."""
+    one, few, many = forms
+    if 11 <= n % 100 <= 14:
+        return many
+    tail = n % 10
+    if tail == 1:
+        return one
+    if 2 <= tail <= 4:
+        return few
+    return many
 
 
 def _parse_rrule(rrule: str) -> dict[str, str]:
@@ -259,37 +285,53 @@ def _parse_rrule(rrule: str) -> dict[str, str]:
 
 
 def _humanize_recurrence_ru(rrule: str | None) -> str:
-    """RRULE → short Russian phrase; '' for one-shot / unknown.
+    """RRULE → short Russian phrase. Returns '' ONLY for a one-shot (no
+    rule); a present-but-unusual rule falls back to «по расписанию» so a
+    recurring reminder is NEVER shown as one-shot (Codex #149 R1).
 
-    ``FREQ=WEEKLY;BYDAY=MO,WE,FR`` → «по пн, ср и пт»;
-    ``FREQ=DAILY`` → «ежедневно»; ``FREQ=WEEKLY`` (no BYDAY) → «еженедельно».
-    Time/BYHOUR/BYMINUTE are ignored here — the clock comes from
-    ``next_trigger_at`` (already the correct next occurrence).
+    ``FREQ=WEEKLY;BYDAY=MO,WE,FR`` → «по пн, ср и пт»; ``FREQ=DAILY`` →
+    «ежедневно»; ``FREQ=MINUTELY;INTERVAL=30`` → «каждые 30 минут».
+    BYHOUR/BYMINUTE ignored — the clock comes from ``next_trigger_at``.
     """
     if not rrule:
         return ""
     parts = _parse_rrule(rrule)
+    freq = parts.get("FREQ", "").upper()
+    try:
+        interval = int(parts.get("INTERVAL", "1"))
+    except ValueError:
+        interval = 1
     byday = parts.get("BYDAY")
-    if byday:
+    if freq == "WEEKLY" and byday and interval == 1:
         days = [_BYDAY_RU[d] for d in byday.split(",") if d in _BYDAY_RU]
         if len(days) == 1:
             return f"по {days[0]}"
         if days:
             return "по " + ", ".join(days[:-1]) + f" и {days[-1]}"
-    return _FREQ_RU.get(parts.get("FREQ", "").upper(), "")
+    if interval > 1 and freq in _FREQ_UNIT_RU:
+        return f"каждые {interval} {_plural_ru(interval, _FREQ_UNIT_RU[freq])}"
+    if freq in _FREQ_EVERY1_RU:
+        return _FREQ_EVERY1_RU[freq]
+    return "по расписанию"  # present but unparseable → never one-shot
 
 
-def _humanize_until_ru(rrule: str | None) -> str:
-    """``UNTIL=20261231T...`` → « (до 31 декабря)»; '' if absent/bad."""
+def _humanize_until_ru(rrule: str | None, tz: ZoneInfo) -> str:
+    """``UNTIL=YYYYMMDD[Thhmmss[Z]]`` → « (до 31 декабря)» in the user's tz."""
     if not rrule:
         return ""
-    m = re.search(r"UNTIL=(\d{4})(\d{2})(\d{2})", rrule)
+    m = re.search(r"UNTIL=(\d{8})(?:T(\d{6})Z?)?", rrule)
     if not m:
         return ""
-    month = int(m.group(2))
-    if 1 <= month <= 12:
-        return f" (до {int(m.group(3))} {_MENU_MONTH_NAMES_RU[month]})"
-    return ""
+    ymd, hms = m.group(1), (m.group(2) or "000000")
+    try:
+        dt = datetime(
+            int(ymd[0:4]), int(ymd[4:6]), int(ymd[6:8]),
+            int(hms[0:2]), int(hms[2:4]), int(hms[4:6]),
+            tzinfo=timezone.utc,
+        ).astimezone(tz)
+    except ValueError:
+        return ""
+    return f" (до {dt.day} {_MENU_MONTH_NAMES_RU[dt.month]})"
 
 
 def _resolve_user_tz(
@@ -334,7 +376,12 @@ def _format_reminder_for_llm(reminder: Any, tz: ZoneInfo) -> str:
         hhmm = f"{local.hour:02d}:{local.minute:02d}"
         rec = _humanize_recurrence_ru(rrule)
         if rec:
-            when = f"{rec} в {hhmm}{_humanize_until_ru(rrule)}"
+            freq = _parse_rrule(rrule).get("FREQ", "").upper() if rrule else ""
+            until = _humanize_until_ru(rrule, tz)
+            if freq in _SUBHOUR_FREQ:
+                when = f"{rec}{until}"  # «каждые 30 минут» — clock meaningless
+            else:
+                when = f"{rec} в {hhmm}{until}"
         else:
             when = f"{local.day} {_MENU_MONTH_NAMES_RU[local.month]} в {hhmm}"
     return f"[{reminder.id}] {reminder.title} — {when}"
