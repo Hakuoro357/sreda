@@ -3669,7 +3669,14 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         text = _WEATHER_HALLUCINATION_SUBSTITUTE
     elif (
         _is_provider_refusal(text)
-        or _is_predominantly_non_russian(text)
+        # 2026-06-15 (Boris): временно убран `or _is_predominantly_non_russian(text)`.
+        # %-эвристика «<30% кириллицы» ложно глушила ЛЕГАЛЬНЫЕ русские ответы с
+        # большой долей ASCII — список напоминаний с ISO-датами + RRULE
+        # («разминка -> 2026-06-17 06:00 FREQ=WEEKLY;BYDAY=MO,WE,FR») выходит ~26%
+        # кириллицы → подмена → юзер не видел список (прод-разбор tenant_max_40921122).
+        # Реальные иноязычные утечки (CJK/тайский/иврит) всё равно ВЫРЕЗАЮТСЯ в
+        # _sanitize_chat_reply выше → защита сохраняется. Вернуть умнее: флагать по
+        # наличию иностранной ПИСЬМЕННОСТИ (_CJK_PATTERN), не по доле кириллицы.
         or _is_reasoning_leak_after_tool(text, called_tools)
         or _mentions_tool_internals(text)
     ):
