@@ -328,8 +328,9 @@ SAVE_RECIPE_SPEC = ToolSpec(
         "сохрани вот этот рецепт",
     ],
     mutex_notes=[
-        "Для batch-сохранения (>1 рецепт за раз) — save_recipes_batch, не save_recipe в цикле.",
-        "Для редактирования существующего рецепта — delete_recipe + save_recipe (нет отдельного update).",
+        "Для >1 рецепта — save_recipes_batch; для правки — delete_recipe + save_recipe.",
+        # #146: юзер диктует рецепт без всех полей → НЕ уточняй, заполни сам.
+        "Юзер дал не все поля → НЕ уточняй: servings=4, source=user_dictated, способ→instructions_md, продукты→ingredients (пусто ок). Подтверди через ${s1.title}, НЕ raw_text. Сохраняй сразу.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -339,11 +340,9 @@ SAVE_RECIPE_SPEC = ToolSpec(
 SAVE_RECIPES_BATCH_SPEC = ToolSpec(
     name="save_recipes_batch",
     description=(
-        "Сохранить НЕСКОЛЬКО рецептов одним вызовом (до 50, ~200k "
-        "символов суммарно): «запиши N рецептов», либо после "
-        "планирования меню (группа МЕНЮ) превратить свободные блюда в "
-        "структурированные рецепты. Дедуп per-title; дубли внутри "
-        "батча схема отвергает."
+        "Сохранить НЕСКОЛЬКО рецептов одним вызовом (до 50): «запиши N "
+        "рецептов» либо превратить блюда плана меню в структурированные "
+        "рецепты. Дедуп per-title; дубли внутри батча схема отвергает."
     ),
     family="recipes",
     effect="write",
