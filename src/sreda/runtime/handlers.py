@@ -3680,6 +3680,23 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         or _is_reasoning_leak_after_tool(text, called_tools)
         or _mentions_tool_internals(text)
     ):
+        # TEMP PROBE 2026-06-15 (УДАЛИТЬ после диагноза): дамп текста рта +
+        # вердиктов всех 4 гардов — какой именно глушит список напоминаний.
+        # Логгер sreda.runtime.* на проде нем, текст не персистится → файл.
+        try:
+            import json as _probe_json
+            with open("/tmp/rot_probe.jsonl", "a", encoding="utf-8") as _probe_f:
+                _probe_f.write(_probe_json.dumps({
+                    "tenant": action.tenant_id,
+                    "chars": len(text),
+                    "refusal": _is_provider_refusal(text),
+                    "non_russian": _is_predominantly_non_russian(text),
+                    "reasoning_leak": _is_reasoning_leak_after_tool(text, called_tools),
+                    "tool_internals": _mentions_tool_internals(text),
+                    "text": text,
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
         logger.warning(
             "CHAT_PROVIDER_REFUSAL tenant=%s feature=%s original_chars=%d original_first=%r",
             action.tenant_id, feature_key, len(text), text[:80],
