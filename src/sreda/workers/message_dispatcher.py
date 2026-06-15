@@ -313,7 +313,6 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
     means the turn crashed and we must report failure to the queue
     so retry / dead_letter can engage.
     """
-    from sreda.config.settings import get_settings
     from sreda.db.models import InboundMessage
     from sreda.services.telegram_inbound import (
         _process_approved_turn,
@@ -323,7 +322,6 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
     payload = job.message_payload["payload"]
     bot_key = job.message_payload.get("bot_key", "sreda")
     inbound_message_id = job.message_payload.get("inbound_message_id")
-    settings = get_settings()
 
     SessionLocal = get_session_factory()
     # Explicit transaction — ``ensure_telegram_user_bundle`` may create
@@ -333,12 +331,15 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
     with SessionLocal() as session, session.begin():
         onboarding = ensure_telegram_user_bundle(session, payload)
 
+    # #136: dispatcher MUST mirror the inline path's call shape exactly —
+    # ``_process_approved_turn`` is kw-only (bot_key/payload/onboarding/
+    # inbound_message_id); a stray ``bot_token=`` raised TypeError on every
+    # queue job. bot_token is derived downstream from ``bot_key``, never passed.
     await _process_approved_turn(
         bot_key=bot_key,
         payload=payload,
         onboarding=onboarding,
         inbound_message_id=inbound_message_id,
-        bot_token=settings.telegram_bot_token,
     )
 
     # Crash detection — see docstring.
