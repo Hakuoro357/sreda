@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+from sreda.services.llm_pricing import cost_estimate
 
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.models.core import Tenant, User
@@ -432,4 +435,161 @@ def get_llm_calls(
         total_pages=total_pages,
         tenant_name=tenants.get(tenant_id, tenant_id),
         feature_key=feature_key,
+    )
+
+
+# ------------------------------------------------ #150 F2: траты по моделям
+
+# Валидная строка для денег: оба счётчика токенов неотрицательны. Отрицательные
+# — аномалия данных, исключаются из сумм И считаются отдельно (Codex-ревью:
+# нельзя суммировать в группе — отрицательная и положительная взаимогасятся).
+_VALID_TOKENS = (
+    (SkillAIExecution.prompt_tokens >= 0)
+    & (SkillAIExecution.completion_tokens >= 0)
+)
+
+
+def period_window_utc(
+    period: str, anchor: datetime | None = None
+) -> tuple[datetime, datetime]:
+    """MSK-календарное окно периода → ``[start_utc, end_utc)`` (aware-UTC).
+
+    ``period`` ∈ {day, week, month}, считается в Europe/Moscow: день — с 00:00;
+    неделя — с понедельника 00:00; месяц — с 1-го 00:00 (след. месяц —
+    календарной арифметикой). Границы aware-UTC, полуоткрытые — как
+    ``_msk_day_window_utc`` (сравнение с ``created_at`` идентично SQLite/Postgres).
+    """
+    now = anchor or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    local = now.astimezone(MSK_TZ)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "day":
+        start_local, end_local = midnight, midnight + timedelta(days=1)
+    elif period == "week":
+        start_local = midnight - timedelta(days=local.weekday())
+        end_local = start_local + timedelta(days=7)
+    elif period == "month":
+        start_local = midnight.replace(day=1)
+        if start_local.month == 12:
+            end_local = start_local.replace(year=start_local.year + 1, month=1)
+        else:
+            end_local = start_local.replace(month=start_local.month + 1)
+    else:
+        raise ValueError(f"unknown period: {period!r} (day|week|month)")
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class SpendModelRow:
+    provider_key: str
+    model: str
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    est_usd: Decimal | None   # None если беспрайсово (→ «—» на UI)
+    upper_usd: Decimal | None
+    priced: bool
+
+
+@dataclass(frozen=True)
+class SpendReport:
+    period: str
+    start_utc: datetime
+    end_utc: datetime
+    rows: list[SpendModelRow]            # priced (по est убыв.), затем unpriced
+    priced_subtotal_usd: Decimal
+    upper_subtotal_usd: Decimal
+    unpriced_models: list[tuple[str, str]]
+    unpriced_calls: int
+    unpriced_tokens: int
+    coverage_calls_pct: int | None       # None если 0 валидных вызовов
+    coverage_tokens_pct: int | None
+    anomaly_count: int
+
+
+def get_spend_by_model(
+    session: Session, period: str, anchor: datetime | None = None
+) -> SpendReport:
+    """Траты по (provider_key, model) за MSK-окно периода.
+
+    Стоимость — через ``llm_pricing.cost_estimate`` (беспрайсовое → est=None → «—»).
+    Итог — «priced subtotal» + покрытие (% валидных вызовов/токенов с известной
+    ценой) + число аномалий. Историю считаем по текущему прайсу (оценка).
+    """
+    start, end = period_window_utc(period, anchor)
+    in_win = (
+        SkillAIExecution.created_at >= start,
+        SkillAIExecution.created_at < end,
+    )
+
+    anomaly_count = (
+        session.query(func.count(SkillAIExecution.id))
+        .filter(*in_win, ~_VALID_TOKENS)
+        .scalar()
+    ) or 0
+
+    grouped = (
+        session.query(
+            SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+        )
+        .filter(*in_win, _VALID_TOKENS)
+        .group_by(SkillAIExecution.provider_key, SkillAIExecution.model)
+        .all()
+    )
+
+    rows: list[SpendModelRow] = []
+    priced_subtotal = Decimal("0")
+    upper_subtotal = Decimal("0")
+    unpriced_models: list[tuple[str, str]] = []
+    unpriced_calls = unpriced_tokens = 0
+    total_calls = total_tokens = 0
+    priced_calls = priced_tokens = 0
+
+    for provider_key, model, calls, prompt, completion in grouped:
+        provider_key = provider_key or ""
+        model = model or ""
+        calls = int(calls)
+        prompt = int(prompt)
+        completion = int(completion)
+        toks = prompt + completion
+        total_calls += calls
+        total_tokens += toks
+        est = cost_estimate(
+            provider_key, model,
+            prompt_tokens=prompt, completion_tokens=completion,
+        )
+        if est is not None:
+            priced_subtotal += est.est_usd
+            upper_subtotal += est.upper_usd
+            priced_calls += calls
+            priced_tokens += toks
+            rows.append(SpendModelRow(
+                provider_key, model, calls, prompt, completion,
+                est.est_usd, est.upper_usd, True,
+            ))
+        else:
+            unpriced_models.append((provider_key, model))
+            unpriced_calls += calls
+            unpriced_tokens += toks
+            rows.append(SpendModelRow(
+                provider_key, model, calls, prompt, completion, None, None, False,
+            ))
+
+    # priced (по est убыв.) сперва, беспрайсовые — в конец
+    rows.sort(key=lambda r: (r.priced, r.est_usd or Decimal("0")), reverse=True)
+
+    cov_calls = round(priced_calls * 100 / total_calls) if total_calls else None
+    cov_tokens = round(priced_tokens * 100 / total_tokens) if total_tokens else None
+
+    return SpendReport(
+        period=period, start_utc=start, end_utc=end, rows=rows,
+        priced_subtotal_usd=priced_subtotal, upper_subtotal_usd=upper_subtotal,
+        unpriced_models=unpriced_models, unpriced_calls=unpriced_calls,
+        unpriced_tokens=unpriced_tokens, coverage_calls_pct=cov_calls,
+        coverage_tokens_pct=cov_tokens, anomaly_count=int(anomaly_count),
     )
