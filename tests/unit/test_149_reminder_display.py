@@ -99,6 +99,10 @@ def test_full_list_passes_substitution_guards() -> None:
             datetime(2026, 6, 22, 6, 0, tzinfo=UTC),
             "FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20261231T060000Z",
         ),
+        _rem(
+            "rem_" + "0" * 24, "выпить воды",
+            datetime(2026, 6, 17, 6, 0, tzinfo=UTC), "FREQ=DAILY;BYHOUR=6",
+        ),
     ]
     lines = [_format_reminder_for_llm(r, MSK) for r in rems]
     # Simulate the rot: it omits the [rem_...] id per the brain prompt.
@@ -134,8 +138,9 @@ def test_interval_weekly_plural() -> None:
     assert "каждые 2 недели" in out
 
 
-def test_unknown_rrule_never_oneshot() -> None:
-    # A present-but-unusual rule must NOT render as a one-shot date.
+def test_unknown_rrule_safe_fallback() -> None:
+    # A present-but-unusual rule → safe «по расписанию, ближайшее — <fire>»,
+    # anchored on the real next occurrence; never a bare one-shot date.
     rem = _rem(
         "rem_" + "3" * 24, "что-то",
         datetime(2026, 6, 17, 6, 0, tzinfo=UTC),
@@ -143,7 +148,24 @@ def test_unknown_rrule_never_oneshot() -> None:
     )
     out = _format_reminder_for_llm(rem, MSK)
     assert "по расписанию" in out
-    assert "июня" not in out  # not rendered as a one-shot calendar date
+    assert "ближайшее" in out
+    assert "09:00" in out  # correct next local time
+
+
+def test_bymonthday_ordinal_count_multitime_fall_back() -> None:
+    # Codex R2 M2: shapes we don't render exactly must degrade to the safe
+    # phrase, not a misleading broad recurrence.
+    for rrule in (
+        "FREQ=MONTHLY;BYMONTHDAY=31",
+        "FREQ=MONTHLY;BYDAY=1MO",
+        "FREQ=WEEKLY;BYDAY=MO;COUNT=10",
+        "FREQ=DAILY;BYHOUR=8,12,17",
+        "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO",
+    ):
+        rem = _rem("rem_" + "0" * 24, "x", datetime(2026, 6, 17, 6, 0, tzinfo=UTC), rrule)
+        out = _format_reminder_for_llm(rem, MSK)
+        assert "по расписанию" in out, rrule
+        assert "FREQ=" not in out and "BYDAY=" not in out, rrule
 
 
 def test_until_tz_aware_rolls_to_local_day() -> None:
@@ -160,18 +182,18 @@ def test_until_tz_aware_rolls_to_local_day() -> None:
 # --- M3: display uses user-frame BYDAY weekday (reject, with proof) ---------
 
 
-def test_near_midnight_weekday_is_user_frame() -> None:
-    # 2026-06-15 is Monday. 22:00 UTC Mon = 01:00 MSK Tue. The reminder was
-    # set "по понедельникам в 01:00 MSK" → RRULE keeps BYDAY=MO (MSK frame,
-    # per schedule_reminder convention). Display must show the user's intent:
-    # "по пн в 01:00", NOT the UTC weekday.
+def test_near_midnight_weekday_shifted_to_local() -> None:
+    # Codex R2 M3: the runtime advances the rule with a UTC dtstart, so BYDAY
+    # is UTC-framed. 22:00 UTC fires at 01:00 MSK the NEXT day → BYDAY=MO must
+    # display as the local weekday (вт), not "по пн". day_delta=+1 shifts it.
     rem = _rem(
         "rem_" + "5" * 24, "разминка",
         datetime(2026, 6, 15, 22, 0, tzinfo=UTC),
         "FREQ=WEEKLY;BYDAY=MO",
     )
     out = _format_reminder_for_llm(rem, MSK)
-    assert "по пн" in out
+    assert "по вт" in out  # local weekday, shifted from UTC Monday
+    assert "по пн" not in out
     assert "01:00" in out
 
 
@@ -225,7 +247,7 @@ def test_alert_text_internal_only(monkeypatch) -> None:
     )
 
     class _Settings:
-        planner_enabled_tenants = frozenset({"tenant_internal"})
+        admin_alert_preview_tenants = frozenset({"tenant_internal"})
 
     monkeypatch.setattr(h, "get_settings", lambda: _Settings())
 
@@ -243,3 +265,57 @@ def test_alert_text_internal_only(monkeypatch) -> None:
     assert secret not in captured[1]["body"]  # external → redacted
     assert "tenant_external" in captured[1]["body"]  # but tenant/guard kept
     assert captured[1]["dedupe_key"].startswith("rot_substituted:")
+
+
+# --- MINOR: date-only UNTIL not tz-shifted; _resolve_user_tz from profile ---
+
+
+def test_until_date_only_not_tz_shifted() -> None:
+    # Codex R2 MINOR: a date-only UNTIL is a calendar boundary — converting it
+    # as a UTC instant shifts western tz back a day. Must stay "до 31 декабря".
+    from zoneinfo import ZoneInfo
+
+    rem = _rem(
+        "rem_" + "7" * 24, "разминка",
+        datetime(2026, 6, 18, 6, 0, tzinfo=UTC),
+        "FREQ=WEEKLY;BYDAY=MO;UNTIL=20261231",  # no T-part → date-only
+    )
+    out = _format_reminder_for_llm(rem, ZoneInfo("America/New_York"))  # UTC-5
+    assert "до 31 декабря" in out
+
+
+def test_resolve_user_tz_from_profile(monkeypatch) -> None:
+    from sreda.services import housewife_chat_tools as hct
+
+    class _Prof:
+        timezone = "Asia/Yekaterinburg"
+
+    class _Repo:
+        def __init__(self, _s):
+            pass
+
+        def get_profile(self, _t, _u):
+            return _Prof()
+
+    monkeypatch.setattr(
+        "sreda.db.repositories.user_profile.UserProfileRepository", _Repo
+    )
+    tz = hct._resolve_user_tz(object(), "tenant_x", "user_x")
+    assert str(tz) == "Asia/Yekaterinburg"
+
+
+def test_resolve_user_tz_no_profile_defaults_msk(monkeypatch) -> None:
+    from sreda.services import housewife_chat_tools as hct
+
+    class _Repo:
+        def __init__(self, _s):
+            pass
+
+        def get_profile(self, _t, _u):
+            return None
+
+    monkeypatch.setattr(
+        "sreda.db.repositories.user_profile.UserProfileRepository", _Repo
+    )
+    tz = hct._resolve_user_tz(object(), "tenant_x", "user_x")
+    assert str(tz) == "Europe/Moscow"

@@ -347,6 +347,14 @@ class Settings(BaseSettings):
             "sreda_planner_enabled_tenants",
         ),
     )
+    # #149 M5: tenants whose substituted reply text may be previewed in admin
+    # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
+    # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
+    # not start leaking their reply text). Empty (default) → never preview.
+    admin_alert_preview_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_ADMIN_ALERT_PREVIEW_TENANTS",
+    )
 
     # Plan-Execute LLM provider split (Hakuoro357/vex-assistant#77 item #5).
     # Planner needs heavyweight reasoning + structured-output compliance —
@@ -741,6 +749,15 @@ class Settings(BaseSettings):
         Empty set → everyone stays on legacy ReAct (current behaviour).
         """
         raw = self.planner_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def admin_alert_preview_tenants(self) -> frozenset[str]:
+        """#149 M5: tenants whose substituted reply text may appear in admin
+        alerts (privacy allowlist). Empty (default) → no preview for anyone."""
+        raw = self.admin_alert_preview_tenants_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())

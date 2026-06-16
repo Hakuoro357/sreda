@@ -3563,6 +3563,14 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
                 tool_count,
                 last_tools,
             )
+            # #149 R2 (Codex medium M1): the «...» fallback is a visible blank
+            # failure — alert it too, not just the WARNING.
+            _alert_reply_substituted(
+                reason="empty_reply",
+                tenant_id=action.tenant_id,
+                feature_key=feature_key,
+                text=text,
+            )
             text = _EMPTY_REPLY_FALLBACK
     # Sanitise before handing off to Telegram delivery. Two issues
     # observed 2026-04-23 on MiMo v2.5:
@@ -3747,12 +3755,15 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         try:
             import hashlib
             from sreda.services.admin_alerts import send_admin_alert
-            # #149 M5: текст-превью только внутренним тенантам (алерт бьёт и по
-            # внешнему/легаси-пути — превью внешнего юзера = его ПД в канал).
-            _is_internal = action.tenant_id in get_settings().planner_enabled_tenants
+            # #149 M5: текст-превью только тенантам из allowlist приватности
+            # (алерт бьёт и по внешнему/легаси-пути — превью внешнего юзера =
+            # его ПД в канал). Отдельная настройка, НЕ раскатка планировщика.
+            _preview_ok = (
+                action.tenant_id in get_settings().admin_alert_preview_tenants
+            )
             _text_preview = (
                 (text[:300] + "…" if len(text) > 300 else text)
-                if _is_internal else "(скрыто — внешний тенант)"
+                if _preview_ok else "(скрыто — вне preview-allowlist)"
             )
             _text_hash = hashlib.md5(
                 text.encode("utf-8"),
@@ -4193,24 +4204,30 @@ def _alert_reply_substituted(
     Fire-and-forget with dedup; alerting must never break the reply.
     """
     try:
+        import hashlib
         from sreda.services.admin_alerts import send_admin_alert
 
         _tc = trace.current()
         trace_id = getattr(_tc, "trace_id", None)
-        is_internal = tenant_id in get_settings().planner_enabled_tenants
+        # #149 M5: preview only for tenants on the explicit privacy allowlist
+        # (NOT planner rollout — Codex R2 M3).
+        preview_ok = tenant_id in get_settings().admin_alert_preview_tenants
+        text_hash = hashlib.md5(
+            text.encode("utf-8"), usedforsecurity=False,
+        ).hexdigest()[:8]
         body_lines = [
             f"tenant={tenant_id} feature={feature_key}",
-            f"причина={reason} chars={len(text)} trace_id={trace_id}",
+            f"причина={reason} chars={len(text)} hash={text_hash} trace_id={trace_id}",
         ]
-        if is_internal:
+        if preview_ok:
             body_lines.append(f"текст[:120]={text[:120]!r}")
         send_admin_alert(
             severity="INFO",
             title=f"Рот заглушён: {reason}",
             body="\n".join(body_lines),
-            # tenant in the key so one tenant's storm doesn't mask another's
-            # (Codex R1 MINOR); per-reason+feature so distinct causes alert.
-            dedupe_key=f"rot_substituted:{reason}:{feature_key}:{tenant_id}",
+            # tenant + text hash so one tenant's storm — or a different reply —
+            # doesn't mask another (Codex R1/R2 MINOR); per-reason+feature too.
+            dedupe_key=f"rot_substituted:{reason}:{feature_key}:{tenant_id}:{text_hash}",
         )
     except Exception:  # noqa: BLE001 — alerting must never break the reply
         logger.debug("admin alert (rot substitution) failed", exc_info=True)
