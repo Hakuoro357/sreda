@@ -155,6 +155,15 @@ def create_app() -> FastAPI:
         if request.url.path.startswith("/admin"):
             response.headers.setdefault("Referrer-Policy", "no-referrer")
             response.headers.setdefault("Cache-Control", "no-store")
+            # #150: после header/query-аутентификации require_admin_token кладёт
+            # HMAC-маркер в request.state → ставим HttpOnly session-cookie, чтобы
+            # навигация шла без ?token= в URL (additive — header/query всё ещё ок).
+            sess = getattr(request.state, "admin_set_session", None)
+            if sess:
+                response.set_cookie(
+                    "admin_session", sess, max_age=86400,
+                    httponly=True, samesite="strict", secure=True,
+                )
         return response
 
     return app

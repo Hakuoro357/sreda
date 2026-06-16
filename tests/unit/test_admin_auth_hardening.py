@@ -149,3 +149,50 @@ def test_x_forwarded_for_used_for_logging(monkeypatch):
         req, header_token="ok-token", query_token=None,
     )
     assert result == "ok-token"
+
+
+# --- #150 F0: session-cookie (additive, не убирает header/query) -------------
+
+
+def test_passes_with_valid_session_cookie(monkeypatch):
+    from sreda.admin.auth import _session_value
+    from sreda.config.settings import Settings
+    monkeypatch.setattr(
+        "sreda.admin.auth.get_settings",
+        lambda: Settings(admin_token="real-secret-token-xyz"),
+    )
+    req = _mk_request()
+    cookie = _session_value("real-secret-token-xyz")
+    assert require_admin_token(
+        req, header_token=None, query_token=None, cookie_token=cookie,
+    ) == "real-secret-token-xyz"
+
+
+def test_wrong_session_cookie_is_401(monkeypatch):
+    from sreda.config.settings import Settings
+    monkeypatch.setattr(
+        "sreda.admin.auth.get_settings",
+        lambda: Settings(admin_token="real-secret-token-xyz"),
+    )
+    req = _mk_request()
+    with pytest.raises(HTTPException) as exc:
+        require_admin_token(
+            req, header_token=None, query_token=None, cookie_token="bogus",
+        )
+    assert exc.value.status_code == 401
+
+
+def test_header_auth_signals_cookie_set(monkeypatch):
+    """После header/query-аутентификации в request.state кладётся HMAC-маркер
+    (middleware ставит по нему HttpOnly-cookie). Содержит НЕ сам токен."""
+    from sreda.admin.auth import _session_value
+    from sreda.config.settings import Settings
+    monkeypatch.setattr(
+        "sreda.admin.auth.get_settings",
+        lambda: Settings(admin_token="real-secret-token-xyz"),
+    )
+    req = _mk_request()
+    require_admin_token(req, header_token="real-secret-token-xyz", query_token=None)
+    expected = _session_value("real-secret-token-xyz")
+    assert req.state.admin_set_session == expected
+    assert expected != "real-secret-token-xyz"   # cookie ≠ сам токен

@@ -13,10 +13,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 
-from fastapi import Header, HTTPException, Query, Request
+from fastapi import Cookie, Header, HTTPException, Query, Request
 
 from sreda.config.settings import get_settings
 
@@ -24,10 +25,18 @@ from sreda.config.settings import get_settings
 logger = logging.getLogger("sreda.admin.auth")
 
 
+def _session_value(admin_token: str) -> str:
+    """HMAC-маркер для session-cookie — НЕ раскрывает сам admin-токен."""
+    return hmac.new(
+        admin_token.encode("utf-8"), b"admin-session-v1", hashlib.sha256
+    ).hexdigest()
+
+
 def require_admin_token(
     request: Request,
     header_token: str | None = Header(default=None, alias="X-Admin-Token"),
     query_token: str | None = Query(default=None, alias="token"),
+    cookie_token: str | None = Cookie(default=None, alias="admin_session"),
 ) -> str:
     """FastAPI dependency: validate admin token from header (preferred)
     or query param (legacy fallback).
@@ -54,6 +63,20 @@ def require_admin_token(
         )
         raise HTTPException(status_code=403, detail="Admin dashboard is disabled")
 
+    # 0. Session cookie (выставляется после первой header/query-аутентификации) —
+    #    даёт навигацию по админке без ?token= в URL. Содержит HMAC-маркер, не
+    #    сам токен; HttpOnly+SameSite=Strict+Secure (ставит middleware).
+    expected_session = _session_value(expected)
+    # isinstance(str): при прямом вызове (юнит-тесты) непереданный параметр —
+    # это sentinel Cookie(...), не None; в FastAPI-DI — str|None.
+    if (
+        isinstance(cookie_token, str)
+        and cookie_token
+        and hmac.compare_digest(cookie_token, expected_session)
+    ):
+        logger.debug("admin auth: OK via cookie path=%s", request.url.path)
+        return expected
+
     # Header wins over query param.
     presented = header_token or query_token
 
@@ -75,6 +98,14 @@ def require_admin_token(
             "header" if header_token else "query",
         )
         raise HTTPException(status_code=401, detail="Invalid admin token")
+
+    # header/query OK → сигналим middleware выставить session-cookie, чтобы
+    # дальнейшая навигация шла без token в URL (#150 митигейт). Additive:
+    # header/query продолжают работать как раньше.
+    try:
+        request.state.admin_set_session = expected_session
+    except Exception:  # noqa: BLE001 — сигнал best-effort, не валит auth
+        pass
 
     # Success path — debug-level log (не INFO чтоб не засорять при
     # каждом GET /admin/users refresh).
