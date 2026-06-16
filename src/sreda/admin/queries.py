@@ -559,19 +559,25 @@ class SpendReport:
 
 
 def get_spend_by_model(
-    session: Session, period: str, anchor: datetime | None = None
+    session: Session,
+    period: str,
+    anchor: datetime | None = None,
+    tenant_id: str | None = None,
 ) -> SpendReport:
-    """Траты по (provider_key, model) за MSK-окно периода.
+    """Траты по (provider_key, model) за MSK-окно периода (опц. по тенанту).
 
     Стоимость — через ``llm_pricing.cost_estimate`` (беспрайсовое → est=None → «—»).
     Итог — «priced subtotal» + покрытие (% валидных вызовов/токенов с известной
     ценой) + число аномалий. Историю считаем по текущему прайсу (оценка).
     """
     start, end = period_window_utc(period, anchor)
-    in_win = (
+    in_win_list = [
         SkillAIExecution.created_at >= start,
         SkillAIExecution.created_at < end,
-    )
+    ]
+    if tenant_id is not None:
+        in_win_list.append(SkillAIExecution.tenant_id == tenant_id)
+    in_win = tuple(in_win_list)
 
     anomaly_count = (
         session.query(func.count(SkillAIExecution.id))
@@ -642,4 +648,58 @@ def get_spend_by_model(
         unpriced_models=unpriced_models, unpriced_calls=unpriced_calls,
         unpriced_tokens=unpriced_tokens, coverage_calls_pct=cov_calls,
         coverage_tokens_pct=cov_tokens, anomaly_count=int(anomaly_count),
+    )
+
+
+@dataclass(frozen=True)
+class TenantSpendDetail:
+    tenant_id: str
+    tenant_name: str
+    day: SpendReport
+    week: SpendReport
+    month: SpendReport
+
+
+def get_tenant_spend_detail(
+    session: Session, tenant_id: str, anchor: datetime | None = None
+) -> TenantSpendDetail:
+    """Траты ОДНОГО тенанта за день/неделю/месяц (карточка). UI: «расходы
+    тенанта/аккаунта, не пользователя» (у тенанта может быть несколько юзеров)."""
+    name = (
+        session.query(Tenant.name).filter(Tenant.id == tenant_id).scalar()
+        or tenant_id
+    )
+    return TenantSpendDetail(
+        tenant_id=tenant_id,
+        tenant_name=name,
+        day=get_spend_by_model(session, "day", anchor, tenant_id=tenant_id),
+        week=get_spend_by_model(session, "week", anchor, tenant_id=tenant_id),
+        month=get_spend_by_model(session, "month", anchor, tenant_id=tenant_id),
+    )
+
+
+@dataclass(frozen=True)
+class UsersPage:
+    rows: list[UserRow]
+    page: int
+    per_page: int
+    total: int
+    total_pages: int
+
+
+def get_users_page(
+    session: Session, page: int = 1, per_page: int = 50
+) -> UsersPage:
+    """Пагинация над get_all_users (полный список мал — внутренние + альфа
+    200-300; per-page bulk-load — оптимизация на будущее при росте базы)."""
+    page = max(1, page)
+    per_page = max(1, min(per_page, 200))
+    all_rows = get_all_users(session)
+    total = len(all_rows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    start = (page - 1) * per_page
+    return UsersPage(
+        rows=all_rows[start:start + per_page],
+        page=page, per_page=per_page, total=total, total_pages=total_pages,
     )

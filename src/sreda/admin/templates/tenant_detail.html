@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Расходы тенанта{% endblock %}
+{% block content %}
+<h2>Расходы тенанта: {{ detail.tenant_name }}</h2>
+<small class="muted">Это расходы <strong>тенанта/аккаунта</strong>, не отдельного
+пользователя (у тенанта может быть несколько пользователей). Оценка по текущему
+прайсу, не бухгалтерия.</small>
+<p style="margin-top: 12px;">
+  <a href="/admin/llm-calls?tenant_id={{ detail.tenant_id }}&token={{ token }}"
+     role="button" class="outline">Вся переписка (llm-calls)</a>
+</p>
+
+{% macro spend_block(title, rep) %}
+<article style="margin-bottom: 16px;">
+  <h4 style="margin-bottom: 6px;">{{ title }}: ≈${{ "%.4f"|format(rep.priced_subtotal_usd) }}
+    {% if rep.coverage_calls_pct is not none and rep.coverage_calls_pct < 100 %}
+      <span class="muted">(покрытие {{ rep.coverage_calls_pct }}%)</span>
+    {% endif %}
+  </h4>
+  {% if rep.rows %}
+  <table>
+    <thead><tr><th>Провайдер · Модель</th><th>Вызовов</th><th>Токенов</th><th>≈ USD</th></tr></thead>
+    <tbody>
+    {% for r in rep.rows %}
+      <tr>
+        <td>{{ r.provider_key }} · <span class="muted">{{ r.model }}</span></td>
+        <td>{{ "{:,}".format(r.calls) }}</td>
+        <td>{{ "{:,}".format(r.prompt_tokens + r.completion_tokens) }}</td>
+        <td>
+          {% if r.est_usd is none %}<span class="muted">—</span>
+          {% elif r.est_usd < 0.0001 %}&lt;$0.0001
+          {% else %}${{ "%.4f"|format(r.est_usd) }}{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">Нет вызовов.</p>{% endif %}
+</article>
+{% endmacro %}
+
+{{ spend_block("Сегодня", detail.day) }}
+{{ spend_block("Неделя", detail.week) }}
+{{ spend_block("Месяц", detail.month) }}
+{% endblock %}

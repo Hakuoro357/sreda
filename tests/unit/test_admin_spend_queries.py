@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from sreda.admin.queries import get_spend_by_model, period_window_utc
+from sreda.admin.queries import SpendReport, get_spend_by_model, period_window_utc
 from sreda.db.base import Base
 from sreda.db.models.core import Tenant
 from sreda.db.models.skill_platform import SkillAIExecution
@@ -152,3 +152,59 @@ def test_budget_row_usd_and_coverage(session) -> None:
     r = rows[0]
     assert r.est_usd is not None and r.est_usd > 0          # Mercury priced
     assert r.cost_coverage_pct == 50                        # 1 priced из 2 вызовов
+
+
+def test_get_users_page_paginates(session) -> None:
+    from sreda.admin.queries import get_users_page
+    from sreda.db.models.core import User
+
+    for i in range(3):
+        session.add(Tenant(id=f"tt{i}", name=f"T{i}"))
+        session.add(User(id=f"u{i}", tenant_id=f"tt{i}", telegram_account_id=str(100 + i)))
+    session.commit()
+
+    p1 = get_users_page(session, page=1, per_page=2)
+    assert p1.per_page == 2 and p1.total == 3 and p1.total_pages == 2
+    assert len(p1.rows) == 2
+    assert len(get_users_page(session, page=2, per_page=2).rows) == 1
+
+
+def test_tenant_spend_detail_filters_tenant(session) -> None:
+    from sreda.admin.queries import get_tenant_spend_detail
+
+    in_win = datetime(2026, 6, 16, 10, 0, tzinfo=UTC)
+    _exec(session, provider_key="inception-mercury2", model="mercury-2",
+          prompt=1000, completion=10, created=in_win)              # t1
+    session.add(Tenant(id="t2", name="T2"))
+    session.add(SkillAIExecution(
+        id="skai_t2", run_id="r_t2", attempt_id=None, tenant_id="t2",
+        feature_key="housewife_assistant", task_type="llm_call",
+        provider_key="inception-mercury2", model="mercury-2", ai_schema_version=1,
+        status="succeeded", prompt_tokens=5000, completion_tokens=99,
+        total_tokens=5099, credits_consumed=0,
+        created_at=in_win, started_at=in_win, finished_at=in_win))
+    session.commit()
+
+    detail = get_tenant_spend_detail(session, "t1", anchor=ANCHOR)
+    assert detail.tenant_id == "t1"
+    rows = detail.month.rows
+    assert any(r.prompt_tokens == 1000 for r in rows)       # t1 есть
+    assert all(r.prompt_tokens != 5000 for r in rows)       # t2 НЕ протёк
+
+
+def test_tenant_detail_template_renders() -> None:
+    from sreda.admin.queries import TenantSpendDetail
+    from sreda.admin.routes import templates
+
+    empty = SpendReport(
+        period="day", start_utc=ANCHOR, end_utc=ANCHOR, rows=[],
+        priced_subtotal_usd=Decimal("0"), upper_subtotal_usd=Decimal("0"),
+        unpriced_models=[], unpriced_calls=0, unpriced_tokens=0,
+        coverage_calls_pct=None, coverage_tokens_pct=None, anomaly_count=0)
+    detail = TenantSpendDetail(
+        tenant_id="t1", tenant_name="Tenant One", day=empty, week=empty, month=empty)
+    html = templates.env.get_template("tenant_detail.html").render(
+        token="t", section="users", detail=detail)
+    assert "Tenant One" in html
+    assert "тенанта/аккаунта" in html        # подпись «не пользователя»
+    assert "llm-calls" in html

@@ -13,10 +13,11 @@ from fastapi.templating import Jinja2Templates
 
 from sreda.admin.auth import require_admin_token
 from sreda.admin.queries import (
-    get_all_users,
     get_budget_summary_for_day,
     get_llm_calls,
     get_spend_by_model,
+    get_tenant_spend_detail,
+    get_users_page,
 )
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
@@ -65,14 +66,41 @@ def _audit_admin_view(
 @router.get("/users", response_class=HTMLResponse)
 def admin_users(
     request: Request,
+    page: int = Query(1, ge=1),
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    _audit_admin_view(session, "admin.users.viewed", token, request)
-    users = get_all_users(session)
+    _audit_admin_view(session, "admin.users.viewed", token, request, page=page)
+    users_page = get_users_page(session, page=page)
     return templates.TemplateResponse(
         request, "users.html",
-        {"token": token, "users": users, "section": "users"},
+        {
+            "token": token,
+            "users": users_page.rows,
+            "page": users_page,
+            "section": "users",
+        },
+    )
+
+
+@router.get("/tenants/{tenant_id}", response_class=HTMLResponse)
+def admin_tenant_detail(
+    tenant_id: str,
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Карточка тенанта: траты день/неделя/месяц по моделям + ссылки на
+    переписку (llm-calls). Только агрегаты/метаданные — без текстов сообщений.
+    Подпись «расходы тенанта/аккаунта, не пользователя» (тенант может иметь
+    несколько юзеров) — в шаблоне."""
+    _audit_admin_view(
+        session, "admin.tenant.viewed", token, request, tenant_id=tenant_id,
+    )
+    detail = get_tenant_spend_detail(session, tenant_id)
+    return templates.TemplateResponse(
+        request, "tenant_detail.html",
+        {"token": token, "section": "users", "detail": detail},
     )
 
 
