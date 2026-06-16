@@ -62,6 +62,7 @@
     <aside class="sidebar">
       <div class="sidebar-brand">Sreda Admin</div>
       <nav class="sidebar-nav">
+        <a href="/admin/" class="{% if section == 'dashboard' %}active{% endif %}">Дашборд</a>
         <a href="/admin/users" class="{% if section == 'users' %}active{% endif %}">Пользователи</a>
         <a href="/admin/logs" class="{% if section == 'logs' %}active{% endif %}">Логи</a>
         <a href="/admin/traces" class="{% if section == 'traces' %}active{% endif %}">Traces</a>

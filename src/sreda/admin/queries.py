@@ -703,3 +703,91 @@ def get_users_page(
         rows=all_rows[start:start + per_page],
         page=page, per_page=per_page, total=total, total_pages=total_pages,
     )
+
+
+# -------------------------------------------------- #150 dashboard aggregates
+
+
+def get_cost_volume_summary(
+    session: Session, anchor: datetime | None = None
+) -> dict[str, SpendReport]:
+    """Затраты+объём за день/неделю/месяц (все тенанты). Переиспользует
+    get_spend_by_model → каждый отчёт несёт priced subtotal + покрытие."""
+    return {
+        p: get_spend_by_model(session, p, anchor) for p in ("day", "week", "month")
+    }
+
+
+@dataclass(frozen=True)
+class TopTenants:
+    # (tenant_id, tenant_name, est_usd, calls) — по priced subtotal убыв.
+    by_spend: list[tuple[str, str, Decimal, int]]
+    # (tenant_id, tenant_name, unpriced_tokens) — слепая зона: тяжёлые
+    # беспрайсовые тенанты, которых нет в by_spend (Codex R2 high).
+    by_unpriced: list[tuple[str, str, int]]
+
+
+def get_top_tenants_by_spend(
+    session: Session, period: str = "month", limit: int = 10,
+    anchor: datetime | None = None,
+) -> TopTenants:
+    start, end = period_window_utc(period, anchor)
+    grouped = (
+        session.query(
+            SkillAIExecution.tenant_id,
+            SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+        )
+        .filter(
+            SkillAIExecution.created_at >= start,
+            SkillAIExecution.created_at < end,
+            _VALID_TOKENS,
+        )
+        .group_by(
+            SkillAIExecution.tenant_id, SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+        )
+        .all()
+    )
+    est_by_tenant: dict[str, Decimal] = {}
+    calls_by_tenant: dict[str, int] = {}
+    unpriced_tok_by_tenant: dict[str, int] = {}
+    for tid, pk, model, calls, prompt, completion in grouped:
+        tid = tid or "—"
+        ce = cost_estimate(pk or "", model or "", prompt_tokens=int(prompt),
+                           completion_tokens=int(completion))
+        if ce is not None:
+            est_by_tenant[tid] = est_by_tenant.get(tid, Decimal("0")) + ce.est_usd
+            calls_by_tenant[tid] = calls_by_tenant.get(tid, 0) + int(calls)
+        else:
+            unpriced_tok_by_tenant[tid] = (
+                unpriced_tok_by_tenant.get(tid, 0) + int(prompt) + int(completion)
+            )
+    names = {t.id: t.name for t in session.query(Tenant).all()}
+    by_spend = sorted(
+        ((tid, names.get(tid, tid), est, calls_by_tenant.get(tid, 0))
+         for tid, est in est_by_tenant.items()),
+        key=lambda x: x[2], reverse=True,
+    )[:limit]
+    by_unpriced = sorted(
+        ((tid, names.get(tid, tid), tok)
+         for tid, tok in unpriced_tok_by_tenant.items()),
+        key=lambda x: x[2], reverse=True,
+    )[:limit]
+    return TopTenants(by_spend=by_spend, by_unpriced=by_unpriced)
+
+
+def get_dialogue_health(session: Session):
+    """Здоровье диалога за окно (gather_day_counts). best-effort — при сбое
+    None (UI покажет «—»). breakdowns_precounted=0: без glob-логов в вебе."""
+    try:
+        from sreda.workers.reliability_report import gather_day_counts
+
+        return gather_day_counts(
+            session, now=datetime.now(timezone.utc), breakdowns_precounted=0,
+        )
+    except Exception:  # noqa: BLE001 — секция дашборда не валит страницу
+        return None

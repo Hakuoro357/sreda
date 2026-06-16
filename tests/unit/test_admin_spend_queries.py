@@ -208,3 +208,64 @@ def test_tenant_detail_template_renders() -> None:
     assert "Tenant One" in html
     assert "тенанта/аккаунта" in html        # подпись «не пользователя»
     assert "llm-calls" in html
+
+
+def test_cost_volume_summary(session) -> None:
+    from sreda.admin.queries import get_cost_volume_summary
+
+    cv = get_cost_volume_summary(session, anchor=ANCHOR)
+    assert set(cv) == {"day", "week", "month"}
+    assert all(isinstance(cv[p], SpendReport) for p in cv)
+
+
+def test_top_tenants_by_spend(session) -> None:
+    from sreda.admin.queries import get_top_tenants_by_spend
+
+    in_win = datetime(2026, 6, 16, 10, 0, tzinfo=UTC)
+    _exec(session, provider_key="inception-mercury2", model="mercury-2",
+          prompt=2000, completion=50, created=in_win)             # t1 priced
+    session.add(Tenant(id="t2", name="T2"))
+    session.add(SkillAIExecution(
+        id="skai_u", run_id="r_u", attempt_id=None, tenant_id="t2",
+        feature_key="housewife_assistant", task_type="llm_call",
+        provider_key="mimo-v2.5-pro", model="mimo-v2.5-pro", ai_schema_version=1,
+        status="succeeded", prompt_tokens=9000, completion_tokens=100,
+        total_tokens=9100, credits_consumed=0,
+        created_at=in_win, started_at=in_win, finished_at=in_win))
+    session.commit()
+
+    top = get_top_tenants_by_spend(session, "month", anchor=ANCHOR)
+    assert "t1" in [t[0] for t in top.by_spend]          # priced Mercury
+    assert "t2" in [t[0] for t in top.by_unpriced]       # unpriced MiMo
+
+
+def test_dialogue_health_returns_counts(session) -> None:
+    from sreda.admin.queries import get_dialogue_health
+
+    h = get_dialogue_health(session)
+    assert h is None or h.turns_total == 0   # пустая БД → нули (или None)
+
+
+def test_dashboard_template_renders() -> None:
+    from sreda.admin.queries import TopTenants
+    from sreda.admin.routes import templates
+    from sreda.workers.reliability_report import DayCounts
+
+    empty = SpendReport(
+        period="day", start_utc=ANCHOR, end_utc=ANCHOR, rows=[],
+        priced_subtotal_usd=Decimal("0"), upper_subtotal_usd=Decimal("0"),
+        unpriced_models=[], unpriced_calls=0, unpriced_tokens=0,
+        coverage_calls_pct=None, coverage_tokens_pct=None, anomaly_count=0)
+    html = templates.env.get_template("dashboard.html").render(
+        token="t", section="dashboard",
+        cost={"day": empty, "week": empty, "month": empty},
+        health=DayCounts(5, 1, 0, 0, 2),
+        top=TopTenants(
+            by_spend=[("t1", "Tenant1", Decimal("0.05"), 10)],
+            by_unpriced=[("t2", "Tenant2", 9000)]),
+        balances=[])
+    assert "Дашборд" in html
+    assert "Затраты и объём" in html
+    assert "Здоровье диалога" in html
+    assert "Tenant1" in html and "Tenant2" in html
+    assert "всего проблем" in html

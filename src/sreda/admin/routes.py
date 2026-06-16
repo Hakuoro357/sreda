@@ -14,9 +14,12 @@ from fastapi.templating import Jinja2Templates
 from sreda.admin.auth import require_admin_token
 from sreda.admin.queries import (
     get_budget_summary_for_day,
+    get_cost_volume_summary,
+    get_dialogue_health,
     get_llm_calls,
     get_spend_by_model,
     get_tenant_spend_detail,
+    get_top_tenants_by_spend,
     get_users_page,
 )
 from sreda.config.settings import get_settings
@@ -60,6 +63,39 @@ def _audit_admin_view(
         actor_id=hash_admin_token(token),
         action=action,
         metadata=md,
+    )
+
+
+@router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
+def admin_dashboard(
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Дашборд админки (landing): (a) затраты+объём день/неделя/месяц,
+    (b) здоровье диалога, (c) балансы провайдеров, (d) активность тенантов
+    (top по тратам + top беспрайсовых). Только агрегаты — без текстов сообщений."""
+    _audit_admin_view(session, "admin.dashboard.viewed", token, request)
+    cost = get_cost_volume_summary(session)
+    health = get_dialogue_health(session)
+    top = get_top_tenants_by_spend(session, "month")
+    try:
+        from sreda.services import provider_balances as _pb
+
+        balances = _pb.fetch_balances(get_settings())
+    except Exception:  # noqa: BLE001 — балансы не валят дашборд
+        balances = []
+    return templates.TemplateResponse(
+        request, "dashboard.html",
+        {
+            "token": token,
+            "section": "dashboard",
+            "cost": cost,
+            "health": health,
+            "top": top,
+            "balances": balances,
+        },
     )
 
 
