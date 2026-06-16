@@ -43,8 +43,11 @@ def _make_settings(**overrides: Any) -> Settings:
 class _FakeAIMessage:
     """Stand-in for langchain_core AIMessage.content access."""
 
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, usage_metadata: dict | None = None) -> None:
         self.content = content
+        # langchain AIMessage carries usage_metadata = {"input_tokens",
+        # "output_tokens", "total_tokens"} (None when provider omits it).
+        self.usage_metadata = usage_metadata
 
 
 class _FakeChatLLM:
@@ -116,6 +119,36 @@ def test_call_planner_returns_typed_result() -> None:
     assert result.model == "mimo-v2.5-pro"
     assert result.attempt_no == 1
     assert result.parsed_plan is None  # parsing in orchestrator
+
+
+def test_call_planner_captures_usage_tokens() -> None:
+    # F-1 (#151): planner LLM usage must be captured so admin cost pages can
+    # attribute Mercury spend. usage_metadata → PlannerCallResult tokens.
+    fake_response = _FakeAIMessage(
+        content='{"clarity": "clear"}',
+        usage_metadata={"input_tokens": 120, "output_tokens": 30, "total_tokens": 150},
+    )
+    result = call_planner(
+        "build me a plan",
+        provider="inception-mercury2",
+        settings_factory=lambda: _make_settings(),
+        chat_llm_factory=lambda *a, **k: _FakeChatLLM(model_name="mercury-2"),
+        invoke=lambda *a, **k: fake_response,
+    )
+    assert result.prompt_tokens == 120
+    assert result.completion_tokens == 30
+
+
+def test_call_planner_usage_defaults_zero_when_absent() -> None:
+    # Provider omitted usage_metadata → tokens default to 0 (never None/crash).
+    result = call_planner(
+        "x",
+        settings_factory=lambda: _make_settings(),
+        chat_llm_factory=lambda *a, **k: _FakeChatLLM(),
+        invoke=lambda *a, **k: _FakeAIMessage("ok"),
+    )
+    assert result.prompt_tokens == 0
+    assert result.completion_tokens == 0
 
 
 def test_call_planner_uses_settings_provider_when_unspecified() -> None:

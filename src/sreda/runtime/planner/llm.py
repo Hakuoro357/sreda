@@ -68,6 +68,11 @@ class PlannerCallResult:
     # orchestrator (Phase B.4) so retry/validation logic owns the JSON
     # parse error path consistently.
     parsed_plan: Any = None
+    # F-1 (#151): token usage from the LLM response so the orchestrator can
+    # sum across attempts and the chat loop can record real planner spend
+    # into skill_ai_executions. 0 when the provider omits usage_metadata.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +172,7 @@ def call_planner(
 
     raw_text = _extract_text(response)
     model_name = _resolve_model_name(runnable, s, effective_provider)
+    prompt_tokens, completion_tokens = _extract_usage(response)
 
     return PlannerCallResult(
         raw_text=raw_text,
@@ -175,12 +181,27 @@ def call_planner(
         model=model_name,
         attempt_no=attempt_no,
         parsed_plan=None,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
     )
 
 
 # ---------------------------------------------------------------------------
 # Helpers (private)
 # ---------------------------------------------------------------------------
+
+
+def _extract_usage(response: Any) -> tuple[int, int]:
+    """Pull (prompt_tokens, completion_tokens) from a LangChain AIMessage's
+    ``usage_metadata`` (input_tokens/output_tokens). Returns (0, 0) when the
+    provider omits usage — never raises (F-1 #151, mirrors handlers.py:2235)."""
+    usage = getattr(response, "usage_metadata", None) or {}
+    try:
+        prompt = int(usage.get("input_tokens") or 0)
+        completion = int(usage.get("output_tokens") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0, 0
+    return max(prompt, 0), max(completion, 0)
 
 
 def _extract_text(response: Any) -> str:
