@@ -340,7 +340,9 @@ def _recurrence_phrase(rrule: str, day_delta: int, *, stable: bool) -> str | Non
     # «каждые N часов» (e.g. HOURLY;INTERVAL=4;BYHOUR=13 is not "каждые 4 часа").
     # These claim NO local clock, so they're safe even in variable-offset zones.
     if freq in ("MINUTELY", "HOURLY"):
-        if parts.get("BYHOUR") or parts.get("BYMINUTE"):
+        # BYHOUR/BYMINUTE/BYDAY all CONSTRAIN a sub-hour cadence — rendering a
+        # bare «ежеминутно»/«каждые N часов» would drop them (Codex #149 R5).
+        if parts.get("BYHOUR") or parts.get("BYMINUTE") or byday:
             return None
         if interval > 1:
             return f"каждые {interval} {_plural_ru(interval, _FREQ_UNIT_RU[freq])}"

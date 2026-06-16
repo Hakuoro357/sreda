@@ -166,6 +166,8 @@ def test_bymonthday_ordinal_count_multitime_fall_back() -> None:
         "FREQ=YEARLY;BYWEEKNO=20",  # exotic BY* must fail closed
         "FREQ=DAILY;BYHOUR=6;BYMINUTE=0;BYSECOND=30",  # R4: BYSECOND dropped → fallback
         "FREQ=MINUTELY;BYSECOND=0,30",  # R4: fires 2×/min — not «ежеминутно»
+        "FREQ=MINUTELY;BYDAY=MO",  # R5: sub-hour + weekday constraint dropped
+        "FREQ=HOURLY;INTERVAL=2;BYDAY=FR",  # R5: «каждые 2 часа» drops BYDAY=FR
     ):
         rem = _rem("rem_" + "0" * 24, "x", datetime(2026, 6, 17, 6, 0, tzinfo=UTC), rrule)
         out = _format_reminder_for_llm(rem, MSK)
