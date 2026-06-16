@@ -172,6 +172,22 @@ def test_step_id_and_parsed_output_fallback() -> None:
     assert s.outcome == {"status": "ok"}  # from parsed_output fallback
 
 
+def test_outcome_cascades_to_raw_output_when_parsed_none() -> None:
+    # parsed_output present but None (failure path) → fall through to raw_output,
+    # NOT return None (Codex R2 MAJOR: dict.get default doesn't skip a None value).
+    pe = {
+        "planner_status": "valid",
+        "plan_json": {"actions": {"s1": {"tool": "x", "args": {}}}},
+        "execution_log_json": [
+            {"step_id": "s1", "status": "failed",
+             "parsed_output": None, "raw_output": "error: boom"}
+        ],
+        "validation_errors": None, "composer_path": "", "execution_status": "failed",
+    }
+    b = build_trace_bundle(_raw_diag(planner_execution=pe), decrypt=_ok_decrypt)
+    assert b.steps[0].outcome == "error: boom"
+
+
 def test_non_dict_log_entries_filtered() -> None:
     pe = {
         "planner_status": "valid",
@@ -231,6 +247,7 @@ def test_load_planner_execution_reads_encrypted(db_session) -> None:
         plan_json=None,
         plan_json_enc={"actions": {"s1": {"tool": "list_reminders", "args": {}}}},
         validation_errors=None,
+        validation_errors_enc="schema mismatch on s1",
         execution_log_json=[],
         execution_log_json_enc=[
             {"node_id": "s1", "status": "completed", "outcome": {"items": 3}}
@@ -249,6 +266,7 @@ def test_load_planner_execution_reads_encrypted(db_session) -> None:
         {"node_id": "s1", "status": "completed", "outcome": {"items": 3}}
     ]
     assert loaded["composer_path"] == "template:reminders_list_show"
+    assert loaded["validation_errors"] == "schema mismatch on s1"  # decrypted *_enc
     # wrong tenant → no row (defense-in-depth)
     assert _load_planner_execution(db_session, rid, "tenant_other") == {}
 

@@ -204,9 +204,16 @@ def _extract_steps(
         node_id = str(entry.get("node_id") or entry.get("step_id") or "")
         action = actions.get(node_id) if isinstance(actions, dict) else None
         action = action if isinstance(action, dict) else {}
+        # Explicit cascade outcome → parsed_output → raw_output, skipping a
+        # present-but-None value at each level. ``dict.get(k, default)`` would
+        # return None when ``parsed_output`` is explicitly None even if
+        # ``raw_output`` is set — losing the raw outcome on failure paths
+        # (Codex R2 MAJOR).
         outcome = entry.get("outcome")
         if outcome is None:
-            outcome = entry.get("parsed_output", entry.get("raw_output"))
+            outcome = entry.get("parsed_output")
+        if outcome is None:
+            outcome = entry.get("raw_output")
         steps.append(
             ExecutionStep(
                 node_id=node_id,
