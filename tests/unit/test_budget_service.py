@@ -186,6 +186,35 @@ def test_exhausted_quota_blocks_further_use(session):
     assert svc.has_quota("t1", "eds_monitor") is False
 
 
+def test_record_llm_usage_persists_real_provider_key(session):
+    # F-1 (#151): planner (Mercury) / rot (Gemini) usage must be recorded with
+    # the REAL provider_key, not the hardcoded "mimo", so admin cost pages can
+    # attribute spend per provider/model. Default stays "mimo" for legacy callers.
+    svc = BudgetService(session)
+    svc.record_llm_usage(
+        tenant_id="t1", feature_key="housewife_assistant",
+        provider_key="inception-mercury2", model="mercury-2",
+        prompt_tokens=100, completion_tokens=50,
+        run_id=f"run_{uuid4().hex[:8]}",
+    )
+    session.commit()
+    row = session.query(SkillAIExecution).filter_by(model="mercury-2").one()
+    assert row.provider_key == "inception-mercury2"
+
+
+def test_record_llm_usage_defaults_provider_key_to_mimo(session):
+    # Backwards-compat: legacy callers omit provider_key → stays "mimo".
+    svc = BudgetService(session)
+    svc.record_llm_usage(
+        tenant_id="t1", feature_key="eds_monitor",
+        model="mimo-v2.5-pro", prompt_tokens=10, completion_tokens=5,
+        run_id=f"run_{uuid4().hex[:8]}",
+    )
+    session.commit()
+    row = session.query(SkillAIExecution).filter_by(model="mimo-v2.5-pro").one()
+    assert row.provider_key == "mimo"
+
+
 def test_usage_scoped_per_feature_key(session):
     eds_plan = _seed_plan(
         session, plan_key="eds_basic", feature_key="eds_monitor",
