@@ -499,14 +499,14 @@ def admin_llm_save(
 def admin_llm_calls(
     request: Request,
     tenant_id: str = Query(...),
-    feature_key: str = Query(...),
+    feature_key: str | None = Query(None),
     page: int = Query(default=1, ge=1),
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     _audit_admin_view(
         session, "admin.llm_calls.viewed", token, request,
-        tenant_id=tenant_id, feature_key=feature_key, page=page,
+        tenant_id=tenant_id, feature_key=feature_key or "", page=page,
     )
     data = get_llm_calls(session, tenant_id, feature_key, page=page)
     return templates.TemplateResponse(

@@ -160,6 +160,23 @@ def create_app() -> FastAPI:
             # навигация шла без ?token= в URL (additive — header/query всё ещё ок).
             sess = getattr(request.state, "admin_set_session", None)
             if sess:
+                # Bootstrap через ?token= на GET → 303 на ТОТ ЖЕ URL без token
+                # (cookie уже ставим ниже), чтобы токен не остался в адресной
+                # строке/истории/access-логах после первого входа (Codex R3).
+                if request.method == "GET" and "token" in request.query_params:
+                    from urllib.parse import urlencode
+
+                    from starlette.responses import RedirectResponse
+
+                    clean = [
+                        (k, v) for k, v in request.query_params.multi_items()
+                        if k != "token"
+                    ]
+                    qs = urlencode(clean)
+                    target = request.url.path + (f"?{qs}" if qs else "")
+                    response = RedirectResponse(target, status_code=303)
+                    response.headers["Referrer-Policy"] = "no-referrer"
+                    response.headers["Cache-Control"] = "no-store"
                 response.set_cookie(
                     "admin_session", sess, max_age=86400, path="/admin",
                     httponly=True, samesite="strict", secure=True,

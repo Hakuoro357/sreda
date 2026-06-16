@@ -262,6 +262,29 @@ def test_dialogue_health_returns_counts(session) -> None:
     assert h is None or h.turns_total == 0   # пустая БД → нули (или None)
 
 
+def test_get_llm_calls_feature_key_optional(session) -> None:
+    # #150 (Codex R2 субагент): ссылка из карточки тенанта не несёт feature_key →
+    # роут зовёт get_llm_calls(tenant, None) → все фичи тенанта; с feature_key →
+    # только она. Раньше feature_key был обязателен → 422 (мёртвая ссылка).
+    from sreda.admin.queries import get_llm_calls
+
+    base = datetime(2026, 6, 16, 10, 0, tzinfo=UTC)
+    for fk in ("housewife_assistant", "eds_monitor"):
+        session.add(SkillAIExecution(
+            id=f"skai_{uuid4().hex[:16]}", run_id=f"r_{uuid4().hex[:8]}", attempt_id=None,
+            tenant_id="t1", feature_key=fk, task_type="llm_call",
+            provider_key="inception-mercury2", model="mercury-2", ai_schema_version=1,
+            status="succeeded", prompt_tokens=10, completion_tokens=5, total_tokens=15,
+            credits_consumed=0, created_at=base, started_at=base, finished_at=base,
+        ))
+    session.commit()
+
+    all_calls = get_llm_calls(session, "t1", None)
+    assert all_calls.total == 2                       # обе фичи
+    one = get_llm_calls(session, "t1", "eds_monitor")
+    assert one.total == 1                             # только запрошенная
+
+
 def test_dashboard_template_renders() -> None:
     from sreda.admin.queries import TopTenants
     from sreda.admin.routes import templates

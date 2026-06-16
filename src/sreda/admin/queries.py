@@ -439,17 +439,21 @@ class LLMCallsPage:
 def get_llm_calls(
     session: Session,
     tenant_id: str,
-    feature_key: str,
+    feature_key: str | None = None,
     page: int = 1,
     per_page: int = 50,
 ) -> LLMCallsPage:
-    """Paginated skill_ai_executions for a tenant + feature."""
+    """Paginated skill_ai_executions for a tenant (+ optional feature filter).
+
+    feature_key=None → все фичи тенанта (ссылка из карточки тенанта). #150.
+    """
     tenants = {t.id: t.name for t in session.query(Tenant).all()}
 
     base = session.query(SkillAIExecution).filter(
         SkillAIExecution.tenant_id == tenant_id,
-        SkillAIExecution.feature_key == feature_key,
     )
+    if feature_key:
+        base = base.filter(SkillAIExecution.feature_key == feature_key)
     total = base.count()
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
