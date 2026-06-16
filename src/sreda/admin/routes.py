@@ -178,6 +178,15 @@ _LLM_PROVIDERS_METADATA = [
         "static_model": "mimo-v2.5",
     },
     {
+        # #150: планировщик Среды (с 2026-06-15). Баланса нет — fetch_balances
+        # тянет только openrouter+mimo, Inception сетью не дёргается («нет API»).
+        "key": "inception-mercury2",
+        "label": "Inception · Mercury-2 (планировщик)",
+        "default_model_attr": None,
+        "resolver": "resolve_inception_api_key",
+        "static_model": "mercury-2",
+    },
+    {
         "key": "openrouter",
         "label": "OpenRouter · Gemma 4 26B MoE",
         "default_model_attr": "openrouter_chat_model",
