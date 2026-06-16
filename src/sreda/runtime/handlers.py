@@ -3666,6 +3666,12 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
             original_chars=len(text),
         ):
             pass
+        _alert_reply_substituted(
+            reason="weather_hallucination",
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            text=text,
+        )
         text = _WEATHER_HALLUCINATION_SUBSTITUTE
     elif (
         _is_provider_refusal(text)
@@ -3685,24 +3691,12 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         if _mentions_tool_internals(text):
             _fired.append("tool_internals")
         _fired_str = "+".join(_fired) or "unknown"
-        # #149: substitution used to be SILENT (only WARNING + trace) — admin
-        # never learned the rot was blanked. Alert on every substitution
-        # (INFO, deduped per guard+feature so a storm collapses to ~1/30min).
-        try:
-            from sreda.services.admin_alerts import send_admin_alert
-
-            send_admin_alert(
-                severity="INFO",
-                title=f"Рот заглушён гардом: {_fired_str}",
-                body=(
-                    f"tenant={action.tenant_id} feature={feature_key}\n"
-                    f"гарды={_fired_str} chars={len(text)}\n"
-                    f"текст[:120]={text[:120]!r}"
-                ),
-                dedupe_key=f"rot_substituted:{_fired_str}:{feature_key}",
-            )
-        except Exception:  # noqa: BLE001 — alerting must never break the reply
-            logger.debug("admin alert (rot substitution) failed", exc_info=True)
+        _alert_reply_substituted(
+            reason=f"guards:{_fired_str}",
+            tenant_id=action.tenant_id,
+            feature_key=feature_key,
+            text=text,
+        )
         logger.warning(
             "CHAT_PROVIDER_REFUSAL tenant=%s feature=%s guards=%s original_chars=%d original_first=%r",
             action.tenant_id, feature_key, _fired_str, len(text), text[:80],
@@ -3753,8 +3747,12 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         try:
             import hashlib
             from sreda.services.admin_alerts import send_admin_alert
+            # #149 M5: текст-превью только внутренним тенантам (алерт бьёт и по
+            # внешнему/легаси-пути — превью внешнего юзера = его ПД в канал).
+            _is_internal = action.tenant_id in get_settings().planner_enabled_tenants
             _text_preview = (
-                text[:300] + "…" if len(text) > 300 else text
+                (text[:300] + "…" if len(text) > 300 else text)
+                if _is_internal else "(скрыто — внешний тенант)"
             )
             _text_hash = hashlib.md5(
                 text.encode("utf-8"),
@@ -4183,6 +4181,39 @@ def _foreign_letter_ratio_below(text: str, threshold: float) -> bool:
         return False
     cyrillic = sum(1 for c in letters if "Ѐ" <= c <= "ӿ")
     return (cyrillic / len(letters)) < threshold
+
+
+def _alert_reply_substituted(
+    *, reason: str, tenant_id: str, feature_key: str | None, text: str,
+) -> None:
+    """#149: surface EVERY rot substitution to the admin channel (it used to
+    be silent — only WARNING + trace). The raw text snippet is included ONLY
+    for internal tenants: this fires on the external/legacy path too and the
+    blanked reply can carry user content (privacy — owner decision 2026-06-16).
+    Fire-and-forget with dedup; alerting must never break the reply.
+    """
+    try:
+        from sreda.services.admin_alerts import send_admin_alert
+
+        _tc = trace.current()
+        trace_id = getattr(_tc, "trace_id", None)
+        is_internal = tenant_id in get_settings().planner_enabled_tenants
+        body_lines = [
+            f"tenant={tenant_id} feature={feature_key}",
+            f"причина={reason} chars={len(text)} trace_id={trace_id}",
+        ]
+        if is_internal:
+            body_lines.append(f"текст[:120]={text[:120]!r}")
+        send_admin_alert(
+            severity="INFO",
+            title=f"Рот заглушён: {reason}",
+            body="\n".join(body_lines),
+            # tenant in the key so one tenant's storm doesn't mask another's
+            # (Codex R1 MINOR); per-reason+feature so distinct causes alert.
+            dedupe_key=f"rot_substituted:{reason}:{feature_key}:{tenant_id}",
+        )
+    except Exception:  # noqa: BLE001 — alerting must never break the reply
+        logger.debug("admin alert (rot substitution) failed", exc_info=True)
 
 
 def _is_reasoning_leak_after_tool(
