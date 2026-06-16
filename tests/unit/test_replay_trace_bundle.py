@@ -15,8 +15,6 @@ _REPLAY_DIR = Path(__file__).resolve().parents[2] / "scripts" / "replay"
 if str(_REPLAY_DIR) not in sys.path:
     sys.path.insert(0, str(_REPLAY_DIR))
 
-import pytest  # noqa: E402
-
 from trace_bundle import (  # noqa: E402
     ExecutionStep,
     TraceBundle,
