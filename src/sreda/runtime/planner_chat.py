@@ -164,6 +164,54 @@ def _history_snapshots(messages: list[Any], limit: int = 10) -> tuple:
     )
 
 
+def _record_usage_safe(
+    session: Any,
+    *,
+    tenant_id: str,
+    feature_key: str | None,
+    run_id: str,
+    provider_key: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    task_type: str,
+) -> None:
+    """#151: best-effort запись ОДНОЙ строки usage в skill_ai_executions.
+
+    Учёт НИКОГДА не валит ход (try/except + rollback). Пропускаем, если нет
+    сессии (юнит-швы) или нулевые токены. provider_key пишем настоящий
+    (планировщик: inception-mercury2 и т.п.; рот: openrouter-…), чтобы
+    админка денег атрибутировала траты по модели."""
+    if session is None:
+        return
+    if (prompt_tokens or 0) <= 0 and (completion_tokens or 0) <= 0:
+        return
+    if not provider_key:
+        return
+    try:
+        from sreda.services.budget import BudgetService
+
+        BudgetService(session).record_llm_usage(
+            tenant_id=tenant_id,
+            feature_key=feature_key or "housewife_assistant",
+            model=model or provider_key,
+            prompt_tokens=max(prompt_tokens or 0, 0),
+            completion_tokens=max(completion_tokens or 0, 0),
+            run_id=run_id,
+            provider_key=provider_key,
+            task_type=task_type,
+        )
+        session.commit()
+    except Exception:  # noqa: BLE001 — учёт не валит ответ пользователю
+        logger.warning(
+            "planner_chat: usage record failed (%s)", task_type, exc_info=True,
+        )
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def run_planner_chat_loop(
     *,
     session: Any,
@@ -269,6 +317,19 @@ async def run_planner_chat_loop(
             _fallback_invalid(),
         ))
 
+    # F-1 (#151): план валиден → LLM планировщика отработал. Пишем usage СЕЙЧАС
+    # (а не только на полном успехе), чтобы траты Mercury учитывались и когда
+    # исполнение/сборка ниже падают. getattr-дефолты — для тест-швов без полей.
+    _record_usage_safe(
+        session,
+        tenant_id=action.tenant_id, feature_key=pf.feature_key, run_id=pf.run_id,
+        provider_key=getattr(plan_result, "provider", "") or "",
+        model=getattr(plan_result, "model", "") or "",
+        prompt_tokens=getattr(plan_result, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(plan_result, "completion_tokens", 0) or 0,
+        task_type="planner.plan",
+    )
+
     # --- стадия 2: исполнение настоящими инструментами ----------------------
     try:
         from sreda.runtime.planner.executor import execute_plan
@@ -335,10 +396,20 @@ async def run_planner_chat_loop(
         # ВСЕ ответы через живой голос; шаблон — сырьё и страховка).
         _voice_used = {"v": False}
         _beautify_failed = {"v": False}  # R1 medium: не выставляет fallback_used
+        # F-1 (#151): копим usage рта (обе ветки — внутри compose и прихорашивание).
+        _rot_usage = {"prompt": 0, "completion": 0, "provider": "", "model": ""}
+
+        def _capture_rot(res: Any) -> Any:
+            _rot_usage["prompt"] += getattr(res, "prompt_tokens", 0) or 0
+            _rot_usage["completion"] += getattr(res, "completion_tokens", 0) or 0
+            if getattr(res, "provider", ""):
+                _rot_usage["provider"] = res.provider
+                _rot_usage["model"] = getattr(res, "model", "") or ""
+            return res
 
         def _tracking_voice(**kw):
             _voice_used["v"] = True
-            return _voice_mod.DEFAULT_LLM_COMPOSER(**kw)
+            return _capture_rot(_voice_mod.DEFAULT_LLM_COMPOSER(**kw))
 
         with trace.step("planner.compose") as _meta:
             reply = compose(
@@ -407,7 +478,7 @@ async def run_planner_chat_loop(
             # болтовня, identity) не прихорашиваются — там перефраз вредит.
             with trace.step("planner.voice") as _vmeta:
                 try:
-                    voiced = _voice_mod.DEFAULT_LLM_COMPOSER(
+                    voiced = _capture_rot(_voice_mod.DEFAULT_LLM_COMPOSER(
                         llm_prompt_key="humanize_result",
                         template_data={
                             "intent": (pf.user_text or "запрос пользователя")[:300],
@@ -418,7 +489,7 @@ async def run_planner_chat_loop(
                         },
                         execution_log=exec_log,
                         ctx=ctx2,
-                    )
+                    ))
                     voiced_text = (getattr(voiced, "text", "") or "").strip()
                     _vmeta["ok"] = bool(voiced_text)
                     _vmeta["latency_ms"] = getattr(voiced, "latency_ms", None)
@@ -456,6 +527,15 @@ async def run_planner_chat_loop(
             )
         except Exception:  # noqa: BLE001 — библиотека не валит ход
             logger.warning("plan_library: schedule failed", exc_info=True)
+        # F-1 (#151): запись usage рта (provider/model — из реального ответа
+        # композера, захвачены _capture_rot в обеих ветках голоса).
+        _record_usage_safe(
+            session,
+            tenant_id=action.tenant_id, feature_key=pf.feature_key, run_id=pf.run_id,
+            provider_key=_rot_usage["provider"], model=_rot_usage["model"],
+            prompt_tokens=_rot_usage["prompt"], completion_tokens=_rot_usage["completion"],
+            task_type="composer.voice",
+        )
         return _result(text, called=called, counts=counts)
     except Exception as exc:  # noqa: BLE001
         logger.exception("planner_chat: compose stage crashed")
