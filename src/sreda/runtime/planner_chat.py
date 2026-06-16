@@ -99,6 +99,205 @@ def _alert(stage: str, action: Any, code: str, detail: str) -> None:
         logger.exception("planner_chat: alert delivery failed")
 
 
+def _ordered_subsequence(haystack: str, needles: list[str]) -> bool:
+    """True если ``needles`` встречаются в ``haystack`` в ТОМ ЖЕ порядке
+    (как подпоследовательность). Пустой список → True (нечего проверять)."""
+    pos = 0
+    for n in needles:
+        if not n:
+            continue
+        idx = haystack.find(n, pos)
+        if idx < 0:
+            return False
+        pos = idx + len(n)
+    return True
+
+
+def _selector_clarification_reply(
+    *,
+    exec_log: Any,
+    plan_result: Any,
+    action: Any,
+    pf: Any,
+    session: Any,
+    registry_snapshot_hash: str,
+) -> str | None:
+    """#153 Фаза 1 (ЯДРО) — generic-проводка уточнения селекторной
+    неоднозначности (`.only` на 0/>1 → ``abort_kind="selector_ambiguity"``).
+
+    Возвращает ГОТОВЫЙ к показу текст уточнения (через рот, со страховкой) ЛИБО
+    ``None`` — если это НЕ селекторный аборт (тогда вызывающий идёт прежним
+    breakdown-путём БЕЗ изменений; см. риск p-001).
+
+    Шаги (зеркалит стадию-3 compose + блок прихорашивания):
+    1. ``abort_kind != "selector_ambiguity"`` → ``None`` (не-селекторные аборты
+       не трогаем — регресс-инвариант).
+    2. ``compose_for_execution(plan.compose, exec_log, …)`` детерминированно
+       роутит в ``selector_ambiguity_clarification`` (compose() игнорирует
+       plan.compose для не-completed исходов — поэтому нужен именно этот шов).
+    3. Озвучить детерминированный текст через ``humanize_result`` — ДАЖЕ при
+       пустом ``called`` (селекторный шаг = arg_violation, исключён из called),
+       минуя гейт ``and called`` (иначе уточнение ушло бы сухим шаблоном —
+       регресс правила «все ответы через рот»).
+    4. ORDER-PRESERVING guard: ДО рта снимаем ``options`` (упорядоченные,
+       id-stripped, cap 5 — selector.py:337) + ``count``. ПОСЛЕ рта проверяем,
+       что озвученный текст содержит count и КАЖДЫЙ лейбл как УПОРЯДОЧЕННУЮ
+       подпоследовательность (а для aborted_partial — ещё и done_summary
+       «часть действий уже выполнила»). Пусто/исключение рта ИЛИ провал guard →
+       fallback на ДЕТЕРМИНИРОВАННЫЙ текст (варианты не теряем) + owner-alert.
+
+    ПРИМЕЧАНИЕ: guard покрывает только первые 5 вариантов (cap selector.py:337);
+    лейблов больше 5 в abort_details_public не бывает.
+    """
+    if getattr(exec_log, "abort_kind", None) != "selector_ambiguity":
+        return None
+
+    # code-review R1 [MINOR, оба Codex + субагент]: подготовка (импорты, чтение
+    # abort_details_public, сборка ComposerContext) была ВНЕ try — сбой здесь
+    # пробивал бы до шва handlers.py, который обнуляет called_tools/counts
+    # (теряя honesty на aborted_partial). Оборачиваем: любой сбой подготовки →
+    # None (прежний breakdown/partial путь БЕЗ изменений, p-001) + owner-alert.
+    try:
+        from sreda.services.composer import llm_composer as _voice_mod
+        from sreda.services.composer.compose import ComposerContext
+        from sreda.runtime.planner.selector import (
+            SELECTOR_PARTIAL_DONE_SUMMARY,
+            compose_for_execution,
+        )
+
+        public = getattr(exec_log, "abort_details_public", None) or {}
+        if not isinstance(public, dict):
+            return None
+        options: list[str] = list(public.get("options", []) or [])
+        count = public.get("count", 0)
+        partial = getattr(exec_log, "outcome", None) == "aborted_partial"
+        # done_summary — ровно тот генерик-литерал, что кладёт
+        # clarification_compose_for_abort для aborted_partial. Импортируем
+        # из selector.py (единый источник, НЕ дублируем литерал — иначе смена
+        # текста продюсера молча роняла бы guard; code-review R1).
+        done_summary = SELECTOR_PARTIAL_DONE_SUMMARY if partial else ""
+
+        ctx2 = ComposerContext(
+            tenant_id=action.tenant_id,
+            run_id=pf.run_id,
+            user_message=pf.user_text,
+            locale="ru-RU",
+            timezone="Europe/Moscow",
+            persona_preset=_persona_preset_or_none(session, action, pf),
+        )
+    except Exception as exc:  # noqa: BLE001 — подготовка не должна ронять ход
+        logger.exception("planner_chat: selector clarification setup failed")
+        _alert("голос-уточнение", action, "setup_failed", str(exc))
+        return None
+
+    # F-1 (#151) + code-review R1 [MAJOR, оба Codex + субагент]: usage рта на
+    # пути уточнения раньше НЕ писался (ранний return минует стадию-3
+    # _record_usage_safe) — тот же класс «узкий путь молча роняет гарантию
+    # остального цикла», что и чинит #153. Копим токены вызовов рта и пишем
+    # composer.voice перед КАЖДЫМ возвратом, где рот реально звали.
+    _rot = {"prompt": 0, "completion": 0, "provider": "", "model": ""}
+
+    def _cap(res: Any) -> Any:
+        _rot["prompt"] += getattr(res, "prompt_tokens", 0) or 0
+        _rot["completion"] += getattr(res, "completion_tokens", 0) or 0
+        if getattr(res, "provider", ""):
+            _rot["provider"] = res.provider
+            _rot["model"] = getattr(res, "model", "") or ""
+        return res
+
+    def _flush_usage() -> None:
+        # _record_usage_safe сам no-op при session=None или нулевых токенах.
+        _record_usage_safe(
+            session,
+            tenant_id=action.tenant_id,
+            feature_key=getattr(pf, "feature_key", None),
+            run_id=pf.run_id,
+            provider_key=_rot["provider"], model=_rot["model"],
+            prompt_tokens=_rot["prompt"], completion_tokens=_rot["completion"],
+            task_type="composer.voice",
+        )
+
+    # (2) Детерминированный текст уточнения через единый шов. Рот, если он
+    # зовётся ВНУТРИ compose, захватываем per-call через _track (как счастливый
+    # путь _tracking_voice): токены копятся инкрементально и ПЕРЕЖИВАЮТ
+    # возможное исключение compose ПОСЛЕ вызова рта (code-review R2 MINOR,
+    # субагент). НЕ _cap'аем сам итог compose — иначе двойной учёт, если
+    # ComposeResult несёт агрегат. Для selector-шаблона compose детерминирован
+    # (рот не зовётся) → отсюда 0 токенов; реальный рот — стадия (3) ниже.
+    def _track(**kw: Any) -> Any:
+        return _cap(_voice_mod.DEFAULT_LLM_COMPOSER(**kw))
+
+    try:
+        clar = compose_for_execution(
+            plan_result.plan.compose,
+            exec_log,
+            llm_composer=_track,
+            ctx=ctx2,
+            expected_registry_snapshot_hash=registry_snapshot_hash,
+        )
+        clar_text = (getattr(clar, "text", "") or "").strip()
+    except Exception:  # noqa: BLE001 — уточнение не должно ронять ход
+        logger.exception("planner_chat: selector clarification compose failed")
+        _flush_usage()  # рот мог быть вызван внутри compose ДО исключения
+        return None
+    if not clar_text:
+        _flush_usage()  # compose мог потратить токены рта
+        return None
+
+    def _guard_ok(text: str) -> bool:
+        if not text:
+            return False
+        if str(count) not in text:
+            return False
+        # Лейблы вариантов — ТОЧНО и в ПОРЯДКЕ (анти-перестановка/анти-потеря,
+        # лейблы уже id-stripped продюсером).
+        if not _ordered_subsequence(text, options):
+            return False
+        # done_summary — honesty-сигнал; рот естественно меняет регистр первой
+        # буквы, поэтому проверяем подстроку без учёта регистра (важно, что
+        # «часть … уже выполнила» НЕ потерялась, а не байт-точное совпадение).
+        if partial and done_summary.lower() not in text.lower():
+            return False
+        return True
+
+    # (3) Озвучить детерминированный clar-текст — минуя гейт `and called`.
+    try:
+        voiced = _cap(_voice_mod.DEFAULT_LLM_COMPOSER(
+            llm_prompt_key="humanize_result",
+            template_data={
+                "intent": (pf.user_text or "запрос пользователя")[:300],
+                "actions": [{
+                    "user_visible_summary": clar_text,
+                    "status": "ok",
+                }],
+            },
+            execution_log=exec_log,
+            ctx=ctx2,
+        ))
+        voiced_text = (getattr(voiced, "text", "") or "").strip()
+    except Exception as exc:  # noqa: BLE001 — страховка детерминированным текстом
+        logger.warning(
+            "planner_chat: selector clarification voice failed (%s) — "
+            "детерминированный текст", type(exc).__name__,
+        )
+        _alert("голос-уточнение", action, type(exc).__name__, str(exc))
+        _flush_usage()  # compose_for_execution мог потратить токены рта
+        return clar_text
+
+    # Рот отработал (оба вызова состоялись) — usage пишем ОДИН раз здесь,
+    # покрывая и провал guard (детерминированный текст), и успех (озвучка).
+    _flush_usage()
+    # (4) ORDER-PRESERVING guard. Провал → детерминированный текст + alert.
+    if not _guard_ok(voiced_text):
+        _alert(
+            "голос-уточнение", action, "options_guard_failed",
+            "рот потерял/переставил варианты или count/partial — "
+            "ушёл детерминированный текст",
+        )
+        return clar_text
+    return voiced_text
+
+
 def _persona_preset_or_none(session: Any, action: Any, pf: Any) -> str | None:
     """#126 п.3: тон персоны для рта. Сбой чтения НИКОГДА не валит ход —
     None означает «дефолтный голос» (warm_practical-поведение)."""
@@ -527,6 +726,15 @@ async def run_planner_chat_loop(
     ok_tools = sorted(counts)
 
     if exec_log.outcome in ("aborted", "failed"):
+        # #153 Фаза 1: селекторная неоднозначность (.only на 0/>1) → уточнение
+        # через рот ДО прежнего breakdown. None → не-селекторный аборт, прежний
+        # путь БЕЗ изменений (регресс-инвариант p-001).
+        _clar = _selector_clarification_reply(
+            exec_log=exec_log, plan_result=plan_result, action=action,
+            pf=pf, session=session, registry_snapshot_hash=registry_snapshot_hash,
+        )
+        if _clar is not None:
+            return _result(_clar, called=called, counts=counts)
         _alert("исполнение", action, exec_log.outcome,
                "; ".join(f"{st.step_id}:{st.tool}:{st.status}"
                          for st in exec_log.steps)[:300])
@@ -534,6 +742,15 @@ async def run_planner_chat_loop(
         return _result(_fallback_error(), called=called, counts=counts)
 
     if exec_log.outcome == "aborted_partial":
+        # #153 Фаза 1: селекторная неоднозначность на aborted_partial → уточнение
+        # (с сохранённым «часть уже сделала») через рот ДО прежней partial-ветки.
+        # None → не-селекторный partial, прежний путь БЕЗ изменений.
+        _clar = _selector_clarification_reply(
+            exec_log=exec_log, plan_result=plan_result, action=action,
+            pf=pf, session=session, registry_snapshot_hash=registry_snapshot_hash,
+        )
+        if _clar is not None:
+            return _result(_clar, called=called, counts=counts)
         # Контракт compose(): aborted_partial обязан быть подменён честным
         # фолбэком ДО сборки — часть записей совершена, обычная сборка может
         # отрендерить «успех» и спрятать неопределённость (Codex R1 CRITICAL).

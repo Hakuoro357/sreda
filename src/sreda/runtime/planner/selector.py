@@ -474,6 +474,14 @@ if TYPE_CHECKING:
     from sreda.services.composer.compose import ComposeResult
 
 
+# #153: GENERIC honesty-литерал для aborted_partial-уточнения — НИКОГДА из
+# сырых имён инструментов (PR-c R1 leak-класс). Единый источник истины:
+# и продюсер (clarification_compose_for_abort ниже), и order-preserving guard
+# в planner_chat._selector_clarification_reply импортируют ЭТУ константу, чтобы
+# смена текста не могла молча уронить guard (code-review R1: дублированный литерал).
+SELECTOR_PARTIAL_DONE_SUMMARY = "часть действий уже выполнила"
+
+
 def clarification_compose_for_abort(
     execution_log: "ExecutionLog",
 ) -> "ComposerCall | None":
@@ -533,7 +541,7 @@ def clarification_compose_for_abort(
                 "options": options,
                 "count": count,
                 "partial": True,
-                "done_summary": "часть действий уже выполнила",
+                "done_summary": SELECTOR_PARTIAL_DONE_SUMMARY,
             },
         })
 

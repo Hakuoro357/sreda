@@ -76,6 +76,11 @@ _SHOPPING_LIST_EMPTY = "Список покупок пуст."
 
 _REMINDER_SET_OK = "Напомню {{ when_phrase }}: {{ what }}."
 
+# #153 Фаза 2 — compose отмены напоминания. FIXED-TEXT v1 (без переменных):
+# CancelReminderOk несёт только status='cancelled' — нет when_phrase/what для
+# reminder_set_ok. okv2 (название отменённого напоминания) — DEFER.
+_REMINDER_CANCELLED = "Готово, напоминание отменила."
+
 _REMINDER_SKIPPED_PAST = (
     "Это время уже прошло ({{ trigger_at_local }}, {{ late_by_minutes }} мин назад). "
     "Назначить на завтра в это же время?"
@@ -375,6 +380,8 @@ HOUSEWIFE_TEMPLATES: dict[str, str] = {
     "shopping_list_empty": _SHOPPING_LIST_EMPTY,
     # reminders
     "reminder_set_ok": _REMINDER_SET_OK,
+    # #153 Фаза 2 — отмена напоминания (fixed-text)
+    "reminder_cancelled": _REMINDER_CANCELLED,
     "reminder_skipped_past": _REMINDER_SKIPPED_PAST,
     "reminders_list_show": _REMINDERS_LIST_SHOW,
     "reminders_list_empty": _REMINDERS_LIST_EMPTY,

@@ -549,6 +549,8 @@ SAMPLE_TEMPLATE_DATA: dict[str, dict] = {
     },
     "shopping_list_empty": {},
     "reminder_set_ok": {"when_phrase": "завтра в 8:00", "what": "отправить образцы"},
+    # #153 Фаза 2 — fixed-text, без переменных
+    "reminder_cancelled": {},
     "reminder_skipped_past": {
         "trigger_at_local": "сегодня 09:00", "late_by_minutes": 42,
     },
@@ -632,6 +634,9 @@ _COMPOSER_CONTRACTS: dict[str, ComposerContract | object] = {
     "generic_tool_error": NO_CONTRACT,
     "partial_with_compose_error": NO_CONTRACT,
     "invalid_plan_fallback": NO_CONTRACT,
+    # #153 Фаза 2 — fixed-text «Готово, напоминание отменила.» (нет переменных →
+    # NO_CONTRACT, как generic_tool_error; НЕ пустой кортеж TEMPLATE_REQUIRED_KEYS).
+    "reminder_cancelled": NO_CONTRACT,
     # conversational / identity — fixed canned text.
     "identity_playful": NO_CONTRACT,
     "smalltalk_fallback": NO_CONTRACT,
