@@ -96,13 +96,16 @@ def test_plain_http_keeps_token_no_redirect(monkeypatch) -> None:
     get_settings.cache_clear()
     app.dependency_overrides[_get_session] = _mem_session
     try:
-        client = TestClient(app, base_url="http://10.0.0.5")   # plain-HTTP, не localhost
-        r = client.get(
-            "/admin/users?token=test-admin-tok-123456", follow_redirects=False,
-        )
-        assert r.status_code == 200                  # отдали страницу, без 303
-        assert r.headers.get("Referrer-Policy") == "no-referrer"
-        assert "no-store" in r.headers.get("Cache-Control", "")
+        # plain-HTTP И на «чужом» хосте, И на localhost (Codex R5 subagent: карв-аут
+        # localhost убран — по http://localhost браузер Secure-cookie тоже не шлёт).
+        for base in ("http://10.0.0.5", "http://localhost"):
+            client = TestClient(app, base_url=base)
+            r = client.get(
+                "/admin/users?token=test-admin-tok-123456", follow_redirects=False,
+            )
+            assert r.status_code == 200, base          # отдали страницу, без 303
+            assert r.headers.get("Referrer-Policy") == "no-referrer"
+            assert "no-store" in r.headers.get("Cache-Control", "")
     finally:
         app.dependency_overrides.clear()
         get_settings.cache_clear()

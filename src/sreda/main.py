@@ -163,20 +163,21 @@ def create_app() -> FastAPI:
                 # Bootstrap через ?token= на GET → 303 на ТОТ ЖЕ URL без token
                 # (cookie уже ставим ниже), чтобы токен не остался в адресной
                 # строке/истории/access-логах после первого входа (Codex R3).
-                # ВАЖНО (Codex R4): редиректим на чистый URL ТОЛЬКО в secure-
-                # контексте (HTTPS либо localhost). Иначе Secure-cookie не уйдёт
-                # обратно по plain-HTTP → чистый URL отдаст 401 и вход по токену
-                # сломается. На plain-HTTP оставляем token в URL (его прикрывают
-                # no-referrer + no-store выше). Прод — HTTPS (admin.sredaspace.ru).
-                _host = request.url.hostname or ""
-                _secure_ctx = (
-                    request.url.scheme == "https"
-                    or _host in ("localhost", "127.0.0.1")
-                )
+                # ВАЖНО (Codex R4/R5): редиректим на чистый URL ТОЛЬКО когда запрос
+                # реально по HTTPS — иначе Secure-cookie не уйдёт обратно → чистый URL
+                # отдаст 401 и вход по токену сломается. На plain-HTTP оставляем token
+                # в URL (его прикрывают no-referrer + no-store выше).
+                # Гейт — РОВНО request.url.scheme == "https" (Codex R5 subagent: без
+                # карв-аута localhost — Secure-cookie по RFC scheme-based, по
+                # http://localhost браузер её не шлёт; а host берётся из заголовка Host
+                # и подделываем). За TLS-терминацией scheme корректен: uvicorn запущен
+                # с --proxy-headers --forwarded-allow-ips=127.0.0.1, а nginx для
+                # admin.sredaspace.ru шлёт `X-Forwarded-Proto $scheme` → ProxyHeaders
+                # ставит scheme=https (проверено на проде 2026-06-16, Codex R5 medium).
                 if (
                     request.method == "GET"
                     and "token" in request.query_params
-                    and _secure_ctx
+                    and request.url.scheme == "https"
                 ):
                     from urllib.parse import urlencode
 
