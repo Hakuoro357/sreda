@@ -413,3 +413,43 @@ async def test_zero_match_empty_branch_not_clarification(monkeypatch):
     assert "уточни" not in text.lower(), text
     assert text not in _breakdown_pool(), text
     assert "не нашла" in text.lower() or "не " in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# code-review R1 [MAJOR] — usage рта на пути уточнения ОБЯЗАН писаться
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_selector_clarification_records_composer_voice_usage(monkeypatch):
+    """#153 code-review R1 [MAJOR, оба Codex + субагент]: путь уточнения делает
+    реальные вызовы рта, но ранний return раньше МИНОВАЛ стадию-3
+    ``_record_usage_safe`` → spend рта на уточнениях не учитывался (#151), и НИ
+    ОДИН тест этого не ловил (live-тесты гоняют с ``session=None``). Тот же класс
+    «узкий путь молча роняет гарантию остального цикла», что и чинит #153.
+
+    Шпионим за ``_record_usage_safe``: путь уточнения ОБЯЗАН вызвать его ровно
+    раз с ``task_type='composer.voice'`` и ненулевыми токенами реального рта."""
+    from sreda.runtime import planner_chat
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        planner_chat, "_record_usage_safe",
+        lambda session, **kw: recorded.append(kw),
+    )
+
+    options = ["Разминка утром (08:00)", "Разминка вечером (19:00)"]
+    log = _selector_abort_log(outcome="aborted", options=options, count=2)
+    voiced = (
+        "Нашла 2 напоминания про разминку — какое отменить: "
+        "Разминка утром (08:00), Разминка вечером (19:00)?"
+    )
+    text, voice_calls = await _drive(monkeypatch, exec_log=log, voice_text=voiced)
+
+    assert text == voiced, "ушло озвученное уточнение"
+    voice_rows = [r for r in recorded if r.get("task_type") == "composer.voice"]
+    assert len(voice_rows) == 1, recorded
+    row = voice_rows[0]
+    assert (row["prompt_tokens"] or 0) + (row["completion_tokens"] or 0) > 0, row
+    # настоящий провайдер рта, не пустой — деньги считаются по (provider, model)
+    assert row["provider_key"], row

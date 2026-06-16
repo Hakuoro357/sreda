@@ -79,3 +79,100 @@ def test_cancel_reminder_compose_uses_reminder_cancelled_not_set_ok() -> None:
     # reminder_set_ok на тех же данных — StrictUndefined (нужны when_phrase/what)
     with pytest.raises(TemplateError):
         render("reminder_set_ok", {})
+
+
+# ---------------------------------------------------------------------------
+# Пин формы ПЛАНА через validate_plan (code-review R1+R2 [MINOR], оба Codex +
+# субагент): рендер-пин выше изолирован — он не доказывает, что КАНОНИЧНЫЙ
+# план одиночного удаления (list_reminders → cancel_reminder(.only) →
+# compose=reminder_cancelled) проходит ВЕСЬ валидатор. Здесь — end-to-end через
+# реальные специи и реальный validate_plan (без новой логики валидатора).
+# ---------------------------------------------------------------------------
+
+
+def _cancel_reminder_plan(compose):
+    """Каноничная форма #153: list_reminders(title_match) с терминальной
+    empty-веткой → cancel_reminder(reminder_id=${s1.items.only.reminder_id}) →
+    переданный compose. Реальные специи REMINDERS."""
+    from sreda.runtime.planner.schemas import (
+        Action,
+        OutcomeBranch,
+        Plan,
+        TurnClassification,
+    )
+
+    return Plan(
+        turn_classification=TurnClassification(is_new_turn=True, reason="test"),
+        actions={
+            "s1": Action(
+                tool="list_reminders",
+                args={"title_match": "разминка"},
+                expected_outcomes=[
+                    OutcomeBranch(match={"status": "ok"}, next="s2"),
+                    # .only требует терминальную empty-ветку продюсера
+                    OutcomeBranch(match={"status": "empty"}),
+                ],
+                depends_on=[],
+            ),
+            "s2": Action(
+                tool="cancel_reminder",
+                # CancelReminderInput.reminder_id ← ровно-одно через .only
+                args={"reminder_id": "${s1.items.only.reminder_id}"},
+                # CancelReminderOk.status == 'cancelled' (НЕ 'ok')
+                expected_outcomes=[OutcomeBranch(match={"status": "cancelled"})],
+                depends_on=["s1"],
+            ),
+        },
+        compose=compose,
+    )
+
+
+def _reminders_registry() -> dict:
+    from sreda.services.tool_schemas.specs_reminders import (
+        CANCEL_REMINDER_SPEC,
+        LIST_REMINDERS_SPEC,
+    )
+
+    return {
+        "list_reminders": LIST_REMINDERS_SPEC,
+        "cancel_reminder": CANCEL_REMINDER_SPEC,
+    }
+
+
+def test_cancel_reminder_plan_with_reminder_cancelled_validates() -> None:
+    """Чеклист #153 п.3 (плановый уровень): каноничный план удаления одного
+    напоминания с ``compose=reminder_cancelled`` проходит ``validate_plan``
+    без единого нарушения (template известен, contract=NO_CONTRACT, .only-ссылка
+    ``${s1.items.only.reminder_id}`` валидна против ListRemindersItem)."""
+    from sreda.runtime.planner.schemas import ComposerCall
+    from sreda.runtime.planner.validator import validate_plan
+
+    plan = _cancel_reminder_plan(
+        ComposerCall(kind="template", template_id="reminder_cancelled", template_data={})
+    )
+    violations = validate_plan(plan, _reminders_registry())
+    assert violations == [], (
+        "каноничный план отмены (compose=reminder_cancelled) обязан быть валиден; "
+        f"получено: {[(v.code, v.message) for v in violations]}"
+    )
+
+
+def test_cancel_reminder_plan_with_reminder_set_ok_is_rejected() -> None:
+    """Чеклист #153 п.3 (негатив): тот же план отмены, но ОШИБОЧНО собранный
+    через ``reminder_set_ok`` (шаблон создания, требует when_phrase/what,
+    которых у отмены нет), отвергается валидатором по contract-нарушению — а не
+    тихо проходит, чтобы потом упасть на рендере в проде."""
+    from sreda.runtime.planner.schemas import ComposerCall
+    from sreda.runtime.planner.validator import validate_plan
+
+    plan = _cancel_reminder_plan(
+        ComposerCall(kind="template", template_id="reminder_set_ok", template_data={})
+    )
+    violations = validate_plan(plan, _reminders_registry())
+    contract_v = [v for v in violations if v.code == "composer_contract_invalid"]
+    assert contract_v, (
+        "compose=reminder_set_ok для отмены обязан давать composer_contract_invalid "
+        f"(нет when_phrase/what); получено: {[(v.code, v.message) for v in violations]}"
+    )
+    msgs = " ".join(v.message or "" for v in contract_v)
+    assert "when_phrase" in msgs and "what" in msgs, msgs
