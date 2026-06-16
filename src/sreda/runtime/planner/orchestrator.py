@@ -167,6 +167,14 @@ class PlannerResult:
     error_summary: str | None = None
     raw_responses: tuple[str, ...] = ()
 
+    # F-1 (#151): summed planner LLM token usage across attempts (success path;
+    # 0 on failure paths) + the effective provider/model, so
+    # run_planner_chat_loop records an accurate skill_ai_executions row.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    provider: str = ""
+    model: str = ""
+
 
 # ---------------------------------------------------------------------------
 # PII redaction for admin alerts
@@ -395,6 +403,9 @@ async def run(
 
     cumulative_latency_ms = 0
     raw_responses: list[str] = []
+    # F-1 (#151): sum planner token usage across attempts for cost recording.
+    planner_prompt_tokens = 0
+    planner_completion_tokens = 0
     last_errors = ""
     last_raw = ""
 
@@ -504,6 +515,8 @@ async def run(
 
         cumulative_latency_ms += call_result.latency_ms
         raw_responses.append(call_result.raw_text)
+        planner_prompt_tokens += call_result.prompt_tokens
+        planner_completion_tokens += call_result.completion_tokens
         last_raw = call_result.raw_text
         if _verbose_log:
             logger.info(
@@ -684,6 +697,10 @@ async def run(
             plan=plan,
             execution_plan=execution_plan,
             raw_responses=tuple(raw_responses),
+            prompt_tokens=planner_prompt_tokens,
+            completion_tokens=planner_completion_tokens,
+            provider=call_result.provider,
+            model=call_result.model,
         )
 
     # Loop fell through — shouldn't happen

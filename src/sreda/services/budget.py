@@ -129,17 +129,27 @@ class BudgetService:
         prompt_tokens: int,
         completion_tokens: int,
         run_id: str,
+        provider_key: str = "mimo",
         attempt_id: str | None = None,
         task_type: str | None = None,
         structured_output_json: str | None = None,
         status: str = "succeeded",
+        credits_override: int | None = None,
     ) -> int:
-        """Write a ``skill_ai_executions`` row and return credits_consumed."""
+        """Write a ``skill_ai_executions`` row and return credits_consumed.
+
+        ``credits_override`` (#151): when given, store this credit value verbatim
+        instead of ``credits_for(model, …)``. ``credits_for`` is MiMo-calibrated;
+        non-MiMo рядов (Mercury/Gemini планировщика и рта) попали бы в
+        пессимистичный fallback 2×MiMo и исказили бы квоту. Наблюдательные строки
+        usage пишутся с ``credits_override=0`` — токены+provider для денежных
+        страниц (USD = токены×прайс), БЕЗ влияния на кредит-квоту."""
         now = _utcnow()
         # 2026-04-28: pass now → credit_formula применяет off-peak discount
         # 20% в окне 09:00–17:00 PDT (16:00–24:00 UTC).
-        credits = credits_for(
-            model, prompt_tokens, completion_tokens, now=now
+        credits = (
+            credits_override if credits_override is not None
+            else credits_for(model, prompt_tokens, completion_tokens, now=now)
         )
         row = SkillAIExecution(
             id=f"skai_{_short_uuid()}",
@@ -148,7 +158,7 @@ class BudgetService:
             tenant_id=tenant_id,
             feature_key=feature_key,
             task_type=task_type or "llm_call",
-            provider_key="mimo",
+            provider_key=provider_key,
             model=model,
             ai_schema_version=1,
             status=status,

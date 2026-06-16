@@ -186,6 +186,61 @@ def test_exhausted_quota_blocks_further_use(session):
     assert svc.has_quota("t1", "eds_monitor") is False
 
 
+def test_record_llm_usage_persists_real_provider_key(session):
+    # F-1 (#151): planner (Mercury) / rot (Gemini) usage must be recorded with
+    # the REAL provider_key, not the hardcoded "mimo", so admin cost pages can
+    # attribute spend per provider/model. Default stays "mimo" for legacy callers.
+    svc = BudgetService(session)
+    svc.record_llm_usage(
+        tenant_id="t1", feature_key="housewife_assistant",
+        provider_key="inception-mercury2", model="mercury-2",
+        prompt_tokens=100, completion_tokens=50,
+        run_id=f"run_{uuid4().hex[:8]}",
+    )
+    session.commit()
+    row = session.query(SkillAIExecution).filter_by(model="mercury-2").one()
+    assert row.provider_key == "inception-mercury2"
+
+
+def test_record_llm_usage_defaults_provider_key_to_mimo(session):
+    # Backwards-compat: legacy callers omit provider_key → stays "mimo".
+    svc = BudgetService(session)
+    svc.record_llm_usage(
+        tenant_id="t1", feature_key="eds_monitor",
+        model="mimo-v2.5-pro", prompt_tokens=10, completion_tokens=5,
+        run_id=f"run_{uuid4().hex[:8]}",
+    )
+    session.commit()
+    row = session.query(SkillAIExecution).filter_by(model="mimo-v2.5-pro").one()
+    assert row.provider_key == "mimo"
+
+
+def test_record_llm_usage_credits_override_zero_no_quota(session):
+    # F-1 (#151) Codex R2 high MAJOR: credits_for is MiMo-only → Mercury/Gemini
+    # would fall into the 2x-MiMo fallback and pollute the credit quota. The
+    # observability rows pass credits_override=0 → 0 credits, quota untouched.
+    plan = _seed_plan(
+        session, plan_key="hw_basic", feature_key="housewife_assistant",
+        credits_monthly_quota=1_000_000,
+    )
+    _seed_subscription(session, plan=plan)
+    session.commit()
+
+    svc = BudgetService(session)
+    credits = svc.record_llm_usage(
+        tenant_id="t1", feature_key="housewife_assistant",
+        provider_key="inception-mercury2", model="mercury-2",
+        prompt_tokens=1000, completion_tokens=500,
+        run_id=f"run_{uuid4().hex[:8]}", credits_override=0,
+    )
+    session.commit()
+    assert credits == 0  # override wins over the (non-zero) MiMo credits_for
+    row = session.query(SkillAIExecution).filter_by(model="mercury-2").one()
+    assert row.credits_consumed == 0
+    # quota stays untouched — observability row consumes no credits
+    assert svc.get_quota_status("t1", "housewife_assistant").credits_used == 0
+
+
 def test_usage_scoped_per_feature_key(session):
     eds_plan = _seed_plan(
         session, plan_key="eds_basic", feature_key="eds_monitor",

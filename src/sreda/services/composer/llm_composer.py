@@ -108,6 +108,10 @@ class LLMComposerResult:
     provider: str
     model: str
     latency_ms: int
+    # F-1 (#151): token usage so run_planner_chat_loop can record real rot
+    # spend into skill_ai_executions. 0 when the provider omits usage_metadata.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -314,11 +318,20 @@ def make_llm_composer(
                 f"composer LLM returned blank/unparseable text for "
                 f"llm_prompt_key={llm_prompt_key!r}"
             )
+        # F-1 (#151): capture token usage (0 when provider omits it; never raises).
+        _usage = getattr(response, "usage_metadata", None) or {}
+        try:
+            _prompt_tokens = max(int(_usage.get("input_tokens") or 0), 0)
+            _completion_tokens = max(int(_usage.get("output_tokens") or 0), 0)
+        except (AttributeError, TypeError, ValueError):
+            _prompt_tokens = _completion_tokens = 0
         return LLMComposerResult(
             text=text,
             provider=s.composer_provider,
             model=_resolve_model_name(runnable, s.composer_provider),
             latency_ms=latency_ms,
+            prompt_tokens=_prompt_tokens,
+            completion_tokens=_completion_tokens,
         )
 
     return _compose_with_llm

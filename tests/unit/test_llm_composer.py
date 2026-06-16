@@ -45,8 +45,10 @@ from sreda.services.llm import LLMCallTimeout
 
 
 class _FakeAIMessage:
-    def __init__(self, content: Any) -> None:
+    def __init__(self, content: Any, usage_metadata: dict | None = None) -> None:
         self.content = content
+        # langchain AIMessage carries usage_metadata (None when omitted).
+        self.usage_metadata = usage_metadata
 
 
 def _settings(provider: str = "mimo-flash", timeout: float = 30.0) -> Any:
@@ -118,6 +120,41 @@ def test_happy_path_returns_text() -> None:
     assert out.provider == "mimo-flash"
     assert out.model == "flash"
     assert out.latency_ms >= 0
+
+
+def test_composer_captures_usage_tokens() -> None:
+    # F-1 (#151): rot (composer) LLM usage must be captured so admin cost pages
+    # can attribute Gemini spend. usage_metadata → LLMComposerResult tokens.
+    captured: dict = {}
+    composer = make_llm_composer(
+        registry=_registry_one(),
+        settings_factory=_settings,
+        chat_llm_factory=lambda *, settings, provider: SimpleNamespace(model="flash"),
+        invoke=_capture_invoke(captured, _FakeAIMessage(
+            "Готовлю борщ!",
+            usage_metadata={"input_tokens": 200, "output_tokens": 40, "total_tokens": 240},
+        )),
+    )
+    out = composer(
+        llm_prompt_key="k", template_data={}, execution_log=_log(), ctx=_ctx(),
+    )
+    assert out.prompt_tokens == 200
+    assert out.completion_tokens == 40
+
+
+def test_composer_usage_defaults_zero_when_absent() -> None:
+    captured: dict = {}
+    composer = make_llm_composer(
+        registry=_registry_one(),
+        settings_factory=_settings,
+        chat_llm_factory=lambda *, settings, provider: SimpleNamespace(model="flash"),
+        invoke=_capture_invoke(captured, _FakeAIMessage("OK")),  # no usage_metadata
+    )
+    out = composer(
+        llm_prompt_key="k", template_data={}, execution_log=_log(), ctx=_ctx(),
+    )
+    assert out.prompt_tokens == 0
+    assert out.completion_tokens == 0
 
 
 def test_system_message_is_spec_system_prompt() -> None:
