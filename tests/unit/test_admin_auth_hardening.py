@@ -155,17 +155,34 @@ def test_x_forwarded_for_used_for_logging(monkeypatch):
 
 
 def test_passes_with_valid_session_cookie(monkeypatch):
-    from sreda.admin.auth import _session_value
+    from sreda.admin.auth import _make_session
     from sreda.config.settings import Settings
     monkeypatch.setattr(
         "sreda.admin.auth.get_settings",
         lambda: Settings(admin_token="real-secret-token-xyz"),
     )
     req = _mk_request()
-    cookie = _session_value("real-secret-token-xyz")
+    cookie = _make_session("real-secret-token-xyz")
     assert require_admin_token(
         req, header_token=None, query_token=None, cookie_token=cookie,
     ) == "real-secret-token-xyz"
+
+
+def test_expired_session_cookie_rejected(monkeypatch):
+    from sreda.admin.auth import _make_session
+    from sreda.config.settings import Settings
+    monkeypatch.setattr(
+        "sreda.admin.auth.get_settings",
+        lambda: Settings(admin_token="real-secret-token-xyz"),
+    )
+    req = _mk_request()
+    # cookie выписан «в прошлом» (now=0) → exp давно истёк → серверная проверка 401.
+    stale = _make_session("real-secret-token-xyz", now=0)
+    with pytest.raises(HTTPException) as exc:
+        require_admin_token(
+            req, header_token=None, query_token=None, cookie_token=stale,
+        )
+    assert exc.value.status_code == 401
 
 
 def test_wrong_session_cookie_is_401(monkeypatch):
@@ -185,7 +202,7 @@ def test_wrong_session_cookie_is_401(monkeypatch):
 def test_header_auth_signals_cookie_set(monkeypatch):
     """После header/query-аутентификации в request.state кладётся HMAC-маркер
     (middleware ставит по нему HttpOnly-cookie). Содержит НЕ сам токен."""
-    from sreda.admin.auth import _session_value
+    from sreda.admin.auth import _verify_session
     from sreda.config.settings import Settings
     monkeypatch.setattr(
         "sreda.admin.auth.get_settings",
@@ -193,6 +210,6 @@ def test_header_auth_signals_cookie_set(monkeypatch):
     )
     req = _mk_request()
     require_admin_token(req, header_token="real-secret-token-xyz", query_token=None)
-    expected = _session_value("real-secret-token-xyz")
-    assert req.state.admin_set_session == expected
-    assert expected != "real-secret-token-xyz"   # cookie ≠ сам токен
+    marker = req.state.admin_set_session
+    assert _verify_session("real-secret-token-xyz", marker)   # валидный маркер
+    assert "real-secret-token-xyz" not in marker              # cookie ≠ сам токен

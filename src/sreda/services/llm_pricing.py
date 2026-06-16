@@ -107,14 +107,17 @@ def cost_estimate(
     price = _priced(provider_key, model)
     if price is None:
         return None
+    # Неполная форма: нет сплита prompt/completion (любой None — напр. legacy
+    # строка только с total_tokens) → честно не оценить (Codex #150 MAJOR).
+    if prompt_tokens is None or completion_tokens is None:
+        return None
     pt = prompt_tokens
     ct = completion_tokens
-    # неполная форма: ни prompt, ни completion (мог быть только total) → не оценить
-    if not pt and not ct:
-        return None
-    pt = pt or 0
-    ct = ct or 0
     if pt < 0 or ct < 0:  # аномалия данных — не в деньги
+        return None
+    if pt == 0 and ct == 0 and (total_tokens or 0) > 0:
+        # сплит отсутствует (есть только total_tokens) — incomplete → None
+        # (genuine 0/0-вызов без total → ниже даст priced $0, это корректно).
         return None
     inp = price.input_per_mtok
     out = price.output_per_mtok

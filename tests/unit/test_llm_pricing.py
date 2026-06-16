@@ -59,6 +59,18 @@ def test_negative_tokens_returns_none() -> None:
     assert cost_estimate(*MERCURY, prompt_tokens=-5, completion_tokens=10) is None
 
 
+def test_none_token_is_incomplete_none() -> None:
+    # Один из счётчиков None → нет сплита → None (Codex MAJOR: не считать только один).
+    assert cost_estimate(*MERCURY, prompt_tokens=None, completion_tokens=10) is None
+    assert cost_estimate(*MERCURY, prompt_tokens=10, completion_tokens=None) is None
+
+
+def test_genuine_zero_call_is_priced_zero() -> None:
+    # 0/0 без total → реальный нулевой вызов priced-модели → $0 (priced, НЕ None).
+    est = cost_estimate(*MERCURY, prompt_tokens=0, completion_tokens=0)
+    assert est is not None and est.est_usd == Decimal("0")
+
+
 def test_gemini_rot_priced_no_cache_est_equals_upper() -> None:
     # Gemini-рот сидирован (прайс OpenRouter) без cached_input → est == upper.
     gem = ("openrouter-gemini-2.5-flash-lite", "google/gemini-2.5-flash-lite")

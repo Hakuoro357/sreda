@@ -6,11 +6,11 @@
 затрат в USD по текущему прайсу (беспрайсовые модели → «—», % — покрытие).</small>
 
 <nav class="day-nav" style="display: flex; gap: 12px; align-items: center; justify-content: flex-start; margin-bottom: 16px;">
-  <a href="/admin/budget?token={{ token }}&date={{ prev_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
+  <a href="/admin/budget?date={{ prev_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
     ← Предыдущий день
   </a>
   {% if next_date %}
-  <a href="/admin/budget?token={{ token }}&date={{ next_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
+  <a href="/admin/budget?date={{ next_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
     Следующий день →
   </a>
   {% endif %}
@@ -68,9 +68,7 @@
       <td>{{ "{:,}".format(r.total_calls) }}</td>
       <td>{{ "{:,}".format(r.total_tokens) }}</td>
       <td>
-        {% if r.est_usd is none %}<span class="muted">—</span>
-        {% elif r.est_usd < 0.0001 %}&lt;$0.0001
-        {% else %}${{ "%.4f"|format(r.est_usd) }}{% endif %}
+        {{ r.est_usd | usd }}
         {% if r.cost_coverage_pct is not none and r.cost_coverage_pct < 100 %}
           <span class="muted" title="доля вызовов с известной ценой">({{ r.cost_coverage_pct }}%)</span>
         {% endif %}

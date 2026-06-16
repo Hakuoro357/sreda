@@ -44,7 +44,7 @@
   <tbody>
   {% for tid, name, est, calls in top.by_spend %}
     <tr>
-      <td><a href="/admin/tenants/{{ tid }}?token={{ token }}">{{ name }}</a></td>
+      <td><a href="/admin/tenants/{{ tid }}">{{ name }}</a></td>
       <td>${{ "%.4f"|format(est) }}</td>
       <td>{{ "{:,}".format(calls) }}</td>
     </tr>
@@ -58,7 +58,7 @@
 <table><tbody>
   {% for tid, name, tok in top.by_unpriced %}
     <tr>
-      <td><a href="/admin/tenants/{{ tid }}?token={{ token }}">{{ name }}</a></td>
+      <td><a href="/admin/tenants/{{ tid }}">{{ name }}</a></td>
       <td>{{ "{:,}".format(tok) }} токенов</td>
     </tr>
   {% endfor %}

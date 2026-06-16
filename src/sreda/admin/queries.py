@@ -378,6 +378,8 @@ def get_budget_summary_for_day(
                 _has_priced = True
                 _priced_calls += _c
         _est_usd = _est if _has_priced else None
+        # Знаменатель покрытия — ВАЛИДНЫЕ вызовы строки (_VALID_TOKENS), а не
+        # показанный total_calls (тот без фильтра аномалий): «доля valid с ценой».
         _cost_cov = round(_priced_calls * 100 / _row_calls) if _row_calls else None
 
         rows_with_sort.append((
@@ -494,7 +496,9 @@ def get_llm_calls(
 # — аномалия данных, исключаются из сумм И считаются отдельно (Codex-ревью:
 # нельзя суммировать в группе — отрицательная и положительная взаимогасятся).
 _VALID_TOKENS = (
-    (SkillAIExecution.prompt_tokens >= 0)
+    SkillAIExecution.prompt_tokens.isnot(None)
+    & SkillAIExecution.completion_tokens.isnot(None)
+    & (SkillAIExecution.prompt_tokens >= 0)
     & (SkillAIExecution.completion_tokens >= 0)
 )
 

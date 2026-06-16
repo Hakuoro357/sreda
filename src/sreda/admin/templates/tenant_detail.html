@@ -6,7 +6,7 @@
 пользователя (у тенанта может быть несколько пользователей). Оценка по текущему
 прайсу, не бухгалтерия.</small>
 <p style="margin-top: 12px;">
-  <a href="/admin/llm-calls?tenant_id={{ detail.tenant_id }}&token={{ token }}"
+  <a href="/admin/llm-calls?tenant_id={{ detail.tenant_id }}"
      role="button" class="outline">Вся переписка (llm-calls)</a>
 </p>
 
@@ -26,11 +26,7 @@
         <td>{{ r.provider_key }} · <span class="muted">{{ r.model }}</span></td>
         <td>{{ "{:,}".format(r.calls) }}</td>
         <td>{{ "{:,}".format(r.prompt_tokens + r.completion_tokens) }}</td>
-        <td>
-          {% if r.est_usd is none %}<span class="muted">—</span>
-          {% elif r.est_usd < 0.0001 %}&lt;$0.0001
-          {% else %}${{ "%.4f"|format(r.est_usd) }}{% endif %}
-        </td>
+        <td>{{ r.est_usd | usd }}</td>
       </tr>
     {% endfor %}
     </tbody>

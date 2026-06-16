@@ -161,7 +161,7 @@ def create_app() -> FastAPI:
             sess = getattr(request.state, "admin_set_session", None)
             if sess:
                 response.set_cookie(
-                    "admin_session", sess, max_age=86400,
+                    "admin_session", sess, max_age=86400, path="/admin",
                     httponly=True, samesite="strict", secure=True,
                 )
         return response

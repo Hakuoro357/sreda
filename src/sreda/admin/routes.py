@@ -30,6 +30,22 @@ _MSK_TZ = ZoneInfo("Europe/Moscow")
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 
+
+def _fmt_usd(value) -> str:
+    """#150: деньги для UI. None → «—»; <$0.0001 → «<$0.0001»; иначе $X.XXXX.
+    Централизует формат — никаких Decimal<float сравнений в шаблонах (Codex MAJOR)."""
+    from decimal import Decimal as _D
+
+    if value is None:
+        return "—"
+    v = value if isinstance(value, _D) else _D(str(value))
+    if v < _D("0.0001"):
+        return "<$0.0001"
+    return f"${v:.4f}"
+
+
+templates.env.filters["usd"] = _fmt_usd
+
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 

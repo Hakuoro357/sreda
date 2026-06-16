@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import time
 
 from fastapi import Cookie, Header, HTTPException, Query, Request
 
@@ -25,11 +26,36 @@ from sreda.config.settings import get_settings
 logger = logging.getLogger("sreda.admin.auth")
 
 
-def _session_value(admin_token: str) -> str:
-    """HMAC-маркер для session-cookie — НЕ раскрывает сам admin-токен."""
-    return hmac.new(
-        admin_token.encode("utf-8"), b"admin-session-v1", hashlib.sha256
+_SESSION_TTL = 86400  # 24h — СЕРВЕРНЫЙ срок жизни session-cookie
+
+
+def _make_session(admin_token: str, *, now: int | None = None) -> str:
+    """Подписанный session-маркер `<exp>.<hmac>` — НЕ раскрывает токен; срок
+    действия зашит в подпись и проверяется СЕРВЕРОМ (не только браузерным
+    max_age) — украденный cookie не вечен (Codex #150 MAJOR)."""
+    exp = (int(time.time()) if now is None else now) + _SESSION_TTL
+    sig = hmac.new(
+        admin_token.encode("utf-8"), f"admin-session-v1:{exp}".encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _verify_session(admin_token: str, cookie: str, *, now: int | None = None) -> bool:
+    """True если cookie подписан этим токеном И НЕ истёк (серверная проверка)."""
+    _now = int(time.time()) if now is None else now
+    try:
+        exp_s, sig = cookie.split(".", 1)
+        exp = int(exp_s)
+    except (ValueError, AttributeError):
+        return False
+    if exp < _now:
+        return False
+    expected = hmac.new(
+        admin_token.encode("utf-8"), f"admin-session-v1:{exp}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(sig, expected)
 
 
 def require_admin_token(
@@ -66,14 +92,9 @@ def require_admin_token(
     # 0. Session cookie (выставляется после первой header/query-аутентификации) —
     #    даёт навигацию по админке без ?token= в URL. Содержит HMAC-маркер, не
     #    сам токен; HttpOnly+SameSite=Strict+Secure (ставит middleware).
-    expected_session = _session_value(expected)
     # isinstance(str): при прямом вызове (юнит-тесты) непереданный параметр —
     # это sentinel Cookie(...), не None; в FastAPI-DI — str|None.
-    if (
-        isinstance(cookie_token, str)
-        and cookie_token
-        and hmac.compare_digest(cookie_token, expected_session)
-    ):
+    if isinstance(cookie_token, str) and _verify_session(expected, cookie_token):
         logger.debug("admin auth: OK via cookie path=%s", request.url.path)
         return expected
 
@@ -103,7 +124,7 @@ def require_admin_token(
     # дальнейшая навигация шла без token в URL (#150 митигейт). Additive:
     # header/query продолжают работать как раньше.
     try:
-        request.state.admin_set_session = expected_session
+        request.state.admin_set_session = _make_session(expected)
     except Exception:  # noqa: BLE001 — сигнал best-effort, не валит auth
         pass
 
