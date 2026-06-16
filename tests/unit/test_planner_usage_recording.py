@@ -19,8 +19,11 @@ from sreda.db.models.skill_platform import SkillAIExecution
 
 
 @pytest.fixture()
-def session():
-    engine = create_engine("sqlite:///:memory:")
+def session(tmp_path):
+    # Файловый SQLite (не :memory:) — _record_usage_safe пишет в ОТДЕЛЬНОЙ
+    # session на том же engine (новое соединение); файл общий, поэтому строки
+    # видны тестовой session. У :memory: каждое соединение = своя БД.
+    engine = create_engine(f"sqlite:///{tmp_path / 'f1.db'}")
     Base.metadata.create_all(engine)
     s = sessionmaker(bind=engine)()
     s.add(Tenant(id="t-rec", name="T"))
@@ -117,9 +120,12 @@ async def test_planner_and_rot_usage_recorded(session, monkeypatch) -> None:
     assert planner_row.completion_tokens == 120
     assert planner_row.model == "mercury-2"
     assert planner_row.task_type == "planner.plan"
+    # Наблюдательная строка: квоту НЕ потребляет (Codex R2 high MAJOR).
+    assert planner_row.credits_consumed == 0
 
     assert "openrouter-gemini-2.5-flash-lite" in by_provider, "нет строки usage рта"
     rot_row = by_provider["openrouter-gemini-2.5-flash-lite"]
     assert rot_row.prompt_tokens == 800
     assert rot_row.completion_tokens == 60
     assert rot_row.task_type == "composer.voice"
+    assert rot_row.credits_consumed == 0

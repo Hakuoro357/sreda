@@ -176,18 +176,22 @@ def _record_usage_safe(
     completion_tokens: int,
     task_type: str,
 ) -> None:
-    """#151: best-effort запись ОДНОЙ строки usage в skill_ai_executions.
+    """#151: best-effort запись ОДНОЙ наблюдательной строки usage в skill_ai_executions.
 
-    Учёт НИКОГДА не валит ход. Пропускаем, если нет сессии (юнит-швы) или
-    нулевые токены. provider_key пишем настоящий (планировщик: inception-mercury2
-    и т.п.; рот: openrouter-…), чтобы админка денег атрибутировала траты по модели.
+    Учёт НИКОГДА не валит ход. Пропускаем, если нет сессии (юнит-швы) или нулевые
+    токены. provider_key пишем настоящий (планировщик: inception-mercury2 и т.п.;
+    рот: openrouter-…) — денежные страницы считают USD = токены×прайс по
+    (provider_key, model).
 
-    Изоляция транзакции (Codex R1 MAJOR): пишем В SAVEPOINT (`begin_nested`),
-    БЕЗ commit/rollback общей session хода. При сбое откатывается ТОЛЬКО эта
-    строка (savepoint), pending-состояние хода (preflight/инструменты/agent_run)
-    НЕ трогается. Персист — общим commit хода (finalize_chat_reply), как и
-    остальное состояние turn-а; отдельный commit здесь зафиксировал/откатил бы
-    чужие изменения раньше границы хода."""
+    Изоляция (Codex R2 MAJOR, оба ревьюера): пишем в ОТДЕЛЬНУЮ session на том же
+    engine и коммитим САМИ — НЕ трогаем общую session хода. `begin_nested` на ней
+    флашил бы ВСЁ её pending-состояние (preflight/инструменты) и мог отравить
+    сессию; плановые инструменты к тому же сами коммитят mid-turn. Отдельная
+    транзакция: строка durable сразу, независимо от исхода хода — для учёта верно.
+
+    `credits_override=0` (Codex R2 MAJOR high): credits_for — MiMo-only, Mercury/
+    Gemini попали бы в fallback 2×MiMo и исказили бы кредит-квоту. Наблюдательные
+    строки квоту НЕ потребляют (provider-aware квота — отдельная задача)."""
     if session is None:
         return
     if (prompt_tokens or 0) <= 0 and (completion_tokens or 0) <= 0:
@@ -195,10 +199,14 @@ def _record_usage_safe(
     if not provider_key:
         return
     try:
+        from sqlalchemy.orm import Session as _SASession
+
         from sreda.services.budget import BudgetService
 
-        with session.begin_nested():  # SAVEPOINT — откат только этой строки
-            BudgetService(session).record_llm_usage(
+        bind = session.get_bind()
+        acct = _SASession(bind=bind)
+        try:
+            BudgetService(acct).record_llm_usage(
                 tenant_id=tenant_id,
                 feature_key=feature_key or "housewife_assistant",
                 model=model or provider_key,
@@ -207,7 +215,11 @@ def _record_usage_safe(
                 run_id=run_id,
                 provider_key=provider_key,
                 task_type=task_type,
+                credits_override=0,
             )
+            acct.commit()
+        finally:
+            acct.close()
     except Exception:  # noqa: BLE001 — учёт не валит ответ пользователю
         logger.warning(
             "planner_chat: usage record failed (%s)", task_type, exc_info=True,
