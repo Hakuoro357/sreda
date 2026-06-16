@@ -210,6 +210,22 @@ def test_tenant_detail_template_renders() -> None:
     assert "llm-calls" in html
 
 
+def test_incomplete_split_row_is_anomaly_not_priced_zero(session) -> None:
+    # legacy «только total»: 0/0 но total=500 — НЕ должно стать priced $0 (Codex R2).
+    in_win = datetime(2026, 6, 16, 10, 0, tzinfo=UTC)
+    session.add(SkillAIExecution(
+        id="skai_inc", run_id="r_inc", attempt_id=None, tenant_id="t1",
+        feature_key="housewife_assistant", task_type="llm_call",
+        provider_key="inception-mercury2", model="mercury-2", ai_schema_version=1,
+        status="succeeded", prompt_tokens=0, completion_tokens=0, total_tokens=500,
+        credits_consumed=0, created_at=in_win, started_at=in_win, finished_at=in_win))
+    session.commit()
+
+    rep = get_spend_by_model(session, "month", ANCHOR)
+    assert [r for r in rep.rows if r.provider_key == "inception-mercury2"] == []
+    assert rep.anomaly_count == 1
+
+
 def test_cost_volume_summary(session) -> None:
     from sreda.admin.queries import get_cost_volume_summary
 

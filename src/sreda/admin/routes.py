@@ -830,7 +830,7 @@ def admin_tenant_reset(
     msg = "+".join(parts) if parts else "nothing+to+delete"
 
     return RedirectResponse(
-        url=f"/admin/users?token={token}&reset=ok&msg={msg}",
+        url=f"/admin/users?reset=ok&msg={msg}",
         status_code=303,
     )
 
@@ -879,7 +879,7 @@ async def _legacy_admin_tenant_approve_unused(
     tenant = session.get(Tenant, tenant_id)
     if tenant is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&approve=err&msg=tenant_not_found",
+            url=f"/admin/users?approve=err&msg=tenant_not_found",
             status_code=303,
         )
 
@@ -1011,7 +1011,7 @@ async def _legacy_admin_tenant_approve_unused(
 
     return RedirectResponse(
         url=(
-            f"/admin/users?token={token}&approve=ok&tenant={tenant_id}"
+            f"/admin/users?approve=ok&tenant={tenant_id}"
             f"&welcome={delivery_status}&grant={grant_status}"
         ),
         status_code=303,
@@ -1048,7 +1048,7 @@ async def admin_tenant_suspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&suspend=err&msg=no_active_sub",
+            url=f"/admin/users?suspend=err&msg=no_active_sub",
             status_code=303,
         )
     sub.status = "suspended"
@@ -1066,7 +1066,7 @@ async def admin_tenant_suspend(
     )
     session.commit()
     return RedirectResponse(
-        url=f"/admin/users?token={token}&suspend=ok&tenant={tenant_id}",
+        url=f"/admin/users?suspend=ok&tenant={tenant_id}",
         status_code=303,
     )
 
@@ -1092,7 +1092,7 @@ async def admin_tenant_unsuspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&unsuspend=err&msg=no_suspended_sub",
+            url=f"/admin/users?unsuspend=err&msg=no_suspended_sub",
             status_code=303,
         )
     sub.status = "active"
@@ -1110,6 +1110,6 @@ async def admin_tenant_unsuspend(
     )
     session.commit()
     return RedirectResponse(
-        url=f"/admin/users?token={token}&unsuspend=ok&tenant={tenant_id}",
+        url=f"/admin/users?unsuspend=ok&tenant={tenant_id}",
         status_code=303,
     )

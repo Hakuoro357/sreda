@@ -500,6 +500,13 @@ _VALID_TOKENS = (
     & SkillAIExecution.completion_tokens.isnot(None)
     & (SkillAIExecution.prompt_tokens >= 0)
     & (SkillAIExecution.completion_tokens >= 0)
+    # incomplete split: 0/0 при total>0 (legacy «только total_tokens») — НЕ valid
+    # (иначе priced-модель даст ложный $0, занизит spend) → попадёт в аномалии.
+    & ~(
+        (SkillAIExecution.prompt_tokens == 0)
+        & (SkillAIExecution.completion_tokens == 0)
+        & (func.coalesce(SkillAIExecution.total_tokens, 0) > 0)
+    )
 )
 
 
