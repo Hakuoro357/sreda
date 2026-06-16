@@ -218,11 +218,11 @@ def _fetch_inception(settings: Settings) -> ProviderBalance:
     key = settings.resolve_inception_api_key()
     if not key:
         return ProviderBalance(
-            key="inception-mercury2", label="Inception · Mercury-2 (Фредди)",
+            key="inception-mercury2", label="Inception · Mercury-2 (Фредди, планировщик)",
             status="not_configured", headline="ключ не настроен",
         )
     return ProviderBalance(
-        key="inception-mercury2", label="Inception · Mercury-2 (Фредди)",
+        key="inception-mercury2", label="Inception · Mercury-2 (Фредди, планировщик)",
         status="not_supported",
         headline="нет публичного billing API",
         details="оценка трат в USD — на /admin/budget и /admin/spend-by-model",
