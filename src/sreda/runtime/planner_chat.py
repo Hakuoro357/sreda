@@ -173,16 +173,28 @@ def _step_to_log(s: Any) -> dict[str, Any]:
     subagent R1 CRITICAL). Keeps only the fields the feedback loop / TraceBundle
     read, model-dumping the one nested Pydantic field.
     """
+    import json as _json
+
     sc = getattr(s, "selected_compose", None)
-    return {
+    record = {
         "step_id": getattr(s, "step_id", None),
         "tool": getattr(s, "tool", None),
         "status": getattr(s, "status", None),
+        # error_summary is the per-step failure reason — the single most valuable
+        # field for the feedback loop (subagent R2 MAJOR).
+        "error_summary": getattr(s, "error_summary", None),
+        "matched_status": getattr(s, "matched_status", None),
+        "matched_branch_index": getattr(s, "matched_branch_index", None),
+        "latency_ms": getattr(s, "latency_ms", None),
         "parsed_output": getattr(s, "parsed_output", None),
         "raw_output": getattr(s, "raw_output", None),
-        "matched_status": getattr(s, "matched_status", None),
         "selected_compose": sc.model_dump(mode="json") if sc is not None else None,
     }
+    # Defense-in-depth (subagent R2 MAJOR, reproduced): parsed_output is built
+    # upstream with model_dump(mode="python") and may hold datetime/Decimal/etc.;
+    # JSONEncryptedString.json.dumps has no default=, so a single non-JSON-native
+    # value would silently lose the whole row. Coerce the record to JSON-native.
+    return _json.loads(_json.dumps(record, default=str))
 
 
 def _build_diag_persist_args(
@@ -311,7 +323,10 @@ async def run_planner_chat_loop(
                 tenant_id=action.tenant_id,
                 feature_key=pf.feature_key or "housewife_assistant",
                 planner_provider=_st.planner_provider or "",
-                planner_prompt_version=getattr(ctx, "planner_prompt_version", 1),
+                # Codex R2 MAJOR: the configured prompt version (ctx defaults to 1
+                # and ignores SREDA_PLANNER_PROMPT_VERSION), so audit/replay rows
+                # are attributed correctly after a prompt bump.
+                planner_prompt_version=getattr(_st, "planner_prompt_version", 1),
                 tool_registry_version=getattr(ctx, "tool_registry_version", None),
                 composer_registry_snapshot_hash=getattr(
                     ctx, "composer_registry_snapshot_hash", None

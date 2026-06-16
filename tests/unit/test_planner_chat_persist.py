@@ -22,6 +22,9 @@ class _Step:
     parsed_output: dict | None = None
     raw_output: str | None = None
     matched_status: str | None = None
+    error_summary: str | None = None
+    latency_ms: int | None = None
+    matched_branch_index: int | None = None
     selected_compose: object | None = None
 
 
@@ -81,6 +84,21 @@ def test_step_to_log_serialises_selected_compose() -> None:
     # The whole record must be JSON-serialisable (what JSONEncryptedString does).
     import json
     json.dumps(log)
+
+
+def test_step_to_log_coerces_non_json_parsed_output() -> None:
+    # parsed_output is built upstream with model_dump(mode="python") → may carry
+    # datetime/Decimal; _step_to_log must coerce so JSONEncryptedString.json.dumps
+    # never fails and silently loses the row (subagent R2 MAJOR, reproduced).
+    import json
+    from datetime import datetime
+
+    step = _Step("s1", "x", "failed", parsed_output={"when": datetime(2026, 6, 17, 9)},
+                 error_summary="contract_violation: bad date")
+    log = _step_to_log(step)
+    json.dumps(log)  # must NOT raise
+    assert isinstance(log["parsed_output"]["when"], str)  # coerced to str
+    assert log["error_summary"] == "contract_violation: bad date"  # per-step reason kept
 
 
 def test_extract_valid_requires_execution_plan() -> None:
