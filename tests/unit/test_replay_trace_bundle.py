@@ -271,6 +271,82 @@ def test_load_planner_execution_reads_encrypted(db_session) -> None:
     assert _load_planner_execution(db_session, rid, "tenant_other") == {}
 
 
+def _seed_run(db_session):
+    from uuid import uuid4
+
+    from sreda.db.models import AgentRun, AgentThread, Tenant, Workspace
+
+    tid = f"tenant_{uuid4().hex[:8]}"
+    wid, thid, rid = (f"ws_{uuid4().hex[:8]}", f"thread_{uuid4().hex[:8]}",
+                      f"run_{uuid4().hex[:8]}")
+    db_session.add(Tenant(id=tid, name="t"))
+    db_session.add(Workspace(id=wid, tenant_id=tid, name="w"))
+    db_session.add(AgentThread(id=thid, tenant_id=tid, workspace_id=wid,
+                               channel_type="telegram", external_chat_id="42"))
+    db_session.add(AgentRun(id=rid, thread_id=thid, tenant_id=tid,
+                            workspace_id=wid, action_type="chat"))
+    db_session.flush()
+    return tid, rid
+
+
+def test_persist_completed_turn_valid_roundtrips(db_session) -> None:
+    """#155: persist_completed_turn writes ONE row that TraceBundle's loader
+    reads back through encryption (writer ⋈ reader end-to-end)."""
+    from uuid import uuid4
+
+    from sreda.runtime.planner.persistence import persist_completed_turn
+    from trace_bundle import _load_planner_execution
+
+    tid, rid = _seed_run(db_session)
+    persist_completed_turn(
+        db_session,
+        execution_id=f"pe_{uuid4().hex[:8]}", run_id=rid, tenant_id=tid,
+        feature_key="housewife_assistant", planner_prompt_version=1,
+        planner_provider="inception-mercury2", planner_model="mercury-2",
+        planner_status="valid", execution_status="completed",
+        plan_json={"actions": {"s1": {"tool": "list_reminders", "args": {}}}},
+        execution_log=[{"step_id": "s1", "tool": "list_reminders", "status": "ok",
+                        "parsed_output": {"items": 2}, "raw_output": None}],
+        validation_errors=None,
+        composer_path="template:reminders_list_show",
+    )
+    db_session.expire_all()  # force decrypt path
+
+    loaded = _load_planner_execution(db_session, rid, tid)
+    assert loaded["planner_status"] == "valid"
+    assert loaded["plan_json"] == {"actions": {"s1": {"tool": "list_reminders", "args": {}}}}
+    assert loaded["execution_log_json"][0]["tool"] == "list_reminders"
+    assert loaded["execution_log_json"][0]["parsed_output"] == {"items": 2}
+    assert loaded["composer_path"] == "template:reminders_list_show"
+
+
+def test_persist_completed_turn_invalid_plan(db_session) -> None:
+    """#155: the failure case (invalid plan) — the most valuable for SIA — is
+    persisted: status=invalid, no plan, decrypted validation_errors."""
+    from uuid import uuid4
+
+    from sreda.runtime.planner.persistence import persist_completed_turn
+    from trace_bundle import _load_planner_execution
+
+    tid, rid = _seed_run(db_session)
+    persist_completed_turn(
+        db_session,
+        execution_id=f"pe_{uuid4().hex[:8]}", run_id=rid, tenant_id=tid,
+        feature_key="housewife_assistant", planner_prompt_version=1,
+        planner_provider="inception-mercury2", planner_model="mercury-2",
+        planner_status="invalid", execution_status="pending",
+        plan_json=None, execution_log=[],
+        validation_errors="schema mismatch on s1.args",
+    )
+    db_session.expire_all()
+
+    loaded = _load_planner_execution(db_session, rid, tid)
+    assert loaded["planner_status"] == "invalid"
+    assert loaded["plan_json"] is None
+    assert loaded["validation_errors"] == "schema mismatch on s1.args"
+    assert loaded["execution_log_json"] == []
+
+
 def test_step_without_plan_action_keeps_outcome() -> None:
     # An execution-log step whose node_id is absent from plan.actions still
     # surfaces its status/outcome (tool/args empty) — never dropped.

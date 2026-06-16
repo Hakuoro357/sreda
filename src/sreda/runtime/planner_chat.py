@@ -164,6 +164,47 @@ def _history_snapshots(messages: list[Any], limit: int = 10) -> tuple:
     )
 
 
+def _build_diag_persist_args(
+    plan_result: Any,
+    exec_log: Any,
+    *,
+    run_id: str,
+    tenant_id: str,
+    feature_key: str,
+    planner_provider: str,
+) -> dict[str, Any] | None:
+    """#155: extract ``persist_completed_turn`` kwargs from the planner result +
+    execution log. Returns ``None`` when there's nothing to persist (no
+    ``plan_result`` / no ``execution_id``). PURE — unit-tested with synthetic
+    objects, so the live-path persistence is covered without a full chat harness.
+    """
+    if plan_result is None or not getattr(plan_result, "execution_id", None):
+        return None
+    from dataclasses import asdict
+
+    plan_obj = getattr(plan_result, "plan", None)
+    plan_json = plan_obj.model_dump(mode="json") if plan_obj is not None else None
+    steps: list = []
+    exec_status = "pending"
+    if exec_log is not None:
+        steps = [asdict(s) for s in exec_log.steps]
+        exec_status = exec_log.outcome
+    return {
+        "execution_id": plan_result.execution_id,
+        "run_id": run_id,
+        "tenant_id": tenant_id,
+        "feature_key": feature_key,
+        "planner_prompt_version": 1,
+        "planner_provider": planner_provider,
+        "planner_model": "",
+        "planner_status": "valid" if plan_result.success else "invalid",
+        "execution_status": exec_status,
+        "plan_json": plan_json,
+        "execution_log": steps,
+        "validation_errors": getattr(plan_result, "error_summary", None),
+    }
+
+
 async def run_planner_chat_loop(
     *,
     session: Any,
@@ -203,6 +244,37 @@ async def run_planner_chat_loop(
             successful_tool_counts=counts or {},
             onboarding_resolution_called=False,
         )
+
+    def _persist_diag(plan_result: Any, exec_log: Any) -> None:
+        """#155 (SIA срединный путь): ONE planner_executions row at end of turn
+        (plan + per-step execution), gated by a flag. Own session + commit (like
+        the orchestrator's per-stage writes); NEVER raises — persistence must not
+        break the user-facing reply. Captures valid AND invalid plans (the latter
+        are the most valuable for the feedback loop)."""
+        try:
+            from sreda.config.settings import get_settings
+
+            _st = get_settings()
+            if not _st.planner_persist_executions:
+                return
+            args = _build_diag_persist_args(
+                plan_result, exec_log,
+                run_id=pf.run_id,
+                tenant_id=action.tenant_id,
+                feature_key=pf.feature_key or "housewife_assistant",
+                planner_provider=_st.planner_provider or "",
+            )
+            if args is None:
+                return
+            from sreda.db.session import get_session_factory
+            from sreda.runtime.planner.persistence import persist_completed_turn
+
+            _sf = get_session_factory()
+            with _sf() as _s:
+                persist_completed_turn(_s, **args)
+                _s.commit()
+        except Exception:  # noqa: BLE001 — persistence must NEVER break the turn
+            logger.exception("planner_chat: persist_completed_turn failed")
 
     # --- стадия 1: план -----------------------------------------------------
     try:
@@ -263,6 +335,7 @@ async def run_planner_chat_loop(
     if not plan_result.success or plan_result.execution_plan is None:
         _alert("план", action, plan_result.error_summary or "invalid",
                f"attempts={plan_result.final_attempt_no}")
+        _persist_diag(plan_result, None)  # #155: invalid plan — самое ценное для SIA
         return _result(_render_or(
             "invalid_plan_fallback",
             {"attempt_count": plan_result.final_attempt_no},
@@ -285,6 +358,7 @@ async def run_planner_chat_loop(
         _alert("исполнение", action, type(exc).__name__, str(exc))
         return _result(_fallback_error())
 
+    _persist_diag(plan_result, exec_log)  # #155: план + выполнение (на успехе)
     # called_tools = физически ВЫЗВАННЫЕ инструменты (семантика легаси и
     # стража честности): error/timeout/unknown_outcome/plan_gap — пост-вызовные
     # статусы, запись могла совершиться. Исключаем только до-вызовные
