@@ -347,6 +347,36 @@ def test_persist_completed_turn_invalid_plan(db_session) -> None:
     assert loaded["execution_log_json"] == []
 
 
+def test_persist_encrypted_only_physical_columns(db_session) -> None:
+    """#155 privacy invariant (Codex R1): under encrypted_only the plaintext PII
+    columns are NULL (execution_log_json stays []), real data lives in *_enc."""
+    from uuid import uuid4
+
+    from sreda.db.models import PlannerExecution
+    from sreda.runtime.planner.persistence import persist_completed_turn
+
+    tid, rid = _seed_run(db_session)
+    eid = f"pe_{uuid4().hex[:8]}"
+    persist_completed_turn(
+        db_session, execution_id=eid, run_id=rid, tenant_id=tid,
+        feature_key="hw", planner_prompt_version=1, planner_provider="x",
+        planner_model="", planner_status="valid", execution_status="completed",
+        plan_json={"actions": {"s1": {"tool": "t", "args": {}}}},
+        execution_log=[{"step_id": "s1", "tool": "t", "status": "ok"}],
+        validation_errors="oops",
+    )
+    db_session.expire_all()
+    row = db_session.get(PlannerExecution, eid)
+    # plaintext PII columns NULL / empty
+    assert row.plan_json is None
+    assert row.validation_errors is None
+    assert row.execution_log_json == []  # NOT NULL col → empty, not NULL
+    # *_enc mirrors decrypt to the real data
+    assert row.plan_json_enc == {"actions": {"s1": {"tool": "t", "args": {}}}}
+    assert row.validation_errors_enc == "oops"
+    assert row.execution_log_json_enc == [{"step_id": "s1", "tool": "t", "status": "ok"}]
+
+
 def test_step_without_plan_action_keeps_outcome() -> None:
     # An execution-log step whose node_id is absent from plan.actions still
     # surfaces its status/outcome (tool/args empty) — never dropped.

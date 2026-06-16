@@ -164,6 +164,27 @@ def _history_snapshots(messages: list[Any], limit: int = 10) -> tuple:
     )
 
 
+def _step_to_log(s: Any) -> dict[str, Any]:
+    """JSON-safe execution-log record for ONE step.
+
+    Avoids ``dataclasses.asdict`` — it leaves ``StepResult.selected_compose``
+    (a Pydantic ``ComposerCall``) as a model instance, which ``JSONEncryptedString``
+    cannot ``json.dumps`` → the whole row would silently fail to persist (Codex +
+    subagent R1 CRITICAL). Keeps only the fields the feedback loop / TraceBundle
+    read, model-dumping the one nested Pydantic field.
+    """
+    sc = getattr(s, "selected_compose", None)
+    return {
+        "step_id": getattr(s, "step_id", None),
+        "tool": getattr(s, "tool", None),
+        "status": getattr(s, "status", None),
+        "parsed_output": getattr(s, "parsed_output", None),
+        "raw_output": getattr(s, "raw_output", None),
+        "matched_status": getattr(s, "matched_status", None),
+        "selected_compose": sc.model_dump(mode="json") if sc is not None else None,
+    }
+
+
 def _build_diag_persist_args(
     plan_result: Any,
     exec_log: Any,
@@ -172,36 +193,60 @@ def _build_diag_persist_args(
     tenant_id: str,
     feature_key: str,
     planner_provider: str,
+    planner_prompt_version: int = 1,
+    tool_registry_version: str | None = None,
+    composer_registry_snapshot_hash: str | None = None,
+    execution_status_override: str | None = None,
 ) -> dict[str, Any] | None:
     """#155: extract ``persist_completed_turn`` kwargs from the planner result +
     execution log. Returns ``None`` when there's nothing to persist (no
     ``plan_result`` / no ``execution_id``). PURE — unit-tested with synthetic
     objects, so the live-path persistence is covered without a full chat harness.
+
+    ``composer_path`` is the PLANNED compose target (from ``plan.compose``); the
+    actual fallback-adjusted path chosen during compose is a follow-up (the
+    persist fires before/independently of the compose stage).
     """
     if plan_result is None or not getattr(plan_result, "execution_id", None):
         return None
-    from dataclasses import asdict
-
     plan_obj = getattr(plan_result, "plan", None)
     plan_json = plan_obj.model_dump(mode="json") if plan_obj is not None else None
     steps: list = []
-    exec_status = "pending"
+    exec_status = execution_status_override or "pending"
     if exec_log is not None:
-        steps = [asdict(s) for s in exec_log.steps]
-        exec_status = exec_log.outcome
+        steps = [_step_to_log(s) for s in exec_log.steps]
+        if execution_status_override is None:
+            exec_status = exec_log.outcome
+    # composer_path from the PLANNED compose target (template_id / llm_prompt_key).
+    composer_path: str | None = None
+    compose = getattr(plan_obj, "compose", None) if plan_obj is not None else None
+    if compose is not None:
+        if getattr(compose, "template_id", None):
+            composer_path = f"template:{compose.template_id}"
+        elif getattr(compose, "llm_prompt_key", None):
+            composer_path = f"llm:{compose.llm_prompt_key}"
+    # validity = the SAME live condition the caller branches on (success AND a
+    # built execution_plan) — not success alone (Codex R1 MINOR edge).
+    valid = bool(
+        plan_result.success
+        and getattr(plan_result, "execution_plan", None) is not None
+    )
     return {
         "execution_id": plan_result.execution_id,
         "run_id": run_id,
         "tenant_id": tenant_id,
         "feature_key": feature_key,
-        "planner_prompt_version": 1,
+        "planner_prompt_version": planner_prompt_version,
         "planner_provider": planner_provider,
         "planner_model": "",
-        "planner_status": "valid" if plan_result.success else "invalid",
+        "planner_status": "valid" if valid else "invalid",
         "execution_status": exec_status,
         "plan_json": plan_json,
         "execution_log": steps,
         "validation_errors": getattr(plan_result, "error_summary", None),
+        "composer_path": composer_path,
+        "tool_registry_version": tool_registry_version,
+        "composer_registry_snapshot_hash": composer_registry_snapshot_hash,
     }
 
 
@@ -245,12 +290,15 @@ async def run_planner_chat_loop(
             onboarding_resolution_called=False,
         )
 
-    def _persist_diag(plan_result: Any, exec_log: Any) -> None:
+    def _persist_diag(
+        plan_result: Any, exec_log: Any, *, exec_status_override: str | None = None
+    ) -> None:
         """#155 (SIA срединный путь): ONE planner_executions row at end of turn
         (plan + per-step execution), gated by a flag. Own session + commit (like
         the orchestrator's per-stage writes); NEVER raises — persistence must not
-        break the user-facing reply. Captures valid AND invalid plans (the latter
-        are the most valuable for the feedback loop)."""
+        break the user-facing reply. Captures valid plans, invalid plans, AND
+        executor crashes (``exec_status_override='failed'``) — the failure cases
+        are the most valuable for the feedback loop."""
         try:
             from sreda.config.settings import get_settings
 
@@ -263,6 +311,12 @@ async def run_planner_chat_loop(
                 tenant_id=action.tenant_id,
                 feature_key=pf.feature_key or "housewife_assistant",
                 planner_provider=_st.planner_provider or "",
+                planner_prompt_version=getattr(ctx, "planner_prompt_version", 1),
+                tool_registry_version=getattr(ctx, "tool_registry_version", None),
+                composer_registry_snapshot_hash=getattr(
+                    ctx, "composer_registry_snapshot_hash", None
+                ),
+                execution_status_override=exec_status_override,
             )
             if args is None:
                 return
@@ -270,11 +324,18 @@ async def run_planner_chat_loop(
             from sreda.runtime.planner.persistence import persist_completed_turn
 
             _sf = get_session_factory()
-            with _sf() as _s:
-                persist_completed_turn(_s, **args)
-                _s.commit()
-        except Exception:  # noqa: BLE001 — persistence must NEVER break the turn
-            logger.exception("planner_chat: persist_completed_turn failed")
+            with trace.step("planner.persist"):  # perf timing (Codex R1 MINOR)
+                with _sf() as _s:
+                    persist_completed_turn(_s, **args)
+                    _s.commit()
+        except Exception as exc:  # noqa: BLE001 — persistence must NEVER break the turn
+            # Codex R1 (medium) CRITICAL: do NOT log full exc_info — a SQLAlchemy
+            # bind error can embed plaintext plan/log params (PII before encryption).
+            logger.error(
+                "planner_chat: persist_completed_turn failed type=%s run=%s exec=%s",
+                type(exc).__name__, getattr(pf, "run_id", "?"),
+                getattr(plan_result, "execution_id", "?"),
+            )
 
     # --- стадия 1: план -----------------------------------------------------
     try:
@@ -356,6 +417,8 @@ async def run_planner_chat_loop(
     except Exception as exc:  # noqa: BLE001
         logger.exception("planner_chat: execute stage crashed")
         _alert("исполнение", action, type(exc).__name__, str(exc))
+        # #155: valid plan whose execution crashed — highest-value SIA failure.
+        _persist_diag(plan_result, None, exec_status_override="failed")
         return _result(_fallback_error())
 
     _persist_diag(plan_result, exec_log)  # #155: план + выполнение (на успехе)
