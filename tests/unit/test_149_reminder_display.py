@@ -161,11 +161,29 @@ def test_bymonthday_ordinal_count_multitime_fall_back() -> None:
         "FREQ=WEEKLY;BYDAY=MO;COUNT=10",
         "FREQ=DAILY;BYHOUR=8,12,17",
         "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO",
+        "FREQ=MONTHLY;BYMONTH=1",  # whitelist (R3 M2): BYMONTH not rendered
+        "FREQ=HOURLY;INTERVAL=4;BYHOUR=13",  # constrained sub-hour → not "каждые 4 часа"
+        "FREQ=YEARLY;BYWEEKNO=20",  # exotic BY* must fail closed
     ):
         rem = _rem("rem_" + "0" * 24, "x", datetime(2026, 6, 17, 6, 0, tzinfo=UTC), rrule)
         out = _format_reminder_for_llm(rem, MSK)
         assert "по расписанию" in out, rrule
         assert "FREQ=" not in out and "BYDAY=" not in out, rrule
+
+
+def test_dst_zone_weekly_falls_back() -> None:
+    # Codex R3 M3: in a DST zone a fixed-UTC weekly rule has no invariant local
+    # weekday/time → render the safe fallback, not a specific «по <день>».
+    from zoneinfo import ZoneInfo
+
+    rem = _rem(
+        "rem_" + "9" * 24, "разминка",
+        datetime(2026, 6, 17, 6, 0, tzinfo=UTC),
+        "FREQ=WEEKLY;BYDAY=MO,WE,FR",
+    )
+    out = _format_reminder_for_llm(rem, ZoneInfo("America/New_York"))
+    assert "по расписанию" in out
+    assert "по пн" not in out and "по ср" not in out
 
 
 def test_until_tz_aware_rolls_to_local_day() -> None:

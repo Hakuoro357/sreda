@@ -282,40 +282,66 @@ def _parse_rrule(rrule: str) -> dict[str, str]:
     return parts
 
 
-def _recurrence_phrase(rrule: str, day_delta: int) -> str | None:
+# Only these RRULE keys are understood by the renderers below. ANY other key
+# (BYMONTH, BYMONTHDAY, BYYEARDAY, BYWEEKNO, BYSETPOS, COUNT, …) means the
+# schedule carries semantics we don't render exactly → safe fallback. Whitelist
+# beats blocklist: a new BY* param can't silently slip through (Codex #149 R3 M2).
+_RENDER_SAFE_KEYS = frozenset(
+    {"FREQ", "INTERVAL", "BYDAY", "BYHOUR", "BYMINUTE", "BYSECOND", "WKST", "UNTIL"}
+)
+
+
+def _tz_observes_dst(tz: ZoneInfo, ref: datetime) -> bool:
+    """True if ``tz``'s UTC offset varies across the year (DST). A fixed-UTC
+    recurring rule then has no guaranteed-invariant LOCAL weekday/time, so we
+    must not render a specific weekday (Codex #149 R3 M3). The default
+    Europe/Moscow has no DST since 2014 → renders normally.
+    """
+    try:
+        jan = ref.replace(month=1, day=15).astimezone(tz).utcoffset()
+        jul = ref.replace(month=7, day=15).astimezone(tz).utcoffset()
+        return jan != jul
+    except Exception:  # noqa: BLE001 — unknown → be safe, force fallback
+        return True
+
+
+def _recurrence_phrase(rrule: str, day_delta: int, *, tz_stable: bool) -> str | None:
     """RRULE → short Russian phrase for the COMMON, unambiguous cases; ``None``
     for anything else, so the caller falls back to a safe «по расписанию,
     ближайшее — <next local fire>» that never misrepresents the schedule
-    (Codex #149 R2 M2).
+    (Codex #149 R2/R3 M2).
 
-    ``day_delta`` (local_date − utc_date of next_trigger, ∈ {−1,0,1}) shifts
-    UTC-framed BYDAY into the user's LOCAL weekday: the runtime advances the
-    rule with a UTC dtstart (``rrulestr(dtstart=UTC)``), so BYDAY is UTC and a
-    near-midnight reminder would otherwise show the wrong day (Codex R2 M3).
-    BYHOUR/BYMINUTE are not used for the clock — that comes from next_trigger.
+    ``day_delta`` (local_date − utc_date of next_trigger) shifts UTC-framed
+    BYDAY into the user's LOCAL weekday: the runtime advances the rule with a
+    UTC dtstart, so BYDAY is UTC (Codex R2 M3). ``tz_stable`` is False for DST
+    zones, where that single shift isn't invariant → weekday phrase suppressed
+    (Codex R3 M3). BYHOUR/BYMINUTE are not the clock — that's from next_trigger.
     """
     parts = _parse_rrule(rrule)
+    # Fail closed on any key we don't render exactly (whitelist — R3 M2).
+    if set(parts) - _RENDER_SAFE_KEYS:
+        return None
     freq = parts.get("FREQ", "").upper()
     try:
         interval = int(parts.get("INTERVAL", "1"))
     except ValueError:
         interval = 1
     byday = parts.get("BYDAY", "")
-    # Bail to the safe fallback on anything we don't render EXACTLY: specific
-    # month-days, occurrence caps, ordinal weekdays (1MO), multiple fire-times.
-    if parts.get("BYMONTHDAY") or parts.get("COUNT"):
-        return None
-    if any(ch.isdigit() for ch in byday):  # ordinal BYDAY like 1MO
-        return None
     if "," in parts.get("BYHOUR", "") or "," in parts.get("BYMINUTE", ""):
-        return None
-    # Sub-hour cadences — no weekday, no clock.
+        return None  # multiple fire-times per period
+    if any(ch.isdigit() for ch in byday):
+        return None  # ordinal BYDAY like 1MO
+    # Sub-hour cadences — any BYHOUR/BYMINUTE constrains them → can't say
+    # «каждые N часов» (e.g. HOURLY;INTERVAL=4;BYHOUR=13 is not "каждые 4 часа").
     if freq in ("MINUTELY", "HOURLY"):
+        if parts.get("BYHOUR") or parts.get("BYMINUTE"):
+            return None
         if interval > 1:
             return f"каждые {interval} {_plural_ru(interval, _FREQ_UNIT_RU[freq])}"
         return _FREQ_EVERY1_RU[freq]
-    # Weekly with explicit days (single interval) → LOCAL weekdays.
-    if freq == "WEEKLY" and byday and interval == 1:
+    # Weekly with explicit days → LOCAL weekdays (only when the offset is stable;
+    # DST zones can flip the local weekday/time of a fixed-UTC rule — R3 M3).
+    if freq == "WEEKLY" and byday and interval == 1 and tz_stable:
         idxs = [_BYDAY_INDEX[d] for d in byday.split(",") if d in _BYDAY_INDEX]
         if not idxs:
             return None
@@ -403,9 +429,11 @@ def _format_reminder_for_llm(reminder: Any, tz: ZoneInfo) -> str:
         if not rrule:
             when = f"{date_ru} в {hhmm}"
         else:
-            # day_delta shifts UTC-framed BYDAY into the user's local weekday.
+            # day_delta shifts UTC-framed BYDAY into the user's local weekday;
+            # suppressed in DST zones where the shift isn't invariant (R3 M3).
             day_delta = (local.date() - ts.date()).days
-            phrase = _recurrence_phrase(rrule, day_delta)
+            tz_stable = not _tz_observes_dst(tz, ts)
+            phrase = _recurrence_phrase(rrule, day_delta, tz_stable=tz_stable)
             until = _humanize_until_ru(rrule, tz)
             freq = _parse_rrule(rrule).get("FREQ", "").upper()
             if phrase is None:
