@@ -154,6 +154,105 @@ def test_plan_and_log_as_json_strings_coerced() -> None:
     assert b.steps[0].outcome == {"status": "empty"}
 
 
+def test_step_id_and_parsed_output_fallback() -> None:
+    # Realistic persisted shape: step_id (not node_id) + parsed_output (the
+    # in-memory StepResult field), not "outcome". The join must still work.
+    pe = {
+        "planner_status": "valid",
+        "plan_json": {"actions": {"s1": {"tool": "list_menu", "args": {"x": 1}}}},
+        "execution_log_json": [
+            {"step_id": "s1", "status": "completed", "parsed_output": {"status": "ok"}}
+        ],
+        "validation_errors": None, "composer_path": "", "execution_status": "completed",
+    }
+    b = build_trace_bundle(_raw_diag(planner_execution=pe), decrypt=_ok_decrypt)
+    assert len(b.steps) == 1
+    s = b.steps[0]
+    assert (s.node_id, s.tool, s.args) == ("s1", "list_menu", {"x": 1})
+    assert s.outcome == {"status": "ok"}  # from parsed_output fallback
+
+
+def test_non_dict_log_entries_filtered() -> None:
+    pe = {
+        "planner_status": "valid",
+        "plan_json": {"actions": {"s1": {"tool": "list_menu", "args": {}}}},
+        "execution_log_json": [
+            {"node_id": "s1", "status": "completed", "outcome": {"ok": True}},
+            "garbage",
+            None,
+        ],
+        "validation_errors": None, "composer_path": "", "execution_status": "completed",
+    }
+    b = build_trace_bundle(_raw_diag(planner_execution=pe), decrypt=_ok_decrypt)
+    assert len(b.steps) == 1  # only the dict entry survives
+
+
+def test_planner_execution_as_json_string_coerced() -> None:
+    import json as _json
+
+    pe_str = _json.dumps({
+        "planner_status": "valid",
+        "plan_json": {"actions": {"s1": {"tool": "list_menu", "args": {}}}},
+        "execution_log_json": [{"node_id": "s1", "status": "completed", "outcome": 1}],
+        "validation_errors": None, "composer_path": "", "execution_status": "completed",
+    })
+    b = build_trace_bundle(_raw_diag(planner_execution=pe_str), decrypt=_ok_decrypt)
+    assert b.diag_status == {"plan": "ok", "execution": "ok"}
+    assert b.steps[0].tool == "list_menu"
+
+
+def test_load_planner_execution_reads_encrypted(db_session) -> None:
+    """Prod writes planner PII to the ``*_enc`` mirrors ONLY (encrypted_only);
+    the loader must decrypt them via the ORM. A plaintext SELECT would return
+    NULL (Codex + subagent R1 CRITICAL). Also pins tenant-scope."""
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from sreda.db.models import (
+        AgentRun, AgentThread, PlannerExecution, Tenant, Workspace,
+    )
+    from trace_bundle import _load_planner_execution
+
+    tid = f"tenant_{uuid4().hex[:8]}"
+    wid, thid, rid = (f"ws_{uuid4().hex[:8]}", f"thread_{uuid4().hex[:8]}",
+                      f"run_{uuid4().hex[:8]}")
+    db_session.add(Tenant(id=tid, name="t"))
+    db_session.add(Workspace(id=wid, tenant_id=tid, name="w"))
+    db_session.add(AgentThread(id=thid, tenant_id=tid, workspace_id=wid,
+                               channel_type="telegram", external_chat_id="42"))
+    db_session.add(AgentRun(id=rid, thread_id=thid, tenant_id=tid,
+                            workspace_id=wid, action_type="chat"))
+    # Prod-shaped: plaintext PII NULL, *_enc populated (TypeDecorator encrypts).
+    db_session.add(PlannerExecution(
+        id=f"pe_{uuid4().hex[:8]}", run_id=rid, tenant_id=tid,
+        feature_key="housewife_assistant", planner_prompt_version=1,
+        planner_provider="mimo-v2.5-pro", planner_model="mimo-v2.5-pro",
+        planner_status="valid", execution_status="completed",
+        plan_json=None,
+        plan_json_enc={"actions": {"s1": {"tool": "list_reminders", "args": {}}}},
+        validation_errors=None,
+        execution_log_json=[],
+        execution_log_json_enc=[
+            {"node_id": "s1", "status": "completed", "outcome": {"items": 3}}
+        ],
+        composer_path="template:reminders_list_show",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db_session.flush()
+    db_session.expire_all()  # force reload from DB → exercise the decrypt path
+
+    loaded = _load_planner_execution(db_session, rid, tid)
+    assert loaded["plan_json"] == {
+        "actions": {"s1": {"tool": "list_reminders", "args": {}}}
+    }
+    assert loaded["execution_log_json"] == [
+        {"node_id": "s1", "status": "completed", "outcome": {"items": 3}}
+    ]
+    assert loaded["composer_path"] == "template:reminders_list_show"
+    # wrong tenant → no row (defense-in-depth)
+    assert _load_planner_execution(db_session, rid, "tenant_other") == {}
+
+
 def test_step_without_plan_action_keeps_outcome() -> None:
     # An execution-log step whose node_id is absent from plan.actions still
     # surfaces its status/outcome (tool/args empty) — never dropped.

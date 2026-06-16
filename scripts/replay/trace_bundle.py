@@ -18,8 +18,15 @@ Structure mirrors ``probe_replay_export`` for testability + safety:
     ``planner_executions`` row to each replay raw-turn (runs on the VDS).
 
 PII discipline is inherited from ``probe_replay_export``: ids are SHA-256
-hashed, the tenant is a redacted placeholder, and the assembled bundle is PII
-until redacted — it must live in the quarantine dir and NEVER be committed.
+hashed, the tenant is a redacted placeholder. NOTE the DIAGNOSTIC fields this
+module adds — ``plan_json``, ``steps[].args``, ``steps[].outcome``,
+``validation_errors`` — are themselves raw user PII (reminder titles, recipe
+text, rejected payload snippets; on prod they live ONLY in the encrypted
+``*_enc`` columns). The assembled bundle is therefore PII: any
+serialization/export MUST reuse ``probe_replay_export``'s §15 guards
+(``resolve_quarantine_dir`` / ``safe_output_path`` + ``REPLAY_MODE``) and the
+file must NEVER be committed. v1 has no exporter; a follow-up carries those
+guards into one.
 """
 
 from __future__ import annotations
@@ -189,16 +196,24 @@ def _extract_steps(
     actions = (plan_json or {}).get("actions") or {}
     steps: list[ExecutionStep] = []
     for entry in execution_log:
+        # The persisted execution_log_json shape is NOT yet finalized (no writer
+        # until executor Phase E; persistence currently always stores []). The
+        # in-memory StepResult uses ``step_id`` + ``parsed_output``/``raw_output``
+        # (subagent R1). Accept both id keys and fall back to parsed/raw output
+        # so the join survives whichever shape the future writer emits.
         node_id = str(entry.get("node_id") or entry.get("step_id") or "")
         action = actions.get(node_id) if isinstance(actions, dict) else None
         action = action if isinstance(action, dict) else {}
+        outcome = entry.get("outcome")
+        if outcome is None:
+            outcome = entry.get("parsed_output", entry.get("raw_output"))
         steps.append(
             ExecutionStep(
                 node_id=node_id,
                 tool=str(action.get("tool") or ""),
                 args=dict(action.get("args") or {}),
                 status=str(entry.get("status") or ""),
-                outcome=entry.get("outcome"),
+                outcome=outcome,
             )
         )
     return tuple(steps)
@@ -259,33 +274,57 @@ def build_trace_bundle(
 # ---------------------------------------------------------------------------
 
 
-def _load_planner_execution(session: Any, run_id: str) -> dict[str, Any]:
-    """Latest ``planner_executions`` row for ``run_id`` → dict (or ``{}``).
+def _load_planner_execution(
+    session: Any, run_id: str, tenant_id: str
+) -> dict[str, Any]:
+    """Latest ``planner_executions`` row for ``(run_id, tenant_id)`` → dict.
 
-    Read-only. Picks the most recent row (retries create multiple rows per run).
+    Read-only. Uses the ORM (NOT raw ``text()`` SQL) so the ``*_enc``
+    TypeDecorators decrypt transparently, and the prefer-enc accessor
+    ``read_planner_pii`` — prod writes the planner PII to the ``*_enc`` mirrors
+    ONLY (``_PLANNER_PII_WRITE_MODE="encrypted_only"``), so a plaintext
+    ``SELECT plan_json`` returns NULL and a raw SELECT of ``*_enc`` returns
+    undecrypted ``v2:`` ciphertext (Codex + subagent R1 CRITICAL: the bundle
+    would be blank on every real turn). ``tenant_id``-scoped (defense-in-depth
+    for PII tooling) + ``id`` tiebreak so "latest" is deterministic across
+    same-timestamp retries.
     """
-    from sqlalchemy import text
+    from sqlalchemy import select
 
-    row = session.execute(
-        text(
-            "SELECT planner_status, plan_json, execution_log_json, "
-            "validation_errors, composer_path, execution_status "
-            "FROM planner_executions WHERE run_id = :r "
-            "ORDER BY created_at DESC LIMIT 1"
-        ),
-        {"r": run_id},
-    ).fetchone()
+    from sreda.db.models import PlannerExecution
+    from sreda.runtime.planner.persistence import read_planner_pii
+
+    row = (
+        session.execute(
+            select(PlannerExecution)
+            .where(
+                PlannerExecution.run_id == run_id,
+                PlannerExecution.tenant_id == tenant_id,
+            )
+            .order_by(
+                PlannerExecution.created_at.desc(),
+                PlannerExecution.id.desc(),
+            )
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
     if row is None:
         return {}
-    planner_status, plan_json, execution_log_json, validation_errors, \
-        composer_path, execution_status = row
+    # ``execution_log_json`` is NOT one of read_planner_pii's fields ("no writer
+    # yet"); dual-read its enc mirror directly (JSONEncryptedString decrypts on
+    # ORM access), falling back to the plaintext column for legacy rows.
+    exec_log = row.execution_log_json_enc
+    if exec_log is None:
+        exec_log = row.execution_log_json
     return {
-        "planner_status": planner_status,
-        "plan_json": plan_json,
-        "execution_log_json": execution_log_json,
-        "validation_errors": validation_errors,
-        "composer_path": composer_path,
-        "execution_status": execution_status,
+        "planner_status": row.planner_status,
+        "plan_json": read_planner_pii(row, "plan_json"),
+        "execution_log_json": exec_log,
+        "validation_errors": read_planner_pii(row, "validation_errors"),
+        "composer_path": row.composer_path,
+        "execution_status": row.execution_status,
     }
 
 
@@ -307,6 +346,6 @@ def fetch_diag_turns(
     ):
         run_id = str(raw_turn.get("turn_id") or "")
         raw_turn["planner_execution"] = (
-            _load_planner_execution(session, run_id) if run_id else {}
+            _load_planner_execution(session, run_id, tenant_id) if run_id else {}
         )
         yield raw_turn
