@@ -344,8 +344,8 @@ CANCEL_REMINDER_SPEC = ToolSpec(
         "удали напоминание про кружок",
     ],
     mutex_notes=[
-        "Для полной отмены. In-place правка — update_reminder, не cancel + schedule.",
-        "Сначала list_reminders — получить reminder_id.",
+        "Полная отмена; правка — update_reminder (не cancel+schedule).",
+        "id не угадывай: list_reminders→.only; compose=reminder_cancelled.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
