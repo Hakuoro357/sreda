@@ -4188,8 +4188,11 @@ def _foreign_letter_ratio_below(text: str, threshold: float) -> bool:
     """
     probe = _STRUCTURAL_ASCII_RE.sub(" ", text)
     letters = [c for c in probe if c.isalpha()]
-    if len(letters) < 10:
-        return False
+    if not letters:
+        # No language left after stripping structural tokens — a real Russian
+        # reply always has prose letters, so a digit/url/emoji/punct-only reply
+        # (the caller already gated short text) is predominantly non-Russian.
+        return True
     cyrillic = sum(1 for c in letters if "Ѐ" <= c <= "ӿ")
     return (cyrillic / len(letters)) < threshold
 
