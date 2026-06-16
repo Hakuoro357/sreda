@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Расходы по моделям{% endblock %}
+{% block content %}
+<h2>Расходы по моделям</h2>
+
+<nav style="display: flex; gap: 8px; margin-bottom: 12px;">
+  {% for p, label in [("day", "День"), ("week", "Неделя"), ("month", "Месяц")] %}
+  <a href="/admin/spend-by-model?token={{ token }}&period={{ p }}"
+     role="button" class="{% if period != p %}outline{% endif %}"
+     style="margin: 0; flex: 0 0 auto;">{{ label }}</a>
+  {% endfor %}
+</nav>
+
+<article style="padding: 12px 16px; margin-bottom: 16px;">
+  <strong>≈ Priced subtotal: ${{ "%.4f"|format(report.priced_subtotal_usd) }}</strong>
+  {% if report.upper_subtotal_usd > report.priced_subtotal_usd %}
+    <span class="muted">(без кэша до ${{ "%.4f"|format(report.upper_subtotal_usd) }})</span>
+  {% endif %}
+  <br>
+  <span class="muted">
+    Покрытие:
+    {% if report.coverage_calls_pct is not none %}{{ report.coverage_calls_pct }}% вызовов,
+    {{ report.coverage_tokens_pct }}% токенов{% else %}—{% endif %}
+    с известной ценой.
+    {% if report.unpriced_models %}
+      Без цены ({{ report.unpriced_models | length }}):
+      {% for pk, m in report.unpriced_models %}{{ pk }}/{{ m }}{% if not loop.last %}, {% endif %}{% endfor %}.
+    {% endif %}
+    {% if report.anomaly_count %}<br>⚠ Аномальных строк (отриц. токены): {{ report.anomaly_count }}.{% endif %}
+  </span>
+  <br>
+  <small class="muted">Оценка по текущему прайсу, не бухгалтерия. «%» — от priced subtotal.</small>
+</article>
+
+{% if not report.rows %}
+<p>Нет вызовов за период.</p>
+{% else %}
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Провайдер · Модель</th>
+      <th>Вызовов</th>
+      <th>Токенов (in/out)</th>
+      <th>≈ Стоимость (USD)</th>
+      <th>% от priced</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in report.rows %}
+    <tr>
+      <td>{{ r.provider_key }} · <span class="muted">{{ r.model }}</span></td>
+      <td>{{ "{:,}".format(r.calls) }}</td>
+      <td>{{ "{:,}".format(r.prompt_tokens) }} / {{ "{:,}".format(r.completion_tokens) }}</td>
+      <td>
+        {% if r.est_usd is none %}<span class="muted">—</span>
+        {% elif r.est_usd < 0.0001 %}&lt;$0.0001
+        {% else %}${{ "%.4f"|format(r.est_usd) }}{% endif %}
+        {% if r.upper_usd is not none and r.upper_usd > r.est_usd %}
+          <span class="muted" title="верхняя оценка без кэша">(↑${{ "%.4f"|format(r.upper_usd) }})</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if r.priced and report.priced_subtotal_usd > 0 %}
+          {{ "%.0f"|format(r.est_usd / report.priced_subtotal_usd * 100) }}%
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% endif %}
+{% endblock %}

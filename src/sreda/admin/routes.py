@@ -16,6 +16,7 @@ from sreda.admin.queries import (
     get_all_users,
     get_budget_summary_for_day,
     get_llm_calls,
+    get_spend_by_model,
 )
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
@@ -120,6 +121,36 @@ def admin_budget(
                 if selected < today
                 else None
             ),
+        },
+    )
+
+
+@router.get("/spend-by-model", response_class=HTMLResponse)
+def admin_spend_by_model(
+    request: Request,
+    period: str = Query("month"),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Траты по (provider_key, model) за день/неделю/месяц (MSK).
+
+    ≈USD по ТЕКУЩЕМУ прайсу (`llm_pricing`); беспрайсовые модели → «—». Шапка
+    показывает покрытие (% валидных вызовов/токенов с известной ценой) + список
+    беспрайсовых + число аномалий. Только агрегаты — без текстов сообщений.
+    """
+    if period not in ("day", "week", "month"):
+        period = "month"
+    _audit_admin_view(
+        session, "admin.spend_by_model.viewed", token, request, period=period,
+    )
+    report = get_spend_by_model(session, period)
+    return templates.TemplateResponse(
+        request, "spend_by_model.html",
+        {
+            "token": token,
+            "section": "spend-by-model",
+            "period": period,
+            "report": report,
         },
     )
 
