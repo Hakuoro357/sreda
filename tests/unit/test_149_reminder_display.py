@@ -164,6 +164,8 @@ def test_bymonthday_ordinal_count_multitime_fall_back() -> None:
         "FREQ=MONTHLY;BYMONTH=1",  # whitelist (R3 M2): BYMONTH not rendered
         "FREQ=HOURLY;INTERVAL=4;BYHOUR=13",  # constrained sub-hour → not "каждые 4 часа"
         "FREQ=YEARLY;BYWEEKNO=20",  # exotic BY* must fail closed
+        "FREQ=DAILY;BYHOUR=6;BYMINUTE=0;BYSECOND=30",  # R4: BYSECOND dropped → fallback
+        "FREQ=MINUTELY;BYSECOND=0,30",  # R4: fires 2×/min — not «ежеминутно»
     ):
         rem = _rem("rem_" + "0" * 24, "x", datetime(2026, 6, 17, 6, 0, tzinfo=UTC), rrule)
         out = _format_reminder_for_llm(rem, MSK)
@@ -184,6 +186,21 @@ def test_dst_zone_weekly_falls_back() -> None:
     out = _format_reminder_for_llm(rem, ZoneInfo("America/New_York"))
     assert "по расписанию" in out
     assert "по пн" not in out and "по ср" not in out
+
+
+def test_dst_zone_daily_falls_back() -> None:
+    # Codex R4 M3: a fixed local clock («ежедневно в HH:MM») also drifts across
+    # a DST transition, so daily must fall back in variable-offset zones too.
+    from zoneinfo import ZoneInfo
+
+    rem = _rem(
+        "rem_" + "8" * 24, "вода",
+        datetime(2026, 6, 17, 6, 0, tzinfo=UTC),
+        "FREQ=DAILY",
+    )
+    out = _format_reminder_for_llm(rem, ZoneInfo("America/New_York"))
+    assert "по расписанию" in out
+    assert "ежедневно" not in out
 
 
 def test_until_tz_aware_rolls_to_local_day() -> None:
