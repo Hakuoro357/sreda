@@ -10,7 +10,7 @@
   {% set rep = cost[key] %}
   <article style="flex: 1 1 200px;">
     <strong>{{ label }}</strong><br>
-    ≈ ${{ "%.4f"|format(rep.priced_subtotal_usd) }}<br>
+    ≈ {{ rep.priced_subtotal_usd | usd }}<br>
     <span class="muted">{{ "{:,}".format(rep.rows | sum(attribute='calls')) }} вызовов</span><br>
     <span class="muted">покрытие
       {% if rep.coverage_calls_pct is not none %}{{ rep.coverage_calls_pct }}%{% else %}—{% endif %}</span>
@@ -45,7 +45,7 @@
   {% for tid, name, est, calls in top.by_spend %}
     <tr>
       <td><a href="/admin/tenants/{{ tid }}">{{ name }}</a></td>
-      <td>${{ "%.4f"|format(est) }}</td>
+      <td>{{ est | usd }}</td>
       <td>{{ "{:,}".format(calls) }}</td>
     </tr>
   {% else %}<tr><td class="muted">— нет priced-трат —</td></tr>{% endfor %}

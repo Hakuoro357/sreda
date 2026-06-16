@@ -12,7 +12,7 @@
 
 {% macro spend_block(title, rep) %}
 <article style="margin-bottom: 16px;">
-  <h4 style="margin-bottom: 6px;">{{ title }}: ≈${{ "%.4f"|format(rep.priced_subtotal_usd) }}
+  <h4 style="margin-bottom: 6px;">{{ title }}: ≈{{ rep.priced_subtotal_usd | usd }}
     {% if rep.coverage_calls_pct is not none and rep.coverage_calls_pct < 100 %}
       <span class="muted">(покрытие {{ rep.coverage_calls_pct }}%)</span>
     {% endif %}

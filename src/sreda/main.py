@@ -163,7 +163,21 @@ def create_app() -> FastAPI:
                 # Bootstrap через ?token= на GET → 303 на ТОТ ЖЕ URL без token
                 # (cookie уже ставим ниже), чтобы токен не остался в адресной
                 # строке/истории/access-логах после первого входа (Codex R3).
-                if request.method == "GET" and "token" in request.query_params:
+                # ВАЖНО (Codex R4): редиректим на чистый URL ТОЛЬКО в secure-
+                # контексте (HTTPS либо localhost). Иначе Secure-cookie не уйдёт
+                # обратно по plain-HTTP → чистый URL отдаст 401 и вход по токену
+                # сломается. На plain-HTTP оставляем token в URL (его прикрывают
+                # no-referrer + no-store выше). Прод — HTTPS (admin.sredaspace.ru).
+                _host = request.url.hostname or ""
+                _secure_ctx = (
+                    request.url.scheme == "https"
+                    or _host in ("localhost", "127.0.0.1")
+                )
+                if (
+                    request.method == "GET"
+                    and "token" in request.query_params
+                    and _secure_ctx
+                ):
                     from urllib.parse import urlencode
 
                     from starlette.responses import RedirectResponse

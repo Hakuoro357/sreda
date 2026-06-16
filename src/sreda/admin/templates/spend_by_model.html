@@ -12,9 +12,9 @@
 </nav>
 
 <article style="padding: 12px 16px; margin-bottom: 16px;">
-  <strong>≈ Priced subtotal: ${{ "%.4f"|format(report.priced_subtotal_usd) }}</strong>
+  <strong>≈ Priced subtotal: {{ report.priced_subtotal_usd | usd }}</strong>
   {% if report.upper_subtotal_usd > report.priced_subtotal_usd %}
-    <span class="muted">(без кэша до ${{ "%.4f"|format(report.upper_subtotal_usd) }})</span>
+    <span class="muted">(без кэша до {{ report.upper_subtotal_usd | usd }})</span>
   {% endif %}
   <br>
   <span class="muted">

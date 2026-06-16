@@ -32,13 +32,18 @@ templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 
 
 def _fmt_usd(value) -> str:
-    """#150: деньги для UI. None → «—»; <$0.0001 → «<$0.0001»; иначе $X.XXXX.
-    Централизует формат — никаких Decimal<float сравнений в шаблонах (Codex MAJOR)."""
+    """#150: деньги для UI. None → «—»; точный $0 → «$0.0000»;
+    0<v<$0.0001 → «<$0.0001»; иначе $X.XXXX.
+    Централизует формат — никаких Decimal<float сравнений в шаблонах (Codex MAJOR).
+    Точный ноль отделён от микросумм (Codex R4): пустой период показывает честный
+    $0.0000, а не вводящее в заблуждение «<$0.0001»."""
     from decimal import Decimal as _D
 
     if value is None:
         return "—"
     v = value if isinstance(value, _D) else _D(str(value))
+    if v == 0:
+        return "$0.0000"
     if v < _D("0.0001"):
         return "<$0.0001"
     return f"${v:.4f}"

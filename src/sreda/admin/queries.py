@@ -433,7 +433,8 @@ class LLMCallsPage:
     per_page: int
     total_pages: int
     tenant_name: str
-    feature_key: str
+    tenant_id: str
+    feature_key: str | None   # None → показаны все фичи тенанта (#150)
 
 
 def get_llm_calls(
@@ -490,6 +491,7 @@ def get_llm_calls(
         per_page=per_page,
         total_pages=total_pages,
         tenant_name=tenants.get(tenant_id, tenant_id),
+        tenant_id=tenant_id,
         feature_key=feature_key,
     )
 
