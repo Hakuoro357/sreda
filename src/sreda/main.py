@@ -144,6 +144,19 @@ def create_app() -> FastAPI:
     app.include_router(approvals_router)
     feature_registry.register_api(app)
     app.state.feature_registry = feature_registry
+
+    @app.middleware("http")
+    async def _admin_security_headers(request, call_next):
+        # #150 CRITICAL-митигейт (token-в-URL): на ВСЕХ /admin-ответах no-referrer
+        # (токен не утечёт через Referer при переходе) + no-store (token-bearing
+        # страницы не кэшируются прокси/браузером). Полный уход от token-в-URL —
+        # отдельный owner-gated срез (cookie-auth).
+        response = await call_next(request)
+        if request.url.path.startswith("/admin"):
+            response.headers.setdefault("Referrer-Policy", "no-referrer")
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
     return app
 
 
