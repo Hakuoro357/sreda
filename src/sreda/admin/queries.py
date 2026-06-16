@@ -186,6 +186,10 @@ class BudgetRow:
     period_start: str
     period_end: str
     last_used_at: str
+    # #150: ≈стоимость USD (priced subtotal по моделям строки) + покрытие.
+    # None — нет ни одной priced-модели в строке (mixed обрабатывается покрытием).
+    est_usd: Decimal | None = None
+    cost_coverage_pct: int | None = None
 
 
 def get_budget_summary(session: Session) -> list[BudgetRow]:
@@ -302,6 +306,34 @@ def get_budget_summary_for_day(
 
     day_start_utc, day_end_utc = _msk_day_window_utc(for_date)
 
+    # #150: карта стоимости за день, ОДНИМ запросом по
+    # (tenant, feature, provider, model) — без N+1 на строку бюджета.
+    cost_map: dict[tuple[str, str], list[tuple[str, str, int, int, int]]] = {}
+    for tid, fkey, pk, model, c_calls, c_prompt, c_completion in (
+        session.query(
+            SkillAIExecution.tenant_id,
+            SkillAIExecution.feature_key,
+            SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+        )
+        .filter(
+            SkillAIExecution.created_at >= day_start_utc,
+            SkillAIExecution.created_at < day_end_utc,
+            _VALID_TOKENS,
+        )
+        .group_by(
+            SkillAIExecution.tenant_id, SkillAIExecution.feature_key,
+            SkillAIExecution.provider_key, SkillAIExecution.model,
+        )
+        .all()
+    ):
+        cost_map.setdefault((tid, fkey), []).append(
+            (pk or "", model or "", int(c_calls), int(c_prompt), int(c_completion))
+        )
+
     rows_with_sort: list[tuple[datetime | None, BudgetRow]] = []
     for sub, plan in active_subs:
         q = session.query(
@@ -332,6 +364,22 @@ def get_budget_summary_for_day(
                 int(credits_used) / plan.credits_monthly_quota * 100, 1
             )
 
+        # #150: ≈стоимость строки = priced subtotal по её (provider, model).
+        _est = Decimal("0")
+        _has_priced = False
+        _priced_calls = _row_calls = 0
+        for _pk, _model, _c, _p, _comp in cost_map.get(
+            (sub.tenant_id, plan.feature_key), []
+        ):
+            _row_calls += _c
+            _ce = cost_estimate(_pk, _model, prompt_tokens=_p, completion_tokens=_comp)
+            if _ce is not None:
+                _est += _ce.est_usd
+                _has_priced = True
+                _priced_calls += _c
+        _est_usd = _est if _has_priced else None
+        _cost_cov = round(_priced_calls * 100 / _row_calls) if _row_calls else None
+
         rows_with_sort.append((
             last_used_dt,
             BudgetRow(
@@ -347,6 +395,8 @@ def get_budget_summary_for_day(
                 period_start=_fmt_dt(day_start_utc),
                 period_end=_fmt_dt(day_end_utc),
                 last_used_at=_fmt_dt(last_used_dt),
+                est_usd=_est_usd,
+                cost_coverage_pct=_cost_cov,
             ),
         ))
     _SENTINEL_OLD = datetime.min.replace(tzinfo=timezone.utc)

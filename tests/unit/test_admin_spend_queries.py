@@ -122,3 +122,33 @@ def test_spend_priced_unpriced_anomaly(session) -> None:
     assert rep.coverage_calls_pct is not None
     # прошлый месяц не попал
     assert all(r.prompt_tokens != 999 for r in rep.rows)
+
+
+def test_budget_row_usd_and_coverage(session) -> None:
+    from datetime import date, timedelta
+
+    from sreda.admin.queries import get_budget_summary_for_day
+    from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+
+    session.add(SubscriptionPlan(
+        id="plan_x", plan_key="hw_base", feature_key="housewife_assistant",
+        title="HW", description="", price_rub=500, credits_monthly_quota=1_000_000,
+    ))
+    _now = datetime.now(UTC)
+    session.add(TenantSubscription(
+        id="sub_x", tenant_id="t1", plan_id="plan_x", feature_key="housewife_assistant",
+        status="active", starts_at=_now - timedelta(days=10),
+        active_until=_now + timedelta(days=10),
+    ))
+    in_win = datetime(2026, 6, 16, 10, 0, tzinfo=UTC)
+    _exec(session, provider_key="inception-mercury2", model="mercury-2",
+          prompt=40000, completion=600, created=in_win)          # priced
+    _exec(session, provider_key="mimo-v2.5-pro", model="mimo-v2.5-pro",
+          prompt=500, completion=50, created=in_win)             # unpriced
+    session.commit()
+
+    rows = get_budget_summary_for_day(session, date(2026, 6, 16))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.est_usd is not None and r.est_usd > 0          # Mercury priced
+    assert r.cost_coverage_pct == 50                        # 1 priced из 2 вызовов
