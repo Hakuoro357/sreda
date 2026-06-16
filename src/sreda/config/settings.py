@@ -384,6 +384,19 @@ class Settings(BaseSettings):
             "the composer.)"
         ),
     )
+    planner_persist_executions: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "SREDA_PLANNER_PERSIST_EXECUTIONS",
+            "sreda_planner_persist_executions",
+        ),
+        description=(
+            "#155 (SIA): when True, the live planner path writes ONE "
+            "planner_executions row at end of turn (plan + per-step execution "
+            "log) for the offline feedback loop. Default off; enabled per "
+            "rollout on the internal planner tenants."
+        ),
+    )
     planner_verbose_log: bool = Field(
         default=True,
         validation_alias=AliasChoices(

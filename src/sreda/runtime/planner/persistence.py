@@ -371,6 +371,77 @@ def insert_pending(
     session.flush()
 
 
+def persist_completed_turn(
+    session: Session,
+    *,
+    execution_id: str,
+    run_id: str,
+    tenant_id: str,
+    feature_key: str,
+    planner_prompt_version: int,
+    planner_provider: str,
+    planner_model: str,
+    planner_status: str,
+    execution_status: str,
+    plan_json: dict | None,
+    execution_log: list,
+    validation_errors: str | None,
+    composer_path: str | None = None,
+    tool_registry_version: str | None = None,
+    composer_registry_snapshot_hash: str | None = None,
+) -> None:
+    """#155 (SIA срединный путь): ONE write at end of a planner turn.
+
+    Captures the planner diagnostic (validated plan, per-step execution log,
+    statuses) for the offline SIA feedback loop in a SINGLE INSERT — no pre-LLM
+    ``insert_pending`` row, because crash-recovery isn't needed for an offline
+    read loop. PII (plan / execution log / validation errors) goes through the
+    configured write mode (``encrypted_only`` on prod → ``*_enc`` only).
+
+    Caller MUST wrap this in try/except: persistence failures must NEVER break
+    the user-facing turn.
+    """
+    row = PlannerExecution(
+        id=execution_id,
+        run_id=run_id,
+        tenant_id=tenant_id,
+        feature_key=feature_key,
+        planner_prompt_version=planner_prompt_version,
+        planner_provider=planner_provider,
+        planner_model=planner_model,
+        planner_status=planner_status,
+        execution_status=execution_status,
+        composer_path=composer_path,
+        tool_registry_version=tool_registry_version,
+        composer_registry_snapshot_hash=composer_registry_snapshot_hash,
+        execution_log_json=[],  # overwritten below per write-mode (NOT NULL col)
+        created_at=datetime.now(timezone.utc),
+    )
+    # plan_json / validation_errors are nullable → standard prefer-enc helper.
+    _write_pii(
+        row, plain_attr="plan_json", enc_attr="plan_json_enc", value=plan_json
+    )
+    _write_pii(
+        row, plain_attr="validation_errors",
+        enc_attr="validation_errors_enc", value=validation_errors,
+    )
+    # execution_log_json is NOT NULL (default []), so encrypted_only can't NULL
+    # the plaintext column — keep it [] and put the real (PII) log in the enc
+    # mirror. read_planner_pii / TraceBundle prefer the enc value.
+    _mode = _PLANNER_PII_WRITE_MODE
+    if _mode == "plaintext_only":
+        row.execution_log_json = list(execution_log)
+        row.execution_log_json_enc = None
+    elif _mode == "dual_write":
+        row.execution_log_json = list(execution_log)
+        row.execution_log_json_enc = list(execution_log)
+    else:  # encrypted_only (prod): plaintext empty, real data in enc mirror
+        row.execution_log_json = []
+        row.execution_log_json_enc = list(execution_log)
+    session.add(row)
+    session.flush()
+
+
 def mark_received(
     session: Session,
     *,
