@@ -107,6 +107,8 @@ async def test_planner_and_rot_usage_recorded(session, monkeypatch) -> None:
     )
 
     rows = session.query(SkillAIExecution).filter_by(tenant_id="t-rec").all()
+    # РОВНО 2 строки — ловит двойную запись/дубли (Codex R1 MINOR).
+    assert len(rows) == 2, f"ожидаем ровно 2 строки usage, получили {len(rows)}"
     by_provider = {r.provider_key: r for r in rows}
 
     assert "inception-mercury2" in by_provider, "нет строки usage планировщика"
@@ -114,8 +116,10 @@ async def test_planner_and_rot_usage_recorded(session, monkeypatch) -> None:
     assert planner_row.prompt_tokens == 1500
     assert planner_row.completion_tokens == 120
     assert planner_row.model == "mercury-2"
+    assert planner_row.task_type == "planner.plan"
 
     assert "openrouter-gemini-2.5-flash-lite" in by_provider, "нет строки usage рта"
     rot_row = by_provider["openrouter-gemini-2.5-flash-lite"]
     assert rot_row.prompt_tokens == 800
     assert rot_row.completion_tokens == 60
+    assert rot_row.task_type == "composer.voice"

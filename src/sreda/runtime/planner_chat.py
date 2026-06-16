@@ -178,10 +178,16 @@ def _record_usage_safe(
 ) -> None:
     """#151: best-effort запись ОДНОЙ строки usage в skill_ai_executions.
 
-    Учёт НИКОГДА не валит ход (try/except + rollback). Пропускаем, если нет
-    сессии (юнит-швы) или нулевые токены. provider_key пишем настоящий
-    (планировщик: inception-mercury2 и т.п.; рот: openrouter-…), чтобы
-    админка денег атрибутировала траты по модели."""
+    Учёт НИКОГДА не валит ход. Пропускаем, если нет сессии (юнит-швы) или
+    нулевые токены. provider_key пишем настоящий (планировщик: inception-mercury2
+    и т.п.; рот: openrouter-…), чтобы админка денег атрибутировала траты по модели.
+
+    Изоляция транзакции (Codex R1 MAJOR): пишем В SAVEPOINT (`begin_nested`),
+    БЕЗ commit/rollback общей session хода. При сбое откатывается ТОЛЬКО эта
+    строка (savepoint), pending-состояние хода (preflight/инструменты/agent_run)
+    НЕ трогается. Персист — общим commit хода (finalize_chat_reply), как и
+    остальное состояние turn-а; отдельный commit здесь зафиксировал/откатил бы
+    чужие изменения раньше границы хода."""
     if session is None:
         return
     if (prompt_tokens or 0) <= 0 and (completion_tokens or 0) <= 0:
@@ -191,25 +197,21 @@ def _record_usage_safe(
     try:
         from sreda.services.budget import BudgetService
 
-        BudgetService(session).record_llm_usage(
-            tenant_id=tenant_id,
-            feature_key=feature_key or "housewife_assistant",
-            model=model or provider_key,
-            prompt_tokens=max(prompt_tokens or 0, 0),
-            completion_tokens=max(completion_tokens or 0, 0),
-            run_id=run_id,
-            provider_key=provider_key,
-            task_type=task_type,
-        )
-        session.commit()
+        with session.begin_nested():  # SAVEPOINT — откат только этой строки
+            BudgetService(session).record_llm_usage(
+                tenant_id=tenant_id,
+                feature_key=feature_key or "housewife_assistant",
+                model=model or provider_key,
+                prompt_tokens=max(prompt_tokens or 0, 0),
+                completion_tokens=max(completion_tokens or 0, 0),
+                run_id=run_id,
+                provider_key=provider_key,
+                task_type=task_type,
+            )
     except Exception:  # noqa: BLE001 — учёт не валит ответ пользователю
         logger.warning(
             "planner_chat: usage record failed (%s)", task_type, exc_info=True,
         )
-        try:
-            session.rollback()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 async def run_planner_chat_loop(
