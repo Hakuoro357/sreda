@@ -248,15 +248,44 @@ async def _process_approved_turn_locked(
                 )
 
         try:
-            await handle_telegram_interaction(
-                bg_session,
-                bot_key=bot_key,
-                payload=payload,
-                telegram_client=telegram_client,
-                onboarding=onboarding,
-                inbound_message_id=inbound_message_id,
-                ack_progress_controller=ack_progress_controller,
-            )
+            # #66 ГЕЙТ-эксперимент: для тенантов из react_loop_enabled_tenants
+            # текстовые ходы идут через новый LangGraph ReAct+interrupt-цикл
+            # (InMemory checkpointer, single-process поллер). Остальные тенанты
+            # и не-текстовые сообщения — прежним путём (нулевой регресс).
+            _react_text = message.get("text") if isinstance(message, dict) else None
+            if (
+                message_type == "text"
+                and _react_text
+                and not onboarding.is_new_user
+                and onboarding.tenant_id in get_settings().react_loop_enabled_tenants
+            ):
+                from sreda.runtime import react_loop
+                from sreda.services.llm import get_chat_llm
+
+                _s = get_settings()
+                _llm = get_chat_llm(provider=_s.planner_provider, settings=_s)
+                _reply = await react_loop.handle_turn(
+                    session=bg_session,
+                    tenant_id=onboarding.tenant_id,
+                    user_id=onboarding.user_id,
+                    thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
+                    llm=_llm,
+                    user_text=_react_text,
+                )
+                trace.record("react_loop.replied", chars=len(_reply or ""))
+                await telegram_client.send_message(
+                    chat_id=str(onboarding.chat_id), text=_reply,
+                )
+            else:
+                await handle_telegram_interaction(
+                    bg_session,
+                    bot_key=bot_key,
+                    payload=payload,
+                    telegram_client=telegram_client,
+                    onboarding=onboarding,
+                    inbound_message_id=inbound_message_id,
+                    ack_progress_controller=ack_progress_controller,
+                )
         except TelegramDeliveryError as exc:
             logger.warning(
                 "Telegram delivery failed during turn processing: %s", exc,

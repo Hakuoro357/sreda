@@ -347,6 +347,19 @@ class Settings(BaseSettings):
             "sreda_planner_enabled_tenants",
         ),
     )
+    react_loop_enabled_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_LOOP_ENABLED_TENANTS",
+            "sreda_react_loop_enabled_tenants",
+        ),
+        description=(
+            "#66 gated experiment: tenants routed to the new LangGraph "
+            "ReAct+interrupt conversational loop (InMemory checkpointer, no "
+            "PII at rest). Empty (default) → nobody; everyone stays on the "
+            "existing inline path (zero regression)."
+        ),
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -762,6 +775,15 @@ class Settings(BaseSettings):
         Empty set → everyone stays on legacy ReAct (current behaviour).
         """
         raw = self.planner_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_loop_enabled_tenants(self) -> frozenset[str]:
+        """#66: tenants on the new ReAct+interrupt conversational loop (gated
+        experiment). Empty (default) → nobody; everyone on the existing path."""
+        raw = self.react_loop_enabled_tenants_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())
