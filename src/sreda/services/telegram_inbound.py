@@ -226,11 +226,23 @@ async def _process_approved_turn_locked(
         else:
             trace.record("webhook.received", type="unknown")
 
+        # #66 ГЕЙТ решаем ДО ack: для react-ходов индикатор «печатает» НЕ создаём
+        # (react отвечает сам через send_message, мимо outbox — иначе ack завис бы
+        # / возможны двойные сообщения; Codex MAJOR).
+        _react_text = message.get("text") if isinstance(message, dict) else None
+        _use_react = (
+            message_type == "text"
+            and bool(_react_text)
+            and not onboarding.is_new_user
+            and onboarding.tenant_id in get_settings().react_loop_enabled_tenants
+        )
+
         ack_task: asyncio.Task | None = None
         ack_progress_controller = None
         if (
             message_type in ("text", "voice")
             and not onboarding.is_new_user
+            and not _use_react
         ):
             ack_text = pick_ack()
             ack_task = _create_task(
@@ -248,17 +260,10 @@ async def _process_approved_turn_locked(
                 )
 
         try:
-            # #66 ГЕЙТ-эксперимент: для тенантов из react_loop_enabled_tenants
-            # текстовые ходы идут через новый LangGraph ReAct+interrupt-цикл
-            # (InMemory checkpointer, single-process поллер). Остальные тенанты
-            # и не-текстовые сообщения — прежним путём (нулевой регресс).
-            _react_text = message.get("text") if isinstance(message, dict) else None
-            if (
-                message_type == "text"
-                and _react_text
-                and not onboarding.is_new_user
-                and onboarding.tenant_id in get_settings().react_loop_enabled_tenants
-            ):
+            # #66 ГЕЙТ-эксперимент: тенант из react_loop_enabled_tenants + текст →
+            # новый LangGraph ReAct+interrupt-цикл (InMemory, single-process
+            # поллер). Остальные тенанты/не-текст — прежним путём (нулевой регресс).
+            if _use_react:
                 from sreda.runtime import react_loop
                 from sreda.services.llm import get_chat_llm
 

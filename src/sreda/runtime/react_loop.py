@@ -36,7 +36,12 @@ logger = logging.getLogger("sreda.react_loop")
 # свежекомпилированных графов (Codex Q1) — имена узлов/каналов обязаны совпадать.
 _TOPOLOGY_VERSION = "react-v1:chat,tools"
 _CHECKPOINTER = InMemorySaver()  # singleton на процесс
-_PENDING_TS: dict[str, datetime] = {}  # thread_id → когда поставлен interrupt (TTL)
+# Единый источник правды о паузе — сам checkpoint (snap.next + snap.created_at),
+# как в wassim249 (без параллельного словаря → нечему рассинхронизироваться).
+# _THREAD_GEN — лишь СЕЛЕКТОР поколения thread_id: поднимаем при протухшем
+# pending или ошибке, чтобы свежий ход шёл на ЧИСТЫЙ тред, а не приклеился к
+# старой паузе (Codex CRITICAL 2026-06-17).
+_THREAD_GEN: dict[str, int] = {}
 _PENDING_TTL_SECONDS = 300  # 5 минут (решение владельца)
 
 _MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -115,9 +120,11 @@ def build_reminder_tools(session: Any, tenant_id: str, user_id: str) -> list:
         decision = interrupt(f"Точно удалить «{title} — {_fmt(when)}»?")
         if not _is_yes(str(decision)):
             return f"Хорошо, не удаляю «{title}». Скажи, какое тогда."
-        # перечитываем заново (узел перевыполнился) — мутация ПОСЛЕ interrupt
+        # Перечитываем заново (узел перевыполнился) — мутация ПОСЛЕ interrupt.
+        # tenant/user-guard ВПЛОТНУЮ к мутации (Codex MAJOR: не только до паузы).
         r2 = session.get(FamilyReminder, reminder_ref)
-        if r2 is None or r2.status != "pending":
+        if (r2 is None or r2.tenant_id != tenant_id or r2.user_id != user_id
+                or r2.status != "pending"):
             return f"Напоминание «{title}» уже неактивно."
         r2.status = "cancelled"
         session.commit()
@@ -157,45 +164,70 @@ def _build_graph(llm_with_tools: Any, tools_by_name: dict):
 
 def _scrub_ids(text: str) -> str:
     import re
-    return re.sub(r"\bref=\S+|\brem_[0-9a-f]+", "", text or "").strip()
+    # ref=/id=/rem_<hex> не должны утечь пользователю в финальном тексте.
+    return re.sub(r"\bref=\S+|\bid=\S+|\brem_[0-9a-f]+", "", text or "").strip()
+
+
+def _interrupt_age_seconds(created_at: Any) -> float:
+    """Возраст текущего снимка checkpoint (для TTL) — из САМОГО снимка (единый
+    источник, без параллельного словаря). 0 при невозможности разобрать."""
+    if not created_at:
+        return 0.0
+    try:
+        ts = (created_at if isinstance(created_at, datetime)
+              else datetime.fromisoformat(str(created_at).replace("Z", "+00:00")))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _pending_question(snap: Any) -> str:
+    if snap.tasks and snap.tasks[0].interrupts:
+        return str(snap.tasks[0].interrupts[0].value)
+    return ""
 
 
 async def handle_turn(
     *, session: Any, tenant_id: str, user_id: str, thread_id: str,
     llm: Any, user_text: str,
 ) -> str:
-    """ВХОД нового цикла на одно входящее сообщение. Решает resume-vs-свежий по
-    состоянию графа этого треда; возвращает текст пользователю (вопрос или финал).
-    НИКОГДА не поднимает исключений — при сбое отдаёт безопасный fallback."""
+    """ВХОД нового цикла на одно входящее сообщение. Источник правды о паузе —
+    сам checkpoint (snap.next + snap.created_at), как в wassim249. Поколение
+    thread_id поднимаем только при протухшем pending или ошибке. НИКОГДА не
+    поднимает исключений — при сбое отдаёт безопасный fallback."""
+    base = thread_id
+    gen = _THREAD_GEN.get(base, 0)
+
+    def _cfg(g: int) -> dict:
+        return {"configurable": {"thread_id": f"{base}#{g}"}}
+
     try:
         tools = build_reminder_tools(session, tenant_id, user_id)
         graph = _build_graph(llm.bind_tools(tools), {t.name: t for t in tools})
-        cfg = {"configurable": {"thread_id": thread_id}}
 
-        snap = await graph.aget_state(cfg)
-        # TTL: протухший pending → начинаем свежий ход (Codex Q3).
-        ts = _PENDING_TS.get(thread_id)
-        stale = bool(ts and (datetime.now(timezone.utc) - ts).total_seconds() > _PENDING_TTL_SECONDS)
-        resuming = bool(snap.next) and not stale
+        snap = await graph.aget_state(_cfg(gen))
+        live_pause = bool(snap.next) and _interrupt_age_seconds(snap.created_at) <= _PENDING_TTL_SECONDS
 
-        if resuming:
-            result = await graph.ainvoke(Command(resume=user_text), cfg)
+        if live_pause:  # живое уточнение → возобновляем тем же поколением
+            result = await graph.ainvoke(Command(resume=user_text), _cfg(gen))
         else:
-            if stale:
-                _PENDING_TS.pop(thread_id, None)
-            result = await graph.ainvoke({"messages": [HumanMessage(user_text)]}, cfg)
+            # свежий ход. Если на этом поколении осталась ПРОТУХШАЯ пауза —
+            # поднимаем поколение, чтобы свежий ход не приклеился к ней.
+            if snap.next:
+                gen += 1
+                _THREAD_GEN[base] = gen
+            result = await graph.ainvoke({"messages": [HumanMessage(user_text)]}, _cfg(gen))
 
-        snap = await graph.aget_state(cfg)
+        snap = await graph.aget_state(_cfg(gen))
         if snap.next:  # снова пауза → отдать вопрос пользователю
-            _PENDING_TS[thread_id] = datetime.now(timezone.utc)
-            q = snap.tasks[0].interrupts[0].value if snap.tasks and snap.tasks[0].interrupts else ""
-            return _scrub_ids(str(q)) or "Уточни, пожалуйста."
-        _PENDING_TS.pop(thread_id, None)
+            return _scrub_ids(_pending_question(snap)) or "Уточни, пожалуйста."
         last = result["messages"][-1] if result.get("messages") else None
         text = (getattr(last, "content", "") or "").strip() if isinstance(last, AIMessage) else ""
         return _scrub_ids(text) or "Готово."
-    except Exception:  # noqa: BLE001 — цикл не должен ронять ход
-        logger.exception("react_loop: handle_turn failed thread=%s", thread_id)
-        _PENDING_TS.pop(thread_id, None)
+    except Exception:  # noqa: BLE001 — цикл не должен ронять ход; без ПД в логе
+        logger.exception("react_loop: handle_turn failed (gen=%s)", gen)
+        _THREAD_GEN[base] = gen + 1  # бросаем поколение → следующий ход на чистом треде
         return ("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
                 "что нужно сделать.")
