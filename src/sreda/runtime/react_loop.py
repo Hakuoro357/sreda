@@ -485,6 +485,36 @@ def _scrub_ids(text: str) -> str:
     return t.strip()
 
 
+def _format_lists(text: str) -> str:
+    """Детерминированный пост-формат: скомканный в ОДНУ строку список (≥3 пунктов через
+    « — ») разбиваем построчно. Промпт ненадёжен на длинных списках (Mercury комкает) —
+    это страховка. КОНСЕРВАТИВНО: триггер только при ≥2 разделителях « — » в строке, чтобы
+    НЕ задеть «— название — время» напоминаний (там 1 тире) и обычный текст с одним тире."""
+    out: list[str] = []
+    for ln in (text or "").split("\n"):
+        if ln.count(" — ") < 2:
+            out.append(ln)
+            continue
+        stripped = ln.lstrip()
+        if stripped.startswith("—"):
+            intro, seg = None, stripped
+        elif ":" in ln:
+            head, _, tail = ln.partition(":")
+            intro, seg = head + ":", tail.strip()
+        else:
+            out.append(ln)
+            continue
+        items = [p.strip().lstrip("—").strip() for p in seg.split(" — ")]
+        items = [i for i in items if i]
+        if len(items) < 3:  # подстраховка: не дробим «title — time»-подобное
+            out.append(ln)
+            continue
+        if intro:
+            out.append(intro)
+        out.extend("— " + i for i in items)
+    return "\n".join(out)
+
+
 def _interrupt_age_seconds(created_at: Any) -> float:
     """Возраст текущего снимка checkpoint (TTL). FAIL-CLOSED: при отсутствии/невалидности
     created_at → inf (недатированную паузу НЕ возобновляем, ротируем поколение)."""
@@ -562,10 +592,10 @@ async def handle_turn(
 
         snap = await graph.aget_state(_cfg(gen))
         if snap.next:  # снова пауза → отдать вопрос пользователю
-            return _scrub_ids(_pending_question(snap)) or "Уточни, пожалуйста."
+            return _format_lists(_scrub_ids(_pending_question(snap))) or "Уточни, пожалуйста."
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
-        return _scrub_ids(text) or "Готово."
+        return _format_lists(_scrub_ids(text)) or "Готово."
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s",

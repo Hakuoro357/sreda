@@ -141,6 +141,29 @@ def test_scrub_ids_strips_internal_keeps_text():
     assert _scrub_ids("видеоидентификатор и рефлекс") == "видеоидентификатор и рефлекс"
 
 
+def test_format_lists_breaks_crammed_keeps_rest():
+    """Пост-формат: скомканный список → построчно; «— название — время» (1 тире)
+    и обычный текст НЕ трогаем."""
+    from sreda.runtime.react_loop import _format_lists
+
+    inp = "Вот твой список покупок:\n— молоко — хлеб (1) — яйца — мёд (1 банка)"
+    assert _format_lists(inp) == (
+        "Вот твой список покупок:\n— молоко\n— хлеб (1)\n— яйца\n— мёд (1 банка)"
+    ), repr(_format_lists(inp))
+    # напоминание «— название — время» (1 тире) — НЕ дробим
+    rem = "Вот твои напоминания:\n— принять витамины — 18 июня, 08:00"
+    assert _format_lists(rem) == rem
+    # обычный текст с одним тире — не трогаем
+    prose = "Готово — удалила напоминание про зал."
+    assert _format_lists(prose) == prose
+    # инлайн-интро «список: a — b — c» → построчно
+    inline = "Вот список: — молоко — хлеб — яйца"
+    assert _format_lists(inline) == "Вот список:\n— молоко\n— хлеб\n— яйца"
+    # уже построчно — не трогаем
+    ml = "Список:\n— молоко\n— хлеб"
+    assert _format_lists(ml) == ml
+
+
 def test_destructive_extra_families_confirm_coverage(db_session):
     """ПРАВИЛО #7 confirm-гейт: все разрушающие добранных семей покрыты
     _CONFIRM_PHRASE (включая move_task_to_checklist, который отменяет задачу);
