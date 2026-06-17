@@ -98,6 +98,94 @@ class TaskService:
             raise ValueError("title required")
 
         now = _utcnow()
+
+        # #162 Фаза 0 — within-turn идемпотентность создания (эталон
+        # services/housewife_shopping.py::add_items; симметрично
+        # HousewifeReminderService.schedule). ctx is None → легаси байт-в-байт;
+        # ctx is not None → operation_id (logical_key с scheduled_date) +
+        # INSERT ON CONFLICT DO NOTHING + SELECT (стабильный id). emit_event → #163.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            # fail-closed user_id (чеклист #162 п.8).
+            if not user_id:
+                raise ValueError(
+                    "add ctx path: user_id обязателен (fail-closed)."
+                )
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "add ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — "
+                    "ToolRuntimeContext leaked across a tenant boundary."
+                )
+            # reminder-on-create — ВНЕ среза (#162): урезанная ReAct-схема не
+            # передаёт reminder_offset_minutes; в ctx-пути его не цепляем.
+            from sreda.services.operation_id import compute_operation_id_create
+            from sreda.services.text_normalization import normalize_for_dedup
+
+            sep = "\x1f"
+            logical_key = sep.join(
+                [
+                    normalize_for_dedup(title_clean),
+                    scheduled_date.isoformat() if scheduled_date else "",
+                    time_start.isoformat() if time_start else "",  # время в ключе (Codex MAJOR)
+                    recurrence_rule or "",
+                ]
+            )
+            op_id = compute_operation_id_create(
+                plan_id=ctx.execution_id,
+                step_id=ctx.step_id,
+                action="create",
+                entity_type="task",
+                logical_key=logical_key,
+            )
+            dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
+            if dialect_name == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as _insert
+            else:
+                from sqlalchemy.dialects.sqlite import insert as _insert  # type: ignore[no-redef]
+
+            stmt = (
+                _insert(Task)
+                .values(
+                    id=f"task_{uuid4().hex[:24]}",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    title=title_clean[:500],
+                    notes=(notes or "").strip() or None,
+                    scheduled_date=scheduled_date,
+                    time_start=time_start,
+                    time_end=time_end,
+                    recurrence_rule=recurrence_rule or None,
+                    delegated_to=(delegated_to or "").strip() or None,
+                    status="pending",
+                    created_at=now,
+                    updated_at=now,
+                    operation_id=op_id,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["tenant_id", "user_id", "operation_id"]
+                )
+            )
+            self.session.execute(stmt)
+            self.session.commit()
+            actual = (
+                self.session.query(Task)
+                .filter(
+                    Task.tenant_id == tenant_id,
+                    Task.user_id == user_id,
+                    Task.operation_id == op_id,
+                )
+                .one_or_none()
+            )
+            if actual is None:
+                raise RuntimeError(
+                    "add ctx path: строка не найдена после INSERT для "
+                    f"op_id={op_id!r} (tenant={tenant_id!r})"
+                )
+            return actual
+
         task = Task(
             id=f"task_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -408,6 +496,10 @@ class TaskService:
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
+        # #162 п.6 — no-op guard: уже завершена → НЕ двигаем completed_at/updated_at
+        # на повторе внутри хода (replay) и не гасим напоминание повторно.
+        if task.status == "completed":
+            return task
         task.status = "completed"
         task.completed_at = _utcnow()
         task.updated_at = _utcnow()
@@ -433,6 +525,9 @@ class TaskService:
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
+        # #162 п.6 — no-op guard: уже pending → не двигаем updated_at на повторе.
+        if task.status == "pending":
+            return task
         task.status = "pending"
         task.completed_at = None
         task.updated_at = _utcnow()
@@ -446,6 +541,10 @@ class TaskService:
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
+        # #162 no-op guard (Codex MAJOR): уже отменена → не двигаем updated_at и не
+        # гасим напоминание повторно на replay.
+        if task.status == "cancelled":
+            return task
         task.status = "cancelled"
         task.updated_at = _utcnow()
         if task.reminder_id:

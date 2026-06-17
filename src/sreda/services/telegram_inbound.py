@@ -276,6 +276,8 @@ async def _process_approved_turn_locked(
                     thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
                     llm=_llm,
                     user_text=_react_text,
+                    inbound_message_id=inbound_message_id,
+                    channel="telegram",
                 )
                 trace.record("react_loop.replied", chars=len(_reply or ""))
                 await telegram_client.send_message(

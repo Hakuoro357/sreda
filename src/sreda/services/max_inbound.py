@@ -1031,6 +1031,8 @@ async def _process_approved_max_turn(
                         thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
                         llm=_llm,
                         user_text=message_text,
+                        inbound_message_id=inbound_message_id,
+                        channel="max",
                     )
                     trace.record(
                         "react_loop.replied", chars=len(_reply or ""), channel="max",
