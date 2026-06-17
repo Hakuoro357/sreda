@@ -141,6 +141,28 @@ def _set_processing_status(
     session.commit()
 
 
+def _voice_to_react_gate(
+    message_type: str, *, is_new_user: bool, tenant_id, enabled_tenants,
+) -> bool:
+    """#166: голос флагованного тенанта транскрибируем ДО react-гейта.
+    Чистое решение без побочек (тестируемо). Не-голос / новичок / не-флагованный → False."""
+    return (
+        message_type == "voice"
+        and not is_new_user
+        and tenant_id in enabled_tenants
+    )
+
+
+def _clean_transcript(message) -> str | None:
+    """Нормализованный непустой текст расшифровки или None. Codex high R1:
+    пробельная расшифровка («   ») НЕ должна уходить в ReAct как текст."""
+    if not isinstance(message, dict):
+        return None
+    text = message.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    return text or None
+
+
 async def _process_approved_turn(
     *,
     bot_key: str,
@@ -225,6 +247,50 @@ async def _process_approved_turn_locked(
             trace.record("webhook.received", type="callback")
         else:
             trace.record("webhook.received", type="unknown")
+
+        # #166 голос на ReAct: для флагованного тенанта транскрибируем голос ДО
+        # гейта ТОЙ ЖЕ _maybe_transcribe_voice, что и старый путь (она держит
+        # доступ/квоты/ошибки и инжектит расшифровку в message["text"]). Дальше
+        # ведём как обычный текстовый react-ход. Зеркало MAX-пути
+        # (_maybe_transcribe_max_voice до его гейта). Остальные тенанты не тронуты.
+        if _voice_to_react_gate(
+            message_type, is_new_user=onboarding.is_new_user,
+            tenant_id=onboarding.tenant_id,
+            enabled_tenants=get_settings().react_loop_enabled_tenants,
+        ):
+            from sreda.services.telegram_bot import _maybe_transcribe_voice
+            payload = await _maybe_transcribe_voice(
+                payload, session=bg_session,
+                telegram_client=telegram_client, onboarding=onboarding,
+            )
+            if payload is None:
+                # доступ/квота/STT-ошибка уже сообщены пользователю — ход завершён.
+                # Эмитим trace ДО выхода (voice.download/transcribe уже записаны) —
+                # иначе срез голосовых отказов теряет диагностику (R1 MAJOR Codex+
+                # субагент). Статус ignored — паритет с MAX-путём (max_inbound) для
+                # того же класса событий.
+                if trace_ctx is not None:
+                    trace.emit_block(trace_ctx)
+                _set_processing_status(bg_session, inbound_message_id, "ignored")
+                return
+            message = payload.get("message") if isinstance(payload, dict) else None
+            _vtext = _clean_transcript(message)
+            if _vtext is None:
+                # пустая/пробельная расшифровка: НЕ уводим в старый путь (квота уже
+                # списана), мягко просим повторить и завершаем ход.
+                try:
+                    await telegram_client.send_message(
+                        chat_id=str(onboarding.chat_id),
+                        text="Не расслышала, повтори, пожалуйста.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("empty-voice reply failed: %s", type(exc).__name__)
+                if trace_ctx is not None:
+                    trace.emit_block(trace_ctx)
+                _set_processing_status(bg_session, inbound_message_id, "processed")
+                return
+            message["text"] = _vtext  # нормализованная расшифровка → react-ход
+            message_type = "text"  # обычный react-гейт ниже
 
         # #66 ГЕЙТ решаем ДО ack: для react-ходов индикатор «печатает» НЕ создаём
         # (react отвечает сам через send_message, мимо outbox — иначе ack завис бы
