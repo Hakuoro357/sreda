@@ -107,7 +107,12 @@ class TaskService:
         from sreda.runtime.planner.tool_runtime import current_tool_runtime
 
         ctx = current_tool_runtime()
-        if ctx is not None:
+        # ВАЖНО (Codex MAJOR): ctx биндит И plan-execute executor, не только ReAct.
+        # Идемпотентную ctx-ветку берём ТОЛЬКО для простого create (reminder_offset
+        # is None). reminder-on-create (его шлёт лишь plan-execute — ReAct-схема
+        # урезана) падает в legacy-путь ниже, где _attach_reminder_inner реально
+        # цепляет напоминание → нет молчаливой потери напоминания у др. тенантов.
+        if ctx is not None and reminder_offset_minutes is None:
             # fail-closed user_id (чеклист #162 п.8).
             if not user_id:
                 raise ValueError(

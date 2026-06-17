@@ -190,6 +190,11 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 new_trigger = _parse_dt(trigger_iso)
             except Exception:  # noqa: BLE001
                 return f"Не разобрала время: {trigger_iso!r}."
+        # no-op guard (#162 п.5): те же значения → успех без записи.
+        new_title = title or None
+        if ((new_title is None or new_title == r0.title)
+                and (new_trigger is None or new_trigger == r0.trigger_at)):
+            return f"ok:updated:{r0.id} | {r0.title} | {_fmt(r0.trigger_at)}"
         r = reminders.update(
             tenant_id=tenant_id, reminder_id=reminder_ref,
             title=title or None, trigger_at=new_trigger,
@@ -260,11 +265,18 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     @tool
     def update_task(task_ref: str, title: str = "", notes: str = "") -> str:
         """Изменить ТЕКСТ задачи (название/заметки). Перенос по времени пока не поддержан."""
+        t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
+        if t0 is None:
+            return "Такой задачи у тебя нет."
+        # no-op guard (#162 п.5): те же значения → успех без записи (replay не двигает updated_at).
+        new_title = (title or "").strip()[:500] or None
+        new_notes = (notes or "").strip() or None
+        if ((new_title is None or new_title == (t0.title or None))
+                and (new_notes is None or new_notes == t0.notes)):
+            return f"ok:updated:{t0.id} | {t0.title}"
         t = tasks.update(tenant_id=tenant_id, user_id=user_id, task_id=task_ref,
                          title=title or None, notes=notes or None)
-        if t is None:
-            return "Такой задачи у тебя нет."
-        return f"ok:updated:{t.id} | {t.title}"
+        return f"ok:updated:{t.id} | {t.title}" if t else "Такой задачи у тебя нет."
 
     @tool
     def complete_task(task_ref: str) -> str:

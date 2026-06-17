@@ -153,3 +153,41 @@ def test_list_tasks_returns_dated_task(db_session):
         tools["add_task"].invoke({"title": "полить цветы", "scheduled_date": "2030-06-20"})
     out = tools["list_tasks"].invoke({"scheduled_date": ""})
     assert "цвет" in out.lower(), out
+
+
+def test_add_task_with_reminder_not_regressed_under_ctx(db_session):
+    """MAJOR (Codex medium): ctx биндит И plan-execute. add_task с
+    reminder_offset_minutes НЕ должен уходить в idempotent-ветку (иначе напоминание
+    молча теряется у не-ReAct тенантов) — должен реально прицепить напоминание."""
+    from datetime import date, time
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    svc = TaskService(db_session)
+    ctx = ToolRuntimeContext(operation_id="o", execution_id="e", step_id="s",
+                             tool_name="add_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk")
+    with bind_tool_runtime(ctx):
+        t = svc.add(tenant_id=u.tenant_id, user_id=u.user_id, title="принять лекарство",
+                    scheduled_date=date(2030, 1, 1), time_start=time(9, 0),
+                    reminder_offset_minutes=10)
+    db_session.expire_all()
+    assert t.reminder_id is not None, "напоминание должно быть прицеплено (нет регрессии)"
+
+
+def test_update_task_noop_same_values_keeps_updated_at(db_session):
+    """п.5: повтор update теми же значениями → updated_at не двигается."""
+    from sreda.db.models.tasks import Task
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx = ToolRuntimeContext(operation_id="o", execution_id="e", step_id="s",
+                             tool_name="add_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk")
+    with bind_tool_runtime(ctx):
+        tools["add_task"].invoke({"title": "созвон"})
+    t = db_session.query(Task).filter_by(tenant_id=u.tenant_id, user_id=u.user_id).one()
+    before = t.updated_at
+    tools["update_task"].invoke({"task_ref": t.id, "title": "созвон"})  # те же значения
+    db_session.expire_all()
+    t2 = db_session.query(Task).filter_by(id=t.id).one()
+    assert t2.updated_at == before, "no-op update не должен двигать updated_at"
