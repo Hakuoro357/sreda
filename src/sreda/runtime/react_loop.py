@@ -185,6 +185,24 @@ def _interrupt_age_seconds(created_at: Any) -> float:
         return float("inf")
 
 
+def _text_content(content: Any) -> str:
+    """Нормализация контента ответа модели в строку (как extract_text_content у
+    wassim249). Reasoning-модели (вкл. Mercury с reasoning_effort) могут вернуть
+    СПИСОК блоков [{type:reasoning},{type:text}] — берём только текст; иначе
+    .strip() на списке уронил бы ход в fallback."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for b in content:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict) and b.get("type") == "text":
+                parts.append(str(b.get("text", "")))
+        return "".join(parts).strip()
+    return str(content or "").strip()
+
+
 def _pending_question(snap: Any) -> str:
     if snap.tasks and snap.tasks[0].interrupts:
         return str(snap.tasks[0].interrupts[0].value)
@@ -226,7 +244,7 @@ async def handle_turn(
         if snap.next:  # снова пауза → отдать вопрос пользователю
             return _scrub_ids(_pending_question(snap)) or "Уточни, пожалуйста."
         last = result["messages"][-1] if result.get("messages") else None
-        text = (getattr(last, "content", "") or "").strip() if isinstance(last, AIMessage) else ""
+        text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
         return _scrub_ids(text) or "Готово."
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
         # PII-safe (Codex R2 MAJOR): только тип ошибки + поколение, БЕЗ traceback
