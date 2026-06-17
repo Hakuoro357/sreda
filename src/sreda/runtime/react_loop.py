@@ -170,9 +170,11 @@ def _scrub_ids(text: str) -> str:
 
 def _interrupt_age_seconds(created_at: Any) -> float:
     """Возраст текущего снимка checkpoint (для TTL) — из САМОГО снимка (единый
-    источник, без параллельного словаря). 0 при невозможности разобрать."""
+    источник). FAIL-CLOSED (Codex R2 MAJOR): при отсутствии/невалидности
+    created_at возвращаем inf → пауза считается протухшей (недатированную паузу
+    НЕ возобновляем, а ротируем поколение)."""
     if not created_at:
-        return 0.0
+        return float("inf")
     try:
         ts = (created_at if isinstance(created_at, datetime)
               else datetime.fromisoformat(str(created_at).replace("Z", "+00:00")))
@@ -180,7 +182,7 @@ def _interrupt_age_seconds(created_at: Any) -> float:
             ts = ts.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - ts).total_seconds()
     except Exception:  # noqa: BLE001
-        return 0.0
+        return float("inf")
 
 
 def _pending_question(snap: Any) -> str:
@@ -226,8 +228,11 @@ async def handle_turn(
         last = result["messages"][-1] if result.get("messages") else None
         text = (getattr(last, "content", "") or "").strip() if isinstance(last, AIMessage) else ""
         return _scrub_ids(text) or "Готово."
-    except Exception:  # noqa: BLE001 — цикл не должен ронять ход; без ПД в логе
-        logger.exception("react_loop: handle_turn failed (gen=%s)", gen)
+    except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
+        # PII-safe (Codex R2 MAJOR): только тип ошибки + поколение, БЕЗ traceback
+        # и str(exc) — они могут нести текст юзера / название / ref.
+        logger.warning("react_loop: handle_turn failed type=%s gen=%s",
+                       type(exc).__name__, gen)
         _THREAD_GEN[base] = gen + 1  # бросаем поколение → следующий ход на чистом треде
         return ("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
                 "что нужно сделать.")
