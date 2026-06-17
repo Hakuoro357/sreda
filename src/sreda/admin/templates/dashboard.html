@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Дашборд{% endblock %}
+{% block content %}
+<h2>Дашборд</h2>
+<small class="muted">Оценка по текущему прайсу, не бухгалтерия. Только агрегаты.</small>
+
+<h3>Затраты и объём</h3>
+<div style="display: flex; gap: 12px; flex-wrap: wrap;">
+{% for key, label in [("day", "Сегодня"), ("week", "Неделя"), ("month", "Месяц")] %}
+  {% set rep = cost[key] %}
+  <article style="flex: 1 1 200px;">
+    <strong>{{ label }}</strong><br>
+    ≈ {{ rep.priced_subtotal_usd | usd }}<br>
+    <span class="muted">{{ "{:,}".format(rep.rows | sum(attribute='calls')) }} вызовов</span><br>
+    <span class="muted">покрытие
+      {% if rep.coverage_calls_pct is not none %}{{ rep.coverage_calls_pct }}%{% else %}—{% endif %}</span>
+  </article>
+{% endfor %}
+</div>
+
+<h3>Здоровье диалога (сутки)</h3>
+{% if health %}
+<p>
+  Ходов: <strong>{{ health.turns_total }}</strong> ·
+  сбоев: {{ health.runs_failed }} · застряло вход: {{ health.inbound_stuck }} ·
+  outbox-fail: {{ health.outbox_failed }} · поломок: {{ health.breakdowns_shown }} ·
+  <strong>всего проблем: {{ health.failures_total }}</strong>
+</p>
+{% else %}<p class="muted">— нет данных —</p>{% endif %}
+
+<h3>Балансы провайдеров</h3>
+<table><tbody>
+{% for b in balances %}
+  <tr>
+    <td><strong>{{ b.label }}</strong></td>
+    <td>{% if b.status == "ok" %}{{ b.headline }}{% else %}<span class="muted">{{ b.headline }}</span>{% endif %}</td>
+  </tr>
+{% else %}<tr><td class="muted">—</td></tr>{% endfor %}
+</tbody></table>
+
+<h3>Топ тенантов по тратам (месяц)</h3>
+<table>
+  <thead><tr><th>Тенант</th><th>≈ USD</th><th>Вызовов</th></tr></thead>
+  <tbody>
+  {% for tid, name, est, calls in top.by_spend %}
+    <tr>
+      <td><a href="/admin/tenants/{{ tid }}">{{ name }}</a></td>
+      <td>{{ est | usd }}</td>
+      <td>{{ "{:,}".format(calls) }}</td>
+    </tr>
+  {% else %}<tr><td class="muted">— нет priced-трат —</td></tr>{% endfor %}
+  </tbody>
+</table>
+
+{% if top.by_unpriced %}
+<h4>Топ беспрайсовых тенантов (по токенам)</h4>
+<small class="muted">слепая зона priced-метрики — тяжёлые тенанты без известной цены</small>
+<table><tbody>
+  {% for tid, name, tok in top.by_unpriced %}
+    <tr>
+      <td><a href="/admin/tenants/{{ tid }}">{{ name }}</a></td>
+      <td>{{ "{:,}".format(tok) }} токенов</td>
+    </tr>
+  {% endfor %}
+</tbody></table>
+{% endif %}
+{% endblock %}

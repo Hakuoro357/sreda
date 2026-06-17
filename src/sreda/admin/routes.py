@@ -13,9 +13,14 @@ from fastapi.templating import Jinja2Templates
 
 from sreda.admin.auth import require_admin_token
 from sreda.admin.queries import (
-    get_all_users,
     get_budget_summary_for_day,
+    get_cost_volume_summary,
+    get_dialogue_health,
     get_llm_calls,
+    get_spend_by_model,
+    get_tenant_spend_detail,
+    get_top_tenants_by_spend,
+    get_users_page,
 )
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
@@ -24,6 +29,27 @@ _MSK_TZ = ZoneInfo("Europe/Moscow")
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+
+
+def _fmt_usd(value) -> str:
+    """#150: деньги для UI. None → «—»; точный $0 → «$0.0000»;
+    0<v<$0.0001 → «<$0.0001»; иначе $X.XXXX.
+    Централизует формат — никаких Decimal<float сравнений в шаблонах (Codex MAJOR).
+    Точный ноль отделён от микросумм (Codex R4): пустой период показывает честный
+    $0.0000, а не вводящее в заблуждение «<$0.0001»."""
+    from decimal import Decimal as _D
+
+    if value is None:
+        return "—"
+    v = value if isinstance(value, _D) else _D(str(value))
+    if v == 0:
+        return "$0.0000"
+    if v < _D("0.0001"):
+        return "<$0.0001"
+    return f"${v:.4f}"
+
+
+templates.env.filters["usd"] = _fmt_usd
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -61,17 +87,77 @@ def _audit_admin_view(
     )
 
 
-@router.get("/users", response_class=HTMLResponse)
-def admin_users(
+@router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
+def admin_dashboard(
     request: Request,
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    _audit_admin_view(session, "admin.users.viewed", token, request)
-    users = get_all_users(session)
+    """Дашборд админки (landing): (a) затраты+объём день/неделя/месяц,
+    (b) здоровье диалога, (c) балансы провайдеров, (d) активность тенантов
+    (top по тратам + top беспрайсовых). Только агрегаты — без текстов сообщений."""
+    _audit_admin_view(session, "admin.dashboard.viewed", token, request)
+    cost = get_cost_volume_summary(session)
+    health = get_dialogue_health(session)
+    top = get_top_tenants_by_spend(session, "month")
+    try:
+        from sreda.services import provider_balances as _pb
+
+        balances = _pb.fetch_balances(get_settings())
+    except Exception:  # noqa: BLE001 — балансы не валят дашборд
+        balances = []
+    return templates.TemplateResponse(
+        request, "dashboard.html",
+        {
+            "token": token,
+            "section": "dashboard",
+            "cost": cost,
+            "health": health,
+            "top": top,
+            "balances": balances,
+        },
+    )
+
+
+@router.get("/users", response_class=HTMLResponse)
+def admin_users(
+    request: Request,
+    page: int = Query(1, ge=1),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    _audit_admin_view(session, "admin.users.viewed", token, request, page=page)
+    users_page = get_users_page(session, page=page)
     return templates.TemplateResponse(
         request, "users.html",
-        {"token": token, "users": users, "section": "users"},
+        {
+            "token": token,
+            "users": users_page.rows,
+            "page": users_page,
+            "section": "users",
+        },
+    )
+
+
+@router.get("/tenants/{tenant_id}", response_class=HTMLResponse)
+def admin_tenant_detail(
+    tenant_id: str,
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Карточка тенанта: траты день/неделя/месяц по моделям + ссылки на
+    переписку (llm-calls). Только агрегаты/метаданные — без текстов сообщений.
+    Подпись «расходы тенанта/аккаунта, не пользователя» (тенант может иметь
+    несколько юзеров) — в шаблоне."""
+    _audit_admin_view(
+        session, "admin.tenant.viewed", token, request, tenant_id=tenant_id,
+    )
+    detail = get_tenant_spend_detail(session, tenant_id)
+    return templates.TemplateResponse(
+        request, "tenant_detail.html",
+        {"token": token, "section": "users", "detail": detail},
     )
 
 
@@ -120,6 +206,36 @@ def admin_budget(
                 if selected < today
                 else None
             ),
+        },
+    )
+
+
+@router.get("/spend-by-model", response_class=HTMLResponse)
+def admin_spend_by_model(
+    request: Request,
+    period: str = Query("month"),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Траты по (provider_key, model) за день/неделю/месяц (MSK).
+
+    ≈USD по ТЕКУЩЕМУ прайсу (`llm_pricing`); беспрайсовые модели → «—». Шапка
+    показывает покрытие (% валидных вызовов/токенов с известной ценой) + список
+    беспрайсовых + число аномалий. Только агрегаты — без текстов сообщений.
+    """
+    if period not in ("day", "week", "month"):
+        period = "month"
+    _audit_admin_view(
+        session, "admin.spend_by_model.viewed", token, request, period=period,
+    )
+    report = get_spend_by_model(session, period)
+    return templates.TemplateResponse(
+        request, "spend_by_model.html",
+        {
+            "token": token,
+            "section": "spend-by-model",
+            "period": period,
+            "report": report,
         },
     )
 
@@ -176,6 +292,15 @@ _LLM_PROVIDERS_METADATA = [
         "default_model_attr": None,
         "resolver": "resolve_mimo_api_key",
         "static_model": "mimo-v2.5",
+    },
+    {
+        # #150: планировщик Среды (с 2026-06-15). Баланса нет — fetch_balances
+        # тянет только openrouter+mimo, Inception сетью не дёргается («нет API»).
+        "key": "inception-mercury2",
+        "label": "Inception · Mercury-2 (Фредди, планировщик)",
+        "default_model_attr": None,
+        "resolver": "resolve_inception_api_key",
+        "static_model": "mercury-2",
     },
     {
         "key": "openrouter",
@@ -379,14 +504,14 @@ def admin_llm_save(
 def admin_llm_calls(
     request: Request,
     tenant_id: str = Query(...),
-    feature_key: str = Query(...),
+    feature_key: str | None = Query(None),
     page: int = Query(default=1, ge=1),
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     _audit_admin_view(
         session, "admin.llm_calls.viewed", token, request,
-        tenant_id=tenant_id, feature_key=feature_key, page=page,
+        tenant_id=tenant_id, feature_key=feature_key or "", page=page,
     )
     data = get_llm_calls(session, tenant_id, feature_key, page=page)
     return templates.TemplateResponse(
@@ -710,7 +835,7 @@ def admin_tenant_reset(
     msg = "+".join(parts) if parts else "nothing+to+delete"
 
     return RedirectResponse(
-        url=f"/admin/users?token={token}&reset=ok&msg={msg}",
+        url=f"/admin/users?reset=ok&msg={msg}",
         status_code=303,
     )
 
@@ -759,7 +884,7 @@ async def _legacy_admin_tenant_approve_unused(
     tenant = session.get(Tenant, tenant_id)
     if tenant is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&approve=err&msg=tenant_not_found",
+            url=f"/admin/users?approve=err&msg=tenant_not_found",
             status_code=303,
         )
 
@@ -891,7 +1016,7 @@ async def _legacy_admin_tenant_approve_unused(
 
     return RedirectResponse(
         url=(
-            f"/admin/users?token={token}&approve=ok&tenant={tenant_id}"
+            f"/admin/users?approve=ok&tenant={tenant_id}"
             f"&welcome={delivery_status}&grant={grant_status}"
         ),
         status_code=303,
@@ -928,7 +1053,7 @@ async def admin_tenant_suspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&suspend=err&msg=no_active_sub",
+            url=f"/admin/users?suspend=err&msg=no_active_sub",
             status_code=303,
         )
     sub.status = "suspended"
@@ -946,7 +1071,7 @@ async def admin_tenant_suspend(
     )
     session.commit()
     return RedirectResponse(
-        url=f"/admin/users?token={token}&suspend=ok&tenant={tenant_id}",
+        url=f"/admin/users?suspend=ok&tenant={tenant_id}",
         status_code=303,
     )
 
@@ -972,7 +1097,7 @@ async def admin_tenant_unsuspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&unsuspend=err&msg=no_suspended_sub",
+            url=f"/admin/users?unsuspend=err&msg=no_suspended_sub",
             status_code=303,
         )
     sub.status = "active"
@@ -990,6 +1115,6 @@ async def admin_tenant_unsuspend(
     )
     session.commit()
     return RedirectResponse(
-        url=f"/admin/users?token={token}&unsuspend=ok&tenant={tenant_id}",
+        url=f"/admin/users?unsuspend=ok&tenant={tenant_id}",
         status_code=303,
     )
