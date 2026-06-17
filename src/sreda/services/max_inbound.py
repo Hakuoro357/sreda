@@ -1008,6 +1008,41 @@ async def _process_approved_max_turn(
                     )
                     return
 
+                # #66 ГЕЙТ MAX: тенант из react_loop_enabled_tenants + текст →
+                # новый ReAct+interrupt-цикл. Ответ шлём напрямую MaxClient
+                # (welcome тоже inline-шлёт), ack не создаём, dispatch пропускаем.
+                # Остальные тенанты/callback/voice-ошибки/новые юзеры — прежним
+                # путём (нулевой регресс). Флаг по умолчанию пуст → no-op.
+                if (
+                    message_text
+                    and not onboarding.is_new_user
+                    and onboarding.tenant_id in settings.react_loop_enabled_tenants
+                ):
+                    from sreda.runtime import react_loop
+                    from sreda.services.llm import get_chat_llm
+
+                    _llm = get_chat_llm(
+                        provider=settings.planner_provider, settings=settings,
+                    )
+                    _reply = await react_loop.handle_turn(
+                        session=bg_session,
+                        tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                        llm=_llm,
+                        user_text=message_text,
+                    )
+                    trace.record(
+                        "react_loop.replied", chars=len(_reply or ""), channel="max",
+                    )
+                    await max_client.send_message(
+                        recipient={"chat_id": onboarding.max_chat_id}, text=_reply,
+                    )
+                    _set_processing_status(
+                        bg_session, inbound_message_id, "processed",
+                    )
+                    return
+
             # Ack message — UX parity с TG: показываем «⏳ Работаю…» как
             # только начали обработку, чтобы юзер не молча ждал 5-15s
             # пока LLM думает + outbox doставляет. Boris directive
