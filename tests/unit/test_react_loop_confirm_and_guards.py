@@ -141,6 +141,19 @@ def test_scrub_ids_strips_internal_keeps_text():
     assert _scrub_ids("видеоидентификатор и рефлекс") == "видеоидентификатор и рефлекс"
 
 
+def test_destructive_extra_families_confirm_coverage(db_session):
+    """ПРАВИЛО #7 confirm-гейт: все разрушающие добранных семей покрыты
+    _CONFIRM_PHRASE (включая move_task_to_checklist, который отменяет задачу);
+    utility (log_unsupported_request) НЕ просачивается в цикл."""
+    from sreda.runtime.react_loop import _CONFIRM_PHRASE
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    names = {t.name for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    assert set(_CONFIRM_PHRASE) <= names, set(_CONFIRM_PHRASE) - names  # все привязаны
+    assert "move_task_to_checklist" in _CONFIRM_PHRASE  # destructive cross-family под confirm
+    assert "log_unsupported_request" not in names  # utility отфильтрован
+
+
 def test_list_tasks_returns_dated_task(db_session):
     """Регресс: list_tasks без фильтра даты возвращает ДАТИРОВАННУЮ задачу
     (баг include_no_date=True исключал её; найден живым прогоном)."""

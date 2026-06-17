@@ -35,24 +35,29 @@ class _StubLLM:
         return msg
 
 
-def test_build_slice_tools_names_and_reduced_schemas(db_session):
+def test_build_all_tools_families_and_reduced_task_schemas(db_session):
     u = seed_telegram_user(db_session)
     db_session.commit()
     tools = react_loop.build_slice_tools(db_session, u.tenant_id, u.user_id)
-    names = {t.name for t in tools}
-    assert names == {
+    by = {t.name: t for t in tools}
+    names = set(by)
+    bespoke = {
         "list_reminders", "schedule_reminder", "update_reminder", "cancel_reminder",
         "list_tasks", "add_task", "update_task", "complete_task", "uncomplete_task",
         "cancel_task", "delete_task", "ask_human",
-    }, names
-    by = {t.name: t for t in tools}
+    }
+    assert bespoke <= names, bespoke - names
+    # добранные семьи (#162 полный перенос): покупки/меню/рецепты/чек-листы/семья/память/веб
+    extra_expected = {
+        "add_shopping_items", "list_shopping", "plan_week_menu", "save_recipe",
+        "create_checklist", "add_family_members", "save_core_fact", "get_weather",
+    }
+    assert extra_expected <= names, extra_expected - names
+    # бес­поке add_task/update_task остаются урезанными (композит/расписание — позже)
     add_args = set(by["add_task"].args.keys())
     assert "details_items" not in add_args, add_args
     assert "reminder_offset_minutes" not in add_args, add_args
-    upd_args = set(by["update_task"].args.keys())
-    assert "scheduled_date" not in upd_args, upd_args
-    assert "time_start" not in upd_args, upd_args
-    assert "recurrence_rule" not in upd_args, upd_args
+    assert "scheduled_date" not in set(by["update_task"].args.keys())
 
 
 @pytest.mark.asyncio

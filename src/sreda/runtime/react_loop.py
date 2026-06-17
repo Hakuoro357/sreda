@@ -54,6 +54,45 @@ _MONTHS = ["", "января", "февраля", "марта", "апреля", "
 _YES = {"да", "ага", "угу", "удали", "удаляй", "подтверждаю", "yes", "верно", "точно"}
 # Решение строится на `not _is_yes(...)` (всё не-«да» = отказ — fail-closed для удаления).
 
+# #162 полный перенос: семьи, которые добираем из общего реестра (напоминания+задачи
+# отдаём бес­поке-инструментами выше — с именованным confirm). onboarding/ui/utility — НЕ
+# в разговорном цикле.
+_EXTRA_FAMILIES = {"shopping", "recipes", "menu", "household", "checklists", "web"}
+# Разрушающие инструменты добранных семей → требуют подтверждения (переиспользуем
+# канонический набор из handlers, минус не-разрушающие). reminders/tasks-разрушающее
+# уже под бес­поке-confirm выше.
+_CONFIRM_PHRASE = {
+    "delete_recipe": "удалить рецепт",
+    "remove_shopping_items": "удалить позиции из списка покупок",
+    "clear_bought_shopping": "очистить купленное в списке покупок",
+    "clear_menu": "очистить меню",
+    "remove_family_member": "удалить члена семьи",
+    "delete_checklist_item": "удалить пункт чек-листа",
+    "archive_checklist": "архивировать чек-лист",
+    # move_task_to_checklist шаг 1 ОТМЕНЯЕТ исходную задачу (+напоминание) — destructive,
+    # обходил бы confirm иначе (все 3 ревьюера, MAJOR).
+    "move_task_to_checklist": "перенести задачу в дела (исходная задача отменится)",
+}
+
+
+def _confirm_wrap(inner: Any, phrase: str) -> Any:
+    """Обернуть разрушающий инструмент подтверждением через interrupt(): мутация
+    ТОЛЬКО после «да» (детерминированный guardrail, как у cancel_reminder). Сохраняет
+    имя/описание/схему inner — ЛЛМ зовёт прозрачно; ctx остаётся забинженным (вызов
+    inner.invoke идёт внутри bind_tool_runtime из run_tools)."""
+    from langchain_core.tools import StructuredTool
+
+    def _wrapped(**kwargs: Any) -> str:
+        decision = interrupt(f"Точно {phrase}? Это действие необратимо.")
+        if not _is_yes(str(decision)):
+            return "Хорошо, не трогаю."
+        return str(inner.invoke(kwargs))
+
+    return StructuredTool.from_function(
+        func=_wrapped, name=inner.name, description=inner.description,
+        args_schema=inner.args_schema,
+    )
+
 
 class ReactState(MessagesState):
     """MessagesState + turn_key. turn_key минтится РАЗ на ход (handle_turn) и
@@ -67,9 +106,11 @@ def _system_prompt(today_str: str) -> str:
     return (
         "<persona>\nТы — Среда, ассистент в мессенджере. Ведёшь напоминания и задачи "
         "пользователя.\n</persona>\n\n"
-        "<style>\nОтвечай по-русски, кратко, разговорно — без markdown, списков-звёздочек, "
-        "заголовков и таблиц. Один вопрос за раз. Не начинай ответ с «Отлично!», «Конечно!».\n"
-        "</style>\n\n"
+        "<style>\nОтвечай по-русски, тепло и живо — как помощник, не как сухая справка. "
+        "Без markdown-звёздочек, заголовков и таблиц. СПИСКИ (напоминания, задачи, покупки, "
+        "меню и т.п.) выводи КАЖДЫЙ ПУНКТ С НОВОЙ СТРОКИ через «— », НЕ в одну строку через "
+        "тире. Дату и время пиши по-человечески («19 июня, 09:00»). Один вопрос за раз. "
+        "Не начинай ответ с «Отлично!», «Конечно!».\n</style>\n\n"
         f"<context>\nСегодня {today_str}. Относительные даты («сегодня», «завтра», «в пятницу») "
         "САМ переводи в абсолютные перед вызовом инструментов: дату — YYYY-MM-DD, время — HH:MM, "
         "момент напоминания — полный ISO-8601 datetime.\n</context>\n\n"
@@ -86,17 +127,24 @@ def _system_prompt(today_str: str) -> str:
         "- complete_task(task_ref) / uncomplete_task(task_ref): отметить выполненной/вернуть.\n"
         "- cancel_task(task_ref) / delete_task(task_ref): отменить/удалить. САМИ спросят "
         "подтверждение.\n"
-        "- ask_human(question): уточнить у пользователя (какое из нескольких).\n</tools>\n\n"
-        "<scope>\nТы умеешь ТОЛЬКО напоминания и задачи. Если просят другое (покупки, меню, "
-        "рецепты, память, члены семьи) — коротко скажи, что пока умеешь напоминания и задачи, "
-        "не выдумывай инструментов.\n</scope>\n\n"
+        "- ask_human(question): уточнить у пользователя (какое из нескольких).\n"
+        "Другое (своими инструментами): списки покупок, недельное меню, рецепты, чек-листы, "
+        "члены семьи, заметки-память, погода и веб-поиск.\n</tools>\n\n"
+        "<scope>\nТы ведёшь: напоминания, задачи, списки покупок, меню, рецепты, чек-листы, "
+        "членов семьи, заметки-память; знаешь погоду и веб-поиск. Если просят совсем вне этого "
+        "(оплатить счёт, позвонить за меня) — коротко скажи, что так не умеешь; инструменты "
+        "не выдумывай.\n</scope>\n\n"
         "<examples>\nПравильно:\nПользователь: «удали напоминание про зал»\n"
         "→ list_reminders(title_match=\"зал\"); если ровно одно — cancel_reminder(ref).\n"
         "Пользователь: «вечернее» (ответ на выбор)\n"
         "→ НЕ вызывать list_reminders снова; cancel_reminder(ref вечернего).\n"
         "Пользователь: «добавь задачу полить цветы завтра»\n"
-        "→ add_task(title=\"полить цветы\", scheduled_date=<завтра YYYY-MM-DD>).\n\n"
-        "Неправильно (так НЕ делай):\n- вызывать list повторно, когда список уже есть;\n"
+        "→ add_task(title=\"полить цветы\", scheduled_date=<завтра YYYY-MM-DD>).\n"
+        "Пользователь: «покажи список покупок» (формат списка — СТРОГО так, с переносами):\n"
+        "Вот твой список покупок:\n— молоко\n— хлеб\n— яйца\n\n"
+        "Неправильно (так НЕ делай):\n"
+        "- перечислять списком в ОДНУ строку: «список: — молоко — хлеб» (НАДО каждый с новой строки);\n"
+        "- вызывать list повторно, когда список уже есть;\n"
         "- спрашивать «точно удалить?» через ask_human — это делают сами cancel/delete;\n"
         "- спрашивать несколько вещей сразу.\n</examples>\n\n"
         "<rules>\n1. Если по запросу подходит НЕ ровно одно — ask_human, какое именно "
@@ -104,7 +152,10 @@ def _system_prompt(today_str: str) -> str:
         "2. Определился ровно один — вызови нужный инструмент по его ref. Подтверждение "
         "разрушающие берут сами; не дублируй.\n3. Минимум вызовов: список уже получен — не "
         "запрашивай снова.\n4. ref бери из результата list_*, не выдумывай.\n"
-        "5. Один вопрос за раз.\n</rules>"
+        "5. Один вопрос за раз.\n"
+        "6. ЛЮБОЙ список (напоминания, задачи, покупки, меню, рецепты) — ВСЕГДА построчно: "
+        "вводная фраза с двоеточием, затем КАЖДЫЙ пункт на ОТДЕЛЬНОЙ строке с «— ». "
+        "НИКОГДА не перечисляй в одну строку.\n</rules>"
     )
 
 
@@ -327,11 +378,49 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         """Задать пользователю уточняющий вопрос (какое из нескольких) и дождаться ответа."""
         return str(interrupt(question))
 
-    return [
+    bespoke = [
         list_reminders, schedule_reminder, update_reminder, cancel_reminder,
         list_tasks, add_task, update_task, complete_task, uncomplete_task,
         cancel_task, delete_task, ask_human,
     ]
+
+    # #162 полный перенос — добираем остальные семьи из общего реестра
+    # (покупки/меню/рецепты/чек-листы/семья/веб) + память. Напоминания/задачи
+    # отданы бес­поке выше (именованный confirm + within-turn идемпотентность).
+    from sreda.runtime.tools import build_memory_tools
+    from sreda.services.embeddings import get_embeddings_client
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+    from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+
+    _emb = get_embeddings_client()
+    _bespoke_names = {t.name for t in bespoke}
+    extra: list = []
+    for t in build_housewife_tools(
+        session=session, tenant_id=tenant_id, user_id=user_id,
+        pending_buttons_state=None, menu_display_state=None,
+        embedding_client=_emb,
+    ):
+        if t.name in _bespoke_names:
+            continue  # напоминания/задачи уже у бес­поке
+        if TOOL_FAMILY_MANIFEST.get(t.name) not in _EXTRA_FAMILIES:
+            continue  # onboarding/ui/utility/tasks-cross — вне цикла
+        extra.append(
+            _confirm_wrap(t, _CONFIRM_PHRASE[t.name])
+            if t.name in _CONFIRM_PHRASE else t
+        )
+    # память + веб; фильтруем по семье и дедупим — иначе утекает
+    # log_unsupported_request (utility), которого в цикле быть не должно (Codex MINOR).
+    _seen = {t.name for t in bespoke} | {t.name for t in extra}
+    for t in build_memory_tools(
+        session=session, tenant_id=tenant_id, user_id=user_id, embedding_client=_emb,
+    ):
+        if t.name in _seen:
+            continue
+        if TOOL_FAMILY_MANIFEST.get(t.name) not in {"memory", "web"}:
+            continue
+        _seen.add(t.name)
+        extra.append(t)
+    return bespoke + extra
 
 
 def _build_graph(llm_with_tools: Any, tools_by_name: dict, *,

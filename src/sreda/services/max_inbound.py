@@ -1024,6 +1024,13 @@ async def _process_approved_max_turn(
                     _llm = get_chat_llm(
                         provider=settings.planner_provider, settings=settings,
                     )
+                    # ack v3: «Секунду…» → правим ЕГО в ответ (PUT /messages, одно
+                    # сообщение). Переиспользуем устойчивый _send_max_ack (defensive
+                    # извлечение mid по нескольким формам ответа MAX — Codex/субагент MAJOR).
+                    _ack_mid = await _send_max_ack(
+                        token=settings.max_bot_token,
+                        chat_id=onboarding.max_chat_id, text="Секунду…",
+                    )
                     _reply = await react_loop.handle_turn(
                         session=bg_session,
                         tenant_id=onboarding.tenant_id,
@@ -1037,9 +1044,23 @@ async def _process_approved_max_turn(
                     trace.record(
                         "react_loop.replied", chars=len(_reply or ""), channel="max",
                     )
-                    await max_client.send_message(
-                        recipient={"chat_id": onboarding.max_chat_id}, text=_reply,
-                    )
+                    _edited = False
+                    if _ack_mid:
+                        try:
+                            await max_client.edit_message(str(_ack_mid), text=_reply)
+                            _edited = True
+                        except Exception:  # noqa: BLE001
+                            _edited = False
+                    if not _edited:
+                        # сбой edit → убираем «Секунду…» (не висит + не дублируется)
+                        if _ack_mid:
+                            try:
+                                await max_client.delete_message(str(_ack_mid))
+                            except Exception:  # noqa: BLE001
+                                pass
+                        await max_client.send_message(
+                            recipient={"chat_id": onboarding.max_chat_id}, text=_reply,
+                        )
                     _set_processing_status(
                         bg_session, inbound_message_id, "processed",
                     )

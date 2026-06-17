@@ -269,6 +269,17 @@ async def _process_approved_turn_locked(
 
                 _s = get_settings()
                 _llm = get_chat_llm(provider=_s.planner_provider, settings=_s)
+                # ack v3: шлём «Секунду…» и редактируем ЕГО в финальный ответ
+                # (одно сообщение, как раньше; напрямую через editMessageText, без
+                # outbox → не зависнет). Любой сбой ack — не критичен.
+                _ack_mid = None
+                try:
+                    _ack = await telegram_client.send_message(
+                        chat_id=str(onboarding.chat_id), text="Секунду…",
+                    )
+                    _ack_mid = (_ack or {}).get("result", {}).get("message_id")
+                except Exception:  # noqa: BLE001
+                    _ack_mid = None
                 _reply = await react_loop.handle_turn(
                     session=bg_session,
                     tenant_id=onboarding.tenant_id,
@@ -280,9 +291,28 @@ async def _process_approved_turn_locked(
                     channel="telegram",
                 )
                 trace.record("react_loop.replied", chars=len(_reply or ""))
-                await telegram_client.send_message(
-                    chat_id=str(onboarding.chat_id), text=_reply,
-                )
+                _edited = False
+                if _ack_mid is not None:
+                    try:
+                        await telegram_client.edit_message_text(
+                            chat_id=str(onboarding.chat_id),
+                            message_id=_ack_mid, text=_reply,
+                        )
+                        _edited = True
+                    except Exception:  # noqa: BLE001
+                        _edited = False
+                if not _edited:
+                    # сбой edit → убираем «Секунду…», чтобы не висело + не дублировалось
+                    if _ack_mid is not None:
+                        try:
+                            await telegram_client.delete_message(
+                                chat_id=str(onboarding.chat_id), message_id=_ack_mid,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    await telegram_client.send_message(
+                        chat_id=str(onboarding.chat_id), text=_reply,
+                    )
             else:
                 await handle_telegram_interaction(
                     bg_session,
