@@ -1001,6 +1001,54 @@ def _pending(snap: Any) -> tuple[str, bool, str]:
     return "", False, ""
 
 
+def _called_tools(result: Any) -> list[str]:
+    """Имена инструментов, запрошенных в ТЕКУЩЕМ ходе — для дебага. result["messages"] — вся
+    история треда (накапливается); берём только хвост после ПОСЛЕДНЕГО HumanMessage (текущий
+    обмен), иначе счёт раздувается историей (Codex R1 MINOR)."""
+    msgs = result.get("messages", []) if isinstance(result, dict) else []
+    start = 0
+    for i, m in enumerate(msgs):
+        if isinstance(m, HumanMessage):
+            start = i
+    names: list[str] = []
+    for m in msgs[start:]:
+        for tc in getattr(m, "tool_calls", None) or []:
+            n = tc.get("name") if isinstance(tc, dict) else None
+            if n:
+                names.append(n)
+    return names
+
+
+def _persist_debug_turn(*, tenant_id: str, user_id: str, thread_id: str, channel: str,
+                        user_text: str, reply: Any, tools: list[str], kind: str) -> None:
+    """vex#170 (ВРЕМЕННОЕ): записать ход (вопрос + ответ бота + инструменты) в
+    react_debug_turns, чтобы видеть всю переписку пока тестируем механизм. Гейт — ALLOWLIST
+    тенантов react_debug_tenants (НЕ глобальный флаг; пусто → никому). ИЗОЛИРОВАННАЯ сессия
+    (не транзакция хода); текст шифруется на уровне модели; НИКОГДА не роняет ход (debug — не
+    correctness). reply — это _Reply (подкласс str) → str(reply) даёт чистый текст ответа."""
+    try:
+        from sreda.config.settings import get_settings
+        if tenant_id not in get_settings().react_debug_tenants:
+            return
+        import json as _json
+        from uuid import uuid4
+
+        from sreda.db.models import ReactDebugTurn
+        from sreda.db.session import get_session_factory
+        sess = get_session_factory()()
+        try:
+            sess.add(ReactDebugTurn(
+                id=f"rdt_{uuid4().hex}", tenant_id=tenant_id, user_id=user_id,
+                thread_id=thread_id, channel=channel, kind=kind,
+                user_text=user_text or "", reply_text=str(reply),
+                tools_json=_json.dumps(tools, ensure_ascii=False)))
+            sess.commit()
+        finally:
+            sess.close()
+    except Exception as exc:  # noqa: BLE001 — дебаг-запись НИКОГДА не ломает ход
+        logger.warning("react_loop: debug-persist failed type=%s", type(exc).__name__)
+
+
 async def handle_turn(
     *, session: Any, tenant_id: str, user_id: str, thread_id: str,
     llm: Any, user_text: str, inbound_message_id: str = "", channel: str = "react",
@@ -1063,17 +1111,30 @@ async def handle_turn(
                 {"messages": [HumanMessage(user_text)], "turn_key": turn_key}, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
+        _tools = _called_tools(result)
         if _has_pause(snap):  # снова пауза → вопрос пользователю (+ confirm + токен для [Да][Нет])
             q, is_confirm, pid = _pending(snap)
-            return _Reply(_postformat(q) or "Уточни, пожалуйста.",
-                          awaiting_confirm=is_confirm, confirm_id=pid)
+            reply = _Reply(_postformat(q) or "Уточни, пожалуйста.",
+                           awaiting_confirm=is_confirm, confirm_id=pid)
+            _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
+                                channel=channel, user_text=user_text, reply=reply,
+                                tools=_tools, kind="pause")
+            return reply
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
-        return _Reply(_postformat(text) or "Готово.")
+        reply = _Reply(_postformat(text) or "Готово.")
+        _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
+                            channel=channel, user_text=user_text, reply=reply,
+                            tools=_tools, kind="final")
+        return reply
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s",
                        type(exc).__name__, gen)
         _THREAD_GEN[base] = gen + 1
-        return _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
-                      "что нужно сделать.")
+        _reply = _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
+                        "что нужно сделать.")
+        _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
+                            channel=channel, user_text=user_text, reply=_reply,
+                            tools=[], kind="error")
+        return _reply
