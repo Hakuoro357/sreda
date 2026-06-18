@@ -227,3 +227,333 @@ def test_update_task_noop_same_values_keeps_updated_at(db_session):
     db_session.expire_all()
     t2 = db_session.query(Task).filter_by(id=t.id).one()
     assert t2.updated_at == before, "no-op update не должен двигать updated_at"
+
+
+@pytest.mark.asyncio
+async def test_confirm_pause_sets_awaiting_confirm(db_session):
+    """#166 B: confirm-пауза («Точно удалить?») → _Reply.awaiting_confirm=True (канал вешает
+    кнопки [Да][Нет])."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    thread = f"react:t:{uuid4().hex}"
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=_cancel_script(rid),
+                           user_text="удали разминку", inbound_message_id="m1", channel="max")
+    assert getattr(r1, "awaiting_confirm", False) is True, repr(r1)
+    assert "точно" in r1.lower()
+
+
+@pytest.mark.asyncio
+async def test_ask_human_pause_not_confirm(db_session):
+    """#166 B: ask_human-пауза (уточнение «какое из нескольких?») → awaiting_confirm=False
+    (кнопки Да/Нет НЕ вешаем)."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    thread = f"react:t:{uuid4().hex}"
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "ask_human", "args": {"question": "Какое из двух удалить?"},
+            "id": "call_1"}]),
+        AIMessage(content="ок"),
+    ])
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=stub,
+                           user_text="удали что-нибудь", inbound_message_id="m1", channel="max")
+    assert getattr(r1, "awaiting_confirm", False) is False, repr(r1)
+    assert "какое" in r1.lower()
+
+
+def test_confirm_resume_text_public_helper():
+    """#166 B R2/R3: публичный маппинг callback_data → resume-текст + id паузы + сборка
+    (каналы не лезут в приватные структуры; терпит суффикс :<pause_id>)."""
+    # resume-текст: без суффикса и с суффиксом
+    assert react_loop.confirm_resume_text("react:yes") == "да"
+    assert react_loop.confirm_resume_text("react:no") == "нет"
+    assert react_loop.confirm_resume_text("react:yes:abc123") == "да"
+    assert react_loop.confirm_resume_text("react:no:abc123") == "нет"
+    assert react_loop.confirm_resume_text("btn_reply:x") is None
+    assert react_loop.confirm_resume_text("") is None
+    assert react_loop.confirm_resume_text("react:maybe") is None
+    # id паузы из callback_data
+    assert react_loop.confirm_callback_id("react:yes:abc123") == "abc123"
+    assert react_loop.confirm_callback_id("react:no") == ""
+    assert react_loop.confirm_callback_id("btn_reply:x") == ""
+    # сборка callback_data (с id и без)
+    assert react_loop.confirm_callback_data("yes", "abc123") == "react:yes:abc123"
+    assert react_loop.confirm_callback_data("no", "") == "react:no"
+    # round-trip
+    cb = react_loop.confirm_callback_data("yes", "deadbeef")
+    assert react_loop.confirm_resume_text(cb) == "да"
+    assert react_loop.confirm_callback_id(cb) == "deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_resume_only_repeat_tap_is_noop(db_session):
+    """#166 B R2 (Codex MAJOR): первый тап «да» (resume_only) возобновляет паузу и удаляет;
+    ПОВТОРНЫЙ тап (живой паузы уже нет) → пустой _Reply (no-op), свежий ход с текстом «да»
+    НЕ стартует, состояние не меняется."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    thread = f"react:t:{uuid4().hex}"
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=_cancel_script(rid),
+                           user_text="удали разминку", inbound_message_id="m1", channel="max")
+    tok = r1.confirm_id  # токен паузы из кнопки
+    # первый тап [Да] — resume_only с верным токеном: возобновляет паузу
+    r2 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=_cancel_script(rid), resume_only=True,
+                           user_text="да", expected_confirm_id=tok,
+                           inbound_message_id="m2", channel="max")
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).status == "cancelled", r2
+    assert str(r2) != "", "первый тап должен дать непустой ответ"
+    # повторный тап [Да] — живой паузы уже нет → no-op, пустой ответ
+    r3 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=_cancel_script(rid), resume_only=True,
+                           user_text="да", expected_confirm_id=tok,
+                           inbound_message_id="m3", channel="max")
+    assert str(r3) == "", f"повторный тап должен быть no-op (пустой), а не свежий ход: {r3!r}"
+    assert getattr(r3, "awaiting_confirm", False) is False
+
+
+@pytest.mark.asyncio
+async def test_resume_only_legacy_no_id_is_noop_against_id_pause(db_session):
+    """#166 B R4 (Codex high/medium MAJOR, fail-closed): legacy-кнопка БЕЗ токена
+    (expected_confirm_id="") НЕ подтверждает confirm-паузу, У КОТОРОЙ токен есть.
+    Старые react:yes/no из R1/R2 (уже в чатах) → no-op. Текстовое «да» (не resume_only) — ок."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    thread = f"react:t:{uuid4().hex}"
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=_cancel_script(rid),
+                           user_text="удали разминку", inbound_message_id="m1", channel="max")
+    assert r1.confirm_id, "у паузы должен быть непустой токен"
+    # legacy-тап (resume_only, токен пустой) → fail-closed no-op
+    r_legacy = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                                 thread_id=thread, llm=_cancel_script(rid), resume_only=True,
+                                 user_text="да", expected_confirm_id="",
+                                 inbound_message_id="m2", channel="max")
+    db_session.expire_all()
+    assert str(r_legacy) == "", f"legacy без токена → no-op: {r_legacy!r}"
+    assert db_session.get(FamilyReminder, rid).status == "pending", "legacy-тап не должен удалять"
+    # текстовое «да» (НЕ resume_only) — обычный resume, подтверждает
+    r_txt = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                              thread_id=thread, llm=_cancel_script(rid),
+                              user_text="да", inbound_message_id="m3", channel="max")
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).status == "cancelled", r_txt
+
+
+def test_pause_token_discriminates_chain_same_id_different_question():
+    """#166 B R4 (субагент MAJOR): Interrupt.id одинаков для цепочки confirm в одном
+    исполнении узла → токен паузы ДОЛЖЕН различать их по тексту вопроса. Иначе старая
+    кнопка A подтвердит цепочечный confirm B (другое разрушающее действие)."""
+    from sreda.runtime.react_loop import _pause_token
+
+    class _It:
+        def __init__(self, id_, value):
+            self.id, self.value = id_, value
+
+    # один id (общий namespace узла), РАЗНЫЕ вопросы → РАЗНЫЕ токены
+    a = _It("samens", {"confirm": "Точно отменить задачу «X»?"})
+    b = _It("samens", {"confirm": "Точно отменить задачу «Y»?"})
+    assert _pause_token(a) != _pause_token(b)
+    # тот же id+вопрос → стабильный токен (легитимный тап матчит)
+    assert _pause_token(a) == _pause_token(_It("samens", {"confirm": "Точно отменить задачу «X»?"}))
+    # разный id (межходовой), один вопрос → разные токены
+    assert _pause_token(_It("id1", {"confirm": "q"})) != _pause_token(_It("id2", {"confirm": "q"}))
+    # нет паузы → пустой токен
+    assert _pause_token(_It("", None)) == ""
+
+
+def test_pause_token_discriminates_identical_text_via_hidden_key():
+    """#166 B R5 (Codex high+medium MAJOR): один id + ИДЕНТИЧНЫЙ текст вопроса (две задачи
+    «купить хлеб»), но РАЗНЫЕ скрытые ключи цели → РАЗНЫЕ токены. Текст один не различил бы."""
+    from sreda.runtime.react_loop import _pause_token
+
+    class _It:
+        def __init__(self, id_, value):
+            self.id, self.value = id_, value
+
+    q = "Точно отменяю задачу «купить хлеб»?"
+    a = _It("samens", {"confirm": q, "key": "task:t1:отменяю"})
+    b = _It("samens", {"confirm": q, "key": "task:t2:отменяю"})
+    assert _pause_token(a) != _pause_token(b), "разные цели при одном тексте → разные токены"
+    # тот же id+текст+ключ → стабильный токен (легитимный тап матчит)
+    assert _pause_token(a) == _pause_token(_It("samens", {"confirm": q, "key": "task:t1:отменяю"}))
+    # тот же объект, РАЗНОЕ действие (cancel vs delete) → разные токены
+    c = _It("samens", {"confirm": q, "key": "task:t1:удаляю"})
+    assert _pause_token(a) != _pause_token(c)
+
+
+@pytest.mark.asyncio
+async def test_chain_confirm_stale_token_does_not_confirm_next(db_session):
+    """#166 B R4 (субагент MAJOR, e2e): цепочка confirm в ОДНОМ ходе («удали напоминание И
+    задачу») → две паузы с РАЗНЫМИ токенами; устаревший токен A не подтверждает паузу B."""
+    from sreda.db.models.tasks import Task
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    # задача через add_task (известно-рабочий путь)
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx = ToolRuntimeContext(operation_id="o", execution_id="e", step_id="s",
+                             tool_name="add_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk")
+    with bind_tool_runtime(ctx):
+        tools["add_task"].invoke({"title": "купить хлеб"})
+    tid = db_session.query(Task).filter_by(tenant_id=u.tenant_id, user_id=u.user_id).one().id
+
+    thread = f"react:t:{uuid4().hex}"
+    stub = _StubLLM([  # ОДИН AIMessage с ДВУМЯ разрушающими вызовами
+        AIMessage(content="", tool_calls=[
+            {"name": "cancel_reminder", "args": {"reminder_ref": rid}, "id": "c1"},
+            {"name": "cancel_task", "args": {"task_ref": tid}, "id": "c2"}]),
+        AIMessage(content="Готово."),
+    ])
+    # ход1 → пауза A (напоминание)
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=stub, user_text="удали напоминание и задачу",
+                           inbound_message_id="m1", channel="max")
+    tok_a = r1.confirm_id
+    assert getattr(r1, "awaiting_confirm", False) is True and tok_a, repr(r1)
+    # тап A (верный токен) → напоминание отменено, цепочка → пауза B (задача)
+    r2 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=stub, resume_only=True, user_text="да",
+                           expected_confirm_id=tok_a, inbound_message_id="m2", channel="max")
+    tok_b = r2.confirm_id
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).status == "cancelled", "A должно отмениться"
+    assert getattr(r2, "awaiting_confirm", False) is True, f"должна быть пауза B: {r2!r}"
+    assert tok_a != tok_b, "цепочка confirm в одном ходе → РАЗНЫЕ токены (иначе дыра B)"
+    assert db_session.get(Task, tid).status == "pending", "B ещё не подтверждено"
+    # устаревший тап токеном A по живой паузе B → no-op, задача НЕ отменяется
+    r_stale = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                                thread_id=thread, llm=stub, resume_only=True, user_text="да",
+                                expected_confirm_id=tok_a, inbound_message_id="m3", channel="max")
+    db_session.expire_all()
+    assert str(r_stale) == "", f"старый токен A → no-op на паузе B: {r_stale!r}"
+    assert db_session.get(Task, tid).status == "pending", "чужой токен не должен отменять задачу"
+    # верный токен B → задача отменяется
+    await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                      thread_id=thread, llm=stub, resume_only=True, user_text="да",
+                      expected_confirm_id=tok_b, inbound_message_id="m4", channel="max")
+    db_session.expire_all()
+    assert db_session.get(Task, tid).status == "cancelled", "верный токен B → отмена задачи"
+
+
+@pytest.mark.asyncio
+async def test_chain_confirm_same_title_stale_token_noop(db_session):
+    """#166 B R5 (Codex high+medium MAJOR, e2e): ДВЕ задачи с ОДИНАКОВЫМ названием в одной
+    цепочке confirm → токены РАЗНЫЕ (скрытый ключ цели task:<id>:<verb>); устаревший токен A
+    НЕ подтверждает паузу B, хотя текст вопроса идентичен."""
+    from sreda.db.models.tasks import Task
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    # ДВЕ задачи с одним названием: разные ctx (execution_id/step_id), иначе within-turn
+    # дедуп схлопнет их в одну.
+    for i in range(2):
+        ctx_i = ToolRuntimeContext(operation_id=f"o{i}", execution_id=f"e{i}", step_id=f"s{i}",
+                                   tool_name="add_task", tenant_id=u.tenant_id,
+                                   user_id=u.user_id, turn_key=f"tk{i}")
+        with bind_tool_runtime(ctx_i):
+            tools["add_task"].invoke({"title": "купить хлеб"})
+    rows = db_session.query(Task).filter_by(tenant_id=u.tenant_id, user_id=u.user_id).all()
+    assert len(rows) == 2
+    t1, t2 = rows[0].id, rows[1].id
+
+    thread = f"react:t:{uuid4().hex}"
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[
+            {"name": "cancel_task", "args": {"task_ref": t1}, "id": "c1"},
+            {"name": "cancel_task", "args": {"task_ref": t2}, "id": "c2"}]),
+        AIMessage(content="Готово."),
+    ])
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=stub, user_text="отмени обе задачи купить хлеб",
+                           inbound_message_id="m1", channel="max")
+    tok_a = r1.confirm_id
+    r2 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=stub, resume_only=True, user_text="да",
+                           expected_confirm_id=tok_a, inbound_message_id="m2", channel="max")
+    tok_b = r2.confirm_id
+    db_session.expire_all()
+    assert getattr(r2, "awaiting_confirm", False) is True, f"должна быть пауза B: {r2!r}"
+    assert tok_a != tok_b, "ОДИН текст, но РАЗНЫЕ цели → разные токены (ключ цели)"
+    # устаревший токен A по паузе B → no-op, t2 не отменяется
+    r_stale = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                                thread_id=thread, llm=stub, resume_only=True, user_text="да",
+                                expected_confirm_id=tok_a, inbound_message_id="m3", channel="max")
+    db_session.expire_all()
+    assert str(r_stale) == "", f"старый токен A → no-op на B (одинаковый текст!): {r_stale!r}"
+    assert db_session.get(Task, t2).status == "pending", "t2 не должна отмениться чужим токеном"
+
+
+@pytest.mark.asyncio
+async def test_confirm_pause_carries_confirm_id(db_session):
+    """#166 B R3: confirm-пауза несёт _Reply.confirm_id (id паузы для callback_data кнопок)."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    thread = f"react:t:{uuid4().hex}"
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=_cancel_script(rid),
+                           user_text="удали разминку", inbound_message_id="m1", channel="max")
+    assert getattr(r1, "confirm_id", "") != "", "confirm-пауза должна нести id паузы"
+
+
+@pytest.mark.asyncio
+async def test_resume_only_wrong_confirm_id_is_noop(db_session):
+    """#166 B R3 (Codex MAJOR B): тап кнопки с ЧУЖИМ id паузы → no-op (не подтверждает
+    активную паузу). С ВЕРНЫМ id — возобновляет."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    thread = f"react:t:{uuid4().hex}"
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=_cancel_script(rid),
+                           user_text="удали разминку", inbound_message_id="m1", channel="max")
+    good_id = r1.confirm_id
+    assert good_id, "нужен непустой id паузы для теста"
+    # тап со СТАРЫМ/ЧУЖИМ id — no-op, напоминание не трогаем
+    r_wrong = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                                thread_id=thread, llm=_cancel_script(rid), resume_only=True,
+                                user_text="да", expected_confirm_id="deadbeef-not-this-pause",
+                                inbound_message_id="m2", channel="max")
+    db_session.expire_all()
+    assert str(r_wrong) == "", f"чужой id → no-op: {r_wrong!r}"
+    assert db_session.get(FamilyReminder, rid).status == "pending", "чужой тап не должен удалять"
+    # тап с ВЕРНЫМ id — возобновляет, удаляет
+    r_ok = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                             thread_id=thread, llm=_cancel_script(rid), resume_only=True,
+                             user_text="да", expected_confirm_id=good_id,
+                             inbound_message_id="m3", channel="max")
+    db_session.expire_all()
+    assert str(r_ok) != "", "верный id → непустой ответ"
+    assert db_session.get(FamilyReminder, rid).status == "cancelled", r_ok
+
+
+@pytest.mark.asyncio
+async def test_resume_only_rejects_non_confirm_pause(db_session):
+    """#166 B R3 (Codex MAJOR A): устаревший тап [Да]/[Нет] НЕ должен отвечать «да/нет»
+    на ask_human-уточнение (не-confirm пауза) → no-op. Обычный текстовый ответ — отвечает."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    thread = f"react:t:{uuid4().hex}"
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "ask_human", "args": {"question": "Какое из двух удалить?"},
+            "id": "call_1"}]),
+        AIMessage(content="понял, удаляю первое"),
+    ])
+    r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                           thread_id=thread, llm=stub,
+                           user_text="удали что-нибудь", inbound_message_id="m1", channel="max")
+    assert getattr(r1, "awaiting_confirm", False) is False  # ask_human, не confirm
+    # тап кнопки (resume_only) по ask_human-паузе → no-op
+    r_btn = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                              thread_id=thread, llm=stub, resume_only=True,
+                              user_text="да", expected_confirm_id="whatever",
+                              inbound_message_id="m2", channel="max")
+    assert str(r_btn) == "", f"кнопка не должна отвечать на ask_human: {r_btn!r}"
+    # обычный текстовый ответ (НЕ resume_only) — отвечает на уточнение
+    r_txt = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                              thread_id=thread, llm=stub,
+                              user_text="первое", inbound_message_id="m3", channel="max")
+    assert str(r_txt) != "", "текстовый ответ должен возобновить ask_human"

@@ -248,6 +248,69 @@ async def _process_approved_turn_locked(
         else:
             trace.record("webhook.received", type="unknown")
 
+        # #166 B: тап по кнопке [Да]/[Нет] react-подтверждения → resume паузы того же треда.
+        # answerCallbackQuery ПЕРВЫМ (идемпотентность кнопок); само действие идемпотентно в
+        # цикле (operation_id + guard статуса) → повторный тап после resume = безвредный no-op.
+        _cb = payload.get("callback_query") if isinstance(payload, dict) else None
+        _cb_data = str(_cb.get("data") or "") if isinstance(_cb, dict) else ""
+        if (_cb_data.startswith(("react:yes", "react:no"))
+                and not onboarding.is_new_user
+                and onboarding.tenant_id in get_settings().react_loop_enabled_tenants):
+            from sreda.runtime import react_loop
+            from sreda.services.llm import get_chat_llm
+            _cb_id = str(_cb.get("id") or "")
+            if _cb_id:
+                try:
+                    await telegram_client.answer_callback_query(_cb_id, text="")
+                except Exception:  # noqa: BLE001
+                    pass
+            _s2 = get_settings()
+            _llm2 = get_chat_llm(provider=_s2.planner_provider, settings=_s2)
+            # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
+            # к которой кнопка была привязана (id из callback_data). Устаревший/повторный/
+            # чужой тап → пустой ответ (no-op), свежий ход не стартуем (R3 Codex MAJOR A/B).
+            _reply2 = await react_loop.handle_turn(
+                session=bg_session, tenant_id=onboarding.tenant_id,
+                user_id=onboarding.user_id,
+                thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
+                llm=_llm2, user_text=react_loop.confirm_resume_text(_cb_data) or "",
+                inbound_message_id=inbound_message_id, channel="telegram",
+                resume_only=True,
+                expected_confirm_id=react_loop.confirm_callback_id(_cb_data))
+            trace.record("react_loop.resumed", chars=len(_reply2 or ""),
+                         channel="telegram", noop=(not _reply2))
+            if _reply2:  # непустой → пауза возобновлена (пустой = устаревший/чужой тап → no-op)
+                # цепочка-confirm: следующий вопрос снова с [Да][Нет] (с id новой паузы)
+                _cid2 = getattr(_reply2, "confirm_id", "")
+                _kb2 = ({"inline_keyboard": [[
+                    {"text": "Да", "callback_data": react_loop.confirm_callback_data("yes", _cid2)},
+                    {"text": "Нет", "callback_data": react_loop.confirm_callback_data("no", _cid2)}]]}
+                    if getattr(_reply2, "awaiting_confirm", False) else None)
+                # правим ИСХОДНОЕ сообщение: результат + СНИМАЕМ старые кнопки. Telegram
+                # editMessageText без reply_markup НЕ убирает клавиатуру → передаём пустой
+                # inline_keyboard явно (субагент R2 MINOR), либо новые [Да][Нет] при цепочке.
+                _kb_edit = _kb2 if _kb2 is not None else {"inline_keyboard": []}
+                _orig_mid = (_cb.get("message") or {}).get("message_id")
+                _done = False
+                if _orig_mid is not None:
+                    try:
+                        await telegram_client.edit_message_text(
+                            chat_id=str(onboarding.chat_id), message_id=_orig_mid,
+                            text=_reply2, reply_markup=_kb_edit)
+                        _done = True
+                    except Exception:  # noqa: BLE001
+                        _done = False
+                if not _done:
+                    try:
+                        await telegram_client.send_message(
+                            chat_id=str(onboarding.chat_id), text=_reply2, reply_markup=_kb2)
+                    except Exception:  # noqa: BLE001
+                        pass
+            if trace_ctx is not None:
+                trace.emit_block(trace_ctx)
+            _set_processing_status(bg_session, inbound_message_id, "processed")
+            return
+
         # #166 голос на ReAct: для флагованного тенанта транскрибируем голос ДО
         # гейта ТОЙ ЖЕ _maybe_transcribe_voice, что и старый путь (она держит
         # доступ/квоты/ошибки и инжектит расшифровку в message["text"]). Дальше
@@ -357,12 +420,19 @@ async def _process_approved_turn_locked(
                     channel="telegram",
                 )
                 trace.record("react_loop.replied", chars=len(_reply or ""))
+                # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id
+                # КОНКРЕТНОЙ паузы в callback_data (текст «да/нет» тоже работает — кнопки добавка).
+                _cid = getattr(_reply, "confirm_id", "")
+                _kb = ({"inline_keyboard": [[
+                    {"text": "Да", "callback_data": react_loop.confirm_callback_data("yes", _cid)},
+                    {"text": "Нет", "callback_data": react_loop.confirm_callback_data("no", _cid)}]]}
+                    if getattr(_reply, "awaiting_confirm", False) else None)
                 _edited = False
                 if _ack_mid is not None:
                     try:
                         await telegram_client.edit_message_text(
                             chat_id=str(onboarding.chat_id),
-                            message_id=_ack_mid, text=_reply,
+                            message_id=_ack_mid, text=_reply, reply_markup=_kb,
                         )
                         _edited = True
                     except Exception:  # noqa: BLE001
@@ -377,7 +447,7 @@ async def _process_approved_turn_locked(
                         except Exception:  # noqa: BLE001
                             pass
                     await telegram_client.send_message(
-                        chat_id=str(onboarding.chat_id), text=_reply,
+                        chat_id=str(onboarding.chat_id), text=_reply, reply_markup=_kb,
                     )
             else:
                 await handle_telegram_interaction(

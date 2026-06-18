@@ -56,6 +56,50 @@ _MONTHS = ["", "января", "февраля", "марта", "апреля", "
 _YES = {"да", "ага", "угу", "удали", "удаляй", "подтверждаю", "yes", "верно", "точно"}
 # Решение строится на `not _is_yes(...)` (всё не-«да» = отказ — fail-closed для удаления).
 
+# #166 Срез B: подтверждения Да/Нет кнопками. confirm-пауза несёт СТРУКТУРНЫЙ value
+# {"confirm": "<вопрос>"} (ask_human — обычная строка), чтобы канал прикрепил [Да][Нет].
+# callback_data кнопки: "react:yes:<pause_id>" / "react:no:<pause_id>" — несёт id КОНКРЕТНОЙ
+# паузы (LangGraph Interrupt.id), чтобы старая кнопка не подтвердила другую/более новую паузу
+# того же треда (#166 B R3, Codex MAJOR). Без суффикса (legacy) id="" → проверка id пропускается.
+_CONFIRM_ACTION = {"yes": "да", "no": "нет"}  # action-токен → resume-текст
+
+
+def confirm_resume_text(callback_data: str) -> str | None:
+    """Публичный доступ для каналов: callback_data кнопки → resume-текст («да»/«нет»),
+    или None если это не react-confirm-кнопка. Терпит суффикс :<pause_id>."""
+    parts = (callback_data or "").split(":")
+    if len(parts) >= 2 and parts[0] == "react":
+        return _CONFIRM_ACTION.get(parts[1])
+    return None
+
+
+def confirm_callback_id(callback_data: str) -> str:
+    """id паузы из callback_data ("react:yes:<id>" → "<id>"); "" если суффикса нет."""
+    parts = (callback_data or "").split(":", 2)
+    if len(parts) == 3 and parts[0] == "react":
+        return parts[2]
+    return ""
+
+
+def confirm_callback_data(action: str, pause_id: str) -> str:
+    """Собрать callback_data кнопки: action ∈ {"yes","no"} + id паузы (может быть "")."""
+    return f"react:{action}:{pause_id}" if pause_id else f"react:{action}"
+
+
+class _Reply(str):
+    """Ответ handle_turn: строка ответа (для старых вызывающих — обычный str) + признак
+    `awaiting_confirm`, что это да/нет-подтверждение (канал тогда вешает кнопки [Да][Нет]),
+    и `confirm_id` — id паузы для callback_data кнопок (защита от устаревшего тапа)."""
+    awaiting_confirm: bool
+    confirm_id: str
+
+    def __new__(cls, text: str, awaiting_confirm: bool = False,
+                confirm_id: str = "") -> "_Reply":
+        obj = super().__new__(cls, text)
+        obj.awaiting_confirm = awaiting_confirm
+        obj.confirm_id = confirm_id
+        return obj
+
 # #162 полный перенос: семьи, которые добираем из общего реестра (напоминания+задачи
 # отдаём бес­поке-инструментами выше — с именованным confirm). onboarding/ui/utility — НЕ
 # в разговорном цикле.
@@ -85,7 +129,11 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
     from langchain_core.tools import StructuredTool
 
     def _wrapped(**kwargs: Any) -> str:
-        decision = interrupt(f"Точно {phrase}? Это действие необратимо.")
+        # key — скрытый стабильный дискриминатор цели (#166 B R5): имя инструмента +
+        # canon(args). Различает РАЗНЫЕ цели при ИДЕНТИЧНОМ тексте вопроса (см. _pause_token).
+        _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
+        decision = interrupt({
+            "confirm": f"Точно {phrase}? Это действие необратимо.", "key": _key})
         if not _is_yes(str(decision)):
             return "Хорошо, не трогаю."
         return str(inner.invoke(kwargs))
@@ -286,7 +334,10 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         if r.status != "pending":
             return f"Напоминание «{r.title}» уже неактивно."
         title, when = r.title, r.trigger_at  # снимок ДО interrupt (g-032)
-        decision = interrupt(f"Точно удалить «{title} — {_fmt(when)}»?")
+        # key — скрытый дискриминатор цели (#166 B R5): различает разные напоминания
+        # при совпавшем тексте вопроса (см. _pause_token).
+        decision = interrupt({"confirm": f"Точно удалить «{title} — {_fmt(when)}»?",
+                              "key": f"reminder:{reminder_ref}:cancel"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не удаляю «{title}». Скажи, какое тогда."
         r2 = session.get(FamilyReminder, reminder_ref)
@@ -388,11 +439,14 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         if t is None:
             return "Такой задачи у тебя нет."
         title = t.title
-        decision = interrupt(f"Точно {verb} задачу «{title}»?")
+        # key — скрытый дискриминатор цели (#166 B R5): различает РАЗНЫЕ задачи (даже с
+        # одинаковым названием «купить хлеб») и действие cancel vs delete (см. _pause_token).
+        decision = interrupt({"confirm": f"Точно {verb} задачу «{title}»?",
+                              "key": f"task:{task_ref}:{verb}"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не трогаю «{title}»."
-        ok = apply(task_ref)
-        # ok=False → задача уже отсутствует/отменена (idempotent replay) → успех.
+        apply(task_ref)  # возврат намеренно игнорируем:
+        # False → задача уже отсутствует/отменена (idempotent replay) → тоже успех.
         return f"Готово, {verb}: «{title}»."
 
     @tool
@@ -654,18 +708,65 @@ def _text_content(content: Any) -> str:
     return str(content or "").strip()
 
 
-def _pending_question(snap: Any) -> str:
+def _pause_token(it: Any) -> str:
+    """Токен ИДЕНТИЧНОСТИ confirm-паузы для callback_data кнопок (защита от устаревшего тапа).
+
+    = sha1(Interrupt.id ⊕ текст вопроса ⊕ СКРЫТЫЙ ключ цели)[:20]. Три слагаемых, т.к.:
+    - Interrupt.id (LangGraph) уникален МЕЖДУ ходами (разные исполнения узла) — режет
+      межходовой stale-tap (#166 B R3, Codex high/medium);
+    - но id = хэш namespace УЗЛА → ОДИНАКОВ для цепочки confirm В ОДНОМ исполнении узла
+      («удали X и Y»). Текст вопроса режет большинство таких цепочек (R4, субагент);
+    - но текст МОЖЕТ совпасть (две задачи «купить хлеб», generic-обёртка с одной фразой) →
+      добавляем СКРЫТЫЙ ключ цели value["key"] = "<tool>:<ref>:<action>" / canon(args)
+      (не показывается юзеру) — различает РАЗНЫЕ цели при идентичном тексте (#166 B R5,
+      Codex high+medium MAJOR). Остаточно: коллизия только при совпадении И id, И текста,
+      И ключа цели (тот же объект, то же действие) — что и есть та же пауза. Пусто, если паузы нет."""
+    base = str(getattr(it, "id", "") or "")
+    v = getattr(it, "value", None)
+    if isinstance(v, dict) and "confirm" in v:
+        q = str(v["confirm"])
+        key = str(v.get("key") or "")
+    else:
+        q, key = "", ""
+    if not base and not q and not key:
+        return ""
+    return hashlib.sha1(f"{base}\x00{q}\x00{key}".encode()).hexdigest()[:20]
+
+
+def _has_pause(snap: Any) -> bool:
+    """Есть ли НЕЗАВЕРШЁННЫЙ interrupt (живая пауза).
+
+    snap.next НЕнадёжен: после resume узла, который СНОВА прерывается (цепочка confirm в
+    одном исполнении узла — «удали X и Y»), LangGraph 1.x отдаёт next=() ХОТЯ пауза жива
+    (проверено эмпирически). Источник истины — сами interrupts чекпоинта (как _pending).
+    snap.next оставляем доп. сигналом (свежая пауза fresh-хода)."""
     if snap.tasks and snap.tasks[0].interrupts:
-        return str(snap.tasks[0].interrupts[0].value)
-    return ""
+        return True
+    return bool(snap.next)
+
+
+def _pending(snap: Any) -> tuple[str, bool, str]:
+    """(текст вопроса активной паузы, это_confirm, токен_паузы). confirm-паузы несут
+    {"confirm": "..."}; ask_human — обычная строка (кнопки [Да][Нет] вешаем только на confirm).
+    токен_паузы (см. _pause_token) кладётся в callback_data кнопок для защиты от устаревшего
+    тапа (#166 B R3/R4)."""
+    if snap.tasks and snap.tasks[0].interrupts:
+        it = snap.tasks[0].interrupts[0]
+        tok = _pause_token(it)
+        v = it.value
+        if isinstance(v, dict) and "confirm" in v:
+            return str(v["confirm"]), True, tok
+        return str(v), False, tok
+    return "", False, ""
 
 
 async def handle_turn(
     *, session: Any, tenant_id: str, user_id: str, thread_id: str,
     llm: Any, user_text: str, inbound_message_id: str = "", channel: str = "react",
-) -> str:
+    resume_only: bool = False, expected_confirm_id: str = "",
+) -> "_Reply":
     """ВХОД нового цикла на одно входящее сообщение. Источник правды о паузе — сам
-    checkpoint (snap.next + snap.created_at). turn_key минтится РАЗ на свежий ход из
+    checkpoint (_has_pause: interrupts + snap.created_at). turn_key минтится РАЗ на свежий ход из
     durable inbound_message_id и живёт в state (переживает resume). НИКОГДА не поднимает
     исключений — при сбое отдаёт безопасный fallback."""
     base = thread_id
@@ -685,13 +786,34 @@ async def handle_turn(
             tenant_id=tenant_id, user_id=user_id, today_str=today_str)
 
         snap = await graph.aget_state(_cfg(gen))
-        live_pause = (bool(snap.next)
+        live_pause = (_has_pause(snap)
                       and _interrupt_age_seconds(snap.created_at) <= _PENDING_TTL_SECONDS)
+
+        if resume_only:
+            # #166 B R3/R4: тап по кнопке возобновляет ТОЛЬКО ту confirm-паузу, к которой
+            # кнопка была привязана. Иначе — no-op (пустой ответ; канал ничего не шлёт, тап
+            # уже подтверждён ack). Три отказа:
+            #   1) живой паузы нет (повторный/устаревший тап после resolve) — R2;
+            #   2) живая пауза НЕ confirm (напр. ask_human) — кнопка не отвечает «да/нет»
+            #      на уточнение (Codex A);
+            #   3) токен живой паузы ≠ токен из callback_data — другая/более новая пауза
+            #      того же треда (Codex B). FAIL-CLOSED (R4, Codex high/medium): сравнение
+            #      БЕЗ «and» → пустой expected (legacy-кнопка react:yes/no без токена, уже
+            #      лежащая в чатах с R1/R2) матчит ТОЛЬКО пустой токен паузы (среда без
+            #      Interrupt.id). При живой паузе с токеном старая статичная кнопка → no-op
+            #      (юзер может ответить текстом «да/нет» — это не resume_only).
+            if not live_pause:
+                return _Reply("")
+            _, _is_confirm, _cur_pid = _pending(snap)
+            if not _is_confirm:
+                return _Reply("")
+            if expected_confirm_id != _cur_pid:
+                return _Reply("")
 
         if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
             result = await graph.ainvoke(Command(resume=user_text), _cfg(gen))
         else:
-            if snap.next:  # протухшая пауза на этом поколении → свежий ход на чистом треде
+            if _has_pause(snap):  # протухшая пауза на этом поколении → свежий ход на чистом треде
                 gen += 1
                 _THREAD_GEN[base] = gen
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
@@ -700,15 +822,17 @@ async def handle_turn(
                 {"messages": [HumanMessage(user_text)], "turn_key": turn_key}, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
-        if snap.next:  # снова пауза → отдать вопрос пользователю
-            return _postformat(_pending_question(snap)) or "Уточни, пожалуйста."
+        if _has_pause(snap):  # снова пауза → вопрос пользователю (+ confirm + токен для [Да][Нет])
+            q, is_confirm, pid = _pending(snap)
+            return _Reply(_postformat(q) or "Уточни, пожалуйста.",
+                          awaiting_confirm=is_confirm, confirm_id=pid)
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
-        return _postformat(text) or "Готово."
+        return _Reply(_postformat(text) or "Готово.")
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s",
                        type(exc).__name__, gen)
         _THREAD_GEN[base] = gen + 1
-        return ("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
-                "что нужно сделать.")
+        return _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
+                      "что нужно сделать.")
