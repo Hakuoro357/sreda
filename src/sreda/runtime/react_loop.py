@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import date, datetime, time, timezone
+import re
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -48,6 +49,7 @@ _TOPOLOGY_VERSION = "react-v2:chat,tools,turn_key"
 _CHECKPOINTER = InMemorySaver()  # singleton на процесс
 _THREAD_GEN: dict[str, int] = {}
 _PENDING_TTL_SECONDS = 300  # 5 минут (решение владельца)
+_MSK = timezone(timedelta(hours=3))  # МСК = UTC+3 круглый год; локаль пользователя и дата-якорь
 
 _MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
            "июля", "августа", "сентября", "октября", "ноября", "декабря"]
@@ -114,7 +116,9 @@ def _system_prompt(today_str: str) -> str:
         "уместно — но БЕЗ восторгов и канцелярита. "
         "Без markdown-звёздочек, заголовков и таблиц. СПИСКИ (напоминания, задачи, покупки, "
         "меню и т.п.) выводи КАЖДЫЙ ПУНКТ С НОВОЙ СТРОКИ через «— », НЕ в одну строку через "
-        "тире. Дату и время пиши по-человечески («19 июня, 09:00»). Один вопрос за раз. "
+        "тире. Рецепты и пошаговые инструкции — КАЖДЫЙ ингредиент и КАЖДЫЙ шаг с НОВОЙ строки "
+        "(шаги нумеруй «1.», «2.», …), без звёздочек. "
+        "Дату и время пиши по-человечески («19 июня, 09:00»). Один вопрос за раз. "
         "Не начинай ответ с «Отлично!», «Конечно!».\n</style>\n\n"
         f"<context>\nСегодня {today_str}. Относительные даты («сегодня», «завтра», «в пятницу») "
         "САМ переводи в абсолютные перед вызовом инструментов: дату — YYYY-MM-DD, время — HH:MM, "
@@ -169,7 +173,12 @@ def _system_prompt(today_str: str) -> str:
 
 
 def _fmt(when: datetime) -> str:
-    return f"{when.day} {_MONTHS[when.month]} в {when:%H:%M}"
+    """Напоминание хранится как UTC-instant → показываем пользователю в МСК (#168: иначе
+    Фредди эхом подтвердит смещённое время из tool-result, напр. «08:00» вместо «11:00»).
+    Naive из БД трактуем как UTC, затем → МСК."""
+    w = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+    w = w.astimezone(_MSK)
+    return f"{w.day} {_MONTHS[w.month]} в {w:%H:%M}"
 
 
 def _fmt_task_when(t: Any) -> str:
@@ -189,10 +198,13 @@ def _is_yes(text: str) -> bool:
 
 
 def _parse_dt(s: str) -> datetime:
-    """ISO-8601 → aware UTC. Naive трактуем как UTC (как schedule_reminder сегодня)."""
+    """ISO-8601 → aware UTC. Naive (без зоны) трактуем как МСК (UTC+3) — согласованно с
+    дата-якорем в handle_turn; Фредди отдаёт локальное время пользователя без оффсета.
+    (#168: раньше naive считался UTC → сдвиг +3ч, напоминание срабатывало на 3 часа позже,
+    миниапп показывал верное смещённое время.)"""
     dt = datetime.fromisoformat((s or "").strip().replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=_MSK)
     return dt.astimezone(timezone.utc)
 
 
@@ -480,7 +492,6 @@ def _build_graph(llm_with_tools: Any, tools_by_name: dict, *,
 
 
 def _scrub_ids(text: str) -> str:
-    import re
     # ref=/id=/rem_/task_/checklist_<hex> + скобочные «(ref …)» не должны утечь пользователю.
     t = text or ""
     t = re.sub(r"\(\s*(?:ref|id)\b[^)]*\)", "", t, flags=re.IGNORECASE)
@@ -494,34 +505,76 @@ def _scrub_ids(text: str) -> str:
     return t.strip()
 
 
+def _strip_md(text: str) -> str:
+    """Снять markdown bold, который Mercury вставляет вопреки промпту (#168): ПАРНЫЙ
+    `**жирный**` → содержимое; ведущие '#'-заголовки. ТОЛЬКО парные маркеры (не глобально
+    `**`/`__`) — иначе мнём «2**3», «__init__», пути/глобы (R1: Codex high+medium+Kimi+
+    субагент). `__` не трогаем вовсе (Mercury использует `**`)."""
+    t = text or ""
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)        # парный жирный → содержимое
+    t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", t)   # ведущие '#'-заголовки
+    return t
+
+
+# «N.» в начале строки (^) ИЛИ после пробела — число вплотную к «.»+пробел+буква.
+# Граница (^|после пробела) исключает mid-token («версия1.»); «0.5 ч»/«2 см.»/«1 ч.» не
+# матчатся (нет цифры вплотную к «.»+пробел+буква). Группа = номер.
+_STEP_RE = re.compile(r"(?:(?<=\s)|^)(\d{1,2})\.\s+(?=[А-ЯЁа-яёA-Za-z])")
+
+
+def _split_numbered_steps(line: str) -> list[str]:
+    """Разбить строку на нумерованные шаги ТОЛЬКО если номера образуют последовательность
+    1,2,…,N (N≥2) — надёжный признак списка шагов. Случайные порядковые в прозе («до 90.
+    Снимите», «версия 2. Готово», даже две в одной строке) дают номера НЕ вида 1..N → не
+    дробим. «1.» в начале строки ловится через ^ (R2: Codex high — глобальный счёт + col-0)."""
+    matches = list(_STEP_RE.finditer(line))
+    nums = [int(m.group(1)) for m in matches]
+    if len(nums) < 2 or nums != list(range(1, len(nums) + 1)):
+        return [line]
+    parts, last = [], 0
+    for m in matches:
+        if m.start() > 0:
+            parts.append(line[last:m.start()])
+            last = m.start()
+    parts.append(line[last:])
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _format_lists(text: str) -> str:
     """Детерминированный пост-формат: скомканный в ОДНУ строку список (≥3 пунктов через
-    « — ») разбиваем построчно. Промпт ненадёжен на длинных списках (Mercury комкает) —
-    это страховка. КОНСЕРВАТИВНО: триггер только при ≥2 разделителях « — » в строке, чтобы
-    НЕ задеть «— название — время» напоминаний (там 1 тире) и обычный текст с одним тире."""
+    « — ») разбиваем построчно + нумерованные шаги-последовательности (#168). Промпт
+    ненадёжен на длинных списках (Mercury комкает) — это страховка. КОНСЕРВАТИВНО: « — »
+    триггерит при ≥2 разделителях; шаги — только при последовательности 1..N."""
     out: list[str] = []
-    for ln in (text or "").split("\n"):
-        if ln.count(" — ") < 2:
-            out.append(ln)
-            continue
-        stripped = ln.lstrip()
-        if stripped.startswith("—"):
-            intro, seg = None, stripped
-        elif ":" in ln:
-            head, _, tail = ln.partition(":")
-            intro, seg = head + ":", tail.strip()
-        else:
-            out.append(ln)
-            continue
-        items = [p.strip().lstrip("—").strip() for p in seg.split(" — ")]
-        items = [i for i in items if i]
-        if len(items) < 3:  # подстраховка: не дробим «title — time»-подобное
-            out.append(ln)
-            continue
-        if intro:
-            out.append(intro)
-        out.extend("— " + i for i in items)
+    for raw in (text or "").split("\n"):
+        for ln in _split_numbered_steps(raw):
+            if ln.count(" — ") < 2:
+                out.append(ln)
+                continue
+            stripped = ln.lstrip()
+            if stripped.startswith("—"):
+                intro, seg = None, stripped
+            elif ":" in ln:
+                head, _, tail = ln.partition(":")
+                intro, seg = head + ":", tail.strip()
+            else:
+                out.append(ln)
+                continue
+            items = [p.strip().lstrip("—").strip() for p in seg.split(" — ")]
+            items = [i for i in items if i]
+            if len(items) < 3:  # подстраховка: не дробим «title — time»-подобное
+                out.append(ln)
+                continue
+            if intro:
+                out.append(intro)
+            out.extend("— " + i for i in items)
     return "\n".join(out)
+
+
+def _postformat(text: str) -> str:
+    """Единый пост-формат ответа Фредди: снять id/ref → снять markdown → разбить шаги/списки.
+    Порядок важен: markdown снимаем ДО разбивки шагов (иначе «N. **Заглавная**» не ловится)."""
+    return _format_lists(_strip_md(_scrub_ids(text)))
 
 
 def _interrupt_age_seconds(created_at: Any) -> float:
@@ -575,9 +628,9 @@ async def handle_turn(
         return {"configurable": {"thread_id": f"{base}#{g}"}}
 
     try:
-        # дата-якорь для резолва относительных дат моделью (МСК = UTC+3)
-        from datetime import timedelta
-        today_str = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d (%A)")
+        # дата-якорь для резолва относительных дат моделью (МСК = UTC+3, та же зона, что
+        # и naive-парсинг времени в _parse_dt — #168).
+        today_str = datetime.now(_MSK).strftime("%Y-%m-%d (%A)")
 
         tools = build_slice_tools(session, tenant_id, user_id)
         graph = _build_graph(
@@ -601,10 +654,10 @@ async def handle_turn(
 
         snap = await graph.aget_state(_cfg(gen))
         if snap.next:  # снова пауза → отдать вопрос пользователю
-            return _format_lists(_scrub_ids(_pending_question(snap))) or "Уточни, пожалуйста."
+            return _postformat(_pending_question(snap)) or "Уточни, пожалуйста."
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
-        return _format_lists(_scrub_ids(text)) or "Готово."
+        return _postformat(text) or "Готово."
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s",
