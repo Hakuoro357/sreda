@@ -131,11 +131,13 @@ def _system_prompt(today_str: str) -> str:
         "Задачи:\n"
         "- list_tasks(scheduled_date?): задачи (ref, название, дата/время).\n"
         "- add_task(title, scheduled_date?, time_start?, notes?): создать задачу.\n"
-        "- update_task(task_ref, title?, notes?): изменить ТЕКСТ задачи (перенос по времени "
-        "пока не поддержан).\n"
+        "- update_task(task_ref, title?, notes?, scheduled_date?, time_start?): изменить задачу "
+        "— текст и/или ПЕРЕНОС по времени (связанное напоминание подвинется само).\n"
         "- complete_task(task_ref) / uncomplete_task(task_ref): отметить выполненной/вернуть.\n"
         "- cancel_task(task_ref) / delete_task(task_ref): отменить/удалить. САМИ спросят "
         "подтверждение.\n"
+        "- link_task(task_ref, checklist_ref) / unlink_task(task_ref): связать/отвязать "
+        "задачу с чек-листом.\n"
         "- ask_human(question): уточнить у пользователя (какое из нескольких).\n"
         "Другое (своими инструментами): списки покупок, недельное меню, рецепты, чек-листы, "
         "члены семьи, заметки-память, погода и веб-поиск.\n</tools>\n\n"
@@ -335,20 +337,38 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         return f"ok:created:{t.id} | {t.title} | {_fmt_task_when(t)}"
 
     @tool
-    def update_task(task_ref: str, title: str = "", notes: str = "") -> str:
-        """Изменить ТЕКСТ задачи (название/заметки). Перенос по времени пока не поддержан."""
+    def update_task(task_ref: str, title: str = "", notes: str = "",
+                    scheduled_date: str = "", time_start: str = "") -> str:
+        """Изменить задачу: название/заметки и/или ПЕРЕНОС по времени (scheduled_date —
+        YYYY-MM-DD, time_start — HH:MM). Связанное напоминание сервис пере-цепит сам."""
         t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
         if t0 is None:
             return "Такой задачи у тебя нет."
-        # no-op guard (#162 п.5): те же значения → успех без записи (replay не двигает updated_at).
+        d = ts = None
+        if scheduled_date:
+            try:
+                d = date.fromisoformat(scheduled_date.strip())
+            except Exception:  # noqa: BLE001
+                return f"Не разобрала дату: {scheduled_date!r}."
+        if time_start:
+            try:
+                ts = time.fromisoformat(time_start.strip())
+            except Exception:  # noqa: BLE001
+                return f"Не разобрала время: {time_start!r}."
         new_title = (title or "").strip()[:500] or None
         new_notes = (notes or "").strip() or None
+        # no-op guard (#162 п.5): те же значения (вкл. дату/время) → успех без записи. Это И
+        # идемпотентность переноса: на replay дата/время уже = новым → НЕ пере-создаём напоминание.
         if ((new_title is None or new_title == (t0.title or None))
-                and (new_notes is None or new_notes == t0.notes)):
-            return f"ok:updated:{t0.id} | {t0.title}"
+                and (new_notes is None or new_notes == t0.notes)
+                and (d is None or d == t0.scheduled_date)
+                and (ts is None or ts == t0.time_start)):
+            return f"ok:updated:{t0.id} | {t0.title} | {_fmt_task_when(t0)}"
         t = tasks.update(tenant_id=tenant_id, user_id=user_id, task_id=task_ref,
-                         title=title or None, notes=notes or None)
-        return f"ok:updated:{t.id} | {t.title}" if t else "Такой задачи у тебя нет."
+                         title=title or None, notes=notes or None,
+                         scheduled_date=d, time_start=ts)
+        return (f"ok:updated:{t.id} | {t.title} | {_fmt_task_when(t)}"
+                if t else "Такой задачи у тебя нет.")
 
     @tool
     def complete_task(task_ref: str) -> str:
@@ -395,6 +415,33 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         return _confirm_destructive_task(task_ref, "удаляю", _apply)
 
     @tool
+    def link_task(task_ref: str, checklist_ref: str) -> str:
+        """Связать задачу с чек-листом по их ref. Идемпотентно (повтор → «уже связаны»)."""
+        status, _ = tasks.link_to_checklist(
+            tenant_id=tenant_id, user_id=user_id,
+            task_id=task_ref, checklist_id=checklist_ref)
+        if status.startswith("ok"):
+            session.commit()
+            return "Уже связаны." if status == "ok:already_linked" else "Готово, связала."
+        # error-пути сервиса НЕ мутируют (по контракту link_to_checklist) → rollback не нужен.
+        return {
+            "error:not_found": "Не нашла такую задачу или чек-лист.",
+            "error:archived": "Этот чек-лист в архиве — связать нельзя.",
+            "error:task_already_linked_to_other": "Задача уже связана с другим чек-листом.",
+            "error:checklist_already_linked_to_other": "Чек-лист уже связан с другой задачей.",
+        }.get(status, "Не получилось связать.")
+
+    @tool
+    def unlink_task(task_ref: str) -> str:
+        """Отвязать задачу от её чек-листа. Идемпотентно (если не связана — так и скажет)."""
+        status, _ = tasks.unlink_from_checklist(
+            tenant_id=tenant_id, user_id=user_id, task_id=task_ref)
+        if status == "error:not_found":
+            return "Такой задачи у тебя нет."
+        session.commit()
+        return "Она и не была связана." if status == "ok:not_linked" else "Готово, отвязала."
+
+    @tool
     def ask_human(question: str) -> str:
         """Задать пользователю уточняющий вопрос (какое из нескольких) и дождаться ответа."""
         return str(interrupt(question))
@@ -402,7 +449,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     bespoke = [
         list_reminders, schedule_reminder, update_reminder, cancel_reminder,
         list_tasks, add_task, update_task, complete_task, uncomplete_task,
-        cancel_task, delete_task, ask_human,
+        cancel_task, delete_task, link_task, unlink_task, ask_human,
     ]
 
     # #162 полный перенос — добираем остальные семьи из общего реестра

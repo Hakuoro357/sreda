@@ -44,7 +44,7 @@ def test_build_all_tools_families_and_reduced_task_schemas(db_session):
     bespoke = {
         "list_reminders", "schedule_reminder", "update_reminder", "cancel_reminder",
         "list_tasks", "add_task", "update_task", "complete_task", "uncomplete_task",
-        "cancel_task", "delete_task", "ask_human",
+        "cancel_task", "delete_task", "link_task", "unlink_task", "ask_human",
     }
     assert bespoke <= names, bespoke - names
     # добранные семьи (#162 полный перенос): покупки/меню/рецепты/чек-листы/семья/память/веб
@@ -53,11 +53,13 @@ def test_build_all_tools_families_and_reduced_task_schemas(db_session):
         "create_checklist", "add_family_members", "save_core_fact", "get_weather",
     }
     assert extra_expected <= names, extra_expected - names
-    # бес­поке add_task/update_task остаются урезанными (композит/расписание — позже)
+    # #166 A2: update_task ТЕПЕРЬ умеет перенос (scheduled_date/time_start) + есть link/unlink;
+    # add_task всё ещё урезан — композит (details_items/reminder_offset) отложен в #163.
     add_args = set(by["add_task"].args.keys())
     assert "details_items" not in add_args, add_args
     assert "reminder_offset_minutes" not in add_args, add_args
-    assert "scheduled_date" not in set(by["update_task"].args.keys())
+    upd_args = set(by["update_task"].args.keys())
+    assert {"scheduled_date", "time_start"} <= upd_args, upd_args
 
 
 @pytest.mark.asyncio
