@@ -1429,6 +1429,15 @@ async def handle_turn(
     checkpoint (_has_pause: interrupts + snap.created_at). turn_key минтится РАЗ на свежий ход из
     durable inbound_message_id и живёт в state (переживает resume). НИКОГДА не поднимает
     исключений — при сбое отдаёт безопасный fallback."""
+    # #175: подстраховка учёта расхода — если call-site забыл передать provider_key, берём
+    # planner_provider (все вызовы строят llm именно из него). Без этого пропущенный call-site
+    # ТИХО терял бы запись usage (прецедент: telegram_inbound сначала не передал → бюджет пуст).
+    if not provider_key:
+        try:
+            from sreda.config.settings import get_settings
+            provider_key = get_settings().planner_provider or ""
+        except Exception:  # noqa: BLE001 — не валим ход из-за учёта
+            provider_key = ""
     base = thread_id
     gen = _THREAD_GEN.get(base, 0)
 

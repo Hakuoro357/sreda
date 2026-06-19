@@ -129,6 +129,30 @@ async def test_react_records_usage_per_llm_call(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_react_usage_provider_key_fallback_to_planner_provider(db_session, monkeypatch):
+    """#175 подстраховка: call-site НЕ передал provider_key → handle_turn берёт planner_provider
+    (иначе пропущенный call-site тихо терял бы учёт — реальный прецедент с telegram_inbound)."""
+    from sreda.config.settings import get_settings
+
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    captured: list[dict] = []
+    monkeypatch.setattr(react_loop, "_record_react_usage",
+                        lambda **kw: captured.append(kw))
+
+    stub = _RecordingStubLLM([AIMessage(content="Привет!", usage_metadata=_u(10, 5))])
+    await react_loop.handle_turn(  # provider_key НЕ передан
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="u175-fb", llm=stub, user_text="привет",
+        inbound_message_id="u175-fb-msg", channel="react")
+
+    assert captured, "запись не вызвана — подстраховка provider_key не сработала"
+    expected = get_settings().planner_provider
+    assert expected, "planner_provider пуст в тест-настройках — нечего проверять"
+    assert all(c["provider_key"] == expected for c in captured)
+
+
+@pytest.mark.asyncio
 async def test_react_usage_failure_does_not_break_turn(db_session, monkeypatch):
     """C: сбой записи usage НЕ валит ход — пользователь получает нормальный ответ."""
     u = seed_telegram_user(db_session)
