@@ -344,12 +344,26 @@ def _safe_float(v: object) -> float | None:
         return None
 
 
+def _hhmm(iso: object) -> str | None:
+    """#176: ISO «2026-06-19T03:44» → «03:44». None если формат не строгий HH:MM (Codex MINOR:
+    не пускаем мусор после «T» в «Светло …»)."""
+    if not isinstance(iso, str) or "T" not in iso:
+        return None
+    part = iso.split("T", 1)[1][:5]
+    if len(part) == 5 and part[:2].isdigit() and part[2] == ":" and part[3:].isdigit():
+        return part
+    return None
+
+
+_HPA_TO_MMHG = 0.750062  # #176: гПа → мм рт.ст. (конвенция для RU)
+
+
 def _format_day_line(
     day: _date, code: int, tmax: float, tmin: float, precip_mm: float,
     *, feels_max: float | None = None, feels_min: float | None = None,
-    prob: float | None = None, gust: float | None = None,
+    prob: float | None = None, gust: float | None = None, uv: float | None = None,
 ) -> str:
-    """F1 format: '🌧️ ср 29 апр: +3°…+1° · 3.1мм'. #176: опц. ощущается/вероятность/порывы —
+    """F1 format: '🌧️ ср 29 апр: +3°…+1° · 3.1мм'. #176: опц. ощущается/вероятность/порывы/UV —
     дописываются ТОЛЬКО когда поле пришло из API (обратная совместимость)."""
     emoji = _WEATHER_EMOJI.get(code, "·")
     weekday = _RU_WEEKDAYS_SHORT.get(day.weekday(), "")
@@ -370,7 +384,9 @@ def _format_day_line(
     else:
         precip_part = _format_precip(precip_mm)
     gust_part = f" · порывы {round(gust)} м/с" if gust is not None and gust >= 12 else ""
-    return f"{emoji} {date_part}: {temp_part} · {precip_part}{gust_part}"
+    # #176 хвост: UV — только заметный (≥3, когда уже стоит мазаться кремом)
+    uv_part = f" · УФ {round(uv)}" if uv is not None and uv >= 3 else ""
+    return f"{emoji} {date_part}: {temp_part} · {precip_part}{gust_part}{uv_part}"
 
 
 def _format_hour_line(
@@ -492,11 +508,12 @@ def _fetch_forecast(
             "temperature_2m_max,temperature_2m_min,"
             "precipitation_sum,weathercode,"
             "apparent_temperature_max,apparent_temperature_min,"   # #176 ощущается
-            "precipitation_probability_max,wind_gusts_10m_max"      # #176 вероятность/порывы
+            "precipitation_probability_max,wind_gusts_10m_max,"     # #176 вероятность/порывы
+            "uv_index_max,sunrise,sunset"                           # #176 хвост: UV/рассвет/закат
         ),
         "current": (  # #176 текущие условия (для «сейчас/сегодня»)
             "temperature_2m,apparent_temperature,precipitation,weather_code,"
-            "wind_speed_10m,wind_gusts_10m,relative_humidity_2m"
+            "wind_speed_10m,wind_gusts_10m,relative_humidity_2m,pressure_msl"  # #176 хвост: давление
         ),
         "wind_speed_unit": "ms",
     }
@@ -652,9 +669,11 @@ def build_weather_tool() -> Callable:
     return get_weather
 
 
-def _render_current(current: dict | None) -> str | None:
+def _render_current(
+    current: dict | None, sunrise: object = None, sunset: object = None,
+) -> str | None:
     """#176: строка текущих условий «Сейчас: ☀️ +20°, ощущается +18°, ветер 10 м/с (порывы 31),
-    влажность 49%». None если блока нет / нет температуры (тогда выдача идёт без неё)."""
+    влажность 49%, давление 760 мм. Светло 03:44–21:17». None если блока нет / нет температуры."""
     if not current:
         return None
     try:
@@ -679,7 +698,14 @@ def _render_current(current: dict | None) -> str | None:
         hum = current.get("relative_humidity_2m")
         if hum is not None:
             parts.append(f"влажность {int(round(float(hum)))}%")
-        return ", ".join(parts)
+        pressure = _safe_float(current.get("pressure_msl"))  # #176 хвост: давление в мм рт.ст.
+        if pressure is not None:
+            parts.append(f"давление {round(pressure * _HPA_TO_MMHG)} мм")
+        line = ", ".join(parts)
+        sr, ss = _hhmm(sunrise), _hhmm(sunset)  # #176 хвост: светлое время
+        if sr and ss:
+            line += f". Светло {sr}–{ss}"
+        return line
     except (ValueError, TypeError):
         return None
 
@@ -699,6 +725,9 @@ def _render_daily(
     fmin = daily.get("apparent_temperature_min") or []
     probs = daily.get("precipitation_probability_max") or []
     gusts = daily.get("wind_gusts_10m_max") or []
+    uvs = daily.get("uv_index_max") or []                 # #176 хвост
+    sunrises = daily.get("sunrise") or []                 # #176 хвост
+    sunsets = daily.get("sunset") or []                   # #176 хвост
 
     if not dates:
         return "error: пустой прогноз"
@@ -721,7 +750,7 @@ def _render_daily(
                 tmin=float(tmin[i]) if i < len(tmin) else 0.0,
                 precip_mm=float(precip[i]) if i < len(precip) else 0.0,
                 feels_max=_at(fmax, i), feels_min=_at(fmin, i),
-                prob=_at(probs, i), gust=_at(gusts, i),
+                prob=_at(probs, i), gust=_at(gusts, i), uv=_at(uvs, i),
             )
         except (ValueError, TypeError, IndexError):
             continue
@@ -730,8 +759,15 @@ def _render_daily(
     if not lines:
         return "error: не удалось распарсить прогноз"
     body = f"{display}:\n" + "\n".join(lines)
-    # #176: для сегодня — текущие условия первой строкой (если блок current пришёл)
-    cur = _render_current(data.get("current")) if day_offset == 0 else None
+    # #176: для сегодня — текущие условия первой строкой (если блок current пришёл);
+    # рассвет/закат берём из daily текущего дня (day_offset).
+    cur = None
+    if day_offset == 0:
+        # daily-массивы начинаются с СЕГОДНЯ → индекс [0] = сегодня (валидно только в этой ветке
+        # day_offset==0; если когда-то покажем светлое время для др. дней — индекс пересчитать).
+        sr = sunrises[0] if sunrises else None
+        ss = sunsets[0] if sunsets else None
+        cur = _render_current(data.get("current"), sunrise=sr, sunset=ss)
     return f"{cur}\n{body}" if cur else body
 
 

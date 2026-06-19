@@ -283,6 +283,40 @@ def test_render_hourly_includes_probability_176():
     assert "70%" in out, out
 
 
+def test_hhmm_parses_valid_rejects_garbage_176():
+    """#176 хвост: _hhmm берёт строгий HH:MM, мусор → None (не течёт в «Светло …»)."""
+    assert wt._hhmm("2026-06-19T03:44") == "03:44"
+    assert wt._hhmm("2026-06-19T21:17:00") == "21:17"
+    assert wt._hhmm("xTabcde") is None
+    assert wt._hhmm("no-T-here") is None
+    assert wt._hhmm(None) is None
+    assert wt._hhmm(12345) is None
+
+
+def test_render_daily_includes_uv_176():
+    """#176 хвост: дневной рендер показывает UV-индекс (когда заметный)."""
+    data = {"daily": {"time": ["2026-06-19"], "temperature_2m_max": [21.0],
+                      "temperature_2m_min": [14.0], "precipitation_sum": [0.0],
+                      "weathercode": [1], "uv_index_max": [5.95]}}
+    out = wt._render_daily(data, day_offset=0, days_count=1, display="Москва")
+    assert "УФ 6" in out, out  # round(5.95)=6
+
+
+def test_render_current_pressure_and_daylight_176():
+    """#176 хвост: текущие условия — давление в мм рт.ст. + светлое время (рассвет/закат)."""
+    data = {
+        "daily": {"time": ["2026-06-19"], "temperature_2m_max": [21.0],
+                  "temperature_2m_min": [14.0], "precipitation_sum": [0.0], "weathercode": [1],
+                  "sunrise": ["2026-06-19T03:44"], "sunset": ["2026-06-19T21:17"]},
+        "current": {"temperature_2m": 20.0, "weather_code": 1, "pressure_msl": 1013.9},
+    }
+    out = wt._render_daily(data, day_offset=0, days_count=1, display="Москва")
+    assert "давление" in out.lower(), out
+    assert "760" in out, out      # 1013.9 hPa → 760 мм рт.ст.
+    assert "03:44" in out, out    # рассвет
+    assert "21:17" in out, out    # закат
+
+
 def test_get_weather_multi_day_format():
     """7-day forecast форматируется одной строкой на день."""
     wt._GEO_CACHE.clear()
