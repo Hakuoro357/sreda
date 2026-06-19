@@ -1315,6 +1315,14 @@ CHAT_PROVIDERS = (
     # 2026-06-19 (#173): быстрые НЕ-thinking, пиннинг Groq (форс быстрый бэкенд):
     "openrouter-llama33-groq",       # llama-3.3-70b @ Groq
     "openrouter-llama4scout-groq",   # llama-4-scout @ Groq
+    # 2026-06-19 (#173): ПРЯМОЙ Groq (свой ключ, без OpenRouter):
+    "groq-llama33-70b",              # llama-3.3-70b-versatile
+    "groq-gpt-oss-120b",             # openai/gpt-oss-120b
+    "groq-gpt-oss-20b",              # openai/gpt-oss-20b
+    "groq-qwen36-27b",               # qwen/qwen3.6-27b
+    "groq-qwen3-32b",                # qwen/qwen3-32b
+    "groq-llama4-scout",             # meta-llama/llama-4-scout-17b-16e-instruct
+    "groq-llama31-8b",               # llama-3.1-8b-instant
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1359,6 +1367,21 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
 # Inception (прямой) — Mercury-2. id сверен по /v1/models на ключе 2026-06-15.
 _INCEPTION_MODEL_BY_PROVIDER = {
     "inception-mercury2": "mercury-2",
+}
+
+
+# 2026-06-19 (#173): ПРЯМОЙ Groq (OpenAI-совместимый), ключ = resolve_groq_api_key()
+# (тот же, что для Whisper-STT). Tool-use модели сверены по /openai/v1/models на ключе.
+# Без хопа OpenRouter → ниже латентность. ТОЛЬКО для оценки замены Фредди.
+_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+_GROQ_MODEL_BY_PROVIDER = {
+    "groq-llama33-70b":   "llama-3.3-70b-versatile",
+    "groq-gpt-oss-120b":  "openai/gpt-oss-120b",
+    "groq-gpt-oss-20b":   "openai/gpt-oss-20b",
+    "groq-qwen36-27b":    "qwen/qwen3.6-27b",
+    "groq-qwen3-32b":     "qwen/qwen3-32b",
+    "groq-llama4-scout":  "meta-llama/llama-4-scout-17b-16e-instruct",
+    "groq-llama31-8b":    "llama-3.1-8b-instant",
 }
 
 
@@ -1520,6 +1543,20 @@ def _build_chat_llm(
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,
         )
+    if provider in _GROQ_MODEL_BY_PROVIDER:  # #173 прямой Groq (оценка)
+        api_key = settings.resolve_groq_api_key()
+        if not api_key:
+            logger.info("chat LLM disabled: no Groq API key configured")
+            return None
+        override = _GROQ_MODEL_BY_PROVIDER[provider]
+        return ChatOpenAI(
+            base_url=_GROQ_BASE_URL,
+            api_key=api_key,
+            model=model or override,
+            temperature=_override_temperature(provider, temperature),
+            timeout=settings.mimo_request_timeout_seconds,
+            **kwargs,
+        )
     logger.warning("chat LLM: unknown provider %r — ignoring", provider)
     return None
 
@@ -1638,6 +1675,8 @@ def _provider_key_is_available(provider: str, settings: Settings) -> bool:
         return bool(settings.resolve_openrouter_api_key())
     if provider in _INCEPTION_MODEL_BY_PROVIDER:
         return bool(settings.resolve_inception_api_key())
+    if provider in _GROQ_MODEL_BY_PROVIDER:  # #173 прямой Groq
+        return bool(settings.resolve_groq_api_key())
     return False
 
 
