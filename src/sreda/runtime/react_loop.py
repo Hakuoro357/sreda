@@ -162,6 +162,9 @@ class ReactState(MessagesState):
     # семью), и счётчик проходов chat (анти-петля, лимит _MAX_TURN_PASSES). Last-value каналы.
     guard_attempted_families: list[str]
     turn_pass_count: int
+    # wrote_unkeyed: в ходу уже отработал инструмент unkeyed-write семьи → guard ОТКЛЮЧЁН
+    # (анти-дубль на recovery-проходе, Codex medium R3). Last-value канал.
+    wrote_unkeyed: bool
     # guard_nudge: транзиентная подсказка от guard — chat дописывает её к системному промпту
     # на ОДИН проход и тут же очищает. НЕ кладём SystemMessage в историю (копился бы между
     # ходами + system в середине диалога → провайдер; R1 medium+субагент).
@@ -584,17 +587,54 @@ _REFUSAL_MARKERS = (
     "не умею", "не могу помочь", "пока не могу", "пока умею", "не поддерживаю",
     "это вне моих", "не получится помочь", "к сожалению, не",
 )
-# МИНИМАЛЬНЫЙ детектор семьи по ключевым словам (Срез A). Срез B заменит полноценным
-# словарём токен-матча по границам слова (план §4) — здесь лишь разблокировка guard.
-_GUARD_FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "shopping": ("купи", "покупк", "в список покупок", "в корзину", "молок", "продукт"),
+# #165 Срез B: СЛОВАРЬ-ПРЕДЗАГРУЗКА — корни по ГРАНИЦЕ СЛОВА (prefix-of-token, НЕ substring;
+# корни ≥4 симв — короткие дают ложные матчи, план §4). Один источник и для предзагрузки
+# (_route_families top-k), и для guard-добора (_guard_family). Тюнится по shadow-логам.
+# Дефисы нормализуются (чек-лист→чеклист). Хэнд-словарь — бутстрап (Kimi: позже learned-роутер).
+_WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+_FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
+    "shopping": ("купи", "покупк", "корзин", "продукт", "молок", "хлеб", "овощ", "фрукт", "магазин"),
     "recipes": ("рецепт", "приготов", "блюд", "ингредиент"),
-    "menu": ("меню", "на неделю", "что приготовить", "ужин на"),
-    "checklists": ("чек-лист", "чеклист", "список дел", "сборы"),
-    "household": ("член семьи", "членов семьи", "домочад", "кто в семье"),
-    "web": ("найди в интернете", "погугли", "поищи в сети", "новости", "погод", "курс"),
-    "memory": ("запомни", "сохрани заметк", "запиши факт"),
+    "menu": ("меню", "недел", "ужин", "обед", "завтрак"),
+    "checklists": ("чеклист", "сборы", "поручен"),  # «чек-лист» → дефис нормализуется в «чеклист»
+    "household": ("домочад", "родствен", "член", "семьи", "семью", "семей", "семейн"),
+    "web": ("найди", "поищ", "погугл", "поиск", "новост", "погода", "погоду", "погоды",
+            "курс", "интернет", "сайт"),  # корни сужены (R2: найд/погод→ложные «найден/погоди»)
+    "memory": ("запомни", "заметк", "запиш", "сохран"),  # запиши / сохрани факт
 }
+# #165 Срез B (R3-карв-аут): БЕЗОПАСНО резать (ленивые) только семьи без риска дубля на
+# recovery-проходе — shopping (есть within-turn ключ идемпотентности) + web (только чтение).
+# Остальные ленивые (recipes/menu/household/checklists/memory-save) пишут БЕЗ ключа → пока НЕ
+# режем (всегда привязаны), до #163 (оснащение ключами). Codex high R2 + план §5 + #163.
+_PRUNABLE_FAMILIES = frozenset({"shopping", "web"})
+# Ленивые семьи БЕЗ ключа идемпотентности (всегда привязаны карв-аутом). Если инструмент такой
+# семьи уже отработал в ходу — guard-добор (лишний recovery-проход) ОТКЛЮЧАЕМ: повтор мог бы
+# задвоить запись (Codex medium R3). Пред-существующий multi-pass re-emit — отдельно, #163.
+_UNKEYED_WRITE_FAMILIES = frozenset(_LAZY_FAMILIES) - _PRUNABLE_FAMILIES
+
+
+def _route_families(text: str, k: int = 2) -> list[str]:
+    """Предзагрузка (Срез B): текст → токены → семьи с корнем-префиксом токена → top-k по
+    числу СОВПАВШИХ ТОКЕНОВ (не пар: токен с несколькими корнями = 1 очко). Плохой словарь →
+    лишь чаще лишний need_family-шаг, НЕ отказ (страж §2). k≤0 → пусто."""
+    if k <= 0:
+        return []
+    # нормализуем класс дефисов/тире (вкл. не-ASCII ‑–—, R2 medium): чек-лист→чеклист
+    norm = re.sub(r"[-‐‑‒–—]", "", (text or "").lower())
+    tokens = _WORD_RE.findall(norm)
+    scored: dict[str, int] = {}
+    for fam, roots in _FAMILY_ROOTS.items():
+        n = sum(1 for tok in tokens if any(tok.startswith(r) for r in roots))
+        if n:
+            scored[fam] = n
+    return [f for f, _ in sorted(scored.items(), key=lambda kv: -kv[1])][:k]
+
+
+def _is_pruned(tenant_id: str) -> bool:
+    """#165 Срез B: обрезан ли набор инструментов у тенанта (per-tenant флаг
+    SREDA_REACT_PRUNE_TENANTS). Дефолт — НЕТ → full-bind (ноль изменений). Канарейка/kill-switch."""
+    from sreda.config.settings import get_settings
+    return tenant_id in get_settings().react_prune_tenants
 
 
 def _looks_like_refusal(content: Any) -> bool:
@@ -602,11 +642,13 @@ def _looks_like_refusal(content: Any) -> bool:
     return any(m in t for m in _REFUSAL_MARKERS)
 
 
-def _detect_family_kw(text: str) -> str | None:
-    """Минимальный детектор семьи по ключевым словам (Срез A; Срез B → словарь)."""
-    t = (text or "").lower()
-    for fam, kws in _GUARD_FAMILY_KEYWORDS.items():
-        if any(k in t for k in kws):
+def _guard_family(text: str, active: Any) -> str | None:
+    """Семья для guard-ДОБОРА: первая по ранжированию словаря, которой ЕЩЁ НЕТ в active.
+    R1-фикс (все ревьюеры): top-1 почти всегда УЖЕ предзагружен → брать его бессмысленно;
+    guard должен искать первую НЕзагруженную семью (recovery для rank-2+/промахов предзагрузки)."""
+    have = set(active or ())
+    for fam in _route_families(text, k=len(_FAMILY_ROOTS)):
+        if fam not in have:
             return fam
     return None
 
@@ -932,10 +974,12 @@ def _build_graph(llm: Any, all_tools: list, *,
         }
 
     def run_tools(state: ReactState):
+        from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
         turn_key = state.get("turn_key") or ""
         exec_id = (hashlib.sha1(turn_key.encode("utf-8")).hexdigest()
                    if turn_key else "")
         active = list(state.get("active_families") or [])
+        wrote_unkeyed = False  # отработал ли инструмент unkeyed-write семьи (→ выключит guard)
         # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента
         # из НЕ загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш.
         bound_by_name = {t.name: t for t in _select_tools(all_tools, active)}
@@ -983,9 +1027,13 @@ def _build_graph(llm: Any, all_tools: list, *,
             else:
                 res = tool_obj.invoke(tc["args"])
             out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"]))
+            if TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES:
+                wrote_unkeyed = True  # unkeyed-write выполнен → guard отключим (анти-дубль)
         update: dict = {"messages": out}
         if added:  # семья добрана → обновляем state (last-value канал)
             update["active_families"] = active
+        if wrote_unkeyed:  # фиксируем флаг (last-value: остаётся True до конца хода)
+            update["wrote_unkeyed"] = True
         return update
 
     def route(state: ReactState):
@@ -1002,18 +1050,25 @@ def _build_graph(llm: Any, all_tools: list, *,
         # → подстраховка (один retry на семью). scope-отказ (нет семьи в срезе) НЕ триггерит.
         if passes < _MAX_TURN_PASSES \
                 and _looks_like_refusal(getattr(last, "content", "")):
-            fam = _detect_family_kw(_last_human_text(state["messages"]))
-            if fam and fam not in (state.get("active_families") or ()) \
-                    and fam not in (state.get("guard_attempted_families") or ()):
-                return "guard"
+            # active-aware: первая НЕзагруженная семья по словарю (recovery, не уже-загруженный top-1)
+            fam = _guard_family(_last_human_text(state["messages"]),
+                                state.get("active_families"))
+            if fam and fam not in (state.get("guard_attempted_families") or ()):
+                # R4 (Codex medium): unkeyed-write уже был в ходу → guard ОТКЛЮЧЁН (повтор задвоил бы).
+                # R5 (Kimi): логируем СОБЫТИЕ подавления — наблюдаемость для канарейки (как часто
+                # backstop реально нужен, но подавлен). need_family остаётся модель-driven путём.
+                if state.get("wrote_unkeyed"):
+                    logger.info("react: guard подавлен после unkeyed-write (семья %s не добрана)", fam)
+                else:
+                    return "guard"
         return END
 
     def guard(state: ReactState):
         # догрузить семью + пометить пробованной + ТРАНЗИЕНТНЫЙ nudge (через состояние, НЕ
         # сообщением в истории) → обратно в chat. turn_pass_count инкрементит chat. Один retry
         # на семью; если после него модель снова откажет — route не вернёт guard (в attempted).
-        fam = _detect_family_kw(_last_human_text(state["messages"]))
         active = list(state.get("active_families") or [])
+        fam = _guard_family(_last_human_text(state["messages"]), active)
         attempted = list(state.get("guard_attempted_families") or [])
         if fam and fam not in active:
             active.append(fam)
@@ -1333,13 +1388,21 @@ async def handle_turn(
                 _THREAD_GEN[base] = gen
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
-            # #165 Срез A: свежий ход стартует с БАЗЫ семей (в Срезе A — пусто → только ядро;
-            # дальше Срез B добавит словарь-предзагрузку). Сброс на каждый ход → нет дрейфа.
-            # guard_attempted_families/turn_pass_count тоже сбрасываем (per-turn анти-петля).
+            # #165 Срез B (R3-карв-аут): пруненый тенант → база = НЕБЕЗОПАСНЫЕ-к-обрезке
+            # ленивые семьи ВСЕГДА (recipes/menu/household/checklists/memory — пишут без ключа,
+            # дубль на recovery; до #163) + распознанные словарём PRUNABLE (shopping/web —
+            # режем только их). Флаг ВЫКЛ (дефолт) → ВСЕ ленивые = full-bind (ноль изменений).
+            # Сброс базы на каждый ход → нет межсообщенного дрейфа.
+            if _is_pruned(tenant_id):
+                routed = set(_route_families(user_text, k=len(_FAMILY_ROOTS)))
+                base_fams = sorted((set(_LAZY_FAMILIES) - _PRUNABLE_FAMILIES)
+                                   | (routed & _PRUNABLE_FAMILIES))
+            else:
+                base_fams = list(_LAZY_FAMILIES)
             result = await graph.ainvoke(
                 {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
-                 "active_families": [], "guard_attempted_families": [],
-                 "turn_pass_count": 0, "guard_nudge": ""}, _cfg(gen))
+                 "active_families": base_fams, "guard_attempted_families": [],
+                 "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
         _tools = _called_tools(result)

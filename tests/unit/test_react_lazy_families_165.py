@@ -40,6 +40,14 @@ class _RecordingStubLLM:
         return msg
 
 
+@pytest.fixture(autouse=True)
+def _prune_on(monkeypatch):
+    """#165 Срез B: флаг обрезки по умолчанию ВЫКЛ → mechanism-тесты гоняем с ВКЛ обрезкой
+    (иначе full-bind и посыл «семья не предзагружена» не проверить). Тесты предзагрузки/флага
+    переопределяют это сами."""
+    monkeypatch.setattr(react_loop, "_is_pruned", lambda _t: True)
+
+
 @pytest.mark.asyncio
 async def test_need_family_loads_family_and_executes_tool(db_session):
     """Срез A контракт: need_family(shopping) → add_shopping_items доступен и выполняется."""
@@ -66,7 +74,9 @@ async def test_need_family_loads_family_and_executes_tool(db_session):
         user_id=u.user_id,
         thread_id="lazy165-1",
         llm=stub,
-        user_text="добавь молоко и хлеб в покупки",
+        # НЕЙТРАЛЬНЫЙ текст: словарь его не матчит → база пуста → проверяем именно ДОБОР
+        # (если бы написали «купи молоко», Срез B предзагрузил бы shopping сам).
+        user_text="сделай, пожалуйста, вот это",
         inbound_message_id="lazy165-1-msg",
         channel="react",
     )
@@ -88,11 +98,13 @@ async def test_need_family_loads_family_and_executes_tool(db_session):
 
 
 @pytest.mark.asyncio
-async def test_guard_loads_family_when_model_refuses(db_session):
+async def test_guard_loads_family_when_model_refuses(db_session, monkeypatch):
     """Срез A пункт 2: модель сама не дозвалась («не умею») → guard догружает семью и ход
-    завершается ДЕЛОМ (не молчаливым отказом)."""
+    завершается ДЕЛОМ (не молчаливым отказом). Текст нейтральный (база пуста), детектор guard
+    мокаем на shopping — изолируем МЕХАНИЗМ guard (в проде детект — тем же словарём)."""
     u = seed_telegram_user(db_session)
     db_session.commit()
+    monkeypatch.setattr(react_loop, "_guard_family", lambda _t, _a: "shopping")
     scripted = [
         AIMessage(content="Извини, пока не умею добавлять в покупки."),  # ОТКАЗ, без tool_call
         AIMessage(content="", tool_calls=[{  # после guard-добора — реальный вызов
@@ -104,7 +116,7 @@ async def test_guard_loads_family_when_model_refuses(db_session):
     stub = _RecordingStubLLM(scripted)
     reply = await react_loop.handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
-        thread_id="lazy165-guard", llm=stub, user_text="добавь молоко в покупки",
+        thread_id="lazy165-guard", llm=stub, user_text="помоги мне, пожалуйста",
         inbound_message_id="lazy165-guard-msg", channel="react")
 
     # guard сработал: shopping не было на 1-м проходе, появилось на 2-м
@@ -157,7 +169,7 @@ async def test_repeat_write_after_need_family_no_duplicate(db_session):
     stub = _RecordingStubLLM(scripted)
     await react_loop.handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
-        thread_id="lazy165-dup", llm=stub, user_text="добавь молоко в покупки",
+        thread_id="lazy165-dup", llm=stub, user_text="помоги мне с делом",
         inbound_message_id="lazy165-dup-msg", channel="react")
 
     # title — EncryptedString (недетерминир. шифрование) → фильтровать в Python по расшифровке
@@ -240,3 +252,111 @@ async def test_repeated_need_family_does_not_loop_forever(db_session):
     assert reply
     assert "потеряла контекст" not in (reply or "")
     assert len(stub.binds) <= react_loop._MAX_TURN_PASSES
+
+
+# ───────────────────────── #165 Срез B: словарь-предзагрузка + флаг ─────────────────────────
+
+def test_route_families_token_boundary():
+    """Срез B: словарь матчит семьи по корню-префиксу токена (не подстрока), top-k."""
+    assert "shopping" in react_loop._route_families("купи молоко и хлеб")
+    assert "web" in react_loop._route_families("какая погода завтра")
+    assert "recipes" in react_loop._route_families("дай рецепт борща")
+    assert react_loop._route_families("привет, как дела") == []  # болтовня → пусто
+    assert len(react_loop._route_families("купи молоко, дай рецепт, меню на неделю")) <= 2  # top-2
+    assert "checklists" in react_loop._route_families("добавь в чек-лист")  # дефис нормализуется
+    assert react_loop._route_families("текст", k=0) == []  # k≤0 → пусто (R2 MINOR)
+
+
+def test_guard_family_picks_first_non_preloaded():
+    """R2 (все ревьюеры): guard-добор берёт первую НЕзагруженную семью по ранжированию, а НЕ
+    уже-предзагруженный top-1 (иначе guard мёртв). shopping активен → берёт web."""
+    fam = react_loop._guard_family("купи молоко и найди магазин рядом", active=["shopping"])
+    assert fam == "web", fam  # shopping уже active → первая незагруженная = web
+    # если всё уже загружено — None (нечего добирать)
+    assert react_loop._guard_family("купи молоко", active=["shopping"]) is None
+
+
+@pytest.mark.asyncio
+async def test_preload_binds_predicted_family_without_need_family(db_session):
+    """Срез B: текст про покупки → словарь предзагружает shopping → инструмент доступен СРАЗУ
+    (на 1-м проходе), без лишнего need_family-шага."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "add_shopping_items",
+            "args": {"items": [{"title": "молоко"}]}, "id": "add"}]),
+        AIMessage(content="Готово."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy165-preload", llm=stub, user_text="купи молоко",
+        inbound_message_id="lazy165-preload-msg", channel="react")
+    # shopping предзагружен → доступен уже на ПЕРВОМ bind (need_family не понадобился)
+    assert "add_shopping_items" in stub.binds[0]
+    from sreda.db.models.housewife_food import ShoppingListItem
+    rows = db_session.query(ShoppingListItem).filter(
+        ShoppingListItem.tenant_id == u.tenant_id).all()
+    assert "молоко" in {r.title for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_flag_off_full_bind_no_pruning(db_session, monkeypatch):
+    """Срез B: флаг обрезки ВЫКЛ → full-bind (все семьи привязаны на 1-м проходе) = поведение
+    до #165, ноль изменений. (autouse-фикстура _prune_on переопределяется здесь.)"""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    monkeypatch.setattr(react_loop, "_is_pruned", lambda _t: False)  # флаг ВЫКЛ
+    stub = _RecordingStubLLM([AIMessage(content="Привет!")])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy165-flagoff", llm=stub, user_text="помоги мне",
+        inbound_message_id="lazy165-flagoff-msg", channel="react")
+    # full-bind: даже на нейтральном тексте семейные инструменты привязаны
+    assert "add_shopping_items" in stub.binds[0]
+    assert "save_recipe" in stub.binds[0]
+
+
+@pytest.mark.asyncio
+async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
+    """Срез B R3-карв-аут (Codex high R2 MAJOR): семьи БЕЗ ключа идемпотентности
+    (recipes/menu/household/checklists) при ВКЛ обрезке остаются ПРИВЯЗАННЫМИ (иначе повтор на
+    recovery-проходе задвоит запись, #163). Режем только shopping (есть ключ) + web (чтение)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
+    stub = _RecordingStubLLM([AIMessage(content="Привет!")])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy165-carveout", llm=stub, user_text="привет, как дела",  # нейтральный
+        inbound_message_id="lazy165-carveout-msg", channel="react")
+    bound = stub.binds[0]
+    # unkeyed-write семьи ВСЕГДА привязаны даже при обрезке + нейтральном тексте
+    assert "save_recipe" in bound          # recipes
+    assert "plan_week_menu" in bound       # menu
+    assert "add_family_members" in bound   # household
+    assert "create_checklist" in bound     # checklists
+    # prunable (shopping/web) на нейтральном тексте НЕ предзагружены (режутся)
+    assert "add_shopping_items" not in bound
+    assert "web_search" not in bound
+
+
+@pytest.mark.asyncio
+async def test_guard_suppressed_after_unkeyed_write(db_session, monkeypatch):
+    """R4 (Codex medium): после выполнения инструмента unkeyed-семьи в ходу guard ОТКЛЮЧЁН —
+    повторный recovery-проход мог бы задвоить запись. (need_family остаётся доступен моделью.)"""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    monkeypatch.setattr(react_loop, "_guard_family", lambda _t, _a: "web")  # guard БЫ выбрал web
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[{  # пасс1: инструмент unkeyed-семьи (checklists)
+            "name": "list_checklists", "args": {}, "id": "lc"}]),
+        AIMessage(content="Извини, искать в сети пока не умею."),  # пасс2: отказ (web-ish)
+        AIMessage(content="..."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy165-unkeyed-guard", llm=stub, user_text="покажи чек-листы",
+        inbound_message_id="lazy165-unkeyed-guard-msg", channel="react")
+    # guard НЕ сработал (wrote_unkeyed) → нет 3-го прохода с web; web не догружен
+    assert len(stub.binds) == 2, f"guard сработал после unkeyed-write: {len(stub.binds)} проходов"
+    assert all("web_search" not in b for b in stub.binds)
