@@ -151,7 +151,8 @@ def test_schedule_reminder_future_still_works_174(db_session):
     db_session.commit()
     future_iso = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
     tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
-    out = tools["schedule_reminder"].invoke({"title": "стоматолог", "trigger_iso": future_iso})
+    out = tools["schedule_reminder"].invoke(
+        {"title": "стоматолог", "trigger_iso": future_iso})
     assert "ok:scheduled" in out, out
     rows = db_session.query(FamilyReminder).filter(
         FamilyReminder.tenant_id == u.tenant_id).all()
@@ -185,6 +186,71 @@ async def test_run_tools_tool_exception_does_not_kill_turn_163(db_session, monke
         inbound_message_id="i163-raise-msg", channel="react")
     assert "потеряла контекст" not in str(reply), f"ход упал вместо error-ToolMessage: {reply!r}"
     assert "отово" in str(reply), f"модель не продолжила после сбоя инструмента: {reply!r}"
+
+
+@pytest.mark.asyncio
+async def test_reminder_without_time_blocked_by_gate_180(db_session):
+    """#180 (ключевой принцип, ДЕТЕРМИНИРОВАННЫЙ гейт): полный ход «напомни завтра позвонить
+    маме» (БЕЗ времени) — даже если модель зовёт schedule_reminder, run_tools блокирует по
+    словам юзера (нет времени) и просит спросить; строка в БД НЕ создаётся."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{  # модель ВЫДУМАЛА 09:00 (как в проде)
+            "name": "schedule_reminder",
+            "args": {"title": "позвонить маме", "trigger_iso": "2030-01-02T09:00:00+03:00"},
+            "id": "call_1"}]),
+        AIMessage(content="А во сколько напомнить?"),  # после need_time модель спрашивает
+    ])
+    await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                      thread_id=f"react:t:{uuid4().hex}", llm=stub,
+                      user_text="напомни завтра позвонить маме",  # БЕЗ времени
+                      inbound_message_id=f"msg_{uuid4().hex}", channel="max")
+    rows = db_session.query(FamilyReminder).filter(
+        FamilyReminder.tenant_id == u.tenant_id).all()
+    assert rows == [], f"без времени напоминание не должно создаваться: {rows}"
+
+
+@pytest.mark.asyncio
+async def test_reminder_with_time_passes_gate_180(db_session):
+    """#180 регресс: «напомни завтра в 9 позвонить маме» (время названо) — гейт пропускает,
+    напоминание создаётся."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "schedule_reminder",
+            "args": {"title": "позвонить маме", "trigger_iso": "2030-01-02T09:00:00+03:00"},
+            "id": "call_1"}]),
+        AIMessage(content="Позвонить маме завтра в 09:00 — запланировала."),
+    ])
+    await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+                      thread_id=f"react:t:{uuid4().hex}", llm=stub,
+                      user_text="напомни завтра в 9 позвонить маме",  # время названо
+                      inbound_message_id=f"msg_{uuid4().hex}", channel="max")
+    rows = db_session.query(FamilyReminder).filter(
+        FamilyReminder.tenant_id == u.tenant_id).all()
+    assert len(rows) == 1 and rows[0].title == "позвонить маме"
+
+
+def test_text_mentions_time_detector_180():
+    """#180: детектор конкретного времени — что считается временем, что нет."""
+    yes = ["в 9", "к 18", "в 14:00", "позвонить в 9 утра", "через 10 минут", "в полдень",
+           "напомни в 6 позвонить маме", "14:30", "напомни завтра в 6 забрать посылку",
+           "в 5 часов", "в 5 ч", "через 2 часа"]
+    # ложные срабатывания (Codex/субагент R2-R3) — количество/дата/существительные, НЕ время:
+    no = ["напомни завтра позвонить маме", "напомни утром", "вечером", "купить хлеб",
+          "напомни про зал", "купить в 2 магазинах продукты", "позвонить в 5 человек",
+          "встреча в 10 офисе", "в двух словах напомни", "напомни в девять",
+          "напомни 9.05 поздравить", "к 9 мая купить подарок",  # дата
+          "разбить в 5 частей", "в 2 части", "через 10 частей",  # «части» (Codex R3 час\w*)
+          "в 6 ночь", "в 5 дети",  # -чь/-ти существительные (субагент R3)
+          "в 5 часть", "в 5 область", "в 5 сеть", "в 5 новость",  # -ть существительные (Codex R4)
+          "посмотреть Полночный экспресс"]  # «полночный» — прилагательное, не время (Codex R4)
+    for t in yes:
+        assert react_loop._text_mentions_time(t), f"должно быть время: {t!r}"
+    for t in no:
+        assert not react_loop._text_mentions_time(t), f"НЕ должно быть времени: {t!r}"
 
 
 def test_update_reminder_past_trigger_rolls_forward_174(db_session):
