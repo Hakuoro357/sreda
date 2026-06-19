@@ -995,12 +995,73 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     return bespoke + extra
 
 
+def _extract_usage(resp: Any) -> tuple[int, int]:
+    """(prompt, completion) из usage_metadata ответа LLM (input/output_tokens); (0,0) если нет.
+    Тот же контракт, что planner/llm._extract_usage (#151) — провайдеры МиМо/Mercury/Gemini
+    кладут usage в LangChain AIMessage.usage_metadata."""
+    usage = getattr(resp, "usage_metadata", None) or {}
+    try:
+        return (max(int(usage.get("input_tokens") or 0), 0),
+                max(int(usage.get("output_tokens") or 0), 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0, 0
+
+
+def _record_react_usage(*, bind: Any, tenant_id: str, provider_key: str, model: str,
+                        prompt_tokens: int, completion_tokens: int, run_id: str) -> None:
+    """#175 (хвост #150/#151): записать ОДИН вызов LLM ReAct-узла в skill_ai_executions, чтобы
+    денежные страницы #150 видели расход ReAct (legacy пишет в planner_chat.py:506; ReAct —
+    отдельный путь, не писал ничего). Наблюдательная строка: credits_override=0 (Mercury не
+    MiMo-калиброван → не искажаем кредит-квоту; токены+provider нужны USD-оценке). ИЗОЛИРОВАННАЯ
+    сессия (не транзакция хода — учёт переживает откат хода и не пачкает его). Guarded —
+    учёт НИКОГДА не валит ход (как planner_chat / handlers)."""
+    if (prompt_tokens or 0) <= 0 and (completion_tokens or 0) <= 0:
+        return  # провайдер не отдал usage — мусорную нулевую строку не копим
+    if not provider_key:
+        return
+    try:
+        from sqlalchemy.orm import Session as _SASession
+
+        from sreda.services.budget import BudgetService
+        acct = _SASession(bind=bind)
+        try:
+            BudgetService(acct).record_llm_usage(
+                tenant_id=tenant_id, feature_key="housewife_assistant",
+                model=model or provider_key,
+                prompt_tokens=max(prompt_tokens or 0, 0),
+                completion_tokens=max(completion_tokens or 0, 0),
+                run_id=run_id or f"react_{provider_key}",
+                provider_key=provider_key, task_type="react_turn",
+                credits_override=0,
+            )
+            acct.commit()
+        finally:
+            acct.close()
+    except Exception:  # noqa: BLE001 — учёт не валит ход
+        logger.warning("react_loop: usage record failed", exc_info=True)
+
+
 def _build_graph(llm: Any, all_tools: list, *,
-                 tenant_id: str, user_id: str, today_str: str):
+                 tenant_id: str, user_id: str, today_str: str,
+                 session: Any = None, provider_key: str = ""):
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
     ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
-    набор меняется по ходу без перекомпиляции графа (need_family добирает семью)."""
+    набор меняется по ходу без перекомпиляции графа (need_family добирает семью).
+
+    #175: session (для bind изолированной accounting-сессии) + provider_key (планировщика) —
+    chat-узел пишет usage каждого вызова LLM в skill_ai_executions (деньги/#150)."""
     system_prompt = _system_prompt(today_str)
+    # #175: каноничное имя модели — ТЕМ ЖЕ резолвером, что legacy #151 (planner/llm), чтобы
+    # ключ (provider_key, model) совпал с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
+    # response_metadata.model_name мог бы дать иную форму → unpriced. Резолвим РАЗ (не на вызов).
+    _model_name = ""
+    if provider_key:
+        try:
+            from sreda.config.settings import get_settings
+            from sreda.runtime.planner.llm import _resolve_model_name
+            _model_name = _resolve_model_name(llm, get_settings(), provider_key)
+        except Exception:  # noqa: BLE001 — резолв не валит ход; пусто → fallback provider_key
+            _model_name = ""
 
     def chat(state: ReactState):
         # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
@@ -1009,9 +1070,20 @@ def _build_graph(llm: Any, all_tools: list, *,
         nudge = state.get("guard_nudge")
         if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
             sp = f"{sp}\n\n{nudge}"
+        resp = llm.bind_tools(bound).invoke([SystemMessage(sp), *state["messages"]])
+        # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
+        # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
+        try:
+            _p, _c = _extract_usage(resp)
+            _record_react_usage(
+                bind=(session.get_bind() if session is not None else None),
+                tenant_id=tenant_id, provider_key=provider_key, model=_model_name,
+                prompt_tokens=_p, completion_tokens=_c,
+                run_id=state.get("turn_key") or "")
+        except Exception:  # noqa: BLE001 — учёт не валит ход
+            logger.warning("react_loop: usage handling failed", exc_info=True)
         return {
-            "messages": [llm.bind_tools(bound).invoke(
-                [SystemMessage(sp), *state["messages"]])],
+            "messages": [resp],
             "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # анти-петля
             "guard_nudge": "",  # one-shot: очищаем после применения
         }
@@ -1373,11 +1445,21 @@ async def handle_turn(
     *, session: Any, tenant_id: str, user_id: str, thread_id: str,
     llm: Any, user_text: str, inbound_message_id: str = "", channel: str = "react",
     resume_only: bool = False, expected_confirm_id: str = "",
+    provider_key: str = "",
 ) -> "_Reply":
     """ВХОД нового цикла на одно входящее сообщение. Источник правды о паузе — сам
     checkpoint (_has_pause: interrupts + snap.created_at). turn_key минтится РАЗ на свежий ход из
     durable inbound_message_id и живёт в state (переживает resume). НИКОГДА не поднимает
     исключений — при сбое отдаёт безопасный fallback."""
+    # #175: подстраховка учёта расхода — если call-site забыл передать provider_key, берём
+    # planner_provider (все вызовы строят llm именно из него). Без этого пропущенный call-site
+    # ТИХО терял бы запись usage (прецедент: telegram_inbound сначала не передал → бюджет пуст).
+    if not provider_key:
+        try:
+            from sreda.config.settings import get_settings
+            provider_key = get_settings().planner_provider or ""
+        except Exception:  # noqa: BLE001 — не валим ход из-за учёта
+            provider_key = ""
     base = thread_id
     gen = _THREAD_GEN.get(base, 0)
 
@@ -1396,7 +1478,8 @@ async def handle_turn(
         tools = build_slice_tools(session, tenant_id, user_id)
         graph = _build_graph(  # #165 Срез A: сырой llm + ВСЕ инструменты; bind поднабора в узлах
             llm, tools,
-            tenant_id=tenant_id, user_id=user_id, today_str=today_str)
+            tenant_id=tenant_id, user_id=user_id, today_str=today_str,
+            session=session, provider_key=provider_key)  # #175: учёт расхода в chat-узле
 
         snap = await graph.aget_state(_cfg(gen))
         live_pause = (_has_pause(snap)

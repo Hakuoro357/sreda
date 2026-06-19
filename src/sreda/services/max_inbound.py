@@ -917,6 +917,7 @@ async def _process_approved_max_turn(
                         inbound_message_id=inbound_message_id, channel="max",
                         resume_only=True,
                         expected_confirm_id=react_loop.confirm_callback_id(_cb_confirm),
+                        provider_key=settings.planner_provider,  # #175: учёт расхода ReAct
                     )
                     trace.record(
                         "react_loop.resumed", chars=len(_reply_r or ""), channel="max",
@@ -1113,6 +1114,7 @@ async def _process_approved_max_turn(
                         user_text=message_text,
                         inbound_message_id=inbound_message_id,
                         channel="max",
+                        provider_key=settings.planner_provider,  # #175: учёт расхода ReAct
                     )
                     trace.record(
                         "react_loop.replied", chars=len(_reply or ""), channel="max",

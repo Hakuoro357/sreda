@@ -273,6 +273,15 @@ def _msk_day_window_utc(for_date: date) -> tuple[datetime, datetime]:
     return start_msk.astimezone(timezone.utc), end_msk.astimezone(timezone.utc)
 
 
+def has_active_subscriptions(session: Session) -> bool:
+    """#175: есть ли хоть одна активная подписка. Нужно странице /budget, чтобы отличить
+    «активных подписок нет» от «подписки есть, но расхода за день нет» (иначе пустой день
+    показывал ложное «Нет активных подписок» — симптом #175)."""
+    return session.query(TenantSubscription.id).filter(
+        TenantSubscription.status == "active"
+    ).first() is not None
+
+
 def get_budget_summary_for_day(
     session: Session, for_date: date
 ) -> list[BudgetRow]:
