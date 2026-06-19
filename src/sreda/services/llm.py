@@ -1323,6 +1323,8 @@ CHAT_PROVIDERS = (
     "groq-qwen3-32b",                # qwen/qwen3-32b
     "groq-llama4-scout",             # meta-llama/llama-4-scout-17b-16e-instruct
     "groq-llama31-8b",               # llama-3.1-8b-instant
+    "groq-gpt-oss-120b-low",         # gpt-oss-120b reasoning_effort=low
+    "groq-gpt-oss-120b-high",        # gpt-oss-120b reasoning_effort=high
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1382,6 +1384,15 @@ _GROQ_MODEL_BY_PROVIDER = {
     "groq-qwen3-32b":     "qwen/qwen3-32b",
     "groq-llama4-scout":  "meta-llama/llama-4-scout-17b-16e-instruct",
     "groq-llama31-8b":    "llama-3.1-8b-instant",
+    # 2026-06-19 (#173): варианты gpt-oss-120b с разным reasoning_effort (срезать хвост латентности).
+    "groq-gpt-oss-120b-low":  "openai/gpt-oss-120b",
+    "groq-gpt-oss-120b-high": "openai/gpt-oss-120b",
+}
+
+# #173: per-provider extra_body для прямого Groq (reasoning_effort у gpt-oss).
+_GROQ_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    "groq-gpt-oss-120b-low":  {"reasoning_effort": "low"},
+    "groq-gpt-oss-120b-high": {"reasoning_effort": "high"},
 }
 
 
@@ -1549,6 +1560,9 @@ def _build_chat_llm(
             logger.info("chat LLM disabled: no Groq API key configured")
             return None
         override = _GROQ_MODEL_BY_PROVIDER[provider]
+        groq_extra = _GROQ_EXTRA_BODY_BY_PROVIDER.get(provider)
+        if groq_extra:  # #173 reasoning_effort и т.п.
+            kwargs["extra_body"] = {**groq_extra, **(kwargs.pop("extra_body", None) or {})}
         return ChatOpenAI(
             base_url=_GROQ_BASE_URL,
             api_key=api_key,
