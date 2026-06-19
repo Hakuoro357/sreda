@@ -17,11 +17,12 @@ def _sp() -> str:
     return _system_prompt("2030-01-01 (Вторник)").lower()
 
 
-def test_rule11_transparency_names_moment_and_default_180():
+def test_rule11_missing_info_ask_not_assume_180():
     sp = _sp()
-    assert "прозрачность допущений" in sp
-    assert "всегда называй" in sp          # итоговый момент напоминания
-    assert "по умолчанию" in sp            # помечать дефолтное время
+    assert "не додумывай" in sp                 # ключевой принцип: не хватает — спроси
+    assert "во сколько напомнить" in sp         # время напоминания не названо → спросить
+    assert "всегда называй" in sp               # итоговый момент в подтверждении
+    assert "расплывчато" in sp                  # даже «утром» — уточнить час
 
 
 def test_rule12_memory_before_question_and_honest_179():
