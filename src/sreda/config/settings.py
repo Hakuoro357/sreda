@@ -347,6 +347,19 @@ class Settings(BaseSettings):
             "sreda_planner_enabled_tenants",
         ),
     )
+    react_loop_enabled_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_LOOP_ENABLED_TENANTS",
+            "sreda_react_loop_enabled_tenants",
+        ),
+        description=(
+            "#66 gated experiment: tenants routed to the new LangGraph "
+            "ReAct+interrupt conversational loop (InMemory checkpointer, no "
+            "PII at rest). Empty (default) → nobody; everyone stays on the "
+            "existing inline path (zero regression)."
+        ),
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -354,6 +367,22 @@ class Settings(BaseSettings):
     admin_alert_preview_tenants_raw: str | None = Field(
         default=None,
         validation_alias="SREDA_ADMIN_ALERT_PREVIEW_TENANTS",
+    )
+    # vex#170: ВРЕМЕННЫЙ debug-allowlist тенантов, чьи react-ходы (вопрос+ответ бота+инструменты)
+    # сохраняются в react_debug_turns, чтобы видеть всю переписку пока тестируем механизм. Текст
+    # шифруется. Дефолт пуст → НИКОМУ (защита: только явно перечисленные дебаг/тест-тенанты).
+    # Удалить вместе с фичей после теста. НЕ глобальный флаг (privacy defense-in-depth, Codex R1).
+    react_debug_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_REACT_DEBUG_TENANTS",
+    )
+    # #165 Срез B: тенанты с ОБРЕЗКОЙ набора инструментов (ленивая загрузка семей: ядро +
+    # предзагруженные словарём top-2 + добор need_family/guard). Дефолт пуст → НИКОМУ: все
+    # на full-bind (весь набор привязан, как до #165 — ноль изменений). Канарейка/kill-switch:
+    # добавить/убрать тенанта здесь. НЕ глобальный (per-tenant rollout, p-004 tenant↔user 1:1).
+    react_prune_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_REACT_PRUNE_TENANTS",
     )
 
     # Plan-Execute LLM provider split (Hakuoro357/vex-assistant#77 item #5).
@@ -762,6 +791,33 @@ class Settings(BaseSettings):
         Empty set → everyone stays on legacy ReAct (current behaviour).
         """
         raw = self.planner_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_loop_enabled_tenants(self) -> frozenset[str]:
+        """#66: tenants on the new ReAct+interrupt conversational loop (gated
+        experiment). Empty (default) → nobody; everyone on the existing path."""
+        raw = self.react_loop_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_debug_tenants(self) -> frozenset[str]:
+        """vex#170 (ВРЕМЕННОЕ): тенанты, чьи react-ходы сохраняются в react_debug_turns для
+        дебага. Пусто (дефолт) → НИКОМУ (не глобально — privacy allowlist)."""
+        raw = self.react_debug_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_prune_tenants(self) -> frozenset[str]:
+        """#165 Срез B: тенанты с обрезкой набора инструментов (ленивая загрузка семей).
+        Пусто (дефолт) → НИКОМУ → full-bind (ноль изменений). Per-tenant canary/kill-switch."""
+        raw = self.react_prune_tenants_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())

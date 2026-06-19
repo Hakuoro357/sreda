@@ -167,23 +167,124 @@ class HousewifeReminderService:
         embedding_json, embedding_model = self._embed_title(clean_title)
 
         from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
-        reminder = FamilyReminder(
-            id=f"rem_{uuid4().hex[:24]}",
-            tenant_id=tenant_id,
-            user_id=user_id,
-            title=clean_title,
-            trigger_at=trigger_at,
-            next_trigger_at=next_trigger_at,
-            recurrence_rule=recurrence_rule,
-            status="pending",
-            source_memo=source_memo,
-            embedding_json=embedding_json,
-            embedding_model=embedding_model,
-            bot_key=bot_key if bot_key is not None else LEGACY_NULL_BOT_KEY,
+        resolved_bot_key = bot_key if bot_key is not None else LEGACY_NULL_BOT_KEY
+
+        # #162 Фаза 0 — within-turn идемпотентность создания (эталон
+        # services/housewife_shopping.py::add_items). Ветвление по наличию
+        # ToolRuntimeContext:
+        #   ctx is None  → ЛЕГАСИ-путь (plan-execute/чат сегодня) — байт-в-байт.
+        #   ctx is not None → ReAct-путь: operation_id (с ВРЕМЕНЕМ в logical_key)
+        #                     + INSERT ON CONFLICT DO NOTHING + SELECT (стабильный id).
+        # emit_event/audit в этом срезе НЕ зовём (→ #163).
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        ctx = current_tool_runtime()
+
+        if ctx is None:
+            reminder = FamilyReminder(
+                id=f"rem_{uuid4().hex[:24]}",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                title=clean_title,
+                trigger_at=trigger_at,
+                next_trigger_at=next_trigger_at,
+                recurrence_rule=recurrence_rule,
+                status="pending",
+                source_memo=source_memo,
+                embedding_json=embedding_json,
+                embedding_model=embedding_model,
+                bot_key=resolved_bot_key,
+            )
+            self.session.add(reminder)
+            self.session.commit()
+            return reminder
+
+        # --- ReAct-путь (within-turn idempotency) -------------------------
+        # fail-closed user_id (чеклист #162 п.8): nullable user_id ослабляет
+        # UNIQUE (tenant,user,operation_id) — ctx-путь требует непустой user_id.
+        if not user_id:
+            raise ValueError(
+                "schedule ctx path: user_id обязателен (fail-closed) — "
+                "пустой user_id ослабил бы UNIQUE-дедуп."
+            )
+        # tenant-guard: контекст не должен утечь через границу тенанта.
+        if ctx.tenant_id and ctx.tenant_id != tenant_id:
+            raise ValueError(
+                "schedule ctx path: ctx.tenant_id="
+                f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — "
+                "ToolRuntimeContext leaked across a tenant boundary."
+            )
+
+        from sreda.services.operation_id import compute_operation_id_create
+        from sreda.services.text_normalization import normalize_for_dedup
+
+        # logical_key напоминания — С ВРЕМЕНЕМ (R2 CRITICAL): «лекарство в 9:00»
+        # и «в 21:00» — РАЗНЫЕ записи; title-only ключ схлопнул бы их.
+        sep = "\x1f"
+        logical_key = sep.join(
+            [
+                normalize_for_dedup(clean_title),
+                trigger_at.isoformat(),
+                recurrence_rule or "",
+            ]
         )
-        self.session.add(reminder)
+        op_id = compute_operation_id_create(
+            plan_id=ctx.execution_id,
+            step_id=ctx.step_id,
+            action="create",
+            entity_type="family_reminder",
+            logical_key=logical_key,
+        )
+
+        dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
+        if dialect_name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as _insert  # type: ignore[no-redef]
+
+        stmt = (
+            _insert(FamilyReminder)
+            .values(
+                id=f"rem_{uuid4().hex[:24]}",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                title=clean_title,
+                trigger_at=trigger_at,
+                next_trigger_at=next_trigger_at,
+                recurrence_rule=recurrence_rule,
+                status="pending",
+                source_memo=source_memo,
+                embedding_json=embedding_json,
+                embedding_model=embedding_model,
+                bot_key=resolved_bot_key,
+                operation_id=op_id,
+            )
+            .on_conflict_do_nothing(
+                index_elements=["tenant_id", "user_id", "operation_id"]
+            )
+        )
+        self.session.execute(stmt)
         self.session.commit()
-        return reminder
+
+        # SELECT-after-conflict: вернуть СТАБИЛЬНУЮ строку (тот же id) и при
+        # вставке, и при ON CONFLICT (повтор внутри хода) — иначе replay вернул бы
+        # «пусто» и потерял id (Codex R3 MAJOR).
+        actual = (
+            self.session.query(FamilyReminder)
+            .filter(
+                FamilyReminder.tenant_id == tenant_id,
+                FamilyReminder.user_id == user_id,
+                FamilyReminder.operation_id == op_id,
+            )
+            .one_or_none()
+        )
+        if actual is None:
+            # Не должно случаться: либо вставка прошла, либо был конфликт.
+            raise RuntimeError(
+                "schedule ctx path: строка не найдена после INSERT для "
+                f"op_id={op_id!r} (tenant={tenant_id!r})"
+            )
+        return actual
 
     def update(
         self,

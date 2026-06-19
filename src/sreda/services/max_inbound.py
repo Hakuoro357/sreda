@@ -307,6 +307,14 @@ async def handle_max_update(
             if update_type == "message_callback"
             else ""
         )
+        # #166 B R2 (Codex medium MAJOR): тап [Да]/[Нет] react-подтверждения
+        # обрабатываем НЕ здесь, а в детач-ходе ``_process_approved_max_turn``
+        # ВНУТРИ per-tenant lock + trace. Раньше обработка шла прямо тут (инлайн
+        # из вебхука): (1) вне tenant-lock → гонка с параллельным текст-ходом того
+        # же треда; (2) без trace → невидима в trace.log; (3) полный LLM-ход
+        # блокировал ответ 202 вебхука. ``react:yes/no`` добавлены в
+        # ``_KNOWN_MAX_CALLBACK_EXACT`` → проходят unknown-prefix-гейт и шедулятся.
+
         if isinstance(_cb_data_btn, str) and _cb_data_btn.startswith("btn_reply:"):
             from sreda.services.reply_buttons import ReplyButtonService
             cb_token = _cb_data_btn.removeprefix("btn_reply:").strip()
@@ -876,6 +884,71 @@ async def _process_approved_max_turn(
             # — и возвращают True если turn полностью обработан. Остальные
             # callback prefixes (billing/profile/eds) идут через dispatcher.
             if payload.get("update_type") == "message_callback":
+                # #166 B R2: тап [Да]/[Нет] react-подтверждения → resume паузы
+                # ТОГО ЖЕ треда. Здесь (а не в handle_max_update) — внутри
+                # tenant-lock + trace, детачем (не блокирует вебхук). Перехват
+                # ДО _handle_max_callback (тот react: не знает → вернул бы False).
+                _cb_confirm = (payload.get("callback") or {}).get("payload") or ""
+                if (_cb_confirm.startswith(("react:yes", "react:no"))
+                        and not onboarding.is_new_user
+                        and onboarding.max_chat_id
+                        and onboarding.tenant_id in settings.react_loop_enabled_tenants):
+                    from sreda.runtime import react_loop
+                    from sreda.services.llm import get_chat_llm
+                    # answer_callback ПЕРВЫМ (UX + ack идемпотентности кнопки)
+                    _cb_id_r = (payload.get("callback") or {}).get("callback_id")
+                    if _cb_id_r and settings.max_bot_token:
+                        try:
+                            await MaxClient(token=settings.max_bot_token).answer_callback(
+                                str(_cb_id_r))
+                        except Exception:  # noqa: BLE001
+                            logger.warning("max react confirm ack failed", exc_info=True)
+                    _llm_r = get_chat_llm(
+                        provider=settings.planner_provider, settings=settings)
+                    # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
+                    # к которой кнопка привязана (id из callback_data). Устаревший/повторный/чужой
+                    # тап → пустой ответ (no-op), свежий ход с «да/нет» НЕ стартуем (R3 Codex A/B).
+                    _reply_r = await react_loop.handle_turn(
+                        session=bg_session, tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                        llm=_llm_r,
+                        user_text=react_loop.confirm_resume_text(_cb_confirm) or "",
+                        inbound_message_id=inbound_message_id, channel="max",
+                        resume_only=True,
+                        expected_confirm_id=react_loop.confirm_callback_id(_cb_confirm),
+                    )
+                    trace.record(
+                        "react_loop.resumed", chars=len(_reply_r or ""), channel="max",
+                        noop=(not _reply_r))
+                    if _reply_r and settings.max_bot_token:  # непустой → пауза возобновлена
+                        # цепочка-confirm: следующий вопрос снова с [Да][Нет] (с id новой паузы)
+                        _cid_r = getattr(_reply_r, "confirm_id", "")
+                        _kb_r = ([{
+                            "type": "inline_keyboard",
+                            "payload": {"buttons": [[
+                                {"type": "callback", "text": "Да",
+                                 "payload": react_loop.confirm_callback_data("yes", _cid_r)},
+                                {"type": "callback", "text": "Нет",
+                                 "payload": react_loop.confirm_callback_data("no", _cid_r)},
+                            ]]},
+                        }] if getattr(_reply_r, "awaiting_confirm", False) else None)
+                        try:
+                            await MaxClient(token=settings.max_bot_token).send_message(
+                                recipient={"chat_id": onboarding.max_chat_id},
+                                text=_reply_r, attachments=_kb_r,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning("max react confirm reply failed", exc_info=True)
+                    # #166 B R3 (Codex medium MINOR): react-путь шлёт напрямую (минуя outbox,
+                    # который обычно финализирует trace) → эмитим блок здесь явно
+                    # (идемпотентно: _emitted-guard; НЕ в finally — там сломали бы
+                    # outbox.delivered у dispatch-пути). _tc_r может быть None вне веб-хука.
+                    _tc_r = trace.current()
+                    if _tc_r is not None:
+                        trace.emit_block(_tc_r)
+                    _set_processing_status(bg_session, inbound_message_id, "processed")
+                    return
                 if settings.max_bot_token:
                     max_client_cb = MaxClient(token=settings.max_bot_token)
                     handled = await _handle_max_callback(
@@ -1003,6 +1076,83 @@ async def _process_approved_max_turn(
                         max_client=max_client,
                         onboarding=onboarding,
                     )
+                    _set_processing_status(
+                        bg_session, inbound_message_id, "processed",
+                    )
+                    return
+
+                # #66 ГЕЙТ MAX: тенант из react_loop_enabled_tenants + текст →
+                # новый ReAct+interrupt-цикл. Ответ шлём напрямую MaxClient
+                # (welcome тоже inline-шлёт), ack не создаём, dispatch пропускаем.
+                # Остальные тенанты/callback/voice-ошибки/новые юзеры — прежним
+                # путём (нулевой регресс). Флаг по умолчанию пуст → no-op.
+                if (
+                    message_text
+                    and not onboarding.is_new_user
+                    and onboarding.tenant_id in settings.react_loop_enabled_tenants
+                ):
+                    from sreda.runtime import react_loop
+                    from sreda.services.llm import get_chat_llm
+
+                    _llm = get_chat_llm(
+                        provider=settings.planner_provider, settings=settings,
+                    )
+                    # ack v3: «Секунду…» → правим ЕГО в ответ (PUT /messages, одно
+                    # сообщение). Переиспользуем устойчивый _send_max_ack (defensive
+                    # извлечение mid по нескольким формам ответа MAX — Codex/субагент MAJOR).
+                    _ack_mid = await _send_max_ack(
+                        token=settings.max_bot_token,
+                        chat_id=onboarding.max_chat_id, text="Секунду…",
+                    )
+                    _reply = await react_loop.handle_turn(
+                        session=bg_session,
+                        tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                        llm=_llm,
+                        user_text=message_text,
+                        inbound_message_id=inbound_message_id,
+                        channel="max",
+                    )
+                    trace.record(
+                        "react_loop.replied", chars=len(_reply or ""), channel="max",
+                    )
+                    # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id
+                    # КОНКРЕТНОЙ паузы в payload (MAX attachments; текст «да/нет» тоже работает).
+                    _cid = getattr(_reply, "confirm_id", "")
+                    _kb = ([{
+                        "type": "inline_keyboard",
+                        "payload": {"buttons": [[
+                            {"type": "callback", "text": "Да",
+                             "payload": react_loop.confirm_callback_data("yes", _cid)},
+                            {"type": "callback", "text": "Нет",
+                             "payload": react_loop.confirm_callback_data("no", _cid)},
+                        ]]},
+                    }] if getattr(_reply, "awaiting_confirm", False) else None)
+                    _edited = False
+                    if _ack_mid:
+                        try:
+                            await max_client.edit_message(
+                                str(_ack_mid), text=_reply, attachments=_kb)
+                            _edited = True
+                        except Exception:  # noqa: BLE001
+                            _edited = False
+                    if not _edited:
+                        # сбой edit → убираем «Секунду…» (не висит + не дублируется)
+                        if _ack_mid:
+                            try:
+                                await max_client.delete_message(str(_ack_mid))
+                            except Exception:  # noqa: BLE001
+                                pass
+                        await max_client.send_message(
+                            recipient={"chat_id": onboarding.max_chat_id},
+                            text=_reply, attachments=_kb,
+                        )
+                    # #166 B R3: react-путь шлёт напрямую (минуя outbox-финализацию trace) →
+                    # эмитим блок явно (идемпотентно; закрывает пробел нормального react-пути).
+                    _tc = trace.current()
+                    if _tc is not None:
+                        trace.emit_block(_tc)
                     _set_processing_status(
                         bg_session, inbound_message_id, "processed",
                     )
@@ -1939,6 +2089,7 @@ _KNOWN_MAX_CALLBACK_PREFIXES: tuple[str, ...] = (
     "rem_snooze:",  # reminder snooze
     "confirm_link:",  # channel-link confirmation (handled earlier)
     "cancel_link:",   # channel-link cancellation (handled earlier)
+    "react:",       # #166 B: ReAct confirm-кнопки «react:yes:<id>»/«react:no:<id>»
 )
 
 _KNOWN_MAX_CALLBACK_EXACT: frozenset[str] = frozenset({

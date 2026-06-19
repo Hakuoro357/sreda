@@ -63,9 +63,8 @@ def test_add_with_reminder_creates_linked_reminder(session):
         .filter(FamilyReminder.id == t.reminder_id)
         .one()
     )
-    # trigger = 10:00 - 15m = 09:45 UTC (task times are stored as UTC
-    # in MVP — user-facing conversion happens at LLM boundary)
-    expected = datetime(2026, 4, 24, 9, 45, tzinfo=timezone.utc)
+    # #166: no-profile → МСК-default (UTC+3). 10:00 МСК = 07:00 UTC; - 15m = 06:45 UTC.
+    expected = datetime(2026, 4, 24, 6, 45, tzinfo=timezone.utc)
     assert reminder.trigger_at.replace(tzinfo=timezone.utc) == expected
     assert reminder.status == "pending"
     assert reminder.title.startswith("⏰")  # clock emoji marker
@@ -289,9 +288,9 @@ def test_update_time_reschedules_reminder(session):
     new_reminder = session.query(FamilyReminder).filter(
         FamilyReminder.id == updated.reminder_id
     ).one()
-    # Trigger = 14:00 - 15m = 13:45
+    # #166: 14:00 МСК - 15m = 10:45 UTC (no-profile → МСК-default)
     assert new_reminder.trigger_at.replace(tzinfo=timezone.utc) == datetime(
-        2026, 4, 24, 13, 45, tzinfo=timezone.utc
+        2026, 4, 24, 10, 45, tzinfo=timezone.utc
     )
     # Old reminder cancelled
     assert session.query(FamilyReminder).filter(

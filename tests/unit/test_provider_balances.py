@@ -185,6 +185,29 @@ def test_mimo_without_rate_limit_headers_flagged_not_supported(_patch_httpx) -> 
 
 
 # ---------------------------------------------------------------------------
+# Inception (Mercury-2, «Фредди») — провайдер планировщика, без сетевого probe
+# ---------------------------------------------------------------------------
+
+
+def test_inception_listed_no_billing_api_when_key_set() -> None:
+    # #150 follow-up: Inception попадает в «Балансы провайдеров»; публичного
+    # billing API нет, сетью провайдера планировщика НЕ дёргаем (не нужен httpx).
+    s = _settings(inception_api_key="inc-k")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "inception-mercury2")
+    assert row.status == "not_supported"
+    assert "billing" in row.headline.lower()
+    assert "Фредди" in row.label
+
+
+def test_inception_not_configured_without_key() -> None:
+    s = _settings()  # ключа нет
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "inception-mercury2")
+    assert row.status == "not_configured"
+
+
+# ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------
 

@@ -144,6 +144,60 @@ def create_app() -> FastAPI:
     app.include_router(approvals_router)
     feature_registry.register_api(app)
     app.state.feature_registry = feature_registry
+
+    @app.middleware("http")
+    async def _admin_security_headers(request, call_next):
+        # #150 CRITICAL-митигейт (token-в-URL): на ВСЕХ /admin-ответах no-referrer
+        # (токен не утечёт через Referer при переходе) + no-store (token-bearing
+        # страницы не кэшируются прокси/браузером). Полный уход от token-в-URL —
+        # отдельный owner-gated срез (cookie-auth).
+        response = await call_next(request)
+        if request.url.path.startswith("/admin"):
+            response.headers.setdefault("Referrer-Policy", "no-referrer")
+            response.headers.setdefault("Cache-Control", "no-store")
+            # #150: после header/query-аутентификации require_admin_token кладёт
+            # HMAC-маркер в request.state → ставим HttpOnly session-cookie, чтобы
+            # навигация шла без ?token= в URL (additive — header/query всё ещё ок).
+            sess = getattr(request.state, "admin_set_session", None)
+            if sess:
+                # Bootstrap через ?token= на GET → 303 на ТОТ ЖЕ URL без token
+                # (cookie уже ставим ниже), чтобы токен не остался в адресной
+                # строке/истории/access-логах после первого входа (Codex R3).
+                # ВАЖНО (Codex R4/R5): редиректим на чистый URL ТОЛЬКО когда запрос
+                # реально по HTTPS — иначе Secure-cookie не уйдёт обратно → чистый URL
+                # отдаст 401 и вход по токену сломается. На plain-HTTP оставляем token
+                # в URL (его прикрывают no-referrer + no-store выше).
+                # Гейт — РОВНО request.url.scheme == "https" (Codex R5 subagent: без
+                # карв-аута localhost — Secure-cookie по RFC scheme-based, по
+                # http://localhost браузер её не шлёт; а host берётся из заголовка Host
+                # и подделываем). За TLS-терминацией scheme корректен: uvicorn запущен
+                # с --proxy-headers --forwarded-allow-ips=127.0.0.1, а nginx для
+                # admin.sredaspace.ru шлёт `X-Forwarded-Proto $scheme` → ProxyHeaders
+                # ставит scheme=https (проверено на проде 2026-06-16, Codex R5 medium).
+                if (
+                    request.method == "GET"
+                    and "token" in request.query_params
+                    and request.url.scheme == "https"
+                ):
+                    from urllib.parse import urlencode
+
+                    from starlette.responses import RedirectResponse
+
+                    clean = [
+                        (k, v) for k, v in request.query_params.multi_items()
+                        if k != "token"
+                    ]
+                    qs = urlencode(clean)
+                    target = request.url.path + (f"?{qs}" if qs else "")
+                    response = RedirectResponse(target, status_code=303)
+                    response.headers["Referrer-Policy"] = "no-referrer"
+                    response.headers["Cache-Control"] = "no-store"
+                response.set_cookie(
+                    "admin_session", sess, max_age=86400, path="/admin",
+                    httponly=True, samesite="strict", secure=True,
+                )
+        return response
+
     return app
 
 

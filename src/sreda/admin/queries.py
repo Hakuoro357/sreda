@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+from sreda.services.llm_pricing import cost_estimate
 
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.models.core import Tenant, User
@@ -183,6 +186,10 @@ class BudgetRow:
     period_start: str
     period_end: str
     last_used_at: str
+    # #150: ≈стоимость USD (priced subtotal по моделям строки) + покрытие.
+    # None — нет ни одной priced-модели в строке (mixed обрабатывается покрытием).
+    est_usd: Decimal | None = None
+    cost_coverage_pct: int | None = None
 
 
 def get_budget_summary(session: Session) -> list[BudgetRow]:
@@ -299,6 +306,34 @@ def get_budget_summary_for_day(
 
     day_start_utc, day_end_utc = _msk_day_window_utc(for_date)
 
+    # #150: карта стоимости за день, ОДНИМ запросом по
+    # (tenant, feature, provider, model) — без N+1 на строку бюджета.
+    cost_map: dict[tuple[str, str], list[tuple[str, str, int, int, int]]] = {}
+    for tid, fkey, pk, model, c_calls, c_prompt, c_completion in (
+        session.query(
+            SkillAIExecution.tenant_id,
+            SkillAIExecution.feature_key,
+            SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+        )
+        .filter(
+            SkillAIExecution.created_at >= day_start_utc,
+            SkillAIExecution.created_at < day_end_utc,
+            _VALID_TOKENS,
+        )
+        .group_by(
+            SkillAIExecution.tenant_id, SkillAIExecution.feature_key,
+            SkillAIExecution.provider_key, SkillAIExecution.model,
+        )
+        .all()
+    ):
+        cost_map.setdefault((tid, fkey), []).append(
+            (pk or "", model or "", int(c_calls), int(c_prompt), int(c_completion))
+        )
+
     rows_with_sort: list[tuple[datetime | None, BudgetRow]] = []
     for sub, plan in active_subs:
         q = session.query(
@@ -329,6 +364,24 @@ def get_budget_summary_for_day(
                 int(credits_used) / plan.credits_monthly_quota * 100, 1
             )
 
+        # #150: ≈стоимость строки = priced subtotal по её (provider, model).
+        _est = Decimal("0")
+        _has_priced = False
+        _priced_calls = _row_calls = 0
+        for _pk, _model, _c, _p, _comp in cost_map.get(
+            (sub.tenant_id, plan.feature_key), []
+        ):
+            _row_calls += _c
+            _ce = cost_estimate(_pk, _model, prompt_tokens=_p, completion_tokens=_comp)
+            if _ce is not None:
+                _est += _ce.est_usd
+                _has_priced = True
+                _priced_calls += _c
+        _est_usd = _est if _has_priced else None
+        # Знаменатель покрытия — ВАЛИДНЫЕ вызовы строки (_VALID_TOKENS), а не
+        # показанный total_calls (тот без фильтра аномалий): «доля valid с ценой».
+        _cost_cov = round(_priced_calls * 100 / _row_calls) if _row_calls else None
+
         rows_with_sort.append((
             last_used_dt,
             BudgetRow(
@@ -344,6 +397,8 @@ def get_budget_summary_for_day(
                 period_start=_fmt_dt(day_start_utc),
                 period_end=_fmt_dt(day_end_utc),
                 last_used_at=_fmt_dt(last_used_dt),
+                est_usd=_est_usd,
+                cost_coverage_pct=_cost_cov,
             ),
         ))
     _SENTINEL_OLD = datetime.min.replace(tzinfo=timezone.utc)
@@ -378,23 +433,28 @@ class LLMCallsPage:
     per_page: int
     total_pages: int
     tenant_name: str
-    feature_key: str
+    tenant_id: str
+    feature_key: str | None   # None → показаны все фичи тенанта (#150)
 
 
 def get_llm_calls(
     session: Session,
     tenant_id: str,
-    feature_key: str,
+    feature_key: str | None = None,
     page: int = 1,
     per_page: int = 50,
 ) -> LLMCallsPage:
-    """Paginated skill_ai_executions for a tenant + feature."""
+    """Paginated skill_ai_executions for a tenant (+ optional feature filter).
+
+    feature_key=None → все фичи тенанта (ссылка из карточки тенанта). #150.
+    """
     tenants = {t.id: t.name for t in session.query(Tenant).all()}
 
     base = session.query(SkillAIExecution).filter(
         SkillAIExecution.tenant_id == tenant_id,
-        SkillAIExecution.feature_key == feature_key,
     )
+    if feature_key:
+        base = base.filter(SkillAIExecution.feature_key == feature_key)
     total = base.count()
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
@@ -431,5 +491,320 @@ def get_llm_calls(
         per_page=per_page,
         total_pages=total_pages,
         tenant_name=tenants.get(tenant_id, tenant_id),
+        tenant_id=tenant_id,
         feature_key=feature_key,
     )
+
+
+# ------------------------------------------------ #150 F2: траты по моделям
+
+# Валидная строка для денег: оба счётчика токенов неотрицательны. Отрицательные
+# — аномалия данных, исключаются из сумм И считаются отдельно (Codex-ревью:
+# нельзя суммировать в группе — отрицательная и положительная взаимогасятся).
+_VALID_TOKENS = (
+    SkillAIExecution.prompt_tokens.isnot(None)
+    & SkillAIExecution.completion_tokens.isnot(None)
+    & (SkillAIExecution.prompt_tokens >= 0)
+    & (SkillAIExecution.completion_tokens >= 0)
+    # incomplete split: 0/0 при total>0 (legacy «только total_tokens») — НЕ valid
+    # (иначе priced-модель даст ложный $0, занизит spend) → попадёт в аномалии.
+    & ~(
+        (SkillAIExecution.prompt_tokens == 0)
+        & (SkillAIExecution.completion_tokens == 0)
+        & (func.coalesce(SkillAIExecution.total_tokens, 0) > 0)
+    )
+)
+
+
+def period_window_utc(
+    period: str, anchor: datetime | None = None
+) -> tuple[datetime, datetime]:
+    """MSK-календарное окно периода → ``[start_utc, end_utc)`` (aware-UTC).
+
+    ``period`` ∈ {day, week, month}, считается в Europe/Moscow: день — с 00:00;
+    неделя — с понедельника 00:00; месяц — с 1-го 00:00 (след. месяц —
+    календарной арифметикой). Границы aware-UTC, полуоткрытые — как
+    ``_msk_day_window_utc`` (сравнение с ``created_at`` идентично SQLite/Postgres).
+    """
+    now = anchor or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    local = now.astimezone(MSK_TZ)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "day":
+        start_local, end_local = midnight, midnight + timedelta(days=1)
+    elif period == "week":
+        start_local = midnight - timedelta(days=local.weekday())
+        end_local = start_local + timedelta(days=7)
+    elif period == "month":
+        start_local = midnight.replace(day=1)
+        if start_local.month == 12:
+            end_local = start_local.replace(year=start_local.year + 1, month=1)
+        else:
+            end_local = start_local.replace(month=start_local.month + 1)
+    else:
+        raise ValueError(f"unknown period: {period!r} (day|week|month)")
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class SpendModelRow:
+    provider_key: str
+    model: str
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    est_usd: Decimal | None   # None если беспрайсово (→ «—» на UI)
+    upper_usd: Decimal | None
+    priced: bool
+
+
+@dataclass(frozen=True)
+class SpendReport:
+    period: str
+    start_utc: datetime
+    end_utc: datetime
+    rows: list[SpendModelRow]            # priced (по est убыв.), затем unpriced
+    priced_subtotal_usd: Decimal
+    upper_subtotal_usd: Decimal
+    unpriced_models: list[tuple[str, str]]
+    unpriced_calls: int
+    unpriced_tokens: int
+    coverage_calls_pct: int | None       # None если 0 валидных вызовов
+    coverage_tokens_pct: int | None
+    anomaly_count: int
+
+
+def get_spend_by_model(
+    session: Session,
+    period: str,
+    anchor: datetime | None = None,
+    tenant_id: str | None = None,
+) -> SpendReport:
+    """Траты по (provider_key, model) за MSK-окно периода (опц. по тенанту).
+
+    Стоимость — через ``llm_pricing.cost_estimate`` (беспрайсовое → est=None → «—»).
+    Итог — «priced subtotal» + покрытие (% валидных вызовов/токенов с известной
+    ценой) + число аномалий. Историю считаем по текущему прайсу (оценка).
+    """
+    start, end = period_window_utc(period, anchor)
+    in_win_list = [
+        SkillAIExecution.created_at >= start,
+        SkillAIExecution.created_at < end,
+    ]
+    if tenant_id is not None:
+        in_win_list.append(SkillAIExecution.tenant_id == tenant_id)
+    in_win = tuple(in_win_list)
+
+    anomaly_count = (
+        session.query(func.count(SkillAIExecution.id))
+        .filter(*in_win, ~_VALID_TOKENS)
+        .scalar()
+    ) or 0
+
+    grouped = (
+        session.query(
+            SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+        )
+        .filter(*in_win, _VALID_TOKENS)
+        .group_by(SkillAIExecution.provider_key, SkillAIExecution.model)
+        .all()
+    )
+
+    rows: list[SpendModelRow] = []
+    priced_subtotal = Decimal("0")
+    upper_subtotal = Decimal("0")
+    unpriced_models: list[tuple[str, str]] = []
+    unpriced_calls = unpriced_tokens = 0
+    total_calls = total_tokens = 0
+    priced_calls = priced_tokens = 0
+
+    for provider_key, model, calls, prompt, completion in grouped:
+        provider_key = provider_key or ""
+        model = model or ""
+        calls = int(calls)
+        prompt = int(prompt)
+        completion = int(completion)
+        toks = prompt + completion
+        total_calls += calls
+        total_tokens += toks
+        est = cost_estimate(
+            provider_key, model,
+            prompt_tokens=prompt, completion_tokens=completion,
+        )
+        if est is not None:
+            priced_subtotal += est.est_usd
+            upper_subtotal += est.upper_usd
+            priced_calls += calls
+            priced_tokens += toks
+            rows.append(SpendModelRow(
+                provider_key, model, calls, prompt, completion,
+                est.est_usd, est.upper_usd, True,
+            ))
+        else:
+            unpriced_models.append((provider_key, model))
+            unpriced_calls += calls
+            unpriced_tokens += toks
+            rows.append(SpendModelRow(
+                provider_key, model, calls, prompt, completion, None, None, False,
+            ))
+
+    # priced (по est убыв.) сперва, беспрайсовые — в конец
+    rows.sort(key=lambda r: (r.priced, r.est_usd or Decimal("0")), reverse=True)
+
+    cov_calls = round(priced_calls * 100 / total_calls) if total_calls else None
+    cov_tokens = round(priced_tokens * 100 / total_tokens) if total_tokens else None
+
+    return SpendReport(
+        period=period, start_utc=start, end_utc=end, rows=rows,
+        priced_subtotal_usd=priced_subtotal, upper_subtotal_usd=upper_subtotal,
+        unpriced_models=unpriced_models, unpriced_calls=unpriced_calls,
+        unpriced_tokens=unpriced_tokens, coverage_calls_pct=cov_calls,
+        coverage_tokens_pct=cov_tokens, anomaly_count=int(anomaly_count),
+    )
+
+
+@dataclass(frozen=True)
+class TenantSpendDetail:
+    tenant_id: str
+    tenant_name: str
+    day: SpendReport
+    week: SpendReport
+    month: SpendReport
+
+
+def get_tenant_spend_detail(
+    session: Session, tenant_id: str, anchor: datetime | None = None
+) -> TenantSpendDetail:
+    """Траты ОДНОГО тенанта за день/неделю/месяц (карточка). UI: «расходы
+    тенанта/аккаунта, не пользователя» (у тенанта может быть несколько юзеров)."""
+    name = (
+        session.query(Tenant.name).filter(Tenant.id == tenant_id).scalar()
+        or tenant_id
+    )
+    return TenantSpendDetail(
+        tenant_id=tenant_id,
+        tenant_name=name,
+        day=get_spend_by_model(session, "day", anchor, tenant_id=tenant_id),
+        week=get_spend_by_model(session, "week", anchor, tenant_id=tenant_id),
+        month=get_spend_by_model(session, "month", anchor, tenant_id=tenant_id),
+    )
+
+
+@dataclass(frozen=True)
+class UsersPage:
+    rows: list[UserRow]
+    page: int
+    per_page: int
+    total: int
+    total_pages: int
+
+
+def get_users_page(
+    session: Session, page: int = 1, per_page: int = 50
+) -> UsersPage:
+    """Пагинация над get_all_users (полный список мал — внутренние + альфа
+    200-300; per-page bulk-load — оптимизация на будущее при росте базы)."""
+    page = max(1, page)
+    per_page = max(1, min(per_page, 200))
+    all_rows = get_all_users(session)
+    total = len(all_rows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    start = (page - 1) * per_page
+    return UsersPage(
+        rows=all_rows[start:start + per_page],
+        page=page, per_page=per_page, total=total, total_pages=total_pages,
+    )
+
+
+# -------------------------------------------------- #150 dashboard aggregates
+
+
+def get_cost_volume_summary(
+    session: Session, anchor: datetime | None = None
+) -> dict[str, SpendReport]:
+    """Затраты+объём за день/неделю/месяц (все тенанты). Переиспользует
+    get_spend_by_model → каждый отчёт несёт priced subtotal + покрытие."""
+    return {
+        p: get_spend_by_model(session, p, anchor) for p in ("day", "week", "month")
+    }
+
+
+@dataclass(frozen=True)
+class TopTenants:
+    # (tenant_id, tenant_name, est_usd, calls) — по priced subtotal убыв.
+    by_spend: list[tuple[str, str, Decimal, int]]
+    # (tenant_id, tenant_name, unpriced_tokens) — слепая зона: тяжёлые
+    # беспрайсовые тенанты, которых нет в by_spend (Codex R2 high).
+    by_unpriced: list[tuple[str, str, int]]
+
+
+def get_top_tenants_by_spend(
+    session: Session, period: str = "month", limit: int = 10,
+    anchor: datetime | None = None,
+) -> TopTenants:
+    start, end = period_window_utc(period, anchor)
+    grouped = (
+        session.query(
+            SkillAIExecution.tenant_id,
+            SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+        )
+        .filter(
+            SkillAIExecution.created_at >= start,
+            SkillAIExecution.created_at < end,
+            _VALID_TOKENS,
+        )
+        .group_by(
+            SkillAIExecution.tenant_id, SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+        )
+        .all()
+    )
+    est_by_tenant: dict[str, Decimal] = {}
+    calls_by_tenant: dict[str, int] = {}
+    unpriced_tok_by_tenant: dict[str, int] = {}
+    for tid, pk, model, calls, prompt, completion in grouped:
+        tid = tid or "—"
+        ce = cost_estimate(pk or "", model or "", prompt_tokens=int(prompt),
+                           completion_tokens=int(completion))
+        if ce is not None:
+            est_by_tenant[tid] = est_by_tenant.get(tid, Decimal("0")) + ce.est_usd
+            calls_by_tenant[tid] = calls_by_tenant.get(tid, 0) + int(calls)
+        else:
+            unpriced_tok_by_tenant[tid] = (
+                unpriced_tok_by_tenant.get(tid, 0) + int(prompt) + int(completion)
+            )
+    names = {t.id: t.name for t in session.query(Tenant).all()}
+    by_spend = sorted(
+        ((tid, names.get(tid, tid), est, calls_by_tenant.get(tid, 0))
+         for tid, est in est_by_tenant.items()),
+        key=lambda x: x[2], reverse=True,
+    )[:limit]
+    by_unpriced = sorted(
+        ((tid, names.get(tid, tid), tok)
+         for tid, tok in unpriced_tok_by_tenant.items()),
+        key=lambda x: x[2], reverse=True,
+    )[:limit]
+    return TopTenants(by_spend=by_spend, by_unpriced=by_unpriced)
+
+
+def get_dialogue_health(session: Session):
+    """Здоровье диалога за окно (gather_day_counts). best-effort — при сбое
+    None (UI покажет «—»). breakdowns_precounted=0: без glob-логов в вебе."""
+    try:
+        from sreda.workers.reliability_report import gather_day_counts
+
+        return gather_day_counts(
+            session, now=datetime.now(timezone.utc), breakdowns_precounted=0,
+        )
+    except Exception:  # noqa: BLE001 — секция дашборда не валит страницу
+        return None

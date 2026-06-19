@@ -98,11 +98,27 @@
             Сброс
           </button>
         </form>
+        <a href="/admin/tenants/{{ u.tenant_id }}" role="button" class="outline"
+           style="padding: .25rem .5rem; font-size: .8rem;" title="расходы тенанта/аккаунта">
+          Расходы
+        </a>
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
 </figure>
+
+{% if page and page.total_pages > 1 %}
+<nav style="display: flex; gap: 12px; align-items: center; margin-top: 16px;">
+  {% if page.page > 1 %}
+  <a href="/admin/users?page={{ page.page - 1 }}" role="button" class="outline" style="margin: 0;">← Назад</a>
+  {% endif %}
+  <span class="muted">Стр. {{ page.page }} / {{ page.total_pages }} ({{ page.total }} польз.)</span>
+  {% if page.page < page.total_pages %}
+  <a href="/admin/users?page={{ page.page + 1 }}" role="button" class="outline" style="margin: 0;">Вперёд →</a>
+  {% endif %}
+</nav>
+{% endif %}
 {% endif %}
 {% endblock %}

@@ -209,6 +209,26 @@ def _fetch_groq(settings: Settings) -> ProviderBalance:
     )
 
 
+def _fetch_inception(settings: Settings) -> ProviderBalance:
+    """Inception (Mercury-2, «Фредди») — провайдер планировщика Среды.
+    Публичного billing/balance API у Inception нет; провайдера планировщика
+    НАМЕРЕННО не дёргаем сетью на каждый показ админки (в отличие от
+    openrouter/groq/mimo). Оценку трат в USD смотреть на /admin/budget и
+    /admin/spend-by-model — там Inception priced по нашему прайсу (#150)."""
+    key = settings.resolve_inception_api_key()
+    if not key:
+        return ProviderBalance(
+            key="inception-mercury2", label="Inception · Mercury-2 (Фредди, планировщик)",
+            status="not_configured", headline="ключ не настроен",
+        )
+    return ProviderBalance(
+        key="inception-mercury2", label="Inception · Mercury-2 (Фредди, планировщик)",
+        status="not_supported",
+        headline="нет публичного billing API",
+        details="оценка трат в USD — на /admin/budget и /admin/spend-by-model",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -227,6 +247,7 @@ def fetch_balances(settings: Settings, *, force_refresh: bool = False) -> list[P
 
     balances = [
         _fetch_openrouter(settings),
+        _fetch_inception(settings),   # планировщик «Фредди» (#150 follow-up)
         _fetch_mimo(settings),
         _fetch_groq(settings),
     ]

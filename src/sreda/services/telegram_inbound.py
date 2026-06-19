@@ -141,6 +141,28 @@ def _set_processing_status(
     session.commit()
 
 
+def _voice_to_react_gate(
+    message_type: str, *, is_new_user: bool, tenant_id, enabled_tenants,
+) -> bool:
+    """#166: голос флагованного тенанта транскрибируем ДО react-гейта.
+    Чистое решение без побочек (тестируемо). Не-голос / новичок / не-флагованный → False."""
+    return (
+        message_type == "voice"
+        and not is_new_user
+        and tenant_id in enabled_tenants
+    )
+
+
+def _clean_transcript(message) -> str | None:
+    """Нормализованный непустой текст расшифровки или None. Codex high R1:
+    пробельная расшифровка («   ») НЕ должна уходить в ReAct как текст."""
+    if not isinstance(message, dict):
+        return None
+    text = message.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    return text or None
+
+
 async def _process_approved_turn(
     *,
     bot_key: str,
@@ -226,11 +248,130 @@ async def _process_approved_turn_locked(
         else:
             trace.record("webhook.received", type="unknown")
 
+        # #166 B: тап по кнопке [Да]/[Нет] react-подтверждения → resume паузы того же треда.
+        # answerCallbackQuery ПЕРВЫМ (идемпотентность кнопок); само действие идемпотентно в
+        # цикле (operation_id + guard статуса) → повторный тап после resume = безвредный no-op.
+        _cb = payload.get("callback_query") if isinstance(payload, dict) else None
+        _cb_data = str(_cb.get("data") or "") if isinstance(_cb, dict) else ""
+        if (_cb_data.startswith(("react:yes", "react:no"))
+                and not onboarding.is_new_user
+                and onboarding.tenant_id in get_settings().react_loop_enabled_tenants):
+            from sreda.runtime import react_loop
+            from sreda.services.llm import get_chat_llm
+            _cb_id = str(_cb.get("id") or "")
+            if _cb_id:
+                try:
+                    await telegram_client.answer_callback_query(_cb_id, text="")
+                except Exception:  # noqa: BLE001
+                    pass
+            _s2 = get_settings()
+            _llm2 = get_chat_llm(provider=_s2.planner_provider, settings=_s2)
+            # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
+            # к которой кнопка была привязана (id из callback_data). Устаревший/повторный/
+            # чужой тап → пустой ответ (no-op), свежий ход не стартуем (R3 Codex MAJOR A/B).
+            _reply2 = await react_loop.handle_turn(
+                session=bg_session, tenant_id=onboarding.tenant_id,
+                user_id=onboarding.user_id,
+                thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
+                llm=_llm2, user_text=react_loop.confirm_resume_text(_cb_data) or "",
+                inbound_message_id=inbound_message_id, channel="telegram",
+                resume_only=True,
+                expected_confirm_id=react_loop.confirm_callback_id(_cb_data))
+            trace.record("react_loop.resumed", chars=len(_reply2 or ""),
+                         channel="telegram", noop=(not _reply2))
+            if _reply2:  # непустой → пауза возобновлена (пустой = устаревший/чужой тап → no-op)
+                # цепочка-confirm: следующий вопрос снова с [Да][Нет] (с id новой паузы)
+                _cid2 = getattr(_reply2, "confirm_id", "")
+                _kb2 = ({"inline_keyboard": [[
+                    {"text": "Да", "callback_data": react_loop.confirm_callback_data("yes", _cid2)},
+                    {"text": "Нет", "callback_data": react_loop.confirm_callback_data("no", _cid2)}]]}
+                    if getattr(_reply2, "awaiting_confirm", False) else None)
+                # правим ИСХОДНОЕ сообщение: результат + СНИМАЕМ старые кнопки. Telegram
+                # editMessageText без reply_markup НЕ убирает клавиатуру → передаём пустой
+                # inline_keyboard явно (субагент R2 MINOR), либо новые [Да][Нет] при цепочке.
+                _kb_edit = _kb2 if _kb2 is not None else {"inline_keyboard": []}
+                _orig_mid = (_cb.get("message") or {}).get("message_id")
+                _done = False
+                if _orig_mid is not None:
+                    try:
+                        await telegram_client.edit_message_text(
+                            chat_id=str(onboarding.chat_id), message_id=_orig_mid,
+                            text=_reply2, reply_markup=_kb_edit)
+                        _done = True
+                    except Exception:  # noqa: BLE001
+                        _done = False
+                if not _done:
+                    try:
+                        await telegram_client.send_message(
+                            chat_id=str(onboarding.chat_id), text=_reply2, reply_markup=_kb2)
+                    except Exception:  # noqa: BLE001
+                        pass
+            if trace_ctx is not None:
+                trace.emit_block(trace_ctx)
+            _set_processing_status(bg_session, inbound_message_id, "processed")
+            return
+
+        # #166 голос на ReAct: для флагованного тенанта транскрибируем голос ДО
+        # гейта ТОЙ ЖЕ _maybe_transcribe_voice, что и старый путь (она держит
+        # доступ/квоты/ошибки и инжектит расшифровку в message["text"]). Дальше
+        # ведём как обычный текстовый react-ход. Зеркало MAX-пути
+        # (_maybe_transcribe_max_voice до его гейта). Остальные тенанты не тронуты.
+        if _voice_to_react_gate(
+            message_type, is_new_user=onboarding.is_new_user,
+            tenant_id=onboarding.tenant_id,
+            enabled_tenants=get_settings().react_loop_enabled_tenants,
+        ):
+            from sreda.services.telegram_bot import _maybe_transcribe_voice
+            payload = await _maybe_transcribe_voice(
+                payload, session=bg_session,
+                telegram_client=telegram_client, onboarding=onboarding,
+            )
+            if payload is None:
+                # доступ/квота/STT-ошибка уже сообщены пользователю — ход завершён.
+                # Эмитим trace ДО выхода (voice.download/transcribe уже записаны) —
+                # иначе срез голосовых отказов теряет диагностику (R1 MAJOR Codex+
+                # субагент). Статус ignored — паритет с MAX-путём (max_inbound) для
+                # того же класса событий.
+                if trace_ctx is not None:
+                    trace.emit_block(trace_ctx)
+                _set_processing_status(bg_session, inbound_message_id, "ignored")
+                return
+            message = payload.get("message") if isinstance(payload, dict) else None
+            _vtext = _clean_transcript(message)
+            if _vtext is None:
+                # пустая/пробельная расшифровка: НЕ уводим в старый путь (квота уже
+                # списана), мягко просим повторить и завершаем ход.
+                try:
+                    await telegram_client.send_message(
+                        chat_id=str(onboarding.chat_id),
+                        text="Не расслышала, повтори, пожалуйста.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("empty-voice reply failed: %s", type(exc).__name__)
+                if trace_ctx is not None:
+                    trace.emit_block(trace_ctx)
+                _set_processing_status(bg_session, inbound_message_id, "processed")
+                return
+            message["text"] = _vtext  # нормализованная расшифровка → react-ход
+            message_type = "text"  # обычный react-гейт ниже
+
+        # #66 ГЕЙТ решаем ДО ack: для react-ходов индикатор «печатает» НЕ создаём
+        # (react отвечает сам через send_message, мимо outbox — иначе ack завис бы
+        # / возможны двойные сообщения; Codex MAJOR).
+        _react_text = message.get("text") if isinstance(message, dict) else None
+        _use_react = (
+            message_type == "text"
+            and bool(_react_text)
+            and not onboarding.is_new_user
+            and onboarding.tenant_id in get_settings().react_loop_enabled_tenants
+        )
+
         ack_task: asyncio.Task | None = None
         ack_progress_controller = None
         if (
             message_type in ("text", "voice")
             and not onboarding.is_new_user
+            and not _use_react
         ):
             ack_text = pick_ack()
             ack_task = _create_task(
@@ -248,15 +389,76 @@ async def _process_approved_turn_locked(
                 )
 
         try:
-            await handle_telegram_interaction(
-                bg_session,
-                bot_key=bot_key,
-                payload=payload,
-                telegram_client=telegram_client,
-                onboarding=onboarding,
-                inbound_message_id=inbound_message_id,
-                ack_progress_controller=ack_progress_controller,
-            )
+            # #66 ГЕЙТ-эксперимент: тенант из react_loop_enabled_tenants + текст →
+            # новый LangGraph ReAct+interrupt-цикл (InMemory, single-process
+            # поллер). Остальные тенанты/не-текст — прежним путём (нулевой регресс).
+            if _use_react:
+                from sreda.runtime import react_loop
+                from sreda.services.llm import get_chat_llm
+
+                _s = get_settings()
+                _llm = get_chat_llm(provider=_s.planner_provider, settings=_s)
+                # ack v3: шлём «Секунду…» и редактируем ЕГО в финальный ответ
+                # (одно сообщение, как раньше; напрямую через editMessageText, без
+                # outbox → не зависнет). Любой сбой ack — не критичен.
+                _ack_mid = None
+                try:
+                    _ack = await telegram_client.send_message(
+                        chat_id=str(onboarding.chat_id), text="Секунду…",
+                    )
+                    _ack_mid = (_ack or {}).get("result", {}).get("message_id")
+                except Exception:  # noqa: BLE001
+                    _ack_mid = None
+                _reply = await react_loop.handle_turn(
+                    session=bg_session,
+                    tenant_id=onboarding.tenant_id,
+                    user_id=onboarding.user_id,
+                    thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
+                    llm=_llm,
+                    user_text=_react_text,
+                    inbound_message_id=inbound_message_id,
+                    channel="telegram",
+                )
+                trace.record("react_loop.replied", chars=len(_reply or ""))
+                # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id
+                # КОНКРЕТНОЙ паузы в callback_data (текст «да/нет» тоже работает — кнопки добавка).
+                _cid = getattr(_reply, "confirm_id", "")
+                _kb = ({"inline_keyboard": [[
+                    {"text": "Да", "callback_data": react_loop.confirm_callback_data("yes", _cid)},
+                    {"text": "Нет", "callback_data": react_loop.confirm_callback_data("no", _cid)}]]}
+                    if getattr(_reply, "awaiting_confirm", False) else None)
+                _edited = False
+                if _ack_mid is not None:
+                    try:
+                        await telegram_client.edit_message_text(
+                            chat_id=str(onboarding.chat_id),
+                            message_id=_ack_mid, text=_reply, reply_markup=_kb,
+                        )
+                        _edited = True
+                    except Exception:  # noqa: BLE001
+                        _edited = False
+                if not _edited:
+                    # сбой edit → убираем «Секунду…», чтобы не висело + не дублировалось
+                    if _ack_mid is not None:
+                        try:
+                            await telegram_client.delete_message(
+                                chat_id=str(onboarding.chat_id), message_id=_ack_mid,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    await telegram_client.send_message(
+                        chat_id=str(onboarding.chat_id), text=_reply, reply_markup=_kb,
+                    )
+            else:
+                await handle_telegram_interaction(
+                    bg_session,
+                    bot_key=bot_key,
+                    payload=payload,
+                    telegram_client=telegram_client,
+                    onboarding=onboarding,
+                    inbound_message_id=inbound_message_id,
+                    ack_progress_controller=ack_progress_controller,
+                )
         except TelegramDeliveryError as exc:
             logger.warning(
                 "Telegram delivery failed during turn processing: %s", exc,
