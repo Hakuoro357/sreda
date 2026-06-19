@@ -46,6 +46,7 @@ from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.db.models.runtime_config import RuntimeConfig
 from sreda.db.models.signup_attempts import SignupAttempt
 from sreda.db.models.tasks import Task
+from sreda.db.models.tool_operations import ToolOperationResult
 from sreda.db.models.usage_ledger import UsageLedger
 from sreda.db.models.skill_platform import (
     SkillAIExecution,
@@ -92,6 +93,7 @@ __all__ = [
     "PlannerGap",
     "PlannerLlmReservation",
     "StepExecutionLedger",
+    "ToolOperationResult",
     "Recipe",
     "RecipeIngredient",
     "RuntimeConfig",
