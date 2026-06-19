@@ -50,6 +50,15 @@ def compute_args_hmac(args: Any, *, secret: str) -> str:
     return hmac.new(secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _lookup(session: Any, operation_id: str) -> ToolOperationResult | None:
+    """Найти строку результата по operation_id (один источник для initial + post-race re-query)."""
+    return (
+        session.query(ToolOperationResult)
+        .filter(ToolOperationResult.operation_id == operation_id)
+        .one_or_none()
+    )
+
+
 def execute_idempotent_durable_op(
     session: Any,
     *,
@@ -71,7 +80,11 @@ def execute_idempotent_durable_op(
 
     def _resolve(row: ToolOperationResult) -> Any:
         """Разрулить НАЙДЕННУЮ строку (по initial query ИЛИ после гонки-IntegrityError)."""
-        if row.tenant_id != tenant_id or (row.user_id or None) != (user_id or None):
+        # scope = tenant + user + operation_family (Codex R2): глобальный operation_id обязан быть
+        # уникален; совпадение в чужом scope (вкл. иную семью) = коллизия/баг, не отдаём чужой payload.
+        if (row.tenant_id != tenant_id
+                or (row.user_id or None) != (user_id or None)
+                or row.operation_family != operation_family):
             logger.warning("idempotent_ops: scope mismatch op=%s", operation_id)
             raise IdempotencyScopeMismatch(operation_id)
         if row.status != "committed":
@@ -82,11 +95,7 @@ def execute_idempotent_durable_op(
             raise IdempotencyArgsMismatch(operation_id)
         return row.stable_return_payload  # exact-replay без мутации
 
-    existing = (
-        session.query(ToolOperationResult)
-        .filter(ToolOperationResult.operation_id == operation_id)
-        .one_or_none()
-    )
+    existing = _lookup(session, operation_id)
     if existing is not None:
         return _resolve(existing)
 
@@ -103,11 +112,11 @@ def execute_idempotent_durable_op(
     except IntegrityError:
         # racer успел вставить тот же operation_id между нашим query и flush → перечитать и
         # разрулить (replay / mismatch / in-flight), не дублируя мутацию.
-        existing = (
-            session.query(ToolOperationResult)
-            .filter(ToolOperationResult.operation_id == operation_id)
-            .one()
-        )
+        existing = _lookup(session, operation_id)
+        if existing is None:
+            # IntegrityError НЕ от нашего uq(operation_id) (Фаза 3: иной constraint) — НЕ маскируем
+            # «строкой не найдено»; ре-райзим исходный (зеркало billing.py). Настоящий баг виден.
+            raise
         return _resolve(existing)
 
     # claim наш → выполнить мутацию (в тесте no-op; реальная мутация сервиса — Фаза 3).

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import pytest
 
 from sreda.db.models.tool_operations import ToolOperationResult
+from sreda.services import idempotent_ops
 from sreda.services.idempotent_ops import (
     IdempotencyArgsMismatch,
     IdempotencyInFlight,
@@ -21,11 +22,11 @@ from sreda.services.idempotent_ops import (
 
 
 def _seed_row(db_session, *, operation_id, tenant_id="t1", user_id="u1", status="committed",
-              args_hmac="h", payload=None):
+              args_hmac="h", payload=None, operation_family="reminders"):
     now = datetime.now(timezone.utc)
     row = ToolOperationResult(
         id=f"tor_{operation_id}", tenant_id=tenant_id, user_id=user_id,
-        operation_family="reminders", tool_name=None, operation_id=operation_id,
+        operation_family=operation_family, tool_name=None, operation_id=operation_id,
         args_hmac=args_hmac, status=status, stable_return_payload=payload,
         created_at=now, updated_at=now)
     db_session.add(row)
@@ -102,6 +103,41 @@ def test_scope_mismatch_cross_tenant_163(db_session):
     with pytest.raises(IdempotencyScopeMismatch):
         execute_idempotent_durable_op(
             db_session, operation_id="op-x", tenant_id="t1", user_id="u1",
+            operation_family="reminders", args_hmac="h", mutate_fn=lambda: "new")
+
+
+def test_claim_race_integrityerror_requery_163(db_session, monkeypatch):
+    """Race-путь (субагент R2): initial query промахнулся (TOCTOU), flush упал на unique →
+    re-query + _resolve, нашу мутацию НЕ запускаем (возвращаем payload racer'а)."""
+    _seed_row(db_session, operation_id="op-race", status="committed", args_hmac="h",
+              payload="racer")
+    calls = []
+    real_lookup = idempotent_ops._lookup
+    state = {"first": True}
+
+    def fake_lookup(session, op):
+        if state["first"]:
+            state["first"] = False
+            return None  # симулируем TOCTOU: initial query не увидел racer'а
+        return real_lookup(session, op)
+
+    monkeypatch.setattr(idempotent_ops, "_lookup", fake_lookup)
+    r = execute_idempotent_durable_op(
+        db_session, operation_id="op-race", tenant_id="t1", user_id="u1",
+        operation_family="reminders", args_hmac="h",
+        mutate_fn=lambda: calls.append(1) or "new")
+    assert calls == [], "racer уже сделал → нашу мутацию не запускаем"
+    assert r == "racer", f"должны вернуть payload racer'а: {r!r}"
+
+
+def test_scope_mismatch_cross_family_163(db_session):
+    """Codex R2 MAJOR: тот же operation_id, но ИНАЯ operation_family → IdempotencyScopeMismatch
+    (не отдаём чужой payload через коллизию ключа между семьями)."""
+    _seed_row(db_session, operation_id="op-fam", operation_family="tasks",
+              status="committed", args_hmac="h", payload="from_tasks")
+    with pytest.raises(IdempotencyScopeMismatch):
+        execute_idempotent_durable_op(
+            db_session, operation_id="op-fam", tenant_id="t1", user_id="u1",
             operation_family="reminders", args_hmac="h", mutate_fn=lambda: "new")
 
 
