@@ -903,8 +903,8 @@ async def _process_approved_max_turn(
                                 str(_cb_id_r))
                         except Exception:  # noqa: BLE001
                             logger.warning("max react confirm ack failed", exc_info=True)
-                    _llm_r = get_chat_llm(
-                        provider=settings.planner_provider, settings=settings)
+                    _prov_r = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
+                    _llm_r = get_chat_llm(provider=_prov_r, settings=settings)
                     # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
                     # к которой кнопка привязана (id из callback_data). Устаревший/повторный/чужой
                     # тап → пустой ответ (no-op), свежий ход с «да/нет» НЕ стартуем (R3 Codex A/B).
@@ -917,7 +917,7 @@ async def _process_approved_max_turn(
                         inbound_message_id=inbound_message_id, channel="max",
                         resume_only=True,
                         expected_confirm_id=react_loop.confirm_callback_id(_cb_confirm),
-                        provider_key=settings.planner_provider,  # #175: учёт расхода ReAct
+                        provider_key=_prov_r,  # #175 учёт расхода + #184 «Оса»
                     )
                     trace.record(
                         "react_loop.resumed", chars=len(_reply_r or ""), channel="max",
@@ -1095,9 +1095,8 @@ async def _process_approved_max_turn(
                     from sreda.runtime import react_loop
                     from sreda.services.llm import get_chat_llm
 
-                    _llm = get_chat_llm(
-                        provider=settings.planner_provider, settings=settings,
-                    )
+                    _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
+                    _llm = get_chat_llm(provider=_prov, settings=settings)
                     # ack v3: «Секунду…» → правим ЕГО в ответ (PUT /messages, одно
                     # сообщение). Переиспользуем устойчивый _send_max_ack (defensive
                     # извлечение mid по нескольким формам ответа MAX — Codex/субагент MAJOR).
@@ -1114,7 +1113,7 @@ async def _process_approved_max_turn(
                         user_text=message_text,
                         inbound_message_id=inbound_message_id,
                         channel="max",
-                        provider_key=settings.planner_provider,  # #175: учёт расхода ReAct
+                        provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
                     )
                     trace.record(
                         "react_loop.replied", chars=len(_reply or ""), channel="max",

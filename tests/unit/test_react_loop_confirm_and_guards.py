@@ -159,6 +159,35 @@ def test_schedule_reminder_future_still_works_174(db_session):
     assert len(rows) == 1 and rows[0].title == "стоматолог"
 
 
+@pytest.mark.asyncio
+async def test_run_tools_tool_exception_does_not_kill_turn_163(db_session, monkeypatch):
+    """#163 Фаза 1а: инструмент БРОСАЕТ исключение (а не возвращает строку) → run_tools отдаёт
+    error-ToolMessage, ход НЕ падает в «потеряла контекст», модель продолжает и отвечает.
+    (Фундамент честного частичного отчёта named-P.)"""
+    from langchain_core.tools import tool as _lc_tool
+
+    @_lc_tool
+    def schedule_reminder(title: str = "", trigger_iso: str = "") -> str:
+        """raising stub (имя core-инструмента → попадает в bound)."""
+        raise RuntimeError("boom")
+
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    monkeypatch.setattr(react_loop, "build_slice_tools", lambda *a, **k: [schedule_reminder])
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "schedule_reminder",
+            "args": {"title": "x", "trigger_iso": "2030-01-01T09:00:00+03:00"}, "id": "c1"}]),
+        AIMessage(content="Готово."),
+    ])
+    reply = await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="i163-raise", llm=stub, user_text="поставь напоминание",
+        inbound_message_id="i163-raise-msg", channel="react")
+    assert "потеряла контекст" not in str(reply), f"ход упал вместо error-ToolMessage: {reply!r}"
+    assert "отово" in str(reply), f"модель не продолжила после сбоя инструмента: {reply!r}"
+
+
 def test_update_reminder_past_trigger_rolls_forward_174(db_session):
     """#174 (Codex medium R1): перенос напоминания на ПРОШЛОЕ — тот же класс бага → перекат.
     update_reminder с прошедшим trigger_iso НЕ меняет момент, отдаёт директиву переката."""

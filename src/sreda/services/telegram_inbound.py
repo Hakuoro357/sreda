@@ -265,7 +265,8 @@ async def _process_approved_turn_locked(
                 except Exception:  # noqa: BLE001
                     pass
             _s2 = get_settings()
-            _llm2 = get_chat_llm(provider=_s2.planner_provider, settings=_s2)
+            _prov2 = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
+            _llm2 = get_chat_llm(provider=_prov2, settings=_s2)
             # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
             # к которой кнопка была привязана (id из callback_data). Устаревший/повторный/
             # чужой тап → пустой ответ (no-op), свежий ход не стартуем (R3 Codex MAJOR A/B).
@@ -277,7 +278,7 @@ async def _process_approved_turn_locked(
                 inbound_message_id=inbound_message_id, channel="telegram",
                 resume_only=True,
                 expected_confirm_id=react_loop.confirm_callback_id(_cb_data),
-                provider_key=_s2.planner_provider)  # #175: учёт расхода ReAct
+                provider_key=_prov2)  # #175 учёт расхода + #184 «Оса»
             trace.record("react_loop.resumed", chars=len(_reply2 or ""),
                          channel="telegram", noop=(not _reply2))
             if _reply2:  # непустой → пауза возобновлена (пустой = устаревший/чужой тап → no-op)
@@ -398,7 +399,8 @@ async def _process_approved_turn_locked(
                 from sreda.services.llm import get_chat_llm
 
                 _s = get_settings()
-                _llm = get_chat_llm(provider=_s.planner_provider, settings=_s)
+                _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
+                _llm = get_chat_llm(provider=_prov, settings=_s)
                 # ack v3: шлём «Секунду…» и редактируем ЕГО в финальный ответ
                 # (одно сообщение, как раньше; напрямую через editMessageText, без
                 # outbox → не зависнет). Любой сбой ack — не критичен.
@@ -419,7 +421,7 @@ async def _process_approved_turn_locked(
                     user_text=_react_text,
                     inbound_message_id=inbound_message_id,
                     channel="telegram",
-                    provider_key=_s.planner_provider,  # #175: учёт расхода ReAct
+                    provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
                 )
                 trace.record("react_loop.replied", chars=len(_reply or ""))
                 # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id

@@ -31,6 +31,7 @@ from typing import Any, Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -84,6 +85,15 @@ def confirm_callback_id(callback_data: str) -> str:
 def confirm_callback_data(action: str, pause_id: str) -> str:
     """Собрать callback_data кнопки: action ∈ {"yes","no"} + id паузы (может быть "")."""
     return f"react:{action}:{pause_id}" if pause_id else f"react:{action}"
+
+
+def react_provider(tenant_id: str) -> str:
+    """#184: провайдер LLM для ReAct-цикла тенанта. Тенант в react_osa_tenants → «Оса»
+    (groq-gpt-oss-120b @ Groq), иначе planner_provider (Mercury, дефолт). Per-tenant эксперимент;
+    планировщик (plan-execute) НЕ затронут — это оверрайд ТОЛЬКО для ReAct-входа."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return "groq-gpt-oss-120b" if tenant_id in s.react_osa_tenants else s.planner_provider
 
 
 class _Reply(str):
@@ -1134,17 +1144,34 @@ def _build_graph(llm: Any, all_tools: list, *,
                 continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
-            if turn_key:
-                op_id = allocate_operation_id(
-                    turn_key=turn_key, step_id=tc["id"], tool_name=name)
-                ctx = ToolRuntimeContext(
-                    operation_id=op_id, execution_id=exec_id, step_id=tc["id"],
-                    tool_name=name, tenant_id=tenant_id, user_id=user_id,
-                    turn_key=turn_key)
-                with bind_tool_runtime(ctx):
+            try:
+                if turn_key:
+                    op_id = allocate_operation_id(
+                        turn_key=turn_key, step_id=tc["id"], tool_name=name)
+                    ctx = ToolRuntimeContext(
+                        operation_id=op_id, execution_id=exec_id, step_id=tc["id"],
+                        tool_name=name, tenant_id=tenant_id, user_id=user_id,
+                        turn_key=turn_key)
+                    with bind_tool_runtime(ctx):
+                        res = tool_obj.invoke(tc["args"])
+                else:
                     res = tool_obj.invoke(tc["args"])
-            else:
-                res = tool_obj.invoke(tc["args"])
+            except GraphBubbleUp:
+                # control-flow LangGraph (interrupt()-пауза подтверждения / Command / Send и любые
+                # будущие подклассы) — НЕ ошибка инструмента; пробросить, иначе сломается
+                # confirm/HITL-поток. Ловим БАЗОВЫЙ класс (как ToolNode самого LangGraph).
+                raise
+            except Exception as exc:  # noqa: BLE001 — #163 Фаза 1а: исключение инструмента НЕ
+                # роняет ВЕСЬ ход. PII-safe: тип ошибки, без str(exc)/traceback (правило проекта:
+                # аргументы инструментов = ПД, напр. название напоминания → не логируем полное
+                # исключение). Парный error-ToolMessage (status="error") ОБЯЗАТЕЛЕН: нет висящего
+                # tool_call → провайдер не отвергнет AIMessage; модель видит сбой ИМЕННО этого
+                # инструмента → честный частичный отчёт named-P. wrote_unkeyed НЕ ставим.
+                logger.warning("react_loop: tool %s failed type=%s", name, type(exc).__name__)
+                out.append(ToolMessage(
+                    content=f"error: инструмент {name} не смог выполниться, повтори запрос.",
+                    name=name, tool_call_id=tc["id"], status="error"))
+                continue
             out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"]))
             if TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES:
                 wrote_unkeyed = True  # unkeyed-write выполнен → guard отключим (анти-дубль)
