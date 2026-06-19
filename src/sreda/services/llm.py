@@ -1307,6 +1307,11 @@ CHAT_PROVIDERS = (
     # 2026-06-15 (#60): Inception Mercury-2 (прямой api.inceptionlabs.ai) —
     # диффузионная LLM, 1000+ tps + cached input. Переезд планировщика с MiMo.
     "inception-mercury2",         # mercury-2
+    # 2026-06-19 (#173, форк freddie-eval): 3 кандидата на замену/фоллбек Фредди.
+    # ТОЛЬКО для оценки — на прод не катим. Замер через SREDA_PLANNER_PROVIDER.
+    "openrouter-trinity-thinking",   # arcee-ai/trinity-large-thinking
+    "openrouter-ling-flash",         # inclusionai/ling-2.6-flash
+    "openrouter-qwen3-thinking",     # qwen/qwen3-next-80b-a3b-thinking
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1339,6 +1344,10 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter-qwen-flash":        "qwen/qwen3.5-flash-02-23",
     "openrouter-gemini-2.5-flash":  "google/gemini-2.5-flash",
     "openrouter-gemini-2.5-flash-lite": "google/gemini-2.5-flash-lite",
+    # 2026-06-19 (#173, форк freddie-eval) — кандидаты на замену/фоллбек Фредди (оценка):
+    "openrouter-trinity-thinking":  "arcee-ai/trinity-large-thinking",
+    "openrouter-ling-flash":        "inclusionai/ling-2.6-flash",
+    "openrouter-qwen3-thinking":    "qwen/qwen3-next-80b-a3b-thinking",
 }
 
 
