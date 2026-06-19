@@ -26,7 +26,7 @@ import hashlib
 import logging
 import re
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -45,7 +45,7 @@ logger = logging.getLogger("sreda.react_loop")
 # Топология фиксирована: ОДИН checkpointer на множестве свежекомпилированных графов.
 # v2 — добавлен канал turn_key в state (#162). InMemory сбрасывается на рестарте, миграции
 # чекпойнтов не нужны.
-_TOPOLOGY_VERSION = "react-v2:chat,tools,turn_key"
+_TOPOLOGY_VERSION = "react-v5:chat,tools,guard,stop"  # #165 Срез A: ленивые семьи + guard + анти-петля
 _CHECKPOINTER = InMemorySaver()  # singleton на процесс
 _THREAD_GEN: dict[str, int] = {}
 _PENDING_TTL_SECONDS = 300  # 5 минут (решение владельца)
@@ -145,11 +145,27 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
 
 
 class ReactState(MessagesState):
-    """MessagesState + turn_key. turn_key минтится РАЗ на ход (handle_turn) и
-    хранится в checkpoint → переживает resume; run_tools берёт его отсюда для
-    стабильного operation_id (within-turn идемпотентность, g-032)."""
+    """MessagesState + turn_key + active_families. turn_key минтится РАЗ на ход
+    (handle_turn) и хранится в checkpoint → переживает resume; run_tools берёт его
+    отсюда для стабильного operation_id (within-turn идемпотентность, g-032).
+
+    #165 Срез A: active_families — список загруженных семей инструментов (last-value
+    канал, БЕЗ reducer: узел tools возвращает полный обновлённый список). Свежий ход
+    (handle_turn) стартует с базы (в Срезе A — пусто → биндится только ядро), копится в
+    пределах ОДНОГО сообщения через need_family (переживает resume). Межсообщенного
+    накопления НЕТ (сброс на свежем ходу) → нет дрейфа к full-bind. Sticky-через-ходы +
+    TTL/cap — отдельный под-шаг (#165 Срез C)."""
 
     turn_key: str
+    active_families: list[str]
+    # #165 Срез A guard: семьи, уже пробованные подстраховкой в ЭТОМ ходу (один retry на
+    # семью), и счётчик проходов chat (анти-петля, лимит _MAX_TURN_PASSES). Last-value каналы.
+    guard_attempted_families: list[str]
+    turn_pass_count: int
+    # guard_nudge: транзиентная подсказка от guard — chat дописывает её к системному промпту
+    # на ОДИН проход и тут же очищает. НЕ кладём SystemMessage в историю (копился бы между
+    # ходами + system в середине диалога → провайдер; R1 medium+субагент).
+    guard_nudge: str
 
 
 def _system_prompt(today_str: str) -> str:
@@ -521,6 +537,88 @@ def _react_desc(t: Any) -> Any:
         return t
 
 
+# ───────────────────────── #165 Срез A: ленивая загрузка семей ─────────────────────────
+# Ядро (ВСЕГДА привязано, не роутится): bespoke (напоминания+задачи+ask_human) + recall_memory
+# + need_family. Остальные семьи привязываются только когда загружены (active_families).
+_CORE_TOOL_NAMES = frozenset({
+    "list_reminders", "schedule_reminder", "update_reminder", "cancel_reminder",
+    "list_tasks", "add_task", "update_task", "complete_task", "uncomplete_task",
+    "cancel_task", "delete_task", "link_task", "unlink_task", "ask_human",
+    "recall_memory", "need_family",
+})
+# Валидные ленивые семьи — СИНХРОННО с Literal need_family ниже. run_tools ре-валидирует
+# arg против этого набора (Literal в схеме не гарантирует — модель может галлюцинировать).
+_LAZY_FAMILIES = frozenset({
+    "shopping", "recipes", "menu", "household", "checklists", "web", "memory"})
+
+
+@tool
+def need_family(
+    family: Literal["shopping", "recipes", "menu", "household", "checklists", "web", "memory"],
+) -> str:
+    """Догрузить семью инструментов, если нужного инструмента нет в текущем наборе.
+    Семьи: shopping — покупки; recipes — рецепты; menu — недельное меню; household — члены
+    семьи; checklists — чек-листы; web — поиск/погода/страницы; memory — сохранить заметку.
+    Зови ПЕРЕД тем как сказать «не умею», если задача из одной из этих семей."""
+    return f"Семья «{family}» загружена — теперь её инструменты доступны, продолжай."
+
+
+def _select_tools(all_tools: list, active_families: Any) -> list:
+    """Инструменты для bind на ЭТОМ проходе: ядро (по имени) + инструменты ЗАГРУЖЕННЫХ семей.
+    Семья инструмента — из TOOL_FAMILY_MANIFEST (ленивый импорт: тот же модуль, что и
+    build_slice_tools; sys.modules-кэш → дёшево на hot-path)."""
+    from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+    fams = set(active_families or ())
+    return [
+        t for t in all_tools
+        if t.name in _CORE_TOOL_NAMES or TOOL_FAMILY_MANIFEST.get(t.name) in fams
+    ]
+
+
+# #165 Срез A guard — детерминированный backstop «не отказать молчаливо».
+# ЛИМИТ ПРОХОДОВ chat/ход (анти-петля для ВСЕГО цикла, не только guard): при достижении
+# route → стоп-узел (грациозный выход), НЕ дожидаясь recursion_limit (тот — внешний нет
+# с большим запасом, см. _cfg). Срез добавил круги (детуры need_family) → запас нужен.
+_MAX_TURN_PASSES = 8
+_REFUSAL_MARKERS = (
+    "не умею", "не могу помочь", "пока не могу", "пока умею", "не поддерживаю",
+    "это вне моих", "не получится помочь", "к сожалению, не",
+)
+# МИНИМАЛЬНЫЙ детектор семьи по ключевым словам (Срез A). Срез B заменит полноценным
+# словарём токен-матча по границам слова (план §4) — здесь лишь разблокировка guard.
+_GUARD_FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "shopping": ("купи", "покупк", "в список покупок", "в корзину", "молок", "продукт"),
+    "recipes": ("рецепт", "приготов", "блюд", "ингредиент"),
+    "menu": ("меню", "на неделю", "что приготовить", "ужин на"),
+    "checklists": ("чек-лист", "чеклист", "список дел", "сборы"),
+    "household": ("член семьи", "членов семьи", "домочад", "кто в семье"),
+    "web": ("найди в интернете", "погугли", "поищи в сети", "новости", "погод", "курс"),
+    "memory": ("запомни", "сохрани заметк", "запиши факт"),
+}
+
+
+def _looks_like_refusal(content: Any) -> bool:
+    t = (content if isinstance(content, str) else str(content or "")).lower()
+    return any(m in t for m in _REFUSAL_MARKERS)
+
+
+def _detect_family_kw(text: str) -> str | None:
+    """Минимальный детектор семьи по ключевым словам (Срез A; Срез B → словарь)."""
+    t = (text or "").lower()
+    for fam, kws in _GUARD_FAMILY_KEYWORDS.items():
+        if any(k in t for k in kws):
+            return fam
+    return None
+
+
+def _last_human_text(messages: list) -> str:
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = getattr(m, "content", "")
+            return c if isinstance(c, str) else str(c or "")
+    return ""
+
+
 def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     """Тонкие инструменты среза (напоминания+задачи) над сервисами, замкнутые на
     session/tenant/user ЭТОГО запроса. Идемпотентность создания — в сервисах
@@ -769,6 +867,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         list_reminders, schedule_reminder, update_reminder, cancel_reminder,
         list_tasks, add_task, update_task, complete_task, uncomplete_task,
         cancel_task, delete_task, link_task, unlink_task, ask_human,
+        need_family,  # #165 Срез A: мета-инструмент добора семей (ядро, всегда в наборе)
     ]
 
     # #162 полный перенос — добираем остальные семьи из общего реестра
@@ -811,50 +910,148 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     return bespoke + extra
 
 
-def _build_graph(llm_with_tools: Any, tools_by_name: dict, *,
+def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str):
+    """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
+    ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
+    набор меняется по ходу без перекомпиляции графа (need_family добирает семью)."""
     system_prompt = _system_prompt(today_str)
 
     def chat(state: ReactState):
-        return {"messages": [llm_with_tools.invoke(
-            [SystemMessage(system_prompt), *state["messages"]])]}
+        # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
+        bound = _select_tools(all_tools, state.get("active_families"))
+        sp = system_prompt
+        nudge = state.get("guard_nudge")
+        if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
+            sp = f"{sp}\n\n{nudge}"
+        return {
+            "messages": [llm.bind_tools(bound).invoke(
+                [SystemMessage(sp), *state["messages"]])],
+            "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # анти-петля
+            "guard_nudge": "",  # one-shot: очищаем после применения
+        }
 
     def run_tools(state: ReactState):
         turn_key = state.get("turn_key") or ""
         exec_id = (hashlib.sha1(turn_key.encode("utf-8")).hexdigest()
                    if turn_key else "")
+        active = list(state.get("active_families") or [])
+        # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента
+        # из НЕ загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш.
+        bound_by_name = {t.name: t for t in _select_tools(all_tools, active)}
         out = []
+        added = False
         for tc in state["messages"][-1].tool_calls:
+            name = tc["name"]
+            # #165 Срез A: need_family — мета-инструмент, обрабатываем в узле (узел нативно
+            # обновляет state) → семья доезжает до следующего chat. Парный ToolMessage с
+            # оригинальным tool_call_id ОБЯЗАТЕЛЕН (провайдер иначе отвергнет AIMessage).
+            if name == "need_family":
+                fam = (tc.get("args") or {}).get("family")
+                # ре-валидация против allowed-set (Literal в схеме НЕ гарантирует — модель
+                # может галлюцинировать «utility»/«tasks»/мусор ИЛИ не-строку list/dict →
+                # `in frozenset` на unhashable дал бы TypeError → «потеряла контекст»; потому
+                # isinstance(str) ПЕРВЫМ). Невалидное → НЕ грузим, честная ошибка.
+                if isinstance(fam, str) and fam in _LAZY_FAMILIES:
+                    if fam not in active:
+                        active.append(fam)
+                        added = True
+                    msg = f"Семья «{fam}» загружена."
+                else:
+                    msg = (f"Семья «{fam}» неизвестна. Доступные для добора: "
+                           + ", ".join(sorted(_LAZY_FAMILIES)) + ".")
+                out.append(ToolMessage(content=msg, name=name, tool_call_id=tc["id"]))
+                continue
+            tool_obj = bound_by_name.get(name)
+            if tool_obj is None:
+                out.append(ToolMessage(
+                    content=(f"Инструмент {name} сейчас недоступен — сначала позови "
+                             "need_family нужной семьи."),
+                    name=name, tool_call_id=tc["id"]))
+                continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
             if turn_key:
-                # ctx.operation_id — per-STEP id (для будущего emit_event/#163); в срезе
-                # НЕ дедуп-ключ create: сервисы пересчитывают row-ключ через
-                # compute_operation_id_create(plan_id=execution_id, step_id, logical_key).
                 op_id = allocate_operation_id(
-                    turn_key=turn_key, step_id=tc["id"], tool_name=tc["name"])
+                    turn_key=turn_key, step_id=tc["id"], tool_name=name)
                 ctx = ToolRuntimeContext(
                     operation_id=op_id, execution_id=exec_id, step_id=tc["id"],
-                    tool_name=tc["name"], tenant_id=tenant_id, user_id=user_id,
+                    tool_name=name, tenant_id=tenant_id, user_id=user_id,
                     turn_key=turn_key)
                 with bind_tool_runtime(ctx):
-                    res = tools_by_name[tc["name"]].invoke(tc["args"])
+                    res = tool_obj.invoke(tc["args"])
             else:
-                res = tools_by_name[tc["name"]].invoke(tc["args"])
-            out.append(ToolMessage(content=str(res), name=tc["name"],
-                                   tool_call_id=tc["id"]))
-        return {"messages": out}
+                res = tool_obj.invoke(tc["args"])
+            out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"]))
+        update: dict = {"messages": out}
+        if added:  # семья добрана → обновляем state (last-value канал)
+            update["active_families"] = active
+        return update
 
     def route(state: ReactState):
-        return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
+        last = state["messages"][-1]
+        passes = state.get("turn_pass_count") or 0
+        if getattr(last, "tool_calls", None):
+            # АНТИ-ПЕТЛЯ (R1 medium+субагент): лимит проходов исчерпан (повтор need_family/
+            # недоступного инструмента и т.п.) → грациозный стоп-узел, НЕ зацикливаемся до
+            # recursion_limit (который дал бы «потеряла контекст»). turn_pass_count гейтит и
+            # tool-путь, не только guard.
+            return "stop" if passes >= _MAX_TURN_PASSES else "tools"
+        # #165 Срез A guard: ответ БЕЗ tool_call И похож на отказ И по тексту юзера видна
+        # семья ИЗ СРЕЗА не в bound И семья ещё НЕ пробована И лимит проходов не превышен
+        # → подстраховка (один retry на семью). scope-отказ (нет семьи в срезе) НЕ триггерит.
+        if passes < _MAX_TURN_PASSES \
+                and _looks_like_refusal(getattr(last, "content", "")):
+            fam = _detect_family_kw(_last_human_text(state["messages"]))
+            if fam and fam not in (state.get("active_families") or ()) \
+                    and fam not in (state.get("guard_attempted_families") or ()):
+                return "guard"
+        return END
+
+    def guard(state: ReactState):
+        # догрузить семью + пометить пробованной + ТРАНЗИЕНТНЫЙ nudge (через состояние, НЕ
+        # сообщением в истории) → обратно в chat. turn_pass_count инкрементит chat. Один retry
+        # на семью; если после него модель снова откажет — route не вернёт guard (в attempted).
+        fam = _detect_family_kw(_last_human_text(state["messages"]))
+        active = list(state.get("active_families") or [])
+        attempted = list(state.get("guard_attempted_families") or [])
+        if fam and fam not in active:
+            active.append(fam)
+        if fam and fam not in attempted:
+            attempted.append(fam)
+        return {
+            "active_families": active,
+            "guard_attempted_families": attempted,
+            "guard_nudge": (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
+                            "инструментом, не отвечай «не умею»."),
+        }
+
+    def stop(state: ReactState):
+        # АНТИ-ПЕТЛЯ: лимит проходов исчерпан. Закрываем висящие tool_calls парными
+        # ToolMessage (иначе провайдер на след. ходу отвергнет историю) + терминальный ответ.
+        last = state["messages"][-1]
+        out: list = [
+            ToolMessage(content="прервано: исчерпан лимит шагов хода",
+                        name=tc["name"], tool_call_id=tc["id"])
+            for tc in (getattr(last, "tool_calls", None) or [])
+        ]
+        out.append(AIMessage(
+            content="Прости, не получилось довести до конца за разумное число шагов. "
+                    "Уточни, пожалуйста, что именно нужно?"))
+        return {"messages": out}
 
     g = StateGraph(ReactState)
     g.add_node("chat", chat)
     g.add_node("tools", run_tools)
+    g.add_node("guard", guard)
+    g.add_node("stop", stop)
     g.add_edge(START, "chat")
-    g.add_conditional_edges("chat", route, {"tools": "tools", END: END})
+    g.add_conditional_edges(
+        "chat", route, {"tools": "tools", "guard": "guard", "stop": "stop", END: END})
     g.add_edge("tools", "chat")
-    assert _TOPOLOGY_VERSION == "react-v2:chat,tools,turn_key"  # топология фиксирована
+    g.add_edge("guard", "chat")
+    g.add_edge("stop", END)
+    assert _TOPOLOGY_VERSION == "react-v5:chat,tools,guard,stop"  # топология фикс.
     return g.compile(checkpointer=_CHECKPOINTER)
 
 
@@ -1087,7 +1284,11 @@ async def handle_turn(
     gen = _THREAD_GEN.get(base, 0)
 
     def _cfg(g: int) -> dict:
-        return {"configurable": {"thread_id": f"{base}#{g}"}}
+        # #165 Срез A: recursion_limit — ВНЕШНИЙ нет с запасом (R1: 15 было тесно — срез
+        # добавил круги need_family → молчаливая потеря хода). Реальный бранд петли —
+        # _MAX_TURN_PASSES (route→stop, грациозно). recursion_limit держим выше 2×MAX, чтобы
+        # stop срабатывал ПЕРВЫМ, а не GraphRecursionError.
+        return {"configurable": {"thread_id": f"{base}#{g}"}, "recursion_limit": 25}
 
     try:
         # дата-якорь для резолва относительных дат моделью (МСК = UTC+3, та же зона, что
@@ -1095,8 +1296,8 @@ async def handle_turn(
         today_str = datetime.now(_MSK).strftime("%Y-%m-%d (%A)")
 
         tools = build_slice_tools(session, tenant_id, user_id)
-        graph = _build_graph(
-            llm.bind_tools(tools), {t.name: t for t in tools},
+        graph = _build_graph(  # #165 Срез A: сырой llm + ВСЕ инструменты; bind поднабора в узлах
+            llm, tools,
             tenant_id=tenant_id, user_id=user_id, today_str=today_str)
 
         snap = await graph.aget_state(_cfg(gen))
@@ -1132,8 +1333,13 @@ async def handle_turn(
                 _THREAD_GEN[base] = gen
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
+            # #165 Срез A: свежий ход стартует с БАЗЫ семей (в Срезе A — пусто → только ядро;
+            # дальше Срез B добавит словарь-предзагрузку). Сброс на каждый ход → нет дрейфа.
+            # guard_attempted_families/turn_pass_count тоже сбрасываем (per-turn анти-петля).
             result = await graph.ainvoke(
-                {"messages": [HumanMessage(user_text)], "turn_key": turn_key}, _cfg(gen))
+                {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
+                 "active_families": [], "guard_attempted_families": [],
+                 "turn_pass_count": 0, "guard_nudge": ""}, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
         _tools = _called_tools(result)
