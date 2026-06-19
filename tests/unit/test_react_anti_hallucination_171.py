@@ -79,6 +79,22 @@ def test_rule10_carveouts_weather_and_user_data():
     assert "из головы" in sp
 
 
+def test_rule9_grounding_no_invented_details():
+    # Шаг 3-lite: числа/адреса/география из выдачи, не досочинять, не сливать сущности
+    sp = _sp()
+    assert "из выдачи" in sp
+    assert "не досочиняй" in sp
+    assert "не сливай разные объекты" in sp
+
+
+def test_no_false_done_word_on_info_answer():
+    # Шаг 3-lite: «записала/сохранила/...» только при реальном write-инструменте,
+    # на справку/поиск/совет так не говорить (ложное «записала» — правило #7)
+    sp = _sp()
+    assert "изменила что-то инструментом" in sp
+    assert "на справку, поиск или совет так не говори" in sp
+
+
 def test_rule10_mixed_answer_external_facts_still_rule9():
     # смешанный ответ (данные юзера + внешний факт) — внешнее всё равно по правилу 9
     # (Codex medium R3 MAJOR — шов #9/#10 на смешанных запросах)
