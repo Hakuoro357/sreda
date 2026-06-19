@@ -229,6 +229,60 @@ def test_get_weather_clamps_oob_offsets():
     assert "error:" in result or "Москва:" in result
 
 
+def test_render_daily_includes_probability_feels_gusts_176():
+    """#176: дневной рендер выдаёт вероятность осадков, ощущается, порывы — когда поля есть."""
+    data = {
+        "daily": {
+            "time": ["2026-06-19"],
+            "temperature_2m_max": [21.0], "temperature_2m_min": [14.0],
+            "precipitation_sum": [9.0], "weathercode": [63],
+            "apparent_temperature_max": [18.0], "apparent_temperature_min": [10.0],
+            "precipitation_probability_max": [63], "wind_gusts_10m_max": [32.0],
+        }
+    }
+    out = wt._render_daily(data, day_offset=0, days_count=1, display="Москва")
+    assert "63%" in out, out            # вероятность осадков
+    assert "ощущ" in out.lower(), out   # ощущается
+    assert "32" in out, out             # порывы
+
+
+def test_render_daily_today_prepends_current_176():
+    """#176: для сегодня (day_offset=0) при наличии current — строка текущих условий."""
+    data = {
+        "daily": {"time": ["2026-06-19"], "temperature_2m_max": [21.0],
+                  "temperature_2m_min": [14.0], "precipitation_sum": [0.0], "weathercode": [3]},
+        "current": {"temperature_2m": 20.1, "apparent_temperature": 16.0,
+                    "weather_code": 3, "wind_speed_10m": 10.2, "wind_gusts_10m": 31.3,
+                    "relative_humidity_2m": 49, "precipitation": 0.0},
+    }
+    out = wt._render_daily(data, day_offset=0, days_count=1, display="Москва")
+    assert "ейчас" in out, out   # «Сейчас:»
+    assert "16" in out, out      # ощущается +16 (отличается от +20 → показано)
+
+
+def test_render_daily_no_current_unchanged_176():
+    """#176 регресс: без current/новых полей — прежний формат (заголовок первой строкой)."""
+    data = {"daily": {"time": ["2026-04-29"], "temperature_2m_max": [5.0],
+                      "temperature_2m_min": [1.0], "precipitation_sum": [0.0], "weathercode": [0]}}
+    out = wt._render_daily(data, day_offset=0, days_count=1, display="Москва")
+    assert out.split("\n")[0] == "Москва:", out
+    assert "Сейчас" not in out, out
+
+
+def test_render_hourly_includes_probability_176():
+    """#176: почасовой рендер показывает вероятность осадков, когда поле есть."""
+    data = {"hourly": {
+        "time": ["2026-06-19T15:00"], "temperature_2m": [19.0], "weathercode": [61],
+        "precipitation": [1.2], "windspeed_10m": [4.0],
+        "precipitation_probability": [70], "wind_gusts_10m": [9.0],
+    }}
+    tz = ZoneInfo("Europe/Moscow")
+    start = _datetime(2026, 6, 19, 0, 0, tzinfo=tz)
+    end = _datetime(2026, 6, 19, 23, 0, tzinfo=tz)
+    out = wt._render_hourly(data, "Москва", tz, start, end, end, False)
+    assert "70%" in out, out
+
+
 def test_get_weather_multi_day_format():
     """7-day forecast форматируется одной строкой на день."""
     wt._GEO_CACHE.clear()
