@@ -1312,6 +1312,9 @@ CHAT_PROVIDERS = (
     "openrouter-trinity-thinking",   # arcee-ai/trinity-large-thinking
     "openrouter-ling-flash",         # inclusionai/ling-2.6-flash
     "openrouter-qwen3-thinking",     # qwen/qwen3-next-80b-a3b-thinking
+    # 2026-06-19 (#173): быстрые НЕ-thinking, пиннинг Groq (форс быстрый бэкенд):
+    "openrouter-llama33-groq",       # llama-3.3-70b @ Groq
+    "openrouter-llama4scout-groq",   # llama-4-scout @ Groq
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1348,6 +1351,8 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
     "openrouter-trinity-thinking":  "arcee-ai/trinity-large-thinking",
     "openrouter-ling-flash":        "inclusionai/ling-2.6-flash",
     "openrouter-qwen3-thinking":    "qwen/qwen3-next-80b-a3b-thinking",
+    "openrouter-llama33-groq":      "meta-llama/llama-3.3-70b-instruct",
+    "openrouter-llama4scout-groq":  "meta-llama/llama-4-scout",
 }
 
 
@@ -1389,6 +1394,13 @@ def _override_temperature(provider: str, default: float) -> float:
 
 
 _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    # 2026-06-19 (#173): форс Groq (быстрый бэкенд, ~500-1000 tps) для замера скорости.
+    "openrouter-llama33-groq": {
+        "provider": {"only": ["groq"], "allow_fallbacks": False},
+    },
+    "openrouter-llama4scout-groq": {
+        "provider": {"only": ["groq"], "allow_fallbacks": False},
+    },
     # 2026-05-11: `order` оказался preference, не forced — OpenRouter
     # роутил на DekaLLM (нестабильный, 1.9-253 t/s spread) когда
     # DeepInfra/bf16 был busy. Меняем на `only` + allow_fallbacks=False
