@@ -13,11 +13,17 @@ from sreda.api.deps import enforce_connect_rate_limit
 from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import Settings, get_settings
 from sreda.db.session import get_db_session
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.services.eds_account_verification import EDSAccountVerificationService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 
 router = APIRouter(tags=["connect"])
 logger = logging.getLogger(__name__)
+
+# #181: eds_monitor retired. The connect routes stay mounted (old Telegram
+# messages / Mini App buttons link here) but become tombstones — they render
+# a "disabled" page instead of 404, and perform NO DB mutation.
+_EDS_DISABLED_PAGE_MESSAGE = "Это умение отключено."
 
 
 def _enforce_same_origin(request: Request, settings: Settings) -> None:
@@ -64,6 +70,8 @@ def open_eds_connect_form(
     token: str,
     session: Session = Depends(get_db_session),
 ) -> HTMLResponse:
+    if is_feature_disabled("eds_monitor"):
+        return HTMLResponse(_render_error_page(_EDS_DISABLED_PAGE_MESSAGE), status_code=200)
     service = EDSConnectService(session, get_settings())
     try:
         connect_session = service.open_form(token)
@@ -88,6 +96,8 @@ async def submit_eds_connect_form(
     request: Request,
     session: Session = Depends(get_db_session),
 ) -> HTMLResponse:
+    if is_feature_disabled("eds_monitor"):
+        return HTMLResponse(_render_error_page(_EDS_DISABLED_PAGE_MESSAGE), status_code=200)
     settings = get_settings()
     _enforce_same_origin(request, settings)
     service = EDSConnectService(session, settings)

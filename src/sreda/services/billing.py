@@ -17,8 +17,14 @@ from sreda.db.models.billing import (
 )
 from sreda.db.models.connect import TenantEDSAccount
 from sreda.db.models.core import TenantFeature, User
+from sreda.domain.tenants.features import is_feature_disabled
 
 logger = logging.getLogger(__name__)
+
+# #181: text shown when a user reaches a retired skill through any old
+# surface (callback, Mini App, legacy chat command). No reply_markup —
+# the surface is a tombstone, there is no follow-up action.
+DISABLED_FEATURE_MESSAGE = "Это умение больше не поддерживается."
 
 STATUS_CALLBACK = "billing:status"
 SUBSCRIPTIONS_CALLBACK = "billing:subscriptions"
@@ -122,6 +128,14 @@ PLAN_SEEDS: tuple[PlanSeed, ...] = (
 class BillingService:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    @staticmethod
+    def _eds_disabled_result() -> SubscriptionActionResult:
+        """#181: no-op result for a retired skill. No DB write, no markup."""
+        return SubscriptionActionResult(
+            message_text=DISABLED_FEATURE_MESSAGE,
+            reply_markup={},
+        )
 
     def ensure_default_plans(self) -> None:
         # 2026-06-04 (vex-assistant#99/#100): write ONLY when a plan is missing
@@ -249,19 +263,91 @@ class BillingService:
             connected_accounts=connected_accounts,
         )
 
+    def compute_display_next_payment(
+        self, tenant_id: str, *, now: datetime | None = None
+    ) -> tuple[int, datetime | None]:
+        """#181 DISPLAY-only recompute of the next-payment amount + date,
+        EXCLUDING any plan whose ``feature_key`` is a retired skill.
+
+        ``get_summary().next_amount_rub`` is computed purely from the EDS
+        plans (base + extra), so a stale-EDS tenant with
+        ``next_cycle_quantity > 0`` would surface a charge for a retired
+        skill. This helper re-derives the figure the SAME way
+        ``renew_cycle`` builds ``total_amount_rub`` (subscription⋈plan rows,
+        per-plan ``next_quantity`` with the EDS-base special case) but drops
+        disabled-feature plans, leaving voice / housewife / future non-EDS
+        contributions intact.
+
+        Returns ``(amount_rub, due_at)``. When the recomputed amount is 0 —
+        either because there is no renewable NON-disabled subscription, or the
+        only non-EDS renewals are free (e.g. the 0 ₽ housewife plan) — this
+        returns ``(0, None)`` so the caller suppresses the "Сумма к оплате"
+        line entirely. This is READ-ONLY: it never mutates rows and never
+        calls ``get_summary``'s quarantined EDS read-path beyond plan prices.
+        """
+        current_time = _utcnow(now)
+        cycle = self._get_cycle(tenant_id)
+        if cycle is None:
+            return 0, None
+
+        subscription_plan_rows: list[tuple[TenantSubscription, SubscriptionPlan]] = (
+            self.session.query(TenantSubscription, SubscriptionPlan)
+            .join(SubscriptionPlan, TenantSubscription.plan_id == SubscriptionPlan.id)
+            .filter(TenantSubscription.tenant_id == tenant_id)
+            .all()
+        )
+        amount_rub = 0
+        for subscription, plan in subscription_plan_rows:
+            if is_feature_disabled(plan.feature_key):
+                continue
+            next_quantity = self._get_next_cycle_quantity(subscription)
+            if (
+                plan.plan_key == PLAN_EDS_MONITOR_BASE
+                and subscription.quantity > 0
+                and subscription.active_until
+                and _coerce_utc(subscription.active_until) > current_time
+                and next_quantity <= 0
+            ):
+                next_quantity = subscription.quantity
+            if next_quantity <= 0:
+                continue
+            amount_rub += plan.price_rub * next_quantity
+
+        # Suppress the payment line when there is nothing to CHARGE (no
+        # non-EDS renewal, or only free renewals) — task: "сумма = 0 / нет
+        # не-EDS подписки на продление → не показывать «Сумма к оплате»".
+        if amount_rub <= 0:
+            return 0, None
+        return amount_rub, cycle.next_payment_due_at
+
     def build_status_message(self, tenant_id: str, *, now: datetime | None = None) -> tuple[str, dict]:
         summary = self.get_summary(tenant_id, now=now)
+        # #181 DISPLAY tombstone: suppress EDS active lines AND the "Кабинеты
+        # EDS" block when eds_monitor is retired. Non-EDS status (payment due,
+        # other active subscriptions) is unaffected. Display-only — get_summary
+        # stays quarantined, not removed.
+        eds_disabled = is_feature_disabled("eds_monitor")
         active_lines: list[str] = []
-        if summary.base_active and summary.base_active_until:
+        if not eds_disabled and summary.base_active and summary.base_active_until:
             active_lines.append(f"- EDS Monitor — активно до {_format_date(summary.base_active_until)}")
-        if summary.extra_quantity > 0 and summary.extra_active_until:
+        if not eds_disabled and summary.extra_quantity > 0 and summary.extra_active_until:
             active_lines.append(
                 f"- Доп. кабинеты EDS — {summary.extra_quantity} шт., активно до {_format_date(summary.extra_active_until)}"
             )
         if not active_lines:
             active_lines.append("- нет")
 
-        due_text = _format_date(summary.next_payment_due_at) if summary.next_payment_due_at else "не назначен"
+        # #181 DISPLAY tombstone: the payment amount/date in get_summary are
+        # EDS-only, so a stale-EDS tenant would see a charge for a retired
+        # skill. Recompute display-only, excluding disabled-feature plans.
+        # If nothing non-EDS renews → suppress the payment block entirely
+        # (no "Сумма к оплате" line). Non-disabled path keeps get_summary's
+        # figures byte-for-byte.
+        if eds_disabled:
+            display_amount, display_due = self.compute_display_next_payment(tenant_id, now=now)
+        else:
+            display_amount, display_due = summary.next_amount_rub, summary.next_payment_due_at
+
         connected_account_lines = [
             f"- {account.login_masked}{' (не продлевать)' if account.scheduled_for_disconnect else ''}"
             for account in summary.connected_accounts
@@ -273,14 +359,24 @@ class BillingService:
                 f"- подключено кабинетов: {summary.connected_count} из {summary.allowed_count}"
             )
 
+        payment_block = ""
+        if eds_disabled and display_due is None:
+            # Nothing non-EDS to renew → omit the payment lines completely.
+            payment_block = ""
+        else:
+            due_text = _format_date(display_due) if display_due else "не назначен"
+            payment_block = (
+                f"Следующий платеж: {due_text}\n"
+                f"Сумма к оплате: {display_amount} ₽\n\n"
+            )
+
         text = (
             "Мой статус\n\n"
-            f"Следующий платеж: {due_text}\n"
-            f"Сумма к оплате: {summary.next_amount_rub} ₽\n\n"
+            f"{payment_block}"
             "Активные подписки:\n"
             f"{chr(10).join(active_lines)}"
         )
-        if summary.allowed_count > 0 or summary.connected_accounts:
+        if not eds_disabled and (summary.allowed_count > 0 or summary.connected_accounts):
             text += "\n\nКабинеты EDS:"
             if eds_lines:
                 text += f"\n{chr(10).join(eds_lines)}"
@@ -308,6 +404,12 @@ class BillingService:
         base_plan = self._get_plan(PLAN_EDS_MONITOR_BASE)
         extra_plan = self._get_plan(PLAN_EDS_MONITOR_EXTRA)
         next_cycle_free_slots = self._get_free_slots_for_next_cycle(tenant_id)
+        # #181 DISPLAY tombstone: when eds_monitor is retired, suppress every
+        # EDS active/available LINE and every EDS BUTTON in this legacy
+        # subscriptions view (reachable when connect_public_base_url is unset).
+        # Voice and the navigation button stay. This is display-only — the
+        # billing read-path / get_summary remain quarantined, not removed.
+        eds_disabled = is_feature_disabled("eds_monitor")
 
         # Voice transcription subscription state
         voice_plan = self._get_plan_optional(PLAN_VOICE_TRANSCRIPTION)
@@ -315,11 +417,11 @@ class BillingService:
         voice_active = self._is_subscription_active(voice_sub, _utcnow(now)) if voice_sub else False
 
         active_lines: list[str] = []
-        if summary.base_active and summary.base_active_until:
+        if not eds_disabled and summary.base_active and summary.base_active_until:
             active_lines.append(
                 f"- {base_plan.title} — {base_plan.price_rub} ₽ / 30 дней, активно до {_format_date(summary.base_active_until)}"
             )
-        if summary.extra_quantity > 0 and summary.extra_active_until:
+        if not eds_disabled and summary.extra_quantity > 0 and summary.extra_active_until:
             active_lines.append(
                 f"- {extra_plan.title} — {summary.extra_quantity} × {extra_plan.price_rub} ₽ / 30 дней, активно до {_format_date(summary.extra_active_until)}"
             )
@@ -335,10 +437,11 @@ class BillingService:
             active_block = "Подключенных подписок пока нет."
 
         available_lines = []
-        if not summary.base_active:
-            available_lines.append(f"- {base_plan.title} — {base_plan.price_rub} ₽ / 30 дней")
-        elif summary.base_active:
-            available_lines.append(f"- {extra_plan.title} — {extra_plan.price_rub} ₽ / 30 дней")
+        if not eds_disabled:
+            if not summary.base_active:
+                available_lines.append(f"- {base_plan.title} — {base_plan.price_rub} ₽ / 30 дней")
+            elif summary.base_active:
+                available_lines.append(f"- {extra_plan.title} — {extra_plan.price_rub} ₽ / 30 дней")
         if not voice_active and voice_plan:
             price_label = f"{voice_plan.price_rub} ₽ / 30 дней" if voice_plan.price_rub > 0 else "бесплатно"
             available_lines.append(f"- {voice_plan.title} — {price_label}")
@@ -347,7 +450,11 @@ class BillingService:
         text = f"Подписки\n\n{active_block}\n\n{available_block}"
 
         buttons: list[list[dict]] = []
-        if not summary.base_active:
+        if eds_disabled:
+            # #181: emit NO EDS buttons (connect/add/remove/restore). Only the
+            # voice toggle (below) + navigation button remain.
+            pass
+        elif not summary.base_active:
             buttons.append([{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}])
         else:
             buttons.append([{"text": "Добавить подписку на EDS", "callback_data": ADD_EDS_ACCOUNT_CALLBACK}])
@@ -386,6 +493,8 @@ class BillingService:
         now: datetime | None = None,
         connect_button_override: dict | None = None,
     ) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         self.ensure_default_plans()
         current_time = _utcnow(now)
         existing = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
@@ -494,6 +603,8 @@ class BillingService:
         now: datetime | None = None,
         connect_button_override: dict | None = None,
     ) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         self.ensure_default_plans()
         current_time = _utcnow(now)
         base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
@@ -601,6 +712,16 @@ class BillingService:
             .filter(TenantSubscription.tenant_id == tenant_id)
             .all()
         )
+        # #181 PARTITION: drop disabled-skill subscriptions (eds_monitor) from
+        # the source iteration entirely. They must NOT enter ``renewable_items``
+        # NOR the implicit expire-loop below (which would set them expired /
+        # quantity=0). Filtering both lists here keeps every disabled-EDS row
+        # byte-for-byte. Non-EDS subs (voice/housewife) renew as usual.
+        subscription_plan_rows = [
+            row
+            for row in subscription_plan_rows
+            if not is_feature_disabled(row[1].feature_key)
+        ]
         subscriptions = [row[0] for row in subscription_plan_rows]
         renewable_items: list[tuple[TenantSubscription, SubscriptionPlan, int]] = []
         total_amount_rub = 0
@@ -668,22 +789,52 @@ class BillingService:
         cycle.status = "active"
         cycle.updated_at = current_time
 
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        self._ensure_feature_enabled(
-            tenant_id,
-            "eds_monitor",
-            bool(base_subscription and base_subscription.quantity > 0 and base_subscription.status == "active"),
-        )
-        self._apply_tenant_eds_account_renewal_state(tenant_id)
+        # #181: skip the unconditional eds_monitor feature re-sync and the
+        # EDS-account renewal-state mutation for a retired skill — both would
+        # touch disabled-EDS rows. Non-EDS renewals above are unaffected.
+        if not is_feature_disabled("eds_monitor"):
+            base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
+            self._ensure_feature_enabled(
+                tenant_id,
+                "eds_monitor",
+                bool(base_subscription and base_subscription.quantity > 0 and base_subscription.status == "active"),
+            )
+            self._apply_tenant_eds_account_renewal_state(tenant_id)
         self.session.commit()
 
         summary = self.get_summary(tenant_id, now=current_time)
+        # #181 DISPLAY tombstone: renew_cycle is intentionally NOT disabled (it
+        # renews voice/housewife), but its success message rendered
+        # ``summary.next_amount_rub`` / ``next_payment_due_at`` straight from
+        # get_summary, which sums ONLY the EDS base+extra plans. A stale-EDS
+        # tenant (eds next_cycle_quantity>0) renewing voice would therefore see
+        # a phantom charge for the retired skill. Recompute display-only via the
+        # SAME helper build_status_message uses — excluding disabled-feature
+        # plans — so the voice/housewife figure stays correct (299 ₽) and the
+        # EDS contribution never surfaces. When the disabled-aware recompute
+        # finds nothing non-EDS to charge (due is None) the payment line is
+        # dropped entirely. Non-disabled tenants keep get_summary byte-for-byte.
+        if is_feature_disabled("eds_monitor"):
+            display_amount, display_due = self.compute_display_next_payment(
+                tenant_id, now=current_time
+            )
+        else:
+            display_amount, display_due = (
+                summary.next_amount_rub,
+                summary.next_payment_due_at,
+            )
+
+        if is_feature_disabled("eds_monitor") and display_due is None:
+            payment_block = ""
+        else:
+            payment_block = (
+                "\n\n"
+                f"Следующий платеж: {_format_date(display_due)}\n"
+                f"Сумма следующего платежа: {display_amount} ₽"
+            )
+
         return SubscriptionActionResult(
-            message_text=(
-                "Подписка продлена.\n\n"
-                f"Следующий платеж: {_format_date(summary.next_payment_due_at)}\n"
-                f"Сумма следующего платежа: {summary.next_amount_rub} ₽"
-            ),
+            message_text=f"Подписка продлена.{payment_block}",
             reply_markup=_inline_keyboard(
                 [
                     [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
@@ -693,6 +844,8 @@ class BillingService:
         )
 
     def cancel_base_at_period_end(self, tenant_id: str) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
         if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
             return SubscriptionActionResult(
@@ -719,6 +872,8 @@ class BillingService:
         )
 
     def resume_base_renewal(self, tenant_id: str) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
         if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
             return SubscriptionActionResult(
@@ -746,6 +901,8 @@ class BillingService:
         )
 
     def remove_extra_account_at_period_end(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         current_time = _utcnow(now)
         summary = self.get_summary(tenant_id, now=current_time)
         if summary.allowed_count <= 0:
@@ -795,6 +952,8 @@ class BillingService:
         tenant_id: str,
         tenant_eds_account_id: str,
     ) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         tenant_account = self.session.get(TenantEDSAccount, tenant_eds_account_id)
         if tenant_account is None or tenant_account.tenant_id != tenant_id:
             return SubscriptionActionResult(
@@ -871,6 +1030,8 @@ class BillingService:
         )
 
     def restore_extra_account_slot(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         current_time = _utcnow(now)
         if self._get_removed_free_slot_count(tenant_id, now=current_time) <= 0:
             return SubscriptionActionResult(
@@ -908,6 +1069,8 @@ class BillingService:
         *,
         now: datetime | None = None,
     ) -> SubscriptionActionResult:
+        if is_feature_disabled("eds_monitor"):
+            return self._eds_disabled_result()
         current_time = _utcnow(now)
         tenant_account = self.session.get(TenantEDSAccount, tenant_eds_account_id)
         if tenant_account is None or tenant_account.tenant_id != tenant_id:
@@ -1068,6 +1231,10 @@ class BillingService:
                     [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
                 ),
             )
+        # #181: cut ONLY a retired skill (by resolved feature_key) — voice /
+        # housewife (other feature_key) keep flowing through this generic path.
+        if is_feature_disabled(plan.feature_key):
+            return self._eds_disabled_result()
         sub = self._get_subscription_optional(tenant_id, plan_key)
         if sub is not None and self._is_subscription_active(sub, current_time):
             return SubscriptionActionResult(
@@ -1127,6 +1294,9 @@ class BillingService:
                     [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
                 ),
             )
+        # #181: cut ONLY a retired skill (by resolved feature_key).
+        if is_feature_disabled(plan.feature_key):
+            return self._eds_disabled_result()
         sub = self._get_subscription_optional(tenant_id, plan_key)
         if sub is None or sub.quantity <= 0:
             return SubscriptionActionResult(

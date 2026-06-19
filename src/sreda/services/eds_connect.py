@@ -13,11 +13,27 @@ from sqlalchemy.orm import Session
 from sreda.config.settings import Settings
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import Assistant, Job
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.services.billing import BillingService
 from sreda.services.secure_storage import store_secure_json
 
 
 SESSION_TTL_MINUTES_DEFAULT = 15  # Overridden by settings.connect_session_ttl_minutes
+
+# #181: eds_monitor is retired. EDSConnectService is the SECOND mutation
+# boundary outside billing (it writes ConnectSession / TenantEDSAccount /
+# Job / SecureRecord directly), so every entry point gets a disabled check
+# BEFORE any mutation. Raising the existing ConnectSessionError keeps every
+# caller (routes + retry callbacks + legacy fallbacks) on its known error path.
+_EDS_DISABLED_MESSAGE = "Это умение больше не поддерживается."
+
+
+def _raise_eds_disabled() -> None:
+    raise ConnectSessionError(
+        "feature_disabled",
+        _EDS_DISABLED_MESSAGE,
+        status_code=410,
+    )
 
 
 class ConnectSessionError(Exception):
@@ -57,6 +73,8 @@ class EDSConnectService:
         user_id: str | None,
         slot_type: str,
     ) -> ConnectLinkResult:
+        if is_feature_disabled("eds_monitor"):
+            _raise_eds_disabled()
         if slot_type not in {"primary", "extra"}:
             raise ConnectSessionError("invalid_slot", "Invalid account slot type.", status_code=400)
 
@@ -112,6 +130,8 @@ class EDSConnectService:
         )
 
     def open_form(self, raw_token: str) -> ConnectSession:
+        if is_feature_disabled("eds_monitor"):
+            _raise_eds_disabled()
         connect_session = self._require_valid_session(raw_token)
         if connect_session.opened_at is None:
             connect_session.opened_at = _utcnow()
@@ -121,6 +141,8 @@ class EDSConnectService:
         return connect_session
 
     def submit_form(self, raw_token: str, *, login: str, password: str) -> ConnectSubmitResult:
+        if is_feature_disabled("eds_monitor"):
+            _raise_eds_disabled()
         normalized_login = login.strip()
         normalized_password = password.strip()
         if not normalized_login or not normalized_password:

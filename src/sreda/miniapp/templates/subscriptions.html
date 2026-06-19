@@ -1751,6 +1751,16 @@
 
   // --- Screen: EDS Monitor skill (#/skill/eds_monitor) ---
   function renderEdsSkill() {
+    // #181: EDS Monitor retired. Tombstone screen — old deep-links to
+    // #/skill/eds_monitor land here and see a disabled notice instead of a
+    // broken control surface. The backend never emits EDS cards now, so this
+    // route is only reachable via a stale bookmark.
+    setupBackButton(true);
+    return '<h1>EDS Monitor</h1>'
+      + '<div class="card"><p>Это умение отключено.</p></div>';
+  }
+
+  function _renderEdsSkillLegacy() {
     setupBackButton(true);
     var s = state.summary;
     var html = '<h1>EDS Monitor</h1>';

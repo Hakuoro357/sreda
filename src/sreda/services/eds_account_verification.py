@@ -16,6 +16,7 @@ from sreda.config.settings import get_settings
 from sreda.db.models.eds_monitor import EDSAccount
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import Job, SecureRecord, User
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.integrations.telegram.client import TelegramClient
 from sreda.services.privacy_guard import get_default_privacy_guard
 from sreda.services.secure_storage import load_secure_json, store_secure_json
@@ -155,6 +156,11 @@ class EDSAccountVerificationService:
         self.adapter = adapter or DefaultEDSVerificationAdapter()
 
     async def process_pending_jobs(self, *, limit: int = 20) -> int:
+        # #181: eds_monitor retired — do NOT drain pending eds-jobs into a
+        # state mutation. Leaving them ``pending`` (untouched) keeps the
+        # disabled-EDS rows intact through Phase 1; Phase 4 cleans the queue.
+        if is_feature_disabled("eds_monitor"):
+            return 0
         jobs = (
             self.session.query(Job)
             .filter(Job.job_type == "eds.verify_account_connect", Job.status == "pending")
@@ -169,6 +175,10 @@ class EDSAccountVerificationService:
         return processed
 
     async def process_job(self, job_id: str) -> str:
+        # #181: eds_monitor retired — no-op on the inline (connect.py) entry
+        # too, BEFORE touching the job. Pending eds-jobs are not mutated.
+        if is_feature_disabled("eds_monitor"):
+            return "skipped"
         job = self.session.get(Job, job_id)
         if job is None:
             return "missing"

@@ -31,6 +31,7 @@ from sreda.db.repositories.user_profile import (
     NOTIFICATION_PRIORITIES,
     UserProfileRepository,
 )
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.app_registry import get_feature_registry
 from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.tools import build_memory_tools
@@ -314,6 +315,16 @@ def _try_build_connect_override(
 
 
 def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
+    # #181: /claim is an eds_monitor feature — tombstone. No DB read of EDS
+    # state, just a disabled notice (the handler + dispatch route stay so
+    # old /claim commands get a clear answer, not a silent unknown-command).
+    if is_feature_disabled("eds_monitor"):
+        return [
+            RuntimeReply(
+                text="Это умение отключено.",
+                reply_markup=_miniapp_reply_markup(),
+            )
+        ]
     claim_id = str(action.params.get("claim_id") or "").strip()
     service = ClaimLookupService(session)
     result = service.lookup_local_claim(action.tenant_id, claim_id)
@@ -379,6 +390,16 @@ def execute_subscription_cancel_voice(
 def execute_eds_connect_start(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
+    # #181: eds_monitor is retired — return a COMPLETED tombstone instead of
+    # raising. The EDSConnectService guard still raises ConnectSessionError
+    # (defense-in-depth), but routing the connect *action* through the
+    # exception path would make the graph persist run.status="failed", which
+    # is inconsistent with the /claim tombstone (a completed run). Mirror
+    # execute_claim_lookup: short-circuit to a completed disabled notice.
+    if is_feature_disabled("eds_monitor"):
+        return [
+            RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())
+        ]
     slot_type = str(action.params.get("slot_type") or "available_slot")
     resolved_slot_type = _resolve_slot_type(session, action.tenant_id, slot_type)
     return _build_connect_replies(session, action, slot_type=resolved_slot_type)
@@ -387,6 +408,11 @@ def execute_eds_connect_start(
 def execute_eds_connect_retry(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
+    # #181: see execute_eds_connect_start — completed tombstone, not a failed run.
+    if is_feature_disabled("eds_monitor"):
+        return [
+            RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())
+        ]
     slot_type = str(action.params.get("slot_type") or "")
     return _build_connect_replies(session, action, slot_type=slot_type)
 

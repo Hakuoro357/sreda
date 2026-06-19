@@ -313,7 +313,11 @@ def test_telegram_webhook_handles_status_command(
     real_reply = sent_messages[1]
     assert real_reply["chat_id"] == EXISTING_CHAT_ID
     assert "Мой статус" in real_reply["text"]
-    assert "Сумма к оплате: 0 ₽" in real_reply["text"]
+    # #181: eds_monitor retired. The status payment amount/date are EDS-only
+    # figures, so for a tenant with no non-EDS renewal the payment block is
+    # suppressed entirely — no "Сумма к оплате: 0 ₽" line for a retired skill.
+    assert "Сумма к оплате" not in real_reply["text"]
+    assert "Следующий платеж" not in real_reply["text"]
 
     session = get_session_factory()()
     try:
@@ -408,7 +412,10 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     _wait_for(lambda: len(answered_callbacks) == 1 and len(sent_messages) == 1)
     assert len(answered_callbacks) == 1
     assert len(sent_messages) == 1
-    assert "Подписка EDS Monitor подключена." in sent_messages[0]["text"]
+    # #181: eds_monitor retired. The legacy connect callback still routes
+    # (no 404 / silent drop) but the billing mutator is a disabled no-op —
+    # the reply is the disabled notice and NO subscription is created.
+    assert "Это умение больше не поддерживается." in sent_messages[0]["text"]
 
     session = get_session_factory()()
     try:
@@ -419,7 +426,7 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     finally:
         session.close()
 
-    assert len(subscriptions) == 1
+    assert len(subscriptions) == 0  # no-op: nothing written
     assert len(jobs) == 1
     assert len(runs) == 1
     assert len(outbox) == 1
@@ -597,7 +604,10 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
     finally:
         session.close()
 
-    assert len(subscriptions) == 1
+    # #181: the EDS connect callback is now a no-op (eds_monitor retired), so
+    # no subscription is created. The point of this test is the 202-on-
+    # delivery-timeout behavior, which is unaffected by the tombstone.
+    assert len(subscriptions) == 0
 
 
 def test_telegram_webhook_rejects_request_without_secret_token_header(
@@ -827,8 +837,11 @@ def test_telegram_webhook_handles_claim_lookup_command(
     assert len(sent_messages) == 2
     assert sent_messages[0]["text"] in all_phrases()
     real_reply = sent_messages[1]
-    assert "Заявка #6230173" in real_reply["text"]
-    assert "Статус: В работе" in real_reply["text"]
+    # #181: /claim is an eds_monitor feature — tombstoned. The command still
+    # routes and the run completes, but the reply is the disabled notice, not
+    # a claim card.
+    assert "Это умение отключено." in real_reply["text"]
+    assert "Заявка #6230173" not in real_reply["text"]
 
     session = get_session_factory()()
     try:

@@ -1,6 +1,18 @@
+"""EDS connect-flow tests.
+
+Module-level skip 2026-06-19 (#181 Phase 1): eds_monitor is retired and the
+connect surfaces are now tombstoned at the service layer (EDSConnectService
+no-ops, connect routes render a disabled page). These tests exercise the
+live connect/verify flow that no longer runs. They are scheduled for DELETION
+in #181 Phase 3 (test surface cleanup); skipped here to keep Phase-1 CI green
+without deleting modules ahead of the import-graph/quarantine work.
+"""
+
 import base64
 import threading
 from pathlib import Path
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -15,6 +27,11 @@ from sreda.services.eds_account_verification import EDSAccountVerificationServic
 from sreda.services.billing import BillingService
 from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.secure_storage import load_secure_json
+
+pytestmark = pytest.mark.skip(
+    reason="#181 Phase 1: eds_monitor deactivated; connect flow tombstoned. "
+    "Tests deleted in Phase 3."
+)
 
 
 CHAT_ID = "100000010"

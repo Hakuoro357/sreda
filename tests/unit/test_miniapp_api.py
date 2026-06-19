@@ -140,10 +140,11 @@ class TestMiniAppAuth:
         )
         assert resp.status_code == 200
         data = resp.json()
-        # Freshly provisioned — no active skills, EDS Monitor in available.
+        # Freshly provisioned — no active skills. #181: EDS Monitor is retired,
+        # so it is NO LONGER surfaced in available_skills (tombstoned).
         assert data["active_skills"] == []
-        assert any(
-            s["plan_key"] == "eds_monitor_base" for s in data["available_skills"]
+        assert not any(
+            s["feature_key"] == "eds_monitor" for s in data["available_skills"]
         )
 
 
@@ -170,9 +171,9 @@ class TestMiniAppSummary:
         )
         data = resp.json()
         assert len(data["active_skills"]) == 0
-        # EDS Monitor should be available
+        # #181: EDS Monitor retired — never surfaced in available_skills now.
         eds_plans = [s for s in data["available_skills"] if s["feature_key"] == "eds_monitor"]
-        assert len(eds_plans) == 1
+        assert len(eds_plans) == 0
 
 
 class TestMiniAppPlans:
@@ -186,17 +187,21 @@ class TestMiniAppPlans:
         data = resp.json()
         assert "plans" in data
         assert isinstance(data["plans"], list)
-        # At least EDS base and extra plans exist
+        # #181: EDS plans are tombstoned out of the public catalog.
         plan_keys = [p["plan_key"] for p in data["plans"]]
-        assert "eds_monitor_base" in plan_keys
+        assert "eds_monitor_base" not in plan_keys
+        assert "eds_monitor_extra_account" not in plan_keys
 
 
 class TestMiniAppSubscribe:
     def test_subscribe_eds_base(self, seeded_client):
+        # #181: subscribing to a retired skill is a no-op tombstone. The
+        # endpoint still answers 200 (old links don't 404) but reports the
+        # skill is gone and creates NO active subscription.
         init_data = _make_init_data()
         headers = {"Authorization": f"tma {init_data}"}
 
-        # Subscribe
+        # Subscribe attempt → disabled no-op
         resp = seeded_client.post(
             "/miniapp/api/v1/subscribe",
             json={"plan_key": "eds_monitor_base"},
@@ -205,12 +210,13 @@ class TestMiniAppSubscribe:
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
+        assert data["message"] == "Это умение больше не поддерживается."
 
-        # Verify active in summary
+        # Summary must NOT show eds_monitor as active.
         resp = seeded_client.get("/miniapp/api/v1/summary", headers=headers)
         data = resp.json()
         active_keys = [s["feature_key"] for s in data["active_skills"]]
-        assert "eds_monitor" in active_keys
+        assert "eds_monitor" not in active_keys
 
     def test_subscribe_unknown_plan_returns_400(self, seeded_client):
         init_data = _make_init_data()

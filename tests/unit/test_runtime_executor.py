@@ -315,13 +315,15 @@ def test_runtime_service_claim_lookup_sends_claim_card(monkeypatch, tmp_path: Pa
     finally:
         session.close()
 
+    # #181: /claim is an eds_monitor feature — now a tombstone. The run still
+    # completes (handler answers, no error) but the reply is a disabled notice,
+    # NOT a claim card. The seeded EDS state is left untouched.
     assert len(runs) == 1
     assert runs[0].status == "completed"
     assert len(outbox) == 1
     assert len(telegram_client.sent_messages) == 1
-    assert "Заявка #6230173" in telegram_client.sent_messages[0]["text"]
-    assert "Статус: В работе" in telegram_client.sent_messages[0]["text"]
-    assert "Источник: EDS кабинет 1" in telegram_client.sent_messages[0]["text"]
+    assert "Это умение отключено." in telegram_client.sent_messages[0]["text"]
+    assert "Заявка #6230173" not in telegram_client.sent_messages[0]["text"]
 
 
 def test_runtime_service_claim_lookup_requires_claim_id(monkeypatch, tmp_path: Path) -> None:
@@ -370,9 +372,14 @@ def test_runtime_service_claim_lookup_requires_claim_id(monkeypatch, tmp_path: P
     finally:
         session.close()
 
-    assert runs[0].status == "failed"
-    assert runs[0].error_code == "claim_id_missing"
-    assert "Используй команду" in telegram_client.sent_messages[0]["text"]
+    # #181: /claim is an eds_monitor feature — tombstoned. With the skill
+    # retired, the legacy "claim_id_missing" usage-hint validation no longer
+    # fires: policy bypasses the EDS-specific checks and the handler tombstone
+    # short-circuits BEFORE reading claim_id, so an empty /claim now completes
+    # with the disabled notice (not a failed claim_id_missing run).
+    assert runs[0].status == "completed"
+    assert "Это умение отключено." in telegram_client.sent_messages[0]["text"]
+    assert "Используй команду" not in telegram_client.sent_messages[0]["text"]
 
 
 def test_runtime_mark_failed_sanitizes_error_message_before_persisting(monkeypatch, tmp_path: Path) -> None:

@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
 from sreda.config.settings import get_settings
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.app_registry import get_feature_registry
 from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
 from sreda.services.agent_capabilities import active_feature_keys
@@ -506,7 +507,8 @@ def get_summary(
     # Query plans and subscriptions directly
     plans_by_key = _plans_by_key(session)
 
-    base_plan = plans_by_key.get(PLAN_EDS_MONITOR_BASE)
+    # #181: base_plan (EDS) card emission removed — only extra_price_rub is
+    # still echoed back for response-shape stability (quarantine).
     extra_plan = plans_by_key.get(PLAN_EDS_MONITOR_EXTRA)
     extra_price_rub = extra_plan.price_rub if extra_plan else 2990
 
@@ -514,29 +516,11 @@ def get_summary(
     active_skills: list[dict] = []
     available_skills: list[dict] = []
 
-    # EDS Monitor
-    if summary.base_active and base_plan:
-        total_eds_subs = 1 + summary.extra_quantity
-        total_eds_price = base_plan.price_rub
-        if summary.extra_quantity > 0 and extra_plan:
-            total_eds_price += extra_plan.price_rub * summary.extra_quantity
-        active_skills.append({
-            "feature_key": "eds_monitor",
-            "title": "EDS Monitor",
-            "icon": "\U0001f4ca",
-            "summary_line": f"{total_eds_subs} шт \u00b7 {total_eds_price:,} \u20bd/мес".replace(",", " "),
-            "is_active": True,
-        })
-    elif base_plan:
-        available_skills.append({
-            "feature_key": "eds_monitor",
-            "plan_key": PLAN_EDS_MONITOR_BASE,
-            "title": "EDS Monitor",
-            "icon": "\U0001f4ca",
-            "description": base_plan.description or "",
-            "price_rub": base_plan.price_rub,
-            "is_active": False,
-        })
+    # EDS Monitor — #181: retired skill. Tombstoned: no EDS card is emitted
+    # into active_skills / available_skills, so no migrated user sees an EDS
+    # card after deactivation (the SPA also filters eds_monitor as a second
+    # backstop). The quarantined billing read-path (get_summary / PLAN_EDS_*
+    # seeds) stays intact; only card emission here is suppressed.
 
     # Simple skills (one plan → one subscription → one card). Voice
     # transcription was removed in 2026-04 — it's now a capability
@@ -576,14 +560,25 @@ def get_summary(
                 "is_active": False,
             })
 
-    # EDS subscriptions detail (for EDS skill page)
-    eds_subscriptions = _build_eds_subscriptions(
-        session, summary, ctx.tenant_id, base_plan, extra_plan,
-    )
+    # EDS subscriptions detail — #181: retired. Always empty; the EDS skill
+    # page is a tombstone (the helper _build_eds_subscriptions stays in the
+    # module, quarantined, until Phase 2 module deletion).
+    eds_subscriptions: list[dict] = []
+
+    # #181 DISPLAY tombstone: summary.next_amount_rub / next_payment_due_at are
+    # EDS-only figures (get_summary sums only the EDS base+extra plans), so a
+    # stale-EDS tenant with next_cycle_quantity>0 would see a charge/date for a
+    # retired skill. Recompute display-only, excluding disabled-feature plans.
+    # When nothing non-EDS renews → return 0 / null (the SPA hides the payment
+    # banner). Non-disabled tenants keep the get_summary figures unchanged.
+    if is_feature_disabled("eds_monitor"):
+        next_amount_rub, next_due = billing.compute_display_next_payment(ctx.tenant_id)
+    else:
+        next_amount_rub, next_due = summary.next_amount_rub, summary.next_payment_due_at
 
     return {
-        "next_payment_due_at": _iso(summary.next_payment_due_at),
-        "next_amount_rub": summary.next_amount_rub,
+        "next_payment_due_at": _iso(next_due),
+        "next_amount_rub": next_amount_rub,
         "active_skills": active_skills,
         "available_skills": available_skills,
         "eds_subscriptions": eds_subscriptions,
@@ -779,6 +774,10 @@ def get_plans(
                 "billing_period_days": p.billing_period_days,
             }
             for p in plans
+            # #181: retired skills (eds_monitor) are tombstoned out of the
+            # catalog. The plan rows + PLAN_EDS_* seeds stay (quarantine);
+            # only the public listing drops them.
+            if not is_feature_disabled(p.feature_key)
         ]
     }
 
@@ -874,6 +873,13 @@ def list_eds_accounts(
     session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
+    # #181: eds_monitor retired — this READ route is tombstoned. Short-circuit
+    # to an empty accounts shape WITHOUT reading EDS account details, so a
+    # migrated tenant's stale TenantEDSAccount rows never leak back to the SPA.
+    # (The POST /api/v1/eds/* routes mutate via billing / EDSConnectService,
+    # which are already no-op/disabled — this is the only EDS READ route.)
+    if is_feature_disabled("eds_monitor"):
+        return {"accounts": []}
     billing = BillingService(session)
     summary = billing.get_summary(ctx.tenant_id)
     return {

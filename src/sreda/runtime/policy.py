@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.handlers import (
     ActionRuntimeError,
@@ -20,6 +21,20 @@ from sreda.runtime.handlers import (
 )
 from sreda.services.claim_lookup import is_valid_claim_id
 from sreda.services.onboarding import build_connect_eds_message
+
+# #181: EDS-feature action types whose policy checks would otherwise emit the
+# legacy "подключи EDS" / "Сначала подключи EDS" prompts. When eds_monitor is
+# retired we BYPASS those EDS-specific policy checks (return None) BEFORE they
+# run, so the action falls through to its downstream handler/service, which is
+# already tombstoned (``execute_claim_lookup`` → "Это умение отключено.";
+# ``add_extra_eds_account`` / ``EDSConnectService`` → disabled no-op/raise).
+# This guarantees BOTH stale ``TenantFeature(enabled=False)`` tenants and any
+# ``enabled=True`` leftover get the disabled tombstone, NEVER the legacy
+# connect/subscribe prompt. Passing through (vs raising here) keeps the
+# handler-level tombstone path (e.g. /claim → completed run) intact.
+_EDS_DISABLED_ACTION_TYPES = frozenset(
+    {"claim.lookup", "subscription.add_eds", "eds.connect.start", "eds.connect.retry"}
+)
 
 
 def evaluate_policy(
@@ -34,6 +49,15 @@ def evaluate_policy(
             "runtime_context_missing",
             "Не удалось определить контекст пользователя для этого действия.",
         )
+
+    # #181: GLOBAL disabled bypass — runs BEFORE any EDS-specific check so a
+    # retired skill never hits its legacy "подключи EDS" prompts. Pass through
+    # to the (already-tombstoned) handler/service instead of raising here.
+    if (
+        action.action_type in _EDS_DISABLED_ACTION_TYPES
+        and is_feature_disabled("eds_monitor")
+    ):
+        return None
 
     summary = context["billing_summary"]
 

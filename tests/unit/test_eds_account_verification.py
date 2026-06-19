@@ -1,3 +1,13 @@
+"""EDS account-verification worker tests.
+
+Module-level skip 2026-06-19 (#181 Phase 1): eds_monitor is retired and the
+verification worker is gated off (process_pending_jobs returns 0, process_job
+returns "skipped" before any mutation). These tests drive the live
+verification path that no longer runs. Scheduled for DELETION in #181 Phase 3
+(test surface cleanup); skipped here to keep Phase-1 CI green without deleting
+modules ahead of the import-graph/quarantine work.
+"""
+
 import asyncio
 import base64
 import json
@@ -23,6 +33,11 @@ from sreda.services.eds_account_verification import (
 from sreda.services.eds_connect import EDSConnectService
 from sreda.services.encryption import get_encryption_service
 from sreda.services.secure_storage import load_secure_json
+
+pytestmark = pytest.mark.skip(
+    reason="#181 Phase 1: eds_monitor deactivated; verification worker gated. "
+    "Tests deleted in Phase 3."
+)
 
 
 class FakeTelegramClient:
