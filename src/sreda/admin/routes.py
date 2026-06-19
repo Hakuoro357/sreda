@@ -21,6 +21,7 @@ from sreda.admin.queries import (
     get_tenant_spend_detail,
     get_top_tenants_by_spend,
     get_users_page,
+    has_active_subscriptions,
 )
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
@@ -193,11 +194,15 @@ def admin_budget(
             pass  # malformed query string — fall back to today
 
     rows = get_budget_summary_for_day(session, selected)
+    # #175: различаем «активных подписок нет» от «подписки есть, но за день нет расхода»
+    # (иначе пустой день показывал ложное «Нет активных подписок»).
+    has_subs = has_active_subscriptions(session)
     return templates.TemplateResponse(
         request, "budget.html",
         {
             "token": token,
             "rows": rows,
+            "has_active_subs": has_subs,
             "section": "budget",
             "selected_date": selected.isoformat(),
             "prev_date": (selected - timedelta(days=1)).isoformat(),
@@ -884,7 +889,7 @@ async def _legacy_admin_tenant_approve_unused(
     tenant = session.get(Tenant, tenant_id)
     if tenant is None:
         return RedirectResponse(
-            url=f"/admin/users?approve=err&msg=tenant_not_found",
+            url="/admin/users?approve=err&msg=tenant_not_found",
             status_code=303,
         )
 
@@ -1053,7 +1058,7 @@ async def admin_tenant_suspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?suspend=err&msg=no_active_sub",
+            url="/admin/users?suspend=err&msg=no_active_sub",
             status_code=303,
         )
     sub.status = "suspended"
@@ -1097,7 +1102,7 @@ async def admin_tenant_unsuspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?unsuspend=err&msg=no_suspended_sub",
+            url="/admin/users?unsuspend=err&msg=no_suspended_sub",
             status_code=303,
         )
     sub.status = "active"
