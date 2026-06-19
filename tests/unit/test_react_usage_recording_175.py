@@ -122,6 +122,10 @@ async def test_react_records_usage_per_llm_call(db_session, monkeypatch):
     assert captured[1]["prompt_tokens"] == 150 and captured[1]["completion_tokens"] == 30
     assert all(c["provider_key"] == "inception-mercury2" for c in captured)
     assert all(c["tenant_id"] == u.tenant_id for c in captured)
+    # модель резолвится в каноничную «mercury-2» (карта inception-провайдера) → ключ
+    # (provider_key, model) совпадёт с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
+    assert all(c["model"] == "mercury-2" for c in captured), \
+        f"модель не резолвилась в mercury-2: {[c['model'] for c in captured]}"
 
 
 @pytest.mark.asyncio

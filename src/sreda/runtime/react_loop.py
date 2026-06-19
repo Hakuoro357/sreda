@@ -1029,6 +1029,17 @@ def _build_graph(llm: Any, all_tools: list, *,
     #175: session (для bind изолированной accounting-сессии) + provider_key (планировщика) —
     chat-узел пишет usage каждого вызова LLM в skill_ai_executions (деньги/#150)."""
     system_prompt = _system_prompt(today_str)
+    # #175: каноничное имя модели — ТЕМ ЖЕ резолвером, что legacy #151 (planner/llm), чтобы
+    # ключ (provider_key, model) совпал с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
+    # response_metadata.model_name мог бы дать иную форму → unpriced. Резолвим РАЗ (не на вызов).
+    _model_name = ""
+    if provider_key:
+        try:
+            from sreda.config.settings import get_settings
+            from sreda.runtime.planner.llm import _resolve_model_name
+            _model_name = _resolve_model_name(llm, get_settings(), provider_key)
+        except Exception:  # noqa: BLE001 — резолв не валит ход; пусто → fallback provider_key
+            _model_name = ""
 
     def chat(state: ReactState):
         # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
@@ -1042,14 +1053,9 @@ def _build_graph(llm: Any, all_tools: list, *,
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
         try:
             _p, _c = _extract_usage(resp)
-            _model = ""
-            try:
-                _model = (getattr(resp, "response_metadata", None) or {}).get("model_name") or ""
-            except Exception:  # noqa: BLE001
-                _model = ""
             _record_react_usage(
                 bind=(session.get_bind() if session is not None else None),
-                tenant_id=tenant_id, provider_key=provider_key, model=_model,
+                tenant_id=tenant_id, provider_key=provider_key, model=_model_name,
                 prompt_tokens=_p, completion_tokens=_c,
                 run_id=state.get("turn_key") or "")
         except Exception:  # noqa: BLE001 — учёт не валит ход
