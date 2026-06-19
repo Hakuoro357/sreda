@@ -194,7 +194,10 @@ def _system_prompt(today_str: str) -> str:
         "Не начинай ответ с «Отлично!», «Конечно!».\n</style>\n\n"
         f"<context>\nСегодня {today_str}. Относительные даты («сегодня», «завтра», «в пятницу») "
         "САМ переводи в абсолютные перед вызовом инструментов: дату — YYYY-MM-DD, время — HH:MM, "
-        "момент напоминания — полный ISO-8601 datetime.\n</context>\n\n"
+        "момент напоминания — полный ISO-8601 datetime. На СЕГОДНЯ ставь, лишь если момент ещё "
+        "НЕ наступил. Если относительно «Сегодня» он уже ПРОШЁЛ: назван день недели → бери "
+        "СЛЕДУЮЩУЮ такую неделю (+7 дней), а не сегодня; названо только время суток → завтра.\n"
+        "</context>\n\n"
         "<tools>\nНапоминания:\n"
         "- list_reminders(title_match): активные напоминания (ref, название, время).\n"
         "- schedule_reminder(title, trigger_iso): создать напоминание на абсолютный момент.\n"
@@ -282,6 +285,18 @@ def _fmt(when: datetime) -> str:
     w = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
     w = w.astimezone(_MSK)
     return f"{w.day} {_MONTHS[w.month]} в {w:%H:%M}"
+
+
+def _past_rollforward_msg(when: datetime, tool: str) -> str:
+    """#174 (решение владельца 2026-06-19): момент уже прошёл → НЕ ставить в прошлое и НЕ
+    переспрашивать, а перекатить ВПЕРЁД. Период знает только Фредди (распарсил «пятница»/«в
+    14:00»), инструмент — лишь абсолютный ISO → отдаём директиву пересчитать и вызвать снова.
+    Это НЕ specs/worker-grace (15 мин на доставку) — отдельная семантика момента создания."""
+    return (f"skipped:past | момент {_fmt(when)} (МСК) уже прошёл — в прошлое не ставлю. "
+            "Пересчитай ОТ СЕЙЧАС на БЛИЖАЙШЕЕ вхождение того же намерения, которое строго в "
+            "БУДУЩЕМ (> текущего момента): был день недели → ближайший такой день недели впереди; "
+            "только время суток → сегодня, если ещё не прошло, иначе завтра. Затем вызови "
+            f"{tool} снова с будущим trigger_iso. Пользователя НЕ переспрашивай.")
 
 
 def _fmt_task_when(t: Any) -> str:
@@ -700,6 +715,9 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
             when = _parse_dt(trigger_iso)
         except Exception:  # noqa: BLE001
             return f"Не разобрала время: {trigger_iso!r}. Дай абсолютный момент."
+        # #174: момент уже прошёл → перекатить вперёд (анти-петля turn_pass_count/stop страхует).
+        if when <= datetime.now(timezone.utc):
+            return _past_rollforward_msg(when, "schedule_reminder")
         r = reminders.schedule(tenant_id=tenant_id, user_id=user_id,
                                title=title, trigger_at=when)
         return f"ok:scheduled:{r.id} | {r.title} | {_fmt(r.trigger_at)}"
@@ -717,6 +735,9 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 new_trigger = _parse_dt(trigger_iso)
             except Exception:  # noqa: BLE001
                 return f"Не разобрала время: {trigger_iso!r}."
+            # #174 (Codex medium R1): перенос на прошлое = тот же класс бага → перекат вперёд.
+            if new_trigger <= datetime.now(timezone.utc):
+                return _past_rollforward_msg(new_trigger, "update_reminder")
         # no-op guard (#162 п.5): те же значения → успех без записи.
         new_title = title or None
         if ((new_title is None or new_title == r0.title)

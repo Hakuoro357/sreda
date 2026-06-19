@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -126,6 +126,51 @@ def test_add_task_ctx_fail_closed_empty_user(db_session):
     with bind_tool_runtime(ctx):
         with pytest.raises(ValueError):
             svc.add(tenant_id=u.tenant_id, user_id="", title="x")
+
+
+def test_schedule_reminder_past_trigger_not_scheduled_174(db_session):
+    """#174: trigger_iso в прошлом → НЕ ставить в прошлое (иначе past-due → мгновенный fired).
+    Решение владельца: перекатывать вперёд → инструмент возвращает ДИРЕКТИВУ Фредди пересчитать
+    на будущее и вызвать снова (без вопроса юзеру); строка в БД на этом вызове НЕ создаётся."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    out = tools["schedule_reminder"].invoke(
+        {"title": "позвонить врачу", "trigger_iso": "2020-06-19T14:00:00+03:00"})
+    assert "ok:scheduled" not in out, out          # в прошлое НЕ поставлено
+    assert "прош" in out.lower(), out              # «уже прошло»
+    assert "будущ" in out.lower(), out             # директива переката на будущее
+    rows = db_session.query(FamilyReminder).filter(
+        FamilyReminder.tenant_id == u.tenant_id).all()
+    assert rows == [], f"past-due напоминание не должно создаваться: {rows}"
+
+
+def test_schedule_reminder_future_still_works_174(db_session):
+    """#174 регресс: будущее время по-прежнему ставится нормально (relative — не time-bomb)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    future_iso = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    out = tools["schedule_reminder"].invoke({"title": "стоматолог", "trigger_iso": future_iso})
+    assert "ok:scheduled" in out, out
+    rows = db_session.query(FamilyReminder).filter(
+        FamilyReminder.tenant_id == u.tenant_id).all()
+    assert len(rows) == 1 and rows[0].title == "стоматолог"
+
+
+def test_update_reminder_past_trigger_rolls_forward_174(db_session):
+    """#174 (Codex medium R1): перенос напоминания на ПРОШЛОЕ — тот же класс бага → перекат.
+    update_reminder с прошедшим trigger_iso НЕ меняет момент, отдаёт директиву переката."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    rid = _seed_reminder(db_session, u)  # trigger 2030 (future), pending
+    orig = db_session.get(FamilyReminder, rid).trigger_at
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    out = tools["update_reminder"].invoke(
+        {"reminder_ref": rid, "trigger_iso": "2020-06-19T14:00:00+03:00"})
+    assert "ok:updated" not in out and "прош" in out.lower(), out
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).trigger_at == orig, "момент не должен уехать в прошлое"
 
 
 def test_scrub_ids_strips_internal_keeps_text():
