@@ -26,6 +26,7 @@ from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
 from sreda.db.models.core import InboundMessage, Job, Tenant, User, Workspace
+from sreda.db.models.planner import PlannerExecution, StepExecutionLedger
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.maintenance.retention_cleanup import cleanup_runtime_retention
 from sreda.workers import retention_worker as rw_module
@@ -304,3 +305,113 @@ async def test_naive_timestamp_in_state_does_not_crash(
     )
     w = RetentionWorker(MagicMock(), state_file=str(state))
     await w.process_pending()  # главное — не TypeError
+
+
+# ---------------------------------------------------------------------------
+# #164 — ретеншен planner_executions + FK-безопасность с чисткой agent_runs
+# ---------------------------------------------------------------------------
+def _planner_exec(sess, peid: str, run_id: str, age_days: int,
+                  status: str = "completed") -> None:
+    sess.add(PlannerExecution(
+        id=peid, run_id=run_id, tenant_id="t1", feature_key="housewife_assistant",
+        planner_prompt_version=1, planner_provider="mimo-v2.5-pro",
+        planner_model="mimo-v2.5-pro", planner_status="valid",
+        execution_status=status, execution_log_json=[],
+        created_at=datetime.now(timezone.utc) - timedelta(days=age_days),
+    ))
+
+
+def test_planner_executions_terminal_old_deleted_164(session) -> None:
+    """#164: завершённая planner_executions старше окна (90д) удаляется; свежая и ЖИВАЯ
+    (pending/in_progress) — нет."""
+    _run(session, "run_old", None, age_days=100)
+    _run(session, "run_fresh", None, age_days=5)
+    _run(session, "run_live", None, age_days=5)
+    session.commit()  # родители (agent_runs) до детей — FK включён
+    _planner_exec(session, "pe_old_done", "run_old", age_days=100, status="completed")
+    _planner_exec(session, "pe_fresh_done", "run_fresh", age_days=5, status="completed")
+    _planner_exec(session, "pe_live", "run_live", age_days=5, status="in_progress")
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()
+
+    assert session.get(PlannerExecution, "pe_old_done") is None      # старая+терминальная → удалена
+    assert session.get(PlannerExecution, "pe_fresh_done") is not None  # свежая → нет
+    assert session.get(PlannerExecution, "pe_live") is not None        # живая → нет
+    assert result.planner_executions == 1
+
+
+def test_planner_executions_fk_safe_before_agent_runs_164(session) -> None:
+    """#164: при чистке agent_runs (90д) дочерние planner_executions удаляются РАНЬШЕ →
+    нет нарушения FK planner_executions.run_id → agent_runs.id (NOT NULL, без CASCADE).
+    Без порядка «дети раньше родителя» удаление agent_runs упало бы на IntegrityError."""
+    _run(session, "run_parent_old", None, age_days=100)  # терминальный, попадёт под чистку
+    session.commit()  # родитель до ребёнка — FK включён
+    _planner_exec(session, "pe_child_old", "run_parent_old", age_days=100, status="completed")
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()  # не должно бросить IntegrityError
+
+    assert session.get(PlannerExecution, "pe_child_old") is None  # ребёнок удалён
+    assert session.get(AgentRun, "run_parent_old") is None        # родитель удалён
+    assert result.planner_executions == 1
+    assert result.agent_runs == 1
+
+
+def test_planner_exec_children_deleted_before_parent_164(session) -> None:
+    """#164 (субагент-ревью): planner_executions САМА — родитель step_execution_ledger
+    (execution_id NOT NULL, без CASCADE). Дочерний ledger удаляется РАНЬШЕ planner_executions,
+    та — раньше agent_runs. Полная цепочка дети→родители без IntegrityError."""
+    _run(session, "run_p", None, age_days=100)
+    session.commit()
+    _planner_exec(session, "pe_p", "run_p", age_days=100, status="completed")
+    session.commit()
+    old = datetime.now(timezone.utc) - timedelta(days=100)
+    session.add(StepExecutionLedger(
+        id="sel_1", execution_id="pe_p", step_id="s1", operation_id="op_1",
+        status="committed", created_at=old, updated_at=old,
+    ))
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()  # не должно бросить IntegrityError
+
+    assert session.get(StepExecutionLedger, "sel_1") is None  # ребёнок удалён первым
+    assert session.get(PlannerExecution, "pe_p") is None       # затем планнер
+    assert session.get(AgentRun, "run_p") is None              # затем agent_run
+    assert result.step_execution_ledger == 1
+    assert result.planner_executions == 1
+
+
+def test_planner_exec_skew_and_stuck_live_fk_safe_164(session) -> None:
+    """#164 (Codex R2 MAJOR): чистка agent_runs FK-safe ДАЖЕ если planner-ребёнок НЕ попадает под
+    собственный возраст/статус-фильтр — т.к. удаляем ВСЕХ детей удаляемых родителей (run_id∈doomed).
+    Покрывает: (skew) terminal-ребёнок чуть моложе родителя; (stuck) застрявший in_progress.
+    Недавние живые (свежий родитель) — хранятся."""
+    _run(session, "run_skew", None, age_days=91)    # doomed
+    _run(session, "run_stuck", None, age_days=100)  # doomed
+    _run(session, "run_recent", None, age_days=5)   # жив
+    session.commit()
+    _planner_exec(session, "pe_skew", "run_skew", age_days=89, status="completed")    # моложе своего окна
+    _planner_exec(session, "pe_stuck", "run_stuck", age_days=100, status="in_progress")  # застрявший живой
+    _planner_exec(session, "pe_recent", "run_recent", age_days=5, status="in_progress")  # недавний живой
+    session.commit()
+
+    cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()  # не должно бросить IntegrityError
+
+    assert session.get(PlannerExecution, "pe_skew") is None     # удалён (родитель doomed)
+    assert session.get(PlannerExecution, "pe_stuck") is None     # удалён (родитель doomed), хоть и live
+    assert session.get(PlannerExecution, "pe_recent") is not None  # недавний живой — хранится
+    assert session.get(AgentRun, "run_skew") is None
+    assert session.get(AgentRun, "run_stuck") is None
+    assert session.get(AgentRun, "run_recent") is not None
+
+
+# NB (#164, Codex R2 MINOR): planner_gaps / planner_llm_reservations (nullable execution_id, FK
+# без CASCADE) удаляются ТЕМ ЖЕ кодом-путём, что step_execution_ledger выше —
+# `execution_id.in_(deletable_exec_ids)`. Путь доказан тестом-цепочкой (ledger) + skew/stuck-тестом;
+# FK-граф (agent_runs→planner_executions→{3 листа}) проверен grep'ом. Отдельный сид этих двух
+# опущен (finance-нюанс сидинга), покрытие — через идентичность пути.

@@ -22,9 +22,13 @@ skill_run_attempts             90 days     parent run succeeded/failed/cancelled
 skill_runs                     90 days     status in succeeded/failed/cancelled
 =============================  ==========  ===============================
 
-Order matters: children (attempts, events, ai_executions) are deleted
-before their parent runs so we never violate ``skill_run_attempts.run_id``
-FK. Everything else uses soft references and order-independence.
+Order matters: children are deleted before their parents so we never
+violate non-CASCADE FKs. Two such chains:
+  * skill: attempts/events/ai_executions before their parent skill_runs.
+  * #164 planner: step_execution_ledger / planner_gaps /
+    planner_llm_reservations before planner_executions, and
+    planner_executions before its parent agent_runs.
+Everything else uses soft references and order-independence.
 
 Live runs (pending/running/retry_scheduled) are never touched.
 """
@@ -39,6 +43,12 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.core import InboundMessage, Job, OutboxMessage, SecureRecord
+from sreda.db.models.planner import (
+    PlannerExecution,
+    PlannerGap,
+    PlannerLlmReservation,
+    StepExecutionLedger,
+)
 from sreda.db.models.runtime import AgentRun
 from sreda.db.models.skill_platform import (
     SkillAIExecution,
@@ -68,6 +78,10 @@ class RetentionCleanupResult:
     skill_events_warn_error: int = 0
     skill_run_attempts: int = 0
     skill_runs: int = 0
+    planner_executions: int = 0  # #164
+    step_execution_ledger: int = 0  # #164 (ребёнок planner_executions)
+    planner_gaps: int = 0  # #164
+    planner_llm_reservations: int = 0  # #164
     plan_library_entries: int = 0
     deleted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -85,12 +99,21 @@ class RetentionCleanupResult:
             + self.skill_events_warn_error
             + self.skill_run_attempts
             + self.skill_runs
+            + self.planner_executions
+            + self.step_execution_ledger
+            + self.planner_gaps
+            + self.planner_llm_reservations
         )
 
 
 # Retention windows (in days). Kept as module constants so they can be
 # patched in tests.
 AGENT_RUNS_DAYS = 90
+# #164: planner_executions (с #155 копит зашифрованные ПД) — окно = 90д (как родитель
+# agent_runs, утв. владельцем 2026-06-19; max корпус для будущей SIA-петли). Удаляем ТЕРМИНАЛЬНЫЕ
+# строки ПЕРЕД чисткой agent_runs (дети раньше родителя — FK run_id NOT NULL, без CASCADE).
+PLANNER_EXECUTIONS_DAYS = 90
+_PLANNER_LIVE_STATUSES = ("pending", "in_progress")  # живые ходы НЕ чистим
 INBOUND_MESSAGES_DAYS = 30
 JOBS_DAYS = 30
 OUTBOX_SENT_DAYS = 30
@@ -223,8 +246,57 @@ def cleanup_runtime_retention(
         ),
     )
 
-    # ---------- agent_runs ----------
+    # ---------- planner_executions + её дети (#164 — дети раньше родителей) ----------
+    # FK planner_executions.run_id → agent_runs.id: NOT NULL, без ON DELETE CASCADE. Чтобы чистка
+    # agent_runs не падала на FK, удаляем planner_executions ДВУХ видов (Codex R2 — закрыть skew +
+    # застрявших-живых): (а) ВСЕ под удаляемыми родителями (run_id ∈ doomed agent_runs) — любой
+    # статус/возраст: ребёнок 90д-мёртвого родителя тоже мёртв (вкл. застрявший pending/in_progress
+    # и terminal чуть моложе родителя); (б) собственная ретенция planner_executions — терминальные
+    # старше своего окна, даже если родитель ещё жив. Недавние живые (свежий родитель) — хранятся.
+    #
+    # САМА planner_executions — родитель: step_execution_ledger.execution_id (NOT NULL),
+    # planner_gaps / planner_llm_reservations (nullable, но non-null ссылки тоже держат) — все FK
+    # БЕЗ CASCADE → их детей удаляем ЕЩЁ раньше. Цепочка дети→планнер→agent_runs полная. (Сейчас
+    # 3 дочерние таблицы пусты — ledger/billing подключатся следующим срезом #163, но future-safe.)
+    # Удаление физически уносит зашифрованные *_enc ПД (нет осиротевших персональных данных).
     agent_runs_cutoff = now - timedelta(days=AGENT_RUNS_DAYS)
+    planner_exec_cutoff = now - timedelta(days=PLANNER_EXECUTIONS_DAYS)
+    doomed_agent_run_ids = select(AgentRun.id).where(
+        and_(
+            AgentRun.status.in_(TERMINAL_AGENT_RUN_STATUSES),
+            AgentRun.created_at < agent_runs_cutoff,
+        )
+    )
+    _deletable_exec = or_(
+        PlannerExecution.run_id.in_(doomed_agent_run_ids),
+        and_(
+            PlannerExecution.execution_status.notin_(_PLANNER_LIVE_STATUSES),
+            PlannerExecution.created_at < planner_exec_cutoff,
+        ),
+    )
+    deletable_exec_ids = select(PlannerExecution.id).where(_deletable_exec)
+    result.step_execution_ledger = _delete_returning_count(
+        session,
+        delete(StepExecutionLedger).where(
+            StepExecutionLedger.execution_id.in_(deletable_exec_ids)
+        ),
+    )
+    result.planner_gaps = _delete_returning_count(
+        session,
+        delete(PlannerGap).where(PlannerGap.execution_id.in_(deletable_exec_ids)),
+    )
+    result.planner_llm_reservations = _delete_returning_count(
+        session,
+        delete(PlannerLlmReservation).where(
+            PlannerLlmReservation.execution_id.in_(deletable_exec_ids)
+        ),
+    )
+    result.planner_executions = _delete_returning_count(
+        session,
+        delete(PlannerExecution).where(_deletable_exec),  # тот же предикат (без self-ref)
+    )
+
+    # ---------- agent_runs (после её planner-детей → FK-safe) ----------
     result.agent_runs = _delete_returning_count(
         session,
         delete(AgentRun).where(
