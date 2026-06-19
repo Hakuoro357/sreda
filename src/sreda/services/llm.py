@@ -1307,6 +1307,9 @@ CHAT_PROVIDERS = (
     # 2026-06-15 (#60): Inception Mercury-2 (прямой api.inceptionlabs.ai) —
     # диффузионная LLM, 1000+ tps + cached input. Переезд планировщика с MiMo.
     "inception-mercury2",         # mercury-2
+    # 2026-06-19 (#184): «Оса» — прямой Groq gpt-oss-120b для ReAct (per-tenant эксперимент).
+    "groq-gpt-oss-120b",          # openai/gpt-oss-120b @ Groq (medium reasoning по умолчанию)
+    "groq-gpt-oss-120b-low",      # то же, reasoning_effort=low (скоростной режим)
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1345,6 +1348,18 @@ _OPENROUTER_MODEL_BY_PROVIDER = {
 # Inception (прямой) — Mercury-2. id сверен по /v1/models на ключе 2026-06-15.
 _INCEPTION_MODEL_BY_PROVIDER = {
     "inception-mercury2": "mercury-2",
+}
+
+# 2026-06-19 (#184): ПРЯМОЙ Groq (OpenAI-совместимый), ключ = resolve_groq_api_key() (тот же,
+# что для Whisper-STT). «Оса» = gpt-oss-120b. id сверены по /openai/v1/models на ключе.
+_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+_GROQ_MODEL_BY_PROVIDER = {
+    "groq-gpt-oss-120b":     "openai/gpt-oss-120b",
+    "groq-gpt-oss-120b-low": "openai/gpt-oss-120b",
+}
+# reasoning_effort через extra_body (gpt-oss): low — скоростной режим (короче «думание»).
+_GROQ_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    "groq-gpt-oss-120b-low": {"reasoning_effort": "low"},
 }
 
 
@@ -1499,6 +1514,23 @@ def _build_chat_llm(
             timeout=settings.mimo_request_timeout_seconds,
             **kwargs,
         )
+    if provider in _GROQ_MODEL_BY_PROVIDER:  # #184 прямой Groq «Оса»
+        api_key = settings.resolve_groq_api_key()
+        if not api_key:
+            logger.info("chat LLM disabled: no Groq API key configured")
+            return None
+        override = _GROQ_MODEL_BY_PROVIDER[provider]
+        groq_extra = _GROQ_EXTRA_BODY_BY_PROVIDER.get(provider)
+        if groq_extra:  # reasoning_effort и т.п.
+            kwargs["extra_body"] = {**groq_extra, **(kwargs.pop("extra_body", None) or {})}
+        return ChatOpenAI(
+            base_url=_GROQ_BASE_URL,
+            api_key=api_key,
+            model=model or override,
+            temperature=_override_temperature(provider, temperature),
+            timeout=settings.mimo_request_timeout_seconds,
+            **kwargs,
+        )
     logger.warning("chat LLM: unknown provider %r — ignoring", provider)
     return None
 
@@ -1617,6 +1649,8 @@ def _provider_key_is_available(provider: str, settings: Settings) -> bool:
         return bool(settings.resolve_openrouter_api_key())
     if provider in _INCEPTION_MODEL_BY_PROVIDER:
         return bool(settings.resolve_inception_api_key())
+    if provider in _GROQ_MODEL_BY_PROVIDER:  # #184 «Оса»
+        return bool(settings.resolve_groq_api_key())
     return False
 
 

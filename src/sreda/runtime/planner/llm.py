@@ -247,6 +247,7 @@ def _resolve_model_name(runnable: Any, settings: Settings, provider: str) -> str
     # only for opaque runnables (.with_fallbacks()) that hide .model_name.
     try:
         from sreda.services.llm import (  # type: ignore[attr-defined]
+            _GROQ_MODEL_BY_PROVIDER,
             _INCEPTION_MODEL_BY_PROVIDER,
             _MIMO_MODEL_BY_PROVIDER,
             _OPENROUTER_MODEL_BY_PROVIDER,
@@ -255,6 +256,7 @@ def _resolve_model_name(runnable: Any, settings: Settings, provider: str) -> str
             _MIMO_MODEL_BY_PROVIDER,
             _OPENROUTER_MODEL_BY_PROVIDER,
             _INCEPTION_MODEL_BY_PROVIDER,
+            _GROQ_MODEL_BY_PROVIDER,  # #184 «Оса»
         ):
             if isinstance(table, dict):
                 mapped = table.get(provider)

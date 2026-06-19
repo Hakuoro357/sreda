@@ -360,6 +360,16 @@ class Settings(BaseSettings):
             "existing inline path (zero regression)."
         ),
     )
+    # #173/#184: тенанты, чей ReAct-цикл крутится на «Осе» (gpt-oss-120b @ Groq) ВМЕСТО
+    # planner_provider (Mercury) — per-tenant эксперимент по образцу react_loop_enabled_tenants.
+    # Пусто (дефолт) → никому → все на planner_provider (ноль изменений). Планировщик НЕ затронут.
+    react_osa_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_OSA_TENANTS",
+            "sreda_react_osa_tenants",
+        ),
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -800,6 +810,15 @@ class Settings(BaseSettings):
         """#66: tenants on the new ReAct+interrupt conversational loop (gated
         experiment). Empty (default) → nobody; everyone on the existing path."""
         raw = self.react_loop_enabled_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_osa_tenants(self) -> frozenset[str]:
+        """#184: тенанты, чей ReAct идёт на «Осе» (gpt-oss-120b @ Groq) вместо planner_provider.
+        Пусто (дефолт) → никому → все на planner_provider (Mercury)."""
+        raw = self.react_osa_tenants_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())

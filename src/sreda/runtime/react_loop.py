@@ -87,6 +87,15 @@ def confirm_callback_data(action: str, pause_id: str) -> str:
     return f"react:{action}:{pause_id}" if pause_id else f"react:{action}"
 
 
+def react_provider(tenant_id: str) -> str:
+    """#184: провайдер LLM для ReAct-цикла тенанта. Тенант в react_osa_tenants → «Оса»
+    (groq-gpt-oss-120b @ Groq), иначе planner_provider (Mercury, дефолт). Per-tenant эксперимент;
+    планировщик (plan-execute) НЕ затронут — это оверрайд ТОЛЬКО для ReAct-входа."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return "groq-gpt-oss-120b" if tenant_id in s.react_osa_tenants else s.planner_provider
+
+
 class _Reply(str):
     """Ответ handle_turn: строка ответа (для старых вызывающих — обычный str) + признак
     `awaiting_confirm`, что это да/нет-подтверждение (канал тогда вешает кнопки [Да][Нет]),

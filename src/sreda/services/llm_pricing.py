@@ -65,6 +65,22 @@ _PRICES: dict[tuple[str, str], ModelPrice] = {
         source="https://openrouter.ai/google/gemini-2.5-flash-lite (retrieved 2026-06-16)",
         price_checked_at=date(2026, 6, 16),
     ),
+    # «Оса» (#184): прямой Groq gpt-oss-120b. input $0.15 / cached $0.075 (50% off; кеш Groq
+    # ~44% подтверждён дневным агрегатом console 2026-06-19) / output $0.60 за 1M.
+    ("groq-gpt-oss-120b", "openai/gpt-oss-120b"): ModelPrice(
+        input_per_mtok=Decimal("0.15"),
+        cached_input_per_mtok=Decimal("0.075"),
+        output_per_mtok=Decimal("0.60"),
+        source="https://groq.com/pricing (retrieved 2026-06-19)",
+        price_checked_at=date(2026, 6, 19),
+    ),
+    ("groq-gpt-oss-120b-low", "openai/gpt-oss-120b"): ModelPrice(
+        input_per_mtok=Decimal("0.15"),
+        cached_input_per_mtok=Decimal("0.075"),
+        output_per_mtok=Decimal("0.60"),
+        source="https://groq.com/pricing (retrieved 2026-06-19)",
+        price_checked_at=date(2026, 6, 19),
+    ),
     # ОТКРЫТЫЕ ВХОДНЫЕ (план R4): сидировать при подтверждённом source. До того —
     # беспрайсовые → «—» + покрытие на страницах:
     #   ("mimo-v2.5-pro"/"mimo-v2.5", ...) — инвойс Xiaomi (уточнить у владельца);
