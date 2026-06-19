@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
+
 from sreda.db.models.tool_operations import ToolOperationResult
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,16 @@ logger = logging.getLogger(__name__)
 class IdempotencyArgsMismatch(Exception):
     """Тот же operation_id, но args_hmac РАЗОШЁЛСЯ — внутренняя ошибка (коллизия ключа /
     баг canonicalization), НЕ user-facing (план #163: metric+alert+fallback, не «конфликт»)."""
+
+
+class IdempotencyScopeMismatch(Exception):
+    """Строка по operation_id принадлежит ДРУГОМУ tenant/user — анти-cross-tenant (внутренняя
+    ошибка: глобальный operation_id обязан быть уникален; совпадение в чужом scope = баг/коллизия)."""
+
+
+class IdempotencyInFlight(Exception):
+    """Строка по operation_id есть, но НЕ committed (pending/failed) — исход неизвестен. НЕ
+    перезапускаем mutate (анти-двойное-применение); вызывающий повторит/разрулит (Фаза 3)."""
 
 
 def compute_args_hmac(args: Any, *, secret: str) -> str:
@@ -51,36 +63,57 @@ def execute_idempotent_durable_op(
 ) -> Any:
     """exact-replay durable-операции. Возвращает payload (новый или сохранённый при повторе).
 
-    committed + тот же args_hmac → сохранённый payload, мутации НЕТ.
-    committed + иной args_hmac → IdempotencyArgsMismatch (внутренняя ошибка).
-    нет строки / pending → claim → mutate_fn() → payload+committed → commit.
+    committed + тот же args_hmac + тот же scope → сохранённый payload, мутации НЕТ.
+    committed + иной args_hmac → IdempotencyArgsMismatch. чужой scope → IdempotencyScopeMismatch.
+    pending/failed → IdempotencyInFlight (НЕ перезапускаем — анти-двойное-применение).
+    нет строки → claim(pending) → mutate_fn() → payload+committed → commit (per-operation tx).
     """
+
+    def _resolve(row: ToolOperationResult) -> Any:
+        """Разрулить НАЙДЕННУЮ строку (по initial query ИЛИ после гонки-IntegrityError)."""
+        if row.tenant_id != tenant_id or (row.user_id or None) != (user_id or None):
+            logger.warning("idempotent_ops: scope mismatch op=%s", operation_id)
+            raise IdempotencyScopeMismatch(operation_id)
+        if row.status != "committed":
+            raise IdempotencyInFlight(operation_id)  # исход неизвестен → не перезапускаем
+        if row.args_hmac != args_hmac:
+            logger.warning("idempotent_ops: args_hmac mismatch op=%s family=%s",
+                           operation_id, operation_family)
+            raise IdempotencyArgsMismatch(operation_id)
+        return row.stable_return_payload  # exact-replay без мутации
+
     existing = (
         session.query(ToolOperationResult)
         .filter(ToolOperationResult.operation_id == operation_id)
         .one_or_none()
     )
-    if existing is not None and existing.status == "committed":
-        if existing.args_hmac != args_hmac:
-            logger.warning("idempotent_ops: args_hmac mismatch op=%s family=%s",
-                           operation_id, operation_family)
-            raise IdempotencyArgsMismatch(operation_id)
-        return existing.stable_return_payload  # exact-replay без мутации
+    if existing is not None:
+        return _resolve(existing)
 
     now = datetime.now(timezone.utc)
-    if existing is None:
-        existing = ToolOperationResult(
-            id=f"tor_{uuid4().hex}", tenant_id=tenant_id, user_id=user_id,
-            operation_family=operation_family, tool_name=tool_name,
-            operation_id=operation_id, args_hmac=args_hmac, status="pending",
-            created_at=now, updated_at=now)
-        session.add(existing)
-        session.flush()  # занять operation_id (unique) ДО мутации (claim-first)
+    row = ToolOperationResult(
+        id=f"tor_{uuid4().hex}", tenant_id=tenant_id, user_id=user_id,
+        operation_family=operation_family, tool_name=tool_name,
+        operation_id=operation_id, args_hmac=args_hmac, status="pending",
+        created_at=now, updated_at=now)
+    try:
+        with session.begin_nested():  # SAVEPOINT: гонка INSERT (unique) не отравит внешнюю tx
+            session.add(row)
+            session.flush()  # занять operation_id (unique) ДО мутации (claim-first)
+    except IntegrityError:
+        # racer успел вставить тот же operation_id между нашим query и flush → перечитать и
+        # разрулить (replay / mismatch / in-flight), не дублируя мутацию.
+        existing = (
+            session.query(ToolOperationResult)
+            .filter(ToolOperationResult.operation_id == operation_id)
+            .one()
+        )
+        return _resolve(existing)
 
-    # выполнить мутацию (в тесте — инъецированная no-op; реальная мутация сервиса — Фаза 3).
+    # claim наш → выполнить мутацию (в тесте no-op; реальная мутация сервиса — Фаза 3).
     payload = mutate_fn()
-    existing.stable_return_payload = payload
-    existing.status = "committed"
-    existing.updated_at = datetime.now(timezone.utc)
+    row.stable_return_payload = payload
+    row.status = "committed"
+    row.updated_at = datetime.now(timezone.utc)
     session.commit()
     return payload
