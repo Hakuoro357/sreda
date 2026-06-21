@@ -103,3 +103,31 @@ async def test_handle_turn_persists_for_allowlisted(monkeypatch, db_session):
     assert rows[0].user_text == "что у меня сегодня"
     assert rows[0].reply_text == str(r)
     assert rows[0].kind == "final"
+
+
+def test_persist_debug_all_captures_any_tenant_185(monkeypatch):
+    """#185: глобальный флаг SREDA_REACT_DEBUG_ALL → пишет тенанта, которого НЕТ в allowlist."""
+    monkeypatch.delenv("SREDA_REACT_DEBUG_TENANTS", raising=False)  # allowlist пуст
+    monkeypatch.setenv("SREDA_REACT_DEBUG_ALL", "1")
+    get_settings.cache_clear()
+    SF = _fresh_factory()
+    monkeypatch.setattr("sreda.db.session.get_session_factory", lambda: SF)
+    react_loop._persist_debug_turn(
+        tenant_id="random_tenant_xyz", user_id="u", thread_id="th", channel="telegram",
+        user_text="привет", reply=react_loop._Reply("Здравствуй!"), tools=[], kind="final")
+    get_settings.cache_clear()
+    rows = SF().query(ReactDebugTurn).all()
+    assert len(rows) == 1 and rows[0].tenant_id == "random_tenant_xyz"
+
+
+def test_persist_no_flag_no_allowlist_is_noop_185(monkeypatch):
+    """#185 регресс: флаг ВЫКЛ (дефолт) + пустой allowlist → НЕ пишем (прежнее поведение)."""
+    monkeypatch.delenv("SREDA_REACT_DEBUG_TENANTS", raising=False)
+    monkeypatch.delenv("SREDA_REACT_DEBUG_ALL", raising=False)
+    get_settings.cache_clear()
+    called = []
+    monkeypatch.setattr("sreda.db.session.get_session_factory", lambda: called.append(1))
+    react_loop._persist_debug_turn(tenant_id="t", user_id="u", thread_id="th", channel="max",
+                                   user_text="hi", reply="r", tools=[], kind="final")
+    assert called == [], "флаг ВЫКЛ + пустой allowlist → фабрика сессий не вызывается"
+    get_settings.cache_clear()

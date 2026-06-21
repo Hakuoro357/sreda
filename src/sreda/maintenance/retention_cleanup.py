@@ -49,6 +49,7 @@ from sreda.db.models.planner import (
     PlannerLlmReservation,
     StepExecutionLedger,
 )
+from sreda.db.models.react_debug import ReactDebugTurn
 from sreda.db.models.runtime import AgentRun
 from sreda.db.models.skill_platform import (
     SkillAIExecution,
@@ -82,6 +83,7 @@ class RetentionCleanupResult:
     step_execution_ledger: int = 0  # #164 (ребёнок planner_executions)
     planner_gaps: int = 0  # #164
     planner_llm_reservations: int = 0  # #164
+    react_debug_turns: int = 0  # #185 (временный QA-захват переписки — короткий TTL)
     plan_library_entries: int = 0
     deleted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -103,6 +105,7 @@ class RetentionCleanupResult:
             + self.step_execution_ledger
             + self.planner_gaps
             + self.planner_llm_reservations
+            + self.react_debug_turns
         )
 
 
@@ -124,6 +127,9 @@ SKILL_EVENTS_DEBUG_INFO_DAYS = 30
 SKILL_EVENTS_WARN_ERROR_DAYS = 90
 SKILL_ATTEMPTS_DAYS = 90
 SKILL_RUNS_DAYS = 90
+# #185: react_debug_turns — ВРЕМЕННЫЙ QA-захват переписки (полный текст, EncryptedString). Короткое
+# окно: для отлова багов хватает, а ПД всех юзеров не копятся бессрочно (Codex high MAJOR).
+REACT_DEBUG_TURNS_DAYS = 14
 
 # #127: размер порции для unlink+delete входящих (см. блок inbound ниже)
 INBOUND_CHUNK_SIZE = 5000
@@ -432,6 +438,15 @@ def cleanup_runtime_retention(
                 SecureRecord.id.notin_(referenced_ids),
             )
         ),
+    )
+
+    # ---------- react_debug_turns (#185: временный QA-захват переписки, короткий TTL) ----------
+    # Leaf-таблица (нет FK-детей/родителей в чистке), полный текст переписки (EncryptedString).
+    # Удаляем строки старше REACT_DEBUG_TURNS_DAYS — ограничиваем накопление ПД при debug_all.
+    react_debug_cutoff = now - timedelta(days=REACT_DEBUG_TURNS_DAYS)
+    result.react_debug_turns = _delete_returning_count(
+        session,
+        delete(ReactDebugTurn).where(ReactDebugTurn.created_at < react_debug_cutoff),
     )
 
     # ---------- plan_library (#135: TTL всем статусам, без PII) ----------

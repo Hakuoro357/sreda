@@ -206,6 +206,7 @@ class RetentionWorker:
             "skill_events_high": result.skill_events_warn_error,
             "skill_attempts": result.skill_run_attempts,
             "skill_runs": result.skill_runs,
+            "react_debug": result.react_debug_turns,  # #185
         }
         logger.info(
             "retention cleanup ts=%s total=%d details=%s",

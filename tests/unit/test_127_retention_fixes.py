@@ -27,6 +27,7 @@ from sqlalchemy.orm import sessionmaker
 from sreda.db.base import Base
 from sreda.db.models.core import InboundMessage, Job, Tenant, User, Workspace
 from sreda.db.models.planner import PlannerExecution, StepExecutionLedger
+from sreda.db.models.react_debug import ReactDebugTurn  # #185 — регистрация таблицы для create_all
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.maintenance.retention_cleanup import cleanup_runtime_retention
 from sreda.workers import retention_worker as rw_module
@@ -408,6 +409,27 @@ def test_planner_exec_skew_and_stuck_live_fk_safe_164(session) -> None:
     assert session.get(AgentRun, "run_skew") is None
     assert session.get(AgentRun, "run_stuck") is None
     assert session.get(AgentRun, "run_recent") is not None
+
+
+def test_react_debug_turns_retention_185(session) -> None:
+    """#185: react_debug_turns старше TTL (14д) удаляются, свежие остаются."""
+    now = datetime.now(timezone.utc)
+    session.add_all([
+        ReactDebugTurn(id="rdt_old", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", kind="final", user_text="старое",
+                       reply_text="ответ", tools_json="[]",
+                       created_at=now - timedelta(days=20)),
+        ReactDebugTurn(id="rdt_new", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", kind="final", user_text="свежее",
+                       reply_text="ответ", tools_json="[]",
+                       created_at=now - timedelta(days=2)),
+    ])
+    session.commit()
+    result = cleanup_runtime_retention(session, now=now)
+    session.commit()
+    remaining = {r.id for r in session.query(ReactDebugTurn).all()}
+    assert remaining == {"rdt_new"}, remaining   # старше 14д удалено, свежее осталось
+    assert result.react_debug_turns == 1
 
 
 # NB (#164, Codex R2 MINOR): planner_gaps / planner_llm_reservations (nullable execution_id, FK

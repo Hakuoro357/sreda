@@ -386,6 +386,13 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="SREDA_REACT_DEBUG_TENANTS",
     )
+    # #185 (pre-launch QA, ВРЕМЕННО): ГЛОБАЛЬНЫЙ захват переписки. True → _persist_debug_turn пишет
+    # ходы ВСЕХ тенантов (а не только allowlist выше) — производственная отладка/отлов багов перед
+    # запуском, снять после. Текст шифруется (EncryptedString). Оферта/согласие ПД на запуске ДОЛЖНЫ
+    # покрывать захват переписки. Дефолт False (без флага — прежнее поведение, только allowlist).
+    react_debug_all: bool = Field(
+        default=False, validation_alias="SREDA_REACT_DEBUG_ALL"
+    )
     # #165 Срез B: тенанты с ОБРЕЗКОЙ набора инструментов (ленивая загрузка семей: ядро +
     # предзагруженные словарём top-2 + добор need_family/guard). Дефолт пуст → НИКОМУ: все
     # на full-bind (весь набор привязан, как до #165 — ноль изменений). Канарейка/kill-switch:

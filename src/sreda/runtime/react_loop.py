@@ -1445,13 +1445,15 @@ def _called_tools(result: Any) -> list[str]:
 def _persist_debug_turn(*, tenant_id: str, user_id: str, thread_id: str, channel: str,
                         user_text: str, reply: Any, tools: list[str], kind: str) -> None:
     """vex#170 (ВРЕМЕННОЕ): записать ход (вопрос + ответ бота + инструменты) в
-    react_debug_turns, чтобы видеть всю переписку пока тестируем механизм. Гейт — ALLOWLIST
-    тенантов react_debug_tenants (НЕ глобальный флаг; пусто → никому). ИЗОЛИРОВАННАЯ сессия
-    (не транзакция хода); текст шифруется на уровне модели; НИКОГДА не роняет ход (debug — не
-    correctness). reply — это _Reply (подкласс str) → str(reply) даёт чистый текст ответа."""
+    react_debug_turns, чтобы видеть всю переписку пока тестируем механизм. Гейт: глобальный флаг
+    react_debug_all (#185, pre-launch QA — пишет ВСЕХ) ИЛИ ALLOWLIST react_debug_tenants. Оба ВЫКЛ
+    (дефолт) → никому. ИЗОЛИРОВАННАЯ сессия (не транзакция хода); текст шифруется на уровне модели;
+    НИКОГДА не роняет ход (debug — не correctness). reply — _Reply (подкласс str) → str(reply) = текст."""
     try:
         from sreda.config.settings import get_settings
-        if tenant_id not in get_settings().react_debug_tenants:
+        _s = get_settings()
+        # #185: захват для ВСЕХ при react_debug_all; иначе — только per-tenant allowlist (#170).
+        if not (_s.react_debug_all or tenant_id in _s.react_debug_tenants):
             return
         import json as _json
         from uuid import uuid4
