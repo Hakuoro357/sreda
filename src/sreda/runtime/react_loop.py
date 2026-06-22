@@ -969,11 +969,18 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 and (d is None or d == t0.scheduled_date)
                 and (ts is None or ts == t0.time_start)):
             return f"ok:updated:{t0.id} | {t0.title} | {_fmt_task_when(t0)}"
-        t = tasks.update(tenant_id=tenant_id, user_id=user_id, task_id=task_ref,
-                         title=title or None, notes=notes or None,
-                         scheduled_date=d, time_start=ts)
-        return (f"ok:updated:{t.id} | {t.title} | {_fmt_task_when(t)}"
-                if t else "Такой задачи у тебя нет.")
+        def _mut(commit: bool) -> str:
+            t = tasks.update(tenant_id=tenant_id, user_id=user_id, task_id=task_ref,
+                             title=title or None, notes=notes or None,
+                             scheduled_date=d, time_start=ts, commit=commit)
+            return (f"ok:updated:{t.id} | {t.title} | {_fmt_task_when(t)}"
+                    if t else "Такой задачи у тебя нет.")
+
+        return _idempotent_write(
+            action="update", entity_type="task", entity_id=task_ref,
+            args={"title": title or None, "notes": notes or None,
+                  "scheduled_date": scheduled_date or None, "time_start": time_start or None},
+            mutate=_mut)
 
     @tool
     def complete_task(task_ref: str) -> str:

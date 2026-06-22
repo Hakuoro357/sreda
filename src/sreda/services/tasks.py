@@ -495,6 +495,7 @@ class TaskService:
         recurrence_rule: str | None = None,
         notes: str | None = None,
         delegated_to: str | None = None,
+        commit: bool = True,
     ) -> Task | None:
         """Partial update. Pass only fields you want to change.
         ``None`` values mean "leave as-is"; to explicitly clear a
@@ -541,19 +542,23 @@ class TaskService:
             # (#166: иначе react TaskService без bot_key сбросил бы на LEGACY_NULL).
             old_rem = self.session.get(FamilyReminder, task.reminder_id)
             old_bot_key = old_rem.bot_key if old_rem is not None else self._bot_key
+            # #163 Фаза 3: sub-операции БЕЗ своего commit — весь update атомарен одним commit ниже
+            # (раньше cancel+attach коммитили по отдельности; теперь единая per-op граница).
             self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id,
+                tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
             )
             task.reminder_id = None
             if task.scheduled_date and task.time_start:
                 self._attach_reminder_inner(
-                    task=task, offset_minutes=old_offset, bot_key=old_bot_key,
+                    task=task, offset_minutes=old_offset, bot_key=old_bot_key, commit=False,
                 )
             else:
                 task.reminder_offset_minutes = None
-                self.session.commit()
-        else:
+        # Единый commit (per-op атомарность). commit=False → владеет durable-helper (ctx-путь).
+        if commit:
             self.session.commit()
+        else:
+            self.session.flush()
         return task
 
     def complete(
@@ -689,7 +694,7 @@ class TaskService:
         return task
 
     def _attach_reminder_inner(self, *, task: Task, offset_minutes: int,
-                               bot_key=_USE_SELF_BOT_KEY) -> None:
+                               bot_key=_USE_SELF_BOT_KEY, commit: bool = True) -> None:
         """Internal helper: create a FamilyReminder, link it, commit.
         Caller guarantees the task has scheduled_date + time_start.
 
@@ -751,7 +756,10 @@ class TaskService:
         task.reminder_id = reminder.id
         task.reminder_offset_minutes = offset_minutes
         task.updated_at = _utcnow()
-        self.session.commit()
+        if commit:  # #163 Фаза 3: commit=False как часть большей операции (tasks.update через helper)
+            self.session.commit()
+        else:
+            self.session.flush()
 
     def _user_timezone(self, tenant_id: str, user_id: str):
         """Resolve the user's IANA timezone for local-wall-clock ↔ UTC

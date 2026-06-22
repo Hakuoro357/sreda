@@ -444,7 +444,7 @@ class HousewifeReminderService:
             q = q.filter(FamilyReminder.user_id == user_id)
         return q.count()
 
-    def cancel(self, *, tenant_id: str, reminder_id: str) -> bool:
+    def cancel(self, *, tenant_id: str, reminder_id: str, commit: bool = True) -> bool:
         reminder = (
             self.session.query(FamilyReminder)
             .filter(
@@ -458,7 +458,10 @@ class HousewifeReminderService:
         reminder.status = "cancelled"
         reminder.next_trigger_at = None
         reminder.updated_at = _utcnow()
-        self.session.commit()
+        if commit:  # #163 Фаза 3: commit=False когда зовётся как часть большей операции (tasks.update)
+            self.session.commit()
+        else:
+            self.session.flush()
         return True
 
     # --- worker-facing --------------------------------------------------

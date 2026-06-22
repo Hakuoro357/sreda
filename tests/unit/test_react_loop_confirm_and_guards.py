@@ -74,6 +74,34 @@ def test_update_reminder_exact_replay_no_reapply_163(db_session):
         "replay НЕ должен переприменять (нет отката к 'новое')"
 
 
+def test_update_task_exact_replay_no_reapply_163(db_session):
+    """#163 Фаза 3a-2 named-X: повтор update_task (тот же ctx→op_id) → сохранённый payload без
+    переприменения (не откатывает более новое состояние)."""
+    from datetime import date
+    from sreda.db.models.tasks import Task
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    tid = f"task_{uuid4().hex[:20]}"
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title="старое",
+                        scheduled_date=date(2030, 6, 20), status="pending",
+                        created_at=now, updated_at=now))
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx1 = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                              tool_name="update_task", tenant_id=u.tenant_id,
+                              user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx1):
+        r1 = tools["update_task"].invoke({"task_ref": tid, "title": "новое"})
+    assert "новое" in r1, r1
+    db_session.get(Task, tid).title = "новейшее"; db_session.commit()
+    with bind_tool_runtime(ctx1):
+        r2 = tools["update_task"].invoke({"task_ref": tid, "title": "новое"})
+    assert r2 == r1, f"replay → сохранённый payload: {r2!r}"
+    db_session.expire_all()
+    assert db_session.get(Task, tid).title == "новейшее", "replay не переприменил"
+
+
 def _cancel_script(rid: str) -> _StubLLM:
     return _StubLLM([
         AIMessage(content="", tool_calls=[{
