@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import operator
 import re
+import time as _time
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -35,6 +37,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
+from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода
 from sreda.runtime.planner.tool_runtime import (
     ToolRuntimeContext,
     allocate_operation_id,
@@ -207,6 +210,9 @@ class ReactState(MessagesState):
     # на ОДИН проход и тут же очищает. НЕ кладём SystemMessage в историю (копился бы между
     # ходами + system в середине диалога → провайдер; R1 medium+субагент).
     guard_nudge: str
+    # #192: аккумулятор вызовов LLM узла chat для трейса (add-reducer — НЕ двоится на resume:
+    # interrupt в run_tools, chat-узлы до паузы уже отработали и checkpointed, заново не идут).
+    llm_calls: Annotated[list, operator.add]
 
 
 def _system_prompt(today_str: str) -> str:
@@ -1138,6 +1144,8 @@ def _build_graph(llm: Any, all_tools: list, *,
         # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
         _bound_primary = llm.bind_tools(bound)
         _used_provider, _used_model = provider_key, _model_name
+        _fallback_fired = False
+        _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
         if fallback_llm is not None:
             try:
                 resp = _bound_primary.invoke(_msgs)
@@ -1146,8 +1154,10 @@ def _build_graph(llm: Any, all_tools: list, *,
                                type(_e).__name__, exc_info=True)
                 resp = fallback_llm.bind_tools(bound).invoke(_msgs)
                 _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
+                _fallback_fired = True
         else:
             resp = _bound_primary.invoke(_msgs)
+        _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
         try:
@@ -1163,6 +1173,14 @@ def _build_graph(llm: Any, all_tools: list, *,
             "messages": [resp],
             "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # анти-петля
             "guard_nudge": "",  # one-shot: очищаем после применения
+            # #192: наблюдательная запись вызова (НЕ деньги — деньги в skill_ai_executions #175)
+            "llm_calls": [{
+                "phase": "chat",
+                "call_index": (state.get("turn_pass_count") or 0),
+                "provider_key": _used_provider, "model": _used_model,
+                "latency_ms": _latency_ms, "retries": (1 if _fallback_fired else 0),
+                "fallback_fired": _fallback_fired,
+            }],
         }
 
     def run_tools(state: ReactState):
@@ -1193,20 +1211,25 @@ def _build_graph(llm: Any, all_tools: list, *,
                         active.append(fam)
                         added = True
                     msg = f"Семья «{fam}» загружена."
+                    _rk = "ok"
                 else:
                     msg = (f"Семья «{fam}» неизвестна. Доступные для добора: "
                            + ", ".join(sorted(_LAZY_FAMILIES)) + ".")
-                out.append(ToolMessage(content=msg, name=name, tool_call_id=tc["id"]))
+                    _rk = "unknown_family"  # #192: не-исполнение, НЕ успех вслепую
+                out.append(ToolMessage(content=msg, name=name, tool_call_id=tc["id"],
+                                       artifact={"result_kind": _rk}))
                 continue
             tool_obj = bound_by_name.get(name)
             if tool_obj is None:
                 out.append(ToolMessage(
                     content=(f"Инструмент {name} сейчас недоступен — сначала позови "
                              "need_family нужной семьи."),
-                    name=name, tool_call_id=tc["id"]))
+                    name=name, tool_call_id=tc["id"],
+                    artifact={"result_kind": "unavailable"}))  # #192: не-исполнение
                 continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
+            _t = _time.perf_counter()  # #192: латентность инструмента для трейса
             try:
                 if turn_key:
                     op_id = allocate_operation_id(
@@ -1233,9 +1256,13 @@ def _build_graph(llm: Any, all_tools: list, *,
                 logger.warning("react_loop: tool %s failed type=%s", name, type(exc).__name__)
                 out.append(ToolMessage(
                     content=f"error: инструмент {name} не смог выполниться, повтори запрос.",
-                    name=name, tool_call_id=tc["id"], status="error"))
+                    name=name, tool_call_id=tc["id"], status="error",
+                    artifact={"result_kind": "error", "error_type": type(exc).__name__,
+                              "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
                 continue
-            out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"]))
+            out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"],
+                                   artifact={"result_kind": "ok",
+                                             "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
             if TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES:
                 wrote_unkeyed = True  # unkeyed-write выполнен → guard отключим (анти-дубль)
         update: dict = {"messages": out}
@@ -1515,6 +1542,10 @@ def _persist_debug_turn(*, tenant_id: str, user_id: str, thread_id: str, channel
     try:
         from sreda.config.settings import get_settings
         _s = get_settings()
+        # #192: при включённом durable-трейсе (react_turn_trace) НЕ пишем временный react_debug_turns
+        # — одна система, без dual-write. Снос самой таблицы — отдельной миграцией позже.
+        if getattr(_s, "react_trace_enabled", False):
+            return
         # #185: захват для ВСЕХ при react_debug_all; иначе — только per-tenant allowlist (#170).
         if not (_s.react_debug_all or tenant_id in _s.react_debug_tenants):
             return
@@ -1558,6 +1589,7 @@ async def handle_turn(
             provider_key = ""
     base = thread_id
     gen = _THREAD_GEN.get(base, 0)
+    _tk_trace = ""  # #192: turn_key для трейса — до try, доступен в except при любом сбое
 
     def _cfg(g: int) -> dict:
         # #165 Срез A: recursion_limit — ВНЕШНИЙ нет с запасом (R1: 15 было тесно — срез
@@ -1611,6 +1643,11 @@ async def handle_turn(
                 _THREAD_GEN[base] = gen
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
+            _tk_trace = turn_key
+            # #192: start-строка трейса ДО графа (свежий ход). Resume — НЕ start (строка есть с pause).
+            _trace.persist_trace_start(
+                tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
+                turn_key=turn_key, origin_user_text=user_text)
             # #165 Срез B (R3-карв-аут): пруненый тенант → база = НЕБЕЗОПАСНЫЕ-к-обрезке
             # ленивые семьи ВСЕГДА (recipes/menu/household/checklists/memory — пишут без ключа,
             # дубль на recovery; до #163) + распознанные словарём PRUNABLE (shopping/web —
@@ -1628,11 +1665,15 @@ async def handle_turn(
                  "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
+        # #192: turn_key из state (resume-путь — локального turn_key нет; fresh — совпадёт).
+        _tk_trace = ((snap.values or {}).get("turn_key") if snap and snap.values else None) or _tk_trace
         _tools = _called_tools(result)
         if _has_pause(snap):  # снова пауза → вопрос пользователю (+ confirm + токен для [Да][Нет])
             q, is_confirm, pid = _pending(snap)
             reply = _Reply(_postformat(q) or "Уточни, пожалуйста.",
                            awaiting_confirm=is_confirm, confirm_id=pid)
+            # #192: pause-ход → awaiting_confirm/pending (conditional; не переоткрывает done)
+            _trace.persist_trace_pause(tenant_id=tenant_id, user_id=user_id, turn_key=_tk_trace)
             _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                                 channel=channel, user_text=user_text, reply=reply,
                                 tools=_tools, kind="pause")
@@ -1640,6 +1681,18 @@ async def handle_turn(
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
         reply = _Reply(_postformat(text) or "Готово.")
+        # #192: финал → done + структура (llm_calls из chat-аккумулятора, tool_calls из истории).
+        _msgs_fin = result.get("messages", []) if isinstance(result, dict) else []
+        _tcs = _trace.collect_tool_calls(_msgs_fin, tenant_id=tenant_id)
+        _lcs = result.get("llm_calls") if isinstance(result, dict) else None
+        _outcome = ("tool_error" if any(t.get("result_kind") == "error" for t in _tcs)
+                    else "fallback_used" if any(c.get("fallback_fired") for c in (_lcs or []))
+                    else "ok")
+        _trace.persist_trace_finish(
+            tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
+            turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
+            confirm_state=("confirmed" if live_pause else "none"),  # best-effort (declined → след. шаг)
+            outcome=_outcome, passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                             channel=channel, user_text=user_text, reply=reply,
                             tools=_tools, kind="final")
@@ -1651,6 +1704,13 @@ async def handle_turn(
         _THREAD_GEN[base] = gen + 1
         _reply = _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
                         "что нужно сделать.")
+        # #192: handled-ошибка (поймана) → терминал done+outcome (НЕ in_progress; in_progress
+        # остаётся только при НЕпойманном краше/потере finish-хука). Best-effort, guarded.
+        if _tk_trace:
+            _trace.persist_trace_finish(
+                tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
+                turn_key=_tk_trace, reply_text=str(_reply), llm_calls=None, tool_calls=None,
+                confirm_state="none", outcome="safe_reply", passes=0)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                             channel=channel, user_text=user_text, reply=_reply,
                             tools=[], kind="error")

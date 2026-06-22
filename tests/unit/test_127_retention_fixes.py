@@ -28,6 +28,7 @@ from sreda.db.base import Base
 from sreda.db.models.core import InboundMessage, Job, Tenant, User, Workspace
 from sreda.db.models.planner import PlannerExecution, StepExecutionLedger
 from sreda.db.models.react_debug import ReactDebugTurn  # #185 — регистрация таблицы для create_all
+from sreda.db.models.react_trace import ReactTurnTrace  # #192 — регистрация для create_all
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.maintenance.retention_cleanup import cleanup_runtime_retention
 from sreda.workers import retention_worker as rw_module
@@ -430,6 +431,27 @@ def test_react_debug_turns_retention_185(session) -> None:
     remaining = {r.id for r in session.query(ReactDebugTurn).all()}
     assert remaining == {"rdt_new"}, remaining   # старше 14д удалено, свежее осталось
     assert result.react_debug_turns == 1
+
+
+def test_react_turn_trace_retention_192(session) -> None:
+    """#192: react_turn_trace старше TTL (14д) удаляется, свежий остаётся."""
+    now = datetime.now(timezone.utc)
+    session.add_all([
+        ReactTurnTrace(id="rtt_old", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", turn_key="k_old", status="done",
+                       origin_user_text="старое", reply_text="ответ",
+                       created_at=now - timedelta(days=20)),
+        ReactTurnTrace(id="rtt_new", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", turn_key="k_new", status="done",
+                       origin_user_text="свежее", reply_text="ответ",
+                       created_at=now - timedelta(days=2)),
+    ])
+    session.commit()
+    result = cleanup_runtime_retention(session, now=now)
+    session.commit()
+    remaining = {r.id for r in session.query(ReactTurnTrace).all()}
+    assert remaining == {"rtt_new"}, remaining
+    assert result.react_turn_trace == 1
 
 
 # NB (#164, Codex R2 MINOR): planner_gaps / planner_llm_reservations (nullable execution_id, FK
