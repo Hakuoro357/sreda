@@ -199,7 +199,72 @@ def tenant_advisory_lock(session: Session, tenant_id: str) -> Iterator[None]:
                 pass
 
 
-def soft_delete_tenant(session: Session, tenant_id: str) -> bool:
+def _write_lifecycle_audit(
+    session: Session,
+    *,
+    action: str,
+    tenant_id: str,
+    actor_type: str | None,
+    actor_id: str | None,
+    source: str | None,
+    reason: str | None,
+    extra_metadata: dict | None = None,
+):
+    """Записать audit_log-строку для lifecycle-действия ПОД текущей транзакцией.
+
+    Вызывается ВНУТРИ ``soft_delete_tenant`` / ``restore_tenant`` (под advisory-
+    локом, ДО внутреннего ``session.commit()``), поэтому audit-строка коммитится
+    атомарно с флагом+drain'ом: durable-флаг ⟺ есть его audit-запись. ``commit=
+    False`` — транзакцией управляет вызывающая lifecycle-функция; здесь только
+    ``session.add``+``flush``. Self-delete (Фаза 4b-2) переиспользует ЭТОТ путь,
+    передав ``actor_type='user'`` + свой ``action`` через те же параметры.
+
+    Аудит пишется ТОЛЬКО если задан ``action`` И ``actor_type`` (admin/self
+    передают оба). Для внутренних/системных вызовов без actor (если появятся)
+    — параметры опускаются → audit не пишется (поведение Фаз 0-4a не меняется).
+
+    **Возврат (R1 MAJOR — строгий аудит).** Когда actor задан — возвращаем
+    ``AuditLog``-строку или ``None``, если ``audit_event`` НЕ записал её
+    (невалидный ``actor_type`` → audit.py:71-75, либо flush-ошибка + rollback →
+    audit.py:94-103). Вызывающий ОБЯЗАН проверить: ``None`` при заданном actor
+    означает, что аудит-строки нет (или сессия уже откачена) — флаг коммитить
+    НЕЛЬЗЯ (иначе нарушится A11 «committed-флаг ⟺ audit-строка»). Когда actor
+    НЕ задан (системный путь Фаз 0-4a) — возвращаем ``None`` БЕЗ записи; для
+    этого пути ``None`` ожидаем и не является ошибкой.
+    """
+    if not action or not actor_type:
+        return None
+    from sreda.services.audit import audit_event
+
+    metadata: dict = {}
+    if source is not None:
+        metadata["source"] = source
+    if reason is not None:
+        metadata["reason"] = reason
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return audit_event(
+        session,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        action=action,
+        resource_type="tenant",
+        resource_id=tenant_id,
+        metadata=metadata,
+        commit=False,
+    )
+
+
+def soft_delete_tenant(
+    session: Session,
+    tenant_id: str,
+    *,
+    actor_type: str | None = None,
+    actor_id: str | None = None,
+    source: str | None = None,
+    reason: str | None = None,
+    audit_action: str = "admin.tenant.soft_delete",
+) -> bool:
     """Помечает тенанта удалённым (`deleted_at`) И активно дренит pending-артефакты.
 
     **Управляет своей транзакцией — вызывающему commit НЕ нужен (R1 CRITICAL).**
@@ -212,6 +277,13 @@ def soft_delete_tenant(session: Session, tenant_id: str) -> bool:
 
     Возвращает ``True`` если тенант был помечен в этом вызове, ``False`` если
     он уже удалён (no-op — повторный drain не запускается).
+
+    **Аудит (A11):** если переданы ``actor_type`` (admin/self) — пишем ОДНУ
+    ``audit_log``-строку ``audit_action`` (по умолчанию ``admin.tenant.soft_delete``)
+    ПОД локом, ДО внутреннего commit'а → атомарно с флагом+drain'ом (committed-
+    флаг ⟺ его audit-запись). На идемпотентном/нет-строки no-op-пути audit НЕ
+    пишется (не было реального действия → нет второй строки на повторе). Без
+    ``actor_type`` (системный вызов) — audit опускается (поведение Фаз 0-4a).
 
     **Идемпотентность:** если ``tenant.deleted_at`` уже не NULL — НИЧЕГО не
     делаем (не пере-штампуем флаг, не дренируем повторно). Идемпотентный путь
@@ -310,6 +382,43 @@ def soft_delete_tenant(session: Session, tenant_id: str) -> bool:
         # ставит ``status='pending'``). Чеклист A6 reminders НЕ требует — только
         # outbox / message_jobs / inbound_events.
 
+        # A11 аудит: пишем audit-строку ПОД локом, ДО commit'а — атомарно с
+        # флагом+drain'ом (committed-флаг ⟺ его audit-запись). Только на пути
+        # реального удаления (idempotent/no-row no-op выходят выше → нет второй
+        # строки на повторе). metadata.source='admin'|'self' + reason +
+        # previous_deleted_at=None (был активен — нижняя точка для трассировки).
+        audit_row = _write_lifecycle_audit(
+            session,
+            action=audit_action,
+            tenant_id=tenant_id,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            source=source,
+            reason=reason,
+            extra_metadata={"previous_deleted_at": None},
+        )
+        # R1 MAJOR (строгий аудит): когда actor задан (admin/self), аудит-строка
+        # ОБЯЗАНА быть записана. ``audit_event`` best-effort возвращает None при
+        # невалидном actor_type ИЛИ при flush-ошибке (тогда сессия УЖЕ откачена)
+        # — в обоих случаях commit ниже выставил бы флаг БЕЗ audit-строки (или
+        # вернул бы ``True`` на откаченной мутации). Поднимаем ДО commit'а: флаг
+        # не коммитится, вызывающий (админ-эндпойнт) получает ошибку, не ложный
+        # ``ok``. Лок отпустится в ``finally`` ``tenant_advisory_lock`` (raise
+        # выходит из ``with``-блока), рабочая транзакция откатится вызывающим/
+        # контекст-менеджером сессии. Системный путь (actor_type=None) сюда не
+        # доходит: _write_lifecycle_audit вернул None БЕЗ записи, но и проверка
+        # пропущена (actor_type is None) → коммит как прежде (Фазы 0-4a).
+        if actor_type is not None and audit_row is None:
+            # Codex R2 MAJOR: при невалидном actor_type audit_event возвращает None
+            # БЕЗ rollback → pending флаг+drain остаются в сессии. Откатываем САМИ
+            # перед raise (не полагаясь на вызывающего): иначе caller, поймавший
+            # RuntimeError, мог бы потом commit()'нуть флаг без аудит-строки.
+            session.rollback()
+            raise RuntimeError(
+                f"lifecycle audit write failed for tenant {tenant_id} "
+                f"(action={audit_action}) — refusing to commit flag without audit"
+            )
+
         # R1 CRITICAL: коммитим флаг+drain ПОД локом (а не flush с commit'ом на
         # вызывающем) — лок держится до durable-commit, окно «unlock→commit»
         # закрыто. Управляем своей транзакцией; вызывающему commit НЕ нужен.
@@ -321,7 +430,16 @@ def soft_delete_tenant(session: Session, tenant_id: str) -> bool:
         return True
 
 
-def restore_tenant(session: Session, tenant_id: str) -> bool:
+def restore_tenant(
+    session: Session,
+    tenant_id: str,
+    *,
+    actor_type: str | None = None,
+    actor_id: str | None = None,
+    source: str | None = None,
+    reason: str | None = None,
+    audit_action: str = "admin.tenant.restore",
+) -> bool:
     """Снимает `deleted_at` И зачищает окно удаления `[deleted_at, restored_at]`.
 
     Симметрично ``soft_delete_tenant``: работает ПОД тем же session-scoped
@@ -331,6 +449,12 @@ def restore_tenant(session: Session, tenant_id: str) -> bool:
     **Идемпотентность:** если ``tenant.deleted_at IS NULL`` (уже активен или
     никогда не удалялся) — НИЧЕГО не делаем (return False). Нет строки → тоже
     False (нечего восстанавливать).
+
+    **Аудит (A11):** симметрично ``soft_delete_tenant`` — если передан
+    ``actor_type``, пишем ОДНУ ``audit_log``-строку ``audit_action`` (по умолчанию
+    ``admin.tenant.restore``) ПОД локом, ДО commit'а (атомарно с обнулением флага +
+    зачисткой окна). metadata несёт ``previous_deleted_at`` (значение до restore —
+    для трассировки длительности удаления). На no-op-пути audit НЕ пишется.
 
     **Зачистка окна удаления (анти-воскрешение, A2).** За время удаления
     producer-фильтр воркеров не давал тенанту ничего слать, но pending-артефакты
@@ -494,6 +618,36 @@ def restore_tenant(session: Session, tenant_id: str) -> bool:
             # См. one-shot выше: ДБ-side WHERE, без Python evaluator (naive/aware).
             execution_options={"synchronize_session": False},
         )
+
+        # A11 аудит: ПОД локом, ДО commit'а — атомарно с обнулением флага +
+        # зачисткой окна. previous_deleted_at = значение ДО restore (iso-строка) —
+        # для трассировки, сколько тенант был удалён. Только на пути реального
+        # restore (no-op'ы вышли выше → нет лишней строки на повторе).
+        audit_row = _write_lifecycle_audit(
+            session,
+            action=audit_action,
+            tenant_id=tenant_id,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            source=source,
+            reason=reason,
+            extra_metadata={"previous_deleted_at": deleted_at.isoformat()},
+        )
+        # R1 MAJOR (строгий аудит, симметрично soft_delete): actor задан → аудит-
+        # строка ОБЯЗАНА быть. None при заданном actor = не записалась (невалидный
+        # actor_type) ИЛИ flush-ошибка с уже откаченной сессией → raise ДО commit'а,
+        # чтобы не снять флаг + не зачистить окно БЕЗ audit-строки и не вернуть
+        # ложный ``ok``. Лок отпустится в ``finally`` барьера, транзакция откатится
+        # вызывающим. Системный путь (actor_type=None) проверку пропускает.
+        if actor_type is not None and audit_row is None:
+            # Codex R2 MAJOR (симметрично soft_delete): откатываем pending снятие
+            # флага + зачистку окна САМИ перед raise — невалидный actor_type не
+            # делает rollback в audit_event, оставляя транзакцию грязной.
+            session.rollback()
+            raise RuntimeError(
+                f"lifecycle audit write failed for tenant {tenant_id} "
+                f"(action={audit_action}) — refusing to commit restore without audit"
+            )
 
         # Коммит ПОД локом (симметрично soft_delete): флаг+drain durable до unlock.
         session.commit()

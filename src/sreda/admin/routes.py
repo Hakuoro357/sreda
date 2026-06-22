@@ -1148,3 +1148,69 @@ async def admin_tenant_unsuspend(
         url=f"/admin/users?unsuspend=ok&tenant={tenant_id}",
         status_code=303,
     )
+
+
+@router.post("/tenant/{tenant_id}/soft-delete", response_class=HTMLResponse)
+async def admin_tenant_soft_delete(
+    tenant_id: str,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """#187 Phase 4b-1 — soft-delete a tenant (admin-only trigger, A15).
+
+    Reversible: flips ``tenants.deleted_at`` + actively drains pending
+    artefacts under the tenant advisory-lock barrier (see
+    ``services.tenant_lifecycle.soft_delete_tenant``). Protected EXACTLY like
+    the other admin actions (suspend/unsuspend): ``require_admin_token`` →
+    reachable only on the admin surface (IP-locked vhost + admin auth), NOT a
+    public endpoint. The ``admin.tenant.soft_delete`` audit row (A11) is
+    written INSIDE ``soft_delete_tenant``, atomically with the flag under the
+    same lock/transaction — no separate commit here.
+    """
+    from sreda.services.audit import hash_admin_token
+    from sreda.services.tenant_lifecycle import soft_delete_tenant
+
+    changed = soft_delete_tenant(
+        session,
+        tenant_id,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        source="admin",
+    )
+    status = "ok" if changed else "noop"
+    return RedirectResponse(
+        url=f"/admin/users?soft_delete={status}&tenant={tenant_id}",
+        status_code=303,
+    )
+
+
+@router.post("/tenant/{tenant_id}/restore", response_class=HTMLResponse)
+async def admin_tenant_restore(
+    tenant_id: str,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """#187 Phase 4b-1 — restore a soft-deleted tenant (admin-only, A15).
+
+    Reverses ``admin_tenant_soft_delete``: clears ``deleted_at`` and cleans the
+    deletion window ``[deleted_at, restored_at]`` under the same advisory-lock
+    (see ``services.tenant_lifecycle.restore_tenant``). Same protection as every
+    other admin action (``require_admin_token``). The ``admin.tenant.restore``
+    audit row (A11) is written inside ``restore_tenant``, atomically with the
+    flag.
+    """
+    from sreda.services.audit import hash_admin_token
+    from sreda.services.tenant_lifecycle import restore_tenant
+
+    changed = restore_tenant(
+        session,
+        tenant_id,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        source="admin",
+    )
+    status = "ok" if changed else "noop"
+    return RedirectResponse(
+        url=f"/admin/users?restore={status}&tenant={tenant_id}",
+        status_code=303,
+    )
