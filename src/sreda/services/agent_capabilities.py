@@ -45,8 +45,8 @@ def active_feature_keys(session: Session, tenant_id: str) -> set[str]:
         if sub.status not in {"active", "scheduled_for_cancel"}:
             continue
         # Phase 2 fix 2026-05-08 (Codex MAJOR-5): active_until=NULL означает
-        # бессрочную подписку — sreda_free и housewife_grandfathered создаются
-        # без срока. Раньше `if not sub.active_until: continue` эти подписки
+        # бессрочную подписку — free/grandfathered подписки создаются без срока
+        # (#200: после слияния все на sreda_free). Раньше `if not sub.active_until: continue` эти подписки
         # ИСКЛЮЧАЛ из active_keys → has_voice_access возвращал False для
         # каждого нового sreda_free юзера → «голосовые недоступны». Теперь
         # NULL = unlimited, пропускаем temporal-check, добавляем feature_key.
