@@ -464,7 +464,7 @@ class HousewifeReminderService:
         has passed. Called by the worker; NEVER expose to chat tools —
         they must stay tenant-scoped."""
         current = _coerce_utc(now or _utcnow())
-        return (
+        q = (
             self.session.query(FamilyReminder)
             .filter(
                 FamilyReminder.status == "pending",
@@ -473,8 +473,14 @@ class HousewifeReminderService:
             )
             .order_by(FamilyReminder.next_trigger_at.asc())
             .limit(limit)
-            .all()
         )
+        # #163 Фаза 4 — FOR UPDATE SKIP LOCKED (только PG): при будущей многопроцессности второй
+        # воркер пропустит уже залоченные due-строки → нет двойного пика/двойной постановки. Лок
+        # держится до commit тика (после mark_fired). SQLite не поддерживает — без лока (1 воркер).
+        bind = self.session.bind
+        if bind is not None and bind.dialect.name == "postgresql":
+            q = q.with_for_update(skip_locked=True)
+        return q.all()
 
     def mark_fired(
         self, reminder: FamilyReminder, *, now: datetime | None = None

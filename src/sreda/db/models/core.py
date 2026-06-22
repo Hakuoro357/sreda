@@ -194,6 +194,23 @@ class OutboxMessage(Base):
         String(64), nullable=False, default="sreda",
         server_default=sa_text("'sreda'"), index=True
     )
+    # #163 Фаза 4 — ключ идемпотентности доставки (с КАНАЛОМ+ботом): не более ОДНОГО
+    # outbox-сообщения на (источник+канал+бот). Воркер напоминаний кладёт
+    # f"{reminder_id}:{fired_trigger_iso}:{channel}:{bot_key}": эскалационные ре-пинги
+    # (разный fired_trigger) и dual TG+MAX (разный канал) РАЗЛИЧАЮТСЯ; повтор той же тройки
+    # (мультипроцесс/повтор-enqueue) → дедуп. Партиал (IS NOT NULL): прочие продюсеры
+    # (без ключа) НЕ ограничены — аддитивно, ничего из легаси не схлопывается.
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_outbox_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=sa_text("idempotency_key IS NOT NULL"),
+            sqlite_where=sa_text("idempotency_key IS NOT NULL"),
+        ),
+    )
 
 
 class SecureRecord(Base):

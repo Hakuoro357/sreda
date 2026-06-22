@@ -151,7 +151,32 @@ class HousewifeReminderWorker:
         # Dual delivery (Boris directive 2026-05-05): создаём отдельную
         # outbox row на каждый available channel — юзер видит reminder
         # и в TG и в МАКСе.
+        # #163 Фаза 4 — fired_trigger = триггер ИМЕННО ЭТОГО срабатывания (next_trigger_at ДО
+        # mark_fired-advance). Дискриминирует эскалационные ре-пинги: у каждого свой next_trigger_at,
+        # значит свой ключ → не схлопываются. None быть не должно (due_now фильтрует), но fallback на
+        # trigger_at на всякий.
+        fired = reminder.next_trigger_at or reminder.trigger_at
+        if fired is not None and fired.tzinfo is None:
+            fired = fired.replace(tzinfo=timezone.utc)
+        fired_iso = fired.isoformat() if fired is not None else ""
+        # Dual delivery (Boris directive 2026-05-05): создаём отдельную
+        # outbox row на каждый available channel — юзер видит reminder
+        # и в TG и в МАКСе.
         for routing in routings:
+            row_bot_key = routing.bot_key or reminder.bot_key or LEGACY_NULL_BOT_KEY
+            # #163 Фаза 4 — ключ идемпотентности доставки С КАНАЛОМ+ботом: dual TG+MAX различны
+            # (разный канал), эскалации различны (разный fired_iso); повтор ТОЙ ЖЕ тройки
+            # (мультипроцесс / повтор-enqueue) → дедуп. Pre-check (одно-поточный путь); partial-unique
+            # индекс — backstop гонки.
+            idem_key = f"{reminder.id}:{fired_iso}:{routing.channel}:{row_bot_key}"
+            if (self.session.query(OutboxMessage.id)
+                    .filter(OutboxMessage.idempotency_key == idem_key)
+                    .first() is not None):
+                logger.info(
+                    "reminder %s: outbox idem-key уже поставлен (%s) — пропуск дубля доставки",
+                    reminder.id, routing.channel,
+                )
+                continue
             payload = {
                 "chat_id": routing.chat_id,
                 "text": text,
@@ -168,7 +193,8 @@ class HousewifeReminderWorker:
                 # #109: deliver to the user's CURRENT bot (routing.bot_key,
                 # populated from user.last_bot_key) when known; else fall
                 # back to the reminder's frozen bot_key, then legacy default.
-                bot_key=routing.bot_key or reminder.bot_key or LEGACY_NULL_BOT_KEY,
+                bot_key=row_bot_key,
+                idempotency_key=idem_key,
             )
             if hasattr(OutboxMessage, "user_id"):
                 outbox.user_id = reminder.user_id
