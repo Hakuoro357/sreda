@@ -86,7 +86,6 @@ def seeded_client(client, monkeypatch, tmp_path):
             telegram_account_id="352612382",
             assistant_id="assistant_test",
             assistant_name="Среда",
-            eds_monitor_enabled=False,
         )
         session.commit()
     finally:
@@ -195,13 +194,13 @@ class TestMiniAppPlans:
 
 class TestMiniAppSubscribe:
     def test_subscribe_eds_base(self, seeded_client):
-        # #181: subscribing to a retired skill is a no-op tombstone. The
-        # endpoint still answers 200 (old links don't 404) but reports the
-        # skill is gone and creates NO active subscription.
+        # #181 Phase B: subscribing to a retired skill is a tombstone. The
+        # endpoint still answers 200 (old links don't 404) but reports ok=False
+        # with the disabled message and creates NO active subscription.
         init_data = _make_init_data()
         headers = {"Authorization": f"tma {init_data}"}
 
-        # Subscribe attempt → disabled no-op
+        # Subscribe attempt → disabled tombstone
         resp = seeded_client.post(
             "/miniapp/api/v1/subscribe",
             json={"plan_key": "eds_monitor_base"},
@@ -209,7 +208,7 @@ class TestMiniAppSubscribe:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["ok"] is True
+        assert data["ok"] is False
         assert data["message"] == "Это умение больше не поддерживается."
 
         # Summary must NOT show eds_monitor as active.
@@ -228,24 +227,20 @@ class TestMiniAppSubscribe:
         assert resp.status_code == 400
 
     def test_cancel_eds_base(self, seeded_client):
+        # #181 Phase B: cancel on a retired EDS plan_key is a disabled tombstone
+        # (200, ok=False), not a 404/500.
         init_data = _make_init_data()
         headers = {"Authorization": f"tma {init_data}"}
 
-        # Subscribe first
-        seeded_client.post(
-            "/miniapp/api/v1/subscribe",
-            json={"plan_key": "eds_monitor_base"},
-            headers=headers,
-        )
-
-        # Cancel
         resp = seeded_client.post(
             "/miniapp/api/v1/cancel",
             json={"plan_key": "eds_monitor_base"},
             headers=headers,
         )
         assert resp.status_code == 200
-        assert resp.json()["ok"] is True
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["message"] == "Это умение больше не поддерживается."
 
     def test_subscribe_voice_transcription(self, seeded_client):
         init_data = _make_init_data()

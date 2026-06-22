@@ -31,8 +31,6 @@ from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
 from sreda.services.agent_capabilities import active_feature_keys
 from sreda.services.billing import (
     DISABLED_FEATURE_MESSAGE,
-    PLAN_EDS_MONITOR_BASE,
-    PLAN_EDS_MONITOR_EXTRA,
     BillingService,
 )
 from sreda.services.housewife_family import HousewifeFamilyService
@@ -57,6 +55,11 @@ from sreda.services.telegram_auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+# #181 Phase B: legacy EDS plan_keys. EDS Monitor is retired and its plan rows
+# are dropped, but old Mini App clients / deep-links may still POST these keys.
+# subscribe/cancel answer them with the disabled tombstone (200, no mutation).
+_EDS_PLAN_KEYS = frozenset({"eds_monitor_base", "eds_monitor_extra_account"})
 
 router = APIRouter(
     prefix="/miniapp",
@@ -501,26 +504,22 @@ def get_summary(
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     billing = BillingService(session)
-    summary = billing.get_summary(ctx.tenant_id)
     now = datetime.now(UTC)
 
     # Query plans and subscriptions directly
     plans_by_key = _plans_by_key(session)
 
-    # #181: base_plan (EDS) card emission removed — only extra_price_rub is
-    # still echoed back for response-shape stability (quarantine).
-    extra_plan = plans_by_key.get(PLAN_EDS_MONITOR_EXTRA)
-    extra_price_rub = extra_plan.price_rub if extra_plan else 2990
+    # #181 Phase B: EDS Monitor fully retired. extra_price_rub kept only for
+    # response-shape stability; the EDS plan rows are dropped by migration so
+    # this falls back to the historic default.
+    extra_price_rub = 2990
 
     # Build active skills list (for main screen cards)
     active_skills: list[dict] = []
     available_skills: list[dict] = []
 
-    # EDS Monitor — #181: retired skill. Tombstoned: no EDS card is emitted
-    # into active_skills / available_skills, so no migrated user sees an EDS
-    # card after deactivation (the SPA also filters eds_monitor as a second
-    # backstop). The quarantined billing read-path (get_summary / PLAN_EDS_*
-    # seeds) stays intact; only card emission here is suppressed.
+    # EDS Monitor — #181: retired skill, fully removed. No EDS card is emitted
+    # into active_skills / available_skills.
 
     # Simple skills (one plan → one subscription → one card). Voice
     # transcription was removed in 2026-04 — it's now a capability
@@ -560,21 +559,13 @@ def get_summary(
                 "is_active": False,
             })
 
-    # EDS subscriptions detail — #181: retired. Always empty; the EDS skill
-    # page is a tombstone (the helper _build_eds_subscriptions stays in the
-    # module, quarantined, until Phase 2 module deletion).
+    # EDS subscriptions detail — #181 Phase B: retired and removed. Always empty.
     eds_subscriptions: list[dict] = []
 
-    # #181 DISPLAY tombstone: summary.next_amount_rub / next_payment_due_at are
-    # EDS-only figures (get_summary sums only the EDS base+extra plans), so a
-    # stale-EDS tenant with next_cycle_quantity>0 would see a charge/date for a
-    # retired skill. Recompute display-only, excluding disabled-feature plans.
-    # When nothing non-EDS renews → return 0 / null (the SPA hides the payment
-    # banner). Non-disabled tenants keep the get_summary figures unchanged.
-    if is_feature_disabled("eds_monitor"):
-        next_amount_rub, next_due = billing.compute_display_next_payment(ctx.tenant_id)
-    else:
-        next_amount_rub, next_due = summary.next_amount_rub, summary.next_payment_due_at
+    # #181 Phase B: next-payment figures are derived from the renewable non-EDS
+    # subscriptions (voice / housewife). When nothing renews → 0 / null and the
+    # SPA hides the payment banner.
+    next_amount_rub, next_due = billing.next_payment_for_display(ctx.tenant_id)
 
     return {
         "next_payment_due_at": _iso(next_due),
@@ -618,109 +609,6 @@ def _is_active(sub: TenantSubscription | None, now: datetime) -> bool:
     if active_until <= now:
         return False
     return sub.status in {"active", "scheduled_for_cancel"}
-
-
-def _build_eds_subscriptions(
-    session: Session,
-    summary,
-    tenant_id: str,
-    base_plan: SubscriptionPlan | None,
-    extra_plan: SubscriptionPlan | None,
-) -> list[dict]:
-    """Build per-slot EDS subscription cards for the EDS detail page."""
-    result: list[dict] = []
-    accounts = summary.connected_accounts or []
-
-    # Map accounts by role/index for slot assignment
-    active_accounts = [a for a in accounts if not a.scheduled_for_disconnect]
-    disconnecting_accounts = [a for a in accounts if a.scheduled_for_disconnect]
-
-    if summary.base_active and base_plan:
-        # Base subscription card
-        base_account = None
-        for acc in active_accounts:
-            if acc.account_role != "extra":
-                base_account = acc
-                break
-        if base_account is None and active_accounts:
-            base_account = active_accounts[0]
-
-        card: dict = {
-            "title": "EDS Monitor",
-            "price_rub": base_plan.price_rub,
-            "active_until": _iso(summary.base_active_until),
-            "status": "scheduled_for_cancel" if summary.base_cancel_at_period_end else "active",
-            "can_cancel": not summary.base_cancel_at_period_end,
-            "cancel_type": "base",
-            "slot_type": "base",
-            "is_free_slot": False,
-            "account": None,
-        }
-        if base_account:
-            card["account"] = _account_dict(base_account)
-            active_accounts = [a for a in active_accounts if a.tenant_eds_account_id != base_account.tenant_eds_account_id]
-        elif summary.free_count > 0:
-            card["is_free_slot"] = True
-        result.append(card)
-
-    # Extra subscription cards
-    extra_price = extra_plan.price_rub if extra_plan else 2990
-
-    for i in range(summary.extra_quantity):
-        acc = active_accounts[i] if i < len(active_accounts) else None
-        is_free = acc is None
-
-        # A free slot (paid but no cabinet attached) should be
-        # cancel-able right from the card — otherwise the user has a
-        # paid slot they can't get rid of unless they first attach a
-        # cabinet. slot_type="free" routes the JS to window._removeSlot.
-        card = {
-            "title": "Доп. кабинет EDS",
-            "price_rub": extra_price,
-            "active_until": _iso(summary.extra_active_until),
-            "status": "active",
-            "can_cancel": is_free,
-            "cancel_type": "extra",
-            "slot_type": "free" if is_free else "extra",
-            "is_free_slot": is_free,
-            "account": _account_dict(acc) if acc else None,
-        }
-        # Already scheduled for removal at period end — keep the same
-        # labelling as the free-slot case so the UI is consistent.
-        if i >= summary.extra_next_cycle_quantity and summary.extra_next_cycle_quantity < summary.extra_quantity:
-            card["slot_type"] = "free"
-            card["can_cancel"] = True
-        result.append(card)
-
-    # Disconnecting accounts (shown in their slots)
-    for acc in disconnecting_accounts:
-        already_shown = any(
-            c.get("account") and c["account"]["id"] == acc.tenant_eds_account_id
-            for c in result
-        )
-        if not already_shown:
-            card = {
-                "title": "Доп. кабинет EDS",
-                "price_rub": extra_price,
-                "active_until": _iso(summary.extra_active_until),
-                "status": "active",
-                "can_cancel": False,
-                "cancel_type": "extra",
-                "slot_type": "extra",
-                "is_free_slot": False,
-                "account": _account_dict(acc),
-            }
-            result.append(card)
-
-    return result
-
-
-def _account_dict(acc) -> dict:
-    return {
-        "id": acc.tenant_eds_account_id,
-        "login_masked": acc.login_masked,
-        "status": acc.status,
-    }
 
 
 def _iso(dt) -> str | None:
@@ -774,9 +662,9 @@ def get_plans(
                 "billing_period_days": p.billing_period_days,
             }
             for p in plans
-            # #181: retired skills (eds_monitor) are tombstoned out of the
-            # catalog. The plan rows + PLAN_EDS_* seeds stay (quarantine);
-            # only the public listing drops them.
+            # Generic guard: a retired skill's plans are dropped from the public
+            # catalog. EDS Monitor (#181) is fully removed — its rows no longer
+            # exist; this keeps the guard for any future skill retirement.
             if not is_feature_disabled(p.feature_key)
         ]
     }
@@ -796,21 +684,21 @@ def subscribe(
     billing = BillingService(session)
     plan_key = body.plan_key
 
-    if plan_key == PLAN_EDS_MONITOR_BASE:
-        result = billing.start_base_subscription(ctx.tenant_id)
-    elif plan_key == PLAN_EDS_MONITOR_EXTRA:
-        result = billing.add_extra_eds_account(ctx.tenant_id)
-    else:
-        # Generic simple-skill path: any plan_key that exists in
-        # subscription_plans with a feature_key can be (un)subscribed
-        # via start_simple_subscription. Covers voice, housewife, any
-        # future simple skill without per-skill branching.
-        plan = session.query(SubscriptionPlan).filter(
-            SubscriptionPlan.plan_key == plan_key
-        ).one_or_none()
-        if plan is None:
-            raise HTTPException(status_code=400, detail="unknown_plan")
-        result = billing.start_simple_subscription(ctx.tenant_id, plan_key)
+    # #181 Phase B: EDS Monitor retired — old EDS plan_keys answer the disabled
+    # tombstone (200, no mutation) instead of routing to the removed mutators.
+    if plan_key in _EDS_PLAN_KEYS:
+        return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
+
+    # Generic simple-skill path: any plan_key that exists in subscription_plans
+    # with a feature_key can be (un)subscribed via start_simple_subscription.
+    # Covers voice, housewife, any future simple skill without per-skill
+    # branching.
+    plan = session.query(SubscriptionPlan).filter(
+        SubscriptionPlan.plan_key == plan_key
+    ).one_or_none()
+    if plan is None:
+        raise HTTPException(status_code=400, detail="unknown_plan")
+    result = billing.start_simple_subscription(ctx.tenant_id, plan_key)
 
     return {"ok": True, "message": result.message_text}
 
@@ -824,15 +712,16 @@ def cancel(
     billing = BillingService(session)
     plan_key = body.plan_key
 
-    if plan_key == PLAN_EDS_MONITOR_BASE:
-        result = billing.cancel_base_at_period_end(ctx.tenant_id)
-    else:
-        plan = session.query(SubscriptionPlan).filter(
-            SubscriptionPlan.plan_key == plan_key
-        ).one_or_none()
-        if plan is None:
-            raise HTTPException(status_code=400, detail="unknown_plan")
-        result = billing.cancel_simple_subscription(ctx.tenant_id, plan_key)
+    # #181 Phase B: EDS Monitor retired — disabled tombstone for old EDS keys.
+    if plan_key in _EDS_PLAN_KEYS:
+        return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
+
+    plan = session.query(SubscriptionPlan).filter(
+        SubscriptionPlan.plan_key == plan_key
+    ).one_or_none()
+    if plan is None:
+        raise HTTPException(status_code=400, detail="unknown_plan")
+    result = billing.cancel_simple_subscription(ctx.tenant_id, plan_key)
 
     return {"ok": True, "message": result.message_text}
 
@@ -843,14 +732,9 @@ def resume(
     session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-
-    if body.plan_key == PLAN_EDS_MONITOR_BASE:
-        result = billing.resume_base_renewal(ctx.tenant_id)
-    else:
-        raise HTTPException(status_code=400, detail="unknown_plan")
-
-    return {"ok": True, "message": result.message_text}
+    # #181 Phase B: resume only ever applied to the EDS base subscription, which
+    # is retired. Disabled tombstone (200, no mutation).
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/renew")
@@ -868,98 +752,66 @@ def renew(
 # ---------------------------------------------------------------------------
 
 
+# #181 Phase B: EDS Monitor is fully retired (engine, billing read-path and
+# DB tables removed). The /api/v1/eds/* routes below stay as hardcoded
+# tombstones so old Mini App clients / deep-links get a clean "отключено"
+# answer (200, no mutation) instead of a 404/500.
+
+
 @router.get("/api/v1/eds/accounts")
 def list_eds_accounts(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    # #181: eds_monitor retired — this READ route is tombstoned. Short-circuit
-    # to an empty accounts shape WITHOUT reading EDS account details, so a
-    # migrated tenant's stale TenantEDSAccount rows never leak back to the SPA.
-    # (The POST /api/v1/eds/* routes mutate via billing / EDSConnectService,
-    # which are already no-op/disabled — this is the only EDS READ route.)
-    if is_feature_disabled("eds_monitor"):
-        return {"accounts": []}
-    billing = BillingService(session)
-    summary = billing.get_summary(ctx.tenant_id)
-    return {
-        "accounts": [_account_dict(a) for a in summary.connected_accounts],
-    }
+    return {"accounts": []}
 
 
 @router.post("/api/v1/eds/accounts/{account_id}/cancel")
 def cancel_eds_account(
     account_id: str,
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.schedule_connected_eds_account_cancel(ctx.tenant_id, account_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/eds/accounts/{account_id}/restore")
 def restore_eds_account(
     account_id: str,
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.restore_connected_eds_account_cancel(ctx.tenant_id, account_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/eds/slot/remove")
 def remove_eds_slot(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.remove_extra_account_at_period_end(ctx.tenant_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/eds/slot/restore")
 def restore_eds_slot(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.restore_extra_account_slot(ctx.tenant_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 # ---------------------------------------------------------------------------
-# JSON API — EDS connect (create session + return form URL)
+# JSON API — EDS connect (retired tombstone)
 # ---------------------------------------------------------------------------
 
 
 @router.post("/api/v1/eds/connect")
 def eds_connect(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    """#181: eds_monitor retired — tombstone. Phase 1 already short-circuited
-    this route via the EDSConnectService disabled guard (which raised
-    "feature_disabled" → ``{"ok": False, ...}``). Phase 2: the service was
-    removed with its module, so the disabled response is inlined here with no
-    DB mutation."""
     return {"ok": False, "message": DISABLED_FEATURE_MESSAGE, "connect_url": None}
 
 
 @router.post("/api/v1/eds/add-and-connect")
 def eds_add_and_connect(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    """#181: eds_monitor retired — tombstone. The billing mutator
-    ``add_extra_eds_account`` is itself disabled (quarantined read/early-reject
-    path), so it returns the disabled message with no DB write; the connect-link
-    step is gone with EDSConnectService. Mirrors the Phase 1 shape (the
-    ConnectSessionError branch): no connect_url, the billing message echoed."""
-    billing = BillingService(session)
-    result = billing.add_extra_eds_account(ctx.tenant_id)
-    return {"ok": True, "message": result.message_text, "connect_url": None}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE, "connect_url": None}
 
 
 # ---------------------------------------------------------------------------

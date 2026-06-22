@@ -16,15 +16,12 @@ from sreda.db.models.core import (
     OutboxMessage,
     SecureRecord,
     Tenant,
-    TenantFeature,
     User,
     Workspace,
 )
-from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState
 from sreda.db.session import get_engine, get_session_factory
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.main import create_app
-from sreda.services.billing import BillingService
 from sreda.services.secure_storage import load_secure_json
 
 EXISTING_CHAT_ID = "100000003"
@@ -412,10 +409,10 @@ def test_telegram_webhook_handles_connect_subscription_callback(
     _wait_for(lambda: len(answered_callbacks) == 1 and len(sent_messages) == 1)
     assert len(answered_callbacks) == 1
     assert len(sent_messages) == 1
-    # #181: eds_monitor retired. The legacy connect callback still routes
-    # (no 404 / silent drop) but the billing mutator is a disabled no-op —
-    # the reply is the disabled notice and NO subscription is created.
-    assert "Это умение больше не поддерживается." in sent_messages[0]["text"]
+    # #181 Phase B: eds_monitor fully retired. The legacy connect callback
+    # still routes (no 404 / silent drop) but the handler is a hardcoded
+    # tombstone — the reply is the disabled notice and NO subscription is created.
+    assert "Это умение отключено." in sent_messages[0]["text"]
 
     session = get_session_factory()()
     try:
@@ -427,107 +424,6 @@ def test_telegram_webhook_handles_connect_subscription_callback(
         session.close()
 
     assert len(subscriptions) == 0  # no-op: nothing written
-    assert len(jobs) == 1
-    assert len(runs) == 1
-    assert len(outbox) == 1
-
-
-@pytest.mark.skip(reason="EDS-monitor scrubbed 2026-05-07; obsolete pending code removal")
-def test_telegram_webhook_add_subscription_immediately_starts_eds_binding(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "test.db"
-    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
-    sent_messages: list[dict] = []
-    answered_callbacks: list[dict] = []
-
-    async def fake_send_message(
-        self,
-        chat_id: str,
-        text: str,
-        parse_mode: str | None = None,
-        reply_markup: dict | None = None,
-    ) -> dict:
-        sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
-        return {"ok": True}
-
-    async def fake_answer_callback_query(self, callback_query_id: str, text: str | None = None) -> dict:
-        answered_callbacks.append({"id": callback_query_id, "text": text})
-        return {"ok": True}
-
-    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
-    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
-    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
-    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.example.test")
-    monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
-    monkeypatch.setattr(TelegramClient, "answer_callback_query", fake_answer_callback_query)
-
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-    Base.metadata.create_all(get_engine())
-    session = get_session_factory()()
-    try:
-        # approved_at set explicitly: approval gate (2026-04-23) silent-
-        # drops tenants with NULL; existing users were auto-approved by
-        # migration, so tests mirror that.
-        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
-        session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
-        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
-        # 2026-04-27: бипасс state-machine онбординга в webhook'е
-        # (имя+форма обращения должны быть заполнены, иначе вместо
-        # обычного chat-flow приходит вопрос «как тебя зовут?»).
-        from sreda.db.models.user_profile import TenantUserProfile as _TUP
-        session.add(_TUP(
-            id="tup_test", tenant_id="tenant_1", user_id="user_1",
-            display_name="Тестовый Юзер", address_form="ty",
-        ))
-        _mark_existing_user_welcome_sent(session)
-        session.commit()
-        BillingService(session).start_base_subscription("tenant_1")
-    finally:
-        session.close()
-
-    client = TestClient(create_app())
-    payload = {
-        "update_id": 9004,
-        "callback_query": {
-            "id": "cb_add_subscription",
-            "data": "billing:add_eds_account",
-            "message": {
-                "message_id": 13,
-                "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
-            },
-        },
-    }
-
-    response = client.post("/webhooks/telegram/sreda", json=payload)
-
-    assert response.status_code == 202
-    _wait_for(lambda: len(answered_callbacks) == 1 and len(sent_messages) == 1)
-    assert len(answered_callbacks) == 1
-    # Phase: Mini-App-only UX — the reply carries a single "Открыть
-    # подписки" web_app button instead of the old per-action "Подключить
-    # ЛК EDS" inline. User continues the connect flow inside Mini App.
-    assert len(sent_messages) == 1
-    assert "Дополнительный кабинет EDS подключен." in sent_messages[0]["text"]
-    reply_markup = sent_messages[0]["reply_markup"]
-    # reply_markup may be None when base_url is unset in the test env.
-    if reply_markup is not None:
-        button = reply_markup["inline_keyboard"][0][0]
-        assert button["text"] == "Открыть подписки"
-        assert "web_app" in button
-
-    session = get_session_factory()()
-    try:
-        jobs = session.query(Job).filter(Job.job_type == "agent.execute_action").all()
-        runs = session.query(AgentRun).all()
-        outbox = session.query(OutboxMessage).all()
-    finally:
-        session.close()
-
     assert len(jobs) == 1
     assert len(runs) == 1
     assert len(outbox) == 1
@@ -775,44 +671,10 @@ def test_telegram_webhook_handles_claim_lookup_command(
             display_name="Тестовый Юзер", address_form="ty",
         ))
         _mark_existing_user_welcome_sent(session)
-        session.add(TenantFeature(id="feature_1", tenant_id="tenant_1", feature_key="eds_monitor", enabled=True))
-        session.add(
-            EDSAccount(
-                id="eds_acc_1",
-                tenant_id="tenant_1",
-                workspace_id="workspace_tg_100000003",
-                assistant_id="assistant_1",
-                tenant_eds_account_id=None,
-                site_key="mosreg",
-                account_key="eds-1",
-                label="EDS кабинет 1",
-                login_masked="***41",
-            )
-        )
-        session.add(
-            EDSClaimState(
-                id="state_1",
-                eds_account_id="eds_acc_1",
-                claim_id="6230173",
-                fingerprint_hash="hash_1",
-                status="WORK",
-                status_name="В работе",
-                last_seen_changed="2026-03-28T15:10:00+00:00",
-                last_history_order=12,
-                last_history_code="HISTORY_SOLVED",
-                last_history_date="2026-03-28T15:09:00+00:00",
-            )
-        )
-        session.add(
-            EDSChangeEvent(
-                id="evt_1",
-                eds_account_id="eds_acc_1",
-                claim_id="6230173",
-                change_type="client_updated",
-                has_new_response=True,
-                requires_user_action=False,
-            )
-        )
+        # #181 Phase B: /claim is a retired eds_monitor command — the EDS data
+        # models (EDSAccount/EDSClaimState/EDSChangeEvent) are gone, so there is
+        # nothing to seed. The handler is a hardcoded tombstone regardless of
+        # any stored state.
         session.commit()
     finally:
         session.close()

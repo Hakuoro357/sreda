@@ -303,7 +303,6 @@ def ensure_telegram_user_bundle_by_id(
         telegram_account_id=telegram_id,
         assistant_id=assistant_id,
         assistant_name="Среда",
-        eds_monitor_enabled=False,
     )
 
     # Phase 2C: auto-approve + sreda_free grant. Replaces manual
@@ -653,7 +652,6 @@ def ensure_max_user_bundle(
         max_account_id=aid,
         assistant_id=assistant_id,
         assistant_name="Среда",
-        eds_monitor_enabled=False,
     )
 
     # ensure_tenant_bundle commit'нул, теперь patch'им chat_id

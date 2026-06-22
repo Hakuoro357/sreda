@@ -17,7 +17,6 @@ class SeedRepository(Repository):
         max_account_id: str | None = None,
         assistant_id: str,
         assistant_name: str,
-        eds_monitor_enabled: bool,
     ) -> None:
         """Idempotently create / update a tenant bundle.
 
@@ -75,7 +74,6 @@ class SeedRepository(Repository):
             )
 
         self._ensure_feature(tenant_id, "core_assistant", True)
-        self._ensure_feature(tenant_id, "eds_monitor", eds_monitor_enabled)
         self.session.commit()
 
     def _ensure_feature(self, tenant_id: str, feature_key: str, enabled: bool) -> None:

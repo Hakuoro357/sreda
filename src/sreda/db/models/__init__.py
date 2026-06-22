@@ -9,7 +9,6 @@ from sreda.db.models.billing import (
 )
 from sreda.db.models.channel_linking import ChannelLinkToken
 from sreda.db.models.checklists import Checklist, ChecklistItem
-from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.conversation_turns import ConversationTurn
 from sreda.db.models.core import (
     Assistant,
@@ -72,7 +71,6 @@ __all__ = [
     "ChannelLinkToken",
     "Checklist",
     "ChecklistItem",
-    "ConnectSession",
     "ConversationTurn",
     "ReactDebugTurn",
     "PaymentOrder",
@@ -108,7 +106,6 @@ __all__ = [
     "UsageLedger",
     "Tenant",
     "TenantBillingCycle",
-    "TenantEDSAccount",
     "TenantSkillConfig",
     "TenantSkillState",
     "TenantSubscription",

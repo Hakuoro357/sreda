@@ -802,11 +802,10 @@ def admin_tenant_reset(
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    """Full tenant reset: unbind EDS cabinets, delete subscriptions,
-    skill states, all events, outbox — as if the user just registered."""
+    """Full tenant reset: delete subscriptions, skill states, all events,
+    outbox — as if the user just registered."""
     from sreda.db.models.billing import TenantSubscription  # noqa: keep cycles/orders
-    from sreda.db.models.connect import ConnectSession, TenantEDSAccount
-    from sreda.db.models.core import OutboxMessage, SecureRecord, Tenant
+    from sreda.db.models.core import OutboxMessage, Tenant
     from sreda.db.models.inbound_event import InboundEvent
     from sreda.db.models.skill_platform import TenantSkillConfig, TenantSkillState
     # Note: PaymentOrder / TenantBillingCycle are NOT deleted — FK cascades
@@ -818,28 +817,15 @@ def admin_tenant_reset(
 
     d: dict[str, int] = {}
 
-    # EDS cabinet bindings (tenant_eds_accounts) + secure records.
-    # #181 Фаза 4-A: eds_monitor-таблицы (eds_accounts/claim_state/change_events/delivery_records)
-    # дропнуты — их больше не чистим; connect-слой tenant_eds_accounts остаётся до Фазы B.
-    for ta in session.query(TenantEDSAccount).filter_by(tenant_id=tenant_id).all():
-        if ta.secure_record_id:
-            sr = session.get(SecureRecord, ta.secure_record_id)
-            if sr:
-                session.delete(sr)
-                d["secure_records"] = d.get("secure_records", 0) + 1
-        session.delete(ta)
-        d["tenant_eds_accounts"] = d.get("tenant_eds_accounts", 0) + 1
+    # #181 Фаза B: EDS Monitor полностью ретайрен — connect-слой
+    # (connect_sessions / tenant_eds_accounts) и его secure_records дропнуты
+    # миграцией; reset их больше не чистит.
 
     # Events and outbox
     d["inbound_events"] = session.query(InboundEvent).filter_by(
         tenant_id=tenant_id
     ).delete()
     d["outbox"] = session.query(OutboxMessage).filter_by(
-        tenant_id=tenant_id
-    ).delete()
-
-    # Connect sessions
-    d["connect_sessions"] = session.query(ConnectSession).filter_by(
         tenant_id=tenant_id
     ).delete()
 

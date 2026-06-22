@@ -11,28 +11,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from sreda.domain.tenants.features import is_feature_disabled
 from sreda.runtime.dispatcher import ActionEnvelope
-from sreda.runtime.handlers import (
-    ActionRuntimeError,
-    connect_reply_markup,
-    subscriptions_markup,
-)
-from sreda.services.onboarding import build_connect_eds_message
+from sreda.runtime.handlers import ActionRuntimeError
 
-# #181: EDS-feature action types whose policy checks would otherwise emit the
-# legacy "подключи EDS" / "Сначала подключи EDS" prompts. When eds_monitor is
-# retired we BYPASS those EDS-specific policy checks (return None) BEFORE they
-# run, so the action falls through to its downstream handler/service, which is
-# already tombstoned (``execute_claim_lookup`` → "Это умение отключено.";
-# ``add_extra_eds_account`` / ``EDSConnectService`` → disabled no-op/raise).
-# This guarantees BOTH stale ``TenantFeature(enabled=False)`` tenants and any
-# ``enabled=True`` leftover get the disabled tombstone, NEVER the legacy
-# connect/subscribe prompt. Passing through (vs raising here) keeps the
-# handler-level tombstone path (e.g. /claim → completed run) intact.
-_EDS_DISABLED_ACTION_TYPES = frozenset(
-    {"claim.lookup", "subscription.add_eds", "eds.connect.start", "eds.connect.retry"}
-)
+# #181 Phase B: the EDS billing-state gates (subscription.add_eds /
+# eds.connect.* / claim.lookup) that used to read ``context["billing_summary"]``
+# are gone with the retired skill. Those action types now fall straight through
+# to their tombstoned handlers (each returns "Это умение отключено."). The only
+# remaining structured precondition is the runtime-context presence check that
+# every authenticated action shares.
 
 
 def evaluate_policy(
@@ -47,48 +34,5 @@ def evaluate_policy(
             "runtime_context_missing",
             "Не удалось определить контекст пользователя для этого действия.",
         )
-
-    # #181: GLOBAL disabled bypass — runs BEFORE any EDS-specific check so a
-    # retired skill never hits its legacy "подключи EDS" prompts. Pass through
-    # to the (already-tombstoned) handler/service instead of raising here.
-    if (
-        action.action_type in _EDS_DISABLED_ACTION_TYPES
-        and is_feature_disabled("eds_monitor")
-    ):
-        return None
-
-    summary = context["billing_summary"]
-
-    # #181: ``claim.lookup`` is an eds_monitor feature. Its legacy policy checks
-    # (claim_id format validation + "подключи EDS" prompt) are gone with the
-    # skill; the GLOBAL disabled bypass above already returns None for it, and
-    # the downstream handler answers the disabled tombstone. No EDS-specific
-    # claim.lookup branch remains here.
-
-    if action.action_type == "subscription.add_eds" and not summary["base_active"]:
-        return ActionRuntimeError(
-            "subscription_required",
-            "Сначала подключи EDS Monitor, а потом можно будет добавить еще один кабинет.",
-            reply_markup=subscriptions_markup(),
-        )
-
-    if action.action_type in {"eds.connect.start", "eds.connect.retry"}:
-        if not summary["base_active"]:
-            return ActionRuntimeError(
-                "subscription_required",
-                build_connect_eds_message(
-                    base_active=False,
-                    connected_count=summary["connected_count"],
-                    allowed_count=summary["allowed_count"],
-                ),
-                reply_markup=connect_reply_markup(False),
-            )
-        if summary["free_count"] <= 0:
-            return ActionRuntimeError(
-                "limit_exceeded",
-                "Сейчас все оплаченные кабинеты уже заняты.\n\n"
-                "Если нужен еще один кабинет, сначала добавь его в подписках.",
-                reply_markup=subscriptions_markup(),
-            )
 
     return None

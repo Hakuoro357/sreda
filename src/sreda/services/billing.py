@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from math import ceil
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -15,7 +14,6 @@ from sreda.db.models.billing import (
     TenantBillingCycle,
     TenantSubscription,
 )
-from sreda.db.models.connect import TenantEDSAccount
 from sreda.db.models.core import TenantFeature, User
 from sreda.domain.tenants.features import is_feature_disabled
 
@@ -29,6 +27,11 @@ DISABLED_FEATURE_MESSAGE = "Это умение больше не поддерж
 STATUS_CALLBACK = "billing:status"
 SUBSCRIPTIONS_CALLBACK = "billing:subscriptions"
 RENEW_CALLBACK = "billing:renew"
+# #181 Phase B: EDS Monitor is fully retired (engine, billing read-path and
+# DB tables removed). The legacy EDS callback CONSTANTS below are kept ONLY so
+# the dispatcher can still map old chat buttons (pre-migration history) to the
+# tombstoned ``eds.*`` / ``subscription.*`` handlers, which answer "Это умение
+# отключено." There is no EDS code path behind them anymore.
 CONNECT_BASE_CALLBACK = "billing:connect_plan:eds_monitor_base"
 ADD_EDS_ACCOUNT_CALLBACK = "billing:add_eds_account"
 REMOVE_EDS_ACCOUNT_CALLBACK = "billing:remove_eds_account"
@@ -38,30 +41,9 @@ RESTORE_EDS_ACCOUNT_SELECT_PREFIX = "billing:restore_eds_account:select:"
 CANCEL_BASE_CALLBACK = "billing:cancel_plan:eds_monitor_base"
 RESUME_BASE_CALLBACK = "billing:resume_plan:eds_monitor_base"
 
-PLAN_EDS_MONITOR_BASE = "eds_monitor_base"
-PLAN_EDS_MONITOR_EXTRA = "eds_monitor_extra_account"
 PLAN_VOICE_TRANSCRIPTION = "voice_transcription_base"
 CONNECT_VOICE_CALLBACK = "billing:connect_plan:voice_transcription_base"
 CANCEL_VOICE_CALLBACK = "billing:cancel_plan:voice_transcription_base"
-OCCUPIED_ACCOUNT_STATUSES = {
-    "pending_verification",
-    "active",
-    "auth_failed",
-    "scheduled_for_disconnect",
-}
-CONNECTED_ACCOUNT_STATUSES = {
-    "active",
-    "scheduled_for_disconnect",
-}
-
-
-@dataclass(frozen=True, slots=True)
-class ConnectedEDSAccountSummary:
-    tenant_eds_account_id: str
-    account_role: str
-    login_masked: str
-    status: str
-    scheduled_for_disconnect: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,50 +61,15 @@ class PlanSeed:
 
 
 @dataclass(slots=True)
-class BillingSummary:
-    tenant_id: str
-    next_payment_due_at: datetime | None
-    next_amount_rub: int
-    base_active: bool
-    base_active_until: datetime | None
-    base_cancel_at_period_end: bool
-    extra_quantity: int
-    extra_next_cycle_quantity: int
-    extra_active_until: datetime | None
-    base_next_cycle_quantity: int
-    allowed_count: int
-    next_allowed_count: int
-    connected_count: int
-    free_count: int
-    connected_accounts: list[ConnectedEDSAccountSummary]
-
-
-@dataclass(slots=True)
 class SubscriptionActionResult:
     message_text: str
     reply_markup: dict
 
 
-PLAN_SEEDS: tuple[PlanSeed, ...] = (
-    PlanSeed(
-        id="plan_eds_monitor_base",
-        plan_key=PLAN_EDS_MONITOR_BASE,
-        feature_key="eds_monitor",
-        title="EDS Monitor",
-        description="Базовая подписка на мониторинг EDS. Включает 1 кабинет.",
-        price_rub=2990,
-        sort_order=10,
-    ),
-    PlanSeed(
-        id="plan_eds_monitor_extra_account",
-        plan_key=PLAN_EDS_MONITOR_EXTRA,
-        feature_key="eds_monitor",
-        title="Доп. кабинет EDS",
-        description="Дополнительный кабинет для EDS Monitor.",
-        price_rub=2990,
-        sort_order=20,
-    ),
-)
+# #181 Phase B: EDS PlanSeeds removed. No plans are auto-seeded by the engine
+# anymore (voice / housewife plans are seeded by their own skill modules). The
+# tuple stays so ``ensure_default_plans`` keeps its read-only no-op contract.
+PLAN_SEEDS: tuple[PlanSeed, ...] = ()
 
 
 class BillingService:
@@ -131,7 +78,11 @@ class BillingService:
 
     @staticmethod
     def _eds_disabled_result() -> SubscriptionActionResult:
-        """#181: no-op result for a retired skill. No DB write, no markup."""
+        """#181: no-op result for a retired skill. No DB write, no markup.
+
+        Kept as a generic guard for the simple-subscription path: if a future
+        skill is retired via ``is_feature_disabled`` its start/cancel calls
+        short-circuit here instead of mutating rows."""
         return SubscriptionActionResult(
             message_text=DISABLED_FEATURE_MESSAGE,
             reply_markup={},
@@ -197,8 +148,7 @@ class BillingService:
             "Я Среда.\n\n"
             "Сейчас я умею:\n"
             "- показывать статус аккаунта и подписок;\n"
-            "- подключать и продлевать подписки;\n"
-            "- помогать с подключением EDS."
+            "- подключать и продлевать подписки."
         )
         return text, _inline_keyboard(
             [
@@ -207,85 +157,23 @@ class BillingService:
             ]
         )
 
-    def get_summary(self, tenant_id: str, *, now: datetime | None = None) -> BillingSummary:
-        self.ensure_default_plans()
-        now = _utcnow(now)
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        cycle = self._get_cycle(tenant_id)
-
-        base_active = bool(
-            base_subscription
-            and base_subscription.quantity > 0
-            and base_subscription.active_until
-            and _coerce_utc(base_subscription.active_until) > now
-            and base_subscription.status in {"active", "scheduled_for_cancel"}
-        )
-        base_next_quantity = self._get_next_cycle_quantity(base_subscription)
-        if (
-            base_active
-            and base_subscription is not None
-            and base_subscription.quantity > 0
-            and base_next_quantity <= 0
-        ):
-            base_next_quantity = base_subscription.quantity
-        extra_quantity = extra_subscription.quantity if extra_subscription and extra_subscription.quantity > 0 else 0
-        extra_next_quantity = self._get_next_cycle_quantity(extra_subscription)
-        allowed_count = (1 if base_active else 0) + extra_quantity
-        next_allowed_count = (1 if base_next_quantity > 0 else 0) + extra_next_quantity
-        occupied_accounts = self._list_occupied_accounts(tenant_id) if allowed_count > 0 else []
-        connected_accounts = self._build_connected_account_summaries(occupied_accounts)
-        connected_count = len(connected_accounts)
-        free_count = max(allowed_count - len(occupied_accounts), 0)
-
-        next_amount_rub = 0
-        if cycle is not None:
-            if base_next_quantity > 0:
-                next_amount_rub += self._get_plan(PLAN_EDS_MONITOR_BASE).price_rub
-            if extra_next_quantity > 0:
-                next_amount_rub += self._get_plan(PLAN_EDS_MONITOR_EXTRA).price_rub * extra_next_quantity
-
-        return BillingSummary(
-            tenant_id=tenant_id,
-            next_payment_due_at=cycle.next_payment_due_at if cycle else None,
-            next_amount_rub=next_amount_rub,
-            base_active=base_active,
-            base_active_until=base_subscription.active_until if base_subscription else None,
-            base_cancel_at_period_end=bool(base_subscription and base_subscription.cancel_at_period_end),
-            extra_quantity=extra_quantity,
-            extra_next_cycle_quantity=extra_next_quantity,
-            extra_active_until=extra_subscription.active_until if extra_subscription else None,
-            base_next_cycle_quantity=base_next_quantity,
-            allowed_count=allowed_count,
-            next_allowed_count=next_allowed_count,
-            connected_count=connected_count,
-            free_count=free_count,
-            connected_accounts=connected_accounts,
-        )
-
-    def compute_display_next_payment(
+    def next_payment_for_display(
         self, tenant_id: str, *, now: datetime | None = None
     ) -> tuple[int, datetime | None]:
-        """#181 DISPLAY-only recompute of the next-payment amount + date,
-        EXCLUDING any plan whose ``feature_key`` is a retired skill.
+        """Compute the next renewal charge (amount, due date) across the
+        tenant's renewable subscriptions.
 
-        ``get_summary().next_amount_rub`` is computed purely from the EDS
-        plans (base + extra), so a stale-EDS tenant with
-        ``next_cycle_quantity > 0`` would surface a charge for a retired
-        skill. This helper re-derives the figure the SAME way
-        ``renew_cycle`` builds ``total_amount_rub`` (subscription⋈plan rows,
-        per-plan ``next_quantity`` with the EDS-base special case) but drops
-        disabled-feature plans, leaving voice / housewife / future non-EDS
-        contributions intact.
+        #181 Phase B: this replaces the EDS-centric ``get_summary`` figures.
+        It sums every renewable subscription (voice / housewife / future
+        simple skills) by joining ``TenantSubscription`` with its plan and
+        using ``next_cycle_quantity``. Plans that map to a retired skill are
+        skipped via ``is_feature_disabled`` (generic guard; currently a no-op).
 
-        Returns ``(amount_rub, due_at)``. When the recomputed amount is 0 —
-        either because there is no renewable NON-disabled subscription, or the
-        only non-EDS renewals are free (e.g. the 0 ₽ housewife plan) — this
-        returns ``(0, None)`` so the caller suppresses the "Сумма к оплате"
-        line entirely. This is READ-ONLY: it never mutates rows and never
-        calls ``get_summary``'s quarantined EDS read-path beyond plan prices.
+        Returns ``(amount_rub, due_at)``. When nothing renews — no billing
+        cycle, or only free renewals (e.g. the 0 ₽ housewife plan) — returns
+        ``(0, None)`` so the caller drops the "Сумма к оплате" line. READ-ONLY:
+        never mutates rows.
         """
-        current_time = _utcnow(now)
         cycle = self._get_cycle(tenant_id)
         if cycle is None:
             return 0, None
@@ -301,72 +189,32 @@ class BillingService:
             if is_feature_disabled(plan.feature_key):
                 continue
             next_quantity = self._get_next_cycle_quantity(subscription)
-            if (
-                plan.plan_key == PLAN_EDS_MONITOR_BASE
-                and subscription.quantity > 0
-                and subscription.active_until
-                and _coerce_utc(subscription.active_until) > current_time
-                and next_quantity <= 0
-            ):
-                next_quantity = subscription.quantity
             if next_quantity <= 0:
                 continue
             amount_rub += plan.price_rub * next_quantity
 
-        # Suppress the payment line when there is nothing to CHARGE (no
-        # non-EDS renewal, or only free renewals) — task: "сумма = 0 / нет
-        # не-EDS подписки на продление → не показывать «Сумма к оплате»".
         if amount_rub <= 0:
             return 0, None
         return amount_rub, cycle.next_payment_due_at
 
     def build_status_message(self, tenant_id: str, *, now: datetime | None = None) -> tuple[str, dict]:
-        summary = self.get_summary(tenant_id, now=now)
-        # #181 DISPLAY tombstone: suppress EDS active lines AND the "Кабинеты
-        # EDS" block when eds_monitor is retired. Non-EDS status (payment due,
-        # other active subscriptions) is unaffected. Display-only — get_summary
-        # stays quarantined, not removed.
-        eds_disabled = is_feature_disabled("eds_monitor")
-        active_lines: list[str] = []
-        if not eds_disabled and summary.base_active and summary.base_active_until:
-            active_lines.append(f"- EDS Monitor — активно до {_format_date(summary.base_active_until)}")
-        if not eds_disabled and summary.extra_quantity > 0 and summary.extra_active_until:
-            active_lines.append(
-                f"- Доп. кабинеты EDS — {summary.extra_quantity} шт., активно до {_format_date(summary.extra_active_until)}"
-            )
+        # #181 Phase B: EDS Monitor is retired — no EDS active lines, no
+        # "Кабинеты EDS" block. Active subscriptions and the payment block are
+        # derived from the non-EDS subscription rows (voice / housewife / etc.).
+        self.ensure_default_plans()
+        current_time = _utcnow(now)
+        active_lines = self._build_active_subscription_lines(tenant_id, now=current_time)
         if not active_lines:
             active_lines.append("- нет")
 
-        # #181 DISPLAY tombstone: the payment amount/date in get_summary are
-        # EDS-only, so a stale-EDS tenant would see a charge for a retired
-        # skill. Recompute display-only, excluding disabled-feature plans.
-        # If nothing non-EDS renews → suppress the payment block entirely
-        # (no "Сумма к оплате" line). Non-disabled path keeps get_summary's
-        # figures byte-for-byte.
-        if eds_disabled:
-            display_amount, display_due = self.compute_display_next_payment(tenant_id, now=now)
-        else:
-            display_amount, display_due = summary.next_amount_rub, summary.next_payment_due_at
+        display_amount, display_due = self.next_payment_for_display(tenant_id, now=current_time)
 
-        connected_account_lines = [
-            f"- {account.login_masked}{' (не продлевать)' if account.scheduled_for_disconnect else ''}"
-            for account in summary.connected_accounts
-        ]
-        eds_lines: list[str] = []
-        eds_lines.extend(connected_account_lines)
-        if summary.allowed_count > 0 and summary.connected_count < summary.allowed_count:
-            eds_lines.append(
-                f"- подключено кабинетов: {summary.connected_count} из {summary.allowed_count}"
-            )
-
-        payment_block = ""
-        if eds_disabled and display_due is None:
-            # Nothing non-EDS to renew → omit the payment lines completely.
+        if display_due is None:
+            # Nothing to renew → omit the payment lines completely.
             payment_block = ""
         else:
-            due_text = _format_date(display_due) if display_due else "не назначен"
             payment_block = (
-                f"Следующий платеж: {due_text}\n"
+                f"Следующий платеж: {_format_date(display_due)}\n"
                 f"Сумма к оплате: {display_amount} ₽\n\n"
             )
 
@@ -376,10 +224,6 @@ class BillingService:
             "Активные подписки:\n"
             f"{chr(10).join(active_lines)}"
         )
-        if not eds_disabled and (summary.allowed_count > 0 or summary.connected_accounts):
-            text += "\n\nКабинеты EDS:"
-            if eds_lines:
-                text += f"\n{chr(10).join(eds_lines)}"
 
         buttons: list[list[dict]] = [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
         return text, _inline_keyboard(buttons)
@@ -393,38 +237,19 @@ class BillingService:
     ) -> tuple[str, dict]:
         """Render the /subscriptions message + markup.
 
-        ``connect_button_override`` — if set, replaces the default
-        ``callback_data`` button for "Подключить ЛК EDS" with a
-        caller-supplied button dict (typically a ``web_app``-backed
-        one carrying a pre-generated one-time connect URL). Lets the
-        dispatcher skip the intermediate "click to open" step and
-        launch the connect UI with a single tap.
-        """
-        summary = self.get_summary(tenant_id, now=now)
-        base_plan = self._get_plan(PLAN_EDS_MONITOR_BASE)
-        extra_plan = self._get_plan(PLAN_EDS_MONITOR_EXTRA)
-        next_cycle_free_slots = self._get_free_slots_for_next_cycle(tenant_id)
-        # #181 DISPLAY tombstone: when eds_monitor is retired, suppress every
-        # EDS active/available LINE and every EDS BUTTON in this legacy
-        # subscriptions view (reachable when connect_public_base_url is unset).
-        # Voice and the navigation button stay. This is display-only — the
-        # billing read-path / get_summary remain quarantined, not removed.
-        eds_disabled = is_feature_disabled("eds_monitor")
+        #181 Phase B: the EDS connect/add/remove/restore UI is gone. Only the
+        non-EDS simple subscriptions (currently voice transcription) remain.
+        ``connect_button_override`` is accepted for signature stability but is
+        no longer used (it carried the EDS connect-link button)."""
+        self.ensure_default_plans()
+        current_time = _utcnow(now)
 
         # Voice transcription subscription state
         voice_plan = self._get_plan_optional(PLAN_VOICE_TRANSCRIPTION)
         voice_sub = self._get_subscription_optional(tenant_id, PLAN_VOICE_TRANSCRIPTION)
-        voice_active = self._is_subscription_active(voice_sub, _utcnow(now)) if voice_sub else False
+        voice_active = self._is_subscription_active(voice_sub, current_time) if voice_sub else False
 
         active_lines: list[str] = []
-        if not eds_disabled and summary.base_active and summary.base_active_until:
-            active_lines.append(
-                f"- {base_plan.title} — {base_plan.price_rub} ₽ / 30 дней, активно до {_format_date(summary.base_active_until)}"
-            )
-        if not eds_disabled and summary.extra_quantity > 0 and summary.extra_active_until:
-            active_lines.append(
-                f"- {extra_plan.title} — {summary.extra_quantity} × {extra_plan.price_rub} ₽ / 30 дней, активно до {_format_date(summary.extra_active_until)}"
-            )
         if voice_active and voice_sub and voice_plan:
             price_label = f"{voice_plan.price_rub} ₽ / 30 дней" if voice_plan.price_rub > 0 else "бесплатно"
             active_lines.append(
@@ -437,11 +262,6 @@ class BillingService:
             active_block = "Подключенных подписок пока нет."
 
         available_lines = []
-        if not eds_disabled:
-            if not summary.base_active:
-                available_lines.append(f"- {base_plan.title} — {base_plan.price_rub} ₽ / 30 дней")
-            elif summary.base_active:
-                available_lines.append(f"- {extra_plan.title} — {extra_plan.price_rub} ₽ / 30 дней")
         if not voice_active and voice_plan:
             price_label = f"{voice_plan.price_rub} ₽ / 30 дней" if voice_plan.price_rub > 0 else "бесплатно"
             available_lines.append(f"- {voice_plan.title} — {price_label}")
@@ -450,33 +270,6 @@ class BillingService:
         text = f"Подписки\n\n{active_block}\n\n{available_block}"
 
         buttons: list[list[dict]] = []
-        if eds_disabled:
-            # #181: emit NO EDS buttons (connect/add/remove/restore). Only the
-            # voice toggle (below) + navigation button remain.
-            pass
-        elif not summary.base_active:
-            buttons.append([{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}])
-        else:
-            buttons.append([{"text": "Добавить подписку на EDS", "callback_data": ADD_EDS_ACCOUNT_CALLBACK}])
-            if summary.free_count > 0:
-                if connect_button_override is not None:
-                    buttons.append([connect_button_override])
-                else:
-                    buttons.append([{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}])
-            for account in summary.connected_accounts:
-                if account.scheduled_for_disconnect:
-                    continue
-                buttons.append(
-                    [
-                        {
-                            "text": f"Убрать {account.login_masked}",
-                            "callback_data": f"{REMOVE_EDS_ACCOUNT_SELECT_PREFIX}{account.tenant_eds_account_id}",
-                        }
-                    ]
-                )
-            if next_cycle_free_slots > 0:
-                buttons.append([{"text": "Убрать свободную подписку на EDS", "callback_data": REMOVE_EDS_ACCOUNT_CALLBACK}])
-            buttons.extend(self._build_restore_rows(tenant_id, summary, now=now))
         # Voice transcription toggle
         if voice_plan:
             if not voice_active:
@@ -486,210 +279,22 @@ class BillingService:
         buttons.append([{"text": "Мой статус", "callback_data": STATUS_CALLBACK}])
         return text, _inline_keyboard(buttons)
 
-    def start_base_subscription(
-        self,
-        tenant_id: str,
-        *,
-        now: datetime | None = None,
-        connect_button_override: dict | None = None,
-    ) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        self.ensure_default_plans()
-        current_time = _utcnow(now)
-        existing = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        if self._is_subscription_active(existing, current_time):
-            return SubscriptionActionResult(
-                message_text=(
-                    f"Подписка уже активна до {_format_date(existing.active_until)}."
-                    if existing and existing.active_until
-                    else "Подписка уже активна."
-                ),
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                        [{"text": "Не продлевать", "callback_data": CANCEL_BASE_CALLBACK}],
-                    ]
-                ),
+    def _build_active_subscription_lines(
+        self, tenant_id: str, *, now: datetime
+    ) -> list[str]:
+        """Active non-EDS subscription lines for the status message.
+
+        #181 Phase B: currently only voice transcription has a status line;
+        housewife is shown via the Mini App skill cards, not the chat status.
+        """
+        lines: list[str] = []
+        voice_plan = self._get_plan_optional(PLAN_VOICE_TRANSCRIPTION)
+        voice_sub = self._get_subscription_optional(tenant_id, PLAN_VOICE_TRANSCRIPTION)
+        if voice_plan and voice_sub and self._is_subscription_active(voice_sub, now):
+            lines.append(
+                f"- {voice_plan.title} — активно до {_format_date(voice_sub.active_until)}"
             )
-
-        cycle = self._get_cycle(tenant_id)
-        plan = self._get_plan(PLAN_EDS_MONITOR_BASE)
-        if cycle is None or cycle.status == "expired" or _ensure_aware(cycle.next_payment_due_at) <= current_time:
-            cycle = TenantBillingCycle(
-                id=f"cycle_{uuid4().hex[:24]}",
-                tenant_id=tenant_id,
-                billing_anchor_at=current_time,
-                next_payment_due_at=current_time + timedelta(days=plan.billing_period_days),
-                currency="RUB",
-                status="active",
-            )
-            self.session.add(cycle)
-            order_type = "initial_purchase"
-            amount_rub = plan.price_rub
-            period_start = current_time
-            period_end = cycle.next_payment_due_at
-            calculation_type = "full_cycle"
-        else:
-            order_type = "proration_purchase"
-            amount_rub = _calculate_proration(plan.price_rub, cycle.next_payment_due_at, current_time)
-            period_start = current_time
-            period_end = cycle.next_payment_due_at
-            calculation_type = "proration"
-
-        order = self._create_paid_stub_order(
-            tenant_id=tenant_id,
-            cycle=cycle,
-            order_type=order_type,
-            amount_rub=amount_rub,
-            description=f"Подключение {plan.title}",
-        )
-        self.session.add(
-            PaymentOrderItem(
-                id=f"poi_{uuid4().hex[:24]}",
-                payment_order_id=order.id,
-                plan_id=plan.id,
-                amount_rub=amount_rub,
-                quantity=1,
-                period_start=period_start,
-                period_end=period_end,
-                calculation_type=calculation_type,
-            )
-        )
-
-        if existing is None:
-            existing = TenantSubscription(
-                id=f"sub_{uuid4().hex[:24]}",
-                tenant_id=tenant_id,
-                plan_id=plan.id,
-            )
-            self.session.add(existing)
-
-        existing.status = "active"
-        existing.starts_at = current_time
-        existing.active_until = cycle.next_payment_due_at
-        existing.cancel_at_period_end = False
-        existing.quantity = 1
-        existing.next_cycle_quantity = 1
-        existing.last_payment_order_id = order.id
-        existing.updated_at = current_time
-
-        self._ensure_feature_enabled(tenant_id, "eds_monitor", True)
-        self.session.commit()
-
-        summary = self.get_summary(tenant_id, now=current_time)
-        return SubscriptionActionResult(
-            message_text=(
-                "Подписка EDS Monitor подключена.\n\n"
-                f"Активно до: {_format_date(existing.active_until)}\n"
-                f"Следующий платеж: {_format_date(summary.next_payment_due_at)}\n"
-                f"Сумма следующего платежа: {summary.next_amount_rub} ₽"
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [connect_button_override]
-                    if connect_button_override is not None
-                    else [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                ]
-            ),
-        )
-
-    def add_extra_eds_account(
-        self,
-        tenant_id: str,
-        *,
-        now: datetime | None = None,
-        connect_button_override: dict | None = None,
-    ) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        self.ensure_default_plans()
-        current_time = _utcnow(now)
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        if not self._is_subscription_active(base_subscription, current_time):
-            return SubscriptionActionResult(
-                message_text=(
-                    "Сначала подключи EDS Monitor, а потом можно будет добавить еще один кабинет."
-                ),
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подключить", "callback_data": CONNECT_BASE_CALLBACK}],
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        cycle = self._get_cycle(tenant_id)
-        if cycle is None:
-            raise RuntimeError(
-                f"tenant {tenant_id} has an active base subscription but no billing cycle"
-            )
-        plan = self._get_plan(PLAN_EDS_MONITOR_EXTRA)
-        amount_rub = _calculate_proration(plan.price_rub, cycle.next_payment_due_at, current_time)
-
-        order = self._create_paid_stub_order(
-            tenant_id=tenant_id,
-            cycle=cycle,
-            order_type="proration_purchase",
-            amount_rub=amount_rub,
-            description="Подключение дополнительного кабинета EDS",
-        )
-        self.session.add(
-            PaymentOrderItem(
-                id=f"poi_{uuid4().hex[:24]}",
-                payment_order_id=order.id,
-                plan_id=plan.id,
-                amount_rub=amount_rub,
-                quantity=1,
-                period_start=current_time,
-                period_end=cycle.next_payment_due_at,
-                calculation_type="proration",
-            )
-        )
-
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        if extra_subscription is None:
-            next_quantity = 0
-            extra_subscription = TenantSubscription(
-                id=f"sub_{uuid4().hex[:24]}",
-                tenant_id=tenant_id,
-                plan_id=plan.id,
-            )
-            self.session.add(extra_subscription)
-            current_quantity = 0
-        else:
-            current_quantity = extra_subscription.quantity
-            next_quantity = self._get_next_cycle_quantity(extra_subscription)
-        extra_subscription.status = "active"
-        extra_subscription.starts_at = extra_subscription.starts_at or current_time
-        extra_subscription.active_until = cycle.next_payment_due_at
-        extra_subscription.cancel_at_period_end = False
-        extra_subscription.quantity = current_quantity + 1
-        extra_subscription.next_cycle_quantity = max(next_quantity, current_quantity) + 1
-        extra_subscription.last_payment_order_id = order.id
-        extra_subscription.updated_at = current_time
-
-        self.session.commit()
-        summary = self.get_summary(tenant_id, now=current_time)
-        return SubscriptionActionResult(
-            message_text=(
-                "Дополнительный кабинет EDS подключен.\n\n"
-                f"Теперь доступно кабинетов: {summary.allowed_count}\n"
-                f"Следующий платеж: {_format_date(summary.next_payment_due_at)}\n"
-                f"Сумма следующего платежа: {summary.next_amount_rub} ₽"
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [connect_button_override]
-                    if connect_button_override is not None
-                    else [{"text": "Подключить ЛК EDS", "callback_data": "onboarding:connect_eds"}],
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                ]
-            ),
-        )
+        return lines
 
     def renew_cycle(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
         self.ensure_default_plans()
@@ -712,11 +317,10 @@ class BillingService:
             .filter(TenantSubscription.tenant_id == tenant_id)
             .all()
         )
-        # #181 PARTITION: drop disabled-skill subscriptions (eds_monitor) from
-        # the source iteration entirely. They must NOT enter ``renewable_items``
-        # NOR the implicit expire-loop below (which would set them expired /
-        # quantity=0). Filtering both lists here keeps every disabled-EDS row
-        # byte-for-byte. Non-EDS subs (voice/housewife) renew as usual.
+        # #181 PARTITION: drop disabled-skill subscriptions from the source
+        # iteration entirely (generic guard; currently a no-op). They must NOT
+        # enter ``renewable_items`` NOR the implicit expire-loop below. Non-EDS
+        # subs (voice/housewife) renew as usual.
         subscription_plan_rows = [
             row
             for row in subscription_plan_rows
@@ -727,14 +331,6 @@ class BillingService:
         total_amount_rub = 0
         for subscription, plan in subscription_plan_rows:
             next_quantity = self._get_next_cycle_quantity(subscription)
-            if (
-                plan.plan_key == PLAN_EDS_MONITOR_BASE
-                and subscription.quantity > 0
-                and subscription.active_until
-                and _coerce_utc(subscription.active_until) > current_time
-                and next_quantity <= 0
-            ):
-                next_quantity = subscription.quantity
             if next_quantity <= 0:
                 continue
             renewable_items.append((subscription, plan, next_quantity))
@@ -789,42 +385,15 @@ class BillingService:
         cycle.status = "active"
         cycle.updated_at = current_time
 
-        # #181: skip the unconditional eds_monitor feature re-sync and the
-        # EDS-account renewal-state mutation for a retired skill — both would
-        # touch disabled-EDS rows. Non-EDS renewals above are unaffected.
-        if not is_feature_disabled("eds_monitor"):
-            base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-            self._ensure_feature_enabled(
-                tenant_id,
-                "eds_monitor",
-                bool(base_subscription and base_subscription.quantity > 0 and base_subscription.status == "active"),
-            )
-            self._apply_tenant_eds_account_renewal_state(tenant_id)
         self.session.commit()
 
-        summary = self.get_summary(tenant_id, now=current_time)
-        # #181 DISPLAY tombstone: renew_cycle is intentionally NOT disabled (it
-        # renews voice/housewife), but its success message rendered
-        # ``summary.next_amount_rub`` / ``next_payment_due_at`` straight from
-        # get_summary, which sums ONLY the EDS base+extra plans. A stale-EDS
-        # tenant (eds next_cycle_quantity>0) renewing voice would therefore see
-        # a phantom charge for the retired skill. Recompute display-only via the
-        # SAME helper build_status_message uses — excluding disabled-feature
-        # plans — so the voice/housewife figure stays correct (299 ₽) and the
-        # EDS contribution never surfaces. When the disabled-aware recompute
-        # finds nothing non-EDS to charge (due is None) the payment line is
-        # dropped entirely. Non-disabled tenants keep get_summary byte-for-byte.
-        if is_feature_disabled("eds_monitor"):
-            display_amount, display_due = self.compute_display_next_payment(
-                tenant_id, now=current_time
-            )
-        else:
-            display_amount, display_due = (
-                summary.next_amount_rub,
-                summary.next_payment_due_at,
-            )
-
-        if is_feature_disabled("eds_monitor") and display_due is None:
+        # #181 Phase B: success message reflects the post-renewal next charge,
+        # computed across the non-EDS subscriptions just renewed. When nothing
+        # remains to renew (due is None) the payment line is dropped.
+        display_amount, display_due = self.next_payment_for_display(
+            tenant_id, now=current_time
+        )
+        if display_due is None:
             payment_block = ""
         else:
             payment_block = (
@@ -839,288 +408,6 @@ class BillingService:
                 [
                     [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
                     [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                ]
-            ),
-        )
-
-    def cancel_base_at_period_end(self, tenant_id: str) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
-            return SubscriptionActionResult(
-                message_text="Подписка EDS Monitor сейчас не активна.",
-                reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
-            )
-        subscription.cancel_at_period_end = True
-        subscription.next_cycle_quantity = 0
-        subscription.status = "scheduled_for_cancel"
-        subscription.updated_at = _utcnow()
-        self.session.commit()
-        return SubscriptionActionResult(
-            message_text=(
-                "Подписка не будет продлеваться дальше.\n\n"
-                f"Подписка будет активна до: {_format_date(subscription.active_until)}\n"
-                "После этой даты она завершится, если ее не продлить вручную."
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                ]
-            ),
-        )
-
-    def resume_base_renewal(self, tenant_id: str) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        if subscription is None or subscription.quantity <= 0 or subscription.active_until is None:
-            return SubscriptionActionResult(
-                message_text="Подписка EDS Monitor сейчас не активна.",
-                reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
-            )
-
-        subscription.cancel_at_period_end = False
-        subscription.next_cycle_quantity = max(subscription.quantity, 1)
-        subscription.status = "active"
-        subscription.updated_at = _utcnow()
-        self.session.commit()
-        return SubscriptionActionResult(
-            message_text=(
-                "Продление EDS Monitor снова включено.\n\n"
-                f"Подписка активна до: {_format_date(subscription.active_until)}\n"
-                "Она будет продлена в следующий платежный цикл."
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                ]
-            ),
-        )
-
-    def remove_extra_account_at_period_end(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        current_time = _utcnow(now)
-        summary = self.get_summary(tenant_id, now=current_time)
-        if summary.allowed_count <= 0:
-            return SubscriptionActionResult(
-                message_text="Сейчас нет подписок EDS, которые можно убрать.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        next_cycle_free_slots = self._get_free_slots_for_next_cycle(tenant_id)
-        if next_cycle_free_slots <= 0:
-            return SubscriptionActionResult(
-                message_text="Сейчас нет свободной подписки EDS, которую можно убрать.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        self._decrement_next_cycle_free_slot(tenant_id)
-        self.session.commit()
-        next_allowed_count = self._get_next_allowed_count(tenant_id)
-        active_until = self._get_active_until_for_eds(tenant_id)
-
-        return SubscriptionActionResult(
-            message_text=(
-                "Свободная подписка на EDS не будет продлеваться в следующий период.\n\n"
-                f"До {_format_date(active_until)} текущая емкость подписки сохранится.\n"
-                f"После этой даты число доступных кабинетов уменьшится до {next_allowed_count}."
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                ]
-            ),
-        )
-
-    def schedule_connected_eds_account_cancel(
-        self,
-        tenant_id: str,
-        tenant_eds_account_id: str,
-    ) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        tenant_account = self.session.get(TenantEDSAccount, tenant_eds_account_id)
-        if tenant_account is None or tenant_account.tenant_id != tenant_id:
-            return SubscriptionActionResult(
-                message_text="Не удалось найти выбранный кабинет.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        if tenant_account.status not in CONNECTED_ACCOUNT_STATUSES:
-            return SubscriptionActionResult(
-                message_text="Выбранный кабинет уже не активен.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        if tenant_account.status == "scheduled_for_disconnect":
-            return SubscriptionActionResult(
-                message_text=(
-                    f"Кабинет {tenant_account.login_masked} уже помечен как не продленный на следующий период."
-                ),
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        decremented_plan_key = self._decrement_next_cycle_slot_for_account(tenant_account)
-        if decremented_plan_key is None:
-            return SubscriptionActionResult(
-                message_text="Сейчас этот кабинет нельзя снять с продления.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        tenant_account.status = "scheduled_for_disconnect"
-        tenant_account.updated_at = _utcnow()
-        self.session.commit()
-
-        next_allowed_count = self._get_next_allowed_count(tenant_id)
-        active_until = self._get_active_until_for_eds(tenant_id)
-
-        return SubscriptionActionResult(
-            message_text=(
-                f"Кабинет {tenant_account.login_masked} не будет продлеваться на следующий период.\n\n"
-                f"До {_format_date(active_until)} он останется активным.\n"
-                f"После этой даты число доступных кабинетов уменьшится до {next_allowed_count}."
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [
-                        {
-                            "text": f"Вернуть {tenant_account.login_masked}",
-                            "callback_data": f"{RESTORE_EDS_ACCOUNT_SELECT_PREFIX}{tenant_account.id}",
-                        }
-                    ],
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                ]
-            ),
-        )
-
-    def restore_extra_account_slot(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        current_time = _utcnow(now)
-        if self._get_removed_free_slot_count(tenant_id, now=current_time) <= 0:
-            return SubscriptionActionResult(
-                message_text="Сейчас нет свободной подписки EDS, которую можно вернуть.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        self._restore_next_cycle_free_slot(tenant_id)
-        self.session.commit()
-
-        summary = self.get_summary(tenant_id, now=current_time)
-        return SubscriptionActionResult(
-            message_text=(
-                "Свободная подписка на EDS снова будет продлена на следующий период.\n\n"
-                f"Следующий платеж: {_format_date(summary.next_payment_due_at)}\n"
-                f"Сумма следующего платежа: {summary.next_amount_rub} ₽"
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                ]
-            ),
-        )
-
-    def restore_connected_eds_account_cancel(
-        self,
-        tenant_id: str,
-        tenant_eds_account_id: str,
-        *,
-        now: datetime | None = None,
-    ) -> SubscriptionActionResult:
-        if is_feature_disabled("eds_monitor"):
-            return self._eds_disabled_result()
-        current_time = _utcnow(now)
-        tenant_account = self.session.get(TenantEDSAccount, tenant_eds_account_id)
-        if tenant_account is None or tenant_account.tenant_id != tenant_id:
-            return SubscriptionActionResult(
-                message_text="Не удалось найти выбранный кабинет.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        if tenant_account.status != "scheduled_for_disconnect":
-            return SubscriptionActionResult(
-                message_text=f"Кабинет {tenant_account.login_masked} сейчас не помечен как отмененный.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        if not self._restore_next_cycle_slot_for_account(tenant_account):
-            return SubscriptionActionResult(
-                message_text=f"Кабинет {tenant_account.login_masked} сейчас нельзя вернуть.",
-                reply_markup=_inline_keyboard(
-                    [
-                        [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                        [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
-                    ]
-                ),
-            )
-
-        tenant_account.status = "active"
-        tenant_account.updated_at = _utcnow()
-        self.session.commit()
-
-        summary = self.get_summary(tenant_id, now=current_time)
-        return SubscriptionActionResult(
-            message_text=(
-                f"Кабинет {tenant_account.login_masked} снова будет продлен на следующий период.\n\n"
-                f"Следующий платеж: {_format_date(summary.next_payment_due_at)}\n"
-                f"Сумма следующего платежа: {summary.next_amount_rub} ₽"
-            ),
-            reply_markup=_inline_keyboard(
-                [
-                    [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-                    [{"text": "Мой статус", "callback_data": STATUS_CALLBACK}],
                 ]
             ),
         )
@@ -1330,25 +617,6 @@ class BillingService:
             .first()
         )
 
-    def _get_subscription(self, tenant_id: str, plan_key: str) -> TenantSubscription | None:
-        plan = self._get_plan(plan_key)
-        return (
-            self.session.query(TenantSubscription)
-            .filter(
-                TenantSubscription.tenant_id == tenant_id,
-                TenantSubscription.plan_id == plan.id,
-            )
-            .one_or_none()
-        )
-
-    def _get_plan(self, plan_key: str) -> SubscriptionPlan:
-        plan = (
-            self.session.query(SubscriptionPlan)
-            .filter(SubscriptionPlan.plan_key == plan_key)
-            .one()
-        )
-        return plan
-
     def _get_plan_optional(self, plan_key: str) -> SubscriptionPlan | None:
         return (
             self.session.query(SubscriptionPlan)
@@ -1368,232 +636,6 @@ class BillingService:
             )
             .one_or_none()
         )
-
-    def _list_occupied_accounts(self, tenant_id: str) -> list[TenantEDSAccount]:
-        return (
-            self.session.query(TenantEDSAccount)
-            .filter(
-                TenantEDSAccount.tenant_id == tenant_id,
-                TenantEDSAccount.status.in_(tuple(OCCUPIED_ACCOUNT_STATUSES)),
-            )
-            .order_by(TenantEDSAccount.account_index.asc(), TenantEDSAccount.created_at.asc())
-            .all()
-        )
-
-    def _build_connected_account_summaries(
-        self,
-        tenant_accounts: list[TenantEDSAccount],
-    ) -> list[ConnectedEDSAccountSummary]:
-        items: list[ConnectedEDSAccountSummary] = []
-        for account in tenant_accounts:
-            if account.status not in CONNECTED_ACCOUNT_STATUSES:
-                continue
-            items.append(
-                ConnectedEDSAccountSummary(
-                    tenant_eds_account_id=account.id,
-                    account_role=account.account_role,
-                    login_masked=account.login_masked,
-                    status=account.status,
-                    scheduled_for_disconnect=account.status == "scheduled_for_disconnect",
-                )
-            )
-        return items
-
-    def _build_restore_rows(self, tenant_id: str, summary: BillingSummary, *, now: datetime | None = None) -> list[list[dict]]:
-        rows: list[list[dict]] = []
-        scheduled_accounts = [account for account in summary.connected_accounts if account.scheduled_for_disconnect]
-        if scheduled_accounts:
-            for account in scheduled_accounts:
-                rows.append(
-                    [
-                        {
-                            "text": f"Вернуть {account.login_masked}",
-                            "callback_data": f"{RESTORE_EDS_ACCOUNT_SELECT_PREFIX}{account.tenant_eds_account_id}",
-                        }
-                    ]
-                )
-        if self._get_removed_free_slot_count(tenant_id, now=now) > 0:
-            rows.append([{"text": "Вернуть свободную подписку на EDS", "callback_data": RESTORE_EDS_ACCOUNT_CALLBACK}])
-        return rows
-
-    def _get_next_allowed_count(self, tenant_id: str) -> int:
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        base_next = self._get_next_cycle_quantity(base_subscription)
-        extra_next = self._get_next_cycle_quantity(extra_subscription)
-        return (1 if base_next > 0 else 0) + extra_next
-
-    def _get_active_until_for_eds(self, tenant_id: str) -> datetime | None:
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        if base_subscription is not None and base_subscription.active_until is not None:
-            return base_subscription.active_until
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        return extra_subscription.active_until if extra_subscription is not None else None
-
-    def _get_unscheduled_occupied_count(self, tenant_id: str) -> int:
-        return sum(
-            1
-            for account in self._list_occupied_accounts(tenant_id)
-            if account.status != "scheduled_for_disconnect"
-        )
-
-    def _get_free_slots_for_next_cycle(self, tenant_id: str) -> int:
-        next_allowed_count = self._get_next_allowed_count(tenant_id)
-        return max(next_allowed_count - self._get_unscheduled_occupied_count(tenant_id), 0)
-
-    def _get_removed_free_slot_count(self, tenant_id: str, *, now: datetime | None = None) -> int:
-        summary = self.get_summary(tenant_id, now=now)
-        scheduled_connected_count = sum(
-            1 for account in summary.connected_accounts if account.scheduled_for_disconnect
-        )
-        current_available_for_next = summary.allowed_count - scheduled_connected_count
-        return max(current_available_for_next - summary.next_allowed_count, 0)
-
-    def _decrement_next_cycle_free_slot(self, tenant_id: str) -> bool:
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        if extra_subscription is not None and self._get_next_cycle_quantity(extra_subscription) > 0:
-            extra_subscription.next_cycle_quantity = max(self._get_next_cycle_quantity(extra_subscription) - 1, 0)
-            extra_subscription.status = (
-                "scheduled_for_cancel" if extra_subscription.next_cycle_quantity == 0 else "active"
-            )
-            extra_subscription.updated_at = _utcnow()
-            return True
-
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        if base_subscription is not None and self._get_next_cycle_quantity(base_subscription) > 0:
-            base_subscription.next_cycle_quantity = max(self._get_next_cycle_quantity(base_subscription) - 1, 0)
-            base_subscription.cancel_at_period_end = base_subscription.next_cycle_quantity == 0
-            base_subscription.status = (
-                "scheduled_for_cancel" if base_subscription.next_cycle_quantity == 0 else "active"
-            )
-            base_subscription.updated_at = _utcnow()
-            return True
-        return False
-
-    def _restore_next_cycle_free_slot(self, tenant_id: str) -> bool:
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-        if (
-            base_subscription is not None
-            and base_subscription.quantity > 0
-            and self._get_next_cycle_quantity(base_subscription) < base_subscription.quantity
-        ):
-            base_subscription.next_cycle_quantity = min(
-                self._get_next_cycle_quantity(base_subscription) + 1,
-                base_subscription.quantity,
-            )
-            base_subscription.cancel_at_period_end = False
-            base_subscription.status = "active"
-            base_subscription.updated_at = _utcnow()
-            return True
-
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        if (
-            extra_subscription is not None
-            and extra_subscription.quantity > 0
-            and self._get_next_cycle_quantity(extra_subscription) < extra_subscription.quantity
-        ):
-            extra_subscription.next_cycle_quantity = min(
-                self._get_next_cycle_quantity(extra_subscription) + 1,
-                extra_subscription.quantity,
-            )
-            extra_subscription.status = "active"
-            extra_subscription.updated_at = _utcnow()
-            return True
-        return False
-
-    def _decrement_next_cycle_slot_for_account(self, tenant_account: TenantEDSAccount) -> str | None:
-        tenant_id = tenant_account.tenant_id
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-
-        if tenant_account.account_role == "extra":
-            if extra_subscription is None or self._get_next_cycle_quantity(extra_subscription) <= 0:
-                return None
-            extra_subscription.next_cycle_quantity = max(self._get_next_cycle_quantity(extra_subscription) - 1, 0)
-            extra_subscription.status = (
-                "scheduled_for_cancel" if extra_subscription.next_cycle_quantity == 0 else "active"
-            )
-            extra_subscription.updated_at = _utcnow()
-            return PLAN_EDS_MONITOR_EXTRA
-
-        if extra_subscription is not None and self._get_next_cycle_quantity(extra_subscription) > 0:
-            extra_subscription.next_cycle_quantity = max(self._get_next_cycle_quantity(extra_subscription) - 1, 0)
-            extra_subscription.status = (
-                "scheduled_for_cancel" if extra_subscription.next_cycle_quantity == 0 else "active"
-            )
-            extra_subscription.updated_at = _utcnow()
-            return PLAN_EDS_MONITOR_EXTRA
-
-        if base_subscription is not None and self._get_next_cycle_quantity(base_subscription) > 0:
-            base_subscription.next_cycle_quantity = max(self._get_next_cycle_quantity(base_subscription) - 1, 0)
-            base_subscription.cancel_at_period_end = base_subscription.next_cycle_quantity == 0
-            base_subscription.status = (
-                "scheduled_for_cancel" if base_subscription.next_cycle_quantity == 0 else "active"
-            )
-            base_subscription.updated_at = _utcnow()
-            return PLAN_EDS_MONITOR_BASE
-        return None
-
-    def _restore_next_cycle_slot_for_account(self, tenant_account: TenantEDSAccount) -> bool:
-        tenant_id = tenant_account.tenant_id
-        extra_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_EXTRA)
-        base_subscription = self._get_subscription(tenant_id, PLAN_EDS_MONITOR_BASE)
-
-        if tenant_account.account_role == "extra":
-            if extra_subscription is None or extra_subscription.quantity <= 0:
-                return False
-            extra_subscription.next_cycle_quantity = min(
-                self._get_next_cycle_quantity(extra_subscription) + 1,
-                extra_subscription.quantity,
-            )
-            extra_subscription.status = "active"
-            extra_subscription.updated_at = _utcnow()
-            return True
-
-        if (
-            base_subscription is not None
-            and base_subscription.quantity > 0
-            and self._get_next_cycle_quantity(base_subscription) < base_subscription.quantity
-        ):
-            base_subscription.next_cycle_quantity = min(
-                self._get_next_cycle_quantity(base_subscription) + 1,
-                base_subscription.quantity,
-            )
-            base_subscription.cancel_at_period_end = False
-            base_subscription.status = "active"
-            base_subscription.updated_at = _utcnow()
-            return True
-
-        if (
-            extra_subscription is not None
-            and extra_subscription.quantity > 0
-            and self._get_next_cycle_quantity(extra_subscription) < extra_subscription.quantity
-        ):
-            extra_subscription.next_cycle_quantity = min(
-                self._get_next_cycle_quantity(extra_subscription) + 1,
-                extra_subscription.quantity,
-            )
-            extra_subscription.status = "active"
-            extra_subscription.updated_at = _utcnow()
-            return True
-        return False
-
-    def _apply_tenant_eds_account_renewal_state(self, tenant_id: str) -> None:
-        scheduled_accounts = (
-            self.session.query(TenantEDSAccount)
-            .filter(
-                TenantEDSAccount.tenant_id == tenant_id,
-                TenantEDSAccount.status == "scheduled_for_disconnect",
-            )
-            .order_by(TenantEDSAccount.account_index.asc(), TenantEDSAccount.created_at.asc())
-            .all()
-        )
-        if not scheduled_accounts:
-            return
-        now = _utcnow()
-        for account in scheduled_accounts:
-            account.status = "expired"
-            account.updated_at = now
 
     def _create_paid_stub_order(
         self,
@@ -1711,24 +753,10 @@ def _utcnow(value: datetime | None = None) -> datetime:
     return datetime.now(UTC)
 
 
-def _ensure_aware(dt: datetime) -> datetime:
-    """Normalize naive datetimes (e.g. from SQLite) to UTC-aware."""
-    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
-
-
 def _format_date(value: datetime | None) -> str:
     if value is None:
         return "не назначен"
     return _coerce_utc(value).strftime("%d.%m.%Y")
-
-
-def _calculate_proration(price_rub: int, next_payment_due_at: datetime, now: datetime) -> int:
-    due = _utcnow(next_payment_due_at)
-    current = _utcnow(now)
-    if due <= current:
-        return 0
-    remaining_days = max(1, ceil((due - current).total_seconds() / 86400))
-    return round(price_rub * remaining_days / 30)
 
 
 def _coerce_utc(value: datetime) -> datetime:

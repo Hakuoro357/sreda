@@ -16,7 +16,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--telegram-account-id", default="100000001")
     parser.add_argument("--assistant-id", default="assistant_demo")
     parser.add_argument("--assistant-name", default="Demo assistant")
-    parser.add_argument("--enable-eds-monitor", action="store_true")
     return parser.parse_args()
 
 
@@ -34,7 +33,6 @@ def main() -> None:
             telegram_account_id=args.telegram_account_id,
             assistant_id=args.assistant_id,
             assistant_name=args.assistant_name,
-            eds_monitor_enabled=args.enable_eds_monitor,
         )
     finally:
         session.close()

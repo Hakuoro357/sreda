@@ -1,42 +1,32 @@
-"""#181 Phase 1 — EDS (eds_monitor) deactivation regression suite.
+"""#181 Phase B — EDS (eds_monitor) FINAL-removal regression suite.
 
-Two concerns, both RED-before-implementation:
+EDS Monitor is fully retired: the engine (Phase 1/2), the eds_monitor DB
+tables (Phase 4-A) and now the connect-layer + billing read-path + connect
+tables (Phase B). This suite locks in the post-removal contract:
 
-1. **Invariant (mixed-tenant):** a tenant that migrated EDS→Среда keeps an
-   active ``housewife_assistant`` subscription, a paid
-   ``voice_transcription`` subscription, AND stale disabled-EDS rows
-   (TenantFeature ``eds_monitor``, base+extra EDS subscriptions,
-   tenant_eds_accounts, a pending ``eds.verify_account_connect`` job, an
-   EDS secure_record). After every Phase-1 deactivation:
-     - ``renew_cycle`` renews voice but leaves the EDS subscriptions AND
-       their TenantFeature byte-for-byte unchanged;
-     - the verification worker no-ops and does NOT mutate the pending
-       eds-job.
+1. **INVARIANT (critical):** a tenant that migrated EDS→Среда with an active
+   ``housewife_assistant`` subscription + a paid ``voice_transcription``
+   subscription keeps working AND renewing after EDS is gone:
+     - ``renew_cycle`` renews the voice subscription and shows the VOICE
+       amount (never an EDS amount — there are no EDS rows left);
+     - the runtime ``node_load_context`` (called every turn) does not crash
+       and no longer loads any EDS billing summary / feature flag;
+     - the generic simple-subscription path (voice/housewife) is unaffected.
 
-2. **Denylist (parametrized):** every EDS-dedicated billing mutator, the
-   generic simple-subscription mutators against an EDS plan_key, and the
-   ``FeatureRegistry`` registration methods all no-op for ``eds_monitor`` with
-   **zero DB mutations**. (#181 Phase 2: the ``EDSConnectService`` mutators
-   were DELETED — the surviving guarantee is the ROUTE-level tombstone, asserted
-   by ``test_route_eds_connect_*`` / ``test_route_connect_eds_token_*``.)
+2. **Tombstones:** the legacy EDS surfaces still answer cleanly (no 404/500)
+   instead of routing to removed code:
+     - ``GET /api/v1/eds/accounts`` → empty; the EDS POST routes →
+       ``{"ok": False, ...}`` disabled message;
+     - ``GET/POST /connect/eds/{token}`` → disabled HTML page (HTTP 200);
+     - ``runtime.policy`` lets the legacy EDS action types through to their
+       tombstoned handlers ("Это умение отключено.");
+     - the runtime executor lands those actions as COMPLETED runs (not
+       failed) with a disabled tombstone reply.
 
-3. **Display / route / policy tombstone (R2, #181 Ph1 review):** the
-   surfaces that only READ or RENDER EDS state — they do not mutate, so they
-   are not in concern (2), but they would otherwise leak stale disabled-EDS
-   state back to the user:
-     - ``GET /api/v1/eds/accounts`` (the only EDS READ route) returns an
-       empty accounts shape;
-     - ``subscriptions.show`` legacy fallback (no ``connect_public_base_url``)
-       renders NO EDS lines/buttons and performs 0 DB mutations;
-     - ``runtime.policy`` short-circuits ``claim.lookup`` /
-       ``subscription.add_eds`` / ``eds.connect.start`` / ``eds.connect.retry``
-       to the disabled tombstone BEFORE the legacy "подключи EDS" checks —
-       even for an old ``TenantFeature(eds_monitor, enabled=False)`` tenant;
-     - the job_runner tick (#181 Phase 2: verification worker removed) leaves
-       the pending eds-job byte-for-byte (it is no longer drained).
-
-These tests are GREEN across all later phases (the deactivation is the
-floor, not a transient state).
+The EDS subscriptions/plans/accounts no longer exist (dropped by migration
+20260622_0060), so there is nothing EDS-shaped left to mutate or leak — the
+suite seeds only a stale ``TenantFeature(eds_monitor, enabled=False)`` (feature
+history is intentionally kept) and asserts the surviving non-EDS behaviour.
 """
 
 from __future__ import annotations
@@ -57,11 +47,8 @@ from sreda.db.models.billing import (
     TenantBillingCycle,
     TenantSubscription,
 )
-from sreda.db.models.connect import TenantEDSAccount
 from sreda.db.models.core import (
     Assistant,
-    Job,
-    SecureRecord,
     Tenant,
     TenantFeature,
     User,
@@ -69,23 +56,17 @@ from sreda.db.models.core import (
 )
 from sreda.services.billing import (
     DISABLED_FEATURE_MESSAGE,
-    PLAN_EDS_MONITOR_BASE,
-    PLAN_EDS_MONITOR_EXTRA,
     PLAN_VOICE_TRANSCRIPTION,
     BillingService,
 )
-
-# #181 Phase 2: eds_connect / eds_account_verification modules were DELETED.
-# The connect/verify behaviour they once owned is now structurally impossible
-# (the live mutators are gone); the surviving guarantee is the tombstone at the
-# IMPORTER boundary (routes / handlers / job_runner). Tests that used to call
-# the deleted services directly are rewritten below to assert that boundary
-# tombstone WITHOUT importing the removed modules.
 
 TENANT = "tenant_mixed"
 WORKSPACE = "ws_mixed"
 ASSISTANT = "asst_mixed"
 NOW = datetime(2026, 6, 19, 12, 0, tzinfo=UTC)
+
+DISABLED_TOMBSTONE_TEXT = "Это умение отключено."
+DISABLED_TEXT = "Это умение больше не поддерживается."
 
 
 # ---------------------------------------------------------------------------
@@ -127,25 +108,10 @@ def _plan(
 
 
 def _seed_plans(session) -> None:
-    """Seed the four plans the suite touches. EDS plans mirror the
-    PLAN_SEEDS in billing.py so ``ensure_default_plans`` (run by the
-    read-path) would be a no-op even if it fired."""
+    """Seed the surviving non-EDS plans (voice + housewife). #181 Phase B: the
+    EDS plans are dropped — no EDS plan row is seeded anywhere anymore."""
     session.add_all(
         [
-            _plan(
-                id="plan_eds_monitor_base",
-                plan_key=PLAN_EDS_MONITOR_BASE,
-                feature_key="eds_monitor",
-                title="EDS Monitor",
-                price_rub=2990,
-            ),
-            _plan(
-                id="plan_eds_monitor_extra_account",
-                plan_key=PLAN_EDS_MONITOR_EXTRA,
-                feature_key="eds_monitor",
-                title="Доп. кабинет EDS",
-                price_rub=2990,
-            ),
             _plan(
                 id="plan_voice",
                 plan_key=PLAN_VOICE_TRANSCRIPTION,
@@ -189,8 +155,9 @@ def _subscription(
 
 
 def _seed_mixed_tenant(session) -> None:
-    """Build the migrated-user fixture: active housewife + paid voice +
-    stale disabled-EDS rows."""
+    """Build the migrated-user fixture: active housewife + paid voice + a stale
+    disabled ``TenantFeature(eds_monitor)`` (feature history kept). #181 Phase B:
+    NO EDS subscription / account / plan rows — those are gone."""
     session.add(Tenant(id=TENANT, name="Mixed", approved_at=NOW - timedelta(days=30)))
     session.add(Workspace(id=WORKSPACE, tenant_id=TENANT, name="WS"))
     session.add(User(id="user_mixed", tenant_id=TENANT, telegram_account_id="40921122"))
@@ -230,39 +197,15 @@ def _seed_mixed_tenant(session) -> None:
             active_until=NOW + timedelta(days=36500),
         )
     )
-    # Stale EDS base + extra subscriptions (the user migrated; these are
-    # leftover disabled rows that MUST NOT be mutated). At most one row per
-    # feature_key may carry status='active' (partial unique index
-    # ux_tenant_subs_active_per_feature, migration 0042) — mirrors the prod
-    # state after the 2026-05-07 EDS scrub. The extra row is a non-active
-    # leftover (scheduled_for_cancel), which the partition must STILL leave
-    # byte-for-byte.
-    session.add(
-        _subscription(
-            id="sub_eds_base",
-            plan_id="plan_eds_monitor_base",
-            feature_key="eds_monitor",
-            active_until=active_until,
-            status="active",
-        )
-    )
-    session.add(
-        _subscription(
-            id="sub_eds_extra",
-            plan_id="plan_eds_monitor_extra_account",
-            feature_key="eds_monitor",
-            active_until=active_until,
-            status="scheduled_for_cancel",
-        )
-    )
 
-    # Feature flags.
+    # Feature flags. eds_monitor is kept as a DISABLED row (feature history is
+    # intentionally not cleaned — see migration 20260622_0060 docstring).
     session.add(
         TenantFeature(
             id=f"{TENANT}:eds_monitor",
             tenant_id=TENANT,
             feature_key="eds_monitor",
-            enabled=True,
+            enabled=False,
         )
     )
     session.add(
@@ -281,46 +224,10 @@ def _seed_mixed_tenant(session) -> None:
             enabled=True,
         )
     )
-
-    # Stale EDS account + secure_record + pending verify job.
-    session.add(
-        TenantEDSAccount(
-            id="teds_mixed",
-            tenant_id=TENANT,
-            workspace_id=WORKSPACE,
-            assistant_id=ASSISTANT,
-            account_index="1",
-            account_role="primary",
-            status="active",
-            login_masked="***99",
-        )
-    )
-    session.add(
-        SecureRecord(
-            id="sec_eds_mixed",
-            tenant_id=TENANT,
-            workspace_id=WORKSPACE,
-            record_type="eds_account_credentials",
-            record_key="teds_mixed",
-            encrypted_json="{}",
-        )
-    )
-    session.add(
-        Job(
-            id="job_eds_mixed",
-            tenant_id=TENANT,
-            workspace_id=WORKSPACE,
-            job_type="eds.verify_account_connect",
-            status="pending",
-            payload_json=json.dumps({"connect_session_id": "cs_mixed"}),
-        )
-    )
     session.commit()
 
 
 def _coerce_naive(dt: datetime) -> datetime:
-    """SQLite round-trips DateTime as naive; normalise both sides to naive
-    UTC so comparisons never hit the offset-naive/aware TypeError."""
     if dt.tzinfo is not None:
         return dt.astimezone(UTC).replace(tzinfo=None)
     return dt
@@ -336,122 +243,7 @@ def _snapshot(sub: TenantSubscription) -> dict:
     }
 
 
-def _feature_snapshot(session, feature_key: str) -> dict:
-    feat = (
-        session.query(TenantFeature)
-        .filter(
-            TenantFeature.tenant_id == TENANT,
-            TenantFeature.feature_key == feature_key,
-        )
-        .one()
-    )
-    return {"id": feat.id, "enabled": feat.enabled}
-
-
-# ---------------------------------------------------------------------------
-# Invariant tests
-# ---------------------------------------------------------------------------
-
-
-def test_renew_cycle_renews_voice_but_leaves_eds_byte_for_byte(session) -> None:
-    _seed_mixed_tenant(session)
-    voice_before = _snapshot(session.get(TenantSubscription, "sub_voice"))
-    eds_base_before = _snapshot(session.get(TenantSubscription, "sub_eds_base"))
-    eds_extra_before = _snapshot(session.get(TenantSubscription, "sub_eds_extra"))
-    eds_feature_before = _feature_snapshot(session, "eds_monitor")
-
-    BillingService(session).renew_cycle(TENANT, now=NOW)
-    session.expire_all()
-
-    voice_after = _snapshot(session.get(TenantSubscription, "sub_voice"))
-    eds_base_after = _snapshot(session.get(TenantSubscription, "sub_eds_base"))
-    eds_extra_after = _snapshot(session.get(TenantSubscription, "sub_eds_extra"))
-    eds_feature_after = _feature_snapshot(session, "eds_monitor")
-
-    # Voice renewed: active_until advanced.
-    assert voice_after["active_until"] > voice_before["active_until"]
-    assert voice_after["status"] == "active"
-
-    # EDS subscriptions + feature untouched.
-    assert eds_base_after == eds_base_before
-    assert eds_extra_after == eds_extra_before
-    assert eds_feature_after == eds_feature_before
-
-
-def test_job_runner_tick_leaves_pending_eds_job_untouched(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """#181 Phase 2: the EDS verification worker was REMOVED from job_runner —
-    pending ``eds.verify_account_connect`` jobs are no longer drained (they stay
-    pending until Phase 4 table cleanup). A full job_runner tick must run
-    cleanly AND leave the seeded pending eds-job byte-for-byte. This replaces
-    the old direct ``EDSAccountVerificationService.process_pending_jobs`` test
-    (that service module no longer exists)."""
-    import base64
-
-    from sreda.config.settings import get_settings as _get_settings
-    from sreda.db.base import Base as _Base
-    from sreda.db.session import get_engine, get_session_factory
-    from sreda.workers import job_runner
-
-    db_path = tmp_path / "job_runner_eds.db"
-    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
-    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
-    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
-
-    _get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-    _Base.metadata.create_all(get_engine())
-    seed_session = get_session_factory()()
-    try:
-        # Minimal FK-valid fixture (the env engine enforces FK constraints):
-        # a tenant + workspace + one pending eds.verify_account_connect job.
-        seed_session.add(Tenant(id=TENANT, name="Mixed"))
-        seed_session.add(Workspace(id=WORKSPACE, tenant_id=TENANT, name="WS"))
-        seed_session.flush()
-        seed_session.add(
-            Job(
-                id="job_eds_mixed",
-                tenant_id=TENANT,
-                workspace_id=WORKSPACE,
-                job_type="eds.verify_account_connect",
-                status="pending",
-                payload_json=json.dumps({"connect_session_id": "cs_mixed"}),
-            )
-        )
-        seed_session.commit()
-        job_before = seed_session.get(Job, "job_eds_mixed")
-        status_before = job_before.status
-        payload_before = job_before.payload_json
-    finally:
-        seed_session.close()
-
-    # A full tick must not raise and must not drain the eds-job.
-    asyncio.run(job_runner.process_pending_jobs_once(limit=20))
-
-    check_session = get_session_factory()()
-    try:
-        job_after = check_session.get(Job, "job_eds_mixed")
-        assert job_after.status == status_before == "pending"
-        assert job_after.payload_json == payload_before
-    finally:
-        check_session.close()
-
-    _get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-
-# ---------------------------------------------------------------------------
-# Denylist tests
-# ---------------------------------------------------------------------------
-
-DISABLED_TEXT = "Это умение больше не поддерживается."
-
-
-def _count_mutations(session) -> dict[str, int]:
+def _count_mutations(session) -> tuple[dict[str, int], object]:
     counts: dict[str, int] = {}
 
     def _listener(conn, cursor, statement, parameters, context, executemany):
@@ -463,40 +255,119 @@ def _count_mutations(session) -> dict[str, int]:
     return counts, _listener
 
 
-_EDS_BILLING_CALLS = [
-    ("start_base_subscription", lambda s: BillingService(s).start_base_subscription(TENANT, now=NOW)),
-    ("add_extra_eds_account", lambda s: BillingService(s).add_extra_eds_account(TENANT, now=NOW)),
-    ("cancel_base_at_period_end", lambda s: BillingService(s).cancel_base_at_period_end(TENANT)),
-    ("resume_base_renewal", lambda s: BillingService(s).resume_base_renewal(TENANT)),
-    ("remove_extra_account_at_period_end", lambda s: BillingService(s).remove_extra_account_at_period_end(TENANT, now=NOW)),
-    ("schedule_connected_eds_account_cancel", lambda s: BillingService(s).schedule_connected_eds_account_cancel(TENANT, "teds_mixed")),
-    ("restore_extra_account_slot", lambda s: BillingService(s).restore_extra_account_slot(TENANT, now=NOW)),
-    ("restore_connected_eds_account_cancel", lambda s: BillingService(s).restore_connected_eds_account_cancel(TENANT, "teds_mixed", now=NOW)),
-    # Generic simple-subscription mutators against an EDS plan_key.
-    ("start_simple_subscription[eds]", lambda s: BillingService(s).start_simple_subscription(TENANT, PLAN_EDS_MONITOR_BASE, now=NOW)),
-    ("cancel_simple_subscription[eds]", lambda s: BillingService(s).cancel_simple_subscription(TENANT, PLAN_EDS_MONITOR_BASE)),
-]
+# ---------------------------------------------------------------------------
+# INVARIANT — the migrated tenant keeps working/renewing after EDS removal
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name,call", _EDS_BILLING_CALLS, ids=[c[0] for c in _EDS_BILLING_CALLS])
-def test_billing_eds_method_is_noop_disabled(session, name, call) -> None:
+def test_renew_cycle_renews_voice_and_shows_voice_amount(session) -> None:
+    """The critical invariant: a migrated EDS→Среда tenant renews voice and the
+    success message carries the VOICE amount (299 ₽) — never an EDS amount
+    (there are no EDS rows left to sum)."""
     _seed_mixed_tenant(session)
-    engine = session.get_bind()
-    counts, listener = _count_mutations(session)
-    event.listen(engine, "before_cursor_execute", listener)
-    try:
-        result = call(session)
-    finally:
-        event.remove(engine, "before_cursor_execute", listener)
+    voice_before = _snapshot(session.get(TenantSubscription, "sub_voice"))
 
-    assert result.message_text == DISABLED_TEXT
-    assert result.reply_markup == {}
-    assert counts == {}, f"{name} performed DB mutations: {counts}"
+    result = BillingService(session).renew_cycle(TENANT, now=NOW)
+    session.expire_all()
+
+    voice_after = _snapshot(session.get(TenantSubscription, "sub_voice"))
+    # Voice renewed: active_until advanced, still active.
+    assert voice_after["active_until"] > voice_before["active_until"]
+    assert voice_after["status"] == "active"
+
+    # Success message shows the voice amount, no EDS amount/word.
+    assert "Подписка продлена." in result.message_text
+    assert "Сумма следующего платежа: 299 ₽" in result.message_text
+    assert "2990" not in result.message_text
+    assert "5980" not in result.message_text
+    assert "EDS" not in result.message_text
+
+
+def test_renew_skips_stale_eds_subscription_keeps_voice(session) -> None:
+    """ПРАВИЛО #7 regression-guard для CRITICAL-2 (is_feature_disabled retired-set).
+
+    Миграция оставляет EDS-планы инертными (FK/история), значит СТЕЙЛ
+    TenantSubscription(feature_key="eds_monitor") теоретически может лежать в проде.
+    renew_cycle ДОЛЖЕН пропустить её (не продлить И не force-expire) благодаря
+    is_feature_disabled("eds_monitor")=True; voice при этом продлевается. Регресс
+    is_feature_disabled→always-False продлил/заэкспайрил бы EDS-строку и/или вернул
+    EDS-сумму (2990) в сообщение — этот тест бы упал."""
+    _seed_mixed_tenant(session)
+    # Инертный EDS-план (как в проде — не дропнут) + стейл EDS-подписка, выглядящая renewable
+    # (due в прошлом, next_cycle_quantity=1).
+    session.add(
+        _plan(
+            id="plan_eds",
+            plan_key="eds_monitor_base",
+            feature_key="eds_monitor",
+            title="EDS",
+            price_rub=2990,
+        )
+    )
+    session.add(
+        _subscription(
+            id="sub_eds",
+            plan_id="plan_eds",
+            feature_key="eds_monitor",
+            active_until=NOW - timedelta(days=1),
+        )
+    )
+    session.commit()
+    eds_before = _snapshot(session.get(TenantSubscription, "sub_eds"))
+    voice_before = _snapshot(session.get(TenantSubscription, "sub_voice"))
+
+    result = BillingService(session).renew_cycle(TENANT, now=NOW)
+    session.expire_all()
+
+    # EDS-подписка byte-for-byte не тронута (пропущена: не продлена, не force-expired).
+    assert _snapshot(session.get(TenantSubscription, "sub_eds")) == eds_before
+    # Voice продлён.
+    assert session.get(TenantSubscription, "sub_voice").active_until > voice_before["active_until"]
+    # Сообщение: только voice-сумма, без EDS (2990) и суммы 2990+299.
+    assert "299 ₽" in result.message_text
+    assert "2990" not in result.message_text
+    assert "3289" not in result.message_text
+
+
+def test_node_load_context_does_not_crash_and_carries_identity_only(session) -> None:
+    """``node_load_context`` runs every turn via graph.node_load_context. After
+    Phase B it must NOT query any EDS billing summary / feature flag — it only
+    carries the routing identity keys, and it must not raise even with a stale
+    disabled eds_monitor feature present."""
+    _seed_mixed_tenant(session)
+
+    from sreda.runtime import graph as graph_mod
+    from sreda.runtime.dispatcher import ActionEnvelope
+
+    envelope = ActionEnvelope(
+        action_type="conversation.chat",
+        tenant_id=TENANT,
+        workspace_id=WORKSPACE,
+        assistant_id=ASSISTANT,
+        user_id="user_mixed",
+        channel_type="telegram_dm",
+        external_chat_id="42",
+        bot_key="sreda",
+        inbound_message_id=None,
+        source_type="telegram_message",
+        source_value="привет",
+        params={"text": "привет"},
+    )
+    config = {"configurable": {"session": session}}
+    out = graph_mod.node_load_context({"action": envelope.as_dict()}, config)
+
+    ctx = out["context"]
+    assert ctx["tenant_id"] == TENANT
+    assert ctx["workspace_id"] == WORKSPACE
+    assert ctx["assistant_id"] == ASSISTANT
+    # No EDS-era keys leak into the context.
+    assert "billing_summary" not in ctx
+    assert "eds_monitor_enabled" not in ctx
 
 
 def test_generic_simple_subscription_voice_still_works(session) -> None:
-    """The generic guard must cut ONLY the EDS plan_key — voice/housewife
-    (different feature_key) keep flowing through start/cancel_simple."""
+    """The simple-subscription path (voice/housewife) is unaffected by the EDS
+    removal — cancelling voice flows through and mutates the row."""
     _seed_mixed_tenant(session)
     result = BillingService(session).cancel_simple_subscription(
         TENANT, PLAN_VOICE_TRANSCRIPTION
@@ -507,261 +378,43 @@ def test_generic_simple_subscription_voice_still_works(session) -> None:
     assert voice.status == "cancelled"
 
 
-# #181 Phase 2: EDSConnectService was DELETED. Its three mutators
-# (create_connect_link / open_form / submit_form) used to be the second mutation
-# boundary outside billing; the routes that reached them are now inline
-# tombstones. We assert the tombstone at the ROUTE boundary (the new, surviving
-# boundary) and that NO ConnectSession row is ever created — the structural
-# proof that the connect mutation can no longer happen.
-
-
-def _connect_session_count(session_factory) -> int:
-    from sreda.db.models.connect import ConnectSession
-
-    s = session_factory()
-    try:
-        return s.query(ConnectSession).count()
-    finally:
-        s.close()
-
-
-def test_route_eds_connect_tombstone_no_session_created(miniapp_client) -> None:
-    """``POST /miniapp/api/v1/eds/connect`` (formerly create_connect_link) →
-    tombstone {"ok": False, connect_url: None}, and NO ConnectSession row is
-    created."""
-    from sreda.db.session import get_session_factory
-
-    before = _connect_session_count(get_session_factory())
-    resp = miniapp_client.post(
-        "/miniapp/api/v1/eds/connect", headers=miniapp_client._eds_auth_header
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["ok"] is False
-    assert data["connect_url"] is None
-    assert data["message"] == DISABLED_FEATURE_MESSAGE
-    assert _connect_session_count(get_session_factory()) == before
-
-
-def test_route_eds_add_and_connect_tombstone_no_session_created(miniapp_client) -> None:
-    """``POST /miniapp/api/v1/eds/add-and-connect`` → tombstone with NO
-    connect_url and NO ConnectSession row (the billing add-slot mutator is
-    itself disabled, the connect-link step is gone with EDSConnectService)."""
-    from sreda.db.session import get_session_factory
-
-    before = _connect_session_count(get_session_factory())
-    resp = miniapp_client.post(
-        "/miniapp/api/v1/eds/add-and-connect", headers=miniapp_client._eds_auth_header
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["connect_url"] is None
-    assert _connect_session_count(get_session_factory()) == before
-
-
-def test_route_connect_eds_token_get_tombstone(miniapp_client) -> None:
-    """``GET /connect/eds/{token}`` (formerly open_form) → a disabled page
-    (HTTP 200, not 404), no ConnectSession mutation."""
-    from sreda.db.session import get_session_factory
-
-    before = _connect_session_count(get_session_factory())
-    resp = miniapp_client.get("/connect/eds/sometoken")
-    assert resp.status_code == 200
-    assert DISABLED_TOMBSTONE_TEXT in resp.text
-    assert _connect_session_count(get_session_factory()) == before
-
-
-def test_route_connect_eds_token_post_tombstone(miniapp_client) -> None:
-    """``POST /connect/eds/{token}`` (formerly submit_form) → a disabled page
-    (HTTP 200), no ConnectSession / TenantEDSAccount / Job mutation."""
-    from sreda.db.session import get_session_factory
-
-    before = _connect_session_count(get_session_factory())
-    resp = miniapp_client.post(
-        "/connect/eds/sometoken",
-        data={"login": "u@example.com", "password": "pw"},
-    )
-    assert resp.status_code == 200
-    assert DISABLED_TOMBSTONE_TEXT in resp.text
-    assert _connect_session_count(get_session_factory()) == before
-
-
-def test_registry_does_not_register_eds_monitor() -> None:
-    from sreda.features.registry import FeatureRegistry
-
-    registry = FeatureRegistry()
-
-    class _Module:
-        feature_key = "eds_monitor"
-
-        def register_api(self, app):  # pragma: no cover - never called
-            raise AssertionError("eds_monitor module should not be registered")
-
-        def register_runtime(self):  # pragma: no cover
-            raise AssertionError
-
-        def register_workers(self):  # pragma: no cover
-            raise AssertionError
-
-    registry.register(_Module())
-    assert registry.modules == {}
-
-    async def _handler(*a, **k):  # pragma: no cover
-        return None
-
-    registry.register_skill_job_handler(
-        feature_key="eds_monitor", job_type="eds.verify_account_connect", handler=_handler
-    )
-    assert registry.skill_job_types() == []
-
-    registry.register_proactive_handler(feature_key="eds_monitor", handler=lambda ctx: [])
-    assert registry.get_proactive_handler("eds_monitor") is None
-
-    registry.register_delivery_hook(feature_key="eds_monitor", hook=_handler)
-    assert registry.get_delivery_hook("eds_monitor") is None
-
-
-def test_registry_still_registers_non_eds_feature() -> None:
-    from sreda.features.registry import FeatureRegistry
-
-    registry = FeatureRegistry()
-
-    async def _handler(*a, **k):
-        return None
-
-    registry.register_skill_job_handler(
-        feature_key="housewife_assistant", job_type="housewife.reminder", handler=_handler
-    )
-    assert registry.skill_job_types() == ["housewife.reminder"]
-
-
 # ---------------------------------------------------------------------------
-# Display / route / policy tombstone tests (R2 — #181 Ph1 review)
+# Display — status / subscriptions render no EDS, keep voice
 # ---------------------------------------------------------------------------
 
-DISABLED_TOMBSTONE_TEXT = "Это умение отключено."
+
+def test_build_status_message_keeps_voice_amount_no_eds(session) -> None:
+    """A migrated tenant with a renewable voice sub sees the voice amount
+    (299 ₽) and no EDS content."""
+    _seed_mixed_tenant(session)
+    text, _markup = BillingService(session).build_status_message(TENANT, now=NOW)
+    assert "Сумма к оплате: 299 ₽" in text
+    assert "2990" not in text
+    assert "EDS" not in text
 
 
-# --- Route: GET /api/v1/eds/accounts → empty (no EDS account details) -------
-
-
-@pytest.fixture()
-def miniapp_client(monkeypatch, tmp_path):
-    """TestClient with in-memory SQLite + a pre-seeded migrated tenant whose
-    eds_monitor TenantFeature is DISABLED (enabled=False) and who has stale
-    TenantEDSAccount rows. Mirrors tests/unit/test_miniapp_api.py wiring."""
-    import hashlib
-    import hmac
-    import time
-    from urllib.parse import urlencode
-
-    from fastapi.testclient import TestClient
-
-    bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-    db_path = tmp_path / "test_eds_route.db"
-    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
-    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", bot_token)
-    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.test.local")
-
-    from sreda.api.deps import reset_rate_limiters
-    from sreda.config.settings import get_settings as _get_settings
-    from sreda.db.base import Base as _Base
-    from sreda.db.session import get_engine, get_session_factory
-    from sreda.main import create_app
-
-    from sreda.db.repositories.seed import SeedRepository
-
-    _get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    reset_rate_limiters()
-    _Base.metadata.create_all(get_engine())
-
-    # Seed a migrated tenant (eds_monitor TenantFeature DISABLED) with a stale
-    # active TenantEDSAccount, so a non-tombstoned route WOULD leak the account
-    # (login_masked "***42"). Use SeedRepository for the bundle so all FKs are
-    # satisfied (the in-app engine enforces FK constraints).
-    s = get_session_factory()()
-    try:
-        SeedRepository(s).ensure_tenant_bundle(
-            tenant_id="tenant_route",
-            tenant_name="Route",
-            workspace_id="ws_route",
-            workspace_name="WS",
-            user_id="user_route",
-            telegram_account_id="352612382",
-            assistant_id="asst_route",
-            assistant_name="A",
-            eds_monitor_enabled=False,
-        )
-        s.add(
-            TenantEDSAccount(
-                id="teds_route",
-                tenant_id="tenant_route",
-                workspace_id="ws_route",
-                assistant_id="asst_route",
-                account_index="1",
-                account_role="primary",
-                status="active",
-                login_masked="***42",
-            )
-        )
-        s.commit()
-    finally:
-        s.close()
-
-    def _init_data() -> str:
-        auth_date = int(time.time())
-        user_json = json.dumps(
-            {"id": 352612382, "first_name": "Test", "username": "t"},
-            separators=(",", ":"),
-        )
-        params = {"auth_date": str(auth_date), "user": user_json}
-        dcs = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
-        secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-        params["hash"] = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
-        return urlencode(params)
-
-    with TestClient(create_app()) as c:
-        c._eds_auth_header = {"Authorization": f"tma {_init_data()}"}  # type: ignore[attr-defined]
-        yield c
-
-    _get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    reset_rate_limiters()
-
-
-def test_route_eds_accounts_returns_empty_when_disabled(miniapp_client) -> None:
-    resp = miniapp_client.get(
-        "/miniapp/api/v1/eds/accounts", headers=miniapp_client._eds_auth_header
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    # Tombstoned: empty accounts, no stale "***42" login leaked back.
-    assert data == {"accounts": []}
-    assert "***42" not in resp.text
-
-
-# --- subscriptions.show legacy fallback: no EDS lines/buttons, 0 mutations --
-
-
-def test_subscriptions_show_fallback_has_no_eds_and_no_mutation(session) -> None:
-    """``subscriptions.show`` with NO connect_public_base_url falls back to
-    ``build_subscriptions_message``; with eds_monitor retired it must render
-    voice + nav only — no EDS active/available lines, no EDS buttons — and
-    perform ZERO DB mutations."""
+def test_build_status_message_suppresses_payment_when_nothing_renews(session) -> None:
+    """With no renewable charge (voice cancelled, housewife free) the payment
+    block is dropped entirely — no "Сумма к оплате: 0 ₽" line."""
     _seed_mixed_tenant(session)
     billing = BillingService(session)
-    # Drain the unrelated plan-catalog self-heal (ensure_default_plans) BEFORE
-    # measuring, so the mutation count reflects ONLY the tombstone render path
-    # (which must touch no tenant EDS state). ensure_default_plans writes to the
-    # subscription_plans catalog, not to tenant subscriptions/accounts.
-    billing.ensure_default_plans()
+    billing.cancel_simple_subscription(TENANT, PLAN_VOICE_TRANSCRIPTION)
     session.commit()
 
-    eds_base_before = _snapshot(session.get(TenantSubscription, "sub_eds_base"))
-    eds_extra_before = _snapshot(session.get(TenantSubscription, "sub_eds_extra"))
+    text, _markup = billing.build_status_message(TENANT, now=NOW)
+    assert "Сумма к оплате" not in text
+    assert "Следующий платеж" not in text
+    assert "EDS" not in text
+
+
+def test_subscriptions_message_has_no_eds_and_no_mutation(session) -> None:
+    """``build_subscriptions_message`` renders voice + nav only — no EDS lines,
+    no EDS buttons, no ``onboarding:connect_eds`` — and mutates nothing beyond
+    the (separately drained) plan self-heal."""
+    _seed_mixed_tenant(session)
+    billing = BillingService(session)
+    billing.ensure_default_plans()
+    session.commit()
 
     engine = session.get_bind()
     counts, listener = _count_mutations(session)
@@ -771,34 +424,24 @@ def test_subscriptions_show_fallback_has_no_eds_and_no_mutation(session) -> None
     finally:
         event.remove(engine, "before_cursor_execute", listener)
 
-    # No EDS lines in the rendered body.
     assert "EDS" not in text
     assert "ЛК" not in text
-    # Voice is still rendered (non-EDS part survives).
     assert "Распознавание голоса" in text
 
-    # No EDS buttons (connect / add / remove / restore / onboarding:connect_eds).
     flat = [btn for row in markup.get("inline_keyboard", []) for btn in row]
     callbacks = [b.get("callback_data", "") for b in flat]
     labels = [b.get("text", "") for b in flat]
     assert not any("eds" in (cb or "").lower() for cb in callbacks)
     assert not any("EDS" in lbl for lbl in labels)
     assert "onboarding:connect_eds" not in callbacks
-    # Navigation button remains.
     assert any("Мой статус" in lbl for lbl in labels)
 
-    # Pure render → zero mutations of tenant state.
     assert counts == {}, f"build_subscriptions_message mutated DB: {counts}"
-    # And the stale EDS subscriptions are byte-for-byte untouched.
-    session.expire_all()
-    assert _snapshot(session.get(TenantSubscription, "sub_eds_base")) == eds_base_before
-    assert _snapshot(session.get(TenantSubscription, "sub_eds_extra")) == eds_extra_before
 
 
 def test_subscriptions_show_handler_fallback_no_eds(session, monkeypatch) -> None:
     """End-to-end through the runtime handler: with connect_public_base_url
-    unset the handler hits the legacy fallback, which must carry no EDS
-    content for a retired skill."""
+    unset the handler hits the legacy fallback, which must carry no EDS content."""
     _seed_mixed_tenant(session)
 
     from sreda.runtime import handlers as handlers_mod
@@ -832,7 +475,9 @@ def test_subscriptions_show_handler_fallback_no_eds(session, monkeypatch) -> Non
     assert not any("eds" in (b.get("callback_data", "") or "").lower() for b in flat)
 
 
-# --- policy: bypass legacy "подключи EDS" checks for a retired skill --------
+# ---------------------------------------------------------------------------
+# Policy — legacy EDS actions pass through to the tombstoned handler
+# ---------------------------------------------------------------------------
 
 _POLICY_DISABLED_ACTIONS = [
     "claim.lookup",
@@ -862,58 +507,31 @@ def _policy_envelope(action_type: str):
 
 
 @pytest.mark.parametrize("action_type", _POLICY_DISABLED_ACTIONS)
-def test_policy_bypasses_legacy_eds_prompt_when_disabled(action_type) -> None:
-    """For a stale tenant whose ``TenantFeature(eds_monitor)`` is enabled=False
-    (context ``eds_monitor_enabled=False``) AND base_active=False, the policy
-    must NOT emit the legacy "подключи EDS" / "Сначала подключи EDS" prompt for
-    any EDS action type. It passes through (returns None) so the downstream
-    tombstoned handler/service answers — never the old connect/subscribe text.
-
-    Pre-#181 this returned an ``eds_monitor_disabled`` /
-    ``subscription_required`` error carrying the legacy connect prompt; the
-    bypass closes that gap.
-    """
+def test_policy_lets_legacy_eds_action_through(action_type) -> None:
+    """The policy no longer emits any legacy "подключи EDS" prompt — every
+    legacy EDS action type passes through (returns None) so its tombstoned
+    handler answers. Context carries only the identity keys (Phase B
+    node_load_context shape)."""
     from sreda.runtime.policy import evaluate_policy
 
-    # Mirrors graph.py context for a TenantFeature(enabled=False) tenant with
-    # no active EDS subscription — the exact state the reviewers flagged.
     context = {
         "tenant_id": TENANT,
         "workspace_id": WORKSPACE,
-        "eds_monitor_enabled": False,
-        "billing_summary": {
-            "base_active": False,
-            "allowed_count": 0,
-            "connected_count": 0,
-            "free_count": 0,
-        },
+        "assistant_id": ASSISTANT,
     }
-
-    error = evaluate_policy(_policy_envelope(action_type), context)
-    # Bypass → pass through to the (tombstoned) handler/service.
-    assert error is None
+    assert evaluate_policy(_policy_envelope(action_type), context) is None
 
 
-def test_policy_claim_lookup_disabled_reaches_handler_tombstone(session) -> None:
-    """End-to-end: policy bypass + handler tombstone → the disabled notice
-    "Это умение отключено.", NOT the legacy "подключи EDS" prompt."""
+def test_policy_claim_lookup_reaches_handler_tombstone(session) -> None:
+    """End-to-end: policy passthrough + handler tombstone → the disabled
+    notice, not a claim card / connect prompt."""
     from sreda.runtime import handlers as handlers_mod
     from sreda.runtime.policy import evaluate_policy
 
     _seed_mixed_tenant(session)
     envelope = _policy_envelope("claim.lookup")
-    context = {
-        "tenant_id": TENANT,
-        "workspace_id": WORKSPACE,
-        "eds_monitor_enabled": False,
-        "billing_summary": {
-            "base_active": False,
-            "allowed_count": 0,
-            "connected_count": 0,
-            "free_count": 0,
-        },
-    }
-    assert evaluate_policy(envelope, context) is None  # policy lets it through
+    context = {"tenant_id": TENANT, "workspace_id": WORKSPACE, "assistant_id": ASSISTANT}
+    assert evaluate_policy(envelope, context) is None
     replies = handlers_mod.execute_claim_lookup(session, envelope, context)
     assert len(replies) == 1
     assert replies[0].text == DISABLED_TOMBSTONE_TEXT
@@ -921,33 +539,200 @@ def test_policy_claim_lookup_disabled_reaches_handler_tombstone(session) -> None
 
 
 def test_policy_allows_non_eds_action() -> None:
-    """The global EDS bypass must NOT swallow unrelated actions."""
     from sreda.runtime.policy import evaluate_policy
 
-    # help.show short-circuits to None (allowed) regardless of context.
     assert evaluate_policy(_policy_envelope("help.show"), {}) is None
+    # A normal authenticated action passes when context is present.
+    context = {"tenant_id": TENANT, "workspace_id": WORKSPACE, "assistant_id": ASSISTANT}
+    assert evaluate_policy(_policy_envelope("conversation.chat"), context) is None
 
 
-# --- inline process_job entry removed (connect.py POST is now a tombstone) ---
-#
-# #181 Phase 2: the inline ``EDSAccountVerificationService.process_job`` kick
-# that the connect.py POST route used to fire was removed with the service
-# module. The route is now a pure tombstone — see
-# ``test_route_connect_eds_token_post_tombstone`` (POST renders the disabled
-# page, creates no ConnectSession). The "pending eds-job survives" guarantee is
-# now covered by ``test_job_runner_tick_leaves_pending_eds_job_untouched``.
+def test_policy_blocks_when_runtime_context_missing() -> None:
+    from sreda.runtime.policy import evaluate_policy
+
+    error = evaluate_policy(_policy_envelope("conversation.chat"), {})
+    assert error is not None
+    assert error.code == "runtime_context_missing"
 
 
 # ---------------------------------------------------------------------------
-# Runtime executor-level tombstone tests (R3 — #181 Ph1 review)
-#
-# evaluate_policy(...) is None proves the policy BYPASS, but not that the full
-# action lands as a COMPLETED run with a tombstone reply and zero EDS mutations.
-# These run the whole executor (graph → policy → handler → persist) and assert:
-#   - run.status == "completed" (NOT failed — the connect actions must be a
-#     completed tombstone like /claim, the regression the reviewers flagged);
-#   - the user-facing reply is a disabled notice, NOT a connect link / EDS sum;
-#   - the seeded stale-EDS rows are byte-for-byte untouched (0 mutations).
+# Registry — generic guard still drops a retired feature module
+# ---------------------------------------------------------------------------
+
+
+def test_registry_registers_non_eds_feature() -> None:
+    from sreda.features.registry import FeatureRegistry
+
+    registry = FeatureRegistry()
+
+    async def _handler(*a, **k):
+        return None
+
+    registry.register_skill_job_handler(
+        feature_key="housewife_assistant", job_type="housewife.reminder", handler=_handler
+    )
+    assert registry.skill_job_types() == ["housewife.reminder"]
+
+
+# ---------------------------------------------------------------------------
+# Route tombstones (Mini App + /connect/eds)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def miniapp_client(monkeypatch, tmp_path):
+    """TestClient with in-memory SQLite + a migrated tenant (stale disabled
+    eds_monitor feature, NO EDS account/sub rows — those tables are gone)."""
+    import hashlib
+    import hmac
+    import time
+    from urllib.parse import urlencode
+
+    from fastapi.testclient import TestClient
+
+    bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+    db_path = tmp_path / "test_eds_route.db"
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", bot_token)
+    monkeypatch.setenv("SREDA_CONNECT_PUBLIC_BASE_URL", "https://connect.test.local")
+
+    from sreda.api.deps import reset_rate_limiters
+    from sreda.config.settings import get_settings as _get_settings
+    from sreda.db.base import Base as _Base
+    from sreda.db.repositories.seed import SeedRepository
+    from sreda.db.session import get_engine, get_session_factory
+    from sreda.main import create_app
+
+    _get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+    reset_rate_limiters()
+    _Base.metadata.create_all(get_engine())
+
+    s = get_session_factory()()
+    try:
+        SeedRepository(s).ensure_tenant_bundle(
+            tenant_id="tenant_route",
+            tenant_name="Route",
+            workspace_id="ws_route",
+            workspace_name="WS",
+            user_id="user_route",
+            telegram_account_id="352612382",
+            assistant_id="asst_route",
+            assistant_name="A",
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    def _init_data() -> str:
+        auth_date = int(time.time())
+        user_json = json.dumps(
+            {"id": 352612382, "first_name": "Test", "username": "t"},
+            separators=(",", ":"),
+        )
+        params = {"auth_date": str(auth_date), "user": user_json}
+        dcs = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        params["hash"] = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+        return urlencode(params)
+
+    with TestClient(create_app()) as c:
+        c._eds_auth_header = {"Authorization": f"tma {_init_data()}"}  # type: ignore[attr-defined]
+        yield c
+
+    _get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+    reset_rate_limiters()
+
+
+def test_route_eds_accounts_returns_empty(miniapp_client) -> None:
+    resp = miniapp_client.get(
+        "/miniapp/api/v1/eds/accounts", headers=miniapp_client._eds_auth_header
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"accounts": []}
+
+
+def test_route_eds_connect_tombstone(miniapp_client) -> None:
+    resp = miniapp_client.post(
+        "/miniapp/api/v1/eds/connect", headers=miniapp_client._eds_auth_header
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["connect_url"] is None
+    assert data["message"] == DISABLED_FEATURE_MESSAGE
+
+
+def test_route_eds_add_and_connect_tombstone(miniapp_client) -> None:
+    resp = miniapp_client.post(
+        "/miniapp/api/v1/eds/add-and-connect", headers=miniapp_client._eds_auth_header
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["connect_url"] is None
+
+
+def test_route_subscribe_eds_plan_key_tombstone(miniapp_client) -> None:
+    """An old client POSTing an EDS plan_key gets the disabled message (200),
+    not a 400/500 and no mutation."""
+    resp = miniapp_client.post(
+        "/miniapp/api/v1/subscribe",
+        headers=miniapp_client._eds_auth_header,
+        json={"plan_key": "eds_monitor_base"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["message"] == DISABLED_FEATURE_MESSAGE
+
+
+def test_route_resume_tombstone(miniapp_client) -> None:
+    resp = miniapp_client.post(
+        "/miniapp/api/v1/resume",
+        headers=miniapp_client._eds_auth_header,
+        json={"plan_key": "eds_monitor_base"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is False
+
+
+def test_route_connect_eds_token_get_tombstone(miniapp_client) -> None:
+    resp = miniapp_client.get("/connect/eds/sometoken")
+    assert resp.status_code == 200
+    assert DISABLED_TOMBSTONE_TEXT in resp.text
+
+
+def test_route_connect_eds_token_post_tombstone(miniapp_client) -> None:
+    resp = miniapp_client.post(
+        "/connect/eds/sometoken",
+        data={"login": "u@example.com", "password": "pw"},
+    )
+    assert resp.status_code == 200
+    assert DISABLED_TOMBSTONE_TEXT in resp.text
+
+
+def test_api_summary_no_eds_card_and_voice_amount(miniapp_client) -> None:
+    """``GET /api/v1/summary`` carries no EDS card and an empty
+    eds_subscriptions list. With no billing cycle there is nothing to charge."""
+    resp = miniapp_client.get(
+        "/miniapp/api/v1/summary", headers=miniapp_client._eds_auth_header
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["eds_subscriptions"] == []
+    assert data["next_amount_rub"] == 0
+    assert data["next_payment_due_at"] is None
+    # No EDS card sneaks into the skill lists.
+    for card in data["active_skills"] + data["available_skills"]:
+        assert card.get("feature_key") != "eds_monitor"
+
+
+# ---------------------------------------------------------------------------
+# Runtime executor — legacy EDS actions land as COMPLETED tombstone runs
 # ---------------------------------------------------------------------------
 
 ENGINE_TENANT = "tenant_1"
@@ -971,9 +756,9 @@ class _FakeTelegramClient:
 
 
 def _seed_engine_tenant(session) -> None:
-    """Seed a migrated tenant on the env-backed engine: voice + stale EDS
-    base sub (next_cycle_quantity>0) + EDS feature + pending eds-job."""
-    from sreda.db.models.core import Assistant, Job, Tenant, TenantFeature, User, Workspace
+    """Seed a migrated tenant on the env-backed engine: voice sub + stale
+    disabled eds_monitor feature (NO EDS sub/account rows — tables are gone)."""
+    from sreda.db.models.core import Assistant, Tenant, TenantFeature, User, Workspace
 
     session.add(Tenant(id=ENGINE_TENANT, name="T"))
     session.add(Workspace(id=ENGINE_WORKSPACE, tenant_id=ENGINE_TENANT, name="WS"))
@@ -985,20 +770,6 @@ def _seed_engine_tenant(session) -> None:
     _seed_plans(session)
 
     active_until = datetime.now(UTC) - timedelta(days=1)
-    session.add(
-        TenantSubscription(
-            id="sub_eds_base",
-            tenant_id=ENGINE_TENANT,
-            plan_id="plan_eds_monitor_base",
-            feature_key="eds_monitor",
-            status="active",
-            starts_at=active_until - timedelta(days=29),
-            active_until=active_until,
-            cancel_at_period_end=False,
-            quantity=1,
-            next_cycle_quantity=1,
-        )
-    )
     session.add(
         TenantSubscription(
             id="sub_voice",
@@ -1021,43 +792,16 @@ def _seed_engine_tenant(session) -> None:
             enabled=False,
         )
     )
-    session.add(
-        Job(
-            id="job_eds_engine",
-            tenant_id=ENGINE_TENANT,
-            workspace_id=ENGINE_WORKSPACE,
-            job_type="eds.verify_account_connect",
-            status="pending",
-            payload_json=json.dumps({"connect_session_id": "cs"}),
-        )
-    )
     session.commit()
-
-
-def _eds_state_snapshot(session) -> dict:
-    """Snapshot the stale-EDS rows that must survive an executor run."""
-    from sreda.db.models.core import Job, TenantFeature
-
-    base = session.get(TenantSubscription, "sub_eds_base")
-    feat = (
-        session.query(TenantFeature)
-        .filter(TenantFeature.tenant_id == ENGINE_TENANT, TenantFeature.feature_key == "eds_monitor")
-        .one()
-    )
-    job = session.get(Job, "job_eds_engine")
-    return {
-        "base": _snapshot(base),
-        "feature_enabled": feat.enabled,
-        "job_status": job.status,
-        "job_payload": job.payload_json,
-    }
 
 
 _RUNTIME_TOMBSTONE_ACTIONS = [
     # (action_type, source_value, params, expected_tombstone_text)
-    ("subscription.add_eds", "billing:add_eds_account", {}, "Это умение больше не поддерживается."),
-    ("eds.connect.start", "onboarding:connect_eds", {"slot_type": "primary"}, "Это умение отключено."),
-    ("eds.connect.retry", "eds:connect_retry", {"slot_type": "extra"}, "Это умение отключено."),
+    ("subscription.add_eds", "billing:add_eds_account", {}, DISABLED_TOMBSTONE_TEXT),
+    ("subscription.connect_base", "billing:connect_plan:eds_monitor_base", {}, DISABLED_TOMBSTONE_TEXT),
+    ("eds.connect.start", "onboarding:connect_eds", {"slot_type": "primary"}, DISABLED_TOMBSTONE_TEXT),
+    ("eds.connect.retry", "eds:connect_retry", {"slot_type": "extra"}, DISABLED_TOMBSTONE_TEXT),
+    ("claim.lookup", "/claim 6230173", {"claim_id": "6230173"}, DISABLED_TOMBSTONE_TEXT),
 ]
 
 
@@ -1066,9 +810,11 @@ _RUNTIME_TOMBSTONE_ACTIONS = [
     _RUNTIME_TOMBSTONE_ACTIONS,
     ids=[a[0] for a in _RUNTIME_TOMBSTONE_ACTIONS],
 )
-def test_runtime_executor_eds_action_completed_tombstone_no_mutation(
+def test_runtime_executor_eds_action_completed_tombstone(
     monkeypatch, tmp_path: Path, action_type, source_value, params, expected_text
 ) -> None:
+    """The legacy EDS actions land as COMPLETED runs (not failed) with a
+    disabled tombstone reply — and no EDS rows exist to mutate."""
     from sreda.config.settings import get_settings
     from sreda.db.base import Base
     from sreda.db.models import AgentRun, Job, OutboxMessage
@@ -1089,7 +835,6 @@ def test_runtime_executor_eds_action_completed_tombstone_no_mutation(
     session = get_session_factory()()
     try:
         _seed_engine_tenant(session)
-        before = _eds_state_snapshot(session)
 
         telegram_client = _FakeTelegramClient()
         service = ActionRuntimeService(session, telegram_client=telegram_client)
@@ -1111,213 +856,31 @@ def test_runtime_executor_eds_action_completed_tombstone_no_mutation(
         )
         result = asyncio.run(service.process_job(queued.job_id))
 
-        # Refresh from DB and capture scalars BEFORE closing the session.
         session.expire_all()
-        after = _eds_state_snapshot(session)
         run_status = session.query(AgentRun).filter(AgentRun.id == queued.run_id).one().status
         job_status = session.query(Job).filter(Job.id == queued.job_id).one().status
         outbox_count = session.query(OutboxMessage).count()
     finally:
         session.close()
 
-    # Completed run (NOT failed) — the connect actions must be a completed
-    # tombstone like /claim, not the ConnectSessionError → failed-run path.
     assert result == "completed"
     assert run_status == "completed"
     assert job_status == "completed"
 
-    # User sees the disabled tombstone, never a connect link / EDS amount.
     assert len(telegram_client.sent_messages) == 1
     sent_text = telegram_client.sent_messages[0]["text"]
     assert expected_text in sent_text
-    assert "защищенн" not in sent_text  # no connect-link intro
-    assert "Ввести логин" not in sent_text
     markup = telegram_client.sent_messages[0]["reply_markup"] or {}
     flat = [b for row in markup.get("inline_keyboard", []) for b in row]
     assert not any("EDS" in b.get("text", "") for b in flat)
-
-    # Zero EDS-state mutations: the stale rows are byte-for-byte unchanged.
-    assert after == before
-    # Outbox carries exactly one (the tombstone), not a failure notice.
     assert outbox_count == 1
 
 
-# ---------------------------------------------------------------------------
-# Display tombstone — stale-EDS payment amount/date must NOT leak (R3)
-# ---------------------------------------------------------------------------
-
-
-def test_build_status_message_hides_eds_amount_for_stale_tenant(session) -> None:
-    """A migrated tenant whose ONLY renewable subs are the stale EDS base+extra
-    (next_cycle_quantity>0) must NOT see "Сумма к оплате" at all — get_summary
-    would surface 5980 ₽ (base+extra) for the retired skill. Voice here is
-    cancelled, so there is no non-EDS renewal → whole payment block suppressed."""
-    _seed_mixed_tenant(session)
-    billing = BillingService(session)
-    # Cancel voice so the ONLY renewable contributor would be EDS.
-    billing.cancel_simple_subscription(TENANT, PLAN_VOICE_TRANSCRIPTION)
-    session.commit()
-
-    # get_summary still reports the EDS charge (quarantined read-path).
-    summary = billing.get_summary(TENANT, now=NOW)
-    assert summary.next_amount_rub == 5980  # base+extra EDS still counted internally
-
-    text, _markup = billing.build_status_message(TENANT, now=NOW)
-    # Display tombstone: NO payment lines, NO EDS sum, NO EDS lines.
-    assert "Сумма к оплате" not in text
-    assert "Следующий платеж" not in text
-    assert "5980" not in text
-    assert "2990" not in text
-    assert "EDS" not in text
-
-
-def test_build_status_message_keeps_voice_amount_for_stale_tenant(session) -> None:
-    """The recompute excludes ONLY disabled-feature plans: a stale-EDS tenant
-    who ALSO has a renewable voice sub still sees the voice amount (299 ₽),
-    never the EDS contribution (the get_summary figure of 299+2990)."""
-    _seed_mixed_tenant(session)
-    billing = BillingService(session)
-
-    text, _markup = billing.build_status_message(TENANT, now=NOW)
-    # Payment block present, voice amount shown, EDS amount excluded.
-    assert "Сумма к оплате: 299 ₽" in text
-    assert "2990" not in text
-    assert "3289" not in text  # never the EDS+voice sum
-    assert "EDS" not in text
-
-
-def test_api_summary_excludes_eds_amount_for_stale_tenant(miniapp_client) -> None:
-    """``GET /api/v1/summary`` for a stale-EDS tenant must echo a display
-    amount that EXCLUDES the retired EDS plan. We seed a stale EDS base sub
-    (next_cycle_quantity>0) + a billing cycle so that WITHOUT the display fix
-    get_summary would surface 2990 ₽ for the retired skill. With no non-EDS
-    renewal the banner is hidden (amount 0 / due null)."""
-    from sreda.db.session import get_session_factory
-
-    # Seed the stale EDS state into the route tenant so the leak is real.
-    s = get_session_factory()()
-    try:
-        BillingService(s).ensure_default_plans()  # creates EDS plan rows
-        s.add(
-            TenantBillingCycle(
-                id="cycle_route",
-                tenant_id="tenant_route",
-                billing_anchor_at=datetime.now(UTC) - timedelta(days=30),
-                next_payment_due_at=datetime.now(UTC) + timedelta(days=1),
-                currency="RUB",
-                status="active",
-            )
-        )
-        base_plan_id = s.query(SubscriptionPlan).filter(
-            SubscriptionPlan.plan_key == PLAN_EDS_MONITOR_BASE
-        ).one().id
-        s.add(
-            TenantSubscription(
-                id="sub_eds_base_route",
-                tenant_id="tenant_route",
-                plan_id=base_plan_id,
-                feature_key="eds_monitor",
-                status="active",
-                starts_at=datetime.now(UTC) - timedelta(days=29),
-                active_until=datetime.now(UTC) + timedelta(days=1),
-                cancel_at_period_end=False,
-                quantity=1,
-                next_cycle_quantity=1,
-            )
-        )
-        s.commit()
-        # Sanity: the quarantined read-path WOULD surface the EDS charge.
-        assert BillingService(s).get_summary("tenant_route").next_amount_rub == 2990
-    finally:
-        s.close()
-
-    resp = miniapp_client.get(
-        "/miniapp/api/v1/summary", headers=miniapp_client._eds_auth_header
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    # No EDS charge leaks; with no non-EDS renewal the banner is hidden.
-    assert data["next_amount_rub"] == 0
-    assert data["next_payment_due_at"] is None
-    assert data["eds_subscriptions"] == []
-
-
-# ---------------------------------------------------------------------------
-# Display tombstone — renew_cycle success message must NOT leak stale-EDS sum
-# (R4 — code-grounded reviewer found a 3rd amount-render surface). renew_cycle
-# is intentionally NOT disabled (it renews voice/housewife), but its success
-# message rendered ``summary.next_amount_rub`` / ``next_payment_due_at`` from
-# the quarantined get_summary read-path (EDS-only sum). A stale-EDS tenant
-# (eds next_cycle_quantity>0) renewing voice would see a phantom EDS charge.
-# Reachable from BOTH Telegram callback (billing:renew →
-# execute_subscription_renew_cycle) and miniapp POST /api/v1/renew.
-# ---------------------------------------------------------------------------
-
-
-def test_renew_cycle_message_excludes_eds_amount_keeps_voice(session) -> None:
-    """A stale-EDS tenant (eds next_cycle_quantity>0) renewing the renewable
-    voice subscription must see the VOICE amount (299 ₽) — never the EDS
-    contribution (2990 base / 5980 base+extra). The success message recomputes
-    the figure disabled-aware via ``compute_display_next_payment`` instead of
-    the EDS-only get_summary sum."""
-    _seed_mixed_tenant(session)
-    billing = BillingService(session)
-
-    # Sanity: the quarantined get_summary read-path WOULD surface the EDS
-    # charge (base 2990 + extra 2990, both with next_cycle_quantity=1 → 5980).
-    assert billing.get_summary(TENANT, now=NOW).next_amount_rub == 5980
-
-    result = billing.renew_cycle(TENANT, now=NOW)
-    msg = result.message_text
-
-    assert "Подписка продлена." in msg
-    # Voice amount shown, EDS amount excluded.
-    assert "Сумма следующего платежа: 299 ₽" in msg
-    assert "2990" not in msg
-    assert "5980" not in msg
-    assert "3289" not in msg  # never the EDS+voice sum
-    assert "6279" not in msg  # never the EDS-base+extra+voice sum
-    assert "EDS" not in msg
-
-    # And the renewal itself still renewed voice / left EDS byte-for-byte.
-    session.expire_all()
-    voice = session.get(TenantSubscription, "sub_voice")
-    assert voice.status == "active"
-    assert _coerce_naive(voice.active_until) > _coerce_naive(NOW)
-    eds_base = session.get(TenantSubscription, "sub_eds_base")
-    assert eds_base.status == "active"
-    assert eds_base.quantity == 1
-    assert eds_base.next_cycle_quantity == 1
-
-
-def test_renew_cycle_message_suppresses_payment_line_when_only_eds(session) -> None:
-    """If the ONLY renewable contributor would be the stale EDS sub (voice
-    cancelled), the disabled-aware recompute yields nothing to charge → the
-    "Сумма следующего платежа" line is dropped entirely (no phantom 2990 ₽)."""
-    _seed_mixed_tenant(session)
-    billing = BillingService(session)
-    # Cancel voice so the only renewable contributor would be EDS.
-    billing.cancel_simple_subscription(TENANT, PLAN_VOICE_TRANSCRIPTION)
-    session.commit()
-
-    result = billing.renew_cycle(TENANT, now=NOW)
-    msg = result.message_text
-
-    # Voice cancelled → still a renewable? housewife is free (price 0). Either
-    # way no EDS sum, and no phantom charge line.
-    assert "2990" not in msg
-    assert "5980" not in msg
-    assert "EDS" not in msg
-
-
-def test_renew_cycle_through_executor_renews_voice_no_eds_amount(
+def test_runtime_executor_renew_cycle_renews_voice_no_eds(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """End-to-end through the executor (``subscription.renew_cycle`` →
-    execute_subscription_renew_cycle → BillingService.renew_cycle): a migrated
-    stale-EDS tenant renewing voice lands as a COMPLETED run, the user-facing
-    reply renews voice (299 ₽) and carries NO EDS amount (2990/5980), and the
-    stale EDS subscription is byte-for-byte untouched."""
+    """End-to-end through the executor: a migrated tenant renewing voice lands
+    as a COMPLETED run, the reply renews voice (299 ₽) and carries NO EDS amount."""
     from sreda.config.settings import get_settings
     from sreda.db.base import Base
     from sreda.db.models import AgentRun, Job
@@ -1338,8 +901,6 @@ def test_renew_cycle_through_executor_renews_voice_no_eds_amount(
     session = get_session_factory()()
     try:
         _seed_engine_tenant(session)
-        # _seed_engine_tenant has voice + stale EDS base but NO billing cycle;
-        # renew_cycle needs a cycle whose due date is in the past so it advances.
         session.add(
             TenantBillingCycle(
                 id="cycle_engine",
@@ -1351,7 +912,6 @@ def test_renew_cycle_through_executor_renews_voice_no_eds_amount(
             )
         )
         session.commit()
-        before = _eds_state_snapshot(session)
 
         telegram_client = _FakeTelegramClient()
         service = ActionRuntimeService(session, telegram_client=telegram_client)
@@ -1374,7 +934,6 @@ def test_renew_cycle_through_executor_renews_voice_no_eds_amount(
         result = asyncio.run(service.process_job(queued.job_id))
 
         session.expire_all()
-        after = _eds_state_snapshot(session)
         run_status = session.query(AgentRun).filter(AgentRun.id == queued.run_id).one().status
         job_status = session.query(Job).filter(Job.id == queued.job_id).one().status
         voice_after = _snapshot(session.get(TenantSubscription, "sub_voice"))
@@ -1385,18 +944,12 @@ def test_renew_cycle_through_executor_renews_voice_no_eds_amount(
     assert run_status == "completed"
     assert job_status == "completed"
 
-    # Voice renewed (active in the future).
     assert voice_after["status"] == "active"
     assert _coerce_naive(voice_after["active_until"]) > _coerce_naive(datetime.now(UTC))
 
-    # User-facing reply: voice amount, no EDS leak.
     assert len(telegram_client.sent_messages) == 1
     sent_text = telegram_client.sent_messages[0]["text"]
     assert "Подписка продлена." in sent_text
     assert "299" in sent_text
     assert "2990" not in sent_text
-    assert "5980" not in sent_text
     assert "EDS" not in sent_text
-
-    # Stale EDS subscription / feature / job byte-for-byte unchanged.
-    assert after == before

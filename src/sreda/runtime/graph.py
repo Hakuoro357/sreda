@@ -48,7 +48,7 @@ from sqlalchemy.orm import Session
 from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import get_settings
 from sreda.db.models import AgentRun
-from sreda.db.models.core import Job, OutboxMessage, TenantFeature
+from sreda.db.models.core import Job, OutboxMessage
 from sreda.db.repositories.memory import MemoryRepository
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
@@ -58,7 +58,6 @@ from sreda.runtime.graph_state import AssistantGraphState
 from sreda.runtime.handlers import HANDLERS, ActionRuntimeError
 from sreda.runtime.policy import evaluate_policy
 from sreda.services import trace
-from sreda.services.billing import BillingService
 from sreda.services.embeddings import EmbeddingClient
 from sreda.services.privacy_guard import get_default_privacy_guard
 
@@ -130,31 +129,15 @@ def _find_skill_config(
 
 
 def node_load_context(state: AssistantGraphState, config: RunnableConfig) -> dict:
-    session = _session(config)
+    # #181 Phase B: the billing summary + eds_monitor feature flag that used to
+    # be loaded here were consumed ONLY by the EDS policy gates (removed in this
+    # phase). With EDS retired, the context only carries the routing identity
+    # keys; the non-EDS path (voice/housewife/reminders/tasks) never read them.
     action = _action(state)
-
-    billing_summary = BillingService(session).get_summary(action.tenant_id)
-    eds_monitor_enabled = (
-        session.query(TenantFeature)
-        .filter(
-            TenantFeature.tenant_id == action.tenant_id,
-            TenantFeature.feature_key == "eds_monitor",
-            TenantFeature.enabled.is_(True),
-        )
-        .one_or_none()
-        is not None
-    )
     context = {
         "tenant_id": action.tenant_id,
         "workspace_id": action.workspace_id,
         "assistant_id": action.assistant_id,
-        "eds_monitor_enabled": eds_monitor_enabled,
-        "billing_summary": {
-            "base_active": billing_summary.base_active,
-            "allowed_count": billing_summary.allowed_count,
-            "connected_count": billing_summary.connected_count,
-            "free_count": billing_summary.free_count,
-        },
     }
     return {"context": context}
 

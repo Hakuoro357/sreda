@@ -287,21 +287,19 @@ def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict
 def execute_subscription_connect_base(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    # Legacy callback path (chat history pre-migration). Subscription
-    # gets activated; Mini App button is the single next action —
-    # pre-generating a one-tap connect link stopped making sense when
-    # /subscriptions stopped showing the inline keyboard that hosted it.
-    result = BillingService(session).start_base_subscription(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
+    # #181 Phase B: EDS Monitor retired — tombstone. The legacy callback
+    # (chat history pre-migration) is still mapped by the dispatcher, but the
+    # billing mutator was removed. Answer with the disabled notice (completed
+    # run), mirroring execute_eds_connect_start. No DB mutation.
+    return [RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())]
 
 
 def execute_subscription_add_eds(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    # Legacy callback path. Slot is added; user continues in Mini App
-    # (it has an explicit "Подключить ЛК EDS" button on the fresh slot).
-    result = BillingService(session).add_extra_eds_account(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
+    # #181 Phase B: EDS Monitor retired — tombstone (see connect_base). No DB
+    # mutation; the billing mutator add_extra_eds_account was removed.
+    return [RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())]
 
 
 def execute_subscription_renew_cycle(
@@ -351,47 +349,29 @@ def execute_eds_connect_retry(
 def execute_eds_slot_remove_free(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    result = BillingService(session).remove_extra_account_at_period_end(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
+    # #181 Phase B: EDS Monitor retired — tombstone (billing mutator removed).
+    return [RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())]
 
 
 def execute_eds_slot_restore_free(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    result = BillingService(session).restore_extra_account_slot(action.tenant_id)
-    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
+    # #181 Phase B: EDS Monitor retired — tombstone (billing mutator removed).
+    return [RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())]
 
 
 def execute_eds_account_remove(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    tenant_eds_account_id = str(action.params.get("tenant_eds_account_id") or "").strip()
-    if not tenant_eds_account_id:
-        raise ActionRuntimeError(
-            "tenant_eds_account_missing",
-            "Не удалось определить кабинет для отключения.",
-            reply_markup=_miniapp_reply_markup(),
-        )
-    result = BillingService(session).schedule_connected_eds_account_cancel(
-        action.tenant_id, tenant_eds_account_id
-    )
-    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
+    # #181 Phase B: EDS Monitor retired — tombstone (billing mutator removed).
+    return [RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())]
 
 
 def execute_eds_account_restore(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
-    tenant_eds_account_id = str(action.params.get("tenant_eds_account_id") or "").strip()
-    if not tenant_eds_account_id:
-        raise ActionRuntimeError(
-            "tenant_eds_account_missing",
-            "Не удалось определить кабинет для возврата.",
-            reply_markup=_miniapp_reply_markup(),
-        )
-    result = BillingService(session).restore_connected_eds_account_cancel(
-        action.tenant_id, tenant_eds_account_id
-    )
-    return [RuntimeReply(text=result.message_text, reply_markup=_miniapp_reply_markup())]
+    # #181 Phase B: EDS Monitor retired — tombstone (billing mutator removed).
+    return [RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())]
 
 
 # ---------------------------------------------------------------------------
@@ -2686,7 +2666,6 @@ async def _chat_preflight(
         AIMessage,
         HumanMessage,
         SystemMessage,
-        ToolMessage,
     )
 
     user_id = _require_user_id(action)
@@ -3868,10 +3847,10 @@ _MENU_DISPLAY_SIMPLE_PATTERNS = tuple(
         rf"(?:покажи|выведи|напиши)(?: мне)? "
         rf"(?:все|всю|полное|полный) меню(?: {_MENU_DISPLAY_WEEK_RE})?",
         rf"(?:какое|какой)(?: у меня)? меню(?: {_MENU_DISPLAY_WEEK_RE})?",
-        rf"что(?: у меня)?(?: в меню)? на "
-        rf"(?:этой|текущей|следующей) недел(?:е|и)",
-        rf"что(?: у меня)? на "
-        rf"(?:этой|текущей|следующей) недел(?:е|и)(?: в меню)?",
+        r"что(?: у меня)?(?: в меню)? на "
+        r"(?:этой|текущей|следующей) недел(?:е|и)",
+        r"что(?: у меня)? на "
+        r"(?:этой|текущей|следующей) недел(?:е|и)(?: в меню)?",
     )
 )
 

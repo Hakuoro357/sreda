@@ -14,7 +14,6 @@ inbound_messages               30 days     any
 jobs                           30 days     status in completed/failed/cancelled
 outbox_messages (sent)         30 days     status == sent
 outbox_messages (failed)       60 days     status == failed
-secure_records                 7 days      record_type == eds_connect_payload
 skill_ai_executions            30 days     any
 skill_events (debug/info)      30 days     severity in debug/info
 skill_events (warn/error)      90 days     severity in warn/error
@@ -38,11 +37,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, delete, or_, select, union_all, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.orm import Session
 
-from sreda.db.models.connect import ConnectSession, TenantEDSAccount
-from sreda.db.models.core import InboundMessage, Job, OutboxMessage, SecureRecord
+from sreda.db.models.core import InboundMessage, Job, OutboxMessage
 from sreda.db.models.planner import (
     PlannerExecution,
     PlannerGap,
@@ -56,7 +54,6 @@ from sreda.db.models.skill_platform import (
     SkillEvent,
     SkillRun,
     SkillRunAttempt,
-    TenantSkillConfig,
 )
 
 
@@ -121,7 +118,6 @@ INBOUND_MESSAGES_DAYS = 30
 JOBS_DAYS = 30
 OUTBOX_SENT_DAYS = 30
 OUTBOX_FAILED_DAYS = 60
-EDS_CONNECT_PAYLOAD_DAYS = 7
 SKILL_AI_EXECUTIONS_DAYS = 30
 SKILL_EVENTS_DEBUG_INFO_DAYS = 30
 SKILL_EVENTS_WARN_ERROR_DAYS = 90
@@ -396,49 +392,13 @@ def cleanup_runtime_retention(
         ),
     )
 
-    # ---------- secure_records (eds_connect_payload only) ----------
-    # 2026-04-28 fix: было FK-violation. SecureRecord ссылается из
-    # connect_sessions / tenant_eds_accounts / inbound_messages /
-    # tenant_skill_configs / skill_runs (in/out) / skill_run_attempts.
-    # Удаляем ТОЛЬКО orphan'ов — у которых ни один FK не указывает на них.
-    # Если кто-то ещё ссылается — secure_record нужен (parent живой),
-    # его TTL обнуляется.
-    eds_cutoff = now - timedelta(days=EDS_CONNECT_PAYLOAD_DAYS)
-    # union_all через function-form (SQLAlchemy 2.x): chained .union_all
-    # на Select возвращает CompoundSelect у которого нет своего .union_all.
-    referenced_ids = union_all(
-        select(ConnectSession.secure_record_id).where(
-            ConnectSession.secure_record_id.isnot(None)
-        ),
-        select(TenantEDSAccount.secure_record_id).where(
-            TenantEDSAccount.secure_record_id.isnot(None)
-        ),
-        select(InboundMessage.secure_record_id).where(
-            InboundMessage.secure_record_id.isnot(None)
-        ),
-        select(TenantSkillConfig.secure_record_id).where(
-            TenantSkillConfig.secure_record_id.isnot(None)
-        ),
-        select(SkillRun.input_secure_record_id).where(
-            SkillRun.input_secure_record_id.isnot(None)
-        ),
-        select(SkillRun.output_secure_record_id).where(
-            SkillRun.output_secure_record_id.isnot(None)
-        ),
-        select(SkillAIExecution.raw_artifact_secure_record_id).where(
-            SkillAIExecution.raw_artifact_secure_record_id.isnot(None)
-        ),
-    )
-    result.secure_records_eds_connect_payload = _delete_returning_count(
-        session,
-        delete(SecureRecord).where(
-            and_(
-                SecureRecord.record_type == "eds_connect_payload",
-                SecureRecord.created_at < eds_cutoff,
-                SecureRecord.id.notin_(referenced_ids),
-            )
-        ),
-    )
+    # ---------- secure_records (eds_connect_payload) ----------
+    # #181 Phase B: EDS Monitor retired — the connect-layer tables
+    # (connect_sessions / tenant_eds_accounts) and the eds_connect_payload
+    # secure_records they referenced are dropped/deleted by migration
+    # 20260622_0060. There is no longer any eds_connect_payload row to clean up
+    # here, so this branch is gone. ``result.secure_records_eds_connect_payload``
+    # stays at its default 0 for log/metric shape compatibility.
 
     # ---------- react_debug_turns (#185: временный QA-захват переписки, короткий TTL) ----------
     # Leaf-таблица (нет FK-детей/родителей в чистке), полный текст переписки (EncryptedString).
