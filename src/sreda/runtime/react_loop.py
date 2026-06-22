@@ -847,10 +847,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     @tool
     def update_reminder(reminder_ref: str, title: str = "", trigger_iso: str = "") -> str:
         """Изменить напоминание по ref: название и/или момент (АБСОЛЮТНЫЙ ISO)."""
-        # user-guard (симметрично cancel_reminder): сервис update гардит только tenant.
-        r0 = session.get(FamilyReminder, reminder_ref)
-        if r0 is None or r0.tenant_id != tenant_id or r0.user_id != user_id:
-            return "Такого напоминания у тебя нет."
+        # parse-валидация ввода (НЕ часть exact-replay операции — ошибка ввода, без claim op).
         new_trigger = None
         if trigger_iso:
             try:
@@ -860,12 +857,18 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
             # #174 (Codex medium R1): перенос на прошлое = тот же класс бага → перекат вперёд.
             if new_trigger <= datetime.now(timezone.utc):
                 return _past_rollforward_msg(new_trigger, "update_reminder")
-        # no-op guard (#162 п.5): те же значения → успех без записи.
         new_title = title or None
-        if ((new_title is None or new_title == r0.title)
-                and (new_trigger is None or new_trigger == r0.trigger_at)):
-            return f"ok:updated:{r0.id} | {r0.title} | {_fmt(r0.trigger_at)}"
+
         def _mut(commit: bool) -> str:
+            # not-found + no-op ВНУТРИ mutate (Codex R1 MAJOR): иначе replay вернул бы живое
+            # форматирование / «не найдено» вместо сохранённого payload (exact-replay).
+            r0 = session.get(FamilyReminder, reminder_ref)
+            if r0 is None or r0.tenant_id != tenant_id or r0.user_id != user_id:
+                return "Такого напоминания у тебя нет."
+            # no-op guard (#162 п.5): те же значения → успех без записи.
+            if ((new_title is None or new_title == r0.title)
+                    and (new_trigger is None or new_trigger == r0.trigger_at)):
+                return f"ok:updated:{r0.id} | {r0.title} | {_fmt(r0.trigger_at)}"
             r = reminders.update(
                 tenant_id=tenant_id, reminder_id=reminder_ref,
                 title=title or None, trigger_at=new_trigger, commit=commit,
@@ -946,9 +949,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                     scheduled_date: str = "", time_start: str = "") -> str:
         """Изменить задачу: название/заметки и/или ПЕРЕНОС по времени (scheduled_date —
         YYYY-MM-DD, time_start — HH:MM). Связанное напоминание сервис пере-цепит сам."""
-        t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
-        if t0 is None:
-            return "Такой задачи у тебя нет."
+        # parse-валидация ввода (НЕ часть exact-replay — ошибка ввода, без claim op).
         d = ts = None
         if scheduled_date:
             try:
@@ -962,14 +963,20 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 return f"Не разобрала время: {time_start!r}."
         new_title = (title or "").strip()[:500] or None
         new_notes = (notes or "").strip() or None
-        # no-op guard (#162 п.5): те же значения (вкл. дату/время) → успех без записи. Это И
-        # идемпотентность переноса: на replay дата/время уже = новым → НЕ пере-создаём напоминание.
-        if ((new_title is None or new_title == (t0.title or None))
-                and (new_notes is None or new_notes == t0.notes)
-                and (d is None or d == t0.scheduled_date)
-                and (ts is None or ts == t0.time_start)):
-            return f"ok:updated:{t0.id} | {t0.title} | {_fmt_task_when(t0)}"
+
         def _mut(commit: bool) -> str:
+            # not-found + no-op ВНУТРИ mutate (Codex R1 MAJOR): иначе replay вернул бы живое
+            # форматирование / «не найдено» вместо сохранённого payload (exact-replay).
+            t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
+            if t0 is None:
+                return "Такой задачи у тебя нет."
+            # no-op guard (#162 п.5): те же значения (вкл. дату/время) → успех без записи. Это И
+            # идемпотентность переноса: на replay дата/время уже = новым → НЕ пере-создаём напоминание.
+            if ((new_title is None or new_title == (t0.title or None))
+                    and (new_notes is None or new_notes == t0.notes)
+                    and (d is None or d == t0.scheduled_date)
+                    and (ts is None or ts == t0.time_start)):
+                return f"ok:updated:{t0.id} | {t0.title} | {_fmt_task_when(t0)}"
             t = tasks.update(tenant_id=tenant_id, user_id=user_id, task_id=task_ref,
                              title=title or None, notes=notes or None,
                              scheduled_date=d, time_start=ts, commit=commit)

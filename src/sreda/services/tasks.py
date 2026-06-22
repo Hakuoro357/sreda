@@ -752,6 +752,7 @@ class TaskService:
             recurrence_rule=task.recurrence_rule,
             source_memo=f"task:{task.id}",
             bot_key=(self._bot_key if bot_key is _USE_SELF_BOT_KEY else bot_key),
+            commit=commit,  # #163 Фаза 3: не коммитить изнутри savepoint helper'а (tasks.update)
         )
         task.reminder_id = reminder.id
         task.reminder_offset_minutes = offset_minutes
