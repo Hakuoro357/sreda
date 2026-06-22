@@ -169,22 +169,12 @@ class HousewifeReminderService:
         from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
         resolved_bot_key = bot_key if bot_key is not None else LEGACY_NULL_BOT_KEY
 
-        # #163 Фаза 2а: time-aware semantic-ключ (название+время+повтор) → межходовой замок от
-        # дублей. Аддитивно: пишем в normalized_title_hash в ОБА пути (легаси+ReAct); сама
-        # уникальность (partial-unique индекс) — Фаза 2в. user_id||"" — для общесемейных (None).
-        from sreda.services.operation_id import compute_normalized_title_hash
-        nhash = compute_normalized_title_hash(
-            clean_title, entity_type="family_reminder", tenant_id=tenant_id,
-            user_id=user_id or "",
-            extra="\x1f".join([trigger_at.isoformat(), recurrence_rule or ""]))
-
         # #162 Фаза 0 — within-turn идемпотентность создания (эталон
-        # services/housewife_shopping.py::add_items). Ветвление по наличию
-        # ToolRuntimeContext:
-        #   ctx is None  → ЛЕГАСИ-путь (plan-execute/чат сегодня) — байт-в-байт.
-        #   ctx is not None → ReAct-путь: operation_id (с ВРЕМЕНЕМ в logical_key)
-        #                     + INSERT ON CONFLICT DO NOTHING + SELECT (стабильный id).
-        # emit_event/audit в этом срезе НЕ зовём (→ #163).
+        # services/housewife_shopping.py::add_items). Ветвление по наличию ToolRuntimeContext:
+        #   ctx is None  → ЛЕГАСИ-путь (plan-execute/чат сегодня) — байт-в-байт, БЕЗ дедупа.
+        #   ctx is not None → ReAct-путь: operation_id + INSERT ON CONFLICT + semantic_key + reuse.
+        # #163 scope (план + контракт #162 + «не трогаем легаси»): межходовой замок (semantic_key
+        # + дедуп) — ТОЛЬКО на ReAct (ctx) пути; легаси остаётся прежним (без хеша, без дедупа).
         from sreda.runtime.planner.tool_runtime import current_tool_runtime
 
         ctx = current_tool_runtime()
@@ -203,7 +193,6 @@ class HousewifeReminderService:
                 embedding_json=embedding_json,
                 embedding_model=embedding_model,
                 bot_key=resolved_bot_key,
-                normalized_title_hash=nhash,
             )
             self.session.add(reminder)
             self.session.commit()
@@ -246,6 +235,18 @@ class HousewifeReminderService:
             logical_key=logical_key,
         )
 
+        # #163 Фаза 2b — semantic_key (межходовой замок) ТОЛЬКО на ReAct-пути (scope #163; легаси
+        # не трогаем). Напоминание всегда с временем → hash всегда есть. reuse — pre-check + backstop.
+        from sqlalchemy.exc import IntegrityError
+
+        from sreda.services.idempotent_ops import find_existing_pending_semantic
+        from sreda.services.operation_id import compute_normalized_title_hash
+
+        nhash = compute_normalized_title_hash(
+            clean_title, entity_type="family_reminder", tenant_id=tenant_id,
+            user_id=user_id or "",
+            extra=sep.join([trigger_at.isoformat(), recurrence_rule or ""]))
+
         dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
         if dialect_name == "postgresql":
             from sqlalchemy.dialects.postgresql import insert as _insert
@@ -274,8 +275,25 @@ class HousewifeReminderService:
                 index_elements=["tenant_id", "user_id", "operation_id"]
             )
         )
-        self.session.execute(stmt)
-        self.session.commit()
+        # pre-check межходового дубля (одно-поточный путь + тесты): тот же semantic_key, pending →
+        # reuse без вставки. ON CONFLICT(op_id) покрывает within-turn повтор; backstop ниже — гонку.
+        if nhash is not None:
+            existing = find_existing_pending_semantic(
+                self.session, FamilyReminder, tenant_id=tenant_id, user_id=user_id, nhash=nhash)
+            if existing is not None:
+                return existing
+        try:
+            self.session.execute(stmt)
+            self.session.commit()
+        except IntegrityError:
+            # backstop гонки (иной op_id, тот же semantic_key — межходовой) ловит partial-unique индекс.
+            self.session.rollback()
+            existing = (find_existing_pending_semantic(
+                self.session, FamilyReminder, tenant_id=tenant_id,
+                user_id=user_id, nhash=nhash) if nhash is not None else None)
+            if existing is not None:
+                return existing
+            raise
 
         # SELECT-after-conflict: вернуть СТАБИЛЬНУЮ строку (тот же id) и при
         # вставке, и при ON CONFLICT (повтор внутри хода) — иначе replay вернул бы

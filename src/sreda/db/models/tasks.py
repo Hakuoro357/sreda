@@ -30,7 +30,6 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    Text,
     Time,
     text as sql_text,
 )
@@ -163,5 +162,19 @@ class Task(Base):
             "normalized_title_hash",
             postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
+        ),
+        # #163 Фаза 2b — межходовой замок от дублей: не более ОДНОЙ pending задачи
+        # с одним semantic_key. COALESCE(user_id,'__tenant_wide__') — единообразно с
+        # напоминаниями (общесемейные NULL user). Партиал: только pending с непустым hash.
+        Index(
+            "uq_tasks_items_pending_semantic",
+            "tenant_id",
+            sql_text("COALESCE(user_id, '__tenant_wide__')"),
+            "normalized_title_hash",
+            unique=True,
+            postgresql_where=sql_text(
+                "status = 'pending' AND normalized_title_hash IS NOT NULL"),
+            sqlite_where=sql_text(
+                "status = 'pending' AND normalized_title_hash IS NOT NULL"),
         ),
     )

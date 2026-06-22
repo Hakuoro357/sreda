@@ -151,6 +151,21 @@ class FamilyReminder(Base):
             postgresql_where=sa_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sa_text("normalized_title_hash IS NOT NULL"),
         ),
+        # #163 Фаза 2b — межходовой замок от дублей: не более ОДНОГО pending
+        # напоминания с одним semantic_key. COALESCE(user_id,'__tenant_wide__') ловит
+        # ОБЩЕСЕМЕЙНЫЕ (NULL user) — без заглушки NULL≠NULL в UNIQUE их бы не схлопнул.
+        # Партиал: только pending с непустым hash (легаси NULL-hash и не-pending — вне замка).
+        Index(
+            "uq_family_reminders_pending_semantic",
+            "tenant_id",
+            sa_text("COALESCE(user_id, '__tenant_wide__')"),
+            "normalized_title_hash",
+            unique=True,
+            postgresql_where=sa_text(
+                "status = 'pending' AND normalized_title_hash IS NOT NULL"),
+            sqlite_where=sa_text(
+                "status = 'pending' AND normalized_title_hash IS NOT NULL"),
+        ),
     )
 
 

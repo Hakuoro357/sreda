@@ -23,7 +23,6 @@ doesn't roll back the earlier good ones.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import date, datetime, time, timedelta, timezone
 from uuid import uuid4
@@ -32,7 +31,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.housewife import FamilyReminder
-from sreda.db.models.tasks import TASK_STATUSES, Task
+from sreda.db.models.tasks import Task
 from sreda.services.housewife_reminders import HousewifeReminderService
 
 # МСК = UTC+3 круглый год; фиксированный оффсет (не требует tzdata). Для no-profile/unknown-zone
@@ -105,16 +104,9 @@ class TaskService:
 
         now = _utcnow()
 
-        # #163 Фаза 2а: time-aware semantic-ключ (название+дата+время+повтор) → межходовой замок
-        # от дублей. Аддитивно: пишем в normalized_title_hash в ОБА пути (ctx+легаси); уникальность
-        # (partial-unique индекс) — Фаза 2в. user_id||"" — единообразие с легаси-путём.
-        from sreda.services.operation_id import compute_normalized_title_hash
-        nhash = compute_normalized_title_hash(
-            title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
-            extra="\x1f".join([
-                scheduled_date.isoformat() if scheduled_date else "",
-                time_start.isoformat() if time_start else "",
-                recurrence_rule or ""]))
+        # #163 scope (план + контракт #162 + «не трогаем легаси»): межходовой замок (semantic_key
+        # + дедуп) — ТОЛЬКО на ReAct (ctx) пути; легаси (ctx=None) — байт-в-байт прежний, без хеша.
+        # Решение Бориса 2026-06-22: дедупим лишь задачи С датой/временем (без — hash=NULL).
 
         # #162 Фаза 0 — within-turn идемпотентность создания (эталон
         # services/housewife_shopping.py::add_items; симметрично
@@ -162,6 +154,21 @@ class TaskService:
                 entity_type="task",
                 logical_key=logical_key,
             )
+            # #163 Фаза 2b — semantic_key ТОЛЬКО на ReAct-пути; дедупим лишь задачи С датой/временем
+            # (без → nhash=None → вне индекса). reuse — pre-check + backstop ниже.
+            from sqlalchemy.exc import IntegrityError
+
+            from sreda.services.idempotent_ops import find_existing_pending_semantic
+            from sreda.services.operation_id import compute_normalized_title_hash
+
+            nhash = None
+            if scheduled_date is not None or time_start is not None:
+                nhash = compute_normalized_title_hash(
+                    title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
+                    extra=sep.join([
+                        scheduled_date.isoformat() if scheduled_date else "",
+                        time_start.isoformat() if time_start else "",
+                        recurrence_rule or ""]))
             dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
             if dialect_name == "postgresql":
                 from sqlalchemy.dialects.postgresql import insert as _insert
@@ -191,8 +198,24 @@ class TaskService:
                     index_elements=["tenant_id", "user_id", "operation_id"]
                 )
             )
-            self.session.execute(stmt)
-            self.session.commit()
+            # pre-check межходового дубля (одно-поточный путь + тесты): тот же semantic_key, pending →
+            # reuse без вставки. ON CONFLICT(op_id) покрывает within-turn повтор; backstop ниже — гонку.
+            if nhash is not None:
+                existing = find_existing_pending_semantic(
+                    self.session, Task, tenant_id=tenant_id, user_id=user_id, nhash=nhash)
+                if existing is not None:
+                    return existing
+            try:
+                self.session.execute(stmt)
+                self.session.commit()
+            except IntegrityError:
+                self.session.rollback()
+                existing = (find_existing_pending_semantic(
+                    self.session, Task, tenant_id=tenant_id,
+                    user_id=user_id, nhash=nhash) if nhash is not None else None)
+                if existing is not None:
+                    return existing
+                raise
             actual = (
                 self.session.query(Task)
                 .filter(
@@ -209,6 +232,7 @@ class TaskService:
                 )
             return actual
 
+        # Легаси-путь (ctx=None) — БЕЗ semantic_key/дедупа (scope #163: только ReAct), байт-в-байт.
         task = Task(
             id=f"task_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -223,7 +247,6 @@ class TaskService:
             status="pending",
             created_at=now,
             updated_at=now,
-            normalized_title_hash=nhash,
         )
         self.session.add(task)
         self.session.flush()
@@ -291,15 +314,8 @@ class TaskService:
             raise ValueError("title required")
 
         now = _utcnow()
-        # #163 Фаза 2а: time-aware semantic-ключ и на композит-пути (легаси-чат) — иначе задачи
-        # отсюда не участвовали бы в межходовом замке от дублей (анти-пропуск ПРАВИЛО #7).
-        from sreda.services.operation_id import compute_normalized_title_hash
-        nhash = compute_normalized_title_hash(
-            title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
-            extra="\x1f".join([
-                scheduled_date.isoformat() if scheduled_date else "",
-                time_start.isoformat() if time_start else "",
-                recurrence_rule or ""]))
+        # #163 scope: композит-путь — легаси-чат (не ReAct) → БЕЗ semantic_key/дедупа (план #163:
+        # замок только на ReAct). Прежнее поведение байт-в-байт.
         task = Task(
             id=f"task_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -314,7 +330,6 @@ class TaskService:
             status="pending",
             created_at=now,
             updated_at=now,
-            normalized_title_hash=nhash,
         )
         self.session.add(task)
         self.session.flush()  # NO commit — caller owns TX
