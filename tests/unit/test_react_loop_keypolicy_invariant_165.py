@@ -48,8 +48,8 @@ def test_unkeyed_covers_all_unkeyed_policy_165():
 
 
 def test_current_prunable_state_pin_165():
-    """Регресс-пин текущего безопасного состояния: режем shopping (keyed) + web (readonly); карв-аут —
-    5 семей без ключа. Когда семью сделают replay-safe и переведут в "idempotent" — пин обновить ОСОЗНАННО."""
+    """Регресс-пин текущего безопасного состояния: режем shopping (idempotent) + web (metered_read);
+    карв-аут — 5 семей без ключа. Семью сделают replay-safe → "idempotent" → пин обновить ОСОЗНАННО."""
     assert react_loop._PRUNABLE_FAMILIES == frozenset({"shopping", "web"})
     assert react_loop._UNKEYED_WRITE_FAMILIES == frozenset(
         {"recipes", "menu", "household", "checklists", "memory"})
