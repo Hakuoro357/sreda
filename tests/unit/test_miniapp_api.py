@@ -40,6 +40,50 @@ def _make_init_data(
     return urlencode(params)
 
 
+def _seed_housewife_sub(plan_key: str, active_until):
+    """#200 Фаза 0: сидим housewife-план + активную подписку tenant_test на нём."""
+    from datetime import UTC, datetime
+
+    from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+    from sreda.db.session import get_session_factory
+
+    session = get_session_factory()()
+    try:
+        plan = session.query(SubscriptionPlan).filter_by(plan_key=plan_key).first()
+        if plan is None:
+            plan = SubscriptionPlan(
+                id=f"plan_{plan_key}",
+                plan_key=plan_key,
+                feature_key="housewife_assistant",
+                title=f"HW {plan_key}",
+                description="desc",
+                price_rub=0,
+                billing_period_days=30,
+                is_public=True,
+                is_active=True,
+                sort_order=0,
+            )
+            session.add(plan)
+            session.flush()
+        session.add(
+            TenantSubscription(
+                id=f"sub_{plan_key}",
+                tenant_id="tenant_test",
+                plan_id=plan.id,
+                feature_key="housewife_assistant",
+                status="active",
+                starts_at=datetime.now(UTC) - timedelta(days=5),
+                active_until=active_until,
+                cancel_at_period_end=False,
+                quantity=1,
+                next_cycle_quantity=1,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
     """Create a TestClient with in-memory SQLite and a known bot token."""
@@ -173,6 +217,73 @@ class TestMiniAppSummary:
         # #181: EDS Monitor retired — never surfaced in available_skills now.
         eds_plans = [s for s in data["available_skills"] if s["feature_key"] == "eds_monitor"]
         assert len(eds_plans) == 0
+
+
+class TestMiniAppPhase0FeatureKeyResolution:
+    """#200 Фаза 0: витрина резолвит housewife по feature_key, active_until=NULL=бессрочная,
+    plan_key карточки = plan_key активной подписки (для subscribe/cancel)."""
+
+    @pytest.mark.parametrize(
+        "plan_key",
+        ["sreda_free", "housewife_assistant_base", "housewife_grandfathered"],
+    )
+    def test_housewife_active_via_any_plan_with_null_active_until(self, seeded_client, plan_key):
+        _seed_housewife_sub(plan_key, active_until=None)  # бессрочная (free/grandfathered)
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        hw = [s for s in data["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(hw) == 1, f"housewife должен быть активным на плане {plan_key}"
+        assert hw[0]["is_active"] is True
+        # plan_key карточки = plan_key активной подписки (кнопки subscribe/cancel целятся в него)
+        assert hw[0]["plan_key"] == plan_key
+        # и НЕ дублируется в available
+        assert not [
+            s for s in data["available_skills"] if s["feature_key"] == "housewife_assistant"
+        ]
+
+    def test_post_merge_single_sub_on_sreda_free_builds_card(self, seeded_client):
+        """После слияния единственная активная подписка на sreda_free → карточка строится,
+        plan_key=sreda_free, даже без legacy-планов в БД (резолв по feature_key, не plan_key)."""
+        _seed_housewife_sub("sreda_free", active_until=None)
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        data = resp.json()
+        hw = [s for s in data["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(hw) == 1
+        assert hw[0]["plan_key"] == "sreda_free"
+        assert hw[0]["is_active"] is True
+
+    def test_future_active_until_is_active_no_regression(self, seeded_client):
+        """Анти-регресс платного пути: dated-подписка (active_until в будущем) активна."""
+        from datetime import UTC, datetime
+
+        _seed_housewife_sub("sreda_free", active_until=datetime.now(UTC) + timedelta(days=30))
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        hw = [s for s in resp.json()["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(hw) == 1 and hw[0]["is_active"] is True
+
+    def test_expired_sub_falls_to_available_canonical(self, seeded_client):
+        """Истёкшая подписка → не active; available-карточка из канонического плана (plan_key)."""
+        from datetime import UTC, datetime
+
+        _seed_housewife_sub("sreda_free", active_until=datetime.now(UTC) - timedelta(days=1))
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        data = resp.json()
+        assert not [s for s in data["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        avail = [s for s in data["available_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(avail) == 1 and avail[0]["plan_key"] == "sreda_free"
 
 
 class TestMiniAppPlans:

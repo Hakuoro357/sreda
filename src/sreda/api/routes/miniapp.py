@@ -526,32 +526,41 @@ def get_summary(
     # bundled with agents (see SkillManifestBase.includes_voice), not
     # a standalone subscription. Add any future simple agent here with
     # one tuple and no per-agent branching.
-    _simple_skills: list[tuple[str, str, str, str]] = [
-        # (plan_key, feature_key, default_title, icon)
-        ("housewife_assistant_base", "housewife_assistant", "Помощник домохозяйки", "\U0001f3e0"),
+    # #200 (Фаза 0): резолвим простой скил по feature_key, НЕ по зашитому plan_key.
+    # Подписка может быть на любом плане фичи (sreda_free / housewife_base /
+    # grandfathered — после слияния все на sreda_free); карточка + plan_key берутся
+    # из ПЛАНА активной подписки (для not-subscribed — из канонического public-плана).
+    _simple_skills: list[tuple[str, str, str]] = [
+        # (feature_key, default_title, icon)
+        ("housewife_assistant", "Помощник домохозяйки", "🏠"),
     ]
-    for plan_key, feature_key, default_title, icon in _simple_skills:
-        plan = plans_by_key.get(plan_key)
-        if plan is None:
-            continue
-        sub = _get_sub(session, ctx.tenant_id, plan)
-        is_active = _is_active(sub, now)
-        if is_active:
+    plans_by_id = {p.id: p for p in plans_by_key.values()}
+    for feature_key, default_title, icon in _simple_skills:
+        sub = _active_sub_by_feature(session, ctx.tenant_id, feature_key, now)
+        if sub is not None:
+            # Карточка и plan_key — из плана АКТИВНОЙ подписки (subscribe/cancel
+            # должны целиться в него, а не в legacy housewife_assistant_base).
+            plan = plans_by_id.get(sub.plan_id)
+            price = plan.price_rub if plan else 0
             active_skills.append({
                 "feature_key": feature_key,
-                "title": plan.title or default_title,
+                "title": (plan.title if plan else None) or default_title,
                 "icon": icon,
-                "summary_line": "Бесплатно" if plan.price_rub == 0 else f"{plan.price_rub:,} \u20bd/мес".replace(",", " "),
+                "summary_line": "Бесплатно" if price == 0 else f"{price:,} ₽/мес".replace(",", " "),
                 "is_active": True,
-                "plan_key": plan_key,
-                "description": plan.description or "",
-                "price_rub": plan.price_rub,
-                "active_until": _iso(sub.active_until) if sub else None,
+                "plan_key": plan.plan_key if plan else feature_key,
+                "description": (plan.description if plan else "") or "",
+                "price_rub": price,
+                "active_until": _iso(sub.active_until),
             })
         else:
+            # Канонический public+active план фичи (после слияния — sreda_free).
+            plan = _canonical_plan_for_feature(plans_by_key, feature_key)
+            if plan is None:
+                continue
             available_skills.append({
                 "feature_key": feature_key,
-                "plan_key": plan_key,
+                "plan_key": plan.plan_key,
                 "title": plan.title or default_title,
                 "icon": icon,
                 "description": plan.description or "",
@@ -583,32 +592,55 @@ def _plans_by_key(session: Session) -> dict[str, SubscriptionPlan]:
     return {p.plan_key: p for p in plans}
 
 
-def _get_sub(
-    session: Session, tenant_id: str, plan: SubscriptionPlan | None,
+def _active_sub_by_feature(
+    session: Session, tenant_id: str, feature_key: str, now: datetime,
 ) -> TenantSubscription | None:
-    if plan is None:
-        return None
-    return (
+    """#200: активная подписка фичи через feature_key (не через зашитый plan_key).
+
+    Партиальный unique-index гарантирует ≤1 active подписку на (tenant, feature_key),
+    но подписка может быть на ЛЮБОМ плане фичи (sreda_free / housewife_base / grandfathered).
+    """
+    subs = (
         session.query(TenantSubscription)
         .filter(
             TenantSubscription.tenant_id == tenant_id,
-            TenantSubscription.plan_id == plan.id,
+            TenantSubscription.feature_key == feature_key,
         )
-        .first()
+        .order_by(TenantSubscription.id)  # детерминизм (страховка, если active + scheduled_for_cancel)
+        .all()
     )
+    for sub in subs:
+        if _is_active(sub, now):
+            return sub
+    return None
+
+
+def _canonical_plan_for_feature(
+    plans_by_key: dict[str, SubscriptionPlan], feature_key: str,
+) -> SubscriptionPlan | None:
+    """#200: какой план рекламировать not-subscribed-пользователю — public+active план
+    фичи с наименьшим sort_order (sreda_free=0 → канонический free после слияния)."""
+    candidates = [
+        p for p in plans_by_key.values()
+        if p.feature_key == feature_key and p.is_active and p.is_public
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda p: (p.sort_order or 0, p.plan_key))
 
 
 def _is_active(sub: TenantSubscription | None, now: datetime) -> bool:
     if sub is None or not sub.quantity or sub.quantity <= 0:
         return False
-    if not sub.active_until:
+    if sub.status not in {"active", "scheduled_for_cancel"}:
         return False
+    # #200: active_until is None = бессрочная (free/grandfathered) — НЕ отбрасывать.
+    if sub.active_until is None:
+        return True
     active_until = sub.active_until
     if active_until.tzinfo is None:
         active_until = active_until.replace(tzinfo=UTC)
-    if active_until <= now:
-        return False
-    return sub.status in {"active", "scheduled_for_cancel"}
+    return active_until > now
 
 
 def _iso(dt) -> str | None:
