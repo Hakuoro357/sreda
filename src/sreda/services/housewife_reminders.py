@@ -74,6 +74,40 @@ def _coerce_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def compute_next_occurrence_after(
+    recurrence_rule: str,
+    dtstart: datetime,
+    reference: datetime,
+) -> datetime | None:
+    """Next RRULE occurrence STRICTLY after *reference* (``inc=False``), or None.
+
+    Extracted from the formerly-duplicated inline rrule logic in
+    ``mark_fired`` and ``acknowledge`` (#187 Phase 3) so the restore-window
+    drain can reuse the exact same advance semantics. The two former call-sites
+    now delegate here — behaviour is byte-identical (same ``rrulestr(...,
+    dtstart).after(reference, inc=False)`` call, same UTC coercion).
+
+    All datetimes are coerced to UTC first (``_coerce_utc``): SQLite strips
+    tzinfo on store, so callers may hand us naive wall-clock values.
+
+    Failure handling: a malformed ``recurrence_rule`` (should not happen — it's
+    validated at ``schedule``/``update`` time) is logged and treated as "no
+    future occurrence" (returns None), matching the pre-extraction behaviour
+    where both call-sites swallowed the exception and fell back to None.
+    """
+    try:
+        rule = rrulestr(recurrence_rule, dtstart=_coerce_utc(dtstart))
+        next_occ = rule.after(_coerce_utc(reference), inc=False)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "failed to compute next occurrence for rule %r", recurrence_rule
+        )
+        return None
+    if next_occ is None:
+        return None
+    return _coerce_utc(next_occ)
+
+
 def _initial_next_trigger_at(trigger_at: datetime, recurrence_rule: str | None) -> datetime:
     """Return the first pending fire time for a newly scheduled reminder."""
     trigger_at = _coerce_utc(trigger_at)
@@ -531,24 +565,15 @@ class HousewifeReminderService:
             reminder.next_trigger_at = None
             return
 
-        try:
-            rule = rrulestr(
-                reminder.recurrence_rule,
-                dtstart=_coerce_utc(reminder.trigger_at),
-            )
-            next_occ = rule.after(current, inc=False)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "reminder %s: failed to compute next occurrence, marking fired",
-                reminder.id,
-            )
-            next_occ = None
-
+        # #187 Phase 3 — shared helper (was inline here AND in acknowledge).
+        next_occ = compute_next_occurrence_after(
+            reminder.recurrence_rule, reminder.trigger_at, current
+        )
         if next_occ is None:
             reminder.status = "fired"
             reminder.next_trigger_at = None
         else:
-            reminder.next_trigger_at = _coerce_utc(next_occ)
+            reminder.next_trigger_at = next_occ
 
     def acknowledge(
         self, reminder: FamilyReminder, *, now: datetime | None = None
@@ -571,24 +596,15 @@ class HousewifeReminderService:
             reminder.next_trigger_at = None
             return
 
-        try:
-            rule = rrulestr(
-                reminder.recurrence_rule,
-                dtstart=_coerce_utc(reminder.trigger_at),
-            )
-            next_occ = rule.after(current, inc=False)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "reminder %s: failed to compute next occurrence on ack",
-                reminder.id,
-            )
-            next_occ = None
-
+        # #187 Phase 3 — shared helper (was inline here AND in mark_fired).
+        next_occ = compute_next_occurrence_after(
+            reminder.recurrence_rule, reminder.trigger_at, current
+        )
         if next_occ is None:
             reminder.status = "fired"
             reminder.next_trigger_at = None
         else:
-            reminder.next_trigger_at = _coerce_utc(next_occ)
+            reminder.next_trigger_at = next_occ
 
     def snooze(
         self,

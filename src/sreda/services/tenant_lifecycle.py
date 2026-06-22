@@ -21,6 +21,7 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import Session
 
 from sreda.db.models.core import OutboxMessage, Tenant
+from sreda.db.models.housewife import FamilyReminder
 from sreda.db.models.inbound_event import InboundEvent
 from sreda.db.models.message_jobs import MessageJob
 
@@ -315,6 +316,189 @@ def soft_delete_tenant(session: Session, tenant_id: str) -> bool:
         session.commit()
         logger.info(
             "soft_delete_tenant: tenant %s помечен удалённым + drain выполнен",
+            tenant_id,
+        )
+        return True
+
+
+def restore_tenant(session: Session, tenant_id: str) -> bool:
+    """Снимает `deleted_at` И зачищает окно удаления `[deleted_at, restored_at]`.
+
+    Симметрично ``soft_delete_tenant``: работает ПОД тем же session-scoped
+    advisory-lock и коммитит ПОД локом (Фаза 3). Возвращает ``True`` если тенант
+    был восстановлен в этом вызове, ``False`` если он уже активен (no-op).
+
+    **Идемпотентность:** если ``tenant.deleted_at IS NULL`` (уже активен или
+    никогда не удалялся) — НИЧЕГО не делаем (return False). Нет строки → тоже
+    False (нечего восстанавливать).
+
+    **Зачистка окна удаления (анти-воскрешение, A2).** За время удаления
+    producer-фильтр воркеров не давал тенанту ничего слать, но pending-артефакты
+    с триггером ВНУТРИ окна остались «взведёнными». Если просто снять флаг — они
+    выстрелят пачкой сразу после restore (просрочка). Окно — ИМЕННО
+    ``[deleted_at, restored_at]`` (обе границы включительно): дренируем то, чей
+    триггер/появление попали В ЭТОТ ИНТЕРВАЛ. Артефакты, просроченные ЕЩЁ ДО
+    удаления (триггер ``< deleted_at``), НЕ трогаем — они не результат удаления
+    (R1 MAJOR: без нижней границы был over-reach). ``deleted_at`` читаем ДО
+    обнуления флага:
+
+      - **one-shot reminders** (``recurrence_rule IS NULL``, ``status='pending'``,
+        ``deleted_at <= next_trigger_at <= restored_at``) → ``status='cancelled'`` +
+        ``next_trigger_at=None`` (терминал, как штатный ``cancel()``). Они
+        просрочены за период удаления → пользователю уже не актуальны. Берём
+        ``cancelled``, НЕ ``fired``: ``snooze()`` безусловно ставит
+        ``status='pending'`` и мог бы воскресить ``fired`` — ``cancelled``
+        безопаснее (а эти и не доставлялись).
+      - **recurring reminders** (``recurrence_rule`` НЕ NULL, ``status='pending'``,
+        ``deleted_at <= next_trigger_at <= restored_at``) → сдвиг ``next_trigger_at``
+        на следующее вхождение СТРОГО ПОСЛЕ ``restored_at`` (пропущенные за период
+        удаления НЕ слать). Через общий ``compute_next_occurrence_after`` (тот же,
+        что в ``mark_fired``/``acknowledge``). Если будущих вхождений нет
+        (исчерпан ``COUNT``/``UNTIL``) → ``status='fired'`` + ``next_trigger_at=
+        None`` (как в воркере).
+      - **inbound_events** нетерминальные (new/needs_classification/classified),
+        у которых ``created_at`` В ``[deleted_at, restored_at]`` ИЛИ ``classified_at``
+        В ``[deleted_at, restored_at]`` → ``status='skipped'`` +
+        ``status_reason='tenant_deleted'`` (защитно; симметрично one-shot — иначе
+        ``list_ready_for_delivery`` оживил бы старый проактив после restore).
+        ``classified_at`` nullable (inbound_event.py:95) → «new» (без classified_at)
+        ловится парой по ``created_at``; NULL-сравнение по classified_at тихо не
+        матчит, предикат не ломается.
+
+    Дренированное (``cancelled``/``fired``/``skipped``/advanced) НЕ воскрешается:
+    статус терминальный или триггер уже в будущем относительно ``restored_at``.
+
+    Будущие напоминания (триггер ``> restored_at``, вне окна) и просроченные ДО
+    удаления (``< deleted_at``) НЕ трогаются — первые взведены легитимно (сработают
+    позже), вторые не относятся к удалению.
+    """
+    from sreda.services.housewife_reminders import compute_next_occurrence_after
+
+    with tenant_advisory_lock(session, tenant_id):
+        tenant = session.get(Tenant, tenant_id)
+        if tenant is None:
+            # Нет строки — нечего восстанавливать. Коммит под локом (инвариант
+            # «лок до durable-точки» единообразен на всех путях, как в delete).
+            logger.warning("restore_tenant: tenant %s не найден — no-op", tenant_id)
+            session.commit()
+            return False
+
+        if tenant.deleted_at is None:
+            # Уже активен (или не удалялся) — идемпотентный no-op. Коммит под
+            # локом (симметрично delete-no-op-пути).
+            session.commit()
+            return False
+
+        # 🔴 Нижняя граница окна — СОХРАНИТЬ deleted_at ДО обнуления флага.
+        # Окно зачистки — ИМЕННО ``[deleted_at, restored_at]`` (включительно с
+        # обоих концов): артефакт, просроченный/созданный ВНУТРИ периода удаления,
+        # дренируем; артефакт, просроченный ЕЩЁ ДО удаления (next_trigger_at <
+        # deleted_at), НЕ трогаем — он не результат удаления, у него своя судьба
+        # (его проворонил/обработал воркер до удаления). Без нижней границы был
+        # over-reach: restore отменял/сдвигал напоминания, к удалению отношения
+        # не имевшие (R1 MAJOR).
+        # Нормализуем deleted_at к aware-UTC: на PG ``DateTime(timezone=True)``
+        # отдаёт aware, на SQLite (тесты) — naive. Без нормализации Python-side
+        # evaluator bulk-UPDATE (``synchronize_session='evaluate'``) падал бы
+        # ``can't compare offset-naive and offset-aware`` на сравнении naive
+        # deleted_at с aware created_at/next_trigger_at. Делаем обе границы окна
+        # aware — сравнения единообразны на любом диалекте.
+        deleted_at = tenant.deleted_at
+        if deleted_at is not None and deleted_at.tzinfo is None:
+            deleted_at = deleted_at.replace(tzinfo=timezone.utc)
+        restored_at = datetime.now(timezone.utc)
+        tenant.deleted_at = None
+
+        # --- one-shot reminders в окне → cancelled (терминал) ------------
+        # ``synchronize_session=False``: ДБ выполняет WHERE (включая datetime-
+        # сравнения), без Python-side evaluator, который мешал бы naive/aware
+        # datetime'ы на смешанных строках. Вызывающий перечитывает строки
+        # (``refresh``) после commit — устаревшего in-session-стейта нет.
+        session.execute(
+            update(FamilyReminder)
+            .where(
+                FamilyReminder.tenant_id == tenant_id,
+                FamilyReminder.status == "pending",
+                FamilyReminder.recurrence_rule.is_(None),
+                FamilyReminder.next_trigger_at.isnot(None),
+                FamilyReminder.next_trigger_at >= deleted_at,
+                FamilyReminder.next_trigger_at <= restored_at,
+            )
+            .values(status="cancelled", next_trigger_at=None, updated_at=restored_at),
+            execution_options={"synchronize_session": False},
+        )
+
+        # --- recurring reminders в окне → сдвиг за restored_at ------------
+        # Построчно (rrule per-row): берём pending recurring, чей next_trigger_at
+        # внутри окна [deleted_at, restored_at], и двигаем на следующее вхождение
+        # СТРОГО ПОСЛЕ restored_at.
+        due_recurring = (
+            session.query(FamilyReminder)
+            .filter(
+                FamilyReminder.tenant_id == tenant_id,
+                FamilyReminder.status == "pending",
+                FamilyReminder.recurrence_rule.isnot(None),
+                FamilyReminder.next_trigger_at.isnot(None),
+                FamilyReminder.next_trigger_at >= deleted_at,
+                FamilyReminder.next_trigger_at <= restored_at,
+            )
+            .all()
+        )
+        for reminder in due_recurring:
+            next_occ = compute_next_occurrence_after(
+                reminder.recurrence_rule, reminder.trigger_at, restored_at
+            )
+            if next_occ is None:
+                # Вхождений после restored_at нет (исчерпан COUNT/UNTIL) →
+                # терминал, как в воркере при пустом next_occ.
+                reminder.status = "fired"
+                reminder.next_trigger_at = None
+            else:
+                reminder.next_trigger_at = next_occ
+            reminder.updated_at = restored_at
+
+        # --- inbound_events нетерминальные В ОКНЕ → skipped --------------
+        # Окно — ``[deleted_at, restored_at]`` (нижняя граница включительно).
+        # Цель: событие, СОЗДАННОЕ в окне (``created_at``) ИЛИ ставшее
+        # классифицированным в окне (``classified_at``). Две независимые пары
+        # диапазонов, каждая со своими границами:
+        #   - created_at  В [deleted_at, restored_at]  — ловит «new» (у которых
+        #     ``classified_at IS NULL``: предикат по classified_at на NULL даёт
+        #     NULL/неопределённость, поэтому «new» ловится ТОЛЬКО этой парой);
+        #   - classified_at В [deleted_at, restored_at] — ловит события,
+        #     классифицированные в окне (даже если созданы раньше удаления —
+        #     переход в нетерминальный «classified» случился внутри окна).
+        # ``classified_at`` nullable (db/models/inbound_event.py:95) → на NULL
+        # вторая пара тихо не матчит (NULL-сравнение = не-TRUE), предикат не
+        # ломается. Без нижней границы был over-reach: skip'ались и события,
+        # созданные/классифицированные ЕЩЁ ДО удаления (R1 MAJOR).
+        from sqlalchemy import and_, or_
+
+        session.execute(
+            update(InboundEvent)
+            .where(
+                InboundEvent.tenant_id == tenant_id,
+                InboundEvent.status.in_(_INBOUND_NON_TERMINAL),
+                or_(
+                    and_(
+                        InboundEvent.created_at >= deleted_at,
+                        InboundEvent.created_at <= restored_at,
+                    ),
+                    and_(
+                        InboundEvent.classified_at >= deleted_at,
+                        InboundEvent.classified_at <= restored_at,
+                    ),
+                ),
+            )
+            .values(status="skipped", status_reason=_DRAIN_REASON),
+            # См. one-shot выше: ДБ-side WHERE, без Python evaluator (naive/aware).
+            execution_options={"synchronize_session": False},
+        )
+
+        # Коммит ПОД локом (симметрично soft_delete): флаг+drain durable до unlock.
+        session.commit()
+        logger.info(
+            "restore_tenant: tenant %s восстановлен + окно удаления зачищено",
             tenant_id,
         )
         return True
