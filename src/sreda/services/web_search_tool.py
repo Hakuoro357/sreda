@@ -27,12 +27,16 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx
 from langchain_core.tools import tool as lc_tool
 
 from sreda.config.settings import get_settings
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +156,18 @@ _TAVILY_URL = "https://api.tavily.com/search"
 _TAVILY_TIMEOUT_SECONDS = 8.0
 _QUOTA_EXHAUSTED_MSG = "error: Достигнут лимит поиска"
 
+# Машинный статус для free-исчерпания per-user (LLM формулирует апсейл).
+# Форма как у no-results/error — `error:<machine_code>:<copy>` (#200 Фаза 1).
+_FREE_QUOTA_EXHAUSTED_MSG = (
+    "error:web_search_quota_exhausted:"
+    "Веб-поиск исчерпан на этот месяц — доступно в расширенном тарифе"
+)
+# Транзиентная недоступность (provider 5xx/timeout/auth ИЛИ global 950 для
+# free): НЕ апсейл, НЕ DDG — слот не считается.
+_WEB_SEARCH_UNAVAILABLE_MSG = (
+    "error: веб-поиск временно недоступен, попробуйте позже"
+)
+
 
 def _format_results(items: list[tuple[str, str, str]]) -> str:
     """Convert (title, body, url) tuples to the LLM-facing formatted block:
@@ -246,24 +262,31 @@ def build_web_search_tool(
     session: "Session | None" = None,
     tenant_id: str | None = None,
     user_id: str | None = None,
+    per_user_cap: int | None = 5,
+    is_free: bool = True,
 ) -> Callable:
-    """Return a LangChain tool — Tavily primary + DDG fallback при
-    превышении квоты.
+    """Return a LangChain tool — Tavily primary + DDG fallback.
 
     2026-04-29: переехали с DDGS-html (Bing) на Tavily API из-за
-    Bing-403 на RU egress. Tavily free 1000/мес, разделяем по юзерам
-    через `WebSearchUsageCounter` (30/user/month + 950 global hard).
-    При исчерпании — fallback на DDG `backend="api"` (instant answers,
-    free но низкого качества).
+    Bing-403 на RU egress. Tavily free 1000/мес.
+
+    #200 Фаза 1 — тир-aware политика веб-поиска (веб-поиск доступен ВСЕМ):
+    * free (`per_user_cap=5`, `is_free=True`) — жёстко 5/мес: атомарный
+      счётчик не даёт 6-й Tavily-вызов; на исчерпании — машинный статус
+      апсейла (LLM формулирует), без DDG.
+    * grandfathered/платные (`per_user_cap=None`, `is_free=False`) — без
+      per-user лимита; при global≥950 → DDG fallback.
+    Глобальный 950/мес резервируется атомарно в той же транзакции, что и
+    per-user (`try_consume_tavily`).
 
     Args:
-        session: SQLAlchemy session для quota-counter. Если None —
-            quota не проверяется (legacy fallback / tests без БД).
-        tenant_id, user_id: scoping для quota-counter. Без них
-            quota не отслеживается.
+        session: SQLAlchemy session — Engine берём через ``session.get_bind()``
+            для атомарного консьюма. Если None — quota не проверяется
+            (legacy / tests без БД); см. fail-closed ниже.
+        tenant_id, user_id: scope для счётчика.
+        per_user_cap: per-user лимит (free=5) или None (без лимита).
+        is_free: free-тир (определяет fail-closed и поведение на global≥950).
     """
-    from sqlalchemy.orm import Session as _Session  # noqa: F401  (typing only)
-
     api_key = (get_settings().tavily_api_key or "").strip()
 
     @lc_tool
@@ -280,6 +303,11 @@ def build_web_search_tool(
         its URL to read the actual page — snippets rarely answer the
         full question on their own.
 
+        Note: на бесплатном тарифе веб-поиск ограничен 5 запросами в
+        месяц (не «нет веб-поиска»). При исчерпании tool возвращает
+        машинный статус ``error:web_search_quota_exhausted:…`` — мягко
+        сообщи юзеру и предложи расширенный тариф.
+
         Args:
             query: Short search phrase. Write it as you'd type into
                 Google — 3-8 words, no quotes unless exact match is
@@ -287,52 +315,105 @@ def build_web_search_tool(
 
         Returns:
             A formatted block with up to 3 results, each
-            "N. Title\\n<snippet>\\n<url>". On quota exhaustion +
-            fallback failure returns ``"error: Достигнут лимит
-            поиска"``. Adapt and respond gracefully.
+            "N. Title\\n<snippet>\\n<url>". On free-quota exhaustion —
+            ``error:web_search_quota_exhausted:<copy>``; on transient
+            unavailability — ``error: веб-поиск временно недоступен…``.
+            Adapt and respond gracefully.
         """
         q = (query or "").strip()
         if not q:
             return "error: empty query"
 
-        # Decide: Tavily or DDG fallback?
-        use_tavily = bool(api_key)
-        if use_tavily and session is not None and tenant_id and user_id:
-            from sreda.services.web_search_usage import WebSearchUsageCounter
-            counter = WebSearchUsageCounter(session)
-            if not counter.can_use_tavily(tenant_id=tenant_id, user_id=user_id):
-                logger.info(
-                    "web_search: quota exhausted tenant=%s user=%s — fallback to DDG",
-                    tenant_id, user_id,
-                )
-                use_tavily = False
-        else:
-            counter = None
+        # Нет api_key — DDG как раньше (quota не применяется).
+        if not api_key:
+            return _ddg_fallback(q, session, tenant_id, user_id)
 
-        # Primary: Tavily
-        if use_tavily:
-            results = _call_tavily(q, api_key)
-            if results is not None:
-                if counter is not None and tenant_id and user_id:
-                    try:
-                        counter.record_tavily(tenant_id=tenant_id, user_id=user_id)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("web_search: tavily counter failed")
-                return _format_results(results)
-            # Tavily fail (network/auth/etc) — fall through to DDG.
-
-        # Fallback: DDG
-        results = _call_ddg_fallback(q)
-        if results is None:
-            return _QUOTA_EXHAUSTED_MSG
-        if counter is not None and tenant_id and user_id:
+        # Полный контекст для атомарного консьюма?
+        engine = None
+        if session is not None and tenant_id and user_id:
             try:
-                counter.record_fallback(tenant_id=tenant_id, user_id=user_id)
+                engine = session.get_bind()
             except Exception:  # noqa: BLE001
-                logger.exception("web_search: fallback counter failed")
-        return _format_results(results)
+                engine = None
+
+        if engine is None:
+            # Fail-closed: api_key есть, но НЕТ полного контекста.
+            # free → апсейл-статус (НЕ безлимитный Tavily); non-free → DDG.
+            # (В рантайме контекст всегда есть — это защита.)
+            if is_free:
+                logger.warning(
+                    "web_search: missing context (session/tenant/user) "
+                    "for free tier — fail-closed quota exhausted",
+                )
+                return _FREE_QUOTA_EXHAUSTED_MSG
+            return _ddg_fallback(q, session, tenant_id, user_id)
+
+        from sreda.services.web_search_usage import (
+            QuotaDecision,
+            release_tavily,
+            try_consume_tavily,
+        )
+
+        dec = try_consume_tavily(
+            engine, tenant_id, user_id, per_user_cap,
+        )
+
+        if dec is QuotaDecision.USER_EXHAUSTED:
+            logger.info(
+                "web_search: free per-user quota exhausted tenant=%s user=%s",
+                tenant_id, user_id,
+            )
+            return _FREE_QUOTA_EXHAUSTED_MSG
+
+        if dec is QuotaDecision.GLOBAL_EXHAUSTED:
+            logger.info(
+                "web_search: global quota exhausted tenant=%s user=%s is_free=%s",
+                tenant_id, user_id, is_free,
+            )
+            if is_free:
+                # Слот не считается, без DDG — транзиентная недоступность.
+                return _WEB_SEARCH_UNAVAILABLE_MSG
+            return _ddg_fallback(q, session, tenant_id, user_id)
+
+        # ALLOW — слот зарезервирован атомарно. Зовём Tavily.
+        results = _call_tavily(q, api_key)
+        if results is not None:
+            # results ИЛИ empty → СЧИТАЕТСЯ (слот уже занят).
+            return _format_results(results)
+
+        # Tavily None (5xx/timeout/auth) → release слот + транзиентная ошибка.
+        try:
+            release_tavily(engine, tenant_id, user_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("web_search: release_tavily failed")
+        return _WEB_SEARCH_UNAVAILABLE_MSG
 
     return web_search
+
+
+def _ddg_fallback(
+    q: str,
+    session: "Session | None",
+    tenant_id: str | None,
+    user_id: str | None,
+) -> str:
+    """DDG fallback + record_fallback (DDG-аналитика, не атомизируем).
+
+    Используется когда: нет api_key; non-free при global≥950; non-free
+    без полного контекста.
+    """
+    results = _call_ddg_fallback(q)
+    if results is None:
+        return _QUOTA_EXHAUSTED_MSG
+    if session is not None and tenant_id and user_id:
+        try:
+            from sreda.services.web_search_usage import WebSearchUsageCounter
+            WebSearchUsageCounter(session).record_fallback(
+                tenant_id=tenant_id, user_id=user_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("web_search: fallback counter failed")
+    return _format_results(results)
 
 
 def build_fetch_url_tool() -> Callable:
