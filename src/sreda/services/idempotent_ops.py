@@ -130,24 +130,26 @@ def execute_idempotent_durable_op(
         operation_family=operation_family, tool_name=tool_name,
         operation_id=operation_id, args_hmac=args_hmac, status="pending",
         created_at=now, updated_at=now)
+    # claim + мутация + payload — в ОДНОМ SAVEPOINT (Codex medium R1 MAJOR): любое исключение
+    # (включая сбой mutate_fn, напр. ValueError из валидации сервиса) откатывает claim ВМЕСТЕ с
+    # мутацией → нет orphan pending-строки, которую следующий tool закоммитил бы (иначе replay
+    # упёрся бы в IdempotencyInFlight НАВСЕГДА, мутации-то не было). На успехе savepoint
+    # релизится, затем commit — per-operation граница (владелец commit = helper).
     try:
-        with session.begin_nested():  # SAVEPOINT: гонка INSERT (unique) не отравит внешнюю tx
+        with session.begin_nested():  # SAVEPOINT
             session.add(row)
-            session.flush()  # занять operation_id (unique) ДО мутации (claim-first)
+            session.flush()  # claim-first: занять operation_id (unique) ДО мутации
+            payload = mutate_fn()
+            row.stable_return_payload = payload
+            row.status = "committed"
+            row.updated_at = datetime.now(timezone.utc)
     except IntegrityError:
-        # racer успел вставить тот же operation_id между нашим query и flush → перечитать и
-        # разрулить (replay / mismatch / in-flight), не дублируя мутацию.
+        # Либо гонка по operation_id (racer вставил между query и flush), либо мутация нарушила
+        # constraint. Наш claim уже откатан savepoint'ом. Если по operation_id committed-строка
+        # есть (racer) → replay её; иначе (нет/наш откатан) → ре-райзим (зеркало billing.py).
         existing = _lookup(session, operation_id)
         if existing is None:
-            # IntegrityError НЕ от нашего uq(operation_id) (Фаза 3: иной constraint) — НЕ маскируем
-            # «строкой не найдено»; ре-райзим исходный (зеркало billing.py). Настоящий баг виден.
             raise
         return _resolve(existing)
-
-    # claim наш → выполнить мутацию (в тесте no-op; реальная мутация сервиса — Фаза 3).
-    payload = mutate_fn()
-    row.stable_return_payload = payload
-    row.status = "committed"
-    row.updated_at = datetime.now(timezone.utc)
     session.commit()
     return payload
