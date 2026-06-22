@@ -156,3 +156,74 @@ def test_collect_tool_calls_hmac_and_merge(persist):
     tc = res[0]
     assert tc["name"] == "cancel_reminder" and tc["ok"] is True and tc["result_kind"] == "ok"
     assert tc["args_hash"].startswith("v1:") and "r1" not in tc["args_hash"]  # HMAC, не сырьё
+
+
+def test_collect_result_kind_variants(persist):
+    """result_kind: error/unavailable/unknown_family → ok=false (не успех вслепую)."""
+    p, _ = persist
+    msgs = [
+        AIMessage(content="", tool_calls=[
+            {"name": "add_task", "args": {"t": "x"}, "id": "c1"},
+            {"name": "ghost_tool", "args": {}, "id": "c2"},
+            {"name": "need_family", "args": {"family": "wat"}, "id": "c3"}]),
+        ToolMessage(content="err", tool_call_id="c1", status="error",
+                    artifact={"result_kind": "error", "error_type": "ValueError"}),
+        ToolMessage(content="недоступен", tool_call_id="c2", status="success",
+                    artifact={"result_kind": "unavailable"}),
+        ToolMessage(content="неизвестна", tool_call_id="c3", status="success",
+                    artifact={"result_kind": "unknown_family"}),
+    ]
+    by = {t["name"]: t for t in p.collect_tool_calls(msgs, tenant_id="t1")}
+    assert by["add_task"]["result_kind"] == "error" and by["add_task"]["ok"] is False
+    assert by["add_task"]["error_type"] == "ValueError"
+    assert by["ghost_tool"]["result_kind"] == "unavailable" and by["ghost_tool"]["ok"] is False
+    assert by["need_family"]["result_kind"] == "unknown_family" and by["need_family"]["ok"] is False
+
+
+def test_nullable_user_dedup(persist):
+    """tenant-wide (user_id=None) + один turn_key → одна строка (expression-unique backstop)."""
+    p, SF = persist
+    tk = "react:tg:t1:nu"
+    p.persist_trace_start(tenant_id="t1", user_id=None, thread_id="th", channel="tg",
+                          turn_key=tk, origin_user_text="x")
+    p.persist_trace_start(tenant_id="t1", user_id=None, thread_id="th", channel="tg",
+                          turn_key=tk, origin_user_text="y")
+    assert len(_row(SF, tk)) == 1
+
+
+def test_tenant_scoped(persist):
+    """finish одного тенанта не задевает строку другого с тем же turn_key (user-scope)."""
+    p, SF = persist
+    tk = "react:tg:shared:k"
+    p.persist_trace_start(tenant_id="tA", user_id="u", thread_id="th", channel="tg",
+                          turn_key=tk, origin_user_text="A")
+    p.persist_trace_start(tenant_id="tB", user_id="u", thread_id="th", channel="tg",
+                          turn_key=tk, origin_user_text="B")
+    p.persist_trace_finish(tenant_id="tA", user_id="u", thread_id="th", channel="tg",
+                           turn_key=tk, reply_text="rA", llm_calls=[], tool_calls=[],
+                           confirm_state="none", outcome="ok", passes=1)
+    s = SF()
+    try:
+        rows = {r.tenant_id: r for r in s.query(ReactTurnTrace).filter(
+            ReactTurnTrace.turn_key == tk).all()}
+        assert rows["tA"].status == "done" and rows["tB"].status == "in_progress"  # tB не задет
+    finally:
+        s.close()
+
+
+def test_stale_in_progress_detectable(persist):
+    """Застрявшие in_progress находятся запросом (ради чего и stateful)."""
+    from datetime import datetime, timedelta, timezone
+
+    p, SF = persist
+    p.persist_trace_start(tenant_id="t1", user_id="u", thread_id="th", channel="tg",
+                          turn_key="react:tg:t1:stuck", origin_user_text="x")
+    s = SF()
+    try:
+        # «застрявшие» = in_progress (на проде фильтр created_at < now-N мин; здесь свежая → ловим по статусу)
+        stuck = s.query(ReactTurnTrace).filter(
+            ReactTurnTrace.status == "in_progress",
+            ReactTurnTrace.created_at < datetime.now(timezone.utc) + timedelta(minutes=1)).all()
+        assert len(stuck) == 1
+    finally:
+        s.close()

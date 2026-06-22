@@ -22,7 +22,12 @@ def _derive_key() -> tuple[str, bytes]:
     from sreda.config.settings import get_settings
 
     s = get_settings()
-    secret = (s.encryption_key or "").encode("utf-8")
+    raw = s.encryption_key or ""
+    if not raw:
+        # без секрета HMAC выродился бы в предсказуемый (анти-словарь пропал) → явная ошибка
+        # (ловится guard'ом персиста: трейс пропускается, ход не падает). В проде ключ всегда задан.
+        raise ValueError("encryption_key required for react_trace args HMAC")
+    secret = raw.encode("utf-8")
     key_id = s.encryption_key_id or "0"
     # HKDF-expand-подобно: HMAC(secret, info) — domain-separated 32-байтный ключ
     derived = hmac.new(secret, _KDF_INFO, hashlib.sha256).digest()

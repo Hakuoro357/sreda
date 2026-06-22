@@ -67,7 +67,7 @@ def persist_trace_pause(*, tenant_id: str, user_id: str | None, turn_key: str) -
     if not trace_enabled():
         return
     try:
-        from sqlalchemy import update
+        from sqlalchemy import func, update
 
         from sreda.db.models import ReactTurnTrace
         sess = _session()
@@ -76,6 +76,9 @@ def persist_trace_pause(*, tenant_id: str, user_id: str | None, turn_key: str) -
                 update(ReactTurnTrace)
                 .where(ReactTurnTrace.turn_key == turn_key,
                        ReactTurnTrace.tenant_id == tenant_id,
+                       # nullable-safe user-скоуп (как в uq_react_turn_trace_scope) — не задеть
+                       # чужую строку при коллизии turn_key внутри тенанта (R1 MAJOR Codex)
+                       func.coalesce(ReactTurnTrace.user_id, "") == (user_id or ""),
                        ReactTurnTrace.status == "in_progress")
                 .values(status="awaiting_confirm", confirm_state="pending"))
             sess.commit()
@@ -95,7 +98,7 @@ def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str,
     if not trace_enabled():
         return
     try:
-        from sqlalchemy import update
+        from sqlalchemy import func, update
         from sqlalchemy.exc import IntegrityError
 
         from sreda.db.models import ReactTurnTrace
@@ -111,6 +114,8 @@ def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str,
                 update(ReactTurnTrace)
                 .where(ReactTurnTrace.turn_key == turn_key,
                        ReactTurnTrace.tenant_id == tenant_id,
+                       # nullable-safe user-скоуп (R1 MAJOR Codex) — как в uq_react_turn_trace_scope
+                       func.coalesce(ReactTurnTrace.user_id, "") == (user_id or ""),
                        ReactTurnTrace.status.in_(("in_progress", "awaiting_confirm")))
                 .values(**vals))
             if (res.rowcount or 0) == 0:

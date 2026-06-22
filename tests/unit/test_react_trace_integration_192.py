@@ -111,3 +111,62 @@ async def test_trace_integration_disabled_no_row(db_session, _test_engine, monke
         assert _trace_rows(SF, u.tenant_id) == []
     finally:
         st_mod.get_settings.cache_clear()
+
+
+def test_trace_debug_suppressed_when_trace_enabled(monkeypatch):
+    """Снос #185 dual-write: при trace ВКЛ _persist_debug_turn НЕ пишет react_debug_turns."""
+    import sreda.db.session as _dbsess
+
+    monkeypatch.setenv("SREDA_REACT_TRACE_ENABLED", "1")
+    monkeypatch.setenv("SREDA_REACT_DEBUG_ALL", "1")  # иначе бы писал — проверяем, что trace-gate выше
+    st_mod.get_settings.cache_clear()
+
+    called = []
+    monkeypatch.setattr(_dbsess, "get_session_factory", lambda: called.append(1))
+    try:
+        react_loop._persist_debug_turn(
+            tenant_id="t", user_id="u", thread_id="th", channel="telegram",
+            user_text="x", reply="r", tools=[], kind="final")
+        assert called == [], "при trace ВКЛ react_debug_turns не должен писаться (early-return)"
+    finally:
+        st_mod.get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_trace_never_breaks_turn(db_session, trace_on, monkeypatch):
+    """Сбой записи трейса (finish) НЕ роняет ход — пользователь получает ответ."""
+    def _boom(**kw):
+        raise RuntimeError("trace db down")
+
+    monkeypatch.setattr(react_trace_persist, "persist_trace_finish", _boom)
+    u = seed_telegram_user(db_session)
+    db_session.flush()
+    stub = _RecordingStubLLM([AIMessage(content="Готово.", usage_metadata=_u(10, 5))])
+    r = await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="tr-nb",
+        llm=stub, user_text="привет", inbound_message_id="m-nb",
+        channel="telegram", provider_key="inception-mercury2")
+    assert "Готово" in str(r)  # ход не упал, несмотря на сбой трейса
+
+
+class _RaisingLLM:
+    def bind_tools(self, tools):  # noqa: ANN001
+        return self
+
+    def invoke(self, msgs):  # noqa: ANN001
+        raise RuntimeError("LLM down")
+
+
+@pytest.mark.asyncio
+async def test_trace_error_branch_safe_reply(db_session, trace_on):
+    """Handled-сбой графа → except handle_turn → строка done + outcome=safe_reply (не in_progress)."""
+    SF = trace_on
+    u = seed_telegram_user(db_session)
+    db_session.flush()
+    r = await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="tr-err",
+        llm=_RaisingLLM(), user_text="привет", inbound_message_id="m-err",
+        channel="telegram", provider_key="inception-mercury2")
+    assert "потеряла контекст" in str(r)  # safe-reply
+    rows = _trace_rows(SF, u.tenant_id)
+    assert len(rows) == 1 and rows[0].status == "done" and rows[0].outcome == "safe_reply"

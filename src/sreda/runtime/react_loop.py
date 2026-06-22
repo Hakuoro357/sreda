@@ -1681,18 +1681,25 @@ async def handle_turn(
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
         reply = _Reply(_postformat(text) or "Готово.")
-        # #192: финал → done + структура (llm_calls из chat-аккумулятора, tool_calls из истории).
-        _msgs_fin = result.get("messages", []) if isinstance(result, dict) else []
-        _tcs = _trace.collect_tool_calls(_msgs_fin, tenant_id=tenant_id)
-        _lcs = result.get("llm_calls") if isinstance(result, dict) else None
-        _outcome = ("tool_error" if any(t.get("result_kind") == "error" for t in _tcs)
-                    else "fallback_used" if any(c.get("fallback_fired") for c in (_lcs or []))
-                    else "ok")
-        _trace.persist_trace_finish(
-            tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
-            turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
-            confirm_state=("confirmed" if live_pause else "none"),  # best-effort (declined → след. шаг)
-            outcome=_outcome, passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0)
+        # #192: финал → done + структура. ВЕСЬ блок под флагом И guarded (R1 CRITICAL Codex high):
+        # collect_tool_calls/HMAC/json НЕ должны выполняться при OFF (спящий прод) и НЕ должны ронять
+        # ход при сбое (трейс = отладка, best-effort).
+        if _trace.trace_enabled():
+            try:
+                _msgs_fin = result.get("messages", []) if isinstance(result, dict) else []
+                _tcs = _trace.collect_tool_calls(_msgs_fin, tenant_id=tenant_id)
+                _lcs = result.get("llm_calls") if isinstance(result, dict) else None
+                _outcome = ("tool_error" if any(t.get("result_kind") == "error" for t in _tcs)
+                            else "fallback_used" if any(c.get("fallback_fired") for c in (_lcs or []))
+                            else "ok")
+                _trace.persist_trace_finish(
+                    tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
+                    turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
+                    confirm_state=("confirmed" if live_pause else "none"),  # best-effort
+                    outcome=_outcome,
+                    passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0)
+            except Exception:  # noqa: BLE001 — трейс не валит ход
+                logger.warning("react_loop: trace finish failed", exc_info=True)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                             channel=channel, user_text=user_text, reply=reply,
                             tools=_tools, kind="final")
