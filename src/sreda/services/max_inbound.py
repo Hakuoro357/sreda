@@ -127,6 +127,27 @@ async def handle_max_update(
             return ""
 
     with SessionLocal() as session:
+        # #187 Phase 1 — soft-delete ingress guard (resolve → gate → provision).
+        # Чистый резолв MAX-account→tenant (read-only) ДО ensure_max_user_bundle
+        # И ДО любой обработки голоса (STT идёт downstream в
+        # ``_process_approved_max_turn`` — entry-гард его покрывает). Удалённый
+        # существующий тенант → ТИХИЙ no-op. Новый юзер (резолв=None) → гард
+        # пропускается. RuntimeError из резолва → «не резолвится», НЕ «удалён».
+        from sreda.services.tenant_lifecycle import is_tenant_active
+        from sreda.services.max_auth import resolve_tenant_from_max_account_id
+
+        try:
+            _resolved = resolve_tenant_from_max_account_id(session, str(sender_user_id))
+        except RuntimeError:
+            _resolved = None
+        if _resolved is not None and not is_tenant_active(session, _resolved[0]):
+            logger.info(
+                "max inbound: tenant %s is soft-deleted — silent drop "
+                "(no ensure/welcome/LLM/STT)",
+                _resolved[0],
+            )
+            return ""
+
         # Sender display name (best-effort).
         display_name = _extract_max_display_name(payload)
         # Phase 2C: catch SignupBlocked from abuse guard.

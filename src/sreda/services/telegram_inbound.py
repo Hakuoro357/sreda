@@ -660,10 +660,35 @@ async def handle_telegram_update(
     settings = get_settings()
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
+        # #187 Phase 1 — soft-delete ingress guard (resolve → gate → provision).
+        # Чистый резолв account→tenant (read-only, БЕЗ side-effects) ДО ensure/
+        # welcome/обработки. Удалённый существующий тенант → ТИХИЙ no-op (нет
+        # ensure, нет welcome, нет LLM). Новый юзер (резолв=None) → гард
+        # пропускается, идёт обычная регистрация. is_tenant_active стоит ПЕРВЫМ
+        # — до EntitlementGate/suspended (precedence: deleted > suspended, §13).
+        # RuntimeError из резолва (соль не сконфигурена) → трактуем как «не
+        # резолвится», НЕ как «удалён» (A16).
+        from sreda.services.onboarding import _extract_chat_id
+        from sreda.services.tenant_lifecycle import is_tenant_active
+        from sreda.services.telegram_auth import resolve_tenant_from_telegram_id
+
+        _guard_chat_id = _extract_chat_id(payload)
+        if _guard_chat_id is not None:
+            try:
+                _resolved = resolve_tenant_from_telegram_id(session, str(_guard_chat_id))
+            except RuntimeError:
+                _resolved = None
+            if _resolved is not None and not is_tenant_active(session, _resolved[0]):
+                logger.info(
+                    "telegram inbound: tenant %s is soft-deleted — silent drop "
+                    "(no ensure/welcome/LLM)",
+                    _resolved[0],
+                )
+                return None
+
         # Phase 2C: catch SignupBlocked from abuse guard inside
         # ensure_telegram_user_bundle. Send UPGRADE_COPY[reason] to user
         # and drop update (no inbound persisted, no LLM call).
-        from sreda.services.onboarding import _extract_chat_id
         from sreda.services.signup_abuse import SignupBlocked
         from sreda.services.upgrade_copy import UPGRADE_COPY
         try:
