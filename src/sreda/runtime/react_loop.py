@@ -799,6 +799,15 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
             # op_id (новый step_id) → коллизии не будет → применится.
             logger.error("idempotent durable op=%s внутренняя коллизия (%s) — НЕ применяю",
                          op_id, type(exc).__name__)
+            try:  # best-effort алерт (fire-and-forget; план #163 «metric+alert»); не ломает ход
+                from sreda.services.admin_alerts import send_admin_alert
+                send_admin_alert(
+                    "WARNING", "#163 idempotent operation_id collision",
+                    f"op={op_id} family={entity_type}: durable-операция НЕ применена "
+                    f"({type(exc).__name__}); operation_id обязан быть уникален на tool_call.",
+                    dedupe_key=f"idem_collision:{entity_type}")
+            except Exception:  # noqa: BLE001
+                logger.warning("send_admin_alert не доставил idempotent-collision")
             return "Не смогла безопасно применить правку (внутренняя сверка) — попробуй ещё раз."
 
     # ---- напоминания ----------------------------------------------------
