@@ -96,6 +96,33 @@ def react_provider(tenant_id: str) -> str:
     return "groq-gpt-oss-120b" if tenant_id in s.react_osa_tenants else s.planner_provider
 
 
+_FALLBACK_PROVIDER_KEY = "groq-gpt-oss-120b"  # #184: Оса @ Groq — запас Фредди в ReAct
+
+
+def react_fallback_llm(primary_provider: str = "") -> Any:
+    """#184: запасной LLM для ReAct — Оса (gpt-oss-120b @ Groq) при сбое primary (Фредди/Mercury).
+    Включён флагом SREDA_REACT_OSA_FALLBACK. None → без запаса.
+
+    Защиты (ревью R1):
+    - если effective primary УЖЕ Оса (SREDA_REACT_OSA_TENANTS) — само-fallback не нужен (Groq+Groq =
+      повтор того же сбоя + двойной расход) → None;
+    - построение LLM в guarded-блоке: мисконфиг Groq НЕ должен ронять ReAct-вход до safe-reply."""
+    from sreda.config.settings import get_settings
+    from sreda.services.llm import _GROQ_MODEL_BY_PROVIDER, get_chat_llm
+    if not get_settings().react_osa_fallback:
+        return None
+    # R2 MINOR (Codex high): любой Groq/Оса-провайдер как primary (incl. groq-gpt-oss-120b-low) →
+    # запас не нужен (Groq+Groq = повтор сбоя + двойной расход). Проверяем членство в groq-карте.
+    if primary_provider in _GROQ_MODEL_BY_PROVIDER:
+        return None
+    try:
+        return get_chat_llm(provider=_FALLBACK_PROVIDER_KEY)
+    except Exception:  # noqa: BLE001 — мисконфиг fallback не валит вход; просто без запаса
+        logger.warning("react_loop: не удалось построить fallback (Оса) — продолжаем без запаса",
+                       exc_info=True)
+        return None
+
+
 class _Reply(str):
     """Ответ handle_turn: строка ответа (для старых вызывающих — обычный str) + признак
     `awaiting_confirm`, что это да/нет-подтверждение (канал тогда вешает кнопки [Да][Нет]),
@@ -1057,7 +1084,8 @@ def _record_react_usage(*, bind: Any, tenant_id: str, provider_key: str, model: 
 
 def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str,
-                 session: Any = None, provider_key: str = ""):
+                 session: Any = None, provider_key: str = "",
+                 fallback_llm: Any = None):  # #184: запасной LLM (Оса) при сбое primary
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
     ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
     набор меняется по ходу без перекомпиляции графа (need_family добирает семью).
@@ -1076,6 +1104,16 @@ def _build_graph(llm: Any, all_tools: list, *,
             _model_name = _resolve_model_name(llm, get_settings(), provider_key)
         except Exception:  # noqa: BLE001 — резолв не валит ход; пусто → fallback provider_key
             _model_name = ""
+    # #184: имя модели запаса (Осы) — для КОРРЕКТНОЙ атрибуции расхода при срабатывании fallback
+    # (иначе токены Осы попали бы в строку Mercury → таблица «расход по провайдерам» врёт; R1 MAJOR).
+    _fallback_model_name = ""
+    if fallback_llm is not None:
+        try:
+            from sreda.config.settings import get_settings as _gs
+            from sreda.runtime.planner.llm import _resolve_model_name as _rmn
+            _fallback_model_name = _rmn(fallback_llm, _gs(), _FALLBACK_PROVIDER_KEY)
+        except Exception:  # noqa: BLE001
+            _fallback_model_name = ""
 
     def chat(state: ReactState):
         # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
@@ -1084,14 +1122,35 @@ def _build_graph(llm: Any, all_tools: list, *,
         nudge = state.get("guard_nudge")
         if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
             sp = f"{sp}\n\n{nudge}"
-        resp = llm.bind_tools(bound).invoke([SystemMessage(sp), *state["messages"]])
+        _msgs = [SystemMessage(sp), *state["messages"]]
+        # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
+        #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
+        #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
+        #   (2) bind_tools — ВНЕ try (R2 MAJOR Codex high): ошибка построения/схемы инструментов =
+        #       ЛОКАЛЬНЫЙ баг, его НЕ маскируем уходом на Осу; в try ТОЛЬКО сетевой invoke;
+        #   (3) лог с exc_info=True — полный traceback причины перехода (диагностируемо, даже когда
+        #       запас «спас» ход; иначе скрытый баг invoke виден лишь по имени класса).
+        # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
+        _bound_primary = llm.bind_tools(bound)
+        _used_provider, _used_model = provider_key, _model_name
+        if fallback_llm is not None:
+            _bound_fallback = fallback_llm.bind_tools(bound)  # построение запаса — тоже вне try
+            try:
+                resp = _bound_primary.invoke(_msgs)
+            except Exception as _e:  # noqa: BLE001 — INVOKE primary упал (сеть/провайдер/5xx) → запас
+                logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
+                               type(_e).__name__, exc_info=True)
+                resp = _bound_fallback.invoke(_msgs)
+                _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
+        else:
+            resp = _bound_primary.invoke(_msgs)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
         try:
             _p, _c = _extract_usage(resp)
             _record_react_usage(
                 bind=(session.get_bind() if session is not None else None),
-                tenant_id=tenant_id, provider_key=provider_key, model=_model_name,
+                tenant_id=tenant_id, provider_key=_used_provider, model=_used_model,
                 prompt_tokens=_p, completion_tokens=_c,
                 run_id=state.get("turn_key") or "")
         except Exception:  # noqa: BLE001 — учёт не валит ход
@@ -1478,7 +1537,7 @@ async def handle_turn(
     *, session: Any, tenant_id: str, user_id: str, thread_id: str,
     llm: Any, user_text: str, inbound_message_id: str = "", channel: str = "react",
     resume_only: bool = False, expected_confirm_id: str = "",
-    provider_key: str = "",
+    provider_key: str = "", fallback_llm: Any = None,  # #184: Оса как fallback Фредди
 ) -> "_Reply":
     """ВХОД нового цикла на одно входящее сообщение. Источник правды о паузе — сам
     checkpoint (_has_pause: interrupts + snap.created_at). turn_key минтится РАЗ на свежий ход из
@@ -1512,7 +1571,8 @@ async def handle_turn(
         graph = _build_graph(  # #165 Срез A: сырой llm + ВСЕ инструменты; bind поднабора в узлах
             llm, tools,
             tenant_id=tenant_id, user_id=user_id, today_str=today_str,
-            session=session, provider_key=provider_key)  # #175: учёт расхода в chat-узле
+            session=session, provider_key=provider_key,  # #175: учёт расхода в chat-узле
+            fallback_llm=fallback_llm)  # #184: Оса-fallback
 
         snap = await graph.aget_state(_cfg(gen))
         live_pause = (_has_pause(snap)

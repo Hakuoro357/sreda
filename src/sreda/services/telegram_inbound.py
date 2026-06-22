@@ -278,7 +278,8 @@ async def _process_approved_turn_locked(
                 inbound_message_id=inbound_message_id, channel="telegram",
                 resume_only=True,
                 expected_confirm_id=react_loop.confirm_callback_id(_cb_data),
-                provider_key=_prov2)  # #175 учёт расхода + #184 «Оса»
+                provider_key=_prov2,  # #175 учёт расхода + #184 «Оса»
+                fallback_llm=react_loop.react_fallback_llm(_prov2))  # #184 Оса-fallback
             trace.record("react_loop.resumed", chars=len(_reply2 or ""),
                          channel="telegram", noop=(not _reply2))
             if _reply2:  # непустой → пауза возобновлена (пустой = устаревший/чужой тап → no-op)
@@ -422,6 +423,7 @@ async def _process_approved_turn_locked(
                     inbound_message_id=inbound_message_id,
                     channel="telegram",
                     provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
+                    fallback_llm=react_loop.react_fallback_llm(_prov),  # #184 Оса-fallback
                 )
                 trace.record("react_loop.replied", chars=len(_reply or ""))
                 # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id

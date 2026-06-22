@@ -369,6 +369,42 @@ _LLM_PROVIDERS_METADATA = [
 ]
 
 
+def _provider_spend(session, *, days: int = 30) -> list[dict]:
+    """#184 ч.3: расход по провайдерам из skill_ai_executions за N дней (токены + USD-оценка из
+    estimated_cost_rub_micro). У Inception/Groq нет API баланса → считаем СВОЙ расход. Включает
+    react_turn (Mercury/Оса) + остальные пути. Сортировка по стоимости."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import func, select
+
+    from sreda.db.models.skill_platform import SkillAIExecution
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = session.execute(
+        select(
+            SkillAIExecution.provider_key,
+            func.count(),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.estimated_cost_rub_micro), 0),
+        )
+        .where(SkillAIExecution.created_at >= cutoff)
+        .group_by(SkillAIExecution.provider_key)
+    ).all()
+    out = [
+        {
+            "provider": pk or "(неизвестно)",
+            "calls": int(cnt or 0),
+            "prompt_tokens": int(pt or 0),
+            "completion_tokens": int(ct or 0),
+            "cost_rub": round(int(cost or 0) / 1_000_000, 2),
+        }
+        for pk, cnt, pt, ct, cost in rows
+    ]
+    out.sort(key=lambda r: -r["cost_rub"])
+    return out
+
+
 def _llm_context(
     session,
     token: str,
@@ -416,6 +452,22 @@ def _llm_context(
         or ""
     )
     balances = pb.fetch_balances(settings) if with_balances else []
+    # #184 ч.2: react-механизм управляется ENV (НЕ свитчером chat-провайдера выше). Показываем
+    # read-only, чтобы правки react/Осы перестали быть невидимы на этой странице.
+    react_info = {
+        "primary": settings.planner_provider,
+        "osa_fallback_on": settings.react_osa_fallback,
+        # R1-фикс: флаг ВКЛ ещё не значит «запас работает» — нужен ключ Groq. Показываем отдельно,
+        # чтобы оператор не считал запас активным, когда LLM фактически не создастся.
+        "osa_fallback_available": bool(
+            settings.react_osa_fallback and settings.resolve_groq_api_key()
+        ),
+        "osa_primary_tenants": sorted(settings.react_osa_tenants),
+    }
+    # #184 ч.3: расход по провайдерам (баланс-API у Inception/Groq нет → считаем свой). Локальный
+    # дешёвый запрос (НЕ сеть) → считаем ВСЕГДА, не под with_balances (R1: иначе POST-перерендер
+    # показал бы «нет данных» при наличии расхода).
+    react_spend = _provider_spend(session)
     return {
         "token": token,
         "section": "llm",
@@ -423,6 +475,8 @@ def _llm_context(
         "current_primary": current_primary,
         "current_fallback": current_fallback,
         "balances": balances,
+        "react_info": react_info,
+        "react_spend": react_spend,
         "flash": flash,
     }
 

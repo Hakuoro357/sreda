@@ -45,6 +45,85 @@
   <button type="submit">Сохранить</button>
 </form>
 
+<!-- #184: ReAct (новый механизм) — управляется ENV, НЕ формой выше -->
+<h3 style="margin-top: 32px;">ReAct (новый механизм)
+  <span class="muted" style="font-size: 12px; font-weight: normal;">— управляется через ENV, не формой выше</span>
+</h3>
+<figure>
+<table>
+  <tbody>
+    <tr>
+      <td><strong>Primary (Фредди)</strong></td>
+      <td><code>{{ react_info.primary }}</code></td>
+    </tr>
+    <tr>
+      <td><strong>Fallback (Оса @ Groq)</strong></td>
+      <td>
+        {% if react_info.osa_fallback_on %}
+          {% if react_info.osa_fallback_available %}
+            <span class="badge badge-green">включён</span> <code>groq-gpt-oss-120b</code>
+          {% else %}
+            <span class="badge badge-red">флаг ВКЛ, но ключ Groq не настроен — запас НЕ работает</span>
+          {% endif %}
+        {% else %}
+          <span class="badge badge-gray">выключен</span>
+          <span class="muted">SREDA_REACT_OSA_FALLBACK=1 + ключ Groq чтобы включить</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
+      <td><strong>Оса как primary (тенанты)</strong></td>
+      <td>
+        {% if react_info.osa_primary_tenants %}
+          {% for t in react_info.osa_primary_tenants %}<code>{{ t }}</code> {% endfor %}
+        {% else %}
+          <span class="muted">— нет (все на Фредди)</span>
+        {% endif %}
+      </td>
+    </tr>
+  </tbody>
+</table>
+</figure>
+<p class="muted" style="font-size: 12px;">
+  Модель react-цикла: <code>SREDA_PLANNER_PROVIDER</code> (primary/Фредди) +
+  <code>SREDA_REACT_OSA_FALLBACK</code> (Оса-запас) + <code>SREDA_REACT_OSA_TENANTS</code>
+  (Оса как primary для тенанта). Форма «primary/fallback» выше — ЛЕГАСИ chat-путь, react её не читает.
+</p>
+
+<h3 style="margin-top: 32px;">Расход по провайдерам (30 дней)
+  <span class="muted" style="font-size: 12px; font-weight: normal;">— свой счёт; у Inception/Groq нет API баланса</span>
+</h3>
+<figure>
+<table>
+  <thead>
+    <tr>
+      <th>Провайдер (provider_key)</th>
+      <th>Вызовов</th>
+      <th>Вход (ток.)</th>
+      <th>Выход (ток.)</th>
+      <th>Оценка, ₽</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for s in react_spend %}
+    <tr>
+      <td><code>{{ s.provider }}</code></td>
+      <td>{{ s.calls }}</td>
+      <td>{{ s.prompt_tokens }}</td>
+      <td>{{ s.completion_tokens }}</td>
+      <td>{{ "%.2f"|format(s.cost_rub) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">нет данных за период</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+</figure>
+<p class="muted" style="font-size: 12px;">
+  Из <code>skill_ai_executions</code> (наш учёт расхода, #175) за 30 дней. Inception (Mercury/Фредди)
+  и Groq (Оса) баланс по API не отдают — показываем СВОЙ расход.
+</p>
+
 <h3 style="margin-top: 32px;">Баланс и лимиты
   <a href="/admin/llm?refresh=1"
      style="font-size: 12px; font-weight: normal; margin-left: 12px;">

@@ -370,6 +370,12 @@ class Settings(BaseSettings):
             "sreda_react_osa_tenants",
         ),
     )
+    # #184: Оса (gpt-oss-120b @ Groq) как FALLBACK для Фредди (Mercury) в ReAct — при сбое primary
+    # (timeout/5xx) ход уходит на Осу. True → fallback включён для всех react-тенантов; False
+    # (дефолт) → без fallback (как сейчас). Независим от react_osa_tenants (там Оса как PRIMARY).
+    react_osa_fallback: bool = Field(
+        default=False, validation_alias="SREDA_REACT_OSA_FALLBACK"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
