@@ -36,20 +36,30 @@ def test_prunable_only_safe_policies_165():
         )
 
 
-def test_prunable_and_unkeyed_disjoint_165():
-    """Прунабельные и unkeyed-write семьи не пересекаются (семья либо режется, либо карв-аут)."""
-    assert react_loop._PRUNABLE_FAMILIES.isdisjoint(react_loop._UNKEYED_WRITE_FAMILIES)
+def test_prunable_and_rerun_unsafe_independent_165():
+    """Обрезка-безопасность ≠ rerun-безопасность (Codex high R2 MAJOR): множества НЕЗАВИСИМЫ и
+    ПЕРЕСЕКАЮТСЯ ровно по metered_read (web). metered_read семья — И prunable (опускать ок), И
+    rerun-guarded (перевызывать на recovery нельзя — спалит слот квоты)."""
+    overlap = react_loop._PRUNABLE_FAMILIES & react_loop._UNKEYED_WRITE_FAMILIES
+    expected_overlap = {f for f, p in react_loop._FAMILY_WRITE_POLICY.items() if p == "metered_read"}
+    assert overlap == expected_overlap, (
+        "пересечение prunable∩rerun-unsafe должно быть РОВНО metered_read-семьями "
+        "(prune-safe но rerun-unsafe); ничего лишнего"
+    )
 
 
-def test_unkeyed_covers_all_unkeyed_policy_165():
-    """Карв-аут (_UNKEYED_WRITE_FAMILIES) == РОВНО семьи с policy 'unkeyed' — ни одна не потеряна."""
-    expected = {f for f, p in react_loop._FAMILY_WRITE_POLICY.items() if p == "unkeyed"}
+def test_unkeyed_covers_rerun_unsafe_policy_165():
+    """_UNKEYED_WRITE_FAMILIES (guard recovery-добора) == РОВНО семьи policy unkeyed|metered_read —
+    т.е. все, чей повтор на recovery вреден (задвоит сущность ИЛИ спалит слот квоты)."""
+    expected = {f for f, p in react_loop._FAMILY_WRITE_POLICY.items()
+                if p in ("unkeyed", "metered_read")}
     assert set(react_loop._UNKEYED_WRITE_FAMILIES) == expected
 
 
 def test_current_prunable_state_pin_165():
     """Регресс-пин текущего безопасного состояния: режем shopping (idempotent) + web (metered_read);
-    карв-аут — 5 семей без ключа. Семью сделают replay-safe → "idempotent" → пин обновить ОСОЗНАННО."""
+    guard recovery-добора — 5 unkeyed-семей + web (metered_read, rerun-unsafe). Семью сделают
+    replay-safe → "idempotent" → пин обновить ОСОЗНАННО."""
     assert react_loop._PRUNABLE_FAMILIES == frozenset({"shopping", "web"})
     assert react_loop._UNKEYED_WRITE_FAMILIES == frozenset(
-        {"recipes", "menu", "household", "checklists", "memory"})
+        {"recipes", "menu", "household", "checklists", "memory", "web"})

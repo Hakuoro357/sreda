@@ -699,12 +699,12 @@ _FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
 #                (Codex medium R1 MAJOR: «keyed» подразумевал бы op_id для ВСЕХ инструментов семьи —
 #                неточно; safety-свойство для обрезки = «повтор не задвоит», а не конкретный механизм.)
 #   "readonly"    — в БД не пишет (только чтение) → безопасно резать;
-#   "metered_read" — по сути чтение, но есть best-effort СЧЁТЧИК расхода (квота/usage, +1 без ключа
-#                идемпотентности). Повтор на recovery-проходе = второй реальный (платный) вызов
-#                web_search + второе списание квоты — НЕ дубль пользовательской сущности; терпимо
-#                из-за буфера квоты (≈950/1000 + soft-cap) и редкости recovery-добора → режем.
-#                (Codex high+medium+субагент R1 MAJOR: web_search пишет tavily/fallback-счётчик — не
-#                чистый readonly; честно отражаем, а не «readonly».)
+#   "metered_read" — по сути чтение, но web_search ГЕЙТИТ жёсткую квоту Tavily (GLOBAL_LIMIT=950 +
+#                месячный кап free) ДО вызова. ОБРЕЗАТЬ безопасно (опускать семью — ок) → prunable;
+#                но ПЕРЕ-вызывать на recovery-проходе НЕЛЬЗЯ (второй платный вызов + лишний слот
+#                квоты = отказ в следующем поиске) → семья ОДНОВРЕМЕННО в _UNKEYED_WRITE (guard
+#                отключит recovery-добор после web_search). (Codex high R2 MAJOR: счётчик — жёсткий
+#                гейт, не аналитика; обрезка-безопасность ≠ rerun-безопасность.)
 #   "unkeyed"     — durable-write пользовательских данных БЕЗ ключа → НЕ резать (карв-аут; повтор на
 #                recovery-проходе задвоил бы СУЩНОСТЬ). Оснащение ключами (образец #163
 #                reminders/tasks/shopping) = отдельный эпик; до него — "unkeyed", всегда привязаны.
@@ -720,13 +720,16 @@ _FAMILY_WRITE_POLICY: dict[str, str] = {
     "checklists": "unkeyed",
     "memory": "unkeyed",        # сохранение заметки без op_id
 }
+# ПРУНАБЕЛЬНОСТЬ (можно ОПУСТИТЬ семью из набора, если не нужна) — idempotent/readonly/metered_read.
 _PRUNABLE_FAMILIES = frozenset(
     f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("idempotent", "readonly", "metered_read"))
-# Ленивые семьи БЕЗ ключа идемпотентности (всегда привязаны карв-аутом). Если инструмент такой
-# семьи уже отработал в ходу — guard-добор (лишний recovery-проход) ОТКЛЮЧАЕМ: повтор мог бы
-# задвоить запись (Codex medium R3). Пред-существующий multi-pass re-emit — отдельно, #163.
+# RECOVERY-RERUN-НЕБЕЗОПАСНОСТЬ (НЕЗАВИСИМО от прунабельности — Codex high R2 MAJOR): семьи,
+# ПОВТОРНЫЙ прогон которых на guard-recovery-проходе вреден. Если такой инструмент отработал в ходу
+# → wrote_unkeyed=True → guard-добор ОТКЛЮЧАЕМ. Сюда: "unkeyed" (задвоит сущность) И "metered_read"
+# (web_search спалит лишний жёсткий слот квоты Tavily). web т.о. И prunable, И rerun-guarded —
+# множества пересекаются по metered_read (это не баг: опускать ≠ перевызывать).
 _UNKEYED_WRITE_FAMILIES = frozenset(
-    f for f, p in _FAMILY_WRITE_POLICY.items() if p == "unkeyed")
+    f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("unkeyed", "metered_read"))
 
 
 def _route_families(text: str, k: int = 2) -> list[str]:
