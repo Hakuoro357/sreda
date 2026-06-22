@@ -9,8 +9,8 @@ Expression-unique uq_react_turn_trace_scope (tenant_id, coalesce(user_id,''), tu
 UNIQUE в PG допускает несколько NULL → tenant-wide (user_id=NULL) двоился бы; coalesce снимает.
 ON CONFLICT в коде таргетит ТЕМ ЖЕ выражением (см. план #192).
 
-Revision ID: 20260622_0063
-Revises: 20260622_0062
+Revision ID: 20260622_0064
+Revises: 20260622_0063  (перецеплено при синхроне с origin/main: их 0063 = merge_housewife_free_plans #200)
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "20260622_0063"
-down_revision = "20260622_0062"
+revision = "20260622_0064"
+down_revision = "20260622_0063"
 branch_labels = None
 depends_on = None
 
