@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import operator
 import re
+import time as _time
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -35,6 +37,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
+from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода
 from sreda.runtime.planner.tool_runtime import (
     ToolRuntimeContext,
     allocate_operation_id,
@@ -208,6 +211,9 @@ class ReactState(MessagesState):
     # на ОДИН проход и тут же очищает. НЕ кладём SystemMessage в историю (копился бы между
     # ходами + system в середине диалога → провайдер; R1 medium+субагент).
     guard_nudge: str
+    # #192: аккумулятор вызовов LLM узла chat для трейса (add-reducer — НЕ двоится на resume:
+    # interrupt в run_tools, chat-узлы до паузы уже отработали и checkpointed, заново не идут).
+    llm_calls: Annotated[list, operator.add]
 
 
 def _system_prompt(today_str: str) -> str:
@@ -686,15 +692,46 @@ _FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
             "курс", "интернет", "сайт"),  # корни сужены (R2: найд/погод→ложные «найден/погоди»)
     "memory": ("запомни", "заметк", "запиш", "сохран"),  # запиши / сохрани факт
 }
-# #165 Срез B (R3-карв-аут): БЕЗОПАСНО резать (ленивые) только семьи без риска дубля на
-# recovery-проходе — shopping (есть within-turn ключ идемпотентности) + web (только чтение).
-# Остальные ленивые (recipes/menu/household/checklists/memory-save) пишут БЕЗ ключа → пока НЕ
-# режем (всегда привязаны), до #163 (оснащение ключами). Codex high R2 + план §5 + #163.
-_PRUNABLE_FAMILIES = frozenset({"shopping", "web"})
-# Ленивые семьи БЕЗ ключа идемпотентности (всегда привязаны карв-аутом). Если инструмент такой
-# семьи уже отработал в ходу — guard-добор (лишний recovery-проход) ОТКЛЮЧАЕМ: повтор мог бы
-# задвоить запись (Codex medium R3). Пред-существующий multi-pass re-emit — отдельно, #163.
-_UNKEYED_WRITE_FAMILIES = frozenset(_LAZY_FAMILIES) - _PRUNABLE_FAMILIES
+# #165 Срез B (R3-карв-аут) + #165 Фаза 5 (#163 разблокировка): ЯВНАЯ классификация write-policy
+# ленивых семей = ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ для инварианта «семья прунабельна ⇒ её durable-write
+# инструменты идемпотентны» (тест test_prunable_families_invariant_165). Значения:
+#   "idempotent"  — durable-write, но ПОВТОР БЕЗОПАСЕН любым механизмом → БЕЗОПАСНО резать. Покрывает
+#                op_id-keyed (add_items: op_id + ON CONFLICT) И state-идемпотентные (mark_bought/
+#                remove/update/clear: status-flip с only_from-гейтом / absolute-SET → повтор = no-op).
+#                (Codex medium R1 MAJOR: «keyed» подразумевал бы op_id для ВСЕХ инструментов семьи —
+#                неточно; safety-свойство для обрезки = «повтор не задвоит», а не конкретный механизм.)
+#   "readonly"    — в БД не пишет (только чтение) → безопасно резать;
+#   "metered_read" — по сути чтение, но web_search ГЕЙТИТ жёсткую квоту Tavily (GLOBAL_LIMIT=950 +
+#                месячный кап free) ДО вызова. ОБРЕЗАТЬ безопасно (опускать семью — ок) → prunable;
+#                но ПЕРЕ-вызывать на recovery-проходе НЕЛЬЗЯ (второй платный вызов + лишний слот
+#                квоты = отказ в следующем поиске) → семья ОДНОВРЕМЕННО в _UNKEYED_WRITE (guard
+#                отключит recovery-добор после web_search). (Codex high R2 MAJOR: счётчик — жёсткий
+#                гейт, не аналитика; обрезка-безопасность ≠ rerun-безопасность.)
+#   "unkeyed"     — durable-write пользовательских данных БЕЗ ключа → НЕ резать (карв-аут; повтор на
+#                recovery-проходе задвоил бы СУЩНОСТЬ). Оснащение ключами (образец #163
+#                reminders/tasks/shopping) = отдельный эпик; до него — "unkeyed", всегда привязаны.
+# Чтобы перевести семью из "unkeyed" в прунабельные — СНАЧАЛА сделать её write-инструменты replay-safe
+# (op_id-ключ ИЛИ state-идемпотентность) и поменять policy на "idempotent" (регресс-пин теста поймает
+# флип). _PRUNABLE и _UNKEYED ВЫВОДЯТСЯ из policy → не дрейфуют.
+_FAMILY_WRITE_POLICY: dict[str, str] = {
+    "shopping": "idempotent",   # add_items — op_id+ON CONFLICT; mark/remove/update/clear — state-идемпотентны
+    "web": "metered_read",      # fetch_url/get_weather — чтение; web_search — +счётчик квоты (терпим)
+    "recipes": "unkeyed",       # пишет сущности без op_id/идемпотентности — ждёт оснащения
+    "menu": "unkeyed",
+    "household": "unkeyed",
+    "checklists": "unkeyed",
+    "memory": "unkeyed",        # сохранение заметки без op_id
+}
+# ПРУНАБЕЛЬНОСТЬ (можно ОПУСТИТЬ семью из набора, если не нужна) — idempotent/readonly/metered_read.
+_PRUNABLE_FAMILIES = frozenset(
+    f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("idempotent", "readonly", "metered_read"))
+# RECOVERY-RERUN-НЕБЕЗОПАСНОСТЬ (НЕЗАВИСИМО от прунабельности — Codex high R2 MAJOR): семьи,
+# ПОВТОРНЫЙ прогон которых на guard-recovery-проходе вреден. Если такой инструмент отработал в ходу
+# → wrote_unkeyed=True → guard-добор ОТКЛЮЧАЕМ. Сюда: "unkeyed" (задвоит сущность) И "metered_read"
+# (web_search спалит лишний жёсткий слот квоты Tavily). web т.о. И prunable, И rerun-guarded —
+# множества пересекаются по metered_read (это не баг: опускать ≠ перевызывать).
+_UNKEYED_WRITE_FAMILIES = frozenset(
+    f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("unkeyed", "metered_read"))
 
 
 def _route_families(text: str, k: int = 2) -> list[str]:
@@ -760,6 +797,78 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     reminders = HousewifeReminderService(session)
     tasks = TaskService(session)
 
+    # #163 Фаза 3 — exact-replay update/delete на ReAct-пути через durable-helper (named-X).
+    # current_tool_runtime импортируется на уровне модуля (#187 4b-2 дедуп); локальный дубль убран при синхроне.
+    from sreda.services.idempotent_ops import (
+        IdempotencyArgsMismatch,
+        IdempotencyInFlight,
+        IdempotencyScopeMismatch,
+        compute_args_hmac,
+        execute_idempotent_durable_op,
+        peek_committed_replay,
+    )
+    from sreda.services.operation_id import compute_operation_id_update
+
+    def _replay_done(*, action: str, entity_type: str, entity_id: str, args: dict):
+        """#163 Фаза 3 (destructive-инструменты с interrupt): ДО not-found/confirm — если эта
+        durable-операция уже committed (replay/tombstone), вернуть сохранённый payload (exact-replay,
+        в т.ч. после hard-delete). None → свежая, продолжить обычным путём. Только ctx-путь."""
+        ctx = current_tool_runtime()
+        if ctx is None:
+            return None
+        from sreda.config.settings import get_settings
+
+        secret = get_settings().encryption_key or "dev-insecure-args-hmac"
+        op_id = compute_operation_id_update(
+            plan_id=ctx.execution_id, step_id=ctx.step_id, action=action,
+            entity_type=entity_type, entity_id=entity_id)
+        return peek_committed_replay(
+            session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
+            operation_family=entity_type, args_hmac=compute_args_hmac(args, secret=secret))
+
+    def _idempotent_write(*, action: str, entity_type: str, entity_id: str,
+                          args: dict, mutate) -> str:
+        """exact-replay durable update/delete. ``mutate(commit: bool) -> str`` делает мутацию и
+        возвращает payload-строку (helper владеет commit → внутри ctx зовём mutate(False)).
+        Вне ctx (легаси-путь) — self-commit БЕЗ идемпотентности (scope #163: только ReAct). Повтор
+        того же operation_id со статусом committed → сохранённый payload БЕЗ переприменения; т.к.
+        op_id = f(execution_id, step_id, ...), старый ход = старый op_id → replay-after-change тоже
+        не переприменяет (новый ход уже сделал свою правку под своим op_id)."""
+        ctx = current_tool_runtime()
+        if ctx is None:
+            return mutate(True)
+        from sreda.config.settings import get_settings
+
+        secret = get_settings().encryption_key or "dev-insecure-args-hmac"
+        op_id = compute_operation_id_update(
+            plan_id=ctx.execution_id, step_id=ctx.step_id, action=action,
+            entity_type=entity_type, entity_id=entity_id)
+        try:
+            return execute_idempotent_durable_op(
+                session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
+                operation_family=entity_type,
+                args_hmac=compute_args_hmac(args, secret=secret),
+                mutate_fn=lambda: mutate(False), tool_name=action)
+        except IdempotencyInFlight:
+            return "Секунду, эта правка уже в обработке — повтори, если не дошло."
+        except (IdempotencyArgsMismatch, IdempotencyScopeMismatch) as exc:
+            # Внутренняя коллизия operation_id (он должен быть уникален на tool_call → это баг-сигнал).
+            # НЕ применяем напрямую (мимо R1 MAJOR: mutate(True) тут = возможный double-apply поверх
+            # уже применённой операции). Фейлим безопасно + алертим; ретрай в НОВОМ ходу даст новый
+            # op_id (новый step_id) → коллизии не будет → применится.
+            logger.error("idempotent durable op=%s внутренняя коллизия (%s) — НЕ применяю",
+                         op_id, type(exc).__name__)
+            try:  # best-effort алерт (fire-and-forget; план #163 «metric+alert»); не ломает ход
+                from sreda.services.admin_alerts import send_admin_alert
+                send_admin_alert(
+                    "WARNING", "#163 idempotent operation_id collision",
+                    f"op={op_id} family={entity_type}: durable-операция НЕ применена "
+                    f"({type(exc).__name__}); operation_id обязан быть уникален на tool_call.",
+                    dedupe_key=f"idem_collision:{entity_type}")
+            except Exception:  # noqa: BLE001
+                logger.warning("send_admin_alert не доставил idempotent-collision")
+            return "Не смогла безопасно применить правку (внутренняя сверка) — попробуй ещё раз."
+
     # ---- напоминания ----------------------------------------------------
     def _active_reminders() -> list:
         session.expire_all()
@@ -797,10 +906,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     @tool
     def update_reminder(reminder_ref: str, title: str = "", trigger_iso: str = "") -> str:
         """Изменить напоминание по ref: название и/или момент (АБСОЛЮТНЫЙ ISO)."""
-        # user-guard (симметрично cancel_reminder): сервис update гардит только tenant.
-        r0 = session.get(FamilyReminder, reminder_ref)
-        if r0 is None or r0.tenant_id != tenant_id or r0.user_id != user_id:
-            return "Такого напоминания у тебя нет."
+        # parse-валидация ввода (НЕ часть exact-replay операции — ошибка ввода, без claim op).
         new_trigger = None
         if trigger_iso:
             try:
@@ -810,22 +916,40 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
             # #174 (Codex medium R1): перенос на прошлое = тот же класс бага → перекат вперёд.
             if new_trigger <= datetime.now(timezone.utc):
                 return _past_rollforward_msg(new_trigger, "update_reminder")
-        # no-op guard (#162 п.5): те же значения → успех без записи.
         new_title = title or None
-        if ((new_title is None or new_title == r0.title)
-                and (new_trigger is None or new_trigger == r0.trigger_at)):
-            return f"ok:updated:{r0.id} | {r0.title} | {_fmt(r0.trigger_at)}"
-        r = reminders.update(
-            tenant_id=tenant_id, reminder_id=reminder_ref,
-            title=title or None, trigger_at=new_trigger,
-        )
-        if r is None:
-            return "Такого напоминания у тебя нет."
-        return f"ok:updated:{r.id} | {r.title} | {_fmt(r.trigger_at)}"
+
+        def _mut(commit: bool) -> str:
+            # not-found + no-op ВНУТРИ mutate (Codex R1 MAJOR): иначе replay вернул бы живое
+            # форматирование / «не найдено» вместо сохранённого payload (exact-replay).
+            r0 = session.get(FamilyReminder, reminder_ref)
+            if r0 is None or r0.tenant_id != tenant_id or r0.user_id != user_id:
+                return "Такого напоминания у тебя нет."
+            # no-op guard (#162 п.5): те же значения → успех без записи.
+            if ((new_title is None or new_title == r0.title)
+                    and (new_trigger is None or new_trigger == r0.trigger_at)):
+                return f"ok:updated:{r0.id} | {r0.title} | {_fmt(r0.trigger_at)}"
+            r = reminders.update(
+                tenant_id=tenant_id, reminder_id=reminder_ref,
+                title=title or None, trigger_at=new_trigger, commit=commit,
+            )
+            if r is None:
+                return "Такого напоминания у тебя нет."
+            return f"ok:updated:{r.id} | {r.title} | {_fmt(r.trigger_at)}"
+
+        return _idempotent_write(
+            action="update", entity_type="family_reminder", entity_id=reminder_ref,
+            # эффективные args (мимо R1 MINOR: "" → None, как в самой мутации) → стабильный hmac.
+            args={"title": title or None, "trigger_iso": trigger_iso or None}, mutate=_mut)
 
     @tool
     def cancel_reminder(reminder_ref: str) -> str:
         """Удалить напоминание по ref. САМ спрашивает подтверждение и удаляет ТОЛЬКО при «да»."""
+        # exact-replay/tombstone ДО not-found/confirm (Codex+субагент R1 MAJOR): повтор того же
+        # cancel-хода → сохранённый payload, даже если строка уже исчезла/неактивна.
+        done = _replay_done(action="cancel", entity_type="family_reminder",
+                            entity_id=reminder_ref, args={})
+        if done is not None:
+            return done
         r = session.get(FamilyReminder, reminder_ref)
         if r is None or r.tenant_id != tenant_id or r.user_id != user_id:
             return "Такого напоминания у тебя нет."
@@ -838,13 +962,23 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                               "key": f"reminder:{reminder_ref}:cancel"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не удаляю «{title}». Скажи, какое тогда."
-        r2 = session.get(FamilyReminder, reminder_ref)
-        if (r2 is None or r2.tenant_id != tenant_id or r2.user_id != user_id
-                or r2.status != "pending"):
-            return f"Напоминание «{title}» уже неактивно."  # идемпотентно
-        r2.status = "cancelled"
-        session.commit()
-        return f"Готово, удалила «{title}»."
+
+        def _mut(commit: bool) -> str:
+            # пост-confirm мутация через durable-helper (exact-replay + аудит/tombstone op-результата).
+            r2 = session.get(FamilyReminder, reminder_ref)
+            if (r2 is None or r2.tenant_id != tenant_id or r2.user_id != user_id
+                    or r2.status != "pending"):
+                return f"Напоминание «{title}» уже неактивно."  # идемпотентно
+            r2.status = "cancelled"
+            if commit:
+                session.commit()
+            else:
+                session.flush()
+            return f"Готово, удалила «{title}»."
+
+        return _idempotent_write(
+            action="cancel", entity_type="family_reminder",
+            entity_id=reminder_ref, args={}, mutate=_mut)
 
     # ---- задачи ---------------------------------------------------------
     @tool
@@ -890,9 +1024,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                     scheduled_date: str = "", time_start: str = "") -> str:
         """Изменить задачу: название/заметки и/или ПЕРЕНОС по времени (scheduled_date —
         YYYY-MM-DD, time_start — HH:MM). Связанное напоминание сервис пере-цепит сам."""
-        t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
-        if t0 is None:
-            return "Такой задачи у тебя нет."
+        # parse-валидация ввода (НЕ часть exact-replay — ошибка ввода, без claim op).
         d = ts = None
         if scheduled_date:
             try:
@@ -906,18 +1038,31 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 return f"Не разобрала время: {time_start!r}."
         new_title = (title or "").strip()[:500] or None
         new_notes = (notes or "").strip() or None
-        # no-op guard (#162 п.5): те же значения (вкл. дату/время) → успех без записи. Это И
-        # идемпотентность переноса: на replay дата/время уже = новым → НЕ пере-создаём напоминание.
-        if ((new_title is None or new_title == (t0.title or None))
-                and (new_notes is None or new_notes == t0.notes)
-                and (d is None or d == t0.scheduled_date)
-                and (ts is None or ts == t0.time_start)):
-            return f"ok:updated:{t0.id} | {t0.title} | {_fmt_task_when(t0)}"
-        t = tasks.update(tenant_id=tenant_id, user_id=user_id, task_id=task_ref,
-                         title=title or None, notes=notes or None,
-                         scheduled_date=d, time_start=ts)
-        return (f"ok:updated:{t.id} | {t.title} | {_fmt_task_when(t)}"
-                if t else "Такой задачи у тебя нет.")
+
+        def _mut(commit: bool) -> str:
+            # not-found + no-op ВНУТРИ mutate (Codex R1 MAJOR): иначе replay вернул бы живое
+            # форматирование / «не найдено» вместо сохранённого payload (exact-replay).
+            t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
+            if t0 is None:
+                return "Такой задачи у тебя нет."
+            # no-op guard (#162 п.5): те же значения (вкл. дату/время) → успех без записи. Это И
+            # идемпотентность переноса: на replay дата/время уже = новым → НЕ пере-создаём напоминание.
+            if ((new_title is None or new_title == (t0.title or None))
+                    and (new_notes is None or new_notes == t0.notes)
+                    and (d is None or d == t0.scheduled_date)
+                    and (ts is None or ts == t0.time_start)):
+                return f"ok:updated:{t0.id} | {t0.title} | {_fmt_task_when(t0)}"
+            t = tasks.update(tenant_id=tenant_id, user_id=user_id, task_id=task_ref,
+                             title=title or None, notes=notes or None,
+                             scheduled_date=d, time_start=ts, commit=commit)
+            return (f"ok:updated:{t.id} | {t.title} | {_fmt_task_when(t)}"
+                    if t else "Такой задачи у тебя нет.")
+
+        return _idempotent_write(
+            action="update", entity_type="task", entity_id=task_ref,
+            args={"title": title or None, "notes": notes or None,
+                  "scheduled_date": scheduled_date or None, "time_start": time_start or None},
+            mutate=_mut)
 
     @tool
     def complete_task(task_ref: str) -> str:
@@ -931,8 +1076,15 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         t = tasks.uncomplete(tenant_id=tenant_id, user_id=user_id, task_id=task_ref)
         return "Готово, вернула в работу." if t else "Такой задачи у тебя нет."
 
-    def _confirm_destructive_task(task_ref: str, verb: str, apply) -> str:
-        """Общий confirm-wrapper для cancel/delete задачи: снимок→interrupt→act."""
+    def _confirm_destructive_task(task_ref: str, verb: str, action: str, apply) -> str:
+        """Общий confirm-wrapper для cancel/delete задачи: снимок→interrupt→durable-мутация.
+        ``apply(ref, commit)`` делает мутацию (commit владеет helper). exact-replay + tombstone
+        (op-результат) на ReAct-пути; вне ctx — self-commit (легаси)."""
+        # exact-replay/tombstone ДО not-found/confirm (Codex+субагент R1 MAJOR): повтор того же
+        # cancel/delete-хода → сохранённый payload, даже если строка задачи уже удалена/отменена.
+        done = _replay_done(action=action, entity_type="task", entity_id=task_ref, args={})
+        if done is not None:
+            return done
         t = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001 — внутр. lookup сервиса
         if t is None:
             return "Такой задачи у тебя нет."
@@ -943,28 +1095,37 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                               "key": f"task:{task_ref}:{verb}"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не трогаю «{title}»."
-        apply(task_ref)  # возврат намеренно игнорируем:
-        # False → задача уже отсутствует/отменена (idempotent replay) → тоже успех.
-        return f"Готово, {verb}: «{title}»."
+
+        def _mut(commit: bool) -> str:
+            apply(task_ref, commit)  # возврат игнорируем (False → уже нет/отменена → idempotent)
+            return f"Готово, {verb}: «{title}»."
+
+        return _idempotent_write(action=action, entity_type="task",
+                                 entity_id=task_ref, args={}, mutate=_mut)
 
     @tool
     def cancel_task(task_ref: str) -> str:
         """Отменить задачу по ref. САМ спрашивает подтверждение."""
+        # exact-replay ДО pre-check (иначе «уже отменена» перехватил бы replay раньше op-результата).
+        done = _replay_done(action="cancel", entity_type="task", entity_id=task_ref, args={})
+        if done is not None:
+            return done
         # idempotent pre-check (Codex MAJOR): уже отменена → не переспрашивать.
         t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
         if t0 is not None and t0.status == "cancelled":
             return f"Задача «{t0.title}» уже отменена."
 
-        def _apply(ref: str) -> bool:
-            return tasks.cancel(tenant_id=tenant_id, user_id=user_id, task_id=ref) is not None
-        return _confirm_destructive_task(task_ref, "отменяю", _apply)
+        def _apply(ref: str, commit: bool) -> bool:
+            return tasks.cancel(tenant_id=tenant_id, user_id=user_id,
+                                task_id=ref, commit=commit) is not None
+        return _confirm_destructive_task(task_ref, "отменяю", "cancel", _apply)
 
     @tool
     def delete_task(task_ref: str) -> str:
         """Удалить задачу по ref. САМ спрашивает подтверждение."""
-        def _apply(ref: str) -> bool:
-            return tasks.delete(tenant_id=tenant_id, user_id=user_id, task_id=ref)
-        return _confirm_destructive_task(task_ref, "удаляю", _apply)
+        def _apply(ref: str, commit: bool) -> bool:
+            return tasks.delete(tenant_id=tenant_id, user_id=user_id, task_id=ref, commit=commit)
+        return _confirm_destructive_task(task_ref, "удаляю", "delete", _apply)
 
     @tool
     def link_task(task_ref: str, checklist_ref: str) -> str:
@@ -1231,6 +1392,8 @@ def _build_graph(llm: Any, all_tools: list, *,
         # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
         _bound_primary = llm.bind_tools(bound)
         _used_provider, _used_model = provider_key, _model_name
+        _fallback_fired = False
+        _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
         if fallback_llm is not None:
             try:
                 resp = _bound_primary.invoke(_msgs)
@@ -1239,8 +1402,10 @@ def _build_graph(llm: Any, all_tools: list, *,
                                type(_e).__name__, exc_info=True)
                 resp = fallback_llm.bind_tools(bound).invoke(_msgs)
                 _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
+                _fallback_fired = True
         else:
             resp = _bound_primary.invoke(_msgs)
+        _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
         try:
@@ -1256,6 +1421,14 @@ def _build_graph(llm: Any, all_tools: list, *,
             "messages": [resp],
             "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # анти-петля
             "guard_nudge": "",  # one-shot: очищаем после применения
+            # #192: наблюдательная запись вызова (НЕ деньги — деньги в skill_ai_executions #175)
+            "llm_calls": [{
+                "phase": "chat",
+                "call_index": (state.get("turn_pass_count") or 0),
+                "provider_key": _used_provider, "model": _used_model,
+                "latency_ms": _latency_ms, "retries": (1 if _fallback_fired else 0),
+                "fallback_fired": _fallback_fired,
+            }],
         }
 
     def run_tools(state: ReactState):
@@ -1286,20 +1459,25 @@ def _build_graph(llm: Any, all_tools: list, *,
                         active.append(fam)
                         added = True
                     msg = f"Семья «{fam}» загружена."
+                    _rk = "ok"
                 else:
                     msg = (f"Семья «{fam}» неизвестна. Доступные для добора: "
                            + ", ".join(sorted(_LAZY_FAMILIES)) + ".")
-                out.append(ToolMessage(content=msg, name=name, tool_call_id=tc["id"]))
+                    _rk = "unknown_family"  # #192: не-исполнение, НЕ успех вслепую
+                out.append(ToolMessage(content=msg, name=name, tool_call_id=tc["id"],
+                                       artifact={"result_kind": _rk}))
                 continue
             tool_obj = bound_by_name.get(name)
             if tool_obj is None:
                 out.append(ToolMessage(
                     content=(f"Инструмент {name} сейчас недоступен — сначала позови "
                              "need_family нужной семьи."),
-                    name=name, tool_call_id=tc["id"]))
+                    name=name, tool_call_id=tc["id"],
+                    artifact={"result_kind": "unavailable"}))  # #192: не-исполнение
                 continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
+            _t = _time.perf_counter()  # #192: латентность инструмента для трейса
             try:
                 if turn_key:
                     op_id = allocate_operation_id(
@@ -1326,9 +1504,13 @@ def _build_graph(llm: Any, all_tools: list, *,
                 logger.warning("react_loop: tool %s failed type=%s", name, type(exc).__name__)
                 out.append(ToolMessage(
                     content=f"error: инструмент {name} не смог выполниться, повтори запрос.",
-                    name=name, tool_call_id=tc["id"], status="error"))
+                    name=name, tool_call_id=tc["id"], status="error",
+                    artifact={"result_kind": "error", "error_type": type(exc).__name__,
+                              "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
                 continue
-            out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"]))
+            out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"],
+                                   artifact={"result_kind": "ok",
+                                             "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
             if TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES:
                 wrote_unkeyed = True  # unkeyed-write выполнен → guard отключим (анти-дубль)
         update: dict = {"messages": out}
@@ -1608,6 +1790,10 @@ def _persist_debug_turn(*, tenant_id: str, user_id: str, thread_id: str, channel
     try:
         from sreda.config.settings import get_settings
         _s = get_settings()
+        # #192: при включённом durable-трейсе (react_turn_trace) НЕ пишем временный react_debug_turns
+        # — одна система, без dual-write. Снос самой таблицы — отдельной миграцией позже.
+        if getattr(_s, "react_trace_enabled", False):
+            return
         # #185: захват для ВСЕХ при react_debug_all; иначе — только per-tenant allowlist (#170).
         if not (_s.react_debug_all or tenant_id in _s.react_debug_tenants):
             return
@@ -1651,6 +1837,7 @@ async def handle_turn(
             provider_key = ""
     base = thread_id
     gen = _THREAD_GEN.get(base, 0)
+    _tk_trace = ""  # #192: turn_key для трейса — до try, доступен в except при любом сбое
 
     def _cfg(g: int) -> dict:
         # #165 Срез A: recursion_limit — ВНЕШНИЙ нет с запасом (R1: 15 было тесно — срез
@@ -1704,6 +1891,11 @@ async def handle_turn(
                 _THREAD_GEN[base] = gen
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
+            _tk_trace = turn_key
+            # #192: start-строка трейса ДО графа (свежий ход). Resume — НЕ start (строка есть с pause).
+            _trace.persist_trace_start(
+                tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
+                turn_key=turn_key, origin_user_text=user_text)
             # #165 Срез B (R3-карв-аут): пруненый тенант → база = НЕБЕЗОПАСНЫЕ-к-обрезке
             # ленивые семьи ВСЕГДА (recipes/menu/household/checklists/memory — пишут без ключа,
             # дубль на recovery; до #163) + распознанные словарём PRUNABLE (shopping/web —
@@ -1721,11 +1913,15 @@ async def handle_turn(
                  "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
+        # #192: turn_key из state (resume-путь — локального turn_key нет; fresh — совпадёт).
+        _tk_trace = ((snap.values or {}).get("turn_key") if snap and snap.values else None) or _tk_trace
         _tools = _called_tools(result)
         if _has_pause(snap):  # снова пауза → вопрос пользователю (+ confirm + токен для [Да][Нет])
             q, is_confirm, pid = _pending(snap)
             reply = _Reply(_postformat(q) or "Уточни, пожалуйста.",
                            awaiting_confirm=is_confirm, confirm_id=pid)
+            # #192: pause-ход → awaiting_confirm/pending (conditional; не переоткрывает done)
+            _trace.persist_trace_pause(tenant_id=tenant_id, user_id=user_id, turn_key=_tk_trace)
             _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                                 channel=channel, user_text=user_text, reply=reply,
                                 tools=_tools, kind="pause")
@@ -1733,6 +1929,25 @@ async def handle_turn(
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
         reply = _Reply(_postformat(text) or "Готово.")
+        # #192: финал → done + структура. ВЕСЬ блок под флагом И guarded (R1 CRITICAL Codex high):
+        # collect_tool_calls/HMAC/json НЕ должны выполняться при OFF (спящий прод) и НЕ должны ронять
+        # ход при сбое (трейс = отладка, best-effort).
+        if _trace.trace_enabled():
+            try:
+                _msgs_fin = result.get("messages", []) if isinstance(result, dict) else []
+                _tcs = _trace.collect_tool_calls(_msgs_fin, tenant_id=tenant_id)
+                _lcs = result.get("llm_calls") if isinstance(result, dict) else None
+                _outcome = ("tool_error" if any(t.get("result_kind") == "error" for t in _tcs)
+                            else "fallback_used" if any(c.get("fallback_fired") for c in (_lcs or []))
+                            else "ok")
+                _trace.persist_trace_finish(
+                    tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
+                    turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
+                    confirm_state=("confirmed" if live_pause else "none"),  # best-effort
+                    outcome=_outcome,
+                    passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0)
+            except Exception:  # noqa: BLE001 — трейс не валит ход
+                logger.warning("react_loop: trace finish failed", exc_info=True)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                             channel=channel, user_text=user_text, reply=reply,
                             tools=_tools, kind="final")
@@ -1744,6 +1959,13 @@ async def handle_turn(
         _THREAD_GEN[base] = gen + 1
         _reply = _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
                         "что нужно сделать.")
+        # #192: handled-ошибка (поймана) → терминал done+outcome (НЕ in_progress; in_progress
+        # остаётся только при НЕпойманном краше/потере finish-хука). Best-effort, guarded.
+        if _tk_trace:
+            _trace.persist_trace_finish(
+                tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
+                turn_key=_tk_trace, reply_text=str(_reply), llm_calls=None, tool_calls=None,
+                confirm_state="none", outcome="safe_reply", passes=0)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                             channel=channel, user_text=user_text, reply=_reply,
                             tools=[], kind="error")

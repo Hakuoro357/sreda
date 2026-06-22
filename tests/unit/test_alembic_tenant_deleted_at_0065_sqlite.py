@@ -1,8 +1,9 @@
-"""#187 Фаза 0 — SQLite Alembic round-trip миграции 0063 (`tenants.deleted_at` + partial-индекс).
+"""#187 Фаза 0 — SQLite Alembic round-trip миграции 0065 (`tenants.deleted_at` + partial-индекс).
 
 Чеклист приёмки A9: миграция аддитивна; downgrade убирает колонку+индекс, upgrade возвращает;
 существующие тенанты остаются `deleted_at=NULL` (БЕЗ backfill — в отличие от approved_at). Форма как
-0051-round-trip (`test_alembic_operation_id_columns_sqlite.py`). RED до создания миграции 0063.
+0051-round-trip (`test_alembic_operation_id_columns_sqlite.py`). RED до создания миграции.
+(Ревизия перецеплена 0063→0065 при синхроне с origin/main: 0063 занял #200, 0064 — #192.)
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ def alembic_cfg(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-def _bootstrap_stamped_at_0063(engine, cfg) -> None:
+def _bootstrap_stamped_at_0065(engine, cfg) -> None:
     from sreda.db.base import Base
     import sreda.db.models  # noqa: F401
     import sreda.db.models.audit  # noqa: F401
@@ -43,13 +44,13 @@ def _bootstrap_stamped_at_0063(engine, cfg) -> None:
     import sreda.db.models.reply_buttons  # noqa: F401
 
     Base.metadata.create_all(engine)
-    command.stamp(cfg, "20260622_0063")
+    command.stamp(cfg, "20260622_0065")
 
 
-def test_migration_0063_downgrade_then_upgrade(alembic_cfg):
+def test_migration_0065_downgrade_then_upgrade(alembic_cfg):
     cfg, db_path = alembic_cfg
     engine = create_engine(f"sqlite:///{db_path.as_posix()}", future=True)
-    _bootstrap_stamped_at_0063(engine, cfg)
+    _bootstrap_stamped_at_0065(engine, cfg)
 
     # Существующий тенант — без deleted_at (имитирует живого пользователя до миграции).
     with engine.begin() as conn:
@@ -59,12 +60,12 @@ def test_migration_0063_downgrade_then_upgrade(alembic_cfg):
         ))
 
     # Downgrade → колонка + partial-индекс уходят.
-    command.downgrade(cfg, "20260622_0062")
+    command.downgrade(cfg, "20260622_0064")
     cols = {c["name"] for c in inspect(engine).get_columns("tenants")}
     assert "deleted_at" not in cols, f"downgrade не убрал deleted_at; got {sorted(cols)}"
 
     # Upgrade обратно → колонка + partial-индекс возвращаются.
-    command.upgrade(cfg, "20260622_0063")
+    command.upgrade(cfg, "20260622_0065")
     insp = inspect(engine)
     cols = {c["name"] for c in insp.get_columns("tenants")}
     assert "deleted_at" in cols, f"upgrade не вернул deleted_at; got {sorted(cols)}"

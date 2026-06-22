@@ -9,8 +9,8 @@ Partial-индекс ``WHERE deleted_at IS NOT NULL`` — только для а
 plain CREATE INDEX берёт SHARE-лок + сканирует таблицу для предиката; на PG ``SET lock_timeout``
 делает build fail-fast (как 0062). На альфа-масштабе tenants крошечная → суб-секунда.
 
-Revision ID: 20260622_0063
-Revises: 20260622_0062
+Revision ID: 20260622_0065
+Revises: 20260622_0064
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "20260622_0063"
-down_revision = "20260622_0062"
+revision = "20260622_0065"
+down_revision = "20260622_0064"
 branch_labels = None
 depends_on = None
 

@@ -364,6 +364,22 @@ def test_signup_abuse_free_tier_full(session):
     assert reason == "free_tier_full"
 
 
+def test_signup_abuse_grandfathered_excluded_from_cap(session):
+    """#200: grandfathered active sreda_free НЕ занимает free-место → cap не сработал."""
+    from sreda.services.signup_abuse import SignupAbuseGuard
+
+    plan = _seed_plan(session, "sreda_free", sort_order=0)
+    _seed_tenant(session, "t_gf_1")
+    _seed_subscription(
+        session, sub_id="sub_gf_1", tenant_id="t_gf_1", plan=plan,
+        grandfathered=True,  # безлимит штатно — не «бесплатная liability под потолком»
+    )
+
+    guard = SignupAbuseGuard(free_tier_active_max=1)  # cap=1, но единственная active — grandfathered
+    allowed, reason = guard.check_inside_tx(session, "telegram", "778")
+    assert allowed, f"grandfathered не должен занимать free-место, но reason={reason}"
+
+
 def test_signup_abuse_rate_limited(session):
     """4-я попытка с одного source за 24h → 'rate_limited'."""
     from sreda.services.signup_abuse import SignupAbuseGuard, hmac_signup_source

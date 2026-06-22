@@ -1,13 +1,16 @@
 """Unit-tests for `build_web_search_tool` Tavily-backed implementation.
 
-Covers:
-* Tavily happy path → формат «N. Title\\n<snippet>\\n<url>»
-* Tavily 401/network → DDG fallback
-* Quota exhausted → DDG fallback (не звоним в Tavily)
-* DDG fallback hit инкрементирует `fallback_calls`
-* Tavily success инкрементирует `tavily_calls`
+#200 Фаза 1 — тир-aware политика веб-поиска (веб-поиск доступен ВСЕМ;
+free=5/мес жёстко, grandfathered/платные без per-user лимита; global 950
+атомарно). Покрывает:
+* Tavily happy path → формат «N. Title\\n<snippet>\\n<url>», слот считается
+* пустой результат → «no results», слот СЧИТАЕТСЯ
+* Tavily 401/None (provider-fail) → release слота + транзиентная ошибка (НЕ DDG)
+* free 6-й вызов → машинный статус апсейла (Tavily НЕ зван)
+* grandfathered (per_user_cap=None) → 31-й проходит
+* missing context + is_free → fail-closed (quota exhausted, не Tavily)
+* global≥950 + free → транзиентная (без Tavily/DDG)
 * Empty query → "error: empty query"
-* Tavily fail + DDG fail → "error: Достигнут лимит поиска"
 """
 
 from __future__ import annotations
@@ -17,17 +20,16 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
-import pytest
 
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
 from sreda.db.models.core import Tenant
 from sreda.db.models.web_search import WebSearchUsage
 from sreda.db.session import get_engine, get_session_factory
-from sreda.services.web_search_tool import build_web_search_tool
-from sreda.services.web_search_usage import (
-    PER_USER_LIMIT,
-    WebSearchUsageCounter,
+from sreda.services.web_search_tool import (
+    _FREE_QUOTA_EXHAUSTED_MSG,
+    _WEB_SEARCH_UNAVAILABLE_MSG,
+    build_web_search_tool,
 )
 
 
@@ -89,7 +91,7 @@ def test_tavily_happy_path_increments_counter(monkeypatch, tmp_path):
         assert "https://a.example" in result
         assert "2. Title B" in result
 
-        # Counter incremented
+        # Counter incremented atomically (один слот занят).
         row = session.query(WebSearchUsage).one()
         assert row.tavily_calls == 1
         assert row.fallback_calls == 0
@@ -108,7 +110,7 @@ def test_tavily_no_results_returns_no_results_string(monkeypatch, tmp_path):
             result = tool.invoke({"query": "obscure"})
 
         assert result == "no results"
-        # Counter всё равно инкрементируется (Tavily запрос-то отправили)
+        # Пустой результат = занятый слот (Tavily запрос-то отправили).
         row = session.query(WebSearchUsage).one()
         assert row.tavily_calls == 1
     finally:
@@ -136,130 +138,272 @@ def test_empty_query_short_circuits(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------
-# Quota exhaustion → DDG fallback
+# Free per-user exhaustion → апсейл-статус (НЕ DDG)
 # --------------------------------------------------------------------
 
 
-def test_per_user_quota_exhausted_falls_back_to_ddg(monkeypatch, tmp_path):
-    """Per-user limit достигнут → tool НЕ зовёт tavily, идёт в DDG.
-
-    Mock-уем `_call_ddg_fallback` напрямую (а не саму ddgs-библиотеку),
-    чтобы тесты работали даже без установленного duckduckgo_search."""
+def test_web_search_free_hard_stop_after_5(monkeypatch, tmp_path):
+    """free (per_user_cap=5): ровно 5 Tavily-вызовов проходят; 6-й →
+    машинный статус апсейла, Tavily НЕ зван (call_count == 5)."""
     session = _bootstrap(monkeypatch, tmp_path)
     try:
-        # Bump per-user счётчик до лимита
-        counter = WebSearchUsageCounter(session)
-        for _ in range(PER_USER_LIMIT):
-            counter.record_tavily(tenant_id="t1", user_id="u1")
-
         tool = build_web_search_tool(
             session=session, tenant_id="t1", user_id="u1",
+            per_user_cap=5, is_free=True,
         )
+        with patch("sreda.services.web_search_tool._call_tavily") as mock_tavily:
+            mock_tavily.return_value = [("T", "B", "https://x")]
+            results = [tool.invoke({"query": f"q{i}"}) for i in range(6)]
 
-        ddg_results = [
-            ("DDG Title", "DDG snippet", "https://ddg.example"),
-        ]
+        # Первые 5 — успех, 6-й — апсейл-статус.
+        assert all("1. T" in r for r in results[:5])
+        assert results[5] == _FREE_QUOTA_EXHAUSTED_MSG
+        # Tavily вызван ровно 5 раз — 6-й НЕ дошёл.
+        assert mock_tavily.call_count == 5
 
-        with patch("sreda.services.web_search_tool.httpx.post") as mock_post, \
-             patch(
-                 "sreda.services.web_search_tool._call_ddg_fallback",
-                 return_value=ddg_results,
-             ):
-            result = tool.invoke({"query": "test"})
-
-        # Tavily НЕ вызывался (квота исчерпана заранее)
-        mock_post.assert_not_called()
-        assert "DDG Title" in result
-        assert "DDG snippet" in result
-
-        # fallback_calls инкрементирован
-        row = (
-            session.query(WebSearchUsage)
-            .filter_by(tenant_id="t1", user_id="u1")
-            .one()
-        )
-        assert row.tavily_calls == PER_USER_LIMIT  # уже было
-        assert row.fallback_calls == 1
+        row = session.query(WebSearchUsage).one()
+        assert row.tavily_calls == 5
+        assert row.fallback_calls == 0
     finally:
         session.close()
 
 
-def test_tavily_http_error_falls_back_to_ddg(monkeypatch, tmp_path):
-    """Tavily вернул 401/500 → fall back to DDG."""
+def test_web_search_contention_retry_exhaustion_graceful(monkeypatch, tmp_path):
+    """#200 carry-forward: try_consume_tavily исчерпал ретраи (40001 ×3) → RuntimeError.
+    Замыкание НЕ валит ход — free отдаёт транзиентную недоступность, Tavily не зван
+    (слот не зарезервирован → release не нужен). Эмпирически всплыло на Postgres-прогоне."""
     session = _bootstrap(monkeypatch, tmp_path)
     try:
         tool = build_web_search_tool(
             session=session, tenant_id="t1", user_id="u1",
+            per_user_cap=5, is_free=True,
         )
+        with patch(
+            "sreda.services.web_search_usage.try_consume_tavily",
+            side_effect=RuntimeError("retried 3× — все serialization failures (40001)"),
+        ), patch("sreda.services.web_search_tool._call_tavily") as mock_tavily:
+            result = tool.invoke({"query": "q"})
+        assert result == _WEB_SEARCH_UNAVAILABLE_MSG
+        assert mock_tavily.call_count == 0  # слот не зарезервирован — Tavily не зван
+    finally:
+        session.close()
 
+
+def test_web_search_grandfathered_no_user_cap(monkeypatch, tmp_path):
+    """grandfathered/платные (per_user_cap=None): 31-й вызов проходит
+    (нет per-user стопа)."""
+    session = _bootstrap(monkeypatch, tmp_path)
+    try:
+        tool = build_web_search_tool(
+            session=session, tenant_id="t1", user_id="u1",
+            per_user_cap=None, is_free=False,
+        )
+        with patch("sreda.services.web_search_tool._call_tavily") as mock_tavily:
+            mock_tavily.return_value = [("T", "B", "https://x")]
+            for i in range(31):
+                result = tool.invoke({"query": f"q{i}"})
+
+        assert "1. T" in result  # 31-й прошёл
+        assert mock_tavily.call_count == 31
+        row = session.query(WebSearchUsage).one()
+        assert row.tavily_calls == 31
+    finally:
+        session.close()
+
+
+# --------------------------------------------------------------------
+# Provider failure → release slot
+# --------------------------------------------------------------------
+
+
+def test_web_search_provider_failure_releases_slot(monkeypatch, tmp_path):
+    """Tavily None (5xx/timeout/auth) → release слота + транзиентная
+    ошибка (НЕ DDG, НЕ апсейл); счётчик не растёт."""
+    session = _bootstrap(monkeypatch, tmp_path)
+    try:
+        tool = build_web_search_tool(
+            session=session, tenant_id="t1", user_id="u1",
+            per_user_cap=5, is_free=True,
+        )
+        ddg = MagicMock(return_value=[("DDG", "fb", "https://x")])
+        with patch("sreda.services.web_search_tool.httpx.post") as mock_post, \
+             patch("sreda.services.web_search_tool._call_ddg_fallback", ddg):
+            mock_post.return_value = _http_error_response(500)
+            result = tool.invoke({"query": "test"})
+
+        # Транзиентная ошибка, НЕ DDG.
+        assert result == _WEB_SEARCH_UNAVAILABLE_MSG
+        ddg.assert_not_called()
+        # Слот зарезервировали → потом release → счётчик 0.
+        row = session.query(WebSearchUsage).one()
+        assert row.tavily_calls == 0
+    finally:
+        session.close()
+
+
+def test_web_search_empty_results_counts(monkeypatch, tmp_path):
+    """Пустой результат Tavily = занятый слот (НЕ release)."""
+    session = _bootstrap(monkeypatch, tmp_path)
+    try:
+        tool = build_web_search_tool(
+            session=session, tenant_id="t1", user_id="u1",
+            per_user_cap=5, is_free=True,
+        )
+        with patch("sreda.services.web_search_tool.httpx.post") as mock_post:
+            mock_post.return_value = _tavily_ok_response([])
+            result = tool.invoke({"query": "obscure"})
+
+        assert result == "no results"
+        row = session.query(WebSearchUsage).one()
+        assert row.tavily_calls == 1  # СЧИТАЕТСЯ
+    finally:
+        session.close()
+
+
+# --------------------------------------------------------------------
+# Fail-closed: missing context
+# --------------------------------------------------------------------
+
+
+def test_web_search_missing_context_fail_closed(monkeypatch, tmp_path):
+    """is_free + НЕТ полного контекста (session) → апсейл-статус, НЕ
+    безлимитный Tavily."""
+    session = _bootstrap(monkeypatch, tmp_path)
+    try:
+        # Контекст неполный: tenant/user без session.
+        tool = build_web_search_tool(
+            session=None, tenant_id="t1", user_id="u1",
+            per_user_cap=5, is_free=True,
+        )
+        with patch("sreda.services.web_search_tool.httpx.post") as mock_post:
+            result = tool.invoke({"query": "test"})
+
+        assert result == _FREE_QUOTA_EXHAUSTED_MSG
+        mock_post.assert_not_called()
+    finally:
+        session.close()
+
+
+def test_web_search_missing_context_non_free_uses_ddg(monkeypatch, tmp_path):
+    """non-free без полного контекста → DDG (не апсейл, не Tavily)."""
+    session = _bootstrap(monkeypatch, tmp_path)
+    try:
+        tool = build_web_search_tool(
+            session=None, tenant_id=None, user_id=None,
+            per_user_cap=None, is_free=False,
+        )
         with patch("sreda.services.web_search_tool.httpx.post") as mock_post, \
              patch(
                  "sreda.services.web_search_tool._call_ddg_fallback",
                  return_value=[("DDG", "fb", "https://x")],
              ):
-            mock_post.return_value = _http_error_response(401)
             result = tool.invoke({"query": "test"})
 
         assert "DDG" in result
-        # Tavily вызван 1 раз, but failed
-        assert mock_post.call_count == 1
-        # tavily_calls НЕ инкрементирован (только при success)
-        # fallback_calls инкрементирован
-        row = session.query(WebSearchUsage).one()
-        assert row.tavily_calls == 0
-        assert row.fallback_calls == 1
+        mock_post.assert_not_called()
     finally:
         session.close()
 
 
 # --------------------------------------------------------------------
-# Both fail → quota exhausted message
+# Global 950 → free транзиентная (без Tavily); non-free → DDG
 # --------------------------------------------------------------------
 
 
-def test_tavily_fail_plus_ddg_fail_returns_quota_msg(monkeypatch, tmp_path):
+def test_web_search_global_950_blocks_free_no_tavily(monkeypatch, tmp_path):
+    """global ≥ 950 + free → транзиентная недоступность; Tavily НЕ зван,
+    DDG НЕ зван, слот не считается."""
     session = _bootstrap(monkeypatch, tmp_path)
     try:
-        tool = build_web_search_tool(
-            session=session, tenant_id="t1", user_id="u1",
+        # Накачиваем глобальный счётчик до 950 через прямые строки
+        # (разные юзеры по 30 — но per-user тут неважно, важна SUM).
+        from sreda.services.web_search_usage import (
+            QuotaDecision,
+            try_consume_tavily,
         )
+        engine = session.get_bind()
+        for u in range(950 // 30 + 1):
+            cap = None
+            for _ in range(min(30, 950 - u * 30)):
+                dec = try_consume_tavily(engine, "t1", f"gu{u}", cap)
+                assert dec is QuotaDecision.ALLOW
+        session.expire_all()
 
+        tool = build_web_search_tool(
+            session=session, tenant_id="t1", user_id="ufresh",
+            per_user_cap=5, is_free=True,
+        )
+        ddg = MagicMock(return_value=[("DDG", "fb", "https://x")])
+        with patch("sreda.services.web_search_tool.httpx.post") as mock_post, \
+             patch("sreda.services.web_search_tool._call_ddg_fallback", ddg):
+            result = tool.invoke({"query": "test"})
+
+        assert result == _WEB_SEARCH_UNAVAILABLE_MSG
+        mock_post.assert_not_called()
+        ddg.assert_not_called()
+    finally:
+        session.close()
+
+
+def test_web_search_global_950_non_free_uses_ddg(monkeypatch, tmp_path):
+    """global ≥ 950 + non-free → DDG fallback (Tavily не зван)."""
+    session = _bootstrap(monkeypatch, tmp_path)
+    try:
+        from sreda.services.web_search_usage import (
+            QuotaDecision,
+            try_consume_tavily,
+        )
+        engine = session.get_bind()
+        for u in range(950 // 30 + 1):
+            for _ in range(min(30, 950 - u * 30)):
+                dec = try_consume_tavily(engine, "t1", f"gu{u}", None)
+                assert dec is QuotaDecision.ALLOW
+        session.expire_all()
+
+        tool = build_web_search_tool(
+            session=session, tenant_id="t1", user_id="ufresh",
+            per_user_cap=None, is_free=False,
+        )
         with patch("sreda.services.web_search_tool.httpx.post") as mock_post, \
              patch(
                  "sreda.services.web_search_tool._call_ddg_fallback",
-                 return_value=None,
+                 return_value=[("DDG", "fb", "https://x")],
              ):
-            mock_post.return_value = _http_error_response(500)
             result = tool.invoke({"query": "test"})
 
-        assert result == "error: Достигнут лимит поиска"
-        # Никакие counter'ы не инкрементируем — оба fail
-        row = session.query(WebSearchUsage).first()
-        assert row is None or (row.tavily_calls == 0 and row.fallback_calls == 0)
+        assert "DDG" in result
+        mock_post.assert_not_called()
     finally:
         session.close()
 
 
 # --------------------------------------------------------------------
-# Without session/tenant — quota check skipped
+# No api_key → DDG (quota не применяется)
 # --------------------------------------------------------------------
 
 
-def test_no_session_skips_quota_check(monkeypatch, tmp_path):
-    """tool вызван без session/tenant_id (legacy / scripts) — quota
-    не отслеживается, но Tavily всё равно работает."""
+def test_no_api_key_uses_ddg(monkeypatch, tmp_path):
+    """Без TAVILY_API_KEY tool идёт в DDG как раньше."""
     session = _bootstrap(monkeypatch, tmp_path)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    get_settings.cache_clear()
     try:
-        tool = build_web_search_tool()  # without session/tenant
-        with patch("sreda.services.web_search_tool.httpx.post") as mock_post:
-            mock_post.return_value = _tavily_ok_response([
-                {"title": "A", "content": "B", "url": "https://c"},
-            ])
+        tool = build_web_search_tool(
+            session=session, tenant_id="t1", user_id="u1",
+            per_user_cap=5, is_free=True,
+        )
+        with patch("sreda.services.web_search_tool.httpx.post") as mock_post, \
+             patch(
+                 "sreda.services.web_search_tool._call_ddg_fallback",
+                 return_value=[("DDG", "fb", "https://x")],
+             ):
             result = tool.invoke({"query": "test"})
 
-        assert "1. A" in result
-        # Никаких counter rows не создано
-        rows = session.query(WebSearchUsage).all()
-        assert rows == []
+        assert "DDG" in result
+        mock_post.assert_not_called()
+        # fallback_calls инкрементирован.
+        row = session.query(WebSearchUsage).one()
+        assert row.fallback_calls == 1
+        assert row.tavily_calls == 0
     finally:
         session.close()

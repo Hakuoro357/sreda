@@ -148,3 +148,31 @@ def test_compute_args_hmac_stable_and_sensitive_163():
     c = compute_args_hmac({"x": 1, "y": 3}, secret="s")  # иное значение
     assert a == b, "hmac должен быть стабилен к порядку ключей"
     assert a != c, "hmac должен реагировать на значения"
+
+
+def test_mutate_exception_rolls_back_claim_no_orphan_163():
+    """Codex medium R1 MAJOR: mutate_fn бросает → claim ОТКАТАН (нет orphan pending); повтор с
+    успешной мутацией применяется (не вечный IdempotencyInFlight). Плайн-сессия (не conftest-обёртка,
+    иначе orphan-claim замаскировался бы внешней транзакцией)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from sreda.db.base import Base
+
+    eng = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(eng)
+    s = sessionmaker(bind=eng)()
+    kw = dict(operation_id="op-boom", tenant_id="t1", user_id="u1",
+              operation_family="reminders", args_hmac="h")
+
+    def boom():
+        raise ValueError("blank")
+
+    with pytest.raises(ValueError):
+        execute_idempotent_durable_op(s, mutate_fn=boom, **kw)
+    orphans = (s.query(ToolOperationResult)
+               .filter(ToolOperationResult.operation_id == "op-boom").all())
+    assert orphans == [], f"claim должен быть откатан, не orphan pending: {orphans}"
+    # повтор той же операции с УСПЕШНОЙ мутацией → применяется (не упёрся в IdempotencyInFlight)
+    r = execute_idempotent_durable_op(s, mutate_fn=lambda: "ok", **kw)
+    assert r == "ok", "после отката claim повтор должен примениться"

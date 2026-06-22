@@ -238,11 +238,16 @@ class SignupAbuseGuard:
         # 4. Committed liability cap (active free subscriptions count).
         # Bot-agnostic: shared global capacity across all bots (Model B
         # shared tenant — limits are per-tenant, not per-bot).
+        # #200: grandfathered подписки НЕ занимают free-места (они безлимитны
+        # штатным механизмом, а не «бесплатная liability под потолком»). После
+        # слияния тарифов 15+1 grandfathered оказываются на plan_sreda_free —
+        # без этого фильтра они бы съели места и могли молча закрыть регистрации.
         active_count = session.execute(text("""
             SELECT COUNT(*) FROM tenant_subscriptions ts
             JOIN subscription_plans sp ON ts.plan_id = sp.id
             WHERE sp.plan_key = 'sreda_free'
               AND ts.status = 'active'
+              AND ts.grandfathered_at IS NULL
         """)).scalar()
         if (active_count or 0) >= self.free_tier_active_max:
             return (False, "free_tier_full")

@@ -22,6 +22,7 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.db.models.react_debug import ReactDebugTurn
+from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.housewife import FamilyMember, FamilyReminder
 from sreda.db.models.housewife_food import (
     MenuPlan,
@@ -73,6 +74,7 @@ __all__ = [
     "ChecklistItem",
     "ConversationTurn",
     "ReactDebugTurn",
+    "ReactTurnTrace",
     "PaymentOrder",
     "PaymentOrderItem",
     "InboundMessage",
