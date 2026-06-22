@@ -48,6 +48,32 @@ def _seed_reminder(db_session, u) -> str:
     return rid
 
 
+def test_update_reminder_exact_replay_no_reapply_163(db_session):
+    """#163 Фаза 3 named-X: повтор того же update (тот же ctx→op_id, committed) → сохранённый
+    payload БЕЗ переприменения (replay-after-change не откатывает более новое состояние БД)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx1 = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                              tool_name="update_reminder", tenant_id=u.tenant_id,
+                              user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx1):
+        r1 = tools["update_reminder"].invoke({"reminder_ref": rid, "title": "новое"})
+    assert "новое" in r1, r1
+    # более новое состояние БД (как будто прошёл ещё один ход и поменял title)
+    row = db_session.get(FamilyReminder, rid)
+    row.title = "новейшее"
+    db_session.commit()
+    # replay ТОГО ЖЕ хода (ctx1 → тот же op_id) → сохранённый payload, БЕЗ переприменения
+    with bind_tool_runtime(ctx1):
+        r2 = tools["update_reminder"].invoke({"reminder_ref": rid, "title": "новое"})
+    assert r2 == r1, f"replay должен вернуть сохранённый payload: {r2!r} != {r1!r}"
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).title == "новейшее", \
+        "replay НЕ должен переприменять (нет отката к 'новое')"
+
+
 def _cancel_script(rid: str) -> _StubLLM:
     return _StubLLM([
         AIMessage(content="", tool_calls=[{

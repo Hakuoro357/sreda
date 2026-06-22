@@ -327,6 +327,7 @@ class HousewifeReminderService:
         trigger_at: datetime | None = None,
         recurrence_rule: str | None = None,
         clear_recurrence: bool = False,
+        commit: bool = True,
     ) -> FamilyReminder | None:
         """Patch an existing reminder in-place — used вместо delete+create
         когда юзер уточняет существующее напоминание.

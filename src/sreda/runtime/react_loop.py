@@ -756,6 +756,47 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     reminders = HousewifeReminderService(session)
     tasks = TaskService(session)
 
+    # #163 Фаза 3 — exact-replay update/delete на ReAct-пути через durable-helper (named-X).
+    from sreda.runtime.planner.tool_runtime import current_tool_runtime
+    from sreda.services.idempotent_ops import (
+        IdempotencyArgsMismatch,
+        IdempotencyInFlight,
+        IdempotencyScopeMismatch,
+        compute_args_hmac,
+        execute_idempotent_durable_op,
+    )
+    from sreda.services.operation_id import compute_operation_id_update
+
+    def _idempotent_write(*, action: str, entity_type: str, entity_id: str,
+                          args: dict, mutate) -> str:
+        """exact-replay durable update/delete. ``mutate(commit: bool) -> str`` делает мутацию и
+        возвращает payload-строку (helper владеет commit → внутри ctx зовём mutate(False)).
+        Вне ctx (легаси-путь) — self-commit БЕЗ идемпотентности (scope #163: только ReAct). Повтор
+        того же operation_id со статусом committed → сохранённый payload БЕЗ переприменения; т.к.
+        op_id = f(execution_id, step_id, ...), старый ход = старый op_id → replay-after-change тоже
+        не переприменяет (новый ход уже сделал свою правку под своим op_id)."""
+        ctx = current_tool_runtime()
+        if ctx is None:
+            return mutate(True)
+        from sreda.config.settings import get_settings
+
+        secret = get_settings().encryption_key or "dev-insecure-args-hmac"
+        op_id = compute_operation_id_update(
+            plan_id=ctx.execution_id, step_id=ctx.step_id, action=action,
+            entity_type=entity_type, entity_id=entity_id)
+        try:
+            return execute_idempotent_durable_op(
+                session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
+                operation_family=entity_type,
+                args_hmac=compute_args_hmac(args, secret=secret),
+                mutate_fn=lambda: mutate(False), tool_name=action)
+        except IdempotencyInFlight:
+            return "Секунду, эта правка уже в обработке — повтори, если не дошло."
+        except (IdempotencyArgsMismatch, IdempotencyScopeMismatch):
+            # внутренняя коллизия ключа (не user-facing): не блокируем — применяем напрямую.
+            logger.warning("idempotent update внутренняя коллизия op=%s — применяю напрямую", op_id)
+            return mutate(True)
+
     # ---- напоминания ----------------------------------------------------
     def _active_reminders() -> list:
         session.expire_all()
@@ -811,13 +852,18 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         if ((new_title is None or new_title == r0.title)
                 and (new_trigger is None or new_trigger == r0.trigger_at)):
             return f"ok:updated:{r0.id} | {r0.title} | {_fmt(r0.trigger_at)}"
-        r = reminders.update(
-            tenant_id=tenant_id, reminder_id=reminder_ref,
-            title=title or None, trigger_at=new_trigger,
-        )
-        if r is None:
-            return "Такого напоминания у тебя нет."
-        return f"ok:updated:{r.id} | {r.title} | {_fmt(r.trigger_at)}"
+        def _mut(commit: bool) -> str:
+            r = reminders.update(
+                tenant_id=tenant_id, reminder_id=reminder_ref,
+                title=title or None, trigger_at=new_trigger, commit=commit,
+            )
+            if r is None:
+                return "Такого напоминания у тебя нет."
+            return f"ok:updated:{r.id} | {r.title} | {_fmt(r.trigger_at)}"
+
+        return _idempotent_write(
+            action="update", entity_type="family_reminder", entity_id=reminder_ref,
+            args={"title": title, "trigger_iso": trigger_iso}, mutate=_mut)
 
     @tool
     def cancel_reminder(reminder_ref: str) -> str:
