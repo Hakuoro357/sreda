@@ -376,6 +376,12 @@ class Settings(BaseSettings):
     react_osa_fallback: bool = Field(
         default=False, validation_alias="SREDA_REACT_OSA_FALLBACK"
     )
+    # #192: durable структурный трейс хода ReAct (react_turn_trace). True → пишем трейс (start/pause/
+    # finish) И НЕ пишем временный react_debug_turns (#185, одна система). False (дефолт) → старый
+    # путь #185 (откат). Раскат как #185: проверка → ВКЛ глобально.
+    react_trace_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_TRACE_ENABLED"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
