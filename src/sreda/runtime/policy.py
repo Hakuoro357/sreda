@@ -16,10 +16,8 @@ from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.handlers import (
     ActionRuntimeError,
     connect_reply_markup,
-    status_subscriptions_markup,
     subscriptions_markup,
 )
-from sreda.services.claim_lookup import is_valid_claim_id
 from sreda.services.onboarding import build_connect_eds_message
 
 # #181: EDS-feature action types whose policy checks would otherwise emit the
@@ -61,27 +59,11 @@ def evaluate_policy(
 
     summary = context["billing_summary"]
 
-    if action.action_type == "claim.lookup":
-        claim_id = str(action.params.get("claim_id") or "").strip()
-        if not claim_id:
-            return ActionRuntimeError(
-                "claim_id_missing",
-                "Используй команду в формате:\n\n/claim <номер_заявки>",
-                reply_markup=status_subscriptions_markup(),
-            )
-        if not is_valid_claim_id(claim_id):
-            return ActionRuntimeError(
-                "claim_id_invalid",
-                "Номер заявки должен содержать только буквы, цифры, '-' или '_'.",
-                reply_markup=status_subscriptions_markup(),
-            )
-        if not context.get("eds_monitor_enabled"):
-            return ActionRuntimeError(
-                "eds_monitor_disabled",
-                "Поиск по заявкам станет доступен после подключения EDS.",
-                reply_markup=subscriptions_markup(),
-            )
-        return None
+    # #181: ``claim.lookup`` is an eds_monitor feature. Its legacy policy checks
+    # (claim_id format validation + "подключи EDS" prompt) are gone with the
+    # skill; the GLOBAL disabled bypass above already returns None for it, and
+    # the downstream handler answers the disabled tombstone. No EDS-specific
+    # claim.lookup branch remains here.
 
     if action.action_type == "subscription.add_eds" and not summary["base_active"]:
         return ActionRuntimeError(

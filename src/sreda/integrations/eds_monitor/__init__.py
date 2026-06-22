@@ -1,1 +1,0 @@
-# Site monitor integration package.

@@ -30,11 +30,11 @@ from sreda.features.app_registry import get_feature_registry
 from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
 from sreda.services.agent_capabilities import active_feature_keys
 from sreda.services.billing import (
+    DISABLED_FEATURE_MESSAGE,
     PLAN_EDS_MONITOR_BASE,
     PLAN_EDS_MONITOR_EXTRA,
     BillingService,
 )
-from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.housewife_family import HousewifeFamilyService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
@@ -939,19 +939,12 @@ def eds_connect(
     session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    """Create a one-time connect session for a free EDS slot."""
-    settings = get_settings()
-    try:
-        link = EDSConnectService(session, settings).create_connect_link(
-            tenant_id=ctx.tenant_id,
-            workspace_id=ctx.workspace_id,
-            user_id=ctx.user_id,
-            slot_type="extra",
-        )
-    except ConnectSessionError as exc:
-        return {"ok": False, "message": exc.message, "connect_url": None}
-
-    return {"ok": True, "connect_url": link.url, "message": None}
+    """#181: eds_monitor retired — tombstone. Phase 1 already short-circuited
+    this route via the EDSConnectService disabled guard (which raised
+    "feature_disabled" → ``{"ok": False, ...}``). Phase 2: the service was
+    removed with its module, so the disabled response is inlined here with no
+    DB mutation."""
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE, "connect_url": None}
 
 
 @router.post("/api/v1/eds/add-and-connect")
@@ -959,25 +952,14 @@ def eds_add_and_connect(
     session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    """Add an extra EDS subscription slot AND create a connect session."""
+    """#181: eds_monitor retired — tombstone. The billing mutator
+    ``add_extra_eds_account`` is itself disabled (quarantined read/early-reject
+    path), so it returns the disabled message with no DB write; the connect-link
+    step is gone with EDSConnectService. Mirrors the Phase 1 shape (the
+    ConnectSessionError branch): no connect_url, the billing message echoed."""
     billing = BillingService(session)
     result = billing.add_extra_eds_account(ctx.tenant_id)
-
-    # Now create the connect link
-    settings = get_settings()
-    try:
-        link = EDSConnectService(session, settings).create_connect_link(
-            tenant_id=ctx.tenant_id,
-            workspace_id=ctx.workspace_id,
-            user_id=ctx.user_id,
-            slot_type="extra",
-        )
-    except ConnectSessionError:
-        # Subscription was created but link failed — still return success
-        # so the UI can refresh and show the new slot.
-        return {"ok": True, "message": result.message_text, "connect_url": None}
-
-    return {"ok": True, "connect_url": link.url, "message": result.message_text}
+    return {"ok": True, "message": result.message_text, "connect_url": None}
 
 
 # ---------------------------------------------------------------------------
