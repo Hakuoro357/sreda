@@ -18,7 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.orm import Session
 
@@ -90,6 +90,25 @@ class MiniAppContext:
     # not branch on these — used only for diagnostic logging.
     channel: str = "telegram"
     account_id: str = ""
+
+
+def _gate_miniapp_tenant_active(session: Session, tenant_id: str) -> None:
+    """#187 Phase 4a — soft-delete gate для mini-app auth-пути.
+
+    Зовётся из ``_require_miniapp_auth`` СРАЗУ после резолва существующего
+    тенанта и ДО любой durable-мутации auth-слоя (TG ``_stamp_last_bot_key``,
+    MAX ``max_chat_id``-refresh). Удалён → 410 Gone reason ``tenant_deleted``
+    (НЕ 401/404 — иначе фронт уходит в re-provision-петлю, см. план
+    db-fix-tenant-deletion-plan.md дверь #8). Lazy-provisioned юзер сюда не
+    передаётся (только что создан, всегда активен) — false-positive нет.
+    """
+    from sreda.services.tenant_lifecycle import is_tenant_active
+
+    if not is_tenant_active(session, tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="tenant_deleted",
+        )
 
 
 def _require_miniapp_auth(
@@ -202,6 +221,12 @@ def _require_miniapp_auth(
             user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
+            # #187 Phase 4a — soft-delete gate ДО любой durable-мутации
+            # auth-слоя (_stamp_last_bot_key коммитит last_bot_key). Удалён
+            # existing-тенант → 410 БЕЗ мутации. Гейт только для уже
+            # резолвленного тенанта; lazy-provision-ветка (resolved is None)
+            # сюда не попадает — там тенант только что создан, всегда активен.
+            _gate_miniapp_tenant_active(session, tenant_id)
             # #109 (Codex MAJOR): existing TG-юзер открыл Mini App, но
             # /start не слал — здесь НЕ вызывается
             # ensure_telegram_user_bundle_by_id, поэтому _stamp_last_bot_key
@@ -358,6 +383,13 @@ def _require_miniapp_auth(
                 user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
+            # #187 Phase 4a — soft-delete gate ДО durable-мутации
+            # max_chat_id-refresh (session.commit ниже). Удалён existing
+            # MAX-тенант → 410 БЕЗ записи max_chat_id. Гейт только для уже
+            # резолвленного тенанта; lazy-provision/race-ветки (onboarding не
+            # None / resolved-after-race) сюда не попадают — тенант только что
+            # создан, всегда активен.
+            _gate_miniapp_tenant_active(session, tenant_id)
             # Codex R1 MAJOR #4: refresh max_chat_id если изменился.
             # Сценарий: Boris вручную SQL-merge'нул tenant'ы; max_chat_id
             # был известен на момент merge'а. Если юзер удалит и пересоздаст
@@ -384,6 +416,11 @@ def _require_miniapp_auth(
                         user_id, exc_info=True,
                     )
                     session.rollback()
+
+    # #187 Phase 4a — soft-delete gate уже применён ДО мутаций auth-слоя:
+    # для existing-тенанта (обе ветки TG/MAX) через _gate_miniapp_tenant_active
+    # сразу после резолва; lazy-provisioned тенант только что создан и всегда
+    # активен. Удалённый тенант → 410 БЕЗ stamp/refresh-мутаций.
 
     # Resolve workspace_id for connect link creation (channel-agnostic)
     from sreda.db.models.core import Assistant, Workspace
@@ -1809,6 +1846,24 @@ def archive_checklist_endpoint(
 # ────────────────────────────────────────────────────────────────────
 
 
+def _gate_channel_link_tenant_active(session: Session, tenant_id: str) -> None:
+    """#187 Phase 4a — soft-delete gate для channel-link auth-пути.
+
+    Зовётся из ``_resolve_platform_auth`` СРАЗУ после резолва существующего
+    тенанта (но ДО мутаций в эндпойнтах consume/cancel/start). Удалён → 410
+    Gone reason ``tenant_deleted`` (симметрично ``_require_miniapp_auth``;
+    НЕ 401/404 чтобы фронт не уходил в re-provision-петлю). Новый юзер
+    (резолв=None) сюда не попадает — гейт только для существующего тенанта.
+    """
+    from sreda.services.tenant_lifecycle import is_tenant_active
+
+    if not is_tenant_active(session, tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="tenant_deleted",
+        )
+
+
 def _resolve_platform_auth(
     request: Request,
     settings,
@@ -1853,6 +1908,7 @@ def _resolve_platform_auth(
                 tenant_id, user_id = resolved
                 payload["tenant_id"] = tenant_id
                 payload["user_id"] = user_id
+                _gate_channel_link_tenant_active(session, tenant_id)
         return ("telegram", payload)
 
     if platform == "max":
@@ -1878,6 +1934,7 @@ def _resolve_platform_auth(
                 tenant_id, user_id = resolved
                 payload["tenant_id"] = tenant_id
                 payload["user_id"] = user_id
+                _gate_channel_link_tenant_active(session, tenant_id)
         return ("max", payload)
 
     raise HTTPException(status_code=400, detail=f"unknown platform: {platform!r}")
@@ -2126,10 +2183,31 @@ async def channel_link_cancel(
 
     from sreda.db.models.channel_linking import ChannelLinkToken
 
+    token_hash = _channel_link_token_hash(raw_token)
+
+    # #187 Phase 4a — soft-delete пред-чтение SOURCE-тенанта ДО мутации used_at.
+    # _resolve_platform_auth гейтит только TARGET (запрашивающего), НЕ владельца
+    # токена. Без этого активный target мог бы отменить токен, чей source-тенант
+    # уже soft-deleted → durable-мутация (used_at) для удалённого тенанта,
+    # нарушая инвариант «нет мутаций удалённого». Читаем ТОЛЬКО колонку
+    # ``tenant_id`` (скаляр, не ORM-сущность — как в consume_link), чтобы не
+    # засорять identity-map naive ``expires_at`` строкой. Удалён → отклонить БЕЗ
+    # мутации, тот же контракт-ответ что на невалидный/уже-использованный токен
+    # ({"ok": False}). Нет строки (None) / активен — обычный путь.
+    from sreda.services.tenant_lifecycle import is_tenant_active
+
+    _src_tenant_id = session.execute(
+        select(ChannelLinkToken.tenant_id).where(
+            ChannelLinkToken.token_hash == token_hash
+        )
+    ).scalar_one_or_none()
+    if _src_tenant_id is not None and not is_tenant_active(session, _src_tenant_id):
+        return {"ok": False}
+
     result = session.execute(
         update(ChannelLinkToken)
         .where(
-            ChannelLinkToken.token_hash == _channel_link_token_hash(raw_token),
+            ChannelLinkToken.token_hash == token_hash,
             ChannelLinkToken.target_channel == platform,
             ChannelLinkToken.used_at.is_(None),
         )

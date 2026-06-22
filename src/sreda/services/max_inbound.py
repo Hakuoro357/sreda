@@ -1823,7 +1823,10 @@ async def _handle_max_link_start_cmd(*, raw_token: str, chat_id: str | None) -> 
     triggers `confirm_link:<token>` или `cancel_link:<token>` callback
     что мы catches in handle_max_update.
     """
-    from sreda.services.channel_linking import lookup_token
+    from sqlalchemy import select
+    from sreda.db.models.channel_linking import ChannelLinkToken
+    from sreda.services.channel_linking import _hash_token, lookup_token
+    from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
     if not (settings.max_bot_token and chat_id):
@@ -1832,7 +1835,31 @@ async def _handle_max_link_start_cmd(*, raw_token: str, chat_id: str | None) -> 
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        token_row = lookup_token(session, raw_token)
+        # #187 Phase 4a — gate source-тенант ДО показа confirm-кнопки. Column-
+        # only пред-чтение ``tenant_id`` по token_hash (как confirm/cancel-ветки
+        # и consume_link), НЕ через lookup_token: lookup_token возвращает None
+        # для used/expired токена ДО проверки tenant-active, поэтому удалённый
+        # тенант с уже использованным/просроченным токеном ушёл бы в invalid-
+        # token reply вместо тихого no-op. Читаем скаляр (не ORM-сущность) —
+        # не засоряем identity-map. Резолвится по hash → ловит и used/expired.
+        # Удалён → тихий no-op (никакого confirm-сообщения). Нет строки по hash
+        # → обычный путь (token_row=None → invalid-token reply ниже).
+        _pre_tenant_id = session.execute(
+            select(ChannelLinkToken.tenant_id).where(
+                ChannelLinkToken.token_hash == _hash_token(raw_token)
+            )
+        ).scalar_one_or_none()
+        source_tenant_deleted = (
+            _pre_tenant_id is not None
+            and not is_tenant_active(session, _pre_tenant_id)
+        )
+        token_row = None if source_tenant_deleted else lookup_token(session, raw_token)
+
+    if source_tenant_deleted:
+        logger.info(
+            "max link /start: source tenant soft-deleted — silent no-op"
+        )
+        return
 
     client = MaxClient(token=settings.max_bot_token)
 
@@ -1885,12 +1912,31 @@ async def _handle_max_link_confirm_cb(
     callback_id,
 ) -> None:
     """Handle `confirm_link:<token>` callback — execute consume_link."""
-    from sreda.services.channel_linking import consume_link
+    from sqlalchemy import select
+    from sreda.db.models.channel_linking import ChannelLinkToken
+    from sreda.services.channel_linking import _hash_token, consume_link
+    from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
     SessionLocal = get_session_factory()
 
     with SessionLocal() as session:
+        # #187 Phase 4a — gate source-тенант ДО consume (мутации привязки).
+        # ``consume_link`` имеет собственный гейт (defence-in-depth), но здесь
+        # удалённый тенант = тихий no-op (без attach, без ответа юзеру), а не
+        # текстовая ошибка. Читаем ТОЛЬКО колонку tenant_id (скаляр, не ORM-
+        # сущность) — не засоряем identity-map (см. channel_linking.consume_link).
+        _pre_tenant_id = session.execute(
+            select(ChannelLinkToken.tenant_id).where(
+                ChannelLinkToken.token_hash == _hash_token(raw_token)
+            )
+        ).scalar_one_or_none()
+        if _pre_tenant_id is not None and not is_tenant_active(session, _pre_tenant_id):
+            logger.info(
+                "max link confirm: source tenant soft-deleted — silent no-op"
+            )
+            return
+
         outcome = consume_link(
             session,
             raw_token=raw_token,
@@ -1938,15 +1984,32 @@ async def _handle_max_link_cancel_cb(
     *, raw_token: str, callback_id,
 ) -> None:
     """Handle `cancel_link:<token>` callback — invalidate token."""
+    from sqlalchemy import select
+    from sqlalchemy import update as sa_update
     from sreda.db.models.channel_linking import ChannelLinkToken
     from sreda.services.channel_linking import _hash_token
-    from sqlalchemy import update as sa_update
+    from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
     SessionLocal = get_session_factory()
 
     with SessionLocal() as session:
         token_hash = _hash_token(raw_token)
+        # #187 Phase 4a — gate source-тенант ДО мутации токена (used_at).
+        # Для удалённого тенанта — тихий no-op (токен и так уже терминирован
+        # дренажом при soft_delete; повторно его трогать не нужно). Column-only
+        # пред-чтение (без ORM-сущности в identity-map).
+        _pre_tenant_id = session.execute(
+            select(ChannelLinkToken.tenant_id).where(
+                ChannelLinkToken.token_hash == token_hash
+            )
+        ).scalar_one_or_none()
+        if _pre_tenant_id is not None and not is_tenant_active(session, _pre_tenant_id):
+            logger.info(
+                "max link cancel: source tenant soft-deleted — silent no-op"
+            )
+            return
+
         session.execute(
             sa_update(ChannelLinkToken)
             .where(
