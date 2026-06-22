@@ -49,9 +49,9 @@ Entity-specific logical_key recipes (Codex Sub-A10 R1 MAJOR #8):
     "дать лекарство" today and tomorrow are distinct.
     ``sha1(normalize_for_dedup(title), trigger_iso, recurrence_rule or "")``
     is the right shape.
-  - ``task_item``: include the scheduled date. Two "сходить на
+  - ``task``: include the scheduled date (+time). Two "сходить на
     тренировку" tasks on different days are distinct.
-    ``sha1(normalize_for_dedup(title), scheduled_date.isoformat() if scheduled_date else "")``.
+    ``sha1(normalize_for_dedup(title), scheduled_date.isoformat() if scheduled_date else "", time)``.
   - ``recipe``: ``normalize_for_dedup(title)`` is sufficient. Same
     recipe re-saved is a partial-duplicate by design.
   - ``checklist``: ``normalize_for_dedup(title)`` is sufficient.
