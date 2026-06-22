@@ -31,19 +31,15 @@ from sreda.db.repositories.user_profile import (
     NOTIFICATION_PRIORITIES,
     UserProfileRepository,
 )
-from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.app_registry import get_feature_registry
 from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.tools import build_memory_tools
 from sreda.services.billing import (
     BillingService,
     CONNECT_BASE_CALLBACK,
-    STATUS_CALLBACK,
     SUBSCRIPTIONS_CALLBACK,
 )
 from sreda.services.budget import BudgetService, QuotaStatus
-from sreda.services.claim_lookup import ClaimLookupService
-from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
 from sreda.services.llm import (
@@ -245,32 +241,17 @@ def execute_subscriptions_show(session: Session, action: ActionEnvelope, context
         ]
 
     # Legacy fallback for environments without a public HTTPS base URL.
+    # #181 Phase 2: eds_monitor is retired — never pre-generate an EDS connect
+    # link override (the live EDSConnectService was removed with its module).
+    # In Phase 1 the override could only have come from that service, which
+    # raised "disabled" → None; ``build_subscriptions_message`` already drops
+    # all EDS lines/buttons for a retired skill, so the fallback is the same
+    # voice + nav render with no EDS content and zero mutations.
     billing = BillingService(session)
-    summary = billing.get_summary(action.tenant_id)
-
-    connect_button_override: dict | None = None
-    if summary.base_active and summary.free_count > 0:
-        slot_type = "primary" if not summary.connected_accounts else "extra"
-        connect_button_override = _try_build_connect_override(
-            session, action, slot_type=slot_type
-        )
-
     text, reply_markup = billing.build_subscriptions_message(
-        action.tenant_id, connect_button_override=connect_button_override
+        action.tenant_id, connect_button_override=None
     )
     return [RuntimeReply(text=text, reply_markup=reply_markup)]
-
-
-def _build_connect_subscriptions_button(url: str) -> dict:
-    """Inline button for "Подключить ЛК EDS" in the subscriptions view.
-
-    Distinguished from the legacy connect-flow button (which uses the
-    "Ввести логин и пароль от EDS" label sent in the intermediate
-    message) by its subscriptions-facing label. Both point at the
-    same one-time ``url`` through Telegram's web_app / url field."""
-    if url.startswith("https://"):
-        return {"text": "Подключить ЛК EDS", "web_app": {"url": url}}
-    return {"text": "Подключить ЛК EDS", "url": url}
 
 
 def _swap_connect_button(markup: dict, override: dict) -> dict:
@@ -289,59 +270,16 @@ def _swap_connect_button(markup: dict, override: dict) -> dict:
     return {"inline_keyboard": new_rows}
 
 
-def _try_build_connect_override(
-    session: Session, action: ActionEnvelope, *, slot_type: str
-) -> dict | None:
-    """Pre-generate a one-time EDS connect link and wrap it as a
-    ``web_app`` inline button. Returns ``None`` if the link cannot be
-    created — caller falls back to the legacy callback button."""
-    if action.user_id is None:
-        return None
-    try:
-        link = EDSConnectService(session, get_settings()).create_connect_link(
-            tenant_id=action.tenant_id,
-            workspace_id=action.workspace_id,
-            user_id=action.user_id,
-            slot_type=slot_type,
-        )
-    except ConnectSessionError as exc:
-        logger.warning(
-            "connect-override: could not pre-generate link (%s); "
-            "falling back to callback button",
-            exc.code,
-        )
-        return None
-    return _build_connect_subscriptions_button(link.url)
-
-
 def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
     # #181: /claim is an eds_monitor feature — tombstone. No DB read of EDS
     # state, just a disabled notice (the handler + dispatch route stay so
     # old /claim commands get a clear answer, not a silent unknown-command).
-    if is_feature_disabled("eds_monitor"):
-        return [
-            RuntimeReply(
-                text="Это умение отключено.",
-                reply_markup=_miniapp_reply_markup(),
-            )
-        ]
-    claim_id = str(action.params.get("claim_id") or "").strip()
-    service = ClaimLookupService(session)
-    result = service.lookup_local_claim(action.tenant_id, claim_id)
-    if result is None:
-        return [
-            RuntimeReply(
-                text=(
-                    f"Заявка #{claim_id} пока не найдена в локальном состоянии Среды.\n\n"
-                    "Если она появилась недавно, попробуй еще раз позже."
-                ),
-                reply_markup=_status_subscriptions_markup(),
-            )
-        ]
+    # Phase 2: the live ClaimLookupService lookup was removed with the module;
+    # the disabled notice is the only behaviour that remains.
     return [
         RuntimeReply(
-            text=service.build_claim_reply(result),
-            reply_markup=_status_subscriptions_markup(),
+            text="Это умение отключено.",
+            reply_markup=_miniapp_reply_markup(),
         )
     ]
 
@@ -391,30 +329,23 @@ def execute_eds_connect_start(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     # #181: eds_monitor is retired — return a COMPLETED tombstone instead of
-    # raising. The EDSConnectService guard still raises ConnectSessionError
-    # (defense-in-depth), but routing the connect *action* through the
-    # exception path would make the graph persist run.status="failed", which
-    # is inconsistent with the /claim tombstone (a completed run). Mirror
-    # execute_claim_lookup: short-circuit to a completed disabled notice.
-    if is_feature_disabled("eds_monitor"):
-        return [
-            RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())
-        ]
-    slot_type = str(action.params.get("slot_type") or "available_slot")
-    resolved_slot_type = _resolve_slot_type(session, action.tenant_id, slot_type)
-    return _build_connect_replies(session, action, slot_type=resolved_slot_type)
+    # raising. Routing the connect *action* through an exception path would
+    # make the graph persist run.status="failed", which is inconsistent with
+    # the /claim tombstone (a completed run). Mirror execute_claim_lookup:
+    # a completed disabled notice. Phase 2: the live EDSConnectService link
+    # generation was removed with the module; the tombstone is all that remains.
+    return [
+        RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())
+    ]
 
 
 def execute_eds_connect_retry(
     session: Session, action: ActionEnvelope, context: dict[str, Any]
 ) -> list[RuntimeReply]:
     # #181: see execute_eds_connect_start — completed tombstone, not a failed run.
-    if is_feature_disabled("eds_monitor"):
-        return [
-            RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())
-        ]
-    slot_type = str(action.params.get("slot_type") or "")
-    return _build_connect_replies(session, action, slot_type=slot_type)
+    return [
+        RuntimeReply(text="Это умение отключено.", reply_markup=_miniapp_reply_markup())
+    ]
 
 
 def execute_eds_slot_remove_free(
@@ -4568,46 +4499,6 @@ HANDLERS: dict[str, HandlerFn] = {
 # ---------------------------------------------------------------------------
 
 
-def _build_connect_replies(
-    session: Session, action: ActionEnvelope, *, slot_type: str
-) -> list[RuntimeReply]:
-    connect_service = EDSConnectService(session, get_settings())
-    try:
-        link = connect_service.create_connect_link(
-            tenant_id=action.tenant_id,
-            workspace_id=action.workspace_id,
-            user_id=action.user_id,
-            slot_type=slot_type,
-        )
-    except ConnectSessionError as exc:
-        raise ActionRuntimeError(
-            exc.code, exc.message, reply_markup=_subscriptions_markup()
-        ) from exc
-
-    return [
-        RuntimeReply(
-            text=(
-                "Сейчас откроется защищенная одноразовая страница для подключения личного кабинета EDS.\n\n"
-                "Логин и пароль передаются по защищенному соединению и сохраняются в системе только в зашифрованном виде.\n\n"
-                "Чтобы ввести данные для подключения, нажмите кнопку ниже."
-            ),
-            reply_markup={
-                "inline_keyboard": [
-                    [_build_connect_open_button(link.url)],
-                    [{"text": "Отменить", "callback_data": STATUS_CALLBACK}],
-                ]
-            },
-        )
-    ]
-
-
-def _resolve_slot_type(session: Session, tenant_id: str, slot_type: str) -> str:
-    if slot_type in {"primary", "extra"}:
-        return slot_type
-    summary = BillingService(session).get_summary(tenant_id)
-    return "primary" if not summary.connected_accounts else "extra"
-
-
 def _miniapp_reply_markup() -> dict | None:
     """Mini-App button — единая кнопка, заменяющая все устаревшие
     inline-keyboards с callback-кнопками управления подписками,
@@ -4658,9 +4549,3 @@ def subscriptions_markup() -> dict:
 def status_subscriptions_markup() -> dict:
     """Exported for ``policy.py``."""
     return _status_subscriptions_markup()
-
-
-def _build_connect_open_button(url: str) -> dict:
-    if url.startswith("https://"):
-        return {"text": "Ввести логин и пароль от EDS", "web_app": {"url": url}}
-    return {"text": "Ввести логин и пароль от EDS", "url": url}

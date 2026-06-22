@@ -105,6 +105,17 @@ class TaskService:
 
         now = _utcnow()
 
+        # #163 Фаза 2а: time-aware semantic-ключ (название+дата+время+повтор) → межходовой замок
+        # от дублей. Аддитивно: пишем в normalized_title_hash в ОБА пути (ctx+легаси); уникальность
+        # (partial-unique индекс) — Фаза 2в. user_id||"" — единообразие с легаси-путём.
+        from sreda.services.operation_id import compute_normalized_title_hash
+        nhash = compute_normalized_title_hash(
+            title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
+            extra="\x1f".join([
+                scheduled_date.isoformat() if scheduled_date else "",
+                time_start.isoformat() if time_start else "",
+                recurrence_rule or ""]))
+
         # #162 Фаза 0 — within-turn идемпотентность создания (эталон
         # services/housewife_shopping.py::add_items; симметрично
         # HousewifeReminderService.schedule). ctx is None → легаси байт-в-байт;
@@ -174,6 +185,7 @@ class TaskService:
                     created_at=now,
                     updated_at=now,
                     operation_id=op_id,
+                    normalized_title_hash=nhash,
                 )
                 .on_conflict_do_nothing(
                     index_elements=["tenant_id", "user_id", "operation_id"]
@@ -211,6 +223,7 @@ class TaskService:
             status="pending",
             created_at=now,
             updated_at=now,
+            normalized_title_hash=nhash,
         )
         self.session.add(task)
         self.session.flush()
@@ -278,6 +291,15 @@ class TaskService:
             raise ValueError("title required")
 
         now = _utcnow()
+        # #163 Фаза 2а: time-aware semantic-ключ и на композит-пути (легаси-чат) — иначе задачи
+        # отсюда не участвовали бы в межходовом замке от дублей (анти-пропуск ПРАВИЛО #7).
+        from sreda.services.operation_id import compute_normalized_title_hash
+        nhash = compute_normalized_title_hash(
+            title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
+            extra="\x1f".join([
+                scheduled_date.isoformat() if scheduled_date else "",
+                time_start.isoformat() if time_start else "",
+                recurrence_rule or ""]))
         task = Task(
             id=f"task_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -292,6 +314,7 @@ class TaskService:
             status="pending",
             created_at=now,
             updated_at=now,
+            normalized_title_hash=nhash,
         )
         self.session.add(task)
         self.session.flush()  # NO commit — caller owns TX

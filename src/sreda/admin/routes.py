@@ -807,7 +807,6 @@ def admin_tenant_reset(
     from sreda.db.models.billing import TenantSubscription  # noqa: keep cycles/orders
     from sreda.db.models.connect import ConnectSession, TenantEDSAccount
     from sreda.db.models.core import OutboxMessage, SecureRecord, Tenant
-    from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState
     from sreda.db.models.inbound_event import InboundEvent
     from sreda.db.models.skill_platform import TenantSkillConfig, TenantSkillState
     # Note: PaymentOrder / TenantBillingCycle are NOT deleted — FK cascades
@@ -819,19 +818,9 @@ def admin_tenant_reset(
 
     d: dict[str, int] = {}
 
-    # EDS state
-    d["claim_states"] = session.query(EDSClaimState).filter(
-        EDSClaimState.eds_account_id.in_(
-            session.query(EDSAccount.id).filter_by(tenant_id=tenant_id)
-        )
-    ).delete(synchronize_session="fetch")
-    d["change_events"] = session.query(EDSChangeEvent).filter(
-        EDSChangeEvent.eds_account_id.in_(
-            session.query(EDSAccount.id).filter_by(tenant_id=tenant_id)
-        )
-    ).delete(synchronize_session="fetch")
-
-    # EDS accounts + secure records
+    # EDS cabinet bindings (tenant_eds_accounts) + secure records.
+    # #181 Фаза 4-A: eds_monitor-таблицы (eds_accounts/claim_state/change_events/delivery_records)
+    # дропнуты — их больше не чистим; connect-слой tenant_eds_accounts остаётся до Фазы B.
     for ta in session.query(TenantEDSAccount).filter_by(tenant_id=tenant_id).all():
         if ta.secure_record_id:
             sr = session.get(SecureRecord, ta.secure_record_id)
@@ -840,10 +829,6 @@ def admin_tenant_reset(
                 d["secure_records"] = d.get("secure_records", 0) + 1
         session.delete(ta)
         d["tenant_eds_accounts"] = d.get("tenant_eds_accounts", 0) + 1
-
-    d["eds_accounts"] = session.query(EDSAccount).filter_by(
-        tenant_id=tenant_id
-    ).delete()
 
     # Events and outbox
     d["inbound_events"] = session.query(InboundEvent).filter_by(

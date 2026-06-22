@@ -10,7 +10,6 @@ from sreda.db.session import get_session_factory
 from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.max import MaxClient
 from sreda.runtime.executor import ActionRuntimeService
-from sreda.services.eds_account_verification import EDSAccountVerificationService
 from sreda.workers.housewife_onboarding_worker import (
     HousewifeOnboardingKickoffWorker,
 )
@@ -55,7 +54,10 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             telegram_client=telegram_client,
             bot_registry=bot_registry,
         )
-        verification = EDSAccountVerificationService(session, telegram_client=telegram_client)
+        # #181 Phase 2: EDS verification worker removed. Pending
+        # ``eds.verify_account_connect`` jobs are intentionally NOT drained —
+        # they stay pending until Phase 4 (table cleanup with a backup). The
+        # worker simply no longer processes them.
         skill_platform = SkillPlatformJobProcessor(session, registry)
         _sys_bot_key = bot_registry.system_default_bot_key
         # #109: pass bot_registry so resolve_outbox_routings can route async
@@ -102,7 +104,6 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             limit=min(5, limit)
         )
         runtime_processed = await runtime_service.process_pending_jobs(limit=limit)
-        verification_processed = await verification.process_pending_jobs(limit=limit)
         skill_processed = await skill_platform.process_pending_jobs(limit=limit)
         proactive_processed = await proactive.process_pending(limit=limit)
         housewife_processed = await housewife_reminders.process_pending(limit=limit)
@@ -114,7 +115,6 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         return (
             message_queue_processed
             + runtime_processed
-            + verification_processed
             + skill_processed
             + proactive_processed
             + housewife_processed

@@ -11,10 +11,11 @@ data that predates the migration.
 Target tables (entity_type → ORM class → has EncryptedString title):
 
   * shopping_list_items  → ShoppingListItem  → yes
-  * family_reminders     → FamilyReminder    → no (plaintext String(500))
-  * tasks_items          → Task              → yes
   * recipes              → Recipe            → yes
   * checklists           → Checklist         → no (plaintext String(200))
+
+NB (#163 Фаза 2а): family_reminders / tasks_items НЕ здесь — у них TIME-AWARE
+semantic_key (название+время), title-only бэкфилл им не подходит (см. TABLES).
 
 For EncryptedString titles we go through the ORM so the descriptor
 auto-decrypts at attribute access. Plaintext titles work the same way.
@@ -82,9 +83,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from sreda.db.models.checklists import Checklist
-from sreda.db.models.housewife import FamilyReminder
 from sreda.db.models.housewife_food import Recipe, ShoppingListItem
-from sreda.db.models.tasks import Task
 from sreda.db.session import get_session_factory
 from sreda.services.operation_id import compute_normalized_title_hash
 
@@ -98,8 +97,11 @@ class TableSpec:
 
 TABLES: tuple[TableSpec, ...] = (
     TableSpec("shopping_list_item", ShoppingListItem, "shopping_list_items"),
-    TableSpec("family_reminder", FamilyReminder, "family_reminders"),
-    TableSpec("task_item", Task, "tasks_items"),
+    # #163 Фаза 2а: family_reminders/tasks_items используют TIME-AWARE semantic_key
+    # (название+время), а НЕ title-only. Title-only бэкфилл здесь схлопнул бы записи с разным
+    # временем → ЛОЖНЫЕ коллизии в partial-unique индексе (Фаза 2в). По плану #163 их НЕ
+    # бэкфиллим (индекс работает на новых строках; старые NULL-hash не участвуют). Понадобится —
+    # отдельный TIME-AWARE бэкфилл (с extra=trigger/date+time+rrule), не этот title-only.
     TableSpec("recipe", Recipe, "recipes"),
     TableSpec("checklist", Checklist, "checklists"),
 )

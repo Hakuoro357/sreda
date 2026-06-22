@@ -14,9 +14,11 @@ Two concerns, both RED-before-implementation:
        eds-job.
 
 2. **Denylist (parametrized):** every EDS-dedicated billing mutator, the
-   generic simple-subscription mutators against an EDS plan_key, every
-   ``EDSConnectService`` mutator, and the ``FeatureRegistry`` registration
-   methods all no-op for ``eds_monitor`` with **zero DB mutations**.
+   generic simple-subscription mutators against an EDS plan_key, and the
+   ``FeatureRegistry`` registration methods all no-op for ``eds_monitor`` with
+   **zero DB mutations**. (#181 Phase 2: the ``EDSConnectService`` mutators
+   were DELETED — the surviving guarantee is the ROUTE-level tombstone, asserted
+   by ``test_route_eds_connect_*`` / ``test_route_connect_eds_token_*``.)
 
 3. **Display / route / policy tombstone (R2, #181 Ph1 review):** the
    surfaces that only READ or RENDER EDS state — they do not mutate, so they
@@ -30,8 +32,8 @@ Two concerns, both RED-before-implementation:
        ``subscription.add_eds`` / ``eds.connect.start`` / ``eds.connect.retry``
        to the disabled tombstone BEFORE the legacy "подключи EDS" checks —
        even for an old ``TenantFeature(eds_monitor, enabled=False)`` tenant;
-     - the inline ``process_job`` entry (not only ``process_pending_jobs``)
-       no-ops.
+     - the job_runner tick (#181 Phase 2: verification worker removed) leaves
+       the pending eds-job byte-for-byte (it is no longer drained).
 
 These tests are GREEN across all later phases (the deactivation is the
 floor, not a transient state).
@@ -49,7 +51,6 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from sreda.config.settings import get_settings
 from sreda.db.base import Base
 from sreda.db.models.billing import (
     SubscriptionPlan,
@@ -67,12 +68,19 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.services.billing import (
+    DISABLED_FEATURE_MESSAGE,
     PLAN_EDS_MONITOR_BASE,
     PLAN_EDS_MONITOR_EXTRA,
     PLAN_VOICE_TRANSCRIPTION,
     BillingService,
 )
-from sreda.services.eds_connect import EDSConnectService
+
+# #181 Phase 2: eds_connect / eds_account_verification modules were DELETED.
+# The connect/verify behaviour they once owned is now structurally impossible
+# (the live mutators are gone); the surviving guarantee is the tombstone at the
+# IMPORTER boundary (routes / handlers / job_runner). Tests that used to call
+# the deleted services directly are rewritten below to assert that boundary
+# tombstone WITHOUT importing the removed modules.
 
 TENANT = "tenant_mixed"
 WORKSPACE = "ws_mixed"
@@ -370,25 +378,70 @@ def test_renew_cycle_renews_voice_but_leaves_eds_byte_for_byte(session) -> None:
     assert eds_feature_after == eds_feature_before
 
 
-@pytest.mark.asyncio
-async def test_verification_worker_noop_leaves_pending_eds_job(session) -> None:
-    _seed_mixed_tenant(session)
-    job_before = session.get(Job, "job_eds_mixed")
-    status_before = job_before.status
-    payload_before = job_before.payload_json
+def test_job_runner_tick_leaves_pending_eds_job_untouched(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#181 Phase 2: the EDS verification worker was REMOVED from job_runner —
+    pending ``eds.verify_account_connect`` jobs are no longer drained (they stay
+    pending until Phase 4 table cleanup). A full job_runner tick must run
+    cleanly AND leave the seeded pending eds-job byte-for-byte. This replaces
+    the old direct ``EDSAccountVerificationService.process_pending_jobs`` test
+    (that service module no longer exists)."""
+    import base64
 
-    from sreda.services.eds_account_verification import (
-        EDSAccountVerificationService,
-    )
+    from sreda.config.settings import get_settings as _get_settings
+    from sreda.db.base import Base as _Base
+    from sreda.db.session import get_engine, get_session_factory
+    from sreda.workers import job_runner
 
-    service = EDSAccountVerificationService(session)
-    processed = await service.process_pending_jobs(limit=20)
-    session.expire_all()
+    db_path = tmp_path / "job_runner_eds.db"
+    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
 
-    assert processed == 0
-    job_after = session.get(Job, "job_eds_mixed")
-    assert job_after.status == status_before == "pending"
-    assert job_after.payload_json == payload_before
+    _get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+    _Base.metadata.create_all(get_engine())
+    seed_session = get_session_factory()()
+    try:
+        # Minimal FK-valid fixture (the env engine enforces FK constraints):
+        # a tenant + workspace + one pending eds.verify_account_connect job.
+        seed_session.add(Tenant(id=TENANT, name="Mixed"))
+        seed_session.add(Workspace(id=WORKSPACE, tenant_id=TENANT, name="WS"))
+        seed_session.flush()
+        seed_session.add(
+            Job(
+                id="job_eds_mixed",
+                tenant_id=TENANT,
+                workspace_id=WORKSPACE,
+                job_type="eds.verify_account_connect",
+                status="pending",
+                payload_json=json.dumps({"connect_session_id": "cs_mixed"}),
+            )
+        )
+        seed_session.commit()
+        job_before = seed_session.get(Job, "job_eds_mixed")
+        status_before = job_before.status
+        payload_before = job_before.payload_json
+    finally:
+        seed_session.close()
+
+    # A full tick must not raise and must not drain the eds-job.
+    asyncio.run(job_runner.process_pending_jobs_once(limit=20))
+
+    check_session = get_session_factory()()
+    try:
+        job_after = check_session.get(Job, "job_eds_mixed")
+        assert job_after.status == status_before == "pending"
+        assert job_after.payload_json == payload_before
+    finally:
+        check_session.close()
+
+    _get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -454,40 +507,83 @@ def test_generic_simple_subscription_voice_still_works(session) -> None:
     assert voice.status == "cancelled"
 
 
-_EDS_CONNECT_CALLS = [
-    (
-        "create_connect_link",
-        lambda s: EDSConnectService(s, get_settings()).create_connect_link(
-            tenant_id=TENANT, workspace_id=WORKSPACE, user_id="user_mixed", slot_type="extra"
-        ),
-    ),
-    ("open_form", lambda s: EDSConnectService(s, get_settings()).open_form("tok")),
-    (
-        "submit_form",
-        lambda s: EDSConnectService(s, get_settings()).submit_form(
-            "tok", login="u@example.com", password="pw"
-        ),
-    ),
-]
+# #181 Phase 2: EDSConnectService was DELETED. Its three mutators
+# (create_connect_link / open_form / submit_form) used to be the second mutation
+# boundary outside billing; the routes that reached them are now inline
+# tombstones. We assert the tombstone at the ROUTE boundary (the new, surviving
+# boundary) and that NO ConnectSession row is ever created — the structural
+# proof that the connect mutation can no longer happen.
 
 
-@pytest.mark.parametrize("name,call", _EDS_CONNECT_CALLS, ids=[c[0] for c in _EDS_CONNECT_CALLS])
-def test_eds_connect_service_noop_disabled(session, name, call) -> None:
-    _seed_mixed_tenant(session)
-    engine = session.get_bind()
-    counts, listener = _count_mutations(session)
-    event.listen(engine, "before_cursor_execute", listener)
+def _connect_session_count(session_factory) -> int:
+    from sreda.db.models.connect import ConnectSession
+
+    s = session_factory()
     try:
-        with pytest.raises(Exception) as exc_info:
-            call(session)
+        return s.query(ConnectSession).count()
     finally:
-        event.remove(engine, "before_cursor_execute", listener)
+        s.close()
 
-    # Disabled → ConnectSessionError (no row created).
-    from sreda.services.eds_connect import ConnectSessionError
 
-    assert isinstance(exc_info.value, ConnectSessionError)
-    assert counts == {}, f"{name} performed DB mutations: {counts}"
+def test_route_eds_connect_tombstone_no_session_created(miniapp_client) -> None:
+    """``POST /miniapp/api/v1/eds/connect`` (formerly create_connect_link) →
+    tombstone {"ok": False, connect_url: None}, and NO ConnectSession row is
+    created."""
+    from sreda.db.session import get_session_factory
+
+    before = _connect_session_count(get_session_factory())
+    resp = miniapp_client.post(
+        "/miniapp/api/v1/eds/connect", headers=miniapp_client._eds_auth_header
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert data["connect_url"] is None
+    assert data["message"] == DISABLED_FEATURE_MESSAGE
+    assert _connect_session_count(get_session_factory()) == before
+
+
+def test_route_eds_add_and_connect_tombstone_no_session_created(miniapp_client) -> None:
+    """``POST /miniapp/api/v1/eds/add-and-connect`` → tombstone with NO
+    connect_url and NO ConnectSession row (the billing add-slot mutator is
+    itself disabled, the connect-link step is gone with EDSConnectService)."""
+    from sreda.db.session import get_session_factory
+
+    before = _connect_session_count(get_session_factory())
+    resp = miniapp_client.post(
+        "/miniapp/api/v1/eds/add-and-connect", headers=miniapp_client._eds_auth_header
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["connect_url"] is None
+    assert _connect_session_count(get_session_factory()) == before
+
+
+def test_route_connect_eds_token_get_tombstone(miniapp_client) -> None:
+    """``GET /connect/eds/{token}`` (formerly open_form) → a disabled page
+    (HTTP 200, not 404), no ConnectSession mutation."""
+    from sreda.db.session import get_session_factory
+
+    before = _connect_session_count(get_session_factory())
+    resp = miniapp_client.get("/connect/eds/sometoken")
+    assert resp.status_code == 200
+    assert DISABLED_TOMBSTONE_TEXT in resp.text
+    assert _connect_session_count(get_session_factory()) == before
+
+
+def test_route_connect_eds_token_post_tombstone(miniapp_client) -> None:
+    """``POST /connect/eds/{token}`` (formerly submit_form) → a disabled page
+    (HTTP 200), no ConnectSession / TenantEDSAccount / Job mutation."""
+    from sreda.db.session import get_session_factory
+
+    before = _connect_session_count(get_session_factory())
+    resp = miniapp_client.post(
+        "/connect/eds/sometoken",
+        data={"login": "u@example.com", "password": "pw"},
+    )
+    assert resp.status_code == 200
+    assert DISABLED_TOMBSTONE_TEXT in resp.text
+    assert _connect_session_count(get_session_factory()) == before
 
 
 def test_registry_does_not_register_eds_monitor() -> None:
@@ -832,34 +928,14 @@ def test_policy_allows_non_eds_action() -> None:
     assert evaluate_policy(_policy_envelope("help.show"), {}) is None
 
 
-# --- inline process_job (not only process_pending_jobs) no-op ---------------
-
-
-@pytest.mark.asyncio
-async def test_process_job_inline_noop_leaves_pending(session) -> None:
-    """The inline (connect.py) ``process_job`` entry must no-op to "skipped"
-    BEFORE touching the job, leaving the pending eds-job byte-for-byte."""
-    _seed_mixed_tenant(session)
-    job_before = session.get(Job, "job_eds_mixed")
-    status_before = job_before.status
-    payload_before = job_before.payload_json
-
-    from sreda.services.eds_account_verification import EDSAccountVerificationService
-
-    engine = session.get_bind()
-    counts, listener = _count_mutations(session)
-    event.listen(engine, "before_cursor_execute", listener)
-    try:
-        result = await EDSAccountVerificationService(session).process_job("job_eds_mixed")
-    finally:
-        event.remove(engine, "before_cursor_execute", listener)
-
-    assert result == "skipped"
-    session.expire_all()
-    job_after = session.get(Job, "job_eds_mixed")
-    assert job_after.status == status_before == "pending"
-    assert job_after.payload_json == payload_before
-    assert counts == {}, f"process_job mutated DB: {counts}"
+# --- inline process_job entry removed (connect.py POST is now a tombstone) ---
+#
+# #181 Phase 2: the inline ``EDSAccountVerificationService.process_job`` kick
+# that the connect.py POST route used to fire was removed with the service
+# module. The route is now a pure tombstone — see
+# ``test_route_connect_eds_token_post_tombstone`` (POST renders the disabled
+# page, creates no ConnectSession). The "pending eds-job survives" guarantee is
+# now covered by ``test_job_runner_tick_leaves_pending_eds_job_untouched``.
 
 
 # ---------------------------------------------------------------------------
