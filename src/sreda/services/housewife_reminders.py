@@ -169,6 +169,15 @@ class HousewifeReminderService:
         from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
         resolved_bot_key = bot_key if bot_key is not None else LEGACY_NULL_BOT_KEY
 
+        # #163 Фаза 2а: time-aware semantic-ключ (название+время+повтор) → межходовой замок от
+        # дублей. Аддитивно: пишем в normalized_title_hash в ОБА пути (легаси+ReAct); сама
+        # уникальность (partial-unique индекс) — Фаза 2в. user_id||"" — для общесемейных (None).
+        from sreda.services.operation_id import compute_normalized_title_hash
+        nhash = compute_normalized_title_hash(
+            clean_title, entity_type="family_reminder", tenant_id=tenant_id,
+            user_id=user_id or "",
+            extra="\x1f".join([trigger_at.isoformat(), recurrence_rule or ""]))
+
         # #162 Фаза 0 — within-turn идемпотентность создания (эталон
         # services/housewife_shopping.py::add_items). Ветвление по наличию
         # ToolRuntimeContext:
@@ -194,6 +203,7 @@ class HousewifeReminderService:
                 embedding_json=embedding_json,
                 embedding_model=embedding_model,
                 bot_key=resolved_bot_key,
+                normalized_title_hash=nhash,
             )
             self.session.add(reminder)
             self.session.commit()
@@ -258,6 +268,7 @@ class HousewifeReminderService:
                 embedding_model=embedding_model,
                 bot_key=resolved_bot_key,
                 operation_id=op_id,
+                normalized_title_hash=nhash,
             )
             .on_conflict_do_nothing(
                 index_elements=["tenant_id", "user_id", "operation_id"]
