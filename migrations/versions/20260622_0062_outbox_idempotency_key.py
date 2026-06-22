@@ -36,7 +36,7 @@ def upgrade() -> None:
     # R1 (Codex high+medium MAJOR): plain CREATE INDEX берёт SHARE-лок + сканирует таблицу. На PG —
     # fail-fast по lock_timeout, чтобы build не висел за чужой долгой транзакцией (как 0061).
     if bind.dialect.name == "postgresql":
-        bind.execute(sa.text("SET lock_timeout = '3s'"))
+        bind.execute(sa.text("SET LOCAL lock_timeout = '3s'"))
     op.add_column(
         "outbox_messages",
         sa.Column("idempotency_key", sa.String(length=200), nullable=True),
