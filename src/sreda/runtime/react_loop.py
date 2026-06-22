@@ -103,23 +103,24 @@ def react_fallback_llm(primary_provider: str = "") -> Any:
     """#184: запасной LLM для ReAct — Оса (gpt-oss-120b @ Groq) при сбое primary (Фредди/Mercury).
     Включён флагом SREDA_REACT_OSA_FALLBACK. None → без запаса.
 
-    Защиты (ревью R1):
-    - если effective primary УЖЕ Оса (SREDA_REACT_OSA_TENANTS) — само-fallback не нужен (Groq+Groq =
-      повтор того же сбоя + двойной расход) → None;
-    - построение LLM в guarded-блоке: мисконфиг Groq НЕ должен ронять ReAct-вход до safe-reply."""
-    from sreda.config.settings import get_settings
-    from sreda.services.llm import _GROQ_MODEL_BY_PROVIDER, get_chat_llm
-    if not get_settings().react_osa_fallback:
-        return None
-    # R2 MINOR (Codex high): любой Groq/Оса-провайдер как primary (incl. groq-gpt-oss-120b-low) →
-    # запас не нужен (Groq+Groq = повтор сбоя + двойной расход). Проверяем членство в groq-карте.
-    if primary_provider in _GROQ_MODEL_BY_PROVIDER:
-        return None
+    Защиты:
+    - R1: если effective primary УЖЕ Оса (SREDA_REACT_OSA_TENANTS) — само-fallback не нужен
+      (Groq+Groq = повтор того же сбоя + двойной расход) → None;
+    - R3 (MiMo MAJOR): ВЕСЬ body guarded (импорт + membership + build) — функция зовётся как
+      АРГУМENT до входа в handle_turn-guard, поэтому НИКОГДА не должна поднимать исключение;
+      любой сбой (импорт/мисконфиг Groq) → None (ReAct идёт без запаса, не падает)."""
     try:
+        from sreda.config.settings import get_settings
+        from sreda.services.llm import _GROQ_MODEL_BY_PROVIDER, get_chat_llm
+        if not get_settings().react_osa_fallback:
+            return None
+        # R2 MINOR (Codex high): любой Groq/Оса primary (incl. groq-gpt-oss-120b-low) → запас не
+        # нужен (Groq+Groq = повтор сбоя + двойной расход). Членство в groq-карте.
+        if primary_provider in _GROQ_MODEL_BY_PROVIDER:
+            return None
         return get_chat_llm(provider=_FALLBACK_PROVIDER_KEY)
-    except Exception:  # noqa: BLE001 — мисконфиг fallback не валит вход; просто без запаса
-        logger.warning("react_loop: не удалось построить fallback (Оса) — продолжаем без запаса",
-                       exc_info=True)
+    except Exception:  # noqa: BLE001 — fallback недоступен (импорт/мисконфиг) → без запаса
+        logger.warning("react_loop: fallback (Оса) недоступен — продолжаем без запаса", exc_info=True)
         return None
 
 
@@ -1096,24 +1097,22 @@ def _build_graph(llm: Any, all_tools: list, *,
     # #175: каноничное имя модели — ТЕМ ЖЕ резолвером, что legacy #151 (planner/llm), чтобы
     # ключ (provider_key, model) совпал с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
     # response_metadata.model_name мог бы дать иную форму → unpriced. Резолвим РАЗ (не на вызов).
-    _model_name = ""
-    if provider_key:
-        try:
-            from sreda.config.settings import get_settings
-            from sreda.runtime.planner.llm import _resolve_model_name
-            _model_name = _resolve_model_name(llm, get_settings(), provider_key)
-        except Exception:  # noqa: BLE001 — резолв не валит ход; пусто → fallback provider_key
-            _model_name = ""
-    # #184: имя модели запаса (Осы) — для КОРРЕКТНОЙ атрибуции расхода при срабатывании fallback
+    # #175/#184: каноничные имена моделей primary + fallback (Осы) — ОДИН резолвер (тот же, что
+    # legacy #151), чтобы (provider_key, model) совпал с прайс-таблицей llm_pricing → USD. Резолвим
+    # РАЗ (не на вызов). Имя модели Осы нужно для ВЕРНОЙ атрибуции расхода при срабатывании запаса
     # (иначе токены Осы попали бы в строку Mercury → таблица «расход по провайдерам» врёт; R1 MAJOR).
+    _model_name = ""
     _fallback_model_name = ""
-    if fallback_llm is not None:
-        try:
-            from sreda.config.settings import get_settings as _gs
-            from sreda.runtime.planner.llm import _resolve_model_name as _rmn
-            _fallback_model_name = _rmn(fallback_llm, _gs(), _FALLBACK_PROVIDER_KEY)
-        except Exception:  # noqa: BLE001
-            _fallback_model_name = ""
+    try:
+        from sreda.config.settings import get_settings as _gs
+        from sreda.runtime.planner.llm import _resolve_model_name as _rmn
+        _s = _gs()
+        if provider_key:
+            _model_name = _rmn(llm, _s, provider_key)
+        if fallback_llm is not None:
+            _fallback_model_name = _rmn(fallback_llm, _s, _FALLBACK_PROVIDER_KEY)
+    except Exception:  # noqa: BLE001 — резолв не валит ход; пусто → fallback на provider_key
+        pass
 
     def chat(state: ReactState):
         # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
