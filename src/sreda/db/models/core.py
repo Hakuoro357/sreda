@@ -34,6 +34,24 @@ class Tenant(Base):
     preferred_channel: Mapped[str | None] = mapped_column(
         String(16), nullable=True,
     )
+    # #187 soft-delete (2026-06-22): NULL = активен; не-null = помечен удалённым
+    # (обратимо — restore снимает). Источник истины рубильника — is_tenant_active()
+    # в services/tenant_lifecycle.py. В таблицы данных признак НЕ добавляем (один флаг).
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    __table_args__ = (
+        # Partial-индекс ТОЛЬКО по удалённым (для админ-листинга удалённых тенантов).
+        # Гейт is_tenant_active идёт по PK; ~99% строк deleted_at=NULL → full-index
+        # бесполезен. where-clause обязан быть sa_text(), не bare-строкой.
+        Index(
+            "ix_tenants_deleted_at",
+            "deleted_at",
+            postgresql_where=sa_text("deleted_at IS NOT NULL"),
+            sqlite_where=sa_text("deleted_at IS NOT NULL"),
+        ),
+    )
 
 
 class Workspace(Base):
