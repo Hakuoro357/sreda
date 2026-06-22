@@ -39,6 +39,7 @@ from sreda.runtime.planner.tool_runtime import (
     ToolRuntimeContext,
     allocate_operation_id,
     bind_tool_runtime,
+    current_tool_runtime,
 )
 
 logger = logging.getLogger("sreda.react_loop")
@@ -629,6 +630,7 @@ _CORE_TOOL_NAMES = frozenset({
     "list_reminders", "schedule_reminder", "update_reminder", "cancel_reminder",
     "list_tasks", "add_task", "update_task", "complete_task", "uncomplete_task",
     "cancel_task", "delete_task", "link_task", "unlink_task", "ask_human",
+    "delete_my_account",  # #187 Фаза 4b-2: self-delete (ядро, всегда привязан)
     "recall_memory", "need_family",
 })
 # Валидные ленивые семьи — СИНХРОННО с Literal need_family ниже. run_tools ре-валидирует
@@ -749,6 +751,8 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     (ctx-ветка); ctx биндится в run_tools. Разрушающие сами спрашивают подтверждение.
     #165: семейные инструменты получают КОРОТКИЕ описания (_react_desc) — экономия
     контекста Фредди; WRITE_GUARD перенесён в системный промпт (rules #8)."""
+    from sreda.db.models.audit import AuditLog
+    from sreda.db.models.core import User
     from sreda.db.models.housewife import FamilyReminder
     from sreda.services.housewife_reminders import HousewifeReminderService
     from sreda.services.tasks import TaskService
@@ -994,10 +998,99 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         """Задать пользователю уточняющий вопрос (какое из нескольких) и дождаться ответа."""
         return str(interrupt(question))
 
+    @tool
+    def delete_my_account() -> str:
+        """Удалить аккаунт самого пользователя («удали меня», «удали мой аккаунт»). РАЗРУШАЮЩЕЕ
+        и обратимое: помечает тенант удалённым (soft-delete) — входящие игнорируются, доставки
+        дренируются; админ может восстановить. САМ спрашивает подтверждение и удаляет ТОЛЬКО при
+        «да». Чей аккаунт — берётся из контекста хода, аргументов НЕТ; разрешено ТОЛЬКО когда в
+        аккаунте один пользователь и это он сам (иначе отправляет к админу)."""
+        # #187 Фаза 4b-2 (A7): self-delete тенанта. tenant_id/user_id — ИЗ КОНТЕКСТА ХОДА
+        # (closure-bind, как у всех bespoke-инструментов), НЕ из аргумента модели → пересланное
+        # «удали меня» / инъекция в текст НЕ нацелят на чужой тенант (у инструмента вовсе нет
+        # аргументов — модель не может подсунуть tenant_id). tenant_id/user_id замкнуты выше.
+        from sreda.services.audit import audit_event
+        from sreda.services.tenant_lifecycle import soft_delete_tenant
+
+        # authz owner-only (single-user, решение Бориса A): разрешено ТОЛЬКО если в тенанте
+        # РОВНО ОДИН users И это actor (его id == user_id хода). Раньше проверяли только
+        # count==1 — но НЕ что единственная строка и есть actor: при ошибке binding'а чужой
+        # actor_id мог бы снести single-user тенант жертвы (+ ложный audit actor). Теперь
+        # достаём id-строки тенанта и требуем: ровно одна И она == user_id. Связка TG+MAX
+        # одного человека = одна строка User → владельца не блокирует; семья (>1) или actor
+        # ≠ единственный владелец → к админу (НЕ удаляем).
+        owner_ids = [row[0] for row in (
+            session.query(User.id).filter(User.tenant_id == tenant_id).all())]
+        if len(owner_ids) != 1 or owner_ids[0] != user_id:
+            # мульти-юзер / вырожденный 0 / actor не единственный владелец → reject БЕЗ confirm
+            # и БЕЗ аудита (реального действия не было — нет requested/completed строки).
+            return ("В этом аккаунте несколько пользователей — удалить его сам не могу. "
+                    "Обратись, пожалуйста, к администратору.")
+
+        # A11 «requested» — пишем ДО confirm (намерение зафиксировано). Узел tools на resume
+        # перевыполняется С НАЧАЛА (первый вызов interrupt() бросает GraphBubbleUp; на resume
+        # возвращает решение) → наивная запись задвоила бы requested В ОДНОМ ходу. Дедупим
+        # ТОЛЬКО within-turn (перевыполнение того же хода), НЕ вечно: вечный дедуп по
+        # action+resource+actor ломал бы restore→повторный-запрос (старая requested-строка
+        # блокировала бы новый аудит) и «нет»→новый-запрос.
+        # Маркер хода = operation_id из tool-runtime (#163): он стабилен при перевыполнении
+        # узла (turn_key из чекпойнта + step_id=tool_call.id + tool_name → детерминирован),
+        # но УНИКАЛЕН на КАЖДЫЙ реальный запрос (новый ход → новый tool_call.id → новый
+        # operation_id). Кладём его в metadata.operation_id и дедупим запись по нему:
+        #   • перевыполнение того же хода (resume) → тот же operation_id → НЕ двоим;
+        #   • restore → новое «удали меня» → новый ход → новый operation_id → НОВЫЙ requested;
+        #   • «нет» → новый запрос → новый ход → новый operation_id → НОВЫЙ requested.
+        # Если runtime-контекста нет (легаси/прямой вызов без bind_tool_runtime) — маркера
+        # хода нет, но и resume нет (interrupt вне графа бросит наружу) → пишем без дедупа.
+        import json as _json
+
+        rt = current_tool_runtime()
+        op_id = rt.operation_id if rt is not None else None
+        already_requested = False
+        if op_id is not None:
+            # точное сравнение по разобранному JSON (не LIKE-подстрока: '_' в LIKE —
+            # wildcard, дал бы тонкие ложные совпадения). Кандидатов мало (requested
+            # этого тенанта), парсинг дёшев.
+            for (md_json,) in (session.query(AuditLog.metadata_json)
+                               .filter(AuditLog.action == "user.self_delete.requested",
+                                       AuditLog.resource_id == tenant_id,
+                                       AuditLog.actor_id == user_id).all()):
+                try:
+                    if _json.loads(md_json or "{}").get("operation_id") == op_id:
+                        already_requested = True
+                        break
+                except (ValueError, TypeError):
+                    continue
+        if not already_requested:
+            md = {"source": "self_service"}
+            if op_id is not None:
+                md["operation_id"] = op_id
+            audit_event(
+                session, actor_type="user", actor_id=user_id,
+                action="user.self_delete.requested", resource_type="tenant",
+                resource_id=tenant_id, metadata=md,
+                commit=True)
+
+        decision = interrupt({
+            "confirm": "Точно удалить твой аккаунт? Это можно отменить через администратора.",
+            "key": f"account:{tenant_id}:self_delete"})
+        if not _is_yes(str(decision)):
+            return "Хорошо, ничего не удаляю — аккаунт на месте."
+
+        # confirmed → soft_delete_tenant (флаг + drain + барьер + строгий аудит «completed»).
+        # actor_type="user"/actor_id=user_id/source="self_service" → audit_action пишет
+        # ОДНУ строку user.self_delete.completed ПОД advisory-локом, атомарно с флагом; повтор
+        # (уже удалён) — идемпотентный no-op без второй completed-строки.
+        soft_delete_tenant(
+            session, tenant_id, actor_type="user", actor_id=user_id,
+            source="self_service", audit_action="user.self_delete.completed")
+        return "Готово, удалила твой аккаунт. Если передумаешь — напиши администратору, он восстановит."
+
     bespoke = [
         list_reminders, schedule_reminder, update_reminder, cancel_reminder,
         list_tasks, add_task, update_task, complete_task, uncomplete_task,
         cancel_task, delete_task, link_task, unlink_task, ask_human,
+        delete_my_account,  # #187 Фаза 4b-2: self-delete (owner-only, single-user, confirm)
         need_family,  # #165 Срез A: мета-инструмент добора семей (ядро, всегда в наборе)
     ]
 
