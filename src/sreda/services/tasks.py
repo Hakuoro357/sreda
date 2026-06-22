@@ -606,7 +606,7 @@ class TaskService:
         return task
 
     def cancel(
-        self, *, tenant_id: str, user_id: str, task_id: str,
+        self, *, tenant_id: str, user_id: str, task_id: str, commit: bool = True,
     ) -> Task | None:
         """Soft-cancel. Row stays in DB, disappears from pending lists."""
         task = self._get(tenant_id, user_id, task_id)
@@ -619,16 +619,19 @@ class TaskService:
         task.status = "cancelled"
         task.updated_at = _utcnow()
         if task.reminder_id:
-            self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id,
+            self.reminders.cancel(  # #163 Фаза 3: часть этой операции → без своего commit
+                tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
             )
             task.reminder_id = None
             task.reminder_offset_minutes = None
-        self.session.commit()
+        if commit:  # #163 Фаза 3: единая per-op граница; commit=False → владеет durable-helper
+            self.session.commit()
+        else:
+            self.session.flush()
         return task
 
     def delete(
-        self, *, tenant_id: str, user_id: str, task_id: str,
+        self, *, tenant_id: str, user_id: str, task_id: str, commit: bool = True,
     ) -> bool:
         """Hard delete. Cancels the reminder first (if any) so we
         don't leave a pending reminder orphaned."""
@@ -637,10 +640,13 @@ class TaskService:
             return False
         if task.reminder_id:
             self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id,
+                tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
             )
         self.session.delete(task)
-        self.session.commit()
+        if commit:
+            self.session.commit()
+        else:
+            self.session.flush()
         return True
 
     # ------------------------------------------------------------------

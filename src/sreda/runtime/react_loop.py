@@ -897,13 +897,23 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                               "key": f"reminder:{reminder_ref}:cancel"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не удаляю «{title}». Скажи, какое тогда."
-        r2 = session.get(FamilyReminder, reminder_ref)
-        if (r2 is None or r2.tenant_id != tenant_id or r2.user_id != user_id
-                or r2.status != "pending"):
-            return f"Напоминание «{title}» уже неактивно."  # идемпотентно
-        r2.status = "cancelled"
-        session.commit()
-        return f"Готово, удалила «{title}»."
+
+        def _mut(commit: bool) -> str:
+            # пост-confirm мутация через durable-helper (exact-replay + аудит/tombstone op-результата).
+            r2 = session.get(FamilyReminder, reminder_ref)
+            if (r2 is None or r2.tenant_id != tenant_id or r2.user_id != user_id
+                    or r2.status != "pending"):
+                return f"Напоминание «{title}» уже неактивно."  # идемпотентно
+            r2.status = "cancelled"
+            if commit:
+                session.commit()
+            else:
+                session.flush()
+            return f"Готово, удалила «{title}»."
+
+        return _idempotent_write(
+            action="cancel", entity_type="family_reminder",
+            entity_id=reminder_ref, args={}, mutate=_mut)
 
     # ---- задачи ---------------------------------------------------------
     @tool
@@ -1001,8 +1011,10 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         t = tasks.uncomplete(tenant_id=tenant_id, user_id=user_id, task_id=task_ref)
         return "Готово, вернула в работу." if t else "Такой задачи у тебя нет."
 
-    def _confirm_destructive_task(task_ref: str, verb: str, apply) -> str:
-        """Общий confirm-wrapper для cancel/delete задачи: снимок→interrupt→act."""
+    def _confirm_destructive_task(task_ref: str, verb: str, action: str, apply) -> str:
+        """Общий confirm-wrapper для cancel/delete задачи: снимок→interrupt→durable-мутация.
+        ``apply(ref, commit)`` делает мутацию (commit владеет helper). exact-replay + tombstone
+        (op-результат) на ReAct-пути; вне ctx — self-commit (легаси)."""
         t = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001 — внутр. lookup сервиса
         if t is None:
             return "Такой задачи у тебя нет."
@@ -1013,9 +1025,13 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                               "key": f"task:{task_ref}:{verb}"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не трогаю «{title}»."
-        apply(task_ref)  # возврат намеренно игнорируем:
-        # False → задача уже отсутствует/отменена (idempotent replay) → тоже успех.
-        return f"Готово, {verb}: «{title}»."
+
+        def _mut(commit: bool) -> str:
+            apply(task_ref, commit)  # возврат игнорируем (False → уже нет/отменена → idempotent)
+            return f"Готово, {verb}: «{title}»."
+
+        return _idempotent_write(action=action, entity_type="task",
+                                 entity_id=task_ref, args={}, mutate=_mut)
 
     @tool
     def cancel_task(task_ref: str) -> str:
@@ -1025,16 +1041,17 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         if t0 is not None and t0.status == "cancelled":
             return f"Задача «{t0.title}» уже отменена."
 
-        def _apply(ref: str) -> bool:
-            return tasks.cancel(tenant_id=tenant_id, user_id=user_id, task_id=ref) is not None
-        return _confirm_destructive_task(task_ref, "отменяю", _apply)
+        def _apply(ref: str, commit: bool) -> bool:
+            return tasks.cancel(tenant_id=tenant_id, user_id=user_id,
+                                task_id=ref, commit=commit) is not None
+        return _confirm_destructive_task(task_ref, "отменяю", "cancel", _apply)
 
     @tool
     def delete_task(task_ref: str) -> str:
         """Удалить задачу по ref. САМ спрашивает подтверждение."""
-        def _apply(ref: str) -> bool:
-            return tasks.delete(tenant_id=tenant_id, user_id=user_id, task_id=ref)
-        return _confirm_destructive_task(task_ref, "удаляю", _apply)
+        def _apply(ref: str, commit: bool) -> bool:
+            return tasks.delete(tenant_id=tenant_id, user_id=user_id, task_id=ref, commit=commit)
+        return _confirm_destructive_task(task_ref, "удаляю", "delete", _apply)
 
     @tool
     def link_task(task_ref: str, checklist_ref: str) -> str:
