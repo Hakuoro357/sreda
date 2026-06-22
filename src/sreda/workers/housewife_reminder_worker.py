@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
@@ -169,9 +170,7 @@ class HousewifeReminderWorker:
             # (мультипроцесс / повтор-enqueue) → дедуп. Pre-check (одно-поточный путь); partial-unique
             # индекс — backstop гонки.
             idem_key = f"{reminder.id}:{fired_iso}:{routing.channel}:{row_bot_key}"
-            if (self.session.query(OutboxMessage.id)
-                    .filter(OutboxMessage.idempotency_key == idem_key)
-                    .first() is not None):
+            if self._outbox_key_exists(idem_key):
                 logger.info(
                     "reminder %s: outbox idem-key уже поставлен (%s) — пропуск дубля доставки",
                     reminder.id, routing.channel,
@@ -200,8 +199,30 @@ class HousewifeReminderWorker:
                 outbox.user_id = reminder.user_id
             if hasattr(OutboxMessage, "is_interactive"):
                 outbox.is_interactive = False
-            self.session.add(outbox)
-        self.session.flush()
+            # SAVEPOINT (R1 MAJOR — субагент+Codex high+medium, мимо CRITICAL): гонку, которую
+            # pre-check не закрыл, ловит partial-unique индекс на flush. БЕЗ savepoint IntegrityError
+            # отравил бы ВСЮ тик-транзакцию (PendingRollbackError на финальном commit → откат всех
+            # mark_fired-advance + доставка тика не идёт). begin_nested откатывает ТОЛЬКО эту строку
+            # → гонка дедупится без падения тика.
+            try:
+                with self.session.begin_nested():
+                    self.session.add(outbox)
+                    self.session.flush()
+            except IntegrityError:
+                logger.info(
+                    "reminder %s: outbox idem-key гонка (%s) → дедуп (другой писатель опередил)",
+                    reminder.id, routing.channel,
+                )
+                continue
+
+    def _outbox_key_exists(self, idem_key: str) -> bool:
+        """Pre-check дедупа доставки (#163 Фаза 4): есть ли уже outbox с этим ключом.
+        Закрывает общий повтор-enqueue; гонку (TOCTOU) ловит partial-unique индекс + savepoint."""
+        return (
+            self.session.query(OutboxMessage.id)
+            .filter(OutboxMessage.idempotency_key == idem_key)
+            .first() is not None
+        )
 
     def _resolve_routings(self, reminder: FamilyReminder):
         """Reminder → list of OutboxRouting (10.6 dual-channel).

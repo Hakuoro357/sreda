@@ -6,9 +6,13 @@
 повтор той же тройки (мультипроцесс / повтор-enqueue) дедупится. Партиал ``WHERE idempotency_key IS
 NOT NULL``: прочие продюсеры (без ключа) НЕ ограничены — аддитивно, легаси не схлопывается.
 
-Дёшево даже на большой outbox_messages: колонка nullable = метаданные (instant, без переписи), а на
-момент миграции ВСЕ строки имеют key=NULL → партиал-индекс пуст → build мгновенный, долгий лок не нужен.
-Имя индекса = модель (uq_outbox_idempotency_key). Downgrade — drop индекса + колонки.
+Колонка nullable = метаданные (instant, без переписи). Партиал-индекс на момент миграции ПУСТ (все
+key=NULL) — запись индекса мгновенна, НО plain CREATE INDEX всё равно берёт SHARE-лок и СКАНИРУЕТ
+таблицу для проверки предиката (R1 Codex high+medium MAJOR — «без лока» было неточно). На текущем
+масштабе (альфа) outbox_messages невелика → скан суб-секунда; `SET lock_timeout` (PG) делает build
+fail-fast вместо зависания за чужой долгой транзакцией. Если outbox сильно вырастет — заменить на
+CREATE INDEX CONCURRENTLY (вне транзакции alembic; здесь не нужно). Имя индекса = модель
+(uq_outbox_idempotency_key). Downgrade — drop индекса + колонки.
 
 Revision ID: 20260622_0062
 Revises: 20260622_0061
@@ -28,6 +32,11 @@ _IDX = "uq_outbox_idempotency_key"
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    # R1 (Codex high+medium MAJOR): plain CREATE INDEX берёт SHARE-лок + сканирует таблицу. На PG —
+    # fail-fast по lock_timeout, чтобы build не висел за чужой долгой транзакцией (как 0061).
+    if bind.dialect.name == "postgresql":
+        bind.execute(sa.text("SET lock_timeout = '3s'"))
     op.add_column(
         "outbox_messages",
         sa.Column("idempotency_key", sa.String(length=200), nullable=True),

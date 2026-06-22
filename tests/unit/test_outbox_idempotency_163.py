@@ -84,6 +84,32 @@ def test_worker_dual_channel_distinct_keys_163():
     assert len({row.channel_type for row in rows}) == 2
 
 
+def test_worker_race_backstop_does_not_poison_tick_163(monkeypatch):
+    """R1 MAJOR (субагент+Codex high+medium, мимо CRITICAL): гонка (pre-check промахнулся, индекс
+    ловит на flush) → savepoint откатывает ТОЛЬКО строку; тик НЕ падает (advance+commit проходят)."""
+    from sreda.db.models.housewife import FamilyReminder
+
+    s = _session()
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    firing = now - timedelta(minutes=1)
+    r = HousewifeReminderService(s).schedule(
+        tenant_id="tenant_1", user_id="user_1", title="Молоко", trigger_at=firing)
+    w = HousewifeReminderWorker(s)
+    asyncio.run(w.process_pending(now=now))
+    assert s.query(OutboxMessage).count() == 1
+    # вернуть в pending на ТОТ ЖЕ firing-trigger → воркер построит ТОТ ЖЕ ключ (коллизия с тик-1).
+    row = s.get(FamilyReminder, r.id)
+    row.status = "pending"
+    row.next_trigger_at = firing
+    row.escalation_count = 0
+    s.commit()
+    # форсим промах pre-check → путь backstop (IntegrityError на flush в savepoint).
+    monkeypatch.setattr(w, "_outbox_key_exists", lambda _k: False)
+    asyncio.run(w.process_pending(now=now))  # НЕ должно бросить (savepoint спасает тик)
+    assert s.query(OutboxMessage).count() == 1, "backstop: дубль НЕ создан"
+    assert s.get(FamilyReminder, r.id).last_fired_at is not None, "тик не упал — advance прошёл"
+
+
 def test_outbox_idempotency_key_unique_index_163():
     """DB-инвариант: два outbox с ОДНИМ idempotency_key → IntegrityError; NULL не ограничен."""
     s = _session()
