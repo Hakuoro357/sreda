@@ -1125,21 +1125,22 @@ def _build_graph(llm: Any, all_tools: list, *,
         # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
         #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
         #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
-        #   (2) bind_tools — ВНЕ try (R2 MAJOR Codex high): ошибка построения/схемы инструментов =
+        #   (2) primary bind_tools — ВНЕ try (R2 MAJOR Codex high): ошибка построения/схемы =
         #       ЛОКАЛЬНЫЙ баг, его НЕ маскируем уходом на Осу; в try ТОЛЬКО сетевой invoke;
-        #   (3) лог с exc_info=True — полный traceback причины перехода (диагностируемо, даже когда
-        #       запас «спас» ход; иначе скрытый баг invoke виден лишь по имени класса).
+        #   (3) запас (bind_tools + invoke) строим ЛЕНИВО, ТОЛЬКО когда primary упал (mimocode
+        #       MINOR): с флагом ВКЛ построение запаса на КАЖДОМ ходу — баг bind_tools резерва
+        #       ронял бы happy-path primary, хотя Mercury в порядке; ленивость это исключает;
+        #   (4) лог с exc_info=True — полный traceback причины перехода.
         # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
         _bound_primary = llm.bind_tools(bound)
         _used_provider, _used_model = provider_key, _model_name
         if fallback_llm is not None:
-            _bound_fallback = fallback_llm.bind_tools(bound)  # построение запаса — тоже вне try
             try:
                 resp = _bound_primary.invoke(_msgs)
             except Exception as _e:  # noqa: BLE001 — INVOKE primary упал (сеть/провайдер/5xx) → запас
                 logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
                                type(_e).__name__, exc_info=True)
-                resp = _bound_fallback.invoke(_msgs)
+                resp = fallback_llm.bind_tools(bound).invoke(_msgs)
                 _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
         else:
             resp = _bound_primary.invoke(_msgs)
