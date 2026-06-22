@@ -133,3 +133,38 @@ def test_add_dated_task_reuses_but_dateless_does_not_163(db_session):
     with bind_tool_runtime(_ctx(u.tenant_id, u.user_id, "e4")):
         d2 = svc.add(tenant_id=u.tenant_id, user_id=u.user_id, title="купить хлеб")
     assert d1.id != d2.id, "без даты → две отдельные задачи (не дедупим — решение Бориса)"
+
+
+def test_time_only_task_not_deduped_163(db_session):
+    """Codex high R1 MAJOR: задача со ВРЕМЕНЕМ но БЕЗ даты — НЕ дедупим (только «с датой»)."""
+    from datetime import time as _time
+
+    from sreda.services.tasks import TaskService
+
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    svc = TaskService(db_session)
+    with bind_tool_runtime(_ctx(u.tenant_id, u.user_id, "e1")):
+        a = svc.add(tenant_id=u.tenant_id, user_id=u.user_id, title="позвонить",
+                    time_start=_time(9, 0))
+    with bind_tool_runtime(_ctx(u.tenant_id, u.user_id, "e2")):
+        b = svc.add(tenant_id=u.tenant_id, user_id=u.user_id, title="позвонить",
+                    time_start=_time(9, 0))
+    assert a.normalized_title_hash is None, "время-без-даты → hash не пишется"
+    assert a.id != b.id, "время-без-даты → не дедупим (две отдельные)"
+
+
+def test_punctuation_title_reminder_not_deduped_163(db_session):
+    """Субагент R1 MINOR: вырожденное название (пунктуация → пустой хеш) → hash=None, НЕ дедупим."""
+    from sreda.services.housewife_reminders import HousewifeReminderService
+
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    svc = HousewifeReminderService(db_session)
+    when = datetime(2030, 1, 1, 9, 0, tzinfo=timezone.utc)
+    with bind_tool_runtime(_ctx(u.tenant_id, u.user_id, "e1")):
+        a = svc.schedule(tenant_id=u.tenant_id, user_id=u.user_id, title="...", trigger_at=when)
+    with bind_tool_runtime(_ctx(u.tenant_id, u.user_id, "e2")):
+        b = svc.schedule(tenant_id=u.tenant_id, user_id=u.user_id, title="...", trigger_at=when)
+    assert a.normalized_title_hash is None, "пунктуация → пустой хеш → None (вне индекса)"
+    assert a.id != b.id, "вырожденное название → не дедупим"

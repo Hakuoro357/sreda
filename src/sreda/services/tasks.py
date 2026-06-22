@@ -162,13 +162,17 @@ class TaskService:
             from sreda.services.operation_id import compute_normalized_title_hash
 
             nhash = None
-            if scheduled_date is not None or time_start is not None:
+            if scheduled_date is not None:  # Codex MAJOR: дедупим только задачи С ДАТОЙ (решение
+                # Бориса «только задачи с датой»); время-без-даты — НЕ дедупим. Время участвует в
+                # ключе (extra) лишь когда дата есть.
+                # `or None`: вырожденное название (пунктуация) → хеш "" → IS NOT NULL → ложно
+                # схлопнул бы разные такие задачи в индексе; трактуем "" как «дедуп невозможен» (субагент MINOR).
                 nhash = compute_normalized_title_hash(
                     title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
                     extra=sep.join([
                         scheduled_date.isoformat() if scheduled_date else "",
                         time_start.isoformat() if time_start else "",
-                        recurrence_rule or ""]))
+                        recurrence_rule or ""])) or None
             dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
             if dialect_name == "postgresql":
                 from sqlalchemy.dialects.postgresql import insert as _insert

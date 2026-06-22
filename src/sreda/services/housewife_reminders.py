@@ -242,10 +242,13 @@ class HousewifeReminderService:
         from sreda.services.idempotent_ops import find_existing_pending_semantic
         from sreda.services.operation_id import compute_normalized_title_hash
 
+        # `or None`: вырожденное название (только пунктуация) → нормализация даёт "" → хеш "".
+        # Пустой hash IS NOT NULL → попал бы в партиал-индекс и ложно схлопнул разные такие записи;
+        # трактуем "" как «дедуп невозможен» (None, вне индекса) — единообразно с легаси-NULL (субагент MINOR).
         nhash = compute_normalized_title_hash(
             clean_title, entity_type="family_reminder", tenant_id=tenant_id,
             user_id=user_id or "",
-            extra=sep.join([trigger_at.isoformat(), recurrence_rule or ""]))
+            extra=sep.join([trigger_at.isoformat(), recurrence_rule or ""])) or None
 
         dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
         if dialect_name == "postgresql":
