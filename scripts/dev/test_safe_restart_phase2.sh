@@ -89,6 +89,16 @@ out=$(run "$ENVF" 1 0 "" 0 2>&1); rc=$?
 check "взята последняя запись, max 8s" "max 8s" "$out"
 check_absent "не ушёл в WARN/дефолт" "WARN" "$out"
 
+echo "=== Scenario 2c: окружение (env-файл пуст, shell UVICORN_READY_TIMEOUT=8) → max 8s ==="
+: > "$ENVF"
+out=$(run "$ENVF" 1 0 "8" 0 2>&1); rc=$?
+check "shell env применён, max 8s" "max 8s" "$out"
+
+echo "=== Scenario 2d: приоритет env-файл > окружение (файл=7, shell=99) → max 7s ==="
+printf 'UVICORN_READY_TIMEOUT=7\n' > "$ENVF"
+out=$(run "$ENVF" 1 0 "99" 0 2>&1); rc=$?
+check "env-файл побеждает окружение, max 7s" "max 7s" "$out"
+
 echo "=== Scenario 3: невалидное значение → дефолт + WARN ==="
 printf 'UVICORN_READY_TIMEOUT=abc\n' > "$ENVF"
 out=$(run "$ENVF" 1 0 "" 0 2>&1); rc=$?
@@ -100,6 +110,24 @@ printf 'UVICORN_READY_TIMEOUT=9999\n' > "$ENVF"
 out=$(run "$ENVF" 1 0 "" 0 2>&1); rc=$?
 check "WARN о превышении MAX" "WARN: UVICORN_READY_TIMEOUT='9999'" "$out"
 check "откат на дефолт 120s" "max 120s" "$out"
+
+echo "=== Scenario 3d: граница 3600 (валидно) → max 3600s, без WARN ==="
+printf 'UVICORN_READY_TIMEOUT=3600\n' > "$ENVF"
+out=$(run "$ENVF" 1 0 "" 0 2>&1); rc=$?
+check "3600 принято, max 3600s" "max 3600s" "$out"
+check_absent "без WARN на верхней границе" "WARN" "$out"
+
+echo "=== Scenario 3e: 3601 (за границей) → дефолт + WARN ==="
+printf 'UVICORN_READY_TIMEOUT=3601\n' > "$ENVF"
+out=$(run "$ENVF" 1 0 "" 0 2>&1); rc=$?
+check "3601 отвергнут" "WARN: UVICORN_READY_TIMEOUT='3601'" "$out"
+check "откат на дефолт 120s" "max 120s" "$out"
+
+echo "=== Scenario 3f: граница 1 (валидно) → max 1s, без WARN ==="
+printf 'UVICORN_READY_TIMEOUT=1\n' > "$ENVF"
+out=$(run "$ENVF" 1 0 "" 0 2>&1); rc=$?
+check "1 принято, max 1s" "max 1s" "$out"
+check_absent "без WARN на нижней границе" "WARN" "$out"
 
 echo "=== Scenario 3c: '0' (и пустое после нормализации) → дефолт + WARN ==="
 printf 'UVICORN_READY_TIMEOUT=0\n' > "$ENVF"
