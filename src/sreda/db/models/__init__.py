@@ -22,7 +22,6 @@ from sreda.db.models.core import (
     User,
     Workspace,
 )
-from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
 from sreda.db.models.react_debug import ReactDebugTurn
 from sreda.db.models.housewife import FamilyMember, FamilyReminder
 from sreda.db.models.housewife_food import (
@@ -79,10 +78,6 @@ __all__ = [
     "PaymentOrder",
     "PaymentOrderItem",
     "InboundMessage",
-    "EDSAccount",
-    "EDSChangeEvent",
-    "EDSClaimState",
-    "EDSDeliveryRecord",
     "FamilyMember",
     "FamilyReminder",
     "InboundEvent",
