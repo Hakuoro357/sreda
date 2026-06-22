@@ -32,8 +32,9 @@ alembic (CONCURRENTLY не может в транзакции и оставил 
 Примечание: alembic autogenerate НЕ умеет рефлексировать выражение-индекс (COALESCE) —
 может «не видеть» его и предлагать пере-создать; это известное ограничение, не баг миграции.
 
-Revision ID: 20260622_0060
-Revises: 20260622_0059
+Revision ID: 20260622_0061
+Revises: 20260622_0060
+(переномеровано с 0060 → 0061 при синке: форк #181 Фаза B занял 0060 — drop_eds_connect_tables.)
 """
 from __future__ import annotations
 
@@ -41,8 +42,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "20260622_0060"
-down_revision = "20260622_0059"
+revision = "20260622_0061"
+down_revision = "20260622_0060"
 branch_labels = None
 depends_on = None
 
