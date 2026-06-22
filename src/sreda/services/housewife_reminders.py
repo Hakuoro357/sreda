@@ -464,12 +464,20 @@ class HousewifeReminderService:
         has passed. Called by the worker; NEVER expose to chat tools —
         they must stay tenant-scoped."""
         current = _coerce_utc(now or _utcnow())
+        # #187 soft-delete — producer-фильтр (defence-in-depth, дверь #10):
+        # удалённые тенанты исключаются из забора. JOIN tenants ... AND
+        # deleted_at IS NULL — удалённый тенант не попадёт в due-набор воркера.
+        # (Per-row fencing-recheck в воркере закрывает окно между SELECT и advance.)
+        from sreda.db.models.core import Tenant
+
         q = (
             self.session.query(FamilyReminder)
+            .join(Tenant, Tenant.id == FamilyReminder.tenant_id)
             .filter(
                 FamilyReminder.status == "pending",
                 FamilyReminder.next_trigger_at.isnot(None),
                 FamilyReminder.next_trigger_at <= current,
+                Tenant.deleted_at.is_(None),
             )
             .order_by(FamilyReminder.next_trigger_at.asc())
             .limit(limit)
@@ -477,9 +485,13 @@ class HousewifeReminderService:
         # #163 Фаза 4 — FOR UPDATE SKIP LOCKED (только PG): при будущей многопроцессности второй
         # воркер пропустит уже залоченные due-строки → нет двойного пика/двойной постановки. Лок
         # держится до commit тика (после mark_fired). SQLite не поддерживает — без лока (1 воркер).
+        # #187 R1 MAJOR — ``of=FamilyReminder``: после добавления producer-JOIN на Tenant голый
+        # FOR UPDATE лочил бы И строки tenants. На PG со SKIP LOCKED это привело бы к ложным
+        # пропускам due-напоминаний из-за лока tenant-ряда (общего у многих напоминаний). ``of=``
+        # сужает блокировку ТОЛЬКО до строк family_reminders.
         bind = self.session.bind
         if bind is not None and bind.dialect.name == "postgresql":
-            q = q.with_for_update(skip_locked=True)
+            q = q.with_for_update(skip_locked=True, of=FamilyReminder)
         return q.all()
 
     def mark_fired(

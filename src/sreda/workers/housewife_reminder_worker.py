@@ -66,6 +66,19 @@ class HousewifeReminderWorker:
         skipped_late = 0
         for reminder in due:
             try:
+                # #187 soft-delete — fencing-recheck (дверь #10): между SELECT
+                # (due_now producer-фильтр) и сдвигом состояния есть окно —
+                # тенант мог быть удалён администратором мид-тик в другом
+                # процессе. Перепроверяем В ТОЙ ЖЕ TX прямо перед доставкой +
+                # advance; удалён → пропускаем (НЕ доставляем, НЕ двигаем state).
+                from sreda.services.tenant_lifecycle import is_tenant_active
+
+                if not is_tenant_active(self.session, reminder.tenant_id):
+                    logger.info(
+                        "reminder %s: tenant %s удалён (fencing) — пропуск без advance",
+                        reminder.id, reminder.tenant_id,
+                    )
+                    continue
                 # 2026-04-23 «баг 2b»: если напоминание просрочено больше
                 # чем LATE_FIRE_GRACE_MINUTES — закрываем его silently
                 # без отправки в Telegram. Типичный случай: LLM создала

@@ -25,7 +25,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
-from sreda.db.models.core import InboundMessage, Job, Tenant, User, Workspace
+from sreda.db.models.core import (
+    InboundMessage,
+    Job,
+    OutboxMessage,
+    Tenant,
+    User,
+    Workspace,
+)
 from sreda.db.models.planner import PlannerExecution, StepExecutionLedger
 from sreda.db.models.react_debug import ReactDebugTurn  # #185 — регистрация таблицы для create_all
 from sreda.db.models.runtime import AgentRun, AgentThread
@@ -430,6 +437,36 @@ def test_react_debug_turns_retention_185(session) -> None:
     remaining = {r.id for r in session.query(ReactDebugTurn).all()}
     assert remaining == {"rdt_new"}, remaining   # старше 14д удалено, свежее осталось
     assert result.react_debug_turns == 1
+
+
+# ---------------------------------------------------------------------------
+# #187 — ретеншен outbox status='dropped' (drain удалённого тенанта)
+# ---------------------------------------------------------------------------
+def _dropped_outbox(sess, oid: str, age_days: int) -> None:
+    sess.add(OutboxMessage(
+        id=oid, tenant_id="t1", workspace_id="w1",
+        channel_type="telegram", status="dropped",
+        payload_json="{}", drop_reason="tenant_deleted", bot_key="sreda",
+        created_at=datetime.now(timezone.utc) - timedelta(days=age_days),
+    ))
+
+
+def test_dropped_outbox_retention_187(session) -> None:
+    """#187 (R1 MAJOR): outbox со status='dropped' старше окна (60д) удаляется
+    ретеншеном; свежая dropped-строка — нет (иначе drain удалённого тенанта
+    копил бы dropped-строки бессрочно)."""
+    from sreda.maintenance import retention_cleanup as rc
+
+    _dropped_outbox(session, "out_dropped_old", age_days=rc.OUTBOX_DROPPED_DAYS + 5)
+    _dropped_outbox(session, "out_dropped_new", age_days=3)
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()
+
+    assert session.get(OutboxMessage, "out_dropped_old") is None   # старше окна → удалена
+    assert session.get(OutboxMessage, "out_dropped_new") is not None  # свежая → нет
+    assert result.outbox_messages_dropped == 1
 
 
 # NB (#164, Codex R2 MINOR): planner_gaps / planner_llm_reservations (nullable execution_id, FK

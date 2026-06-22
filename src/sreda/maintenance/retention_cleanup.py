@@ -70,6 +70,7 @@ class RetentionCleanupResult:
     jobs: int = 0
     outbox_messages_sent: int = 0
     outbox_messages_failed: int = 0
+    outbox_messages_dropped: int = 0  # #187 — drain удалённого тенанта (status='dropped')
     secure_records_eds_connect_payload: int = 0
     skill_ai_executions: int = 0
     skill_events_debug_info: int = 0
@@ -92,6 +93,7 @@ class RetentionCleanupResult:
             + self.jobs
             + self.outbox_messages_sent
             + self.outbox_messages_failed
+            + self.outbox_messages_dropped
             + self.secure_records_eds_connect_payload
             + self.skill_ai_executions
             + self.skill_events_debug_info
@@ -118,6 +120,9 @@ INBOUND_MESSAGES_DAYS = 30
 JOBS_DAYS = 30
 OUTBOX_SENT_DAYS = 30
 OUTBOX_FAILED_DAYS = 60
+# #187: outbox со status='dropped' (drain удалённого тенанта). Терминальный
+# не-доставленный статус, как 'failed' — то же окно 60д.
+OUTBOX_DROPPED_DAYS = 60
 SKILL_AI_EXECUTIONS_DAYS = 30
 SKILL_EVENTS_DEBUG_INFO_DAYS = 30
 SKILL_EVENTS_WARN_ERROR_DAYS = 90
@@ -388,6 +393,19 @@ def cleanup_runtime_retention(
             and_(
                 OutboxMessage.status == "failed",
                 OutboxMessage.created_at < failed_cutoff,
+            )
+        ),
+    )
+    # #187: status='dropped' (drain удалённого тенанта) — терминальный
+    # не-доставленный статус; без этой ветки dropped-строки копились бы
+    # бессрочно. То же окно, что failed (60д).
+    dropped_cutoff = now - timedelta(days=OUTBOX_DROPPED_DAYS)
+    result.outbox_messages_dropped = _delete_returning_count(
+        session,
+        delete(OutboxMessage).where(
+            and_(
+                OutboxMessage.status == "dropped",
+                OutboxMessage.created_at < dropped_cutoff,
             )
         ),
     )

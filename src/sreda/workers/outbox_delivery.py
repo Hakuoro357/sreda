@@ -87,6 +87,17 @@ class OutboxDeliveryWorker:
         return processed
 
     async def _process_one(self, row: OutboxMessage, *, now_utc: datetime) -> None:
+        # #187 soft-delete — fencing (дверь #9): тенант мог быть удалён ПОСЛЕ
+        # постановки строки в outbox. Проверяем В ТОЙ ЖЕ TX прямо перед внешней
+        # отправкой; удалён → терминируем без send (тот же drop_reason что drain).
+        from sreda.services.tenant_lifecycle import is_tenant_active
+
+        if not is_tenant_active(self.session, row.tenant_id):
+            row.status = "dropped"
+            row.drop_reason = "tenant_deleted"
+            self.session.commit()
+            return
+
         profile_dict, skill_config_dict = self._load_user_context(row)
         decision = decide_delivery(
             profile=profile_dict,
