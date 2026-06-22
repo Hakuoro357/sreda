@@ -233,14 +233,11 @@ class BillingService:
         tenant_id: str,
         *,
         now: datetime | None = None,
-        connect_button_override: dict | None = None,
     ) -> tuple[str, dict]:
         """Render the /subscriptions message + markup.
 
         #181 Phase B: the EDS connect/add/remove/restore UI is gone. Only the
-        non-EDS simple subscriptions (currently voice transcription) remain.
-        ``connect_button_override`` is accepted for signature stability but is
-        no longer used (it carried the EDS connect-link button)."""
+        non-EDS simple subscriptions (currently voice transcription) remain."""
         self.ensure_default_plans()
         current_time = _utcnow(now)
 

@@ -36,7 +36,6 @@ from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.tools import build_memory_tools
 from sreda.services.billing import (
     BillingService,
-    CONNECT_BASE_CALLBACK,
     SUBSCRIPTIONS_CALLBACK,
 )
 from sreda.services.budget import BudgetService, QuotaStatus
@@ -248,26 +247,8 @@ def execute_subscriptions_show(session: Session, action: ActionEnvelope, context
     # all EDS lines/buttons for a retired skill, so the fallback is the same
     # voice + nav render with no EDS content and zero mutations.
     billing = BillingService(session)
-    text, reply_markup = billing.build_subscriptions_message(
-        action.tenant_id, connect_button_override=None
-    )
+    text, reply_markup = billing.build_subscriptions_message(action.tenant_id)
     return [RuntimeReply(text=text, reply_markup=reply_markup)]
-
-
-def _swap_connect_button(markup: dict, override: dict) -> dict:
-    """Replace fallback 'onboarding:connect_eds' callback button with a
-    direct web_app button in an existing inline_keyboard markup."""
-    rows = markup.get("inline_keyboard", [])
-    new_rows = []
-    for row in rows:
-        new_row = []
-        for btn in row:
-            if btn.get("callback_data") == "onboarding:connect_eds":
-                new_row.append(override)
-            else:
-                new_row.append(btn)
-        new_rows.append(new_row)
-    return {"inline_keyboard": new_rows}
 
 
 def execute_claim_lookup(session: Session, action: ActionEnvelope, context: dict[str, Any]) -> list[RuntimeReply]:
@@ -4498,31 +4479,10 @@ def _miniapp_reply_markup() -> dict | None:
     }
 
 
-# Backwards-compat aliases for the handlers — all three call sites now
-# produce the same Mini-App button regardless of original semantic.
-def _subscriptions_markup() -> dict | None:
-    return _miniapp_reply_markup()
-
-
+# Backwards-compat alias for the handlers — produces the Mini-App button
+# regardless of original semantic.
 def _status_subscriptions_markup() -> dict | None:
     return _miniapp_reply_markup()
-
-
-def connect_reply_markup(base_active: bool) -> dict:
-    """Exported for ``policy.py`` — markup for the "connect base" CTA."""
-    if base_active:
-        return _status_subscriptions_markup()
-    return {
-        "inline_keyboard": [
-            [{"text": "Подключить EDS Monitor", "callback_data": CONNECT_BASE_CALLBACK}],
-            [{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}],
-        ]
-    }
-
-
-def subscriptions_markup() -> dict:
-    """Exported for ``policy.py``."""
-    return _subscriptions_markup()
 
 
 def status_subscriptions_markup() -> dict:

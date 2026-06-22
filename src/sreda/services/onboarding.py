@@ -470,19 +470,6 @@ def build_post_approve_keyboard_max() -> list[dict]:
 # выше остаются для возможной будущей фичи conditional name prompt.
 
 
-def build_connect_eds_message(*, base_active: bool, connected_count: int, allowed_count: int) -> str:
-    if not base_active:
-        return (
-            "Сначала подключи подписку EDS Monitor.\n\n"
-            "После этого можно будет привязать кабинет EDS."
-        )
-    return (
-        "Подключение EDS скоро будет доступно через защищенную веб-страницу.\n\n"
-        f"Сейчас подключено кабинетов: {connected_count} из {allowed_count}.\n"
-        "Следующий шаг — открыть защищенную форму и передать логин и пароль от кабинета."
-    )
-
-
 def _extract_chat_id(payload: dict) -> str | None:
     for key in ("message", "edited_message"):
         message = payload.get(key)
