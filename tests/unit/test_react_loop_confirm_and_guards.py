@@ -48,6 +48,167 @@ def _seed_reminder(db_session, u) -> str:
     return rid
 
 
+def test_update_reminder_exact_replay_no_reapply_163(db_session):
+    """#163 Фаза 3 named-X: повтор того же update (тот же ctx→op_id, committed) → сохранённый
+    payload БЕЗ переприменения (replay-after-change не откатывает более новое состояние БД)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx1 = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                              tool_name="update_reminder", tenant_id=u.tenant_id,
+                              user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx1):
+        r1 = tools["update_reminder"].invoke({"reminder_ref": rid, "title": "новое"})
+    assert "новое" in r1, r1
+    # более новое состояние БД (как будто прошёл ещё один ход и поменял title)
+    row = db_session.get(FamilyReminder, rid)
+    row.title = "новейшее"
+    db_session.commit()
+    # replay ТОГО ЖЕ хода (ctx1 → тот же op_id) → сохранённый payload, БЕЗ переприменения
+    with bind_tool_runtime(ctx1):
+        r2 = tools["update_reminder"].invoke({"reminder_ref": rid, "title": "новое"})
+    assert r2 == r1, f"replay должен вернуть сохранённый payload: {r2!r} != {r1!r}"
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).title == "новейшее", \
+        "replay НЕ должен переприменять (нет отката к 'новое')"
+
+
+def test_update_task_exact_replay_no_reapply_163(db_session):
+    """#163 Фаза 3a-2 named-X: повтор update_task (тот же ctx→op_id) → сохранённый payload без
+    переприменения (не откатывает более новое состояние)."""
+    from datetime import date
+    from sreda.db.models.tasks import Task
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    tid = f"task_{uuid4().hex[:20]}"
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title="старое",
+                        scheduled_date=date(2030, 6, 20), status="pending",
+                        created_at=now, updated_at=now))
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx1 = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                              tool_name="update_task", tenant_id=u.tenant_id,
+                              user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx1):
+        r1 = tools["update_task"].invoke({"task_ref": tid, "title": "новое"})
+    assert "новое" in r1, r1
+    db_session.get(Task, tid).title = "новейшее"; db_session.commit()
+    with bind_tool_runtime(ctx1):
+        r2 = tools["update_task"].invoke({"task_ref": tid, "title": "новое"})
+    assert r2 == r1, f"replay → сохранённый payload: {r2!r}"
+    db_session.expire_all()
+    assert db_session.get(Task, tid).title == "новейшее", "replay не переприменил"
+
+
+def test_update_task_reschedule_linked_reminder_ctx_atomic_163(db_session):
+    """#163 Фаза 3a-2 (субагент R1 CRITICAL): ctx-путь update_task с ПЕРЕНОСОМ + связанным
+    напоминанием НЕ падает (schedule изнутри helper-savepoint раньше → InvalidRequestError);
+    recreate атомарен (старое cancelled, новое создано+linked, задача обновлена)."""
+    from datetime import date
+    from datetime import time as _time
+
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.db.models.tasks import Task
+
+    u = seed_telegram_user(db_session); db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    when = datetime(2030, 6, 20, 9, 0, tzinfo=timezone.utc)
+    rid = f"rem_{uuid4().hex[:20]}"
+    db_session.add(FamilyReminder(id=rid, tenant_id=u.tenant_id, user_id=u.user_id,
+                                  title="⏰ задача", trigger_at=when, next_trigger_at=when,
+                                  status="pending", bot_key="sreda"))
+    tid = f"task_{uuid4().hex[:20]}"
+    db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title="задача",
+                        scheduled_date=date(2030, 6, 20), time_start=_time(9, 0),
+                        reminder_id=rid, reminder_offset_minutes=0, status="pending",
+                        created_at=when, updated_at=when))
+    db_session.commit()
+    ctx = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                             tool_name="update_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx):
+        r = tools["update_task"].invoke({"task_ref": tid, "scheduled_date": "2030-06-21"})
+    assert r.startswith("ok:updated"), f"ctx-перенос со связанным напоминанием не должен падать: {r!r}"
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).status == "cancelled", "старое напоминание отменено"
+    t = db_session.get(Task, tid)
+    assert t.scheduled_date == date(2030, 6, 21), "дата обновлена"
+    assert t.reminder_id and t.reminder_id != rid, "новое напоминание привязано"
+
+
+def test_update_reminder_replay_after_delete_returns_stored_163(db_session):
+    """Codex R1 MAJOR: replay update ПОСЛЕ удаления цели → СОХРАНЁННЫЙ payload (exact-replay), а не
+    живое «не найдено». Со старым кодом (not-found ДО _idempotent_write) вернулось бы «нет»."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    rid = _seed_reminder(db_session, u)
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx1 = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                              tool_name="update_reminder", tenant_id=u.tenant_id,
+                              user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx1):
+        r1 = tools["update_reminder"].invoke({"reminder_ref": rid, "title": "новое"})
+    assert "новое" in r1, r1
+    # удалить цель
+    db_session.delete(db_session.get(FamilyReminder, rid)); db_session.commit()
+    with bind_tool_runtime(ctx1):
+        r2 = tools["update_reminder"].invoke({"reminder_ref": rid, "title": "новое"})
+    assert r2 == r1, f"replay после удаления → сохранённый payload, не «не найдено»: {r2!r}"
+
+
+def test_delete_task_tombstone_replay_163(db_session, monkeypatch):
+    """#163 Фаза 3a-3 named-Z: replay delete_task ПОСЛЕ исчезновения строки задачи → сохранённый
+    payload (tombstone op-результата), не «не найдено». Без фикса peek вернулось бы «нет»."""
+    from datetime import date
+    from sreda.db.models.tasks import Task
+
+    monkeypatch.setattr(react_loop, "interrupt", lambda *a, **k: "да")
+    u = seed_telegram_user(db_session); db_session.commit()
+    tid = f"task_{uuid4().hex[:20]}"
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title="удаляемая",
+                        scheduled_date=date(2030, 6, 20), status="pending",
+                        created_at=now, updated_at=now))
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                             tool_name="delete_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx):
+        r1 = tools["delete_task"].invoke({"task_ref": tid})
+    assert r1.startswith("Готово, удаляю"), r1
+    assert db_session.get(Task, tid) is None  # строка удалена
+    with bind_tool_runtime(ctx):
+        r2 = tools["delete_task"].invoke({"task_ref": tid})
+    assert r2 == r1, f"replay после hard-delete → сохранённый payload (tombstone): {r2!r}"
+
+
+def test_cancel_task_exact_replay_163(db_session, monkeypatch):
+    """#163 Фаза 3a-3 named-X: повтор cancel_task (тот же ctx→op_id) → сохранённый payload."""
+    from datetime import date
+    from sreda.db.models.tasks import Task
+
+    monkeypatch.setattr(react_loop, "interrupt", lambda *a, **k: "да")
+    u = seed_telegram_user(db_session); db_session.commit()
+    tid = f"task_{uuid4().hex[:20]}"
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title="отменяемая",
+                        scheduled_date=date(2030, 6, 20), status="pending",
+                        created_at=now, updated_at=now))
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                             tool_name="cancel_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx):
+        r1 = tools["cancel_task"].invoke({"task_ref": tid})
+    assert r1.startswith("Готово, отменяю"), r1
+    with bind_tool_runtime(ctx):
+        r2 = tools["cancel_task"].invoke({"task_ref": tid})
+    assert r2 == r1, f"replay cancel → сохранённый payload: {r2!r}"
+
+
 def _cancel_script(rid: str) -> _StubLLM:
     return _StubLLM([
         AIMessage(content="", tool_calls=[{

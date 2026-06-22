@@ -152,6 +152,7 @@ class HousewifeReminderService:
         recurrence_rule: str | None = None,
         source_memo: str | None = None,
         bot_key: str | None = None,
+        commit: bool = True,
     ) -> FamilyReminder:
         trigger_at = _coerce_utc(trigger_at)
         # Validate rrule upfront — silently accepting a bad RRULE would
@@ -195,7 +196,10 @@ class HousewifeReminderService:
                 bot_key=resolved_bot_key,
             )
             self.session.add(reminder)
-            self.session.commit()
+            if commit:  # #163 Фаза 3: commit=False когда schedule — часть большей операции
+                self.session.commit()
+            else:
+                self.session.flush()
             return reminder
 
         # --- ReAct-путь (within-turn idempotency) -------------------------
@@ -285,18 +289,25 @@ class HousewifeReminderService:
                 self.session, FamilyReminder, tenant_id=tenant_id, user_id=user_id, nhash=nhash)
             if existing is not None:
                 return existing
-        try:
+        if commit:
+            try:
+                self.session.execute(stmt)
+                self.session.commit()
+            except IntegrityError:
+                # backstop гонки (иной op_id, тот же semantic_key — межходовой) ловит partial-unique.
+                self.session.rollback()
+                existing = (find_existing_pending_semantic(
+                    self.session, FamilyReminder, tenant_id=tenant_id,
+                    user_id=user_id, nhash=nhash) if nhash is not None else None)
+                if existing is not None:
+                    return existing
+                raise
+        else:
+            # #163 Фаза 3: schedule как часть большей операции (savepoint владельца, напр. tasks.update
+            # через durable-helper). БЕЗ commit/rollback-backstop — гонку/откат разрулит внешний
+            # savepoint (commit изнутри begin_nested закрыл бы его → InvalidRequestError).
             self.session.execute(stmt)
-            self.session.commit()
-        except IntegrityError:
-            # backstop гонки (иной op_id, тот же semantic_key — межходовой) ловит partial-unique индекс.
-            self.session.rollback()
-            existing = (find_existing_pending_semantic(
-                self.session, FamilyReminder, tenant_id=tenant_id,
-                user_id=user_id, nhash=nhash) if nhash is not None else None)
-            if existing is not None:
-                return existing
-            raise
+            self.session.flush()
 
         # SELECT-after-conflict: вернуть СТАБИЛЬНУЮ строку (тот же id) и при
         # вставке, и при ON CONFLICT (повтор внутри хода) — иначе replay вернул бы
@@ -327,6 +338,7 @@ class HousewifeReminderService:
         trigger_at: datetime | None = None,
         recurrence_rule: str | None = None,
         clear_recurrence: bool = False,
+        commit: bool = True,
     ) -> FamilyReminder | None:
         """Patch an existing reminder in-place — used вместо delete+create
         когда юзер уточняет существующее напоминание.
@@ -409,7 +421,10 @@ class HousewifeReminderService:
             rem.recurrence_rule = rrule_value
 
         rem.updated_at = _utcnow()
-        self.session.commit()
+        if commit:  # #163 Фаза 3: на ctx-пути commit владеет durable-helper (claim+мутация атомарны)
+            self.session.commit()
+        else:
+            self.session.flush()
         return rem
 
     def list_active(
@@ -440,7 +455,7 @@ class HousewifeReminderService:
             q = q.filter(FamilyReminder.user_id == user_id)
         return q.count()
 
-    def cancel(self, *, tenant_id: str, reminder_id: str) -> bool:
+    def cancel(self, *, tenant_id: str, reminder_id: str, commit: bool = True) -> bool:
         reminder = (
             self.session.query(FamilyReminder)
             .filter(
@@ -454,7 +469,10 @@ class HousewifeReminderService:
         reminder.status = "cancelled"
         reminder.next_trigger_at = None
         reminder.updated_at = _utcnow()
-        self.session.commit()
+        if commit:  # #163 Фаза 3: commit=False когда зовётся как часть большей операции (tasks.update)
+            self.session.commit()
+        else:
+            self.session.flush()
         return True
 
     # --- worker-facing --------------------------------------------------

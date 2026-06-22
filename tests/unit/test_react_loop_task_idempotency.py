@@ -77,3 +77,64 @@ def test_add_task_legacy_no_ctx_unchanged(db_session):
 
     rows = db_session.query(Task).filter_by(tenant_id=u.tenant_id, user_id=u.user_id).all()
     assert len(rows) == 2, "легаси без ctx — без дедупа, 2 вызова = 2 строки"
+
+
+def test_tasks_update_commit_false_does_not_persist_163():
+    """#163 Фаза 3a-2: tasks.update(commit=False) НЕ коммитит (helper владеет). Плайн-сессия."""
+    from datetime import date, datetime, timezone
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from sreda.db.base import Base
+    from sreda.db.models.core import Tenant, User
+    from sreda.db.models.tasks import Task
+    from sreda.services.tasks import TaskService
+
+    eng = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(eng)
+    s = sessionmaker(bind=eng)()
+    s.add(Tenant(id="t1", name="T"))
+    s.add(User(id="u1", tenant_id="t1"))
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    s.add(Task(id="task_x", tenant_id="t1", user_id="u1", title="старое",
+               scheduled_date=date(2030, 6, 20), status="pending", created_at=now, updated_at=now))
+    s.commit()
+    TaskService(s).update(tenant_id="t1", user_id="u1", task_id="task_x",
+                          title="новое", commit=False)
+    assert s.get(Task, "task_x").title == "новое"  # в сессии (flush)
+    s.rollback()
+    assert s.get(Task, "task_x").title == "старое", "commit=False не должен фиксировать"
+
+
+def test_tasks_cancel_delete_commit_false_does_not_persist_163():
+    """#163 Фаза 3 cancel/delete: commit=False НЕ коммитит (helper владеет). Плайн-сессия."""
+    from datetime import date, datetime, timezone
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from sreda.db.base import Base
+    from sreda.db.models.core import Tenant, User
+    from sreda.db.models.tasks import Task
+    from sreda.services.tasks import TaskService
+
+    eng = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(eng)
+    s = sessionmaker(bind=eng)()
+    s.add(Tenant(id="t1", name="T"))
+    s.add(User(id="u1", tenant_id="t1"))
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    s.add(Task(id="c1", tenant_id="t1", user_id="u1", title="отменяемая",
+               scheduled_date=date(2030, 6, 20), status="pending", created_at=now, updated_at=now))
+    s.add(Task(id="d1", tenant_id="t1", user_id="u1", title="удаляемая",
+               scheduled_date=date(2030, 6, 20), status="pending", created_at=now, updated_at=now))
+    s.commit()
+    svc = TaskService(s)
+    svc.cancel(tenant_id="t1", user_id="u1", task_id="c1", commit=False)
+    svc.delete(tenant_id="t1", user_id="u1", task_id="d1", commit=False)
+    assert s.get(Task, "c1").status == "cancelled"  # в сессии
+    assert s.get(Task, "d1") is None  # удалена в сессии (flush)
+    s.rollback()
+    assert s.get(Task, "c1").status == "pending", "cancel(commit=False) не должен фиксировать"
+    assert s.get(Task, "d1") is not None, "delete(commit=False) не должен фиксировать"

@@ -183,6 +183,8 @@ def test_admin_per_user_returns_rows_sorted_descending(monkeypatch, tmp_path):
     assert [r.user_id for r in rows] == ["u2", "u1", "u3"]
     assert rows[0].tenant_name == "Tenant One"
     assert rows[0].tavily_calls == 10
-    assert rows[0].user_remaining == PER_USER_LIMIT - 10
+    # #200 Фаза 1: тир-aware остаток в листинге недоступен → None
+    # («по тарифу»), не врём «30−calls».
+    assert rows[0].user_remaining is None
     assert rows[2].tenant_name == "Tenant Two"
     assert rows[2].tavily_calls == 2

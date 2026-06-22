@@ -50,7 +50,7 @@
       <th>User ID</th>
       <th>Tavily</th>
       <th>Fallback (DDG)</th>
-      <th>Остаток (per-user)</th>
+      <th>Остаток (по тарифу)</th>
     </tr>
   </thead>
   <tbody>
@@ -69,16 +69,20 @@
         {% endif %}
       </td>
       <td>
-        {% set upct = (r.tavily_calls / summary.per_user_limit * 100) | round(1) %}
-        <span class="usage-bar">
-          <span class="usage-bar-fill" style="width: {{ [upct, 100] | min }}%;
-            {% if upct >= 100 %}background: #dc3545;
-            {% elif upct > 80 %}background: #ffc107;
-            {% else %}background: #28a745;
-            {% endif %}
-          "></span>
-        </span>
-        {{ r.user_remaining }}
+        {% if r.user_remaining is none %}
+          <span class="muted">по тарифу</span>
+        {% else %}
+          {% set upct = (r.tavily_calls / summary.per_user_limit * 100) | round(1) %}
+          <span class="usage-bar">
+            <span class="usage-bar-fill" style="width: {{ [upct, 100] | min }}%;
+              {% if upct >= 100 %}background: #dc3545;
+              {% elif upct > 80 %}background: #ffc107;
+              {% else %}background: #28a745;
+              {% endif %}
+            "></span>
+          </span>
+          {{ r.user_remaining }}
+        {% endif %}
       </td>
     </tr>
     {% endfor %}

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import DateTime, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -30,6 +30,19 @@ from sreda.db.base import Base
 
 class WebSearchUsage(Base):
     __tablename__ = "web_search_usage"
+
+    # Композитный UNIQUE на тройку — нужен для атомарного
+    # INSERT…ON CONFLICT (tenant_id,user_id,year_month) в
+    # `try_consume_tavily`. На проде создаёт миграция 0033
+    # (`ix_web_search_usage_unique`, unique=True); дублируем в модели,
+    # чтобы `create_all` в тестах (SQLite) давал тот же констрейнт.
+    __table_args__ = (
+        Index(
+            "ix_web_search_usage_unique",
+            "tenant_id", "user_id", "year_month",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
