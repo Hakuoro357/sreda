@@ -690,15 +690,32 @@ _FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
             "курс", "интернет", "сайт"),  # корни сужены (R2: найд/погод→ложные «найден/погоди»)
     "memory": ("запомни", "заметк", "запиш", "сохран"),  # запиши / сохрани факт
 }
-# #165 Срез B (R3-карв-аут): БЕЗОПАСНО резать (ленивые) только семьи без риска дубля на
-# recovery-проходе — shopping (есть within-turn ключ идемпотентности) + web (только чтение).
-# Остальные ленивые (recipes/menu/household/checklists/memory-save) пишут БЕЗ ключа → пока НЕ
-# режем (всегда привязаны), до #163 (оснащение ключами). Codex high R2 + план §5 + #163.
-_PRUNABLE_FAMILIES = frozenset({"shopping", "web"})
+# #165 Срез B (R3-карв-аут) + #165 Фаза 5 (#163 разблокировка): ЯВНАЯ классификация write-policy
+# ленивых семей = ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ для инварианта «семья прунабельна ⇒ её durable-write
+# инструменты идемпотентны» (тест test_prunable_families_invariant_165). Значения:
+#   "keyed"    — durable-write с ключом идемпотентности (op_id + ON CONFLICT) → БЕЗОПАСНО резать;
+#   "readonly" — в БД не пишет (только чтение) → безопасно резать;
+#   "unkeyed"  — durable-write БЕЗ ключа → НЕ резать (карв-аут; повтор на recovery-проходе задвоил
+#                бы запись). Оснащение этих семей ключами (по образцу #163 reminders/tasks/shopping)
+#                = отдельный эпик; до него они остаются "unkeyed" и всегда привязаны.
+# Чтобы перевести семью в прунабельные — СНАЧАЛА оснастить ключом и поменять policy здесь на "keyed"
+# (инвариант-тест поймает несоответствие). _PRUNABLE и _UNKEYED ВЫВОДЯТСЯ из policy → не дрейфуют.
+_FAMILY_WRITE_POLICY: dict[str, str] = {
+    "shopping": "keyed",       # housewife_shopping.add_items — op_id + INSERT ON CONFLICT (эталон #162)
+    "web": "readonly",         # web_search / fetch_url / get_weather — только чтение
+    "recipes": "unkeyed",      # пишет без op_id — ждёт оснащения
+    "menu": "unkeyed",
+    "household": "unkeyed",
+    "checklists": "unkeyed",
+    "memory": "unkeyed",       # сохранение заметки без op_id
+}
+_PRUNABLE_FAMILIES = frozenset(
+    f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("keyed", "readonly"))
 # Ленивые семьи БЕЗ ключа идемпотентности (всегда привязаны карв-аутом). Если инструмент такой
 # семьи уже отработал в ходу — guard-добор (лишний recovery-проход) ОТКЛЮЧАЕМ: повтор мог бы
 # задвоить запись (Codex medium R3). Пред-существующий multi-pass re-emit — отдельно, #163.
-_UNKEYED_WRITE_FAMILIES = frozenset(_LAZY_FAMILIES) - _PRUNABLE_FAMILIES
+_UNKEYED_WRITE_FAMILIES = frozenset(
+    f for f, p in _FAMILY_WRITE_POLICY.items() if p == "unkeyed")
 
 
 def _route_families(text: str, k: int = 2) -> list[str]:
