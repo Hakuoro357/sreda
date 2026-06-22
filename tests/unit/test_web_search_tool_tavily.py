@@ -168,6 +168,27 @@ def test_web_search_free_hard_stop_after_5(monkeypatch, tmp_path):
         session.close()
 
 
+def test_web_search_contention_retry_exhaustion_graceful(monkeypatch, tmp_path):
+    """#200 carry-forward: try_consume_tavily исчерпал ретраи (40001 ×3) → RuntimeError.
+    Замыкание НЕ валит ход — free отдаёт транзиентную недоступность, Tavily не зван
+    (слот не зарезервирован → release не нужен). Эмпирически всплыло на Postgres-прогоне."""
+    session = _bootstrap(monkeypatch, tmp_path)
+    try:
+        tool = build_web_search_tool(
+            session=session, tenant_id="t1", user_id="u1",
+            per_user_cap=5, is_free=True,
+        )
+        with patch(
+            "sreda.services.web_search_usage.try_consume_tavily",
+            side_effect=RuntimeError("retried 3× — все serialization failures (40001)"),
+        ), patch("sreda.services.web_search_tool._call_tavily") as mock_tavily:
+            result = tool.invoke({"query": "q"})
+        assert result == _WEB_SEARCH_UNAVAILABLE_MSG
+        assert mock_tavily.call_count == 0  # слот не зарезервирован — Tavily не зван
+    finally:
+        session.close()
+
+
 def test_web_search_grandfathered_no_user_cap(monkeypatch, tmp_path):
     """grandfathered/платные (per_user_cap=None): 31-й вызов проходит
     (нет per-user стопа)."""

@@ -354,9 +354,23 @@ def build_web_search_tool(
             try_consume_tavily,
         )
 
-        dec = try_consume_tavily(
-            engine, tenant_id, user_id, per_user_cap,
-        )
+        try:
+            dec = try_consume_tavily(
+                engine, tenant_id, user_id, per_user_cap,
+            )
+        except Exception:  # noqa: BLE001
+            # #200 carry-forward: исчерпание ретраев на serialization-контенции
+            # (40001 ×3) или иной сбой счётчика. Слот НЕ зарезервирован (txn
+            # откатилась) → graceful degrade, ход НЕ валим. free → транзиентная
+            # недоступность (без Tavily/DDG), non-free → DDG. release не нужен.
+            logger.warning(
+                "web_search: try_consume_tavily failed (contention/db) "
+                "tenant=%s user=%s is_free=%s — graceful degrade",
+                tenant_id, user_id, is_free,
+            )
+            if is_free:
+                return _WEB_SEARCH_UNAVAILABLE_MSG
+            return _ddg_fallback(q, session, tenant_id, user_id)
 
         if dec is QuotaDecision.USER_EXHAUSTED:
             logger.info(
