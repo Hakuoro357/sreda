@@ -20,17 +20,19 @@ def test_every_lazy_family_classified_165():
 
 
 def test_policy_values_valid_165():
-    """Допустимы только три значения политики."""
-    assert set(react_loop._FAMILY_WRITE_POLICY.values()) <= {"keyed", "readonly", "unkeyed"}
+    """Допустимы только четыре значения политики."""
+    assert set(react_loop._FAMILY_WRITE_POLICY.values()) <= {
+        "idempotent", "readonly", "metered_read", "unkeyed"}
 
 
-def test_prunable_only_keyed_or_readonly_165():
-    """ГЛАВНЫЙ инвариант: прунабельная семья НИКОГДА не содержит durable-write без ключа.
-    Резать безопасно только keyed (идемпотентный write) или readonly (не пишет в БД)."""
+def test_prunable_only_safe_policies_165():
+    """ГЛАВНЫЙ инвариант: прунабельная семья НИКОГДА не содержит durable-write ПОЛЬЗОВАТЕЛЬСКИХ
+    данных, повтор которого задвоил бы сущность. Резать безопасно: idempotent (повтор=no-op любым
+    механизмом), readonly (не пишет), metered_read (только best-effort счётчик квоты — двойной счёт терпим)."""
     for fam in react_loop._PRUNABLE_FAMILIES:
-        assert react_loop._FAMILY_WRITE_POLICY[fam] in ("keyed", "readonly"), (
-            f"семья {fam!r} в _PRUNABLE, но её write-policy не keyed/readonly — "
-            "обрезка+повтор на recovery-проходе задвоили бы запись"
+        assert react_loop._FAMILY_WRITE_POLICY[fam] in ("idempotent", "readonly", "metered_read"), (
+            f"семья {fam!r} в _PRUNABLE, но её write-policy не idempotent/readonly/metered_read — "
+            "обрезка+повтор на recovery-проходе задвоили бы запись сущности"
         )
 
 
@@ -47,7 +49,7 @@ def test_unkeyed_covers_all_unkeyed_policy_165():
 
 def test_current_prunable_state_pin_165():
     """Регресс-пин текущего безопасного состояния: режем shopping (keyed) + web (readonly); карв-аут —
-    5 семей без ключа. Когда семью оснастят ключом и переведут в "keyed" — пин обновить ОСОЗНАННО."""
+    5 семей без ключа. Когда семью сделают replay-safe и переведут в "idempotent" — пин обновить ОСОЗНАННО."""
     assert react_loop._PRUNABLE_FAMILIES == frozenset({"shopping", "web"})
     assert react_loop._UNKEYED_WRITE_FAMILIES == frozenset(
         {"recipes", "menu", "household", "checklists", "memory"})

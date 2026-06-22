@@ -693,24 +693,34 @@ _FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
 # #165 Срез B (R3-карв-аут) + #165 Фаза 5 (#163 разблокировка): ЯВНАЯ классификация write-policy
 # ленивых семей = ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ для инварианта «семья прунабельна ⇒ её durable-write
 # инструменты идемпотентны» (тест test_prunable_families_invariant_165). Значения:
-#   "keyed"    — durable-write с ключом идемпотентности (op_id + ON CONFLICT) → БЕЗОПАСНО резать;
-#   "readonly" — в БД не пишет (только чтение) → безопасно резать;
-#   "unkeyed"  — durable-write БЕЗ ключа → НЕ резать (карв-аут; повтор на recovery-проходе задвоил
-#                бы запись). Оснащение этих семей ключами (по образцу #163 reminders/tasks/shopping)
-#                = отдельный эпик; до него они остаются "unkeyed" и всегда привязаны.
-# Чтобы перевести семью в прунабельные — СНАЧАЛА оснастить ключом и поменять policy здесь на "keyed"
-# (инвариант-тест поймает несоответствие). _PRUNABLE и _UNKEYED ВЫВОДЯТСЯ из policy → не дрейфуют.
+#   "idempotent"  — durable-write, но ПОВТОР БЕЗОПАСЕН любым механизмом → БЕЗОПАСНО резать. Покрывает
+#                op_id-keyed (add_items: op_id + ON CONFLICT) И state-идемпотентные (mark_bought/
+#                remove/update/clear: status-flip с only_from-гейтом / absolute-SET → повтор = no-op).
+#                (Codex medium R1 MAJOR: «keyed» подразумевал бы op_id для ВСЕХ инструментов семьи —
+#                неточно; safety-свойство для обрезки = «повтор не задвоит», а не конкретный механизм.)
+#   "readonly"    — в БД не пишет (только чтение) → безопасно резать;
+#   "metered_read" — по сути чтение, но есть best-effort СЧЁТЧИК расхода (квота/usage, +1 без
+#                ключа идемпотентности, обёрнут в try/except — сбой глотается). Двойной счёт на
+#                recovery-проходе = лишь дрейф квоты (НЕ пользовательские данные, не дубль сущности)
+#                → ТЕРПИМО, режем. (Codex high+субагент R1 MAJOR: web_search пишет tavily/fallback-
+#                счётчик — не чистый readonly; честно отражаем, а не «readonly».)
+#   "unkeyed"     — durable-write пользовательских данных БЕЗ ключа → НЕ резать (карв-аут; повтор на
+#                recovery-проходе задвоил бы СУЩНОСТЬ). Оснащение ключами (образец #163
+#                reminders/tasks/shopping) = отдельный эпик; до него — "unkeyed", всегда привязаны.
+# Чтобы перевести семью из "unkeyed" в прунабельные — СНАЧАЛА сделать её write-инструменты replay-safe
+# (op_id-ключ ИЛИ state-идемпотентность) и поменять policy на "idempotent" (регресс-пин теста поймает
+# флип). _PRUNABLE и _UNKEYED ВЫВОДЯТСЯ из policy → не дрейфуют.
 _FAMILY_WRITE_POLICY: dict[str, str] = {
-    "shopping": "keyed",       # housewife_shopping.add_items — op_id + INSERT ON CONFLICT (эталон #162)
-    "web": "readonly",         # web_search / fetch_url / get_weather — только чтение
-    "recipes": "unkeyed",      # пишет без op_id — ждёт оснащения
+    "shopping": "idempotent",   # add_items — op_id+ON CONFLICT; mark/remove/update/clear — state-идемпотентны
+    "web": "metered_read",      # fetch_url/get_weather — чтение; web_search — +счётчик квоты (терпим)
+    "recipes": "unkeyed",       # пишет сущности без op_id/идемпотентности — ждёт оснащения
     "menu": "unkeyed",
     "household": "unkeyed",
     "checklists": "unkeyed",
-    "memory": "unkeyed",       # сохранение заметки без op_id
+    "memory": "unkeyed",        # сохранение заметки без op_id
 }
 _PRUNABLE_FAMILIES = frozenset(
-    f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("keyed", "readonly"))
+    f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("idempotent", "readonly", "metered_read"))
 # Ленивые семьи БЕЗ ключа идемпотентности (всегда привязаны карв-аутом). Если инструмент такой
 # семьи уже отработал в ходу — guard-добор (лишний recovery-проход) ОТКЛЮЧАЕМ: повтор мог бы
 # задвоить запись (Codex medium R3). Пред-существующий multi-pass re-emit — отдельно, #163.
