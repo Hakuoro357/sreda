@@ -764,8 +764,26 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         IdempotencyScopeMismatch,
         compute_args_hmac,
         execute_idempotent_durable_op,
+        peek_committed_replay,
     )
     from sreda.services.operation_id import compute_operation_id_update
+
+    def _replay_done(*, action: str, entity_type: str, entity_id: str, args: dict):
+        """#163 Фаза 3 (destructive-инструменты с interrupt): ДО not-found/confirm — если эта
+        durable-операция уже committed (replay/tombstone), вернуть сохранённый payload (exact-replay,
+        в т.ч. после hard-delete). None → свежая, продолжить обычным путём. Только ctx-путь."""
+        ctx = current_tool_runtime()
+        if ctx is None:
+            return None
+        from sreda.config.settings import get_settings
+
+        secret = get_settings().encryption_key or "dev-insecure-args-hmac"
+        op_id = compute_operation_id_update(
+            plan_id=ctx.execution_id, step_id=ctx.step_id, action=action,
+            entity_type=entity_type, entity_id=entity_id)
+        return peek_committed_replay(
+            session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
+            operation_family=entity_type, args_hmac=compute_args_hmac(args, secret=secret))
 
     def _idempotent_write(*, action: str, entity_type: str, entity_id: str,
                           args: dict, mutate) -> str:
@@ -885,6 +903,12 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     @tool
     def cancel_reminder(reminder_ref: str) -> str:
         """Удалить напоминание по ref. САМ спрашивает подтверждение и удаляет ТОЛЬКО при «да»."""
+        # exact-replay/tombstone ДО not-found/confirm (Codex+субагент R1 MAJOR): повтор того же
+        # cancel-хода → сохранённый payload, даже если строка уже исчезла/неактивна.
+        done = _replay_done(action="cancel", entity_type="family_reminder",
+                            entity_id=reminder_ref, args={})
+        if done is not None:
+            return done
         r = session.get(FamilyReminder, reminder_ref)
         if r is None or r.tenant_id != tenant_id or r.user_id != user_id:
             return "Такого напоминания у тебя нет."
@@ -1015,6 +1039,11 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         """Общий confirm-wrapper для cancel/delete задачи: снимок→interrupt→durable-мутация.
         ``apply(ref, commit)`` делает мутацию (commit владеет helper). exact-replay + tombstone
         (op-результат) на ReAct-пути; вне ctx — self-commit (легаси)."""
+        # exact-replay/tombstone ДО not-found/confirm (Codex+субагент R1 MAJOR): повтор того же
+        # cancel/delete-хода → сохранённый payload, даже если строка задачи уже удалена/отменена.
+        done = _replay_done(action=action, entity_type="task", entity_id=task_ref, args={})
+        if done is not None:
+            return done
         t = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001 — внутр. lookup сервиса
         if t is None:
             return "Такой задачи у тебя нет."
@@ -1036,6 +1065,10 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     @tool
     def cancel_task(task_ref: str) -> str:
         """Отменить задачу по ref. САМ спрашивает подтверждение."""
+        # exact-replay ДО pre-check (иначе «уже отменена» перехватил бы replay раньше op-результата).
+        done = _replay_done(action="cancel", entity_type="task", entity_id=task_ref, args={})
+        if done is not None:
+            return done
         # idempotent pre-check (Codex MAJOR): уже отменена → не переспрашивать.
         t0 = tasks._get(tenant_id, user_id, task_ref)  # noqa: SLF001
         if t0 is not None and t0.status == "cancelled":

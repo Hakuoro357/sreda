@@ -157,6 +157,58 @@ def test_update_reminder_replay_after_delete_returns_stored_163(db_session):
     assert r2 == r1, f"replay после удаления → сохранённый payload, не «не найдено»: {r2!r}"
 
 
+def test_delete_task_tombstone_replay_163(db_session, monkeypatch):
+    """#163 Фаза 3a-3 named-Z: replay delete_task ПОСЛЕ исчезновения строки задачи → сохранённый
+    payload (tombstone op-результата), не «не найдено». Без фикса peek вернулось бы «нет»."""
+    from datetime import date
+    from sreda.db.models.tasks import Task
+
+    monkeypatch.setattr(react_loop, "interrupt", lambda *a, **k: "да")
+    u = seed_telegram_user(db_session); db_session.commit()
+    tid = f"task_{uuid4().hex[:20]}"
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title="удаляемая",
+                        scheduled_date=date(2030, 6, 20), status="pending",
+                        created_at=now, updated_at=now))
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                             tool_name="delete_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx):
+        r1 = tools["delete_task"].invoke({"task_ref": tid})
+    assert r1.startswith("Готово, удаляю"), r1
+    assert db_session.get(Task, tid) is None  # строка удалена
+    with bind_tool_runtime(ctx):
+        r2 = tools["delete_task"].invoke({"task_ref": tid})
+    assert r2 == r1, f"replay после hard-delete → сохранённый payload (tombstone): {r2!r}"
+
+
+def test_cancel_task_exact_replay_163(db_session, monkeypatch):
+    """#163 Фаза 3a-3 named-X: повтор cancel_task (тот же ctx→op_id) → сохранённый payload."""
+    from datetime import date
+    from sreda.db.models.tasks import Task
+
+    monkeypatch.setattr(react_loop, "interrupt", lambda *a, **k: "да")
+    u = seed_telegram_user(db_session); db_session.commit()
+    tid = f"task_{uuid4().hex[:20]}"
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title="отменяемая",
+                        scheduled_date=date(2030, 6, 20), status="pending",
+                        created_at=now, updated_at=now))
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+    ctx = ToolRuntimeContext(operation_id="o1", execution_id="e1", step_id="s1",
+                             tool_name="cancel_task", tenant_id=u.tenant_id,
+                             user_id=u.user_id, turn_key="tk1")
+    with bind_tool_runtime(ctx):
+        r1 = tools["cancel_task"].invoke({"task_ref": tid})
+    assert r1.startswith("Готово, отменяю"), r1
+    with bind_tool_runtime(ctx):
+        r2 = tools["cancel_task"].invoke({"task_ref": tid})
+    assert r2 == r1, f"replay cancel → сохранённый payload: {r2!r}"
+
+
 def _cancel_script(rid: str) -> _StubLLM:
     return _StubLLM([
         AIMessage(content="", tool_calls=[{

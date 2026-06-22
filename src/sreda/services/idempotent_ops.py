@@ -59,6 +59,26 @@ def _lookup(session: Any, operation_id: str) -> ToolOperationResult | None:
     )
 
 
+def peek_committed_replay(
+    session: Any, *, operation_id: str, tenant_id: str, user_id: str | None,
+    operation_family: str, args_hmac: str,
+) -> Any | None:
+    """#163 Фаза 3: read-only «уже сделано?» ДО not-found/interrupt у destructive-инструментов.
+
+    Если op_id уже committed с тем же scope+args (replay/tombstone) → сохранённый payload (exact-replay,
+    в т.ч. после hard-delete — строка сущности исчезла, op-результат жив). Иначе (нет строки / pending /
+    mismatch) → None: вызывающий идёт обычным путём (not-found → confirm → execute_idempotent_durable_op,
+    который и разрулит pending/mismatch claim'ом). Мутаций не делает, commit не трогает."""
+    row = _lookup(session, operation_id)
+    if (row is not None and row.status == "committed"
+            and row.tenant_id == tenant_id
+            and (row.user_id or None) == (user_id or None)
+            and row.operation_family == operation_family
+            and row.args_hmac == args_hmac):
+        return row.stable_return_payload
+    return None
+
+
 def find_existing_pending_semantic(
     session: Any, model: Any, *, tenant_id: str, user_id: str | None, nhash: str,
 ) -> Any:
