@@ -15,7 +15,7 @@ from sreda.db.models.core import Tenant
 
 def test_active_tenant_is_active(db_session):
     seed_telegram_user(db_session, tenant_id="t_active")
-    db_session.flush()  # материализовать строку (как deleted-тест через .get())
+    db_session.flush()  # симметрия с deleted-тестом; autoflush=True и так материализовал бы
     assert is_tenant_active(db_session, "t_active") is True
 
 

@@ -71,6 +71,16 @@ def test_migration_0063_downgrade_then_upgrade(alembic_cfg):
     idx = {ix["name"] for ix in insp.get_indexes("tenants")}
     assert "ix_tenants_deleted_at" in idx, f"нет partial-индекса ix_tenants_deleted_at; got {sorted(idx)}"
 
+    # Пиним именно PARTIAL (не full index): SQLite-инспектор не отдаёт WHERE-предикат
+    # в get_indexes(), поэтому читаем DDL из sqlite_master (ревью Ф0: все 3 гейта MINOR).
+    with engine.connect() as conn:
+        ddl = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='ix_tenants_deleted_at'"
+        )).scalar()
+    assert ddl is not None and "deleted_at IS NOT NULL" in ddl, (
+        f"индекс должен быть PARTIAL (WHERE deleted_at IS NOT NULL), не full; DDL={ddl!r}"
+    )
+
     # Существующий тенант остался активным: deleted_at=NULL (аддитивно, без backfill).
     with engine.connect() as conn:
         val = conn.execute(
