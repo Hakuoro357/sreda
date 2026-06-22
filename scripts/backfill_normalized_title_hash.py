@@ -236,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         "--only",
         choices=[s.label for s in TABLES],
         default=None,
-        help="Restrict to a single table (default: all 5).",
+        help="Restrict to a single table (default: all 3).",
     )
     args = parser.parse_args(argv)
 
