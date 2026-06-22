@@ -792,10 +792,14 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 mutate_fn=lambda: mutate(False), tool_name=action)
         except IdempotencyInFlight:
             return "Секунду, эта правка уже в обработке — повтори, если не дошло."
-        except (IdempotencyArgsMismatch, IdempotencyScopeMismatch):
-            # внутренняя коллизия ключа (не user-facing): не блокируем — применяем напрямую.
-            logger.warning("idempotent update внутренняя коллизия op=%s — применяю напрямую", op_id)
-            return mutate(True)
+        except (IdempotencyArgsMismatch, IdempotencyScopeMismatch) as exc:
+            # Внутренняя коллизия operation_id (он должен быть уникален на tool_call → это баг-сигнал).
+            # НЕ применяем напрямую (мимо R1 MAJOR: mutate(True) тут = возможный double-apply поверх
+            # уже применённой операции). Фейлим безопасно + алертим; ретрай в НОВОМ ходу даст новый
+            # op_id (новый step_id) → коллизии не будет → применится.
+            logger.error("idempotent durable op=%s внутренняя коллизия (%s) — НЕ применяю",
+                         op_id, type(exc).__name__)
+            return "Не смогла безопасно применить правку (внутренняя сверка) — попробуй ещё раз."
 
     # ---- напоминания ----------------------------------------------------
     def _active_reminders() -> list:
@@ -863,7 +867,8 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
 
         return _idempotent_write(
             action="update", entity_type="family_reminder", entity_id=reminder_ref,
-            args={"title": title, "trigger_iso": trigger_iso}, mutate=_mut)
+            # эффективные args (мимо R1 MINOR: "" → None, как в самой мутации) → стабильный hmac.
+            args={"title": title or None, "trigger_iso": trigger_iso or None}, mutate=_mut)
 
     @tool
     def cancel_reminder(reminder_ref: str) -> str:

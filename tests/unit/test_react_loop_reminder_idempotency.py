@@ -103,3 +103,34 @@ def test_schedule_reminder_legacy_no_ctx_unchanged(db_session):
         .all()
     )
     assert len(rows) == 2, "легаси-путь без ctx — без дедупа, 2 вызова = 2 строки"
+
+
+def test_reminders_update_commit_false_does_not_persist_163():
+    """#163 Фаза 3 (субагент CRITICAL R1): update(commit=False) НЕ коммитит — durable-helper владеет
+    commit. На сессии С СОБСТВЕННОЙ транзакцией (не обёртка conftest), иначе двойной commit
+    маскируется. Со старым багом (безусловный commit) rollback НЕ откатил бы → тест RED."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from sreda.db.base import Base
+    from sreda.db.models.core import Tenant, User
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.services.housewife_reminders import HousewifeReminderService
+
+    eng = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(eng)
+    s = sessionmaker(bind=eng)()
+    s.add(Tenant(id="t1", name="T"))
+    s.add(User(id="u1", tenant_id="t1"))
+    when = datetime(2030, 1, 1, 9, 0, tzinfo=timezone.utc)
+    s.add(FamilyReminder(id="rem_x", tenant_id="t1", user_id="u1", title="старое",
+                         trigger_at=when, next_trigger_at=when, status="pending"))
+    s.commit()
+    HousewifeReminderService(s).update(tenant_id="t1", reminder_id="rem_x",
+                                       title="новое", commit=False)
+    assert s.get(FamilyReminder, "rem_x").title == "новое"  # в сессии видно (flush)
+    s.rollback()  # commit=False → НЕ зафиксировано → откат вернёт старое
+    assert s.get(FamilyReminder, "rem_x").title == "старое", \
+        "commit=False не должен фиксировать (иначе двойной commit ломает атомарность claim+мутация)"

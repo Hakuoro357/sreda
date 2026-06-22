@@ -410,7 +410,10 @@ class HousewifeReminderService:
             rem.recurrence_rule = rrule_value
 
         rem.updated_at = _utcnow()
-        self.session.commit()
+        if commit:  # #163 Фаза 3: на ctx-пути commit владеет durable-helper (claim+мутация атомарны)
+            self.session.commit()
+        else:
+            self.session.flush()
         return rem
 
     def list_active(
