@@ -10,7 +10,6 @@ from sreda.db.models.billing import TenantSubscription
 from sreda.config.settings import get_settings
 from sreda.db.base import Base
 from sreda.db.models.core import (
-    Assistant,
     InboundMessage,
     Job,
     OutboxMessage,
@@ -334,107 +333,13 @@ def test_telegram_webhook_handles_status_command(
     assert outbox[0].status == "sent"
 
 
-def test_telegram_webhook_handles_connect_subscription_callback(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "test.db"
-    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
-    sent_messages: list[dict] = []
-    answered_callbacks: list[dict] = []
-
-    async def fake_send_message(
-        self,
-        chat_id: str,
-        text: str,
-        parse_mode: str | None = None,
-        reply_markup: dict | None = None,
-    ) -> dict:
-        sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
-        return {"ok": True}
-
-    async def fake_answer_callback_query(self, callback_query_id: str, text: str | None = None) -> dict:
-        answered_callbacks.append({"id": callback_query_id, "text": text})
-        return {"ok": True}
-
-    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
-    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
-    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
-    monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
-    monkeypatch.setattr(TelegramClient, "answer_callback_query", fake_answer_callback_query)
-    _allow_housewife_entitlement(monkeypatch)
-
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-    Base.metadata.create_all(get_engine())
-    session = get_session_factory()()
-    try:
-        # approved_at set explicitly: approval gate (2026-04-23) silent-
-        # drops tenants with NULL; existing users were auto-approved by
-        # migration, so tests mirror that.
-        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
-        session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
-        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
-        # 2026-04-27: бипасс state-machine онбординга в webhook'е
-        # (имя+форма обращения должны быть заполнены, иначе вместо
-        # обычного chat-flow приходит вопрос «как тебя зовут?»).
-        from sreda.db.models.user_profile import TenantUserProfile as _TUP
-        session.add(_TUP(
-            id="tup_test", tenant_id="tenant_1", user_id="user_1",
-            display_name="Тестовый Юзер", address_form="ty",
-        ))
-        _mark_existing_user_welcome_sent(session)
-        session.commit()
-    finally:
-        session.close()
-
-    client = TestClient(create_app())
-    payload = {
-        "update_id": 9002,
-        "callback_query": {
-            "id": "cb_1",
-            "data": "billing:connect_plan:eds_monitor_base",
-            "message": {
-                "message_id": 11,
-                "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
-            },
-        },
-    }
-
-    response = client.post("/webhooks/telegram/sreda", json=payload)
-
-    assert response.status_code == 202
-    _wait_for(lambda: len(answered_callbacks) == 1 and len(sent_messages) == 1)
-    assert len(answered_callbacks) == 1
-    assert len(sent_messages) == 1
-    # #181 Phase B: eds_monitor fully retired. The legacy connect callback
-    # still routes (no 404 / silent drop) but the handler is a hardcoded
-    # tombstone — the reply is the disabled notice and NO subscription is created.
-    assert "Это умение отключено." in sent_messages[0]["text"]
-
-    session = get_session_factory()()
-    try:
-        subscriptions = session.query(TenantSubscription).all()
-        jobs = session.query(Job).filter(Job.job_type == "agent.execute_action").all()
-        runs = session.query(AgentRun).all()
-        outbox = session.query(OutboxMessage).all()
-    finally:
-        session.close()
-
-    assert len(subscriptions) == 0  # no-op: nothing written
-    assert len(jobs) == 1
-    assert len(runs) == 1
-    assert len(outbox) == 1
-
-
 def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "test.db"
     key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+    send_attempts: list[str] = []
 
     async def failing_send_message(
         self,
@@ -443,6 +348,10 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
         parse_mode: str | None = None,
         reply_markup: dict | None = None,
     ) -> dict:
+        # Record the attempt BEFORE raising so the test can prove the delivery
+        # path actually ran — not silently skipped after the eds_monitor
+        # tombstone made "0 subscriptions" trivially true.
+        send_attempts.append(chat_id)
         raise TelegramDeliveryError("timeout")
 
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
@@ -493,6 +402,14 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
     response = client.post("/webhooks/telegram/sreda", json=payload)
 
     assert response.status_code == 202
+    # The webhook returns 202 immediately (202-first), then processes in a
+    # background task. Wait until the delivery path actually invokes
+    # send_message and assert it did — that raising call IS the timeout path
+    # this test guards. Without it, "202 + 0 subscriptions" would pass even if
+    # the callback became a silent no-op that never reached Telegram delivery
+    # (Codex MAJOR, #188).
+    _wait_for(lambda: len(send_attempts) >= 1)
+    assert len(send_attempts) >= 1
 
     session = get_session_factory()()
     try:
@@ -621,103 +538,6 @@ def test_telegram_webhook_accepts_request_with_matching_secret_token(
     )
 
     assert response.status_code == 202
-
-
-def test_telegram_webhook_handles_claim_lookup_command(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "claim_webhook.db"
-    key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
-    sent_messages: list[dict] = []
-
-    async def fake_send_message(
-        self,
-        chat_id: str,
-        text: str,
-        parse_mode: str | None = None,
-        reply_markup: dict | None = None,
-    ) -> dict:
-        sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
-        return {"ok": True}
-
-    monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
-    monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
-    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
-    monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
-    _allow_housewife_entitlement(monkeypatch)
-
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-    Base.metadata.create_all(get_engine())
-    session = get_session_factory()()
-    try:
-        # approved_at set explicitly: approval gate (2026-04-23) silent-
-        # drops tenants with NULL; existing users were auto-approved by
-        # migration, so tests mirror that.
-        session.add(Tenant(id="tenant_1", name="Tenant 1", approved_at=_dt.now(_tz.utc)))
-        session.add(Workspace(id="workspace_tg_100000003", tenant_id="tenant_1", name="Workspace 1"))
-        session.flush()
-        session.add(Assistant(id="assistant_1", tenant_id="tenant_1", workspace_id="workspace_tg_100000003", name="Sreda"))
-        session.add(User(id="user_1", tenant_id="tenant_1", telegram_account_id=EXISTING_CHAT_ID))
-        # 2026-04-27: бипасс state-machine онбординга в webhook'е
-        # (имя+форма обращения должны быть заполнены, иначе вместо
-        # обычного chat-flow приходит вопрос «как тебя зовут?»).
-        from sreda.db.models.user_profile import TenantUserProfile as _TUP
-        session.add(_TUP(
-            id="tup_test", tenant_id="tenant_1", user_id="user_1",
-            display_name="Тестовый Юзер", address_form="ty",
-        ))
-        _mark_existing_user_welcome_sent(session)
-        # #181 Phase B: /claim is a retired eds_monitor command — the EDS data
-        # models (EDSAccount/EDSClaimState/EDSChangeEvent) are gone, so there is
-        # nothing to seed. The handler is a hardcoded tombstone regardless of
-        # any stored state.
-        session.commit()
-    finally:
-        session.close()
-
-    client = TestClient(create_app())
-    payload = {
-        "update_id": 9010,
-        "message": {
-            "message_id": 21,
-            "chat": {"id": int(EXISTING_CHAT_ID), "type": "private"},
-            "text": "/claim 6230173",
-        },
-    }
-
-    response = client.post("/webhooks/telegram/sreda", json=payload)
-
-    from sreda.services.ack_messages import all_phrases
-
-    assert response.status_code == 202
-    # Fast ack (index 0) + real claim reply (index 1).
-    _wait_for(lambda: len(sent_messages) == 2)
-    assert len(sent_messages) == 2
-    assert sent_messages[0]["text"] in all_phrases()
-    real_reply = sent_messages[1]
-    # #181: /claim is an eds_monitor feature — tombstoned. The command still
-    # routes and the run completes, but the reply is the disabled notice, not
-    # a claim card.
-    assert "Это умение отключено." in real_reply["text"]
-    assert "Заявка #6230173" not in real_reply["text"]
-
-    session = get_session_factory()()
-    try:
-        jobs = session.query(Job).filter(Job.job_type == "agent.execute_action").all()
-        runs = session.query(AgentRun).all()
-        outbox = session.query(OutboxMessage).all()
-    finally:
-        session.close()
-
-    assert len(jobs) == 1
-    assert len(runs) == 1
-    assert runs[0].action_type == "claim.lookup"
-    assert runs[0].status == "completed"
-    assert len(outbox) == 1
 
 
 def test_telegram_webhook_rejects_unknown_bot_key(
