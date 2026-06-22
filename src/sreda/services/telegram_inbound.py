@@ -213,7 +213,24 @@ async def _process_approved_turn_locked(
     """
     SessionLocal = get_session_factory()
     bg_session: Session = SessionLocal()
+    # #187 Phase 2b БАРЬЕР: держим session-scoped advisory-lock на тенанта весь
+    # ход (взять первым делом, отпустить в finally). soft_delete_tenant берёт ТОТ
+    # ЖЕ лок ДО флага+drain → ждёт этот in-flight ход и дренит после. На SQLite
+    # (тесты) — no-op. Дополняет in-process tenant_lock (тот сериализует ходы в
+    # одном процессе; advisory — cross-process против админ-delete). ExitStack —
+    # симметричный unlock на любом пути выхода без переиндентации тела хода.
+    from contextlib import ExitStack
+
+    from sreda.services.tenant_lifecycle import tenant_advisory_lock
+    _barrier = ExitStack()
     try:
+        # #187 R2 MAJOR: enter_context ВНУТРИ try (зеркало MAX
+        # ``_process_approved_turn``) — если захват advisory-лока бросит,
+        # ``finally`` ниже всё равно закроет bg_session (раньше enter_context был
+        # ДО try → исключение из захвата лока утекало bg_session).
+        _barrier.enter_context(
+            tenant_advisory_lock(bg_session, onboarding.tenant_id)
+        )
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
         )
@@ -518,6 +535,10 @@ async def _process_approved_turn_locked(
     except Exception:  # noqa: BLE001
         logger.exception("background turn processing crashed")
     finally:
+        # #187 Phase 2b: отпустить advisory-lock ДО close() сессии. Лок session-
+        # scoped — закрытие соединения тоже снимет его, но явный unlock держит
+        # симметрию с soft_delete_tenant и не зависит от порядка GC.
+        _barrier.close()
         bg_session.close()
 
 

@@ -858,6 +858,22 @@ async def _process_approved_max_turn(
     settings = get_settings()
     # Cut-off time для outbox correlation (используется в ack delete polling).
     turn_started_at = datetime.now(timezone.utc)
+    # #187 Phase 2b БАРЬЕР: держим session-scoped advisory-lock на тенанта весь
+    # ход (зеркало TG ``_process_approved_turn_locked``). soft_delete_tenant
+    # берёт ТОТ ЖЕ лок ДО флага+drain → ждёт in-flight ход и дренит после. На
+    # SQLite — no-op. Дополняет in-process tenant_lock (cross-process барьер).
+    #
+    # 🔴 ПОРЯДОК ЛОКОВ (R1 CRITICAL): advisory берётся ВНУТРИ in-process
+    # ``tenant_lock`` (ниже, после ``async with tenant_lock``) — ЗЕРКАЛО TG
+    # (``telegram_inbound``: asyncio-lock OUTERMOST, advisory INNER). Если взять
+    # advisory ПЕРВЫМ (как было), а ``pg_advisory_lock`` заблокируется на чужом
+    # держателе, корутина встанет под блокирующим SQL ДО входа в ``tenant_lock``
+    # → весь event loop потенциально зависает на синхронном вызове, а порядок
+    # вложенности расходится с TG (риск перекрёстного дедлока на двух каналах
+    # одного тенанта). Поэтому ExitStack заполняется ВНУТРИ ``tenant_lock``.
+    from contextlib import ExitStack
+
+    _barrier = ExitStack()
     try:
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
@@ -899,6 +915,15 @@ async def _process_approved_max_turn(
                 onboarding.tenant_id, inbound_message_id,
             )
         async with tenant_lock:
+            # #187 Phase 2b: advisory-lock берётся ЗДЕСЬ, ВНУТРИ tenant_lock
+            # (зеркало TG). Держится до конца хода; отпускается в общем
+            # ``finally`` через ``_barrier.close()``. tenant_lock (asyncio)
+            # сериализует ходы тенанта В ЭТОМ процессе ПЕРВЫМ; advisory —
+            # cross-process барьер против админ-delete — берётся ПОД ним.
+            from sreda.services.tenant_lifecycle import tenant_advisory_lock
+            _barrier.enter_context(
+                tenant_advisory_lock(bg_session, onboarding.tenant_id)
+            )
             # message_callback (inline-button tap): обработать ДО
             # dispatch'а / voice. Inline-handlers (rem_done/rem_snooze/
             # btn_reply/pb) выполняются здесь — DB updates + answer_callback
@@ -1292,6 +1317,8 @@ async def _process_approved_max_turn(
             onboarding.tenant_id, inbound_message_id,
         )
     finally:
+        # #187 Phase 2b: отпустить advisory-lock ДО close() (симметрия с TG).
+        _barrier.close()
         bg_session.close()
 
 
