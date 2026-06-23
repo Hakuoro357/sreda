@@ -98,9 +98,11 @@ class HousewifeFamilyService:
         key = _normalise_name(clean_name)
         for existing in self.list_members(tenant_id=tenant_id, user_id=user_id):
             if _normalise_name(existing.name) == key:
+                # #202 (Codex medium R1 MAJOR): НЕ логируем имя (ПД) — на ctx-пути (ReAct) это нарушает
+                # PII-правило проекта. Достаточно tenant/user/id существующей строки.
                 logger.info(
-                    "add_member: dedup hit tenant=%s user=%s name=%r → existing id=%s",
-                    tenant_id, user_id, clean_name, existing.id,
+                    "add_member: dedup hit tenant=%s user=%s → existing id=%s",
+                    tenant_id, user_id, existing.id,
                 )
                 return existing
 
@@ -279,10 +281,13 @@ class HousewifeFamilyService:
         dropped. Untitled / non-dict rows have no name and are not reported."""
         result = AddFamilyMembersResult()
         seen_in_batch: set[str] = set()
-        existing_keys = {
-            _normalise_name(m.name)
-            for m in self.list_members(tenant_id=tenant_id, user_id=user_id)
-        }
+        existing_members = self.list_members(tenant_id=tenant_id, user_id=user_id)
+        existing_keys = {_normalise_name(m.name) for m in existing_members}
+        # #202: id уже-существующих + созданных В ЭТОМ батче — для by-name классификации МОРФО-дубля
+        # (одна лемма, мимо whitespace-_normalise_name): add_member на ctx-пути вернёт РАНЕЕ созданную
+        # строку (op_id/hash pre-check схлопнул) → НЕ считать «созданным» дважды (контракт #115).
+        existing_ids = {m.id for m in existing_members}
+        created_ids: set[str] = set()
         for raw in members or []:
             if not isinstance(raw, dict):
                 continue
@@ -311,7 +316,14 @@ class HousewifeFamilyService:
                 result.invalid.append(name)  # #115 nameable validation drop
                 continue
             existing_keys.add(key)
-            result.created.append(row)
+            # #202: классифицируем по id результата add_member (морфо-дубль мимо whitespace-дедупа).
+            if row.id in existing_ids:
+                result.duplicates_existing.append(name)  # морфо-дубль уже-существующего члена
+            elif row.id in created_ids:
+                result.duplicates_in_batch.append(name)  # морфо-дубль в этом же батче
+            else:
+                created_ids.add(row.id)
+                result.created.append(row)
         return result
 
     # ------------------------------------------------------------------

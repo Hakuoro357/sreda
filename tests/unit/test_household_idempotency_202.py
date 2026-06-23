@@ -81,6 +81,16 @@ def test_add_members_batch_morpho_no_crash_202(s):
     rows = s.query(FamilyMember).all()
     op_ids = [r.operation_id for r in rows if r.operation_id is not None]
     assert len(op_ids) == len(set(op_ids)), "op_id в БД уникальны (нет коллизии)"
+    # by-name контракт #115 (Codex/субагент R1 MAJOR): морфо-дубль в created НЕ задваивается; если
+    # лемматизация схлопнула — «Маши» помечен как duplicate_in_batch, иначе обе created (нет коллизии).
+    from sreda.services.operation_id import compute_normalized_title_hash as _h
+    if _h("Маша", entity_type="family_member", tenant_id="t1", user_id="u1") == \
+       _h("Маши", entity_type="family_member", tenant_id="t1", user_id="u1"):
+        assert len(rows) == 1, "одна лемма → одна строка"
+        assert len(res.created) == 1, "created НЕ задваивает морфо-дубль (#115)"
+        assert "Маши" in res.duplicates_in_batch, "морфо-дубль помечен duplicate_in_batch (#115)"
+    created_ids = [c.id for c in res.created]
+    assert len(created_ids) == len(set(created_ids)), "created не содержит одну строку дважды"
 
 
 def test_add_member_hash_dedup_catches_morpho_202(s):
