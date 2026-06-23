@@ -262,6 +262,11 @@ class ReactState(MessagesState):
     # #165 Срез A guard: семьи, уже пробованные подстраховкой в ЭТОМ ходу (один retry на
     # семью), и счётчик проходов chat (анти-петля, лимит _MAX_TURN_PASSES). Last-value каналы.
     guard_attempted_families: list[str]
+    # #202 (Codex medium R2 CRITICAL): один раз за ход guard сделал FULL-recovery (добрал ВСЕ ленивые
+    # семьи) — для канон-интента мимо словаря-роутера (напр. «план кроя» → checklists), чтобы pruned-
+    # тенант не остался без инструмента. Цена — один лишний прогон на вне-скоупном отказе (итог тот же).
+    # Last-value канал; гейтит повторное full-recovery (анти-петля).
+    guard_full_attempted: bool
     turn_pass_count: int
     # wrote_unkeyed: в ходу уже отработал инструмент unkeyed-write семьи → guard ОТКЛЮЧЁН
     # (анти-дубль на recovery-проходе, Codex medium R3). Last-value канал.
@@ -1593,16 +1598,19 @@ def _build_graph(llm: Any, all_tools: list, *,
         # → подстраховка (один retry на семью). scope-отказ (нет семьи в срезе) НЕ триггерит.
         if passes < _MAX_TURN_PASSES \
                 and _looks_like_refusal(getattr(last, "content", "")):
-            # active-aware: первая НЕзагруженная семья по словарю (recovery, не уже-загруженный top-1)
-            fam = _guard_family(_last_human_text(state["messages"]),
-                                state.get("active_families"))
-            if fam and fam not in (state.get("guard_attempted_families") or ()):
-                # R4 (Codex medium): unkeyed-write уже был в ходу → guard ОТКЛЮЧЁН (повтор задвоил бы).
-                # R5 (Kimi): логируем СОБЫТИЕ подавления — наблюдаемость для канарейки (как часто
-                # backstop реально нужен, но подавлен). need_family остаётся модель-driven путём.
-                if state.get("wrote_unkeyed"):
-                    logger.info("react: guard подавлен после unkeyed-write (семья %s не добрана)", fam)
-                else:
+            # R4 (Codex medium): unkeyed-write уже был в ходу → guard ОТКЛЮЧЁН (повтор задвоил бы
+            # сущность). R5 (Kimi): логируем подавление — наблюдаемость для канарейки.
+            if state.get("wrote_unkeyed"):
+                logger.info("react: guard подавлен после unkeyed-write")
+            else:
+                # active-aware: первая НЕзагруженная семья по словарю (recovery, не уже-загруженный top-1)
+                fam = _guard_family(_last_human_text(state["messages"]),
+                                    state.get("active_families"))
+                attempted = state.get("guard_attempted_families") or ()
+                # router нашёл НОВУЮ семью → точечный добор; ИЛИ роутер промахнулся (канон-интент мимо
+                # словаря, напр. «план кроя» → checklists; Codex medium R2 CRITICAL) и FULL-recovery ещё
+                # не делали → guard добёрет ВСЕ ленивые семьи (на отказе ничего не записано → безопасно).
+                if (fam and fam not in attempted) or not state.get("guard_full_attempted"):
                     return "guard"
         return END
 
@@ -1611,18 +1619,33 @@ def _build_graph(llm: Any, all_tools: list, *,
         # сообщением в истории) → обратно в chat. turn_pass_count инкрементит chat. Один retry
         # на семью; если после него модель снова откажет — route не вернёт guard (в attempted).
         active = list(state.get("active_families") or [])
-        fam = _guard_family(_last_human_text(state["messages"]), active)
         attempted = list(state.get("guard_attempted_families") or [])
-        if fam and fam not in active:
-            active.append(fam)
+        fam = _guard_family(_last_human_text(state["messages"]), active)
+        update: dict = {}
         if fam and fam not in attempted:
+            # точечный добор семьи по словарю-роутеру
+            if fam not in active:
+                active.append(fam)
             attempted.append(fam)
-        return {
+            nudge = (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
+                     "инструментом, не отвечай «не умею».")
+        else:
+            # FULL-recovery (Codex medium R2 CRITICAL): роутер не дал новой семьи, но юзер получил
+            # отказ → на отказе ничего не записано (wrote_unkeyed отфильтрован в route) → безопасно
+            # добрать ВСЕ ленивые семьи на ретрай. Один раз за ход (guard_full_attempted). Канон-интент
+            # мимо словаря (напр. «план кроя» → checklists) детерминированно получит инструмент.
+            for f in _LAZY_FAMILIES:
+                if f not in active:
+                    active.append(f)
+            update["guard_full_attempted"] = True
+            nudge = ("Все инструменты теперь доступны — выполни запрос пользователя, "
+                     "не отвечай «не умею».")
+        update.update({
             "active_families": active,
             "guard_attempted_families": attempted,
-            "guard_nudge": (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
-                            "инструментом, не отвечай «не умею»."),
-        }
+            "guard_nudge": nudge,
+        })
+        return update
 
     def stop(state: ReactState):
         # АНТИ-ПЕТЛЯ: лимит проходов исчерпан. Закрываем висящие tool_calls парными

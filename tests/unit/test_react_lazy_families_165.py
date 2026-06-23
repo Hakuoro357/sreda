@@ -131,13 +131,16 @@ async def test_guard_loads_family_when_model_refuses(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_guard_does_not_fire_on_out_of_scope(db_session):
-    """Срез A пункт 2 (анти-false-positive): вне-скоупная просьба («оплати счёт» — нет семьи
-    в срезе) → guard НЕ триггерит, отказ отдаётся как есть, один проход."""
+async def test_guard_full_recovery_then_ends_on_out_of_scope(db_session):
+    """#202: вне-скоупная просьба («оплати счёт» — инструмента нет вообще) → отказ → guard делает
+    ОДНУ попытку полного восстановления (добор всех семей; вдруг канон-интент мимо словаря) → Среда
+    снова отказывает (дела нет) → ход завершается отказом. Цена — один лишний прогон, итог корректный
+    («не умею»). Анти-петля: повторно guard не дёргается (guard_full_attempted)."""
     u = seed_telegram_user(db_session)
     db_session.commit()
     scripted = [
-        AIMessage(content="Извини, оплачивать счета я не умею."),  # ОТКАЗ, нет семьи
+        AIMessage(content="Извини, оплачивать счета я не умею."),  # отказ → full-recovery
+        AIMessage(content="Извини, это я пока не умею."),          # после восстановления — снова отказ
         AIMessage(content="..."),
     ]
     stub = _RecordingStubLLM(scripted)
@@ -146,8 +149,8 @@ async def test_guard_does_not_fire_on_out_of_scope(db_session):
         thread_id="lazy165-oos", llm=stub, user_text="оплати счёт за свет",
         inbound_message_id="lazy165-oos-msg", channel="react")
 
-    # guard НЕ сработал → ровно ОДИН проход chat (нет повторного bind)
-    assert len(stub.binds) == 1, f"guard ложно сработал: {len(stub.binds)} проходов"
+    # guard сработал РОВНО раз (full-recovery), затем завершился (анти-петля guard_full_attempted)
+    assert len(stub.binds) == 2, f"ожидался один full-recovery retry, не больше: {len(stub.binds)}"
     assert "не умею" in (reply or "").lower()
 
 
@@ -388,3 +391,32 @@ async def test_need_family_loads_checklists_reachable_202(db_session):
     from sreda.db.models.checklists import Checklist
     rows = db_session.query(Checklist).filter(Checklist.tenant_id == u.tenant_id).all()
     assert any((c.title or "") == "план кроя" for c in rows), "чек-лист не создан через need_family"
+
+
+@pytest.mark.asyncio
+async def test_guard_full_recovery_on_router_miss_refusal_202(db_session):
+    """#202 (Codex medium R2 CRITICAL): канон-интент мимо словаря-роутера («план кроя» НЕ матчит
+    checklists-корни) на pruned-тенанте → модель отказывает БЕЗ need_family → guard делает FULL-recovery
+    (добирает ВСЕ ленивые семьи) → на ретрае create_checklist доступен и выполняется. Детерминированно,
+    без scripted need_family (доказывает ВОССТАНОВЛЕНИЕ, не только механизм добора)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
+    scripted = [
+        # пасс 1: checklists не предзагружен (роутер промахнулся) → модель отказывает БЕЗ инструмента
+        AIMessage(content="Извини, чек-листы пока не умею."),
+        # пасс 2: после guard FULL-recovery create_checklist в наборе → реальный вызов
+        AIMessage(content="", tool_calls=[{
+            "name": "create_checklist", "args": {"title": "план кроя"}, "id": "cc"}]),
+        AIMessage(content="Готово."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy202-full", llm=stub, user_text="план кроя",
+        inbound_message_id="lazy202-full-msg", channel="react")
+    assert "create_checklist" not in stub.binds[0], "роутер промахнулся по «план кроя» → не предзагружен"
+    assert len(stub.binds) >= 2 and "create_checklist" in stub.binds[1], (
+        "после guard FULL-recovery (отказ + промах роутера) create_checklist должен стать доступен")
+    from sreda.db.models.checklists import Checklist
+    rows = db_session.query(Checklist).filter(Checklist.tenant_id == u.tenant_id).all()
+    assert any((c.title or "") == "план кроя" for c in rows), "чек-лист не создан после full-recovery"
