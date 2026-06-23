@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from sreda.db.models.housewife_food import (
@@ -240,6 +241,28 @@ class HousewifeRecipeService:
                 title_clean, entity_type="recipe", tenant_id=tenant_id,
                 user_id=user_id or "") or None
 
+            # op_id ФУНКЦИОНАЛЕН, не декоративен (гейт R1: субагент+Codex high+medium): pre-check по
+            # op_id ловит повтор того же tool_call И морфовариант той же леммы в этом же батче (строка
+            # с тем же op_id уже flushed) → existing БЕЗ второй вставки (анти-IntegrityError, т.к.
+            # ix_recipes_operation_id UNIQUE). Затем hash — кросс-ходовой семантический ключ (лемма):
+            # ловит морфовариант, что fuzzy выше пропустил («Борщи»≠«Борщ» для fuzzy, одна лемма для hash).
+            existing_op = (
+                self.session.query(Recipe)
+                .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                .one_or_none()
+            )
+            if existing_op is not None:
+                return existing_op, False
+            if nhash_value is not None:
+                existing_hash = (
+                    self.session.query(Recipe)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id,
+                               normalized_title_hash=nhash_value)
+                    .first()
+                )
+                if existing_hash is not None:
+                    return existing_hash, False
+
         normalised_ings = _normalise_ingredients(ingredients)
 
         # cooking_time_minutes: cap to 1..600 (10 hours) — sanity limit
@@ -275,21 +298,35 @@ class HousewifeRecipeService:
             normalized_title_hash=nhash_value,
         )
         self.session.add(recipe)
-        # Flush so recipe.id is assignable as FK even before commit.
-        self.session.flush()
+        try:
+            # Flush so recipe.id is assignable as FK even before commit.
+            self.session.flush()
 
-        for idx, ing in enumerate(normalised_ings):
-            self.session.add(
-                RecipeIngredient(
-                    id=f"ring_{uuid4().hex[:20]}",
-                    recipe_id=recipe.id,
-                    title=ing.title,
-                    quantity_text=ing.quantity_text,
-                    is_optional=ing.is_optional,
-                    sort_order=idx,
+            for idx, ing in enumerate(normalised_ings):
+                self.session.add(
+                    RecipeIngredient(
+                        id=f"ring_{uuid4().hex[:20]}",
+                        recipe_id=recipe.id,
+                        title=ing.title,
+                        quantity_text=ing.quantity_text,
+                        is_optional=ing.is_optional,
+                        sort_order=idx,
+                    )
                 )
-            )
-        self.session.commit()
+            self.session.commit()
+        except IntegrityError:
+            # Гонка по operation_id (другой writer вставил тот же op_id между pre-check и commit) —
+            # на сингл-тенанте ReAct не ожидается, но fail-safe: откат + replay существующей (не крах).
+            self.session.rollback()
+            if op_id_value is not None:
+                racer = (
+                    self.session.query(Recipe)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                    .one_or_none()
+                )
+                if racer is not None:
+                    return racer, False
+            raise
         self._invalidate_cache(tenant_id, user_id)
         return recipe, True
 
@@ -421,6 +458,17 @@ class HousewifeRecipeService:
                 nhash_value = compute_normalized_title_hash(
                     title, entity_type="recipe", tenant_id=tenant_id,
                     user_id=user_id or "") or None
+                # #202 R1 (гейт): морфовариант той же леммы в батче (или повтор) → строка с тем же
+                # op_id уже flushed → схлопнуть как дубль БЕЗ второй вставки (анти-IntegrityError по
+                # UNIQUE ix_recipes_operation_id; in-batch dedup по _normalise_title их не ловит).
+                existing_op = (
+                    self.session.query(Recipe)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                    .one_or_none()
+                )
+                if existing_op is not None:
+                    result.duplicates_in_batch.append(title)
+                    continue
 
             recipe = Recipe(
                 id=f"rec_{uuid4().hex[:24]}",

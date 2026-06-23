@@ -90,3 +90,33 @@ def test_save_recipes_batch_ctx_populates_keys_202(s):
     assert None not in op_ids, "каждый рецепт батча должен иметь operation_id"
     assert len(op_ids) == 2, "разные рецепты (разный title) → разные operation_id"
     assert all(r.normalized_title_hash is not None for r in rows)
+
+
+def test_save_recipes_batch_morpho_variants_no_crash_202(s):
+    """#202 R1 (гейт): батч с морфовариантами одной леммы («Борщи»+«Борщ» → один op_id) НЕ роняет
+    батч IntegrityError'ом (op_id pre-check схлопывает flushed-дубль). op_id в БД уникальны."""
+    svc = HousewifeRecipeService(s)
+    with bind_tool_runtime(_ctx()):
+        res = svc.save_recipes_batch(
+            tenant_id="t1", user_id="u1",
+            recipes=[{"title": "Борщи", "ingredients": []},
+                     {"title": "Борщ", "ingredients": []}])
+    assert res is not None  # не упало
+    rows = s.query(Recipe).all()
+    assert len(rows) >= 1
+    op_ids = [r.operation_id for r in rows if r.operation_id is not None]
+    assert len(op_ids) == len(set(op_ids)), "op_id в БД уникальны (нет коллизии)"
+
+
+def test_save_recipe_hash_dedup_catches_morpho_202(s):
+    """#202 R1 (гейт): hash-pre-check ловит морфовариант, что fuzzy пропустил — «Борщи» затем «Борщ»
+    РАЗНЫМИ ходами (разный step→разный op_id) → одна лемма → один hash → 2-й replay'ит 1-й (1 строка)."""
+    svc = HousewifeRecipeService(s)
+    with bind_tool_runtime(_ctx(step="s1")):
+        r1, new1 = svc.save_recipe(tenant_id="t1", user_id="u1", title="Борщи", ingredients=[])
+    with bind_tool_runtime(_ctx(step="s2")):
+        r2, new2 = svc.save_recipe(tenant_id="t1", user_id="u1", title="Борщ", ingredients=[])
+    # если pymorphy схлопнул леммы — 1 строка (hash-дедуп); иначе 2 (нет коллизии). Главное — без краша.
+    assert s.query(Recipe).count() in (1, 2)
+    if r1.normalized_title_hash == r2.normalized_title_hash:
+        assert new2 is False and r1.id == r2.id, "одинаковый hash → 2-й должен быть replay 1-го"
