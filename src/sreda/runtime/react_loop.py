@@ -272,6 +272,11 @@ class ReactState(MessagesState):
     # #165 Срез A guard: семьи, уже пробованные подстраховкой в ЭТОМ ходу (один retry на
     # семью), и счётчик проходов chat (анти-петля, лимит _MAX_TURN_PASSES). Last-value каналы.
     guard_attempted_families: list[str]
+    # #202 (Codex medium R2 CRITICAL): один раз за ход guard сделал FULL-recovery (добрал ВСЕ ленивые
+    # семьи) — для канон-интента мимо словаря-роутера (напр. «план кроя» → checklists), чтобы pruned-
+    # тенант не остался без инструмента. Цена — один лишний прогон на вне-скоупном отказе (итог тот же).
+    # Last-value канал; гейтит повторное full-recovery (анти-петля).
+    guard_full_attempted: bool
     turn_pass_count: int
     # wrote_unkeyed: в ходу уже отработал инструмент unkeyed-write семьи → guard ОТКЛЮЧЁН
     # (анти-дубль на recovery-проходе, Codex medium R3). Last-value канал.
@@ -708,6 +713,20 @@ _CORE_TOOL_NAMES = frozenset({
     "delete_my_account",  # #187 Фаза 4b-2: self-delete (ядро, всегда привязан)
     "recall_memory", "need_family",
 })
+# #202 (Codex medium R3 CRITICAL): ядро-инструменты, ПИШУЩИЕ durable-данные пользователя. Они всегда
+# привязаны (вне ленивых семей) → их запись НЕ ставит wrote_unkeyed по семье. Но guard-recovery (особенно
+# FULL-recovery) на ретрае может ПЕРЕ-вызвать их: add_task БЕЗ даты не имеет семантического дедупа
+# (Борис: датовые-only) → дубль. Поэтому ЛЮБАЯ core-мутирующая запись тоже подавляет guard (как
+# rerun-unsafe). read- core (list_*, recall_memory, need_family, ask_human) — безопасны, сюда НЕ входят.
+# read-only ядро: безопасны к повтору на recovery (durable-данные не пишут).
+_CORE_READONLY_TOOLS = frozenset({
+    "list_reminders", "list_tasks", "recall_memory", "need_family", "ask_human",
+})
+# core-мутирующие ВЫВОДИМ как дополнение (Codex/субагент R4 MAJOR: НЕ второй ручной список — иначе
+# новый core-write забыли бы сюда → баг дубля вернулся бы тихо). FAIL-SAFE: новый core-инструмент по
+# умолчанию считается ПИШУЩИМ (не в read-only) → guard подавится → дубля не будет. Пин-тест
+# (test_core_mutating_derivation_202) ловит дрейф read-only набора (чтобы туда не попал write-инструмент).
+_CORE_MUTATING_TOOLS = _CORE_TOOL_NAMES - _CORE_READONLY_TOOLS
 # Валидные ленивые семьи — СИНХРОННО с Literal need_family ниже. run_tools ре-валидирует
 # arg против этого набора (Literal в схеме не гарантирует — модель может галлюцинировать).
 _LAZY_FAMILIES = frozenset({
@@ -786,10 +805,15 @@ _FAMILY_WRITE_POLICY: dict[str, str] = {
     "shopping": "idempotent",   # add_items — op_id+ON CONFLICT; mark/remove/update/clear — state-идемпотентны
     "web": "metered_read",      # fetch_url/get_weather — чтение; web_search — +счётчик квоты (терпим)
     "recipes": "idempotent",    # #202: save_recipe/batch на ctx-пути пишут op_id+hash; fuzzy-дедуп ловит повтор контента
-    "menu": "unkeyed",
-    "household": "unkeyed",
-    "checklists": "unkeyed",
-    "memory": "unkeyed",        # сохранение заметки без op_id
+    "menu": "idempotent",       # #202: state-идемпотентна БЕЗ op_id — plan_week UPSERT по (tenant,user,week);
+                                # set_cell по (plan,day,meal); clear по неделе. Повтор не дублирует (нет миграции)
+    "household": "idempotent",  # #202: add_member пишет op_id+hash (pre-check + батч-морфо guard через коммит-на-строку)
+    "checklists": "idempotent",  # #202: create_list пишет op_id+hash (pre-check); add_items — item-дедуп по title
+    "memory": "unkeyed",        # #202 ОСОЗНАННО оставлена unkeyed (НЕ прунабельна): (1) безопасна и так —
+                                # запись ставит wrote_unkeyed → guard подавлен → нет recovery-перевыпуска;
+                                # (2) recall дедупит near-дубли (cosine>0.95) → даже дубль-строка не видна;
+                                # (3) content-дедуп-на-сохранении семантически НЕВЕРЕН для episodic (повторные
+                                # события — разные записи); (4) выигрыш обрезки мал (recall_memory — core).
 }
 # ПРУНАБЕЛЬНОСТЬ (можно ОПУСТИТЬ семью из набора, если не нужна) — idempotent/readonly/metered_read.
 _PRUNABLE_FAMILIES = frozenset(
@@ -1582,8 +1606,19 @@ def _build_graph(llm: Any, all_tools: list, *,
             out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"],
                                    artifact={"result_kind": "ok",
                                              "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
-            if TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES:
-                wrote_unkeyed = True  # unkeyed-write выполнен → guard отключим (анти-дубль)
+            if (name in _CORE_MUTATING_TOOLS
+                    or TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES):
+                # rerun-unsafe запись (#202 Codex medium R3): core-мутирующая (add_task без даты — нет
+                # семантического дедупа) ИЛИ unkeyed-семья → guard/full-recovery ОТКЛЮЧАЕМ, иначе ретрай
+                # мог бы пере-вызвать запись (дубль). keyed-семьи (shopping/recipes/checklists) сюда НЕ
+                # входят — их повтор семантически дедупится, recovery после них безопасен.
+                # ОСОЗНАННАЯ КОНСЕРВАТИВНОСТЬ (Codex medium R4 vs субагент R4 — в напряжении): ставим
+                # флаг по ИМЕНИ инструмента, не по факту реальной записи. На no-op (add_task-дедуп-хит,
+                # cancel уже-отменённого) guard переподавится — но это БЕЗОПАСНАЯ сторона (дубля НЕ будет,
+                # сужается лишь редкий fallback; основной recovery через need_family НЕ задет). Точный
+                # детект «реально записал» пожертвовал бы drift-safety вывода _CORE_MUTATING. Если
+                # shadow-логи покажут частое переподавление → уточнить тогда (follow-up #165).
+                wrote_unkeyed = True
         update: dict = {"messages": out}
         if added:  # семья добрана → обновляем state (last-value канал)
             update["active_families"] = active
@@ -1605,16 +1640,19 @@ def _build_graph(llm: Any, all_tools: list, *,
         # → подстраховка (один retry на семью). scope-отказ (нет семьи в срезе) НЕ триггерит.
         if passes < _MAX_TURN_PASSES \
                 and _looks_like_refusal(getattr(last, "content", "")):
-            # active-aware: первая НЕзагруженная семья по словарю (recovery, не уже-загруженный top-1)
-            fam = _guard_family(_last_human_text(state["messages"]),
-                                state.get("active_families"))
-            if fam and fam not in (state.get("guard_attempted_families") or ()):
-                # R4 (Codex medium): unkeyed-write уже был в ходу → guard ОТКЛЮЧЁН (повтор задвоил бы).
-                # R5 (Kimi): логируем СОБЫТИЕ подавления — наблюдаемость для канарейки (как часто
-                # backstop реально нужен, но подавлен). need_family остаётся модель-driven путём.
-                if state.get("wrote_unkeyed"):
-                    logger.info("react: guard подавлен после unkeyed-write (семья %s не добрана)", fam)
-                else:
+            # R4 (Codex medium): unkeyed-write уже был в ходу → guard ОТКЛЮЧЁН (повтор задвоил бы
+            # сущность). R5 (Kimi): логируем подавление — наблюдаемость для канарейки.
+            if state.get("wrote_unkeyed"):
+                logger.info("react: guard подавлен после unkeyed-write")
+            else:
+                # active-aware: первая НЕзагруженная семья по словарю (recovery, не уже-загруженный top-1)
+                fam = _guard_family(_last_human_text(state["messages"]),
+                                    state.get("active_families"))
+                attempted = state.get("guard_attempted_families") or ()
+                # router нашёл НОВУЮ семью → точечный добор; ИЛИ роутер промахнулся (канон-интент мимо
+                # словаря, напр. «план кроя» → checklists; Codex medium R2 CRITICAL) и FULL-recovery ещё
+                # не делали → guard добёрет ВСЕ ленивые семьи (на отказе ничего не записано → безопасно).
+                if (fam and fam not in attempted) or not state.get("guard_full_attempted"):
                     return "guard"
         return END
 
@@ -1623,18 +1661,33 @@ def _build_graph(llm: Any, all_tools: list, *,
         # сообщением в истории) → обратно в chat. turn_pass_count инкрементит chat. Один retry
         # на семью; если после него модель снова откажет — route не вернёт guard (в attempted).
         active = list(state.get("active_families") or [])
-        fam = _guard_family(_last_human_text(state["messages"]), active)
         attempted = list(state.get("guard_attempted_families") or [])
-        if fam and fam not in active:
-            active.append(fam)
+        fam = _guard_family(_last_human_text(state["messages"]), active)
+        update: dict = {}
         if fam and fam not in attempted:
+            # точечный добор семьи по словарю-роутеру
+            if fam not in active:
+                active.append(fam)
             attempted.append(fam)
-        return {
+            nudge = (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
+                     "инструментом, не отвечай «не умею».")
+        else:
+            # FULL-recovery (Codex medium R2 CRITICAL): роутер не дал новой семьи, но юзер получил
+            # отказ → на отказе ничего не записано (wrote_unkeyed отфильтрован в route) → безопасно
+            # добрать ВСЕ ленивые семьи на ретрай. Один раз за ход (guard_full_attempted). Канон-интент
+            # мимо словаря (напр. «план кроя» → checklists) детерминированно получит инструмент.
+            for f in _LAZY_FAMILIES:
+                if f not in active:
+                    active.append(f)
+            update["guard_full_attempted"] = True
+            nudge = ("Все инструменты теперь доступны — выполни запрос пользователя, "
+                     "не отвечай «не умею».")
+        update.update({
             "active_families": active,
             "guard_attempted_families": attempted,
-            "guard_nudge": (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
-                            "инструментом, не отвечай «не умею»."),
-        }
+            "guard_nudge": nudge,
+        })
+        return update
 
     def stop(state: ReactState):
         # АНТИ-ПЕТЛЯ: лимит проходов исчерпан. Закрываем висящие tool_calls парными
@@ -1978,9 +2031,11 @@ async def handle_turn(
                 tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                 turn_key=turn_key, origin_user_text=user_text)
             # #165 Срез B (R3-карв-аут): пруненый тенант → база = НЕБЕЗОПАСНЫЕ-к-обрезке
-            # ленивые семьи ВСЕГДА (recipes/menu/household/checklists/memory — пишут без ключа,
-            # дубль на recovery; до #163) + распознанные словарём PRUNABLE (shopping/web —
-            # режем только их). Флаг ВЫКЛ (дефолт) → ВСЕ ленивые = full-bind (ноль изменений).
+            # ленивые семьи ВСЕГДА (#202: остались menu/household/memory — пишут без ключа,
+            # дубль на recovery; recipes/checklists уже оснащены ключами → prunable) +
+            # распознанные словарём PRUNABLE (shopping/web/recipes/checklists — режем только их).
+            # Источник истины — _PRUNABLE_FAMILIES (выводится из _FAMILY_WRITE_POLICY ниже).
+            # Флаг ВЫКЛ (дефолт) → ВСЕ ленивые = full-bind (ноль изменений).
             # Сброс базы на каждый ход → нет межсообщенного дрейфа.
             if _is_pruned(tenant_id):
                 routed = set(_route_families(user_text, k=len(_FAMILY_ROOTS)))
