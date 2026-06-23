@@ -572,11 +572,42 @@ async def _maybe_transcribe_max_voice(
         )
         return None
 
-    # 2. Tenant has active agent с voice access
-    from sreda.services.agent_capabilities import has_voice_access
-    if not tenant_id or not has_voice_access(session, tenant_id):
+    # 2. Tenant has active agent с voice access.
+    # #204 Решение 1/3: resolve access AND carrier feature_key in ONE pass
+    # (``.allowed`` matches the old ``has_voice_access``); mirror TG.
+    from sreda.services.agent_capabilities import resolve_voice_access
+    voice_access = resolve_voice_access(session, tenant_id) if tenant_id else None
+    if voice_access is None or not voice_access.allowed:
         await _send_error(
             "Голосовые сообщения доступны в подписке. "
+            "Открой /subscriptions, чтобы узнать подробнее."
+        )
+        return None
+
+    # #204 Решение 1: fail-closed. allowed=True but no carrier feature_key
+    # → can't attribute the spend → do NOT transcribe (invariant safeguard).
+    billing_feature_key = voice_access.billing_feature_key
+    if billing_feature_key is None:
+        logger.error(
+            "max voice fail-closed: allowed=True but billing_feature_key is "
+            "None (tenant=%s) — refusing to transcribe",
+            tenant_id,
+        )
+        await _send_error(
+            "Голосовые сообщения сейчас не работают. "
+            "Напиши текстом или попробуй позже."
+        )
+        return None
+
+    # #204 Решение 3: preflight quota gate BEFORE any reserve/download/STT.
+    # Block ONLY a real exhaustion of an ACTIVE metered carrier subscription
+    # (``is_subscribed AND is_exhausted``) — see TG twin for rationale.
+    from sreda.services.budget import BudgetService
+    budget = BudgetService(session)
+    _quota = budget.get_quota_status(tenant_id, billing_feature_key)
+    if _quota.is_subscribed and _quota.is_exhausted:
+        await _send_error(
+            "Лимит голосовых сообщений по подписке исчерпан. "
             "Открой /subscriptions, чтобы узнать подробнее."
         )
         return None
@@ -811,10 +842,12 @@ async def _maybe_transcribe_max_voice(
 
     # 8. Record budget usage — после persist'а (codex R5 ordering fix).
     # Если сюда дошли — STT и persist прошли; charge корректно.
-    from sreda.services.budget import BudgetService
-    BudgetService(session).record_api_usage(
+    # #204 Решение 1: attribute to the carrier (``billing_feature_key``),
+    # NOT legacy "voice_transcription"; reuse the BudgetService built for the
+    # quota gate above.
+    budget.record_api_usage(
         tenant_id=tenant_id,
-        feature_key=_VOICE_FEATURE_KEY,
+        feature_key=billing_feature_key,
         provider_key=settings.speech_provider or "unknown",
         task_type="speech_recognition",
         credits_consumed=1,

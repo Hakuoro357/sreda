@@ -6,8 +6,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from sreda.services.agent_capabilities import VoiceAccessResult
+from sreda.services.budget import QuotaStatus
 from sreda.services.speech.base import SpeechRecognitionError
 from sreda.services.telegram_bot import _maybe_transcribe_voice
+
+# #204: the carrier agent voice usage is billed under (manifest
+# ``includes_voice=True``). The legacy hard-wired "voice_transcription" key
+# is gone from record_api_usage — usage is now attributed to the carrier so
+# it is visible in that agent's /admin/budget.
+_CARRIER = "housewife_assistant"
 
 
 # ---------------------------------------------------------------------------
@@ -40,9 +48,28 @@ def _make_registry(registered: bool = True):
     return registry
 
 
-def _make_budget():
+def _make_quota(is_subscribed: bool = False, is_exhausted: bool = False) -> QuotaStatus:
+    """Real QuotaStatus so the #204 gate (``is_subscribed AND is_exhausted``)
+    evaluates against booleans, not truthy MagicMock attrs.
+
+    Default = housewife sreda_free shape: not a metered active sub on the
+    carrier → ``is_subscribed=False`` → gate never blocks.
+    """
+    return QuotaStatus(
+        feature_key=_CARRIER,
+        is_subscribed=is_subscribed,
+        is_exhausted=is_exhausted,
+        credits_used=0,
+        credits_quota=None,
+        period_start=None,
+        period_end=None,
+    )
+
+
+def _make_budget(quota: QuotaStatus | None = None):
     budget = MagicMock()
     budget.record_api_usage = MagicMock()
+    budget.get_quota_status = MagicMock(return_value=quota or _make_quota())
     return budget
 
 
@@ -58,9 +85,17 @@ def _make_settings(speech_provider: str = "yandex"):
     return settings
 
 
-def _patch_voice_access(value: bool):
-    """Shortcut for patching the agent-capability gate."""
-    return patch("sreda.services.telegram_bot.has_voice_access", return_value=value)
+def _patch_voice_access(value: bool, *, billing_feature_key: str | None = _CARRIER):
+    """Patch the #204 voice resolver. ``value`` = allowed; on allow, attribute
+    billing to ``billing_feature_key`` (carrier). Pass ``billing_feature_key=
+    None`` with ``value=True`` to exercise the fail-closed branch (test d)."""
+    if value:
+        result = VoiceAccessResult(True, billing_feature_key, "ok")
+    else:
+        result = VoiceAccessResult(False, None, "no_voice_carrier")
+    return patch(
+        "sreda.services.telegram_bot.resolve_voice_access", return_value=result
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -262,11 +297,134 @@ async def test_happy_path_injects_text():
     # Verify recognizer called with audio
     recognizer.recognize.assert_awaited_once_with(b"ogg_data")
 
-    # Verify usage recorded
+    # Verify usage recorded under the CARRIER (#204), not legacy
+    # "voice_transcription". Non-vacuous: reverting record_api_usage to the
+    # old key reddens this assertion.
     budget.record_api_usage.assert_called_once_with(
         tenant_id="t1",
-        feature_key="voice_transcription",
+        feature_key=_CARRIER,
         provider_key="yandex",
         task_type="speech_recognition",
         credits_consumed=1,
     )
+
+
+# ---------------------------------------------------------------------------
+# #204 Phase 1 — carrier attribution, fail-closed, quota gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_no_voice_sub_active_housewife_billed_under_carrier():
+    """(a) Тенант без voice-sub, но с active carrier (housewife) →
+    голос работает, расход пишется под carrier (виден в /admin/budget)."""
+    payload = _make_voice_payload(duration=5, file_id="fid_a")
+    session = MagicMock()
+    telegram = _make_telegram(file_path="voice/a.oga", audio=b"ogg_a")
+    onboarding = _make_onboarding(tenant_id="t_a", chat_id="c_a")
+    # sreda_free housewife shape: subscribed=False on metered key → no block.
+    budget = _make_budget(_make_quota(is_subscribed=False, is_exhausted=False))
+    recognizer = _make_recognizer(text="расшифровка")
+
+    with (
+        patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True, billing_feature_key="housewife_assistant"),
+        patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
+        patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
+        patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+    ):
+        result = await _maybe_transcribe_voice(
+            payload, session=session, telegram_client=telegram, onboarding=onboarding
+        )
+
+    assert result is payload
+    recognizer.recognize.assert_awaited_once()
+    budget.record_api_usage.assert_called_once()
+    assert budget.record_api_usage.call_args.kwargs["feature_key"] == "housewife_assistant"
+
+
+@pytest.mark.asyncio
+async def test_d_fail_closed_no_carrier_key_skips_stt_and_usage():
+    """(d) fail-closed: resolver allowed=True но billing_feature_key=None →
+    STT НЕ зван, usage НЕ записан, отдаётся voice-error."""
+    payload = _make_voice_payload(file_id="fid_d")
+    session = MagicMock()
+    telegram = _make_telegram()
+    onboarding = _make_onboarding(tenant_id="t_d")
+    budget = _make_budget()
+    recognizer = _make_recognizer()
+
+    with (
+        patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True, billing_feature_key=None),
+        patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
+        patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
+        patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+    ):
+        result = await _maybe_transcribe_voice(
+            payload, session=session, telegram_client=telegram, onboarding=onboarding
+        )
+
+    assert result is None
+    recognizer.recognize.assert_not_awaited()
+    budget.record_api_usage.assert_not_called()
+    telegram.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_f_exhausted_metered_carrier_blocks_before_stt_and_usage():
+    """(f) is_subscribed=True И is_exhausted=True (исчерпан метрированный
+    carrier) → STT/download/usage НЕ вызваны, голос блокирован."""
+    payload = _make_voice_payload(file_id="fid_f")
+    session = MagicMock()
+    telegram = _make_telegram()
+    onboarding = _make_onboarding(tenant_id="t_f")
+    budget = _make_budget(_make_quota(is_subscribed=True, is_exhausted=True))
+    recognizer = _make_recognizer()
+
+    with (
+        patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
+        patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
+        patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
+        patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+    ):
+        result = await _maybe_transcribe_voice(
+            payload, session=session, telegram_client=telegram, onboarding=onboarding
+        )
+
+    assert result is None
+    recognizer.recognize.assert_not_awaited()
+    telegram.download_file.assert_not_awaited()
+    budget.record_api_usage.assert_not_called()
+    telegram.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_g_scheduled_carrier_not_subscribed_gate_does_not_block():
+    """(g) scheduled_for_cancel carrier → is_subscribed=False → quota-гейт
+    НЕ блокирует (фикс R5-A: гейт не сужает доступ). usage записан."""
+    payload = _make_voice_payload(duration=5, file_id="fid_g")
+    session = MagicMock()
+    telegram = _make_telegram(file_path="voice/g.oga", audio=b"ogg_g")
+    onboarding = _make_onboarding(tenant_id="t_g")
+    # scheduled carrier: _active_subscription (status=='active' only) → None →
+    # is_subscribed=False even though is_exhausted defaults True for "no sub".
+    budget = _make_budget(_make_quota(is_subscribed=False, is_exhausted=True))
+    recognizer = _make_recognizer(text="расшифровка g")
+
+    with (
+        patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
+        patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
+        patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
+        patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+    ):
+        result = await _maybe_transcribe_voice(
+            payload, session=session, telegram_client=telegram, onboarding=onboarding
+        )
+
+    assert result is payload
+    recognizer.recognize.assert_awaited_once()
+    budget.record_api_usage.assert_called_once()
+    assert budget.record_api_usage.call_args.kwargs["feature_key"] == _CARRIER
