@@ -1595,6 +1595,12 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # семантического дедупа) ИЛИ unkeyed-семья → guard/full-recovery ОТКЛЮЧАЕМ, иначе ретрай
                 # мог бы пере-вызвать запись (дубль). keyed-семьи (shopping/recipes/checklists) сюда НЕ
                 # входят — их повтор семантически дедупится, recovery после них безопасен.
+                # ОСОЗНАННАЯ КОНСЕРВАТИВНОСТЬ (Codex medium R4 vs субагент R4 — в напряжении): ставим
+                # флаг по ИМЕНИ инструмента, не по факту реальной записи. На no-op (add_task-дедуп-хит,
+                # cancel уже-отменённого) guard переподавится — но это БЕЗОПАСНАЯ сторона (дубля НЕ будет,
+                # сужается лишь редкий fallback; основной recovery через need_family НЕ задет). Точный
+                # детект «реально записал» пожертвовал бы drift-safety вывода _CORE_MUTATING. Если
+                # shadow-логи покажут частое переподавление → уточнить тогда (follow-up #165).
                 wrote_unkeyed = True
         update: dict = {"messages": out}
         if added:  # семья добрана → обновляем state (last-value канал)
