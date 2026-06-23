@@ -41,6 +41,15 @@ def test_proxy_for_url_none_without_proxy_208():
     assert mh._proxy_for_url("https://api.groq.com/x") is None
 
 
+def test_proxy_for_url_mirrors_bot_priority_208():
+    """Зеркалит приоритет бота: SREDA_GROQ_HTTP_PROXY первым (если задан), иначе HTTPS_PROXY."""
+    mh = _load()
+    mh._ENV = {"SREDA_GROQ_HTTP_PROXY": "http://127.0.0.1:9","HTTPS_PROXY": "socks5://127.0.0.1:1080","NO_PROXY": ""}
+    assert mh._proxy_for_url("https://api.groq.com/x") == "http://127.0.0.1:9", "GROQ-шим имеет приоритет"
+    mh._ENV = {"HTTPS_PROXY": "socks5://127.0.0.1:1080", "NO_PROXY": ""}
+    assert mh._proxy_for_url("https://api.groq.com/x") == "socks5://127.0.0.1:1080", "fallback на HTTPS_PROXY"
+
+
 def test_external_latency_max_severity_downgrade_208(monkeypatch):
     """max_severity='warning' понижает critical→warning (openrouter депрекейч)."""
     mh = _load()

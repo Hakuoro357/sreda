@@ -64,8 +64,18 @@ def _proxy_for_url(url: str) -> str | None:
     (``/etc/sreda/.env``) для хостов НЕ в ``NO_PROXY`` (Groq идёт через SOCKS-туннель, как
     ``speech/groq.py``); None (direct) для хостов В ``NO_PROXY`` (telegram/mimo/openrouter).
     Прямой маршрут с VDS до части CDN-IP мёртв (RU-сеть) → probe обязан мерить тот же путь,
-    что и прод, иначе ложный CRITICAL (groq_stt 2026-06-23)."""
-    proxy = _ENV.get("HTTPS_PROXY") or _ENV.get("https_proxy")
+    что и прод, иначе ложный CRITICAL (groq_stt 2026-06-23).
+
+    ТОЧНО зеркалит приоритет бота (speech/groq.py::_resolve_outbound_proxy + provider_balances.py):
+    SREDA_GROQ_HTTP_PROXY первым (Groq-специфичный HTTP→SOCKS-шим, если задан), затем общий SOCKS.
+    На VDS (2026-06-23) задан только HTTPS_PROXY=socks5://… (socksio в venv ЕСТЬ → httpx+socks5 → Groq=401)."""
+    proxy = None
+    for _var in ("SREDA_GROQ_HTTP_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
+                 "https_proxy", "http_proxy"):
+        _v = _ENV.get(_var)
+        if _v:
+            proxy = _v
+            break
     if not proxy:
         return None
     host = (urlparse(url).hostname or "").lower()
