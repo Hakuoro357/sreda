@@ -390,6 +390,12 @@ class Settings(BaseSettings):
     react_persist_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_PERSIST_ENABLED"
     )
+    # #194: компакция истории ReAct как prompt-view (структурный конвейер БЕЗ LLM). OFF (дефолт) →
+    # модель получает всю историю (как сейчас). ON → урезанный валидный вид в пределах char-бюджета
+    # (снижает prompt_too_long; полное устранение — L4). ReAct-only; канон #193 не мутируется.
+    react_compact_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_COMPACT_ENABLED"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must

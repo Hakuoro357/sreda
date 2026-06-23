@@ -39,6 +39,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
 from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода
+from sreda.runtime.react_compaction import build_model_input  # #194: компакция истории (prompt-view)
 from sreda.runtime.planner.tool_runtime import (
     ToolRuntimeContext,
     allocate_operation_id,
@@ -69,6 +70,15 @@ def _persist_enabled() -> bool:
     try:
         from sreda.config.settings import get_settings
         return bool(get_settings().react_persist_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
+def _compact_enabled() -> bool:
+    """#194: компакция истории как prompt-view ВКЛ? (флаг SREDA_REACT_COMPACT_ENABLED, дефолт OFF)."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().react_compact_enabled)
     except Exception:  # noqa: BLE001 — флаг не валит ход
         return False
 
@@ -1438,7 +1448,9 @@ def _build_graph(llm: Any, all_tools: list, *,
         nudge = state.get("guard_nudge")
         if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
             sp = f"{sp}\n\n{nudge}"
-        _msgs = [SystemMessage(sp), *state["messages"]]
+        # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
+        # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
+        _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled())
         # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
         #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
         #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
