@@ -322,10 +322,10 @@ async def test_flag_off_full_bind_no_pruning(db_session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
-    """Срез B R3-карв-аут (Codex high R2 MAJOR): семьи БЕЗ ключа идемпотентности (остались menu/memory)
+    """Срез B R3-карв-аут (Codex high R2 MAJOR): семьи БЕЗ ключа идемпотентности (осталась memory)
     при ВКЛ обрезке остаются ПРИВЯЗАННЫМИ (иначе повтор на recovery-проходе задвоит запись, #163).
-    Режем shopping/recipes/checklists/household (есть ключ) + web (чтение).
-    #202: recipes+checklists+household оснащены ключами → переехали в prunable."""
+    Режем shopping/recipes/checklists/household/menu (re-issue-safe) + web (чтение).
+    #202: recipes+checklists+household (op_id) + menu (state-идемпотентна по upsert) → prunable."""
     u = seed_telegram_user(db_session)
     db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
     stub = _RecordingStubLLM([AIMessage(content="Привет!")])
@@ -334,14 +334,14 @@ async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
         thread_id="lazy165-carveout", llm=stub, user_text="привет, как дела",  # нейтральный
         inbound_message_id="lazy165-carveout-msg", channel="react")
     bound = stub.binds[0]
-    # unkeyed-write семьи (остались menu/memory) ВСЕГДА привязаны даже при обрезке + нейтральном тексте
-    assert "plan_week_menu" in bound       # menu (ещё unkeyed)
+    # unkeyed-write семья (осталась memory) ВСЕГДА привязана даже при обрезке + нейтральном тексте
     assert "save_core_fact" in bound       # memory (ещё unkeyed)
-    # prunable (shopping/recipes/checklists/household/web) на нейтральном тексте НЕ предзагружены (режутся)
+    # prunable (shopping/recipes/checklists/household/menu/web) на нейтральном тексте НЕ предзагружены
     assert "add_shopping_items" not in bound
     assert "save_recipe" not in bound       # #202: recipes idempotent → prunable
     assert "create_checklist" not in bound  # #202: checklists idempotent → prunable
     assert "add_family_members" not in bound  # #202: household idempotent → prunable
+    assert "plan_week_menu" not in bound    # #202: menu state-idempotent → prunable
     assert "web_search" not in bound
 
 
@@ -353,14 +353,14 @@ async def test_guard_suppressed_after_unkeyed_write(db_session, monkeypatch):
     db_session.commit()
     monkeypatch.setattr(react_loop, "_guard_family", lambda _t, _a: "web")  # guard БЫ выбрал web
     stub = _RecordingStubLLM([
-        AIMessage(content="", tool_calls=[{  # пасс1: инструмент unkeyed-семьи (menu; #202 household уже keyed)
-            "name": "list_menu", "args": {}, "id": "lm"}]),
+        AIMessage(content="", tool_calls=[{  # пасс1: unkeyed-запись (memory; #202 menu уже keyed)
+            "name": "save_core_fact", "args": {"content": "любит борщ"}, "id": "sf"}]),
         AIMessage(content="Извини, искать в сети пока не умею."),  # пасс2: отказ (web-ish)
         AIMessage(content="..."),
     ])
     await react_loop.handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
-        thread_id="lazy165-unkeyed-guard", llm=stub, user_text="покажи меню",
+        thread_id="lazy165-unkeyed-guard", llm=stub, user_text="запомни: любит борщ",
         inbound_message_id="lazy165-unkeyed-guard-msg", channel="react")
     # guard НЕ сработал (wrote_unkeyed) → нет 3-го прохода с web; web не догружен
     assert len(stub.binds) == 2, f"guard сработал после unkeyed-write: {len(stub.binds)} проходов"
