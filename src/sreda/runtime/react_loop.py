@@ -799,7 +799,11 @@ _FAMILY_WRITE_POLICY: dict[str, str] = {
                                 # set_cell по (plan,day,meal); clear по неделе. Повтор не дублирует (нет миграции)
     "household": "idempotent",  # #202: add_member пишет op_id+hash (pre-check + батч-морфо guard через коммит-на-строку)
     "checklists": "idempotent",  # #202: create_list пишет op_id+hash (pre-check); add_items — item-дедуп по title
-    "memory": "unkeyed",        # сохранение заметки без op_id
+    "memory": "unkeyed",        # #202 ОСОЗНАННО оставлена unkeyed (НЕ прунабельна): (1) безопасна и так —
+                                # запись ставит wrote_unkeyed → guard подавлен → нет recovery-перевыпуска;
+                                # (2) recall дедупит near-дубли (cosine>0.95) → даже дубль-строка не видна;
+                                # (3) content-дедуп-на-сохранении семантически НЕВЕРЕН для episodic (повторные
+                                # события — разные записи); (4) выигрыш обрезки мал (recall_memory — core).
 }
 # ПРУНАБЕЛЬНОСТЬ (можно ОПУСТИТЬ семью из набора, если не нужна) — idempotent/readonly/metered_read.
 _PRUNABLE_FAMILIES = frozenset(
