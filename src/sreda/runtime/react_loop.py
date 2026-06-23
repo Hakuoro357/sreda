@@ -778,7 +778,7 @@ _FAMILY_WRITE_POLICY: dict[str, str] = {
     "recipes": "idempotent",    # #202: save_recipe/batch на ctx-пути пишут op_id+hash; fuzzy-дедуп ловит повтор контента
     "menu": "unkeyed",
     "household": "unkeyed",
-    "checklists": "unkeyed",
+    "checklists": "idempotent",  # #202: create_list пишет op_id+hash (pre-check); add_items — item-дедуп по title
     "memory": "unkeyed",        # сохранение заметки без op_id
 }
 # ПРУНАБЕЛЬНОСТЬ (можно ОПУСТИТЬ семью из набора, если не нужна) — idempotent/readonly/metered_read.

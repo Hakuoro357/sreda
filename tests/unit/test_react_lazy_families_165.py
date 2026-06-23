@@ -334,10 +334,10 @@ async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
     # unkeyed-write семьи ВСЕГДА привязаны даже при обрезке + нейтральном тексте
     assert "plan_week_menu" in bound       # menu
     assert "add_family_members" in bound   # household
-    assert "create_checklist" in bound     # checklists
-    # prunable (shopping/recipes/web) на нейтральном тексте НЕ предзагружены (режутся)
+    # prunable (shopping/recipes/checklists/web) на нейтральном тексте НЕ предзагружены (режутся)
     assert "add_shopping_items" not in bound
-    assert "save_recipe" not in bound      # #202: recipes теперь idempotent → prunable
+    assert "save_recipe" not in bound      # #202: recipes idempotent → prunable
+    assert "create_checklist" not in bound  # #202: checklists idempotent → prunable
     assert "web_search" not in bound
 
 
@@ -349,14 +349,14 @@ async def test_guard_suppressed_after_unkeyed_write(db_session, monkeypatch):
     db_session.commit()
     monkeypatch.setattr(react_loop, "_guard_family", lambda _t, _a: "web")  # guard БЫ выбрал web
     stub = _RecordingStubLLM([
-        AIMessage(content="", tool_calls=[{  # пасс1: инструмент unkeyed-семьи (checklists)
-            "name": "list_checklists", "args": {}, "id": "lc"}]),
+        AIMessage(content="", tool_calls=[{  # пасс1: инструмент unkeyed-семьи (household; #202 checklists уже keyed)
+            "name": "list_family_members", "args": {}, "id": "lf"}]),
         AIMessage(content="Извини, искать в сети пока не умею."),  # пасс2: отказ (web-ish)
         AIMessage(content="..."),
     ])
     await react_loop.handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
-        thread_id="lazy165-unkeyed-guard", llm=stub, user_text="покажи чек-листы",
+        thread_id="lazy165-unkeyed-guard", llm=stub, user_text="кто в семье",
         inbound_message_id="lazy165-unkeyed-guard-msg", channel="react")
     # guard НЕ сработал (wrote_unkeyed) → нет 3-го прохода с web; web не догружен
     assert len(stub.binds) == 2, f"guard сработал после unkeyed-write: {len(stub.binds)} проходов"
