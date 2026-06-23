@@ -32,6 +32,7 @@ from sreda.services.agent_capabilities import active_feature_keys
 from sreda.services.billing import (
     DISABLED_FEATURE_MESSAGE,
     BillingService,
+    DeprecatedPlanError,
 )
 from sreda.services.housewife_family import HousewifeFamilyService
 from sreda.services.housewife_recipes import HousewifeRecipeService
@@ -767,7 +768,15 @@ def subscribe(
     ).one_or_none()
     if plan is None:
         raise HTTPException(status_code=400, detail="unknown_plan")
-    result = billing.start_simple_subscription(ctx.tenant_id, plan_key)
+    # #204 Фаза 2: deny subscribing to a deprecated (is_active=False) plan —
+    # voice_transcription_base tombstone (migration 0018). The service raises
+    # DeprecatedPlanError; surface it as 400 deprecated_plan for the Mini App.
+    if not plan.is_active:
+        raise HTTPException(status_code=400, detail="deprecated_plan")
+    try:
+        result = billing.start_simple_subscription(ctx.tenant_id, plan_key)
+    except DeprecatedPlanError as exc:
+        raise HTTPException(status_code=400, detail="deprecated_plan") from exc
 
     return {"ok": True, "message": result.message_text}
 

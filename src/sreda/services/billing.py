@@ -46,6 +46,20 @@ CONNECT_VOICE_CALLBACK = "billing:connect_plan:voice_transcription_base"
 CANCEL_VOICE_CALLBACK = "billing:cancel_plan:voice_transcription_base"
 
 
+class DeprecatedPlanError(ValueError):
+    """#204 Фаза 2: попытка активировать подписку на план с ``is_active=False``.
+
+    Прод-состояние (миграция 0018): ``voice_transcription_base`` помечен
+    tombstone (``is_active=False``). Любой путь активации (``start_simple_
+    subscription`` / endpoint ``POST /subscribe``) поднимает это исключение,
+    а endpoint транслирует его в HTTP 400 ``deprecated_plan``. Активные планы
+    (``is_active`` default True) не задеты — отклоняется ТОЛЬКО deprecated."""
+
+    def __init__(self, plan_key: str) -> None:
+        self.plan_key = plan_key
+        super().__init__(f"plan {plan_key!r} is deprecated (is_active=False)")
+
+
 @dataclass(frozen=True, slots=True)
 class PlanSeed:
     id: str
@@ -169,6 +183,15 @@ class BillingService:
         using ``next_cycle_quantity``. Plans that map to a retired skill are
         skipped via ``is_feature_disabled`` (generic guard; currently a no-op).
 
+        #204 Фаза 2 (Решение 4, MINOR-фикс): a DEPRECATED plan
+        (``is_active=False`` — voice_transcription_base tombstone, migration
+        0018) is ALSO skipped here. A legacy paid voice-sub with
+        ``next_cycle_quantity>0`` would otherwise surface a phantom future
+        charge in the read-only status block, even though ``renew_cycle``
+        never actually renews it (it filters the same way). Mirror that filter
+        locally so the displayed next payment matches what really renews. This
+        is a local skip (NOT in the shared ``_get_plan_optional``).
+
         Returns ``(amount_rub, due_at)``. When nothing renews — no billing
         cycle, or only free renewals (e.g. the 0 ₽ housewife plan) — returns
         ``(0, None)`` so the caller drops the "Сумма к оплате" line. READ-ONLY:
@@ -186,7 +209,7 @@ class BillingService:
         )
         amount_rub = 0
         for subscription, plan in subscription_plan_rows:
-            if is_feature_disabled(plan.feature_key):
+            if is_feature_disabled(plan.feature_key) or not plan.is_active:
                 continue
             next_quantity = self._get_next_cycle_quantity(subscription)
             if next_quantity <= 0:
@@ -258,8 +281,15 @@ class BillingService:
         else:
             active_block = "Подключенных подписок пока нет."
 
+        # #204 Фаза 2 (Решение 4): a DEPRECATED voice plan (``is_active=False`` —
+        # tombstone) is no longer OFFERED. Hide the "Доступные" voice line and the
+        # connect button LOCALLY here (NOT in the shared ``_get_plan_optional`` —
+        # ``cancel_voice_subscription`` relies on it to find the row in Ф3). The
+        # "Отключить" cancel button stays available for an existing active sub.
+        voice_offerable = bool(voice_plan and voice_plan.is_active)
+
         available_lines = []
-        if not voice_active and voice_plan:
+        if not voice_active and voice_offerable:
             price_label = f"{voice_plan.price_rub} ₽ / 30 дней" if voice_plan.price_rub > 0 else "бесплатно"
             available_lines.append(f"- {voice_plan.title} — {price_label}")
         available_block = "Доступные:\n" + ("\n".join(available_lines) if available_lines else "- нет")
@@ -268,11 +298,12 @@ class BillingService:
 
         buttons: list[list[dict]] = []
         # Voice transcription toggle
-        if voice_plan:
-            if not voice_active:
-                buttons.append([{"text": f"Подключить {voice_plan.title}", "callback_data": CONNECT_VOICE_CALLBACK}])
-            else:
-                buttons.append([{"text": f"Отключить {voice_plan.title}", "callback_data": CANCEL_VOICE_CALLBACK}])
+        if voice_active and voice_plan:
+            # An existing active sub can always be cancelled, even on a tombstone
+            # plan (Ф3 needs the cancel path live).
+            buttons.append([{"text": f"Отключить {voice_plan.title}", "callback_data": CANCEL_VOICE_CALLBACK}])
+        elif voice_offerable:
+            buttons.append([{"text": f"Подключить {voice_plan.title}", "callback_data": CONNECT_VOICE_CALLBACK}])
         buttons.append([{"text": "Мой статус", "callback_data": STATUS_CALLBACK}])
         return text, _inline_keyboard(buttons)
 
@@ -318,10 +349,17 @@ class BillingService:
         # iteration entirely (generic guard; currently a no-op). They must NOT
         # enter ``renewable_items`` NOR the implicit expire-loop below. Non-EDS
         # subs (voice/housewife) renew as usual.
+        #
+        # #204 Фаза 2 (Решение 2): also drop subscriptions on a DEPRECATED plan
+        # (``is_active=False`` — voice_transcription_base tombstone, migration
+        # 0018). Excluding them here means a legacy cancelled voice-sub with
+        # ``next_cycle_quantity>0`` is NEVER flipped back to ``status='active'`` by
+        # renewal (it stays untouched). is_active default True → live plans
+        # (voice live / housewife / EDS) renew as before.
         subscription_plan_rows = [
             row
             for row in subscription_plan_rows
-            if not is_feature_disabled(row[1].feature_key)
+            if not is_feature_disabled(row[1].feature_key) and row[1].is_active
         ]
         subscriptions = [row[0] for row in subscription_plan_rows]
         renewable_items: list[tuple[TenantSubscription, SubscriptionPlan, int]] = []
@@ -418,6 +456,13 @@ class BillingService:
                 message_text="План распознавания голоса не найден.",
                 reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
             )
+        # #204 Фаза 2: the voice plan is a tombstone (is_active=False on prod,
+        # migration 0018). Activation is stubbed — this method is only reached via
+        # the connect-voice callback handler, where a raised exception would mark
+        # the run failed. Return the disabled tombstone result (NO DB write), the
+        # same graceful no-op #181 uses for a retired skill on the callback path.
+        if not plan.is_active:
+            return self._eds_disabled_result()
         sub = self._get_subscription_optional(tenant_id, PLAN_VOICE_TRANSCRIPTION)
         if sub is not None and self._is_subscription_active(sub, current_time):
             return SubscriptionActionResult(
@@ -515,6 +560,12 @@ class BillingService:
                     [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
                 ),
             )
+        # #204 Фаза 2: deny activation of a deprecated (is_active=False) plan.
+        # is_active default True → reject ONLY tombstoned plans (voice_transcription_
+        # base); sreda_free / housewife / EDS are untouched. The endpoint maps this
+        # to HTTP 400 deprecated_plan.
+        if not plan.is_active:
+            raise DeprecatedPlanError(plan_key)
         # #181: cut ONLY a retired skill (by resolved feature_key) — voice /
         # housewife (other feature_key) keep flowing through this generic path.
         if is_feature_disabled(plan.feature_key):

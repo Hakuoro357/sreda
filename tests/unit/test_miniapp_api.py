@@ -354,12 +354,15 @@ class TestMiniAppSubscribe:
         assert data["message"] == "Это умение больше не поддерживается."
 
     def test_subscribe_voice_transcription(self, seeded_client):
+        # #204 Фаза 2: voice_transcription_base — tombstone (is_active=False на
+        # проде, миграция 0018). Подписка через Mini App на него ДОЛЖНА быть
+        # отклонена 400 deprecated_plan — реактивация закрыта и на endpoint.
         init_data = _make_init_data()
         headers = {"Authorization": f"tma {init_data}"}
 
-        # Need voice plan seeded first
+        # Seed the voice plan in its production tombstone state (is_active=False).
         from sreda.db.session import get_session_factory
-        from sreda.db.models.billing import SubscriptionPlan
+        from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 
         session = get_session_factory()()
         try:
@@ -379,7 +382,7 @@ class TestMiniAppSubscribe:
                         price_rub=0,
                         billing_period_days=30,
                         is_public=True,
-                        is_active=True,
+                        is_active=False,
                         sort_order=30,
                     )
                 )
@@ -392,8 +395,23 @@ class TestMiniAppSubscribe:
             json={"plan_key": "voice_transcription_base"},
             headers=headers,
         )
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "deprecated_plan"
+
+        # No active voice subscription was created by the denied request.
+        session = get_session_factory()()
+        try:
+            active = (
+                session.query(TenantSubscription)
+                .filter(
+                    TenantSubscription.feature_key == "voice_transcription",
+                    TenantSubscription.status == "active",
+                )
+                .count()
+            )
+            assert active == 0
+        finally:
+            session.close()
 
 
 class TestMiniAppFamilyPatch:
