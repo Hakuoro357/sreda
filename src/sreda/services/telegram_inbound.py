@@ -231,6 +231,24 @@ async def _process_approved_turn_locked(
         _barrier.enter_context(
             tenant_advisory_lock(bg_session, onboarding.tenant_id)
         )
+        # #187 дверь #6 (A3 re-check ПОД локом): ingress-гейт (handle_telegram_update)
+        # проверил активность ДО спавна хода, но между гейтом и захватом лока админ
+        # мог soft_delete'нуть тенант. Закрываем delete-first гонку: soft_delete берёт
+        # ТОТ ЖЕ лок и КОММИТИТ флаг под ним → если он успел ПЕРВЫМ, этот ход (взявший
+        # лок после) обязан НЕ коммитить доменные мутации (drain их уже не застанет).
+        # Лок на отдельном соединении; bg_session тут делает свежий SELECT → видит
+        # durable deleted_at. На SQLite лок no-op, но re-check всё равно читает флаг.
+        from sreda.services.tenant_lifecycle import is_tenant_active
+        if not is_tenant_active(bg_session, onboarding.tenant_id):
+            logger.info(
+                "turn aborted: tenant %s soft-deleted mid-turn (re-check под advisory-локом)",
+                onboarding.tenant_id,
+            )
+            # Codex MINOR: пометить inbound терминально ('ignored'), иначе монитор
+            # unprocessed_inbound (NOT IN processed/ignored) ложно сочтёт корректно
+            # отброшенный ход зависшим. Намеренный скип удалённого тенанта = ignored.
+            _set_processing_status(bg_session, inbound_message_id, "ignored")
+            return
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
         )

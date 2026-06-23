@@ -131,6 +131,55 @@ def _max_payload_message(
     }
 
 
+def _tg_voice_payload(chat_id: str, *, update_id: int = 7011) -> dict:
+    """TG voice update — ``message.voice`` dict (no text). Triggers the STT path
+    in ``_maybe_transcribe_voice`` IF the turn is ever reached."""
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": 2,
+            "chat": {"id": int(chat_id), "type": "private"},
+            "voice": {
+                "file_id": "voice_file_abc",
+                "duration": 3,
+                "mime_type": "audio/ogg",
+            },
+        },
+    }
+
+
+def _max_voice_payload(
+    *,
+    sender_user_id: int = int(EXISTING_MAX_ACCOUNT_ID),
+    chat_id: int = int(EXISTING_MAX_CHAT_ID),
+) -> dict:
+    """MAX voice update — ``body.attachments[].type=='audio'`` (no text).
+    Triggers the STT path in ``_maybe_transcribe_max_voice`` IF reached."""
+    return {
+        "update_type": "message_created",
+        "timestamp": 1777907183208,
+        "message": {
+            "recipient": {"chat_id": chat_id, "chat_type": "dialog"},
+            "body": {
+                "mid": "mid.voice",
+                "seq": 2,
+                "attachments": [
+                    {
+                        "type": "audio",
+                        "payload": {"url": "https://example/audio.ogg"},
+                    }
+                ],
+            },
+            "sender": {
+                "user_id": sender_user_id,
+                "first_name": "X",
+                "name": "X",
+                "is_bot": False,
+            },
+        },
+    }
+
+
 # ---- A1: deleted inbound silent ----------------------------------------
 
 
@@ -198,6 +247,91 @@ async def test_deleted_inbound_silent_max(fresh_db, monkeypatch):
 
     assert result == ""
     send_mock.assert_not_called()
+    ensure_spy.assert_not_called()
+
+    with SessionLocal() as session:
+        rows = session.query(InboundMessage).all()
+        assert rows == []
+
+
+# ---- A1 (voice): deleted tenant sends VOICE → silent, STT never runs ----
+# Чеклист #187 A1 требовал «текст И голос». Голос дороже: если гейт пропустит
+# удалённого, СНАЧАЛА сожжётся STT (Yandex SpeechKit — сетевой+квота) ещё до
+# LLM. Прямой ``assert_not_called`` на функцию транскрипции пинит, что гейт
+# отсекает ДО любого STT.
+
+
+@pytest.mark.asyncio
+async def test_deleted_inbound_voice_silent_telegram(fresh_db, monkeypatch):
+    """A1 (TG voice). Удалённый тенант шлёт ГОЛОС → None, send_message НЕ вызван,
+    STT (``_maybe_transcribe_voice``) НЕ вызван, ensure не запущен."""
+    from sreda.services import telegram_bot as tb
+    from sreda.services import telegram_inbound as ti
+
+    SessionLocal = get_session_factory()
+    with SessionLocal() as session:
+        seeded = seed_telegram_user(
+            session, chat_id=EXISTING_TG_CHAT_ID, tenant_id="tg_del_voice",
+            workspace_id="ws_tg_del_voice", user_id="u_tg_del_voice",
+        )
+        session.commit()
+        _mark_deleted(session, seeded.tenant_id)
+
+    send_mock = AsyncMock()
+    fake_client = MagicMock()
+    fake_client.send_message = send_mock
+
+    # Explicit STT spy: любой вызов транскрипции на удалённом = провал гейта.
+    stt_spy = AsyncMock(side_effect=AssertionError("STT must not run for deleted"))
+    monkeypatch.setattr(tb, "_maybe_transcribe_voice", stt_spy)
+    ensure_spy = MagicMock(side_effect=AssertionError("ensure must not run for deleted"))
+    monkeypatch.setattr(ti, "ensure_telegram_user_bundle", ensure_spy)
+    monkeypatch.setattr(ti, "telegram_client_for", lambda *a, **k: fake_client)
+
+    result = await ti.handle_telegram_update(_tg_voice_payload(EXISTING_TG_CHAT_ID))
+
+    assert result is None
+    send_mock.assert_not_called()       # ни welcome, ни любой ответ
+    stt_spy.assert_not_called()         # STT не сожжён
+    ensure_spy.assert_not_called()
+
+    with SessionLocal() as session:
+        rows = session.query(InboundMessage).all()
+        assert rows == []  # inbound НЕ персистнут
+
+
+@pytest.mark.asyncio
+async def test_deleted_inbound_voice_silent_max(fresh_db, monkeypatch):
+    """A1 (MAX voice). Удалённый тенант шлёт ГОЛОС → "", send_message НЕ вызван,
+    STT (``_maybe_transcribe_max_voice``) НЕ вызван, ensure не запущен."""
+    from sreda.services import max_inbound as mi
+
+    SessionLocal = get_session_factory()
+    with SessionLocal() as session:
+        _seed_max_user(session, tenant_id="max_del_voice")
+        session.commit()
+        _mark_deleted(session, "max_del_voice")
+
+    send_mock = AsyncMock()
+
+    class _Client:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        async def send_message(self, **kwargs):
+            return await send_mock(**kwargs)
+
+    stt_spy = AsyncMock(side_effect=AssertionError("STT must not run for deleted"))
+    monkeypatch.setattr(mi, "_maybe_transcribe_max_voice", stt_spy)
+    ensure_spy = MagicMock(side_effect=AssertionError("ensure must not run for deleted"))
+    monkeypatch.setattr(mi, "ensure_max_user_bundle", ensure_spy)
+    monkeypatch.setattr(mi, "MaxClient", _Client)
+
+    result = await mi.handle_max_update(_max_voice_payload())
+
+    assert result == ""
+    send_mock.assert_not_called()
+    stt_spy.assert_not_called()
     ensure_spy.assert_not_called()
 
     with SessionLocal() as session:

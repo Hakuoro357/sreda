@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from sreda.db.models.housewife_food import (
@@ -206,6 +207,66 @@ class HousewifeRecipeService:
                 )
                 return existing_row, False
 
+        # #202 семья recipes: на ReAct-пути (ctx) оснащаем строку ключами идемпотентности
+        # (operation_id + normalized_title_hash) — key-policy для гейта Фазы 5 + аудит. Сам дедуп
+        # создания обеспечивает fuzzy/exact-блок ВЫШЕ (богаче — ловит near-dup; на повтор того же
+        # контента в ходе вернёт существующий ДО этой точки). Легаси (ctx None) — ключи None,
+        # поведение байт-в-байт. fail-closed user_id + tenant-guard как в housewife_reminders.schedule.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        op_id_value: str | None = None
+        nhash_value: str | None = None
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            if not user_id:
+                raise ValueError(
+                    "save_recipe ctx path: user_id обязателен (fail-closed) — "
+                    "пустой user_id ослабил бы UNIQUE-дедуп operation_id."
+                )
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "save_recipe ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — leak across tenant."
+                )
+            from sreda.services.operation_id import (
+                compute_normalized_title_hash,
+                compute_operation_id_create,
+            )
+            from sreda.services.text_normalization import normalize_for_dedup
+
+            op_id_value = compute_operation_id_create(
+                plan_id=ctx.execution_id, step_id=ctx.step_id, action="create",
+                entity_type="recipe", logical_key=normalize_for_dedup(title_clean))
+            nhash_value = compute_normalized_title_hash(
+                title_clean, entity_type="recipe", tenant_id=tenant_id,
+                user_id=user_id or "") or None
+
+            # op_id ФУНКЦИОНАЛЕН, не декоративен (гейт R1: субагент+Codex high+medium): pre-check по
+            # op_id ловит повтор того же tool_call И морфовариант той же леммы в этом же батче (строка
+            # с тем же op_id уже flushed) → existing БЕЗ второй вставки (анти-IntegrityError, т.к.
+            # ix_recipes_operation_id UNIQUE). Затем hash — кросс-ходовой семантический ключ (лемма):
+            # ловит морфовариант, что fuzzy выше пропустил («Борщи»≠«Борщ» для fuzzy, одна лемма для hash).
+            existing_op = (
+                self.session.query(Recipe)
+                .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                .one_or_none()
+            )
+            if existing_op is not None:
+                return existing_op, False
+            # ОГРАНИЧЕНИЕ (Codex R2 MINOR): ix_recipes_normalized_title НЕ unique → семантический
+            # дедуп по hash — это PRE-CHECK (query), не атомарный констрейнт. На сингл-тенанте ReAct
+            # (последовательные ходы, без конкуренции) гонки нет. Полный гонко-безопасный замок (partial
+            # UNIQUE на hash + миграция) — если семья пойдёт на многопоточные пути → отдельной задачей.
+            if nhash_value is not None:
+                existing_hash = (
+                    self.session.query(Recipe)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id,
+                               normalized_title_hash=nhash_value)
+                    .first()
+                )
+                if existing_hash is not None:
+                    return existing_hash, False
+
         normalised_ings = _normalise_ingredients(ingredients)
 
         # cooking_time_minutes: cap to 1..600 (10 hours) — sanity limit
@@ -237,23 +298,39 @@ class HousewifeRecipeService:
             tags_json=json.dumps(tags, ensure_ascii=False) if tags else None,
             created_at=_utcnow(),
             updated_at=_utcnow(),
+            operation_id=op_id_value,  # #202: key-policy (ctx-путь) / None (легаси)
+            normalized_title_hash=nhash_value,
         )
         self.session.add(recipe)
-        # Flush so recipe.id is assignable as FK even before commit.
-        self.session.flush()
+        try:
+            # Flush so recipe.id is assignable as FK even before commit.
+            self.session.flush()
 
-        for idx, ing in enumerate(normalised_ings):
-            self.session.add(
-                RecipeIngredient(
-                    id=f"ring_{uuid4().hex[:20]}",
-                    recipe_id=recipe.id,
-                    title=ing.title,
-                    quantity_text=ing.quantity_text,
-                    is_optional=ing.is_optional,
-                    sort_order=idx,
+            for idx, ing in enumerate(normalised_ings):
+                self.session.add(
+                    RecipeIngredient(
+                        id=f"ring_{uuid4().hex[:20]}",
+                        recipe_id=recipe.id,
+                        title=ing.title,
+                        quantity_text=ing.quantity_text,
+                        is_optional=ing.is_optional,
+                        sort_order=idx,
+                    )
                 )
-            )
-        self.session.commit()
+            self.session.commit()
+        except IntegrityError:
+            # Гонка по operation_id (другой writer вставил тот же op_id между pre-check и commit) —
+            # на сингл-тенанте ReAct не ожидается, но fail-safe: откат + replay существующей (не крах).
+            self.session.rollback()
+            if op_id_value is not None:
+                racer = (
+                    self.session.query(Recipe)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                    .one_or_none()
+                )
+                if racer is not None:
+                    return racer, False
+            raise
         self._invalidate_cache(tenant_id, user_id)
         return recipe, True
 
@@ -287,6 +364,25 @@ class HousewifeRecipeService:
         result = SaveRecipesBatchResult()
         existing_index = self._existing_by_normalised_title(tenant_id, user_id)
         seen_in_batch: set[str] = set()
+
+        # #202: ctx-путь оснащает КАЖДЫЙ рецепт батча ключами (op_id по своему title как logical_key →
+        # разные рецепты = разные op_id; ctx общий на батч). Легаси (ctx None) — ключи None.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+        from sreda.services.operation_id import (
+            compute_normalized_title_hash,
+            compute_operation_id_create,
+        )
+        from sreda.services.text_normalization import normalize_for_dedup
+
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            if not user_id:
+                raise ValueError(
+                    "save_recipes_batch ctx path: user_id обязателен (fail-closed).")
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "save_recipes_batch ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — leak across tenant.")
 
         for raw in recipes or []:
             if not isinstance(raw, dict):
@@ -357,6 +453,27 @@ class HousewifeRecipeService:
                 except (ValueError, TypeError):
                     ctm = None
 
+            op_id_value: str | None = None
+            nhash_value: str | None = None
+            if ctx is not None:
+                op_id_value = compute_operation_id_create(
+                    plan_id=ctx.execution_id, step_id=ctx.step_id, action="create",
+                    entity_type="recipe", logical_key=normalize_for_dedup(title))
+                nhash_value = compute_normalized_title_hash(
+                    title, entity_type="recipe", tenant_id=tenant_id,
+                    user_id=user_id or "") or None
+                # #202 R1 (гейт): морфовариант той же леммы в батче (или повтор) → строка с тем же
+                # op_id уже flushed → схлопнуть как дубль БЕЗ второй вставки (анти-IntegrityError по
+                # UNIQUE ix_recipes_operation_id; in-batch dedup по _normalise_title их не ловит).
+                existing_op = (
+                    self.session.query(Recipe)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                    .one_or_none()
+                )
+                if existing_op is not None:
+                    result.duplicates_in_batch.append(title)
+                    continue
+
             recipe = Recipe(
                 id=f"rec_{uuid4().hex[:24]}",
                 tenant_id=tenant_id,
@@ -375,6 +492,8 @@ class HousewifeRecipeService:
                 tags_json=tags_json,
                 created_at=_utcnow(),
                 updated_at=_utcnow(),
+                operation_id=op_id_value,  # #202: key-policy (ctx) / None (легаси)
+                normalized_title_hash=nhash_value,
             )
             self.session.add(recipe)
             self.session.flush()
