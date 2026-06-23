@@ -23,6 +23,7 @@ update(без расписания), complete, uncomplete, cancel, delete}. Ос
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import operator
 import re
@@ -85,10 +86,24 @@ def _get_checkpointer():
 
 
 def _durable_thread_id(base: str) -> str:
-    """#193: durable thread_id с версией топологии в ПРЕФИКСЕ. ВАЖНО: `checkpoint_ns` зарезервирован
-    LangGraph под подграфы (get_state с ns≠"" ищет subgraph) — НЕЛЬЗЯ использовать как версию топологии.
-    Поэтому версия в префиксе thread_id; bump _REACT_NS → старые checkpoint'ы неактуальны (новый ключ)."""
-    return f"{_REACT_NS}:{base}"
+    """#193: durable thread_id = `{_REACT_NS}:{hmac_sha256(base)}`.
+
+    Версия топологии в ПРЕФИКСЕ (`checkpoint_ns` зарезервирован LangGraph под подграфы — нельзя как
+    версию; bump _REACT_NS → старые checkpoint'ы неактуальны). Хешируем base ЦЕЛИКОМ (чеклист приёмки
+    #193 п.2 «chat_id только HMAC»): в Среде tenant_id = `tenant_{ch}_{account_id}`, т.е. account id
+    (≈chat_id) сидит И в tenant-сегменте — хешировать только chat-сегмент недостаточно. Поэтому весь
+    идентификатор → HMAC; читаемость для ops даёт #192 react_turn_trace (там thread_id плейнтекст).
+
+    Секрет = encryption_key (стабилен между рестартами → ключ детерминирован, durable переживает
+    рестарт). Fail-closed: без ключа durable-персистентность НЕ должна строить guessable-ключ (и saver
+    всё равно не сможет шифровать) → исключение (ловится в try-блоках вызывающих)."""
+    from sreda.config.settings import get_settings
+    secret = get_settings().encryption_key
+    if not secret:
+        from sreda.services.encryption import EncryptionConfigError
+        raise EncryptionConfigError("durable ReAct (SREDA_REACT_PERSIST_ENABLED) требует SREDA_ENCRYPTION_KEY")
+    digest = hmac.new(secret.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{_REACT_NS}:{digest}"
 
 
 def _build_thread_config(base: str, gen: int) -> dict:
@@ -2017,9 +2032,10 @@ async def handle_turn(
             # #193 (CR R1 MAJOR): durable-ключ стабилен → восстановление не через gen-bump.
             # Транзиентный краш (LLM-таймаут и т.п.) терпим; после N подряд — poison-checkpoint →
             # сброс треда (аналог свежего треда на эфемерном пути), иначе юзер залипнет навсегда.
-            _dur = _durable_thread_id(base)
-            n = _DURABLE_CRASH.get(_dur, 0) + 1
+            # _durable_thread_id внутри try — fail-closed raise (нет ключа) не должен утечь из except.
             try:
+                _dur = _durable_thread_id(base)
+                n = _DURABLE_CRASH.get(_dur, 0) + 1
                 if n >= _DURABLE_CRASH_LIMIT:
                     _get_checkpointer().delete_thread(_dur)
                     _DURABLE_CRASH.pop(_dur, None)
