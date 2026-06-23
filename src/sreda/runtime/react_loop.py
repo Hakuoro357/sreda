@@ -796,7 +796,7 @@ _FAMILY_WRITE_POLICY: dict[str, str] = {
     "web": "metered_read",      # fetch_url/get_weather — чтение; web_search — +счётчик квоты (терпим)
     "recipes": "idempotent",    # #202: save_recipe/batch на ctx-пути пишут op_id+hash; fuzzy-дедуп ловит повтор контента
     "menu": "unkeyed",
-    "household": "unkeyed",
+    "household": "idempotent",  # #202: add_member пишет op_id+hash (pre-check + батч-морфо guard через коммит-на-строку)
     "checklists": "idempotent",  # #202: create_list пишет op_id+hash (pre-check); add_items — item-дедуп по title
     "memory": "unkeyed",        # сохранение заметки без op_id
 }

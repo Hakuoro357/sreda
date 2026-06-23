@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.housewife import FAMILY_ROLES, FamilyMember
@@ -103,6 +104,51 @@ class HousewifeFamilyService:
                 )
                 return existing
 
+        # #202 household: ctx-путь (ReAct) оснащает op_id+hash (эталон recipes/checklists). pre-check по
+        # op_id ловит повтор tool_call И морфовариант той же леммы в батче (_normalise_name только
+        # whitespace/регистр — «Маша»/«Маши» им НЕ схлопываются, а op_id по лемме совпал бы → коллизия;
+        # add_members_batch коммитит каждого → следующий видит). hash — кросс-ходовой ключ-лемма. Легаси
+        # (ctx None) → ключи None, байт-в-байт. fail-closed user_id + tenant-guard.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        op_id_value: str | None = None
+        nhash_value: str | None = None
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            if not user_id:
+                raise ValueError("add_member ctx path: user_id обязателен (fail-closed).")
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    f"add_member ctx path: ctx.tenant_id={ctx.tenant_id!r} != {tenant_id!r} — leak.")
+            from sreda.services.operation_id import (
+                compute_normalized_title_hash,
+                compute_operation_id_create,
+            )
+            from sreda.services.text_normalization import normalize_for_dedup
+
+            op_id_value = compute_operation_id_create(
+                plan_id=ctx.execution_id, step_id=ctx.step_id, action="create",
+                entity_type="family_member", logical_key=normalize_for_dedup(clean_name))
+            nhash_value = compute_normalized_title_hash(
+                clean_name, entity_type="family_member", tenant_id=tenant_id,
+                user_id=user_id or "") or None
+            existing_op = (
+                self.session.query(FamilyMember)
+                .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                .one_or_none()
+            )
+            if existing_op is not None:
+                return existing_op
+            if nhash_value is not None:
+                existing_hash = (
+                    self.session.query(FamilyMember)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id,
+                               normalized_title_hash=nhash_value)
+                    .first()
+                )
+                if existing_hash is not None:
+                    return existing_hash
+
         row = FamilyMember(
             id=f"fm_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -114,9 +160,24 @@ class HousewifeFamilyService:
             notes=(notes or "").strip()[:500] or None,
             created_at=_utcnow(),
             updated_at=_utcnow(),
+            operation_id=op_id_value,  # #202: key-policy (ctx) / None (легаси)
+            normalized_title_hash=nhash_value,
         )
         self.session.add(row)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # Гонка по operation_id — на сингл-тенанте ReAct не ожидается, fail-safe: откат + replay.
+            self.session.rollback()
+            if op_id_value is not None:
+                racer = (
+                    self.session.query(FamilyMember)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                    .one_or_none()
+                )
+                if racer is not None:
+                    return racer
+            raise
         return row
 
     def update_member(

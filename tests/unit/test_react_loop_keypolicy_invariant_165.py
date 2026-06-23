@@ -60,12 +60,12 @@ def test_current_prunable_state_pin_165():
     """Регресс-пин текущего безопасного состояния: режем shopping (idempotent) + web (metered_read);
     guard recovery-добора — 5 unkeyed-семей + web (metered_read, rerun-unsafe). Семью сделают
     replay-safe → "idempotent" → пин обновить ОСОЗНАННО."""
-    # #202: recipes + checklists оснащены ключами (create пишет op_id+hash на ctx-пути) →
+    # #202: recipes + checklists + household оснащены ключами (create пишет op_id+hash на ctx-пути) →
     # idempotent → переехали из rerun-unsafe в prunable. Пин обновлён ОСОЗНАННО.
     assert react_loop._PRUNABLE_FAMILIES == frozenset(
-        {"shopping", "web", "recipes", "checklists"})
+        {"shopping", "web", "recipes", "checklists", "household"})
     assert react_loop._UNKEYED_WRITE_FAMILIES == frozenset(
-        {"menu", "household", "memory", "web"})
+        {"menu", "memory", "web"})
 
 
 def test_core_mutating_derivation_202():
