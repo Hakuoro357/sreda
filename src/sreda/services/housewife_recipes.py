@@ -206,6 +206,40 @@ class HousewifeRecipeService:
                 )
                 return existing_row, False
 
+        # #202 семья recipes: на ReAct-пути (ctx) оснащаем строку ключами идемпотентности
+        # (operation_id + normalized_title_hash) — key-policy для гейта Фазы 5 + аудит. Сам дедуп
+        # создания обеспечивает fuzzy/exact-блок ВЫШЕ (богаче — ловит near-dup; на повтор того же
+        # контента в ходе вернёт существующий ДО этой точки). Легаси (ctx None) — ключи None,
+        # поведение байт-в-байт. fail-closed user_id + tenant-guard как в housewife_reminders.schedule.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        op_id_value: str | None = None
+        nhash_value: str | None = None
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            if not user_id:
+                raise ValueError(
+                    "save_recipe ctx path: user_id обязателен (fail-closed) — "
+                    "пустой user_id ослабил бы UNIQUE-дедуп operation_id."
+                )
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "save_recipe ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — leak across tenant."
+                )
+            from sreda.services.operation_id import (
+                compute_normalized_title_hash,
+                compute_operation_id_create,
+            )
+            from sreda.services.text_normalization import normalize_for_dedup
+
+            op_id_value = compute_operation_id_create(
+                plan_id=ctx.execution_id, step_id=ctx.step_id, action="create",
+                entity_type="recipe", logical_key=normalize_for_dedup(title_clean))
+            nhash_value = compute_normalized_title_hash(
+                title_clean, entity_type="recipe", tenant_id=tenant_id,
+                user_id=user_id or "") or None
+
         normalised_ings = _normalise_ingredients(ingredients)
 
         # cooking_time_minutes: cap to 1..600 (10 hours) — sanity limit
@@ -237,6 +271,8 @@ class HousewifeRecipeService:
             tags_json=json.dumps(tags, ensure_ascii=False) if tags else None,
             created_at=_utcnow(),
             updated_at=_utcnow(),
+            operation_id=op_id_value,  # #202: key-policy (ctx-путь) / None (легаси)
+            normalized_title_hash=nhash_value,
         )
         self.session.add(recipe)
         # Flush so recipe.id is assignable as FK even before commit.
@@ -287,6 +323,25 @@ class HousewifeRecipeService:
         result = SaveRecipesBatchResult()
         existing_index = self._existing_by_normalised_title(tenant_id, user_id)
         seen_in_batch: set[str] = set()
+
+        # #202: ctx-путь оснащает КАЖДЫЙ рецепт батча ключами (op_id по своему title как logical_key →
+        # разные рецепты = разные op_id; ctx общий на батч). Легаси (ctx None) — ключи None.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+        from sreda.services.operation_id import (
+            compute_normalized_title_hash,
+            compute_operation_id_create,
+        )
+        from sreda.services.text_normalization import normalize_for_dedup
+
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            if not user_id:
+                raise ValueError(
+                    "save_recipes_batch ctx path: user_id обязателен (fail-closed).")
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "save_recipes_batch ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — leak across tenant.")
 
         for raw in recipes or []:
             if not isinstance(raw, dict):
@@ -357,6 +412,16 @@ class HousewifeRecipeService:
                 except (ValueError, TypeError):
                     ctm = None
 
+            op_id_value: str | None = None
+            nhash_value: str | None = None
+            if ctx is not None:
+                op_id_value = compute_operation_id_create(
+                    plan_id=ctx.execution_id, step_id=ctx.step_id, action="create",
+                    entity_type="recipe", logical_key=normalize_for_dedup(title))
+                nhash_value = compute_normalized_title_hash(
+                    title, entity_type="recipe", tenant_id=tenant_id,
+                    user_id=user_id or "") or None
+
             recipe = Recipe(
                 id=f"rec_{uuid4().hex[:24]}",
                 tenant_id=tenant_id,
@@ -375,6 +440,8 @@ class HousewifeRecipeService:
                 tags_json=tags_json,
                 created_at=_utcnow(),
                 updated_at=_utcnow(),
+                operation_id=op_id_value,  # #202: key-policy (ctx) / None (легаси)
+                normalized_title_hash=nhash_value,
             )
             self.session.add(recipe)
             self.session.flush()

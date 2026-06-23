@@ -716,7 +716,7 @@ _FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
 _FAMILY_WRITE_POLICY: dict[str, str] = {
     "shopping": "idempotent",   # add_items — op_id+ON CONFLICT; mark/remove/update/clear — state-идемпотентны
     "web": "metered_read",      # fetch_url/get_weather — чтение; web_search — +счётчик квоты (терпим)
-    "recipes": "unkeyed",       # пишет сущности без op_id/идемпотентности — ждёт оснащения
+    "recipes": "idempotent",    # #202: save_recipe/batch на ctx-пути пишут op_id+hash; fuzzy-дедуп ловит повтор контента
     "menu": "unkeyed",
     "household": "unkeyed",
     "checklists": "unkeyed",

@@ -320,8 +320,9 @@ async def test_flag_off_full_bind_no_pruning(db_session, monkeypatch):
 @pytest.mark.asyncio
 async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
     """Срез B R3-карв-аут (Codex high R2 MAJOR): семьи БЕЗ ключа идемпотентности
-    (recipes/menu/household/checklists) при ВКЛ обрезке остаются ПРИВЯЗАННЫМИ (иначе повтор на
-    recovery-проходе задвоит запись, #163). Режем только shopping (есть ключ) + web (чтение)."""
+    (menu/household/checklists/memory) при ВКЛ обрезке остаются ПРИВЯЗАННЫМИ (иначе повтор на
+    recovery-проходе задвоит запись, #163). Режем shopping/recipes (есть ключ) + web (чтение).
+    #202: recipes оснащена ключами → переехала в prunable (режется как shopping)."""
     u = seed_telegram_user(db_session)
     db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
     stub = _RecordingStubLLM([AIMessage(content="Привет!")])
@@ -331,12 +332,12 @@ async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
         inbound_message_id="lazy165-carveout-msg", channel="react")
     bound = stub.binds[0]
     # unkeyed-write семьи ВСЕГДА привязаны даже при обрезке + нейтральном тексте
-    assert "save_recipe" in bound          # recipes
     assert "plan_week_menu" in bound       # menu
     assert "add_family_members" in bound   # household
     assert "create_checklist" in bound     # checklists
-    # prunable (shopping/web) на нейтральном тексте НЕ предзагружены (режутся)
+    # prunable (shopping/recipes/web) на нейтральном тексте НЕ предзагружены (режутся)
     assert "add_shopping_items" not in bound
+    assert "save_recipe" not in bound      # #202: recipes теперь idempotent → prunable
     assert "web_search" not in bound
 
 
