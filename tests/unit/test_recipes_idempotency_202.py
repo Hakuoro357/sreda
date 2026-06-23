@@ -80,7 +80,7 @@ def test_save_recipes_batch_ctx_populates_keys_202(s):
     """Батч на ctx-пути → каждый рецепт получает свой operation_id (по своему title) + hash."""
     svc = HousewifeRecipeService(s)
     with bind_tool_runtime(_ctx()):
-        res = svc.save_recipes_batch(
+        svc.save_recipes_batch(
             tenant_id="t1", user_id="u1",
             recipes=[{"title": "Борщ", "ingredients": []},
                      {"title": "Плов", "ingredients": []}])

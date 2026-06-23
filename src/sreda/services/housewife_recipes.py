@@ -253,6 +253,10 @@ class HousewifeRecipeService:
             )
             if existing_op is not None:
                 return existing_op, False
+            # ОГРАНИЧЕНИЕ (Codex R2 MINOR): ix_recipes_normalized_title НЕ unique → семантический
+            # дедуп по hash — это PRE-CHECK (query), не атомарный констрейнт. На сингл-тенанте ReAct
+            # (последовательные ходы, без конкуренции) гонки нет. Полный гонко-безопасный замок (partial
+            # UNIQUE на hash + миграция) — если семья пойдёт на многопоточные пути → отдельной задачей.
             if nhash_value is not None:
                 existing_hash = (
                     self.session.query(Recipe)
