@@ -194,6 +194,19 @@ def test_short_dialogue_passthrough_on():
     assert out[0].content == "SP"  # без compaction-note
 
 
+def test_budget_override_triggers_on_short(monkeypatch):
+    """env-override бюджета: низкий budget → компакция срабатывает даже на коротком диалоге."""
+    monkeypatch.setattr(rc, "KEEP_HEAD_BLOCKS", 0)
+    monkeypatch.setattr(rc, "KEEP_TAIL_BLOCKS", 0)
+    msgs = [_ai(f"реплика {k} " * 5) for k in range(10)] + [_human("текущий")]
+    # без override (кодовый дефолт 20000) — мало, passthrough
+    assert build_model_input("SP", msgs, enabled=True)[1:] == msgs
+    # низкий budget=80 → компакция сработала (note + меньше сообщений)
+    out = build_model_input("SP", msgs, enabled=True, budget=80)
+    assert "свёрнут" in out[0].content
+    assert len(out) < len(msgs) + 1
+
+
 # --- идемпотентность / note -------------------------------------------------
 
 def test_repeat_projection_idempotent(monkeypatch):

@@ -396,6 +396,12 @@ class Settings(BaseSettings):
     react_compact_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_COMPACT_ENABLED"
     )
+    # #194: переопределение char-бюджета компакции без передеплоя (калибровка/наблюдение). 0 (дефолт) →
+    # кодовая константа TOTAL_BUDGET_CHARS. Поставить низкое значение → компакция сработает на коротком
+    # диалоге (увидеть в логах react_compaction); вернуть в норму/0 после замера.
+    react_compact_budget_chars: int = Field(
+        default=0, validation_alias="SREDA_REACT_COMPACT_BUDGET_CHARS"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must

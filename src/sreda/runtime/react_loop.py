@@ -83,6 +83,15 @@ def _compact_enabled() -> bool:
         return False
 
 
+def _compact_budget() -> int | None:
+    """#194: env-переопределение char-бюджета компакции (калибровка/наблюдение). 0 → кодовый дефолт."""
+    try:
+        from sreda.config.settings import get_settings
+        return get_settings().react_compact_budget_chars or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _get_checkpointer():
     """#193: ВКЛ → durable EncryptedSqlCheckpointSaver (стабильный ключ, переживает рестарт);
     ВЫКЛ → процессный InMemorySaver (прежнее поведение)."""
@@ -1474,7 +1483,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             sp = f"{sp}\n\n{nudge}"
         # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
         # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
-        _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled())
+        _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(), budget=_compact_budget())
         # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
         #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
         #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);

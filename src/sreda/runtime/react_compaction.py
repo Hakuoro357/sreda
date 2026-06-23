@@ -25,14 +25,16 @@ from langchain_core.messages import (
 logger = logging.getLogger(__name__)
 
 # --- Пороги (g-018: rationale + bump-policy) --------------------------------
-# Размер меряем по СИМВОЛАМ как ГРУБОЕ приближение к токенам. ВНИМАНИЕ (CR mimocode): кириллица в BPE
-# ДОРОГА — 1 символ ≈ 1.5–3 токена (НЕ «1+»). Значит char-бюджет должен быть СУЩЕСТВЕННО МЕНЬШЕ окна
-# модели в токенах: при окне ~32K и ~2.5 токена/символ безопасный потолок ≈ 32000/2.5 ≈ 12–13K символов.
-# fail-closed НЕ спасает от переполнения по размеру (только от рваных пар) → бюджет ОБЯЗАН быть
-# консервативным, иначе валидная проекция всё равно даст prompt_too_long. ТОЧНОЕ значение —
-# КАЛИБРОВАТЬ staging-smoke'ом под реальное окно Mercury/Осы ДО включения на проде; точный токен-счёт
-# (tiktoken) + LLM-сводка → отдельный шаг L4. BUMP-policy: менять только после замера, согласовать с владельцем.
-TOTAL_BUDGET_CHARS = 12000   # консервативный потолок видимого промпта (sp+note + проекция), под кириллицу
+# Размер меряем по СИМВОЛАМ как ГРУБОЕ приближение к токенам (кириллица дороже латиницы, ~1–2 токена/символ).
+# ОКНА ПРОВЕРЕНЫ (2026-06-23, веб): Mercury-2 (Фредди) = 128K токенов (выход до 50K); gpt-oss-120b (Оса @
+# Groq) = 128K. Оба 128K → компакция = ЗАЩИТНАЯ СЕТКА для очень длинных диалогов, не повседневный режим.
+# Бюджет: оставляем запас на ответ модели + tool-схемы. 40000 символов ≈ 40–80K токенов (при 1–2 ток/символ)
+# — заметно ниже 128K, с большим запасом. Правит по МЕНЬШЕМУ окну (сейчас оба 128K). fail-closed НЕ спасает
+# от переполнения по размеру (только от рваных пар). BUMP-policy: КАЛИБРОВАТЬ staging-smoke'ом перед
+# включением (точный токен-счёт tiktoken + LLM-сводка → отдельный шаг L4); менять после замера, согласовать.
+TOTAL_BUDGET_CHARS = 20000   # потолок видимого промпта (sp+note + проекция). Снижен 40000→20000 (Борис
+                             # 2026-06-23): окно 128K оставляет огромный запас, но для наблюдаемости и
+                             # ранней страховки режем при ~10 страницах текста. Калибровать на стенде.
 PREVIEW_CHARS = 600          # порог «большого» tool-результата И длина головы текстового превью
 STRUCTURED_JSON_PARSE_LIMIT = 50000  # выше — НЕ парсим JSON (CPU/RAM), режем текстовым префиксом
 KEEP_FRESH_TOOLS = 3         # последние N tool-результатов — целиком (модель берёт из них id/ref)
@@ -198,11 +200,16 @@ def _assert_valid_tool_sequence(messages: Sequence[BaseMessage]) -> bool:
     return True
 
 
-def _project(messages: list[BaseMessage], sp_size: int) -> tuple[list[BaseMessage], bool]:
-    """Ядро: вернуть (projected_messages, compacted). Дроп — только блоками; current_turn не режем."""
+def _project(
+    messages: list[BaseMessage], sp_size: int, budget: int | None = None
+) -> tuple[list[BaseMessage], bool]:
+    """Ядро: вернуть (projected_messages, compacted). Дроп — только блоками; current_turn не режем.
+
+    budget: None → кодовая константа TOTAL_BUDGET_CHARS; >0 → переопределение (env, для калибровки)."""
+    budget = budget or TOTAL_BUDGET_CHARS
     blocks = segment_messages(messages)
     total = sp_size + sum(b.char_size() for b in blocks)
-    if total <= TOTAL_BUDGET_CHARS:
+    if total <= budget:
         return list(messages), False  # уже влезает → passthrough
 
     # CR: при компакции в финал добавится COMPACTION_NOTE → резервируем его длину в бюджете, иначе
@@ -224,34 +231,42 @@ def _project(messages: list[BaseMessage], sp_size: int) -> tuple[list[BaseMessag
         return overhead + sum(b.char_size() for b in (head + middle + tail + current_blocks))
 
     # дропаем старейшие: сначала середина, затем head, затем tail (current_turn НИКОГДА)
-    while middle and _cur_total() > TOTAL_BUDGET_CHARS:
+    while middle and _cur_total() > budget:
         middle.pop(0)
-    while head and _cur_total() > TOTAL_BUDGET_CHARS:
+    while head and _cur_total() > budget:
         head.pop(0)
-    while tail and _cur_total() > TOTAL_BUDGET_CHARS:
+    while tail and _cur_total() > budget:
         tail.pop(0)
     # current_blocks один может быть > бюджета — оставляем целиком (graceful, без исключения)
     return _flatten(head + middle + tail + current_blocks), True
 
 
 def build_model_input(
-    system_prompt: str, messages: Sequence[BaseMessage], *, enabled: bool
+    system_prompt: str, messages: Sequence[BaseMessage], *, enabled: bool, budget: int | None = None
 ) -> list[BaseMessage]:
     """Вход для LLM: [SystemMessage(sp'), *проекция]. OFF → [SystemMessage(sp), *messages] (как сейчас).
 
-    Note дописывается ПОСЛЕ system_prompt (а sp уже содержит guard_nudge от вызывающего) → порядок
-    sp → nudge → compaction-note. Любой сбой проекции/невалидная последовательность → fail-closed на
-    ПОЛНУЮ историю БЕЗ note.
+    budget: None → кодовая константа; >0 → переопределение (env, калибровка). Note дописывается ПОСЛЕ
+    system_prompt (а sp уже содержит guard_nudge от вызывающего) → порядок sp → nudge → compaction-note.
+    Любой сбой проекции/невалидная последовательность → fail-closed на ПОЛНУЮ историю БЕЗ note.
     """
     if not enabled:
         return [SystemMessage(system_prompt), *messages]
     try:
-        projected, compacted = _project(list(messages), len(system_prompt))
+        projected, compacted = _project(list(messages), len(system_prompt), budget)
     except Exception:  # noqa: BLE001 — компакция не валит ход
         logger.warning("react_compaction: projection failed → full history", exc_info=True)
         return [SystemMessage(system_prompt), *messages]
     if not _assert_valid_tool_sequence(projected):
         logger.warning("react_compaction: invalid projection → fail-closed full history")
         return [SystemMessage(system_prompt), *messages]
+    if compacted:
+        # наблюдаемость (PII-safe — только числа): видно, что компакция реально сработала
+        logger.info(
+            "react_compaction: trimmed %d→%d msgs, ~%d→%d chars (budget=%d)",
+            len(messages), len(projected),
+            sum(_content_len(m) for m in messages), sum(_content_len(m) for m in projected),
+            budget or TOTAL_BUDGET_CHARS,
+        )
     sp_final = system_prompt + COMPACTION_NOTE if compacted else system_prompt
     return [SystemMessage(sp_final), *projected]
