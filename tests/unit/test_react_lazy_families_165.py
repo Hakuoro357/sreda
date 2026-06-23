@@ -131,13 +131,16 @@ async def test_guard_loads_family_when_model_refuses(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_guard_does_not_fire_on_out_of_scope(db_session):
-    """Срез A пункт 2 (анти-false-positive): вне-скоупная просьба («оплати счёт» — нет семьи
-    в срезе) → guard НЕ триггерит, отказ отдаётся как есть, один проход."""
+async def test_guard_full_recovery_then_ends_on_out_of_scope(db_session):
+    """#202: вне-скоупная просьба («оплати счёт» — инструмента нет вообще) → отказ → guard делает
+    ОДНУ попытку полного восстановления (добор всех семей; вдруг канон-интент мимо словаря) → Среда
+    снова отказывает (дела нет) → ход завершается отказом. Цена — один лишний прогон, итог корректный
+    («не умею»). Анти-петля: повторно guard не дёргается (guard_full_attempted)."""
     u = seed_telegram_user(db_session)
     db_session.commit()
     scripted = [
-        AIMessage(content="Извини, оплачивать счета я не умею."),  # ОТКАЗ, нет семьи
+        AIMessage(content="Извини, оплачивать счета я не умею."),  # отказ → full-recovery
+        AIMessage(content="Извини, это я пока не умею."),          # после восстановления — снова отказ
         AIMessage(content="..."),
     ]
     stub = _RecordingStubLLM(scripted)
@@ -146,8 +149,8 @@ async def test_guard_does_not_fire_on_out_of_scope(db_session):
         thread_id="lazy165-oos", llm=stub, user_text="оплати счёт за свет",
         inbound_message_id="lazy165-oos-msg", channel="react")
 
-    # guard НЕ сработал → ровно ОДИН проход chat (нет повторного bind)
-    assert len(stub.binds) == 1, f"guard ложно сработал: {len(stub.binds)} проходов"
+    # guard сработал РОВНО раз (full-recovery), затем завершился (анти-петля guard_full_attempted)
+    assert len(stub.binds) == 2, f"ожидался один full-recovery retry, не больше: {len(stub.binds)}"
     assert "не умею" in (reply or "").lower()
 
 
@@ -319,10 +322,10 @@ async def test_flag_off_full_bind_no_pruning(db_session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
-    """Срез B R3-карв-аут (Codex high R2 MAJOR): семьи БЕЗ ключа идемпотентности
-    (menu/household/checklists/memory) при ВКЛ обрезке остаются ПРИВЯЗАННЫМИ (иначе повтор на
-    recovery-проходе задвоит запись, #163). Режем shopping/recipes (есть ключ) + web (чтение).
-    #202: recipes оснащена ключами → переехала в prunable (режется как shopping)."""
+    """Срез B R3-карв-аут (Codex high R2 MAJOR): семьи БЕЗ ключа идемпотентности (осталась memory)
+    при ВКЛ обрезке остаются ПРИВЯЗАННЫМИ (иначе повтор на recovery-проходе задвоит запись, #163).
+    Режем shopping/recipes/checklists/household/menu (re-issue-safe) + web (чтение).
+    #202: recipes+checklists+household (op_id) + menu (state-идемпотентна по upsert) → prunable."""
     u = seed_telegram_user(db_session)
     db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
     stub = _RecordingStubLLM([AIMessage(content="Привет!")])
@@ -331,13 +334,14 @@ async def test_unkeyed_write_families_always_bound_when_pruning(db_session):
         thread_id="lazy165-carveout", llm=stub, user_text="привет, как дела",  # нейтральный
         inbound_message_id="lazy165-carveout-msg", channel="react")
     bound = stub.binds[0]
-    # unkeyed-write семьи ВСЕГДА привязаны даже при обрезке + нейтральном тексте
-    assert "plan_week_menu" in bound       # menu
-    assert "add_family_members" in bound   # household
-    assert "create_checklist" in bound     # checklists
-    # prunable (shopping/recipes/web) на нейтральном тексте НЕ предзагружены (режутся)
+    # unkeyed-write семья (осталась memory) ВСЕГДА привязана даже при обрезке + нейтральном тексте
+    assert "save_core_fact" in bound       # memory (ещё unkeyed)
+    # prunable (shopping/recipes/checklists/household/menu/web) на нейтральном тексте НЕ предзагружены
     assert "add_shopping_items" not in bound
-    assert "save_recipe" not in bound      # #202: recipes теперь idempotent → prunable
+    assert "save_recipe" not in bound       # #202: recipes idempotent → prunable
+    assert "create_checklist" not in bound  # #202: checklists idempotent → prunable
+    assert "add_family_members" not in bound  # #202: household idempotent → prunable
+    assert "plan_week_menu" not in bound    # #202: menu state-idempotent → prunable
     assert "web_search" not in bound
 
 
@@ -349,15 +353,96 @@ async def test_guard_suppressed_after_unkeyed_write(db_session, monkeypatch):
     db_session.commit()
     monkeypatch.setattr(react_loop, "_guard_family", lambda _t, _a: "web")  # guard БЫ выбрал web
     stub = _RecordingStubLLM([
-        AIMessage(content="", tool_calls=[{  # пасс1: инструмент unkeyed-семьи (checklists)
-            "name": "list_checklists", "args": {}, "id": "lc"}]),
+        AIMessage(content="", tool_calls=[{  # пасс1: unkeyed-запись (memory; #202 menu уже keyed)
+            "name": "save_core_fact", "args": {"content": "любит борщ"}, "id": "sf"}]),
         AIMessage(content="Извини, искать в сети пока не умею."),  # пасс2: отказ (web-ish)
         AIMessage(content="..."),
     ])
     await react_loop.handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
-        thread_id="lazy165-unkeyed-guard", llm=stub, user_text="покажи чек-листы",
+        thread_id="lazy165-unkeyed-guard", llm=stub, user_text="запомни: любит борщ",
         inbound_message_id="lazy165-unkeyed-guard-msg", channel="react")
     # guard НЕ сработал (wrote_unkeyed) → нет 3-го прохода с web; web не догружен
     assert len(stub.binds) == 2, f"guard сработал после unkeyed-write: {len(stub.binds)} проходов"
     assert all("web_search" not in b for b in stub.binds)
+
+
+@pytest.mark.asyncio
+async def test_need_family_loads_checklists_reachable_202(db_session):
+    """#202 (Codex medium R1 CRITICAL — reject): checklists стал prunable, НО достижим через
+    need_family на pruned-тенанте (роутер-промах канон-интента = лишний шаг, НЕ недоступность,
+    строка ~740 'НЕ отказ'). need_family(checklists) → create_checklist доступен и выполняется."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
+    scripted = [
+        AIMessage(content="", tool_calls=[{
+            "name": "need_family", "args": {"family": "checklists"}, "id": "nf"}]),
+        AIMessage(content="", tool_calls=[{
+            "name": "create_checklist", "args": {"title": "план кроя"}, "id": "cc"}]),
+        AIMessage(content="Готово."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy202-cl", llm=stub, user_text="сделай вот это",
+        inbound_message_id="lazy202-cl-msg", channel="react")
+    assert "create_checklist" not in stub.binds[0], "checklists prunable → не предзагружен на нейтральном"
+    assert len(stub.binds) >= 2 and "create_checklist" in stub.binds[1], (
+        "после need_family(checklists) create_checklist должен быть в наборе")
+    from sreda.db.models.checklists import Checklist
+    rows = db_session.query(Checklist).filter(Checklist.tenant_id == u.tenant_id).all()
+    assert any((c.title or "") == "план кроя" for c in rows), "чек-лист не создан через need_family"
+
+
+@pytest.mark.asyncio
+async def test_guard_full_recovery_on_router_miss_refusal_202(db_session):
+    """#202 (Codex medium R2 CRITICAL): канон-интент мимо словаря-роутера («план кроя» НЕ матчит
+    checklists-корни) на pruned-тенанте → модель отказывает БЕЗ need_family → guard делает FULL-recovery
+    (добирает ВСЕ ленивые семьи) → на ретрае create_checklist доступен и выполняется. Детерминированно,
+    без scripted need_family (доказывает ВОССТАНОВЛЕНИЕ, не только механизм добора)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
+    scripted = [
+        # пасс 1: checklists не предзагружен (роутер промахнулся) → модель отказывает БЕЗ инструмента
+        AIMessage(content="Извини, чек-листы пока не умею."),
+        # пасс 2: после guard FULL-recovery create_checklist в наборе → реальный вызов
+        AIMessage(content="", tool_calls=[{
+            "name": "create_checklist", "args": {"title": "план кроя"}, "id": "cc"}]),
+        AIMessage(content="Готово."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy202-full", llm=stub, user_text="план кроя",
+        inbound_message_id="lazy202-full-msg", channel="react")
+    assert "create_checklist" not in stub.binds[0], "роутер промахнулся по «план кроя» → не предзагружен"
+    assert len(stub.binds) >= 2 and "create_checklist" in stub.binds[1], (
+        "после guard FULL-recovery (отказ + промах роутера) create_checklist должен стать доступен")
+    from sreda.db.models.checklists import Checklist
+    rows = db_session.query(Checklist).filter(Checklist.tenant_id == u.tenant_id).all()
+    assert any((c.title or "") == "план кроя" for c in rows), "чек-лист не создан после full-recovery"
+
+
+@pytest.mark.asyncio
+async def test_guard_suppressed_after_core_write_no_dup_202(db_session):
+    """#202 (Codex medium R3 CRITICAL): после core-записи (add_task — задача без даты, нет
+    семантического дедупа) отказ на второй интент → guard/full-recovery ПОДАВЛЕН (wrote_unkeyed),
+    иначе ретрай пере-создал бы задачу. Задача РОВНО одна; full-recovery-прохода нет (binds==2)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
+    scripted = [
+        AIMessage(content="", tool_calls=[{
+            "name": "add_task", "args": {"title": "купить хлеб"}, "id": "at"}]),  # core durable-write
+        AIMessage(content="Задачу добавила. А рецепт пока не умею."),  # отказ ПОСЛЕ записи
+        AIMessage(content="..."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy202-core", llm=stub, user_text="добавь задачу купить хлеб",
+        inbound_message_id="lazy202-core-msg", channel="react")
+    assert len(stub.binds) == 2, (
+        f"после core-записи guard НЕ должен восстанавливать (нет 3-го прохода): {len(stub.binds)}")
+    from sreda.db.models.tasks import Task
+    tasks = db_session.query(Task).filter(Task.tenant_id == u.tenant_id).all()
+    assert len(tasks) == 1, f"задача РОВНО одна (без дубля от recovery-ретрая): {len(tasks)}"

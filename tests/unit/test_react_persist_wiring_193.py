@@ -50,12 +50,42 @@ def test_flag_off_keeps_gen_key(_persist_off):
 
 
 def test_flag_on_stable_key_and_saver(_persist_on):
-    cfg = RL._build_thread_config("react:t1:hmacX", 2)
-    # СТАБИЛЬНЫЙ ключ с версией в ПРЕФИКСЕ (checkpoint_ns зарезервирован LangGraph под подграфы), gen НЕ в ключе
-    assert cfg["configurable"]["thread_id"] == "react-v1:react:t1:hmacX"
-    assert "checkpoint_ns" not in cfg["configurable"]  # ns="" штатно (не версия топологии)
-    assert RL._durable_thread_id("react:t1:hmacX") == "react-v1:react:t1:hmacX"
+    raw_chat = "40921122"
+    base = f"react:tenant_max_{raw_chat}:{raw_chat}"  # в Среде account id сидит И в tenant
+    cfg = RL._build_thread_config(base, 2)
+    tid = cfg["configurable"]["thread_id"]
+    # версия в ПРЕФИКСЕ (checkpoint_ns зарезервирован LangGraph под подграфы); gen НЕ в ключе
+    assert tid.startswith("react-v1:")
+    assert "checkpoint_ns" not in cfg["configurable"]
+    # чеклист #193 п.2: весь идентификатор хеширован — ни chat_id, ни tenant-сегмент не плейнтекстом
+    assert raw_chat not in tid
+    assert "tenant_max" not in tid
+    assert len(tid) == len("react-v1:") + 64  # sha256 hexdigest
+    # детерминирован (тот же base → тот же ключ → durable переживает рестарт)
+    assert RL._durable_thread_id(base) == tid
     assert isinstance(RL._get_checkpointer(), EncryptedSqlCheckpointSaver)
+
+
+def test_durable_key_hides_raw_chat_id(_persist_on):
+    """ПРАВИЛО #7 чеклист #193 п.2: account id (chat_id, и в tenant) в durable-ключе только HMAC."""
+    raw_chat = "987654321"
+    tid = RL._durable_thread_id(f"react:tenant_max_{raw_chat}:{raw_chat}")
+    assert raw_chat not in tid  # ни в chat-, ни в tenant-сегменте — весь base хеширован
+    # разные base → разные ключи; одинаковые → одинаковые (детерминизм для durable)
+    assert RL._durable_thread_id("react:t:111") != RL._durable_thread_id("react:t:222")
+    assert RL._durable_thread_id("react:t:111") == RL._durable_thread_id("react:t:111")
+
+
+def test_durable_key_fail_closed_without_encryption_key(monkeypatch):
+    """Fail-closed (CR hmac MEDIUM): без encryption_key durable НЕ строит guessable-ключ → исключение."""
+    monkeypatch.setattr(RL, "_persist_enabled", lambda: True)
+    monkeypatch.setenv("SREDA_REACT_PERSIST_ENABLED", "1")
+    monkeypatch.delenv("SREDA_ENCRYPTION_KEY", raising=False)
+    st_mod.get_settings.cache_clear()
+    from sreda.services.encryption import EncryptionConfigError
+    with pytest.raises(EncryptionConfigError):
+        RL._durable_thread_id("react:t:1")
+    st_mod.get_settings.cache_clear()
 
 
 # --- реальный compiled-граф с interrupt -----------------------------------
@@ -164,7 +194,7 @@ async def test_durable_crash_recovery_counter(monkeypatch):
     assert "потеряла контекст" in str(r1)
     await RL.handle_turn(**kw)
     assert calls == {"clear": 1, "delete": 1}  # 2й подряд → delete_thread
-    assert "react-v1:react:t1:crash" not in RL._DURABLE_CRASH  # счётчик сброшен после delete
+    assert RL._durable_thread_id("react:t1:crash") not in RL._DURABLE_CRASH  # счётчик сброшен после delete
 
 
 @pytest.mark.asyncio

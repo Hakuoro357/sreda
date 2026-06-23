@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import delete as sa_delete, select as sa_select, update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.checklists import (
@@ -144,6 +145,51 @@ class ChecklistService:
             if " ".join((cl.title or "").lower().split()) == norm_target:
                 return cl
 
+        # #202 семья checklists: ctx-путь (ReAct) оснащает op_id+hash (эталон recipes) — key-policy для
+        # гейта Фазы 5 + аудит. pre-check по op_id (повтор tool_call → existing) и по hash (кросс-ходовой
+        # семантический ключ-лемма; ловит морфовариант мимо whitespace-дедупа выше) делают ключи
+        # ФУНКЦИОНАЛЬНЫМИ. Легаси (ctx None) → ключи None, поведение байт-в-байт. fail-closed + tenant-guard.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        op_id_value: str | None = None
+        nhash_value: str | None = None
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            if not user_id:
+                raise ValueError("create_list ctx path: user_id обязателен (fail-closed).")
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "create_list ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — leak across tenant.")
+            from sreda.services.operation_id import (
+                compute_normalized_title_hash,
+                compute_operation_id_create,
+            )
+            from sreda.services.text_normalization import normalize_for_dedup
+
+            op_id_value = compute_operation_id_create(
+                plan_id=ctx.execution_id, step_id=ctx.step_id, action="create",
+                entity_type="checklist", logical_key=normalize_for_dedup(clean))
+            nhash_value = compute_normalized_title_hash(
+                clean, entity_type="checklist", tenant_id=tenant_id,
+                user_id=user_id or "") or None
+            existing_op = (
+                self.session.query(Checklist)
+                .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                .one_or_none()
+            )
+            if existing_op is not None:
+                return existing_op
+            if nhash_value is not None:
+                existing_hash = (
+                    self.session.query(Checklist)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id,
+                               normalized_title_hash=nhash_value, status="active")
+                    .first()
+                )
+                if existing_hash is not None:
+                    return existing_hash
+
         now = _utcnow()
         checklist = Checklist(
             id=f"checklist_{uuid4().hex[:24]}",
@@ -153,9 +199,24 @@ class ChecklistService:
             status="active",
             created_at=now,
             updated_at=now,
+            operation_id=op_id_value,  # #202: key-policy (ctx) / None (легаси)
+            normalized_title_hash=nhash_value,
         )
         self.session.add(checklist)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # Гонка по operation_id — на сингл-тенанте ReAct не ожидается, fail-safe: откат + replay.
+            self.session.rollback()
+            if op_id_value is not None:
+                racer = (
+                    self.session.query(Checklist)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                    .one_or_none()
+                )
+                if racer is not None:
+                    return racer
+            raise
         return checklist
 
     def create_list_no_commit(
