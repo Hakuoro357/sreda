@@ -76,6 +76,9 @@ def test_create_checklist_hash_dedup_catches_morpho_202(s):
         c1 = svc.create_list(tenant_id="t1", user_id="u1", title="Покупки")
     with bind_tool_runtime(_ctx(step="s2")):
         c2 = svc.create_list(tenant_id="t1", user_id="u1", title="Покупка")
-    assert s.query(Checklist).count() in (1, 2)
-    if c1.normalized_title_hash == c2.normalized_title_hash:
-        assert c1.id == c2.id, "одинаковый hash → 2-й replay 1-го"
+    # детерминированно (Codex R1 MAJOR): hash-дедуп требует лемматизации (pymorphy). Если недоступна —
+    # морфоформы не схлопнутся → тест неинформативен → пропускаем. Иначе строго: одна лемма → 1 список.
+    if c1.normalized_title_hash != c2.normalized_title_hash:
+        pytest.skip("normalize_for_dedup не схлопнул морфоформы (pymorphy недоступна)")
+    assert s.query(Checklist).count() == 1, "одна лемма → один hash → 2-й replay'ит 1-й"
+    assert c1.id == c2.id

@@ -1966,9 +1966,11 @@ async def handle_turn(
                 tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                 turn_key=turn_key, origin_user_text=user_text)
             # #165 Срез B (R3-карв-аут): пруненый тенант → база = НЕБЕЗОПАСНЫЕ-к-обрезке
-            # ленивые семьи ВСЕГДА (recipes/menu/household/checklists/memory — пишут без ключа,
-            # дубль на recovery; до #163) + распознанные словарём PRUNABLE (shopping/web —
-            # режем только их). Флаг ВЫКЛ (дефолт) → ВСЕ ленивые = full-bind (ноль изменений).
+            # ленивые семьи ВСЕГДА (#202: остались menu/household/memory — пишут без ключа,
+            # дубль на recovery; recipes/checklists уже оснащены ключами → prunable) +
+            # распознанные словарём PRUNABLE (shopping/web/recipes/checklists — режем только их).
+            # Источник истины — _PRUNABLE_FAMILIES (выводится из _FAMILY_WRITE_POLICY ниже).
+            # Флаг ВЫКЛ (дефолт) → ВСЕ ленивые = full-bind (ноль изменений).
             # Сброс базы на каждый ход → нет межсообщенного дрейфа.
             if _is_pruned(tenant_id):
                 routed = set(_route_families(user_text, k=len(_FAMILY_ROOTS)))

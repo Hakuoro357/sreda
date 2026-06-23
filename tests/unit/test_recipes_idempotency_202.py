@@ -116,7 +116,8 @@ def test_save_recipe_hash_dedup_catches_morpho_202(s):
         r1, new1 = svc.save_recipe(tenant_id="t1", user_id="u1", title="Борщи", ingredients=[])
     with bind_tool_runtime(_ctx(step="s2")):
         r2, new2 = svc.save_recipe(tenant_id="t1", user_id="u1", title="Борщ", ingredients=[])
-    # если pymorphy схлопнул леммы — 1 строка (hash-дедуп); иначе 2 (нет коллизии). Главное — без краша.
-    assert s.query(Recipe).count() in (1, 2)
-    if r1.normalized_title_hash == r2.normalized_title_hash:
-        assert new2 is False and r1.id == r2.id, "одинаковый hash → 2-й должен быть replay 1-го"
+    # детерминированно (Codex R2 MAJOR): hash-дедуп требует лемматизации (pymorphy). Недоступна → skip.
+    if r1.normalized_title_hash != r2.normalized_title_hash:
+        pytest.skip("normalize_for_dedup не схлопнул морфоформы (pymorphy недоступна)")
+    assert s.query(Recipe).count() == 1, "одна лемма → один hash → 2-й replay'ит 1-й"
+    assert new2 is False and r1.id == r2.id

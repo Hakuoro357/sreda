@@ -361,3 +361,30 @@ async def test_guard_suppressed_after_unkeyed_write(db_session, monkeypatch):
     # guard НЕ сработал (wrote_unkeyed) → нет 3-го прохода с web; web не догружен
     assert len(stub.binds) == 2, f"guard сработал после unkeyed-write: {len(stub.binds)} проходов"
     assert all("web_search" not in b for b in stub.binds)
+
+
+@pytest.mark.asyncio
+async def test_need_family_loads_checklists_reachable_202(db_session):
+    """#202 (Codex medium R1 CRITICAL — reject): checklists стал prunable, НО достижим через
+    need_family на pruned-тенанте (роутер-промах канон-интента = лишний шаг, НЕ недоступность,
+    строка ~740 'НЕ отказ'). need_family(checklists) → create_checklist доступен и выполняется."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
+    scripted = [
+        AIMessage(content="", tool_calls=[{
+            "name": "need_family", "args": {"family": "checklists"}, "id": "nf"}]),
+        AIMessage(content="", tool_calls=[{
+            "name": "create_checklist", "args": {"title": "план кроя"}, "id": "cc"}]),
+        AIMessage(content="Готово."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy202-cl", llm=stub, user_text="сделай вот это",
+        inbound_message_id="lazy202-cl-msg", channel="react")
+    assert "create_checklist" not in stub.binds[0], "checklists prunable → не предзагружен на нейтральном"
+    assert len(stub.binds) >= 2 and "create_checklist" in stub.binds[1], (
+        "после need_family(checklists) create_checklist должен быть в наборе")
+    from sreda.db.models.checklists import Checklist
+    rows = db_session.query(Checklist).filter(Checklist.tenant_id == u.tenant_id).all()
+    assert any((c.title or "") == "план кроя" for c in rows), "чек-лист не создан через need_family"
