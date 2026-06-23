@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import urlparse
 
 import httpx
 
@@ -56,6 +57,23 @@ def _load_env(path: str = ENV_PATH) -> dict[str, str]:
 
 
 _ENV = _load_env()
+
+
+def _proxy_for_url(url: str) -> str | None:
+    """#208: прокси для внешнего probe — ЗЕРКАЛИТ бота. ``HTTPS_PROXY`` из ``_ENV``
+    (``/etc/sreda/.env``) для хостов НЕ в ``NO_PROXY`` (Groq идёт через SOCKS-туннель, как
+    ``speech/groq.py``); None (direct) для хостов В ``NO_PROXY`` (telegram/mimo/openrouter).
+    Прямой маршрут с VDS до части CDN-IP мёртв (RU-сеть) → probe обязан мерить тот же путь,
+    что и прод, иначе ложный CRITICAL (groq_stt 2026-06-23)."""
+    proxy = _ENV.get("HTTPS_PROXY") or _ENV.get("https_proxy")
+    if not proxy:
+        return None
+    host = (urlparse(url).hostname or "").lower()
+    raw = _ENV.get("NO_PROXY") or _ENV.get("no_proxy") or ""
+    for entry in (e.strip().lower() for e in raw.split(",")):
+        if entry and (host == entry or host.endswith("." + entry)):
+            return None  # в NO_PROXY → прод ходит direct → probe тоже direct
+    return proxy
 
 
 # ---------------------------------------------------------------------------
@@ -518,24 +536,38 @@ def _external_latency(
     baseline_ms: int = 500,
     warning_ms: int | None = None,
     timeout_s: float = 5.0,
+    max_severity: Severity = "critical",
 ) -> ProbeResult:
     """Measure GET latency. Critical if 5xx или timeout. Warning если elapsed
-    > warning_ms (если задан) или > 4x baseline иначе."""
+    > warning_ms (если задан) или > 4x baseline иначе.
+
+    #208: запрос идёт через SOCKS-прокси для хостов НЕ в NO_PROXY (как бот) — иначе прямой
+    мёртвый маршрут даёт ложный CRITICAL. ``max_severity='warning'`` понижает critical→warning
+    (для депрекейченных путей, напр. openrouter старого plan-execute рта)."""
     threshold_ms = warning_ms if warning_ms is not None else baseline_ms * 4
+
+    def _cap(sev: Severity) -> Severity:
+        return "warning" if (sev == "critical" and max_severity == "warning") else sev
+
+    proxy = _proxy_for_url(url)
+    # trust_env=False: не полагаемся на os.environ (cron его не грузит) — прокси берём из _ENV явно.
+    client_kwargs: dict[str, Any] = {"timeout": timeout_s, "trust_env": False}
+    if proxy:
+        client_kwargs["proxy"] = proxy
     try:
         t0 = time.time()
-        with httpx.Client(timeout=timeout_s) as c:
+        with httpx.Client(**client_kwargs) as c:
             r = c.get(url)
         elapsed_ms = int((time.time() - t0) * 1000)
         if r.status_code >= 500:
-            return ProbeResult(name, "critical", f"{r.status_code} ({elapsed_ms}ms)")
+            return ProbeResult(name, _cap("critical"), f"{r.status_code} ({elapsed_ms}ms)")
         if elapsed_ms > threshold_ms:
             return ProbeResult(name, "warning", f"{elapsed_ms}ms (threshold {threshold_ms}ms)")
         return ProbeResult(name, "ok", f"{elapsed_ms}ms")
     except httpx.TimeoutException:
-        return ProbeResult(name, "critical", f"timeout >{timeout_s}s")
+        return ProbeResult(name, _cap("critical"), f"timeout >{timeout_s}s")
     except Exception as e:
-        return ProbeResult(name, "critical", f"error: {type(e).__name__}: {str(e)[:100]}")
+        return ProbeResult(name, _cap("critical"), f"error: {type(e).__name__}: {str(e)[:100]}")
 
 
 def probe_telegram_api_latency() -> ProbeResult:
@@ -561,8 +593,12 @@ def probe_mimo_llm_latency() -> ProbeResult:
 
 
 def probe_openrouter_latency() -> ProbeResult:
+    # #208: openrouter в NO_PROXY → прод ходит DIRECT, и это рот СТАРОГО plan-execute
+    # (задепрекейчен; уйдёт с вырезанием старого планировщика). Прямой маршрут до openrouter
+    # с VDS мёртв → probe не зелёный, но это НЕ live-critical → max_severity='warning'.
     return _external_latency("https://openrouter.ai/api/v1/models",
-                              "openrouter_latency", baseline_ms=500)
+                              "openrouter_latency", baseline_ms=500,
+                              max_severity="warning")
 
 
 def probe_groq_stt_latency() -> ProbeResult:
