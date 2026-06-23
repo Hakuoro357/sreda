@@ -8,6 +8,7 @@ import pytest
 
 from sreda.services.agent_capabilities import VoiceAccessResult
 from sreda.services.budget import QuotaStatus
+from sreda.services.entitlement_gate import GateResult
 from sreda.services.speech.base import SpeechRecognitionError
 from sreda.services.telegram_bot import _maybe_transcribe_voice
 
@@ -428,3 +429,126 @@ async def test_g_scheduled_carrier_not_subscribed_gate_does_not_block():
     recognizer.recognize.assert_awaited_once()
     budget.record_api_usage.assert_called_once()
     assert budget.record_api_usage.call_args.kwargs["feature_key"] == _CARRIER
+
+
+# ---------------------------------------------------------------------------
+# #204 V6 — exhausted carrier gate sits BEFORE the free-tier llm_turn reserve
+# ---------------------------------------------------------------------------
+#
+# Adversarial-приёмка (2026-06-23): тесты (f) доказывают, что
+# download/STT/record_api_usage НЕ зван при исчерпанном carrier'е, но НЕ
+# доказывают, что free-tier-резерв (``UsageLedgerService.try_consume`` на
+# ``llm_turns``) тоже не зван — в (f) сессия = MagicMock, ``_is_free`` ложно,
+# и ветка free-tier структурно мертва (резерв и так недостижим, гейт ни при
+# чём). Здесь делаем тенанта РЕАЛЬНО-free (patch EntitlementGate →
+# plan_key="sreda_free") + spy на ``try_consume``: при исчерпанном carrier'е
+# гейт (строки telegram_bot.py:249-254) отсекает ход ДО резерва.
+
+
+def _patch_free_gate():
+    """Patch EntitlementGate так, чтобы ``.check()`` вернул sreda_free
+    (``_is_free=True``) → free-tier-резерв ``try_consume('llm_turns')``
+    становится ДОСТИЖИМ (если гейт исчерпания не отсечёт раньше).
+
+    Источник истины: ``telegram_bot.py:285`` ``_is_free = (plan_key ==
+    'sreda_free' and not is_grandfathered)`` + ``GateResult``
+    (``entitlement_gate.py:45``)."""
+    gate = MagicMock()
+    gate.check = MagicMock(
+        return_value=GateResult(
+            allowed=True, reason="ok",
+            plan_key="sreda_free", is_grandfathered=False,
+        )
+    )
+    return patch("sreda.services.entitlement_gate.EntitlementGate", return_value=gate)
+
+
+def _patch_ledger_spy():
+    """Patch UsageLedgerService с spy на ``try_consume`` (sync → не await).
+    Возвращает (context_manager, ledger_mock) — ассерты по
+    ``ledger.try_consume``."""
+    ledger = MagicMock()
+    ledger.try_consume = MagicMock(return_value=True)
+    ledger.refund = MagicMock()
+    cm = patch(
+        "sreda.services.usage_ledger.UsageLedgerService", return_value=ledger
+    )
+    return cm, ledger
+
+
+@pytest.mark.asyncio
+async def test_v6_exhausted_carrier_does_not_reserve_llm_turn():
+    """V6: РЕАЛЬНО-free тенант (``_is_free=True``) + исчерпанный метрированный
+    carrier (``is_subscribed AND is_exhausted``) → гейт исчерпания отсекает ход
+    ДО free-tier-резерва: ``UsageLedgerService.try_consume`` НЕ зван."""
+    payload = _make_voice_payload(file_id="fid_v6")
+    session = MagicMock()
+    telegram = _make_telegram()
+    onboarding = _make_onboarding(tenant_id="t_v6")
+    budget = _make_budget(_make_quota(is_subscribed=True, is_exhausted=True))
+    recognizer = _make_recognizer()
+    ledger_cm, ledger = _patch_ledger_spy()
+
+    with (
+        patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
+        patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
+        patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
+        patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+        _patch_free_gate(),
+        ledger_cm,
+    ):
+        result = await _maybe_transcribe_voice(
+            payload, session=session, telegram_client=telegram, onboarding=onboarding
+        )
+
+    assert result is None
+    # Главный позитивный ассерт: free-tier reserve НЕ зван (гейт ДО резерва).
+    ledger.try_consume.assert_not_called()
+    # И ход блокирован полностью.
+    recognizer.recognize.assert_not_awaited()
+    budget.record_api_usage.assert_not_called()
+    telegram.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_v6_non_exhausted_free_carrier_does_reserve_llm_turn():
+    """V6 не-вакуумность: тот же РЕАЛЬНО-free тенант, но carrier НЕ исчерпан
+    (sreda_free, quota=None → is_exhausted=False) → гейт НЕ срабатывает →
+    free-tier-резерв ``try_consume('llm_turns', 1)`` ДОСТИГНУТ и зван.
+
+    Доказывает, что резерв реально достижим для этого тенанта, поэтому
+    ``assert_not_called`` в exhausted-кейсе обусловлен именно гейтом, а не
+    мёртвой веткой."""
+    payload = _make_voice_payload(duration=5, file_id="fid_v6b")
+    session = MagicMock()
+    telegram = _make_telegram(file_path="voice/v6b.oga", audio=b"ogg_v6b")
+    onboarding = _make_onboarding(tenant_id="t_v6b")
+    # sreda_free housewife: is_subscribed=False on metered key → гейт пропускает.
+    budget = _make_budget(_make_quota(is_subscribed=False, is_exhausted=False))
+    recognizer = _make_recognizer(text="расшифровка v6b")
+    ledger_cm, ledger = _patch_ledger_spy()
+
+    with (
+        patch("sreda.services.telegram_bot.get_feature_registry", return_value=_make_registry()),
+        _patch_voice_access(True),
+        patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
+        patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
+        patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+        # ffprobe duration нужен для voice-резерва ПОСЛЕ download.
+        patch("sreda.services.audio_probe.ffprobe_duration", return_value=3.0),
+        _patch_free_gate(),
+        ledger_cm,
+    ):
+        result = await _maybe_transcribe_voice(
+            payload, session=session, telegram_client=telegram, onboarding=onboarding
+        )
+
+    assert result is payload
+    # Free-tier llm_turn reserve ДОСТИГНУТ (гейт не отсёк): первый вызов —
+    # 'llm_turns' с amount=1.
+    assert ledger.try_consume.call_count >= 1
+    first_call = ledger.try_consume.call_args_list[0]
+    assert first_call.args[0] == "t_v6b"   # tenant_id
+    assert first_call.args[1] == "llm_turns"
+    assert first_call.args[2] == 1

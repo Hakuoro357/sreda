@@ -22,6 +22,7 @@ import pytest
 
 from sreda.services.agent_capabilities import VoiceAccessResult
 from sreda.services.budget import QuotaStatus
+from sreda.services.entitlement_gate import GateResult
 from sreda.services.max_inbound import (
     _extract_max_voice_url,
     _maybe_transcribe_max_voice,
@@ -568,4 +569,133 @@ async def test_max_g_scheduled_carrier_not_subscribed_gate_does_not_block(monkey
     fake_recognizer.recognize.assert_awaited_once()
     _budget.record_api_usage.assert_called_once()
     assert _budget.record_api_usage.call_args.kwargs["feature_key"] == _CARRIER
+
+
+# ---------------------------------------------------------------------------
+# #204 V6 — exhausted carrier gate sits BEFORE the free-tier llm_turn reserve
+# ---------------------------------------------------------------------------
+#
+# MAX-близнец V6 (см. подробный коммент в test_voice_transcription.py): тест
+# (f) доказывает, что download/STT/record_api_usage НЕ зван при исчерпанном
+# carrier'е, но НЕ доказывает, что free-tier-резерв ``try_consume('llm_turns')``
+# тоже не зван — в (f) ``_is_free`` ложно, ветка free-tier структурно мертва.
+# Здесь делаем тенанта РЕАЛЬНО-free (patch EntitlementGate → sreda_free) + spy
+# на ``try_consume``: гейт исчерпания (max_inbound.py:608-613) отсекает ход ДО
+# резерва (max_inbound.py:649).
+
+
+def _patch_free_gate(monkeypatch) -> None:
+    """EntitlementGate.check → sreda_free → ``_is_free=True`` (резерв достижим).
+    Источник: ``max_inbound.py:636`` + ``GateResult`` (entitlement_gate.py:45)."""
+    gate = MagicMock()
+    gate.check = MagicMock(
+        return_value=GateResult(
+            allowed=True, reason="ok",
+            plan_key="sreda_free", is_grandfathered=False,
+        )
+    )
+    monkeypatch.setattr(
+        "sreda.services.entitlement_gate.EntitlementGate", lambda s: gate
+    )
+
+
+def _patch_ledger_spy(monkeypatch) -> MagicMock:
+    """UsageLedgerService с spy на ``try_consume`` (sync). Возвращает ledger-mock."""
+    ledger = MagicMock()
+    ledger.try_consume = MagicMock(return_value=True)
+    ledger.refund = MagicMock()
+    monkeypatch.setattr(
+        "sreda.services.usage_ledger.UsageLedgerService", lambda engine: ledger
+    )
+    return ledger
+
+
+@pytest.mark.asyncio
+async def test_max_v6_exhausted_carrier_does_not_reserve_llm_turn(monkeypatch):
+    """V6 (MAX): РЕАЛЬНО-free тенант + исчерпанный метрированный carrier →
+    гейт исчерпания отсекает ход ДО free-tier-резерва:
+    ``UsageLedgerService.try_consume`` НЕ зван."""
+    _patch_voice_access(monkeypatch)
+    _budget = _patch_budget(
+        monkeypatch, _make_quota(is_subscribed=True, is_exhausted=True)
+    )
+    _patch_free_gate(monkeypatch)
+    ledger = _patch_ledger_spy(monkeypatch)
+
+    fake_recognizer = MagicMock()
+    fake_recognizer.recognize = AsyncMock(return_value="не должно дойти")
+    monkeypatch.setattr(
+        "sreda.services.speech.factory.get_speech_recognizer",
+        lambda settings: fake_recognizer,
+    )
+    monkeypatch.setattr(
+        "sreda.features.app_registry.get_feature_registry",
+        lambda: MagicMock(modules={"voice_transcription": True}),
+    )
+
+    max_client = MagicMock()
+    max_client.send_message = AsyncMock()
+    max_client.download_audio = AsyncMock(return_value=b"OggS" + b"\x00" * 100)
+
+    result = await _maybe_transcribe_max_voice(
+        _voice_payload(),
+        session=MagicMock(),
+        max_client=max_client,
+        onboarding=_onboarding(),
+    )
+
+    assert result is None
+    ledger.try_consume.assert_not_called()
+    max_client.download_audio.assert_not_awaited()
+    fake_recognizer.recognize.assert_not_awaited()
+    _budget.record_api_usage.assert_not_called()
+    max_client.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_max_v6_non_exhausted_free_carrier_does_reserve_llm_turn(monkeypatch):
+    """V6 не-вакуумность (MAX): тот же РЕАЛЬНО-free тенант, но carrier НЕ исчерпан
+    → гейт НЕ срабатывает → ``try_consume('llm_turns', 1)`` ДОСТИГНУТ. Доказывает,
+    что резерв реально достижим, и ``assert_not_called`` в exhausted-кейсе —
+    следствие гейта, а не мёртвой ветки."""
+    _patch_voice_access(monkeypatch)
+    _budget = _patch_budget(
+        monkeypatch, _make_quota(is_subscribed=False, is_exhausted=False)
+    )
+    _patch_free_gate(monkeypatch)
+    ledger = _patch_ledger_spy(monkeypatch)
+
+    fake_recognizer = MagicMock()
+    fake_recognizer.recognize = AsyncMock(return_value="расшифровка v6b")
+    monkeypatch.setattr(
+        "sreda.services.speech.factory.get_speech_recognizer",
+        lambda settings: fake_recognizer,
+    )
+    monkeypatch.setattr(
+        "sreda.features.app_registry.get_feature_registry",
+        lambda: MagicMock(modules={"voice_transcription": True}),
+    )
+    # ffprobe duration нужен для voice-резерва ПОСЛЕ download.
+    monkeypatch.setattr(
+        "sreda.services.audio_probe.ffprobe_duration", lambda b: 3.0
+    )
+
+    max_client = MagicMock()
+    max_client.send_message = AsyncMock()
+    max_client.download_audio = AsyncMock(return_value=b"OggS" + b"\x00" * 100)
+
+    payload = _voice_payload()
+    result = await _maybe_transcribe_max_voice(
+        payload,
+        session=MagicMock(),
+        max_client=max_client,
+        onboarding=_onboarding(),
+    )
+
+    assert result is payload
+    assert ledger.try_consume.call_count >= 1
+    first_call = ledger.try_consume.call_args_list[0]
+    assert first_call.args[0] == "t1"        # tenant_id (из _onboarding)
+    assert first_call.args[1] == "llm_turns"
+    assert first_call.args[2] == 1
     max_client.send_message.assert_not_awaited()
