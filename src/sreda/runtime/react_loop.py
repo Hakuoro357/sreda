@@ -703,6 +703,17 @@ _CORE_TOOL_NAMES = frozenset({
     "delete_my_account",  # #187 Фаза 4b-2: self-delete (ядро, всегда привязан)
     "recall_memory", "need_family",
 })
+# #202 (Codex medium R3 CRITICAL): ядро-инструменты, ПИШУЩИЕ durable-данные пользователя. Они всегда
+# привязаны (вне ленивых семей) → их запись НЕ ставит wrote_unkeyed по семье. Но guard-recovery (особенно
+# FULL-recovery) на ретрае может ПЕРЕ-вызвать их: add_task БЕЗ даты не имеет семантического дедупа
+# (Борис: датовые-only) → дубль. Поэтому ЛЮБАЯ core-мутирующая запись тоже подавляет guard (как
+# rerun-unsafe). read- core (list_*, recall_memory, need_family, ask_human) — безопасны, сюда НЕ входят.
+_CORE_MUTATING_TOOLS = frozenset({
+    "schedule_reminder", "update_reminder", "cancel_reminder",
+    "add_task", "update_task", "complete_task", "uncomplete_task",
+    "cancel_task", "delete_task", "link_task", "unlink_task",
+    "delete_my_account",
+})
 # Валидные ленивые семьи — СИНХРОННО с Literal need_family ниже. run_tools ре-валидирует
 # arg против этого набора (Literal в схеме не гарантирует — модель может галлюцинировать).
 _LAZY_FAMILIES = frozenset({
@@ -1575,8 +1586,13 @@ def _build_graph(llm: Any, all_tools: list, *,
             out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"],
                                    artifact={"result_kind": "ok",
                                              "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
-            if TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES:
-                wrote_unkeyed = True  # unkeyed-write выполнен → guard отключим (анти-дубль)
+            if (name in _CORE_MUTATING_TOOLS
+                    or TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES):
+                # rerun-unsafe запись (#202 Codex medium R3): core-мутирующая (add_task без даты — нет
+                # семантического дедупа) ИЛИ unkeyed-семья → guard/full-recovery ОТКЛЮЧАЕМ, иначе ретрай
+                # мог бы пере-вызвать запись (дубль). keyed-семьи (shopping/recipes/checklists) сюда НЕ
+                # входят — их повтор семантически дедупится, recovery после них безопасен.
+                wrote_unkeyed = True
         update: dict = {"messages": out}
         if added:  # семья добрана → обновляем state (last-value канал)
             update["active_families"] = active

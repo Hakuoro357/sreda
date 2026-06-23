@@ -420,3 +420,28 @@ async def test_guard_full_recovery_on_router_miss_refusal_202(db_session):
     from sreda.db.models.checklists import Checklist
     rows = db_session.query(Checklist).filter(Checklist.tenant_id == u.tenant_id).all()
     assert any((c.title or "") == "план кроя" for c in rows), "чек-лист не создан после full-recovery"
+
+
+@pytest.mark.asyncio
+async def test_guard_suppressed_after_core_write_no_dup_202(db_session):
+    """#202 (Codex medium R3 CRITICAL): после core-записи (add_task — задача без даты, нет
+    семантического дедупа) отказ на второй интент → guard/full-recovery ПОДАВЛЕН (wrote_unkeyed),
+    иначе ретрай пере-создал бы задачу. Задача РОВНО одна; full-recovery-прохода нет (binds==2)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
+    scripted = [
+        AIMessage(content="", tool_calls=[{
+            "name": "add_task", "args": {"title": "купить хлеб"}, "id": "at"}]),  # core durable-write
+        AIMessage(content="Задачу добавила. А рецепт пока не умею."),  # отказ ПОСЛЕ записи
+        AIMessage(content="..."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy202-core", llm=stub, user_text="добавь задачу купить хлеб",
+        inbound_message_id="lazy202-core-msg", channel="react")
+    assert len(stub.binds) == 2, (
+        f"после core-записи guard НЕ должен восстанавливать (нет 3-го прохода): {len(stub.binds)}")
+    from sreda.db.models.tasks import Task
+    tasks = db_session.query(Task).filter(Task.tenant_id == u.tenant_id).all()
+    assert len(tasks) == 1, f"задача РОВНО одна (без дубля от recovery-ретрая): {len(tasks)}"
