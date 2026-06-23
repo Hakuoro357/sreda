@@ -51,9 +51,53 @@ logger = logging.getLogger("sreda.react_loop")
 # v2 — добавлен канал turn_key в state (#162). InMemory сбрасывается на рестарте, миграции
 # чекпойнтов не нужны.
 _TOPOLOGY_VERSION = "react-v5:chat,tools,guard,stop"  # #165 Срез A: ленивые семьи + guard + анти-петля
-_CHECKPOINTER = InMemorySaver()  # singleton на процесс
+_CHECKPOINTER = InMemorySaver()  # singleton на процесс (OFF/legacy путь)
 _THREAD_GEN: dict[str, int] = {}
 _PENDING_TTL_SECONDS = 300  # 5 минут (решение владельца)
+_REACT_NS = "react-v1"  # #193: версия топологии для durable-ключа (смена → bump → старое не грузится)
+_PERSIST_SAVER: Any = None  # #193: lazy-синглтон durable-saver (ВКЛ)
+# #193 (CR R1 MAJOR): подряд-краши durable-треда. На ВЫКЛ краш делает gen-bump → свежий InMemory-тред
+# (юзер восстанавливается). На ВКЛ ключ стабилен → тот же checkpoint грузится снова; poison-checkpoint
+# (грузится, но крашит граф) залипал бы НАВСЕГДА. После N подряд крашей одного треда → delete_thread.
+_DURABLE_CRASH: dict[str, int] = {}
+_DURABLE_CRASH_LIMIT = 2
+
+
+def _persist_enabled() -> bool:
+    """#193: durable-персистентность диалога ВКЛ? (флаг SREDA_REACT_PERSIST_ENABLED, дефолт OFF)."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().react_persist_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
+def _get_checkpointer():
+    """#193: ВКЛ → durable EncryptedSqlCheckpointSaver (стабильный ключ, переживает рестарт);
+    ВЫКЛ → процессный InMemorySaver (прежнее поведение)."""
+    global _PERSIST_SAVER
+    if _persist_enabled():
+        if _PERSIST_SAVER is None:
+            from sreda.runtime.react_checkpoint_saver import EncryptedSqlCheckpointSaver
+            _PERSIST_SAVER = EncryptedSqlCheckpointSaver()
+        return _PERSIST_SAVER
+    return _CHECKPOINTER
+
+
+def _durable_thread_id(base: str) -> str:
+    """#193: durable thread_id с версией топологии в ПРЕФИКСЕ. ВАЖНО: `checkpoint_ns` зарезервирован
+    LangGraph под подграфы (get_state с ns≠"" ищет subgraph) — НЕЛЬЗЯ использовать как версию топологии.
+    Поэтому версия в префиксе thread_id; bump _REACT_NS → старые checkpoint'ы неактуальны (новый ключ)."""
+    return f"{_REACT_NS}:{base}"
+
+
+def _build_thread_config(base: str, gen: int) -> dict:
+    """#193: ТОЧКА ПОДКЛЮЧЕНИЯ ФЛАГА (ключ checkpoint). ВКЛ → СТАБИЛЬНЫЙ durable-ключ
+    (`{_REACT_NS}:{base}`, gen НЕ в ключе → переживает рестарт, p-010; checkpoint_ns="" — штатно).
+    ВЫКЛ → прежний {base}#{gen} (InMemory, эфемерно). recursion_limit выше 2×MAX (см. _cfg ниже)."""
+    if _persist_enabled():
+        return {"configurable": {"thread_id": _durable_thread_id(base)}, "recursion_limit": 25}
+    return {"configurable": {"thread_id": f"{base}#{gen}"}, "recursion_limit": 25}
 _MSK = timezone(timedelta(hours=3))  # МСК = UTC+3 круглый год; локаль пользователя и дата-якорь
 
 _MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -1591,7 +1635,7 @@ def _build_graph(llm: Any, all_tools: list, *,
     g.add_edge("guard", "chat")
     g.add_edge("stop", END)
     assert _TOPOLOGY_VERSION == "react-v5:chat,tools,guard,stop"  # топология фикс.
-    return g.compile(checkpointer=_CHECKPOINTER)
+    return g.compile(checkpointer=_get_checkpointer())  # #193: флаг-зависимый saver
 
 
 def _scrub_ids(text: str) -> str:
@@ -1843,8 +1887,9 @@ async def handle_turn(
         # #165 Срез A: recursion_limit — ВНЕШНИЙ нет с запасом (R1: 15 было тесно — срез
         # добавил круги need_family → молчаливая потеря хода). Реальный бранд петли —
         # _MAX_TURN_PASSES (route→stop, грациозно). recursion_limit держим выше 2×MAX, чтобы
-        # stop срабатывал ПЕРВЫМ, а не GraphRecursionError.
-        return {"configurable": {"thread_id": f"{base}#{g}"}, "recursion_limit": 25}
+        # stop срабатывал ПЕРВЫМ, а не GraphRecursionError. Ключ — #193 точка флага (см.
+        # _build_thread_config): ВКЛ durable base+ns / ВЫКЛ {base}#{gen}.
+        return _build_thread_config(base, g)
 
     try:
         # дата-якорь для резолва относительных дат моделью (МСК = UTC+3, та же зона, что
@@ -1886,9 +1931,18 @@ async def handle_turn(
         if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
             result = await graph.ainvoke(Command(resume=user_text), _cfg(gen))
         else:
-            if _has_pause(snap):  # протухшая пауза на этом поколении → свежий ход на чистом треде
-                gen += 1
-                _THREAD_GEN[base] = gen
+            if _has_pause(snap):  # протухшая пауза → гасим
+                # #193: ВКЛ durable → ключ стабилен, паузу гасим ЯВНО (clear_pending: drop
+                # interrupt-write idx<0), СОХРАНЯЯ историю диалога; НЕ сменой ключа (p-010).
+                # Свежий ainvoke ниже продолжит беседу с историей, без залипшей паузы.
+                if _persist_enabled():
+                    try:
+                        _get_checkpointer().clear_pending(_durable_thread_id(base))
+                    except Exception:  # noqa: BLE001 — гашение не валит ход
+                        logger.warning("react_loop: clear_pending failed", exc_info=True)
+                else:  # ВЫКЛ → прежнее: свежий ход на чистом поколении (эфемерно)
+                    gen += 1
+                    _THREAD_GEN[base] = gen
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
             _tk_trace = turn_key
@@ -1913,6 +1967,9 @@ async def handle_turn(
                  "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
+        # #193: ход дошёл сюда без краша → сбрасываем счётчик подряд-крашей durable-треда.
+        if _persist_enabled():
+            _DURABLE_CRASH.pop(_durable_thread_id(base), None)
         # #192: turn_key из state (resume-путь — локального turn_key нет; fresh — совпадёт).
         _tk_trace = ((snap.values or {}).get("turn_key") if snap and snap.values else None) or _tk_trace
         _tools = _called_tools(result)
@@ -1956,7 +2013,23 @@ async def handle_turn(
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s",
                        type(exc).__name__, gen)
-        _THREAD_GEN[base] = gen + 1
+        if _persist_enabled():
+            # #193 (CR R1 MAJOR): durable-ключ стабилен → восстановление не через gen-bump.
+            # Транзиентный краш (LLM-таймаут и т.п.) терпим; после N подряд — poison-checkpoint →
+            # сброс треда (аналог свежего треда на эфемерном пути), иначе юзер залипнет навсегда.
+            _dur = _durable_thread_id(base)
+            n = _DURABLE_CRASH.get(_dur, 0) + 1
+            try:
+                if n >= _DURABLE_CRASH_LIMIT:
+                    _get_checkpointer().delete_thread(_dur)
+                    _DURABLE_CRASH.pop(_dur, None)
+                else:
+                    _DURABLE_CRASH[_dur] = n
+                    _get_checkpointer().clear_pending(_dur)  # хотя бы снять залипшую паузу
+            except Exception:  # noqa: BLE001 — recovery не валит ход
+                logger.warning("react_loop: durable crash-recovery failed", exc_info=True)
+        else:
+            _THREAD_GEN[base] = gen + 1
         _reply = _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
                         "что нужно сделать.")
         # #192: handled-ошибка (поймана) → терминал done+outcome (НЕ in_progress; in_progress

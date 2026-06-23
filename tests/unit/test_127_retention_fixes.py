@@ -491,6 +491,46 @@ def test_react_turn_trace_retention_192(session) -> None:
     assert result.react_turn_trace == 1
 
 
+def test_react_checkpoint_gc_by_thread_last_activity_193(session) -> None:
+    """#193: тред с MAX(created_at) старше 30д удаляется ЦЕЛИКОМ (обе таблицы); активный тред (есть
+    свежий checkpoint) сохраняется ПОЛНОСТЬЮ, включая старые checkpoint'ы (целостность parent-цепочки)."""
+    from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
+
+    now = datetime.now(timezone.utc)
+
+    def _cp(thread, cid, age):
+        return ReactCheckpoint(
+            thread_id=thread, checkpoint_ns="", checkpoint_id=cid,
+            checkpoint_type="msgpack", blob=b"x", metadata_type="msgpack",
+            checkpoint_metadata=b"m", created_at=now - timedelta(days=age))
+
+    session.add_all([
+        # протухший тред: оба checkpoint'а старые (>30д) + interrupt-write
+        _cp("react-v1:react:t1:stale", "a1", 45),
+        _cp("react-v1:react:t1:stale", "a2", 40),
+        ReactCheckpointWrite(thread_id="react-v1:react:t1:stale", checkpoint_ns="",
+                             checkpoint_id="a2", task_id="tk", idx=-3, channel="__interrupt__",
+                             write_type="msgpack", blob=b"w", created_at=now - timedelta(days=40)),
+        # активный тред: старый + свежий → MAX свежий → НЕ режем (даже старый checkpoint)
+        _cp("react-v1:react:t1:active", "b1", 45),
+        _cp("react-v1:react:t1:active", "b2", 2),
+    ])
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=now)
+    session.commit()
+
+    # протухший тред удалён целиком (обе таблицы)
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:stale", "", "a1")) is None
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:stale", "", "a2")) is None
+    assert session.get(ReactCheckpointWrite,
+                       ("react-v1:react:t1:stale", "", "a2", "tk", -3)) is None
+    # активный тред цел ПОЛНОСТЬЮ (старый checkpoint сохранён ради parent-цепочки)
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:active", "", "b1")) is not None
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:active", "", "b2")) is not None
+    assert result.react_checkpoint == 2  # 2 checkpoint'а протухшего треда
+
+
 # NB (#164, Codex R2 MINOR): planner_gaps / planner_llm_reservations (nullable execution_id, FK
 # без CASCADE) удаляются ТЕМ ЖЕ кодом-путём, что step_execution_ledger выше —
 # `execution_id.in_(deletable_exec_ids)`. Путь доказан тестом-цепочкой (ledger) + skew/stuck-тестом;

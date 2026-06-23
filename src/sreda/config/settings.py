@@ -382,6 +382,14 @@ class Settings(BaseSettings):
     react_trace_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_TRACE_ENABLED"
     )
+    # #193: durable персистентность диалога ReAct (свой EncryptedSqlCheckpointSaver вместо
+    # InMemorySaver). OFF (дефолт) → прежнее поведение: InMemory + ключ {base}#{gen}. ON →
+    # стабильный durable-ключ f"react-v1:{base}" (версия топологии в ПРЕФИКСЕ; checkpoint_ns
+    # зарезервирован LangGraph под подграфы), диалог переживает рестарт. ReAct-only;
+    # НЕ конфликтует с легасовыми SREDA_LANGGRAPH_* (те гейтят отдельный legacy-граф).
+    react_persist_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_PERSIST_ENABLED"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must

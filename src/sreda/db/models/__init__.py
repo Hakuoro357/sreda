@@ -21,6 +21,7 @@ from sreda.db.models.core import (
     User,
     Workspace,
 )
+from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
 from sreda.db.models.react_debug import ReactDebugTurn
 from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.housewife import FamilyMember, FamilyReminder
@@ -73,6 +74,8 @@ __all__ = [
     "Checklist",
     "ChecklistItem",
     "ConversationTurn",
+    "ReactCheckpoint",
+    "ReactCheckpointWrite",
     "ReactDebugTurn",
     "ReactTurnTrace",
     "PaymentOrder",

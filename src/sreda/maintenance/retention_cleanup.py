@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.core import InboundMessage, Job, OutboxMessage
@@ -47,6 +47,7 @@ from sreda.db.models.planner import (
     PlannerLlmReservation,
     StepExecutionLedger,
 )
+from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
 from sreda.db.models.react_debug import ReactDebugTurn
 from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.runtime import AgentRun
@@ -84,6 +85,7 @@ class RetentionCleanupResult:
     planner_llm_reservations: int = 0  # #164
     react_debug_turns: int = 0  # #185 (временный QA-захват переписки — короткий TTL)
     react_turn_trace: int = 0  # #192 (durable трейс хода — короткий TTL, ПД)
+    react_checkpoint: int = 0  # #193 (durable checkpoint диалога — GC по last-activity треда, ПД)
     plan_library_entries: int = 0
     deleted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -108,6 +110,7 @@ class RetentionCleanupResult:
             + self.planner_llm_reservations
             + self.react_debug_turns
             + self.react_turn_trace
+            + self.react_checkpoint
         )
 
 
@@ -134,6 +137,10 @@ SKILL_RUNS_DAYS = 90
 # #185: react_debug_turns — ВРЕМЕННЫЙ QA-захват переписки (полный текст, EncryptedString). Короткое
 # окно: для отлова багов хватает, а ПД всех юзеров не копятся бессрочно (Codex high MAJOR).
 REACT_DEBUG_TURNS_DAYS = 14
+# #193: react_checkpoint/_write — durable диалог ReAct (ПД, шифр). GC по last-activity ТРЕДА: тред,
+# у которого MAX(created_at) < cutoff, удаляется ЦЕЛИКОМ (обе таблицы) — активный тред не режем
+# (целостность parent-цепочки). Окно длиннее трейса (живой диалог дольше отладочного следа).
+REACT_CHECKPOINT_DAYS = 30
 # #192: react_turn_trace — durable трейс хода (контент EncryptedString + структура). Тот же короткий
 # TTL, что и debug-захват: наблюдательные данные с ПД не копятся бессрочно.
 REACT_TURN_TRACE_DAYS = 14
@@ -439,6 +446,30 @@ def cleanup_runtime_retention(
         session,
         delete(ReactTurnTrace).where(ReactTurnTrace.created_at < react_trace_cutoff),
     )
+
+    # #193: react_checkpoint/_write — durable диалог. GC по last-activity ТРЕДА: тред, у которого
+    # MAX(created_at) < cutoff, удаляем ЦЕЛИКОМ (обе таблицы); активный тред не трогаем (целостность
+    # parent-цепочки checkpoint'ов). Одной транзакцией (как и вся чистка).
+    cp_cutoff = now - timedelta(days=REACT_CHECKPOINT_DAYS)
+    stale_threads = session.execute(
+        select(ReactCheckpoint.thread_id, ReactCheckpoint.checkpoint_ns)
+        .group_by(ReactCheckpoint.thread_id, ReactCheckpoint.checkpoint_ns)
+        .having(func.max(ReactCheckpoint.created_at) < cp_cutoff)
+    ).all()
+    for thread_id, ns in stale_threads:
+        session.execute(
+            delete(ReactCheckpointWrite).where(
+                ReactCheckpointWrite.thread_id == thread_id,
+                ReactCheckpointWrite.checkpoint_ns == ns,
+            )
+        )
+        result.react_checkpoint += _delete_returning_count(
+            session,
+            delete(ReactCheckpoint).where(
+                ReactCheckpoint.thread_id == thread_id,
+                ReactCheckpoint.checkpoint_ns == ns,
+            ),
+        )
 
     # ---------- plan_library (#135: TTL всем статусам, без PII) ----------
     try:
