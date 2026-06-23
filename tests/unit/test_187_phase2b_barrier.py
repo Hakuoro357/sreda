@@ -339,6 +339,43 @@ def test_turn_paths_reference_tenant_advisory_lock() -> None:
     )
 
 
+def test_turn_paths_recheck_is_tenant_active_under_lock() -> None:
+    """(b) #187 дверь #6 A3: both turn functions re-check ``is_tenant_active``
+    AFTER acquiring ``tenant_advisory_lock`` (re-check под локом, не до него).
+
+    Static-wiring check complementing the OUTCOME test in
+    ``test_187_phase2b_recheck`` (delete-first abort): here we pin that the
+    re-check (a) exists in BOTH turn functions and (b) appears AFTER the
+    advisory-lock acquisition in source order — so removing the re-check (the
+    A3 spec-drift) reddens this test. ``test_187_phase2b_recheck`` proves the
+    re-check is BEHAVIOURALLY load-bearing; this guards the wiring cheaply.
+    """
+    import inspect
+
+    from sreda.services import max_inbound, telegram_inbound
+
+    tg_src = inspect.getsource(telegram_inbound._process_approved_turn_locked)
+    max_src = inspect.getsource(max_inbound._process_approved_max_turn)
+
+    for name, src in (
+        ("_process_approved_turn_locked (TG)", tg_src),
+        ("_process_approved_max_turn (MAX)", max_src),
+    ):
+        adv_idx = src.find("tenant_advisory_lock(")
+        recheck_idx = src.find("is_tenant_active(")
+        assert adv_idx != -1, f"{name} must enter tenant_advisory_lock"
+        assert recheck_idx != -1, (
+            f"{name} must re-check is_tenant_active after taking the advisory lock "
+            "(#187 дверь #6 A3 — re-check под локом; removing it closes the "
+            "delete-first race window only on paper)"
+        )
+        assert adv_idx < recheck_idx, (
+            f"{name}: is_tenant_active re-check must come AFTER "
+            f"tenant_advisory_lock acquisition (advisory @ {adv_idx}, "
+            f"re-check @ {recheck_idx})"
+        )
+
+
 def test_max_acquires_advisory_after_tenant_lock() -> None:
     """(b) R1 CRITICAL lock-ordering: in the MAX turn path the in-process
     asyncio ``tenant_lock`` is acquired FIRST and the ``tenant_advisory_lock``

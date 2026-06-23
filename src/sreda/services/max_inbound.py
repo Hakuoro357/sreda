@@ -924,6 +924,23 @@ async def _process_approved_max_turn(
             _barrier.enter_context(
                 tenant_advisory_lock(bg_session, onboarding.tenant_id)
             )
+            # #187 дверь #6 (A3 re-check ПОД локом, зеркало TG): ingress-гейт
+            # (handle_max_update) проверил активность ДО спавна хода; между гейтом и
+            # захватом advisory-лока админ мог soft_delete'нуть. Закрываем delete-first
+            # гонку: soft_delete берёт ТОТ ЖЕ лок и КОММИТИТ флаг под ним → если успел
+            # ПЕРВЫМ, этот ход НЕ должен коммитить доменные мутации. Свежий SELECT
+            # bg_session видит durable deleted_at (на SQLite лок no-op, флаг читается).
+            from sreda.services.tenant_lifecycle import is_tenant_active
+            if not is_tenant_active(bg_session, onboarding.tenant_id):
+                logger.info(
+                    "max turn aborted: tenant %s soft-deleted mid-turn (re-check под advisory-локом)",
+                    onboarding.tenant_id,
+                )
+                # Codex MINOR (зеркало TG): терминальный 'ignored' — иначе монитор
+                # unprocessed_inbound ложно сочтёт отброшенный ход зависшим. MAX уже
+                # выставил 'processing_started' до лока → здесь перекрываем на ignored.
+                _set_processing_status(bg_session, inbound_message_id, "ignored")
+                return
             # message_callback (inline-button tap): обработать ДО
             # dispatch'а / voice. Inline-handlers (rem_done/rem_snooze/
             # btn_reply/pb) выполняются здесь — DB updates + answer_callback
