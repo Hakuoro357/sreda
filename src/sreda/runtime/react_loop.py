@@ -708,12 +708,15 @@ _CORE_TOOL_NAMES = frozenset({
 # FULL-recovery) на ретрае может ПЕРЕ-вызвать их: add_task БЕЗ даты не имеет семантического дедупа
 # (Борис: датовые-only) → дубль. Поэтому ЛЮБАЯ core-мутирующая запись тоже подавляет guard (как
 # rerun-unsafe). read- core (list_*, recall_memory, need_family, ask_human) — безопасны, сюда НЕ входят.
-_CORE_MUTATING_TOOLS = frozenset({
-    "schedule_reminder", "update_reminder", "cancel_reminder",
-    "add_task", "update_task", "complete_task", "uncomplete_task",
-    "cancel_task", "delete_task", "link_task", "unlink_task",
-    "delete_my_account",
+# read-only ядро: безопасны к повтору на recovery (durable-данные не пишут).
+_CORE_READONLY_TOOLS = frozenset({
+    "list_reminders", "list_tasks", "recall_memory", "need_family", "ask_human",
 })
+# core-мутирующие ВЫВОДИМ как дополнение (Codex/субагент R4 MAJOR: НЕ второй ручной список — иначе
+# новый core-write забыли бы сюда → баг дубля вернулся бы тихо). FAIL-SAFE: новый core-инструмент по
+# умолчанию считается ПИШУЩИМ (не в read-only) → guard подавится → дубля не будет. Пин-тест
+# (test_core_mutating_derivation_202) ловит дрейф read-only набора (чтобы туда не попал write-инструмент).
+_CORE_MUTATING_TOOLS = _CORE_TOOL_NAMES - _CORE_READONLY_TOOLS
 # Валидные ленивые семьи — СИНХРОННО с Literal need_family ниже. run_tools ре-валидирует
 # arg против этого набора (Literal в схеме не гарантирует — модель может галлюцинировать).
 _LAZY_FAMILIES = frozenset({

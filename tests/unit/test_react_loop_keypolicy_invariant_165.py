@@ -66,3 +66,23 @@ def test_current_prunable_state_pin_165():
         {"shopping", "web", "recipes", "checklists"})
     assert react_loop._UNKEYED_WRITE_FAMILIES == frozenset(
         {"menu", "household", "memory", "web"})
+
+
+def test_core_mutating_derivation_202():
+    """#202 R4 (drift-пин, Codex/субагент): _CORE_MUTATING ВЫВОДИТСЯ из _CORE_TOOL_NAMES − _CORE_READONLY
+    (fail-safe: новый core-инструмент по умолчанию мутирующий → guard подавится → дубля не будет). read-only
+    набор пиним поимённо — чтобы туда случайно не попал ПИШУЩИЙ инструмент (иначе guard восстановит после
+    его записи → дубль задачи без даты)."""
+    from sreda.runtime import react_loop as rl
+
+    assert rl._CORE_READONLY_TOOLS == frozenset({
+        "list_reminders", "list_tasks", "recall_memory", "need_family", "ask_human"})
+    # раздел: вывод корректен, объединение = всё ядро, пересечения нет
+    assert rl._CORE_MUTATING_TOOLS == rl._CORE_TOOL_NAMES - rl._CORE_READONLY_TOOLS
+    assert rl._CORE_READONLY_TOOLS <= rl._CORE_TOOL_NAMES
+    assert rl._CORE_MUTATING_TOOLS | rl._CORE_READONLY_TOOLS == rl._CORE_TOOL_NAMES
+    assert not (rl._CORE_MUTATING_TOOLS & rl._CORE_READONLY_TOOLS)
+    # ключевые пишущие — точно мутирующие (подавляют guard)
+    for w in ("schedule_reminder", "add_task", "update_task", "cancel_task",
+              "delete_task", "delete_my_account"):
+        assert w in rl._CORE_MUTATING_TOOLS, w
