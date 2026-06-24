@@ -5,6 +5,7 @@ description = "Sreda MVP backend: FastAPI + LangGraph + PostgreSQL"
 requires-python = ">=3.12"
 dependencies = [
   "alembic>=1.16.0",
+  "certifi>=2024.0.0",  # #214: прямой импорт в integrations/max/client (TLS-бандл Минцифры)
   "cryptography>=45.0.0",
   "fastapi>=0.116.0",
   "jinja2>=3.1.0",

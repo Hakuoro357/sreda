@@ -439,7 +439,7 @@ def test_max_primary_succeeds_no_tg_call(_db_max) -> None:
         # Only MAX POST should have fired.
         assert mock_post.call_count == 1
         url_called = mock_post.call_args.args[0]
-        assert "platform-api.max.ru" in url_called
+        assert "platform-api2.max.ru" in url_called
         # Query string carries chat_id
         params = mock_post.call_args.kwargs["params"]
         assert params["chat_id"] == "320955459"
@@ -455,7 +455,7 @@ def test_max_primary_succeeds_no_tg_call(_db_max) -> None:
 def test_max_failure_falls_back_to_tg(_db_max) -> None:
     """MAX returns 500 → TG fallback POSTs successfully."""
     def _post_side_effect(url, *args, **kwargs):
-        if "platform-api.max.ru" in url:
+        if "platform-api2.max.ru" in url:
             return MagicMock(status_code=500, text="max down")
         # TG path
         return MagicMock(status_code=200, text="ok")
@@ -468,14 +468,14 @@ def test_max_failure_falls_back_to_tg(_db_max) -> None:
         # Both MAX (failed) + TG (success) POSTed.
         assert mock_post.call_count == 2
         urls = [c.args[0] for c in mock_post.call_args_list]
-        assert any("platform-api.max.ru" in u for u in urls)
+        assert any("platform-api2.max.ru" in u for u in urls)
         assert any("api.telegram.org" in u for u in urls)
 
 
 def test_max_exception_falls_back_to_tg(_db_max) -> None:
     """MAX raises (timeout/network) → TG fallback engaged."""
     def _post_side_effect(url, *args, **kwargs):
-        if "platform-api.max.ru" in url:
+        if "platform-api2.max.ru" in url:
             raise Exception("max timeout")
         return MagicMock(status_code=200, text="ok")
 
@@ -505,7 +505,7 @@ def test_both_channels_fail_no_mark_sent(_db_max) -> None:
         )
         # Second attempt: MAX retried → succeeds на этот раз → no TG fallback.
         assert mock_post.call_count == 1
-        assert "platform-api.max.ru" in mock_post.call_args.args[0]
+        assert "platform-api2.max.ru" in mock_post.call_args.args[0]
 
 
 def test_max_only_no_tg_configured(monkeypatch, tmp_path) -> None:
@@ -528,7 +528,7 @@ def test_max_only_no_tg_configured(monkeypatch, tmp_path) -> None:
             )
             # MAX attempted once, no TG fallback (not configured).
             assert mock_post.call_count == 1
-            assert "platform-api.max.ru" in mock_post.call_args.args[0]
+            assert "platform-api2.max.ru" in mock_post.call_args.args[0]
     finally:
         get_settings.cache_clear()
         get_engine.cache_clear()

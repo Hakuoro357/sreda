@@ -23,14 +23,62 @@ Phase 0 lock-ins documented in ``docs/research/max_api_contracts.md``.
 from __future__ import annotations
 
 import logging
+import ssl
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
+import certifi
 import httpx
 
 logger = logging.getLogger(__name__)
 
 
-BASE_URL = "https://platform-api.max.ru"
+# #214: адрес MAX API — ТОЛЬКО через max_base_url() (настройка env). Дефолт —
+# platform-api2.max.ru (миграция МАКС до 19.07.2026); хардкод старого адреса
+# убран намеренно, чтобы ничто не ходило в обход настройки/верификации.
+_DEFAULT_BASE_URL = "https://platform-api2.max.ru"
+_CERTS_DIR = Path(__file__).parent / "certs"
+# Корни Минцифры для platform-api2 (см. max_ssl_context). Sub нужен в бандле:
+# сервер MAX промежуточный Sub НЕ шлёт, а его keyid (77:3D:D9…) — поколения
+# subca_ssl_rsa2024, которого нет в общем бандле gosuslugi.
+_RU_CA_FILES = (
+    "russian_trusted_root_ca.pem",
+    "russian_trusted_sub_ca_ssl_rsa2024.pem",
+)
+
+
+def max_base_url() -> str:
+    """#214: базовый URL MAX API из настройки (env SREDA_MAX_API_BASE_URL).
+    Дефолт — platform-api2.max.ru; откат на старый — сменой env без редеплоя."""
+    from sreda.config.settings import get_settings
+
+    return (get_settings().max_api_base_url or _DEFAULT_BASE_URL).rstrip("/")
+
+
+@lru_cache(maxsize=1)
+def max_ssl_context() -> ssl.SSLContext:
+    """#214: SSLContext ТОЛЬКО для MAX-клиента = стандартные CA (certifi) +
+    корни Минцифры (Russian Trusted Root CA + Sub CA SSL RSA 2024).
+
+    platform-api2.max.ru отдаёт TLS, выпущенный Минцифры (нет в стандартном
+    хранилище) и НЕ присылает промежуточный Sub → кладём оба корня в бандл.
+    СКОУП: контекст применяется ТОЛЬКО к MAX-клиенту — гос-CA НЕ попадает в
+    системное доверие и не влияет на остальной outbound (Gemini/Groq/Telegram).
+    Сертификаты публичные, лежат в ``certs/`` (проверены по отпечатку #214)."""
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    for name in _RU_CA_FILES:
+        p = _CERTS_DIR / name
+        if not p.exists():
+            # Fail-fast (Codex R2): отсутствие обязательного корня — это
+            # дефект поставки. Лучше упасть громко при сборке клиента, чем
+            # ловить отложенный verify-fail на первом запросе к platform-api2.
+            raise RuntimeError(
+                f"max_ssl_context: отсутствует обязательный CA-файл Минцифры {p} — "
+                "TLS к platform-api2 не пройдёт verify (проверь поставку certs/)"
+            )
+        ctx.load_verify_locations(cafile=str(p))
+    return ctx
 
 
 # Per-token httpx pool. См. integrations/telegram/client.py для rationale —
@@ -53,6 +101,7 @@ def _make_pool_client() -> httpx.AsyncClient:
     """
     return httpx.AsyncClient(
         trust_env=False,
+        verify=max_ssl_context(),  # #214: certifi + корни Минцифры (platform-api2)
         timeout=httpx.Timeout(30.0, connect=10.0),
         limits=httpx.Limits(
             max_keepalive_connections=0,
@@ -204,7 +253,7 @@ class MaxClient:
         timeout: float = 10.0,
     ) -> Any:
         client = _get_pool_client(self._token)
-        url = f"{BASE_URL}{path}"
+        url = f"{max_base_url()}{path}"  # #214: адрес из настройки (platform-api2)
         try:
             resp = await client.request(
                 method, url,

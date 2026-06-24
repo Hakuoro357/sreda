@@ -813,6 +813,14 @@ def _bind_for(all_tools: list, active_families: Any, intent: str | None) -> list
 # route → стоп-узел (грациозный выход), НЕ дожидаясь recursion_limit (тот — внешний нет
 # с большим запасом, см. _cfg). Срез добавил круги (детуры need_family) → запас нужен.
 _MAX_TURN_PASSES = 8
+# #215: лимит web-инструментов на ход ПО ИНТЕНТУ (смягчён — прежний ≤1 душил факты: модель делала
+# 1 поиск + 1 fetch и упиралась в лимит, отвечала «не могу из-за ограничений»). chat — болтовня,
+# ресёрч почти не нужен; fact — реальный вопрос, нужен поиск → открыть → уточнить. Жёсткий потолок от
+# шторма всё равно есть: глобальный кап web_search #211 + _MAX_TURN_PASSES. Дефолт (нет ключа) = 1.
+_SEARCH_CAPS: dict[tuple[str, str], int] = {
+    ("chat", "web_search"): 1, ("chat", "fetch_url"): 2,
+    ("fact", "web_search"): 3, ("fact", "fetch_url"): 3,
+}
 _REFUSAL_MARKERS = (
     "не умею", "не могу помочь", "пока не могу", "пока умею", "не поддерживаю",
     "это вне моих", "не получится помочь", "к сожалению, не",
@@ -1607,6 +1615,16 @@ def _build_graph(llm: Any, all_tools: list, *,
             nudge = state.get("guard_nudge")
             if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
                 sp = f"{sp}\n\n{nudge}"
+            # #215: детерминированная карта «слово→раздел». Фредди (быстрая модель) сам путал «покажи
+            # дела» → list_reminders. Ловим слово-раздел ПО КОДУ (не доверяем промпту, урок #180) и
+            # вставляем жёсткую директиву (какой list_* звать) на ЭТОТ проход. ТОЛЬКО при eff=="task"
+            # (preflight ВКЛ + task-интент) — НЕ на OFF (eff=None): иначе OFF-промпт менялся бы на «покажи
+            # дела» и ломал byte-identical rollback (code-review R1 MAJOR, оба Codex). Порядок: sp→nudge→section.
+            if eff == "task":
+                from sreda.runtime.react_preflight import _section_hint
+                _sec = _section_hint(_last_human_text(state["messages"]))
+                if _sec:
+                    sp = f"{sp}\n\n{_sec}"
             # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
             # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
             _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
@@ -1699,12 +1717,14 @@ def _build_graph(llm: Any, all_tools: list, *,
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
-            # #197: web_search≤1 / fetch_url≤1 за ход — ТОЛЬКО chat/fact. Исполненные в прошлых проходах
+            # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
+            # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
             # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
             # трогаем). task/None — без лимита (прежнее). Закрывает batch-tool-call (2+ в одном AIMessage).
             if eff in ("chat", "fact") and name in ("web_search", "fetch_url"):
+                _cap = _SEARCH_CAPS.get((eff, name), 1)  # #215: по интенту (chat жёстче, fact свободнее)
                 _batch_search[name] = _batch_search.get(name, 0) + 1
-                if _count_executed_tool(state["messages"], name) + _batch_search[name] > 1:
+                if _count_executed_tool(state["messages"], name) + _batch_search[name] > _cap:
                     out.append(ToolMessage(
                         content="лимит поиска исчерпан, ответь из уже найденного",
                         name=name, tool_call_id=tc["id"],

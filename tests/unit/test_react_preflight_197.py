@@ -19,7 +19,8 @@ from langgraph.types import interrupt
 
 from sreda.runtime import react_loop
 from sreda.runtime.react_preflight import (
-    _MUST_TASK_PATTERNS, _WEB_ONLY_TOOL_NAMES, _must_task, _parse_intent,
+    _HINT_CHECKLIST, _HINT_REMINDER, _HINT_TASK, _MUST_TASK_PATTERNS,
+    _WEB_ONLY_TOOL_NAMES, _must_task, _parse_intent, _section_hint,
     chat_fact_system_prompt, classify_intent,
 )
 from sreda.runtime.react_loop import _bind_for, _count_executed_tool, _select_tools
@@ -56,7 +57,7 @@ class _Chat:
     ответов; пишет состав bound в bound_capture; считает вызовы в calls; raise_on_invoke → сбой invoke."""
 
     def __init__(self, label, *, classify="task", responses=None, bound_capture=None,
-                 calls=None, raise_on_invoke=False):
+                 calls=None, raise_on_invoke=False, sp_capture=None):
         self.label = label
         self._classify = classify
         self._responses = list(responses or [])
@@ -64,6 +65,7 @@ class _Chat:
         self._cap = bound_capture
         self._calls = calls if calls is not None else {}
         self._raise = raise_on_invoke
+        self._spcap = sp_capture  # #215: захват system-промпта, что увидела модель
 
     async def ainvoke(self, _msgs):
         self._calls["classify_" + self.label] = self._calls.get("classify_" + self.label, 0) + 1
@@ -76,6 +78,8 @@ class _Chat:
 
         def _inv(_msgs):
             outer._calls["invoke_" + outer.label] = outer._calls.get("invoke_" + outer.label, 0) + 1
+            if outer._spcap is not None and _msgs:
+                outer._spcap.append(getattr(_msgs[0], "content", ""))
             if outer._raise:
                 raise RuntimeError("boom-" + outer.label)
             if outer._responses:
@@ -183,6 +187,49 @@ def test_intent_switch_not_sticky():
     assert _must_task("напомни купить хлеб", prev_intent="chat") is True
 
 
+def test_section_hint_maps_words_to_section():
+    # #215: «дела»/«списки» → чек-листы; «задачи»/«расписание» → tasks; «напоминания» → reminders
+    assert _section_hint("покажи дела") == _HINT_CHECKLIST
+    assert _section_hint("мои списки") == _HINT_CHECKLIST
+    assert _section_hint("список кино") == _HINT_CHECKLIST
+    assert _section_hint("покажи задачи") == _HINT_TASK
+    assert _section_hint("что у меня в расписании") == _HINT_TASK
+    assert _section_hint("напомни купить молоко") == _HINT_REMINDER
+    assert _section_hint("мои напоминания") == _HINT_REMINDER
+    # нет ложного матча на «сделай»/«делать» (подстрока «дела»)
+    assert _section_hint("сделай это") is None
+    assert _section_hint("надо что-то делать") is None
+    assert _section_hint("как настроение") is None
+    assert _section_hint("") is None
+    # приоритет: напоминания > задачи > списки
+    assert _section_hint("напомни про задачи") == _HINT_REMINDER
+
+
+def test_section_hint_reaches_model_on_task(install):
+    # «покажи дела» → must_task → task → Фредди; директива «используй list_checklists» в промпте модели
+    spcap = []
+    freddie = _Chat("freddie", classify="task", sp_capture=spcap,
+                    responses=[AIMessage(content="вот твои списки")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    _turn(freddie, thread="sec-hint", text="покажи дела")
+    assert spcap, "модель не получила промпт"
+    assert "list_checklists" in spcap[-1]
+    assert "list_reminders" in spcap[-1]  # директива явно говорит НЕ показывать напоминания
+
+
+def test_off_no_section_hint(install):
+    # #215 (code-review R1, все 3 ревьюера MAJOR): на OFF (eff=None) секц-подсказка НЕ добавляется —
+    # сохраняем byte-identical OFF (инвариант T3 #197), даже на слове-разделе «покажи дела».
+    spcap = []
+    freddie = _Chat("freddie", classify="task", sp_capture=spcap,
+                    responses=[AIMessage(content="ок")])
+    install(on=False, deepseek=_Chat("deepseek"), invoked={})
+    _turn(freddie, thread="off-nosec", text="покажи дела")
+    assert spcap, "модель не получила промпт"
+    assert _HINT_CHECKLIST not in spcap[-1]
+    assert "list_checklists" not in spcap[-1]
+
+
 # ───────────────────────── юнит: _bind_for ─────────────────────────
 def test_byte_identical_bind_for_none():
     inv = {}
@@ -277,15 +324,29 @@ def test_web_search_batch_capped_one(install):
     assert "итог" in reply
 
 
-def test_fetch_url_capped_one(install):
+def test_fetch_url_capped_chat_two(install):
+    # #215: chat fetch_url ≤2 → из 3 исполнятся 2, 3-й → synthetic limit
     inv = {}
     deepseek = _Chat("deepseek",
-                     responses=[_ai_tools(("fetch_url", "f1"), ("fetch_url", "f2")),
+                     responses=[_ai_tools(("fetch_url", "f1"), ("fetch_url", "f2"), ("fetch_url", "f3")),
                                 AIMessage(content="готово")])
     freddie = _Chat("freddie", classify="chat")
     install(on=True, deepseek=deepseek, invoked=inv)
     _turn(freddie, thread="cap-fu", text="открой пару ссылок")
-    assert inv.get("fetch_url", 0) == 1
+    assert inv.get("fetch_url", 0) == 2
+
+
+def test_fact_allows_more_searches(install):
+    # #215: fact web_search ≤3 (смягчён с ≤1 — иначе факты упираются в лимит) → из 4 исполнятся 3
+    inv = {}
+    deepseek = _Chat("deepseek",
+                     responses=[_ai_tools(("web_search", "w1"), ("web_search", "w2"),
+                                          ("web_search", "w3"), ("web_search", "w4")),
+                                AIMessage(content="ответ по факту")])
+    freddie = _Chat("freddie", classify="fact")
+    install(on=True, deepseek=deepseek, invoked=inv)
+    _turn(freddie, thread="cap-fact", text="кто выиграл финал лиги чемпионов")
+    assert inv.get("web_search", 0) == 3
 
 
 def test_task_allows_multiple_searches(install):
