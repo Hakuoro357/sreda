@@ -150,6 +150,7 @@ def test_web_search_free_hard_stop_after_5(monkeypatch, tmp_path):
         tool = build_web_search_tool(
             session=session, tenant_id="t1", user_id="u1",
             per_user_cap=5, is_free=True,
+            per_turn_cap=0,  # #211: изолируем МЕСЯЧНУЮ квоту от per-ход лимита
         )
         with patch("sreda.services.web_search_tool._call_tavily") as mock_tavily:
             mock_tavily.return_value = [("T", "B", "https://x")]
@@ -197,6 +198,7 @@ def test_web_search_grandfathered_no_user_cap(monkeypatch, tmp_path):
         tool = build_web_search_tool(
             session=session, tenant_id="t1", user_id="u1",
             per_user_cap=None, is_free=False,
+            per_turn_cap=0,  # #211: изолируем per-user механизм от per-ход лимита
         )
         with patch("sreda.services.web_search_tool._call_tavily") as mock_tavily:
             mock_tavily.return_value = [("T", "B", "https://x")]

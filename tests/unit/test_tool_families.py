@@ -28,6 +28,7 @@ from sreda.services.tool_schemas.families import (
     FAMILIES,
     FAMILY_HEADERS,
     NON_FAMILY_REDIRECTS,
+    REACT_ONLY_TOOLS,
     TOOL_FAMILY_MANIFEST,
     Family,
     FamilyHeader,
@@ -323,8 +324,9 @@ def test_manifest_assigns_expected_tasks_count() -> None:
 
 def test_manifest_assigns_expected_checklists_count() -> None:
     # #143 Phase B: +list_checklist_items → 9.
+    # #210: +update_checklist_item (ReAct-only) → 10.
     checklists_tools = [t for t, f in TOOL_FAMILY_MANIFEST.items() if f == "checklists"]
-    assert len(checklists_tools) == 9
+    assert len(checklists_tools) == 10
 
 
 @pytest.mark.parametrize("tool_name", [
@@ -608,6 +610,7 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
         # Restore here when the spec lands.
         "save_recipe", "save_recipes_batch", "search_recipes",
         "get_recipe", "delete_recipe",
+        "update_recipe",  # #210: ReAct-only (в манифесте, без plan-execute спека)
     }),
     "menu": frozenset({
         "plan_week_menu", "update_menu_item", "list_menu",
@@ -628,6 +631,7 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
         "show_checklist", "list_checklist_items", "move_task_to_checklist",
         "mark_checklist_item_done", "delete_checklist_item",
         "archive_checklist",
+        "update_checklist_item",  # #210: ReAct-only (в манифесте, без plan-execute спека)
     }),
     "onboarding": frozenset({
         "onboarding_answered", "onboarding_deferred",
@@ -659,10 +663,46 @@ def test_manifest_exact_tool_set_per_family(
     )
 
 
-def test_manifest_total_size_is_56() -> None:
-    # 7+4+5+5+4+11+9+3+1+3+1+3 = 56. #143 Phase B добавил
-    # list_checklist_items (checklists 8→9), итог 55→56.
-    assert len(TOOL_FAMILY_MANIFEST) == 56
+def test_manifest_total_size_is_58() -> None:
+    # 7+4+6+5+4+11+10+3+1+3+1+3 = 58. #143 Phase B добавил
+    # list_checklist_items (checklists 8→9, итог 55→56). #210 добавил
+    # update_recipe (recipes 5→6) и update_checklist_item (checklists 9→10),
+    # оба ReAct-only — итог 56→58.
+    assert len(TOOL_FAMILY_MANIFEST) == 58
+
+
+def test_react_only_tools_are_in_manifest() -> None:
+    """#210: ReAct-only имена реально присутствуют в манифесте (иначе фильтр
+    ReAct-набора их бы не пропустил к Фредди)."""
+    for name in REACT_ONLY_TOOLS:
+        assert name in TOOL_FAMILY_MANIFEST, f"{name} нет в манифесте"
+
+
+def test_assert_manifest_matches_specs_excuses_react_only() -> None:
+    """#210: spec-набор покрывает ВСЕ манифест-инструменты, КРОМЕ ReAct-only —
+    assert_manifest_matches_specs НЕ считает их пропавшими (plan-execute
+    заморожен, спека у них нет by design)."""
+    from types import SimpleNamespace
+    fake_specs = [
+        SimpleNamespace(name=n, family=f)
+        for n, f in TOOL_FAMILY_MANIFEST.items()
+        if n not in REACT_ONLY_TOOLS
+    ]
+    # не бросает, хотя update_* остались в манифесте без спека
+    assert_manifest_matches_specs(fake_specs)
+
+
+def test_assert_manifest_matches_specs_still_catches_real_gap() -> None:
+    """Негатив: обычный (НЕ ReAct-only) манифест-инструмент без спека всё ещё
+    AssertionError — исключение узкое, не дыра."""
+    from types import SimpleNamespace
+    fake_specs = [
+        SimpleNamespace(name=n, family=f)
+        for n, f in TOOL_FAMILY_MANIFEST.items()
+        if n not in REACT_ONLY_TOOLS and n != "save_recipe"
+    ]
+    with pytest.raises(AssertionError, match="save_recipe"):
+        assert_manifest_matches_specs(fake_specs)
 
 
 # ---------------------------------------------------------------------------

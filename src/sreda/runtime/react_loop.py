@@ -577,9 +577,16 @@ _REACT_TOOL_DESC: dict[str, str] = {
         "Полные детали сохранённого рецепта (ингредиенты + шаги) по recipe_id (rec_). Когда: "
         "процитировать рецепт целиком или достать ингредиенты. Read-only."
     ),
+    "update_recipe": (
+        "ПРАВКА рецепта НА МЕСТЕ по recipe_id (rec_) — название/шаги/порции/время/ингредиенты. "
+        "Когда: «измени рецепт», «поправь шаги», «замени картошку на батат», «сделай на 4 порции». "
+        "Меняются только переданные поля; ingredients (если передан) ЗАМЕНЯЕТ весь список. Это "
+        "правка БЕЗ confirm — НЕ удаляй+создавай ради изменения. Сначала search_recipes/get_recipe "
+        "для recipe_id."
+    ),
     "delete_recipe": (
-        "Удалить рецепт из книги по recipe_id (rec_), каскадом с ингредиентами. Когда: просят "
-        "удалить. Правка рецепта = delete_recipe + save_recipe (отдельного update нет)."
+        "Удалить рецепт из книги ЦЕЛИКОМ по recipe_id (rec_), каскадом с ингредиентами. Когда: "
+        "просят убрать рецепт. Для ПРАВКИ рецепта — update_recipe (на месте), НЕ delete+save."
     ),
     # меню
     "plan_week_menu": (
@@ -670,11 +677,17 @@ _REACT_TOOL_DESC: dict[str, str] = {
         "«купила сахар». Сначала list_checklist_items для item_id. Принимает id, не название; "
         "чужой/архивный/исчезнувший → error:item_not_found."
     ),
+    "update_checklist_item": (
+        "ПРАВКА текста ОДНОГО пункта чек-листа НА МЕСТЕ по item_id (clitem_) — пункт сохраняет id, "
+        "позицию и статус, меняется лишь текст. Когда: «переименуй пункт», «измени X на Y», "
+        "«поправь название». Это правка БЕЗ confirm — НЕ удаляй+добавляй ради изменения. Сначала "
+        "list_checklist_items для item_id; принимает id, не название."
+    ),
     "delete_checklist_item": (
         "Жёстко удалить ОДИН пункт чек-листа по item_id (clitem_) — исчезает везде. Когда: «удали "
-        "пункт X», в т.ч. исправление своей ошибочной записи. Отличается от "
-        "mark_checklist_item_done (статус done) и archive_checklist (весь список). Сначала "
-        "list_checklist_items для item_id; принимает id, не название."
+        "пункт X». Для ПРАВКИ текста пункта — update_checklist_item (на месте), НЕ delete+add. "
+        "Отличается от mark_checklist_item_done (статус done) и archive_checklist (весь список). "
+        "Сначала list_checklist_items для item_id; принимает id, не название."
     ),
     "archive_checklist": (
         "Архивировать чек-лист (скрыть из активных, оставить в БД) — list_id_or_title id "
@@ -809,11 +822,21 @@ _REFUSAL_MARKERS = (
 # Дефисы нормализуются (чек-лист→чеклист). Хэнд-словарь — бутстрап (Kimi: позже learned-роутер).
 _WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
 _FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
-    "shopping": ("купи", "покупк", "корзин", "продукт", "молок", "хлеб", "овощ", "фрукт", "магазин"),
+    "shopping": ("купи", "покуп", "корзин", "продукт", "молок", "хлеб", "овощ", "фрукт", "магазин"),
     "recipes": ("рецепт", "приготов", "блюд", "ингредиент"),
     "menu": ("меню", "недел", "ужин", "обед", "завтрак"),
-    "checklists": ("чеклист", "сборы", "поручен"),  # «чек-лист» → дефис нормализуется в «чеклист»
-    "household": ("домочад", "родствен", "член", "семьи", "семью", "семей", "семейн"),
+    # #165 тюнинг (2026-06-24): «пункт» — замер выбора показал «отметь пункт» брал list_tasks вместо checklists.
+    "checklists": ("чеклист", "сборы", "поручен", "пункт"),  # «чек-лист» → дефис нормализуется в «чеклист»
+    # #165 тюнинг (2026-06-24, R2/R3 по ревью): household-промахи замера («кто в семье»→recall_memory).
+    # ПРЕФИКСНЫЕ корни ниже — явные формы жена*/мужа* (НЕ широкие жен/муж: ловили бы женщина/мужчина/мужской).
+    # Короткие коллизионные «муж»/«муже» (ном./предл.) — через _FAMILY_EXACT_ROOTS (точный токен, не префикс),
+    # иначе «мой муж»/«о муже» промахивались бы (Codex R2 MAJOR: промах хуже лишнего бинда). Числительное
+    # «семь» (4 симв) короче любого сем-корня (≥5) → не матчит; сын/дочк/дети не ловят «сыр/детский/детали»
+    # (расходятся на 3–4-м симв). Остаточные «женат»/«мужать» — приняты (по смыслу про семью / редки); ложный
+    # матч лишь ДОБАВЛЯет household (route без cap → не вытесняет, не ломает).
+    "household": ("домочад", "родствен", "член", "семьи", "семью", "семей", "семейн", "семье", "семья", "семьё",
+                  "жена", "жене", "жену", "жены", "женой", "мужа", "мужу", "мужем",
+                  "сын", "дочк", "дочер", "дети", "детей", "ребён", "ребен"),
     "web": ("найди", "поищ", "погугл", "поиск", "новост", "погода", "погоду", "погоды",
             "курс", "интернет", "сайт"),  # корни сужены (R2: найд/погод→ложные «найден/погоди»)
     "memory": ("запомни", "заметк", "запиш", "сохран"),  # запиши / сохрани факт
@@ -865,10 +888,19 @@ _UNKEYED_WRITE_FAMILIES = frozenset(
     f for f, p in _FAMILY_WRITE_POLICY.items() if p in ("unkeyed", "metered_read"))
 
 
+# Точные токены (равенство, НЕ префикс) — для коротких форм, чей ПРЕФИКС ловил бы общие слова:
+# «муж» (префикс → мужчина/мужской/мужественный), «муже» (→ мужество/мужественный). Точное равенство
+# токену даёт recall на «мой муж»/«о муже» БЕЗ этих ложных срабатываний (Codex high+medium R2 MAJOR:
+# промах хуже лишнего бинда). Прочие household-формы (жена*/мужа/мужу/мужем/сын/дочк/дети) — префиксные.
+_FAMILY_EXACT_ROOTS: dict[str, tuple[str, ...]] = {
+    "household": ("муж", "муже"),
+}
+
+
 def _route_families(text: str, k: int = 2) -> list[str]:
-    """Предзагрузка (Срез B): текст → токены → семьи с корнем-префиксом токена → top-k по
-    числу СОВПАВШИХ ТОКЕНОВ (не пар: токен с несколькими корнями = 1 очко). Плохой словарь →
-    лишь чаще лишний need_family-шаг, НЕ отказ (страж §2). k≤0 → пусто."""
+    """Предзагрузка (Срез B): текст → токены → семьи с корнем-ПРЕФИКСОМ токена ИЛИ точным токеном
+    (_FAMILY_EXACT_ROOTS) → top-k по числу СОВПАВШИХ ТОКЕНОВ (токен с неск. корнями = 1 очко). Плохой
+    словарь → лишь чаще лишний need_family-шаг, НЕ отказ (страж §2). k≤0 → пусто."""
     if k <= 0:
         return []
     # нормализуем класс дефисов/тире (вкл. не-ASCII ‑–—, R2 medium): чек-лист→чеклист
@@ -876,7 +908,9 @@ def _route_families(text: str, k: int = 2) -> list[str]:
     tokens = _WORD_RE.findall(norm)
     scored: dict[str, int] = {}
     for fam, roots in _FAMILY_ROOTS.items():
-        n = sum(1 for tok in tokens if any(tok.startswith(r) for r in roots))
+        exact = _FAMILY_EXACT_ROOTS.get(fam, ())
+        n = sum(1 for tok in tokens
+                if tok in exact or any(tok.startswith(r) for r in roots))
         if n:
             scored[fam] = n
     return [f for f, _ in sorted(scored.items(), key=lambda kv: -kv[1])][:k]
@@ -974,12 +1008,22 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         op_id = compute_operation_id_update(
             plan_id=ctx.execution_id, step_id=ctx.step_id, action=action,
             entity_type=entity_type, entity_id=entity_id)
+        # #163 Фаза 3d: action-глагол (update/cancel/delete) → audit-enum (created/updated/deleted/
+        # skipped). cancel = смена статуса (строка жива) → updated; delete = hard-delete → deleted.
+        # entity_type ("family_reminder"/"task") валиден И как operation_family, И как audit entity_type.
+        audit_action = {"update": "updated", "cancel": "updated", "delete": "deleted"}.get(action)
+        if audit_action is None:  # неизвестный глагол под ctx → аудит молча пропустился бы (Codex R1 MINOR)
+            logger.warning(
+                "idempotent_write: action=%r не смаплен на audit-enum — durable-действие БЕЗ "
+                "аудита (op=%s, entity=%s). Добавь маппинг.", action, op_id, entity_type)
         try:
             return execute_idempotent_durable_op(
                 session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
                 operation_family=entity_type,
                 args_hmac=compute_args_hmac(args, secret=secret),
-                mutate_fn=lambda: mutate(False), tool_name=action)
+                mutate_fn=lambda: mutate(False), tool_name=action,
+                audit_entity_type=entity_type, audit_entity_id=entity_id,
+                audit_action=audit_action)
         except IdempotencyInFlight:
             return "Секунду, эта правка уже в обработке — повтори, если не дошло."
         except (IdempotencyArgsMismatch, IdempotencyScopeMismatch) as exc:
@@ -1479,7 +1523,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                  # #197: state-driven селектор — граф строится ОДИН раз с ОБЕИМИ моделями; chat-узел
                  # выбирает по effective_intent. deepseek_llm=None (OFF/мисконфиг) → chat/fact на Фредди+web-only.
                  deepseek_llm: Any = None, chat_prompt: str = "",
-                 deepseek_provider_key: str = "", preflight_enabled: bool = False):
+                 deepseek_provider_key: str = "", preflight_enabled: bool = False,
+                 channel: str = "", thread_id: str = ""):  # #163 Фаза 3d: провенанс react-аудита в ctx
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
     ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
     набор меняется по ходу без перекомпиляции графа (need_family добирает семью).
@@ -1677,7 +1722,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                     ctx = ToolRuntimeContext(
                         operation_id=op_id, execution_id=exec_id, step_id=tc["id"],
                         tool_name=name, tenant_id=tenant_id, user_id=user_id,
-                        turn_key=turn_key)
+                        turn_key=turn_key, channel=channel, thread_id=thread_id)
                     with bind_tool_runtime(ctx):
                         res = tool_obj.invoke(tc["args"])
                 else:
@@ -2134,7 +2179,8 @@ async def handle_turn(
             session=session, provider_key=provider_key,  # #175: учёт расхода в chat-узле
             fallback_llm=fallback_llm,  # #184: Оса-fallback
             deepseek_llm=_deepseek_llm, chat_prompt=_chat_prompt,  # #197 state-driven селектор
-            deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight)
+            deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight,
+            channel=channel, thread_id=base)  # #163 Фаза 3d: провенанс react-аудита
 
         snap = await graph.aget_state(_cfg(gen))
         live_pause = (_has_pause(snap)

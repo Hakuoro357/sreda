@@ -280,6 +280,91 @@ def emit_event(
     return event
 
 
+def emit_tool_audit(
+    session: Session,
+    *,
+    operation_id: str,
+    tenant_id: str,
+    user_id: str | None,
+    entity_type: str,
+    entity_id: str | None,
+    action: str,
+) -> None:
+    """#163 Фаза 3d — атомарный аудит durable-действия ReAct.
+
+    Провенанс берётся из ``ToolRuntimeContext`` (current_tool_runtime). Если контекста НЕТ
+    (легаси/plan-execute/прямой вызов сервиса) → **no-op** (react-аудит не пишем, путь не падает).
+    ``caused_by`` = {source:"react", turn_key, thread_id, channel, tool_name} — без user-content
+    (ПД-safe; #192). ВНИМАНИЕ: содержит ВНУТРЕННИЕ идентификаторы (turn_key включает tenant_id +
+    inbound/thread id, thread_id — id ветки) — НЕ свободный текст, но при экспорте ленты наружу их
+    стоит минимизировать/хешировать. ``operation_id`` — ключ операции (UNIQUE в outbox → replay не двоит).
+
+    Перед эмитом — PRE-проверка: если строка с этим op_id уже есть в outbox/feed и относится к иной
+    цели/действию → RuntimeError (op_id-коллизия, аудит не подменяем; мутация откатится).
+
+    Атомарность (named-W): эмит в ОТДЕЛЬНОМ SAVEPOINT *внутри* родительского savepoint вызывающего.
+    Гонка по operation_id (racer уже записал) → IntegrityError → внутренний savepoint откатывается,
+    РОДИТЕЛЬСКАЯ мутация цела (поглощаем, источник продолжает). Поглощаем ТОЛЬКО IntegrityError —
+    прочие исключения (валидация enum, identity-конфликт PRE-проверки) пробрасываем → откат операции.
+    """
+    from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+    ctx = current_tool_runtime()
+    if ctx is None:
+        return  # не-ReAct путь — react-аудит не пишем
+    caused_by = {
+        "source": "react",
+        "turn_key": ctx.turn_key,
+        "thread_id": ctx.thread_id,
+        "channel": ctx.channel,
+        "tool_name": ctx.tool_name,
+    }
+    # PRE-проверка идентичности (Codex high+medium R2 MAJOR, incl. feed-relayed): op_id уникален
+    # per-операцию по построению, НО fail-loud на нарушение инварианта. Если строка с НАШИМ op_id уже
+    # есть в outbox ИЛИ в уже-отрелеенном feed и относится к ДРУГОЙ цели/действию → raise (аудит не
+    # подменяем молча; мутация откатится у вызывающего, named-W). Проверяем ДО emit_event обе таблицы,
+    # т.к. на feed-коллизии emit_event вернул бы transient из ЗАПРОСА → пост-проверки ev недостаточно.
+    # Сверяем entity_type+entity_id+action+source (полная цель операции; Codex R2 MINOR — узкая проверка).
+    from sreda.db.models import AuditOutboxEvent, UserDataChangeFeedEvent
+
+    for _model in (AuditOutboxEvent, UserDataChangeFeedEvent):
+        _existing = (
+            session.query(_model)
+            .filter(_model.operation_id == operation_id)
+            .one_or_none()
+        )
+        if _existing is not None and (
+            _existing.entity_type != entity_type
+            or _existing.entity_id != entity_id
+            or _existing.action != action
+            or (_existing.caused_by or {}).get("source") != "react"
+        ):
+            raise RuntimeError(
+                f"emit_tool_audit: op={operation_id} — чужая audit-строка "
+                f"({_existing.entity_type}/{_existing.entity_id}/{_existing.action}); "
+                f"коллизия operation_id, аудит НЕ подменяем"
+            )
+    try:
+        with session.begin_nested():  # отдельный SAVEPOINT ВНУТРИ родительского — гонка аудита не валит мутацию
+            emit_event(
+                session,
+                operation_id=operation_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                source="среда",
+                entity_type=entity_type,
+                entity_id=entity_id,
+                action=action,
+                payload=None,
+                caused_by=caused_by,
+            )
+    except IntegrityError:
+        _logger.info(
+            "emit_tool_audit: op=%s audit-строка уже записана (гонка); продолжаем",
+            operation_id,
+        )
+
+
 def read_recent_events(
     session: Session,
     *,

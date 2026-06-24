@@ -36,6 +36,7 @@ WRITE_TOOLS_EXPECTED: set[str] = {
     "clear_bought_shopping",
     # recipes
     "save_recipe", "save_recipes_batch", "delete_recipe",
+    "update_recipe",  # #210: правка рецепта на месте
     # menu
     "plan_week_menu", "update_menu_item", "generate_shopping_from_menu",
     "clear_menu",
@@ -47,6 +48,8 @@ WRITE_TOOLS_EXPECTED: set[str] = {
     # checklists (incl R-30 culprit add_checklist_items)
     "create_checklist", "add_checklist_items", "move_task_to_checklist",
     "mark_checklist_item_done", "delete_checklist_item", "archive_checklist",
+    "update_checklist_item",  # #210: правка пункта на месте
+
     # R-33 (2026-05-15): task↔checklist link tools
     "link_task_to_checklist", "unlink_task",
 }

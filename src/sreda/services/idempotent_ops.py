@@ -114,8 +114,16 @@ def execute_idempotent_durable_op(
     args_hmac: str,
     mutate_fn: Callable[[], Any],
     tool_name: str | None = None,
+    audit_entity_type: str | None = None,
+    audit_entity_id: str | None = None,
+    audit_action: str | None = None,
 ) -> Any:
     """exact-replay durable-операции. Возвращает payload (новый или сохранённый при повторе).
+
+    #163 Фаза 3d: если заданы ``audit_entity_type``+``audit_action`` — на СВЕЖЕМ исполнении (НЕ на
+    replay) пишется react-аудит АТОМАРНО (в том же savepoint, после успешной mutate_fn). Нет
+    ToolRuntimeContext → emit_tool_audit no-op. Replay возвращается раньше (committed-ветка) →
+    повторно не аудитим (UNIQUE op_id всё равно подстрахует).
 
     committed + тот же args_hmac + тот же scope → сохранённый payload, мутации НЕТ.
     committed + иной args_hmac → IdempotencyArgsMismatch. чужой scope → IdempotencyScopeMismatch.
@@ -163,6 +171,24 @@ def execute_idempotent_durable_op(
             row.stable_return_payload = payload
             row.status = "committed"
             row.updated_at = datetime.now(timezone.utc)
+            # #163 Фаза 3d (Codex R1 MAJOR): ФЛАШИМ claim+мутацию ДО аудита. Иначе автофлаш при
+            # установке внутреннего audit-savepoint'а (begin_nested) мог бы поднять IntegrityError
+            # от САМОЙ мутации/claim'а — и emit_tool_audit проглотил бы его как «гонку аудита».
+            # После явного flush мутация уже на диске (её IntegrityError всплыл бы ЗДЕСЬ → ниже в
+            # except → гонка ОПЕРАЦИИ), а audit-savepoint флашит только audit-строку. Flush
+            # БЕЗУСЛОВНЫЙ (и на no-audit пути — безвреден, данные всё равно флашатся на commit ниже);
+            # НЕ переносить внутрь `if audit...` (иначе разделение savepoint'ов сломается).
+            session.flush()
+            # #163 Фаза 3d: react-аудит АТОМАРНО (в этом savepoint, ПОСЛЕ успешной мутации). Только
+            # на свежем исполнении — replay/mismatch вернулись выше (committed-ветка), повторно не
+            # аудитим. Нет ToolRuntimeContext → emit_tool_audit no-op. Гонка аудита → внутренний
+            # savepoint поглощает (мутация цела); non-race сбой → пробрасывается → откат операции.
+            if audit_entity_type and audit_action:
+                from sreda.services.audit_feed import emit_tool_audit
+                emit_tool_audit(
+                    session, operation_id=operation_id, tenant_id=tenant_id,
+                    user_id=user_id, entity_type=audit_entity_type,
+                    entity_id=audit_entity_id, action=audit_action)
     except IntegrityError:
         # Либо гонка по operation_id (racer вставил между query и flush), либо мутация нарушила
         # constraint. Наш claim уже откатан savepoint'ом. Если по operation_id committed-строка

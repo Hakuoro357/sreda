@@ -712,6 +712,14 @@ class Settings(BaseSettings):
         default=None, validation_alias="TAVILY_API_KEY"
     )
 
+    # #211: жёсткий лимит web_search на ОДИН ход ReAct (для ВСЕХ тиров) —
+    # отсечка шторма. Один спутанный ход загонял 35 веб-поисков и выжирал
+    # Tavily-квоту; per-user стоп есть не у всех (grandfathered). 0 — без
+    # per-ход лимита (только дневная/месячная квота). Тюнится без редеплоя.
+    react_web_search_per_turn_cap: int = Field(
+        default=4, validation_alias="SREDA_REACT_WEB_SEARCH_PER_TURN_CAP"
+    )
+
     # Опциональный путь к файлу для structured JSON-лога неудачных
     # попыток подключения EDS-ЛК (для post-mortem анализа). Одна
     # запись — одна строка JSON с timestamp, tenant_id, login_masked,

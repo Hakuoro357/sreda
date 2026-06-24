@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -264,6 +265,7 @@ def build_web_search_tool(
     user_id: str | None = None,
     per_user_cap: int | None = 5,
     is_free: bool = True,
+    per_turn_cap: int | None = None,
 ) -> Callable:
     """Return a LangChain tool — Tavily primary + DDG fallback.
 
@@ -288,6 +290,21 @@ def build_web_search_tool(
         is_free: free-тир (определяет fail-closed и поведение на global≥950).
     """
     api_key = (get_settings().tavily_api_key or "").strip()
+    # #211: per-ход лимит web_search. build_web_search_tool пересобирается
+    # КАЖДЫЙ ход (build_slice_tools per-turn) → счётчик в замыкании сам
+    # сбрасывается на следующем ходе. None → берём из настроек (дефолт 4).
+    if per_turn_cap is None:
+        per_turn_cap = get_settings().react_web_search_per_turn_cap
+    try:
+        per_turn_cap = max(0, int(per_turn_cap or 0))  # клампим (<=0 = выкл)
+    except (ValueError, TypeError):
+        per_turn_cap = 0
+    _turn_web_calls = [0]
+    # Lock (Codex R1 MAJOR): plan-execute executor гоняет same-layer read-шаги
+    # через asyncio.gather; web_search — read → может выполняться конкурентно
+    # (вкл. thread-pool). Инкремент+проверка под lock → нет lost-update,
+    # лимит не переполняется. На последовательном ReAct-пути lock не мешает.
+    _turn_web_lock = threading.Lock()
 
     @lc_tool
     def web_search(query: str) -> str:
@@ -323,6 +340,22 @@ def build_web_search_tool(
         q = (query or "").strip()
         if not q:
             return "error: empty query"
+
+        # #211: жёсткая отсечка шторма — не более per_turn_cap веб-поисков за
+        # ОДИН ход. ДО Tavily/DDG — экономим И квоту, И время. Применяется ко
+        # ВСЕМ тирам (grandfathered без per-user стопа загонял 35/ход).
+        # Инкремент+проверка под lock — корректно при конкурентных read-шагах
+        # plan-execute (Codex R1 MAJOR).
+        if per_turn_cap > 0:
+            with _turn_web_lock:
+                _turn_web_calls[0] += 1
+                over_cap = _turn_web_calls[0] > per_turn_cap
+            if over_cap:
+                return (
+                    "error:web_search_turn_limit: достигнут предел веб-поисков "
+                    "за один ответ — ответь тем, что уже найдено; новые поиски "
+                    "в этом ходе не выполняются"
+                )
 
         # Нет api_key — DDG как раньше (quota не применяется).
         if not api_key:

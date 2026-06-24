@@ -22,7 +22,10 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
-from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+from sreda.services.tool_schemas.families import (
+    REACT_ONLY_TOOLS,
+    TOOL_FAMILY_MANIFEST,
+)
 from sreda.services.tool_schemas.housewife import (
     AddChecklistItemsOk,
     AddChecklistItemsWithDups,
@@ -103,7 +106,9 @@ def test_manifest_matches_checklists_specs() -> None:
         if family == "checklists"
     }
     spec_names = {s.name for s in CHECKLISTS_SPECS}
-    assert manifest_checklists == spec_names
+    # #210: update_checklist_item — ReAct-only (в манифесте для фильтра ReAct,
+    # без plan-execute ToolSpec, т.к. старый планировщик заморожен).
+    assert manifest_checklists - REACT_ONLY_TOOLS == spec_names
 
 
 @pytest.mark.parametrize("spec", CHECKLISTS_SPECS, ids=lambda s: s.name)
