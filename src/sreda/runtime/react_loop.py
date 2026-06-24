@@ -297,6 +297,15 @@ class ReactState(MessagesState):
     # #192: аккумулятор вызовов LLM узла chat для трейса (add-reducer — НЕ двоится на resume:
     # interrupt в run_tools, chat-узлы до паузы уже отработали и checkpointed, заново не идут).
     llm_calls: Annotated[list, operator.add]
+    # #197: намерение хода (task/chat/fact), определённое preflight ДО графа (fresh — в init-dict;
+    # resume — из чекпойнта). Last-value канал. Читается ТОЛЬКО при preflight_enabled (через
+    # effective_intent); OFF → игнорируется (byte-identical, безопасный rollback даже при intent=chat
+    # в старом чекпойнте). chat/fact → web-only scope + deepseek; task/None → как сейчас.
+    intent: str
+    # #197 Слой 4 (наблюдаемость): как определён intent — {"source": "must_task"|"classifier",
+    # "must_task": bool, "classifier_raw": str}. Last-value, ставится на fresh-ходе; chat-узел кладёт в
+    # llm_calls-трейс (#192) для отладки мисклассификации на проде. OFF → не ставится.
+    intent_meta: dict
 
 
 def _system_prompt(today_str: str) -> str:
@@ -771,6 +780,18 @@ def _select_tools(all_tools: list, active_families: Any) -> list:
         t for t in all_tools
         if t.name in _CORE_TOOL_NAMES or TOOL_FAMILY_MANIFEST.get(t.name) in fams
     ]
+
+
+def _bind_for(all_tools: list, active_families: Any, intent: str | None) -> list:
+    """#197: набор инструментов для bind/dispatch ПО ИНТЕНТУ.
+    - chat/fact → ТОЛЬКО web-семья (`_WEB_ONLY_TOOL_NAMES`: web_search/fetch_url/get_weather), БЕЗ ядра
+      (нет reminders/tasks/recall_memory/need_family/delete_account) — анти-флейл, явный список (аудируем).
+    - task ИЛИ None/absent → ДОСЛОВНО `_select_tools` (byte-identical при OFF: effective_intent=None).
+    Зовётся в ОБОИХ местах (chat-bind И run_tools dispatch), иначе галлюцинация need_family откроет семью."""
+    from sreda.runtime.react_preflight import _WEB_ONLY_TOOL_NAMES
+    if intent in ("chat", "fact"):
+        return [t for t in all_tools if t.name in _WEB_ONLY_TOOL_NAMES]
+    return _select_tools(all_tools, active_families)
 
 
 # #165 Срез A guard — детерминированный backstop «не отказать молчаливо».
@@ -1454,7 +1475,11 @@ def _record_react_usage(*, bind: Any, tenant_id: str, provider_key: str, model: 
 def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str,
                  session: Any = None, provider_key: str = "",
-                 fallback_llm: Any = None):  # #184: запасной LLM (Оса) при сбое primary
+                 fallback_llm: Any = None,  # #184: запасной LLM (Оса) при сбое primary
+                 # #197: state-driven селектор — граф строится ОДИН раз с ОБЕИМИ моделями; chat-узел
+                 # выбирает по effective_intent. deepseek_llm=None (OFF/мисконфиг) → chat/fact на Фредди+web-only.
+                 deepseek_llm: Any = None, chat_prompt: str = "",
+                 deepseek_provider_key: str = "", preflight_enabled: bool = False):
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
     ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
     набор меняется по ходу без перекомпиляции графа (need_family добирает семью).
@@ -1471,6 +1496,7 @@ def _build_graph(llm: Any, all_tools: list, *,
     # (иначе токены Осы попали бы в строку Mercury → таблица «расход по провайдерам» врёт; R1 MAJOR).
     _model_name = ""
     _fallback_model_name = ""
+    _deepseek_model_name = ""  # #197: имя модели deepseek для атрибуции расхода chat/fact
     try:
         from sreda.config.settings import get_settings as _gs
         from sreda.runtime.planner.llm import _resolve_model_name as _rmn
@@ -1479,45 +1505,73 @@ def _build_graph(llm: Any, all_tools: list, *,
             _model_name = _rmn(llm, _s, provider_key)
         if fallback_llm is not None:
             _fallback_model_name = _rmn(fallback_llm, _s, _FALLBACK_PROVIDER_KEY)
+        if deepseek_llm is not None and deepseek_provider_key:
+            _deepseek_model_name = _rmn(deepseek_llm, _s, deepseek_provider_key)
     except Exception:  # noqa: BLE001 — резолв не валит ход; пусто → fallback на provider_key
         pass
 
     def chat(state: ReactState):
-        # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
-        bound = _select_tools(all_tools, state.get("active_families"))
-        sp = system_prompt
-        nudge = state.get("guard_nudge")
-        if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
-            sp = f"{sp}\n\n{nudge}"
-        # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
-        # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
-        _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(), budget=_compact_budget())
-        # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
-        #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
-        #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
-        #   (2) primary bind_tools — ВНЕ try (R2 MAJOR Codex high): ошибка построения/схемы =
-        #       ЛОКАЛЬНЫЙ баг, его НЕ маскируем уходом на Осу; в try ТОЛЬКО сетевой invoke;
-        #   (3) запас (bind_tools + invoke) строим ЛЕНИВО, ТОЛЬКО когда primary упал (mimocode
-        #       MINOR): с флагом ВКЛ построение запаса на КАЖДОМ ходу — баг bind_tools резерва
-        #       ронял бы happy-path primary, хотя Mercury в порядке; ленивость это исключает;
-        #   (4) лог с exc_info=True — полный traceback причины перехода.
-        # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
-        _bound_primary = llm.bind_tools(bound)
-        _used_provider, _used_model = provider_key, _model_name
-        _fallback_fired = False
-        _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
-        if fallback_llm is not None:
-            try:
-                resp = _bound_primary.invoke(_msgs)
-            except Exception as _e:  # noqa: BLE001 — INVOKE primary упал (сеть/провайдер/5xx) → запас
-                logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
+        # #197: effective_intent — читаем сохранённый intent ТОЛЬКО при preflight_enabled. OFF → None →
+        # task-ветка ниже = ДОСЛОВНО прежнее поведение (byte-identical даже при чекпойнте intent=chat).
+        eff = (state.get("intent") or None) if preflight_enabled else None
+        _used_provider, _used_model, _fallback_fired = provider_key, _model_name, False
+        if eff in ("chat", "fact"):
+            # #197 chat/fact: рассуждающая модель (deepseek) + ТОЛЬКО web-семья + honesty. ИНВАРИАНТ:
+            # SCOPE всегда web-only (bound по eff ДО try → fallback наследует тот же bound → не расширится);
+            # МОДЕЛЬ best-effort (deepseek → при сбое bind/invoke Фредди с ТЕМ ЖЕ web-only + chat_prompt,
+            # НЕ task). Если и Фредди+web-only упадёт → исключение во внешний guard → safe-reply (scope цел).
+            bound = _bind_for(all_tools, state.get("active_families"), eff)
+            sp = chat_prompt or system_prompt
+            _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
+                                      budget=_compact_budget())
+            _primary = deepseek_llm if deepseek_llm is not None else llm  # мисконфиг → Фредди+web-only
+            _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
+            _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
+            _t0 = _time.perf_counter()
+            try:  # guarded bind+invoke (deepseek может не принять tool-схему)
+                resp = _primary.bind_tools(bound).invoke(_msgs)
+            except Exception as _e:  # noqa: BLE001 — сбой deepseek bind/invoke → fallback Фредди web-only
+                logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
-                resp = fallback_llm.bind_tools(bound).invoke(_msgs)
-                _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
-                _fallback_fired = True
+                resp = llm.bind_tools(bound).invoke(_msgs)  # тот же web-only bound, НЕ task
+                _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
+            _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:
-            resp = _bound_primary.invoke(_msgs)
-        _latency_ms = int((_time.perf_counter() - _t0) * 1000)
+            # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical).
+            # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
+            bound = _select_tools(all_tools, state.get("active_families"))
+            sp = system_prompt
+            nudge = state.get("guard_nudge")
+            if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
+                sp = f"{sp}\n\n{nudge}"
+            # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
+            # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
+            _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
+                                      budget=_compact_budget())
+            # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
+            #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
+            #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
+            #   (2) primary bind_tools — ВНЕ try (R2 MAJOR Codex high): ошибка построения/схемы =
+            #       ЛОКАЛЬНЫЙ баг, его НЕ маскируем уходом на Осу; в try ТОЛЬКО сетевой invoke;
+            #   (3) запас (bind_tools + invoke) строим ЛЕНИВО, ТОЛЬКО когда primary упал (mimocode
+            #       MINOR): с флагом ВКЛ построение запаса на КАЖДОМ ходу — баг bind_tools резерва
+            #       ронял бы happy-path primary, хотя Mercury в порядке; ленивость это исключает;
+            #   (4) лог с exc_info=True — полный traceback причины перехода.
+            # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
+            _bound_primary = llm.bind_tools(bound)
+            _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
+            if fallback_llm is not None:
+                try:
+                    resp = _bound_primary.invoke(_msgs)
+                except Exception as _e:  # noqa: BLE001 — INVOKE primary упал (сеть/провайдер/5xx) → запас
+                    logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
+                                   type(_e).__name__, exc_info=True)
+                    resp = fallback_llm.bind_tools(bound).invoke(_msgs)
+                    _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
+                    _fallback_fired = True
+            else:
+                resp = _bound_primary.invoke(_msgs)
+            _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
         try:
@@ -1540,6 +1594,14 @@ def _build_graph(llm: Any, all_tools: list, *,
                 "provider_key": _used_provider, "model": _used_model,
                 "latency_ms": _latency_ms, "retries": (1 if _fallback_fired else 0),
                 "fallback_fired": _fallback_fired,
+                # #197 Слой 4: наблюдаемость роутинга — для отладки мисклассификации на проде.
+                "intent": eff or "task",
+                "tool_scope": ("web" if eff in ("chat", "fact") else "full"),
+                "selected_provider": _used_provider,
+                "web_search_count": _count_executed_tool(state["messages"], "web_search"),
+                "must_task": (state.get("intent_meta") or {}).get("must_task"),
+                "intent_source": (state.get("intent_meta") or {}).get("source"),
+                "classifier_raw": (state.get("intent_meta") or {}).get("classifier_raw"),
             }],
         }
 
@@ -1549,18 +1611,36 @@ def _build_graph(llm: Any, all_tools: list, *,
         exec_id = (hashlib.sha1(turn_key.encode("utf-8")).hexdigest()
                    if turn_key else "")
         active = list(state.get("active_families") or [])
+        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
         wrote_unkeyed = False  # отработал ли инструмент unkeyed-write семьи (→ выключит guard)
-        # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента
-        # из НЕ загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш.
-        bound_by_name = {t.name: t for t in _select_tools(all_tools, active)}
+        # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента из НЕ
+        # загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш. #197: тот же
+        # `_bind_for(eff)`, что в chat-узле (chat/fact → web-only; иначе галлюцинация need_family
+        # открыла бы семью мимо bind).
+        bound_by_name = {t.name: t for t in _bind_for(all_tools, active, eff)}
         out = []
         added = False
+        _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
+            # #197: web_search≤1 / fetch_url≤1 за ход — ТОЛЬКО chat/fact. Исполненные в прошлых проходах
+            # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
+            # трогаем). task/None — без лимита (прежнее). Закрывает batch-tool-call (2+ в одном AIMessage).
+            if eff in ("chat", "fact") and name in ("web_search", "fetch_url"):
+                _batch_search[name] = _batch_search.get(name, 0) + 1
+                if _count_executed_tool(state["messages"], name) + _batch_search[name] > 1:
+                    out.append(ToolMessage(
+                        content="лимит поиска исчерпан, ответь из уже найденного",
+                        name=name, tool_call_id=tc["id"],
+                        artifact={"result_kind": "search_limit", "limit_hit": True}))
+                    continue
             # #165 Срез A: need_family — мета-инструмент, обрабатываем в узле (узел нативно
             # обновляет state) → семья доезжает до следующего chat. Парный ToolMessage с
             # оригинальным tool_call_id ОБЯЗАТЕЛЕН (провайдер иначе отвергнет AIMessage).
-            if name == "need_family":
+            # #197 (code-review R1 MAJOR): need_family — мета-инструмент ЯДРА; на chat/fact его НЕТ в
+            # web-only наборе, значит галлюцинацию need_family НЕ обрабатываем нативно (иначе семья
+            # просочилась бы мимо bind) — она упадёт в ветку «недоступен» ниже (bound_by_name.get→None).
+            if name == "need_family" and eff not in ("chat", "fact"):
                 fam = (tc.get("args") or {}).get("family")
                 # ре-валидация против allowed-set (Literal в схеме НЕ гарантирует — модель
                 # может галлюцинировать «utility»/«tasks»/мусор ИЛИ не-строку list/dict →
@@ -1646,6 +1726,7 @@ def _build_graph(llm: Any, all_tools: list, *,
     def route(state: ReactState):
         last = state["messages"][-1]
         passes = state.get("turn_pass_count") or 0
+        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
         if getattr(last, "tool_calls", None):
             # АНТИ-ПЕТЛЯ (R1 medium+субагент): лимит проходов исчерпан (повтор need_family/
             # недоступного инструмента и т.п.) → грациозный стоп-узел, НЕ зацикливаемся до
@@ -1655,7 +1736,9 @@ def _build_graph(llm: Any, all_tools: list, *,
         # #165 Срез A guard: ответ БЕЗ tool_call И похож на отказ И по тексту юзера видна
         # семья ИЗ СРЕЗА не в bound И семья ещё НЕ пробована И лимит проходов не превышен
         # → подстраховка (один retry на семью). scope-отказ (нет семьи в срезе) НЕ триггерит.
-        if passes < _MAX_TURN_PASSES \
+        # #197: chat/fact НЕ запускают guard-recovery (на «не уверена» → END, без добора семей —
+        # иначе productivity-инструменты просочились бы в болтовню; defense-in-depth с _bind_for).
+        if eff not in ("chat", "fact") and passes < _MAX_TURN_PASSES \
                 and _looks_like_refusal(getattr(last, "content", "")):
             # R4 (Codex medium): unkeyed-write уже был в ходу → guard ОТКЛЮЧЁН (повтор задвоил бы
             # сущность). R5 (Kimi): логируем подавление — наблюдаемость для канарейки.
@@ -1674,6 +1757,10 @@ def _build_graph(llm: Any, all_tools: list, *,
         return END
 
     def guard(state: ReactState):
+        # #197 defense-in-depth: chat/fact сюда НЕ маршрутизируются (route → END), но если бы попали —
+        # ничего не добираем (scope остаётся web-only, productivity не просачивается).
+        if preflight_enabled and (state.get("intent") in ("chat", "fact")):
+            return {}
         # догрузить семью + пометить пробованной + ТРАНЗИЕНТНЫЙ nudge (через состояние, НЕ
         # сообщением в истории) → обратно в chat. turn_pass_count инкрементит chat. Один retry
         # на семью; если после него модель снова откажет — route не вернёт guard (в attempted).
@@ -1921,6 +2008,24 @@ def _called_tools(result: Any) -> list[str]:
     return names
 
 
+def _count_executed_tool(messages: Any, name: str) -> int:
+    """#197: сколько РАЗ инструмент `name` РЕАЛЬНО исполнен в текущем ходу (после последнего
+    HumanMessage) — по ИСПОЛНЕННЫМ ToolMessage (re-exec-safe: история checkpointed, не append-счётчик).
+    Synthetic-лимит (artifact.result_kind=="search_limit") НЕ считается исполнением. Для cap web_search≤1."""
+    msgs = list(messages or [])
+    start = 0
+    for i, m in enumerate(msgs):
+        if isinstance(m, HumanMessage):
+            start = i
+    n = 0
+    for m in msgs[start:]:
+        if isinstance(m, ToolMessage) and getattr(m, "name", None) == name:
+            rk = (getattr(m, "artifact", None) or {}).get("result_kind")
+            if rk != "search_limit":
+                n += 1
+    return n
+
+
 def _persist_debug_turn(*, tenant_id: str, user_id: str, thread_id: str, channel: str,
                         user_text: str, reply: Any, tools: list[str], kind: str) -> None:
     """vex#170 (ВРЕМЕННОЕ): записать ход (вопрос + ответ бота + инструменты) в
@@ -1994,11 +2099,42 @@ async def handle_turn(
         today_str = datetime.now(_MSK).strftime("%Y-%m-%d (%A)")
 
         tools = build_slice_tools(session, tenant_id, user_id)
+        # #197: preflight — рассуждающую модель для chat/fact строим ОДИН раз (дёшево, без сети). Мисконфиг
+        # (нет ключа/неизвестный провайдер) → None → chat/fact пойдёт на Фредди+web-only (НЕ task). Сбой
+        # setup → OFF на этот ход (как будто preflight выключен) — ход не падает.
+        _preflight = False
+        _deepseek_llm = None
+        _chat_prompt = ""
+        _deepseek_pk = ""
+        try:  # чтение флага — отдельно: его сбой = preflight OFF (прежнее поведение)
+            from sreda.config.settings import get_settings as _gs2
+            _s2 = _gs2()
+            _preflight = bool(_s2.react_preflight_enabled)
+            _deepseek_pk = (_s2.react_preflight_chat_provider or "") if _preflight else ""
+        except Exception:  # noqa: BLE001 — чтение флага упало → OFF на этот ход
+            logger.warning("react_loop: preflight flag read failed → OFF", exc_info=True)
+            _preflight = False
+        if _preflight:
+            # code-review R1 MAJOR (Codex medium): сбой ПОСТРОЕНИЯ deepseek НЕ должен ронять preflight в
+            # task (иначе chat/fact получил бы полный набор) — deepseek=None → chat/fact идёт на
+            # Фредди+web-only (инвариант scope сохраняется). preflight ОСТАЁТСЯ ON.
+            try:
+                from sreda.runtime.react_preflight import chat_fact_system_prompt
+                from sreda.services.llm import get_chat_llm
+                _chat_prompt = chat_fact_system_prompt(today_str)
+                if _deepseek_pk:
+                    _deepseek_llm = get_chat_llm(provider=_deepseek_pk)  # None при мисконфиге
+            except Exception:  # noqa: BLE001 — сбой build → deepseek None, preflight НЕ выключаем
+                logger.warning("react_loop: deepseek build failed → chat/fact на Фредди+web-only",
+                               exc_info=True)
+                _deepseek_llm = None
         graph = _build_graph(  # #165 Срез A: сырой llm + ВСЕ инструменты; bind поднабора в узлах
             llm, tools,
             tenant_id=tenant_id, user_id=user_id, today_str=today_str,
             session=session, provider_key=provider_key,  # #175: учёт расхода в chat-узле
-            fallback_llm=fallback_llm)  # #184: Оса-fallback
+            fallback_llm=fallback_llm,  # #184: Оса-fallback
+            deepseek_llm=_deepseek_llm, chat_prompt=_chat_prompt,  # #197 state-driven селектор
+            deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight)
 
         snap = await graph.aget_state(_cfg(gen))
         live_pause = (_has_pause(snap)
@@ -2060,10 +2196,26 @@ async def handle_turn(
                                    | (routed & _PRUNABLE_FAMILIES))
             else:
                 base_fams = list(_LAZY_FAMILIES)
-            result = await graph.ainvoke(
-                {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
-                 "active_families": base_fams, "guard_attempted_families": [],
-                 "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}, _cfg(gen))
+            # #197: определить intent для СВЕЖЕГО хода (resume читает intent из чекпойнта, не классифицирует).
+            # Слой 0 `_must_task` (явная productivity-команда → task без LLM) → иначе Слой 1 classify (Фредди,
+            # fail-open task). prev_intent + история — из снапа прошлого хода. fail-open в task — ТОЛЬКО здесь.
+            _init: dict = {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
+                           "active_families": base_fams, "guard_attempted_families": [],
+                           "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}
+            if _preflight:
+                from sreda.runtime.react_preflight import _must_task, classify_intent
+                _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
+                _recent = ((snap.values or {}).get("messages") if snap and snap.values else None) or []
+                _mt = _must_task(user_text, _prev)
+                if _mt:
+                    _init["intent"] = "task"
+                    _init["intent_meta"] = {"source": "must_task", "must_task": True, "classifier_raw": ""}
+                else:
+                    _raw: list[str] = []
+                    _init["intent"] = await classify_intent(_recent, user_text, _prev, llm, raw_sink=_raw)
+                    _init["intent_meta"] = {"source": "classifier", "must_task": False,
+                                            "classifier_raw": (_raw[0] if _raw else "")}
+            result = await graph.ainvoke(_init, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
         # #193: ход дошёл сюда без краша → сбрасываем счётчик подряд-крашей durable-треда.

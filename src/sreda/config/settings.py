@@ -402,6 +402,18 @@ class Settings(BaseSettings):
     react_compact_budget_chars: int = Field(
         default=0, validation_alias="SREDA_REACT_COMPACT_BUDGET_CHARS"
     )
+    # #197: preflight intent-router. OFF (дефолт) → прежнее: один Фредди, полный набор инструментов
+    # (byte-identical через effective_intent=None — даже при чекпойнте с intent=chat). ON → классификатор
+    # намерения (task/chat/fact): task→Фредди+полный набор; chat/fact→deepseek+web-only+поиск≤1
+    # (анти-флейл, инцидент 2026-06-23). ReAct-only; legacy plan-execute не тронут. Раскат спящим.
+    react_preflight_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_PREFLIGHT_ENABLED"
+    )
+    # #197: провайдер рассуждающей модели для chat/fact-пути (eval #173 → deepseek-v4-flash). Строится
+    # через get_chat_llm(provider=...). Недоступен/мисконфиг → fail-open в task (Фредди), scope web-only.
+    react_preflight_chat_provider: str = Field(
+        default="openrouter-deepseek", validation_alias="SREDA_REACT_PREFLIGHT_CHAT_PROVIDER"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
