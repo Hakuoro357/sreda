@@ -31,7 +31,7 @@ import time as _time
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Any, Literal
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphBubbleUp
@@ -315,6 +315,13 @@ def _system_prompt(today_str: str) -> str:
         "Помогаешь с напоминаниями, задачами, покупками, меню, рецептами, чек-листами, "
         "семьёй и заметками. Говоришь по-доброму и по-свойски, будто давно знакомы — "
         "живая, не казённая, но без приторности и лишних слов.\n</persona>\n\n"
+        "<identity>\n"
+        "На вопрос о создателях, разработчиках, авторах — или на какой модели/нейросети "
+        "ты работаешь, «что у тебя под капотом», «какой ты ИИ» — отвечай ДОСЛОВНО: "
+        "«Меня создала команда Среды. С обратной связью и вопросами пишите @BorisPechorin». "
+        "НИКОГДА не называй базовую модель, провайдера, компанию или тип архитектуры "
+        "(Inception, Mercury, MiMo, Gemini, OpenAI, GPT, Anthropic, диффузионная, "
+        "автогрессивная и т.п.) — это внутренняя кухня, её не раскрываем.\n</identity>\n\n"
         "<style>\nОтвечай по-русски, тепло и по-человечески — как заботливый помощник, "
         "а не сухая справка. ПОСЛЕ успешного результата инструмента коротко по-доброму "
         "отметь сделанное («Готово, записала», «Сделала, напомню вовремя»), посочувствуй "
@@ -1999,10 +2006,33 @@ def _format_lists(text: str) -> str:
     return "\n".join(out)
 
 
+# #216: детерминированный гард — не выпускать ответ, раскрывающий базовую модель/
+# провайдера. Узкие стоп-слова (бренды/архитектуры, не встречаются в бытовых ответах
+# помощницы) → если всплыло, подменяем ВЕСЬ ответ на безопасную строку про Среду.
+# Надёжный слой к промпт-правилу <identity> (промпт быстрой модели может протечь).
+_IDENTITY_SAFE = (
+    "Меня создала команда Среды. С обратной связью и вопросами пишите @BorisPechorin"
+)
+_PROVIDER_LEAK_RE = re.compile(
+    r"inception|инцепшн|инсепшн|mercury|м[её]ркьюри|\bmimo\b|gemini|джемини|"
+    r"openai|chatgpt|\bgpt\b|gpt[\s\-‐-―]?\d|\bгпт\b|deepseek|qwen|"
+    r"anthropic|\bclaude\b|diffusion|диффузионн|autoregressive|авто(?:ре)?гресс",
+    re.IGNORECASE,
+)
+
+
+def _redact_identity(text: str) -> str:
+    """#216: если ответ раскрывает провайдера/модель/архитектуру — подменить на
+    безопасную строку про Среду (личная кухня не раскрывается)."""
+    if text and _PROVIDER_LEAK_RE.search(text):
+        return _IDENTITY_SAFE
+    return text
+
+
 def _postformat(text: str) -> str:
-    """Единый пост-формат ответа Фредди: снять id/ref → снять markdown → разбить шаги/списки.
-    Порядок важен: markdown снимаем ДО разбивки шагов (иначе «N. **Заглавная**» не ловится)."""
-    return _format_lists(_strip_md(_scrub_ids(text)))
+    """Единый пост-формат ответа Фредди: гард личности → снять id/ref → снять markdown →
+    разбить шаги/списки. Порядок важен: markdown снимаем ДО разбивки шагов."""
+    return _redact_identity(_format_lists(_strip_md(_scrub_ids(text))))
 
 
 def _interrupt_age_seconds(created_at: Any) -> float:
