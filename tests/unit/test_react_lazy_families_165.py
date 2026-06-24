@@ -270,6 +270,35 @@ def test_route_families_token_boundary():
     assert react_loop._route_families("текст", k=0) == []  # k≤0 → пусто (R2 MINOR)
 
 
+def test_route_families_recall_gaps_fixed_165():
+    """#165 тюнинг словаря (2026-06-24): закрыты дыры recall, пойманные ЧЕСТНЫМ замером выбора
+    инструмента (plans/165-footprint-after.md). RED до правки _FAMILY_ROOTS:
+    - household «в семье» / члены семьи — замер: «кто в семье» брал recall_memory вместо household;
+    - checklists «пункт» — замер: «отметь пункт масло» брал list_tasks вместо checklists;
+    - shopping род.п. мн.ч. «покупок» — часть 1: корень «покупк» не ловил «покупок»."""
+    r = react_loop._route_families
+    assert "household" in r("кто у меня записан в семье"), "household: «в семье»"
+    assert "household" in r("запиши что у меня жена и двое детей"), "household: жена/дети"
+    assert "household" in r("у дочки теперь день рождения в мае"), "household: дочка"
+    # муж/муже — точный токен (_FAMILY_EXACT_ROOTS), не префикс (Codex R2 MAJOR: иначе «мой муж» промах)
+    assert "household" in r("запиши что у меня есть муж"), "household: муж (точный токен, ном.)"
+    assert "household" in r("напомни о муже на годовщину"), "household: о муже (точный токен, предл.)"
+    assert "checklists" in r("отметь пункт масло выполненным"), "checklists: пункт"
+    assert "shopping" in r("что у меня в списке покупок"), "shopping: род.п. покупок"
+
+
+def test_route_families_no_false_positive_165():
+    """Анти-регресс к тюнингу (R2 по ревью Codex): числительные и общие слова НЕ матчат household —
+    явные формы жена*/мужа* вместо широких жен/муж; болтовня пуста."""
+    r = react_loop._route_families
+    assert "household" not in r("у меня семь яблок")          # число «семь»
+    assert "household" not in r("у меня семьдесят рублей")    # «семьдесят» (Codex medium)
+    assert "household" not in r("на встречу пришла женщина")  # жен→женщина (был FP, Codex high)
+    assert "household" not in r("надень мужской свитер")      # муж→мужской (был FP, Codex high)
+    assert "household" not in r("это мужественный поступок")  # муж→мужественный (был FP)
+    assert react_loop._route_families("спасибо большое") == []
+
+
 def test_guard_family_picks_first_non_preloaded():
     """R2 (все ревьюеры): guard-добор берёт первую НЕзагруженную семью по ранжированию, а НЕ
     уже-предзагруженный top-1 (иначе guard мёртв). shopping активен → берёт web."""
