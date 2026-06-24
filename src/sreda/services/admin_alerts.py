@@ -333,12 +333,18 @@ def _post_max_sync(bot_token: str, chat_id: str, text: str) -> bool:
     swallowed → caller (fallback path) попробует TG.
     """
     try:
+        # #214: адрес и TLS-доверие — из общих хелперов MAX-клиента
+        # (platform-api2 + корни Минцифры; trust_env=False — RU напрямую).
+        from sreda.integrations.max.client import max_base_url, max_ssl_context
+
         resp = httpx.post(
-            "https://platform-api.max.ru/messages",
+            f"{max_base_url()}/messages",
             params={"chat_id": chat_id},
             json={"text": text},
             headers={"Authorization": bot_token},
             timeout=5.0,
+            trust_env=False,
+            verify=max_ssl_context(),
         )
         if 200 <= resp.status_code < 300:
             return True
