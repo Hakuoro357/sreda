@@ -987,12 +987,22 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         op_id = compute_operation_id_update(
             plan_id=ctx.execution_id, step_id=ctx.step_id, action=action,
             entity_type=entity_type, entity_id=entity_id)
+        # #163 Фаза 3d: action-глагол (update/cancel/delete) → audit-enum (created/updated/deleted/
+        # skipped). cancel = смена статуса (строка жива) → updated; delete = hard-delete → deleted.
+        # entity_type ("family_reminder"/"task") валиден И как operation_family, И как audit entity_type.
+        audit_action = {"update": "updated", "cancel": "updated", "delete": "deleted"}.get(action)
+        if audit_action is None:  # неизвестный глагол под ctx → аудит молча пропустился бы (Codex R1 MINOR)
+            logger.warning(
+                "idempotent_write: action=%r не смаплен на audit-enum — durable-действие БЕЗ "
+                "аудита (op=%s, entity=%s). Добавь маппинг.", action, op_id, entity_type)
         try:
             return execute_idempotent_durable_op(
                 session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
                 operation_family=entity_type,
                 args_hmac=compute_args_hmac(args, secret=secret),
-                mutate_fn=lambda: mutate(False), tool_name=action)
+                mutate_fn=lambda: mutate(False), tool_name=action,
+                audit_entity_type=entity_type, audit_entity_id=entity_id,
+                audit_action=audit_action)
         except IdempotencyInFlight:
             return "Секунду, эта правка уже в обработке — повтори, если не дошло."
         except (IdempotencyArgsMismatch, IdempotencyScopeMismatch) as exc:
@@ -1488,7 +1498,8 @@ def _record_react_usage(*, bind: Any, tenant_id: str, provider_key: str, model: 
 def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str,
                  session: Any = None, provider_key: str = "",
-                 fallback_llm: Any = None):  # #184: запасной LLM (Оса) при сбое primary
+                 fallback_llm: Any = None,  # #184: запасной LLM (Оса) при сбое primary
+                 channel: str = "", thread_id: str = ""):  # #163 Фаза 3d: провенанс react-аудита в ctx
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
     ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
     набор меняется по ходу без перекомпиляции графа (need_family добирает семью).
@@ -1631,7 +1642,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                     ctx = ToolRuntimeContext(
                         operation_id=op_id, execution_id=exec_id, step_id=tc["id"],
                         tool_name=name, tenant_id=tenant_id, user_id=user_id,
-                        turn_key=turn_key)
+                        turn_key=turn_key, channel=channel, thread_id=thread_id)
                     with bind_tool_runtime(ctx):
                         res = tool_obj.invoke(tc["args"])
                 else:
@@ -2032,7 +2043,8 @@ async def handle_turn(
             llm, tools,
             tenant_id=tenant_id, user_id=user_id, today_str=today_str,
             session=session, provider_key=provider_key,  # #175: учёт расхода в chat-узле
-            fallback_llm=fallback_llm)  # #184: Оса-fallback
+            fallback_llm=fallback_llm,  # #184: Оса-fallback
+            channel=channel, thread_id=base)  # #163 Фаза 3d: провенанс react-аудита
 
         snap = await graph.aget_state(_cfg(gen))
         live_pause = (_has_pause(snap)
