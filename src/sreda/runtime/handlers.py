@@ -4017,13 +4017,13 @@ _TOOL_NAMES_SET: frozenset[str] = frozenset({
     "mark_shopping_bought", "update_shopping_item",
     "update_shopping_items_category", "clear_bought_shopping",
     "search_recipes", "save_recipe", "save_recipes_batch",
-    "delete_recipe",
+    "delete_recipe", "update_recipe",  # #210
     "add_family_members", "update_family_member", "remove_family_member",
     "add_task", "update_task", "complete_task", "uncomplete_task",
     "cancel_task", "delete_task", "list_tasks",
     "create_checklist", "add_checklist_items",
     "move_task_to_checklist", "mark_checklist_item_done",
-    "delete_checklist_item", "archive_checklist",
+    "delete_checklist_item", "archive_checklist", "update_checklist_item",  # #210
     # generic
     "recall_memory", "save_core_fact", "save_episode",
     "get_weather", "web_search", "fetch_url",
@@ -4266,6 +4266,7 @@ _TOOL_TO_DOMAIN: dict[str, str] = {
     "save_recipe": "рецепты",
     "save_recipes_batch": "рецепты",
     "delete_recipe": "рецепты",
+    "update_recipe": "рецепты",  # #210
     # Меню
     "plan_week_menu": "меню",
     "update_menu_item": "меню",
@@ -4276,6 +4277,7 @@ _TOOL_TO_DOMAIN: dict[str, str] = {
     "mark_checklist_item_done": "чек-лист",
     "delete_checklist_item": "чек-лист",
     "archive_checklist": "чек-лист",
+    "update_checklist_item": "чек-лист",  # #210
     # Семья
     "add_family_member": "семья",
     "add_family_members": "семья",

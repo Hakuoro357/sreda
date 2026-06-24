@@ -796,3 +796,66 @@ class ChecklistService:
         row = self.session.execute(stmt).first()
         self.session.commit()
         return (row[0], row[1]) if row is not None else None
+
+    def update_owned_item(
+        self, *, item_id: str, tenant_id: str, user_id: str, new_title: str,
+    ) -> tuple[str, str] | None:
+        """#210: ПРАВКА пункта НА МЕСТЕ — переименовать текст одним
+        АТОМАРНЫМ ``UPDATE title WHERE id AND EXISTS(active owned) RETURNING``
+        (тот же страж владельца+активности+гонки, что у
+        ``mark_owned_item_done`` / ``delete_owned_item``).
+
+        Зачем: раньше «изменить пункт» вынужденно шло
+        ``delete_checklist_item`` (а у удаления — confirm) +
+        ``add_checklist_items`` → правка превращалась в «подтвердите
+        удаление». Теперь правка на месте: пункт сохраняет id, position и
+        статус (pending/done), меняется только текст; confirm не нужен.
+
+        Возвращает ``(item_id, new_title)`` или ``None`` (чужой / архивный /
+        исчезнувший). Пустой ``new_title`` → ``None`` (правка без текста —
+        не операция; пункт НЕ трогаем).
+
+        Embedding: title изменился → старый вектор устарел. После атомарной
+        правки ЛУЧШИМ-УСИЛИЕМ пере-эмбедим (как в ``add_items``); провал не
+        фатален (пункт уже переименован, вектор дозаполнится при backfill
+        или следующей правке)."""
+        clean = (new_title or "").strip()
+        if not clean:
+            return None
+        clean = clean[:1000]  # как add_items: EncryptedString вмещает Text
+        now = _utcnow()
+        stmt = (
+            sa_update(ChecklistItem)
+            .where(
+                ChecklistItem.id == item_id,
+                self._owned_active_item_exists(tenant_id=tenant_id, user_id=user_id),
+            )
+            .values(title=clean, updated_at=now)
+            .returning(ChecklistItem.id, ChecklistItem.title)
+            .execution_options(synchronize_session=False)
+        )
+        row = self.session.execute(stmt).first()
+        self.session.commit()
+        if row is None:
+            return None
+        # best-effort re-embed (title сменился → вектор устарел). Non-fatal.
+        if self._embedding_client is not None:
+            try:
+                it = self.session.get(ChecklistItem, row[0])
+                parent = (
+                    self.session.get(Checklist, it.checklist_id)
+                    if it is not None else None
+                )
+                if it is not None and parent is not None:
+                    emb_json, emb_model = self._embed_item(parent.title, it.title)
+                    if emb_json is not None:
+                        it.embedding_json = emb_json
+                        it.embedding_model = emb_model
+                        it.updated_at = _utcnow()
+                        self.session.commit()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "update_owned_item re-embed failed (non-fatal): %s", exc
+                )
+                self.session.rollback()
+        return (row[0], row[1])

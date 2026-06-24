@@ -594,6 +594,129 @@ class HousewifeRecipeService:
         self._invalidate_cache(tenant_id, user_id)
         return True
 
+    def update_recipe(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        recipe_id: str,
+        title: str | None = None,
+        instructions_md: str | None = None,
+        servings: int | None = None,
+        cooking_time_minutes: int | None = None,
+        ingredients: list[IngredientInput] | list[dict[str, Any]] | None = None,
+    ) -> Recipe | None:
+        """#210: ПРАВКА рецепта НА МЕСТЕ (тот же ``recipe_id``), без
+        удаления+создания.
+
+        Зачем: раньше «отдельного update нет» → правка рецепта вынужденно
+        шла ``delete_recipe`` (а у удаления — confirm) + ``save_recipe`` →
+        правка превращалась в «подтвердите удаление». Теперь редактируем
+        переданные поля по id; ``None``-поля НЕ трогаем (частичная правка).
+
+        ``ingredients`` (если передан) ПОЛНОСТЬЮ заменяет список
+        ингредиентов (cascade delete-orphan по relationship). Пустой
+        список → у рецепта не остаётся ингредиентов (легально — рецепт
+        может быть instructions-only). Чтобы оставить ингредиенты как есть
+        — НЕ передавай этот аргумент (``None``).
+
+        Cross-tenant-safe (owned-фильтр tenant+user). Возвращает обновлённый
+        ``Recipe`` или ``None`` (чужой / не найден).
+
+        ПРИ СМЕНЕ НАЗВАНИЯ пересчитываем ``normalized_title_hash`` по новому
+        title (subagent R1 CRITICAL). Иначе переименованный рецепт хранит хеш
+        СТАРОГО названия, и ctx-precheck ``save_recipe``
+        (``WHERE normalized_title_hash = hash(новое_имя)``) матчит этот
+        устаревший хеш → НОВЫЙ одноимённый рецепт молча дропается (data loss
+        на ReAct-пути). exact+fuzzy сверка по ЖИВОМУ title защищает только от
+        дубля переименованного рецепта, но НЕ независимый hash-precheck.
+        ``operation_id`` (create-ключ) НЕ трогаем — он не участвует в
+        hash-lookup, так что обновление только хеша консистентно."""
+        row = (
+            self.session.query(Recipe)
+            .filter(
+                Recipe.id == recipe_id,
+                Recipe.tenant_id == tenant_id,
+                Recipe.user_id == user_id,
+            )
+            .one_or_none()
+        )
+        if row is None:
+            return None
+
+        # РАЗБОР/ВАЛИДАЦИЯ всех входов в локали ДО мутации row (Codex high R1
+        # MAJOR): иначе сбой int(servings)/нормализации ПОСЛЕ присвоения title
+        # оставил бы сессию грязной → следующий commit мог бы записать
+        # частичную правку. Сначала вычисляем, потом одним блоком применяем.
+        new_title: str | None = None
+        if title is not None:
+            t = (title or "").strip()
+            if t:
+                new_title = t[:500]
+        set_instructions = instructions_md is not None
+        new_instructions = (
+            ((instructions_md or "").strip() or None) if set_instructions else None
+        )
+        new_servings: int | None = None
+        if servings is not None:
+            # Невалидное число → не меняем порции (как cooking_time ниже),
+            # а не валим всю правку (household-помощник, мягко).
+            try:
+                new_servings = max(1, int(servings))
+            except (ValueError, TypeError):
+                new_servings = None
+        new_ctm: int | None = None
+        if cooking_time_minutes is not None:
+            # sanity-cap 1..600 как save_recipe. Невалид/вне-диапазона →
+            # НЕ меняем поле (как servings; Codex high R2 MAJOR): иначе
+            # cooking_time_minutes=999 ЗАТЁР бы существующее время.
+            try:
+                v = int(cooking_time_minutes)
+                if 1 <= v <= 600:
+                    new_ctm = v
+            except (ValueError, TypeError):
+                new_ctm = None
+        new_ingredient_rows: list[RecipeIngredient] | None = None
+        if ingredients is not None:
+            normalised = _normalise_ingredients(ingredients)
+            new_ingredient_rows = [
+                RecipeIngredient(
+                    id=f"ring_{uuid4().hex[:20]}",
+                    title=ing.title,
+                    quantity_text=ing.quantity_text,
+                    is_optional=ing.is_optional,
+                    sort_order=idx,
+                )
+                for idx, ing in enumerate(normalised)
+            ]
+
+        # Применяем — дальше ничего парсить не нужно, частичной мутации не будет.
+        if new_title is not None:
+            row.title = new_title
+            # subagent R1 CRITICAL: хеш дедупа должен следовать за живым
+            # названием, иначе save_recipe ctx-precheck по новому имени матчит
+            # старый хеш переименованного рецепта → дроп нового одноимённого.
+            from sreda.services.operation_id import compute_normalized_title_hash
+            row.normalized_title_hash = compute_normalized_title_hash(
+                new_title, entity_type="recipe", tenant_id=tenant_id,
+                user_id=user_id or "",
+            ) or None
+        if set_instructions:
+            row.instructions_md = new_instructions
+        if new_servings is not None:
+            row.servings = new_servings
+        if new_ctm is not None:
+            row.cooking_time_minutes = new_ctm
+        if new_ingredient_rows is not None:
+            # Полная замена строк через relationship (cascade all,
+            # delete-orphan убирает старые; recipe_id проставит ORM).
+            row.ingredients = new_ingredient_rows
+
+        row.updated_at = _utcnow()
+        self.session.commit()
+        self._invalidate_cache(tenant_id, user_id)
+        return row
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------

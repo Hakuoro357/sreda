@@ -434,11 +434,12 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "list_reminders": "reminders",
     "update_reminder": "reminders",
     "cancel_reminder": "reminders",
-    # ---- recipes (5 + 1 from TODO-2 = 6) ---------------------------------
+    # ---- recipes (6 + 1 from TODO-2 = 7) ---------------------------------
     "save_recipe": "recipes",
     "save_recipes_batch": "recipes",
     "search_recipes": "recipes",
     "get_recipe": "recipes",
+    "update_recipe": "recipes",  # #210: правка рецепта на месте (не delete+save)
     "delete_recipe": "recipes",
     # Codex Sub-A4 recipes R1 MAJOR #6: ``get_recipe_any_source`` removed
     # from the manifest until the runtime function actually ships
@@ -469,7 +470,7 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "detach_reminder": "tasks",
     "link_task_to_checklist": "tasks",
     "unlink_task": "tasks",
-    # ---- checklists (8) ---------------------------------------------------
+    # ---- checklists (9) ---------------------------------------------------
     "create_checklist": "checklists",
     "add_checklist_items": "checklists",
     "list_checklists": "checklists",
@@ -477,6 +478,7 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "list_checklist_items": "checklists",
     "move_task_to_checklist": "checklists",
     "mark_checklist_item_done": "checklists",
+    "update_checklist_item": "checklists",  # #210: правка пункта на месте (не delete+add)
     "delete_checklist_item": "checklists",
     "archive_checklist": "checklists",
     # ---- onboarding (3) ---------------------------------------------------
@@ -509,6 +511,21 @@ Adding a tool: append the name + family. Removing a tool: drop the
 entry. Test ``test_manifest_covers_all_55_tools`` enforces the count
 ≥55 so accidental deletes fail loud.
 """
+
+
+# ReAct-only инструменты: зарегистрированы в манифесте (фильтр ReAct-набора
+# `_EXTRA_FAMILIES` в react_loop пускает инструмент в набор Фредди только если
+# у него есть запись с допустимой семьёй), но НАМЕРЕННО без plan-execute
+# ``ToolSpec``. Причина: старый plan-execute планировщик заморожен/депрекейчен
+# (канон 2026-06-19) — новые семейные инструменты идут только в ReAct, и
+# тратиться на их spec-обвязку (input/output-схемы, парсеры, презентеры) для
+# умирающего пути не нужно. Инвариант «у каждого манифест-инструмента есть
+# spec» (``assert_manifest_matches_specs`` + семейные guard-тесты) исключает
+# эти имена. #210: правка чек-листов/рецептов на месте.
+REACT_ONLY_TOOLS: Final[frozenset[str]] = frozenset({
+    "update_checklist_item",
+    "update_recipe",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +572,9 @@ def assert_manifest_matches_specs(specs: object) -> None:
 
     expected_names = set(TOOL_FAMILY_MANIFEST.keys())
     actual_names = set(actual.keys())
-    missing = expected_names - actual_names
+    # ReAct-only инструменты (#210) живут в манифесте, но НЕ имеют plan-execute
+    # spec'а — не считаем их «пропавшими из спеков» (plan-execute заморожен).
+    missing = expected_names - actual_names - REACT_ONLY_TOOLS
     extra = actual_names - expected_names
     family_mismatches = [
         (name, actual[name], TOOL_FAMILY_MANIFEST[name])
@@ -591,6 +610,7 @@ __all__ = [
     "FamilyHeader",
     "NON_FAMILY_REDIRECTS",
     "NonFamilyRedirect",
+    "REACT_ONLY_TOOLS",
     "TOOL_FAMILY_MANIFEST",
     "assert_manifest_matches_specs",
 ]

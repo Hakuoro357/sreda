@@ -303,7 +303,7 @@ _KNOWN_TOOL_NAMES = (
     "update_shopping_item", "update_shopping_items_category",
     # Housewife recipes
     "search_recipes", "get_recipe", "save_recipe", "save_recipes_batch",
-    "delete_recipe",
+    "delete_recipe", "update_recipe",  # #210
     # Housewife menu
     "plan_week_menu", "list_menu", "update_menu_item",
     "generate_shopping_from_menu", "clear_menu",
@@ -395,7 +395,7 @@ def strip_reasoning_prefix(text: str) -> str:
 # membership only.
 _WRITE_TOOL_NAMES = frozenset({
     "save_core_fact", "save_episode",
-    "save_recipe", "save_recipes_batch", "delete_recipe",
+    "save_recipe", "save_recipes_batch", "delete_recipe", "update_recipe",  # #210
     "add_shopping_items", "remove_shopping_items", "mark_shopping_bought",
     "update_shopping_item", "update_shopping_items_category",
     "plan_week_menu", "update_menu_item", "generate_shopping_from_menu",
@@ -584,6 +584,7 @@ _OBJECT_TO_CATEGORY: tuple[tuple[str, str | None], ...] = (
 _CATEGORY_TO_TOOLS: dict[str, frozenset[str]] = {
     "recipe": frozenset({
         "save_recipe", "save_recipes_batch", "delete_recipe",
+        "update_recipe",  # #210: правка рецепта на месте бэкает «обновила рецепт»
     }),
     "shopping": frozenset({
         "add_shopping_items", "remove_shopping_items",
@@ -610,6 +611,7 @@ _CATEGORY_TO_TOOLS: dict[str, frozenset[str]] = {
         "create_checklist", "add_checklist_items",
         "move_task_to_checklist", "mark_checklist_item_done",
         "delete_checklist_item", "archive_checklist",
+        "update_checklist_item",  # #210: правка пункта бэкает «изменила пункт»
     }),
     "memory": frozenset({"save_core_fact", "save_episode"}),
 }

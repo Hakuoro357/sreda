@@ -21,7 +21,10 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
-from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+from sreda.services.tool_schemas.families import (
+    REACT_ONLY_TOOLS,
+    TOOL_FAMILY_MANIFEST,
+)
 from sreda.services.tool_schemas.housewife import (
     DeleteRecipeOk,
     HousewifeToolError,
@@ -85,9 +88,12 @@ def test_recipes_specs_match_tool_family_manifest() -> None:
         if family == "recipes"
     }
     spec_names = {s.name for s in RECIPES_SPECS}
-    assert spec_names == manifest_recipes, (
-        f"Mismatch.\nIn manifest only: {manifest_recipes - spec_names}\n"
-        f"In specs only: {spec_names - manifest_recipes}"
+    # #210: update_recipe — ReAct-only (в манифесте для фильтра ReAct, без
+    # plan-execute ToolSpec, т.к. старый планировщик заморожен).
+    manifest_recipes_specced = manifest_recipes - REACT_ONLY_TOOLS
+    assert spec_names == manifest_recipes_specced, (
+        f"Mismatch.\nIn manifest only: {manifest_recipes_specced - spec_names}\n"
+        f"In specs only: {spec_names - manifest_recipes_specced}"
     )
     for spec in RECIPES_SPECS:
         expected = TOOL_FAMILY_MANIFEST[spec.name]

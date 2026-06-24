@@ -1555,9 +1555,11 @@ def build_housewife_tools(
     def delete_recipe(recipe_id: str) -> str:
         """Delete a recipe from the user's book. Cascades to ingredients.
 
-        Use sparingly — only when user explicitly asks to remove a
-        recipe. To EDIT a recipe, call delete_recipe followed by
-        save_recipe with updated data (there's no separate update tool).
+        Use sparingly — only when the user explicitly asks to REMOVE a
+        recipe entirely. To EDIT a recipe (rename, fix steps, adjust
+        servings, change ingredients) use ``update_recipe`` — it edits
+        in place. Do NOT delete_recipe + save_recipe to change a recipe
+        (that asks the user to confirm a deletion for what is just an edit).
 
         Args:
             recipe_id: id (starts with ``rec_``).
@@ -1574,6 +1576,81 @@ def build_housewife_tools(
             logger.exception("delete_recipe failed")
             return "error: internal"
         return "ok:deleted" if ok else f"error: recipe {recipe_id!r} not found"
+
+    @_write_lc_tool
+    def update_recipe(
+        recipe_id: str,
+        title: str | None = None,
+        instructions_md: str | None = None,
+        servings: int | None = None,
+        cooking_time_minutes: int | None = None,
+        ingredients: ListOfDict = None,
+    ) -> str:
+        """Edit an existing recipe IN PLACE by recipe_id (keeps the same id).
+
+        Use this to CHANGE a saved recipe — rename it, fix the steps,
+        adjust servings/time, or replace ingredients: «измени рецепт»,
+        «поправь в рецепте X», «замени картошку на батат», «сделай на 4
+        порции», «перепиши шаги».
+
+        ⚠️ Use THIS for edits — do NOT delete_recipe + save_recipe to
+        change a recipe (that asks the user to confirm a deletion for
+        what is really just an edit).
+
+        Only the fields you pass are changed; omitted fields stay as they
+        were. If you pass ``ingredients``, it REPLACES the whole ingredient
+        list — pass the FULL new list, not only the changed lines. So to
+        change ONE ingredient («замени картошку на батат»): FIRST call
+        get_recipe to read the current list, swap the one item, and pass
+        the COMPLETE resulting list — otherwise the other ingredients are
+        wiped.
+
+        Сначала найди рецепт (search_recipes / get_recipe), возьми его
+        ``recipe_id`` (``rec_xxx``), потом передай сюда с изменёнными полями.
+
+        Args:
+            recipe_id: id (starts with ``rec_``).
+            title: новое название (опционально).
+            instructions_md: новые шаги в markdown (опционально).
+            servings: новое число порций (опционально).
+            cooking_time_minutes: новое время в минутах, 1..600 (опционально).
+            ingredients: ПОЛНЫЙ новый список {title, quantity_text?,
+                is_optional?} — ЗАМЕНЯЕТ все ингредиенты (опционально).
+
+        Returns ``ok:updated:<recipe_id>`` or ``error: recipe '<id>' not found``
+        (matches delete_recipe) / ``error:title_required`` (blank title) /
+        ``error:no_fields_to_update`` (nothing to change).
+        """
+        if not user_id:
+            return "error: no user_id context"
+        # No-op / blank-title guard (Codex R1 MINOR): не рапортовать «обновила»,
+        # когда менять нечего. title="" (передан, но пустой) ≠ title=None (не
+        # передан) — как у update_checklist_item.
+        if title is not None and not (title or "").strip():
+            return "error: title_required"
+        if all(
+            x is None for x in (
+                title, instructions_md, servings, cooking_time_minutes, ingredients,
+            )
+        ):
+            return "error: no_fields_to_update"
+        try:
+            recipe = recipe_service.update_recipe(
+                tenant_id=tenant_id, user_id=user_id,
+                recipe_id=(recipe_id or "").strip(),
+                title=title, instructions_md=instructions_md,
+                servings=servings, cooking_time_minutes=cooking_time_minutes,
+                ingredients=ingredients,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("update_recipe failed")
+            # Откатить возможную грязь сессии (Codex R1 MAJOR): иначе
+            # частичная мутация могла бы уехать в следующий commit.
+            session.rollback()
+            return "error: internal"
+        if recipe is None:
+            return f"error: recipe {recipe_id!r} not found"
+        return f"ok:updated:{recipe.id}"
 
     # ----------------------------------------------------------------
     # Menu-planning tools (v1.1). Week grid 7×3(+snack) stored as
@@ -3132,6 +3209,10 @@ def build_housewife_tools(
         to remove that wrong record — the previous bad item is gone,
         only the corrected one stays.
 
+        ⚠️ To RENAME / fix the WORDING of an item (keep the item, change
+        its text) use ``update_checklist_item`` instead — do NOT delete +
+        re-add (that asks the user to confirm a deletion for a mere edit).
+
         Сначала вызови list_checklist_items, чтобы получить item_id
         (``.only.item_id``), потом передай его сюда.
 
@@ -3153,6 +3234,48 @@ def build_housewife_tools(
             return "error: item_not_found"
         item_id_resolved, item_title = deleted
         return f"ok:deleted:{item_id_resolved}:{item_title}"
+
+    @_write_lc_tool
+    def update_checklist_item(item_id: str, title: str) -> str:
+        """Rename / edit the TEXT of ONE checklist item IN PLACE by item_id.
+
+        Use when the user wants to CHANGE an existing item — fix a typo,
+        refine the wording, correct a movie / title: «переименуй пункт»,
+        «измени X на Y», «поправь название пункта», «не так записала,
+        поправь на …». The item KEEPS its id, position and done-status;
+        only the text changes. NO confirmation needed (this is an edit,
+        not a deletion).
+
+        ⚠️ Use THIS for edits — do NOT delete_checklist_item +
+        add_checklist_items to change an item (that asks the user to
+        confirm a deletion for what is really just a rename).
+
+        Сначала вызови list_checklist_items, чтобы получить item_id
+        (``.only.item_id``), потом передай его сюда с новым текстом.
+
+        Args:
+            item_id: ``clitem_xxx`` id пункта (из list_checklist_items).
+            title: новый текст пункта.
+
+        Returns: ``ok:updated:<item_id>:<title>`` or ``error:item_not_found``
+        (or ``error:title_required`` if the new text is empty).
+        """
+        if not user_id:
+            return "error: no user_id context"
+        clean = (title or "").strip()
+        if not clean:
+            return "error: title_required"
+        # АТОМАРНАЯ правка на месте (см. delete_owned_item): ownership +
+        # активность + update в одном вызове. None (чужой/архивный/
+        # исчезнувший) → мягкий item_not_found.
+        updated = checklist_service.update_owned_item(
+            item_id=(item_id or "").strip(), tenant_id=tenant_id,
+            user_id=user_id, new_title=clean,
+        )
+        if updated is None:
+            return "error: item_not_found"
+        item_id_resolved, item_title = updated
+        return f"ok:updated:{item_id_resolved}:{item_title}"
 
     @_write_lc_tool
     def archive_checklist(list_id_or_title: str) -> str:
@@ -3197,6 +3320,7 @@ def build_housewife_tools(
         save_recipes_batch,
         search_recipes,
         get_recipe,
+        update_recipe,  # #210: правка рецепта на месте (не delete+save)
         delete_recipe,
         plan_week_menu,
         update_menu_item,
@@ -3230,6 +3354,7 @@ def build_housewife_tools(
         # #143 Phase B: читающий шаг «по описанию» → .only → mark/delete по id
         list_checklist_items,
         mark_checklist_item_done,
+        update_checklist_item,  # #210: правка пункта на месте (не delete+add)
         delete_checklist_item,
         archive_checklist,
         # 2026-04-28: атомарный перенос task → checklist
