@@ -518,6 +518,23 @@ class Settings(BaseSettings):
             "default. Sub-A12 Phase B.2 (planner LLM wrapper)."
         ),
     )
+    react_llm_timeout_sec: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_LLM_TIMEOUT_SEC",
+            "sreda_react_llm_timeout_sec",
+        ),
+        description=(
+            "Wall-clock cap for a single ReAct chat-node LLM call, in seconds. "
+            "Default 60s matches the legacy ``invoke_with_per_call_timeout`` "
+            "default and ``planner_timeout_sec``. #159 п.1: bounds a hung/slow "
+            "primary (Mercury/deepseek) so the turn falls over to the #184 "
+            "fallback (Osa/Freddie) instead of hanging. Applies to both the "
+            "task and chat/fact branches, primary and fallback invokes."
+        ),
+    )
     planner_prompt_version: int = Field(
         default=1,
         ge=1,

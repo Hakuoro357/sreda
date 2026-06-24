@@ -40,6 +40,7 @@ from langgraph.types import Command, interrupt
 
 from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода
 from sreda.runtime.react_compaction import build_model_input  # #194: компакция истории (prompt-view)
+from sreda.services.llm import invoke_with_per_call_timeout  # #159 п.1: wall-clock потолок вызова LLM
 from sreda.runtime.planner.tool_runtime import (
     ToolRuntimeContext,
     allocate_operation_id,
@@ -1555,11 +1556,25 @@ def _build_graph(llm: Any, all_tools: list, *,
     except Exception:  # noqa: BLE001 — резолв не валит ход; пусто → fallback на provider_key
         pass
 
+    # #159 п.1: wall-clock потолок на ОДИН вызов LLM в узле chat. Резолвим РАЗ (не на вызов);
+    # мисконфиг настройки НЕ валит граф — дефолт обёртки 60с. Зависший primary → LLMCallTimeout
+    # → ветка fallback (Оса/Фредди); без fallback → исключение во внешний guard → safe-reply.
+    try:
+        from sreda.config.settings import get_settings as _gs2
+        _react_timeout_s = float(_gs2().react_llm_timeout_sec)
+    except Exception:  # noqa: BLE001 — настройка недоступна → дефолт обёртки (60с)
+        _react_timeout_s = 60.0
+
     def chat(state: ReactState):
         # #197: effective_intent — читаем сохранённый intent ТОЛЬКО при preflight_enabled. OFF → None →
         # task-ветка ниже = ДОСЛОВНО прежнее поведение (byte-identical даже при чекпойнте intent=chat).
         eff = (state.get("intent") or None) if preflight_enabled else None
         _used_provider, _used_model, _fallback_fired = provider_key, _model_name, False
+        # #159 R2 (Codex MAJOR): телеметрия попытки primary при срабатывании запаса. Учёт ДЕНЕГ
+        # (#175) пишется на ОТВЕТИВШИЙ провайдер — токены зависшего/упавшего primary неизвестны (его
+        # поток отброшен обёрткой). Идентичность+ошибку primary кладём в наблюдательный трейс (#192),
+        # чтобы дашборд стоимости НЕ выглядел так, будто primary не вызывался/был бесплатным.
+        _primary_provider, _primary_model, _primary_error = "", "", ""
         if eff in ("chat", "fact"):
             # #197 chat/fact: рассуждающая модель (deepseek) + ТОЛЬКО web-семья + honesty. ИНВАРИАНТ:
             # SCOPE всегда web-only (bound по eff ДО try → fallback наследует тот же bound → не расширится);
@@ -1573,12 +1588,15 @@ def _build_graph(llm: Any, all_tools: list, *,
             _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
             _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
             _t0 = _time.perf_counter()
-            try:  # guarded bind+invoke (deepseek может не принять tool-схему)
-                resp = _primary.bind_tools(bound).invoke(_msgs)
-            except Exception as _e:  # noqa: BLE001 — сбой deepseek bind/invoke → fallback Фредди web-only
+            try:  # guarded bind+invoke (deepseek может не принять tool-схему); #159: под wall-clock таймаутом
+                resp = invoke_with_per_call_timeout(
+                    _primary.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
+            except Exception as _e:  # noqa: BLE001 — сбой/таймаут deepseek → fallback Фредди web-only
                 logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
-                resp = llm.bind_tools(bound).invoke(_msgs)  # тот же web-only bound, НЕ task
+                _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
+                resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; тоже под таймаутом
+                    llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:
@@ -1597,7 +1615,8 @@ def _build_graph(llm: Any, all_tools: list, *,
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
             #   (2) primary bind_tools — ВНЕ try (R2 MAJOR Codex high): ошибка построения/схемы =
-            #       ЛОКАЛЬНЫЙ баг, его НЕ маскируем уходом на Осу; в try ТОЛЬКО сетевой invoke;
+            #       ЛОКАЛЬНЫЙ баг, его НЕ маскируем уходом на Осу; в try ТОЛЬКО сетевой invoke
+            #       (#159 п.1: под wall-clock таймаутом — зависший Mercury → LLMCallTimeout → Оса);
             #   (3) запас (bind_tools + invoke) строим ЛЕНИВО, ТОЛЬКО когда primary упал (mimocode
             #       MINOR): с флагом ВКЛ построение запаса на КАЖДОМ ходу — баг bind_tools резерва
             #       ронял бы happy-path primary, хотя Mercury в порядке; ленивость это исключает;
@@ -1607,15 +1626,21 @@ def _build_graph(llm: Any, all_tools: list, *,
             _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
             if fallback_llm is not None:
                 try:
-                    resp = _bound_primary.invoke(_msgs)
-                except Exception as _e:  # noqa: BLE001 — INVOKE primary упал (сеть/провайдер/5xx) → запас
+                    resp = invoke_with_per_call_timeout(
+                        _bound_primary, _msgs, timeout_seconds=_react_timeout_s)
+                except Exception as _e:  # noqa: BLE001 — INVOKE primary упал/завис (сеть/5xx/таймаут) → запас
                     logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
                                    type(_e).__name__, exc_info=True)
-                    resp = fallback_llm.bind_tools(bound).invoke(_msgs)
+                    _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
+                    resp = invoke_with_per_call_timeout(
+                        fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
                     _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
                     _fallback_fired = True
             else:
-                resp = _bound_primary.invoke(_msgs)
+                # Без запаса: зависший primary → LLMCallTimeout всплывает во внешний guard → safe-reply
+                # (раньше висел бы без ограничения по времени).
+                resp = invoke_with_per_call_timeout(
+                    _bound_primary, _msgs, timeout_seconds=_react_timeout_s)
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
@@ -1647,6 +1672,12 @@ def _build_graph(llm: Any, all_tools: list, *,
                 "must_task": (state.get("intent_meta") or {}).get("must_task"),
                 "intent_source": (state.get("intent_meta") or {}).get("source"),
                 "classifier_raw": (state.get("intent_meta") or {}).get("classifier_raw"),
+                # #159 R2 (Codex MAJOR): попытка primary при срабатывании запаса — идентичность+ошибка
+                # (incl. LLMCallTimeout). Деньги (#175) на ответивший провайдер; это — наблюдаемость,
+                # чтобы таймаут/сбой primary не выглядел в трейсе как «primary не вызывался». Пусто без запаса.
+                "primary_provider_key": _primary_provider,
+                "primary_model": _primary_model,
+                "primary_error": _primary_error,
             }],
         }
 
