@@ -1722,7 +1722,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                     ctx = ToolRuntimeContext(
                         operation_id=op_id, execution_id=exec_id, step_id=tc["id"],
                         tool_name=name, tenant_id=tenant_id, user_id=user_id,
-                        turn_key=turn_key, channel=channel, thread_id=thread_id)
+                        turn_key=turn_key, channel=channel, thread_id=thread_id,
+                        origin="react")  # #163 Фаза 3d-B: react-аудит метится только при origin=react
                     with bind_tool_runtime(ctx):
                         res = tool_obj.invoke(tc["args"])
                 else:

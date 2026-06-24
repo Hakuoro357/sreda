@@ -326,7 +326,6 @@ class HousewifeReminderService:
         if commit:
             try:
                 self.session.execute(stmt)
-                self.session.commit()
             except IntegrityError:
                 # backstop гонки (иной op_id, тот же semantic_key — межходовой) ловит partial-unique.
                 self.session.rollback()
@@ -343,9 +342,39 @@ class HousewifeReminderService:
             self.session.execute(stmt)
             self.session.flush()
 
-        # SELECT-after-conflict: вернуть СТАБИЛЬНУЮ строку (тот же id) и при
-        # вставке, и при ON CONFLICT (повтор внутри хода) — иначе replay вернул бы
-        # «пусто» и потерял id (Codex R3 MAJOR).
+        # SELECT-after-conflict: вернуть СТАБИЛЬНУЮ строку (тот же id) и при вставке, и при ON CONFLICT
+        # (повтор внутри хода) — иначе replay вернул бы «пусто» и потерял id (Codex R3 MAJOR).
+        if commit:
+            # #163 Фаза 3d-B: ReAct-путь — SELECT + проверка + react-аудит + commit под ОДНИМ
+            # rollback-guard'ом (Codex high/mimo R1 MAJOR: сбой SELECT/RuntimeError ДО guard'а оставил
+            # бы вставку pending без отката → поздний commit чужого тула закоммитил бы её БЕЗ аудита).
+            # Сбой (не гонка) → откат всей операции (named-W). Гонку аудита поглощает emit_tool_audit.
+            try:
+                actual = (
+                    self.session.query(FamilyReminder)
+                    .filter(
+                        FamilyReminder.tenant_id == tenant_id,
+                        FamilyReminder.user_id == user_id,
+                        FamilyReminder.operation_id == op_id,
+                    )
+                    .one_or_none()
+                )
+                if actual is None:
+                    raise RuntimeError(
+                        "schedule ctx path: строка не найдена после INSERT для "
+                        f"op_id={op_id!r} (tenant={tenant_id!r})"
+                    )
+                from sreda.services.audit_feed import emit_tool_audit
+                emit_tool_audit(
+                    self.session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
+                    entity_type="family_reminder", entity_id=actual.id, action="created")
+                self.session.commit()
+            except Exception:  # noqa: BLE001 — сбой SELECT/аудита/commit → откат всей операции
+                self.session.rollback()
+                raise
+            return actual
+        # commit=False (helper-owned): SELECT без guard'а — гонку/откат/аудит разрулит внешний
+        # savepoint владельца (durable-helper, см. 3d-A); commit изнутри здесь закрыл бы его.
         actual = (
             self.session.query(FamilyReminder)
             .filter(
@@ -356,7 +385,6 @@ class HousewifeReminderService:
             .one_or_none()
         )
         if actual is None:
-            # Не должно случаться: либо вставка прошла, либо был конфликт.
             raise RuntimeError(
                 "schedule ctx path: строка не найдена после INSERT для "
                 f"op_id={op_id!r} (tenant={tenant_id!r})"

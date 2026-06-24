@@ -597,6 +597,14 @@ class HousewifeShoppingService:
         # rolls the savepoint back (parent txn survives) and we treat the
         # racer's row as the winner.
         if normalised:
+            # #163 Фаза 3d-B: react-провенанс ТОЛЬКО для react-ctx (origin=="react"); на легаси
+            # plan-execute (origin!=react) caused_by=None — поведение как до 3d-B (Codex medium R1 MAJOR:
+            # ToolRuntimeContext биндит и planner/executor → иначе ложный react-тег у легаси-покупок).
+            react_cb = (
+                {"source": "react", "turn_key": ctx.turn_key,
+                 "thread_id": getattr(ctx, "thread_id", None),
+                 "channel": getattr(ctx, "channel", None), "tool_name": ctx.tool_name}
+                if getattr(ctx, "origin", None) == "react" else None)
             try:
                 with self.session.begin_nested():
                     emit_event(
@@ -609,6 +617,7 @@ class HousewifeShoppingService:
                         entity_id=None,
                         action="created",
                         payload=None,
+                        caused_by=react_cb,
                     )
             except IntegrityError:
                 # Concurrent racer already wrote this step's audit row; the
