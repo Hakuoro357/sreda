@@ -35,7 +35,7 @@ def _ctx(tenant_id, user_id, *, op_id="op_test", tool="update_task"):
     return ToolRuntimeContext(
         operation_id=op_id, execution_id="ex", step_id="st", tool_name=tool,
         tenant_id=tenant_id, user_id=user_id, turn_key="react:max:t1:msg1",
-        channel="max", thread_id="thr1")
+        channel="max", thread_id="thr1", origin="react")
 
 
 def _run_helper(session, tenant_id, user_id, *, op_id, mutate, audit=True):
@@ -57,6 +57,21 @@ def test_emit_tool_audit_no_ctx_noop(db_session):
     emit_tool_audit(db_session, operation_id="o1", tenant_id=u.tenant_id, user_id=u.user_id,
                     entity_type="task", entity_id="task_x", action="updated")
     assert _audit(db_session, u.tenant_id) == []
+
+
+def test_emit_tool_audit_non_react_origin_noop(db_session):
+    """Codex medium R1 MAJOR (3d-B): ctx БЕЗ origin=react (напр. легаси plan-execute executor биндит
+    ToolRuntimeContext с origin=None) → emit_tool_audit no-op (нет ложного react-провенанса)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    planner_ctx = ToolRuntimeContext(  # origin не задан → None (не react)
+        operation_id="oplan", execution_id="ex", step_id="st", tool_name="add_task",
+        tenant_id=u.tenant_id, user_id=u.user_id, turn_key="plan:1")
+    with bind_tool_runtime(planner_ctx):
+        emit_tool_audit(db_session, operation_id="oplan", tenant_id=u.tenant_id, user_id=u.user_id,
+                        entity_type="task", entity_id="task_x", action="created")
+    db_session.flush()
+    assert _audit(db_session, u.tenant_id) == [], "non-react ctx → react-аудит не пишется"
 
 
 def test_emit_tool_audit_with_ctx_emits_react(db_session):
@@ -268,3 +283,121 @@ async def test_react_update_task_emits_react_audit_integration(db_session):
     assert cb.get("tool_name") == "update_task" and cb.get("turn_key"), cb
     assert cb.get("thread_id") == "audit3d-1", cb  # прокидка thread_id (base) в ctx
     assert rows[0].action == "updated"
+
+
+# ───────── 3d-B: аудит на СОЗДАНИИ (schedule_reminder / add_task) + react-тег shopping ─────────
+
+@pytest.mark.asyncio
+async def test_react_create_task_emits_react_audit(db_session):
+    """3d-B: создание задачи через ReAct → 1 react-audit (created), атомарно с записью."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    stub = _Stub([
+        AIMessage(content="", tool_calls=[{
+            "name": "add_task", "args": {"title": "купить хлеб"}, "id": "at"}]),
+        AIMessage(content="Готово."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="audit3db-t", llm=stub, user_text="добавь задачу купить хлеб",
+        inbound_message_id="audit3db-t-msg", channel="max")
+    rows = _audit(db_session, u.tenant_id, "task")
+    assert len(rows) == 1, f"одна react-audit на создание задачи: {len(rows)}"
+    cb = rows[0].caused_by or {}
+    assert cb.get("source") == "react" and cb.get("tool_name") == "add_task", cb
+    assert rows[0].action == "created" and rows[0].entity_id
+
+
+@pytest.mark.asyncio
+async def test_react_create_reminder_emits_react_audit(db_session):
+    """3d-B: создание напоминания через ReAct → 1 react-audit (created)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    stub = _Stub([
+        AIMessage(content="", tool_calls=[{
+            "name": "schedule_reminder",
+            "args": {"title": "позвонить маме", "trigger_iso": "2031-03-15T09:00:00"},
+            "id": "sr"}]),
+        AIMessage(content="Готово."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="audit3db-r", llm=stub, user_text="напомни позвонить маме",
+        inbound_message_id="audit3db-r-msg", channel="max")
+    rows = _audit(db_session, u.tenant_id, "family_reminder")
+    assert len(rows) == 1, f"одна react-audit на создание напоминания: {len(rows)}"
+    cb = rows[0].caused_by or {}
+    assert cb.get("source") == "react" and cb.get("tool_name") == "schedule_reminder", cb
+    assert rows[0].action == "created"
+
+
+@pytest.mark.asyncio
+async def test_react_create_task_audit_matches_task_count(db_session):
+    """3d-B инвариант: повтор add_task (дательная задача → semantic-дедуп) в одном ходу → число
+    react-audit РОВНО = числу созданных задач (reuse не эмитит лишнего; каждое создание — одна audit).
+    Дательная (есть scheduled_date), т.к. у задач БЕЗ даты семантического дедупа нет (датовые-only)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    add = {"name": "add_task", "args": {"title": "купить хлеб", "scheduled_date": "2031-03-15"}}
+    stub = _Stub([
+        AIMessage(content="", tool_calls=[{**add, "id": "a1"}]),
+        AIMessage(content="", tool_calls=[{**add, "id": "a2"}]),  # та же задача+дата → semantic reuse
+        AIMessage(content="Готово."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="audit3db-dup", llm=stub, user_text="добавь задачу купить хлеб на 15 марта",
+        inbound_message_id="audit3db-dup-msg", channel="max")
+    from sreda.db.models.tasks import Task
+    tasks_rows = db_session.query(Task).filter(Task.tenant_id == u.tenant_id).all()
+    audit_rows = _audit(db_session, u.tenant_id, "task")
+    assert len(audit_rows) == len(tasks_rows) >= 1, (
+        f"audit ({len(audit_rows)}) ≠ числу задач ({len(tasks_rows)}) — reuse эмитит лишнее ИЛИ дубль")
+    assert all((r.caused_by or {}).get("source") == "react" and r.action == "created"
+               for r in audit_rows), "все audit — react/created"
+
+
+@pytest.mark.asyncio
+async def test_react_create_shopping_react_tagged(db_session):
+    """3d-B: покупки уже эмитили аудит — теперь с react-провенансом (caused_by.source=react)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    stub = _Stub([
+        AIMessage(content="", tool_calls=[{
+            "name": "add_shopping_items",
+            "args": {"items": [{"title": "молоко"}]}, "id": "as"}]),
+        AIMessage(content="Готово."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="audit3db-sh", llm=stub, user_text="купи молоко",
+        inbound_message_id="audit3db-sh-msg", channel="max")
+    rows = _audit(db_session, u.tenant_id, "shopping_list_item")
+    assert len(rows) >= 1, "покупки пишут аудит"
+    assert (rows[0].caused_by or {}).get("source") == "react", rows[0].caused_by
+
+
+def test_create_task_audit_failure_rolls_back(db_session, monkeypatch):
+    """Codex high R1 MINOR (3d-B): non-race сбой аудита на СОЗДАНИИ задачи → откат вставки (named-W):
+    задача НЕ остаётся без аудита (SELECT+аудит+commit под одним rollback-guard'ом)."""
+    from datetime import date
+
+    from sreda.db.models.tasks import Task
+    from sreda.services import audit_feed as _af
+    from sreda.services.tasks import TaskService
+
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+
+    def _boom(*a, **k):
+        raise ValueError("audit boom")
+
+    monkeypatch.setattr(_af, "emit_event", _boom)
+    with bind_tool_runtime(_ctx(u.tenant_id, u.user_id, op_id="ocreate_fail", tool="add_task")):
+        with pytest.raises(ValueError):
+            TaskService(db_session).add(
+                tenant_id=u.tenant_id, user_id=u.user_id, title="купить хлеб",
+                scheduled_date=date(2031, 3, 15))
+    db_session.rollback()
+    assert db_session.query(Task).filter(Task.tenant_id == u.tenant_id).count() == 0, (
+        "вставка задачи откатилась при сбое аудита (named-W)")

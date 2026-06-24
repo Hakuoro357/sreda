@@ -310,8 +310,8 @@ def emit_tool_audit(
     from sreda.runtime.planner.tool_runtime import current_tool_runtime
 
     ctx = current_tool_runtime()
-    if ctx is None:
-        return  # не-ReAct путь — react-аудит не пишем
+    if ctx is None or getattr(ctx, "origin", None) != "react":
+        return  # не-ReAct путь (нет ctx / plan-execute executor) — react-аудит не пишем
     caused_by = {
         "source": "react",
         "turn_key": ctx.turn_key,

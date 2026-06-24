@@ -211,7 +211,6 @@ class TaskService:
                     return existing
             try:
                 self.session.execute(stmt)
-                self.session.commit()
             except IntegrityError:
                 self.session.rollback()
                 existing = (find_existing_pending_semantic(
@@ -220,20 +219,34 @@ class TaskService:
                 if existing is not None:
                     return existing
                 raise
-            actual = (
-                self.session.query(Task)
-                .filter(
-                    Task.tenant_id == tenant_id,
-                    Task.user_id == user_id,
-                    Task.operation_id == op_id,
+            # #163 Фаза 3d-B: SELECT + проверка + react-аудит + commit под ОДНИМ rollback-guard'ом
+            # (Codex high/mimo R1 MAJOR: сбой SELECT/RuntimeError ДО guard'а оставлял бы вставку pending
+            # без отката → поздний commit чужого тула закоммитил бы её БЕЗ аудита). Within-turn replay
+            # (тот же op_id) emit_tool_audit дедупит по op_id; semantic-reuse (другой ход) вернулся ВЫШЕ
+            # до execute → не эмитит. Сбой (не гонка) → откат всей операции (named-W). Гонку аудита поглощает emit.
+            try:
+                actual = (
+                    self.session.query(Task)
+                    .filter(
+                        Task.tenant_id == tenant_id,
+                        Task.user_id == user_id,
+                        Task.operation_id == op_id,
+                    )
+                    .one_or_none()
                 )
-                .one_or_none()
-            )
-            if actual is None:
-                raise RuntimeError(
-                    "add ctx path: строка не найдена после INSERT для "
-                    f"op_id={op_id!r} (tenant={tenant_id!r})"
-                )
+                if actual is None:
+                    raise RuntimeError(
+                        "add ctx path: строка не найдена после INSERT для "
+                        f"op_id={op_id!r} (tenant={tenant_id!r})"
+                    )
+                from sreda.services.audit_feed import emit_tool_audit
+                emit_tool_audit(
+                    self.session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
+                    entity_type="task", entity_id=actual.id, action="created")
+                self.session.commit()
+            except Exception:  # noqa: BLE001 — сбой SELECT/аудита/commit → откат (задача не остаётся без аудита)
+                self.session.rollback()
+                raise
             return actual
 
         # Легаси-путь (ctx=None) — БЕЗ semantic_key/дедупа (scope #163: только ReAct), байт-в-байт.

@@ -194,19 +194,47 @@ done
 
 # ============ Phase 4: reset MAX webhook (если настроен) ============
 if [ -n "$MAX_TOKEN" ]; then
-    log "phase 4a: deleteWebhook (MAX)"
-    max_del=$(curl -sS -X DELETE "https://platform-api.max.ru/subscriptions" \
-                  -H "Authorization: ${MAX_TOKEN}" 2>&1 | head -c 200 || echo "skip")
-    log "  → $max_del"
+    # #214: адрес MAX API — из env (дефолт platform-api2.max.ru).
+    MAX_BASE="${SREDA_MAX_API_BASE_URL:-https://platform-api2.max.ru}"
+    MAX_BASE="${MAX_BASE%/}"  # снять хвостовой слэш (как max_base_url() в коде)
+    # #214 (Codex R3): зеркалим Python-allowlist (Settings._validate_max_api_base_url) —
+    # токен (Authorization) шлём ТОЛЬКО на известные хосты MAX. Плохой/опечатанный
+    # env → fail-closed: пропускаем MAX webhook, токен НЕ уходит на чужой хост.
+    case "$MAX_BASE" in
+        https://platform-api2.max.ru|https://platform-api.max.ru)
+            # TLS-доверие Минцифры — бандл из репо (тот же, что max_ssl_context в
+            # коде): platform-api2 выпущен Минцифры (нет в системном хранилище) →
+            # без --cacert curl упадёт на verify.
+            _MAX_CERTS="$(cd "$(dirname "$0")/.." && pwd)/src/sreda/integrations/max/certs"
+            MAX_CA="/tmp/sreda_max_ca_$$.pem"
+            if cat "$_MAX_CERTS/russian_trusted_root_ca.pem" \
+                   "$_MAX_CERTS/russian_trusted_sub_ca_ssl_rsa2024.pem" > "$MAX_CA" 2>/dev/null; then
+                CA_OPT="--cacert $MAX_CA"
+            else
+                CA_OPT=""
+                log "  ВНИМАНИЕ: бандл Минцифры не собран ($_MAX_CERTS) — verify к platform-api2 не пройдёт"
+            fi
 
-    sleep 2
+            log "phase 4a: deleteWebhook (MAX @ ${MAX_BASE})"
+            max_del=$(curl -sS $CA_OPT -X DELETE "${MAX_BASE}/subscriptions" \
+                          -H "Authorization: ${MAX_TOKEN}" 2>&1 | head -c 200 || echo "skip")
+            log "  → $max_del"
 
-    log "phase 4b: setWebhook (MAX) — пропущен, добавится когда настроим webhook URL"
-    # TODO: после настройки MAX webhook URL раскомментировать:
-    # curl -sS -X POST "https://platform-api.max.ru/subscriptions" \
-    #     -H "Authorization: ${MAX_TOKEN}" \
-    #     -H "Content-Type: application/json" \
-    #     -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+            sleep 2
+
+            log "phase 4b: setWebhook (MAX) — пропущен, добавится когда настроим webhook URL"
+            # TODO: после настройки MAX webhook URL раскомментировать (использует ${MAX_BASE} + $CA_OPT):
+            # curl -sS $CA_OPT -X POST "${MAX_BASE}/subscriptions" \
+            #     -H "Authorization: ${MAX_TOKEN}" \
+            #     -H "Content-Type: application/json" \
+            #     -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+
+            rm -f "$MAX_CA"
+            ;;
+        *)
+            log "phase 4: SREDA_MAX_API_BASE_URL='${MAX_BASE}' вне allowlist (platform-api2.max.ru / platform-api.max.ru) — MAX webhook ПРОПУЩЕН (fail-closed, токен не шлём)"
+            ;;
+    esac
 else
     log "phase 4: MAX токен не настроен — skip"
 fi

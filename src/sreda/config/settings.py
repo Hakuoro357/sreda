@@ -106,6 +106,14 @@ class Settings(BaseSettings):
     max_bot_token: str | None = None
     max_webhook_url: str | None = None
     max_webhook_secret_token: str | None = None
+    # #214: базовый URL MAX Bot API. МАКС мигрирует с platform-api.max.ru на
+    # platform-api2.max.ru (до 19.07.2026; новый адрес отдаёт TLS, выпущенный
+    # Минцифры — см. integrations/max/client.max_ssl_context). Дефолт = новый
+    # адрес; откат на старый — сменой env SREDA_MAX_API_BASE_URL без редеплоя.
+    max_api_base_url: str = Field(
+        default="https://platform-api2.max.ru",
+        validation_alias="SREDA_MAX_API_BASE_URL",
+    )
     connect_public_base_url: str | None = None
 
     openai_base_url: str | None = None
@@ -774,6 +782,44 @@ class Settings(BaseSettings):
                 "remove require_persist flag."
             )
         return self
+
+    @field_validator("max_api_base_url")
+    @classmethod
+    def _validate_max_api_base_url(cls, value: str) -> str:
+        # #214: на этот адрес уходит токен MAX-бота (Authorization header).
+        # Плохое значение из env = утечка токена или открытый текст, поэтому
+        # fail-fast на загрузке конфига строгими правилами:
+        #   * scheme строго https (иначе токен ушёл бы в открытом виде);
+        #   * host обязателен и только в зоне max.ru (не чужой хост);
+        #   * без userinfo (user:pass@) — анти-инъекция.
+        from urllib.parse import urlsplit
+
+        # Точный allowlist хостов API MAX (Codex R2): новый + адрес отката.
+        # Токен-несущий endpoint — пускаем ТОЛЬКО известные хосты, не любой
+        # *.max.ru (иначе плохой env мог бы отправить токен на другой сервис MAX).
+        _ALLOWED_HOSTS = {"platform-api2.max.ru", "platform-api.max.ru"}
+        candidate = (value or "").strip()
+        parts = urlsplit(candidate)
+        if parts.scheme != "https":
+            raise ValueError(
+                "max_api_base_url должен быть https:// — иначе токен MAX "
+                "уйдёт в открытом виде"
+            )
+        if parts.username or parts.password:
+            raise ValueError("max_api_base_url не должен содержать userinfo")
+        host = (parts.hostname or "").lower()
+        if host not in _ALLOWED_HOSTS:
+            raise ValueError(
+                f"max_api_base_url host должен быть одним из {sorted(_ALLOWED_HOSTS)}, "
+                f"получено: {host!r}"
+            )
+        if parts.port not in (None, 443):
+            raise ValueError(
+                f"max_api_base_url: нестандартный порт {parts.port!r} не допускается"
+            )
+        if parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise ValueError("max_api_base_url не должен содержать path/query/fragment")
+        return candidate
 
     @field_validator("connect_public_base_url")
     @classmethod

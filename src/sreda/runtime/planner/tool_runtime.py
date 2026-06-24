@@ -65,6 +65,10 @@ class ToolRuntimeContext:
     # тесты, что не задают их). Заполняет react_loop.run_tools.
     channel: str | None = None
     thread_id: str | None = None
+    # #163 Фаза 3d-B (Codex medium R1 MAJOR): источник хода. ToolRuntimeContext биндит И react_loop,
+    # И легаси planner/executor → react-аудит (emit_tool_audit) метим ТОЛЬКО при origin=="react",
+    # иначе plan-execute durable-записи получили бы ЛОЖНЫЙ react-провенанс. Default None = не-react.
+    origin: str | None = None
 
 
 # Module-level ContextVar.  Default is None so that tools running outside
