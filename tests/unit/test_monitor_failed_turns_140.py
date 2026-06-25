@@ -31,46 +31,73 @@ def _load_monitor():
     return mod
 
 
-def _block(trace_id: str, *, type_: str = "text", iters: int = 0,
-           outcome: str = "ok") -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    return (
-        f"=== TRACE {trace_id} {ts} user=u chan=telegram ===\n"
-        f"      0ms  webhook.received       type={type_}\n"
-        f"      5ms  ack.sent  [10ms] phrase=ack\n"
-        f"  100ms  planner.plan           [90ms]\n"
-        f"------- TOTAL 100ms iters={iters} tok_in=0 tok_out=0 outcome={outcome}\n"
-    )
+def _pg_out(counts: dict[str, int]) -> str:
+    """Эмуляция psql -tA `SELECT outcome, count(*) ... GROUP BY outcome`:
+    строки вида ``outcome|count`` (разделитель | по умолчанию)."""
+    return "\n".join(f"{oc}|{c}" for oc, c in counts.items())
 
 
-def _write_log(tmp_path, blocks: list[str]) -> Path:
-    p = tmp_path / "trace.log"
-    p.write_text("\n".join(blocks), encoding="utf-8")
-    return p
-
-
-def test_planner_success_iters0_not_counted_failed(tmp_path, monkeypatch):
-    # ГЛАВНОЕ: успешные ходы планировщика (iters=0, outcome=ok) НЕ провал.
+# #227: проба читает БД react_turn_trace (источник истины ReAct), НЕ trace.log
+# (там у ReAct всегда outcome=ok — react_loop не зовёт mark_outcome → проба была
+# слепа к провалам на всём проде). Провал = safe_reply | breakdown.
+def test_safe_reply_counted_failed(monkeypatch):
+    # РЕГРЕСС #227: ReAct-провал = safe_reply (краш / сетевой сбой LLM). 2/5=40% → critical.
     mod = _load_monitor()
-    log = _write_log(tmp_path, [_block(f"t{i}", iters=0, outcome="ok")
-                                for i in range(5)])
-    monkeypatch.setattr(mod, "TRACE_LOG", log)
+    monkeypatch.setattr(mod, "_pg_query",
+                        lambda sql: _pg_out({"ok": 3, "safe_reply": 2}))
     r = mod.probe_failed_turns_rate()
-    assert r.status == "ok", (
-        f"успешные ходы планировщика (iters=0) не должны считаться провалом: "
-        f"{r.message}"
-    )
+    assert r.status == "critical", f"2/5 safe_reply (40%) → critical: {r.message}"
 
 
-def test_breakdown_turns_counted_failed(tmp_path, monkeypatch):
-    # Поломки считаются: 2 из 5 = 40% > 20% → critical.
+def test_low_traffic_burst_counted_failed(monkeypatch):
+    # НОЧНОЙ СЦЕНАРИЙ #227: низкий трафик (n<5, rate-гейт не сработает), но 3
+    # safe_reply = всплеск краша/сетевого сбоя → critical по абсолютному порогу.
     mod = _load_monitor()
-    blocks = ([_block(f"ok{i}", outcome="ok") for i in range(3)]
-              + [_block(f"bd{i}", outcome="breakdown") for i in range(2)])
-    log = _write_log(tmp_path, blocks)
-    monkeypatch.setattr(mod, "TRACE_LOG", log)
+    monkeypatch.setattr(mod, "_pg_query", lambda sql: _pg_out({"safe_reply": 3}))
     r = mod.probe_failed_turns_rate()
-    assert r.status == "critical", f"2/5 поломок (40%) → critical: {r.message}"
+    assert r.status == "critical", f"3 safe_reply при n<5 → critical (всплеск): {r.message}"
+
+
+def test_breakdown_still_counted_failed(monkeypatch):
+    # back-compat: legacy breakdown по-прежнему провал.
+    mod = _load_monitor()
+    monkeypatch.setattr(mod, "_pg_query",
+                        lambda sql: _pg_out({"ok": 3, "breakdown": 2}))
+    r = mod.probe_failed_turns_rate()
+    assert r.status == "critical", f"2/5 breakdown (40%) → critical: {r.message}"
+
+
+def test_all_ok_not_counted_failed(monkeypatch):
+    # ГЛАВНОЕ (наследие #140): успешные ходы НЕ провал.
+    mod = _load_monitor()
+    monkeypatch.setattr(mod, "_pg_query", lambda sql: _pg_out({"ok": 10}))
+    r = mod.probe_failed_turns_rate()
+    assert r.status == "ok", f"10/10 ok → не провал: {r.message}"
+
+
+def test_below_sample_size_not_critical(monkeypatch):
+    # n<5 → не алертим даже при высокой доле (1 safe_reply из 2 = 50%, но n=2).
+    mod = _load_monitor()
+    monkeypatch.setattr(mod, "_pg_query",
+                        lambda sql: _pg_out({"ok": 1, "safe_reply": 1}))
+    r = mod.probe_failed_turns_rate()
+    assert r.status == "ok", f"n<5 → не critical: {r.message}"
+
+
+def test_pg_query_failure_is_warning(monkeypatch):
+    # psql упал (None) → warning, не ложный critical/ok.
+    mod = _load_monitor()
+    monkeypatch.setattr(mod, "_pg_query", lambda sql: None)
+    r = mod.probe_failed_turns_rate()
+    assert r.status == "warning", f"psql fail → warning: {r.message}"
+
+
+def test_no_finished_turns_is_ok(monkeypatch):
+    # пустой результат (нет завершённых ходов) → ok, не падение.
+    mod = _load_monitor()
+    monkeypatch.setattr(mod, "_pg_query", lambda sql: "")
+    r = mod.probe_failed_turns_rate()
+    assert r.status == "ok", f"нет ходов → ok: {r.message}"
 
 
 def test_emit_block_writes_outcome():
