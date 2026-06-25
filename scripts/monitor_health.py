@@ -719,23 +719,46 @@ def probe_turn_latency_p95() -> ProbeResult:
     return ProbeResult("turn_latency_p95", "ok", f"p95={p95}ms (n={n})")
 
 
+_FAILED_OUTCOMES = ("safe_reply", "breakdown")
+# tool_error / fallback_used — НАМЕРЕННО не провал: ход восстановился внутри ReAct-петли,
+# юзер получил реальный ответ. safe_reply — единственная видимая юзеру заглушка («потеряла контекст»).
+# Абсолютный порог всплеска: N провалов за окно → алерт ДАЖЕ при низком трафике.
+# Rate-гейт (n>=5 и >20%) на нашем трафике (~2 хода/час) почти не набирается → ночной
+# сетевой сбой (4 safe_reply за часы) в 30-мин окно из 5 ходов мог не попасть (#227).
+_FAILED_BURST = 3
+
+
 def probe_failed_turns_rate() -> ProbeResult:
-    traces = _recent_traces(window_min=30)
-    # Считаем только text/voice (где LLM ОБЯЗАН отработать). Callback'и и
-    # pending-bot — отдельные пути.
-    chat_traces = [t for t in traces if t.get("type") in ("text", "voice")]
-    if not chat_traces:
-        return ProbeResult("failed_turns_rate", "ok", "(no chat turns in 30m)")
-    n = len(chat_traces)
-    # #140: провал = «ход отдал поломку» (outcome=='breakdown'), НЕ iters==0.
-    # iters — счётчик старого tool-loop; у планировщика он всегда 0 даже на
-    # успехе, и iters==0 ложно метил успешные ходы провалами (ломало KPI на
-    # трафике планировщика). Старые трейсы без outcome= → 'ok' (не провал).
-    failed = sum(1 for t in chat_traces if t.get("outcome") == "breakdown")
-    pct = 100 * failed / n if n else 0
-    if n >= 5 and pct > 20:
-        return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} chat-turns failed ({pct:.0f}%)")
-    return ProbeResult("failed_turns_rate", "ok", f"{failed}/{n} chat-turns failed ({pct:.0f}%)")
+    # Источник истины по ReAct = БД react_turn_trace (#192). В trace.log у ReAct
+    # ВСЕГДА outcome=ok (react_loop не зовёт mark_outcome) → парсер trace.log слеп
+    # к провалам на всём прод-трафике (#227). Провал = ход отдал безопасную
+    # заглушку safe_reply («Ой, потеряла контекст» — краш / таймаут / сетевой сбой
+    # LLM) ИЛИ legacy breakdown (plan-execute). Знаменатель — только ЗАВЕРШЁННЫЕ
+    # ходы (outcome IS NOT NULL): in_progress / paused-на-confirm в счёт не идут.
+    out = _pg_query(
+        "SELECT outcome, count(*) FROM react_turn_trace "
+        "WHERE created_at > now() - interval '30 minutes' "
+        "AND outcome IS NOT NULL GROUP BY outcome"
+    )
+    if out is None:
+        return ProbeResult("failed_turns_rate", "warning", "psql query failed")
+    counts: dict[str, int] = {}
+    for line in out.splitlines():
+        oc, sep, c = line.strip().partition("|")
+        if sep:
+            try:
+                counts[oc] = int(c)
+            except ValueError:
+                pass
+    n = sum(counts.values())
+    if n == 0:
+        return ProbeResult("failed_turns_rate", "ok", "(no finished react turns in 30m)")
+    failed = sum(counts.get(o, 0) for o in _FAILED_OUTCOMES)
+    pct = 100 * failed / n
+    # Два триггера: абсолютный всплеск (низкий трафик — rate не наберёт n) ЛИБО доля (высокий трафик).
+    if failed >= _FAILED_BURST or (n >= 5 and pct > 20):
+        return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} react-turns failed ({pct:.0f}%)")
+    return ProbeResult("failed_turns_rate", "ok", f"{failed}/{n} react-turns failed ({pct:.0f}%)")
 
 
 def probe_ack_latency_p95() -> ProbeResult:

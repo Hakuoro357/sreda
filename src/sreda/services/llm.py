@@ -1397,6 +1397,18 @@ def _override_temperature(provider: str, default: float) -> float:
 
 
 _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    # #3 (2026-06-25): chat/fact-ветка (#197) переведена с deepseek (медленный, 4-11с на
+    # ход — реальная жалоба юзера «долго отвечаешь») на gemini-2.5-flash-lite (≈0.7с).
+    # Пин google-vertex EU-регион — data-residency (ПД обрабатываются в EU-Vertex, а не
+    # «куда дешевле»). allow_fallbacks=False → если vertex/eu недоступен, OpenRouter вернёт
+    # 5xx, дальше наша цепочка фолбэка. Слаг "google-vertex/eu" проверен вживую 2026-06-25
+    # (713мс, без NotFoundError → принят и сроутил).
+    "openrouter-gemini-2.5-flash-lite": {
+        "provider": {
+            "only": ["google-vertex/eu"],
+            "allow_fallbacks": False,
+        },
+    },
     # 2026-05-11: `order` оказался preference, не forced — OpenRouter
     # роутил на DekaLLM (нестабильный, 1.9-253 t/s spread) когда
     # DeepInfra/bf16 был busy. Меняем на `only` + allow_fallbacks=False

@@ -13,11 +13,14 @@ the same env vars ``services.speech.groq`` does to stay consistent.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -230,6 +233,186 @@ def _fetch_inception(settings: Settings) -> ProviderBalance:
 
 
 # ---------------------------------------------------------------------------
+# Yandex Cloud billing balance (#229) — SA key → JWT(PS256) → IAM → Billing
+# ---------------------------------------------------------------------------
+
+_YANDEX_IAM_ENDPOINT = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
+_YANDEX_BILLING_ENDPOINT = "https://billing.api.cloud.yandex.net/billing/v1/billingAccounts"
+# IAM tokens live 12h; we refresh after ~50min (3000s) — well before expiry,
+# and before the 1h JWT `exp` we sign — so the cached token is always valid.
+_IAM_TTL = 3000.0
+_iam_lock = threading.Lock()
+_iam_cache: dict[str, tuple[str, float]] = {}
+
+
+def _parse_yandex_sa_key(raw: str, sa_id_fallback: str | None) -> tuple[str, str, str]:
+    """Extract ``(key_id, service_account_id, private_key_pem)`` from an
+    authorized-key file. Two console download formats are accepted:
+
+    * **JSON** («скачать ключ как JSON») — has ``id`` /
+      ``service_account_id`` / ``private_key``.
+    * **PEM with a Yandex header** «… SA Key ID <id>» («скачать приватный
+      ключ») — key id is in the header (the console sometimes wraps it in
+      ``<…>`` — strip it); the service-account id is NOT in the file, so it
+      must come from ``sa_id_fallback`` (``SREDA_YANDEX_BILLING_SA_ID``).
+    """
+    raw = raw.strip()
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict) and obj.get("private_key"):
+        key_id = (obj.get("id") or "").strip()
+        sa_id = (obj.get("service_account_id") or sa_id_fallback or "").strip()
+        pem = obj["private_key"]
+    else:
+        m = re.search(r"Key ID\s*<?([A-Za-z0-9]+)>?", raw)
+        key_id = m.group(1) if m else ""
+        sa_id = (sa_id_fallback or "").strip()
+        i = raw.find("-----BEGIN")
+        pem = raw[i:].strip() if i >= 0 else ""
+    if not (key_id and sa_id and pem):
+        raise ValueError(
+            "incomplete Yandex SA key (key_id=%s sa_id=%s pem=%s; PEM-format "
+            "keys need SREDA_YANDEX_BILLING_SA_ID)"
+            % ("ok" if key_id else "missing",
+               "ok" if sa_id else "missing",
+               "ok" if pem else "missing")
+        )
+    return key_id, sa_id, pem
+
+
+def _build_yandex_jwt(key_id: str, sa_id: str, private_pem: str) -> str:
+    """Sign a PS256 JWT used to obtain an IAM token from the SA key."""
+    import base64
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    def b64u(data: bytes) -> bytes:
+        return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+    now = int(time.time())
+    header = {"alg": "PS256", "typ": "JWT", "kid": key_id}
+    payload = {"iss": sa_id, "aud": _YANDEX_IAM_ENDPOINT, "iat": now, "exp": now + 3600}
+    signing_input = (
+        b64u(json.dumps(header, separators=(",", ":")).encode())
+        + b"."
+        + b64u(json.dumps(payload, separators=(",", ":")).encode())
+    )
+    private_key = serialization.load_pem_private_key(private_pem.encode(), password=None)
+    signature = private_key.sign(
+        signing_input,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256(),
+    )
+    return (signing_input + b"." + b64u(signature)).decode()
+
+
+def _mint_yandex_iam(settings: Settings) -> str:
+    with open(settings.yandex_billing_sa_key_file, encoding="utf-8-sig") as fh:
+        raw = fh.read()
+    key_id, sa_id, pem = _parse_yandex_sa_key(raw, settings.yandex_billing_sa_id)
+    jwt_token = _build_yandex_jwt(key_id, sa_id, pem)
+    with httpx.Client(**_http_client_kwargs(use_proxy=False)) as client:
+        resp = client.post(_YANDEX_IAM_ENDPOINT, json={"jwt": jwt_token})
+        resp.raise_for_status()
+        token = resp.json().get("iamToken")
+    if not token:
+        raise ValueError("IAM token missing in exchange response")
+    return token
+
+
+def _yandex_iam_token(settings: Settings) -> str:
+    """Return a cached IAM token (minted lazily; refreshed after ~50min)."""
+    cache_key = settings.yandex_billing_sa_key_file or ""
+    now = time.monotonic()
+    with _iam_lock:
+        hit = _iam_cache.get(cache_key)
+        if hit is not None and now < hit[1]:
+            return hit[0]
+    token = _mint_yandex_iam(settings)
+    with _iam_lock:
+        _iam_cache[cache_key] = (token, now + _IAM_TTL)
+    return token
+
+
+def invalidate_iam_cache() -> None:
+    with _iam_lock:
+        _iam_cache.clear()
+
+
+def _fetch_yandex(settings: Settings) -> ProviderBalance:
+    """Yandex Cloud прямой остаток ₽ (покрывает SpeechKit STT, #229).
+    Авторизация: авторизованный ключ СА → PS256 JWT → IAM-токен → Billing
+    API. В отличие от Groq/OpenRouter ходим НАПРЯМУЮ (Яндекс — RU-сервис, не
+    геоблочит), как и speech-вызов.
+
+    Защита (R1-ревью): весь разбор внутри ``try`` (битый ответ не валит
+    остальные провайдеры); error-details ОБЕЗЛИЧЕНЫ и в лог идёт только класс
+    исключения — это секрет-смежный путь (ключ/IAM-токен), сырой ``str(exc)``
+    мог бы протечь содержимое ключа при кривом конфиге (путь = сам ключ)."""
+    label = "Яндекс · SpeechKit (STT)"
+    if not settings.yandex_billing_sa_key_file:
+        return ProviderBalance(
+            key="yandex", label=label,
+            status="not_configured", headline="ключ не настроен",
+        )
+
+    def _err(headline: str, details: str = "") -> ProviderBalance:
+        return ProviderBalance(
+            key="yandex", label=label, status="error",
+            headline=headline, details=details,
+        )
+
+    try:
+        token = _yandex_iam_token(settings)
+        with httpx.Client(**_http_client_kwargs(use_proxy=False)) as client:
+            resp = client.get(
+                _YANDEX_BILLING_ENDPOINT,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+        raw_accounts = payload.get("billingAccounts") if isinstance(payload, dict) else None
+        accounts = [a for a in (raw_accounts or []) if isinstance(a, dict)]
+        if not accounts:
+            return _err(
+                "нет доступа к платёжному аккаунту",
+                "проверь роль billing.accounts.viewer у сервисного аккаунта",
+            )
+
+        want = settings.yandex_billing_account_id
+        if want:
+            account = next((a for a in accounts if a.get("id") == want), None)
+            if account is None:
+                return _err(
+                    "платёжный аккаунт не найден",
+                    f"SREDA_YANDEX_BILLING_ACCOUNT_ID={want} отсутствует в списке",
+                )
+        else:
+            account = accounts[0]
+
+        raw_balance = account.get("balance")
+        if raw_balance is None:
+            return _err("баланс не получен", "ответ Billing API без поля balance")
+        balance = Decimal(str(raw_balance))  # InvalidOperation → ловится ниже
+    except Exception as exc:  # noqa: BLE001
+        # Только класс исключения — НЕ str(exc) (секрет-смежный путь).
+        logger.warning("provider_balances: Yandex fetch failed: %s", type(exc).__name__)
+        return _err("ошибка запроса", "не удалось получить баланс Yandex Billing")
+
+    currency = account.get("currency") or "RUB"
+    name = account.get("name") or account.get("id") or ""
+    details = f"аккаунт {name}" + ("" if account.get("active", True) else " (НЕактивен!)")
+    return ProviderBalance(
+        key="yandex", label=label,
+        status="ok", headline=f"{balance:.2f} {currency}", details=details,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -250,6 +433,7 @@ def fetch_balances(settings: Settings, *, force_refresh: bool = False) -> list[P
         _fetch_inception(settings),   # планировщик «Фредди» (#150 follow-up)
         _fetch_mimo(settings),
         _fetch_groq(settings),
+        _fetch_yandex(settings),      # STT + биллинг, реальный остаток ₽ (#229)
     ]
 
     with _cache_lock:

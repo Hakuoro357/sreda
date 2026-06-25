@@ -42,6 +42,49 @@ _SECRET_FIELD_NAMES = frozenset({
 })
 
 
+class _ReactTenantGate(frozenset):
+    """Множество tenant-id для ReAct-гейтов с режимом «всем» (#159-rollout).
+
+    Построено из env-значения ``*`` → ``__contains__`` истинно для ЛЮБОГО
+    tenant_id (включая будущие регистрации), и объект truthy. Иначе ведёт себя
+    как обычный ``frozenset`` (явный allowlist).
+
+    Зачем подкласс, а не отдельный bool-флаг: гейт проверяется как ``tenant_id in
+    gate`` в нескольких местах (telegram/max inbound + voice-gate) — подкласс
+    сохраняет ВСЕ существующие call-site без правок (нулевой риск пропустить точку
+    проверки + добавить новый дрейф). Применяется ТОЛЬКО к loop/prune гейтам;
+    privacy-allowlist'ы (debug, admin preview) и эксперимент osa остаются строгими
+    списками без «*». В режиме «всем» итерация/len дают ПУСТО (полный список
+    тенантов не перечисляем — его и нет), поэтому проверяй принадлежность через
+    ``in``, а наличие гейта — через ``bool``/``if``, не через ``len``."""
+
+    def __new__(cls, items=(), *, all_: bool = False):
+        self = super().__new__(cls, items)
+        self._all = all_
+        return self
+
+    def __contains__(self, item: object) -> bool:
+        if getattr(self, "_all", False):
+            # Режим «всем»: членом считается ЛЮБОЙ непустой строковый tenant_id.
+            # None/""/нестрока → False (анти-регресс: малформный id из call-site
+            # ДО резолва тенанта не должен «тихо включиться» под `*`). Codex R1 MINOR.
+            return isinstance(item, str) and bool(item)
+        return super().__contains__(item)
+
+    def __bool__(self) -> bool:
+        return True if getattr(self, "_all", False) else len(self) > 0
+
+
+def _parse_tenant_gate(raw: str | None) -> _ReactTenantGate:
+    """CSV tenant-id → гейт. Одиночный ``*`` → режим «всем»; пусто/None → никому.
+    Общий разбор для loop/prune гейтов (#159-rollout)."""
+    if not raw:
+        return _ReactTenantGate()
+    if raw.strip() == "*":
+        return _ReactTenantGate(all_=True)
+    return _ReactTenantGate(item.strip() for item in raw.split(",") if item.strip())
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SREDA_", extra="ignore")
 
@@ -544,6 +587,23 @@ class Settings(BaseSettings):
             "default. Sub-A12 Phase B.2 (planner LLM wrapper)."
         ),
     )
+    react_llm_timeout_sec: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_LLM_TIMEOUT_SEC",
+            "sreda_react_llm_timeout_sec",
+        ),
+        description=(
+            "Wall-clock cap for a single ReAct chat-node LLM call, in seconds. "
+            "Default 60s matches the legacy ``invoke_with_per_call_timeout`` "
+            "default and ``planner_timeout_sec``. #159 п.1: bounds a hung/slow "
+            "primary (Mercury/deepseek) so the turn falls over to the #184 "
+            "fallback (Osa/Freddie) instead of hanging. Applies to both the "
+            "task and chat/fact branches, primary and fallback invokes."
+        ),
+    )
     planner_prompt_version: int = Field(
         default=1,
         ge=1,
@@ -720,6 +780,20 @@ class Settings(BaseSettings):
     speech_provider: str | None = Field(default=None, validation_alias="SREDA_SPEECH_PROVIDER")
     yandex_speechkit_api_key: str | None = Field(
         default=None, validation_alias="SREDA_YANDEX_SPEECHKIT_API_KEY"
+    )
+    # Yandex Cloud Billing — показ остатка ₽ в /admin/llm (#229). Авторизованный
+    # ключ сервисного аккаунта (PEM с заголовком «… SA Key ID <id>» ИЛИ JSON),
+    # которым подписывается JWT → IAM-токен → Billing API. SA-id нужен ТОЛЬКО
+    # для PEM-формата (в JSON он внутри). account_id опционален — если не задан,
+    # берётся первый аккаунт из List.
+    yandex_billing_sa_key_file: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_SA_KEY_FILE"
+    )
+    yandex_billing_sa_id: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_SA_ID"
+    )
+    yandex_billing_account_id: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_ACCOUNT_ID"
     )
     # Groq Whisper — OpenAI-compatible /audio/transcriptions endpoint on
     # LPU hardware. Same resolve-precedence as MiMo: explicit key first,
@@ -930,12 +1004,9 @@ class Settings(BaseSettings):
 
     @property
     def react_loop_enabled_tenants(self) -> frozenset[str]:
-        """#66: tenants on the new ReAct+interrupt conversational loop (gated
-        experiment). Empty (default) → nobody; everyone on the existing path."""
-        raw = self.react_loop_enabled_tenants_raw
-        if not raw:
-            return frozenset()
-        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+        """#66: tenants on the new ReAct+interrupt conversational loop. Empty
+        (default) → nobody; ``*`` → ВСЕ тенанты, включая будущие (#159-rollout)."""
+        return _parse_tenant_gate(self.react_loop_enabled_tenants_raw)
 
     @property
     def react_osa_tenants(self) -> frozenset[str]:
@@ -958,11 +1029,9 @@ class Settings(BaseSettings):
     @property
     def react_prune_tenants(self) -> frozenset[str]:
         """#165 Срез B: тенанты с обрезкой набора инструментов (ленивая загрузка семей).
-        Пусто (дефолт) → НИКОМУ → full-bind (ноль изменений). Per-tenant canary/kill-switch."""
-        raw = self.react_prune_tenants_raw
-        if not raw:
-            return frozenset()
-        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+        Пусто (дефолт) → НИКОМУ → full-bind; ``*`` → ВСЕ тенанты (#159-rollout, экономия
+        токенов; измеренно безопасно: −89% токенов, паритет выбора инструмента)."""
+        return _parse_tenant_gate(self.react_prune_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:

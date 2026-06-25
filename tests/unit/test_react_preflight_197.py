@@ -293,11 +293,14 @@ def test_chat_tools_web_only_bind_and_dispatch(install):
 
 def test_state_driven_model_select(install):
     cap = {}
-    deepseek = _Chat("deepseek", bound_capture=cap, responses=[AIMessage(content="ответ-deepseek")])
+    # #216: маркер ответа НЕ "deepseek" — гард личности (_redact_identity) редактирует
+    # имена провайдеров/моделей в тексте ответа. Используем нейтральный sentinel,
+    # тест по-прежнему проверяет, что ответ пришёл по deepseek-пути (модель в cap ниже).
+    deepseek = _Chat("deepseek", bound_capture=cap, responses=[AIMessage(content="ответ-маркер-ДС")])
     freddie = _Chat("freddie", classify="chat", bound_capture=cap, calls={})
     install(on=True, deepseek=deepseek, invoked={})
     r1 = _turn(freddie, thread="sds-chat", text="как настроение")
-    assert "deepseek" in r1
+    assert "маркер-ДС" in r1
     assert cap["deepseek"][-1] == sorted(_WEB_ONLY_TOOL_NAMES)
 
     cap2 = {}

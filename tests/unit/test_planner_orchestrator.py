@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime
 from typing import Any
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -43,6 +45,31 @@ from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_planner_log_propagation():
+    """Force ``sreda.runtime.planner`` to propagate to the root logger.
+
+    ``create_app()`` calls ``configure_logging`` (config/logging.py), whose
+    ``dictConfig`` pins ``sreda.runtime.planner`` to ``propagate=False`` with
+    its own stderr handler. In a mixed test run, any earlier test that builds
+    the app severs planner→root propagation for the whole pytest process, so
+    ``caplog`` (a root-logger handler) captures nothing and the verbose-log
+    tests below fail — while the record still reaches the app's stderr handler.
+
+    Same defence as ``sreda.trace`` (test_trace.py) and
+    ``sreda.feature_requests`` (test_unsupported_request_tool.py): enable
+    propagation before each test and restore the prior state in teardown.
+    """
+    lg = logging.getLogger("sreda.runtime.planner")
+    prev_propagate = lg.propagate
+    prev_level = lg.level
+    lg.propagate = True
+    lg.setLevel(logging.INFO)
+    yield
+    lg.propagate = prev_propagate
+    lg.setLevel(prev_level)
 
 
 def _make_ctx(*, user_message: str = "купи молоко") -> PlannerContext:
