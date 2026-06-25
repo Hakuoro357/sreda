@@ -199,6 +199,18 @@ _PHRASES: tuple[tuple[str, str], ...] = (
 # «в памяти» exact-словами (НЕ префикс «памят» — он ловил бы «памятник»/«памятный», R1 negative).
 _MEMORY_WORDS = frozenset({"памяти", "память", "памятью"})
 _DIRECTIVE = {"reminders": _HINT_REMINDER, "tasks": _HINT_TASK, "checklists": _HINT_CHECKLIST}
+# Направленные кросс-доменные намерения «X из Y» (source-предлог): маркер в тексте + оба домена вовлечены.
+# Единственный — «покупки ИЗ меню» (generate_shopping_from_menu: читает menu, пишет shopping). Направленность
+# по предлогу: «из меню» (menu=source) → target shopping; «из покупок» НЕ сработает (R3: иначе ложная
+# shopping-запись на menu-target запросе). Маркер устойчив к союзам («из меню и без орехов» всё равно ловится).
+_CROSS_INTENTS: tuple[tuple[str, frozenset[str], str], ...] = (
+    ("из меню", frozenset({"menu", "shopping"}), "menu_to_shopping"),
+)
+# cross_intent → (allowed_read, allowed_write). Семьи предзагрузки = allowed_read (обе семьи пары — иначе
+# инструмент кросс-домена не попадёт в _select_tools, R3 субагент CRITICAL).
+_CROSS_INTENT_POLICY: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "menu_to_shopping": (frozenset({"menu", "shopping"}), frozenset({"shopping"})),
+}
 # Action-домены (императив-глагол = намерение действия): выбираются в клаузе ПЕРВЫМИ, поверх фразы и
 # content (R3 Codex high: «запомни список покупок»→memory, «напомни список покупок»→reminders — глагол
 # важнее фразы «список покупок»→shopping).
@@ -213,9 +225,12 @@ class RouteResult:
     compound_by_connector: bool
     intent_hint: str | None              # "task" ТОЛЬКО от task-сигнала #197/#215, иначе None
     intent_only: bool                    # task-сигнал БЕЗ конкретного раздела
-    active_families: tuple[str, ...]     # домены ∩ ленивые (БЕЗ core reminders/tasks — предзагрузка)
+    active_families: tuple[str, ...]     # домены ∩ ленивые для ПРЕДЗАГРУЗКИ (вкл. семьи кросс-пары — иначе
+                                         # инструмент кросс-домена не попадёт в набор _select_tools, R3 субагент)
     directive: str | None
     all_domains: tuple[str, ...] = ()    # primary ∪ secondary — для Ф3 split/confirm (НЕ active_families)
+    cross_intent: str | None = None      # НАПРАВЛЕННОЕ кросс-доменное намерение «X из Y» (source-предлог), напр.
+                                         # "menu_to_shopping" («покупки ИЗ меню»). Задаёт allowed-сеты в compute.
 
 
 @lru_cache(maxsize=1)
@@ -278,10 +293,16 @@ def route_domains(text: str) -> RouteResult:
     # «напомни ... и купить ...» → ложный compound, И пропускал «внеси/запланируй» → терял команду).
     clause_info: list[tuple[str, bool]] = []  # (primary раздела клаузы, is_command)
     suppressed: set[str] = set()
+    cross_ci: str | None = None  # кросс-намерение детектится ПОКЛАУЗНО (маркер + ОБА домена в ОДНОЙ клаузе)
     for ct in clauses:
         matched = _match_domains(_WORD_RE2.findall(ct))
         if not matched:
             continue
+        # R4 субагент: cross — только если маркер-предлог И оба домена пары в ЭТОЙ ЖЕ клаузе (иначе ложное
+        # срабатывание при со-встречаемости в разных клаузах: «убери из меню и добавь в покупки»).
+        if cross_ci is None:
+            cross_ci = next((ci for marker, need, ci in _CROSS_INTENTS
+                             if marker in ct and need <= set(matched)), None)
         action = sorted((d for d in matched if d in _ACTION_DOMAINS), key=_prio)
         forced = next((dom for ph, dom in _PHRASES if ph in ct), None)
         if action:
@@ -295,7 +316,7 @@ def route_domains(text: str) -> RouteResult:
 
     if not clause_info:
         return RouteResult(None, (), (), False, ("task" if task_signal else None),
-                           bool(task_signal), (), None, ())
+                           bool(task_signal), (), None, (), None)
 
     # compound — ТОЛЬКО при ≥2 РАЗНЫХ клаузах-КОМАНДАХ (task-сигнал); хвост-список без сигнала — не команда.
     command_doms: list[str] = []
@@ -319,10 +340,101 @@ def route_domains(text: str) -> RouteResult:
 
     suppressed -= {primary, *secondary}
     all_domains = (primary, *secondary)
-    active = tuple(sorted(d for d in all_domains if d in onto["lazy"]))
+    # cross_intent применяем ТОЛЬКО если нет КОМАНДЫ вне кросс-пары (R4 high/medium/субагент: иначе cross
+    # перекрывает compound — «составь покупки из меню И напомни про X» терял бы reminders / давал ложную запись).
+    cross_intent = cross_ci if (cross_ci and not (set(command_doms) - _CROSS_INTENT_POLICY[cross_ci][0])) else None
+    # active_families для предзагрузки: домены результата ∪ семьи кросс-пары (source подавлен в all_domains,
+    # но без его загрузки кросс-инструмент не попадёт в _select_tools — R3 субагент).
+    cross_fams = _CROSS_INTENT_POLICY[cross_intent][0] if cross_intent else frozenset()
+    active = tuple(sorted((set(all_domains) | cross_fams) & onto["lazy"]))
     return RouteResult(primary, secondary, tuple(sorted(suppressed)), compound,
                        ("task" if task_signal else None), False, active,
-                       _DIRECTIVE.get(primary), all_domains)
+                       _DIRECTIVE.get(primary), all_domains, cross_intent)
+
+
+# ───────────────────────── #221 Ф2: доменный фолбэк-классификатор (Слой-1) ─────────────────────────
+# Зовётся ТОЛЬКО когда intent=task (#197) И route_domains не дал детерминированного домена. Возвращает
+# домен(ы) семейств + СОВЕЩАТЕЛЬНУЮ уверенность. LLM-fallback домен → ТОЛЬКО read-привязка (write-гейт в
+# графе, Ф3): уверенность high лишь при РОВНО одном домене (exact-enum). Сбой/мусор → пусто+low (fail-open).
+# Промпт-карта = из замера (22/24 на реальном корпусе). web покрывает погоду/поиск.
+_USER_DOMAINS: frozenset[str] = frozenset({
+    "checklists", "tasks", "reminders", "shopping", "menu", "recipes", "household", "memory", "web"})
+_DOMAIN_CLASSIFIER_SYSTEM = (
+    "Ты — классификатор РАЗДЕЛА запроса к ассистенту. Верни РОВНО ОДНО слово на латинице:\n"
+    "- checklists: списки дел / чек-листы (слова «дела», «списки», «список <имя>», «сборы», «пункты»)\n"
+    "- tasks: задачи с делом/датой («задачи», «поставь задачу», «что я обещал»)\n"
+    "- reminders: напоминания в конкретное время («напомни», «напоминания»)\n"
+    "- shopping: покупки («купи», «в покупки», «список покупок», добавить товар)\n"
+    "- menu: недельное меню; - recipes: рецепты; - household: члены семьи, дни рождения родных;\n"
+    "- memory: запомнить/вспомнить заметку, факт о себе; - web: погода, поиск в интернете, актуальные факты.\n"
+    "Только одно слово (раздел), без пояснений."
+)
+
+
+@dataclass(frozen=True)
+class DomainClassResult:
+    domains: tuple[str, ...]      # распознанные домены (семьи); пусто = не определил
+    confidence: str              # "high" (ровно один домен) | "low" (ноль/несколько/сбой)
+
+
+def _parse_domains(raw: Any) -> DomainClassResult:
+    """Строгий парс: латиница-токены ∩ _USER_DOMAINS (weather→web). high ровно при одном; иначе low."""
+    s = ("" if raw is None else str(raw)).lower()
+    found: list[str] = []
+    for w in re.findall(r"[a-z]+", s):
+        d = "web" if w == "weather" else w
+        if d in _USER_DOMAINS and d not in found:
+            found.append(d)
+    return DomainClassResult(tuple(found), "high" if len(found) == 1 else "low")
+
+
+async def classify_domains(
+    recent_messages: Iterable[Any], user_text: str, freddie_llm: Any,
+    timeout: float = 4.0, raw_sink: list[str] | None = None,
+) -> DomainClassResult:
+    """Слой-1 фолбэк ПО ДОМЕНУ (на task-пути). Async, fail-open (пусто+low) при сбое/таймауте/мусоре —
+    тогда привязка идёт по fail-open-политике (read-only/уточнение, Ф3), НЕ по угаданному домену."""
+    recent = _format_recent(recent_messages)
+    payload = (f"Последние реплики:\n{recent}\n\nТекущее сообщение пользователя:\n{user_text}\n\n"
+               "Одно слово (раздел):")
+    try:
+        resp = await asyncio.wait_for(
+            freddie_llm.ainvoke([SystemMessage(content=_DOMAIN_CLASSIFIER_SYSTEM),
+                                 HumanMessage(content=payload)]),
+            timeout=timeout)
+        raw = getattr(resp, "content", resp)
+        if raw_sink is not None:
+            raw_sink.append(str(raw)[:120])
+        res = _parse_domains(raw)
+        logger.info("react_preflight: classify_domains raw=%r → %s/%s", str(raw)[:60], res.domains, res.confidence)
+        return res
+    except Exception:  # noqa: BLE001 — таймаут/сеть/провайдер → пусто+low (fail-open в графе, не угаданный домен)
+        logger.warning("react_preflight: classify_domains failed → empty/low", exc_info=True)
+        return DomainClassResult((), "low")
+
+
+def compute_allowed_domains(
+    route: RouteResult, classified: DomainClassResult | None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """#221 Ф2: политика РАЗРЕШЁННЫХ доменов (allowed_read, allowed_write) из детерм. роутинга + LLM-фолбэка.
+    Это контракт «запись никогда по догадке» + fail-open (план §3/§4). pending_intent/resume — в Ф3.
+    - направленное кросс-намерение «X из Y» (cross_intent, напр. «покупки из меню») → read оба, write — целевой;
+    - детерм. ОДИН домен → read+write (явная команда);
+    - детерм. СОСТАВНОЕ (>1, союз) → read оба, write ∅ (compound-write → уточнение в Ф3, не авто-запись);
+    - LLM-fallback high (ровно один) → ТОЛЬКО read (запись не по догадке модели);
+    - иначе (low/мусор/нет домена) → ∅/∅ = явный deny (ask_human-only; пустой set ≠ None, R5 Codex medium).
+    Возврат — frozenset'ы (пустой = ЯВНЫЙ запрет; None НЕ возвращаем — None зарезервирован для OFF/legacy в графе)."""
+    if route.cross_intent in _CROSS_INTENT_POLICY:  # направленное «X из Y» (source-предлог) → целевая запись
+        return _CROSS_INTENT_POLICY[route.cross_intent]
+    doms = route.all_domains
+    if len(doms) == 1:
+        s = frozenset(doms)
+        return s, s
+    if len(doms) >= 2:
+        return frozenset(doms), frozenset()
+    if classified and classified.domains and classified.confidence == "high":
+        return frozenset(classified.domains), frozenset()
+    return frozenset(), frozenset()
 
 
 def chat_fact_system_prompt(today_str: str) -> str:

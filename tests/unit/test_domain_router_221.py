@@ -10,11 +10,14 @@
 - intent_only: команда без раздела («что у меня») → intent=task, domain=None.
 - keyword-coverage (без молчаливой потери) + НЕГАТИВЫ (нет ложных срабатываний).
 """
+import asyncio
+
 import pytest
 
 from sreda.runtime import react_loop
 from sreda.runtime.react_routing_data import FAMILY_EXACT_ROOTS, FAMILY_ROOTS
 from sreda.runtime.react_preflight import (
+    DomainClassResult,
     _DOMAIN_PRIORITY,
     _MUST_TASK_PATTERNS,
     _SEC_CHECKLIST_WORDS,
@@ -22,8 +25,23 @@ from sreda.runtime.react_preflight import (
     _SEC_TASK_ROOTS,
     _clear_ontology_cache_for_tests,
     _ontology,
+    _parse_domains,
+    classify_domains,
+    compute_allowed_domains,
     route_domains,
 )
+
+
+class _FakeLLM:
+    """Мини-LLM для classify_domains: ainvoke → AIMessage(content) или raise (fail-open)."""
+    def __init__(self, content=None, exc=None):
+        self._content, self._exc = content, exc
+
+    async def ainvoke(self, _messages):
+        if self._exc is not None:
+            raise self._exc
+        from langchain_core.messages import AIMessage
+        return AIMessage(content=self._content)
 
 
 # ── ontology: слово → правильный раздел (longest-match + suppression) ──────────────────────────────
@@ -273,3 +291,226 @@ def test_ontology_cache_clear_smoke():
     _ontology()
     _clear_ontology_cache_for_tests()  # не должно падать; следующий вызов пересоберёт
     assert "checklists" in _ontology()["roots"]
+
+
+# ── Ф2: доменный фолбэк-классификатор ──────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("raw,expected_domains,conf", [
+    ("checklists", ("checklists",), "high"),
+    ("weather", ("web",), "high"),                 # weather → web (семья)
+    ("shopping, reminders", ("shopping", "reminders"), "low"),  # несколько → low
+    ("какой-то мусор", (), "low"),                  # нет валидного домена → low
+    ("", (), "low"),
+])
+def test_parse_domains(raw, expected_domains, conf):
+    r = _parse_domains(raw)
+    assert r.domains == expected_domains and r.confidence == conf
+
+
+def test_classify_domains_high_single():
+    r = asyncio.run(classify_domains([], "покажи дела", _FakeLLM(content="checklists")))
+    assert r.domains == ("checklists",) and r.confidence == "high"
+
+
+def test_classify_domains_failopen_on_error():
+    """Сбой LLM → пусто+low (fail-open в графе по политике, НЕ угаданный домен)."""
+    r = asyncio.run(classify_domains([], "что-то", _FakeLLM(exc=RuntimeError("timeout"))))
+    assert r == DomainClassResult((), "low")
+
+
+# ── Ф2: метаданные op-class + read/write домены ────────────────────────────────────────────────────
+def test_tool_op_metadata_complete():
+    """Полнота: КАЖДЫЙ инструмент манифеста классифицирован (import-time assert уже это гарантирует)."""
+    from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, TOOL_OP_CLASS
+    assert set(TOOL_OP_CLASS) == set(TOOL_FAMILY_MANIFEST)
+
+
+@pytest.mark.parametrize("name,read,write", [
+    ("list_shopping", {"shopping"}, set()),                       # read_pure: write=∅
+    ("add_shopping_items", {"shopping"}, {"shopping"}),            # обычный write = family
+    ("generate_shopping_from_menu", {"menu"}, {"shopping"}),       # ЕДИНСТВ. кросс-override: family menu→write shopping
+    ("attach_reminder", {"tasks"}, {"tasks"}),                    # скоуп = family tasks (каскад reminders — внутри)
+    ("move_task_to_checklist", {"checklists"}, {"checklists"}),    # скоуп = family checklists
+    ("recall_memory", {"memory"}, set()),                        # family memory (broadcast — внутр. деталь, не скоуп)
+    ("get_weather", {"web"}, set()),                             # read_external: домен web, write=∅
+    ("add_task", {"tasks"}, {"tasks"}),                          # КЛЮЧ: write=family tasks (не вся triple из ToolSpec)
+    ("cancel_task", {"tasks"}, {"tasks"}),
+])
+def test_tool_domains_scoping(name, read, write):
+    from sreda.services.tool_schemas.families import tool_read_domains, tool_write_domains
+    assert set(tool_read_domains(name)) == read
+    assert set(tool_write_domains(name)) == write
+
+
+# ── Ф2: _apply_domain_policy ───────────────────────────────────────────────────────────────────────
+class _T:
+    def __init__(self, name): self.name = name
+
+
+def _names(tools):
+    return {t.name for t in tools}
+
+
+def test_apply_policy_none_no_filter():
+    from sreda.runtime.react_loop import _apply_domain_policy
+    tools = [_T("add_task"), _T("list_shopping")]
+    assert _apply_domain_policy(tools, None, None) is tools  # OFF/legacy — без фильтра
+
+
+def test_apply_policy_meta_always_pass():
+    from sreda.runtime.react_loop import _apply_domain_policy
+    out = _apply_domain_policy([_T("ask_human"), _T("need_family")], set(), set())
+    assert _names(out) == {"ask_human", "need_family"}
+
+
+def test_apply_policy_read_gated():
+    from sreda.runtime.react_loop import _apply_domain_policy
+    out = _apply_domain_policy([_T("list_checklists"), _T("list_tasks")], {"checklists"}, set())
+    assert _names(out) == {"list_checklists"}  # list_tasks read=tasks не разрешён
+
+
+def test_apply_policy_write_gated():
+    from sreda.runtime.react_loop import _apply_domain_policy
+    tools = [_T("add_shopping_items"), _T("list_shopping")]
+    assert _names(_apply_domain_policy(tools, {"shopping"}, set())) == {"list_shopping"}  # запись запрещена
+    assert _names(_apply_domain_policy(tools, {"shopping"}, {"shopping"})) == {"add_shopping_items", "list_shopping"}
+
+
+def test_apply_policy_cross_domain_write_checked():
+    """generate_shopping_from_menu пишет shopping: при allowed_write без shopping — НЕ привязывается (R1)."""
+    from sreda.runtime.react_loop import _apply_domain_policy
+    t = [_T("generate_shopping_from_menu")]
+    assert _apply_domain_policy(t, {"menu", "household"}, {"menu"}) == []          # shopping не в write
+    assert len(_apply_domain_policy(t, {"menu", "household"}, {"menu", "shopping"})) == 1
+
+
+def test_apply_policy_recall_memory_scoped_to_memory():
+    """recall_memory скоуп=memory: на не-memory маршруте отрезан, на memory — есть (R1 high: не резать на memory)."""
+    from sreda.runtime.react_loop import _apply_domain_policy
+    assert _apply_domain_policy([_T("recall_memory")], {"checklists"}, set()) == []   # не memory-маршрут
+    assert len(_apply_domain_policy([_T("recall_memory")], {"memory"}, set())) == 1   # memory-маршрут
+
+
+def test_apply_policy_unknown_failclosed():
+    from sreda.runtime.react_loop import _apply_domain_policy
+    assert _apply_domain_policy([_T("totally_unknown_tool")], {"shopping"}, {"shopping"}) == []
+
+
+def test_apply_policy_link_task_alias_survives():
+    """link_task (бэспоук, runtime-имя≠манифест) канонизируется → не fail-closed (R1 CRITICAL)."""
+    from sreda.runtime.react_loop import _apply_domain_policy
+    out = _apply_domain_policy([_T("link_task")], {"tasks", "checklists"}, {"tasks", "checklists"})
+    assert _names(out) == {"link_task"}
+
+
+def test_apply_policy_add_task_not_cut_on_tasks_route():
+    """Контрпример против ToolSpec-литерала: add_task/cancel_task на чистом tasks-маршруте НЕ режутся."""
+    from sreda.runtime.react_loop import _apply_domain_policy
+    out = _apply_domain_policy([_T("add_task"), _T("cancel_task")], {"tasks"}, {"tasks"})
+    assert _names(out) == {"add_task", "cancel_task"}
+
+
+def test_every_core_tool_survives_policy_at_its_domain():
+    """Pin (R1): КАЖДОЕ имя из _CORE_TOOL_NAMES проходит фильтр при широком task-наборе (ловит fail-closed по имени)."""
+    from sreda.runtime.react_loop import _CORE_TOOL_NAMES, _apply_domain_policy
+    allowed = {"tasks", "reminders", "checklists", "memory"}
+    survived = {t.name for t in _apply_domain_policy([_T(n) for n in _CORE_TOOL_NAMES], allowed, allowed)}
+    assert survived == set(_CORE_TOOL_NAMES), f"core отрезаны фильтром: {set(_CORE_TOOL_NAMES) - survived}"
+
+
+def test_op_class_matches_toolspec_effect():
+    """Сверка (R1 medium/субагент): op_class write↔read согласован с ToolSpec.effect — ловит дрейф классификации."""
+    import importlib
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS
+    eff_by_name = {}
+    for m in ("specs_tasks", "specs_shopping", "specs_reminders", "specs_recipes", "specs_menu",
+              "specs_household", "specs_checklists", "specs_memory", "specs_web", "specs_ui",
+              "specs_utility", "specs_onboarding"):
+        mod = importlib.import_module("sreda.services.tool_schemas." + m)
+        for v in vars(mod).values():
+            if isinstance(v, (list, tuple)):
+                for s in v:
+                    if hasattr(s, "name") and hasattr(s, "effect"):
+                        eff_by_name[s.name] = s.effect
+    mismatch = [(n, TOOL_OP_CLASS[n], eff) for n, eff in eff_by_name.items()
+                if n in TOOL_OP_CLASS and (TOOL_OP_CLASS[n] == "write") != (eff == "write")]
+    assert not mismatch, f"op_class ≠ ToolSpec.effect: {mismatch}"
+
+
+# ── Ф2: compute_allowed_domains (политика «запись не по догадке» + fail-open) ───────────────────────
+def test_allowed_deterministic_single_read_and_write():
+    r = route_domains("покажи дела")  # детерм. checklists
+    ar, aw = compute_allowed_domains(r, None)
+    assert ar == frozenset({"checklists"}) and aw == frozenset({"checklists"})
+
+
+def test_allowed_compound_read_both_no_write():
+    """Составное (детерм.) → читать оба, писать НИ В ОДИН (compound-write → уточнение, не авто)."""
+    r = route_domains("добавь молоко в покупки и напомни про встречу")
+    ar, aw = compute_allowed_domains(r, None)
+    assert ar == frozenset({"shopping", "reminders"}) and aw == frozenset()
+
+
+def test_allowed_llm_fallback_read_only():
+    """Нет детерм. домена, LLM high → ТОЛЬКО read (запись не по догадке)."""
+    r = route_domains("расскажи анекдот")  # нет домена
+    ar, aw = compute_allowed_domains(r, DomainClassResult(("checklists",), "high"))
+    assert ar == frozenset({"checklists"}) and aw == frozenset()
+
+
+def test_allowed_low_confidence_is_explicit_deny():
+    """Низкая уверенность/нет домена → ∅/∅ = явный deny (ask_human-only), НЕ None."""
+    r = route_domains("расскажи анекдот")
+    ar, aw = compute_allowed_domains(r, DomainClassResult((), "low"))
+    assert ar == frozenset() and aw == frozenset()
+    ar2, aw2 = compute_allowed_domains(r, DomainClassResult(("a", "b"), "low"))  # мульти-low → deny
+    assert ar2 == frozenset() and aw2 == frozenset()
+
+
+def test_generate_shopping_reachable_full_pipeline():
+    """РЕАЛЬНЫЙ пайплайн route→active_families→_select_tools→compute→_apply_domain_policy (R3 субагент CRITICAL):
+    «составь покупки из меню» делает generate_shopping_from_menu ДЕЙСТВИТЕЛЬНО доступным (загрузка семьи + фильтр)."""
+    from sreda.runtime.react_loop import _apply_domain_policy, _select_tools
+    r = route_domains("составь покупки из меню")
+    assert r.cross_intent == "menu_to_shopping"
+    assert "menu" in r.active_families and "shopping" in r.active_families  # обе семьи предзагружены
+    ar, aw = compute_allowed_domains(r, None)
+    assert ar == frozenset({"menu", "shopping"}) and aw == frozenset({"shopping"})
+    # реальный отбор кандидатов по active_families (НЕ ручная подача), затем доменный фильтр:
+    all_tools = [_T("generate_shopping_from_menu"), _T("list_menu"), _T("list_shopping"), _T("list_checklists")]
+    selected = _select_tools(all_tools, r.active_families)
+    assert "generate_shopping_from_menu" in _names(selected)  # семья menu загружена → инструмент в наборе
+    assert "generate_shopping_from_menu" in _names(_apply_domain_policy(selected, ar, aw))  # пережил фильтр
+
+
+def test_cross_intent_directional_reverse_no_false_write():
+    """Обратное направление «меню из покупок» (нет «из меню») → НЕ menu_to_shopping; generate_shopping недостижим."""
+    r = route_domains("составь меню из покупок")
+    assert r.cross_intent is None
+    ar, aw = compute_allowed_domains(r, None)
+    assert ar != frozenset({"menu", "shopping"}) or aw != frozenset({"shopping"})  # не кросс-политика
+
+
+def test_cross_intent_robust_to_connector():
+    """Маркер «из меню» устойчив к союзу-ХВОСТУ (не команда): «...из меню и без орехов» всё равно кросс (R3 MINOR)."""
+    r = route_domains("составь покупки из меню и без орехов")
+    assert r.cross_intent == "menu_to_shopping"
+
+
+def test_cross_intent_not_override_compound_command():
+    """Cross + ДРУГАЯ команда в соседней клаузе → cross НЕ применяется (не теряем reminders, R4 high/medium)."""
+    r = route_domains("напомни про ужин и составь покупки из меню")
+    assert r.cross_intent is None
+    ar, aw = compute_allowed_domains(r, None)
+    assert "reminders" in ar and aw == frozenset({"reminders"})  # команда reminders сохранена, без cross-write shopping
+
+
+@pytest.mark.parametrize("text", [
+    "убери салат из меню и добавь молоко в покупки",  # «из меню»+menu в кл.1, shopping в кл.2 — РАЗНЫЕ клаузы
+    "что из меню вкусное и покажи покупки",            # два read в разных клаузах
+])
+def test_cross_intent_no_false_cross_co_occurrence(text):
+    """Со-встречаемость menu+shopping в РАЗНЫХ клаузах → НЕ cross (R4 субагент: иначе ложная shopping-запись)."""
+    r = route_domains(text)
+    assert r.cross_intent is None
+    _, aw = compute_allowed_domains(r, None)
+    assert aw != frozenset({"shopping"}) or r.primary_domain == "shopping"  # cross-write shopping не навязан

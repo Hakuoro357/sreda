@@ -806,6 +806,36 @@ def _bind_for(all_tools: list, active_families: Any, intent: str | None) -> list
     return _select_tools(all_tools, active_families)
 
 
+# #221 Ф2: контрол/мета-инструменты — всегда проходят доменный фильтр (не относятся к user-домену; это
+# escape/служебные: уточнение, догрузка семьи, self-delete с собственным confirm).
+_META_TOOLS = frozenset({"ask_human", "need_family", "delete_my_account"})
+# Бэспоук-инструменты ReAct, чьё runtime-имя ≠ имени в манифесте/TOOL_OP_CLASS (R1 CRITICAL: иначе fail-closed
+# молча вырежет рабочий core-инструмент). Канонизируем имя ДО поиска метаданных. `unlink_task` совпадает с
+# манифестом — алиас не нужен.
+_TOOL_NAME_ALIASES = {"link_task": "link_task_to_checklist"}
+
+
+def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
+    """#221 Ф2: финальный фильтр набора по РАЗРЕШЁННЫМ доменам (применяется на ВСЕХ bind-сайтах в Ф3).
+    Инструмент проходит, ТОЛЬКО если read_domains ⊆ allowed_read И write_domains ⊆ allowed_write (гейт по
+    write_domains домена-скоупинга, НЕ по литералу ToolSpec — см. families.py). Мета — всегда; инструмент без
+    метаданных (неизвестный) → fail-closed. allowed_* = None → НЕ фильтровать (legacy/OFF)."""
+    if allowed_read is None and allowed_write is None:
+        return tools
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_read_domains, tool_write_domains
+    ar, aw = set(allowed_read or ()), set(allowed_write or ())
+    out = []
+    for t in tools:
+        name = _TOOL_NAME_ALIASES.get(t.name, t.name)
+        if t.name in _META_TOOLS:
+            out.append(t)
+        elif name not in TOOL_OP_CLASS:  # неизвестный инструмент → fail-closed
+            continue
+        elif tool_read_domains(name) <= ar and tool_write_domains(name) <= aw:
+            out.append(t)
+    return out
+
+
 # #165 Срез A guard — детерминированный backstop «не отказать молчаливо».
 # ЛИМИТ ПРОХОДОВ chat/ход (анти-петля для ВСЕГО цикла, не только guard): при достижении
 # route → стоп-узел (грациозный выход), НЕ дожидаясь recursion_limit (тот — внешний нет
