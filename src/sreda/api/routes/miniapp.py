@@ -945,18 +945,18 @@ def _collect_menu_sections(
     return list(merged.values())
 
 
-@router.get("/api/v1/menu")
-def get_menu(
-    session: Session = Depends(get_session),
-    ctx: MiniAppContext = Depends(_require_miniapp_auth),
-) -> dict:
-    """Home-screen menu for the Mini App.
+# «Расписание» (id="schedule") скрыт из Mini App home по решению владельца
+# 2026-06-25 (#233): текущий UX не устраивает, нужна доработка. Бэкенд НЕ
+# тронут — tasks-API, экран #/schedule и приватный скил housewife остаются;
+# секция просто не инжектится в home (как платформенный tile «Подписки»).
+# Снять сокрытие = убрать id из набора.
+_HIDDEN_MENU_SECTION_IDS: frozenset[str] = frozenset({"schedule"})
 
-    Returns skill-level entry-points (Напоминания, etc.) aggregated
-    from subscribed agents, plus the always-on Подписки tile.
-    """
-    sections = _collect_menu_sections(session, ctx.tenant_id, ctx.user_id)
-    items = [
+
+def _menu_items_for_render(sections: list[MiniAppSection]) -> list[dict]:
+    """Collected sections → home-screen item dicts, dropping any section
+    whose id is platform-hidden (#233 «Расписание»). Order preserved."""
+    return [
         {
             "id": s.id,
             "title": s.title,
@@ -966,12 +966,25 @@ def get_menu(
             "count": s.count,
         }
         for s in sections
+        if s.id not in _HIDDEN_MENU_SECTION_IDS
     ]
-    # Platform-level tile «Подписки» временно скрыт (2026-04-25 —
-    # подписку выдаёт админ при approve, юзер сам не оформляет).
-    # Route #/subscriptions и весь биллинг-код остаются нетронутыми;
-    # просто tile не инжектится в Mini App home до запуска платежей.
-    return {"items": items}
+
+
+@router.get("/api/v1/menu")
+def get_menu(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Home-screen menu for the Mini App.
+
+    Returns skill-level entry-points (Напоминания, etc.) aggregated from
+    subscribed agents. Platform-hidden sections (e.g. «Расписание», #233)
+    and the «Подписки» tile (hidden 2026-04-25 — admin grants the
+    subscription, user doesn't self-serve) are omitted: their routes and
+    backend code stay intact, the tiles just aren't injected into home.
+    """
+    sections = _collect_menu_sections(session, ctx.tenant_id, ctx.user_id)
+    return {"items": _menu_items_for_render(sections)}
 
 
 # ---------------------------------------------------------------------------
