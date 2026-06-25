@@ -763,6 +763,20 @@ class Settings(BaseSettings):
     yandex_speechkit_api_key: str | None = Field(
         default=None, validation_alias="SREDA_YANDEX_SPEECHKIT_API_KEY"
     )
+    # Yandex Cloud Billing — показ остатка ₽ в /admin/llm (#229). Авторизованный
+    # ключ сервисного аккаунта (PEM с заголовком «… SA Key ID <id>» ИЛИ JSON),
+    # которым подписывается JWT → IAM-токен → Billing API. SA-id нужен ТОЛЬКО
+    # для PEM-формата (в JSON он внутри). account_id опционален — если не задан,
+    # берётся первый аккаунт из List.
+    yandex_billing_sa_key_file: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_SA_KEY_FILE"
+    )
+    yandex_billing_sa_id: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_SA_ID"
+    )
+    yandex_billing_account_id: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_ACCOUNT_ID"
+    )
     # Groq Whisper — OpenAI-compatible /audio/transcriptions endpoint on
     # LPU hardware. Same resolve-precedence as MiMo: explicit key first,
     # then file path, then disabled.
