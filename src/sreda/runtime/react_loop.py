@@ -1523,6 +1523,19 @@ def _extract_usage(resp: Any) -> tuple[int, int]:
         return 0, 0
 
 
+def _extract_cache_read(resp: Any) -> int:
+    """#230 Срез 0a: cache_read из usage_metadata (наблюдаемость prompt-кеша). НЕ влияет на бюджет
+    (его берёт _extract_usage) — идёт только в наблюдательный трейс #192. Нормализованный путь как у
+    llm_trace.extract_usage: LangChain кладёт в usage_metadata.input_token_details.cache_read
+    (OpenAI-style), fallback .cached. 0 при отсутствии/ошибке."""
+    try:
+        usage = getattr(resp, "usage_metadata", None) or {}
+        details = usage.get("input_token_details") or {}
+        return max(int(details.get("cache_read") or details.get("cached") or 0), 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
 def _record_react_usage(*, bind: Any, tenant_id: str, provider_key: str, model: str,
                         prompt_tokens: int, completion_tokens: int, run_id: str) -> None:
     """#175 (хвост #150/#151): записать ОДИН вызов LLM ReAct-узла в skill_ai_executions, чтобы
@@ -1719,6 +1732,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                 "provider_key": _used_provider, "model": _used_model,
                 "latency_ms": _latency_ms, "retries": (1 if _fallback_fired else 0),
                 "fallback_fired": _fallback_fired,
+                "cache_read": _extract_cache_read(resp),  # #230 Срез 0a: наблюдаемость prompt-кеша (не деньги)
                 # #197 Слой 4: наблюдаемость роутинга — для отладки мисклассификации на проде.
                 "intent": eff or "task",
                 "tool_scope": ("web" if eff in ("chat", "fact") else "full"),
