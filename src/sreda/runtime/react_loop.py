@@ -306,6 +306,11 @@ class ReactState(MessagesState):
     # "must_task": bool, "classifier_raw": str}. Last-value, ставится на fresh-ходе; chat-узел кладёт в
     # llm_calls-трейс (#192) для отладки мисклассификации на проде. OFF → не ставится.
     intent_meta: dict
+    # #221 Ф3: разрешённые домены для _apply_domain_policy (ТОЛЬКО execute-режим). Last-value каналы; None/
+    # отсутствует → фильтр НЕ применяется (disabled/shadow byte-identical). Ставятся на свежем ходу из
+    # compute_allowed_domains; resume читает из чекпойнта. Тип Optional — на resume старого чекпойнта = None.
+    router_allowed_read_domains: list[str] | None
+    router_allowed_write_domains: list[str] | None
 
 
 def _system_prompt(today_str: str) -> str:
@@ -939,6 +944,12 @@ def _is_pruned(tenant_id: str) -> bool:
     SREDA_REACT_PRUNE_TENANTS). Дефолт — НЕТ → full-bind (ноль изменений). Канарейка/kill-switch."""
     from sreda.config.settings import get_settings
     return tenant_id in get_settings().react_prune_tenants
+
+
+def _domain_scope() -> str:
+    """#221 Ф3: режим доменного скоупинга ∈ {disabled, shadow, execute}. disabled (дефолт) → byte-identical."""
+    from sreda.config.settings import get_settings
+    return get_settings().react_domain_scope
 
 
 def _looks_like_refusal(content: Any) -> bool:
@@ -1583,7 +1594,9 @@ def _build_graph(llm: Any, all_tools: list, *,
             # SCOPE всегда web-only (bound по eff ДО try → fallback наследует тот же bound → не расширится);
             # МОДЕЛЬ best-effort (deepseek → при сбое bind/invoke Фредди с ТЕМ ЖЕ web-only + chat_prompt,
             # НЕ task). Если и Фредди+web-only упадёт → исключение во внешний guard → safe-reply (scope цел).
-            bound = _bind_for(all_tools, state.get("active_families"), eff)
+            bound = _apply_domain_policy(  # #221 Ф3: фильтр разрешённых разделов (None allowed → no-op, byte-identical)
+                _bind_for(all_tools, state.get("active_families"), eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = chat_prompt or system_prompt
             _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                       budget=_compact_budget())
@@ -1600,9 +1613,12 @@ def _build_graph(llm: Any, all_tools: list, *,
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:
-            # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical).
+            # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical при router_allowed=None).
             # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
-            bound = _select_tools(all_tools, state.get("active_families"))
+            # #221 Ф3: + фильтр разрешённых разделов (execute ставит router_allowed_*; иначе None → no-op).
+            bound = _apply_domain_policy(
+                _select_tools(all_tools, state.get("active_families")),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = system_prompt
             nudge = state.get("guard_nudge")
             if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
@@ -1690,7 +1706,11 @@ def _build_graph(llm: Any, all_tools: list, *,
         # загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш. #197: тот же
         # `_bind_for(eff)`, что в chat-узле (chat/fact → web-only; иначе галлюцинация need_family
         # открыла бы семью мимо bind).
-        bound_by_name = {t.name: t for t in _bind_for(all_tools, active, eff)}
+        # #221 Ф3: dispatch-набор тоже под доменным фильтром (execute) — иначе галлюцинация инструмента вне
+        # разрешённых разделов исполнилась бы; None allowed → no-op (byte-identical).
+        bound_by_name = {t.name: t for t in _apply_domain_policy(
+            _bind_for(all_tools, active, eff),
+            state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
         out = []
         added = False
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
@@ -1844,10 +1864,12 @@ def _build_graph(llm: Any, all_tools: list, *,
         attempted = list(state.get("guard_attempted_families") or [])
         fam = _guard_family(_last_human_text(state["messages"]), active)
         update: dict = {}
+        added: set[str] = set()  # #221 Ф3: семьи, реально ДОБРАННЫЕ этим guard-вызовом (для точного allowed_read)
         if fam and fam not in attempted:
             # точечный добор семьи по словарю-роутеру
             if fam not in active:
                 active.append(fam)
+                added.add(fam)
             attempted.append(fam)
             nudge = (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
                      "инструментом, не отвечай «не умею».")
@@ -1859,6 +1881,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             for f in _LAZY_FAMILIES:
                 if f not in active:
                     active.append(f)
+                    added.add(f)
             update["guard_full_attempted"] = True
             nudge = ("Все инструменты теперь доступны — выполни запрос пользователя, "
                      "не отвечай «не умею».")
@@ -1867,6 +1890,12 @@ def _build_graph(llm: Any, all_tools: list, *,
             "guard_attempted_families": attempted,
             "guard_nudge": nudge,
         })
+        # #221 Ф3: в execute расширить allowed_READ ТОЛЬКО реально добранными семьями (R1 high: не всем active —
+        # иначе при classifier-only маршруте вернулись бы чужие read-инструменты). WRITE НЕ расширяем (write-гейт
+        # сохранён; guard-recovery read-safe — route не пускает сюда после wrote_unkeyed). None → no-op (disabled).
+        if state.get("router_allowed_read_domains") is not None and added:
+            update["router_allowed_read_domains"] = sorted(
+                set(state.get("router_allowed_read_domains") or []) | added)
         return update
 
     def stop(state: ReactState):
@@ -2278,7 +2307,11 @@ async def handle_turn(
             # fail-open task). prev_intent + история — из снапа прошлого хода. fail-open в task — ТОЛЬКО здесь.
             _init: dict = {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
                            "active_families": base_fams, "guard_attempted_families": [],
-                           "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}
+                           "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False,
+                           # #221 Ф3 (R1 CRITICAL): СБРОС каждый свежий ход — last-value каналы переживают
+                           # invoke в одном треде; без сброса после execute-хода disabled/shadow фильтровали бы
+                           # из чекпойнта (не byte-identical). execute ниже перезапишет.
+                           "router_allowed_read_domains": None, "router_allowed_write_domains": None}
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
@@ -2292,6 +2325,37 @@ async def handle_turn(
                     _init["intent"] = await classify_intent(_recent, user_text, _prev, llm, raw_sink=_raw)
                     _init["intent_meta"] = {"source": "classifier", "must_task": False,
                                             "classifier_raw": (_raw[0] if _raw else "")}
+                # #221 Ф3: доменный скоуп. execute → новый ontology-роутер драйвит active_families + allowed-домены
+                # (ТОЛЬКО pruned-тенант — доменный роутер заменяет _route_families, pruned-only; non-pruned
+                # full-bind не трогаем). shadow → только лог решения (исполнение legacy, классификатор НЕ зовём —
+                # лишняя латентность/сбой на legacy-пути). disabled → ничего (byte-identical). Только task-путь.
+                # Весь блок в try/except (R1 MAJOR): сбой доменного роутинга НЕ роняет ход → legacy fail-open.
+                _dsm = _domain_scope()
+                if _dsm in ("shadow", "execute") and _init.get("intent") == "task" and _is_pruned(tenant_id):
+                    try:
+                        from sreda.runtime.react_preflight import (
+                            classify_domains, compute_allowed_domains, route_domains)
+                        _route = route_domains(user_text)
+                        if _dsm == "execute":
+                            # нет детерм. домена → LLM-фолбэк по домену (read-only по compute).
+                            _classified = (await classify_domains(_recent, user_text, llm)
+                                           if not _route.all_domains else None)
+                            _ar, _aw = compute_allowed_domains(_route, _classified)
+                            # active_families = разрешённые-на-ЧТЕНИЕ ленивые (R1 medium: грузить и classifier-домен,
+                            # и кросс-пару — не только route.active_families, иначе фильтру нечего пропускать).
+                            _init["active_families"] = sorted(set(_ar) & set(_LAZY_FAMILIES))
+                            _init["router_allowed_read_domains"] = sorted(_ar)
+                            _init["router_allowed_write_domains"] = sorted(_aw)
+                        else:  # shadow — только лог детерм. решения; _init НЕ трогаем (исполнение legacy)
+                            _ar, _aw = compute_allowed_domains(_route, None)
+                            logger.info("react_domain shadow: primary=%s active=%s ar=%s aw=%s legacy=%s",
+                                        _route.primary_domain, list(_route.active_families),
+                                        sorted(_ar), sorted(_aw), base_fams)
+                    except Exception:  # noqa: BLE001 — sidecar/роутинг не роняет ход; legacy (router_allowed=None)
+                        logger.warning("react_domain: routing failed → legacy fail-open", exc_info=True)
+                        _init["active_families"] = base_fams
+                        _init["router_allowed_read_domains"] = None
+                        _init["router_allowed_write_domains"] = None
             result = await graph.ainvoke(_init, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))

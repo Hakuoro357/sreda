@@ -422,6 +422,24 @@ class Settings(BaseSettings):
     react_preflight_chat_provider: str = Field(
         default="openrouter-deepseek", validation_alias="SREDA_REACT_PREFLIGHT_CHAT_PROVIDER"
     )
+    # #221 Ф3: режим доменного скоупинга инструментов (ОТДЕЛЬНЫЙ от preflight #197, R4 Codex medium — не
+    # сворачивать в один флаг, иначе миграция сломает #197). Три состояния:
+    #   "disabled" (дефолт) — точный legacy: старый _route_families, БЕЗ нового роутера/логов → byte-identical;
+    #   "shadow" — legacy-исполнение + sidecar-лог решения нового роутера (только свежий ход, try/except,
+    #             НЕ мутирует state) → сравнение расхождений перед включением;
+    #   "execute" — новый ontology-роутер драйвит active_families + _apply_domain_policy на bind-сайтах.
+    # Активен ТОЛЬКО при react_preflight_enabled (домены — надстройка на task-пути). Невалидное значение →
+    # "disabled" (fail-safe). Старый bool preflight НЕ затронут (миграция: старый прод-env сохраняет #197,
+    # домен-режим по умолчанию disabled — R4 golden env-parsing).
+    react_domain_scope_mode: str = Field(
+        default="disabled", validation_alias="SREDA_REACT_DOMAIN_SCOPE_MODE"
+    )
+
+    @property
+    def react_domain_scope(self) -> str:
+        """Нормализованный режим доменного скоупинга ∈ {disabled, shadow, execute}; иначе → disabled (fail-safe)."""
+        v = (self.react_domain_scope_mode or "").strip().lower()
+        return v if v in ("disabled", "shadow", "execute") else "disabled"
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
