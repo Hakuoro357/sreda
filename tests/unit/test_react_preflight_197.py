@@ -530,6 +530,7 @@ def test_domain_scope_execute_scopes_tools(install, monkeypatch):
     install(on=True, deepseek=_Chat("deepseek"), invoked={})
     monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
     monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: тенант в канареечном списке
     sm.get_settings.cache_clear()
     _turn(freddie, thread="dsm-exec", text="напомни купить молоко")
     bound = cap["freddie"][-1]
@@ -549,6 +550,7 @@ def test_domain_scope_no_stale_leak_across_turns(install, monkeypatch):
     install(on=True, deepseek=_Chat("deepseek"), invoked={})
     monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
     monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: канареечный список
     sm.get_settings.cache_clear()
     _turn(freddie, thread="stale", text="напомни купить молоко")  # execute → router_allowed={reminders} в чекпойнте
     monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "disabled")
@@ -581,6 +583,7 @@ def test_domain_scope_execute_classify_failure_failopen(install, monkeypatch):
     install(on=True, deepseek=_Chat("deepseek"), invoked={})
     monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
     monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: канареечный список
     sm.get_settings.cache_clear()
 
     async def _boom(*a, **k):
@@ -601,8 +604,39 @@ def test_domain_scope_execute_guard_read_recovery(install, monkeypatch):
     install(on=True, deepseek=_Chat("deepseek"), invoked={})
     monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
     monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: канареечный список
     sm.get_settings.cache_clear()
     _turn(freddie, thread="guard-rec", text="погода завтра")  # web-маршрут; отказ → guard full-recovery
     last_bound = cap["freddie"][-1]            # bind 2-го прохода (после guard-recovery)
     assert "recall_memory" in last_bound       # read memory расширен guard-recovery (#202 сохранён)
     assert "add_task" not in last_bound        # write tasks НЕ расширен (write-гейт цел)
+
+
+def test_domain_scope_execute_canary_excluded_is_shadow(install, monkeypatch):
+    """Ф4 КАНАРЕЙКА: mode=execute, но тенант НЕ в списке → ведёт себя как shadow (фильтр НЕ применён,
+    add_task на месте). Глобальный flip execute не трогает тех, кого нет в канареечном списке."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "other")  # "t" НЕ в списке
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="canary-excl", text="напомни купить молоко")
+    assert "add_task" in cap["freddie"][-1]  # эффективный shadow — фильтр НЕ применён
+
+
+def test_domain_scope_execute_canary_wildcard(install, monkeypatch):
+    """Ф4 КАНАРЕЙКА: mode=execute + список='*' → execute на всех (фильтр применён, add_task срезан)."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "*")  # все
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="canary-wild", text="напомни купить молоко")
+    bound = cap["freddie"][-1]
+    assert "schedule_reminder" in bound and "add_task" not in bound  # execute драйвит (фильтр применён)

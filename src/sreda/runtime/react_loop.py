@@ -964,6 +964,13 @@ def _domain_scope() -> str:
     return get_settings().react_domain_scope
 
 
+def _is_domain_execute_tenant(tenant_id: str) -> bool:
+    """#221 Ф4 (канареечная раскатка): драйвит ли роутер РЕАЛЬНО (execute) для этого тенанта при
+    глобальном mode=execute. Пусто → никому (mode=execute = глобальный shadow); ``*`` → всем."""
+    from sreda.config.settings import get_settings
+    return tenant_id in get_settings().react_domain_scope_execute_tenants
+
+
 def _looks_like_refusal(content: Any) -> bool:
     t = (content if isinstance(content, str) else str(content or "")).lower()
     return any(m in t for m in _REFUSAL_MARKERS)
@@ -2419,7 +2426,10 @@ async def handle_turn(
                         from sreda.runtime.react_preflight import (
                             classify_domains, compute_allowed_domains, route_domains)
                         _route = route_domains(user_text)
-                        if _dsm == "execute":
+                        # #221 Ф4: РЕАЛЬНО драйвить (execute) только при глобальном mode=execute И тенанте в
+                        # канареечном списке; иначе (mode=shadow ЛИБО execute-но-тенант-не-в-списке) → shadow-лог.
+                        _eff_execute = (_dsm == "execute") and _is_domain_execute_tenant(tenant_id)
+                        if _eff_execute:
                             # нет детерм. домена → LLM-фолбэк по домену (read-only по compute).
                             _classified = (await classify_domains(_recent, user_text, llm)
                                            if not _route.all_domains else None)
@@ -2439,8 +2449,10 @@ async def handle_turn(
                             _clf, _conf = None, "not_run_in_shadow"
                         # #221 Ф3b: решение роутера в трейс (БЕЗ ПД: только домены/семьи + confidence + флаги) —
                         # источник для измерения shadow-расхождений (≤5%) и будущей петли самообучения.
+                        # mode = ЭФФЕКТИВНЫЙ режим (execute только если реально драйвили этот тенант).
                         _init["router_decision_json"] = json.dumps({
-                            "mode": _dsm, "primary_domain": _route.primary_domain,
+                            "mode": ("execute" if _eff_execute else "shadow"),
+                            "primary_domain": _route.primary_domain,
                             "all_domains": list(_route.all_domains),
                             "classified": _clf, "confidence": _conf,
                             "classifier_would_run": (not _route.all_domains),
@@ -2449,7 +2461,7 @@ async def handle_turn(
                             "compound": _route.compound_by_connector,
                             "cross_intent": _route.cross_intent,
                         }, ensure_ascii=False)
-                        if _dsm == "shadow":
+                        if not _eff_execute:  # эффективный shadow (mode=shadow ИЛИ тенант вне execute-списка)
                             logger.info("react_domain shadow: primary=%s ar=%s aw=%s legacy=%s",
                                         _route.primary_domain, sorted(_ar), sorted(_aw), base_fams)
                     except Exception:  # noqa: BLE001 — sidecar/роутинг не роняет ход; legacy (router_allowed=None)

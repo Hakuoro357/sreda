@@ -122,6 +122,7 @@ async def test_trace_routing_decision_execute(db_session, trace_on, monkeypatch)
     u = seed_telegram_user(db_session)
     db_session.flush()
     monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", u.tenant_id)
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", u.tenant_id)  # Ф4: канареечный список
     st_mod.get_settings.cache_clear()
     stub = _RecordingStubLLM([AIMessage(content="Готово.", usage_metadata=_u(10, 5))])
     await react_loop.handle_turn(

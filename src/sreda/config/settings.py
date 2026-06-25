@@ -483,6 +483,13 @@ class Settings(BaseSettings):
         """Нормализованный режим доменного скоупинга ∈ {disabled, shadow, execute}; иначе → disabled (fail-safe)."""
         v = (self.react_domain_scope_mode or "").strip().lower()
         return v if v in ("disabled", "shadow", "execute") else "disabled"
+    # #221 Ф4 (канареечная раскатка execute): даже при глобальном mode=execute РЕАЛЬНО драйвить роутер
+    # только для тенантов из этого списка; остальные при execute ведут себя как shadow (лог-only). Так
+    # execute катится постепенно (сперва тенант Бориса → проверка «дела» → ``*`` на всех). Пусто (дефолт)
+    # → НИКОМУ execute (mode=execute без списка = глобальный shadow). ``*`` → ВСЕ (полная раскатка).
+    react_domain_scope_execute_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -1032,6 +1039,13 @@ class Settings(BaseSettings):
         Пусто (дефолт) → НИКОМУ → full-bind; ``*`` → ВСЕ тенанты (#159-rollout, экономия
         токенов; измеренно безопасно: −89% токенов, паритет выбора инструмента)."""
         return _parse_tenant_gate(self.react_prune_tenants_raw)
+
+    @property
+    def react_domain_scope_execute_tenants(self) -> frozenset[str]:
+        """#221 Ф4: тенанты, на которых доменный роутер РЕАЛЬНО драйвит (execute) при глобальном
+        mode=execute. Пусто (дефолт) → НИКОМУ execute (mode=execute = глобальный shadow); ``*`` → ВСЕ
+        (полная раскатка). Канареечный гейт: сперва тенант Бориса, после проверки «дела» → ``*``."""
+        return _parse_tenant_gate(self.react_domain_scope_execute_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:
