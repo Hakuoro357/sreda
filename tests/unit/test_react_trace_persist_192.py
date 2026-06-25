@@ -63,6 +63,25 @@ def test_lifecycle_start_pause_finish(persist):
     assert r.origin_user_text == "напомни купить молоко"  # origin не затёрт
 
 
+def test_finish_stores_routing_decision(persist):
+    """#221 Ф3b: persist_trace_finish пишет routing_decision_json; без аргумента (disabled) — NULL."""
+    p, SF = persist
+    tk = "react:tg:t1:rd"
+    rd = json.dumps({"mode": "execute", "primary_domain": "checklists",
+                     "allowed_read": ["checklists"], "allowed_write": ["checklists"]}, ensure_ascii=False)
+    p.persist_trace_finish(tenant_id="t1", user_id="u1", thread_id="th", channel="tg",
+                           turn_key=tk, reply_text="ok", llm_calls=[], tool_calls=[],
+                           confirm_state="none", outcome="ok", passes=1, routing_decision_json=rd)
+    r = _row(SF, tk)[0]
+    assert json.loads(r.routing_decision_json)["primary_domain"] == "checklists"
+
+    tk2 = "react:tg:t1:rd0"  # disabled (аргумент не передан) → NULL
+    p.persist_trace_finish(tenant_id="t1", user_id="u1", thread_id="th", channel="tg",
+                           turn_key=tk2, reply_text="ok", llm_calls=[], tool_calls=[],
+                           confirm_state="none", outcome="ok", passes=1)
+    assert _row(SF, tk2)[0].routing_decision_json is None
+
+
 def test_finish_immutable_after_done(persist):
     """replay finish на уже-done → терминальные поля НЕ меняются (conditional)."""
     p, SF = persist

@@ -51,6 +51,15 @@ class ReactTurnTrace(Base):
     # ok|clarification|tool_error|llm_error|timeout|max_iter|fallback_used|policy_blocked|safe_reply
     outcome: Mapped[str | None] = mapped_column(String(24), nullable=True)
     passes: Mapped[int] = mapped_column(Integer, default=0)
+    # #221 Ф3b: решение доменного роутера (БЕЗ ПД — только имена доменов/семей + confidence + флаги).
+    # Задел под измерение shadow-расхождений (≤5%) и будущую петлю самообучения. NULL в disabled-режиме.
+    # {mode, primary_domain, all_domains, classified, confidence, allowed_read, allowed_write,
+    #  legacy_active, router_active, compound, cross_intent}
+    # ВАЖНО для анализа (R1 субагент): legacy_active = ГИПОТЕТИЧЕСКИЙ legacy-набор семей; в execute
+    # фактически загружено router_active (в shadow реально исполняется legacy_active). confidence
+    # совмещает детерм. путь ("deterministic"/"not_run_in_shadow") и LLM ("high"/"low") — первичный
+    # дискриминатор классификатора = флаг classifier_would_run, не строка confidence.
+    routing_decision_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # R3/R4: обычный UNIQUE в Postgres допускает несколько NULL → tenant-wide двоился бы.

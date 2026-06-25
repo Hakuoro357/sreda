@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import operator
 import re
@@ -311,6 +312,9 @@ class ReactState(MessagesState):
     # compute_allowed_domains; resume читает из чекпойнта. Тип Optional — на resume старого чекпойнта = None.
     router_allowed_read_domains: list[str] | None
     router_allowed_write_domains: list[str] | None
+    # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
+    # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
+    router_decision_json: str | None
 
 
 def _system_prompt(today_str: str) -> str:
@@ -2343,19 +2347,38 @@ async def handle_turn(
                             _ar, _aw = compute_allowed_domains(_route, _classified)
                             # active_families = разрешённые-на-ЧТЕНИЕ ленивые (R1 medium: грузить и classifier-домен,
                             # и кросс-пару — не только route.active_families, иначе фильтру нечего пропускать).
-                            _init["active_families"] = sorted(set(_ar) & set(_LAZY_FAMILIES))
+                            _ractive = sorted(set(_ar) & set(_LAZY_FAMILIES))
+                            _init["active_families"] = _ractive
                             _init["router_allowed_read_domains"] = sorted(_ar)
                             _init["router_allowed_write_domains"] = sorted(_aw)
-                        else:  # shadow — только лог детерм. решения; _init НЕ трогаем (исполнение legacy)
+                            _clf = list(_classified.domains) if _classified else None
+                            _conf = (_classified.confidence if _classified else "deterministic")
+                        else:  # shadow — детерм. решение; классификатор НЕ зовём (латентность/сбой на legacy);
+                            # _init НЕ трогаем (исполнение legacy). router_active = что execute ЗАГРУЗИЛ БЫ.
                             _ar, _aw = compute_allowed_domains(_route, None)
-                            logger.info("react_domain shadow: primary=%s active=%s ar=%s aw=%s legacy=%s",
-                                        _route.primary_domain, list(_route.active_families),
-                                        sorted(_ar), sorted(_aw), base_fams)
+                            _ractive = sorted(set(_ar) & set(_LAZY_FAMILIES))
+                            _clf, _conf = None, "not_run_in_shadow"
+                        # #221 Ф3b: решение роутера в трейс (БЕЗ ПД: только домены/семьи + confidence + флаги) —
+                        # источник для измерения shadow-расхождений (≤5%) и будущей петли самообучения.
+                        _init["router_decision_json"] = json.dumps({
+                            "mode": _dsm, "primary_domain": _route.primary_domain,
+                            "all_domains": list(_route.all_domains),
+                            "classified": _clf, "confidence": _conf,
+                            "classifier_would_run": (not _route.all_domains),
+                            "allowed_read": sorted(_ar), "allowed_write": sorted(_aw),
+                            "router_active": _ractive, "legacy_active": list(base_fams),
+                            "compound": _route.compound_by_connector,
+                            "cross_intent": _route.cross_intent,
+                        }, ensure_ascii=False)
+                        if _dsm == "shadow":
+                            logger.info("react_domain shadow: primary=%s ar=%s aw=%s legacy=%s",
+                                        _route.primary_domain, sorted(_ar), sorted(_aw), base_fams)
                     except Exception:  # noqa: BLE001 — sidecar/роутинг не роняет ход; legacy (router_allowed=None)
                         logger.warning("react_domain: routing failed → legacy fail-open", exc_info=True)
                         _init["active_families"] = base_fams
                         _init["router_allowed_read_domains"] = None
                         _init["router_allowed_write_domains"] = None
+                        _init["router_decision_json"] = None
             result = await graph.ainvoke(_init, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
@@ -2389,12 +2412,15 @@ async def handle_turn(
                 _outcome = ("tool_error" if any(t.get("result_kind") == "error" for t in _tcs)
                             else "fallback_used" if any(c.get("fallback_fired") for c in (_lcs or []))
                             else "ok")
+                # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
+                _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
                     confirm_state=("confirmed" if live_pause else "none"),  # best-effort
                     outcome=_outcome,
-                    passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0)
+                    passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0,
+                    routing_decision_json=_rdj)
             except Exception:  # noqa: BLE001 — трейс не валит ход
                 logger.warning("react_loop: trace finish failed", exc_info=True)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,

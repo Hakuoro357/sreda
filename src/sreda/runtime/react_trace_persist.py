@@ -91,10 +91,13 @@ def persist_trace_pause(*, tenant_id: str, user_id: str | None, turn_key: str) -
 def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str, channel: str,
                          turn_key: str, reply_text: str, llm_calls: list[dict] | None,
                          tool_calls: list[dict] | None, confirm_state: str, outcome: str,
-                         passes: int) -> None:
+                         passes: int, routing_decision_json: str | None = None) -> None:
     """Финал/resume/handled-error: → `done` + структура. CONDITIONAL UPDATE из
     `in_progress`/`awaiting_confirm` (терминал НЕИЗМЕНЕН). Если строки нет (start потерян) — INSERT
-    сразу `done` (finish-only recovery). НЕ перезаписывает origin/created_at. Guarded."""
+    сразу `done` (finish-only recovery). НЕ перезаписывает origin/created_at. Guarded.
+
+    routing_decision_json (#221 Ф3b): сериализованное решение доменного роутера (БЕЗ ПД). None в
+    disabled-режиме → колонка NULL (никаких новых данных при выключенном роутере)."""
     if not trace_enabled():
         return
     try:
@@ -107,7 +110,8 @@ def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str,
             status="done", reply_text=reply_text or "", confirm_state=confirm_state or "none",
             outcome=outcome or "ok", passes=int(passes or 0), finished_at=_now(),
             llm_calls_json=json.dumps(llm_calls or [], ensure_ascii=False),
-            tool_calls_json=json.dumps(tool_calls or [], ensure_ascii=False))
+            tool_calls_json=json.dumps(tool_calls or [], ensure_ascii=False),
+            routing_decision_json=routing_decision_json)
         sess = _session()
         try:
             res = sess.execute(
