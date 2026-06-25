@@ -171,6 +171,160 @@ def _section_hint(text: str) -> str | None:
     return None
 
 
+# ───────────────────────── #221 Ф1: единый ontology-роутер доменов ─────────────────────────
+# Слияние ТРЁХ словарей (_MUST_TASK #197 / _SEC_* #215 / _FAMILY_ROOTS #165) в ОДИН источник «слово→
+# раздел(ы)». РЕФРЕЙМ (план v5): intent (task/chat/fact) остаётся авторитетом #197; домены — надстройка
+# на task-пути (какие семьи привязать). R1-ревью (Codex high/medium + субагент):
+# - intent_hint=task ТОЛЬКО от task-сигнала (#197 _must_task / #215 _section_hint / intent_only), НЕ от
+#   семейных корней (иначе «найди про X»/«погода» ложно → task → потеря deepseek, инцидент 2026-06-23);
+# - compound ТОЛЬКО при союзе МЕЖДУ клаузами (split), не от любого союза в тексте;
+# - longest-match через фразы; данные семей — из нейтрального react_routing_data (нет импорта react_loop).
+from dataclasses import dataclass
+from functools import lru_cache
+
+from sreda.runtime.react_routing_data import FAMILY_EXACT_ROOTS, FAMILY_ROOTS, LAZY_FAMILIES
+
+# Приоритет тай-брейка: action-домены (reminders/tasks/memory — глагол-действие) ВЫШЕ content
+# (shopping/recipes/menu/household), затем web, checklists ПОСЛЕДНИЙ («списк/дела» самые общие).
+# R2-ревью: memory выше content («запомни рецепт борща»→memory, не recipes); recipes выше menu
+# («рецепт на ужин»→recipes, не menu).
+_DOMAIN_PRIORITY: tuple[str, ...] = (
+    "reminders", "tasks", "memory", "shopping", "recipes", "menu", "household", "web", "checklists")
+_CONNECTORS_RE = re.compile(r"\b(?:и|потом|затем|также|плюс)\b")  # split на клаузы; compound только МЕЖДУ ними
+# Многословные фразы (longest-match): форсируют домен поверх одиночных корней — разрешают «список X».
+_PHRASES: tuple[tuple[str, str], ...] = (
+    ("список покупок", "shopping"), ("списка покупок", "shopping"), ("списке покупок", "shopping"),
+    ("список покупк", "shopping"), ("список дел", "checklists"), ("списки дел", "checklists"),
+    ("список задач", "tasks"))
+# «в памяти» exact-словами (НЕ префикс «памят» — он ловил бы «памятник»/«памятный», R1 negative).
+_MEMORY_WORDS = frozenset({"памяти", "память", "памятью"})
+_DIRECTIVE = {"reminders": _HINT_REMINDER, "tasks": _HINT_TASK, "checklists": _HINT_CHECKLIST}
+# Action-домены (императив-глагол = намерение действия): выбираются в клаузе ПЕРВЫМИ, поверх фразы и
+# content (R3 Codex high: «запомни список покупок»→memory, «напомни список покупок»→reminders — глагол
+# важнее фразы «список покупок»→shopping).
+_ACTION_DOMAINS = frozenset({"reminders", "tasks", "memory"})
+
+
+@dataclass(frozen=True)
+class RouteResult:
+    primary_domain: str | None
+    secondary_domains: tuple[str, ...]
+    suppressed_domains: tuple[str, ...]
+    compound_by_connector: bool
+    intent_hint: str | None              # "task" ТОЛЬКО от task-сигнала #197/#215, иначе None
+    intent_only: bool                    # task-сигнал БЕЗ конкретного раздела
+    active_families: tuple[str, ...]     # домены ∩ ленивые (БЕЗ core reminders/tasks — предзагрузка)
+    directive: str | None
+    all_domains: tuple[str, ...] = ()    # primary ∪ secondary — для Ф3 split/confirm (НЕ active_families)
+
+
+@lru_cache(maxsize=1)
+def _ontology() -> dict:
+    """Единая карта из НЕЙТРАЛЬНЫХ данных (react_routing_data) + _SEC_* (#215) + reminders/tasks.
+    lru_cache → строится один раз; сброс в тестах через _clear_ontology_cache_for_tests()."""
+    roots: dict[str, tuple[str, ...]] = {k: tuple(v) for k, v in FAMILY_ROOTS.items()}
+    roots["reminders"] = _SEC_REMINDER_ROOTS
+    roots["tasks"] = _SEC_TASK_ROOTS
+    roots["checklists"] = tuple(roots.get("checklists", ())) + _SEC_CHECKLIST_ROOTS
+    return {
+        "roots": roots,
+        "words": {"checklists": _SEC_CHECKLIST_WORDS, "memory": _MEMORY_WORDS},
+        "exact": {k: tuple(v) for k, v in FAMILY_EXACT_ROOTS.items()},
+        "lazy": frozenset(LAZY_FAMILIES),
+    }
+
+
+def _clear_ontology_cache_for_tests() -> None:
+    """Сброс кэша онтологии (изоляция тестов / monkeypatch). R1-ревью: mutable global без сброса."""
+    _ontology.cache_clear()
+
+
+def _prio(d: str) -> int:
+    """Индекс приоритета; неизвестный домен (дрейф онтологии) → в конец (НЕ ValueError, R1-ревью)."""
+    return _DOMAIN_PRIORITY.index(d) if d in _DOMAIN_PRIORITY else len(_DOMAIN_PRIORITY)
+
+
+def _match_domains(toks: list[str]) -> dict[str, int]:
+    onto = _ontology()
+    out: dict[str, int] = {}
+    for dom, rts in onto["roots"].items():
+        exact = onto["exact"].get(dom, ())
+        words = onto["words"].get(dom, frozenset())
+        n = sum(1 for t in toks if t in exact or t in words or any(t.startswith(r) for r in rts))
+        if n:
+            out[dom] = n
+    return out
+
+
+def route_domains(text: str) -> RouteResult:
+    """#221 Ф1: текст → разделы (классы улик) + проекции + директива. Чистая функция (без графа).
+    Мульти-домен ТОЛЬКО при союзе МЕЖДУ клаузами; longest-match через фразы; intent_hint — только от
+    task-сигнала #197/#215 (НЕ от семейных корней — рефрейм «#197 финален»)."""
+    onto = _ontology()
+    norm = re.sub(r"чек\s+лист", "чеклист", _normalize(text))  # дефис уже снят _normalize, пробел — здесь
+
+    # intent — авторитет #197/#215: task_signal = явная команда (_must_task, вкл. «что у меня»/«перенеси на»)
+    # ИЛИ слово-раздел (_section_hint). Семейные корни (погода/рецепт/купи) сами по себе task НЕ ставят.
+    # (Отдельный _INTENT_ONLY_PHRASES убран — дублировал _must_task; широкая «что мне нужно» ловила
+    # «что мне нужно ЗНАТЬ про X» → ложный task, R2 Codex high MAJOR.)
+    task_signal = _must_task(text) or _section_hint(text) is not None
+
+    clauses = _CONNECTORS_RE.split(norm)
+    connector_present = len(clauses) > 1
+
+    # Резолвинг клаузы: action-домен (глагол-действие) ВЫШЕ фразы и content; фраза — поверх голых корней.
+    # «Командность» клаузы выводится из ТОГО ЖЕ task-сигнала #197/#215 (_must_task ∪ _section_hint), НЕ из
+    # ручного списка глаголов (R4 Codex high/medium: список одновременно ловил инфинитив в теле напоминания
+    # «напомни ... и купить ...» → ложный compound, И пропускал «внеси/запланируй» → терял команду).
+    clause_info: list[tuple[str, bool]] = []  # (primary раздела клаузы, is_command)
+    suppressed: set[str] = set()
+    for ct in clauses:
+        matched = _match_domains(_WORD_RE2.findall(ct))
+        if not matched:
+            continue
+        action = sorted((d for d in matched if d in _ACTION_DOMAINS), key=_prio)
+        forced = next((dom for ph, dom in _PHRASES if ph in ct), None)
+        if action:
+            primary = action[0]
+        elif forced:
+            primary = forced
+        else:
+            primary = sorted(matched, key=lambda d: (_prio(d), -matched[d]))[0]
+        suppressed |= {d for d in matched if d != primary}
+        clause_info.append((primary, _must_task(ct) or _section_hint(ct) is not None))
+
+    if not clause_info:
+        return RouteResult(None, (), (), False, ("task" if task_signal else None),
+                           bool(task_signal), (), None, ())
+
+    # compound — ТОЛЬКО при ≥2 РАЗНЫХ клаузах-КОМАНДАХ (task-сигнал); хвост-список без сигнала — не команда.
+    command_doms: list[str] = []
+    for p, is_cmd in clause_info:
+        if is_cmd and p not in command_doms:
+            command_doms.append(p)
+    all_clause_doms: list[str] = []
+    for p, _ in clause_info:
+        if p not in all_clause_doms:
+            all_clause_doms.append(p)
+
+    if connector_present and len(command_doms) >= 2:
+        primary, secondary, compound = command_doms[0], tuple(command_doms[1:]), True
+        suppressed |= {d for d in all_clause_doms if d not in command_doms}
+    elif command_doms:  # ровно одна команда → ОНА primary (не ронять явную команду, даже если она не первая)
+        primary, secondary, compound = command_doms[0], (), False
+        suppressed |= {d for d in all_clause_doms if d != command_doms[0]}
+    else:
+        primary, secondary, compound = all_clause_doms[0], (), False
+        suppressed |= set(all_clause_doms[1:])
+
+    suppressed -= {primary, *secondary}
+    all_domains = (primary, *secondary)
+    active = tuple(sorted(d for d in all_domains if d in onto["lazy"]))
+    return RouteResult(primary, secondary, tuple(sorted(suppressed)), compound,
+                       ("task" if task_signal else None), False, active,
+                       _DIRECTIVE.get(primary), all_domains)
+
+
 def chat_fact_system_prompt(today_str: str) -> str:
     """Scoped системный промпт для chat/fact (Codex high R2): БЕЗ productivity-инструментов, honesty,
     анти-флейл, web-only. Не перечисляет reminders/tasks/lists — модель не пытается их звать."""
