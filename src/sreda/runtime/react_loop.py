@@ -2397,11 +2397,20 @@ async def handle_turn(
             # fail-open task). prev_intent + история — из снапа прошлого хода. fail-open в task — ТОЛЬКО здесь.
             _init: dict = {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
                            "active_families": base_fams, "guard_attempted_families": [],
+                           # R1 high (соседний баг того же класса): guard_full_attempted — last-value канал
+                           # «один раз за ХОД». Без сброса ход2 того же треда унаследует True → не получит
+                           # full-recovery (#202-страховка канон-интента мимо словаря). Сбрасываем.
+                           "guard_full_attempted": False,
                            "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False,
                            # #221 Ф3 (R1 CRITICAL): СБРОС каждый свежий ход — last-value каналы переживают
                            # invoke в одном треде; без сброса после execute-хода disabled/shadow фильтровали бы
                            # из чекпойнта (не byte-identical). execute ниже перезапишет.
-                           "router_allowed_read_domains": None, "router_allowed_write_domains": None}
+                           "router_allowed_read_domains": None, "router_allowed_write_domains": None,
+                           # #221 Ф3b-фикс: router_decision_json ТОЖЕ сбрасывать (как allowed_*). Иначе ход,
+                           # пропустивший доменный блок (intent=чат/факт), писал бы в трейс СТАРОЕ решение
+                           # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
+                           # не затрагивало (бинд по allowed_*, они сброшены), только колонка лога.
+                           "router_decision_json": None}
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)

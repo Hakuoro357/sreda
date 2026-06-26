@@ -155,6 +155,35 @@ async def test_guard_full_recovery_then_ends_on_out_of_scope(db_session):
 
 
 @pytest.mark.asyncio
+async def test_guard_full_attempted_reset_across_turns(db_session):
+    """R1 high (баг класса стейл-state): guard_full_attempted СБРАСЫВАЕТСЯ каждый свежий ход. Ход2 того же
+    треда, снова требующий full-recovery, получает его (не унаследовал True от хода1) — #202-страховка
+    работает многоходово, а не один раз на тред."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    # ход1: вне-скоуп → отказ → full-recovery → снова отказ (guard_full_attempted=True в чекпойнте треда)
+    stub1 = _RecordingStubLLM([
+        AIMessage(content="Извини, оплачивать счета я не умею."),
+        AIMessage(content="Извини, это я пока не умею."),
+        AIMessage(content="..."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="gfa-reset",
+        llm=stub1, user_text="оплати счёт за свет", inbound_message_id="gfa-1", channel="react")
+    assert len(stub1.binds) == 2, f"ход1: ожидался один full-recovery retry: {len(stub1.binds)}"
+    # ход2: ТОТ ЖЕ тред, снова вне-скоуп → должен СНОВА получить full-recovery (без сброса унаследовал бы True)
+    stub2 = _RecordingStubLLM([
+        AIMessage(content="Извини, бронировать столик я не умею."),
+        AIMessage(content="Извини, это я пока не умею."),
+        AIMessage(content="..."),
+    ])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="gfa-reset",
+        llm=stub2, user_text="забронируй столик в ресторане", inbound_message_id="gfa-2", channel="react")
+    assert len(stub2.binds) == 2, f"ход2 должен СНОВА получить full-recovery (сброс guard_full_attempted): {len(stub2.binds)}"
+
+
+@pytest.mark.asyncio
 async def test_repeat_write_after_need_family_no_duplicate(db_session):
     """Срез A пункт 3: повтор разрушающего действия в одном ходу (после добора семьи) НЕ
     задваивает — модель дважды зовёт add_shopping_items с тем же товаром → одна позиция."""
