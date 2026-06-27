@@ -354,6 +354,10 @@ async def _process_approved_turn_locked(
         # доступ/квоты/ошибки и инжектит расшифровку в message["text"]). Дальше
         # ведём как обычный текстовый react-ход. Зеркало MAX-пути
         # (_maybe_transcribe_max_voice до его гейта). Остальные тенанты не тронуты.
+        # #243: списана ли уже free-квота llm_turns в этом ходе? voice-ветка ниже
+        # спишет её внутри _maybe_transcribe_voice; чистый текст — нет (спишем в
+        # react-блоке). Флаг не даёт списать дважды на голосовом ходе.
+        _llm_quota_consumed = False
         if _voice_to_react_gate(
             message_type, is_new_user=onboarding.is_new_user,
             tenant_id=onboarding.tenant_id,
@@ -392,6 +396,7 @@ async def _process_approved_turn_locked(
                 return
             message["text"] = _vtext  # нормализованная расшифровка → react-ход
             message_type = "text"  # обычный react-гейт ниже
+            _llm_quota_consumed = True  # #243: _maybe_transcribe_voice уже списала llm_turns
 
         # #66 ГЕЙТ решаем ДО ack: для react-ходов индикатор «печатает» НЕ создаём
         # (react отвечает сам через send_message, мимо outbox — иначе ack завис бы
@@ -431,6 +436,46 @@ async def _process_approved_turn_locked(
             # новый LangGraph ReAct+interrupt-цикл (InMemory, single-process
             # поллер). Остальные тенанты/не-текст — прежним путём (нулевой регресс).
             if _use_react:
+                # #243: free-tier llm_turns квота на ТЕКСТ-пути (зеркало голосового
+                # telegram_bot._maybe_transcribe_voice). Без неё free-юзер шлёт текст
+                # без дневного лимита → cost-exhaustion. Голос уже списал
+                # (_llm_quota_consumed) → повторно не списываем. Превышение → UPGRADE_COPY
+                # + статус ignored + выход (паритет с voice-квота-путём; refund не нужен —
+                # списываем прямо перед ходом, голос LLM-ход тоже не рефандит).
+                if not _llm_quota_consumed:
+                    from sreda.services.entitlement_gate import EntitlementGate
+                    from sreda.services.upgrade_copy import UPGRADE_COPY
+                    from sreda.services.usage_ledger import (
+                        SREDA_FREE_LLM_DAILY,
+                        SREDA_FREE_LLM_MONTHLY,
+                        UsageLedgerService,
+                        msk_period_keys,
+                    )
+
+                    _eg = EntitlementGate(bg_session).check(onboarding.tenant_id)
+                    if _eg.plan_key == "sreda_free" and not _eg.is_grandfathered:
+                        _qdaily, _qmonthly = msk_period_keys()
+                        _qledger = UsageLedgerService(bg_session.get_bind())
+                        _qperiods = [
+                            ("daily", _qdaily, SREDA_FREE_LLM_DAILY),
+                            ("monthly", _qmonthly, SREDA_FREE_LLM_MONTHLY),
+                        ]
+                        if not _qledger.try_consume(
+                            onboarding.tenant_id, "llm_turns", 1, _qperiods
+                        ):
+                            try:
+                                await telegram_client.send_message(
+                                    chat_id=str(onboarding.chat_id),
+                                    text=UPGRADE_COPY["llm_daily_or_monthly"],
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                            if trace_ctx is not None:
+                                trace.emit_block(trace_ctx)
+                            _set_processing_status(
+                                bg_session, inbound_message_id, "ignored"
+                            )
+                            return
                 from sreda.runtime import react_loop
                 from sreda.services.llm import get_chat_llm
 
