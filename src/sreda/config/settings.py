@@ -453,6 +453,13 @@ class Settings(BaseSettings):
     react_compact_budget_chars: int = Field(
         default=0, validation_alias="SREDA_REACT_COMPACT_BUDGET_CHARS"
     )
+    # #247: кеш-дисциплина. OFF (дефолт) → section-hint #215 + guard-нудж дописываются в СИСТЕМНЫЙ промпт
+    # (нестабильный префикс каждый ход → ломается кеш большого префикса Mercury). ON → системный промпт
+    # СТАБИЛЕН, директивы уходят в ХВОСТ (отдельным сообщением после истории) → кеш-префикс не рушится,
+    # инструкция-следование даже лучше (свежесть). Дефолт OFF = byte-identical.
+    react_tail_directives_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_TAIL_DIRECTIVES"
+    )
     # #197: preflight intent-router. OFF (дефолт) → прежнее: один Фредди, полный набор инструментов
     # (byte-identical через effective_intent=None — даже при чекпойнте с intent=chat). ON → классификатор
     # намерения (task/chat/fact): task→Фредди+полный набор; chat/fact→deepseek+web-only+поиск≤1

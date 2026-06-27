@@ -57,7 +57,8 @@ class _Chat:
     ответов; пишет состав bound в bound_capture; считает вызовы в calls; raise_on_invoke → сбой invoke."""
 
     def __init__(self, label, *, classify="task", responses=None, bound_capture=None,
-                 calls=None, raise_on_invoke=False, sp_capture=None):
+                 calls=None, raise_on_invoke=False, sp_capture=None, msgs_capture=None,
+                 types_capture=None):
         self.label = label
         self._classify = classify
         self._responses = list(responses or [])
@@ -66,6 +67,8 @@ class _Chat:
         self._calls = calls if calls is not None else {}
         self._raise = raise_on_invoke
         self._spcap = sp_capture  # #215: захват system-промпта, что увидела модель
+        self._msgcap = msgs_capture  # #247: захват ВСЕХ сообщений (content) каждого вызова
+        self._typecap = types_capture  # #247 R2: захват РОЛЕЙ (типов сообщений) — защита от регресса роли хвоста
 
     async def ainvoke(self, _msgs):
         self._calls["classify_" + self.label] = self._calls.get("classify_" + self.label, 0) + 1
@@ -80,6 +83,10 @@ class _Chat:
             outer._calls["invoke_" + outer.label] = outer._calls.get("invoke_" + outer.label, 0) + 1
             if outer._spcap is not None and _msgs:
                 outer._spcap.append(getattr(_msgs[0], "content", ""))
+            if outer._msgcap is not None:
+                outer._msgcap.append([getattr(m, "content", "") for m in (_msgs or [])])
+            if outer._typecap is not None:
+                outer._typecap.append([type(m).__name__ for m in (_msgs or [])])
             if outer._raise:
                 raise RuntimeError("boom-" + outer.label)
             if outer._responses:
@@ -640,3 +647,64 @@ def test_domain_scope_execute_canary_wildcard(install, monkeypatch):
     _turn(freddie, thread="canary-wild", text="напомни купить молоко")
     bound = cap["freddie"][-1]
     assert "schedule_reminder" in bound and "add_task" not in bound  # execute драйвит (фильтр применён)
+
+
+# ───────────────────────── #247: кеш-дисциплина — директивы в ХВОСТ ─────────────────────────
+def test_tail_directives_off_section_in_system_prompt(install, monkeypatch):
+    """Флаг OFF (легаси): section-hint #215 дописан в СИСТЕМНЫЙ промпт (нестабильный префикс — как было)."""
+    from sreda.config import settings as sm
+    spcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], sp_capture=spcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.delenv("SREDA_REACT_TAIL_DIRECTIVES", raising=False)
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="td-off", text="покажи дела")
+    assert any(_HINT_CHECKLIST in (s or "") for s in spcap), "OFF: section должен быть в системном промпте"
+
+
+def test_tail_directives_on_stable_prefix_and_tail(install, monkeypatch):
+    """Флаг ON (#247): системный промпт СТАБИЛЕН (без section), директива section — в ХВОСТЕ (последнее сообщение).
+    Это и чинит кеш-префикс: начало запроса не меняется от текста пользователя."""
+    from sreda.config import settings as sm
+    msgcap, typecap = [], []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")],
+                    msgs_capture=msgcap, types_capture=typecap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="td-on", text="покажи дела")
+    first = msgcap[0]                                   # content всех сообщений 1-го вызова
+    assert _HINT_CHECKLIST not in (first[0] or ""), "ON: системный промпт (первое сообщение) должен быть БЕЗ section"
+    assert _HINT_CHECKLIST in (first[-1] or ""), "ON: section-директива должна быть в ХВОСТЕ (последнее сообщение)"
+    # R2 MINOR (оба Codex): хвост — РОЛЬ user (HumanMessage), не SystemMessage (защита от регресса роли)
+    assert typecap[0][-1] == "HumanMessage", f"ON: хвостовая директива должна быть ролью user, не {typecap[0][-1]}"
+
+
+def test_tail_directives_on_prefix_identical_across_sections(install, monkeypatch):
+    """Флаг ON: системный промпт (первое сообщение) БАЙТ-В-БАЙТ одинаков для РАЗНЫХ разделов — кеш-префикс стабилен."""
+    from sreda.config import settings as sm
+    cap1, cap2 = [], []
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(_Chat("f1", classify="task", responses=[AIMessage(content="ок")], msgs_capture=cap1),
+          thread="td-p1", text="покажи дела")              # → checklists-директива
+    _turn(_Chat("f2", classify="task", responses=[AIMessage(content="ок")], msgs_capture=cap2),
+          thread="td-p2", text="покажи задачи")            # → tasks-директива
+    assert cap1[0][0] == cap2[0][0], "ON: системный промпт должен быть идентичен независимо от раздела запроса"
+
+
+def test_tail_directives_on_nudge_in_tail(install, monkeypatch):
+    """#247 R1 (MINOR medium): guard-нудж тоже уходит в ХВОСТ — последнее сообщение 2-го прохода
+    (после refusal → guard-recovery) содержит нудж."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task",
+                    responses=[AIMessage(content="не умею это"), AIMessage(content="готово")],
+                    msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="td-nudge", text="напомни купить молоко")
+    assert len(msgcap) >= 2, "ожидался 2-й проход после guard-recovery"
+    assert "выполни запрос" in (msgcap[1][-1] or ""), "guard-нудж должен быть в хвосте 2-го прохода (роль user)"

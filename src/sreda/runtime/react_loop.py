@@ -971,6 +971,13 @@ def _is_domain_execute_tenant(tenant_id: str) -> bool:
     return tenant_id in get_settings().react_domain_scope_execute_tenants
 
 
+def _tail_directives_enabled() -> bool:
+    """#247: динамические директивы (section-hint #215 + guard-нудж) — в ХВОСТ, а не в системный промпт.
+    OFF (дефолт) → легаси (дописываем в sp). ON → системный промпт стабилен (кеш-префикс цел)."""
+    from sreda.config.settings import get_settings
+    return bool(getattr(get_settings(), "react_tail_directives_enabled", False))
+
+
 def _looks_like_refusal(content: Any) -> bool:
     t = (content if isinstance(content, str) else str(content or "")).lower()
     return any(m in t for m in _REFUSAL_MARKERS)
@@ -1670,22 +1677,42 @@ def _build_graph(llm: Any, all_tools: list, *,
                 state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = system_prompt
             nudge = state.get("guard_nudge")
-            if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
-                sp = f"{sp}\n\n{nudge}"
             # #215: детерминированная карта «слово→раздел». Фредди (быстрая модель) сам путал «покажи
             # дела» → list_reminders. Ловим слово-раздел ПО КОДУ (не доверяем промпту, урок #180) и
             # вставляем жёсткую директиву (какой list_* звать) на ЭТОТ проход. ТОЛЬКО при eff=="task"
             # (preflight ВКЛ + task-интент) — НЕ на OFF (eff=None): иначе OFF-промпт менялся бы на «покажи
-            # дела» и ломал byte-identical rollback (code-review R1 MAJOR, оба Codex). Порядок: sp→nudge→section.
+            # дела» и ломал byte-identical rollback (code-review R1 MAJOR, оба Codex).
+            _sec = None
             if eff == "task":
                 from sreda.runtime.react_preflight import _section_hint
                 _sec = _section_hint(_last_human_text(state["messages"]))
+            # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
+            # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
+            # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
+            if _tail_directives_enabled():
+                _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
+                                          budget=_compact_budget())
+                _tail = [d for d in (nudge, _sec) if d]
+                if _tail:
+                    _directive = "\n\n".join(_tail)
+                    # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
+                    # (Mercury/Оса) принимают user в конце ВСЕГДА; трейлинг system после истории/tool —
+                    # непроверенный контракт. Приклеиваем к последнему user-сообщению (без двойного user);
+                    # иначе (хвост = tool/assistant, напр. guard-нудж после refusal) — отдельным user.
+                    if _msgs and isinstance(_msgs[-1], HumanMessage):
+                        _msgs = [*_msgs[:-1],
+                                 HumanMessage(content=f"{_msgs[-1].content}\n\n{_directive}")]
+                    else:
+                        _msgs = [*_msgs, HumanMessage(content=_directive)]
+            else:
+                if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
+                    sp = f"{sp}\n\n{nudge}"
                 if _sec:
                     sp = f"{sp}\n\n{_sec}"
-            # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
-            # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
-            _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
-                                      budget=_compact_budget())
+                # #194: компакция истории как prompt-view. OFF → [SystemMessage(sp), *messages] (как было).
+                # Канон state["messages"] не мутируется.
+                _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
+                                          budget=_compact_budget())
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
