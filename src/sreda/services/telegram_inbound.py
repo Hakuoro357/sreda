@@ -122,6 +122,56 @@ async def _delete_ack_after_reply(
         logger.debug("ack delete crashed", exc_info=True)
 
 
+# #252: первый ак — «Минутку…» (был «Секунду…»; ход часто длиннее секунды).
+_ACK_INITIAL_TEXT = "Минутку…"
+
+
+async def _send_initial_ack(client: TelegramClient, chat_id: str) -> int | None:
+    """#252: шлёт начальный ак «Минутку…», возвращает message_id (None при сбое).
+    Для ГОЛОСА вызывается ДО расшифровки (мгновенный отклик, как в старом механизме);
+    для текста — в react-блоке. Сбой ак не критичен."""
+    try:
+        _ack = await client.send_message(chat_id=str(chat_id), text=_ACK_INITIAL_TEXT)
+        return (_ack or {}).get("result", {}).get("message_id")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _drive_ack_progress(
+    client: TelegramClient,
+    chat_id: str,
+    ack_message_id: int,
+    *,
+    step_seconds: float = 9.0,
+    max_random_edits: int = 2,
+) -> None:
+    """#252: временной драйвер поэтапного ак. Пока идёт ход — каждые ~step сек правит ак
+    СЛУЧАЙНОЙ фразой прогресса (пул `_PROGRESS_PHRASES`); после `max_random_edits` правок
+    ставит «Почти готово» (`FINAL_PROGRESS_TEXT`) и завершается — терминал держится до
+    ответа. Сбой правки best-effort (не валит ход). Драйвер живёт ТОЛЬКО на время хода —
+    снимается `cancel()` при возврате `handle_turn`. Временной (не по-итерациям): при
+    зависшем LLM-вызове юзер всё равно видит, что Среда работает."""
+    from sreda.services.ack_messages import FINAL_PROGRESS_TEXT, pick_progress_ack
+
+    _prev: str | None = None
+    for _i in range(max_random_edits + 1):
+        await asyncio.sleep(step_seconds)
+        _text = (
+            FINAL_PROGRESS_TEXT
+            if _i >= max_random_edits
+            else pick_progress_ack(previous=_prev)
+        )
+        _prev = _text
+        try:
+            await client.edit_message_text(
+                chat_id=str(chat_id), message_id=ack_message_id, text=_text,
+            )
+        except Exception:  # noqa: BLE001 — правка ак best-effort
+            pass
+        if _text == FINAL_PROGRESS_TEXT:
+            return  # «Почти готово» — терминал, дальше ждём ответ молча
+
+
 def _set_processing_status(
     session: Session, inbound_message_id: str, new_status: str,
 ) -> None:
@@ -223,6 +273,9 @@ async def _process_approved_turn_locked(
 
     from sreda.services.tenant_lifecycle import tenant_advisory_lock
     _barrier = ExitStack()
+    # #252: ранний голосовой ак — объявляем ДО outer-try, чтобы outer-finally-ловушка
+    # (ниже) не упала на UnboundLocalError, если ход бросит до его установки.
+    _early_ack_mid: int | None = None
     try:
         # #187 R2 MAJOR: enter_context ВНУТРИ try (зеркало MAX
         # ``_process_approved_turn``) — если захват advisory-лока бросит,
@@ -358,11 +411,15 @@ async def _process_approved_turn_locked(
         # спишет её внутри _maybe_transcribe_voice; чистый текст — нет (спишем в
         # react-блоке). Флаг не даёт списать дважды на голосовом ходе.
         _llm_quota_consumed = False
+        # #252: для голоса начальный ак шлём ДО расшифровки (мгновенный отклик); этот
+        # message_id переиспользует react-блок (правка по этапам + финал в ответ).
         if _voice_to_react_gate(
             message_type, is_new_user=onboarding.is_new_user,
             tenant_id=onboarding.tenant_id,
             enabled_tenants=get_settings().react_loop_enabled_tenants,
         ):
+            # #252: ак СРАЗУ (до STT) — раньше приходил только после расшифровки.
+            _early_ack_mid = await _send_initial_ack(telegram_client, onboarding.chat_id)
             from sreda.services.telegram_bot import _maybe_transcribe_voice
             payload = await _maybe_transcribe_voice(
                 payload, session=bg_session,
@@ -370,6 +427,11 @@ async def _process_approved_turn_locked(
             )
             if payload is None:
                 # доступ/квота/STT-ошибка уже сообщены пользователю — ход завершён.
+                # #252: убираем ранний «Минутку…» (его сообщение об ошибке уже отдало).
+                if _early_ack_mid is not None:
+                    await _delete_ack_after_reply(
+                        telegram_client, str(onboarding.chat_id), _early_ack_mid)
+                    _early_ack_mid = None  # обработан → finally-ловушка не тронет
                 # Эмитим trace ДО выхода (voice.download/transcribe уже записаны) —
                 # иначе срез голосовых отказов теряет диагностику (R1 MAJOR Codex+
                 # субагент). Статус ignored — паритет с MAX-путём (max_inbound) для
@@ -383,13 +445,28 @@ async def _process_approved_turn_locked(
             if _vtext is None:
                 # пустая/пробельная расшифровка: НЕ уводим в старый путь (квота уже
                 # списана), мягко просим повторить и завершаем ход.
-                try:
-                    await telegram_client.send_message(
-                        chat_id=str(onboarding.chat_id),
-                        text="Не расслышала, повтори, пожалуйста.",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("empty-voice reply failed: %s", type(exc).__name__)
+                # #252: переиспользуем ранний ак — правим «Минутку…» в текст просьбы
+                # (без лишнего мелькания), при отсутствии ак — шлём новое.
+                _retry_text = "Не расслышала, повтори, пожалуйста."
+                _retry_done = False
+                if _early_ack_mid is not None:
+                    try:
+                        await telegram_client.edit_message_text(
+                            chat_id=str(onboarding.chat_id),
+                            message_id=_early_ack_mid, text=_retry_text,
+                        )
+                        _early_ack_mid = None  # ак стал retry-сообщением
+                        _retry_done = True
+                    except Exception:  # noqa: BLE001 — edit упал → шлём новым (ак чистит finally)
+                        pass
+                if not _retry_done:
+                    # ак не было ИЛИ edit упал — гарантируем доставку retry новым сообщением
+                    try:
+                        await telegram_client.send_message(
+                            chat_id=str(onboarding.chat_id), text=_retry_text,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("empty-voice reply failed: %s", type(exc).__name__)
                 if trace_ctx is not None:
                     trace.emit_block(trace_ctx)
                 _set_processing_status(bg_session, inbound_message_id, "processed")
@@ -482,29 +559,49 @@ async def _process_approved_turn_locked(
                 _s = get_settings()
                 _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
                 _llm = get_chat_llm(provider=_prov, settings=_s)
-                # ack v3: шлём «Секунду…» и редактируем ЕГО в финальный ответ
-                # (одно сообщение, как раньше; напрямую через editMessageText, без
-                # outbox → не зависнет). Любой сбой ack — не критичен.
-                _ack_mid = None
-                try:
-                    _ack = await telegram_client.send_message(
-                        chat_id=str(onboarding.chat_id), text="Секунду…",
+                # ack v3 + #252: «Минутку…» (для голоса уже послан до расшифровки —
+                # переиспользуем _early_ack_mid), правим его ПО ЭТАПАМ пока идёт ход
+                # (_drive_ack_progress), в конце редактируем в финальный ответ (одно
+                # сообщение, напрямую через editMessageText, без outbox → не зависнет).
+                # Любой сбой ак — не критичен.
+                _ack_mid = _early_ack_mid
+                _early_ack_mid = None  # #252: передан react-блоку (его финал/сбой чистит _ack_mid)
+                if _ack_mid is None:
+                    _ack_mid = await _send_initial_ack(
+                        telegram_client, onboarding.chat_id)
+                _progress_task = (
+                    asyncio.create_task(
+                        _drive_ack_progress(
+                            telegram_client, str(onboarding.chat_id), _ack_mid,
+                        ),
+                        name="ack_progress_react",
                     )
-                    _ack_mid = (_ack or {}).get("result", {}).get("message_id")
-                except Exception:  # noqa: BLE001
-                    _ack_mid = None
-                _reply = await react_loop.handle_turn(
-                    session=bg_session,
-                    tenant_id=onboarding.tenant_id,
-                    user_id=onboarding.user_id,
-                    thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
-                    llm=_llm,
-                    user_text=_react_text,
-                    inbound_message_id=inbound_message_id,
-                    channel="telegram",
-                    provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
-                    fallback_llm=react_loop.react_fallback_llm(_prov),  # #184 Оса-fallback
+                    if _ack_mid is not None else None
                 )
+                try:
+                    _reply = await react_loop.handle_turn(
+                        session=bg_session,
+                        tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
+                        llm=_llm,
+                        user_text=_react_text,
+                        inbound_message_id=inbound_message_id,
+                        channel="telegram",
+                        provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
+                        fallback_llm=react_loop.react_fallback_llm(_prov),  # #184 Оса-fallback
+                    )
+                finally:
+                    # #252: снимаем прогресс-драйвер ДО финальной правки ак (нет гонки
+                    # за editMessageText). cancel даже на исключении хода.
+                    if _progress_task is not None:
+                        _progress_task.cancel()
+                        try:
+                            await _progress_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:  # noqa: BLE001
+                            pass
                 trace.record("react_loop.replied", chars=len(_reply or ""))
                 # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id
                 # КОНКРЕТНОЙ паузы в callback_data (текст «да/нет» тоже работает — кнопки добавка).
@@ -524,7 +621,7 @@ async def _process_approved_turn_locked(
                     except Exception:  # noqa: BLE001
                         _edited = False
                 if not _edited:
-                    # сбой edit → убираем «Секунду…», чтобы не висело + не дублировалось
+                    # сбой edit → убираем ак-сообщение, чтобы не висело + не дублировалось
                     if _ack_mid is not None:
                         try:
                             await telegram_client.delete_message(
@@ -598,6 +695,16 @@ async def _process_approved_turn_locked(
     except Exception:  # noqa: BLE001
         logger.exception("background turn processing crashed")
     finally:
+        # #252: ловушка утечки раннего голосового ак — outer-finally ловит ЛЮБОЙ выход,
+        # включая исключение в голосовой ветке/inner-try ДО передачи ак (None/edit/reuse
+        # обнуляют _early_ack_mid). «Минутку…» не должно висеть. Best-effort — не
+        # маскируем исходную ошибку.
+        if _early_ack_mid is not None and onboarding.chat_id is not None:
+            try:
+                await _delete_ack_after_reply(
+                    telegram_client, str(onboarding.chat_id), _early_ack_mid)
+            except Exception:  # noqa: BLE001
+                pass
         # #187 Phase 2b: отпустить advisory-lock ДО close() сессии. Лок session-
         # scoped — закрытие соединения тоже снимет его, но явный unlock держит
         # симметрию с soft_delete_tenant и не зависит от порядка GC.
