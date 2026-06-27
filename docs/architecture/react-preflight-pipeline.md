@@ -1,9 +1,11 @@
 # Preflight-конвейер ReAct (интент + домены)
 
 **Owner:** эпик #191 — harness-обвязка ReAct; интент — #197, домены — #215/#221
-**Source code:** `src/sreda/runtime/react_preflight.py` (классификаторы и роутер), потребление в `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph`)
+**Source code:** `src/sreda/runtime/react_preflight.py` (классификаторы и роутер — отслеживается на актуальность)
+**Related code:** `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph` — потребление; меняется по многим причинам, freshness НЕ трекаем)
 **Tests:** `tests/unit/` — калибровка `_must_task` (`test_must_task_high_precision`), классификаторы интента/доменов, политика `compute_allowed_domains`
 **Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально
+**Verified-against:** `75f9ab8` (сверено с кодом 2026-06-27)
 **Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek`; на проде по #224 переведён на `gemini-2.5-flash-lite` ради скорости)
 
 ## Зачем это существует
