@@ -344,6 +344,12 @@ async def _process_approved_turn_locked(
                             chat_id=str(onboarding.chat_id), text=_reply2, reply_markup=_kb2)
                     except Exception:  # noqa: BLE001
                         pass
+                # #232 шаг B: выжимка истории — DETACHED после доставки resume-ответа (не на новой паузе)
+                if not getattr(_reply2, "awaiting_confirm", False):
+                    _create_task(react_loop.run_post_turn_summary(
+                        tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
+                        channel="telegram", provider_key=_prov2))
             if trace_ctx is not None:
                 trace.emit_block(trace_ctx)
             _set_processing_status(bg_session, inbound_message_id, "processed")
@@ -490,6 +496,13 @@ async def _process_approved_turn_locked(
                     await telegram_client.send_message(
                         chat_id=str(onboarding.chat_id), text=_reply, reply_markup=_kb,
                     )
+                # #232 шаг B: выжимка истории — DETACHED после доставки (своя сессия в фасаде, вне
+                # bg_session/advisory-lock); только финальный ответ (не confirm-пауза). Best-effort.
+                if not getattr(_reply, "awaiting_confirm", False):
+                    _create_task(react_loop.run_post_turn_summary(
+                        tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
+                        channel="telegram", provider_key=_prov))
             else:
                 await handle_telegram_interaction(
                     bg_session,

@@ -1038,6 +1038,12 @@ async def _process_approved_max_turn(
                             )
                         except Exception:  # noqa: BLE001
                             logger.warning("max react confirm reply failed", exc_info=True)
+                        # #232 шаг B: выжимка истории — DETACHED после доставки resume-ответа (не на паузе)
+                        if not getattr(_reply_r, "awaiting_confirm", False):
+                            _create_task(react_loop.run_post_turn_summary(
+                                tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
+                                thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                                channel="max", provider_key=_prov_r))
                     # #166 B R3 (Codex medium MINOR): react-путь шлёт напрямую (минуя outbox,
                     # который обычно финализирует trace) → эмитим блок здесь явно
                     # (идемпотентно: _emitted-guard; НЕ в finally — там сломали бы
@@ -1247,6 +1253,12 @@ async def _process_approved_max_turn(
                             recipient={"chat_id": onboarding.max_chat_id},
                             text=_reply, attachments=_kb,
                         )
+                    # #232 шаг B: выжимка истории — DETACHED после доставки (своя сессия в фасаде); финальный ответ
+                    if not getattr(_reply, "awaiting_confirm", False):
+                        _create_task(react_loop.run_post_turn_summary(
+                            tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
+                            thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                            channel="max", provider_key=_prov))
                     # #166 B R3: react-путь шлёт напрямую (минуя outbox-финализацию trace) →
                     # эмитим блок явно (идемпотентно; закрывает пробел нормального react-пути).
                     _tc = trace.current()
