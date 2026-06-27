@@ -72,6 +72,8 @@ def test_route_spisok_pokupok_suppresses_checklists():
     assert r.primary_domain == "shopping"
     assert "checklists" in r.suppressed_domains
     assert r.compound_by_connector is False
+    # #250: у shopping директивы НЕТ → chat-узел не подмешает checklists-подсказку на «список покупок»
+    assert r.directive is None
 
 
 def test_route_spisok_kino_is_checklists_not_shopping():

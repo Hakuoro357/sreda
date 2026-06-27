@@ -708,3 +708,81 @@ def test_tail_directives_on_nudge_in_tail(install, monkeypatch):
     _turn(freddie, thread="td-nudge", text="напомни купить молоко")
     assert len(msgcap) >= 2, "ожидался 2-й проход после guard-recovery"
     assert "выполни запрос" in (msgcap[1][-1] or ""), "guard-нудж должен быть в хвосте 2-го прохода (роль user)"
+
+
+# ───────────────────────── #250: section-директива из РОУТЕРА на execute ─────────────────────────
+def _exec_env(monkeypatch):
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+
+
+def test_250_execute_router_directive_no_checklist_conflict(install, monkeypatch):
+    """#250: на execute директива берётся из РОУТЕРА. «Покажи список покупок» → shopping → директивы НЕТ →
+    в сообщениях НЕТ checklists-подсказки (раньше сырой _section_hint давал checklists на слове «список»)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    _exec_env(monkeypatch); sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-shop", text="Покажи список покупок")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST not in allmsgs, "#250: на execute «список покупок» НЕ должно быть checklists-директивы"
+
+
+def test_250_execute_checklists_directive_kept(install, monkeypatch):
+    """#250: «покажи дела» на execute → роутер checklists → директива checklists ОСТАЁТСЯ (полезный кейс не сломан)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    _exec_env(monkeypatch); sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-del", text="покажи дела")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST in allmsgs, "#250: «покажи дела» должно сохранить checklists-директиву (роутер checklists)"
+
+
+def test_250_disabled_keeps_legacy_section_hint(install, monkeypatch):
+    """#250: на disabled (роутер не сужает) — легаси _section_hint цел («список покупок»→checklists как было)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.delenv("SREDA_REACT_DOMAIN_SCOPE_MODE", raising=False)  # disabled
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-dis", text="Покажи список покупок")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST in allmsgs, "#250 disabled: легаси _section_hint должен остаться (checklists на «список»)"
+
+
+def test_250_execute_guard_2pass_no_checklist(install, monkeypatch):
+    """#250 R1 (MINOR medium): фикс держится и на guard-2-проходе. execute «список покупок» + отказ → guard →
+    НИ на одном из проходов нет checklists-директивы (router_allowed жив, _last_human_text исходный)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task",
+                    responses=[AIMessage(content="не умею это"), AIMessage(content="готово")],
+                    msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    _exec_env(monkeypatch); sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-guard", text="Покажи список покупок")
+    assert len(msgcap) >= 2, "ожидался 2-й проход после guard"
+    for i, p in enumerate(msgcap):
+        assert _HINT_CHECKLIST not in " ".join(p), f"#250: checklists-директива не должна появляться (проход {i})"
+
+
+def test_250_shadow_keeps_legacy_section_hint(install, monkeypatch):
+    """#250 R1 (MINOR high): в shadow router_allowed=None → легаси _section_hint цел («список покупок»→checklists)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "shadow")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-shadow", text="Покажи список покупок")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST in allmsgs, "#250 shadow: легаси _section_hint должен остаться (checklists на «список»)"

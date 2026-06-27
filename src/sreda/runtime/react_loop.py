@@ -1733,10 +1733,24 @@ def _build_graph(llm: Any, all_tools: list, *,
             # вставляем жёсткую директиву (какой list_* звать) на ЭТОТ проход. ТОЛЬКО при eff=="task"
             # (preflight ВКЛ + task-интент) — НЕ на OFF (eff=None): иначе OFF-промпт менялся бы на «покажи
             # дела» и ломал byte-identical rollback (code-review R1 MAJOR, оба Codex).
+            # #250: на ВКЛЮЧЁННОМ роутере (execute, router_allowed_* выставлен) брать БЕСКОНФЛИКТНУЮ директиву
+            # РОУТЕРА (единый авторитет: «список покупок»→shopping→директивы нет), а НЕ сырой _section_hint —
+            # тот на слове «список» даёт checklists даже для «список покупок» → конфликт со скоупом (list_checklists
+            # срезан) → бот показывал ДЕЛА вместо покупок и упирался в лимит. На disabled/shadow роутер инструменты
+            # не сужает → легаси _section_hint (единственный механизм; не регрессим). _section_hint жив как
+            # детектор командности внутри route_domains — его НЕ трогаем.
+            # NB (R1 субагент): директива — ТОЛЬКО из детерминированного route_domains; на LLM-фолбэке (нет
+            # детерм. домена → classify_domains дал скоуп) directive=None by design (строго безопаснее: не
+            # подмешиваем подсказку мимо LLM-выбранного скоупа). Потенц. follow-up — директива по classified.
             _sec = None
             if eff == "task":
-                from sreda.runtime.react_preflight import _section_hint
-                _sec = _section_hint(_last_human_text(state["messages"]))
+                _text = _last_human_text(state["messages"])
+                if state.get("router_allowed_read_domains") is not None:
+                    from sreda.runtime.react_preflight import route_domains
+                    _sec = route_domains(_text).directive
+                else:
+                    from sreda.runtime.react_preflight import _section_hint
+                    _sec = _section_hint(_text)
             # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
             # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
             # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
