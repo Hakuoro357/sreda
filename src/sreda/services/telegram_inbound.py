@@ -273,6 +273,9 @@ async def _process_approved_turn_locked(
 
     from sreda.services.tenant_lifecycle import tenant_advisory_lock
     _barrier = ExitStack()
+    # #252: ранний голосовой ак — объявляем ДО outer-try, чтобы outer-finally-ловушка
+    # (ниже) не упала на UnboundLocalError, если ход бросит до его установки.
+    _early_ack_mid: int | None = None
     try:
         # #187 R2 MAJOR: enter_context ВНУТРИ try (зеркало MAX
         # ``_process_approved_turn``) — если захват advisory-лока бросит,
@@ -410,7 +413,6 @@ async def _process_approved_turn_locked(
         _llm_quota_consumed = False
         # #252: для голоса начальный ак шлём ДО расшифровки (мгновенный отклик); этот
         # message_id переиспользует react-блок (правка по этапам + финал в ответ).
-        _early_ack_mid: int | None = None
         if _voice_to_react_gate(
             message_type, is_new_user=onboarding.is_new_user,
             tenant_id=onboarding.tenant_id,
@@ -429,6 +431,7 @@ async def _process_approved_turn_locked(
                 if _early_ack_mid is not None:
                     await _delete_ack_after_reply(
                         telegram_client, str(onboarding.chat_id), _early_ack_mid)
+                    _early_ack_mid = None  # обработан → finally-ловушка не тронет
                 # Эмитим trace ДО выхода (voice.download/transcribe уже записаны) —
                 # иначе срез голосовых отказов теряет диагностику (R1 MAJOR Codex+
                 # субагент). Статус ignored — паритет с MAX-путём (max_inbound) для
@@ -445,18 +448,25 @@ async def _process_approved_turn_locked(
                 # #252: переиспользуем ранний ак — правим «Минутку…» в текст просьбы
                 # (без лишнего мелькания), при отсутствии ак — шлём новое.
                 _retry_text = "Не расслышала, повтори, пожалуйста."
-                try:
-                    if _early_ack_mid is not None:
+                _retry_done = False
+                if _early_ack_mid is not None:
+                    try:
                         await telegram_client.edit_message_text(
                             chat_id=str(onboarding.chat_id),
                             message_id=_early_ack_mid, text=_retry_text,
                         )
-                    else:
+                        _early_ack_mid = None  # ак стал retry-сообщением
+                        _retry_done = True
+                    except Exception:  # noqa: BLE001 — edit упал → шлём новым (ак чистит finally)
+                        pass
+                if not _retry_done:
+                    # ак не было ИЛИ edit упал — гарантируем доставку retry новым сообщением
+                    try:
                         await telegram_client.send_message(
                             chat_id=str(onboarding.chat_id), text=_retry_text,
                         )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("empty-voice reply failed: %s", type(exc).__name__)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("empty-voice reply failed: %s", type(exc).__name__)
                 if trace_ctx is not None:
                     trace.emit_block(trace_ctx)
                 _set_processing_status(bg_session, inbound_message_id, "processed")
@@ -555,6 +565,7 @@ async def _process_approved_turn_locked(
                 # сообщение, напрямую через editMessageText, без outbox → не зависнет).
                 # Любой сбой ак — не критичен.
                 _ack_mid = _early_ack_mid
+                _early_ack_mid = None  # #252: передан react-блоку (его финал/сбой чистит _ack_mid)
                 if _ack_mid is None:
                     _ack_mid = await _send_initial_ack(
                         telegram_client, onboarding.chat_id)
@@ -684,6 +695,16 @@ async def _process_approved_turn_locked(
     except Exception:  # noqa: BLE001
         logger.exception("background turn processing crashed")
     finally:
+        # #252: ловушка утечки раннего голосового ак — outer-finally ловит ЛЮБОЙ выход,
+        # включая исключение в голосовой ветке/inner-try ДО передачи ак (None/edit/reuse
+        # обнуляют _early_ack_mid). «Минутку…» не должно висеть. Best-effort — не
+        # маскируем исходную ошибку.
+        if _early_ack_mid is not None and onboarding.chat_id is not None:
+            try:
+                await _delete_ack_after_reply(
+                    telegram_client, str(onboarding.chat_id), _early_ack_mid)
+            except Exception:  # noqa: BLE001
+                pass
         # #187 Phase 2b: отпустить advisory-lock ДО close() сессии. Лок session-
         # scoped — закрытие соединения тоже снимет его, но явный unlock держит
         # симметрию с soft_delete_tenant и не зависит от порядка GC.
