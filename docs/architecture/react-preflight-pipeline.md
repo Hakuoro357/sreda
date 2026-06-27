@@ -1,9 +1,11 @@
 # Preflight-конвейер ReAct (интент + домены)
 
 **Owner:** эпик #191 — harness-обвязка ReAct; интент — #197, домены — #215/#221
-**Source code:** `src/sreda/runtime/react_preflight.py` (классификаторы и роутер), потребление в `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph`)
+**Source code:** `src/sreda/runtime/react_preflight.py` (классификаторы и роутер — отслеживается на актуальность)
+**Related code:** `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph` — потребление; меняется по многим причинам, freshness НЕ трекаем)
 **Tests:** `tests/unit/` — калибровка `_must_task` (`test_must_task_high_precision`), классификаторы интента/доменов, политика `compute_allowed_domains`
 **Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально
+**Verified-against:** `f98e4e0` (сверено с кодом 2026-06-27; #251 — persona в chat/fact)
 **Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek`; на проде по #224 переведён на `gemini-2.5-flash-lite` ради скорости)
 
 ## Зачем это существует
@@ -61,7 +63,7 @@ flowchart TD
 
 Граф строится ОДИН раз с обеими моделями; узел выбирает по `effective_intent` из state.
 
-- **`chat` / `fact`** → рассуждающая модель (`SREDA_REACT_PREFLIGHT_CHAT_PROVIDER`) + **только web-семья** `_WEB_ONLY_TOOL_NAMES = {web_search, fetch_url, get_weather}` + промпт `chat_fact_system_prompt` (honesty, анти-флейл, без productivity-инструментов). Инвариант: web-only scope зашит ДО `try`; при сбое рассуждающей модели → fallback на Фредди с **тем же web-only**, НЕ на task.
+- **`chat` / `fact`** → рассуждающая модель (`SREDA_REACT_PREFLIGHT_CHAT_PROVIDER`) + **только web-семья** `_WEB_ONLY_TOOL_NAMES = {web_search, fetch_url, get_weather}` + промпт `chat_fact_system_prompt` (honesty, анти-флейл, без productivity-инструментов; несёт ЛИЧНОСТЬ Среды — женский род, живой тон «не справка», + слот `persona_overlay`, #242/#121). Инвариант: web-only scope зашит ДО `try`; при сбое рассуждающей модели → fallback на Фредди с **тем же web-only**, НЕ на task.
 - **`task`** (или флаг OFF) → Фредди (быстрый) + полный набор инструментов.
 
 Лимит «1 поиск на ход» в chat/fact обязателен — он делает флейл-петлю поиска невозможной (исходный инцидент 2026-06-23 был циклом поиска ×5+).

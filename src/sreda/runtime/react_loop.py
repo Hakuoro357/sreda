@@ -1620,6 +1620,25 @@ def _record_react_usage(*, bind: Any, tenant_id: str, provider_key: str, model: 
         logger.warning("react_loop: usage record failed", exc_info=True)
 
 
+def _persona_overlay_for(session: Any, tenant_id: str, user_id: str) -> str:
+    """persona-preset (warm_practical/tender_care) юзера → overlay-текст стиля для
+    промта. Fail-open: нет сессии/ошибка → "" (базовый характер). #242 (task-путь) /
+    #250 (chat/fact-путь) считают этим ОДНИМ helper'ом — один источник, один формат."""
+    if session is None:
+        return ""
+    try:
+        from sreda.services.housewife_persona import (
+            build_persona_overlay,
+            get_persona_preset,
+        )
+        return build_persona_overlay(
+            get_persona_preset(session, tenant_id=tenant_id, user_id=user_id)
+        )
+    except Exception:  # noqa: BLE001 — персона не валит ход; дефолт = базовый характер
+        logger.warning("react_loop: persona overlay failed (fail-open to base)", exc_info=True)
+        return ""
+
+
 def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str,
                  session: Any = None, provider_key: str = "",
@@ -1628,6 +1647,9 @@ def _build_graph(llm: Any, all_tools: list, *,
                  # выбирает по effective_intent. deepseek_llm=None (OFF/мисконфиг) → chat/fact на Фредди+web-only.
                  deepseek_llm: Any = None, chat_prompt: str = "",
                  deepseek_provider_key: str = "", preflight_enabled: bool = False,
+                 # #242/#250: предрасчитанный overlay стиля (handle_turn считает ОДИН раз на ход
+                 # для task+chat промтов). None → посчитать здесь самим (прямой вызов/тест).
+                 persona_overlay: str | None = None,
                  channel: str = "", thread_id: str = ""):  # #163 Фаза 3d: провенанс react-аудита в ctx
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
     ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
@@ -1636,20 +1658,12 @@ def _build_graph(llm: Any, all_tools: list, *,
     #175: session (для bind изолированной accounting-сессии) + provider_key (планировщика) —
     chat-узел пишет usage каждого вызова LLM в skill_ai_executions (деньги/#150)."""
     # #242: persona-preset (warm_practical/tender_care) из профиля юзера → overlay в промт,
-    # чтобы выбор стиля в онбординге снова влиял на тон. Fail-open: нет сессии/ошибка → база.
-    _persona_overlay = ""
-    if session is not None:
-        try:
-            from sreda.services.housewife_persona import (
-                build_persona_overlay,
-                get_persona_preset,
-            )
-            _persona_overlay = build_persona_overlay(
-                get_persona_preset(session, tenant_id=tenant_id, user_id=user_id)
-            )
-        except Exception:  # noqa: BLE001 — персона не валит ход; дефолт = базовый характер
-            logger.warning("react_loop: persona overlay failed (fail-open to base)", exc_info=True)
-            _persona_overlay = ""
+    # чтобы выбор стиля в онбординге снова влиял на тон. Предрасчёт из handle_turn (#250 —
+    # тот же overlay идёт и в chat/fact-промт); None → считаем сами (back-compat/тест).
+    _persona_overlay = (
+        persona_overlay if persona_overlay is not None
+        else _persona_overlay_for(session, tenant_id, user_id)
+    )
     system_prompt = _system_prompt(today_str, persona_overlay=_persona_overlay)
     # #175: каноничное имя модели — ТЕМ ЖЕ резолвером, что legacy #151 (planner/llm), чтобы
     # ключ (provider_key, model) совпал с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
@@ -2389,6 +2403,9 @@ async def handle_turn(
         # #197: preflight — рассуждающую модель для chat/fact строим ОДИН раз (дёшево, без сети). Мисконфиг
         # (нет ключа/неизвестный провайдер) → None → chat/fact пойдёт на Фредди+web-only (НЕ task). Сбой
         # setup → OFF на этот ход (как будто preflight выключен) — ход не падает.
+        # #250: persona overlay (стиль) считаем ОДИН раз на ход — нужен и task-промту
+        # (_system_prompt через _build_graph), и chat/fact-промту (болтовня тоже живая).
+        _persona_overlay = _persona_overlay_for(session, tenant_id, user_id)
         _preflight = False
         _deepseek_llm = None
         _chat_prompt = ""
@@ -2408,7 +2425,7 @@ async def handle_turn(
             try:
                 from sreda.runtime.react_preflight import chat_fact_system_prompt
                 from sreda.services.llm import get_chat_llm
-                _chat_prompt = chat_fact_system_prompt(today_str)
+                _chat_prompt = chat_fact_system_prompt(today_str, persona_overlay=_persona_overlay)
                 if _deepseek_pk:
                     _deepseek_llm = get_chat_llm(provider=_deepseek_pk)  # None при мисконфиге
             except Exception:  # noqa: BLE001 — сбой build → deepseek None, preflight НЕ выключаем
@@ -2422,6 +2439,7 @@ async def handle_turn(
             fallback_llm=fallback_llm,  # #184: Оса-fallback
             deepseek_llm=_deepseek_llm, chat_prompt=_chat_prompt,  # #197 state-driven селектор
             deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight,
+            persona_overlay=_persona_overlay,  # #250: тот же overlay, что у chat-промта (1 чтение/ход)
             channel=channel, thread_id=base)  # #163 Фаза 3d: провенанс react-аудита
 
         snap = await graph.aget_state(_cfg(gen))

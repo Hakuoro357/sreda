@@ -60,3 +60,29 @@ def test_react_system_prompt_threads_persona_overlay_in_tail() -> None:
     assert "<style_preset>" in tc and "tender_care" in tc
     assert tc.index("</rules>") < tc.index("<style_preset>") < tc.index("<context>")
     assert base.rindex("<context>") > base.rindex("</rules>")  # today в хвосте
+
+
+def test_chat_fact_prompt_carries_persona_gender_and_overlay() -> None:
+    # #250: chat/fact-промт (болтовня) несёт ЛИЧНОСТЬ Среды — само-определение,
+    # женский род, тон — И overlay стиля. Иначе в болтовне Среда сухая и без рода.
+    from sreda.runtime.react_preflight import chat_fact_system_prompt
+    from sreda.services.housewife_persona import build_persona_overlay
+
+    today = "2026-06-27 (суббота)"
+    base = chat_fact_system_prompt(today)
+    assert "ОНА" in base and "-ла/-лась" in base            # о себе женский род
+    assert "близкий человек семьи" in base                  # не справочное бюро
+    assert today in base
+    assert "web_search" in base                             # scoped web-only правила целы
+    assert "PERSONA PRESET" not in base                     # без overlay — нет блока
+
+    tc = chat_fact_system_prompt(today, persona_overlay=build_persona_overlay(PERSONA_TENDER_CARE))
+    assert "PERSONA PRESET: tender_care" in tc              # overlay прокинут
+    assert "ОНА" in tc and "web_search" in tc               # личность + scope сохранены
+
+
+def test_persona_overlay_for_fail_open_without_session() -> None:
+    # #250: helper fail-open — нет сессии → "" (базовый характер), ход не падает.
+    from sreda.runtime.react_loop import _persona_overlay_for
+
+    assert _persona_overlay_for(None, "t", "u") == ""
