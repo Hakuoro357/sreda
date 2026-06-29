@@ -94,7 +94,7 @@ def _scope_session():
     from sreda.db.models.checklists import Checklist, ChecklistItem
     from sreda.db.models.core import Tenant, User
     from sreda.db.models.housewife import FamilyMember
-    from sreda.db.models.housewife_food import Recipe
+    from sreda.db.models.housewife_food import Recipe, ShoppingListItem
     from sreda.db.models.tasks import Task
 
     engine = create_engine("sqlite:///:memory:")
@@ -111,6 +111,8 @@ def _scope_session():
     s.add(Recipe(id="rec_b", tenant_id="t1", user_id="u1b", title="Секретный борщ", source="user_dictated"))
     s.add(FamilyMember(id="fm_b", tenant_id="t1", user_id="u1b", name="Тайный дядя", role="self"))
     s.add(Task(id="task_b", tenant_id="t1", user_id="u1b", title="секретная задача"))
+    s.add(ShoppingListItem(id="sli_b", tenant_id="t1", user_id="u1b", title="тайное молоко", category="other", status="pending"))
+    s.add(ShoppingListItem(id="sli_cancel", tenant_id="t1", user_id="u1b", title="отменённый сыр", category="other", status="cancelled"))
     s.commit()
     yield s
     s.close()
@@ -180,3 +182,19 @@ def test_confirm_phrase_archive_checklist_scoped_by_user_264(_scope_session):
     ph_owner = _confirm_phrase("archive_checklist", _scope_session, "t1", "u1b")
     out = ph_owner({"list_id_or_title": "Список"})  # фрагмент названия
     assert "Список Б" in out and "архивировать" in out  # владелец → название
+
+
+def test_confirm_phrase_shopping_real_db_and_status_264(_scope_session):
+    # happy-path на РЕАЛЬНОЙ БД + статусная граница: pending → название; cancelled (delete
+    # пропустит как ineligible) → НЕ называется → статичная; чужой → статичная.
+    from sreda.runtime.react_loop import _CONFIRM_PHRASE, _confirm_phrase
+
+    ph_owner = _confirm_phrase("remove_shopping_items", _scope_session, "t1", "u1b")
+    out = ph_owner({"item_ids": ["sli_b"]})
+    assert "тайное молоко" in out and "из списка покупок" in out  # pending → название
+
+    # cancelled позиция: delete её пропустит → confirm не должен её называть
+    assert ph_owner({"item_ids": ["sli_cancel"]}) == _CONFIRM_PHRASE["remove_shopping_items"]
+
+    ph_other = _confirm_phrase("remove_shopping_items", _scope_session, "t1", "u1")
+    assert ph_other({"item_ids": ["sli_b"]}) == _CONFIRM_PHRASE["remove_shopping_items"]  # чужой → статичная

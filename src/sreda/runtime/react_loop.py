@@ -331,10 +331,14 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                 from sreda.db.models.housewife_food import ShoppingListItem
                 ids = [str(i) for i in (kwargs.get("item_ids") or [])]
                 if ids:
+                    # #264 R3 (субагент MINOR): паритет со скоупом удаления — remove_items_detailed
+                    # берёт only_from=("pending","bought"); иначе confirm назвал бы уже-отменённую
+                    # позицию, которую delete пропустит как ineligible.
                     rows = (session.query(ShoppingListItem)
                             .filter(ShoppingListItem.id.in_(ids),
                                     ShoppingListItem.tenant_id == tenant_id,
-                                    ShoppingListItem.user_id == user_id).all())
+                                    ShoppingListItem.user_id == user_id,
+                                    ShoppingListItem.status.in_(("pending", "bought"))).all())
                     names = [r.title for r in rows if getattr(r, "title", None)]
                     if names:
                         return "убрать " + ", ".join(f"«{n}»" for n in names) + " из списка покупок"
