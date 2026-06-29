@@ -345,9 +345,15 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                 from sreda.db.models.checklists import Checklist, ChecklistItem
                 iid = str(kwargs.get("item_id") or "")
                 if iid:
+                    # #264 R2 (Codex high + субагент MAJOR): скоуп резолва БАЙТ-В-БАЙТ как у
+                    # удаления (_owned_active_item_exists: tenant_id+user_id+status=active) — иначе
+                    # confirm мог бы назвать чужой (в том же тенанте) пункт, а delete потом отказал бы.
                     r = (session.query(ChecklistItem)
                          .join(Checklist, ChecklistItem.checklist_id == Checklist.id)
-                         .filter(ChecklistItem.id == iid, Checklist.tenant_id == tenant_id).first())
+                         .filter(ChecklistItem.id == iid,
+                                 Checklist.tenant_id == tenant_id,
+                                 Checklist.user_id == user_id,
+                                 Checklist.status == "active").first())
                     if r is not None and getattr(r, "title", None):
                         return f"удалить пункт «{r.title}» из чек-листа"
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
