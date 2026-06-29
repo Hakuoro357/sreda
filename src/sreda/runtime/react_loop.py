@@ -301,8 +301,11 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
         # key — скрытый стабильный дискриминатор цели (#166 B R5): имя инструмента +
         # canon(args). Различает РАЗНЫЕ цели при ИДЕНТИЧНОМ тексте вопроса (см. _pause_token).
         _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
+        # #264: phrase может быть строкой ИЛИ callable(kwargs)->str (динамическая фраза с
+        # названиями удаляемого — по id достаёт имена; сбой резолва → фолбэк на статичную).
+        _p = phrase(kwargs) if callable(phrase) else phrase
         decision = interrupt({
-            "confirm": f"Точно {phrase}? Это действие необратимо.", "key": _key})
+            "confirm": f"Точно {_p}? Это действие необратимо.", "key": _key})
         if not _is_yes(str(decision)):
             return "Хорошо, не трогаю."
         return str(inner.invoke(kwargs))
@@ -311,6 +314,47 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
         func=_wrapped, name=inner.name, description=inner.description,
         args_schema=inner.args_schema,
     )
+
+
+def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> Any:
+    """#264: текст подтверждения удаления. Для удаления ПУНКТОВ — динамический callable(kwargs)->str
+    (по id достаёт названия → «убрать «куриное филе» из списка покупок», вместо безличного «позиции»);
+    иначе — статичный _CONFIRM_PHRASE[name]. Резолв best-effort: сбой/пусто → статичная фраза (НЕ валит
+    confirm). Резолв scoped по тенанту (покупки — прямо; чек-лист — через join на Checklist)."""
+    static = _CONFIRM_PHRASE[name]
+    if name == "remove_shopping_items":
+        def _ph_shop(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.housewife_food import ShoppingListItem
+                ids = [str(i) for i in (kwargs.get("item_ids") or [])]
+                if ids:
+                    rows = (session.query(ShoppingListItem)
+                            .filter(ShoppingListItem.id.in_(ids),
+                                    ShoppingListItem.tenant_id == tenant_id,
+                                    ShoppingListItem.user_id == user_id).all())
+                    names = [r.title for r in rows if getattr(r, "title", None)]
+                    if names:
+                        return "убрать " + ", ".join(f"«{n}»" for n in names) + " из списка покупок"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase shopping resolve failed", exc_info=True)
+            return static
+        return _ph_shop
+    if name == "delete_checklist_item":
+        def _ph_cl(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.checklists import Checklist, ChecklistItem
+                iid = str(kwargs.get("item_id") or "")
+                if iid:
+                    r = (session.query(ChecklistItem)
+                         .join(Checklist, ChecklistItem.checklist_id == Checklist.id)
+                         .filter(ChecklistItem.id == iid, Checklist.tenant_id == tenant_id).first())
+                    if r is not None and getattr(r, "title", None):
+                        return f"удалить пункт «{r.title}» из чек-листа"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase checklist resolve failed", exc_info=True)
+            return static
+        return _ph_cl
+    return static
 
 
 class ReactState(MessagesState):
@@ -1642,7 +1686,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
             continue  # onboarding/ui/utility/tasks-cross — вне цикла
         t = _react_desc(t)  # #165: короткое описание для Фредди (до confirm-wrap)
         extra.append(
-            _confirm_wrap(t, _CONFIRM_PHRASE[t.name])
+            _confirm_wrap(t, _confirm_phrase(t.name, session, tenant_id, user_id))
             if t.name in _CONFIRM_PHRASE else t
         )
     # память + веб; фильтруем по семье и дедупим — иначе утекает
