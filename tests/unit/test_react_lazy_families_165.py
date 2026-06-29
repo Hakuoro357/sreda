@@ -98,6 +98,41 @@ async def test_need_family_loads_family_and_executes_tool(db_session):
 
 
 @pytest.mark.asyncio
+async def test_need_family_same_batch_executes_dependent_tool_259(db_session):
+    """#259: need_family и зависимый инструмент в ОДНОМ батче (один AIMessage) → инструмент
+    выполняется в ТОМ ЖЕ проходе (пре-скан грузит семью ДО привязки), без «unavailable». Раньше
+    need_family «доезжал до следующего chat» → инструмент в том же батче падал недоступным →
+    агент повторял батч → петля до лимита шагов (штопор на правке списка, инцидент #259).
+
+    RED до фикса: add_shopping_items в том же батче был бы «unavailable» → молоко НЕ создано."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ, shopping НЕ предзагружен
+    scripted = [
+        # ОДИН батч: need_family(shopping) + add_shopping_items вместе
+        AIMessage(content="", tool_calls=[
+            {"name": "need_family", "args": {"family": "shopping"}, "id": "nf"},
+            {"name": "add_shopping_items",
+             "args": {"items": [{"title": "молоко"}]}, "id": "add"},
+        ]),
+        AIMessage(content="Готово."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    reply = await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="lazy259-samebatch", llm=stub,
+        user_text="сделай, пожалуйста, вот это",  # нейтральный → shopping не предзагружен
+        inbound_message_id="lazy259-samebatch-msg", channel="react")
+    # инструмент выполнился В ТОМ ЖЕ батче — позиция создана (без второго круга need_family)
+    from sreda.db.models.housewife_food import ShoppingListItem
+    rows = db_session.query(ShoppingListItem).filter(
+        ShoppingListItem.tenant_id == u.tenant_id).all()
+    assert "молоко" in {r.title for r in rows}, (
+        "add_shopping_items не выполнился в том же батче с need_family (петля #259)")
+    assert reply
+    assert len(stub.binds) == 2, f"ожидалось 2 прохода (батч+финал), не петля: {len(stub.binds)}"
+
+
+@pytest.mark.asyncio
 async def test_guard_loads_family_when_model_refuses(db_session, monkeypatch):
     """Срез A пункт 2: модель сама не дозвалась («не умею») → guard догружает семью и ход
     завершается ДЕЛОМ (не молчаливым отказом). Текст нейтральный (база пуста), детектор guard

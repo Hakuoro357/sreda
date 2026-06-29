@@ -1882,11 +1882,25 @@ def _build_graph(llm: Any, all_tools: list, *,
         # открыла бы семью мимо bind).
         # #221 Ф3: dispatch-набор тоже под доменным фильтром (execute) — иначе галлюцинация инструмента вне
         # разрешённых разделов исполнилась бы; None allowed → no-op (byte-identical).
+        added = False
+        # #259: need_family в батче должен влиять на ЗАВИСИМЫЕ инструменты ТОГО ЖЕ батча.
+        # Агент естественно батчит [need_family(X), инструмент_семьи_X]; раньше need_family
+        # «доезжал до следующего chat» (active обновлялся в цикле, но bound_by_name — нет), и
+        # инструмент в том же проходе падал «unavailable» → агент повторял тот же батч → петля
+        # до лимита шагов (инцидент #259, штопор на правке списка). Пре-скан грузит семьи из
+        # need_family-вызовов ДО привязки → bound_by_name видит их сразу. ТОЛЬКО task (на
+        # chat/fact need_family не в наборе — web-only; не расширяем семью мимо bind, #197).
+        if eff not in ("chat", "fact"):
+            for _ptc in state["messages"][-1].tool_calls:
+                if _ptc.get("name") == "need_family":
+                    _pf = (_ptc.get("args") or {}).get("family")
+                    if isinstance(_pf, str) and _pf in _LAZY_FAMILIES and _pf not in active:
+                        active.append(_pf)
+                        added = True
         bound_by_name = {t.name: t for t in _apply_domain_policy(
             _bind_for(all_tools, active, eff),
             state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
         out = []
-        added = False
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
