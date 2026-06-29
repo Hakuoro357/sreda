@@ -291,6 +291,12 @@ _CONFIRM_PHRASE = {
 }
 
 
+def _task_confirm_verb(verb: str) -> str:
+    """#265: глагол задачи (отменяю/удаляю) → форма 1-го лица БУДУЩЕГО для вопроса confirm
+    («Я сейчас {verb} задачу…»), единообразно с прочими confirm. Неизвестный verb → как есть."""
+    return {"отменяю": "отменю", "удаляю": "удалю"}.get(verb, verb)
+
+
 def _confirm_wrap(inner: Any, phrase: str) -> Any:
     """Обернуть разрушающий инструмент подтверждением через interrupt(): мутация
     ТОЛЬКО после «да» (детерминированный guardrail, как у cancel_reminder). Сохраняет
@@ -1451,7 +1457,8 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         title, when = r.title, r.trigger_at  # снимок ДО interrupt (g-032)
         # key — скрытый дискриминатор цели (#166 B R5): различает разные напоминания
         # при совпавшем тексте вопроса (см. _pause_token).
-        decision = interrupt({"confirm": f"Точно удалить «{title} — {_fmt(when)}»?",
+        decision = interrupt({"confirm": f"Я сейчас удалю напоминание «{title} — {_fmt(when)}». "
+                                         f"Нужно твоё подтверждение.",
                               "key": f"reminder:{reminder_ref}:cancel"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не удаляю «{title}». Скажи, какое тогда."
@@ -1584,7 +1591,10 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         title = t.title
         # key — скрытый дискриминатор цели (#166 B R5): различает РАЗНЫЕ задачи (даже с
         # одинаковым названием «купить хлеб») и действие cancel vs delete (см. _pause_token).
-        decision = interrupt({"confirm": f"Точно {verb} задачу «{title}»?",
+        # #265: вопрос от 1-го лица будущего (отменю/удалю), как и остальные confirm. verb
+        # (отменяю/удаляю) остаётся в key (дискриминатор cancel/delete) и success без изменений.
+        _vp = _task_confirm_verb(verb)
+        decision = interrupt({"confirm": f"Я сейчас {_vp} задачу «{title}». Нужно твоё подтверждение.",
                               "key": f"task:{task_ref}:{verb}"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не трогаю «{title}»."
@@ -1726,7 +1736,8 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 commit=True)
 
         decision = interrupt({
-            "confirm": "Точно удалить твой аккаунт? Это можно отменить через администратора.",
+            "confirm": "Я сейчас удалю твой аккаунт (восстановить можно через администратора). "
+                       "Нужно твоё подтверждение.",
             "key": f"account:{tenant_id}:self_delete"})
         if not _is_yes(str(decision)):
             return "Хорошо, ничего не удаляю — аккаунт на месте."

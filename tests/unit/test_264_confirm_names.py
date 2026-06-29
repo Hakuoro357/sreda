@@ -224,3 +224,12 @@ def test_confirm_wrap_first_person_format_265(monkeypatch):
     assert captured["confirm"] == "Я сейчас удалю рецепт «Борщ». Нужно твоё подтверждение."
     assert "необратимо" not in captured["confirm"]
     assert out == "Хорошо, не трогаю."
+
+
+def test_task_confirm_verb_first_person_265():
+    # #265: бес­поке-confirm задачи — глагол в 1-м лице будущего (отменяю→отменю, удаляю→удалю).
+    from sreda.runtime.react_loop import _task_confirm_verb
+
+    assert _task_confirm_verb("отменяю") == "отменю"
+    assert _task_confirm_verb("удаляю") == "удалю"
+    assert _task_confirm_verb("ничего") == "ничего"  # неизвестный → как есть (best-effort)
