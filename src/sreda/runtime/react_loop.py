@@ -900,8 +900,16 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
 # с большим запасом, см. _cfg). Срез добавил круги (детуры need_family) → запас нужен.
 _MAX_TURN_PASSES = 8
 
-# #258: «деградировавшие» исходы хода, на которые алертим оператора (помимо max_steps —
-# тот ловим по passes>=_MAX_TURN_PASSES, т.к. в outcome он пишется как «ok»).
+# Терминальный ответ анти-петли (stop-узел при исчерпании лимита проходов). Маркер —
+# стабильная подстрока (без markdown/id/списков → переживает _postformat); по ней детектор
+# #258 НАДЁЖНО ловит штопор. По passes>=лимит ловить нельзя: успешный длинный ход ровно из
+# _MAX_TURN_PASSES проходов (детуры need_family/guard #165/#221) даёт passes=лимит, но
+# отвечает в END без stop → был бы ложный «штопор» (R1 MAJOR субагент #258).
+_MAX_STEPS_MARKER = "не получилось довести до конца за разумное число шагов"
+_MAX_STEPS_REPLY = f"Прости, {_MAX_STEPS_MARKER}. Уточни, пожалуйста, что именно нужно?"
+
+# #258: «деградировавшие» исходы хода, на которые алертим оператора (max_steps ловим
+# отдельно по тексту stop-узла — см. _MAX_STEPS_MARKER).
 _DEGRADED_OUTCOMES = frozenset({"tool_error", "fallback_used", "safe_reply"})
 
 
@@ -917,8 +925,8 @@ def _maybe_alert_degraded_turn(
     (поиск в react_turn_trace), кусочки текста обрезаны."""
     try:
         _p = int(passes or 0)
-        if _p >= _MAX_TURN_PASSES:
-            reason = "max_steps"  # штопор: исчерпан лимит шагов
+        if _MAX_STEPS_MARKER in (reply_text or ""):
+            reason = "max_steps"  # штопор: РЕАЛЬНЫЙ заход в stop-узел (по тексту, не по passes)
         elif outcome in _DEGRADED_OUTCOMES:
             reason = outcome
         else:
@@ -927,7 +935,7 @@ def _maybe_alert_degraded_turn(
         _q = (user_text or "").strip()[:160]
         _a = (reply_text or "").strip()[:160]
         send_admin_alert(
-            severity="warning",
+            severity="P2",  # деградация = «знать + разобрать», не срочно (контракт P0/P1/P2/INFO)
             title=f"Среда: деградировавший ход — {reason}",
             body=(f"причина: {reason} · passes: {_p} · канал: {channel}\n"
                   f"тенант: {tenant_id} · turn_key: {turn_key}\n"
@@ -2134,9 +2142,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                         name=tc["name"], tool_call_id=tc["id"])
             for tc in (getattr(last, "tool_calls", None) or [])
         ]
-        out.append(AIMessage(
-            content="Прости, не получилось довести до конца за разумное число шагов. "
-                    "Уточни, пожалуйста, что именно нужно?"))
+        out.append(AIMessage(content=_MAX_STEPS_REPLY))  # #258: маркер для детектора штопора
         return {"messages": out}
 
     g = StateGraph(ReactState)

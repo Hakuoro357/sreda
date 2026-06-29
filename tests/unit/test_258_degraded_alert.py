@@ -20,19 +20,36 @@ def _patch_alert(monkeypatch):
     return calls
 
 
-def test_max_steps_fires_alert_even_when_outcome_ok(monkeypatch):
-    # Штопор: outcome пишется как «ok», но passes>=_MAX_TURN_PASSES → алерт max_steps.
+def test_max_steps_detected_by_stop_reply(monkeypatch):
+    # Штопор детектится по ТЕКСТУ stop-узла (outcome пишется как «ok») — надёжный признак
+    # реального захода в stop, а не косвенный passes.
     from sreda.runtime import react_loop
 
     calls = _patch_alert(monkeypatch)
     react_loop._maybe_alert_degraded_turn(
         tenant_id="tenant_tg_1", user_id="user_tg_1", channel="telegram",
-        turn_key="tk-abc", user_text="сарафан лизе", reply_text="не получилось",
+        turn_key="tk-abc", user_text="сарафан лизе",
+        reply_text=react_loop._MAX_STEPS_REPLY,  # терминал stop-узла (содержит маркер)
         outcome="ok", passes=react_loop._MAX_TURN_PASSES)
     assert len(calls) == 1
+    assert calls[0]["severity"] == "P2"  # валидный контракт severity (не "warning")
     assert "max_steps" in calls[0]["title"]
     assert calls[0]["dedupe_key"] == "degraded:max_steps:tenant_tg_1"
     assert "tenant_tg_1" in calls[0]["body"] and "tk-abc" in calls[0]["body"]
+
+
+def test_long_successful_turn_no_false_max_steps(monkeypatch):
+    # R1 MAJOR (#258, субагент): успешный длинный ход ровно из _MAX_TURN_PASSES проходов
+    # (детуры need_family/guard → passes=лимит, но ответ в END без stop) НЕ должен ложно
+    # алертить max_steps — детект по тексту stop, а не по passes.
+    from sreda.runtime import react_loop
+
+    calls = _patch_alert(monkeypatch)
+    react_loop._maybe_alert_degraded_turn(
+        tenant_id="t", user_id="u", channel="telegram", turn_key="tk",
+        user_text="сложный составной запрос", reply_text="Готово, всё сделала 👍",
+        outcome="ok", passes=react_loop._MAX_TURN_PASSES)
+    assert calls == []  # реальный ответ (не текст stop) → не штопор
 
 
 def test_degraded_outcomes_fire_alert(monkeypatch):
