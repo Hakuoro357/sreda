@@ -1025,9 +1025,9 @@ async def _process_approved_max_turn(
                         _kb_r = ([{
                             "type": "inline_keyboard",
                             "payload": {"buttons": [[
-                                {"type": "callback", "text": "Да",
+                                {"type": "callback", "text": "Подтверждаю",
                                  "payload": react_loop.confirm_callback_data("yes", _cid_r)},
-                                {"type": "callback", "text": "Нет",
+                                {"type": "callback", "text": "Отменить",
                                  "payload": react_loop.confirm_callback_data("no", _cid_r)},
                             ]]},
                         }] if getattr(_reply_r, "awaiting_confirm", False) else None)
@@ -1222,9 +1222,9 @@ async def _process_approved_max_turn(
                     _kb = ([{
                         "type": "inline_keyboard",
                         "payload": {"buttons": [[
-                            {"type": "callback", "text": "Да",
+                            {"type": "callback", "text": "Подтверждаю",
                              "payload": react_loop.confirm_callback_data("yes", _cid)},
-                            {"type": "callback", "text": "Нет",
+                            {"type": "callback", "text": "Отменить",
                              "payload": react_loop.confirm_callback_data("no", _cid)},
                         ]]},
                     }] if getattr(_reply, "awaiting_confirm", False) else None)

@@ -169,7 +169,7 @@ def test_confirm_phrase_move_task_scoped_by_user_264(_scope_session):
 
     ph_owner = _confirm_phrase("move_task_to_checklist", _scope_session, "t1", "u1b")
     out = ph_owner({"task_id": "task_b"})
-    assert "секретная задача" in out and "перенести" in out  # владелец → название
+    assert "секретная задача" in out and "перенесу" in out  # владелец → название (1-е лицо #265)
 
 
 def test_confirm_phrase_archive_checklist_scoped_by_user_264(_scope_session):
@@ -181,7 +181,7 @@ def test_confirm_phrase_archive_checklist_scoped_by_user_264(_scope_session):
 
     ph_owner = _confirm_phrase("archive_checklist", _scope_session, "t1", "u1b")
     out = ph_owner({"list_id_or_title": "Список"})  # фрагмент названия
-    assert "Список Б" in out and "архивировать" in out  # владелец → название
+    assert "Список Б" in out and "архивирую" in out  # владелец → название (1-е лицо #265)
 
 
 def test_confirm_phrase_shopping_real_db_and_status_264(_scope_session):
@@ -198,3 +198,29 @@ def test_confirm_phrase_shopping_real_db_and_status_264(_scope_session):
 
     ph_other = _confirm_phrase("remove_shopping_items", _scope_session, "t1", "u1")
     assert ph_other({"item_ids": ["sli_b"]}) == _CONFIRM_PHRASE["remove_shopping_items"]  # чужой → статичная
+
+
+def test_confirm_wrap_first_person_format_265(monkeypatch):
+    # #265: обёртка _confirm_wrap → «Я сейчас {phrase}. Нужно твоё подтверждение.» (от первого
+    # лица, без хвоста «необратимо»). «Отменить» (callback no) → «Хорошо, не трогаю».
+    from langchain_core.tools import StructuredTool
+
+    from sreda.runtime import react_loop
+
+    captured: dict = {}
+
+    def _fake_interrupt(payload):  # noqa: ANN001
+        captured.update(payload)
+        return "нет"  # Отменить → inner не зовётся
+
+    monkeypatch.setattr(react_loop, "interrupt", _fake_interrupt)
+
+    def _inner(recipe_id: str) -> str:
+        return "удалил"
+
+    inner = StructuredTool.from_function(func=_inner, name="delete_recipe", description="d")
+    wrapped = react_loop._confirm_wrap(inner, "удалю рецепт «Борщ»")
+    out = wrapped.func(recipe_id="rec_1")
+    assert captured["confirm"] == "Я сейчас удалю рецепт «Борщ». Нужно твоё подтверждение."
+    assert "необратимо" not in captured["confirm"]
+    assert out == "Хорошо, не трогаю."

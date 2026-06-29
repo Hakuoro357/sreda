@@ -371,11 +371,11 @@ async def _process_approved_turn_locked(
             trace.record("react_loop.resumed", chars=len(_reply2 or ""),
                          channel="telegram", noop=(not _reply2))
             if _reply2:  # непустой → пауза возобновлена (пустой = устаревший/чужой тап → no-op)
-                # цепочка-confirm: следующий вопрос снова с [Да][Нет] (с id новой паузы)
+                # цепочка-confirm: следующий вопрос снова с [Подтверждаю][Отменить] (id новой паузы)
                 _cid2 = getattr(_reply2, "confirm_id", "")
                 _kb2 = ({"inline_keyboard": [[
-                    {"text": "Да", "callback_data": react_loop.confirm_callback_data("yes", _cid2)},
-                    {"text": "Нет", "callback_data": react_loop.confirm_callback_data("no", _cid2)}]]}
+                    {"text": "Подтверждаю", "callback_data": react_loop.confirm_callback_data("yes", _cid2)},
+                    {"text": "Отменить", "callback_data": react_loop.confirm_callback_data("no", _cid2)}]]}
                     if getattr(_reply2, "awaiting_confirm", False) else None)
                 # правим ИСХОДНОЕ сообщение: результат + СНИМАЕМ старые кнопки. Telegram
                 # editMessageText без reply_markup НЕ убирает клавиатуру → передаём пустой
@@ -603,12 +603,12 @@ async def _process_approved_turn_locked(
                         except Exception:  # noqa: BLE001
                             pass
                 trace.record("react_loop.replied", chars=len(_reply or ""))
-                # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id
+                # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Подтверждаю][Отменить] с id
                 # КОНКРЕТНОЙ паузы в callback_data (текст «да/нет» тоже работает — кнопки добавка).
                 _cid = getattr(_reply, "confirm_id", "")
                 _kb = ({"inline_keyboard": [[
-                    {"text": "Да", "callback_data": react_loop.confirm_callback_data("yes", _cid)},
-                    {"text": "Нет", "callback_data": react_loop.confirm_callback_data("no", _cid)}]]}
+                    {"text": "Подтверждаю", "callback_data": react_loop.confirm_callback_data("yes", _cid)},
+                    {"text": "Отменить", "callback_data": react_loop.confirm_callback_data("no", _cid)}]]}
                     if getattr(_reply, "awaiting_confirm", False) else None)
                 _edited = False
                 if _ack_mid is not None:
