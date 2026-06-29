@@ -72,6 +72,53 @@ _PERSIST_SAVER: Any = None  # #193: lazy-синглтон durable-saver (ВКЛ)
 _DURABLE_CRASH: dict[str, int] = {}
 _DURABLE_CRASH_LIMIT = 2
 
+# #225: классификатор транзиентного сбоя LLM/сети (≠ porча стейта). Транзиент → recovery НЕ копит в
+# poison-счётчик и НЕ сносит беседу (delete_thread) — максимум clear_pending. Реальный кейс: ночной
+# egress-down → подряд LLMCallTimeout → беседа вытиралась зря. NB: porча десериализации чекпойнта НЕ
+# долетает сюда (saver._row_to_tuple на битом blob возвращает None → свежий старт, граф НЕ крашит);
+# в этот except приходят крахи ВЫПОЛНЕНИЯ — и LLM-сбой среди них самый частый.
+_TRANSIENT_EXC_TYPES: tuple[type[BaseException], ...] = (TimeoutError, ConnectionError)  # LLMCallTimeout ⊂ TimeoutError
+# ТОЛЬКО чисто-сетевые модули (любая их ошибка = транзиент). R1 (Codex high+medium MAJOR): провайдерские
+# модули (openai/groq/anthropic) УБРАНЫ — их ПОСТОЯННЫЕ ошибки (BadRequest/Auth/Permission/ContextLength;
+# porча стейта может маскироваться под BadRequestError) НЕ транзиент → должны идти в poison-путь. Их
+# ТРАНЗИЕНТНЫЕ ошибки ловятся ниже по специфичному ИМЕНИ (APITimeoutError/RateLimitError/...).
+_TRANSIENT_EXC_MODULES = frozenset({"httpx", "httpcore", "socket", "ssl"})
+# Специфичные транзиентные ИМЕНА (generic apierror/apistatus УБРАНЫ — могли поймать 4xx-постоянные, R1 MAJOR).
+_TRANSIENT_EXC_NAME_RE = re.compile(
+    r"timeout|connect|ratelimit|serviceunavailable|internalserver|"
+    r"remoteprotocol|networkerror|unavailable|overloaded", re.IGNORECASE)
+
+
+def _is_transient_llm_exc(exc: BaseException) -> bool:
+    """#225: краш — транзиентный сбой LLM/сети (НЕ porча стейта)? Allowlist: тип ∈ Timeout/Connection, ИЛИ
+    модуль типа ∈ чисто-сетевые, ИЛИ имя типа матчит специфичный транзиентный паттерн. DFS по ОБОИМ
+    __cause__/__context__ (R1 MINOR: транзиент мог быть только в context; LLM-ошибка часто завёрнута),
+    bounded + seen (анти-цикл). Не-транзиент/unknown → False (анти-залип не ослабляем: реальный краш графа
+    после N подряд по-прежнему сносит тред). ВНИМАНИЕ: имя матчится ПОДСТРОКОЙ — новый НЕ-транзиентный
+    exc-класс с именем вроде ...Timeout.../...Unavailable... ошибочно стал бы транзиентом (никогда не снёсся
+    бы). Калибровка залочена тестом test_is_transient_llm_exc_classifier_225 (вкл. реальные openai-классы —
+    ап SDK с переименованием транзиентного класса покраснит тест, а не молча вытрет беседу, анти-#74)."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    steps = 0
+    while stack and steps < 24:  # bounded (DFS по двум ссылкам → запас вдвое от прежних 12)
+        steps += 1
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, _TRANSIENT_EXC_TYPES):
+            return True
+        if (type(cur).__module__ or "").split(".")[0] in _TRANSIENT_EXC_MODULES:
+            return True
+        if _TRANSIENT_EXC_NAME_RE.search(type(cur).__name__):
+            return True
+        if cur.__cause__ is not None:
+            stack.append(cur.__cause__)
+        if cur.__context__ is not None:
+            stack.append(cur.__context__)
+    return False
+
 
 def _persist_enabled() -> bool:
     """#193: durable-персистентность диалога ВКЛ? (флаг SREDA_REACT_PERSIST_ENABLED, дефолт OFF)."""
@@ -260,8 +307,11 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
         # key — скрытый стабильный дискриминатор цели (#166 B R5): имя инструмента +
         # canon(args). Различает РАЗНЫЕ цели при ИДЕНТИЧНОМ тексте вопроса (см. _pause_token).
         _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
+        # #264: phrase может быть строкой ИЛИ callable(kwargs)->str (динамическая фраза с
+        # названиями удаляемого — по id достаёт имена; сбой резолва → фолбэк на статичную).
+        _p = phrase(kwargs) if callable(phrase) else phrase
         decision = interrupt({
-            "confirm": f"Точно {phrase}? Это действие необратимо.", "key": _key})
+            "confirm": f"Точно {_p}? Это действие необратимо.", "key": _key})
         if not _is_yes(str(decision)):
             return "Хорошо, не трогаю."
         return str(inner.invoke(kwargs))
@@ -270,6 +320,129 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
         func=_wrapped, name=inner.name, description=inner.description,
         args_schema=inner.args_schema,
     )
+
+
+def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> Any:
+    """#264: текст подтверждения удаления. Для разрушающих действий с КОНКРЕТНОЙ целью — динамический
+    callable(kwargs)->str (по id/ref достаёт название → «убрать «куриное филе»», «удалить рецепт «Борщ»»,
+    вместо безличного «позиции»/«рецепт»). Покрыто: remove_shopping_items, delete_checklist_item,
+    delete_recipe, remove_family_member, move_task_to_checklist, archive_checklist. «Очистить всё»
+    (clear_menu/clear_bought_shopping) остаются статичными — это честно про всё. Иначе — статичный
+    _CONFIRM_PHRASE[name]. Резолв best-effort: сбой/пусто → статичная фраза (НЕ валит confirm). КАЖДЫЙ
+    резолв scoped БАЙТ-В-БАЙТ как его мутация (иначе показал бы чужое — прецедент R2 у чек-листа)."""
+    static = _CONFIRM_PHRASE[name]
+    if name == "remove_shopping_items":
+        def _ph_shop(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.housewife_food import ShoppingListItem
+                ids = [str(i) for i in (kwargs.get("item_ids") or [])]
+                if ids:
+                    # #264 R3 (субагент MINOR): паритет со скоупом удаления — remove_items_detailed
+                    # берёт only_from=("pending","bought"); иначе confirm назвал бы уже-отменённую
+                    # позицию, которую delete пропустит как ineligible.
+                    rows = (session.query(ShoppingListItem)
+                            .filter(ShoppingListItem.id.in_(ids),
+                                    ShoppingListItem.tenant_id == tenant_id,
+                                    ShoppingListItem.user_id == user_id,
+                                    ShoppingListItem.status.in_(("pending", "bought"))).all())
+                    names = [r.title for r in rows if getattr(r, "title", None)]
+                    if names:
+                        return "убрать " + ", ".join(f"«{n}»" for n in names) + " из списка покупок"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase shopping resolve failed", exc_info=True)
+            return static
+        return _ph_shop
+    if name == "delete_checklist_item":
+        def _ph_cl(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.checklists import Checklist, ChecklistItem
+                iid = str(kwargs.get("item_id") or "")
+                if iid:
+                    # #264 R2 (Codex high + субагент MAJOR): скоуп резолва БАЙТ-В-БАЙТ как у
+                    # удаления (_owned_active_item_exists: tenant_id+user_id+status=active) — иначе
+                    # confirm мог бы назвать чужой (в том же тенанте) пункт, а delete потом отказал бы.
+                    r = (session.query(ChecklistItem)
+                         .join(Checklist, ChecklistItem.checklist_id == Checklist.id)
+                         .filter(ChecklistItem.id == iid,
+                                 Checklist.tenant_id == tenant_id,
+                                 Checklist.user_id == user_id,
+                                 Checklist.status == "active").first())
+                    if r is not None and getattr(r, "title", None):
+                        return f"удалить пункт «{r.title}» из чек-листа"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase checklist resolve failed", exc_info=True)
+            return static
+        return _ph_cl
+    if name == "delete_recipe":
+        def _ph_recipe(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.housewife_food import Recipe
+                rid = str(kwargs.get("recipe_id") or "")
+                if rid:
+                    # скоуп как delete_recipe: id+tenant_id+user_id (Recipe без status/join).
+                    r = (session.query(Recipe)
+                         .filter(Recipe.id == rid,
+                                 Recipe.tenant_id == tenant_id,
+                                 Recipe.user_id == user_id).first())
+                    if r is not None and getattr(r, "title", None):
+                        return f"удалить рецепт «{r.title}»"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase recipe resolve failed", exc_info=True)
+            return static
+        return _ph_recipe
+    if name == "remove_family_member":
+        def _ph_fm(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.housewife import FamilyMember
+                mid = str(kwargs.get("member_id") or "")
+                if mid:
+                    # скоуп как remove_member/_get_member: id+tenant_id+user_id (без status/join).
+                    r = (session.query(FamilyMember)
+                         .filter(FamilyMember.id == mid,
+                                 FamilyMember.tenant_id == tenant_id,
+                                 FamilyMember.user_id == user_id).first())
+                    if r is not None and getattr(r, "name", None):
+                        return f"удалить члена семьи «{r.name}»"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase family resolve failed", exc_info=True)
+            return static
+        return _ph_fm
+    if name == "move_task_to_checklist":
+        def _ph_move(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.tasks import Task
+                tid = str(kwargs.get("task_id") or "")
+                if tid:
+                    # скоуп как cancel()->_get(): id+tenant_id+user_id (без status/join).
+                    # Именуем ОТМЕНЯЕМУЮ задачу — необратим именно её отмена (шаг 1).
+                    r = (session.query(Task)
+                         .filter(Task.id == tid,
+                                 Task.tenant_id == tenant_id,
+                                 Task.user_id == user_id).first())
+                    if r is not None and getattr(r, "title", None):
+                        return f"перенести задачу «{r.title}» в дела (исходная задача отменится)"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase move_task resolve failed", exc_info=True)
+            return static
+        return _ph_move
+    if name == "archive_checklist":
+        def _ph_arch(kwargs: dict) -> str:
+            try:
+                needle = str(kwargs.get("list_id_or_title") or "")
+                if needle:
+                    # #264: аргумент = id ИЛИ нечёткий фрагмент названия. Резолвим ТЕМ ЖЕ методом,
+                    # что и мутация (ChecklistService.find_list_by_title, scoped tenant+user) — иначе
+                    # дрейф со скоупом архивации (raw-фильтр по id назвал бы не то / ничего).
+                    from sreda.services.checklists import ChecklistService
+                    cl = ChecklistService(session).find_list_by_title(
+                        tenant_id=tenant_id, user_id=user_id, needle=needle)
+                    if cl is not None and getattr(cl, "title", None):
+                        return f"архивировать чек-лист «{cl.title}»"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase archive resolve failed", exc_info=True)
+            return static
+        return _ph_arch
+    return static
 
 
 class ReactState(MessagesState):
@@ -1054,13 +1227,6 @@ def _is_pruned(tenant_id: str) -> bool:
     return tenant_id in get_settings().react_prune_tenants
 
 
-def _summary_enabled_for(tenant_id: str) -> bool:
-    """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
-    Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
-    from sreda.config.settings import get_settings
-    return tenant_id in get_settings().react_summary_tenants
-
-
 def _domain_scope() -> str:
     """#221 Ф3: режим доменного скоупинга ∈ {disabled, shadow, execute}. disabled (дефолт) → byte-identical."""
     from sreda.config.settings import get_settings
@@ -1079,6 +1245,13 @@ def _tail_directives_enabled() -> bool:
     OFF (дефолт) → легаси (дописываем в sp). ON → системный промпт стабилен (кеш-префикс цел)."""
     from sreda.config.settings import get_settings
     return bool(getattr(get_settings(), "react_tail_directives_enabled", False))
+
+
+def _summary_enabled_for(tenant_id: str) -> bool:
+    """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
+    Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
+    from sreda.config.settings import get_settings
+    return tenant_id in get_settings().react_summary_tenants
 
 
 def _looks_like_refusal(content: Any) -> bool:
@@ -1610,7 +1783,7 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
             continue  # onboarding/ui/utility/tasks-cross — вне цикла
         t = _react_desc(t)  # #165: короткое описание для Фредди (до confirm-wrap)
         extra.append(
-            _confirm_wrap(t, _CONFIRM_PHRASE[t.name])
+            _confirm_wrap(t, _confirm_phrase(t.name, session, tenant_id, user_id))
             if t.name in _CONFIRM_PHRASE else t
         )
     # память + веб; фильтруем по семье и дедупим — иначе утекает
@@ -2918,26 +3091,36 @@ async def handle_turn(
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s",
                        type(exc).__name__, gen)
+        _transient = _is_transient_llm_exc(exc)  # #225: LLM/сеть down ≠ porча стейта
         if _persist_enabled():
-            # #193 (CR R1 MAJOR): durable-ключ стабилен → восстановление не через gen-bump.
-            # Транзиентный краш (LLM-таймаут и т.п.) терпим; после N подряд — poison-checkpoint →
-            # сброс треда (аналог свежего треда на эфемерном пути), иначе юзер залипнет навсегда.
+            # #193/#225: durable-ключ стабилен → восстановление не через gen-bump. ТРАНЗИЕНТ (LLM/сеть
+            # down, #225) — беседу НЕ сносим и в poison-счётчик НЕ копим (макс. clear_pending). Только
+            # НЕ-транзиентный краш (битый/крашащий граф стейт) после N подряд → delete_thread (анти-залип).
             # _durable_thread_id внутри try — fail-closed raise (нет ключа) не должен утечь из except.
             try:
                 _dur = _durable_thread_id(base)
-                n = _DURABLE_CRASH.get(_dur, 0) + 1
-                if n >= _DURABLE_CRASH_LIMIT:
-                    _get_checkpointer().delete_thread(_dur)
+                if _transient:
+                    # R1 (Codex medium MAJOR): транзиент РВЁТ цепочку «подряд» → сброс poison-счётчика
+                    # (иначе poison→transient→poison ложно сносит на 2-м, хотя крахи не подряд-poison).
                     _DURABLE_CRASH.pop(_dur, None)
+                    _get_checkpointer().clear_pending(_dur)  # снять залипшую паузу
                 else:
-                    _DURABLE_CRASH[_dur] = n
-                    _get_checkpointer().clear_pending(_dur)  # хотя бы снять залипшую паузу
+                    n = _DURABLE_CRASH.get(_dur, 0) + 1
+                    if n >= _DURABLE_CRASH_LIMIT:
+                        _get_checkpointer().delete_thread(_dur)
+                        _DURABLE_CRASH.pop(_dur, None)
+                    else:
+                        _DURABLE_CRASH[_dur] = n
+                        _get_checkpointer().clear_pending(_dur)  # хотя бы снять залипшую паузу
             except Exception:  # noqa: BLE001 — recovery не валит ход
                 logger.warning("react_loop: durable crash-recovery failed", exc_info=True)
         else:
             _THREAD_GEN[base] = gen + 1
-        _reply = _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
-                        "что нужно сделать.")
+        # #225: на транзиенте при durable беседа ЦЕЛА → не врём «потеряла контекст».
+        _reply = _Reply(
+            "Связь на секунду подвела — повтори, пожалуйста. Контекст я сохранила."
+            if (_transient and _persist_enabled()) else
+            "Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, что нужно сделать.")
         # #192: handled-ошибка (поймана) → терминал done+outcome (НЕ in_progress; in_progress
         # остаётся только при НЕпойманном краше/потере finish-хука). Best-effort, guarded.
         if _tk_trace:
