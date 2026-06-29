@@ -66,6 +66,53 @@ _PERSIST_SAVER: Any = None  # #193: lazy-синглтон durable-saver (ВКЛ)
 _DURABLE_CRASH: dict[str, int] = {}
 _DURABLE_CRASH_LIMIT = 2
 
+# #225: классификатор транзиентного сбоя LLM/сети (≠ porча стейта). Транзиент → recovery НЕ копит в
+# poison-счётчик и НЕ сносит беседу (delete_thread) — максимум clear_pending. Реальный кейс: ночной
+# egress-down → подряд LLMCallTimeout → беседа вытиралась зря. NB: porча десериализации чекпойнта НЕ
+# долетает сюда (saver._row_to_tuple на битом blob возвращает None → свежий старт, граф НЕ крашит);
+# в этот except приходят крахи ВЫПОЛНЕНИЯ — и LLM-сбой среди них самый частый.
+_TRANSIENT_EXC_TYPES: tuple[type[BaseException], ...] = (TimeoutError, ConnectionError)  # LLMCallTimeout ⊂ TimeoutError
+# ТОЛЬКО чисто-сетевые модули (любая их ошибка = транзиент). R1 (Codex high+medium MAJOR): провайдерские
+# модули (openai/groq/anthropic) УБРАНЫ — их ПОСТОЯННЫЕ ошибки (BadRequest/Auth/Permission/ContextLength;
+# porча стейта может маскироваться под BadRequestError) НЕ транзиент → должны идти в poison-путь. Их
+# ТРАНЗИЕНТНЫЕ ошибки ловятся ниже по специфичному ИМЕНИ (APITimeoutError/RateLimitError/...).
+_TRANSIENT_EXC_MODULES = frozenset({"httpx", "httpcore", "socket", "ssl"})
+# Специфичные транзиентные ИМЕНА (generic apierror/apistatus УБРАНЫ — могли поймать 4xx-постоянные, R1 MAJOR).
+_TRANSIENT_EXC_NAME_RE = re.compile(
+    r"timeout|connect|ratelimit|serviceunavailable|internalserver|"
+    r"remoteprotocol|networkerror|unavailable|overloaded", re.IGNORECASE)
+
+
+def _is_transient_llm_exc(exc: BaseException) -> bool:
+    """#225: краш — транзиентный сбой LLM/сети (НЕ porча стейта)? Allowlist: тип ∈ Timeout/Connection, ИЛИ
+    модуль типа ∈ чисто-сетевые, ИЛИ имя типа матчит специфичный транзиентный паттерн. DFS по ОБОИМ
+    __cause__/__context__ (R1 MINOR: транзиент мог быть только в context; LLM-ошибка часто завёрнута),
+    bounded + seen (анти-цикл). Не-транзиент/unknown → False (анти-залип не ослабляем: реальный краш графа
+    после N подряд по-прежнему сносит тред). ВНИМАНИЕ: имя матчится ПОДСТРОКОЙ — новый НЕ-транзиентный
+    exc-класс с именем вроде ...Timeout.../...Unavailable... ошибочно стал бы транзиентом (никогда не снёсся
+    бы). Калибровка залочена тестом test_is_transient_llm_exc_classifier_225 (вкл. реальные openai-классы —
+    ап SDK с переименованием транзиентного класса покраснит тест, а не молча вытрет беседу, анти-#74)."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    steps = 0
+    while stack and steps < 24:  # bounded (DFS по двум ссылкам → запас вдвое от прежних 12)
+        steps += 1
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, _TRANSIENT_EXC_TYPES):
+            return True
+        if (type(cur).__module__ or "").split(".")[0] in _TRANSIENT_EXC_MODULES:
+            return True
+        if _TRANSIENT_EXC_NAME_RE.search(type(cur).__name__):
+            return True
+        if cur.__cause__ is not None:
+            stack.append(cur.__cause__)
+        if cur.__context__ is not None:
+            stack.append(cur.__context__)
+    return False
+
 
 def _persist_enabled() -> bool:
     """#193: durable-персистентность диалога ВКЛ? (флаг SREDA_REACT_PERSIST_ENABLED, дефолт OFF)."""
@@ -2716,26 +2763,36 @@ async def handle_turn(
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s",
                        type(exc).__name__, gen)
+        _transient = _is_transient_llm_exc(exc)  # #225: LLM/сеть down ≠ porча стейта
         if _persist_enabled():
-            # #193 (CR R1 MAJOR): durable-ключ стабилен → восстановление не через gen-bump.
-            # Транзиентный краш (LLM-таймаут и т.п.) терпим; после N подряд — poison-checkpoint →
-            # сброс треда (аналог свежего треда на эфемерном пути), иначе юзер залипнет навсегда.
+            # #193/#225: durable-ключ стабилен → восстановление не через gen-bump. ТРАНЗИЕНТ (LLM/сеть
+            # down, #225) — беседу НЕ сносим и в poison-счётчик НЕ копим (макс. clear_pending). Только
+            # НЕ-транзиентный краш (битый/крашащий граф стейт) после N подряд → delete_thread (анти-залип).
             # _durable_thread_id внутри try — fail-closed raise (нет ключа) не должен утечь из except.
             try:
                 _dur = _durable_thread_id(base)
-                n = _DURABLE_CRASH.get(_dur, 0) + 1
-                if n >= _DURABLE_CRASH_LIMIT:
-                    _get_checkpointer().delete_thread(_dur)
+                if _transient:
+                    # R1 (Codex medium MAJOR): транзиент РВЁТ цепочку «подряд» → сброс poison-счётчика
+                    # (иначе poison→transient→poison ложно сносит на 2-м, хотя крахи не подряд-poison).
                     _DURABLE_CRASH.pop(_dur, None)
+                    _get_checkpointer().clear_pending(_dur)  # снять залипшую паузу
                 else:
-                    _DURABLE_CRASH[_dur] = n
-                    _get_checkpointer().clear_pending(_dur)  # хотя бы снять залипшую паузу
+                    n = _DURABLE_CRASH.get(_dur, 0) + 1
+                    if n >= _DURABLE_CRASH_LIMIT:
+                        _get_checkpointer().delete_thread(_dur)
+                        _DURABLE_CRASH.pop(_dur, None)
+                    else:
+                        _DURABLE_CRASH[_dur] = n
+                        _get_checkpointer().clear_pending(_dur)  # хотя бы снять залипшую паузу
             except Exception:  # noqa: BLE001 — recovery не валит ход
                 logger.warning("react_loop: durable crash-recovery failed", exc_info=True)
         else:
             _THREAD_GEN[base] = gen + 1
-        _reply = _Reply("Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, "
-                        "что нужно сделать.")
+        # #225: на транзиенте при durable беседа ЦЕЛА → не врём «потеряла контекст».
+        _reply = _Reply(
+            "Связь на секунду подвела — повтори, пожалуйста. Контекст я сохранила."
+            if (_transient and _persist_enabled()) else
+            "Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, что нужно сделать.")
         # #192: handled-ошибка (поймана) → терминал done+outcome (НЕ in_progress; in_progress
         # остаётся только при НЕпойманном краше/потере finish-хука). Best-effort, guarded.
         if _tk_trace:

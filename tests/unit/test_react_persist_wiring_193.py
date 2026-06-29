@@ -218,3 +218,138 @@ async def test_async_wrappers_roundtrip(_file_sf):
     assert got.checkpoint["channel_values"]["messages"][0].content == "async-привет"
     listed = [t async for t in saver.alist(cfg)]
     assert len(listed) == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_transient_llm_crash_preserves_thread_225(monkeypatch):
+    """#225: N подряд ТРАНЗИЕНТНЫХ LLM-сбоев (LLMCallTimeout) → delete_thread НЕ зван, история цела
+    (poison-счётчик НЕ копится); ответ НЕ врёт «потеряла контекст». Транзиент ≠ porча стейта."""
+    from sreda.services.llm import LLMCallTimeout
+    monkeypatch.setattr(RL, "_persist_enabled", lambda: True)
+    RL._DURABLE_CRASH.clear()
+    calls = {"clear": 0, "delete": 0}
+
+    class _FakeSaver:
+        def clear_pending(self, tid, ns=""):
+            calls["clear"] += 1
+        def delete_thread(self, tid):
+            calls["delete"] += 1
+
+    monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
+    monkeypatch.setattr(RL, "build_slice_tools", lambda *a, **k: [])
+    monkeypatch.setattr(RL, "_persist_debug_turn", lambda *a, **k: None)
+
+    def _boom_transient(*a, **k):
+        raise LLMCallTimeout("LLM invoke exceeded wall time")
+    monkeypatch.setattr(RL, "_build_graph", _boom_transient)
+
+    kw = dict(session=None, tenant_id="t1", user_id="u1", thread_id="react:t1:transient225",
+              llm=object(), user_text="привет")
+    await RL.handle_turn(**kw)
+    await RL.handle_turn(**kw)
+    r3 = await RL.handle_turn(**kw)  # три подряд транзиента
+    assert calls["delete"] == 0, f"#225: транзиент НЕ должен сносить тред, delete={calls['delete']}"
+    assert calls["clear"] == 3, f"#225: каждый транзиент → clear_pending, clear={calls['clear']}"
+    assert RL._durable_thread_id("react:t1:transient225") not in RL._DURABLE_CRASH  # счётчик не копился
+    assert "потеряла контекст" not in str(r3), f"#225: на транзиенте не врать про потерю: {r3}"
+
+
+def test_is_transient_llm_exc_classifier_225():
+    """#225 классификатор: транзиентные → True, porча-shaped → False, транзиент в __context__ (не __cause__)
+    при non-matching __cause__ → True (DFS по обоим, R1 MINOR high). Калибровка-страж (R1 субагент MINOR)."""
+    from sreda.services.llm import LLMCallTimeout
+    f = RL._is_transient_llm_exc
+    # транзиентные
+    assert f(LLMCallTimeout("wall")) is True
+    assert f(ConnectionError("net")) is True
+    assert f(TimeoutError("t")) is True
+
+    class RateLimitError(Exception):
+        pass
+    assert f(RateLimitError("429")) is True  # по имени
+    # порча-стейта / generic → НЕ транзиент (poison-путь цел)
+    for exc in (RuntimeError("boom"), ValueError("v"), KeyError("k"), TypeError("ty"), AttributeError("a")):
+        assert f(exc) is False, exc
+
+    class BadRequestError(Exception):  # провайдерская ПОСТОЯННАЯ (porча под ней) → НЕ транзиент
+        pass
+    BadRequestError.__module__ = "openai"
+    assert f(BadRequestError("bad")) is False
+    # транзиент ТОЛЬКО в __context__, а __cause__ — non-matching (DFS по обоим)
+    wrapper = RuntimeError("wrap")
+    wrapper.__cause__ = ValueError("permanent")
+    wrapper.__context__ = ConnectionError("net down")
+    assert f(wrapper) is True
+    # R2 (субагент MINOR, анти-#74): лочим РЕАЛЬНЫЕ openai-имена — ап SDK с переименованием транзиентного
+    # класса покраснит этот тест, а не молча начнёт вытирать беседу на egress-down.
+    openai = pytest.importorskip("openai")
+    for nm in ("APITimeoutError", "APIConnectionError", "RateLimitError", "InternalServerError"):
+        cls = getattr(openai, nm, None)
+        if cls is not None:
+            assert f(cls.__new__(cls)) is True, f"openai.{nm} должен быть транзиентом"
+    for nm in ("BadRequestError", "AuthenticationError", "PermissionDeniedError", "NotFoundError"):
+        cls = getattr(openai, nm, None)
+        if cls is not None:
+            assert f(cls.__new__(cls)) is False, f"openai.{nm} (постоянная) → poison-путь, НЕ транзиент"
+
+
+@pytest.mark.asyncio
+async def test_durable_badrequest_still_deletes_225(monkeypatch):
+    """#225 (R1 high MAJOR): porча под provider-ошибкой (BadRequestError, module=openai) — НЕ транзиент →
+    poison-путь цел: 2 подряд → delete_thread (юзер не залипает навсегда)."""
+    monkeypatch.setattr(RL, "_persist_enabled", lambda: True)
+    RL._DURABLE_CRASH.clear()
+    calls = {"clear": 0, "delete": 0}
+
+    class _FakeSaver:
+        def clear_pending(self, tid, ns=""):
+            calls["clear"] += 1
+        def delete_thread(self, tid):
+            calls["delete"] += 1
+
+    class BadRequestError(Exception):
+        pass
+    BadRequestError.__module__ = "openai"
+    monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
+    monkeypatch.setattr(RL, "build_slice_tools", lambda *a, **k: [])
+    monkeypatch.setattr(RL, "_persist_debug_turn", lambda *a, **k: None)
+    monkeypatch.setattr(RL, "_build_graph", lambda *a, **k: (_ for _ in ()).throw(BadRequestError("bad")))
+    kw = dict(session=None, tenant_id="t1", user_id="u1", thread_id="react:t1:badreq225",
+              llm=object(), user_text="привет")
+    await RL.handle_turn(**kw)
+    await RL.handle_turn(**kw)
+    assert calls["delete"] == 1, f"#225: porча-под-BadRequest должна сноситься на 2-м, delete={calls['delete']}"
+
+
+@pytest.mark.asyncio
+async def test_durable_transient_resets_poison_counter_225(monkeypatch):
+    """#225 (R1 medium MAJOR): транзиент РВЁТ цепочку «подряд» → poison→transient→poison НЕ сносит
+    (крахи не подряд-poison). Счётчик сбрасывается на транзиенте."""
+    from sreda.services.llm import LLMCallTimeout
+    monkeypatch.setattr(RL, "_persist_enabled", lambda: True)
+    RL._DURABLE_CRASH.clear()
+    calls = {"clear": 0, "delete": 0}
+
+    class _FakeSaver:
+        def clear_pending(self, tid, ns=""):
+            calls["clear"] += 1
+        def delete_thread(self, tid):
+            calls["delete"] += 1
+
+    seq = [RuntimeError("boom"), LLMCallTimeout("net"), RuntimeError("boom")]
+    idx = {"n": 0}
+
+    def _boom_seq(*a, **k):
+        e = seq[idx["n"]]
+        idx["n"] += 1
+        raise e
+    monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
+    monkeypatch.setattr(RL, "build_slice_tools", lambda *a, **k: [])
+    monkeypatch.setattr(RL, "_persist_debug_turn", lambda *a, **k: None)
+    monkeypatch.setattr(RL, "_build_graph", _boom_seq)
+    kw = dict(session=None, tenant_id="t1", user_id="u1", thread_id="react:t1:mixed225",
+              llm=object(), user_text="привет")
+    await RL.handle_turn(**kw)  # poison → counter=1
+    await RL.handle_turn(**kw)  # transient → reset
+    await RL.handle_turn(**kw)  # poison → counter=1 (не 2)
+    assert calls["delete"] == 0, f"#225: транзиент между poison-крахами рвёт «подряд», delete={calls['delete']}"
