@@ -93,18 +93,24 @@ def _scope_session():
     from sreda.db.base import Base
     from sreda.db.models.checklists import Checklist, ChecklistItem
     from sreda.db.models.core import Tenant, User
+    from sreda.db.models.housewife import FamilyMember
+    from sreda.db.models.housewife_food import Recipe
+    from sreda.db.models.tasks import Task
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     s = sessionmaker(bind=engine)()
     s.add(Tenant(id="t1", name="T1"))
     s.add(User(id="u1", tenant_id="t1", telegram_account_id="1"))
-    s.add(User(id="u1b", tenant_id="t1", telegram_account_id="2"))
+    s.add(User(id="u1b", tenant_id="t1", telegram_account_id="2"))  # тот же тенант, другой юзер
+    # Сущности «чужого» (u1b) пользователя в ТОМ ЖЕ тенанте — для проверки scope по user_id.
     s.add(Checklist(id="cl_b", tenant_id="t1", user_id="u1b", title="Список Б", status="active"))
     s.add(ChecklistItem(id="it_b", checklist_id="cl_b", position=0, title="секретный пункт", status="pending"))
-    # архивный чек-лист того же владельца — для проверки status=active
     s.add(Checklist(id="cl_arch", tenant_id="t1", user_id="u1b", title="Архив", status="archived"))
     s.add(ChecklistItem(id="it_arch", checklist_id="cl_arch", position=0, title="архивный пункт", status="pending"))
+    s.add(Recipe(id="rec_b", tenant_id="t1", user_id="u1b", title="Секретный борщ", source="user_dictated"))
+    s.add(FamilyMember(id="fm_b", tenant_id="t1", user_id="u1b", name="Тайный дядя", role="self"))
+    s.add(Task(id="task_b", tenant_id="t1", user_id="u1b", title="секретная задача"))
     s.commit()
     yield s
     s.close()
@@ -129,3 +135,48 @@ def test_confirm_phrase_checklist_archived_falls_back_264(_scope_session):
 
     ph = _confirm_phrase("delete_checklist_item", _scope_session, "t1", "u1b")
     assert ph({"item_id": "it_arch"}) == _CONFIRM_PHRASE["delete_checklist_item"]
+
+
+def test_confirm_phrase_recipe_scoped_by_user_264(_scope_session):
+    from sreda.runtime.react_loop import _CONFIRM_PHRASE, _confirm_phrase
+
+    ph_other = _confirm_phrase("delete_recipe", _scope_session, "t1", "u1")
+    assert ph_other({"recipe_id": "rec_b"}) == _CONFIRM_PHRASE["delete_recipe"]  # чужой → статичная
+
+    ph_owner = _confirm_phrase("delete_recipe", _scope_session, "t1", "u1b")
+    out = ph_owner({"recipe_id": "rec_b"})
+    assert "Секретный борщ" in out and "рецепт" in out  # владелец → название
+
+
+def test_confirm_phrase_family_member_scoped_by_user_264(_scope_session):
+    from sreda.runtime.react_loop import _CONFIRM_PHRASE, _confirm_phrase
+
+    ph_other = _confirm_phrase("remove_family_member", _scope_session, "t1", "u1")
+    assert ph_other({"member_id": "fm_b"}) == _CONFIRM_PHRASE["remove_family_member"]  # чужой → статичная
+
+    ph_owner = _confirm_phrase("remove_family_member", _scope_session, "t1", "u1b")
+    out = ph_owner({"member_id": "fm_b"})
+    assert "Тайный дядя" in out and "член" in out  # владелец → имя
+
+
+def test_confirm_phrase_move_task_scoped_by_user_264(_scope_session):
+    from sreda.runtime.react_loop import _CONFIRM_PHRASE, _confirm_phrase
+
+    ph_other = _confirm_phrase("move_task_to_checklist", _scope_session, "t1", "u1")
+    assert ph_other({"task_id": "task_b"}) == _CONFIRM_PHRASE["move_task_to_checklist"]  # чужой → статичная
+
+    ph_owner = _confirm_phrase("move_task_to_checklist", _scope_session, "t1", "u1b")
+    out = ph_owner({"task_id": "task_b"})
+    assert "секретная задача" in out and "перенести" in out  # владелец → название
+
+
+def test_confirm_phrase_archive_checklist_scoped_by_user_264(_scope_session):
+    # archive принимает id ИЛИ нечёткий фрагмент названия → резолв через find_list_by_title.
+    from sreda.runtime.react_loop import _CONFIRM_PHRASE, _confirm_phrase
+
+    ph_other = _confirm_phrase("archive_checklist", _scope_session, "t1", "u1")
+    assert ph_other({"list_id_or_title": "Список"}) == _CONFIRM_PHRASE["archive_checklist"]  # чужой → статичная
+
+    ph_owner = _confirm_phrase("archive_checklist", _scope_session, "t1", "u1b")
+    out = ph_owner({"list_id_or_title": "Список"})  # фрагмент названия
+    assert "Список Б" in out and "архивировать" in out  # владелец → название

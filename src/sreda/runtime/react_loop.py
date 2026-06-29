@@ -317,10 +317,13 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
 
 
 def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> Any:
-    """#264: текст подтверждения удаления. Для удаления ПУНКТОВ — динамический callable(kwargs)->str
-    (по id достаёт названия → «убрать «куриное филе» из списка покупок», вместо безличного «позиции»);
-    иначе — статичный _CONFIRM_PHRASE[name]. Резолв best-effort: сбой/пусто → статичная фраза (НЕ валит
-    confirm). Резолв scoped по тенанту (покупки — прямо; чек-лист — через join на Checklist)."""
+    """#264: текст подтверждения удаления. Для разрушающих действий с КОНКРЕТНОЙ целью — динамический
+    callable(kwargs)->str (по id/ref достаёт название → «убрать «куриное филе»», «удалить рецепт «Борщ»»,
+    вместо безличного «позиции»/«рецепт»). Покрыто: remove_shopping_items, delete_checklist_item,
+    delete_recipe, remove_family_member, move_task_to_checklist, archive_checklist. «Очистить всё»
+    (clear_menu/clear_bought_shopping) остаются статичными — это честно про всё. Иначе — статичный
+    _CONFIRM_PHRASE[name]. Резолв best-effort: сбой/пусто → статичная фраза (НЕ валит confirm). КАЖДЫЙ
+    резолв scoped БАЙТ-В-БАЙТ как его мутация (иначе показал бы чужое — прецедент R2 у чек-листа)."""
     static = _CONFIRM_PHRASE[name]
     if name == "remove_shopping_items":
         def _ph_shop(kwargs: dict) -> str:
@@ -360,6 +363,75 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                 logger.warning("react_loop: confirm-phrase checklist resolve failed", exc_info=True)
             return static
         return _ph_cl
+    if name == "delete_recipe":
+        def _ph_recipe(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.housewife_food import Recipe
+                rid = str(kwargs.get("recipe_id") or "")
+                if rid:
+                    # скоуп как delete_recipe: id+tenant_id+user_id (Recipe без status/join).
+                    r = (session.query(Recipe)
+                         .filter(Recipe.id == rid,
+                                 Recipe.tenant_id == tenant_id,
+                                 Recipe.user_id == user_id).first())
+                    if r is not None and getattr(r, "title", None):
+                        return f"удалить рецепт «{r.title}»"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase recipe resolve failed", exc_info=True)
+            return static
+        return _ph_recipe
+    if name == "remove_family_member":
+        def _ph_fm(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.housewife import FamilyMember
+                mid = str(kwargs.get("member_id") or "")
+                if mid:
+                    # скоуп как remove_member/_get_member: id+tenant_id+user_id (без status/join).
+                    r = (session.query(FamilyMember)
+                         .filter(FamilyMember.id == mid,
+                                 FamilyMember.tenant_id == tenant_id,
+                                 FamilyMember.user_id == user_id).first())
+                    if r is not None and getattr(r, "name", None):
+                        return f"удалить члена семьи «{r.name}»"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase family resolve failed", exc_info=True)
+            return static
+        return _ph_fm
+    if name == "move_task_to_checklist":
+        def _ph_move(kwargs: dict) -> str:
+            try:
+                from sreda.db.models.tasks import Task
+                tid = str(kwargs.get("task_id") or "")
+                if tid:
+                    # скоуп как cancel()->_get(): id+tenant_id+user_id (без status/join).
+                    # Именуем ОТМЕНЯЕМУЮ задачу — необратим именно её отмена (шаг 1).
+                    r = (session.query(Task)
+                         .filter(Task.id == tid,
+                                 Task.tenant_id == tenant_id,
+                                 Task.user_id == user_id).first())
+                    if r is not None and getattr(r, "title", None):
+                        return f"перенести задачу «{r.title}» в дела (исходная задача отменится)"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase move_task resolve failed", exc_info=True)
+            return static
+        return _ph_move
+    if name == "archive_checklist":
+        def _ph_arch(kwargs: dict) -> str:
+            try:
+                needle = str(kwargs.get("list_id_or_title") or "")
+                if needle:
+                    # #264: аргумент = id ИЛИ нечёткий фрагмент названия. Резолвим ТЕМ ЖЕ методом,
+                    # что и мутация (ChecklistService.find_list_by_title, scoped tenant+user) — иначе
+                    # дрейф со скоупом архивации (raw-фильтр по id назвал бы не то / ничего).
+                    from sreda.services.checklists import ChecklistService
+                    cl = ChecklistService(session).find_list_by_title(
+                        tenant_id=tenant_id, user_id=user_id, needle=needle)
+                    if cl is not None and getattr(cl, "title", None):
+                        return f"архивировать чек-лист «{cl.title}»"
+            except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
+                logger.warning("react_loop: confirm-phrase archive resolve failed", exc_info=True)
+            return static
+        return _ph_arch
     return static
 
 
