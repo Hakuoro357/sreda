@@ -313,12 +313,8 @@ class ReactState(MessagesState):
     # "must_task": bool, "classifier_raw": str}. Last-value, ставится на fresh-ходе; chat-узел кладёт в
     # llm_calls-трейс (#192) для отладки мисклассификации на проде. OFF → не ставится.
     intent_meta: dict
-    # #232 шаг A: durable-выжимка старой истории (last-value канал; пишется на шаге B через
-    # graph.aupdate_state). Потребляется build_model_input при компакции (fenced в ведущий sp, если
-    # covered_hash совпал — иначе fail-open). Сериализуется штатно (dict, как intent_meta). До шага B
-    # канал None → потребление = байт-идентично #194. Форма: {version, text, covered_message_count,
-    # covered_hash, [covered_start_block, covered_end_block]}.
-    history_summary: dict
+    # #232 способ Б: выжимка истории живёт в ОТДЕЛЬНОЙ таблице react_summaries (НЕ в канале чекпойнта —
+    # она вне таймлайна разговора). Грузится в handle_turn и прокидывается в _build_graph параметром.
 
 
 def _system_prompt(today_str: str) -> str:
@@ -1566,7 +1562,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                  # выбирает по effective_intent. deepseek_llm=None (OFF/мисконфиг) → chat/fact на Фредди+web-only.
                  deepseek_llm: Any = None, chat_prompt: str = "",
                  deepseek_provider_key: str = "", preflight_enabled: bool = False,
-                 channel: str = "", thread_id: str = ""):  # #163 Фаза 3d: провенанс react-аудита в ctx
+                 channel: str = "", thread_id: str = "",  # #163 Фаза 3d: провенанс react-аудита в ctx
+                 history_summary: dict | None = None):  # #232 способ Б: выжимка из таблицы (потребление)
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
     ПОДНАБОР per-invocation из state["active_families"] (ядро всегда + загруженные семьи) —
     набор меняется по ходу без перекомпиляции графа (need_family добирает семью).
@@ -1624,7 +1621,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             bound = _bind_for(all_tools, state.get("active_families"), eff)
             sp = chat_prompt or system_prompt
             _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
-                                      budget=_compact_budget(), summary=state.get("history_summary"))
+                                      budget=_compact_budget(), summary=history_summary)
             _primary = deepseek_llm if deepseek_llm is not None else llm  # мисконфиг → Фредди+web-only
             _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
             _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
@@ -1661,7 +1658,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
             # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
             _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
-                                      budget=_compact_budget(), summary=state.get("history_summary"))
+                                      budget=_compact_budget(), summary=history_summary)
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
@@ -2250,14 +2247,50 @@ def _format_history_for_summary(prev_summary_text: str, coverable: list) -> str:
     return "\n".join(parts)
 
 
+def _snap_ts(snap: Any):
+    """as-of метка выжимки = created_at снимка (строка ISO или datetime) → datetime|None. Дёшево, БЕЗ скана
+    истории (R2: точная per-message метка требовала бы дешифровки всей истории — не стоит для
+    информационного поля; корректность «не новее» обеспечена отдельной таблицей, якорь — covered_hash)."""
+    v = getattr(snap, "created_at", None)
+    if isinstance(v, str):
+        try:
+            from datetime import datetime as _dt
+            return _dt.fromisoformat(v.replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            return None
+    return v if isinstance(v, datetime) else None
+
+
+_SUMMARY_BG_TASKS: set = set()  # сильные ссылки на detached-пересказы (R2: иначе GC может убить незавершённый таск)
+
+
+def spawn_post_turn_summary(
+    *, tenant_id: str, user_id: str, thread_id: str, channel: str = "react", provider_key: str = "",
+) -> None:
+    """Запустить пост-ходовую выжимку DETACHED, удерживая СИЛЬНУЮ ссылку (анти-GC, R2 MINOR). Зовётся из
+    inbound ПОСЛЕ доставки ответа. create_task сам не бросает; нет running loop (sync-тесты) → тихо пропуск."""
+    try:  # проверяем loop ДО создания корутины — иначе «coroutine was never awaited» в no-loop пути
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # нет running event loop (sync-контекст/тесты) — пропускаем (best-effort)
+        logger.debug("spawn_post_turn_summary: no running loop, skip")
+        return
+    t = loop.create_task(run_post_turn_summary(
+        tenant_id=tenant_id, user_id=user_id, thread_id=thread_id,
+        channel=channel, provider_key=provider_key))
+    _SUMMARY_BG_TASKS.add(t)
+    t.add_done_callback(_SUMMARY_BG_TASKS.discard)
+
+
 async def run_post_turn_summary(
     *, tenant_id: str, user_id: str, thread_id: str, channel: str = "react", provider_key: str = "",
 ) -> None:
-    """#232 шаг B: пересказать старую середину истории и записать выжимку в durable-канал history_summary.
+    """#232 шаг B (способ Б): пересказать старую середину истории и записать выжимку в ТАБЛИЦУ
+    react_summaries (атомарный upsert своей строки; общий снимок разговора не трогаем → гонки-затирания нет).
 
     Запускается DETACHED (create_task) ПОСЛЕ доставки ответа юзеру, ВНЕ request-сессии/lock'а. Строит
-    свою сессию и граф. Best-effort: НИКОГДА ничего не валит. Backpressure: семафор (слот занят → skip).
-    durable выкл → no-op (InMemory не переживёт; фича только для durable-#193-тенантов)."""
+    свою сессию и граф (граф — только для ЧТЕНИЯ messages через aget_state; запись идёт в таблицу).
+    Best-effort: НИКОГДА ничего не валит. Backpressure: семафор (слот занят → skip). durable выкл → no-op
+    (выжимка применяется только durable-#193-тенантам)."""
     if not _persist_enabled():
         return
     try:  # занять слот без ожидания; занято → skip (не копим задачи)
@@ -2307,37 +2340,46 @@ async def _run_post_turn_summary_inner(
         covered_n, coverable = summary_coverage(messages)
         if covered_n < _SUMMARY_MIN_COVERED_MSGS or not coverable:
             return  # базовый триггер (шаг C уточнит watermark/cooldown)
-        prev = snap.values.get("history_summary")
-        prev_text = prev.get("text", "") if isinstance(prev, dict) else ""
-        # базовая анти-петля: префикс уже покрыт не меньше — не пересказываем заново (шаг C доточит cooldown)
-        if isinstance(prev, dict) and int(prev.get("covered_message_count", 0) or 0) >= covered_n:
+        from sreda.services import react_summary_store
+        # prev — из ТАБЛИЦЫ react_summaries (не из канала чекпойнта): выжимка живёт ВНЕ таймлайна разговора
+        # (способ Б) → она не «самая свежая», гонки-затирания нет by construction (код-ревью R1 CRITICAL).
+        durable_key = _durable_thread_id(thread_id)
+        prev = react_summary_store.load_summary(session, durable_key)
+        # R2 MAJOR: доверяем prev для дельты ТОЛЬКО если она валидна И покрытый ею префикс реально совпал
+        # (не «отмываем» стылую/битую выжимку в новую applicable-запись). Аппенд-онли → обычно совпадает;
+        # защита от edge (rewind/poison-recovery, смена истории).
+        prev_n, prev_text = 0, ""
+        if isinstance(prev, dict) and prev.get("version") == _rc._SUMMARY_VERSION:
+            _pn = int(prev.get("covered_message_count", 0) or 0)
+            if 0 < _pn <= covered_n and _rc._history_prefix_hash(messages, _pn) == prev.get("covered_hash"):
+                prev_n, prev_text = _pn, (prev.get("text") or "")
+        # анти-петля: префикс уже покрыт не меньше — не пересказываем (шаг C доточит cooldown)
+        if prev_n >= covered_n:
+            return
+        # пере-сжатие на ДЕЛЬТЕ (R1 MAJOR): prev_summary + ТОЛЬКО новые покрытые сообщения, не весь префикс
+        chunk = coverable[prev_n:]
+        if not chunk:
             return
         summary_llm = get_chat_llm(provider=_SUMMARY_PROVIDER, temperature=0.3)
         if summary_llm is None:
             logger.info("react_summary: summarizer provider unavailable (%s)", _SUMMARY_PROVIDER)
             return
         prompt = [SystemMessage(_SUMMARY_SYS),
-                  HumanMessage(_format_history_for_summary(prev_text, coverable))]
-        resp = invoke_with_per_call_timeout(summary_llm, prompt, timeout_seconds=_SUMMARY_LLM_TIMEOUT_S)
+                  HumanMessage(_format_history_for_summary(prev_text, chunk))]
+        # вызов пересказчика — в отдельном потоке (R1 MAJOR): синхронный invoke не блокирует event loop
+        resp = await asyncio.to_thread(
+            invoke_with_per_call_timeout, summary_llm, prompt, timeout_seconds=_SUMMARY_LLM_TIMEOUT_S)
         text = (getattr(resp, "content", "") or "").strip()
         if not text:
             return
-        record = make_summary_record(text, messages, covered_n)
-        # RE-READ latest перед записью (гонка R3/R4): ушло в паузу / префикс разошёлся → skip, не перезапись
-        snap2 = await graph.aget_state(cfg)
-        if snap2 is None or _has_pause(snap2):
-            logger.info("react_summary: state paused before write → skip tenant=%s", tenant_id)
-            return
-        msgs2 = (getattr(snap2, "values", None) or {}).get("messages") or []
-        if make_summary_record("", msgs2, covered_n)["covered_hash"] != record["covered_hash"]:
-            logger.info("react_summary: head changed before write → skip tenant=%s", tenant_id)
-            return
-        # TODO(#232 R1-CRITICAL — НЕ ВЫКАТЫВАТЬ без фикса): re-read + covered_hash НЕ закрывают гонку.
-        # Параллельный ход в окне внутреннего read→write у aupdate_state может быть ЗАТЁРТ (тихая потеря
-        # хвоста durable-истории; субагент воспроизвёл эмпирически). Фикс ждёт решение владельца:
-        # (а) tenant-lock вокруг этой записи ИЛИ (б) отдельная таблица react_summaries (атомарный upsert).
-        # Детали: plans/compaction-v2-232-AB-review-r1-*.md.
-        await graph.aupdate_state(cfg, {"history_summary": record}, as_node="chat")
+        record = make_summary_record(text, messages, covered_n)  # covered_hash по полному префиксу messages[:covered_n]
+        covered_ts = _snap_ts(snap)  # as-of = время снимка (дёшево; см. _snap_ts)
+        # запись — атомарный upsert СВОЕЙ строки (общий снимок разговора не трогаем). Вызывающий коммитит.
+        react_summary_store.upsert_summary(
+            session, thread_id=durable_key, tenant_id=tenant_id, text=record["text"],
+            covered_message_count=record["covered_message_count"], covered_hash=record["covered_hash"],
+            version=record["version"], covered_through_ts=covered_ts)
+        session.commit()
         prompt_tokens, completion_tokens = _extract_usage(resp)
         _record_react_usage(  # #175-паттерн: task_type=summary, credits_override=0 (виден в стоимости, не блокирует квоту)
             bind=session.get_bind(), tenant_id=tenant_id, provider_key=_SUMMARY_PROVIDER,
@@ -2414,6 +2456,14 @@ async def handle_turn(
                 logger.warning("react_loop: deepseek build failed → chat/fact на Фредди+web-only",
                                exc_info=True)
                 _deepseek_llm = None
+        # #232 способ Б: durable-выжимка истории из ТАБЛИЦЫ (не из канала). None / не-durable → поведение #194.
+        _summary = None
+        if _persist_enabled():
+            try:
+                from sreda.services import react_summary_store
+                _summary = react_summary_store.load_summary(session, _durable_thread_id(base))
+            except Exception:  # noqa: BLE001 — потребление выжимки не валит ход
+                logger.warning("react_summary: load failed → без выжимки", exc_info=True)
         graph = _build_graph(  # #165 Срез A: сырой llm + ВСЕ инструменты; bind поднабора в узлах
             llm, tools,
             tenant_id=tenant_id, user_id=user_id, today_str=today_str,
@@ -2421,7 +2471,7 @@ async def handle_turn(
             fallback_llm=fallback_llm,  # #184: Оса-fallback
             deepseek_llm=_deepseek_llm, chat_prompt=_chat_prompt,  # #197 state-driven селектор
             deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight,
-            channel=channel, thread_id=base)  # #163 Фаза 3d: провенанс react-аудита
+            channel=channel, thread_id=base, history_summary=_summary)  # #232 выжимка (потребление)
 
         snap = await graph.aget_state(_cfg(gen))
         live_pause = (_has_pause(snap)

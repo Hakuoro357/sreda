@@ -346,10 +346,10 @@ async def _process_approved_turn_locked(
                         pass
                 # #232 шаг B: выжимка истории — DETACHED после доставки resume-ответа (не на новой паузе)
                 if not getattr(_reply2, "awaiting_confirm", False):
-                    _create_task(react_loop.run_post_turn_summary(
+                    react_loop.spawn_post_turn_summary(
                         tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
                         thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
-                        channel="telegram", provider_key=_prov2))
+                        channel="telegram", provider_key=_prov2)
             if trace_ctx is not None:
                 trace.emit_block(trace_ctx)
             _set_processing_status(bg_session, inbound_message_id, "processed")
@@ -499,10 +499,10 @@ async def _process_approved_turn_locked(
                 # #232 шаг B: выжимка истории — DETACHED после доставки (своя сессия в фасаде, вне
                 # bg_session/advisory-lock); только финальный ответ (не confirm-пауза). Best-effort.
                 if not getattr(_reply, "awaiting_confirm", False):
-                    _create_task(react_loop.run_post_turn_summary(
+                    react_loop.spawn_post_turn_summary(
                         tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
                         thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
-                        channel="telegram", provider_key=_prov))
+                        channel="telegram", provider_key=_prov)
             else:
                 await handle_telegram_interaction(
                     bg_session,

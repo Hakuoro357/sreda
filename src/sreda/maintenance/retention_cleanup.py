@@ -48,6 +48,7 @@ from sreda.db.models.planner import (
     StepExecutionLedger,
 )
 from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
+from sreda.services.react_summary_store import delete_summaries_older_than
 from sreda.db.models.react_debug import ReactDebugTurn
 from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.runtime import AgentRun
@@ -86,6 +87,7 @@ class RetentionCleanupResult:
     react_debug_turns: int = 0  # #185 (временный QA-захват переписки — короткий TTL)
     react_turn_trace: int = 0  # #192 (durable трейс хода — короткий TTL, ПД)
     react_checkpoint: int = 0  # #193 (durable checkpoint диалога — GC по last-activity треда, ПД)
+    react_summaries: int = 0  # #232 способ Б (durable-выжимка истории — GC по updated_at, ПД)
     plan_library_entries: int = 0
     deleted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -111,6 +113,7 @@ class RetentionCleanupResult:
             + self.react_debug_turns
             + self.react_turn_trace
             + self.react_checkpoint
+            + self.react_summaries
         )
 
 
@@ -470,6 +473,11 @@ def cleanup_runtime_retention(
                 ReactCheckpoint.checkpoint_ns == ns,
             ),
         )
+
+    # #232 способ Б: react_summaries — durable-выжимка истории (ПД, шифр), лист-таблица (нет FK-детей).
+    # GC по updated_at тем же окном, что тред (#193). Единый источник правды — store (не дублируем delete).
+    summary_cutoff = now - timedelta(days=REACT_CHECKPOINT_DAYS)
+    result.react_summaries = delete_summaries_older_than(session, summary_cutoff)
 
     # ---------- plan_library (#135: TTL всем статусам, без PII) ----------
     try:
