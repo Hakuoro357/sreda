@@ -24,15 +24,22 @@ def _utc(y, mo, d, h=0) -> datetime:
 # Тесты считают точные кредиты по пиковому rate (×2 без скидки), поэтому
 # замораживаем budget._utcnow на ПИК — иначе после 16:00 UTC «бомба»
 # (480 вместо 600). Замысел тестов — проверять rate, не время суток.
+#
+# #266: дата заморозки — СЕГОДНЯ (в пиковый час), а НЕ фиксированная.
+# `_seed_subscription` строит окно подписки относительно реального now
+# (now±15д); если морозить запись usage на фиксированную прошлую дату, то
+# с ходом календаря (now−15д уезжает вперёд) запись выпадает из окна,
+# `_sum_credits` её выкидывает и квота считается нулевой. «Сегодня в пик»
+# держит обе шкалы в одном дне → дата-независимо и off-peak убран.
 import pytest as _pytest
 
 
 @_pytest.fixture(autouse=True)
 def _freeze_budget_clock_to_peak(monkeypatch):
     import sreda.services.budget as _b
-    monkeypatch.setattr(
-        _b, "_utcnow",
-        lambda: datetime(2026, 6, 12, 10, 0, tzinfo=timezone.utc))
+    peak_today = datetime.now(timezone.utc).replace(
+        hour=10, minute=0, second=0, microsecond=0)  # 10:00 UTC — вне off-peak
+    monkeypatch.setattr(_b, "_utcnow", lambda: peak_today)
 
 
 @pytest.fixture()
@@ -137,9 +144,33 @@ def test_expired_subscription_is_not_active(session):
     session.commit()
 
     svc = BudgetService(session)
-    # April 15 2026 is well past Feb 1 expiry
+    # frozen "today" (see fixture) is well past the Feb 1 2026 expiry
     status = svc.get_quota_status("t1", "eds_monitor")
     assert not status.is_subscribed
+
+
+def test_future_dated_subscription_not_yet_active(session):
+    # #266 (Codex-high MAJOR): a future-STARTING active subscription must NOT be
+    # treated as active. Otherwise quota is granted before starts_at, and usage
+    # recorded before starts_at is excluded by _sum_credits (created_at >=
+    # period_start) → effectively unmetered use until the period begins.
+    import sreda.services.budget as _b
+    now = _b._utcnow()  # honors the frozen-clock fixture
+    plan = _seed_plan(
+        session, plan_key="eds_basic", feature_key="eds_monitor",
+        credits_monthly_quota=1000,
+    )
+    _seed_subscription(
+        session, plan=plan,
+        starts_at=now + timedelta(days=1),       # starts tomorrow
+        active_until=now + timedelta(days=31),   # ends well in the future
+    )
+    session.commit()
+
+    svc = BudgetService(session)
+    status = svc.get_quota_status("t1", "eds_monitor")
+    assert not status.is_subscribed             # period hasn't started yet
+    assert svc.has_quota("t1", "eds_monitor") is False
 
 
 def test_unmetered_plan_never_exhausted(session):
