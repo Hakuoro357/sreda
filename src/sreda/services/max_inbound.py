@@ -1020,14 +1020,14 @@ async def _process_approved_max_turn(
                         "react_loop.resumed", chars=len(_reply_r or ""), channel="max",
                         noop=(not _reply_r))
                     if _reply_r and settings.max_bot_token:  # непустой → пауза возобновлена
-                        # цепочка-confirm: следующий вопрос снова с [Да][Нет] (с id новой паузы)
+                        # цепочка-confirm: следующий вопрос снова с [Подтверждаю][Отменить] (id новой паузы)
                         _cid_r = getattr(_reply_r, "confirm_id", "")
                         _kb_r = ([{
                             "type": "inline_keyboard",
                             "payload": {"buttons": [[
-                                {"type": "callback", "text": "Да",
+                                {"type": "callback", "text": "Подтверждаю",
                                  "payload": react_loop.confirm_callback_data("yes", _cid_r)},
-                                {"type": "callback", "text": "Нет",
+                                {"type": "callback", "text": "Отменить",
                                  "payload": react_loop.confirm_callback_data("no", _cid_r)},
                             ]]},
                         }] if getattr(_reply_r, "awaiting_confirm", False) else None)
@@ -1222,15 +1222,15 @@ async def _process_approved_max_turn(
                     trace.record(
                         "react_loop.replied", chars=len(_reply or ""), channel="max",
                     )
-                    # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Да][Нет] с id
+                    # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Подтверждаю][Отменить] с id
                     # КОНКРЕТНОЙ паузы в payload (MAX attachments; текст «да/нет» тоже работает).
                     _cid = getattr(_reply, "confirm_id", "")
                     _kb = ([{
                         "type": "inline_keyboard",
                         "payload": {"buttons": [[
-                            {"type": "callback", "text": "Да",
+                            {"type": "callback", "text": "Подтверждаю",
                              "payload": react_loop.confirm_callback_data("yes", _cid)},
-                            {"type": "callback", "text": "Нет",
+                            {"type": "callback", "text": "Отменить",
                              "payload": react_loop.confirm_callback_data("no", _cid)},
                         ]]},
                     }] if getattr(_reply, "awaiting_confirm", False) else None)

@@ -283,17 +283,24 @@ _EXTRA_FAMILIES = {"shopping", "recipes", "menu", "household", "checklists", "we
 # канонический набор из handlers, минус не-разрушающие). reminders/tasks-разрушающее
 # уже под бес­поке-confirm выше.
 _CONFIRM_PHRASE = {
-    "delete_recipe": "удалить рецепт",
-    "remove_shopping_items": "удалить позиции из списка покупок",
-    "clear_bought_shopping": "очистить купленное в списке покупок",
-    "clear_menu": "очистить меню",
-    "remove_family_member": "удалить члена семьи",
-    "delete_checklist_item": "удалить пункт чек-листа",
-    "archive_checklist": "архивировать чек-лист",
+    # #265: от ПЕРВОГО ЛИЦА — обёртка «Я сейчас {phrase}. Нужно твоё подтверждение.»
+    "delete_recipe": "удалю рецепт",
+    "remove_shopping_items": "уберу позиции из списка покупок",
+    "clear_bought_shopping": "очищу купленное в списке покупок",
+    "clear_menu": "очищу меню",
+    "remove_family_member": "удалю члена семьи",
+    "delete_checklist_item": "удалю пункт чек-листа",
+    "archive_checklist": "архивирую чек-лист",
     # move_task_to_checklist шаг 1 ОТМЕНЯЕТ исходную задачу (+напоминание) — destructive,
     # обходил бы confirm иначе (все 3 ревьюера, MAJOR).
-    "move_task_to_checklist": "перенести задачу в дела (исходная задача отменится)",
+    "move_task_to_checklist": "перенесу задачу в дела (исходная задача отменится)",
 }
+
+
+def _task_confirm_verb(verb: str) -> str:
+    """#265: глагол задачи (отменяю/удаляю) → форма 1-го лица БУДУЩЕГО для вопроса confirm
+    («Я сейчас {verb} задачу…»), единообразно с прочими confirm. Неизвестный verb → как есть."""
+    return {"отменяю": "отменю", "удаляю": "удалю"}.get(verb, verb)
 
 
 def _confirm_wrap(inner: Any, phrase: str) -> Any:
@@ -311,7 +318,7 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
         # названиями удаляемого — по id достаёт имена; сбой резолва → фолбэк на статичную).
         _p = phrase(kwargs) if callable(phrase) else phrase
         decision = interrupt({
-            "confirm": f"Точно {_p}? Это действие необратимо.", "key": _key})
+            "confirm": f"Я сейчас {_p}. Нужно твоё подтверждение.", "key": _key})
         if not _is_yes(str(decision)):
             return "Хорошо, не трогаю."
         return str(inner.invoke(kwargs))
@@ -323,9 +330,10 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
 
 
 def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> Any:
-    """#264: текст подтверждения удаления. Для разрушающих действий с КОНКРЕТНОЙ целью — динамический
-    callable(kwargs)->str (по id/ref достаёт название → «убрать «куриное филе»», «удалить рецепт «Борщ»»,
-    вместо безличного «позиции»/«рецепт»). Покрыто: remove_shopping_items, delete_checklist_item,
+    """#264/#265: текст подтверждения удаления (от ПЕРВОГО ЛИЦА — обёртка «Я сейчас {phrase}. Нужно твоё
+    подтверждение.»). Для разрушающих действий с КОНКРЕТНОЙ целью — динамический callable(kwargs)->str (по
+    id/ref достаёт название → «уберу «куриное филе»», «удалю рецепт «Борщ»», вместо безличного «позиции»/
+    «рецепт»). Покрыто: remove_shopping_items, delete_checklist_item,
     delete_recipe, remove_family_member, move_task_to_checklist, archive_checklist. «Очистить всё»
     (clear_menu/clear_bought_shopping) остаются статичными — это честно про всё. Иначе — статичный
     _CONFIRM_PHRASE[name]. Резолв best-effort: сбой/пусто → статичная фраза (НЕ валит confirm). КАЖДЫЙ
@@ -347,7 +355,7 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                                     ShoppingListItem.status.in_(("pending", "bought"))).all())
                     names = [r.title for r in rows if getattr(r, "title", None)]
                     if names:
-                        return "убрать " + ", ".join(f"«{n}»" for n in names) + " из списка покупок"
+                        return "уберу " + ", ".join(f"«{n}»" for n in names) + " из списка покупок"
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
                 logger.warning("react_loop: confirm-phrase shopping resolve failed", exc_info=True)
             return static
@@ -368,7 +376,7 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                                  Checklist.user_id == user_id,
                                  Checklist.status == "active").first())
                     if r is not None and getattr(r, "title", None):
-                        return f"удалить пункт «{r.title}» из чек-листа"
+                        return f"удалю пункт «{r.title}» из чек-листа"
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
                 logger.warning("react_loop: confirm-phrase checklist resolve failed", exc_info=True)
             return static
@@ -385,7 +393,7 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                                  Recipe.tenant_id == tenant_id,
                                  Recipe.user_id == user_id).first())
                     if r is not None and getattr(r, "title", None):
-                        return f"удалить рецепт «{r.title}»"
+                        return f"удалю рецепт «{r.title}»"
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
                 logger.warning("react_loop: confirm-phrase recipe resolve failed", exc_info=True)
             return static
@@ -402,7 +410,7 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                                  FamilyMember.tenant_id == tenant_id,
                                  FamilyMember.user_id == user_id).first())
                     if r is not None and getattr(r, "name", None):
-                        return f"удалить члена семьи «{r.name}»"
+                        return f"удалю члена семьи «{r.name}»"
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
                 logger.warning("react_loop: confirm-phrase family resolve failed", exc_info=True)
             return static
@@ -420,7 +428,7 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                                  Task.tenant_id == tenant_id,
                                  Task.user_id == user_id).first())
                     if r is not None and getattr(r, "title", None):
-                        return f"перенести задачу «{r.title}» в дела (исходная задача отменится)"
+                        return f"перенесу задачу «{r.title}» в дела (исходная задача отменится)"
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
                 logger.warning("react_loop: confirm-phrase move_task resolve failed", exc_info=True)
             return static
@@ -437,7 +445,7 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                     cl = ChecklistService(session).find_list_by_title(
                         tenant_id=tenant_id, user_id=user_id, needle=needle)
                     if cl is not None and getattr(cl, "title", None):
-                        return f"архивировать чек-лист «{cl.title}»"
+                        return f"архивирую чек-лист «{cl.title}»"
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
                 logger.warning("react_loop: confirm-phrase archive resolve failed", exc_info=True)
             return static
@@ -1464,7 +1472,8 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         title, when = r.title, r.trigger_at  # снимок ДО interrupt (g-032)
         # key — скрытый дискриминатор цели (#166 B R5): различает разные напоминания
         # при совпавшем тексте вопроса (см. _pause_token).
-        decision = interrupt({"confirm": f"Точно удалить «{title} — {_fmt(when)}»?",
+        decision = interrupt({"confirm": f"Я сейчас удалю напоминание «{title} — {_fmt(when)}». "
+                                         f"Нужно твоё подтверждение.",
                               "key": f"reminder:{reminder_ref}:cancel"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не удаляю «{title}». Скажи, какое тогда."
@@ -1597,7 +1606,10 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         title = t.title
         # key — скрытый дискриминатор цели (#166 B R5): различает РАЗНЫЕ задачи (даже с
         # одинаковым названием «купить хлеб») и действие cancel vs delete (см. _pause_token).
-        decision = interrupt({"confirm": f"Точно {verb} задачу «{title}»?",
+        # #265: вопрос от 1-го лица будущего (отменю/удалю), как и остальные confirm. verb
+        # (отменяю/удаляю) остаётся в key (дискриминатор cancel/delete) и success без изменений.
+        _vp = _task_confirm_verb(verb)
+        decision = interrupt({"confirm": f"Я сейчас {_vp} задачу «{title}». Нужно твоё подтверждение.",
                               "key": f"task:{task_ref}:{verb}"})
         if not _is_yes(str(decision)):
             return f"Хорошо, не трогаю «{title}»."
@@ -1739,7 +1751,8 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
                 commit=True)
 
         decision = interrupt({
-            "confirm": "Точно удалить твой аккаунт? Это можно отменить через администратора.",
+            "confirm": "Я сейчас удалю твой аккаунт (восстановить можно через администратора). "
+                       "Нужно твоё подтверждение.",
             "key": f"account:{tenant_id}:self_delete"})
         if not _is_yes(str(decision)):
             return "Хорошо, ничего не удаляю — аккаунт на месте."

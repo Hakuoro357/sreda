@@ -119,6 +119,9 @@ async def test_self_delete_single_user_confirmed_deletes(db_session):
     assert is_tenant_active(db_session, u.tenant_id) is True, (
         "до подтверждения тенант не должен удаляться")
     assert getattr(r1, "awaiting_confirm", False) is True, repr(r1)
+    # #265: голос Среды + сохранён важный нюанс восстановимости аккаунта.
+    assert "удалю твой аккаунт" in r1.lower(), r1
+    assert "восстановить можно через администратора" in r1.lower(), r1
 
     await handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,

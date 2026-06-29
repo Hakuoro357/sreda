@@ -226,7 +226,7 @@ async def test_confirm_cancel_yes_deletes(db_session):
     r1 = await handle_turn(session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
                            thread_id=thread, llm=_cancel_script(rid),
                            user_text="удали разминку", inbound_message_id="m1", channel="max")
-    assert "удалить" in r1.lower(), r1
+    assert "удалю" in r1.lower(), r1  # #265: «Я сейчас удалю напоминание …»
     db_session.expire_all()
     assert db_session.get(FamilyReminder, rid).status == "pending", "до «да» не удалять"
     # ход2 «да» (resume) — НОВЫЙ stub не нужен: cancel re-run сам, chat вернёт финал
@@ -476,7 +476,7 @@ async def test_confirm_pause_sets_awaiting_confirm(db_session):
                            thread_id=thread, llm=_cancel_script(rid),
                            user_text="удали разминку", inbound_message_id="m1", channel="max")
     assert getattr(r1, "awaiting_confirm", False) is True, repr(r1)
-    assert "точно" in r1.lower()
+    assert "подтверждение" in r1.lower()  # #265: «…Нужно твоё подтверждение.»
 
 
 @pytest.mark.asyncio
