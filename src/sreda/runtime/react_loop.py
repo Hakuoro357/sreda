@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import operator
 import re
@@ -315,14 +316,54 @@ class ReactState(MessagesState):
     intent_meta: dict
     # #232 способ Б: выжимка истории живёт в ОТДЕЛЬНОЙ таблице react_summaries (НЕ в канале чекпойнта —
     # она вне таймлайна разговора). Грузится в handle_turn и прокидывается в _build_graph параметром.
+    # #221 Ф3: разрешённые домены для _apply_domain_policy (ТОЛЬКО execute-режим). Last-value каналы; None/
+    # отсутствует → фильтр НЕ применяется (disabled/shadow byte-identical). Ставятся на свежем ходу из
+    # compute_allowed_domains; resume читает из чекпойнта. Тип Optional — на resume старого чекпойнта = None.
+    router_allowed_read_domains: list[str] | None
+    router_allowed_write_domains: list[str] | None
+    # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
+    # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
+    router_decision_json: str | None
 
 
-def _system_prompt(today_str: str) -> str:
+def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
+    # Кэш-дружелюбно (#«кеш везде»): стабильный префикс (одинаков у ВСЕХ) — выше;
+    # динамика — в ХВОСТЕ: persona-preset overlay (по юзеру, 2 варианта) + today (по дню).
+    _overlay = (persona_overlay or "").strip()
+    _preset_block = f"<style_preset>\n{_overlay}\n</style_preset>\n\n" if _overlay else ""
     return (
-        "<persona>\nТы — Среда: тёплый, внимательный личный помощник в мессенджере. "
-        "Помогаешь с напоминаниями, задачами, покупками, меню, рецептами, чек-листами, "
-        "семьёй и заметками. Говоришь по-доброму и по-свойски, будто давно знакомы — "
-        "живая, не казённая, но без приторности и лишних слов.\n</persona>\n\n"
+        "<persona>\nТы — Среда. Близкий человек семьи, который заботится о пользователе, "
+        "а НЕ справочное бюро и НЕ робот-исполнитель команд. Помогаешь с напоминаниями, "
+        "задачами, покупками, меню, рецептами, чек-листами, семьёй и заметками. Говоришь "
+        "тепло и по-свойски, будто давно знакомы — живая, не казённая, без приторности и "
+        "лишних слов. Видишь больше, чем спросили (это эмпатия, а не право выдумывать "
+        "факты — см. правила ниже), но не давишь советами.\n</persona>\n\n"
+        "<character>\n"
+        "ЗАБОТА (когда уместно по контексту — НЕ на каждом ответе, не заваливай советами): "
+        "замечай, что человек упускает (пустой список перед ужином, нет ключевого "
+        "ингредиента для запланированного блюда); связывай факты ЭТОГО хода "
+        "(покупки ↔ меню ↔ семья) — в меню борщ, а свёклы нет в покупках, упомяни; думай на "
+        "шаг вперёд (сохранила рецепт → предложи докупить ингредиенты). Сначала суть, потом "
+        "— уместное короткое доброе наблюдение или follow-up вопрос. Забота НЕ даёт права "
+        "додумывать: связывай ТОЛЬКО то, что реально вернули инструменты в этом ходе "
+        "(см. правила 7–12); выдуманный пункт «из заботы» — это вред.\n"
+        "ТОН: на «ты», никогда «вы»; тёплый, но РАВНЫЙ, без покровительства "
+        "(точную меру ласковости задаёт style_preset в хвосте промта).\n"
+        "ПРИВАТНОСТЬ (критично для доверия): ты помнишь факты ПО ЗАПРОСУ, ты НЕ следишь за "
+        "пользователем. НЕ пиши первой без явного повода. Запрещены навсегда: «Как прошёл "
+        "день?», «Давно тебя не было», «Я заметила, что ты…», «Вижу, что ты…». Не считай "
+        "вслух упоминания («ты N раз говорил про X») — мягко: «похоже, X у тебя часто "
+        "заканчивается».\n</character>\n\n"
+        "<gender>\n"
+        "Среда — ОНА (бренд, критично). ВСЕ глаголы прошедшего времени от своего лица — "
+        "«-ла»/«-лась» (или «-ела»), НЕ «-л»/«-лся», БЕЗ исключений, даже для редкого "
+        "глагола. ❌ посмотрел → ✅ посмотрела; ❌ нашёл/составил/сохранил/добавил/отметил → "
+        "✅ нашла/составила/сохранила/добавила/отметила; возвратные ✅ нашлась, занялась "
+        "(НЕ нашёлся/занялся). О себе — «я/мне/меня»; безличного «выполнено», «можно "
+        "сделать» избегай — теряется голос Среды.\n"
+        "Род ПОЛЬЗОВАТЕЛЯ: пока пол неизвестен — НЕ женский род к нему: «ты сказала», «ты "
+        "сама» НЕЛЬЗЯ; используй «ты говорил(-а)», «ты упомянул(-а)» или безличное «был "
+        "разговор про X». Пол явно указан в профиле/памяти — используй его.\n</gender>\n\n"
         "<identity>\n"
         "На вопрос о создателях, разработчиках, авторах — или на какой модели/нейросети "
         "ты работаешь, «что у тебя под капотом», «какой ты ИИ» — отвечай ДОСЛОВНО: "
@@ -345,13 +386,9 @@ def _system_prompt(today_str: str) -> str:
         "Рецепты и пошаговые инструкции — КАЖДЫЙ ингредиент и КАЖДЫЙ шаг с НОВОЙ строки "
         "(шаги нумеруй «1.», «2.», …), без звёздочек. "
         "Дату и время пиши по-человечески («19 июня, 09:00»). Один вопрос за раз. "
+        "Канцелярит под запретом: НИКОГДА «у вас имеется», «являясь…», «согласно вашему "
+        "запросу», «информирую вас», «вы можете». "
         "Не начинай ответ с «Отлично!», «Конечно!».\n</style>\n\n"
-        f"<context>\nСегодня {today_str}. Относительные даты («сегодня», «завтра», «в пятницу») "
-        "САМ переводи в абсолютные перед вызовом инструментов: дату — YYYY-MM-DD, время — HH:MM, "
-        "момент напоминания — полный ISO-8601 datetime. На СЕГОДНЯ ставь, лишь если момент ещё "
-        "НЕ наступил. Если относительно «Сегодня» он уже ПРОШЁЛ: назван день недели → бери "
-        "СЛЕДУЮЩУЮ такую неделю (+7 дней), а не сегодня; названо только время суток → завтра.\n"
-        "</context>\n\n"
         "<tools>\nНапоминания:\n"
         "- list_reminders(title_match): активные напоминания (ref, название, время).\n"
         "- schedule_reminder(title, trigger_iso): создать напоминание. Время должен назвать "
@@ -377,7 +414,7 @@ def _system_prompt(today_str: str) -> str:
         "не выдумывай.\n</scope>\n\n"
         "<examples>\nПравильно:\nПользователь: «удали напоминание про зал»\n"
         "→ list_reminders(title_match=\"зал\"); если ровно одно — cancel_reminder(ref).\n"
-        "Пользователь: «вечернее» (ответ на выбор)\n"
+        "Пользователь: «вечернее» (ВЫБОР из показанного списка В ЭТОМ ЖЕ ходе, НЕ новый запрос)\n"
         "→ НЕ вызывать list_reminders снова; cancel_reminder(ref вечернего).\n"
         "Пользователь: «добавь задачу полить цветы завтра»\n"
         "→ add_task(title=\"полить цветы\", scheduled_date=<завтра YYYY-MM-DD>).\n"
@@ -385,14 +422,19 @@ def _system_prompt(today_str: str) -> str:
         "Вот твой список покупок:\n— молоко\n— хлеб\n— яйца\n\n"
         "Неправильно (так НЕ делай):\n"
         "- перечислять списком в ОДНУ строку: «список: — молоко — хлеб» (НАДО каждый с новой строки);\n"
-        "- вызывать list повторно, когда список уже есть;\n"
+        "- вызывать list повторно В ОДНОМ ХОДЕ, когда он уже получен в этом ответе (но на НОВЫЙ "
+        "запрос «покажи» — вызывай заново: данные могли измениться);\n"
         "- спрашивать «точно удалить?» через ask_human — это делают сами cancel/delete;\n"
         "- спрашивать несколько вещей сразу.\n</examples>\n\n"
         "<rules>\n1. Если по запросу подходит НЕ ровно одно — ask_human, какое именно "
         "(перечисли варианты с временем/датой).\n"
         "2. Определился ровно один — вызови нужный инструмент по его ref. Подтверждение "
-        "разрушающие берут сами; не дублируй.\n3. Минимум вызовов: список уже получен — не "
-        "запрашивай снова.\n4. ref бери из результата list_*, не выдумывай.\n"
+        "разрушающие берут сами; не дублируй.\n3. Минимум вызовов ВНУТРИ одного хода: если список "
+        "уже получен инструментом В ЭТОМ ОТВЕТЕ (напр. после уточняющего выбора) — не запрашивай "
+        "его снова в том же ходе. НО новый запрос пользователя («покажи», «что у меня в…», «какие у "
+        "меня…») — это ВСЕГДА свежий вызов list_*: данные могли измениться с прошлого раза (в т.ч. "
+        "через приложение), НЕ бери список из прежних сообщений.\n"
+        "4. ref бери из результата list_*, не выдумывай.\n"
         "5. Один вопрос за раз.\n"
         "6. ЛЮБОЙ список (напоминания, задачи, покупки, меню, рецепты) — ВСЕГДА построчно: "
         "вводная фраза с двоеточием, затем КАЖДЫЙ пункт на ОТДЕЛЬНОЙ строке с «— ». "
@@ -464,7 +506,15 @@ def _system_prompt(today_str: str) -> str:
         "уверена»/«не знаю», не сочиняй. Если САМА задаёшь вопрос-викторину — ты ОБЯЗАНА уже знать "
         "верный ответ; не задавай вопрос, ответа на который не знаешь, а на «сдаюсь» назови ответ "
         "из того, что знаешь, НЕ ищи его по кругу инструментами.\n"
-        "</rules>"
+        "</rules>\n\n"
+        # --- ХВОСТ (динамика, кэш-враждебное — после стабильного префикса) ---
+        + _preset_block
+        + f"<context>\nСегодня {today_str}. Относительные даты («сегодня», «завтра», «в пятницу») "
+        "САМА переводи в абсолютные перед вызовом инструментов: дату — YYYY-MM-DD, время — HH:MM, "
+        "момент напоминания — полный ISO-8601 datetime. На СЕГОДНЯ ставь, лишь если момент ещё "
+        "НЕ наступил. Если относительно «Сегодня» он уже ПРОШЁЛ: назван день недели → бери "
+        "СЛЕДУЮЩУЮ такую неделю (+7 дней), а не сегодня; названо только время суток → завтра.\n"
+        "</context>"
     )
 
 
@@ -782,10 +832,9 @@ _CORE_READONLY_TOOLS = frozenset({
 # умолчанию считается ПИШУЩИМ (не в read-only) → guard подавится → дубля не будет. Пин-тест
 # (test_core_mutating_derivation_202) ловит дрейф read-only набора (чтобы туда не попал write-инструмент).
 _CORE_MUTATING_TOOLS = _CORE_TOOL_NAMES - _CORE_READONLY_TOOLS
-# Валидные ленивые семьи — СИНХРОННО с Literal need_family ниже. run_tools ре-валидирует
-# arg против этого набора (Literal в схеме не гарантирует — модель может галлюцинировать).
-_LAZY_FAMILIES = frozenset({
-    "shopping", "recipes", "menu", "household", "checklists", "web", "memory"})
+# Валидные ленивые семьи — СИНХРОННО с Literal need_family ниже. #221: данные в нейтральном
+# react_routing_data (единый источник, без цикла preflight↔loop); здесь ре-экспорт имени.
+from sreda.runtime.react_routing_data import LAZY_FAMILIES as _LAZY_FAMILIES  # noqa: E402
 
 
 @tool
@@ -823,11 +872,88 @@ def _bind_for(all_tools: list, active_families: Any, intent: str | None) -> list
     return _select_tools(all_tools, active_families)
 
 
+# #221 Ф2: контрол/мета-инструменты — всегда проходят доменный фильтр (не относятся к user-домену; это
+# escape/служебные: уточнение, догрузка семьи, self-delete с собственным confirm).
+_META_TOOLS = frozenset({"ask_human", "need_family", "delete_my_account"})
+# Бэспоук-инструменты ReAct, чьё runtime-имя ≠ имени в манифесте/TOOL_OP_CLASS (R1 CRITICAL: иначе fail-closed
+# молча вырежет рабочий core-инструмент). Канонизируем имя ДО поиска метаданных. `unlink_task` совпадает с
+# манифестом — алиас не нужен.
+_TOOL_NAME_ALIASES = {"link_task": "link_task_to_checklist"}
+
+
+def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
+    """#221 Ф2: финальный фильтр набора по РАЗРЕШЁННЫМ доменам (применяется на ВСЕХ bind-сайтах в Ф3).
+    Инструмент проходит, ТОЛЬКО если read_domains ⊆ allowed_read И write_domains ⊆ allowed_write (гейт по
+    write_domains домена-скоупинга, НЕ по литералу ToolSpec — см. families.py). Мета — всегда; инструмент без
+    метаданных (неизвестный) → fail-closed. allowed_* = None → НЕ фильтровать (legacy/OFF)."""
+    if allowed_read is None and allowed_write is None:
+        return tools
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_read_domains, tool_write_domains
+    ar, aw = set(allowed_read or ()), set(allowed_write or ())
+    out = []
+    for t in tools:
+        name = _TOOL_NAME_ALIASES.get(t.name, t.name)
+        if t.name in _META_TOOLS:
+            out.append(t)
+        elif name not in TOOL_OP_CLASS:  # неизвестный инструмент → fail-closed
+            continue
+        elif tool_read_domains(name) <= ar and tool_write_domains(name) <= aw:
+            out.append(t)
+    return out
+
+
 # #165 Срез A guard — детерминированный backstop «не отказать молчаливо».
 # ЛИМИТ ПРОХОДОВ chat/ход (анти-петля для ВСЕГО цикла, не только guard): при достижении
 # route → стоп-узел (грациозный выход), НЕ дожидаясь recursion_limit (тот — внешний нет
 # с большим запасом, см. _cfg). Срез добавил круги (детуры need_family) → запас нужен.
 _MAX_TURN_PASSES = 8
+
+# Терминальный ответ анти-петли (stop-узел при исчерпании лимита проходов). Маркер —
+# стабильная подстрока (без markdown/id/списков → переживает _postformat); по ней детектор
+# #258 НАДЁЖНО ловит штопор. По passes>=лимит ловить нельзя: успешный длинный ход ровно из
+# _MAX_TURN_PASSES проходов (детуры need_family/guard #165/#221) даёт passes=лимит, но
+# отвечает в END без stop → был бы ложный «штопор» (R1 MAJOR субагент #258).
+_MAX_STEPS_MARKER = "не получилось довести до конца за разумное число шагов"
+_MAX_STEPS_REPLY = f"Прости, {_MAX_STEPS_MARKER}. Уточни, пожалуйста, что именно нужно?"
+
+# #258: «деградировавшие» исходы хода, на которые алертим оператора (max_steps ловим
+# отдельно по тексту stop-узла — см. _MAX_STEPS_MARKER).
+_DEGRADED_OUTCOMES = frozenset({"tool_error", "fallback_used", "safe_reply"})
+
+
+def _maybe_alert_degraded_turn(
+    *, tenant_id: str, user_id: str | None, channel: str, turn_key: str,
+    user_text: str, reply_text: str, outcome: str, passes: int,
+) -> None:
+    """#258: если ReAct-ход деградировал (штопор / запасной LLM / ошибка инструмента /
+    safe-reply) — алерт оператору в Среду (admin-чат) через send_admin_alert (DB-dedup +
+    burst-cap + severity-rate-limit → не флудит). Цель: сбои падают оператору сразу, а не
+    всплывают по случайному скриншоту. Best-effort: любой сбой алерта НЕ влияет на ход.
+    Приватность: алерт идёт в ПРИВАТНЫЙ админ-чат; tenant_id+turn_key нужны для разбора
+    (поиск в react_turn_trace), кусочки текста обрезаны."""
+    try:
+        _p = int(passes or 0)
+        if _MAX_STEPS_MARKER in (reply_text or ""):
+            reason = "max_steps"  # штопор: РЕАЛЬНЫЙ заход в stop-узел (по тексту, не по passes)
+        elif outcome in _DEGRADED_OUTCOMES:
+            reason = outcome
+        else:
+            return  # нормальный ход — не шумим
+        from sreda.services.admin_alerts import send_admin_alert
+        _q = (user_text or "").strip()[:160]
+        _a = (reply_text or "").strip()[:160]
+        send_admin_alert(
+            severity="P2",  # деградация = «знать + разобрать», не срочно (контракт P0/P1/P2/INFO)
+            title=f"Среда: деградировавший ход — {reason}",
+            body=(f"причина: {reason} · passes: {_p} · канал: {channel}\n"
+                  f"тенант: {tenant_id} · turn_key: {turn_key}\n"
+                  f"вопрос: {_q}\nответ: {_a}"),
+            dedupe_key=f"degraded:{reason}:{tenant_id}",
+        )
+    except Exception:  # noqa: BLE001 — алерт НЕ валит ход
+        logger.warning("react_loop: degraded-turn alert failed", exc_info=True)
+
+
 # #215: лимит web-инструментов на ход ПО ИНТЕНТУ (смягчён — прежний ≤1 душил факты: модель делала
 # 1 поиск + 1 fetch и упиралась в лимит, отвечала «не могу из-за ограничений»). chat — болтовня,
 # ресёрч почти не нужен; fact — реальный вопрос, нужен поиск → открыть → уточнить. Жёсткий потолок от
@@ -845,26 +971,8 @@ _REFUSAL_MARKERS = (
 # (_route_families top-k), и для guard-добора (_guard_family). Тюнится по shadow-логам.
 # Дефисы нормализуются (чек-лист→чеклист). Хэнд-словарь — бутстрап (Kimi: позже learned-роутер).
 _WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
-_FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
-    "shopping": ("купи", "покуп", "корзин", "продукт", "молок", "хлеб", "овощ", "фрукт", "магазин"),
-    "recipes": ("рецепт", "приготов", "блюд", "ингредиент"),
-    "menu": ("меню", "недел", "ужин", "обед", "завтрак"),
-    # #165 тюнинг (2026-06-24): «пункт» — замер выбора показал «отметь пункт» брал list_tasks вместо checklists.
-    "checklists": ("чеклист", "сборы", "поручен", "пункт"),  # «чек-лист» → дефис нормализуется в «чеклист»
-    # #165 тюнинг (2026-06-24, R2/R3 по ревью): household-промахи замера («кто в семье»→recall_memory).
-    # ПРЕФИКСНЫЕ корни ниже — явные формы жена*/мужа* (НЕ широкие жен/муж: ловили бы женщина/мужчина/мужской).
-    # Короткие коллизионные «муж»/«муже» (ном./предл.) — через _FAMILY_EXACT_ROOTS (точный токен, не префикс),
-    # иначе «мой муж»/«о муже» промахивались бы (Codex R2 MAJOR: промах хуже лишнего бинда). Числительное
-    # «семь» (4 симв) короче любого сем-корня (≥5) → не матчит; сын/дочк/дети не ловят «сыр/детский/детали»
-    # (расходятся на 3–4-м симв). Остаточные «женат»/«мужать» — приняты (по смыслу про семью / редки); ложный
-    # матч лишь ДОБАВЛЯет household (route без cap → не вытесняет, не ломает).
-    "household": ("домочад", "родствен", "член", "семьи", "семью", "семей", "семейн", "семье", "семья", "семьё",
-                  "жена", "жене", "жену", "жены", "женой", "мужа", "мужу", "мужем",
-                  "сын", "дочк", "дочер", "дети", "детей", "ребён", "ребен"),
-    "web": ("найди", "поищ", "погугл", "поиск", "новост", "погода", "погоду", "погоды",
-            "курс", "интернет", "сайт"),  # корни сужены (R2: найд/погод→ложные «найден/погоди»)
-    "memory": ("запомни", "заметк", "запиш", "сохран"),  # запиши / сохрани факт
-}
+# #221: словарь корней перенесён в нейтральный react_routing_data (единый источник). Тюнинг — там.
+from sreda.runtime.react_routing_data import FAMILY_ROOTS as _FAMILY_ROOTS  # noqa: E402
 # #165 Срез B (R3-карв-аут) + #165 Фаза 5 (#163 разблокировка): ЯВНАЯ классификация write-policy
 # ленивых семей = ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ для инварианта «семья прунабельна ⇒ её durable-write
 # инструменты идемпотентны» (тест test_prunable_families_invariant_165). Значения:
@@ -916,9 +1024,8 @@ _UNKEYED_WRITE_FAMILIES = frozenset(
 # «муж» (префикс → мужчина/мужской/мужественный), «муже» (→ мужество/мужественный). Точное равенство
 # токену даёт recall на «мой муж»/«о муже» БЕЗ этих ложных срабатываний (Codex high+medium R2 MAJOR:
 # промах хуже лишнего бинда). Прочие household-формы (жена*/мужа/мужу/мужем/сын/дочк/дети) — префиксные.
-_FAMILY_EXACT_ROOTS: dict[str, tuple[str, ...]] = {
-    "household": ("муж", "муже"),
-}
+# #221: перенесено в нейтральный react_routing_data (единый источник). Ре-экспорт имени.
+from sreda.runtime.react_routing_data import FAMILY_EXACT_ROOTS as _FAMILY_EXACT_ROOTS  # noqa: E402
 
 
 def _route_families(text: str, k: int = 2) -> list[str]:
@@ -952,6 +1059,26 @@ def _summary_enabled_for(tenant_id: str) -> bool:
     Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
     from sreda.config.settings import get_settings
     return tenant_id in get_settings().react_summary_tenants
+
+
+def _domain_scope() -> str:
+    """#221 Ф3: режим доменного скоупинга ∈ {disabled, shadow, execute}. disabled (дефолт) → byte-identical."""
+    from sreda.config.settings import get_settings
+    return get_settings().react_domain_scope
+
+
+def _is_domain_execute_tenant(tenant_id: str) -> bool:
+    """#221 Ф4 (канареечная раскатка): драйвит ли роутер РЕАЛЬНО (execute) для этого тенанта при
+    глобальном mode=execute. Пусто → никому (mode=execute = глобальный shadow); ``*`` → всем."""
+    from sreda.config.settings import get_settings
+    return tenant_id in get_settings().react_domain_scope_execute_tenants
+
+
+def _tail_directives_enabled() -> bool:
+    """#247: динамические директивы (section-hint #215 + guard-нудж) — в ХВОСТ, а не в системный промпт.
+    OFF (дефолт) → легаси (дописываем в sp). ON → системный промпт стабилен (кеш-префикс цел)."""
+    from sreda.config.settings import get_settings
+    return bool(getattr(get_settings(), "react_tail_directives_enabled", False))
 
 
 def _looks_like_refusal(content: Any) -> bool:
@@ -1561,6 +1688,25 @@ def _record_react_usage(*, bind: Any, tenant_id: str, provider_key: str, model: 
         logger.warning("react_loop: usage record failed", exc_info=True)
 
 
+def _persona_overlay_for(session: Any, tenant_id: str, user_id: str) -> str:
+    """persona-preset (warm_practical/tender_care) юзера → overlay-текст стиля для
+    промта. Fail-open: нет сессии/ошибка → "" (базовый характер). #242 (task-путь) /
+    #250 (chat/fact-путь) считают этим ОДНИМ helper'ом — один источник, один формат."""
+    if session is None:
+        return ""
+    try:
+        from sreda.services.housewife_persona import (
+            build_persona_overlay,
+            get_persona_preset,
+        )
+        return build_persona_overlay(
+            get_persona_preset(session, tenant_id=tenant_id, user_id=user_id)
+        )
+    except Exception:  # noqa: BLE001 — персона не валит ход; дефолт = базовый характер
+        logger.warning("react_loop: persona overlay failed (fail-open to base)", exc_info=True)
+        return ""
+
+
 def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str,
                  session: Any = None, provider_key: str = "",
@@ -1569,6 +1715,9 @@ def _build_graph(llm: Any, all_tools: list, *,
                  # выбирает по effective_intent. deepseek_llm=None (OFF/мисконфиг) → chat/fact на Фредди+web-only.
                  deepseek_llm: Any = None, chat_prompt: str = "",
                  deepseek_provider_key: str = "", preflight_enabled: bool = False,
+                 # #242/#250: предрасчитанный overlay стиля (handle_turn считает ОДИН раз на ход
+                 # для task+chat промтов). None → посчитать здесь самим (прямой вызов/тест).
+                 persona_overlay: str | None = None,
                  channel: str = "", thread_id: str = "",  # #163 Фаза 3d: провенанс react-аудита в ctx
                  history_summary: dict | None = None):  # #232 способ Б: выжимка из таблицы (потребление)
     """#165 Срез A: СЫРОЙ llm + ВСЕ инструменты среза. Узлы chat/tools привязывают/резолвят
@@ -1577,7 +1726,14 @@ def _build_graph(llm: Any, all_tools: list, *,
 
     #175: session (для bind изолированной accounting-сессии) + provider_key (планировщика) —
     chat-узел пишет usage каждого вызова LLM в skill_ai_executions (деньги/#150)."""
-    system_prompt = _system_prompt(today_str)
+    # #242: persona-preset (warm_practical/tender_care) из профиля юзера → overlay в промт,
+    # чтобы выбор стиля в онбординге снова влиял на тон. Предрасчёт из handle_turn (#250 —
+    # тот же overlay идёт и в chat/fact-промт); None → считаем сами (back-compat/тест).
+    _persona_overlay = (
+        persona_overlay if persona_overlay is not None
+        else _persona_overlay_for(session, tenant_id, user_id)
+    )
+    system_prompt = _system_prompt(today_str, persona_overlay=_persona_overlay)
     # #175: каноничное имя модели — ТЕМ ЖЕ резолвером, что legacy #151 (planner/llm), чтобы
     # ключ (provider_key, model) совпал с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
     # response_metadata.model_name мог бы дать иную форму → unpriced. Резолвим РАЗ (не на вызов).
@@ -1604,11 +1760,16 @@ def _build_graph(llm: Any, all_tools: list, *,
     # #159 п.1: wall-clock потолок на ОДИН вызов LLM в узле chat. Резолвим РАЗ (не на вызов);
     # мисконфиг настройки НЕ валит граф — дефолт обёртки 60с. Зависший primary → LLMCallTimeout
     # → ветка fallback (Оса/Фредди); без fallback → исключение во внешний guard → safe-reply.
+    # #256: chat/fact-ветка — ОТДЕЛЬНЫЙ короткий таймаут (быстрый фоллбэк при блипе провайдера/егресса);
+    # task-таймаут (60с) НЕ трогаем (Mercury-планировщик + многоходовка с tool-call'ами). Резолвим РАЗ.
     try:
         from sreda.config.settings import get_settings as _gs2
-        _react_timeout_s = float(_gs2().react_llm_timeout_sec)
-    except Exception:  # noqa: BLE001 — настройка недоступна → дефолт обёртки (60с)
+        _s2 = _gs2()
+        _react_timeout_s = float(_s2.react_llm_timeout_sec)
+        _chat_timeout_s = float(_s2.react_chat_llm_timeout_sec)
+    except Exception:  # noqa: BLE001 — настройка недоступна/мисконфиг → безопасные дефолты
         _react_timeout_s = 60.0
+        _chat_timeout_s = 15.0
 
     def chat(state: ReactState):
         # #197: effective_intent — читаем сохранённый intent ТОЛЬКО при preflight_enabled. OFF → None →
@@ -1625,7 +1786,9 @@ def _build_graph(llm: Any, all_tools: list, *,
             # SCOPE всегда web-only (bound по eff ДО try → fallback наследует тот же bound → не расширится);
             # МОДЕЛЬ best-effort (deepseek → при сбое bind/invoke Фредди с ТЕМ ЖЕ web-only + chat_prompt,
             # НЕ task). Если и Фредди+web-only упадёт → исключение во внешний guard → safe-reply (scope цел).
-            bound = _bind_for(all_tools, state.get("active_families"), eff)
+            bound = _apply_domain_policy(  # #221 Ф3: фильтр разрешённых разделов (None allowed → no-op, byte-identical)
+                _bind_for(all_tools, state.get("active_families"), eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = chat_prompt or system_prompt
             _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                       budget=_compact_budget(), summary=history_summary)
@@ -1633,39 +1796,76 @@ def _build_graph(llm: Any, all_tools: list, *,
             _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
             _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
             _t0 = _time.perf_counter()
-            try:  # guarded bind+invoke (deepseek может не принять tool-схему); #159: под wall-clock таймаутом
+            try:  # guarded bind+invoke (deepseek может не принять tool-схему); #256: КОРОТКИЙ chat-таймаут
                 resp = invoke_with_per_call_timeout(
-                    _primary.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
+                    _primary.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s)
             except Exception as _e:  # noqa: BLE001 — сбой/таймаут deepseek → fallback Фредди web-only
                 logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
-                resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; тоже под таймаутом
-                    llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
+                resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
+                    llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s)
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:
-            # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical).
+            # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical при router_allowed=None).
             # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
-            bound = _select_tools(all_tools, state.get("active_families"))
+            # #221 Ф3: + фильтр разрешённых разделов (execute ставит router_allowed_*; иначе None → no-op).
+            bound = _apply_domain_policy(
+                _select_tools(all_tools, state.get("active_families")),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = system_prompt
             nudge = state.get("guard_nudge")
-            if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
-                sp = f"{sp}\n\n{nudge}"
             # #215: детерминированная карта «слово→раздел». Фредди (быстрая модель) сам путал «покажи
             # дела» → list_reminders. Ловим слово-раздел ПО КОДУ (не доверяем промпту, урок #180) и
             # вставляем жёсткую директиву (какой list_* звать) на ЭТОТ проход. ТОЛЬКО при eff=="task"
             # (preflight ВКЛ + task-интент) — НЕ на OFF (eff=None): иначе OFF-промпт менялся бы на «покажи
-            # дела» и ломал byte-identical rollback (code-review R1 MAJOR, оба Codex). Порядок: sp→nudge→section.
+            # дела» и ломал byte-identical rollback (code-review R1 MAJOR, оба Codex).
+            # #250: на ВКЛЮЧЁННОМ роутере (execute, router_allowed_* выставлен) брать БЕСКОНФЛИКТНУЮ директиву
+            # РОУТЕРА (единый авторитет: «список покупок»→shopping→директивы нет), а НЕ сырой _section_hint —
+            # тот на слове «список» даёт checklists даже для «список покупок» → конфликт со скоупом (list_checklists
+            # срезан) → бот показывал ДЕЛА вместо покупок и упирался в лимит. На disabled/shadow роутер инструменты
+            # не сужает → легаси _section_hint (единственный механизм; не регрессим). _section_hint жив как
+            # детектор командности внутри route_domains — его НЕ трогаем.
+            # NB (R1 субагент): директива — ТОЛЬКО из детерминированного route_domains; на LLM-фолбэке (нет
+            # детерм. домена → classify_domains дал скоуп) directive=None by design (строго безопаснее: не
+            # подмешиваем подсказку мимо LLM-выбранного скоупа). Потенц. follow-up — директива по classified.
+            _sec = None
             if eff == "task":
-                from sreda.runtime.react_preflight import _section_hint
-                _sec = _section_hint(_last_human_text(state["messages"]))
+                _text = _last_human_text(state["messages"])
+                if state.get("router_allowed_read_domains") is not None:
+                    from sreda.runtime.react_preflight import route_domains
+                    _sec = route_domains(_text).directive
+                else:
+                    from sreda.runtime.react_preflight import _section_hint
+                    _sec = _section_hint(_text)
+            # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
+            # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
+            # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
+            if _tail_directives_enabled():
+                _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
+                                          budget=_compact_budget(), summary=history_summary)
+                _tail = [d for d in (nudge, _sec) if d]
+                if _tail:
+                    _directive = "\n\n".join(_tail)
+                    # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
+                    # (Mercury/Оса) принимают user в конце ВСЕГДА; трейлинг system после истории/tool —
+                    # непроверенный контракт. Приклеиваем к последнему user-сообщению (без двойного user);
+                    # иначе (хвост = tool/assistant, напр. guard-нудж после refusal) — отдельным user.
+                    if _msgs and isinstance(_msgs[-1], HumanMessage):
+                        _msgs = [*_msgs[:-1],
+                                 HumanMessage(content=f"{_msgs[-1].content}\n\n{_directive}")]
+                    else:
+                        _msgs = [*_msgs, HumanMessage(content=_directive)]
+            else:
+                if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
+                    sp = f"{sp}\n\n{nudge}"
                 if _sec:
                     sp = f"{sp}\n\n{_sec}"
-            # #194: компакция истории как prompt-view (sp уже с nudge → порядок sp→nudge→compaction-note).
-            # OFF → [SystemMessage(sp), *messages] (как было). Канон state["messages"] не мутируется.
-            _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
-                                      budget=_compact_budget(), summary=history_summary)
+                # #194: компакция истории как prompt-view. OFF → [SystemMessage(sp), *messages] (как было).
+                # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
+                _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
+                                          budget=_compact_budget(), summary=history_summary)
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
@@ -1749,9 +1949,27 @@ def _build_graph(llm: Any, all_tools: list, *,
         # загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш. #197: тот же
         # `_bind_for(eff)`, что в chat-узле (chat/fact → web-only; иначе галлюцинация need_family
         # открыла бы семью мимо bind).
-        bound_by_name = {t.name: t for t in _bind_for(all_tools, active, eff)}
-        out = []
+        # #221 Ф3: dispatch-набор тоже под доменным фильтром (execute) — иначе галлюцинация инструмента вне
+        # разрешённых разделов исполнилась бы; None allowed → no-op (byte-identical).
         added = False
+        # #259: need_family в батче должен влиять на ЗАВИСИМЫЕ инструменты ТОГО ЖЕ батча.
+        # Агент естественно батчит [need_family(X), инструмент_семьи_X]; раньше need_family
+        # «доезжал до следующего chat» (active обновлялся в цикле, но bound_by_name — нет), и
+        # инструмент в том же проходе падал «unavailable» → агент повторял тот же батч → петля
+        # до лимита шагов (инцидент #259, штопор на правке списка). Пре-скан грузит семьи из
+        # need_family-вызовов ДО привязки → bound_by_name видит их сразу. ТОЛЬКО task (на
+        # chat/fact need_family не в наборе — web-only; не расширяем семью мимо bind, #197).
+        if eff not in ("chat", "fact"):
+            for _ptc in state["messages"][-1].tool_calls:
+                if _ptc.get("name") == "need_family":
+                    _pf = (_ptc.get("args") or {}).get("family")
+                    if isinstance(_pf, str) and _pf in _LAZY_FAMILIES and _pf not in active:
+                        active.append(_pf)
+                        added = True
+        bound_by_name = {t.name: t for t in _apply_domain_policy(
+            _bind_for(all_tools, active, eff),
+            state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
+        out = []
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
@@ -1903,10 +2121,12 @@ def _build_graph(llm: Any, all_tools: list, *,
         attempted = list(state.get("guard_attempted_families") or [])
         fam = _guard_family(_last_human_text(state["messages"]), active)
         update: dict = {}
+        added: set[str] = set()  # #221 Ф3: семьи, реально ДОБРАННЫЕ этим guard-вызовом (для точного allowed_read)
         if fam and fam not in attempted:
             # точечный добор семьи по словарю-роутеру
             if fam not in active:
                 active.append(fam)
+                added.add(fam)
             attempted.append(fam)
             nudge = (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
                      "инструментом, не отвечай «не умею».")
@@ -1918,6 +2138,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             for f in _LAZY_FAMILIES:
                 if f not in active:
                     active.append(f)
+                    added.add(f)
             update["guard_full_attempted"] = True
             nudge = ("Все инструменты теперь доступны — выполни запрос пользователя, "
                      "не отвечай «не умею».")
@@ -1926,6 +2147,12 @@ def _build_graph(llm: Any, all_tools: list, *,
             "guard_attempted_families": attempted,
             "guard_nudge": nudge,
         })
+        # #221 Ф3: в execute расширить allowed_READ ТОЛЬКО реально добранными семьями (R1 high: не всем active —
+        # иначе при classifier-only маршруте вернулись бы чужие read-инструменты). WRITE НЕ расширяем (write-гейт
+        # сохранён; guard-recovery read-safe — route не пускает сюда после wrote_unkeyed). None → no-op (disabled).
+        if state.get("router_allowed_read_domains") is not None and added:
+            update["router_allowed_read_domains"] = sorted(
+                set(state.get("router_allowed_read_domains") or []) | added)
         return update
 
     def stop(state: ReactState):
@@ -1937,9 +2164,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                         name=tc["name"], tool_call_id=tc["id"])
             for tc in (getattr(last, "tool_calls", None) or [])
         ]
-        out.append(AIMessage(
-            content="Прости, не получилось довести до конца за разумное число шагов. "
-                    "Уточни, пожалуйста, что именно нужно?"))
+        out.append(AIMessage(content=_MAX_STEPS_REPLY))  # #258: маркер для детектора штопора
         return {"messages": out}
 
     g = StateGraph(ReactState)
@@ -2440,6 +2665,9 @@ async def handle_turn(
         # #197: preflight — рассуждающую модель для chat/fact строим ОДИН раз (дёшево, без сети). Мисконфиг
         # (нет ключа/неизвестный провайдер) → None → chat/fact пойдёт на Фредди+web-only (НЕ task). Сбой
         # setup → OFF на этот ход (как будто preflight выключен) — ход не падает.
+        # #250: persona overlay (стиль) считаем ОДИН раз на ход — нужен и task-промту
+        # (_system_prompt через _build_graph), и chat/fact-промту (болтовня тоже живая).
+        _persona_overlay = _persona_overlay_for(session, tenant_id, user_id)
         _preflight = False
         _deepseek_llm = None
         _chat_prompt = ""
@@ -2459,7 +2687,7 @@ async def handle_turn(
             try:
                 from sreda.runtime.react_preflight import chat_fact_system_prompt
                 from sreda.services.llm import get_chat_llm
-                _chat_prompt = chat_fact_system_prompt(today_str)
+                _chat_prompt = chat_fact_system_prompt(today_str, persona_overlay=_persona_overlay)
                 if _deepseek_pk:
                     _deepseek_llm = get_chat_llm(provider=_deepseek_pk)  # None при мисконфиге
             except Exception:  # noqa: BLE001 — сбой build → deepseek None, preflight НЕ выключаем
@@ -2481,7 +2709,9 @@ async def handle_turn(
             fallback_llm=fallback_llm,  # #184: Оса-fallback
             deepseek_llm=_deepseek_llm, chat_prompt=_chat_prompt,  # #197 state-driven селектор
             deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight,
-            channel=channel, thread_id=base, history_summary=_summary)  # #232 выжимка (потребление)
+            persona_overlay=_persona_overlay,  # #250: тот же overlay, что у chat-промта (1 чтение/ход)
+            channel=channel, thread_id=base,  # #163 Фаза 3d: провенанс react-аудита
+            history_summary=_summary)  # #232 выжимка (потребление)
 
         snap = await graph.aget_state(_cfg(gen))
         live_pause = (_has_pause(snap)
@@ -2548,7 +2778,20 @@ async def handle_turn(
             # fail-open task). prev_intent + история — из снапа прошлого хода. fail-open в task — ТОЛЬКО здесь.
             _init: dict = {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
                            "active_families": base_fams, "guard_attempted_families": [],
-                           "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False}
+                           # R1 high (соседний баг того же класса): guard_full_attempted — last-value канал
+                           # «один раз за ХОД». Без сброса ход2 того же треда унаследует True → не получит
+                           # full-recovery (#202-страховка канон-интента мимо словаря). Сбрасываем.
+                           "guard_full_attempted": False,
+                           "turn_pass_count": 0, "guard_nudge": "", "wrote_unkeyed": False,
+                           # #221 Ф3 (R1 CRITICAL): СБРОС каждый свежий ход — last-value каналы переживают
+                           # invoke в одном треде; без сброса после execute-хода disabled/shadow фильтровали бы
+                           # из чекпойнта (не byte-identical). execute ниже перезапишет.
+                           "router_allowed_read_domains": None, "router_allowed_write_domains": None,
+                           # #221 Ф3b-фикс: router_decision_json ТОЖЕ сбрасывать (как allowed_*). Иначе ход,
+                           # пропустивший доменный блок (intent=чат/факт), писал бы в трейс СТАРОЕ решение
+                           # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
+                           # не затрагивало (бинд по allowed_*, они сброшены), только колонка лога.
+                           "router_decision_json": None}
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
@@ -2562,6 +2805,61 @@ async def handle_turn(
                     _init["intent"] = await classify_intent(_recent, user_text, _prev, llm, raw_sink=_raw)
                     _init["intent_meta"] = {"source": "classifier", "must_task": False,
                                             "classifier_raw": (_raw[0] if _raw else "")}
+                # #221 Ф3: доменный скоуп. execute → новый ontology-роутер драйвит active_families + allowed-домены
+                # (ТОЛЬКО pruned-тенант — доменный роутер заменяет _route_families, pruned-only; non-pruned
+                # full-bind не трогаем). shadow → только лог решения (исполнение legacy, классификатор НЕ зовём —
+                # лишняя латентность/сбой на legacy-пути). disabled → ничего (byte-identical). Только task-путь.
+                # Весь блок в try/except (R1 MAJOR): сбой доменного роутинга НЕ роняет ход → legacy fail-open.
+                _dsm = _domain_scope()
+                if _dsm in ("shadow", "execute") and _init.get("intent") == "task" and _is_pruned(tenant_id):
+                    try:
+                        from sreda.runtime.react_preflight import (
+                            classify_domains, compute_allowed_domains, route_domains)
+                        _route = route_domains(user_text)
+                        # #221 Ф4: РЕАЛЬНО драйвить (execute) только при глобальном mode=execute И тенанте в
+                        # канареечном списке; иначе (mode=shadow ЛИБО execute-но-тенант-не-в-списке) → shadow-лог.
+                        _eff_execute = (_dsm == "execute") and _is_domain_execute_tenant(tenant_id)
+                        if _eff_execute:
+                            # нет детерм. домена → LLM-фолбэк по домену (read-only по compute).
+                            _classified = (await classify_domains(_recent, user_text, llm)
+                                           if not _route.all_domains else None)
+                            _ar, _aw = compute_allowed_domains(_route, _classified)
+                            # active_families = разрешённые-на-ЧТЕНИЕ ленивые (R1 medium: грузить и classifier-домен,
+                            # и кросс-пару — не только route.active_families, иначе фильтру нечего пропускать).
+                            _ractive = sorted(set(_ar) & set(_LAZY_FAMILIES))
+                            _init["active_families"] = _ractive
+                            _init["router_allowed_read_domains"] = sorted(_ar)
+                            _init["router_allowed_write_domains"] = sorted(_aw)
+                            _clf = list(_classified.domains) if _classified else None
+                            _conf = (_classified.confidence if _classified else "deterministic")
+                        else:  # shadow — детерм. решение; классификатор НЕ зовём (латентность/сбой на legacy);
+                            # _init НЕ трогаем (исполнение legacy). router_active = что execute ЗАГРУЗИЛ БЫ.
+                            _ar, _aw = compute_allowed_domains(_route, None)
+                            _ractive = sorted(set(_ar) & set(_LAZY_FAMILIES))
+                            _clf, _conf = None, "not_run_in_shadow"
+                        # #221 Ф3b: решение роутера в трейс (БЕЗ ПД: только домены/семьи + confidence + флаги) —
+                        # источник для измерения shadow-расхождений (≤5%) и будущей петли самообучения.
+                        # mode = ЭФФЕКТИВНЫЙ режим (execute только если реально драйвили этот тенант).
+                        _init["router_decision_json"] = json.dumps({
+                            "mode": ("execute" if _eff_execute else "shadow"),
+                            "primary_domain": _route.primary_domain,
+                            "all_domains": list(_route.all_domains),
+                            "classified": _clf, "confidence": _conf,
+                            "classifier_would_run": (not _route.all_domains),
+                            "allowed_read": sorted(_ar), "allowed_write": sorted(_aw),
+                            "router_active": _ractive, "legacy_active": list(base_fams),
+                            "compound": _route.compound_by_connector,
+                            "cross_intent": _route.cross_intent,
+                        }, ensure_ascii=False)
+                        if not _eff_execute:  # эффективный shadow (mode=shadow ИЛИ тенант вне execute-списка)
+                            logger.info("react_domain shadow: primary=%s ar=%s aw=%s legacy=%s",
+                                        _route.primary_domain, sorted(_ar), sorted(_aw), base_fams)
+                    except Exception:  # noqa: BLE001 — sidecar/роутинг не роняет ход; legacy (router_allowed=None)
+                        logger.warning("react_domain: routing failed → legacy fail-open", exc_info=True)
+                        _init["active_families"] = base_fams
+                        _init["router_allowed_read_domains"] = None
+                        _init["router_allowed_write_domains"] = None
+                        _init["router_decision_json"] = None
             result = await graph.ainvoke(_init, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
@@ -2595,12 +2893,21 @@ async def handle_turn(
                 _outcome = ("tool_error" if any(t.get("result_kind") == "error" for t in _tcs)
                             else "fallback_used" if any(c.get("fallback_fired") for c in (_lcs or []))
                             else "ok")
+                # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
+                _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
+                _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
                     confirm_state=("confirmed" if live_pause else "none"),  # best-effort
                     outcome=_outcome,
-                    passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0)
+                    passes=_passes_fin,
+                    routing_decision_json=_rdj)
+                # #258: деградировавший ход → алерт оператору (best-effort; _outcome/passes уже
+                # посчитаны; на проде трейс ВКЛ — он же источник сигнала).
+                _maybe_alert_degraded_turn(
+                    tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
+                    user_text=user_text, reply_text=str(reply), outcome=_outcome, passes=_passes_fin)
             except Exception:  # noqa: BLE001 — трейс не валит ход
                 logger.warning("react_loop: trace finish failed", exc_info=True)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
@@ -2638,6 +2945,10 @@ async def handle_turn(
                 tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                 turn_key=_tk_trace, reply_text=str(_reply), llm_calls=None, tool_calls=None,
                 confirm_state="none", outcome="safe_reply", passes=0)
+            # #258: поймано исключение хода (safe-reply) — деградировавший ход → алерт оператору.
+            _maybe_alert_degraded_turn(
+                tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
+                user_text=user_text, reply_text=str(_reply), outcome="safe_reply", passes=0)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                             channel=channel, user_text=user_text, reply=_reply,
                             tools=[], kind="error")

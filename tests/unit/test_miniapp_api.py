@@ -682,3 +682,105 @@ class TestMiniAppScheduleWeek:
             assert "Прогулка" in titles, f"missing on {day['date']}"
 
 
+class TestMiniAppWeeklyMenu:
+    """#235 — read-only weekly-menu API restore (GET grid for #/menu screen)."""
+
+    def test_menu_item_dict_serialises_own_recipe_title_and_calories(self):
+        from types import SimpleNamespace
+
+        from sreda.api.routes.miniapp import _menu_item_dict
+
+        recipe = SimpleNamespace(
+            title="Борщ", calories_per_serving=250, tenant_id="t", user_id="u",
+        )
+        item = SimpleNamespace(
+            id="i1", day_of_week=2, meal_type="dinner",
+            recipe_id="r1", free_text=None, notes=None, recipe=recipe,
+        )
+        out = _menu_item_dict(item, tenant_id="t", user_id="u")
+        assert out["recipe_title"] == "Борщ"
+        assert out["recipe_calories"] == 250
+        assert out["day_of_week"] == 2 and out["meal_type"] == "dinner"
+
+    def test_menu_item_dict_free_text_cell_has_no_recipe_fields(self):
+        from types import SimpleNamespace
+
+        from sreda.api.routes.miniapp import _menu_item_dict
+
+        item = SimpleNamespace(
+            id="i2", day_of_week=0, meal_type="breakfast",
+            recipe_id=None, free_text="Овсянка", notes=None, recipe=None,
+        )
+        out = _menu_item_dict(item, tenant_id="t", user_id="u")
+        assert out["free_text"] == "Овсянка"
+        assert out["recipe_title"] is None
+        assert out["recipe_calories"] is None
+
+    def test_menu_item_dict_hides_cross_tenant_recipe(self):
+        """R1 MAJOR: a recipe_id pointing at ANOTHER (tenant,user)'s recipe
+        must NOT leak its title/calories through the read endpoint."""
+        from types import SimpleNamespace
+
+        from sreda.api.routes.miniapp import _menu_item_dict
+
+        foreign = SimpleNamespace(
+            title="Чужой борщ", calories_per_serving=300,
+            tenant_id="other_t", user_id="other_u",
+        )
+        item = SimpleNamespace(
+            id="i3", day_of_week=1, meal_type="lunch",
+            recipe_id="r9", free_text=None, notes=None, recipe=foreign,
+        )
+        out = _menu_item_dict(item, tenant_id="tenant_test", user_id="user_test")
+        assert out["recipe_title"] is None     # foreign recipe NOT leaked
+        assert out["recipe_calories"] is None
+        assert out["recipe_id"] == "r9"        # own id passes through
+
+    def test_weekly_menu_empty_returns_plan_none(self, seeded_client):
+        resp = seeded_client.get(
+            "/miniapp/api/v1/weekly-menu",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"plan": None}
+
+    def test_weekly_menu_returns_grid_after_seeding(self, seeded_client):
+        from datetime import date
+
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_menu import HousewifeMenuService, MenuCellInput
+
+        session = get_session_factory()()
+        try:
+            HousewifeMenuService(session).plan_week(
+                tenant_id="tenant_test", user_id="user_test",
+                week_start=date(2026, 6, 22),
+                cells=[
+                    MenuCellInput(day_of_week=0, meal_type="breakfast", free_text="Овсянка"),
+                    MenuCellInput(day_of_week=2, meal_type="dinner", free_text="Борщ"),
+                ],
+            )
+        finally:
+            session.close()
+
+        resp = seeded_client.get(
+            "/miniapp/api/v1/weekly-menu",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 200
+        plan = resp.json()["plan"]
+        assert plan is not None
+        cells = {(c["day_of_week"], c["meal_type"]): c for c in plan["items"]}
+        assert cells[(0, "breakfast")]["free_text"] == "Овсянка"
+        assert cells[(2, "dinner")]["free_text"] == "Борщ"
+        assert "recipe_title" in cells[(0, "breakfast")]  # serializer shape intact
+
+    def test_weekly_menu_invalid_week_start_returns_400(self, seeded_client):
+        """R1: bad ?week_start= → controlled 400, not 500 (mirror schedule/week)."""
+        resp = seeded_client.get(
+            "/miniapp/api/v1/weekly-menu?week_start=notadate",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 400
+
+

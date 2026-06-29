@@ -8,9 +8,13 @@ GC 30д — по updated_at (ветка в retention).
 
 Безопасность миграции: CREATE TABLE новой таблицы — без блокировок существующих данных, мгновенно.
 
-Revision ID: 20260629_0068
-Revises: 20260623_0067
+Revision ID: 20260629_0069
+Revises: 20260625_0068
 Create Date: 2026-06-29
+
+NB (#232 sync 2026-06-29): перецеплено 0068→0069 при синке ветки с main — main принёс
+20260625_0068_react_trace_routing_decision (#221) от того же предка 0067 (две головы). Линеаризация:
+0067 → 0068 (routing_decision) → 0069 (react_summaries).
 """
 
 from __future__ import annotations
@@ -20,8 +24,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = "20260629_0068"
-down_revision = "20260623_0067"
+revision = "20260629_0069"
+down_revision = "20260625_0068"
 branch_labels = None
 depends_on = None
 

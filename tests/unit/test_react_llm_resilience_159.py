@@ -195,6 +195,7 @@ async def test_chat_fact_primary_timeout_falls_back_to_freddie(db_session, monke
     monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
     monkeypatch.setenv("SREDA_REACT_PREFLIGHT_CHAT_PROVIDER", "openrouter-deepseek")
     monkeypatch.setenv("SREDA_REACT_LLM_TIMEOUT_SEC", _TIMEOUT_S)
+    monkeypatch.setenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", _TIMEOUT_S)  # #256: chat/fact под КОРОТКИМ таймаутом
     st_mod.get_settings.cache_clear()
     monkeypatch.setattr(react_loop, "_record_react_usage", lambda **kw: None)
     import sreda.services.llm as llm_mod
@@ -272,11 +273,12 @@ async def test_task_invoke_uses_settings_timeout(db_session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_fact_invoke_uses_settings_timeout(db_session, monkeypatch):
-    """chat/fact-ветка (preflight ON, intent=chat): первичный вызов deepseek тоже идёт через
-    обёртку с тем же сроком из настройки."""
+    """#256: chat/fact-ветка (preflight ON, intent=chat) идёт через обёртку со сроком из ОТДЕЛЬНОЙ
+    настройки react_chat_llm_timeout_sec (короткий), НЕ из общего react_llm_timeout_sec."""
     monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
     monkeypatch.setenv("SREDA_REACT_PREFLIGHT_CHAT_PROVIDER", "openrouter-deepseek")
-    monkeypatch.setenv("SREDA_REACT_LLM_TIMEOUT_SEC", "23")
+    monkeypatch.setenv("SREDA_REACT_LLM_TIMEOUT_SEC", "60")  # task-таймаут — НЕ должен попасть в chat/fact
+    monkeypatch.setenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", "23")
     st_mod.get_settings.cache_clear()
     seen: list[float] = []
 
@@ -309,4 +311,5 @@ async def test_chat_fact_invoke_uses_settings_timeout(db_session, monkeypatch):
         fallback_llm=None, user_text="кто такой Пушкин?",
         inbound_message_id="m-cf", channel="telegram", provider_key="inception-mercury2")
     assert seen and 23.0 in seen, seen
+    assert 60.0 not in seen, f"#256: chat/fact НЕ должен брать task-таймаут (60с): {seen}"
     st_mod.get_settings.cache_clear()

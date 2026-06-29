@@ -453,6 +453,13 @@ class Settings(BaseSettings):
     react_compact_budget_chars: int = Field(
         default=0, validation_alias="SREDA_REACT_COMPACT_BUDGET_CHARS"
     )
+    # #247: кеш-дисциплина. OFF (дефолт) → section-hint #215 + guard-нудж дописываются в СИСТЕМНЫЙ промпт
+    # (нестабильный префикс каждый ход → ломается кеш большого префикса Mercury). ON → системный промпт
+    # СТАБИЛЕН, директивы уходят в ХВОСТ (отдельным сообщением после истории) → кеш-префикс не рушится,
+    # инструкция-следование даже лучше (свежесть). Дефолт OFF = byte-identical.
+    react_tail_directives_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_TAIL_DIRECTIVES"
+    )
     # #197: preflight intent-router. OFF (дефолт) → прежнее: один Фредди, полный набор инструментов
     # (byte-identical через effective_intent=None — даже при чекпойнте с intent=chat). ON → классификатор
     # намерения (task/chat/fact): task→Фредди+полный набор; chat/fact→deepseek+web-only+поиск≤1
@@ -464,6 +471,31 @@ class Settings(BaseSettings):
     # через get_chat_llm(provider=...). Недоступен/мисконфиг → fail-open в task (Фредди), scope web-only.
     react_preflight_chat_provider: str = Field(
         default="openrouter-deepseek", validation_alias="SREDA_REACT_PREFLIGHT_CHAT_PROVIDER"
+    )
+    # #221 Ф3: режим доменного скоупинга инструментов (ОТДЕЛЬНЫЙ от preflight #197, R4 Codex medium — не
+    # сворачивать в один флаг, иначе миграция сломает #197). Три состояния:
+    #   "disabled" (дефолт) — точный legacy: старый _route_families, БЕЗ нового роутера/логов → byte-identical;
+    #   "shadow" — legacy-исполнение + sidecar-лог решения нового роутера (только свежий ход, try/except,
+    #             НЕ мутирует state) → сравнение расхождений перед включением;
+    #   "execute" — новый ontology-роутер драйвит active_families + _apply_domain_policy на bind-сайтах.
+    # Активен ТОЛЬКО при react_preflight_enabled (домены — надстройка на task-пути). Невалидное значение →
+    # "disabled" (fail-safe). Старый bool preflight НЕ затронут (миграция: старый прод-env сохраняет #197,
+    # домен-режим по умолчанию disabled — R4 golden env-parsing).
+    react_domain_scope_mode: str = Field(
+        default="disabled", validation_alias="SREDA_REACT_DOMAIN_SCOPE_MODE"
+    )
+
+    @property
+    def react_domain_scope(self) -> str:
+        """Нормализованный режим доменного скоупинга ∈ {disabled, shadow, execute}; иначе → disabled (fail-safe)."""
+        v = (self.react_domain_scope_mode or "").strip().lower()
+        return v if v in ("disabled", "shadow", "execute") else "disabled"
+    # #221 Ф4 (канареечная раскатка execute): даже при глобальном mode=execute РЕАЛЬНО драйвить роутер
+    # только для тенантов из этого списка; остальные при execute ведут себя как shadow (лог-only). Так
+    # execute катится постепенно (сперва тенант Бориса → проверка «дела» → ``*`` на всех). Пусто (дефолт)
+    # → НИКОМУ execute (mode=execute без списка = глобальный shadow). ``*`` → ВСЕ (полная раскатка).
+    react_domain_scope_execute_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS"
     )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
@@ -589,6 +621,24 @@ class Settings(BaseSettings):
             "primary (Mercury/deepseek) so the turn falls over to the #184 "
             "fallback (Osa/Freddie) instead of hanging. Applies to both the "
             "task and chat/fact branches, primary and fallback invokes."
+        ),
+    )
+    react_chat_llm_timeout_sec: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_CHAT_LLM_TIMEOUT_SEC",
+            "sreda_react_chat_llm_timeout_sec",
+        ),
+        description=(
+            "#256: separate, SHORTER wall-clock cap for the chat/fact branch "
+            "LLM calls (primary + fallback), in seconds. Default 15s — the "
+            "chat/fact reasoning model is normally 1-3s, so a hung primary "
+            "fails over to the #184 Freddie web-only fallback fast instead of "
+            "the user waiting the full task cap (``react_llm_timeout_sec``, "
+            "60s — kept long for Mercury multi-hop tool turns). Misconfig → "
+            "code falls back to a safe default."
         ),
     )
     planner_prompt_version: int = Field(
@@ -1025,6 +1075,13 @@ class Settings(BaseSettings):
         """#232 способ Б: тенанты с durable-выжимкой истории (генерация + потребление). Пусто (дефолт) →
         НИКОМУ (фича OFF, потребление байт-идентично #194); ``*`` → ВСЕ. Канарейка/kill-switch."""
         return _parse_tenant_gate(self.react_summary_tenants_raw)
+
+    @property
+    def react_domain_scope_execute_tenants(self) -> frozenset[str]:
+        """#221 Ф4: тенанты, на которых доменный роутер РЕАЛЬНО драйвит (execute) при глобальном
+        mode=execute. Пусто (дефолт) → НИКОМУ execute (mode=execute = глобальный shadow); ``*`` → ВСЕ
+        (полная раскатка). Канареечный гейт: сперва тенант Бориса, после проверки «дела» → ``*``."""
+        return _parse_tenant_gate(self.react_domain_scope_execute_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:

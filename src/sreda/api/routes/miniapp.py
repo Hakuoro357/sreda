@@ -35,6 +35,7 @@ from sreda.services.billing import (
     DeprecatedPlanError,
 )
 from sreda.services.housewife_family import HousewifeFamilyService
+from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
@@ -1263,18 +1264,105 @@ def delete_recipe_endpoint(
 
 # ---------------------------------------------------------------------------
 # JSON API — Menu planning (housewife v1.1)
-# REMOVED from Mini App 2026-04-22. Voice + backend (HousewifeMenuService,
-# plan_week_menu/update_menu_item/list_menu/clear_menu/
-# generate_shopping_from_menu chat tools) preserved intact in
-# services/housewife_menu.py and services/housewife_chat_tools.py.
-# UI may return in a later iteration; this section was the front door,
-# nothing downstream relied on it.
+# READ-ONLY restore 2026-06-25 (#235): weekly-menu card+screen were removed
+# 2026-04-22 (commit 5e5ae19) — the EDITING UX was unfinished (LLM flaky on
+# partial cell updates). Restoring ONLY the read path: GET grid for the
+# #/menu screen. Editing (PATCH cell / generate-shopping / regenerate) stays
+# OUT; mutations go through voice as before.
 # ---------------------------------------------------------------------------
 
 
-# (menu helpers + 5 endpoints removed below — they lived here before
-#  the 2026-04-22 Mini App cleanup. Task scheduler below replaces
-#  the UI slot.)
+def _menu_item_dict(item, *, tenant_id: str, user_id: str | None) -> dict:
+    """Serialise one menu cell for the week grid. Includes the linked
+    recipe's title + per-serving calories if any — saves a round-trip
+    when the UI wants to sum "day total kcal".
+
+    Defence-in-depth (R1 review): the linked recipe is exposed ONLY when it
+    belongs to the same (tenant, user). A stale/bad ``recipe_id`` pointing at
+    another user's recipe must not leak its title/calories. Mirrors the
+    ownership filter in ``HousewifeMenuService.aggregate_ingredients_*``.
+    """
+    out = {
+        "id": item.id,
+        "day_of_week": item.day_of_week,
+        "meal_type": item.meal_type,
+        "recipe_id": item.recipe_id,
+        "free_text": item.free_text,
+        "notes": item.notes,
+        "recipe_title": None,
+        "recipe_calories": None,
+    }
+    recipe = item.recipe
+    if (
+        item.recipe_id
+        and recipe is not None
+        and recipe.tenant_id == tenant_id
+        and recipe.user_id == user_id
+    ):
+        out["recipe_title"] = recipe.title
+        out["recipe_calories"] = recipe.calories_per_serving
+    return out
+
+
+def _menu_plan_dict(plan, *, tenant_id: str, user_id: str | None) -> dict:
+    return {
+        "id": plan.id,
+        "week_start_date": plan.week_start_date.isoformat(),
+        "notes": plan.notes,
+        "status": plan.status,
+        "items": [
+            _menu_item_dict(item, tenant_id=tenant_id, user_id=user_id)
+            for item in (plan.items or [])
+        ],
+    }
+
+
+@router.get("/api/v1/weekly-menu")
+def get_weekly_menu(
+    week_start: str | None = None,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Fetch the user's weekly menu grid (read-only, #235).
+
+    Without ``?week_start=`` returns the most recent plan. With it returns
+    the plan for that specific week (Monday-anchored; any date works, the
+    service coerces). ``{"plan": None}`` if no plan exists yet.
+    """
+    service = HousewifeMenuService(session)
+
+    if week_start:
+        try:
+            plan = service.get_plan_for_week(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                week_start=week_start,
+            )
+        except ValueError as exc:
+            # Bad ?week_start= → controlled 400, not a 500 (mirror
+            # the sibling GET /api/v1/schedule/week).
+            raise HTTPException(
+                status_code=400, detail="invalid week_start date"
+            ) from exc
+    else:
+        # list_user_plans is ordered by week_start_date DESC → [0] is the
+        # most recent week.
+        all_plans = service.list_user_plans(
+            tenant_id=ctx.tenant_id, user_id=ctx.user_id
+        )
+        plan = all_plans[0] if all_plans else None
+        if plan is not None:
+            # Re-fetch with items eagerly loaded — list_user_plans
+            # skips them for cheap listings.
+            plan = service.get_plan_for_week(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                week_start=plan.week_start_date,
+            )
+
+    if plan is None:
+        return {"plan": None}
+    return {"plan": _menu_plan_dict(plan, tenant_id=ctx.tenant_id, user_id=ctx.user_id)}
 
 
 # ---------------------------------------------------------------------------

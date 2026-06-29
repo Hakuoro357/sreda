@@ -113,6 +113,80 @@ async def test_trace_integration_disabled_no_row(db_session, _test_engine, monke
         st_mod.get_settings.cache_clear()
 
 
+@pytest.mark.asyncio
+async def test_trace_routing_decision_execute(db_session, trace_on, monkeypatch):
+    """#221 Ф3b: в execute строка трейса несёт routing_decision_json (mode=execute + домен + allowed)."""
+    SF = trace_on
+    monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    u = seed_telegram_user(db_session)
+    db_session.flush()
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", u.tenant_id)
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", u.tenant_id)  # Ф4: канареечный список
+    st_mod.get_settings.cache_clear()
+    stub = _RecordingStubLLM([AIMessage(content="Готово.", usage_metadata=_u(10, 5))])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="tr-rd",
+        llm=stub, user_text="напомни купить молоко", inbound_message_id="m-rd",
+        channel="telegram", provider_key="inception-mercury2")
+    rows = _trace_rows(SF, u.tenant_id)
+    assert len(rows) == 1
+    rd = json.loads(rows[0].routing_decision_json)
+    assert rd["mode"] == "execute" and rd["primary_domain"] == "reminders"
+    assert "reminders" in rd["allowed_read"] and rd["confidence"] == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_trace_routing_decision_disabled_null(db_session, trace_on, monkeypatch):
+    """disabled (дефолт) → routing_decision_json NULL (никаких новых данных при выключенном роутере)."""
+    SF = trace_on
+    monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
+    monkeypatch.delenv("SREDA_REACT_DOMAIN_SCOPE_MODE", raising=False)  # disabled
+    u = seed_telegram_user(db_session)
+    db_session.flush()
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", u.tenant_id)
+    st_mod.get_settings.cache_clear()
+    stub = _RecordingStubLLM([AIMessage(content="Готово.", usage_metadata=_u(10, 5))])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="tr-rd0",
+        llm=stub, user_text="напомни купить молоко", inbound_message_id="m-rd0",
+        channel="telegram", provider_key="inception-mercury2")
+    rows = _trace_rows(SF, u.tenant_id)
+    assert len(rows) == 1 and rows[0].routing_decision_json is None
+
+
+@pytest.mark.asyncio
+async def test_trace_routing_decision_reset_no_stale(db_session, trace_on, monkeypatch):
+    """#221 Ф3b-фикс: router_decision_json СБРАСЫВАЕТСЯ каждый свежий ход. Ход, пропустивший доменный блок
+    (здесь: 2-й ход того же треда при mode=disabled), пишет в трейс None, а НЕ стейл-решение прошлого хода."""
+    SF = trace_on
+    monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
+    u = seed_telegram_user(db_session)
+    db_session.flush()
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", u.tenant_id)
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", u.tenant_id)
+    stub = _RecordingStubLLM([AIMessage(content="ок", usage_metadata=_u(10, 5)),
+                              AIMessage(content="ок2", usage_metadata=_u(10, 5))])
+    # ход 1: execute → router_decision_json = решение (reminders) в чекпойнте треда
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    st_mod.get_settings.cache_clear()
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="reset-th",
+        llm=stub, user_text="напомни купить молоко", inbound_message_id="m-r1",
+        channel="telegram", provider_key="inception-mercury2")
+    # ход 2: ТОТ ЖЕ тред, mode=disabled → доменный блок пропущен → решение должно быть None (сброс)
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "disabled")
+    st_mod.get_settings.cache_clear()
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id="reset-th",
+        llm=stub, user_text="привет", inbound_message_id="m-r2",
+        channel="telegram", provider_key="inception-mercury2")
+    rows = sorted(_trace_rows(SF, u.tenant_id), key=lambda r: r.created_at)
+    assert len(rows) == 2
+    assert json.loads(rows[0].routing_decision_json)["primary_domain"] == "reminders"  # ход1 — решение
+    assert rows[1].routing_decision_json is None  # ход2 — СБРОШЕНО, не стейл reminders
+
+
 def test_trace_debug_suppressed_when_trace_enabled(monkeypatch):
     """Снос #185 dual-write: при trace ВКЛ _persist_debug_turn НЕ пишет react_debug_turns."""
     import sreda.db.session as _dbsess

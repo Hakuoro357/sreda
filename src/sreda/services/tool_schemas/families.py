@@ -529,6 +529,96 @@ REACT_ONLY_TOOLS: Final[frozenset[str]] = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# #221 Ф2: operation-class + read/write домены per-tool.
+# Контракт фильтра «разрешённых разделов» (_apply_domain_policy в react_loop): инструмент привязывается,
+# только если его read_domains ⊆ allowed_read И write_domains ⊆ allowed_write. КРИТИЧНО (R1-ревью): гейтить
+# по write_domains, НЕ по family — кросс-доменные инструменты (семья ≠ мутируемое) иначе протекут.
+# op_class: read_pure (чтение БД), read_external (внешний API), write (мутация durable-данных пользователя).
+# Полнота (каждый инструмент манифеста классифицирован) проверяется на ИМПОРТЕ ниже (R1: unknown → raise,
+# не молчаливый fail-closed на проде). Классификация — по реальному коду (см. plans/221 decision-log).
+# ---------------------------------------------------------------------------
+TOOL_OP_CLASS: Final[Mapping[str, str]] = MappingProxyType({
+    "add_shopping_items": "write", "list_shopping": "read_pure", "mark_shopping_bought": "write",
+    "remove_shopping_items": "write", "update_shopping_item": "write",
+    "update_shopping_items_category": "write", "clear_bought_shopping": "write",
+    "schedule_reminder": "write", "list_reminders": "read_pure", "update_reminder": "write",
+    "cancel_reminder": "write",
+    "save_recipe": "write", "save_recipes_batch": "write", "search_recipes": "read_pure",
+    "get_recipe": "read_pure", "update_recipe": "write", "delete_recipe": "write",
+    "plan_week_menu": "write", "update_menu_item": "write", "list_menu": "read_pure",
+    "generate_shopping_from_menu": "write", "clear_menu": "write",
+    "add_family_members": "write", "list_family_members": "read_pure", "update_family_member": "write",
+    "remove_family_member": "write",
+    "add_task": "write", "list_tasks": "read_pure", "update_task": "write", "complete_task": "write",
+    "uncomplete_task": "write", "cancel_task": "write", "delete_task": "write",
+    "attach_reminder": "write", "detach_reminder": "write", "link_task_to_checklist": "write",
+    "unlink_task": "write",
+    "create_checklist": "write", "add_checklist_items": "write", "list_checklists": "read_pure",
+    "show_checklist": "read_pure", "list_checklist_items": "read_pure", "move_task_to_checklist": "write",
+    "mark_checklist_item_done": "write", "update_checklist_item": "write",
+    "delete_checklist_item": "write", "archive_checklist": "write",
+    "onboarding_answered": "write", "onboarding_deferred": "write", "onboarding_complete": "write",
+    "reply_with_buttons": "write",   # ToolSpec.effect=write (write_domains=ui); не в ReAct-наборе — скоуп моот
+    "save_core_fact": "write", "save_episode": "write", "recall_memory": "read_pure",
+    "log_unsupported_request": "write",  # ToolSpec.effect=write (write_domains=utility); не в ReAct-наборе
+    "get_weather": "read_external", "web_search": "read_external", "fetch_url": "read_external",
+})
+_VALID_OP_CLASSES: Final[frozenset[str]] = frozenset({"read_pure", "read_external", "write"})
+
+# СЕМАНТИКА (R1-ревью Ф2, важно): read/write домены здесь = ДОМЕН СКОУПИНГА (на каком маршруте инструмент
+# доступен), а НЕ литеральные домены ToolSpec.read_domains/write_domains (те описывают ВСЕ затронутые сторы для
+# конфликт-детекта plan-execute и ШИРЕ). Литерал ToolSpec для скоупинга НЕ годится: напр. add_task имеет
+# write=(tasks,checklists,reminders) — гейт по нему ОТРЕЗАЛ БЫ add_task на чистом tasks-маршруте (каскад
+# напоминания/чек-листа — ВНУТРИ управления задачей, не отдельное намерение). Поэтому скоуп = family по дефолту.
+# ДЕФОЛТ: read=(family,); write=(family,) если op_class=="write", иначе (). Override — ТОЛЬКО когда ПЕРВИЧНАЯ
+# мутация в ДРУГОМ домене, чем family (настоящий кросс-домен). Единственный такой — generate_shopping_from_menu
+# (семья menu, но создаёт СПИСОК ПОКУПОК). recall_memory НЕ нуждается в read-override: его family и так = memory,
+# а ToolSpec-broadcast (checklists/reminders) для скоупинга ИГНОРИРУЕТСЯ дефолтом (=family) → recall доступен на
+# memory-маршруте (R1 high). Read-оверрайдов сейчас нет.
+_TOOL_READ_DOMAIN_OVERRIDES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType({})
+_TOOL_WRITE_DOMAIN_OVERRIDES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType({
+    "generate_shopping_from_menu": ("shopping",),            # family=menu, но первичная запись — shopping
+})
+
+
+def tool_read_domains(name: str) -> frozenset[str]:
+    """Домены, к которым инструмент относится по чтению/членству (дефолт = его семья)."""
+    return frozenset(_TOOL_READ_DOMAIN_OVERRIDES.get(name, (TOOL_FAMILY_MANIFEST[name],)))
+
+
+def tool_write_domains(name: str) -> frozenset[str]:
+    """Домены, которые инструмент МУТИРУЕТ (∅ для не-write; дефолт write = его семья)."""
+    if TOOL_OP_CLASS.get(name) != "write":
+        return frozenset()
+    return frozenset(_TOOL_WRITE_DOMAIN_OVERRIDES.get(name, (TOOL_FAMILY_MANIFEST[name],)))
+
+
+def _validate_tool_op_metadata() -> None:
+    """Import-time полнота/согласованность (R1-ревью: unknown op-class → raise, не молчание на проде)."""
+    miss = set(TOOL_FAMILY_MANIFEST) - set(TOOL_OP_CLASS)
+    extra = set(TOOL_OP_CLASS) - set(TOOL_FAMILY_MANIFEST)
+    if miss or extra:
+        raise RuntimeError(f"TOOL_OP_CLASS рассинхрон с манифестом: missing={miss}, extra={extra}")
+    bad = {n: c for n, c in TOOL_OP_CLASS.items() if c not in _VALID_OP_CLASSES}
+    if bad:
+        raise RuntimeError(f"TOOL_OP_CLASS неизвестные классы: {bad}")
+    for n in {**_TOOL_READ_DOMAIN_OVERRIDES, **_TOOL_WRITE_DOMAIN_OVERRIDES}:
+        if n not in TOOL_FAMILY_MANIFEST:
+            raise RuntimeError(f"override для несуществующего инструмента: {n!r}")
+    for n in _TOOL_WRITE_DOMAIN_OVERRIDES:
+        if TOOL_OP_CLASS[n] != "write":
+            raise RuntimeError(f"write-override для не-write инструмента: {n!r} ({TOOL_OP_CLASS[n]})")
+    # R1-ревью MINOR: токены доменов в оверрайдах — реальные семьи (опечатка «shoping» иначе = тихий fail-closed).
+    bad_tokens = {tok for vals in (*_TOOL_READ_DOMAIN_OVERRIDES.values(), *_TOOL_WRITE_DOMAIN_OVERRIDES.values())
+                  for tok in vals if tok not in FAMILIES}
+    if bad_tokens:
+        raise RuntimeError(f"override содержит неизвестные домены (не в FAMILIES): {bad_tokens}")
+
+
+_validate_tool_op_metadata()
+
+
+# ---------------------------------------------------------------------------
 # Runtime bridge: real ToolSpec set ↔ TOOL_FAMILY_MANIFEST agreement
 # ---------------------------------------------------------------------------
 

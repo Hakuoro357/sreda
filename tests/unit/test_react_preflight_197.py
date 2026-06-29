@@ -57,7 +57,8 @@ class _Chat:
     ответов; пишет состав bound в bound_capture; считает вызовы в calls; raise_on_invoke → сбой invoke."""
 
     def __init__(self, label, *, classify="task", responses=None, bound_capture=None,
-                 calls=None, raise_on_invoke=False, sp_capture=None):
+                 calls=None, raise_on_invoke=False, sp_capture=None, msgs_capture=None,
+                 types_capture=None):
         self.label = label
         self._classify = classify
         self._responses = list(responses or [])
@@ -66,6 +67,8 @@ class _Chat:
         self._calls = calls if calls is not None else {}
         self._raise = raise_on_invoke
         self._spcap = sp_capture  # #215: захват system-промпта, что увидела модель
+        self._msgcap = msgs_capture  # #247: захват ВСЕХ сообщений (content) каждого вызова
+        self._typecap = types_capture  # #247 R2: захват РОЛЕЙ (типов сообщений) — защита от регресса роли хвоста
 
     async def ainvoke(self, _msgs):
         self._calls["classify_" + self.label] = self._calls.get("classify_" + self.label, 0) + 1
@@ -80,6 +83,10 @@ class _Chat:
             outer._calls["invoke_" + outer.label] = outer._calls.get("invoke_" + outer.label, 0) + 1
             if outer._spcap is not None and _msgs:
                 outer._spcap.append(getattr(_msgs[0], "content", ""))
+            if outer._msgcap is not None:
+                outer._msgcap.append([getattr(m, "content", "") for m in (_msgs or [])])
+            if outer._typecap is not None:
+                outer._typecap.append([type(m).__name__ for m in (_msgs or [])])
             if outer._raise:
                 raise RuntimeError("boom-" + outer.label)
             if outer._responses:
@@ -494,3 +501,340 @@ def test_resume_keeps_task_scope(install):
     r2 = _turn(freddie, thread="resume", text="да")
     assert "готово" in r2
     assert freddie._calls.get("classify_freddie", 0) == 1   # resume НЕ классифицируется повторно
+
+
+# ───────────────────────── #221 Ф3: проводка доменного скоупа в граф ─────────────────────────
+def test_domain_scope_mode_normalization(install, monkeypatch):
+    """react_domain_scope нормализует значение флага; мусор/пусто → disabled (fail-safe)."""
+    from sreda.config import settings as sm
+    for raw, exp in [("execute", "execute"), ("SHADOW", "shadow"), ("  disabled ", "disabled"),
+                     ("bogus", "disabled"), ("", "disabled")]:
+        monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", raw)
+        sm.get_settings.cache_clear()
+        assert sm.get_settings().react_domain_scope == exp
+
+
+def test_domain_scope_disabled_byte_identical(install, monkeypatch):
+    """disabled (дефолт) + pruned тенант: набор НЕ фильтруется доменом — add_task/recall_memory на месте."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "disabled")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="dsm-off", text="напомни купить молоко")
+    bound = cap["freddie"][-1]
+    assert "add_task" in bound and "recall_memory" in bound  # без доменного фильтра (byte-identical)
+
+
+def test_domain_scope_execute_scopes_tools(install, monkeypatch):
+    """execute + pruned: на reminders-маршруте фильтр срезает чужие домены (add_task=write tasks, recall=read memory),
+    оставляя reminders-инструменты и мета (need_family). Доменный скоуп работает в живом графе."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: тенант в канареечном списке
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="dsm-exec", text="напомни купить молоко")
+    bound = cap["freddie"][-1]
+    assert "schedule_reminder" in bound and "list_reminders" in bound  # reminders-домен разрешён
+    assert "need_family" in bound                                      # мета всегда
+    assert "add_task" not in bound                                     # write tasks ⊄ allowed_write={reminders}
+    assert "recall_memory" not in bound                               # read memory ⊄ allowed_read={reminders}
+
+
+def test_domain_scope_no_stale_leak_across_turns(install, monkeypatch):
+    """R1 CRITICAL: после execute-хода следующий disabled-ход в ТОМ ЖЕ треде НЕ наследует фильтр (router_allowed
+    сброшен в None на свежем ходу; last-value канал иначе переживал бы invoke)."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap,
+                    responses=[AIMessage(content="ок"), AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: канареечный список
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="stale", text="напомни купить молоко")  # execute → router_allowed={reminders} в чекпойнте
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "disabled")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="stale", text="покажи задачи")          # тот же тред, disabled → byte-identical
+    bound = cap["freddie"][-1]
+    assert "add_task" in bound and "recall_memory" in bound       # stale-фильтр НЕ унаследован
+
+
+def test_domain_scope_shadow_is_legacy(install, monkeypatch):
+    """shadow: исполнение legacy (фильтр НЕ применяется), ход не падает — add_task на месте."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "shadow")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    sm.get_settings.cache_clear()
+    r = _turn(freddie, thread="shadow", text="напомни купить молоко")
+    assert "ок" in r
+    assert "add_task" in cap["freddie"][-1]  # shadow = legacy, доменного фильтра нет
+
+
+def test_domain_scope_execute_classify_failure_failopen(install, monkeypatch):
+    """execute + нет детерм. домена: сбой classify_domains → legacy fail-open (фильтр не применён, ход цел)."""
+    from sreda.config import settings as sm
+    from sreda.runtime import react_preflight as rp
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: канареечный список
+    sm.get_settings.cache_clear()
+
+    async def _boom(*a, **k):
+        raise RuntimeError("classify boom")
+    monkeypatch.setattr(rp, "classify_domains", _boom)
+    r = _turn(freddie, thread="exec-fail", text="расскажи что-нибудь интересное")  # нет домена → classify → boom
+    assert "ок" in r                          # ход не упал (try/except → legacy)
+    assert "add_task" in cap["freddie"][-1]   # legacy fail-open: доменный фильтр НЕ применён
+
+
+def test_domain_scope_execute_guard_read_recovery(install, monkeypatch):
+    """R2 субагент (ПРАВИЛО #7): в execute guard full-recovery расширяет allowed_READ (recall_memory появляется
+    на 2-м проходе), но WRITE-гейт ЦЕЛ (add_task/schedule_reminder остаются срезаны) — #202 read-safe."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap,
+                    responses=[AIMessage(content="не умею это"), AIMessage(content="готово")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: канареечный список
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="guard-rec", text="погода завтра")  # web-маршрут; отказ → guard full-recovery
+    last_bound = cap["freddie"][-1]            # bind 2-го прохода (после guard-recovery)
+    assert "recall_memory" in last_bound       # read memory расширен guard-recovery (#202 сохранён)
+    assert "add_task" not in last_bound        # write tasks НЕ расширен (write-гейт цел)
+
+
+def test_domain_scope_execute_canary_excluded_is_shadow(install, monkeypatch):
+    """Ф4 КАНАРЕЙКА: mode=execute, но тенант НЕ в списке → ведёт себя как shadow (фильтр НЕ применён,
+    add_task на месте). Глобальный flip execute не трогает тех, кого нет в канареечном списке."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "other")  # "t" НЕ в списке
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="canary-excl", text="напомни купить молоко")
+    assert "add_task" in cap["freddie"][-1]  # эффективный shadow — фильтр НЕ применён
+
+
+def test_domain_scope_execute_canary_wildcard(install, monkeypatch):
+    """Ф4 КАНАРЕЙКА: mode=execute + список='*' → execute на всех (фильтр применён, add_task срезан)."""
+    from sreda.config import settings as sm
+    cap = {}
+    freddie = _Chat("freddie", classify="task", bound_capture=cap, responses=[AIMessage(content="ок")])
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "*")  # все
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="canary-wild", text="напомни купить молоко")
+    bound = cap["freddie"][-1]
+    assert "schedule_reminder" in bound and "add_task" not in bound  # execute драйвит (фильтр применён)
+
+
+# ───────────────────────── #247: кеш-дисциплина — директивы в ХВОСТ ─────────────────────────
+def test_tail_directives_off_section_in_system_prompt(install, monkeypatch):
+    """Флаг OFF (легаси): section-hint #215 дописан в СИСТЕМНЫЙ промпт (нестабильный префикс — как было)."""
+    from sreda.config import settings as sm
+    spcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], sp_capture=spcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.delenv("SREDA_REACT_TAIL_DIRECTIVES", raising=False)
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="td-off", text="покажи дела")
+    assert any(_HINT_CHECKLIST in (s or "") for s in spcap), "OFF: section должен быть в системном промпте"
+
+
+def test_tail_directives_on_stable_prefix_and_tail(install, monkeypatch):
+    """Флаг ON (#247): системный промпт СТАБИЛЕН (без section), директива section — в ХВОСТЕ (последнее сообщение).
+    Это и чинит кеш-префикс: начало запроса не меняется от текста пользователя."""
+    from sreda.config import settings as sm
+    msgcap, typecap = [], []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")],
+                    msgs_capture=msgcap, types_capture=typecap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="td-on", text="покажи дела")
+    first = msgcap[0]                                   # content всех сообщений 1-го вызова
+    assert _HINT_CHECKLIST not in (first[0] or ""), "ON: системный промпт (первое сообщение) должен быть БЕЗ section"
+    assert _HINT_CHECKLIST in (first[-1] or ""), "ON: section-директива должна быть в ХВОСТЕ (последнее сообщение)"
+    # R2 MINOR (оба Codex): хвост — РОЛЬ user (HumanMessage), не SystemMessage (защита от регресса роли)
+    assert typecap[0][-1] == "HumanMessage", f"ON: хвостовая директива должна быть ролью user, не {typecap[0][-1]}"
+
+
+def test_tail_directives_on_prefix_identical_across_sections(install, monkeypatch):
+    """Флаг ON: системный промпт (первое сообщение) БАЙТ-В-БАЙТ одинаков для РАЗНЫХ разделов — кеш-префикс стабилен."""
+    from sreda.config import settings as sm
+    cap1, cap2 = [], []
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(_Chat("f1", classify="task", responses=[AIMessage(content="ок")], msgs_capture=cap1),
+          thread="td-p1", text="покажи дела")              # → checklists-директива
+    _turn(_Chat("f2", classify="task", responses=[AIMessage(content="ок")], msgs_capture=cap2),
+          thread="td-p2", text="покажи задачи")            # → tasks-директива
+    assert cap1[0][0] == cap2[0][0], "ON: системный промпт должен быть идентичен независимо от раздела запроса"
+
+
+def test_tail_directives_on_nudge_in_tail(install, monkeypatch):
+    """#247 R1 (MINOR medium): guard-нудж тоже уходит в ХВОСТ — последнее сообщение 2-го прохода
+    (после refusal → guard-recovery) содержит нудж."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task",
+                    responses=[AIMessage(content="не умею это"), AIMessage(content="готово")],
+                    msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="td-nudge", text="напомни купить молоко")
+    assert len(msgcap) >= 2, "ожидался 2-й проход после guard-recovery"
+    assert "выполни запрос" in (msgcap[1][-1] or ""), "guard-нудж должен быть в хвосте 2-го прохода (роль user)"
+
+
+# ───────────────────────── #250: section-директива из РОУТЕРА на execute ─────────────────────────
+def _exec_env(monkeypatch):
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "execute")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+
+
+def test_250_execute_router_directive_no_checklist_conflict(install, monkeypatch):
+    """#250: на execute директива берётся из РОУТЕРА. «Покажи список покупок» → shopping → директивы НЕТ →
+    в сообщениях НЕТ checklists-подсказки (раньше сырой _section_hint давал checklists на слове «список»)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    _exec_env(monkeypatch); sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-shop", text="Покажи список покупок")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST not in allmsgs, "#250: на execute «список покупок» НЕ должно быть checklists-директивы"
+
+
+def test_250_execute_checklists_directive_kept(install, monkeypatch):
+    """#250: «покажи дела» на execute → роутер checklists → директива checklists ОСТАЁТСЯ (полезный кейс не сломан)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    _exec_env(monkeypatch); sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-del", text="покажи дела")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST in allmsgs, "#250: «покажи дела» должно сохранить checklists-директиву (роутер checklists)"
+
+
+def test_250_disabled_keeps_legacy_section_hint(install, monkeypatch):
+    """#250: на disabled (роутер не сужает) — легаси _section_hint цел («список покупок»→checklists как было)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.delenv("SREDA_REACT_DOMAIN_SCOPE_MODE", raising=False)  # disabled
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-dis", text="Покажи список покупок")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST in allmsgs, "#250 disabled: легаси _section_hint должен остаться (checklists на «список»)"
+
+
+def test_250_execute_guard_2pass_no_checklist(install, monkeypatch):
+    """#250 R1 (MINOR medium): фикс держится и на guard-2-проходе. execute «список покупок» + отказ → guard →
+    НИ на одном из проходов нет checklists-директивы (router_allowed жив, _last_human_text исходный)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task",
+                    responses=[AIMessage(content="не умею это"), AIMessage(content="готово")],
+                    msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    _exec_env(monkeypatch); sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-guard", text="Покажи список покупок")
+    assert len(msgcap) >= 2, "ожидался 2-й проход после guard"
+    for i, p in enumerate(msgcap):
+        assert _HINT_CHECKLIST not in " ".join(p), f"#250: checklists-директива не должна появляться (проход {i})"
+
+
+def test_250_shadow_keeps_legacy_section_hint(install, monkeypatch):
+    """#250 R1 (MINOR high): в shadow router_allowed=None → легаси _section_hint цел («список покупок»→checklists)."""
+    from sreda.config import settings as sm
+    msgcap = []
+    freddie = _Chat("freddie", classify="task", responses=[AIMessage(content="ок")], msgs_capture=msgcap)
+    install(on=True, deepseek=_Chat("deepseek"), invoked={})
+    monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_MODE", "shadow")
+    monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    sm.get_settings.cache_clear()
+    _turn(freddie, thread="b250-shadow", text="Покажи список покупок")
+    allmsgs = " ".join(m for p in msgcap for m in p)
+    assert _HINT_CHECKLIST in allmsgs, "#250 shadow: легаси _section_hint должен остаться (checklists на «список»)"
+
+
+# ───────────────────────── #256: отдельный короткий таймаут chat/fact ─────────────────────────
+def test_256_chat_fact_short_timeout_task_unchanged(install, monkeypatch):
+    """#256: chat/fact-вызовы под КОРОТКИМ таймаутом (react_chat_llm_timeout_sec); task — под общим 60с."""
+    from sreda.config import settings as sm
+    cap = []
+    def _cap(runnable, msgs, timeout_seconds=None):
+        cap.append(timeout_seconds)
+        return AIMessage(content="ок")
+    monkeypatch.setattr(react_loop, "invoke_with_per_call_timeout", _cap)
+    monkeypatch.setenv("SREDA_REACT_LLM_TIMEOUT_SEC", "60")
+    monkeypatch.setenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", "12")
+    sm.get_settings.cache_clear()
+    # chat/fact ход → короткий таймаут
+    install(on=True, deepseek=_Chat("deepseek", responses=[AIMessage(content="ок")]), invoked={})
+    _turn(_Chat("freddie", classify="chat"), thread="b256-chat", text="расскажи анекдот")
+    assert cap and cap[0] == 12.0, f"chat/fact таймаут должен быть 12с, был {cap[:2]}"
+    # task ход → общий 60с
+    cap.clear()
+    install(on=True, deepseek=_Chat("deepseek2"), invoked={})
+    _turn(_Chat("freddie2", classify="task", responses=[AIMessage(content="готово")]),
+          thread="b256-task", text="покажи мои задачи")
+    assert cap and cap[0] == 60.0, f"task таймаут должен быть 60с, был {cap[:2]}"
+
+
+def test_256_default_when_env_unset(install, monkeypatch):
+    """#256: env НЕ задан → Field-дефолт 15с применяется к chat/fact (R1 субагент MINOR — ассерт значения)."""
+    from sreda.config import settings as sm
+    cap = []
+    def _cap(runnable, msgs, timeout_seconds=None):
+        cap.append(timeout_seconds)
+        return AIMessage(content="ок")
+    monkeypatch.setattr(react_loop, "invoke_with_per_call_timeout", _cap)
+    monkeypatch.delenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", raising=False)
+    sm.get_settings.cache_clear()
+    install(on=True, deepseek=_Chat("deepseek", responses=[AIMessage(content="ок")]), invoked={})
+    _turn(_Chat("freddie", classify="chat"), thread="b256-def", text="как дела")
+    assert cap and cap[0] == 15.0, f"env не задан → дефолт 15с, был {cap[:2]}"
+    sm.get_settings.cache_clear()
+
+
+def test_256_misconfig_does_not_crash(install, monkeypatch):
+    """#256: мусор в env (сломанный деплой) → get_settings падает глобально → ход НЕ падает (safe-reply)."""
+    from sreda.config import settings as sm
+    monkeypatch.setenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", "не-число")
+    sm.get_settings.cache_clear()
+    install(on=True, deepseek=_Chat("deepseek", responses=[AIMessage(content="ок")]), invoked={})
+    # не должно бросить — ход завершается (safe-reply при глобальном сбое конфига)
+    r = _turn(_Chat("freddie", classify="chat"), thread="b256-misc", text="как дела")
+    assert r is not None
+    sm.get_settings.cache_clear()
