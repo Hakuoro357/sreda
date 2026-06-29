@@ -417,11 +417,13 @@ def compute_allowed_domains(
     route: RouteResult, classified: DomainClassResult | None,
 ) -> tuple[frozenset[str], frozenset[str]]:
     """#221 Ф2: политика РАЗРЕШЁННЫХ доменов (allowed_read, allowed_write) из детерм. роутинга + LLM-фолбэка.
-    Это контракт «запись никогда по догадке» + fail-open (план §3/§4). pending_intent/resume — в Ф3.
+    Контракт (Борис 2026-06-29): уверенный раздел (high=один) → можно ПИСАТЬ; безопасность УДАЛЕНИЯ держит
+    confirm-гейт, НЕ запрет записи; fail-open (план §3/§4). pending_intent/resume — в Ф3.
     - направленное кросс-намерение «X из Y» (cross_intent, напр. «покупки из меню») → read оба, write — целевой;
     - детерм. ОДИН домен → read+write (явная команда);
     - детерм. СОСТАВНОЕ (>1, союз) → read оба, write ∅ (compound-write → уточнение в Ф3, не авто-запись);
-    - LLM-fallback high (ровно один) → ТОЛЬКО read (запись не по догадке модели);
+    - LLM-fallback high (ровно один) → read+write (Борис 2026-06-29: запись разрешена; УДАЛЕНИЕ держит
+      confirm-гейт «Да/Нет», а не запрет записи — иначе «убери X» терял инструмент удаления);
     - иначе (low/мусор/нет домена) → ∅/∅ = явный deny (ask_human-only; пустой set ≠ None, R5 Codex medium).
     Возврат — frozenset'ы (пустой = ЯВНЫЙ запрет; None НЕ возвращаем — None зарезервирован для OFF/legacy в графе)."""
     if route.cross_intent in _CROSS_INTENT_POLICY:  # направленное «X из Y» (source-предлог) → целевая запись
@@ -433,7 +435,13 @@ def compute_allowed_domains(
     if len(doms) >= 2:
         return frozenset(doms), frozenset()
     if classified and classified.domains and classified.confidence == "high":
-        return frozenset(classified.domains), frozenset()
+        # #221 (Борис 2026-06-29): уверенное распознавание раздела (high = ровно один домен) → read+write,
+        # как при детерминированном распознавании по словам. Раньше было ТОЛЬКО read → «убери куриное филе»
+        # терял инструмент удаления (write-домен ⊄ ∅) → отказ «нет возможности удалить». Безопасность
+        # УДАЛЕНИЯ держит confirm-гейт (_confirm_wrap: remove_*/delete_*/cancel_* спрашивают Да/Нет), а НЕ
+        # запрет записи. compound (>1 детерм.) выше остаётся write=∅ — там неоднозначность реальна.
+        cd = frozenset(classified.domains)
+        return cd, cd
     return frozenset(), frozenset()
 
 

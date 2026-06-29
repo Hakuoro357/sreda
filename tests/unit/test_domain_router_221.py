@@ -438,7 +438,7 @@ def test_op_class_matches_toolspec_effect():
     assert not mismatch, f"op_class ≠ ToolSpec.effect: {mismatch}"
 
 
-# ── Ф2: compute_allowed_domains (политика «запись не по догадке» + fail-open) ───────────────────────
+# ── Ф2: compute_allowed_domains (уверенный раздел → write; удаление под confirm-гейтом; fail-open) ──
 def test_allowed_deterministic_single_read_and_write():
     r = route_domains("покажи дела")  # детерм. checklists
     ar, aw = compute_allowed_domains(r, None)
@@ -452,11 +452,14 @@ def test_allowed_compound_read_both_no_write():
     assert ar == frozenset({"shopping", "reminders"}) and aw == frozenset()
 
 
-def test_allowed_llm_fallback_read_only():
-    """Нет детерм. домена, LLM high → ТОЛЬКО read (запись не по догадке)."""
-    r = route_domains("расскажи анекдот")  # нет домена
-    ar, aw = compute_allowed_domains(r, DomainClassResult(("checklists",), "high"))
-    assert ar == frozenset({"checklists"}) and aw == frozenset()
+def test_allowed_llm_fallback_high_grants_write_221():
+    """#221 (Борис 2026-06-29): нет детерм. домена, LLM high (ровно один) → read+write (раньше read-only).
+    Безопасность УДАЛЕНИЯ держит confirm-гейт «Да/Нет», а не запрет записи — иначе «убери X» терял инструмент
+    удаления (инцидент «убери куриное филе» → отказ «нет возможности удалить»). RED до фикса: write был ∅."""
+    r = route_domains("расскажи анекдот")  # нет детерм. домена
+    ar, aw = compute_allowed_domains(r, DomainClassResult(("shopping",), "high"))
+    assert ar == frozenset({"shopping"})
+    assert aw == frozenset({"shopping"})
 
 
 def test_allowed_low_confidence_is_explicit_deny():
