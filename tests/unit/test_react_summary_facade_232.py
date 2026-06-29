@@ -67,6 +67,7 @@ def db():
 def wired(monkeypatch, db):
     SF = db
     monkeypatch.setattr(rl, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(rl, "_summary_enabled_for", lambda tid: True)  # #232 канарейка-флаг: вкл для теста
     monkeypatch.setattr(rl, "build_slice_tools", lambda *a, **k: [])
     monkeypatch.setattr(rl, "react_provider", lambda tid: "inception-mercury2")
     monkeypatch.setattr(rl, "_extract_usage", lambda resp: (10, 5))
@@ -94,6 +95,16 @@ def _key():
 
 def test_skip_when_not_persist(monkeypatch, wired):
     monkeypatch.setattr(rl, "_persist_enabled", lambda: False)
+    built = []
+    monkeypatch.setattr(rl, "_build_graph", lambda *a, **k: built.append(1))
+    _run()
+    assert built == []
+    assert store.load_summary(wired["SF"](), _key()) is None
+
+
+def test_skip_when_not_enrolled(monkeypatch, wired):
+    """#232 канарейка: тенант НЕ в SREDA_REACT_SUMMARY_TENANTS → выжимка не генерится (фича OFF)."""
+    monkeypatch.setattr(rl, "_summary_enabled_for", lambda tid: False)
     built = []
     monkeypatch.setattr(rl, "_build_graph", lambda *a, **k: built.append(1))
     _run()

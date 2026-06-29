@@ -947,6 +947,13 @@ def _is_pruned(tenant_id: str) -> bool:
     return tenant_id in get_settings().react_prune_tenants
 
 
+def _summary_enabled_for(tenant_id: str) -> bool:
+    """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
+    Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
+    from sreda.config.settings import get_settings
+    return tenant_id in get_settings().react_summary_tenants
+
+
 def _looks_like_refusal(content: Any) -> bool:
     t = (content if isinstance(content, str) else str(content or "")).lower()
     return any(m in t for m in _REFUSAL_MARKERS)
@@ -2293,6 +2300,8 @@ async def run_post_turn_summary(
     (выжимка применяется только durable-#193-тенантам)."""
     if not _persist_enabled():
         return
+    if not _summary_enabled_for(tenant_id):
+        return  # #232: фича включена только для enrolled-тенантов (канарейка/kill-switch)
     try:  # занять слот без ожидания; занято → skip (не копим задачи)
         await asyncio.wait_for(_SUMMARY_SEM.acquire(), timeout=0.01)
     except Exception:  # noqa: BLE001 — TimeoutError или иное → бэкпрешер-скип
@@ -2383,7 +2392,8 @@ async def _run_post_turn_summary_inner(
         prompt_tokens, completion_tokens = _extract_usage(resp)
         _record_react_usage(  # #175-паттерн: task_type=summary, credits_override=0 (виден в стоимости, не блокирует квоту)
             bind=session.get_bind(), tenant_id=tenant_id, provider_key=_SUMMARY_PROVIDER,
-            model="gemini-2.5-flash-lite", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            # модель = ключ прайсинга _PRICES (иначе ₽ unpriced): openrouter-gemini-2.5-flash-lite → google/...
+            model="google/gemini-2.5-flash-lite", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
             run_id=f"react_summary:{thread_id}", task_type="summary")
         logger.info("react_summary: wrote covered=%d text=%dc tenant=%s", covered_n, len(record["text"]), tenant_id)
     finally:
@@ -2458,7 +2468,7 @@ async def handle_turn(
                 _deepseek_llm = None
         # #232 способ Б: durable-выжимка истории из ТАБЛИЦЫ (не из канала). None / не-durable → поведение #194.
         _summary = None
-        if _persist_enabled():
+        if _persist_enabled() and _summary_enabled_for(tenant_id):
             try:
                 from sreda.services import react_summary_store
                 _summary = react_summary_store.load_summary(session, _durable_thread_id(base))

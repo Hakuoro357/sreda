@@ -496,6 +496,11 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="SREDA_REACT_PRUNE_TENANTS",
     )
+    # #232 способ Б: тенанты с durable-выжимкой истории (генерация+потребление). Дефолт None → НИКОМУ.
+    react_summary_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_REACT_SUMMARY_TENANTS",
+    )
 
     # Plan-Execute LLM provider split (Hakuoro357/vex-assistant#77 item #5).
     # Planner needs heavyweight reasoning + structured-output compliance —
@@ -1014,6 +1019,12 @@ class Settings(BaseSettings):
         Пусто (дефолт) → НИКОМУ → full-bind; ``*`` → ВСЕ тенанты (#159-rollout, экономия
         токенов; измеренно безопасно: −89% токенов, паритет выбора инструмента)."""
         return _parse_tenant_gate(self.react_prune_tenants_raw)
+
+    @property
+    def react_summary_tenants(self) -> frozenset[str]:
+        """#232 способ Б: тенанты с durable-выжимкой истории (генерация + потребление). Пусто (дефолт) →
+        НИКОМУ (фича OFF, потребление байт-идентично #194); ``*`` → ВСЕ. Канарейка/kill-switch."""
+        return _parse_tenant_gate(self.react_summary_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:
