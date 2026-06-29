@@ -899,6 +899,45 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
 # route → стоп-узел (грациозный выход), НЕ дожидаясь recursion_limit (тот — внешний нет
 # с большим запасом, см. _cfg). Срез добавил круги (детуры need_family) → запас нужен.
 _MAX_TURN_PASSES = 8
+
+# #258: «деградировавшие» исходы хода, на которые алертим оператора (помимо max_steps —
+# тот ловим по passes>=_MAX_TURN_PASSES, т.к. в outcome он пишется как «ok»).
+_DEGRADED_OUTCOMES = frozenset({"tool_error", "fallback_used", "safe_reply"})
+
+
+def _maybe_alert_degraded_turn(
+    *, tenant_id: str, user_id: str | None, channel: str, turn_key: str,
+    user_text: str, reply_text: str, outcome: str, passes: int,
+) -> None:
+    """#258: если ReAct-ход деградировал (штопор / запасной LLM / ошибка инструмента /
+    safe-reply) — алерт оператору в Среду (admin-чат) через send_admin_alert (DB-dedup +
+    burst-cap + severity-rate-limit → не флудит). Цель: сбои падают оператору сразу, а не
+    всплывают по случайному скриншоту. Best-effort: любой сбой алерта НЕ влияет на ход.
+    Приватность: алерт идёт в ПРИВАТНЫЙ админ-чат; tenant_id+turn_key нужны для разбора
+    (поиск в react_turn_trace), кусочки текста обрезаны."""
+    try:
+        _p = int(passes or 0)
+        if _p >= _MAX_TURN_PASSES:
+            reason = "max_steps"  # штопор: исчерпан лимит шагов
+        elif outcome in _DEGRADED_OUTCOMES:
+            reason = outcome
+        else:
+            return  # нормальный ход — не шумим
+        from sreda.services.admin_alerts import send_admin_alert
+        _q = (user_text or "").strip()[:160]
+        _a = (reply_text or "").strip()[:160]
+        send_admin_alert(
+            severity="warning",
+            title=f"Среда: деградировавший ход — {reason}",
+            body=(f"причина: {reason} · passes: {_p} · канал: {channel}\n"
+                  f"тенант: {tenant_id} · turn_key: {turn_key}\n"
+                  f"вопрос: {_q}\nответ: {_a}"),
+            dedupe_key=f"degraded:{reason}:{tenant_id}",
+        )
+    except Exception:  # noqa: BLE001 — алерт НЕ валит ход
+        logger.warning("react_loop: degraded-turn alert failed", exc_info=True)
+
+
 # #215: лимит web-инструментов на ход ПО ИНТЕНТУ (смягчён — прежний ≤1 душил факты: модель делала
 # 1 поиск + 1 fetch и упиралась в лимит, отвечала «не могу из-за ограничений»). chat — болтовня,
 # ресёрч почти не нужен; fact — реальный вопрос, нужен поиск → открыть → уточнить. Жёсткий потолок от
@@ -2643,13 +2682,19 @@ async def handle_turn(
                             else "ok")
                 # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
                 _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
+                _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
                     confirm_state=("confirmed" if live_pause else "none"),  # best-effort
                     outcome=_outcome,
-                    passes=(result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0,
+                    passes=_passes_fin,
                     routing_decision_json=_rdj)
+                # #258: деградировавший ход → алерт оператору (best-effort; _outcome/passes уже
+                # посчитаны; на проде трейс ВКЛ — он же источник сигнала).
+                _maybe_alert_degraded_turn(
+                    tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
+                    user_text=user_text, reply_text=str(reply), outcome=_outcome, passes=_passes_fin)
             except Exception:  # noqa: BLE001 — трейс не валит ход
                 logger.warning("react_loop: trace finish failed", exc_info=True)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
@@ -2687,6 +2732,10 @@ async def handle_turn(
                 tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                 turn_key=_tk_trace, reply_text=str(_reply), llm_calls=None, tool_calls=None,
                 confirm_state="none", outcome="safe_reply", passes=0)
+            # #258: поймано исключение хода (safe-reply) — деградировавший ход → алерт оператору.
+            _maybe_alert_degraded_turn(
+                tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
+                user_text=user_text, reply_text=str(_reply), outcome="safe_reply", passes=0)
         _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
                             channel=channel, user_text=user_text, reply=_reply,
                             tools=[], kind="error")
