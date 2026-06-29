@@ -786,3 +786,55 @@ def test_250_shadow_keeps_legacy_section_hint(install, monkeypatch):
     _turn(freddie, thread="b250-shadow", text="Покажи список покупок")
     allmsgs = " ".join(m for p in msgcap for m in p)
     assert _HINT_CHECKLIST in allmsgs, "#250 shadow: легаси _section_hint должен остаться (checklists на «список»)"
+
+
+# ───────────────────────── #256: отдельный короткий таймаут chat/fact ─────────────────────────
+def test_256_chat_fact_short_timeout_task_unchanged(install, monkeypatch):
+    """#256: chat/fact-вызовы под КОРОТКИМ таймаутом (react_chat_llm_timeout_sec); task — под общим 60с."""
+    from sreda.config import settings as sm
+    cap = []
+    def _cap(runnable, msgs, timeout_seconds=None):
+        cap.append(timeout_seconds)
+        return AIMessage(content="ок")
+    monkeypatch.setattr(react_loop, "invoke_with_per_call_timeout", _cap)
+    monkeypatch.setenv("SREDA_REACT_LLM_TIMEOUT_SEC", "60")
+    monkeypatch.setenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", "12")
+    sm.get_settings.cache_clear()
+    # chat/fact ход → короткий таймаут
+    install(on=True, deepseek=_Chat("deepseek", responses=[AIMessage(content="ок")]), invoked={})
+    _turn(_Chat("freddie", classify="chat"), thread="b256-chat", text="расскажи анекдот")
+    assert cap and cap[0] == 12.0, f"chat/fact таймаут должен быть 12с, был {cap[:2]}"
+    # task ход → общий 60с
+    cap.clear()
+    install(on=True, deepseek=_Chat("deepseek2"), invoked={})
+    _turn(_Chat("freddie2", classify="task", responses=[AIMessage(content="готово")]),
+          thread="b256-task", text="покажи мои задачи")
+    assert cap and cap[0] == 60.0, f"task таймаут должен быть 60с, был {cap[:2]}"
+
+
+def test_256_default_when_env_unset(install, monkeypatch):
+    """#256: env НЕ задан → Field-дефолт 15с применяется к chat/fact (R1 субагент MINOR — ассерт значения)."""
+    from sreda.config import settings as sm
+    cap = []
+    def _cap(runnable, msgs, timeout_seconds=None):
+        cap.append(timeout_seconds)
+        return AIMessage(content="ок")
+    monkeypatch.setattr(react_loop, "invoke_with_per_call_timeout", _cap)
+    monkeypatch.delenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", raising=False)
+    sm.get_settings.cache_clear()
+    install(on=True, deepseek=_Chat("deepseek", responses=[AIMessage(content="ок")]), invoked={})
+    _turn(_Chat("freddie", classify="chat"), thread="b256-def", text="как дела")
+    assert cap and cap[0] == 15.0, f"env не задан → дефолт 15с, был {cap[:2]}"
+    sm.get_settings.cache_clear()
+
+
+def test_256_misconfig_does_not_crash(install, monkeypatch):
+    """#256: мусор в env (сломанный деплой) → get_settings падает глобально → ход НЕ падает (safe-reply)."""
+    from sreda.config import settings as sm
+    monkeypatch.setenv("SREDA_REACT_CHAT_LLM_TIMEOUT_SEC", "не-число")
+    sm.get_settings.cache_clear()
+    install(on=True, deepseek=_Chat("deepseek", responses=[AIMessage(content="ок")]), invoked={})
+    # не должно бросить — ход завершается (safe-reply при глобальном сбое конфига)
+    r = _turn(_Chat("freddie", classify="chat"), thread="b256-misc", text="как дела")
+    assert r is not None
+    sm.get_settings.cache_clear()

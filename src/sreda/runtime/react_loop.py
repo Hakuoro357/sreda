@@ -1743,11 +1743,16 @@ def _build_graph(llm: Any, all_tools: list, *,
     # #159 п.1: wall-clock потолок на ОДИН вызов LLM в узле chat. Резолвим РАЗ (не на вызов);
     # мисконфиг настройки НЕ валит граф — дефолт обёртки 60с. Зависший primary → LLMCallTimeout
     # → ветка fallback (Оса/Фредди); без fallback → исключение во внешний guard → safe-reply.
+    # #256: chat/fact-ветка — ОТДЕЛЬНЫЙ короткий таймаут (быстрый фоллбэк при блипе провайдера/егресса);
+    # task-таймаут (60с) НЕ трогаем (Mercury-планировщик + многоходовка с tool-call'ами). Резолвим РАЗ.
     try:
         from sreda.config.settings import get_settings as _gs2
-        _react_timeout_s = float(_gs2().react_llm_timeout_sec)
-    except Exception:  # noqa: BLE001 — настройка недоступна → дефолт обёртки (60с)
+        _s2 = _gs2()
+        _react_timeout_s = float(_s2.react_llm_timeout_sec)
+        _chat_timeout_s = float(_s2.react_chat_llm_timeout_sec)
+    except Exception:  # noqa: BLE001 — настройка недоступна/мисконфиг → безопасные дефолты
         _react_timeout_s = 60.0
+        _chat_timeout_s = 15.0
 
     def chat(state: ReactState):
         # #197: effective_intent — читаем сохранённый intent ТОЛЬКО при preflight_enabled. OFF → None →
@@ -1774,15 +1779,15 @@ def _build_graph(llm: Any, all_tools: list, *,
             _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
             _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
             _t0 = _time.perf_counter()
-            try:  # guarded bind+invoke (deepseek может не принять tool-схему); #159: под wall-clock таймаутом
+            try:  # guarded bind+invoke (deepseek может не принять tool-схему); #256: КОРОТКИЙ chat-таймаут
                 resp = invoke_with_per_call_timeout(
-                    _primary.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
+                    _primary.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s)
             except Exception as _e:  # noqa: BLE001 — сбой/таймаут deepseek → fallback Фредди web-only
                 logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
-                resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; тоже под таймаутом
-                    llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
+                resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
+                    llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s)
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:

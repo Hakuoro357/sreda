@@ -618,6 +618,24 @@ class Settings(BaseSettings):
             "task and chat/fact branches, primary and fallback invokes."
         ),
     )
+    react_chat_llm_timeout_sec: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_CHAT_LLM_TIMEOUT_SEC",
+            "sreda_react_chat_llm_timeout_sec",
+        ),
+        description=(
+            "#256: separate, SHORTER wall-clock cap for the chat/fact branch "
+            "LLM calls (primary + fallback), in seconds. Default 15s — the "
+            "chat/fact reasoning model is normally 1-3s, so a hung primary "
+            "fails over to the #184 Freddie web-only fallback fast instead of "
+            "the user waiting the full task cap (``react_llm_timeout_sec``, "
+            "60s — kept long for Mercury multi-hop tool turns). Misconfig → "
+            "code falls back to a safe default."
+        ),
+    )
     planner_prompt_version: int = Field(
         default=1,
         ge=1,
