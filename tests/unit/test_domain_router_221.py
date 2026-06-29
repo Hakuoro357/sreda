@@ -438,7 +438,7 @@ def test_op_class_matches_toolspec_effect():
     assert not mismatch, f"op_class ≠ ToolSpec.effect: {mismatch}"
 
 
-# ── Ф2: compute_allowed_domains (политика «запись не по догадке» + fail-open) ───────────────────────
+# ── Ф2: compute_allowed_domains (уверенный раздел → write; удаление под confirm-гейтом; fail-open) ──
 def test_allowed_deterministic_single_read_and_write():
     r = route_domains("покажи дела")  # детерм. checklists
     ar, aw = compute_allowed_domains(r, None)

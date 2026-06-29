@@ -417,7 +417,8 @@ def compute_allowed_domains(
     route: RouteResult, classified: DomainClassResult | None,
 ) -> tuple[frozenset[str], frozenset[str]]:
     """#221 Ф2: политика РАЗРЕШЁННЫХ доменов (allowed_read, allowed_write) из детерм. роутинга + LLM-фолбэка.
-    Это контракт «запись никогда по догадке» + fail-open (план §3/§4). pending_intent/resume — в Ф3.
+    Контракт (Борис 2026-06-29): уверенный раздел (high=один) → можно ПИСАТЬ; безопасность УДАЛЕНИЯ держит
+    confirm-гейт, НЕ запрет записи; fail-open (план §3/§4). pending_intent/resume — в Ф3.
     - направленное кросс-намерение «X из Y» (cross_intent, напр. «покупки из меню») → read оба, write — целевой;
     - детерм. ОДИН домен → read+write (явная команда);
     - детерм. СОСТАВНОЕ (>1, союз) → read оба, write ∅ (compound-write → уточнение в Ф3, не авто-запись);
