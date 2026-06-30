@@ -2078,7 +2078,7 @@
     setupBackButton(true);
     var html = '<h1>🧠 Память</h1>';
     html += '<div class="card-subtitle" style="margin-bottom:12px;line-height:1.4">' +
-            'Что я о вас помню. Тапните категорию — внутри факты по ярусам; их можно править и удалять.</div>';
+            'Тапните категорию — внутри факты по ярусам; их можно править и удалять.</div>';
 
     // Поле появляется ТОЛЬКО при переименовании (тап ✏️ на категории). Постоянного «Создать» нет —
     // категории создаются голосом/текстом через бот (решение владельца); Common есть у всех всегда.
@@ -2113,13 +2113,16 @@
       var expanded = !!state.memExpanded[c.id];
       html += '<div class="card" style="padding:0;overflow:hidden">';
       // Шапка категории: тап по названию раскрывает/сворачивает (id в data-attr, не в inline-строке — R-31).
-      html += '<div style="display:flex;align-items:center;gap:8px;padding:12px 14px">';
+      // Индикатор открытости: раскрытая категория подсвечена фоном + развёрнутый шеврон.
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:12px 14px' +
+              (expanded ? ';background:var(--tg-theme-secondary-bg-color,#e7ebf0)' : '') + '">';
       html += '<div data-mem-id="' + escAttr(c.id) + '" onclick="window._toggleMemoryCategory(this)" ' +
               'style="flex:1;min-width:0;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px">';
-      html += '<div class="card-title" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
-              escHtml(c.name) + '</div>';
+      html += '<div class="card-title" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' +
+              (expanded ? ';font-weight:600' : '') + '">' + escHtml(c.name) + '</div>';
       html += '<div class="card-subtitle" style="margin:0;flex-shrink:0">' + (c.fact_count || 0) +
-              ' <span class="chevron">' + (expanded ? '▾' : '›') + '</span></div>';
+              ' <span class="chevron" style="display:inline-block;font-size:15px;transition:transform .15s;' +
+              (expanded ? 'transform:rotate(90deg)' : '') + '">▸</span></div>';
       html += '</div>';
       if (!c.is_system) {
         html += '<button type="button" data-mem-id="' + escAttr(c.id) + '" ' +
