@@ -79,6 +79,25 @@ def test_blocked_via_live_proxy_is_ok_244(monkeypatch):
     assert mh.probe_fetch_egress_filtered().status == "ok"
 
 
+def test_socks_blocked_is_ok_244(monkeypatch):
+    # РЕАЛЬНЫЙ blocked-сигнал через SOCKS — socksio.ProtocolError «Malformed reply» (leak мимо httpx,
+    # НЕ TransportError) — доказано live на проде 2026-06-30. Должен классифицироваться как ok, не warning.
+    socksio_exc = pytest.importorskip("socksio.exceptions")
+    mh = _load()
+    mh._ENV = {"SREDA_FETCH_URL_PROXY": _PROXY}
+    _sock_ok(monkeypatch, mh)
+
+    class _C(_Cm):
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, url):
+            raise socksio_exc.ProtocolError("Malformed reply")
+
+    monkeypatch.setattr(mh.httpx, "Client", _C)
+    assert mh.probe_fetch_egress_filtered().status == "ok"
+
+
 def test_metadata_200_is_critical_244(monkeypatch):
     mh = _load()
     mh._ENV = {"SREDA_FETCH_URL_PROXY": _PROXY}

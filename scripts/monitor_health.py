@@ -616,6 +616,17 @@ def probe_groq_stt_latency() -> ProbeResult:
                               "groq_stt_latency", baseline_ms=400)
 
 
+# «Граница держит» = target НЕ достигнут. Кроме httpx.TransportError сюда ОБЯЗАТЕЛЬНО входит
+# socksio.SOCKSError: при tcp-reset фильтра SOCKS-прокси отдаёт сбойный reply → socksio.ProtocolError
+# («Malformed reply») ПРОТЕКАЕТ мимо httpx (НЕ TransportError) — доказано live на проде 2026-06-30.
+# Без этого блокировка читалась бы как «probe error→warning» (ложный алерт каждый тик). Defensive import.
+try:
+    from socksio.exceptions import SOCKSError as _SocksError
+    _BOUNDARY_BLOCKED_EXC: tuple[type[BaseException], ...] = (httpx.TransportError, _SocksError)
+except Exception:  # noqa: BLE001  socksio — dep httpx[socks]; на проде есть, но не падаем если нет
+    _BOUNDARY_BLOCKED_EXC = (httpx.TransportError,)
+
+
 def probe_fetch_egress_filtered() -> ProbeResult:
     """#244 ИНВЕРСНАЯ проба SSRF-границы fetch_url. metadata-IP через фильтр-egress
     (``SREDA_FETCH_URL_PROXY``) ДОЛЖЕН быть недостижим. 3 шага:
@@ -665,8 +676,9 @@ def probe_fetch_egress_filtered() -> ProbeResult:
             "fetch_egress_filtered", "critical",
             f"metadata REACHED via fetch-egress (http {r.status_code}) — фильтр НЕ режет private!",
         )
-    except httpx.TransportError as e:
-        # connection-level (refused/RST/timeout/protocol) через ЖИВОЙ proxy = граница держит = ok
+    except _BOUNDARY_BLOCKED_EXC as e:
+        # connection-level (httpx refused/RST/timeout/protocol) ИЛИ socksio SOCKS-сбой через ЖИВОЙ proxy
+        # = target не достигнут = граница держит = ok
         return ProbeResult("fetch_egress_filtered", "ok", f"private blocked via live proxy ({type(e).__name__})")
     except Exception as e:  # noqa: BLE001  setup/непредвиденное → граница НЕ проверена → warning, НЕ ложное ok
         return ProbeResult("fetch_egress_filtered", "warning", f"probe error, граница не проверена ({type(e).__name__})")
