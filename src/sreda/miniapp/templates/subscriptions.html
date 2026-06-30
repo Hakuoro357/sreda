@@ -153,9 +153,17 @@
     checklists: null,
     checklistDetail: {},  // R-33: per-id cache для detail view
     family: null,
+    memory: null,            // #262: список категорий памяти
+    memoryFacts: {},         // #262: per-category cache фактов (lazy на раскрытии аккордеона)
+    memExpanded: {},         // #262: id категории → раскрыта ли (аккордеон)
     loading: true,
     error: null,
   };
+
+  // #262: режим создания/переименования категории (поле сверху) + режим инлайн-правки факта.
+  var _memEditId = null;     // null = создание категории; иначе id переименовываемой категории
+  var _factEditId = null;    // id факта в режиме инлайн-правки (иначе null)
+  var _MEMORY_TIER_LABELS = { core: "О вас", episodic: "События" };
 
   var _channelLinkSessionExpired = false;
   var _channelLinkPollIntervalId = null;
@@ -465,6 +473,36 @@
     }).catch(function(err) {
       if (err.message !== "auth_expired") {
         state.family = { items: [], _error: true };
+        render();
+      }
+    });
+  }
+
+  // #262: память — категории (список) + факты категории (read-only).
+  function loadMemory() {
+    return apiFetch("/miniapp/api/v1/memory/categories").then(function(res) {
+      state.memory = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.memory = { categories: [], _error: true };
+        render();
+      }
+    });
+  }
+
+  function loadMemoryFacts(categoryId) {
+    // In-flight sentinel (ревью C2): пока запрос летит, кэш не undefined → повторный re-render раскрытой
+    // категории НЕ вызовет дубль GET (rapid collapse/expand или unrelated render до ответа).
+    state.memoryFacts[categoryId] = { facts: [], _loading: true };
+    return apiFetch(
+      "/miniapp/api/v1/memory/facts?category_id=" + encodeURIComponent(categoryId)
+    ).then(function(res) {
+      state.memoryFacts[categoryId] = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.memoryFacts[categoryId] = { facts: [], _error: true };
         render();
       }
     });
@@ -1921,6 +1959,124 @@
   }
 
   // -- Main render --
+  // #262: «Память» — категории (CRUD), факты внутри по ярусам (read-only; мутации фактов — голосом).
+  function renderMemory() {
+    setupBackButton(true);
+    var html = '<h1>🧠 Память</h1>';
+    html += '<div class="card-subtitle" style="margin-bottom:12px;line-height:1.4">' +
+            'Что я о вас помню. Тапните категорию — внутри факты по ярусам; их можно править и удалять.</div>';
+
+    // Одно поле ввода: создание ИЛИ переименование (режим по _memEditId).
+    var editing = _memEditId !== null;
+    var editName = "";
+    if (editing && state.memory && state.memory.categories) {
+      for (var k = 0; k < state.memory.categories.length; k++) {
+        if (state.memory.categories[k].id === _memEditId) { editName = state.memory.categories[k].name; break; }
+      }
+    }
+    html += '<div class="card" style="display:flex;gap:8px;align-items:center;padding:12px 14px">';
+    html += '<input id="mem-cat-name" type="text" maxlength="100" ' +
+            'onkeydown="if(event.key===\'Enter\')window._submitMemoryCategory()" ' +
+            'placeholder="' + (editing ? 'Новое имя' : 'Новая категория') + '" ' +
+            'value="' + escAttr(editName) + '" ' +
+            'style="flex:1;min-width:0;border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:8px;' +
+            'padding:8px 10px;font-size:15px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)">';
+    html += '<button class="btn btn-primary" onclick="window._submitMemoryCategory()" style="padding:8px 14px;flex-shrink:0">' +
+            (editing ? 'Сохранить' : 'Создать') + '</button>';
+    if (editing) {
+      html += '<button class="btn btn-small" onclick="window._cancelMemoryEdit()" ' +
+              'style="padding:8px 10px;flex-shrink:0;background:rgba(0,0,0,0.06)">Отмена</button>';
+    }
+    html += '</div>';
+
+    if (state.memory === null) { loadMemory(); return html + renderLoading(); }
+    if (state.memory && state.memory._error) {
+      return html + '<div class="error-state">Не удалось загрузить память.</div>';
+    }
+    var cats = (state.memory && state.memory.categories) || [];
+    for (var i = 0; i < cats.length; i++) {
+      var c = cats[i];
+      var expanded = !!state.memExpanded[c.id];
+      html += '<div class="card" style="padding:0;overflow:hidden">';
+      // Шапка категории: тап по названию раскрывает/сворачивает (id в data-attr, не в inline-строке — R-31).
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:12px 14px">';
+      html += '<div data-mem-id="' + escAttr(c.id) + '" onclick="window._toggleMemoryCategory(this)" ' +
+              'style="flex:1;min-width:0;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px">';
+      html += '<div class="card-title" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+              escHtml(c.name) + '</div>';
+      html += '<div class="card-subtitle" style="margin:0;flex-shrink:0">' + (c.fact_count || 0) +
+              ' <span class="chevron">' + (expanded ? '▾' : '›') + '</span></div>';
+      html += '</div>';
+      if (!c.is_system) {
+        html += '<button type="button" data-mem-id="' + escAttr(c.id) + '" ' +
+                'onclick="window._startRenameMemoryCategory(this)" aria-label="Переименовать категорию" ' +
+                'style="background:none;border:none;cursor:pointer;font-size:18px;padding:4px">✏️</button>';
+        html += '<button type="button" data-mem-id="' + escAttr(c.id) + '" data-mem-name="' + escAttr(c.name) + '" ' +
+                'data-mem-count="' + (c.fact_count || 0) + '" onclick="window._deleteMemoryCategory(this)" ' +
+                'aria-label="Удалить категорию" style="background:none;border:none;cursor:pointer;font-size:18px;padding:4px;' +
+                'color:var(--tg-theme-destructive-text-color,#e53935)">🗑️</button>';
+      }
+      html += '</div>';
+      if (expanded) { html += _memoryFactsBodyHtml(c.id); }
+      html += '</div>';
+    }
+    return html;
+  }
+
+  // Тело раскрытой категории: факты по ярусам (lazy-load при первом раскрытии).
+  function _memoryFactsBodyHtml(catId) {
+    var data = state.memoryFacts[catId];
+    if (data === undefined) { loadMemoryFacts(catId); return '<div style="padding:6px 14px 12px">' + renderLoading() + '</div>'; }
+    if (data && data._loading) { return '<div style="padding:6px 14px 12px">' + renderLoading() + '</div>'; }
+    if (data && data._error) {
+      return '<div class="error-state" style="padding:6px 14px 12px">Не удалось загрузить факты.</div>';
+    }
+    var facts = (data && data.facts) || [];
+    if (facts.length === 0) {
+      return '<div style="padding:2px 14px 14px;color:var(--tg-theme-hint-color,#999);font-size:14px;line-height:1.4">' +
+             'Пусто. Расскажите мне о себе голосом или текстом — запомню.</div>';
+    }
+    var out = '<div style="padding:0 14px 10px">';
+    var order = ['core', 'episodic'];
+    var known = { core: 1, episodic: 1 };
+    function group(label, arr) {
+      if (!arr.length) return;
+      out += '<div class="section-title" style="margin:8px 0 4px">' + escHtml(label) + '</div>';
+      for (var j = 0; j < arr.length; j++) { out += _memoryFactCardHtml(arr[j], catId); }
+    }
+    for (var t = 0; t < order.length; t++) {
+      group(_MEMORY_TIER_LABELS[order[t]], facts.filter(function(f) { return f.tier === order[t]; }));
+    }
+    group('Прочее', facts.filter(function(f) { return !known[f.tier]; }));
+    out += '</div>';
+    return out;
+  }
+
+  // Карточка факта: текст + ✏️/🗑️; в режиме правки (_factEditId) — textarea + Сохранить/Отмена.
+  function _memoryFactCardHtml(f, catId) {
+    if (_factEditId === f.id) {
+      return '<div class="card" style="display:block">' +
+        '<textarea id="fact-edit-input" maxlength="2000" rows="3" ' +
+        'style="width:100%;box-sizing:border-box;border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:8px;' +
+        'padding:8px;font-size:15px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);resize:vertical">' +
+        escHtml(f.content) + '</textarea>' +
+        '<div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end">' +
+        '<button class="btn btn-small" onclick="window._cancelFactEdit()" style="padding:6px 10px;background:rgba(0,0,0,0.06)">Отмена</button>' +
+        '<button class="btn btn-primary" data-fact-id="' + escAttr(f.id) + '" data-cat-id="' + escAttr(catId) + '" ' +
+        'onclick="window._saveMemoryFact(this)" style="padding:6px 12px">Сохранить</button>' +
+        '</div></div>';
+    }
+    return '<div class="card" style="display:flex;align-items:flex-start;gap:8px">' +
+      '<div class="card-title" style="margin:0;flex:1;min-width:0;font-weight:normal;line-height:1.4">' +
+      escHtml(f.content) + '</div>' +
+      '<button type="button" data-fact-id="' + escAttr(f.id) + '" onclick="window._editMemoryFact(this)" ' +
+      'aria-label="Править факт" style="background:none;border:none;cursor:pointer;font-size:16px;padding:2px 4px">✏️</button>' +
+      '<button type="button" data-fact-id="' + escAttr(f.id) + '" data-cat-id="' + escAttr(catId) + '" ' +
+      'onclick="window._deleteMemoryFact(this)" aria-label="Удалить факт" ' +
+      'style="background:none;border:none;cursor:pointer;font-size:16px;padding:2px 4px;color:var(--tg-theme-destructive-text-color,#e53935)">🗑️</button>' +
+      '</div>';
+  }
+
   function render() {
     var route = getRoute();
     // TG-Android / MAX quirk fix: initData засовывается в location.hash:
@@ -1991,6 +2147,8 @@
     } else if (route.indexOf("/catalog/") === 0) {
       var planKey = route.replace("/catalog/", "");
       html = renderPlanDetail(planKey);
+    } else if (route === "/memory") {
+      html = renderMemory();
     } else {
       html = renderDashboard();
     }
@@ -2005,6 +2163,153 @@
   // -- Global actions --
 
   window._nav = function(path) { navigate(path); };
+
+  // #262: память — аккордеон категорий + CRUD категорий + правка/удаление фактов.
+  window._toggleMemoryCategory = function(btn) {
+    var id = btn.getAttribute("data-mem-id");
+    state.memExpanded[id] = !state.memExpanded[id];
+    _factEditId = null;  // сворачивая/разворачивая, выходим из режима правки факта
+    render();  // renderMemory лениво подгрузит факты раскрытой категории
+  };
+
+  window._startRenameMemoryCategory = function(btn) {
+    _memEditId = btn.getAttribute("data-mem-id");
+    render();
+    var input = document.getElementById("mem-cat-name");
+    if (input) { input.focus(); }
+  };
+
+  window._cancelMemoryEdit = function() {
+    _memEditId = null;
+    render();
+  };
+
+  window._submitMemoryCategory = function() {
+    var input = document.getElementById("mem-cat-name");
+    var name = (input && input.value || "").trim();
+    if (!name) return;
+    var editing = _memEditId !== null;
+    var path = editing
+      ? "/miniapp/api/v1/memory/categories/" + encodeURIComponent(_memEditId)
+      : "/miniapp/api/v1/memory/categories";
+    apiFetch(path, { method: editing ? "PATCH" : "POST", body: { name: name } })
+      .then(function(res) {
+        if (res && (res.ok || res.category)) {
+          _memEditId = null;
+          state.memory = null;  // перезагрузить список
+          render();
+        } else if (res && res.detail === "category_name_conflict") {
+          showAlert("Категория с таким именем уже есть.");
+        } else if (res && res.detail === "category_immutable") {
+          showAlert("Категорию «Общее» нельзя изменить.");
+        } else {
+          showAlert("Не удалось сохранить категорию.");
+        }
+      })
+      .catch(function(err) {
+        if (err.message !== "auth_expired") showAlert("Не удалось сохранить категорию.");
+      });
+  };
+
+  window._deleteMemoryCategory = function(btn) {
+    var id = btn.getAttribute("data-mem-id");
+    var name = btn.getAttribute("data-mem-name") || "";
+    var count = parseInt(btn.getAttribute("data-mem-count") || "0", 10);
+    var msg = count > 0
+      ? ("Удалить категорию «" + name + "» вместе с " + count + " фактами? Факты удалятся безвозвратно.")
+      : ("Удалить категорию «" + name + "»?");
+    showPopup(msg, function() {
+      apiFetch(
+        "/miniapp/api/v1/memory/categories/" + encodeURIComponent(id) + "?confirm_count=" + count,
+        { method: "DELETE" }
+      ).then(function(res) {
+        if (res && res.ok) {
+          _memEditId = null;
+          delete state.memoryFacts[id];   // чистим кэш фактов удалённой категории (ревью B)
+          delete state.memExpanded[id];
+          state.memory = null;
+          render();
+        } else if (res && res.detail === "confirm_count_mismatch") {
+          showAlert("Список фактов изменился — обновляю.");
+          state.memory = null;
+          delete state.memoryFacts[id];
+          render();
+        } else if (res && res.detail === "category_immutable") {
+          showAlert("Категорию «Общее» нельзя удалить.");
+        } else {
+          showAlert("Не удалось удалить категорию.");
+        }
+      }).catch(function(err) {
+        if (err.message !== "auth_expired") showAlert("Не удалось удалить категорию.");
+      });
+    });
+  };
+
+  // --- факты: инлайн-правка (с пере-эмбеддингом на бэке) + удаление ---
+  window._editMemoryFact = function(btn) {
+    _factEditId = btn.getAttribute("data-fact-id");
+    render();
+    var ta = document.getElementById("fact-edit-input");
+    if (ta) { ta.focus(); }
+  };
+
+  window._cancelFactEdit = function() {
+    _factEditId = null;
+    render();
+  };
+
+  window._saveMemoryFact = function(btn) {
+    var ta = document.getElementById("fact-edit-input");
+    var content = (ta && ta.value || "").trim();
+    if (!content) return;
+    var factId = btn.getAttribute("data-fact-id");
+    var catId = btn.getAttribute("data-cat-id");
+    apiFetch("/miniapp/api/v1/memory/facts/" + encodeURIComponent(factId), {
+      method: "PATCH", body: { content: content }
+    }).then(function(res) {
+      if (res && (res.ok || res.fact)) {
+        _factEditId = null;
+        delete state.memoryFacts[catId];  // перезагрузить факты категории (текст изменился)
+        render();
+      } else if (res && res.detail === "embedding_unavailable") {
+        showAlert("Поиск по памяти временно недоступен — правка не сохранена, попробуйте позже.");
+      } else if (res && res.detail === "memory_not_found") {
+        showAlert("Факт не найден — обновляю.");
+        _factEditId = null;
+        delete state.memoryFacts[catId];
+        render();
+      } else {
+        showAlert("Не удалось сохранить факт.");
+      }
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") showAlert("Не удалось сохранить факт.");
+    });
+  };
+
+  window._deleteMemoryFact = function(btn) {
+    var factId = btn.getAttribute("data-fact-id");
+    var catId = btn.getAttribute("data-cat-id");
+    showPopup("Удалить этот факт?", function() {
+      apiFetch("/miniapp/api/v1/memory/facts/" + encodeURIComponent(factId), {
+        method: "DELETE"
+      }).then(function(res) {
+        if (res && res.ok) {
+          _factEditId = null;
+          delete state.memoryFacts[catId];  // перезагрузить факты + счётчик категории
+          state.memory = null;
+          render();
+        } else if (res && res.detail === "memory_not_found") {
+          delete state.memoryFacts[catId];
+          state.memory = null;
+          render();
+        } else {
+          showAlert("Не удалось удалить факт.");
+        }
+      }).catch(function(err) {
+        if (err.message !== "auth_expired") showAlert("Не удалось удалить факт.");
+      });
+    });
+  };
 
   window._loadNextWeek = function() { loadNextWeek(); };
 
@@ -2736,6 +3041,7 @@
     if (route === "/checklists" && state.checklists !== null) loadChecklists();
     if (route === "/recipes" && state.recipes !== null) loadRecipes();
     if (route === "/family" && state.family !== null) loadFamily();
+    if (route === "/memory" && state.memory !== null) loadMemory();
     // Recipe detail page (#/recipes/{id}) — refetch currently viewed recipe.
     var detailMatch = route.match(/^\/recipes\/(.+)$/);
     if (detailMatch && state.recipeDetail[detailMatch[1]] !== undefined) {
