@@ -2444,12 +2444,10 @@ def _build_graph(llm: Any, all_tools: list, *,
         attempted = list(state.get("guard_attempted_families") or [])
         fam = _guard_family(_last_human_text(state["messages"]), active)
         update: dict = {}
-        added: set[str] = set()  # #221 Ф3: семьи, реально ДОБРАННЫЕ этим guard-вызовом (для точного allowed_read)
         if fam and fam not in attempted:
             # точечный добор семьи по словарю-роутеру
             if fam not in active:
                 active.append(fam)
-                added.add(fam)
             attempted.append(fam)
             nudge = (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
                      "инструментом, не отвечай «не умею».")
@@ -2461,7 +2459,6 @@ def _build_graph(llm: Any, all_tools: list, *,
             for f in _LAZY_FAMILIES:
                 if f not in active:
                     active.append(f)
-                    added.add(f)
             update["guard_full_attempted"] = True
             nudge = ("Все инструменты теперь доступны — выполни запрос пользователя, "
                      "не отвечай «не умею».")
@@ -2472,7 +2469,7 @@ def _build_graph(llm: Any, all_tools: list, *,
         })
         # #267 A4: видение router_allowed_read_domains УБРАНО — в execute сюда уже не доходим (вышли по
         # A4-ветке выше, «роутер побеждает»); в legacy allowed=None и видение всё равно было no-op. Так
-        # guard-recovery больше НЕ откатывает доменное решение роутера. (added — для active, не для доменов.)
+        # guard-recovery больше НЕ откатывает доменное решение роутера.
         return update
 
     def stop(state: ReactState):
