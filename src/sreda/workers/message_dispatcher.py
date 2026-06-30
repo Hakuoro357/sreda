@@ -318,12 +318,27 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
         _process_approved_turn,
         ensure_telegram_user_bundle,
     )
+    from sreda.services.tenant_lifecycle import is_tenant_active
 
     payload = job.message_payload["payload"]
     bot_key = job.message_payload.get("bot_key", "sreda")
     inbound_message_id = job.message_payload.get("inbound_message_id")
 
     SessionLocal = get_session_factory()
+    # #187 Phase 1 — soft-delete gate ДО ensure_*. ``job.tenant_id`` известен
+    # (NOT NULL) и уже зарезолвлен при enqueue — здесь не нужен account-резолв,
+    # гейтим прямо по нему. Удалённый тенант → возвращаемся без обработки;
+    # ``process_pending`` затем зовёт ``mark_done`` (job терминально закрыт),
+    # без ensure/turn. Existing terminal mechanism — НЕ изобретаем dead_letter.
+    with SessionLocal() as session:
+        if not is_tenant_active(session, job.tenant_id):
+            logger.info(
+                "dispatcher: tenant %s is soft-deleted — terminal close job "
+                "%s (no ensure/turn)",
+                job.tenant_id, job.id,
+            )
+            return
+
     # Explicit transaction — ``ensure_telegram_user_bundle`` may create
     # Tenant/Workspace/User rows on first message; without commit those
     # writes get rolled back at ``with`` exit (code-review 2026-05-25

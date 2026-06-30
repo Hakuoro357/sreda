@@ -150,6 +150,7 @@
     recipes: null,
     recipeDetail: {},
     schedule: null,
+    weeklyMenu: null,
     checklists: null,
     checklistDetail: {},  // R-33: per-id cache для detail view
     family: null,
@@ -1109,6 +1110,109 @@
     return html;
   }
 
+  // --- Screen: Weekly menu (#/menu) — READ-ONLY (#235) ---
+  // Card+screen removed 2026-04-22 (editing UX unfinished); restored
+  // 2026-06-25 as read-only viewing. All edits go through voice.
+  var _MENU_DAYS_RU = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"];
+  var _MEAL_LABELS = {
+    "breakfast": "Завтрак",
+    "lunch": "Обед",
+    "dinner": "Ужин",
+    "snack": "Перекус"
+  };
+  var _MEAL_ORDER = ["breakfast", "lunch", "dinner", "snack"];
+
+  function loadWeeklyMenu() {
+    return apiFetch("/miniapp/api/v1/weekly-menu").then(function(res) {
+      state.weeklyMenu = res;
+      render();
+    }).catch(function(err) {
+      if (err.message !== "auth_expired") {
+        state.weeklyMenu = { plan: null, _error: true };
+        render();
+      }
+    });
+  }
+
+  function renderWeeklyMenu() {
+    setupBackButton(true);
+    var html = '<h1>🍽 Меню недели</h1>';
+
+    if (state.weeklyMenu === null) {
+      loadWeeklyMenu();
+      return html + renderLoading();
+    }
+    if (state.weeklyMenu._error) {
+      return html + '<div class="error-state">Не удалось загрузить меню.</div>';
+    }
+
+    var plan = state.weeklyMenu.plan;
+    if (!plan) {
+      html += '<div class="empty-state">';
+      html += 'Меню пока пусто.<br><br>';
+      html += 'Напиши боту: «составь меню на неделю» — Среда подберёт ';
+      html += 'блюда с учётом твоей семьи и сохранённых рецептов.';
+      html += '</div>';
+      return html;
+    }
+
+    // Index items by (day, meal_type) for O(1) cell lookup.
+    var byCell = {};
+    var allItems = plan.items || [];
+    for (var i = 0; i < allItems.length; i++) {
+      var it = allItems[i];
+      byCell[it.day_of_week + ":" + it.meal_type] = it;
+    }
+
+    if (plan.week_start_date) {
+      html += '<div class="card-subtitle" style="margin-bottom:12px">с ' + escHtml(plan.week_start_date) + '</div>';
+    }
+
+    for (var d = 0; d < 7; d++) {
+      // Day-total calories (sum of recipe cells that carry per-serving kcal).
+      var dayKcal = 0;
+      var kcalHasAny = false;
+      for (var mk = 0; mk < _MEAL_ORDER.length; mk++) {
+        var ck = byCell[d + ":" + _MEAL_ORDER[mk]];
+        if (ck && ck.recipe_calories != null) {
+          dayKcal += ck.recipe_calories;
+          kcalHasAny = true;
+        }
+      }
+      var title = _MENU_DAYS_RU[d];
+      if (kcalHasAny) {
+        title += " · ~" + Math.round(dayKcal) + " ккал";
+      }
+
+      html += '<div class="section-title" style="margin:20px 0 8px 4px">' + escHtml(title) + '</div>';
+      html += '<div class="card" style="padding:8px 12px">';
+      for (var m = 0; m < _MEAL_ORDER.length; m++) {
+        var mealType = _MEAL_ORDER[m];
+        var cell = byCell[d + ":" + mealType];
+        var dish;
+        if (cell && cell.recipe_title) {
+          dish = escHtml(cell.recipe_title);
+        } else if (cell && cell.free_text) {
+          dish = escHtml(cell.free_text);
+        } else {
+          dish = '—'; // —
+        }
+        html += '<div style="padding:8px 0;border-bottom:1px solid rgba(0,0,0,0.06)">';
+        html += '<span class="card-subtitle" style="display:inline-block;min-width:90px">' + escHtml(_MEAL_LABELS[mealType]) + ':</span> ';
+        html += '<span>' + dish + '</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    // Voice-only hint — read-only screen, all edits via chat (mirrors renderSchedule).
+    html += '<div class="card-subtitle" style="text-align:center;margin-top:16px;padding:0 8px;line-height:1.4">';
+    html += 'Чтобы изменить меню — просто скажи Среде голосом.';
+    html += '</div>';
+
+    return html;
+  }
+
   // --- Screen: Shopping (#/shopping) ---
   // User-visible category labels. Keys must match the backend taxonomy
   // (see services/housewife_shopping.py::SHOPPING_CATEGORIES).
@@ -1789,6 +1893,16 @@
 
   // --- Screen: EDS Monitor skill (#/skill/eds_monitor) ---
   function renderEdsSkill() {
+    // #181: EDS Monitor retired. Tombstone screen — old deep-links to
+    // #/skill/eds_monitor land here and see a disabled notice instead of a
+    // broken control surface. The backend never emits EDS cards now, so this
+    // route is only reachable via a stale bookmark.
+    setupBackButton(true);
+    return '<h1>EDS Monitor</h1>'
+      + '<div class="card"><p>Это умение отключено.</p></div>';
+  }
+
+  function _renderEdsSkillLegacy() {
     setupBackButton(true);
     var s = state.summary;
     var html = '<h1>EDS Monitor</h1>';
@@ -2121,6 +2235,8 @@
       html = renderReminders();
     } else if (route === "/schedule") {
       html = renderSchedule();
+    } else if (route === "/menu") {
+      html = renderWeeklyMenu();
     } else if (route === "/shopping") {
       html = renderShopping();
     } else if (route === "/checklists") {
@@ -3000,6 +3116,7 @@
     var r = (location.hash || "#/").replace(/^#/, "") || "/";
     if (r === "/reminders" && state.reminders !== null) loadReminders();
     if (r === "/schedule" && state.schedule !== null) loadSchedule();
+    if (r === "/menu" && state.weeklyMenu !== null) loadWeeklyMenu();
     if (r === "/shopping" && state.shopping !== null) loadShopping();
     if (r === "/checklists" && state.checklists !== null) loadChecklists();
     if (r === "/recipes" && state.recipes !== null) loadRecipes();
@@ -3037,6 +3154,7 @@
     var route = getRoute();
     if (route === "/reminders" && state.reminders !== null) loadReminders();
     if (route === "/schedule" && state.schedule !== null) loadSchedule();
+    if (route === "/menu" && state.weeklyMenu !== null) loadWeeklyMenu();
     if (route === "/shopping" && state.shopping !== null) loadShopping();
     if (route === "/checklists" && state.checklists !== null) loadChecklists();
     if (route === "/recipes" && state.recipes !== null) loadRecipes();

@@ -82,6 +82,22 @@ class EncryptionService:
             f"Unsupported encryption payload version: {version}"
         )
 
+    # -- bytes-level (CipherProtocol для LangGraph-checkpoint #193) ---------
+
+    def encrypt_bytes(self, data: bytes) -> tuple[str, bytes]:
+        """AES-GCM поверх СЫРЫХ байт (контракт CipherProtocol: encrypt(bytes)->(name, bytes)).
+        ciphername = key_id (ротация: decrypt_bytes выберет нужный ключ); payload = nonce(12)+ct."""
+        nonce = os.urandom(12)
+        cipher = self._ciphers[self._primary_key_id]
+        ct = cipher.encrypt(nonce, data, None)
+        return self._primary_key_id, nonce + ct
+
+    def decrypt_bytes(self, key_id: str, data: bytes) -> bytes:
+        cipher = self._ciphers.get(key_id)
+        if cipher is None:
+            raise EncryptionConfigError(f"Unknown encryption key_id: {key_id!r}")
+        return cipher.decrypt(data[:12], data[12:], None)
+
     # -- private -----------------------------------------------------------
 
     def _decrypt_v2(self, parts: list[str]) -> str:

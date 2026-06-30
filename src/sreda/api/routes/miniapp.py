@@ -18,7 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel, Field
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm import Session
@@ -34,17 +34,18 @@ from sreda.db.repositories.memory import (
     MemoryCategoryError,
     MemoryRepository,
 )
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.app_registry import get_feature_registry
 from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
 from sreda.services.agent_capabilities import active_feature_keys
 from sreda.services.billing import (
-    PLAN_EDS_MONITOR_BASE,
-    PLAN_EDS_MONITOR_EXTRA,
+    DISABLED_FEATURE_MESSAGE,
     BillingService,
+    DeprecatedPlanError,
 )
-from sreda.services.eds_connect import ConnectSessionError, EDSConnectService
 from sreda.services.embeddings import get_embeddings_client
 from sreda.services.housewife_family import HousewifeFamilyService
+from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
@@ -66,6 +67,11 @@ from sreda.services.telegram_auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+# #181 Phase B: legacy EDS plan_keys. EDS Monitor is retired and its plan rows
+# are dropped, but old Mini App clients / deep-links may still POST these keys.
+# subscribe/cancel answer them with the disabled tombstone (200, no mutation).
+_EDS_PLAN_KEYS = frozenset({"eds_monitor_base", "eds_monitor_extra_account"})
 
 router = APIRouter(
     prefix="/miniapp",
@@ -96,6 +102,25 @@ class MiniAppContext:
     # not branch on these — used only for diagnostic logging.
     channel: str = "telegram"
     account_id: str = ""
+
+
+def _gate_miniapp_tenant_active(session: Session, tenant_id: str) -> None:
+    """#187 Phase 4a — soft-delete gate для mini-app auth-пути.
+
+    Зовётся из ``_require_miniapp_auth`` СРАЗУ после резолва существующего
+    тенанта и ДО любой durable-мутации auth-слоя (TG ``_stamp_last_bot_key``,
+    MAX ``max_chat_id``-refresh). Удалён → 410 Gone reason ``tenant_deleted``
+    (НЕ 401/404 — иначе фронт уходит в re-provision-петлю, см. план
+    db-fix-tenant-deletion-plan.md дверь #8). Lazy-provisioned юзер сюда не
+    передаётся (только что создан, всегда активен) — false-positive нет.
+    """
+    from sreda.services.tenant_lifecycle import is_tenant_active
+
+    if not is_tenant_active(session, tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="tenant_deleted",
+        )
 
 
 def _require_miniapp_auth(
@@ -208,6 +233,12 @@ def _require_miniapp_auth(
             user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
+            # #187 Phase 4a — soft-delete gate ДО любой durable-мутации
+            # auth-слоя (_stamp_last_bot_key коммитит last_bot_key). Удалён
+            # existing-тенант → 410 БЕЗ мутации. Гейт только для уже
+            # резолвленного тенанта; lazy-provision-ветка (resolved is None)
+            # сюда не попадает — там тенант только что создан, всегда активен.
+            _gate_miniapp_tenant_active(session, tenant_id)
             # #109 (Codex MAJOR): existing TG-юзер открыл Mini App, но
             # /start не слал — здесь НЕ вызывается
             # ensure_telegram_user_bundle_by_id, поэтому _stamp_last_bot_key
@@ -364,6 +395,13 @@ def _require_miniapp_auth(
                 user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
+            # #187 Phase 4a — soft-delete gate ДО durable-мутации
+            # max_chat_id-refresh (session.commit ниже). Удалён existing
+            # MAX-тенант → 410 БЕЗ записи max_chat_id. Гейт только для уже
+            # резолвленного тенанта; lazy-provision/race-ветки (onboarding не
+            # None / resolved-after-race) сюда не попадают — тенант только что
+            # создан, всегда активен.
+            _gate_miniapp_tenant_active(session, tenant_id)
             # Codex R1 MAJOR #4: refresh max_chat_id если изменился.
             # Сценарий: Boris вручную SQL-merge'нул tenant'ы; max_chat_id
             # был известен на момент merge'а. Если юзер удалит и пересоздаст
@@ -390,6 +428,11 @@ def _require_miniapp_auth(
                         user_id, exc_info=True,
                     )
                     session.rollback()
+
+    # #187 Phase 4a — soft-delete gate уже применён ДО мутаций auth-слоя:
+    # для existing-тенанта (обе ветки TG/MAX) через _gate_miniapp_tenant_active
+    # сразу после резолва; lazy-provisioned тенант только что создан и всегда
+    # активен. Удалённый тенант → 410 БЕЗ stamp/refresh-мутаций.
 
     # Resolve workspace_id for connect link creation (channel-agnostic)
     from sreda.db.models.core import Assistant, Workspace
@@ -510,75 +553,63 @@ def get_summary(
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     billing = BillingService(session)
-    summary = billing.get_summary(ctx.tenant_id)
     now = datetime.now(UTC)
 
     # Query plans and subscriptions directly
     plans_by_key = _plans_by_key(session)
 
-    base_plan = plans_by_key.get(PLAN_EDS_MONITOR_BASE)
-    extra_plan = plans_by_key.get(PLAN_EDS_MONITOR_EXTRA)
-    extra_price_rub = extra_plan.price_rub if extra_plan else 2990
+    # #181 Phase B: EDS Monitor fully retired. extra_price_rub kept only for
+    # response-shape stability; the EDS plan rows are dropped by migration so
+    # this falls back to the historic default.
+    extra_price_rub = 2990
 
     # Build active skills list (for main screen cards)
     active_skills: list[dict] = []
     available_skills: list[dict] = []
 
-    # EDS Monitor
-    if summary.base_active and base_plan:
-        total_eds_subs = 1 + summary.extra_quantity
-        total_eds_price = base_plan.price_rub
-        if summary.extra_quantity > 0 and extra_plan:
-            total_eds_price += extra_plan.price_rub * summary.extra_quantity
-        active_skills.append({
-            "feature_key": "eds_monitor",
-            "title": "EDS Monitor",
-            "icon": "\U0001f4ca",
-            "summary_line": f"{total_eds_subs} шт \u00b7 {total_eds_price:,} \u20bd/мес".replace(",", " "),
-            "is_active": True,
-        })
-    elif base_plan:
-        available_skills.append({
-            "feature_key": "eds_monitor",
-            "plan_key": PLAN_EDS_MONITOR_BASE,
-            "title": "EDS Monitor",
-            "icon": "\U0001f4ca",
-            "description": base_plan.description or "",
-            "price_rub": base_plan.price_rub,
-            "is_active": False,
-        })
+    # EDS Monitor — #181: retired skill, fully removed. No EDS card is emitted
+    # into active_skills / available_skills.
 
     # Simple skills (one plan → one subscription → one card). Voice
     # transcription was removed in 2026-04 — it's now a capability
     # bundled with agents (see SkillManifestBase.includes_voice), not
     # a standalone subscription. Add any future simple agent here with
     # one tuple and no per-agent branching.
-    _simple_skills: list[tuple[str, str, str, str]] = [
-        # (plan_key, feature_key, default_title, icon)
-        ("housewife_assistant_base", "housewife_assistant", "Помощник домохозяйки", "\U0001f3e0"),
+    # #200 (Фаза 0): резолвим простой скил по feature_key, НЕ по зашитому plan_key.
+    # Подписка может быть на любом плане фичи (sreda_free / housewife_base /
+    # grandfathered — после слияния все на sreda_free); карточка + plan_key берутся
+    # из ПЛАНА активной подписки (для not-subscribed — из канонического public-плана).
+    _simple_skills: list[tuple[str, str, str]] = [
+        # (feature_key, default_title, icon)
+        ("housewife_assistant", "Помощник домохозяйки", "🏠"),
     ]
-    for plan_key, feature_key, default_title, icon in _simple_skills:
-        plan = plans_by_key.get(plan_key)
-        if plan is None:
-            continue
-        sub = _get_sub(session, ctx.tenant_id, plan)
-        is_active = _is_active(sub, now)
-        if is_active:
+    plans_by_id = {p.id: p for p in plans_by_key.values()}
+    for feature_key, default_title, icon in _simple_skills:
+        sub = _active_sub_by_feature(session, ctx.tenant_id, feature_key, now)
+        if sub is not None:
+            # Карточка и plan_key — из плана АКТИВНОЙ подписки (subscribe/cancel
+            # должны целиться в него, а не в legacy housewife_assistant_base).
+            plan = plans_by_id.get(sub.plan_id)
+            price = plan.price_rub if plan else 0
             active_skills.append({
                 "feature_key": feature_key,
-                "title": plan.title or default_title,
+                "title": (plan.title if plan else None) or default_title,
                 "icon": icon,
-                "summary_line": "Бесплатно" if plan.price_rub == 0 else f"{plan.price_rub:,} \u20bd/мес".replace(",", " "),
+                "summary_line": "Бесплатно" if price == 0 else f"{price:,} ₽/мес".replace(",", " "),
                 "is_active": True,
-                "plan_key": plan_key,
-                "description": plan.description or "",
-                "price_rub": plan.price_rub,
-                "active_until": _iso(sub.active_until) if sub else None,
+                "plan_key": plan.plan_key if plan else feature_key,
+                "description": (plan.description if plan else "") or "",
+                "price_rub": price,
+                "active_until": _iso(sub.active_until),
             })
         else:
+            # Канонический public+active план фичи (после слияния — sreda_free).
+            plan = _canonical_plan_for_feature(plans_by_key, feature_key)
+            if plan is None:
+                continue
             available_skills.append({
                 "feature_key": feature_key,
-                "plan_key": plan_key,
+                "plan_key": plan.plan_key,
                 "title": plan.title or default_title,
                 "icon": icon,
                 "description": plan.description or "",
@@ -586,14 +617,17 @@ def get_summary(
                 "is_active": False,
             })
 
-    # EDS subscriptions detail (for EDS skill page)
-    eds_subscriptions = _build_eds_subscriptions(
-        session, summary, ctx.tenant_id, base_plan, extra_plan,
-    )
+    # EDS subscriptions detail — #181 Phase B: retired and removed. Always empty.
+    eds_subscriptions: list[dict] = []
+
+    # #181 Phase B: next-payment figures are derived from the renewable non-EDS
+    # subscriptions (voice / housewife). When nothing renews → 0 / null and the
+    # SPA hides the payment banner.
+    next_amount_rub, next_due = billing.next_payment_for_display(ctx.tenant_id)
 
     return {
-        "next_payment_due_at": _iso(summary.next_payment_due_at),
-        "next_amount_rub": summary.next_amount_rub,
+        "next_payment_due_at": _iso(next_due),
+        "next_amount_rub": next_amount_rub,
         "active_skills": active_skills,
         "available_skills": available_skills,
         "eds_subscriptions": eds_subscriptions,
@@ -607,135 +641,55 @@ def _plans_by_key(session: Session) -> dict[str, SubscriptionPlan]:
     return {p.plan_key: p for p in plans}
 
 
-def _get_sub(
-    session: Session, tenant_id: str, plan: SubscriptionPlan | None,
+def _active_sub_by_feature(
+    session: Session, tenant_id: str, feature_key: str, now: datetime,
 ) -> TenantSubscription | None:
-    if plan is None:
-        return None
-    return (
+    """#200: активная подписка фичи через feature_key (не через зашитый plan_key).
+
+    Партиальный unique-index гарантирует ≤1 active подписку на (tenant, feature_key),
+    но подписка может быть на ЛЮБОМ плане фичи (sreda_free / housewife_base / grandfathered).
+    """
+    subs = (
         session.query(TenantSubscription)
         .filter(
             TenantSubscription.tenant_id == tenant_id,
-            TenantSubscription.plan_id == plan.id,
+            TenantSubscription.feature_key == feature_key,
         )
-        .first()
+        .order_by(TenantSubscription.id)  # детерминизм (страховка, если active + scheduled_for_cancel)
+        .all()
     )
+    for sub in subs:
+        if _is_active(sub, now):
+            return sub
+    return None
+
+
+def _canonical_plan_for_feature(
+    plans_by_key: dict[str, SubscriptionPlan], feature_key: str,
+) -> SubscriptionPlan | None:
+    """#200: какой план рекламировать not-subscribed-пользователю — public+active план
+    фичи с наименьшим sort_order (sreda_free=0 → канонический free после слияния)."""
+    candidates = [
+        p for p in plans_by_key.values()
+        if p.feature_key == feature_key and p.is_active and p.is_public
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda p: (p.sort_order or 0, p.plan_key))
 
 
 def _is_active(sub: TenantSubscription | None, now: datetime) -> bool:
     if sub is None or not sub.quantity or sub.quantity <= 0:
         return False
-    if not sub.active_until:
+    if sub.status not in {"active", "scheduled_for_cancel"}:
         return False
+    # #200: active_until is None = бессрочная (free/grandfathered) — НЕ отбрасывать.
+    if sub.active_until is None:
+        return True
     active_until = sub.active_until
     if active_until.tzinfo is None:
         active_until = active_until.replace(tzinfo=UTC)
-    if active_until <= now:
-        return False
-    return sub.status in {"active", "scheduled_for_cancel"}
-
-
-def _build_eds_subscriptions(
-    session: Session,
-    summary,
-    tenant_id: str,
-    base_plan: SubscriptionPlan | None,
-    extra_plan: SubscriptionPlan | None,
-) -> list[dict]:
-    """Build per-slot EDS subscription cards for the EDS detail page."""
-    result: list[dict] = []
-    accounts = summary.connected_accounts or []
-
-    # Map accounts by role/index for slot assignment
-    active_accounts = [a for a in accounts if not a.scheduled_for_disconnect]
-    disconnecting_accounts = [a for a in accounts if a.scheduled_for_disconnect]
-
-    if summary.base_active and base_plan:
-        # Base subscription card
-        base_account = None
-        for acc in active_accounts:
-            if acc.account_role != "extra":
-                base_account = acc
-                break
-        if base_account is None and active_accounts:
-            base_account = active_accounts[0]
-
-        card: dict = {
-            "title": "EDS Monitor",
-            "price_rub": base_plan.price_rub,
-            "active_until": _iso(summary.base_active_until),
-            "status": "scheduled_for_cancel" if summary.base_cancel_at_period_end else "active",
-            "can_cancel": not summary.base_cancel_at_period_end,
-            "cancel_type": "base",
-            "slot_type": "base",
-            "is_free_slot": False,
-            "account": None,
-        }
-        if base_account:
-            card["account"] = _account_dict(base_account)
-            active_accounts = [a for a in active_accounts if a.tenant_eds_account_id != base_account.tenant_eds_account_id]
-        elif summary.free_count > 0:
-            card["is_free_slot"] = True
-        result.append(card)
-
-    # Extra subscription cards
-    extra_price = extra_plan.price_rub if extra_plan else 2990
-
-    for i in range(summary.extra_quantity):
-        acc = active_accounts[i] if i < len(active_accounts) else None
-        is_free = acc is None
-
-        # A free slot (paid but no cabinet attached) should be
-        # cancel-able right from the card — otherwise the user has a
-        # paid slot they can't get rid of unless they first attach a
-        # cabinet. slot_type="free" routes the JS to window._removeSlot.
-        card = {
-            "title": "Доп. кабинет EDS",
-            "price_rub": extra_price,
-            "active_until": _iso(summary.extra_active_until),
-            "status": "active",
-            "can_cancel": is_free,
-            "cancel_type": "extra",
-            "slot_type": "free" if is_free else "extra",
-            "is_free_slot": is_free,
-            "account": _account_dict(acc) if acc else None,
-        }
-        # Already scheduled for removal at period end — keep the same
-        # labelling as the free-slot case so the UI is consistent.
-        if i >= summary.extra_next_cycle_quantity and summary.extra_next_cycle_quantity < summary.extra_quantity:
-            card["slot_type"] = "free"
-            card["can_cancel"] = True
-        result.append(card)
-
-    # Disconnecting accounts (shown in their slots)
-    for acc in disconnecting_accounts:
-        already_shown = any(
-            c.get("account") and c["account"]["id"] == acc.tenant_eds_account_id
-            for c in result
-        )
-        if not already_shown:
-            card = {
-                "title": "Доп. кабинет EDS",
-                "price_rub": extra_price,
-                "active_until": _iso(summary.extra_active_until),
-                "status": "active",
-                "can_cancel": False,
-                "cancel_type": "extra",
-                "slot_type": "extra",
-                "is_free_slot": False,
-                "account": _account_dict(acc),
-            }
-            result.append(card)
-
-    return result
-
-
-def _account_dict(acc) -> dict:
-    return {
-        "id": acc.tenant_eds_account_id,
-        "login_masked": acc.login_masked,
-        "status": acc.status,
-    }
+    return active_until > now
 
 
 def _iso(dt) -> str | None:
@@ -789,6 +743,10 @@ def get_plans(
                 "billing_period_days": p.billing_period_days,
             }
             for p in plans
+            # Generic guard: a retired skill's plans are dropped from the public
+            # catalog. EDS Monitor (#181) is fully removed — its rows no longer
+            # exist; this keeps the guard for any future skill retirement.
+            if not is_feature_disabled(p.feature_key)
         ]
     }
 
@@ -807,21 +765,29 @@ def subscribe(
     billing = BillingService(session)
     plan_key = body.plan_key
 
-    if plan_key == PLAN_EDS_MONITOR_BASE:
-        result = billing.start_base_subscription(ctx.tenant_id)
-    elif plan_key == PLAN_EDS_MONITOR_EXTRA:
-        result = billing.add_extra_eds_account(ctx.tenant_id)
-    else:
-        # Generic simple-skill path: any plan_key that exists in
-        # subscription_plans with a feature_key can be (un)subscribed
-        # via start_simple_subscription. Covers voice, housewife, any
-        # future simple skill without per-skill branching.
-        plan = session.query(SubscriptionPlan).filter(
-            SubscriptionPlan.plan_key == plan_key
-        ).one_or_none()
-        if plan is None:
-            raise HTTPException(status_code=400, detail="unknown_plan")
+    # #181 Phase B: EDS Monitor retired — old EDS plan_keys answer the disabled
+    # tombstone (200, no mutation) instead of routing to the removed mutators.
+    if plan_key in _EDS_PLAN_KEYS:
+        return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
+
+    # Generic simple-skill path: any plan_key that exists in subscription_plans
+    # with a feature_key can be (un)subscribed via start_simple_subscription.
+    # Covers voice, housewife, any future simple skill without per-skill
+    # branching.
+    plan = session.query(SubscriptionPlan).filter(
+        SubscriptionPlan.plan_key == plan_key
+    ).one_or_none()
+    if plan is None:
+        raise HTTPException(status_code=400, detail="unknown_plan")
+    # #204 Фаза 2: deny subscribing to a deprecated (is_active=False) plan —
+    # voice_transcription_base tombstone (migration 0018). The service raises
+    # DeprecatedPlanError; surface it as 400 deprecated_plan for the Mini App.
+    if not plan.is_active:
+        raise HTTPException(status_code=400, detail="deprecated_plan")
+    try:
         result = billing.start_simple_subscription(ctx.tenant_id, plan_key)
+    except DeprecatedPlanError as exc:
+        raise HTTPException(status_code=400, detail="deprecated_plan") from exc
 
     return {"ok": True, "message": result.message_text}
 
@@ -835,15 +801,16 @@ def cancel(
     billing = BillingService(session)
     plan_key = body.plan_key
 
-    if plan_key == PLAN_EDS_MONITOR_BASE:
-        result = billing.cancel_base_at_period_end(ctx.tenant_id)
-    else:
-        plan = session.query(SubscriptionPlan).filter(
-            SubscriptionPlan.plan_key == plan_key
-        ).one_or_none()
-        if plan is None:
-            raise HTTPException(status_code=400, detail="unknown_plan")
-        result = billing.cancel_simple_subscription(ctx.tenant_id, plan_key)
+    # #181 Phase B: EDS Monitor retired — disabled tombstone for old EDS keys.
+    if plan_key in _EDS_PLAN_KEYS:
+        return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
+
+    plan = session.query(SubscriptionPlan).filter(
+        SubscriptionPlan.plan_key == plan_key
+    ).one_or_none()
+    if plan is None:
+        raise HTTPException(status_code=400, detail="unknown_plan")
+    result = billing.cancel_simple_subscription(ctx.tenant_id, plan_key)
 
     return {"ok": True, "message": result.message_text}
 
@@ -854,14 +821,9 @@ def resume(
     session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-
-    if body.plan_key == PLAN_EDS_MONITOR_BASE:
-        result = billing.resume_base_renewal(ctx.tenant_id)
-    else:
-        raise HTTPException(status_code=400, detail="unknown_plan")
-
-    return {"ok": True, "message": result.message_text}
+    # #181 Phase B: resume only ever applied to the EDS base subscription, which
+    # is retired. Disabled tombstone (200, no mutation).
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/renew")
@@ -879,109 +841,66 @@ def renew(
 # ---------------------------------------------------------------------------
 
 
+# #181 Phase B: EDS Monitor is fully retired (engine, billing read-path and
+# DB tables removed). The /api/v1/eds/* routes below stay as hardcoded
+# tombstones so old Mini App clients / deep-links get a clean "отключено"
+# answer (200, no mutation) instead of a 404/500.
+
+
 @router.get("/api/v1/eds/accounts")
 def list_eds_accounts(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    summary = billing.get_summary(ctx.tenant_id)
-    return {
-        "accounts": [_account_dict(a) for a in summary.connected_accounts],
-    }
+    return {"accounts": []}
 
 
 @router.post("/api/v1/eds/accounts/{account_id}/cancel")
 def cancel_eds_account(
     account_id: str,
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.schedule_connected_eds_account_cancel(ctx.tenant_id, account_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/eds/accounts/{account_id}/restore")
 def restore_eds_account(
     account_id: str,
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.restore_connected_eds_account_cancel(ctx.tenant_id, account_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/eds/slot/remove")
 def remove_eds_slot(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.remove_extra_account_at_period_end(ctx.tenant_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 @router.post("/api/v1/eds/slot/restore")
 def restore_eds_slot(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    billing = BillingService(session)
-    result = billing.restore_extra_account_slot(ctx.tenant_id)
-    return {"ok": True, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
 
 
 # ---------------------------------------------------------------------------
-# JSON API — EDS connect (create session + return form URL)
+# JSON API — EDS connect (retired tombstone)
 # ---------------------------------------------------------------------------
 
 
 @router.post("/api/v1/eds/connect")
 def eds_connect(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    """Create a one-time connect session for a free EDS slot."""
-    settings = get_settings()
-    try:
-        link = EDSConnectService(session, settings).create_connect_link(
-            tenant_id=ctx.tenant_id,
-            workspace_id=ctx.workspace_id,
-            user_id=ctx.user_id,
-            slot_type="extra",
-        )
-    except ConnectSessionError as exc:
-        return {"ok": False, "message": exc.message, "connect_url": None}
-
-    return {"ok": True, "connect_url": link.url, "message": None}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE, "connect_url": None}
 
 
 @router.post("/api/v1/eds/add-and-connect")
 def eds_add_and_connect(
-    session: Session = Depends(get_session),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
-    """Add an extra EDS subscription slot AND create a connect session."""
-    billing = BillingService(session)
-    result = billing.add_extra_eds_account(ctx.tenant_id)
-
-    # Now create the connect link
-    settings = get_settings()
-    try:
-        link = EDSConnectService(session, settings).create_connect_link(
-            tenant_id=ctx.tenant_id,
-            workspace_id=ctx.workspace_id,
-            user_id=ctx.user_id,
-            slot_type="extra",
-        )
-    except ConnectSessionError:
-        # Subscription was created but link failed — still return success
-        # so the UI can refresh and show the new slot.
-        return {"ok": True, "message": result.message_text, "connect_url": None}
-
-    return {"ok": True, "connect_url": link.url, "message": result.message_text}
+    return {"ok": False, "message": DISABLED_FEATURE_MESSAGE, "connect_url": None}
 
 
 # ---------------------------------------------------------------------------
@@ -1037,18 +956,18 @@ def _collect_menu_sections(
     return list(merged.values())
 
 
-@router.get("/api/v1/menu")
-def get_menu(
-    session: Session = Depends(get_session),
-    ctx: MiniAppContext = Depends(_require_miniapp_auth),
-) -> dict:
-    """Home-screen menu for the Mini App.
+# «Расписание» (id="schedule") скрыт из Mini App home по решению владельца
+# 2026-06-25 (#233): текущий UX не устраивает, нужна доработка. Бэкенд НЕ
+# тронут — tasks-API, экран #/schedule и приватный скил housewife остаются;
+# секция просто не инжектится в home (как платформенный tile «Подписки»).
+# Снять сокрытие = убрать id из набора.
+_HIDDEN_MENU_SECTION_IDS: frozenset[str] = frozenset({"schedule"})
 
-    Returns skill-level entry-points (Напоминания, etc.) aggregated
-    from subscribed agents, plus the always-on Подписки tile.
-    """
-    sections = _collect_menu_sections(session, ctx.tenant_id, ctx.user_id)
-    items = [
+
+def _menu_items_for_render(sections: list[MiniAppSection]) -> list[dict]:
+    """Collected sections → home-screen item dicts, dropping any section
+    whose id is platform-hidden (#233 «Расписание»). Order preserved."""
+    return [
         {
             "id": s.id,
             "title": s.title,
@@ -1058,7 +977,25 @@ def get_menu(
             "count": s.count,
         }
         for s in sections
+        if s.id not in _HIDDEN_MENU_SECTION_IDS
     ]
+
+
+@router.get("/api/v1/menu")
+def get_menu(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Home-screen menu for the Mini App.
+
+    Returns skill-level entry-points (Напоминания, etc.) aggregated from
+    subscribed agents. Platform-hidden sections (e.g. «Расписание», #233)
+    and the «Подписки» tile (hidden 2026-04-25 — admin grants the
+    subscription, user doesn't self-serve) are omitted: their routes and
+    backend code stay intact, the tiles just aren't injected into home.
+    """
+    sections = _collect_menu_sections(session, ctx.tenant_id, ctx.user_id)
+    items = _menu_items_for_render(sections)
     # #262: платформенная плитка «Память» — у каждого юзера (не привязана к скилу).
     items.append({
         "id": "memory",
@@ -1068,10 +1005,6 @@ def get_menu(
         "subtitle": "Что я о вас помню",
         "count": None,
     })
-    # Platform-level tile «Подписки» временно скрыт (2026-04-25 —
-    # подписку выдаёт админ при approve, юзер сам не оформляет).
-    # Route #/subscriptions и весь биллинг-код остаются нетронутыми;
-    # просто tile не инжектится в Mini App home до запуска платежей.
     return {"items": items}
 
 
@@ -1351,18 +1284,105 @@ def delete_recipe_endpoint(
 
 # ---------------------------------------------------------------------------
 # JSON API — Menu planning (housewife v1.1)
-# REMOVED from Mini App 2026-04-22. Voice + backend (HousewifeMenuService,
-# plan_week_menu/update_menu_item/list_menu/clear_menu/
-# generate_shopping_from_menu chat tools) preserved intact in
-# services/housewife_menu.py and services/housewife_chat_tools.py.
-# UI may return in a later iteration; this section was the front door,
-# nothing downstream relied on it.
+# READ-ONLY restore 2026-06-25 (#235): weekly-menu card+screen were removed
+# 2026-04-22 (commit 5e5ae19) — the EDITING UX was unfinished (LLM flaky on
+# partial cell updates). Restoring ONLY the read path: GET grid for the
+# #/menu screen. Editing (PATCH cell / generate-shopping / regenerate) stays
+# OUT; mutations go through voice as before.
 # ---------------------------------------------------------------------------
 
 
-# (menu helpers + 5 endpoints removed below — they lived here before
-#  the 2026-04-22 Mini App cleanup. Task scheduler below replaces
-#  the UI slot.)
+def _menu_item_dict(item, *, tenant_id: str, user_id: str | None) -> dict:
+    """Serialise one menu cell for the week grid. Includes the linked
+    recipe's title + per-serving calories if any — saves a round-trip
+    when the UI wants to sum "day total kcal".
+
+    Defence-in-depth (R1 review): the linked recipe is exposed ONLY when it
+    belongs to the same (tenant, user). A stale/bad ``recipe_id`` pointing at
+    another user's recipe must not leak its title/calories. Mirrors the
+    ownership filter in ``HousewifeMenuService.aggregate_ingredients_*``.
+    """
+    out = {
+        "id": item.id,
+        "day_of_week": item.day_of_week,
+        "meal_type": item.meal_type,
+        "recipe_id": item.recipe_id,
+        "free_text": item.free_text,
+        "notes": item.notes,
+        "recipe_title": None,
+        "recipe_calories": None,
+    }
+    recipe = item.recipe
+    if (
+        item.recipe_id
+        and recipe is not None
+        and recipe.tenant_id == tenant_id
+        and recipe.user_id == user_id
+    ):
+        out["recipe_title"] = recipe.title
+        out["recipe_calories"] = recipe.calories_per_serving
+    return out
+
+
+def _menu_plan_dict(plan, *, tenant_id: str, user_id: str | None) -> dict:
+    return {
+        "id": plan.id,
+        "week_start_date": plan.week_start_date.isoformat(),
+        "notes": plan.notes,
+        "status": plan.status,
+        "items": [
+            _menu_item_dict(item, tenant_id=tenant_id, user_id=user_id)
+            for item in (plan.items or [])
+        ],
+    }
+
+
+@router.get("/api/v1/weekly-menu")
+def get_weekly_menu(
+    week_start: str | None = None,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Fetch the user's weekly menu grid (read-only, #235).
+
+    Without ``?week_start=`` returns the most recent plan. With it returns
+    the plan for that specific week (Monday-anchored; any date works, the
+    service coerces). ``{"plan": None}`` if no plan exists yet.
+    """
+    service = HousewifeMenuService(session)
+
+    if week_start:
+        try:
+            plan = service.get_plan_for_week(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                week_start=week_start,
+            )
+        except ValueError as exc:
+            # Bad ?week_start= → controlled 400, not a 500 (mirror
+            # the sibling GET /api/v1/schedule/week).
+            raise HTTPException(
+                status_code=400, detail="invalid week_start date"
+            ) from exc
+    else:
+        # list_user_plans is ordered by week_start_date DESC → [0] is the
+        # most recent week.
+        all_plans = service.list_user_plans(
+            tenant_id=ctx.tenant_id, user_id=ctx.user_id
+        )
+        plan = all_plans[0] if all_plans else None
+        if plan is not None:
+            # Re-fetch with items eagerly loaded — list_user_plans
+            # skips them for cheap listings.
+            plan = service.get_plan_for_week(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                week_start=plan.week_start_date,
+            )
+
+    if plan is None:
+        return {"plan": None}
+    return {"plan": _menu_plan_dict(plan, tenant_id=ctx.tenant_id, user_id=ctx.user_id)}
 
 
 # ---------------------------------------------------------------------------
@@ -1988,6 +2008,24 @@ def archive_checklist_endpoint(
 # ────────────────────────────────────────────────────────────────────
 
 
+def _gate_channel_link_tenant_active(session: Session, tenant_id: str) -> None:
+    """#187 Phase 4a — soft-delete gate для channel-link auth-пути.
+
+    Зовётся из ``_resolve_platform_auth`` СРАЗУ после резолва существующего
+    тенанта (но ДО мутаций в эндпойнтах consume/cancel/start). Удалён → 410
+    Gone reason ``tenant_deleted`` (симметрично ``_require_miniapp_auth``;
+    НЕ 401/404 чтобы фронт не уходил в re-provision-петлю). Новый юзер
+    (резолв=None) сюда не попадает — гейт только для существующего тенанта.
+    """
+    from sreda.services.tenant_lifecycle import is_tenant_active
+
+    if not is_tenant_active(session, tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="tenant_deleted",
+        )
+
+
 def _resolve_platform_auth(
     request: Request,
     settings,
@@ -2032,6 +2070,7 @@ def _resolve_platform_auth(
                 tenant_id, user_id = resolved
                 payload["tenant_id"] = tenant_id
                 payload["user_id"] = user_id
+                _gate_channel_link_tenant_active(session, tenant_id)
         return ("telegram", payload)
 
     if platform == "max":
@@ -2057,6 +2096,7 @@ def _resolve_platform_auth(
                 tenant_id, user_id = resolved
                 payload["tenant_id"] = tenant_id
                 payload["user_id"] = user_id
+                _gate_channel_link_tenant_active(session, tenant_id)
         return ("max", payload)
 
     raise HTTPException(status_code=400, detail=f"unknown platform: {platform!r}")
@@ -2305,10 +2345,31 @@ async def channel_link_cancel(
 
     from sreda.db.models.channel_linking import ChannelLinkToken
 
+    token_hash = _channel_link_token_hash(raw_token)
+
+    # #187 Phase 4a — soft-delete пред-чтение SOURCE-тенанта ДО мутации used_at.
+    # _resolve_platform_auth гейтит только TARGET (запрашивающего), НЕ владельца
+    # токена. Без этого активный target мог бы отменить токен, чей source-тенант
+    # уже soft-deleted → durable-мутация (used_at) для удалённого тенанта,
+    # нарушая инвариант «нет мутаций удалённого». Читаем ТОЛЬКО колонку
+    # ``tenant_id`` (скаляр, не ORM-сущность — как в consume_link), чтобы не
+    # засорять identity-map naive ``expires_at`` строкой. Удалён → отклонить БЕЗ
+    # мутации, тот же контракт-ответ что на невалидный/уже-использованный токен
+    # ({"ok": False}). Нет строки (None) / активен — обычный путь.
+    from sreda.services.tenant_lifecycle import is_tenant_active
+
+    _src_tenant_id = session.execute(
+        select(ChannelLinkToken.tenant_id).where(
+            ChannelLinkToken.token_hash == token_hash
+        )
+    ).scalar_one_or_none()
+    if _src_tenant_id is not None and not is_tenant_active(session, _src_tenant_id):
+        return {"ok": False}
+
     result = session.execute(
         update(ChannelLinkToken)
         .where(
-            ChannelLinkToken.token_hash == _channel_link_token_hash(raw_token),
+            ChannelLinkToken.token_hash == token_hash,
             ChannelLinkToken.target_channel == platform,
             ChannelLinkToken.used_at.is_(None),
         )

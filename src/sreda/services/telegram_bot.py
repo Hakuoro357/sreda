@@ -11,7 +11,7 @@ from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryE
 from sreda.runtime.dispatcher import dispatch_telegram_action
 from sreda.runtime.executor import ActionRuntimeService
 from sreda.services import trace
-from sreda.services.agent_capabilities import has_voice_access
+from sreda.services.agent_capabilities import resolve_voice_access
 from sreda.services.budget import BudgetService
 from sreda.services.onboarding import TelegramOnboardingResult
 from sreda.services.speech.base import SpeechRecognitionError
@@ -212,13 +212,46 @@ async def _maybe_transcribe_voice(
     # bundled with agents like Помощник домохозяйки (see manifest
     # ``includes_voice``). EDS Monitor and other text-only agents do
     # NOT grant voice.
-    if not tenant_id or not has_voice_access(session, tenant_id):
+    # #204 Решение 1/3: resolve access AND the carrier feature_key to bill
+    # under in ONE pass (``.allowed`` matches the old ``has_voice_access``).
+    voice_access = resolve_voice_access(session, tenant_id) if tenant_id else None
+    if voice_access is None or not voice_access.allowed:
         await _send_error(
             "Голосовые сообщения доступны в подписке. "
             "Открой /subscriptions, чтобы узнать подробнее."
         )
         return None
+
+    # #204 Решение 1: fail-closed. allowed=True but no carrier feature_key
+    # → can't attribute the spend → do NOT transcribe (invariant safeguard;
+    # feature_key is NOT NULL by schema, so this is unreachable in prod).
+    billing_feature_key = voice_access.billing_feature_key
+    if billing_feature_key is None:
+        logger.error(
+            "voice fail-closed: allowed=True but billing_feature_key is None "
+            "(tenant=%s) — refusing to transcribe",
+            tenant_id,
+        )
+        await _send_error(
+            "Голосовые сообщения сейчас не работают. Напиши текстом или попробуй позже."
+        )
+        return None
+
     budget = BudgetService(session)
+
+    # #204 Решение 3: preflight quota gate BEFORE any reserve/download/STT.
+    # Block ONLY a real exhaustion of an ACTIVE metered subscription on the
+    # carrier (``is_subscribed AND is_exhausted``) — NOT ``not has_quota``,
+    # which would also block a scheduled_for_cancel carrier (is_subscribed=
+    # False) where voice still works. housewife sreda_free → quota=None →
+    # is_exhausted=False → no-op today.
+    _quota = budget.get_quota_status(tenant_id, billing_feature_key)
+    if _quota.is_subscribed and _quota.is_exhausted:
+        await _send_error(
+            "Лимит голосовых сообщений по подписке исчерпан. "
+            "Открой /subscriptions, чтобы узнать подробнее."
+        )
+        return None
 
     # 3. Duration limit
     duration = voice.get("duration", 0)
@@ -352,10 +385,14 @@ async def _maybe_transcribe_voice(
         _trace_meta["chars_out"] = len(text)
         _trace_meta["status"] = "ok"
 
-    # 7. Record usage (1 credit per message)
+    # 7. Record usage (1 credit per message). #204 Решение 1: attribute to
+    # the carrier agent (``billing_feature_key``, e.g. housewife_assistant),
+    # NOT the legacy hard-wired "voice_transcription" — so voice spend is
+    # visible in the carrier's budget. The plugin-presence check above still
+    # uses _VOICE_FEATURE_KEY (module key), this is the BILLING key.
     budget.record_api_usage(
         tenant_id=tenant_id,
-        feature_key=_VOICE_FEATURE_KEY,
+        feature_key=billing_feature_key,
         provider_key=settings.speech_provider or "unknown",
         task_type="speech_recognition",
         credits_consumed=1,

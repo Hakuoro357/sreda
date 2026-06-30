@@ -2,20 +2,28 @@
 {% block title %}Бюджет{% endblock %}
 {% block content %}
 <h2>Бюджет по скилам — {{ selected_date }}</h2>
+<small class="muted">Кредиты — квота (не деньги). Токены — объём. ≈ Стоимость — оценка
+затрат в USD по текущему прайсу (беспрайсовые модели → «—», % — покрытие).</small>
 
 <nav class="day-nav" style="display: flex; gap: 12px; align-items: center; justify-content: flex-start; margin-bottom: 16px;">
-  <a href="/admin/budget?token={{ token }}&date={{ prev_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
+  <a href="/admin/budget?date={{ prev_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
     ← Предыдущий день
   </a>
   {% if next_date %}
-  <a href="/admin/budget?token={{ token }}&date={{ next_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
+  <a href="/admin/budget?date={{ next_date }}" role="button" class="outline" style="margin: 0; flex: 0 0 auto;">
     Следующий день →
   </a>
   {% endif %}
 </nav>
 
 {% if not rows %}
+{# #175: пустой список — две РАЗНЫЕ причины. Раньше всегда «Нет активных подписок» (ложь,
+   когда подписки есть, но расхода за день нет). #}
+{% if has_active_subs %}
+<p>Нет расхода за этот день.</p>
+{% else %}
 <p>Нет активных подписок.</p>
+{% endif %}
 {% else %}
 <figure>
 <table>
@@ -28,6 +36,7 @@
       <th>Использование</th>
       <th>Вызовов LLM</th>
       <th>Токенов</th>
+      <th>≈ Стоимость (USD)</th>
       <th>Последнее использ.</th>
       <th>Период</th>
       <th></th>
@@ -64,6 +73,12 @@
       </td>
       <td>{{ "{:,}".format(r.total_calls) }}</td>
       <td>{{ "{:,}".format(r.total_tokens) }}</td>
+      <td>
+        {{ r.est_usd | usd }}
+        {% if r.cost_coverage_pct is not none and r.cost_coverage_pct < 100 %}
+          <span class="muted" title="доля вызовов с известной ценой">({{ r.cost_coverage_pct }}%)</span>
+        {% endif %}
+      </td>
       <td><span class="muted">{{ r.last_used_at }}</span></td>
       <td><span class="muted">{{ r.period_start }} → {{ r.period_end }}</span></td>
       <td>

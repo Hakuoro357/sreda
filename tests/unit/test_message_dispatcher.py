@@ -260,6 +260,17 @@ def _seed_inbound(db_session: Session, *, status: str) -> str:
     """
     from uuid import uuid4
 
+    from sreda.db.models.core import Tenant
+
+    # #187 Phase 1: the dispatcher now gates on ``is_tenant_active(job.tenant_id)``
+    # BEFORE ensure/turn (fail-closed — a missing tenant row = inactive = early
+    # terminal close). These dispatch tests must seed an *active* tenant row so
+    # the gate passes and the real downstream behaviour (crash-detection /
+    # kwargs forwarding) is still exercised.
+    if db_session.get(Tenant, "tenant_test") is None:
+        db_session.add(Tenant(id="tenant_test", name="Test Tenant"))
+        db_session.flush()
+
     inbound_id = f"inbound_{uuid4().hex[:24]}"
     row = InboundMessage(
         id=inbound_id,

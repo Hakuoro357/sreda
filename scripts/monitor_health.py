@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import urlparse
 
 import httpx
 
@@ -56,6 +57,33 @@ def _load_env(path: str = ENV_PATH) -> dict[str, str]:
 
 
 _ENV = _load_env()
+
+
+def _proxy_for_url(url: str) -> str | None:
+    """#208: прокси для внешнего probe — ЗЕРКАЛИТ бота. ``HTTPS_PROXY`` из ``_ENV``
+    (``/etc/sreda/.env``) для хостов НЕ в ``NO_PROXY`` (Groq идёт через SOCKS-туннель, как
+    ``speech/groq.py``); None (direct) для хостов В ``NO_PROXY`` (telegram/mimo/openrouter).
+    Прямой маршрут с VDS до части CDN-IP мёртв (RU-сеть) → probe обязан мерить тот же путь,
+    что и прод, иначе ложный CRITICAL (groq_stt 2026-06-23).
+
+    ТОЧНО зеркалит приоритет бота (speech/groq.py::_resolve_outbound_proxy + provider_balances.py):
+    SREDA_GROQ_HTTP_PROXY первым (Groq-специфичный HTTP→SOCKS-шим, если задан), затем общий SOCKS.
+    На VDS (2026-06-23) задан только HTTPS_PROXY=socks5://… (socksio в venv ЕСТЬ → httpx+socks5 → Groq=401)."""
+    proxy = None
+    for _var in ("SREDA_GROQ_HTTP_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
+                 "https_proxy", "http_proxy"):
+        _v = _ENV.get(_var)
+        if _v:
+            proxy = _v
+            break
+    if not proxy:
+        return None
+    host = (urlparse(url).hostname or "").lower()
+    raw = _ENV.get("NO_PROXY") or _ENV.get("no_proxy") or ""
+    for entry in (e.strip().lower() for e in raw.split(",")):
+        if entry and (host == entry or host.endswith("." + entry)):
+            return None  # в NO_PROXY → прод ходит direct → probe тоже direct
+    return proxy
 
 
 # ---------------------------------------------------------------------------
@@ -518,24 +546,38 @@ def _external_latency(
     baseline_ms: int = 500,
     warning_ms: int | None = None,
     timeout_s: float = 5.0,
+    max_severity: Severity = "critical",
 ) -> ProbeResult:
     """Measure GET latency. Critical if 5xx или timeout. Warning если elapsed
-    > warning_ms (если задан) или > 4x baseline иначе."""
+    > warning_ms (если задан) или > 4x baseline иначе.
+
+    #208: запрос идёт через SOCKS-прокси для хостов НЕ в NO_PROXY (как бот) — иначе прямой
+    мёртвый маршрут даёт ложный CRITICAL. ``max_severity='warning'`` понижает critical→warning
+    (для депрекейченных путей, напр. openrouter старого plan-execute рта)."""
     threshold_ms = warning_ms if warning_ms is not None else baseline_ms * 4
+
+    def _cap(sev: Severity) -> Severity:
+        return "warning" if (sev == "critical" and max_severity == "warning") else sev
+
+    proxy = _proxy_for_url(url)
+    # trust_env=False: не полагаемся на os.environ (cron его не грузит) — прокси берём из _ENV явно.
+    client_kwargs: dict[str, Any] = {"timeout": timeout_s, "trust_env": False}
+    if proxy:
+        client_kwargs["proxy"] = proxy
     try:
         t0 = time.time()
-        with httpx.Client(timeout=timeout_s) as c:
+        with httpx.Client(**client_kwargs) as c:
             r = c.get(url)
         elapsed_ms = int((time.time() - t0) * 1000)
         if r.status_code >= 500:
-            return ProbeResult(name, "critical", f"{r.status_code} ({elapsed_ms}ms)")
+            return ProbeResult(name, _cap("critical"), f"{r.status_code} ({elapsed_ms}ms)")
         if elapsed_ms > threshold_ms:
             return ProbeResult(name, "warning", f"{elapsed_ms}ms (threshold {threshold_ms}ms)")
         return ProbeResult(name, "ok", f"{elapsed_ms}ms")
     except httpx.TimeoutException:
-        return ProbeResult(name, "critical", f"timeout >{timeout_s}s")
+        return ProbeResult(name, _cap("critical"), f"timeout >{timeout_s}s")
     except Exception as e:
-        return ProbeResult(name, "critical", f"error: {type(e).__name__}: {str(e)[:100]}")
+        return ProbeResult(name, _cap("critical"), f"error: {type(e).__name__}: {str(e)[:100]}")
 
 
 def probe_telegram_api_latency() -> ProbeResult:
@@ -561,8 +603,12 @@ def probe_mimo_llm_latency() -> ProbeResult:
 
 
 def probe_openrouter_latency() -> ProbeResult:
+    # #208: openrouter в NO_PROXY → прод ходит DIRECT, и это рот СТАРОГО plan-execute
+    # (задепрекейчен; уйдёт с вырезанием старого планировщика). Прямой маршрут до openrouter
+    # с VDS мёртв → probe не зелёный, но это НЕ live-critical → max_severity='warning'.
     return _external_latency("https://openrouter.ai/api/v1/models",
-                              "openrouter_latency", baseline_ms=500)
+                              "openrouter_latency", baseline_ms=500,
+                              max_severity="warning")
 
 
 def probe_groq_stt_latency() -> ProbeResult:
@@ -673,23 +719,46 @@ def probe_turn_latency_p95() -> ProbeResult:
     return ProbeResult("turn_latency_p95", "ok", f"p95={p95}ms (n={n})")
 
 
+_FAILED_OUTCOMES = ("safe_reply", "breakdown")
+# tool_error / fallback_used — НАМЕРЕННО не провал: ход восстановился внутри ReAct-петли,
+# юзер получил реальный ответ. safe_reply — единственная видимая юзеру заглушка («потеряла контекст»).
+# Абсолютный порог всплеска: N провалов за окно → алерт ДАЖЕ при низком трафике.
+# Rate-гейт (n>=5 и >20%) на нашем трафике (~2 хода/час) почти не набирается → ночной
+# сетевой сбой (4 safe_reply за часы) в 30-мин окно из 5 ходов мог не попасть (#227).
+_FAILED_BURST = 3
+
+
 def probe_failed_turns_rate() -> ProbeResult:
-    traces = _recent_traces(window_min=30)
-    # Считаем только text/voice (где LLM ОБЯЗАН отработать). Callback'и и
-    # pending-bot — отдельные пути.
-    chat_traces = [t for t in traces if t.get("type") in ("text", "voice")]
-    if not chat_traces:
-        return ProbeResult("failed_turns_rate", "ok", "(no chat turns in 30m)")
-    n = len(chat_traces)
-    # #140: провал = «ход отдал поломку» (outcome=='breakdown'), НЕ iters==0.
-    # iters — счётчик старого tool-loop; у планировщика он всегда 0 даже на
-    # успехе, и iters==0 ложно метил успешные ходы провалами (ломало KPI на
-    # трафике планировщика). Старые трейсы без outcome= → 'ok' (не провал).
-    failed = sum(1 for t in chat_traces if t.get("outcome") == "breakdown")
-    pct = 100 * failed / n if n else 0
-    if n >= 5 and pct > 20:
-        return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} chat-turns failed ({pct:.0f}%)")
-    return ProbeResult("failed_turns_rate", "ok", f"{failed}/{n} chat-turns failed ({pct:.0f}%)")
+    # Источник истины по ReAct = БД react_turn_trace (#192). В trace.log у ReAct
+    # ВСЕГДА outcome=ok (react_loop не зовёт mark_outcome) → парсер trace.log слеп
+    # к провалам на всём прод-трафике (#227). Провал = ход отдал безопасную
+    # заглушку safe_reply («Ой, потеряла контекст» — краш / таймаут / сетевой сбой
+    # LLM) ИЛИ legacy breakdown (plan-execute). Знаменатель — только ЗАВЕРШЁННЫЕ
+    # ходы (outcome IS NOT NULL): in_progress / paused-на-confirm в счёт не идут.
+    out = _pg_query(
+        "SELECT outcome, count(*) FROM react_turn_trace "
+        "WHERE created_at > now() - interval '30 minutes' "
+        "AND outcome IS NOT NULL GROUP BY outcome"
+    )
+    if out is None:
+        return ProbeResult("failed_turns_rate", "warning", "psql query failed")
+    counts: dict[str, int] = {}
+    for line in out.splitlines():
+        oc, sep, c = line.strip().partition("|")
+        if sep:
+            try:
+                counts[oc] = int(c)
+            except ValueError:
+                pass
+    n = sum(counts.values())
+    if n == 0:
+        return ProbeResult("failed_turns_rate", "ok", "(no finished react turns in 30m)")
+    failed = sum(counts.get(o, 0) for o in _FAILED_OUTCOMES)
+    pct = 100 * failed / n
+    # Два триггера: абсолютный всплеск (низкий трафик — rate не наберёт n) ЛИБО доля (высокий трафик).
+    if failed >= _FAILED_BURST or (n >= 5 and pct > 20):
+        return ProbeResult("failed_turns_rate", "critical", f"{failed}/{n} react-turns failed ({pct:.0f}%)")
+    return ProbeResult("failed_turns_rate", "ok", f"{failed}/{n} react-turns failed ({pct:.0f}%)")
 
 
 def probe_ack_latency_p95() -> ProbeResult:

@@ -9,7 +9,6 @@ from sreda.db.models.billing import (
 )
 from sreda.db.models.channel_linking import ChannelLinkToken
 from sreda.db.models.checklists import Checklist, ChecklistItem
-from sreda.db.models.connect import ConnectSession, TenantEDSAccount
 from sreda.db.models.conversation_turns import ConversationTurn
 from sreda.db.models.core import (
     Assistant,
@@ -22,7 +21,10 @@ from sreda.db.models.core import (
     User,
     Workspace,
 )
-from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState, EDSDeliveryRecord
+from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
+from sreda.db.models.react_summary import ReactSummary
+from sreda.db.models.react_debug import ReactDebugTurn
+from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.housewife import FamilyMember, FamilyReminder
 from sreda.db.models.housewife_food import (
     MenuPlan,
@@ -45,6 +47,7 @@ from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.db.models.runtime_config import RuntimeConfig
 from sreda.db.models.signup_attempts import SignupAttempt
 from sreda.db.models.tasks import Task
+from sreda.db.models.tool_operations import ToolOperationResult
 from sreda.db.models.usage_ledger import UsageLedger
 from sreda.db.models.skill_platform import (
     SkillAIExecution,
@@ -71,15 +74,15 @@ __all__ = [
     "ChannelLinkToken",
     "Checklist",
     "ChecklistItem",
-    "ConnectSession",
     "ConversationTurn",
+    "ReactCheckpoint",
+    "ReactCheckpointWrite",
+    "ReactSummary",
+    "ReactDebugTurn",
+    "ReactTurnTrace",
     "PaymentOrder",
     "PaymentOrderItem",
     "InboundMessage",
-    "EDSAccount",
-    "EDSChangeEvent",
-    "EDSClaimState",
-    "EDSDeliveryRecord",
     "FamilyMember",
     "FamilyReminder",
     "InboundEvent",
@@ -90,6 +93,7 @@ __all__ = [
     "PlannerGap",
     "PlannerLlmReservation",
     "StepExecutionLedger",
+    "ToolOperationResult",
     "Recipe",
     "RecipeIngredient",
     "RuntimeConfig",
@@ -109,7 +113,6 @@ __all__ = [
     "UsageLedger",
     "Tenant",
     "TenantBillingCycle",
-    "TenantEDSAccount",
     "TenantSkillConfig",
     "TenantSkillState",
     "TenantSubscription",

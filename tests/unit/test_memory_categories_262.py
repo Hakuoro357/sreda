@@ -41,7 +41,7 @@ def s():
         seed.ensure_tenant_bundle(
             tenant_id=f"tenant_{sfx}", tenant_name=sfx, workspace_id=f"ws_{sfx}", workspace_name=sfx,
             user_id=f"user_{sfx}", telegram_account_id=f"{sfx}1", assistant_id=f"as_{sfx}",
-            assistant_name=sfx, eds_monitor_enabled=False)
+            assistant_name=sfx)
     sess.commit()
     yield sess
     sess.close()
@@ -160,7 +160,7 @@ def test_reserved_common_name_rejected_before_common_exists(s):
 
 
 def test_common_name_normalized_frozen_literal():
-    """Сторож дрейфа: 0058 морозит литерал 'общий', repo считает живо — должны совпадать (иначе обновить 0058)."""
+    """Сторож дрейфа: 0071 морозит литерал 'общий', repo считает живо — должны совпадать (иначе обновить 0071)."""
     from sreda.db.repositories.memory import COMMON_NAME_NORMALIZED
     assert normalize_for_dedup("Общее") == "общий"
     assert COMMON_NAME_NORMALIZED == "общий"

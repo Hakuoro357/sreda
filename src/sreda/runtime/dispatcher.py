@@ -17,10 +17,6 @@ from sreda.services.billing import (
     STATUS_CALLBACK,
     SUBSCRIPTIONS_CALLBACK,
 )
-from sreda.services.eds_account_verification import (
-    RETRY_CONNECT_EXTRA_CALLBACK,
-    RETRY_CONNECT_PRIMARY_CALLBACK,
-)
 from sreda.services.onboarding import (
     CONNECT_EDS_CALLBACK,
     MaxOnboardingResult,
@@ -29,6 +25,14 @@ from sreda.services.onboarding import (
 
 
 logger = logging.getLogger(__name__)
+
+# #181 Phase 2: eds_account_verification removed. These two retry-connect
+# callback strings used to be imported from that module; the callbacks are
+# tombstoned downstream (``eds.connect.retry`` handler returns a completed
+# disabled notice), but the dispatcher still routes the legacy callback strings
+# (old Telegram messages) to that action, so the literals are inlined here.
+RETRY_CONNECT_PRIMARY_CALLBACK = "eds:retry_connect:primary"
+RETRY_CONNECT_EXTRA_CALLBACK = "eds:retry_connect:extra"
 
 
 def to_outbox_channel(action_channel_type: str) -> str:

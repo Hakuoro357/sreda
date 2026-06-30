@@ -25,7 +25,17 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
-from sreda.db.models.core import InboundMessage, Job, Tenant, User, Workspace
+from sreda.db.models.core import (
+    InboundMessage,
+    Job,
+    OutboxMessage,
+    Tenant,
+    User,
+    Workspace,
+)
+from sreda.db.models.planner import PlannerExecution, StepExecutionLedger
+from sreda.db.models.react_debug import ReactDebugTurn  # #185 — регистрация таблицы для create_all
+from sreda.db.models.react_trace import ReactTurnTrace  # #192 — регистрация для create_all
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.maintenance.retention_cleanup import cleanup_runtime_retention
 from sreda.workers import retention_worker as rw_module
@@ -304,3 +314,225 @@ async def test_naive_timestamp_in_state_does_not_crash(
     )
     w = RetentionWorker(MagicMock(), state_file=str(state))
     await w.process_pending()  # главное — не TypeError
+
+
+# ---------------------------------------------------------------------------
+# #164 — ретеншен planner_executions + FK-безопасность с чисткой agent_runs
+# ---------------------------------------------------------------------------
+def _planner_exec(sess, peid: str, run_id: str, age_days: int,
+                  status: str = "completed") -> None:
+    sess.add(PlannerExecution(
+        id=peid, run_id=run_id, tenant_id="t1", feature_key="housewife_assistant",
+        planner_prompt_version=1, planner_provider="mimo-v2.5-pro",
+        planner_model="mimo-v2.5-pro", planner_status="valid",
+        execution_status=status, execution_log_json=[],
+        created_at=datetime.now(timezone.utc) - timedelta(days=age_days),
+    ))
+
+
+def test_planner_executions_terminal_old_deleted_164(session) -> None:
+    """#164: завершённая planner_executions старше окна (90д) удаляется; свежая и ЖИВАЯ
+    (pending/in_progress) — нет."""
+    _run(session, "run_old", None, age_days=100)
+    _run(session, "run_fresh", None, age_days=5)
+    _run(session, "run_live", None, age_days=5)
+    session.commit()  # родители (agent_runs) до детей — FK включён
+    _planner_exec(session, "pe_old_done", "run_old", age_days=100, status="completed")
+    _planner_exec(session, "pe_fresh_done", "run_fresh", age_days=5, status="completed")
+    _planner_exec(session, "pe_live", "run_live", age_days=5, status="in_progress")
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()
+
+    assert session.get(PlannerExecution, "pe_old_done") is None      # старая+терминальная → удалена
+    assert session.get(PlannerExecution, "pe_fresh_done") is not None  # свежая → нет
+    assert session.get(PlannerExecution, "pe_live") is not None        # живая → нет
+    assert result.planner_executions == 1
+
+
+def test_planner_executions_fk_safe_before_agent_runs_164(session) -> None:
+    """#164: при чистке agent_runs (90д) дочерние planner_executions удаляются РАНЬШЕ →
+    нет нарушения FK planner_executions.run_id → agent_runs.id (NOT NULL, без CASCADE).
+    Без порядка «дети раньше родителя» удаление agent_runs упало бы на IntegrityError."""
+    _run(session, "run_parent_old", None, age_days=100)  # терминальный, попадёт под чистку
+    session.commit()  # родитель до ребёнка — FK включён
+    _planner_exec(session, "pe_child_old", "run_parent_old", age_days=100, status="completed")
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()  # не должно бросить IntegrityError
+
+    assert session.get(PlannerExecution, "pe_child_old") is None  # ребёнок удалён
+    assert session.get(AgentRun, "run_parent_old") is None        # родитель удалён
+    assert result.planner_executions == 1
+    assert result.agent_runs == 1
+
+
+def test_planner_exec_children_deleted_before_parent_164(session) -> None:
+    """#164 (субагент-ревью): planner_executions САМА — родитель step_execution_ledger
+    (execution_id NOT NULL, без CASCADE). Дочерний ledger удаляется РАНЬШЕ planner_executions,
+    та — раньше agent_runs. Полная цепочка дети→родители без IntegrityError."""
+    _run(session, "run_p", None, age_days=100)
+    session.commit()
+    _planner_exec(session, "pe_p", "run_p", age_days=100, status="completed")
+    session.commit()
+    old = datetime.now(timezone.utc) - timedelta(days=100)
+    session.add(StepExecutionLedger(
+        id="sel_1", execution_id="pe_p", step_id="s1", operation_id="op_1",
+        status="committed", created_at=old, updated_at=old,
+    ))
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()  # не должно бросить IntegrityError
+
+    assert session.get(StepExecutionLedger, "sel_1") is None  # ребёнок удалён первым
+    assert session.get(PlannerExecution, "pe_p") is None       # затем планнер
+    assert session.get(AgentRun, "run_p") is None              # затем agent_run
+    assert result.step_execution_ledger == 1
+    assert result.planner_executions == 1
+
+
+def test_planner_exec_skew_and_stuck_live_fk_safe_164(session) -> None:
+    """#164 (Codex R2 MAJOR): чистка agent_runs FK-safe ДАЖЕ если planner-ребёнок НЕ попадает под
+    собственный возраст/статус-фильтр — т.к. удаляем ВСЕХ детей удаляемых родителей (run_id∈doomed).
+    Покрывает: (skew) terminal-ребёнок чуть моложе родителя; (stuck) застрявший in_progress.
+    Недавние живые (свежий родитель) — хранятся."""
+    _run(session, "run_skew", None, age_days=91)    # doomed
+    _run(session, "run_stuck", None, age_days=100)  # doomed
+    _run(session, "run_recent", None, age_days=5)   # жив
+    session.commit()
+    _planner_exec(session, "pe_skew", "run_skew", age_days=89, status="completed")    # моложе своего окна
+    _planner_exec(session, "pe_stuck", "run_stuck", age_days=100, status="in_progress")  # застрявший живой
+    _planner_exec(session, "pe_recent", "run_recent", age_days=5, status="in_progress")  # недавний живой
+    session.commit()
+
+    cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()  # не должно бросить IntegrityError
+
+    assert session.get(PlannerExecution, "pe_skew") is None     # удалён (родитель doomed)
+    assert session.get(PlannerExecution, "pe_stuck") is None     # удалён (родитель doomed), хоть и live
+    assert session.get(PlannerExecution, "pe_recent") is not None  # недавний живой — хранится
+    assert session.get(AgentRun, "run_skew") is None
+    assert session.get(AgentRun, "run_stuck") is None
+    assert session.get(AgentRun, "run_recent") is not None
+
+
+def test_react_debug_turns_retention_185(session) -> None:
+    """#185: react_debug_turns старше TTL (14д) удаляются, свежие остаются."""
+    now = datetime.now(timezone.utc)
+    session.add_all([
+        ReactDebugTurn(id="rdt_old", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", kind="final", user_text="старое",
+                       reply_text="ответ", tools_json="[]",
+                       created_at=now - timedelta(days=20)),
+        ReactDebugTurn(id="rdt_new", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", kind="final", user_text="свежее",
+                       reply_text="ответ", tools_json="[]",
+                       created_at=now - timedelta(days=2)),
+    ])
+    session.commit()
+    result = cleanup_runtime_retention(session, now=now)
+    session.commit()
+    remaining = {r.id for r in session.query(ReactDebugTurn).all()}
+    assert remaining == {"rdt_new"}, remaining   # старше 14д удалено, свежее осталось
+    assert result.react_debug_turns == 1
+
+
+# ---------------------------------------------------------------------------
+# #187 — ретеншен outbox status='dropped' (drain удалённого тенанта)
+# ---------------------------------------------------------------------------
+def _dropped_outbox(sess, oid: str, age_days: int) -> None:
+    sess.add(OutboxMessage(
+        id=oid, tenant_id="t1", workspace_id="w1",
+        channel_type="telegram", status="dropped",
+        payload_json="{}", drop_reason="tenant_deleted", bot_key="sreda",
+        created_at=datetime.now(timezone.utc) - timedelta(days=age_days),
+    ))
+
+
+def test_dropped_outbox_retention_187(session) -> None:
+    """#187 (R1 MAJOR): outbox со status='dropped' старше окна (60д) удаляется
+    ретеншеном; свежая dropped-строка — нет (иначе drain удалённого тенанта
+    копил бы dropped-строки бессрочно)."""
+    from sreda.maintenance import retention_cleanup as rc
+
+    _dropped_outbox(session, "out_dropped_old", age_days=rc.OUTBOX_DROPPED_DAYS + 5)
+    _dropped_outbox(session, "out_dropped_new", age_days=3)
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=datetime.now(timezone.utc))
+    session.commit()
+
+    assert session.get(OutboxMessage, "out_dropped_old") is None   # старше окна → удалена
+    assert session.get(OutboxMessage, "out_dropped_new") is not None  # свежая → нет
+    assert result.outbox_messages_dropped == 1
+
+
+def test_react_turn_trace_retention_192(session) -> None:
+    """#192: react_turn_trace старше TTL (14д) удаляется, свежий остаётся."""
+    now = datetime.now(timezone.utc)
+    session.add_all([
+        ReactTurnTrace(id="rtt_old", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", turn_key="k_old", status="done",
+                       origin_user_text="старое", reply_text="ответ",
+                       created_at=now - timedelta(days=20)),
+        ReactTurnTrace(id="rtt_new", tenant_id="t", user_id="u", thread_id="th",
+                       channel="telegram", turn_key="k_new", status="done",
+                       origin_user_text="свежее", reply_text="ответ",
+                       created_at=now - timedelta(days=2)),
+    ])
+    session.commit()
+    result = cleanup_runtime_retention(session, now=now)
+    session.commit()
+    remaining = {r.id for r in session.query(ReactTurnTrace).all()}
+    assert remaining == {"rtt_new"}, remaining
+    assert result.react_turn_trace == 1
+
+
+def test_react_checkpoint_gc_by_thread_last_activity_193(session) -> None:
+    """#193: тред с MAX(created_at) старше 30д удаляется ЦЕЛИКОМ (обе таблицы); активный тред (есть
+    свежий checkpoint) сохраняется ПОЛНОСТЬЮ, включая старые checkpoint'ы (целостность parent-цепочки)."""
+    from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
+
+    now = datetime.now(timezone.utc)
+
+    def _cp(thread, cid, age):
+        return ReactCheckpoint(
+            thread_id=thread, checkpoint_ns="", checkpoint_id=cid,
+            checkpoint_type="msgpack", blob=b"x", metadata_type="msgpack",
+            checkpoint_metadata=b"m", created_at=now - timedelta(days=age))
+
+    session.add_all([
+        # протухший тред: оба checkpoint'а старые (>30д) + interrupt-write
+        _cp("react-v1:react:t1:stale", "a1", 45),
+        _cp("react-v1:react:t1:stale", "a2", 40),
+        ReactCheckpointWrite(thread_id="react-v1:react:t1:stale", checkpoint_ns="",
+                             checkpoint_id="a2", task_id="tk", idx=-3, channel="__interrupt__",
+                             write_type="msgpack", blob=b"w", created_at=now - timedelta(days=40)),
+        # активный тред: старый + свежий → MAX свежий → НЕ режем (даже старый checkpoint)
+        _cp("react-v1:react:t1:active", "b1", 45),
+        _cp("react-v1:react:t1:active", "b2", 2),
+    ])
+    session.commit()
+
+    result = cleanup_runtime_retention(session, now=now)
+    session.commit()
+
+    # протухший тред удалён целиком (обе таблицы)
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:stale", "", "a1")) is None
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:stale", "", "a2")) is None
+    assert session.get(ReactCheckpointWrite,
+                       ("react-v1:react:t1:stale", "", "a2", "tk", -3)) is None
+    # активный тред цел ПОЛНОСТЬЮ (старый checkpoint сохранён ради parent-цепочки)
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:active", "", "b1")) is not None
+    assert session.get(ReactCheckpoint, ("react-v1:react:t1:active", "", "b2")) is not None
+    assert result.react_checkpoint == 2  # 2 checkpoint'а протухшего треда
+
+
+# NB (#164, Codex R2 MINOR): planner_gaps / planner_llm_reservations (nullable execution_id, FK
+# без CASCADE) удаляются ТЕМ ЖЕ кодом-путём, что step_execution_ledger выше —
+# `execution_id.in_(deletable_exec_ids)`. Путь доказан тестом-цепочкой (ledger) + skew/stuck-тестом;
+# FK-граф (agent_runs→planner_executions→{3 листа}) проверен grep'ом. Отдельный сид этих двух
+# опущен (finance-нюанс сидинга), покрытие — через идентичность пути.

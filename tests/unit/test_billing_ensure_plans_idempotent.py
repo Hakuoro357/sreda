@@ -14,41 +14,22 @@ all ORM tables and rolls back per test.
 
 from __future__ import annotations
 
-from sreda.db.models.billing import SubscriptionPlan
-from sreda.services.billing import BillingService
+from sreda.services.billing import PLAN_SEEDS, BillingService
 
 
-def test_ensure_default_plans_seeds_on_first_call(db_session) -> None:
-    BillingService(db_session).ensure_default_plans()
-    assert db_session.query(SubscriptionPlan).count() > 0
+def test_ensure_default_plans_no_engine_seeds_after_eds_removal() -> None:
+    # #181 Phase B: the only engine-level PLAN_SEEDS were the EDS plans, which
+    # are removed. The engine now seeds NO plans (voice / housewife are seeded
+    # by their own skill modules), so PLAN_SEEDS is empty.
+    assert PLAN_SEEDS == ()
 
 
 def test_ensure_default_plans_no_write_when_unchanged(db_session) -> None:
     svc = BillingService(db_session)
-    svc.ensure_default_plans()  # first call seeds + flushes
-    # Second call on an already-seeded, unchanged catalog must enqueue no
-    # INSERT/UPDATE — otherwise every Mini App open writes + row-locks the
-    # shared plan rows (the prod 499 root cause).
+    svc.ensure_default_plans()  # no-op now (empty PLAN_SEEDS)
+    # A second call must enqueue no INSERT/UPDATE — the prod-499 regression
+    # guard. With empty PLAN_SEEDS this holds trivially, but the assertion keeps
+    # the contract pinned for any future engine seed.
     svc.ensure_default_plans()
     assert not db_session.new, f"unexpected INSERTs: {db_session.new}"
     assert not db_session.dirty, f"unexpected UPDATEs: {db_session.dirty}"
-
-
-def test_ensure_default_plans_rewrites_when_field_drifts(db_session) -> None:
-    svc = BillingService(db_session)
-    svc.ensure_default_plans()
-    plan = db_session.query(SubscriptionPlan).first()
-    assert plan is not None
-    plan_key = plan.plan_key
-    drift = "СТАРОЕ НАЗВАНИЕ КОТОРОГО НЕТ В СИДЕ"
-    plan.title = drift
-    db_session.flush()
-    # ensure_default_plans flushes its own correction, so assert the EFFECT
-    # (the drifted row is rewritten back to match the seed).
-    svc.ensure_default_plans()
-    refreshed = (
-        db_session.query(SubscriptionPlan)
-        .filter(SubscriptionPlan.plan_key == plan_key)
-        .one()
-    )
-    assert refreshed.title != drift, "drifted plan should be re-written to match its seed"

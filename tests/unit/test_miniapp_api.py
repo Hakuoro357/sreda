@@ -40,6 +40,50 @@ def _make_init_data(
     return urlencode(params)
 
 
+def _seed_housewife_sub(plan_key: str, active_until):
+    """#200 Фаза 0: сидим housewife-план + активную подписку tenant_test на нём."""
+    from datetime import UTC, datetime
+
+    from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+    from sreda.db.session import get_session_factory
+
+    session = get_session_factory()()
+    try:
+        plan = session.query(SubscriptionPlan).filter_by(plan_key=plan_key).first()
+        if plan is None:
+            plan = SubscriptionPlan(
+                id=f"plan_{plan_key}",
+                plan_key=plan_key,
+                feature_key="housewife_assistant",
+                title=f"HW {plan_key}",
+                description="desc",
+                price_rub=0,
+                billing_period_days=30,
+                is_public=True,
+                is_active=True,
+                sort_order=0,
+            )
+            session.add(plan)
+            session.flush()
+        session.add(
+            TenantSubscription(
+                id=f"sub_{plan_key}",
+                tenant_id="tenant_test",
+                plan_id=plan.id,
+                feature_key="housewife_assistant",
+                status="active",
+                starts_at=datetime.now(UTC) - timedelta(days=5),
+                active_until=active_until,
+                cancel_at_period_end=False,
+                quantity=1,
+                next_cycle_quantity=1,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
     """Create a TestClient with in-memory SQLite and a known bot token."""
@@ -86,7 +130,6 @@ def seeded_client(client, monkeypatch, tmp_path):
             telegram_account_id="352612382",
             assistant_id="assistant_test",
             assistant_name="Среда",
-            eds_monitor_enabled=False,
         )
         session.commit()
     finally:
@@ -140,10 +183,11 @@ class TestMiniAppAuth:
         )
         assert resp.status_code == 200
         data = resp.json()
-        # Freshly provisioned — no active skills, EDS Monitor in available.
+        # Freshly provisioned — no active skills. #181: EDS Monitor is retired,
+        # so it is NO LONGER surfaced in available_skills (tombstoned).
         assert data["active_skills"] == []
-        assert any(
-            s["plan_key"] == "eds_monitor_base" for s in data["available_skills"]
+        assert not any(
+            s["feature_key"] == "eds_monitor" for s in data["available_skills"]
         )
 
 
@@ -170,9 +214,76 @@ class TestMiniAppSummary:
         )
         data = resp.json()
         assert len(data["active_skills"]) == 0
-        # EDS Monitor should be available
+        # #181: EDS Monitor retired — never surfaced in available_skills now.
         eds_plans = [s for s in data["available_skills"] if s["feature_key"] == "eds_monitor"]
-        assert len(eds_plans) == 1
+        assert len(eds_plans) == 0
+
+
+class TestMiniAppPhase0FeatureKeyResolution:
+    """#200 Фаза 0: витрина резолвит housewife по feature_key, active_until=NULL=бессрочная,
+    plan_key карточки = plan_key активной подписки (для subscribe/cancel)."""
+
+    @pytest.mark.parametrize(
+        "plan_key",
+        ["sreda_free", "housewife_assistant_base", "housewife_grandfathered"],
+    )
+    def test_housewife_active_via_any_plan_with_null_active_until(self, seeded_client, plan_key):
+        _seed_housewife_sub(plan_key, active_until=None)  # бессрочная (free/grandfathered)
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        hw = [s for s in data["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(hw) == 1, f"housewife должен быть активным на плане {plan_key}"
+        assert hw[0]["is_active"] is True
+        # plan_key карточки = plan_key активной подписки (кнопки subscribe/cancel целятся в него)
+        assert hw[0]["plan_key"] == plan_key
+        # и НЕ дублируется в available
+        assert not [
+            s for s in data["available_skills"] if s["feature_key"] == "housewife_assistant"
+        ]
+
+    def test_post_merge_single_sub_on_sreda_free_builds_card(self, seeded_client):
+        """После слияния единственная активная подписка на sreda_free → карточка строится,
+        plan_key=sreda_free, даже без legacy-планов в БД (резолв по feature_key, не plan_key)."""
+        _seed_housewife_sub("sreda_free", active_until=None)
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        data = resp.json()
+        hw = [s for s in data["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(hw) == 1
+        assert hw[0]["plan_key"] == "sreda_free"
+        assert hw[0]["is_active"] is True
+
+    def test_future_active_until_is_active_no_regression(self, seeded_client):
+        """Анти-регресс платного пути: dated-подписка (active_until в будущем) активна."""
+        from datetime import UTC, datetime
+
+        _seed_housewife_sub("sreda_free", active_until=datetime.now(UTC) + timedelta(days=30))
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        hw = [s for s in resp.json()["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(hw) == 1 and hw[0]["is_active"] is True
+
+    def test_expired_sub_falls_to_available_canonical(self, seeded_client):
+        """Истёкшая подписка → не active; available-карточка из канонического плана (plan_key)."""
+        from datetime import UTC, datetime
+
+        _seed_housewife_sub("sreda_free", active_until=datetime.now(UTC) - timedelta(days=1))
+        resp = seeded_client.get(
+            "/miniapp/api/v1/summary",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        data = resp.json()
+        assert not [s for s in data["active_skills"] if s["feature_key"] == "housewife_assistant"]
+        avail = [s for s in data["available_skills"] if s["feature_key"] == "housewife_assistant"]
+        assert len(avail) == 1 and avail[0]["plan_key"] == "sreda_free"
 
 
 class TestMiniAppPlans:
@@ -186,17 +297,21 @@ class TestMiniAppPlans:
         data = resp.json()
         assert "plans" in data
         assert isinstance(data["plans"], list)
-        # At least EDS base and extra plans exist
+        # #181: EDS plans are tombstoned out of the public catalog.
         plan_keys = [p["plan_key"] for p in data["plans"]]
-        assert "eds_monitor_base" in plan_keys
+        assert "eds_monitor_base" not in plan_keys
+        assert "eds_monitor_extra_account" not in plan_keys
 
 
 class TestMiniAppSubscribe:
     def test_subscribe_eds_base(self, seeded_client):
+        # #181 Phase B: subscribing to a retired skill is a tombstone. The
+        # endpoint still answers 200 (old links don't 404) but reports ok=False
+        # with the disabled message and creates NO active subscription.
         init_data = _make_init_data()
         headers = {"Authorization": f"tma {init_data}"}
 
-        # Subscribe
+        # Subscribe attempt → disabled tombstone
         resp = seeded_client.post(
             "/miniapp/api/v1/subscribe",
             json={"plan_key": "eds_monitor_base"},
@@ -204,13 +319,14 @@ class TestMiniAppSubscribe:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["ok"] is True
+        assert data["ok"] is False
+        assert data["message"] == "Это умение больше не поддерживается."
 
-        # Verify active in summary
+        # Summary must NOT show eds_monitor as active.
         resp = seeded_client.get("/miniapp/api/v1/summary", headers=headers)
         data = resp.json()
         active_keys = [s["feature_key"] for s in data["active_skills"]]
-        assert "eds_monitor" in active_keys
+        assert "eds_monitor" not in active_keys
 
     def test_subscribe_unknown_plan_returns_400(self, seeded_client):
         init_data = _make_init_data()
@@ -222,32 +338,31 @@ class TestMiniAppSubscribe:
         assert resp.status_code == 400
 
     def test_cancel_eds_base(self, seeded_client):
+        # #181 Phase B: cancel on a retired EDS plan_key is a disabled tombstone
+        # (200, ok=False), not a 404/500.
         init_data = _make_init_data()
         headers = {"Authorization": f"tma {init_data}"}
 
-        # Subscribe first
-        seeded_client.post(
-            "/miniapp/api/v1/subscribe",
-            json={"plan_key": "eds_monitor_base"},
-            headers=headers,
-        )
-
-        # Cancel
         resp = seeded_client.post(
             "/miniapp/api/v1/cancel",
             json={"plan_key": "eds_monitor_base"},
             headers=headers,
         )
         assert resp.status_code == 200
-        assert resp.json()["ok"] is True
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["message"] == "Это умение больше не поддерживается."
 
     def test_subscribe_voice_transcription(self, seeded_client):
+        # #204 Фаза 2: voice_transcription_base — tombstone (is_active=False на
+        # проде, миграция 0018). Подписка через Mini App на него ДОЛЖНА быть
+        # отклонена 400 deprecated_plan — реактивация закрыта и на endpoint.
         init_data = _make_init_data()
         headers = {"Authorization": f"tma {init_data}"}
 
-        # Need voice plan seeded first
+        # Seed the voice plan in its production tombstone state (is_active=False).
         from sreda.db.session import get_session_factory
-        from sreda.db.models.billing import SubscriptionPlan
+        from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 
         session = get_session_factory()()
         try:
@@ -267,7 +382,7 @@ class TestMiniAppSubscribe:
                         price_rub=0,
                         billing_period_days=30,
                         is_public=True,
-                        is_active=True,
+                        is_active=False,
                         sort_order=30,
                     )
                 )
@@ -280,8 +395,23 @@ class TestMiniAppSubscribe:
             json={"plan_key": "voice_transcription_base"},
             headers=headers,
         )
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "deprecated_plan"
+
+        # No active voice subscription was created by the denied request.
+        session = get_session_factory()()
+        try:
+            active = (
+                session.query(TenantSubscription)
+                .filter(
+                    TenantSubscription.feature_key == "voice_transcription",
+                    TenantSubscription.status == "active",
+                )
+                .count()
+            )
+            assert active == 0
+        finally:
+            session.close()
 
 
 class TestMiniAppFamilyPatch:
@@ -550,5 +680,107 @@ class TestMiniAppScheduleWeek:
         for day in resp.json()["days"]:
             titles = [t["title"] for t in day["tasks"]]
             assert "Прогулка" in titles, f"missing on {day['date']}"
+
+
+class TestMiniAppWeeklyMenu:
+    """#235 — read-only weekly-menu API restore (GET grid for #/menu screen)."""
+
+    def test_menu_item_dict_serialises_own_recipe_title_and_calories(self):
+        from types import SimpleNamespace
+
+        from sreda.api.routes.miniapp import _menu_item_dict
+
+        recipe = SimpleNamespace(
+            title="Борщ", calories_per_serving=250, tenant_id="t", user_id="u",
+        )
+        item = SimpleNamespace(
+            id="i1", day_of_week=2, meal_type="dinner",
+            recipe_id="r1", free_text=None, notes=None, recipe=recipe,
+        )
+        out = _menu_item_dict(item, tenant_id="t", user_id="u")
+        assert out["recipe_title"] == "Борщ"
+        assert out["recipe_calories"] == 250
+        assert out["day_of_week"] == 2 and out["meal_type"] == "dinner"
+
+    def test_menu_item_dict_free_text_cell_has_no_recipe_fields(self):
+        from types import SimpleNamespace
+
+        from sreda.api.routes.miniapp import _menu_item_dict
+
+        item = SimpleNamespace(
+            id="i2", day_of_week=0, meal_type="breakfast",
+            recipe_id=None, free_text="Овсянка", notes=None, recipe=None,
+        )
+        out = _menu_item_dict(item, tenant_id="t", user_id="u")
+        assert out["free_text"] == "Овсянка"
+        assert out["recipe_title"] is None
+        assert out["recipe_calories"] is None
+
+    def test_menu_item_dict_hides_cross_tenant_recipe(self):
+        """R1 MAJOR: a recipe_id pointing at ANOTHER (tenant,user)'s recipe
+        must NOT leak its title/calories through the read endpoint."""
+        from types import SimpleNamespace
+
+        from sreda.api.routes.miniapp import _menu_item_dict
+
+        foreign = SimpleNamespace(
+            title="Чужой борщ", calories_per_serving=300,
+            tenant_id="other_t", user_id="other_u",
+        )
+        item = SimpleNamespace(
+            id="i3", day_of_week=1, meal_type="lunch",
+            recipe_id="r9", free_text=None, notes=None, recipe=foreign,
+        )
+        out = _menu_item_dict(item, tenant_id="tenant_test", user_id="user_test")
+        assert out["recipe_title"] is None     # foreign recipe NOT leaked
+        assert out["recipe_calories"] is None
+        assert out["recipe_id"] == "r9"        # own id passes through
+
+    def test_weekly_menu_empty_returns_plan_none(self, seeded_client):
+        resp = seeded_client.get(
+            "/miniapp/api/v1/weekly-menu",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"plan": None}
+
+    def test_weekly_menu_returns_grid_after_seeding(self, seeded_client):
+        from datetime import date
+
+        from sreda.db.session import get_session_factory
+        from sreda.services.housewife_menu import HousewifeMenuService, MenuCellInput
+
+        session = get_session_factory()()
+        try:
+            HousewifeMenuService(session).plan_week(
+                tenant_id="tenant_test", user_id="user_test",
+                week_start=date(2026, 6, 22),
+                cells=[
+                    MenuCellInput(day_of_week=0, meal_type="breakfast", free_text="Овсянка"),
+                    MenuCellInput(day_of_week=2, meal_type="dinner", free_text="Борщ"),
+                ],
+            )
+        finally:
+            session.close()
+
+        resp = seeded_client.get(
+            "/miniapp/api/v1/weekly-menu",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 200
+        plan = resp.json()["plan"]
+        assert plan is not None
+        cells = {(c["day_of_week"], c["meal_type"]): c for c in plan["items"]}
+        assert cells[(0, "breakfast")]["free_text"] == "Овсянка"
+        assert cells[(2, "dinner")]["free_text"] == "Борщ"
+        assert "recipe_title" in cells[(0, "breakfast")]  # serializer shape intact
+
+    def test_weekly_menu_invalid_week_start_returns_400(self, seeded_client):
+        """R1: bad ?week_start= → controlled 400, not 500 (mirror schedule/week)."""
+        resp = seeded_client.get(
+            "/miniapp/api/v1/weekly-menu?week_start=notadate",
+            headers={"Authorization": f"tma {_make_init_data()}"},
+        )
+        assert resp.status_code == 400
 
 

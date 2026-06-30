@@ -23,7 +23,6 @@ doesn't roll back the earlier good ones.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import date, datetime, time, timedelta, timezone
 from uuid import uuid4
@@ -32,8 +31,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.housewife import FamilyReminder
-from sreda.db.models.tasks import TASK_STATUSES, Task
+from sreda.db.models.tasks import Task
 from sreda.services.housewife_reminders import HousewifeReminderService
+
+# МСК = UTC+3 круглый год; фиксированный оффсет (не требует tzdata). Для no-profile/unknown-zone
+# fallback в _user_timezone — система MSK-центрична, согласованно с #168 (react naive→МСК). #166.
+_MSK = timezone(timedelta(hours=3))
+# sentinel: _attach_reminder_inner берёт self._bot_key, если override явно не передан.
+_USE_SELF_BOT_KEY = object()
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,153 @@ class TaskService:
             raise ValueError("title required")
 
         now = _utcnow()
+
+        # #163 scope (план + контракт #162 + «не трогаем легаси»): межходовой замок (semantic_key
+        # + дедуп) — ТОЛЬКО на ReAct (ctx) пути; легаси (ctx=None) — байт-в-байт прежний, без хеша.
+        # Решение Бориса 2026-06-22: дедупим лишь задачи С датой/временем (без — hash=NULL).
+
+        # #162 Фаза 0 — within-turn идемпотентность создания (эталон
+        # services/housewife_shopping.py::add_items; симметрично
+        # HousewifeReminderService.schedule). ctx is None → легаси байт-в-байт;
+        # ctx is not None → operation_id (logical_key с scheduled_date) +
+        # INSERT ON CONFLICT DO NOTHING + SELECT (стабильный id). emit_event → #163.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        ctx = current_tool_runtime()
+        # ВАЖНО (Codex MAJOR): ctx биндит И plan-execute executor, не только ReAct.
+        # Идемпотентную ctx-ветку берём ТОЛЬКО для простого create (reminder_offset
+        # is None). reminder-on-create (его шлёт лишь plan-execute — ReAct-схема
+        # урезана) падает в legacy-путь ниже, где _attach_reminder_inner реально
+        # цепляет напоминание → нет молчаливой потери напоминания у др. тенантов.
+        if ctx is not None and reminder_offset_minutes is None:
+            # fail-closed user_id (чеклист #162 п.8).
+            if not user_id:
+                raise ValueError(
+                    "add ctx path: user_id обязателен (fail-closed)."
+                )
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "add ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — "
+                    "ToolRuntimeContext leaked across a tenant boundary."
+                )
+            # reminder-on-create — ВНЕ среза (#162): урезанная ReAct-схема не
+            # передаёт reminder_offset_minutes; в ctx-пути его не цепляем.
+            from sreda.services.operation_id import compute_operation_id_create
+            from sreda.services.text_normalization import normalize_for_dedup
+
+            sep = "\x1f"
+            logical_key = sep.join(
+                [
+                    normalize_for_dedup(title_clean),
+                    scheduled_date.isoformat() if scheduled_date else "",
+                    time_start.isoformat() if time_start else "",  # время в ключе (Codex MAJOR)
+                    recurrence_rule or "",
+                ]
+            )
+            op_id = compute_operation_id_create(
+                plan_id=ctx.execution_id,
+                step_id=ctx.step_id,
+                action="create",
+                entity_type="task",
+                logical_key=logical_key,
+            )
+            # #163 Фаза 2b — semantic_key ТОЛЬКО на ReAct-пути; дедупим лишь задачи С датой/временем
+            # (без → nhash=None → вне индекса). reuse — pre-check + backstop ниже.
+            from sqlalchemy.exc import IntegrityError
+
+            from sreda.services.idempotent_ops import find_existing_pending_semantic
+            from sreda.services.operation_id import compute_normalized_title_hash
+
+            nhash = None
+            if scheduled_date is not None:  # Codex MAJOR: дедупим только задачи С ДАТОЙ (решение
+                # Бориса «только задачи с датой»); время-без-даты — НЕ дедупим. Время участвует в
+                # ключе (extra) лишь когда дата есть.
+                # `or None`: вырожденное название (пунктуация) → хеш "" → IS NOT NULL → ложно
+                # схлопнул бы разные такие задачи в индексе; трактуем "" как «дедуп невозможен» (субагент MINOR).
+                nhash = compute_normalized_title_hash(
+                    title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
+                    extra=sep.join([
+                        scheduled_date.isoformat() if scheduled_date else "",
+                        time_start.isoformat() if time_start else "",
+                        recurrence_rule or ""])) or None
+            dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
+            if dialect_name == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as _insert
+            else:
+                from sqlalchemy.dialects.sqlite import insert as _insert  # type: ignore[no-redef]
+
+            stmt = (
+                _insert(Task)
+                .values(
+                    id=f"task_{uuid4().hex[:24]}",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    title=title_clean[:500],
+                    notes=(notes or "").strip() or None,
+                    scheduled_date=scheduled_date,
+                    time_start=time_start,
+                    time_end=time_end,
+                    recurrence_rule=recurrence_rule or None,
+                    delegated_to=(delegated_to or "").strip() or None,
+                    status="pending",
+                    created_at=now,
+                    updated_at=now,
+                    operation_id=op_id,
+                    normalized_title_hash=nhash,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["tenant_id", "user_id", "operation_id"]
+                )
+            )
+            # pre-check межходового дубля (одно-поточный путь + тесты): тот же semantic_key, pending →
+            # reuse без вставки. ON CONFLICT(op_id) покрывает within-turn повтор; backstop ниже — гонку.
+            if nhash is not None:
+                existing = find_existing_pending_semantic(
+                    self.session, Task, tenant_id=tenant_id, user_id=user_id, nhash=nhash)
+                if existing is not None:
+                    return existing
+            try:
+                self.session.execute(stmt)
+            except IntegrityError:
+                self.session.rollback()
+                existing = (find_existing_pending_semantic(
+                    self.session, Task, tenant_id=tenant_id,
+                    user_id=user_id, nhash=nhash) if nhash is not None else None)
+                if existing is not None:
+                    return existing
+                raise
+            # #163 Фаза 3d-B: SELECT + проверка + react-аудит + commit под ОДНИМ rollback-guard'ом
+            # (Codex high/mimo R1 MAJOR: сбой SELECT/RuntimeError ДО guard'а оставлял бы вставку pending
+            # без отката → поздний commit чужого тула закоммитил бы её БЕЗ аудита). Within-turn replay
+            # (тот же op_id) emit_tool_audit дедупит по op_id; semantic-reuse (другой ход) вернулся ВЫШЕ
+            # до execute → не эмитит. Сбой (не гонка) → откат всей операции (named-W). Гонку аудита поглощает emit.
+            try:
+                actual = (
+                    self.session.query(Task)
+                    .filter(
+                        Task.tenant_id == tenant_id,
+                        Task.user_id == user_id,
+                        Task.operation_id == op_id,
+                    )
+                    .one_or_none()
+                )
+                if actual is None:
+                    raise RuntimeError(
+                        "add ctx path: строка не найдена после INSERT для "
+                        f"op_id={op_id!r} (tenant={tenant_id!r})"
+                    )
+                from sreda.services.audit_feed import emit_tool_audit
+                emit_tool_audit(
+                    self.session, operation_id=op_id, tenant_id=tenant_id, user_id=user_id,
+                    entity_type="task", entity_id=actual.id, action="created")
+                self.session.commit()
+            except Exception:  # noqa: BLE001 — сбой SELECT/аудита/commit → откат (задача не остаётся без аудита)
+                self.session.rollback()
+                raise
+            return actual
+
+        # Легаси-путь (ctx=None) — БЕЗ semantic_key/дедупа (scope #163: только ReAct), байт-в-байт.
         task = Task(
             id=f"task_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -179,6 +331,8 @@ class TaskService:
             raise ValueError("title required")
 
         now = _utcnow()
+        # #163 scope: композит-путь — легаси-чат (не ReAct) → БЕЗ semantic_key/дедупа (план #163:
+        # замок только на ReAct). Прежнее поведение байт-в-байт.
         task = Task(
             id=f"task_{uuid4().hex[:24]}",
             tenant_id=tenant_id,
@@ -354,10 +508,13 @@ class TaskService:
         recurrence_rule: str | None = None,
         notes: str | None = None,
         delegated_to: str | None = None,
+        commit: bool = True,
     ) -> Task | None:
         """Partial update. Pass only fields you want to change.
         ``None`` values mean "leave as-is"; to explicitly clear a
-        field call ``detach_reminder`` / use a dedicated clearer."""
+        field call ``detach_reminder`` / use a dedicated clearer.
+        ``recurrence_rule=""`` clears recurrence (task becomes one-shot;
+        a linked reminder is recreated as one-shot — #166)."""
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
@@ -365,16 +522,23 @@ class TaskService:
         schedule_changed = False
         if title is not None:
             task.title = title.strip()[:500]
-        if scheduled_date is not None:
+        # schedule_changed — ТОЛЬКО при РЕАЛЬНОМ изменении значения (#166: иначе передача
+        # текущих даты/времени вместе с правкой текста зря пере-создаёт напоминание).
+        if scheduled_date is not None and scheduled_date != task.scheduled_date:
             task.scheduled_date = scheduled_date
             schedule_changed = True
-        if time_start is not None:
+        if time_start is not None and time_start != task.time_start:
             task.time_start = time_start
             schedule_changed = True
         if time_end is not None:
             task.time_end = time_end
         if recurrence_rule is not None:
-            task.recurrence_rule = recurrence_rule or None
+            new_rrule = recurrence_rule or None
+            if new_rrule != task.recurrence_rule:
+                task.recurrence_rule = new_rrule
+                # #166: смена повторения тоже ресинкает связанное напоминание (иначе reminder
+                # оставался бы со старым rrule; раньше синкалось лишь случайно при изменении даты).
+                schedule_changed = True
         if notes is not None:
             task.notes = notes.strip() or None
         if delegated_to is not None:
@@ -387,19 +551,27 @@ class TaskService:
         # reminder ends as status=cancelled, new one gets a fresh id).
         if schedule_changed and task.reminder_id and task.reminder_offset_minutes is not None:
             old_offset = task.reminder_offset_minutes
+            # сохранить bot_key СТАРОГО напоминания → новое останется на том же боте/канале
+            # (#166: иначе react TaskService без bot_key сбросил бы на LEGACY_NULL).
+            old_rem = self.session.get(FamilyReminder, task.reminder_id)
+            old_bot_key = old_rem.bot_key if old_rem is not None else self._bot_key
+            # #163 Фаза 3: sub-операции БЕЗ своего commit — весь update атомарен одним commit ниже
+            # (раньше cancel+attach коммитили по отдельности; теперь единая per-op граница).
             self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id,
+                tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
             )
             task.reminder_id = None
             if task.scheduled_date and task.time_start:
                 self._attach_reminder_inner(
-                    task=task, offset_minutes=old_offset,
+                    task=task, offset_minutes=old_offset, bot_key=old_bot_key, commit=False,
                 )
             else:
                 task.reminder_offset_minutes = None
-                self.session.commit()
-        else:
+        # Единый commit (per-op атомарность). commit=False → владеет durable-helper (ctx-путь).
+        if commit:
             self.session.commit()
+        else:
+            self.session.flush()
         return task
 
     def complete(
@@ -408,6 +580,10 @@ class TaskService:
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
+        # #162 п.6 — no-op guard: уже завершена → НЕ двигаем completed_at/updated_at
+        # на повторе внутри хода (replay) и не гасим напоминание повторно.
+        if task.status == "completed":
+            return task
         task.status = "completed"
         task.completed_at = _utcnow()
         task.updated_at = _utcnow()
@@ -433,6 +609,9 @@ class TaskService:
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
+        # #162 п.6 — no-op guard: уже pending → не двигаем updated_at на повторе.
+        if task.status == "pending":
+            return task
         task.status = "pending"
         task.completed_at = None
         task.updated_at = _utcnow()
@@ -440,25 +619,32 @@ class TaskService:
         return task
 
     def cancel(
-        self, *, tenant_id: str, user_id: str, task_id: str,
+        self, *, tenant_id: str, user_id: str, task_id: str, commit: bool = True,
     ) -> Task | None:
         """Soft-cancel. Row stays in DB, disappears from pending lists."""
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
+        # #162 no-op guard (Codex MAJOR): уже отменена → не двигаем updated_at и не
+        # гасим напоминание повторно на replay.
+        if task.status == "cancelled":
+            return task
         task.status = "cancelled"
         task.updated_at = _utcnow()
         if task.reminder_id:
-            self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id,
+            self.reminders.cancel(  # #163 Фаза 3: часть этой операции → без своего commit
+                tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
             )
             task.reminder_id = None
             task.reminder_offset_minutes = None
-        self.session.commit()
+        if commit:  # #163 Фаза 3: единая per-op граница; commit=False → владеет durable-helper
+            self.session.commit()
+        else:
+            self.session.flush()
         return task
 
     def delete(
-        self, *, tenant_id: str, user_id: str, task_id: str,
+        self, *, tenant_id: str, user_id: str, task_id: str, commit: bool = True,
     ) -> bool:
         """Hard delete. Cancels the reminder first (if any) so we
         don't leave a pending reminder orphaned."""
@@ -467,10 +653,13 @@ class TaskService:
             return False
         if task.reminder_id:
             self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id,
+                tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
             )
         self.session.delete(task)
-        self.session.commit()
+        if commit:
+            self.session.commit()
+        else:
+            self.session.flush()
         return True
 
     # ------------------------------------------------------------------
@@ -523,7 +712,8 @@ class TaskService:
         self.session.commit()
         return task
 
-    def _attach_reminder_inner(self, *, task: Task, offset_minutes: int) -> None:
+    def _attach_reminder_inner(self, *, task: Task, offset_minutes: int,
+                               bot_key=_USE_SELF_BOT_KEY, commit: bool = True) -> None:
         """Internal helper: create a FamilyReminder, link it, commit.
         Caller guarantees the task has scheduled_date + time_start.
 
@@ -570,8 +760,9 @@ class TaskService:
 
         trigger_dt = trigger_dt - timedelta(minutes=offset_minutes)
         # Copy RRULE over so a recurring task gets a recurring reminder.
-        # Pass self._bot_key so the reminder fires via the same bot the
-        # task was created from (Phase 5: bot_key fixed at creation).
+        # bot_key: по умолчанию self._bot_key (Phase 5: bot_key fixed at creation);
+        # при RESCHEDULE вызывающий передаёт bot_key СТАРОГО напоминания, чтобы новое не
+        # сбросилось на LEGACY_NULL (#166: react TaskService создаётся без bot_key).
         reminder = self.reminders.schedule(
             tenant_id=task.tenant_id,
             user_id=task.user_id,
@@ -579,21 +770,26 @@ class TaskService:
             trigger_at=trigger_dt,
             recurrence_rule=task.recurrence_rule,
             source_memo=f"task:{task.id}",
-            bot_key=self._bot_key,
+            bot_key=(self._bot_key if bot_key is _USE_SELF_BOT_KEY else bot_key),
+            commit=commit,  # #163 Фаза 3: не коммитить изнутри savepoint helper'а (tasks.update)
         )
         task.reminder_id = reminder.id
         task.reminder_offset_minutes = offset_minutes
         task.updated_at = _utcnow()
-        self.session.commit()
+        if commit:  # #163 Фаза 3: commit=False как часть большей операции (tasks.update через helper)
+            self.session.commit()
+        else:
+            self.session.flush()
 
     def _user_timezone(self, tenant_id: str, user_id: str):
         """Resolve the user's IANA timezone for local-wall-clock ↔ UTC
-        conversion. Falls back to UTC if no profile row or an unknown
-        zone — matching the TenantUserProfile default column value."""
+        conversion. Falls back to МСК (UTC+3) if no profile row or an unknown
+        zone — система MSK-центрична (#166/#168); прежний UTC-fallback давал
+        напоминания задач +3ч для profile-less юзеров."""
         try:
             from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
         except ImportError:  # pragma: no cover
-            return timezone.utc
+            return _MSK
 
         from sreda.db.models.user_profile import TenantUserProfile
         profile = (
@@ -604,11 +800,13 @@ class TaskService:
             )
             .one_or_none()
         )
-        tz_name = (profile.timezone if profile else None) or "UTC"
+        tz_name = profile.timezone if profile else None
+        if not tz_name:
+            return _MSK  # нет профиля → МСК, не UTC
         try:
             return ZoneInfo(tz_name)
         except ZoneInfoNotFoundError:
-            return timezone.utc
+            return _MSK
 
     # ------------------------------------------------------------------
     # Queries

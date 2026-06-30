@@ -5,6 +5,7 @@ OpenRouter + rate-limit-headers shapes, and respect for the cache.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -57,6 +58,7 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def _reset_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     pb.invalidate_cache()
+    pb.invalidate_iam_cache()
     # Strip any SREDA_* env leakage so Settings picks up constructor
     # kwargs cleanly instead of inheriting dev-shell secrets.
     import os
@@ -185,6 +187,29 @@ def test_mimo_without_rate_limit_headers_flagged_not_supported(_patch_httpx) -> 
 
 
 # ---------------------------------------------------------------------------
+# Inception (Mercury-2, «Фредди») — провайдер планировщика, без сетевого probe
+# ---------------------------------------------------------------------------
+
+
+def test_inception_listed_no_billing_api_when_key_set() -> None:
+    # #150 follow-up: Inception попадает в «Балансы провайдеров»; публичного
+    # billing API нет, сетью провайдера планировщика НЕ дёргаем (не нужен httpx).
+    s = _settings(inception_api_key="inc-k")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "inception-mercury2")
+    assert row.status == "not_supported"
+    assert "billing" in row.headline.lower()
+    assert "Фредди" in row.label
+
+
+def test_inception_not_configured_without_key() -> None:
+    s = _settings()  # ключа нет
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "inception-mercury2")
+    assert row.status == "not_configured"
+
+
+# ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------
 
@@ -213,3 +238,176 @@ def test_cache_hit_avoids_second_http_call(_patch_httpx, monkeypatch) -> None:
 
     pb.fetch_balances(s, force_refresh=True)
     assert calls["n"] > first, "force_refresh must bypass cache"
+
+
+# ---------------------------------------------------------------------------
+# Yandex Cloud billing (#229) — SA key parse + balance fetch
+# ---------------------------------------------------------------------------
+
+
+def test_yandex_parse_pem_with_bracketed_key_id() -> None:
+    """Regression: console PEM wraps the key id in <…>; brackets must be
+    stripped (else IAM exchange → 'Key not found')."""
+    raw = (
+        "PLEASE DO NOT REMOVE THIS LINE! Yandex.Cloud SA Key ID <aje123abc456>\n"
+        "-----BEGIN PRIVATE KEY-----\nMIIstub\n-----END PRIVATE KEY-----\n"
+    )
+    key_id, sa_id, pem = pb._parse_yandex_sa_key(raw, "sa-fallback")
+    assert key_id == "aje123abc456"          # brackets stripped
+    assert sa_id == "sa-fallback"            # PEM has no sa_id → fallback used
+    assert pem.startswith("-----BEGIN PRIVATE KEY-----")
+
+
+def test_yandex_parse_json_key_prefers_embedded_sa_id() -> None:
+    raw = json.dumps({
+        "id": "key-1",
+        "service_account_id": "sa-json",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----",
+    })
+    key_id, sa_id, pem = pb._parse_yandex_sa_key(raw, "ignored-fallback")
+    assert key_id == "key-1"
+    assert sa_id == "sa-json"                # JSON sa_id wins over fallback
+
+
+def test_yandex_pem_without_sa_id_raises() -> None:
+    raw = "Key ID <k1>\n-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----"
+    with pytest.raises(ValueError):
+        pb._parse_yandex_sa_key(raw, None)   # no sa_id anywhere → cannot sign
+
+
+def test_build_yandex_jwt_is_ps256_three_parts() -> None:
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = priv.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    token = pb._build_yandex_jwt("kid-1", "sa-1", pem)
+    parts = token.split(".")
+    assert len(parts) == 3
+
+    def _decode(seg: str) -> dict:
+        return json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+
+    header, payload = _decode(parts[0]), _decode(parts[1])
+    assert header["alg"] == "PS256" and header["kid"] == "kid-1"
+    assert payload["iss"] == "sa-1"
+    assert payload["aud"].endswith("/iam/v1/tokens")
+
+
+def test_yandex_balance_ok(_patch_httpx, monkeypatch) -> None:
+    monkeypatch.setattr(pb, "_yandex_iam_token", lambda s: "iam-fake")
+    _patch_httpx({
+        "billingAccounts": FakeResponse(200, json_body={"billingAccounts": [
+            {"id": "dn-1", "name": "account-451", "balance": "99.3496",
+             "currency": "RUB", "active": True},
+        ]}),
+    })
+    s = _settings(yandex_billing_sa_key_file="/x/key")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "yandex")
+    assert row.status == "ok"
+    assert "99.35 RUB" in row.headline      # string balance → Decimal, 2dp
+    assert "account-451" in row.details
+
+
+def test_yandex_not_configured_without_key() -> None:
+    s = _settings()
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "yandex")
+    assert row.status == "not_configured"
+
+
+def test_yandex_empty_accounts_flags_missing_role(_patch_httpx, monkeypatch) -> None:
+    monkeypatch.setattr(pb, "_yandex_iam_token", lambda s: "iam-fake")
+    _patch_httpx({"billingAccounts": FakeResponse(200, json_body={"billingAccounts": []})})
+    s = _settings(yandex_billing_sa_key_file="/x/key")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "yandex")
+    assert row.status == "error"
+    assert "billing.accounts.viewer" in row.details
+
+
+def test_yandex_iam_failure_doesnt_hide_others(_patch_httpx, monkeypatch) -> None:
+    def _boom(_s):
+        raise RuntimeError("iam down")
+
+    monkeypatch.setattr(pb, "_yandex_iam_token", _boom)
+    _patch_httpx({"/models": FakeResponse(200, headers={
+        "x-ratelimit-remaining-requests": "5",
+        "x-ratelimit-limit-requests": "10",
+    })})
+    s = _settings(yandex_billing_sa_key_file="/x/key", groq_api_key="g-k")
+    rows = pb.fetch_balances(s)
+    yandex = next(r for r in rows if r.key == "yandex")
+    groq = next(r for r in rows if r.key == "groq")
+    assert yandex.status == "error"
+    assert groq.status == "ok", "Groq must still be queried when Yandex fails"
+
+
+def test_yandex_picks_configured_account_id(_patch_httpx, monkeypatch) -> None:
+    monkeypatch.setattr(pb, "_yandex_iam_token", lambda s: "iam-fake")
+    _patch_httpx({
+        "billingAccounts": FakeResponse(200, json_body={"billingAccounts": [
+            {"id": "first", "name": "a", "balance": "1.0", "currency": "RUB", "active": True},
+            {"id": "wanted", "name": "b", "balance": "55.0", "currency": "RUB", "active": True},
+        ]}),
+    })
+    s = _settings(yandex_billing_sa_key_file="/x/key", yandex_billing_account_id="wanted")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "yandex")
+    assert "55.00 RUB" in row.headline       # picked the configured id, not first
+
+
+def test_yandex_configured_account_missing_is_error(_patch_httpx, monkeypatch) -> None:
+    """R1 MAJOR: configured account_id not in list must NOT silently fall back
+    to the first account (would show a stranger's balance as ok)."""
+    monkeypatch.setattr(pb, "_yandex_iam_token", lambda s: "iam-fake")
+    _patch_httpx({
+        "billingAccounts": FakeResponse(200, json_body={"billingAccounts": [
+            {"id": "other", "name": "x", "balance": "1.0", "currency": "RUB", "active": True},
+        ]}),
+    })
+    s = _settings(yandex_billing_sa_key_file="/x/key", yandex_billing_account_id="nope")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "yandex")
+    assert row.status == "error"
+    assert "1.0" not in row.headline          # did NOT show the wrong account
+    assert "nope" in row.details
+
+
+def test_yandex_null_balance_is_error_not_ok(_patch_httpx, monkeypatch) -> None:
+    """R1 MAJOR: a None/missing balance must not render as ok ('None RUB')."""
+    monkeypatch.setattr(pb, "_yandex_iam_token", lambda s: "iam-fake")
+    _patch_httpx({
+        "billingAccounts": FakeResponse(200, json_body={"billingAccounts": [
+            {"id": "dn-1", "name": "acc", "balance": None, "currency": "RUB", "active": True},
+        ]}),
+    })
+    s = _settings(yandex_billing_sa_key_file="/x/key")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "yandex")
+    assert row.status == "error"
+    assert "None" not in row.headline
+
+
+def test_yandex_malformed_accounts_doesnt_crash(_patch_httpx, monkeypatch) -> None:
+    """R1 MAJOR: non-dict entries / odd shapes must be filtered, not raise
+    after the defensive block (which would hide every other provider)."""
+    monkeypatch.setattr(pb, "_yandex_iam_token", lambda s: "iam-fake")
+    _patch_httpx({
+        "billingAccounts": FakeResponse(200, json_body={"billingAccounts": [
+            None, "garbage",
+            {"id": "good", "name": "acc", "balance": "12.5", "currency": "RUB", "active": True},
+        ]}),
+    })
+    s = _settings(yandex_billing_sa_key_file="/x/key")
+    rows = pb.fetch_balances(s)
+    row = next(r for r in rows if r.key == "yandex")
+    assert row.status == "ok"
+    assert "12.50 RUB" in row.headline       # picked the only valid dict

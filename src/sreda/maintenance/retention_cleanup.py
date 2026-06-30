@@ -14,7 +14,6 @@ inbound_messages               30 days     any
 jobs                           30 days     status in completed/failed/cancelled
 outbox_messages (sent)         30 days     status == sent
 outbox_messages (failed)       60 days     status == failed
-secure_records                 7 days      record_type == eds_connect_payload
 skill_ai_executions            30 days     any
 skill_events (debug/info)      30 days     severity in debug/info
 skill_events (warn/error)      90 days     severity in warn/error
@@ -22,9 +21,13 @@ skill_run_attempts             90 days     parent run succeeded/failed/cancelled
 skill_runs                     90 days     status in succeeded/failed/cancelled
 =============================  ==========  ===============================
 
-Order matters: children (attempts, events, ai_executions) are deleted
-before their parent runs so we never violate ``skill_run_attempts.run_id``
-FK. Everything else uses soft references and order-independence.
+Order matters: children are deleted before their parents so we never
+violate non-CASCADE FKs. Two such chains:
+  * skill: attempts/events/ai_executions before their parent skill_runs.
+  * #164 planner: step_execution_ledger / planner_gaps /
+    planner_llm_reservations before planner_executions, and
+    planner_executions before its parent agent_runs.
+Everything else uses soft references and order-independence.
 
 Live runs (pending/running/retry_scheduled) are never touched.
 """
@@ -34,18 +37,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, delete, or_, select, union_all, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
-from sreda.db.models.connect import ConnectSession, TenantEDSAccount
-from sreda.db.models.core import InboundMessage, Job, OutboxMessage, SecureRecord
+from sreda.db.models.core import InboundMessage, Job, OutboxMessage
+from sreda.db.models.planner import (
+    PlannerExecution,
+    PlannerGap,
+    PlannerLlmReservation,
+    StepExecutionLedger,
+)
+from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
+from sreda.services.react_summary_store import delete_summaries_older_than
+from sreda.db.models.react_debug import ReactDebugTurn
+from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.runtime import AgentRun
 from sreda.db.models.skill_platform import (
     SkillAIExecution,
     SkillEvent,
     SkillRun,
     SkillRunAttempt,
-    TenantSkillConfig,
 )
 
 
@@ -62,12 +73,21 @@ class RetentionCleanupResult:
     jobs: int = 0
     outbox_messages_sent: int = 0
     outbox_messages_failed: int = 0
+    outbox_messages_dropped: int = 0  # #187 — drain удалённого тенанта (status='dropped')
     secure_records_eds_connect_payload: int = 0
     skill_ai_executions: int = 0
     skill_events_debug_info: int = 0
     skill_events_warn_error: int = 0
     skill_run_attempts: int = 0
     skill_runs: int = 0
+    planner_executions: int = 0  # #164
+    step_execution_ledger: int = 0  # #164 (ребёнок planner_executions)
+    planner_gaps: int = 0  # #164
+    planner_llm_reservations: int = 0  # #164
+    react_debug_turns: int = 0  # #185 (временный QA-захват переписки — короткий TTL)
+    react_turn_trace: int = 0  # #192 (durable трейс хода — короткий TTL, ПД)
+    react_checkpoint: int = 0  # #193 (durable checkpoint диалога — GC по last-activity треда, ПД)
+    react_summaries: int = 0  # #232 способ Б (durable-выжимка истории — GC по updated_at, ПД)
     plan_library_entries: int = 0
     deleted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -79,28 +99,54 @@ class RetentionCleanupResult:
             + self.jobs
             + self.outbox_messages_sent
             + self.outbox_messages_failed
+            + self.outbox_messages_dropped
             + self.secure_records_eds_connect_payload
             + self.skill_ai_executions
             + self.skill_events_debug_info
             + self.skill_events_warn_error
             + self.skill_run_attempts
             + self.skill_runs
+            + self.planner_executions
+            + self.step_execution_ledger
+            + self.planner_gaps
+            + self.planner_llm_reservations
+            + self.react_debug_turns
+            + self.react_turn_trace
+            + self.react_checkpoint
+            + self.react_summaries
         )
 
 
 # Retention windows (in days). Kept as module constants so they can be
 # patched in tests.
 AGENT_RUNS_DAYS = 90
+# #164: planner_executions (с #155 копит зашифрованные ПД) — окно = 90д (как родитель
+# agent_runs, утв. владельцем 2026-06-19; max корпус для будущей SIA-петли). Удаляем ТЕРМИНАЛЬНЫЕ
+# строки ПЕРЕД чисткой agent_runs (дети раньше родителя — FK run_id NOT NULL, без CASCADE).
+PLANNER_EXECUTIONS_DAYS = 90
+_PLANNER_LIVE_STATUSES = ("pending", "in_progress")  # живые ходы НЕ чистим
 INBOUND_MESSAGES_DAYS = 30
 JOBS_DAYS = 30
 OUTBOX_SENT_DAYS = 30
 OUTBOX_FAILED_DAYS = 60
-EDS_CONNECT_PAYLOAD_DAYS = 7
+# #187: outbox со status='dropped' (drain удалённого тенанта). Терминальный
+# не-доставленный статус, как 'failed' — то же окно 60д.
+OUTBOX_DROPPED_DAYS = 60
 SKILL_AI_EXECUTIONS_DAYS = 30
 SKILL_EVENTS_DEBUG_INFO_DAYS = 30
 SKILL_EVENTS_WARN_ERROR_DAYS = 90
 SKILL_ATTEMPTS_DAYS = 90
 SKILL_RUNS_DAYS = 90
+# #185: react_debug_turns — ВРЕМЕННЫЙ QA-захват переписки (полный текст, EncryptedString). Короткое
+# окно: для отлова багов хватает, а ПД всех юзеров не копятся бессрочно (Codex high MAJOR).
+REACT_DEBUG_TURNS_DAYS = 14
+# #193: react_checkpoint/_write — durable диалог ReAct (ПД, шифр). GC по last-activity ТРЕДА: тред,
+# у которого MAX(created_at) < cutoff, удаляется ЦЕЛИКОМ (обе таблицы) — активный тред не режем
+# (целостность parent-цепочки). Окно длиннее трейса (живой диалог дольше отладочного следа).
+REACT_CHECKPOINT_DAYS = 30
+# #192: react_turn_trace — durable трейс хода (контент EncryptedString + структура). Тот же короткий
+# TTL, что и debug-захват: наблюдательные данные с ПД не копятся бессрочно.
+REACT_TURN_TRACE_DAYS = 14
 
 # #127: размер порции для unlink+delete входящих (см. блок inbound ниже)
 INBOUND_CHUNK_SIZE = 5000
@@ -223,8 +269,57 @@ def cleanup_runtime_retention(
         ),
     )
 
-    # ---------- agent_runs ----------
+    # ---------- planner_executions + её дети (#164 — дети раньше родителей) ----------
+    # FK planner_executions.run_id → agent_runs.id: NOT NULL, без ON DELETE CASCADE. Чтобы чистка
+    # agent_runs не падала на FK, удаляем planner_executions ДВУХ видов (Codex R2 — закрыть skew +
+    # застрявших-живых): (а) ВСЕ под удаляемыми родителями (run_id ∈ doomed agent_runs) — любой
+    # статус/возраст: ребёнок 90д-мёртвого родителя тоже мёртв (вкл. застрявший pending/in_progress
+    # и terminal чуть моложе родителя); (б) собственная ретенция planner_executions — терминальные
+    # старше своего окна, даже если родитель ещё жив. Недавние живые (свежий родитель) — хранятся.
+    #
+    # САМА planner_executions — родитель: step_execution_ledger.execution_id (NOT NULL),
+    # planner_gaps / planner_llm_reservations (nullable, но non-null ссылки тоже держат) — все FK
+    # БЕЗ CASCADE → их детей удаляем ЕЩЁ раньше. Цепочка дети→планнер→agent_runs полная. (Сейчас
+    # 3 дочерние таблицы пусты — ledger/billing подключатся следующим срезом #163, но future-safe.)
+    # Удаление физически уносит зашифрованные *_enc ПД (нет осиротевших персональных данных).
     agent_runs_cutoff = now - timedelta(days=AGENT_RUNS_DAYS)
+    planner_exec_cutoff = now - timedelta(days=PLANNER_EXECUTIONS_DAYS)
+    doomed_agent_run_ids = select(AgentRun.id).where(
+        and_(
+            AgentRun.status.in_(TERMINAL_AGENT_RUN_STATUSES),
+            AgentRun.created_at < agent_runs_cutoff,
+        )
+    )
+    _deletable_exec = or_(
+        PlannerExecution.run_id.in_(doomed_agent_run_ids),
+        and_(
+            PlannerExecution.execution_status.notin_(_PLANNER_LIVE_STATUSES),
+            PlannerExecution.created_at < planner_exec_cutoff,
+        ),
+    )
+    deletable_exec_ids = select(PlannerExecution.id).where(_deletable_exec)
+    result.step_execution_ledger = _delete_returning_count(
+        session,
+        delete(StepExecutionLedger).where(
+            StepExecutionLedger.execution_id.in_(deletable_exec_ids)
+        ),
+    )
+    result.planner_gaps = _delete_returning_count(
+        session,
+        delete(PlannerGap).where(PlannerGap.execution_id.in_(deletable_exec_ids)),
+    )
+    result.planner_llm_reservations = _delete_returning_count(
+        session,
+        delete(PlannerLlmReservation).where(
+            PlannerLlmReservation.execution_id.in_(deletable_exec_ids)
+        ),
+    )
+    result.planner_executions = _delete_returning_count(
+        session,
+        delete(PlannerExecution).where(_deletable_exec),  # тот же предикат (без self-ref)
+    )
+
+    # ---------- agent_runs (после её planner-детей → FK-safe) ----------
     result.agent_runs = _delete_returning_count(
         session,
         delete(AgentRun).where(
@@ -317,50 +412,72 @@ def cleanup_runtime_retention(
             )
         ),
     )
-
-    # ---------- secure_records (eds_connect_payload only) ----------
-    # 2026-04-28 fix: было FK-violation. SecureRecord ссылается из
-    # connect_sessions / tenant_eds_accounts / inbound_messages /
-    # tenant_skill_configs / skill_runs (in/out) / skill_run_attempts.
-    # Удаляем ТОЛЬКО orphan'ов — у которых ни один FK не указывает на них.
-    # Если кто-то ещё ссылается — secure_record нужен (parent живой),
-    # его TTL обнуляется.
-    eds_cutoff = now - timedelta(days=EDS_CONNECT_PAYLOAD_DAYS)
-    # union_all через function-form (SQLAlchemy 2.x): chained .union_all
-    # на Select возвращает CompoundSelect у которого нет своего .union_all.
-    referenced_ids = union_all(
-        select(ConnectSession.secure_record_id).where(
-            ConnectSession.secure_record_id.isnot(None)
-        ),
-        select(TenantEDSAccount.secure_record_id).where(
-            TenantEDSAccount.secure_record_id.isnot(None)
-        ),
-        select(InboundMessage.secure_record_id).where(
-            InboundMessage.secure_record_id.isnot(None)
-        ),
-        select(TenantSkillConfig.secure_record_id).where(
-            TenantSkillConfig.secure_record_id.isnot(None)
-        ),
-        select(SkillRun.input_secure_record_id).where(
-            SkillRun.input_secure_record_id.isnot(None)
-        ),
-        select(SkillRun.output_secure_record_id).where(
-            SkillRun.output_secure_record_id.isnot(None)
-        ),
-        select(SkillAIExecution.raw_artifact_secure_record_id).where(
-            SkillAIExecution.raw_artifact_secure_record_id.isnot(None)
-        ),
-    )
-    result.secure_records_eds_connect_payload = _delete_returning_count(
+    # #187: status='dropped' (drain удалённого тенанта) — терминальный
+    # не-доставленный статус; без этой ветки dropped-строки копились бы
+    # бессрочно. То же окно, что failed (60д).
+    dropped_cutoff = now - timedelta(days=OUTBOX_DROPPED_DAYS)
+    result.outbox_messages_dropped = _delete_returning_count(
         session,
-        delete(SecureRecord).where(
+        delete(OutboxMessage).where(
             and_(
-                SecureRecord.record_type == "eds_connect_payload",
-                SecureRecord.created_at < eds_cutoff,
-                SecureRecord.id.notin_(referenced_ids),
+                OutboxMessage.status == "dropped",
+                OutboxMessage.created_at < dropped_cutoff,
             )
         ),
     )
+
+    # ---------- secure_records (eds_connect_payload) ----------
+    # #181 Phase B: EDS Monitor retired — the connect-layer tables
+    # (connect_sessions / tenant_eds_accounts) and the eds_connect_payload
+    # secure_records they referenced are dropped/deleted by migration
+    # 20260622_0060. There is no longer any eds_connect_payload row to clean up
+    # here, so this branch is gone. ``result.secure_records_eds_connect_payload``
+    # stays at its default 0 for log/metric shape compatibility.
+
+    # ---------- react_debug_turns (#185: временный QA-захват переписки, короткий TTL) ----------
+    # Leaf-таблица (нет FK-детей/родителей в чистке), полный текст переписки (EncryptedString).
+    # Удаляем строки старше REACT_DEBUG_TURNS_DAYS — ограничиваем накопление ПД при debug_all.
+    react_debug_cutoff = now - timedelta(days=REACT_DEBUG_TURNS_DAYS)
+    result.react_debug_turns = _delete_returning_count(
+        session,
+        delete(ReactDebugTurn).where(ReactDebugTurn.created_at < react_debug_cutoff),
+    )
+
+    # #192: react_turn_trace — durable трейс хода, тот же короткий TTL (ПД).
+    react_trace_cutoff = now - timedelta(days=REACT_TURN_TRACE_DAYS)
+    result.react_turn_trace = _delete_returning_count(
+        session,
+        delete(ReactTurnTrace).where(ReactTurnTrace.created_at < react_trace_cutoff),
+    )
+
+    # #193: react_checkpoint/_write — durable диалог. GC по last-activity ТРЕДА: тред, у которого
+    # MAX(created_at) < cutoff, удаляем ЦЕЛИКОМ (обе таблицы); активный тред не трогаем (целостность
+    # parent-цепочки checkpoint'ов). Одной транзакцией (как и вся чистка).
+    cp_cutoff = now - timedelta(days=REACT_CHECKPOINT_DAYS)
+    stale_threads = session.execute(
+        select(ReactCheckpoint.thread_id, ReactCheckpoint.checkpoint_ns)
+        .group_by(ReactCheckpoint.thread_id, ReactCheckpoint.checkpoint_ns)
+        .having(func.max(ReactCheckpoint.created_at) < cp_cutoff)
+    ).all()
+    for thread_id, ns in stale_threads:
+        session.execute(
+            delete(ReactCheckpointWrite).where(
+                ReactCheckpointWrite.thread_id == thread_id,
+                ReactCheckpointWrite.checkpoint_ns == ns,
+            )
+        )
+        result.react_checkpoint += _delete_returning_count(
+            session,
+            delete(ReactCheckpoint).where(
+                ReactCheckpoint.thread_id == thread_id,
+                ReactCheckpoint.checkpoint_ns == ns,
+            ),
+        )
+
+    # #232 способ Б: react_summaries — durable-выжимка истории (ПД, шифр), лист-таблица (нет FK-детей).
+    # GC по updated_at тем же окном, что тред (#193). Единый источник правды — store (не дублируем delete).
+    summary_cutoff = now - timedelta(days=REACT_CHECKPOINT_DAYS)
+    result.react_summaries = delete_summaries_older_than(session, summary_cutoff)
 
     # ---------- plan_library (#135: TTL всем статусам, без PII) ----------
     try:

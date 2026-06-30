@@ -136,12 +136,21 @@ class InboundEventRepository:
     def list_ready_for_delivery(
         self, *, limit: int = 50, min_score: float = 0.5
     ) -> list[InboundEvent]:
-        """Classified + not-yet-consumed events over the score threshold."""
+        """Classified + not-yet-consumed events over the score threshold.
+
+        #187 soft-delete — producer-фильтр (дверь #10): удалённые тенанты
+        исключаются (JOIN tenants ... AND deleted_at IS NULL), иначе
+        проактив оживал бы после удаления/restore.
+        """
+        from sreda.db.models.core import Tenant
+
         return (
             self.session.query(InboundEvent)
+            .join(Tenant, Tenant.id == InboundEvent.tenant_id)
             .filter(
                 InboundEvent.status == "classified",
                 InboundEvent.relevance_score >= min_score,
+                Tenant.deleted_at.is_(None),
             )
             .order_by(InboundEvent.created_at.asc())
             .limit(limit)

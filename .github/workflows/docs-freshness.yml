@@ -1,0 +1,31 @@
+name: docs-freshness
+
+# Анти doc-drift (vex-assistant#248): если код из `Source code` дока менялся после его
+# `Verified-against`, проверка падает. На PR — красный чек; на push в main — красный main.
+# Это СИГНАЛ (решение владельца 2026-06-27: соло-разработчик, branch-protection НЕ вводим).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'docs/**'
+      - 'scripts/check_docs_freshness.py'
+      - '.github/workflows/docs-freshness.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'docs/**'
+      - 'scripts/check_docs_freshness.py'
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # нужна полная история для `git log <Verified-against>..HEAD`
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Проверка актуальности архитектурных доков
+        run: python scripts/check_docs_freshness.py

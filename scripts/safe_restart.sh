@@ -72,9 +72,35 @@ systemctl restart sreda-uvicorn sreda-job-runner
 # Поллеры рестартуем в Phase 3 после deleteWebhook чтобы не словить 409.
 
 # ============ Phase 2: wait for ready ============
-log "phase 2: ждём пока uvicorn примет соединения (max 30s)"
-for i in $(seq 1 30); do
-    sleep 1
+# Таймаут готовности uvicorn — РЕАЛЬНОЕ wall-clock время (дедлайн по $SECONDS),
+# а не число проб. На ХОЛОДНОМ старте (после деплоя) lifespan-init грузит модель
+# bge-m3 / llm-trace writer и блокирует accept >30s — наблюдали 34s при деплое
+# #187 (2026-06-22); старый лимит 30s давал ложный FATAL и обрывал скрипт до
+# Phase 3 (deleteWebhook + рестарт поллеров). Тёплый рестарт — 3–6s, проба выходит
+# сразу при готовности, потолок штатных рестартов не замедляет.
+#
+# Конфигурируется через UVICORN_READY_TIMEOUT в $ENV_FILE (как токены) или из
+# окружения (если sudo пробрасывает); приоритет: env-файл → окружение → дефолт.
+# Берём ПОСЛЕДНЮЮ запись из env-файла и чистим пробелы/CR. Невалидное значение
+# (не целое 1..READY_TIMEOUT_MAX) → дефолт + WARN.
+READY_TIMEOUT_DEFAULT=120
+READY_TIMEOUT_MAX=3600
+_rt_envfile=$(grep "^UVICORN_READY_TIMEOUT=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '[:space:]' || echo "")
+READY_TIMEOUT="${_rt_envfile:-${UVICORN_READY_TIMEOUT:-$READY_TIMEOUT_DEFAULT}}"
+# regex ограничивает 1..9999 (≤4 цифр — нет переполнения), затем -gt отсекает >MAX.
+if ! printf '%s' "$READY_TIMEOUT" | grep -Eq '^[1-9][0-9]{0,3}$' || [ "$READY_TIMEOUT" -gt "$READY_TIMEOUT_MAX" ]; then
+    log "phase 2: WARN: UVICORN_READY_TIMEOUT='${READY_TIMEOUT}' невалиден (ожидается целое 1..${READY_TIMEOUT_MAX}) — использую дефолт ${READY_TIMEOUT_DEFAULT}s"
+    READY_TIMEOUT=$READY_TIMEOUT_DEFAULT
+fi
+
+log "phase 2: ждём пока uvicorn примет соединения (max ${READY_TIMEOUT}s)"
+phase2_start=$SECONDS
+phase2_deadline=$((phase2_start + READY_TIMEOUT))
+ready=false
+probe=0
+code="000"
+while [ "$SECONDS" -lt "$phase2_deadline" ]; do
+    probe=$((probe + 1))
     # /webhooks/telegram/sreda без secret-token должен вернуть 401 (auth pipeline активен)
     # или 404 если secret не настроен и bot_key неизвестен реестру — любое значение
     # кроме 000/500/502 означает что uvicorn жив.
@@ -82,15 +108,19 @@ for i in $(seq 1 30); do
                 -X POST -H "Content-Type: application/json" -d "{}" \
                 "http://127.0.0.1:${SREDA_PORT}/webhooks/telegram/sreda" 2>/dev/null || echo "000")
     if [ "$code" = "401" ] || [ "$code" = "404" ] || [ "$code" = "202" ] || [ "$code" = "422" ]; then
-        log "phase 2: ready после ${i}s (uvicorn вернул ${code})"
+        log "phase 2: ready за $((SECONDS - phase2_start))s (uvicorn вернул ${code}, проба ${probe})"
+        ready=true
         break
     fi
-    if [ $i -eq 30 ]; then
-        log "FATAL: uvicorn не поднялся за 30s, последний код=${code}"
-        systemctl status sreda-uvicorn --no-pager | tee -a "$LOG"
-        exit 2
-    fi
+    sleep 1
 done
+if [ "$ready" = "false" ]; then
+    log "FATAL: uvicorn не поднялся за $((SECONDS - phase2_start))s (лимит ${READY_TIMEOUT}s, проб: ${probe}), последний код=${code}"
+    # `|| true`: под set -euo pipefail `systemctl status` на упавшем юните вернёт
+    # non-zero и pipefail увёл бы exit-код не в 2 (harness это ловит).
+    systemctl status sreda-uvicorn --no-pager 2>&1 | tee -a "$LOG" || true
+    exit 2
+fi
 
 # ============ Phase 3: deleteWebhook per bot + restart pollers ============
 log "phase 3: long-poll reset для всех ботов"
@@ -164,19 +194,47 @@ done
 
 # ============ Phase 4: reset MAX webhook (если настроен) ============
 if [ -n "$MAX_TOKEN" ]; then
-    log "phase 4a: deleteWebhook (MAX)"
-    max_del=$(curl -sS -X DELETE "https://platform-api.max.ru/subscriptions" \
-                  -H "Authorization: ${MAX_TOKEN}" 2>&1 | head -c 200 || echo "skip")
-    log "  → $max_del"
+    # #214: адрес MAX API — из env (дефолт platform-api2.max.ru).
+    MAX_BASE="${SREDA_MAX_API_BASE_URL:-https://platform-api2.max.ru}"
+    MAX_BASE="${MAX_BASE%/}"  # снять хвостовой слэш (как max_base_url() в коде)
+    # #214 (Codex R3): зеркалим Python-allowlist (Settings._validate_max_api_base_url) —
+    # токен (Authorization) шлём ТОЛЬКО на известные хосты MAX. Плохой/опечатанный
+    # env → fail-closed: пропускаем MAX webhook, токен НЕ уходит на чужой хост.
+    case "$MAX_BASE" in
+        https://platform-api2.max.ru|https://platform-api.max.ru)
+            # TLS-доверие Минцифры — бандл из репо (тот же, что max_ssl_context в
+            # коде): platform-api2 выпущен Минцифры (нет в системном хранилище) →
+            # без --cacert curl упадёт на verify.
+            _MAX_CERTS="$(cd "$(dirname "$0")/.." && pwd)/src/sreda/integrations/max/certs"
+            MAX_CA="/tmp/sreda_max_ca_$$.pem"
+            if cat "$_MAX_CERTS/russian_trusted_root_ca.pem" \
+                   "$_MAX_CERTS/russian_trusted_sub_ca_ssl_rsa2024.pem" > "$MAX_CA" 2>/dev/null; then
+                CA_OPT="--cacert $MAX_CA"
+            else
+                CA_OPT=""
+                log "  ВНИМАНИЕ: бандл Минцифры не собран ($_MAX_CERTS) — verify к platform-api2 не пройдёт"
+            fi
 
-    sleep 2
+            log "phase 4a: deleteWebhook (MAX @ ${MAX_BASE})"
+            max_del=$(curl -sS $CA_OPT -X DELETE "${MAX_BASE}/subscriptions" \
+                          -H "Authorization: ${MAX_TOKEN}" 2>&1 | head -c 200 || echo "skip")
+            log "  → $max_del"
 
-    log "phase 4b: setWebhook (MAX) — пропущен, добавится когда настроим webhook URL"
-    # TODO: после настройки MAX webhook URL раскомментировать:
-    # curl -sS -X POST "https://platform-api.max.ru/subscriptions" \
-    #     -H "Authorization: ${MAX_TOKEN}" \
-    #     -H "Content-Type: application/json" \
-    #     -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+            sleep 2
+
+            log "phase 4b: setWebhook (MAX) — пропущен, добавится когда настроим webhook URL"
+            # TODO: после настройки MAX webhook URL раскомментировать (использует ${MAX_BASE} + $CA_OPT):
+            # curl -sS $CA_OPT -X POST "${MAX_BASE}/subscriptions" \
+            #     -H "Authorization: ${MAX_TOKEN}" \
+            #     -H "Content-Type: application/json" \
+            #     -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+
+            rm -f "$MAX_CA"
+            ;;
+        *)
+            log "phase 4: SREDA_MAX_API_BASE_URL='${MAX_BASE}' вне allowlist (platform-api2.max.ru / platform-api.max.ru) — MAX webhook ПРОПУЩЕН (fail-closed, токен не шлём)"
+            ;;
+    esac
 else
     log "phase 4: MAX токен не настроен — skip"
 fi

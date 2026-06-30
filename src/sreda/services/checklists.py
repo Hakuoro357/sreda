@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import delete as sa_delete, select as sa_select, update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.checklists import (
@@ -144,6 +145,51 @@ class ChecklistService:
             if " ".join((cl.title or "").lower().split()) == norm_target:
                 return cl
 
+        # #202 семья checklists: ctx-путь (ReAct) оснащает op_id+hash (эталон recipes) — key-policy для
+        # гейта Фазы 5 + аудит. pre-check по op_id (повтор tool_call → existing) и по hash (кросс-ходовой
+        # семантический ключ-лемма; ловит морфовариант мимо whitespace-дедупа выше) делают ключи
+        # ФУНКЦИОНАЛЬНЫМИ. Легаси (ctx None) → ключи None, поведение байт-в-байт. fail-closed + tenant-guard.
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        op_id_value: str | None = None
+        nhash_value: str | None = None
+        ctx = current_tool_runtime()
+        if ctx is not None:
+            if not user_id:
+                raise ValueError("create_list ctx path: user_id обязателен (fail-closed).")
+            if ctx.tenant_id and ctx.tenant_id != tenant_id:
+                raise ValueError(
+                    "create_list ctx path: ctx.tenant_id="
+                    f"{ctx.tenant_id!r} != tenant_id={tenant_id!r} — leak across tenant.")
+            from sreda.services.operation_id import (
+                compute_normalized_title_hash,
+                compute_operation_id_create,
+            )
+            from sreda.services.text_normalization import normalize_for_dedup
+
+            op_id_value = compute_operation_id_create(
+                plan_id=ctx.execution_id, step_id=ctx.step_id, action="create",
+                entity_type="checklist", logical_key=normalize_for_dedup(clean))
+            nhash_value = compute_normalized_title_hash(
+                clean, entity_type="checklist", tenant_id=tenant_id,
+                user_id=user_id or "") or None
+            existing_op = (
+                self.session.query(Checklist)
+                .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                .one_or_none()
+            )
+            if existing_op is not None:
+                return existing_op
+            if nhash_value is not None:
+                existing_hash = (
+                    self.session.query(Checklist)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id,
+                               normalized_title_hash=nhash_value, status="active")
+                    .first()
+                )
+                if existing_hash is not None:
+                    return existing_hash
+
         now = _utcnow()
         checklist = Checklist(
             id=f"checklist_{uuid4().hex[:24]}",
@@ -153,9 +199,24 @@ class ChecklistService:
             status="active",
             created_at=now,
             updated_at=now,
+            operation_id=op_id_value,  # #202: key-policy (ctx) / None (легаси)
+            normalized_title_hash=nhash_value,
         )
         self.session.add(checklist)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # Гонка по operation_id — на сингл-тенанте ReAct не ожидается, fail-safe: откат + replay.
+            self.session.rollback()
+            if op_id_value is not None:
+                racer = (
+                    self.session.query(Checklist)
+                    .filter_by(tenant_id=tenant_id, user_id=user_id, operation_id=op_id_value)
+                    .one_or_none()
+                )
+                if racer is not None:
+                    return racer
+            raise
         return checklist
 
     def create_list_no_commit(
@@ -735,3 +796,66 @@ class ChecklistService:
         row = self.session.execute(stmt).first()
         self.session.commit()
         return (row[0], row[1]) if row is not None else None
+
+    def update_owned_item(
+        self, *, item_id: str, tenant_id: str, user_id: str, new_title: str,
+    ) -> tuple[str, str] | None:
+        """#210: ПРАВКА пункта НА МЕСТЕ — переименовать текст одним
+        АТОМАРНЫМ ``UPDATE title WHERE id AND EXISTS(active owned) RETURNING``
+        (тот же страж владельца+активности+гонки, что у
+        ``mark_owned_item_done`` / ``delete_owned_item``).
+
+        Зачем: раньше «изменить пункт» вынужденно шло
+        ``delete_checklist_item`` (а у удаления — confirm) +
+        ``add_checklist_items`` → правка превращалась в «подтвердите
+        удаление». Теперь правка на месте: пункт сохраняет id, position и
+        статус (pending/done), меняется только текст; confirm не нужен.
+
+        Возвращает ``(item_id, new_title)`` или ``None`` (чужой / архивный /
+        исчезнувший). Пустой ``new_title`` → ``None`` (правка без текста —
+        не операция; пункт НЕ трогаем).
+
+        Embedding: title изменился → старый вектор устарел. После атомарной
+        правки ЛУЧШИМ-УСИЛИЕМ пере-эмбедим (как в ``add_items``); провал не
+        фатален (пункт уже переименован, вектор дозаполнится при backfill
+        или следующей правке)."""
+        clean = (new_title or "").strip()
+        if not clean:
+            return None
+        clean = clean[:1000]  # как add_items: EncryptedString вмещает Text
+        now = _utcnow()
+        stmt = (
+            sa_update(ChecklistItem)
+            .where(
+                ChecklistItem.id == item_id,
+                self._owned_active_item_exists(tenant_id=tenant_id, user_id=user_id),
+            )
+            .values(title=clean, updated_at=now)
+            .returning(ChecklistItem.id, ChecklistItem.title)
+            .execution_options(synchronize_session=False)
+        )
+        row = self.session.execute(stmt).first()
+        self.session.commit()
+        if row is None:
+            return None
+        # best-effort re-embed (title сменился → вектор устарел). Non-fatal.
+        if self._embedding_client is not None:
+            try:
+                it = self.session.get(ChecklistItem, row[0])
+                parent = (
+                    self.session.get(Checklist, it.checklist_id)
+                    if it is not None else None
+                )
+                if it is not None and parent is not None:
+                    emb_json, emb_model = self._embed_item(parent.title, it.title)
+                    if emb_json is not None:
+                        it.embedding_json = emb_json
+                        it.embedding_model = emb_model
+                        it.updated_at = _utcnow()
+                        self.session.commit()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "update_owned_item re-embed failed (non-fatal): %s", exc
+                )
+                self.session.rollback()
+        return (row[0], row[1])

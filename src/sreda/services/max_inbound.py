@@ -127,6 +127,27 @@ async def handle_max_update(
             return ""
 
     with SessionLocal() as session:
+        # #187 Phase 1 — soft-delete ingress guard (resolve → gate → provision).
+        # Чистый резолв MAX-account→tenant (read-only) ДО ensure_max_user_bundle
+        # И ДО любой обработки голоса (STT идёт downstream в
+        # ``_process_approved_max_turn`` — entry-гард его покрывает). Удалённый
+        # существующий тенант → ТИХИЙ no-op. Новый юзер (резолв=None) → гард
+        # пропускается. RuntimeError из резолва → «не резолвится», НЕ «удалён».
+        from sreda.services.tenant_lifecycle import is_tenant_active
+        from sreda.services.max_auth import resolve_tenant_from_max_account_id
+
+        try:
+            _resolved = resolve_tenant_from_max_account_id(session, str(sender_user_id))
+        except RuntimeError:
+            _resolved = None
+        if _resolved is not None and not is_tenant_active(session, _resolved[0]):
+            logger.info(
+                "max inbound: tenant %s is soft-deleted — silent drop "
+                "(no ensure/welcome/LLM/STT)",
+                _resolved[0],
+            )
+            return ""
+
         # Sender display name (best-effort).
         display_name = _extract_max_display_name(payload)
         # Phase 2C: catch SignupBlocked from abuse guard.
@@ -307,6 +328,14 @@ async def handle_max_update(
             if update_type == "message_callback"
             else ""
         )
+        # #166 B R2 (Codex medium MAJOR): тап [Да]/[Нет] react-подтверждения
+        # обрабатываем НЕ здесь, а в детач-ходе ``_process_approved_max_turn``
+        # ВНУТРИ per-tenant lock + trace. Раньше обработка шла прямо тут (инлайн
+        # из вебхука): (1) вне tenant-lock → гонка с параллельным текст-ходом того
+        # же треда; (2) без trace → невидима в trace.log; (3) полный LLM-ход
+        # блокировал ответ 202 вебхука. ``react:yes/no`` добавлены в
+        # ``_KNOWN_MAX_CALLBACK_EXACT`` → проходят unknown-prefix-гейт и шедулятся.
+
         if isinstance(_cb_data_btn, str) and _cb_data_btn.startswith("btn_reply:"):
             from sreda.services.reply_buttons import ReplyButtonService
             cb_token = _cb_data_btn.removeprefix("btn_reply:").strip()
@@ -543,11 +572,42 @@ async def _maybe_transcribe_max_voice(
         )
         return None
 
-    # 2. Tenant has active agent с voice access
-    from sreda.services.agent_capabilities import has_voice_access
-    if not tenant_id or not has_voice_access(session, tenant_id):
+    # 2. Tenant has active agent с voice access.
+    # #204 Решение 1/3: resolve access AND carrier feature_key in ONE pass
+    # (``.allowed`` matches the old ``has_voice_access``); mirror TG.
+    from sreda.services.agent_capabilities import resolve_voice_access
+    voice_access = resolve_voice_access(session, tenant_id) if tenant_id else None
+    if voice_access is None or not voice_access.allowed:
         await _send_error(
             "Голосовые сообщения доступны в подписке. "
+            "Открой /subscriptions, чтобы узнать подробнее."
+        )
+        return None
+
+    # #204 Решение 1: fail-closed. allowed=True but no carrier feature_key
+    # → can't attribute the spend → do NOT transcribe (invariant safeguard).
+    billing_feature_key = voice_access.billing_feature_key
+    if billing_feature_key is None:
+        logger.error(
+            "max voice fail-closed: allowed=True but billing_feature_key is "
+            "None (tenant=%s) — refusing to transcribe",
+            tenant_id,
+        )
+        await _send_error(
+            "Голосовые сообщения сейчас не работают. "
+            "Напиши текстом или попробуй позже."
+        )
+        return None
+
+    # #204 Решение 3: preflight quota gate BEFORE any reserve/download/STT.
+    # Block ONLY a real exhaustion of an ACTIVE metered carrier subscription
+    # (``is_subscribed AND is_exhausted``) — see TG twin for rationale.
+    from sreda.services.budget import BudgetService
+    budget = BudgetService(session)
+    _quota = budget.get_quota_status(tenant_id, billing_feature_key)
+    if _quota.is_subscribed and _quota.is_exhausted:
+        await _send_error(
+            "Лимит голосовых сообщений по подписке исчерпан. "
             "Открой /subscriptions, чтобы узнать подробнее."
         )
         return None
@@ -782,10 +842,12 @@ async def _maybe_transcribe_max_voice(
 
     # 8. Record budget usage — после persist'а (codex R5 ordering fix).
     # Если сюда дошли — STT и persist прошли; charge корректно.
-    from sreda.services.budget import BudgetService
-    BudgetService(session).record_api_usage(
+    # #204 Решение 1: attribute to the carrier (``billing_feature_key``),
+    # NOT legacy "voice_transcription"; reuse the BudgetService built for the
+    # quota gate above.
+    budget.record_api_usage(
         tenant_id=tenant_id,
-        feature_key=_VOICE_FEATURE_KEY,
+        feature_key=billing_feature_key,
         provider_key=settings.speech_provider or "unknown",
         task_type="speech_recognition",
         credits_consumed=1,
@@ -829,6 +891,22 @@ async def _process_approved_max_turn(
     settings = get_settings()
     # Cut-off time для outbox correlation (используется в ack delete polling).
     turn_started_at = datetime.now(timezone.utc)
+    # #187 Phase 2b БАРЬЕР: держим session-scoped advisory-lock на тенанта весь
+    # ход (зеркало TG ``_process_approved_turn_locked``). soft_delete_tenant
+    # берёт ТОТ ЖЕ лок ДО флага+drain → ждёт in-flight ход и дренит после. На
+    # SQLite — no-op. Дополняет in-process tenant_lock (cross-process барьер).
+    #
+    # 🔴 ПОРЯДОК ЛОКОВ (R1 CRITICAL): advisory берётся ВНУТРИ in-process
+    # ``tenant_lock`` (ниже, после ``async with tenant_lock``) — ЗЕРКАЛО TG
+    # (``telegram_inbound``: asyncio-lock OUTERMOST, advisory INNER). Если взять
+    # advisory ПЕРВЫМ (как было), а ``pg_advisory_lock`` заблокируется на чужом
+    # держателе, корутина встанет под блокирующим SQL ДО входа в ``tenant_lock``
+    # → весь event loop потенциально зависает на синхронном вызове, а порядок
+    # вложенности расходится с TG (риск перекрёстного дедлока на двух каналах
+    # одного тенанта). Поэтому ExitStack заполняется ВНУТРИ ``tenant_lock``.
+    from contextlib import ExitStack
+
+    _barrier = ExitStack()
     try:
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
@@ -870,12 +948,111 @@ async def _process_approved_max_turn(
                 onboarding.tenant_id, inbound_message_id,
             )
         async with tenant_lock:
+            # #187 Phase 2b: advisory-lock берётся ЗДЕСЬ, ВНУТРИ tenant_lock
+            # (зеркало TG). Держится до конца хода; отпускается в общем
+            # ``finally`` через ``_barrier.close()``. tenant_lock (asyncio)
+            # сериализует ходы тенанта В ЭТОМ процессе ПЕРВЫМ; advisory —
+            # cross-process барьер против админ-delete — берётся ПОД ним.
+            from sreda.services.tenant_lifecycle import tenant_advisory_lock
+            _barrier.enter_context(
+                tenant_advisory_lock(bg_session, onboarding.tenant_id)
+            )
+            # #187 дверь #6 (A3 re-check ПОД локом, зеркало TG): ingress-гейт
+            # (handle_max_update) проверил активность ДО спавна хода; между гейтом и
+            # захватом advisory-лока админ мог soft_delete'нуть. Закрываем delete-first
+            # гонку: soft_delete берёт ТОТ ЖЕ лок и КОММИТИТ флаг под ним → если успел
+            # ПЕРВЫМ, этот ход НЕ должен коммитить доменные мутации. Свежий SELECT
+            # bg_session видит durable deleted_at (на SQLite лок no-op, флаг читается).
+            from sreda.services.tenant_lifecycle import is_tenant_active
+            if not is_tenant_active(bg_session, onboarding.tenant_id):
+                logger.info(
+                    "max turn aborted: tenant %s soft-deleted mid-turn (re-check под advisory-локом)",
+                    onboarding.tenant_id,
+                )
+                # Codex MINOR (зеркало TG): терминальный 'ignored' — иначе монитор
+                # unprocessed_inbound ложно сочтёт отброшенный ход зависшим. MAX уже
+                # выставил 'processing_started' до лока → здесь перекрываем на ignored.
+                _set_processing_status(bg_session, inbound_message_id, "ignored")
+                return
             # message_callback (inline-button tap): обработать ДО
             # dispatch'а / voice. Inline-handlers (rem_done/rem_snooze/
             # btn_reply/pb) выполняются здесь — DB updates + answer_callback
             # — и возвращают True если turn полностью обработан. Остальные
             # callback prefixes (billing/profile/eds) идут через dispatcher.
             if payload.get("update_type") == "message_callback":
+                # #166 B R2: тап [Да]/[Нет] react-подтверждения → resume паузы
+                # ТОГО ЖЕ треда. Здесь (а не в handle_max_update) — внутри
+                # tenant-lock + trace, детачем (не блокирует вебхук). Перехват
+                # ДО _handle_max_callback (тот react: не знает → вернул бы False).
+                _cb_confirm = (payload.get("callback") or {}).get("payload") or ""
+                if (_cb_confirm.startswith(("react:yes", "react:no"))
+                        and not onboarding.is_new_user
+                        and onboarding.max_chat_id
+                        and onboarding.tenant_id in settings.react_loop_enabled_tenants):
+                    from sreda.runtime import react_loop
+                    from sreda.services.llm import get_chat_llm
+                    # answer_callback ПЕРВЫМ (UX + ack идемпотентности кнопки)
+                    _cb_id_r = (payload.get("callback") or {}).get("callback_id")
+                    if _cb_id_r and settings.max_bot_token:
+                        try:
+                            await MaxClient(token=settings.max_bot_token).answer_callback(
+                                str(_cb_id_r))
+                        except Exception:  # noqa: BLE001
+                            logger.warning("max react confirm ack failed", exc_info=True)
+                    _prov_r = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
+                    _llm_r = get_chat_llm(provider=_prov_r, settings=settings)
+                    # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
+                    # к которой кнопка привязана (id из callback_data). Устаревший/повторный/чужой
+                    # тап → пустой ответ (no-op), свежий ход с «да/нет» НЕ стартуем (R3 Codex A/B).
+                    _reply_r = await react_loop.handle_turn(
+                        session=bg_session, tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                        llm=_llm_r,
+                        user_text=react_loop.confirm_resume_text(_cb_confirm) or "",
+                        inbound_message_id=inbound_message_id, channel="max",
+                        resume_only=True,
+                        expected_confirm_id=react_loop.confirm_callback_id(_cb_confirm),
+                        provider_key=_prov_r,  # #175 учёт расхода + #184 «Оса»
+                        fallback_llm=react_loop.react_fallback_llm(_prov_r),  # #184 Оса-fallback
+                    )
+                    trace.record(
+                        "react_loop.resumed", chars=len(_reply_r or ""), channel="max",
+                        noop=(not _reply_r))
+                    if _reply_r and settings.max_bot_token:  # непустой → пауза возобновлена
+                        # цепочка-confirm: следующий вопрос снова с [Подтверждаю][Отменить] (id новой паузы)
+                        _cid_r = getattr(_reply_r, "confirm_id", "")
+                        _kb_r = ([{
+                            "type": "inline_keyboard",
+                            "payload": {"buttons": [[
+                                {"type": "callback", "text": "Подтверждаю",
+                                 "payload": react_loop.confirm_callback_data("yes", _cid_r)},
+                                {"type": "callback", "text": "Отменить",
+                                 "payload": react_loop.confirm_callback_data("no", _cid_r)},
+                            ]]},
+                        }] if getattr(_reply_r, "awaiting_confirm", False) else None)
+                        try:
+                            await MaxClient(token=settings.max_bot_token).send_message(
+                                recipient={"chat_id": onboarding.max_chat_id},
+                                text=_reply_r, attachments=_kb_r,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning("max react confirm reply failed", exc_info=True)
+                        # #232 шаг B: выжимка истории — DETACHED после доставки resume-ответа (не на паузе)
+                        if not getattr(_reply_r, "awaiting_confirm", False):
+                            react_loop.spawn_post_turn_summary(
+                                tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
+                                thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                                channel="max", provider_key=_prov_r)
+                    # #166 B R3 (Codex medium MINOR): react-путь шлёт напрямую (минуя outbox,
+                    # который обычно финализирует trace) → эмитим блок здесь явно
+                    # (идемпотентно: _emitted-guard; НЕ в finally — там сломали бы
+                    # outbox.delivered у dispatch-пути). _tc_r может быть None вне веб-хука.
+                    _tc_r = trace.current()
+                    if _tc_r is not None:
+                        trace.emit_block(_tc_r)
+                    _set_processing_status(bg_session, inbound_message_id, "processed")
+                    return
                 if settings.max_bot_token:
                     max_client_cb = MaxClient(token=settings.max_bot_token)
                     handled = await _handle_max_callback(
@@ -1008,6 +1185,90 @@ async def _process_approved_max_turn(
                     )
                     return
 
+                # #66 ГЕЙТ MAX: тенант из react_loop_enabled_tenants + текст →
+                # новый ReAct+interrupt-цикл. Ответ шлём напрямую MaxClient
+                # (welcome тоже inline-шлёт), ack не создаём, dispatch пропускаем.
+                # Остальные тенанты/callback/voice-ошибки/новые юзеры — прежним
+                # путём (нулевой регресс). Флаг по умолчанию пуст → no-op.
+                if (
+                    message_text
+                    and not onboarding.is_new_user
+                    and onboarding.tenant_id in settings.react_loop_enabled_tenants
+                ):
+                    from sreda.runtime import react_loop
+                    from sreda.services.llm import get_chat_llm
+
+                    _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
+                    _llm = get_chat_llm(provider=_prov, settings=settings)
+                    # ack v3: «Секунду…» → правим ЕГО в ответ (PUT /messages, одно
+                    # сообщение). Переиспользуем устойчивый _send_max_ack (defensive
+                    # извлечение mid по нескольким формам ответа MAX — Codex/субагент MAJOR).
+                    _ack_mid = await _send_max_ack(
+                        token=settings.max_bot_token,
+                        chat_id=onboarding.max_chat_id, text="Секунду…",
+                    )
+                    _reply = await react_loop.handle_turn(
+                        session=bg_session,
+                        tenant_id=onboarding.tenant_id,
+                        user_id=onboarding.user_id,
+                        thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                        llm=_llm,
+                        user_text=message_text,
+                        inbound_message_id=inbound_message_id,
+                        channel="max",
+                        provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
+                        fallback_llm=react_loop.react_fallback_llm(_prov),  # #184 Оса-fallback
+                    )
+                    trace.record(
+                        "react_loop.replied", chars=len(_reply or ""), channel="max",
+                    )
+                    # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Подтверждаю][Отменить] с id
+                    # КОНКРЕТНОЙ паузы в payload (MAX attachments; текст «да/нет» тоже работает).
+                    _cid = getattr(_reply, "confirm_id", "")
+                    _kb = ([{
+                        "type": "inline_keyboard",
+                        "payload": {"buttons": [[
+                            {"type": "callback", "text": "Подтверждаю",
+                             "payload": react_loop.confirm_callback_data("yes", _cid)},
+                            {"type": "callback", "text": "Отменить",
+                             "payload": react_loop.confirm_callback_data("no", _cid)},
+                        ]]},
+                    }] if getattr(_reply, "awaiting_confirm", False) else None)
+                    _edited = False
+                    if _ack_mid:
+                        try:
+                            await max_client.edit_message(
+                                str(_ack_mid), text=_reply, attachments=_kb)
+                            _edited = True
+                        except Exception:  # noqa: BLE001
+                            _edited = False
+                    if not _edited:
+                        # сбой edit → убираем «Секунду…» (не висит + не дублируется)
+                        if _ack_mid:
+                            try:
+                                await max_client.delete_message(str(_ack_mid))
+                            except Exception:  # noqa: BLE001
+                                pass
+                        await max_client.send_message(
+                            recipient={"chat_id": onboarding.max_chat_id},
+                            text=_reply, attachments=_kb,
+                        )
+                    # #232 шаг B: выжимка истории — DETACHED после доставки (своя сессия в фасаде); финальный ответ
+                    if not getattr(_reply, "awaiting_confirm", False):
+                        react_loop.spawn_post_turn_summary(
+                            tenant_id=onboarding.tenant_id, user_id=onboarding.user_id,
+                            thread_id=f"react:{onboarding.tenant_id}:{onboarding.max_chat_id}",
+                            channel="max", provider_key=_prov)
+                    # #166 B R3: react-путь шлёт напрямую (минуя outbox-финализацию trace) →
+                    # эмитим блок явно (идемпотентно; закрывает пробел нормального react-пути).
+                    _tc = trace.current()
+                    if _tc is not None:
+                        trace.emit_block(_tc)
+                    _set_processing_status(
+                        bg_session, inbound_message_id, "processed",
+                    )
+                    return
+
             # Ack message — UX parity с TG: показываем «⏳ Работаю…» как
             # только начали обработку, чтобы юзер не молча ждал 5-15s
             # пока LLM думает + outbox doставляет. Boris directive
@@ -1118,6 +1379,8 @@ async def _process_approved_max_turn(
             onboarding.tenant_id, inbound_message_id,
         )
     finally:
+        # #187 Phase 2b: отпустить advisory-lock ДО close() (симметрия с TG).
+        _barrier.close()
         bg_session.close()
 
 
@@ -1622,7 +1885,10 @@ async def _handle_max_link_start_cmd(*, raw_token: str, chat_id: str | None) -> 
     triggers `confirm_link:<token>` или `cancel_link:<token>` callback
     что мы catches in handle_max_update.
     """
-    from sreda.services.channel_linking import lookup_token
+    from sqlalchemy import select
+    from sreda.db.models.channel_linking import ChannelLinkToken
+    from sreda.services.channel_linking import _hash_token, lookup_token
+    from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
     if not (settings.max_bot_token and chat_id):
@@ -1631,7 +1897,31 @@ async def _handle_max_link_start_cmd(*, raw_token: str, chat_id: str | None) -> 
 
     SessionLocal = get_session_factory()
     with SessionLocal() as session:
-        token_row = lookup_token(session, raw_token)
+        # #187 Phase 4a — gate source-тенант ДО показа confirm-кнопки. Column-
+        # only пред-чтение ``tenant_id`` по token_hash (как confirm/cancel-ветки
+        # и consume_link), НЕ через lookup_token: lookup_token возвращает None
+        # для used/expired токена ДО проверки tenant-active, поэтому удалённый
+        # тенант с уже использованным/просроченным токеном ушёл бы в invalid-
+        # token reply вместо тихого no-op. Читаем скаляр (не ORM-сущность) —
+        # не засоряем identity-map. Резолвится по hash → ловит и used/expired.
+        # Удалён → тихий no-op (никакого confirm-сообщения). Нет строки по hash
+        # → обычный путь (token_row=None → invalid-token reply ниже).
+        _pre_tenant_id = session.execute(
+            select(ChannelLinkToken.tenant_id).where(
+                ChannelLinkToken.token_hash == _hash_token(raw_token)
+            )
+        ).scalar_one_or_none()
+        source_tenant_deleted = (
+            _pre_tenant_id is not None
+            and not is_tenant_active(session, _pre_tenant_id)
+        )
+        token_row = None if source_tenant_deleted else lookup_token(session, raw_token)
+
+    if source_tenant_deleted:
+        logger.info(
+            "max link /start: source tenant soft-deleted — silent no-op"
+        )
+        return
 
     client = MaxClient(token=settings.max_bot_token)
 
@@ -1684,12 +1974,31 @@ async def _handle_max_link_confirm_cb(
     callback_id,
 ) -> None:
     """Handle `confirm_link:<token>` callback — execute consume_link."""
-    from sreda.services.channel_linking import consume_link
+    from sqlalchemy import select
+    from sreda.db.models.channel_linking import ChannelLinkToken
+    from sreda.services.channel_linking import _hash_token, consume_link
+    from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
     SessionLocal = get_session_factory()
 
     with SessionLocal() as session:
+        # #187 Phase 4a — gate source-тенант ДО consume (мутации привязки).
+        # ``consume_link`` имеет собственный гейт (defence-in-depth), но здесь
+        # удалённый тенант = тихий no-op (без attach, без ответа юзеру), а не
+        # текстовая ошибка. Читаем ТОЛЬКО колонку tenant_id (скаляр, не ORM-
+        # сущность) — не засоряем identity-map (см. channel_linking.consume_link).
+        _pre_tenant_id = session.execute(
+            select(ChannelLinkToken.tenant_id).where(
+                ChannelLinkToken.token_hash == _hash_token(raw_token)
+            )
+        ).scalar_one_or_none()
+        if _pre_tenant_id is not None and not is_tenant_active(session, _pre_tenant_id):
+            logger.info(
+                "max link confirm: source tenant soft-deleted — silent no-op"
+            )
+            return
+
         outcome = consume_link(
             session,
             raw_token=raw_token,
@@ -1737,15 +2046,32 @@ async def _handle_max_link_cancel_cb(
     *, raw_token: str, callback_id,
 ) -> None:
     """Handle `cancel_link:<token>` callback — invalidate token."""
+    from sqlalchemy import select
+    from sqlalchemy import update as sa_update
     from sreda.db.models.channel_linking import ChannelLinkToken
     from sreda.services.channel_linking import _hash_token
-    from sqlalchemy import update as sa_update
+    from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
     SessionLocal = get_session_factory()
 
     with SessionLocal() as session:
         token_hash = _hash_token(raw_token)
+        # #187 Phase 4a — gate source-тенант ДО мутации токена (used_at).
+        # Для удалённого тенанта — тихий no-op (токен и так уже терминирован
+        # дренажом при soft_delete; повторно его трогать не нужно). Column-only
+        # пред-чтение (без ORM-сущности в identity-map).
+        _pre_tenant_id = session.execute(
+            select(ChannelLinkToken.tenant_id).where(
+                ChannelLinkToken.token_hash == token_hash
+            )
+        ).scalar_one_or_none()
+        if _pre_tenant_id is not None and not is_tenant_active(session, _pre_tenant_id):
+            logger.info(
+                "max link cancel: source tenant soft-deleted — silent no-op"
+            )
+            return
+
         session.execute(
             sa_update(ChannelLinkToken)
             .where(
@@ -1939,6 +2265,7 @@ _KNOWN_MAX_CALLBACK_PREFIXES: tuple[str, ...] = (
     "rem_snooze:",  # reminder snooze
     "confirm_link:",  # channel-link confirmation (handled earlier)
     "cancel_link:",   # channel-link cancellation (handled earlier)
+    "react:",       # #166 B: ReAct confirm-кнопки «react:yes:<id>»/«react:no:<id>»
 )
 
 _KNOWN_MAX_CALLBACK_EXACT: frozenset[str] = frozenset({

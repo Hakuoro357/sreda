@@ -1,7 +1,7 @@
 {% extends "base.html" %}
-{% block title %}LLM-вызовы — {{ data.feature_key }}{% endblock %}
+{% block title %}LLM-вызовы — {{ data.feature_key or "все фичи" }}{% endblock %}
 {% block content %}
-<h2>LLM-вызовы: {{ data.tenant_name }} / {{ data.feature_key }}</h2>
+<h2>LLM-вызовы: {{ data.tenant_name }} / {{ data.feature_key or "все фичи" }}</h2>
 <p class="muted">Всего: {{ "{:,}".format(data.total) }} вызовов. Страница {{ data.page }} из {{ data.total_pages }}.</p>
 
 {% if not data.rows %}
@@ -57,10 +57,14 @@
 </figure>
 
 {# Pagination #}
+{# #150 (Codex R4): ссылки строим из data.tenant_id (не из request.query_params),
+   feature_key добавляем ТОЛЬКО когда задан — иначе пагинация уходила на
+   ?feature_key=None и фильтровала по литералу "None" → пустая страница. #}
+{% set fk_q = ('&feature_key=' ~ data.feature_key) if data.feature_key else '' %}
 <nav>
   <ul>
     {% if data.page > 1 %}
-    <li><a href="/admin/llm-calls?tenant_id={{ data.rows[0].id[:0] }}{{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page - 1 }}">← Назад</a></li>
+    <li><a href="/admin/llm-calls?tenant_id={{ data.tenant_id }}{{ fk_q }}&page={{ data.page - 1 }}">← Назад</a></li>
     {% else %}
     <li><span class="muted">← Назад</span></li>
     {% endif %}
@@ -68,7 +72,7 @@
     <li><span class="muted">{{ data.page }} / {{ data.total_pages }}</span></li>
 
     {% if data.page < data.total_pages %}
-    <li><a href="/admin/llm-calls?tenant_id={{ request.query_params.get('tenant_id') }}&feature_key={{ data.feature_key }}&page={{ data.page + 1 }}">Вперёд →</a></li>
+    <li><a href="/admin/llm-calls?tenant_id={{ data.tenant_id }}{{ fk_q }}&page={{ data.page + 1 }}">Вперёд →</a></li>
     {% else %}
     <li><span class="muted">Вперёд →</span></li>
     {% endif %}

@@ -24,7 +24,6 @@ def test_seed_repository_updates_existing_user_telegram_account_id() -> None:
         telegram_account_id=INITIAL_TELEGRAM_ID,
         assistant_id="assistant_1",
         assistant_name="Assistant 1",
-        eds_monitor_enabled=True,
     )
     repository.ensure_tenant_bundle(
         tenant_id="tenant_1",
@@ -35,7 +34,6 @@ def test_seed_repository_updates_existing_user_telegram_account_id() -> None:
         telegram_account_id=UPDATED_TELEGRAM_ID,
         assistant_id="assistant_1",
         assistant_name="Assistant 1",
-        eds_monitor_enabled=True,
     )
 
     user = session.get(User, "user_1")

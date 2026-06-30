@@ -228,7 +228,8 @@ class ConsumeOutcome:
         'not_found_or_expired' | 'missing_chat_id' |
         'source_user_not_found' | 'already_linked_other_account' |
         'account_already_registered_separately' |
-        'account_belongs_to_other_family_member' | 'invalid_token_format'
+        'account_belongs_to_other_family_member' | 'invalid_token_format' |
+        'tenant_deleted'
     """
 
     success: bool
@@ -270,6 +271,25 @@ def consume_link(
     _validate_token_format(raw_token)
     token_hash = _hash_token(raw_token)
     now = _utcnow()
+
+    # #187 Phase 4a — soft-delete пред-чтение ДО сжигания токена. Атомарный
+    # UPDATE ниже выставляет ``used_at`` РАНЬШЕ чтения source-тенанта, поэтому
+    # гейт «после» сжёг бы токен удалённого тенанта впустую. Читаем ТОЛЬКО
+    # колонку ``tenant_id`` (скаляр, не ORM-сущность) → не засоряем identity-map
+    # резидентной строкой с naive ``expires_at`` (иначе UPDATE
+    # synchronize_session="evaluate" споткнётся о naive-vs-aware datetime на
+    # SQLite). Удалён → отклонить БЕЗ мутации (токен не сжигается, source_user
+    # не привязывается). Нет строки/активен — продолжаем к атомарному UPDATE
+    # (он сам отсечёт expired/used).
+    from sreda.services.tenant_lifecycle import is_tenant_active
+
+    _pre_tenant_id = session.execute(
+        select(ChannelLinkToken.tenant_id).where(
+            ChannelLinkToken.token_hash == token_hash
+        )
+    ).scalar_one_or_none()
+    if _pre_tenant_id is not None and not is_tenant_active(session, _pre_tenant_id):
+        return ConsumeOutcome(success=False, error="tenant_deleted")
 
     stmt = (
         update(ChannelLinkToken)

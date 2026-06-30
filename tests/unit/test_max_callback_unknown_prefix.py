@@ -92,6 +92,19 @@ def test_channel_link_callbacks_known() -> None:
         )
 
 
+def test_known_react_confirm_is_not_unknown() -> None:
+    """#166 B: react:yes:<id> / react:no:<id> — confirm-кнопки ReAct, обрабатываются
+    в _process_approved_max_turn (внутри tenant-lock). Не должны sync-дропаться."""
+    for cb_data in ("react:yes:abc123", "react:no:abc123", "react:yes", "react:no"):
+        payload = {
+            "update_type": "message_callback",
+            "callback": {"payload": cb_data},
+        }
+        assert _is_unknown_max_callback_prefix(payload) is False, (
+            f"{cb_data} should be known"
+        )
+
+
 # --------------------------------------------------------------------
 # Unknown prefixes — must be detected (incident reproduction)
 # --------------------------------------------------------------------
@@ -198,6 +211,7 @@ def test_known_prefixes_constant_includes_all_handlers() -> None:
         "rem_snooze:",    # FamilyReminder snooze
         "confirm_link:",  # channel-link confirmation (handle_max_update line 104)
         "cancel_link:",   # channel-link cancellation (handle_max_update line 114)
+        "react:",         # #166 B: ReAct confirm-кнопки (_process_approved_max_turn, в локе)
     }
     actual = set(_KNOWN_MAX_CALLBACK_PREFIXES)
     assert actual == expected, (

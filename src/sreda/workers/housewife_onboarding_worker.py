@@ -85,9 +85,17 @@ class HousewifeOnboardingKickoffWorker:
         self, *, limit: int = 50, now: datetime | None = None
     ) -> int:
         current = now or datetime.now(timezone.utc)
+        # #187 soft-delete — producer-фильтр (дверь #10): исключаем удалённых
+        # тенантов из забора онбординга (JOIN tenants ... AND deleted_at IS NULL).
+        from sreda.db.models.core import Tenant
+
         rows = (
             self.session.query(TenantUserSkillConfig)
-            .filter(TenantUserSkillConfig.feature_key == HOUSEWIFE_FEATURE_KEY)
+            .join(Tenant, Tenant.id == TenantUserSkillConfig.tenant_id)
+            .filter(
+                TenantUserSkillConfig.feature_key == HOUSEWIFE_FEATURE_KEY,
+                Tenant.deleted_at.is_(None),
+            )
             .limit(limit * 5)  # over-fetch; most are already in_progress
             .all()
         )

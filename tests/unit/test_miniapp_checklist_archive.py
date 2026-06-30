@@ -100,7 +100,6 @@ def seeded_with_checklist(client, monkeypatch):
             telegram_account_id="352612382",
             assistant_id="assistant_test",
             assistant_name="Среда",
-            eds_monitor_enabled=False,
         )
         session.commit()
         svc = ChecklistService(session)
@@ -198,7 +197,6 @@ def test_archive_wrong_tenant_returns_404(client, monkeypatch) -> None:
             telegram_account_id="111",
             assistant_id="assistant_caller",
             assistant_name="Среда",
-            eds_monitor_enabled=False,
         )
         SeedRepository(session).ensure_tenant_bundle(
             tenant_id="tenant_owner",
@@ -209,7 +207,6 @@ def test_archive_wrong_tenant_returns_404(client, monkeypatch) -> None:
             telegram_account_id="222",
             assistant_id="assistant_owner",
             assistant_name="Среда",
-            eds_monitor_enabled=False,
         )
         session.commit()
         svc = ChecklistService(session)

@@ -276,31 +276,32 @@ def build_memory_tools(
     # фактически не работал.
     from sreda.services.weather_tool import build_weather_tool
 
-    # 2026-04-29: web_search получает session/tenant/user для quota
-    # tracking (Tavily 30/user/мес + 950 global). При исчерпании квоты
-    # tool сам fall'нётся на DDG `backend="api"`.
-    web_search_tool = build_web_search_tool(
-        session=session, tenant_id=tenant_id, user_id=user_id,
-    )
-    fetch_url_tool = build_fetch_url_tool()
-    weather_tool = build_weather_tool()
-
-    # Phase 2D: web_search disabled for sreda_free tier. Free users
-    # see "веб-поиск доступен в расширенном тарифе" в upgrade copy.
-    # Grandfathered + paid tiers retain web_search.
+    # #200 Фаза 1: web_search доступен ВСЕМ. Тир определяет per-user
+    # лимит: free (sreda_free и НЕ grandfathered) — 5/мес (детерминир.
+    # атомарный счётчик); grandfathered/платные — без per-user лимита
+    # (глобальный 950 остаётся). Enforcement в замыкании; апсейл —
+    # машинный статус, LLM формулирует.
     from sreda.services.entitlement_gate import EntitlementGate
     _gate = EntitlementGate(session).check(tenant_id)
     _is_free_only = (
         _gate.plan_key == "sreda_free" and not _gate.is_grandfathered
     )
+    _per_user_cap = 5 if _is_free_only else None
+
+    web_search_tool = build_web_search_tool(
+        session=session, tenant_id=tenant_id, user_id=user_id,
+        per_user_cap=_per_user_cap, is_free=_is_free_only,
+    )
+    fetch_url_tool = build_fetch_url_tool()
+    weather_tool = build_weather_tool()
 
     tools_list: list[Callable] = [
         save_core_fact,
         save_episode,
         recall_memory,
         weather_tool,
+        web_search_tool,
+        fetch_url_tool,
+        log_unsupported_request,
     ]
-    if not _is_free_only:
-        tools_list.append(web_search_tool)
-    tools_list.extend([fetch_url_tool, log_unsupported_request])
     return tools_list

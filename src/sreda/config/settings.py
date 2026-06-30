@@ -42,6 +42,49 @@ _SECRET_FIELD_NAMES = frozenset({
 })
 
 
+class _ReactTenantGate(frozenset):
+    """Множество tenant-id для ReAct-гейтов с режимом «всем» (#159-rollout).
+
+    Построено из env-значения ``*`` → ``__contains__`` истинно для ЛЮБОГО
+    tenant_id (включая будущие регистрации), и объект truthy. Иначе ведёт себя
+    как обычный ``frozenset`` (явный allowlist).
+
+    Зачем подкласс, а не отдельный bool-флаг: гейт проверяется как ``tenant_id in
+    gate`` в нескольких местах (telegram/max inbound + voice-gate) — подкласс
+    сохраняет ВСЕ существующие call-site без правок (нулевой риск пропустить точку
+    проверки + добавить новый дрейф). Применяется ТОЛЬКО к loop/prune гейтам;
+    privacy-allowlist'ы (debug, admin preview) и эксперимент osa остаются строгими
+    списками без «*». В режиме «всем» итерация/len дают ПУСТО (полный список
+    тенантов не перечисляем — его и нет), поэтому проверяй принадлежность через
+    ``in``, а наличие гейта — через ``bool``/``if``, не через ``len``."""
+
+    def __new__(cls, items=(), *, all_: bool = False):
+        self = super().__new__(cls, items)
+        self._all = all_
+        return self
+
+    def __contains__(self, item: object) -> bool:
+        if getattr(self, "_all", False):
+            # Режим «всем»: членом считается ЛЮБОЙ непустой строковый tenant_id.
+            # None/""/нестрока → False (анти-регресс: малформный id из call-site
+            # ДО резолва тенанта не должен «тихо включиться» под `*`). Codex R1 MINOR.
+            return isinstance(item, str) and bool(item)
+        return super().__contains__(item)
+
+    def __bool__(self) -> bool:
+        return True if getattr(self, "_all", False) else len(self) > 0
+
+
+def _parse_tenant_gate(raw: str | None) -> _ReactTenantGate:
+    """CSV tenant-id → гейт. Одиночный ``*`` → режим «всем»; пусто/None → никому.
+    Общий разбор для loop/prune гейтов (#159-rollout)."""
+    if not raw:
+        return _ReactTenantGate()
+    if raw.strip() == "*":
+        return _ReactTenantGate(all_=True)
+    return _ReactTenantGate(item.strip() for item in raw.split(",") if item.strip())
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SREDA_", extra="ignore")
 
@@ -106,6 +149,14 @@ class Settings(BaseSettings):
     max_bot_token: str | None = None
     max_webhook_url: str | None = None
     max_webhook_secret_token: str | None = None
+    # #214: базовый URL MAX Bot API. МАКС мигрирует с platform-api.max.ru на
+    # platform-api2.max.ru (до 19.07.2026; новый адрес отдаёт TLS, выпущенный
+    # Минцифры — см. integrations/max/client.max_ssl_context). Дефолт = новый
+    # адрес; откат на старый — сменой env SREDA_MAX_API_BASE_URL без редеплоя.
+    max_api_base_url: str = Field(
+        default="https://platform-api2.max.ru",
+        validation_alias="SREDA_MAX_API_BASE_URL",
+    )
     connect_public_base_url: str | None = None
 
     openai_base_url: str | None = None
@@ -347,6 +398,105 @@ class Settings(BaseSettings):
             "sreda_planner_enabled_tenants",
         ),
     )
+    react_loop_enabled_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_LOOP_ENABLED_TENANTS",
+            "sreda_react_loop_enabled_tenants",
+        ),
+        description=(
+            "#66 gated experiment: tenants routed to the new LangGraph "
+            "ReAct+interrupt conversational loop (InMemory checkpointer, no "
+            "PII at rest). Empty (default) → nobody; everyone stays on the "
+            "existing inline path (zero regression)."
+        ),
+    )
+    # #173/#184: тенанты, чей ReAct-цикл крутится на «Осе» (gpt-oss-120b @ Groq) ВМЕСТО
+    # planner_provider (Mercury) — per-tenant эксперимент по образцу react_loop_enabled_tenants.
+    # Пусто (дефолт) → никому → все на planner_provider (ноль изменений). Планировщик НЕ затронут.
+    react_osa_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_OSA_TENANTS",
+            "sreda_react_osa_tenants",
+        ),
+    )
+    # #184: Оса (gpt-oss-120b @ Groq) как FALLBACK для Фредди (Mercury) в ReAct — при сбое primary
+    # (timeout/5xx) ход уходит на Осу. True → fallback включён для всех react-тенантов; False
+    # (дефолт) → без fallback (как сейчас). Независим от react_osa_tenants (там Оса как PRIMARY).
+    react_osa_fallback: bool = Field(
+        default=False, validation_alias="SREDA_REACT_OSA_FALLBACK"
+    )
+    # #192: durable структурный трейс хода ReAct (react_turn_trace). True → пишем трейс (start/pause/
+    # finish) И НЕ пишем временный react_debug_turns (#185, одна система). False (дефолт) → старый
+    # путь #185 (откат). Раскат как #185: проверка → ВКЛ глобально.
+    react_trace_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_TRACE_ENABLED"
+    )
+    # #193: durable персистентность диалога ReAct (свой EncryptedSqlCheckpointSaver вместо
+    # InMemorySaver). OFF (дефолт) → прежнее поведение: InMemory + ключ {base}#{gen}. ON →
+    # стабильный durable-ключ f"react-v1:{base}" (версия топологии в ПРЕФИКСЕ; checkpoint_ns
+    # зарезервирован LangGraph под подграфы), диалог переживает рестарт. ReAct-only;
+    # НЕ конфликтует с легасовыми SREDA_LANGGRAPH_* (те гейтят отдельный legacy-граф).
+    react_persist_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_PERSIST_ENABLED"
+    )
+    # #194: компакция истории ReAct как prompt-view (структурный конвейер БЕЗ LLM). OFF (дефолт) →
+    # модель получает всю историю (как сейчас). ON → урезанный валидный вид в пределах char-бюджета
+    # (снижает prompt_too_long; полное устранение — L4). ReAct-only; канон #193 не мутируется.
+    react_compact_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_COMPACT_ENABLED"
+    )
+    # #194: переопределение char-бюджета компакции без передеплоя (калибровка/наблюдение). 0 (дефолт) →
+    # кодовая константа TOTAL_BUDGET_CHARS. Поставить низкое значение → компакция сработает на коротком
+    # диалоге (увидеть в логах react_compaction); вернуть в норму/0 после замера.
+    react_compact_budget_chars: int = Field(
+        default=0, validation_alias="SREDA_REACT_COMPACT_BUDGET_CHARS"
+    )
+    # #247: кеш-дисциплина. OFF (дефолт) → section-hint #215 + guard-нудж дописываются в СИСТЕМНЫЙ промпт
+    # (нестабильный префикс каждый ход → ломается кеш большого префикса Mercury). ON → системный промпт
+    # СТАБИЛЕН, директивы уходят в ХВОСТ (отдельным сообщением после истории) → кеш-префикс не рушится,
+    # инструкция-следование даже лучше (свежесть). Дефолт OFF = byte-identical.
+    react_tail_directives_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_TAIL_DIRECTIVES"
+    )
+    # #197: preflight intent-router. OFF (дефолт) → прежнее: один Фредди, полный набор инструментов
+    # (byte-identical через effective_intent=None — даже при чекпойнте с intent=chat). ON → классификатор
+    # намерения (task/chat/fact): task→Фредди+полный набор; chat/fact→deepseek+web-only+поиск≤1
+    # (анти-флейл, инцидент 2026-06-23). ReAct-only; legacy plan-execute не тронут. Раскат спящим.
+    react_preflight_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_PREFLIGHT_ENABLED"
+    )
+    # #197: провайдер рассуждающей модели для chat/fact-пути (eval #173 → deepseek-v4-flash). Строится
+    # через get_chat_llm(provider=...). Недоступен/мисконфиг → fail-open в task (Фредди), scope web-only.
+    react_preflight_chat_provider: str = Field(
+        default="openrouter-deepseek", validation_alias="SREDA_REACT_PREFLIGHT_CHAT_PROVIDER"
+    )
+    # #221 Ф3: режим доменного скоупинга инструментов (ОТДЕЛЬНЫЙ от preflight #197, R4 Codex medium — не
+    # сворачивать в один флаг, иначе миграция сломает #197). Три состояния:
+    #   "disabled" (дефолт) — точный legacy: старый _route_families, БЕЗ нового роутера/логов → byte-identical;
+    #   "shadow" — legacy-исполнение + sidecar-лог решения нового роутера (только свежий ход, try/except,
+    #             НЕ мутирует state) → сравнение расхождений перед включением;
+    #   "execute" — новый ontology-роутер драйвит active_families + _apply_domain_policy на bind-сайтах.
+    # Активен ТОЛЬКО при react_preflight_enabled (домены — надстройка на task-пути). Невалидное значение →
+    # "disabled" (fail-safe). Старый bool preflight НЕ затронут (миграция: старый прод-env сохраняет #197,
+    # домен-режим по умолчанию disabled — R4 golden env-parsing).
+    react_domain_scope_mode: str = Field(
+        default="disabled", validation_alias="SREDA_REACT_DOMAIN_SCOPE_MODE"
+    )
+
+    @property
+    def react_domain_scope(self) -> str:
+        """Нормализованный режим доменного скоупинга ∈ {disabled, shadow, execute}; иначе → disabled (fail-safe)."""
+        v = (self.react_domain_scope_mode or "").strip().lower()
+        return v if v in ("disabled", "shadow", "execute") else "disabled"
+    # #221 Ф4 (канареечная раскатка execute): даже при глобальном mode=execute РЕАЛЬНО драйвить роутер
+    # только для тенантов из этого списка; остальные при execute ведут себя как shadow (лог-only). Так
+    # execute катится постепенно (сперва тенант Бориса → проверка «дела» → ``*`` на всех). Пусто (дефолт)
+    # → НИКОМУ execute (mode=execute без списка = глобальный shadow). ``*`` → ВСЕ (полная раскатка).
+    react_domain_scope_execute_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -354,6 +504,34 @@ class Settings(BaseSettings):
     admin_alert_preview_tenants_raw: str | None = Field(
         default=None,
         validation_alias="SREDA_ADMIN_ALERT_PREVIEW_TENANTS",
+    )
+    # vex#170: ВРЕМЕННЫЙ debug-allowlist тенантов, чьи react-ходы (вопрос+ответ бота+инструменты)
+    # сохраняются в react_debug_turns, чтобы видеть всю переписку пока тестируем механизм. Текст
+    # шифруется. Дефолт пуст → НИКОМУ (защита: только явно перечисленные дебаг/тест-тенанты).
+    # Удалить вместе с фичей после теста. НЕ глобальный флаг (privacy defense-in-depth, Codex R1).
+    react_debug_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_REACT_DEBUG_TENANTS",
+    )
+    # #185 (pre-launch QA, ВРЕМЕННО): ГЛОБАЛЬНЫЙ захват переписки. True → _persist_debug_turn пишет
+    # ходы ВСЕХ тенантов (а не только allowlist выше) — производственная отладка/отлов багов перед
+    # запуском, снять после. Текст шифруется (EncryptedString). Оферта/согласие ПД на запуске ДОЛЖНЫ
+    # покрывать захват переписки. Дефолт False (без флага — прежнее поведение, только allowlist).
+    react_debug_all: bool = Field(
+        default=False, validation_alias="SREDA_REACT_DEBUG_ALL"
+    )
+    # #165 Срез B: тенанты с ОБРЕЗКОЙ набора инструментов (ленивая загрузка семей: ядро +
+    # предзагруженные словарём top-2 + добор need_family/guard). Дефолт пуст → НИКОМУ: все
+    # на full-bind (весь набор привязан, как до #165 — ноль изменений). Канарейка/kill-switch:
+    # добавить/убрать тенанта здесь. НЕ глобальный (per-tenant rollout, p-004 tenant↔user 1:1).
+    react_prune_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_REACT_PRUNE_TENANTS",
+    )
+    # #232 способ Б: тенанты с durable-выжимкой истории (генерация+потребление). Дефолт None → НИКОМУ.
+    react_summary_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias="SREDA_REACT_SUMMARY_TENANTS",
     )
 
     # Plan-Execute LLM provider split (Hakuoro357/vex-assistant#77 item #5).
@@ -426,6 +604,41 @@ class Settings(BaseSettings):
             "Wall-clock cap for a single planner LLM call, in seconds. "
             "Default 60s matches the legacy ``invoke_with_per_call_timeout`` "
             "default. Sub-A12 Phase B.2 (planner LLM wrapper)."
+        ),
+    )
+    react_llm_timeout_sec: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_LLM_TIMEOUT_SEC",
+            "sreda_react_llm_timeout_sec",
+        ),
+        description=(
+            "Wall-clock cap for a single ReAct chat-node LLM call, in seconds. "
+            "Default 60s matches the legacy ``invoke_with_per_call_timeout`` "
+            "default and ``planner_timeout_sec``. #159 п.1: bounds a hung/slow "
+            "primary (Mercury/deepseek) so the turn falls over to the #184 "
+            "fallback (Osa/Freddie) instead of hanging. Applies to both the "
+            "task and chat/fact branches, primary and fallback invokes."
+        ),
+    )
+    react_chat_llm_timeout_sec: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_CHAT_LLM_TIMEOUT_SEC",
+            "sreda_react_chat_llm_timeout_sec",
+        ),
+        description=(
+            "#256: separate, SHORTER wall-clock cap for the chat/fact branch "
+            "LLM calls (primary + fallback), in seconds. Default 15s — the "
+            "chat/fact reasoning model is normally 1-3s, so a hung primary "
+            "fails over to the #184 Freddie web-only fallback fast instead of "
+            "the user waiting the full task cap (``react_llm_timeout_sec``, "
+            "60s — kept long for Mercury multi-hop tool turns). Misconfig → "
+            "code falls back to a safe default."
         ),
     )
     planner_prompt_version: int = Field(
@@ -605,6 +818,20 @@ class Settings(BaseSettings):
     yandex_speechkit_api_key: str | None = Field(
         default=None, validation_alias="SREDA_YANDEX_SPEECHKIT_API_KEY"
     )
+    # Yandex Cloud Billing — показ остатка ₽ в /admin/llm (#229). Авторизованный
+    # ключ сервисного аккаунта (PEM с заголовком «… SA Key ID <id>» ИЛИ JSON),
+    # которым подписывается JWT → IAM-токен → Billing API. SA-id нужен ТОЛЬКО
+    # для PEM-формата (в JSON он внутри). account_id опционален — если не задан,
+    # берётся первый аккаунт из List.
+    yandex_billing_sa_key_file: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_SA_KEY_FILE"
+    )
+    yandex_billing_sa_id: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_SA_ID"
+    )
+    yandex_billing_account_id: str | None = Field(
+        default=None, validation_alias="SREDA_YANDEX_BILLING_ACCOUNT_ID"
+    )
     # Groq Whisper — OpenAI-compatible /audio/transcriptions endpoint on
     # LPU hardware. Same resolve-precedence as MiMo: explicit key first,
     # then file path, then disabled.
@@ -620,6 +847,14 @@ class Settings(BaseSettings):
     # global 950/мес). При превышении — fallback на DDG `backend="api"`.
     tavily_api_key: str | None = Field(
         default=None, validation_alias="TAVILY_API_KEY"
+    )
+
+    # #211: жёсткий лимит web_search на ОДИН ход ReAct (для ВСЕХ тиров) —
+    # отсечка шторма. Один спутанный ход загонял 35 веб-поисков и выжирал
+    # Tavily-квоту; per-user стоп есть не у всех (grandfathered). 0 — без
+    # per-ход лимита (только дневная/месячная квота). Тюнится без редеплоя.
+    react_web_search_per_turn_cap: int = Field(
+        default=4, validation_alias="SREDA_REACT_WEB_SEARCH_PER_TURN_CAP"
     )
 
     # Опциональный путь к файлу для structured JSON-лога неудачных
@@ -676,6 +911,44 @@ class Settings(BaseSettings):
                 "remove require_persist flag."
             )
         return self
+
+    @field_validator("max_api_base_url")
+    @classmethod
+    def _validate_max_api_base_url(cls, value: str) -> str:
+        # #214: на этот адрес уходит токен MAX-бота (Authorization header).
+        # Плохое значение из env = утечка токена или открытый текст, поэтому
+        # fail-fast на загрузке конфига строгими правилами:
+        #   * scheme строго https (иначе токен ушёл бы в открытом виде);
+        #   * host обязателен и только в зоне max.ru (не чужой хост);
+        #   * без userinfo (user:pass@) — анти-инъекция.
+        from urllib.parse import urlsplit
+
+        # Точный allowlist хостов API MAX (Codex R2): новый + адрес отката.
+        # Токен-несущий endpoint — пускаем ТОЛЬКО известные хосты, не любой
+        # *.max.ru (иначе плохой env мог бы отправить токен на другой сервис MAX).
+        _ALLOWED_HOSTS = {"platform-api2.max.ru", "platform-api.max.ru"}
+        candidate = (value or "").strip()
+        parts = urlsplit(candidate)
+        if parts.scheme != "https":
+            raise ValueError(
+                "max_api_base_url должен быть https:// — иначе токен MAX "
+                "уйдёт в открытом виде"
+            )
+        if parts.username or parts.password:
+            raise ValueError("max_api_base_url не должен содержать userinfo")
+        host = (parts.hostname or "").lower()
+        if host not in _ALLOWED_HOSTS:
+            raise ValueError(
+                f"max_api_base_url host должен быть одним из {sorted(_ALLOWED_HOSTS)}, "
+                f"получено: {host!r}"
+            )
+        if parts.port not in (None, 443):
+            raise ValueError(
+                f"max_api_base_url: нестандартный порт {parts.port!r} не допускается"
+            )
+        if parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise ValueError("max_api_base_url не должен содержать path/query/fragment")
+        return candidate
 
     @field_validator("connect_public_base_url")
     @classmethod
@@ -765,6 +1038,50 @@ class Settings(BaseSettings):
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_loop_enabled_tenants(self) -> frozenset[str]:
+        """#66: tenants on the new ReAct+interrupt conversational loop. Empty
+        (default) → nobody; ``*`` → ВСЕ тенанты, включая будущие (#159-rollout)."""
+        return _parse_tenant_gate(self.react_loop_enabled_tenants_raw)
+
+    @property
+    def react_osa_tenants(self) -> frozenset[str]:
+        """#184: тенанты, чей ReAct идёт на «Осе» (gpt-oss-120b @ Groq) вместо planner_provider.
+        Пусто (дефолт) → никому → все на planner_provider (Mercury)."""
+        raw = self.react_osa_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_debug_tenants(self) -> frozenset[str]:
+        """vex#170 (ВРЕМЕННОЕ): тенанты, чьи react-ходы сохраняются в react_debug_turns для
+        дебага. Пусто (дефолт) → НИКОМУ (не глобально — privacy allowlist)."""
+        raw = self.react_debug_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_prune_tenants(self) -> frozenset[str]:
+        """#165 Срез B: тенанты с обрезкой набора инструментов (ленивая загрузка семей).
+        Пусто (дефолт) → НИКОМУ → full-bind; ``*`` → ВСЕ тенанты (#159-rollout, экономия
+        токенов; измеренно безопасно: −89% токенов, паритет выбора инструмента)."""
+        return _parse_tenant_gate(self.react_prune_tenants_raw)
+
+    @property
+    def react_summary_tenants(self) -> frozenset[str]:
+        """#232 способ Б: тенанты с durable-выжимкой истории (генерация + потребление). Пусто (дефолт) →
+        НИКОМУ (фича OFF, потребление байт-идентично #194); ``*`` → ВСЕ. Канарейка/kill-switch."""
+        return _parse_tenant_gate(self.react_summary_tenants_raw)
+
+    @property
+    def react_domain_scope_execute_tenants(self) -> frozenset[str]:
+        """#221 Ф4: тенанты, на которых доменный роутер РЕАЛЬНО драйвит (execute) при глобальном
+        mode=execute. Пусто (дефолт) → НИКОМУ execute (mode=execute = глобальный shadow); ``*`` → ВСЕ
+        (полная раскатка). Канареечный гейт: сперва тенант Бориса, после проверки «дела» → ``*``."""
+        return _parse_tenant_gate(self.react_domain_scope_execute_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:

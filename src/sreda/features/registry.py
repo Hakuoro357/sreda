@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import FastAPI
 from sqlalchemy.orm import Session
 
+from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.contracts import FeatureModule, ManifestedFeatureModule
 from sreda.features.skill_contracts import SkillManifestBase
 
@@ -51,6 +52,9 @@ class FeatureRegistry:
     # ------------------------------------------------------------- modules
 
     def register(self, module: FeatureModule) -> None:
+        # #181 defense-in-depth: never register a retired skill's module.
+        if is_feature_disabled(module.feature_key):
+            return
         self._modules[module.feature_key] = module
 
     def register_api(self, app: FastAPI) -> None:
@@ -109,6 +113,9 @@ class FeatureRegistry:
         it picks up a pending ``Job`` of the given ``job_type``. The handler
         runs inside a ``skill_run_attempt`` wrapper that already created the
         platform run/attempt rows."""
+        # #181 defense-in-depth: drop handlers for a retired skill.
+        if is_feature_disabled(feature_key):
+            return
         if job_type in self._skill_job_handlers:
             raise ValueError(
                 f"skill job handler already registered for job_type={job_type!r}"
@@ -136,6 +143,9 @@ class FeatureRegistry:
         """Register the function invoked when the proactive worker picks
         up a classified ``InboundEvent`` for this feature. At most one
         handler per feature_key; second registration raises."""
+        # #181 defense-in-depth: drop handlers for a retired skill.
+        if is_feature_disabled(feature_key):
+            return
         if feature_key in self._proactive_handlers:
             raise ValueError(
                 f"proactive handler already registered for feature_key={feature_key!r}"
@@ -160,6 +170,9 @@ class FeatureRegistry:
         Called by ``OutboxDeliveryWorker`` after the text message is
         successfully sent via Telegram. Allows features to perform
         extra delivery steps (e.g. sending photos)."""
+        # #181 defense-in-depth: drop hooks for a retired skill.
+        if is_feature_disabled(feature_key):
+            return
         if feature_key in self._delivery_hooks:
             raise ValueError(
                 f"delivery hook already registered for feature_key={feature_key!r}"

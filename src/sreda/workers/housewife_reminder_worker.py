@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
@@ -65,6 +66,19 @@ class HousewifeReminderWorker:
         skipped_late = 0
         for reminder in due:
             try:
+                # #187 soft-delete — fencing-recheck (дверь #10): между SELECT
+                # (due_now producer-фильтр) и сдвигом состояния есть окно —
+                # тенант мог быть удалён администратором мид-тик в другом
+                # процессе. Перепроверяем В ТОЙ ЖЕ TX прямо перед доставкой +
+                # advance; удалён → пропускаем (НЕ доставляем, НЕ двигаем state).
+                from sreda.services.tenant_lifecycle import is_tenant_active
+
+                if not is_tenant_active(self.session, reminder.tenant_id):
+                    logger.info(
+                        "reminder %s: tenant %s удалён (fencing) — пропуск без advance",
+                        reminder.id, reminder.tenant_id,
+                    )
+                    continue
                 # 2026-04-23 «баг 2b»: если напоминание просрочено больше
                 # чем LATE_FIRE_GRACE_MINUTES — закрываем его silently
                 # без отправки в Telegram. Типичный случай: LLM создала
@@ -151,7 +165,30 @@ class HousewifeReminderWorker:
         # Dual delivery (Boris directive 2026-05-05): создаём отдельную
         # outbox row на каждый available channel — юзер видит reminder
         # и в TG и в МАКСе.
+        # #163 Фаза 4 — fired_trigger = триггер ИМЕННО ЭТОГО срабатывания (next_trigger_at ДО
+        # mark_fired-advance). Дискриминирует эскалационные ре-пинги: у каждого свой next_trigger_at,
+        # значит свой ключ → не схлопываются. None быть не должно (due_now фильтрует), но fallback на
+        # trigger_at на всякий.
+        fired = reminder.next_trigger_at or reminder.trigger_at
+        if fired is not None and fired.tzinfo is None:
+            fired = fired.replace(tzinfo=timezone.utc)
+        fired_iso = fired.isoformat() if fired is not None else ""
+        # Dual delivery (Boris directive 2026-05-05): создаём отдельную
+        # outbox row на каждый available channel — юзер видит reminder
+        # и в TG и в МАКСе.
         for routing in routings:
+            row_bot_key = routing.bot_key or reminder.bot_key or LEGACY_NULL_BOT_KEY
+            # #163 Фаза 4 — ключ идемпотентности доставки С КАНАЛОМ+ботом: dual TG+MAX различны
+            # (разный канал), эскалации различны (разный fired_iso); повтор ТОЙ ЖЕ тройки
+            # (мультипроцесс / повтор-enqueue) → дедуп. Pre-check (одно-поточный путь); partial-unique
+            # индекс — backstop гонки.
+            idem_key = f"{reminder.id}:{fired_iso}:{routing.channel}:{row_bot_key}"
+            if self._outbox_key_exists(idem_key):
+                logger.info(
+                    "reminder %s: outbox idem-key уже поставлен (%s) — пропуск дубля доставки",
+                    reminder.id, routing.channel,
+                )
+                continue
             payload = {
                 "chat_id": routing.chat_id,
                 "text": text,
@@ -168,14 +205,37 @@ class HousewifeReminderWorker:
                 # #109: deliver to the user's CURRENT bot (routing.bot_key,
                 # populated from user.last_bot_key) when known; else fall
                 # back to the reminder's frozen bot_key, then legacy default.
-                bot_key=routing.bot_key or reminder.bot_key or LEGACY_NULL_BOT_KEY,
+                bot_key=row_bot_key,
+                idempotency_key=idem_key,
             )
             if hasattr(OutboxMessage, "user_id"):
                 outbox.user_id = reminder.user_id
             if hasattr(OutboxMessage, "is_interactive"):
                 outbox.is_interactive = False
-            self.session.add(outbox)
-        self.session.flush()
+            # SAVEPOINT (R1 MAJOR — субагент+Codex high+medium, мимо CRITICAL): гонку, которую
+            # pre-check не закрыл, ловит partial-unique индекс на flush. БЕЗ savepoint IntegrityError
+            # отравил бы ВСЮ тик-транзакцию (PendingRollbackError на финальном commit → откат всех
+            # mark_fired-advance + доставка тика не идёт). begin_nested откатывает ТОЛЬКО эту строку
+            # → гонка дедупится без падения тика.
+            try:
+                with self.session.begin_nested():
+                    self.session.add(outbox)
+                    self.session.flush()
+            except IntegrityError:
+                logger.info(
+                    "reminder %s: outbox idem-key гонка (%s) → дедуп (другой писатель опередил)",
+                    reminder.id, routing.channel,
+                )
+                continue
+
+    def _outbox_key_exists(self, idem_key: str) -> bool:
+        """Pre-check дедупа доставки (#163 Фаза 4): есть ли уже outbox с этим ключом.
+        Закрывает общий повтор-enqueue; гонку (TOCTOU) ловит partial-unique индекс + savepoint."""
+        return (
+            self.session.query(OutboxMessage.id)
+            .filter(OutboxMessage.idempotency_key == idem_key)
+            .first() is not None
+        )
 
     def _resolve_routings(self, reminder: FamilyReminder):
         """Reminder → list of OutboxRouting (10.6 dual-channel).

@@ -1,11 +1,14 @@
-"""Unit tests for agent_capabilities.has_voice_access."""
+"""Unit tests for agent_capabilities.has_voice_access / resolve_voice_access."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
-from sreda.services.agent_capabilities import has_voice_access
+from sreda.services.agent_capabilities import (
+    has_voice_access,
+    resolve_voice_access,
+)
 
 
 def _mk_sub(
@@ -141,3 +144,105 @@ def test_zero_quantity_ignored():
     registry = _make_registry({"housewife_assistant": _mk_manifest(True)})
     with patch("sreda.services.agent_capabilities.get_feature_registry", return_value=registry):
         assert has_voice_access(session, "t1") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_voice_access (#204 Фаза 1, Решение 1)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_no_tenant_denied():
+    res = resolve_voice_access(MagicMock(), "")
+    assert res.allowed is False
+    assert res.billing_feature_key is None
+
+
+def test_resolve_active_carrier_billed_under_carrier():
+    """(a)/(c): active housewife carrier → allowed, billing_feature_key=carrier."""
+    session = _make_session([_mk_sub(feature_key="housewife_assistant")])
+    registry = _make_registry({"housewife_assistant": _mk_manifest(True)})
+    with patch("sreda.services.agent_capabilities.get_feature_registry", return_value=registry):
+        res = resolve_voice_access(session, "t1")
+    assert res.allowed is True
+    assert res.billing_feature_key == "housewife_assistant"
+
+
+def test_resolve_legacy_voice_sub_without_carrier_denied():
+    """(b): legacy voice_transcription sub (includes_voice=False) → denied,
+    no billing key."""
+    session = _make_session([_mk_sub(feature_key="voice_transcription")])
+    registry = _make_registry({"voice_transcription": _mk_manifest(False)})
+    with patch("sreda.services.agent_capabilities.get_feature_registry", return_value=registry):
+        res = resolve_voice_access(session, "t1")
+    assert res.allowed is False
+    assert res.billing_feature_key is None
+
+
+def test_resolve_multi_carrier_picks_sorted_first():
+    """(e): two voice carriers → deterministic sorted-first billing key."""
+    # "alpha_voice" < "housewife_assistant" lexicographically → sorted-first.
+    session = _make_session([
+        _mk_sub(feature_key="housewife_assistant"),
+        _mk_sub(feature_key="alpha_voice"),
+    ])
+    registry = _make_registry({
+        "housewife_assistant": _mk_manifest(True),
+        "alpha_voice": _mk_manifest(True),
+    })
+    with patch("sreda.services.agent_capabilities.get_feature_registry", return_value=registry):
+        res = resolve_voice_access(session, "t1")
+    assert res.allowed is True
+    assert res.billing_feature_key == "alpha_voice"
+
+
+def test_resolve_scheduled_for_cancel_carrier_still_billed():
+    """scheduled_for_cancel carrier still grants + bills (criterion shared)."""
+    session = _make_session([
+        _mk_sub(feature_key="housewife_assistant", status="scheduled_for_cancel"),
+    ])
+    registry = _make_registry({"housewife_assistant": _mk_manifest(True)})
+    with patch("sreda.services.agent_capabilities.get_feature_registry", return_value=registry):
+        res = resolve_voice_access(session, "t1")
+    assert res.allowed is True
+    assert res.billing_feature_key == "housewife_assistant"
+
+
+def test_resolve_expired_carrier_denied():
+    session = _make_session([
+        _mk_sub(feature_key="housewife_assistant", active_until_offset_days=-1),
+    ])
+    registry = _make_registry({"housewife_assistant": _mk_manifest(True)})
+    with patch("sreda.services.agent_capabilities.get_feature_registry", return_value=registry):
+        res = resolve_voice_access(session, "t1")
+    assert res.allowed is False
+    assert res.billing_feature_key is None
+
+
+def test_has_voice_access_equals_resolve_allowed_regression():
+    """Регрессия: has_voice_access поведение НЕ изменилось — оно строго
+    равно resolve_voice_access(...).allowed на одинаковых входах."""
+    cases = [
+        ([_mk_sub(feature_key="housewife_assistant")],
+         {"housewife_assistant": _mk_manifest(True)}),
+        ([_mk_sub(feature_key="eds_monitor")],
+         {"eds_monitor": _mk_manifest(False)}),
+        ([_mk_sub(feature_key="voice_transcription")],
+         {"voice_transcription": _mk_manifest(False)}),
+        ([_mk_sub(feature_key="housewife_assistant", status="cancelled")],
+         {"housewife_assistant": _mk_manifest(True)}),
+        ([_mk_sub(feature_key="housewife_assistant", status="scheduled_for_cancel")],
+         {"housewife_assistant": _mk_manifest(True)}),
+        ([_mk_sub(feature_key="housewife_assistant", quantity=0)],
+         {"housewife_assistant": _mk_manifest(True)}),
+        ([], {}),
+    ]
+    for subs, manifests in cases:
+        session = _make_session(subs)
+        registry = _make_registry(manifests)
+        with patch(
+            "sreda.services.agent_capabilities.get_feature_registry",
+            return_value=registry,
+        ):
+            assert has_voice_access(session, "t1") is (
+                resolve_voice_access(session, "t1").allowed
+            )

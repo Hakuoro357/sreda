@@ -151,6 +151,21 @@ class FamilyReminder(Base):
             postgresql_where=sa_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sa_text("normalized_title_hash IS NOT NULL"),
         ),
+        # #163 Фаза 2b — межходовой замок от дублей: не более ОДНОГО pending
+        # напоминания с одним semantic_key. COALESCE(user_id,'__tenant_wide__') ловит
+        # ОБЩЕСЕМЕЙНЫЕ (NULL user) — без заглушки NULL≠NULL в UNIQUE их бы не схлопнул.
+        # Партиал: только pending с непустым hash (легаси NULL-hash и не-pending — вне замка).
+        Index(
+            "uq_family_reminders_pending_semantic",
+            "tenant_id",
+            sa_text("COALESCE(user_id, '__tenant_wide__')"),
+            "normalized_title_hash",
+            unique=True,
+            postgresql_where=sa_text(
+                "status = 'pending' AND normalized_title_hash IS NOT NULL"),
+            sqlite_where=sa_text(
+                "status = 'pending' AND normalized_title_hash IS NOT NULL"),
+        ),
     )
 
 
@@ -174,6 +189,13 @@ class FamilyMember(Base):
     __tablename__ = "family_members"
     __table_args__ = (
         Index("ix_family_members_tenant_user", "tenant_id", "user_id"),
+        # #202: идемпотентность + семантический дедуп (как Sub-A10 у reminders/tasks/checklists).
+        Index("ix_family_members_operation_id",
+              "tenant_id", "user_id", "operation_id", unique=True),
+        Index("ix_family_members_normalized_title",
+              "tenant_id", "user_id", "normalized_title_hash",
+              postgresql_where=sa_text("normalized_title_hash IS NOT NULL"),
+              sqlite_where=sa_text("normalized_title_hash IS NOT NULL")),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -202,3 +224,7 @@ class FamilyMember(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+
+    # #202: idempotency + semantic-dedup columns (ctx-путь ReAct пишет; легаси — None).
+    operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    normalized_title_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

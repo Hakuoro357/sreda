@@ -303,7 +303,7 @@ _KNOWN_TOOL_NAMES = (
     "update_shopping_item", "update_shopping_items_category",
     # Housewife recipes
     "search_recipes", "get_recipe", "save_recipe", "save_recipes_batch",
-    "delete_recipe",
+    "delete_recipe", "update_recipe",  # #210
     # Housewife menu
     "plan_week_menu", "list_menu", "update_menu_item",
     "generate_shopping_from_menu", "clear_menu",
@@ -395,7 +395,7 @@ def strip_reasoning_prefix(text: str) -> str:
 # membership only.
 _WRITE_TOOL_NAMES = frozenset({
     "save_core_fact", "save_episode",
-    "save_recipe", "save_recipes_batch", "delete_recipe",
+    "save_recipe", "save_recipes_batch", "delete_recipe", "update_recipe",  # #210
     "add_shopping_items", "remove_shopping_items", "mark_shopping_bought",
     "update_shopping_item", "update_shopping_items_category",
     "plan_week_menu", "update_menu_item", "generate_shopping_from_menu",
@@ -584,6 +584,7 @@ _OBJECT_TO_CATEGORY: tuple[tuple[str, str | None], ...] = (
 _CATEGORY_TO_TOOLS: dict[str, frozenset[str]] = {
     "recipe": frozenset({
         "save_recipe", "save_recipes_batch", "delete_recipe",
+        "update_recipe",  # #210: правка рецепта на месте бэкает «обновила рецепт»
     }),
     "shopping": frozenset({
         "add_shopping_items", "remove_shopping_items",
@@ -610,6 +611,7 @@ _CATEGORY_TO_TOOLS: dict[str, frozenset[str]] = {
         "create_checklist", "add_checklist_items",
         "move_task_to_checklist", "mark_checklist_item_done",
         "delete_checklist_item", "archive_checklist",
+        "update_checklist_item",  # #210: правка пункта бэкает «изменила пункт»
     }),
     "memory": frozenset({"save_core_fact", "save_episode"}),
 }
@@ -1307,6 +1309,9 @@ CHAT_PROVIDERS = (
     # 2026-06-15 (#60): Inception Mercury-2 (прямой api.inceptionlabs.ai) —
     # диффузионная LLM, 1000+ tps + cached input. Переезд планировщика с MiMo.
     "inception-mercury2",         # mercury-2
+    # 2026-06-19 (#184): «Оса» — прямой Groq gpt-oss-120b для ReAct (per-tenant эксперимент).
+    "groq-gpt-oss-120b",          # openai/gpt-oss-120b @ Groq (medium reasoning по умолчанию)
+    "groq-gpt-oss-120b-low",      # то же, reasoning_effort=low (скоростной режим)
 )
 
 # MiMo variants share base_url + api key — only the model id changes.
@@ -1347,6 +1352,18 @@ _INCEPTION_MODEL_BY_PROVIDER = {
     "inception-mercury2": "mercury-2",
 }
 
+# 2026-06-19 (#184): ПРЯМОЙ Groq (OpenAI-совместимый), ключ = resolve_groq_api_key() (тот же,
+# что для Whisper-STT). «Оса» = gpt-oss-120b. id сверены по /openai/v1/models на ключе.
+_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+_GROQ_MODEL_BY_PROVIDER = {
+    "groq-gpt-oss-120b":     "openai/gpt-oss-120b",
+    "groq-gpt-oss-120b-low": "openai/gpt-oss-120b",
+}
+# reasoning_effort через extra_body (gpt-oss): low — скоростной режим (короче «думание»).
+_GROQ_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    "groq-gpt-oss-120b-low": {"reasoning_effort": "low"},
+}
+
 
 # 2026-05-10: Per-provider OpenRouter routing overrides (extra_body).
 # OpenRouter обычно сам выбирает provider'а с лучшей ценой, но иногда
@@ -1380,6 +1397,18 @@ def _override_temperature(provider: str, default: float) -> float:
 
 
 _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
+    # #3 (2026-06-25): chat/fact-ветка (#197) переведена с deepseek (медленный, 4-11с на
+    # ход — реальная жалоба юзера «долго отвечаешь») на gemini-2.5-flash-lite (≈0.7с).
+    # Пин google-vertex EU-регион — data-residency (ПД обрабатываются в EU-Vertex, а не
+    # «куда дешевле»). allow_fallbacks=False → если vertex/eu недоступен, OpenRouter вернёт
+    # 5xx, дальше наша цепочка фолбэка. Слаг "google-vertex/eu" проверен вживую 2026-06-25
+    # (713мс, без NotFoundError → принят и сроутил).
+    "openrouter-gemini-2.5-flash-lite": {
+        "provider": {
+            "only": ["google-vertex/eu"],
+            "allow_fallbacks": False,
+        },
+    },
     # 2026-05-11: `order` оказался preference, не forced — OpenRouter
     # роутил на DekaLLM (нестабильный, 1.9-253 t/s spread) когда
     # DeepInfra/bf16 был busy. Меняем на `only` + allow_fallbacks=False
@@ -1493,6 +1522,23 @@ def _build_chat_llm(
         override = _INCEPTION_MODEL_BY_PROVIDER[provider]
         return ChatOpenAI(
             base_url=settings.inception_base_url,
+            api_key=api_key,
+            model=model or override,
+            temperature=_override_temperature(provider, temperature),
+            timeout=settings.mimo_request_timeout_seconds,
+            **kwargs,
+        )
+    if provider in _GROQ_MODEL_BY_PROVIDER:  # #184 прямой Groq «Оса»
+        api_key = settings.resolve_groq_api_key()
+        if not api_key:
+            logger.info("chat LLM disabled: no Groq API key configured")
+            return None
+        override = _GROQ_MODEL_BY_PROVIDER[provider]
+        groq_extra = _GROQ_EXTRA_BODY_BY_PROVIDER.get(provider)
+        if groq_extra:  # reasoning_effort и т.п.
+            kwargs["extra_body"] = {**groq_extra, **(kwargs.pop("extra_body", None) or {})}
+        return ChatOpenAI(
+            base_url=_GROQ_BASE_URL,
             api_key=api_key,
             model=model or override,
             temperature=_override_temperature(provider, temperature),
@@ -1617,6 +1663,8 @@ def _provider_key_is_available(provider: str, settings: Settings) -> bool:
         return bool(settings.resolve_openrouter_api_key())
     if provider in _INCEPTION_MODEL_BY_PROVIDER:
         return bool(settings.resolve_inception_api_key())
+    if provider in _GROQ_MODEL_BY_PROVIDER:  # #184 «Оса»
+        return bool(settings.resolve_groq_api_key())
     return False
 
 

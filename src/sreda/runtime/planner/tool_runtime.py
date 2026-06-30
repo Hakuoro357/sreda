@@ -50,6 +50,8 @@ class ToolRuntimeContext:
     user_id        — optional; None when the execution is system-initiated.
     turn_key       — optional stable key for the conversation turn; used as
                      the primary input to allocate_operation_id().
+    channel        — #163 Фаза 3d: канал хода (max/telegram/react) для react-аудита caused_by.
+    thread_id      — #163 Фаза 3d: id диалоговой ветки для каузальной связки аудита.
     """
 
     operation_id: str
@@ -59,6 +61,14 @@ class ToolRuntimeContext:
     tenant_id: str
     user_id: str | None = None
     turn_key: str | None = None
+    # #163 Фаза 3d: провенанс react-аудита. Defaults None — backcompat (plan-execute executor и
+    # тесты, что не задают их). Заполняет react_loop.run_tools.
+    channel: str | None = None
+    thread_id: str | None = None
+    # #163 Фаза 3d-B (Codex medium R1 MAJOR): источник хода. ToolRuntimeContext биндит И react_loop,
+    # И легаси planner/executor → react-аудит (emit_tool_audit) метим ТОЛЬКО при origin=="react",
+    # иначе plan-execute durable-записи получили бы ЛОЖНЫЙ react-провенанс. Default None = не-react.
+    origin: str | None = None
 
 
 # Module-level ContextVar.  Default is None so that tools running outside

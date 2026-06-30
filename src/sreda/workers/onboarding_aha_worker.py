@@ -101,6 +101,8 @@ class OnboardingAhaWorker:
                 Tenant.approved_at.isnot(None),
                 Tenant.approved_at >= lo,
                 Tenant.approved_at <= hi,
+                # #187 soft-delete — producer-фильтр (дверь #10): удалённым не шлём.
+                Tenant.deleted_at.is_(None),
             )
             .limit(limit)
             .all()

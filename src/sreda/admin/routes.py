@@ -13,9 +13,15 @@ from fastapi.templating import Jinja2Templates
 
 from sreda.admin.auth import require_admin_token
 from sreda.admin.queries import (
-    get_all_users,
     get_budget_summary_for_day,
+    get_cost_volume_summary,
+    get_dialogue_health,
     get_llm_calls,
+    get_spend_by_model,
+    get_tenant_spend_detail,
+    get_top_tenants_by_spend,
+    get_users_page,
+    has_active_subscriptions,
 )
 from sreda.config.settings import get_settings
 from sreda.db.session import get_session_factory
@@ -24,6 +30,27 @@ _MSK_TZ = ZoneInfo("Europe/Moscow")
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+
+
+def _fmt_usd(value) -> str:
+    """#150: деньги для UI. None → «—»; точный $0 → «$0.0000»;
+    0<v<$0.0001 → «<$0.0001»; иначе $X.XXXX.
+    Централизует формат — никаких Decimal<float сравнений в шаблонах (Codex MAJOR).
+    Точный ноль отделён от микросумм (Codex R4): пустой период показывает честный
+    $0.0000, а не вводящее в заблуждение «<$0.0001»."""
+    from decimal import Decimal as _D
+
+    if value is None:
+        return "—"
+    v = value if isinstance(value, _D) else _D(str(value))
+    if v == 0:
+        return "$0.0000"
+    if v < _D("0.0001"):
+        return "<$0.0001"
+    return f"${v:.4f}"
+
+
+templates.env.filters["usd"] = _fmt_usd
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -61,17 +88,77 @@ def _audit_admin_view(
     )
 
 
-@router.get("/users", response_class=HTMLResponse)
-def admin_users(
+@router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
+def admin_dashboard(
     request: Request,
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    _audit_admin_view(session, "admin.users.viewed", token, request)
-    users = get_all_users(session)
+    """Дашборд админки (landing): (a) затраты+объём день/неделя/месяц,
+    (b) здоровье диалога, (c) балансы провайдеров, (d) активность тенантов
+    (top по тратам + top беспрайсовых). Только агрегаты — без текстов сообщений."""
+    _audit_admin_view(session, "admin.dashboard.viewed", token, request)
+    cost = get_cost_volume_summary(session)
+    health = get_dialogue_health(session)
+    top = get_top_tenants_by_spend(session, "month")
+    try:
+        from sreda.services import provider_balances as _pb
+
+        balances = _pb.fetch_balances(get_settings())
+    except Exception:  # noqa: BLE001 — балансы не валят дашборд
+        balances = []
+    return templates.TemplateResponse(
+        request, "dashboard.html",
+        {
+            "token": token,
+            "section": "dashboard",
+            "cost": cost,
+            "health": health,
+            "top": top,
+            "balances": balances,
+        },
+    )
+
+
+@router.get("/users", response_class=HTMLResponse)
+def admin_users(
+    request: Request,
+    page: int = Query(1, ge=1),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    _audit_admin_view(session, "admin.users.viewed", token, request, page=page)
+    users_page = get_users_page(session, page=page)
     return templates.TemplateResponse(
         request, "users.html",
-        {"token": token, "users": users, "section": "users"},
+        {
+            "token": token,
+            "users": users_page.rows,
+            "page": users_page,
+            "section": "users",
+        },
+    )
+
+
+@router.get("/tenants/{tenant_id}", response_class=HTMLResponse)
+def admin_tenant_detail(
+    tenant_id: str,
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Карточка тенанта: траты день/неделя/месяц по моделям + ссылки на
+    переписку (llm-calls). Только агрегаты/метаданные — без текстов сообщений.
+    Подпись «расходы тенанта/аккаунта, не пользователя» (тенант может иметь
+    несколько юзеров) — в шаблоне."""
+    _audit_admin_view(
+        session, "admin.tenant.viewed", token, request, tenant_id=tenant_id,
+    )
+    detail = get_tenant_spend_detail(session, tenant_id)
+    return templates.TemplateResponse(
+        request, "tenant_detail.html",
+        {"token": token, "section": "users", "detail": detail},
     )
 
 
@@ -107,11 +194,15 @@ def admin_budget(
             pass  # malformed query string — fall back to today
 
     rows = get_budget_summary_for_day(session, selected)
+    # #175: различаем «активных подписок нет» от «подписки есть, но за день нет расхода»
+    # (иначе пустой день показывал ложное «Нет активных подписок»).
+    has_subs = has_active_subscriptions(session)
     return templates.TemplateResponse(
         request, "budget.html",
         {
             "token": token,
             "rows": rows,
+            "has_active_subs": has_subs,
             "section": "budget",
             "selected_date": selected.isoformat(),
             "prev_date": (selected - timedelta(days=1)).isoformat(),
@@ -120,6 +211,36 @@ def admin_budget(
                 if selected < today
                 else None
             ),
+        },
+    )
+
+
+@router.get("/spend-by-model", response_class=HTMLResponse)
+def admin_spend_by_model(
+    request: Request,
+    period: str = Query("month"),
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Траты по (provider_key, model) за день/неделю/месяц (MSK).
+
+    ≈USD по ТЕКУЩЕМУ прайсу (`llm_pricing`); беспрайсовые модели → «—». Шапка
+    показывает покрытие (% валидных вызовов/токенов с известной ценой) + список
+    беспрайсовых + число аномалий. Только агрегаты — без текстов сообщений.
+    """
+    if period not in ("day", "week", "month"):
+        period = "month"
+    _audit_admin_view(
+        session, "admin.spend_by_model.viewed", token, request, period=period,
+    )
+    report = get_spend_by_model(session, period)
+    return templates.TemplateResponse(
+        request, "spend_by_model.html",
+        {
+            "token": token,
+            "section": "spend-by-model",
+            "period": period,
+            "report": report,
         },
     )
 
@@ -176,6 +297,15 @@ _LLM_PROVIDERS_METADATA = [
         "default_model_attr": None,
         "resolver": "resolve_mimo_api_key",
         "static_model": "mimo-v2.5",
+    },
+    {
+        # #150: планировщик Среды (с 2026-06-15). Баланса нет — fetch_balances
+        # тянет только openrouter+mimo, Inception сетью не дёргается («нет API»).
+        "key": "inception-mercury2",
+        "label": "Inception · Mercury-2 (Фредди, планировщик)",
+        "default_model_attr": None,
+        "resolver": "resolve_inception_api_key",
+        "static_model": "mercury-2",
     },
     {
         "key": "openrouter",
@@ -239,6 +369,42 @@ _LLM_PROVIDERS_METADATA = [
 ]
 
 
+def _provider_spend(session, *, days: int = 30) -> list[dict]:
+    """#184 ч.3: расход по провайдерам из skill_ai_executions за N дней (токены + USD-оценка из
+    estimated_cost_rub_micro). У Inception/Groq нет API баланса → считаем СВОЙ расход. Включает
+    react_turn (Mercury/Оса) + остальные пути. Сортировка по стоимости."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import func, select
+
+    from sreda.db.models.skill_platform import SkillAIExecution
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = session.execute(
+        select(
+            SkillAIExecution.provider_key,
+            func.count(),
+            func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
+            func.coalesce(func.sum(SkillAIExecution.estimated_cost_rub_micro), 0),
+        )
+        .where(SkillAIExecution.created_at >= cutoff)
+        .group_by(SkillAIExecution.provider_key)
+    ).all()
+    out = [
+        {
+            "provider": pk or "(неизвестно)",
+            "calls": int(cnt or 0),
+            "prompt_tokens": int(pt or 0),
+            "completion_tokens": int(ct or 0),
+            "cost_rub": round(int(cost or 0) / 1_000_000, 2),
+        }
+        for pk, cnt, pt, ct, cost in rows
+    ]
+    out.sort(key=lambda r: -r["cost_rub"])
+    return out
+
+
 def _llm_context(
     session,
     token: str,
@@ -286,6 +452,22 @@ def _llm_context(
         or ""
     )
     balances = pb.fetch_balances(settings) if with_balances else []
+    # #184 ч.2: react-механизм управляется ENV (НЕ свитчером chat-провайдера выше). Показываем
+    # read-only, чтобы правки react/Осы перестали быть невидимы на этой странице.
+    react_info = {
+        "primary": settings.planner_provider,
+        "osa_fallback_on": settings.react_osa_fallback,
+        # R1-фикс: флаг ВКЛ ещё не значит «запас работает» — нужен ключ Groq. Показываем отдельно,
+        # чтобы оператор не считал запас активным, когда LLM фактически не создастся.
+        "osa_fallback_available": bool(
+            settings.react_osa_fallback and settings.resolve_groq_api_key()
+        ),
+        "osa_primary_tenants": sorted(settings.react_osa_tenants),
+    }
+    # #184 ч.3: расход по провайдерам (баланс-API у Inception/Groq нет → считаем свой). Локальный
+    # дешёвый запрос (НЕ сеть) → считаем ВСЕГДА, не под with_balances (R1: иначе POST-перерендер
+    # показал бы «нет данных» при наличии расхода).
+    react_spend = _provider_spend(session)
     return {
         "token": token,
         "section": "llm",
@@ -293,6 +475,8 @@ def _llm_context(
         "current_primary": current_primary,
         "current_fallback": current_fallback,
         "balances": balances,
+        "react_info": react_info,
+        "react_spend": react_spend,
         "flash": flash,
     }
 
@@ -379,14 +563,14 @@ def admin_llm_save(
 def admin_llm_calls(
     request: Request,
     tenant_id: str = Query(...),
-    feature_key: str = Query(...),
+    feature_key: str | None = Query(None),
     page: int = Query(default=1, ge=1),
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     _audit_admin_view(
         session, "admin.llm_calls.viewed", token, request,
-        tenant_id=tenant_id, feature_key=feature_key, page=page,
+        tenant_id=tenant_id, feature_key=feature_key or "", page=page,
     )
     data = get_llm_calls(session, tenant_id, feature_key, page=page)
     return templates.TemplateResponse(
@@ -618,12 +802,10 @@ def admin_tenant_reset(
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    """Full tenant reset: unbind EDS cabinets, delete subscriptions,
-    skill states, all events, outbox — as if the user just registered."""
+    """Full tenant reset: delete subscriptions, skill states, all events,
+    outbox — as if the user just registered."""
     from sreda.db.models.billing import TenantSubscription  # noqa: keep cycles/orders
-    from sreda.db.models.connect import ConnectSession, TenantEDSAccount
-    from sreda.db.models.core import OutboxMessage, SecureRecord, Tenant
-    from sreda.db.models.eds_monitor import EDSAccount, EDSChangeEvent, EDSClaimState
+    from sreda.db.models.core import OutboxMessage, Tenant
     from sreda.db.models.inbound_event import InboundEvent
     from sreda.db.models.skill_platform import TenantSkillConfig, TenantSkillState
     # Note: PaymentOrder / TenantBillingCycle are NOT deleted — FK cascades
@@ -635,42 +817,15 @@ def admin_tenant_reset(
 
     d: dict[str, int] = {}
 
-    # EDS state
-    d["claim_states"] = session.query(EDSClaimState).filter(
-        EDSClaimState.eds_account_id.in_(
-            session.query(EDSAccount.id).filter_by(tenant_id=tenant_id)
-        )
-    ).delete(synchronize_session="fetch")
-    d["change_events"] = session.query(EDSChangeEvent).filter(
-        EDSChangeEvent.eds_account_id.in_(
-            session.query(EDSAccount.id).filter_by(tenant_id=tenant_id)
-        )
-    ).delete(synchronize_session="fetch")
-
-    # EDS accounts + secure records
-    for ta in session.query(TenantEDSAccount).filter_by(tenant_id=tenant_id).all():
-        if ta.secure_record_id:
-            sr = session.get(SecureRecord, ta.secure_record_id)
-            if sr:
-                session.delete(sr)
-                d["secure_records"] = d.get("secure_records", 0) + 1
-        session.delete(ta)
-        d["tenant_eds_accounts"] = d.get("tenant_eds_accounts", 0) + 1
-
-    d["eds_accounts"] = session.query(EDSAccount).filter_by(
-        tenant_id=tenant_id
-    ).delete()
+    # #181 Фаза B: EDS Monitor полностью ретайрен — connect-слой
+    # (connect_sessions / tenant_eds_accounts) и его secure_records дропнуты
+    # миграцией; reset их больше не чистит.
 
     # Events and outbox
     d["inbound_events"] = session.query(InboundEvent).filter_by(
         tenant_id=tenant_id
     ).delete()
     d["outbox"] = session.query(OutboxMessage).filter_by(
-        tenant_id=tenant_id
-    ).delete()
-
-    # Connect sessions
-    d["connect_sessions"] = session.query(ConnectSession).filter_by(
         tenant_id=tenant_id
     ).delete()
 
@@ -710,7 +865,7 @@ def admin_tenant_reset(
     msg = "+".join(parts) if parts else "nothing+to+delete"
 
     return RedirectResponse(
-        url=f"/admin/users?token={token}&reset=ok&msg={msg}",
+        url=f"/admin/users?reset=ok&msg={msg}",
         status_code=303,
     )
 
@@ -759,7 +914,7 @@ async def _legacy_admin_tenant_approve_unused(
     tenant = session.get(Tenant, tenant_id)
     if tenant is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&approve=err&msg=tenant_not_found",
+            url="/admin/users?approve=err&msg=tenant_not_found",
             status_code=303,
         )
 
@@ -891,7 +1046,7 @@ async def _legacy_admin_tenant_approve_unused(
 
     return RedirectResponse(
         url=(
-            f"/admin/users?token={token}&approve=ok&tenant={tenant_id}"
+            f"/admin/users?approve=ok&tenant={tenant_id}"
             f"&welcome={delivery_status}&grant={grant_status}"
         ),
         status_code=303,
@@ -928,7 +1083,7 @@ async def admin_tenant_suspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&suspend=err&msg=no_active_sub",
+            url="/admin/users?suspend=err&msg=no_active_sub",
             status_code=303,
         )
     sub.status = "suspended"
@@ -946,7 +1101,7 @@ async def admin_tenant_suspend(
     )
     session.commit()
     return RedirectResponse(
-        url=f"/admin/users?token={token}&suspend=ok&tenant={tenant_id}",
+        url=f"/admin/users?suspend=ok&tenant={tenant_id}",
         status_code=303,
     )
 
@@ -972,7 +1127,7 @@ async def admin_tenant_unsuspend(
     )
     if sub is None:
         return RedirectResponse(
-            url=f"/admin/users?token={token}&unsuspend=err&msg=no_suspended_sub",
+            url="/admin/users?unsuspend=err&msg=no_suspended_sub",
             status_code=303,
         )
     sub.status = "active"
@@ -990,6 +1145,72 @@ async def admin_tenant_unsuspend(
     )
     session.commit()
     return RedirectResponse(
-        url=f"/admin/users?token={token}&unsuspend=ok&tenant={tenant_id}",
+        url=f"/admin/users?unsuspend=ok&tenant={tenant_id}",
+        status_code=303,
+    )
+
+
+@router.post("/tenant/{tenant_id}/soft-delete", response_class=HTMLResponse)
+async def admin_tenant_soft_delete(
+    tenant_id: str,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """#187 Phase 4b-1 — soft-delete a tenant (admin-only trigger, A15).
+
+    Reversible: flips ``tenants.deleted_at`` + actively drains pending
+    artefacts under the tenant advisory-lock barrier (see
+    ``services.tenant_lifecycle.soft_delete_tenant``). Protected EXACTLY like
+    the other admin actions (suspend/unsuspend): ``require_admin_token`` →
+    reachable only on the admin surface (IP-locked vhost + admin auth), NOT a
+    public endpoint. The ``admin.tenant.soft_delete`` audit row (A11) is
+    written INSIDE ``soft_delete_tenant``, atomically with the flag under the
+    same lock/transaction — no separate commit here.
+    """
+    from sreda.services.audit import hash_admin_token
+    from sreda.services.tenant_lifecycle import soft_delete_tenant
+
+    changed = soft_delete_tenant(
+        session,
+        tenant_id,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        source="admin",
+    )
+    status = "ok" if changed else "noop"
+    return RedirectResponse(
+        url=f"/admin/users?soft_delete={status}&tenant={tenant_id}",
+        status_code=303,
+    )
+
+
+@router.post("/tenant/{tenant_id}/restore", response_class=HTMLResponse)
+async def admin_tenant_restore(
+    tenant_id: str,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """#187 Phase 4b-1 — restore a soft-deleted tenant (admin-only, A15).
+
+    Reverses ``admin_tenant_soft_delete``: clears ``deleted_at`` and cleans the
+    deletion window ``[deleted_at, restored_at]`` under the same advisory-lock
+    (see ``services.tenant_lifecycle.restore_tenant``). Same protection as every
+    other admin action (``require_admin_token``). The ``admin.tenant.restore``
+    audit row (A11) is written inside ``restore_tenant``, atomically with the
+    flag.
+    """
+    from sreda.services.audit import hash_admin_token
+    from sreda.services.tenant_lifecycle import restore_tenant
+
+    changed = restore_tenant(
+        session,
+        tenant_id,
+        actor_type="admin",
+        actor_id=hash_admin_token(token),
+        source="admin",
+    )
+    status = "ok" if changed else "noop"
+    return RedirectResponse(
+        url=f"/admin/users?restore={status}&tenant={tenant_id}",
         status_code=303,
     )

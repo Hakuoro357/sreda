@@ -49,9 +49,9 @@ Entity-specific logical_key recipes (Codex Sub-A10 R1 MAJOR #8):
     "дать лекарство" today and tomorrow are distinct.
     ``sha1(normalize_for_dedup(title), trigger_iso, recurrence_rule or "")``
     is the right shape.
-  - ``task_item``: include the scheduled date. Two "сходить на
+  - ``task``: include the scheduled date (+time). Two "сходить на
     тренировку" tasks on different days are distinct.
-    ``sha1(normalize_for_dedup(title), scheduled_date.isoformat() if scheduled_date else "")``.
+    ``sha1(normalize_for_dedup(title), scheduled_date.isoformat() if scheduled_date else "", time)``.
   - ``recipe``: ``normalize_for_dedup(title)`` is sufficient. Same
     recipe re-saved is a partial-duplicate by design.
   - ``checklist``: ``normalize_for_dedup(title)`` is sufficient.
@@ -173,6 +173,7 @@ def compute_normalized_title_hash(
     entity_type: str = "",
     tenant_id: str = "",
     user_id: str = "",
+    extra: str = "",
 ) -> str:
     """Compute the dedup-hash of a title.
 
@@ -201,13 +202,19 @@ def compute_normalized_title_hash(
     # Use \x1f (Unit Separator) between fields so values containing
     # ``|`` / ``:`` / spaces can't cross boundaries.
     sep = "\x1f"
-    payload = sep.join([
+    fields = [
         f"v{NORMALIZATION_VERSION}",
         entity_type,
         tenant_id,
         user_id,
         normalized,
-    ])
+    ]
+    # #163 Фаза 2а: time-aware семантический ключ (для напоминаний trigger+rrule, для задач
+    # date+time). Аппендим ТОЛЬКО если extra непуст → хеш title-only вызывающих (shopping) НЕ
+    # меняется (обратная совместимость; иначе сдвинулись бы существующие dedup-хеши).
+    if extra:
+        fields.append(extra)
+    payload = sep.join(fields)
     msg = payload.encode("utf-8")
     key = _get_hmac_key()
     if key:

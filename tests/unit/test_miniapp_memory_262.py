@@ -77,7 +77,7 @@ def seeded(client):
         SeedRepository(s).ensure_tenant_bundle(
             tenant_id="tenant_test", tenant_name="T", workspace_id="ws", workspace_name="W",
             user_id="user_test", telegram_account_id="352612382", assistant_id="as",
-            assistant_name="С", eds_monitor_enabled=False)
+            assistant_name="С")
         s.commit()
     finally:
         s.close()
@@ -111,7 +111,7 @@ def _seed_other_user_category() -> str:
         SeedRepository(s).ensure_tenant_bundle(
             tenant_id="tenant_other", tenant_name="O", workspace_id="wso", workspace_name="WO",
             user_id="user_other", telegram_account_id="999000", assistant_id="aso",
-            assistant_name="O", eds_monitor_enabled=False)
+            assistant_name="O")
         s.commit()
         cat = MemoryRepository(s).create_category("tenant_other", "user_other", "Чужая")
         s.commit()
@@ -263,7 +263,7 @@ def _seed_other_user_fact() -> str:
         SeedRepository(s).ensure_tenant_bundle(
             tenant_id="tenant_other", tenant_name="O", workspace_id="wso", workspace_name="WO",
             user_id="user_other", telegram_account_id="999000", assistant_id="aso",
-            assistant_name="O", eds_monitor_enabled=False)
+            assistant_name="O")
         s.commit()
         m = MemoryRepository(s).save("tenant_other", "user_other", tier="core",
                                      content="чужой факт", embedding=[0.5, 0.6])
