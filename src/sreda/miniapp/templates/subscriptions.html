@@ -2097,7 +2097,7 @@
               'value="' + escAttr(editName) + '" ' +
               'style="flex:1;min-width:0;border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:8px;' +
               'padding:8px 10px;font-size:15px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)">';
-      html += '<button class="btn btn-primary" onclick="window._submitMemoryCategory()" style="padding:8px 14px;flex-shrink:0">Сохранить</button>';
+      html += '<button id="mem-cat-save-btn" class="btn btn-primary" onclick="window._submitMemoryCategory()" style="padding:8px 14px;flex-shrink:0">Сохранить</button>';
       html += '<button class="btn btn-small" onclick="window._cancelMemoryEdit()" ' +
               'style="padding:8px 10px;flex-shrink:0;background:rgba(0,0,0,0.06)">Отмена</button>';
       html += '</div>';
@@ -2164,6 +2164,21 @@
       var delBtn = card.querySelector('button[data-mem-count]');
       if (delBtn) { delBtn.setAttribute("data-mem-count", (c.fact_count || 0)); }
     }
+  }
+  // #262: крутилка + блокировка кнопки на время async-запроса (фидбэк юзера: «Сохранить» без
+  // индикации → жмут несколько раз). На успехе форма убирается; на ошибке — восстанавливаем кнопку.
+  function _btnBusy(btn) {
+    if (!btn || btn.disabled) return false;
+    btn.disabled = true;
+    btn.setAttribute("data-label", btn.innerHTML);
+    btn.innerHTML = '<span class="spinner-small"></span>';
+    return true;
+  }
+  function _btnRestore(btn) {
+    if (!btn) return;
+    btn.disabled = false;
+    var lbl = btn.getAttribute("data-label");
+    if (lbl !== null) { btn.innerHTML = lbl; btn.removeAttribute("data-label"); }
   }
 
   // Тело раскрытой категории: факты по ярусам (lazy-load при первом раскрытии).
@@ -2330,6 +2345,8 @@
   };
 
   window._submitMemoryCategory = function() {
+    var saveBtn = document.getElementById("mem-cat-save-btn");
+    if (saveBtn && saveBtn.disabled) return;  // уже сохраняется
     var input = document.getElementById("mem-cat-name");
     var name = (input && input.value || "").trim();
     if (!name) return;
@@ -2340,6 +2357,7 @@
     var path = editing
       ? "/miniapp/api/v1/memory/categories/" + encodeURIComponent(editId)
       : "/miniapp/api/v1/memory/categories";
+    _btnBusy(saveBtn);
     apiFetch(path, { method: editing ? "PATCH" : "POST", body: { name: name } })
       .then(function(res) {
         if (res && (res.ok || res.category)) {
@@ -2373,14 +2391,18 @@
             render();
           }
         } else if (res && res.detail === "category_name_conflict") {
+          _btnRestore(saveBtn);
           showAlert("Категория с таким именем уже есть.");
         } else if (res && res.detail === "category_immutable") {
+          _btnRestore(saveBtn);
           showAlert("Категорию «Общее» нельзя изменить.");
         } else {
+          _btnRestore(saveBtn);
           showAlert("Не удалось сохранить категорию.");
         }
       })
       .catch(function(err) {
+        _btnRestore(saveBtn);
         if (err.message !== "auth_expired") showAlert("Не удалось сохранить категорию.");
       });
   };
@@ -2437,11 +2459,13 @@
   };
 
   window._saveMemoryFact = function(btn) {
+    if (btn && btn.disabled) return;  // уже сохраняется
     var ta = document.getElementById("fact-edit-input");
     var content = (ta && ta.value || "").trim();
     if (!content) return;
     var factId = btn.getAttribute("data-fact-id");
     var catId = btn.getAttribute("data-cat-id");
+    _btnBusy(btn);
     apiFetch("/miniapp/api/v1/memory/facts/" + encodeURIComponent(factId), {
       method: "PATCH", body: { content: content }
     }).then(function(res) {
@@ -2459,6 +2483,7 @@
         _factEditId = null;
         if (!_patchMemoryFactsBody(catId)) { render(); }  // только тело категории, без рефетча
       } else if (res && res.detail === "embedding_unavailable") {
+        _btnRestore(btn);
         showAlert("Поиск по памяти временно недоступен — правка не сохранена, попробуйте позже.");
       } else if (res && res.detail === "memory_not_found") {
         showAlert("Факт не найден — обновляю.");
@@ -2474,9 +2499,11 @@
         if (removedNf && cmf && typeof cmf.fact_count === "number" && cmf.fact_count > 0) { cmf.fact_count -= 1; }
         if (_patchMemoryFactsBody(catId)) { _patchMemoryCount(catId); } else { render(); }
       } else {
+        _btnRestore(btn);
         showAlert("Не удалось сохранить факт.");
       }
     }).catch(function(err) {
+      _btnRestore(btn);
       if (err.message !== "auth_expired") showAlert("Не удалось сохранить факт.");
     });
   };
