@@ -2417,6 +2417,26 @@ def _build_graph(llm: Any, all_tools: list, *,
         # ничего не добираем (scope остаётся web-only, productivity не просачивается).
         if preflight_enabled and (state.get("intent") in ("chat", "fact")):
             return {}
+        # #267 A4 (Борис: «роутер побеждает»): в EXECUTE-режиме (роутер решил раздел) guard НЕ
+        # восстанавливается в ЧУЖОЙ раздел — НЕ грузит семьи вне allowed и НЕ расширяет домены роутера
+        # (иначе откатил бы его решение: recipes снова открылся бы, Codex high MAJOR). Один retry: nudge
+        # «останься в разделе ИЛИ спроси пользователя», без авто-эскейпа домена. Мис-классификация роутера
+        # ловится Фазой C (лог расхождений) + ревью владельца, а не молчаливым расширением.
+        if state.get("router_allowed_read_domains") is not None:
+            _a4_attempted = list(state.get("guard_attempted_families") or [])
+            _a4_fam = _guard_family(_last_human_text(state["messages"]),
+                                    state.get("active_families"))
+            if _a4_fam and _a4_fam not in _a4_attempted:
+                _a4_attempted.append(_a4_fam)
+            _a4_doms = ", ".join(sorted(state.get("router_allowed_read_domains") or [])) or "—"
+            return {
+                "guard_attempted_families": _a4_attempted,
+                "guard_full_attempted": True,  # один retry; дальше route не вернёт guard (анти-петля)
+                "guard_nudge": (f"Запрос относится к разделу: {_a4_doms}. Используй его инструменты. "
+                                "Если цель пользователя в другом разделе — спроси, что именно он хочет, "
+                                "не отвечай «не умею»."),
+            }
+        # legacy/disabled (allowed=None): прежняя recovery (домен не фильтруется → escape безопасен).
         # догрузить семью + пометить пробованной + ТРАНЗИЕНТНЫЙ nudge (через состояние, НЕ
         # сообщением в истории) → обратно в chat. turn_pass_count инкрементит chat. Один retry
         # на семью; если после него модель снова откажет — route не вернёт guard (в attempted).
@@ -2450,12 +2470,9 @@ def _build_graph(llm: Any, all_tools: list, *,
             "guard_attempted_families": attempted,
             "guard_nudge": nudge,
         })
-        # #221 Ф3: в execute расширить allowed_READ ТОЛЬКО реально добранными семьями (R1 high: не всем active —
-        # иначе при classifier-only маршруте вернулись бы чужие read-инструменты). WRITE НЕ расширяем (write-гейт
-        # сохранён; guard-recovery read-safe — route не пускает сюда после wrote_unkeyed). None → no-op (disabled).
-        if state.get("router_allowed_read_domains") is not None and added:
-            update["router_allowed_read_domains"] = sorted(
-                set(state.get("router_allowed_read_domains") or []) | added)
+        # #267 A4: видение router_allowed_read_domains УБРАНО — в execute сюда уже не доходим (вышли по
+        # A4-ветке выше, «роутер побеждает»); в legacy allowed=None и видение всё равно было no-op. Так
+        # guard-recovery больше НЕ откатывает доменное решение роутера. (added — для active, не для доменов.)
         return update
 
     def stop(state: ReactState):
