@@ -2682,6 +2682,12 @@ _SUMMARY_MAX_CONCURRENCY = 2     # backpressure: не больше N перес�
 _SUMMARY_LLM_TIMEOUT_S = 20.0    # wall-clock на вызов пересказчика
 _SUMMARY_MIN_COVERED_MSGS = 6    # базовый триггер: меньше старого — не сворачиваем (числа уточнит шаг C)
 _SUMMARY_MSG_CAP = 2000          # потолок content одного сообщения во входе пересказчика (анти-дамп)
+# #232 шаг C: ЗАМОРОЗКА ПО РАЗМЕРУ. Пере-сжимаем (и делаем первую выжимку), только когда
+# len(выжимка) + len(сообщения вне выжимки) ≥ этого лимита. Иначе выжимка ЗАМОРОЖЕНА → префикс промпта
+# стабилен между ходами → кеш модели держится (цель эпика). Не по числу сообщений и не по времени —
+# только по размеру переписки (Борис 2026-06-30). Половина TOTAL_BUDGET_CHARS(20000): сворачиваем с
+# запасом, ДО того как #194 начнёт резать середину. Рост самой выжимки ограничен SUMMARY_MAX_CHARS (обрез).
+_SUMMARY_RECOMPACT_LIMIT_CHARS = 10000
 _SUMMARY_SEM = asyncio.Semaphore(_SUMMARY_MAX_CONCURRENCY)
 _SUMMARY_SYS = (
     "Ты сжимаешь СЕРЕДИНУ переписки пользователя с ассистентом в краткую выжимку для памяти. "
@@ -2821,6 +2827,13 @@ async def _run_post_turn_summary_inner(
         chunk = coverable[prev_n:]
         if not chunk:
             return
+        # #232 шаг C — ЗАМОРОЗКА ПО РАЗМЕРУ: пере-сжимаем (и делаем первую выжимку) ТОЛЬКО когда
+        # len(выжимка) + len(сообщения вне выжимки) ≥ лимита. Иначе выжимка заморожена → префикс промпта
+        # стабилен между ходами → кеш модели держится. Применяется и к первой выжимке (prev_text=""), и к
+        # пере-сжатию. «Сообщения вне выжимки» = messages[prev_n:] (всё после уже покрытого префикса).
+        _uncovered_chars = sum(len(_text_content(getattr(m, "content", ""))) for m in messages[prev_n:])
+        if len(prev_text) + _uncovered_chars < _SUMMARY_RECOMPACT_LIMIT_CHARS:
+            return  # суммарный размер ниже лимита — заморозка, не пере-сжимаем (стабильный префикс)
         summary_llm = get_chat_llm(provider=_SUMMARY_PROVIDER, temperature=0.3)
         if summary_llm is None:
             logger.info("react_summary: summarizer provider unavailable (%s)", _SUMMARY_PROVIDER)
