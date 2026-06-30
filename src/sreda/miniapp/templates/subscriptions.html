@@ -2080,28 +2080,28 @@
     html += '<div class="card-subtitle" style="margin-bottom:12px;line-height:1.4">' +
             'Что я о вас помню. Тапните категорию — внутри факты по ярусам; их можно править и удалять.</div>';
 
-    // Одно поле ввода: создание ИЛИ переименование (режим по _memEditId).
+    // Поле появляется ТОЛЬКО при переименовании (тап ✏️ на категории). Постоянного «Создать» нет —
+    // категории создаются голосом/текстом через бот (решение владельца); Common есть у всех всегда.
     var editing = _memEditId !== null;
-    var editName = "";
-    if (editing && state.memory && state.memory.categories) {
-      for (var k = 0; k < state.memory.categories.length; k++) {
-        if (state.memory.categories[k].id === _memEditId) { editName = state.memory.categories[k].name; break; }
-      }
-    }
-    html += '<div class="card" style="display:flex;gap:8px;align-items:center;padding:12px 14px">';
-    html += '<input id="mem-cat-name" type="text" maxlength="100" ' +
-            'onkeydown="if(event.key===\'Enter\')window._submitMemoryCategory()" ' +
-            'placeholder="' + (editing ? 'Новое имя' : 'Новая категория') + '" ' +
-            'value="' + escAttr(editName) + '" ' +
-            'style="flex:1;min-width:0;border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:8px;' +
-            'padding:8px 10px;font-size:15px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)">';
-    html += '<button class="btn btn-primary" onclick="window._submitMemoryCategory()" style="padding:8px 14px;flex-shrink:0">' +
-            (editing ? 'Сохранить' : 'Создать') + '</button>';
     if (editing) {
+      var editName = "";
+      if (state.memory && state.memory.categories) {
+        for (var k = 0; k < state.memory.categories.length; k++) {
+          if (state.memory.categories[k].id === _memEditId) { editName = state.memory.categories[k].name; break; }
+        }
+      }
+      html += '<div class="card" style="display:flex;gap:8px;align-items:center;padding:12px 14px">';
+      html += '<input id="mem-cat-name" type="text" maxlength="100" ' +
+              'onkeydown="if(event.key===\'Enter\')window._submitMemoryCategory()" ' +
+              'placeholder="Новое имя" ' +
+              'value="' + escAttr(editName) + '" ' +
+              'style="flex:1;min-width:0;border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:8px;' +
+              'padding:8px 10px;font-size:15px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)">';
+      html += '<button class="btn btn-primary" onclick="window._submitMemoryCategory()" style="padding:8px 14px;flex-shrink:0">Сохранить</button>';
       html += '<button class="btn btn-small" onclick="window._cancelMemoryEdit()" ' +
               'style="padding:8px 10px;flex-shrink:0;background:rgba(0,0,0,0.06)">Отмена</button>';
+      html += '</div>';
     }
-    html += '</div>';
 
     if (state.memory === null) { loadMemory(); return html + renderLoading(); }
     if (state.memory && state.memory._error) {
@@ -2181,7 +2181,7 @@
         '</div></div>';
     }
     return '<div class="card" style="display:flex;align-items:flex-start;gap:10px;background:var(--tg-theme-bg-color,#fff);border-radius:10px;padding:11px 12px;margin-bottom:8px">' +
-      '<div class="card-title" style="margin:0;flex:1;min-width:0;font-weight:normal;line-height:1.4">' +
+      '<div class="card-title" style="margin:0;flex:1;min-width:0;font-weight:normal;line-height:1.4;overflow-wrap:anywhere">' +
       escHtml(f.content) + '</div>' +
       '<button type="button" data-fact-id="' + escAttr(f.id) + '" onclick="window._editMemoryFact(this)" ' +
       'aria-label="Править факт" style="background:none;border:none;cursor:pointer;font-size:16px;padding:2px 4px">✏️</button>' +
