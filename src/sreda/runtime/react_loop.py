@@ -191,8 +191,26 @@ _MSK = timezone(timedelta(hours=3))  # МСК = UTC+3 круглый год; л�
 
 _MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
            "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-_YES = {"да", "ага", "угу", "удали", "удаляй", "подтверждаю", "yes", "верно", "точно"}
+_YES = {"да", "ага", "угу", "подтверждаю", "yes", "верно", "точно"}
+# #267 A0: командные глаголы «удали»/«удаляй» УБРАНЫ из _YES — на confirm-паузе свободный текст
+# «удали Y» больше НЕ читается как «да» (была инверсия намерения: удалял НЕ ТО — CRITICAL). Свободный
+# текст классифицируется в classify_confirm_reply (ниже); в граф идёт ТОЛЬКО канон «да»/«нет».
 # Решение строится на `not _is_yes(...)` (всё не-«да» = отказ — fail-closed для удаления).
+_NEGATE = {"нет", "неа", "отмена", "отменить", "не надо", "не нужно"}
+
+
+def classify_confirm_reply(text: str) -> str:
+    """#267 A0: классификация СВОБОДНОГО ТЕКСТА юзера на confirm-паузе → "affirm"|"negate"|"redirect".
+    affirm — ТОЛЬКО строгий аффирматив (ТОЧНОЕ совпадение, БЕЗ командных глаголов): иначе «удали Y»
+    прочлось бы как «да» → удаление НЕ ТОГО (CRITICAL). negate — отмена. Всё прочее (вкл. «удали…»,
+    новое намерение) → redirect (Фаза B авто-переключит раздел; A0 безопасно трактует redirect как отказ).
+    Зовётся в handle_turn ДО Command(resume) — в граф идёт только канон «да»/«нет»."""
+    t = (text or "").strip().lower().rstrip("!.?")
+    if t in _YES:
+        return "affirm"
+    if t in _NEGATE:
+        return "negate"
+    return "redirect"
 
 # #166 Срез B: подтверждения Да/Нет кнопками. confirm-пауза несёт СТРУКТУРНЫЙ value
 # {"confirm": "<вопрос>"} (ask_human — обычная строка), чтобы канал прикрепил [Да][Нет].
@@ -2970,7 +2988,16 @@ async def handle_turn(
                 return _Reply("")
 
         if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
-            result = await graph.ainvoke(Command(resume=user_text), _cfg(gen))
+            # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
+            # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
+            # уже шлёт канон (confirm_resume_text). ask_human (не confirm) — текст-ответ как есть.
+            # redirect → A0 трактует «нет» (безопасный отказ; авто-переключение раздела — Фаза B).
+            _resume_val = user_text
+            if not resume_only:
+                _, _is_confirm_pause, _ = _pending(snap)
+                if _is_confirm_pause:
+                    _resume_val = "да" if classify_confirm_reply(user_text) == "affirm" else "нет"
+            result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
             if _has_pause(snap):  # протухшая пауза → гасим
                 # #193: ВКЛ durable → ключ стабилен, паузу гасим ЯВНО (clear_pending: drop
