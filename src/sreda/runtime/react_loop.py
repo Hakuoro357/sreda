@@ -1101,6 +1101,37 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
     return out
 
 
+def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any) -> str:
+    """#267 A: структурная причина недоступности инструмента — ЕДИНЫЙ источник для pre-scan,
+    need_family-handler и unavailable-dispatch. Различает «семья не загружена» (нужен need_family) от
+    «домен вне запроса» (need_family НЕ поможет). Закрывает trap: раньше need_family врал «загружена»,
+    а доменный фильтр резал заново → планировщик долбился в стену до лимита проходов. Возвращает:
+    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available."""
+    from sreda.services.tool_schemas.families import (
+        TOOL_OP_CLASS, tool_read_domains, tool_write_domains,
+    )
+    if name == "need_family":
+        fam = (args or {}).get("family")
+        if not isinstance(fam, str) or fam not in _LAZY_FAMILIES:
+            return "unknown_family"
+        if allowed_read is None and allowed_write is None:
+            return "available"  # домен не фильтруется (legacy/disabled) → семью грузить можно
+        # семья-раздел вне разрешённых доменов → её инструменты всё равно зарежет _apply_domain_policy
+        if fam not in set(allowed_read or ()) and fam not in set(allowed_write or ()):
+            return "domain_blocked"
+        return "available"
+    canon = _TOOL_NAME_ALIASES.get(name, name)
+    if canon not in TOOL_OP_CLASS:  # неизвестный/галлюцинированный инструмент → НЕ KeyError на tool_*_domains
+        return "unknown_tool"
+    if allowed_read is None and allowed_write is None:
+        return "family_not_loaded"  # домен не фильтруется → недоступность = семья не загружена
+    if not (tool_read_domains(canon) <= set(allowed_read or ())):
+        return "domain_blocked"
+    if not (tool_write_domains(canon) <= set(allowed_write or ())):
+        return "domain_blocked"
+    return "family_not_loaded"  # домен ок → недоступен значит семья ещё не в active
+
+
 # #165 Срез A guard — детерминированный backstop «не отказать молчаливо».
 # ЛИМИТ ПРОХОДОВ chat/ход (анти-петля для ВСЕГО цикла, не только guard): при достижении
 # route → стоп-узел (грациозный выход), НЕ дожидаясь recursion_limit (тот — внешний нет
@@ -2208,7 +2239,13 @@ def _build_graph(llm: Any, all_tools: list, *,
             for _ptc in state["messages"][-1].tool_calls:
                 if _ptc.get("name") == "need_family":
                     _pf = (_ptc.get("args") or {}).get("family")
-                    if isinstance(_pf, str) and _pf in _LAZY_FAMILIES and _pf not in active:
+                    # #267 A: НЕ грузим домен-заблокированную семью в active (иначе протекает в state +
+                    # планировщик думает «загрузил», а доменный фильтр режет → trap).
+                    if (isinstance(_pf, str) and _pf in _LAZY_FAMILIES and _pf not in active
+                            and _tool_unavailable_reason(
+                                "need_family", {"family": _pf},
+                                state.get("router_allowed_read_domains"),
+                                state.get("router_allowed_write_domains")) != "domain_blocked"):
                         active.append(_pf)
                         added = True
         bound_by_name = {t.name: t for t in _apply_domain_policy(
@@ -2243,26 +2280,47 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # может галлюцинировать «utility»/«tasks»/мусор ИЛИ не-строку list/dict →
                 # `in frozenset` на unhashable дал бы TypeError → «потеряла контекст»; потому
                 # isinstance(str) ПЕРВЫМ). Невалидное → НЕ грузим, честная ошибка.
-                if isinstance(fam, str) and fam in _LAZY_FAMILIES:
+                _far = state.get("router_allowed_read_domains")
+                _faw = state.get("router_allowed_write_domains")
+                # #267 A: domain_blocked → честный отказ (НЕ «загружена ok» — иначе планировщик думает,
+                # что загрузил, а доменный фильтр режет заново → trap). Семью НЕ грузим.
+                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw)
+                if _nreason == "domain_blocked":
+                    _avail = ", ".join(sorted(set(_far or []) | set(_faw or []))) or "—"
+                    msg = (f"Раздел «{fam}» не относится к этому запросу (он про: {_avail}). "
+                           "Если цель в другом разделе — уточни у пользователя.")
+                    _rk = "domain_blocked"  # #192: не-исполнение, честно
+                elif _nreason == "unknown_family":
+                    msg = (f"Семья «{fam}» неизвестна. Доступные для добора: "
+                           + ", ".join(sorted(_LAZY_FAMILIES)) + ".")
+                    _rk = "unknown_family"  # #192: не-исполнение, НЕ успех вслепую
+                else:
                     if fam not in active:
                         active.append(fam)
                         added = True
                     msg = f"Семья «{fam}» загружена."
                     _rk = "ok"
-                else:
-                    msg = (f"Семья «{fam}» неизвестна. Доступные для добора: "
-                           + ", ".join(sorted(_LAZY_FAMILIES)) + ".")
-                    _rk = "unknown_family"  # #192: не-исполнение, НЕ успех вслепую
                 out.append(ToolMessage(content=msg, name=name, tool_call_id=tc["id"],
                                        artifact={"result_kind": _rk}))
                 continue
             tool_obj = bound_by_name.get(name)
             if tool_obj is None:
+                # #267 A: различаем «семья не загружена» (нужен need_family) от «раздел вне запроса»
+                # (need_family НЕ поможет — иначе trap: планировщик долбится в need_family по кругу).
+                _ufar = state.get("router_allowed_read_domains")
+                _ufaw = state.get("router_allowed_write_domains")
+                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw)
+                if _ureason == "domain_blocked":
+                    _uavail = ", ".join(sorted(set(_ufar or []) | set(_ufaw or []))) or "—"
+                    _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
+                             "need_family здесь не поможет. Если нужная цель в другом разделе — "
+                             "спроси у пользователя, что он имеет в виду.")
+                else:
+                    _umsg = (f"Инструмент {name} сейчас недоступен — сначала позови "
+                             "need_family нужной семьи.")
                 out.append(ToolMessage(
-                    content=(f"Инструмент {name} сейчас недоступен — сначала позови "
-                             "need_family нужной семьи."),
-                    name=name, tool_call_id=tc["id"],
-                    artifact={"result_kind": "unavailable"}))  # #192: не-исполнение
+                    content=_umsg, name=name, tool_call_id=tc["id"],  # #192: не-исполнение
+                    artifact={"result_kind": "domain_blocked" if _ureason == "domain_blocked" else "unavailable"}))
                 continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
