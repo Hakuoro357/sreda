@@ -77,9 +77,9 @@ from sreda.services.tool_schemas.specs_web import (
 
 
 def test_memory_specs_construct() -> None:
-    assert len(MEMORY_SPECS) == 3
+    assert len(MEMORY_SPECS) == 4
     assert {s.name for s in MEMORY_SPECS} == {
-        "save_core_fact", "save_episode", "recall_memory",
+        "save_core_fact", "create_memory_category", "save_episode", "recall_memory",
     }
 
 
@@ -111,7 +111,7 @@ def test_all_four_families_pass_quality_strict() -> None:
 
 def test_manifest_matches_specs() -> None:
     for family, expected in [
-        ("memory", {"save_core_fact", "save_episode", "recall_memory"}),
+        ("memory", {"save_core_fact", "create_memory_category", "save_episode", "recall_memory"}),
         ("utility", {"log_unsupported_request"}),
         ("ui", {"reply_with_buttons"}),
         ("web", {"get_weather", "web_search", "fetch_url"}),
@@ -731,12 +731,12 @@ def test_typeadapter_rejects_sentinel() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_migrated_count_is_56() -> None:
+def test_migrated_count_is_57() -> None:
     """Sub-A4 closure: every housewife + cross-skill tool typed.
-    #143 Phase B добавил list_checklist_items → 56."""
+    #143 Phase B добавил list_checklist_items → 56; #262b create_memory_category → 57."""
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
-    assert len(MIGRATED_TOOL_SPECS) == 56, (
-        f"Expected 56 typed ToolSpec, got {len(MIGRATED_TOOL_SPECS)}. "
+    assert len(MIGRATED_TOOL_SPECS) == 57, (
+        f"Expected 57 typed ToolSpec, got {len(MIGRATED_TOOL_SPECS)}. "
         f"Sub-A4 migration target was 100% — recount expected after "
         f"manifest changes."
     )

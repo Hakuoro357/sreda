@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.housewife import (
+    CreateMemoryCategoryOutput,
     RecallMemoryOutput,
     SaveCoreFactOutput,
     SaveEpisodeOutput,
@@ -63,6 +64,15 @@ keywords («ткани характеристики», «дети возраст
 500 char cap covers typical query lengths."""
 
 
+CategoryName = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
+]
+"""#262b: имя пользовательской категории памяти. 100 — как лимит мини-аппа
+(DB String(120), запас). Нормализация/уникальность — в repo (normalize_for_dedup);
+«Общее» зарезервировано за системной Common."""
+
+
 # ---------------------------------------------------------------------------
 # Input models
 # ---------------------------------------------------------------------------
@@ -77,6 +87,16 @@ class SaveCoreFactInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     content: CoreFactContent
+    # #262b: опц. имя категории. Задано → факт кладётся в неё (создаётся, если нет); иначе в «Общее».
+    category: CategoryName | None = None
+
+
+class CreateMemoryCategoryInput(BaseModel):
+    """#262b: создать пользовательскую категорию памяти по явной команде
+    («заведи/создай категорию X»). Имя «Общее» зарезервировано → вернётся ошибка."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: CategoryName
 
 
 class SaveEpisodeInput(BaseModel):
@@ -118,8 +138,11 @@ SAVE_CORE_FACT_SPEC = ToolSpec(
         "предпочтения) — то, что будет верно и через год. Настроение "
         "и transient-события → save_episode. Запись НЕ дедуплицирует "
         "— каждый вызов вставляет строку (дедуп только при recall); "
-        "не вызывай повторно «на всякий случай». Возвращает "
-        "saved_core:<memory_id>."
+        "не вызывай повторно «на всякий случай». Параметр category "
+        "(опц.) — имя категории, куда положить факт (создаётся, если "
+        "нет); используй ТОЛЬКО когда юзер ЯВНО назвал категорию "
+        "(«запомни в категорию X»); иначе НЕ передавай — факт уйдёт в "
+        "«Общее». Возвращает saved_core:<memory_id>."
     ),
     family="memory",
     effect="write",
@@ -136,6 +159,38 @@ SAVE_CORE_FACT_SPEC = ToolSpec(
     mutex_notes=[
         "ТОЛЬКО для стабильных фактов. Для recent events / mood → save_episode.",
         "Runtime НЕ дедупит save-time — каждый вызов = новая строка. НЕ вызывай повторно по тому же факту.",
+    ],
+    timeout_seconds=15,
+    side_effect_class="transactional_write",
+)
+
+
+CREATE_MEMORY_CATEGORY_SPEC = ToolSpec(
+    name="create_memory_category",
+    description=(
+        "Создать новую пользовательскую категорию памяти по ЯВНОЙ "
+        "команде юзера («заведи/создай категорию X», «новая категория "
+        "— X», «сделай раздел X»). Имя «Общее» зарезервировано за "
+        "системной категорией — вернёт ошибку. Если категория уже есть "
+        "— вернёт «уже есть». Чтобы СРАЗУ положить факт в категорию, "
+        "не обязательно звать это — у save_core_fact есть параметр "
+        "category (он сам создаст). Возвращает created:<id>:<name>."
+    ),
+    family="memory",
+    effect="write",
+    read_domains=[],
+    write_domains=["memory"],
+    input_model=CreateMemoryCategoryInput,
+    output_model=CreateMemoryCategoryOutput,
+    trigger_examples=[
+        "заведи категорию машина",
+        "создай категорию работа",
+        "новая категория — здоровье",
+        "сделай раздел путешествия",
+    ],
+    mutex_notes=[
+        "ТОЛЬКО по явной команде создать категорию. Запомнить факт В категорию → save_core_fact(category=...).",
+        "«Общее» нельзя создать — зарезервировано за системной категорией.",
     ],
     timeout_seconds=15,
     side_effect_class="transactional_write",
@@ -211,6 +266,7 @@ RECALL_MEMORY_SPEC = ToolSpec(
 
 MEMORY_SPECS: list[ToolSpec] = [
     SAVE_CORE_FACT_SPEC,
+    CREATE_MEMORY_CATEGORY_SPEC,
     SAVE_EPISODE_SPEC,
     RECALL_MEMORY_SPEC,
 ]

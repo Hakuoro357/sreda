@@ -489,6 +489,7 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "reply_with_buttons": "ui",
     # ---- memory (3) -------------------------------------------------------
     "save_core_fact": "memory",
+    "create_memory_category": "memory",
     "save_episode": "memory",
     "recall_memory": "memory",
     # ---- utility (1) ------------------------------------------------------
@@ -560,6 +561,7 @@ TOOL_OP_CLASS: Final[Mapping[str, str]] = MappingProxyType({
     "onboarding_answered": "write", "onboarding_deferred": "write", "onboarding_complete": "write",
     "reply_with_buttons": "write",   # ToolSpec.effect=write (write_domains=ui); не в ReAct-наборе — скоуп моот
     "save_core_fact": "write", "save_episode": "write", "recall_memory": "read_pure",
+    "create_memory_category": "write",
     "log_unsupported_request": "write",  # ToolSpec.effect=write (write_domains=utility); не в ReAct-наборе
     "get_weather": "read_external", "web_search": "read_external", "fetch_url": "read_external",
 })

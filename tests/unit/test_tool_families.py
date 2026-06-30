@@ -638,7 +638,7 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
         "onboarding_complete",
     }),
     "ui": frozenset({"reply_with_buttons"}),
-    "memory": frozenset({"save_core_fact", "save_episode", "recall_memory"}),
+    "memory": frozenset({"save_core_fact", "create_memory_category", "save_episode", "recall_memory"}),
     "utility": frozenset({"log_unsupported_request"}),
     "web": frozenset({"get_weather", "web_search", "fetch_url"}),
 }
@@ -663,12 +663,12 @@ def test_manifest_exact_tool_set_per_family(
     )
 
 
-def test_manifest_total_size_is_58() -> None:
-    # 7+4+6+5+4+11+10+3+1+3+1+3 = 58. #143 Phase B добавил
+def test_manifest_total_size_is_59() -> None:
+    # 7+4+6+5+4+11+10+3+1+4+1+3 = 59. #143 Phase B добавил
     # list_checklist_items (checklists 8→9, итог 55→56). #210 добавил
     # update_recipe (recipes 5→6) и update_checklist_item (checklists 9→10),
-    # оба ReAct-only — итог 56→58.
-    assert len(TOOL_FAMILY_MANIFEST) == 58
+    # оба ReAct-only — итог 56→58. #262b create_memory_category (memory 3→4) → 59.
+    assert len(TOOL_FAMILY_MANIFEST) == 59
 
 
 def test_react_only_tools_are_in_manifest() -> None:

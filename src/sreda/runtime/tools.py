@@ -28,8 +28,13 @@ from collections.abc import Callable
 from langchain_core.tools import tool as lc_tool
 from sqlalchemy.orm import Session
 
-from sreda.db.repositories.memory import MemoryRepository
+from sreda.db.repositories.memory import (
+    COMMON_NAME_NORMALIZED,
+    CategoryNameConflict,
+    MemoryRepository,
+)
 from sreda.services.embeddings import EmbeddingClient
+from sreda.services.text_normalization import normalize_for_dedup
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +90,23 @@ def build_memory_tools(
     from the same turn."""
     repo = MemoryRepository(session)
 
+    def _resolve_or_create_category(name: str) -> str | None:
+        """#262b: id категории по имени для (tenant,user) — существующая ИЛИ создать новую.
+        «Общее» (по нормализации) → системная Common. Пусто → None (= «Общее» дефолтом в save())."""
+        nm = (name or "").strip()
+        if not nm:
+            return None
+        norm = normalize_for_dedup(nm)
+        if norm == COMMON_NAME_NORMALIZED:
+            return repo.ensure_common(tenant_id, user_id)
+        for c in repo.list_categories(tenant_id, user_id):
+            if c.name_normalized == norm:
+                return c.id
+        cat = repo.create_category(tenant_id, user_id, nm)
+        return cat.id
+
     @lc_tool
-    def save_core_fact(content: str) -> str:
+    def save_core_fact(content: str, category: str | None = None) -> str:
         """Save a stable long-term fact about the user (core memory tier).
 
         Use ONLY for durable truths that will remain valid across sessions
@@ -96,11 +116,16 @@ def build_memory_tools(
         Args:
             content: the fact in a single concise sentence, preserving
                 the user's own wording where possible.
+            category: optional category NAME. Pass it ONLY when the user
+                explicitly named a category to put this fact in («запомни
+                в категорию X»); it is created if missing. Omit otherwise —
+                the fact goes to the default «Общее» category.
         """
         text = (content or "").strip()
         if not text:
             return "error: empty content"
         _log_memory_date_drift(text, "save_core_fact", tenant_id, user_id)
+        category_id = _resolve_or_create_category(category) if category else None
         try:
             embedding = embedding_client.embed_document(text)
         except Exception as exc:  # noqa: BLE001
@@ -113,9 +138,34 @@ def build_memory_tools(
             content=text,
             embedding=embedding,
             source="agent_inferred",
+            category_id=category_id,
         )
         session.commit()
         return f"saved_core:{row.id}"
+
+    @lc_tool
+    def create_memory_category(name: str) -> str:
+        """Create a new user memory category by an EXPLICIT user command
+        («заведи/создай категорию X»). «Общее» is reserved for the system
+        default category. Returns ``created:<id>:<name>`` on success, or a
+        human-readable ``error: …`` the agent must relay honestly.
+
+        Args:
+            name: the category name in the user's wording.
+        """
+        display = (name or "").strip()
+        if not display:
+            return "error: пустое имя категории"
+        if normalize_for_dedup(display) == COMMON_NAME_NORMALIZED:
+            return "error: имя «Общее» зарезервировано за системной категорией"
+        try:
+            cat = repo.create_category(tenant_id, user_id, display)
+        except CategoryNameConflict:
+            return f"error: категория «{display}» уже есть"
+        except ValueError:
+            return "error: некорректное имя категории"
+        session.commit()
+        return f"created:{cat.id}:{cat.name}"
 
     @lc_tool
     def save_episode(summary: str) -> str:
@@ -297,6 +347,7 @@ def build_memory_tools(
 
     tools_list: list[Callable] = [
         save_core_fact,
+        create_memory_category,
         save_episode,
         recall_memory,
         weather_tool,
