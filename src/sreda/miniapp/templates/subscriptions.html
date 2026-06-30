@@ -2090,7 +2090,7 @@
           if (state.memory.categories[k].id === _memEditId) { editName = state.memory.categories[k].name; break; }
         }
       }
-      html += '<div class="card" style="display:flex;gap:8px;align-items:center;padding:12px 14px">';
+      html += '<div class="card" id="mem-edit-form" style="display:flex;gap:8px;align-items:center;padding:12px 14px">';
       html += '<input id="mem-cat-name" type="text" maxlength="100" ' +
               'onkeydown="if(event.key===\'Enter\')window._submitMemoryCategory()" ' +
               'placeholder="Новое имя" ' +
@@ -2111,17 +2111,17 @@
     for (var i = 0; i < cats.length; i++) {
       var c = cats[i];
       var expanded = !!state.memExpanded[c.id];
-      html += '<div class="card" style="padding:0;overflow:hidden">';
+      html += '<div class="card" id="memcat-' + escAttr(c.id) + '" style="padding:0;overflow:hidden">';
       // Шапка категории: тап по названию раскрывает/сворачивает (id в data-attr, не в inline-строке — R-31).
       // Индикатор открытости: раскрытая категория подсвечена фоном + развёрнутый шеврон.
       html += '<div style="display:flex;align-items:center;gap:8px;padding:12px 14px' +
               (expanded ? ';background:var(--tg-theme-secondary-bg-color,#e7ebf0)' : '') + '">';
       html += '<div data-mem-id="' + escAttr(c.id) + '" onclick="window._toggleMemoryCategory(this)" ' +
               'style="flex:1;min-width:0;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px">';
-      html += '<div class="card-title" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' +
+      html += '<div class="card-title" id="memtitle-' + escAttr(c.id) + '" style="margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' +
               (expanded ? ';font-weight:600' : '') + '">' + escHtml(c.name) + '</div>';
-      html += '<div class="card-subtitle" style="margin:0;flex-shrink:0">' + (c.fact_count || 0) +
-              ' <span class="chevron" style="display:inline-block;font-size:15px;transition:transform .15s;' +
+      html += '<div class="card-subtitle" style="margin:0;flex-shrink:0"><span id="memcount-' + escAttr(c.id) + '">' + (c.fact_count || 0) +
+              '</span> <span class="chevron" style="display:inline-block;font-size:15px;transition:transform .15s;' +
               (expanded ? 'transform:rotate(90deg)' : '') + '">▸</span></div>';
       html += '</div>';
       if (!c.is_system) {
@@ -2134,10 +2134,36 @@
                 'color:var(--tg-theme-destructive-text-color,#e53935)">🗑️</button>';
       }
       html += '</div>';
-      if (expanded) { html += _memoryFactsBodyHtml(c.id); }
+      if (expanded) { html += '<div id="memfacts-' + escAttr(c.id) + '">' + _memoryFactsBodyHtml(c.id) + '</div>'; }
       html += '</div>';
     }
     return html;
+  }
+
+  // #262: точечные обновления DOM без полной перерисовки/рефетча (фидбэк юзеров: правка/удаление
+  // не должны «перезагружать» интерфейс — мелькание спиннера + прыжок скролла). На УСПЕХЕ мутации
+  // правим кэш на месте и перерисовываем только затронутый узел; полный render() остаётся фолбэком.
+  function _memCat(catId) {
+    var cats = (state.memory && state.memory.categories) || [];
+    for (var i = 0; i < cats.length; i++) { if (cats[i].id === catId) return cats[i]; }
+    return null;
+  }
+  function _patchMemoryFactsBody(catId) {
+    var el = document.getElementById("memfacts-" + catId);
+    if (el) { el.innerHTML = _memoryFactsBodyHtml(catId); return true; }
+    return false;
+  }
+  function _patchMemoryCount(catId) {
+    var c = _memCat(catId);
+    if (!c) return;
+    var el = document.getElementById("memcount-" + catId);
+    if (el) { el.textContent = (c.fact_count || 0); }
+    // синхронизируем data-mem-count на кнопке удаления категории, иначе stale confirm_count → 409 → рефетч (R2)
+    var card = document.getElementById("memcat-" + catId);
+    if (card) {
+      var delBtn = card.querySelector('button[data-mem-count]');
+      if (delBtn) { delBtn.setAttribute("data-mem-count", (c.fact_count || 0)); }
+    }
   }
 
   // Тело раскрытой категории: факты по ярусам (lazy-load при первом раскрытии).
@@ -2307,16 +2333,45 @@
     var input = document.getElementById("mem-cat-name");
     var name = (input && input.value || "").trim();
     if (!name) return;
-    var editing = _memEditId !== null;
+    // Захват состояния ДО запроса: _memEditId — изменяемое UI-состояние, юзер может начать
+    // переименовывать другую категорию до прихода ответа (ревью R1 Codex medium).
+    var editId = _memEditId;
+    var editing = editId !== null;
     var path = editing
-      ? "/miniapp/api/v1/memory/categories/" + encodeURIComponent(_memEditId)
+      ? "/miniapp/api/v1/memory/categories/" + encodeURIComponent(editId)
       : "/miniapp/api/v1/memory/categories";
     apiFetch(path, { method: editing ? "PATCH" : "POST", body: { name: name } })
       .then(function(res) {
         if (res && (res.ok || res.category)) {
-          _memEditId = null;
-          state.memory = null;  // перезагрузить список
-          render();
+          var rc = editing ? _memCat(editId) : null;
+          if (rc) {
+            var newName = (res.category && res.category.name) || name;
+            rc.name = newName;
+            var titleEl = document.getElementById("memtitle-" + editId);
+            if (titleEl) {
+              // in-place: правим заголовок + data-mem-name кнопки удаления, без полной перерисовки (R2)
+              titleEl.textContent = newName;
+              var card = document.getElementById("memcat-" + editId);
+              if (card) {
+                var delBtn = card.querySelector('button[data-mem-name]');
+                if (delBtn) { delBtn.setAttribute("data-mem-name", newName); }
+              }
+              if (_memEditId === editId) {
+                // юзер не начал править другую категорию → убираем форму этой правки
+                _memEditId = null;
+                var formEl = document.getElementById("mem-edit-form");
+                if (formEl && formEl.parentNode) { formEl.parentNode.removeChild(formEl); }
+              }
+              // если _memEditId !== editId — форма уже принадлежит НОВОЙ правке, не трогаем её черновик
+            } else {
+              if (_memEditId === editId) { _memEditId = null; }
+              render();  // узел заголовка не найден — фолбэк
+            }
+          } else {
+            if (_memEditId === editId) { _memEditId = null; }
+            state.memory = null;  // create или разошёлся кэш — ресинк
+            render();
+          }
         } else if (res && res.detail === "category_name_conflict") {
           showAlert("Категория с таким именем уже есть.");
         } else if (res && res.detail === "category_immutable") {
@@ -2344,10 +2399,14 @@
       ).then(function(res) {
         if (res && res.ok) {
           _memEditId = null;
+          _factEditId = null;   // факт удаляемой категории мог быть в режиме правки (ревью R1)
           delete state.memoryFacts[id];   // чистим кэш фактов удалённой категории (ревью B)
           delete state.memExpanded[id];
-          state.memory = null;
-          render();
+          if (state.memory && state.memory.categories) {
+            state.memory.categories = state.memory.categories.filter(function(cc) { return cc.id !== id; });
+          }
+          var node = document.getElementById("memcat-" + id);
+          if (node && node.parentNode) { node.parentNode.removeChild(node); } else { render(); }
         } else if (res && res.detail === "confirm_count_mismatch") {
           showAlert("Список фактов изменился — обновляю.");
           state.memory = null;
@@ -2387,16 +2446,33 @@
       method: "PATCH", body: { content: content }
     }).then(function(res) {
       if (res && (res.ok || res.fact)) {
+        var data = state.memoryFacts[catId];
+        if (data && data.facts) {
+          for (var i = 0; i < data.facts.length; i++) {
+            if (data.facts[i].id === factId) {
+              data.facts[i].content = (res.fact && res.fact.content) || content;
+              if (res.fact && res.fact.tier) { data.facts[i].tier = res.fact.tier; }
+              break;
+            }
+          }
+        }
         _factEditId = null;
-        delete state.memoryFacts[catId];  // перезагрузить факты категории (текст изменился)
-        render();
+        if (!_patchMemoryFactsBody(catId)) { render(); }  // только тело категории, без рефетча
       } else if (res && res.detail === "embedding_unavailable") {
         showAlert("Поиск по памяти временно недоступен — правка не сохранена, попробуйте позже.");
       } else if (res && res.detail === "memory_not_found") {
         showAlert("Факт не найден — обновляю.");
         _factEditId = null;
-        delete state.memoryFacts[catId];
-        render();
+        var dmf = state.memoryFacts[catId];
+        var removedNf = false;
+        if (dmf && dmf.facts) {
+          var beforeNf = dmf.facts.length;
+          dmf.facts = dmf.facts.filter(function(f) { return f.id !== factId; });
+          removedNf = dmf.facts.length !== beforeNf;  // минус только при фактическом удалении (R1)
+        }
+        var cmf = _memCat(catId);
+        if (removedNf && cmf && typeof cmf.fact_count === "number" && cmf.fact_count > 0) { cmf.fact_count -= 1; }
+        if (_patchMemoryFactsBody(catId)) { _patchMemoryCount(catId); } else { render(); }
       } else {
         showAlert("Не удалось сохранить факт.");
       }
@@ -2412,15 +2488,18 @@
       apiFetch("/miniapp/api/v1/memory/facts/" + encodeURIComponent(factId), {
         method: "DELETE"
       }).then(function(res) {
-        if (res && res.ok) {
+        if ((res && res.ok) || (res && res.detail === "memory_not_found")) {
           _factEditId = null;
-          delete state.memoryFacts[catId];  // перезагрузить факты + счётчик категории
-          state.memory = null;
-          render();
-        } else if (res && res.detail === "memory_not_found") {
-          delete state.memoryFacts[catId];
-          state.memory = null;
-          render();
+          var data = state.memoryFacts[catId];
+          var removed = false;
+          if (data && data.facts) {
+            var before = data.facts.length;
+            data.facts = data.facts.filter(function(f) { return f.id !== factId; });
+            removed = data.facts.length !== before;  // минусуем счётчик только если реально убрали (анти-дубль, R1)
+          }
+          var c = _memCat(catId);
+          if (removed && c && typeof c.fact_count === "number" && c.fact_count > 0) { c.fact_count -= 1; }
+          if (_patchMemoryFactsBody(catId)) { _patchMemoryCount(catId); } else { render(); }
         } else {
           showAlert("Не удалось удалить факт.");
         }
