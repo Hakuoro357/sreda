@@ -2169,7 +2169,7 @@
   // Карточка факта: текст + ✏️/🗑️; в режиме правки (_factEditId) — textarea + Сохранить/Отмена.
   function _memoryFactCardHtml(f, catId) {
     if (_factEditId === f.id) {
-      return '<div class="card" style="display:block">' +
+      return '<div class="card" style="display:block;background:var(--tg-theme-bg-color,#fff);border-radius:10px;padding:11px 12px;margin-bottom:8px">' +
         '<textarea id="fact-edit-input" maxlength="2000" rows="3" ' +
         'style="width:100%;box-sizing:border-box;border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:8px;' +
         'padding:8px;font-size:15px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000);resize:vertical">' +
@@ -2180,7 +2180,7 @@
         'onclick="window._saveMemoryFact(this)" style="padding:6px 12px">Сохранить</button>' +
         '</div></div>';
     }
-    return '<div class="card" style="display:flex;align-items:flex-start;gap:8px">' +
+    return '<div class="card" style="display:flex;align-items:flex-start;gap:10px;background:var(--tg-theme-bg-color,#fff);border-radius:10px;padding:11px 12px;margin-bottom:8px">' +
       '<div class="card-title" style="margin:0;flex:1;min-width:0;font-weight:normal;line-height:1.4">' +
       escHtml(f.content) + '</div>' +
       '<button type="button" data-fact-id="' + escAttr(f.id) + '" onclick="window._editMemoryFact(this)" ' +
