@@ -25,18 +25,54 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.checklists import Checklist, ChecklistItem
 from sreda.db.models.housewife import FamilyReminder
-from sreda.db.models.memory import AssistantMemory
+from sreda.db.models.memory import AssistantMemory, MemoryCategory
 from sreda.services.embeddings import cosine_similarity
+from sreda.services.text_normalization import normalize_for_dedup
 
 logger = logging.getLogger(__name__)
 
 
 MEMORY_TIERS = frozenset({"core", "episodic"})
 MEMORY_SOURCES = frozenset({"user_direct", "agent_inferred", "system"})
+
+# #262: системная категория «Common» — дом по умолчанию, неизменяема.
+COMMON_SLUG = "common"
+COMMON_DISPLAY_NAME = "Общее"
+# Зарезервированная норма имени Common (= normalize_for_dedup("Общее") = "общий"). Считаем один раз.
+# create_category/rename_category отвергают это имя ВСЕГДА (даже до создания Common) — иначе юзер «украл» бы
+# имя и последующий ensure_common упал бы на uq_memory_categories_name (R2 дыра порядка). Миграция 0058
+# держит замороженный литерал + дрейф-тест (не импортит эту константу — историческая стабильность).
+COMMON_NAME_NORMALIZED = normalize_for_dedup(COMMON_DISPLAY_NAME)
+
+
+class MemoryCategoryError(Exception):
+    """База для ошибок операций над категориями (API-слой маппит в 4xx)."""
+
+
+class CategoryNameConflict(MemoryCategoryError):
+    """Имя категории дублирует существующее (по name_normalized) → 409."""
+
+
+class CategoryNotFound(MemoryCategoryError):
+    """Категория не существует у этого (tenant,user) → 404 (напр. явный category_id в save())."""
+
+
+class CategoryImmutable(MemoryCategoryError):
+    """Попытка переименовать/удалить системную Common → 409."""
+
+
+class CategoryConfirmMismatch(MemoryCategoryError):
+    """confirm_count не совпал с фактическим числом фактов (набор изменился) → 409."""
+
+    def __init__(self, expected: int, given: int) -> None:
+        self.expected = expected
+        self.given = given
+        super().__init__(f"confirm_count mismatch: expected {expected}, got {given}")
 
 
 def _utcnow() -> datetime:
@@ -45,6 +81,10 @@ def _utcnow() -> datetime:
 
 def _id() -> str:
     return f"mem_{uuid4().hex[:24]}"
+
+
+def _cat_id() -> str:
+    return f"memcat_{uuid4().hex[:24]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +203,260 @@ class MemoryRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
+    # -------------------------------------------------------------- categories
+
+    def _find_common(self, tenant_id: str, user_id: str) -> MemoryCategory | None:
+        # is_system И slug='common' (high m2): порченая system-строка не станет «навсегда Common».
+        return (
+            self.session.query(MemoryCategory)
+            .filter_by(tenant_id=tenant_id, user_id=user_id, is_system=True, slug=COMMON_SLUG)
+            .first()
+        )
+
+    def ensure_common(self, tenant_id: str, user_id: str) -> str:
+        """#262: вернуть id системной Common-категории юзера; создать при отсутствии. Идемпотентно.
+
+        Гонко-безопасно (4-5 параллельных fetch мини-аппа / параллельные ходы): SELECT → INSERT под
+        savepoint; на гонке partial-unique `(tenant,user) WHERE is_system` бросит IntegrityError → откат
+        savepoint (внешняя транзакция цела) → re-SELECT берёт победителя. Дёргается из save() и страницы."""
+        row = self._find_common(tenant_id, user_id)
+        if row is not None:
+            return row.id
+        cat = MemoryCategory(
+            id=_cat_id(), tenant_id=tenant_id, user_id=user_id, slug=COMMON_SLUG,
+            name=COMMON_DISPLAY_NAME,
+            # C2: норма по имени (а не slug!) — иначе юзер создаст вторую «Общее» (norm «общий») без конфликта.
+            name_normalized=COMMON_NAME_NORMALIZED,
+            is_system=True, created_at=_utcnow(),
+        )
+        try:
+            with self.session.begin_nested():  # savepoint — гонку не выносим во внешнюю транзакцию
+                self.session.add(cat)
+                self.session.flush()
+            return cat.id
+        except IntegrityError:  # гонка: другой создал Common первым → берём победителя
+            winner = self._find_common(tenant_id, user_id)
+            if winner is not None:
+                return winner.id
+            logger.warning(
+                "ensure_common: IntegrityError but no Common for %s/%s (конфликт не по partial-unique system?)",
+                tenant_id, user_id,
+            )
+            raise
+
+    # NB (#262 A2): bulk-backfill существующих фактов в Common делает МИГРАЦИЯ 0058 инлайн-SQL (единственный
+    # источник, исторически стабильный) — не дублируем его ORM-методом в репо (риск расхождения, ревью R1 M2).
+    # Backfill валидируется сухим прогоном 0058 на Postgres-снапшоте (срез D). Горячий путь новых фактов —
+    # ensure_common() выше, он же резолвит Common в save().
+
+    # --------------------------------------------------------- categories CRUD
+
+    def _own_category(self, tenant_id: str, user_id: str, category_id: str) -> MemoryCategory | None:
+        """Категория, ТОЛЬКО если она принадлежит этому (tenant,user). Иначе None (→ API 404)."""
+        return (
+            self.session.query(MemoryCategory)
+            .filter_by(id=category_id, tenant_id=tenant_id, user_id=user_id)
+            .first()
+        )
+
+    def list_categories(self, tenant_id: str, user_id: str) -> list[MemoryCategory]:
+        """Категории юзера: Common первой, дальше пользовательские по дате создания."""
+        return (
+            self.session.query(MemoryCategory)
+            .filter_by(tenant_id=tenant_id, user_id=user_id)
+            .order_by(MemoryCategory.is_system.desc(), MemoryCategory.created_at.asc())
+            .all()
+        )
+
+    def get_category(self, tenant_id: str, user_id: str, category_id: str) -> MemoryCategory | None:
+        """Категория этого (tenant,user) по id, иначе None. Публичный фасад над _own_category для API-слоя."""
+        return self._own_category(tenant_id, user_id, category_id)
+
+    def list_facts_in_category(
+        self, tenant_id: str, user_id: str, category_id: str
+    ) -> list[AssistantMemory]:
+        """Факты одной категории (скоуп tenant+user+category), новые сверху. Ownership категории проверяет
+        вызывающий через get_category (пустой список тут не отличает «чужая» от «своя пустая»)."""
+        return (
+            self.session.query(AssistantMemory)
+            .filter_by(tenant_id=tenant_id, user_id=user_id, category_id=category_id)
+            .order_by(AssistantMemory.created_at.desc())
+            .all()
+        )
+
+    def get_memory(self, tenant_id: str, user_id: str, memory_id: str) -> AssistantMemory | None:
+        """Факт этого (tenant,user) по id, иначе None. Публичный фасад над _own_memory — для API-слоя,
+        чтобы проверить существование/владение ДО дорогих сайд-эффектов (синхронный re-embed при правке)."""
+        return self._own_memory(tenant_id, user_id, memory_id)
+
+    def create_category(self, tenant_id: str, user_id: str, name: str) -> MemoryCategory:
+        """Создать пользовательскую категорию. Дубль имени (name_normalized) → CategoryNameConflict (409)."""
+        display = (name or "").strip()
+        norm = normalize_for_dedup(display)
+        if not norm:
+            raise ValueError("category name cannot be empty")
+        if norm == COMMON_NAME_NORMALIZED:  # «Общее» зарезервировано за системной Common (R2 дыра порядка)
+            raise CategoryNameConflict(display)
+        cat = MemoryCategory(
+            id=_cat_id(), tenant_id=tenant_id, user_id=user_id, slug=None,
+            name=display, name_normalized=norm, is_system=False, created_at=_utcnow(),
+        )
+        try:
+            with self.session.begin_nested():  # savepoint — конфликт не рвёт внешнюю транзакцию
+                self.session.add(cat)
+                self.session.flush()
+        except IntegrityError as exc:
+            raise CategoryNameConflict(display) from exc
+        return cat
+
+    def rename_category(
+        self, tenant_id: str, user_id: str, category_id: str, name: str
+    ) -> MemoryCategory | None:
+        """Переименовать. None → 404; Common → CategoryImmutable; дубль → CategoryNameConflict."""
+        cat = self._own_category(tenant_id, user_id, category_id)
+        if cat is None:
+            return None
+        if cat.is_system:
+            raise CategoryImmutable("Common cannot be renamed")
+        display = (name or "").strip()
+        norm = normalize_for_dedup(display)
+        if not norm:
+            raise ValueError("category name cannot be empty")
+        if norm == COMMON_NAME_NORMALIZED:  # «Общее» зарезервировано за Common — нельзя переименовать в него
+            raise CategoryNameConflict(display)
+        if norm == cat.name_normalized:  # то же имя (с точностью до нормализации) — просто обновим display
+            cat.name = display
+            self.session.flush()
+            return cat
+        old_name, old_norm = cat.name, cat.name_normalized
+        try:
+            # C1: мутируем ВНУТРИ savepoint (симметрично create_category). Иначе при конфликте откат
+            # savepoint оставляет внешнюю сессию dirty → PendingRollbackError на следующей операции → 500.
+            with self.session.begin_nested():
+                cat.name = display
+                cat.name_normalized = norm
+                self.session.flush()
+        except IntegrityError as exc:
+            cat.name, cat.name_normalized = old_name, old_norm  # вернуть in-memory к старому
+            raise CategoryNameConflict(display) from exc
+        return cat
+
+    def count_facts_in_category(self, tenant_id: str, user_id: str, category_id: str) -> int:
+        return (
+            self.session.query(AssistantMemory)
+            .filter_by(tenant_id=tenant_id, user_id=user_id, category_id=category_id)
+            .count()
+        )
+
+    def delete_category(
+        self, tenant_id: str, user_id: str, category_id: str, *, confirm_count: int
+    ) -> int | None:
+        """Удалить категорию ВМЕСТЕ с её фактами (решение владельца). Атомарно в одной транзакции.
+
+        None → 404; Common → CategoryImmutable; confirm_count ≠ факт. числа → CategoryConfirmMismatch
+        (набор изменился, защита от удаления вслепую). Возвращает число удалённых фактов (для server-confirm
+        + аудита). Аудит-метаданные (id/счётчик, БЕЗ контента) пишет API-слой."""
+        # M4 TOCTOU: сразу лочим строку категории FOR UPDATE (один fetch, R2) — конкурентный FK-insert факта
+        # в неё (он берёт FOR KEY SHARE на родителя) блокируется до нашего коммита, после чего FK отвергнет
+        # его (категории уже нет). Так is_system, count и delete читаются/делаются по ОДНОЙ залоченной строке
+        # атомарно относительно confirm_count. SQLite: FOR UPDATE — no-op (тестам ок).
+        cat = (
+            self.session.query(MemoryCategory)
+            .filter_by(id=category_id, tenant_id=tenant_id, user_id=user_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        if cat is None:  # нет такой / чужая / удалена в гонке → 404
+            return None
+        if cat.is_system:
+            raise CategoryImmutable("Common cannot be deleted")
+        # R3: confirm_count сверяем с ФАКТИЧЕСКИМ rowcount удаления, а не с предварительным count. FOR UPDATE на
+        # родителе не блокирует конкурентный move-out/delete дочернего факта между count и delete — поэтому
+        # удаляем под savepoint и, если удалили НЕ ровно confirm_count, откатываем (факты целы) и бросаем
+        # mismatch. Так «удалить ровно подтверждённое или ничего» — атомарно, без устаревшего счётчика.
+        with self.session.begin_nested():
+            deleted = (
+                self.session.query(AssistantMemory)
+                .filter_by(tenant_id=tenant_id, user_id=user_id, category_id=category_id)
+                .delete(synchronize_session=False)
+            )
+            if deleted != confirm_count:
+                raise CategoryConfirmMismatch(deleted, confirm_count)  # откатит savepoint (факты не тронуты)
+            self.session.delete(cat)
+            self.session.flush()
+        return deleted
+
+    # ------------------------------------------------------------- facts CRUD
+
+    def _own_memory(self, tenant_id: str, user_id: str, memory_id: str) -> AssistantMemory | None:
+        return (
+            self.session.query(AssistantMemory)
+            .filter_by(id=memory_id, tenant_id=tenant_id, user_id=user_id)
+            .first()
+        )
+
+    def move_memory(
+        self, tenant_id: str, user_id: str, memory_id: str, target_category_id: str
+    ) -> AssistantMemory | None:
+        """Перенести факт в другую СВОЮ категорию. None → 404 (нет факта ИЛИ чужая/несущ. цель)."""
+        mem = self._own_memory(tenant_id, user_id, memory_id)
+        if mem is None:
+            return None
+        if self._own_category(tenant_id, user_id, target_category_id) is None:
+            return None  # цель чужая/не существует → composite FK всё равно бы отверг; явная 404
+        mem.category_id = target_category_id
+        self.session.flush()
+        return mem
+
+    def edit_memory(
+        self,
+        tenant_id: str,
+        user_id: str,
+        memory_id: str,
+        *,
+        content: str,
+        embedding: list[float] | None = None,
+        clear_embedding_for_manual_reembed: bool = False,
+    ) -> AssistantMemory | None:
+        """Ручная правка факта: новый текст + ПЕРЕ-эмбеддинг + source=user_direct. None → 404.
+
+        КОНТРАКТ (ревью R1 M5 / R2): вызывающий слой (API среза B) ОБЯЗАН вычислить новый embedding и передать
+        его — как `save_core_fact` считает вектор перед `repo.save`. Сброс вектора в NULL делает факт
+        невидимым для косинус-recall (durable reembed-джоба НЕТ — только ручной
+        `scripts/reembed_all_with_current_model.py`), поэтому это НЕ молчаливый дефолт: чтобы сбросить вектор,
+        надо ЯВНО передать `clear_embedding_for_manual_reembed=True`. Иначе пустой/отсутствующий вектор без
+        флага → ValueError (защита от случайной потери recall, в т.ч. на `embedding=[]` от багнутого
+        эмбеддера). Приёмка B: правленый факт остаётся находим recall'ом."""
+        # `not embedding` ловит И None, И пустой список [] (R3: багнутый эмбеддер может вернуть [] вместо None,
+        # а строка хранения ниже трактует [] как falsy → занулила бы вектор молча).
+        if not embedding and not clear_embedding_for_manual_reembed:
+            raise ValueError(
+                "edit_memory requires a non-empty recomputed embedding (или явный "
+                "clear_embedding_for_manual_reembed=True для деградированного режима)"
+            )
+        mem = self._own_memory(tenant_id, user_id, memory_id)
+        if mem is None:
+            return None
+        text = (content or "").strip()
+        if not text:
+            raise ValueError("memory content cannot be empty")
+        mem.content = text
+        mem.embedding_json = json.dumps(embedding) if embedding else None
+        mem.embedding_dim = len(embedding) if embedding else 0
+        mem.source = "user_direct"  # пользователь правил вручную
+        self.session.flush()
+        return mem
+
+    def delete_memory(self, tenant_id: str, user_id: str, memory_id: str) -> bool:
+        """Удалить один факт (в т.ч. из Common). False → 404."""
+        deleted = (
+            self.session.query(AssistantMemory)
+            .filter_by(id=memory_id, tenant_id=tenant_id, user_id=user_id)
+            .delete(synchronize_session=False)
+        )
+        self.session.flush()
+        return deleted > 0
+
     # ------------------------------------------------------------------- save
 
     def save(
@@ -174,6 +468,7 @@ class MemoryRepository:
         content: str,
         embedding: list[float] | None = None,
         source: str = "agent_inferred",
+        category_id: str | None = None,
     ) -> AssistantMemory:
         if tier not in MEMORY_TIERS:
             raise ValueError(f"unknown tier: {tier!r}")
@@ -182,6 +477,12 @@ class MemoryRepository:
         text = (content or "").strip()
         if not text:
             raise ValueError("memory content cannot be empty")
+        # #262: факт без явной категории → Common (горячий путь tools.py, та же транзакция). С явной
+        # категорией — префлайт владения (high m1): чужой/несущ. id → домен-404, а не IntegrityError/500.
+        if category_id is None:
+            category_id = self.ensure_common(tenant_id, user_id)
+        elif self._own_category(tenant_id, user_id, category_id) is None:
+            raise CategoryNotFound(category_id)
 
         row = AssistantMemory(
             id=_id(),
@@ -192,6 +493,7 @@ class MemoryRepository:
             embedding_json=json.dumps(embedding) if embedding else None,
             embedding_dim=len(embedding) if embedding else 0,
             source=source,
+            category_id=category_id,
             created_at=_utcnow(),
         )
         self.session.add(row)
@@ -219,6 +521,8 @@ class MemoryRepository:
         return q.all()
 
     def get(self, memory_id: str) -> AssistantMemory | None:
+        """INTERNAL, по id БЕЗ скоупа (M7). User-facing пути ОБЯЗАНЫ использовать `_own_memory`/`list_by_user`
+        (скоуп по tenant+user) — иначе утечённый id заденет чужого тенанта."""
         return self.session.get(AssistantMemory, memory_id)
 
     # ----------------------------------------------------------------- recall
@@ -559,6 +863,8 @@ class MemoryRepository:
     # ----------------------------------------------------------------- update
 
     def touch_accessed(self, memory_id: str) -> None:
+        """INTERNAL, по id БЕЗ скоупа (M7). Дёргается только из recall-bookkeeping (graph.py) с id уже
+        отскоупленного recall-хита; не для user-facing путей."""
         row = self.session.get(AssistantMemory, memory_id)
         if row is None:
             return
@@ -567,6 +873,8 @@ class MemoryRepository:
         self.session.flush()
 
     def delete(self, memory_id: str) -> bool:
+        """INTERNAL, по id БЕЗ скоупа (M7). User-facing удаление — ТОЛЬКО `delete_memory(tenant,user,id)`;
+        этот footgun снёс бы чужой факт по утечённому id."""
         row = self.session.get(AssistantMemory, memory_id)
         if row is None:
             return False

@@ -616,6 +616,74 @@ def probe_groq_stt_latency() -> ProbeResult:
                               "groq_stt_latency", baseline_ms=400)
 
 
+# «Граница держит» = target НЕ достигнут. Кроме httpx.TransportError сюда ОБЯЗАТЕЛЬНО входит
+# socksio.SOCKSError: при tcp-reset фильтра SOCKS-прокси отдаёт сбойный reply → socksio.ProtocolError
+# («Malformed reply») ПРОТЕКАЕТ мимо httpx (НЕ TransportError) — доказано live на проде 2026-06-30.
+# Без этого блокировка читалась бы как «probe error→warning» (ложный алерт каждый тик). Defensive import.
+try:
+    from socksio.exceptions import SOCKSError as _SocksError
+    _BOUNDARY_BLOCKED_EXC: tuple[type[BaseException], ...] = (httpx.TransportError, _SocksError)
+except Exception:  # noqa: BLE001  socksio — dep httpx[socks]; на проде есть, но не падаем если нет
+    _BOUNDARY_BLOCKED_EXC = (httpx.TransportError,)
+
+
+def probe_fetch_egress_filtered() -> ProbeResult:
+    """#244 ИНВЕРСНАЯ проба SSRF-границы fetch_url. metadata-IP через фильтр-egress
+    (``SREDA_FETCH_URL_PROXY``) ДОЛЖЕН быть недостижим. 3 шага:
+
+    1. proxy обязан быть loopback-socks5 (иначе мониторим НЕ ту границу) → critical-misconfig.
+       (Ошибка на root-туннель :1080 поймается и шагом 3: root не фильтрует → metadata reached → critical.)
+    2. TCP-preflight живости туннеля. Мёртв → **warning** (НЕ ok): fetch тогда fail-closed, но граница
+       НЕ проверена — нельзя выдавать «здорово» (иначе слепота к падению egress, ревью R1 MAJOR).
+    3. GET 169.254.169.254 через ЖИВОЙ proxy: **ЛЮБОЙ HTTP-ответ (200/403/500/3xx) = critical** — TCP-коннект
+       до link-local ПРОШЁЛ и сервис ответил = фильтр пробит (статус/тело неважны — важен факт достижимости;
+       гейт на ==200 дал бы false-negative на 403/500 от достигнутой метадаты, ревью R1 — отклонено).
+       Исключение через ЖИВОЙ proxy (RST/refused) = граница держит = ok.
+
+    Семантика ИНВЕРСНА ``_external_latency`` (там 200=healthy). Пусто proxy → skip(ok)."""
+    proxy = _ENV.get("SREDA_FETCH_URL_PROXY")
+    if not proxy:
+        return ProbeResult("fetch_egress_filtered", "ok", "(SREDA_FETCH_URL_PROXY unset, skip)")
+    pp = urlparse(proxy)
+    host = (pp.hostname or "").rstrip(".").lower()  # rstrip как прод-preflight: localhost. = localhost (R3)
+    try:
+        port = pp.port  # ValueError на нечисловом/out-of-range порту → ловим явно
+    except ValueError:
+        return ProbeResult("fetch_egress_filtered", "critical", "SREDA_FETCH_URL_PROXY: невалидный порт — мониторим не ту границу")
+    # mirror прод-preflight_egress: чистый loopback-socks5, БЕЗ userinfo (R2/R3 ревью). Иначе мониторим не ту границу.
+    # userinfo — по PRESENCE (is not None), не truthiness: пустой marker `socks5://@host` тоже отвергаем (R3).
+    if (pp.scheme not in ("socks5", "socks5h") or host not in ("127.0.0.1", "::1", "localhost")
+            or not port or pp.username is not None or pp.password is not None):
+        return ProbeResult(
+            "fetch_egress_filtered", "critical",
+            f"SREDA_FETCH_URL_PROXY не чистый loopback-socks5 ({pp.scheme}://{host}:{port}) — мониторим не ту границу",
+        )
+    # 2. туннель жив? мёртв → fetch fail-closed, но граница НЕ проверена → warning (не ok).
+    try:
+        with socket.create_connection((host, port), timeout=3.0):
+            pass
+    except OSError:
+        return ProbeResult(
+            "fetch_egress_filtered", "warning",
+            f"fetch-egress туннель :{port} недоступен — fetch fail-closed, граница не проверена",
+        )
+    # 3. инверсный GET через ЖИВОЙ proxy. trust_env=False: cron не грузит os.environ.
+    # follow_redirects=False явно: 3xx ДОЛЖЕН вернуться ответом (=critical), а не уйти по редиректу.
+    try:
+        with httpx.Client(timeout=6.0, trust_env=False, proxy=proxy, follow_redirects=False) as c:
+            r = c.get("http://169.254.169.254/latest/meta-data/")
+        return ProbeResult(
+            "fetch_egress_filtered", "critical",
+            f"metadata REACHED via fetch-egress (http {r.status_code}) — фильтр НЕ режет private!",
+        )
+    except _BOUNDARY_BLOCKED_EXC as e:
+        # connection-level (httpx refused/RST/timeout/protocol) ИЛИ socksio SOCKS-сбой через ЖИВОЙ proxy
+        # = target не достигнут = граница держит = ok
+        return ProbeResult("fetch_egress_filtered", "ok", f"private blocked via live proxy ({type(e).__name__})")
+    except Exception as e:  # noqa: BLE001  setup/непредвиденное → граница НЕ проверена → warning, НЕ ложное ok
+        return ProbeResult("fetch_egress_filtered", "warning", f"probe error, граница не проверена ({type(e).__name__})")
+
+
 # ---------------------------------------------------------------------------
 # Trace.log analysis
 # ---------------------------------------------------------------------------
@@ -816,6 +884,7 @@ PROBES: list[Callable[[], ProbeResult]] = [
     probe_ack_latency_p95,
     # Security
     probe_fail2ban_active,
+    probe_fetch_egress_filtered,  # #244: SSRF-граница fetch_url держится (инверсная: 200=critical)
 ]
 
 

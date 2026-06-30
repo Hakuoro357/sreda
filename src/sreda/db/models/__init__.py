@@ -21,6 +21,7 @@ from sreda.db.models.core import (
     User,
     Workspace,
 )
+from sreda.db.models.fetch_url_usage import FetchUrlUsage
 from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
 from sreda.db.models.react_summary import ReactSummary
 from sreda.db.models.react_debug import ReactDebugTurn
@@ -85,6 +86,7 @@ __all__ = [
     "InboundMessage",
     "FamilyMember",
     "FamilyReminder",
+    "FetchUrlUsage",
     "InboundEvent",
     "MenuPlan",
     "MenuPlanItem",
