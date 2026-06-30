@@ -4,12 +4,14 @@
 существующих данных, мгновенно. Композитный UNIQUE(tenant_id,user_id,ymd) обязателен для атомарного
 INSERT…ON CONFLICT в try_consume_fetch_url. Образец — 0033 web_search_usage / 0069 react_summaries.
 
-Revision ID: 20260630_0070
-Revises: 20260629_0069
+Revision ID: 20260630_0073
+Revises: 20260630_0072
 Create Date: 2026-06-30
 
-NB: голова на момент написания — 20260629_0069 (react_summaries, #232), пришла с синком ветки на main
-ПЕРЕД началом #244. down_revision перецеплен 0068→0069 соответственно (проверено `alembic heads` = одна голова).
+NB: ПЕРЕЦЕПЛЕНО 0069→0072 при синке ветки с main перед деплоем #244. main принёс #262
+(20260630_0070_memory_categories → 0071 → 0072) от того же предка 0069 → revision id «20260630_0070»
+КОЛЛИДИРОВАЛ с моим. Линеаризация: …0069 → 0070/0071/0072 (#262 память) → 0073 (#244 fetch_url_usage).
+Проверено `alembic heads` = одна голова 20260630_0073.
 """
 
 from __future__ import annotations
@@ -19,8 +21,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = "20260630_0070"
-down_revision = "20260629_0069"
+revision = "20260630_0073"
+down_revision = "20260630_0072"
 branch_labels = None
 depends_on = None
 
