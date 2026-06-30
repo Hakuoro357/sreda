@@ -1102,6 +1102,47 @@ _MAX_STEPS_REPLY = f"Прости, {_MAX_STEPS_MARKER}. Уточни, пожал
 _DEGRADED_OUTCOMES = frozenset({"tool_error", "fallback_used", "safe_reply"})
 
 
+def _toolmsg_is_error(m) -> bool:
+    """ToolMessage с исходом-ошибкой. Логика зеркалит collect_tool_calls (react_trace_persist:157,169):
+    result_kind из artifact, иначе error при status=='error'. Читаем НАПРЯМУЮ из ToolMessage (он есть в
+    дельте хода даже на resume — в отличие от AIMessage.tool_calls, который остаётся до паузы)."""
+    if not isinstance(m, ToolMessage):
+        return False
+    art = getattr(m, "artifact", None)
+    rk = art.get("result_kind") if isinstance(art, dict) else None
+    if rk is None:
+        rk = "error" if getattr(m, "status", None) == "error" else "ok"
+    return rk == "error"
+
+
+def _turn_outcome(result_lcs, result_msgs, prev_lcs_n: int, prev_msgs_n: int, *, tenant_id: str):
+    """#269: outcome ТЕКУЩЕГО хода по ДЕЛЬТЕ (calls/messages, добавленные ИМЕННО этим ходом), НЕ по
+    накопителю треда. `llm_calls`/`messages` — add-reducer, копятся между ходами durable-треда (#193):
+    если считать `any(fallback_fired)`/`tool_error` по всему накопителю, один старый сбой (напр.
+    egress-таймаут) навсегда красит ВСЕ последующие ходы → ложный #258-алерт каждый ход.
+    Дельта берётся от состояния ДО инвока (len из `snap.values`). Возвращает (outcome, lcs_turn, tcs_turn)
+    — lcs_turn/tcs_turn идут в трейс (per-turn, без раздувания накопителем).
+
+    tool_error (R2, Codex medium MAJOR): детектим по ToolMessage'ам ДЕЛЬТЫ НАПРЯМУЮ, а НЕ по результату
+    collect_tool_calls(дельта) — на resume AIMessage с tool_calls остаётся ДО паузы (вне дельты), и
+    collect_tool_calls (сшивает по AIMessage.tool_calls) вернул бы [] → пропустили бы ошибку
+    подтверждённого действия. ToolMessage же приходит ПОСЛЕ resume — он в дельте.
+    Ограничение: fallback в ПРЕ-пауза части хода + resume не попадёт в дельту (resume считает post-pause)
+    — приемлемо: несравнимо лучше, чем «навсегда красит все ходы». tcs_turn (для трейса) на resume может
+    быть неполным по той же причине (collect_tool_calls без пары AIMessage) — это best-effort отладки,
+    outcome при этом корректен."""
+    lcs_turn = (result_lcs or [])[prev_lcs_n:]
+    msgs_turn = (result_msgs or [])[prev_msgs_n:]
+    tcs_turn = _trace.collect_tool_calls(msgs_turn, tenant_id=tenant_id)
+    if any(_toolmsg_is_error(m) for m in msgs_turn):
+        oc = "tool_error"
+    elif any(c.get("fallback_fired") for c in lcs_turn):
+        oc = "fallback_used"
+    else:
+        oc = "ok"
+    return oc, lcs_turn, tcs_turn
+
+
 def _maybe_alert_degraded_turn(
     *, tenant_id: str, user_id: str | None, channel: str, turn_key: str,
     user_text: str, reply_text: str, outcome: str, passes: int,
@@ -2900,6 +2941,10 @@ async def handle_turn(
             history_summary=_summary)  # #232 выжимка (потребление)
 
         snap = await graph.aget_state(_cfg(gen))
+        # #269: счётчики llm_calls/messages ДО инвока — outcome считаем по ДЕЛЬТЕ хода (анти-накопитель)
+        _pre_vals = getattr(snap, "values", None) or {}
+        _lcs0 = len(_pre_vals.get("llm_calls") or [])
+        _msgs0 = len(_pre_vals.get("messages") or [])
         live_pause = (_has_pause(snap)
                       and _interrupt_age_seconds(snap.created_at) <= _PENDING_TTL_SECONDS)
 
@@ -3073,12 +3118,12 @@ async def handle_turn(
         # ход при сбое (трейс = отладка, best-effort).
         if _trace.trace_enabled():
             try:
-                _msgs_fin = result.get("messages", []) if isinstance(result, dict) else []
-                _tcs = _trace.collect_tool_calls(_msgs_fin, tenant_id=tenant_id)
-                _lcs = result.get("llm_calls") if isinstance(result, dict) else None
-                _outcome = ("tool_error" if any(t.get("result_kind") == "error" for t in _tcs)
-                            else "fallback_used" if any(c.get("fallback_fired") for c in (_lcs or []))
-                            else "ok")
+                # #269: outcome + трейс по ДЕЛЬТЕ хода (не по накопителю треда — иначе старый fallback
+                # навсегда красит все ходы fallback_used → ложный #258-алерт). _lcs0/_msgs0 сняты до инвока.
+                _lcs_all = result.get("llm_calls") if isinstance(result, dict) else None
+                _msgs_all = result.get("messages", []) if isinstance(result, dict) else []
+                _outcome, _lcs, _tcs = _turn_outcome(
+                    _lcs_all, _msgs_all, _lcs0, _msgs0, tenant_id=tenant_id)
                 # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
                 _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
                 _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0

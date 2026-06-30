@@ -14,17 +14,26 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
 from sreda.config.settings import get_settings
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
+from sreda.db.repositories.memory import (
+    CategoryConfirmMismatch,
+    CategoryImmutable,
+    CategoryNameConflict,
+    CategoryNotFound,
+    MemoryCategoryError,
+    MemoryRepository,
+)
 from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.app_registry import get_feature_registry
 from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
@@ -34,6 +43,7 @@ from sreda.services.billing import (
     BillingService,
     DeprecatedPlanError,
 )
+from sreda.services.embeddings import get_embeddings_client
 from sreda.services.housewife_family import HousewifeFamilyService
 from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
@@ -985,7 +995,17 @@ def get_menu(
     backend code stay intact, the tiles just aren't injected into home.
     """
     sections = _collect_menu_sections(session, ctx.tenant_id, ctx.user_id)
-    return {"items": _menu_items_for_render(sections)}
+    items = _menu_items_for_render(sections)
+    # #262: платформенная плитка «Память» — у каждого юзера (не привязана к скилу).
+    items.append({
+        "id": "memory",
+        "title": "Память",
+        "icon": "🧠",
+        "route": "#/memory",
+        "subtitle": "Что я о вас помню",
+        "count": None,
+    })
+    return {"items": items}
 
 
 # ---------------------------------------------------------------------------
@@ -2431,3 +2451,211 @@ async def channel_link_status(
         "expires_at": row.expires_at.isoformat(),
         "consumed": row.used_at is not None,
     }
+
+
+# ---------------------------------------------------------------------------
+# #262 Memory categories — user-facing CRUD над assistant_memories + categories
+# ---------------------------------------------------------------------------
+
+
+# Лимиты длины на границе API (ревью B): безразмерный вход раздувает БД/UI и — для content — синхронно
+# гоняется через эмбеддер (DoS-вектор). name ≤ 100 (DB String(120), запас); content ≤ 2000 (факт — короткое
+# утверждение). Пустое/пробельное добивает strip+валидация в репо (→ 400).
+_MAX_CATEGORY_NAME = 100
+_MAX_FACT_CONTENT = 2000
+
+
+class MemoryCategoryCreate(BaseModel):
+    name: str = Field(max_length=_MAX_CATEGORY_NAME)
+
+
+class MemoryCategoryRename(BaseModel):
+    name: str = Field(max_length=_MAX_CATEGORY_NAME)
+
+
+class MemoryFactEdit(BaseModel):
+    content: str = Field(max_length=_MAX_FACT_CONTENT)
+
+
+def _memory_category_to_dict(cat, fact_count: int) -> dict:
+    # DTO-allowlist: НИКОГДА не отдаём slug/name_normalized/tenant_id/user_id наружу.
+    return {
+        "id": cat.id,
+        "name": cat.name,
+        "is_system": cat.is_system,
+        "fact_count": fact_count,
+    }
+
+
+def _memory_fact_to_dict(m) -> dict:
+    # DTO-allowlist: БЕЗ embedding_json/embedding_dim/access_count (внутреннее).
+    return {
+        "id": m.id,
+        "content": m.content,
+        "tier": m.tier,
+        "source": m.source,
+        "category_id": m.category_id,
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+    }
+
+
+def _map_memory_category_error(exc: MemoryCategoryError) -> HTTPException:
+    if isinstance(exc, CategoryNotFound):
+        return HTTPException(status_code=404, detail="category_not_found")
+    if isinstance(exc, CategoryImmutable):
+        return HTTPException(status_code=403, detail="category_immutable")
+    if isinstance(exc, CategoryConfirmMismatch):
+        return HTTPException(status_code=409, detail="confirm_count_mismatch")
+    if isinstance(exc, CategoryNameConflict):
+        return HTTPException(status_code=409, detail="category_name_conflict")
+    return HTTPException(status_code=400, detail="category_error")
+
+
+@router.get("/api/v1/memory/categories")
+def list_memory_categories(
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Категории памяти юзера (Common первой) + счётчик фактов. Лениво гарантирует Common (дом по умолчанию
+    у каждого юзера) — идемпотентно."""
+    repo = MemoryRepository(session)
+    repo.ensure_common(ctx.tenant_id, ctx.user_id)
+    session.commit()
+    cats = repo.list_categories(ctx.tenant_id, ctx.user_id)
+    out = [
+        _memory_category_to_dict(
+            c, repo.count_facts_in_category(ctx.tenant_id, ctx.user_id, c.id)
+        )
+        for c in cats
+    ]
+    return {"categories": out}
+
+
+@router.post("/api/v1/memory/categories")
+def create_memory_category(
+    body: MemoryCategoryCreate,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    repo = MemoryRepository(session)
+    try:
+        cat = repo.create_category(ctx.tenant_id, ctx.user_id, body.name)
+    except MemoryCategoryError as exc:
+        raise _map_memory_category_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid_name") from exc
+    session.commit()
+    return {"ok": True, "category": _memory_category_to_dict(cat, 0)}
+
+
+@router.patch("/api/v1/memory/categories/{category_id}")
+def rename_memory_category(
+    category_id: str,
+    body: MemoryCategoryRename,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    repo = MemoryRepository(session)
+    try:
+        cat = repo.rename_category(ctx.tenant_id, ctx.user_id, category_id, body.name)
+    except MemoryCategoryError as exc:
+        raise _map_memory_category_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid_name") from exc
+    if cat is None:
+        raise HTTPException(status_code=404, detail="category_not_found")
+    session.commit()
+    return {
+        "ok": True,
+        "category": _memory_category_to_dict(
+            cat, repo.count_facts_in_category(ctx.tenant_id, ctx.user_id, cat.id)
+        ),
+    }
+
+
+@router.delete("/api/v1/memory/categories/{category_id}")
+def delete_memory_category(
+    category_id: str,
+    confirm_count: int = Query(ge=0),  # отрицательное — заведомо невалидно → 422 (не 409)
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Удалить категорию ВМЕСТЕ с фактами. confirm_count (query) — сколько фактов клиент видел; расхождение
+    с фактическим → 409 (защита от удаления вслепую)."""
+    repo = MemoryRepository(session)
+    try:
+        deleted = repo.delete_category(
+            ctx.tenant_id, ctx.user_id, category_id, confirm_count=confirm_count
+        )
+    except MemoryCategoryError as exc:
+        raise _map_memory_category_error(exc) from exc
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="category_not_found")
+    session.commit()
+    return {"ok": True, "deleted": deleted}
+
+
+@router.get("/api/v1/memory/facts")
+def list_memory_facts(
+    category_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Факты одной категории (фронт группирует по ярусу внутри). 404 если категория не существует/чужая."""
+    repo = MemoryRepository(session)
+    if repo.get_category(ctx.tenant_id, ctx.user_id, category_id) is None:
+        raise HTTPException(status_code=404, detail="category_not_found")
+    facts = repo.list_facts_in_category(ctx.tenant_id, ctx.user_id, category_id)
+    return {"facts": [_memory_fact_to_dict(m) for m in facts]}
+
+@router.patch("/api/v1/memory/facts/{memory_id}")
+def edit_memory_fact(
+    memory_id: str,
+    body: MemoryFactEdit,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Правка текста факта + СИНХРОННЫЙ пере-эмбеддинг (иначе факт выпал бы из recall). Сбой/пустой вектор
+    эмбеддера → 503 (правка НЕ применена — целостность recall важнее). source → user_direct.
+    Перенос/move между категориями — голосом (в мини-аппе нет, решение владельца)."""
+    content = (body.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="empty_content")
+    repo = MemoryRepository(session)
+    # Префлайт владения ДО эмбеддинга: чужой/несущ. id не должен гонять дорогой синхронный эмбеддер и
+    # не должен отдавать 503 вместо 404. Авторитетная запись — всё равно scoped edit_memory ниже.
+    if repo.get_memory(ctx.tenant_id, ctx.user_id, memory_id) is None:
+        raise HTTPException(status_code=404, detail="memory_not_found")
+    try:
+        embedding = get_embeddings_client().embed_document(content)
+    except Exception as exc:  # noqa: BLE001 — любой сбой эмбеддера → 503, правку не применяем
+        logger.warning("edit_memory_fact: embedding failed: %s", exc)
+        raise HTTPException(status_code=503, detail="embedding_unavailable") from exc
+    if not embedding:
+        raise HTTPException(status_code=503, detail="embedding_unavailable")
+    try:
+        m = repo.edit_memory(
+            ctx.tenant_id, ctx.user_id, memory_id, content=content, embedding=embedding
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid_content") from exc
+    except StaleDataError as exc:  # факт удалён в гонке между _own_memory и flush() → 404
+        raise HTTPException(status_code=404, detail="memory_not_found") from exc
+    if m is None:  # удалён в гонке между префлайтом и записью
+        raise HTTPException(status_code=404, detail="memory_not_found")
+    session.commit()
+    return {"ok": True, "fact": _memory_fact_to_dict(m)}
+
+
+@router.delete("/api/v1/memory/facts/{memory_id}")
+def delete_memory_fact(
+    memory_id: str,
+    session: Session = Depends(get_session),
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> dict:
+    """Удалить один факт (в т.ч. из Common). Скоуп по (tenant,user). 404 если нет/чужой."""
+    repo = MemoryRepository(session)
+    if not repo.delete_memory(ctx.tenant_id, ctx.user_id, memory_id):
+        raise HTTPException(status_code=404, detail="memory_not_found")
+    session.commit()
+    return {"ok": True}

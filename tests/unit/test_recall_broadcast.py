@@ -30,7 +30,6 @@ from sreda.db.models.housewife import FamilyReminder
 from sreda.db.repositories.memory import (
     BroadcastHit,
     MemoryRepository,
-    SourceStats,
     _dedup_pairwise,
 )
 
@@ -81,7 +80,8 @@ def test_recall_broadcast_skips_null_embedding_rows(session):
     # save a memory WITH embedding
     repo.save("t1", "u1", tier="core", content="имеет",
               embedding=_vec(1), source="user_direct")
-    # raw insert a memory WITHOUT embedding_json (legacy row)
+    # raw insert a memory WITHOUT embedding_json (legacy row).
+    # #262: category_id теперь NOT NULL — кладём в Common (ensure_common идемпотентен, save выше его создал).
     from sreda.db.models.memory import AssistantMemory
     legacy = AssistantMemory(
         id="mem_legacy",
@@ -92,6 +92,7 @@ def test_recall_broadcast_skips_null_embedding_rows(session):
         embedding_json=None,
         embedding_dim=0,
         source="user_direct",
+        category_id=repo.ensure_common("t1", "u1"),
     )
     session.add(legacy)
     session.commit()
