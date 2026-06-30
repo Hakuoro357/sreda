@@ -236,7 +236,15 @@ class BudgetService:
         # list in Python.
         rows = query.all()
         for sub, plan in rows:
+            period_start = _ensure_utc(sub.starts_at)
             period_end = _ensure_utc(sub.active_until)
+            # Not yet started → a future-dated "active" subscription does NOT
+            # grant quota (#266 / Codex-high MAJOR): otherwise usage recorded
+            # before ``starts_at`` is excluded by ``_sum_credits`` (created_at
+            # >= period_start) and the window acts as unmetered until it begins.
+            # All write paths set starts_at=now today, so this is defensive.
+            if period_start is not None and period_start > now:
+                continue
             if period_end is None or period_end > now:
                 return sub, plan
         return None, None

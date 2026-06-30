@@ -1255,10 +1255,13 @@ def test_conversation_exhausted_budget_returns_upgrade_prompt(monkeypatch, tmp_p
 def test_conversation_records_llm_usage_in_skill_ai_executions(monkeypatch, tmp_path: Path):
     # #105: заморозить часы биллинга на ПИК — иначе off-peak 0.8 после
     # 16:00 UTC даёт 320 вместо 400 (тест проверяет rate, не время).
+    # #266: дата — СЕГОДНЯ@10:00 (НЕ фикс-2026-06-12): _bootstrap сидит подписку
+    # относительно реального now (now−1д), а _active_subscription теперь требует
+    # starts_at<=now — фикс-прошлая дата сделала бы подписку «ещё не начавшейся».
     import sreda.services.budget as _b
     from datetime import datetime as _dt, timezone as _tz
-    monkeypatch.setattr(
-        _b, "_utcnow", lambda: _dt(2026, 6, 12, 10, 0, tzinfo=_tz.utc))
+    _peak_today = _dt.now(_tz.utc).replace(hour=10, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr(_b, "_utcnow", lambda: _peak_today)
     """After an LLM call, skill_ai_executions should have a row with
     the right tenant/feature/model/credits_consumed."""
     from langchain_core.messages import AIMessage
