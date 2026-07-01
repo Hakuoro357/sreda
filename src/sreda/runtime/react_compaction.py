@@ -94,37 +94,38 @@ def _history_prefix_hash(messages: Sequence[BaseMessage], n: int) -> str:
     return h.hexdigest()
 
 
-def _applicable_summary_text(summary, messages: Sequence[BaseMessage]) -> str:
-    """Fenced-текст выжимки, если она ПРИМЕНИМА; иначе '' (fail-open на обычную #194-проекцию).
+def _applicable_summary(summary, messages: Sequence[BaseMessage]) -> tuple[int, str]:
+    """(covered_n, fenced_text) если выжимка ПРИМЕНИМА к ВАЛИДНОМУ префиксу [:covered_n]; иначе (0, '').
 
     Применима ⟺ dict + знакомая версия + непустой text + валидный covered_message_count в пределах
-    истории + covered_hash совпал с хэшем реального префикса. Любой сбой/несовпадение → '' (без падения)."""
+    истории + covered_hash совпал с хэшем реального префикса [:covered_n]. Любой сбой/несовпадение →
+    (0, '') (fail-open на обычную #194-проекцию), без падения.
+
+    #232 шаг C: НЕТ требования n >= summary_coverage (бывший M2). Выжимка покрывает РОВНО [:covered_n], а
+    build_model_input проецирует ТОЛЬКО остаток messages[covered_n:] → [:n] ⊕ [n:] = вся история, дыры нет
+    by construction (раньше _project выкидывал [n:coverable] при полной проекции — отсюда и было нужно M2).
+    Заморожённая выжимка (n < coverable) теперь применима, [n:] показывается честно."""
     try:
         if not isinstance(summary, dict):
-            return ""
+            return 0, ""
         if summary.get("version") != _SUMMARY_VERSION:
-            return ""
+            return 0, ""
         text = summary.get("text")
         n = summary.get("covered_message_count")
         chash = summary.get("covered_hash")
         if not isinstance(text, str) or not text.strip():
-            return ""
+            return 0, ""
         if not isinstance(n, int) or isinstance(n, bool) or n <= 0 or n > len(messages):
-            return ""
+            return 0, ""
         if not isinstance(chash, str) or not chash:
-            return ""
+            return 0, ""
         if _history_prefix_hash(messages, n) != chash:
-            return ""  # история разошлась с выжимкой → не подставляем (анти-устаревание)
-        # R2 MAJOR: выжимка должна покрывать НЕ МЕНЬШЕ, чем сейчас выкидывается. Иначе стылая выжимка
-        # (covered=20 на треде из 100) пройдёт по hash, но _project выкинет середину ПОСЛЕ 20-го →
-        # выкинутое не покрыто справкой. Требуем n >= текущей границы покрытия, иначе fail-open (#194).
-        if n < summary_coverage(messages)[0]:
-            return ""
+            return 0, ""  # история разошлась с выжимкой → не подставляем (анти-устаревание)
         safe = _SUMMARY_FENCE_FAKE.sub("(справка)", text.strip())  # нельзя подделать границы блока
-        return f"\n\n{_SUMMARY_FENCE_BEGIN}\n{safe}\n{_SUMMARY_FENCE_END}"
+        return n, f"\n\n{_SUMMARY_FENCE_BEGIN}\n{safe}\n{_SUMMARY_FENCE_END}"
     except Exception:  # noqa: BLE001 — применимость выжимки НИКОГДА не валит ход
         logger.warning("react_compaction: summary applicability check failed → fail-open", exc_info=True)
-        return ""
+        return 0, ""
 
 
 class _Block:
@@ -375,15 +376,17 @@ def build_model_input(
     if not compacted:
         # влезло целиком → выжимка не нужна (полная история на месте); поведение #194
         return [SystemMessage(system_prompt), *projected]
-    # компакция сработала: если выжимка применима — резервируем её место и репроецируем (режем больше
-    # сырых блоков, выжимка << выкинутой середины). Выжимка идёт в sp → недропаема.
-    summary_block = _applicable_summary_text(summary, messages)
+    # компакция сработала: если выжимка применима (покрывает валидный префикс [:n]) — она ЗАМЕНЯЕТ этот
+    # префикс, а проецируем ТОЛЬКО остаток messages[n:] (#232 шаг C). [:n] ⊕ [n:] = вся история → дыры нет
+    # by construction; выжимка идёт в sp → недропаема; её место резервируем в бюджете остатка. n
+    # блок-выровнен (covered из summary_coverage) → messages[n:] начинается с границы блока.
+    summary_n, summary_block = _applicable_summary(summary, messages)
     if summary_block:
         try:
-            projected, compacted = _project(
-                list(messages), len(system_prompt) + len(summary_block), budget)
-        except Exception:  # noqa: BLE001 — выжимка не валит ход → без неё
-            logger.warning("react_compaction: reprojection with summary failed → without summary", exc_info=True)
+            projected, _ = _project(
+                list(messages)[summary_n:], len(system_prompt) + len(summary_block), budget)
+        except Exception:  # noqa: BLE001 — выжимка не валит ход → без неё (остаётся полная проекция)
+            logger.warning("react_compaction: reprojection of remainder with summary failed → without summary", exc_info=True)
             summary_block = ""
     if not _assert_valid_tool_sequence(projected):
         logger.warning("react_compaction: invalid projection → fail-closed full history")

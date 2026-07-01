@@ -366,7 +366,13 @@ def build_memory_tools(
         session=session, tenant_id=tenant_id, user_id=user_id,
         per_user_cap=_per_user_cap, is_free=_is_free_only,
     )
-    fetch_url_tool = build_fetch_url_tool()
+    # #244: fetch_url через выделенный фильтр-egress + per-day квота (no-refund).
+    # Контекст симметрично web_search; is_free тот же гейт. per_day/per_turn/proxy
+    # резолвятся из настроек внутри build_fetch_url_tool (None → settings).
+    fetch_url_tool = build_fetch_url_tool(
+        session=session, tenant_id=tenant_id, user_id=user_id,
+        is_free=_is_free_only,
+    )
     weather_tool = build_weather_tool()
 
     tools_list: list[Callable] = [

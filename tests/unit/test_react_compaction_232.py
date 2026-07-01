@@ -72,13 +72,33 @@ def test_summary_injected_when_compacted(monkeypatch):
     assert "Орбита" in sp              # текст выжимки реально вставлен
 
 
-def test_summary_below_coverage_fails_open(monkeypatch):
-    """R2 MAJOR: валидный hash, но выжимка покрывает МЕНЬШЕ текущей drop-зоны → НЕ вставляется (fail-open)."""
+def test_summary_below_coverage_now_applied_no_gap(monkeypatch):
+    """#232 шаг C (бывший M2 РАЗВЁРНУТ): выжимка покрывает МЕНЬШЕ текущей drop-зоны (заморожена) →
+    теперь ПРИМЕНЯЕТСЯ (валидный hash). Остаток messages[n:] проецируется ОТДЕЛЬНО → префикс [:n] заменён
+    выжимкой (не дублируется сырым), хвост на месте → дыры нет."""
     monkeypatch.setattr(rc, "TOTAL_BUDGET_CHARS", 300)
     msgs = _long_history()
     cov = rc.summary_coverage(msgs)[0]
-    s = _summary_for(msgs, covered_n=max(2, cov - 4))   # hash валиден (префикс цел), но покрытие < текущего
-    assert build_model_input("SP", msgs, enabled=True, summary=s)[0].content.find(FENCE) == -1
+    n = max(2, cov - 4)   # покрытие < текущего coverable, hash валиден (заморозка)
+    out = build_model_input("SP", msgs, enabled=True, summary=_summary_for(msgs, covered_n=n))
+    sp, body = out[0].content, out[1:]
+    assert FENCE in sp                                                          # ПРИМЕНЕНА (раньше fail-open)
+    assert all(msgs[0].content != getattr(m, "content", None) for m in body)   # [:n] заменён, не дублируется сырым
+    assert any(msgs[-1].content == getattr(m, "content", None) for m in body)  # хвост (current) на месте
+
+
+def test_stepC_frozen_prefix_byte_stable_across_turns(monkeypatch):
+    """#232 шаг C (ЦЕЛЬ эпика): при заморозке (та же выжимка) ведущий SystemMessage БАЙТ-идентичен между
+    ходами, хотя хвост дописался → кеш-дружественный стабильный префикс."""
+    monkeypatch.setattr(rc, "TOTAL_BUDGET_CHARS", 300)
+    msgs = _long_history()
+    n = max(2, rc.summary_coverage(msgs)[0] - 4)         # заморожено на [:n]
+    sp1 = build_model_input("SP", msgs, enabled=True, summary=_summary_for(msgs, covered_n=n))[0].content
+    # следующий ход: дописали реплику (хвост вырос), выжимка ТА ЖЕ — covered_n тот же, hash [:n] не изменился
+    msgs2 = msgs + [_human("новый вопрос"), _ai("новый ответ")]
+    sp2 = build_model_input("SP", msgs2, enabled=True, summary=_summary_for(msgs2, covered_n=n))[0].content
+    assert FENCE in sp1 and FENCE in sp2
+    assert sp1 == sp2   # ведущий префикс байт-идентичен между ходами → промпт-кеш держится
 
 
 def test_summary_not_injected_when_history_fits(monkeypatch):
@@ -185,7 +205,7 @@ def test_make_summary_record_roundtrip_applicable(monkeypatch):
     msgs = _long_history(n_turns=10)
     covered_n, _ = rc.summary_coverage(msgs)
     rec = rc.make_summary_record("ВЫЖИМКА теста", msgs, covered_n)
-    assert rc._applicable_summary_text(rec, msgs) != ""     # generation→consumption замкнуто
+    assert rc._applicable_summary(rec, msgs)[1] != ""     # generation→consumption замкнуто
 
 
 def test_fenced_block_neutralizes_fake_markers(monkeypatch):

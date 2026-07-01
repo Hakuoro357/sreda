@@ -68,6 +68,7 @@ def wired(monkeypatch, db):
     SF = db
     monkeypatch.setattr(rl, "_persist_enabled", lambda: True)
     monkeypatch.setattr(rl, "_summary_enabled_for", lambda tid: True)  # #232 канарейка-флаг: вкл для теста
+    monkeypatch.setattr(rl, "_SUMMARY_RECOMPACT_LIMIT_CHARS", 1)  # #232 шаг C: лимит≈0 → гейт размера не мешает тестам ген/дельты
     monkeypatch.setattr(rl, "build_slice_tools", lambda *a, **k: [])
     monkeypatch.setattr(rl, "react_provider", lambda tid: "inception-mercury2")
     monkeypatch.setattr(rl, "_extract_usage", lambda resp: (10, 5))
@@ -185,3 +186,41 @@ def test_recompression_ignores_invalid_prev(monkeypatch, wired):
     human_text = wired["prompts"][0][1].content
     assert "БИТАЯ-ВЫЖИМКА" not in human_text  # битый prev отвергнут (не «отмыт» в дельту)
     assert "вопрос0 " in human_text           # полный префикс с начала (дельта не включилась)
+
+
+def test_stepC_freeze_first_summary_below_limit(monkeypatch, wired):
+    """#232 шаг C: первая выжимка НЕ генерится, пока размер переписки ниже лимита (заморозка)."""
+    monkeypatch.setattr(rl, "_SUMMARY_RECOMPACT_LIMIT_CHARS", 10 ** 9)  # лимит огромный → размер не влезает
+    msgs = _hist(n_turns=12)  # ~2000 символов << лимита
+    monkeypatch.setattr(rl, "_build_graph", lambda *a, **k: _FakeGraph(_Snap({"messages": msgs})))
+    _run()
+    assert store.load_summary(wired["SF"](), _key()) is None  # заморожено — выжимки нет
+    assert not wired["prompts"]  # пересказчик НЕ вызывался
+
+
+def test_stepC_fires_above_limit(monkeypatch, wired):
+    """#232 шаг C: размер переписки превысил лимит → выжимка генерится."""
+    monkeypatch.setattr(rl, "_SUMMARY_RECOMPACT_LIMIT_CHARS", 50)  # маленький лимит
+    msgs = _hist(n_turns=12)  # ~2000 символов > 50
+    monkeypatch.setattr(rl, "_build_graph", lambda *a, **k: _FakeGraph(_Snap({"messages": msgs})))
+    _run()
+    assert store.load_summary(wired["SF"](), _key()) is not None  # лимит превышен → выжимка есть
+
+
+def test_stepC_freeze_with_prev_keeps_coverage(monkeypatch, wired):
+    """#232 шаг C (ядро кеш-стабильности): есть prev-выжимка, переписка подросла, но размер ниже лимита →
+    НЕ пере-сжимаем (covered_n и текст те же → префикс стабилен между ходами)."""
+    monkeypatch.setattr(rl, "_SUMMARY_RECOMPACT_LIMIT_CHARS", 10 ** 9)
+    msgs = _hist(n_turns=12)
+    prev_n = 4
+    s0 = wired["SF"]()
+    store.upsert_summary(s0, thread_id=_key(), tenant_id="tenant_tg_1", text="ЗАМОРОЖЕННАЯ-ВЫЖИМКА",
+                         covered_message_count=prev_n,
+                         covered_hash=rc._history_prefix_hash(msgs, prev_n), version=1)
+    s0.commit()
+    monkeypatch.setattr(rl, "_build_graph", lambda *a, **k: _FakeGraph(_Snap({"messages": msgs})))
+    _run()
+    rec = store.load_summary(wired["SF"](), _key())
+    assert rec["covered_message_count"] == prev_n          # НЕ пере-сжали → covered_n тот же (заморозка)
+    assert rec["text"] == "ЗАМОРОЖЕННАЯ-ВЫЖИМКА"            # выжимка та же
+    assert not wired["prompts"]                            # пересказчик НЕ вызывался

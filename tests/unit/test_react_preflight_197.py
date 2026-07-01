@@ -601,9 +601,10 @@ def test_domain_scope_execute_classify_failure_failopen(install, monkeypatch):
     assert "add_task" in cap["freddie"][-1]   # legacy fail-open: доменный фильтр НЕ применён
 
 
-def test_domain_scope_execute_guard_read_recovery(install, monkeypatch):
-    """R2 субагент (ПРАВИЛО #7): в execute guard full-recovery расширяет allowed_READ (recall_memory появляется
-    на 2-м проходе), но WRITE-гейт ЦЕЛ (add_task/schedule_reminder остаются срезаны) — #202 read-safe."""
+def test_domain_scope_execute_guard_no_domain_widening_267_a4(install, monkeypatch):
+    """#267 A4 (Борис «роутер побеждает», ЗАМЕНЯЕТ #202 read-recovery): в execute guard НЕ расширяет
+    домены роутера на отказе. Мис-классиф. (роутер=task, юзер про погоду) → recall_memory НЕ появляется
+    на 2-м проходе (раздел НЕ открыт); write-гейт по-прежнему цел. Планировщик остаётся в разделе/спросит."""
     from sreda.config import settings as sm
     cap = {}
     freddie = _Chat("freddie", classify="task", bound_capture=cap,
@@ -613,9 +614,9 @@ def test_domain_scope_execute_guard_read_recovery(install, monkeypatch):
     monkeypatch.setenv("SREDA_REACT_PRUNE_TENANTS", "t")
     monkeypatch.setenv("SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS", "t")  # Ф4: канареечный список
     sm.get_settings.cache_clear()
-    _turn(freddie, thread="guard-rec", text="погода завтра")  # web-маршрут; отказ → guard full-recovery
-    last_bound = cap["freddie"][-1]            # bind 2-го прохода (после guard-recovery)
-    assert "recall_memory" in last_bound       # read memory расширен guard-recovery (#202 сохранён)
+    _turn(freddie, thread="guard-rec", text="погода завтра")  # отказ → guard, но A4 НЕ расширяет домены
+    last_bound = cap["freddie"][-1]            # bind 2-го прохода (после guard-nudge, БЕЗ видения доменов)
+    assert "recall_memory" not in last_bound   # #267 A4: read-домен НЕ расширен (роутер побеждает)
     assert "add_task" not in last_bound        # write tasks НЕ расширен (write-гейт цел)
 
 

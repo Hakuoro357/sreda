@@ -641,6 +641,48 @@ class Settings(BaseSettings):
             "code falls back to a safe default."
         ),
     )
+    # --- #244: fetch_url SSRF egress + per-day квота -------------------------
+    # Маршрут fetch_url ТОЛЬКО через выделенный фильтр-egress туннель (C/nft на
+    # выходной ноде). Пусто → fetch FAIL-CLOSED (не direct/не env). Env —
+    # короткое ops-имя SREDA_FETCH_URL_PROXY (НЕ ..._URL), задаётся на шаге 5
+    # gate-раскатки ПОСЛЕ того как nft+туннель PORT2 подняты и probes зелёные.
+    react_fetch_url_proxy_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_FETCH_URL_PROXY",
+            "sreda_fetch_url_proxy",
+        ),
+        description=(
+            "#244: socks5://127.0.0.1:<PORT2> — ЕДИНСТВЕННЫЙ egress для fetch_url "
+            "(фильтр-туннель на выходной ноде). Пусто → fetch fail-closed."
+        ),
+    )
+    react_fetch_url_per_day_cap: int = Field(
+        default=50,
+        ge=1,
+        le=100000,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_FETCH_URL_PER_DAY_CAP",
+            "sreda_react_fetch_url_per_day_cap",
+        ),
+        description=(
+            "#244: дневной лимит fetch_url для FREE-тира (анти-злоупотребление; "
+            "paid/grandfathered — без лимита). NO-REFUND. Дефолт 50 — env-tunable."
+        ),
+    )
+    react_fetch_url_per_turn_cap: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_FETCH_URL_PER_TURN_CAP",
+            "sreda_react_fetch_url_per_turn_cap",
+        ),
+        description=(
+            "#244: storm-cap fetch_url в ОДНОМ ходе (#211) — отсекает шторм "
+            "параллельных fetch (paid/grandfathered иначе без дневного предела). Дефолт 5."
+        ),
+    )
     planner_prompt_version: int = Field(
         default=1,
         ge=1,

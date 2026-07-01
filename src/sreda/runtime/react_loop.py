@@ -191,8 +191,26 @@ _MSK = timezone(timedelta(hours=3))  # МСК = UTC+3 круглый год; л�
 
 _MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
            "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-_YES = {"да", "ага", "угу", "удали", "удаляй", "подтверждаю", "yes", "верно", "точно"}
+_YES = {"да", "ага", "угу", "подтверждаю", "yes", "верно", "точно"}
+# #267 A0: командные глаголы «удали»/«удаляй» УБРАНЫ из _YES — на confirm-паузе свободный текст
+# «удали Y» больше НЕ читается как «да» (была инверсия намерения: удалял НЕ ТО — CRITICAL). Свободный
+# текст классифицируется в classify_confirm_reply (ниже); в граф идёт ТОЛЬКО канон «да»/«нет».
 # Решение строится на `not _is_yes(...)` (всё не-«да» = отказ — fail-closed для удаления).
+_NEGATE = {"нет", "неа", "отмена", "отменить", "не надо", "не нужно"}
+
+
+def classify_confirm_reply(text: str) -> str:
+    """#267 A0: классификация СВОБОДНОГО ТЕКСТА юзера на confirm-паузе → "affirm"|"negate"|"redirect".
+    affirm — ТОЛЬКО строгий аффирматив (ТОЧНОЕ совпадение, БЕЗ командных глаголов): иначе «удали Y»
+    прочлось бы как «да» → удаление НЕ ТОГО (CRITICAL). negate — отмена. Всё прочее (вкл. «удали…»,
+    новое намерение) → redirect (Фаза B авто-переключит раздел; A0 безопасно трактует redirect как отказ).
+    Зовётся в handle_turn ДО Command(resume) — в граф идёт только канон «да»/«нет»."""
+    t = (text or "").strip().lower().rstrip("!.?")
+    if t in _YES:
+        return "affirm"
+    if t in _NEGATE:
+        return "negate"
+    return "redirect"
 
 # #166 Срез B: подтверждения Да/Нет кнопками. confirm-пауза несёт СТРУКТУРНЫЙ value
 # {"confirm": "<вопрос>"} (ask_human — обычная строка), чтобы канал прикрепил [Да][Нет].
@@ -1090,6 +1108,37 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
         elif tool_read_domains(name) <= ar and tool_write_domains(name) <= aw:
             out.append(t)
     return out
+
+
+def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any) -> str:
+    """#267 A: структурная причина недоступности инструмента — ЕДИНЫЙ источник для pre-scan,
+    need_family-handler и unavailable-dispatch. Различает «семья не загружена» (нужен need_family) от
+    «домен вне запроса» (need_family НЕ поможет). Закрывает trap: раньше need_family врал «загружена»,
+    а доменный фильтр резал заново → планировщик долбился в стену до лимита проходов. Возвращает:
+    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available."""
+    from sreda.services.tool_schemas.families import (
+        TOOL_OP_CLASS, tool_read_domains, tool_write_domains,
+    )
+    if name == "need_family":
+        fam = (args or {}).get("family")
+        if not isinstance(fam, str) or fam not in _LAZY_FAMILIES:
+            return "unknown_family"
+        if allowed_read is None and allowed_write is None:
+            return "available"  # домен не фильтруется (legacy/disabled) → семью грузить можно
+        # семья-раздел вне разрешённых доменов → её инструменты всё равно зарежет _apply_domain_policy
+        if fam not in set(allowed_read or ()) and fam not in set(allowed_write or ()):
+            return "domain_blocked"
+        return "available"
+    canon = _TOOL_NAME_ALIASES.get(name, name)
+    if canon not in TOOL_OP_CLASS:  # неизвестный/галлюцинированный инструмент → НЕ KeyError на tool_*_domains
+        return "unknown_tool"
+    if allowed_read is None and allowed_write is None:
+        return "family_not_loaded"  # домен не фильтруется → недоступность = семья не загружена
+    if not (tool_read_domains(canon) <= set(allowed_read or ())):
+        return "domain_blocked"
+    if not (tool_write_domains(canon) <= set(allowed_write or ())):
+        return "domain_blocked"
+    return "family_not_loaded"  # домен ок → недоступен значит семья ещё не в active
 
 
 # #165 Срез A guard — детерминированный backstop «не отказать молчаливо».
@@ -2199,7 +2248,13 @@ def _build_graph(llm: Any, all_tools: list, *,
             for _ptc in state["messages"][-1].tool_calls:
                 if _ptc.get("name") == "need_family":
                     _pf = (_ptc.get("args") or {}).get("family")
-                    if isinstance(_pf, str) and _pf in _LAZY_FAMILIES and _pf not in active:
+                    # #267 A: НЕ грузим домен-заблокированную семью в active (иначе протекает в state +
+                    # планировщик думает «загрузил», а доменный фильтр режет → trap).
+                    if (isinstance(_pf, str) and _pf in _LAZY_FAMILIES and _pf not in active
+                            and _tool_unavailable_reason(
+                                "need_family", {"family": _pf},
+                                state.get("router_allowed_read_domains"),
+                                state.get("router_allowed_write_domains")) != "domain_blocked"):
                         active.append(_pf)
                         added = True
         bound_by_name = {t.name: t for t in _apply_domain_policy(
@@ -2234,26 +2289,47 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # может галлюцинировать «utility»/«tasks»/мусор ИЛИ не-строку list/dict →
                 # `in frozenset` на unhashable дал бы TypeError → «потеряла контекст»; потому
                 # isinstance(str) ПЕРВЫМ). Невалидное → НЕ грузим, честная ошибка.
-                if isinstance(fam, str) and fam in _LAZY_FAMILIES:
+                _far = state.get("router_allowed_read_domains")
+                _faw = state.get("router_allowed_write_domains")
+                # #267 A: domain_blocked → честный отказ (НЕ «загружена ok» — иначе планировщик думает,
+                # что загрузил, а доменный фильтр режет заново → trap). Семью НЕ грузим.
+                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw)
+                if _nreason == "domain_blocked":
+                    _avail = ", ".join(sorted(set(_far or []) | set(_faw or []))) or "—"
+                    msg = (f"Раздел «{fam}» не относится к этому запросу (он про: {_avail}). "
+                           "Если цель в другом разделе — уточни у пользователя.")
+                    _rk = "domain_blocked"  # #192: не-исполнение, честно
+                elif _nreason == "unknown_family":
+                    msg = (f"Семья «{fam}» неизвестна. Доступные для добора: "
+                           + ", ".join(sorted(_LAZY_FAMILIES)) + ".")
+                    _rk = "unknown_family"  # #192: не-исполнение, НЕ успех вслепую
+                else:
                     if fam not in active:
                         active.append(fam)
                         added = True
                     msg = f"Семья «{fam}» загружена."
                     _rk = "ok"
-                else:
-                    msg = (f"Семья «{fam}» неизвестна. Доступные для добора: "
-                           + ", ".join(sorted(_LAZY_FAMILIES)) + ".")
-                    _rk = "unknown_family"  # #192: не-исполнение, НЕ успех вслепую
                 out.append(ToolMessage(content=msg, name=name, tool_call_id=tc["id"],
                                        artifact={"result_kind": _rk}))
                 continue
             tool_obj = bound_by_name.get(name)
             if tool_obj is None:
+                # #267 A: различаем «семья не загружена» (нужен need_family) от «раздел вне запроса»
+                # (need_family НЕ поможет — иначе trap: планировщик долбится в need_family по кругу).
+                _ufar = state.get("router_allowed_read_domains")
+                _ufaw = state.get("router_allowed_write_domains")
+                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw)
+                if _ureason == "domain_blocked":
+                    _uavail = ", ".join(sorted(set(_ufar or []) | set(_ufaw or []))) or "—"
+                    _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
+                             "need_family здесь не поможет. Если нужная цель в другом разделе — "
+                             "спроси у пользователя, что он имеет в виду.")
+                else:
+                    _umsg = (f"Инструмент {name} сейчас недоступен — сначала позови "
+                             "need_family нужной семьи.")
                 out.append(ToolMessage(
-                    content=(f"Инструмент {name} сейчас недоступен — сначала позови "
-                             "need_family нужной семьи."),
-                    name=name, tool_call_id=tc["id"],
-                    artifact={"result_kind": "unavailable"}))  # #192: не-исполнение
+                    content=_umsg, name=name, tool_call_id=tc["id"],  # #192: не-исполнение
+                    artifact={"result_kind": "domain_blocked" if _ureason == "domain_blocked" else "unavailable"}))
                 continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
@@ -2350,6 +2426,26 @@ def _build_graph(llm: Any, all_tools: list, *,
         # ничего не добираем (scope остаётся web-only, productivity не просачивается).
         if preflight_enabled and (state.get("intent") in ("chat", "fact")):
             return {}
+        # #267 A4 (Борис: «роутер побеждает»): в EXECUTE-режиме (роутер решил раздел) guard НЕ
+        # восстанавливается в ЧУЖОЙ раздел — НЕ грузит семьи вне allowed и НЕ расширяет домены роутера
+        # (иначе откатил бы его решение: recipes снова открылся бы, Codex high MAJOR). Один retry: nudge
+        # «останься в разделе ИЛИ спроси пользователя», без авто-эскейпа домена. Мис-классификация роутера
+        # ловится Фазой C (лог расхождений) + ревью владельца, а не молчаливым расширением.
+        if state.get("router_allowed_read_domains") is not None:
+            _a4_attempted = list(state.get("guard_attempted_families") or [])
+            _a4_fam = _guard_family(_last_human_text(state["messages"]),
+                                    state.get("active_families"))
+            if _a4_fam and _a4_fam not in _a4_attempted:
+                _a4_attempted.append(_a4_fam)
+            _a4_doms = ", ".join(sorted(state.get("router_allowed_read_domains") or [])) or "—"
+            return {
+                "guard_attempted_families": _a4_attempted,
+                "guard_full_attempted": True,  # один retry; дальше route не вернёт guard (анти-петля)
+                "guard_nudge": (f"Запрос относится к разделу: {_a4_doms}. Используй его инструменты. "
+                                "Если цель пользователя в другом разделе — спроси, что именно он хочет, "
+                                "не отвечай «не умею»."),
+            }
+        # legacy/disabled (allowed=None): прежняя recovery (домен не фильтруется → escape безопасен).
         # догрузить семью + пометить пробованной + ТРАНЗИЕНТНЫЙ nudge (через состояние, НЕ
         # сообщением в истории) → обратно в chat. turn_pass_count инкрементит chat. Один retry
         # на семью; если после него модель снова откажет — route не вернёт guard (в attempted).
@@ -2357,12 +2453,10 @@ def _build_graph(llm: Any, all_tools: list, *,
         attempted = list(state.get("guard_attempted_families") or [])
         fam = _guard_family(_last_human_text(state["messages"]), active)
         update: dict = {}
-        added: set[str] = set()  # #221 Ф3: семьи, реально ДОБРАННЫЕ этим guard-вызовом (для точного allowed_read)
         if fam and fam not in attempted:
             # точечный добор семьи по словарю-роутеру
             if fam not in active:
                 active.append(fam)
-                added.add(fam)
             attempted.append(fam)
             nudge = (f"Семья «{fam}» теперь загружена — выполни запрос пользователя её "
                      "инструментом, не отвечай «не умею».")
@@ -2374,7 +2468,6 @@ def _build_graph(llm: Any, all_tools: list, *,
             for f in _LAZY_FAMILIES:
                 if f not in active:
                     active.append(f)
-                    added.add(f)
             update["guard_full_attempted"] = True
             nudge = ("Все инструменты теперь доступны — выполни запрос пользователя, "
                      "не отвечай «не умею».")
@@ -2383,12 +2476,9 @@ def _build_graph(llm: Any, all_tools: list, *,
             "guard_attempted_families": attempted,
             "guard_nudge": nudge,
         })
-        # #221 Ф3: в execute расширить allowed_READ ТОЛЬКО реально добранными семьями (R1 high: не всем active —
-        # иначе при classifier-only маршруте вернулись бы чужие read-инструменты). WRITE НЕ расширяем (write-гейт
-        # сохранён; guard-recovery read-safe — route не пускает сюда после wrote_unkeyed). None → no-op (disabled).
-        if state.get("router_allowed_read_domains") is not None and added:
-            update["router_allowed_read_domains"] = sorted(
-                set(state.get("router_allowed_read_domains") or []) | added)
+        # #267 A4: видение router_allowed_read_domains УБРАНО — в execute сюда уже не доходим (вышли по
+        # A4-ветке выше, «роутер побеждает»); в legacy allowed=None и видение всё равно было no-op. Так
+        # guard-recovery больше НЕ откатывает доменное решение роутера.
         return update
 
     def stop(state: ReactState):
@@ -2691,6 +2781,12 @@ _SUMMARY_MAX_CONCURRENCY = 2     # backpressure: не больше N перес�
 _SUMMARY_LLM_TIMEOUT_S = 20.0    # wall-clock на вызов пересказчика
 _SUMMARY_MIN_COVERED_MSGS = 6    # базовый триггер: меньше старого — не сворачиваем (числа уточнит шаг C)
 _SUMMARY_MSG_CAP = 2000          # потолок content одного сообщения во входе пересказчика (анти-дамп)
+# #232 шаг C: ЗАМОРОЗКА ПО РАЗМЕРУ. Пере-сжимаем (и делаем первую выжимку), только когда
+# len(выжимка) + len(сообщения вне выжимки) ≥ этого лимита. Иначе выжимка ЗАМОРОЖЕНА → префикс промпта
+# стабилен между ходами → кеш модели держится (цель эпика). Не по числу сообщений и не по времени —
+# только по размеру переписки (Борис 2026-06-30). Половина TOTAL_BUDGET_CHARS(20000): сворачиваем с
+# запасом, ДО того как #194 начнёт резать середину. Рост самой выжимки ограничен SUMMARY_MAX_CHARS (обрез).
+_SUMMARY_RECOMPACT_LIMIT_CHARS = 10000
 _SUMMARY_SEM = asyncio.Semaphore(_SUMMARY_MAX_CONCURRENCY)
 _SUMMARY_SYS = (
     "Ты сжимаешь СЕРЕДИНУ переписки пользователя с ассистентом в краткую выжимку для памяти. "
@@ -2830,6 +2926,13 @@ async def _run_post_turn_summary_inner(
         chunk = coverable[prev_n:]
         if not chunk:
             return
+        # #232 шаг C — ЗАМОРОЗКА ПО РАЗМЕРУ: пере-сжимаем (и делаем первую выжимку) ТОЛЬКО когда
+        # len(выжимка) + len(сообщения вне выжимки) ≥ лимита. Иначе выжимка заморожена → префикс промпта
+        # стабилен между ходами → кеш модели держится. Применяется и к первой выжимке (prev_text=""), и к
+        # пере-сжатию. «Сообщения вне выжимки» = messages[prev_n:] (всё после уже покрытого префикса).
+        _uncovered_chars = sum(len(_text_content(getattr(m, "content", ""))) for m in messages[prev_n:])
+        if len(prev_text) + _uncovered_chars < _SUMMARY_RECOMPACT_LIMIT_CHARS:
+            return  # суммарный размер ниже лимита — заморозка, не пере-сжимаем (стабильный префикс)
         summary_llm = get_chat_llm(provider=_SUMMARY_PROVIDER, temperature=0.3)
         if summary_llm is None:
             logger.info("react_summary: summarizer provider unavailable (%s)", _SUMMARY_PROVIDER)
@@ -2979,7 +3082,16 @@ async def handle_turn(
                 return _Reply("")
 
         if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
-            result = await graph.ainvoke(Command(resume=user_text), _cfg(gen))
+            # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
+            # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
+            # уже шлёт канон (confirm_resume_text). ask_human (не confirm) — текст-ответ как есть.
+            # redirect → A0 трактует «нет» (безопасный отказ; авто-переключение раздела — Фаза B).
+            _resume_val = user_text
+            if not resume_only:
+                _, _is_confirm_pause, _ = _pending(snap)
+                if _is_confirm_pause:
+                    _resume_val = "да" if classify_confirm_reply(user_text) == "affirm" else "нет"
+            result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
             if _has_pause(snap):  # протухшая пауза → гасим
                 # #193: ВКЛ durable → ключ стабилен, паузу гасим ЯВНО (clear_pending: drop
