@@ -2776,7 +2776,7 @@ def _persist_debug_turn(*, tenant_id: str, user_id: str, thread_id: str, channel
 
 
 # --- #232 шаг B: пост-ходовая генерация выжимки истории (фасад) --------------
-_SUMMARY_PROVIDER = "openrouter-gemini-2.5-flash-lite"  # шаг 0 (eval 2026-06-27): EU + верность + 4-10× скорость
+_SUMMARY_PROVIDER = "openrouter-gemini-2.5-flash-lite"  # eval 2026-06-27: верность + 4-10× скорость; пин EU-Vertex снят 2026-07-01 (деградация→429, #257-корень) → residency НЕ гарантир.
 _SUMMARY_MAX_CONCURRENCY = 2     # backpressure: не больше N пересказов одновременно на процесс
 _SUMMARY_LLM_TIMEOUT_S = 20.0    # wall-clock на вызов пересказчика
 _SUMMARY_MIN_COVERED_MSGS = 6    # базовый триггер: меньше старого — не сворачиваем (числа уточнит шаг C)
