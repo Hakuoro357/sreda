@@ -292,7 +292,7 @@ _REASONING_PREFIX_RE = re.compile(
 # tool-call and our anchored regex skipped the match.
 _KNOWN_TOOL_NAMES = (
     # Memory
-    "save_core_fact", "save_episode", "recall_memory",
+    "save_core_fact", "create_memory_category", "save_episode", "recall_memory",
     # Web
     "web_search", "fetch_url", "log_unsupported_request",
     # Reminders
@@ -394,7 +394,7 @@ def strip_reasoning_prefix(text: str) -> str:
 # corresponding tool. Keep ordered as-registered — dispatch is by
 # membership only.
 _WRITE_TOOL_NAMES = frozenset({
-    "save_core_fact", "save_episode",
+    "save_core_fact", "create_memory_category", "save_episode",
     "save_recipe", "save_recipes_batch", "delete_recipe", "update_recipe",  # #210
     "add_shopping_items", "remove_shopping_items", "mark_shopping_bought",
     "update_shopping_item", "update_shopping_items_category",
@@ -613,7 +613,7 @@ _CATEGORY_TO_TOOLS: dict[str, frozenset[str]] = {
         "delete_checklist_item", "archive_checklist",
         "update_checklist_item",  # #210: правка пункта бэкает «изменила пункт»
     }),
-    "memory": frozenset({"save_core_fact", "save_episode"}),
+    "memory": frozenset({"save_core_fact", "create_memory_category", "save_episode"}),
 }
 
 

@@ -4025,7 +4025,7 @@ _TOOL_NAMES_SET: frozenset[str] = frozenset({
     "move_task_to_checklist", "mark_checklist_item_done",
     "delete_checklist_item", "archive_checklist", "update_checklist_item",  # #210
     # generic
-    "recall_memory", "save_core_fact", "save_episode",
+    "recall_memory", "save_core_fact", "create_memory_category", "save_episode",
     "get_weather", "web_search", "fetch_url",
     "log_unsupported_request",
     "reply_with_buttons",
@@ -4288,6 +4288,7 @@ _TOOL_TO_DOMAIN: dict[str, str] = {
     "cancel_reminder": "напоминания",
     # Память
     "save_core_fact": "память",
+    "create_memory_category": "память",
     "save_episode": "память",
     # Профиль
     "update_profile_field": "профиль",

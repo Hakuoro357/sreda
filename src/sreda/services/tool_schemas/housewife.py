@@ -94,6 +94,14 @@ class HousewifeToolError(BaseModel):
 # ---------------------------------------------------------------------------
 
 _STABLE_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # #270 create_memory_category: стабильный код НЕ зависит от имени категории (иначе fallback
+    # выводит код из всей строки с именем → разный код на каждый ввод, R1 Claude MINOR).
+    (re.compile(r"^категория\s+.+\s+уже\s+есть$", re.IGNORECASE), "category_exists"),
+    (re.compile(r"^имя\s+.+\s+зарезервировано.*$", re.IGNORECASE), "category_reserved"),
+    (re.compile(r"^имя не должно содержать.*$", re.IGNORECASE), "category_bad_name"),
+    (re.compile(r"^некорректное имя категории$", re.IGNORECASE), "category_bad_name"),
+    (re.compile(r"^пустое имя категории$", re.IGNORECASE), "category_empty_name"),
+    (re.compile(r"^не удалось определить категорию.*$", re.IGNORECASE), "category_resolve_failed"),
     # update_shopping_item: ``error: item 'sh_42' not found``
     (re.compile(r"^item\s+.+\s+not\s+found$", re.IGNORECASE), "item_not_found"),
     # task_chat_tools: ``error: task 'task_42' not found``
@@ -4594,7 +4602,8 @@ class CreateMemoryCategoryOk(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["created"] = "created"
     category_id: MemoryId
-    name: str
+    # R1 (Claude MINOR): непустое санитизированное имя (парсер берёт группу regex как есть).
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
 
 CreateMemoryCategoryOutput = Annotated[

@@ -66,11 +66,18 @@ keywords («ткани характеристики», «дети возраст
 
 CategoryName = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=100,
+        # R1 (Codex high): контрол-символы (\r\n\t\0 и прочие C0) ломают построчный контракт
+        # вывода `created:<id>:<name>` → отсекаем на входе. strip_whitespace снимает хвостовые.
+        pattern=r"^[^\x00-\x1f]+$",
+    ),
 ]
 """#262b: имя пользовательской категории памяти. 100 — как лимит мини-аппа
 (DB String(120), запас). Нормализация/уникальность — в repo (normalize_for_dedup);
-«Общее» зарезервировано за системной Common."""
+«Общее» зарезервировано за системной Common. Контрол-символы запрещены (R1)."""
 
 
 # ---------------------------------------------------------------------------

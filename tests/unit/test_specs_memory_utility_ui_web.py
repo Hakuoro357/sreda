@@ -25,6 +25,7 @@ from pydantic import TypeAdapter, ValidationError
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
 from sreda.services.tool_schemas.housewife import (
+    CreateMemoryCategoryOk,
     FetchUrlToolOk,
     HousewifeToolError,
     LogUnsupportedRequestOk,
@@ -207,6 +208,36 @@ def test_save_core_fact_parser_empty_content_error() -> None:
     parsed = parse_tool_output("save_core_fact", "error: empty content")
     assert isinstance(parsed, HousewifeToolError)
     assert parsed.error_code == "empty_content"
+
+
+def test_create_memory_category_parser_ok_colon_name() -> None:
+    # #270 R1: round-trip имени с двоеточием (жадный .+ в regex) — «работа: 2025» целиком в name
+    parsed = parse_tool_output("create_memory_category", "created:memcat_abc123:работа: 2025")
+    assert isinstance(parsed, CreateMemoryCategoryOk)
+    assert parsed.category_id == "memcat_abc123"
+    assert parsed.name == "работа: 2025"
+
+
+def test_create_memory_category_parser_error_stable_code() -> None:
+    # #270 R1 (Claude): стабильный error_code НЕ зависит от имени категории
+    for name in ("работа", "машина"):
+        parsed = parse_tool_output("create_memory_category", f"error: категория «{name}» уже есть")
+        assert isinstance(parsed, HousewifeToolError)
+        assert parsed.error_code == "category_exists"
+    reserved = parse_tool_output(
+        "create_memory_category", "error: имя «Общее» зарезервировано за системной категорией")
+    assert isinstance(reserved, HousewifeToolError)
+    assert reserved.error_code == "category_reserved"
+
+
+def test_category_name_input_rejects_control_chars() -> None:
+    # #270 R1 (Codex high): CategoryName отсекает контрол-символы (ломают построчный контракт)
+    from sreda.services.tool_schemas.specs_memory import CreateMemoryCategoryInput
+    with pytest.raises(Exception):
+        CreateMemoryCategoryInput(name="ма\nшина")
+    with pytest.raises(Exception):
+        CreateMemoryCategoryInput(name="ра\tбота")
+    assert CreateMemoryCategoryInput(name="работа: 2025").name == "работа: 2025"  # двоеточие ок
 
 
 def test_save_episode_parser_ok() -> None:

@@ -61,10 +61,69 @@ class _FakeLLM:
     ("кто у меня в семье", "household"),
     ("мой муж", "household"),
     ("запомни число 47", "memory"),
+    # #270: команды создания категории детерминированно роутятся в memory (ТОЧНЫЕ формы «категория»)
+    # — иначе флагман-команда create_memory_category не доедет до Фредди (write-гейт #221 fail-closed).
+    ("заведи категорию машина", "memory"),
+    ("создай категорию работа", "memory"),
+    ("новая категория здоровье", "memory"),
+    ("запомни в категорию машина купить масло", "memory"),
+    ("сделай раздел путешествия", "memory"),  # R3: creation-контекст «раздел» → memory (детерминированно)
+    # R2/R3-регрессия: генерик «раздел»/«категорическ*» И голое «категория» (общее с shopping) больше
+    # НЕ перехватывают чужие домены — memory только в creation-контексте.
+    ("покажи раздел покупок", "shopping"),
+    ("что в разделе меню", "menu"),
+    ("молоко в категорию молочные", "shopping"),  # R3 MAJOR: shopping-команда update_shopping_item
     ("погода на завтра", "web"),
 ])
 def test_route_primary_domain(text, expected_primary):
     assert route_domains(text).primary_domain == expected_primary
+
+
+def test_route_category_creation_reaches_memory_write_270():
+    """#270 acceptance: «заведи категорию X» даёт all_domains=(memory,) → write-гейт #221 пропустит
+    create_memory_category (write_domains={memory} ⊆ allowed). Без детерминированного корня всё висело
+    на LLM-фолбэке (R1 Claude MAJOR)."""
+    for text in ("заведи категорию машина", "создай категорию работа", "новая категория здоровье",
+                 "запомни в категорию машина купить масло", "сделай раздел путешествия"):
+        r = route_domains(text)
+        assert r.all_domains == ("memory",), f"{text!r} → {r.all_domains}, ожидали (memory,)"
+
+
+def test_route_shopping_category_not_hijacked_by_memory_270():
+    """#270 R3 MAJOR (оба Codex): «молоко в категорию молочные» — это shopping-команда
+    (update_shopping_item, у товара есть категория), а НЕ память. Голое «категория» больше не
+    роутит в memory; memory только в creation-контексте (_MEMORY_CREATION_PHRASES)."""
+    assert route_domains("молоко в категорию молочные").primary_domain == "shopping"
+    assert route_domains("добавь молоко в категорию молочка").primary_domain == "shopping"
+    assert route_domains("добавь в список покупок молоко в категорию молочка").primary_domain == "shopping"
+
+
+def test_route_creation_phrase_does_not_suppress_content_270():
+    """#270 R4 (Claude MAJOR): creation-фраза инъектит memory ТОЛЬКО когда в клаузе НЕТ контент-домена
+    (react_preflight.route_domains). Иначе «создай раздел покупок»/«новый раздел меню» глушили бы
+    shopping/menu (memory — action-домен). Чистая creation без контент-слова → memory."""
+    assert route_domains("создай раздел покупок").primary_domain == "shopping"
+    assert route_domains("новый раздел меню на неделю").primary_domain == "menu"
+    assert route_domains("создай раздел путешествия").all_domains == ("memory",)
+    assert route_domains("заведи категорию машина").all_domains == ("memory",)
+
+
+def test_category_creation_intent_is_task_270():
+    """#270 R2: интент команд создания категории = task ДЕТЕРМИНИРОВАННО. Доменный блок react_loop
+    гейтится intent==task; без этого команда висела бы на LLM-классификаторе (R2 Claude MAJOR)."""
+    from sreda.runtime.react_preflight import _must_task
+    for text in ("заведи категорию машина", "создай категорию работа", "новая категория здоровье",
+                 "новую категорию дом", "сделай раздел путешествия", "новый раздел работа"):
+        assert _must_task(text), f"{text!r} должно быть intent=task"
+
+
+def test_route_generic_razdel_not_hijacked_by_memory_270():
+    """#270 R2 регрессия (Claude MAJOR): генерик «раздел»/«категорическ*» НЕ уходят в memory —
+    перехватывали shopping/menu/chat, т.к. memory это action-домен с высоким приоритетом."""
+    assert route_domains("покажи раздел покупок").primary_domain == "shopping"
+    assert route_domains("что в разделе меню").primary_domain == "menu"
+    assert route_domains("ты категорически не права").primary_domain != "memory"
+    assert route_domains("раздели пиццу пополам").primary_domain != "memory"
 
 
 def test_route_spisok_pokupok_suppresses_checklists():

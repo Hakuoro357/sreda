@@ -90,19 +90,34 @@ def build_memory_tools(
     from the same turn."""
     repo = MemoryRepository(session)
 
+    def _has_control_chars(s: str) -> bool:
+        return any(ord(ch) < 32 for ch in s)  # \r \n \t \0 и прочие C0 — ломают построчный контракт
+
     def _resolve_or_create_category(name: str) -> str | None:
         """#262b: id категории по имени для (tenant,user) — существующая ИЛИ создать новую.
-        «Общее» (по нормализации) → системная Common. Пусто → None (= «Общее» дефолтом в save())."""
+        «Общее» (по нормализации) → системная Common. Пусто → None (= «Общее» дефолтом в save()).
+        R1-фиксы: контрол-символы → ValueError; гонка на create → ре-резолв конфликта; лог мусор-риска."""
         nm = (name or "").strip()
         if not nm:
             return None
+        if _has_control_chars(nm):
+            raise ValueError("category name contains control characters")
         norm = normalize_for_dedup(nm)
         if norm == COMMON_NAME_NORMALIZED:
             return repo.ensure_common(tenant_id, user_id)
         for c in repo.list_categories(tenant_id, user_id):
             if c.name_normalized == norm:
                 return c.id
-        cat = repo.create_category(tenant_id, user_id, nm)
+        try:
+            cat = repo.create_category(tenant_id, user_id, nm)
+        except CategoryNameConflict:
+            # гонка: категория создана конкурентно между list_categories и create → ре-резолв (R1 high+medium)
+            for c in repo.list_categories(tenant_id, user_id):
+                if c.name_normalized == norm:
+                    return c.id
+            raise
+        # наблюдаемость: категория заведена как ПОБОЧНЫЙ эффект save (риск мусора от ASR/опечатки — R1 Claude)
+        logger.info("category_created_via_save: tenant=%s user=%s name=%r", tenant_id, user_id, nm)
         return cat.id
 
     @lc_tool
@@ -125,7 +140,14 @@ def build_memory_tools(
         if not text:
             return "error: empty content"
         _log_memory_date_drift(text, "save_core_fact", tenant_id, user_id)
-        category_id = _resolve_or_create_category(category) if category else None
+        category_id = None
+        if category:
+            try:
+                category_id = _resolve_or_create_category(category)
+            except ValueError:
+                return "error: некорректное имя категории"
+            except CategoryNameConflict:
+                return f"error: не удалось определить категорию «{category}», попробуйте ещё раз"
         try:
             embedding = embedding_client.embed_document(text)
         except Exception as exc:  # noqa: BLE001
@@ -156,6 +178,8 @@ def build_memory_tools(
         display = (name or "").strip()
         if not display:
             return "error: пустое имя категории"
+        if _has_control_chars(display):
+            return "error: имя не должно содержать переводы строк или спецсимволы"
         if normalize_for_dedup(display) == COMMON_NAME_NORMALIZED:
             return "error: имя «Общее» зарезервировано за системной категорией"
         try:

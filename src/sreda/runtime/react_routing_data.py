@@ -34,4 +34,8 @@ FAMILY_ROOTS: dict[str, tuple[str, ...]] = {
 # («муж»→мужчина/мужской). Точное равенство даёт recall на «мой муж»/«о муже» без ложных.
 FAMILY_EXACT_ROOTS: dict[str, tuple[str, ...]] = {
     "household": ("муж", "муже"),
+    # #270 R3: голое «категория» НЕ роутим в memory — слово ОБЩЕЕ с shopping (update_shopping_item:
+    # trigger «молоко в категорию молочные») + memory как action-домен перехватывал бы легитимную
+    # shopping-команду (R3 MAJOR, оба Codex). Создание категории ПАМЯТИ детерминируется в route_domains
+    # по creation-контексту (_MEMORY_CREATION_PHRASES), не по голому существительному.
 }

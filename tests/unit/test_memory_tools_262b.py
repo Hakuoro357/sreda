@@ -89,3 +89,39 @@ def test_save_fact_without_category_goes_to_common(ctx):
     common = next(c for c in _repo(s).list_categories("t1", "u1") if c.is_system)
     facts = _repo(s).list_facts_in_category("t1", "u1", common.id)
     assert any("Москве" in f.content for f in facts)
+
+
+def test_create_category_rejects_control_chars(ctx):
+    """R1 (Codex high): контрол-символы ломают построчный контракт created:<id>:<name> → отсекаем."""
+    s, tools = ctx
+    out = tools["create_memory_category"].invoke({"name": "ма\nшина"})
+    assert out.startswith("error:") and ("спецсимвол" in out or "переводы" in out)
+    assert not [c for c in _repo(s).list_categories("t1", "u1") if "\n" in c.name]  # в БД не записалась
+
+
+def test_save_fact_rejects_control_char_category(ctx):
+    """R1: category с контрол-символом → error, факт НЕ уходит молча в «Общее»."""
+    s, tools = ctx
+    out = tools["save_core_fact"].invoke({"content": "тест", "category": "ра\tбота"})
+    assert out.startswith("error:") and "имя" in out
+
+
+def test_save_fact_category_race_reresolves(ctx, monkeypatch):
+    """R1 (Codex high+medium): гонка — категория создана конкурентно между list и create.
+    Симуляция: 1-й list_categories → [] (не нашли), create ловит CategoryNameConflict (категория УЖЕ
+    есть), ре-резолв (2-й list) находит её → факт сохранён, инструмент НЕ падает."""
+    s, tools = ctx
+    tools["create_memory_category"].invoke({"name": "машина"})  # категория уже существует + закоммичена
+    real_list = MemoryRepository.list_categories
+    state = {"n": 0}
+
+    def fake_list(self, t, u):
+        state["n"] += 1
+        return [] if state["n"] == 1 else real_list(self, t, u)
+
+    monkeypatch.setattr(MemoryRepository, "list_categories", fake_list)
+    out = tools["save_core_fact"].invoke({"content": "купить ТО", "category": "машина"})
+    monkeypatch.undo()
+    assert out.startswith("saved_core:")  # НЕ error — ре-резолв нашёл существующую
+    cat = next(c for c in _repo(s).list_categories("t1", "u1") if c.name == "машина")
+    assert any("ТО" in f.content for f in _repo(s).list_facts_in_category("t1", "u1", cat.id))
