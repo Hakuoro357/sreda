@@ -122,8 +122,10 @@ def test_dashboard_full_snapshot_renders_all_sections(client, session_factory):
             "by_unpriced": [{"tenant_id": "t2", "name": "Tenant2", "tokens": 9000}]},
         "balances": [{"key": "openrouter", "label": "OpenRouter", "status": "ok",
                       "headline": "$12.40", "details": ""}],
-        "llm_chain": {"primary": "mercury-2", "fallback": "osa-groq",
-                      "planner": "mercury-2"},
+        # значения цепочки уникальны в payload'е (R2 субагент MINOR):
+        # совпадение с model в errors/slow/cost не маскирует пропажу блока
+        "llm_chain": {"primary": "chat-primary-x", "fallback": "osa-groq",
+                      "planner": "planner-model-x"},
     })
     s.close()
     resp = client.get("/admin/", params={"token": "T"})
@@ -142,7 +144,8 @@ def test_dashboard_full_snapshot_renders_all_sections(client, session_factory):
     assert "timeout" in html and "10:15" in html
     assert "31.5 с" in html
     # LLM-цепочка
-    assert "mercury-2" in html and "osa-groq" in html
+    assert "chat-primary-x" in html and "osa-groq" in html
+    assert "planner-model-x" in html
 
 
 def test_dashboard_survives_garbage_snapshot(client, session_factory):
