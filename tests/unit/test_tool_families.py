@@ -325,8 +325,9 @@ def test_manifest_assigns_expected_tasks_count() -> None:
 def test_manifest_assigns_expected_checklists_count() -> None:
     # #143 Phase B: +list_checklist_items → 9.
     # #210: +update_checklist_item (ReAct-only) → 10.
+    # #213 Срез A: +get_checklist (ReAct-only, единый read) → 11.
     checklists_tools = [t for t, f in TOOL_FAMILY_MANIFEST.items() if f == "checklists"]
-    assert len(checklists_tools) == 10
+    assert len(checklists_tools) == 11
 
 
 @pytest.mark.parametrize("tool_name", [
@@ -632,6 +633,7 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
         "mark_checklist_item_done", "delete_checklist_item",
         "archive_checklist",
         "update_checklist_item",  # #210: ReAct-only (в манифесте, без plan-execute спека)
+        "get_checklist",  # #213 Срез A: ReAct-only единый read (items|overview)
     }),
     "onboarding": frozenset({
         "onboarding_answered", "onboarding_deferred",
@@ -664,11 +666,12 @@ def test_manifest_exact_tool_set_per_family(
 
 
 def test_manifest_total_size_is_59() -> None:
-    # 7+4+6+5+4+11+10+3+1+4+1+3 = 59. #143 Phase B добавил
+    # 7+4+6+5+4+11+11+3+1+4+1+3 = 60. #143 Phase B добавил
     # list_checklist_items (checklists 8→9, итог 55→56). #210 добавил
     # update_recipe (recipes 5→6) и update_checklist_item (checklists 9→10),
     # оба ReAct-only — итог 56→58. #262b create_memory_category (memory 3→4) → 59.
-    assert len(TOOL_FAMILY_MANIFEST) == 59
+    # #213 Срез A: get_checklist (checklists 10→11, ReAct-only) → 60.
+    assert len(TOOL_FAMILY_MANIFEST) == 60
 
 
 def test_react_only_tools_are_in_manifest() -> None:

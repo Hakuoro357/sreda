@@ -470,11 +470,12 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "detach_reminder": "tasks",
     "link_task_to_checklist": "tasks",
     "unlink_task": "tasks",
-    # ---- checklists (9) ---------------------------------------------------
+    # ---- checklists (10) --------------------------------------------------
     "create_checklist": "checklists",
     "add_checklist_items": "checklists",
     "list_checklists": "checklists",
     "show_checklist": "checklists",
+    "get_checklist": "checklists",  # #213 Срез A: единый read (items|overview); старая пара → deprecated-алиасы
     "list_checklist_items": "checklists",
     "move_task_to_checklist": "checklists",
     "mark_checklist_item_done": "checklists",
@@ -526,6 +527,11 @@ entry. Test ``test_manifest_covers_all_55_tools`` enforces the count
 REACT_ONLY_TOOLS: Final[frozenset[str]] = frozenset({
     "update_checklist_item",
     "update_recipe",
+    "get_checklist",  # #213 Срез A: единый read чек-листов, только ReAct
+    # #262b/#270: долг Среза 1 закрыт в #213 Срезе A — полный spec+parser
+    # комплект для мёртвого пути раздувал prod-like префикс планировщика
+    # (headroom-гейт) и требовал презентер. ReAct-only по канону #210.
+    "create_memory_category",
 })
 
 
@@ -555,7 +561,8 @@ TOOL_OP_CLASS: Final[Mapping[str, str]] = MappingProxyType({
     "attach_reminder": "write", "detach_reminder": "write", "link_task_to_checklist": "write",
     "unlink_task": "write",
     "create_checklist": "write", "add_checklist_items": "write", "list_checklists": "read_pure",
-    "show_checklist": "read_pure", "list_checklist_items": "read_pure", "move_task_to_checklist": "write",
+    "show_checklist": "read_pure", "get_checklist": "read_pure",  # #213 Срез A
+    "list_checklist_items": "read_pure", "move_task_to_checklist": "write",
     "mark_checklist_item_done": "write", "update_checklist_item": "write",
     "delete_checklist_item": "write", "archive_checklist": "write",
     "onboarding_answered": "write", "onboarding_deferred": "write", "onboarding_complete": "write",
@@ -595,6 +602,18 @@ def tool_write_domains(name: str) -> frozenset[str]:
     return frozenset(_TOOL_WRITE_DOMAIN_OVERRIDES.get(name, (TOOL_FAMILY_MANIFEST[name],)))
 
 
+# #213 Срез A: депрекейт-алиасы read-инструментов чек-листов. LLM-origin вызов
+# старого имени при SREDA_CHECKLIST_UNIFIED=ON канонизируется в цель (react_loop
+# tool-node, ДО unavailable-ветки; аргументы маппит _map_deprecated_args там же).
+# Internal-пути (parse-путь housewife, replay, eval) зовут старые имена напрямую
+# и от флага не зависят. Старые имена ОСТАЮТСЯ в манифесте/op-class (нужны
+# internal-путям и тестам согласия); при ON они лишь скрыты из LLM-экспозиции.
+DEPRECATED_TOOL_ALIASES: Final[Mapping[str, str]] = MappingProxyType({
+    "list_checklists": "get_checklist",
+    "show_checklist": "get_checklist",
+})
+
+
 def _validate_tool_op_metadata() -> None:
     """Import-time полнота/согласованность (R1-ревью: unknown op-class → raise, не молчание на проде)."""
     miss = set(TOOL_FAMILY_MANIFEST) - set(TOOL_OP_CLASS)
@@ -607,6 +626,13 @@ def _validate_tool_op_metadata() -> None:
     for n in {**_TOOL_READ_DOMAIN_OVERRIDES, **_TOOL_WRITE_DOMAIN_OVERRIDES}:
         if n not in TOOL_FAMILY_MANIFEST:
             raise RuntimeError(f"override для несуществующего инструмента: {n!r}")
+    # #213 Срез A: alias и его цель обязаны существовать в манифесте, цель не может
+    # сама быть алиасом (иначе цепочка канонизации).
+    for alias, target in DEPRECATED_TOOL_ALIASES.items():
+        if alias not in TOOL_FAMILY_MANIFEST or target not in TOOL_FAMILY_MANIFEST:
+            raise RuntimeError(f"deprecated-alias вне манифеста: {alias!r}→{target!r}")
+        if target in DEPRECATED_TOOL_ALIASES:
+            raise RuntimeError(f"deprecated-alias цепочка запрещена: {alias!r}→{target!r}")
     for n in _TOOL_WRITE_DOMAIN_OVERRIDES:
         if TOOL_OP_CLASS[n] != "write":
             raise RuntimeError(f"write-override для не-write инструмента: {n!r} ({TOOL_OP_CLASS[n]})")

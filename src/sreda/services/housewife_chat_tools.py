@@ -3123,6 +3123,98 @@ def build_housewife_tools(
             lines.append(f"[{it.id}] {mark} {it.title}")
         return "\n".join(lines)
 
+    def _result_id() -> str:
+        """#213 Срез A: короткий id результата для envelope (source_result_id
+        write-enforcement'а среза B). Стабилен при перевыполнении узла:
+        берём хвост operation_id (он детерминирован от turn_key+step_id),
+        fallback — uuid4 (вне ReAct-контекста, напр. юнит-вызов)."""
+        from uuid import uuid4 as _uuid4
+
+        from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+        ctx = current_tool_runtime()
+        if ctx is not None and getattr(ctx, "operation_id", None):
+            return "r" + str(ctx.operation_id)[-10:]
+        return "r" + _uuid4().hex[:10]
+
+    def _unified_on() -> bool:
+        from sreda.config.settings import get_settings
+
+        return bool(get_settings().checklist_unified_enabled)
+
+    @lc_tool
+    def get_checklist(mode: str, name: str | None = None) -> str:
+        """Показать чек-листы: пункты ОДНОГО списка или обзор всех.
+
+        #213 Срез A — единый read-инструмент вместо пары
+        list_checklists/show_checklist. Схема обязательная:
+          mode="items"    — пункты одного списка; name ОБЯЗАТЕЛЕН
+                            (id ``checklist_…`` или название);
+          mode="overview" — все списки со счётчиками; name ЗАПРЕЩЁН.
+        Нарушение схемы → структурная ошибка (не исполнение).
+        Первая строка ответа — паспорт результата (result_type/result_id/…),
+        дальше тело в построчном формате.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        rid = _result_id()
+        m = (mode or "").strip().lower()
+        if m not in ("items", "overview"):
+            return "error: invalid_mode — mode строго items|overview"
+        clean_name = (name or "").strip()
+
+        if m == "overview":
+            if clean_name:
+                # хедж внутри валидной схемы невозможен: overview не принимает имя
+                return ("error: name_forbidden_for_overview — либо mode=items с name, "
+                        "либо mode=overview без name")
+            rows = checklist_service.list_active(tenant_id=tenant_id, user_id=user_id)
+            head = f"result_type=overview result_id={rid} count={len(rows)}"
+            if not rows:
+                return head + "\nno checklists"
+            lines = [head]
+            for cl in rows:
+                p, d, t = checklist_service.list_summary(list_id=cl.id)
+                lines.append(f"[{cl.id}] · {cl.title} · {p} pending, {d} done, {t} total")
+            return "\n".join(lines)
+
+        # mode == "items"
+        if not clean_name:
+            return ("error: name_required — назови список (mode=items требует name); "
+                    "своё имя НЕ выдумывай, спроси пользователя «какой список?»")
+        res = checklist_service.resolve_list_by_title_ranked(
+            tenant_id=tenant_id, user_id=user_id, needle=clean_name,
+        )
+        if res.status == "not_found":
+            # ВАЖНО (класс #213): имена других списков НЕ перечисляем —
+            # конкурирующий перечень в контексте и есть исходный баг.
+            return (f"result_type=items result_id={rid} resolution=not_found\n"
+                    f"not_found: список «{clean_name}» не найден — скажи пользователю "
+                    "и уточни название")
+        if res.status == "ambiguous":
+            lines = [
+                f"result_type=items result_id={rid} resolution=ambiguous "
+                f"candidates={len(res.candidates)}",
+                "ambiguous: несколько подходящих списков — уточни у пользователя, "
+                "какой именно (пункты НЕ показаны):",
+            ]
+            for cl in res.candidates:
+                lines.append(f"[{cl.id}] · {cl.title}")
+            return "\n".join(lines)
+
+        cl = res.checklist
+        matched_by = "exact" if res.status == "exact" else "fuzzy"
+        head = (f"result_type=items result_id={rid} checklist=\"{cl.title}\" "
+                f"checklist_id={cl.id} matched_by={matched_by} resolution={res.status}")
+        items = checklist_service.list_items(list_id=cl.id)
+        if not items:
+            return head + f"\nempty: list={cl.id} title={cl.title!r}"
+        lines = [head]
+        for it in items:
+            mark = {"pending": "☐", "done": "☑", "cancelled": "✗"}.get(it.status, "?")
+            lines.append(f"[{it.id}] {mark} {it.title}")
+        return "\n".join(lines)
+
     @lc_tool
     def list_checklist_items(
         title_match: str, list_title_match: str | None = None,
@@ -3161,6 +3253,14 @@ def build_housewife_tools(
                 lines.append(
                     f"[{it.id}] {mark} {it.title} @ [{cl.id}] {cl.title}"
                 )
+        # #213 Срез A: при unified=ON search-результат получает паспорт (envelope),
+        # чтобы items/overview/search были различимы структурно. При OFF —
+        # байт-в-байт легаси (без заголовка).
+        if _unified_on():
+            head = f"result_type=search result_id={_result_id()} matches={len(lines)}"
+            if not lines:
+                return head + "\nempty"
+            return "\n".join([head, *lines])
         if not lines:
             return "empty"
         return "\n".join(lines)
@@ -3351,6 +3451,10 @@ def build_housewife_tools(
         add_checklist_items,
         list_checklists,
         show_checklist,
+        # #213 Срез A: единый read (mode=items|overview). Фабрика отдаёт ВСЕГДА
+        # (нужен канонизации LLM-origin алиасов при ON); ЭКСПОЗИЦИЯ LLM решается
+        # флагом SREDA_CHECKLIST_UNIFIED в react_loop (OFF → скрыт, byte-identical).
+        get_checklist,
         # #143 Phase B: читающий шаг «по описанию» → .only → mark/delete по id
         list_checklist_items,
         mark_checklist_item_done,

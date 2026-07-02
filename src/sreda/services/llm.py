@@ -293,6 +293,8 @@ _REASONING_PREFIX_RE = re.compile(
 _KNOWN_TOOL_NAMES = (
     # Memory
     "save_core_fact", "create_memory_category", "save_episode", "recall_memory",
+    # Checklists unified read (#213 Срез A) — скраббер синтаксиса, безопасен при OFF
+    "get_checklist",
     # Web
     "web_search", "fetch_url", "log_unsupported_request",
     # Reminders
@@ -460,7 +462,8 @@ _CLAIM_VERBS = ("сохранил", "сохранила", "сохранено",
 #     read tool does not back a mutation claim).
 #   • «✅ В список покупок: молоко» + show_checklist → still fires (object
 #     is shopping, not checklist — display backing never applies).
-_CHECKLIST_DISPLAY_TOOLS: frozenset[str] = frozenset({"show_checklist"})
+# #213 Срез A: get_checklist добавлен — при unified=ON пункты (☑/☐) рендерит он.
+_CHECKLIST_DISPLAY_TOOLS: frozenset[str] = frozenset({"show_checklist", "get_checklist"})
 # Subset of _CLAIM_VERBS that describe rendered checklist item STATE rather
 # than a mutation. Only these get the read-tool backing for the «checklist»
 # category. Deliberately narrow (Codex r2 high MAJOR/MEDIUM):
@@ -718,17 +721,19 @@ _READ_OBJECT_TO_TOOL: tuple[tuple[str, frozenset[str]], ...] = (
     # Cutting plan / checklists — stored as checklists or memory.
     # Все падежи «план кроя»: nom «план кро», instr «плану кро»,
     # gen «плана кро», loc «плане кро».
-    ("план кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
-    ("плану кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
-    ("плана кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
-    ("плане кро", frozenset({"list_checklists", "show_checklist", "recall_memory"})),
+    # #213 Срез A: get_checklist в expected-сетах — при unified=ON именно он
+    # легитимный backing для checklist-claim'ов (добавка безопасна при OFF).
+    ("план кро", frozenset({"list_checklists", "show_checklist", "get_checklist", "recall_memory"})),
+    ("плану кро", frozenset({"list_checklists", "show_checklist", "get_checklist", "recall_memory"})),
+    ("плана кро", frozenset({"list_checklists", "show_checklist", "get_checklist", "recall_memory"})),
+    ("плане кро", frozenset({"list_checklists", "show_checklist", "get_checklist", "recall_memory"})),
     # Checklist. Codex r2 #2: bare «пункт» dropped — false-positives
     # on «пункт назначения», «сборный пункт», «пункт повестки» where
     # nothing checklist-related is claimed. Чек-лист/чеклист/чек лист
     # сами по себе достаточный discriminator.
-    ("чек-лист", frozenset({"list_checklists", "show_checklist"})),
-    ("чеклист", frozenset({"list_checklists", "show_checklist"})),
-    ("чек лист", frozenset({"list_checklists", "show_checklist"})),
+    ("чек-лист", frozenset({"list_checklists", "show_checklist", "get_checklist"})),
+    ("чеклист", frozenset({"list_checklists", "show_checklist", "get_checklist"})),
+    ("чек лист", frozenset({"list_checklists", "show_checklist", "get_checklist"})),
     # Memory
     ("памят", frozenset({"recall_memory"})),
     ("в записях", frozenset({"recall_memory"})),

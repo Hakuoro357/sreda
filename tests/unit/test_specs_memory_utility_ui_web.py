@@ -25,7 +25,6 @@ from pydantic import TypeAdapter, ValidationError
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
 from sreda.services.tool_schemas.housewife import (
-    CreateMemoryCategoryOk,
     FetchUrlToolOk,
     HousewifeToolError,
     LogUnsupportedRequestOk,
@@ -78,9 +77,11 @@ from sreda.services.tool_schemas.specs_web import (
 
 
 def test_memory_specs_construct() -> None:
-    assert len(MEMORY_SPECS) == 4
+    # #213 Срез A: create_memory_category переведён в REACT_ONLY_TOOLS
+    # (долг #270 — spec-обвязка мёртвого plan-execute пути не строится).
+    assert len(MEMORY_SPECS) == 3
     assert {s.name for s in MEMORY_SPECS} == {
-        "save_core_fact", "create_memory_category", "save_episode", "recall_memory",
+        "save_core_fact", "save_episode", "recall_memory",
     }
 
 
@@ -111,7 +112,10 @@ def test_all_four_families_pass_quality_strict() -> None:
 
 
 def test_manifest_matches_specs() -> None:
+    from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS
+
     for family, expected in [
+        # create_memory_category — в манифесте (ReAct-фильтр), но ReAct-only (без спека)
         ("memory", {"save_core_fact", "create_memory_category", "save_episode", "recall_memory"}),
         ("utility", {"log_unsupported_request"}),
         ("ui", {"reply_with_buttons"}),
@@ -121,6 +125,10 @@ def test_manifest_matches_specs() -> None:
             name for name, fam in TOOL_FAMILY_MANIFEST.items() if fam == family
         }
         assert manifest == expected, f"{family}: {manifest} vs {expected}"
+    # спеки покрывают манифест за вычетом ReAct-only
+    memory_specs = {s.name for s in MEMORY_SPECS}
+    manifest_memory = {n for n, f in TOOL_FAMILY_MANIFEST.items() if f == "memory"}
+    assert manifest_memory - REACT_ONLY_TOOLS == memory_specs
 
 
 @pytest.mark.parametrize("spec", [
@@ -210,34 +218,21 @@ def test_save_core_fact_parser_empty_content_error() -> None:
     assert parsed.error_code == "empty_content"
 
 
-def test_create_memory_category_parser_ok_colon_name() -> None:
-    # #270 R1: round-trip имени с двоеточием (жадный .+ в regex) — «работа: 2025» целиком в name
-    parsed = parse_tool_output("create_memory_category", "created:memcat_abc123:работа: 2025")
-    assert isinstance(parsed, CreateMemoryCategoryOk)
-    assert parsed.category_id == "memcat_abc123"
-    assert parsed.name == "работа: 2025"
+# #213 Срез A: парсер-тесты create_memory_category удалены вместе с парсером
+# (инструмент ReAct-only, канон #210; runtime-поведение пинят тесты
+# test_memory_tools_262b.py). Гарантия контрол-символов (#270 R1 Codex high)
+# сохранена ниже через CategoryName у save_core_fact(category=...).
 
 
-def test_create_memory_category_parser_error_stable_code() -> None:
-    # #270 R1 (Claude): стабильный error_code НЕ зависит от имени категории
-    for name in ("работа", "машина"):
-        parsed = parse_tool_output("create_memory_category", f"error: категория «{name}» уже есть")
-        assert isinstance(parsed, HousewifeToolError)
-        assert parsed.error_code == "category_exists"
-    reserved = parse_tool_output(
-        "create_memory_category", "error: имя «Общее» зарезервировано за системной категорией")
-    assert isinstance(reserved, HousewifeToolError)
-    assert reserved.error_code == "category_reserved"
-
-
-def test_category_name_input_rejects_control_chars() -> None:
-    # #270 R1 (Codex high): CategoryName отсекает контрол-символы (ломают построчный контракт)
-    from sreda.services.tool_schemas.specs_memory import CreateMemoryCategoryInput
+def test_category_name_rejects_control_chars() -> None:
+    # #270 R1 (Codex high): CategoryName отсекает контрол-символы (ломают построчный контракт).
+    # #213: проверяем через SaveCoreFactInput.category — та же аннотация CategoryName.
     with pytest.raises(Exception):
-        CreateMemoryCategoryInput(name="ма\nшина")
+        SaveCoreFactInput(content="факт про машину", category="ма\nшина")
     with pytest.raises(Exception):
-        CreateMemoryCategoryInput(name="ра\tбота")
-    assert CreateMemoryCategoryInput(name="работа: 2025").name == "работа: 2025"  # двоеточие ок
+        SaveCoreFactInput(content="факт про работу", category="ра\tбота")
+    ok = SaveCoreFactInput(content="факт", category="работа: 2025")
+    assert ok.category == "работа: 2025"  # двоеточие ок
 
 
 def test_save_episode_parser_ok() -> None:
@@ -764,10 +759,11 @@ def test_typeadapter_rejects_sentinel() -> None:
 
 def test_migrated_count_is_57() -> None:
     """Sub-A4 closure: every housewife + cross-skill tool typed.
-    #143 Phase B добавил list_checklist_items → 56; #262b create_memory_category → 57."""
+    #143 Phase B добавил list_checklist_items → 56; #262b create_memory_category → 57;
+    #213 Срез A увёл create_memory_category в REACT_ONLY (без спека) → 56."""
     from sreda.services.tool_schemas.specs import MIGRATED_TOOL_SPECS
-    assert len(MIGRATED_TOOL_SPECS) == 57, (
-        f"Expected 57 typed ToolSpec, got {len(MIGRATED_TOOL_SPECS)}. "
+    assert len(MIGRATED_TOOL_SPECS) == 56, (
+        f"Expected 56 typed ToolSpec, got {len(MIGRATED_TOOL_SPECS)}. "
         f"Sub-A4 migration target was 100% — recount expected after "
         f"manifest changes."
     )
