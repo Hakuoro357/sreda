@@ -207,6 +207,94 @@ def test_stepC_fires_above_limit(monkeypatch, wired):
     assert store.load_summary(wired["SF"](), _key()) is not None  # лимит превышен → выжимка есть
 
 
+class _EnumFinish:
+    """Enum-подобное значение finish_reason (native-обёртки могут класть не-строку)."""
+    name = "STOP"
+    value = 1
+
+
+def _guard_invoke(monkeypatch, wired, msgs, **msg_kwargs):
+    monkeypatch.setattr(rl, "_build_graph", lambda *a, **k: _FakeGraph(_Snap({"messages": msgs})))
+    monkeypatch.setattr(
+        rl, "invoke_with_per_call_timeout",
+        lambda llm, m, **k: AIMessage(content="ОБРЫВОК-ИЛИ-ВЫЖИМКА: перв", **msg_kwargs))
+
+
+@pytest.mark.parametrize("msg_kwargs", [
+    {"response_metadata": {"finish_reason": "error"}},           # live 2026-07-01 (обрывок, 451 симв)
+    {"response_metadata": {"finish_reason": "length"}},          # обрезан по max_tokens
+    {"response_metadata": {"finish_reason": "content_filter"}},  # OpenRouter-нормализация SAFETY
+    {"response_metadata": {"finish_reason": "SAFETY"}},          # native-Google регистр (R1: нормализация)
+    {"response_metadata": {"finish_reason": "PROHIBITED_CONTENT"}},  # gemini-native отказ (R2 high)
+    {"response_metadata": {"stop_reason": "max_tokens"}},        # anthropic-стиль ключ (R1 high-2)
+    {"additional_kwargs": {"finish_reason": "error"}},           # нестандартное место (R1 medium-2)
+])
+def test_guard_bad_finish_not_persisted(monkeypatch, wired, msg_kwargs, caplog):
+    """#287: аварийный finish/stop_reason (обрывок с НЕПУСТЫМ контентом) → выжимка НЕ записана,
+    но расход УЧТЁН (R1 sub: недоучёт в деградации; нулевой usage no-op'ится в _record_react_usage)."""
+    _guard_invoke(monkeypatch, wired, _hist(n_turns=12), **msg_kwargs)
+    with caplog.at_level("WARNING", logger=rl.logger.name):
+        _run()
+    assert store.load_summary(wired["SF"](), _key()) is None  # fail-open на #194, не персистим
+    assert wired["recorded"] and wired["recorded"][0]["task_type"] == "summary"  # расход виден в money
+    # R1-суб MAJOR (наблюдаемость петли скипов): warning несёт thread=durable_key — пин против рефакторинга
+    skip_logs = [r.getMessage() for r in caplog.records if "skip persist finish_reason=" in r.getMessage()]
+    assert skip_logs and f"thread={_key()}" in skip_logs[0]
+
+
+@pytest.mark.parametrize("msg_kwargs", [
+    {"response_metadata": {"finish_reason": "stop"}},            # openai/openrouter норма
+    {"response_metadata": {"finish_reason": "STOP"}},            # native-Google успех (R1: не false-skip)
+    {"response_metadata": {"stop_reason": "end_turn"}},          # anthropic-стиль успех
+    {"response_metadata": {"finish_reason": _EnumFinish()}},     # enum-подобный успех (unwrap .name)
+])
+def test_guard_good_finish_persisted(monkeypatch, wired, msg_kwargs):
+    """#287: успешный финиш в любом известном написании → персистим (метаданные не ломают happy-path)."""
+    _guard_invoke(monkeypatch, wired, _hist(n_turns=12), **msg_kwargs)
+    _run()
+    rec = store.load_summary(wired["SF"](), _key())
+    assert rec is not None and "перв" in rec["text"]
+
+
+def test_guard_unknown_finish_persists(monkeypatch, wired):
+    """#287: НЕИЗВЕСТНОЕ значение finish_reason → персистим + warning (fail-open: молчаливый вечный
+    скип на новом значении провайдера хуже, чем прежнее поведение). Exemplar вымышленный (R2 суб:
+    реальные значения классифицируются явно, pause_turn = BAD)."""
+    _guard_invoke(monkeypatch, wired, _hist(n_turns=12),
+                  response_metadata={"finish_reason": "new_reason_xyz"})
+    _run()
+    assert store.load_summary(wired["SF"](), _key()) is not None
+
+
+def test_guard_missing_finish_reason_persisted(monkeypatch, wired):
+    """#287: провайдер НЕ отдал finish_reason → персистим (fail-open к прежнему поведению;
+    не ломаем пересказчик на провайдерах без этого поля). Дублирует happy-path осознанно —
+    пинит именно выбор «отсутствие метаданных ≠ авария»."""
+    msgs = _hist(n_turns=12)
+    monkeypatch.setattr(rl, "_build_graph", lambda *a, **k: _FakeGraph(_Snap({"messages": msgs})))
+    # дефолтный _fake_invoke из wired уже без response_metadata — просто убеждаемся, что записано
+    _run()
+    assert store.load_summary(wired["SF"](), _key()) is not None
+
+
+def test_guard_error_keeps_valid_prev_untouched(monkeypatch, wired):
+    """#287 (R1 medium-3/sub-4): bad finish при СУЩЕСТВУЮЩЕЙ валидной prev-выжимке → prev остаётся
+    побайтно прежней (ключевой инвариант заморозки: до гейта ничего не мутируется)."""
+    msgs = _hist(n_turns=12)
+    prev_n = 4
+    s0 = wired["SF"]()
+    store.upsert_summary(s0, thread_id=_key(), tenant_id="tenant_tg_1", text="ПРЕЖНЯЯ-ВЫЖИМКА",
+                         covered_message_count=prev_n,
+                         covered_hash=rc._history_prefix_hash(msgs, prev_n), version=1)
+    s0.commit()
+    _guard_invoke(monkeypatch, wired, msgs, response_metadata={"finish_reason": "error"})
+    _run()
+    rec = store.load_summary(wired["SF"](), _key())
+    assert rec["text"] == "ПРЕЖНЯЯ-ВЫЖИМКА"
+    assert rec["covered_message_count"] == prev_n
+    assert rec["covered_hash"] == rc._history_prefix_hash(msgs, prev_n)
+
+
 def test_stepC_freeze_with_prev_keeps_coverage(monkeypatch, wired):
     """#232 шаг C (ядро кеш-стабильности): есть prev-выжимка, переписка подросла, но размер ниже лимита →
     НЕ пере-сжимаем (covered_n и текст те же → префикс стабилен между ходами)."""
