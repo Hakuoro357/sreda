@@ -303,6 +303,14 @@ class Settings(BaseSettings):
         validation_alias="SREDA_ADMIN_LOG_FILES",
     )
 
+    # #292: интервал фонового пересбора снапшота обзорного дашборда
+    # (job_runner). Страница /admin только читает снапшот; 0 или меньше —
+    # луп выключен (дев-машины без нужды в фоне).
+    admin_dashboard_refresh_seconds: float = Field(
+        default=300.0,
+        validation_alias="SREDA_ADMIN_DASHBOARD_REFRESH_SECONDS",
+    )
+
     # Hard wall-clock budget for a single job run. Applied around the
     # network-bound parts of job handlers (Telegram send, EDS adapter
     # verification, etc.) so a hung upstream cannot pin a job in

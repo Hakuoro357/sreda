@@ -1269,6 +1269,7 @@ def _maybe_alert_degraded_turn(
                   f"тенант: {tenant_id} · turn_key: {turn_key}\n"
                   f"вопрос: {_q}\nответ: {_a}"),
             dedupe_key=f"degraded:{reason}:{tenant_id}",
+            both_channels=True,  # #294: деградации — в оба канала (MAX + TG), не fallback
         )
     except Exception:  # noqa: BLE001 — алерт НЕ валит ход
         logger.warning("react_loop: degraded-turn alert failed", exc_info=True)

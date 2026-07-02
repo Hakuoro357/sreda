@@ -369,6 +369,7 @@ def _deliver_in_thread(
     tg_chat_id: str | None,
     max_bot_token: str | None,
     max_chat_id: str | None,
+    both_channels: bool = False,
 ) -> None:
     """Background-thread payload: dedup check + format + POST + mark.
 
@@ -382,6 +383,11 @@ def _deliver_in_thread(
     (HTTP non-2xx, timeout, exception) — fall through to TG если
     configured. Mark-sent fires только после первого успешного POST
     (любого канала) — duplicate suppression работает cross-channel.
+
+    #294: ``both_channels=True`` — dual-delivery: POST в MAX И TG независимо
+    (требует ОБА канала полностью сконфигуренными, иначе warning + одиночная
+    доставка по обычной цепочке). ok=True если доставил хотя бы один;
+    dedup/burst/mark_sent — по-прежнему один раз на alert, не на канал.
     """
     # Phase 1: in-flight lease (Codex R3 MAJOR fix). MUST take BEFORE dedup
     # check — иначе stale-then-release race:
@@ -447,8 +453,26 @@ def _deliver_in_thread(
     # logs (audit какой канал реально сработал).
     ok = False
     delivered_via: str | None = None
+    # #294 MINOR (ревью): дуал запрошен, но сконфигурен лишь один канал — не молчать
+    # о потере избыточности (алерт всё равно уйдёт одиночной цепочкой ниже).
+    if both_channels and not (max_bot_token and max_chat_id and tg_bot_token and tg_chat_id):
+        logger.warning(
+            "admin_alerts: dual-channel requested (key=%s) but only one "
+            "channel configured — delivering single-channel",
+            dedupe_key,
+        )
     try:
-        if max_bot_token and max_chat_id:
+        if both_channels and max_bot_token and max_chat_id and tg_bot_token and tg_chat_id:
+            # #294: dual-channel — деградации дублируются в ОБА канала (Boris:
+            # «оставь в макс, продублируй в тг, так надёжнее»). Каналы независимы;
+            # ok=True если доставил ХОТЯ БЫ один (dedup/mark_sent корректны — один
+            # alert = один dedupe_key = один dedup-чек на оба канала).
+            _max = _post_max_sync(max_bot_token, max_chat_id, text_payload)
+            _tg = _post_telegram_sync(tg_bot_token, tg_chat_id, text_payload)
+            if _max or _tg:
+                ok = True
+                delivered_via = "+".join(c for c, s in (("max", _max), ("telegram", _tg)) if s)
+        elif max_bot_token and max_chat_id:
             if _post_max_sync(max_bot_token, max_chat_id, text_payload):
                 ok = True
                 delivered_via = "max"
@@ -495,6 +519,7 @@ def send_admin_alert(
     *,
     dedupe_key: str | None = None,
     extra_context: dict | None = None,
+    both_channels: bool = False,
 ) -> None:
     """R-28: send admin alert with dedup + burst cap + severity rate-limit.
 
@@ -521,6 +546,9 @@ def send_admin_alert(
         dedupe_key: stable id like ``"llm_fallback:BadRequestError:housewife_assistant"``.
                     None → derived from sha256(severity + title).
         extra_context: optional dict → serialized as " • key: value" footer
+        both_channels: #294 — True = дублировать в MAX И TG одновременно
+                       (для деградационных алертов); False (default) =
+                       прежняя цепочка MAX-primary → TG-fallback
     """
     # Early exit checks на caller thread (no I/O)
     settings = get_settings()
@@ -562,6 +590,7 @@ def send_admin_alert(
                 "tg_chat_id": tg_chat_id if tg_ok else None,
                 "max_bot_token": max_bot_token if max_ok else None,
                 "max_chat_id": max_chat_id if max_ok else None,
+                "both_channels": both_channels,
             },
             daemon=True,
             name=f"admin-alert-{severity}",

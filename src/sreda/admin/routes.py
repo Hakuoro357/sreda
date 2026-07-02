@@ -14,12 +14,9 @@ from fastapi.templating import Jinja2Templates
 from sreda.admin.auth import require_admin_token
 from sreda.admin.queries import (
     get_budget_summary_for_day,
-    get_cost_volume_summary,
-    get_dialogue_health,
     get_llm_calls,
     get_spend_by_model,
     get_tenant_spend_detail,
-    get_top_tenants_by_spend,
     get_users_page,
     has_active_subscriptions,
 )
@@ -95,29 +92,61 @@ def admin_dashboard(
     token: str = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    """Дашборд админки (landing): (a) затраты+объём день/неделя/месяц,
-    (b) здоровье диалога, (c) балансы провайдеров, (d) активность тенантов
-    (top по тратам + top беспрайсовых). Только агрегаты — без текстов сообщений."""
-    _audit_admin_view(session, "admin.dashboard.viewed", token, request)
-    cost = get_cost_volume_summary(session)
-    health = get_dialogue_health(session)
-    top = get_top_tenants_by_spend(session, "month")
-    try:
-        from sreda.services import provider_balances as _pb
+    """Обзорный дашборд (#292): сервер/туннели + KPI + ошибки/медленные +
+    деньги. Агрегаты читаются из СНАПШОТА (фоновый рефреш в job_runner) —
+    на открытии страницы ноль сетевых вызовов и тяжёлых запросов
+    (требование владельца 2026-07-02). Живьём — только host-метрики
+    (/proc, микросекунды) и статус systemd-юнитов туннелей."""
+    from sreda.admin import host_metrics as hostm
+    from sreda.admin import overview_snapshot as ov
 
-        balances = _pb.fetch_balances(get_settings())
-    except Exception:  # noqa: BLE001 — балансы не валят дашборд
-        balances = []
+    from datetime import UTC
+
+    _audit_admin_view(session, "admin.dashboard.viewed", token, request)
+    raw_snap, snap_at = ov.load_snapshot(session, ov.KEY_OVERVIEW)
+    # R1 medium MAJOR: устаревший/битый payload → пустые блоки, не 500.
+    snap = ov.normalize_overview(raw_snap)
+    snap_age_min: int | None = None
+    if snap_at is not None:
+        _now = datetime.now(UTC)
+        _at = snap_at if snap_at.tzinfo else snap_at.replace(tzinfo=UTC)
+        snap_age_min = max(0, int((_now - _at).total_seconds() // 60))
     return templates.TemplateResponse(
         request, "dashboard.html",
         {
             "token": token,
             "section": "dashboard",
-            "cost": cost,
-            "health": health,
-            "top": top,
-            "balances": balances,
+            "snap": snap,
+            "snap_age_min": snap_age_min,
+            "host": hostm.get_host_metrics(),
+            "tunnels": hostm.get_egress_tunnels(),
         },
+    )
+
+
+@router.post("/refresh-snapshot")
+async def admin_refresh_snapshot(
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Ручной пересбор снапшота («обновить сейчас»). Явное действие
+    админа — единственный путь, где агрегаты/балансы считаются в
+    запросе; сам дашборд по-прежнему только читает.
+
+    R1 (субагент): async + to_thread — сетевые балансы (до ~30с
+    таймаутов) не держат воркер threadpool'а uvicorn."""
+    import asyncio
+
+    from sreda.admin import overview_snapshot as ov
+
+    _audit_admin_view(session, "admin.dashboard.refreshed", token, request)
+    ok = await asyncio.to_thread(
+        ov.refresh_overview, get_session_factory(), get_settings()
+    )
+    suffix = "" if ok else "&refresh=err"
+    return RedirectResponse(
+        url=f"/admin/?token={token}{suffix}", status_code=303,
     )
 
 
