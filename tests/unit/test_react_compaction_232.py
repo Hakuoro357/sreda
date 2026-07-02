@@ -218,3 +218,46 @@ def test_fenced_block_neutralizes_fake_markers(monkeypatch):
     assert sp.count("[КОНЕЦ СПРАВКИ О ПРОШЛОЙ ПЕРЕПИСКЕ]") == 1   # только реальный END (подделка убрана)
     assert "(справка)" in sp                                       # подделка заменена
     assert sp.rstrip().endswith("[КОНЕЦ СПРАВКИ О ПРОШЛОЙ ПЕРЕПИСКЕ]")  # END в самом конце блока
+
+
+# ids обязательны: значения-простыни в id теста упирают PYTEST_CURRENT_TEST в Windows-лимит env (32767)
+@pytest.mark.parametrize("sp", ["SP", "П" * 8000], ids=["sp-min", "sp-8k"])
+@pytest.mark.parametrize("summary_text", [
+    "ВЫЖИМКА: ранее обсудили проект Орбита, дедлайн 14 марта.",  # типовая короткая
+    "х" * rc.SUMMARY_MAX_CHARS,                                   # худший случай: потолок 1200
+], ids=["короткая", "потолок-1200"])
+def test_acceptance1_input_smaller_with_summary_than_drop_middle(summary_text, sp):
+    """Приёмка #232 №1 (прямой замер, ПРОД-константы — бюджет НЕ подменяем): вход модели МЕНЬШЕ
+    при валидной выжимке, чем при #194 drop-middle.
+
+    Прод-профиль (live 2026-06-30: 439 сообщ ≈ 34к ток → выжимка ≈ 1к ток): покрытый префикс
+    большой, сырой хвост (KEEP_TAIL_BLOCKS + текущий ход) много меньше бюджета. #194 добивает
+    вход до ~TOTAL_BUDGET_CHARS (drop-middle), выжимка заменяет префикс блоком ≤ SUMMARY_MAX_CHARS
+    + проекция ТОЛЬКО хвоста messages[n:] (замер на константах момента пина, sp=«SP»: экономия
+    75-81%; на реалистичном sp разрыв уже, направление то же). Пин закрывает дыру R1-воркфлоу
+    приёмки: раньше критерий держался на прокси (байт-стабильность префикса) и прод-замере без
+    машинной ассерции. NB граница (задокументирована): если сырой хвост САМ насыщает бюджет
+    (достижимо: огромный current_turn — он не режется, — или крупные свежие tool-результаты),
+    оба пути упираются в бюджет и вход с выжимкой может быть чуть БОЛЬШЕ — превышение ограничено
+    размером блока выжимки (~1.4к симв, наблюдалось до ~+4%). Критерий — про длинный тред
+    прод-профиля; гейты ниже держат тест именно в этом режиме."""
+    msgs = _long_history(n_turns=100, pad=40)  # длинный тред: сильно больше бюджета (гейт ниже)
+    cov = rc.summary_coverage(msgs)[0]
+    summary = _summary_for(msgs, covered_n=cov, text=summary_text)
+
+    def total_chars(out):
+        return sum(rc._content_len(m) for m in out)  # метрика модуля (= бюджетной), не самопал
+
+    # Гейты режима (R1 high: сценарий пересчитывается от ТЕКУЩИХ прод-констант, не тихо дрейфует):
+    raw_total = sum(rc._content_len(m) for m in msgs)
+    assert raw_total > rc.TOTAL_BUDGET_CHARS, "история обязана НЕ влезать (иначе оба пути passthrough)"
+    tail_chars = sum(rc._content_len(m) for m in msgs[cov:])
+    assert len(sp) + tail_chars + rc.SUMMARY_MAX_CHARS + 500 < rc.TOTAL_BUDGET_CHARS, \
+        "прод-профиль: sp + сырой хвост + worst-case выжимка не насыщают бюджет (иначе граница из докстринга)"
+
+    with_summary = build_model_input(sp, msgs, enabled=True, summary=summary)
+    without = build_model_input(sp, msgs, enabled=True, summary=None)
+    assert FENCE in with_summary[0].content        # выжимка реально применилась (не fail-open)
+    assert FENCE not in without[0].content         # базовый путь без выжимки
+    assert len(without) - 1 < len(msgs), "без выжимки #194 обязан РЕАЛЬНО дропнуть середину (не passthrough)"
+    assert total_chars(with_summary) < total_chars(without)  # сам критерий №1: вход строго меньше
