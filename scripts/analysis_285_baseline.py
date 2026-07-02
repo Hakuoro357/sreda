@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.session import get_session_factory
 from sreda.runtime.react_preflight import _must_task, _section_hint
-from sreda.services.tool_schemas.families import TOOL_OP_CLASS
+from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_read_domains, tool_write_domains
 
 # Командные глаголы-мутации (корпус §1.1). Щедрые корни = замер recall, не боевой гейт.
 # Отсечены известные паразиты: «удалось/удалась» (не команда «удали»).
@@ -64,6 +64,7 @@ def compute(rows) -> dict:
         "unsig_turns": {"old": 0, "v0": 0, "v0_wo_cmd": 0, "v0_wo_decl": 0},
         "unsig_w_exec": {"old": 0, "v0": 0},
         "unsig_tools": Counter(), "writes_per_unsig_turn": [],
+        "write_domains_per_unsig_turn": [], "read_domains_per_unsig_turn": [],
         "unsig_turns_with_own_read": 0, "own_read_exec_on_unsig": 0,
         "window": [None, None], "tenants": set(),
     }
@@ -107,6 +108,15 @@ def compute(rows) -> dict:
             if own_reads:
                 agg["unsig_turns_with_own_read"] += 1
                 agg["own_read_exec_on_unsig"] += len(own_reads)
+            # доменный fanout хода (R2 MINOR: форма batch-превью и bounded-маппера)
+            wd: set[str] = set()
+            for c in writes:
+                wd |= set(tool_write_domains(str(c.get("name"))))
+            agg["write_domains_per_unsig_turn"].append(len(wd))
+            rd: set[str] = set()
+            for c in own_reads:
+                rd |= set(tool_read_domains(str(c.get("name"))))
+            agg["read_domains_per_unsig_turn"].append(len(rd))
         # декомпозиция: чем был бы v0 без каждого слоя
         if not (d["must_task"] or d["decl"]):
             agg["unsig_turns"]["v0_wo_cmd"] += 1
@@ -141,6 +151,13 @@ def render(agg: dict) -> str:
         lines.append(f"writes/ход на v0-безсигнальных: p50={p(0.5)} p90={p(0.9)} p95={p(0.95)} max={wpt[-1]} (n={n})")
     lines.append(f"v0-безсигнальные ходы с ≥1 own-data read: {agg['unsig_turns_with_own_read']} "
                  f"(исполнений reads: {agg['own_read_exec_on_unsig']})")
+    for key, label in (("write_domains_per_unsig_turn", "write-доменов/ход"),
+                       ("read_domains_per_unsig_turn", "read-доменов/ход")):
+        vals = agg[key]
+        if vals:
+            dist = Counter(vals)
+            lines.append(f"{label} на v0-безсигнальных: " +
+                         ", ".join(f"{k}дом:{dist[k]}" for k in sorted(dist)) + f"; max={max(vals)}")
     lines.append("top write-инструменты на v0-безсигнальных ходах (ИСПОЛНЕНИЙ, не ходов):")
     for name, cnt in agg["unsig_tools"].most_common(10):
         lines.append(f"  {name}: {cnt}")
