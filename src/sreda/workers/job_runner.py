@@ -158,6 +158,19 @@ async def run_job_loop_async() -> None:
         run_svo_monitor_loop(), name="svo_monitor",
     )
 
+    # #292: фоновый пересбор снапшота обзорного дашборда админки —
+    # страница /admin только читает снапшот, считает этот луп.
+    # R1 medium MAJOR: спавн защищён — сбой импорта/конфига оставляет
+    # воркер жить без дашборд-рефреша, а не роняет его на старте.
+    overview_task: asyncio.Task | None = None
+    try:
+        from sreda.admin.overview_snapshot import run_overview_refresh_loop
+        overview_task = asyncio.create_task(
+            run_overview_refresh_loop(), name="admin_overview_refresh",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("job_runner: overview refresh loop failed to start")
+
     try:
         while True:
             try:
@@ -168,7 +181,9 @@ async def run_job_loop_async() -> None:
             if processed == 0:
                 await asyncio.sleep(interval)
     finally:
-        for task in (health_task, svo_task):
+        for task in (health_task, svo_task, overview_task):
+            if task is None:
+                continue
             task.cancel()
             try:
                 await task
