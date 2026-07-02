@@ -91,6 +91,63 @@ def test_dashboard_renders_when_no_snapshot(client):
     assert "снапшот ещё не собран" in resp.text
 
 
+def test_dashboard_full_snapshot_renders_all_sections(client, session_factory):
+    # #297 (Codex high R1 MAJOR): позитивный smoke заполненных секций —
+    # деньги / здоровье / топ тенантов / балансы / ошибки / медленные / цепочка.
+    # Регресс шаблона (секция молча пропала под {% if %}) не пройдёт на 200-only.
+    s = session_factory()
+    ov.store_snapshot(s, ov.KEY_OVERVIEW, {
+        "llm_24h": {"calls": 42, "errors": 2, "error_rate_pct": 4.8, "slow": 1},
+        "errors_recent": [{
+            "at": "2026-07-02T10:15:00", "status": "failed", "error_code": "timeout",
+            "task_type": "llm_call", "model": "mercury-2",
+            "tenant_id": "t1", "feature_key": "housewife_assistant"}],
+        "slow_recent": [{
+            "at": "2026-07-02T11:00:00", "latency_ms": 31500, "task_type": "llm_call",
+            "model": "mercury-2", "tenant_id": "t1", "feature_key": "housewife_assistant"}],
+        "cost": {"day": {
+            "priced_subtotal_usd": 1.23, "upper_subtotal_usd": 2.5, "calls": 40,
+            "coverage_calls_pct": 95, "unpriced_calls": 2, "unpriced_tokens": 9000,
+            "rows": [{"provider_key": "inception-mercury2", "model": "mercury-2",
+                      "calls": 40, "prompt_tokens": 100, "completion_tokens": 10,
+                      "priced": True, "est_usd": 1.23, "upper_usd": 2.5}],
+            "unpriced_rows": [{"provider_key": "mimo", "model": "mimo-v2.5-pro",
+                               "calls": 2, "prompt_tokens": 8000,
+                               "completion_tokens": 1000, "priced": False}]}},
+        "health": {"turns_total": 50, "runs_failed": 1, "inbound_stuck": 0,
+                   "outbox_failed": 0, "breakdowns_shown": 2, "failures_total": 3},
+        "top_tenants": {
+            "by_spend": [{"tenant_id": "t1", "name": "Tenant1",
+                          "est_usd": 0.05, "calls": 10}],
+            "by_unpriced": [{"tenant_id": "t2", "name": "Tenant2", "tokens": 9000}]},
+        "balances": [{"key": "openrouter", "label": "OpenRouter", "status": "ok",
+                      "headline": "$12.40", "details": ""}],
+        # значения цепочки уникальны в payload'е (R2 субагент MINOR):
+        # совпадение с model в errors/slow/cost не маскирует пропажу блока
+        "llm_chain": {"primary": "chat-primary-x", "fallback": "osa-groq",
+                      "planner": "planner-model-x"},
+    })
+    s.close()
+    resp = client.get("/admin/", params={"token": "T"})
+    assert resp.status_code == 200
+    html = resp.text
+    # здоровье диалога
+    assert "3 проблем" in html and "50 ходов" in html
+    # деньги: priced-итог, покрытие, беспрайсовая строка
+    assert "$1.23" in html and "покрытие 95" in html and "без прайса" in html
+    # топ тенантов: по тратам и беспрайсовые
+    assert "Топ тенантов по тратам (месяц)" in html
+    assert "Tenant1" in html and "Tenant2" in html
+    # балансы провайдеров
+    assert "OpenRouter" in html and "$12.40" in html
+    # ошибки и медленные за сутки
+    assert "timeout" in html and "10:15" in html
+    assert "31.5 с" in html
+    # LLM-цепочка
+    assert "chat-primary-x" in html and "osa-groq" in html
+    assert "planner-model-x" in html
+
+
 def test_dashboard_survives_garbage_snapshot(client, session_factory):
     # битый/устаревший payload (не та схема, мусорные типы) → 200, не 500
     s = session_factory()
