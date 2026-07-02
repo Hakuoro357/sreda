@@ -293,7 +293,10 @@ _REASONING_PREFIX_RE = re.compile(
 _KNOWN_TOOL_NAMES = (
     # Memory
     "save_core_fact", "create_memory_category", "save_episode", "recall_memory",
-    # Checklists unified read (#213 Срез A) — скраббер синтаксиса, безопасен при OFF
+    # Checklists unified read (#213 Срез A). ОСОЗНАННОЕ исключение из «OFF = байт-в-байт»
+    # (decision log slice-A R1): скраббер вычищает сырой tool-синтаксис из ТЕКСТА ответа;
+    # знание имени при OFF полезно ровно в сценарии отката ON→OFF (durable-история #193
+    # праймит get_checklist — без скраббера юзер увидел бы сырой вызов в реплае).
     "get_checklist",
     # Web
     "web_search", "fetch_url", "log_unsupported_request",
@@ -462,8 +465,13 @@ _CLAIM_VERBS = ("сохранил", "сохранила", "сохранено",
 #     read tool does not back a mutation claim).
 #   • «✅ В список покупок: молоко» + show_checklist → still fires (object
 #     is shopping, not checklist — display backing never applies).
-# #213 Срез A: get_checklist добавлен — при unified=ON пункты (☑/☐) рендерит он.
-_CHECKLIST_DISPLAY_TOOLS: frozenset[str] = frozenset({"show_checklist", "get_checklist"})
+# #213 Срез A: get_checklist сюда НЕ добавлен НАМЕРЕННО (ревью R1 среза A, Codex high).
+# Механизм живёт только на замороженном legacy-пути (handlers), где get_checklist не
+# экспонируется вообще. При переносе detect_unbacked_claim в ReAct: display-backing от
+# get_checklist давать ТОЛЬКО по содержимому результата (result_type=items и
+# resolution_status∈exact|unique_fuzzy) — overview/name_required/ambiguous вызов
+# НЕ подтверждает «☑»-клеймы.
+_CHECKLIST_DISPLAY_TOOLS: frozenset[str] = frozenset({"show_checklist"})
 # Subset of _CLAIM_VERBS that describe rendered checklist item STATE rather
 # than a mutation. Only these get the read-tool backing for the «checklist»
 # category. Deliberately narrow (Codex r2 high MAJOR/MEDIUM):

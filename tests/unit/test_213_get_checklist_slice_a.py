@@ -183,20 +183,20 @@ def test_ambiguous_returns_candidates(db_session, monkeypatch):
     gc = _housewife_tools(db_session, u)["get_checklist"]
 
     out = gc.invoke({"mode": "items", "name": "кино"})
-    assert "resolution=ambiguous" in out, out
+    assert "resolution_status=ambiguous" in out, out
     assert "Кино к просмотру" in out and "Кино детям" in out  # кандидаты названы
     assert "Дюна" not in out and "Тачки" not in out  # пункты НЕ раскрыты
 
 
 def test_exact_id_resolution(db_session, monkeypatch):
-    """Приёмка п.22 (deferred MINOR R5): checklist_-id → resolution=exact."""
+    """Приёмка п.22 (deferred MINOR R5): checklist_-id → resolution_status=exact."""
     _flag_unified(monkeypatch, True)
     u = seed_telegram_user(db_session)
     cl = _seed_kino(db_session, u)
     gc = _housewife_tools(db_session, u)["get_checklist"]
 
     out = gc.invoke({"mode": "items", "name": cl.id})
-    assert "resolution=exact" in out, out
+    assert "resolution_status=exact" in out, out
     assert "Скорпион" in out
 
 
@@ -208,7 +208,7 @@ def test_not_found_no_competing_names(db_session, monkeypatch):
     gc = _housewife_tools(db_session, u)["get_checklist"]
 
     out = gc.invoke({"mode": "items", "name": "сталоне"})
-    assert "resolution=not_found" in out, out
+    assert "resolution_status=not_found" in out, out
     assert "Кино к просмотру" not in out
 
 
@@ -425,7 +425,7 @@ async def test_llm_origin_ambiguous_via_alias_returns_candidates(db_session, mon
     tm = _tool_message_for(stub, "call_amb")
     assert tm is not None
     content = str(tm.content)
-    assert "resolution=ambiguous" in content, content
+    assert "resolution_status=ambiguous" in content, content
     assert "Дюна" not in content and "Тачки" not in content, (
         f"молчаливый top-1 через алиас при ON запрещён: {content}")
 

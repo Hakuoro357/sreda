@@ -2330,6 +2330,17 @@ def _build_graph(llm: Any, all_tools: list, *,
             if _unified_213 and name in _DEPRECATED_ALIASES_213:
                 tc_args = _map_deprecated_checklist_args(name, tc_args)
                 name = _DEPRECATED_ALIASES_213[name]
+            elif not _unified_213 and name == "get_checklist":
+                # ЗЕРКАЛО (ревью R1 среза A, Claude MAJOR-4): откат ON→OFF. Durable-история
+                # (#193) после канарейки праймит модель именем get_checklist, а при OFF он
+                # не собран → была бы family_not_loaded-петля до лимита проходов. Маппим
+                # назад в легаси-пару. Byte-identity для настоящего легаси-трафика цела:
+                # модель, не видевшая ON, это имя эмитить не может.
+                if (tc_args or {}).get("mode") == "overview":
+                    name, tc_args = "list_checklists", {}
+                else:
+                    name = "show_checklist"
+                    tc_args = {"list_id_or_title": str((tc_args or {}).get("name") or "")}
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
             # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
@@ -2394,7 +2405,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                     _umsg = (f"Инструмент {name} сейчас недоступен — сначала позови "
                              "need_family нужной семьи.")
                 out.append(ToolMessage(
-                    content=_umsg, name=name, tool_call_id=tc["id"],  # #192: не-исполнение
+                    content=_umsg, name=tc["name"], tool_call_id=tc["id"],  # #192: не-исполнение
                     artifact={"result_kind": "domain_blocked" if _ureason == "domain_blocked" else "unavailable"}))
                 continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
@@ -2427,13 +2438,20 @@ def _build_graph(llm: Any, all_tools: list, *,
                 logger.warning("react_loop: tool %s failed type=%s", name, type(exc).__name__)
                 out.append(ToolMessage(
                     content=f"error: инструмент {name} не смог выполниться, повтори запрос.",
-                    name=name, tool_call_id=tc["id"], status="error",
+                    name=tc["name"], tool_call_id=tc["id"], status="error",
                     artifact={"result_kind": "error", "error_type": type(exc).__name__,
                               "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
                 continue
-            out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"],
-                                   artifact={"result_kind": "ok",
-                                             "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
+            # name в ToolMessage — ОРИГИНАЛ из tool_call (ревью R1 среза A, Claude MINOR-1):
+            # OpenAI-путь матчит по tool_call_id, но Gemini-семейство матчит FunctionResponse
+            # ПО ИМЕНИ — канонизированное имя рассинхронизировало бы пару. Факт канонизации
+            # виден трейсу через artifact.canonicalized_to.
+            _art = {"result_kind": "ok",
+                    "latency_ms": int((_time.perf_counter() - _t) * 1000)}
+            if name != tc["name"]:
+                _art["canonicalized_to"] = name
+            out.append(ToolMessage(content=str(res), name=tc["name"], tool_call_id=tc["id"],
+                                   artifact=_art))
             if (name in _CORE_MUTATING_TOOLS
                     or TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES):
                 # rerun-unsafe запись (#202 Codex medium R3): core-мутирующая (add_task без даты — нет

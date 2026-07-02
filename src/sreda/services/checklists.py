@@ -46,6 +46,12 @@ def _utcnow() -> datetime:
 
 
 from dataclasses import dataclass, field
+import re as _re
+
+# #213 Срез A: разделители составного needle (см. composite-guard в
+# resolve_list_by_title_ranked). Союз « и » — с пробелами (не ловить «кино»),
+# запятая/точка с запятой/слэш — как есть.
+_COMPOSITE_NEEDLE_RE = _re.compile(r"(\s(?:и|или)\s|[,;/])")
 
 
 @dataclass(frozen=True)
@@ -508,6 +514,25 @@ class ChecklistService:
             cl for cl in active
             if norm in _normalise(cl.title) or _normalise(cl.title) in norm
         ]
+        # Composite-guard (ревью R1 среза A, Codex high): составной needle
+        # («кино и машина», «кино, машина») БЕЗ точного совпадения НИКОГДА не
+        # даёт unique_fuzzy — reverse-substring (`title in needle`) иначе молча
+        # выберет один из перечисленных списков (класс #213). Кандидаты собираем
+        # ПО ЧАСТЯМ needle (сплит по разделителям) — уточнение полное; матчи
+        # есть → ambiguous, нет → not_found. Exact-имя с « и » внутри
+        # («Дела и покупки») обслужено веткой (2) выше.
+        if _COMPOSITE_NEEDLE_RE.search(norm):
+            parts = [p.strip() for p in _COMPOSITE_NEEDLE_RE.split(norm)
+                     if p.strip() and not _COMPOSITE_NEEDLE_RE.fullmatch(p)]
+            part_matches = [
+                cl for cl in active
+                if any(p in _normalise(cl.title) or _normalise(cl.title) in p
+                       for p in parts)
+            ]
+            merged = part_matches or fuzzy
+            if merged:
+                return ListResolution(status="ambiguous", checklist=None, candidates=merged[:5])
+            return ListResolution(status="not_found", checklist=None, candidates=[])
         if len(fuzzy) == 1:
             return ListResolution(status="unique_fuzzy", checklist=fuzzy[0], candidates=[])
         if len(fuzzy) > 1:

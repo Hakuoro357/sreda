@@ -3059,6 +3059,10 @@ async def _chat_preflight(
             embedding_client=embedding_client,
             bot_key=action.bot_key,
         )
+    # #213 Срез A: get_checklist — ReAct-only контур; замороженному legacy-пути
+    # он не экспонируется НИ ПРИ КАКОМ флаге (у пути нет спека/парсера по канону
+    # #210, эмиссия дала бы ToolOutputContractViolation).
+    tools = [t for t in tools if t.name != "get_checklist"]
     tools_by_name = {t.name: t for t in tools}
 
     # Issue #68 — snapshot OpenAI-style tool schemas для llm-trace replay.
@@ -4024,6 +4028,7 @@ _TOOL_NAMES_SET: frozenset[str] = frozenset({
     "create_checklist", "add_checklist_items",
     "move_task_to_checklist", "mark_checklist_item_done",
     "delete_checklist_item", "archive_checklist", "update_checklist_item",  # #210
+    "get_checklist",  # #213 Срез A: leak-детекция имени полезна и при OFF (откат ON→OFF)
     # generic
     "recall_memory", "save_core_fact", "create_memory_category", "save_episode",
     "get_weather", "web_search", "fetch_url",

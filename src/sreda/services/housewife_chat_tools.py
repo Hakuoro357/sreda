@@ -3107,9 +3107,20 @@ def build_housewife_tools(
         """
         if not user_id:
             return "error: no user_id context"
-        cl = checklist_service.find_list_by_title(
-            tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
-        )
+        # #213 Срез A (чеклист приёмки п.17): при unified=ON internal-путь идёт
+        # через ТОТ ЖЕ ranked-резолвер (единый контракт), наружу — СТАРАЯ форма;
+        # ambiguous ОСОЗНАННО деградирует в легаси top-1 (candidates[0] — самый
+        # свежий: list_active сортирован по created_at desc; старая форма не
+        # имеет канала candidates). При OFF — байт-в-байт легаси.
+        if _unified_on():
+            res = checklist_service.resolve_list_by_title_ranked(
+                tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+            )
+            cl = res.checklist or (res.candidates[0] if res.candidates else None)
+        else:
+            cl = checklist_service.find_list_by_title(
+                tenant_id=tenant_id, user_id=user_id, needle=list_id_or_title,
+            )
         if cl is None:
             return f"error: not_found: {list_id_or_title!r}"
         items = checklist_service.list_items(list_id=cl.id)
@@ -3188,13 +3199,15 @@ def build_housewife_tools(
         if res.status == "not_found":
             # ВАЖНО (класс #213): имена других списков НЕ перечисляем —
             # конкурирующий перечень в контексте и есть исходный баг.
-            return (f"result_type=items result_id={rid} resolution=not_found\n"
+            return (f"result_type=items result_id={rid} resolution_status=not_found\n"
                     f"not_found: список «{clean_name}» не найден — скажи пользователю "
                     "и уточни название")
         if res.status == "ambiguous":
+            # cap 5 в резолвере; маркер «+» честно показывает обрезку
+            n_marker = f"{len(res.candidates)}{'+' if len(res.candidates) >= 5 else ''}"
             lines = [
-                f"result_type=items result_id={rid} resolution=ambiguous "
-                f"candidates={len(res.candidates)}",
+                f"result_type=items result_id={rid} resolution_status=ambiguous "
+                f"candidates={n_marker}",
                 "ambiguous: несколько подходящих списков — уточни у пользователя, "
                 "какой именно (пункты НЕ показаны):",
             ]
@@ -3204,8 +3217,9 @@ def build_housewife_tools(
 
         cl = res.checklist
         matched_by = "exact" if res.status == "exact" else "fuzzy"
-        head = (f"result_type=items result_id={rid} checklist=\"{cl.title}\" "
-                f"checklist_id={cl.id} matched_by={matched_by} resolution={res.status}")
+        safe_title = cl.title.replace('"', "'").replace("\n", " ").replace("\r", " ")
+        head = (f"result_type=items result_id={rid} checklist_name=\"{safe_title}\" "
+                f"checklist_id={cl.id} matched_by={matched_by} resolution_status={res.status}")
         items = checklist_service.list_items(list_id=cl.id)
         if not items:
             return head + f"\nempty: list={cl.id} title={cl.title!r}"
@@ -3254,13 +3268,20 @@ def build_housewife_tools(
                     f"[{it.id}] {mark} {it.title} @ [{cl.id}] {cl.title}"
                 )
         # #213 Срез A: при unified=ON search-результат получает паспорт (envelope),
-        # чтобы items/overview/search были различимы структурно. При OFF —
-        # байт-в-байт легаси (без заголовка).
+        # чтобы items/overview/search были различимы структурно. ТОЛЬКО для
+        # LLM-origin (origin="react" ставит react tool-node): internal-каллеры
+        # (plan-execute executor → parse_list_checklist_items, replay, eval)
+        # обязаны получать СТАРУЮ форму — иначе их построчный парсер даёт
+        # ToolOutputContractViolation (ревью R1 среза A). При OFF — легаси всем.
         if _unified_on():
-            head = f"result_type=search result_id={_result_id()} matches={len(lines)}"
-            if not lines:
-                return head + "\nempty"
-            return "\n".join([head, *lines])
+            from sreda.runtime.planner.tool_runtime import current_tool_runtime
+
+            _ctx = current_tool_runtime()
+            if _ctx is not None and getattr(_ctx, "origin", None) == "react":
+                head = f"result_type=search result_id={_result_id()} matches={len(lines)}"
+                if not lines:
+                    return head + "\nempty"
+                return "\n".join([head, *lines])
         if not lines:
             return "empty"
         return "\n".join(lines)
