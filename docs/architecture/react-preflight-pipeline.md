@@ -5,7 +5,7 @@
 **Related code:** `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph` — потребление; меняется по многим причинам, freshness НЕ трекаем)
 **Tests:** `tests/unit/` — калибровка `_must_task` (`test_must_task_high_precision`), классификаторы интента/доменов, политика `compute_allowed_domains`
 **Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально
-**Verified-against:** `8de86ac` (сверено с кодом 2026-07-02; doc-sync после #263/#270/#279/#213)
+**Verified-against:** `6e6a8a2` (сверено с кодом 2026-07-02; doc-sync после #263/#270/#279/#213)
 **Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek` — это и есть прод; история: #224 переводил на `gemini-2.5-flash-lite` ради скорости, #257 вернул на `openrouter-deepseek` — gemini-lite зависал); `SREDA_CHECKLIST_UNIFIED` (default `False`) меняет текст checklist-директивы (#213, см. `route_domains`)
 
 ## Зачем это существует
