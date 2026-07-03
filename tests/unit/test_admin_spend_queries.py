@@ -284,27 +284,6 @@ def test_get_llm_calls_feature_key_optional(session) -> None:
     one = get_llm_calls(session, "t1", "eds_monitor")
     assert one.total == 1                             # только запрошенная
 
-
-def test_dashboard_template_renders() -> None:
-    from sreda.admin.queries import TopTenants
-    from sreda.admin.routes import templates
-    from sreda.workers.reliability_report import DayCounts
-
-    empty = SpendReport(
-        period="day", start_utc=ANCHOR, end_utc=ANCHOR, rows=[],
-        priced_subtotal_usd=Decimal("0"), upper_subtotal_usd=Decimal("0"),
-        unpriced_models=[], unpriced_calls=0, unpriced_tokens=0,
-        coverage_calls_pct=None, coverage_tokens_pct=None, anomaly_count=0)
-    html = templates.env.get_template("dashboard.html").render(
-        token="t", section="dashboard",
-        cost={"day": empty, "week": empty, "month": empty},
-        health=DayCounts(5, 1, 0, 0, 2),
-        top=TopTenants(
-            by_spend=[("t1", "Tenant1", Decimal("0.05"), 10)],
-            by_unpriced=[("t2", "Tenant2", 9000)]),
-        balances=[])
-    assert "Дашборд" in html
-    assert "Затраты и объём" in html
-    assert "Здоровье диалога" in html
-    assert "Tenant1" in html and "Tenant2" in html
-    assert "всего проблем" in html
+# test_dashboard_template_renders удалён (#297): шаблон dashboard.html переписан
+# в #292 (контекст snap/host/tunnels + request), рендер покрыт route-тестами
+# tests/unit/test_admin_dashboard_route.py через TemplateResponse.

@@ -147,6 +147,28 @@ def _compact_budget() -> int | None:
         return None
 
 
+def _checklist_unified() -> bool:
+    """#213 Срез A: единый get_checklist ВКЛ? (флаг SREDA_CHECKLIST_UNIFIED, дефолт OFF = легаси)."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().checklist_unified_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
+def _map_deprecated_checklist_args(old_name: str, args: dict | None) -> dict:
+    """#213 Срез A: маппинг аргументов канонизации LLM-origin алиасов.
+
+    show_checklist(list_id_or_title=X) → get_checklist(mode=items, name=X);
+    list_checklists() → get_checklist(mode=overview). Пустой/отсутствующий
+    list_id_or_title у show_checklist даёт name="" → штатный name_required
+    нового механизма (recovery-путь), не крэш."""
+    if old_name == "show_checklist":
+        raw = (args or {}).get("list_id_or_title")
+        return {"mode": "items", "name": str(raw) if raw is not None else ""}
+    return {"mode": "overview"}
+
+
 def _get_checkpointer():
     """#193: ВКЛ → durable EncryptedSqlCheckpointSaver (стабильный ключ, переживает рестарт);
     ВЫКЛ → процессный InMemorySaver (прежнее поведение)."""
@@ -530,6 +552,14 @@ def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
     # динамика — в ХВОСТЕ: persona-preset overlay (по юзеру, 2 варианта) + today (по дню).
     _overlay = (persona_overlay or "").strip()
     _preset_block = f"<style_preset>\n{_overlay}\n</style_preset>\n\n" if _overlay else ""
+    # #213 Срез A: few-shot контраст items/overview — ТОЛЬКО при unified=ON
+    # (при OFF промпт байт-в-байт легаси; флаг стабилен в рантайме → кеш цел).
+    _unified_examples = (
+        "Пользователь: «покажи список кино» → get_checklist(mode=\"items\", name=\"кино\") — "
+        "пункты ИМЕННО названного списка; ответ строй из результата result_type=items.\n"
+        "Пользователь: «какие у меня списки» → get_checklist(mode=\"overview\") — только "
+        "названия со счётчиками, name НЕ передавай.\n"
+    ) if _checklist_unified() else ""
     return (
         "<persona>\nТы — Среда. Близкий человек семьи, который заботится о пользователе, "
         "а НЕ справочное бюро и НЕ робот-исполнитель команд. Помогаешь с напоминаниями, "
@@ -618,8 +648,9 @@ def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
         "Пользователь: «добавь задачу полить цветы завтра»\n"
         "→ add_task(title=\"полить цветы\", scheduled_date=<завтра YYYY-MM-DD>).\n"
         "Пользователь: «покажи список покупок» (формат списка — СТРОГО так, с переносами):\n"
-        "Вот твой список покупок:\n— молоко\n— хлеб\n— яйца\n\n"
-        "Неправильно (так НЕ делай):\n"
+        "Вот твой список покупок:\n— молоко\n— хлеб\n— яйца\n"
+        + _unified_examples +
+        "\nНеправильно (так НЕ делай):\n"
         "- перечислять списком в ОДНУ строку: «список: — молоко — хлеб» (НАДО каждый с новой строки);\n"
         "- вызывать list повторно В ОДНОМ ХОДЕ, когда он уже получен в этом ответе (но на НОВЫЙ "
         "запрос «покажи» — вызывай заново: данные могли измениться);\n"
@@ -930,6 +961,15 @@ _REACT_TOOL_DESC: dict[str, str] = {
     "show_checklist": (
         "Показать пункты ОДНОГО чек-листа со статусами (list_id_or_title — id checklist_ или "
         "нечёткое название). Когда: «покажи план кроя», «что осталось в списке X». Read-only."
+    ),
+    # #213 Срез A: единый read чек-листов (экспонируется ВМЕСТО пары выше при флаге).
+    "get_checklist": (
+        "Показать чек-листы. mode='items' + name → пункты ОДНОГО списка (name: id checklist_ "
+        "или название; «покажи план кроя», «что осталось в X»). mode='overview' БЕЗ name → все "
+        "списки со счётчиками («какие списки», «покажи все планы»). Строго: items требует name "
+        "(не выдумывай — спроси), overview запрещает name. Ответ начинается паспортом "
+        "result_type=…; при resolution=ambiguous уточни у пользователя, пункты не показаны. "
+        "Read-only. НЕ для поиска пункта по названию (это list_checklist_items)."
     ),
     "list_checklist_items": (
         "Найти пункты чек-листов по подстроке названия СРАЗУ ПО ВСЕМ спискам (возвращает всех "
@@ -1884,6 +1924,15 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
 
     _emb = get_embeddings_client()
     _bespoke_names = {t.name for t in bespoke}
+    # #213 Срез A: экспозиция read-контура чек-листов по флагу. OFF (дефолт) →
+    # LLM видит старую пару (list_checklists/show_checklist), get_checklist скрыт —
+    # byte-identical легаси. ON → видит ЕДИНЫЙ get_checklist, старая пара скрыта
+    # (LLM-origin вызовы старых имён канонизируются в tool-node). Фабрика строит
+    # все три всегда — internal-пути от флага не зависят.
+    from sreda.config.settings import get_settings as _gs213
+    from sreda.services.tool_schemas.families import DEPRECATED_TOOL_ALIASES
+    _unified = bool(_gs213().checklist_unified_enabled)
+    _hidden_names = set(DEPRECATED_TOOL_ALIASES) if _unified else {"get_checklist"}
     extra: list = []
     for t in build_housewife_tools(
         session=session, tenant_id=tenant_id, user_id=user_id,
@@ -1892,6 +1941,8 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
     ):
         if t.name in _bespoke_names:
             continue  # напоминания/задачи уже у бес­поке
+        if t.name in _hidden_names:
+            continue  # #213: скрыто из LLM-экспозиции по флагу (см. выше)
         if TOOL_FAMILY_MANIFEST.get(t.name) not in _EXTRA_FAMILIES:
             continue  # onboarding/ui/utility/tasks-cross — вне цикла
         t = _react_desc(t)  # #165: короткое описание для Фредди (до confirm-wrap)
@@ -2263,8 +2314,34 @@ def _build_graph(llm: Any, all_tools: list, *,
             state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
         out = []
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
+        # #213 Срез A: контекст канонизации депрекейт-алиасов (один раз на батч).
+        from sreda.services.tool_schemas.families import (
+            DEPRECATED_TOOL_ALIASES as _DEPRECATED_ALIASES_213,
+        )
+        _unified_213 = _checklist_unified()
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
+            tc_args = tc.get("args") or {}
+            # #213 Срез A: LLM-origin вызов депрекейт-алиаса при unified=ON канонизируется в
+            # get_checklist ЗДЕСЬ — ДО unavailable-ветки (иначе family_not_loaded-петля) и ДО
+            # диспетча. Durable-история (#193) праймит модель старыми именами (прецедент #221) —
+            # канонизация даёт ей консистентные данные нового контура вместо отказа. Только
+            # LLM-origin по построению: этот цикл и есть LLM-эмитированные вызовы; internal-пути
+            # (parse-путь housewife, replay, eval) зовут функции напрямую и сюда не попадают.
+            if _unified_213 and name in _DEPRECATED_ALIASES_213:
+                tc_args = _map_deprecated_checklist_args(name, tc_args)
+                name = _DEPRECATED_ALIASES_213[name]
+            elif not _unified_213 and name == "get_checklist":
+                # ЗЕРКАЛО (ревью R1 среза A, Claude MAJOR-4): откат ON→OFF. Durable-история
+                # (#193) после канарейки праймит модель именем get_checklist, а при OFF он
+                # не собран → была бы family_not_loaded-петля до лимита проходов. Маппим
+                # назад в легаси-пару. Byte-identity для настоящего легаси-трафика цела:
+                # модель, не видевшая ON, это имя эмитить не может.
+                if (tc_args or {}).get("mode") == "overview":
+                    name, tc_args = "list_checklists", {}
+                else:
+                    name = "show_checklist"
+                    tc_args = {"list_id_or_title": str((tc_args or {}).get("name") or "")}
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
             # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
@@ -2329,7 +2406,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                     _umsg = (f"Инструмент {name} сейчас недоступен — сначала позови "
                              "need_family нужной семьи.")
                 out.append(ToolMessage(
-                    content=_umsg, name=name, tool_call_id=tc["id"],  # #192: не-исполнение
+                    content=_umsg, name=tc["name"], tool_call_id=tc["id"],  # #192: не-исполнение
                     artifact={"result_kind": "domain_blocked" if _ureason == "domain_blocked" else "unavailable"}))
                 continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
@@ -2345,9 +2422,9 @@ def _build_graph(llm: Any, all_tools: list, *,
                         turn_key=turn_key, channel=channel, thread_id=thread_id,
                         origin="react")  # #163 Фаза 3d-B: react-аудит метится только при origin=react
                     with bind_tool_runtime(ctx):
-                        res = tool_obj.invoke(tc["args"])
+                        res = tool_obj.invoke(tc_args)
                 else:
-                    res = tool_obj.invoke(tc["args"])
+                    res = tool_obj.invoke(tc_args)
             except GraphBubbleUp:
                 # control-flow LangGraph (interrupt()-пауза подтверждения / Command / Send и любые
                 # будущие подклассы) — НЕ ошибка инструмента; пробросить, иначе сломается
@@ -2362,13 +2439,20 @@ def _build_graph(llm: Any, all_tools: list, *,
                 logger.warning("react_loop: tool %s failed type=%s", name, type(exc).__name__)
                 out.append(ToolMessage(
                     content=f"error: инструмент {name} не смог выполниться, повтори запрос.",
-                    name=name, tool_call_id=tc["id"], status="error",
+                    name=tc["name"], tool_call_id=tc["id"], status="error",
                     artifact={"result_kind": "error", "error_type": type(exc).__name__,
                               "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
                 continue
-            out.append(ToolMessage(content=str(res), name=name, tool_call_id=tc["id"],
-                                   artifact={"result_kind": "ok",
-                                             "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
+            # name в ToolMessage — ОРИГИНАЛ из tool_call (ревью R1 среза A, Claude MINOR-1):
+            # OpenAI-путь матчит по tool_call_id, но Gemini-семейство матчит FunctionResponse
+            # ПО ИМЕНИ — канонизированное имя рассинхронизировало бы пару. Факт канонизации
+            # виден трейсу через artifact.canonicalized_to.
+            _art = {"result_kind": "ok",
+                    "latency_ms": int((_time.perf_counter() - _t) * 1000)}
+            if name != tc["name"]:
+                _art["canonicalized_to"] = name
+            out.append(ToolMessage(content=str(res), name=tc["name"], tool_call_id=tc["id"],
+                                   artifact=_art))
             if (name in _CORE_MUTATING_TOOLS
                     or TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES):
                 # rerun-unsafe запись (#202 Codex medium R3): core-мутирующая (add_task без даты — нет

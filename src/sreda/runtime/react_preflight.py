@@ -157,6 +157,26 @@ _HINT_TASK = ("ВАЖНО: пользователь спрашивает про 
 _HINT_CHECKLIST = ("ВАЖНО: пользователь спрашивает про СПИСКИ ДЕЛ (раздел «Дела» = чек-листы со списками "
                    "пунктов, напр. «Кино к просмотру», «Поход», покупки). Используй list_checklists. "
                    "НЕ показывай напоминания (list_reminders) и НЕ показывай задачи (list_tasks).")
+# #213 Срез A: вариант директивы при SREDA_CHECKLIST_UNIFIED=ON. Легаси-текст выше велит
+# «list_checklists» — при ON послушный вызов канонизировался бы в mode=overview и клал в
+# контекст конкурирующий обзор на items-интенте (класс #213 нашей же вставкой; ревью R1
+# среза A, Claude MAJOR-1). При OFF выдаётся легаси-текст байт-в-байт.
+_HINT_CHECKLIST_UNIFIED = (
+    "ВАЖНО: пользователь спрашивает про СПИСКИ ДЕЛ (раздел «Дела» = чек-листы со списками "
+    "пунктов, напр. «Кино к просмотру», «Поход», покупки). Используй get_checklist: назван "
+    "КОНКРЕТНЫЙ список → mode=\"items\" с name; «какие списки/покажи все» → mode=\"overview\" "
+    "без name. НЕ показывай напоминания (list_reminders) и НЕ показывай задачи (list_tasks).")
+
+
+def _hint_checklist() -> str:
+    """#213 Срез A: текст checklist-директивы по флагу (OFF → легаси байт-в-байт)."""
+    try:
+        from sreda.config.settings import get_settings
+        if get_settings().checklist_unified_enabled:
+            return _HINT_CHECKLIST_UNIFIED
+    except Exception:  # noqa: BLE001 — флаг не валит предслой
+        pass
+    return _HINT_CHECKLIST
 
 
 def _section_hint(text: str) -> str | None:
@@ -172,7 +192,7 @@ def _section_hint(text: str) -> str | None:
     if has_root(_SEC_TASK_ROOTS):
         return _HINT_TASK
     if has_root(_SEC_CHECKLIST_ROOTS) or any(t in _SEC_CHECKLIST_WORDS for t in toks):
-        return _HINT_CHECKLIST
+        return _hint_checklist()
     return None
 
 
@@ -204,6 +224,14 @@ _PHRASES: tuple[tuple[str, str], ...] = (
 # «в памяти» exact-словами (НЕ префикс «памят» — он ловил бы «памятник»/«памятный», R1 negative).
 _MEMORY_WORDS = frozenset({"памяти", "память", "памятью"})
 _DIRECTIVE = {"reminders": _HINT_REMINDER, "tasks": _HINT_TASK, "checklists": _HINT_CHECKLIST}
+
+
+def _directive_for(domain: str | None) -> str | None:
+    """#213 Срез A: директива домена; для checklists — флаг-условный текст
+    (см. _hint_checklist), остальные — статические из _DIRECTIVE."""
+    if domain == "checklists":
+        return _hint_checklist()
+    return _DIRECTIVE.get(domain) if domain else None
 # Направленные кросс-доменные намерения «X из Y» (source-предлог): маркер в тексте + оба домена вовлечены.
 # Единственный — «покупки ИЗ меню» (generate_shopping_from_menu: читает menu, пишет shopping). Направленность
 # по предлогу: «из меню» (menu=source) → target shopping; «из покупок» НЕ сработает (R3: иначе ложная
@@ -371,7 +399,7 @@ def route_domains(text: str) -> RouteResult:
     active = tuple(sorted((set(all_domains) | cross_fams) & onto["lazy"]))
     return RouteResult(primary, secondary, tuple(sorted(suppressed)), compound,
                        ("task" if task_signal else None), False, active,
-                       _DIRECTIVE.get(primary), all_domains, cross_intent)
+                       _directive_for(primary), all_domains, cross_intent)
 
 
 # ───────────────────────── #221 Ф2: доменный фолбэк-классификатор (Слой-1) ─────────────────────────
