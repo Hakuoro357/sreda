@@ -91,7 +91,10 @@ _META_BEFORE = re.compile(
     r"\b(?:слов[оаеум]|фраз[аыуе]|команд[аыуе]|значит|означа|перевед\w*|перевес\w*|перевод"
     r"|как\s+сказать|что\s+значит|почему|зачем"
     r"|сказал\w*|говор(?:ит|ил\w*)|пишет|спросил\w*|ответил\w*"
-    r"|(?:по)?просил\w*|просит)\b",  # косвенная речь/просьба «мама просила добавь…» (R3 самопроверка)
+    r"|(?:по)?просил\w*|просит"  # косвенная речь/просьба «мама просила добавь…» (R3)
+    # глаголы-поручения 3-го лица (R4 субагент): «велел/приказал/советует добавь…» → не команда
+    r"|велел\w*|велит|приказал\w*|приказывает|предложил\w*|предлагает"
+    r"|(?:по)?советовал\w*|советует|напомнил\w*|напоминает|требует|требовал\w*)\b",
     re.IGNORECASE,
 )
 _QUOTE = re.compile(r"[«»\"“”„‘’]")
@@ -104,6 +107,19 @@ _REMIND_READ_FRAME = re.compile(
 )
 
 
+def _framed(text: str, start: int, end: int) -> bool:
+    """Совпадение [start:end) отрицается/обсуждается/цитируется → НЕ прямой сигнал (общий guard
+    команд и деклараций, R4 CodexH: декларации тоже подвержены meta/quote/reported-речи)."""
+    before = text[:start]
+    if _NEG_BEFORE.search(before):  # «не» (любой разделитель) перед совпадением
+        return True
+    if _META_BEFORE.search(before):  # мета-рамка/косвенная речь/просьба перед совпадением
+        return True
+    if _QUOTE.search(before) and _QUOTE.search(text[end:]):  # совпадение в кавычках → цитата
+        return True
+    return False
+
+
 def write_command_signal(text: str) -> bool:
     """Есть ли ЯВНАЯ ИМПЕРАТИВНАЯ команда-мутация (ФОРМА). B1-сигнал НЕОБХОДИМ, но НЕ ДОСТАТОЧЕН для
     яруса (а): B2 дополнительно требует productivity write-домен от route_domains (иначе «поставь
@@ -114,16 +130,7 @@ def write_command_signal(text: str) -> bool:
         return False
     # хотя бы ОДИН чистый императив (не отрицаемый/не мета/не цитата). finditer → «не удали, но
     # добавь молоко»: «удали» отрицаемо (skip), «добавь» чистое → True (recall не теряется).
-    for m in _CMD_VERBS.finditer(t):
-        before = t[: m.start()]
-        if _NEG_BEFORE.search(before):  # «не» (любой разделитель) перед глаголом → воздержаться
-            continue
-        if _META_BEFORE.search(before):  # мета-рамка/косвенная речь перед глаголом
-            continue
-        if _QUOTE.search(before) and _QUOTE.search(t[m.end():]):  # глагол в кавычках → цитата
-            continue
-        return True
-    return False
+    return any(not _framed(t, m.start(), m.end()) for m in _CMD_VERBS.finditer(t))
 
 
 def declarative_memory_signal(text: str) -> bool:
@@ -131,15 +138,20 @@ def declarative_memory_signal(text: str) -> bool:
     заглавное нарицательное («живу в Интернете», «зовут Солнышко») — стоп-списком; отрицание
     «(больше) не живу в X» — токенно (R3 CodexH/M: fixed lookbehind пробивался разделителем)."""
     t = text or ""
-    if _DECL_KIDS.search(t):  # «у меня не двое» безопасно (adjacency-паттерн не матчит)
-        return True
+    # KIDS (без capture/стоп-списка) — но с ОБЩИМ guard (R4 CodexM: «не у меня двое детей, а у
+    # сестры» шорткатом сохранял бы чужой факт).
+    for m in _DECL_KIDS.finditer(t):
+        if not _framed(t, m.start(), m.end()):
+            return True
     for pat in (_DECL_NAME, _DECL_LIVE, _DECL_REL, _DECL_MYNAME):
-        m = pat.search(t)
-        if not m or m.group(1).lower() in _DECL_STOP:
-            continue
-        if _NEG_BEFORE.search(t[: m.start()]):  # «не» (любой разделитель) перед декларацией
-            continue
-        return True
+        for m in pat.finditer(t):
+            if m.group(1).lower() in _DECL_STOP:
+                continue
+            # общий guard: отрицание/мета/цитата/косвенная речь (R4 CodexH: «она сказала: меня
+            # зовут Таня», «фраза "меня зовут Таня"…» сохраняли бы неверный факт)
+            if _framed(t, m.start(), m.end()):
+                continue
+            return True
     return False
 
 
