@@ -3228,16 +3228,20 @@ async def handle_turn(
             if expected_confirm_id != _cur_pid:
                 return _Reply("")
 
+        _confirm_resolution: str | None = None  # #285 Фаза A: исход confirm-паузы для трейса
         if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
             # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
             # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
             # уже шлёт канон (confirm_resume_text). ask_human (не confirm) — текст-ответ как есть.
             # redirect → A0 трактует «нет» (безопасный отказ; авто-переключение раздела — Фаза B).
             _resume_val = user_text
-            if not resume_only:
-                _, _is_confirm_pause, _ = _pending(snap)
-                if _is_confirm_pause:
-                    _resume_val = "да" if classify_confirm_reply(user_text) == "affirm" else "нет"
+            _, _is_confirm_pause, _ = _pending(snap)
+            if not resume_only and _is_confirm_pause:
+                _resume_val = "да" if classify_confirm_reply(user_text) == "affirm" else "нет"
+            # #285 Фаза A: различаем «да»/«нет» ДО инвока (finish писал только «confirmed» — петля
+            # калибровки словаря была неизмерима, инвентарь Фазы 0 §5.5). ask_human-пауза → None.
+            if _is_confirm_pause:
+                _confirm_resolution = "yes" if _is_yes(str(_resume_val)) else "no"
             result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
             if _has_pause(snap):  # протухшая пауза → гасим
@@ -3422,13 +3426,17 @@ async def handle_turn(
                 # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
                 _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
                 _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0
+                # #285 Фаза A: снапшот полиси из финального состояния (переживает паузу/resume)
+                _tpj = result.get("turn_policy_json") if isinstance(result, dict) else None
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
                     confirm_state=("confirmed" if live_pause else "none"),  # best-effort
                     outcome=_outcome,
                     passes=_passes_fin,
-                    routing_decision_json=_rdj)
+                    routing_decision_json=_rdj,
+                    turn_policy_json=_tpj,
+                    confirm_resolution=_confirm_resolution)
                 # #258: деградировавший ход → алерт оператору (best-effort; _outcome/passes уже
                 # посчитаны; на проде трейс ВКЛ — он же источник сигнала).
                 _maybe_alert_degraded_turn(

@@ -60,6 +60,13 @@ class ReactTurnTrace(Base):
     # совмещает детерм. путь ("deterministic"/"not_run_in_shadow") и LLM ("high"/"low") — первичный
     # дискриминатор классификатора = флаг classifier_would_run, не строка confidence.
     routing_decision_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # #285 Фаза A: снапшот TurnPolicy хода (shadow-сайдкар, БЕЗ ПД: режимы/домены/бюджеты).
+    # NULL = флаг единого пути OFF / строки до Фазы A.
+    turn_policy_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # #285 Фаза A: исход confirm-паузы "yes"|"no" (петля калибровки словаря: yes на ярусе (б) =
+    # зафиксированный промах сигнала). NULL = паузы не было / до-A строки (confirm_state="confirmed"
+    # да/нет НЕ различал — дыра, найденная инвентарём Фазы 0 §5.5).
+    confirm_resolution: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
     __table_args__ = (
         # R3/R4: обычный UNIQUE в Postgres допускает несколько NULL → tenant-wide двоился бы.

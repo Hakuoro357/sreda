@@ -91,13 +91,17 @@ def persist_trace_pause(*, tenant_id: str, user_id: str | None, turn_key: str) -
 def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str, channel: str,
                          turn_key: str, reply_text: str, llm_calls: list[dict] | None,
                          tool_calls: list[dict] | None, confirm_state: str, outcome: str,
-                         passes: int, routing_decision_json: str | None = None) -> None:
+                         passes: int, routing_decision_json: str | None = None,
+                         turn_policy_json: str | None = None,
+                         confirm_resolution: str | None = None) -> None:
     """Финал/resume/handled-error: → `done` + структура. CONDITIONAL UPDATE из
     `in_progress`/`awaiting_confirm` (терминал НЕИЗМЕНЕН). Если строки нет (start потерян) — INSERT
     сразу `done` (finish-only recovery). НЕ перезаписывает origin/created_at. Guarded.
 
     routing_decision_json (#221 Ф3b): сериализованное решение доменного роутера (БЕЗ ПД). None в
-    disabled-режиме → колонка NULL (никаких новых данных при выключенном роутере)."""
+    disabled-режиме → колонка NULL (никаких новых данных при выключенном роутере).
+    turn_policy_json / confirm_resolution (#285 Фаза A): снапшот TurnPolicy (shadow) и исход
+    confirm-паузы "yes"|"no"; None → NULL (флаг OFF / паузы не было)."""
     if not trace_enabled():
         return
     try:
@@ -111,7 +115,9 @@ def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str,
             outcome=outcome or "ok", passes=int(passes or 0), finished_at=_now(),
             llm_calls_json=json.dumps(llm_calls or [], ensure_ascii=False),
             tool_calls_json=json.dumps(tool_calls or [], ensure_ascii=False),
-            routing_decision_json=routing_decision_json)
+            routing_decision_json=routing_decision_json,
+            turn_policy_json=turn_policy_json,
+            confirm_resolution=confirm_resolution)
         sess = _session()
         try:
             res = sess.execute(
@@ -173,6 +179,10 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                                            args=tc.get("args") or {}),
                     "ok": (rk == "ok"),
                     "result_kind": rk,
+                    # #285 Фаза A: результат НАБЛЮДЁН (ToolMessage найден) или rk — дефолт «ok»
+                    # (resume-обрыв/деградация). Честный executed-счёт: ok AND observed
+                    # (rk-ok best-effort дыра — CodexH R1 фазового ревью Фазы 0).
+                    "observed": cid in results,
                     "error_type": r.get("error_type"),
                     "latency_ms": r.get("latency_ms"),
                 }
