@@ -156,6 +156,31 @@ def _checklist_unified() -> bool:
         return False
 
 
+def _time_in_tail_enabled() -> bool:
+    """#298: дата+время эфемерным хвостом ВКЛ? (SREDA_REACT_TIME_IN_TAIL, дефолт OFF = легаси)."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().react_time_in_tail_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
+def _now_tail_line() -> str:
+    """#298: строка текущих даты+времени для эфемерного хвоста (МСК, до минуты)."""
+    return f"Сейчас {datetime.now(_MSK).strftime('%Y-%m-%d (%A) %H:%M')} (МСК)."
+
+
+def _append_time_tail(msgs: list) -> list:
+    """#298: приклеить строку времени к ПОСЛЕДНЕМУ user-сообщению invoke-вида (prompt-view;
+    канон state["messages"] НЕ мутируется — как директивы #247 и компакция #194). Роль user —
+    контракт OpenAI-совместимых провайдеров (см. #247 R1 MAJOR); если хвост не user (tool/
+    assistant, напр. проход после инструментов) — отдельным user-сообщением."""
+    line = _now_tail_line()
+    if msgs and isinstance(msgs[-1], HumanMessage):
+        return [*msgs[:-1], HumanMessage(content=f"{msgs[-1].content}\n\n{line}")]
+    return [*msgs, HumanMessage(content=line)]
+
+
 def _map_deprecated_checklist_args(old_name: str, args: dict | None) -> dict:
     """#213 Срез A: маппинг аргументов канонизации LLM-origin алиасов.
 
@@ -739,7 +764,12 @@ def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
         "</rules>\n\n"
         # --- ХВОСТ (динамика, кэш-враждебное — после стабильного префикса) ---
         + _preset_block
-        + f"<context>\nСегодня {today_str}. Относительные даты («сегодня», «завтра», «в пятницу») "
+        # #298: пустой today_str (флаг SREDA_REACT_TIME_IN_TAIL=ON) → даты в промпте НЕТ
+        # (полностью стабильный текст, кеш не рвётся даже раз в сутки); текущие дата+время
+        # приходят эфемерным хвостом (см. _append_time_tail). Непустой (легаси) — как раньше.
+        + ("<context>\nТекущие дата и время («Сегодня») указаны отдельным сообщением в конце "
+           "диалога. " if not today_str else f"<context>\nСегодня {today_str}. ")
+        + "Относительные даты («сегодня», «завтра», «в пятницу») "
         "САМА переводи в абсолютные перед вызовом инструментов: дату — YYYY-MM-DD, время — HH:MM, "
         "момент напоминания — полный ISO-8601 datetime. На СЕГОДНЯ ставь, лишь если момент ещё "
         "НЕ наступил. Если относительно «Сегодня» он уже ПРОШЁЛ: назван день недели → бери "
@@ -2129,6 +2159,8 @@ def _build_graph(llm: Any, all_tools: list, *,
             sp = chat_prompt or system_prompt
             _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                       budget=_compact_budget(), summary=history_summary)
+            if _time_in_tail_enabled():  # #298: дата+время эфемерным хвостом (prompt-view)
+                _msgs = _append_time_tail(_msgs)
             _primary = deepseek_llm if deepseek_llm is not None else llm  # мисконфиг → Фредди+web-only
             _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
             _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
@@ -2203,6 +2235,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                           budget=_compact_budget(), summary=history_summary)
+            if _time_in_tail_enabled():  # #298: дата+время эфемерным хвостом (оба режима #247)
+                _msgs = _append_time_tail(_msgs)
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
@@ -3007,7 +3041,8 @@ async def _run_post_turn_summary_inner(
     primary = provider_key or react_provider(tenant_id)
     session = get_session_factory()()
     try:
-        today_str = datetime.now(_MSK).strftime("%Y-%m-%d (%A)")
+        # #298: при time-in-tail дата НЕ в промпте (стабильный текст) — придёт эфемерным хвостом
+        today_str = "" if _time_in_tail_enabled() else datetime.now(_MSK).strftime("%Y-%m-%d (%A)")
         llm = get_chat_llm(provider=primary)  # для постройки графа (узлы не исполняются на aget/aupdate)
         if llm is None:
             return
@@ -3135,7 +3170,8 @@ async def handle_turn(
     try:
         # дата-якорь для резолва относительных дат моделью (МСК = UTC+3, та же зона, что
         # и naive-парсинг времени в _parse_dt — #168).
-        today_str = datetime.now(_MSK).strftime("%Y-%m-%d (%A)")
+        # #298: при time-in-tail дата НЕ в промпте (стабильный текст) — придёт эфемерным хвостом
+        today_str = "" if _time_in_tail_enabled() else datetime.now(_MSK).strftime("%Y-%m-%d (%A)")
 
         tools = build_slice_tools(session, tenant_id, user_id)
         # #197: preflight — рассуждающую модель для chat/fact строим ОДИН раз (дёшево, без сети). Мисконфиг
