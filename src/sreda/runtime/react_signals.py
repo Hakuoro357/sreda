@@ -165,18 +165,26 @@ def declarative_memory_signal(text: str) -> bool:
 
 
 # явный сигнал удаления АККАУНТА (meta_scope: delete_my_account только по нему на едином пути —
-# B2 CodexH CRITICAL). High-precision: «удали задачу» НЕ матчит (нет аккаунт/профиль/учётка рядом).
+# B2 CodexH CRITICAL). ИМПЕРАТИВ (удали/снеси, не инфинитив «как удалить») ЛИБО «хочу удалить …» +
+# существительное аккаунта. High-precision: «удали задачу» не матчит; негация/вопрос/цитата/мета
+# отсекаются _framed (B2 R2 оба Codex: «не удаляй мой аккаунт»/«как удалить?»/«команда "удали
+# аккаунт"» давали ложный сигнал → pre-confirm audit-запись достижима).
+_ACCT_NOUN = r"(?:аккаунт\w*|профил[ья]\w*|учётн\w*|учетн\w*|учётк\w*|учетк\w*)"
 _ACCOUNT_DELETE = re.compile(
-    r"\b(?:удал\w*|снес\w*|снести|стер\w*|уничтож\w*)\b[^.!?]{0,24}"
-    r"\b(?:аккаунт\w*|профил\w*|учётн\w*|учетн\w*|учётк\w*|учетк\w*|мою\s+запись)"
-    r"|\b(?:аккаунт\w*|профил\w*|учётн\w*|учетн\w*)\b[^.!?]{0,16}\b(?:удал\w*|снес\w*|стер\w*)",
+    r"\b(?:удали(?:те)?|снеси(?:те)?|сотри(?:те)?|уничтожь(?:те)?)\b[^.!?]{0,24}\b" + _ACCT_NOUN
+    + r"|\b(?:хочу|надо)\s+(?:удалить|снести|стереть)\b[^.!?]{0,20}\b" + _ACCT_NOUN,
     re.IGNORECASE,
 )
 
 
 def account_deletion_signal(text: str) -> bool:
-    """Явный сигнал удаления аккаунта (гейт delete_my_account на едином пути). Пустой/None → False."""
-    return bool(_ACCOUNT_DELETE.search(text or ""))
+    """Явный сигнал удаления аккаунта (гейт delete_my_account на едином пути). Императив/«хочу удалить»
+    + аккаунт; негация/вопрос/цитата/мета → False (общий _framed guard). Пустой/None → False."""
+    t = text or ""
+    m = _ACCOUNT_DELETE.search(t)
+    if not m:
+        return False
+    return not _framed(t, m.start(), m.end())
 
 
 def read_cue_domains(text: str) -> frozenset[str]:

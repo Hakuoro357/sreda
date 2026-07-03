@@ -1253,8 +1253,11 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
         elif name not in TOOL_OP_CLASS:  # неизвестный → fail-closed
             continue
         elif TOOL_OP_CLASS.get(name) == "write":
-            if tool_write_domains(name) <= aw:
-                out.append(t)  # ярус (а): домен разрешён → прямой write без confirm
+            # ярус (а) прямой — ТОЛЬКО если И write-домен разрешён, И read-домен инструмента в allowed_read
+            # (B2 CodexH R2: иначе write-инструмент с read≠write доменом, напр. generate_shopping_from_menu
+            # write=shopping/read=menu, читал бы menu-own-data без гранта). Иначе → кандидат под confirm.
+            if tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
+                out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
             else:
                 out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
         elif tool_read_domains(name) <= ar:

@@ -70,10 +70,25 @@ def test_delete_my_account_gated_by_signal():
 def test_account_deletion_signal_precision():
     from sreda.runtime.react_signals import account_deletion_signal as a
     for t in ("удали мой аккаунт", "хочу удалить учётную запись", "снеси мой профиль",
-              "удалить аккаунт навсегда"):
+              "удали мою учётку", "уничтожь мой аккаунт"):
         assert a(t) is True, t
-    for t in ("удали задачу", "добавь молоко", "как дела?", "удали напоминание про врача"):
+    # негация/вопрос/цитата/мета/чужой (B2 R2 оба Codex) + не-аккаунт
+    for t in ("удали задачу", "добавь молоко", "как дела?", "удали напоминание про врача",
+              "не удаляй мой аккаунт", "как удалить аккаунт?", 'команда "удали мой аккаунт" не работает',
+              "он сказал удали свой аккаунт"):
         assert a(t) is False, t
+
+
+def test_direct_write_requires_read_domain_too():
+    """B2 CodexH R2 MAJOR: write-инструмент с read≠write доменом (write=shopping/read=menu) на
+    shopping-ходе НЕ прямой (читал бы menu own-data), а кандидат под confirm."""
+    t = _tool("generate_shopping_from_menu")  # write=shopping, read=menu (override)
+    # write разрешён (shopping), но read (menu) НЕ в allowed_read → кандидат (обёрнут)
+    out = _apply_unified_policy([t], allowed_read=["web", "shopping"], allowed_write=["shopping"])
+    assert len(out) == 1 and out[0] is not t  # обёрнут (кандидат), не прямой
+    # если И read-домен разрешён → прямой
+    out2 = _apply_unified_policy([t], allowed_read=["web", "menu", "shopping"], allowed_write=["shopping"])
+    assert out2 == [t]  # прямой
 
 
 def test_unknown_tool_fail_closed():
