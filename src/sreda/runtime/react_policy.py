@@ -63,3 +63,57 @@ def build_turn_policy(
 
 def dumps_policy(policy: dict) -> str:
     return json.dumps(policy, ensure_ascii=False, sort_keys=True)
+
+
+# ─────────────────────────── Фаза B срез B2a: двухъярусная политика единого пути ───────────────────────────
+# Чистая функция — соединяет детерминированные сигналы B1 (react_signals) с доменной онтологией #221
+# (compute_allowed_domains) в per-turn политику. Пилляры 1/3 плана:
+#   allowed_write (ярус а)  — ДЕТЕРМИНИРОВАННЫЙ write-грант БЕЗ confirm: командный сигнал B1 И домен
+#                             резолвится #221 (иначе «поставь чайник» → ∅ → кандидат); + memory если
+#                             декларативный stable-fact.
+#   confirm_write (ярус б)  — на единый путь write НИКОГДА не deny-all: write-инструмент вне allowed_write
+#                             биндится как КАНДИДАТ под универсальным confirm (B2b), не отказ. Всегда True
+#                             на execute (unsignaled write → подтверждение, не тупик #281/#282).
+#   allowed_read            — baseline web ВСЕГДА + own-data по read-кюсу B1 + домены записи (что пишем —
+#                             читаем). НЕ включает route-домены сами по себе («как дела?»→checklists у #221,
+#                             но read-кюс пуст → own-data не открывается — нейтрализация route-мины).
+POLICY_VERSION_B2 = 2
+
+
+def compute_unified_policy(text, route, classified=None, *, base_web=True):
+    """Двухъярусная политика единого пути (execute). Чистая; поведение прода не трогает (проводка — B2b).
+
+    text: текст хода. route: RouteResult из route_domains(text). classified: DomainClassResult|None
+    (LLM-фолбэк домена, как в #221). Возврат — dict (JSON-сериализуемый; без ПД: домены/флаги)."""
+    from sreda.runtime.react_preflight import compute_allowed_domains
+    from sreda.runtime.react_signals import (
+        declarative_memory_signal, read_cue_domains, write_command_signal,
+    )
+
+    w_sig = bool(write_command_signal(text))
+    d_sig = bool(declarative_memory_signal(text))
+    read_cues = set(read_cue_domains(text))
+
+    allowed_write: set[str] = set()
+    if w_sig:
+        # ярус (а): домен(ы) резолвит #221 (single→write; compound/нет-домена→∅→кандидат). B1 гейтит
+        # САМ факт команды (route.task_signal-мину для write игнорируем — пишем только при B1-сигнале).
+        _ar, aw = compute_allowed_domains(route, classified)
+        allowed_write |= set(aw)
+    if d_sig:
+        allowed_write.add("memory")
+
+    allowed_read: set[str] = set()
+    if base_web:
+        allowed_read.add("web")
+    allowed_read |= read_cues
+    allowed_read |= allowed_write  # что разрешено писать — разрешено и читать (найти объект правки)
+
+    return {
+        "v": POLICY_VERSION_B2,
+        "mode": "unified-execute",
+        "allowed_read": sorted(allowed_read),
+        "allowed_write": sorted(allowed_write),   # ярус (а): прямой write без confirm
+        "confirm_write": True,                    # ярус (б): write вне allowed_write → кандидат+confirm (B2b)
+        "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues)},
+    }
