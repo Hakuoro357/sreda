@@ -212,11 +212,20 @@ class ChecklistQuery:
     confidence: str           # high | low
 
 
-# write-глаголы чек-листов: ход с ними — write-shaped, предслой его не гейтит.
+# write-глаголы чек-листов: ход с ними — write-shaped, предслой его не гейтит (подготовительные
+# read-вызовы легитимны). R2 Claude B2: расширено до объединения с WRITE_GUARD-инвентарём проекта
+# (housewife_chat_tools) — пропущенные основы (убери/зачеркни/обнови/очисти/дополни/поставь/сними/
+# поменяй/восстанови/верни/сохрани/занеси) гейтили обученный флоу «сначала list_checklist_items».
 _CQ_WRITE_RE = re.compile(
-    r"(добав|отмет|удали|вычеркн|создай|заведи|запиши|архивир|переимен|перенес|измени|закрой)")
-# слова-разделы чек-листов (расширение _SEC_CHECKLIST_WORDS формами «план/чек-лист»)
-_CQ_SECTION_RE = re.compile(r"\b(списк\w*|список|плана|плане|план\w?|чек-?лист\w*|дела|дел)\b")
+    r"(добав|отмет|удали|вычеркн|создай|заве[дл]|запиш|архивир|переимен|перенес|перенос|измен|"
+    r"закр|убер|зачеркн|обнов|очист|дополн|сним|поставь|поменя|восстанов|верн|сохран|занес|"
+    r"пометь|галочк)")
+# слова-разделы чек-листов (расширение _SEC_CHECKLIST_WORDS формами «план/чек-лист»).
+# M3: «план\w*» ловит «планов»; порядок форм не важен (alternation).
+_CQ_SECTION_RE = re.compile(r"\b(списк\w*|список|план\w*|плана|плане|чек-?лист\w*|дела|дел)\b")
+# M1: секц-слова, которые НЕ должны попадать в имя списка (сами себе раздел, не название).
+_CQ_SECTION_WORD_RE = re.compile(
+    r"^(дел[аоуы]?|списк\w*|список|план\w*|чек-?лист\w*)$")
 # overview-маркеры: plural-вопрос/«все»/«сколько». До 2 слов между («какие ЕЩЁ списки»,
 # «какие У МЕНЯ списки»); беглая гласная «список/списков» учтена ниже отдельными формами.
 _CQ_OVERVIEW_RE = re.compile(
@@ -251,7 +260,15 @@ def classify_checklist_query(text: str) -> ChecklistQuery | None:
     if m_items:
         raw = m_items.group(1).strip()
         raw = re.split(r"\s+и\s+|\s+или\s+", raw)[0].strip()
-        span = raw
+        _words = raw.split()
+        # M1: первое слово после раздел-слова — тоже секц-слово («покажи список ДЕЛ»,
+        # «список ПЛАНОВ»): это обзор раздела целиком, НЕ имя конкретного списка → overview.
+        if _words and _CQ_SECTION_WORD_RE.match(_words[0]):
+            has_overview = True
+            raw = " ".join(_words[1:]).strip()  # остаток (обычно пуст) — не имя
+            span = raw if raw and not _CQ_SECTION_WORD_RE.match(raw.split()[0]) else ""
+        else:
+            span = raw
     has_items = bool(span) or (
         _CQ_SECTION_RE.search(norm) and not has_overview and not has_search)
     if has_overview and (span or has_search):

@@ -101,6 +101,31 @@ def test_kind_none_for_non_checklist():
         assert _classify(text) is None, text
 
 
+# --- фиксы R2 Claude в классификаторе -------------------------------------
+
+
+def test_kind_write_verbs_extended():
+    """R2 B2: расширенный инвентарь write-глаголов → None (write-ход не гейтим)."""
+    for text in ("убери лопату из списка кино", "зачеркни стекло в списке машина",
+                 "обнови пункт в плане кроя", "очисти список поход",
+                 "дополни список кино фильмом", "поставь галочку на лопате",
+                 "сними отметку с колодок", "поменяй местами пункты",
+                 "восстанови удалённый пункт", "верни лопату в список"):
+        assert _classify(text) is None, text
+
+
+def test_kind_section_word_not_captured_as_name():
+    """R2 M1: «покажи список дел» — «дел» это раздел-слово, не имя → overview, не items/«дел»."""
+    q = _classify("покажи список дел")
+    assert q is not None and q.kind == "overview", (q.kind, q.name_span)
+
+
+def test_kind_planov_overview():
+    """R2 M3: «сколько у меня планов» → overview (форма «планов» распознана)."""
+    q = _classify("сколько у меня планов")
+    assert q is not None and q.kind == "overview", (q.kind if q else None)
+
+
 # ---------------------------------------------------------------------------
 # B. Cross-check в tool-node (ON/ON): mismatch, редирект, search-гейт, зеркало
 # ---------------------------------------------------------------------------
@@ -435,6 +460,236 @@ async def test_querykind_inert_without_preflight(db_session, monkeypatch):
     assert tm is not None
     assert "result_type=overview" in str(tm.content), (
         f"без preflight срез B инертен: {tm.content}")
+
+
+class _DynamicStubLLM:
+    """Стаб, чьи tool_calls вычисляются из УВИДЕННЫХ ToolMessage (для позитива
+    write-enforcement: подставить source_result_id + item_id из показанного items-result)."""
+
+    def __init__(self, planner):
+        self._planner = planner  # callable(seen_tool_messages) -> AIMessage
+        self.seen_messages: list[list] = []
+
+    def bind_tools(self, tools):  # noqa: ANN001
+        return self
+
+    def invoke(self, messages):  # noqa: ANN001
+        self.seen_messages.append(list(messages))
+        from langchain_core.messages import ToolMessage
+        tms = [m for m in messages if isinstance(m, ToolMessage)]
+        return self._planner(tms)
+
+
+def _parse_result_id(content: str) -> str:
+    import re as _re
+    m = _re.search(r"result_id=(\S+)", content or "")
+    return m.group(1) if m else ""
+
+
+def _parse_first_item_id(content: str) -> str:
+    import re as _re
+    m = _re.search(r"\[(clitem_[0-9a-f]+)\]", content or "")
+    return m.group(1) if m else ""
+
+
+@pytest.mark.asyncio
+async def test_write_enforcement_positive_binding_executes(db_session, monkeypatch):
+    """R2 Claude B3 (приёмка п.8 позитив): 2 items-result + write С правильной привязкой
+    (source_result_id + item_id из ТОГО результата) → исполняется."""
+    _flags(monkeypatch, unified=True, querykind=True)
+    u = seed_telegram_user(db_session)
+    svc = ChecklistService(db_session)
+    a = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Кино к просмотру")
+    (ia,), _ = svc.add_items(list_id=a.id, items=["Дюна"])
+    b = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Машина")
+    svc.add_items(list_id=b.id, items=["Колодки"])
+    db_session.commit()
+    ia_id = ia.id
+
+    from langchain_core.messages import AIMessage as _AI
+
+    def _planner(tms):
+        if not tms:  # проход 1: два items-вызова
+            return _AI(content="", tool_calls=[
+                {"name": "get_checklist", "args": {"mode": "items", "name": "кино"}, "id": "p1"},
+                {"name": "get_checklist", "args": {"mode": "items", "name": "машина"}, "id": "p2"},
+            ])
+        done = {m.tool_call_id for m in tms}
+        if "p3" not in done:  # проход 2: write с привязкой к result_id списка «Кино»
+            kino_rid = ""
+            for m in tms:
+                c = str(m.content)
+                if "Кино к просмотру" in c and "result_type=items" in c:
+                    kino_rid = _parse_result_id(c)
+            return _AI(content="", tool_calls=[{
+                "name": "mark_checklist_item_done",
+                "args": {"item_id": ia_id, "source_result_id": kino_rid}, "id": "p3",
+            }])
+        return _AI(content="Отметила.")
+
+    stub = _DynamicStubLLM(_planner)
+    await _turn(db_session, u, stub, "что в списках кино и машина, отметь первый из кино",
+                "213b-pos-1")
+    tm = _tool_message_for(stub, "p3")
+    assert tm is not None, "write-проход не дошёл"
+    assert "ok:done" in str(tm.content), tm.content
+    db_session.expire_all()
+    from sreda.db.models.checklists import ChecklistItem
+    assert db_session.get(ChecklistItem, ia_id).status == "done"
+
+
+@pytest.mark.asyncio
+async def test_write_enforcement_wrong_binding_refused(db_session, monkeypatch):
+    """R2 Claude B3: source_result_id указывает на ДРУГОЙ результат (item_id не из него) →
+    отказ, write не исполняется."""
+    _flags(monkeypatch, unified=True, querykind=True)
+    u = seed_telegram_user(db_session)
+    svc = ChecklistService(db_session)
+    a = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Кино к просмотру")
+    (ia,), _ = svc.add_items(list_id=a.id, items=["Дюна"])
+    b = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Машина")
+    (ib,), _ = svc.add_items(list_id=b.id, items=["Колодки"])
+    db_session.commit()
+    ia_id, ib_id = ia.id, ib.id
+
+    from langchain_core.messages import AIMessage as _AI
+
+    def _planner(tms):
+        if not tms:
+            return _AI(content="", tool_calls=[
+                {"name": "get_checklist", "args": {"mode": "items", "name": "кино"}, "id": "w1"},
+                {"name": "get_checklist", "args": {"mode": "items", "name": "машина"}, "id": "w2"},
+            ])
+        done = {m.tool_call_id for m in tms}
+        if "w3" not in done:
+            # берём result_id списка «Машина», но item_id из «Кино» — несоответствие
+            mash_rid = ""
+            for m in tms:
+                c = str(m.content)
+                if "Машина" in c and "result_type=items" in c:
+                    mash_rid = _parse_result_id(c)
+            return _AI(content="", tool_calls=[{
+                "name": "mark_checklist_item_done",
+                "args": {"item_id": ia_id, "source_result_id": mash_rid}, "id": "w3",
+            }])
+        return _AI(content="Уточню.")
+
+    stub = _DynamicStubLLM(_planner)
+    await _turn(db_session, u, stub, "что в списках кино и машина, отметь первый", "213b-wb-1")
+    tm = _tool_message_for(stub, "w3")
+    assert tm is not None
+    assert "source_result" in str(tm.content) and "ok:done" not in str(tm.content), tm.content
+    db_session.expire_all()
+    from sreda.db.models.checklists import ChecklistItem
+    assert db_session.get(ChecklistItem, ia_id).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_compound_items_items_both_execute(db_session, monkeypatch):
+    """R2 Claude B1 (приёмка п.15 items+items): «что в списке кино и в списке машина» —
+    ОБА вызова исполняются, второй (машина) НЕ отказывается name_conflict'ом."""
+    _flags(monkeypatch, unified=True, querykind=True)
+    u = seed_telegram_user(db_session)
+    svc = ChecklistService(db_session)
+    a = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Кино к просмотру")
+    svc.add_items(list_id=a.id, items=["Дюна"])
+    b = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Машина")
+    svc.add_items(list_id=b.id, items=["Колодки"])
+    db_session.commit()
+
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[
+            {"name": "get_checklist", "args": {"mode": "items", "name": "кино"}, "id": "cm1"},
+            {"name": "get_checklist", "args": {"mode": "items", "name": "машина"}, "id": "cm2"},
+        ]),
+        AIMessage(content="Вот оба."),
+    ])
+    await _turn(db_session, u, stub, "что в списке кино и в списке машина", "213b-cmp-1")
+    a1 = _tool_message_for(stub, "cm1")
+    a2 = _tool_message_for(stub, "cm2")
+    assert a1 is not None and "Дюна" in str(a1.content)
+    assert a2 is not None and "name_conflict" not in str(a2.content), a2.content
+    assert "Колодки" in str(a2.content), f"второй список должен исполниться: {a2.content}"
+
+
+@pytest.mark.asyncio
+async def test_redirect_nonresolving_name(db_session, monkeypatch):
+    """R2 Claude B5 (приёмка п.12): опечатка «кинооо» (не резолвится) при high-conf span
+    «кино» → редирект на span, исполнение, НЕ not_found."""
+    _flags(monkeypatch, unified=True, querykind=True)
+    u = seed_telegram_user(db_session)
+    _seed_kino(db_session, u)
+
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "get_checklist", "args": {"mode": "items", "name": "кинооо"}, "id": "nr1",
+        }]),
+        AIMessage(content="Вот."),
+    ])
+    await _turn(db_session, u, stub, "покажи список кино", "213b-nr-1")
+    tm = _tool_message_for(stub, "nr1")
+    assert tm is not None
+    assert "result_type=items" in str(tm.content) and "Скорпион" in str(tm.content), (
+        f"нерезолвящееся имя должно редиректиться на span: {tm.content}")
+
+
+@pytest.mark.asyncio
+async def test_redirect_does_not_overwrite_valid_name(db_session, monkeypatch):
+    """R2 Claude B5-граница: РЕЗОЛВЯЩЕЕСЯ имя модели, названное юзером, НЕ перезаписывается."""
+    _flags(monkeypatch, unified=True, querykind=True)
+    u = seed_telegram_user(db_session)
+    _seed_kino(db_session, u)
+    svc = ChecklistService(db_session)
+    p = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Поход")
+    svc.add_items(list_id=p.id, items=["Палатка"])
+    db_session.commit()
+
+    # юзер назвал ОБА («кино и поход»), span=«кино», модель зовёт «поход» — легитимно, не перезап.
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "get_checklist", "args": {"mode": "items", "name": "поход"}, "id": "vn1",
+        }]),
+        AIMessage(content="Вот."),
+    ])
+    await _turn(db_session, u, stub, "что в списке кино и поход", "213b-vn-1")
+    tm = _tool_message_for(stub, "vn1")
+    assert tm is not None
+    assert "Палатка" in str(tm.content), f"имя, названное юзером, не перезаписывается: {tm.content}"
+
+
+@pytest.mark.asyncio
+async def test_write_enforcement_inert_without_preflight(db_session, monkeypatch):
+    """R2 Codex high+medium MAJOR: write-enforcement ТОЖЕ гейтится preflight -
+    при preflight=OFF два items-result + write без source_result_id проходит по легаси."""
+    _flags(monkeypatch, unified=True, querykind=True, preflight=False)
+    u = seed_telegram_user(db_session)
+    svc = ChecklistService(db_session)
+    a = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Кино к просмотру")
+    (ia,), _ = svc.add_items(list_id=a.id, items=["Дюна"])
+    b = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Машина")
+    svc.add_items(list_id=b.id, items=["Колодки"])
+    db_session.commit()
+
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[
+            {"name": "show_checklist", "args": {"list_id_or_title": "кино"}, "id": "wp1"},
+            {"name": "show_checklist", "args": {"list_id_or_title": "машина"}, "id": "wp2"},
+        ]),
+        AIMessage(content="", tool_calls=[{
+            "name": "mark_checklist_item_done", "args": {"item_id": ia.id}, "id": "wp3",
+        }]),
+        AIMessage(content="Готово."),
+    ])
+    await _turn(db_session, u, stub, "что в списках кино и машина, отметь первый",
+                "213b-wp-1")
+    tm = _tool_message_for(stub, "wp3")
+    assert tm is not None
+    assert "source_result_required" not in str(tm.content), (
+        f"без preflight write-enforcement инертен: {tm.content}")
+    assert "ok:done" in str(tm.content), tm.content
+    db_session.expire_all()
+    from sreda.db.models.checklists import ChecklistItem
+    assert db_session.get(ChecklistItem, ia.id).status == "done"
 
 
 @pytest.mark.asyncio
