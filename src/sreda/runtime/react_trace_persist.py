@@ -159,6 +159,7 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
         if isinstance(m, ToolMessage):
             art = getattr(m, "artifact", None) or {}
             results[str(getattr(m, "tool_call_id", ""))] = {
+                "name": getattr(m, "name", None),  # #285 A3: имя для orphan-записей (см. шаг 3)
                 "status": getattr(m, "status", None),
                 "result_kind": (art.get("result_kind") if isinstance(art, dict) else None),
                 "error_type": (art.get("error_type") if isinstance(art, dict) else None),
@@ -186,4 +187,21 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                     "error_type": r.get("error_type"),
                     "latency_ms": r.get("latency_ms"),
                 }
+    # 3) #285 A3 (R1 фазового ревью, CodexH+субагент): НЕПАРНЫЕ ToolMessage — на resume-ходе
+    # AIMessage с вызовом остался ДО паузы (вне дельты, #269), но исполнение (например
+    # подтверждённый write) в дельте ЕСТЬ. Без записи shadow-сверка слепа ровно на
+    # confirm-путях. args неизвестны (не в дельте) → args_hash=None, orphan=True.
+    for cid, r in results.items():
+        if cid and cid not in out:
+            rk = r.get("result_kind") or ("error" if r.get("status") == "error" else "ok")
+            out[cid] = {
+                "name": r.get("name") or "?",
+                "args_hash": None,
+                "ok": (rk == "ok"),
+                "result_kind": rk,
+                "observed": True,
+                "orphan": True,
+                "error_type": r.get("error_type"),
+                "latency_ms": r.get("latency_ms"),
+            }
     return list(out.values())

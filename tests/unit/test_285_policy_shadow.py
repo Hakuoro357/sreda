@@ -191,7 +191,9 @@ def test_flag_on_sidecar_failure_does_not_break_turn(install, monkeypatch):
     freddie = _Chat("freddie", classify="chat", calls=calls)
     install(preflight=True, unified=True, deepseek=_Chat("deepseek", calls=calls))
     reply = _turn(freddie, thread="on-3", text="как настроение?")
-    assert reply is not None  # ход дошёл до ответа
+    # НОРМАЛЬНЫЙ ответ стаба, НЕ safe-reply внешнего catch-all (иначе тест вакуумен: handle_turn
+    # никогда не возвращает None — R1 MAJOR субагента, класс g-055).
+    assert "resp-deepseek" in str(reply)
 
 
 # ───────────── byte-identical: ON == OFF ─────────────

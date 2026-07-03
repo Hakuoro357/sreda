@@ -3236,11 +3236,16 @@ async def handle_turn(
             # redirect → A0 трактует «нет» (безопасный отказ; авто-переключение раздела — Фаза B).
             _resume_val = user_text
             _, _is_confirm_pause, _ = _pending(snap)
+            # #285 Фаза A: различаем yes|no|redirect ДО инвока (finish писал только «confirmed» —
+            # петля калибровки словаря была неизмерима, инвентарь Фазы 0 §5.5). redirect (новое
+            # намерение на confirm-паузе) в ГРАФ по-прежнему идёт как безопасное «нет» (A0), но в
+            # трейсе различим (R1 фазового ревью, оба Codex). ask_human-пауза → None. Кнопка
+            # (resume_only) шлёт канон «да»/«нет» — redirect у неё невозможен.
             if not resume_only and _is_confirm_pause:
-                _resume_val = "да" if classify_confirm_reply(user_text) == "affirm" else "нет"
-            # #285 Фаза A: различаем «да»/«нет» ДО инвока (finish писал только «confirmed» — петля
-            # калибровки словаря была неизмерима, инвентарь Фазы 0 §5.5). ask_human-пауза → None.
-            if _is_confirm_pause:
+                _cls = classify_confirm_reply(user_text)
+                _resume_val = "да" if _cls == "affirm" else "нет"
+                _confirm_resolution = {"affirm": "yes", "negate": "no"}.get(_cls, "redirect")
+            elif _is_confirm_pause:
                 _confirm_resolution = "yes" if _is_yes(str(_resume_val)) else "no"
             result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
@@ -3427,7 +3432,21 @@ async def handle_turn(
                 _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
                 _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0
                 # #285 Фаза A: снапшот полиси из финального состояния (переживает паузу/resume)
+                # + события хода (guard/resume/passes) — guard-каунты для выхода фазы (R1 CodexH).
+                # Только при присутствующей полиси (флаг ON) → OFF по-прежнему ноль новых данных.
                 _tpj = result.get("turn_policy_json") if isinstance(result, dict) else None
+                if _tpj:
+                    try:
+                        _pd285 = json.loads(_tpj)
+                        _pd285["turn_events"] = {
+                            "resumed": bool(live_pause),
+                            "guard_attempted": len(result.get("guard_attempted_families") or []),
+                            "guard_full": bool(result.get("guard_full_attempted")),
+                            "passes": int(_passes_fin or 0),
+                        }
+                        _tpj = json.dumps(_pd285, ensure_ascii=False)
+                    except Exception:  # noqa: BLE001 — события best-effort, полиси не теряем
+                        pass
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,

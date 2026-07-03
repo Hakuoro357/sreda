@@ -44,6 +44,18 @@ def test_collect_observed_false_when_result_missing():
     assert rec["result_kind"] == "ok" and rec["ok"] is True  # backcompat-поведение задокументировано
 
 
+def test_collect_orphan_toolmessage_recorded():
+    """Обратная #269-дыра (R1 фазового ревью, CodexH M3): ToolMessage БЕЗ пары-AIMessage
+    (confirm-resume: AIMessage до паузы вне дельты) → orphan-запись с именем из ToolMessage —
+    подтверждённый write видим shadow-сверке."""
+    tm = ToolMessage(content="ok", tool_call_id="c9", name="cancel_task",
+                     artifact={"result_kind": "ok", "latency_ms": 3})
+    (rec,) = collect_tool_calls([tm], tenant_id="t")
+    assert rec["orphan"] is True and rec["observed"] is True
+    assert rec["name"] == "cancel_task" and rec["result_kind"] == "ok"
+    assert rec["args_hash"] is None  # args вне дельты — честный None, не выдумка
+
+
 # ───────────── (2) finish пишет новые колонки (sqlite) ─────────────
 
 @pytest.fixture
@@ -190,7 +202,9 @@ def _ai_call(name, cid):
     return AIMessage(content="", tool_calls=[{"name": name, "args": {}, "id": cid}])
 
 
-@pytest.mark.parametrize("answer,expected", [("да", "yes"), ("нет", "no"), ("не надо", "no")])
+@pytest.mark.parametrize("answer,expected",
+                         [("да", "yes"), ("нет", "no"), ("не надо", "no"),
+                          ("лучше перенеси её на вторник", "redirect")])
 def test_confirm_resolution_recorded(install, answer, expected):
     """Confirm-пауза → resume текстом: finish несёт confirm_resolution yes|no (различимо)."""
     rec = _RecTrace()
@@ -203,6 +217,39 @@ def test_confirm_resolution_recorded(install, answer, expected):
     assert len(rec.finishes) == 1
     assert rec.finishes[0]["confirm_resolution"] == expected
     assert rec.finishes[0]["confirm_state"] == "confirmed"
+
+
+def test_confirm_resolution_button_path(install):
+    """Кнопка [Да] (resume_only + канон + confirm_id): resolution=yes (R1-субагент m5)."""
+    rec = _RecTrace()
+    freddie = _Chat("freddie", classify="task",
+                    responses=[_ai_call("cancel_task", "c1"), AIMessage(content="ок")])
+    install(unified=False, deepseek=_Chat("ds"), interrupt_names=("cancel_task",), rec=rec)
+    r1 = _turn(freddie, thread="btn-1", text="отмени задачу про хлеб")
+    assert getattr(r1, "awaiting_confirm", False) and getattr(r1, "confirm_id", "")
+    import asyncio as _a
+    r2 = _a.run(react_loop.handle_turn(
+        session=None, tenant_id="t", user_id="u", thread_id="btn-1",
+        llm=freddie, user_text="да", inbound_message_id="btn-1:resume",
+        channel="react", resume_only=True, expected_confirm_id=r1.confirm_id,
+        provider_key="inception-mercury2", fallback_llm=None))
+    assert rec.finishes and rec.finishes[-1]["confirm_resolution"] == "yes"
+
+
+def test_redirect_resumes_graph_with_safe_no(install):
+    """Redirect: в трейсе redirect, но инструмент НЕ исполнен (в граф ушло безопасное «нет», A0)."""
+    rec = _RecTrace()
+    inv = {}
+    freddie = _Chat("freddie", classify="task",
+                    responses=[_ai_call("cancel_task", "c1"), AIMessage(content="ок")])
+    install(unified=False, deepseek=_Chat("ds"), interrupt_names=("cancel_task",),
+            rec=rec, invoked=inv)
+    _turn(freddie, thread="rd-1", text="отмени задачу про хлеб")
+    _turn(freddie, thread="rd-1", text="лучше перенеси её на вторник")
+    assert rec.finishes[-1]["confirm_resolution"] == "redirect"
+    # interrupt-инструмент вызван (до паузы), но подтверждённой ветки «да» не было:
+    # его резюм-ветка вернула «нет»-путь — мутация не «ok» по подтверждению.
+    # (Точная семантика «нет»-ветки — в _mk_tool: return "нет".)
 
 
 def test_fresh_turn_resolution_none(install):

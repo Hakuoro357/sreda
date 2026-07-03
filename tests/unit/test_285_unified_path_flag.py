@@ -30,6 +30,19 @@ def test_unified_path_env_alias(monkeypatch):
     assert s.react_unified_path_enabled is True
 
 
+def test_unified_tenants_gate(monkeypatch):
+    """Companion-список (R1 CodexM m4): пусто → никому; тенант → только он; ``*`` → все."""
+    s = _fresh_settings(monkeypatch, SREDA_REACT_UNIFIED_PATH_ENABLED="1")
+    monkeypatch.delenv("SREDA_REACT_UNIFIED_TENANTS", raising=False)
+    from sreda.config import settings as sm
+    sm.get_settings.cache_clear()
+    assert "tenant_x" not in sm.get_settings().react_unified_tenants
+    s = _fresh_settings(monkeypatch, SREDA_REACT_UNIFIED_TENANTS="tenant_x")
+    assert "tenant_x" in s.react_unified_tenants and "tenant_y" not in s.react_unified_tenants
+    s = _fresh_settings(monkeypatch, SREDA_REACT_UNIFIED_TENANTS="*")
+    assert "anyone" in s.react_unified_tenants
+
+
 def test_unified_path_independent_of_preflight(monkeypatch):
     """НЕ переиспользуем react_preflight_enabled (урок settings R4: обе семантики заняты).
 
