@@ -337,7 +337,14 @@ def _checklist_write_enforce(history: list, batch_out: list,
         if fields.get("resolution_status") in ("not_found", "ambiguous"):
             continue
         rid = fields.get("result_id")
-        ids = {t for t in (fields.get("items") or "").split(",") if t.startswith("clitem_")}
+        _items_field = fields.get("items")
+        if _items_field is not None:
+            ids = {t for t in _items_field.split(",") if t.startswith("clitem_")}
+        else:
+            # #213 Срез C (R1 Codex medium MAJOR): legacy-паспорт срезов A/B БЕЗ поля items=
+            # (durable-история до подшага C) → fallback на тело, чтобы membership не терялся
+            # молча. Новый формат (items= есть) телом НЕ пользуется (M5-защита от подделки).
+            ids = set(re.findall(r"\[(clitem_[0-9a-f]+)\]", c))
         if rid and ids:
             results.append((rid, ids))
     if len(results) + max(pending_batch_reads, 0) < 2:
@@ -2794,19 +2801,26 @@ def _build_graph(llm: Any, all_tools: list, *,
                     "latency_ms": int((_time.perf_counter() - _t) * 1000)}
             if name != tc["name"]:
                 _art["canonicalized_to"] = name
-            # #213 Срез C (M9): различимый result_kind для метрик канарейки. Редирект +
-            # исход паспорта (name_required/ambiguous/not_found) — из ДОВЕРЕННОГО head.
-            # Метрики замера (redirect_rate/ambiguous_rate/name_required_rate) выводятся из
-            # tool_calls_json.result_kind, без нового поля.
+            # #213 Срез C (M9): исход checklist-read для метрик канарейки — в ОТДЕЛЬНЫЕ поля
+            # artifact. result_kind ОСТАЁТСЯ "ok" (вызов ИСПОЛНЕН): переклассификация "ok" ломала бы
+            # кросс-эпиковый смысл «tool ran» — analysis_285_shadow считает executed по result_kind=="ok"
+            # (R1 Claude MAJOR). Non-исполнение (mode_mismatch/…) метится своим result_kind в continue выше.
+            # checklist_kind — конечный исход из ДОВЕРЕННОГО head (enum: items|overview|ambiguous|
+            # not_found|name_required); checklist_redirected — ОТДЕЛЬНЫЙ флаг, чтобы редирект не маскировал
+            # терминальный исход (R1 Codex high MAJOR: redirect на нерезолв мог бы скрыть ambiguous).
             if _redirected_213:
-                _art["result_kind"] = "checklist_redirect"
-            elif name == "get_checklist":
+                _art["checklist_redirected"] = True
+            if name == "get_checklist":
                 _rc = str(res)
-                _hf = _parse_passport_fields(_rc.splitlines()[0] if _rc else "")
-                if "error: name_required" in _rc:
-                    _art["result_kind"] = "name_required"
-                elif _hf.get("resolution_status") in ("ambiguous", "not_found"):
-                    _art["result_kind"] = _hf["resolution_status"]
+                if _rc.startswith("error: name_required"):  # startswith: доверенная 1-я строка, не тело
+                    _art["checklist_kind"] = "name_required"
+                else:
+                    _hf = _parse_passport_fields(_rc.splitlines()[0] if _rc else "")
+                    _rs, _rt = _hf.get("resolution_status"), _hf.get("result_type")
+                    if _rs in ("ambiguous", "not_found"):
+                        _art["checklist_kind"] = _rs
+                    elif _rt in ("items", "overview"):
+                        _art["checklist_kind"] = _rt
             out.append(ToolMessage(content=str(res), name=tc["name"], tool_call_id=tc["id"],
                                    artifact=_art))
             if (name in _CORE_MUTATING_TOOLS

@@ -879,28 +879,26 @@ async def test_write_enforcement_membership_from_passport(db_session, monkeypatc
 # --- Срез C M9: наблюдаемость метрик в трейс -------------------------------
 
 
+def _art_of(stub, cid):
+    m = _tool_message_for(stub, cid)
+    return (getattr(m, "artifact", None) or {}) if m else {}
+
+
 @pytest.mark.asyncio
-async def test_m9_result_kind_marks(db_session, monkeypatch):
-    """M9: checklist-события несут различимый result_kind в artifact (для метрик канарейки):
-    mode_mismatch / name_required / ambiguous / checklist_redirect."""
+async def test_m9_checklist_kind_marks(db_session, monkeypatch):
+    """M9 (после R1 Claude MAJOR): исход read — в ОТДЕЛЬНОМ artifact.checklist_kind
+    (redirect/ambiguous/items), а result_kind ИСПОЛНЕННОГО вызова ОСТАЁТСЯ "ok" —
+    иначе ломается кросс-эпиковый смысл result_kind=="ok" (#285 shadow-отчёт)."""
     _flags(monkeypatch, unified=True, querykind=True)
     u = seed_telegram_user(db_session)
     _seed_kino(db_session, u)
     svc = ChecklistService(db_session)
     svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Кино детям")  # для ambiguous
+    ph = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Поход")
+    svc.add_items(list_id=ph.id, items=["Палатка"])
     db_session.commit()
 
-    def _rk(stub, cid):
-        m = _tool_message_for(stub, cid)
-        return (getattr(m, "artifact", None) or {}).get("result_kind") if m else None
-
-    # редирект: no-name items-вызов при high-conf «кино»... но теперь 2 «кино» → ambiguous.
-    # Возьмём чистый редирект на однозначном «поход».
-    svc2 = ChecklistService(db_session)
-    ph = svc2.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Поход")
-    svc2.add_items(list_id=ph.id, items=["Палатка"])
-    db_session.commit()
-
+    # редирект: no-name items-вызов при high-conf «поход» → редирект имени, ИСПОЛНЕНО
     stub = _RecordingStubLLM([
         AIMessage(content="", tool_calls=[{
             "name": "get_checklist", "args": {"mode": "items"}, "id": "rd",
@@ -908,9 +906,13 @@ async def test_m9_result_kind_marks(db_session, monkeypatch):
         AIMessage(content="Вот."),
     ])
     await _turn(db_session, u, stub, "что в списке поход", "213b-m9-rd")
-    assert _rk(stub, "rd") == "checklist_redirect", _rk(stub, "rd")
+    art = _art_of(stub, "rd")
+    # редирект — ОТДЕЛЬНЫЙ флаг (не маскирует терминальный исход); исход = items (span резолвнулся)
+    assert art.get("checklist_redirected") is True, art
+    assert art.get("checklist_kind") == "items", art
+    assert art.get("result_kind") == "ok", "исполненный вызов держит result_kind=ok (#285)"
 
-    # mode_mismatch
+    # mode_mismatch — НЕ исполнение (continue), result_kind своё, checklist_kind нет
     stub2 = _RecordingStubLLM([
         AIMessage(content="", tool_calls=[{
             "name": "get_checklist", "args": {"mode": "overview"}, "id": "mm",
@@ -918,9 +920,9 @@ async def test_m9_result_kind_marks(db_session, monkeypatch):
         AIMessage(content="Вот."),
     ])
     await _turn(db_session, u, stub2, "что в списке поход", "213b-m9-mm")
-    assert _rk(stub2, "mm") == "mode_mismatch", _rk(stub2, "mm")
+    assert _art_of(stub2, "mm").get("result_kind") == "mode_mismatch"
 
-    # ambiguous (два «кино»)
+    # ambiguous (два «кино») — ИСПОЛНЕНО, result_kind=ok, checklist_kind=ambiguous
     stub3 = _RecordingStubLLM([
         AIMessage(content="", tool_calls=[{
             "name": "get_checklist", "args": {"mode": "items", "name": "кино"}, "id": "am",
@@ -928,4 +930,57 @@ async def test_m9_result_kind_marks(db_session, monkeypatch):
         AIMessage(content="Уточни."),
     ])
     await _turn(db_session, u, stub3, "покажи список кино", "213b-m9-am")
-    assert _rk(stub3, "am") == "ambiguous", _rk(stub3, "am")
+    art3 = _art_of(stub3, "am")
+    assert art3.get("checklist_kind") == "ambiguous" and art3.get("result_kind") == "ok", art3
+
+
+def test_m5_head_invariant_checklist_name_last():
+    """M5-инвариант (R1 Claude MINOR): в items-head свободный checklist_name — ПОСЛЕДНИЙ токен
+    (парсер membership это load-bearing). Пин producer'а."""
+    import re as _re
+    from sreda.runtime.react_loop import _parse_passport_fields
+    head = ('result_type=items result_id=r1 resolution_status=exact matched_by=exact '
+            'checklist_id=checklist_x items=clitem_a,clitem_b checklist_name="любой текст"')
+    # checklist_name — последняя key=value пара
+    keys = [m.group(1) for m in _re.finditer(r'(\w+)=("[^"]*"|\S+)', head)]
+    assert keys[-1] == "checklist_name", keys
+    f = _parse_passport_fields(head)
+    assert f["items"] == "clitem_a,clitem_b" and f["resolution_status"] == "exact"
+
+
+@pytest.mark.asyncio
+async def test_m5_legacy_passport_membership_fallback(db_session, monkeypatch):
+    """R1 Codex medium MAJOR: legacy items-паспорт БЕЗ items= (durable-история срезов A/B) —
+    write-enforce берёт membership из тела (fallback), не теряет молча."""
+    from sreda.runtime.react_loop import _checklist_write_enforce
+    from langchain_core.messages import HumanMessage, ToolMessage
+    # два legacy-результата (старый head без items=), тело несёт [clitem_]
+    legacy_a = ("result_type=items result_id=rA checklist_name=\"Кино\" checklist_id=cl_a "
+                "matched_by=exact resolution_status=exact\n[clitem_aaaa1111] ☐ Дюна")
+    legacy_b = ("result_type=items result_id=rB checklist_name=\"Машина\" checklist_id=cl_b "
+                "matched_by=exact resolution_status=exact\n[clitem_bbbb2222] ☐ Колодки")
+    history = [
+        HumanMessage(content="что в кино и машина, отметь первый"),
+        ToolMessage(content=legacy_a, tool_call_id="x1", name="get_checklist"),
+        ToolMessage(content=legacy_b, tool_call_id="x2", name="get_checklist"),
+    ]
+    # write без source_result_id при ДВУХ результатах → enforcement срабатывает (не потерял legacy)
+    msg = _checklist_write_enforce(history, [], "clitem_aaaa1111", "", pending_batch_reads=0)
+    assert msg is not None and "source_result_required" in msg, msg
+    # с правильной привязкой legacy-membership из тела распознаётся → пропуск
+    ok = _checklist_write_enforce(history, [], "clitem_aaaa1111", "rA", pending_batch_reads=0)
+    assert ok is None, ok
+
+
+def test_m5_parser_normalizes_quotes_no_phantom_fields():
+    """R1 Codex high MINOR: кавычки внутри значения нормализованы (safe_title «"»→«'»),
+    подделка ключей внутри checklist_name не создаёт фантомных полей."""
+    from sreda.runtime.react_loop import _parse_passport_fields
+    # producer санитизирует «"» → «'», так что внутри кавычек чужих " нет; проверяем что
+    # даже с апострофом и «=» внутри название парсится как ОДНО значение
+    head = ('result_type=items result_id=r1 items=clitem_a checklist_id=cx '
+            'resolution_status=exact checklist_name="it\'s items=clitem_FAKE resolution_status=ambiguous"')
+    f = _parse_passport_fields(head)
+    assert f["items"] == "clitem_a", f  # не clitem_FAKE
+    assert f["resolution_status"] == "exact", f  # не ambiguous из названия
+    assert "clitem_FAKE" in f["checklist_name"]  # подделка осталась ВНУТРИ значения
