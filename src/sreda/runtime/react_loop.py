@@ -587,6 +587,10 @@ class ReactState(MessagesState):
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
+    # #285 Фаза A (SHADOW): сериализованная TurnPolicy хода (БЕЗ ПД) — сайдкар в handle_turn выражает
+    # решения сплита явным объектом; исполнением НЕ управляет (byte-identical — пин-тесты). Last-value;
+    # сброс на свежем ходе; None на старых чекпойнтах (fallback-паттерн router_allowed_* выше).
+    turn_policy_json: str | None
 
 
 def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
@@ -1426,6 +1430,12 @@ def _domain_scope() -> str:
     """#221 Ф3: режим доменного скоупинга ∈ {disabled, shadow, execute}. disabled (дефолт) → byte-identical."""
     from sreda.config.settings import get_settings
     return get_settings().react_domain_scope
+
+
+def _unified_enabled() -> bool:
+    """#285 Фаза A: флаг единого пути. OFF (дефолт) → полиси-код на пути не исполняется вовсе."""
+    from sreda.config.settings import get_settings
+    return bool(get_settings().react_unified_path_enabled)
 
 
 def _is_domain_execute_tenant(tenant_id: str) -> bool:
@@ -3283,16 +3293,25 @@ async def handle_turn(
             if expected_confirm_id != _cur_pid:
                 return _Reply("")
 
+        _confirm_resolution: str | None = None  # #285 Фаза A: исход confirm-паузы для трейса
         if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
             # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
             # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
             # уже шлёт канон (confirm_resume_text). ask_human (не confirm) — текст-ответ как есть.
             # redirect → A0 трактует «нет» (безопасный отказ; авто-переключение раздела — Фаза B).
             _resume_val = user_text
-            if not resume_only:
-                _, _is_confirm_pause, _ = _pending(snap)
-                if _is_confirm_pause:
-                    _resume_val = "да" if classify_confirm_reply(user_text) == "affirm" else "нет"
+            _, _is_confirm_pause, _ = _pending(snap)
+            # #285 Фаза A: различаем yes|no|redirect ДО инвока (finish писал только «confirmed» —
+            # петля калибровки словаря была неизмерима, инвентарь Фазы 0 §5.5). redirect (новое
+            # намерение на confirm-паузе) в ГРАФ по-прежнему идёт как безопасное «нет» (A0), но в
+            # трейсе различим (R1 фазового ревью, оба Codex). ask_human-пауза → None. Кнопка
+            # (resume_only) шлёт канон «да»/«нет» — redirect у неё невозможен.
+            if not resume_only and _is_confirm_pause:
+                _cls = classify_confirm_reply(user_text)
+                _resume_val = "да" if _cls == "affirm" else "нет"
+                _confirm_resolution = {"affirm": "yes", "negate": "no"}.get(_cls, "redirect")
+            elif _is_confirm_pause:
+                _confirm_resolution = "yes" if _is_yes(str(_resume_val)) else "no"
             result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
             if _has_pause(snap):  # протухшая пауза → гасим
@@ -3345,7 +3364,10 @@ async def handle_turn(
                            # пропустивший доменный блок (intent=чат/факт), писал бы в трейс СТАРОЕ решение
                            # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
                            # не затрагивало (бинд по allowed_*, они сброшены), только колонка лога.
-                           "router_decision_json": None}
+                           "router_decision_json": None,
+                           # #285 Фаза A: сброс полиси-канала на свежем ходе (дисциплина last-value
+                           # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
+                           "turn_policy_json": None}
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
@@ -3414,6 +3436,30 @@ async def handle_turn(
                         _init["router_allowed_read_domains"] = None
                         _init["router_allowed_write_domains"] = None
                         _init["router_decision_json"] = None
+            # #285 Фаза A (SHADOW): TurnPolicy сайдкаром — выражает решения сплита (#197 интент,
+            # #221 каналы, #256 таймауты, капы) явным объектом в ОТДЕЛЬНЫЙ канал. Legacy-каналы
+            # router_allowed_* НЕ трогаются (контракт отката, инвентарь §2 (б)); исполнением НЕ
+            # управляет. Флаг OFF → ветка не исполняется (zero-overhead). Сбой не роняет ход.
+            if _unified_enabled():
+                try:
+                    from sreda.config.settings import get_settings as _gs285
+                    from sreda.runtime.react_policy import build_turn_policy, dumps_policy
+                    _s285 = _gs285()
+                    _pi = _init.get("intent") or None
+                    _caps285 = ({t: c for (i, t), c in _SEARCH_CAPS.items() if i == _pi}
+                                if _pi in ("chat", "fact") else None)
+                    _init["turn_policy_json"] = dumps_policy(build_turn_policy(
+                        intent=_pi,
+                        router_allowed_read=_init.get("router_allowed_read_domains"),
+                        router_allowed_write=_init.get("router_allowed_write_domains"),
+                        chat_timeout_sec=float(_s285.react_chat_llm_timeout_sec),
+                        task_timeout_sec=float(_s285.react_llm_timeout_sec),
+                        chat_provider=str(_s285.react_preflight_chat_provider),
+                        search_caps=_caps285,
+                    ))
+                except Exception:  # noqa: BLE001 — shadow-сайдкар не роняет ход
+                    logger.warning("react_policy: shadow build failed → None", exc_info=True)
+                    _init["turn_policy_json"] = None
             result = await graph.ainvoke(_init, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
@@ -3450,13 +3496,31 @@ async def handle_turn(
                 # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
                 _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
                 _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0
+                # #285 Фаза A: снапшот полиси из финального состояния (переживает паузу/resume)
+                # + события хода (guard/resume/passes) — guard-каунты для выхода фазы (R1 CodexH).
+                # Только при присутствующей полиси (флаг ON) → OFF по-прежнему ноль новых данных.
+                _tpj = result.get("turn_policy_json") if isinstance(result, dict) else None
+                if _tpj:
+                    try:
+                        _pd285 = json.loads(_tpj)
+                        _pd285["turn_events"] = {
+                            "resumed": bool(live_pause),
+                            "guard_attempted": len(result.get("guard_attempted_families") or []),
+                            "guard_full": bool(result.get("guard_full_attempted")),
+                            "passes": int(_passes_fin or 0),
+                        }
+                        _tpj = json.dumps(_pd285, ensure_ascii=False)
+                    except Exception:  # noqa: BLE001 — события best-effort, полиси не теряем
+                        pass
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
                     confirm_state=("confirmed" if live_pause else "none"),  # best-effort
                     outcome=_outcome,
                     passes=_passes_fin,
-                    routing_decision_json=_rdj)
+                    routing_decision_json=_rdj,
+                    turn_policy_json=_tpj,
+                    confirm_resolution=_confirm_resolution)
                 # #258: деградировавший ход → алерт оператору (best-effort; _outcome/passes уже
                 # посчитаны; на проде трейс ВКЛ — он же источник сигнала).
                 _maybe_alert_degraded_turn(
