@@ -4598,42 +4598,9 @@ def parse_save_core_fact(
         )
 
 
-class CreateMemoryCategoryOk(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    status: Literal["created"] = "created"
-    category_id: MemoryId
-    # R1 (Claude MINOR): непустое санитизированное имя (парсер берёт группу regex как есть).
-    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
-
-
-CreateMemoryCategoryOutput = Annotated[
-    Union[CreateMemoryCategoryOk, HousewifeToolError],
-    Field(discriminator="status"),
-]
-
-
-_CREATE_MEMORY_CATEGORY_RE = re.compile(r"^created:(?P<cid>[a-zA-Z0-9_-]+):(?P<name>.+)$")
-
-
-def parse_create_memory_category(
-    raw: str,
-) -> CreateMemoryCategoryOk | HousewifeToolError | ToolOutputContractViolation:
-    err = _parse_error(raw)
-    if err is not None:
-        return err
-    m = _CREATE_MEMORY_CATEGORY_RE.match(raw.strip())
-    if m is None:
-        return ToolOutputContractViolation(
-            raw_output=raw, tool_name="create_memory_category",
-            timestamp=datetime.now(timezone.utc),
-        )
-    try:
-        return CreateMemoryCategoryOk(category_id=m.group("cid"), name=m.group("name"))
-    except ValidationError:
-        return ToolOutputContractViolation(
-            raw_output=raw, tool_name="create_memory_category",
-            timestamp=datetime.now(timezone.utc),
-        )
+# #262b create_memory_category: Output-модели и парсера НЕТ НАМЕРЕННО —
+# инструмент ReAct-only (families.REACT_ONLY_TOOLS, канон #210). Долг Среза 1
+# #270 закрыт в #213 Срезе A (обвязка мёртвого plan-execute пути не строится).
 
 
 class SaveEpisodeOk(BaseModel):
@@ -5114,7 +5081,6 @@ PARSERS = {
     "onboarding_complete": parse_onboarding_complete,
     "save_core_fact": parse_save_core_fact,
     "save_episode": parse_save_episode,
-    "create_memory_category": parse_create_memory_category,
     "recall_memory": parse_recall_memory,
     "log_unsupported_request": parse_log_unsupported_request,
     "reply_with_buttons": parse_reply_with_buttons,

@@ -59,6 +59,7 @@ READ_ONLY_TOOLS_EXPECTED: set[str] = {
     "list_reminders", "list_shopping", "search_recipes", "get_recipe",
     "list_menu", "list_family_members", "list_tasks",
     "list_checklists", "show_checklist", "list_checklist_items",  # #143 Phase B
+    "get_checklist",  # #213 Срез A: единый read чек-листов (items|overview)
     "reply_with_buttons",  # UI primitive, not state-changing
 }
 

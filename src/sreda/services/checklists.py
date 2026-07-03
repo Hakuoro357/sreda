@@ -45,6 +45,28 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+from dataclasses import dataclass, field
+import re as _re
+
+# #213 Срез A: разделители составного needle (см. composite-guard в
+# resolve_list_by_title_ranked). Союз « и » — с пробелами (не ловить «кино»),
+# запятая/точка с запятой/слэш — как есть.
+_COMPOSITE_NEEDLE_RE = _re.compile(r"(\s(?:и|или)\s|[,;/])")
+
+
+@dataclass(frozen=True)
+class ListResolution:
+    """#213 Срез A: результат ranked-резолюции имени чек-листа.
+
+    status ∈ {exact, unique_fuzzy, ambiguous, not_found}; checklist задан
+    только для exact/unique_fuzzy; candidates — только для ambiguous (cap 5).
+    """
+
+    status: str
+    checklist: "Checklist | None"
+    candidates: "list[Checklist]" = field(default_factory=list)
+
+
 def _normalise(text: str) -> str:
     """Lowercase + strip. Используем для fuzzy-сравнений «План кроя» ↔ «план кроя»."""
     return (text or "").strip().lower()
@@ -447,6 +469,75 @@ class ChecklistService:
             if norm in _normalise(cl.title) or _normalise(cl.title) in norm:
                 return cl
         return None
+
+    def resolve_list_by_title_ranked(
+        self, *, tenant_id: str, user_id: str, needle: str,
+    ) -> "ListResolution":
+        """#213 Срез A: ranked-резолюция имени БЕЗ молчаливого top-1.
+
+        Статусы (контракт plans/213-cycle-final.md, ядро п.5):
+          exact        — needle это checklist_-id ИЛИ точное совпадение title;
+          unique_fuzzy — ровно один substring-матч;
+          ambiguous    — >1 матча сопоставимой силы → candidates, пункты НЕ отдавать;
+          not_found    — ни одного (candidates пуст; имена других списков НЕ
+                         подмешиваются — конкурирующий перечень = класс #213).
+
+        Легаси ``find_list_by_title`` (top-1 по свежести) НЕ трогается —
+        internal-пути (parse-путь housewife, replay, eval) сохраняют прежнюю
+        семантику осознанно (decision log R3/R5).
+        """
+        clean = (needle or "").strip()
+        if not clean:
+            return ListResolution(status="not_found", checklist=None, candidates=[])
+
+        # 1) точный id (deferred MINOR R5: exact-id ветка обязана пережить ranked)
+        if clean.startswith("checklist_"):
+            cl = self.session.get(Checklist, clean)
+            if cl is not None and cl.tenant_id == tenant_id and cl.user_id == user_id \
+                    and cl.status == "active":
+                return ListResolution(status="exact", checklist=cl, candidates=[])
+            return ListResolution(status="not_found", checklist=None, candidates=[])
+
+        norm = _normalise(clean)
+        active = self.list_active(tenant_id=tenant_id, user_id=user_id)
+
+        # 2) точное совпадение title (после нормализации)
+        exact = [cl for cl in active if _normalise(cl.title) == norm]
+        if len(exact) == 1:
+            return ListResolution(status="exact", checklist=exact[0], candidates=[])
+        if len(exact) > 1:
+            # create_list дедупит по title, но страхуемся: дубликаты = честная неоднозначность
+            return ListResolution(status="ambiguous", checklist=None, candidates=exact[:5])
+
+        # 3) substring-матчи (в обе стороны, как легаси)
+        fuzzy = [
+            cl for cl in active
+            if norm in _normalise(cl.title) or _normalise(cl.title) in norm
+        ]
+        # Composite-guard (ревью R1 среза A, Codex high): составной needle
+        # («кино и машина», «кино, машина») БЕЗ точного совпадения НИКОГДА не
+        # даёт unique_fuzzy — reverse-substring (`title in needle`) иначе молча
+        # выберет один из перечисленных списков (класс #213). Кандидаты собираем
+        # ПО ЧАСТЯМ needle (сплит по разделителям) — уточнение полное; матчи
+        # есть → ambiguous, нет → not_found. Exact-имя с « и » внутри
+        # («Дела и покупки») обслужено веткой (2) выше.
+        if _COMPOSITE_NEEDLE_RE.search(norm):
+            parts = [p.strip() for p in _COMPOSITE_NEEDLE_RE.split(norm)
+                     if p.strip() and not _COMPOSITE_NEEDLE_RE.fullmatch(p)]
+            part_matches = [
+                cl for cl in active
+                if any(p in _normalise(cl.title) or _normalise(cl.title) in p
+                       for p in parts)
+            ]
+            merged = part_matches or fuzzy
+            if merged:
+                return ListResolution(status="ambiguous", checklist=None, candidates=merged[:5])
+            return ListResolution(status="not_found", checklist=None, candidates=[])
+        if len(fuzzy) == 1:
+            return ListResolution(status="unique_fuzzy", checklist=fuzzy[0], candidates=[])
+        if len(fuzzy) > 1:
+            return ListResolution(status="ambiguous", checklist=None, candidates=fuzzy[:5])
+        return ListResolution(status="not_found", checklist=None, candidates=[])
 
     # ------------------------------------------------------------------
     # ChecklistItem (пункты внутри списка)

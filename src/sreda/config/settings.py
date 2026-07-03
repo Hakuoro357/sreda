@@ -498,6 +498,16 @@ class Settings(BaseSettings):
         """Нормализованный режим доменного скоупинга ∈ {disabled, shadow, execute}; иначе → disabled (fail-safe)."""
         v = (self.react_domain_scope_mode or "").strip().lower()
         return v if v in ("disabled", "shadow", "execute") else "disabled"
+
+    # #213 Срез A: унификация read-инструментов чек-листов. OFF (дефолт) → точный legacy: LLM видит
+    # пару list_checklists/show_checklist, get_checklist не экспонирован, форма ответов байт-в-байт.
+    # ON → LLM видит ЕДИНЫЙ get_checklist(mode: items|overview, name) с result-envelope; старые имена
+    # скрыты из экспозиции, LLM-origin вызовы старых имён канонизируются в get_checklist (durable-история
+    # может их праймить, #193/#221). Internal-пути (handlers/replay/eval) от флага НЕ зависят.
+    # Откат = выключить флаг (без миграций/реверта реестра). Канарейка — срез C (plans/213-cycle-final.md).
+    checklist_unified_enabled: bool = Field(
+        default=False, validation_alias="SREDA_CHECKLIST_UNIFIED"
+    )
     # #221 Ф4 (канареечная раскатка execute): даже при глобальном mode=execute РЕАЛЬНО драйвить роутер
     # только для тенантов из этого списка; остальные при execute ведут себя как shadow (лог-only). Так
     # execute катится постепенно (сперва тенант Бориса → проверка «дела» → ``*`` на всех). Пусто (дефолт)

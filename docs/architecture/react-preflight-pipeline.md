@@ -5,8 +5,8 @@
 **Related code:** `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph` — потребление; меняется по многим причинам, freshness НЕ трекаем)
 **Tests:** `tests/unit/` — калибровка `_must_task` (`test_must_task_high_precision`), классификаторы интента/доменов, политика `compute_allowed_domains`
 **Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально
-**Verified-against:** `f98e4e0` (сверено с кодом 2026-06-27; #251 — persona в chat/fact)
-**Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek`; на проде по #224 переведён на `gemini-2.5-flash-lite` ради скорости)
+**Verified-against:** `6e6a8a2` (сверено с кодом 2026-07-02; doc-sync после #263/#270/#279/#213)
+**Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek` — это и есть прод; история: #224 переводил на `gemini-2.5-flash-lite` ради скорости, #257 вернул на `openrouter-deepseek` — gemini-lite зависал); `SREDA_CHECKLIST_UNIFIED` (default `False`) меняет текст checklist-директивы (#213, см. `route_domains`)
 
 ## Зачем это существует
 
@@ -27,12 +27,12 @@ flowchart TD
     IN --> MT{"_must_task<br/>детерм. паттерны"}
     MT -->|матч| TASK
     MT -->|нет матча| CI["classify_intent · Фредди (LLM)<br/>→ task / chat / fact<br/>сбой → task"]
-    CI -->|chat / fact| CF["Рассуждающая модель<br/>web-only · 1 поиск · honesty"]
+    CI -->|chat / fact| CF["Рассуждающая модель<br/>web-only · капы поиска · honesty"]
     CI -->|task| TASK["task-путь:<br/>Фредди + полный набор"]
     TASK --> RD["route_domains (детерм.)<br/>текст → раздел, семьи, cross"]
     RD -->|раздел найден| CA
     RD -->|не определён| CD["classify_domains · Фредди (фолбэк)<br/>→ раздел + confidence"]
-    CD --> CA["compute_allowed_domains<br/>→ allowed_read / allowed_write<br/>запись только по явной команде"]
+    CD --> CA["compute_allowed_domains<br/>→ allowed_read / allowed_write<br/>уверенный раздел → и запись"]
     CA --> G["граф ReAct:<br/>привязка разрешённых семей + гейт записи"]
 ```
 
@@ -45,7 +45,7 @@ flowchart TD
 ### `_must_task(text, prev_intent=None) -> bool` (слой 0, детерминированный)
 
 - **Вход:** нормализованный текст (lower, дефисы убраны).
-- **Логика:** подстрочный матч по узкому high-precision списку `_MUST_TASK_PATTERNS` (явные productivity-команды / обращения к своим данным: `напомни`, `поставь задач`, `мои задачи`, `список покупок`, `запомни`, `что у меня`, …). Намеренно узко: false-positive = чат зря уйдёт в task и потеряет рассуждающую модель; false-negative безопасен (доедет до LLM-классификатора). `prev_intent` НЕ используется (оставлен для стабильности сигнатуры).
+- **Логика:** подстрочный матч по узкому high-precision списку `_MUST_TASK_PATTERNS` (явные productivity-команды / обращения к своим данным: `напомни`, `поставь задач`, `мои задачи`, `список покупок`, `запомни`, `что у меня`, …; с #270 — также creation-биграммы категории/раздела памяти: `заведи категор`, `создай раздел`, … — НЕ голое «раздел»/«категория»). Намеренно узко: false-positive = чат зря уйдёт в task и потеряет рассуждающую модель; false-negative безопасен (доедет до LLM-классификатора). `prev_intent` НЕ используется (оставлен для стабильности сигнатуры).
 - **Выход:** `True` → сразу `task` (LLM-классификатор не зовётся); `False` → решает слой 1.
 
 ### `classify_intent(recent_messages, user_text, prev_intent, freddie_llm, timeout=4.0, raw_sink=None) -> Intent` (слой 1, LLM на Фредди)
@@ -63,10 +63,10 @@ flowchart TD
 
 Граф строится ОДИН раз с обеими моделями; узел выбирает по `effective_intent` из state.
 
-- **`chat` / `fact`** → рассуждающая модель (`SREDA_REACT_PREFLIGHT_CHAT_PROVIDER`) + **только web-семья** `_WEB_ONLY_TOOL_NAMES = {web_search, fetch_url, get_weather}` + промпт `chat_fact_system_prompt` (honesty, анти-флейл, без productivity-инструментов; несёт ЛИЧНОСТЬ Среды — женский род, живой тон «не справка», + слот `persona_overlay`, #242/#121). Инвариант: web-only scope зашит ДО `try`; при сбое рассуждающей модели → fallback на Фредди с **тем же web-only**, НЕ на task.
+- **`chat` / `fact`** → рассуждающая модель (`SREDA_REACT_PREFLIGHT_CHAT_PROVIDER`) + **только web-семья** `_WEB_ONLY_TOOL_NAMES = {web_search, fetch_url, get_weather}` + промпт `chat_fact_system_prompt` (honesty, анти-флейл; несёт ЛИЧНОСТЬ Среды — женский род, живой тон «не справка», + слот `persona_overlay`, #242/#121). Honesty-floor (#279): web-only подан как «под рукой в ТЕКУЩЕМ ходе», а НЕ «не умею» — промпт запрещает отрицать способности Среды (напоминания/задачи/списки/память) и велит вместо отказа коротко уточнить недостающее; при этом запрещено утверждать, что действие уже сделано в этом ответе. Инвариант: web-only scope зашит ДО `try`; при сбое рассуждающей модели → fallback на Фредди с **тем же web-only**, НЕ на task.
 - **`task`** (или флаг OFF) → Фредди (быстрый) + полный набор инструментов.
 
-Лимит «1 поиск на ход» в chat/fact обязателен — он делает флейл-петлю поиска невозможной (исходный инцидент 2026-06-23 был циклом поиска ×5+).
+Лимит web-инструментов на ход в chat/fact обязателен и задан ПО ИНТЕНТУ (`_SEARCH_CAPS` в `react_loop`, смягчён #215 — прежний единый ≤1 душил факты): `chat` — web_search≤1 / fetch_url≤2, `fact` — web_search≤3 / fetch_url≤3 (fact'у нужно «поиск → открыть → уточнить»); лишние вызовы получают synthetic «лимит поиска исчерпан». Флейл-петля поиска всё равно невозможна (исходный инцидент 2026-06-23 был циклом поиска ×5+): сверху жёсткий потолок — глобальный кап web_search #211 + `_MAX_TURN_PASSES`.
 
 ## Слой 2 — домены (#215/#221): раздел → инструменты + право записи
 
@@ -75,8 +75,8 @@ flowchart TD
 ### `route_domains(text) -> RouteResult` (детерминированный, чистая функция)
 
 - **Вход:** текст сообщения.
-- **Логика:** токены → разделы по онтологии (`_ontology`, слияние `FAMILY_ROOTS` + `_SEC_*` #215). Домены: `reminders, tasks, checklists, shopping, menu, recipes, household, memory, web`. Longest-match фразы («список покупок» → shopping, «список дел» → checklists); action-домены (глагол: напомни/запомни) приоритетнее content; составное (compound) — только при союзе МЕЖДУ клаузами; направленное кросс-намерение «X из Y» (единственное — «покупки **из** меню»).
-- **Выход — `RouteResult`:** `primary_domain`, `secondary_domains`, `suppressed_domains`, `compound_by_connector`, `intent_hint` (`"task"` только от task-сигнала #197/#215, иначе `None`), `intent_only`, `active_families` (ленивые семьи на предзагрузку), `directive` (подсказка-промпт раздела), `all_domains`, `cross_intent`.
+- **Логика:** токены → разделы по онтологии (`_ontology`, слияние `FAMILY_ROOTS` + `_SEC_*` #215). Домены: `reminders, tasks, checklists, shopping, menu, recipes, household, memory, web`. Longest-match фразы («список покупок» → shopping, «список дел» → checklists); action-домены (глагол: напомни/запомни) приоритетнее content; составное (compound) — только при союзе МЕЖДУ клаузами; направленное кросс-намерение «X из Y» (единственное — «покупки **из** меню»). С #270: creation-фразы категории/раздела памяти (`_MEMORY_CREATION_PHRASES`: «заведи категорию X», «создай раздел памяти», …) → детерминированно `memory`, но ТОЛЬКО если в клаузе нет контент-домена («создай раздел покупок» остаётся shopping); голое «категория» в memory НЕ роутится (общее с shopping).
+- **Выход — `RouteResult`:** `primary_domain`, `secondary_domains`, `suppressed_domains`, `compound_by_connector`, `intent_hint` (`"task"` только от task-сигнала #197/#215, иначе `None`), `intent_only`, `active_families` (ленивые семьи на предзагрузку), `directive` (подсказка-промпт раздела; для `checklists` текст флаг-условный — при `SREDA_CHECKLIST_UNIFIED=ON` велит `get_checklist(mode,name)` вместо `list_checklists`, #213), `all_domains`, `cross_intent`.
 
 ### `classify_domains(recent_messages, user_text, freddie_llm, timeout=4.0, raw_sink=None) -> DomainClassResult` (LLM-фолбэк на Фредди)
 
@@ -87,30 +87,30 @@ flowchart TD
 
 ### `compute_allowed_domains(route, classified) -> (frozenset allowed_read, frozenset allowed_write)`
 
-Политика «**запись никогда по догадке**»:
+Контракт (Борис 2026-06-29, #263): «**уверенный раздел → можно и писать**»; безопасность УДАЛЕНИЯ держит confirm-гейт (`_confirm_wrap`: `remove_*`/`delete_*`/`cancel_*` спрашивают Да/Нет), а НЕ запрет записи:
 
 - кросс «X из Y» (`cross_intent`) → read оба домена, write — целевой;
 - детерминированный ОДИН домен → read + write (явная команда);
-- детерминированное СОСТАВНОЕ (≥2, союз) → read оба, **write ∅** (compound-запись → уточнение, не авто-запись);
-- LLM-фолбэк `high` (ровно один) → **только read** (запись не по догадке модели);
+- детерминированное СОСТАВНОЕ (≥2, союз) → read оба, **write ∅** (compound-запись → уточнение, не авто-запись — там неоднозначность реальна);
+- LLM-фолбэк `high` (ровно один) → **read + write** (изменено #263; раньше read-only «запись не по догадке» — из-за этого «убери куриное филе» терял инструмент удаления и отвечал «нет возможности удалить»);
 - иначе (low/мусор/нет домена) → **∅/∅ = явный deny** (только `ask_human`).
 
 Пустой `frozenset` = ЯВНЫЙ запрет; `None` НЕ возвращается (зарезервирован для OFF/legacy в графе).
 
 ### Применение в графе
 
-Результат кладётся в state (`router_allowed_read_domains`, `router_allowed_write_domains`, `active_families`); `_apply_domain_policy(...)` фильтрует привязанные инструменты по разрешённым разделам. При выключенном роутере (`allowed = None`) — no-op, byte-identical.
+Результат кладётся в state (`router_allowed_read_domains`, `router_allowed_write_domains`, `active_families`); `_apply_domain_policy(...)` фильтрует привязанные инструменты по разрешённым разделам. При выключенном роутере (`allowed = None`) — no-op, byte-identical. В execute-режиме guard НЕ расширяет домены роутера — «роутер побеждает» (#267 A4).
 
 ## Прод-статус и откат
 
 - `SREDA_REACT_PREFLIGHT_ENABLED` — ВКЛ на проде (2026-06-24).
-- Доменный роутер #221 — execute-режим глобально (`SCOPE_MODE=execute`, `EXECUTE_TENANTS=*`). Откат: `shadow` + `safe_restart`.
+- Доменный роутер #221 — execute-режим глобально (`SREDA_REACT_DOMAIN_SCOPE_MODE=execute`, `SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS=*`). Откат: `shadow` + `safe_restart`.
 - Детерминированный гейт времени `_text_mentions_time` (#180) сохранён — preflight его дополняет, не заменяет; на разрушающих/приватных путях сбой → уточнение/fail-closed, не no-op.
 
 ## Связанное
 
 - Эпик: #191 (harness-обвязка ReAct).
-- Интент: #197. Домены: #215 (карта «слово→раздел»), #221 (ontology-роутер + write-gate).
-- Выбор рассуждающей модели: #173 (eval — честность + скорость), #224 (chat/fact → gemini-2.5-flash-lite).
+- Интент: #197. Домены: #215 (карта «слово→раздел»), #221 (ontology-роутер + write-gate), #263 (write при уверенном разделе), #270 (создание категории памяти голосом), #213 (единый `get_checklist` — флаг-условная директива).
+- Выбор рассуждающей модели: #173 (eval — честность + скорость), #224 (chat/fact → gemini-2.5-flash-lite), #257 (откат на openrouter-deepseek — gemini-lite зависал). Персона/honesty chat/fact: #242/#121, #251, #279.
 - Наблюдаемость: #192 (трейс `classifier_raw`).
 - Таксономия семей инструментов: [tool-family-taxonomy.md](./tool-family-taxonomy.md).
