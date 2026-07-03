@@ -196,6 +196,93 @@ def _section_hint(text: str) -> str | None:
     return None
 
 
+# ───────────────────────── #213 Срез B: query_kind чек-листов ─────────────────────────
+# Детерминированный классификатор READ-намерения чек-листов для soft cross-check
+# (plans/213-cycle-final.md, ядро п.3). НЕ LLM (сам подвержен классу ошибки #213), НЕ
+# сборка ответа — только классификация intent/slots. Write-ходы НЕ гейтятся (их
+# подготовительные read-вызовы легитимны) → None. Не-checklist ходы → None.
+
+from dataclasses import dataclass as _dc213
+
+
+@_dc213(frozen=True)
+class ChecklistQuery:
+    kind: str                 # items | overview | search | mixed
+    name_span: str            # подстрока текста юзера с именем списка ("" — нет)
+    confidence: str           # high | low
+
+
+# write-глаголы чек-листов: ход с ними — write-shaped, предслой его не гейтит (подготовительные
+# read-вызовы легитимны). R2 Claude B2: расширено до объединения с WRITE_GUARD-инвентарём проекта
+# (housewife_chat_tools) — пропущенные основы (убери/зачеркни/обнови/очисти/дополни/поставь/сними/
+# поменяй/восстанови/верни/сохрани/занеси) гейтили обученный флоу «сначала list_checklist_items».
+_CQ_WRITE_RE = re.compile(
+    r"(добав|отмет|удали|вычеркн|создай|заве[дл]|запиш|архивир|переимен|перенес|перенос|измен|"
+    r"закр|убер|зачеркн|обнов|очист|дополн|сним|поставь|поменя|восстанов|верн|сохран|занес|"
+    r"пометь|галочк)")
+# слова-разделы чек-листов (расширение _SEC_CHECKLIST_WORDS формами «план/чек-лист»).
+# M3: «план\w*» ловит «планов»; порядок форм не важен (alternation).
+_CQ_SECTION_RE = re.compile(r"\b(списк\w*|список|план\w*|плана|плане|чек-?лист\w*|дела|дел)\b")
+# M1: секц-слова, которые НЕ должны попадать в имя списка (сами себе раздел, не название).
+_CQ_SECTION_WORD_RE = re.compile(
+    r"^(дел[аоуы]?|списк\w*|список|план\w*|чек-?лист\w*)$")
+# overview-маркеры: plural-вопрос/«все»/«сколько». До 2 слов между («какие ЕЩЁ списки»,
+# «какие У МЕНЯ списки»); беглая гласная «список/списков» учтена ниже отдельными формами.
+_CQ_OVERVIEW_RE = re.compile(
+    r"(какие\s+(?:\w+\s+){0,2}(списки|планы|чек-?листы|дела)"
+    r"|все\s+(?:\w+\s+){0,2}(списки|планы|чек-?листы)"
+    r"|сколько\s+(?:\w+\s+){0,2}(списков|планов|чек-?листов))")
+# search-маркеры: поиск ПУНКТА по всем спискам
+_CQ_SEARCH_RE = re.compile(
+    r"(найди\s+пункт|в\s+как(ом|ой)\s+списке|где\s+запис|в\s+каком\s+из\s+списков)")
+# items: раздел-слово + возможное имя после него
+_CQ_ITEMS_NAME_RE = re.compile(
+    r"(?:списк[ае]|список|плане?|плана|чек-?лист[ае]?)\s+(?!покупок)([а-яёa-z0-9][^,.!?]*)")
+# исключение: «список покупок» — домен shopping, не чек-листы (лексика #221 _PHRASES).
+# «списо?к»: беглая гласная — «список» (ед.им.) НЕ начинается со «списк».
+_CQ_SHOPPING_RE = re.compile(r"списо?к\w*\s+покупок|покупок|покупки|покупкам")
+
+
+def classify_checklist_query(text: str) -> ChecklistQuery | None:
+    """#213 Срез B: детерминированный query_kind READ-хода чек-листов. None → не гейтим."""
+    norm = re.sub(r"[-‐‑‒–—]", "-", (text or "").lower()).strip()
+    if not norm or _CQ_SHOPPING_RE.search(norm):
+        return None
+    if _CQ_WRITE_RE.search(norm):
+        return None  # write-shaped ход — подготовительные read-вызовы легитимны
+    if not _CQ_SECTION_RE.search(norm) and not _CQ_SEARCH_RE.search(norm):
+        return None  # не про чек-листы
+    has_overview = bool(_CQ_OVERVIEW_RE.search(norm))
+    has_search = bool(_CQ_SEARCH_RE.search(norm))
+    m_items = _CQ_ITEMS_NAME_RE.search(norm)
+    # имя после раздел-слова, обрезанное по клауза-разделителям и союзу « и »
+    span = ""
+    if m_items:
+        raw = m_items.group(1).strip()
+        raw = re.split(r"\s+и\s+|\s+или\s+", raw)[0].strip()
+        _words = raw.split()
+        # M1: первое слово после раздел-слова — тоже секц-слово («покажи список ДЕЛ»,
+        # «список ПЛАНОВ»): это обзор раздела целиком, НЕ имя конкретного списка → overview.
+        if _words and _CQ_SECTION_WORD_RE.match(_words[0]):
+            has_overview = True
+            raw = " ".join(_words[1:]).strip()  # остаток (обычно пуст) — не имя
+            span = raw if raw and not _CQ_SECTION_WORD_RE.match(raw.split()[0]) else ""
+        else:
+            span = raw
+    has_items = bool(span) or (
+        _CQ_SECTION_RE.search(norm) and not has_overview and not has_search)
+    if has_overview and (span or has_search):
+        return ChecklistQuery(kind="mixed", name_span=span, confidence="high")
+    if has_overview:
+        return ChecklistQuery(kind="overview", name_span="", confidence="high")
+    if has_search:
+        return ChecklistQuery(kind="search", name_span="", confidence="high")
+    if has_items:
+        return ChecklistQuery(kind="items", name_span=span,
+                              confidence="high" if span else "low")
+    return None
+
+
 # ───────────────────────── #221 Ф1: единый ontology-роутер доменов ─────────────────────────
 # Слияние ТРЁХ словарей (_MUST_TASK #197 / _SEC_* #215 / _FAMILY_ROOTS #165) в ОДИН источник «слово→
 # раздел(ы)». РЕФРЕЙМ (план v5): intent (task/chat/fact) остаётся авторитетом #197; домены — надстройка

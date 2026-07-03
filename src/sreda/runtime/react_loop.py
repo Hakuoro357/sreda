@@ -166,6 +166,16 @@ def _time_in_tail_enabled() -> bool:
         return False
 
 
+def _checklist_querykind() -> bool:
+    """#213 Срез B: предслойный query_kind + cross-check ВКЛ? (SREDA_CHECKLIST_QUERYKIND,
+    дефолт OFF = fail-open). Действует ТОЛЬКО вместе с _checklist_unified()."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().checklist_querykind_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
 # #298: русские дни недели (не %A — тот локале-зависим, на проде C-locale дал бы
 # «Friday» внутри русской фразы; ревью R1 Claude MINOR). Порядок = weekday().
 _WEEKDAYS_RU = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
@@ -197,6 +207,142 @@ def _append_time_tail(msgs: list, line: str) -> list:
                     HumanMessage(content=f"{msgs[i].content}\n\n{line}"),
                     *msgs[i + 1:]]
     return msgs
+
+
+# #213 Срез B: write-инструменты чек-листов под ordinal-enforcement (source_result_id).
+_CHECKLIST_WRITE_ENFORCED_213 = frozenset(
+    {"mark_checklist_item_done", "delete_checklist_item", "update_checklist_item"})
+
+
+def _token_in_text(needle: str, text: str) -> bool:
+    """#213 Срез B (R3 Codex medium): подстрока по ГРАНИЦАМ токена (кириллица+латиница+цифры),
+    не голый `in` — «ход» НЕ считается названным в «поход». needle может быть многословным."""
+    import re as _re
+    if not needle or not text:
+        return False
+    return _re.search(
+        r"(?<![а-яёa-z0-9])" + _re.escape(needle) + r"(?![а-яёa-z0-9])", text) is not None
+
+
+def _checklist_cross_check(ctx: dict, name: str, args: dict | None,
+                           session: Any, tenant_id: str, user_id: str):
+    """#213 Срез B: сверка вызова с READ-интентом предслоя (plans/213-cycle-final.md п.3).
+
+    Возвращает None (пропуск) ЛИБО (сообщение, result_kind, redirect_args):
+    redirect_args не-None → узкий редирект (заполнение ОТСУТСТВУЮЩЕГО name при mode=items,
+    только exact|unique_fuzzy по span юзера); иначе структурный отказ БЕЗ исполнения.
+    Mode/инструмент редиректом НЕ меняются; в mixed редирект и гейты выключены."""
+    kind = ctx.get("kind")
+    if kind == "mixed":
+        return None  # разрешены и items, и overview; различимость — envelope
+    if name == "list_checklist_items":
+        # implicit mode=search (п.4 плана): на items/overview-интенте search-вызов паразитен.
+        if kind in ("items", "overview"):
+            return (f"mode_mismatch: пользователь просит "
+                    f"{'пункты конкретного списка' if kind == 'items' else 'обзор списков'} — "
+                    "поиск пунктов по всем спискам здесь не нужен. Используй get_checklist.",
+                    "mode_mismatch", None)
+        return None
+    if name != "get_checklist":
+        return None
+    mode = str((args or {}).get("mode") or "").strip().lower()
+    nm = str((args or {}).get("name") or "").strip()
+    span = str(ctx.get("name_span") or "").strip()
+    if kind in ("items", "overview") and mode in ("items", "overview") and mode != kind:
+        want = ("mode=\"items\" с name из запроса пользователя" if kind == "items"
+                else "mode=\"overview\" без name")
+        return (f"mode_mismatch: пользователь просит "
+                f"{'пункты конкретного списка' if kind == 'items' else 'обзор всех списков'} — "
+                f"вызови get_checklist {want}.", "mode_mismatch", None)
+    if kind == "items" and mode == "items" and span:
+        try:
+            from sreda.services.checklists import ChecklistService
+            _svc = ChecklistService(session)
+            if not nm:
+                # редирект ОТСУТСТВУЮЩЕГО имени, только при уверенном резолве span
+                res = _svc.resolve_list_by_title_ranked(
+                    tenant_id=tenant_id, user_id=user_id, needle=span)
+                if res.status in ("exact", "unique_fuzzy"):
+                    return ("", "redirect", {**(args or {}), "name": span})
+                return None  # ambiguous/not_found → штатный путь инструмента (варианты/уточнение)
+            # #213 Срез B (R2 Claude B1): компаунд items+items — если имя модели РЕАЛЬНО
+            # названо юзером в тексте хода («в списке кино И в списке машина»: span=«кино»,
+            # но «машина» тоже в тексте), это легитимный второй список, НЕ конфликт. Пропускаем.
+            # R3 Codex medium MINOR: по ГРАНИЦАМ токена, не substring («ход» ⊄ «поход»).
+            _utn = str(ctx.get("user_text_norm") or "")
+            if nm and _utn and _token_in_text(nm.lower(), _utn):
+                return None
+            r_model = _svc.resolve_list_by_title_ranked(
+                tenant_id=tenant_id, user_id=user_id, needle=nm)
+            r_span = _svc.resolve_list_by_title_ranked(
+                tenant_id=tenant_id, user_id=user_id, needle=span)
+            # #213 Срез B (R2 Claude B5): редирект и НЕРЕЗОЛВЯЩЕГОСЯ имени (опечатка «кинооо»),
+            # если span уверенно резолвится — план п.12 «отсутствующий ИЛИ нерезолвящийся».
+            # РЕЗОЛВЯЩЕЕСЯ имя модели НИКОГДА не перезаписываем (r4-контракт).
+            if r_model.checklist is None and r_span.status in ("exact", "unique_fuzzy"):
+                return ("", "redirect", {**(args or {}), "name": span})
+            # conflicting resolvable names (r4-контракт): предслой уверенно видит span,
+            # модель зовёт ДРУГОЕ резолвящееся имя (не названное юзером) → отказ, не молчаливая
+            # выдача не того списка.
+            if (r_model.checklist is not None and r_span.checklist is not None
+                    and r_model.checklist.id != r_span.checklist.id):
+                return (f"name_conflict: пользователь просил список «{span}», а вызов — про "
+                        f"другое имя. Перезови get_checklist с name=\"{span}\" или уточни у "
+                        "пользователя.", "name_conflict", None)
+        except Exception:  # noqa: BLE001 — сверка не роняет ход (fail-open)
+            logger.warning("react_loop: checklist cross-check failed → pass-through",
+                           exc_info=True)
+    return None
+
+
+def _checklist_write_enforce(history: list, batch_out: list,
+                             item_id: str, source_result_id: str,
+                             pending_batch_reads: int = 0) -> str | None:
+    """#213 Срез B (приёмка п.8): items-result'ы ТЕКУЩЕГО хода (после последнего user,
+    включая текущий батч) из envelope-паспортов; ≥2 → write требует привязки
+    (source_result_id с item_id внутри него); 0/1 → пропуск (легаси-пути целы).
+
+    pending_batch_reads (R1 high MAJOR) — items-read вызовы ТЕКУЩЕГО батча, ещё не
+    исполненные к моменту write: батч параллелен семантически, write между двумя read
+    не должен проскочить как «один результат»."""
+    msgs: list = []
+    last_h = -1
+    for i, m in enumerate(history):
+        if isinstance(m, HumanMessage):
+            last_h = i
+    msgs = list(history[last_h + 1:]) + list(batch_out)
+    results: list[tuple[str, set[str]]] = []
+    for m in msgs:
+        c = str(getattr(m, "content", "") or "")
+        head = c.splitlines()[0] if c else ""
+        if not head.startswith("result_type=items"):
+            continue
+        if "resolution_status=not_found" in head or "resolution_status=ambiguous" in head:
+            continue
+        rid_m = re.search(r"result_id=(\S+)", head)
+        ids = set(re.findall(r"\[(clitem_[0-9a-f]+)\]", c))
+        if rid_m and ids:
+            results.append((rid_m.group(1), ids))
+    if len(results) + max(pending_batch_reads, 0) < 2:
+        return None
+    if len(results) < 2 and not source_result_id:
+        # ≥2 набирается только с учётом НЕисполненных read'ов этого же батча:
+        # результатов для привязки ещё нет — честная подсказка про порядок.
+        return ("source_result_required: в этом батче ты одновременно читаешь списки и "
+                "меняешь пункт — сначала получи списки, потом меняй по source_result_id "
+                "нужного результата (или уточни у пользователя).")
+    if source_result_id:
+        for rid, ids in results:
+            if rid == source_result_id:
+                if item_id in ids:
+                    return None
+                return (f"source_result_required: item_id не принадлежит результату "
+                        f"{source_result_id} — возьми id из нужного показанного списка.")
+        return (f"source_result_required: результата {source_result_id} нет в этом ходе.")
+    shown = ", ".join(rid for rid, _ in results)
+    return ("source_result_required: в этом ходе показано несколько списков "
+            f"(result_id: {shown}) — передай source_result_id того списка, чей пункт "
+            "меняешь, или уточни у пользователя, какой список он имел в виду.")
 
 
 def _map_deprecated_checklist_args(old_name: str, args: dict | None) -> dict:
@@ -588,6 +734,10 @@ class ReactState(MessagesState):
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
+    # #213 Срез B: детерминированный READ-интент чек-листов ({kind, name_span, confidence})
+    # для soft cross-check в tool-node. Скрыт от LLM (не аргумент). None → fail-open (write-ход /
+    # не-checklist / флаги OFF / предслой упал). Ставится на свежем ходу; сбрасывается как router_*.
+    checklist_query_ctx: dict | None
     # #285 Фаза A (SHADOW): сериализованная TurnPolicy хода (БЕЗ ПД) — сайдкар в handle_turn выражает
     # решения сплита явным объектом; исполнением НЕ управляет (byte-identical — пин-тесты). Last-value;
     # сброс на свежем ходе; None на старых чекпойнтах (fallback-паттерн router_allowed_* выше).
@@ -1101,6 +1251,12 @@ def _react_desc(t: Any) -> Any:
     short = _REACT_TOOL_DESC.get(t.name)
     if not short:
         return t
+    # #213 Срез B: при полном контуре write-инструменты знают про привязку source_result_id
+    # (recovery после отказа source_result_required). При OFF — описание байт-в-байт.
+    if (t.name in _CHECKLIST_WRITE_ENFORCED_213
+            and _checklist_unified() and _checklist_querykind()):
+        short = (short + " Если в ходе показано несколько списков — добавь "
+                 "source_result_id=<result_id из паспорта нужного списка>.")
     try:
         return t.model_copy(update={"description": short})
     except Exception:  # noqa: BLE001 — на всякий случай не валим сборку инструментов
@@ -2426,6 +2582,27 @@ def _build_graph(llm: Any, all_tools: list, *,
             DEPRECATED_TOOL_ALIASES as _DEPRECATED_ALIASES_213,
         )
         _unified_213 = _checklist_unified()
+        # #213 Срез B: срез гейтится preflight (как домены #221 — надстройка на preflight-контуре;
+        # R2 Codex high+medium MAJOR: без этого write-enforcement срабатывал бы при preflight=OFF,
+        # ломая fail-open матрицу). Единый гейт для cross-check И write-enforcement.
+        _sliceB_213 = bool(preflight_enabled) and _unified_213 and _checklist_querykind()
+        # READ-интент предслоя для cross-check (None → fail-open).
+        _cq_ctx_213 = state.get("checklist_query_ctx") if _sliceB_213 else None
+
+        # #213 Срез B (R1 high MAJOR): write-enforcement обязан видеть и НЕобработанные
+        # items-read вызовы ТЕКУЩЕГО батча — tool_calls одного AIMessage семантически
+        # параллельны, порядок в списке не гарантия (write между двумя read обошёл бы
+        # «≥2 результатов»). Id items-read вызовов батча; pending = ещё не обработанные
+        # (нет ToolMessage в out — R2 medium MINOR: загейченный read уже НЕ pending,
+        # его отказ в out, хоть и не result_type=items).
+        def _is_items_read_call_213(t: dict) -> bool:
+            n, a = t.get("name"), (t.get("args") or {})
+            if n == "show_checklist":
+                return True  # при ON канонизируется в get_checklist(mode=items)
+            return n == "get_checklist" and a.get("mode") == "items"
+
+        _batch_items_read_ids_213 = {
+            _t["id"] for _t in state["messages"][-1].tool_calls if _is_items_read_call_213(_t)}
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
             tc_args = tc.get("args") or {}
@@ -2449,6 +2626,46 @@ def _build_graph(llm: Any, all_tools: list, *,
                 else:
                     name = "show_checklist"
                     tc_args = {"list_id_or_title": str((tc_args or {}).get("name") or "")}
+            # #213 Срез B: soft cross-check READ-интента чек-листов (LLM-origin by construction —
+            # этот цикл и есть LLM-эмитированные вызовы; internal-пути сюда не попадают).
+            # ctx None (write-ход / не-checklist / флаги/preflight OFF / предслой упал) → fail-open.
+            if _cq_ctx_213 is not None and _cq_ctx_213.get("confidence") == "high":
+                _refuse = _checklist_cross_check(
+                    _cq_ctx_213, name, tc_args, session, tenant_id, user_id)
+                if _refuse is not None:
+                    _msg213, _rk213, _redirect_args = _refuse
+                    if _redirect_args is not None:
+                        # узкий редирект: ТОЛЬКО заполнение отсутствующего name (r4-контракт);
+                        # mode/инструмент не меняются, текст не пишется.
+                        tc_args = _redirect_args
+                    else:
+                        out.append(ToolMessage(
+                            content=_msg213, name=tc["name"], tool_call_id=tc["id"],
+                            artifact={"result_kind": _rk213}))  # #192: не-исполнение, честно
+                        continue
+            # #213 Срез B: write-enforcement source_result_id (приёмка п.8) — привязка ordinal-write
+            # к КОНКРЕТНОМУ items-result хода; ≥2 показанных списков без привязки → уточнение, не write.
+            # source_result_id — СЛУЖЕБНЫЙ аргумент (нет в схеме инструмента): вычищаем БЕЗУСЛОВНО
+            # при unified (R3 Codex high MINOR: strip не должен гейтиться preflight — иначе при
+            # preflight=OFF модель, праймленная desc-хинтом, дотащит лишний аргумент до write-tool).
+            _src_id = ""
+            if _unified_213 and name in _CHECKLIST_WRITE_ENFORCED_213:
+                _src_id = str((tc_args or {}).get("source_result_id") or "").strip()
+                tc_args = {k: v for k, v in (tc_args or {}).items() if k != "source_result_id"}
+            if _sliceB_213 and name in _CHECKLIST_WRITE_ENFORCED_213:
+                # pending = items-read вызовы батча, ещё НЕ обработанные (нет ToolMessage
+                # в out с их tool_call_id) — исполненные видны через out; загейченные тоже
+                # обработаны (их отказ в out) → не pending (R2 medium MINOR).
+                _handled_ids = {getattr(_m, "tool_call_id", None) for _m in out}
+                _pending = len(_batch_items_read_ids_213 - _handled_ids)
+                _wmsg = _checklist_write_enforce(
+                    state["messages"], out, str((tc_args or {}).get("item_id") or ""), _src_id,
+                    pending_batch_reads=_pending)
+                if _wmsg is not None:
+                    out.append(ToolMessage(
+                        content=_wmsg, name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "source_result_required"}))
+                    continue
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
             # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
@@ -3401,9 +3618,31 @@ async def handle_turn(
                            # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
                            # не затрагивало (бинд по allowed_*, они сброшены), только колонка лога.
                            "router_decision_json": None,
+                           # #213 Срез B: сброс каждый свежий ход (last-value канал, как router_*).
+                           "checklist_query_ctx": None,
                            # #285 Фаза A: сброс полиси-канала на свежем ходе (дисциплина last-value
                            # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
                            "turn_policy_json": None}
+            # #213 Срез B: детерминированный READ-интент чек-листов → soft cross-check в tool-node.
+            # ТОЛЬКО при preflight + оба флага (R1 medium: срез B — надстройка на preflight-контуре,
+            # как домены #221; без _preflight конфиг «preflight выключен» внезапно получал бы
+            # cross-check/enforcement — ломается fail-open матрица). Write-ходы/не-checklist → None.
+            if _preflight and _checklist_unified() and _checklist_querykind():
+                try:
+                    from sreda.runtime.react_preflight import classify_checklist_query
+                    _cq = classify_checklist_query(user_text)
+                    if _cq is not None:
+                        _init["checklist_query_ctx"] = {
+                            "kind": _cq.kind, "name_span": _cq.name_span,
+                            "confidence": _cq.confidence,
+                            # #213 Срез B (R2 Claude B1): нормализованный текст хода — cross-check
+                            # НЕ конфликтит имя, которое юзер РЕАЛЬНО назвал (компаунд items+items
+                            # «в списке кино и в списке машина»: span=«кино», но «машина» в тексте).
+                            "user_text_norm": re.sub(
+                                r"[-‐‑‒–—]", "-", (user_text or "").lower())}
+                except Exception:  # noqa: BLE001 — предслой не роняет ход (fail-open)
+                    logger.warning("react_loop: checklist_query classify failed → fail-open",
+                                   exc_info=True)
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
