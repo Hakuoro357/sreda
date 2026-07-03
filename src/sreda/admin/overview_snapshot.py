@@ -69,9 +69,16 @@ def compute_overview(session: Session, settings: Any) -> dict:
     payload["slow_turns"] = _slow_turns_block(settings, now)
     payload["users"] = _safe(_users_block, {}, session, now)
     payload["purchases"] = _safe(_purchases_block, {}, session, now)
-    payload["cost"] = _safe(_cost_block, {}, session)
+    # Отчёты трат считаем ОДИН раз (день/неделя/месяц) — их читают и
+    # cost-блок обзора, и providers-блок раздела «LLM и деньги» (Фаза B).
+    reports = _safe(_cost_reports, None, session)
+    # R1 high MAJOR (Фаза B): трансформация тоже под _safe — сбой формы
+    # отчёта не должен ронять весь рефреш.
+    payload["cost"] = _safe(_cost_block, {}, reports) if reports else {}
     payload["health"] = _safe(_health_block, {}, session, now)
     payload["balances"] = _balances_block(settings)
+    payload["providers"] = _safe(
+        _providers_block, [], session, now, reports, payload["balances"])
     payload["llm_chain"] = _safe(
         _llm_chain_block, {"primary": "", "fallback": "", "planner": ""},
         session, settings)
@@ -254,13 +261,16 @@ def _purchases_block(session: Session, now: datetime) -> dict:
 _TOP_MODEL_ROWS = 8  # верхних строк модели на период в снапшоте
 
 
-def _cost_block(session: Session) -> dict:
-    """Затраты+объём день/неделя/месяц — тонкая JSON-обёртка над
-    ``get_cost_volume_summary`` (#150). Исключения пробрасываются —
-    fail-soft (+rollback) обеспечивает _safe в compute_overview (R2)."""
+def _cost_reports(session: Session):
+    """Отчёты #150 за день/неделю/месяц (единый источник для cost и
+    providers). Исключения пробрасываются в _safe."""
     from sreda.admin.queries import get_cost_volume_summary
 
-    reports = get_cost_volume_summary(session)
+    return get_cost_volume_summary(session)
+
+
+def _cost_block(reports) -> dict:
+    """Затраты+объём — тонкая JSON-обёртка над готовыми отчётами #150."""
     out: dict[str, Any] = {}
     for period, rep in reports.items():
         # R1 (high MAJOR): rows отсортированы «priced, затем unpriced» —
@@ -308,6 +318,150 @@ def _health_block(session: Session, now: datetime) -> dict:
         "breakdowns_shown": c.breakdowns_shown,
         "failures_total": c.failures_total,
     }
+
+
+# Русские подписи ролей моделей — по РЕАЛЬНЫМ task_type из
+# skill_ai_executions (прод 2026-07-03: react_turn / speech_recognition /
+# summary). Неизвестный тип показываем как есть — не выдумываем.
+_TASK_TYPE_LABELS = {
+    "react_turn": "диалог",
+    "speech_recognition": "распознавание речи",
+    "summary": "пересказ истории",
+}
+
+# provider_key исполнений → ключ балансов provider_balances
+# (ключи сверены по коду 2026-07-03: openrouter/mimo/groq/
+# inception-mercury2/yandex — включая #229 Yandex Cloud ₽ и #157).
+_BALANCE_PREFIXES = (
+    ("openrouter", "openrouter"),
+    ("groq", "groq"),
+    ("mimo", "mimo"),
+    ("inception", "inception-mercury2"),
+    ("yandex", "yandex"),
+)
+
+_PROVIDER_LABELS = {
+    "openrouter": "OpenRouter",
+    "inception": "Inception (Mercury)",
+    "groq": "Groq",
+    "mimo": "MiMo",
+    "yandex": "Yandex (STT)",
+}
+
+
+def _provider_prefix(provider_key: str) -> str:
+    if not provider_key or not provider_key.strip():
+        return "прочее"  # R1 субагент MINOR: "" не должен стать ключом
+    for prefix, _bal in _BALANCE_PREFIXES:
+        if provider_key.startswith(prefix):
+            return prefix
+    return provider_key.split("-")[0]
+
+
+def _providers_block(
+    session: Session, now: datetime, reports, balances: list[dict]
+) -> list[dict]:
+    """Карточки раздела «LLM и деньги» (Фаза B): на провайдера — траты
+    день/неделя/месяц (из тех же отчётов #150), ошибки 24ч, модели с
+    ролями (по task_type за 30 дней), баланс (по префиксу ключа).
+    Исключения пробрасываются в _safe."""
+    if not reports:
+        return []
+    # 1. траты по префиксу провайдера на период
+    spend: dict[str, dict] = {}
+    for period, rep in reports.items():
+        for r in rep.rows:
+            p = _provider_prefix(r.provider_key)
+            per = spend.setdefault(p, {}).setdefault(
+                period, {"est_usd": 0.0, "calls": 0, "unpriced_tokens": 0})
+            per["calls"] += r.calls
+            if r.priced and r.est_usd is not None:
+                per["est_usd"] += float(r.est_usd)
+            else:
+                per["unpriced_tokens"] += r.prompt_tokens + r.completion_tokens
+
+    # 2. ошибки за 24ч по провайдеру. sum(case) вместо FILTER-агрегата —
+    # (R1 субагент) портативно на любой SQLite/PG без ограничений версии.
+    from sqlalchemy import case
+
+    since = now - timedelta(hours=24)
+    err_rows = (
+        session.query(
+            SkillAIExecution.provider_key,
+            func.count(SkillAIExecution.id),
+            func.coalesce(func.sum(case(
+                (SkillAIExecution.status.in_(_ERROR_STATUSES), 1), else_=0)), 0),
+        )
+        .filter(SkillAIExecution.created_at >= since,
+                SkillAIExecution.provider_key.isnot(None),
+                SkillAIExecution.provider_key != "")
+        .group_by(SkillAIExecution.provider_key)
+        .all()
+    )
+    errors: dict[str, dict] = {}
+    for pk, calls, errs in err_rows:
+        p = _provider_prefix(pk or "")
+        e = errors.setdefault(p, {"calls": 0, "errors": 0})
+        e["calls"] += int(calls)
+        e["errors"] += int(errs)
+
+    # 3. роли моделей по task_type за 30 дней
+    role_rows = (
+        session.query(
+            SkillAIExecution.provider_key,
+            SkillAIExecution.model,
+            SkillAIExecution.task_type,
+            func.count(SkillAIExecution.id),
+        )
+        .filter(SkillAIExecution.created_at >= now - timedelta(days=30),
+                SkillAIExecution.provider_key.isnot(None))
+        .group_by(SkillAIExecution.provider_key, SkillAIExecution.model,
+                  SkillAIExecution.task_type)
+        .all()
+    )
+    roles: dict[tuple[str, str], dict[str, int]] = {}
+    for pk, model, task_type, cnt in role_rows:
+        key = (_provider_prefix(pk or ""), model or "")
+        roles.setdefault(key, {})[task_type or "?"] = int(cnt)
+
+    # 4. модели на карточке — из месячного отчёта (полный охват)
+    month = reports.get("month")
+    models_by_provider: dict[str, list[dict]] = {}
+    if month is not None:
+        for r in month.rows:
+            p = _provider_prefix(r.provider_key)
+            tt = roles.get((p, r.model or ""), {})
+            role_str = ", ".join(
+                _TASK_TYPE_LABELS.get(t, t)
+                for t, _c in sorted(tt.items(), key=lambda kv: -kv[1])[:3])
+            models_by_provider.setdefault(p, []).append({
+                "model": r.model or "",
+                "roles": role_str,
+                "calls": r.calls,
+                "priced": r.priced,
+                "est_usd": float(round(r.est_usd, 4)) if r.est_usd is not None else None,
+                "tokens": r.prompt_tokens + r.completion_tokens,
+            })
+
+    # 5. баланс по префиксу
+    bal_by_key = {b.get("key", ""): b for b in balances if isinstance(b, dict)}
+    bal_map = dict(_BALANCE_PREFIXES)
+
+    providers: list[dict] = []
+    for p in sorted(spend, key=lambda p: -(spend[p].get("month", {}).get("est_usd") or 0)):
+        e = errors.get(p, {"calls": 0, "errors": 0})
+        providers.append({
+            "key": p,
+            "label": _PROVIDER_LABELS.get(p, p),
+            "balance": bal_by_key.get(bal_map.get(p, ""), None),
+            "spend": spend[p],
+            "errors_24h": {
+                **e,
+                "rate_pct": round(e["errors"] / e["calls"] * 100, 1) if e["calls"] else 0.0,
+            },
+            "models": models_by_provider.get(p, []),
+        })
+    return providers
 
 
 def _balances_block(settings: Any) -> list[dict]:
@@ -421,9 +575,10 @@ def normalize_overview(payload: dict) -> dict:
                 "calls": _int(r.get("calls")),
                 "prompt_tokens": _int(r.get("prompt_tokens")),
                 "completion_tokens": _int(r.get("completion_tokens")),
-                # R2 (high+medium MAJOR): priced ТОЛЬКО при численном est —
-                # иначе шаблон отформатирует None и даст 500.
-                "priced": bool(r.get("priced")) and est is not None,
+                # R2 (high+medium MAJOR) + Фаза B R1 (high MAJOR): priced —
+                # только НАСТОЯЩИЙ bool True И численный est (мусор 1/"yes"
+                # из битого снапшота не должен показать доллары).
+                "priced": (r.get("priced") is True) and est is not None,
                 "est_usd": est,
                 "upper_usd": upper,
             })
@@ -491,6 +646,52 @@ def normalize_overview(payload: dict) -> dict:
         norm["health"] = {k: _int(h.get(k)) for k in (
             "turns_total", "runs_failed", "inbound_stuck",
             "outbox_failed", "breakdowns_shown", "failures_total")}
+    provs = payload.get("providers")
+    if isinstance(provs, list):
+        norm_provs = []
+        for pr in provs:
+            if not isinstance(pr, dict):
+                continue
+            bal = pr.get("balance")
+            spend_in = pr.get("spend") if isinstance(pr.get("spend"), dict) else {}
+            spend = {}
+            for period, s in spend_in.items():
+                if isinstance(s, dict):
+                    spend[period] = {
+                        "est_usd": _num(s.get("est_usd")),
+                        "calls": _int(s.get("calls")),
+                        "unpriced_tokens": _int(s.get("unpriced_tokens")),
+                    }
+            e = pr.get("errors_24h") if isinstance(pr.get("errors_24h"), dict) else {}
+            norm_provs.append({
+                "key": _str(pr.get("key")),
+                "label": _str(pr.get("label")),
+                "balance": ({
+                    "status": _str(bal.get("status")),
+                    "headline": _str(bal.get("headline")),
+                    "details": _str(bal.get("details")),
+                } if isinstance(bal, dict) else None),
+                "spend": spend,
+                "errors_24h": {
+                    "calls": _int(e.get("calls")),
+                    "errors": _int(e.get("errors")),
+                    "rate_pct": _num(e.get("rate_pct")),
+                },
+                "models": [
+                    (lambda est: {
+                        "model": _str(m.get("model")), "roles": _str(m.get("roles")),
+                        "calls": _int(m.get("calls")),
+                        # строгий bool + числовой est (R1 high MAJOR)
+                        "priced": (m.get("priced") is True) and est is not None,
+                        "est_usd": est,
+                        "tokens": _int(m.get("tokens"))})(
+                        float(m["est_usd"])
+                        if isinstance(m.get("est_usd"), (int, float))
+                        and not isinstance(m.get("est_usd"), bool) else None)
+                    for m in (pr.get("models") or []) if isinstance(m, dict)
+                ],
+            })
+        norm["providers"] = norm_provs
     norm["balances"] = [
         {"key": _str(b2.get("key")), "label": _str(b2.get("label")),
          "status": _str(b2.get("status")), "headline": _str(b2.get("headline")),

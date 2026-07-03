@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}LLM и деньги{% endblock %}
+{% block content %}
+<div style="display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+  <h2 style="margin-bottom:4px;">LLM и деньги</h2>
+  <form method="post" action="/admin/refresh-snapshot?token={{ token }}" style="margin:0;">
+    <span class="muted">
+      {% if snap_age_min is not none %}снапшот обновлён {{ snap_age_min }} мин назад{% else %}снапшот ещё не собран{% endif %}
+    </span>
+    <button type="submit" class="outline" style="padding:2px 10px; font-size:12px; margin-left:8px;">обновить сейчас</button>
+  </form>
+</div>
+<small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · периоды — календарные по Москве · роли моделей — по реальным вызовам за 30 дней</small>
+
+{% if snap.cost %}
+<div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:10px;">
+  {% for key, label in [("day", "Сегодня"), ("week", "Неделя"), ("month", "Месяц")] %}
+    {% set rep = snap.cost.get(key) %}
+    {% if rep %}<span><strong>{{ label }}:</strong> ≈ ${{ "%.2f" | format(rep.priced_subtotal_usd) }} <span class="muted">· {{ "{:,}".format(rep.calls).replace(",", " ") }} выз. · покрытие {{ rep.coverage_calls_pct if rep.coverage_calls_pct is not none else "—" }}%</span></span>{% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if snap.providers %}
+<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:14px; margin-top:14px;">
+  {% for p in snap.providers %}
+  <article style="margin:0;">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+      <strong>{{ p.label }}</strong>
+      {% if p.balance %}
+        {% if p.balance.status == "ok" %}<span class="badge badge-green">{{ p.balance.headline }}</span>
+        {% elif p.balance.status == "not_supported" %}<span class="badge badge-gray" title="{{ p.balance.details }}">нет billing API</span>
+        {% elif p.balance.status == "not_configured" %}<span class="badge badge-gray">ключ не настроен</span>
+        {% else %}<span class="badge badge-yellow" title="{{ p.balance.details }}">баланс: ошибка</span>{% endif %}
+      {% else %}<span class="badge badge-gray">баланса нет</span>{% endif %}
+    </div>
+    {% if p.balance and p.balance.status == "ok" and p.balance.details %}
+      <div class="muted" style="font-size:12px;">{{ p.balance.details }}</div>
+    {% endif %}
+
+    <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:8px; font-size:13px;">
+      {% for period, plabel in [("day", "сегодня"), ("week", "неделя"), ("month", "месяц")] %}
+        {% set s = p.spend.get(period) %}
+        <span class="muted">{{ plabel }}:
+          {% if s %}<strong style="color:var(--pico-color);">${{ "%.2f" | format(s.est_usd) }}</strong> · {{ s.calls }} выз.{% if s.unpriced_tokens %} <span title="токены беспрайсовых моделей">(+{{ "{:,}".format(s.unpriced_tokens).replace(",", " ") }} ток. без прайса)</span>{% endif %}
+          {% else %}—{% endif %}
+        </span>
+      {% endfor %}
+    </div>
+    <div style="font-size:13px; margin-top:4px;">
+      {% if p.errors_24h.errors > 0 %}<span class="badge badge-yellow">ошибок за 24 ч: {{ p.errors_24h.errors }} ({{ p.errors_24h.rate_pct }}%)</span>
+      {% else %}<span class="badge badge-green">за 24 ч без ошибок</span>{% endif %}
+      <span class="muted"> из {{ p.errors_24h.calls }} вызовов</span>
+    </div>
+
+    {% if p.models %}
+    <table style="margin-top:8px; font-size:12px;">
+      <thead><tr><th>Модель (месяц)</th><th>Роль</th><th>Выз.</th><th>≈ USD</th></tr></thead>
+      <tbody>
+      {% for m in p.models %}
+        <tr>
+          <td style="font-family:monospace; font-size:11px;">{{ m.model }}</td>
+          <td class="muted">{{ m.roles or "—" }}</td>
+          <td>{{ m.calls }}</td>
+          <td>{% if m.priced and m.est_usd is not none %}${{ "%.4f" | format(m.est_usd) }}{% else %}<span class="muted" title="нет подтверждённого прайса">{{ "{:,}".format(m.tokens).replace(",", " ") }} ток.</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </article>
+  {% endfor %}
+</div>
+{% else %}
+<p class="muted" style="margin-top:14px;">— нет данных (снапшот ещё не собран или вызовов не было) —</p>
+{% endif %}
+
+<p class="muted" style="margin-top:12px; font-size:12px;">
+  Переключить primary/fallback — <a href="/admin/llm?token={{ token }}">LLM</a> ·
+  разбивка по моделям за произвольный период — <a href="/admin/spend-by-model?token={{ token }}">Расходы</a>
+</p>
+{% endblock %}

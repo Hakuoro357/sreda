@@ -124,6 +124,38 @@ def admin_dashboard(
     )
 
 
+@router.get("/llm-money", response_class=HTMLResponse)
+def admin_llm_money(
+    request: Request,
+    token: str = Depends(require_admin_token),
+    session=Depends(_get_session),
+):
+    """Раздел «LLM и деньги» (#292 Фаза B): карточки провайдеров —
+    баланс, траты день/неделя/месяц, ошибки 24ч, модели с ролями.
+    Читает ТОТ ЖЕ снапшот, что обзор (ноль пересчёта на открытии)."""
+    from datetime import UTC
+
+    from sreda.admin import overview_snapshot as ov
+
+    _audit_admin_view(session, "admin.llm_money.viewed", token, request)
+    raw_snap, snap_at = ov.load_snapshot(session, ov.KEY_OVERVIEW)
+    snap = ov.normalize_overview(raw_snap)
+    snap_age_min: int | None = None
+    if snap_at is not None:
+        _now = datetime.now(UTC)
+        _at = snap_at if snap_at.tzinfo else snap_at.replace(tzinfo=UTC)
+        snap_age_min = max(0, int((_now - _at).total_seconds() // 60))
+    return templates.TemplateResponse(
+        request, "llm_money.html",
+        {
+            "token": token,
+            "section": "llm-money",
+            "snap": snap,
+            "snap_age_min": snap_age_min,
+        },
+    )
+
+
 @router.post("/refresh-snapshot")
 async def admin_refresh_snapshot(
     request: Request,

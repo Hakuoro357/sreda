@@ -53,6 +53,7 @@ def _exec_row(
     latency_ms: int = 500,
     age_hours: float = 1.0,
     error_code: str | None = None,
+    task_type: str = "chat",
 ) -> SkillAIExecution:
     n = next(_SEQ)
     return SkillAIExecution(
@@ -60,7 +61,7 @@ def _exec_row(
         run_id=f"run_{n}",
         tenant_id="tenant_test",
         feature_key="housewife_assistant",
-        task_type="chat",
+        task_type=task_type,
         provider_key=provider_key,
         model=model,
         status=status,
@@ -250,6 +251,41 @@ def test_cost_unpriced_pair_no_invented_dollars(session, fake_settings):
     assert row["priced"] is False
     assert row["est_usd"] is None and row["upper_usd"] is None
     assert row["prompt_tokens"] == 1000  # токены показываем честно
+
+
+def test_providers_block_groups_by_provider(session, fake_settings):
+    """Фаза B: карточки провайдеров — траты из отчётов #150, роли из
+    task_type, баланс по префиксу, беспрайсовое токенами."""
+    session.add_all([
+        # Mercury: priced, роль «диалог»
+        _exec_row(task_type="react_turn", prompt_tokens=500_000, completion_tokens=50_000),
+        _exec_row(task_type="react_turn", prompt_tokens=500_000, completion_tokens=50_000),
+        # Yandex STT: беспрайсовый, роль «распознавание речи»
+        _exec_row(provider_key="yandex", model="stt-general",
+                  task_type="speech_recognition", prompt_tokens=1000, completion_tokens=0),
+        # ошибка у Mercury за 24ч
+        _exec_row(task_type="react_turn", status="failed"),
+    ])
+    session.commit()
+    from datetime import UTC, datetime
+    now = datetime.now(UTC)
+    from sreda.admin.queries import get_cost_volume_summary
+    reports = get_cost_volume_summary(session)
+    balances = [{"key": "inception-mercury2", "label": "Inception",
+                 "status": "not_supported", "headline": "нет billing API", "details": ""}]
+    provs = ov._providers_block(session, now, reports, balances)
+    by_key = {p["key"]: p for p in provs}
+    assert "inception" in by_key and "yandex" in by_key
+    m = by_key["inception"]
+    assert m["balance"]["headline"] == "нет billing API"     # префикс-мапа сработала
+    assert m["errors_24h"]["errors"] == 1
+    assert m["spend"]["month"]["est_usd"] > 0                # priced
+    assert m["models"][0]["roles"].startswith("диалог")
+    y = by_key["yandex"]
+    assert y["spend"]["month"]["est_usd"] == 0.0             # беспрайсовый — не выдумываем $
+    assert y["spend"]["month"]["unpriced_tokens"] == 1000
+    assert y["models"][0]["roles"] == "распознавание речи"
+    assert y["balance"] is None                               # в balances не передан
 
 
 def test_snapshot_roundtrip(session, fake_settings):

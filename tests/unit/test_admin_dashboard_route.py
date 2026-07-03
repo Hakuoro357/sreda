@@ -167,6 +167,65 @@ def test_dashboard_survives_garbage_snapshot(client, session_factory):
     assert resp.status_code == 200
 
 
+def test_llm_money_renders_from_snapshot(client, session_factory, monkeypatch):
+    """Фаза B: /admin/llm-money читает ТОТ ЖЕ снапшот, ноль пересчёта."""
+    s = session_factory()
+    ov.store_snapshot(s, ov.KEY_OVERVIEW, {
+        "cost": {"day": {"priced_subtotal_usd": 0.61, "upper_subtotal_usd": 0.7,
+                         "calls": 40, "coverage_calls_pct": 93,
+                         "unpriced_calls": 0, "unpriced_tokens": 0,
+                         "rows": [], "unpriced_rows": []}},
+        "providers": [{
+            "key": "inception", "label": "Inception (Mercury)",
+            "balance": {"status": "not_supported",
+                        "headline": "нет billing API", "details": "консоль"},
+            "spend": {"day": {"est_usd": 0.15, "calls": 30, "unpriced_tokens": 0},
+                      "month": {"est_usd": 3.2, "calls": 700, "unpriced_tokens": 0}},
+            "errors_24h": {"calls": 30, "errors": 1, "rate_pct": 3.3},
+            "models": [{"model": "mercury-2", "roles": "диалог",
+                        "calls": 700, "priced": True, "est_usd": 3.2, "tokens": 0}],
+        }, {
+            "key": "yandex", "label": "Yandex (STT)", "balance": None,
+            "spend": {"month": {"est_usd": 0.0, "calls": 60, "unpriced_tokens": 90000}},
+            "errors_24h": {"calls": 5, "errors": 0, "rate_pct": 0.0},
+            "models": [{"model": "stt-general", "roles": "распознавание речи",
+                        "calls": 60, "priced": False, "est_usd": None, "tokens": 90000}],
+        }],
+    })
+    s.close()
+    monkeypatch.setattr(ov, "compute_overview", _boom)  # не пересчитывает
+    resp = client.get("/admin/llm-money", params={"token": "T"})
+    assert resp.status_code == 200
+    html = resp.text
+    assert "Inception (Mercury)" in html and "нет billing API" in html
+    assert "mercury-2" in html and "диалог" in html
+    assert "Yandex (STT)" in html and "распознавание речи" in html
+    assert "90 000 ток." in html          # беспрайсовое — токенами, рус. разделитель
+    assert "ошибок за 24 ч: 1" in html
+
+
+def test_llm_money_survives_malformed_provider_spend(client, session_factory):
+    """R2 medium: битый spend (нет est_usd, мусорные типы) → 200, не 500
+    (нормализатор прошивает est_usd=0.0 через _num-default)."""
+    s = session_factory()
+    ov.store_snapshot(s, ov.KEY_OVERVIEW, {
+        "providers": [{"key": "x", "label": "X",
+                       "spend": {"day": {"calls": 1}},          # без est_usd
+                       "errors_24h": "мусор",
+                       "models": [{"model": "m", "est_usd": "bad"}]},
+                      "не dict"],
+    })
+    s.close()
+    resp = client.get("/admin/llm-money", params={"token": "T"})
+    assert resp.status_code == 200
+
+
+def test_llm_money_renders_empty(client):
+    resp = client.get("/admin/llm-money", params={"token": "T"})
+    assert resp.status_code == 200
+    assert "снапшот ещё не собран" in resp.text
+
+
 def test_refresh_endpoint_delegates_and_redirects(client, monkeypatch):
     called = {}
     monkeypatch.setattr(
@@ -277,6 +336,36 @@ def test_garbage_priced_row_renders_200(client, session_factory):
     s.close()
     resp = client.get("/admin/", params={"token": "T"})
     assert resp.status_code == 200
+
+
+def test_cost_transform_failure_does_not_kill_snapshot(session_factory, monkeypatch):
+    """R1 Фазы B (high MAJOR): сбой ТРАНСФОРМАЦИИ отчёта (не запроса) —
+    cost={}, остальной снапшот жив."""
+    monkeypatch.setattr(ov, "_cost_block", _boom)
+    monkeypatch.setattr(ov, "_balances_block", lambda st: [])
+    s = session_factory()
+    payload = ov.compute_overview(
+        s, SimpleNamespace(chat_provider="p", chat_fallback_provider=""))
+    s.close()
+    assert payload["cost"] == {}
+    assert "llm_24h" in payload  # остальное собралось
+
+
+def test_normalize_poisoned_priced_flag():
+    """R1 Фазы B (high MAJOR): priced=1/'yes' из битого снапшота НЕ должен
+    показать доллары — только настоящий True + числовой est."""
+    norm = ov.normalize_overview({
+        "cost": {"day": {"rows": [
+            {"priced": 1, "est_usd": 5.0},        # int-мусор
+            {"priced": "yes", "est_usd": 5.0},    # строка-мусор
+            {"priced": True, "est_usd": 5.0},     # честный
+        ]}},
+        "providers": [{"key": "x", "label": "X",
+                       "models": [{"model": "m", "priced": 1, "est_usd": 5.0}]}],
+    })
+    rows = norm["cost"]["day"]["rows"]
+    assert [r["priced"] for r in rows] == [False, False, True]
+    assert norm["providers"][0]["models"][0]["priced"] is False
 
 
 def test_compute_overview_per_block_failsoft(session_factory, monkeypatch):
