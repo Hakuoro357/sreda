@@ -51,9 +51,29 @@ def test_web_always_passes_baseline():
     assert _apply_unified_policy([ws], allowed_read=["web"], allowed_write=[]) == [ws]
 
 
-def test_meta_always_passes():
-    ah = _tool("ask_human")
-    assert _apply_unified_policy([ah], allowed_read=["web"], allowed_write=[]) == [ah]
+def test_meta_ask_human_need_family_pass():
+    for nm in ("ask_human", "need_family"):
+        t = _tool(nm)
+        assert _apply_unified_policy([t], allowed_read=["web"], allowed_write=[]) == [t]
+
+
+def test_delete_my_account_gated_by_signal():
+    """B2 CodexH/M CRITICAL: delete_my_account НЕ биндится без сигнала удаления аккаунта (иначе его
+    pre-confirm audit-запись достижима на смолтоке). С сигналом → биндится (свой A11-confirm)."""
+    d = _tool("delete_my_account")
+    # без сигнала → не бинд (недостижим)
+    assert _apply_unified_policy([d], allowed_read=["web"], allowed_write=[], allow_account_delete=False) == []
+    # с сигналом → бинд
+    assert _apply_unified_policy([d], allowed_read=["web"], allowed_write=[], allow_account_delete=True) == [d]
+
+
+def test_account_deletion_signal_precision():
+    from sreda.runtime.react_signals import account_deletion_signal as a
+    for t in ("удали мой аккаунт", "хочу удалить учётную запись", "снеси мой профиль",
+              "удалить аккаунт навсегда"):
+        assert a(t) is True, t
+    for t in ("удали задачу", "добавь молоко", "как дела?", "удали напоминание про врача"):
+        assert a(t) is False, t
 
 
 def test_unknown_tool_fail_closed():

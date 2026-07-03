@@ -100,6 +100,11 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True):
         # САМ факт команды (route.task_signal-мину для write игнорируем — пишем только при B1-сигнале).
         _ar, aw = compute_allowed_domains(route, classified)
         allowed_write |= set(aw)
+        # memory-ИДИОМА (B2 субагент MAJOR): «сохрани в тайне»/«запиши в дневник» → write_cmd=True И
+        # route→memory (корни памяти сохран/запиш) → был бы ПРЯМОЙ memory-write в обход confirm.
+        # Контракт B1↔B2 «нет домена → кандидат» здесь не спасал (домен ЕСТЬ). Прямой memory-грант —
+        # ТОЛЬКО по декларативу; командные memory-writes («запомни X», «сохрани рецепт») → ярус (б) confirm.
+        allowed_write.discard("memory")
     if d_sig:
         allowed_write.add("memory")
 

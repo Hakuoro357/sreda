@@ -588,6 +588,9 @@ class ReactState(MessagesState):
     # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
     # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
     unified_execute: bool
+    # #285 B2b-2 (meta_scope): на едином пути delete_my_account биндится ТОЛЬКО при явном сигнале
+    # удаления аккаунта (account_deletion_signal). Last-value; сброс на свежем ходе; ставится в override.
+    unified_del_ok: bool
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
@@ -1227,11 +1230,14 @@ def _generic_confirm_wrap(inner: Any) -> Any:
     )
 
 
-def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
+def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
+                          allow_account_delete: bool = False) -> list:
     """#285 B2b-2: фильтр набора на ЕДИНОМ пути execute. Как `_apply_domain_policy` для read, НО write
     ВНЕ allowed_write НЕ отказывает — биндит КАНДИДАТОМ под generic confirm (ярус б). Так unsignaled
     write = подтверждение, не тупик #281/#282; молчаливой мутации нет (write в allowed_write — прямой,
     вне — confirm). read_pure candidate'ом НЕ открывается (кандидат только для write-класса).
+    meta_scope (B2 CodexH/M CRITICAL): ask_human/need_family всегда; delete_my_account — ТОЛЬКО по
+    явному сигналу удаления аккаунта (иначе не биндится → его pre-confirm audit-запись недостижима).
     allowed_* = None → не фильтровать (не должно случаться на unified — политика всегда ставит списки)."""
     if allowed_read is None and allowed_write is None:
         return tools
@@ -1241,7 +1247,9 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) ->
     for t in tools:
         name = _TOOL_NAME_ALIASES.get(t.name, t.name)
         if t.name in _META_TOOLS:
-            out.append(t)  # meta_scope (ask_human/need_family); delete_my_account — сигнал в дизайне B3
+            if t.name == "delete_my_account" and not allow_account_delete:
+                continue  # разрушение аккаунта только по явному сигналу — иначе не бинд (не достижим)
+            out.append(t)  # ask_human/need_family всегда (need_family — механизм кандидата)
         elif name not in TOOL_OP_CLASS:  # неизвестный → fail-closed
             continue
         elif TOOL_OP_CLASS.get(name) == "write":
@@ -2281,10 +2289,15 @@ def _build_graph(llm: Any, all_tools: list, *,
             # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical при router_allowed=None).
             # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
             # #221 Ф3: + фильтр разрешённых разделов (execute ставит router_allowed_*; иначе None → no-op).
-            _policy_fn = _apply_unified_policy if state.get("unified_execute") else _apply_domain_policy
-            bound = _policy_fn(  # B2b-2: единый путь → candidate-write под confirm вместо отказа
-                _select_tools(all_tools, state.get("active_families")),
-                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+            if state.get("unified_execute"):  # B2b-2: единый путь → candidate-write под confirm
+                bound = _apply_unified_policy(
+                    _select_tools(all_tools, state.get("active_families")),
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"),
+                    allow_account_delete=bool(state.get("unified_del_ok")))
+            else:
+                bound = _apply_domain_policy(
+                    _select_tools(all_tools, state.get("active_families")),
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = system_prompt
             nudge = state.get("guard_nudge")
             # #215: детерминированная карта «слово→раздел». Фредди (быстрая модель) сам путал «покажи
@@ -2451,10 +2464,16 @@ def _build_graph(llm: Any, all_tools: list, *,
                                 unified=bool(state.get("unified_execute"))) != "domain_blocked"):
                         active.append(_pf)
                         added = True
-        _policy_fn = _apply_unified_policy if state.get("unified_execute") else _apply_domain_policy
-        bound_by_name = {t.name: t for t in _policy_fn(  # B2b-2: candidate-write под confirm на dispatch
-            _bind_for(all_tools, active, eff),
-            state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
+        if state.get("unified_execute"):  # B2b-2: candidate-write под confirm на dispatch
+            _bound_list = _apply_unified_policy(
+                _bind_for(all_tools, active, eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"),
+                allow_account_delete=bool(state.get("unified_del_ok")))
+        else:
+            _bound_list = _apply_domain_policy(
+                _bind_for(all_tools, active, eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+        bound_by_name = {t.name: t for t in _bound_list}
         out = []
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
         # #213 Срез A: контекст канонизации депрекейт-алиасов (один раз на батч).
@@ -3443,7 +3462,7 @@ async def handle_turn(
                            # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
                            "turn_policy_json": None,
                            # #285 B2b: сброс флага единого пути (override ниже ставит True для канарейки).
-                           "unified_execute": False}
+                           "unified_execute": False, "unified_del_ok": False}
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
@@ -3522,11 +3541,13 @@ async def handle_turn(
                 try:
                     from sreda.runtime.react_policy import compute_unified_policy
                     from sreda.runtime.react_preflight import route_domains as _rd285
+                    from sreda.runtime.react_signals import account_deletion_signal as _acct_del
                     _upol = compute_unified_policy(user_text, _rd285(user_text))
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
                     _init["unified_execute"] = True  # B2b-2: bind-сайты → _apply_unified_policy (candidate)
+                    _init["unified_del_ok"] = bool(_acct_del(user_text))  # meta_scope: delete_my_account по сигналу
                     _init["router_allowed_read_domains"] = _uar
                     _init["router_allowed_write_domains"] = _uaw
                     _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))

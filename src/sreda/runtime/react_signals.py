@@ -164,6 +164,21 @@ def declarative_memory_signal(text: str) -> bool:
     return False
 
 
+# явный сигнал удаления АККАУНТА (meta_scope: delete_my_account только по нему на едином пути —
+# B2 CodexH CRITICAL). High-precision: «удали задачу» НЕ матчит (нет аккаунт/профиль/учётка рядом).
+_ACCOUNT_DELETE = re.compile(
+    r"\b(?:удал\w*|снес\w*|снести|стер\w*|уничтож\w*)\b[^.!?]{0,24}"
+    r"\b(?:аккаунт\w*|профил\w*|учётн\w*|учетн\w*|учётк\w*|учетк\w*|мою\s+запись)"
+    r"|\b(?:аккаунт\w*|профил\w*|учётн\w*|учетн\w*)\b[^.!?]{0,16}\b(?:удал\w*|снес\w*|стер\w*)",
+    re.IGNORECASE,
+)
+
+
+def account_deletion_signal(text: str) -> bool:
+    """Явный сигнал удаления аккаунта (гейт delete_my_account на едином пути). Пустой/None → False."""
+    return bool(_ACCOUNT_DELETE.search(text or ""))
+
+
 def read_cue_domains(text: str) -> frozenset[str]:
     """Щедрый кюс→bounded read-домены (пилляр 3). Голый «дела»/идиома → пусто (не own-data read).
     Пусто = baseline (web без own-data, решает B2). Возврат — объединение доменов совпавших кюсов."""

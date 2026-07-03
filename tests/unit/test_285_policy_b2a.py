@@ -19,12 +19,11 @@ def _pol(text):
     return compute_unified_policy(text, route_domains(text))
 
 
-# ─────────── ярус (а): детерминированный write-грант ───────────
+# ─────────── ярус (а): детерминированный write-грант (не-memory) ───────────
 @pytest.mark.parametrize("text,write_dom", [
     ("добавь молоко", "shopping"),
     ("создай список покупок", "shopping"),
     ("удали задачу", "tasks"),
-    ("запиши что я не ем глютен", "memory"),
 ])
 def test_tier_a_write_grant(text, write_dom):
     p = _pol(text)
@@ -33,9 +32,25 @@ def test_tier_a_write_grant(text, write_dom):
 
 
 def test_declarative_grants_memory_write():
+    """Прямой memory-write (ярус а) — ТОЛЬКО по декларативу («меня зовут»)."""
     p = _pol("меня зовут Таня")
     assert p["allowed_write"] == ["memory"]
     assert p["signals"]["declarative"] is True
+
+
+@pytest.mark.parametrize("text", [
+    "сохрани в тайне",       # идиома — route→memory, но НЕ прямой write (B2 субагент MAJOR)
+    "сохрани в секрете",
+    "запиши в дневник",
+    "запомни, что я не ем глютен",  # командный memory-write → кандидат, не прямой
+    "сохрани рецепт борща",
+])
+def test_memory_command_not_direct_write(text):
+    """Командный/идиомный memory-write НЕ даёт прямой allowed_write (memory) — идёт через ярус (б)
+    confirm (candidate). Прямой memory — только декларатив. Закрывает идиому «сохрани в тайне»."""
+    p = _pol(text)
+    assert "memory" not in p["allowed_write"], (text, p)
+    assert p["confirm_write"] is True  # candidate/confirm активен
 
 
 # ─────────── контракт B1↔B2: форма-команда без домена → НЕ грант ───────────
