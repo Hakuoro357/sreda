@@ -272,10 +272,15 @@ def _checklist_cross_check(ctx: dict, name: str, args: dict | None,
 
 
 def _checklist_write_enforce(history: list, batch_out: list,
-                             item_id: str, source_result_id: str) -> str | None:
+                             item_id: str, source_result_id: str,
+                             pending_batch_reads: int = 0) -> str | None:
     """#213 Срез B (приёмка п.8): items-result'ы ТЕКУЩЕГО хода (после последнего user,
     включая текущий батч) из envelope-паспортов; ≥2 → write требует привязки
-    (source_result_id с item_id внутри него); 0/1 → пропуск (легаси-пути целы)."""
+    (source_result_id с item_id внутри него); 0/1 → пропуск (легаси-пути целы).
+
+    pending_batch_reads (R1 high MAJOR) — items-read вызовы ТЕКУЩЕГО батча, ещё не
+    исполненные к моменту write: батч параллелен семантически, write между двумя read
+    не должен проскочить как «один результат»."""
     msgs: list = []
     last_h = -1
     for i, m in enumerate(history):
@@ -294,8 +299,14 @@ def _checklist_write_enforce(history: list, batch_out: list,
         ids = set(re.findall(r"\[(clitem_[0-9a-f]+)\]", c))
         if rid_m and ids:
             results.append((rid_m.group(1), ids))
-    if len(results) < 2:
+    if len(results) + max(pending_batch_reads, 0) < 2:
         return None
+    if len(results) < 2 and not source_result_id:
+        # ≥2 набирается только с учётом НЕисполненных read'ов этого же батча:
+        # результатов для привязки ещё нет — честная подсказка про порядок.
+        return ("source_result_required: в этом батче ты одновременно читаешь списки и "
+                "меняешь пункт — сначала получи списки, потом меняй по source_result_id "
+                "нужного результата (или уточни у пользователя).")
     if source_result_id:
         for rid, ids in results:
             if rid == source_result_id:
@@ -2505,6 +2516,20 @@ def _build_graph(llm: Any, all_tools: list, *,
         # #213 Срез B: READ-интент предслоя для cross-check (None → fail-open).
         _cq_ctx_213 = (state.get("checklist_query_ctx")
                        if (_unified_213 and _checklist_querykind()) else None)
+
+        # #213 Срез B (R1 high MAJOR): write-enforcement обязан видеть и НЕИСПОЛНЕННЫЕ
+        # items-read вызовы ТЕКУЩЕГО батча — tool_calls одного AIMessage семантически
+        # параллельны, порядок в списке не гарантия (write между двумя read обошёл бы
+        # «≥2 результатов»). Считаем потенциальные items-read'ы батча заранее; по мере
+        # исполнения декрементируем — write видит remaining.
+        def _is_items_read_call_213(t: dict) -> bool:
+            n, a = t.get("name"), (t.get("args") or {})
+            if n == "show_checklist":
+                return True  # при ON канонизируется в get_checklist(mode=items)
+            return n == "get_checklist" and a.get("mode") == "items"
+
+        _batch_items_reads_213 = sum(
+            1 for _t in state["messages"][-1].tool_calls if _is_items_read_call_213(_t))
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
             tc_args = tc.get("args") or {}
@@ -2551,8 +2576,14 @@ def _build_graph(llm: Any, all_tools: list, *,
                     and name in _CHECKLIST_WRITE_ENFORCED_213):
                 _src_id = str((tc_args or {}).get("source_result_id") or "").strip()
                 tc_args = {k: v for k, v in (tc_args or {}).items() if k != "source_result_id"}
+                # remaining = items-read'ы батча, которые ЕЩЁ не исполнены к моменту write
+                # (исполненные уже видны через batch_out; R1 high — параллельная семантика батча)
+                _done_reads = sum(
+                    1 for _m in out
+                    if str(getattr(_m, "content", "") or "").startswith("result_type=items"))
                 _wmsg = _checklist_write_enforce(
-                    state["messages"], out, str((tc_args or {}).get("item_id") or ""), _src_id)
+                    state["messages"], out, str((tc_args or {}).get("item_id") or ""), _src_id,
+                    pending_batch_reads=max(_batch_items_reads_213 - _done_reads, 0))
                 if _wmsg is not None:
                     out.append(ToolMessage(
                         content=_wmsg, name=tc["name"], tool_call_id=tc["id"],
@@ -3504,9 +3535,10 @@ async def handle_turn(
                            # #213 Срез B: сброс каждый свежий ход (last-value канал, как router_*).
                            "checklist_query_ctx": None}
             # #213 Срез B: детерминированный READ-интент чек-листов → soft cross-check в tool-node.
-            # ТОЛЬКО при обоих флагах; write-ходы/не-checklist → None (fail-open). Не зависит от
-            # preflight-интента: классификатор сам отсеивает нерелевантное (правила уже написаны).
-            if _checklist_unified() and _checklist_querykind():
+            # ТОЛЬКО при preflight + оба флага (R1 medium: срез B — надстройка на preflight-контуре,
+            # как домены #221; без _preflight конфиг «preflight выключен» внезапно получал бы
+            # cross-check/enforcement — ломается fail-open матрица). Write-ходы/не-checklist → None.
+            if _preflight and _checklist_unified() and _checklist_querykind():
                 try:
                     from sreda.runtime.react_preflight import classify_checklist_query
                     _cq = classify_checklist_query(user_text)

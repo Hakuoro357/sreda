@@ -382,6 +382,62 @@ async def test_write_enforcement_single_result_passes(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_write_between_reads_same_batch_gated(db_session, monkeypatch):
+    """R1 high MAJOR: батч параллелен - write МЕЖДУ двумя read в одном AIMessage
+    гейтится (видит и неисполненные read'ы батча)."""
+    _flags(monkeypatch, unified=True, querykind=True)
+    u = seed_telegram_user(db_session)
+    svc = ChecklistService(db_session)
+    a = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Кино к просмотру")
+    (ia,), _ = svc.add_items(list_id=a.id, items=["Дюна"])
+    b = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Машина")
+    svc.add_items(list_id=b.id, items=["Колодки"])
+    db_session.commit()
+
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[
+            {"name": "get_checklist", "args": {"mode": "items", "name": "кино"}, "id": "sb1"},
+            {"name": "mark_checklist_item_done", "args": {"item_id": ia.id}, "id": "sb2"},
+            {"name": "get_checklist", "args": {"mode": "items", "name": "машина"}, "id": "sb3"},
+        ]),
+        AIMessage(content="Готово."),
+    ])
+    await _turn(db_session, u, stub, "что в списках кино и машина, отметь первый",
+                "213b-sb-1")
+    tm = _tool_message_for(stub, "sb2")
+    assert tm is not None
+    assert "source_result_required" in str(tm.content), tm.content
+    db_session.expire_all()
+    from sreda.db.models.checklists import ChecklistItem
+    assert db_session.get(ChecklistItem, ia.id).status == "pending", (
+        "write между read'ами одного батча не должен исполниться")
+
+
+@pytest.mark.asyncio
+async def test_querykind_inert_without_preflight(db_session, monkeypatch):
+    """R1 medium MAJOR: unified=ON + querykind=ON, но preflight=OFF → срез B молчит
+    (mismatch НЕ гейтится, enforcement не работает - контракт флага)."""
+    _flags(monkeypatch, unified=True, querykind=True, preflight=False)
+    u = seed_telegram_user(db_session)
+    _seed_kino(db_session, u)
+    svc = ChecklistService(db_session)
+    svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Поход")
+    db_session.commit()
+
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "get_checklist", "args": {"mode": "overview"}, "id": "pf1",
+        }]),
+        AIMessage(content="Вот."),
+    ])
+    await _turn(db_session, u, stub, "покажи список кино", "213b-pf-1")
+    tm = _tool_message_for(stub, "pf1")
+    assert tm is not None
+    assert "result_type=overview" in str(tm.content), (
+        f"без preflight срез B инертен: {tm.content}")
+
+
+@pytest.mark.asyncio
 async def test_write_enforcement_off_when_flags_off(db_session, monkeypatch):
     """OFF/OFF: enforcement молчит - легаси-поведение write-инструментов."""
     _flags(monkeypatch, unified=False, querykind=False, preflight=False)
