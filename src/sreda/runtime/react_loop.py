@@ -40,7 +40,8 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
-from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода
+from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода (БД)
+from sreda.services import trace as _tltrace  # #255: timeline-буфер трейса (ContextVar, админ-вьюер)
 from sreda.runtime.react_compaction import (  # #194 компакция (prompt-view) + #232 выжимка истории
     build_model_input,
     make_summary_record,
@@ -1290,6 +1291,37 @@ def _turn_outcome(result_lcs, result_msgs, prev_lcs_n: int, prev_msgs_n: int, *,
     else:
         oc = "ok"
     return oc, lcs_turn, tcs_turn
+
+
+def _emit_react_timeline(lcs, tcs, passes, intent, intent_meta) -> None:
+    """#255: распаковать react_loop в timeline трейса — на КАЖДЫЙ ход: intent + llm-вызовы (latency,
+    provider, fallback, ошибка primary) + агрегат инструментов + число проходов. Так `react_loop.replied`
+    перестаёт быть чёрным ящиком в админ-вьюере (видно, где ушли секунды при инциденте латентности).
+
+    ПД-free: только числа/enum/имена (как llm_calls_json #192), НЕ текст. Данные — per-turn delta
+    (_lcs/_tcs из _turn_outcome); на resume это post-resume проходы (#269), полный ход — в
+    react_turn_trace.llm_calls_json. `record()` — no-op без активного трейса; весь helper в try
+    (наблюдаемость НИКОГДА не валит ход и не трогает деньги/persist)."""
+    try:
+        _im = intent_meta or {}
+        _tltrace.record("react.classified", intent=(intent or "?"), source=_im.get("source"))
+        for _i, c in enumerate(lcs or []):
+            _tltrace.record(
+                "react.llm", duration_ms=int(c.get("latency_ms") or 0),
+                provider_key=c.get("provider_key"), model=c.get("model"),
+                intent=c.get("intent"), fallback_fired=bool(c.get("fallback_fired")),
+                primary_error=c.get("primary_error"), call_index=c.get("call_index", _i))
+        _tl = tcs or []
+        if _tl:
+            _slow = sorted(_tl, key=lambda t: -(t.get("latency_ms") or 0))[:3]
+            _tltrace.record(
+                "react.tool", count=len(_tl),
+                sum_latency_ms=sum(int(t.get("latency_ms") or 0) for t in _tl),
+                errors=sum(1 for t in _tl if not t.get("ok")),
+                top3="; ".join("%s:%s" % (t.get("name"), t.get("latency_ms") or 0) for t in _slow))
+        _tltrace.record("react.passes", passes=int(passes or 0))
+    except Exception:  # noqa: BLE001 — наблюдаемость не валит ход
+        logger.debug("react_loop: emit_react_timeline failed", exc_info=True)
 
 
 def _maybe_alert_degraded_turn(
@@ -3521,6 +3553,11 @@ async def handle_turn(
                     routing_decision_json=_rdj,
                     turn_policy_json=_tpj,
                     confirm_resolution=_confirm_resolution)
+                # #255: распаковать react_loop в timeline (ПОСЛЕ persist — сбой эмита не блокирует БД).
+                _emit_react_timeline(
+                    _lcs, _tcs, _passes_fin,
+                    result.get("intent") if isinstance(result, dict) else None,
+                    result.get("intent_meta") if isinstance(result, dict) else None)
                 # #258: деградировавший ход → алерт оператору (best-effort; _outcome/passes уже
                 # посчитаны; на проде трейс ВКЛ — он же источник сигнала).
                 _maybe_alert_degraded_turn(
