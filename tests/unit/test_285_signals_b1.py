@@ -57,9 +57,39 @@ def test_write_command_positive(text):
     "мы удалились со встречи",     # паразит «удал»
     "поставщик задерживает",       # паразит «постав»
     "меня зовут на дачу в выходные",  # near-miss декларации (не команда)
+    # R1 CRITICAL (оба Codex + субагент): инфинитив в вопросе/намерении/нарративе — НЕ команда
+    "как удалить задачу?",
+    "можно добавить молоко?",
+    "надо купить молоко",
+    "хочу сохранить рецепт",
+    "купить бы молока",
+    "отменить подписку сложно",
+    "стоит ли сохранить чек",
+    "мне нужно купить лекарство",
+    "забыл записать адрес",
+    "нечего добавить",
+    "не могу удалить фото",
+    # R1 MAJOR (субагент): отрицание «не <перфектив-императив>» — просьба воздержаться
+    "только не удали случайно",
+    "не отмени встречу",
+    "не запиши лишнего",
 ])
 def test_write_command_negative(text):
     assert write_command_signal(text) is False, text
+
+
+# ───────── write_command_signal: императивная ФОРМА-команда True, но B2 гейтит по домену ─────────
+@pytest.mark.parametrize("text", [
+    "поставь чайник",
+    "поставь музыку",
+    "создай атмосферу",
+    "отметь про себя",
+])
+def test_write_command_imperative_form_true_b2_gates_domain(text):
+    """R1 субагент CRITICAL→MAJOR (контракт B1↔B2): императив = ФОРМА-команда (True), но
+    productivity-домена нет → B2 (route_domains) НЕ грантит allowed_write → candidate/confirm,
+    НЕ молчаливая запись. B1 детектит форму; домен-привязку энфорсит B2 (285-B1-decisions.md B)."""
+    assert write_command_signal(text) is True, text
 
 
 # ───────── declarative_memory_signal ─────────
@@ -86,6 +116,12 @@ def test_declarative_positive(text):
     "у меня двое суток на решение",
     "как дела?",
     "добавь молоко",                   # команда, не декларация
+    # R1 MAJOR (субагент): заглавное нарицательное — стоп-список
+    "живу в Интернете",
+    "живу в Аду",
+    "живу в Ожидании",
+    "меня зовут Мама",
+    "меня зовут Солнышко",
 ])
 def test_declarative_negative(text):
     assert declarative_memory_signal(text) is False, text
@@ -96,12 +132,14 @@ def test_declarative_negative(text):
     ("перескажи напоминания", {"reminders"}),
     ("что с задачами?", {"tasks"}),
     ("что в списке?", {"checklists", "shopping"}),
-    ("покажи дела", {"checklists", "shopping"}),
+    ("покажи дела", {"checklists"}),
     ("как меня зовут?", {"memory"}),
     ("помнишь, что я говорила про садик?", {"memory"}),
     ("что у меня записано про врача", {"memory"}),
     ("покажи меню на неделю", {"menu"}),
     ("какой рецепт борща", {"recipes"}),
+    # R1 MAJOR (субагент): идиома «как дела» НЕ должна глотать реальный read-хвост
+    ("как дела с задачами", {"tasks"}),
 ])
 def test_read_cue_positive(text, expected):
     assert set(read_cue_domains(text)) == expected, text
@@ -114,6 +152,12 @@ def test_read_cue_positive(text, expected):
     "доброе утро",
     "как ты сегодня?",
     "сколько варить яйцо?",   # фактовый — baseline web, не own-data
+    # R1 MAJOR: голый «дела» в идиоме/нарративе — НЕ own-data read
+    "дела идут в гору",
+    "как у тебя дела",
+    # R1 MAJOR (CodexH): «помню» (1л) — не own-data lookup, в отличие от «помнишь»
+    "я помню анекдот",
+    "помню, как мы гуляли",
 ])
 def test_read_cue_idiom_and_fact_empty(text):
     assert read_cue_domains(text) == frozenset(), text
