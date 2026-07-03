@@ -1445,6 +1445,15 @@ def _is_domain_execute_tenant(tenant_id: str) -> bool:
     return tenant_id in get_settings().react_domain_scope_execute_tenants
 
 
+def _unified_execute_for(tenant_id: str) -> bool:
+    """#285 Фаза B: гонит ли ЕДИНЫЙ путь execute-режимом для этого тенанта. Требует И флаг единого
+    пути (react_unified_path_enabled), И тенант в канареечном списке (react_unified_tenants). Пусто
+    → НИКОМУ execute (флаг ON = глобальный shadow Фазы A); ``*`` → всем (Фаза F)."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return bool(s.react_unified_path_enabled) and (tenant_id in s.react_unified_tenants)
+
+
 def _tail_directives_enabled() -> bool:
     """#247: динамические директивы (section-hint #215 + guard-нудж) — в ХВОСТ, а не в системный промпт.
     OFF (дефолт) → легаси (дописываем в sp). ON → системный промпт стабилен (кеш-префикс цел)."""
@@ -3436,6 +3445,28 @@ async def handle_turn(
                         _init["router_allowed_read_domains"] = None
                         _init["router_allowed_write_domains"] = None
                         _init["router_decision_json"] = None
+            # #285 Фаза B (B2b-1): ЕДИНЫЙ путь EXECUTE для канареечного тенанта — ПЕРЕОПРЕДЕЛЯЕТ
+            # intent-сплит + #221-домены единой политикой (B1-сигналы + онтология). Переиспользует
+            # task-бинд + _apply_domain_policy (#221-машинерия) — политику берёт из compute_unified_policy.
+            # Требует preflight (task-бинд читает intent только при preflight_enabled). Флаг ИЛИ список
+            # пусты → не исполняется (byte-identical, никто не execute). Сбой → legacy fail-open (не
+            # роняет ход, скоуп НЕ расширяется — остаётся #221-решение выше). Ярус (б) candidate/confirm — B2b-2.
+            if _preflight and _unified_execute_for(tenant_id):
+                try:
+                    from sreda.runtime.react_policy import compute_unified_policy
+                    from sreda.runtime.react_preflight import route_domains as _rd285
+                    _upol = compute_unified_policy(user_text, _rd285(user_text))
+                    _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
+                    _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
+                    _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
+                    _init["router_allowed_read_domains"] = _uar
+                    _init["router_allowed_write_domains"] = _uaw
+                    _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
+                    _init["router_decision_json"] = json.dumps(
+                        {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
+                         "signals": _upol["signals"]}, ensure_ascii=False)
+                except Exception:  # noqa: BLE001 — единый путь не роняет ход → legacy (скоуп #221 выше)
+                    logger.warning("react_unified: policy failed → legacy fail-open", exc_info=True)
             # #285 Фаза A (SHADOW): TurnPolicy сайдкаром — выражает решения сплита (#197 интент,
             # #221 каналы, #256 таймауты, капы) явным объектом в ОТДЕЛЬНЫЙ канал. Legacy-каналы
             # router_allowed_* НЕ трогаются (контракт отката, инвентарь §2 (б)); исполнением НЕ
