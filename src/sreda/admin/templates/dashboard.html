@@ -76,7 +76,7 @@
     <span class="muted">ходов за 24 ч</span>
   </article>
   <article style="flex:1 1 160px; margin:0;">
-    <strong>Расход сегодня</strong><br>
+    <strong>Расход за 24 ч</strong><br>
     {% if snap.cost and snap.cost.day %}≈ ${{ "%.2f" | format(snap.cost.day.priced_subtotal_usd) }}
       <span class="muted">покрытие {{ snap.cost.day.coverage_calls_pct if snap.cost.day.coverage_calls_pct is not none else "—" }}%</span>
     {% else %}<span class="muted">—</span>{% endif %}
@@ -94,11 +94,40 @@
 
 {# ---------- Пользователи + покупки (фидбек владельца 2026-07-03) ---------- #}
 <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:16px;">
-  <article style="flex:1 1 220px; margin:0;">
-    <strong>Пользователи</strong><br>
+  {# Аудитория: всего + приток регистраций (календарь МСК) #}
+  <article style="flex:1 1 260px; margin:0;">
+    <strong>Аудитория</strong><br>
     {% if snap.users %}
-      <span style="font-size:20px;">{{ snap.users.total }}</span> <span class="muted">всего</span><br>
-      <span class="muted">сегодня +{{ snap.users.new_today }} · за 7 дней +{{ snap.users.new_7d }}</span>
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <div style="flex:1; background:#f1f3f5; border-radius:6px; padding:8px 10px;">
+          <div style="font-size:22px; font-weight:600;">{{ snap.users.total }}</div><div class="muted">всего</div>
+        </div>
+        <div style="flex:1; background:#f1f3f5; border-radius:6px; padding:8px 10px;">
+          <div style="font-size:22px; font-weight:600;">+{{ snap.users.new_today }}</div><div class="muted">сегодня</div>
+        </div>
+        <div style="flex:1; background:#f1f3f5; border-radius:6px; padding:8px 10px;">
+          <div style="font-size:22px; font-weight:600;">+{{ snap.users.new_7d }}</div><div class="muted">за 7 дней</div>
+        </div>
+      </div>
+      <div class="muted" title="регистрации по календарному дню/неделе (Москва)" style="margin-top:6px;">новые регистрации, календарь МСК</div>
+    {% else %}<span class="muted">—</span>{% endif %}
+  </article>
+  {# Активность: уникальные тенанты с ходом, скользящие окна #}
+  <article style="flex:1 1 260px; margin:0;">
+    <strong>Активность</strong><br>
+    {% if snap.users %}
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <div style="flex:1; background:#f1f3f5; border-radius:6px; padding:8px 10px;">
+          <div style="font-size:22px; font-weight:600;">{{ snap.users.active_24h }}</div><div class="muted">сутки</div>
+        </div>
+        <div style="flex:1; background:#f1f3f5; border-radius:6px; padding:8px 10px;">
+          <div style="font-size:22px; font-weight:600;">{{ snap.users.active_7d }}</div><div class="muted">неделя</div>
+        </div>
+        <div style="flex:1; background:#f1f3f5; border-radius:6px; padding:8px 10px;">
+          <div style="font-size:22px; font-weight:600;">{{ snap.users.active_30d }}</div><div class="muted">месяц</div>
+        </div>
+      </div>
+      <div class="muted" title="уникальные тенанты с ходом; скользящие окна (последние 24ч / 7 дней / 30 дней)" style="margin-top:6px;">уникальные тенанты с ходом, скользящие окна</div>
     {% else %}<span class="muted">—</span>{% endif %}
   </article>
   <article style="flex:1 1 220px; margin:0;">
@@ -157,7 +186,7 @@
 <small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · подробнее — <a href="/admin/spend-by-model?token={{ token }}">Расходы</a></small>
 {% if snap.cost %}
 <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:8px;">
-  {% for key, label in [("day", "Сегодня"), ("week", "Неделя"), ("month", "Месяц")] %}
+  {% for key, label in [("day", "24 часа"), ("week", "7 дней"), ("month", "30 дней")] %}
     {% set rep = snap.cost.get(key) %}
     {% if rep %}
     <article style="flex:1 1 180px; margin:0;">

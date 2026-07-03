@@ -534,6 +534,23 @@ class Settings(BaseSettings):
     react_domain_scope_execute_tenants_raw: str | None = Field(
         default=None, validation_alias="SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS"
     )
+    # #285 Фаза 0: единый путь ReAct (TurnPolicy). ОТДЕЛЬНЫЙ флаг — react_preflight_enabled НЕ
+    # переиспользуем: его семантика занята (ON = сплит #197, OFF = kill-switch → до-#197 full-bind
+    # byte-identical), свободного значения под «единый путь» нет (тот же урок R4, что у домен-режима
+    # выше: не сворачивать в один флаг). OFF (дефолт) = ноль изменений, сплит #197 как есть;
+    # ON → TurnPolicy-путь (Фаза A shadow → B канарейка; канареечный компаньон-список — при заходе
+    # в Фазу A/B). react_preflight_enabled остаётся независимым kill-switch'ем сплита до Фазы E.
+    react_unified_path_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_UNIFIED_PATH_ENABLED"
+    )
+    # #285 Фаза A: канареечный companion-список единого пути (паттерн Ф4 #221). Семантика связки:
+    # флаг OFF → полиси-кода на пути НЕТ вовсе (zero-overhead откат Фазы A);
+    # флаг ON + список пуст (дефолт) → SHADOW для всех (полиси считается/логируется, НЕ управляет);
+    # флаг ON + тенант в списке → execute (Фаза B; до неё ветки execute в коде не существует);
+    # ``*`` → все (Фаза F). Дизайн-решение: plans/285-phaseA-design.md, Решение 1.
+    react_unified_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_REACT_UNIFIED_TENANTS"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -1161,6 +1178,13 @@ class Settings(BaseSettings):
         mode=execute. Пусто (дефолт) → НИКОМУ execute (mode=execute = глобальный shadow); ``*`` → ВСЕ
         (полная раскатка). Канареечный гейт: сперва тенант Бориса, после проверки «дела» → ``*``."""
         return _parse_tenant_gate(self.react_domain_scope_execute_tenants_raw)
+
+    @property
+    def react_unified_tenants(self) -> frozenset[str]:
+        """#285 Фаза A/B: тенанты execute единого пути при включённом react_unified_path_enabled.
+        Пусто (дефолт) → НИКОМУ execute (флаг ON = глобальный SHADOW); ``*`` → ВСЕ (Фаза F).
+        В Фазе A ветки execute не существует — список задел на B."""
+        return _parse_tenant_gate(self.react_unified_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:

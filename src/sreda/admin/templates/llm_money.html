@@ -10,11 +10,11 @@
     <button type="submit" class="outline" style="padding:2px 10px; font-size:12px; margin-left:8px;">обновить сейчас</button>
   </form>
 </div>
-<small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · периоды — календарные по Москве · роли моделей — по реальным вызовам за 30 дней</small>
+<small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · периоды — скользящие окна (24ч / 7 дней / 30 дней) · роли моделей — по реальным вызовам за 30 дней</small>
 
 {% if snap.cost %}
 <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:10px;">
-  {% for key, label in [("day", "Сегодня"), ("week", "Неделя"), ("month", "Месяц")] %}
+  {% for key, label in [("day", "24 часа"), ("week", "7 дней"), ("month", "30 дней")] %}
     {% set rep = snap.cost.get(key) %}
     {% if rep %}<span><strong>{{ label }}:</strong> ≈ ${{ "%.2f" | format(rep.priced_subtotal_usd) }} <span class="muted">· {{ "{:,}".format(rep.calls).replace(",", " ") }} выз. · покрытие {{ rep.coverage_calls_pct if rep.coverage_calls_pct is not none else "—" }}%</span></span>{% endif %}
   {% endfor %}
@@ -39,7 +39,7 @@
     {% endif %}
 
     <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:8px; font-size:13px;">
-      {% for period, plabel in [("day", "сегодня"), ("week", "неделя"), ("month", "месяц")] %}
+      {% for period, plabel in [("day", "24ч"), ("week", "7д"), ("month", "30д")] %}
         {% set s = p.spend.get(period) %}
         <span class="muted">{{ plabel }}:
           {% if s %}<strong style="color:var(--pico-color);">${{ "%.2f" | format(s.est_usd) }}</strong> · {{ s.calls }} выз.{% if s.unpriced_tokens %} <span title="токены беспрайсовых моделей">(+{{ "{:,}".format(s.unpriced_tokens).replace(",", " ") }} ток. без прайса)</span>{% endif %}
@@ -55,7 +55,7 @@
 
     {% if p.models %}
     <table style="margin-top:8px; font-size:12px;">
-      <thead><tr><th>Модель (месяц)</th><th>Роль</th><th>Выз.</th><th>≈ USD</th></tr></thead>
+      <thead><tr><th>Модель (30 дней)</th><th>Роль</th><th>Выз.</th><th>≈ USD</th></tr></thead>
       <tbody>
       {% for m in p.models %}
         <tr>

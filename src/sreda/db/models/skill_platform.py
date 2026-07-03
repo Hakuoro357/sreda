@@ -212,6 +212,10 @@ class SkillAIExecution(Base):
         Index("ix_skill_ai_feature_created", "feature_key", "created_at"),
         Index("ix_skill_ai_provider_model_created", "provider_key", "model", "created_at"),
         Index("ix_skill_ai_status_created", "status", "created_at"),
+        # #304: DAU/WAU/MAU + #303 надёжность фильтруют по task_type='react_turn'
+        # в окне created_at. Индекс ограничивает скан окном по времени в пределах
+        # типа хода (сейчас таблица мелкая → seq scan, но растёт с каждым AI-вызовом).
+        Index("ix_skill_ai_tasktype_created", "task_type", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)

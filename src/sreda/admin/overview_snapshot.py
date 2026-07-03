@@ -174,11 +174,20 @@ def _slow_turns_block(settings: Any, now: datetime) -> dict:
         in_window.sort(key=lambda p: p[0].total_ms or 0, reverse=True)
         recent = []
         for t, ts in in_window[:_RECENT_LIMIT]:
+            # «Где застряло» = самая долгая размеченная стадия. Но если она
+            # объясняет <50% общего времени — трейс НЕ разметил, куда ушло
+            # остальное (владелец 2026-07-03: ход 39с с «voice.transcribe
+            # 0.8с» вводил в заблуждение). Тогда честно «между стадиями».
             top_stage = ""
             stages = [s for s in t.stages if s.duration_ms]
+            total = t.total_ms or 0
             if stages:
                 s = max(stages, key=lambda s: s.duration_ms or 0)
-                top_stage = f"{s.name} {round((s.duration_ms or 0) / 1000, 1)} с"
+                dur = s.duration_ms or 0
+                if total and dur < total * 0.5:
+                    top_stage = "между стадиями (не размечено)"
+                else:
+                    top_stage = f"{s.name} {round(dur / 1000, 1)} с"
             recent.append({
                 "at": t.timestamp,
                 "total_ms": t.total_ms or 0,
@@ -220,18 +229,41 @@ def _users_block(session: Session, now: datetime) -> dict:
         session.query(func.count(Tenant.id))
         .filter(Tenant.created_at >= week_start).scalar()
     ) or 0
-    return {"total": total, "new_today": new_today, "new_7d": new_7d}
+
+    # #304 DAU/WAU/MAU: активный = уникальный тенант с ходом (react_turn)
+    # в скользящем окне [now-Δ, now). Тот же сигнал, что «ходы» надёжности.
+    def _active(hours: int) -> int:
+        since = now - timedelta(hours=hours)
+        return (
+            session.query(func.count(func.distinct(SkillAIExecution.tenant_id)))
+            .filter(
+                SkillAIExecution.created_at >= since,
+                SkillAIExecution.created_at < now,
+                SkillAIExecution.task_type == "react_turn",
+            ).scalar()
+        ) or 0
+
+    return {
+        "total": total, "new_today": new_today, "new_7d": new_7d,
+        "active_24h": _active(24), "active_7d": _active(24 * 7),
+        "active_30d": _active(24 * 30),
+    }
 
 
 def _purchases_block(session: Session, now: datetime) -> dict:
     """Покупки и оплаченные тенанты (задел под запуск продаж):
     оплаченных тенантов всего (distinct, когда-либо), заказов и сумма ₽
-    за 7/30 дней по paid_at (status='paid' — сверено с billing.py:706)."""
+    за 7/30 дней по paid_at (status='paid' — сверено с billing.py:706).
+
+    Считаем только РЕАЛЬНЫЕ платежи: provider='stub' — заглушечные/ручные
+    «покупки» из раннего дева (payment_id=None), не выручка. Владелец
+    2026-07-03: «оплаты пока не подключены» — виджет показывал 2 stub-заказа."""
     from sreda.db.models.billing import PaymentOrder
 
+    is_real = PaymentOrder.provider_key != "stub"
     paid_tenants = (
         session.query(func.count(func.distinct(PaymentOrder.tenant_id)))
-        .filter(PaymentOrder.status == "paid").scalar()
+        .filter(PaymentOrder.status == "paid", is_real).scalar()
     ) or 0
 
     def _window(days: int) -> tuple[int, int]:
@@ -244,7 +276,7 @@ def _purchases_block(session: Session, now: datetime) -> dict:
                 func.count(PaymentOrder.id),
                 func.coalesce(func.sum(PaymentOrder.amount_rub), 0),
             )
-            .filter(PaymentOrder.status == "paid", paid_ts >= since)
+            .filter(PaymentOrder.status == "paid", is_real, paid_ts >= since)
             .one()
         )
         return int(row[0] or 0), int(row[1] or 0)
@@ -262,11 +294,22 @@ _TOP_MODEL_ROWS = 8  # верхних строк модели на период 
 
 
 def _cost_reports(session: Session):
-    """Отчёты #150 за день/неделю/месяц (единый источник для cost и
-    providers). Исключения пробрасываются в _safe."""
-    from sreda.admin.queries import get_cost_volume_summary
+    """Отчёты трат для дашборда — СКОЛЬЗЯЩИЕ окна 24ч/7д/30д (владелец
+    2026-07-03: календарные день/неделя/месяц давали «месяц < неделя» в
+    начале месяца). Ключи "day"/"week"/"month" сохранены (их читают
+    cost/providers-блоки и шаблон); меняются только подписи в шаблоне.
+    Единый источник для cost и providers. Исключения — в _safe."""
+    from sreda.admin.queries import get_spend_by_model
 
-    return get_cost_volume_summary(session)
+    now = datetime.now(UTC)
+    windows = {
+        "day": (now - timedelta(hours=24), now),
+        "week": (now - timedelta(days=7), now),
+        "month": (now - timedelta(days=30), now),
+    }
+    return {
+        k: get_spend_by_model(session, k, window=w) for k, w in windows.items()
+    }
 
 
 def _cost_block(reports) -> dict:
@@ -305,19 +348,34 @@ def _row_dict(r) -> dict:
 
 
 def _health_block(session: Session, now: datetime) -> dict:
-    """Здоровье диалога за сутки — обёртка над ``gather_day_counts``
-    (reliability_report). Исключения пробрасываются в _safe (R2)."""
-    from sreda.workers.reliability_report import gather_day_counts
+    """Здоровье диалога за 24ч — по ЖИВЫМ данным ReAct-ходов.
 
-    c = gather_day_counts(session, now=now, breakdowns_precounted=0)
-    return {
-        "turns_total": c.turns_total,
-        "runs_failed": c.runs_failed,
-        "inbound_stuck": c.inbound_stuck,
-        "outbox_failed": c.outbox_failed,
-        "breakdowns_shown": c.breakdowns_shown,
-        "failures_total": c.failures_total,
-    }
+    Владелец 2026-07-03: прежний источник ``gather_day_counts`` читает
+    таблицу ``agent_runs``, которая перестала писаться 23.06 (депрекейт
+    старого планировщика) → виджет застыл на «0 ходов». Считаем по
+    ``skill_ai_executions`` task_type='react_turn': ход = уникальный
+    run_id; проблема = ход, где был react_turn с ошибкой.
+    (Слепой автоотчёт надёжности #39 — отдельный issue, не здесь.)
+    Исключения пробрасываются в _safe."""
+    since = now - timedelta(hours=24)
+    # SELECT = count(DISTINCT run_id) в ОБОИХ; .filter добавляет лишь WHERE,
+    # НЕ меняя агрегат → failures_total = число уникальных run_id С ошибкой
+    # (НЕ число ошибочных строк: мульти-итерационный ReAct с N ошибочными
+    # react_turn в одном run считается ОДНИМ проблемным ходом). Тест это
+    # фиксирует (test_health_failures_distinct_run_not_execution_count).
+    # created_at < now: точное окно [since, now) — ЕДИНАЯ семантика с
+    # reliability_report.gather_day_counts (#303; без верхней границы числа
+    # те же, будущих строк нет, но выравниваем во избежание clock-skew-дрейфа).
+    base = session.query(func.count(func.distinct(SkillAIExecution.run_id))).filter(
+        SkillAIExecution.created_at >= since,
+        SkillAIExecution.created_at < now,
+        SkillAIExecution.task_type == "react_turn",
+    )
+    turns_total = base.scalar() or 0
+    failures_total = (
+        base.filter(SkillAIExecution.status.in_(_ERROR_STATUSES)).scalar()
+    ) or 0
+    return {"turns_total": turns_total, "failures_total": failures_total}
 
 
 # Русские подписи ролей моделей — по РЕАЛЬНЫМ task_type из
@@ -327,6 +385,10 @@ _TASK_TYPE_LABELS = {
     "react_turn": "диалог",
     "speech_recognition": "распознавание речи",
     "summary": "пересказ истории",
+    "planner.plan": "планирование",
+    "composer.voice": "озвучка ответа",
+    "planner": "планирование",
+    "composer": "озвучка ответа",
 }
 
 # provider_key исполнений → ключ балансов provider_balances
@@ -607,7 +669,9 @@ def normalize_overview(payload: dict) -> dict:
         }
     u = payload.get("users")
     if isinstance(u, dict) and u:
-        norm["users"] = {k: _int(u.get(k)) for k in ("total", "new_today", "new_7d")}
+        norm["users"] = {k: _int(u.get(k)) for k in (
+            "total", "new_today", "new_7d",
+            "active_24h", "active_7d", "active_30d")}
     p = payload.get("purchases")
     if isinstance(p, dict) and p:
         norm["purchases"] = {k: _int(p.get(k)) for k in (
@@ -644,8 +708,7 @@ def normalize_overview(payload: dict) -> dict:
     h = payload.get("health")
     if isinstance(h, dict) and h:
         norm["health"] = {k: _int(h.get(k)) for k in (
-            "turns_total", "runs_failed", "inbound_stuck",
-            "outbox_failed", "breakdowns_shown", "failures_total")}
+            "turns_total", "failures_total")}
     provs = payload.get("providers")
     if isinstance(provs, list):
         norm_provs = []

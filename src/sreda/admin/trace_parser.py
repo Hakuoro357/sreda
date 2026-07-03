@@ -25,7 +25,6 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
 
 # ---------------------------------------------------------------------------
 # Format regexes — match the actual produced format. Tolerate optional
@@ -164,11 +163,18 @@ def _parse_meta_string(s: str) -> dict[str, str]:
     return out
 
 
-def _filter_safe_meta(raw: dict[str, str]) -> dict[str, str]:
-    """Apply allowlist + truncate value length. Codex r1 CRITICAL #4."""
+def _filter_safe_meta(raw: dict[str, str], step_name: str = "") -> dict[str, str]:
+    """Apply allowlist + truncate value length. Codex r1 CRITICAL #4.
+
+    #255: шаги ``react.*`` (наблюдаемость react_loop) — ПД-free by construction (числа/enum/имена
+    инструментов, как ``llm_calls_json`` #192), пропускаем ВСЕ их поля (иначе latency_ms/intent/fallback
+    отрендерились бы пустыми — ради них весь #255). Префикс БУКВАЛЬНО ``"react."`` (с точкой):
+    ``react_loop.replied`` НЕ подпадает (после ``react`` идёт ``_``) → у него прежний строгий allowlist.
+    Обрезка длины (_MAX_META_VALUE_LEN) применяется в любом случае — страховка от простыней."""
+    loose = step_name.startswith("react.")
     safe: dict[str, str] = {}
     for key, value in raw.items():
-        if key not in _SAFE_META_KEYS:
+        if not loose and key not in _SAFE_META_KEYS:
             continue
         if len(value) > _MAX_META_VALUE_LEN:
             value = value[: _MAX_META_VALUE_LEN - 1] + "…"
@@ -253,7 +259,7 @@ def _parse_block(lines: list[str]) -> ParsedTrace | None:
             except ValueError:
                 pass
         meta_raw = _parse_meta_string(stage_match.group("meta") or "")
-        meta_safe = _filter_safe_meta(meta_raw)
+        meta_safe = _filter_safe_meta(meta_raw, stage_match.group("name"))
         trace.stages.append(ParsedStage(
             at_ms=at_ms,
             name=stage_match.group("name"),

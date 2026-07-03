@@ -258,7 +258,8 @@ def test_normalize_overview_coerces_garbage():
     assert norm["llm_24h"] == {"calls": 0, "errors": 2, "error_rate_pct": 0.0}
     assert norm["slow_turns"]["count_24h"] == 0
     assert norm["slow_turns"]["recent"][0]["total_ms"] == 0
-    assert norm["users"] == {"total": 0, "new_today": 2, "new_7d": 0}
+    assert norm["users"] == {"total": 0, "new_today": 2, "new_7d": 0,
+                             "active_24h": 0, "active_7d": 0, "active_30d": 0}
     assert norm["purchases"]["paid_tenants"] == 0  # bool не число
     assert norm["purchases"]["sum_rub_30d"] == 800
     day = norm["cost"]["day"]
@@ -301,8 +302,10 @@ def test_db_error_in_block_does_not_prevent_store(session_factory, monkeypatch):
     def _sql_boom(*a, **k):
         raise sqlalchemy.exc.OperationalError("SELECT boom", {}, Exception("x"))
 
+    # _cost_reports теперь зовёт get_spend_by_model (скользящие окна) —
+    # мокаем её, чтобы уронить cost-блок (2026-07-03).
     monkeypatch.setattr(
-        "sreda.admin.queries.get_cost_volume_summary", _sql_boom)
+        "sreda.admin.queries.get_spend_by_model", _sql_boom)
     monkeypatch.setattr(
         ov, "_balances_block", lambda settings: [])
     ok = ov.refresh_overview(

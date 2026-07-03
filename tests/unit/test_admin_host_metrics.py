@@ -62,19 +62,21 @@ def test_get_host_metrics_reads_values(monkeypatch):
 
 
 def test_tunnel_status_active_with_restarts(monkeypatch):
-    # Один батч-вызов `show -p ActiveState,NRestarts,ActiveEnterTimestamp`
-    # — три строки в порядке запроса.
+    # Один батч-вызов, вывод — Key=Value. КРИТИЧНО (прод-инцидент 2026-07-03):
+    # systemctl отдаёт свойства в АЛФАВИТНОМ порядке, не в порядке запроса —
+    # мокаем именно так, иначе баг «1098 в статусе» не ловится.
     from datetime import UTC, datetime, timedelta
     started = (datetime.now(UTC) - timedelta(hours=20)).strftime(
         "%a %Y-%m-%d %H:%M:%S UTC")
+    out = f"ActiveEnterTimestamp={started}\nActiveState=active\nNRestarts=1098"
     seen = []
-    monkeypatch.setattr(hm, "_systemctl",
-                        lambda args: seen.append(args) or f"active\n1098\n{started}")
+    monkeypatch.setattr(hm, "_systemctl", lambda args: seen.append(args) or out)
     st = hm.get_tunnel_status("sreda-socks-tunnel.service")
-    assert st.active == "active"
+    assert st.active == "active"         # НЕ «1098» (баг позиционного парсинга)
     assert st.nrestarts == 1098
     assert st.uptime_hours is not None and 19.5 <= st.uptime_hours <= 20.5
-    assert len(seen) == 1  # ровно ОДИН subprocess на юнит
+    assert "--value" not in seen[0]      # парсим по именам, не по позиции
+    assert len(seen) == 1
 
 
 def test_uptime_hours_parse_variants():
@@ -96,7 +98,10 @@ def test_tunnel_status_failsoft_when_systemctl_absent(monkeypatch):
 
 
 def test_tunnel_status_inactive(monkeypatch):
-    monkeypatch.setattr(hm, "_systemctl", lambda args: "inactive\n")
+    monkeypatch.setattr(
+        hm, "_systemctl",
+        lambda args: "ActiveState=inactive\nNRestarts=0\nActiveEnterTimestamp=")
     st = hm.get_tunnel_status("x.service")
     assert st.active == "inactive"
-    assert st.nrestarts is None
+    assert st.nrestarts == 0
+    assert st.uptime_hours is None  # пустой timestamp у inactive

@@ -125,27 +125,31 @@ def get_host_metrics(disk_path: str = "/") -> HostMetrics:
 # --- tunnel status ----------------------------------------------------------
 
 def get_tunnel_status(unit: str) -> TunnelStatus:
-    """One batched ``systemctl show`` call per unit (R1: 2 calls → 1).
+    """One batched ``systemctl show`` call per unit.
 
-    ``--value`` prints one property per line in the requested order:
-    ActiveState, NRestarts, ActiveEnterTimestamp. Uptime — фидбек
-    владельца 2026-07-03: накопительный NRestarts (1098 после шторма
-    24-25.06) пугает; «жив N ч» — полезный сигнал.
+    ПРОД-ИНЦИДЕНТ 2026-07-03: с ``--value`` systemctl печатает свойства в
+    АЛФАВИТНОМ порядке (не в порядке запроса) → NRestarts=1098 встал
+    первой строкой и «1098» отрисовался как статус. Парсим ``Key=Value``
+    (без ``--value``) — порядок строк безразличен. Uptime — фидбек
+    владельца: накопительный NRestarts пугает, «жив N ч» полезнее.
     """
     st = TunnelStatus(unit=unit)
     out = _systemctl([
-        "show", "-p", "ActiveState,NRestarts,ActiveEnterTimestamp",
-        "--value", unit,
+        "show", "-p", "ActiveState,NRestarts,ActiveEnterTimestamp", unit,
     ])
     if out is None:
         return st  # systemctl недоступен → "unknown"/None
-    lines = out.splitlines()
-    if lines and lines[0].strip():
-        st.active = lines[0].strip()
-    if len(lines) > 1 and lines[1].strip().isdigit():
-        st.nrestarts = int(lines[1].strip())
-    if len(lines) > 2:
-        st.uptime_hours = _uptime_hours(lines[2].strip())
+    kv: dict[str, str] = {}
+    for line in out.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            kv[k.strip()] = v.strip()
+    if kv.get("ActiveState"):
+        st.active = kv["ActiveState"]
+    if kv.get("NRestarts", "").isdigit():
+        st.nrestarts = int(kv["NRestarts"])
+    if kv.get("ActiveEnterTimestamp"):
+        st.uptime_hours = _uptime_hours(kv["ActiveEnterTimestamp"])
     return st
 
 
