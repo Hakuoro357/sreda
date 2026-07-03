@@ -499,6 +499,14 @@ class Settings(BaseSettings):
         v = (self.react_domain_scope_mode or "").strip().lower()
         return v if v in ("disabled", "shadow", "execute") else "disabled"
 
+    # #298: дата+время ЭФЕМЕРНЫМ хвостом контекста. OFF (дефолт) → легаси: дата в системном промпте
+    # (рвёт кеш раз в сутки), времени нет нигде (модель выдумывает «сейчас 14:00» ночью - прод-кейс
+    # 2026-07-03). ON → системный промпт ПОЛНОСТЬЮ стабилен (даты нет), «Сейчас YYYY-MM-DD (день)
+    # HH:MM (МСК)» приклеивается к последнему user-сообщению на invoke (prompt-view, НЕ персистится,
+    # префикс-кеш цел). Оба пути: task-граф + chat/fact. Откат = выключить флаг.
+    react_time_in_tail_enabled: bool = Field(
+        default=False, validation_alias="SREDA_REACT_TIME_IN_TAIL"
+    )
     # #213 Срез A: унификация read-инструментов чек-листов. OFF (дефолт) → точный legacy: LLM видит
     # пару list_checklists/show_checklist, get_checklist не экспонирован, форма ответов байт-в-байт.
     # ON → LLM видит ЕДИНЫЙ get_checklist(mode: items|overview, name) с result-envelope; старые имена
