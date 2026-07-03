@@ -76,7 +76,7 @@
     <span class="muted">ходов за 24 ч</span>
   </article>
   <article style="flex:1 1 160px; margin:0;">
-    <strong>Расход сегодня</strong><br>
+    <strong>Расход за 24 ч</strong><br>
     {% if snap.cost and snap.cost.day %}≈ ${{ "%.2f" | format(snap.cost.day.priced_subtotal_usd) }}
       <span class="muted">покрытие {{ snap.cost.day.coverage_calls_pct if snap.cost.day.coverage_calls_pct is not none else "—" }}%</span>
     {% else %}<span class="muted">—</span>{% endif %}
@@ -157,7 +157,7 @@
 <small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · подробнее — <a href="/admin/spend-by-model?token={{ token }}">Расходы</a></small>
 {% if snap.cost %}
 <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:8px;">
-  {% for key, label in [("day", "Сегодня"), ("week", "Неделя"), ("month", "Месяц")] %}
+  {% for key, label in [("day", "24 часа"), ("week", "7 дней"), ("month", "30 дней")] %}
     {% set rep = snap.cost.get(key) %}
     {% if rep %}
     <article style="flex:1 1 180px; margin:0;">

@@ -589,14 +589,19 @@ def get_spend_by_model(
     period: str,
     anchor: datetime | None = None,
     tenant_id: str | None = None,
+    window: tuple[datetime, datetime] | None = None,
 ) -> SpendReport:
     """Траты по (provider_key, model) за MSK-окно периода (опц. по тенанту).
 
     Стоимость — через ``llm_pricing.cost_estimate`` (беспрайсовое → est=None → «—»).
     Итог — «priced subtotal» + покрытие (% валидных вызовов/токенов с известной
     ценой) + число аномалий. Историю считаем по текущему прайсу (оценка).
+
+    ``window`` (2026-07-03, #292): явный ``(start_utc, end_utc)`` вместо
+    календарного окна — для скользящих 24ч/7д/30д на дашборде; календарные
+    /budget и /spend-by-model зовут без него.
     """
-    start, end = period_window_utc(period, anchor)
+    start, end = window if window is not None else period_window_utc(period, anchor)
     in_win_list = [
         SkillAIExecution.created_at >= start,
         SkillAIExecution.created_at < end,

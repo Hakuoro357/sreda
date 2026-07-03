@@ -136,6 +136,60 @@ def test_slow_turns_from_traces(session, fake_settings, monkeypatch):
     assert r["top_stage"] == "llm 28.0 с"
 
 
+def test_slow_turns_unattributed_stage(fake_settings, monkeypatch):
+    """Фикс владельца 2026-07-03: топ-стадия объясняет <50% времени →
+    «между стадиями», а не вводящее в заблуждение «voice.transcribe 0.8с»."""
+    from types import SimpleNamespace as NS
+    from datetime import UTC, datetime
+    traces = [NS(timestamp="2026-07-03 05:30:00.000", user_id="u", channel="tg",
+                 total_ms=39_000, stages=[NS(name="voice.transcribe", duration_ms=800)])]
+    monkeypatch.setattr("sreda.admin.trace_parser.parse_trace_log",
+                        lambda path, **kw: traces)
+    fake_settings.trace_log_path = "/x"
+    blk = ov._slow_turns_block(fake_settings, datetime(2026, 7, 3, 6, 0, tzinfo=UTC))
+    assert blk["recent"][0]["top_stage"] == "между стадиями (не размечено)"
+
+
+def test_health_from_live_react_turns(session, fake_settings):
+    """Здоровье — по живым react_turn (agent_runs мёртв с 23.06):
+    ход = уникальный run_id, проблема = run с ошибочным react_turn."""
+    from datetime import UTC, datetime, timedelta
+
+    def row(run, status, age_h=1.0):
+        return _exec_row(task_type="react_turn", status=status,
+                         provider_key="inception-mercury2", age_hours=age_h)
+    rows = []
+    # 3 хода (run_1..3), у run_2 — ошибка; + шум: summary и старый react_turn
+    for i, (run, st) in enumerate([("run_a","succeeded"),("run_a","succeeded"),
+                                    ("run_b","failed"),("run_c","succeeded")]):
+        r = _exec_row(task_type="react_turn", status=st)
+        r.run_id = run
+        rows.append(r)
+    old = _exec_row(task_type="react_turn", status="succeeded", age_hours=30); old.run_id="run_old"
+    summ = _exec_row(task_type="summary", status="succeeded"); summ.run_id="run_s"
+    rows += [old, summ]
+    session.add_all(rows); session.commit()
+    blk = ov._health_block(session, datetime.now(UTC))
+    assert blk["turns_total"] == 3           # run_a/b/c (run_old вне 24ч, summary не react_turn)
+    assert blk["failures_total"] == 1        # только run_b
+    assert "runs_failed" not in blk          # мёртвые agent_runs-поля убраны
+
+
+def test_health_failures_distinct_run_not_execution_count(session, fake_settings):
+    """R1 субагент (опровержение): run с ДВУМЯ ошибочными react_turn — это
+    ОДИН проблемный ход, не два (failures_total = distinct run_id с ошибкой,
+    а не count ошибочных строк)."""
+    from datetime import UTC, datetime
+    rows = []
+    for st in ("failed", "validation_failed"):        # 2 ошибки в ОДНОМ run
+        r = _exec_row(task_type="react_turn", status=st); r.run_id = "run_x"; rows.append(r)
+    ok = _exec_row(task_type="react_turn", status="succeeded"); ok.run_id = "run_y"; rows.append(ok)
+    session.add_all(rows); session.commit()
+    blk = ov._health_block(session, datetime.now(UTC))
+    assert blk["turns_total"] == 2        # run_x + run_y
+    assert blk["failures_total"] == 1     # run_x ОДИН раз, НЕ 2
+
+
 def test_slow_turns_failsoft_no_path(fake_settings):
     from datetime import UTC, datetime
     blk = ov._slow_turns_block(fake_settings, datetime.now(UTC))
@@ -212,12 +266,17 @@ def test_purchases_block_counts(session, fake_settings):
         PaymentOrder(id="o3", tenant_id="t1", provider_key="yookassa",
                      order_type="sub", status="created", amount_rub=999,
                      description="d"),  # НЕ оплачен — не считается
+        # stub-заказ (заглушка раннего дева) — НЕ выручка, НЕ считается
+        PaymentOrder(id="o4", tenant_id="t_stub", provider_key="stub",
+                     order_type="initial_purchase", status="paid",
+                     amount_rub=2990, description="d",
+                     paid_at=now - timedelta(days=1)),
     ])
     session.commit()
     blk = ov._purchases_block(session, now)
-    assert blk["paid_tenants"] == 1
+    assert blk["paid_tenants"] == 1              # только t1 (t_stub исключён)
     assert blk["orders_7d"] == 1 and blk["sum_rub_7d"] == 500
-    assert blk["orders_30d"] == 2 and blk["sum_rub_30d"] == 800
+    assert blk["orders_30d"] == 2 and blk["sum_rub_30d"] == 800  # stub не в сумме
 
 
 def test_cost_priced_pair_uses_confirmed_price(session, fake_settings):

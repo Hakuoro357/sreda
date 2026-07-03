@@ -301,8 +301,10 @@ def test_db_error_in_block_does_not_prevent_store(session_factory, monkeypatch):
     def _sql_boom(*a, **k):
         raise sqlalchemy.exc.OperationalError("SELECT boom", {}, Exception("x"))
 
+    # _cost_reports теперь зовёт get_spend_by_model (скользящие окна) —
+    # мокаем её, чтобы уронить cost-блок (2026-07-03).
     monkeypatch.setattr(
-        "sreda.admin.queries.get_cost_volume_summary", _sql_boom)
+        "sreda.admin.queries.get_spend_by_model", _sql_boom)
     monkeypatch.setattr(
         ov, "_balances_block", lambda settings: [])
     ok = ov.refresh_overview(
