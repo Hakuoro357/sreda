@@ -345,8 +345,12 @@ def _health_block(session: Session, now: datetime) -> dict:
     # (НЕ число ошибочных строк: мульти-итерационный ReAct с N ошибочными
     # react_turn в одном run считается ОДНИМ проблемным ходом). Тест это
     # фиксирует (test_health_failures_distinct_run_not_execution_count).
+    # created_at < now: точное окно [since, now) — ЕДИНАЯ семантика с
+    # reliability_report.gather_day_counts (#303; без верхней границы числа
+    # те же, будущих строк нет, но выравниваем во избежание clock-skew-дрейфа).
     base = session.query(func.count(func.distinct(SkillAIExecution.run_id))).filter(
         SkillAIExecution.created_at >= since,
+        SkillAIExecution.created_at < now,
         SkillAIExecution.task_type == "react_turn",
     )
     turns_total = base.scalar() or 0

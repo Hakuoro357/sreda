@@ -5,7 +5,9 @@
 (порог запуска: ≥95% ходов без провала — утверждён 2026-06-12).
 
 Классы провалов:
-- ``runs_failed`` — agent_runs.status='failed' за окно;
+- ``runs_failed`` — ход (react_turn) с ошибочным исполнением за окно
+  (#303: раньше agent_runs.status='failed', но agent_runs мертва с 23.06 —
+  старый планировщик задепрекейчен, ReAct пишет skill_ai_executions);
 - ``inbound_stuck`` — входящее старше 10 минут, так и не дошедшее до
   processed/ignored (ход умер до ответа);
 - ``outbox_failed`` — исходящее не доставлено;
@@ -30,7 +32,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from sreda.db.models.core import InboundMessage, OutboxMessage
-from sreda.db.models.runtime import AgentRun
+from sreda.db.models.skill_platform import SkillAIExecution
 from sreda.services.admin_alerts import send_admin_alert
 
 logger = logging.getLogger("sreda.reliability")
@@ -77,11 +79,22 @@ def gather_day_counts(
     breakdowns_precounted: int | None = None,
 ) -> DayCounts:
     since = now - REPORT_WINDOW
-    turns_total = _count(session, select(func.count(AgentRun.id)).where(
-        and_(AgentRun.created_at >= since, AgentRun.created_at < now)))
-    runs_failed = _count(session, select(func.count(AgentRun.id)).where(
-        and_(AgentRun.created_at >= since, AgentRun.created_at < now,
-             AgentRun.status == "failed")))
+    # #303: ход = distinct run_id из react_turn (agent_runs мертва с 23.06).
+    # ЕДИНАЯ семантика с админ-дашбордом (overview_snapshot._health_block):
+    # мульти-итерационный ReAct с N react_turn в одном run = ОДИН ход;
+    # провал = run с хотя бы одним ошибочным react_turn.
+    _react = and_(
+        SkillAIExecution.created_at >= since,
+        SkillAIExecution.created_at < now,
+        SkillAIExecution.task_type == "react_turn",
+    )
+    turns_total = _count(session, select(
+        func.count(func.distinct(SkillAIExecution.run_id))).where(_react))
+    runs_failed = _count(session, select(
+        func.count(func.distinct(SkillAIExecution.run_id))).where(and_(
+            _react,
+            SkillAIExecution.status.in_(("failed", "validation_failed")),
+        )))
     # окно сдвинуто целиком на grace — иначе последние 10 минут каждых
     # суток не проверяются никогда (субагент R1 MINOR)
     inbound_stuck = _count(
