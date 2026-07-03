@@ -545,6 +545,10 @@ class ReactState(MessagesState):
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
+    # #285 Фаза A (SHADOW): сериализованная TurnPolicy хода (БЕЗ ПД) — сайдкар в handle_turn выражает
+    # решения сплита явным объектом; исполнением НЕ управляет (byte-identical — пин-тесты). Last-value;
+    # сброс на свежем ходе; None на старых чекпойнтах (fallback-паттерн router_allowed_* выше).
+    turn_policy_json: str | None
 
 
 def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
@@ -1379,6 +1383,12 @@ def _domain_scope() -> str:
     """#221 Ф3: режим доменного скоупинга ∈ {disabled, shadow, execute}. disabled (дефолт) → byte-identical."""
     from sreda.config.settings import get_settings
     return get_settings().react_domain_scope
+
+
+def _unified_enabled() -> bool:
+    """#285 Фаза A: флаг единого пути. OFF (дефолт) → полиси-код на пути не исполняется вовсе."""
+    from sreda.config.settings import get_settings
+    return bool(get_settings().react_unified_path_enabled)
 
 
 def _is_domain_execute_tenant(tenant_id: str) -> bool:
@@ -3280,7 +3290,10 @@ async def handle_turn(
                            # пропустивший доменный блок (intent=чат/факт), писал бы в трейс СТАРОЕ решение
                            # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
                            # не затрагивало (бинд по allowed_*, они сброшены), только колонка лога.
-                           "router_decision_json": None}
+                           "router_decision_json": None,
+                           # #285 Фаза A: сброс полиси-канала на свежем ходе (дисциплина last-value
+                           # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
+                           "turn_policy_json": None}
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
@@ -3349,6 +3362,30 @@ async def handle_turn(
                         _init["router_allowed_read_domains"] = None
                         _init["router_allowed_write_domains"] = None
                         _init["router_decision_json"] = None
+            # #285 Фаза A (SHADOW): TurnPolicy сайдкаром — выражает решения сплита (#197 интент,
+            # #221 каналы, #256 таймауты, капы) явным объектом в ОТДЕЛЬНЫЙ канал. Legacy-каналы
+            # router_allowed_* НЕ трогаются (контракт отката, инвентарь §2 (б)); исполнением НЕ
+            # управляет. Флаг OFF → ветка не исполняется (zero-overhead). Сбой не роняет ход.
+            if _unified_enabled():
+                try:
+                    from sreda.config.settings import get_settings as _gs285
+                    from sreda.runtime.react_policy import build_turn_policy, dumps_policy
+                    _s285 = _gs285()
+                    _pi = _init.get("intent") or None
+                    _caps285 = ({t: c for (i, t), c in _SEARCH_CAPS.items() if i == _pi}
+                                if _pi in ("chat", "fact") else None)
+                    _init["turn_policy_json"] = dumps_policy(build_turn_policy(
+                        intent=_pi,
+                        router_allowed_read=_init.get("router_allowed_read_domains"),
+                        router_allowed_write=_init.get("router_allowed_write_domains"),
+                        chat_timeout_sec=float(_s285.react_chat_llm_timeout_sec),
+                        task_timeout_sec=float(_s285.react_llm_timeout_sec),
+                        chat_provider=str(_s285.react_preflight_chat_provider),
+                        search_caps=_caps285,
+                    ))
+                except Exception:  # noqa: BLE001 — shadow-сайдкар не роняет ход
+                    logger.warning("react_policy: shadow build failed → None", exc_info=True)
+                    _init["turn_policy_json"] = None
             result = await graph.ainvoke(_init, _cfg(gen))
 
         snap = await graph.aget_state(_cfg(gen))
