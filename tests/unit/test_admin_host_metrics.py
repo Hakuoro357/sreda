@@ -62,15 +62,29 @@ def test_get_host_metrics_reads_values(monkeypatch):
 
 
 def test_tunnel_status_active_with_restarts(monkeypatch):
-    # R1: один батч-вызов `show -p ActiveState,NRestarts --value` —
-    # две строки в порядке запроса.
+    # Один батч-вызов `show -p ActiveState,NRestarts,ActiveEnterTimestamp`
+    # — три строки в порядке запроса.
+    from datetime import UTC, datetime, timedelta
+    started = (datetime.now(UTC) - timedelta(hours=20)).strftime(
+        "%a %Y-%m-%d %H:%M:%S UTC")
     seen = []
     monkeypatch.setattr(hm, "_systemctl",
-                        lambda args: seen.append(args) or "active\n1098")
+                        lambda args: seen.append(args) or f"active\n1098\n{started}")
     st = hm.get_tunnel_status("sreda-socks-tunnel.service")
     assert st.active == "active"
     assert st.nrestarts == 1098
+    assert st.uptime_hours is not None and 19.5 <= st.uptime_hours <= 20.5
     assert len(seen) == 1  # ровно ОДИН subprocess на юнит
+
+
+def test_uptime_hours_parse_variants():
+    from datetime import UTC, datetime, timedelta
+    ts = (datetime.now(UTC) - timedelta(hours=2)).strftime("%a %Y-%m-%d %H:%M:%S UTC")
+    got = hm._uptime_hours(ts)
+    assert got is not None and 1.9 <= got <= 2.1
+    assert hm._uptime_hours("") is None
+    assert hm._uptime_hours("мусор без даты") is None
+    assert hm._uptime_hours("Wed 2026-07-01 12:00:00 MSK") is None  # чужой пояс — честное «—»
 
 
 def test_tunnel_status_failsoft_when_systemctl_absent(monkeypatch):

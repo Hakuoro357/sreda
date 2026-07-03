@@ -123,16 +123,24 @@ def test_refresh_endpoint_delegates_and_redirects(client, monkeypatch):
 
 def test_normalize_overview_coerces_garbage():
     norm = ov.normalize_overview({
-        "llm_24h": {"calls": "x", "errors": 2, "error_rate_pct": "y", "slow": None},
+        "llm_24h": {"calls": "x", "errors": 2, "error_rate_pct": "y"},
         "cost": {"day": {"priced_subtotal_usd": "z", "rows": [
             {"provider_key": 5, "calls": "7", "priced": 1, "est_usd": "bad"},
             "не dict",
         ]}},
         "errors_recent": [{"at": 123}, "мусор"],
+        "slow_turns": {"count_24h": "x", "recent": [{"total_ms": "y"}, "не dict"]},
+        "users": {"total": "x", "new_today": 2, "new_7d": None},
+        "purchases": {"paid_tenants": True, "orders_7d": 1, "sum_rub_7d": "z",
+                      "orders_30d": None, "sum_rub_30d": 800},
         "llm_chain": {"primary": 9},
     })
-    assert norm["llm_24h"] == {
-        "calls": 0, "errors": 2, "error_rate_pct": 0.0, "slow": 0}
+    assert norm["llm_24h"] == {"calls": 0, "errors": 2, "error_rate_pct": 0.0}
+    assert norm["slow_turns"]["count_24h"] == 0
+    assert norm["slow_turns"]["recent"][0]["total_ms"] == 0
+    assert norm["users"] == {"total": 0, "new_today": 2, "new_7d": 0}
+    assert norm["purchases"]["paid_tenants"] == 0  # bool не число
+    assert norm["purchases"]["sum_rub_30d"] == 800
     day = norm["cost"]["day"]
     assert day["priced_subtotal_usd"] == 0.0
     assert day["rows"][0]["provider_key"] == ""  # coerced, не 500

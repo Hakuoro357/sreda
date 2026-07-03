@@ -88,34 +88,135 @@ def _no_network(monkeypatch):
     )
 
 
-def test_llm_24h_counts_errors_and_slow(session, fake_settings):
+def test_llm_24h_counts_errors(session, fake_settings):
     session.add_all([
         _exec_row(),                                   # ok
         _exec_row(status="failed", error_code="timeout"),
         _exec_row(status="validation_failed"),
-        _exec_row(latency_ms=45_000),                  # slow
         _exec_row(age_hours=30),                       # вне окна 24ч
     ])
     session.commit()
     payload = ov.compute_overview(session, fake_settings)
     blk = payload["llm_24h"]
-    assert blk["calls"] == 4          # строка age=30h не в окне
+    assert blk["calls"] == 3          # строка age=30h не в окне
     assert blk["errors"] == 2
-    assert blk["error_rate_pct"] == 50.0
-    assert blk["slow"] == 1
+    assert "slow" not in blk          # медленные теперь из трейсов (slow_turns)
 
 
-def test_errors_and_slow_lists_shapes(session, fake_settings):
-    session.add_all([
-        _exec_row(status="failed", error_code="timeout", model="mercury-2"),
-        _exec_row(latency_ms=61_000),
-    ])
+def test_errors_list_shape(session, fake_settings):
+    session.add(_exec_row(status="failed", error_code="timeout", model="mercury-2"))
     session.commit()
     payload = ov.compute_overview(session, fake_settings)
     err = payload["errors_recent"]
     assert len(err) == 1 and err[0]["error_code"] == "timeout"
-    slow = payload["slow_recent"]
-    assert len(slow) == 1 and slow[0]["latency_ms"] == 61_000
+
+
+def test_slow_turns_from_traces(session, fake_settings, monkeypatch):
+    """«Медленные» = турны из trace.log (latency_ms в БД пуст на прод-пути)."""
+    from types import SimpleNamespace as NS
+
+    fake_traces = [
+        NS(timestamp="2026-07-02 22:05:03.160", user_id="user_tg_755682022",
+           channel="max", total_ms=30_282,
+           stages=[NS(name="llm", duration_ms=28_000), NS(name="tools", duration_ms=1_500)]),
+        NS(timestamp="2020-01-01 00:00:00.000", user_id="old", channel="tg",
+           total_ms=99_000, stages=[]),  # старше 24ч — вне окна
+    ]
+    monkeypatch.setattr(
+        "sreda.admin.trace_parser.parse_trace_log",
+        lambda path, **kw: fake_traces,
+    )
+    fake_settings.trace_log_path = "/var/log/sreda/trace.log"
+    from datetime import UTC, datetime
+    blk = ov._slow_turns_block(fake_settings, datetime(2026, 7, 3, 6, 0, tzinfo=UTC))
+    assert blk["count_24h"] == 1
+    r = blk["recent"][0]
+    assert r["total_ms"] == 30_282 and r["channel"] == "max"
+    assert r["top_stage"] == "llm 28.0 с"
+
+
+def test_slow_turns_failsoft_no_path(fake_settings):
+    from datetime import UTC, datetime
+    blk = ov._slow_turns_block(fake_settings, datetime.now(UTC))
+    assert blk == {"count_24h": 0, "recent": []}
+
+
+def test_users_block_counts(session, fake_settings):
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import text
+    now = datetime.now(UTC)
+    for tid, age_days in (("t_new", 0), ("t_week", 3), ("t_old", 40)):
+        session.execute(text(
+            "INSERT INTO tenants (id, name, created_at) VALUES (:i, :n, :c)"
+        ), {"i": tid, "n": "x", "c": now - timedelta(days=age_days)})
+    session.commit()
+    blk = ov._users_block(session, now)
+    assert blk["total"] == 3
+    assert blk["new_7d"] == 2
+    assert blk["new_today"] >= 1  # t_new (граница дня MSK)
+
+
+def test_users_block_msk_day_boundary(session, fake_settings):
+    """R1 (high+medium MAJOR): 21:30 UTC = 00:30 MSK СЛЕДУЮЩЕГО дня —
+    тенант, созданный в 21:05 UTC, должен попасть в «сегодня» по Москве."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import text
+    now = datetime(2026, 7, 2, 21, 30, tzinfo=UTC)  # 03.07 00:30 МСК
+    session.execute(text(
+        "INSERT INTO tenants (id, name, created_at) VALUES ('t_msk','x',:c)"
+    ), {"c": datetime(2026, 7, 2, 21, 5, tzinfo=UTC)})  # 03.07 00:05 МСК
+    session.commit()
+    blk = ov._users_block(session, now)
+    assert blk["new_today"] == 1  # по UTC-дате было бы 0 — день 02.07
+
+
+def test_purchases_paid_without_paid_at_counted(session, fake_settings):
+    """R1 (субагент MAJOR): paid-заказ с paid_at=NULL не должен выпадать
+    (fallback на created_at)."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import text
+
+    from sreda.db.models.billing import PaymentOrder
+    now = datetime.now(UTC)
+    session.execute(text(
+        "INSERT INTO tenants (id, name, created_at) VALUES ('t2','x',:c)"), {"c": now})
+    session.add(PaymentOrder(
+        id="onull", tenant_id="t2", provider_key="yookassa", order_type="sub",
+        status="paid", amount_rub=700, description="d",
+        paid_at=None, created_at=now - timedelta(days=1)))
+    session.commit()
+    blk = ov._purchases_block(session, now)
+    assert blk["orders_7d"] == 1 and blk["sum_rub_7d"] == 700
+
+
+def test_purchases_block_counts(session, fake_settings):
+    from datetime import UTC, datetime, timedelta
+
+    from sreda.db.models.billing import PaymentOrder
+    now = datetime.now(UTC)
+    session.execute(  # тенант для FK-читаемости (sqlite FK не форсит, но честно)
+        __import__("sqlalchemy").text(
+            "INSERT INTO tenants (id, name, created_at) VALUES ('t1','x',:c)"),
+        {"c": now})
+    session.add_all([
+        PaymentOrder(id="o1", tenant_id="t1", provider_key="yookassa",
+                     order_type="sub", status="paid", amount_rub=500,
+                     description="d", paid_at=now - timedelta(days=2)),
+        PaymentOrder(id="o2", tenant_id="t1", provider_key="yookassa",
+                     order_type="sub", status="paid", amount_rub=300,
+                     description="d", paid_at=now - timedelta(days=20)),
+        PaymentOrder(id="o3", tenant_id="t1", provider_key="yookassa",
+                     order_type="sub", status="created", amount_rub=999,
+                     description="d"),  # НЕ оплачен — не считается
+    ])
+    session.commit()
+    blk = ov._purchases_block(session, now)
+    assert blk["paid_tenants"] == 1
+    assert blk["orders_7d"] == 1 and blk["sum_rub_7d"] == 500
+    assert blk["orders_30d"] == 2 and blk["sum_rub_30d"] == 800
 
 
 def test_cost_priced_pair_uses_confirmed_price(session, fake_settings):

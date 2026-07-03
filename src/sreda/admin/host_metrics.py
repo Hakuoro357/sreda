@@ -39,6 +39,7 @@ class TunnelStatus:
     unit: str
     active: str = "unknown"             # "active" | "inactive" | "failed" | "unknown"
     nrestarts: int | None = None        # cumulative auto-restarts (churn signal)
+    uptime_hours: float | None = None   # hours since last (re)start — the useful signal
 
 
 # --- seams (monkeypatched in tests) ----------------------------------------
@@ -127,10 +128,15 @@ def get_tunnel_status(unit: str) -> TunnelStatus:
     """One batched ``systemctl show`` call per unit (R1: 2 calls → 1).
 
     ``--value`` prints one property per line in the requested order:
-    ActiveState first, NRestarts second.
+    ActiveState, NRestarts, ActiveEnterTimestamp. Uptime — фидбек
+    владельца 2026-07-03: накопительный NRestarts (1098 после шторма
+    24-25.06) пугает; «жив N ч» — полезный сигнал.
     """
     st = TunnelStatus(unit=unit)
-    out = _systemctl(["show", "-p", "ActiveState,NRestarts", "--value", unit])
+    out = _systemctl([
+        "show", "-p", "ActiveState,NRestarts,ActiveEnterTimestamp",
+        "--value", unit,
+    ])
     if out is None:
         return st  # systemctl недоступен → "unknown"/None
     lines = out.splitlines()
@@ -138,7 +144,32 @@ def get_tunnel_status(unit: str) -> TunnelStatus:
         st.active = lines[0].strip()
     if len(lines) > 1 and lines[1].strip().isdigit():
         st.nrestarts = int(lines[1].strip())
+    if len(lines) > 2:
+        st.uptime_hours = _uptime_hours(lines[2].strip())
     return st
+
+
+def _uptime_hours(active_enter: str) -> float | None:
+    """systemd 'Wed 2026-07-01 12:01:27 UTC' → часы с момента старта."""
+    if not active_enter:
+        return None
+    from datetime import UTC, datetime
+
+    parts = active_enter.split()
+    # форма: [День] YYYY-MM-DD HH:MM:SS [TZ] — берём дату+время
+    for i, tok in enumerate(parts):
+        if len(tok) == 10 and tok[4] == "-" and i + 1 < len(parts):
+            try:
+                dt = datetime.fromisoformat(f"{tok} {parts[i + 1]}")
+            except ValueError:
+                return None
+            tz = parts[i + 2] if i + 2 < len(parts) else "UTC"
+            if tz != "UTC":
+                return None  # незнакомый пояс — честнее «—», чем враньё
+            dt = dt.replace(tzinfo=UTC)
+            hours = (datetime.now(UTC) - dt).total_seconds() / 3600
+            return round(hours, 1) if hours >= 0 else None
+    return None
 
 
 def get_egress_tunnels() -> list[TunnelStatus]:
