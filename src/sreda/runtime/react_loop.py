@@ -2814,6 +2814,10 @@ def _build_graph(llm: Any, all_tools: list, *,
                 _rc = str(res)
                 if _rc.startswith("error: name_required"):  # startswith: доверенная 1-я строка, не тело
                     _art["checklist_kind"] = "name_required"
+                elif _rc.startswith("error:"):
+                    # #213 Срез C (R2 Claude MINOR): исполненные схемо-ошибки (invalid_mode/
+                    # name_forbidden при non-high confidence, no user_id) — явный kind, не «ok без kind».
+                    _art["checklist_kind"] = "schema_error"
                 else:
                     _hf = _parse_passport_fields(_rc.splitlines()[0] if _rc else "")
                     _rs, _rt = _hf.get("resolution_status"), _hf.get("result_type")

@@ -164,6 +164,11 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                 "result_kind": (art.get("result_kind") if isinstance(art, dict) else None),
                 "error_type": (art.get("error_type") if isinstance(art, dict) else None),
                 "latency_ms": (art.get("latency_ms") if isinstance(art, dict) else None),
+                # #213 Срез C (M9, R2 Claude MAJOR): исход/редирект checklist-read ДОЖИВАЮТ до
+                # tool_calls_json — иначе метрика канарейки слепа (result_kind="ok" у исполненных
+                # ambiguous/redirect, дискриминатор — только эти поля). Аддитивно, None если нет.
+                "checklist_kind": (art.get("checklist_kind") if isinstance(art, dict) else None),
+                "checklist_redirected": (art.get("checklist_redirected") if isinstance(art, dict) else None),
             }
     # 2) пройтись по вызовам (из AIMessage.tool_calls), сшить с результатом, посчитать HMAC
     out: dict[str, dict] = {}
@@ -174,7 +179,7 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                 name = tc.get("name") or ""
                 r = results.get(cid, {})
                 rk = r.get("result_kind") or ("error" if r.get("status") == "error" else "ok")
-                out[cid or f"{name}:{len(out)}"] = {
+                _entry = {
                     "name": name,
                     "args_hash": args_hmac(tenant_id=tenant_id, tool_name=name,
                                            args=tc.get("args") or {}),
@@ -187,6 +192,12 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                     "error_type": r.get("error_type"),
                     "latency_ms": r.get("latency_ms"),
                 }
+                # #213 Срез C M9: checklist-исход/редирект — только если есть (не засоряем не-checklist)
+                if r.get("checklist_kind") is not None:
+                    _entry["checklist_kind"] = r["checklist_kind"]
+                if r.get("checklist_redirected"):
+                    _entry["checklist_redirected"] = True
+                out[cid or f"{name}:{len(out)}"] = _entry
     # 3) #285 A3 (R1 фазового ревью, CodexH+субагент): НЕПАРНЫЕ ToolMessage — на resume-ходе
     # AIMessage с вызовом остался ДО паузы (вне дельты, #269), но исполнение (например
     # подтверждённый write) в дельте ЕСТЬ. Без записи shadow-сверка слепа ровно на

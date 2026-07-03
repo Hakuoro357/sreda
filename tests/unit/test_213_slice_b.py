@@ -984,3 +984,32 @@ def test_m5_parser_normalizes_quotes_no_phantom_fields():
     assert f["items"] == "clitem_a", f  # не clitem_FAKE
     assert f["resolution_status"] == "exact", f  # не ambiguous из названия
     assert "clitem_FAKE" in f["checklist_name"]  # подделка осталась ВНУТРИ значения
+
+
+# --- Срез C M9 R2: поля доживают до персиста (tool_calls_json) --------------
+
+
+def test_m9_checklist_kind_persists_in_tool_calls():
+    """R2 Claude MAJOR: checklist_kind/checklist_redirected доживают до tool_calls_json
+    (collect_tool_calls), иначе метрика канарейки слепа (result_kind="ok" у исполненных)."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    from sreda.runtime.react_trace_persist import collect_tool_calls
+
+    ai = AIMessage(content="", tool_calls=[
+        {"name": "get_checklist", "args": {"mode": "items", "name": "кино"}, "id": "t1"},
+        {"name": "get_checklist", "args": {"mode": "items"}, "id": "t2"},
+    ])
+    tm1 = ToolMessage(content="result_type=items result_id=r1 items=clitem_a\n[clitem_a] ☐ x",
+                      tool_call_id="t1", name="get_checklist",
+                      artifact={"result_kind": "ok", "checklist_kind": "ambiguous"})
+    tm2 = ToolMessage(content="result_type=items result_id=r2 items=clitem_b\n[clitem_b] ☐ y",
+                      tool_call_id="t2", name="get_checklist",
+                      artifact={"result_kind": "ok", "checklist_kind": "items",
+                                "checklist_redirected": True})
+    rows = collect_tool_calls([ai, tm1, tm2], tenant_id="t")
+    by = {r["name"] + ":" + str(i): r for i, r in enumerate(rows)}
+    # оба ok (для #285), но checklist_kind различает исход
+    kinds = {r.get("checklist_kind") for r in rows}
+    assert "ambiguous" in kinds and "items" in kinds, rows
+    assert all(r["result_kind"] == "ok" for r in rows), "#285: result_kind остаётся ok"
+    assert any(r.get("checklist_redirected") for r in rows), "редирект доживает"
