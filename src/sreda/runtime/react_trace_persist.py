@@ -215,4 +215,11 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                 "error_type": r.get("error_type"),
                 "latency_ms": r.get("latency_ms"),
             }
+            # #213 Срез C (R3 Claude MINOR): дефенсивно — orphan-путь тоже несёт checklist-исход
+            # (сейчас недостижим для checklist-read: он не confirmable → всегда парен на шаге 2;
+            # страховка на случай будущей правки, чтобы метрика не ослепла молча).
+            if r.get("checklist_kind") is not None:
+                out[cid]["checklist_kind"] = r["checklist_kind"]
+            if r.get("checklist_redirected"):
+                out[cid]["checklist_redirected"] = True
     return list(out.values())
