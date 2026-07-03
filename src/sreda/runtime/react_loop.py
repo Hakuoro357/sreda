@@ -165,6 +165,16 @@ def _time_in_tail_enabled() -> bool:
         return False
 
 
+def _checklist_querykind() -> bool:
+    """#213 Срез B: предслойный query_kind + cross-check ВКЛ? (SREDA_CHECKLIST_QUERYKIND,
+    дефолт OFF = fail-open). Действует ТОЛЬКО вместе с _checklist_unified()."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().checklist_querykind_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
 # #298: русские дни недели (не %A — тот локале-зависим, на проде C-locale дал бы
 # «Friday» внутри русской фразы; ревью R1 Claude MINOR). Порядок = weekday().
 _WEEKDAYS_RU = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
@@ -196,6 +206,108 @@ def _append_time_tail(msgs: list, line: str) -> list:
                     HumanMessage(content=f"{msgs[i].content}\n\n{line}"),
                     *msgs[i + 1:]]
     return msgs
+
+
+# #213 Срез B: write-инструменты чек-листов под ordinal-enforcement (source_result_id).
+_CHECKLIST_WRITE_ENFORCED_213 = frozenset(
+    {"mark_checklist_item_done", "delete_checklist_item", "update_checklist_item"})
+
+
+def _checklist_cross_check(ctx: dict, name: str, args: dict | None,
+                           session: Any, tenant_id: str, user_id: str):
+    """#213 Срез B: сверка вызова с READ-интентом предслоя (plans/213-cycle-final.md п.3).
+
+    Возвращает None (пропуск) ЛИБО (сообщение, result_kind, redirect_args):
+    redirect_args не-None → узкий редирект (заполнение ОТСУТСТВУЮЩЕГО name при mode=items,
+    только exact|unique_fuzzy по span юзера); иначе структурный отказ БЕЗ исполнения.
+    Mode/инструмент редиректом НЕ меняются; в mixed редирект и гейты выключены."""
+    kind = ctx.get("kind")
+    if kind == "mixed":
+        return None  # разрешены и items, и overview; различимость — envelope
+    if name == "list_checklist_items":
+        # implicit mode=search (п.4 плана): на items/overview-интенте search-вызов паразитен.
+        if kind in ("items", "overview"):
+            return (f"mode_mismatch: пользователь просит "
+                    f"{'пункты конкретного списка' if kind == 'items' else 'обзор списков'} — "
+                    "поиск пунктов по всем спискам здесь не нужен. Используй get_checklist.",
+                    "mode_mismatch", None)
+        return None
+    if name != "get_checklist":
+        return None
+    mode = str((args or {}).get("mode") or "").strip().lower()
+    nm = str((args or {}).get("name") or "").strip()
+    span = str(ctx.get("name_span") or "").strip()
+    if kind in ("items", "overview") and mode in ("items", "overview") and mode != kind:
+        want = ("mode=\"items\" с name из запроса пользователя" if kind == "items"
+                else "mode=\"overview\" без name")
+        return (f"mode_mismatch: пользователь просит "
+                f"{'пункты конкретного списка' if kind == 'items' else 'обзор всех списков'} — "
+                f"вызови get_checklist {want}.", "mode_mismatch", None)
+    if kind == "items" and mode == "items" and span:
+        try:
+            from sreda.services.checklists import ChecklistService
+            _svc = ChecklistService(session)
+            if not nm:
+                # редирект ТОЛЬКО отсутствующего имени, только при уверенном резолве span
+                res = _svc.resolve_list_by_title_ranked(
+                    tenant_id=tenant_id, user_id=user_id, needle=span)
+                if res.status in ("exact", "unique_fuzzy"):
+                    return ("", "redirect", {**(args or {}), "name": span})
+                return None  # ambiguous/not_found → штатный путь инструмента (варианты/уточнение)
+            # conflicting resolvable names (r4-контракт): предслой уверенно видит span,
+            # модель зовёт ДРУГОЕ резолвящееся имя → отказ, не молчаливая выдача не того списка.
+            r_model = _svc.resolve_list_by_title_ranked(
+                tenant_id=tenant_id, user_id=user_id, needle=nm)
+            r_span = _svc.resolve_list_by_title_ranked(
+                tenant_id=tenant_id, user_id=user_id, needle=span)
+            if (r_model.checklist is not None and r_span.checklist is not None
+                    and r_model.checklist.id != r_span.checklist.id):
+                return (f"name_conflict: пользователь просил список «{span}», а вызов — про "
+                        f"другое имя. Перезови get_checklist с name=\"{span}\" или уточни у "
+                        "пользователя.", "name_conflict", None)
+        except Exception:  # noqa: BLE001 — сверка не роняет ход (fail-open)
+            logger.warning("react_loop: checklist cross-check failed → pass-through",
+                           exc_info=True)
+    return None
+
+
+def _checklist_write_enforce(history: list, batch_out: list,
+                             item_id: str, source_result_id: str) -> str | None:
+    """#213 Срез B (приёмка п.8): items-result'ы ТЕКУЩЕГО хода (после последнего user,
+    включая текущий батч) из envelope-паспортов; ≥2 → write требует привязки
+    (source_result_id с item_id внутри него); 0/1 → пропуск (легаси-пути целы)."""
+    msgs: list = []
+    last_h = -1
+    for i, m in enumerate(history):
+        if isinstance(m, HumanMessage):
+            last_h = i
+    msgs = list(history[last_h + 1:]) + list(batch_out)
+    results: list[tuple[str, set[str]]] = []
+    for m in msgs:
+        c = str(getattr(m, "content", "") or "")
+        head = c.splitlines()[0] if c else ""
+        if not head.startswith("result_type=items"):
+            continue
+        if "resolution_status=not_found" in head or "resolution_status=ambiguous" in head:
+            continue
+        rid_m = re.search(r"result_id=(\S+)", head)
+        ids = set(re.findall(r"\[(clitem_[0-9a-f]+)\]", c))
+        if rid_m and ids:
+            results.append((rid_m.group(1), ids))
+    if len(results) < 2:
+        return None
+    if source_result_id:
+        for rid, ids in results:
+            if rid == source_result_id:
+                if item_id in ids:
+                    return None
+                return (f"source_result_required: item_id не принадлежит результату "
+                        f"{source_result_id} — возьми id из нужного показанного списка.")
+        return (f"source_result_required: результата {source_result_id} нет в этом ходе.")
+    shown = ", ".join(rid for rid, _ in results)
+    return ("source_result_required: в этом ходе показано несколько списков "
+            f"(result_id: {shown}) — передай source_result_id того списка, чей пункт "
+            "меняешь, или уточни у пользователя, какой список он имел в виду.")
 
 
 def _map_deprecated_checklist_args(old_name: str, args: dict | None) -> dict:
@@ -587,6 +699,10 @@ class ReactState(MessagesState):
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
+    # #213 Срез B: детерминированный READ-интент чек-листов ({kind, name_span, confidence})
+    # для soft cross-check в tool-node. Скрыт от LLM (не аргумент). None → fail-open (write-ход /
+    # не-checklist / флаги OFF / предслой упал). Ставится на свежем ходу; сбрасывается как router_*.
+    checklist_query_ctx: dict | None
 
 
 def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
@@ -1096,6 +1212,12 @@ def _react_desc(t: Any) -> Any:
     short = _REACT_TOOL_DESC.get(t.name)
     if not short:
         return t
+    # #213 Срез B: при полном контуре write-инструменты знают про привязку source_result_id
+    # (recovery после отказа source_result_required). При OFF — описание байт-в-байт.
+    if (t.name in _CHECKLIST_WRITE_ENFORCED_213
+            and _checklist_unified() and _checklist_querykind()):
+        short = (short + " Если в ходе показано несколько списков — добавь "
+                 "source_result_id=<result_id из паспорта нужного списка>.")
     try:
         return t.model_copy(update={"description": short})
     except Exception:  # noqa: BLE001 — на всякий случай не валим сборку инструментов
@@ -2380,6 +2502,9 @@ def _build_graph(llm: Any, all_tools: list, *,
             DEPRECATED_TOOL_ALIASES as _DEPRECATED_ALIASES_213,
         )
         _unified_213 = _checklist_unified()
+        # #213 Срез B: READ-интент предслоя для cross-check (None → fail-open).
+        _cq_ctx_213 = (state.get("checklist_query_ctx")
+                       if (_unified_213 and _checklist_querykind()) else None)
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
             tc_args = tc.get("args") or {}
@@ -2403,6 +2528,36 @@ def _build_graph(llm: Any, all_tools: list, *,
                 else:
                     name = "show_checklist"
                     tc_args = {"list_id_or_title": str((tc_args or {}).get("name") or "")}
+            # #213 Срез B: soft cross-check READ-интента чек-листов (LLM-origin by construction —
+            # этот цикл и есть LLM-эмитированные вызовы; internal-пути сюда не попадают).
+            # ctx None (write-ход / не-checklist / флаги OFF / предслой упал) → fail-open, всё мимо.
+            if _cq_ctx_213 is not None and _cq_ctx_213.get("confidence") == "high":
+                _refuse = _checklist_cross_check(
+                    _cq_ctx_213, name, tc_args, session, tenant_id, user_id)
+                if _refuse is not None:
+                    _msg213, _rk213, _redirect_args = _refuse
+                    if _redirect_args is not None:
+                        # узкий редирект: ТОЛЬКО заполнение отсутствующего name (r4-контракт);
+                        # mode/инструмент не меняются, текст не пишется.
+                        tc_args = _redirect_args
+                    else:
+                        out.append(ToolMessage(
+                            content=_msg213, name=tc["name"], tool_call_id=tc["id"],
+                            artifact={"result_kind": _rk213}))  # #192: не-исполнение, честно
+                        continue
+            # #213 Срез B: write-enforcement source_result_id (приёмка п.8) — привязка ordinal-write
+            # к КОНКРЕТНОМУ items-result хода; ≥2 показанных списков без привязки → уточнение, не write.
+            if (_unified_213 and _checklist_querykind()
+                    and name in _CHECKLIST_WRITE_ENFORCED_213):
+                _src_id = str((tc_args or {}).get("source_result_id") or "").strip()
+                tc_args = {k: v for k, v in (tc_args or {}).items() if k != "source_result_id"}
+                _wmsg = _checklist_write_enforce(
+                    state["messages"], out, str((tc_args or {}).get("item_id") or ""), _src_id)
+                if _wmsg is not None:
+                    out.append(ToolMessage(
+                        content=_wmsg, name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "source_result_required"}))
+                    continue
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
             # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
@@ -3345,7 +3500,23 @@ async def handle_turn(
                            # пропустивший доменный блок (intent=чат/факт), писал бы в трейс СТАРОЕ решение
                            # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
                            # не затрагивало (бинд по allowed_*, они сброшены), только колонка лога.
-                           "router_decision_json": None}
+                           "router_decision_json": None,
+                           # #213 Срез B: сброс каждый свежий ход (last-value канал, как router_*).
+                           "checklist_query_ctx": None}
+            # #213 Срез B: детерминированный READ-интент чек-листов → soft cross-check в tool-node.
+            # ТОЛЬКО при обоих флагах; write-ходы/не-checklist → None (fail-open). Не зависит от
+            # preflight-интента: классификатор сам отсеивает нерелевантное (правила уже написаны).
+            if _checklist_unified() and _checklist_querykind():
+                try:
+                    from sreda.runtime.react_preflight import classify_checklist_query
+                    _cq = classify_checklist_query(user_text)
+                    if _cq is not None:
+                        _init["checklist_query_ctx"] = {
+                            "kind": _cq.kind, "name_span": _cq.name_span,
+                            "confidence": _cq.confidence}
+                except Exception:  # noqa: BLE001 — предслой не роняет ход (fail-open)
+                    logger.warning("react_loop: checklist_query classify failed → fail-open",
+                                   exc_info=True)
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)

@@ -516,6 +516,17 @@ class Settings(BaseSettings):
     checklist_unified_enabled: bool = Field(
         default=False, validation_alias="SREDA_CHECKLIST_UNIFIED"
     )
+    # #213 Срез B: предслойный сигнал query_kind + soft cross-check + write-enforcement.
+    # OFF (дефолт) → fail-open: голая схема среза A (или полный легаси при unified=OFF).
+    # ON (работает ТОЛЬКО при unified=ON + preflight): предслой детерминированными правилами
+    # эмитит checklist_query_kind (items|overview|search|mixed) + resolved span; исполнитель
+    # сверяет mode вызова с интентом (mismatch → структурный отказ), редиректит ТОЛЬКО
+    # отсутствующее имя (exact|unique_fuzzy по span юзера), гейтит write ordinal-привязкой
+    # source_result_id. Матрица: UNIFIED=OFF/QUERYKIND=* → легаси; ON/OFF → схема без
+    # cross-check; ON/ON → полный контур. Канарейка — срез C (plans/213-cycle-final.md).
+    checklist_querykind_enabled: bool = Field(
+        default=False, validation_alias="SREDA_CHECKLIST_QUERYKIND"
+    )
     # #221 Ф4 (канареечная раскатка execute): даже при глобальном mode=execute РЕАЛЬНО драйвить роутер
     # только для тенантов из этого списка; остальные при execute ведут себя как shadow (лог-only). Так
     # execute катится постепенно (сперва тенант Бориса → проверка «дела» → ``*`` на всех). Пусто (дефолт)
