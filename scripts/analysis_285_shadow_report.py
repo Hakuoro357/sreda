@@ -137,7 +137,17 @@ def render(agg: dict) -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
+def exit_status(agg: dict) -> int:
+    """Выходной код гейта (R2 CodexH MAJOR): 0 ТОЛЬКО когда shadow реально сработал (with_policy>0)
+    И расхождений нет; иначе 1 — чтобы автоматизация/CI не пропустили FAIL при exit 0."""
+    if agg["with_policy"] == 0:
+        return 1
+    if (agg["mismatch_web_scope"] + agg["mismatch_write_domain"]) > 0:
+        return 1
+    return 0
+
+
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", required=True,
                     help="ISO-дата начала shadow-окна (например 2026-07-04) — отрезает до-shadow историю")
@@ -148,8 +158,11 @@ def main() -> None:
             select(ReactTurnTrace).where(ReactTurnTrace.status == "done",
                                          ReactTurnTrace.created_at >= since)
         ).scalars().all()
-    print(render(compute(rows)))
+    agg = compute(rows)
+    print(render(agg))
+    return exit_status(agg)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    sys.exit(main())

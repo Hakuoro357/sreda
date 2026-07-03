@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from scripts.analysis_285_shadow_report import compute, render
+from scripts.analysis_285_shadow_report import compute, exit_status, render
 
 SENTINEL = "ПРИВАТНЫЙ_ТЕКСТ_98765"
 
@@ -104,3 +104,15 @@ def test_output_has_no_user_text():
     out = render(compute(rows))
     assert SENTINEL not in out and "tenant_z" not in out
     assert "add_task" in out  # имя инструмента расхождения — допустимый агрегат
+
+
+def test_exit_status_gate(monkeypatch):
+    """R2 CodexH MAJOR: код возврата != 0 при with_policy==0 ИЛИ расхождениях (иначе CI пропустит FAIL)."""
+    # чистый ход с полиси, без расхождений → 0
+    ok = compute([_row(_pol(True), [{"name": "web_search", "result_kind": "ok", "observed": True}])])
+    assert exit_status(ok) == 0
+    # ни одной строки с полиси (окно неверно / shadow не работает) → 1
+    assert exit_status(compute([_row(None, [])])) == 1
+    # расхождение web-scope → 1
+    bad = compute([_row(_pol(True), [{"name": "add_task", "result_kind": "ok", "observed": True}])])
+    assert exit_status(bad) == 1
