@@ -584,6 +584,10 @@ class ReactState(MessagesState):
     # compute_allowed_domains; resume читает из чекпойнта. Тип Optional — на resume старого чекпойнта = None.
     router_allowed_read_domains: list[str] | None
     router_allowed_write_domains: list[str] | None
+    # #285 Фаза B (B2b): ход идёт ЕДИНЫМ путём execute (канареечный тенант) → bind-сайты применяют
+    # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
+    # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
+    unified_execute: bool
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
@@ -1201,12 +1205,66 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
     return out
 
 
-def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any) -> str:
+def _generic_confirm_wrap(inner: Any) -> Any:
+    """#285 B2b-2: универсальный confirm для КАНДИДАТА (write без детерминированного сигнала, ярус б).
+    Как `_confirm_wrap`, но превью GENERIC — имя+сырые args, БЕЗ чтения БД (пилляр: превью не читает
+    own-data до «да»). Мутация ТОЛЬКО после «да». blanket-unlock невозможен (wrap на КАЖДОМ
+    инструменте; вторая мутация хода снова через confirm)."""
+    from langchain_core.tools import StructuredTool
+
+    def _wrapped(**kwargs: Any) -> str:
+        _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
+        _args = ", ".join(f"{k}={kwargs[k]}" for k in sorted(kwargs)) if kwargs else "без параметров"
+        decision = interrupt({
+            "confirm": f"Я поняла как «{inner.name}» ({_args}). Подтверди, и я сделаю.",
+            "key": _key})
+        if not _is_yes(str(decision)):
+            return "Хорошо, не делаю."
+        return str(inner.invoke(kwargs))
+
+    return StructuredTool.from_function(
+        func=_wrapped, name=inner.name, description=inner.description, args_schema=inner.args_schema,
+    )
+
+
+def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
+    """#285 B2b-2: фильтр набора на ЕДИНОМ пути execute. Как `_apply_domain_policy` для read, НО write
+    ВНЕ allowed_write НЕ отказывает — биндит КАНДИДАТОМ под generic confirm (ярус б). Так unsignaled
+    write = подтверждение, не тупик #281/#282; молчаливой мутации нет (write в allowed_write — прямой,
+    вне — confirm). read_pure candidate'ом НЕ открывается (кандидат только для write-класса).
+    allowed_* = None → не фильтровать (не должно случаться на unified — политика всегда ставит списки)."""
+    if allowed_read is None and allowed_write is None:
+        return tools
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_read_domains, tool_write_domains
+    ar, aw = set(allowed_read or ()), set(allowed_write or ())
+    out = []
+    for t in tools:
+        name = _TOOL_NAME_ALIASES.get(t.name, t.name)
+        if t.name in _META_TOOLS:
+            out.append(t)  # meta_scope (ask_human/need_family); delete_my_account — сигнал в дизайне B3
+        elif name not in TOOL_OP_CLASS:  # неизвестный → fail-closed
+            continue
+        elif TOOL_OP_CLASS.get(name) == "write":
+            if tool_write_domains(name) <= aw:
+                out.append(t)  # ярус (а): домен разрешён → прямой write без confirm
+            else:
+                out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
+        elif tool_read_domains(name) <= ar:
+            out.append(t)  # read_pure/read_external по allowed_read (как #221)
+    return out
+
+
+def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any,
+                             unified: bool = False) -> str:
     """#267 A: структурная причина недоступности инструмента — ЕДИНЫЙ источник для pre-scan,
     need_family-handler и unavailable-dispatch. Различает «семья не загружена» (нужен need_family) от
     «домен вне запроса» (need_family НЕ поможет). Закрывает trap: раньше need_family врал «загружена»,
     а доменный фильтр резал заново → планировщик долбился в стену до лимита проходов. Возвращает:
-    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available."""
+    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available.
+
+    unified (B2b-2): на ЕДИНОМ пути need_family грузит ЛЮБУЮ известную семью — per-tool гейт
+    `_apply_unified_policy` защищает (read по allowed_read, write вне allowed_write → кандидат+confirm),
+    поэтому загрузка безопасна и НЕ deny-all (ярус б: unsignaled write доводится до подтверждения)."""
     from sreda.services.tool_schemas.families import (
         TOOL_OP_CLASS, tool_read_domains, tool_write_domains,
     )
@@ -1216,6 +1274,8 @@ def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_wr
             return "unknown_family"
         if allowed_read is None and allowed_write is None:
             return "available"  # домен не фильтруется (legacy/disabled) → семью грузить можно
+        if unified:
+            return "available"  # единый путь: грузим любую семью; per-tool гейт защищает (ярус б)
         # семья-раздел вне разрешённых доменов → её инструменты всё равно зарежет _apply_domain_policy
         if fam not in set(allowed_read or ()) and fam not in set(allowed_write or ()):
             return "domain_blocked"
@@ -2221,7 +2281,8 @@ def _build_graph(llm: Any, all_tools: list, *,
             # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical при router_allowed=None).
             # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
             # #221 Ф3: + фильтр разрешённых разделов (execute ставит router_allowed_*; иначе None → no-op).
-            bound = _apply_domain_policy(
+            _policy_fn = _apply_unified_policy if state.get("unified_execute") else _apply_domain_policy
+            bound = _policy_fn(  # B2b-2: единый путь → candidate-write под confirm вместо отказа
                 _select_tools(all_tools, state.get("active_families")),
                 state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = system_prompt
@@ -2386,10 +2447,12 @@ def _build_graph(llm: Any, all_tools: list, *,
                             and _tool_unavailable_reason(
                                 "need_family", {"family": _pf},
                                 state.get("router_allowed_read_domains"),
-                                state.get("router_allowed_write_domains")) != "domain_blocked"):
+                                state.get("router_allowed_write_domains"),
+                                unified=bool(state.get("unified_execute"))) != "domain_blocked"):
                         active.append(_pf)
                         added = True
-        bound_by_name = {t.name: t for t in _apply_domain_policy(
+        _policy_fn = _apply_unified_policy if state.get("unified_execute") else _apply_domain_policy
+        bound_by_name = {t.name: t for t in _policy_fn(  # B2b-2: candidate-write под confirm на dispatch
             _bind_for(all_tools, active, eff),
             state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
         out = []
@@ -2451,7 +2514,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 _faw = state.get("router_allowed_write_domains")
                 # #267 A: domain_blocked → честный отказ (НЕ «загружена ok» — иначе планировщик думает,
                 # что загрузил, а доменный фильтр режет заново → trap). Семью НЕ грузим.
-                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw)
+                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw,
+                                                    unified=bool(state.get("unified_execute")))
                 if _nreason == "domain_blocked":
                     _avail = ", ".join(sorted(set(_far or []) | set(_faw or []))) or "—"
                     msg = (f"Раздел «{fam}» не относится к этому запросу (он про: {_avail}). "
@@ -2476,7 +2540,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # (need_family НЕ поможет — иначе trap: планировщик долбится в need_family по кругу).
                 _ufar = state.get("router_allowed_read_domains")
                 _ufaw = state.get("router_allowed_write_domains")
-                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw)
+                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw,
+                                                    unified=bool(state.get("unified_execute")))
                 if _ureason == "domain_blocked":
                     _uavail = ", ".join(sorted(set(_ufar or []) | set(_ufaw or []))) or "—"
                     _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
@@ -3376,7 +3441,9 @@ async def handle_turn(
                            "router_decision_json": None,
                            # #285 Фаза A: сброс полиси-канала на свежем ходе (дисциплина last-value
                            # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
-                           "turn_policy_json": None}
+                           "turn_policy_json": None,
+                           # #285 B2b: сброс флага единого пути (override ниже ставит True для канарейки).
+                           "unified_execute": False}
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
@@ -3459,6 +3526,7 @@ async def handle_turn(
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
+                    _init["unified_execute"] = True  # B2b-2: bind-сайты → _apply_unified_policy (candidate)
                     _init["router_allowed_read_domains"] = _uar
                     _init["router_allowed_write_domains"] = _uaw
                     _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
