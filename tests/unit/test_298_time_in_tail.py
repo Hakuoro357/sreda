@@ -197,9 +197,10 @@ async def test_time_before_directives_247(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_time_insert_on_after_tool_pass(db_session, monkeypatch):
-    """R1 high MAJOR: на проходе после инструментов (хвост = ToolMessage) вставки НЕТ -
-    отдельный user «Сейчас…» не вклинивается перед синтезом по tool-result."""
+async def test_time_anchor_on_after_tool_pass(db_session, monkeypatch):
+    """R2 Claude MAJOR: якорь времени есть на ВСЕХ проходах хода - на синтез-проходе после
+    инструментов строка приклеена к ПОСЛЕДНЕМУ user (в середине контекста), отдельный user
+    после tool-result НЕ вклинивается (R1 high), строка ЗАМОРОЖЕНА на ход (байты идентичны)."""
     _flag_time(monkeypatch, True)
     u = seed_telegram_user(db_session)
 
@@ -216,15 +217,17 @@ async def test_no_time_insert_on_after_tool_pass(db_session, monkeypatch):
         inbound_message_id="298-tool-1-msg", channel="react",
     )
     assert len(stub.seen_messages) >= 2, "ожидались два прохода (tool_call + синтез)"
-    batch2 = stub.seen_messages[-1]
-    # хвост второго прохода - НЕ HumanMessage с временем
-    assert not isinstance(batch2[-1], HumanMessage) or not _TIME_RE.search(
-        str(batch2[-1].content)), (
-        f"на after-tool проходе не должно быть time-вставки: {batch2[-1]!r}")
-    # и вообще НОВЫХ вставок времени во 2-м проходе нет (вставка 1-го эфемерна,
-    # user-сообщение канона чистое)
-    hits = [m for m in batch2 if isinstance(m, HumanMessage) and _TIME_RE.search(str(m.content))]
-    assert not hits, f"time-вставок во 2-м проходе быть не должно: {hits}"
+    batch1, batch2 = stub.seen_messages[0], stub.seen_messages[-1]
+    # (i) хвост второго прохода - tool-result, НЕ вклиненный user
+    assert not isinstance(batch2[-1], HumanMessage), (
+        f"после tool-result не должно быть вклиненного user: {batch2[-1]!r}")
+    # (ii) якорь времени на синтез-проходе ЕСТЬ - в последнем user (середина контекста)
+    hits2 = [m for m in batch2 if isinstance(m, HumanMessage) and _TIME_RE.search(str(m.content))]
+    assert len(hits2) == 1, f"якорь времени на синтез-проходе: ожидался ровно 1, есть {len(hits2)}"
+    # (iii) заморозка: строка времени идентична проходу 1 (intra-turn кеш)
+    hits1 = [m for m in batch1 if isinstance(m, HumanMessage) and _TIME_RE.search(str(m.content))]
+    assert hits1 and _TIME_RE.search(str(hits1[-1].content)).group(0) == \
+        _TIME_RE.search(str(hits2[0].content)).group(0), "строка должна быть заморожена на ход"
 
 
 @pytest.mark.asyncio
