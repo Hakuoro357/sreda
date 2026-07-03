@@ -178,12 +178,14 @@ def _slow_turns_block(settings: Any, now: datetime) -> dict:
             # объясняет <50% общего времени — трейс НЕ разметил, куда ушло
             # остальное (владелец 2026-07-03: ход 39с с «voice.transcribe
             # 0.8с» вводил в заблуждение). Тогда честно «между стадиями».
+            # effective_ms, не duration_ms: react.llm несёт латентность в мете
+            # (#255-фикс TOTAL), иначе LLM-ход падал бы в «не размечено».
             top_stage = ""
-            stages = [s for s in t.stages if s.duration_ms]
+            stages = [s for s in t.stages if s.effective_ms]
             total = t.total_ms or 0
             if stages:
-                s = max(stages, key=lambda s: s.duration_ms or 0)
-                dur = s.duration_ms or 0
+                s = max(stages, key=lambda s: s.effective_ms or 0)
+                dur = s.effective_ms or 0
                 if total and dur < total * 0.5:
                     top_stage = "между стадиями (не размечено)"
                 else:

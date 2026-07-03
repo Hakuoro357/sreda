@@ -1306,8 +1306,12 @@ def _emit_react_timeline(lcs, tcs, passes, intent, intent_meta) -> None:
         _im = intent_meta or {}
         _tltrace.record("react.classified", intent=(intent or "?"), source=_im.get("source"))
         for _i, c in enumerate(lcs or []):
+            # latency в МЕТУ (latency_ms), НЕ в duration_ms: эти события пишутся в КОНЦЕ хода
+            # (at_ms=конец), а duration_ms там раздул бы TOTAL блока (emit_block: max(at_ms+duration))
+            # — показывал бы «конец+latency» вместо реального времени хода (react_loop.replied). Мету
+            # парсер react.* рендерит (префикс-правило).
             _tltrace.record(
-                "react.llm", duration_ms=int(c.get("latency_ms") or 0),
+                "react.llm", latency_ms=int(c.get("latency_ms") or 0),
                 provider_key=c.get("provider_key"), model=c.get("model"),
                 intent=c.get("intent"), fallback_fired=bool(c.get("fallback_fired")),
                 primary_error=c.get("primary_error"), call_index=c.get("call_index", _i))

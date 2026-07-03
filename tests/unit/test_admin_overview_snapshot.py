@@ -19,6 +19,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.admin import overview_snapshot as ov
+from sreda.admin.trace_parser import ParsedStage
 from sreda.db.base import Base
 from sreda.db.models.skill_platform import SkillAIExecution
 
@@ -119,7 +120,8 @@ def test_slow_turns_from_traces(session, fake_settings, monkeypatch):
     fake_traces = [
         NS(timestamp="2026-07-02 22:05:03.160", user_id="user_tg_755682022",
            channel="max", total_ms=30_282,
-           stages=[NS(name="llm", duration_ms=28_000), NS(name="tools", duration_ms=1_500)]),
+           stages=[ParsedStage(at_ms=0, name="llm", duration_ms=28_000, meta={}),
+                   ParsedStage(at_ms=0, name="tools", duration_ms=1_500, meta={})]),
         NS(timestamp="2020-01-01 00:00:00.000", user_id="old", channel="tg",
            total_ms=99_000, stages=[]),  # старше 24ч — вне окна
     ]
@@ -142,7 +144,8 @@ def test_slow_turns_unattributed_stage(fake_settings, monkeypatch):
     from types import SimpleNamespace as NS
     from datetime import UTC, datetime
     traces = [NS(timestamp="2026-07-03 05:30:00.000", user_id="u", channel="tg",
-                 total_ms=39_000, stages=[NS(name="voice.transcribe", duration_ms=800)])]
+                 total_ms=39_000,
+                 stages=[ParsedStage(at_ms=0, name="voice.transcribe", duration_ms=800, meta={})])]
     monkeypatch.setattr("sreda.admin.trace_parser.parse_trace_log",
                         lambda path, **kw: traces)
     fake_settings.trace_log_path = "/x"
