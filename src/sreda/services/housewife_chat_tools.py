@@ -3218,9 +3218,16 @@ def build_housewife_tools(
         cl = res.checklist
         matched_by = "exact" if res.status == "exact" else "fuzzy"
         safe_title = cl.title.replace('"', "'").replace("\n", " ").replace("\r", " ")
-        head = (f"result_type=items result_id={rid} checklist_name=\"{safe_title}\" "
-                f"checklist_id={cl.id} matched_by={matched_by} resolution_status={res.status}")
         items = checklist_service.list_items(list_id=cl.id)
+        # #213 Срез C (M5): item_ids — ДОВЕРЕННЫЙ паспорт (реальные id пунктов), в head ПЕРЕД
+        # свободным checklist_name. Служебные поля впереди, название в кавычках В КОНЦЕ —
+        # write-enforcement/membership читают из head как key=value (не из тела, где название
+        # пункта «[clitem_подделка]» могло бы вклиниться; не substring, чтобы список с именем
+        # «resolution_status=ambiguous» не выключался ложно).
+        _ids_csv = ",".join(it.id for it in items)
+        head = (f"result_type=items result_id={rid} resolution_status={res.status} "
+                f"matched_by={matched_by} checklist_id={cl.id} items={_ids_csv or '-'} "
+                f"checklist_name=\"{safe_title}\"")
         if not items:
             return head + f"\nempty: list={cl.id} title={cl.title!r}"
         lines = [head]

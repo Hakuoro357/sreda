@@ -295,6 +295,19 @@ def _checklist_cross_check(ctx: dict, name: str, args: dict | None,
     return None
 
 
+def _parse_passport_fields(head: str) -> dict:
+    """#213 Срез C (M5): первая строка envelope → key=value dict (кавычки-aware).
+    Служебные поля (result_type/result_id/resolution_status/items/checklist_id) идут ДО
+    свободного checklist_name="…" — их значения не содержат пробелов; название в кавычках
+    парсится как одно значение, его содержимое НЕ создаёт ложных полей."""
+    import re as _re
+    out: dict = {}
+    for m in _re.finditer(r'(\w+)=("[^"]*"|\S+)', head or ""):
+        v = m.group(2)
+        out[m.group(1)] = v[1:-1] if v.startswith('"') and v.endswith('"') else v
+    return out
+
+
 def _checklist_write_enforce(history: list, batch_out: list,
                              item_id: str, source_result_id: str,
                              pending_batch_reads: int = 0) -> str | None:
@@ -317,12 +330,16 @@ def _checklist_write_enforce(history: list, batch_out: list,
         head = c.splitlines()[0] if c else ""
         if not head.startswith("result_type=items"):
             continue
-        if "resolution_status=not_found" in head or "resolution_status=ambiguous" in head:
+        # #213 Срез C (M5): парсим head как key=value (кавычки-aware) — resolution_status и
+        # item-membership берём из ДОВЕРЕННЫХ полей паспорта, НЕ substring по head и НЕ из тела
+        # (иначе название списка «resolution_status=ambiguous» или пункт «[clitem_x]» искажали бы).
+        fields = _parse_passport_fields(head)
+        if fields.get("resolution_status") in ("not_found", "ambiguous"):
             continue
-        rid_m = re.search(r"result_id=(\S+)", head)
-        ids = set(re.findall(r"\[(clitem_[0-9a-f]+)\]", c))
-        if rid_m and ids:
-            results.append((rid_m.group(1), ids))
+        rid = fields.get("result_id")
+        ids = {t for t in (fields.get("items") or "").split(",") if t.startswith("clitem_")}
+        if rid and ids:
+            results.append((rid, ids))
     if len(results) + max(pending_batch_reads, 0) < 2:
         return None
     if len(results) < 2 and not source_result_id:
@@ -2606,6 +2623,7 @@ def _build_graph(llm: Any, all_tools: list, *,
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
             tc_args = tc.get("args") or {}
+            _redirected_213 = False  # #213 Срез C (M9): был ли редирект имени для этого вызова
             # #213 Срез A: LLM-origin вызов депрекейт-алиаса при unified=ON канонизируется в
             # get_checklist ЗДЕСЬ — ДО unavailable-ветки (иначе family_not_loaded-петля) и ДО
             # диспетча. Durable-история (#193) праймит модель старыми именами (прецедент #221) —
@@ -2638,6 +2656,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                         # узкий редирект: ТОЛЬКО заполнение отсутствующего name (r4-контракт);
                         # mode/инструмент не меняются, текст не пишется.
                         tc_args = _redirect_args
+                        _redirected_213 = True  # #213 Срез C (M9): пометка для метрик
                     else:
                         out.append(ToolMessage(
                             content=_msg213, name=tc["name"], tool_call_id=tc["id"],
@@ -2775,6 +2794,19 @@ def _build_graph(llm: Any, all_tools: list, *,
                     "latency_ms": int((_time.perf_counter() - _t) * 1000)}
             if name != tc["name"]:
                 _art["canonicalized_to"] = name
+            # #213 Срез C (M9): различимый result_kind для метрик канарейки. Редирект +
+            # исход паспорта (name_required/ambiguous/not_found) — из ДОВЕРЕННОГО head.
+            # Метрики замера (redirect_rate/ambiguous_rate/name_required_rate) выводятся из
+            # tool_calls_json.result_kind, без нового поля.
+            if _redirected_213:
+                _art["result_kind"] = "checklist_redirect"
+            elif name == "get_checklist":
+                _rc = str(res)
+                _hf = _parse_passport_fields(_rc.splitlines()[0] if _rc else "")
+                if "error: name_required" in _rc:
+                    _art["result_kind"] = "name_required"
+                elif _hf.get("resolution_status") in ("ambiguous", "not_found"):
+                    _art["result_kind"] = _hf["resolution_status"]
             out.append(ToolMessage(content=str(res), name=tc["name"], tool_call_id=tc["id"],
                                    artifact=_art))
             if (name in _CORE_MUTATING_TOOLS
@@ -3770,6 +3802,22 @@ async def handle_turn(
                     _lcs_all, _msgs_all, _lcs0, _msgs0, tenant_id=tenant_id)
                 # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
                 _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
+                # #213 Срез C (M9): kind/confidence классификатора чек-листов → в трейс (для метрик
+                # канарейки: mismatch/redirect/ambiguous rate берутся из tool_calls_json.result_kind,
+                # а query_kind — отсюда). Дописываем в routing_decision_json (та же колонка), только
+                # когда ctx был (флаг ON) → OFF по-прежнему без новых данных.
+                _cqctx = result.get("checklist_query_ctx") if isinstance(result, dict) else None
+                if _cqctx:
+                    try:
+                        _rdo = json.loads(_rdj) if _rdj else {}
+                        _rdo["checklist_query"] = {
+                            "kind": _cqctx.get("kind"),
+                            "confidence": _cqctx.get("confidence"),
+                            "has_span": bool(_cqctx.get("name_span")),
+                        }
+                        _rdj = json.dumps(_rdo, ensure_ascii=False)
+                    except Exception:  # noqa: BLE001 — метрика best-effort, трейс не теряем
+                        pass
                 _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0
                 # #285 Фаза A: снапшот полиси из финального состояния (переживает паузу/resume)
                 # + события хода (guard/resume/passes) — guard-каунты для выхода фазы (R1 CodexH).
