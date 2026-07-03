@@ -213,6 +213,16 @@ _CHECKLIST_WRITE_ENFORCED_213 = frozenset(
     {"mark_checklist_item_done", "delete_checklist_item", "update_checklist_item"})
 
 
+def _token_in_text(needle: str, text: str) -> bool:
+    """#213 Срез B (R3 Codex medium): подстрока по ГРАНИЦАМ токена (кириллица+латиница+цифры),
+    не голый `in` — «ход» НЕ считается названным в «поход». needle может быть многословным."""
+    import re as _re
+    if not needle or not text:
+        return False
+    return _re.search(
+        r"(?<![а-яёa-z0-9])" + _re.escape(needle) + r"(?![а-яёa-z0-9])", text) is not None
+
+
 def _checklist_cross_check(ctx: dict, name: str, args: dict | None,
                            session: Any, tenant_id: str, user_id: str):
     """#213 Срез B: сверка вызова с READ-интентом предслоя (plans/213-cycle-final.md п.3).
@@ -257,8 +267,9 @@ def _checklist_cross_check(ctx: dict, name: str, args: dict | None,
             # #213 Срез B (R2 Claude B1): компаунд items+items — если имя модели РЕАЛЬНО
             # названо юзером в тексте хода («в списке кино И в списке машина»: span=«кино»,
             # но «машина» тоже в тексте), это легитимный второй список, НЕ конфликт. Пропускаем.
+            # R3 Codex medium MINOR: по ГРАНИЦАМ токена, не substring («ход» ⊄ «поход»).
             _utn = str(ctx.get("user_text_norm") or "")
-            if nm and _utn and nm.lower() in _utn:
+            if nm and _utn and _token_in_text(nm.lower(), _utn):
                 return None
             r_model = _svc.resolve_list_by_title_ranked(
                 tenant_id=tenant_id, user_id=user_id, needle=nm)
@@ -2588,9 +2599,14 @@ def _build_graph(llm: Any, all_tools: list, *,
                         continue
             # #213 Срез B: write-enforcement source_result_id (приёмка п.8) — привязка ordinal-write
             # к КОНКРЕТНОМУ items-result хода; ≥2 показанных списков без привязки → уточнение, не write.
-            if _sliceB_213 and name in _CHECKLIST_WRITE_ENFORCED_213:
+            # source_result_id — СЛУЖЕБНЫЙ аргумент (нет в схеме инструмента): вычищаем БЕЗУСЛОВНО
+            # при unified (R3 Codex high MINOR: strip не должен гейтиться preflight — иначе при
+            # preflight=OFF модель, праймленная desc-хинтом, дотащит лишний аргумент до write-tool).
+            _src_id = ""
+            if _unified_213 and name in _CHECKLIST_WRITE_ENFORCED_213:
                 _src_id = str((tc_args or {}).get("source_result_id") or "").strip()
                 tc_args = {k: v for k, v in (tc_args or {}).items() if k != "source_result_id"}
+            if _sliceB_213 and name in _CHECKLIST_WRITE_ENFORCED_213:
                 # pending = items-read вызовы батча, ещё НЕ обработанные (нет ToolMessage
                 # в out с их tool_call_id) — исполненные видны через out; загейченные тоже
                 # обработаны (их отказ в out) → не pending (R2 medium MINOR).

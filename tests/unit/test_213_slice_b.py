@@ -712,3 +712,69 @@ async def test_write_enforcement_off_when_flags_off(db_session, monkeypatch):
     tm = _tool_message_for(stub, "e1")
     assert tm is not None
     assert "ok:done" in str(tm.content), tm.content
+
+
+# --- фиксы R3 Codex (границы токена, безусловный strip) --------------------
+
+
+def test_token_in_text_boundaries():
+    """R3 medium: «ход» не считается названным в «поход» (границы токена, не substring)."""
+    from sreda.runtime.react_loop import _token_in_text
+    assert _token_in_text("поход", "что в списке кино и поход")
+    assert not _token_in_text("ход", "покажи список поход")
+    assert _token_in_text("кино", "покажи список кино")
+    assert not _token_in_text("ино", "покажи список кино")
+
+
+@pytest.mark.asyncio
+async def test_compound_substring_name_not_false_matched(db_session, monkeypatch):
+    """R3 medium: список «ход», запрос про «поход» — вызов «ход» (не названный юзером)
+    при span=«поход» конфликтует (не проходит по ложному substring)."""
+    _flags(monkeypatch, unified=True, querykind=True)
+    u = seed_telegram_user(db_session)
+    svc = ChecklistService(db_session)
+    p = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="поход")
+    svc.add_items(list_id=p.id, items=["Палатка"])
+    h = svc.create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="ход")
+    svc.add_items(list_id=h.id, items=["Шахматы"])
+    db_session.commit()
+
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "get_checklist", "args": {"mode": "items", "name": "ход"}, "id": "ts1",
+        }]),
+        AIMessage(content="Уточню."),
+    ])
+    await _turn(db_session, u, stub, "покажи список поход", "213b-ts-1")
+    tm = _tool_message_for(stub, "ts1")
+    assert tm is not None
+    assert "name_conflict" in str(tm.content), (
+        f"«ход» не названо юзером (только «поход») → конфликт: {tm.content}")
+
+
+@pytest.mark.asyncio
+async def test_source_result_id_stripped_without_preflight(db_session, monkeypatch):
+    """R3 high: source_result_id вычищается из args даже при preflight=OFF (служебный
+    аргумент не доезжает до write-tool)."""
+    _flags(monkeypatch, unified=True, querykind=True, preflight=False)
+    u = seed_telegram_user(db_session)
+    cl = _seed_kino(db_session, u)
+    svc = ChecklistService(db_session)
+    (it,), _ = svc.add_items(list_id=cl.id, items=["лопата"])
+    db_session.commit()
+
+    stub = _RecordingStubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "mark_checklist_item_done",
+            "args": {"item_id": it.id, "source_result_id": "rXXXX"}, "id": "sr1",
+        }]),
+        AIMessage(content="Готово."),
+    ])
+    await _turn(db_session, u, stub, "отметь лопату", "213b-sr-1")
+    tm = _tool_message_for(stub, "sr1")
+    assert tm is not None
+    # инструмент исполнился (лишний аргумент не сломал вызов), enforcement инертен без preflight
+    assert "ok:done" in str(tm.content), tm.content
+    db_session.expire_all()
+    from sreda.db.models.checklists import ChecklistItem
+    assert db_session.get(ChecklistItem, it.id).status == "done"
