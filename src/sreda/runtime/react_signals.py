@@ -105,6 +105,9 @@ _META_BEFORE = re.compile(
 # глаголом речи (иначе далёкий «сказал» в другой клаузе ложно глушил бы команду).
 _REPORTED_AFTER = re.compile(r",\s*(?:" + _REPORTED + r")\b", re.IGNORECASE)
 _QUOTE = re.compile(r"[«»\"“”„‘’]")
+# реплика/ярлык говорящего перед совпадением: «мама: удали…», «он мне: удали…» (B2 R5 CodexH —
+# reported-речь без глагола, только двоеточие). Двоеточие в хвосте before → цитируемая реплика.
+_DIALOGUE_COLON = re.compile(r":\s*$")
 # R2 CodexM: «напомни, как меня зовут» — «напомни» write-глагол, но WH-фрейм = ЧИТАТЕЛЬСКИЙ запрос
 # (напомни/скажи мне ЧТО/КАК/КТО…, не создать напоминание). Только «напомни» (не «запомни» — там
 # «запомни, какой у меня рост» = write). Over-suppress безопасен (промах → ярус (б) confirm).
@@ -121,6 +124,8 @@ def _framed(text: str, start: int, end: int) -> bool:
     if _NEG_BEFORE.search(before):  # «не» (любой разделитель) перед совпадением
         return True
     if _META_BEFORE.search(before):  # мета-рамка/косвенная речь/просьба перед совпадением
+        return True
+    if _DIALOGUE_COLON.search(before):  # «мама: удали…» — реплика/ярлык говорящего (B2 R5 CodexH)
         return True
     if _REPORTED_AFTER.search(after):  # атрибуция ПОСЛЕ: «…, сказал он» (R5 CodexH/субагент)
         return True
