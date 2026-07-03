@@ -39,6 +39,7 @@ class TunnelStatus:
     unit: str
     active: str = "unknown"             # "active" | "inactive" | "failed" | "unknown"
     nrestarts: int | None = None        # cumulative auto-restarts (churn signal)
+    uptime_hours: float | None = None   # hours since last (re)start — the useful signal
 
 
 # --- seams (monkeypatched in tests) ----------------------------------------
@@ -124,21 +125,55 @@ def get_host_metrics(disk_path: str = "/") -> HostMetrics:
 # --- tunnel status ----------------------------------------------------------
 
 def get_tunnel_status(unit: str) -> TunnelStatus:
-    """One batched ``systemctl show`` call per unit (R1: 2 calls → 1).
+    """One batched ``systemctl show`` call per unit.
 
-    ``--value`` prints one property per line in the requested order:
-    ActiveState first, NRestarts second.
+    ПРОД-ИНЦИДЕНТ 2026-07-03: с ``--value`` systemctl печатает свойства в
+    АЛФАВИТНОМ порядке (не в порядке запроса) → NRestarts=1098 встал
+    первой строкой и «1098» отрисовался как статус. Парсим ``Key=Value``
+    (без ``--value``) — порядок строк безразличен. Uptime — фидбек
+    владельца: накопительный NRestarts пугает, «жив N ч» полезнее.
     """
     st = TunnelStatus(unit=unit)
-    out = _systemctl(["show", "-p", "ActiveState,NRestarts", "--value", unit])
+    out = _systemctl([
+        "show", "-p", "ActiveState,NRestarts,ActiveEnterTimestamp", unit,
+    ])
     if out is None:
         return st  # systemctl недоступен → "unknown"/None
-    lines = out.splitlines()
-    if lines and lines[0].strip():
-        st.active = lines[0].strip()
-    if len(lines) > 1 and lines[1].strip().isdigit():
-        st.nrestarts = int(lines[1].strip())
+    kv: dict[str, str] = {}
+    for line in out.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            kv[k.strip()] = v.strip()
+    if kv.get("ActiveState"):
+        st.active = kv["ActiveState"]
+    if kv.get("NRestarts", "").isdigit():
+        st.nrestarts = int(kv["NRestarts"])
+    if kv.get("ActiveEnterTimestamp"):
+        st.uptime_hours = _uptime_hours(kv["ActiveEnterTimestamp"])
     return st
+
+
+def _uptime_hours(active_enter: str) -> float | None:
+    """systemd 'Wed 2026-07-01 12:01:27 UTC' → часы с момента старта."""
+    if not active_enter:
+        return None
+    from datetime import UTC, datetime
+
+    parts = active_enter.split()
+    # форма: [День] YYYY-MM-DD HH:MM:SS [TZ] — берём дату+время
+    for i, tok in enumerate(parts):
+        if len(tok) == 10 and tok[4] == "-" and i + 1 < len(parts):
+            try:
+                dt = datetime.fromisoformat(f"{tok} {parts[i + 1]}")
+            except ValueError:
+                return None
+            tz = parts[i + 2] if i + 2 < len(parts) else "UTC"
+            if tz != "UTC":
+                return None  # незнакомый пояс — честнее «—», чем враньё
+            dt = dt.replace(tzinfo=UTC)
+            hours = (datetime.now(UTC) - dt).total_seconds() / 3600
+            return round(hours, 1) if hours >= 0 else None
+    return None
 
 
 def get_egress_tunnels() -> list[TunnelStatus]:

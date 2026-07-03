@@ -53,6 +53,7 @@ def _exec_row(
     latency_ms: int = 500,
     age_hours: float = 1.0,
     error_code: str | None = None,
+    task_type: str = "chat",
 ) -> SkillAIExecution:
     n = next(_SEQ)
     return SkillAIExecution(
@@ -60,7 +61,7 @@ def _exec_row(
         run_id=f"run_{n}",
         tenant_id="tenant_test",
         feature_key="housewife_assistant",
-        task_type="chat",
+        task_type=task_type,
         provider_key=provider_key,
         model=model,
         status=status,
@@ -88,34 +89,194 @@ def _no_network(monkeypatch):
     )
 
 
-def test_llm_24h_counts_errors_and_slow(session, fake_settings):
+def test_llm_24h_counts_errors(session, fake_settings):
     session.add_all([
         _exec_row(),                                   # ok
         _exec_row(status="failed", error_code="timeout"),
         _exec_row(status="validation_failed"),
-        _exec_row(latency_ms=45_000),                  # slow
         _exec_row(age_hours=30),                       # вне окна 24ч
     ])
     session.commit()
     payload = ov.compute_overview(session, fake_settings)
     blk = payload["llm_24h"]
-    assert blk["calls"] == 4          # строка age=30h не в окне
+    assert blk["calls"] == 3          # строка age=30h не в окне
     assert blk["errors"] == 2
-    assert blk["error_rate_pct"] == 50.0
-    assert blk["slow"] == 1
+    assert "slow" not in blk          # медленные теперь из трейсов (slow_turns)
 
 
-def test_errors_and_slow_lists_shapes(session, fake_settings):
-    session.add_all([
-        _exec_row(status="failed", error_code="timeout", model="mercury-2"),
-        _exec_row(latency_ms=61_000),
-    ])
+def test_errors_list_shape(session, fake_settings):
+    session.add(_exec_row(status="failed", error_code="timeout", model="mercury-2"))
     session.commit()
     payload = ov.compute_overview(session, fake_settings)
     err = payload["errors_recent"]
     assert len(err) == 1 and err[0]["error_code"] == "timeout"
-    slow = payload["slow_recent"]
-    assert len(slow) == 1 and slow[0]["latency_ms"] == 61_000
+
+
+def test_slow_turns_from_traces(session, fake_settings, monkeypatch):
+    """«Медленные» = турны из trace.log (latency_ms в БД пуст на прод-пути)."""
+    from types import SimpleNamespace as NS
+
+    fake_traces = [
+        NS(timestamp="2026-07-02 22:05:03.160", user_id="user_tg_755682022",
+           channel="max", total_ms=30_282,
+           stages=[NS(name="llm", duration_ms=28_000), NS(name="tools", duration_ms=1_500)]),
+        NS(timestamp="2020-01-01 00:00:00.000", user_id="old", channel="tg",
+           total_ms=99_000, stages=[]),  # старше 24ч — вне окна
+    ]
+    monkeypatch.setattr(
+        "sreda.admin.trace_parser.parse_trace_log",
+        lambda path, **kw: fake_traces,
+    )
+    fake_settings.trace_log_path = "/var/log/sreda/trace.log"
+    from datetime import UTC, datetime
+    blk = ov._slow_turns_block(fake_settings, datetime(2026, 7, 3, 6, 0, tzinfo=UTC))
+    assert blk["count_24h"] == 1
+    r = blk["recent"][0]
+    assert r["total_ms"] == 30_282 and r["channel"] == "max"
+    assert r["top_stage"] == "llm 28.0 с"
+
+
+def test_slow_turns_unattributed_stage(fake_settings, monkeypatch):
+    """Фикс владельца 2026-07-03: топ-стадия объясняет <50% времени →
+    «между стадиями», а не вводящее в заблуждение «voice.transcribe 0.8с»."""
+    from types import SimpleNamespace as NS
+    from datetime import UTC, datetime
+    traces = [NS(timestamp="2026-07-03 05:30:00.000", user_id="u", channel="tg",
+                 total_ms=39_000, stages=[NS(name="voice.transcribe", duration_ms=800)])]
+    monkeypatch.setattr("sreda.admin.trace_parser.parse_trace_log",
+                        lambda path, **kw: traces)
+    fake_settings.trace_log_path = "/x"
+    blk = ov._slow_turns_block(fake_settings, datetime(2026, 7, 3, 6, 0, tzinfo=UTC))
+    assert blk["recent"][0]["top_stage"] == "между стадиями (не размечено)"
+
+
+def test_health_from_live_react_turns(session, fake_settings):
+    """Здоровье — по живым react_turn (agent_runs мёртв с 23.06):
+    ход = уникальный run_id, проблема = run с ошибочным react_turn."""
+    from datetime import UTC, datetime, timedelta
+
+    def row(run, status, age_h=1.0):
+        return _exec_row(task_type="react_turn", status=status,
+                         provider_key="inception-mercury2", age_hours=age_h)
+    rows = []
+    # 3 хода (run_1..3), у run_2 — ошибка; + шум: summary и старый react_turn
+    for i, (run, st) in enumerate([("run_a","succeeded"),("run_a","succeeded"),
+                                    ("run_b","failed"),("run_c","succeeded")]):
+        r = _exec_row(task_type="react_turn", status=st)
+        r.run_id = run
+        rows.append(r)
+    old = _exec_row(task_type="react_turn", status="succeeded", age_hours=30); old.run_id="run_old"
+    summ = _exec_row(task_type="summary", status="succeeded"); summ.run_id="run_s"
+    rows += [old, summ]
+    session.add_all(rows); session.commit()
+    blk = ov._health_block(session, datetime.now(UTC))
+    assert blk["turns_total"] == 3           # run_a/b/c (run_old вне 24ч, summary не react_turn)
+    assert blk["failures_total"] == 1        # только run_b
+    assert "runs_failed" not in blk          # мёртвые agent_runs-поля убраны
+
+
+def test_health_failures_distinct_run_not_execution_count(session, fake_settings):
+    """R1 субагент (опровержение): run с ДВУМЯ ошибочными react_turn — это
+    ОДИН проблемный ход, не два (failures_total = distinct run_id с ошибкой,
+    а не count ошибочных строк)."""
+    from datetime import UTC, datetime
+    rows = []
+    for st in ("failed", "validation_failed"):        # 2 ошибки в ОДНОМ run
+        r = _exec_row(task_type="react_turn", status=st); r.run_id = "run_x"; rows.append(r)
+    ok = _exec_row(task_type="react_turn", status="succeeded"); ok.run_id = "run_y"; rows.append(ok)
+    session.add_all(rows); session.commit()
+    blk = ov._health_block(session, datetime.now(UTC))
+    assert blk["turns_total"] == 2        # run_x + run_y
+    assert blk["failures_total"] == 1     # run_x ОДИН раз, НЕ 2
+
+
+def test_slow_turns_failsoft_no_path(fake_settings):
+    from datetime import UTC, datetime
+    blk = ov._slow_turns_block(fake_settings, datetime.now(UTC))
+    assert blk == {"count_24h": 0, "recent": []}
+
+
+def test_users_block_counts(session, fake_settings):
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import text
+    now = datetime.now(UTC)
+    for tid, age_days in (("t_new", 0), ("t_week", 3), ("t_old", 40)):
+        session.execute(text(
+            "INSERT INTO tenants (id, name, created_at) VALUES (:i, :n, :c)"
+        ), {"i": tid, "n": "x", "c": now - timedelta(days=age_days)})
+    session.commit()
+    blk = ov._users_block(session, now)
+    assert blk["total"] == 3
+    assert blk["new_7d"] == 2
+    assert blk["new_today"] >= 1  # t_new (граница дня MSK)
+
+
+def test_users_block_msk_day_boundary(session, fake_settings):
+    """R1 (high+medium MAJOR): 21:30 UTC = 00:30 MSK СЛЕДУЮЩЕГО дня —
+    тенант, созданный в 21:05 UTC, должен попасть в «сегодня» по Москве."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import text
+    now = datetime(2026, 7, 2, 21, 30, tzinfo=UTC)  # 03.07 00:30 МСК
+    session.execute(text(
+        "INSERT INTO tenants (id, name, created_at) VALUES ('t_msk','x',:c)"
+    ), {"c": datetime(2026, 7, 2, 21, 5, tzinfo=UTC)})  # 03.07 00:05 МСК
+    session.commit()
+    blk = ov._users_block(session, now)
+    assert blk["new_today"] == 1  # по UTC-дате было бы 0 — день 02.07
+
+
+def test_purchases_paid_without_paid_at_counted(session, fake_settings):
+    """R1 (субагент MAJOR): paid-заказ с paid_at=NULL не должен выпадать
+    (fallback на created_at)."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import text
+
+    from sreda.db.models.billing import PaymentOrder
+    now = datetime.now(UTC)
+    session.execute(text(
+        "INSERT INTO tenants (id, name, created_at) VALUES ('t2','x',:c)"), {"c": now})
+    session.add(PaymentOrder(
+        id="onull", tenant_id="t2", provider_key="yookassa", order_type="sub",
+        status="paid", amount_rub=700, description="d",
+        paid_at=None, created_at=now - timedelta(days=1)))
+    session.commit()
+    blk = ov._purchases_block(session, now)
+    assert blk["orders_7d"] == 1 and blk["sum_rub_7d"] == 700
+
+
+def test_purchases_block_counts(session, fake_settings):
+    from datetime import UTC, datetime, timedelta
+
+    from sreda.db.models.billing import PaymentOrder
+    now = datetime.now(UTC)
+    session.execute(  # тенант для FK-читаемости (sqlite FK не форсит, но честно)
+        __import__("sqlalchemy").text(
+            "INSERT INTO tenants (id, name, created_at) VALUES ('t1','x',:c)"),
+        {"c": now})
+    session.add_all([
+        PaymentOrder(id="o1", tenant_id="t1", provider_key="yookassa",
+                     order_type="sub", status="paid", amount_rub=500,
+                     description="d", paid_at=now - timedelta(days=2)),
+        PaymentOrder(id="o2", tenant_id="t1", provider_key="yookassa",
+                     order_type="sub", status="paid", amount_rub=300,
+                     description="d", paid_at=now - timedelta(days=20)),
+        PaymentOrder(id="o3", tenant_id="t1", provider_key="yookassa",
+                     order_type="sub", status="created", amount_rub=999,
+                     description="d"),  # НЕ оплачен — не считается
+        # stub-заказ (заглушка раннего дева) — НЕ выручка, НЕ считается
+        PaymentOrder(id="o4", tenant_id="t_stub", provider_key="stub",
+                     order_type="initial_purchase", status="paid",
+                     amount_rub=2990, description="d",
+                     paid_at=now - timedelta(days=1)),
+    ])
+    session.commit()
+    blk = ov._purchases_block(session, now)
+    assert blk["paid_tenants"] == 1              # только t1 (t_stub исключён)
+    assert blk["orders_7d"] == 1 and blk["sum_rub_7d"] == 500
+    assert blk["orders_30d"] == 2 and blk["sum_rub_30d"] == 800  # stub не в сумме
 
 
 def test_cost_priced_pair_uses_confirmed_price(session, fake_settings):
@@ -149,6 +310,41 @@ def test_cost_unpriced_pair_no_invented_dollars(session, fake_settings):
     assert row["priced"] is False
     assert row["est_usd"] is None and row["upper_usd"] is None
     assert row["prompt_tokens"] == 1000  # токены показываем честно
+
+
+def test_providers_block_groups_by_provider(session, fake_settings):
+    """Фаза B: карточки провайдеров — траты из отчётов #150, роли из
+    task_type, баланс по префиксу, беспрайсовое токенами."""
+    session.add_all([
+        # Mercury: priced, роль «диалог»
+        _exec_row(task_type="react_turn", prompt_tokens=500_000, completion_tokens=50_000),
+        _exec_row(task_type="react_turn", prompt_tokens=500_000, completion_tokens=50_000),
+        # Yandex STT: беспрайсовый, роль «распознавание речи»
+        _exec_row(provider_key="yandex", model="stt-general",
+                  task_type="speech_recognition", prompt_tokens=1000, completion_tokens=0),
+        # ошибка у Mercury за 24ч
+        _exec_row(task_type="react_turn", status="failed"),
+    ])
+    session.commit()
+    from datetime import UTC, datetime
+    now = datetime.now(UTC)
+    from sreda.admin.queries import get_cost_volume_summary
+    reports = get_cost_volume_summary(session)
+    balances = [{"key": "inception-mercury2", "label": "Inception",
+                 "status": "not_supported", "headline": "нет billing API", "details": ""}]
+    provs = ov._providers_block(session, now, reports, balances)
+    by_key = {p["key"]: p for p in provs}
+    assert "inception" in by_key and "yandex" in by_key
+    m = by_key["inception"]
+    assert m["balance"]["headline"] == "нет billing API"     # префикс-мапа сработала
+    assert m["errors_24h"]["errors"] == 1
+    assert m["spend"]["month"]["est_usd"] > 0                # priced
+    assert m["models"][0]["roles"].startswith("диалог")
+    y = by_key["yandex"]
+    assert y["spend"]["month"]["est_usd"] == 0.0             # беспрайсовый — не выдумываем $
+    assert y["spend"]["month"]["unpriced_tokens"] == 1000
+    assert y["models"][0]["roles"] == "распознавание речи"
+    assert y["balance"] is None                               # в balances не передан
 
 
 def test_snapshot_roundtrip(session, fake_settings):

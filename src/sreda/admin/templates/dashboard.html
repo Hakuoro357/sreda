@@ -41,12 +41,13 @@
     {% else %}<span class="muted">—</span>{% endif %}
   </article>
   {% for t in tunnels %}
-  <article style="flex:1 1 170px; margin:0;">
-    <strong>{{ "Egress :1080" if loop.first else "Egress :1081 (фильтр)" }}</strong><br>
-    {% if t.active == "active" %}<span class="badge badge-green">жив</span>
+  <article style="flex:1 1 190px; margin:0;">
+    <strong>{{ "Канал к LLM (:1080)" if loop.first else "Канал fetch_url (:1081)" }}</strong><br>
+    {% if t.active == "active" %}<span class="badge badge-green">жив{% if t.uptime_hours is not none %} {{ t.uptime_hours }} ч{% endif %}</span>
     {% elif t.active == "unknown" %}<span class="badge badge-gray">неизвестно</span>
-    {% else %}<span class="badge badge-red">{{ t.active }}</span>{% endif %}
-    {% if t.nrestarts is not none %}<span class="muted"> рестартов: {{ t.nrestarts }}</span>{% endif %}
+    {% else %}<span class="badge badge-red">{{ t.active }}</span>{% endif %}<br>
+    <span class="muted">{{ "весь исходящий трафик к LLM-провайдерам" if loop.first else "исходящий канал fetch_url, приватные адреса режутся (SSRF-фильтр)" }}</span>
+    {% if t.nrestarts is not none %}<br><span class="muted">рестартов всего (накопительно): {{ t.nrestarts }}</span>{% endif %}
   </article>
   {% endfor %}
   <article style="flex:1 1 200px; margin:0;">
@@ -69,11 +70,13 @@
   </article>
   <article style="flex:1 1 160px; margin:0;">
     <strong>Медленные &gt; 30 с</strong><br>
-    {% if snap.llm_24h.slow > 0 %}<span class="badge badge-yellow">{{ snap.llm_24h.slow }}</span>
+    {% set slow_n = snap.slow_turns.count_24h if snap.slow_turns else 0 %}
+    {% if slow_n > 0 %}<span class="badge badge-yellow">{{ slow_n }}</span>
     {% else %}<span class="badge badge-green">0</span>{% endif %}
+    <span class="muted">ходов за 24 ч</span>
   </article>
   <article style="flex:1 1 160px; margin:0;">
-    <strong>Расход сегодня</strong><br>
+    <strong>Расход за 24 ч</strong><br>
     {% if snap.cost and snap.cost.day %}≈ ${{ "%.2f" | format(snap.cost.day.priced_subtotal_usd) }}
       <span class="muted">покрытие {{ snap.cost.day.coverage_calls_pct if snap.cost.day.coverage_calls_pct is not none else "—" }}%</span>
     {% else %}<span class="muted">—</span>{% endif %}
@@ -88,6 +91,24 @@
   </article>
 </div>
 {% endif %}
+
+{# ---------- Пользователи + покупки (фидбек владельца 2026-07-03) ---------- #}
+<div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:16px;">
+  <article style="flex:1 1 220px; margin:0;">
+    <strong>Пользователи</strong><br>
+    {% if snap.users %}
+      <span style="font-size:20px;">{{ snap.users.total }}</span> <span class="muted">всего</span><br>
+      <span class="muted">сегодня +{{ snap.users.new_today }} · за 7 дней +{{ snap.users.new_7d }}</span>
+    {% else %}<span class="muted">—</span>{% endif %}
+  </article>
+  <article style="flex:1 1 220px; margin:0;">
+    <strong>Покупки</strong><br>
+    {% if snap.purchases %}
+      <span style="font-size:20px;">{{ snap.purchases.paid_tenants }}</span> <span class="muted">оплативших тенантов</span><br>
+      <span class="muted">30 дней: {{ snap.purchases.orders_30d }} покупок на {{ "{:,}".format(snap.purchases.sum_rub_30d).replace(",", " ") }} ₽ · 7 дней: {{ snap.purchases.orders_7d }} на {{ "{:,}".format(snap.purchases.sum_rub_7d).replace(",", " ") }} ₽</span>
+    {% else %}<span class="muted">—</span>{% endif %}
+  </article>
+</div>
 
 {# ---------- Ошибки + медленные ---------- #}
 <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:16px;">
@@ -111,17 +132,18 @@
     {% else %}<p class="muted">— за сутки чисто —</p>{% endif %}
   </div>
   <div style="flex:1 1 340px; min-width:0;">
-    <h3>Медленные запросы</h3>
-    {% if snap.slow_recent %}
+    <h3>Медленные запросы (ходы &gt; 30 с, из трейсов)</h3>
+    {% if snap.slow_turns and snap.slow_turns.recent %}
     <table>
-      <thead><tr><th>Когда</th><th>Сколько</th><th>Что</th><th></th></tr></thead>
+      <thead><tr><th>Когда</th><th>Сколько</th><th>Кто</th><th>Где застряло</th><th></th></tr></thead>
       <tbody>
-      {% for s in snap.slow_recent %}
+      {% for s in snap.slow_turns.recent %}
         <tr>
-          <td class="muted">{{ s.at[11:16] }}</td>
-          <td><span class="badge badge-yellow">{{ (s.latency_ms / 1000) | round(1) }} с</span></td>
-          <td>{{ s.task_type }} · {{ s.model }}<br><span class="muted">{{ s.tenant_id }}</span></td>
-          <td><a href="/admin/traces?token={{ token }}">трейсы</a></td>
+          <td class="muted">{{ s.at[:16] }}</td>
+          <td><span class="badge badge-yellow">{{ (s.total_ms / 1000) | round(1) }} с</span></td>
+          <td>{{ s.user_id }}<br><span class="muted">{{ s.channel }}</span></td>
+          <td class="muted">{{ s.top_stage or "—" }}</td>
+          <td><a href="/admin/traces?token={{ token }}&min_total_ms=30000">трейс</a></td>
         </tr>
       {% endfor %}
       </tbody>
@@ -135,15 +157,15 @@
 <small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · подробнее — <a href="/admin/spend-by-model?token={{ token }}">Расходы</a></small>
 {% if snap.cost %}
 <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:8px;">
-  {% for key, label in [("day", "Сегодня"), ("week", "Неделя"), ("month", "Месяц")] %}
+  {% for key, label in [("day", "24 часа"), ("week", "7 дней"), ("month", "30 дней")] %}
     {% set rep = snap.cost.get(key) %}
     {% if rep %}
     <article style="flex:1 1 180px; margin:0;">
       <strong>{{ label }}</strong><br>
       ≈ ${{ "%.2f" | format(rep.priced_subtotal_usd) }}
       <span class="muted">(до ${{ "%.2f" | format(rep.upper_subtotal_usd) }})</span><br>
-      <span class="muted">{{ "{:,}".format(rep.calls) }} вызовов · покрытие {{ rep.coverage_calls_pct if rep.coverage_calls_pct is not none else "—" }}%</span>
-      {% if rep.unpriced_calls %}<br><span class="muted">без прайса: {{ rep.unpriced_calls }} выз. · {{ "{:,}".format(rep.unpriced_tokens) }} ток.</span>{% endif %}
+      <span class="muted">{{ "{:,}".format(rep.calls).replace(",", " ") }} вызовов · покрытие {{ rep.coverage_calls_pct if rep.coverage_calls_pct is not none else "—" }}%</span>
+      {% if rep.unpriced_calls %}<br><span class="muted">без прайса: {{ rep.unpriced_calls }} выз. · {{ "{:,}".format(rep.unpriced_tokens).replace(",", " ") }} ток.</span>{% endif %}
     </article>
     {% endif %}
   {% endfor %}
@@ -165,7 +187,7 @@
     <tr>
       <td>{{ r.provider_key }} <span class="muted">{{ r.model }}</span> <span class="badge badge-gray">без прайса</span></td>
       <td>{{ r.calls }}</td>
-      <td><span class="muted">{{ "{:,}".format(r.prompt_tokens + r.completion_tokens) }} ток.</span></td>
+      <td><span class="muted">{{ "{:,}".format(r.prompt_tokens + r.completion_tokens).replace(",", " ") }} ток.</span></td>
     </tr>
   {% endfor %}
   </tbody>
@@ -187,23 +209,5 @@
 </tbody></table>
 {% else %}<p class="muted">— нет данных —</p>{% endif %}
 
-{# ---------- Топ тенантов ---------- #}
-{% if snap.top_tenants and snap.top_tenants.by_spend %}
-<h3 style="margin-top:16px;">Топ тенантов по тратам (месяц)</h3>
-<table>
-  <thead><tr><th>Тенант</th><th>≈ USD</th><th>Вызовов</th></tr></thead>
-  <tbody>
-  {% for t in snap.top_tenants.by_spend %}
-    <tr>
-      <td><a href="/admin/tenants/{{ t.tenant_id }}?token={{ token }}">{{ t.name }}</a></td>
-      <td>${{ "%.2f" | format(t.est_usd) }}</td>
-      <td>{{ "{:,}".format(t.calls) }}</td>
-    </tr>
-  {% endfor %}
-  </tbody>
-</table>
-{% if snap.top_tenants.by_unpriced %}
-<small class="muted">беспрайсовые (слепая зона): {% for t in snap.top_tenants.by_unpriced %}{{ t.name }} ({{ "{:,}".format(t.tokens) }} ток.){% if not loop.last %} · {% endif %}{% endfor %}</small>
-{% endif %}
-{% endif %}
+{# Топ тенантов убран по фидбеку владельца 2026-07-03 (заодно снят N+1 follow-up) #}
 {% endblock %}
