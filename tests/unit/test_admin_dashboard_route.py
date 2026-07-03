@@ -258,7 +258,8 @@ def test_normalize_overview_coerces_garbage():
     assert norm["llm_24h"] == {"calls": 0, "errors": 2, "error_rate_pct": 0.0}
     assert norm["slow_turns"]["count_24h"] == 0
     assert norm["slow_turns"]["recent"][0]["total_ms"] == 0
-    assert norm["users"] == {"total": 0, "new_today": 2, "new_7d": 0}
+    assert norm["users"] == {"total": 0, "new_today": 2, "new_7d": 0,
+                             "active_24h": 0, "active_7d": 0, "active_30d": 0}
     assert norm["purchases"]["paid_tenants"] == 0  # bool не число
     assert norm["purchases"]["sum_rub_30d"] == 800
     day = norm["cost"]["day"]

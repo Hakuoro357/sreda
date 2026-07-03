@@ -229,7 +229,25 @@ def _users_block(session: Session, now: datetime) -> dict:
         session.query(func.count(Tenant.id))
         .filter(Tenant.created_at >= week_start).scalar()
     ) or 0
-    return {"total": total, "new_today": new_today, "new_7d": new_7d}
+
+    # #304 DAU/WAU/MAU: активный = уникальный тенант с ходом (react_turn)
+    # в скользящем окне [now-Δ, now). Тот же сигнал, что «ходы» надёжности.
+    def _active(hours: int) -> int:
+        since = now - timedelta(hours=hours)
+        return (
+            session.query(func.count(func.distinct(SkillAIExecution.tenant_id)))
+            .filter(
+                SkillAIExecution.created_at >= since,
+                SkillAIExecution.created_at < now,
+                SkillAIExecution.task_type == "react_turn",
+            ).scalar()
+        ) or 0
+
+    return {
+        "total": total, "new_today": new_today, "new_7d": new_7d,
+        "active_24h": _active(24), "active_7d": _active(24 * 7),
+        "active_30d": _active(24 * 30),
+    }
 
 
 def _purchases_block(session: Session, now: datetime) -> dict:
@@ -651,7 +669,9 @@ def normalize_overview(payload: dict) -> dict:
         }
     u = payload.get("users")
     if isinstance(u, dict) and u:
-        norm["users"] = {k: _int(u.get(k)) for k in ("total", "new_today", "new_7d")}
+        norm["users"] = {k: _int(u.get(k)) for k in (
+            "total", "new_today", "new_7d",
+            "active_24h", "active_7d", "active_30d")}
     p = payload.get("purchases")
     if isinstance(p, dict) and p:
         norm["purchases"] = {k: _int(p.get(k)) for k in (

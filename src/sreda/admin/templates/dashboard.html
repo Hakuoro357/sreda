@@ -98,7 +98,8 @@
     <strong>Пользователи</strong><br>
     {% if snap.users %}
       <span style="font-size:20px;">{{ snap.users.total }}</span> <span class="muted">всего</span><br>
-      <span class="muted">сегодня +{{ snap.users.new_today }} · за 7 дней +{{ snap.users.new_7d }}</span>
+      <span class="muted" title="регистрации по календарному дню/неделе (Москва)">новые: сегодня +{{ snap.users.new_today }} · за 7 дней +{{ snap.users.new_7d }}</span><br>
+      <span class="muted" title="уникальные тенанты с ходом; скользящие окна (последние 24ч / 7 дней / 30 дней)">активные: сутки {{ snap.users.active_24h }} · неделя {{ snap.users.active_7d }} · месяц {{ snap.users.active_30d }}</span>
     {% else %}<span class="muted">—</span>{% endif %}
   </article>
   <article style="flex:1 1 220px; margin:0;">
