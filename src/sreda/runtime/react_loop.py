@@ -165,20 +165,29 @@ def _time_in_tail_enabled() -> bool:
         return False
 
 
+# #298: русские дни недели (не %A — тот локале-зависим, на проде C-locale дал бы
+# «Friday» внутри русской фразы; ревью R1 Claude MINOR). Порядок = weekday().
+_WEEKDAYS_RU = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+
+
 def _now_tail_line() -> str:
     """#298: строка текущих даты+времени для эфемерного хвоста (МСК, до минуты)."""
-    return f"Сейчас {datetime.now(_MSK).strftime('%Y-%m-%d (%A) %H:%M')} (МСК)."
+    now = datetime.now(_MSK)
+    return f"Сейчас {now:%Y-%m-%d} ({_WEEKDAYS_RU[now.weekday()]}) {now:%H:%M} (МСК)."
 
 
 def _append_time_tail(msgs: list) -> list:
     """#298: приклеить строку времени к ПОСЛЕДНЕМУ user-сообщению invoke-вида (prompt-view;
-    канон state["messages"] НЕ мутируется — как директивы #247 и компакция #194). Роль user —
-    контракт OpenAI-совместимых провайдеров (см. #247 R1 MAJOR); если хвост не user (tool/
-    assistant, напр. проход после инструментов) — отдельным user-сообщением."""
-    line = _now_tail_line()
+    канон state["messages"] НЕ мутируется — как директивы #247 и компакция #194).
+
+    ТОЛЬКО когда хвост — user (первый проход хода): решения о датах/времени модель принимает
+    там. На проходах после инструментов (хвост = ToolMessage) НЕ вставляем: отдельный user
+    «Сейчас …» после tool-результата рисковал бы сбить синтез ответа по tool-result
+    (ревью R1 #298, Codex high MAJOR); вставка эфемерна и во 2-м проходе из истории
+    отсутствует — осознанно."""
     if msgs and isinstance(msgs[-1], HumanMessage):
-        return [*msgs[:-1], HumanMessage(content=f"{msgs[-1].content}\n\n{line}")]
-    return [*msgs, HumanMessage(content=line)]
+        return [*msgs[:-1], HumanMessage(content=f"{msgs[-1].content}\n\n{_now_tail_line()}")]
+    return msgs
 
 
 def _map_deprecated_checklist_args(old_name: str, args: dict | None) -> dict:
@@ -767,8 +776,8 @@ def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
         # #298: пустой today_str (флаг SREDA_REACT_TIME_IN_TAIL=ON) → даты в промпте НЕТ
         # (полностью стабильный текст, кеш не рвётся даже раз в сутки); текущие дата+время
         # приходят эфемерным хвостом (см. _append_time_tail). Непустой (легаси) — как раньше.
-        + ("<context>\nТекущие дата и время («Сегодня») указаны отдельным сообщением в конце "
-           "диалога. " if not today_str else f"<context>\nСегодня {today_str}. ")
+        + ("<context>\nТекущие дата и время («Сегодня») указаны в конце последнего "
+           "сообщения пользователя. " if not today_str else f"<context>\nСегодня {today_str}. ")
         + "Относительные даты («сегодня», «завтра», «в пятницу») "
         "САМА переводи в абсолютные перед вызовом инструментов: дату — YYYY-MM-DD, время — HH:MM, "
         "момент напоминания — полный ISO-8601 datetime. На СЕГОДНЯ ставь, лишь если момент ещё "
@@ -2214,6 +2223,11 @@ def _build_graph(llm: Any, all_tools: list, *,
             if _tail_directives_enabled():
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                           budget=_compact_budget(), summary=history_summary)
+                # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
+                # хвоста (приоритет последней инструкции, ревью R1 #298 Codex high MAJOR):
+                # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
+                if _time_in_tail_enabled():
+                    _msgs = _append_time_tail(_msgs)
                 _tail = [d for d in (nudge, _sec) if d]
                 if _tail:
                     _directive = "\n\n".join(_tail)
@@ -2235,8 +2249,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                           budget=_compact_budget(), summary=history_summary)
-            if _time_in_tail_enabled():  # #298: дата+время эфемерным хвостом (оба режима #247)
-                _msgs = _append_time_tail(_msgs)
+                if _time_in_tail_enabled():  # #298: дата+время эфемерным хвостом (легаси-режим #247)
+                    _msgs = _append_time_tail(_msgs)
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);

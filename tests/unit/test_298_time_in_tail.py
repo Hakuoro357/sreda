@@ -107,7 +107,7 @@ def test_system_prompt_stable_without_date():
     """ON-режим промпта: без today_str блок даты заменён стабильной строкой."""
     sp_no_date = react_loop._system_prompt("")
     assert "Сегодня 2" not in sp_no_date and "Сегодня  " not in sp_no_date
-    assert "в конце диалога" in sp_no_date  # указатель на хвост
+    assert "в конце последнего сообщения пользователя" in sp_no_date
     # с датой (легаси) - дата на месте
     sp_legacy = react_loop._system_prompt("2026-07-03 (Friday)")
     assert "Сегодня 2026-07-03 (Friday)" in sp_legacy
@@ -118,6 +118,145 @@ def test_chat_fact_prompt_stable_without_date():
 
     sp_no_date = chat_fact_system_prompt("")
     assert "Сегодня 2" not in sp_no_date
-    assert "в конце диалога" in sp_no_date
+    assert "в конце последнего сообщения пользователя" in sp_no_date
     sp_legacy = chat_fact_system_prompt("2026-07-03 (Friday)")
     assert "2026-07-03" in sp_legacy
+
+
+# ---------------------------------------------------------------------------
+# Фиксы ревью R1 #298
+# ---------------------------------------------------------------------------
+
+
+def test_off_golden_prompt_joints():
+    """R1 medium/high: golden-пин легаси-стыков ОБОИХ промптов (пробел-в-пробел) -
+    конкатенация после правок не сместила ни байта вокруг даты."""
+    from sreda.runtime.react_preflight import chat_fact_system_prompt
+
+    sp = react_loop._system_prompt("2026-07-03 (Friday)")
+    assert "<context>\nСегодня 2026-07-03 (Friday). Относительные даты" in sp
+    cf = chat_fact_system_prompt("2026-07-03 (Friday)")
+    assert "канцелярита.\nСегодня 2026-07-03 (Friday).\nПравила:\n" in cf
+
+
+@pytest.mark.asyncio
+async def test_persisted_user_text_clean(db_session, monkeypatch):
+    """R1 medium: канон-история (персист-слой) хранит ЧИСТЫЙ user_text - вставка
+    времени не протекает в чекпойнт (пин точным равенством)."""
+    _flag_time(monkeypatch, True)
+    u = seed_telegram_user(db_session)
+
+    stub = _RecordingStubLLM([AIMessage(content="Около десяти.")])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="298-clean-1", llm=stub, user_text="а время сколько",
+        inbound_message_id="298-clean-1-msg", channel="react",
+    )
+    stub2 = _RecordingStubLLM([AIMessage(content="Ок.")])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="298-clean-1", llm=stub2, user_text="спасибо",
+        inbound_message_id="298-clean-1-msg2", channel="react",
+    )
+    batch2 = stub2.seen_messages[-1]
+    originals = [m for m in batch2 if isinstance(m, HumanMessage)
+                 and "а время сколько" in str(m.content)]
+    assert originals, "исходное сообщение первого хода не найдено в истории"
+    assert str(originals[0].content) == "а время сколько", (
+        f"персист-канон должен хранить чистый текст: {originals[0].content!r}")
+
+
+@pytest.mark.asyncio
+async def test_time_before_directives_247(db_session, monkeypatch):
+    """R1 high MAJOR: при #247 tail-directives ON директива остаётся ПОСЛЕДНЕЙ
+    инструкцией хвоста (порядок: текст → время → директива)."""
+    _flag_time(monkeypatch, True)
+    import sreda.config.settings as sm
+    monkeypatch.setenv("SREDA_REACT_TAIL_DIRECTIVES", "1")
+    # директива #215 живёт только на task-пути (eff=="task") → включаем preflight;
+    # «покажи дела» матчится слоем-0 _must_task детерминированно (без LLM-классификатора)
+    monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
+    sm.get_settings.cache_clear()
+    u = seed_telegram_user(db_session)
+
+    stub = _RecordingStubLLM([AIMessage(content="Вот дела.")])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="298-dir-1", llm=stub, user_text="покажи дела",
+        inbound_message_id="298-dir-1-msg", channel="react",
+    )
+    batch = stub.seen_messages[-1]
+    last_human = [m for m in batch if isinstance(m, HumanMessage)][-1]
+    content = str(last_human.content)
+    m_time = _TIME_RE.search(content)
+    i_dir = content.find("ВАЖНО:")
+    assert m_time, f"времени нет в хвосте: {content!r}"
+    assert i_dir != -1, f"директивы #215/#247 нет в хвосте: {content!r}"
+    assert m_time.start() < i_dir, (
+        f"директива должна быть ПОСЛЕДНЕЙ инструкцией (время до неё): {content!r}")
+
+
+@pytest.mark.asyncio
+async def test_no_time_insert_on_after_tool_pass(db_session, monkeypatch):
+    """R1 high MAJOR: на проходе после инструментов (хвост = ToolMessage) вставки НЕТ -
+    отдельный user «Сейчас…» не вклинивается перед синтезом по tool-result."""
+    _flag_time(monkeypatch, True)
+    u = seed_telegram_user(db_session)
+
+    scripted = [
+        AIMessage(content="", tool_calls=[{
+            "name": "list_checklists", "args": {}, "id": "call_t1",
+        }]),
+        AIMessage(content="Списков нет."),
+    ]
+    stub = _RecordingStubLLM(scripted)
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="298-tool-1", llm=stub, user_text="покажи список кино",
+        inbound_message_id="298-tool-1-msg", channel="react",
+    )
+    assert len(stub.seen_messages) >= 2, "ожидались два прохода (tool_call + синтез)"
+    batch2 = stub.seen_messages[-1]
+    # хвост второго прохода - НЕ HumanMessage с временем
+    assert not isinstance(batch2[-1], HumanMessage) or not _TIME_RE.search(
+        str(batch2[-1].content)), (
+        f"на after-tool проходе не должно быть time-вставки: {batch2[-1]!r}")
+    # и вообще НОВЫХ вставок времени во 2-м проходе нет (вставка 1-го эфемерна,
+    # user-сообщение канона чистое)
+    hits = [m for m in batch2 if isinstance(m, HumanMessage) and _TIME_RE.search(str(m.content))]
+    assert not hits, f"time-вставок во 2-м проходе быть не должно: {hits}"
+
+
+@pytest.mark.asyncio
+async def test_chat_fact_invoke_gets_time(db_session, monkeypatch):
+    """R1 medium MINOR: chat/fact-путь (deepseek) тоже получает время в хвосте invoke."""
+    _flag_time(monkeypatch, True)
+    import sreda.config.settings as sm
+    monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
+    sm.get_settings.cache_clear()
+    u = seed_telegram_user(db_session)
+
+    # deepseek-стаб: get_chat_llm(provider=...) возвращает его
+    ds = _RecordingStubLLM([AIMessage(content="Сейчас ночь, десять минут второго.")])
+    import sreda.services.llm as llm_mod
+    monkeypatch.setattr(llm_mod, "get_chat_llm", lambda *a, **k: ds)
+
+    # классификатор: форсим интент chat (иначе LLM-классификатор с fail-open task)
+    from sreda.runtime import react_preflight as rp
+    async def _fake_classify(*_a, **_k):
+        return "chat"
+    monkeypatch.setattr(rp, "classify_intent", _fake_classify)
+
+    freddie = _RecordingStubLLM([AIMessage(content="не должен вызываться")])
+    await react_loop.handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id="298-chat-1", llm=freddie, user_text="а время сколько",
+        inbound_message_id="298-chat-1-msg", channel="react",
+    )
+    assert ds.seen_messages, "chat/fact-ветка (deepseek) не вызвалась"
+    batch = ds.seen_messages[-1]
+    last_human = [m for m in batch if isinstance(m, HumanMessage)][-1]
+    assert _TIME_RE.search(str(last_human.content)), (
+        f"время не дошло до chat/fact invoke: {last_human.content!r}")
+    sys_msg = batch[0]
+    assert "Сегодня 2" not in str(sys_msg.content)
