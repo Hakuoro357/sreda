@@ -25,7 +25,11 @@ class YandexSpeechKitRecognizer:
         }
         headers = {"Authorization": f"Api-Key {self._api_key}"}
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            # trust_env=False: Yandex — РОССИЙСКИЙ сервис, VDS в Москве → идём НАПРЯМУЮ, а не через
+            # глобальный HTTPS_PROXY=socks5://:1080 (зарубежный NL-туннель). Замер 2026-07-03: прямой
+            # путь ~40мс vs туннель ~435мс (10×), плюс аудио (до 188КБ) грузилось крюком RU→NL→RU →
+            # спайки/30с-таймаут-отказы STT. Тот же паттерн RU-direct, что MAX-клиент/admin_alerts.
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
                 response = await client.post(
                     _ENDPOINT,
                     params=params,
