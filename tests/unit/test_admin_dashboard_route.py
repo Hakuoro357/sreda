@@ -33,6 +33,10 @@ def session_factory():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+    # audit_log НЕ в sreda.db.models.__init__ и импортится лениво в роуте, поэтому
+    # без явной регистрации таблицы нет → best-effort audit на GET /admin/ пишет
+    # ERROR-трейс. Импортируем модель ДО create_all (как в tests/unit/conftest.py).
+    import sreda.db.models.audit  # noqa: F401 — регистрирует таблицу audit_log
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)
 
@@ -108,7 +112,8 @@ def test_dashboard_full_snapshot_renders_all_sections(client, session_factory):
             "at": "2026-07-02 11:00:03.100", "total_ms": 31500,
             "user_id": "user_tg_755682022", "channel": "max",
             "top_stage": "llm 28.0 с"}]},
-        "users": {"total": 21, "new_today": 2, "new_7d": 5},
+        "users": {"total": 21, "new_today": 2, "new_7d": 5,
+                  "active_24h": 8, "active_7d": 14, "active_30d": 19},
         "purchases": {"paid_tenants": 1, "orders_7d": 1, "sum_rub_7d": 500,
                       "orders_30d": 2, "sum_rub_30d": 800},
         "cost": {"day": {
@@ -139,9 +144,19 @@ def test_dashboard_full_snapshot_renders_all_sections(client, session_factory):
     assert "$1.23" in html and "покрытие 95" in html and "без прайса" in html
     # топ тенантов УБРАН (фидбек владельца 2026-07-03)
     assert "Топ тенантов" not in html
-    # пользователи и покупки
-    assert "сегодня +2" in html and "за 7 дней +5" in html
+    # аудитория/активность (#304: единый виджет разбит на 2 плиточные карточки)
+    # + покупки. Значение и подпись теперь в разных <div>. Заголовки карточек
+    # рендерятся ВНЕ {% if snap.users %} (видны и при пустых данных), поэтому
+    # пропажу данных под {% if %} ловят ЗНАЧЕНИЯ, а не заголовки; «+N» —
+    # единственный со знаком «+» маркёр, уникальный для плиток Аудитории.
+    assert "Аудитория" in html and "Активность" in html   # раздельные карточки (#304)
+    assert ">+2<" in html and ">+5<" in html               # регистрации: +сегодня / +7 дней
     assert "оплативших тенантов" in html and "800 ₽" in html
+    # активность DAU/WAU/MAU (ради этой секции была #304): подписи окон +
+    # значения active_24h/7d/30d (внутри {% if %}) — секция не исчезнет молча (#307).
+    # Формы «>подпись<» отсекают коллизию «сутки» с KPI-заголовком «Диалог за сутки».
+    assert ">сутки<" in html and ">неделя<" in html and ">месяц<" in html
+    assert ">8<" in html and ">14<" in html and ">19<" in html  # active 24h/7d/30d
     # балансы провайдеров
     assert "OpenRouter" in html and "$12.40" in html
     # ошибки и медленные за сутки (из трейсов)
@@ -258,7 +273,8 @@ def test_normalize_overview_coerces_garbage():
     assert norm["llm_24h"] == {"calls": 0, "errors": 2, "error_rate_pct": 0.0}
     assert norm["slow_turns"]["count_24h"] == 0
     assert norm["slow_turns"]["recent"][0]["total_ms"] == 0
-    assert norm["users"] == {"total": 0, "new_today": 2, "new_7d": 0}
+    assert norm["users"] == {"total": 0, "new_today": 2, "new_7d": 0,
+                             "active_24h": 0, "active_7d": 0, "active_30d": 0}
     assert norm["purchases"]["paid_tenants"] == 0  # bool не число
     assert norm["purchases"]["sum_rub_30d"] == 800
     day = norm["cost"]["day"]

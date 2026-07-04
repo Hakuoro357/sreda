@@ -10,7 +10,7 @@
     <button type="submit" class="outline" style="padding:2px 10px; font-size:12px; margin-left:8px;">обновить сейчас</button>
   </form>
 </div>
-<small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · периоды — календарные по Москве · роли моделей — по реальным вызовам за 30 дней</small>
+<small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · периоды — скользящие окна (24ч / 7 дней / 30 дней) · роли моделей — по реальным вызовам за 30 дней</small>
 
 {% if snap.cost %}
 <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:10px;">

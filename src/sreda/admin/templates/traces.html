@@ -97,7 +97,7 @@
   <table class="stage-table">
     <tbody>
       {% for stage in tr.stages %}
-      <tr class="stage-row {{ stage_duration_color(stage.duration_ms) }}">
+      <tr class="stage-row {{ stage_duration_color(stage.effective_ms) }}">
         <td style="width: 70px; text-align: right; color: var(--pico-muted-color);">{{ stage.at_ms }}ms</td>
         <td class="stage-name" style="width: 220px;">{{ stage.name }}</td>
         <td style="width: 80px; text-align: right; font-weight: 600;">

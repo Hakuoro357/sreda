@@ -25,7 +25,6 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
 
 # ---------------------------------------------------------------------------
 # Format regexes — match the actual produced format. Tolerate optional
@@ -99,6 +98,36 @@ class ParsedStage:
     duration_ms: int | None
     meta: dict[str, str]  # only safe keys, values truncated
 
+    @property
+    def effective_ms(self) -> int | None:
+        """Эффективная длительность стадии для ОТОБРАЖЕНИЯ/АТРИБУЦИИ (раскраска строки в трейс-вьюере +
+        выбор «где застряло» в обзор-снапшоте), НЕ для колонки длительности.
+
+        #255-фикс: события ``react.*`` несут длительность вызова как ``latency_ms`` в МЕТЕ, а не в
+        ``duration_ms`` (иначе раздули бы TOTAL блока — эмитятся в конце хода, ``at_ms``=конец). Побочно
+        это увело react.llm-латентность из ``duration_ms``, на который смотрят ДВА потребителя:
+        (1) раскраска строки ``stage_duration_color`` — медленный вызов перестал краснеть; (2)
+        ``overview_snapshot._slow_turns_block`` — LLM-ходы стали падать в «между стадиями (не размечено)».
+        Оба берут ``effective_ms``: своё ``duration_ms``, а когда его нет — ``latency_ms`` из меты. Так
+        восстановлено и «краснеет на глаз», и корректная атрибуция долгого хода к react.llm.
+
+        Колонку длительности в шаблоне (гейт ``duration_ms is not none``) это НЕ трогает: она остаётся
+        пустой, чтобы latency не читался как длительность стадии и не «суммировался» глазом сверх TOTAL.
+
+        Агрегатные шаги (``react.tool`` с ``sum_latency_ms``) осознанно возвращают None (нейтральны/не
+        атрибутируются): сумма по нескольким вызовам против пер-стадийных порогов (2с/5с для ОДНОЙ стадии)
+        красила бы штатные мультитул-ходы ложным красным; узкие места видны в ``top3``. Тянем только
+        ``latency_ms`` — react.tool так и был вне slow-turns (у него ``duration_ms``=0), регресса нет."""
+        if self.duration_ms is not None:
+            return self.duration_ms
+        raw = self.meta.get("latency_ms")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
 
 @dataclass(slots=True)
 class ParsedTrace:
@@ -164,11 +193,18 @@ def _parse_meta_string(s: str) -> dict[str, str]:
     return out
 
 
-def _filter_safe_meta(raw: dict[str, str]) -> dict[str, str]:
-    """Apply allowlist + truncate value length. Codex r1 CRITICAL #4."""
+def _filter_safe_meta(raw: dict[str, str], step_name: str = "") -> dict[str, str]:
+    """Apply allowlist + truncate value length. Codex r1 CRITICAL #4.
+
+    #255: шаги ``react.*`` (наблюдаемость react_loop) — ПД-free by construction (числа/enum/имена
+    инструментов, как ``llm_calls_json`` #192), пропускаем ВСЕ их поля (иначе latency_ms/intent/fallback
+    отрендерились бы пустыми — ради них весь #255). Префикс БУКВАЛЬНО ``"react."`` (с точкой):
+    ``react_loop.replied`` НЕ подпадает (после ``react`` идёт ``_``) → у него прежний строгий allowlist.
+    Обрезка длины (_MAX_META_VALUE_LEN) применяется в любом случае — страховка от простыней."""
+    loose = step_name.startswith("react.")
     safe: dict[str, str] = {}
     for key, value in raw.items():
-        if key not in _SAFE_META_KEYS:
+        if not loose and key not in _SAFE_META_KEYS:
             continue
         if len(value) > _MAX_META_VALUE_LEN:
             value = value[: _MAX_META_VALUE_LEN - 1] + "…"
@@ -253,7 +289,7 @@ def _parse_block(lines: list[str]) -> ParsedTrace | None:
             except ValueError:
                 pass
         meta_raw = _parse_meta_string(stage_match.group("meta") or "")
-        meta_safe = _filter_safe_meta(meta_raw)
+        meta_safe = _filter_safe_meta(meta_raw, stage_match.group("name"))
         trace.stages.append(ParsedStage(
             at_ms=at_ms,
             name=stage_match.group("name"),

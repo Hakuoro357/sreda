@@ -19,7 +19,8 @@ from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
 from sreda.db.models.core import InboundMessage, OutboxMessage, Tenant, Workspace
-from sreda.db.models.runtime import AgentRun, AgentThread
+from sreda.db.models.runtime import AgentThread
+from sreda.db.models.skill_platform import SkillAIExecution
 from sreda.workers import reliability_report as rr_module
 from sreda.workers.reliability_report import (
     ReliabilityReportWorker,
@@ -47,10 +48,19 @@ def session():
 NOW = datetime(2026, 6, 12, 4, 0, tzinfo=timezone.utc)
 
 
-def _run(sess, rid, status, hours_ago):
-    sess.add(AgentRun(id=rid, thread_id="th1", tenant_id="t1",
-                      workspace_id="w1", action_type="chat", status=status,
-                      created_at=NOW - timedelta(hours=hours_ago)))
+# #303: ход отчёта = react_turn (agent_runs мертва). "completed"→"succeeded".
+_STATUS_MAP = {"completed": "succeeded", "failed": "failed"}
+_ex_seq = iter(range(100000))
+
+
+def _run(sess, rid, status, hours_ago, *, exec_id=None):
+    """Один react_turn с run_id=rid (ход = distinct run_id)."""
+    n = next(_ex_seq)
+    sess.add(SkillAIExecution(
+        id=exec_id or f"ex_{n}", run_id=rid, tenant_id="t1",
+        feature_key="housewife_assistant", task_type="react_turn",
+        status=_STATUS_MAP.get(status, status),
+        created_at=NOW - timedelta(hours=hours_ago)))
 
 
 def _inbound(sess, mid, processing_status, hours_ago):
@@ -91,6 +101,28 @@ def test_failure_classification(session, tmp_path: Path) -> None:
     assert c.inbound_stuck == 1        # i2 (i3 свежий)
     assert c.outbox_failed == 1
     assert c.breakdowns_shown == 1     # только строка в окне (12-е)
+
+
+def test_turns_are_distinct_runs_not_executions(session, tmp_path: Path) -> None:
+    """#303: мульти-итерационный ReAct (несколько react_turn в одном run)
+    = ОДИН ход; run с ошибочным react_turn = ОДИН провал (не N)."""
+    # run "rA": 3 react_turn, 2 из них ошибочные
+    _run(session, "rA", "completed", 2, exec_id="a1")
+    _run(session, "rA", "failed", 2, exec_id="a2")
+    _run(session, "rA", "failed", 2, exec_id="a3")
+    # run "rB": 1 успешный
+    _run(session, "rB", "completed", 1, exec_id="b1")
+    # run "rD": validation_failed — тоже провал (Codex high R1: покрыть оба статуса)
+    _run(session, "rD", "validation_failed", 1, exec_id="d1")
+    # шум: не react_turn (STT) — не считается ходом
+    session.add(SkillAIExecution(
+        id="stt1", run_id="rC", tenant_id="t1", feature_key="housewife_assistant",
+        task_type="speech_recognition", status="succeeded",
+        created_at=NOW - timedelta(hours=1)))
+    session.commit()
+    c = gather_day_counts(session, now=NOW, log_path=str(tmp_path / "none.log"))
+    assert c.turns_total == 3      # rA + rB + rD (rC не react_turn)
+    assert c.runs_failed == 2      # rA (один раз, НЕ 2) + rD (validation_failed)
 
 
 def test_reliability_report_format(tmp_path: Path) -> None:

@@ -57,29 +57,12 @@ def test_meta_ask_human_need_family_pass():
         assert _apply_unified_policy([t], allowed_read=["web"], allowed_write=[]) == [t]
 
 
-def test_delete_my_account_gated_by_signal():
-    """B2 CodexH/M CRITICAL: delete_my_account НЕ биндится без сигнала удаления аккаунта (иначе его
-    pre-confirm audit-запись достижима на смолтоке). С сигналом → биндится (свой A11-confirm)."""
+def test_delete_my_account_never_bound_on_unified():
+    """Борис 2026-07-04: delete_my_account на голосовом едином пути НЕ выставляется вообще (не фича;
+    удаление аккаунта — отдельный явный флоу). Снят account-signal whack-a-mole; delete за A11-confirm."""
     d = _tool("delete_my_account")
-    # без сигнала → не бинд (недостижим)
-    assert _apply_unified_policy([d], allowed_read=["web"], allowed_write=[], allow_account_delete=False) == []
-    # с сигналом → бинд
-    assert _apply_unified_policy([d], allowed_read=["web"], allowed_write=[], allow_account_delete=True) == [d]
-
-
-def test_account_deletion_signal_precision():
-    from sreda.runtime.react_signals import account_deletion_signal as a
-    for t in ("удали мой аккаунт", "снеси мой профиль", "удали мою учётку",
-              "уничтожь мой аккаунт", "сотри мой профиль"):
-        assert a(t) is True, t
-    # негация/вопрос/цитата/мета/чужой/безличн./деliberative (B2 R2-R4) + не-аккаунт; ТОЛЬКО императив+притяж.
-    for t in ("удали задачу", "добавь молоко", "как дела?", "удали напоминание про врача",
-              "не удаляй мой аккаунт", "как удалить аккаунт?", 'команда "удали мой аккаунт" не работает',
-              "он сказал удали свой аккаунт",
-              "удали аккаунт в инстаграме", "как удалить аккаунт в телеграме",
-              "надо удалить аккаунт в инстаграме", "надо удалить аккаунт",
-              "надо удалить свой аккаунт?", "хочу удалить свой аккаунт"):  # R4: вопрос/деliberative
-        assert a(t) is False, t
+    assert _apply_unified_policy([d], allowed_read=["web"], allowed_write=[]) == []
+    assert _apply_unified_policy([d], allowed_read=["web", "tasks"], allowed_write=["tasks"]) == []
 
 
 def test_direct_write_requires_read_domain_too():

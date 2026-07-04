@@ -178,12 +178,14 @@ def _slow_turns_block(settings: Any, now: datetime) -> dict:
             # объясняет <50% общего времени — трейс НЕ разметил, куда ушло
             # остальное (владелец 2026-07-03: ход 39с с «voice.transcribe
             # 0.8с» вводил в заблуждение). Тогда честно «между стадиями».
+            # effective_ms, не duration_ms: react.llm несёт латентность в мете
+            # (#255-фикс TOTAL), иначе LLM-ход падал бы в «не размечено».
             top_stage = ""
-            stages = [s for s in t.stages if s.duration_ms]
+            stages = [s for s in t.stages if s.effective_ms]
             total = t.total_ms or 0
             if stages:
-                s = max(stages, key=lambda s: s.duration_ms or 0)
-                dur = s.duration_ms or 0
+                s = max(stages, key=lambda s: s.effective_ms or 0)
+                dur = s.effective_ms or 0
                 if total and dur < total * 0.5:
                     top_stage = "между стадиями (не размечено)"
                 else:
@@ -229,7 +231,25 @@ def _users_block(session: Session, now: datetime) -> dict:
         session.query(func.count(Tenant.id))
         .filter(Tenant.created_at >= week_start).scalar()
     ) or 0
-    return {"total": total, "new_today": new_today, "new_7d": new_7d}
+
+    # #304 DAU/WAU/MAU: активный = уникальный тенант с ходом (react_turn)
+    # в скользящем окне [now-Δ, now). Тот же сигнал, что «ходы» надёжности.
+    def _active(hours: int) -> int:
+        since = now - timedelta(hours=hours)
+        return (
+            session.query(func.count(func.distinct(SkillAIExecution.tenant_id)))
+            .filter(
+                SkillAIExecution.created_at >= since,
+                SkillAIExecution.created_at < now,
+                SkillAIExecution.task_type == "react_turn",
+            ).scalar()
+        ) or 0
+
+    return {
+        "total": total, "new_today": new_today, "new_7d": new_7d,
+        "active_24h": _active(24), "active_7d": _active(24 * 7),
+        "active_30d": _active(24 * 30),
+    }
 
 
 def _purchases_block(session: Session, now: datetime) -> dict:
@@ -345,8 +365,12 @@ def _health_block(session: Session, now: datetime) -> dict:
     # (НЕ число ошибочных строк: мульти-итерационный ReAct с N ошибочными
     # react_turn в одном run считается ОДНИМ проблемным ходом). Тест это
     # фиксирует (test_health_failures_distinct_run_not_execution_count).
+    # created_at < now: точное окно [since, now) — ЕДИНАЯ семантика с
+    # reliability_report.gather_day_counts (#303; без верхней границы числа
+    # те же, будущих строк нет, но выравниваем во избежание clock-skew-дрейфа).
     base = session.query(func.count(func.distinct(SkillAIExecution.run_id))).filter(
         SkillAIExecution.created_at >= since,
+        SkillAIExecution.created_at < now,
         SkillAIExecution.task_type == "react_turn",
     )
     turns_total = base.scalar() or 0
@@ -647,7 +671,9 @@ def normalize_overview(payload: dict) -> dict:
         }
     u = payload.get("users")
     if isinstance(u, dict) and u:
-        norm["users"] = {k: _int(u.get(k)) for k in ("total", "new_today", "new_7d")}
+        norm["users"] = {k: _int(u.get(k)) for k in (
+            "total", "new_today", "new_7d",
+            "active_24h", "active_7d", "active_30d")}
     p = payload.get("purchases")
     if isinstance(p, dict) and p:
         norm["purchases"] = {k: _int(p.get(k)) for k in (

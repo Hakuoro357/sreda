@@ -19,6 +19,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from sreda.admin import overview_snapshot as ov
+from sreda.admin.trace_parser import ParsedStage
 from sreda.db.base import Base
 from sreda.db.models.skill_platform import SkillAIExecution
 
@@ -119,7 +120,8 @@ def test_slow_turns_from_traces(session, fake_settings, monkeypatch):
     fake_traces = [
         NS(timestamp="2026-07-02 22:05:03.160", user_id="user_tg_755682022",
            channel="max", total_ms=30_282,
-           stages=[NS(name="llm", duration_ms=28_000), NS(name="tools", duration_ms=1_500)]),
+           stages=[ParsedStage(at_ms=0, name="llm", duration_ms=28_000, meta={}),
+                   ParsedStage(at_ms=0, name="tools", duration_ms=1_500, meta={})]),
         NS(timestamp="2020-01-01 00:00:00.000", user_id="old", channel="tg",
            total_ms=99_000, stages=[]),  # старше 24ч — вне окна
     ]
@@ -142,7 +144,8 @@ def test_slow_turns_unattributed_stage(fake_settings, monkeypatch):
     from types import SimpleNamespace as NS
     from datetime import UTC, datetime
     traces = [NS(timestamp="2026-07-03 05:30:00.000", user_id="u", channel="tg",
-                 total_ms=39_000, stages=[NS(name="voice.transcribe", duration_ms=800)])]
+                 total_ms=39_000,
+                 stages=[ParsedStage(at_ms=0, name="voice.transcribe", duration_ms=800, meta={})])]
     monkeypatch.setattr("sreda.admin.trace_parser.parse_trace_log",
                         lambda path, **kw: traces)
     fake_settings.trace_log_path = "/x"
@@ -245,6 +248,64 @@ def test_purchases_paid_without_paid_at_counted(session, fake_settings):
     session.commit()
     blk = ov._purchases_block(session, now)
     assert blk["orders_7d"] == 1 and blk["sum_rub_7d"] == 700
+
+
+def test_users_active_dau_wau_mau(session, fake_settings):
+    """#304: активные = уникальные тенанты с react_turn в скользящем окне.
+    Один тенант с несколькими ходами считается ОДИН раз."""
+    from datetime import UTC, datetime, timedelta
+    now = datetime.now(UTC)
+
+    def _react(tid, hours_ago):
+        n = next(_SEQ)
+        session.add(SkillAIExecution(
+            id=f"e_{n}", run_id=f"r_{n}", tenant_id=tid,
+            feature_key="housewife_assistant", task_type="react_turn",
+            status="succeeded", created_at=now - timedelta(hours=hours_ago)))
+
+    _react("t_a", 1)              # сегодня
+    _react("t_a", 2)              # тот же тенант ещё раз (не дубль)
+    _react("t_b", 5)              # сегодня
+    _react("t_c", 24 * 3)         # 3 дня назад (в неделю, не в сутки)
+    _react("t_d", 24 * 20)        # 20 дней (в месяц, не в неделю)
+    _react("t_e", 24 * 40)        # 40 дней — вне месяца
+    # шум: не react_turn — не активность
+    session.add(SkillAIExecution(
+        id="stt_x", run_id="rx", tenant_id="t_z",
+        feature_key="housewife_assistant", task_type="speech_recognition",
+        status="succeeded", created_at=now - timedelta(hours=1)))
+    session.commit()
+    blk = ov._users_block(session, now)
+    assert blk["active_24h"] == 2     # t_a (1 раз), t_b
+    assert blk["active_7d"] == 3      # + t_c
+    assert blk["active_30d"] == 4     # + t_d (t_e вне 30д, t_z не react_turn)
+
+
+def test_users_active_window_boundaries(session, fake_settings):
+    """#304 R1 (high+medium): точная инклюзивность окна [now-Δ, now).
+    Нижняя граница ВКЛючена (>= since), верхняя ИСКЛючена (< now).
+    Ловит будущий регресс >= → > или < → <=."""
+    from datetime import UTC, datetime, timedelta
+    now = datetime.now(UTC)
+
+    def _react(tid, delta):
+        n = next(_SEQ)
+        session.add(SkillAIExecution(
+            id=f"b_{n}", run_id=f"br_{n}", tenant_id=tid,
+            feature_key="housewife_assistant", task_type="react_turn",
+            status="succeeded", created_at=now - delta))
+
+    _react("b_low24", timedelta(hours=24))                    # ровно now-24ч → В сутках
+    _react("b_upper", timedelta(0))                           # ровно now → вне ВСЕХ окон
+    _react("b_out24", timedelta(hours=24, seconds=1))         # чуть за 24ч → в неделе, не в сутках
+    _react("b_low7d", timedelta(days=7))                      # ровно now-7д → в неделе, не в сутках
+    _react("b_low30d", timedelta(days=30))                    # ровно now-30д → в месяце, не в неделе
+    session.commit()
+
+    blk = ov._users_block(session, now)
+    assert blk["active_24h"] == 1     # только b_low24 (граница вкл); b_upper и b_out24 — нет
+    assert blk["active_7d"] == 3      # + b_out24 + b_low7d (граница вкл); b_upper всё ещё нет
+    assert blk["active_30d"] == 4     # + b_low30d (граница вкл); b_upper по-прежнему исключён
 
 
 def test_purchases_block_counts(session, fake_settings):

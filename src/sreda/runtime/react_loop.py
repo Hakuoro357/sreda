@@ -40,7 +40,8 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
-from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода
+from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода (БД)
+from sreda.services import trace as _tltrace  # #255: timeline-буфер трейса (ContextVar, админ-вьюер)
 from sreda.runtime.react_compaction import (  # #194 компакция (prompt-view) + #232 выжимка истории
     build_model_input,
     make_summary_record,
@@ -165,6 +166,16 @@ def _time_in_tail_enabled() -> bool:
         return False
 
 
+def _checklist_querykind() -> bool:
+    """#213 Срез B: предслойный query_kind + cross-check ВКЛ? (SREDA_CHECKLIST_QUERYKIND,
+    дефолт OFF = fail-open). Действует ТОЛЬКО вместе с _checklist_unified()."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().checklist_querykind_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
 # #298: русские дни недели (не %A — тот локале-зависим, на проде C-locale дал бы
 # «Friday» внутри русской фразы; ревью R1 Claude MINOR). Порядок = weekday().
 _WEEKDAYS_RU = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
@@ -196,6 +207,166 @@ def _append_time_tail(msgs: list, line: str) -> list:
                     HumanMessage(content=f"{msgs[i].content}\n\n{line}"),
                     *msgs[i + 1:]]
     return msgs
+
+
+# #213 Срез B: write-инструменты чек-листов под ordinal-enforcement (source_result_id).
+_CHECKLIST_WRITE_ENFORCED_213 = frozenset(
+    {"mark_checklist_item_done", "delete_checklist_item", "update_checklist_item"})
+
+
+def _token_in_text(needle: str, text: str) -> bool:
+    """#213 Срез B (R3 Codex medium): подстрока по ГРАНИЦАМ токена (кириллица+латиница+цифры),
+    не голый `in` — «ход» НЕ считается названным в «поход». needle может быть многословным."""
+    import re as _re
+    if not needle or not text:
+        return False
+    return _re.search(
+        r"(?<![а-яёa-z0-9])" + _re.escape(needle) + r"(?![а-яёa-z0-9])", text) is not None
+
+
+def _checklist_cross_check(ctx: dict, name: str, args: dict | None,
+                           session: Any, tenant_id: str, user_id: str):
+    """#213 Срез B: сверка вызова с READ-интентом предслоя (plans/213-cycle-final.md п.3).
+
+    Возвращает None (пропуск) ЛИБО (сообщение, result_kind, redirect_args):
+    redirect_args не-None → узкий редирект (заполнение ОТСУТСТВУЮЩЕГО name при mode=items,
+    только exact|unique_fuzzy по span юзера); иначе структурный отказ БЕЗ исполнения.
+    Mode/инструмент редиректом НЕ меняются; в mixed редирект и гейты выключены."""
+    kind = ctx.get("kind")
+    if kind == "mixed":
+        return None  # разрешены и items, и overview; различимость — envelope
+    if name == "list_checklist_items":
+        # implicit mode=search (п.4 плана): на items/overview-интенте search-вызов паразитен.
+        if kind in ("items", "overview"):
+            return (f"mode_mismatch: пользователь просит "
+                    f"{'пункты конкретного списка' if kind == 'items' else 'обзор списков'} — "
+                    "поиск пунктов по всем спискам здесь не нужен. Используй get_checklist.",
+                    "mode_mismatch", None)
+        return None
+    if name != "get_checklist":
+        return None
+    mode = str((args or {}).get("mode") or "").strip().lower()
+    nm = str((args or {}).get("name") or "").strip()
+    span = str(ctx.get("name_span") or "").strip()
+    if kind in ("items", "overview") and mode in ("items", "overview") and mode != kind:
+        want = ("mode=\"items\" с name из запроса пользователя" if kind == "items"
+                else "mode=\"overview\" без name")
+        return (f"mode_mismatch: пользователь просит "
+                f"{'пункты конкретного списка' if kind == 'items' else 'обзор всех списков'} — "
+                f"вызови get_checklist {want}.", "mode_mismatch", None)
+    if kind == "items" and mode == "items" and span:
+        try:
+            from sreda.services.checklists import ChecklistService
+            _svc = ChecklistService(session)
+            if not nm:
+                # редирект ОТСУТСТВУЮЩЕГО имени, только при уверенном резолве span
+                res = _svc.resolve_list_by_title_ranked(
+                    tenant_id=tenant_id, user_id=user_id, needle=span)
+                if res.status in ("exact", "unique_fuzzy"):
+                    return ("", "redirect", {**(args or {}), "name": span})
+                return None  # ambiguous/not_found → штатный путь инструмента (варианты/уточнение)
+            # #213 Срез B (R2 Claude B1): компаунд items+items — если имя модели РЕАЛЬНО
+            # названо юзером в тексте хода («в списке кино И в списке машина»: span=«кино»,
+            # но «машина» тоже в тексте), это легитимный второй список, НЕ конфликт. Пропускаем.
+            # R3 Codex medium MINOR: по ГРАНИЦАМ токена, не substring («ход» ⊄ «поход»).
+            _utn = str(ctx.get("user_text_norm") or "")
+            if nm and _utn and _token_in_text(nm.lower(), _utn):
+                return None
+            r_model = _svc.resolve_list_by_title_ranked(
+                tenant_id=tenant_id, user_id=user_id, needle=nm)
+            r_span = _svc.resolve_list_by_title_ranked(
+                tenant_id=tenant_id, user_id=user_id, needle=span)
+            # #213 Срез B (R2 Claude B5): редирект и НЕРЕЗОЛВЯЩЕГОСЯ имени (опечатка «кинооо»),
+            # если span уверенно резолвится — план п.12 «отсутствующий ИЛИ нерезолвящийся».
+            # РЕЗОЛВЯЩЕЕСЯ имя модели НИКОГДА не перезаписываем (r4-контракт).
+            if r_model.checklist is None and r_span.status in ("exact", "unique_fuzzy"):
+                return ("", "redirect", {**(args or {}), "name": span})
+            # conflicting resolvable names (r4-контракт): предслой уверенно видит span,
+            # модель зовёт ДРУГОЕ резолвящееся имя (не названное юзером) → отказ, не молчаливая
+            # выдача не того списка.
+            if (r_model.checklist is not None and r_span.checklist is not None
+                    and r_model.checklist.id != r_span.checklist.id):
+                return (f"name_conflict: пользователь просил список «{span}», а вызов — про "
+                        f"другое имя. Перезови get_checklist с name=\"{span}\" или уточни у "
+                        "пользователя.", "name_conflict", None)
+        except Exception:  # noqa: BLE001 — сверка не роняет ход (fail-open)
+            logger.warning("react_loop: checklist cross-check failed → pass-through",
+                           exc_info=True)
+    return None
+
+
+def _parse_passport_fields(head: str) -> dict:
+    """#213 Срез C (M5): первая строка envelope → key=value dict (кавычки-aware).
+    Служебные поля (result_type/result_id/resolution_status/items/checklist_id) идут ДО
+    свободного checklist_name="…" — их значения не содержат пробелов; название в кавычках
+    парсится как одно значение, его содержимое НЕ создаёт ложных полей."""
+    import re as _re
+    out: dict = {}
+    for m in _re.finditer(r'(\w+)=("[^"]*"|\S+)', head or ""):
+        v = m.group(2)
+        out[m.group(1)] = v[1:-1] if v.startswith('"') and v.endswith('"') else v
+    return out
+
+
+def _checklist_write_enforce(history: list, batch_out: list,
+                             item_id: str, source_result_id: str,
+                             pending_batch_reads: int = 0) -> str | None:
+    """#213 Срез B (приёмка п.8): items-result'ы ТЕКУЩЕГО хода (после последнего user,
+    включая текущий батч) из envelope-паспортов; ≥2 → write требует привязки
+    (source_result_id с item_id внутри него); 0/1 → пропуск (легаси-пути целы).
+
+    pending_batch_reads (R1 high MAJOR) — items-read вызовы ТЕКУЩЕГО батча, ещё не
+    исполненные к моменту write: батч параллелен семантически, write между двумя read
+    не должен проскочить как «один результат»."""
+    msgs: list = []
+    last_h = -1
+    for i, m in enumerate(history):
+        if isinstance(m, HumanMessage):
+            last_h = i
+    msgs = list(history[last_h + 1:]) + list(batch_out)
+    results: list[tuple[str, set[str]]] = []
+    for m in msgs:
+        c = str(getattr(m, "content", "") or "")
+        head = c.splitlines()[0] if c else ""
+        if not head.startswith("result_type=items"):
+            continue
+        # #213 Срез C (M5): парсим head как key=value (кавычки-aware) — resolution_status и
+        # item-membership берём из ДОВЕРЕННЫХ полей паспорта, НЕ substring по head и НЕ из тела
+        # (иначе название списка «resolution_status=ambiguous» или пункт «[clitem_x]» искажали бы).
+        fields = _parse_passport_fields(head)
+        if fields.get("resolution_status") in ("not_found", "ambiguous"):
+            continue
+        rid = fields.get("result_id")
+        _items_field = fields.get("items")
+        if _items_field is not None:
+            ids = {t for t in _items_field.split(",") if t.startswith("clitem_")}
+        else:
+            # #213 Срез C (R1 Codex medium MAJOR): legacy-паспорт срезов A/B БЕЗ поля items=
+            # (durable-история до подшага C) → fallback на тело, чтобы membership не терялся
+            # молча. Новый формат (items= есть) телом НЕ пользуется (M5-защита от подделки).
+            ids = set(re.findall(r"\[(clitem_[0-9a-f]+)\]", c))
+        if rid and ids:
+            results.append((rid, ids))
+    if len(results) + max(pending_batch_reads, 0) < 2:
+        return None
+    if len(results) < 2 and not source_result_id:
+        # ≥2 набирается только с учётом НЕисполненных read'ов этого же батча:
+        # результатов для привязки ещё нет — честная подсказка про порядок.
+        return ("source_result_required: в этом батче ты одновременно читаешь списки и "
+                "меняешь пункт — сначала получи списки, потом меняй по source_result_id "
+                "нужного результата (или уточни у пользователя).")
+    if source_result_id:
+        for rid, ids in results:
+            if rid == source_result_id:
+                if item_id in ids:
+                    return None
+                return (f"source_result_required: item_id не принадлежит результату "
+                        f"{source_result_id} — возьми id из нужного показанного списка.")
+        return (f"source_result_required: результата {source_result_id} нет в этом ходе.")
+    shown = ", ".join(rid for rid, _ in results)
+    return ("source_result_required: в этом ходе показано несколько списков "
+            f"(result_id: {shown}) — передай source_result_id того списка, чей пункт "
+            "меняешь, или уточни у пользователя, какой список он имел в виду.")
 
 
 def _map_deprecated_checklist_args(old_name: str, args: dict | None) -> dict:
@@ -588,12 +759,13 @@ class ReactState(MessagesState):
     # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
     # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
     unified_execute: bool
-    # #285 B2b-2 (meta_scope): на едином пути delete_my_account биндится ТОЛЬКО при явном сигнале
-    # удаления аккаунта (account_deletion_signal). Last-value; сброс на свежем ходе; ставится в override.
-    unified_del_ok: bool
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
+    # #213 Срез B: детерминированный READ-интент чек-листов ({kind, name_span, confidence})
+    # для soft cross-check в tool-node. Скрыт от LLM (не аргумент). None → fail-open (write-ход /
+    # не-checklist / флаги OFF / предслой упал). Ставится на свежем ходу; сбрасывается как router_*.
+    checklist_query_ctx: dict | None
     # #285 Фаза A (SHADOW): сериализованная TurnPolicy хода (БЕЗ ПД) — сайдкар в handle_turn выражает
     # решения сплита явным объектом; исполнением НЕ управляет (byte-identical — пин-тесты). Last-value;
     # сброс на свежем ходе; None на старых чекпойнтах (fallback-паттерн router_allowed_* выше).
@@ -1107,6 +1279,12 @@ def _react_desc(t: Any) -> Any:
     short = _REACT_TOOL_DESC.get(t.name)
     if not short:
         return t
+    # #213 Срез B: при полном контуре write-инструменты знают про привязку source_result_id
+    # (recovery после отказа source_result_required). При OFF — описание байт-в-байт.
+    if (t.name in _CHECKLIST_WRITE_ENFORCED_213
+            and _checklist_unified() and _checklist_querykind()):
+        short = (short + " Если в ходе показано несколько списков — добавь "
+                 "source_result_id=<result_id из паспорта нужного списка>.")
     try:
         return t.model_copy(update={"description": short})
     except Exception:  # noqa: BLE001 — на всякий случай не валим сборку инструментов
@@ -1230,14 +1408,14 @@ def _generic_confirm_wrap(inner: Any) -> Any:
     )
 
 
-def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
-                          allow_account_delete: bool = False) -> list:
+def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
     """#285 B2b-2: фильтр набора на ЕДИНОМ пути execute. Как `_apply_domain_policy` для read, НО write
     ВНЕ allowed_write НЕ отказывает — биндит КАНДИДАТОМ под generic confirm (ярус б). Так unsignaled
     write = подтверждение, не тупик #281/#282; молчаливой мутации нет (write в allowed_write — прямой,
     вне — confirm). read_pure candidate'ом НЕ открывается (кандидат только для write-класса).
-    meta_scope (B2 CodexH/M CRITICAL): ask_human/need_family всегда; delete_my_account — ТОЛЬКО по
-    явному сигналу удаления аккаунта (иначе не биндится → его pre-confirm audit-запись недостижима).
+    meta_scope: ask_human/need_family всегда; delete_my_account на голосовом едином пути НЕ выставляется
+    вообще (Борис 2026-07-04: удаление аккаунта голосом — не фича; кто захочет — отдельный явный флоу.
+    Снимает account-signal whack-a-mole; delete и так за собственным A11-confirm).
     allowed_* = None → не фильтровать (не должно случаться на unified — политика всегда ставит списки)."""
     if allowed_read is None and allowed_write is None:
         return tools
@@ -1247,8 +1425,8 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
     for t in tools:
         name = _TOOL_NAME_ALIASES.get(t.name, t.name)
         if t.name in _META_TOOLS:
-            if t.name == "delete_my_account" and not allow_account_delete:
-                continue  # разрушение аккаунта только по явному сигналу — иначе не бинд (не достижим)
+            if t.name == "delete_my_account":
+                continue  # НЕ на голосовом едином пути (Борис 2026-07-04) — отдельный явный флоу
             out.append(t)  # ask_human/need_family всегда (need_family — механизм кандидата)
         elif name not in TOOL_OP_CLASS:  # неизвестный → fail-closed
             continue
@@ -1361,6 +1539,41 @@ def _turn_outcome(result_lcs, result_msgs, prev_lcs_n: int, prev_msgs_n: int, *,
     else:
         oc = "ok"
     return oc, lcs_turn, tcs_turn
+
+
+def _emit_react_timeline(lcs, tcs, passes, intent, intent_meta) -> None:
+    """#255: распаковать react_loop в timeline трейса — на КАЖДЫЙ ход: intent + llm-вызовы (latency,
+    provider, fallback, ошибка primary) + агрегат инструментов + число проходов. Так `react_loop.replied`
+    перестаёт быть чёрным ящиком в админ-вьюере (видно, где ушли секунды при инциденте латентности).
+
+    ПД-free: только числа/enum/имена (как llm_calls_json #192), НЕ текст. Данные — per-turn delta
+    (_lcs/_tcs из _turn_outcome); на resume это post-resume проходы (#269), полный ход — в
+    react_turn_trace.llm_calls_json. `record()` — no-op без активного трейса; весь helper в try
+    (наблюдаемость НИКОГДА не валит ход и не трогает деньги/persist)."""
+    try:
+        _im = intent_meta or {}
+        _tltrace.record("react.classified", intent=(intent or "?"), source=_im.get("source"))
+        for _i, c in enumerate(lcs or []):
+            # latency в МЕТУ (latency_ms), НЕ в duration_ms: эти события пишутся в КОНЦЕ хода
+            # (at_ms=конец), а duration_ms там раздул бы TOTAL блока (emit_block: max(at_ms+duration))
+            # — показывал бы «конец+latency» вместо реального времени хода (react_loop.replied). Мету
+            # парсер react.* рендерит (префикс-правило).
+            _tltrace.record(
+                "react.llm", latency_ms=int(c.get("latency_ms") or 0),
+                provider_key=c.get("provider_key"), model=c.get("model"),
+                intent=c.get("intent"), fallback_fired=bool(c.get("fallback_fired")),
+                primary_error=c.get("primary_error"), call_index=c.get("call_index", _i))
+        _tl = tcs or []
+        if _tl:
+            _slow = sorted(_tl, key=lambda t: -(t.get("latency_ms") or 0))[:3]
+            _tltrace.record(
+                "react.tool", count=len(_tl),
+                sum_latency_ms=sum(int(t.get("latency_ms") or 0) for t in _tl),
+                errors=sum(1 for t in _tl if not t.get("ok")),
+                top3="; ".join("%s:%s" % (t.get("name"), t.get("latency_ms") or 0) for t in _slow))
+        _tltrace.record("react.passes", passes=int(passes or 0))
+    except Exception:  # noqa: BLE001 — наблюдаемость не валит ход
+        logger.debug("react_loop: emit_react_timeline failed", exc_info=True)
 
 
 def _maybe_alert_degraded_turn(
@@ -2295,8 +2508,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             if state.get("unified_execute"):  # B2b-2: единый путь → candidate-write под confirm
                 bound = _apply_unified_policy(
                     _select_tools(all_tools, state.get("active_families")),
-                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"),
-                    allow_account_delete=bool(state.get("unified_del_ok")))
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             else:
                 bound = _apply_domain_policy(
                     _select_tools(all_tools, state.get("active_families")),
@@ -2470,8 +2682,7 @@ def _build_graph(llm: Any, all_tools: list, *,
         if state.get("unified_execute"):  # B2b-2: candidate-write под confirm на dispatch
             _bound_list = _apply_unified_policy(
                 _bind_for(all_tools, active, eff),
-                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"),
-                allow_account_delete=bool(state.get("unified_del_ok")))
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
         else:
             _bound_list = _apply_domain_policy(
                 _bind_for(all_tools, active, eff),
@@ -2484,9 +2695,31 @@ def _build_graph(llm: Any, all_tools: list, *,
             DEPRECATED_TOOL_ALIASES as _DEPRECATED_ALIASES_213,
         )
         _unified_213 = _checklist_unified()
+        # #213 Срез B: срез гейтится preflight (как домены #221 — надстройка на preflight-контуре;
+        # R2 Codex high+medium MAJOR: без этого write-enforcement срабатывал бы при preflight=OFF,
+        # ломая fail-open матрицу). Единый гейт для cross-check И write-enforcement.
+        _sliceB_213 = bool(preflight_enabled) and _unified_213 and _checklist_querykind()
+        # READ-интент предслоя для cross-check (None → fail-open).
+        _cq_ctx_213 = state.get("checklist_query_ctx") if _sliceB_213 else None
+
+        # #213 Срез B (R1 high MAJOR): write-enforcement обязан видеть и НЕобработанные
+        # items-read вызовы ТЕКУЩЕГО батча — tool_calls одного AIMessage семантически
+        # параллельны, порядок в списке не гарантия (write между двумя read обошёл бы
+        # «≥2 результатов»). Id items-read вызовов батча; pending = ещё не обработанные
+        # (нет ToolMessage в out — R2 medium MINOR: загейченный read уже НЕ pending,
+        # его отказ в out, хоть и не result_type=items).
+        def _is_items_read_call_213(t: dict) -> bool:
+            n, a = t.get("name"), (t.get("args") or {})
+            if n == "show_checklist":
+                return True  # при ON канонизируется в get_checklist(mode=items)
+            return n == "get_checklist" and a.get("mode") == "items"
+
+        _batch_items_read_ids_213 = {
+            _t["id"] for _t in state["messages"][-1].tool_calls if _is_items_read_call_213(_t)}
         for tc in state["messages"][-1].tool_calls:
             name = tc["name"]
             tc_args = tc.get("args") or {}
+            _redirected_213 = False  # #213 Срез C (M9): был ли редирект имени для этого вызова
             # #213 Срез A: LLM-origin вызов депрекейт-алиаса при unified=ON канонизируется в
             # get_checklist ЗДЕСЬ — ДО unavailable-ветки (иначе family_not_loaded-петля) и ДО
             # диспетча. Durable-история (#193) праймит модель старыми именами (прецедент #221) —
@@ -2507,6 +2740,47 @@ def _build_graph(llm: Any, all_tools: list, *,
                 else:
                     name = "show_checklist"
                     tc_args = {"list_id_or_title": str((tc_args or {}).get("name") or "")}
+            # #213 Срез B: soft cross-check READ-интента чек-листов (LLM-origin by construction —
+            # этот цикл и есть LLM-эмитированные вызовы; internal-пути сюда не попадают).
+            # ctx None (write-ход / не-checklist / флаги/preflight OFF / предслой упал) → fail-open.
+            if _cq_ctx_213 is not None and _cq_ctx_213.get("confidence") == "high":
+                _refuse = _checklist_cross_check(
+                    _cq_ctx_213, name, tc_args, session, tenant_id, user_id)
+                if _refuse is not None:
+                    _msg213, _rk213, _redirect_args = _refuse
+                    if _redirect_args is not None:
+                        # узкий редирект: ТОЛЬКО заполнение отсутствующего name (r4-контракт);
+                        # mode/инструмент не меняются, текст не пишется.
+                        tc_args = _redirect_args
+                        _redirected_213 = True  # #213 Срез C (M9): пометка для метрик
+                    else:
+                        out.append(ToolMessage(
+                            content=_msg213, name=tc["name"], tool_call_id=tc["id"],
+                            artifact={"result_kind": _rk213}))  # #192: не-исполнение, честно
+                        continue
+            # #213 Срез B: write-enforcement source_result_id (приёмка п.8) — привязка ordinal-write
+            # к КОНКРЕТНОМУ items-result хода; ≥2 показанных списков без привязки → уточнение, не write.
+            # source_result_id — СЛУЖЕБНЫЙ аргумент (нет в схеме инструмента): вычищаем БЕЗУСЛОВНО
+            # при unified (R3 Codex high MINOR: strip не должен гейтиться preflight — иначе при
+            # preflight=OFF модель, праймленная desc-хинтом, дотащит лишний аргумент до write-tool).
+            _src_id = ""
+            if _unified_213 and name in _CHECKLIST_WRITE_ENFORCED_213:
+                _src_id = str((tc_args or {}).get("source_result_id") or "").strip()
+                tc_args = {k: v for k, v in (tc_args or {}).items() if k != "source_result_id"}
+            if _sliceB_213 and name in _CHECKLIST_WRITE_ENFORCED_213:
+                # pending = items-read вызовы батча, ещё НЕ обработанные (нет ToolMessage
+                # в out с их tool_call_id) — исполненные видны через out; загейченные тоже
+                # обработаны (их отказ в out) → не pending (R2 medium MINOR).
+                _handled_ids = {getattr(_m, "tool_call_id", None) for _m in out}
+                _pending = len(_batch_items_read_ids_213 - _handled_ids)
+                _wmsg = _checklist_write_enforce(
+                    state["messages"], out, str((tc_args or {}).get("item_id") or ""), _src_id,
+                    pending_batch_reads=_pending)
+                if _wmsg is not None:
+                    out.append(ToolMessage(
+                        content=_wmsg, name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "source_result_required"}))
+                    continue
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
             # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
@@ -2618,6 +2892,30 @@ def _build_graph(llm: Any, all_tools: list, *,
                     "latency_ms": int((_time.perf_counter() - _t) * 1000)}
             if name != tc["name"]:
                 _art["canonicalized_to"] = name
+            # #213 Срез C (M9): исход checklist-read для метрик канарейки — в ОТДЕЛЬНЫЕ поля
+            # artifact. result_kind ОСТАЁТСЯ "ok" (вызов ИСПОЛНЕН): переклассификация "ok" ломала бы
+            # кросс-эпиковый смысл «tool ran» — analysis_285_shadow считает executed по result_kind=="ok"
+            # (R1 Claude MAJOR). Non-исполнение (mode_mismatch/…) метится своим result_kind в continue выше.
+            # checklist_kind — конечный исход из ДОВЕРЕННОГО head (enum: items|overview|ambiguous|
+            # not_found|name_required); checklist_redirected — ОТДЕЛЬНЫЙ флаг, чтобы редирект не маскировал
+            # терминальный исход (R1 Codex high MAJOR: redirect на нерезолв мог бы скрыть ambiguous).
+            if _redirected_213:
+                _art["checklist_redirected"] = True
+            if name == "get_checklist":
+                _rc = str(res)
+                if _rc.startswith("error: name_required"):  # startswith: доверенная 1-я строка, не тело
+                    _art["checklist_kind"] = "name_required"
+                elif _rc.startswith("error:"):
+                    # #213 Срез C (R2 Claude MINOR): исполненные схемо-ошибки (invalid_mode/
+                    # name_forbidden при non-high confidence, no user_id) — явный kind, не «ok без kind».
+                    _art["checklist_kind"] = "schema_error"
+                else:
+                    _hf = _parse_passport_fields(_rc.splitlines()[0] if _rc else "")
+                    _rs, _rt = _hf.get("resolution_status"), _hf.get("result_type")
+                    if _rs in ("ambiguous", "not_found"):
+                        _art["checklist_kind"] = _rs
+                    elif _rt in ("items", "overview"):
+                        _art["checklist_kind"] = _rt
             out.append(ToolMessage(content=str(res), name=tc["name"], tool_call_id=tc["id"],
                                    artifact=_art))
             if (name in _CORE_MUTATING_TOOLS
@@ -3461,11 +3759,33 @@ async def handle_turn(
                            # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
                            # не затрагивало (бинд по allowed_*, они сброшены), только колонка лога.
                            "router_decision_json": None,
+                           # #213 Срез B: сброс каждый свежий ход (last-value канал, как router_*).
+                           "checklist_query_ctx": None,
                            # #285 Фаза A: сброс полиси-канала на свежем ходе (дисциплина last-value
                            # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
                            "turn_policy_json": None,
                            # #285 B2b: сброс флага единого пути (override ниже ставит True для канарейки).
-                           "unified_execute": False, "unified_del_ok": False}
+                           "unified_execute": False}
+            # #213 Срез B: детерминированный READ-интент чек-листов → soft cross-check в tool-node.
+            # ТОЛЬКО при preflight + оба флага (R1 medium: срез B — надстройка на preflight-контуре,
+            # как домены #221; без _preflight конфиг «preflight выключен» внезапно получал бы
+            # cross-check/enforcement — ломается fail-open матрица). Write-ходы/не-checklist → None.
+            if _preflight and _checklist_unified() and _checklist_querykind():
+                try:
+                    from sreda.runtime.react_preflight import classify_checklist_query
+                    _cq = classify_checklist_query(user_text)
+                    if _cq is not None:
+                        _init["checklist_query_ctx"] = {
+                            "kind": _cq.kind, "name_span": _cq.name_span,
+                            "confidence": _cq.confidence,
+                            # #213 Срез B (R2 Claude B1): нормализованный текст хода — cross-check
+                            # НЕ конфликтит имя, которое юзер РЕАЛЬНО назвал (компаунд items+items
+                            # «в списке кино и в списке машина»: span=«кино», но «машина» в тексте).
+                            "user_text_norm": re.sub(
+                                r"[-‐‑‒–—]", "-", (user_text or "").lower())}
+                except Exception:  # noqa: BLE001 — предслой не роняет ход (fail-open)
+                    logger.warning("react_loop: checklist_query classify failed → fail-open",
+                                   exc_info=True)
             if _preflight:
                 from sreda.runtime.react_preflight import _must_task, classify_intent
                 _prev = ((snap.values or {}).get("intent") if snap and snap.values else None)
@@ -3544,13 +3864,11 @@ async def handle_turn(
                 try:
                     from sreda.runtime.react_policy import compute_unified_policy
                     from sreda.runtime.react_preflight import route_domains as _rd285
-                    from sreda.runtime.react_signals import account_deletion_signal as _acct_del
                     _upol = compute_unified_policy(user_text, _rd285(user_text))
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
                     _init["unified_execute"] = True  # B2b-2: bind-сайты → _apply_unified_policy (candidate)
-                    _init["unified_del_ok"] = bool(_acct_del(user_text))  # meta_scope: delete_my_account по сигналу
                     _init["router_allowed_read_domains"] = _uar
                     _init["router_allowed_write_domains"] = _uaw
                     _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
@@ -3618,6 +3936,22 @@ async def handle_turn(
                     _lcs_all, _msgs_all, _lcs0, _msgs0, tenant_id=tenant_id)
                 # #221 Ф3b: решение роутера из финального состояния (переживает паузу/resume в чекпойнте)
                 _rdj = result.get("router_decision_json") if isinstance(result, dict) else None
+                # #213 Срез C (M9): kind/confidence классификатора чек-листов → в трейс (для метрик
+                # канарейки: mismatch/redirect/ambiguous rate берутся из tool_calls_json.result_kind,
+                # а query_kind — отсюда). Дописываем в routing_decision_json (та же колонка), только
+                # когда ctx был (флаг ON) → OFF по-прежнему без новых данных.
+                _cqctx = result.get("checklist_query_ctx") if isinstance(result, dict) else None
+                if _cqctx:
+                    try:
+                        _rdo = json.loads(_rdj) if _rdj else {}
+                        _rdo["checklist_query"] = {
+                            "kind": _cqctx.get("kind"),
+                            "confidence": _cqctx.get("confidence"),
+                            "has_span": bool(_cqctx.get("name_span")),
+                        }
+                        _rdj = json.dumps(_rdo, ensure_ascii=False)
+                    except Exception:  # noqa: BLE001 — метрика best-effort, трейс не теряем
+                        pass
                 _passes_fin = (result.get("turn_pass_count") if isinstance(result, dict) else 0) or 0
                 # #285 Фаза A: снапшот полиси из финального состояния (переживает паузу/resume)
                 # + события хода (guard/resume/passes) — guard-каунты для выхода фазы (R1 CodexH).
@@ -3644,6 +3978,11 @@ async def handle_turn(
                     routing_decision_json=_rdj,
                     turn_policy_json=_tpj,
                     confirm_resolution=_confirm_resolution)
+                # #255: распаковать react_loop в timeline (ПОСЛЕ persist — сбой эмита не блокирует БД).
+                _emit_react_timeline(
+                    _lcs, _tcs, _passes_fin,
+                    result.get("intent") if isinstance(result, dict) else None,
+                    result.get("intent_meta") if isinstance(result, dict) else None)
                 # #258: деградировавший ход → алерт оператору (best-effort; _outcome/passes уже
                 # посчитаны; на проде трейс ВКЛ — он же источник сигнала).
                 _maybe_alert_degraded_turn(
