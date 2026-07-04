@@ -1745,6 +1745,41 @@ def _tail_directives_enabled() -> bool:
     return bool(getattr(get_settings(), "react_tail_directives_enabled", False))
 
 
+def _unified_availability_directive(bound) -> str:
+    """#285 B4 (пилляр 4, анти-дрейф промпт↔bind): честный per-turn хвост для ЕДИНОГО пути.
+    Перечисляет инструменты, ФАКТИЧЕСКИ забинденные в ЭТОМ ходе, и несёт #279-семантику: способность
+    есть; это про текущий ход, а не про умения вообще; нужного здесь нет → коротко уточни недостающее,
+    не отказывай. Пересобирается КАЖДЫЙ проход из актуального `bound` (bound меняется между проходами:
+    кандидаты, семьи). Уходит ТОЛЬКО хвостом на user-роли (#247), НЕ в системный промпт — кеш-префикс
+    на unified стабилен.
+    NB: формулировка честности параллельна chat_fact_system_prompt (react_preflight.py ~610-615);
+    физическое DRY-объединение отложено до Фазы E (chat/fact-промт прод-живой — сейчас не трогаем)."""
+    _names = ", ".join(sorted({getattr(t, "name", "") for t in (bound or [])} - {""}))
+    _have = (f"Прямо в этом ходе тебе доступны инструменты: {_names}. "
+             if _names else "Прямо в этом ходе инструменты не подключены. ")
+    return (
+        _have
+        + "Это про ТЕКУЩИЙ ход, а не про твои умения вообще; других инструментов здесь не зови. "
+        "Среда умеет и напоминания, и задачи, и списки, и память. НИКОГДА не говори, что «не умеешь» "
+        "их, и не извиняйся за «несделанное»: способность есть. Но и не утверждай, что уже сделала "
+        "это прямо в текущем ответе. Если человек хочет что-то напомнить, записать или запомнить, а "
+        "нужного инструмента здесь нет, не отказывай, а коротко уточни недостающее: для напоминания "
+        "что и когда, для задачи или списка что и куда, для памяти что запомнить."
+    )
+
+
+def _effective_intent(state, preflight_enabled: bool):
+    """#285 B4 (Codex high+medium R1 MAJOR): ЕДИНЫЙ источник effective_intent для ВСЕХ узлов
+    (chat/run_tools/route/telemetry/caps/guard). На едином пути (unified_execute) ВСЕГДА "task" —
+    так одна персона И unified-политика согласованы во ВСЕХ узлах, а не только в chat(): иначе
+    dispatch/guard/web-caps читали бы сырой intent и на аномалии intent=chat при unified свернулись
+    бы в web-only под task-промптом (полу-defensive хуже, чем полный). На НЕедином — прежняя
+    деривация #197: intent при preflight, иначе None (byte-identical OFF-откат)."""
+    if state.get("unified_execute"):
+        return "task"
+    return (state.get("intent") or None) if preflight_enabled else None
+
+
 def _summary_enabled_for(tenant_id: str) -> bool:
     """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
     Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
@@ -2464,15 +2499,19 @@ def _build_graph(llm: Any, all_tools: list, *,
         _chat_timeout_s = 15.0
 
     def chat(state: ReactState):
-        # #197: effective_intent — читаем сохранённый intent ТОЛЬКО при preflight_enabled. OFF → None →
-        # task-ветка ниже = ДОСЛОВНО прежнее поведение (byte-identical даже при чекпойнте intent=chat).
-        eff = (state.get("intent") or None) if preflight_enabled else None
+        # #197 + #285 B4: единый источник effective_intent (_effective_intent) — на unified ВСЕГДА
+        # "task", иначе intent при preflight (OFF → None → byte-identical даже при чекпойнте intent=chat).
+        # Один резолвер во ВСЕХ узлах (chat/run_tools/route) → одна персона+политика согласованы.
+        eff = _effective_intent(state, preflight_enabled)
         _used_provider, _used_model, _fallback_fired = provider_key, _model_name, False
         # #159 R2 (Codex MAJOR): телеметрия попытки primary при срабатывании запаса. Учёт ДЕНЕГ
         # (#175) пишется на ОТВЕТИВШИЙ провайдер — токены зависшего/упавшего primary неизвестны (его
         # поток отброшен обёрткой). Идентичность+ошибку primary кладём в наблюдательный трейс (#192),
         # чтобы дашборд стоимости НЕ выглядел так, будто primary не вызывался/был бесплатным.
         _primary_provider, _primary_model, _primary_error = "", "", ""
+        # #285 B4: eff уже нормализован (_effective_intent → "task" на unified), поэтому единый путь
+        # chat/fact-ветку не берёт БЕЗ отдельного guard здесь — «одна персона» гарантирована в источнике
+        # eff (согласовано с run_tools/route/caps/guard, Codex high+medium R1 MAJOR).
         if eff in ("chat", "fact"):
             # #197 chat/fact: рассуждающая модель (deepseek) + ТОЛЬКО web-семья + honesty. ИНВАРИАНТ:
             # SCOPE всегда web-only (bound по eff ДО try → fallback наследует тот же bound → не расширится);
@@ -2538,10 +2577,15 @@ def _build_graph(llm: Any, all_tools: list, *,
                 else:
                     from sreda.runtime.react_preflight import _section_hint
                     _sec = _section_hint(_text)
+            # #285 B4 (пилляр 4): единый путь — честный хвост «доступны: …» из ФАКТИЧЕСКОГО bound этого
+            # прохода + #279-семантика (способность есть; про текущий ход; нужного нет → уточни, не
+            # отказывай). Только на unified_execute; None на легаси-пути (там хвост не меняется).
+            _avail = _unified_availability_directive(bound) if state.get("unified_execute") else None
             # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
             # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
             # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
-            if _tail_directives_enabled():
+            # #285 B4: на unified ВСЕГДА user-role хвост (OFF-ветка system-append запрещена — кеш-префикс цел).
+            if _tail_directives_enabled() or state.get("unified_execute"):
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                           budget=_compact_budget(), summary=history_summary)
                 # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
@@ -2549,7 +2593,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
                 if time_tail_line:
                     _msgs = _append_time_tail(_msgs, time_tail_line)
-                _tail = [d for d in (nudge, _sec) if d]
+                _tail = [d for d in (nudge, _avail, _sec) if d]
                 if _tail:
                     _directive = "\n\n".join(_tail)
                     # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
@@ -2649,7 +2693,7 @@ def _build_graph(llm: Any, all_tools: list, *,
         exec_id = (hashlib.sha1(turn_key.encode("utf-8")).hexdigest()
                    if turn_key else "")
         active = list(state.get("active_families") or [])
-        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
+        eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         wrote_unkeyed = False  # отработал ли инструмент unkeyed-write семьи (→ выключит guard)
         # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента из НЕ
         # загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш. #197: тот же
@@ -2941,7 +2985,7 @@ def _build_graph(llm: Any, all_tools: list, *,
     def route(state: ReactState):
         last = state["messages"][-1]
         passes = state.get("turn_pass_count") or 0
-        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
+        eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         if getattr(last, "tool_calls", None):
             # АНТИ-ПЕТЛЯ (R1 medium+субагент): лимит проходов исчерпан (повтор need_family/
             # недоступного инструмента и т.п.) → грациозный стоп-узел, НЕ зацикливаемся до
@@ -2973,8 +3017,10 @@ def _build_graph(llm: Any, all_tools: list, *,
 
     def guard(state: ReactState):
         # #197 defense-in-depth: chat/fact сюда НЕ маршрутизируются (route → END), но если бы попали —
-        # ничего не добираем (scope остаётся web-only, productivity не просачивается).
-        if preflight_enabled and (state.get("intent") in ("chat", "fact")):
+        # ничего не добираем (scope остаётся web-only, productivity не просачивается). #285 B4 (Codex R2
+        # MAJOR): через _effective_intent (unified → "task") — согласовано с chat/run_tools/route; guard
+        # был ПОСЛЕДНИМ сырым intent-сайтом, иначе recovery на аномалии unified+intent=chat молчал бы.
+        if _effective_intent(state, preflight_enabled) in ("chat", "fact"):
             return {}
         # #267 A4 (Борис: «роутер побеждает»): в EXECUTE-режиме (роутер решил раздел) guard НЕ
         # восстанавливается в ЧУЖОЙ раздел — НЕ грузит семьи вне allowed и НЕ расширяет домены роутера
