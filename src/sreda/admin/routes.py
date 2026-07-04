@@ -7,11 +7,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Form, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Cookie, Depends, Form, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from sreda.admin.auth import require_admin_token
+from sreda.admin.auth import AdminPrincipal, require_admin_token
+from sreda.admin.csrf import csrf_token, require_csrf, require_same_origin
 from sreda.admin.queries import (
     get_budget_summary_for_day,
     get_llm_calls,
@@ -61,14 +62,17 @@ def _get_session():
 
 
 def _audit_admin_view(
-    session, action: str, token: str, request: Request, **metadata
+    session, action: str, actor: str, request: Request, **metadata
 ) -> None:
     """Helper: пишет audit_log запись для admin GET-view операций.
 
     2026-04-28: для compliance каждое чтение PII через админку
     логируется. Best-effort — ошибки не пробрасывает (не валит view).
+
+    #305: ``actor`` = ``principal.actor_id`` (``admin_tg:<id>`` для Telegram-входа,
+    ``admin_token`` для legacy fallback) — raw-токен больше не хешируется/не течёт.
     """
-    from sreda.services.audit import audit_event, hash_admin_token
+    from sreda.services.audit import audit_event
 
     md = {
         "ip": request.headers.get("x-forwarded-for", "").split(",")[0].strip()
@@ -79,7 +83,7 @@ def _audit_admin_view(
     audit_event(
         session,
         actor_type="admin",
-        actor_id=hash_admin_token(token),
+        actor_id=actor,
         action=action,
         metadata=md,
     )
@@ -89,7 +93,7 @@ def _audit_admin_view(
 @router.get("/", response_class=HTMLResponse)
 def admin_dashboard(
     request: Request,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """Обзорный дашборд (#292): сервер/туннели + KPI + ошибки/медленные +
@@ -102,7 +106,7 @@ def admin_dashboard(
 
     from datetime import UTC
 
-    _audit_admin_view(session, "admin.dashboard.viewed", token, request)
+    _audit_admin_view(session, "admin.dashboard.viewed", principal.actor_id, request)
     raw_snap, snap_at = ov.load_snapshot(session, ov.KEY_OVERVIEW)
     # R1 medium MAJOR: устаревший/битый payload → пустые блоки, не 500.
     snap = ov.normalize_overview(raw_snap)
@@ -114,7 +118,7 @@ def admin_dashboard(
     return templates.TemplateResponse(
         request, "dashboard.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "section": "dashboard",
             "snap": snap,
             "snap_age_min": snap_age_min,
@@ -127,7 +131,7 @@ def admin_dashboard(
 @router.get("/llm-money", response_class=HTMLResponse)
 def admin_llm_money(
     request: Request,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """Раздел «LLM и деньги» (#292 Фаза B): карточки провайдеров —
@@ -137,7 +141,7 @@ def admin_llm_money(
 
     from sreda.admin import overview_snapshot as ov
 
-    _audit_admin_view(session, "admin.llm_money.viewed", token, request)
+    _audit_admin_view(session, "admin.llm_money.viewed", principal.actor_id, request)
     raw_snap, snap_at = ov.load_snapshot(session, ov.KEY_OVERVIEW)
     snap = ov.normalize_overview(raw_snap)
     snap_age_min: int | None = None
@@ -148,7 +152,7 @@ def admin_llm_money(
     return templates.TemplateResponse(
         request, "llm_money.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "section": "llm-money",
             "snap": snap,
             "snap_age_min": snap_age_min,
@@ -159,7 +163,8 @@ def admin_llm_money(
 @router.post("/refresh-snapshot")
 async def admin_refresh_snapshot(
     request: Request,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
+    _: None = Depends(require_csrf),
     session=Depends(_get_session),
 ):
     """Ручной пересбор снапшота («обновить сейчас»). Явное действие
@@ -172,29 +177,158 @@ async def admin_refresh_snapshot(
 
     from sreda.admin import overview_snapshot as ov
 
-    _audit_admin_view(session, "admin.dashboard.refreshed", token, request)
+    _audit_admin_view(session, "admin.dashboard.refreshed", principal.actor_id, request)
     ok = await asyncio.to_thread(
         ov.refresh_overview, get_session_factory(), get_settings()
     )
-    suffix = "" if ok else "&refresh=err"
+    suffix = "?refresh=err" if not ok else ""
     return RedirectResponse(
-        url=f"/admin/?token={token}{suffix}", status_code=303,
+        url=f"/admin/{suffix}", status_code=303,
     )
+
+
+# ---------------------------------------------------------------------------
+# #305 — Telegram login flow (unauthenticated entry, NO require_admin_token)
+# ---------------------------------------------------------------------------
+
+# Cookies for the login handshake live under path=/admin/login so they are only
+# sent to the login endpoints. SameSite=Strict browser_bind is the CSRF/binding
+# defence for /admin/login/claim.
+_LOGIN_COOKIE_KW = dict(
+    httponly=True, secure=True, samesite="strict", path="/admin/login", max_age=300,
+)
+
+
+def _login_client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if xff:
+        return xff
+    return request.client.host if request.client else "?"
+
+
+@router.get("/login", response_class=HTMLResponse)
+def admin_login(request: Request, session=Depends(_get_session)):
+    """Unauth entry: create a login challenge, render the deep-link button +
+    human_code, set the two Strict/HttpOnly login cookies. No admin auth here."""
+    from sreda.config.bot_registry import TelegramBotRegistry
+    from sreda.services.admin_login import (
+        AdminLoginRateLimited,
+        start_challenge,
+    )
+
+    settings = get_settings()
+
+    # Fail-closed: Telegram login is OFF unless SREDA_ADMIN_TG_IDS is non-empty.
+    # Do NOT render a dead deep-link button (nor create a useless challenge) when
+    # nobody can ever confirm it — return 403 (checklist #15/#10 fail-closed).
+    if not settings.admin_tg_ids:
+        return HTMLResponse(
+            "<h3>Вход через Telegram не настроен</h3>"
+            "<p>Список администраторов (SREDA_ADMIN_TG_IDS) пуст. "
+            "Используйте аварийный токен-доступ.</p>",
+            status_code=403,
+        )
+
+    # Fail-closed: need a resolvable admin-bot username to build the deep-link.
+    try:
+        registry = TelegramBotRegistry.from_settings(settings)
+        bot_username = registry.resolve(settings.admin_bot_key).username
+    except Exception:  # noqa: BLE001 — unknown key / misconfig
+        bot_username = None
+    if not bot_username:
+        return HTMLResponse(
+            "<h3>Вход через Telegram не настроен</h3>"
+            "<p>Не задан username админ-бота (SREDA_*_BOT_USERNAME). "
+            "Используйте аварийный токен-доступ.</p>",
+            status_code=500,
+        )
+
+    try:
+        result = start_challenge(session, _login_client_ip(request))
+    except AdminLoginRateLimited:
+        return HTMLResponse(
+            "<h3>Слишком много попыток входа</h3>"
+            "<p>Подождите несколько минут и обновите страницу.</p>",
+            status_code=429,
+        )
+
+    deep_link = f"https://t.me/{bot_username}?start=adm_{result.challenge_id}"
+    response = templates.TemplateResponse(
+        request, "login.html",
+        {"deep_link": deep_link, "human_code": result.human_code},
+    )
+    response.set_cookie("challenge_ref", result.challenge_id, **_LOGIN_COOKIE_KW)
+    response.set_cookie("browser_bind", result.browser_bind_raw, **_LOGIN_COOKIE_KW)
+    return response
+
+
+@router.get("/login/status")
+def admin_login_status(
+    session=Depends(_get_session),
+    challenge_ref: str | None = Cookie(default=None),
+    browser_bind: str | None = Cookie(default=None),
+):
+    """READ-only status poll. No mutation, no cookies set."""
+    from sreda.services.admin_login import get_status
+
+    if not challenge_ref or not browser_bind:
+        return JSONResponse({"status": "unknown"})
+    status = get_status(session, challenge_ref, browser_bind)
+    return JSONResponse({"status": status})
+
+
+@router.post("/login/claim")
+def admin_login_claim(
+    request: Request,
+    _: None = Depends(require_same_origin),
+    session=Depends(_get_session),
+    challenge_ref: str | None = Cookie(default=None),
+    browser_bind: str | None = Cookie(default=None),
+):
+    """Consume a confirmed challenge → mint admin session cookie.
+
+    CSRF defence, two layers (checklist #10):
+    1. Route-level ``require_same_origin`` (Origin + Sec-Fetch-Site) rejects a
+       cross-site / foreign-Origin POST fail-closed (403) BEFORE any DB work.
+       There is no session cookie yet (it's minted here), so the double-submit
+       token doesn't apply — this is the route-level gate #10 asks for.
+    2. The ``browser_bind`` cookie is SameSite=Strict (never sent cross-site) AND
+       a secret the attacker cannot know, so a forged claim can't consume the
+       challenge even if the Origin gate were somehow bypassed."""
+    from sreda.services.admin_login import claim, mint_session
+
+    if not challenge_ref or not browser_bind:
+        return JSONResponse({"status": "denied"}, status_code=400)
+
+    tg_id = claim(session, challenge_ref, browser_bind)
+    if not tg_id:
+        return JSONResponse({"status": "denied"}, status_code=400)
+
+    raw_session = mint_session(session, tg_id)
+    response = JSONResponse({"redirect": "/admin"})
+    response.set_cookie(
+        "admin_tg_session", raw_session,
+        httponly=True, secure=True, samesite="lax", path="/admin", max_age=86400,
+    )
+    # Clear the one-shot login cookies (same path they were set under).
+    response.delete_cookie("challenge_ref", path="/admin/login")
+    response.delete_cookie("browser_bind", path="/admin/login")
+    return response
 
 
 @router.get("/users", response_class=HTMLResponse)
 def admin_users(
     request: Request,
     page: int = Query(1, ge=1),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
-    _audit_admin_view(session, "admin.users.viewed", token, request, page=page)
+    _audit_admin_view(session, "admin.users.viewed", principal.actor_id, request, page=page)
     users_page = get_users_page(session, page=page)
     return templates.TemplateResponse(
         request, "users.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "users": users_page.rows,
             "page": users_page,
             "section": "users",
@@ -206,7 +340,7 @@ def admin_users(
 def admin_tenant_detail(
     tenant_id: str,
     request: Request,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """Карточка тенанта: траты день/неделя/месяц по моделям + ссылки на
@@ -214,12 +348,12 @@ def admin_tenant_detail(
     Подпись «расходы тенанта/аккаунта, не пользователя» (тенант может иметь
     несколько юзеров) — в шаблоне."""
     _audit_admin_view(
-        session, "admin.tenant.viewed", token, request, tenant_id=tenant_id,
+        session, "admin.tenant.viewed", principal.actor_id, request, tenant_id=tenant_id,
     )
     detail = get_tenant_spend_detail(session, tenant_id)
     return templates.TemplateResponse(
         request, "tenant_detail.html",
-        {"token": token, "section": "users", "detail": detail},
+        {"csrf_token": csrf_token(request), "section": "users", "detail": detail},
     )
 
 
@@ -227,7 +361,7 @@ def admin_tenant_detail(
 def admin_budget(
     request: Request,
     date_str: str | None = Query(None, alias="date"),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """Per-day budget consumption view.
@@ -242,7 +376,7 @@ def admin_budget(
     - "→ Next day" is hidden when ``selected == today`` — nothing to see
       in the future.
     """
-    _audit_admin_view(session, "admin.budget.viewed", token, request)
+    _audit_admin_view(session, "admin.budget.viewed", principal.actor_id, request)
 
     today = datetime.now(_MSK_TZ).date()
     selected = today
@@ -261,7 +395,7 @@ def admin_budget(
     return templates.TemplateResponse(
         request, "budget.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "rows": rows,
             "has_active_subs": has_subs,
             "section": "budget",
@@ -280,7 +414,7 @@ def admin_budget(
 def admin_spend_by_model(
     request: Request,
     period: str = Query("month"),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """Траты по (provider_key, model) за день/неделю/месяц (MSK).
@@ -292,13 +426,13 @@ def admin_spend_by_model(
     if period not in ("day", "week", "month"):
         period = "month"
     _audit_admin_view(
-        session, "admin.spend_by_model.viewed", token, request, period=period,
+        session, "admin.spend_by_model.viewed", principal.actor_id, request, period=period,
     )
     report = get_spend_by_model(session, period)
     return templates.TemplateResponse(
         request, "spend_by_model.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "section": "spend-by-model",
             "period": period,
             "report": report,
@@ -309,14 +443,14 @@ def admin_spend_by_model(
 @router.get("/web-search", response_class=HTMLResponse)
 def admin_web_search(
     request: Request,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """Tavily quota dashboard — global stats + per-user breakdown.
 
     2026-04-29: введено вместе с переездом web_search на Tavily
     (1000/мес free tier разделяется на per-user 30 + global 950)."""
-    _audit_admin_view(session, "admin.web_search.viewed", token, request)
+    _audit_admin_view(session, "admin.web_search.viewed", principal.actor_id, request)
     from sreda.services.web_search_usage import WebSearchUsageCounter
     counter = WebSearchUsageCounter(session)
     summary = counter.admin_summary()
@@ -324,7 +458,7 @@ def admin_web_search(
     return templates.TemplateResponse(
         request, "web_search.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "summary": summary,
             "per_user": per_user,
             "section": "web-search",
@@ -468,7 +602,7 @@ def _provider_spend(session, *, days: int = 30) -> list[dict]:
 
 def _llm_context(
     session,
-    token: str,
+    request: Request,
     *,
     flash: str | None = None,
     with_balances: bool = True,
@@ -530,7 +664,7 @@ def _llm_context(
     # показал бы «нет данных» при наличии расхода).
     react_spend = _provider_spend(session)
     return {
-        "token": token,
+        "csrf_token": csrf_token(request),
         "section": "llm",
         "providers": providers,
         "current_primary": current_primary,
@@ -546,17 +680,17 @@ def _llm_context(
 def admin_llm(
     request: Request,
     refresh: int = Query(default=0),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     _audit_admin_view(
-        session, "admin.llm.viewed", token, request,
+        session, "admin.llm.viewed", principal.actor_id, request,
         refresh=bool(refresh),
     )
     if refresh:
         from sreda.services import provider_balances as pb
         pb.invalidate_cache()
-    ctx = _llm_context(session, token)
+    ctx = _llm_context(session, request)
     return templates.TemplateResponse(request, "llm.html", ctx)
 
 
@@ -565,7 +699,8 @@ def admin_llm_save(
     request: Request,
     primary: str = Form(...),
     fallback: str = Form(default=""),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
+    _: None = Depends(require_csrf),
     session=Depends(_get_session),
 ):
     """Persist the chosen primary/fallback to ``runtime_config``.
@@ -578,7 +713,7 @@ def admin_llm_save(
     known_keys = {meta["key"] for meta in _LLM_PROVIDERS_METADATA}
     if primary not in known_keys:
         ctx = _llm_context(
-            session, token,
+            session, request,
             flash=f"Неизвестный primary-провайдер: {primary!r}",
         )
         return templates.TemplateResponse(request, "llm.html", ctx)
@@ -586,13 +721,13 @@ def admin_llm_save(
     fallback_clean = fallback.strip()
     if fallback_clean and fallback_clean not in known_keys:
         ctx = _llm_context(
-            session, token,
+            session, request,
             flash=f"Неизвестный fallback-провайдер: {fallback_clean!r}",
         )
         return templates.TemplateResponse(request, "llm.html", ctx)
     if fallback_clean == primary:
         ctx = _llm_context(
-            session, token,
+            session, request,
             flash="Fallback не может совпадать с primary — сохранение отменено.",
         )
         return templates.TemplateResponse(request, "llm.html", ctx)
@@ -606,11 +741,11 @@ def admin_llm_save(
     )
     # Audit: admin сменил LLM provider — важная compliance-actie.
     _audit_admin_view(
-        session, "admin.llm.changed", token, request,
+        session, "admin.llm.changed", principal.actor_id, request,
         primary=primary, fallback=fallback_clean or "(none)",
     )
     ctx = _llm_context(
-        session, token,
+        session, request,
         flash=(
             f"Сохранено — primary: {primary}"
             + (f", fallback: {fallback_clean}" if fallback_clean else ", без fallback")
@@ -626,17 +761,17 @@ def admin_llm_calls(
     tenant_id: str = Query(...),
     feature_key: str | None = Query(None),
     page: int = Query(default=1, ge=1),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     _audit_admin_view(
-        session, "admin.llm_calls.viewed", token, request,
+        session, "admin.llm_calls.viewed", principal.actor_id, request,
         tenant_id=tenant_id, feature_key=feature_key or "", page=page,
     )
     data = get_llm_calls(session, tenant_id, feature_key, page=page)
     return templates.TemplateResponse(
         request, "llm_calls.html",
-        {"token": token, "data": data, "section": "users"},
+        {"csrf_token": csrf_token(request), "data": data, "section": "users"},
     )
 
 
@@ -646,11 +781,11 @@ def admin_logs(
     file: str | None = Query(default=None),
     tail: int = Query(default=500, ge=50, le=5000),
     grep: str | None = Query(default=None),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     _audit_admin_view(
-        session, "admin.logs.viewed", token, request,
+        session, "admin.logs.viewed", principal.actor_id, request,
         file=file, tail=tail, grep=grep,
     )
     """Tail view over launchd log files configured in settings.
@@ -720,7 +855,7 @@ def admin_logs(
     return templates.TemplateResponse(
         request, "logs.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "section": "logs",
             "log_files": files_meta,
             "selected_key": selected_key,
@@ -782,7 +917,7 @@ def admin_traces(
     tail: int = Query(default=50, ge=1, le=500),
     min_total_ms: int = Query(default=0, ge=0, le=600_000),
     user_id: str = Query(default="", max_length=64, regex=r"^[a-zA-Z0-9_]*$"),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """Per-stage latency breakdown viewer для conversation.chat turns.
@@ -802,7 +937,7 @@ def admin_traces(
     )
 
     _audit_admin_view(
-        session, "admin.traces.viewed", token, request,
+        session, "admin.traces.viewed", principal.actor_id, request,
         tail=tail, min_total_ms=min_total_ms,
         user_id=user_id or None,
     )
@@ -842,7 +977,7 @@ def admin_traces(
     return templates.TemplateResponse(
         request, "traces.html",
         {
-            "token": token,
+            "csrf_token": csrf_token(request),
             "section": "traces",
             "traces": traces,
             "tail": tail,
@@ -860,7 +995,8 @@ def admin_traces(
 def admin_tenant_reset(
     request: Request,
     tenant_id: str = Query(...),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
+    _: None = Depends(require_csrf),
     session=Depends(_get_session),
 ):
     """Full tenant reset: delete subscriptions, skill states, all events,
@@ -905,12 +1041,12 @@ def admin_tenant_reset(
 
     # 152-ФЗ Часть 2: audit log admin reset action до финального commit'а,
     # чтобы запись попала в одну транзакцию с deletes.
-    from sreda.services.audit import audit_event, hash_admin_token
+    from sreda.services.audit import audit_event
 
     audit_event(
         session,
         actor_type="admin",
-        actor_id=hash_admin_token(token),
+        actor_id=principal.actor_id,
         action="admin.tenant.reset",
         resource_type="tenant",
         resource_id=tenant_id,
@@ -934,7 +1070,7 @@ def admin_tenant_reset(
 @router.post("/tenant/approve")
 async def admin_tenant_approve(
     tenant_id: str = Query(...),
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
     """410 Gone — Phase 2D removed manual approval.
@@ -943,6 +1079,10 @@ async def admin_tenant_approve(
     (`services/onboarding._auto_approve_and_grant_free_tier`). This
     route returns 410 для одного релиза чтобы старые форм-bookmarks
     видели понятный код. Будет полностью удалён в follow-up release.
+
+    #305: no ``require_csrf`` gate — this route mutates nothing (returns 410
+    unconditionally for legacy bookmarks). Adding CSRF would only turn the
+    intended 410 into a 403 for a stale form; кроме того форма удалена.
     """
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(
@@ -1121,7 +1261,8 @@ async def _legacy_admin_tenant_approve_unused(
 @router.post("/tenant/{tenant_id}/suspend", response_class=HTMLResponse)
 async def admin_tenant_suspend(
     tenant_id: str,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
+    _: None = Depends(require_csrf),
     session=Depends(_get_session),
 ):
     """Suspend tenant's housewife_assistant subscription (status='active' → 'suspended').
@@ -1131,7 +1272,7 @@ async def admin_tenant_suspend(
     EntitlementGate when they message the bot.
     """
     from sreda.db.models.billing import TenantSubscription
-    from sreda.services.audit import audit_event, hash_admin_token
+    from sreda.services.audit import audit_event
 
     sub = (
         session.query(TenantSubscription)
@@ -1154,7 +1295,7 @@ async def admin_tenant_suspend(
     audit_event(
         session,
         actor_type="admin",
-        actor_id=hash_admin_token(token),
+        actor_id=principal.actor_id,
         action="admin.tenant.suspend",
         resource_type="tenant",
         resource_id=tenant_id,
@@ -1170,12 +1311,13 @@ async def admin_tenant_suspend(
 @router.post("/tenant/{tenant_id}/unsuspend", response_class=HTMLResponse)
 async def admin_tenant_unsuspend(
     tenant_id: str,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
+    _: None = Depends(require_csrf),
     session=Depends(_get_session),
 ):
     """Unsuspend (status='suspended' → 'active'). Reverses suspend."""
     from sreda.db.models.billing import TenantSubscription
-    from sreda.services.audit import audit_event, hash_admin_token
+    from sreda.services.audit import audit_event
 
     sub = (
         session.query(TenantSubscription)
@@ -1198,7 +1340,7 @@ async def admin_tenant_unsuspend(
     audit_event(
         session,
         actor_type="admin",
-        actor_id=hash_admin_token(token),
+        actor_id=principal.actor_id,
         action="admin.tenant.unsuspend",
         resource_type="tenant",
         resource_id=tenant_id,
@@ -1214,7 +1356,8 @@ async def admin_tenant_unsuspend(
 @router.post("/tenant/{tenant_id}/soft-delete", response_class=HTMLResponse)
 async def admin_tenant_soft_delete(
     tenant_id: str,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
+    _: None = Depends(require_csrf),
     session=Depends(_get_session),
 ):
     """#187 Phase 4b-1 — soft-delete a tenant (admin-only trigger, A15).
@@ -1228,14 +1371,13 @@ async def admin_tenant_soft_delete(
     written INSIDE ``soft_delete_tenant``, atomically with the flag under the
     same lock/transaction — no separate commit here.
     """
-    from sreda.services.audit import hash_admin_token
     from sreda.services.tenant_lifecycle import soft_delete_tenant
 
     changed = soft_delete_tenant(
         session,
         tenant_id,
         actor_type="admin",
-        actor_id=hash_admin_token(token),
+        actor_id=principal.actor_id,
         source="admin",
     )
     status = "ok" if changed else "noop"
@@ -1248,7 +1390,8 @@ async def admin_tenant_soft_delete(
 @router.post("/tenant/{tenant_id}/restore", response_class=HTMLResponse)
 async def admin_tenant_restore(
     tenant_id: str,
-    token: str = Depends(require_admin_token),
+    principal: AdminPrincipal = Depends(require_admin_token),
+    _: None = Depends(require_csrf),
     session=Depends(_get_session),
 ):
     """#187 Phase 4b-1 — restore a soft-deleted tenant (admin-only, A15).
@@ -1260,14 +1403,13 @@ async def admin_tenant_restore(
     audit row (A11) is written inside ``restore_tenant``, atomically with the
     flag.
     """
-    from sreda.services.audit import hash_admin_token
     from sreda.services.tenant_lifecycle import restore_tenant
 
     changed = restore_tenant(
         session,
         tenant_id,
         actor_type="admin",
-        actor_id=hash_admin_token(token),
+        actor_id=principal.actor_id,
         source="admin",
     )
     status = "ok" if changed else "noop"

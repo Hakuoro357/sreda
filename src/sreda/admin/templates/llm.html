@@ -17,6 +17,7 @@
 {% endif %}
 
 <form method="post" action="/admin/llm" style="max-width: 720px;">
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
   <div style="display: grid; grid-template-columns: 180px 1fr; gap: 16px 20px; align-items: center; margin-bottom: 20px;">
     <label for="primary"><strong>Primary</strong></label>
     <select name="primary" id="primary">

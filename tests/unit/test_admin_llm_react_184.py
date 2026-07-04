@@ -52,10 +52,15 @@ def test_provider_spend_empty_db_no_crash(db_session):
 
 def test_llm_context_exposes_react_info(db_session, monkeypatch):
     """ч.2: контекст /admin/llm содержит react_info (primary/Оса-fallback/Оса-тенанты)."""
+    from types import SimpleNamespace
+
     monkeypatch.setenv("SREDA_REACT_OSA_FALLBACK", "1")
     st_mod.get_settings.cache_clear()
     try:
-        ctx = _llm_context(db_session, "tok", with_balances=False)
+        # #305: _llm_context now takes a Request (for csrf_token) instead of a
+        # raw token; csrf_token only reads request.cookies.
+        req = SimpleNamespace(cookies={})
+        ctx = _llm_context(db_session, req, with_balances=False)
         assert "react_info" in ctx and "react_spend" in ctx
         assert ctx["react_info"]["osa_fallback_on"] is True
         # R1-фикс: доступность запаса (флаг + ключ Groq) показывается ОТДЕЛЬНО от флага

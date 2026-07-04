@@ -20,7 +20,8 @@ from sqlalchemy.pool import StaticPool
 from sreda.admin import host_metrics as hm
 from sreda.admin import overview_snapshot as ov
 from sreda.admin import routes as admin_routes
-from sreda.admin.auth import require_admin_token
+from sreda.admin.auth import AdminPrincipal, require_admin_token
+from sreda.admin.csrf import require_csrf
 from sreda.db.base import Base
 
 
@@ -53,7 +54,11 @@ def client(session_factory, monkeypatch):
         finally:
             s.close()
 
-    app.dependency_overrides[require_admin_token] = lambda: "T"
+    # #305: require_admin_token now returns an AdminPrincipal (not a raw token).
+    app.dependency_overrides[require_admin_token] = lambda: AdminPrincipal("token")
+    # CSRF gate is exercised in a dedicated test; here we bypass it so the
+    # existing dashboard-render assertions stay focused on rendering.
+    app.dependency_overrides[require_csrf] = lambda: None
     app.dependency_overrides[admin_routes._get_session] = _session_override
     # host-метрики без subprocess'ов в тестах
     monkeypatch.setattr(hm, "_systemctl", lambda args: None)

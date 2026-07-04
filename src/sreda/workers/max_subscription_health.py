@@ -50,6 +50,13 @@ async def check_max_subscription_health() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("max sub health: token cleanup failed: %s", exc)
 
+    # 3. #305 admin-login GC (checklist #13): истёкшие challenge'и и
+    # admin-сессии. В том же периодическом maintenance-пути, best-effort.
+    try:
+        _cleanup_admin_login()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("max sub health: admin-login cleanup failed: %s", exc)
+
 
 async def _verify_max_subscription(settings) -> None:
     from sreda.integrations.max import MaxClient
@@ -102,6 +109,23 @@ def _cleanup_expired_tokens() -> None:
             logger.info(
                 "channel_link_tokens cleanup: deleted %d expired rows",
                 deleted,
+            )
+
+
+def _cleanup_admin_login() -> None:
+    """#305 GC: удалить истёкшие login-challenge'и + admin-сессии (checklist #13)."""
+    from sreda.services.admin_login import (
+        cleanup_expired_admin_sessions,
+        cleanup_expired_challenges,
+    )
+
+    sf = get_session_factory()
+    with sf() as session:
+        ch = cleanup_expired_challenges(session)
+        se = cleanup_expired_admin_sessions(session)
+        if ch or se:
+            logger.info(
+                "admin-login cleanup: deleted %d challenges, %d sessions", ch, se,
             )
 
 
