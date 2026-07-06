@@ -755,6 +755,10 @@ class ReactState(MessagesState):
     # compute_allowed_domains; resume читает из чекпойнта. Тип Optional — на resume старого чекпойнта = None.
     router_allowed_read_domains: list[str] | None
     router_allowed_write_domains: list[str] | None
+    # #285 Фаза B (B2b): ход идёт ЕДИНЫМ путём execute (канареечный тенант) → bind-сайты применяют
+    # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
+    # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
+    unified_execute: bool
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
@@ -1382,12 +1386,74 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
     return out
 
 
-def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any) -> str:
+def _generic_confirm_wrap(inner: Any) -> Any:
+    """#285 B2b-2: универсальный confirm для КАНДИДАТА (write без детерминированного сигнала, ярус б).
+    Как `_confirm_wrap`, но превью GENERIC — имя+сырые args, БЕЗ чтения БД (пилляр: превью не читает
+    own-data до «да»). Мутация ТОЛЬКО после «да». blanket-unlock невозможен (wrap на КАЖДОМ
+    инструменте; вторая мутация хода снова через confirm)."""
+    from langchain_core.tools import StructuredTool
+
+    def _wrapped(**kwargs: Any) -> str:
+        _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
+        _args = ", ".join(f"{k}={kwargs[k]}" for k in sorted(kwargs)) if kwargs else "без параметров"
+        decision = interrupt({
+            "confirm": f"Я поняла как «{inner.name}» ({_args}). Подтверди, и я сделаю.",
+            "key": _key})
+        if not _is_yes(str(decision)):
+            return "Хорошо, не делаю."
+        return str(inner.invoke(kwargs))
+
+    return StructuredTool.from_function(
+        func=_wrapped, name=inner.name, description=inner.description, args_schema=inner.args_schema,
+    )
+
+
+def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
+    """#285 B2b-2: фильтр набора на ЕДИНОМ пути execute. Как `_apply_domain_policy` для read, НО write
+    ВНЕ allowed_write НЕ отказывает — биндит КАНДИДАТОМ под generic confirm (ярус б). Так unsignaled
+    write = подтверждение, не тупик #281/#282; молчаливой мутации нет (write в allowed_write — прямой,
+    вне — confirm). read_pure candidate'ом НЕ открывается (кандидат только для write-класса).
+    meta_scope: ask_human/need_family всегда; delete_my_account на голосовом едином пути НЕ выставляется
+    вообще (Борис 2026-07-04: удаление аккаунта голосом — не фича; кто захочет — отдельный явный флоу.
+    Снимает account-signal whack-a-mole; delete и так за собственным A11-confirm).
+    allowed_* = None → не фильтровать (не должно случаться на unified — политика всегда ставит списки)."""
+    if allowed_read is None and allowed_write is None:
+        return tools
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_read_domains, tool_write_domains
+    ar, aw = set(allowed_read or ()), set(allowed_write or ())
+    out = []
+    for t in tools:
+        name = _TOOL_NAME_ALIASES.get(t.name, t.name)
+        if t.name in _META_TOOLS:
+            if t.name == "delete_my_account":
+                continue  # НЕ на голосовом едином пути (Борис 2026-07-04) — отдельный явный флоу
+            out.append(t)  # ask_human/need_family всегда (need_family — механизм кандидата)
+        elif name not in TOOL_OP_CLASS:  # неизвестный → fail-closed
+            continue
+        elif TOOL_OP_CLASS.get(name) == "write":
+            # ярус (а) прямой — ТОЛЬКО если И write-домен разрешён, И read-домен инструмента в allowed_read
+            # (B2 CodexH R2: иначе write-инструмент с read≠write доменом, напр. generate_shopping_from_menu
+            # write=shopping/read=menu, читал бы menu-own-data без гранта). Иначе → кандидат под confirm.
+            if tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
+                out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
+            else:
+                out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
+        elif tool_read_domains(name) <= ar:
+            out.append(t)  # read_pure/read_external по allowed_read (как #221)
+    return out
+
+
+def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any,
+                             unified: bool = False) -> str:
     """#267 A: структурная причина недоступности инструмента — ЕДИНЫЙ источник для pre-scan,
     need_family-handler и unavailable-dispatch. Различает «семья не загружена» (нужен need_family) от
     «домен вне запроса» (need_family НЕ поможет). Закрывает trap: раньше need_family врал «загружена»,
     а доменный фильтр резал заново → планировщик долбился в стену до лимита проходов. Возвращает:
-    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available."""
+    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available.
+
+    unified (B2b-2): на ЕДИНОМ пути need_family грузит ЛЮБУЮ известную семью — per-tool гейт
+    `_apply_unified_policy` защищает (read по allowed_read, write вне allowed_write → кандидат+confirm),
+    поэтому загрузка безопасна и НЕ deny-all (ярус б: unsignaled write доводится до подтверждения)."""
     from sreda.services.tool_schemas.families import (
         TOOL_OP_CLASS, tool_read_domains, tool_write_domains,
     )
@@ -1397,6 +1463,8 @@ def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_wr
             return "unknown_family"
         if allowed_read is None and allowed_write is None:
             return "available"  # домен не фильтруется (legacy/disabled) → семью грузить можно
+        if unified:
+            return "available"  # единый путь: грузим любую семью; per-tool гейт защищает (ярус б)
         # семья-раздел вне разрешённых доменов → её инструменты всё равно зарежет _apply_domain_policy
         if fam not in set(allowed_read or ()) and fam not in set(allowed_write or ()):
             return "domain_blocked"
@@ -1661,11 +1729,55 @@ def _is_domain_execute_tenant(tenant_id: str) -> bool:
     return tenant_id in get_settings().react_domain_scope_execute_tenants
 
 
+def _unified_execute_for(tenant_id: str) -> bool:
+    """#285 Фаза B: гонит ли ЕДИНЫЙ путь execute-режимом для этого тенанта. Требует И флаг единого
+    пути (react_unified_path_enabled), И тенант в канареечном списке (react_unified_tenants). Пусто
+    → НИКОМУ execute (флаг ON = глобальный shadow Фазы A); ``*`` → всем (Фаза F)."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return bool(s.react_unified_path_enabled) and (tenant_id in s.react_unified_tenants)
+
+
 def _tail_directives_enabled() -> bool:
     """#247: динамические директивы (section-hint #215 + guard-нудж) — в ХВОСТ, а не в системный промпт.
     OFF (дефолт) → легаси (дописываем в sp). ON → системный промпт стабилен (кеш-префикс цел)."""
     from sreda.config.settings import get_settings
     return bool(getattr(get_settings(), "react_tail_directives_enabled", False))
+
+
+def _unified_availability_directive(bound) -> str:
+    """#285 B4 (пилляр 4, анти-дрейф промпт↔bind): честный per-turn хвост для ЕДИНОГО пути.
+    Перечисляет инструменты, ФАКТИЧЕСКИ забинденные в ЭТОМ ходе, и несёт #279-семантику: способность
+    есть; это про текущий ход, а не про умения вообще; нужного здесь нет → коротко уточни недостающее,
+    не отказывай. Пересобирается КАЖДЫЙ проход из актуального `bound` (bound меняется между проходами:
+    кандидаты, семьи). Уходит ТОЛЬКО хвостом на user-роли (#247), НЕ в системный промпт — кеш-префикс
+    на unified стабилен.
+    NB: формулировка честности параллельна chat_fact_system_prompt (react_preflight.py ~610-615);
+    физическое DRY-объединение отложено до Фазы E (chat/fact-промт прод-живой — сейчас не трогаем)."""
+    _names = ", ".join(sorted({getattr(t, "name", "") for t in (bound or [])} - {""}))
+    _have = (f"Прямо в этом ходе тебе доступны инструменты: {_names}. "
+             if _names else "Прямо в этом ходе инструменты не подключены. ")
+    return (
+        _have
+        + "Это про ТЕКУЩИЙ ход, а не про твои умения вообще; других инструментов здесь не зови. "
+        "Среда умеет и напоминания, и задачи, и списки, и память. НИКОГДА не говори, что «не умеешь» "
+        "их, и не извиняйся за «несделанное»: способность есть. Но и не утверждай, что уже сделала "
+        "это прямо в текущем ответе. Если человек хочет что-то напомнить, записать или запомнить, а "
+        "нужного инструмента здесь нет, не отказывай, а коротко уточни недостающее: для напоминания "
+        "что и когда, для задачи или списка что и куда, для памяти что запомнить."
+    )
+
+
+def _effective_intent(state, preflight_enabled: bool):
+    """#285 B4 (Codex high+medium R1 MAJOR): ЕДИНЫЙ источник effective_intent для ВСЕХ узлов
+    (chat/run_tools/route/telemetry/caps/guard). На едином пути (unified_execute) ВСЕГДА "task" —
+    так одна персона И unified-политика согласованы во ВСЕХ узлах, а не только в chat(): иначе
+    dispatch/guard/web-caps читали бы сырой intent и на аномалии intent=chat при unified свернулись
+    бы в web-only под task-промптом (полу-defensive хуже, чем полный). На НЕедином — прежняя
+    деривация #197: intent при preflight, иначе None (byte-identical OFF-откат)."""
+    if state.get("unified_execute"):
+        return "task"
+    return (state.get("intent") or None) if preflight_enabled else None
 
 
 def _summary_enabled_for(tenant_id: str) -> bool:
@@ -2387,15 +2499,19 @@ def _build_graph(llm: Any, all_tools: list, *,
         _chat_timeout_s = 15.0
 
     def chat(state: ReactState):
-        # #197: effective_intent — читаем сохранённый intent ТОЛЬКО при preflight_enabled. OFF → None →
-        # task-ветка ниже = ДОСЛОВНО прежнее поведение (byte-identical даже при чекпойнте intent=chat).
-        eff = (state.get("intent") or None) if preflight_enabled else None
+        # #197 + #285 B4: единый источник effective_intent (_effective_intent) — на unified ВСЕГДА
+        # "task", иначе intent при preflight (OFF → None → byte-identical даже при чекпойнте intent=chat).
+        # Один резолвер во ВСЕХ узлах (chat/run_tools/route) → одна персона+политика согласованы.
+        eff = _effective_intent(state, preflight_enabled)
         _used_provider, _used_model, _fallback_fired = provider_key, _model_name, False
         # #159 R2 (Codex MAJOR): телеметрия попытки primary при срабатывании запаса. Учёт ДЕНЕГ
         # (#175) пишется на ОТВЕТИВШИЙ провайдер — токены зависшего/упавшего primary неизвестны (его
         # поток отброшен обёрткой). Идентичность+ошибку primary кладём в наблюдательный трейс (#192),
         # чтобы дашборд стоимости НЕ выглядел так, будто primary не вызывался/был бесплатным.
         _primary_provider, _primary_model, _primary_error = "", "", ""
+        # #285 B4: eff уже нормализован (_effective_intent → "task" на unified), поэтому единый путь
+        # chat/fact-ветку не берёт БЕЗ отдельного guard здесь — «одна персона» гарантирована в источнике
+        # eff (согласовано с run_tools/route/caps/guard, Codex high+medium R1 MAJOR).
         if eff in ("chat", "fact"):
             # #197 chat/fact: рассуждающая модель (deepseek) + ТОЛЬКО web-семья + honesty. ИНВАРИАНТ:
             # SCOPE всегда web-only (bound по eff ДО try → fallback наследует тот же bound → не расширится);
@@ -2428,9 +2544,14 @@ def _build_graph(llm: Any, all_tools: list, *,
             # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical при router_allowed=None).
             # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
             # #221 Ф3: + фильтр разрешённых разделов (execute ставит router_allowed_*; иначе None → no-op).
-            bound = _apply_domain_policy(
-                _select_tools(all_tools, state.get("active_families")),
-                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+            if state.get("unified_execute"):  # B2b-2: единый путь → candidate-write под confirm
+                bound = _apply_unified_policy(
+                    _select_tools(all_tools, state.get("active_families")),
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+            else:
+                bound = _apply_domain_policy(
+                    _select_tools(all_tools, state.get("active_families")),
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = system_prompt
             nudge = state.get("guard_nudge")
             # #215: детерминированная карта «слово→раздел». Фредди (быстрая модель) сам путал «покажи
@@ -2456,10 +2577,15 @@ def _build_graph(llm: Any, all_tools: list, *,
                 else:
                     from sreda.runtime.react_preflight import _section_hint
                     _sec = _section_hint(_text)
+            # #285 B4 (пилляр 4): единый путь — честный хвост «доступны: …» из ФАКТИЧЕСКОГО bound этого
+            # прохода + #279-семантика (способность есть; про текущий ход; нужного нет → уточни, не
+            # отказывай). Только на unified_execute; None на легаси-пути (там хвост не меняется).
+            _avail = _unified_availability_directive(bound) if state.get("unified_execute") else None
             # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
             # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
             # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
-            if _tail_directives_enabled():
+            # #285 B4: на unified ВСЕГДА user-role хвост (OFF-ветка system-append запрещена — кеш-префикс цел).
+            if _tail_directives_enabled() or state.get("unified_execute"):
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                           budget=_compact_budget(), summary=history_summary)
                 # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
@@ -2467,7 +2593,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
                 if time_tail_line:
                     _msgs = _append_time_tail(_msgs, time_tail_line)
-                _tail = [d for d in (nudge, _sec) if d]
+                _tail = [d for d in (nudge, _avail, _sec) if d]
                 if _tail:
                     _directive = "\n\n".join(_tail)
                     # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
@@ -2567,7 +2693,7 @@ def _build_graph(llm: Any, all_tools: list, *,
         exec_id = (hashlib.sha1(turn_key.encode("utf-8")).hexdigest()
                    if turn_key else "")
         active = list(state.get("active_families") or [])
-        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
+        eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         wrote_unkeyed = False  # отработал ли инструмент unkeyed-write семьи (→ выключит guard)
         # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента из НЕ
         # загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш. #197: тот же
@@ -2593,12 +2719,19 @@ def _build_graph(llm: Any, all_tools: list, *,
                             and _tool_unavailable_reason(
                                 "need_family", {"family": _pf},
                                 state.get("router_allowed_read_domains"),
-                                state.get("router_allowed_write_domains")) != "domain_blocked"):
+                                state.get("router_allowed_write_domains"),
+                                unified=bool(state.get("unified_execute"))) != "domain_blocked"):
                         active.append(_pf)
                         added = True
-        bound_by_name = {t.name: t for t in _apply_domain_policy(
-            _bind_for(all_tools, active, eff),
-            state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
+        if state.get("unified_execute"):  # B2b-2: candidate-write под confirm на dispatch
+            _bound_list = _apply_unified_policy(
+                _bind_for(all_tools, active, eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+        else:
+            _bound_list = _apply_domain_policy(
+                _bind_for(all_tools, active, eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+        bound_by_name = {t.name: t for t in _bound_list}
         out = []
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
         # #213 Срез A: контекст канонизации депрекейт-алиасов (один раз на батч).
@@ -2721,7 +2854,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 _faw = state.get("router_allowed_write_domains")
                 # #267 A: domain_blocked → честный отказ (НЕ «загружена ok» — иначе планировщик думает,
                 # что загрузил, а доменный фильтр режет заново → trap). Семью НЕ грузим.
-                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw)
+                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw,
+                                                    unified=bool(state.get("unified_execute")))
                 if _nreason == "domain_blocked":
                     _avail = ", ".join(sorted(set(_far or []) | set(_faw or []))) or "—"
                     msg = (f"Раздел «{fam}» не относится к этому запросу (он про: {_avail}). "
@@ -2746,7 +2880,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # (need_family НЕ поможет — иначе trap: планировщик долбится в need_family по кругу).
                 _ufar = state.get("router_allowed_read_domains")
                 _ufaw = state.get("router_allowed_write_domains")
-                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw)
+                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw,
+                                                    unified=bool(state.get("unified_execute")))
                 if _ureason == "domain_blocked":
                     _uavail = ", ".join(sorted(set(_ufar or []) | set(_ufaw or []))) or "—"
                     _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
@@ -2850,7 +2985,7 @@ def _build_graph(llm: Any, all_tools: list, *,
     def route(state: ReactState):
         last = state["messages"][-1]
         passes = state.get("turn_pass_count") or 0
-        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
+        eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         if getattr(last, "tool_calls", None):
             # АНТИ-ПЕТЛЯ (R1 medium+субагент): лимит проходов исчерпан (повтор need_family/
             # недоступного инструмента и т.п.) → грациозный стоп-узел, НЕ зацикливаемся до
@@ -2882,8 +3017,10 @@ def _build_graph(llm: Any, all_tools: list, *,
 
     def guard(state: ReactState):
         # #197 defense-in-depth: chat/fact сюда НЕ маршрутизируются (route → END), но если бы попали —
-        # ничего не добираем (scope остаётся web-only, productivity не просачивается).
-        if preflight_enabled and (state.get("intent") in ("chat", "fact")):
+        # ничего не добираем (scope остаётся web-only, productivity не просачивается). #285 B4 (Codex R2
+        # MAJOR): через _effective_intent (unified → "task") — согласовано с chat/run_tools/route; guard
+        # был ПОСЛЕДНИМ сырым intent-сайтом, иначе recovery на аномалии unified+intent=chat молчал бы.
+        if _effective_intent(state, preflight_enabled) in ("chat", "fact"):
             return {}
         # #267 A4 (Борис: «роутер побеждает»): в EXECUTE-режиме (роутер решил раздел) guard НЕ
         # восстанавливается в ЧУЖОЙ раздел — НЕ грузит семьи вне allowed и НЕ расширяет домены роутера
@@ -3672,7 +3809,9 @@ async def handle_turn(
                            "checklist_query_ctx": None,
                            # #285 Фаза A: сброс полиси-канала на свежем ходе (дисциплина last-value
                            # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
-                           "turn_policy_json": None}
+                           "turn_policy_json": None,
+                           # #285 B2b: сброс флага единого пути (override ниже ставит True для канарейки).
+                           "unified_execute": False}
             # #213 Срез B: детерминированный READ-интент чек-листов → soft cross-check в tool-node.
             # ТОЛЬКО при preflight + оба флага (R1 medium: срез B — надстройка на preflight-контуре,
             # как домены #221; без _preflight конфиг «preflight выключен» внезапно получал бы
@@ -3761,6 +3900,29 @@ async def handle_turn(
                         _init["router_allowed_read_domains"] = None
                         _init["router_allowed_write_domains"] = None
                         _init["router_decision_json"] = None
+            # #285 Фаза B (B2b-1): ЕДИНЫЙ путь EXECUTE для канареечного тенанта — ПЕРЕОПРЕДЕЛЯЕТ
+            # intent-сплит + #221-домены единой политикой (B1-сигналы + онтология). Переиспользует
+            # task-бинд + _apply_domain_policy (#221-машинерия) — политику берёт из compute_unified_policy.
+            # Требует preflight (task-бинд читает intent только при preflight_enabled). Флаг ИЛИ список
+            # пусты → не исполняется (byte-identical, никто не execute). Сбой → legacy fail-open (не
+            # роняет ход, скоуп НЕ расширяется — остаётся #221-решение выше). Ярус (б) candidate/confirm — B2b-2.
+            if _preflight and _unified_execute_for(tenant_id):
+                try:
+                    from sreda.runtime.react_policy import compute_unified_policy
+                    from sreda.runtime.react_preflight import route_domains as _rd285
+                    _upol = compute_unified_policy(user_text, _rd285(user_text))
+                    _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
+                    _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
+                    _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
+                    _init["unified_execute"] = True  # B2b-2: bind-сайты → _apply_unified_policy (candidate)
+                    _init["router_allowed_read_domains"] = _uar
+                    _init["router_allowed_write_domains"] = _uaw
+                    _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
+                    _init["router_decision_json"] = json.dumps(
+                        {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
+                         "signals": _upol["signals"]}, ensure_ascii=False)
+                except Exception:  # noqa: BLE001 — единый путь не роняет ход → legacy (скоуп #221 выше)
+                    logger.warning("react_unified: policy failed → legacy fail-open", exc_info=True)
             # #285 Фаза A (SHADOW): TurnPolicy сайдкаром — выражает решения сплита (#197 интент,
             # #221 каналы, #256 таймауты, капы) явным объектом в ОТДЕЛЬНЫЙ канал. Legacy-каналы
             # router_allowed_* НЕ трогаются (контракт отката, инвентарь §2 (б)); исполнением НЕ
