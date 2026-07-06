@@ -1,14 +1,18 @@
-"""Admin dashboard authentication.
+"""Admin dashboard authentication (#305: AdminPrincipal + Telegram sessions).
 
-2026-04-28 hardening:
-- Поддержка header `X-Admin-Token` (предпочтительный способ — не
-  попадает в URL / browser history / web logs / referer).
-- Backward-compat fallback на query param `?token=` (transitional —
-  bookmarks / curl команды по старым URL продолжают работать).
-- Timing-safe сравнение через `hmac.compare_digest` — защита от
-  byte-by-byte timing attack.
-- Logging admin auth attempts (success / 401 / 403) для видимости в
-  /admin/logs.
+Резолв личности на КАЖДЫЙ admin-request:
+1. Кука ``admin_tg_session`` (Telegram-путь, #305) → серверная сессия
+   ``admin_sessions`` → principal(telegram, tg_id). Allowlist сверяется ЗДЕСЬ
+   (per-request отзыв: убрал tg_id из ``SREDA_ADMIN_TG_IDS`` → сессия перестаёт
+   пускать на следующем запросе). Резолвится ПЕРВЫМ, до легаси.
+2. Fallback ``SREDA_ADMIN_TOKEN`` (break-glass): легаси-кука ``admin_session``
+   (HMAC от токена — ротация токена гасит) / header ``X-Admin-Token`` / query
+   ``?token=``. Не изменён. Даёт principal(token).
+
+``require_admin_token`` возвращает ``AdminPrincipal`` (НЕ raw-токен) — роуты/аудит
+берут ``principal.actor_id``; raw-токен больше не течёт в шаблоны/URL.
+
+403 «admin disabled» — только если НЕТ ни токена, ни allowlist.
 """
 
 from __future__ import annotations
@@ -17,22 +21,31 @@ import hashlib
 import hmac
 import logging
 import time
+from dataclasses import dataclass
 
 from fastapi import Cookie, Header, HTTPException, Query, Request
 
 from sreda.config.settings import get_settings
 
-
 logger = logging.getLogger("sreda.admin.auth")
 
+_SESSION_TTL = 86400  # 24h — серверный срок жизни легаси session-cookie (fallback)
 
-_SESSION_TTL = 86400  # 24h — СЕРВЕРНЫЙ срок жизни session-cookie
+
+@dataclass(frozen=True)
+class AdminPrincipal:
+    """Кто аутентифицирован в админке. ``actor_id`` идёт в audit."""
+
+    auth_method: str            # "telegram" | "token"
+    tg_id: str | None = None
+
+    @property
+    def actor_id(self) -> str:
+        return f"admin_tg:{self.tg_id}" if self.tg_id else "admin_token"
 
 
 def _make_session(admin_token: str, *, now: int | None = None) -> str:
-    """Подписанный session-маркер `<exp>.<hmac>` — НЕ раскрывает токен; срок
-    действия зашит в подпись и проверяется СЕРВЕРОМ (не только браузерным
-    max_age) — украденный cookie не вечен (Codex #150 MAJOR)."""
+    """Подписанный маркер `<exp>.<hmac>` для ЛЕГАСИ fallback-куки (#150)."""
     exp = (int(time.time()) if now is None else now) + _SESSION_TTL
     sig = hmac.new(
         admin_token.encode("utf-8"), f"admin-session-v1:{exp}".encode("utf-8"),
@@ -42,7 +55,7 @@ def _make_session(admin_token: str, *, now: int | None = None) -> str:
 
 
 def _verify_session(admin_token: str, cookie: str, *, now: int | None = None) -> bool:
-    """True если cookie подписан этим токеном И НЕ истёк (серверная проверка)."""
+    """True если легаси-cookie подписан ЭТИМ токеном и НЕ истёк."""
     _now = int(time.time()) if now is None else now
     try:
         exp_s, sig = cookie.split(".", 1)
@@ -58,89 +71,83 @@ def _verify_session(admin_token: str, cookie: str, *, now: int | None = None) ->
     return hmac.compare_digest(sig, expected)
 
 
+def _resolve_tg_principal(cookie: str) -> AdminPrincipal | None:
+    """Резолв Telegram-сессии из ``admin_tg_session``-куки + allowlist-проверка
+    СЕЙЧАС. Открывает короткую сессию БД. None если нет/истекла/отозвана/не в allowlist."""
+    from sreda.db.session import get_session_factory
+    from sreda.services.admin_login import resolve_session
+
+    settings = get_settings()
+    allowlist = settings.admin_tg_ids
+    if not allowlist:
+        return None
+    s = get_session_factory()()
+    try:
+        sess = resolve_session(s, cookie)
+        tg_id = str(sess.tg_id) if sess is not None else None
+    finally:
+        s.close()
+    if tg_id and tg_id in allowlist:
+        return AdminPrincipal("telegram", tg_id=tg_id)
+    return None
+
+
 def require_admin_token(
     request: Request,
     header_token: str | None = Header(default=None, alias="X-Admin-Token"),
     query_token: str | None = Query(default=None, alias="token"),
+    tg_cookie: str | None = Cookie(default=None, alias="admin_tg_session"),
     cookie_token: str | None = Cookie(default=None, alias="admin_session"),
-) -> str:
-    """FastAPI dependency: validate admin token from header (preferred)
-    or query param (legacy fallback).
-
-    Resolution order:
-    1. ``X-Admin-Token`` HTTP header (предпочтительный — не leak'ится
-       в логах прокси, history браузера, referer заголовках).
-    2. ``?token=`` query param (legacy — для существующих закладок и
-       curl-скриптов; будет deprecated в Phase 6).
-
-    Raises:
-        403 если admin disabled (нет SREDA_ADMIN_TOKEN в env).
-        401 если token missing OR не совпадает (через timing-safe compare).
-
-    Returns valid token (для template propagation в формах).
-    """
+) -> AdminPrincipal:
+    """FastAPI dependency: вернуть ``AdminPrincipal`` или бросить 401/403."""
     settings = get_settings()
-    expected = settings.admin_token
+    admin_token = settings.admin_token
+    allowlist = settings.admin_tg_ids
 
-    if not expected:
+    # 403 только если админка выключена целиком (нет ни токена, ни allowlist).
+    if not admin_token and not allowlist:
         logger.warning(
             "admin auth: 403 ADMIN_DISABLED ip=%s path=%s",
             _client_ip(request), request.url.path,
         )
         raise HTTPException(status_code=403, detail="Admin dashboard is disabled")
 
-    # 0. Session cookie (выставляется после первой header/query-аутентификации) —
-    #    даёт навигацию по админке без ?token= в URL. Содержит HMAC-маркер, не
-    #    сам токен; HttpOnly+SameSite=Strict+Secure (ставит middleware).
-    # isinstance(str): при прямом вызове (юнит-тесты) непереданный параметр —
-    # это sentinel Cookie(...), не None; в FastAPI-DI — str|None.
-    if isinstance(cookie_token, str) and _verify_session(expected, cookie_token):
-        logger.debug("admin auth: OK via cookie path=%s", request.url.path)
-        return expected
+    # (1) Telegram-сессия — резолвим ПЕРВОЙ.
+    if isinstance(tg_cookie, str) and tg_cookie:
+        principal = _resolve_tg_principal(tg_cookie)
+        if principal is not None:
+            logger.debug("admin auth: OK via telegram tg_id=%s path=%s",
+                         principal.tg_id, request.url.path)
+            return principal
 
-    # Header wins over query param.
-    presented = header_token or query_token
+    # (2) Легаси fallback-токен (только если задан SREDA_ADMIN_TOKEN).
+    if admin_token:
+        if isinstance(cookie_token, str) and _verify_session(admin_token, cookie_token):
+            logger.debug("admin auth: OK via legacy cookie path=%s", request.url.path)
+            return AdminPrincipal("token")
+        presented = header_token or query_token
+        if presented and hmac.compare_digest(
+            presented.encode("utf-8"), admin_token.encode("utf-8")
+        ):
+            try:
+                request.state.admin_set_session = _make_session(admin_token)
+            except Exception:  # noqa: BLE001 — best-effort сигнал middleware
+                pass
+            logger.debug(
+                "admin auth: OK via %s path=%s",
+                "header" if header_token else "query", request.url.path,
+            )
+            return AdminPrincipal("token")
 
-    if not presented:
-        logger.info(
-            "admin auth: 401 NO_TOKEN ip=%s path=%s "
-            "(neither header X-Admin-Token nor ?token=)",
-            _client_ip(request), request.url.path,
-        )
-        raise HTTPException(status_code=401, detail="Invalid admin token")
-
-    # Timing-safe compare. compare_digest требует одинаковую длину
-    # bytes → если presented короче / длиннее, всё равно проходит
-    # (constant-time для одинаковой длины, byte-equal для разной).
-    if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
-        logger.info(
-            "admin auth: 401 BAD_TOKEN ip=%s path=%s via=%s",
-            _client_ip(request), request.url.path,
-            "header" if header_token else "query",
-        )
-        raise HTTPException(status_code=401, detail="Invalid admin token")
-
-    # header/query OK → сигналим middleware выставить session-cookie, чтобы
-    # дальнейшая навигация шла без token в URL (#150 митигейт). Additive:
-    # header/query продолжают работать как раньше.
-    try:
-        request.state.admin_set_session = _make_session(expected)
-    except Exception:  # noqa: BLE001 — сигнал best-effort, не валит auth
-        pass
-
-    # Success path — debug-level log (не INFO чтоб не засорять при
-    # каждом GET /admin/users refresh).
-    logger.debug(
-        "admin auth: OK ip=%s path=%s via=%s",
+    logger.info(
+        "admin auth: 401 NO_VALID_CREDENTIAL ip=%s path=%s",
         _client_ip(request), request.url.path,
-        "header" if header_token else "query",
     )
-    return presented
+    raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort client IP. Учитывает X-Forwarded-For (от nginx),
-    falls back на request.client.host."""
+    """Best-effort client IP (учёт X-Forwarded-For от nginx)."""
     xff = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
     if xff:
         return xff

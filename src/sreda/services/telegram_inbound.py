@@ -834,6 +834,170 @@ async def _handle_pending_tenant(
             )
 
 
+# ---------------------------------------------------------------------------
+# #305 — admin login via Telegram: two EARLY branches (before soft-delete gate)
+# ---------------------------------------------------------------------------
+
+_ADMIN_LOGIN_START_PREFIX = "/start adm_"
+_ADMIN_LOGIN_CONFIRM_PREFIX = "adm_confirm:"
+_ADMIN_LOGIN_NEUTRAL_REPLY = (
+    "Эта команда доступна только администраторам."
+)
+# module-level анти-спам для не-админов, дёргающих admin-команды (deny-throttle).
+_ADMIN_DENY_LAST: dict[str, float] = {}
+_ADMIN_DENY_WINDOW_SEC = 30.0
+
+
+def _admin_deny_should_reply(tg_id: str, *, now: float | None = None) -> bool:
+    """True если можно ответить нейтралью не-админу (не чаще раза в окно)."""
+    import time as _t
+
+    _now = _t.monotonic() if now is None else now
+    last = _ADMIN_DENY_LAST.get(tg_id)
+    if last is not None and (_now - last) < _ADMIN_DENY_WINDOW_SEC:
+        return False
+    _ADMIN_DENY_LAST[tg_id] = _now
+    return True
+
+
+async def _handle_admin_login_start(
+    session: Session, payload: dict, *, bot_key: str, chat_id: str | None,
+) -> bool:
+    """EARLY branch: `/start adm_<challenge_id>` from the login deep-link.
+
+    Returns True if this update was an admin-login /start (handled — caller must
+    return early). DB-only + guarded send-claim; sends the confirm button ONLY
+    when the send-claim was won (idempotent on duplicate update)."""
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return False
+    text = message.get("text")
+    if not isinstance(text, str) or not text.startswith(_ADMIN_LOGIN_START_PREFIX):
+        return False
+
+    from sreda.services.admin_login import (
+        attach_bot,
+        record_confirm_message,
+    )
+
+    challenge_id = text[len(_ADMIN_LOGIN_START_PREFIX):].strip()
+    frm = message.get("from") or {}
+    tg_id = str(frm.get("id")) if isinstance(frm, dict) and frm.get("id") is not None else None
+
+    allowlist = get_settings().admin_tg_ids
+    if not tg_id or tg_id not in allowlist:
+        # Не-админ (или без id): нейтраль + throttle. НЕ трогаем challenge.
+        if tg_id and chat_id and _admin_deny_should_reply(tg_id):
+            try:
+                registry = TelegramBotRegistry.from_settings(get_settings())
+                client = telegram_client_for(bot_key, registry)
+                await client.send_message(chat_id=str(chat_id), text=_ADMIN_LOGIN_NEUTRAL_REPLY)
+            except Exception:  # noqa: BLE001 — best-effort
+                logger.warning("admin-login deny notify failed", exc_info=True)
+        logger.info("admin-login /start deny tg_id=%s (not in allowlist)", tg_id)
+        return True
+
+    if not challenge_id:
+        logger.info("admin-login /start with empty challenge_id — ignored")
+        return True
+
+    # Атомарный send-claim: строка возвращается ТОЛЬКО при первом выигранном
+    # переходе (дубль update → None → не шлём вторую кнопку).
+    row = attach_bot(session, challenge_id, tg_id, bot_key, str(chat_id) if chat_id else None)
+    if row is None:
+        logger.info(
+            "admin-login /start: send-claim not won (dup or stale) challenge=%s tg_id=%s",
+            challenge_id, tg_id,
+        )
+        return True
+
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Подтвердить вход",
+         "callback_data": f"{_ADMIN_LOGIN_CONFIRM_PREFIX}{challenge_id}"},
+    ]]}
+    try:
+        registry = TelegramBotRegistry.from_settings(get_settings())
+        client = telegram_client_for(bot_key, registry)
+        result = await client.send_message(
+            chat_id=str(chat_id),
+            text=f"✅ Подтвердить вход\nкод: {row.human_code}",
+            reply_markup=keyboard,
+        )
+        message_id = (result or {}).get("result", {}).get("message_id")
+        if message_id is not None:
+            record_confirm_message(session, challenge_id, int(message_id))
+        logger.info("admin-login button sent challenge=%s tg_id=%s", challenge_id, tg_id)
+    except Exception:  # noqa: BLE001 — send-fail: challenge TTL само-лечит (5 мин)
+        logger.warning(
+            "admin-login confirm-button send failed challenge=%s (user re-opens /admin/login)",
+            challenge_id, exc_info=True,
+        )
+    return True
+
+
+async def _handle_admin_login_confirm(
+    session: Session, payload: dict, *, bot_key: str,
+) -> bool:
+    """EARLY branch: `adm_confirm:<challenge_id>` inline-button callback.
+
+    Returns True if this update was an admin-login confirm callback (handled).
+    Guarded pending→confirmed; answers the callback neutrally on ALL outcomes;
+    best-effort deletes the button message on 'confirmed'."""
+    cb = payload.get("callback_query")
+    if not isinstance(cb, dict):
+        return False
+    data = cb.get("data")
+    if not isinstance(data, str) or not data.startswith(_ADMIN_LOGIN_CONFIRM_PREFIX):
+        return False
+
+    from sreda.db.models.admin_auth import AdminLoginChallenge
+    from sreda.services.admin_login import confirm
+
+    challenge_id = data[len(_ADMIN_LOGIN_CONFIRM_PREFIX):].strip()
+    frm = cb.get("from") or {}
+    tg_id = str(frm.get("id")) if isinstance(frm, dict) and frm.get("id") is not None else None
+    cb_id = cb.get("id")
+
+    registry = TelegramBotRegistry.from_settings(get_settings())
+    client = telegram_client_for(bot_key, registry)
+
+    allowlist = get_settings().admin_tg_ids
+    if not tg_id or tg_id not in allowlist:
+        # Не-админ: нейтрально ответить и НЕ двигать challenge.
+        if cb_id:
+            try:
+                await client.answer_callback_query(str(cb_id), text="")
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info("admin-login confirm deny tg_id=%s (not in allowlist)", tg_id)
+        return True
+
+    outcome = confirm(session, challenge_id, tg_id)
+    if cb_id:
+        try:
+            await client.answer_callback_query(str(cb_id), text="Готово")
+        except Exception:  # noqa: BLE001
+            pass
+
+    if outcome == "confirmed":
+        # best-effort: удалить сообщение с кнопкой (chat_id/message_id из строки).
+        from sqlalchemy import select as _select
+        row = session.execute(
+            _select(AdminLoginChallenge).where(
+                AdminLoginChallenge.challenge_id == challenge_id,
+            )
+        ).scalar_one_or_none()
+        if row is not None and row.chat_id and row.message_id:
+            try:
+                del_client = telegram_client_for(row.bot_key or bot_key, registry)
+                await del_client.delete_message(str(row.chat_id), int(row.message_id))
+            except Exception:  # noqa: BLE001 — best-effort
+                logger.debug("admin-login button delete failed", exc_info=True)
+    logger.info("admin-login confirm outcome=%s challenge=%s tg_id=%s",
+                outcome, challenge_id, tg_id)
+    return True
+
+
 async def handle_telegram_update(
     payload: dict,
     *,
@@ -877,6 +1041,18 @@ async def handle_telegram_update(
         from sreda.services.telegram_auth import resolve_tenant_from_telegram_id
 
         _guard_chat_id = _extract_chat_id(payload)
+
+        # #305 — admin login via Telegram: EARLY branches, BEFORE the soft-delete
+        # gate + ensure_telegram_user_bundle. DB-only, guarded, return early so
+        # the login handshake never falls through to onboarding/LLM. A single
+        # branch covers both webhook + long-poll (both call this function).
+        if await _handle_admin_login_start(
+            session, payload, bot_key=bot_key, chat_id=_guard_chat_id,
+        ):
+            return None
+        if await _handle_admin_login_confirm(session, payload, bot_key=bot_key):
+            return None
+
         if _guard_chat_id is not None:
             try:
                 _resolved = resolve_tenant_from_telegram_id(session, str(_guard_chat_id))

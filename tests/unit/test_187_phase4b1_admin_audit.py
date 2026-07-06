@@ -48,7 +48,6 @@ from sqlalchemy.pool import StaticPool
 from sreda.db.base import Base
 from sreda.db.models.audit import AuditLog
 from sreda.db.models.core import Tenant
-from sreda.services.audit import hash_admin_token
 from sreda.services.tenant_lifecycle import (
     is_tenant_active,
     restore_tenant,
@@ -58,6 +57,23 @@ from sreda.services.tenant_lifecycle import (
 from tests.unit.conftest import seed_telegram_user
 
 _ADMIN_TOKEN = "test-admin-tok-123456"
+
+
+def _bootstrap_csrf(client) -> str:
+    """#305: obtain a CSRF token bound to the SAME admin_session cookie the POST
+    will carry. Admin POSTs now go through ``require_csrf`` (fail-closed) whose
+    token binds to the session cookie. A first header-token GET (over https) sets
+    ``admin_session`` in the client jar; from then on the token binds to that
+    cookie value, matching what the server computes for the follow-up POST."""
+    from types import SimpleNamespace
+
+    from sreda.admin.csrf import csrf_token
+
+    # Header-auth GET → middleware sets the admin_session cookie in the response.
+    client.get("/admin/users", headers={"X-Admin-Token": _ADMIN_TOKEN})
+    sess = client.cookies.get("admin_session")
+    cookies = {"admin_session": sess} if sess else {}
+    return csrf_token(SimpleNamespace(cookies=cookies, state=SimpleNamespace()))
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +153,7 @@ def test_admin_soft_delete_marks_tenant_deleted(admin_client) -> None:
     r = client.post(
         f"/admin/tenant/{tid}/soft-delete",
         headers={"X-Admin-Token": _ADMIN_TOKEN},
+        data={"csrf": _bootstrap_csrf(client)},
         follow_redirects=False,
     )
     assert r.status_code in (200, 303)
@@ -157,6 +174,7 @@ def test_admin_restore_marks_tenant_active(admin_client) -> None:
     r = client.post(
         f"/admin/tenant/{tid}/restore",
         headers={"X-Admin-Token": _ADMIN_TOKEN},
+        data={"csrf": _bootstrap_csrf(client)},
         follow_redirects=False,
     )
     assert r.status_code in (200, 303)
@@ -217,6 +235,7 @@ def test_admin_soft_delete_writes_audit(admin_client) -> None:
     client.post(
         f"/admin/tenant/{tid}/soft-delete",
         headers={"X-Admin-Token": _ADMIN_TOKEN},
+        data={"csrf": _bootstrap_csrf(client)},
         follow_redirects=False,
     )
 
@@ -232,7 +251,9 @@ def test_admin_soft_delete_writes_audit(admin_client) -> None:
         assert len(rows) == 1, "exactly one soft_delete audit row expected"
         row = rows[0]
         assert row.actor_type == "admin"
-        assert row.actor_id == hash_admin_token(_ADMIN_TOKEN)
+        # #305: token-auth actor is now the stable ``admin_token`` principal id,
+        # not the hashed raw token (audit uses principal.actor_id).
+        assert row.actor_id == "admin_token"
         assert row.resource_type == "tenant"
         md = json.loads(row.metadata_json)
         assert md.get("source") == "admin"
@@ -249,6 +270,7 @@ def test_admin_restore_writes_audit(admin_client) -> None:
     client.post(
         f"/admin/tenant/{tid}/restore",
         headers={"X-Admin-Token": _ADMIN_TOKEN},
+        data={"csrf": _bootstrap_csrf(client)},
         follow_redirects=False,
     )
 
@@ -264,7 +286,8 @@ def test_admin_restore_writes_audit(admin_client) -> None:
         assert len(rows) == 1, "exactly one restore audit row expected"
         row = rows[0]
         assert row.actor_type == "admin"
-        assert row.actor_id == hash_admin_token(_ADMIN_TOKEN)
+        # #305: token-auth actor is now the stable ``admin_token`` principal id.
+        assert row.actor_id == "admin_token"
         assert row.resource_type == "tenant"
         md = json.loads(row.metadata_json)
         assert md.get("source") == "admin"

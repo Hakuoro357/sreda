@@ -73,7 +73,11 @@ def test_passes_with_correct_header_token(monkeypatch):
     result = require_admin_token(
         req, header_token="real-secret-token-xyz", query_token=None
     )
-    assert result == "real-secret-token-xyz"
+    # #305: returns an AdminPrincipal(token), NOT the raw token — and actor_id
+    # must never echo the secret.
+    assert result.auth_method == "token"
+    assert result.actor_id == "admin_token"
+    assert "real-secret-token-xyz" not in result.actor_id
 
 
 def test_passes_with_correct_query_token_legacy(monkeypatch):
@@ -87,7 +91,8 @@ def test_passes_with_correct_query_token_legacy(monkeypatch):
     result = require_admin_token(
         req, header_token=None, query_token="real-secret-token-xyz"
     )
-    assert result == "real-secret-token-xyz"
+    assert result.auth_method == "token"
+    assert result.actor_id == "admin_token"
 
 
 def test_header_wins_over_query_when_both_set(monkeypatch):
@@ -102,7 +107,7 @@ def test_header_wins_over_query_when_both_set(monkeypatch):
     result = require_admin_token(
         req, header_token="real-token", query_token="wrong-query",
     )
-    assert result == "real-token"
+    assert result.auth_method == "token"
 
 
 def test_header_wrong_query_correct_returns_401(monkeypatch):
@@ -148,7 +153,7 @@ def test_x_forwarded_for_used_for_logging(monkeypatch):
     result = require_admin_token(
         req, header_token="ok-token", query_token=None,
     )
-    assert result == "ok-token"
+    assert result.auth_method == "token"
 
 
 # --- #150 F0: session-cookie (additive, не убирает header/query) -------------
@@ -163,9 +168,11 @@ def test_passes_with_valid_session_cookie(monkeypatch):
     )
     req = _mk_request()
     cookie = _make_session("real-secret-token-xyz")
-    assert require_admin_token(
+    result = require_admin_token(
         req, header_token=None, query_token=None, cookie_token=cookie,
-    ) == "real-secret-token-xyz"
+    )
+    assert result.auth_method == "token"
+    assert result.actor_id == "admin_token"
 
 
 def test_expired_session_cookie_rejected(monkeypatch):

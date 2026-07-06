@@ -274,6 +274,17 @@ class Settings(BaseSettings):
     # OSS-soundsafety причины что и admin_telegram_chat_id.
     admin_max_chat_id: str | None = None
 
+    # #305: allowlist tg id (через запятую) для входа в админку через Telegram.
+    # Пусто → Telegram-вход выключен, fallback-токен работает. Raw-строка +
+    # property (pydantic list из env ждёт JSON, поэтому CSV парсим сами).
+    admin_tg_ids_raw: str | None = Field(default=None, validation_alias="SREDA_ADMIN_TG_IDS")
+
+    @property
+    def admin_tg_ids(self) -> frozenset[str]:
+        if not self.admin_tg_ids_raw:
+            return frozenset()
+        return frozenset(x.strip() for x in self.admin_tg_ids_raw.split(",") if x.strip())
+
     # CSV list of log files surfaced in the /admin/logs view. Each entry
     # may be a plain path (``/tmp/sreda-uvicorn.log``) or ``label=path``
     # (``Uvicorn=/tmp/sreda-uvicorn.log``) for a friendlier nav label.

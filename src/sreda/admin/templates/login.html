@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход в админку — Sreda</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    :root { --pico-font-size: 14px; }
+    body { margin: 0; }
+    .login-wrap { max-width: 460px; margin: 8vh auto; padding: 0 20px; }
+    .human-code {
+      font-family: monospace; font-size: 28px; letter-spacing: 6px;
+      font-weight: 700; background: #f1f3f5; border-radius: 8px;
+      padding: 10px 18px; display: inline-block;
+    }
+    .tg-button {
+      display: inline-block; background: #229ED9; color: #fff;
+      padding: 12px 24px; border-radius: 8px; text-decoration: none;
+      font-weight: 600; font-size: 16px; margin: 8px 0;
+    }
+    .tg-button:hover { background: #1c8bc0; }
+    .muted { color: var(--pico-muted-color); font-size: 13px; }
+    #status { margin-top: 16px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <h2>Вход в админку Sreda</h2>
+    <p class="muted">
+      Откройте бота в Telegram, нажмите «Подтвердить вход» и убедитесь, что
+      показанный там код совпадает с кодом ниже. Вход возможен только с
+      аккаунта из списка администраторов.
+    </p>
+
+    <p>Код подтверждения:</p>
+    <p><span class="human-code">{{ human_code }}</span></p>
+
+    <p>
+      <a class="tg-button" href="{{ deep_link }}" target="_blank" rel="noopener">
+        Открыть бота в Telegram
+      </a>
+    </p>
+
+    <div id="status" class="muted">Ожидание подтверждения в Telegram…</div>
+  </div>
+
+  <script>
+    (function () {
+      var statusEl = document.getElementById("status");
+      var done = false;
+
+      function setStatus(text) { statusEl.textContent = text; }
+
+      function claim() {
+        fetch("/admin/login/claim", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        })
+          .then(function (r) { return r.json().catch(function () { return {}; }); })
+          .then(function (data) {
+            if (data && data.redirect) {
+              window.location.href = data.redirect;
+            } else {
+              setStatus("Вход не подтверждён. Обновите страницу и попробуйте снова.");
+            }
+          })
+          .catch(function () {
+            setStatus("Ошибка при завершении входа. Обновите страницу.");
+          });
+      }
+
+      function poll() {
+        if (done) { return; }
+        fetch("/admin/login/status", { credentials: "same-origin" })
+          .then(function (r) { return r.json().catch(function () { return {}; }); })
+          .then(function (data) {
+            var st = data && data.status;
+            if (st === "confirmed") {
+              done = true;
+              setStatus("Подтверждено — выполняется вход…");
+              claim();
+            } else if (st === "consumed") {
+              done = true;
+              setStatus("Вход уже выполнен в этой сессии.");
+            } else if (st === "unknown") {
+              done = true;
+              setStatus("Ссылка входа устарела. Обновите страницу.");
+            } else {
+              setTimeout(poll, 2000);
+            }
+          })
+          .catch(function () { setTimeout(poll, 3000); });
+      }
+
+      setTimeout(poll, 1500);
+    })();
+  </script>
+</body>
+</html>

@@ -1,4 +1,5 @@
 from sreda.db.models.admin_alerts import AdminAlertSeen
+from sreda.db.models.admin_auth import AdminLoginChallenge, AdminSession
 from sreda.db.models.admin_dashboard import AdminDashboardSnapshot
 from sreda.db.models.audit_feed import AuditOutboxEvent, UserDataChangeFeedEvent
 from sreda.db.models.billing import (
@@ -71,6 +72,8 @@ __all__ = [
     "AgentThread",
     "AdminAlertSeen",
     "AdminDashboardSnapshot",
+    "AdminLoginChallenge",
+    "AdminSession",
     "AuditOutboxEvent",
     "Assistant",
     "AssistantMemory",

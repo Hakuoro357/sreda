@@ -3,7 +3,8 @@
 {% block content %}
 <div style="display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:8px;">
   <h2 style="margin-bottom:4px;">Обзор</h2>
-  <form method="post" action="/admin/refresh-snapshot?token={{ token }}" style="margin:0;">
+  <form method="post" action="/admin/refresh-snapshot" style="margin:0;">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
     <span class="muted">
       {% if snap_age_min is not none %}снапшот обновлён {{ snap_age_min }} мин назад{% else %}снапшот ещё не собран{% endif %}
     </span>
@@ -153,7 +154,7 @@
           <td>{{ e.status }}{% if e.error_code %} · {{ e.error_code }}{% endif %}<br>
               <span class="muted">{{ e.task_type }} · {{ e.tenant_id }}</span></td>
           <td class="muted">{{ e.model }}</td>
-          <td><a href="/admin/llm-calls?token={{ token }}&tenant_id={{ e.tenant_id }}&feature_key={{ e.feature_key }}">вызовы</a></td>
+          <td><a href="/admin/llm-calls?tenant_id={{ e.tenant_id }}&feature_key={{ e.feature_key }}">вызовы</a></td>
         </tr>
       {% endfor %}
       </tbody>
@@ -172,7 +173,7 @@
           <td><span class="badge badge-yellow">{{ (s.total_ms / 1000) | round(1) }} с</span></td>
           <td>{{ s.user_id }}<br><span class="muted">{{ s.channel }}</span></td>
           <td class="muted">{{ s.top_stage or "—" }}</td>
-          <td><a href="/admin/traces?token={{ token }}&min_total_ms=30000">трейс</a></td>
+          <td><a href="/admin/traces?min_total_ms=30000">трейс</a></td>
         </tr>
       {% endfor %}
       </tbody>
@@ -183,7 +184,7 @@
 
 {# ---------- Деньги ---------- #}
 <h3 style="margin-top:16px;">Деньги</h3>
-<small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · подробнее — <a href="/admin/spend-by-model?token={{ token }}">Расходы</a></small>
+<small class="muted">оценка по текущему прайсу (llm_pricing), не бухгалтерия · подробнее — <a href="/admin/spend-by-model">Расходы</a></small>
 {% if snap.cost %}
 <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:8px;">
   {% for key, label in [("day", "24 часа"), ("week", "7 дней"), ("month", "30 дней")] %}

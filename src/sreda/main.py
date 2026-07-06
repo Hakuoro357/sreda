@@ -145,6 +145,33 @@ def create_app() -> FastAPI:
     feature_registry.register_api(app)
     app.state.feature_registry = feature_registry
 
+    from fastapi import HTTPException as _HTTPException
+    from fastapi.exception_handlers import http_exception_handler
+
+    @app.exception_handler(_HTTPException)
+    async def _admin_login_redirect(request, exc):
+        """#305: unauthenticated HTML navigation to /admin* → 302 /admin/login.
+
+        Only a browser page load (GET, Accept: text/html) to a protected admin
+        path that got a **401** (no valid credential) is redirected to the login
+        page. A **403** (admin disabled entirely — neither token nor allowlist)
+        MUST pass through as 403 (checklist #15): there is nothing to log into,
+        so redirecting to /admin/login would mask the disabled state. API/JSON
+        callers and the login endpoints themselves keep the raw status.
+        """
+        from starlette.responses import RedirectResponse as _Redirect
+
+        path = request.url.path
+        if (
+            exc.status_code == 401
+            and request.method == "GET"
+            and path.startswith("/admin")
+            and not path.startswith("/admin/login")
+            and "text/html" in request.headers.get("accept", "")
+        ):
+            return _Redirect("/admin/login", status_code=302)
+        return await http_exception_handler(request, exc)
+
     @app.middleware("http")
     async def _admin_security_headers(request, call_next):
         # #150 CRITICAL-митигейт (token-в-URL): на ВСЕХ /admin-ответах no-referrer
