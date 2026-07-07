@@ -85,7 +85,8 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         # Retention worker — внутренне throttle'ит до 1 раза в 24 часа,
         # state в /tmp/sreda-retention-state.json. На каждом tick
         # просто проверяет «пора ли». 152-ФЗ Часть 2.
-        retention = RetentionWorker(session)
+        # #138 Ф2: сам открывает privileged_session("retention") — сессию не принимает.
+        retention = RetentionWorker()
         # #139: суточная сводка надёжности (этап 0 программы) — тот же
         # каденс-паттерн (state-файл, раз в сутки, откат после провала)
         reliability = ReliabilityReportWorker(session)
