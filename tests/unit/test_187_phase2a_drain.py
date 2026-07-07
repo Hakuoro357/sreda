@@ -396,8 +396,10 @@ def test_deleted_tenant_outbox_process_one_drops_without_send(
     db_session.commit()
 
     fake_tg = _FakeTelegram()
-    worker = OutboxDeliveryWorker(db_session, telegram_client=fake_tg)
-    asyncio.run(worker._process_one(row, now_utc=_now()))
+    # #138 Ф2: воркер не хранит self.session; _process_one берёт session
+    # параметром — зовём helper напрямую с db_session (seam не задействован).
+    worker = OutboxDeliveryWorker(telegram_client=fake_tg)
+    asyncio.run(worker._process_one(db_session, row, now_utc=_now()))
 
     db_session.refresh(row)
     assert row.status == "dropped"

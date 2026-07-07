@@ -58,7 +58,8 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         # ``eds.verify_account_connect`` jobs are intentionally NOT drained —
         # they stay pending until Phase 4 (table cleanup with a backup). The
         # worker simply no longer processes them.
-        skill_platform = SkillPlatformJobProcessor(session, registry)
+        # #138 Ф2: сам ведёт privileged-скан jobs + tenant_session на job.
+        skill_platform = SkillPlatformJobProcessor(registry)
         _sys_bot_key = bot_registry.system_default_bot_key
         # #109: pass bot_registry so resolve_outbox_routings can route async
         # notifications to the user's CURRENT bot (user.last_bot_key).
@@ -79,8 +80,8 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         onboarding_aha = OnboardingAhaWorker(
             system_bot_key=_sys_bot_key, registry=bot_registry,
         )
+        # #138 Ф2: сам ведёт privileged-скан очереди + tenant_session на строку.
         delivery = OutboxDeliveryWorker(
-            session,
             telegram_client=telegram_client,
             max_client=max_client,
             registry=bot_registry,
@@ -92,7 +93,8 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         retention = RetentionWorker()
         # #139: суточная сводка надёжности (этап 0 программы) — тот же
         # каденс-паттерн (state-файл, раз в сутки, откат после провала)
-        reliability = ReliabilityReportWorker(session)
+        # #138 Ф2: сам открывает privileged_session("monitor") на KPI-COUNT.
+        reliability = ReliabilityReportWorker()
 
         # Order matters: proactive & housewife workers fill outbox →
         # delivery drains it within the same tick. The message queue

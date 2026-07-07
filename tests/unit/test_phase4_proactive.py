@@ -430,9 +430,10 @@ def test_acceptance_end_to_end_proactive_flow(worker_db, _isolate_registry):
     session.expire_all()
     assert session.query(OutboxMessage).count() == 1
 
-    # Delivery worker → Telegram (всё ещё принимает сессию — не рефакторен).
+    # Delivery worker → Telegram (#138 Ф2: сам ведёт seam-сессии; worker_db их
+    # патчит на общую БД, поэтому scan видит созданную выше outbox-строку).
     telegram = FakeTelegram()
-    delivery = OutboxDeliveryWorker(session, telegram_client=telegram)
+    delivery = OutboxDeliveryWorker(telegram_client=telegram)
     asyncio.run(delivery.process_pending_messages())
 
     assert len(telegram.sent) == 1
