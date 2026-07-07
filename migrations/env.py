@@ -33,7 +33,11 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# #138 Р5: миграции идут под OWNER-DSN (создаёт/меняет схему + ВЛАДЕЕТ таблицами → обходит RLS
+# естественно, без FORCE). Пусто → фолбэк на database_url (аддитивно v1: пока роли не разведены,
+# owner == текущая роль sreda). Рантайм-процессы под app-DSN (database_url) — НЕ здесь.
+_migration_url = settings.migration_database_url or settings.database_url
+config.set_main_option("sqlalchemy.url", _migration_url)
 target_metadata = Base.metadata
 
 # Explicit naming convention for implicit FK/UQ/IX/PK constraints.

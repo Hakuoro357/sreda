@@ -39,6 +39,10 @@ _SECRET_FIELD_NAMES = frozenset({
     "home_bot_token",
     # database_url содержит пароль PG в DSN — тоже маскируем
     "database_url",
+    # #138 Р5: раздельные роль-DSN тоже несут пароль — маскируем
+    "migration_database_url",
+    "maintenance_database_url",
+    "identity_database_url",
 })
 
 
@@ -96,6 +100,16 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     database_url: str = Field(default="postgresql+psycopg://sreda:sreda@localhost:5432/sreda")
+    # #138 Р5: раздельные DSN под роль-сплит. Пусто (None) → фолбэк на database_url
+    # (аддитивно v1: пока роли не разведены на проде — все ходят под одной ролью, как
+    # сегодня). Ф5 проставляет их (ops, SERVERS.md, не в репо):
+    #   database_url            = app-DSN (рантайм под sreda_app);
+    #   migration_database_url  = owner-DSN (ТОЛЬКО env.py — миграции обходят RLS);
+    #   maintenance_database_url= sreda_maintenance (админ/GC/монитор в privileged-блоках);
+    #   identity_database_url   = sreda_identity (inbound-провижн в privileged-блоках).
+    migration_database_url: str | None = Field(default=None)
+    maintenance_database_url: str | None = Field(default=None)
+    identity_database_url: str | None = Field(default=None)
     # SQLAlchemy connection-pool sizing (PostgreSQL only; SQLite uses its own
     # pool). Defaults are intentionally SMALL: the background processes
     # (pollers, job-runner) are low-concurrency (~3-4 pooled conns each; the
