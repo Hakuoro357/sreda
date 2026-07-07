@@ -246,10 +246,14 @@ def test_routings_accepts_registry_object_via_all_bots(session):
 
 
 @pytest.mark.asyncio
-async def test_reminder_worker_routes_to_current_bot_via_last_bot_key(session):
+async def test_reminder_worker_routes_to_current_bot_via_last_bot_key(worker_db):
     """#109 producer-level: a reminder frozen on 'sreda' is delivered to the
     user's CURRENT bot ('sreda_home') when last_bot_key is set + registry
-    passed. Without last_bot_key the outbox keeps the reminder's bot_key."""
+    passed. Without last_bot_key the outbox keeps the reminder's bot_key.
+
+    #138 Ф2: воркер сам открывает seam-сессии → фикстура ``worker_db``
+    (коммитящая файловая SQLite, шов привязан к ней); сид коммитим ДО
+    прогона воркера."""
     from datetime import datetime, timezone
     from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
     from sreda.db.models.core import OutboxMessage, Workspace
@@ -261,24 +265,24 @@ async def test_reminder_worker_routes_to_current_bot_via_last_bot_key(session):
         BotConfig(key="sreda_home", token="t2", username="SredaHomeBot"),
     ])
     tenant, user = _add_user(
-        session, telegram_account_id="tg_chat_migrated",
+        worker_db, telegram_account_id="tg_chat_migrated",
         last_bot_key="sreda_home",
     )
-    session.add(Workspace(id="ws_mig", tenant_id=tenant.id, name="WS"))
+    worker_db.add(Workspace(id="ws_mig", tenant_id=tenant.id, name="WS"))
     now = datetime.now(timezone.utc)
-    session.add(FamilyReminder(
+    worker_db.add(FamilyReminder(
         id="rem_migrated", tenant_id=tenant.id, user_id=user.id,
         title="Старое напоминание на sreda",
         trigger_at=now, next_trigger_at=now, status="pending",
         bot_key="sreda",  # frozen on the OLD bot
     ))
-    session.commit()
+    worker_db.commit()  # #138: воркер читает своим соединением → сид коммитим
 
-    worker = HousewifeReminderWorker(session, registry=registry)
+    worker = HousewifeReminderWorker(registry=registry)
     await worker.process_pending(limit=10, now=now)
 
     rows = (
-        session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tenant.id)
         .all()
     )
@@ -361,9 +365,12 @@ async def test_onboarding_kickoff_routes_to_current_bot_via_last_bot_key(session
 
 
 @pytest.mark.asyncio
-async def test_reminder_worker_falls_back_to_reminder_bot_key_without_last(session):
+async def test_reminder_worker_falls_back_to_reminder_bot_key_without_last(worker_db):
     """Without last_bot_key, the outbox bot_key is the reminder's frozen
-    value (pre-#109 fallback preserved)."""
+    value (pre-#109 fallback preserved).
+
+    #138 Ф2: воркер сам ведёт seam-сессии → фикстура ``worker_db``; сид
+    коммитим ДО прогона воркера."""
     from datetime import datetime, timezone
     from sreda.config.bot_registry import BotConfig, TelegramBotRegistry
     from sreda.db.models.core import OutboxMessage, Workspace
@@ -375,23 +382,23 @@ async def test_reminder_worker_falls_back_to_reminder_bot_key_without_last(sessi
         BotConfig(key="sreda_home", token="t2", username="SredaHomeBot"),
     ])
     tenant, user = _add_user(
-        session, telegram_account_id="tg_chat_legacy", last_bot_key=None,
+        worker_db, telegram_account_id="tg_chat_legacy", last_bot_key=None,
     )
-    session.add(Workspace(id="ws_leg", tenant_id=tenant.id, name="WS"))
+    worker_db.add(Workspace(id="ws_leg", tenant_id=tenant.id, name="WS"))
     now = datetime.now(timezone.utc)
-    session.add(FamilyReminder(
+    worker_db.add(FamilyReminder(
         id="rem_legacy", tenant_id=tenant.id, user_id=user.id,
         title="Напоминание без current-bot",
         trigger_at=now, next_trigger_at=now, status="pending",
         bot_key="sreda_home",
     ))
-    session.commit()
+    worker_db.commit()  # #138: воркер читает своим соединением → сид коммитим
 
-    worker = HousewifeReminderWorker(session, registry=registry)
+    worker = HousewifeReminderWorker(registry=registry)
     await worker.process_pending(limit=10, now=now)
 
     rows = (
-        session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tenant.id)
         .all()
     )
@@ -437,35 +444,38 @@ def test_singular_emits_deprecation_warning(session, recwarn):
 
 
 @pytest.mark.asyncio
-async def test_housewife_reminder_dual_delivery_creates_two_outbox_rows(session):
-    """Юзер с TG+MAX → reminder fire создаёт 2 outbox rows (TG + MAX)."""
+async def test_housewife_reminder_dual_delivery_creates_two_outbox_rows(worker_db):
+    """Юзер с TG+MAX → reminder fire создаёт 2 outbox rows (TG + MAX).
+
+    #138 Ф2: воркер сам ведёт seam-сессии → фикстура ``worker_db``; сид
+    коммитим ДО прогона воркера."""
     from datetime import datetime, timezone
     from sreda.db.models.core import OutboxMessage, Workspace
     from sreda.db.models.housewife import FamilyReminder
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
     tenant, user = _add_user(
-        session,
+        worker_db,
         telegram_account_id="tg_chat_111",
         max_account_id="max_account_test",
         max_chat_id="max_chat_test",
     )
-    session.add(Workspace(id="ws_t1", tenant_id=tenant.id, name="WS"))
+    worker_db.add(Workspace(id="ws_t1", tenant_id=tenant.id, name="WS"))
     now = datetime.now(timezone.utc)
-    session.add(FamilyReminder(
+    worker_db.add(FamilyReminder(
         id="rem_dual", tenant_id=tenant.id, user_id=user.id,
         title="Тестовое напоминание",
         trigger_at=now,
         next_trigger_at=now,
         status="pending",
     ))
-    session.commit()
+    worker_db.commit()  # #138: воркер читает своим соединением → сид коммитим
 
-    worker = HousewifeReminderWorker(session)
+    worker = HousewifeReminderWorker()
     await worker.process_pending(limit=10, now=now)
 
     rows = (
-        session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tenant.id)
         .order_by(OutboxMessage.channel_type.asc())
         .all()
@@ -476,13 +486,17 @@ async def test_housewife_reminder_dual_delivery_creates_two_outbox_rows(session)
 
 
 @pytest.mark.asyncio
-async def test_housewife_reminder_cross_tenant_user_id_skipped(session, caplog):
+async def test_housewife_reminder_cross_tenant_user_id_skipped(worker_db, caplog):
     """Codex R2/R5 MAJOR: reminder.user_id указывает на user из ДРУГОГО
     tenant'а → no outbox + warning log + reminder.status='fired'
     (mark_fired чтобы не зацикливаться).
 
     Защита от случаев когда manual SQL merge / FK snapshot ошибся —
     user_id мог попасть от чужого tenant'а.
+
+    #138 Ф2: воркер сам ведёт seam-сессии → фикстура ``worker_db``; сид
+    коммитим ДО прогона воркера, ``expire_all`` перед ассертом на
+    изменённый (mark_fired) засиженный reminder.
     """
     import logging
     from datetime import datetime, timezone
@@ -492,27 +506,27 @@ async def test_housewife_reminder_cross_tenant_user_id_skipped(session, caplog):
 
     tenant_this_id = "t_this"
     tenant_other_id = "t_other"
-    session.add(Tenant(id=tenant_this_id, name="This"))
-    session.add(Tenant(id=tenant_other_id, name="Other"))
-    session.add(User(id="cross_user", tenant_id=tenant_other_id,
-                     telegram_account_id="cross_tg_chat"))
-    session.add(Workspace(id="ws_this", tenant_id=tenant_this_id, name="WS"))
+    worker_db.add(Tenant(id=tenant_this_id, name="This"))
+    worker_db.add(Tenant(id=tenant_other_id, name="Other"))
+    worker_db.add(User(id="cross_user", tenant_id=tenant_other_id,
+                       telegram_account_id="cross_tg_chat"))
+    worker_db.add(Workspace(id="ws_this", tenant_id=tenant_this_id, name="WS"))
     now = datetime.now(timezone.utc)
-    session.add(FamilyReminder(
+    worker_db.add(FamilyReminder(
         id="rem_xtenant", tenant_id=tenant_this_id, user_id="cross_user",
         title="Reminder с FK leak'нувшим в чужого tenant'а",
         trigger_at=now, next_trigger_at=now,
         status="pending",
     ))
-    session.commit()
+    worker_db.commit()  # #138: воркер читает своим соединением → сид коммитим
 
     caplog.set_level(logging.WARNING, logger="sreda.workers.housewife_reminder_worker")
-    worker = HousewifeReminderWorker(session)
+    worker = HousewifeReminderWorker()
     fired = await worker.process_pending(limit=10, now=now)
 
     # 1) No outbox row — leak prevented
     rows = (
-        session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tenant_this_id)
         .all()
     )
@@ -520,8 +534,8 @@ async def test_housewife_reminder_cross_tenant_user_id_skipped(session, caplog):
 
     # 2) Worker marked reminder fired (чтобы не retry'ило infinitely);
     # delivery silently skipped, but state advanced.
-    session.expire_all()
-    rem = session.get(FamilyReminder, "rem_xtenant")
+    worker_db.expire_all()
+    rem = worker_db.get(FamilyReminder, "rem_xtenant")
     assert rem.status == "fired", f"expected fired, got {rem.status}"
     assert fired == 1  # processed
 
@@ -600,36 +614,39 @@ async def test_proactive_events_cross_tenant_user_id_skipped(session):
 
 
 @pytest.mark.asyncio
-async def test_housewife_reminder_user_scoped_no_fallback_to_other_user(session):
+async def test_housewife_reminder_user_scoped_no_fallback_to_other_user(worker_db):
     """Codex R1 CRITICAL: reminder.user_id без accounts → skip,
-    NOT fallback на другого user'а tenant'а (личные данные leak)."""
+    NOT fallback на другого user'а tenant'а (личные данные leak).
+
+    #138 Ф2: воркер сам ведёт seam-сессии → фикстура ``worker_db``; сид
+    коммитим ДО прогона воркера."""
     from datetime import datetime, timezone
     from sreda.db.models.core import OutboxMessage, Workspace
     from sreda.db.models.housewife import FamilyReminder
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
     tenant_id = "t_leak"
-    session.add(Tenant(id=tenant_id, name="LeakTest"))
-    session.add(User(id="user_a", tenant_id=tenant_id,
-                     telegram_account_id=None, max_account_id=None))
-    session.add(User(id="user_b", tenant_id=tenant_id,
-                     telegram_account_id="OTHER_USER_TG"))
-    session.add(Workspace(id="ws_leak", tenant_id=tenant_id, name="WS"))
+    worker_db.add(Tenant(id=tenant_id, name="LeakTest"))
+    worker_db.add(User(id="user_a", tenant_id=tenant_id,
+                       telegram_account_id=None, max_account_id=None))
+    worker_db.add(User(id="user_b", tenant_id=tenant_id,
+                       telegram_account_id="OTHER_USER_TG"))
+    worker_db.add(Workspace(id="ws_leak", tenant_id=tenant_id, name="WS"))
     now = datetime.now(timezone.utc)
-    session.add(FamilyReminder(
+    worker_db.add(FamilyReminder(
         id="rem_leak", tenant_id=tenant_id, user_id="user_a",
         title="Личное напоминание для user_a",
         trigger_at=now,
         next_trigger_at=now,
         status="pending",
     ))
-    session.commit()
+    worker_db.commit()  # #138: воркер читает своим соединением → сид коммитим
 
-    worker = HousewifeReminderWorker(session)
+    worker = HousewifeReminderWorker()
     await worker.process_pending(limit=10, now=now)
 
     rows = (
-        session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tenant_id)
         .all()
     )

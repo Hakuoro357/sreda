@@ -65,8 +65,10 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         proactive = ProactiveEventWorker(
             session, system_bot_key=_sys_bot_key, registry=bot_registry,
         )
+        # #138 Ф2: reminder-воркер сам ведёт свои скоупы (privileged-скан +
+        # tenant_session на семью) — общую сессию больше не принимает.
         housewife_reminders = HousewifeReminderWorker(
-            session, registry=bot_registry,
+            registry=bot_registry,
         )
         housewife_onboarding = HousewifeOnboardingKickoffWorker(
             session, system_bot_key=_sys_bot_key, registry=bot_registry,

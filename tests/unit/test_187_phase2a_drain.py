@@ -406,7 +406,7 @@ def test_deleted_tenant_outbox_process_one_drops_without_send(
 
 
 def test_deleted_tenant_reminder_not_delivered_and_not_advanced(
-    db_session: Session,
+    worker_db: Session,
 ) -> None:
     """A5 (producer-filter): a due reminder of a deleted tenant is excluded by
     ``due_now`` (JOIN tenants AND deleted_at IS NULL) → NOT delivered and its
@@ -416,36 +416,39 @@ def test_deleted_tenant_reminder_not_delivered_and_not_advanced(
     pending after delete; the producer-filter is the line of defence the worker
     actually exercises on the normal path. The deeper fencing recheck (the
     in-tick window between SELECT and advance) is covered separately in
-    ``test_deleted_tenant_reminder_fencing_recheck_skips_without_advance``."""
+    ``test_deleted_tenant_reminder_fencing_recheck_skips_without_advance``.
+
+    #138 Ф2: воркер сам открывает seam-сессии → фикстура ``worker_db`` (сид
+    коммитим ДО прогона; ``expire_all`` перед ассертом на засиженную строку)."""
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
     tid = "tenant_rem"
-    _seed_tenant(db_session, tenant_id=tid, chat_id="555", user_id="u_rem")
+    _seed_tenant(worker_db, tenant_id=tid, chat_id="555", user_id="u_rem")
     past = _now() - timedelta(minutes=1)
     reminder = _add_reminder(
-        db_session,
+        worker_db,
         tenant_id=tid,
         user_id="u_rem",
         recurrence_rule=None,
         next_trigger_at=past,
     )
-    db_session.commit()
+    worker_db.commit()
 
     # Soft-delete the tenant. Drain leaves the reminder pending+due; the
     # producer-filter in due_now is what keeps the worker from picking it up.
-    soft_delete_tenant(db_session, tid)
-    db_session.refresh(reminder)
+    soft_delete_tenant(worker_db, tid)
+    worker_db.commit()
+    worker_db.refresh(reminder)
     assert reminder.status == "pending"  # drain did NOT touch it (R1 MAJOR)
-    db_session.commit()
 
-    worker = HousewifeReminderWorker(db_session)
-    fired = asyncio.run(worker.process_pending(now=_now()))
+    fired = asyncio.run(HousewifeReminderWorker().process_pending(now=_now()))
 
-    db_session.refresh(reminder)
+    worker_db.expire_all()
+    reminder = worker_db.get(FamilyReminder, reminder.id)
     assert fired == 0
     # No outbox row was produced for the deleted tenant.
     out_count = (
-        db_session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tid)
         .count()
     )
@@ -461,7 +464,7 @@ def test_deleted_tenant_reminder_not_delivered_and_not_advanced(
 
 
 def test_deleted_tenant_reminder_fencing_recheck_skips_without_advance(
-    db_session: Session,
+    worker_db: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A5 (fencing recheck — non-vacuous): proves the WORKER's in-tick
@@ -472,59 +475,81 @@ def test_deleted_tenant_reminder_fencing_recheck_skips_without_advance(
     удалён (fencing) — пропуск без advance") is never reached. To exercise it
     we simulate the real race window: ``due_now`` selected the reminder while
     the tenant was still active, THEN an admin soft-deleted the tenant mid-tick
-    in another process. We reproduce that by monkeypatching ``due_now`` to
-    return the reminder for a tenant we mark deleted just before the worker
-    loops over it. The worker must skip delivery AND not advance state."""
+    in another process.
+
+    #138 Ф2: воркер сам открывает seam-сессии, поэтому у него больше НЕТ
+    ``worker.service`` — скан зовёт ``HousewifeReminderService(scan).due_now`` в
+    ``privileged_session``, а fencing ``is_tenant_active`` идёт под
+    ``tenant_session`` семьи. Патчим методы НА КЛАССЕ
+    ``HousewifeReminderService`` (не на экземпляре — воркер строит его сам
+    внутри): ``due_now`` возвращает напоминание удалённого тенанта (иначе
+    producer-фильтр отсеял бы), ``mark_fired`` — шпион, доказывающий, что
+    fencing ``continue`` сработал ДО advance."""
+    from sreda.services.housewife_reminders import HousewifeReminderService
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
     tid = "tenant_fence"
-    _seed_tenant(db_session, tenant_id=tid, chat_id="666", user_id="u_fence")
+    _seed_tenant(worker_db, tenant_id=tid, chat_id="666", user_id="u_fence")
     past = _now() - timedelta(minutes=1)
     reminder = _add_reminder(
-        db_session,
+        worker_db,
         tenant_id=tid,
         user_id="u_fence",
         recurrence_rule=None,
         next_trigger_at=past,
     )
-    db_session.commit()
+    worker_db.commit()
 
     # Mark the tenant deleted AFTER it would have been selected — the reminder
-    # itself stays pending+due (drain doesn't touch reminders).
-    soft_delete_tenant(db_session, tid)
-    db_session.commit()
-    db_session.refresh(reminder)
+    # itself stays pending+due (drain doesn't touch reminders). Commit so the
+    # worker's own seam-sessions (separate connections) observe the deletion.
+    soft_delete_tenant(worker_db, tid)
+    worker_db.commit()
+    worker_db.refresh(reminder)
     assert reminder.status == "pending"
 
-    worker = HousewifeReminderWorker(db_session)
+    # Snapshot the id+tenant_id the scan needs BEFORE any expire, so the patched
+    # due_now returns plain values (no lazy reload on a detached row).
+    rem_id = reminder.id
+    rem_tenant = reminder.tenant_id
 
-    # Force due_now to YIELD the reminder despite the deleted tenant — this is
-    # the only way to drive the worker into the fencing recheck branch (the real
-    # producer-filter would have filtered it out). We patch the bound service
-    # method so the worker sees a non-empty due-set.
+    # Force due_now to YIELD the reminder despite the deleted tenant — the only
+    # way to drive the worker into the fencing recheck branch (the real
+    # producer-filter would have filtered it out). Patch the CLASS method: the
+    # worker constructs its own service inside the privileged scan block. The
+    # scan reads only ``.id`` / ``.tenant_id`` off each row, so a tiny stand-in
+    # carrying those two fields is enough and avoids cross-session coupling.
+    class _DueRow:
+        id = rem_id
+        tenant_id = rem_tenant
+
     monkeypatch.setattr(
-        worker.service, "due_now", lambda *, now=None, limit=50: [reminder]
+        HousewifeReminderService,
+        "due_now",
+        lambda self, *, now=None, limit=50: [_DueRow()],
     )
 
-    # Spy on mark_fired to assert state is NOT advanced (worker must `continue`
-    # BEFORE calling it).
+    # Spy on mark_fired (class-level) to assert state is NOT advanced (worker
+    # must `continue` BEFORE calling it). ``self`` is the service instance the
+    # worker builds under tenant_session.
     advanced: list = []
-    real_mark_fired = worker.service.mark_fired
+    real_mark_fired = HousewifeReminderService.mark_fired
 
-    def _spy_mark_fired(rem, *, now=None):  # noqa: ANN001
+    def _spy_mark_fired(self, rem, *, now=None):  # noqa: ANN001
         advanced.append(rem.id)
-        return real_mark_fired(rem, now=now)
+        return real_mark_fired(self, rem, now=now)
 
-    monkeypatch.setattr(worker.service, "mark_fired", _spy_mark_fired)
+    monkeypatch.setattr(HousewifeReminderService, "mark_fired", _spy_mark_fired)
 
-    fired = asyncio.run(worker.process_pending(now=_now()))
+    fired = asyncio.run(HousewifeReminderWorker().process_pending(now=_now()))
 
-    db_session.refresh(reminder)
+    worker_db.expire_all()
+    reminder = worker_db.get(FamilyReminder, rem_id)
     assert fired == 0
     assert advanced == []  # fencing `continue` hit BEFORE mark_fired → no advance
     # No outbox row produced for the deleted tenant.
     out_count = (
-        db_session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tid)
         .count()
     )
