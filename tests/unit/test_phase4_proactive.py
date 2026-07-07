@@ -215,7 +215,9 @@ def test_low_relevance_stays_new(session):
 # ---------------------------------------------------------------------------
 
 
-def test_proactive_handler_writes_outbox(session, _isolate_registry):
+def test_proactive_handler_writes_outbox(worker_db, _isolate_registry):
+    session = worker_db
+    _seed_world(session)
     _seed_subscription(session, feature_key=TEST_FEATURE_KEY)
 
     captured: dict = {}
@@ -250,11 +252,14 @@ def test_proactive_handler_writes_outbox(session, _isolate_registry):
     )
     session.commit()
 
-    worker = ProactiveEventWorker(session)
+    worker = ProactiveEventWorker()
     processed = asyncio.run(worker.process_pending())
     assert processed == 1
 
-    session.refresh(event)
+    # #138 Ф2: воркер писал СВОЕЙ сессией (tenant_session) → засиженный
+    # event перечитываем после expire_all.
+    session.expire_all()
+    event = session.get(InboundEvent, event.id)
     assert event.status == "consumed"
     assert event.consumed_at is not None
     assert captured["payload"] == {"title": "Привет из теста"}
@@ -268,7 +273,9 @@ def test_proactive_handler_writes_outbox(session, _isolate_registry):
     assert "Привет из теста" in outbox.payload_json
 
 
-def test_proactive_no_handler_marks_skipped(session, _isolate_registry):
+def test_proactive_no_handler_marks_skipped(worker_db, _isolate_registry):
+    session = worker_db
+    _seed_world(session)
     _seed_subscription(session, feature_key=TEST_FEATURE_KEY)
     repo = InboundEventRepository(session)
     event = repo.create_from_draft(
@@ -283,16 +290,19 @@ def test_proactive_no_handler_marks_skipped(session, _isolate_registry):
     )
     session.commit()
 
-    worker = ProactiveEventWorker(session)
+    worker = ProactiveEventWorker()
     asyncio.run(worker.process_pending())
 
-    session.refresh(event)
+    session.expire_all()
+    event = session.get(InboundEvent, event.id)
     assert event.status == "skipped"
     assert event.status_reason == "no_proactive_handler"
     assert session.query(OutboxMessage).count() == 0
 
 
-def test_proactive_exhausted_quota_skips(session, _isolate_registry):
+def test_proactive_exhausted_quota_skips(worker_db, _isolate_registry):
+    session = worker_db
+    _seed_world(session)
     # Tiny quota, pre-fill usage to exhaust it
     _seed_subscription(
         session, feature_key=TEST_FEATURE_KEY, credits_quota=100
@@ -330,18 +340,21 @@ def test_proactive_exhausted_quota_skips(session, _isolate_registry):
     )
     session.commit()
 
-    worker = ProactiveEventWorker(session)
+    worker = ProactiveEventWorker()
     asyncio.run(worker.process_pending())
 
-    session.refresh(event)
+    session.expire_all()
+    event = session.get(InboundEvent, event.id)
     assert event.status == "skipped"
     assert event.status_reason == "quota_exhausted"
     assert called[0] == 0  # handler never invoked
     assert session.query(OutboxMessage).count() == 0
 
 
-def test_proactive_unsubscribed_skill_skipped(session, _isolate_registry):
+def test_proactive_unsubscribed_skill_skipped(worker_db, _isolate_registry):
     """No active subscription → quota check fails → event skipped."""
+    session = worker_db
+    _seed_world(session)
 
     def handler(ctx):
         return [RuntimeReply(text="should not run", reply_markup=None)]
@@ -363,10 +376,11 @@ def test_proactive_unsubscribed_skill_skipped(session, _isolate_registry):
     )
     session.commit()
 
-    worker = ProactiveEventWorker(session)
+    worker = ProactiveEventWorker()
     asyncio.run(worker.process_pending())
 
-    session.refresh(event)
+    session.expire_all()
+    event = session.get(InboundEvent, event.id)
     assert event.status == "skipped"
     assert event.status_reason == "quota_exhausted"
 
@@ -376,8 +390,10 @@ def test_proactive_unsubscribed_skill_skipped(session, _isolate_registry):
 # ---------------------------------------------------------------------------
 
 
-def test_acceptance_end_to_end_proactive_flow(session, _isolate_registry):
+def test_acceptance_end_to_end_proactive_flow(worker_db, _isolate_registry):
     """End-to-end: skill's proactive handler → outbox → delivery → Telegram."""
+    session = worker_db
+    _seed_world(session)
     _seed_subscription(session, feature_key=TEST_FEATURE_KEY)
 
     def handler(ctx: ProactiveEventContext):
@@ -408,11 +424,13 @@ def test_acceptance_end_to_end_proactive_flow(session, _isolate_registry):
     session.commit()
 
     # Proactive worker → outbox
-    proactive = ProactiveEventWorker(session)
+    proactive = ProactiveEventWorker()
     asyncio.run(proactive.process_pending())
+    # #138 Ф2: outbox писала tenant_session воркера → перечитываем.
+    session.expire_all()
     assert session.query(OutboxMessage).count() == 1
 
-    # Delivery worker → Telegram
+    # Delivery worker → Telegram (всё ещё принимает сессию — не рефакторен).
     telegram = FakeTelegram()
     delivery = OutboxDeliveryWorker(session, telegram_client=telegram)
     asyncio.run(delivery.process_pending_messages())

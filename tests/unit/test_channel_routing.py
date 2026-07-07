@@ -598,15 +598,16 @@ async def test_proactive_events_cross_tenant_user_id_skipped(session):
                      telegram_account_id="pe_cross_tg"))
     session.commit()
 
-    worker = ProactiveEventWorker.__new__(ProactiveEventWorker)
-    worker.session = session
+    # #138 Ф2: воркер больше не хранит self.session; _resolve_routings берёт
+    # session параметром — тестовую сессию передаём напрямую (seam не задействован).
+    worker = ProactiveEventWorker()
 
     # Mock InboundEvent
     class _FakeEvent:
         tenant_id = tenant_this_id
         user_id = "pe_cross"
 
-    routings = worker._resolve_routings(_FakeEvent())
+    routings = worker._resolve_routings(session, _FakeEvent())
     assert routings == [], (
         "cross-tenant event.user_id должен дать empty routings — "
         f"got {routings!r}"

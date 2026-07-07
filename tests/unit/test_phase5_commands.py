@@ -66,6 +66,21 @@ def _bootstrap(monkeypatch, tmp_path: Path, name: str):
     return session
 
 
+def _seed_proactive_base(session) -> None:
+    """Tenant/Workspace/Assistant/User для e2e воркер-тестов.
+
+    #138 Ф2: с ``worker_db`` схема уже создана фикстурой, а env/шифро-ключ —
+    autouse-фикстурами conftest, поэтому в отличие от ``_bootstrap`` тут ТОЛЬКО
+    строки (тот же набор ids: t1/w1/a1/u1). Коммит — на вызывающей стороне.
+    """
+    session.add(Tenant(id="t1", name="T"))
+    session.add(Workspace(id="w1", tenant_id="t1", name="W"))
+    session.flush()
+    session.add(Assistant(id="a1", tenant_id="t1", workspace_id="w1", name="Sreda"))
+    session.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
+    session.commit()
+
+
 def _seed_subscription(session, feature_key: str):
     plan = SubscriptionPlan(
         id=f"plan_{uuid4().hex[:16]}",
@@ -271,12 +286,17 @@ def _fresh_registry(monkeypatch):
 
 
 def test_proactive_duplicate_dropped_by_policy(
-    monkeypatch, tmp_path: Path, _fresh_registry
+    worker_db, _fresh_registry
 ):
     """When the same handler fires twice on similar content within 24h,
-    the second outbox row is dropped with reason=duplicate."""
-    session = _bootstrap(monkeypatch, tmp_path, "p5e2e1.db")
-    _seed_subscription(session, TEST_FEATURE_KEY)
+    the second outbox row is dropped with reason=duplicate.
+
+    #138 Ф2: воркер сам открывает seam-сессии — через фикстуру ``worker_db``
+    (сессия воркера и сессия теста делят БД, но РАЗНЫЕ). Сид коммитим ДО
+    прогона воркера; после — ``expire_all()`` + перечитываем той же сессией.
+    """
+    _seed_proactive_base(worker_db)
+    _seed_subscription(worker_db, TEST_FEATURE_KEY)
 
     def handler(ctx: ProactiveEventContext):
         return [RuntimeReply(text="Заявка #42 обновлена", reply_markup=None)]
@@ -285,7 +305,7 @@ def test_proactive_duplicate_dropped_by_policy(
         feature_key=TEST_FEATURE_KEY, handler=handler
     )
 
-    repo = InboundEventRepository(session)
+    repo = InboundEventRepository(worker_db)
     repo.create_from_draft(
         InboundEventDraft(
             tenant_id="t1",
@@ -306,39 +326,36 @@ def test_proactive_duplicate_dropped_by_policy(
             relevance_score=0.9,
         )
     )
-    session.commit()
+    worker_db.commit()
 
-    worker = ProactiveEventWorker(session)
-    try:
-        asyncio.run(worker.process_pending())
-    finally:
-        session.close()
+    asyncio.run(ProactiveEventWorker().process_pending())
 
-    # Reopen a session to inspect results
-    session = get_session_factory()()
-    try:
-        outboxes = session.query(OutboxMessage).order_by(OutboxMessage.created_at.asc()).all()
-        # First → sent (pending, delivery worker hasn't run), second → dropped
-        assert len(outboxes) == 2
-        assert outboxes[0].status == "pending"
-        assert outboxes[0].drop_reason is None
-        assert outboxes[1].status == "dropped"
-        assert outboxes[1].drop_reason == "duplicate"
-    finally:
-        session.close()
+    worker_db.expire_all()
+    outboxes = worker_db.query(OutboxMessage).order_by(OutboxMessage.created_at.asc()).all()
+    # First → sent (pending, delivery worker hasn't run), second → dropped
+    assert len(outboxes) == 2
+    assert outboxes[0].status == "pending"
+    assert outboxes[0].drop_reason is None
+    assert outboxes[1].status == "dropped"
+    assert outboxes[1].drop_reason == "duplicate"
 
 
 def test_proactive_throttle_defers_second_event(
-    monkeypatch, tmp_path: Path, _fresh_registry
+    worker_db, _fresh_registry
 ):
     """With explicit throttle=30 in profile, a second proactive reply
-    (unique text) within the window is deferred rather than dropped."""
-    session = _bootstrap(monkeypatch, tmp_path, "p5e2e2.db")
-    _seed_subscription(session, TEST_FEATURE_KEY)
+    (unique text) within the window is deferred rather than dropped.
+
+    #138 Ф2: воркер сам открывает seam-сессии — через фикстуру ``worker_db``.
+    Сид коммитим ДО прогона воркера; после — ``expire_all()`` + перечитываем
+    той же сессией.
+    """
+    _seed_proactive_base(worker_db)
+    _seed_subscription(worker_db, TEST_FEATURE_KEY)
 
     # Default throttle is 0 (disabled). Explicitly set throttle=30 in
     # user profile to test the deferral behaviour.
-    session.add(
+    worker_db.add(
         TenantUserProfile(
             id="prof1",
             tenant_id="t1",
@@ -346,7 +363,7 @@ def test_proactive_throttle_defers_second_event(
             proactive_throttle_minutes=30,
         )
     )
-    session.commit()
+    worker_db.commit()
 
     counter = [0]
 
@@ -360,7 +377,7 @@ def test_proactive_throttle_defers_second_event(
         feature_key=TEST_FEATURE_KEY, handler=handler
     )
 
-    repo = InboundEventRepository(session)
+    repo = InboundEventRepository(worker_db)
     repo.create_from_draft(
         InboundEventDraft(
             tenant_id="t1",
@@ -381,22 +398,15 @@ def test_proactive_throttle_defers_second_event(
             relevance_score=0.9,
         )
     )
-    session.commit()
+    worker_db.commit()
 
-    worker = ProactiveEventWorker(session)
-    try:
-        asyncio.run(worker.process_pending())
-    finally:
-        session.close()
+    asyncio.run(ProactiveEventWorker().process_pending())
 
-    session = get_session_factory()()
-    try:
-        outboxes = session.query(OutboxMessage).order_by(OutboxMessage.created_at.asc()).all()
-        assert len(outboxes) == 2
-        # First message → pending (first event of the window)
-        assert outboxes[0].scheduled_at is None
-        # Second → deferred
-        assert outboxes[1].status == "pending"
-        assert outboxes[1].scheduled_at is not None
-    finally:
-        session.close()
+    worker_db.expire_all()
+    outboxes = worker_db.query(OutboxMessage).order_by(OutboxMessage.created_at.asc()).all()
+    assert len(outboxes) == 2
+    # First message → pending (first event of the window)
+    assert outboxes[0].scheduled_at is None
+    # Second → deferred
+    assert outboxes[1].status == "pending"
+    assert outboxes[1].scheduled_at is not None
