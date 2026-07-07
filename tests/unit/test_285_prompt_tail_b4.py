@@ -126,15 +126,19 @@ def test_availability_directive_lists_names_and_honesty():
         assert n in d, d
     # порядок детерминирован (sorted) — стабильный текст хвоста
     assert d.index("add_task") < d.index("recall_memory") < d.index("web_search")
-    # #279-семантика: способность есть; про текущий ход; уточни недостающее
-    assert "ТЕКУЩИЙ ход" in d
-    assert "НИКОГДА не говори" in d
-    assert "уточни" in d
+    # #285 канарейка-фикс тона: ВЕДЁТ с «ответь по существу, опираясь на результаты» (не со списка
+    # тулов), honesty/условный write — фоном. #279-семантика сохранена.
+    assert "ПО СУЩЕСТВУ" in d          # первичная директива — ответить по сути запроса
+    assert "результаты" in d           # опираться на результаты инструментов (отчёт о действии)
+    assert "текущий ход" in d
+    assert "не умею" in d              # способность есть (honesty)
+    assert "уточни" in d               # условный write-кларификатор
 
 
 def test_availability_directive_empty_bound_still_honest():
     d = react_loop._unified_availability_directive([])
-    assert "НИКОГДА не говори" in d          # честность есть даже без инструментов
+    assert "не умею" in d                    # честность есть даже без инструментов
+    assert "ПО СУЩЕСТВУ" in d                # ведёт с ответа по сути
     assert "доступны инструменты:" not in d  # нечего перечислять
 
 
