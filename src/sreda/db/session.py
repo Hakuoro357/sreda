@@ -28,6 +28,7 @@ PRIVILEGED_REASONS: frozenset[str] = _IDENTITY_REASONS | frozenset({
     "monitor",        # мониторы/probe
     "broadcast",      # рассылки
     "migration-data",  # data-миграции
+    "queue-dispatch",  # консьюмер очереди message_jobs (claim/mark/heartbeat — кросс-тенант)
 })
 
 

@@ -124,6 +124,20 @@ def test_create_task_captures_tenant_ctx():
     assert captured["tid"] == "tenant_max_detached"  # detached-задача видела тенанта хода
 
 
+def test_queue_dispatch_reason_is_registered_maintenance():
+    """#138 Ф2 срез-4 (message_dispatcher): консьюмер очереди message_jobs —
+    КРОСС-ТЕНАНТНЫЙ (claim/mark/heartbeat видят джобы всех семей) → ходит под
+    privileged_session('queue-dispatch'). Reason зарегистрирован и НЕ identity
+    (идёт на maintenance-движок, не на узкую identity-роль). Пер-тенантный
+    dispatch хода — под tenant_session(job.tenant_id) (см. тесты диспетчера)."""
+    assert "queue-dispatch" in dbs.PRIVILEGED_REASONS
+    assert "queue-dispatch" not in dbs._IDENTITY_REASONS  # noqa: SLF001
+    with dbs.privileged_session("queue-dispatch") as s:
+        assert dbs.access_ctx.get() == "privileged"
+        assert dbs.tenant_ctx.get() is None  # privileged не течёт тенантом
+        assert s.execute
+
+
 @pytest.mark.pg
 def test_integration_rls_under_app_role_isolates_tenants():
     """Плейсхолдер integration-теста (реальный Postgres под ролью sreda_app): два тенанта,
