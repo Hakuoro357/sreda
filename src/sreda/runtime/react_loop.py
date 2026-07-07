@@ -1780,6 +1780,22 @@ def _effective_intent(state, preflight_enabled: bool):
     return (state.get("intent") or None) if preflight_enabled else None
 
 
+def _domain_blocked_count(messages) -> int:
+    """#285 канарейка-фикс: сколько раз В ТЕКУЩЕМ ходу (после последнего HumanMessage) инструмент
+    вернул domain_blocked. Детект петли «модель долбит незабинженный тул по кругу» (инцидент
+    канарейки 2026-07-06: «как дела?» → list_checklists ×3 → 7 проходов впустую)."""
+    from langchain_core.messages import HumanMessage, ToolMessage
+    cnt = 0
+    for m in reversed(messages or []):
+        if isinstance(m, HumanMessage):
+            break
+        if isinstance(m, ToolMessage):
+            art = getattr(m, "artifact", None) or {}
+            if isinstance(art, dict) and art.get("result_kind") == "domain_blocked":
+                cnt += 1
+    return cnt
+
+
 def _summary_enabled_for(tenant_id: str) -> bool:
     """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
     Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
@@ -2573,7 +2589,19 @@ def _build_graph(llm: Any, all_tools: list, *,
                 _text = _last_human_text(state["messages"])
                 if state.get("router_allowed_read_domains") is not None:
                     from sreda.runtime.react_preflight import route_domains
-                    _sec = route_domains(_text).directive
+                    _rr = route_domains(_text)
+                    _sec = _rr.directive
+                    # #285 канарейка-фикс (инцидент 2026-07-06): на ЕДИНОМ пути директива route_domains
+                    # НЕ должна называть инструменты домена, который ПОЛИТИКА не разрешила. route-мина
+                    # «как дела?» → primary=checklists → «зови list_checklists», а политика по идиоме
+                    # дала web-only → модель звала незабинженный тул → domain_blocked в цикле. Гейтим
+                    # директиву по фактически allowed-доменам хода. Легаси (#221) НЕ трогаем — там
+                    # router_allowed = те же route-домены, директива уже согласована с ними.
+                    if state.get("unified_execute") and _rr.primary_domain:
+                        _allowed = (set(state.get("router_allowed_read_domains") or [])
+                                    | set(state.get("router_allowed_write_domains") or []))
+                        if _rr.primary_domain not in _allowed:
+                            _sec = None
                 else:
                     from sreda.runtime.react_preflight import _section_hint
                     _sec = _section_hint(_text)
@@ -2884,9 +2912,18 @@ def _build_graph(llm: Any, all_tools: list, *,
                                                     unified=bool(state.get("unified_execute")))
                 if _ureason == "domain_blocked":
                     _uavail = ", ".join(sorted(set(_ufar or []) | set(_ufaw or []))) or "—"
-                    _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
-                             "need_family здесь не поможет. Если нужная цель в другом разделе — "
-                             "спроси у пользователя, что он имеет в виду.")
+                    if state.get("unified_execute"):
+                        # #285 канарейка-фикс: жёстче — НЕ долбить заблокированный тул + для «не про
+                        # раздел» просто ответить словами (смолток «как дела?» не должен уходить в
+                        # «какой чеклист?»). Старый текст звал «спроси у пользователя» → петля/ask_human.
+                        _umsg = (f"Инструмент {name} НЕ подходит к этому ходу (доступно про: {_uavail}). "
+                                 f"НЕ зови {name} снова в этом ходу. Если это обычный разговор или вопрос "
+                                 "не про эти разделы — просто ответь по существу словами, без инструментов. "
+                                 "Если правда нужен другой раздел — уточни ОДНИМ коротким вопросом.")
+                    else:
+                        _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
+                                 "need_family здесь не поможет. Если нужная цель в другом разделе — "
+                                 "спроси у пользователя, что он имеет в виду.")
                 else:
                     _umsg = (f"Инструмент {name} сейчас недоступен — сначала позови "
                              "need_family нужной семьи.")
@@ -2987,6 +3024,11 @@ def _build_graph(llm: Any, all_tools: list, *,
         passes = state.get("turn_pass_count") or 0
         eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         if getattr(last, "tool_calls", None):
+            # #285 канарейка-фикс: на едином пути — если ход уже упёрся в domain_blocked ≥2 раза
+            # (модель долбит незабинженный тул по кругу, инцидент 2026-07-06), грациозный стоп СРАЗУ,
+            # не жечь проходы до потолка (7 впустую на «как дела?»). Легаси не трогаем.
+            if state.get("unified_execute") and _domain_blocked_count(state["messages"]) >= 2:
+                return "stop"
             # АНТИ-ПЕТЛЯ (R1 medium+субагент): лимит проходов исчерпан (повтор need_family/
             # недоступного инструмента и т.п.) → грациозный стоп-узел, НЕ зацикливаемся до
             # recursion_limit (который дал бы «потеряла контекст»). turn_pass_count гейтит и
