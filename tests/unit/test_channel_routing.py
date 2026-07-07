@@ -292,7 +292,7 @@ async def test_reminder_worker_routes_to_current_bot_via_last_bot_key(worker_db)
 
 
 @pytest.mark.asyncio
-async def test_onboarding_kickoff_routes_to_current_bot_via_last_bot_key(session):
+async def test_onboarding_kickoff_routes_to_current_bot_via_last_bot_key(session, monkeypatch):
     """#109 producer-level (onboarding): the kickoff intro is delivered to the
     user's CURRENT bot ('sreda_home') when last_bot_key is set + registry
     passed; falls back to system_bot_key when last_bot_key is NULL.
@@ -320,15 +320,16 @@ async def test_onboarding_kickoff_routes_to_current_bot_via_last_bot_key(session
     session.add(Workspace(id="ws_oh_cur", tenant_id=tenant.id, name="WS"))
     session.commit()
 
-    worker = HousewifeOnboardingKickoffWorker.__new__(
-        HousewifeOnboardingKickoffWorker,
+    # #138 Ф2: воркер не хранит self.session/self.service; _fire берёт session
+    # параметром, а service.start создаётся внутри — мокаем его на классе
+    # (тест про outbox bot_key-routing, не про сам start).
+    monkeypatch.setattr(
+        "sreda.workers.housewife_onboarding_worker.HousewifeOnboardingService.start",
+        lambda self, **kw: None,
     )
-    worker.session = session
-    worker.service = type("S", (), {"start": lambda self, **kw: None})()
-    worker._system_bot_key = "sreda"
-    worker._registry = registry
+    worker = HousewifeOnboardingKickoffWorker(system_bot_key="sreda", registry=registry)
 
-    fired = worker._fire(tenant.id, user.id)
+    fired = worker._fire(session, tenant.id, user.id)
     assert fired is True
     session.flush()
 
@@ -350,7 +351,7 @@ async def test_onboarding_kickoff_routes_to_current_bot_via_last_bot_key(session
     session.add(Workspace(id="ws_oh_null", tenant_id=tenant2.id, name="WS"))
     session.commit()
 
-    fired2 = worker._fire(tenant2.id, user2.id)
+    fired2 = worker._fire(session, tenant2.id, user2.id)
     assert fired2 is True
     session.flush()
 
@@ -565,14 +566,11 @@ async def test_housewife_onboarding_cross_tenant_user_id_skipped(session, monkey
     session.add(Workspace(id="ws_oh_this", tenant_id=tenant_this_id, name="WS"))
     session.commit()
 
-    # Build worker without triggering full housewife_onboarding service init
-    worker = HousewifeOnboardingKickoffWorker.__new__(
-        HousewifeOnboardingKickoffWorker,
-    )
-    worker.session = session
-    worker.service = type("S", (), {"start": lambda self, **kw: None})()
+    # #138 Ф2: воркер не хранит self.session; _fire берёт session параметром.
+    # service.start здесь не зовётся (cross-tenant skip срабатывает раньше).
+    worker = HousewifeOnboardingKickoffWorker()
 
-    fired = worker._fire(tenant_id=tenant_this_id, user_id="oh_cross")
+    fired = worker._fire(session, tenant_id=tenant_this_id, user_id="oh_cross")
 
     assert fired is False, "cross-tenant user_id должен быть skip'нут"
     rows = (

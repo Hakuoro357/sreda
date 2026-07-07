@@ -71,11 +71,13 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         housewife_reminders = HousewifeReminderWorker(
             registry=bot_registry,
         )
+        # #138 Ф2: сам ведёт privileged-скан configs + tenant_session на юзера.
         housewife_onboarding = HousewifeOnboardingKickoffWorker(
-            session, system_bot_key=_sys_bot_key, registry=bot_registry,
+            system_bot_key=_sys_bot_key, registry=bot_registry,
         )
+        # #138 Ф2: сам ведёт privileged-скан свежеодобренных + tenant_session.
         onboarding_aha = OnboardingAhaWorker(
-            session, system_bot_key=_sys_bot_key, registry=bot_registry,
+            system_bot_key=_sys_bot_key, registry=bot_registry,
         )
         delivery = OutboxDeliveryWorker(
             session,
