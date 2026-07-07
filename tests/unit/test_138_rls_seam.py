@@ -101,6 +101,29 @@ def test_three_engines_distinct_accessors_exist():
     assert callable(dbs.get_identity_engine)
 
 
+def test_create_task_captures_tenant_ctx():
+    """#138 Ф2 срез-2 (detached-пересказчик): asyncio.create_task, созданная ВНУТРИ tenant-контекста,
+    НАСЛЕДУЕТ tenant_ctx (копия контекста на момент создания). Пересказчик спавнится внутри
+    tenant-скоупа inbound-хода → detached-summary пишет checkpoint под ВЕРНЫМ тенантом, даже когда
+    внешний ход уже сбросил ctx в finally. Это то, что делает срез-2 покрытым срезом-1."""
+    import asyncio
+
+    captured: dict[str, object] = {}
+
+    async def _main() -> None:
+        async def _detached() -> None:
+            captured["tid"] = dbs.tenant_ctx.get()
+
+        with dbs.tenant_session("tenant_max_detached"):
+            task = asyncio.create_task(_detached())
+        # вышли из tenant_session → внешний ctx сброшен, НО задача несёт свою копию
+        assert dbs.tenant_ctx.get() is None
+        await task
+
+    asyncio.run(_main())
+    assert captured["tid"] == "tenant_max_detached"  # detached-задача видела тенанта хода
+
+
 @pytest.mark.pg
 def test_integration_rls_under_app_role_isolates_tenants():
     """Плейсхолдер integration-теста (реальный Postgres под ролью sreda_app): два тенанта,

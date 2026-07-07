@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from sreda.config.settings import get_settings
 from sreda.db.models.core import Tenant
-from sreda.db.session import get_session_factory
+from sreda.db.session import get_session_factory, tenant_ctx
 from sreda.integrations.max import MaxClient
 from sreda.integrations.max.client import MaxDeliveryError
 from sreda.services.inbound_messages import persist_max_inbound_event
@@ -888,6 +888,10 @@ async def _process_approved_max_turn(
 
     SessionLocal = get_session_factory()
     bg_session = SessionLocal()
+    # #138 Ф2: одобренный ход (post-resolution → onboarding.tenant_id валиден) под tenant-контекстом
+    # → begin-событие ставит sreda.tenant_id на каждой txn bg_session (RLS-скоуп; до Ф3 no-op-эффект).
+    # Reset в outer-finally (:1384). Симметрия с telegram_inbound.
+    _tenant_tok = tenant_ctx.set(onboarding.tenant_id)
     settings = get_settings()
     # Cut-off time для outbox correlation (используется в ack delete polling).
     turn_started_at = datetime.now(timezone.utc)
@@ -1382,6 +1386,7 @@ async def _process_approved_max_turn(
         # #187 Phase 2b: отпустить advisory-lock ДО close() (симметрия с TG).
         _barrier.close()
         bg_session.close()
+        tenant_ctx.reset(_tenant_tok)  # #138 Ф2: снять tenant-контекст хода
 
 
 async def _send_max_ack(
