@@ -22,7 +22,7 @@ from sreda.admin.queries import (
     has_active_subscriptions,
 )
 from sreda.config.settings import get_settings
-from sreda.db.session import get_session_factory
+from sreda.db.session import get_session_factory, privileged_session
 
 _MSK_TZ = ZoneInfo("Europe/Moscow")
 
@@ -54,11 +54,11 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 def _get_session():
-    session = get_session_factory()()
-    try:
+    # #138 Ф2: админ-дашборд видит ВСЕ тенанты (кросс-тенант) → privileged("admin").
+    # Без обёртки под Ф3 RLS все запросы дашборда под ролью app вернут 0 строк (fail-closed).
+    # (refresh_overview :182 — отдельный кросс-тенантный снапшот #292, тоже privileged, treatment overview_snapshot.)
+    with privileged_session("admin") as session:
         yield session
-    finally:
-        session.close()
 
 
 def _audit_admin_view(

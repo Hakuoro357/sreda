@@ -72,29 +72,38 @@ def get_engine():
     return engine
 
 
+@lru_cache
+def _build_role_engine(url: str):
+    """#138 Ф5: отдельный движок под РАЗВЕДЁННЫЙ DSN роли (maintenance/identity), кеш по URL.
+    До Ф5 (url == database_url) НЕ используется — идём в общий get_engine."""
+    return _build_engine(url)
+
+
 def get_app_engine():
     """#138 Р5: app DSN = database_url (рантайм под sreda_app). Переиспользуем пул get_engine."""
     return get_engine()
 
 
-@lru_cache
 def get_maintenance_engine():
-    """#138: maintenance-роль. Пока maintenance_database_url не разведён — тот же движок (аддитивно, v1)."""
+    """#138: maintenance-роль. Пока maintenance_database_url не разведён — общий get_engine.
+    БЕЗ собственного lru_cache: иначе тесты, сбрасывающие get_engine на новую БД, видели бы здесь
+    протухший движок первого теста (privileged-путь расходился бы с tenant-путём). Ф5 (свой DSN) —
+    через кешируемый _build_role_engine."""
     settings = get_settings()
     url = getattr(settings, "maintenance_database_url", None) or settings.database_url
     if url == settings.database_url:
         return get_engine()
-    return _build_engine(url)
+    return _build_role_engine(url)
 
 
-@lru_cache
 def get_identity_engine():
-    """#138: узкая identity-роль (inbound-провижн). Пока identity_database_url не разведён — тот же движок."""
+    """#138: узкая identity-роль (inbound-провижн). Пока identity_database_url не разведён — общий
+    get_engine (без своего lru_cache, та же причина, что у maintenance). Ф5 — _build_role_engine."""
     settings = get_settings()
     url = getattr(settings, "identity_database_url", None) or settings.database_url
     if url == settings.database_url:
         return get_engine()
-    return _build_engine(url)
+    return _build_role_engine(url)
 
 
 @lru_cache
