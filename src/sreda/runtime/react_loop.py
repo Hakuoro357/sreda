@@ -759,6 +759,10 @@ class ReactState(MessagesState):
     # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
     # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
     unified_execute: bool
+    # #stale (канарейка, реальный баг): протухшая пауза + НОВОЕ сообщение → директива грациозного возврата
+    # (ответь на новое + мягко уточни актуальность незакрытого вопроса, НЕ повторяй в лоб). Транзиентная,
+    # как guard_nudge: ставится на свежем ходу при протухании паузы (unified), "" иначе. Last-value.
+    stale_pause_note: str
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
@@ -1848,6 +1852,38 @@ def _withdrawal_messages(last_msg) -> list:
         for tc in last_msg.tool_calls if tc.get("id")]
 
 
+def _stale_pause_directive(gap_seconds: float) -> str:
+    """#stale (канарейка, реальный баг «позвонить маме»): протухшая пауза + НОВОЕ сообщение. Без этого
+    модель перескакивает на вчерашний незакрытый вопрос В ЛОБ («Во сколько?»), игнорируя «Привет». Директива
+    велит ответить на новое сообщение и МЯГКО уточнить актуальность незакрытого (Борис: «Привет. Вчера ты
+    так и не ответил, во сколько … — актуально?»). Формулирует модель; тут даём фрейм + грубую давность."""
+    if gap_seconds >= 20 * 3600:
+        when = "со вчера (или раньше)"
+    elif gap_seconds >= 2 * 3600:
+        when = f"несколько часов назад (~{int(gap_seconds // 3600)} ч)"
+    else:
+        when = "ранее, но разговор прервался"
+    return (
+        "Служебная заметка (НЕ пересказывай её дословно): в истории есть незакрытый вопрос, на который "
+        f"пользователь не ответил ({when}), а затем прислал ТЕКУЩЕЕ сообщение. Если текущее сообщение "
+        "ОТВЕЧАЕТ на тот вопрос — доведи начатое до конца. Если это НОВОЕ/несвязанное сообщение — ответь на "
+        "него по-человечески и МЯГКО, своими словами, напомни про незакрытый вопрос и спроси, актуален ли он "
+        "ещё; НЕ повторяй прошлый вопрос дословно, будто разговор не прерывался.")
+
+
+def _stale_pause_note(has_pause: bool, redirect_new: bool, tenant_id: str,
+                      is_confirm: bool, persist_enabled: bool, gap_seconds: float) -> str:
+    """#stale (ревью R1): ВСЕ гейты в ОДНОМ месте (тест бьёт реальный путь, спец-дрейф #74). Директиву
+    грациозного возврата даём ТОЛЬКО когда: протухшая пауза (has_pause И НЕ redirect) + канареечный тенант
+    + durable-persist (иначе history сброшена gen++, ссылаться не на что) + пауза-УТОЧНЕНИЕ (НЕ confirm:
+    просроченное destructive-подтверждение НЕ ре-предлагаем и НЕ «доводим» — оно fail-closed по TTL; для
+    confirm грациозный возврат = отдельное решение владельца). Иначе "" (обычный свежий ход)."""
+    if not (has_pause and not redirect_new and persist_enabled
+            and not is_confirm and _unified_execute_for(tenant_id)):
+        return ""
+    return _stale_pause_directive(gap_seconds)
+
+
 def _confirm_declined(is_confirm_pause: bool, resume_val: str, tenant_id: str) -> bool:
     """#321: ОТКАЗ на confirm-паузе на ЕДИНОМ (канареечном) пути? = confirm-пауза И resume НЕ «да» И
     `_unified_execute_for`. True → финальный ответ берём ДЕТЕРМИНИРОВАННО («Отменила, ничего не делаю.»),
@@ -2673,6 +2709,8 @@ def _build_graph(llm: Any, all_tools: list, *,
             # прохода + #279-семантика (способность есть; про текущий ход; нужного нет → уточни, не
             # отказывай). Только на unified_execute; None на легаси-пути (там хвост не меняется).
             _avail = _unified_availability_directive(bound) if state.get("unified_execute") else None
+            # #stale: директива грациозного возврата к протухшему вопросу (только unified, только когда стоит)
+            _stale = state.get("stale_pause_note") if state.get("unified_execute") else None
             # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
             # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
             # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
@@ -2685,7 +2723,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
                 if time_tail_line:
                     _msgs = _append_time_tail(_msgs, time_tail_line)
-                _tail = [d for d in (nudge, _avail, _sec) if d]
+                _tail = [d for d in (nudge, _avail, _sec, _stale) if d]
                 if _tail:
                     _directive = "\n\n".join(_tail)
                     # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
@@ -2754,6 +2792,10 @@ def _build_graph(llm: Any, all_tools: list, *,
             "messages": [resp],
             "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # анти-петля
             "guard_nudge": "",  # one-shot: очищаем после применения
+            # #stale (ревью R1 субагент MAJOR): consume-and-clear — иначе директива ПЕРЕЖИВАЕТ границу паузы
+            # (её _init-сброс только на СВЕЖЕМ ходе, resume _init не строит) → ре-инжектится на позднем
+            # resume = сам баг перескока, что чиним. Гасим после ПРИМЕНЕНИЯ (как guard_nudge).
+            "stale_pause_note": "",
             # #192: наблюдательная запись вызова (НЕ деньги — деньги в skill_ai_executions #175)
             "llm_calls": [{
                 "phase": "chat",
@@ -3887,6 +3929,7 @@ async def handle_turn(
             result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
             _redirect_close_msgs: list = []  # #316 R2: withdrawal-ToolMessage для повисших tool_call
+            _stale_note = ""  # #stale: директива грациозного возврата к протухшему вопросу (unified)
             if _has_pause(snap):  # протухшая пауза ИЛИ #316 redirect (новый запрос на едином пути) → гасим
                 # #193: ВКЛ durable → ключ стабилен, паузу гасим ЯВНО (clear_pending: drop
                 # interrupt-write idx<0), СОХРАНЯЯ историю диалога; НЕ сменой ключа (p-010).
@@ -3911,6 +3954,16 @@ async def handle_turn(
                 else:  # ВЫКЛ → прежнее: свежий ход на чистом поколении (эфемерно)
                     gen += 1
                     _THREAD_GEN[base] = gen
+                # #stale (канарейка, реальный баг «позвонить маме»): ПРОТУХШАЯ ask_human-пауза на едином пути
+                # → без директивы модель перескакивает на вчерашний вопрос В ЛОБ. Все гейты (redirect/unified/
+                # durable/не-confirm) — в _stale_pause_note. snap.created_at = время создания паузы → возраст.
+                # R3 (Codex high MAJOR): has_pause = bool(q) из _pending — FAIL-CLOSED на нечитаемой паузе
+                # (snap.next есть, а payload не читается → не трактуем как ask_human). Читается ТОЛЬКО на
+                # preflight (unified_execute — read-gate в chat — ставится под _preflight; вне него — dead work).
+                _stale_q, _stale_is_confirm, _ = _pending(snap)
+                _stale_note = _stale_pause_note(
+                    bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
+                    _persist_enabled(), _interrupt_age_seconds(snap.created_at))
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
             _tk_trace = turn_key
@@ -3959,7 +4012,10 @@ async def handle_turn(
                            # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
                            "turn_policy_json": None,
                            # #285 B2b: сброс флага единого пути (override ниже ставит True для канарейки).
-                           "unified_execute": False}
+                           "unified_execute": False,
+                           # #stale: директива грациозного возврата (непусто ТОЛЬКО при протухшей паузе на
+                           # едином пути); "" на обычном свежем ходе → сброс last-value (как guard_nudge).
+                           "stale_pause_note": _stale_note}
             # #213 Срез B: детерминированный READ-интент чек-листов → soft cross-check в tool-node.
             # ТОЛЬКО при preflight + оба флага (R1 medium: срез B — надстройка на preflight-контуре,
             # как домены #221; без _preflight конфиг «preflight выключен» внезапно получал бы
