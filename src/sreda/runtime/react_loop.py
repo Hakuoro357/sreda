@@ -1805,6 +1805,49 @@ def _domain_blocked_count(messages) -> int:
     return cnt
 
 
+def _is_new_request_on_pause(text: str) -> bool:
+    """#316 (канарейка 2026-07-07): на ask_human-паузе входящий текст — это НОВЫЙ запрос (а не ответ на
+    вопрос)? Да, если несёт явную write-команду («добавь X») ИЛИ явный read-ЗАПРОС own-data («покажи
+    покупки», «какие у меня дела»). Иначе — ОТВЕТ (консервативно: неоднозначное = ответ, чтобы не бросить
+    паузу зря). R2 (оба Codex + субагент, MAJOR): голый read-кюс НЕ годится — слот-ответ «в покупки»/
+    «покупки»/«в список покупок» на «в какой список?» несёт кюс, но это ОТВЕТ; требуем маркер-запроса
+    (new_read_request_signal = кюс И «покажи/какие»). write_command_signal (императив) FP не даёт. Фраза, как B1."""
+    from sreda.runtime.react_signals import new_read_request_signal, write_command_signal
+    return bool(write_command_signal(text)) or new_read_request_signal(text)
+
+
+def _should_redirect_on_pause(user_text: str, is_confirm_pause: bool) -> bool:
+    """#316 R5 (субагент R4 MINOR — спец-дрейф #74): ЕДИНАЯ функция решения «новый запрос на живой паузе
+    → свежий ход». Извлечена из handle_turn, чтобы юнит-тест бил РЕАЛЬНЫЙ путь (а не реимплементацию —
+    иначе дроп конъюнкта не поймался бы тестом). confirm-пауза: положительный сигнал И НЕ голое эхо-
+    подтверждение «удали»/«ок удали» (иначе → A0 «нет», #267 fail-closed удаления); classify-конъюнкт
+    оставлен защитно (при is_new он всегда "redirect"). ask_human: просто сигнал нового запроса — у
+    открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
+    from sreda.runtime.react_signals import bare_command_echo
+    is_new = _is_new_request_on_pause(user_text)
+    if is_confirm_pause:
+        return (is_new and not bare_command_echo(user_text)
+                and classify_confirm_reply(user_text) == "redirect")
+    return is_new
+
+
+def _withdrawal_messages(last_msg) -> list:
+    """#316 R2/R3: withdrawal-ToolMessage на КАЖДЫЙ повисший tool_call последнего AIMessage.
+
+    Сброс живой паузы на redirect снимает interrupt-write, но закоммиченный AIMessage(tool_calls)
+    остаётся БЕЗ пары ToolMessage (узел прервался до коммита результата) → провайдер отвергает «сироту».
+    Дописав по одному withdrawal на вызов, закрываем пару → история валидна. `artifact.result_kind=
+    "withdrawn"` (Codex high/medium R2 MAJOR): без него дефолт «ok» → отменённый delete_task считался бы
+    ИСПОЛНЕННЫМ в shadow-метрике (ok/observed). Не-AIMessage / без tool_calls → пусто (сироты нет)."""
+    if not (isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None)):
+        return []
+    return [ToolMessage(
+        content="(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным)",
+        name=tc.get("name") or "tool", tool_call_id=tc.get("id") or "",
+        artifact={"result_kind": "withdrawn"})
+        for tc in last_msg.tool_calls if tc.get("id")]
+
+
 def _summary_enabled_for(tenant_id: str) -> bool:
     """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
     Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
@@ -3785,7 +3828,28 @@ async def handle_turn(
                 return _Reply("")
 
         _confirm_resolution: str | None = None  # #285 Фаза A: исход confirm-паузы для трейса
-        if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
+        # #316 (канарейка 2026-07-07): на ЕДИНОМ пути НОВЫЙ запрос во время живой паузы обрабатывается
+        # СВЕЖИМ ходом, а не съедается паузой (прежде: confirm→«нет»+дроп нового запроса; ask_human→текст
+        # как ответ; «авто-переключение раздела» было отложено — это оно). redirect детектим ДО инвока:
+        # confirm-пауза — classify_confirm_reply=="redirect"; ask_human — B1-сигнал нового запроса. На
+        # redirect паузу гасим (else-ветка: clear_pending) + обрабатываем свежим ходом. Легаси не трогаем.
+        # #316 R3/R4/R5: решение «новый запрос на живой паузе → свежий ход» ВЫНЕСЕНО в
+        # _should_redirect_on_pause (ЕДИНЫЙ путь для прода и теста, субагент R4 спец-дрейф #74).
+        # confirm: положительный сигнал И НЕ голое эхо-подтверждение «удали»/«ок удали»/«удали пожалуйста»
+        # (иначе → A0 «нет», #267 fail-closed удаления; «ок»/«конечно» тоже не сигнал → resume). ask_human:
+        # просто сигнал нового запроса. classify_confirm_reply → "redirect" на всём не-«да»/«нет» (#267 A0)
+        # → без гейта бросало бы живой confirm. «удали задачу B» (объект) → редирект (свежий ход по B).
+        _redirect_new = False
+        if live_pause and not resume_only and _unified_execute_for(tenant_id):
+            _, _is_cp_r, _ = _pending(snap)
+            _redirect_new = _should_redirect_on_pause(user_text, _is_cp_r)
+        # #316 R2 (MINOR): «реально возобновили» ≠ live_pause (redirect тоже был live_pause, но ход СВЕЖИЙ).
+        # Трейс resumed/confirm_state берёт _did_resume, иначе redirect-ход врёт «resumed/confirmed».
+        # #316 R3 (Codex high R2 MAJOR): _confirm_resolution="redirect" на СВЕЖИЙ ход УБРАН — он писался в
+        # НОВЫЙ turn_key, а не в старый confirm-ряд; старый ряд остаётся awaiting_confirm (телеметрия,
+        # пре-существует у протухших пауз → отдельный follow-up на терминализацию, вне #316).
+        _did_resume = live_pause and not _redirect_new
+        if _did_resume:  # живое уточнение → возобновляем (turn_key уже в state)
             # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
             # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
             # уже шлёт канон (confirm_resume_text). ask_human (не confirm) — текст-ответ как есть.
@@ -3805,15 +3869,28 @@ async def handle_turn(
                 _confirm_resolution = "yes" if _is_yes(str(_resume_val)) else "no"
             result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
-            if _has_pause(snap):  # протухшая пауза → гасим
+            _redirect_close_msgs: list = []  # #316 R2: withdrawal-ToolMessage для повисших tool_call
+            if _has_pause(snap):  # протухшая пауза ИЛИ #316 redirect (новый запрос на едином пути) → гасим
                 # #193: ВКЛ durable → ключ стабилен, паузу гасим ЯВНО (clear_pending: drop
                 # interrupt-write idx<0), СОХРАНЯЯ историю диалога; НЕ сменой ключа (p-010).
                 # Свежий ainvoke ниже продолжит беседу с историей, без залипшей паузы.
                 if _persist_enabled():
                     try:
                         _get_checkpointer().clear_pending(_durable_thread_id(base))
+                        # #316 R2/R3 (субагент MAJOR): очистка ЖИВОЙ паузы на redirect снимает interrupt-write,
+                        # но AIMessage(tool_calls) уже закоммичен в durable-историю без пары ToolMessage
+                        # (узел прервался до коммита результата) → свежий ainvoke послал бы «сироту» → Mercury
+                        # отвергает непарный вызов (run_tools везде держит инвариант; build_model_input сироту
+                        # НЕ чинит). Закрываем пару withdrawal-ToolMessage. R3 (субагент R2 MINOR): блок ВНУТРИ
+                        # try, ПОСЛЕ успешного clear_pending — при сбое гашения withdrawals НЕ шлём (иначе
+                        # fresh-invoke на всё ещё прерванном треде + заглушки). ТОЛЬКО redirect единого пути:
+                        # у легаси протухшая пауза байт-идентична (её fresh-invoke НЕ трогаем).
+                        if _redirect_new:
+                            _pmsgs = _pre_vals.get("messages") or []
+                            _redirect_close_msgs = _withdrawal_messages(_pmsgs[-1] if _pmsgs else None)
                     except Exception:  # noqa: BLE001 — гашение не валит ход
                         logger.warning("react_loop: clear_pending failed", exc_info=True)
+                        _redirect_close_msgs = []  # сбой гашения → без withdrawals (пре-существующее поведение)
                 else:  # ВЫКЛ → прежнее: свежий ход на чистом поколении (эфемерно)
                     gen += 1
                     _THREAD_GEN[base] = gen
@@ -3840,7 +3917,10 @@ async def handle_turn(
             # #197: определить intent для СВЕЖЕГО хода (resume читает intent из чекпойнта, не классифицирует).
             # Слой 0 `_must_task` (явная productivity-команда → task без LLM) → иначе Слой 1 classify (Фредди,
             # fail-open task). prev_intent + история — из снапа прошлого хода. fail-open в task — ТОЛЬКО здесь.
-            _init: dict = {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
+            # #316 R2: withdrawal-ToolMessage (если redirect закрыл повисшую паузу) ИДУТ ПЕРЕД новым
+            # HumanMessage → add_messages аппендит их к [..., AIMessage(tool_calls)] → пара закрыта,
+            # затем новый запрос. Пусто (не redirect / нет сироты) → как раньше [HumanMessage].
+            _init: dict = {"messages": [*_redirect_close_msgs, HumanMessage(user_text)], "turn_key": turn_key,
                            "active_families": base_fams, "guard_attempted_families": [],
                            # R1 high (соседний баг того же класса): guard_full_attempted — last-value канал
                            # «один раз за ХОД». Без сброса ход2 того же треда унаследует True → не получит
@@ -4058,7 +4138,7 @@ async def handle_turn(
                     try:
                         _pd285 = json.loads(_tpj)
                         _pd285["turn_events"] = {
-                            "resumed": bool(live_pause),
+                            "resumed": bool(_did_resume),  # #316 R2: redirect ≠ resume
                             "guard_attempted": len(result.get("guard_attempted_families") or []),
                             "guard_full": bool(result.get("guard_full_attempted")),
                             "passes": int(_passes_fin or 0),
@@ -4069,7 +4149,7 @@ async def handle_turn(
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
-                    confirm_state=("confirmed" if live_pause else "none"),  # best-effort
+                    confirm_state=("confirmed" if _did_resume else "none"),  # #316 R2: redirect≠confirmed
                     outcome=_outcome,
                     passes=_passes_fin,
                     routing_decision_json=_rdj,
