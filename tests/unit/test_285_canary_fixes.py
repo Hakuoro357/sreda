@@ -205,6 +205,65 @@ def test_confirm_declined(install):
     assert not f(True, "нет", "other")  # НЕ канареечный тенант → легаси не трогаем
 
 
+def test_stale_pause_directive():
+    """#stale: директива грациозного возврата к протухшему вопросу — фрейм + грубая давность."""
+    f = react_loop._stale_pause_directive
+    d_day = f(30 * 3600)   # сутки+
+    assert "со вчера" in d_day
+    assert "часов назад" in f(5 * 3600)
+    for d in (d_day, f(5 * 3600), f(600)):
+        assert "не пересказывай" in d.lower()        # служебную заметку не эхоить
+        assert "мягко" in d.lower()                  # мягко напомнить
+        assert "не повторяй" in d.lower()            # не в лоб
+        assert "доведи начатое" in d.lower()         # если это ОТВЕТ — закрыть дело
+        assert "актуален" in d.lower()               # спросить, актуально ли
+
+
+def test_stale_pause_note_gates(install):
+    """#stale (ревью R1): реальная функция гейтов (тест бьёт код, спец-дрейф #74). Директиву грациозного
+    возврата ТОЛЬКО на протухшей ask_human-паузе + unified + durable + не-redirect; иначе ""."""
+    install()  # unified flag ON, unified_tenants="t"
+    f = react_loop._stale_pause_note
+    G = 30 * 3600  # >суток
+    assert "мягко" in f(True, False, "t", False, True, G).lower()  # ask_human/unified/durable/не-redirect → директива
+    assert f(True, False, "t", True, True, G) == ""    # confirm-пауза → "" (просроченное подтверждение не ре-предлагаем)
+    assert f(True, True, "t", False, True, G) == ""    # redirect (#316) → ""
+    assert f(False, False, "t", False, True, G) == ""  # нет паузы → ""
+    assert f(True, False, "other", False, True, G) == ""  # не канареечный тенант → "" (легаси не трогаем)
+    assert f(True, False, "t", False, False, G) == ""  # эфемерный (persist off) → "" (history сброшена)
+
+
+def test_stale_directive_delivered_and_no_leak(install, monkeypatch):
+    """#stale R3 (Codex high + субагент R2 MAJOR, mutation-proven): (a) директива ДОХОДИТ до модели на
+    stale-clear ходе; (b) LEAK-регрессия — пауза, созданная на ЭТОМ ходе, НЕ ре-инжектит директиву на
+    последующем resume (consume-and-clear в chat-узле). Форсим директиву (гейты — test_stale_pause_note_gates)
+    + делаем паузу протухшей через monkeypatch возраста. Ловит мутацию «убрать stale_pause_note:'' из chat»."""
+    monkeypatch.setattr(react_loop, "_stale_pause_note", lambda *a, **k: "СТАЛ-ДИРЕКТИВА-XYZ")
+    msgs = []
+    # пауза стейджится candidate-confirm (unsignaled write → interrupt), как test_unsignaled_write;
+    # confirm-гейт директивы обойдён monkeypatch'ем (гейт проверяет test_stale_pause_note_gates).
+    freddie = _Chat("freddie", msgs_capture=msgs, responses=[
+        _ai_call("add_task", "c1", title="позвонить маме"),  # ход1 → candidate-confirm → пауза P1
+        _ai_call("add_task", "c2", title="ещё"),             # ход2 stale-clear → candidate-confirm → P2
+        AIMessage(content="ок, записала"),                   # ход3 resume «да» → финал
+    ])
+    install(deepseek=_Chat("ds"))
+    r1 = _turn(freddie, thread="stl", text="расскажи как дела")
+    assert getattr(r1, "awaiting_confirm", False) is True, r1  # ход1 → живая пауза P1
+    # P1 «протухла» → ход2 идёт else-веткой (stale-clear)
+    monkeypatch.setattr(react_loop, "_interrupt_age_seconds", lambda *a, **k: 30 * 3600)
+    msgs.clear()
+    _turn(freddie, thread="stl", text="Привет")  # stale-clear: директива в модель + создаёт P2
+    assert any("СТАЛ-ДИРЕКТИВА-XYZ" in _flat(cap) for cap in msgs), "директива должна дойти на stale-clear ходе"
+    # ход3: resume P2 (в пределах TTL)
+    monkeypatch.setattr(react_loop, "_interrupt_age_seconds", lambda *a, **k: 1.0)
+    msgs.clear()
+    _turn(freddie, thread="stl", text="да")  # resume P2
+    assert msgs, "chat должен вызваться на resume (иначе негативная проверка вакуумна)"  # R3 hardening (Codex medium)
+    assert not any("СТАЛ-ДИРЕКТИВА-XYZ" in _flat(cap) for cap in msgs), \
+        "LEAK: директива НЕ должна вернуться на resume следующей паузы (consume-and-clear)"
+
+
 def test_domain_blocked_count_basic():
     assert react_loop._domain_blocked_count([]) == 0
     assert react_loop._domain_blocked_count(None) == 0
