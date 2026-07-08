@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from sreda.runtime.react_signals import read_cue_domains
+from sreda.runtime.react_signals import new_read_request_signal, read_cue_domains
 
 
 # ─────────── обзорные «дела» → checklists ───────────
@@ -53,3 +53,34 @@ def test_other_negatives_stay_clean():
     # «как жизнь» / «что нового» — смолток, не own-data
     for t in ("как жизнь", "что нового", "как настроение"):
         assert read_cue_domains(t) == frozenset(), (t, read_cue_domains(t))
+
+
+# ─────────── #316: new_read_request_signal = маркер-запроса И домен (не голый кюс) ───────────
+def test_new_read_request_signal_true_on_requests():
+    # явный read-запрос own-data: маркер («покажи/какие/сколько/что в») + доменный кюс
+    for t in ("покажи покупки", "какие у меня дела", "покажи мои напоминания",
+              "сколько у меня задач", "что в списке покупок", "покажи список покупок",
+              "какие списки", "перечисли мои дела"):
+        assert new_read_request_signal(t), t
+
+
+def test_new_read_request_signal_false_on_slot_answers():
+    # доменный кюс ЕСТЬ (покупк), но маркера-запроса НЕТ → это ОТВЕТ на «в какой список?», не запрос
+    for t in ("в покупки", "покупки", "в список покупок", "список покупок", "покупки пожалуйста"):
+        assert read_cue_domains(t), f"премиса: у {t!r} должен быть доменный кюс"  # sanity
+        assert not new_read_request_signal(t), f"слот-ответ {t!r} НЕ read-запрос"
+
+
+def test_new_read_request_signal_false_without_domain():
+    # маркер-похожее слово, но домена own-data нет → False (WH-«какой-то» / общий вопрос)
+    for t in ("какой-то важный созвон", "покажи мне дорогу", "что там на улице", "сколько-то раз"):
+        assert not new_read_request_signal(t), t
+
+
+def test_new_read_request_signal_false_on_naming_slot_answers():
+    # R2 (Codex high MAJOR): ответы-ИМЕНА на «как назвать задачу/список?» несут домен, но «назови/дай/
+    # скажи» больше НЕ маркеры → False (иначе тот же класс ложняка, что чинил R1). Домен ЕСТЬ (sanity).
+    for t in ("назови задачу купить хлеб", "назови его покупки", "дай ему покупки",
+              "скажи про покупки", "назови список покупок"):
+        assert read_cue_domains(t), f"премиса: у {t!r} есть доменный кюс"
+        assert not new_read_request_signal(t), f"ответ-имя {t!r} НЕ read-запрос (маркер убран)"
