@@ -12,10 +12,9 @@
 from __future__ import annotations
 
 import asyncio
-import types
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import StructuredTool
 
@@ -192,6 +191,18 @@ def test_withdrawal_messages():
     assert {m.tool_call_id for m in out} == {"c1", "c2"}
     assert all((m.artifact or {}).get("result_kind") == "withdrawn" for m in out)
     assert all("не считать выполненным" in str(m.content) for m in out)
+
+
+def test_confirm_declined(install):
+    """#321: гейт «детерминированный честный отказ» — confirm-пауза И resume НЕ «да» И канареечный
+    тенант. Реальная функция, что зовёт handle_turn (тест бьёт код, не реимплементацию — спец-дрейф #74).
+    Гейт _unified_execute_for → легаси НЕ трогаем (kill-switch)."""
+    install()  # флаг ON, unified_tenants="t"
+    f = react_loop._confirm_declined
+    assert f(True, "нет", "t")          # канарейка + confirm-отказ (текст «нет»/«удали»/«ок» → канон «нет»; кнопка «Нет»)
+    assert not f(True, "да", "t")       # confirm-подтверждение → success-путь НЕ трогаем
+    assert not f(False, "нет", "t")     # ask_human (не confirm) → как есть
+    assert not f(True, "нет", "other")  # НЕ канареечный тенант → легаси не трогаем
 
 
 def test_domain_blocked_count_basic():

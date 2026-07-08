@@ -1848,6 +1848,18 @@ def _withdrawal_messages(last_msg) -> list:
         for tc in last_msg.tool_calls if tc.get("id")]
 
 
+def _confirm_declined(is_confirm_pause: bool, resume_val: str, tenant_id: str) -> bool:
+    """#321: ОТКАЗ на confirm-паузе на ЕДИНОМ (канареечном) пути? = confirm-пауза И resume НЕ «да» И
+    `_unified_execute_for`. True → финальный ответ берём ДЕТЕРМИНИРОВАННО («Отменила, ничего не делаю.»),
+    не даём слабой модели пере-сочинить отказ в ложное «удалено» (канарейка #316 e2e поймала).
+
+    Гейт _unified_execute_for (как #316/#317/#318): kill-switch есть, ЛЕГАСИ НЕ трогаем — там ответ
+    остаётся модель-сочинённым (байт-идентично; отдельное решение владельца, если расширять). Извлечено
+    (ревью R1) → тест бьёт РЕАЛЬНУЮ функцию гейта, а не реимплементацию (спец-дрейф #74)."""
+    return (bool(is_confirm_pause) and not _is_yes(str(resume_val))
+            and _unified_execute_for(tenant_id))
+
+
 def _summary_enabled_for(tenant_id: str) -> bool:
     """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
     Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
@@ -3849,6 +3861,7 @@ async def handle_turn(
         # НОВЫЙ turn_key, а не в старый confirm-ряд; старый ряд остаётся awaiting_confirm (телеметрия,
         # пре-существует у протухших пауз → отдельный follow-up на терминализацию, вне #316).
         _did_resume = live_pause and not _redirect_new
+        _declined_confirm = False  # #321: confirm-ОТМЕНА (resume «нет») → детерминированный ответ ниже
         if _did_resume:  # живое уточнение → возобновляем (turn_key уже в state)
             # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
             # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
@@ -3867,6 +3880,10 @@ async def handle_turn(
                 _confirm_resolution = {"affirm": "yes", "negate": "no"}.get(_cls, "redirect")
             elif _is_confirm_pause:
                 _confirm_resolution = "yes" if _is_yes(str(_resume_val)) else "no"
+            # #321 (канарейка #316 e2e): confirm-ОТМЕНА на едином пути (resume «нет»: текст «нет»/«удали»/
+            # «ок» ИЛИ кнопка «Нет») → ответ ДЕТЕРМИНИРОВАННЫЙ (ниже), не даём слабой модели пере-сочинить
+            # отказ в ложное «удалено». Гейт _unified_execute_for (kill-switch; легаси не трогаем).
+            _declined_confirm = _confirm_declined(_is_confirm_pause, _resume_val, tenant_id)
             result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
             _redirect_close_msgs: list = []  # #316 R2: withdrawal-ToolMessage для повисших tool_call
@@ -4099,6 +4116,13 @@ async def handle_turn(
             return reply
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
+        # #321 (канарейка #316 e2e): на confirm-ОТМЕНЕ (единый путь) ответ ДЕТЕРМИНИРОВАННЫЙ, а НЕ
+        # пере-сочинённый chat-узлом — слабая модель галлюцинирует ложное «удалено» на отказе (юзер сказал
+        # «удали» → модель дописывает «удалена», хотя инструмент отменён; honesty-хвост это не удержал).
+        # Фиксированный текст (ревью R1: без extraction последнего ToolMessage — тот ломался, если модель
+        # после отказа звала ещё тул). Success-путь («да») НЕ трогаем (_declined_confirm=False).
+        if _declined_confirm:
+            text = "Отменила, ничего не делаю."
         reply = _Reply(_postformat(text) or "Готово.")
         # #192: финал → done + структура. ВЕСЬ блок под флагом И guarded (R1 CRITICAL Codex high):
         # collect_tool_calls/HMAC/json НЕ должны выполняться при OFF (спящий прод) и НЕ должны ронять
