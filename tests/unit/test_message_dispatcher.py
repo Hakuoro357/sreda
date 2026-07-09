@@ -87,21 +87,23 @@ def _enqueue_telegram(session: Session, update_id: str) -> MessageJob:
 
 @pytest.fixture
 def _patch_session_factory(db_session, monkeypatch):
-    """Make ``get_session_factory`` return the test session's bound factory.
+    """Redirect the #138 Ф2 seam to the test session's bound factory.
 
-    The dispatcher opens its own sessions; redirect them to the test's
-    bound connection so claims/marks are visible in the same DB.
+    The dispatcher now opens sessions via ``tenant_session`` /
+    ``privileged_session`` (#138 — queue-mgmt cross-tenant → privileged,
+    per-tenant dispatch → tenant_session), which both build sessions
+    through ``sreda.db.session._factory_for``. Patch that single seam so
+    claims/marks land in the test's bound connection while the ContextVar
+    isolation wiring still runs. (Role/engine split is exercised by the Ф3
+    integration red-suite, not these behaviour tests.)
     """
     from sqlalchemy.orm import sessionmaker
 
     bind = db_session.get_bind()
     test_factory = sessionmaker(bind=bind)
 
-    def fake_factory():
-        return test_factory
-
     monkeypatch.setattr(
-        "sreda.workers.message_dispatcher.get_session_factory", fake_factory
+        "sreda.db.session._factory_for", lambda _engine: test_factory
     )
     yield
 

@@ -26,7 +26,6 @@ from sreda.db.models.core import (
 from sreda.db.models.fetch_url_usage import FetchUrlUsage
 from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
 from sreda.db.models.react_summary import ReactSummary
-from sreda.db.models.react_debug import ReactDebugTurn
 from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.housewife import FamilyMember, FamilyReminder
 from sreda.db.models.housewife_food import (
@@ -84,7 +83,6 @@ __all__ = [
     "ReactCheckpoint",
     "ReactCheckpointWrite",
     "ReactSummary",
-    "ReactDebugTurn",
     "ReactTurnTrace",
     "PaymentOrder",
     "PaymentOrderItem",

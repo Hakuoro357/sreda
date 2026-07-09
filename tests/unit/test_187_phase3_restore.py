@@ -261,7 +261,7 @@ def test_compute_next_occurrence_after_matches_legacy_callsites(
 
 
 def test_restore_drains_deletion_window_no_resurrection(
-    db_session: Session,
+    worker_db: Session,
 ) -> None:
     """A2: after soft_delete → restore, everything armed INSIDE the deletion
     window ``[deleted_at, restored_at]`` is neutralised:
@@ -273,42 +273,50 @@ def test_restore_drains_deletion_window_no_resurrection(
     Artefacts are placed AFTER soft_delete with ``deleted_at`` pinned to a
     controlled past anchor, so their trigger / created_at fall strictly inside
     the window (not before it).
+
+    #138 Ф2: воркер САМ открывает seam-сессии (privileged-скан +
+    tenant_session), поэтому этот тест на фикстуре ``worker_db`` (коммитящая
+    файловая SQLite + шов ``_factory_for`` привязан к ней) вместо ``db_session``
+    (транзакционный rollback, воркерский шов к нему НЕ привязан). Сессия теста и
+    сессии воркера — РАЗНЫЕ; сид/restore коммитятся (``soft_delete_tenant`` /
+    ``restore_tenant`` коммитят сами) → видны воркеру. ``expire_all()`` перед
+    ассертом на outbox после прогона воркера — тот пишет своим соединением.
     """
     tid = "tenant_restore"
-    _seed_tenant(db_session, tenant_id=tid, chat_id="700", user_id="u_r")
-    db_session.commit()
+    _seed_tenant(worker_db, tenant_id=tid, chat_id="700", user_id="u_r")
+    worker_db.commit()
 
     # delete, then widen the window: deleted_at := now-2h, restored_at ≈ now.
-    assert soft_delete_tenant(db_session, tid) is True
+    assert soft_delete_tenant(worker_db, tid) is True
     deleted_at = _now() - timedelta(hours=2)
-    _force_deleted_at(db_session, tid, deleted_at)
+    _force_deleted_at(worker_db, tid, deleted_at)
 
     # in-window trigger time (between deleted_at and now)
     in_window = _now() - timedelta(hours=1)
 
     one_shot = _add_reminder(
-        db_session, tenant_id=tid, user_id="u_r",
+        worker_db, tenant_id=tid, user_id="u_r",
         recurrence_rule=None, trigger_at=in_window, next_trigger_at=in_window,
     )
     recurring = _add_reminder(
-        db_session, tenant_id=tid, user_id="u_r",
+        worker_db, tenant_id=tid, user_id="u_r",
         recurrence_rule="FREQ=DAILY;BYHOUR=9", trigger_at=in_window,
         next_trigger_at=in_window,
     )
     inb = _add_inbound_event(
-        db_session, tenant_id=tid, status="classified",
+        worker_db, tenant_id=tid, status="classified",
         created_at=in_window, classified_at=in_window,
     )
-    db_session.commit()
+    worker_db.commit()
 
-    assert restore_tenant(db_session, tid) is True
+    assert restore_tenant(worker_db, tid) is True
 
-    db_session.refresh(one_shot)
-    db_session.refresh(recurring)
-    db_session.refresh(inb)
+    worker_db.refresh(one_shot)
+    worker_db.refresh(recurring)
+    worker_db.refresh(inb)
 
     # tenant active again
-    assert is_tenant_active(db_session, tid) is True
+    assert is_tenant_active(worker_db, tid) is True
 
     # one-shot → terminal, NOT pending, will not fire
     assert one_shot.status == "cancelled"
@@ -326,11 +334,13 @@ def test_restore_drains_deletion_window_no_resurrection(
     # worker after restore: nothing stale delivered
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
-    worker = HousewifeReminderWorker(db_session)
+    worker = HousewifeReminderWorker()
     fired = asyncio.run(worker.process_pending(now=_now()))
+    # Воркер писал бы outbox своим соединением → перечитываем сессией теста.
+    worker_db.expire_all()
     assert fired == 0
     out_count = (
-        db_session.query(OutboxMessage)
+        worker_db.query(OutboxMessage)
         .filter(OutboxMessage.tenant_id == tid)
         .count()
     )

@@ -26,8 +26,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy.orm import Session
-
+from sreda.db.session import privileged_session
 from sreda.maintenance.retention_cleanup import (
     RetentionCleanupResult,
     cleanup_runtime_retention,
@@ -58,12 +57,12 @@ class RetentionWorker:
 
     def __init__(
         self,
-        session: Session,
         *,
         state_file: str | None = None,
         interval: timedelta = DEFAULT_INTERVAL,
     ) -> None:
-        self.session = session
+        # #138 Ф2: воркер сам открывает privileged_session("retention") —
+        # общую job_runner-сессию больше не принимает.
         self.state_file = Path(state_file or DEFAULT_STATE_FILE)
         self.interval = interval
 
@@ -76,22 +75,17 @@ class RetentionWorker:
         if not self._should_run(now):
             return 0
         try:
-            result = cleanup_runtime_retention(self.session, now=now)
-            # #127 CRITICAL (Codex R1 оба): cleanup делает только flush(),
-            # а job_runner закрывает сессию БЕЗ commit — удаления тихо
-            # откатывались, state говорил «успех», ретеншн молчал сутки.
-            # Коммитим ЗДЕСЬ, до записи успешного state; провал коммита —
-            # это провал прогона (rollback + запись провала ниже).
-            self.session.commit()
+            # #138 Ф2: глобальная time-based чистка ~20 операционных таблиц по
+            # ВСЕМ тенантам (tenant_id не фигурирует) → privileged("retention").
+            with privileged_session("retention") as session:
+                result = cleanup_runtime_retention(session, now=now)
+                # #127 CRITICAL: cleanup делает только flush() — коммитим ЗДЕСЬ,
+                # до записи успешного state; провал коммита = провал прогона.
+                session.commit()
         except Exception:  # noqa: BLE001 — никогда не убиваем job_runner
+            # privileged_session на выходе сам закрывает/откатывает свою сессию
+            # (своя, не общая → чужие воркеры тика не задеты, старый rollback не нужен).
             logger.exception("retention cleanup failed")
-            # 2026-04-28: rollback чтобы транзакция не висела в bad state
-            # — иначе следующие workers внутри того же job_runner tick'а
-            # начнут падать с InvalidRequestError на чтении.
-            try:
-                self.session.rollback()
-            except Exception:  # noqa: BLE001
-                pass
             self._record_failure(now)
             return 0
         self._record_run(now, result)
@@ -206,7 +200,6 @@ class RetentionWorker:
             "skill_events_high": result.skill_events_warn_error,
             "skill_attempts": result.skill_run_attempts,
             "skill_runs": result.skill_runs,
-            "react_debug": result.react_debug_turns,  # #185
             "react_turn_trace": result.react_turn_trace,  # #192
         }
         logger.info(

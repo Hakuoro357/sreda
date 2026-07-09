@@ -110,6 +110,19 @@ def test_schedule_defaults_to_legacy_bot_key(session):
 # 2. Reminder worker emits outbox row with reminder.bot_key
 # ---------------------------------------------------------------------------
 
+def _seed_worker_base(session) -> None:
+    """#138 Ф2: базовый tenant/workspace/user для воркер-тестов на ``worker_db``.
+
+    Раньше эти строки давала фикстура ``session``; воркер теперь открывает свои
+    seam-сессии (privileged/tenant), поэтому сид кладём в общую ``worker_db`` БД
+    и коммитим ДО прогона воркера (воркер читает своим соединением).
+    """
+    session.add(Tenant(id="t1", name="T"))
+    session.add(Workspace(id="w1", tenant_id="t1", name="W"))
+    session.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
+    session.commit()
+
+
 def _make_reminder(session, *, bot_key: str | None) -> FamilyReminder:
     """Insert a due FamilyReminder directly (bypass service to test worker)."""
     from datetime import timedelta
@@ -126,20 +139,23 @@ def _make_reminder(session, *, bot_key: str | None) -> FamilyReminder:
         bot_key=bot_key,
     )
     session.add(rem)
-    session.commit()
+    session.commit()  # #138: воркер читает своим соединением → сид коммитим
     return rem
 
 
 @pytest.mark.asyncio
-async def test_reminder_worker_sets_bot_key_from_reminder(session):
+async def test_reminder_worker_sets_bot_key_from_reminder(worker_db):
     """HousewifeReminderWorker copies reminder.bot_key to outbox row."""
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
-    _make_reminder(session, bot_key="sreda_home")
-    worker = HousewifeReminderWorker(session)
-    await worker.process_pending()
+    _seed_worker_base(worker_db)
+    _make_reminder(worker_db, bot_key="sreda_home")
+    await HousewifeReminderWorker().process_pending()
 
-    outbox_rows = session.query(OutboxMessage).all()
+    # Outbox — НОВАЯ строка (создана сессией воркера, закоммичена); перечитываем
+    # через worker_db после воркера (expire_all для консистентности identity map).
+    worker_db.expire_all()
+    outbox_rows = worker_db.query(OutboxMessage).all()
     assert outbox_rows, "No outbox rows were created"
     assert all(r.bot_key == "sreda_home" for r in outbox_rows), (
         f"Expected all outbox rows to have bot_key='sreda_home', "
@@ -148,15 +164,16 @@ async def test_reminder_worker_sets_bot_key_from_reminder(session):
 
 
 @pytest.mark.asyncio
-async def test_reminder_worker_legacy_reminder_uses_legacy_bot_key(session):
+async def test_reminder_worker_legacy_reminder_uses_legacy_bot_key(worker_db):
     """A legacy reminder (bot_key='sreda') routes via 'sreda'."""
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
-    _make_reminder(session, bot_key="sreda")
-    worker = HousewifeReminderWorker(session)
-    await worker.process_pending()
+    _seed_worker_base(worker_db)
+    _make_reminder(worker_db, bot_key="sreda")
+    await HousewifeReminderWorker().process_pending()
 
-    outbox_rows = session.query(OutboxMessage).all()
+    worker_db.expire_all()
+    outbox_rows = worker_db.query(OutboxMessage).all()
     assert outbox_rows, "No outbox rows were created"
     assert all(r.bot_key == LEGACY_NULL_BOT_KEY for r in outbox_rows), (
         f"Expected bot_key={LEGACY_NULL_BOT_KEY!r}, got: {[r.bot_key for r in outbox_rows]}"
@@ -164,7 +181,7 @@ async def test_reminder_worker_legacy_reminder_uses_legacy_bot_key(session):
 
 
 @pytest.mark.asyncio
-async def test_reminder_worker_legacy_bot_key_reminder_routes_to_legacy(session):
+async def test_reminder_worker_legacy_bot_key_reminder_routes_to_legacy(worker_db):
     """A reminder with bot_key=LEGACY_NULL_BOT_KEY routes via the legacy bot.
 
     After migration 20260603_0053, family_reminders.bot_key is NOT NULL so
@@ -174,12 +191,13 @@ async def test_reminder_worker_legacy_bot_key_reminder_routes_to_legacy(session)
     """
     from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
 
-    _make_reminder(session, bot_key=LEGACY_NULL_BOT_KEY)
+    _seed_worker_base(worker_db)
+    _make_reminder(worker_db, bot_key=LEGACY_NULL_BOT_KEY)
 
-    worker = HousewifeReminderWorker(session)
-    await worker.process_pending()
+    await HousewifeReminderWorker().process_pending()
 
-    outbox_rows = session.query(OutboxMessage).all()
+    worker_db.expire_all()
+    outbox_rows = worker_db.query(OutboxMessage).all()
     assert outbox_rows, "No outbox rows were created"
     assert all(r.bot_key == LEGACY_NULL_BOT_KEY for r in outbox_rows), (
         f"Expected bot_key={LEGACY_NULL_BOT_KEY!r} for legacy reminder, "

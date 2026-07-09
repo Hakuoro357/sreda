@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage, User, Workspace
 from sreda.db.models.housewife import FamilyReminder
+from sreda.db.session import privileged_session, tenant_session
 from sreda.services.housewife_reminders import (
     LATE_FIRE_GRACE_MINUTES,
     HousewifeReminderService,
@@ -37,9 +38,10 @@ HOUSEWIFE_FEATURE_KEY = "housewife_assistant"
 class HousewifeReminderWorker:
     """Fires due ``FamilyReminder`` rows as outbox messages."""
 
-    def __init__(self, session: Session, *, registry=None) -> None:
-        self.session = session
-        self.service = HousewifeReminderService(session)
+    def __init__(self, *, registry=None) -> None:
+        # #138 Ф2: воркер больше НЕ принимает общую сессию — сам ведёт свои
+        # скоупы (privileged-скан + tenant_session на семью). job_runner его
+        # больше не снабжает сессией.
         # #109: TelegramBotRegistry so resolve_outbox_routings can route a
         # reminder to the user's CURRENT bot (user.last_bot_key). Optional —
         # when None, resolve_outbox_routings leaves bot_key None and we fall
@@ -53,66 +55,80 @@ class HousewifeReminderWorker:
         """Find reminders whose next_trigger_at is in the past, enqueue
         outbox messages, advance reminder state. Returns count fired.
 
-        Called once per ``job_runner`` tick. Uses a single transaction:
-        either all due-at-this-tick reminders fire or none do — simpler
-        to reason about than per-row commits. ``now`` override exists
-        for tests; production path leaves it ``None`` and gets wall-clock."""
+        Called once per ``job_runner`` tick.
+
+        #138 Ф2: изоляция семей. Скан всех due — КРОСС-ТЕНАНТНЫЙ →
+        ``privileged_session`` (maintenance-роль видит все семьи). Отправка
+        КОНКРЕТНОЙ семье — ПЕР-ТЕНАНТНАЯ → ``tenant_session(tenant_id)`` (RLS
+        не даст записать чужой tenant_id). Каждая семья — СВОЯ транзакция
+        (пер-итерационный коммит вместо одного на тик): сбой одной семьи не
+        откатывает остальных; задвоения нет — держат idempotency_key доставки
+        + fencing ``mark_fired``. ``now`` override для тестов."""
         current = now or datetime.now(timezone.utc)
-        due = self.service.due_now(now=current, limit=limit)
-        if not due:
+        # Скан кросс-тенант → снимаем только id+tenant_id; ORM-строки detach'атся
+        # при закрытии скан-сессии → ниже re-fetch под tenant_session семьи.
+        with privileged_session("monitor") as scan:
+            due_ids = [
+                (r.id, r.tenant_id)
+                for r in HousewifeReminderService(scan).due_now(
+                    now=current, limit=limit
+                )
+            ]
+        if not due_ids:
             return 0
 
         fired = 0
         skipped_late = 0
-        for reminder in due:
+        for reminder_id, tenant_id in due_ids:
             try:
-                # #187 soft-delete — fencing-recheck (дверь #10): между SELECT
-                # (due_now producer-фильтр) и сдвигом состояния есть окно —
-                # тенант мог быть удалён администратором мид-тик в другом
-                # процессе. Перепроверяем В ТОЙ ЖЕ TX прямо перед доставкой +
-                # advance; удалён → пропускаем (НЕ доставляем, НЕ двигаем state).
-                from sreda.services.tenant_lifecycle import is_tenant_active
+                with tenant_session(tenant_id) as s:
+                    reminder = s.get(FamilyReminder, reminder_id)
+                    if reminder is None:
+                        continue  # исчез между сканом и действием
+                    # #187 soft-delete — fencing-recheck (дверь #10): тенант мог
+                    # быть удалён администратором мид-тик. Проверяем прямо перед
+                    # доставкой + advance; удалён → пропуск (НЕ доставляем, НЕ
+                    # двигаем state).
+                    from sreda.services.tenant_lifecycle import is_tenant_active
 
-                if not is_tenant_active(self.session, reminder.tenant_id):
-                    logger.info(
-                        "reminder %s: tenant %s удалён (fencing) — пропуск без advance",
-                        reminder.id, reminder.tenant_id,
-                    )
-                    continue
-                # 2026-04-23 «баг 2b»: если напоминание просрочено больше
-                # чем LATE_FIRE_GRACE_MINUTES — закрываем его silently
-                # без отправки в Telegram. Типичный случай: LLM создала
-                # серию one-shot'ов на прошедшие часы, воркер на первой
-                # же итерации увидит их всех past-due — без этого guard'а
-                # юзер получает несколько одинаковых сообщений пачкой.
-                # mark_fired всё равно вызываем чтобы advance'нуть state
-                # (recurring → next RRULE, one-shot → status='fired').
-                trigger = reminder.next_trigger_at
-                if trigger is not None:
-                    if trigger.tzinfo is None:
-                        trigger = trigger.replace(tzinfo=timezone.utc)
-                    late_min = (current - trigger).total_seconds() / 60
-                    if late_min > LATE_FIRE_GRACE_MINUTES:
+                    if not is_tenant_active(s, tenant_id):
                         logger.info(
-                            "reminder %s: past-due by %dmin > grace %dmin, "
-                            "silent-finalise",
-                            reminder.id, int(late_min),
-                            LATE_FIRE_GRACE_MINUTES,
+                            "reminder %s: tenant %s удалён (fencing) — пропуск без advance",
+                            reminder_id, tenant_id,
                         )
-                        self.service.mark_fired(reminder, now=current)
-                        skipped_late += 1
                         continue
+                    service = HousewifeReminderService(s)
+                    # 2026-04-23 «баг 2b»: если напоминание просрочено больше
+                    # чем LATE_FIRE_GRACE_MINUTES — закрываем silently без
+                    # отправки. mark_fired всё равно зовём чтобы advance'нуть
+                    # state (recurring → next RRULE, one-shot → status='fired').
+                    trigger = reminder.next_trigger_at
+                    if trigger is not None:
+                        if trigger.tzinfo is None:
+                            trigger = trigger.replace(tzinfo=timezone.utc)
+                        late_min = (current - trigger).total_seconds() / 60
+                        if late_min > LATE_FIRE_GRACE_MINUTES:
+                            logger.info(
+                                "reminder %s: past-due by %dmin > grace %dmin, "
+                                "silent-finalise",
+                                reminder_id, int(late_min),
+                                LATE_FIRE_GRACE_MINUTES,
+                            )
+                            service.mark_fired(reminder, now=current)
+                            s.commit()
+                            skipped_late += 1
+                            continue
 
-                self._enqueue_outbox_for(reminder)
-                self.service.mark_fired(reminder, now=current)
-                fired += 1
+                    self._enqueue_outbox_for(s, reminder)
+                    service.mark_fired(reminder, now=current)
+                    s.commit()
+                    fired += 1
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "reminder %s: failed to fire, will retry next tick",
-                    reminder.id,
+                    reminder_id,
                 )
                 continue
-        self.session.commit()
         if fired or skipped_late:
             logger.info(
                 "housewife: fired=%d skipped_late=%d",
@@ -122,8 +138,8 @@ class HousewifeReminderWorker:
 
     # --- internals ------------------------------------------------------
 
-    def _enqueue_outbox_for(self, reminder: FamilyReminder) -> None:
-        routings = self._resolve_routings(reminder)
+    def _enqueue_outbox_for(self, session: Session, reminder: FamilyReminder) -> None:
+        routings = self._resolve_routings(session, reminder)
         if not routings:
             logger.warning(
                 "reminder %s: tenant %s has no deliverable channel "
@@ -133,7 +149,7 @@ class HousewifeReminderWorker:
             )
             return
 
-        workspace_id = self._resolve_workspace_id(reminder.tenant_id)
+        workspace_id = self._resolve_workspace_id(session, reminder.tenant_id)
         if not workspace_id:
             logger.warning(
                 "reminder %s: tenant %s has no workspace, skipping",
@@ -183,7 +199,7 @@ class HousewifeReminderWorker:
             # (мультипроцесс / повтор-enqueue) → дедуп. Pre-check (одно-поточный путь); partial-unique
             # индекс — backstop гонки.
             idem_key = f"{reminder.id}:{fired_iso}:{routing.channel}:{row_bot_key}"
-            if self._outbox_key_exists(idem_key):
+            if self._outbox_key_exists(session, idem_key):
                 logger.info(
                     "reminder %s: outbox idem-key уже поставлен (%s) — пропуск дубля доставки",
                     reminder.id, routing.channel,
@@ -218,9 +234,9 @@ class HousewifeReminderWorker:
             # mark_fired-advance + доставка тика не идёт). begin_nested откатывает ТОЛЬКО эту строку
             # → гонка дедупится без падения тика.
             try:
-                with self.session.begin_nested():
-                    self.session.add(outbox)
-                    self.session.flush()
+                with session.begin_nested():
+                    session.add(outbox)
+                    session.flush()
             except IntegrityError:
                 logger.info(
                     "reminder %s: outbox idem-key гонка (%s) → дедуп (другой писатель опередил)",
@@ -228,16 +244,16 @@ class HousewifeReminderWorker:
                 )
                 continue
 
-    def _outbox_key_exists(self, idem_key: str) -> bool:
+    def _outbox_key_exists(self, session: Session, idem_key: str) -> bool:
         """Pre-check дедупа доставки (#163 Фаза 4): есть ли уже outbox с этим ключом.
         Закрывает общий повтор-enqueue; гонку (TOCTOU) ловит partial-unique индекс + savepoint."""
         return (
-            self.session.query(OutboxMessage.id)
+            session.query(OutboxMessage.id)
             .filter(OutboxMessage.idempotency_key == idem_key)
             .first() is not None
         )
 
-    def _resolve_routings(self, reminder: FamilyReminder):
+    def _resolve_routings(self, session: Session, reminder: FamilyReminder):
         """Reminder → list of OutboxRouting (10.6 dual-channel).
 
         Codex R1 CRITICAL fix: если ``reminder.user_id`` задан, мы НЕ
@@ -253,7 +269,7 @@ class HousewifeReminderWorker:
         from sreda.services.channel_routing import resolve_outbox_routings
         from sreda.db.models.core import Tenant as _Tenant
 
-        tenant = self.session.get(_Tenant, reminder.tenant_id)
+        tenant = session.get(_Tenant, reminder.tenant_id)
 
         # User-scoped reminder: возвращаем routings ТОЛЬКО для своего
         # user'а. Если у юзера нет account'ов — empty list (skip + log),
@@ -263,7 +279,7 @@ class HousewifeReminderWorker:
         # FK был snapshot'ом, и т.д.). Иначе personal-data leak в чужой
         # tenant.
         if reminder.user_id:
-            user = self.session.get(User, reminder.user_id)
+            user = session.get(User, reminder.user_id)
             if user is None or user.tenant_id != reminder.tenant_id:
                 logger.warning(
                     "reminder %s: user %s mismatch tenant (user.tenant=%s "
@@ -274,14 +290,14 @@ class HousewifeReminderWorker:
                 )
                 return []
             return resolve_outbox_routings(
-                self.session, tenant=tenant, user=user,
+                session, tenant=tenant, user=user,
                 telegram_bot_keys=self._registry,
             )
 
         # Tenant-wide reminder (user_id=None): берём любого юзера с
         # deliverable account.
         user = (
-            self.session.query(User)
+            session.query(User)
             .filter(
                 User.tenant_id == reminder.tenant_id,
                 (
@@ -295,13 +311,13 @@ class HousewifeReminderWorker:
         if user is None:
             return []
         return resolve_outbox_routings(
-            self.session, tenant=tenant, user=user,
+            session, tenant=tenant, user=user,
             telegram_bot_keys=self._registry,
         )
 
-    def _resolve_workspace_id(self, tenant_id: str) -> str | None:
+    def _resolve_workspace_id(self, session: Session, tenant_id: str) -> str | None:
         ws = (
-            self.session.query(Workspace)
+            session.query(Workspace)
             .filter(Workspace.tenant_id == tenant_id)
             .order_by(Workspace.id.asc())
             .first()

@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.core import InboundMessage, OutboxMessage
 from sreda.db.models.skill_platform import SkillAIExecution
+from sreda.db.session import privileged_session
 from sreda.services.admin_alerts import send_admin_alert
 
 logger = logging.getLogger("sreda.reliability")
@@ -190,9 +191,10 @@ def format_report(counts, history: list[dict],
 class ReliabilityReportWorker:
     """Шлёт сводку не чаще раза в сутки; провал → откат (не шторм)."""
 
-    def __init__(self, session: Session, *, state_file: str | None = None,
+    def __init__(self, *, state_file: str | None = None,
                  log_path: str | None = None) -> None:
-        self.session = session
+        # #138 Ф2: воркер сам открывает privileged_session("monitor") на
+        # глобальный KPI-COUNT; общую сессию больше не принимает.
         self.state_file = Path(state_file or DEFAULT_STATE_FILE)
         # Codex R2 (оба): при неписабельном основном каталоге провальная
         # отметка писалась тем же сломанным писателем → бесконечные
@@ -213,9 +215,11 @@ class ReliabilityReportWorker:
             breakdowns = await _aio.to_thread(
                 count_breakdown_lines, self.log_path,
                 since=now - REPORT_WINDOW, until=now)
-            counts = gather_day_counts(
-                self.session, now=now,
-                breakdowns_precounted=breakdowns)
+            # #138 Ф2: глобальный KPI (COUNT по ВСЕМ тенантам) → privileged.
+            with privileged_session("monitor") as session:
+                counts = gather_day_counts(
+                    session, now=now,
+                    breakdowns_precounted=breakdowns)
             day = {"date": now.date().isoformat(),
                    "total": counts.turns_total,
                    "failures": counts.failures_total}

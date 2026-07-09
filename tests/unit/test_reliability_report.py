@@ -155,7 +155,7 @@ async def test_reliability_report_backoff(tmp_path: Path, monkeypatch) -> None:
     ok = MagicMock(return_value=DayCounts(1, 0, 0, 0, 0))
     monkeypatch.setattr(rr_module, "gather_day_counts", ok)
     state = tmp_path / "st.json"
-    w = ReliabilityReportWorker(MagicMock(), state_file=str(state))
+    w = ReliabilityReportWorker(state_file=str(state))
     assert await w.process_pending() == 1
     assert len(sent) == 1
     # второй тик тех же суток — отчёт НЕ шлётся
@@ -168,7 +168,7 @@ async def test_reliability_report_backoff(tmp_path: Path, monkeypatch) -> None:
     boom = MagicMock(side_effect=RuntimeError("db down"))
     monkeypatch.setattr(rr_module, "gather_day_counts", boom)
     state2 = tmp_path / "st2.json"
-    w2 = ReliabilityReportWorker(MagicMock(), state_file=str(state2))
+    w2 = ReliabilityReportWorker(state_file=str(state2))
     assert await w2.process_pending() == 0
     assert await w2.process_pending() == 0
     assert boom.call_count == 1, "повтор до отката — шторм"
@@ -212,7 +212,7 @@ def test_history_dedupe_and_calendar_window(tmp_path: Path, monkeypatch) -> None
             {"date": today.isoformat(), "total": 1, "failures": 1},  # дубль дня
         ],
     }), encoding="utf-8")
-    w = ReliabilityReportWorker(MagicMock(), state_file=str(state))
+    w = ReliabilityReportWorker(state_file=str(state))
     import asyncio as _a
     assert _a.get_event_loop_policy() is not None
     assert _a.run(w.process_pending()) == 1
@@ -268,8 +268,7 @@ async def test_unwritable_state_falls_back_and_backs_off(
                         MagicMock(return_value=DayCounts(1, 0, 0, 0, 0)))
     monkeypatch.setattr(rr_module, "count_breakdown_lines",
                         MagicMock(return_value=0))
-    w = ReliabilityReportWorker(MagicMock(),
-                                state_file=str(tmp_path / "nodir" / "st.json"))
+    w = ReliabilityReportWorker(state_file=str(tmp_path / "nodir" / "st.json"))
     # основной путь сломан: каталог-файл
     (tmp_path / "nodir").write_text("файл вместо каталога", encoding="utf-8")
     w.fallback_state_file = tmp_path / "fb.json"
@@ -300,8 +299,7 @@ def test_breakdown_scans_rotated_log(tmp_path: Path) -> None:
 def test_stale_readable_primary_does_not_shadow_fallback(tmp_path: Path) -> None:
     """Codex R3 high: основной читаем, но устарел (записи шли в запасной)
     → чтение берёт свежайший state, повторной отправки нет."""
-    w = ReliabilityReportWorker(MagicMock(),
-                                state_file=str(tmp_path / "st.json"))
+    w = ReliabilityReportWorker(state_file=str(tmp_path / "st.json"))
     w.fallback_state_file = tmp_path / "fb.json"
     today = datetime.now(timezone.utc)
     (tmp_path / "st.json").write_text(json.dumps(

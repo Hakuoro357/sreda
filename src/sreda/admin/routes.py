@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Cookie, Depends, Form, Query, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -22,7 +22,7 @@ from sreda.admin.queries import (
     has_active_subscriptions,
 )
 from sreda.config.settings import get_settings
-from sreda.db.session import get_session_factory
+from sreda.db.session import privileged_session
 
 _MSK_TZ = ZoneInfo("Europe/Moscow")
 
@@ -53,12 +53,15 @@ templates.env.filters["usd"] = _fmt_usd
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-def _get_session():
-    session = get_session_factory()()
-    try:
+async def _get_session():
+    # #138 Ф2: админ-дашборд видит ВСЕ тенанты (кросс-тенант) → privileged("admin").
+    # Без обёртки под Ф3 RLS все запросы дашборда под ролью app вернут 0 строк (fail-closed).
+    # 🔴 ASYNC ОБЯЗАТЕЛЬНО (R1 MAJOR): privileged_session ставит/сбрасывает ContextVar токенами;
+    # sync-gen FastAPI-зависимость гоняется в threadpool (anyio КОПИРУЕТ контекст) → enter/exit в
+    # разных контекстах → reset падает "Token created in a different Context" на КАЖДОМ запросе.
+    # Тот же урок, что get_tenant_db в mini-app (g-073).
+    with privileged_session("admin") as session:
         yield session
-    finally:
-        session.close()
 
 
 def _audit_admin_view(
@@ -179,7 +182,7 @@ async def admin_refresh_snapshot(
 
     _audit_admin_view(session, "admin.dashboard.refreshed", principal.actor_id, request)
     ok = await asyncio.to_thread(
-        ov.refresh_overview, get_session_factory(), get_settings()
+        ov.refresh_overview, None, get_settings()  # #138 R2 M7: None → privileged(admin)
     )
     suffix = "?refresh=err" if not ok else ""
     return RedirectResponse(

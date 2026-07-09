@@ -237,13 +237,14 @@ def _should_attempt_per_dedupe(
 
     Fail-open: SQLAlchemyError → (True, 0) — over-send preferred над missed.
     """
-    from sreda.db.session import get_session_factory
+    from sreda.db.session import privileged_session
     window_s = _RATE_LIMIT_BY_SEVERITY.get(severity, 300)
     now = _utcnow()
     threshold = now - timedelta(seconds=window_s)
-    sf = get_session_factory()
     try:
-        with sf() as session:
+        # #138 Ф2: пишется из daemon-потока (tenant_ctx НЕ наследуется) в ГЛОБАЛЬНУЮ
+        # admin_alerts_seen → privileged (иначе под Ф3 RLS запись упрётся в fail-closed).
+        with privileged_session("monitor") as session:
             # UPSERT increments count but never touches last_sent_at.
             # Initial INSERT uses _EPOCH (1970-01-01) → first call always
             # has last_sent_at < threshold → should_attempt=True.
@@ -277,10 +278,10 @@ def _mark_sent(dedupe_key: str) -> None:
 
     Fail-soft: SQLAlchemyError logged but не propagated.
     """
-    from sreda.db.session import get_session_factory
-    sf = get_session_factory()
+    from sreda.db.session import privileged_session
     try:
-        with sf() as session:
+        # #138 Ф2: daemon-поток + глобальная admin_alerts_seen → privileged.
+        with privileged_session("monitor") as session:
             session.execute(
                 sa_text(
                     "UPDATE admin_alerts_seen SET last_sent_at = :now "

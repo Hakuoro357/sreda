@@ -28,6 +28,9 @@ PRIVILEGED_REASONS: frozenset[str] = _IDENTITY_REASONS | frozenset({
     "monitor",        # мониторы/probe
     "broadcast",      # рассылки
     "migration-data",  # data-миграции
+    "queue-dispatch",  # консьюмер очереди message_jobs (claim/mark/heartbeat — кросс-тенант)
+    "channel-link",   # связывание каналов (#138 R2 M4): токен ищется глобально по хешу,
+                      # source_user чужого тенанта, audit_log — кросс-тенантная identity-операция
 })
 
 
@@ -71,29 +74,38 @@ def get_engine():
     return engine
 
 
+@lru_cache
+def _build_role_engine(url: str):
+    """#138 Ф5: отдельный движок под РАЗВЕДЁННЫЙ DSN роли (maintenance/identity), кеш по URL.
+    До Ф5 (url == database_url) НЕ используется — идём в общий get_engine."""
+    return _build_engine(url)
+
+
 def get_app_engine():
     """#138 Р5: app DSN = database_url (рантайм под sreda_app). Переиспользуем пул get_engine."""
     return get_engine()
 
 
-@lru_cache
 def get_maintenance_engine():
-    """#138: maintenance-роль. Пока maintenance_database_url не разведён — тот же движок (аддитивно, v1)."""
+    """#138: maintenance-роль. Пока maintenance_database_url не разведён — общий get_engine.
+    БЕЗ собственного lru_cache: иначе тесты, сбрасывающие get_engine на новую БД, видели бы здесь
+    протухший движок первого теста (privileged-путь расходился бы с tenant-путём). Ф5 (свой DSN) —
+    через кешируемый _build_role_engine."""
     settings = get_settings()
     url = getattr(settings, "maintenance_database_url", None) or settings.database_url
     if url == settings.database_url:
         return get_engine()
-    return _build_engine(url)
+    return _build_role_engine(url)
 
 
-@lru_cache
 def get_identity_engine():
-    """#138: узкая identity-роль (inbound-провижн). Пока identity_database_url не разведён — тот же движок."""
+    """#138: узкая identity-роль (inbound-провижн). Пока identity_database_url не разведён — общий
+    get_engine (без своего lru_cache, та же причина, что у maintenance). Ф5 — _build_role_engine."""
     settings = get_settings()
     url = getattr(settings, "identity_database_url", None) or settings.database_url
     if url == settings.database_url:
         return get_engine()
-    return _build_engine(url)
+    return _build_role_engine(url)
 
 
 @lru_cache
@@ -135,7 +147,11 @@ def privileged_session(reason: str) -> Iterator[Session]:
     (fail-closed) + аудит-лог. access_ctx='privileged'. tenant_ctx НЕ ставит (RLS пускает по current_user)."""
     if reason not in PRIVILEGED_REASONS:
         raise PermissionError(f"privileged_session: reason not in registry: {reason!r}")
-    logger.info("privileged_session opened reason=%s", reason)  # аудит (без ПД)
+    # R2 MINOR (оба субагента): DEBUG, не INFO — saver.M9 дёргает privileged("gc") на КАЖДЫЙ
+    # put/put_writes (десятки/ход) → INFO топил бы прод-лог. Аудит привилегированного доступа —
+    # дисциплина, не механизм (реальный gate = реестр reason'ов fail-closed); для compliance-
+    # аудита кросс-тенантного чтения нужен отдельный механизм, не лог-строка.
+    logger.debug("privileged_session opened reason=%s", reason)  # без ПД
     engine = get_identity_engine() if reason in _IDENTITY_REASONS else get_maintenance_engine()
     # ГАСИМ tenant_ctx (Ф1-R1 MAJOR): если privileged открыт ВНУТРИ tenant_session(A), а движки
     # ещё фолбэкают на общий get_engine (до Ф5), begin-событие иначе выставило бы чужой

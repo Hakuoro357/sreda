@@ -305,6 +305,50 @@ def db_session(_test_engine):
         conn.close()
 
 
+@pytest.fixture
+def worker_db(monkeypatch, tmp_path):
+    """#138 Ф2 — для воркер-тестов, где воркер САМ открывает seam-сессии
+    (``privileged_session`` / ``tenant_session``), а не принимает сессию.
+
+    Отличие от ``db_session`` (внешняя TX + rollback): здесь свежая КОММИТЯЩАЯ
+    файловая SQLite на тест, и шов привязан к ней через патч ``_factory_for``
+    (единая точка сборки сессий tenant/privileged). Так сессии воркера И
+    сессия теста (сид + ассерты) делят одну БД. Файловая, а не ``:memory:``:
+    воркер открывает СВОИ соединения, а :memory: + StaticPool дало бы
+    single-connection contention; файл виден всем соединениям, коммиты
+    воркера читаются тестом. Свежий файл на тест → нет протечки состояния.
+
+    NB: сессия теста и сессии воркера — РАЗНЫЕ (identity map не общий). После
+    прогона воркера тест должен ``session.expire_all()`` перед ассертом на
+    ИЗМЕНЁННЫЕ засиженные строки (новые строки видны и так)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from sreda.db.base import Base
+    import sreda.db.models  # noqa: F401 — регистрирует ядро таблиц
+    import sreda.db.models.audit  # noqa: F401
+    import sreda.db.models.free_tier  # noqa: F401
+    import sreda.db.models.reply_buttons  # noqa: F401
+
+    db_path = tmp_path / "worker.db"
+    engine = create_engine(
+        f"sqlite:///{db_path.as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    # Шов (tenant_session/privileged_session) собирает сессии через _factory_for
+    # → патчим его на тестовую фабрику. get_maintenance/app_engine всё равно
+    # зовутся, но их результат игнорируется (фабрика фиксирована).
+    monkeypatch.setattr("sreda.db.session._factory_for", lambda _engine: factory)
+    session = factory()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
 @pytest.fixture(autouse=True)
 def _disable_admin_alerts_for_unit_tests(monkeypatch):
     """Глобально no-op'ит send_admin_alert в области unit-тестов.

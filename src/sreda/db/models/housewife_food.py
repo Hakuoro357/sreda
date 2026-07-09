@@ -26,10 +26,12 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text as sql_text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -196,6 +198,9 @@ class Recipe(Base):
             postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
         ),
+        # #138 Ф3-a: нужен composite-FK детей (id, tenant_id) — id и так PK,
+        # constraint формальный.
+        UniqueConstraint("id", "tenant_id", name="uq_recipes_id_tenant"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -264,6 +269,8 @@ class Recipe(Base):
         back_populates="recipe",
         cascade="all, delete-orphan",
         order_by="RecipeIngredient.sort_order",
+        # #138 Ф3-a: после composite-FK путей два — join только по recipe_id.
+        foreign_keys="RecipeIngredient.recipe_id",
     )
 
 
@@ -271,11 +278,24 @@ class RecipeIngredient(Base):
     __tablename__ = "recipe_ingredients"
     __table_args__ = (
         Index("ix_recipe_ingredients_recipe", "recipe_id"),
+        # #138 Ф3-a: composite-FK гарантирует совпадение tenant_id с родителем.
+        ForeignKeyConstraint(
+            ["recipe_id", "tenant_id"],
+            ["recipes.id", "recipes.tenant_id"],
+            ondelete="CASCADE",
+            name="fk_recipe_ingredients_parent_tenant",
+        ),
+        Index("ix_recipe_ingredients_tenant", "tenant_id"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     recipe_id: Mapped[str] = mapped_column(
         ForeignKey("recipes.id", ondelete="CASCADE"), nullable=False
+    )
+    # #138 Ф3-a: денорм из родителя — RLS-скоуп; composite-FK гарантирует
+    # совпадение с родителем.
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id"), nullable=False
     )
     # EncryptedString: "картошка", "куриное филе".
     title: Mapped[str] = mapped_column(EncryptedString(), nullable=False)
@@ -283,7 +303,9 @@ class RecipeIngredient(Base):
     is_optional: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    recipe: Mapped[Recipe] = relationship("Recipe", back_populates="ingredients")
+    recipe: Mapped[Recipe] = relationship(
+        "Recipe", back_populates="ingredients", foreign_keys=[recipe_id],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +327,9 @@ class MenuPlan(Base):
             "user_id",
             "week_start_date",
         ),
+        # #138 Ф3-a: нужен composite-FK детей (id, tenant_id) — id и так PK,
+        # constraint формальный.
+        UniqueConstraint("id", "tenant_id", name="uq_menu_plans_id_tenant"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -330,6 +355,8 @@ class MenuPlan(Base):
         back_populates="plan",
         cascade="all, delete-orphan",
         order_by="(MenuPlanItem.day_of_week, MenuPlanItem.meal_type)",
+        # #138 Ф3-a: после composite-FK путей два — join только по menu_plan_id.
+        foreign_keys="MenuPlanItem.menu_plan_id",
     )
 
 
@@ -347,11 +374,24 @@ class MenuPlanItem(Base):
             "menu_plan_id",
             "day_of_week",
         ),
+        # #138 Ф3-a: composite-FK гарантирует совпадение tenant_id с родителем.
+        ForeignKeyConstraint(
+            ["menu_plan_id", "tenant_id"],
+            ["menu_plans.id", "menu_plans.tenant_id"],
+            ondelete="CASCADE",
+            name="fk_menu_plan_items_parent_tenant",
+        ),
+        Index("ix_menu_plan_items_tenant", "tenant_id"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     menu_plan_id: Mapped[str] = mapped_column(
         ForeignKey("menu_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    # #138 Ф3-a: денорм из родителя — RLS-скоуп; composite-FK гарантирует
+    # совпадение с родителем.
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id"), nullable=False
     )
     # ISO weekday: 0=Monday, 6=Sunday.
     day_of_week: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -364,5 +404,7 @@ class MenuPlanItem(Base):
     free_text: Mapped[str | None] = mapped_column(EncryptedString(), nullable=True)
     notes: Mapped[str | None] = mapped_column(EncryptedString(), nullable=True)
 
-    plan: Mapped[MenuPlan] = relationship("MenuPlan", back_populates="items")
+    plan: Mapped[MenuPlan] = relationship(
+        "MenuPlan", back_populates="items", foreign_keys=[menu_plan_id],
+    )
     recipe: Mapped[Recipe | None] = relationship("Recipe", foreign_keys=[recipe_id])

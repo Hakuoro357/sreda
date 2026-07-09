@@ -75,14 +75,8 @@ def test_prune_explicit_list_unchanged(monkeypatch):
 
 
 # ───────────── privacy-allowlist'ы и osa-эксперимент: БЕЗ `*` (строгие) ─────────────
-def test_debug_gate_treats_star_literally_not_all(monkeypatch):
-    """react_debug_tenants — privacy allowlist; `*` НЕ должен раскрывать всех на дебаг."""
-    monkeypatch.setenv("SREDA_REACT_DEBUG_TENANTS", "*")
-    st_mod.get_settings.cache_clear()
-    g = st_mod.get_settings().react_debug_tenants
-    assert "tenant_random" not in g  # `*` тут — обычная строка-член, не режим «всем»
-
-
+# test_debug_gate_treats_star_literally_not_all УДАЛЁН (#138 Ф3-0): react_debug_tenants снят
+# вместе с react_debug_turns; литеральность `*` для остальных privacy-allowlist'ов покрыта ниже.
 def test_osa_gate_treats_star_literally_not_all(monkeypatch):
     monkeypatch.setenv("SREDA_REACT_OSA_TENANTS", "*")
     st_mod.get_settings.cache_clear()

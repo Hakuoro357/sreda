@@ -227,7 +227,6 @@ async def test_timeout_fallback_records_primary_attempt_in_trace(db_session, mon
     monkeypatch.setenv("SREDA_REACT_LLM_TIMEOUT_SEC", _TIMEOUT_S)
     st_mod.get_settings.cache_clear()
     monkeypatch.setattr(react_loop, "_record_react_usage", lambda **kw: None)
-    monkeypatch.setattr(react_loop, "_persist_debug_turn", lambda **kw: None)
     cap = _CapTrace()
     monkeypatch.setattr(react_loop, "_trace", cap)
     u = seed_telegram_user(db_session)

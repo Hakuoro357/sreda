@@ -181,7 +181,6 @@ async def test_durable_crash_recovery_counter(monkeypatch):
 
     monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
     monkeypatch.setattr(RL, "build_slice_tools", lambda *a, **k: [])
-    monkeypatch.setattr(RL, "_persist_debug_turn", lambda *a, **k: None)
     # детерминированный краш ВНУТРИ try → except-recovery
     def _boom(*a, **k):
         raise RuntimeError("boom")
@@ -237,7 +236,6 @@ async def test_durable_transient_llm_crash_preserves_thread_225(monkeypatch):
 
     monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
     monkeypatch.setattr(RL, "build_slice_tools", lambda *a, **k: [])
-    monkeypatch.setattr(RL, "_persist_debug_turn", lambda *a, **k: None)
 
     def _boom_transient(*a, **k):
         raise LLMCallTimeout("LLM invoke exceeded wall time")
@@ -312,7 +310,6 @@ async def test_durable_badrequest_still_deletes_225(monkeypatch):
     BadRequestError.__module__ = "openai"
     monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
     monkeypatch.setattr(RL, "build_slice_tools", lambda *a, **k: [])
-    monkeypatch.setattr(RL, "_persist_debug_turn", lambda *a, **k: None)
     monkeypatch.setattr(RL, "_build_graph", lambda *a, **k: (_ for _ in ()).throw(BadRequestError("bad")))
     kw = dict(session=None, tenant_id="t1", user_id="u1", thread_id="react:t1:badreq225",
               llm=object(), user_text="привет")
@@ -345,7 +342,6 @@ async def test_durable_transient_resets_poison_counter_225(monkeypatch):
         raise e
     monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
     monkeypatch.setattr(RL, "build_slice_tools", lambda *a, **k: [])
-    monkeypatch.setattr(RL, "_persist_debug_turn", lambda *a, **k: None)
     monkeypatch.setattr(RL, "_build_graph", _boom_seq)
     kw = dict(session=None, tenant_id="t1", user_id="u1", thread_id="react:t1:mixed225",
               llm=object(), user_text="привет")

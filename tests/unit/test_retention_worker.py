@@ -56,8 +56,7 @@ async def test_first_call_runs_cleanup_and_writes_state(
     state_path: Path, cleanup_mock
 ):
     """No state file → run cleanup, persist last_run_at."""
-    session = MagicMock()
-    worker = RetentionWorker(session, state_file=str(state_path))
+    worker = RetentionWorker(state_file=str(state_path))
 
     deleted = await worker.process_pending()
 
@@ -82,8 +81,7 @@ async def test_second_call_within_24h_skips(state_path: Path, cleanup_mock):
         encoding="utf-8",
     )
 
-    session = MagicMock()
-    worker = RetentionWorker(session, state_file=str(state_path))
+    worker = RetentionWorker(state_file=str(state_path))
     deleted = await worker.process_pending()
 
     assert deleted == 0
@@ -99,8 +97,7 @@ async def test_call_after_24h_runs_again(state_path: Path, cleanup_mock):
         encoding="utf-8",
     )
 
-    session = MagicMock()
-    worker = RetentionWorker(session, state_file=str(state_path))
+    worker = RetentionWorker(state_file=str(state_path))
     deleted = await worker.process_pending()
 
     assert deleted == 42
@@ -112,8 +109,7 @@ async def test_corrupt_state_file_treated_as_missing(state_path: Path, cleanup_m
     """Garbage in state file → run cleanup (don't crash)."""
     state_path.write_text("not-json{{}", encoding="utf-8")
 
-    session = MagicMock()
-    worker = RetentionWorker(session, state_file=str(state_path))
+    worker = RetentionWorker(state_file=str(state_path))
     deleted = await worker.process_pending()
 
     assert deleted == 42  # ran
@@ -131,8 +127,7 @@ async def test_cleanup_failure_does_not_crash_worker(
     fail = MagicMock(side_effect=RuntimeError("boom"))
     monkeypatch.setattr(rw_module, "cleanup_runtime_retention", fail)
 
-    session = MagicMock()
-    worker = RetentionWorker(session, state_file=str(state_path))
+    worker = RetentionWorker(state_file=str(state_path))
     deleted = await worker.process_pending()
 
     assert deleted == 0
@@ -151,9 +146,8 @@ async def test_custom_interval(state_path: Path, cleanup_mock):
         encoding="utf-8",
     )
 
-    session = MagicMock()
     worker = RetentionWorker(
-        session, state_file=str(state_path), interval=timedelta(seconds=10)
+        state_file=str(state_path), interval=timedelta(seconds=10)
     )
     deleted = await worker.process_pending()
     assert deleted == 0  # ещё рано
