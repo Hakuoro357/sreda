@@ -78,7 +78,12 @@ _PAIRS = (
 
 
 def _index_state(bind, index_name: str) -> str | None:
-    """None — индекса нет; "valid"/"invalid" — по pg_index.indisvalid."""
+    """None — индекса нет; "valid"/"invalid" — по pg_index.indisvalid.
+
+    R3 MINOR (medium): фильтр по ``relname`` без ``pg_namespace`` — допущение
+    single-schema (миграции Среды гоняются на ``public``, search_path не кастомим).
+    При кастомном search_path одноимённый индекс в другой схеме дал бы ложное совпадение;
+    здесь это не наш кейс. Явно фиксирую допущение, чтобы не расширять запрос без нужды."""
     row = bind.execute(
         sa.text(
             "SELECT i.indisvalid FROM pg_index i "

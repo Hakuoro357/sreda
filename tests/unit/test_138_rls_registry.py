@@ -62,6 +62,9 @@ _FROZEN_0082_NO_RLS = frozenset({
     "admin_sessions", "admin_login_challenges", "runtime_config", "signup_attempts",
     "poller_offsets", "poller_heartbeats", "step_execution_ledger",
 })
+_FROZEN_0082_IDENTITY_INSERT = frozenset({
+    "tenants", "workspaces", "users", "assistants", "tenant_features", "tenant_subscriptions",
+})
 
 
 def test_migration_0082_is_frozen_historical_snapshot():
@@ -76,8 +79,13 @@ def test_migration_0082_is_frozen_historical_snapshot():
     )
     assert set(mig.NO_RLS_TABLES) == _FROZEN_0082_NO_RLS
     assert set(mig.ROOT_TABLES) == {"tenants"}
+    # R3 MINOR (high+medium): заморозить и IDENTITY_INSERT — иначе правка identity-списка
+    # применённой 0082 осталась бы зелёной (provisioning-дыра: fresh PG получит политику,
+    # прод после уже-применённой 0082 — нет).
+    assert set(mig.IDENTITY_INSERT_TABLES) == _FROZEN_0082_IDENTITY_INSERT
     # Реестр ⊇ снапшот (может только расти; сокращение реестра = осознанная миграция DISABLE).
     assert _FROZEN_0082_TENANT <= reg.TENANT_TABLES, "rls_registry потерял таблицы снапшота 0082"
+    assert _FROZEN_0082_IDENTITY_INSERT <= reg.IDENTITY_INSERT_TABLES
 
 
 def test_rls_registry_covers_all_tables_exactly_once():

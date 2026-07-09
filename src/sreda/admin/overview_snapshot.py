@@ -808,7 +808,6 @@ async def run_overview_refresh_loop() -> None:
     # фабрика сессий) логируется, а не молча убивает task.
     try:
         from sreda.config.settings import get_settings
-        from sreda.db.session import get_session_factory
 
         interval = float(get_settings().admin_dashboard_refresh_seconds or 0)
         if interval <= 0:

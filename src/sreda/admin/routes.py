@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Cookie, Depends, Form, Query, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -22,7 +22,7 @@ from sreda.admin.queries import (
     has_active_subscriptions,
 )
 from sreda.config.settings import get_settings
-from sreda.db.session import get_session_factory, privileged_session
+from sreda.db.session import privileged_session
 
 _MSK_TZ = ZoneInfo("Europe/Moscow")
 
