@@ -264,6 +264,144 @@ def test_stale_directive_delivered_and_no_leak(install, monkeypatch):
         "LEAK: директива НЕ должна вернуться на resume следующей паузы (consume-and-clear)"
 
 
+def test_declined_reply():
+    """#320.3 (#321 follow-up): «X» в тексте отмены — из СТРУКТУРНОГО вопроса паузы; из generic
+    candidate-вопроса («Я поняла как «add_task»…») ИМЯ ИНСТРУМЕНТА юзеру НЕ утекает → генерик."""
+    f = react_loop._declined_reply
+    assert f("Я сейчас удалю задачу «проверка». Нужно твоё подтверждение.") == "Отменила, не трогаю «проверка»."
+    assert f("Я сейчас отменю задачу «позвонить маме». Нужно твоё подтверждение.") == "Отменила, не трогаю «позвонить маме»."
+    for q in ("Я поняла как «add_task» (title=x). Подтверди, и я сделаю.",  # generic candidate → без утечки
+              "", None, "Подтверди удаление."):
+        r = f(q)
+        assert r == "Отменила, ничего не делаю.", (q, r)
+        assert "add_task" not in r
+
+
+class _RecTrace(_NoTrace):
+    """#320 R2 (wiring, субагент MAJOR): записывающий стаб — фиксирует persist_trace_abandoned
+    (остальное — no-op как _NoTrace). Удаление вызова / инверсия reason в handle_turn → тест красный."""
+
+    def __init__(self):
+        self.abandoned: list[dict] = []
+
+    def persist_trace_abandoned(self, **kw):
+        self.abandoned.append(kw)
+
+
+def _durable_saver(tmp_path, name):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
+
+    from sreda.db.base import Base
+    from sreda.runtime.react_checkpoint_saver import EncryptedSqlCheckpointSaver
+    engine = create_engine(f"sqlite:///{tmp_path / name}",
+                           connect_args={"check_same_thread": False}, poolclass=NullPool)
+    Base.metadata.create_all(engine)
+    SF = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    return EncryptedSqlCheckpointSaver(session_factory=SF)
+
+
+def test_e2e_redirect_durable_320(install, monkeypatch, tmp_path):
+    """#320.2 e2e handle_turn на DURABLE-пути (чеклист issue): (а) живая пауза + новый запрос → свежий
+    ход, запрос ОБСЛУЖЕН (не съеден), мутация паузы НЕ исполнена; (в) сирота tool_call закрыт
+    withdrawal-ToolMessage (текст «вызов инструмента отменён» доезжает до входа модели на свежем ходе);
+    (б) живая пауза + голое «удали» → resume A0 «нет»: мутации нет, ответ — детерминированный отказ."""
+    saver = _durable_saver(tmp_path, "ck320.db")
+    monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    msgs = []
+    freddie = _Chat("freddie", msgs_capture=msgs, responses=[
+        _ai_call("add_task", "c1", title="позвонить маме"),  # ход1 → candidate-confirm пауза P1
+        _ai_call("list_checklists", "c2"),                    # ход2 (redirect, свежий) → read нового запроса
+        AIMessage(content="Вот твои дела."),                  # ход2 финал
+        _ai_call("add_task", "c3", title="ещё задача"),       # ход3 → новая пауза P2
+        AIMessage(content="Готово, добавила."),               # ход4 (resume «удали»→«нет») — галлюцинация
+    ])
+    inv = install(deepseek=_Chat("ds"))
+    rec = _RecTrace()  # #320 R2 wiring: фиксируем persist_trace_abandoned (стаб вместо _NoTrace)
+    monkeypatch.setattr(react_loop, "_trace", rec)
+    # (а): пауза → новый запрос → свежий ход
+    r1 = _turn(freddie, thread="e2e320", text="расскажи как дела")
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    n_before = len(msgs)
+    _turn(freddie, thread="e2e320", text="какие у меня дела")
+    assert inv.get("add_task", 0) == 0, "мутация брошенной паузы НЕ должна исполниться"
+    assert inv.get("list_checklists", 0) == 1, "новый запрос должен быть ОБСЛУЖЕН (не съеден)"
+    # #320.1 wiring (R2, субагент MAJOR): терминализация вызвана со СТАРЫМ ключом + верным reason
+    _old_tk = f"react:react:t:e2e320:{'расскажи как дела'[:10]}"  # как минтит _turn (imid=thread:text[:10])
+    assert [(a["turn_key"], a["reason"], a["is_confirm"]) for a in rec.abandoned] == \
+        [(_old_tk, "redirected", True)], rec.abandoned
+    # (в): withdrawal дошёл до входа модели свежего хода (пара сироты закрыта в durable-истории)
+    turn2_inputs = msgs[n_before:]
+    assert any("вызов инструмента отменён" in _flat(cap) for cap in turn2_inputs), \
+        "withdrawal-ToolMessage должен закрывать сироту в durable-истории"
+    # (б): новая пауза + голое «удали» → A0 «нет», детерминированный отказ, мутации нет
+    r3 = _turn(freddie, thread="e2e320", text="добавь ещё")
+    assert getattr(r3, "awaiting_confirm", False) is True, r3
+    r4 = _turn(freddie, thread="e2e320", text="удали")
+    assert inv.get("add_task", 0) == 0, "«удали» на confirm — это НЕ подтверждение и НЕ redirect"
+    assert "Отменила" in str(r4) and "Готово" not in str(r4), r4
+    assert len(rec.abandoned) == 1, "resume (decline) НЕ должен терминализировать как abandoned"
+
+
+def test_e2e_stale_durable_320(install, monkeypatch, tmp_path):
+    """#320 R2 wiring (stale-ветка): протухшая пауза + новое сообщение → (1) withdrawal-заглушка сироты
+    доезжает до входа модели (unified, #320.4); (2) старый ряд терминализирован reason=expired (#320.1)."""
+    saver = _durable_saver(tmp_path, "ck320s.db")
+    monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    msgs = []
+    freddie = _Chat("freddie", msgs_capture=msgs, responses=[
+        _ai_call("add_task", "c1", title="позвонить"),  # ход1 → candidate-confirm пауза
+        AIMessage(content="Привет! Чем помочь?"),        # ход2 (stale-clear, свежий) → финал
+    ])
+    inv = install(deepseek=_Chat("ds"))
+    rec = _RecTrace()
+    monkeypatch.setattr(react_loop, "_trace", rec)
+    r1 = _turn(freddie, thread="e2es", text="расскажи как дела")
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    monkeypatch.setattr(react_loop, "_interrupt_age_seconds", lambda *a, **k: 30 * 3600)  # протухла
+    n_before = len(msgs)
+    _turn(freddie, thread="e2es", text="Привет")  # не сигнал → stale-clear (не redirect)
+    assert inv.get("add_task", 0) == 0
+    # #320.4: сирота закрыт withdrawal и на STALE-пути (unified)
+    assert any("вызов инструмента отменён" in _flat(cap) for cap in msgs[n_before:]), \
+        "withdrawal должен закрывать сироту и на протухании (unified)"
+    # #320.1: терминализация reason=expired со старым ключом
+    _old_tk = f"react:react:t:e2es:{'расскажи как дела'[:10]}"
+    assert [(a["turn_key"], a["reason"]) for a in rec.abandoned] == [(_old_tk, "expired")], rec.abandoned
+
+
+def test_abandoned_skipped_on_turn_key_collision_320(install, monkeypatch, tmp_path):
+    """#320 R2 (субагент R1 MINOR): пустой inbound_message_id → новый turn_key = f(thread) СОВПАДАЕТ со
+    старым → терминализировать НЕЛЬЗЯ (пометили бы done ряд, который start/finish свежего хода уже не
+    переоткроют — полная потеря трейса). Guard old != new → abandoned НЕ вызывается."""
+    saver = _durable_saver(tmp_path, "ck320c.db")
+    monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    freddie = _Chat("freddie", responses=[
+        _ai_call("add_task", "c1", title="x"),  # ход1 → пауза (imid ПУСТОЙ → ключ = f(thread))
+        AIMessage(content="Привет!"),            # ход2 stale-clear (imid ПУСТОЙ → ТОТ ЖЕ ключ)
+    ])
+    install(deepseek=_Chat("ds"))
+    rec = _RecTrace()
+    monkeypatch.setattr(react_loop, "_trace", rec)
+
+    def _turn_no_imid(text):
+        return asyncio.run(react_loop.handle_turn(
+            session=None, tenant_id="t", user_id="u", thread_id="col320",
+            llm=freddie, user_text=text, inbound_message_id="",  # ← пустой → fallback на thread_id
+            channel="react", resume_only=False, expected_confirm_id="",
+            provider_key="inception-mercury2", fallback_llm=None))
+
+    r1 = _turn_no_imid("расскажи как дела")
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    monkeypatch.setattr(react_loop, "_interrupt_age_seconds", lambda *a, **k: 30 * 3600)
+    _turn_no_imid("Привет")
+    assert rec.abandoned == [], "коллизия ключей (old==new) → терминализация ПРОПУЩЕНА (guard)"
+
+
 def test_domain_blocked_count_basic():
     assert react_loop._domain_blocked_count([]) == 0
     assert react_loop._domain_blocked_count(None) == 0

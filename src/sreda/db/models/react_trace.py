@@ -46,7 +46,7 @@ class ReactTurnTrace(Base):
     llm_calls_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # tool_calls: [{name, args_hash(HMAC), ok, result_kind, error_type, latency_ms}]
     tool_calls_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # none | pending | confirmed | declined
+    # none | pending | confirmed | declined | redirected | expired (#320: брошенная пауза)
     confirm_state: Mapped[str] = mapped_column(String(16), default="none")
     # ok|clarification|tool_error|llm_error|timeout|max_iter|fallback_used|policy_blocked|safe_reply
     outcome: Mapped[str | None] = mapped_column(String(24), nullable=True)
