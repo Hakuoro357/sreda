@@ -85,9 +85,13 @@ _READ_CUES: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
                 r"|(?:какие|покажи|мои|наши|все)(?:\s+\w+){0,2}\s+списк)",
                 re.IGNORECASE), frozenset({"checklists", "shopping"})),
     (re.compile(r"\bпокупк", re.IGNORECASE), frozenset({"shopping"})),
-    # память: own-data lookup — «помнишь» (2л, не «помню»); явные own-data обороты
+    # память: own-data lookup — «помнишь» (2л, не «помню»); явные own-data обороты. #319: «записи»
+    # (МНОЖ. число — «запись к врачу» ед.ч. НЕ матчится, это appointment) в запросной рамке + «что я
+    # записывал» → recall по теме показывает, а не спрашивает «где сохраняешь?».
     (re.compile(r"\b(?:как\s+меня\s+зовут|помни(?:шь|те)|что\s+я\s+(?:говорил|рассказыв)"
-                r"|что\s+у\s+меня\s+записано|мо[её]\s+имя)", re.IGNORECASE),
+                r"|что\s+у\s+меня\s+записано|мо[её]\s+имя"
+                r"|что\s+я\s+запис(?:ыва|а)л|записи\s+про"
+                r"|(?:покажи|мои|наши|все|какие)(?:\s+\w+){0,2}\s+записи)", re.IGNORECASE),
      frozenset({"memory"})),
     (re.compile(r"\bменю\b", re.IGNORECASE), frozenset({"menu"})),
     (re.compile(r"\bрецепт(?!\s+(?:счастья|успеха|жизни))", re.IGNORECASE), frozenset({"recipes"})),

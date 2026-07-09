@@ -107,3 +107,49 @@ def test_reported_command_no_write():
         p = _pol(text)
         assert p["allowed_write"] == [], (text, p)
         assert p["signals"]["write_cmd"] is False
+
+
+# ─────────── #319 sticky-by-use: «дверь открыта, пока ею пользуются» ───────────
+def _pol_sticky(text):
+    return compute_unified_policy(text, route_domains(text), sticky_memory_write=True)
+
+
+def test_sticky_opens_memory_for_bare_data():
+    """Прошлый ход записал в память → голые данные серии («бёдра 865») пишутся без confirm."""
+    p = _pol_sticky("бёдра 865")
+    assert "memory" in p["allowed_write"], p
+    assert p["signals"]["sticky_memory"] is True
+    # без sticky тот же текст — кандидат (memory НЕ в ярусе а)
+    p0 = _pol("бёдра 865")
+    assert "memory" not in p0["allowed_write"], p0
+    assert p0["signals"]["sticky_memory"] is False
+
+
+def test_sticky_kept_on_explicit_memory_command():
+    """«запиши спинки 900» мид-серии (route→memory) — дверь НЕ закрывается (не хуже голых данных)."""
+    p = _pol_sticky("запиши спинки 900")
+    assert "memory" in p["allowed_write"], p
+    assert p["signals"]["sticky_memory"] is True
+
+
+def test_sticky_precleared_on_other_domain_command():
+    """PRE-CLEAR: явная команда в ДРУГОЙ раздел («добавь молоко в покупки») серию не продолжает —
+    memory НЕ в ярусе (а) этого хода (shopping — да, по обычному яруcу а)."""
+    p = _pol_sticky("добавь молоко в покупки")
+    assert "memory" not in p["allowed_write"], p
+    assert "shopping" in p["allowed_write"], p
+    assert p["signals"]["sticky_memory"] is False
+
+
+def test_sticky_default_off():
+    """Без sticky-параметра поведение прежнее (byte-identical политика)."""
+    p = _pol("бёдра 865")
+    assert p["signals"]["sticky_memory"] is False
+
+
+def test_sticky_precleared_on_domainless_command():
+    """R2 (medium MAJOR): БЕЗ-доменная команда («поставь чайник») при открытой двери НЕ получает прямой
+    memory-write — контракт «нет домена → кандидат» sticky не ломает."""
+    p = _pol_sticky("поставь чайник")
+    assert p["signals"]["write_cmd"] is True and "memory" not in p["allowed_write"], p
+    assert p["signals"]["sticky_memory"] is False
