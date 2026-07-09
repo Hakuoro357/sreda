@@ -113,14 +113,14 @@ def try_consume_tavily(
         return QuotaDecision.USER_EXHAUSTED
     ym = year_month or _current_year_month()
     is_pg = engine.dialect.name == "postgresql"
+    # #331: изоляция через execution_options (на соединении, ДО BEGIN), а НЕ ручным `SET TRANSACTION`
+    # внутри tx — тот конфликтует с begin-событием #138 (set_config GUC первым запросом) →
+    # ActiveSqlTransaction, крэшив ход с web_search. См. usage_ledger.try_consume.
+    _engine = engine.execution_options(isolation_level="SERIALIZABLE") if is_pg else engine
 
     for attempt in range(3):
         try:
-            with engine.begin() as conn:
-                if is_pg:
-                    conn.execute(text(
-                        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
-                    ))
+            with _engine.begin() as conn:
                 # 1. Глобальный резерв в ТОЙ ЖЕ txn (SERIALIZABLE +
                 #    retry 40001 ловит phantom/write-skew у параллельных).
                 global_total = conn.execute(text("""

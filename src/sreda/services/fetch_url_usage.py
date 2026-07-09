@@ -50,12 +50,13 @@ def try_consume_fetch_url(
         return False  # без scope — fail-closed (anonymous отсечён выше по error:fetch_quota_unavailable)
     day = ymd or _current_ymd()
     is_pg = engine.dialect.name == "postgresql"
+    # #331: изоляция через execution_options (до BEGIN), а не ручным SET внутри tx — конфликтует
+    # с begin-событием #138 (set_config GUC). См. usage_ledger.try_consume.
+    _engine = engine.execution_options(isolation_level="SERIALIZABLE") if is_pg else engine
 
     for attempt in range(3):
         try:
-            with engine.begin() as conn:
-                if is_pg:
-                    conn.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+            with _engine.begin() as conn:
                 row = _upsert_fetch_one(conn, tenant_id, user_id, day, per_day_cap)
                 return row is not None
         except DBAPIError as exc:

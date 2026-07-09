@@ -83,3 +83,20 @@ def test_no_refund_contract_no_release_symbol():
 
     bad = [n for n in dir(mod) if n.startswith(("release", "refund", "decrement"))]
     assert bad == [], f"no-refund нарушен: найдены {bad}"
+
+
+def test_331_coexists_with_begin_hook_no_manual_set_transaction(engine, monkeypatch):
+    """#331: под PG-путём try_consume_fetch_url НЕ шлёт ручной SET TRANSACTION внутри tx (конфликт с
+    begin-событием #138). Форс PG-ветки на sqlite + begin-листенер (как #138) → старый код подавился бы
+    синтаксисом SET (красный), фикс через execution_options → зелёный."""
+    from sqlalchemy import event
+    @event.listens_for(engine, "begin")
+    def _first_stmt(conn):  # noqa: ANN001
+        conn.exec_driver_sql("SELECT 1")
+    monkeypatch.setattr(engine.dialect, "name", "postgresql")
+    seen: list[str] = []
+    @event.listens_for(engine, "before_cursor_execute")
+    def _cap(conn, cursor, statement, *a):  # noqa: ANN001
+        seen.append(statement)
+    assert try_consume_fetch_url(engine, "ten", "usr", 3, ymd="2026-06-30") is True
+    assert not any("SET TRANSACTION ISOLATION LEVEL" in s.upper() for s in seen)
