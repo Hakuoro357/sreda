@@ -236,6 +236,40 @@ def test_usage_ledger_try_consume_basic(engine, session):
     assert float(monthly.used) == 6
 
 
+def test_usage_ledger_331_coexists_with_begin_hook_no_manual_set_transaction(engine, session, monkeypatch):
+    """#331 регрессия: под PG-путём (is_pg=True) try_consume НЕ шлёт ручной `SET TRANSACTION ISOLATION
+    LEVEL` внутри транзакции — иначе begin-событие #138 (эмитит запрос ПЕРВЫМ) роняет Postgres
+    (ActiveSqlTransaction), крэшив ход нового юзера лендинга. Форсим PG-ветку на sqlite + вешаем
+    begin-листенер (как #138 set_config) → под СТАРЫМ кодом sqlite подавился бы синтаксисом
+    `SET TRANSACTION…` (красный); под фиксом изоляция идёт через execution_options → зелёный."""
+    from sqlalchemy import event, text as _sqltext
+    _seed_tenant(session, "t_ll331")
+
+    # begin-событие как в #138 (первый запрос транзакции)
+    @event.listens_for(engine, "begin")
+    def _emit_first_stmt(conn):  # noqa: ANN001
+        conn.exec_driver_sql("SELECT 1")
+
+    # форсим PG-ветку (тесты идут на sqlite; is_pg решает по dialect.name)
+    monkeypatch.setattr(engine.dialect, "name", "postgresql")
+
+    # ловим весь исполненный SQL — ручного SET TRANSACTION быть НЕ должно
+    seen: list[str] = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _capture(conn, cursor, statement, *a):  # noqa: ANN001
+        seen.append(statement)
+
+    from sreda.services.usage_ledger import UsageLedgerService
+    ledger = UsageLedgerService(engine)
+    # НЕ должно упасть (сосуществует с begin-хуком) и вернуть True
+    assert ledger.try_consume(
+        "t_ll331", "llm_turns", 1, [("daily", "2026-05-08", 20)])
+    assert not any("SET TRANSACTION ISOLATION LEVEL" in s.upper() for s in seen), \
+        "ручной SET TRANSACTION внутри tx конфликтует с GUC-хуком #138"
+    assert _sqltext  # импорт для читаемости диффа
+
+
 def test_usage_ledger_insert_path_quota_check(engine, session):
     """First request с delta > quota — INSERT path должен reject."""
     _seed_tenant(session, "t_ll2")
