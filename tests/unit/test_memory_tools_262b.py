@@ -141,3 +141,41 @@ def test_319_sticky_prefixes_match_real_tools(ctx):
     ]
     for out in outs:
         assert out.startswith(_MEMORY_WRITE_OK_PREFIXES), out
+
+
+def test_325_exact_replay_same_operation(ctx):
+    """#325: повтор ТОГО ЖЕ operation_id (re-execute узла на resume) → сохранённый payload, БЕЗ второй
+    строки; НОВЫЙ op_id (новый ход) → новая строка."""
+    from sreda.db.models import AssistantMemory
+    from sreda.runtime.planner.tool_runtime import ToolRuntimeContext, bind_tool_runtime
+    s, tools = ctx
+
+    def _ctx(op):
+        return ToolRuntimeContext(operation_id=op, execution_id="e", step_id="s1",
+                                  tool_name="save_episode", tenant_id="t1", user_id="u1",
+                                  turn_key="tk", channel="react", thread_id="th", origin="react")
+
+    def _n_episodes():
+        return s.query(AssistantMemory).filter(AssistantMemory.tenant_id == "t1",
+                                               AssistantMemory.tier == "episodic").count()
+
+    with bind_tool_runtime(_ctx("op-325-a")):
+        out1 = tools["save_episode"].invoke({"summary": "крылья 615"})
+        out2 = tools["save_episode"].invoke({"summary": "крылья 615"})  # re-execute того же вызова
+    assert out1.startswith("saved_episode:") and out1 == out2, (out1, out2)
+    assert _n_episodes() == 1, "повтор того же op_id НЕ создаёт вторую строку"
+    with bind_tool_runtime(_ctx("op-325-b")):  # другой ход → другой op → честная новая запись
+        out3 = tools["save_episode"].invoke({"summary": "крылья 615"})
+    assert out3.startswith("saved_episode:") and out3 != out1
+    assert _n_episodes() == 2
+
+
+def test_325_legacy_path_without_ctx_unchanged(ctx):
+    """#325: вне ReAct-ctx (легаси) — self-commit как раньше, каждый вызов пишет (идемпотентности нет)."""
+    from sreda.db.models import AssistantMemory
+    s, tools = ctx
+    tools["save_episode"].invoke({"summary": "легаси раз"})
+    tools["save_episode"].invoke({"summary": "легаси раз"})
+    n = s.query(AssistantMemory).filter(AssistantMemory.tenant_id == "t1",
+                                        AssistantMemory.tier == "episodic").count()
+    assert n >= 2  # легаси-семантика не менялась (без ctx нет ключа идемпотентности)

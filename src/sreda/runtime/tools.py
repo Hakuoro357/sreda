@@ -34,6 +34,14 @@ from sreda.db.repositories.memory import (
     MemoryRepository,
 )
 from sreda.services.embeddings import EmbeddingClient
+from sreda.services.idempotent_ops import (  # #325: exact-replay memory-записей на ReAct-пути
+    IdempotencyArgsMismatch,
+    IdempotencyInFlight,
+    IdempotencyScopeMismatch,
+    compute_args_hmac,
+    execute_idempotent_durable_op,
+)
+from sreda.runtime.planner.tool_runtime import current_tool_runtime
 from sreda.services.text_normalization import normalize_for_dedup
 
 logger = logging.getLogger(__name__)
@@ -87,8 +95,38 @@ def build_memory_tools(
     Returns a list of LangChain tool objects the caller passes to
     ``llm.bind_tools([...])``. Each tool commits on its own — we don't
     want a single bad tool call to roll back earlier successful saves
-    from the same turn."""
+    from the same turn. (#325: под ReAct-ctx write-инструменты идут через
+    exact-replay op-store — см. ``_idem_write``; commit владеет helper.)"""
     repo = MemoryRepository(session)
+
+    def _idem_write(tool_name: str, args: dict, mutate_fn):
+        """#325: exact-replay memory-записи. При resume хода узел re-execute'ится и прямая запись,
+        делившая батч с interrupt-кандидатом, вызывалась ПОВТОРНО → дубль (memory — unkeyed-семья).
+        operation_id из ToolRuntimeContext стабилен при перевыполнении (turn_key из state + step_id из
+        checkpointed AIMessage — так спроектировано в run_tools) → повтор возвращает сохранённый payload
+        БЕЗ новой строки. Вне ctx (легаси/не-ReAct) — self-commit как раньше. Валидации/error-ветки
+        держим СНАРУЖИ (не клеймят op-строку)."""
+        ctx = current_tool_runtime()
+        if ctx is None:
+            payload = mutate_fn()
+            session.commit()
+            return payload
+        from sreda.config.settings import get_settings
+        secret = get_settings().encryption_key or "dev-insecure-args-hmac"
+        try:
+            # NB: БЕЗ audit_* — react-аудит (audit_feed) memory-тип не белосписан, и memory-записи
+            # не аудитились и до #325; скоуп задачи — идемпотентность, аудит памяти = отдельное решение.
+            return execute_idempotent_durable_op(
+                session, operation_id=ctx.operation_id, tenant_id=tenant_id, user_id=user_id,
+                operation_family="memory", args_hmac=compute_args_hmac(args, secret=secret),
+                mutate_fn=mutate_fn, tool_name=tool_name)
+        except IdempotencyInFlight:
+            return "Секунду, эта запись уже в обработке — повтори, если не дошло."
+        except (IdempotencyArgsMismatch, IdempotencyScopeMismatch) as exc:
+            # внутренняя коллизия op_id (должен быть уникален на tool_call) — НЕ применяем вслепую
+            logger.error("memory _idem_write op=%s коллизия (%s) — не применяю",
+                         ctx.operation_id, type(exc).__name__)
+            return "error: внутренняя ошибка записи, попробуй ещё раз"
 
     def _has_control_chars(s: str) -> bool:
         return any(ord(ch) < 32 for ch in s)  # \r \n \t \0 и прочие C0 — ломают построчный контракт
@@ -148,22 +186,24 @@ def build_memory_tools(
                 return "error: некорректное имя категории"
             except CategoryNameConflict:
                 return f"error: не удалось определить категорию «{category}», попробуйте ещё раз"
-        try:
-            embedding = embedding_client.embed_document(text)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("save_core_fact: embedding failed: %s", exc)
-            embedding = None
-        row = repo.save(
-            tenant_id,
-            user_id,
-            tier="core",
-            content=text,
-            embedding=embedding,
-            source="agent_inferred",
-            category_id=category_id,
-        )
-        session.commit()
-        return f"saved_core:{row.id}"
+        def _mut() -> str:  # #325: эмбеддинг ВНУТРИ (replay не жжёт лишний embed-вызов)
+            try:
+                embedding = embedding_client.embed_document(text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("save_core_fact: embedding failed: %s", exc)
+                embedding = None
+            row = repo.save(
+                tenant_id,
+                user_id,
+                tier="core",
+                content=text,
+                embedding=embedding,
+                source="agent_inferred",
+                category_id=category_id,
+            )
+            return f"saved_core:{row.id}"
+
+        return _idem_write("save_core_fact", {"content": text, "category": category or ""}, _mut)
 
     @lc_tool
     def create_memory_category(name: str) -> str:
@@ -182,14 +222,16 @@ def build_memory_tools(
             return "error: имя не должно содержать переводы строк или спецсимволы"
         if normalize_for_dedup(display) == COMMON_NAME_NORMALIZED:
             return "error: имя «Общее» зарезервировано за системной категорией"
-        try:
+        def _mut() -> str:
             cat = repo.create_category(tenant_id, user_id, display)
+            return f"created:{cat.id}:{cat.name}"
+
+        try:  # #325: conflict/ValueError из мутации откатывают claim (savepoint) → честный error-текст
+            return _idem_write("create_memory_category", {"name": display}, _mut)
         except CategoryNameConflict:
             return f"error: категория «{display}» уже есть"
         except ValueError:
             return "error: некорректное имя категории"
-        session.commit()
-        return f"created:{cat.id}:{cat.name}"
 
     @lc_tool
     def save_episode(summary: str) -> str:
@@ -207,21 +249,23 @@ def build_memory_tools(
         if not text:
             return "error: empty summary"
         _log_memory_date_drift(text, "save_episode", tenant_id, user_id)
-        try:
-            embedding = embedding_client.embed_document(text)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("save_episode: embedding failed: %s", exc)
-            embedding = None
-        row = repo.save(
-            tenant_id,
-            user_id,
-            tier="episodic",
-            content=text,
-            embedding=embedding,
-            source="agent_inferred",
-        )
-        session.commit()
-        return f"saved_episode:{row.id}"
+        def _mut() -> str:  # #325: эмбеддинг ВНУТРИ (replay не жжёт лишний embed-вызов)
+            try:
+                embedding = embedding_client.embed_document(text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("save_episode: embedding failed: %s", exc)
+                embedding = None
+            row = repo.save(
+                tenant_id,
+                user_id,
+                tier="episodic",
+                content=text,
+                embedding=embedding,
+                source="agent_inferred",
+            )
+            return f"saved_episode:{row.id}"
+
+        return _idem_write("save_episode", {"summary": text}, _mut)
 
     @lc_tool
     def recall_memory(query: str, top_k: int = 3) -> str:

@@ -547,3 +547,58 @@ def test_sticky_not_opened_by_error_result(install, monkeypatch):
     assert inv_err.get("save_episode", 0) == 1          # вызван (ярус а по декларативу), вернул error
     _turn(freddie, thread="stk-e", text="бёдра 865")
     assert inv_err.get("save_episode", 0) == 1, "error:* НЕ открывает дверь (R2: успех-префикс)"
+
+
+def _mem_tools_sqlite(tmp_path, name):
+    """#325 e2e: РЕАЛЬНЫЕ memory-инструменты на sqlite (идемпотентность живёт в них)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from sreda.db.base import Base
+    from sreda.runtime.tools import build_memory_tools
+    engine = create_engine(f"sqlite:///{tmp_path / name}")
+    Base.metadata.create_all(engine)
+    s = sessionmaker(bind=engine)()
+
+    class _Emb:
+        def embed_document(self, _t):
+            return None
+
+    tools = {t.name: t for t in build_memory_tools(
+        session=s, tenant_id="t", user_id="u", embedding_client=_Emb())}
+    return s, tools
+
+
+@pytest.mark.parametrize("resume_text", ["да", "нет"])
+def test_e2e_325_no_duplicate_on_resume(install, monkeypatch, tmp_path, resume_text):
+    """#325 e2e (чеклист issue): прямая memory-запись ДЕЛИТ БАТЧ с interrupt-кандидатом → пауза →
+    resume («да» И «нет») → в памяти РОВНО ОДНА строка (re-execute узла реплеит запись по op_id,
+    не дублирует)."""
+    from sreda.db.models import AssistantMemory
+    s, mem_tools = _mem_tools_sqlite(tmp_path, f"m325-{resume_text}.db")
+
+    def _n():
+        return s.query(AssistantMemory).filter(AssistantMemory.tenant_id == "t",
+                                               AssistantMemory.tier == "episodic").count()
+
+    batch = AIMessage(content="", tool_calls=[  # ОДИН AIMessage: запись + кандидат
+        {"name": "save_episode", "args": {"summary": "вес: крылья 615"}, "id": "m1"},
+        {"name": "add_task", "args": {"q": "показать вес"}, "id": "m2"}])
+    freddie = _Chat("freddie", responses=[batch, AIMessage(content="Готово.")])
+    inv = install(deepseek=_Chat("ds"))
+
+    def _clean_task(q: str = "") -> str:  # мок БЕЗ **kw: поле kw=None в схеме ломает ре-валидацию
+        inv["add_task"] = inv.get("add_task", 0) + 1  # внутри confirm-обёртки (харнесс-артефакт)
+        return "add_task-ok"
+
+    _task_tool = StructuredTool.from_function(func=_clean_task, name="add_task", description="d")
+    monkeypatch.setattr(react_loop, "build_slice_tools", lambda *a, **k: [
+        _mk_tool(n, inv) for n in (_TASK_TOOLS + _WEB_TOOLS) if n != "add_task"]
+        + [_task_tool, mem_tools["save_episode"]])
+    # декларатив → memory ярус (а) → save прямой; add_task без сигнала → кандидат → interrupt
+    r1 = _turn(freddie, thread=f"e325{resume_text}", text="меня зовут Борис, взвешиваю курицу")
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    assert _n() == 1, "прямая запись из батча исполнена ДО паузы — одна строка"
+    _turn(freddie, thread=f"e325{resume_text}", text=resume_text)  # resume → re-execute узла
+    assert _n() == 1, f"resume «{resume_text}»: re-execute РЕПЛЕИТ запись по op_id — дубля НЕТ (#325)"
+    assert inv.get("add_task", 0) == (1 if resume_text == "да" else 0)  # кандидат по своему исходу
