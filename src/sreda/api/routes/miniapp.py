@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
 from sreda.config.settings import get_settings
-from sreda.db.session import tenant_session
+from sreda.db.session import privileged_session, tenant_session
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.repositories.memory import (
     CategoryConfirmMismatch,
@@ -478,6 +478,19 @@ async def get_tenant_db(
     enter/exit в РАЗНЫХ контекстах → reset падает ValueError. Async-gen идёт в
     том же таске событийного цикла → set/reset в одном контексте."""
     with tenant_session(ctx.tenant_id) as session:
+        yield session
+
+
+async def get_channel_link_db(
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> AsyncGenerator[Session, None]:
+    """#138 R2 M4: channel-link роуты (start/consume/cancel) — КРОСС-ТЕНАНТНАЯ
+    identity-операция: consume_link ищет токен глобально по хешу, читает source_user
+    ЧУЖОГО тенанта, пишет audit_log. Под tenant_session(ctx) при Ф5 это невидимо/
+    запрещено RLS. Идём под privileged("channel-link") (maintenance-роль). Async —
+    та же причина, что get_tenant_db (ContextVar seam). Auth сохраняется (ctx нужен
+    роутам для source-тенанта/rate-limit)."""
+    with privileged_session("channel-link") as session:
         yield session
 
 
@@ -2159,7 +2172,7 @@ def _consume_outcome_dict(outcome) -> dict:
 @router.post("/api/v1/channel-link/start")
 async def channel_link_start(
     request: Request,
-    session: Session = Depends(get_tenant_db),
+    session: Session = Depends(get_channel_link_db),
 ):
     """Initiate a channel-linking attempt. Юзер сейчас в source channel
     (mini-app), хочет привязать opposite channel.
@@ -2291,7 +2304,7 @@ async def channel_link_start(
 @router.post("/api/v1/channel-link/consume")
 async def channel_link_consume(
     request: Request,
-    session: Session = Depends(get_tenant_db),
+    session: Session = Depends(get_channel_link_db),
 ):
     """Consume a linking token. Юзер сейчас в target channel mini-app
     (открыл deep-link от source mini-app), backend получает target initData
@@ -2351,7 +2364,7 @@ async def channel_link_consume(
 @router.post("/api/v1/channel-link/cancel")
 async def channel_link_cancel(
     request: Request,
-    session: Session = Depends(get_tenant_db),
+    session: Session = Depends(get_channel_link_db),
 ):
     """Invalidate a pending token from the target-side mini-app."""
     settings = get_settings()

@@ -1,11 +1,11 @@
 """#138 Ф3-c — мета-тест дрейфа RLS-классификации (fail-closed гейт).
 
-Каждая таблица Base.metadata обязана быть классифицирована в миграции 0082 РОВНО
-в одном из множеств: TENANT_TABLES (RLS-изоляция по tenant_id) / ROOT_TABLES
-(tenants) / NO_RLS_TABLES (осознанное исключение). Новая таблица без классификации
-= красный тест → «классифицируй в 0082» (или добавь NO_RLS-исключение осознанно).
-Плюс санити: у каждой TENANT-таблицы реально есть колонка tenant_id; опечатка в
-имени (несуществующая таблица в списке) тоже ловится.
+R1 M8-фикс: реестр — источник истины в APP-модуле ``sreda.db.rls_registry`` (НЕ в
+применённой миграции 0082, иначе добавление имени туда не создавало политику →
+несамоисполнимо). Каждая таблица Base.metadata обязана быть классифицирована РОВНО
+в одном множестве реестра. Новая таблица без классификации = красный → «классифицируй
+в rls_registry + напиши миграцию ENABLE RLS». Санити: TENANT-таблица имеет tenant_id;
+опечатка (мёртвое имя) ловится. Parity реестр ⇔ pg_policies на реальном PG — в red-suite.
 """
 from __future__ import annotations
 
@@ -35,16 +35,27 @@ def _metadata_tables():
     return Base.metadata.tables
 
 
-def test_rls_registry_covers_all_tables_exactly_once():
-    """(а)+(б): каждая таблица метадаты ∈ ровно одному множеству; списки без мёртвых имён."""
-    mig = _load_migration_0082()
-    tenant = set(mig.TENANT_TABLES)
-    root = set(mig.ROOT_TABLES)
-    no_rls = set(mig.NO_RLS_TABLES)
+def test_migration_0082_snapshot_matches_registry():
+    """0082 держит ИСТОРИЧЕСКИЙ снапшот; на МОМЕНТ 0082 он обязан совпадать с
+    app-реестром (иначе реальные политики разошлись бы с источником истины).
+    Будущие таблицы добавляются в реестр + НОВОЙ миграцией — тогда снапшот 0082
+    станет подмножеством реестра; здесь (пока новых RLS-миграций нет) — равенство."""
+    from sreda.db import rls_registry as reg
 
-    # Дубликаты внутри списков (кортеж мог задвоить имя).
-    assert len(mig.TENANT_TABLES) == len(tenant), "дубликаты в TENANT_TABLES (0082)"
-    assert len(mig.NO_RLS_TABLES) == len(no_rls), "дубликаты в NO_RLS_TABLES (0082)"
+    mig = _load_migration_0082()
+    assert set(mig.TENANT_TABLES) == reg.TENANT_TABLES, "0082 TENANT-снапшот разошёлся с rls_registry"
+    assert set(mig.ROOT_TABLES) == reg.ROOT_TABLES
+    assert set(mig.NO_RLS_TABLES) == reg.NO_RLS_TABLES
+    assert set(mig.IDENTITY_INSERT_TABLES) == reg.IDENTITY_INSERT_TABLES
+
+
+def test_rls_registry_covers_all_tables_exactly_once():
+    """(а)+(б): каждая таблица метадаты ∈ ровно одному множеству app-реестра; без мёртвых имён."""
+    from sreda.db import rls_registry as reg
+
+    tenant = set(reg.TENANT_TABLES)
+    root = set(reg.ROOT_TABLES)
+    no_rls = set(reg.NO_RLS_TABLES)
 
     # Ровно одно множество на таблицу — пересечения пусты.
     assert not tenant & root, f"таблицы и в TENANT, и в ROOT: {sorted(tenant & root)}"
@@ -70,10 +81,10 @@ def test_rls_registry_covers_all_tables_exactly_once():
 
 def test_tenant_tables_have_tenant_id_column():
     """(в): изоляционная политика бессмысленна без колонки tenant_id."""
-    mig = _load_migration_0082()
+    from sreda.db import rls_registry as reg
     tables = _metadata_tables()
     missing = sorted(
-        t for t in mig.TENANT_TABLES
+        t for t in reg.TENANT_TABLES
         if t in tables and "tenant_id" not in tables[t].columns
     )
     assert not missing, (

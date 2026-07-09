@@ -53,10 +53,13 @@ templates.env.filters["usd"] = _fmt_usd
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-def _get_session():
+async def _get_session():
     # #138 Ф2: админ-дашборд видит ВСЕ тенанты (кросс-тенант) → privileged("admin").
     # Без обёртки под Ф3 RLS все запросы дашборда под ролью app вернут 0 строк (fail-closed).
-    # (refresh_overview :182 — отдельный кросс-тенантный снапшот #292, тоже privileged, treatment overview_snapshot.)
+    # 🔴 ASYNC ОБЯЗАТЕЛЬНО (R1 MAJOR): privileged_session ставит/сбрасывает ContextVar токенами;
+    # sync-gen FastAPI-зависимость гоняется в threadpool (anyio КОПИРУЕТ контекст) → enter/exit в
+    # разных контекстах → reset падает "Token created in a different Context" на КАЖДОМ запросе.
+    # Тот же урок, что get_tenant_db в mini-app (g-073).
     with privileged_session("admin") as session:
         yield session
 
@@ -179,7 +182,7 @@ async def admin_refresh_snapshot(
 
     _audit_admin_view(session, "admin.dashboard.refreshed", principal.actor_id, request)
     ok = await asyncio.to_thread(
-        ov.refresh_overview, get_session_factory(), get_settings()
+        ov.refresh_overview, None, get_settings()  # #138 R2 M7: None → privileged(admin)
     )
     suffix = "?refresh=err" if not ok else ""
     return RedirectResponse(

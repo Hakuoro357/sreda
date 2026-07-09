@@ -817,7 +817,7 @@ async def run_overview_refresh_loop() -> None:
         while True:
             try:
                 await asyncio.to_thread(
-                    refresh_overview, get_session_factory(), get_settings()
+                    refresh_overview, None, get_settings()  # #138 R2 M7: None → privileged(admin)
                 )
             except Exception:  # noqa: BLE001 — луп живёт при любых сбоях
                 logger.exception("overview refresh loop: iteration failed")
@@ -830,22 +830,34 @@ async def run_overview_refresh_loop() -> None:
 
 def refresh_overview(session_factory, settings) -> bool:
     """One refresh pass. NEVER raises (the loop must survive anything);
-    returns True on success for logging/tests."""
+    returns True on success for logging/tests.
+
+    #138 R2 M7: прод-путь (session_factory=None) идёт под
+    ``privileged_session("admin")`` — снапшот КРОСС-ТЕНАНТНЫЙ (агрегаты по всем
+    семьям) + пишет admin_dashboard_snapshots (app-гранты отозваны Ф1). Под app-роль
+    при Ф5 читал бы 0 строк и упирался в REVOKE. Тесты передают свою session_factory
+    (sqlite, RLS инертен) — обратная совместимость."""
+    from contextlib import contextmanager
+
+    from sreda.db.session import privileged_session
+
+    if session_factory is None:
+        cm = privileged_session("admin")
+    else:
+        @contextmanager
+        def _cm():
+            session = session_factory()
+            try:
+                yield session
+            finally:
+                session.close()
+        cm = _cm()
+
     try:
-        session = session_factory()
-    except Exception:  # noqa: BLE001
-        logger.warning("overview_snapshot: session open failed", exc_info=True)
-        return False
-    try:
-        payload = compute_overview(session, settings)
-        store_snapshot(session, KEY_OVERVIEW, payload)
-        return True
+        with cm as session:
+            payload = compute_overview(session, settings)
+            store_snapshot(session, KEY_OVERVIEW, payload)  # сам коммитит
+            return True
     except Exception:  # noqa: BLE001
         logger.warning("overview_snapshot: refresh failed", exc_info=True)
-        try:
-            session.rollback()
-        except Exception:  # noqa: BLE001
-            pass
         return False
-    finally:
-        session.close()

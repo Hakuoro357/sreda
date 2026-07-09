@@ -11,6 +11,19 @@ base в колонке thread_id → durable-ключ восстанавлива
 Самодостаточность: секрет берём из os.environ (НЕ импортируем app-код — миграции
 самодостаточны). Collision-abort: один base у двух разных tenant_id → RuntimeError (не молча).
 
+Лок-профиль (M10, прод-накат под трафиком). react_checkpoint /
+react_checkpoint_write — крупные (весь шифрованный диалог ReAct). Поэтому:
+  * ADD COLUMN nullable без DEFAULT = catalog-only, мгновенно (короткий ACCESS
+    EXCLUSIVE под lock_timeout).
+  * бэкфилл — точечные UPDATE по durable-ключу (thread_id — часть PK, индексирован),
+    берут ROW EXCLUSIVE, чтение/чужие строки не блокируются.
+  * индексы под RLS-фильтр — ``CREATE INDEX CONCURRENTLY`` (обычный build на
+    крупной таблице держал бы ACCESS EXCLUSIVE весь скан). Строим ПОСЛЕ бэкфилла,
+    чтобы не поддерживать индекс во время bulk-UPDATE.
+CONCURRENTLY нельзя в транзакции → индексы в ``op.get_context().autocommit_block()``
+(env.py гонит прогон одной транзакцией; блок временно её коммитит → миграция не
+атомарна, но ``IF NOT EXISTS`` делает повторный прогон безопасным).
+
 PG-guard: unit-тесты строят схему через Base.metadata.create_all (SQLite), прод = PG —
 на не-PG миграция no-op (прецедент 0078/0080).
 """
@@ -72,10 +85,14 @@ def upgrade() -> None:
     if not secret:
         raise RuntimeError("0081: бэкфилл требует SREDA_ENCRYPTION_KEY в окружении")
 
-    # 1. Колонки (nullable — легаси/orphan остаются NULL) + индексы под RLS-фильтр.
+    # Не висеть на локах под трафиком (ограничивает ОЖИДАНИЕ; удержание
+    # минимизировано CONCURRENTLY-индексами ниже).
+    op.execute("SET lock_timeout = '5s'")
+
+    # 1. Колонки (nullable — легаси/orphan остаются NULL). ADD COLUMN без DEFAULT
+    #    = catalog-only, мгновенно. Индексы — ниже, CONCURRENTLY, после бэкфилла.
     for table in _TABLES:
         op.add_column(table, sa.Column("tenant_id", sa.String(64), nullable=True))
-        op.create_index(_INDEXES[table], table, ["tenant_id"])
 
     # 2. Data-бэкфилл через мост react_turn_trace (tenant_id + сырой base).
     rows = bind.execute(
@@ -99,7 +116,16 @@ def upgrade() -> None:
         bind.execute(upd_cp, {"t": tenant, "d": durable})
         bind.execute(upd_w, {"t": tenant, "d": durable})
 
-    # 3. Orphan-preflight: NULL-строки остаются (maintenance-only под RLS), НЕ удаляем.
+    # 3. Индексы под RLS-фильтр — CONCURRENTLY (крупные таблицы; обычный build
+    #    держал бы ACCESS EXCLUSIVE весь скан). Вне транзакции.
+    with op.get_context().autocommit_block():
+        for table in _TABLES:
+            op.execute(
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_INDEXES[table]} "
+                f"ON {table} (tenant_id)"
+            )
+
+    # 4. Orphan-preflight: NULL-строки остаются (maintenance-only под RLS), НЕ удаляем.
     n_cp = bind.execute(
         sa.text("SELECT count(*) FROM react_checkpoint WHERE tenant_id IS NULL")
     ).scalar()
@@ -115,6 +141,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     if op.get_bind().dialect.name != "postgresql":
         return
+    op.execute("SET lock_timeout = '5s'")
     for table in reversed(_TABLES):
-        op.drop_index(_INDEXES[table], table_name=table)
+        with op.get_context().autocommit_block():
+            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEXES[table]}")
         op.drop_column(table, "tenant_id")

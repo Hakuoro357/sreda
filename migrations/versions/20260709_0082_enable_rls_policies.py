@@ -128,6 +128,13 @@ def upgrade() -> None:
     if bind.dialect.name != "postgresql":
         return  # RLS/политики — только Postgres; SQLite unit-DB не поддерживает
 
+    # Лок-профиль (M10). ENABLE RLS + CREATE POLICY = короткий ACCESS EXCLUSIVE
+    # на каталог, БЕЗ скана таблицы (ни строки не читается) — сами по себе
+    # дёшевы, CONCURRENTLY тут неприменим. Единственный риск — очередь за
+    # долгой транзакцией на ~56 таблицах; lock_timeout не даёт зависнуть в
+    # ожидании (упадём и повторим, а не застопорим прод).
+    op.execute("SET lock_timeout = '5s'")
+
     # 1. Тенантные таблицы: изоляция app + allow-all maintenance.
     for t in TENANT_TABLES:
         # БЕЗ FORCE — owner обходит (миграции / легаси-DSN до Ф5).
@@ -172,6 +179,8 @@ def downgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name != "postgresql":
         return
+
+    op.execute("SET lock_timeout = '5s'")
 
     # Зеркально: сперва identity-политики, потом ROOT, потом тенантные.
     for t in reversed(IDENTITY_INSERT_TABLES):

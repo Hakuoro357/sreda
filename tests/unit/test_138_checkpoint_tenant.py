@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -42,7 +43,9 @@ def db():
 @pytest.fixture()
 def saver(db):
     SF, _ = db
-    return EncryptedSqlCheckpointSaver(session_factory=SF)
+    # owner_session_factory=SF: в юнит-тестах (sqlite без RLS) привилегированный owner-lookup
+    # cross-check'а ходит в ту же тестовую БД (в проде None → реальный privileged_session("gc")).
+    return EncryptedSqlCheckpointSaver(session_factory=SF, owner_session_factory=SF)
 
 
 @pytest.fixture()
@@ -165,6 +168,65 @@ def test_put_same_tenant_ok_and_backfills_null(saver, _no_tenant_ctx):
         tenants = [r[0] for r in s.execute(text(
             "select tenant_id from react_checkpoint order by checkpoint_id")).all()]
     assert tenants == ["tenant_A", "tenant_A"]
+
+
+# --- cross-check НЕ слепнет под RLS (владение читается ВНЕ app-скоупа) -------
+
+def test_cross_check_survives_rls_blind_app_session(db):
+    """Ф5-регрессия (R1 MAJOR): app-сессия записи под RLS НЕ видит чужой чекпоинт, но
+    cross-check ВСЁ РАВНО ловит mismatch, т.к. владение читается привилегированной сессией.
+
+    Две РАЗНЫЕ БД моделируют RLS-слепоту: app-БД пуста (чужая строка «отфильтрована» ролью
+    sreda_app), owner-БД содержит чужой tenant_B (её видит maintenance-роль). Если бы lookup
+    шёл через записывающую app-сессию (как в баге) — existing вернулся бы None и подмена
+    прошла бы молча. Тест краснеет при откате фикса."""
+    app_SF, _ = db
+    fd, opath = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    oeng = create_engine(f"sqlite:///{opath}")
+    Base.metadata.create_all(oeng)
+    owner_SF = sessionmaker(bind=oeng, autoflush=False, autocommit=False)
+    try:
+        # заселяем owner-БД чужим тредом tenant_B (тот же thread_id по умолчанию)
+        seeder = EncryptedSqlCheckpointSaver(session_factory=owner_SF, owner_session_factory=owner_SF)
+        _put_as(seeder, "tenant_B", _cfg(), _ckpt("00000000-0000-0000-0000-0000000000b1", "чужое"))
+        # saver ПИШЕТ в пустую app-БД, а владение проверяет через owner-БД (привилегированный путь)
+        saver = EncryptedSqlCheckpointSaver(session_factory=app_SF, owner_session_factory=owner_SF)
+        with pytest.raises(RuntimeError, match="tenant mismatch"):
+            _put_as(saver, "tenant_A", _cfg(), _ckpt("00000000-0000-0000-0000-0000000000a1"))
+        # cross-check сработал ДО upsert'а — в app-БД ничего не записано
+        with app_SF() as s:
+            assert s.execute(text("select count(*) from react_checkpoint")).scalar() == 0
+    finally:
+        oeng.dispose()
+        try:
+            os.unlink(opath)
+        except OSError:
+            pass
+
+
+def test_owner_lookup_goes_through_privileged_session(db, monkeypatch):
+    """Прод-путь (owner_session_factory не задан) читает владение через privileged_session('gc'),
+    а НЕ через записывающую app-сессию (иначе под RLS Ф5 cross-check ослеп бы). Подменяем
+    privileged_session на тестовую БД и фиксируем, что он вызван с reason='gc'."""
+    import sreda.runtime.react_checkpoint_saver as mod
+
+    SF, _ = db
+    calls = []
+
+    @contextmanager
+    def fake_priv(reason):
+        calls.append(reason)
+        s = SF()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    monkeypatch.setattr(mod, "privileged_session", fake_priv)
+    saver = EncryptedSqlCheckpointSaver(session_factory=SF)  # owner_sf=None → прод-путь
+    _put_as(saver, "tenant_A", _cfg(), _ckpt("00000000-0000-0000-0000-0000000000c1"))
+    assert calls == ["gc"]  # владение проверено ИМЕННО привилегированной сессией
 
 
 # --- деривация durable-ключа (бэкфилл 0081 vs react_loop) -------------------

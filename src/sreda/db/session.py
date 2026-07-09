@@ -29,6 +29,8 @@ PRIVILEGED_REASONS: frozenset[str] = _IDENTITY_REASONS | frozenset({
     "broadcast",      # рассылки
     "migration-data",  # data-миграции
     "queue-dispatch",  # консьюмер очереди message_jobs (claim/mark/heartbeat — кросс-тенант)
+    "channel-link",   # связывание каналов (#138 R2 M4): токен ищется глобально по хешу,
+                      # source_user чужого тенанта, audit_log — кросс-тенантная identity-операция
 })
 
 

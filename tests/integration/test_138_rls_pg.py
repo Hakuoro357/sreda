@@ -401,3 +401,32 @@ def test_app_react_checkpoint_foreign_thread_invisible(engines):
             ).scalar_one()
             assert own == 1, "свой чекпоинт обязан быть виден"
             assert foreign == 0, "чекпоинт чужого тенанта ПРОТЁК (диалог не закрыт)"
+
+
+def test_pg_policies_parity_with_app_registry(engines):
+    """#138 R1 M8: parity реестр ⇔ факт БД. Каждая TENANT-таблица app-реестра ОБЯЗАНА
+    иметь на реальном PG политику p_{t}_tenant И relrowsecurity=true; NO_RLS-таблица —
+    НЕ иметь RLS. Ловит «добавил в rls_registry, забыл миграцию ENABLE RLS» (и наоборот)."""
+    from sreda.db import rls_registry as reg
+
+    owner = engines["owner"]
+    with owner.connect() as c:
+        rls_on = {
+            r[0] for r in c.execute(text(
+                "SELECT relname FROM pg_class WHERE relrowsecurity = true"
+            ))
+        }
+        policied = {
+            r[0] for r in c.execute(text(
+                "SELECT tablename FROM pg_policies WHERE policyname LIKE 'p\_%\_tenant'"
+            ))
+        }
+
+    tenant = set(reg.TENANT_TABLES)
+    # (1) каждая tenant-таблица: RLS включён + есть tenant-политика.
+    assert tenant - rls_on == set(), f"TENANT-таблицы БЕЗ ENABLE RLS на PG: {sorted(tenant - rls_on)}"
+    assert tenant - policied == set(), f"TENANT-таблицы БЕЗ политики p_*_tenant: {sorted(tenant - policied)}"
+    # (2) NO_RLS-таблицы реально без RLS (осознанное исключение не должно молча включиться).
+    assert reg.NO_RLS_TABLES & rls_on == set(), (
+        f"NO_RLS-таблицы с внезапным ENABLE RLS: {sorted(reg.NO_RLS_TABLES & rls_on)}"
+    )
