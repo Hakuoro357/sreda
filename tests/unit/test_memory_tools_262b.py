@@ -179,3 +179,36 @@ def test_325_legacy_path_without_ctx_unchanged(ctx):
     n = s.query(AssistantMemory).filter(AssistantMemory.tenant_id == "t1",
                                         AssistantMemory.tier == "episodic").count()
     assert n >= 2  # легаси-семантика не менялась (без ctx нет ключа идемпотентности)
+
+
+def test_325_replay_create_category_and_fact_with_category(ctx):
+    """#325 R2 (субагент MINOR-3): replay остальных write-инструментов. Тот же op_id → 1 строка/1
+    категория, идентичный payload; резолв категории ВНУТРИ мутации (replay его не запускает —
+    иначе побочный эффект утекал бы на replay/error-путях, R1 оба Codex)."""
+    from sreda.db.models import AssistantMemory
+    from sreda.runtime.planner.tool_runtime import ToolRuntimeContext, bind_tool_runtime
+    s, tools = ctx
+
+    def _ctx(op, tool):
+        return ToolRuntimeContext(operation_id=op, execution_id="e", step_id="s1",
+                                  tool_name=tool, tenant_id="t1", user_id="u1",
+                                  turn_key="tk", channel="react", thread_id="th", origin="react")
+
+    # create_memory_category: replay того же op → одна категория, тот же payload
+    with bind_tool_runtime(_ctx("op-325-cat", "create_memory_category")):
+        c1 = tools["create_memory_category"].invoke({"name": "рыбалка325"})
+        c2 = tools["create_memory_category"].invoke({"name": "рыбалка325"})
+    assert c1.startswith("created:") and c1 == c2, (c1, c2)
+    cats = [c for c in _repo(s).list_categories("t1", "u1") if "рыбалка325" in c.name]
+    assert len(cats) == 1, "replay НЕ создаёт вторую категорию"
+
+    # save_core_fact С НОВОЙ категорией: replay → один факт, ОДНА категория (резолв не пере-запущен)
+    with bind_tool_runtime(_ctx("op-325-fact", "save_core_fact")):
+        f1 = tools["save_core_fact"].invoke({"content": "люблю окуней", "category": "охота325"})
+        f2 = tools["save_core_fact"].invoke({"content": "люблю окуней", "category": "охота325"})
+    assert f1.startswith("saved_core:") and f1 == f2, (f1, f2)
+    facts = s.query(AssistantMemory).filter(AssistantMemory.tenant_id == "t1",
+                                            AssistantMemory.tier == "core").count()
+    assert facts == 1, "replay НЕ создаёт второй факт"
+    cats2 = [c for c in _repo(s).list_categories("t1", "u1") if "охота325" in c.name]
+    assert len(cats2) == 1, "replay НЕ создаёт вторую категорию через резолв"

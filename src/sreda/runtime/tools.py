@@ -126,6 +126,15 @@ def build_memory_tools(
             # внутренняя коллизия op_id (должен быть уникален на tool_call) — НЕ применяем вслепую
             logger.error("memory _idem_write op=%s коллизия (%s) — не применяю",
                          ctx.operation_id, type(exc).__name__)
+            try:  # R2 (субагент MINOR-2): тот же best-effort алерт, что у близнеца #163 в react_loop
+                from sreda.services.admin_alerts import send_admin_alert
+                send_admin_alert(
+                    "WARNING", "#163 idempotent operation_id collision",
+                    f"op={ctx.operation_id} family=memory: запись НЕ применена "
+                    f"({type(exc).__name__}); operation_id обязан быть уникален на tool_call.",
+                    dedupe_key="idem_collision:memory")
+            except Exception:  # noqa: BLE001
+                logger.warning("send_admin_alert не доставил idempotent-collision (memory)")
             return "error: внутренняя ошибка записи, попробуй ещё раз"
 
     def _has_control_chars(s: str) -> bool:
@@ -178,15 +187,14 @@ def build_memory_tools(
         if not text:
             return "error: empty content"
         _log_memory_date_drift(text, "save_core_fact", tenant_id, user_id)
-        category_id = None
-        if category:
-            try:
-                category_id = _resolve_or_create_category(category)
-            except ValueError:
-                return "error: некорректное имя категории"
-            except CategoryNameConflict:
-                return f"error: не удалось определить категорию «{category}», попробуйте ещё раз"
-        def _mut() -> str:  # #325: эмбеддинг ВНУТРИ (replay не жжёт лишний embed-вызов)
+
+        def _mut() -> str:
+            # #325 R2 (оба Codex + субагент-проба): резолв/создание КАТЕГОРИИ — ВНУТРИ мутации.
+            # Снаружи побочный эффект утекал на replay/error-путях op-store (висящая pending-категория
+            # коммитилась чужим commit'ом; replay после удаления воскресил бы её). Внутри — savepoint
+            # откатывает категорию ВМЕСТЕ с claim'ом, а replay резолв вообще не запускает.
+            category_id = _resolve_or_create_category(category) if category else None
+            # эмбеддинг тоже ВНУТРИ (replay не жжёт лишний embed-вызов)
             try:
                 embedding = embedding_client.embed_document(text)
             except Exception as exc:  # noqa: BLE001
@@ -203,7 +211,12 @@ def build_memory_tools(
             )
             return f"saved_core:{row.id}"
 
-        return _idem_write("save_core_fact", {"content": text, "category": category or ""}, _mut)
+        try:  # ошибки категории из мутации → те же честные тексты, что раньше (claim откачен savepoint'ом)
+            return _idem_write("save_core_fact", {"content": text, "category": category or ""}, _mut)
+        except ValueError:
+            return "error: некорректное имя категории"
+        except CategoryNameConflict:
+            return f"error: не удалось определить категорию «{category}», попробуйте ещё раз"
 
     @lc_tool
     def create_memory_category(name: str) -> str:
