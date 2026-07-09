@@ -391,6 +391,7 @@ class BillingService:
                 PaymentOrderItem(
                     id=f"poi_{uuid4().hex[:24]}",
                     payment_order_id=order.id,
+                    tenant_id=order.tenant_id,  # #138 Ф3-a: денорм из родителя
                     plan_id=plan.id,
                     amount_rub=plan.price_rub * quantity,
                     quantity=quantity,

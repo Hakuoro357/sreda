@@ -27,10 +27,12 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text as sql_text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -85,6 +87,9 @@ class Checklist(Base):
             postgresql_where=sql_text("normalized_title_hash IS NOT NULL"),
             sqlite_where=sql_text("normalized_title_hash IS NOT NULL"),
         ),
+        # #138 Ф3-a: нужен composite-FK детей (id, tenant_id) — id и так PK,
+        # constraint формальный.
+        UniqueConstraint("id", "tenant_id", name="uq_checklists_id_tenant"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -133,11 +138,24 @@ class ChecklistItem(Base):
             "ix_checklist_items_status",
             "checklist_id", "status", "position",
         ),
+        # #138 Ф3-a: composite-FK гарантирует совпадение tenant_id с родителем.
+        ForeignKeyConstraint(
+            ["checklist_id", "tenant_id"],
+            ["checklists.id", "checklists.tenant_id"],
+            ondelete="CASCADE",
+            name="fk_checklist_items_parent_tenant",
+        ),
+        Index("ix_checklist_items_tenant", "tenant_id"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     checklist_id: Mapped[str] = mapped_column(
         ForeignKey("checklists.id", ondelete="CASCADE"), nullable=False,
+    )
+    # #138 Ф3-a: денорм из родителя — RLS-скоуп; composite-FK гарантирует
+    # совпадение с родителем.
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id"), nullable=False,
     )
 
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

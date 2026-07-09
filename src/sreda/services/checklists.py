@@ -384,6 +384,7 @@ class ChecklistService:
             item = ChecklistItem(
                 id=f"clitem_{uuid4().hex[:24]}",
                 checklist_id=cl.id,
+                tenant_id=cl.tenant_id,  # #138 Ф3-a: денорм из родителя
                 position=position,
                 title=title,
                 status="pending",
@@ -602,13 +603,14 @@ class ChecklistService:
         )
         next_pos = (max_pos[0] + 1) if max_pos else 0
 
-        # Title родительского списка для embedding input (Phase 2).
-        # Если list_id не находится — пропускаем embedding, items без
-        # него по-прежнему создадутся (graceful).
+        # Родительский список: tenant_id для денорма (#138 Ф3-a) + title
+        # для embedding input (Phase 2). Если list_id не находится —
+        # пропускаем embedding; вставка items всё равно упадёт на
+        # NOT NULL/FK (родитель обязателен).
+        parent = self.session.get(Checklist, list_id)
         checklist_title: str | None = None
-        if self._embedding_client is not None:
-            parent = self.session.get(Checklist, list_id)
-            checklist_title = parent.title if parent else None
+        if self._embedding_client is not None and parent is not None:
+            checklist_title = parent.title
 
         now = _utcnow()
         added: list[ChecklistItem] = []
@@ -623,6 +625,8 @@ class ChecklistService:
             item = ChecklistItem(
                 id=f"clitem_{uuid4().hex[:24]}",
                 checklist_id=list_id,
+                # #138 Ф3-a: денорм из родителя
+                tenant_id=parent.tenant_id if parent is not None else None,
                 position=next_pos + offset,
                 title=clean_title,
                 status="pending",
