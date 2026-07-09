@@ -283,3 +283,11 @@ def test_turn_window_r4_noun_command_scopes():
     assert not text_mentions_time(_win("Напомни об этом 8 числа. Это напоминание про встречу в 10"))
     # ни глагола, ни команды → fallback весь текст (вызов из контекста)
     assert text_mentions_time(_win("нужно напоминание на завтра в 10"))
+
+
+def test_turn_window_r4_imperfective_scopes():
+    """R4 fold-in (субагент MINOR): «напоминай(те)» — тоже глагол намерения, скоупит."""
+    def _win(text):
+        return react_loop._turn_time_window_text([HumanMessage(content=text)])
+    assert not text_mentions_time(_win("Встреча завтра в 10. Напоминай мне об этом каждый день"))
+    assert text_mentions_time(_win("Напоминай мне каждый день в 9 утра пить таблетки"))
