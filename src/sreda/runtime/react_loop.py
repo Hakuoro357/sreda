@@ -1904,7 +1904,10 @@ def _declined_reply(question: str) -> str:
     return f"Отменила, не трогаю «{m.group(1)}»." if m else "Отменила, ничего не делаю."
 
 
-_REMIND_SENT_RE = re.compile(r"напомн|напомин", re.IGNORECASE)  # #288 R2: предложения ПРО напоминание
+# #288 R3 (Codex high R2): только ГЛАГОЛ (напомни/напомните/напомнить — стем «напомн»); существительное
+# «напоминание» (стем «напомин») НЕ скоупит — «Это напоминание про встречу в 10» протаскивало время
+# события. Noun-only тексты («поставь напоминание на 19.30») уходят в fallback = весь текст.
+_REMIND_SENT_RE = re.compile(r"напомн", re.IGNORECASE)  # стем глагола; у «напоминание» стем «напомин» — не матчится
 
 
 def _turn_time_window_text(messages: Any) -> str:
@@ -1925,7 +1928,9 @@ def _turn_time_window_text(messages: Any) -> str:
     if last_h < 0:
         return ""
     human = str(getattr(msgs[last_h], "content", "") or "")
-    sents = [s.strip() for s in re.split(r"[.!?;\n]+", human) if s.strip()]
+    # R3 (субагент R2 MAJOR-1): точка МЕЖДУ цифрами — «9.30»/«08.07», НЕ граница предложения (иначе
+    # окно рвало «напомни про рейс 9.30» → «напомни про рейс 9» → ложный отказ на названном времени).
+    sents = [s.strip() for s in re.split(r"[!?;\n]+|\.(?!\d)", human) if s.strip()]
     remind_sents = [s for s in sents if _REMIND_SENT_RE.search(s)]
     parts = [" ".join(remind_sents) if remind_sents else human]
     for m in msgs[last_h + 1:]:
