@@ -755,6 +755,14 @@ class ReactState(MessagesState):
     # compute_allowed_domains; resume читает из чекпойнта. Тип Optional — на resume старого чекпойнта = None.
     router_allowed_read_domains: list[str] | None
     router_allowed_write_domains: list[str] | None
+    # #285 Фаза B (B2b): ход идёт ЕДИНЫМ путём execute (канареечный тенант) → bind-сайты применяют
+    # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
+    # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
+    unified_execute: bool
+    # #stale (канарейка, реальный баг): протухшая пауза + НОВОЕ сообщение → директива грациозного возврата
+    # (ответь на новое + мягко уточни актуальность незакрытого вопроса, НЕ повторяй в лоб). Транзиентная,
+    # как guard_nudge: ставится на свежем ходу при протухании паузы (unified), "" иначе. Last-value.
+    stale_pause_note: str
     # #221 Ф3b: сериализованное решение доменного роутера (БЕЗ ПД) — пишется в трейс на finish (колонка
     # routing_decision_json) для измерения shadow-расхождений. Ставится в shadow И execute; disabled → None.
     router_decision_json: str | None
@@ -1382,12 +1390,74 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
     return out
 
 
-def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any) -> str:
+def _generic_confirm_wrap(inner: Any) -> Any:
+    """#285 B2b-2: универсальный confirm для КАНДИДАТА (write без детерминированного сигнала, ярус б).
+    Как `_confirm_wrap`, но превью GENERIC — имя+сырые args, БЕЗ чтения БД (пилляр: превью не читает
+    own-data до «да»). Мутация ТОЛЬКО после «да». blanket-unlock невозможен (wrap на КАЖДОМ
+    инструменте; вторая мутация хода снова через confirm)."""
+    from langchain_core.tools import StructuredTool
+
+    def _wrapped(**kwargs: Any) -> str:
+        _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
+        _args = ", ".join(f"{k}={kwargs[k]}" for k in sorted(kwargs)) if kwargs else "без параметров"
+        decision = interrupt({
+            "confirm": f"Я поняла как «{inner.name}» ({_args}). Подтверди, и я сделаю.",
+            "key": _key})
+        if not _is_yes(str(decision)):
+            return "Хорошо, не делаю."
+        return str(inner.invoke(kwargs))
+
+    return StructuredTool.from_function(
+        func=_wrapped, name=inner.name, description=inner.description, args_schema=inner.args_schema,
+    )
+
+
+def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
+    """#285 B2b-2: фильтр набора на ЕДИНОМ пути execute. Как `_apply_domain_policy` для read, НО write
+    ВНЕ allowed_write НЕ отказывает — биндит КАНДИДАТОМ под generic confirm (ярус б). Так unsignaled
+    write = подтверждение, не тупик #281/#282; молчаливой мутации нет (write в allowed_write — прямой,
+    вне — confirm). read_pure candidate'ом НЕ открывается (кандидат только для write-класса).
+    meta_scope: ask_human/need_family всегда; delete_my_account на голосовом едином пути НЕ выставляется
+    вообще (Борис 2026-07-04: удаление аккаунта голосом — не фича; кто захочет — отдельный явный флоу.
+    Снимает account-signal whack-a-mole; delete и так за собственным A11-confirm).
+    allowed_* = None → не фильтровать (не должно случаться на unified — политика всегда ставит списки)."""
+    if allowed_read is None and allowed_write is None:
+        return tools
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_read_domains, tool_write_domains
+    ar, aw = set(allowed_read or ()), set(allowed_write or ())
+    out = []
+    for t in tools:
+        name = _TOOL_NAME_ALIASES.get(t.name, t.name)
+        if t.name in _META_TOOLS:
+            if t.name == "delete_my_account":
+                continue  # НЕ на голосовом едином пути (Борис 2026-07-04) — отдельный явный флоу
+            out.append(t)  # ask_human/need_family всегда (need_family — механизм кандидата)
+        elif name not in TOOL_OP_CLASS:  # неизвестный → fail-closed
+            continue
+        elif TOOL_OP_CLASS.get(name) == "write":
+            # ярус (а) прямой — ТОЛЬКО если И write-домен разрешён, И read-домен инструмента в allowed_read
+            # (B2 CodexH R2: иначе write-инструмент с read≠write доменом, напр. generate_shopping_from_menu
+            # write=shopping/read=menu, читал бы menu-own-data без гранта). Иначе → кандидат под confirm.
+            if tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
+                out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
+            else:
+                out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
+        elif tool_read_domains(name) <= ar:
+            out.append(t)  # read_pure/read_external по allowed_read (как #221)
+    return out
+
+
+def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_write: Any,
+                             unified: bool = False) -> str:
     """#267 A: структурная причина недоступности инструмента — ЕДИНЫЙ источник для pre-scan,
     need_family-handler и unavailable-dispatch. Различает «семья не загружена» (нужен need_family) от
     «домен вне запроса» (need_family НЕ поможет). Закрывает trap: раньше need_family врал «загружена»,
     а доменный фильтр резал заново → планировщик долбился в стену до лимита проходов. Возвращает:
-    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available."""
+    unknown_tool | unknown_family | domain_blocked | family_not_loaded | available.
+
+    unified (B2b-2): на ЕДИНОМ пути need_family грузит ЛЮБУЮ известную семью — per-tool гейт
+    `_apply_unified_policy` защищает (read по allowed_read, write вне allowed_write → кандидат+confirm),
+    поэтому загрузка безопасна и НЕ deny-all (ярус б: unsignaled write доводится до подтверждения)."""
     from sreda.services.tool_schemas.families import (
         TOOL_OP_CLASS, tool_read_domains, tool_write_domains,
     )
@@ -1397,6 +1467,8 @@ def _tool_unavailable_reason(name: str, args: Any, allowed_read: Any, allowed_wr
             return "unknown_family"
         if allowed_read is None and allowed_write is None:
             return "available"  # домен не фильтруется (legacy/disabled) → семью грузить можно
+        if unified:
+            return "available"  # единый путь: грузим любую семью; per-tool гейт защищает (ярус б)
         # семья-раздел вне разрешённых доменов → её инструменты всё равно зарежет _apply_domain_policy
         if fam not in set(allowed_read or ()) and fam not in set(allowed_write or ()):
             return "domain_blocked"
@@ -1661,11 +1733,167 @@ def _is_domain_execute_tenant(tenant_id: str) -> bool:
     return tenant_id in get_settings().react_domain_scope_execute_tenants
 
 
+def _unified_execute_for(tenant_id: str) -> bool:
+    """#285 Фаза B: гонит ли ЕДИНЫЙ путь execute-режимом для этого тенанта. Требует И флаг единого
+    пути (react_unified_path_enabled), И тенант в канареечном списке (react_unified_tenants). Пусто
+    → НИКОМУ execute (флаг ON = глобальный shadow Фазы A); ``*`` → всем (Фаза F)."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return bool(s.react_unified_path_enabled) and (tenant_id in s.react_unified_tenants)
+
+
 def _tail_directives_enabled() -> bool:
     """#247: динамические директивы (section-hint #215 + guard-нудж) — в ХВОСТ, а не в системный промпт.
     OFF (дефолт) → легаси (дописываем в sp). ON → системный промпт стабилен (кеш-префикс цел)."""
     from sreda.config.settings import get_settings
     return bool(getattr(get_settings(), "react_tail_directives_enabled", False))
+
+
+def _unified_availability_directive(bound) -> str:
+    """#285 B4 (пилляр 4, анти-дрейф промпт↔bind): честный per-turn хвост для ЕДИНОГО пути.
+    Перечисляет инструменты, ФАКТИЧЕСКИ забинденные в ЭТОМ ходе, и несёт #279-семантику: способность
+    есть; это про текущий ход, а не про умения вообще; нужного здесь нет → коротко уточни недостающее,
+    не отказывай. Пересобирается КАЖДЫЙ проход из актуального `bound` (bound меняется между проходами:
+    кандидаты, семьи). Уходит ТОЛЬКО хвостом на user-роли (#247), НЕ в системный промпт — кеш-префикс
+    на unified стабилен.
+    NB: формулировка честности параллельна chat_fact_system_prompt (react_preflight.py ~610-615);
+    физическое DRY-объединение отложено до Фазы E (chat/fact-промт прод-живой — сейчас не трогаем)."""
+    _names = ", ".join(sorted({getattr(t, "name", "") for t in (bound or [])} - {""}))
+    _have = (f"В этом ходе доступны инструменты: {_names}. "
+             if _names else "В этом ходе инструменты не подключены. ")
+    # #285 канарейка-фикс тона (2026-07-07): ВЕДЁМ с «ответь по сути, опираясь на результаты», а
+    # honesty/доступность — фоном и УСЛОВНО. Раньше хвост вёл со списка тулов + заканчивался
+    # write-призывом (последняя инструкция #298) + «не утверждай что сделала» → модель на «погоду»
+    # (get_weather ok) и на resume-удаление (cancel ok) ОТВЕЧАЛА мимо: дефлектила в «что записать?»
+    # / эхо хвоста вместо отчёта о реальном действии. Трейс: инструмент срабатывал, ломался ОТВЕТ.
+    return (
+        "Главное: ответь человеку ПО СУЩЕСТВУ его запроса, ОПИРАЯСЬ на результаты инструментов этого "
+        "хода — что инструмент реально сделал или нашёл, то и скажи; действий, которых в результатах "
+        "нет, себе не приписывай. Если инструмент вернул отмену или «не делаю» — так и сообщи "
+        "(«отменила, ничего не делаю»), и ОСТАНОВИСЬ: НЕ переспрашивай и не предлагай сделать это "
+        "снова. Не отвечай мимо запроса и не переспрашивай «что записать», если человек спросил о "
+        "другом. Эту служебную заметку НЕ пересказывай в ответе. "
+        + _have +
+        "Это про текущий ход, других инструментов здесь не зови; но способность к напоминаниям, "
+        "задачам, спискам и памяти есть — не говори «не умею». Если человек хочет записать, напомнить "
+        "или запомнить, а нужного инструмента здесь нет, не отказывай — коротко уточни недостающее; "
+        "иначе просто ответь на его вопрос."
+    )
+
+
+def _effective_intent(state, preflight_enabled: bool):
+    """#285 B4 (Codex high+medium R1 MAJOR): ЕДИНЫЙ источник effective_intent для ВСЕХ узлов
+    (chat/run_tools/route/telemetry/caps/guard). На едином пути (unified_execute) ВСЕГДА "task" —
+    так одна персона И unified-политика согласованы во ВСЕХ узлах, а не только в chat(): иначе
+    dispatch/guard/web-caps читали бы сырой intent и на аномалии intent=chat при unified свернулись
+    бы в web-only под task-промптом (полу-defensive хуже, чем полный). На НЕедином — прежняя
+    деривация #197: intent при preflight, иначе None (byte-identical OFF-откат)."""
+    if state.get("unified_execute"):
+        return "task"
+    return (state.get("intent") or None) if preflight_enabled else None
+
+
+def _domain_blocked_count(messages) -> int:
+    """#285 канарейка-фикс: сколько раз В ТЕКУЩЕМ ходу (после последнего HumanMessage) инструмент
+    вернул domain_blocked. Детект петли «модель долбит незабинженный тул по кругу» (инцидент
+    канарейки 2026-07-06: «как дела?» → list_checklists ×3 → 7 проходов впустую)."""
+    from langchain_core.messages import HumanMessage, ToolMessage
+    cnt = 0
+    for m in reversed(messages or []):
+        if isinstance(m, HumanMessage):
+            break
+        if isinstance(m, ToolMessage):
+            art = getattr(m, "artifact", None) or {}
+            if isinstance(art, dict) and art.get("result_kind") == "domain_blocked":
+                cnt += 1
+    return cnt
+
+
+def _is_new_request_on_pause(text: str) -> bool:
+    """#316 (канарейка 2026-07-07): на ask_human-паузе входящий текст — это НОВЫЙ запрос (а не ответ на
+    вопрос)? Да, если несёт явную write-команду («добавь X») ИЛИ явный read-ЗАПРОС own-data («покажи
+    покупки», «какие у меня дела»). Иначе — ОТВЕТ (консервативно: неоднозначное = ответ, чтобы не бросить
+    паузу зря). R2 (оба Codex + субагент, MAJOR): голый read-кюс НЕ годится — слот-ответ «в покупки»/
+    «покупки»/«в список покупок» на «в какой список?» несёт кюс, но это ОТВЕТ; требуем маркер-запроса
+    (new_read_request_signal = кюс И «покажи/какие»). write_command_signal (императив) FP не даёт. Фраза, как B1."""
+    from sreda.runtime.react_signals import new_read_request_signal, write_command_signal
+    return bool(write_command_signal(text)) or new_read_request_signal(text)
+
+
+def _should_redirect_on_pause(user_text: str, is_confirm_pause: bool) -> bool:
+    """#316 R5 (субагент R4 MINOR — спец-дрейф #74): ЕДИНАЯ функция решения «новый запрос на живой паузе
+    → свежий ход». Извлечена из handle_turn, чтобы юнит-тест бил РЕАЛЬНЫЙ путь (а не реимплементацию —
+    иначе дроп конъюнкта не поймался бы тестом). confirm-пауза: положительный сигнал И НЕ голое эхо-
+    подтверждение «удали»/«ок удали» (иначе → A0 «нет», #267 fail-closed удаления); classify-конъюнкт
+    оставлен защитно (при is_new он всегда "redirect"). ask_human: просто сигнал нового запроса — у
+    открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
+    from sreda.runtime.react_signals import bare_command_echo
+    is_new = _is_new_request_on_pause(user_text)
+    if is_confirm_pause:
+        return (is_new and not bare_command_echo(user_text)
+                and classify_confirm_reply(user_text) == "redirect")
+    return is_new
+
+
+def _withdrawal_messages(last_msg) -> list:
+    """#316 R2/R3: withdrawal-ToolMessage на КАЖДЫЙ повисший tool_call последнего AIMessage.
+
+    Сброс живой паузы на redirect снимает interrupt-write, но закоммиченный AIMessage(tool_calls)
+    остаётся БЕЗ пары ToolMessage (узел прервался до коммита результата) → провайдер отвергает «сироту».
+    Дописав по одному withdrawal на вызов, закрываем пару → история валидна. `artifact.result_kind=
+    "withdrawn"` (Codex high/medium R2 MAJOR): без него дефолт «ok» → отменённый delete_task считался бы
+    ИСПОЛНЕННЫМ в shadow-метрике (ok/observed). Не-AIMessage / без tool_calls → пусто (сироты нет)."""
+    if not (isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None)):
+        return []
+    return [ToolMessage(
+        content="(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным)",
+        name=tc.get("name") or "tool", tool_call_id=tc.get("id") or "",
+        artifact={"result_kind": "withdrawn"})
+        for tc in last_msg.tool_calls if tc.get("id")]
+
+
+def _stale_pause_directive(gap_seconds: float) -> str:
+    """#stale (канарейка, реальный баг «позвонить маме»): протухшая пауза + НОВОЕ сообщение. Без этого
+    модель перескакивает на вчерашний незакрытый вопрос В ЛОБ («Во сколько?»), игнорируя «Привет». Директива
+    велит ответить на новое сообщение и МЯГКО уточнить актуальность незакрытого (Борис: «Привет. Вчера ты
+    так и не ответил, во сколько … — актуально?»). Формулирует модель; тут даём фрейм + грубую давность."""
+    if gap_seconds >= 20 * 3600:
+        when = "со вчера (или раньше)"
+    elif gap_seconds >= 2 * 3600:
+        when = f"несколько часов назад (~{int(gap_seconds // 3600)} ч)"
+    else:
+        when = "ранее, но разговор прервался"
+    return (
+        "Служебная заметка (НЕ пересказывай её дословно): в истории есть незакрытый вопрос, на который "
+        f"пользователь не ответил ({when}), а затем прислал ТЕКУЩЕЕ сообщение. Если текущее сообщение "
+        "ОТВЕЧАЕТ на тот вопрос — доведи начатое до конца. Если это НОВОЕ/несвязанное сообщение — ответь на "
+        "него по-человечески и МЯГКО, своими словами, напомни про незакрытый вопрос и спроси, актуален ли он "
+        "ещё; НЕ повторяй прошлый вопрос дословно, будто разговор не прерывался.")
+
+
+def _stale_pause_note(has_pause: bool, redirect_new: bool, tenant_id: str,
+                      is_confirm: bool, persist_enabled: bool, gap_seconds: float) -> str:
+    """#stale (ревью R1): ВСЕ гейты в ОДНОМ месте (тест бьёт реальный путь, спец-дрейф #74). Директиву
+    грациозного возврата даём ТОЛЬКО когда: протухшая пауза (has_pause И НЕ redirect) + канареечный тенант
+    + durable-persist (иначе history сброшена gen++, ссылаться не на что) + пауза-УТОЧНЕНИЕ (НЕ confirm:
+    просроченное destructive-подтверждение НЕ ре-предлагаем и НЕ «доводим» — оно fail-closed по TTL; для
+    confirm грациозный возврат = отдельное решение владельца). Иначе "" (обычный свежий ход)."""
+    if not (has_pause and not redirect_new and persist_enabled
+            and not is_confirm and _unified_execute_for(tenant_id)):
+        return ""
+    return _stale_pause_directive(gap_seconds)
+
+
+def _confirm_declined(is_confirm_pause: bool, resume_val: str, tenant_id: str) -> bool:
+    """#321: ОТКАЗ на confirm-паузе на ЕДИНОМ (канареечном) пути? = confirm-пауза И resume НЕ «да» И
+    `_unified_execute_for`. True → финальный ответ берём ДЕТЕРМИНИРОВАННО («Отменила, ничего не делаю.»),
+    не даём слабой модели пере-сочинить отказ в ложное «удалено» (канарейка #316 e2e поймала).
+
+    Гейт _unified_execute_for (как #316/#317/#318): kill-switch есть, ЛЕГАСИ НЕ трогаем — там ответ
+    остаётся модель-сочинённым (байт-идентично; отдельное решение владельца, если расширять). Извлечено
+    (ревью R1) → тест бьёт РЕАЛЬНУЮ функцию гейта, а не реимплементацию (спец-дрейф #74)."""
+    return (bool(is_confirm_pause) and not _is_yes(str(resume_val))
+            and _unified_execute_for(tenant_id))
 
 
 def _summary_enabled_for(tenant_id: str) -> bool:
@@ -2387,15 +2615,19 @@ def _build_graph(llm: Any, all_tools: list, *,
         _chat_timeout_s = 15.0
 
     def chat(state: ReactState):
-        # #197: effective_intent — читаем сохранённый intent ТОЛЬКО при preflight_enabled. OFF → None →
-        # task-ветка ниже = ДОСЛОВНО прежнее поведение (byte-identical даже при чекпойнте intent=chat).
-        eff = (state.get("intent") or None) if preflight_enabled else None
+        # #197 + #285 B4: единый источник effective_intent (_effective_intent) — на unified ВСЕГДА
+        # "task", иначе intent при preflight (OFF → None → byte-identical даже при чекпойнте intent=chat).
+        # Один резолвер во ВСЕХ узлах (chat/run_tools/route) → одна персона+политика согласованы.
+        eff = _effective_intent(state, preflight_enabled)
         _used_provider, _used_model, _fallback_fired = provider_key, _model_name, False
         # #159 R2 (Codex MAJOR): телеметрия попытки primary при срабатывании запаса. Учёт ДЕНЕГ
         # (#175) пишется на ОТВЕТИВШИЙ провайдер — токены зависшего/упавшего primary неизвестны (его
         # поток отброшен обёрткой). Идентичность+ошибку primary кладём в наблюдательный трейс (#192),
         # чтобы дашборд стоимости НЕ выглядел так, будто primary не вызывался/был бесплатным.
         _primary_provider, _primary_model, _primary_error = "", "", ""
+        # #285 B4: eff уже нормализован (_effective_intent → "task" на unified), поэтому единый путь
+        # chat/fact-ветку не берёт БЕЗ отдельного guard здесь — «одна персона» гарантирована в источнике
+        # eff (согласовано с run_tools/route/caps/guard, Codex high+medium R1 MAJOR).
         if eff in ("chat", "fact"):
             # #197 chat/fact: рассуждающая модель (deepseek) + ТОЛЬКО web-семья + honesty. ИНВАРИАНТ:
             # SCOPE всегда web-only (bound по eff ДО try → fallback наследует тот же bound → не расширится);
@@ -2428,9 +2660,14 @@ def _build_graph(llm: Any, all_tools: list, *,
             # task ИЛИ OFF (eff None) — ПРЕЖНЕЕ поведение (byte-identical при router_allowed=None).
             # bind ПОДНАБОР на КАЖДОМ проходе из текущих active_families (а не фикс. набор).
             # #221 Ф3: + фильтр разрешённых разделов (execute ставит router_allowed_*; иначе None → no-op).
-            bound = _apply_domain_policy(
-                _select_tools(all_tools, state.get("active_families")),
-                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+            if state.get("unified_execute"):  # B2b-2: единый путь → candidate-write под confirm
+                bound = _apply_unified_policy(
+                    _select_tools(all_tools, state.get("active_families")),
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+            else:
+                bound = _apply_domain_policy(
+                    _select_tools(all_tools, state.get("active_families")),
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
             sp = system_prompt
             nudge = state.get("guard_nudge")
             # #215: детерминированная карта «слово→раздел». Фредди (быстрая модель) сам путал «покажи
@@ -2452,14 +2689,33 @@ def _build_graph(llm: Any, all_tools: list, *,
                 _text = _last_human_text(state["messages"])
                 if state.get("router_allowed_read_domains") is not None:
                     from sreda.runtime.react_preflight import route_domains
-                    _sec = route_domains(_text).directive
+                    _rr = route_domains(_text)
+                    _sec = _rr.directive
+                    # #285 канарейка-фикс (инцидент 2026-07-06): на ЕДИНОМ пути директива route_domains
+                    # НЕ должна называть инструменты домена, который ПОЛИТИКА не разрешила. route-мина
+                    # «как дела?» → primary=checklists → «зови list_checklists», а политика по идиоме
+                    # дала web-only → модель звала незабинженный тул → domain_blocked в цикле. Гейтим
+                    # директиву по фактически allowed-доменам хода. Легаси (#221) НЕ трогаем — там
+                    # router_allowed = те же route-домены, директива уже согласована с ними.
+                    if state.get("unified_execute") and _rr.primary_domain:
+                        _allowed = (set(state.get("router_allowed_read_domains") or [])
+                                    | set(state.get("router_allowed_write_domains") or []))
+                        if _rr.primary_domain not in _allowed:
+                            _sec = None
                 else:
                     from sreda.runtime.react_preflight import _section_hint
                     _sec = _section_hint(_text)
+            # #285 B4 (пилляр 4): единый путь — честный хвост «доступны: …» из ФАКТИЧЕСКОГО bound этого
+            # прохода + #279-семантика (способность есть; про текущий ход; нужного нет → уточни, не
+            # отказывай). Только на unified_execute; None на легаси-пути (там хвост не меняется).
+            _avail = _unified_availability_directive(bound) if state.get("unified_execute") else None
+            # #stale: директива грациозного возврата к протухшему вопросу (только unified, только когда стоит)
+            _stale = state.get("stale_pause_note") if state.get("unified_execute") else None
             # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
             # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
             # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
-            if _tail_directives_enabled():
+            # #285 B4: на unified ВСЕГДА user-role хвост (OFF-ветка system-append запрещена — кеш-префикс цел).
+            if _tail_directives_enabled() or state.get("unified_execute"):
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                           budget=_compact_budget(), summary=history_summary)
                 # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
@@ -2467,7 +2723,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
                 if time_tail_line:
                     _msgs = _append_time_tail(_msgs, time_tail_line)
-                _tail = [d for d in (nudge, _sec) if d]
+                _tail = [d for d in (nudge, _avail, _sec, _stale) if d]
                 if _tail:
                     _directive = "\n\n".join(_tail)
                     # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
@@ -2536,6 +2792,10 @@ def _build_graph(llm: Any, all_tools: list, *,
             "messages": [resp],
             "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # анти-петля
             "guard_nudge": "",  # one-shot: очищаем после применения
+            # #stale (ревью R1 субагент MAJOR): consume-and-clear — иначе директива ПЕРЕЖИВАЕТ границу паузы
+            # (её _init-сброс только на СВЕЖЕМ ходе, resume _init не строит) → ре-инжектится на позднем
+            # resume = сам баг перескока, что чиним. Гасим после ПРИМЕНЕНИЯ (как guard_nudge).
+            "stale_pause_note": "",
             # #192: наблюдательная запись вызова (НЕ деньги — деньги в skill_ai_executions #175)
             "llm_calls": [{
                 "phase": "chat",
@@ -2567,7 +2827,7 @@ def _build_graph(llm: Any, all_tools: list, *,
         exec_id = (hashlib.sha1(turn_key.encode("utf-8")).hexdigest()
                    if turn_key else "")
         active = list(state.get("active_families") or [])
-        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
+        eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         wrote_unkeyed = False  # отработал ли инструмент unkeyed-write семьи (→ выключит guard)
         # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента из НЕ
         # загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш. #197: тот же
@@ -2593,12 +2853,19 @@ def _build_graph(llm: Any, all_tools: list, *,
                             and _tool_unavailable_reason(
                                 "need_family", {"family": _pf},
                                 state.get("router_allowed_read_domains"),
-                                state.get("router_allowed_write_domains")) != "domain_blocked"):
+                                state.get("router_allowed_write_domains"),
+                                unified=bool(state.get("unified_execute"))) != "domain_blocked"):
                         active.append(_pf)
                         added = True
-        bound_by_name = {t.name: t for t in _apply_domain_policy(
-            _bind_for(all_tools, active, eff),
-            state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))}
+        if state.get("unified_execute"):  # B2b-2: candidate-write под confirm на dispatch
+            _bound_list = _apply_unified_policy(
+                _bind_for(all_tools, active, eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+        else:
+            _bound_list = _apply_domain_policy(
+                _bind_for(all_tools, active, eff),
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+        bound_by_name = {t.name: t for t in _bound_list}
         out = []
         _batch_search: dict[str, int] = {}  # #197: счётчик web-вызовов в ЭТОМ батче (cap chat/fact)
         # #213 Срез A: контекст канонизации депрекейт-алиасов (один раз на батч).
@@ -2721,7 +2988,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 _faw = state.get("router_allowed_write_domains")
                 # #267 A: domain_blocked → честный отказ (НЕ «загружена ok» — иначе планировщик думает,
                 # что загрузил, а доменный фильтр режет заново → trap). Семью НЕ грузим.
-                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw)
+                _nreason = _tool_unavailable_reason("need_family", {"family": fam}, _far, _faw,
+                                                    unified=bool(state.get("unified_execute")))
                 if _nreason == "domain_blocked":
                     _avail = ", ".join(sorted(set(_far or []) | set(_faw or []))) or "—"
                     msg = (f"Раздел «{fam}» не относится к этому запросу (он про: {_avail}). "
@@ -2746,12 +3014,22 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # (need_family НЕ поможет — иначе trap: планировщик долбится в need_family по кругу).
                 _ufar = state.get("router_allowed_read_domains")
                 _ufaw = state.get("router_allowed_write_domains")
-                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw)
+                _ureason = _tool_unavailable_reason(name, tc.get("args"), _ufar, _ufaw,
+                                                    unified=bool(state.get("unified_execute")))
                 if _ureason == "domain_blocked":
                     _uavail = ", ".join(sorted(set(_ufar or []) | set(_ufaw or []))) or "—"
-                    _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
-                             "need_family здесь не поможет. Если нужная цель в другом разделе — "
-                             "спроси у пользователя, что он имеет в виду.")
+                    if state.get("unified_execute"):
+                        # #285 канарейка-фикс: жёстче — НЕ долбить заблокированный тул + для «не про
+                        # раздел» просто ответить словами (смолток «как дела?» не должен уходить в
+                        # «какой чеклист?»). Старый текст звал «спроси у пользователя» → петля/ask_human.
+                        _umsg = (f"Инструмент {name} НЕ подходит к этому ходу (доступно про: {_uavail}). "
+                                 f"НЕ зови {name} снова в этом ходу. Если это обычный разговор или вопрос "
+                                 "не про эти разделы — просто ответь по существу словами, без инструментов. "
+                                 "Если правда нужен другой раздел — уточни ОДНИМ коротким вопросом.")
+                    else:
+                        _umsg = (f"Инструмент {name} не относится к этому запросу (он про: {_uavail}). "
+                                 "need_family здесь не поможет. Если нужная цель в другом разделе — "
+                                 "спроси у пользователя, что он имеет в виду.")
                 else:
                     _umsg = (f"Инструмент {name} сейчас недоступен — сначала позови "
                              "need_family нужной семьи.")
@@ -2850,8 +3128,13 @@ def _build_graph(llm: Any, all_tools: list, *,
     def route(state: ReactState):
         last = state["messages"][-1]
         passes = state.get("turn_pass_count") or 0
-        eff = (state.get("intent") or None) if preflight_enabled else None  # #197 effective_intent
+        eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         if getattr(last, "tool_calls", None):
+            # #285 канарейка-фикс: на едином пути — если ход уже упёрся в domain_blocked ≥2 раза
+            # (модель долбит незабинженный тул по кругу, инцидент 2026-07-06), грациозный стоп СРАЗУ,
+            # не жечь проходы до потолка (7 впустую на «как дела?»). Легаси не трогаем.
+            if state.get("unified_execute") and _domain_blocked_count(state["messages"]) >= 2:
+                return "stop"
             # АНТИ-ПЕТЛЯ (R1 medium+субагент): лимит проходов исчерпан (повтор need_family/
             # недоступного инструмента и т.п.) → грациозный стоп-узел, НЕ зацикливаемся до
             # recursion_limit (который дал бы «потеряла контекст»). turn_pass_count гейтит и
@@ -2882,8 +3165,10 @@ def _build_graph(llm: Any, all_tools: list, *,
 
     def guard(state: ReactState):
         # #197 defense-in-depth: chat/fact сюда НЕ маршрутизируются (route → END), но если бы попали —
-        # ничего не добираем (scope остаётся web-only, productivity не просачивается).
-        if preflight_enabled and (state.get("intent") in ("chat", "fact")):
+        # ничего не добираем (scope остаётся web-only, productivity не просачивается). #285 B4 (Codex R2
+        # MAJOR): через _effective_intent (unified → "task") — согласовано с chat/run_tools/route; guard
+        # был ПОСЛЕДНИМ сырым intent-сайтом, иначе recovery на аномалии unified+intent=chat молчал бы.
+        if _effective_intent(state, preflight_enabled) in ("chat", "fact"):
             return {}
         # #267 A4 (Борис: «роутер побеждает»): в EXECUTE-режиме (роутер решил раздел) guard НЕ
         # восстанавливается в ЧУЖОЙ раздел — НЕ грузит семьи вне allowed и НЕ расширяет домены роутера
@@ -3597,7 +3882,29 @@ async def handle_turn(
                 return _Reply("")
 
         _confirm_resolution: str | None = None  # #285 Фаза A: исход confirm-паузы для трейса
-        if live_pause:  # живое уточнение → возобновляем (turn_key уже в state)
+        # #316 (канарейка 2026-07-07): на ЕДИНОМ пути НОВЫЙ запрос во время живой паузы обрабатывается
+        # СВЕЖИМ ходом, а не съедается паузой (прежде: confirm→«нет»+дроп нового запроса; ask_human→текст
+        # как ответ; «авто-переключение раздела» было отложено — это оно). redirect детектим ДО инвока:
+        # confirm-пауза — classify_confirm_reply=="redirect"; ask_human — B1-сигнал нового запроса. На
+        # redirect паузу гасим (else-ветка: clear_pending) + обрабатываем свежим ходом. Легаси не трогаем.
+        # #316 R3/R4/R5: решение «новый запрос на живой паузе → свежий ход» ВЫНЕСЕНО в
+        # _should_redirect_on_pause (ЕДИНЫЙ путь для прода и теста, субагент R4 спец-дрейф #74).
+        # confirm: положительный сигнал И НЕ голое эхо-подтверждение «удали»/«ок удали»/«удали пожалуйста»
+        # (иначе → A0 «нет», #267 fail-closed удаления; «ок»/«конечно» тоже не сигнал → resume). ask_human:
+        # просто сигнал нового запроса. classify_confirm_reply → "redirect" на всём не-«да»/«нет» (#267 A0)
+        # → без гейта бросало бы живой confirm. «удали задачу B» (объект) → редирект (свежий ход по B).
+        _redirect_new = False
+        if live_pause and not resume_only and _unified_execute_for(tenant_id):
+            _, _is_cp_r, _ = _pending(snap)
+            _redirect_new = _should_redirect_on_pause(user_text, _is_cp_r)
+        # #316 R2 (MINOR): «реально возобновили» ≠ live_pause (redirect тоже был live_pause, но ход СВЕЖИЙ).
+        # Трейс resumed/confirm_state берёт _did_resume, иначе redirect-ход врёт «resumed/confirmed».
+        # #316 R3 (Codex high R2 MAJOR): _confirm_resolution="redirect" на СВЕЖИЙ ход УБРАН — он писался в
+        # НОВЫЙ turn_key, а не в старый confirm-ряд; старый ряд остаётся awaiting_confirm (телеметрия,
+        # пре-существует у протухших пауз → отдельный follow-up на терминализацию, вне #316).
+        _did_resume = live_pause and not _redirect_new
+        _declined_confirm = False  # #321: confirm-ОТМЕНА (resume «нет») → детерминированный ответ ниже
+        if _did_resume:  # живое уточнение → возобновляем (turn_key уже в state)
             # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
             # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
             # уже шлёт канон (confirm_resume_text). ask_human (не confirm) — текст-ответ как есть.
@@ -3615,20 +3922,48 @@ async def handle_turn(
                 _confirm_resolution = {"affirm": "yes", "negate": "no"}.get(_cls, "redirect")
             elif _is_confirm_pause:
                 _confirm_resolution = "yes" if _is_yes(str(_resume_val)) else "no"
+            # #321 (канарейка #316 e2e): confirm-ОТМЕНА на едином пути (resume «нет»: текст «нет»/«удали»/
+            # «ок» ИЛИ кнопка «Нет») → ответ ДЕТЕРМИНИРОВАННЫЙ (ниже), не даём слабой модели пере-сочинить
+            # отказ в ложное «удалено». Гейт _unified_execute_for (kill-switch; легаси не трогаем).
+            _declined_confirm = _confirm_declined(_is_confirm_pause, _resume_val, tenant_id)
             result = await graph.ainvoke(Command(resume=_resume_val), _cfg(gen))
         else:
-            if _has_pause(snap):  # протухшая пауза → гасим
+            _redirect_close_msgs: list = []  # #316 R2: withdrawal-ToolMessage для повисших tool_call
+            _stale_note = ""  # #stale: директива грациозного возврата к протухшему вопросу (unified)
+            if _has_pause(snap):  # протухшая пауза ИЛИ #316 redirect (новый запрос на едином пути) → гасим
                 # #193: ВКЛ durable → ключ стабилен, паузу гасим ЯВНО (clear_pending: drop
                 # interrupt-write idx<0), СОХРАНЯЯ историю диалога; НЕ сменой ключа (p-010).
                 # Свежий ainvoke ниже продолжит беседу с историей, без залипшей паузы.
                 if _persist_enabled():
                     try:
                         _get_checkpointer().clear_pending(_durable_thread_id(base))
+                        # #316 R2/R3 (субагент MAJOR): очистка ЖИВОЙ паузы на redirect снимает interrupt-write,
+                        # но AIMessage(tool_calls) уже закоммичен в durable-историю без пары ToolMessage
+                        # (узел прервался до коммита результата) → свежий ainvoke послал бы «сироту» → Mercury
+                        # отвергает непарный вызов (run_tools везде держит инвариант; build_model_input сироту
+                        # НЕ чинит). Закрываем пару withdrawal-ToolMessage. R3 (субагент R2 MINOR): блок ВНУТРИ
+                        # try, ПОСЛЕ успешного clear_pending — при сбое гашения withdrawals НЕ шлём (иначе
+                        # fresh-invoke на всё ещё прерванном треде + заглушки). ТОЛЬКО redirect единого пути:
+                        # у легаси протухшая пауза байт-идентична (её fresh-invoke НЕ трогаем).
+                        if _redirect_new:
+                            _pmsgs = _pre_vals.get("messages") or []
+                            _redirect_close_msgs = _withdrawal_messages(_pmsgs[-1] if _pmsgs else None)
                     except Exception:  # noqa: BLE001 — гашение не валит ход
                         logger.warning("react_loop: clear_pending failed", exc_info=True)
+                        _redirect_close_msgs = []  # сбой гашения → без withdrawals (пре-существующее поведение)
                 else:  # ВЫКЛ → прежнее: свежий ход на чистом поколении (эфемерно)
                     gen += 1
                     _THREAD_GEN[base] = gen
+                # #stale (канарейка, реальный баг «позвонить маме»): ПРОТУХШАЯ ask_human-пауза на едином пути
+                # → без директивы модель перескакивает на вчерашний вопрос В ЛОБ. Все гейты (redirect/unified/
+                # durable/не-confirm) — в _stale_pause_note. snap.created_at = время создания паузы → возраст.
+                # R3 (Codex high MAJOR): has_pause = bool(q) из _pending — FAIL-CLOSED на нечитаемой паузе
+                # (snap.next есть, а payload не читается → не трактуем как ask_human). Читается ТОЛЬКО на
+                # preflight (unified_execute — read-gate в chat — ставится под _preflight; вне него — dead work).
+                _stale_q, _stale_is_confirm, _ = _pending(snap)
+                _stale_note = _stale_pause_note(
+                    bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
+                    _persist_enabled(), _interrupt_age_seconds(snap.created_at))
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
             _tk_trace = turn_key
@@ -3652,7 +3987,10 @@ async def handle_turn(
             # #197: определить intent для СВЕЖЕГО хода (resume читает intent из чекпойнта, не классифицирует).
             # Слой 0 `_must_task` (явная productivity-команда → task без LLM) → иначе Слой 1 classify (Фредди,
             # fail-open task). prev_intent + история — из снапа прошлого хода. fail-open в task — ТОЛЬКО здесь.
-            _init: dict = {"messages": [HumanMessage(user_text)], "turn_key": turn_key,
+            # #316 R2: withdrawal-ToolMessage (если redirect закрыл повисшую паузу) ИДУТ ПЕРЕД новым
+            # HumanMessage → add_messages аппендит их к [..., AIMessage(tool_calls)] → пара закрыта,
+            # затем новый запрос. Пусто (не redirect / нет сироты) → как раньше [HumanMessage].
+            _init: dict = {"messages": [*_redirect_close_msgs, HumanMessage(user_text)], "turn_key": turn_key,
                            "active_families": base_fams, "guard_attempted_families": [],
                            # R1 high (соседний баг того же класса): guard_full_attempted — last-value канал
                            # «один раз за ХОД». Без сброса ход2 того же треда унаследует True → не получит
@@ -3672,7 +4010,12 @@ async def handle_turn(
                            "checklist_query_ctx": None,
                            # #285 Фаза A: сброс полиси-канала на свежем ходе (дисциплина last-value
                            # каналов, урок #221 R1 CRITICAL — без сброса стейл из чекпойнта).
-                           "turn_policy_json": None}
+                           "turn_policy_json": None,
+                           # #285 B2b: сброс флага единого пути (override ниже ставит True для канарейки).
+                           "unified_execute": False,
+                           # #stale: директива грациозного возврата (непусто ТОЛЬКО при протухшей паузе на
+                           # едином пути); "" на обычном свежем ходе → сброс last-value (как guard_nudge).
+                           "stale_pause_note": _stale_note}
             # #213 Срез B: детерминированный READ-интент чек-листов → soft cross-check в tool-node.
             # ТОЛЬКО при preflight + оба флага (R1 medium: срез B — надстройка на preflight-контуре,
             # как домены #221; без _preflight конфиг «preflight выключен» внезапно получал бы
@@ -3761,6 +4104,29 @@ async def handle_turn(
                         _init["router_allowed_read_domains"] = None
                         _init["router_allowed_write_domains"] = None
                         _init["router_decision_json"] = None
+            # #285 Фаза B (B2b-1): ЕДИНЫЙ путь EXECUTE для канареечного тенанта — ПЕРЕОПРЕДЕЛЯЕТ
+            # intent-сплит + #221-домены единой политикой (B1-сигналы + онтология). Переиспользует
+            # task-бинд + _apply_domain_policy (#221-машинерия) — политику берёт из compute_unified_policy.
+            # Требует preflight (task-бинд читает intent только при preflight_enabled). Флаг ИЛИ список
+            # пусты → не исполняется (byte-identical, никто не execute). Сбой → legacy fail-open (не
+            # роняет ход, скоуп НЕ расширяется — остаётся #221-решение выше). Ярус (б) candidate/confirm — B2b-2.
+            if _preflight and _unified_execute_for(tenant_id):
+                try:
+                    from sreda.runtime.react_policy import compute_unified_policy
+                    from sreda.runtime.react_preflight import route_domains as _rd285
+                    _upol = compute_unified_policy(user_text, _rd285(user_text))
+                    _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
+                    _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
+                    _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
+                    _init["unified_execute"] = True  # B2b-2: bind-сайты → _apply_unified_policy (candidate)
+                    _init["router_allowed_read_domains"] = _uar
+                    _init["router_allowed_write_domains"] = _uaw
+                    _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
+                    _init["router_decision_json"] = json.dumps(
+                        {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
+                         "signals": _upol["signals"]}, ensure_ascii=False)
+                except Exception:  # noqa: BLE001 — единый путь не роняет ход → legacy (скоуп #221 выше)
+                    logger.warning("react_unified: policy failed → legacy fail-open", exc_info=True)
             # #285 Фаза A (SHADOW): TurnPolicy сайдкаром — выражает решения сплита (#197 интент,
             # #221 каналы, #256 таймауты, капы) явным объектом в ОТДЕЛЬНЫЙ канал. Legacy-каналы
             # router_allowed_* НЕ трогаются (контракт отката, инвентарь §2 (б)); исполнением НЕ
@@ -3806,6 +4172,13 @@ async def handle_turn(
             return reply
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
+        # #321 (канарейка #316 e2e): на confirm-ОТМЕНЕ (единый путь) ответ ДЕТЕРМИНИРОВАННЫЙ, а НЕ
+        # пере-сочинённый chat-узлом — слабая модель галлюцинирует ложное «удалено» на отказе (юзер сказал
+        # «удали» → модель дописывает «удалена», хотя инструмент отменён; honesty-хвост это не удержал).
+        # Фиксированный текст (ревью R1: без extraction последнего ToolMessage — тот ломался, если модель
+        # после отказа звала ещё тул). Success-путь («да») НЕ трогаем (_declined_confirm=False).
+        if _declined_confirm:
+            text = "Отменила, ничего не делаю."
         reply = _Reply(_postformat(text) or "Готово.")
         # #192: финал → done + структура. ВЕСЬ блок под флагом И guarded (R1 CRITICAL Codex high):
         # collect_tool_calls/HMAC/json НЕ должны выполняться при OFF (спящий прод) и НЕ должны ронять
@@ -3845,7 +4218,7 @@ async def handle_turn(
                     try:
                         _pd285 = json.loads(_tpj)
                         _pd285["turn_events"] = {
-                            "resumed": bool(live_pause),
+                            "resumed": bool(_did_resume),  # #316 R2: redirect ≠ resume
                             "guard_attempted": len(result.get("guard_attempted_families") or []),
                             "guard_full": bool(result.get("guard_full_attempted")),
                             "passes": int(_passes_fin or 0),
@@ -3856,7 +4229,7 @@ async def handle_turn(
                 _trace.persist_trace_finish(
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
-                    confirm_state=("confirmed" if live_pause else "none"),  # best-effort
+                    confirm_state=("confirmed" if _did_resume else "none"),  # #316 R2: redirect≠confirmed
                     outcome=_outcome,
                     passes=_passes_fin,
                     routing_decision_json=_rdj,
