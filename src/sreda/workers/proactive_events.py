@@ -37,6 +37,7 @@ from sreda.db.models.core import OutboxMessage
 from sreda.db.models.inbound_event import InboundEvent
 from sreda.db.repositories.inbound_event import InboundEventRepository
 from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.db.session import privileged_session, tenant_session
 from sreda.features.app_registry import get_feature_registry
 from sreda.runtime.handlers import RuntimeReply
 from sreda.runtime.proactive_policy import (
@@ -71,14 +72,13 @@ class ProactiveEventContext:
 class ProactiveEventWorker:
     def __init__(
         self,
-        session: Session,
         *,
         embedding_client: EmbeddingClient | None = None,
         system_bot_key: str | None = None,
         registry=None,
     ) -> None:
-        self.session = session
-        self.repo = InboundEventRepository(session)
+        # #138 Ф2: воркер сам ведёт скоупы (privileged-скан событий +
+        # tenant_session на событие); общую сессию/repo больше не держит.
         # Embedding client is optional — when absent, decide_proactive's
         # semantic duplicate detection degrades to substring equality.
         # Falls back to settings-based factory so production deployments
@@ -95,45 +95,66 @@ class ProactiveEventWorker:
     async def process_pending(
         self, *, limit: int = 50, min_score: float = 0.5
     ) -> int:
-        events = self.repo.list_ready_for_delivery(limit=limit, min_score=min_score)
+        # #138 Ф2: скан всех classified events — КРОСС-ТЕНАНТНЫЙ → privileged.
+        # Снимок (id, tenant_id); ORM-строки detach'атся при закрытии скан-сессии
+        # → ниже re-fetch под tenant_session события.
+        with privileged_session("monitor") as scan:
+            event_ids = [
+                (e.id, e.tenant_id)
+                for e in InboundEventRepository(scan).list_ready_for_delivery(
+                    limit=limit, min_score=min_score
+                )
+            ]
         processed = 0
-        for event in events:
+        for event_id, tenant_id in event_ids:
             try:
-                await self._handle_event(event)
+                with tenant_session(tenant_id) as s:
+                    event = s.get(InboundEvent, event_id)
+                    if event is None:
+                        continue  # исчезло между сканом и обработкой
+                    await self._handle_event(s, event)
                 processed += 1
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "proactive worker: handler failed for event %s", event.id
+                    "proactive worker: handler failed for event %s", event_id
                 )
-                self.session.rollback()
-                self.repo.mark_status(
-                    event.id, status="skipped", reason="handler_exception"
-                )
-                self.session.commit()
+                # Провалившая tenant_session уже закрыта/откачена → помечаем
+                # skipped в СВЕЖЕЙ пер-тенантной сессии.
+                try:
+                    with tenant_session(tenant_id) as s2:
+                        InboundEventRepository(s2).mark_status(
+                            event_id, status="skipped", reason="handler_exception"
+                        )
+                        s2.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "proactive worker: mark-skipped failed for event %s", event_id
+                    )
         return processed
 
-    async def _handle_event(self, event: InboundEvent) -> None:
+    async def _handle_event(self, session: Session, event: InboundEvent) -> None:
+        event_repo = InboundEventRepository(session)
         registry = get_feature_registry()
         handler = registry.get_proactive_handler(event.feature_key)
         if handler is None:
-            self.repo.mark_status(
+            event_repo.mark_status(
                 event.id, status="skipped", reason="no_proactive_handler"
             )
-            self.session.commit()
+            session.commit()
             return
 
-        budget = BudgetService(self.session)
+        budget = BudgetService(session)
         if not budget.has_quota(event.tenant_id, event.feature_key):
-            self.repo.mark_status(
+            event_repo.mark_status(
                 event.id, status="skipped", reason="quota_exhausted"
             )
-            self.session.commit()
+            session.commit()
             return
 
         profile_dict: dict[str, Any] = {}
         memories: list[dict[str, Any]] = []
         if event.user_id:
-            repo = UserProfileRepository(self.session)
+            repo = UserProfileRepository(session)
             profile = repo.get_profile(event.tenant_id, event.user_id)
             if profile is not None:
                 profile_dict = {
@@ -146,7 +167,7 @@ class ProactiveEventWorker:
                 }
 
         context = ProactiveEventContext(
-            session=self.session,
+            session=session,
             event=event,
             event_payload=InboundEventRepository.decode_payload(event),
             profile=profile_dict,
@@ -159,12 +180,12 @@ class ProactiveEventWorker:
         if isinstance(replies, RuntimeReply):
             replies = [replies]
 
-        routings = self._resolve_routings(event)
+        routings = self._resolve_routings(session, event)
         if not routings:
-            self.repo.mark_status(
+            event_repo.mark_status(
                 event.id, status="skipped", reason="no_delivery_channel"
             )
-            self.session.commit()
+            session.commit()
             return
 
         # Resolve embedding client once (for duplicate detection across
@@ -178,7 +199,7 @@ class ProactiveEventWorker:
 
         for reply in replies:
             decision = decide_proactive(
-                session=self.session,
+                session=session,
                 reply_text=reply.text,
                 tenant_id=event.tenant_id,
                 user_id=event.user_id,
@@ -191,6 +212,7 @@ class ProactiveEventWorker:
             # создаём отдельные outbox rows на ВСЕ available channels.
             for routing in routings:
                 self._write_outbox_with_decision(
+                    session,
                     event=event,
                     reply=reply,
                     routing=routing,
@@ -199,10 +221,10 @@ class ProactiveEventWorker:
                     drop_reason=decision.drop_reason,
                 )
 
-        self.repo.mark_status(event.id, status="consumed")
-        self.session.commit()
+        event_repo.mark_status(event.id, status="consumed")
+        session.commit()
 
-    def _resolve_routings(self, event: InboundEvent):
+    def _resolve_routings(self, session: Session, event: InboundEvent):
         """10.6 dual-channel: list of OutboxRouting для proactive event.
 
         Возвращает все доступные channels (TG+MAX если оба set'нуты).
@@ -216,17 +238,18 @@ class ProactiveEventWorker:
         from sreda.db.models.core import Tenant as _Tenant, User
         from sreda.services.channel_routing import resolve_outbox_routings
 
-        user = self.session.get(User, event.user_id)
+        user = session.get(User, event.user_id)
         if user is None or user.tenant_id != event.tenant_id:
             return []
-        tenant = self.session.get(_Tenant, event.tenant_id)
+        tenant = session.get(_Tenant, event.tenant_id)
         return resolve_outbox_routings(
-            self.session, tenant=tenant, user=user,
+            session, tenant=tenant, user=user,
             telegram_bot_keys=self._registry,
         )
 
     def _write_outbox_with_decision(
         self,
+        session: Session,
         *,
         event: InboundEvent,
         reply: RuntimeReply,
@@ -240,7 +263,7 @@ class ProactiveEventWorker:
         All three outcomes (send/defer/drop) produce a row — the ``drop``
         case writes a ``status='dropped'`` row with ``drop_reason`` so
         ``/stats`` can explain the silence to the user."""
-        workspace_id = self._resolve_workspace_id(event)
+        workspace_id = self._resolve_workspace_id(session, event)
 
         if decision_kind == ProactiveDecisionKind.send:
             status = "pending"
@@ -281,15 +304,15 @@ class ProactiveEventWorker:
             # user.last_bot_key) when known; else the system default.
             bot_key=routing.bot_key or self._system_bot_key,
         )
-        self.session.add(outbox)
-        self.session.flush()
+        session.add(outbox)
+        session.flush()
         return outbox
 
-    def _resolve_workspace_id(self, event: InboundEvent) -> str:
+    def _resolve_workspace_id(self, session: Session, event: InboundEvent) -> str:
         from sreda.db.models.core import Workspace
 
         ws = (
-            self.session.query(Workspace)
+            session.query(Workspace)
             .filter(Workspace.tenant_id == event.tenant_id)
             .order_by(Workspace.id.asc())
             .first()

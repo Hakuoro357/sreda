@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Cookie, Depends, Form, Query, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -22,7 +22,7 @@ from sreda.admin.queries import (
     has_active_subscriptions,
 )
 from sreda.config.settings import get_settings
-from sreda.db.session import get_session_factory
+from sreda.db.session import privileged_session
 
 _MSK_TZ = ZoneInfo("Europe/Moscow")
 
@@ -53,12 +53,15 @@ templates.env.filters["usd"] = _fmt_usd
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-def _get_session():
-    session = get_session_factory()()
-    try:
+async def _get_session():
+    # #138 Ф2: админ-дашборд видит ВСЕ тенанты (кросс-тенант) → privileged("admin").
+    # Без обёртки под Ф3 RLS все запросы дашборда под ролью app вернут 0 строк (fail-closed).
+    # 🔴 ASYNC ОБЯЗАТЕЛЬНО (R1 MAJOR): privileged_session ставит/сбрасывает ContextVar токенами;
+    # sync-gen FastAPI-зависимость гоняется в threadpool (anyio КОПИРУЕТ контекст) → enter/exit в
+    # разных контекстах → reset падает "Token created in a different Context" на КАЖДОМ запросе.
+    # Тот же урок, что get_tenant_db в mini-app (g-073).
+    with privileged_session("admin") as session:
         yield session
-    finally:
-        session.close()
 
 
 def _audit_admin_view(
@@ -179,7 +182,7 @@ async def admin_refresh_snapshot(
 
     _audit_admin_view(session, "admin.dashboard.refreshed", principal.actor_id, request)
     ok = await asyncio.to_thread(
-        ov.refresh_overview, get_session_factory(), get_settings()
+        ov.refresh_overview, None, get_settings()  # #138 R2 M7: None → privileged(admin)
     )
     suffix = "?refresh=err" if not ok else ""
     return RedirectResponse(
@@ -565,38 +568,69 @@ _LLM_PROVIDERS_METADATA = [
 
 
 def _provider_spend(session, *, days: int = 30) -> list[dict]:
-    """#184 ч.3: расход по провайдерам из skill_ai_executions за N дней (токены + USD-оценка из
-    estimated_cost_rub_micro). У Inception/Groq нет API баланса → считаем СВОЙ расход. Включает
-    react_turn (Mercury/Оса) + остальные пути. Сортировка по стоимости."""
+    """#184 ч.3 / #238: расход по провайдерам из skill_ai_executions за N дней.
+
+    Стоимость — USD-оценка ИЗ ТОКЕНОВ через ``llm_pricing.cost_estimate`` (group by
+    provider_key+model → est → агрегация по провайдеру), как ``get_spend_by_model``.
+    #238: столбец ``estimated_cost_rub_micro`` МЁРТВ (нигде не пишется) → больше не
+    суммируем его. Беспрайсовые провайдеры → ``cost_usd=None`` (страница покажет «—»,
+    а не выдуманные/нулевые деньги). Сортировка: priced по убыванию стоимости, беспрайсовые в конце."""
     from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
 
     from sqlalchemy import func, select
 
+    from sreda.admin.queries import _VALID_TOKENS
     from sreda.db.models.skill_platform import SkillAIExecution
+    from sreda.services.llm_pricing import cost_estimate
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    # #238 R1 (Codex): фильтруем malformed-строки (NULL/отрицательные токены, legacy
+    # 0/0-при-total>0) тем же _VALID_TOKENS, что get_spend_by_model — иначе одна
+    # отрицательная строка отравит СУММУ группы (→ cost_estimate=None → провайдер «—»
+    # при валидных рядах). Токены/вызовы тоже считаем по валидным (консистентно).
     rows = session.execute(
         select(
             SkillAIExecution.provider_key,
+            SkillAIExecution.model,
             func.count(),
             func.coalesce(func.sum(SkillAIExecution.prompt_tokens), 0),
             func.coalesce(func.sum(SkillAIExecution.completion_tokens), 0),
-            func.coalesce(func.sum(SkillAIExecution.estimated_cost_rub_micro), 0),
         )
-        .where(SkillAIExecution.created_at >= cutoff)
-        .group_by(SkillAIExecution.provider_key)
+        .where(SkillAIExecution.created_at >= cutoff, _VALID_TOKENS)
+        .group_by(SkillAIExecution.provider_key, SkillAIExecution.model)
     ).all()
+
+    agg: dict[str, dict] = {}
+    for pk, model, cnt, pt, ct in rows:
+        provider = pk or "(неизвестно)"
+        a = agg.setdefault(provider, {
+            "provider": provider, "calls": 0,
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "_cost": Decimal("0"), "_any_priced": False,
+        })
+        a["calls"] += int(cnt or 0)
+        a["prompt_tokens"] += int(pt or 0)
+        a["completion_tokens"] += int(ct or 0)
+        est = cost_estimate(
+            pk or "", model or "",
+            prompt_tokens=int(pt or 0), completion_tokens=int(ct or 0),
+        )
+        if est is not None:
+            a["_cost"] += est.est_usd
+            a["_any_priced"] = True
+
     out = [
         {
-            "provider": pk or "(неизвестно)",
-            "calls": int(cnt or 0),
-            "prompt_tokens": int(pt or 0),
-            "completion_tokens": int(ct or 0),
-            "cost_rub": round(int(cost or 0) / 1_000_000, 2),
+            "provider": a["provider"],
+            "calls": a["calls"],
+            "prompt_tokens": a["prompt_tokens"],
+            "completion_tokens": a["completion_tokens"],
+            "cost_usd": (a["_cost"] if a["_any_priced"] else None),
         }
-        for pk, cnt, pt, ct, cost in rows
+        for a in agg.values()
     ]
-    out.sort(key=lambda r: -r["cost_rub"])
+    out.sort(key=lambda r: (r["cost_usd"] is None, -(r["cost_usd"] or Decimal("0"))))
     return out
 
 

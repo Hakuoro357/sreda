@@ -3,6 +3,8 @@
 Три точки жизненного цикла (вызываются из `react_loop.handle_turn`):
 - `persist_trace_start` — свежий ход, ДО графа: INSERT `in_progress` (DO-NOTHING при гонке/replay).
 - `persist_trace_pause` — confirm-пауза: UPDATE → `awaiting_confirm`+`pending`, ТОЛЬКО из `in_progress`.
+- `persist_trace_abandoned` — #320: брошенная пауза (redirect/#316 или протухание TTL): UPDATE →
+  `done`+`redirected|expired`, ТОЛЬКО из `awaiting_confirm` (лёгкий переход, без reply/структуры).
 - `persist_trace_finish` — финал/resume/handled-error: UPSERT → `done` + структура, ТОЛЬКО из
   `in_progress`/`awaiting_confirm` (терминал НЕИЗМЕНЕН — replay уже-`done` не перезатирает).
 
@@ -86,6 +88,45 @@ def persist_trace_pause(*, tenant_id: str, user_id: str | None, turn_key: str) -
             sess.close()
     except Exception as exc:  # noqa: BLE001
         logger.warning("react_trace: pause failed type=%s", type(exc).__name__)
+
+
+def persist_trace_abandoned(*, tenant_id: str, user_id: str | None, turn_key: str,
+                            reason: str, is_confirm: bool = False) -> None:
+    """#320: пауза брошена БЕЗ resume — терминализация старого ряда, чтобы `awaiting_confirm` не висел
+    вечно (недосчёт redirect в метрике #285/#269; пре-существовало и у протухших пауз).
+
+    reason: "redirected" (#316 — новый запрос на живой паузе → свежий ход) | "expired" (пауза протухла
+    по TTL). Переход `awaiting_confirm` → `done` + confirm_state=reason; confirm_resolution="redirect"
+    только для redirected И is_confirm=True (R1 субагент: у ask_human confirm-а НЕ БЫЛО — не загрязняем
+    confirm-метрику; у expired юзер ничего не решал → NULL). ЛЁГКИЙ переход: reply/структуру НЕ пишем
+    (ход не завершился — перенаправлен/протух), origin/created_at не трогаем. ТОЛЬКО из `awaiting_confirm`
+    (in_progress жив, терминал неизменен). Известная гонка (R1, принято): одновременные resume и redirect
+    одного треда — кто первым закоммитил, тот и пометил ряд; finish после abandoned упрётся в unique-index
+    (IntegrityError → swallow, дубля нет), реальный исход resume в трейсе потеряется — телеметрия, редкость.
+    Guarded — сбой не валит ход."""
+    if not trace_enabled():
+        return
+    try:
+        from sqlalchemy import func, update
+
+        from sreda.db.models import ReactTurnTrace
+        sess = _session()
+        try:
+            sess.execute(
+                update(ReactTurnTrace)
+                .where(ReactTurnTrace.turn_key == turn_key,
+                       ReactTurnTrace.tenant_id == tenant_id,
+                       # nullable-safe user-скоуп — как в pause/finish (R1 MAJOR Codex)
+                       func.coalesce(ReactTurnTrace.user_id, "") == (user_id or ""),
+                       ReactTurnTrace.status == "awaiting_confirm")
+                .values(status="done", confirm_state=reason, finished_at=_now(),
+                        confirm_resolution=("redirect" if (reason == "redirected" and is_confirm)
+                                            else None)))
+            sess.commit()
+        finally:
+            sess.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("react_trace: abandoned failed type=%s", type(exc).__name__)
 
 
 def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str, channel: str,

@@ -55,6 +55,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
     "no_sync_thread: opt-out из autouse threading.Thread monkeypatch в test_admin_alerts (для тестов async-функций, использующих asyncio.to_thread)",
+    "pg: требует настоящий Postgres (роли/RLS/DEFINER); пропускается на дефолтном unit-SQLite (#138)",
 ]
 
 [tool.ruff]

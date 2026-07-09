@@ -3,6 +3,15 @@
 Exercises the full path the worker takes: read pending outbox, resolve
 per-user profile + skill config, apply delivery policy, dispatch to
 telegram / defer / drop. Uses injected ``now`` to control time.
+
+#138 Ф2: воркер САМ открывает seam-сессии (privileged-скан очереди +
+tenant_session на строку), а не принимает общую сессию. Тесты через
+фикстуру ``worker_db`` (коммитящая файловая SQLite + шов ``_factory_for``
+привязан к ней). Сессия теста и сессии воркера — РАЗНЫЕ, поэтому:
+(1) сид (tenant/workspace/user + outbox-строки) коммитим ДО прогона
+воркера, (2) ``worker_db.expire_all()`` перед ассертом на ИЗМЕНЁННЫЙ
+статус засиженной строки (sent/muted/dropped/failed); засиженную строку
+перечитываем ``worker_db.get(OutboxMessage, id)``.
 """
 
 from __future__ import annotations
@@ -12,11 +21,6 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from sreda.db.base import Base
 from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.repositories.user_profile import UserProfileRepository
 from sreda.integrations.max.client import MaxDeliveryError
@@ -64,19 +68,17 @@ class FakeMax:
         return {"success": True}
 
 
-@pytest.fixture()
-def session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    sess = sessionmaker(bind=engine)()
-    sess.add(Tenant(id="t1", name="T"))
-    sess.add(Workspace(id="w1", tenant_id="t1", name="W"))
-    sess.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
-    sess.commit()
-    try:
-        yield sess
-    finally:
-        sess.close()
+def _seed_base(session) -> None:
+    """Tenant + Workspace + User для тенанта t1 (chat_id 42).
+
+    #138: раньше это делала фикстура ``session``; теперь ``worker_db``
+    сид не создаёт, поэтому каждый тест сидит базу сам и коммитит ДО
+    прогона воркера (воркер читает СВОИМ соединением из файловой БД).
+    """
+    session.add(Tenant(id="t1", name="T"))
+    session.add(Workspace(id="w1", tenant_id="t1", name="W"))
+    session.add(User(id="u1", tenant_id="t1", telegram_account_id="42"))
+    session.commit()
 
 
 def _outbox_row(
@@ -127,41 +129,45 @@ def _utc(y, mo, d, h, mi=0) -> datetime:
     return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
 
 
-def test_worker_sends_pending_interactive_row(session):
+def test_worker_sends_pending_interactive_row(worker_db):
+    _seed_base(worker_db)
     telegram = FakeTelegram()
-    worker = OutboxDeliveryWorker(session, telegram_client=telegram)
+    worker = OutboxDeliveryWorker(telegram_client=telegram)
     row = _outbox_row(is_interactive=True)
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 23, 0)))
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "sent"
     assert len(telegram.sent) == 1
 
 
-def test_worker_defers_proactive_row_inside_quiet(session):
-    repo = UserProfileRepository(session)
+def test_worker_defers_proactive_row_inside_quiet(worker_db):
+    _seed_base(worker_db)
+    repo = UserProfileRepository(worker_db)
     repo.update_profile(
         "t1",
         "u1",
         tz="Europe/Moscow",
         quiet_hours=[{"from_hour": 22, "to_hour": 8, "weekdays": list(range(7))}],
     )
-    session.commit()
+    worker_db.commit()
 
     telegram = FakeTelegram()
-    worker = OutboxDeliveryWorker(session, telegram_client=telegram)
+    worker = OutboxDeliveryWorker(telegram_client=telegram)
     # Proactive EDS row at 20:00 UTC == 23:00 MSK (inside quiet)
     row = _outbox_row(feature_key="eds_monitor")
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     now = _utc(2026, 4, 15, 20, 0)
     processed = asyncio.run(worker.process_pending_messages(now=now))
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "pending"
     # Expected exit: 08:00 MSK next day == 05:00 UTC 2026-04-16
     # SQLite strips tzinfo on roundtrip — normalize both sides.
@@ -172,28 +178,31 @@ def test_worker_defers_proactive_row_inside_quiet(session):
     assert len(telegram.sent) == 0
 
 
-def test_worker_drops_muted_proactive_row(session):
-    repo = UserProfileRepository(session)
+def test_worker_drops_muted_proactive_row(worker_db):
+    _seed_base(worker_db)
+    repo = UserProfileRepository(worker_db)
     repo.upsert_skill_config(
         "t1", "u1", "eds_monitor", notification_priority="mute"
     )
-    session.commit()
+    worker_db.commit()
 
     telegram = FakeTelegram()
-    worker = OutboxDeliveryWorker(session, telegram_client=telegram)
+    worker = OutboxDeliveryWorker(telegram_client=telegram)
     row = _outbox_row(feature_key="eds_monitor")
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 12, 0)))
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "muted"
     assert len(telegram.sent) == 0
 
 
-def test_worker_urgent_bypasses_quiet(session):
-    repo = UserProfileRepository(session)
+def test_worker_urgent_bypasses_quiet(worker_db):
+    _seed_base(worker_db)
+    repo = UserProfileRepository(worker_db)
     repo.update_profile(
         "t1",
         "u1",
@@ -203,92 +212,102 @@ def test_worker_urgent_bypasses_quiet(session):
     repo.upsert_skill_config(
         "t1", "u1", "eds_monitor", notification_priority="urgent"
     )
-    session.commit()
+    worker_db.commit()
 
     telegram = FakeTelegram()
-    worker = OutboxDeliveryWorker(session, telegram_client=telegram)
+    worker = OutboxDeliveryWorker(telegram_client=telegram)
     row = _outbox_row(feature_key="eds_monitor")
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     now = _utc(2026, 4, 15, 20, 0)  # 23:00 MSK (quiet)
     processed = asyncio.run(worker.process_pending_messages(now=now))
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "sent"
     assert len(telegram.sent) == 1
 
 
-def test_worker_ignores_future_scheduled(session):
+def test_worker_ignores_future_scheduled(worker_db):
+    _seed_base(worker_db)
     telegram = FakeTelegram()
-    worker = OutboxDeliveryWorker(session, telegram_client=telegram)
+    worker = OutboxDeliveryWorker(telegram_client=telegram)
     # Scheduled for tomorrow — should NOT be picked up now
     row = _outbox_row(scheduled_at=_utc(2026, 4, 16, 5, 0))
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 20, 0)))
     assert processed == 0
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "pending"
 
 
-def test_worker_picks_up_expired_scheduled(session):
+def test_worker_picks_up_expired_scheduled(worker_db):
+    _seed_base(worker_db)
     telegram = FakeTelegram()
-    worker = OutboxDeliveryWorker(session, telegram_client=telegram)
+    worker = OutboxDeliveryWorker(telegram_client=telegram)
     # Scheduled for earlier today; now is after — should go out
     row = _outbox_row(scheduled_at=_utc(2026, 4, 16, 5, 0))
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 16, 6, 0)))
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "sent"
 
 
-def test_worker_defer_then_send_after_quiet(session):
+def test_worker_defer_then_send_after_quiet(worker_db):
     """Full defer-wake cycle: worker defers at 23:00, then picks it up
     automatically at 09:00 and sends."""
-    repo = UserProfileRepository(session)
+    _seed_base(worker_db)
+    repo = UserProfileRepository(worker_db)
     repo.update_profile(
         "t1",
         "u1",
         tz="Europe/Moscow",
         quiet_hours=[{"from_hour": 22, "to_hour": 8, "weekdays": list(range(7))}],
     )
-    session.commit()
+    worker_db.commit()
 
     telegram = FakeTelegram()
-    worker = OutboxDeliveryWorker(session, telegram_client=telegram)
+    worker = OutboxDeliveryWorker(telegram_client=telegram)
     row = _outbox_row(feature_key="eds_monitor")
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     # 23:00 MSK — defer
     asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 20, 0)))
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "pending"
     assert row.scheduled_at is not None
 
     # Wake at 09:00 MSK (06:00 UTC next day)
     asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 16, 6, 0)))
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "sent"
     assert len(telegram.sent) == 1
 
 
-def test_worker_edits_max_ack_message_instead_of_sending_new_message(session):
+def test_worker_edits_max_ack_message_instead_of_sending_new_message(worker_db):
+    _seed_base(worker_db)
     max_client = FakeMax()
-    worker = OutboxDeliveryWorker(session, max_client=max_client)
+    worker = OutboxDeliveryWorker(max_client=max_client)
     row = _max_outbox_row(text="Финальный ответ", ack_message_id="ack-mid-1")
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 23, 0)))
 
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "sent"
     assert max_client.sent == []
     assert max_client.edited == [{
@@ -298,38 +317,42 @@ def test_worker_edits_max_ack_message_instead_of_sending_new_message(session):
     }]
 
 
-def test_worker_skips_max_ack_final_edit_when_already_visible(session):
+def test_worker_skips_max_ack_final_edit_when_already_visible(worker_db):
+    _seed_base(worker_db)
     max_client = FakeMax()
-    worker = OutboxDeliveryWorker(session, max_client=max_client)
+    worker = OutboxDeliveryWorker(max_client=max_client)
     row = _max_outbox_row(text="Финальный ответ", ack_message_id="ack-mid-1")
     payload = json.loads(row.payload_json)
     payload["_ack_final_already_visible"] = True
     row.payload_json = json.dumps(payload, ensure_ascii=False)
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 23, 0)))
 
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "sent"
     assert max_client.edited == []
     assert max_client.sent == []
     assert max_client.deleted == []
 
 
-def test_worker_retries_max_ack_edit_then_falls_back_to_send(session):
+def test_worker_retries_max_ack_edit_then_falls_back_to_send(worker_db):
+    _seed_base(worker_db)
     max_client = FakeMax()
     max_client.edit_failures = 2
-    worker = OutboxDeliveryWorker(session, max_client=max_client)
+    worker = OutboxDeliveryWorker(max_client=max_client)
     row = _max_outbox_row(text="Финальный ответ", ack_message_id="ack-mid-1")
-    session.add(row)
-    session.commit()
+    worker_db.add(row)
+    worker_db.commit()
 
     processed = asyncio.run(worker.process_pending_messages(now=_utc(2026, 4, 15, 23, 0)))
 
     assert processed == 1
-    session.refresh(row)
+    worker_db.expire_all()
+    row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "sent"
     assert max_client.edited == []
     assert max_client.sent == [{

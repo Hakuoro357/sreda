@@ -163,6 +163,7 @@ class HousewifeMenuService:
                 MenuPlanItem(
                     id=f"mpi_{uuid4().hex[:24]}",
                     menu_plan_id=plan.id,
+                    tenant_id=plan.tenant_id,  # #138 Ф3-a: денорм из родителя
                     day_of_week=cell.day_of_week,
                     meal_type=cell.meal_type,
                     recipe_id=cell.recipe_id,
@@ -181,6 +182,7 @@ class HousewifeMenuService:
                 MenuPlanItem(
                     id=f"mpi_{uuid4().hex[:24]}",
                     menu_plan_id=plan.id,
+                    tenant_id=plan.tenant_id,  # #138 Ф3-a: денорм из родителя
                     day_of_week=prior_item.day_of_week,
                     meal_type=prior_item.meal_type,
                     recipe_id=prior_item.recipe_id,
@@ -242,6 +244,7 @@ class HousewifeMenuService:
             item = MenuPlanItem(
                 id=f"mpi_{uuid4().hex[:24]}",
                 menu_plan_id=plan.id,
+                tenant_id=plan.tenant_id,  # #138 Ф3-a: денорм из родителя
                 day_of_week=day_of_week,
                 meal_type=meal_type,
                 recipe_id=recipe_id,

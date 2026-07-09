@@ -33,6 +33,7 @@ from sreda.config.bot_registry import (
 )
 from sreda.db.models.core import OutboxMessage
 from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.db.session import privileged_session, tenant_session
 from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.max.client import MaxClient, MaxDeliveryError
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
@@ -45,12 +46,12 @@ logger = logging.getLogger(__name__)
 class OutboxDeliveryWorker:
     def __init__(
         self,
-        session: Session,
         telegram_client: TelegramClient | None = None,
         max_client: "MaxClient | None" = None,
         registry: TelegramBotRegistry | None = None,
     ) -> None:
-        self.session = session
+        # #138 Ф2: воркер сам ведёт скоупы (privileged-скан очереди + tenant_session
+        # на строку); общую сессию больше не принимает.
         self.telegram = telegram_client
         # MAX channel client (Phase 6 of MAX integration sprint).
         # None — MAX channel delivery будет skip'аться (fallback chain
@@ -66,39 +67,54 @@ class OutboxDeliveryWorker:
         self, *, now: datetime | None = None, limit: int = 50
     ) -> int:
         now_utc = now or datetime.now(timezone.utc)
-        rows = (
-            self.session.query(OutboxMessage)
-            .filter(
-                OutboxMessage.status == "pending",
-                OutboxMessage.channel_type.in_(("telegram", "max")),
-                or_(
-                    OutboxMessage.scheduled_at.is_(None),
-                    OutboxMessage.scheduled_at <= now_utc,
-                ),
-            )
-            .order_by(OutboxMessage.created_at.asc())
-            .limit(limit)
-            .all()
-        )
+        # #138 Ф2: очередь доставки outbox — КРОСС-ТЕНАНТНАЯ (все семьи) →
+        # privileged. Снимок (id, tenant_id); доставка КАЖДОЙ строки — пер-тенант
+        # (своя транзакция вокруг HTTP-send + перехода статуса).
+        with privileged_session("queue-dispatch") as scan:
+            row_ids = [
+                (r.id, r.tenant_id)
+                for r in scan.query(OutboxMessage)
+                .filter(
+                    OutboxMessage.status == "pending",
+                    OutboxMessage.channel_type.in_(("telegram", "max")),
+                    or_(
+                        OutboxMessage.scheduled_at.is_(None),
+                        OutboxMessage.scheduled_at <= now_utc,
+                    ),
+                )
+                .order_by(OutboxMessage.created_at.asc())
+                .limit(limit)
+                .all()
+            ]
         processed = 0
-        for row in rows:
-            await self._process_one(row, now_utc=now_utc)
-            processed += 1
+        for row_id, tenant_id in row_ids:
+            # Пер-строчная изоляция: сбой одной доставки не роняет тик (в отличие
+            # от старой общей сессии — но send/статус-переходы и так ловили ошибки внутри).
+            try:
+                with tenant_session(tenant_id) as s:
+                    row = s.get(OutboxMessage, row_id)
+                    if row is None or row.status != "pending":
+                        continue  # исчезла / уже обработана между сканом и доставкой
+                    await self._process_one(s, row, now_utc=now_utc)
+                processed += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("outbox delivery: failed for row %s", row_id)
+                continue
         return processed
 
-    async def _process_one(self, row: OutboxMessage, *, now_utc: datetime) -> None:
+    async def _process_one(self, session: Session, row: OutboxMessage, *, now_utc: datetime) -> None:
         # #187 soft-delete — fencing (дверь #9): тенант мог быть удалён ПОСЛЕ
         # постановки строки в outbox. Проверяем В ТОЙ ЖЕ TX прямо перед внешней
         # отправкой; удалён → терминируем без send (тот же drop_reason что drain).
         from sreda.services.tenant_lifecycle import is_tenant_active
 
-        if not is_tenant_active(self.session, row.tenant_id):
+        if not is_tenant_active(session, row.tenant_id):
             row.status = "dropped"
             row.drop_reason = "tenant_deleted"
-            self.session.commit()
+            session.commit()
             return
 
-        profile_dict, skill_config_dict = self._load_user_context(row)
+        profile_dict, skill_config_dict = self._load_user_context(session, row)
         decision = decide_delivery(
             profile=profile_dict,
             skill_config=skill_config_dict,
@@ -109,23 +125,23 @@ class OutboxDeliveryWorker:
 
         if decision.kind == DeliveryKind.drop:
             row.status = "muted"
-            self.session.commit()
+            session.commit()
             return
         if decision.kind == DeliveryKind.defer:
             row.scheduled_at = decision.defer_until_utc
             # status stays 'pending'; worker will re-check after defer.
-            self.session.commit()
+            session.commit()
             return
 
         # Send path
-        await self._send_now(row)
+        await self._send_now(session, row)
 
     def _load_user_context(
-        self, row: OutboxMessage
+        self, session: Session, row: OutboxMessage
     ) -> tuple[dict | None, dict | None]:
         if not row.user_id:
             return None, None
-        repo = UserProfileRepository(self.session)
+        repo = UserProfileRepository(session)
         profile = repo.get_profile(row.tenant_id, row.user_id)
         profile_dict: dict | None = None
         if profile is not None:
@@ -145,13 +161,13 @@ class OutboxDeliveryWorker:
                 }
         return profile_dict, skill_config_dict
 
-    async def _send_now(self, row: OutboxMessage) -> None:
+    async def _send_now(self, session: Session, row: OutboxMessage) -> None:
         # Phase 6 of MAX integration sprint (2026-05-04): branch by channel.
         # MAX и Telegram имеют разные SDK / payload форматы — разносим
         # на отдельные методы. Для будущей расширяемости (e.g. дополнительный
         # канал) этот dispatch расширяется одной веткой.
         if row.channel_type == "max":
-            await self._send_now_max(row)
+            await self._send_now_max(session, row)
             return
 
         # Default: Telegram path.
@@ -184,7 +200,7 @@ class OutboxDeliveryWorker:
                     )
                     row.status = "failed"
                     row.drop_reason = "unknown_bot_key"
-                    self.session.commit()
+                    session.commit()
                     return
         else:
             tg_client = self.telegram
@@ -193,14 +209,14 @@ class OutboxDeliveryWorker:
             # Dev/test path with no Telegram wired — just mark sent so
             # tests can assert policy without a client mock.
             row.status = "sent"
-            self.session.commit()
+            session.commit()
             return
         try:
             payload = json.loads(row.payload_json or "{}")
         except json.JSONDecodeError:
             logger.exception("outbox delivery: bad payload_json for %s", row.id)
             row.status = "failed"
-            self.session.commit()
+            session.commit()
             return
 
         # Extract end-to-end trace (if the uvicorn process stashed it
@@ -238,7 +254,7 @@ class OutboxDeliveryWorker:
                 if hook is not None:
                     try:
                         await hook(
-                            session=self.session,
+                            session=session,
                             telegram_client=tg_client,
                             outbox_row=row,
                             payload=payload,
@@ -273,9 +289,9 @@ class OutboxDeliveryWorker:
                 chat_id=payload.get("chat_id"),
                 status="failed",
             )
-        self.session.commit()
+        session.commit()
 
-    async def _send_now_max(self, row: OutboxMessage) -> None:
+    async def _send_now_max(self, session: Session, row: OutboxMessage) -> None:
         """MAX channel send (Phase 6).
 
         Payload contract (mirror TG):
@@ -321,7 +337,7 @@ class OutboxDeliveryWorker:
                 # Dev/test path — token не настроен в env, mark sent
                 # для unit-тестов
                 row.status = "sent"
-            self.session.commit()
+            session.commit()
             return
 
         try:
@@ -329,7 +345,7 @@ class OutboxDeliveryWorker:
         except json.JSONDecodeError:
             logger.exception("max outbox: bad payload_json for %s", row.id)
             row.status = "failed"
-            self.session.commit()
+            session.commit()
             return
 
         trace_payload = payload.pop("_trace", None)
@@ -353,7 +369,7 @@ class OutboxDeliveryWorker:
             self._emit_trace(
                 trace_payload, chat_id=None, status="failed_no_recipient",
             )
-            self.session.commit()
+            session.commit()
             return
 
         # Convert TG-style reply_markup → MAX attachments inline_keyboard.
@@ -379,7 +395,7 @@ class OutboxDeliveryWorker:
                         chat_id=chat_id,
                         status="sent_ack_already_visible",
                     )
-                    self.session.commit()
+                    session.commit()
                     return
                 edit_sent = False
                 for attempt in range(2):
@@ -438,7 +454,7 @@ class OutboxDeliveryWorker:
             self._emit_trace(
                 trace_payload, chat_id=chat_id, status="failed",
             )
-        self.session.commit()
+        session.commit()
 
     @staticmethod
     def _emit_trace(

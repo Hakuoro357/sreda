@@ -187,25 +187,8 @@ async def test_trace_routing_decision_reset_no_stale(db_session, trace_on, monke
     assert rows[1].routing_decision_json is None  # ход2 — СБРОШЕНО, не стейл reminders
 
 
-def test_trace_debug_suppressed_when_trace_enabled(monkeypatch):
-    """Снос #185 dual-write: при trace ВКЛ _persist_debug_turn НЕ пишет react_debug_turns."""
-    import sreda.db.session as _dbsess
-
-    monkeypatch.setenv("SREDA_REACT_TRACE_ENABLED", "1")
-    monkeypatch.setenv("SREDA_REACT_DEBUG_ALL", "1")  # иначе бы писал — проверяем, что trace-gate выше
-    st_mod.get_settings.cache_clear()
-
-    called = []
-    monkeypatch.setattr(_dbsess, "get_session_factory", lambda: called.append(1))
-    try:
-        react_loop._persist_debug_turn(
-            tenant_id="t", user_id="u", thread_id="th", channel="telegram",
-            user_text="x", reply="r", tools=[], kind="final")
-        assert called == [], "при trace ВКЛ react_debug_turns не должен писаться (early-return)"
-    finally:
-        st_mod.get_settings.cache_clear()
-
-
+# test_trace_debug_suppressed_when_trace_enabled УДАЛЁН (#138 Ф3-0): _persist_debug_turn
+# и react_debug_turns снесены целиком — dual-write guard больше не существует.
 @pytest.mark.asyncio
 async def test_trace_never_breaks_turn(db_session, trace_on, monkeypatch):
     """Сбой записи трейса (finish) НЕ роняет ход — пользователь получает ответ."""

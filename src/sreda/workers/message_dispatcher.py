@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 import asyncio
 
 from sreda.db.models import MessageJob
-from sreda.db.session import get_session_factory
+from sreda.db.session import privileged_session, tenant_session
 from sreda.workers.message_queue import (
     HEARTBEAT_INTERVAL_SEC,
     claim_next_job,
@@ -75,7 +75,6 @@ async def process_pending(
     # slow first dispatch doesn't give later jobs in this tick a stale
     # / shortened lease. The fixture parameter ``now`` (when provided
     # by tests) overrides only the first iteration's reference point.
-    SessionLocal = get_session_factory()
     processed = 0
 
     while processed < limit:
@@ -84,7 +83,11 @@ async def process_pending(
         # via the row's ``status='processing'`` + ``lease_expires_at``
         # is enough — no need to keep the SQL transaction open while
         # the heavy turn runs.
-        with SessionLocal() as session, session.begin():
+        # #138 Ф2: очередь message_jobs — КРОСС-ТЕНАНТНАЯ (консьюмер видит
+        # джобы всех семей → maintenance-роль). claim/mark/heartbeat под
+        # privileged_session; сам ход (_dispatch → _process_approved_turn)
+        # ставит свой tenant_ctx (срез-1).
+        with privileged_session("queue-dispatch") as session, session.begin():
             job = claim_next_job(session, worker_id=_WORKER_ID, now=when)
             if job is None:
                 break
@@ -111,7 +114,7 @@ async def process_pending(
         try:
             await _dispatch(job_snapshot)
             now_after = now or datetime.now(timezone.utc)
-            with SessionLocal() as session, session.begin():
+            with privileged_session("queue-dispatch") as session, session.begin():
                 landed = mark_done(
                     session,
                     job_id=job_snapshot.id,
@@ -142,7 +145,7 @@ async def process_pending(
             # 2026-05-25 MINOR-1.
             now_after = now or datetime.now(timezone.utc)
             try:
-                with SessionLocal() as session, session.begin():
+                with privileged_session("queue-dispatch") as session, session.begin():
                     mark_failed(
                         session,
                         job_id=job_snapshot.id,
@@ -234,14 +237,14 @@ async def _heartbeat_loop(
     Cancellation is the normal exit path — the caller cancels this task
     when ``_dispatch`` returns or raises.
     """
-    SessionLocal = get_session_factory()
     while True:
         try:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
         except asyncio.CancelledError:
             return
         try:
-            with SessionLocal() as session, session.begin():
+            # #138 Ф2: extend_lease на кросс-тенантной message_jobs — privileged.
+            with privileged_session("queue-dispatch") as session, session.begin():
                 still_ours = extend_lease(
                     session,
                     job_id=job_id,
@@ -324,13 +327,15 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
     bot_key = job.message_payload.get("bot_key", "sreda")
     inbound_message_id = job.message_payload.get("inbound_message_id")
 
-    SessionLocal = get_session_factory()
     # #187 Phase 1 — soft-delete gate ДО ensure_*. ``job.tenant_id`` известен
     # (NOT NULL) и уже зарезолвлен при enqueue — здесь не нужен account-резолв,
     # гейтим прямо по нему. Удалённый тенант → возвращаемся без обработки;
     # ``process_pending`` затем зовёт ``mark_done`` (job терминально закрыт),
     # без ensure/turn. Existing terminal mechanism — НЕ изобретаем dead_letter.
-    with SessionLocal() as session:
+    # #138 Ф2: tenant известен → пер-тенантная работа (gate/ensure/crash-check)
+    # под tenant_session(job.tenant_id). Провижн НОВОГО тенанта тут не бывает
+    # (резолвлен при enqueue; удалённый ловит gate) → ensure = идемпотентный lookup.
+    with tenant_session(job.tenant_id) as session:
         if not is_tenant_active(session, job.tenant_id):
             logger.info(
                 "dispatcher: tenant %s is soft-deleted — terminal close job "
@@ -343,7 +348,7 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
     # Tenant/Workspace/User rows on first message; without commit those
     # writes get rolled back at ``with`` exit (code-review 2026-05-25
     # MAJOR-1).
-    with SessionLocal() as session, session.begin():
+    with tenant_session(job.tenant_id) as session, session.begin():
         # #136 R2: зеркалим inline path (telegram_inbound.py:462) — передаём
         # bot_key. Без него non-default бот (sreda_home) onboard'ится под
         # дефолтным "sreda": неверная per-bot signup policy + last_bot_key.
@@ -362,7 +367,7 @@ async def _dispatch_telegram(job: _JobSnapshot) -> None:
 
     # Crash detection — see docstring.
     if inbound_message_id is not None:
-        with SessionLocal() as session:
+        with tenant_session(job.tenant_id) as session:
             inbound = session.get(InboundMessage, inbound_message_id)
             status = getattr(inbound, "processing_status", None) if inbound else None
         if status != "processed":

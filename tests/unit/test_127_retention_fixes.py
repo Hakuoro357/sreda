@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -34,7 +35,6 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.db.models.planner import PlannerExecution, StepExecutionLedger
-from sreda.db.models.react_debug import ReactDebugTurn  # #185 — регистрация таблицы для create_all
 from sreda.db.models.react_trace import ReactTurnTrace  # #192 — регистрация для create_all
 from sreda.db.models.runtime import AgentRun, AgentThread
 from sreda.maintenance.retention_cleanup import cleanup_runtime_retention
@@ -171,7 +171,7 @@ async def test_failure_backoff_prevents_storm(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr(rw_module, "cleanup_runtime_retention", boom)
     monkeypatch.setattr(rw_module, "send_admin_alert", lambda *a, **kw: None)
 
-    w = RetentionWorker(MagicMock(), state_file=str(tmp_path / "st.json"))
+    w = RetentionWorker(state_file=str(tmp_path / "st.json"))
     assert await w.process_pending() == 0
     assert boom.call_count == 1
     # следующий тик (через «секунду») — чистка НЕ зовётся
@@ -191,7 +191,7 @@ async def test_alert_after_three_consecutive_failures(
     )
 
     state = tmp_path / "st.json"
-    w = RetentionWorker(MagicMock(), state_file=str(state))
+    w = RetentionWorker(state_file=str(state))
     for i in range(3):
         # каждый заход — «после отката»: сдвигаем записанное время назад
         if state.exists():
@@ -223,7 +223,7 @@ async def test_success_resets_failure_streak(tmp_path: Path, monkeypatch) -> Non
         "failure_count": 2,
     }), encoding="utf-8")
 
-    w = RetentionWorker(MagicMock(), state_file=str(state))
+    w = RetentionWorker(state_file=str(state))
     assert await w.process_pending() == 1
     data = json.loads(state.read_text(encoding="utf-8"))
     assert data.get("failure_count", 0) == 0
@@ -250,13 +250,22 @@ def test_inbound_cleanup_chunks_cover_backlog(session, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_success_commits_db_transaction(tmp_path: Path, monkeypatch) -> None:
-    """Codex R1 CRITICAL: cleanup только flush'ит, job_runner закрывает
-    сессию без commit — успех обязан коммититься ВОРКЕРОМ до записи state."""
+    """Codex R1 CRITICAL: cleanup только flush'ит — успех обязан коммититься
+    ВОРКЕРОМ (session.commit) до записи state. #138 Ф2: сессия теперь СВОЯ
+    (privileged_session), поэтому мокаем шов и проверяем, что commit вызван на
+    сессии, которую воркер получил из privileged_session("retention")."""
     ok = MagicMock()
     ok.return_value.total = 3
     monkeypatch.setattr(rw_module, "cleanup_runtime_retention", ok)
     sess = MagicMock()
-    w = RetentionWorker(sess, state_file=str(tmp_path / "st.json"))
+
+    @contextmanager
+    def _fake_priv(reason):
+        assert reason == "retention"  # чистка обязана идти под retention-ролью
+        yield sess
+    monkeypatch.setattr(rw_module, "privileged_session", _fake_priv)
+
+    w = RetentionWorker(state_file=str(tmp_path / "st.json"))
     assert await w.process_pending() == 3
     sess.commit.assert_called_once()
 
@@ -265,16 +274,26 @@ async def test_success_commits_db_transaction(tmp_path: Path, monkeypatch) -> No
 async def test_commit_failure_recorded_as_failure(
     tmp_path: Path, monkeypatch,
 ) -> None:
+    """Провал commit'а = провал прогона (записан в state, успех НЕ подделан).
+    #138 Ф2: rollback перенесён на privileged_session (его finally закрывает
+    свою сессию); воркер лишь ловит исключение и пишет провал — проверяем
+    именно инвариант #127 (failure_count=1, last_run_at отсутствует), а не
+    вызов rollback на сессии (это теперь ответственность шва, покрыта его тестами)."""
     ok = MagicMock()
     ok.return_value.total = 3
     monkeypatch.setattr(rw_module, "cleanup_runtime_retention", ok)
     monkeypatch.setattr(rw_module, "send_admin_alert", lambda *a, **kw: None)
     sess = MagicMock()
     sess.commit.side_effect = RuntimeError("commit down")
+
+    @contextmanager
+    def _fake_priv(reason):
+        yield sess
+    monkeypatch.setattr(rw_module, "privileged_session", _fake_priv)
+
     state = tmp_path / "st.json"
-    w = RetentionWorker(sess, state_file=str(state))
+    w = RetentionWorker(state_file=str(state))
     assert await w.process_pending() == 0
-    sess.rollback.assert_called()
     data = json.loads(state.read_text(encoding="utf-8"))
     assert data["failure_count"] == 1 and "last_run_at" not in data
 
@@ -291,7 +310,7 @@ async def test_corrupt_failure_count_does_not_break_failure_path(
     state = tmp_path / "st.json"
     state.write_text(json.dumps({"failure_count": "bad"}), encoding="utf-8")
 
-    w = RetentionWorker(MagicMock(), state_file=str(state))
+    w = RetentionWorker(state_file=str(state))
     assert await w.process_pending() == 0  # не подняло исключение
     data = json.loads(state.read_text(encoding="utf-8"))
     assert data["failure_count"] == 1
@@ -312,7 +331,7 @@ async def test_naive_timestamp_in_state_does_not_crash(
         json.dumps({"last_run_at": "2026-06-11T10:00:00"}),  # без таймзоны
         encoding="utf-8",
     )
-    w = RetentionWorker(MagicMock(), state_file=str(state))
+    w = RetentionWorker(state_file=str(state))
     await w.process_pending()  # главное — не TypeError
 
 
@@ -419,25 +438,8 @@ def test_planner_exec_skew_and_stuck_live_fk_safe_164(session) -> None:
     assert session.get(AgentRun, "run_recent") is not None
 
 
-def test_react_debug_turns_retention_185(session) -> None:
-    """#185: react_debug_turns старше TTL (14д) удаляются, свежие остаются."""
-    now = datetime.now(timezone.utc)
-    session.add_all([
-        ReactDebugTurn(id="rdt_old", tenant_id="t", user_id="u", thread_id="th",
-                       channel="telegram", kind="final", user_text="старое",
-                       reply_text="ответ", tools_json="[]",
-                       created_at=now - timedelta(days=20)),
-        ReactDebugTurn(id="rdt_new", tenant_id="t", user_id="u", thread_id="th",
-                       channel="telegram", kind="final", user_text="свежее",
-                       reply_text="ответ", tools_json="[]",
-                       created_at=now - timedelta(days=2)),
-    ])
-    session.commit()
-    result = cleanup_runtime_retention(session, now=now)
-    session.commit()
-    remaining = {r.id for r in session.query(ReactDebugTurn).all()}
-    assert remaining == {"rdt_new"}, remaining   # старше 14д удалено, свежее осталось
-    assert result.react_debug_turns == 1
+# test_react_debug_turns_retention_185 УДАЛЁН (#138 Ф3-0): таблица react_debug_turns
+# дропнута миграцией вместе с ретеншн-веткой (#185 закрыт durable-трейсом #192).
 
 
 # ---------------------------------------------------------------------------

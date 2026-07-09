@@ -35,6 +35,7 @@ from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage, User, Workspace
 from sreda.db.models.user_profile import TenantUserSkillConfig
 from sreda.db.repositories.user_profile import UserProfileRepository
+from sreda.db.session import privileged_session, tenant_session
 from sreda.services.housewife_onboarding import (
     HOUSEWIFE_FEATURE_KEY,
     STATUS_NOT_STARTED,
@@ -68,10 +69,10 @@ class HousewifeOnboardingKickoffWorker:
     """
 
     def __init__(
-        self, session: Session, *, system_bot_key: str | None = None, registry=None,
+        self, *, system_bot_key: str | None = None, registry=None,
     ) -> None:
-        self.session = session
-        self.service = HousewifeOnboardingService(session)
+        # #138 Ф2: воркер сам ведёт скоупы (privileged-скан configs +
+        # tenant_session на юзера); общую сессию/service больше не держит.
         # Phase 5: bot_key for system-generated outbox rows (no reminder
         # origin). Sourced from registry.system_default_bot_key in job_runner.
         self._system_bot_key = system_bot_key or LEGACY_NULL_BOT_KEY
@@ -79,60 +80,68 @@ class HousewifeOnboardingKickoffWorker:
         # user's CURRENT bot (user.last_bot_key). Optional — None → fall back
         # to _system_bot_key (pre-#109 behaviour).
         self._registry = registry
-        self.repo = UserProfileRepository(session)
 
     async def process_pending(
         self, *, limit: int = 50, now: datetime | None = None
     ) -> int:
         current = now or datetime.now(timezone.utc)
-        # #187 soft-delete — producer-фильтр (дверь #10): исключаем удалённых
-        # тенантов из забора онбординга (JOIN tenants ... AND deleted_at IS NULL).
         from sreda.db.models.core import Tenant
 
-        rows = (
-            self.session.query(TenantUserSkillConfig)
-            .join(Tenant, Tenant.id == TenantUserSkillConfig.tenant_id)
-            .filter(
-                TenantUserSkillConfig.feature_key == HOUSEWIFE_FEATURE_KEY,
-                Tenant.deleted_at.is_(None),
-            )
-            .limit(limit * 5)  # over-fetch; most are already in_progress
-            .all()
-        )
-        fired = 0
-        for row in rows:
-            if fired >= limit:
-                break
-            params = UserProfileRepository.decode_skill_params(row)
-            ob = params.get("onboarding") or {}
-            if ob.get("status") != STATUS_NOT_STARTED:
-                continue
-            kickoff_iso = ob.get("kickoff_scheduled_at")
-            if not kickoff_iso:
-                continue
-            try:
-                kickoff_at = datetime.fromisoformat(kickoff_iso)
-            except ValueError:
-                logger.warning(
-                    "housewife_onboarding: bad kickoff_scheduled_at=%r on tenant=%s user=%s",
-                    kickoff_iso, row.tenant_id, row.user_id,
+        # #138 Ф2: скан configs всех семей — КРОСС-ТЕНАНТНЫЙ → privileged.
+        # Фильтруем (status/kickoff) ПРЯМО в скан-сессии (decode_skill_params
+        # читает шифр-поле), снимаем (tenant_id, user_id) готовых к запуску.
+        # #187 soft-delete producer-фильтр (дверь #10): JOIN tenants deleted_at IS NULL.
+        to_fire: list[tuple[str, str]] = []
+        with privileged_session("monitor") as scan:
+            rows = (
+                scan.query(TenantUserSkillConfig)
+                .join(Tenant, Tenant.id == TenantUserSkillConfig.tenant_id)
+                .filter(
+                    TenantUserSkillConfig.feature_key == HOUSEWIFE_FEATURE_KEY,
+                    Tenant.deleted_at.is_(None),
                 )
-                continue
-            if kickoff_at.tzinfo is None:
-                kickoff_at = kickoff_at.replace(tzinfo=timezone.utc)
-            if kickoff_at > current:
-                continue
+                .limit(limit * 5)  # over-fetch; most are already in_progress
+                .all()
+            )
+            for row in rows:
+                if len(to_fire) >= limit:
+                    break
+                params = UserProfileRepository.decode_skill_params(row)
+                ob = params.get("onboarding") or {}
+                if ob.get("status") != STATUS_NOT_STARTED:
+                    continue
+                kickoff_iso = ob.get("kickoff_scheduled_at")
+                if not kickoff_iso:
+                    continue
+                try:
+                    kickoff_at = datetime.fromisoformat(kickoff_iso)
+                except ValueError:
+                    logger.warning(
+                        "housewife_onboarding: bad kickoff_scheduled_at=%r on tenant=%s user=%s",
+                        kickoff_iso, row.tenant_id, row.user_id,
+                    )
+                    continue
+                if kickoff_at.tzinfo is None:
+                    kickoff_at = kickoff_at.replace(tzinfo=timezone.utc)
+                if kickoff_at > current:
+                    continue
+                to_fire.append((row.tenant_id, row.user_id))
+
+        fired = 0
+        for tenant_id, user_id in to_fire:
+            # Запуск КОНКРЕТНОГО юзера — пер-тенант, своя транзакция.
             try:
-                if self._fire(row.tenant_id, row.user_id):
-                    fired += 1
+                with tenant_session(tenant_id) as s:
+                    if self._fire(s, tenant_id, user_id):
+                        s.commit()
+                        fired += 1
             except Exception:  # noqa: BLE001 — one bad user must not kill the batch
                 logger.exception(
                     "housewife_onboarding: kickoff failed tenant=%s user=%s",
-                    row.tenant_id, row.user_id,
+                    tenant_id, user_id,
                 )
                 continue
         if fired:
-            self.session.commit()
             logger.info("housewife onboarding: kicked off for %d user(s)", fired)
         return fired
 
@@ -140,7 +149,7 @@ class HousewifeOnboardingKickoffWorker:
     # internals
     # ------------------------------------------------------------------
 
-    def _fire(self, tenant_id: str, user_id: str) -> bool:
+    def _fire(self, session: Session, tenant_id: str, user_id: str) -> bool:
         """Send intro + flip status. Returns True if at least one outbox
         row was enqueued; False on soft failures (no channel binding,
         no workspace) so the caller can decide whether to count it.
@@ -156,8 +165,8 @@ class HousewifeOnboardingKickoffWorker:
         # (даже под одним tenant'ом) недопустимо.
         # Codex R2 MAJOR: defensive cross-tenant check — user.tenant_id
         # должен совпадать с tenant_id аргумента, иначе data inconsistency.
-        tenant = self.session.get(_Tenant, tenant_id)
-        user = self.session.get(User, user_id)
+        tenant = session.get(_Tenant, tenant_id)
+        user = session.get(User, user_id)
         if user is not None and user.tenant_id != tenant_id:
             logger.warning(
                 "housewife_onboarding: user %s belongs to tenant %s "
@@ -166,7 +175,7 @@ class HousewifeOnboardingKickoffWorker:
             )
             return False
         routings = resolve_outbox_routings(
-            self.session, tenant=tenant, user=user,
+            session, tenant=tenant, user=user,
             telegram_bot_keys=self._registry,
         )
 
@@ -177,7 +186,7 @@ class HousewifeOnboardingKickoffWorker:
                 tenant_id, user_id,
             )
             return False
-        workspace_id = self._resolve_workspace_id(tenant_id)
+        workspace_id = self._resolve_workspace_id(session, tenant_id)
         if not workspace_id:
             logger.warning(
                 "housewife_onboarding: no workspace for tenant=%s, skipping",
@@ -188,7 +197,7 @@ class HousewifeOnboardingKickoffWorker:
         # Flip state first. If enqueue fails below we still want status
         # to reflect "we tried" — otherwise next tick re-fires and
         # duplicates the intro.
-        self.service.start(tenant_id=tenant_id, user_id=user_id)
+        HousewifeOnboardingService(session).start(tenant_id=tenant_id, user_id=user_id)
 
         for routing in routings:
             payload = {
@@ -212,13 +221,13 @@ class HousewifeOnboardingKickoffWorker:
                 outbox.user_id = user_id
             if hasattr(OutboxMessage, "is_interactive"):
                 outbox.is_interactive = False
-            self.session.add(outbox)
-        self.session.flush()
+            session.add(outbox)
+        session.flush()
         return True
 
-    def _resolve_workspace_id(self, tenant_id: str) -> str | None:
+    def _resolve_workspace_id(self, session: Session, tenant_id: str) -> str | None:
         ws = (
-            self.session.query(Workspace)
+            session.query(Workspace)
             .filter(Workspace.tenant_id == tenant_id)
             .order_by(Workspace.id.asc())
             .first()

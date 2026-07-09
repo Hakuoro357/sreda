@@ -79,8 +79,10 @@ def _seed_checklist(harness) -> None:
                            user_id="user_1", title="Дела на дачу",
                            status="active"))
         sess.add(ChecklistItem(id="clitem_" + "cd" * 12, checklist_id=cid,
+                               tenant_id=harness.tenant,
                                title="Полить рассаду", position=1))
         sess.add(ChecklistItem(id="clitem_" + "ef" * 12, checklist_id=cid,
+                               tenant_id=harness.tenant,
                                title="Купить шланг", position=2))
         sess.commit()
     finally:

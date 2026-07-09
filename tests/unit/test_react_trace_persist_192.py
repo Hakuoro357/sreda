@@ -63,6 +63,48 @@ def test_lifecycle_start_pause_finish(persist):
     assert r.origin_user_text == "напомни купить молоко"  # origin не затёрт
 
 
+def test_abandoned_terminalizes_awaiting_confirm(persist):
+    """#320.1: брошенная пауза (redirect/#316 ИЛИ протухание) → awaiting_confirm НЕ висит вечно:
+    done + confirm_state=redirected|expired; confirm_resolution=redirect ТОЛЬКО у redirected confirm-паузы
+    (ask_human redirect НЕ загрязняет confirm-метрику — R1 субагент)."""
+    p, SF = persist
+    for reason, is_confirm, want_res in (("redirected", True, "redirect"),
+                                         ("redirected", False, None),   # ask_human redirect
+                                         ("expired", True, None), ("expired", False, None)):
+        tk = f"react:tg:t1:ab-{reason}-{is_confirm}"
+        p.persist_trace_start(tenant_id="t1", user_id="u1", thread_id="th", channel="tg",
+                              turn_key=tk, origin_user_text="удали задачу X")
+        p.persist_trace_pause(tenant_id="t1", user_id="u1", turn_key=tk)
+        p.persist_trace_abandoned(tenant_id="t1", user_id="u1", turn_key=tk,
+                                  reason=reason, is_confirm=is_confirm)
+        r = _row(SF, tk)[0]
+        assert r.status == "done" and r.confirm_state == reason, (reason, r.status, r.confirm_state)
+        assert r.confirm_resolution == want_res, (reason, is_confirm, r.confirm_resolution)
+        assert r.finished_at is not None
+        assert r.origin_user_text == "удали задачу X"  # origin не затёрт (лёгкий переход)
+
+
+def test_abandoned_only_from_awaiting_confirm(persist):
+    """#320.1: терминал/живой ход НЕ трогаем — abandoned применяется ТОЛЬКО из awaiting_confirm."""
+    p, SF = persist
+    # in_progress (живой ход) — не трогаем
+    tk1 = "react:tg:t1:ab-live"
+    p.persist_trace_start(tenant_id="t1", user_id="u1", thread_id="th", channel="tg",
+                          turn_key=tk1, origin_user_text="x")
+    p.persist_trace_abandoned(tenant_id="t1", user_id="u1", turn_key=tk1, reason="expired")
+    assert _row(SF, tk1)[0].status == "in_progress"
+    # done (терминал) — неизменен
+    tk2 = "react:tg:t1:ab-done"
+    p.persist_trace_start(tenant_id="t1", user_id="u1", thread_id="th", channel="tg",
+                          turn_key=tk2, origin_user_text="x")
+    p.persist_trace_finish(tenant_id="t1", user_id="u1", thread_id="th", channel="tg",
+                           turn_key=tk2, reply_text="ок", llm_calls=[], tool_calls=[],
+                           confirm_state="none", outcome="ok", passes=1)
+    p.persist_trace_abandoned(tenant_id="t1", user_id="u1", turn_key=tk2, reason="redirected")
+    r = _row(SF, tk2)[0]
+    assert r.status == "done" and r.confirm_state == "none"  # abandoned не перезаписал финал
+
+
 def test_finish_stores_routing_decision(persist):
     """#221 Ф3b: persist_trace_finish пишет routing_decision_json; без аргумента (disabled) — NULL."""
     p, SF = persist

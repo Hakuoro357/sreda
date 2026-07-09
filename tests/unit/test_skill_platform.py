@@ -102,41 +102,46 @@ def test_stub_skill_manifest_creates_tenant_state(session, stub_registry):
 # ---------------------------------------------------------------------------
 
 
-def test_skill_platform_processor_creates_run_and_attempt(session, stub_registry):
-    job = Job(
-        id=f"job_{uuid4().hex[:24]}",
+def test_skill_platform_processor_creates_run_and_attempt(worker_db, stub_registry):
+    # #138 Ф2: процессор сам открывает seam-сессии (privileged-скан jobs +
+    # tenant_session на job) → фикстура worker_db (сид + ассерты); сид коммитим
+    # ДО прогона; expire_all перед ассертами на изменённый job.status.
+    worker_db.add(Tenant(id="t1", name="Tenant 1"))
+    worker_db.add(Workspace(id="w1", tenant_id="t1", name="Workspace 1"))
+    job_id = f"job_{uuid4().hex[:24]}"
+    worker_db.add(Job(
+        id=job_id,
         tenant_id="t1",
         workspace_id="w1",
         job_type=STUB_SKILL_NOOP_JOB_TYPE,
         status="pending",
         payload_json="{}",
-    )
-    session.add(job)
-    session.commit()
+    ))
+    worker_db.commit()
 
-    processor = SkillPlatformJobProcessor(session, stub_registry)
+    processor = SkillPlatformJobProcessor(stub_registry)
     processed = asyncio.run(processor.process_pending_jobs(limit=10))
     assert processed == 1
 
-    session.expire_all()
-    refreshed_job = session.get(Job, job.id)
+    worker_db.expire_all()
+    refreshed_job = worker_db.get(Job, job_id)
     assert refreshed_job.status == "completed"
 
-    runs = session.query(SkillRun).filter_by(feature_key=STUB_SKILL_FEATURE_KEY).all()
+    runs = worker_db.query(SkillRun).filter_by(feature_key=STUB_SKILL_FEATURE_KEY).all()
     assert len(runs) == 1
     run = runs[0]
     assert run.status == SkillRunStatus.succeeded.value
     assert run.tenant_id == "t1"
-    assert run.run_key == f"job:{job.id}"
+    assert run.run_key == f"job:{job_id}"
 
-    attempts = session.query(SkillRunAttempt).filter_by(run_id=run.id).all()
+    attempts = worker_db.query(SkillRunAttempt).filter_by(run_id=run.id).all()
     assert len(attempts) == 1
     assert attempts[0].status == "succeeded"
-    assert attempts[0].job_id == job.id
+    assert attempts[0].job_id == job_id
 
     # Lazy tenant_skill_state was created by the processor.
     state = (
-        session.query(TenantSkillState)
+        worker_db.query(TenantSkillState)
         .filter_by(tenant_id="t1", feature_key=STUB_SKILL_FEATURE_KEY)
         .one()
     )

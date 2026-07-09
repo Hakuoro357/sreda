@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
 from sreda.config.settings import get_settings
+from sreda.db.session import privileged_session, tenant_session
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.repositories.memory import (
     CategoryConfirmMismatch,
@@ -462,6 +464,36 @@ def _require_miniapp_auth(
     )
 
 
+async def get_tenant_db(
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> AsyncGenerator[Session, None]:
+    """#138 Ф2 (5a): тело mini-app роута — под ``tenant_session`` резолвнутого
+    тенанта (RLS-скоуп при Ф5). ЗАВИСИТ от ``_require_miniapp_auth`` → FastAPI
+    резолвит auth ПЕРВЫМ (порядок session/ctx в сигнатуре роута не важен) и
+    переиспользует ту же MiniAppContext (кеш зависимостей). Auth-сессия
+    (резолв/провижн) идёт отдельно через get_session (5b → privileged identity).
+
+    ASYNC (не sync): tenant_session ставит/сбрасывает ContextVar токенами;
+    sync-gen-зависимость FastAPI гоняет в threadpool (anyio копирует контекст) →
+    enter/exit в РАЗНЫХ контекстах → reset падает ValueError. Async-gen идёт в
+    том же таске событийного цикла → set/reset в одном контексте."""
+    with tenant_session(ctx.tenant_id) as session:
+        yield session
+
+
+async def get_channel_link_db(
+    ctx: MiniAppContext = Depends(_require_miniapp_auth),
+) -> AsyncGenerator[Session, None]:
+    """#138 R2 M4: channel-link роуты (start/consume/cancel) — КРОСС-ТЕНАНТНАЯ
+    identity-операция: consume_link ищет токен глобально по хешу, читает source_user
+    ЧУЖОГО тенанта, пишет audit_log. Под tenant_session(ctx) при Ф5 это невидимо/
+    запрещено RLS. Идём под privileged("channel-link") (maintenance-роль). Async —
+    та же причина, что get_tenant_db (ContextVar seam). Auth сохраняется (ctx нужен
+    роутам для source-тенанта/rate-limit)."""
+    with privileged_session("channel-link") as session:
+        yield session
+
+
 # ---------------------------------------------------------------------------
 # Request / response schemas
 # ---------------------------------------------------------------------------
@@ -549,7 +581,7 @@ async def client_diagnostic(request: Request) -> dict:
 
 @router.get("/api/v1/summary")
 def get_summary(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     billing = BillingService(session)
@@ -716,7 +748,7 @@ def _iso(dt) -> str | None:
 
 @router.get("/api/v1/plans")
 def get_plans(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     billing = BillingService(session)
@@ -759,7 +791,7 @@ def get_plans(
 @router.post("/api/v1/subscribe")
 def subscribe(
     body: PlanKeyBody,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     billing = BillingService(session)
@@ -795,7 +827,7 @@ def subscribe(
 @router.post("/api/v1/cancel")
 def cancel(
     body: PlanKeyBody,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     billing = BillingService(session)
@@ -818,7 +850,7 @@ def cancel(
 @router.post("/api/v1/resume")
 def resume(
     body: PlanKeyBody,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     # #181 Phase B: resume only ever applied to the EDS base subscription, which
@@ -828,7 +860,7 @@ def resume(
 
 @router.post("/api/v1/renew")
 def renew(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     billing = BillingService(session)
@@ -960,8 +992,10 @@ def _collect_menu_sections(
 # 2026-06-25 (#233): текущий UX не устраивает, нужна доработка. Бэкенд НЕ
 # тронут — tasks-API, экран #/schedule и приватный скил housewife остаются;
 # секция просто не инжектится в home (как платформенный tile «Подписки»).
+# «Семья» (id="family") скрыта по решению владельца 2026-07-04: убрать ссылку из
+# home. Бэкенд/route #/family/family-API остаются, тайл не инжектится.
 # Снять сокрытие = убрать id из набора.
-_HIDDEN_MENU_SECTION_IDS: frozenset[str] = frozenset({"schedule"})
+_HIDDEN_MENU_SECTION_IDS: frozenset[str] = frozenset({"schedule", "family"})
 
 
 def _menu_items_for_render(sections: list[MiniAppSection]) -> list[dict]:
@@ -983,7 +1017,7 @@ def _menu_items_for_render(sections: list[MiniAppSection]) -> list[dict]:
 
 @router.get("/api/v1/menu")
 def get_menu(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Home-screen menu for the Mini App.
@@ -1027,7 +1061,7 @@ def _reminder_to_dict(reminder) -> dict:
 
 @router.get("/api/v1/reminders")
 def list_reminders(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """List pending reminders for the current tenant + user.
@@ -1045,7 +1079,7 @@ def list_reminders(
 @router.post("/api/v1/reminders/{reminder_id}/cancel")
 def cancel_reminder(
     reminder_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     service = HousewifeReminderService(session)
@@ -1083,7 +1117,7 @@ def _shopping_item_to_dict(row) -> dict:
 
 @router.get("/api/v1/shopping")
 def list_shopping(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """All ``pending`` shopping items for (tenant, user), ordered by
@@ -1097,7 +1131,7 @@ def list_shopping(
 @router.post("/api/v1/shopping")
 def add_shopping_item(
     body: ShoppingItemCreate,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Add one item from the Mini App inline input. LLM-driven bulk
@@ -1126,7 +1160,7 @@ def add_shopping_item(
 @router.post("/api/v1/shopping/{item_id}/bought")
 def mark_shopping_bought_endpoint(
     item_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Checkbox flip in Mini App → ``status='bought'``."""
@@ -1142,7 +1176,7 @@ def mark_shopping_bought_endpoint(
 @router.delete("/api/v1/shopping/{item_id}")
 def delete_shopping_item(
     item_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Trash icon / swipe-to-delete — cancel without buying.
@@ -1161,7 +1195,7 @@ def delete_shopping_item(
 
 @router.post("/api/v1/shopping/clear-bought")
 def clear_bought_shopping_endpoint(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Bulk housekeeping — cancel every item in ``bought`` state.
@@ -1173,7 +1207,7 @@ def clear_bought_shopping_endpoint(
 
 @router.post("/api/v1/shopping/clear-all")
 def clear_all_shopping_endpoint(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Cancel every pending item — the "Очистить всё" button on the
@@ -1237,7 +1271,7 @@ def _recipe_detail_dict(row) -> dict:
 @router.get("/api/v1/recipes")
 def list_recipes(
     q: str | None = None,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """List the user's recipe book (most recent first). ``?q=...``
@@ -1253,7 +1287,7 @@ def list_recipes(
 @router.get("/api/v1/recipes/{recipe_id}")
 def get_recipe_endpoint(
     recipe_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Full recipe with ingredients + instructions for the detail view."""
@@ -1269,7 +1303,7 @@ def get_recipe_endpoint(
 @router.delete("/api/v1/recipes/{recipe_id}")
 def delete_recipe_endpoint(
     recipe_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Delete a recipe from the user's book. Cascades to ingredients."""
@@ -1340,7 +1374,7 @@ def _menu_plan_dict(plan, *, tenant_id: str, user_id: str | None) -> dict:
 @router.get("/api/v1/weekly-menu")
 def get_weekly_menu(
     week_start: str | None = None,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Fetch the user's weekly menu grid (read-only, #235).
@@ -1495,7 +1529,7 @@ def _current_monday(today: date) -> date:
 @router.get("/api/v1/schedule/week")
 def get_week_schedule(
     start: str | None = None,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Return a 7-day window starting at ``start`` (ISO date, Monday-
@@ -1635,7 +1669,7 @@ def _family_member_dict(row) -> dict:
 
 @router.get("/api/v1/family")
 def list_family(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """All family members for the current user, ordered by role."""
@@ -1647,7 +1681,7 @@ def list_family(
 @router.post("/api/v1/family")
 def add_family_member_endpoint(
     body: FamilyMemberCreate,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Add one family member from Mini App UI."""
@@ -1671,7 +1705,7 @@ def add_family_member_endpoint(
 def update_family_member_endpoint(
     member_id: str,
     body: FamilyMemberPatch,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Update any subset of fields. Pass only what changed."""
@@ -1697,7 +1731,7 @@ def update_family_member_endpoint(
 @router.delete("/api/v1/family/{member_id}")
 def delete_family_member_endpoint(
     member_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     service = HousewifeFamilyService(session)
@@ -1716,7 +1750,7 @@ def delete_family_member_endpoint(
 
 @router.get("/api/v1/checklists")
 def list_checklists_endpoint(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """All ACTIVE checklists with their items embedded.
@@ -1776,7 +1810,7 @@ def list_checklists_endpoint(
 @router.post("/api/v1/checklist/items/{item_id}/toggle")
 def toggle_checklist_item_endpoint(
     item_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Toggle pending ↔ done для пункта чек-листа из Mini App.
@@ -1834,7 +1868,7 @@ def toggle_checklist_item_endpoint(
 @router.get("/api/v1/checklist/{checklist_id}")
 def get_checklist_endpoint(
     checklist_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """R-33 (2026-05-15): single checklist + items + linked_task_id (если есть).
@@ -1912,7 +1946,7 @@ def get_checklist_endpoint(
 @router.post("/api/v1/checklist/{checklist_id}/archive")
 def archive_checklist_endpoint(
     checklist_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """R-31 (2026-05-15): archive checklist from Mini App.
@@ -2140,7 +2174,7 @@ def _consume_outcome_dict(outcome) -> dict:
 @router.post("/api/v1/channel-link/start")
 async def channel_link_start(
     request: Request,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_channel_link_db),
 ):
     """Initiate a channel-linking attempt. Юзер сейчас в source channel
     (mini-app), хочет привязать opposite channel.
@@ -2272,7 +2306,7 @@ async def channel_link_start(
 @router.post("/api/v1/channel-link/consume")
 async def channel_link_consume(
     request: Request,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_channel_link_db),
 ):
     """Consume a linking token. Юзер сейчас в target channel mini-app
     (открыл deep-link от source mini-app), backend получает target initData
@@ -2332,7 +2366,7 @@ async def channel_link_consume(
 @router.post("/api/v1/channel-link/cancel")
 async def channel_link_cancel(
     request: Request,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_channel_link_db),
 ):
     """Invalidate a pending token from the target-side mini-app."""
     settings = get_settings()
@@ -2382,7 +2416,7 @@ async def channel_link_cancel(
 @router.get("/api/v1/channel-link/account-status")
 async def channel_link_account_status(
     request: Request,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
 ):
     """Return whether current user's opposite-channel account is linked."""
     settings = get_settings()
@@ -2414,7 +2448,7 @@ async def channel_link_account_status(
 async def channel_link_status(
     request: Request,
     id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
 ):
     """Polling endpoint для source-side mini-app. Возвращает текущий
     used_at статус токена. Frontend пуллит каждые 2с до used_at != null
@@ -2513,7 +2547,7 @@ def _map_memory_category_error(exc: MemoryCategoryError) -> HTTPException:
 
 @router.get("/api/v1/memory/categories")
 def list_memory_categories(
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Категории памяти юзера (Common первой) + счётчик фактов. Лениво гарантирует Common (дом по умолчанию
@@ -2534,7 +2568,7 @@ def list_memory_categories(
 @router.post("/api/v1/memory/categories")
 def create_memory_category(
     body: MemoryCategoryCreate,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     repo = MemoryRepository(session)
@@ -2552,7 +2586,7 @@ def create_memory_category(
 def rename_memory_category(
     category_id: str,
     body: MemoryCategoryRename,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     repo = MemoryRepository(session)
@@ -2577,7 +2611,7 @@ def rename_memory_category(
 def delete_memory_category(
     category_id: str,
     confirm_count: int = Query(ge=0),  # отрицательное — заведомо невалидно → 422 (не 409)
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Удалить категорию ВМЕСТЕ с фактами. confirm_count (query) — сколько фактов клиент видел; расхождение
@@ -2598,7 +2632,7 @@ def delete_memory_category(
 @router.get("/api/v1/memory/facts")
 def list_memory_facts(
     category_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Факты одной категории (фронт группирует по ярусу внутри). 404 если категория не существует/чужая."""
@@ -2612,7 +2646,7 @@ def list_memory_facts(
 def edit_memory_fact(
     memory_id: str,
     body: MemoryFactEdit,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Правка текста факта + СИНХРОННЫЙ пере-эмбеддинг (иначе факт выпал бы из recall). Сбой/пустой вектор
@@ -2650,7 +2684,7 @@ def edit_memory_fact(
 @router.delete("/api/v1/memory/facts/{memory_id}")
 def delete_memory_fact(
     memory_id: str,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_tenant_db),
     ctx: MiniAppContext = Depends(_require_miniapp_auth),
 ) -> dict:
     """Удалить один факт (в т.ч. из Common). Скоуп по (tenant,user). 404 если нет/чужой."""

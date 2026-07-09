@@ -105,9 +105,9 @@ def _scope_session():
     s.add(User(id="u1b", tenant_id="t1", telegram_account_id="2"))  # тот же тенант, другой юзер
     # Сущности «чужого» (u1b) пользователя в ТОМ ЖЕ тенанте — для проверки scope по user_id.
     s.add(Checklist(id="cl_b", tenant_id="t1", user_id="u1b", title="Список Б", status="active"))
-    s.add(ChecklistItem(id="it_b", checklist_id="cl_b", position=0, title="секретный пункт", status="pending"))
+    s.add(ChecklistItem(id="it_b", checklist_id="cl_b", tenant_id="t1", position=0, title="секретный пункт", status="pending"))
     s.add(Checklist(id="cl_arch", tenant_id="t1", user_id="u1b", title="Архив", status="archived"))
-    s.add(ChecklistItem(id="it_arch", checklist_id="cl_arch", position=0, title="архивный пункт", status="pending"))
+    s.add(ChecklistItem(id="it_arch", checklist_id="cl_arch", tenant_id="t1", position=0, title="архивный пункт", status="pending"))
     s.add(Recipe(id="rec_b", tenant_id="t1", user_id="u1b", title="Секретный борщ", source="user_dictated"))
     s.add(FamilyMember(id="fm_b", tenant_id="t1", user_id="u1b", name="Тайный дядя", role="self"))
     s.add(Task(id="task_b", tenant_id="t1", user_id="u1b", title="секретная задача"))

@@ -38,7 +38,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from sqlalchemy import delete, select
 
 from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
-from sreda.db.session import get_session_factory
+from sreda.db.session import get_session_factory, privileged_session, tenant_ctx
 from sreda.services.encryption import get_encryption_service
 
 logger = logging.getLogger(__name__)
@@ -84,9 +84,21 @@ def make_encrypted_serde() -> SerializerProtocol:
 class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
     """Durable checkpoint-saver на sync-движке Среды с полным шифрованием payload."""
 
-    def __init__(self, session_factory=None, serde: SerializerProtocol | None = None) -> None:
+    def __init__(
+        self,
+        session_factory=None,
+        serde: SerializerProtocol | None = None,
+        owner_session_factory=None,
+    ) -> None:
         super().__init__(serde=serde or make_encrypted_serde())
         self._sf = session_factory or get_session_factory()
+        # #138 Ф5: lookup владения тредом для cross-check ОБЯЗАН читать ВНЕ RLS-скоупа app-роли.
+        # Под RLS (роль sreda_app) записывающая app-сессия НЕ видит чужой чекпоинт → SELECT вернул бы
+        # None → анти-подмена ослепла бы ровно когда должна сработать. Поэтому владение читаем
+        # отдельной ПРИВИЛЕГИРОВАННОЙ (maintenance) сессией, которая видит все строки (и чужие, и NULL).
+        # owner_session_factory — только для юнит-тестов (sqlite без RLS): подменяет привилегированную
+        # сессию фабрикой на тестовую БД. В проде None → реальный privileged_session("gc").
+        self._owner_sf = owner_session_factory
 
     # ---- helpers --------------------------------------------------------
 
@@ -99,6 +111,62 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
                 "checkpoint_id": checkpoint_id,
             }
         }
+
+    def _tenant_for_write(self, thread_id: str, op: str) -> str | None:
+        """#138 Ф3-b: тенант для штампа новых строк + cross-check анти-подмены.
+
+        Возвращает tenant_ctx (может быть None — легаси/фон, тогда warning РАЗ на вызов:
+        строка уйдёт с tenant_id NULL = fail-closed видимость под RLS Ф3-c).
+        Cross-check: если у треда УЖЕ есть checkpoint с tenant_id NOT NULL и он отличается
+        от ctx-тенанта — RuntimeError, чужой тред НИКОГДА не дописываем.
+
+        Ownership читаем через _existing_thread_owner (привилегированная сессия ВНЕ RLS-скоупа):
+        под RLS Ф5 записывающая app-сессия чужую строку НЕ видит → SELECT по ней вернул бы None и
+        cross-check ослеп бы. Вызов идёт ДО открытия записывающей сессии (короткая независимая
+        транзакция, закрывается до app-upsert'а; tenant_ctx на её время гасится privileged_session
+        и восстанавливается — штамп begin-события app-сессии не сбивается)."""
+        ctx_tenant = tenant_ctx.get()
+        if ctx_tenant is None:
+            logger.warning(
+                "react_checkpoint: запись без tenant_ctx thread=%s op=%s — tenant_id=NULL",
+                thread_id, op,
+            )
+            return None
+        existing = self._existing_thread_owner(thread_id)
+        if existing is not None and existing != ctx_tenant:
+            raise RuntimeError(
+                "react_checkpoint: tenant mismatch thread="
+                f"{thread_id} existing={existing!r} ctx={ctx_tenant!r} — запись в чужой тред запрещена"
+            )
+        return ctx_tenant
+
+    def _existing_thread_owner(self, thread_id: str) -> str | None:
+        """Владелец (tenant_id) существующего чекпоинта треда, прочитанный ВНЕ RLS-скоупа app-роли.
+
+        В проде — privileged_session("gc"): maintenance-роль bypass'ит RLS → видит ВСЕ строки треда
+        (в т.ч. чужие и NULL), поэтому cross-check честен и под Ф5. До Ф5 (движки фолбэкают на общий
+        get_engine, RLS не включён) owner видит всё — поведение = прежнему. Один лёгкий SELECT
+        tenant_id по thread_id (индекс в составе PK). Транзакция закрывается ДО записи под app-роль.
+        В юнит-тестах (sqlite без RLS) _owner_sf подменяет привилегированную сессию тестовой."""
+        if self._owner_sf is not None:
+            s = self._owner_sf()
+            try:
+                return self._select_thread_owner(s, thread_id)
+            finally:
+                s.close()
+        with privileged_session("gc") as s:
+            return self._select_thread_owner(s, thread_id)
+
+    @staticmethod
+    def _select_thread_owner(session, thread_id: str) -> str | None:
+        return session.execute(
+            select(ReactCheckpoint.tenant_id)
+            .where(
+                ReactCheckpoint.thread_id == thread_id,
+                ReactCheckpoint.tenant_id.is_not(None),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
 
     def _row_to_tuple(self, session, row: ReactCheckpoint) -> CheckpointTuple | None:
         """Собрать CheckpointTuple из строки checkpoint + её writes. None при ошибке расшифровки
@@ -157,20 +225,28 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
         c_type, c_blob = self.serde.dumps_typed(checkpoint)
         # get_checkpoint_metadata: чистит управляющие символы + мёрджит config-метаданные (контракт savers)
         m_type, m_blob = self.serde.dumps_typed(get_checkpoint_metadata(config, metadata))
-        cols = {
-            "thread_id": thread_id, "checkpoint_ns": ns, "checkpoint_id": cp_id,
-            "parent_checkpoint_id": parent, "checkpoint_type": c_type, "blob": c_blob,
-            "metadata_type": m_type, "metadata": m_blob, "created_at": _now(),
-        }
+        # #138 Ф3-b: штамп тенанта + cross-check (чужой тред → RuntimeError). Владение читаем
+        # привилегированной сессией ВНЕ RLS-скоупа app-роли, ДО открытия записывающей сессии.
+        tenant_id = self._tenant_for_write(thread_id, "put")
         with self._sf() as s:
+            cols = {
+                "thread_id": thread_id, "checkpoint_ns": ns, "checkpoint_id": cp_id,
+                "parent_checkpoint_id": parent, "checkpoint_type": c_type, "blob": c_blob,
+                "metadata_type": m_type, "metadata": m_blob, "tenant_id": tenant_id,
+                "created_at": _now(),
+            }
+            set_ = {
+                "parent_checkpoint_id": parent, "checkpoint_type": c_type, "blob": c_blob,
+                "metadata_type": m_type, "metadata": m_blob,
+            }
+            # tenant_id в UPDATE только при не-NULL ctx: не затираем бэкфилл/прежний штамп NULL'ом
+            if tenant_id is not None:
+                set_["tenant_id"] = tenant_id
             ins = _dialect_insert(s.bind)
             # атомарный upsert по PK-тройке (нет гонки get-then-add); created_at НЕ перезаписываем
             stmt = ins(ReactCheckpoint.__table__).values(**cols).on_conflict_do_update(
                 index_elements=["thread_id", "checkpoint_ns", "checkpoint_id"],
-                set_={
-                    "parent_checkpoint_id": parent, "checkpoint_type": c_type, "blob": c_blob,
-                    "metadata_type": m_type, "metadata": m_blob,
-                },
+                set_=set_,
             )
             s.execute(stmt)
             s.commit()
@@ -187,6 +263,9 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
         ns = config["configurable"].get("checkpoint_ns", "")
         cp_id = config["configurable"]["checkpoint_id"]
         pk = ["thread_id", "checkpoint_ns", "checkpoint_id", "task_id", "idx"]
+        # #138 Ф3-b: штамп тенанта + cross-check РАЗ на вызов (не пер-строку). Владение читаем
+        # привилегированной сессией ВНЕ RLS-скоупа app-роли, ДО открытия записывающей сессии.
+        tenant_id = self._tenant_for_write(thread_id, "put_writes")
         with self._sf() as s:
             ins = _dialect_insert(s.bind)
             for i, (channel, value) in enumerate(writes):
@@ -196,7 +275,7 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
                     "thread_id": thread_id, "checkpoint_ns": ns, "checkpoint_id": cp_id,
                     "task_id": task_id, "idx": widx, "channel": channel,
                     "write_type": w_type, "blob": w_blob, "task_path": task_path,
-                    "created_at": _now(),
+                    "tenant_id": tenant_id, "created_at": _now(),
                 }
                 stmt = ins(ReactCheckpointWrite.__table__).values(**vals)
                 if widx >= 0:
@@ -204,11 +283,12 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
                     stmt = stmt.on_conflict_do_nothing(index_elements=pk)
                 else:
                     # спец-write (interrupt/resume/error) → обновляем
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=pk,
-                        set_={"channel": channel, "write_type": w_type,
-                              "blob": w_blob, "task_path": task_path},
-                    )
+                    set_ = {"channel": channel, "write_type": w_type,
+                            "blob": w_blob, "task_path": task_path}
+                    # не затираем не-NULL tenant_id NULL'ом (симметрично put)
+                    if tenant_id is not None:
+                        set_["tenant_id"] = tenant_id
+                    stmt = stmt.on_conflict_do_update(index_elements=pk, set_=set_)
                 s.execute(stmt)
             s.commit()
 
