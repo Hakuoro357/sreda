@@ -102,7 +102,7 @@
       <th>Вызовов</th>
       <th>Вход (ток.)</th>
       <th>Выход (ток.)</th>
-      <th>Оценка, ₽</th>
+      <th>Оценка, ≈$</th>
     </tr>
   </thead>
   <tbody>
@@ -112,7 +112,7 @@
       <td>{{ s.calls }}</td>
       <td>{{ s.prompt_tokens }}</td>
       <td>{{ s.completion_tokens }}</td>
-      <td>{{ "%.2f"|format(s.cost_rub) }}</td>
+      <td>{{ s.cost_usd | usd }}</td>
     </tr>
     {% else %}
     <tr><td colspan="5" class="muted">нет данных за период</td></tr>

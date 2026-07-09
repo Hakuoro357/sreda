@@ -4,9 +4,9 @@
 **Source code:** `src/sreda/runtime/react_preflight.py` (классификаторы и роутер — отслеживается на актуальность)
 **Related code:** `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph` — потребление; меняется по многим причинам, freshness НЕ трекаем)
 **Tests:** `tests/unit/` — калибровка `_must_task` (`test_must_task_high_precision`), классификаторы интента/доменов, политика `compute_allowed_domains`
-**Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально
-**Verified-against:** `6e6a8a2` (сверено с кодом 2026-07-02; doc-sync после #263/#270/#279/#213)
-**Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek` — это и есть прод; история: #224 переводил на `gemini-2.5-flash-lite` ради скорости, #257 вернул на `openrouter-deepseek` — gemini-lite зависал); `SREDA_CHECKLIST_UNIFIED` (default `False`) меняет текст checklist-директивы (#213, см. `route_domains`)
+**Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально. **С 2026-07-08 поверх конвейера на ВСЕХ тенантах работает ЕДИНЫЙ ПУТЬ #285 (`SREDA_REACT_UNIFIED_TENANTS=*`) — см. «Слой 3»: интент-сплит и #221-домены переопределяются единой политикой; слои 1-2 остаются подложкой и полным поведением при откате**
+**Verified-against:** `fc58e81` (сверено с кодом 2026-07-09; doc-sync на закрытии эпика #285)
+**Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek` — это и есть прод; история: #224 переводил на `gemini-2.5-flash-lite` ради скорости, #257 вернул на `openrouter-deepseek` — gemini-lite зависал); `SREDA_CHECKLIST_UNIFIED` (default `False`) меняет текст checklist-директивы (#213, см. `route_domains`); **`SREDA_REACT_UNIFIED_PATH_ENABLED` + `SREDA_REACT_UNIFIED_TENANTS` (#285)** — единый путь: флаг ON + тенант в списке (`*` = все) → слой 3 переопределяет слои 1-2; флаг OFF или список пуст → byte-identical слоям 1-2
 
 ## Зачем это существует
 
@@ -101,15 +101,47 @@ flowchart TD
 
 Результат кладётся в state (`router_allowed_read_domains`, `router_allowed_write_domains`, `active_families`); `_apply_domain_policy(...)` фильтрует привязанные инструменты по разрешённым разделам. При выключенном роутере (`allowed = None`) — no-op, byte-identical. В execute-режиме guard НЕ расширяет домены роутера — «роутер побеждает» (#267 A4).
 
+## Слой 3 — единый путь #285 (override поверх слоёв 1-2)
+
+С 2026-07-08 на проде для ВСЕХ тенантов (`SREDA_REACT_UNIFIED_TENANTS=*`). Гейт — `_unified_execute_for(tenant_id)`
+(react_loop: флаг И тенант в списке). Идея: НЕ делить трафик на chat/fact/task разными моделями и наборами,
+а вести ОДИН путь (Фредди + полный тулсет) с per-turn детерминированной политикой. На unified-ходе:
+
+- **интент принудительно `task`** (`_effective_intent` → "task" во всех 4 узлах; chat/fact-ветка слоя 1 не берётся);
+- **политика — `compute_unified_policy(text, route_domains(text))`** (`react_policy.py`): B1-сигналы
+  (`react_signals.py`: `write_command_signal` императив / `declarative_memory_signal` / `read_cue_domains`
+  щедрый кюс→bounded read) + онтология `route_domains` → `allowed_read`/`allowed_write`; кладётся в те же
+  state-каналы `router_allowed_*` (переиспользует #221-машинерию `_apply_domain_policy`);
+- **write двухъярусный (B2):** сигнал+продуктивный домен → инструмент напрямую; БЕЗ сигнала → все write-инструменты
+  биндятся КАНДИДАТАМИ под универсальный confirm на dispatch (`_apply_unified_policy` → `_generic_confirm_wrap`;
+  превью без чтения БД; инвариант «нет молчаливой записи»);
+- **промпт единый (B4):** task-персона + user-role хвост честности из ФАКТИЧЕСКОГО bound
+  (`_unified_availability_directive`, #279-семантика: «под рукой в этом ходе», отмена → «сообщи и остановись»,
+  заметку не пересказывать; тон — «ответь ПО СУЩЕСТВУ, опираясь на результаты»);
+- **директива раздела** (`route_domains(...).directive`) на unified гейтится по фактически allowed-доменам
+  (не зовёт незабинженный тул — иначе петля domain_blocked; + loop-guard `_domain_blocked_count`);
+- **паузы (канарейка-фиксы):** новый запрос во время ЖИВОЙ паузы → свежий ход (`_should_redirect_on_pause`:
+  confirm — сигнал И НЕ голое эхо «удали»/«ок удали» → иначе A0 «нет»; ask_human — сигнал; сирота tool_call
+  закрывается withdrawal-ToolMessage `result_kind=withdrawn`) — #316; confirm-ОТМЕНА → детерминированный
+  честный ответ «Отменила, ничего не делаю.» (модель не пере-сочиняет отказ в ложное «удалена») — #321;
+  ПРОТУХШАЯ ask_human-пауза + новое сообщение → директива грациозного возврата (`_stale_pause_note`,
+  consume-and-clear в chat) — баг «вчерашний вопрос в лоб» убит.
+- **Слои 1-2 при этом вычисляются как раньше** (intent-классификатор, #221-роутинг) — их результат на
+  unified-ходе переопределяется; при флаге OFF / пустом списке поведение = ровно слои 1-2 (byte-identical).
+
 ## Прод-статус и откат
 
 - `SREDA_REACT_PREFLIGHT_ENABLED` — ВКЛ на проде (2026-06-24).
 - Доменный роутер #221 — execute-режим глобально (`SREDA_REACT_DOMAIN_SCOPE_MODE=execute`, `SREDA_REACT_DOMAIN_SCOPE_EXECUTE_TENANTS=*`). Откат: `shadow` + `safe_restart`.
+- **Единый путь #285 — на ВСЕХ (`SREDA_REACT_UNIFIED_PATH_ENABLED=1`, `SREDA_REACT_UNIFIED_TENANTS=*`,
+  с 2026-07-08 16:51 UTC). Откат: сузить `SREDA_REACT_UNIFIED_TENANTS` до канареечных / опустошить (= слои 1-2)
+  + `safe_restart`; бэкап env `/etc/sreda/.env.bak-unified-all-20260708-165107`.**
 - Детерминированный гейт времени `_text_mentions_time` (#180) сохранён — preflight его дополняет, не заменяет; на разрушающих/приватных путях сбой → уточнение/fail-closed, не no-op.
 
 ## Связанное
 
-- Эпик: #191 (harness-обвязка ReAct).
+- Эпик: #191 (harness-обвязка ReAct). **Единый путь: эпик #285 (слой 3; свернул intent-сплит; план
+  `plans/chatfact-unify-final.md` в vex-assistant); паузы — #316 (redirect), #321 (честная отмена).**
 - Интент: #197. Домены: #215 (карта «слово→раздел»), #221 (ontology-роутер + write-gate), #263 (write при уверенном разделе), #270 (создание категории памяти голосом), #213 (единый `get_checklist` — флаг-условная директива).
 - Выбор рассуждающей модели: #173 (eval — честность + скорость), #224 (chat/fact → gemini-2.5-flash-lite), #257 (откат на openrouter-deepseek — gemini-lite зависал). Персона/honesty chat/fact: #242/#121, #251, #279.
 - Наблюдаемость: #192 (трейс `classifier_raw`).

@@ -80,11 +80,20 @@ def dumps_policy(policy: dict) -> str:
 POLICY_VERSION_B2 = 2
 
 
-def compute_unified_policy(text, route, classified=None, *, base_web=True):
+def compute_unified_policy(text, route, classified=None, *, base_web=True,
+                           sticky_memory_write=False):
     """Двухъярусная политика единого пути (execute). Чистая; поведение прода не трогает (проводка — B2b).
 
     text: текст хода. route: RouteResult из route_domains(text). classified: DomainClassResult|None
-    (LLM-фолбэк домена, как в #221). Возврат — dict (JSON-сериализуемый; без ПД: домены/флаги)."""
+    (LLM-фолбэк домена, как в #221). Возврат — dict (JSON-сериализуемый; без ПД: домены/флаги).
+
+    sticky_memory_write (#319, «дверь открыта, пока ею пользуются»): ПРОШЛЫЙ ход реально записал в память
+    → серия продолжается: memory в ярусе (а) БЕЗ confirm («бёдра 865» после «запиши крылья 615» не
+    переспрашивает). Граница — по СМЫСЛУ, не по времени (Борис 2026-07-09): продлевается только фактом
+    записи (renewal-by-use в run_tools), закрывается первым ходом без записи. PRE-CLEAR: явная команда в
+    ДРУГОЙ раздел («добавь молоко в покупки») дверь НЕ продлевает и не пользуется ею — sticky не
+    применяется, когда write-команда резолвится исключительно вне memory. Безопасно: в memory-семье нет
+    деструктивных инструментов (save_core_fact/save_episode/create_memory_category)."""
     from sreda.runtime.react_preflight import compute_allowed_domains
     from sreda.runtime.react_signals import (
         declarative_memory_signal, read_cue_domains, write_command_signal,
@@ -108,6 +117,20 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True):
     if d_sig:
         allowed_write.add("memory")
 
+    # #319 sticky-by-use: прошлый ход записал в память → memory в ярус (а) на ЭТОТ ход, КРОМЕ pre-clear:
+    # ЛЮБАЯ write-команда, НЕ резолвящаяся в memory («добавь молоко в покупки» → shopping; R2 medium
+    # MAJOR: и БЕЗ-доменная «поставь чайник» — иначе sticky ломал бы контракт «нет домена → кандидат»).
+    # Продолжают серию: голые данные («бёдра 865», w_sig=False) и «запиши спинки 900» (route→memory).
+    # NB (R1 субагент MINOR, осознанно): мид-серии «запиши X» пишет БЕЗ confirm — идиома-гейт memory
+    # (см. discard выше) перекрывается sticky by design (серия уже подтверждена фактом первой записи).
+    # applied-флаг — в signals (наблюдаемость канарейки).
+    sticky_applied = False
+    if sticky_memory_write:
+        _non_memory_cmd = bool(w_sig and "memory" not in route.all_domains)
+        if not _non_memory_cmd:
+            allowed_write.add("memory")
+            sticky_applied = True
+
     allowed_read: set[str] = set()
     if base_web:
         allowed_read.add("web")
@@ -120,5 +143,6 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True):
         "allowed_read": sorted(allowed_read),
         "allowed_write": sorted(allowed_write),   # ярус (а): прямой write без confirm
         "confirm_write": True,                    # ярус (б): write вне allowed_write → кандидат+confirm (B2b)
-        "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues)},
+        "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues),
+                    "sticky_memory": sticky_applied},
     }
