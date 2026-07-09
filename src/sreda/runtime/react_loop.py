@@ -1904,10 +1904,24 @@ def _declined_reply(question: str) -> str:
     return f"Отменила, не трогаю «{m.group(1)}»." if m else "Отменила, ничего не делаю."
 
 
-# #288 R3 (Codex high R2): только ГЛАГОЛ (напомни/напомните/напомнить — стем «напомн»); существительное
-# «напоминание» (стем «напомин») НЕ скоупит — «Это напоминание про встречу в 10» протаскивало время
-# события. Noun-only тексты («поставь напоминание на 19.30») уходят в fallback = весь текст.
+# #288 R3/R4 — скоуп по НАМЕРЕНИЮ напоминания (маятник ревью: R2 noun-скоуп протаскивал время события
+# через ОПИСАТЕЛЬНОЕ «это напоминание про встречу в 10»; R3 verb-only переоткрыл утечку для НОМИНАЛЬНОЙ
+# КОМАНДЫ «поставь напоминание на 8 число» + событие в соседнем предложении, оба Codex R3). Предложение
+# скоупит, если: глагол «напомн-» ИЛИ «напоминани-» ВМЕСТЕ с командным глаголом (поставь/создай/сделай…).
 _REMIND_SENT_RE = re.compile(r"напомн", re.IGNORECASE)  # стем глагола; у «напоминание» стем «напомин» — не матчится
+_REMIND_NOUN_RE = re.compile(r"напоминани", re.IGNORECASE)
+_MAKE_VERB_RE = re.compile(r"\bсдела(?:й|йте)\b", re.IGNORECASE)  # «сделай» нет в _CMD_VERBS
+
+
+def _is_remind_intent_sentence(s: str) -> bool:
+    """#288 R4: предложение — ПРО постановку напоминания? Глагол «напомни…» ИЛИ существительное
+    «напоминание» с командным глаголом. Описательное «это напоминание про…» — НЕ скоупит."""
+    if _REMIND_SENT_RE.search(s):
+        return True
+    if _REMIND_NOUN_RE.search(s):
+        from sreda.runtime.react_signals import _CMD_VERBS
+        return bool(_CMD_VERBS.search(s) or _MAKE_VERB_RE.search(s))
+    return False
 
 
 def _turn_time_window_text(messages: Any) -> str:
@@ -1931,7 +1945,7 @@ def _turn_time_window_text(messages: Any) -> str:
     # R3 (субагент R2 MAJOR-1): точка МЕЖДУ цифрами — «9.30»/«08.07», НЕ граница предложения (иначе
     # окно рвало «напомни про рейс 9.30» → «напомни про рейс 9» → ложный отказ на названном времени).
     sents = [s.strip() for s in re.split(r"[!?;\n]+|\.(?!\d)", human) if s.strip()]
-    remind_sents = [s for s in sents if _REMIND_SENT_RE.search(s)]
+    remind_sents = [s for s in sents if _is_remind_intent_sentence(s)]
     parts = [" ".join(remind_sents) if remind_sents else human]
     for m in msgs[last_h + 1:]:
         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_human":
