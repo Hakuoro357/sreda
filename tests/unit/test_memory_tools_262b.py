@@ -125,3 +125,19 @@ def test_save_fact_category_race_reresolves(ctx, monkeypatch):
     assert out.startswith("saved_core:")  # НЕ error — ре-резолв нашёл существующую
     cat = next(c for c in _repo(s).list_categories("t1", "u1") if c.name == "машина")
     assert any("ТО" in f.content for f in _repo(s).list_facts_in_category("t1", "u1", cat.id))
+
+
+def test_319_sticky_prefixes_match_real_tools(ctx):
+    """#319 R2 (субагент MINOR): связка контракта — РЕАЛЬНЫЕ ответы memory-write инструментов обязаны
+    начинаться с `_MEMORY_WRITE_OK_PREFIXES` (продление двери серии). Иначе координированная смена
+    формата в tools.py (+его тестов) молча оставила бы константу протухшей → дверь никогда не
+    открывается → серия тихо регрессирует в per-item confirm."""
+    from sreda.runtime.react_loop import _MEMORY_WRITE_OK_PREFIXES
+    s, tools = ctx
+    outs = [
+        tools["create_memory_category"].invoke({"name": "куры"}),
+        tools["save_core_fact"].invoke({"content": "вес крыльев 615", "category": "куры"}),
+        tools["save_episode"].invoke({"summary": "взвесил бёдра 865"}),
+    ]
+    for out in outs:
+        assert out.startswith(_MEMORY_WRITE_OK_PREFIXES), out
