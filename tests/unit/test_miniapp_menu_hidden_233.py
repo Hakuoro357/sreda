@@ -26,9 +26,21 @@ def test_schedule_section_hidden_others_intact() -> None:
     assert ids == ["reminders", "checklists", "shopping"]          # порядок + остальные целы
 
 
-def test_hidden_set_targets_only_schedule() -> None:
-    # точечный фильтр: только schedule, чтобы не зацепить соседей
-    assert _HIDDEN_MENU_SECTION_IDS == frozenset({"schedule"})
+def test_family_section_hidden_others_intact() -> None:
+    # «Семья» (id="family") скрыта по решению владельца 2026-07-04
+    sections = [
+        _sec("reminders", "Напоминания"),
+        _sec("family", "Семья"),
+        _sec("checklists", "Дела"),
+    ]
+    ids = [i["id"] for i in _menu_items_for_render(sections)]
+    assert "family" not in ids                                     # ссылка на Семью убрана
+    assert ids == ["reminders", "checklists"]                      # остальные целы
+
+
+def test_hidden_set_is_schedule_and_family() -> None:
+    # точечный фильтр: schedule (#233) + family (2026-07-04), не зацепить соседей
+    assert _HIDDEN_MENU_SECTION_IDS == frozenset({"schedule", "family"})
 
 
 def test_non_hidden_section_mapped_with_all_fields() -> None:
