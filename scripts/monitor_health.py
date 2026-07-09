@@ -154,9 +154,17 @@ def probe_webhook_health() -> ProbeResult:
     token = _ENV.get("SREDA_TELEGRAM_BOT_TOKEN")
     if not token:
         return ProbeResult("webhook_health", "warning", "no bot token in env")
+    url = f"https://api.telegram.org/bot{token}/getWebhookInfo"
+    proxy = _proxy_for_url(url)
+    # #324: пробить через egress SOCKS (как _external_latency) — иначе прямой мёртвый
+    # маршрут к api.telegram.org даёт ложный webhook_health timeout. trust_env=False:
+    # cron не грузит os.environ, прокси берём из _ENV явно.
+    _kw: dict[str, Any] = {"timeout": 5.0, "trust_env": False}
+    if proxy:
+        _kw["proxy"] = proxy
     try:
-        with httpx.Client(timeout=5.0) as c:
-            r = c.get(f"https://api.telegram.org/bot{token}/getWebhookInfo")
+        with httpx.Client(**_kw) as c:
+            r = c.get(url)
         body = r.json()
         if not body.get("ok"):
             return ProbeResult("webhook_health", "critical", f"getWebhookInfo ok=false: {body.get('description')}")
@@ -943,10 +951,17 @@ def send_telegram_alert(text: str) -> None:
     if not token:
         print("[alert] no bot token, skipping send", file=sys.stderr)
         return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    proxy = _proxy_for_url(url)
+    # #324: слать алерт через egress SOCKS — иначе при флапе прямого маршрута сам
+    # алерт не доставится. trust_env=False: cron не грузит os.environ.
+    _kw: dict[str, Any] = {"timeout": 10.0, "trust_env": False}
+    if proxy:
+        _kw["proxy"] = proxy
     try:
-        with httpx.Client(timeout=10.0) as c:
+        with httpx.Client(**_kw) as c:
             r = c.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
+                url,
                 data={"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML"},
             )
         if r.status_code != 200 or not r.json().get("ok"):

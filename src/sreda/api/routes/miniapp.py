@@ -960,8 +960,10 @@ def _collect_menu_sections(
 # 2026-06-25 (#233): текущий UX не устраивает, нужна доработка. Бэкенд НЕ
 # тронут — tasks-API, экран #/schedule и приватный скил housewife остаются;
 # секция просто не инжектится в home (как платформенный tile «Подписки»).
+# «Семья» (id="family") скрыта по решению владельца 2026-07-04: убрать ссылку из
+# home. Бэкенд/route #/family/family-API остаются, тайл не инжектится.
 # Снять сокрытие = убрать id из набора.
-_HIDDEN_MENU_SECTION_IDS: frozenset[str] = frozenset({"schedule"})
+_HIDDEN_MENU_SECTION_IDS: frozenset[str] = frozenset({"schedule", "family"})
 
 
 def _menu_items_for_render(sections: list[MiniAppSection]) -> list[dict]:
