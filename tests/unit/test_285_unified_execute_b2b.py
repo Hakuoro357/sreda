@@ -84,7 +84,6 @@ def install(monkeypatch):
         return inv
 
     yield _install
-    from sreda.config import settings as settings_mod
     settings_mod.get_settings.cache_clear()
 
 
@@ -172,5 +171,35 @@ def test_unsignaled_write_confirms_then_executes(install):
     assert getattr(r1, "awaiting_confirm", False) is True, r1
     assert inv.get("add_task", 0) == 0, "мутация НЕ должна произойти до подтверждения"
     # resume «да» → исполнение
-    r2 = _turn(freddie, thread="e2e", text="да")
+    _turn(freddie, thread="e2e", text="да")
     assert inv.get("add_task", 0) == 1, "после «да» add_task исполнен ровно раз"
+
+
+# ─────────── #321: confirm-ОТМЕНА → детерминированный честный ответ (не галлюцинация) ───────────
+def test_declined_confirm_deterministic_reply(install):
+    """#321 (канарейка #316 e2e): confirm-пауза (unsignaled write) → resume «нет» → мутации НЕТ И ответ
+    ДЕТЕРМИНИРОВАННЫЙ «Отменила, ничего не делаю.», даже если модель на отмене галлюцинирует «Готово»
+    (корень #321: chat-узел пере-сочинял отказ в ложное «удалено/готово»). Бьёт РЕАЛЬНЫЙ handle_turn."""
+    freddie = _Chat("freddie", classify="chat",
+                    responses=[_ai_call("add_task", "c1", title="позвонить"),
+                               AIMessage(content="Готово, добавила задачу «позвонить».")])  # ← ложь на отмене
+    inv = install(unified_flag=True, unified_tenants="t", deepseek=_Chat("ds"))
+    assert getattr(_turn(freddie, thread="d1", text="расскажи как дела"), "awaiting_confirm", False)
+    r2 = _turn(freddie, thread="d1", text="нет")
+    assert inv.get("add_task", 0) == 0, "отказ → мутации нет"
+    assert "Отменила, ничего не делаю" in str(r2), r2                  # детерминированный честный отказ
+    assert "Готово" not in str(r2) and "добавила" not in str(r2), r2  # галлюцинация подавлена
+
+
+def test_confirmed_write_reply_not_overridden(install):
+    """#321: success-путь НЕ трогаем — resume «да» отдаёт ответ модели, а не фиксированный отказ."""
+    freddie = _Chat("freddie", classify="chat",
+                    responses=[_ai_call("add_task", "c1", title="позвонить"),
+                               AIMessage(content="Готово, добавила «позвонить».")])
+    inv = install(unified_flag=True, unified_tenants="t", deepseek=_Chat("ds"))
+    _turn(freddie, thread="d2", text="расскажи как дела")
+    r2 = _turn(freddie, thread="d2", text="да")
+    assert inv.get("add_task", 0) == 1
+    assert "Отменила, ничего не делаю" not in str(r2), r2  # success не подменяется отказом
+    # NB: легаси-«не оверрайдится» покрыт юнитом test_confirm_declined (not f(True,"нет","other")) —
+    # handle_turn-стаб не стейджит легаси candidate-confirm, поэтому e2e-тест здесь был бы вечный skip.

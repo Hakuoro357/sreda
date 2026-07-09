@@ -35,8 +35,17 @@ def test_invalid_plan_fallback_renders_pool_phrase() -> None:
 
 
 def test_presenter_deny_returns_pool_and_records(monkeypatch, caplog) -> None:
-    """Ровно дыра 15:08: запрет показа теперь = поломка из пула + ERROR-лог
-    + admin-алерт."""
+    """Ровно дыра 15:08 (тихий deny): запрет показа — нет display_field/override
+    для (tool, status) — теперь = поломка из пула + ERROR-лог + admin-алерт.
+
+    Вход — СИНТЕТИЧЕСКИЙ непокрытый инструмент: он детерминированно попадает в
+    ветку deny-by-default при ЛЮБОМ состоянии карты display_field (в т.ч. если
+    её обнулил соседний тест) — order-independent. Раньше здесь стоял
+    ``list_checklists`` с пустым ``ok``-списком, но #141 (ab071b1, 2026-06-13)
+    дал этому инструменту ``display_summary`` — «успешные операции показываются,
+    не поломкой»: пустой список = дружелюбное «нет данных», НЕ поломка (см.
+    breakdown_messages: «пустые списки — не поломки»), так что тот вход больше
+    не бил в deny."""
     alerts: list[tuple] = []
     monkeypatch.setattr(
         "sreda.services.admin_alerts.send_admin_alert",
@@ -46,12 +55,18 @@ def test_presenter_deny_returns_pool_and_records(monkeypatch, caplog) -> None:
 
     caplog.set_level(logging.ERROR,
                      logger="sreda.services.composer.breakdown_messages")
-    out = render_display_text(
-        "list_checklists", {"status": "ok", "checklists": []},
-        domain_status="ok",
-    )
+    tool = "__uncovered_tool__"
+    out = render_display_text(tool, {"status": "ok"}, domain_status="ok")
     assert out in BREAKDOWN_POOL
-    assert alerts, "показ поломки обязан дать admin-алерт"
+    # Алерт обязан прийти ИМЕННО из ветки presenter_deny (дедуп-ключ несёт
+    # источник): это доказывает, что фразу дала deny-by-default, а не иной путь
+    # пула, и что синтетический инструмент реально непокрыт — иначе deny не
+    # сработал бы и этот алерт не пришёл бы (страж от «магической строки»,
+    # которая однажды станет настоящим инструментом).
+    assert any(
+        kw.get("dedupe_key") == f"breakdown:presenter_deny:{tool}:ok"
+        for _a, kw in alerts
+    ), "показ поломки обязан дать admin-алерт из ветки presenter_deny"
     assert any("ПОЛОМКА" in r.getMessage() for r in caplog.records), (
         "показ поломки обязан остаться в ERROR-логе"
     )
