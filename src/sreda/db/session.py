@@ -147,7 +147,11 @@ def privileged_session(reason: str) -> Iterator[Session]:
     (fail-closed) + аудит-лог. access_ctx='privileged'. tenant_ctx НЕ ставит (RLS пускает по current_user)."""
     if reason not in PRIVILEGED_REASONS:
         raise PermissionError(f"privileged_session: reason not in registry: {reason!r}")
-    logger.info("privileged_session opened reason=%s", reason)  # аудит (без ПД)
+    # R2 MINOR (оба субагента): DEBUG, не INFO — saver.M9 дёргает privileged("gc") на КАЖДЫЙ
+    # put/put_writes (десятки/ход) → INFO топил бы прод-лог. Аудит привилегированного доступа —
+    # дисциплина, не механизм (реальный gate = реестр reason'ов fail-closed); для compliance-
+    # аудита кросс-тенантного чтения нужен отдельный механизм, не лог-строка.
+    logger.debug("privileged_session opened reason=%s", reason)  # без ПД
     engine = get_identity_engine() if reason in _IDENTITY_REASONS else get_maintenance_engine()
     # ГАСИМ tenant_ctx (Ф1-R1 MAJOR): если privileged открыт ВНУТРИ tenant_session(A), а движки
     # ещё фолбэкают на общий get_engine (до Ф5), begin-событие иначе выставило бы чужой

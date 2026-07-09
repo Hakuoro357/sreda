@@ -430,3 +430,31 @@ def test_pg_policies_parity_with_app_registry(engines):
     assert reg.NO_RLS_TABLES & rls_on == set(), (
         f"NO_RLS-таблицы с внезапным ENABLE RLS: {sorted(reg.NO_RLS_TABLES & rls_on)}"
     )
+
+
+def test_pg_policies_parity_root_and_identity(engines):
+    """R2 MINOR (medium): parity для ROOT и IDENTITY_INSERT. tenants: RLS ENABLE +
+    p_tenants_self; каждая identity-insert таблица имеет p_{t}_identity_insert."""
+    from sreda.db import rls_registry as reg
+
+    owner = engines["owner"]
+    with owner.connect() as c:
+        rls_on = {
+            r[0] for r in c.execute(text(
+                "SELECT relname FROM pg_class WHERE relrowsecurity = true"
+            ))
+        }
+        pol = {
+            (r[0], r[1]) for r in c.execute(text(
+                "SELECT tablename, policyname FROM pg_policies"
+            ))
+        }
+
+    for t in reg.ROOT_TABLES:
+        assert t in rls_on, f"ROOT {t}: RLS не включён"
+        assert (t, f"p_{t}_self") in pol, f"ROOT {t}: нет self-select политики"
+    missing_ident = sorted(
+        t for t in reg.IDENTITY_INSERT_TABLES
+        if (t, f"p_{t}_identity_insert") not in pol
+    )
+    assert not missing_ident, f"нет identity-insert политик: {missing_ident}"

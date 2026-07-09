@@ -35,18 +35,49 @@ def _metadata_tables():
     return Base.metadata.tables
 
 
-def test_migration_0082_snapshot_matches_registry():
-    """0082 держит ИСТОРИЧЕСКИЙ снапшот; на МОМЕНТ 0082 он обязан совпадать с
-    app-реестром (иначе реальные политики разошлись бы с источником истины).
-    Будущие таблицы добавляются в реестр + НОВОЙ миграцией — тогда снапшот 0082
-    станет подмножеством реестра; здесь (пока новых RLS-миграций нет) — равенство."""
+# R2-фикс (high+субагент): НЕ equality с живым реестром — это возвращало правку ПРИМЕНЁННОЙ
+# 0082 при каждой новой таблице (ровно дрейф из R1: имя в старой миграции ≠ политика на проде).
+# Вместо этого 0082 заморожена ИСТОРИЧЕСКИМ снапшотом ЗДЕСЬ: любое редактирование применённой
+# миграции = красный. Новые таблицы идут в rls_registry + НОВУЮ миграцию (0082 не трогается);
+# «реестр ⇔ реальные политики» держит parity-тест red-suite на живом PG.
+_FROZEN_0082_TENANT = frozenset({
+    "workspaces", "tenant_features", "users", "assistants", "jobs", "outbox_messages",
+    "secure_records", "inbound_messages", "assistant_memories", "memory_categories",
+    "web_search_usage", "reply_button_cache", "tool_operation_results",
+    "tenant_billing_cycles", "tenant_subscriptions", "payment_orders",
+    "plan_library_entries", "tenant_skill_states", "tenant_skill_configs", "skill_runs",
+    "skill_run_attempts", "skill_events", "skill_ai_executions", "react_turn_trace",
+    "react_summaries", "tasks_items", "usage_ledger", "inbound_events",
+    "tenant_user_profiles", "tenant_user_profile_proposals", "tenant_user_skill_configs",
+    "agent_threads", "agent_runs", "user_data_change_feed", "audit_outbox",
+    "planner_executions", "planner_gaps", "planner_llm_reservations", "free_tier_usage",
+    "shopping_list_items", "recipes", "menu_plans", "family_reminders", "family_members",
+    "message_jobs", "fetch_url_usage", "channel_link_tokens", "conversation_turns",
+    "checklists", "checklist_items",
+    "recipe_ingredients", "menu_plan_items", "payment_order_items",
+    "react_checkpoint", "react_checkpoint_write",
+})
+_FROZEN_0082_NO_RLS = frozenset({
+    "subscription_plans", "audit_log", "admin_dashboard_snapshots", "admin_alerts_seen",
+    "admin_sessions", "admin_login_challenges", "runtime_config", "signup_attempts",
+    "poller_offsets", "poller_heartbeats", "step_execution_ledger",
+})
+
+
+def test_migration_0082_is_frozen_historical_snapshot():
+    """Применённую 0082 НЕ редактируют (правка = красный тест). Реестр может только
+    РАСТИ относительно снапшота (новые таблицы — новыми миграциями)."""
     from sreda.db import rls_registry as reg
 
     mig = _load_migration_0082()
-    assert set(mig.TENANT_TABLES) == reg.TENANT_TABLES, "0082 TENANT-снапшот разошёлся с rls_registry"
-    assert set(mig.ROOT_TABLES) == reg.ROOT_TABLES
-    assert set(mig.NO_RLS_TABLES) == reg.NO_RLS_TABLES
-    assert set(mig.IDENTITY_INSERT_TABLES) == reg.IDENTITY_INSERT_TABLES
+    assert set(mig.TENANT_TABLES) == _FROZEN_0082_TENANT, (
+        "миграция 0082 ОТРЕДАКТИРОВАНА — так нельзя: она уже применена на проде, правка "
+        "имени не создаст политику. Новая таблица → rls_registry + НОВАЯ миграция ENABLE RLS."
+    )
+    assert set(mig.NO_RLS_TABLES) == _FROZEN_0082_NO_RLS
+    assert set(mig.ROOT_TABLES) == {"tenants"}
+    # Реестр ⊇ снапшот (может только расти; сокращение реестра = осознанная миграция DISABLE).
+    assert _FROZEN_0082_TENANT <= reg.TENANT_TABLES, "rls_registry потерял таблицы снапшота 0082"
 
 
 def test_rls_registry_covers_all_tables_exactly_once():
@@ -67,14 +98,16 @@ def test_rls_registry_covers_all_tables_exactly_once():
 
     unclassified = actual - classified
     assert not unclassified, (
-        "Новые таблицы БЕЗ RLS-классификации — классифицируй в миграции 0082 "
-        "(TENANT_TABLES / ROOT_TABLES / NO_RLS_TABLES, NO_RLS только осознанно "
-        f"с причиной): {sorted(unclassified)}"
+        "Новые таблицы БЕЗ RLS-классификации — (1) классифицируй в "
+        "src/sreda/db/rls_registry.py (NO_RLS только осознанно, с причиной) и "
+        "(2) для tenant-таблицы напиши НОВУЮ миграцию ENABLE RLS + политики по образцу "
+        "0082 (саму 0082 НЕ редактировать — она применена; parity-тест red-suite "
+        f"проверит факт политик на PG): {sorted(unclassified)}"
     )
 
     ghosts = classified - actual
     assert not ghosts, (
-        "В списках 0082 есть несуществующие таблицы (опечатка = молчаливо "
+        "В rls_registry есть несуществующие таблицы (опечатка = молчаливо "
         f"незащищённая таблица; поправь имя): {sorted(ghosts)}"
     )
 
