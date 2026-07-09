@@ -1,0 +1,293 @@
+"""#288 — механический гейт времени (возврат #180 «не хватает инфо — спроси, особенно ВРЕМЯ»).
+
+Прод-кейс 01.07 (tenant_tg_5006894546): «напомни об этом 8 числа» (дата БЕЗ времени) → бот молча создал
+напоминание на выдуманные 13:00. Промпт (докстринг schedule_reminder) слабую модель не держал. Гейт на
+диспатче: конкретный момент в аргументе + НЕТ упоминания времени в окне хода (текст юзера + ответы
+ask_human) → структурный отказ time_not_specified, не создание. Красная линия «врёт об успехе».
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import StructuredTool
+
+from sreda.runtime import react_loop
+from sreda.runtime.react_signals import text_mentions_time
+
+
+# ─────────── детектор: что считается ВРЕМЕНЕМ ───────────
+def test_time_detector_positive():
+    for t in ("в 9", "в 13:00", "9.30 подойдёт", "в девять утра", "в час дня", "через час",
+              "через 30 минут", "через полчаса", "в полдень", "в полночь", "в 21 час",
+              "утром", "вечером напомни", "днём", "с утра", "после обеда",
+              "завтра в 10", "14 июля в 9 утра"):
+        assert text_mentions_time(t), t
+
+
+def test_time_detector_negative_dates_only():
+    # голая дата/день — НЕ время (ядро кейса Ольги)
+    for t in ("напомни об этом 14 числа", "завтра", "напомни 8 числа про стоматолога",
+              "9 июля", "в пятницу", "на следующей неделе", "напомни послезавтра",
+              "Ане 15 июля нужно к стоматологу. Напомни мне об этом 14 числа"):
+        assert not text_mentions_time(t), t
+
+
+def test_time_detector_v9_july_is_date():
+    # «в 9 июля»-подобные (цифра + месяц) — дата, не «в 9 (часов)»
+    for t in ("напомни в 9 июля", "встреча 9 июля", "в 14 числа"):
+        assert not text_mentions_time(t), t
+
+
+# ─────────── окно хода: текст юзера + ответы ask_human ───────────
+def test_turn_time_window_includes_ask_human_answers():
+    msgs = [
+        HumanMessage(content="напомни про стоматолога 14 числа"),
+        AIMessage(content="", tool_calls=[{"name": "ask_human", "args": {}, "id": "q1"}]),
+        ToolMessage(content="в 13", tool_call_id="q1", name="ask_human"),
+    ]
+    w = react_loop._turn_time_window_text(msgs)
+    assert "14 числа" in w and "в 13" in w
+    assert text_mentions_time(w)  # двухходовка: ответ «в 13» делает окно валидным
+    # без ответа — времени нет
+    assert not text_mentions_time(react_loop._turn_time_window_text(msgs[:1]))
+
+
+# ─────────── e2e через handle_turn (чеклист issue) ───────────
+class _NoTrace:
+    def __getattr__(self, _):
+        return lambda *a, **k: None
+
+
+class _Chat:
+    def __init__(self, label, *, responses=None):
+        self.label = label
+        self._responses, self._i = list(responses or []), 0
+
+    async def ainvoke(self, _msgs):
+        return AIMessage(content="chat")
+
+    def bind_tools(self, tools):
+        outer = self
+
+        def _inv(_msgs):
+            if outer._responses:
+                r = outer._responses[min(outer._i, len(outer._responses) - 1)]
+                outer._i += 1
+                return r
+            return AIMessage(content="resp")
+        return RunnableLambda(_inv)
+
+
+def _clean_tool(name, inv):
+    if name == "ask_human":  # как настоящий: interrupt-пауза, ответ юзера → return (→ ToolMessage)
+        from langgraph.types import interrupt
+
+        def _ask(question: str = "") -> str:
+            inv["ask_human"] = inv.get("ask_human", 0) + 1
+            return str(interrupt(question))
+        return StructuredTool.from_function(func=_ask, name="ask_human", description="ask")
+
+    def _f(title: str = "", trigger_iso: str = "", reminder_ref: str = "", q: str = "") -> str:
+        inv[name] = inv.get(name, 0) + 1
+        return f"{name}-ok"
+    return StructuredTool.from_function(func=_f, name=name, description=name)
+
+
+_CORE = ["list_reminders", "schedule_reminder", "update_reminder", "add_task", "cancel_task",
+         "need_family", "recall_memory", "ask_human"]
+_WEB = ["web_search", "fetch_url", "get_weather"]
+
+
+@pytest.fixture
+def install(monkeypatch):
+    from sreda.config import settings as settings_mod
+
+    def _install(*, responses):
+        monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "1")
+        monkeypatch.setenv("SREDA_REACT_UNIFIED_PATH_ENABLED", "1")
+        monkeypatch.setenv("SREDA_REACT_UNIFIED_TENANTS", "t")
+        settings_mod.get_settings.cache_clear()
+        inv: dict = {}
+        monkeypatch.setattr(react_loop, "build_slice_tools", lambda *a, **k: [
+            _clean_tool(n, inv) for n in (_CORE + _WEB)])
+        monkeypatch.setattr(react_loop, "_trace", _NoTrace())
+        monkeypatch.setattr(react_loop, "_record_react_usage", lambda **k: None)
+        import sreda.services.llm as llm_mod
+        freddie = _Chat("freddie", responses=responses)
+        monkeypatch.setattr(llm_mod, "get_chat_llm", lambda *a, **k: _Chat("ds"))
+        return inv, freddie
+
+    yield _install
+    settings_mod.get_settings.cache_clear()
+
+
+def _turn(freddie, thread, text):
+    return asyncio.run(react_loop.handle_turn(
+        session=None, tenant_id="t", user_id="u", thread_id=thread,
+        llm=freddie, user_text=text, inbound_message_id=f"{thread}:{text[:10]}",
+        channel="react", resume_only=False, expected_confirm_id="",
+        provider_key="inception-mercury2", fallback_llm=None))
+
+
+def _ai_call(name, cid, **args):
+    return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": cid}])
+
+
+def test_e2e_date_without_time_gated(install):
+    """Кейс Ольги (red из чеклиста): дата без времени + модель выдумала 13:00 → напоминание НЕ создано,
+    отказ time_not_specified дошёл до модели, финал — вопрос."""
+    inv, freddie = install(responses=[
+        _ai_call("schedule_reminder", "c1", title="стоматолог", trigger_iso="2026-07-14T13:00:00+03:00"),
+        AIMessage(content="Во сколько напомнить?"),
+    ])
+    r = _turn(freddie, "g1", "Ане 15 июля нужно к стоматологу. Напомни мне об этом 14 числа")
+    assert inv.get("schedule_reminder", 0) == 0, "выдуманное время НЕ должно создать напоминание"
+    assert "сколько" in str(r).lower(), r
+
+
+def test_e2e_explicit_time_passes(install):
+    """Кейс Екатерины (анти-регресс): явное время → создаётся без лишних вопросов."""
+    inv, freddie = install(responses=[
+        _ai_call("schedule_reminder", "c1", title="репетиция", trigger_iso="2026-07-16T09:00:00+03:00"),
+        AIMessage(content="Готово, записала на 9 утра."),
+    ])
+    _turn(freddie, "g2", "напомни 16 июля в 9 утра про репетицию")
+    assert inv.get("schedule_reminder", 0) == 1, "явное время должно пройти гейт"
+
+
+def test_e2e_two_hop_answer_passes(install):
+    """Двухходовка (чеклист п.3): «во сколько?» через ask_human → ответ «в 13» → создание проходит
+    (окно хода видит ответ на уточнение)."""
+    inv, freddie = install(responses=[
+        _ai_call("ask_human", "q1", question="Во сколько напомнить?"),   # ход1 → пауза
+        _ai_call("schedule_reminder", "c1", title="стоматолог",           # resume: время из ответа
+                 trigger_iso="2026-07-14T13:00:00+03:00"),
+        AIMessage(content="Готово, напомню 14-го в 13:00."),
+    ])
+    r1 = _turn(freddie, "g3", "напомни про стоматолога 14 числа")
+    assert "сколько" in str(r1).lower(), r1      # пауза-вопрос дошла до юзера
+    assert inv.get("schedule_reminder", 0) == 0  # до ответа — не создано
+    _turn(freddie, "g3", "в 13")                  # ответ на ask_human (resume)
+    assert inv.get("schedule_reminder", 0) == 1, "ответ «в 13» должен открыть гейт (окно хода)"
+
+
+def test_e2e_update_title_only_not_gated(install):
+    """update_reminder БЕЗ смены времени (title-only) — не гейтится."""
+    inv, freddie = install(responses=[
+        _ai_call("update_reminder", "c1", reminder_ref="r1", title="новое название"),
+        AIMessage(content="Переименовала."),
+    ])
+    r1 = _turn(freddie, "g4", "переименуй напоминание в новое название")
+    if getattr(r1, "awaiting_confirm", False):  # кандидат (нет сигнала) → подтверждаем
+        _turn(freddie, "g4", "да")
+    assert inv.get("update_reminder", 0) == 1, "title-only update не должен гейтиться временем"
+
+
+# ─────────── R2: состязательные кейсы ревью (2 Codex MAJOR + 3 субагент MAJOR) ───────────
+def test_time_detector_r2_dates_and_durations_gate():
+    """dd.mm — ДАТА (субагент MAJOR-1: «напомни 08.07» = прод-кейс 01.07 в письменной форме);
+    «через полтора дня/месяца» — сдвиг даты (оба Codex); «в 9-е» — порядковая дата (Codex high)."""
+    for t in ("напомни 08.07 про стоматолога", "оплатить 14.07", "сделай напоминание на 09.07",
+              "через полтора дня", "через полтора месяца", "напомни в 9-е", "в 9-го числа"):
+        assert not text_mentions_time(t), t
+
+
+def test_time_detector_r2_colloquial_times_pass():
+    """«10 утра» без «в» (субагент MAJOR-2: STT роняет предлог); «к 18»; «то же время»/«как было»/
+    «за N до» (MAJOR-3: иначе петля переспросов на переносе); «через полтора часа»."""
+    for t in ("10 утра", "напомни завтра 10 утра", "завтра 9 вечера", "к 18", "сегодня к 10",
+              "через полтора часа", "то же время", "перенеси на то же время завтра",
+              "за 30 минут до", "за час до", "19.45", "9.30"):
+        assert text_mentions_time(t), t
+
+
+def test_turn_window_r2_event_time_is_not_reminder_time():
+    """Codex high MAJOR: время СОБЫТИЯ в соседнем предложении НЕ открывает гейт напоминанию."""
+    gated = react_loop._turn_time_window_text(
+        [HumanMessage(content="Ане 9 июля в 10 к стоматологу. Напомни мне об этом 8 числа")])
+    assert not text_mentions_time(gated), gated  # «в 10» — про визит, отфильтровано
+    ok = react_loop._turn_time_window_text(
+        [HumanMessage(content="Напомни завтра в 10 про стоматолога. Ане 9 июля к врачу")])
+    assert text_mentions_time(ok), ok  # время в напоминание-предложении — проходит
+    # fallback: нет «напомни»-предложений → весь текст (вызов из контекста)
+    fb = react_loop._turn_time_window_text([HumanMessage(content="встреча завтра в 10")])
+    assert text_mentions_time(fb)
+
+
+def test_e2e_update_trigger_without_time_gated(install):
+    """R2 (субагент MINOR-4, mutation-proven дыра): update-ветка гейта — смена времени без времени
+    в тексте → отказ, инструмент не вызван."""
+    inv, freddie = install(responses=[
+        _ai_call("update_reminder", "c1", reminder_ref="r1", trigger_iso="2026-07-20T13:00:00+03:00"),
+        AIMessage(content="Во сколько перенести?"),
+    ])
+    r = _turn(freddie, "g5", "перенеси напоминание про врача на 20 число")
+    assert inv.get("update_reminder", 0) == 0, "смена времени без времени в тексте — гейт"
+    assert "сколько" in str(r).lower(), r
+
+
+# ─────────── R3: находки R2-ревью (2 Codex MAJOR + 2 субагент MAJOR, пробы live) ───────────
+def test_time_detector_r3_gates():
+    """«в 08.07»/«к 09.07» — префикс до точки-даты НЕ время (Codex high); «через 2 дня»/«за 3 дня до» —
+    длительность, dur-strip (субагент MAJOR-2); «как было»/«как обычно» убраны (широкие FP)."""
+    for t in ("напомни в 08.07", "к 09.07 напомни", "через 2 дня", "напомни через 2 дня",
+              "через 3 дня", "за 3 дня до", "за 2 недели до", "через месяц",
+              "как было", "как обычно", "сделай как обычно напоминание на завтра"):
+        assert not text_mentions_time(t), t
+
+
+def test_time_detector_r3_passes():
+    """«завтра в 2 дня» (=14:00) проходит — dur-strip режет ТОЛЬКО «через/за N дня»; «в 19.30» — по
+    точка-правилу (минуты >12); «за час до» жив после чистки фраз."""
+    for t in ("завтра в 2 дня", "в 19.30", "за час до", "за 30 минут до", "то же время"):
+        assert text_mentions_time(t), t
+
+
+def test_turn_window_r3_dot_times_survive_split():
+    """Субагент R2 MAJOR-1: точка внутри «9.30»/«08.07» — НЕ граница предложения. Композиция
+    окно+детектор (ровно та, что в диспатче)."""
+    def _win(text):
+        return react_loop._turn_time_window_text([HumanMessage(content=text)])
+    # время точкой в «напомни»-предложении — ПРОХОДИТ (раньше рвалось на «напомни про рейс 9»)
+    for t in ("напомни про рейс 9.30", "напомни завтра 19.45", "напомни 08.07 в 9 утра"):
+        assert text_mentions_time(_win(t)), (t, _win(t))
+    # дата точкой — ГЕЙТИТСЯ (не разорвана, детектор видит «08.07» целиком)
+    for t in ("напомни оплатить 14.07", "напомни 08.07 про стоматолога"):
+        assert not text_mentions_time(_win(t)), (t, _win(t))
+    # noun-only → fallback весь текст (глагольный скоуп: «напоминание» не скоупит)
+    assert text_mentions_time(_win("поставь напоминание на 19.30"))
+    # время события при существительном в контексте — ГЕЙТИТСЯ (Codex high R2)
+    assert not text_mentions_time(_win("Напомни об этом 8 числа. Это напоминание про встречу в 10"))
+
+
+def test_turn_window_r4_noun_command_scopes():
+    """R4 (оба Codex R3 MAJOR): НОМИНАЛЬНАЯ КОМАНДА («поставь напоминание…») скоупит — время события из
+    соседнего предложения гейт НЕ открывает; описательное «это напоминание про…» по-прежнему не скоупит."""
+    def _win(text):
+        return react_loop._turn_time_window_text([HumanMessage(content=text)])
+    # событие в 10 + номинальная команда без времени → ГЕЙТ (раньше fallback пропускал «в 10»)
+    for t in ("Встреча завтра в 10. Поставь напоминание на 8 число",
+              "Ане завтра в 10 к врачу. Поставь напоминание на 8 число",
+              "Совещание в 15:00. Создай напоминание на 20 число",
+              "Ужин в 19. Сделай напоминание на завтра"):
+        assert not text_mentions_time(_win(t)), (t, _win(t))
+    # номинальная команда СО временем → проходит (скоупит сама себя)
+    for t in ("Поставь напоминание на 19.30", "Сделай напоминание завтра в 10",
+              "Создай напоминание на 9 утра"):
+        assert text_mentions_time(_win(t)), (t, _win(t))
+    # описательное существительное НЕ скоупит (кейс Codex high R2 остаётся закрыт)
+    assert not text_mentions_time(_win("Напомни об этом 8 числа. Это напоминание про встречу в 10"))
+    # ни глагола, ни команды → fallback весь текст (вызов из контекста)
+    assert text_mentions_time(_win("нужно напоминание на завтра в 10"))
+
+
+def test_turn_window_r4_imperfective_scopes():
+    """R4 fold-in (субагент MINOR): «напоминай(те)» — тоже глагол намерения, скоупит."""
+    def _win(text):
+        return react_loop._turn_time_window_text([HumanMessage(content=text)])
+    assert not text_mentions_time(_win("Встреча завтра в 10. Напоминай мне об этом каждый день"))
+    assert text_mentions_time(_win("Напоминай мне каждый день в 9 утра пить таблетки"))

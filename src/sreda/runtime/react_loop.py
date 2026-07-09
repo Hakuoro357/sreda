@@ -1904,6 +1904,56 @@ def _declined_reply(question: str) -> str:
     return f"Отменила, не трогаю «{m.group(1)}»." if m else "Отменила, ничего не делаю."
 
 
+# #288 R3/R4 — скоуп по НАМЕРЕНИЮ напоминания (маятник ревью: R2 noun-скоуп протаскивал время события
+# через ОПИСАТЕЛЬНОЕ «это напоминание про встречу в 10»; R3 verb-only переоткрыл утечку для НОМИНАЛЬНОЙ
+# КОМАНДЫ «поставь напоминание на 8 число» + событие в соседнем предложении, оба Codex R3). Предложение
+# скоупит, если: глагол «напомн-» ИЛИ «напоминани-» ВМЕСТЕ с командным глаголом (поставь/создай/сделай…).
+_REMIND_SENT_RE = re.compile(r"напомн|напоминай", re.IGNORECASE)  # стем глагола + несов. вид «напоминай(те)»
+# (субагент R4 MINOR: «напоминай мне об этом…» иначе падал в fallback); «напоминание» — не матчится
+_REMIND_NOUN_RE = re.compile(r"напоминани", re.IGNORECASE)
+_MAKE_VERB_RE = re.compile(r"\bсдела(?:й|йте)\b", re.IGNORECASE)  # «сделай» нет в _CMD_VERBS
+
+
+def _is_remind_intent_sentence(s: str) -> bool:
+    """#288 R4: предложение — ПРО постановку напоминания? Глагол «напомни…» ИЛИ существительное
+    «напоминание» с командным глаголом. Описательное «это напоминание про…» — НЕ скоупит."""
+    if _REMIND_SENT_RE.search(s):
+        return True
+    if _REMIND_NOUN_RE.search(s):
+        from sreda.runtime.react_signals import _CMD_VERBS
+        return bool(_CMD_VERBS.search(s) or _MAKE_VERB_RE.search(s))
+    return False
+
+
+def _turn_time_window_text(messages: Any) -> str:
+    """#288: окно текста ХОДА для гейта времени — последний HumanMessage + ответы юзера на уточнения
+    ask_human ПОСЛЕ него (двухходовка: «напомни 14 числа» → «во сколько?» → «в 13» приходит resume'ом
+    ask_human и живёт в ToolMessage, не в HumanMessage — без этого окно не увидело бы ответ).
+
+    R2 (Codex high MAJOR — время СОБЫТИЯ ≠ время НАПОМИНАНИЯ): «Ане 9 июля В 10 к стоматологу. Напомни
+    об этом 8 числа» — «в 10» про визит, а не про напоминание. Если в тексте юзера есть предложения с
+    «напомни…» — в окно идут ТОЛЬКО ОНИ (+ ответы ask_human); прочие предложения (контекст события) время
+    гейту не открывают. Нет напоминание-предложений (вызов из контекста) → весь текст (fallback)."""
+    msgs = list(messages or [])
+    last_h = -1
+    for i in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[i], HumanMessage):
+            last_h = i
+            break
+    if last_h < 0:
+        return ""
+    human = str(getattr(msgs[last_h], "content", "") or "")
+    # R3 (субагент R2 MAJOR-1): точка МЕЖДУ цифрами — «9.30»/«08.07», НЕ граница предложения (иначе
+    # окно рвало «напомни про рейс 9.30» → «напомни про рейс 9» → ложный отказ на названном времени).
+    sents = [s.strip() for s in re.split(r"[!?;\n]+|\.(?!\d)", human) if s.strip()]
+    remind_sents = [s for s in sents if _is_remind_intent_sentence(s)]
+    parts = [" ".join(remind_sents) if remind_sents else human]
+    for m in msgs[last_h + 1:]:
+        if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_human":
+            parts.append(str(getattr(m, "content", "") or ""))
+    return "\n".join(parts)
+
+
 # #319 R2: успех-префиксы memory-write инструментов (tools.py: save_core_fact→`saved_core:`,
 # save_episode→`saved_episode:`, create_memory_category→`created:`). Продление двери серии — ТОЛЬКО по
 # ним: отказ candidate («Хорошо, не делаю.») и `error:*` НЕ продлевают. Дрейф формата ловят red-тесты.
@@ -2985,6 +3035,23 @@ def _build_graph(llm: Any, all_tools: list, *,
                     out.append(ToolMessage(
                         content=_wmsg, name=tc["name"], tool_call_id=tc["id"],
                         artifact={"result_kind": "source_result_required"}))
+                    continue
+            # #288 (возврат механизма #180, красная линия «врёт об успехе»): напоминание с КОНКРЕТНЫМ
+            # моментом, при том что юзер время НЕ называл за ход (окно = текст + ответы ask_human) →
+            # структурный отказ, НЕ создание (прод-кейс 01.07: «напомни 8 числа» → бот молча создал на
+            # 13:00). Промпт (докстринг schedule_reminder) слабую модель не держал — держит диспатч.
+            # update_reminder гейтится ТОЛЬКО при смене времени (title-only проходит). БЕЗ unified-гейта:
+            # это страховочный МЕХАНИЗМ безопасности всего ReAct-пути (как сам #180), не фича канарейки.
+            if name in ("schedule_reminder", "update_reminder"):
+                _needs_time = (name == "schedule_reminder"
+                               or bool(str((tc_args or {}).get("trigger_iso") or "").strip()))
+                from sreda.runtime.react_signals import text_mentions_time
+                if _needs_time and not text_mentions_time(_turn_time_window_text(state["messages"])):
+                    out.append(ToolMessage(
+                        content=("время не названо пользователем — НЕ выдумывай своё: спроси "
+                                 "«во сколько?» одним коротким вопросом"),
+                        name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "time_not_specified"}))
                     continue
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах

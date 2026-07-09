@@ -188,3 +188,29 @@ def test_admin_per_user_returns_rows_sorted_descending(monkeypatch, tmp_path):
     assert rows[0].user_remaining is None
     assert rows[2].tenant_name == "Tenant Two"
     assert rows[2].tavily_calls == 2
+
+
+def test_331_coexists_with_begin_hook_no_manual_set_transaction(monkeypatch, tmp_path):
+    """#331: под PG-путём try_consume_tavily НЕ шлёт ручной SET TRANSACTION внутри tx (конфликт с
+    begin-событием #138). Форс PG-ветки на sqlite + begin-листенер (как #138) → старый код подавился бы
+    синтаксисом SET (красный), фикс через execution_options → зелёный."""
+    from sqlalchemy import event
+    from sreda.services.web_search_usage import try_consume_tavily, QuotaDecision
+    session = _bootstrap(monkeypatch, tmp_path, name="ws_331.db")
+    try:
+        eng = get_engine()
+
+        @event.listens_for(eng, "begin")
+        def _first(conn):  # noqa: ANN001
+            conn.exec_driver_sql("SELECT 1")
+        monkeypatch.setattr(eng.dialect, "name", "postgresql")
+        seen: list[str] = []
+
+        @event.listens_for(eng, "before_cursor_execute")
+        def _cap(conn, cursor, statement, *a):  # noqa: ANN001
+            seen.append(statement)
+        d = try_consume_tavily(eng, "t1", "u1", per_user_cap=5, global_cap=100)
+        assert d == QuotaDecision.ALLOW, d
+        assert not any("SET TRANSACTION ISOLATION LEVEL" in s.upper() for s in seen)
+    finally:
+        session.close()

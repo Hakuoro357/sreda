@@ -127,15 +127,17 @@ class UsageLedgerService:
         periods_list = [self._normalize_period(p) for p in periods]
 
         is_pg = self.engine.dialect.name == "postgresql"
+        # #331: изоляцию ставим через execution_options (уровень СОЕДИНЕНИЯ — драйвер применяет ДО BEGIN),
+        # а НЕ ручным `SET TRANSACTION ISOLATION LEVEL` внутри транзакции. Причина: #138 повесил на app-движок
+        # begin-событие (`set_config('sreda.tenant_id',…)`), которое теперь ПЕРВЫЙ запрос транзакции → Postgres
+        # роняет `SET TRANSACTION ISOLATION LEVEL must be called before any query` (ActiveSqlTransaction),
+        # крэшив ход нового юзера лендинга. execution_options ставит SERIALIZABLE на соединении → BEGIN уже
+        # сериализуемый, GUC-хук выполняется штатно. SQLite: изоляцию не трогаем (single-writer сериализация).
+        _engine = (self.engine.execution_options(isolation_level="SERIALIZABLE")
+                   if is_pg else self.engine)
         for attempt in range(3):
             try:
-                with self.engine.begin() as conn:
-                    if is_pg:
-                        conn.execute(text(
-                            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
-                        ))
-                    # SQLite: default journaling provides effective
-                    # serialization для single-writer model — no SET needed.
+                with _engine.begin() as conn:
                     for spec in periods_list:
                         if not self._try_consume_one(
                             conn, tenant_id, metric, amount, spec,
