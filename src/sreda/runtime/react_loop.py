@@ -1904,6 +1904,25 @@ def _declined_reply(question: str) -> str:
     return f"Отменила, не трогаю «{m.group(1)}»." if m else "Отменила, ничего не делаю."
 
 
+def _turn_time_window_text(messages: Any) -> str:
+    """#288: окно текста ХОДА для гейта времени — последний HumanMessage + ответы юзера на уточнения
+    ask_human ПОСЛЕ него (двухходовка: «напомни 14 числа» → «во сколько?» → «в 13» приходит resume'ом
+    ask_human и живёт в ToolMessage, не в HumanMessage — без этого окно не увидело бы ответ)."""
+    msgs = list(messages or [])
+    last_h = -1
+    for i in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[i], HumanMessage):
+            last_h = i
+            break
+    if last_h < 0:
+        return ""
+    parts = [str(getattr(msgs[last_h], "content", "") or "")]
+    for m in msgs[last_h + 1:]:
+        if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_human":
+            parts.append(str(getattr(m, "content", "") or ""))
+    return "\n".join(parts)
+
+
 # #319 R2: успех-префиксы memory-write инструментов (tools.py: save_core_fact→`saved_core:`,
 # save_episode→`saved_episode:`, create_memory_category→`created:`). Продление двери серии — ТОЛЬКО по
 # ним: отказ candidate («Хорошо, не делаю.») и `error:*` НЕ продлевают. Дрейф формата ловят red-тесты.
@@ -2985,6 +3004,23 @@ def _build_graph(llm: Any, all_tools: list, *,
                     out.append(ToolMessage(
                         content=_wmsg, name=tc["name"], tool_call_id=tc["id"],
                         artifact={"result_kind": "source_result_required"}))
+                    continue
+            # #288 (возврат механизма #180, красная линия «врёт об успехе»): напоминание с КОНКРЕТНЫМ
+            # моментом, при том что юзер время НЕ называл за ход (окно = текст + ответы ask_human) →
+            # структурный отказ, НЕ создание (прод-кейс 01.07: «напомни 8 числа» → бот молча создал на
+            # 13:00). Промпт (докстринг schedule_reminder) слабую модель не держал — держит диспатч.
+            # update_reminder гейтится ТОЛЬКО при смене времени (title-only проходит). БЕЗ unified-гейта:
+            # это страховочный МЕХАНИЗМ безопасности всего ReAct-пути (как сам #180), не фича канарейки.
+            if name in ("schedule_reminder", "update_reminder"):
+                _needs_time = (name == "schedule_reminder"
+                               or bool(str((tc_args or {}).get("trigger_iso") or "").strip()))
+                from sreda.runtime.react_signals import text_mentions_time
+                if _needs_time and not text_mentions_time(_turn_time_window_text(state["messages"])):
+                    out.append(ToolMessage(
+                        content=("время не названо пользователем — НЕ выдумывай своё: спроси "
+                                 "«во сколько?» одним коротким вопросом"),
+                        name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "time_not_specified"}))
                     continue
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах

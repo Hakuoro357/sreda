@@ -322,7 +322,7 @@ async def test_react_create_reminder_emits_react_audit(db_session):
     ])
     await react_loop.handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
-        thread_id="audit3db-r", llm=stub, user_text="напомни позвонить маме",
+        thread_id="audit3db-r", llm=stub, user_text="напомни позвонить маме в 9 утра",  # #288: время в тексте (гейт)
         inbound_message_id="audit3db-r-msg", channel="max")
     rows = _audit(db_session, u.tenant_id, "family_reminder")
     assert len(rows) == 1, f"одна react-audit на создание напоминания: {len(rows)}"
