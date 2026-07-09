@@ -200,7 +200,6 @@ class RetentionWorker:
             "skill_events_high": result.skill_events_warn_error,
             "skill_attempts": result.skill_run_attempts,
             "skill_runs": result.skill_runs,
-            "react_debug": result.react_debug_turns,  # #185
             "react_turn_trace": result.react_turn_trace,  # #192
         }
         logger.info(
