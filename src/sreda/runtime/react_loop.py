@@ -1904,10 +1904,18 @@ def _declined_reply(question: str) -> str:
     return f"Отменила, не трогаю «{m.group(1)}»." if m else "Отменила, ничего не делаю."
 
 
+_REMIND_SENT_RE = re.compile(r"напомн|напомин", re.IGNORECASE)  # #288 R2: предложения ПРО напоминание
+
+
 def _turn_time_window_text(messages: Any) -> str:
     """#288: окно текста ХОДА для гейта времени — последний HumanMessage + ответы юзера на уточнения
     ask_human ПОСЛЕ него (двухходовка: «напомни 14 числа» → «во сколько?» → «в 13» приходит resume'ом
-    ask_human и живёт в ToolMessage, не в HumanMessage — без этого окно не увидело бы ответ)."""
+    ask_human и живёт в ToolMessage, не в HumanMessage — без этого окно не увидело бы ответ).
+
+    R2 (Codex high MAJOR — время СОБЫТИЯ ≠ время НАПОМИНАНИЯ): «Ане 9 июля В 10 к стоматологу. Напомни
+    об этом 8 числа» — «в 10» про визит, а не про напоминание. Если в тексте юзера есть предложения с
+    «напомни…» — в окно идут ТОЛЬКО ОНИ (+ ответы ask_human); прочие предложения (контекст события) время
+    гейту не открывают. Нет напоминание-предложений (вызов из контекста) → весь текст (fallback)."""
     msgs = list(messages or [])
     last_h = -1
     for i in range(len(msgs) - 1, -1, -1):
@@ -1916,7 +1924,10 @@ def _turn_time_window_text(messages: Any) -> str:
             break
     if last_h < 0:
         return ""
-    parts = [str(getattr(msgs[last_h], "content", "") or "")]
+    human = str(getattr(msgs[last_h], "content", "") or "")
+    sents = [s.strip() for s in re.split(r"[.!?;\n]+", human) if s.strip()]
+    remind_sents = [s for s in sents if _REMIND_SENT_RE.search(s)]
+    parts = [" ".join(remind_sents) if remind_sents else human]
     for m in msgs[last_h + 1:]:
         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_human":
             parts.append(str(getattr(m, "content", "") or ""))

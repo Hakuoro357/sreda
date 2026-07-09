@@ -185,3 +185,46 @@ def test_e2e_update_title_only_not_gated(install):
     if getattr(r1, "awaiting_confirm", False):  # кандидат (нет сигнала) → подтверждаем
         _turn(freddie, "g4", "да")
     assert inv.get("update_reminder", 0) == 1, "title-only update не должен гейтиться временем"
+
+
+# ─────────── R2: состязательные кейсы ревью (2 Codex MAJOR + 3 субагент MAJOR) ───────────
+def test_time_detector_r2_dates_and_durations_gate():
+    """dd.mm — ДАТА (субагент MAJOR-1: «напомни 08.07» = прод-кейс 01.07 в письменной форме);
+    «через полтора дня/месяца» — сдвиг даты (оба Codex); «в 9-е» — порядковая дата (Codex high)."""
+    for t in ("напомни 08.07 про стоматолога", "оплатить 14.07", "сделай напоминание на 09.07",
+              "через полтора дня", "через полтора месяца", "напомни в 9-е", "в 9-го числа"):
+        assert not text_mentions_time(t), t
+
+
+def test_time_detector_r2_colloquial_times_pass():
+    """«10 утра» без «в» (субагент MAJOR-2: STT роняет предлог); «к 18»; «то же время»/«как было»/
+    «за N до» (MAJOR-3: иначе петля переспросов на переносе); «через полтора часа»."""
+    for t in ("10 утра", "напомни завтра 10 утра", "завтра 9 вечера", "к 18", "сегодня к 10",
+              "через полтора часа", "то же время", "перенеси на то же время завтра",
+              "как было", "как обычно", "за 30 минут до", "за час до", "19.45", "9.30"):
+        assert text_mentions_time(t), t
+
+
+def test_turn_window_r2_event_time_is_not_reminder_time():
+    """Codex high MAJOR: время СОБЫТИЯ в соседнем предложении НЕ открывает гейт напоминанию."""
+    gated = react_loop._turn_time_window_text(
+        [HumanMessage(content="Ане 9 июля в 10 к стоматологу. Напомни мне об этом 8 числа")])
+    assert not text_mentions_time(gated), gated  # «в 10» — про визит, отфильтровано
+    ok = react_loop._turn_time_window_text(
+        [HumanMessage(content="Напомни завтра в 10 про стоматолога. Ане 9 июля к врачу")])
+    assert text_mentions_time(ok), ok  # время в напоминание-предложении — проходит
+    # fallback: нет «напомни»-предложений → весь текст (вызов из контекста)
+    fb = react_loop._turn_time_window_text([HumanMessage(content="встреча завтра в 10")])
+    assert text_mentions_time(fb)
+
+
+def test_e2e_update_trigger_without_time_gated(install):
+    """R2 (субагент MINOR-4, mutation-proven дыра): update-ветка гейта — смена времени без времени
+    в тексте → отказ, инструмент не вызван."""
+    inv, freddie = install(responses=[
+        _ai_call("update_reminder", "c1", reminder_ref="r1", trigger_iso="2026-07-20T13:00:00+03:00"),
+        AIMessage(content="Во сколько перенести?"),
+    ])
+    r = _turn(freddie, "g5", "перенеси напоминание про врача на 20 число")
+    assert inv.get("update_reminder", 0) == 0, "смена времени без времени в тексте — гейт"
+    assert "сколько" in str(r).lower(), r
