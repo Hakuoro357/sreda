@@ -212,3 +212,30 @@ def test_325_replay_create_category_and_fact_with_category(ctx):
     assert facts == 1, "replay НЕ создаёт второй факт"
     cats2 = [c for c in _repo(s).list_categories("t1", "u1") if "охота325" in c.name]
     assert len(cats2) == 1, "replay НЕ создаёт вторую категорию через резолв"
+
+
+def test_325_replay_does_not_resurrect_deleted_category(ctx):
+    """#325 R3 (субагент R2 MAJOR — mutation-hole): лок на «резолв ВНУТРИ мутации». Replay уже
+    закоммиченной операции НЕ должен пере-запускать резолв категории: удаляем категорию → replay того же
+    op_id → payload сохранённый, категория ОСТАЁТСЯ удалённой. R1-форма (резолв снаружи _idem_write)
+    пере-резолвила бы и ВОСКРЕСИЛА категорию — этот тест на ней красный (mutation-verified)."""
+    from sreda.db.models import AssistantMemory
+    from sreda.runtime.planner.tool_runtime import ToolRuntimeContext, bind_tool_runtime
+    s, tools = ctx
+    c = ToolRuntimeContext(operation_id="op-325-res", execution_id="e", step_id="s1",
+                           tool_name="save_core_fact", tenant_id="t1", user_id="u1",
+                           turn_key="tk", channel="react", thread_id="th", origin="react")
+    with bind_tool_runtime(c):
+        f1 = tools["save_core_fact"].invoke({"content": "клюёт на зорьке", "category": "клёв325"})
+    assert f1.startswith("saved_core:")
+    # удаляем категорию (как будто юзер снёс её в мини-аппе); сначала факт — FK на категорию
+    cat = next(x for x in _repo(s).list_categories("t1", "u1") if "клёв325" in x.name)
+    for m in s.query(AssistantMemory).filter(AssistantMemory.category_id == cat.id).all():
+        s.delete(m)
+    s.delete(cat)
+    s.commit()
+    with bind_tool_runtime(c):  # replay ТОГО ЖЕ op (re-execute узла)
+        f2 = tools["save_core_fact"].invoke({"content": "клюёт на зорьке", "category": "клёв325"})
+    assert f2 == f1, "replay возвращает сохранённый payload"
+    assert not [x for x in _repo(s).list_categories("t1", "u1") if "клёв325" in x.name], \
+        "replay НЕ воскрешает удалённую категорию (резолв не пере-запущен)"

@@ -104,8 +104,9 @@ def build_memory_tools(
         делившая батч с interrupt-кандидатом, вызывалась ПОВТОРНО → дубль (memory — unkeyed-семья).
         operation_id из ToolRuntimeContext стабилен при перевыполнении (turn_key из state + step_id из
         checkpointed AIMessage — так спроектировано в run_tools) → повтор возвращает сохранённый payload
-        БЕЗ новой строки. Вне ctx (легаси/не-ReAct) — self-commit как раньше. Валидации/error-ветки
-        держим СНАРУЖИ (не клеймят op-строку)."""
+        БЕЗ новой строки. Вне ctx (легаси/не-ReAct) — self-commit как раньше. ЧИСТЫЕ валидации
+        (пустой текст и т.п.) — снаружи; а вот побочные шаги (резолв/создание категории) — ВНУТРИ
+        mutate (R2: снаружи утекали на replay/error-путях), их ошибки ловит уровень инструмента."""
         ctx = current_tool_runtime()
         if ctx is None:
             payload = mutate_fn()
@@ -213,6 +214,9 @@ def build_memory_tools(
 
         try:  # ошибки категории из мутации → те же честные тексты, что раньше (claim откачен savepoint'ом)
             return _idem_write("save_core_fact", {"content": text, "category": category or ""}, _mut)
+        # NB (R2 субагент MINOR): catch шире категории синтаксически, но repo.save кидает ValueError
+        # только на unknown tier/source/пустой content — всё константы/пре-валидировано здесь. Если
+        # repo.save обзаведётся новым ValueError-путём — пересмотреть маппинг текста.
         except ValueError:
             return "error: некорректное имя категории"
         except CategoryNameConflict:
