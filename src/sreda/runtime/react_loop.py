@@ -1884,6 +1884,20 @@ def _stale_pause_note(has_pause: bool, redirect_new: bool, tenant_id: str,
     return _stale_pause_directive(gap_seconds)
 
 
+# #320.3 (#321 follow-up): объект «X» — ТОЛЬКО из человеческих confirm-вопросов «Я сейчас … «X»…»
+# (bespoke destructive-обёртки). У generic candidate-confirm в «…» стоит ИМЯ ИНСТРУМЕНТА («Я поняла как
+# «add_task»…») — его юзеру не отдаём → генерик-отказ.
+_DECLINE_OBJ_RE = re.compile(r"^Я сейчас .*?«([^»]+)»")
+
+
+def _declined_reply(question: str) -> str:
+    """#320.3 (#321 follow-up, Codex high R2): вернуть «X» в детерминированный текст отмены — из
+    СТРУКТУРНОГО вопроса паузы (_pending, не LLM/tool-output). «Я сейчас удалю задачу «X». …» →
+    «Отменила, не трогаю «X».»; не распарсили (generic candidate/нет кавычек) → честный генерик."""
+    m = _DECLINE_OBJ_RE.search(question or "")
+    return f"Отменила, не трогаю «{m.group(1)}»." if m else "Отменила, ничего не делаю."
+
+
 def _confirm_declined(is_confirm_pause: bool, resume_val: str, tenant_id: str) -> bool:
     """#321: ОТКАЗ на confirm-паузе на ЕДИНОМ (канареечном) пути? = confirm-пауза И resume НЕ «да» И
     `_unified_execute_for`. True → финальный ответ берём ДЕТЕРМИНИРОВАННО («Отменила, ничего не делаю.»),
@@ -3904,13 +3918,14 @@ async def handle_turn(
         # пре-существует у протухших пауз → отдельный follow-up на терминализацию, вне #316).
         _did_resume = live_pause and not _redirect_new
         _declined_confirm = False  # #321: confirm-ОТМЕНА (resume «нет») → детерминированный ответ ниже
+        _pending_q = ""  # #320.3: вопрос паузы — для «X» в детерминированном тексте отмены
         if _did_resume:  # живое уточнение → возобновляем (turn_key уже в state)
             # #267 A0: свободный ТЕКСТ на confirm-паузе классифицируем ЗДЕСЬ — в граф идёт ТОЛЬКО
             # канон «да»/«нет» (текст «удали Y» больше НЕ исполняет удаление). Кнопка (resume_only)
             # уже шлёт канон (confirm_resume_text). ask_human (не confirm) — текст-ответ как есть.
             # redirect → A0 трактует «нет» (безопасный отказ; авто-переключение раздела — Фаза B).
             _resume_val = user_text
-            _, _is_confirm_pause, _ = _pending(snap)
+            _pending_q, _is_confirm_pause, _ = _pending(snap)  # #320.3: q — в «X» текста отмены
             # #285 Фаза A: различаем yes|no|redirect ДО инвока (finish писал только «confirmed» —
             # петля калибровки словаря была неизмерима, инвентарь Фазы 0 §5.5). redirect (новое
             # намерение на confirm-паузе) в ГРАФ по-прежнему идёт как безопасное «нет» (A0), но в
@@ -3930,6 +3945,7 @@ async def handle_turn(
         else:
             _redirect_close_msgs: list = []  # #316 R2: withdrawal-ToolMessage для повисших tool_call
             _stale_note = ""  # #stale: директива грациозного возврата к протухшему вопросу (unified)
+            _abandon_tk, _abandon_is_confirm = "", False  # #320.1: брошенная пауза (ключ/тип) для терминализации
             if _has_pause(snap):  # протухшая пауза ИЛИ #316 redirect (новый запрос на едином пути) → гасим
                 # #193: ВКЛ durable → ключ стабилен, паузу гасим ЯВНО (clear_pending: drop
                 # interrupt-write idx<0), СОХРАНЯЯ историю диалога; НЕ сменой ключа (p-010).
@@ -3943,9 +3959,12 @@ async def handle_turn(
                         # отвергает непарный вызов (run_tools везде держит инвариант; build_model_input сироту
                         # НЕ чинит). Закрываем пару withdrawal-ToolMessage. R3 (субагент R2 MINOR): блок ВНУТРИ
                         # try, ПОСЛЕ успешного clear_pending — при сбое гашения withdrawals НЕ шлём (иначе
-                        # fresh-invoke на всё ещё прерванном треде + заглушки). ТОЛЬКО redirect единого пути:
-                        # у легаси протухшая пауза байт-идентична (её fresh-invoke НЕ трогаем).
-                        if _redirect_new:
+                        # fresh-invoke на всё ещё прерванном треде + заглушки).
+                        # #320.4: withdrawal ТАКЖЕ на ПРОТУХШЕЙ паузе единого пути (не только redirect) —
+                        # сирота ask_human у stale-clear давал бы тот же отказ провайдера (пре-существовало;
+                        # реальный тред Бориса выжил, но риск подтверждён ревью stale-фикса). Гейт unified —
+                        # откат единого пути возвращает и старое поведение legacy-stale (байт-идентично).
+                        if _redirect_new or _unified_execute_for(tenant_id):
                             _pmsgs = _pre_vals.get("messages") or []
                             _redirect_close_msgs = _withdrawal_messages(_pmsgs[-1] if _pmsgs else None)
                     except Exception:  # noqa: BLE001 — гашение не валит ход
@@ -3964,9 +3983,25 @@ async def handle_turn(
                 _stale_note = _stale_pause_note(
                     bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
                     _persist_enabled(), _interrupt_age_seconds(snap.created_at))
+                # #320.1: ключ/тип брошенной паузы — терминализация ряда НИЖЕ, ПОСЛЕ минтинга нового
+                # turn_key (R1 субагент MINOR: при пустом inbound_message_id новый ключ = f(thread_id) и
+                # может СОВПАСТЬ со старым → abandoned пометил бы done ряд, который start/finish свежего
+                # хода уже не переоткроют — полная потеря трейса хода; guard: old != new).
+                _abandon_tk = str(_pre_vals.get("turn_key") or "")
+                _abandon_is_confirm = _stale_is_confirm
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
             turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
             _tk_trace = turn_key
+            # #320.1: терминализация БРОШЕННОГО ряда — старый ход остался awaiting_confirm навсегда
+            # (недосчёт redirect в метрике #285/#269; висело и у протухших). Лёгкий переход awaiting_confirm
+            # → done + confirm_state=redirected|expired (persist_trace_abandoned, guarded). Телеметрия, НЕ
+            # поведение → без unified-гейта (протухшие ряды легаси тоже перестают висеть). is_confirm —
+            # чтобы abandoned ask_human НЕ писал confirm_resolution (не загрязнял confirm-метрику, R1 субагент).
+            if _abandon_tk and _abandon_tk != turn_key:
+                _trace.persist_trace_abandoned(
+                    tenant_id=tenant_id, user_id=user_id, turn_key=_abandon_tk,
+                    reason=("redirected" if _redirect_new else "expired"),
+                    is_confirm=_abandon_is_confirm)
             # #192: start-строка трейса ДО графа (свежий ход). Resume — НЕ start (строка есть с pause).
             _trace.persist_trace_start(
                 tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
@@ -4175,10 +4210,11 @@ async def handle_turn(
         # #321 (канарейка #316 e2e): на confirm-ОТМЕНЕ (единый путь) ответ ДЕТЕРМИНИРОВАННЫЙ, а НЕ
         # пере-сочинённый chat-узлом — слабая модель галлюцинирует ложное «удалено» на отказе (юзер сказал
         # «удали» → модель дописывает «удалена», хотя инструмент отменён; honesty-хвост это не удержал).
-        # Фиксированный текст (ревью R1: без extraction последнего ToolMessage — тот ломался, если модель
-        # после отказа звала ещё тул). Success-путь («да») НЕ трогаем (_declined_confirm=False).
+        # Без extraction последнего ToolMessage (ревью #321 R1: тот ломался, если модель после отказа звала
+        # ещё тул). Success-путь («да») НЕ трогаем (_declined_confirm=False). #320.3: «X» — из СТРУКТУРНОГО
+        # вопроса паузы (_pending_q, снят ДО инвока), не из LLM/tool-output (Codex high #321 R2).
         if _declined_confirm:
-            text = "Отменила, ничего не делаю."
+            text = _declined_reply(_pending_q)
         reply = _Reply(_postformat(text) or "Готово.")
         # #192: финал → done + структура. ВЕСЬ блок под флагом И guarded (R1 CRITICAL Codex high):
         # collect_tool_calls/HMAC/json НЕ должны выполняться при OFF (спящий прод) и НЕ должны ронять
