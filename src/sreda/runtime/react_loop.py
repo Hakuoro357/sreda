@@ -3523,40 +3523,8 @@ def _count_executed_tool(messages: Any, name: str) -> int:
     return n
 
 
-def _persist_debug_turn(*, tenant_id: str, user_id: str, thread_id: str, channel: str,
-                        user_text: str, reply: Any, tools: list[str], kind: str) -> None:
-    """vex#170 (ВРЕМЕННОЕ): записать ход (вопрос + ответ бота + инструменты) в
-    react_debug_turns, чтобы видеть всю переписку пока тестируем механизм. Гейт: глобальный флаг
-    react_debug_all (#185, pre-launch QA — пишет ВСЕХ) ИЛИ ALLOWLIST react_debug_tenants. Оба ВЫКЛ
-    (дефолт) → никому. ИЗОЛИРОВАННАЯ сессия (не транзакция хода); текст шифруется на уровне модели;
-    НИКОГДА не роняет ход (debug — не correctness). reply — _Reply (подкласс str) → str(reply) = текст."""
-    try:
-        from sreda.config.settings import get_settings
-        _s = get_settings()
-        # #192: при включённом durable-трейсе (react_turn_trace) НЕ пишем временный react_debug_turns
-        # — одна система, без dual-write. Снос самой таблицы — отдельной миграцией позже.
-        if getattr(_s, "react_trace_enabled", False):
-            return
-        # #185: захват для ВСЕХ при react_debug_all; иначе — только per-tenant allowlist (#170).
-        if not (_s.react_debug_all or tenant_id in _s.react_debug_tenants):
-            return
-        import json as _json
-        from uuid import uuid4
-
-        from sreda.db.models import ReactDebugTurn
-        from sreda.db.session import get_session_factory
-        sess = get_session_factory()()
-        try:
-            sess.add(ReactDebugTurn(
-                id=f"rdt_{uuid4().hex}", tenant_id=tenant_id, user_id=user_id,
-                thread_id=thread_id, channel=channel, kind=kind,
-                user_text=user_text or "", reply_text=str(reply),
-                tools_json=_json.dumps(tools, ensure_ascii=False)))
-            sess.commit()
-        finally:
-            sess.close()
-    except Exception as exc:  # noqa: BLE001 — дебаг-запись НИКОГДА не ломает ход
-        logger.warning("react_loop: debug-persist failed type=%s", type(exc).__name__)
+# vex#170/#185 _persist_debug_turn + таблица react_debug_turns УДАЛЕНЫ (#138 Ф3-0,
+# owner-решение 2026-07-06): временный QA-захват заменён durable-трейсом react_turn_trace (#192).
 
 
 # --- #232 шаг B: пост-ходовая генерация выжимки истории (фасад) --------------
@@ -4235,9 +4203,6 @@ async def handle_turn(
                            awaiting_confirm=is_confirm, confirm_id=pid)
             # #192: pause-ход → awaiting_confirm/pending (conditional; не переоткрывает done)
             _trace.persist_trace_pause(tenant_id=tenant_id, user_id=user_id, turn_key=_tk_trace)
-            _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
-                                channel=channel, user_text=user_text, reply=reply,
-                                tools=_tools, kind="pause")
             return reply
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
@@ -4317,9 +4282,6 @@ async def handle_turn(
                     user_text=user_text, reply_text=str(reply), outcome=_outcome, passes=_passes_fin)
             except Exception:  # noqa: BLE001 — трейс не валит ход
                 logger.warning("react_loop: trace finish failed", exc_info=True)
-        _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
-                            channel=channel, user_text=user_text, reply=reply,
-                            tools=_tools, kind="final")
         return reply
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
         # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
@@ -4366,7 +4328,4 @@ async def handle_turn(
             _maybe_alert_degraded_turn(
                 tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
                 user_text=user_text, reply_text=str(_reply), outcome="safe_reply", passes=0)
-        _persist_debug_turn(tenant_id=tenant_id, user_id=user_id, thread_id=base,
-                            channel=channel, user_text=user_text, reply=_reply,
-                            tools=[], kind="error")
         return _reply

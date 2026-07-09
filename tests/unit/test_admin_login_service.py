@@ -114,8 +114,6 @@ def test_session_mint_resolve_revoke(session):
 async def test_maintenance_job_invokes_admin_login_cleanups(monkeypatch):
     """#305 checklist #13: периодический maintenance-джоб (max_subscription_health)
     ВЫЗЫВАЕТ обе admin-login GC-функции (challenge'и + сессии) в реальной сессии."""
-    from contextlib import contextmanager
-
     from sreda.workers import max_subscription_health as msh
 
     engine = create_engine(
@@ -126,17 +124,6 @@ async def test_maintenance_job_invokes_admin_login_cleanups(monkeypatch):
     Base.metadata.create_all(engine)
     Local = sessionmaker(bind=engine)
 
-    class _SF:
-        def __call__(self):
-            @contextmanager
-            def _cm():
-                s = Local()
-                try:
-                    yield s
-                finally:
-                    s.close()
-            return _cm()
-
     calls: list[str] = []
     monkeypatch.setattr(
         "sreda.services.admin_login.cleanup_expired_challenges",
@@ -146,7 +133,9 @@ async def test_maintenance_job_invokes_admin_login_cleanups(monkeypatch):
         "sreda.services.admin_login.cleanup_expired_admin_sessions",
         lambda s, **k: (calls.append("sessions"), 0)[1],
     )
-    monkeypatch.setattr(msh, "get_session_factory", lambda: _SF())
+    # #138 Ф2: _cleanup_admin_login теперь под privileged_session("admin") →
+    # инжектим тестовую БД через шов _factory_for (как в тестах диспетчера).
+    monkeypatch.setattr("sreda.db.session._factory_for", lambda _engine: Local)
     # Neutralise the MAX-subscription + channel-token halves (unrelated).
     monkeypatch.setattr(msh, "_verify_max_subscription", lambda st: None)
     monkeypatch.setattr(msh, "_cleanup_expired_tokens", lambda: None)

@@ -120,7 +120,7 @@ def _add_checklist_with_item(
     )
     session.add(cl)
     item = ChecklistItem(
-        id=item_id, checklist_id=list_id,
+        id=item_id, checklist_id=list_id, tenant_id="t1",
         position=0, title=item_title, status="pending",
         embedding_json=json.dumps(embedding),
         embedding_model="e5-large",

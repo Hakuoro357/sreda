@@ -29,7 +29,7 @@ from typing import Final
 
 import httpx
 
-from sreda.db.session import get_session_factory
+from sreda.db.session import privileged_session
 from sreda.services import runtime_config as rc
 from sreda.services.admin_alerts import send_admin_alert
 
@@ -121,20 +121,15 @@ def _extract_matching_post_id(html: str) -> str | None:
 
 def _read_last_alerted() -> str:
     """Считать последний alert'нутый post_id из runtime_config (sync)."""
-    session = get_session_factory()()
-    try:
+    # #138 Ф2: runtime_config — глобальная операционная таблица (не пер-тенант) → privileged.
+    with privileged_session("monitor") as session:
         return rc.get_config(session, _RC_KEY) or ""
-    finally:
-        session.close()
 
 
 def _write_last_alerted(post_id: str) -> None:
     """Записать post_id как alert'нутый (sync, commits внутри set_config)."""
-    session = get_session_factory()()
-    try:
+    with privileged_session("monitor") as session:
         rc.set_config(session, _RC_KEY, post_id)
-    finally:
-        session.close()
 
 
 async def _tick() -> None:

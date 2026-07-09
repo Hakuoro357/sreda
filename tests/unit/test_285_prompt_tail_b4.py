@@ -90,7 +90,6 @@ def install(monkeypatch):
         monkeypatch.setattr(react_loop, "build_slice_tools", lambda *a, **k: [
             _mk_tool(n, inv) for n in (_TASK_TOOLS + _WEB_TOOLS)])
         monkeypatch.setattr(react_loop, "_trace", _NoTrace())
-        monkeypatch.setattr(react_loop, "_persist_debug_turn", lambda **k: None)
         monkeypatch.setattr(react_loop, "_record_react_usage", lambda **k: None)
         import sreda.services.llm as llm_mod
         monkeypatch.setattr(llm_mod, "get_chat_llm", lambda *a, **k: deepseek)

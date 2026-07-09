@@ -23,7 +23,7 @@ import asyncio
 import logging
 
 from sreda.config.settings import get_settings
-from sreda.db.session import get_session_factory
+from sreda.db.session import privileged_session
 
 
 logger = logging.getLogger(__name__)
@@ -102,8 +102,8 @@ async def _verify_max_subscription(settings) -> None:
 def _cleanup_expired_tokens() -> None:
     from sreda.services.channel_linking import cleanup_expired_tokens
 
-    sf = get_session_factory()
-    with sf() as session:
+    # #138 Ф2: GC истёкших link-токенов ВСЕХ тенантов по времени → кросс-тенант privileged.
+    with privileged_session("retention") as session:
         deleted = cleanup_expired_tokens(session)
         if deleted:
             logger.info(
@@ -119,8 +119,8 @@ def _cleanup_admin_login() -> None:
         cleanup_expired_challenges,
     )
 
-    sf = get_session_factory()
-    with sf() as session:
+    # #138 Ф2: admin_sessions/challenges — админ-инфра (без tenant_id) → privileged.
+    with privileged_session("admin") as session:
         ch = cleanup_expired_challenges(session)
         se = cleanup_expired_admin_sessions(session)
         if ch or se:

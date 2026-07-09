@@ -49,7 +49,6 @@ from sreda.db.models.planner import (
 )
 from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
 from sreda.services.react_summary_store import delete_summaries_older_than
-from sreda.db.models.react_debug import ReactDebugTurn
 from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.runtime import AgentRun
 from sreda.db.models.skill_platform import (
@@ -84,7 +83,6 @@ class RetentionCleanupResult:
     step_execution_ledger: int = 0  # #164 (ребёнок planner_executions)
     planner_gaps: int = 0  # #164
     planner_llm_reservations: int = 0  # #164
-    react_debug_turns: int = 0  # #185 (временный QA-захват переписки — короткий TTL)
     react_turn_trace: int = 0  # #192 (durable трейс хода — короткий TTL, ПД)
     react_checkpoint: int = 0  # #193 (durable checkpoint диалога — GC по last-activity треда, ПД)
     react_summaries: int = 0  # #232 способ Б (durable-выжимка истории — GC по updated_at, ПД)
@@ -110,7 +108,6 @@ class RetentionCleanupResult:
             + self.step_execution_ledger
             + self.planner_gaps
             + self.planner_llm_reservations
-            + self.react_debug_turns
             + self.react_turn_trace
             + self.react_checkpoint
             + self.react_summaries
@@ -137,9 +134,6 @@ SKILL_EVENTS_DEBUG_INFO_DAYS = 30
 SKILL_EVENTS_WARN_ERROR_DAYS = 90
 SKILL_ATTEMPTS_DAYS = 90
 SKILL_RUNS_DAYS = 90
-# #185: react_debug_turns — ВРЕМЕННЫЙ QA-захват переписки (полный текст, EncryptedString). Короткое
-# окно: для отлова багов хватает, а ПД всех юзеров не копятся бессрочно (Codex high MAJOR).
-REACT_DEBUG_TURNS_DAYS = 14
 # #193: react_checkpoint/_write — durable диалог ReAct (ПД, шифр). GC по last-activity ТРЕДА: тред,
 # у которого MAX(created_at) < cutoff, удаляется ЦЕЛИКОМ (обе таблицы) — активный тред не режем
 # (целостность parent-цепочки). Окно длиннее трейса (живой диалог дольше отладочного следа).
@@ -433,15 +427,6 @@ def cleanup_runtime_retention(
     # 20260622_0060. There is no longer any eds_connect_payload row to clean up
     # here, so this branch is gone. ``result.secure_records_eds_connect_payload``
     # stays at its default 0 for log/metric shape compatibility.
-
-    # ---------- react_debug_turns (#185: временный QA-захват переписки, короткий TTL) ----------
-    # Leaf-таблица (нет FK-детей/родителей в чистке), полный текст переписки (EncryptedString).
-    # Удаляем строки старше REACT_DEBUG_TURNS_DAYS — ограничиваем накопление ПД при debug_all.
-    react_debug_cutoff = now - timedelta(days=REACT_DEBUG_TURNS_DAYS)
-    result.react_debug_turns = _delete_returning_count(
-        session,
-        delete(ReactDebugTurn).where(ReactDebugTurn.created_at < react_debug_cutoff),
-    )
 
     # #192: react_turn_trace — durable трейс хода, тот же короткий TTL (ПД).
     react_trace_cutoff = now - timedelta(days=REACT_TURN_TRACE_DAYS)

@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
 from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.models.housewife import FamilyMember, FamilyReminder
+from sreda.db.session import privileged_session, tenant_session
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +73,9 @@ class OnboardingAhaWorker:
     """Проактивный Aha-2: «запомнила диету — предложила меню»."""
 
     def __init__(
-        self, session: Session, *, system_bot_key: str | None = None, registry=None,
+        self, *, system_bot_key: str | None = None, registry=None,
     ) -> None:
-        self.session = session
+        # #138 Ф2: воркер сам ведёт privileged-скан + tenant_session на тенанта.
         # Phase 5: bot_key for system-generated outbox rows (no reminder
         # origin). Sourced from registry.system_default_bot_key in job_runner.
         self._system_bot_key = system_bot_key or LEGACY_NULL_BOT_KEY
@@ -95,42 +96,53 @@ class OnboardingAhaWorker:
         # Ищем тенантов одобренных 20-48 часов назад.
         lo = current - AHA2_MAX_AGE
         hi = current - AHA2_MIN_AGE
-        tenants = (
-            self.session.query(Tenant)
-            .filter(
-                Tenant.approved_at.isnot(None),
-                Tenant.approved_at >= lo,
-                Tenant.approved_at <= hi,
-                # #187 soft-delete — producer-фильтр (дверь #10): удалённым не шлём.
-                Tenant.deleted_at.is_(None),
-            )
-            .limit(limit)
-            .all()
-        )
+        # #138 Ф2: скан свежеодобренных — КРОСС-ТЕНАНТНЫЙ → privileged. Снимок id.
+        # #187 soft-delete producer-фильтр (дверь #10): удалённым не шлём.
+        with privileged_session("monitor") as scan:
+            tenant_ids = [
+                t.id for t in scan.query(Tenant)
+                .filter(
+                    Tenant.approved_at.isnot(None),
+                    Tenant.approved_at >= lo,
+                    Tenant.approved_at <= hi,
+                    Tenant.deleted_at.is_(None),
+                )
+                .limit(limit)
+                .all()
+            ]
 
         sent = 0
-        for tenant in tenants:
+        for tenant_id in tenant_ids:
+            # Работа с КОНКРЕТНЫМ тенантом — пер-тенант, своя транзакция.
             try:
-                if self._try_send_aha2(tenant, current):
-                    sent += 1
+                with tenant_session(tenant_id) as s:
+                    tenant = s.get(Tenant, tenant_id)
+                    if tenant is None:
+                        continue
+                    did_send = self._try_send_aha2(s, tenant, current)
+                    # Коммитим ВСЕГДА: _try_send_aha2 создаёт sentinel даже когда
+                    # не шлёт (no-diet/no-channel) — sentinel обязан персистить,
+                    # чтобы тенанта не перепроверять каждый тик. (Старый код
+                    # коммитил только if sent>0 — no-diet sentinel терялся, если
+                    # в тике не было ни одной отправки; пер-тенант коммит это чинит.)
+                    s.commit()
+                    if did_send:
+                        sent += 1
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "aha2: failed for tenant=%s, skipping tick",
-                    tenant.id,
+                    "aha2: failed for tenant=%s, skipping tick", tenant_id,
                 )
-                self.session.rollback()
                 continue
         if sent:
-            self.session.commit()
             logger.info("aha2: sent=%d", sent)
         return sent
 
     # ------------------------------------------------------------------
 
-    def _try_send_aha2(self, tenant: Tenant, now: datetime) -> bool:
+    def _try_send_aha2(self, session: Session, tenant: Tenant, now: datetime) -> bool:
         # 1) Идемпотентность — sentinel уже есть?
         sentinel = (
-            self.session.query(FamilyReminder)
+            session.query(FamilyReminder)
             .filter(
                 FamilyReminder.tenant_id == tenant.id,
                 FamilyReminder.source_memo == f"aha2:{tenant.id}",
@@ -141,22 +153,22 @@ class OnboardingAhaWorker:
             return False
 
         # 2) Ищем члена семьи с диетой/аллергией в notes.
-        member = self._find_member_with_diet(tenant.id)
+        member = self._find_member_with_diet(session, tenant.id)
         if member is None:
             # Нет диет — Aha-2 неприменимо. Маркируем sentinel всё
             # равно, чтобы не перепроверять каждый тик.
-            self._create_sentinel(tenant, now, diet_member_name=None)
+            self._create_sentinel(session, tenant, now, diet_member_name=None)
             return False
 
         # 3) Узнаём channels для доставки (10.6 dual-channel routing).
-        user, routings = self._resolve_user_and_routings(tenant)
+        user, routings = self._resolve_user_and_routings(session, tenant)
         if user is None or not routings:
-            self._create_sentinel(tenant, now, diet_member_name=None)
+            self._create_sentinel(session, tenant, now, diet_member_name=None)
             return False
 
-        workspace_id = self._resolve_workspace_id(tenant.id)
+        workspace_id = self._resolve_workspace_id(session, tenant.id)
         if not workspace_id:
-            self._create_sentinel(tenant, now, diet_member_name=None)
+            self._create_sentinel(session, tenant, now, diet_member_name=None)
             return False
 
         # 4) Формируем текст и кнопки.
@@ -170,7 +182,7 @@ class OnboardingAhaWorker:
         # 5) Создаём токены для кнопок.
         from sreda.services.reply_buttons import ReplyButtonService
 
-        pairs = ReplyButtonService(self.session).create_tokens(
+        pairs = ReplyButtonService(session).create_tokens(
             tenant_id=tenant.id,
             user_id=user.id,
             labels=[
@@ -212,15 +224,15 @@ class OnboardingAhaWorker:
                 outbox.user_id = user.id
             if hasattr(OutboxMessage, "is_interactive"):
                 outbox.is_interactive = False
-            self.session.add(outbox)
+            session.add(outbox)
 
         # 7) Sentinel — чтобы второй раз не сработало.
-        self._create_sentinel(tenant, now, diet_member_name=member_name)
-        self.session.flush()
+        self._create_sentinel(session, tenant, now, diet_member_name=member_name)
+        session.flush()
         return True
 
     def _create_sentinel(
-        self, tenant: Tenant, now: datetime, *, diet_member_name: str | None,
+        self, session: Session, tenant: Tenant, now: datetime, *, diet_member_name: str | None,
     ) -> None:
         sentinel = FamilyReminder(
             id=f"rem_{uuid4().hex[:24]}",
@@ -233,14 +245,14 @@ class OnboardingAhaWorker:
             status="fired",
             source_memo=f"aha2:{tenant.id}",
         )
-        self.session.add(sentinel)
-        self.session.flush()
+        session.add(sentinel)
+        session.flush()
 
-    def _find_member_with_diet(self, tenant_id: str) -> FamilyMember | None:
+    def _find_member_with_diet(self, session: Session, tenant_id: str) -> FamilyMember | None:
         # Читаем всех членов семьи (EncryptedString расшифровывается
         # автоматически в `notes` при доступе). Ищем keyword-match.
         members = (
-            self.session.query(FamilyMember)
+            session.query(FamilyMember)
             .filter(FamilyMember.tenant_id == tenant_id)
             .all()
         )
@@ -254,7 +266,7 @@ class OnboardingAhaWorker:
         return None
 
     def _resolve_user_and_routings(
-        self, tenant: Tenant,
+        self, session: Session, tenant: Tenant,
     ):
         """10.6 dual-channel routing: user + list[OutboxRouting].
 
@@ -267,7 +279,7 @@ class OnboardingAhaWorker:
         # Codex R1 MAJOR #2: deliverable MAX = ``max_chat_id IS NOT NULL``
         # (chat_id — recipient в /messages, account_id — bot identity).
         user = (
-            self.session.query(User)
+            session.query(User)
             .filter(
                 User.tenant_id == tenant.id,
                 (
@@ -281,14 +293,14 @@ class OnboardingAhaWorker:
         if user is None:
             return None, []
         routings = resolve_outbox_routings(
-            self.session, tenant=tenant, user=user,
+            session, tenant=tenant, user=user,
             telegram_bot_keys=self._registry,
         )
         return user, routings
 
-    def _resolve_workspace_id(self, tenant_id: str) -> str | None:
+    def _resolve_workspace_id(self, session: Session, tenant_id: str) -> str | None:
         ws = (
-            self.session.query(Workspace)
+            session.query(Workspace)
             .filter(Workspace.tenant_id == tenant_id)
             .order_by(Workspace.id.asc())
             .first()

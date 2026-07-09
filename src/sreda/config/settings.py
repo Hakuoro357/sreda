@@ -461,8 +461,7 @@ class Settings(BaseSettings):
         default=False, validation_alias="SREDA_REACT_OSA_FALLBACK"
     )
     # #192: durable структурный трейс хода ReAct (react_turn_trace). True → пишем трейс (start/pause/
-    # finish) И НЕ пишем временный react_debug_turns (#185, одна система). False (дефолт) → старый
-    # путь #185 (откат). Раскат как #185: проверка → ВКЛ глобально.
+    # finish). (Временный react_debug_turns #185 удалён — #138 Ф3-0.) Раскат: проверка → ВКЛ глобально.
     react_trace_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_TRACE_ENABLED"
     )
@@ -584,21 +583,8 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="SREDA_ADMIN_ALERT_PREVIEW_TENANTS",
     )
-    # vex#170: ВРЕМЕННЫЙ debug-allowlist тенантов, чьи react-ходы (вопрос+ответ бота+инструменты)
-    # сохраняются в react_debug_turns, чтобы видеть всю переписку пока тестируем механизм. Текст
-    # шифруется. Дефолт пуст → НИКОМУ (защита: только явно перечисленные дебаг/тест-тенанты).
-    # Удалить вместе с фичей после теста. НЕ глобальный флаг (privacy defense-in-depth, Codex R1).
-    react_debug_tenants_raw: str | None = Field(
-        default=None,
-        validation_alias="SREDA_REACT_DEBUG_TENANTS",
-    )
-    # #185 (pre-launch QA, ВРЕМЕННО): ГЛОБАЛЬНЫЙ захват переписки. True → _persist_debug_turn пишет
-    # ходы ВСЕХ тенантов (а не только allowlist выше) — производственная отладка/отлов багов перед
-    # запуском, снять после. Текст шифруется (EncryptedString). Оферта/согласие ПД на запуске ДОЛЖНЫ
-    # покрывать захват переписки. Дефолт False (без флага — прежнее поведение, только allowlist).
-    react_debug_all: bool = Field(
-        default=False, validation_alias="SREDA_REACT_DEBUG_ALL"
-    )
+    # vex#170/#185 react_debug_tenants/react_debug_all УДАЛЕНЫ (#138 Ф3-0): QA-захват
+    # react_debug_turns заменён durable-трейсом react_turn_trace (#192), таблица дропнута миграцией.
     # #165 Срез B: тенанты с ОБРЕЗКОЙ набора инструментов (ленивая загрузка семей: ядро +
     # предзагруженные словарём top-2 + добор need_family/guard). Дефолт пуст → НИКОМУ: все
     # на full-bind (весь набор привязан, как до #165 — ноль изменений). Канарейка/kill-switch:
@@ -1171,15 +1157,6 @@ class Settings(BaseSettings):
         """#184: тенанты, чей ReAct идёт на «Осе» (gpt-oss-120b @ Groq) вместо planner_provider.
         Пусто (дефолт) → никому → все на planner_provider (Mercury)."""
         raw = self.react_osa_tenants_raw
-        if not raw:
-            return frozenset()
-        return frozenset(item.strip() for item in raw.split(",") if item.strip())
-
-    @property
-    def react_debug_tenants(self) -> frozenset[str]:
-        """vex#170 (ВРЕМЕННОЕ): тенанты, чьи react-ходы сохраняются в react_debug_turns для
-        дебага. Пусто (дефолт) → НИКОМУ (не глобально — privacy allowlist)."""
-        raw = self.react_debug_tenants_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())

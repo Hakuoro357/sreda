@@ -38,6 +38,11 @@ class ReactCheckpoint(Base):
     metadata_type: Mapped[str] = mapped_column(String(255), nullable=False)
     # "metadata" — зарезервированное имя атрибута в declarative → атрибут checkpoint_metadata, колонка metadata
     checkpoint_metadata: Mapped[bytes] = mapped_column("metadata", LargeBinary, nullable=False)
+    # #138 Ф3-b: денормализованный тенант (thread_id = hmac — тенант из ключа не восстановим).
+    # NULLABLE: легаси-строки до бэкфилла 0081 / orphan'ы; под RLS Ф3-c NULL видит только
+    # maintenance (fail-closed видимость). Плоский String БЕЗ FK — hmac-таблицы вне FK-графа
+    # (как react_turn_trace).
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
     )
@@ -45,6 +50,7 @@ class ReactCheckpoint(Base):
     __table_args__ = (
         # последний checkpoint треда + GC по last-activity
         Index("ix_react_checkpoint_thread_created", "thread_id", "checkpoint_ns", "created_at"),
+        Index("ix_react_checkpoint_tenant", "tenant_id"),
     )
 
 
@@ -60,10 +66,13 @@ class ReactCheckpointWrite(Base):
     write_type: Mapped[str] = mapped_column(String(255), nullable=False)
     blob: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     task_path: Mapped[str] = mapped_column(String(256), default="")
+    # #138 Ф3-b: см. ReactCheckpoint.tenant_id (та же семантика: NULLABLE, без FK).
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
     )
 
     __table_args__ = (
         Index("ix_react_cp_write_lookup", "thread_id", "checkpoint_ns", "checkpoint_id"),
+        Index("ix_react_checkpoint_write_tenant", "tenant_id"),
     )

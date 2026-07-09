@@ -6,10 +6,12 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     event,
     text as sql_text,
 )
@@ -133,6 +135,11 @@ class TenantSubscription(Base):
 
 class PaymentOrder(Base):
     __tablename__ = "payment_orders"
+    __table_args__ = (
+        # #138 Ф3-a: нужен composite-FK детей (id, tenant_id) — id и так PK,
+        # constraint формальный.
+        UniqueConstraint("id", "tenant_id", name="uq_payment_orders_id_tenant"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
@@ -163,9 +170,22 @@ class PaymentOrder(Base):
 
 class PaymentOrderItem(Base):
     __tablename__ = "payment_order_items"
+    __table_args__ = (
+        # #138 Ф3-a: composite-FK гарантирует совпадение tenant_id с родителем
+        # (без ondelete — как у существующей одноколоночной FK).
+        ForeignKeyConstraint(
+            ["payment_order_id", "tenant_id"],
+            ["payment_orders.id", "payment_orders.tenant_id"],
+            name="fk_payment_order_items_parent_tenant",
+        ),
+        Index("ix_payment_order_items_tenant", "tenant_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     payment_order_id: Mapped[str] = mapped_column(ForeignKey("payment_orders.id"), index=True)
+    # #138 Ф3-a: денорм из родителя — RLS-скоуп; composite-FK гарантирует
+    # совпадение с родителем.
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     plan_id: Mapped[str] = mapped_column(ForeignKey("subscription_plans.id"), index=True)
     amount_rub: Mapped[int] = mapped_column(Integer)
     quantity: Mapped[int] = mapped_column(Integer, default=1)

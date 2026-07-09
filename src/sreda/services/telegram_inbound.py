@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session
 from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import get_settings
 from sreda.db.models.core import InboundMessage, Tenant
-from sreda.db.session import get_session_factory
+from sreda.db.session import get_session_factory, tenant_ctx
 from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryError
 from sreda.services import trace
 from sreda.services.ack_messages import pick_ack
@@ -263,6 +263,10 @@ async def _process_approved_turn_locked(
     """
     SessionLocal = get_session_factory()
     bg_session: Session = SessionLocal()
+    # #138 Ф2: весь одобренный ход (это post-resolution путь → onboarding.tenant_id валиден)
+    # идёт под tenant-контекстом → engine begin-событие ставит sreda.tenant_id на каждой txn
+    # bg_session (RLS-скоуп; до Ф3 без политик — no-op-эффект). Reset в outer-finally (:725).
+    _tenant_tok = tenant_ctx.set(onboarding.tenant_id)
     # #187 Phase 2b БАРЬЕР: держим session-scoped advisory-lock на тенанта весь
     # ход (взять первым делом, отпустить в finally). soft_delete_tenant берёт ТОТ
     # ЖЕ лок ДО флага+drain → ждёт этот in-flight ход и дренит после. На SQLite
@@ -723,6 +727,7 @@ async def _process_approved_turn_locked(
         # симметрию с soft_delete_tenant и не зависит от порядка GC.
         _barrier.close()
         bg_session.close()
+        tenant_ctx.reset(_tenant_tok)  # #138 Ф2: снять tenant-контекст хода
 
 
 async def _handle_pending_tenant(

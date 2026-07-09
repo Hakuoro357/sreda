@@ -311,6 +311,7 @@ class HousewifeRecipeService:
                     RecipeIngredient(
                         id=f"ring_{uuid4().hex[:20]}",
                         recipe_id=recipe.id,
+                        tenant_id=recipe.tenant_id,  # #138 Ф3-a: денорм из родителя
                         title=ing.title,
                         quantity_text=ing.quantity_text,
                         is_optional=ing.is_optional,
@@ -503,6 +504,7 @@ class HousewifeRecipeService:
                     RecipeIngredient(
                         id=f"ring_{uuid4().hex[:20]}",
                         recipe_id=recipe.id,
+                        tenant_id=recipe.tenant_id,  # #138 Ф3-a: денорм из родителя
                         title=ing.title,
                         quantity_text=ing.quantity_text,
                         is_optional=ing.is_optional,
@@ -682,6 +684,9 @@ class HousewifeRecipeService:
             new_ingredient_rows = [
                 RecipeIngredient(
                     id=f"ring_{uuid4().hex[:20]}",
+                    # #138 Ф3-a: денорм из родителя; relationship проставляет
+                    # только recipe_id (foreign_keys) — tenant_id вручную.
+                    tenant_id=row.tenant_id,
                     title=ing.title,
                     quantity_text=ing.quantity_text,
                     is_optional=ing.is_optional,

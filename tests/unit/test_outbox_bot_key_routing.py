@@ -131,8 +131,8 @@ async def test_sreda_home_row_delivered_via_sreda_home_client(session, registry,
     )
 
     row = _make_row(session, bot_key="sreda_home")
-    worker = OutboxDeliveryWorker(session, registry=registry)
-    await worker._send_now(row)
+    worker = OutboxDeliveryWorker(registry=registry)
+    await worker._send_now(session, row)
 
     assert row.status == "sent"
     home_client = factory.client_for("sreda_home")
@@ -161,8 +161,8 @@ async def test_null_bot_key_falls_back_to_legacy(session, registry, monkeypatch)
     )
 
     row = _make_row(session, bot_key=LEGACY_NULL_BOT_KEY)
-    worker = OutboxDeliveryWorker(session, registry=registry)
-    await worker._send_now(row)
+    worker = OutboxDeliveryWorker(registry=registry)
+    await worker._send_now(session, row)
 
     assert row.status == "sent"
     sreda_client = factory.client_for(LEGACY_NULL_BOT_KEY)
@@ -183,8 +183,8 @@ async def test_sreda_row_delivered_via_sreda_client(session, registry, monkeypat
     )
 
     row = _make_row(session, bot_key="sreda")
-    worker = OutboxDeliveryWorker(session, registry=registry)
-    await worker._send_now(row)
+    worker = OutboxDeliveryWorker(registry=registry)
+    await worker._send_now(session, row)
 
     assert row.status == "sent"
     sreda_client = factory.client_for("sreda")
@@ -201,8 +201,8 @@ async def test_no_registry_falls_back_to_injected_client(session):
     legacy = FakeTelegramClient(token="legacy-token")
 
     row = _make_row(session, bot_key="sreda_home")  # even with a bot_key set
-    worker = OutboxDeliveryWorker(session, telegram_client=legacy, registry=None)
-    await worker._send_now(row)
+    worker = OutboxDeliveryWorker(telegram_client=legacy, registry=None)
+    await worker._send_now(session, row)
 
     assert row.status == "sent"
     assert len(legacy.sent) == 1
@@ -221,8 +221,8 @@ async def test_unknown_non_null_bot_key_fails_closed(session, registry, monkeypa
     )
 
     row = _make_row(session, bot_key="ghost_bot")
-    worker = OutboxDeliveryWorker(session, registry=registry)
-    await worker._send_now(row)
+    worker = OutboxDeliveryWorker(registry=registry)
+    await worker._send_now(session, row)
 
     # Row must be marked failed, not sent.
     assert row.status == "failed", f"Expected 'failed', got {row.status!r}"
