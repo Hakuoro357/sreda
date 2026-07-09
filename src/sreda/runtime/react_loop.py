@@ -759,6 +759,12 @@ class ReactState(MessagesState):
     # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
     # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
     unified_execute: bool
+    # #319 sticky-by-use («дверь открыта, пока ею пользуются»): ЭТОТ ход реально записал в память →
+    # следующий ход получает memory в ярусе (а) без confirm (серия «крылья 615 → бёдра 865» без
+    # переспросов). Renewal-by-use: run_tools ставит True при успешной memory-записи (unified);
+    # _init свежего хода сбрасывает False (consume-then-reset — потребление из _pre_vals ДО сброса).
+    # Граница по СМЫСЛУ (факт записи), не по времени — Борис 2026-07-09. Last-value.
+    sticky_memory_write: bool
     # #stale (канарейка, реальный баг): протухшая пауза + НОВОЕ сообщение → директива грациозного возврата
     # (ответь на новое + мягко уточни актуальность незакрытого вопроса, НЕ повторяй в лоб). Транзиентная,
     # как guard_nudge: ставится на свежем ходу при протухании паузы (unified), "" иначе. Last-value.
@@ -1898,6 +1904,12 @@ def _declined_reply(question: str) -> str:
     return f"Отменила, не трогаю «{m.group(1)}»." if m else "Отменила, ничего не делаю."
 
 
+# #319 R2: успех-префиксы memory-write инструментов (tools.py: save_core_fact→`saved_core:`,
+# save_episode→`saved_episode:`, create_memory_category→`created:`). Продление двери серии — ТОЛЬКО по
+# ним: отказ candidate («Хорошо, не делаю.») и `error:*` НЕ продлевают. Дрейф формата ловят red-тесты.
+_MEMORY_WRITE_OK_PREFIXES = ("saved_core:", "saved_episode:", "created:")
+
+
 def _confirm_declined(is_confirm_pause: bool, resume_val: str, tenant_id: str) -> bool:
     """#321: ОТКАЗ на confirm-паузе на ЕДИНОМ (канареечном) пути? = confirm-пауза И resume НЕ «да» И
     `_unified_execute_for`. True → финальный ответ берём ДЕТЕРМИНИРОВАННО («Отменила, ничего не делаю.»),
@@ -2836,13 +2848,14 @@ def _build_graph(llm: Any, all_tools: list, *,
         }
 
     def run_tools(state: ReactState):
-        from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+        from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, TOOL_OP_CLASS
         turn_key = state.get("turn_key") or ""
         exec_id = (hashlib.sha1(turn_key.encode("utf-8")).hexdigest()
                    if turn_key else "")
         active = list(state.get("active_families") or [])
         eff = _effective_intent(state, preflight_enabled)  # #197 + #285 B4: unified → "task" (см. chat)
         wrote_unkeyed = False  # отработал ли инструмент unkeyed-write семьи (→ выключит guard)
+        sticky_mem = False  # #319 renewal-by-use: успешная memory-запись → дверь серии открыта на след. ход
         # dispatch — из ТЕКУЩЕГО привязанного набора (как видел chat): вызов инструмента из НЕ
         # загруженной семьи → детерминированная ToolMessage-ошибка, НЕ KeyError/краш. #197: тот же
         # `_bind_for(eff)`, что в chat-узле (chat/fact → web-only; иначе галлюцинация need_family
@@ -3132,11 +3145,24 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # детект «реально записал» пожертвовал бы drift-safety вывода _CORE_MUTATING. Если
                 # shadow-логи покажут частое переподавление → уточнить тогда (follow-up #165).
                 wrote_unkeyed = True
+            # #319 renewal-by-use: УСПЕШНО исполненная memory-ЗАПИСЬ → дверь серии открыта на след. ход.
+            # R2 (Codex high+medium R1 MAJOR): «успех» = ПО РЕЗУЛЬТАТУ, не по факту вызова — иначе дверь
+            # открывали бы (а) отклонённый candidate («Хорошо, не делаю.» — inner не вызван) и (б) error:*
+            # без исключения (пустой факт). Продление ТОЛЬКО по успех-префиксу реального write-инструмента
+            # (`saved_core:`/`saved_episode:`/`created:` — tools.py, контракт залочен red-тестами).
+            # recall_memory — read_pure, не продлевает. Только unified (легаси ПОВЕДЕНИЕ идентично; сам
+            # канал сбрасывается в _init у всех — как unified_execute, R1 субагент MINOR-комментарий).
+            if (state.get("unified_execute") and TOOL_FAMILY_MANIFEST.get(name) == "memory"
+                    and TOOL_OP_CLASS.get(name) == "write"
+                    and str(res).startswith(_MEMORY_WRITE_OK_PREFIXES)):
+                sticky_mem = True
         update: dict = {"messages": out}
         if added:  # семья добрана → обновляем state (last-value канал)
             update["active_families"] = active
         if wrote_unkeyed:  # фиксируем флаг (last-value: остаётся True до конца хода)
             update["wrote_unkeyed"] = True
+        if sticky_mem:  # #319: продление серии (last-value; _init свежего хода сбрасывает)
+            update["sticky_memory_write"] = True
         return update
 
     def route(state: ReactState):
@@ -4048,6 +4074,9 @@ async def handle_turn(
                            "turn_policy_json": None,
                            # #285 B2b: сброс флага единого пути (override ниже ставит True для канарейки).
                            "unified_execute": False,
+                           # #319: consume-then-reset — прошлое значение УЖЕ прочитано в _pre_vals
+                           # (потребление в override ниже); ход докажет запись заново (renewal-by-use).
+                           "sticky_memory_write": False,
                            # #stale: директива грациозного возврата (непусто ТОЛЬКО при протухшей паузе на
                            # едином пути); "" на обычном свежем ходе → сброс last-value (как guard_nudge).
                            "stale_pause_note": _stale_note}
@@ -4149,7 +4178,12 @@ async def handle_turn(
                 try:
                     from sreda.runtime.react_policy import compute_unified_policy
                     from sreda.runtime.react_preflight import route_domains as _rd285
-                    _upol = compute_unified_policy(user_text, _rd285(user_text))
+                    # #319 sticky-by-use: ПРОШЛЫЙ ход записал в память (renewal в run_tools) → серия
+                    # продолжается без confirm. Consume из _pre_vals (снап ДО хода); _init выше сбросил
+                    # канал — ход докажет запись заново. Граница по смыслу (факт записи), не по времени.
+                    _upol = compute_unified_policy(
+                        user_text, _rd285(user_text),
+                        sticky_memory_write=bool(_pre_vals.get("sticky_memory_write")))
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}

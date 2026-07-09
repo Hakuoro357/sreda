@@ -77,6 +77,19 @@ def test_new_read_request_signal_false_without_domain():
         assert not new_read_request_signal(t), t
 
 
+# ─────────── #319: «записи» → memory (recall по теме показывает, не спрашивает «где сохраняешь») ───────────
+def test_zapisi_recall_cues_open_memory():
+    for t in ("покажи записи про курицу", "мои записи", "покажи мои записи", "какие у меня записи",
+              "что я записывал", "что я записал про курицу", "записи про вес"):
+        assert "memory" in read_cue_domains(t), t
+
+
+def test_zapis_singular_not_memory():
+    # «запись к врачу» (ед.ч.) — это appointment, НЕ recall памяти; «записаться» — тоже нет
+    for t in ("запись к врачу", "запиши меня к врачу", "хочу записаться на стрижку"):
+        assert "memory" not in read_cue_domains(t), (t, read_cue_domains(t))
+
+
 def test_new_read_request_signal_false_on_naming_slot_answers():
     # R2 (Codex high MAJOR): ответы-ИМЕНА на «как назвать задачу/список?» несут домен, но «назови/дай/
     # скажи» больше НЕ маркеры → False (иначе тот же класс ложняка, что чинил R1). Домен ЕСТЬ (sanity).

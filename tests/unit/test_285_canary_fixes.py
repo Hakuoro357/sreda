@@ -402,6 +402,49 @@ def test_abandoned_skipped_on_turn_key_collision_320(install, monkeypatch, tmp_p
     assert rec.abandoned == [], "коллизия ключей (old==new) → терминализация ПРОПУЩЕНА (guard)"
 
 
+def test_e2e_sticky_series_319(install, monkeypatch):
+    """#319 sticky-by-use, смысловой цикл через handle_turn: (1) memory-запись исполнилась → дверь
+    открыта; (2) голые данные серии («бёдра 865») пишутся СРАЗУ, без паузы; (3) смолток без записи →
+    дверь закрылась; (4) голые данные → запись БОЛЬШЕ НЕ исполняется напрямую (memory не бинден —
+    ленивая семья закрыта; в проде модель идёт need_family → кандидат-confirm). Граница по СМЫСЛУ
+    (факт записи), не по времени — owner-decision Бориса 2026-07-09."""
+    freddie = _Chat("freddie", responses=[
+        _ai_call("save_episode", "c1", text="вес курицы: крылья 615"),  # ход1 → ПРЯМОЙ write (декларатив)
+        AIMessage(content="Записала: крылья 615."),                      # ход1 финал
+        _ai_call("save_episode", "c2", text="бёдра 865"),                # ход2 (sticky) → ПРЯМОЙ write
+        AIMessage(content="Записала: бёдра 865."),                       # ход2 финал
+        AIMessage(content="Пожалуйста!"),                                # ход3 смолток — БЕЗ записи
+        _ai_call("save_episode", "c3", text="голень 770"),               # ход4 → дверь закрыта
+        AIMessage(content="Куда сохранить?"),                            # ход4 финал (после блока)
+    ])
+    inv = install(deepseek=_Chat("ds"))
+
+    def _save_ok(name):  # R2: продление — по УСПЕХ-ПРЕФИКСУ реального инструмента (tools.py контракт)
+        def _f(q: str = "", **kw):
+            inv[name] = inv.get(name, 0) + 1
+            return "saved_episode:1"
+        return StructuredTool.from_function(func=_f, name=name, description=name)
+
+    monkeypatch.setattr(react_loop, "build_slice_tools", lambda *a, **k: [
+        _mk_tool(n, inv) for n in (_TASK_TOOLS + _WEB_TOOLS)] + [_save_ok("save_episode")])
+    # ход1: декларатив («меня зовут…» — memory ярус (а) без confirm) → запись исполнена → дверь открыта
+    r1 = _turn(freddie, thread="stk", text="меня зовут Борис, веду записи веса")
+    assert getattr(r1, "awaiting_confirm", False) is False, r1
+    assert inv.get("save_episode", 0) == 1, "декларатив → прямая memory-запись → дверь открыта"
+    # ход2: голые данные при открытой двери → ПРЯМАЯ запись, БЕЗ паузы и переспроса
+    r2 = _turn(freddie, thread="stk", text="бёдра 865")
+    assert getattr(r2, "awaiting_confirm", False) is False, "sticky: серия без переспроса"
+    assert inv.get("save_episode", 0) == 2, "бёдра записаны сразу (ярус а по sticky)"
+    # ход3: смолток без записи → дверь закрывается (renewal-by-use)
+    r3 = _turn(freddie, thread="stk", text="спасибо")
+    assert getattr(r3, "awaiting_confirm", False) is False
+    assert inv.get("save_episode", 0) == 2
+    # ход4: дверь закрыта → прямой записи НЕТ (semья не биндится; модель получает отказ и уточняет)
+    r4 = _turn(freddie, thread="stk", text="голень 770")
+    assert inv.get("save_episode", 0) == 2, "дверь закрыта → запись не исполняется без подтверждения"
+    assert getattr(r4, "awaiting_confirm", False) is False
+
+
 def test_domain_blocked_count_basic():
     assert react_loop._domain_blocked_count([]) == 0
     assert react_loop._domain_blocked_count(None) == 0
@@ -458,3 +501,49 @@ def test_loop_guard_stops_early_on_blocked(install):
     assert 0 < len(msgs) <= 4, f"петля должна оборваться рано (≤4), а не 8; проходов={len(msgs)}"
     # #3b: жёсткое сообщение блокировки дошло до модели (во входе следующего прохода)
     assert "НЕ зови" in _flat(msgs[-1]), "domain_blocked-сообщение должно быть жёстким на unified"
+
+
+def test_sticky_not_opened_by_declined_candidate(install, monkeypatch):
+    """#319 R2 (оба Codex MAJOR): ОТКАЗ на candidate («нет» → «Хорошо, не делаю.», inner не вызван)
+    НЕ открывает дверь серии — продление только по успех-префиксу реальной записи."""
+    freddie = _Chat("freddie", responses=[
+        _ai_call("need_family", "n1", family="memory"),     # ход1 pass1: добор семьи (unified грузит любую)
+        _ai_call("save_episode", "c1", text="крылья 615"),  # ход1 pass2: кандидат → пауза
+        AIMessage(content="Хорошо."),                        # ход1 resume «нет» → финал (заменён #321-текстом)
+        _ai_call("save_episode", "c2", text="бёдра 865"),    # ход2: дверь ЗАКРЫТА → семья не бинжена
+        AIMessage(content="Куда сохранить?"),                # ход2 финал
+    ])
+    inv = install(deepseek=_Chat("ds"))
+    monkeypatch.setattr(react_loop, "build_slice_tools", lambda *a, **k: [
+        _mk_tool(n, inv) for n in (_TASK_TOOLS + _WEB_TOOLS + ["save_episode"])])
+    r1 = _turn(freddie, thread="stk-d", text="запиши крылья 615")
+    assert getattr(r1, "awaiting_confirm", False) is True, r1  # кандидат-пауза
+    _turn(freddie, thread="stk-d", text="нет")                 # отказ — записи НЕ было
+    assert inv.get("save_episode", 0) == 0
+    _turn(freddie, thread="stk-d", text="бёдра 865")
+    assert inv.get("save_episode", 0) == 0, "отказ НЕ открывает дверь (R2: успех-префикс)"
+
+
+def test_sticky_not_opened_by_error_result(install, monkeypatch):
+    """#319 R2 (Codex high MAJOR): error:* без исключения (пустой факт) НЕ открывает дверь серии."""
+    inv_err = {}
+
+    def _err_tool(name):
+        def _f(q: str = "", **kw):
+            inv_err[name] = inv_err.get(name, 0) + 1
+            return "error: empty content"
+        return StructuredTool.from_function(func=_f, name=name, description=name)
+
+    freddie = _Chat("freddie", responses=[
+        _ai_call("save_episode", "c1", text=""),        # ход1: декларатив → прямой вызов, вернул error
+        AIMessage(content="Не получилось записать."),
+        _ai_call("save_episode", "c2", text="бёдра"),   # ход2: дверь НЕ открыта error-ом
+        AIMessage(content="Куда сохранить?"),
+    ])
+    inv = install(deepseek=_Chat("ds"))
+    monkeypatch.setattr(react_loop, "build_slice_tools", lambda *a, **k: [
+        _mk_tool(n, inv) for n in (_TASK_TOOLS + _WEB_TOOLS)] + [_err_tool("save_episode")])
+    _turn(freddie, thread="stk-e", text="меня зовут Борис, веду записи")
+    assert inv_err.get("save_episode", 0) == 1          # вызван (ярус а по декларативу), вернул error
+    _turn(freddie, thread="stk-e", text="бёдра 865")
+    assert inv_err.get("save_episode", 0) == 1, "error:* НЕ открывает дверь (R2: успех-префикс)"
