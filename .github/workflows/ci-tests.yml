@@ -1,0 +1,71 @@
+name: ci-tests
+
+# Мера A пост-мортема vex-assistant#331: тест-свит в CI (не прод-скрипты).
+# Job unit — весь свит на SQLite на каждый PR (ловит большинство регрессий ДО мержа).
+# Job pg-integration — реальный Postgres + begin-событие #138: ловит транзакционный класс #331
+# (unit-свит на SQLite его не видел: `SET TRANSACTION` там не падает).
+# Деплой остаётся РУЧНЫМ (ПРАВИЛО #3) — CI только проверяет, не катит.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/ci-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/ci-tests.yml'
+
+# Экономим минуты: новый пуш в ту же ветку отменяет прошлый прогон.
+concurrency:
+  group: ci-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (SQLite, без pg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Прогон unit-свита
+        # test_doc_on_disk_is_fresh читает ГЛОБАЛЬНЫЙ реестр инструментов и чувствителен к порядку
+        # (пре-существующее тест-загрязнение, отдельный follow-up) → гоним его ОТДЕЛЬНО (изолированно),
+        # из основного прогона исключаем. Это корректно для теста глобального артефакта, не заглушка.
+        run: >-
+          uv run --all-extras python -m pytest tests/unit -m "not pg"
+          --deselect tests/unit/test_capabilities_map.py::test_doc_on_disk_is_fresh -q
+      - name: Свежесть капабилити-дока (изолированно)
+        run: uv run --all-extras python -m pytest tests/unit/test_capabilities_map.py -q
+
+  pg-integration:
+    name: pg-integration (реальный Postgres, класс #331)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sreda
+          POSTGRES_PASSWORD: sreda
+          POSTGRES_DB: sreda
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sreda"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      SREDA_PG_TEST_DSN: postgresql+psycopg://sreda:sreda@localhost:5432/sreda
+      # dummy AES-256 ключ (как conftest _DEFAULT_TEST_KEY) — интеграционный тест вне unit-conftest
+      SREDA_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Класс #331 на реальном PG (begin-хук #138 × изоляция quota)
+        run: uv run --all-extras python -m pytest tests/integration/test_331_tx_isolation_pg.py -m pg -q
