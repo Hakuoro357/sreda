@@ -394,3 +394,19 @@ def test_r2_until_recurrence_live_voice_works_338():
     text = (f"Ставлю напоминание «пить воду» завтра в 15:00, "
             f"повтор {f.recurrence_human}. Подтверждаешь?")
     assert verify_confirm_text(text, f, now=_NOW)
+
+
+def test_r3_weekday_any_case_form_rejected_338():
+    """R3 medium: день недели в ЛЮБОЙ падежной форме («завтра - среда»,
+    «по средам») сверяется со днём факта (вторник)."""
+    for phrase in ("Ставлю напоминание «выписка лекарств» завтра, среда, в 15:00. Подтверждаешь?",
+                   "Ставлю напоминание «выписка лекарств» завтра по средам в 15:00. Подтверждаешь?"):
+        assert not verify_confirm_text(phrase, _f(), now=_NOW), phrase
+
+
+def test_r3_weekday_correct_form_still_accepted_338():
+    """Правильный день (вторник) в разных формах - проходит."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание «выписка лекарств» завтра, во вторник, в 15:00. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert ok
