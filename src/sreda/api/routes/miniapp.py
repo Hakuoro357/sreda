@@ -2213,8 +2213,13 @@ async def channel_link_start(
         target_channel = "telegram"
 
     from sreda.services.channel_linking import is_account_already_linked
+    # #341 (Codex R-codex R2 MAJOR D-follow-up): исключаем самого инициатора —
+    # он вправе пере-инициировать линк, чтобы ОБНОВИТЬ свой chat_id (смена
+    # MAX-чата). Коллизии с другими юзерами тенанта блокируются (409); все
+    # cross-account/cross-tenant коллизии добивает consume_link.
     if is_account_already_linked(session, tenant_id=tenant_id,
-                                 target_channel=target_channel):
+                                 target_channel=target_channel,
+                                 exclude_user_id=source_user_id):
         raise HTTPException(409, "already_linked")
 
     # Resolve per-bot username/shortname for the deep-link.
