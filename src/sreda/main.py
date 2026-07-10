@@ -37,6 +37,14 @@ async def _lifespan(app: FastAPI):
     """
     settings = get_settings()
 
+    # #341 (F1, CRITICAL security): fail-closed startup gate. Если любой канал
+    # развёрнут в webhook-режиме (token+url заданы), но webhook-secret пуст —
+    # роняем старт ДО регистрации webhook. Иначе роут принимал бы поддельный
+    # неаутентифицированный inbound (перехват max_chat_id жертвы). Дискриминатор
+    # = связка token+url (та же, что гейтит MAX-регистрацию ниже), НЕ «prod».
+    from sreda.services.webhook_security import assert_webhook_secrets_configured
+    assert_webhook_secrets_configured(settings)
+
     # Issue #68: llm-trace writer task lifecycle. Startup eagerly creates
     # queue + writer + GC tasks так что persist_request_envelope не получит
     # cold-start latency на первом turn'е. Shutdown drains queue с 10s

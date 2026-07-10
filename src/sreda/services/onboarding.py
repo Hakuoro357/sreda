@@ -583,8 +583,14 @@ def ensure_max_user_bundle(
     # к существующему tenant'у, не создаём дубль.
     existing_user = find_user_by_max_account_id(session, aid)
     if existing_user is not None:
-        # Update chat_id if newly known
-        if chat_id_str and existing_user.max_chat_id != chat_id_str:
+        # #341 (F1, CRITICAL): разрешаем ТОЛЬКО первичную установку
+        # (NULL/пусто → value). НЕ перезаписываем УЖЕ заданный max_chat_id из
+        # inbound: поддельный payload с чужим chat_id иначе уводил бы все
+        # уведомления/ответы жертвы в чат атакующего. Легитимная смена привязки
+        # идёт ТОЛЬКО через аутентифицированный channel-link flow
+        # (services.channel_linking.consume_link → User.max_chat_id), который
+        # этот guard не затрагивает.
+        if chat_id_str and not existing_user.max_chat_id:
             existing_user.max_chat_id = chat_id_str
             session.commit()
 
@@ -610,7 +616,11 @@ def ensure_max_user_bundle(
         return MaxOnboardingResult(
             False,
             aid,
-            chat_id_str or existing_user.max_chat_id,
+            # #341: возвращаем ПЕРСИСТ-значение (safe), не payload chat_id —
+            # иначе немедленный welcome ушёл бы в чат из поддельного payload.
+            # existing_user.max_chat_id уже актуализирован guard'ом выше
+            # (NULL→value применён; non-NULL сохранён).
+            existing_user.max_chat_id or chat_id_str,
             existing_user.tenant_id,
             workspace_id,
             existing_user.id,
