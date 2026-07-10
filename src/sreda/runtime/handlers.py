@@ -508,14 +508,14 @@ def execute_skill_show(
     if not feature_key:
         raise ActionRuntimeError(
             "skill_key_missing",
-            "Используй: /skill <key> или /skill <key> priority <urgent|normal|low|mute>",
+            "Используй: /skill <название> или /skill <название> priority <срочно: urgent, обычно: normal, тихо: low, без уведомлений: mute>",
         )
     registry = get_feature_registry()
     manifest = registry.get_manifest(feature_key)
     if manifest is None:
         raise ActionRuntimeError(
             "skill_unknown",
-            f"Скил {feature_key!r} не найден. /skills — список доступных.",
+            f"Такого умения не нашла. /skills покажет список доступных.",
         )
     repo = UserProfileRepository(session)
     config = repo.get_skill_config(action.tenant_id, user_id, feature_key)
@@ -534,6 +534,24 @@ def execute_skill_show(
     ]
     return [RuntimeReply(text="\n".join(lines), reply_markup=None)]
 
+
+
+# #338 ч.3 (БИБЛИЯ g-075): прямые тексты юзеру - без англ. имён полей/статусов/ключей.
+_FIELD_RU_338 = {"timezone": "часовой пояс", "communication_style": "стиль общения",
+                 "display_name": "имя"}
+_STATUS_RU_338 = {"confirmed": "уже подтверждено", "rejected": "уже отклонено",
+                  "expired": "уже истекло", "pending": "ещё ждёт решения"}
+_STYLE_RU_338 = {"terse": "кратко", "casual": "по-простому", "formal": "официально"}
+
+
+def _field_ru_338(name: str) -> str:
+    return _FIELD_RU_338.get(str(name), "эта настройка")
+
+
+def _value_ru_338(field_name: str, value) -> str:
+    if str(field_name) == "communication_style":
+        return _STYLE_RU_338.get(str(value), str(value))
+    return str(value)
 
 def _validate_proposed_field(field_name: str, proposed_value: Any) -> tuple[str, Any] | None:
     """Validate an agent-proposed profile field update.
@@ -655,7 +673,7 @@ def execute_profile_confirm_update(
     if proposal.status != "pending":
         raise ActionRuntimeError(
             "proposal_already_resolved",
-            f"Это предложение уже обработано ({proposal.status}).",
+            f"Это предложение {_STATUS_RU_338.get(str(proposal.status), 'уже обработано')}.",
         )
     if UserProfileRepository.is_proposal_expired(proposal, datetime.now(timezone.utc)):
         repo.mark_proposal_status(proposal.id, status="expired")
@@ -681,7 +699,7 @@ def execute_profile_confirm_update(
     else:
         raise ActionRuntimeError(
             "proposal_field_unsupported",
-            f"Поле {field_name!r} больше не поддерживается.",
+            f"Настройка «{_field_ru_338(field_name)}» больше не поддерживается.",
         )
 
     repo.update_profile(action.tenant_id, user_id, **update_kwargs)
@@ -689,7 +707,7 @@ def execute_profile_confirm_update(
     session.commit()
     return [
         RuntimeReply(
-            text=f"✅ Профиль обновлён: {field_name} = {value}",
+            text=f"✅ Готово: {_field_ru_338(field_name)} теперь «{_value_ru_338(field_name, value)}».",
             reply_markup=None,
         )
     ]
@@ -720,7 +738,7 @@ def execute_profile_reject_update(
     if proposal.status != "pending":
         return [
             RuntimeReply(
-                text=f"Это предложение уже обработано ({proposal.status}).",
+                text=f"Это предложение {_STATUS_RU_338.get(str(proposal.status), 'уже обработано')}.",
                 reply_markup=None,
             )
         ]
@@ -925,13 +943,13 @@ def execute_skill_set_priority(
     if priority not in NOTIFICATION_PRIORITIES:
         raise ActionRuntimeError(
             "skill_priority_invalid",
-            "Приоритет должен быть одним из: urgent, normal, low, mute.",
+            "Приоритет пиши одним словом: urgent (срочно), normal (обычно), low (тихо) или mute (без уведомлений).",
         )
     registry = get_feature_registry()
     if registry.get_manifest(feature_key) is None:
         raise ActionRuntimeError(
             "skill_unknown",
-            f"Скил {feature_key!r} не найден. /skills — список доступных.",
+            f"Такого умения не нашла. /skills покажет список доступных.",
         )
     repo = UserProfileRepository(session)
     repo.upsert_skill_config(

@@ -186,7 +186,8 @@ def test_confirm_applies_change_with_audit_source(monkeypatch, tmp_path: Path):
 
     # Two messages: proposal + confirmation reply
     assert len(telegram.sent) == 2
-    assert "обновлён" in telegram.sent[1]["text"]
+    assert "Готово" in telegram.sent[1]["text"]  # #338 ч.3 (g-075): русское имя настройки, не field_name = value
+    assert "стиль общения" in telegram.sent[1]["text"]
 
 
 def test_reject_does_not_change_profile(monkeypatch, tmp_path: Path):
