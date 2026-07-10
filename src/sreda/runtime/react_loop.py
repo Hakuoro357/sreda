@@ -1436,10 +1436,18 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 
     def _wrapped(**kwargs: Any) -> str:
         _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
-        _args = ", ".join(f"{k}={kwargs[k]}" for k in sorted(kwargs)) if kwargs else "без параметров"
-        decision = interrupt({
-            "confirm": f"Я поняла как «{inner.name}» ({_args}). Подтверди, и я сделаю.",
-            "key": _key})
+        # #338 ч.2 (БИБЛИЯ g-075): юзеру - ТОЛЬКО человеческий текст. Сырой
+        # «Я поняла как «schedule_reminder» (title=…, trigger_iso=…)» уволен
+        # (прод-инцидент 755682022). Известный инструмент → факты + человеческий
+        # шаблон (даты по-русски); иначе → русское действие из реестра; совсем
+        # неизвестный → нейтральный вопрос. key НЕ меняется (контракт пауз #166B).
+        from sreda.runtime.confirm_preview import confirm_facts, fallback_template, generic_action_question
+        _facts = confirm_facts(inner.name, kwargs)
+        if _facts is not None:
+            _q = fallback_template(_facts, now=datetime.now(_MSK))
+        else:
+            _q = generic_action_question(inner.name, kwargs)
+        decision = interrupt({"confirm": _q, "key": _key})
         if not _is_yes(str(decision)):
             return "Хорошо, не делаю."
         return str(inner.invoke(kwargs))
