@@ -2761,8 +2761,22 @@ def _build_graph(llm: Any, all_tools: list, *,
             # детерм. домена → classify_domains дал скоуп) directive=None by design (строго безопаснее: не
             # подмешиваем подсказку мимо LLM-выбранного скоупа). Потенц. follow-up — директива по classified.
             _sec = None
+            _recur = None  # #333: «повторяющееся напоминание → передай recurrence_rule»
             if eff == "task":
                 _text = _last_human_text(state["messages"])
+                # #333: НЕЗАВИСИМО от доменной директивы — «кажд»+«напомн» в тексте =
+                # повторяющееся напоминание. Фредди без хинта отказывает «могу только
+                # однократное» (прод 2026-07-10 user_tg_755682022; probe 0/5 FREQ=HOURLY),
+                # хотя schedule_reminder умеет RRULE. Ортогонален _sec (домен) — оба могут
+                # стоять вместе. Гейт ниже (как у _sec, урок #285-канарейки 2026-07-06):
+                # хинт называет schedule_reminder — на unified при политике БЕЗ reminders
+                # это совет звать незабинженный тул → глушим.
+                from sreda.runtime.react_preflight import _recurrence_hint
+                _recur = _recurrence_hint(_text)
+                if _recur is not None and state.get("unified_execute"):
+                    _allowed_w = set(state.get("router_allowed_write_domains") or [])
+                    if "reminders" not in _allowed_w:
+                        _recur = None
                 if state.get("router_allowed_read_domains") is not None:
                     from sreda.runtime.react_preflight import route_domains
                     _rr = route_domains(_text)
@@ -2799,7 +2813,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
                 if time_tail_line:
                     _msgs = _append_time_tail(_msgs, time_tail_line)
-                _tail = [d for d in (nudge, _avail, _sec, _stale) if d]
+                _tail = [d for d in (nudge, _avail, _sec, _recur, _stale) if d]  # #333: _recur после _sec
                 if _tail:
                     _directive = "\n\n".join(_tail)
                     # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
@@ -2816,6 +2830,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                     sp = f"{sp}\n\n{nudge}"
                 if _sec:
                     sp = f"{sp}\n\n{_sec}"
+                if _recur:  # #333: легаси-ветка (#247 OFF) — симметрично _sec
+                    sp = f"{sp}\n\n{_recur}"
                 # #194: компакция истории как prompt-view. OFF → [SystemMessage(sp), *messages] (как было).
                 # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
