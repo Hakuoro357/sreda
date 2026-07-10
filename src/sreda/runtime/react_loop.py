@@ -1412,48 +1412,30 @@ _CONFIRM_DECLINED_TEXT = "Хорошо, не делаю."
 
 
 def _prev_open_domains(messages: Any) -> set:
-    """#338: области инструментов ПРОШЛОГО хода агента, если он закончился ВОПРОСОМ
-    (незакрытый ход - агент сам запросил продолжение: «Во сколько поставить его?»).
-    Ответ юзера на такой вопрос = продолжение хода, не новый вход → policy наследует
-    эти области в ярус (а) (владелец 2026-07-10, инцидент 755682022: «В 15» после
-    нашего вопроса получал кандидат-confirm с сырым schedule_reminder(...)).
+    """#338: область, с которой РЕАЛЬНО работал прошлый ход агента (write-инструмент
+    исполнялся) - «открытый ход». Слот-ответ юзера без самостоятельной темы (гейт -
+    в compute_unified_policy) продолжает его без кандидат-confirm (владелец
+    2026-07-10: «страховка только на первое сообщение входа»; инцидент 755682022:
+    «В 15» после нашего «во сколько?» получал сырой confirm).
 
-    Детект детерминированный: финальная реплика агента (последний AIMessage с текстом,
-    без tool_calls) оканчивается «?» → собрать домены исполненных ToolMessage этого же
-    хода (до предыдущего HumanMessage). Иначе (ход закрыт/вопроса нет/истории нет) → ∅."""
+    R5-переделка (владелец: «не костылями»): решает ФОРМА ОТВЕТА юзера, не форма
+    нашего вопроса. Финальный текст агента НЕ анализируется вообще (никаких
+    «?»-эвристик и списков закрывашек - R1-R5 показали, что парс собственных фраз
+    это бесконечное латание). Источник истины - журнал инструментов хода:
+    детерминированные исходы, не естественный язык. Обобщение sticky-by-use #319
+    («дверь открыта, пока областью пользуются») на все области, с более строгим
+    гейтом продолжения (текст без ЛЮБОЙ темы - см. policy)."""
     msgs = list(messages or [])
     if not msgs:
         return set()
     last = msgs[-1]
     if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
         return set()
-    # R1 MINOR-10: блочный content провайдера (list) - вытащить текст, не str(list)
-    _c = last.content
-    if isinstance(_c, list):
-        _c = " ".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in _c)
-    text = (_c if isinstance(_c, str) else str(_c or "")).strip()
-    if not text.endswith("?"):
-        return set()
-    # R1 MAJOR-6 + R2 Claude: вежливые закрывашки («Что-нибудь ещё?», «Ещё что-то?»)
-    # - ход ЗАКРЫТ. Подстрочный список обходился перестановкой слов и е/ё («рот»
-    # пишет как хочет), а ошибка тут в НЕбезопасную сторону (пропущенная закрывашка
-    # = write-грант без страховки). Правило: последнее предложение с токеном «еще»
-    # (е/ё нормализованы) = закрывашка. Ложное срабатывание на содержательном
-    # «Поставить ещё одно?» даёт лишний ЧЕЛОВЕЧЕСКИЙ confirm - безопасная сторона.
-    # R3 Claude: последний НЕПУСТОЙ сегмент («Что-нибудь ещё...?» и «!?» давали
-    # пустой хвост после split - обход в небезопасную сторону)
-    _segs = [x for x in re.split(r"[.!?]+", text.lower().replace("ё", "е").rstrip("?!. "))
-             if x.strip()]
-    if not _segs:
-        return set()  # R4 Claude: финал из чистой пунктуации («...?») - не вопрос, fail-closed
-    _last_sent = _segs[-1]
-    if re.search(r"(?:^|[^а-яa-z0-9])еще(?:[^а-яa-z0-9]|$)", _last_sent):
-        return set()
     from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
     # R1 MAJOR-6: исходы, которые ход НЕ открывают (инструмент фактически не работал
     # с областью). time_not_specified СОЗНАТЕЛЬНО открывает - это и есть уточняющий
     # исход инцидента («Поставь» → time_not_specified → «Во сколько?» → «В 12:30»).
-    _closed_kinds = frozenset({"domain_blocked", "search_limit",
+    _closed_kinds = frozenset({"domain_blocked", "search_limit", "error",
                                "source_result_required", "schema_error"})
     domains: set = set()
     for m in reversed(msgs[:-1]):
@@ -1469,6 +1451,8 @@ def _prev_open_domains(messages: Any) -> set:
             _art = getattr(m, "artifact", None)
             if isinstance(_art, dict) and _art.get("result_kind") in _closed_kinds:
                 continue
+            if getattr(m, "status", None) == "error":
+                continue  # error-ToolMessage (status-атрибут, #159 исключение) ход не открывает
             _content = m.content if isinstance(m.content, str) else ""
             if _content.startswith(_CONFIRM_DECLINED_TEXT.rstrip(".")):
                 continue  # R1 MAJOR-6: отказанный кандидат ход НЕ открывает
@@ -1479,6 +1463,11 @@ def _prev_open_domains(messages: Any) -> set:
             # а memory-write и так идёт через confirm/sticky #319.
             domains |= set(tool_write_domains(name))
     domains.discard("web")  # web не наследуем: не user-data, страховки не касается
+    # memory не наследуем: продолжение memory-серий - юрисдикция sticky-by-use #319
+    # (продление ТОЛЬКО фактом УСПЕШНОЙ записи, renewal в run_tools) - наследование
+    # с более слабым гейтом перекрывало бы его контракт (поймано смежным тестом
+    # test_sticky_not_opened_by_error_result при R5-переделке).
+    domains.discard("memory")
     # R2 medium: смешанный ход (add_task + schedule_reminder + вопрос) открывал бы ОБА
     # домена - ошибочный task-write прошёл бы без страховки. Вопрос агента относится
     # к одной теме → >1 write-домена = неоднозначно = fail-closed (не наследуем).

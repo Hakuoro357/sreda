@@ -6,12 +6,15 @@
 «В 15» - и получил кандидат-confirm с сырым «schedule_reminder (title=…,
 trigger_iso=…)». Глупо: ответ на НАШ ЖЕ вопрос.
 
-Механизм: «незакрытый ход» = прошлый ход агента закончился ВОПРОСОМ (финальная
-реплика с «?») - тогда области инструментов того хода наследуются в allowed_write
-текущего (продолжение, не вход). Новая команда в ДРУГУЮ область = выход = страховка.
-Паттерн - обобщение #319 sticky-by-use; отличие: гейт сильнее (агент сам запросил
-продолжение вопросом), поэтому наследование переживает и безглагольный ответ
-(«В 15»), и голую команду без домена («Поставь»).
+Механизм (R5-переделка, владелец: «не костылями»): решает ФОРМА ОТВЕТА юзера,
+не форма нашего вопроса. «Открытый ход» = прошлый ход агента реально работал с
+областью (write-инструмент исполнялся - факт журнала, не текст). Продолжение =
+сообщение юзера БЕЗ самостоятельной темы (ни доменных слов route, ни read-кюсов):
+«В 15», «завтра в 9», «Поставь». Любое доменное слово («перескажи напоминания»,
+«что с задачами», «добавь молоко в покупки») = обычный вход со страховкой.
+Финальный текст агента НЕ анализируется вообще (никаких «?» и списков закрывашек).
+Обобщение sticky-by-use #319 на все области. Ошибка строго в безопасную сторону
+(лишний ЧЕЛОВЕЧЕСКИЙ confirm).
 """
 from __future__ import annotations
 
@@ -43,11 +46,14 @@ def test_prev_open_domains_incident_history_338():
     assert "reminders" in _prev_open_domains(_hist_incident())
 
 
-def test_prev_open_domains_closed_turn_338():
-    """Финал БЕЗ вопроса (ход закрыт) → наследовать нечего."""
-    hist = _hist_incident()
-    hist[-1] = AIMessage(content="Готово, напоминание поставлено.")
-    assert _prev_open_domains(hist) == set()
+def test_prev_open_domains_any_final_text_338():
+    """R5: финальный текст агента НЕ анализируется - write-ход открывает область
+    независимо от формулировки финала (гейт продолжения - форма ОТВЕТА юзера)."""
+    for final in ("Готово, напоминание поставлено.", "Что-нибудь ещё?",
+                  "Во сколько поставить его?", "...?"):
+        hist = _hist_incident()
+        hist[-1] = AIMessage(content=final)
+        assert "reminders" in _prev_open_domains(hist), final
 
 
 def test_prev_open_domains_question_without_tools_338():
@@ -133,13 +139,6 @@ def test_prev_open_read_tool_gives_no_write_grant_338():
     assert _prev_open_domains(hist) == set()
 
 
-def test_prev_open_closing_phrase_not_continuation_338():
-    """R1 MAJOR-6: вежливая закрывашка «Что-нибудь ещё?» - ход ЗАКРЫТ."""
-    hist = _hist_incident()
-    hist[-1] = AIMessage(content="Готово, поставила! Что-нибудь ещё?")
-    assert _prev_open_domains(hist) == set()
-
-
 def test_prev_open_declined_candidate_not_continuation_338():
     """R1 MAJOR-6: отклонённый кандидат («Хорошо, не делаю») ход не открывает."""
     hist = [
@@ -207,24 +206,6 @@ def test_r2_read_cue_other_domain_exits_338():
     assert "reminders" not in pol["allowed_write"]
 
 
-def test_r2_closing_phrase_variants_and_yo_338():
-    """R2 Claude MAJOR: закрывашки в любых перестановках и с е/ё - ход закрыт
-    (пропуск закрывашки = write-грант без страховки, небезопасная сторона)."""
-    for phrase in ("Готово! Ещё что-нибудь?", "Ещё что-то?",
-                   "Помочь ещё с чем-нибудь?", "Что-нибудь еще?"):
-        hist = _hist_incident()
-        hist[-1] = AIMessage(content=phrase)
-        assert _prev_open_domains(hist) == set(), phrase
-
-
-def test_r2_substantive_question_with_eshe_closes_too_338():
-    """Содержательный вопрос со словом «ещё» тоже закрывает ход - ОСОЗНАННО
-    (безопасная сторона: лишний человеческий confirm, не открытый write)."""
-    hist = _hist_incident()
-    hist[-1] = AIMessage(content="Поставить ещё одно напоминание?")
-    assert _prev_open_domains(hist) == set()
-
-
 def test_r2_declined_text_freeze_via_real_wrap_338(monkeypatch):
     """R2 Claude MINOR: текст отказа кандидата - через РЕАЛЬНЫЙ wrap (дрейф
     литерала ломал бы фильтр наследования молча)."""
@@ -244,22 +225,6 @@ def test_r2_declined_text_freeze_via_real_wrap_338(monkeypatch):
     assert _prev_open_domains(hist) == set()
 
 
-def test_r3_closing_phrase_uppercase_yo_338():
-    """R3 high (регресс): «ЧТО-НИБУДЬ ЕЩЁ?» - заглавная Ё нормализуется."""
-    hist = _hist_incident()
-    hist[-1] = AIMessage(content="ГОТОВО! ЧТО-НИБУДЬ ЕЩЁ?")
-    assert _prev_open_domains(hist) == set()
-
-
-def test_r3_closing_phrase_ellipsis_and_bang_338():
-    """R3 Claude: «Что-нибудь ещё...?» и «!?» (пустой последний сегмент после
-    split) - тоже закрывашки."""
-    for phrase in ("Готово! Что-нибудь ещё...?", "Что-нибудь ещё!?"):
-        hist = _hist_incident()
-        hist[-1] = AIMessage(content=phrase)
-        assert _prev_open_domains(hist) == set(), phrase
-
-
 def test_r3_read_cue_including_same_domain_exits_338():
     """R3 high: «покажи задачи и напоминания» (read-cue содержит и наследуемый
     домен) - всё равно выход: юзер ушёл смотреть, не отвечает на вопрос."""
@@ -269,11 +234,37 @@ def test_r3_read_cue_including_same_domain_exits_338():
     assert "reminders" not in pol["allowed_write"]
 
 
-def test_r4_slot_answer_with_domain_word_inherits_338():
-    """R4 high: слот-ответ с доменным словом («напоминание в 15», «для напоминания
-    в 15») - валидное продолжение, наследуется (read_cues-гейт это ломал; гейт -
-    new_read_request_signal: нужен МАРКЕР запроса, не голое доменное слово)."""
-    for text in ("напоминание в 15", "для напоминания в 15"):
+def test_r5_domain_word_in_answer_is_entry_338():
+    """R5: ЛЮБОЕ доменное слово = самостоятельная тема = вход со страховкой -
+    включая слот-ответ «напоминание в 15» (осознанный residual: лишний
+    ЧЕЛОВЕЧЕСКИЙ confirm - безопасная сторона, юзер обычно отвечает «в 15»)."""
+    for text in ("напоминание в 15", "перескажи напоминания", "что с задачами",
+                 "добавь молоко в покупки"):
         pol = compute_unified_policy(
             text, route_domains(text), prev_open_domains=frozenset({"reminders"}))
-        assert "reminders" in pol["allowed_write"], text
+        assert "reminders" not in pol["allowed_write"], text
+
+
+def test_r5_error_outcome_does_not_open_338():
+    """R5 (улов смежного sticky-теста): ошибочный write-исход (status=error или
+    result_kind=error) область НЕ открывает - инструмент не отработал."""
+    hist = [
+        HumanMessage(content="поставь напоминание про воду"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="error: провайдер недоступен", name="schedule_reminder",
+                    tool_call_id="t1", status="error"),
+        AIMessage(content="Не получилось, попробуем ещё раз. Во сколько поставить?"),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_r5_memory_is_sticky_jurisdiction_338():
+    """R5: memory НЕ наследуется этим механизмом - продолжение memory-серий ведёт
+    sticky-by-use #319 (только факт УСПЕШНОЙ записи)."""
+    hist = [
+        HumanMessage(content="запомни мой вес"),
+        AIMessage(content="", tool_calls=[{"name": "save_episode", "args": {}, "id": "t1"}]),
+        ToolMessage(content="saved_episode:1", name="save_episode", tool_call_id="t1"),
+        AIMessage(content="Записала! Продолжим?"),
+    ]
+    assert _prev_open_domains(hist) == set()

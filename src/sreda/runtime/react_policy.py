@@ -97,8 +97,7 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     деструктивных инструментов (save_core_fact/save_episode/create_memory_category)."""
     from sreda.runtime.react_preflight import compute_allowed_domains
     from sreda.runtime.react_signals import (
-        declarative_memory_signal, new_read_request_signal, read_cue_domains,
-        write_command_signal,
+        declarative_memory_signal, read_cue_domains, write_command_signal,
     )
 
     w_sig = bool(write_command_signal(text))
@@ -141,21 +140,19 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     # гейт сильнее (агент САМ запросил продолжение вопросом), поэтому наследование
     # переживает и безглагольный ответ («В 15»), и голую команду без домена («Поставь») -
     # контракт «нет домена → кандидат» НЕ ломается, он про ходы БЕЗ открытого вопроса.
-    # Выход из хода: явная команда в ДРУГУЮ область (w_sig + route дал домены, наследуемой
-    # среди них нет) → страховка как на новый вход.
+    # R5-переделка (владелец: «не костылями»): ЕДИНЫЙ гейт продолжения - сообщение
+    # юзера НЕ несёт самостоятельной темы: ни доменных слов (route: «покупки»,
+    # «задачи», «напоминания»...), ни read-кюсов. Тогда «В 15» / «завтра в 9» /
+    # «Поставь» / «да» = продолжение открытого хода; ЛЮБОЕ доменное слово
+    # («перескажи напоминания», «что с задачами», «добавь молоко в покупки»,
+    # и даже «напоминание в 15» - осознанный residual: лишний ЧЕЛОВЕЧЕСКИЙ confirm)
+    # = обычный вход со страховкой. Ошибка строго в безопасную сторону. Никаких
+    # списков фраз: только существующие детекторы route_domains/read_cue_domains.
     continuation: list = []
-    for _d in sorted(prev_open_domains):
-        if w_sig and route.all_domains and _d not in route.all_domains:
-            continue  # новая команда в другую область = выход из хода
-        # R2/R3/R4 Codex high: явный READ-ЗАПРОС - выход из хода («покажи задачи и
-        # напоминания»: юзер ушёл смотреть, не отвечает). Гейт - new_read_request_signal
-        # (#316: маркер запроса И доменный кюс), НЕ голый read_cues: слот-ответ
-        # «напоминание в 15» несёт кюс, но НЕ запрос - это валидное продолжение
-        # инцидентного класса (R4 high: read_cues-гейт ломал его).
-        if new_read_request_signal(text):
-            continue
-        allowed_write.add(_d)
-        continuation.append(_d)
+    if not route.all_domains and not read_cues:
+        for _d in sorted(prev_open_domains):
+            allowed_write.add(_d)
+            continuation.append(_d)
 
     allowed_read: set[str] = set()
     if base_web:
