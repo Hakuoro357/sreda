@@ -141,7 +141,11 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     # = обычный вход со страховкой. Ошибка строго в безопасную сторону. Никаких
     # списков фраз: только существующие детекторы route_domains/read_cue_domains.
     continuation: list = []
-    if not route.all_domains and not read_cues:
+    if not route.all_domains and not read_cues and not sticky_applied:
+        # R7 оба Codex: sticky-серия (memory) и открытый слот НЕ складываются -
+        # два прямых write-домена на themeless-ответе неоднозначны → fail-closed:
+        # активная sticky-серия побеждает (юзер в memory-контексте), слот идёт
+        # через человеческий кандидат-confirm.
         for _d in sorted(prev_open_domains):
             allowed_write.add(_d)
             continuation.append(_d)

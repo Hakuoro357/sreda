@@ -345,3 +345,29 @@ def test_r6_guard_last_message_shapes_338():
     hist2 = _hist_incident()
     hist2[-1] = AIMessage(content="", tool_calls=[{"name": "list_reminders", "args": {}, "id": "x"}])
     assert _prev_open_domains(hist2) == set()
+
+
+def test_r7_late_ok_closes_earlier_slot_338():
+    """R7 high: слот → уточнение → ok В ТОМ ЖЕ ходе = слот закрыт (последний
+    исход домена решает)."""
+    hist = [
+        HumanMessage(content="поставь напоминание про воду в 12:30"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="уточни время", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "time_not_specified"}),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t2"}]),
+        ToolMessage(content="ok:scheduled:rem_1:x", name="schedule_reminder", tool_call_id="t2",
+                    artifact={"result_kind": "ok"}),
+        AIMessage(content="Готово, поставила!"),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_r7_sticky_and_slot_do_not_stack_338():
+    """R7 оба Codex: активная sticky-серия (memory) + открытый слот → continuation
+    НЕ применяется (два прямых домена на themeless-ответе = fail-closed)."""
+    pol = compute_unified_policy(
+        "в 16", route_domains("в 16"),
+        sticky_memory_write=True, prev_open_domains=frozenset({"reminders"}))
+    assert pol["allowed_write"] == ["memory"]  # только sticky
+    assert pol["signals"]["turn_continuation"] == []

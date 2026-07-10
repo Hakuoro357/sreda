@@ -1433,7 +1433,11 @@ def _prev_open_domains(messages: Any) -> set:
         return set()
     from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
     _SLOT_KINDS = frozenset({"time_not_specified"})
+    # R7 Codex high: слот считается открытым по ПОСЛЕДНЕМУ исходу write-инструмента
+    # домена (слот → уточнение → ok В ТОМ ЖЕ ходе = слот ЗАКРЫТ; идём с конца,
+    # первый встреченный исход по домену = последний хронологически, прочие игнор)
     domains: set = set()
+    _seen_domains: set = set()
     for m in reversed(msgs[:-1]):
         if isinstance(m, HumanMessage):
             break  # начало этого хода
@@ -1441,10 +1445,16 @@ def _prev_open_domains(messages: Any) -> set:
             name = _TOOL_NAME_ALIASES.get(m.name, m.name)
             if name not in TOOL_OP_CLASS:
                 continue  # мета/галлюцинированные имена (R1 MAJOR-1)
+            _wd = set(tool_write_domains(name))
+            if not _wd:
+                continue  # read-инструменты состояние слота не меняют
+            _fresh = _wd - _seen_domains
+            _seen_domains |= _wd
+            if not _fresh:
+                continue  # по этому домену уже видели БОЛЕЕ ПОЗДНИЙ исход
             _art = getattr(m, "artifact", None)
-            if not (isinstance(_art, dict) and _art.get("result_kind") in _SLOT_KINDS):
-                continue  # только СТРУКТУРНЫЙ слот-исход открывает ход
-            domains |= set(tool_write_domains(name))
+            if isinstance(_art, dict) and _art.get("result_kind") in _SLOT_KINDS:
+                domains |= _fresh  # последний исход домена = открытый слот
     domains.discard("web")
     # memory-продолжения - юрисдикция sticky #319 (гейт «только успешная запись»)
     domains.discard("memory")
