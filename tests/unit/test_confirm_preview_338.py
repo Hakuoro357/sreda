@@ -410,3 +410,33 @@ def test_r3_weekday_correct_form_still_accepted_338():
         "Ставлю напоминание «выписка лекарств» завтра, во вторник, в 15:00. Подтверждаешь?",
         _f(), now=_NOW)
     assert ok
+
+
+def test_r3_exotic_rrule_blocked_not_confirmed_blind_338(monkeypatch):
+    """R3 high: exotic RRULE (BYMONTHDAY) НЕ подтверждается вслепую - инструмент
+    не исполняется, модель просит переформулировать проще."""
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime import react_loop
+
+    called = {}
+    inner = StructuredTool.from_function(
+        func=lambda title="", trigger_iso="", recurrence_rule="":
+            called.update({"title": title}) or "ok",
+        name="schedule_reminder", description="d")
+    monkeypatch.setattr(react_loop, "interrupt", lambda payload: "да")
+    res = react_loop._generic_confirm_wrap(inner).invoke(
+        {"title": "квартплата", "trigger_iso": _TRIGGER,
+         "recurrence_rule": "FREQ=MONTHLY;BYMONTHDAY=15"})
+    assert "переформулируй" in str(res)
+    assert not called  # инструмент НЕ исполнен
+
+
+def test_r3_recurrence_digits_not_leaked_to_allowance_338():
+    """R3 Claude MINOR: голое число из повтора («возьми 20 штук» при «до 20
+    августа») больше не в допуске - фраза повтора вырезана, её цифры тоже."""
+    f = confirm_facts("schedule_reminder",
+                      {"title": "пить воду", "trigger_iso": _TRIGGER,
+                       "recurrence_rule": "FREQ=HOURLY;UNTIL=20260820T150000Z"})
+    text = (f"Ставлю напоминание «пить воду» завтра в 15:00, возьми 20 штук, "
+            f"повтор {f.recurrence_human}. Подтверждаешь?")
+    assert not verify_confirm_text(text, f, now=_NOW)

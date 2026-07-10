@@ -1440,7 +1440,11 @@ def _prev_open_domains(messages: Any) -> set:
     # = write-грант без страховки). Правило: последнее предложение с токеном «еще»
     # (е/ё нормализованы) = закрывашка. Ложное срабатывание на содержательном
     # «Поставить ещё одно?» даёт лишний ЧЕЛОВЕЧЕСКИЙ confirm - безопасная сторона.
-    _last_sent = re.split(r"[.!?]", text.rstrip("?").replace("ё", "е"))[-1].lower()
+    # R3 Claude: последний НЕПУСТОЙ сегмент («Что-нибудь ещё...?» и «!?» давали
+    # пустой хвост после split - обход в небезопасную сторону)
+    _segs = [x for x in re.split(r"[.!?]+", text.lower().replace("ё", "е").rstrip("?!. "))
+             if x.strip()]
+    _last_sent = _segs[-1] if _segs else ""
     if re.search(r"(?:^|[^а-яa-z0-9])еще(?:[^а-яa-z0-9]|$)", _last_sent):
         return set()
     from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
@@ -1501,6 +1505,13 @@ def _generic_confirm_wrap(inner: Any) -> Any:
         )
         _facts = confirm_facts(inner.name, kwargs)
         _now = datetime.now(_MSK)
+        # R3 Codex high: расписание, которое НЕ рендерится человечески (exotic RRULE),
+        # НЕ подтверждаем вслепую - юзер сказал бы «да» правилу, которого не видел.
+        # Fail-closed: не исполняем, модель переформулирует проще.
+        if (inner.name == "schedule_reminder" and _facts is None
+                and str(kwargs.get("recurrence_rule") or "").strip()):
+            return ("Не могу безопасно подтвердить такое расписание - переформулируй "
+                    "правило проще (например: каждый час, каждый день в 9, по вторникам).")
         if _facts is not None:
             _q = fallback_template(_facts, now=_now)
             # #338 ч.2б (за флагом): живая фраза «рта» в персоне ПОВЕРХ шаблона.

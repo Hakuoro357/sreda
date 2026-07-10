@@ -242,3 +242,28 @@ def test_r2_declined_text_freeze_via_real_wrap_338(monkeypatch):
         AIMessage(content="Не ставлю. Скорректировать что-то?"),
     ]
     assert _prev_open_domains(hist) == set()
+
+
+def test_r3_closing_phrase_uppercase_yo_338():
+    """R3 high (регресс): «ЧТО-НИБУДЬ ЕЩЁ?» - заглавная Ё нормализуется."""
+    hist = _hist_incident()
+    hist[-1] = AIMessage(content="ГОТОВО! ЧТО-НИБУДЬ ЕЩЁ?")
+    assert _prev_open_domains(hist) == set()
+
+
+def test_r3_closing_phrase_ellipsis_and_bang_338():
+    """R3 Claude: «Что-нибудь ещё...?» и «!?» (пустой последний сегмент после
+    split) - тоже закрывашки."""
+    for phrase in ("Готово! Что-нибудь ещё...?", "Что-нибудь ещё!?"):
+        hist = _hist_incident()
+        hist[-1] = AIMessage(content=phrase)
+        assert _prev_open_domains(hist) == set(), phrase
+
+
+def test_r3_read_cue_including_same_domain_exits_338():
+    """R3 high: «покажи задачи и напоминания» (read-cue содержит и наследуемый
+    домен) - всё равно выход: юзер ушёл смотреть, не отвечает на вопрос."""
+    text = "покажи задачи и напоминания"
+    pol = compute_unified_policy(
+        text, route_domains(text), prev_open_domains=frozenset({"reminders"}))
+    assert "reminders" not in pol["allowed_write"]

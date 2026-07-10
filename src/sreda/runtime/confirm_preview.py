@@ -369,9 +369,10 @@ def verify_confirm_text(text: str, facts: ConfirmFacts, *, now: datetime) -> boo
             return False
     # любые прочие числа вне разрешённого набора (день/час/минуты/count) - враньё
     # класса «ID 42» (R1 high) или чужое число
+    # R3 Claude MINOR: цифры recurrence-фразы НЕ добавляем - фраза уже вырезана
+    # из rest, легитимных источников этих цифр не осталось (иначе голое «20» из
+    # «до 20 августа» протаскивалось бы в любом месте текста)
     _allowed_nums = {str(w.day), str(w.hour), f"{w.minute:02d}", str(w.minute)}
-    if facts.recurrence_human:
-        _allowed_nums |= set(re.findall(r"\d+", facts.recurrence_human))
     for num in re.findall(r"\d+", lower_rest):
         if num not in _allowed_nums:
             return False
