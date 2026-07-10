@@ -404,29 +404,29 @@ def _require_miniapp_auth(
             # None / resolved-after-race) сюда не попадают — тенант только что
             # создан, всегда активен.
             _gate_miniapp_tenant_active(session, tenant_id)
-            # Codex R1 MAJOR #4: refresh max_chat_id если изменился.
-            # Сценарий: Boris вручную SQL-merge'нул tenant'ы; max_chat_id
-            # был известен на момент merge'а. Если юзер удалит и пересоздаст
-            # MAX-аккаунт (новый chat_id), без refresh outbound delivery
-            # пойдёт на старый chat_id и упадёт.
+            # #341 (F1, CRITICAL, Codex R-codex MAJOR D): max_chat_id —
+            # FIRST-SET-ONLY. Ставим ТОЛЬКО когда сейчас NULL/пусто (первичная
+            # установка). НЕ перезаписываем УЖЕ установленный chat_id: единый
+            # инвариант — established max_chat_id меняется ТОЛЬКО через
+            # аутентифицированный channel-link flow (channel_linking.consume_link),
+            # чтобы не было второго неконтролируемого пути перезаписи.
+            # Сценарий пересоздания MAX-аккаунта (новый chat_id для того же
+            # аккаунта) теперь обслуживается ре-линком через consume_link
+            # (same-account ветка обновляет chat_id).
             if max_user.max_chat_id:
                 try:
                     from sreda.db.models.core import User
                     user_row = session.get(User, user_id)
-                    if (
-                        user_row is not None
-                        and user_row.max_chat_id != max_user.max_chat_id
-                    ):
+                    if user_row is not None and not (user_row.max_chat_id or "").strip():
                         logger.info(
-                            "miniapp auth: refreshing max_chat_id user=%s "
-                            "old=%r new=%s",
-                            user_id, user_row.max_chat_id, max_user.max_chat_id,
+                            "miniapp auth: first-set max_chat_id user=%s new=%s",
+                            user_id, max_user.max_chat_id,
                         )
                         user_row.max_chat_id = max_user.max_chat_id
                         session.commit()
                 except Exception:  # noqa: BLE001
                     logger.warning(
-                        "miniapp auth: max_chat_id refresh failed user=%s",
+                        "miniapp auth: max_chat_id first-set failed user=%s",
                         user_id, exc_info=True,
                     )
                     session.rollback()

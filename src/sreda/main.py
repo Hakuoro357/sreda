@@ -76,7 +76,16 @@ async def _lifespan(app: FastAPI):
     # health endpoint показывает degraded если регистрация не удалась.
     # Rollback path: убрать SREDA_MAX_BOT_TOKEN из env → этот блок skip.
     app.state.max_webhook_status = "disabled"
-    if settings.max_bot_token and settings.max_webhook_url:
+    # #341 MAJOR B: единый дискриминатор is_webhook_deployed (не сырая
+    # truthiness). Startup-гейт выше уже гарантировал, что secret задан, если
+    # бот развёрнут — регистрируем нормализованным секретом.
+    from sreda.services.webhook_security import (
+        is_webhook_deployed as _is_webhook_deployed,
+        normalized_webhook_secret as _normalized_webhook_secret,
+    )
+    if _is_webhook_deployed(
+        bot_token=settings.max_bot_token, webhook_url=settings.max_webhook_url
+    ):
         try:
             from sreda.integrations.max import MaxClient
             from sreda.services.admin_alerts import alert_admin_async
@@ -88,7 +97,9 @@ async def _lifespan(app: FastAPI):
             # в `X-Max-Bot-Api-Secret` header каждого webhook'а.
             await max_client.set_webhook(
                 url=settings.max_webhook_url,
-                secret_token=settings.max_webhook_secret_token,
+                secret_token=_normalized_webhook_secret(
+                    settings.max_webhook_secret_token
+                ),
             )
             app.state.max_webhook_status = "ok"
             logger.info(

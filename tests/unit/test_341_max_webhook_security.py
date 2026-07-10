@@ -65,7 +65,8 @@ def _sqlite_env(monkeypatch, tmp_path, name: str) -> None:
 
 
 def test_startup_fails_without_max_webhook_secret(monkeypatch, tmp_path) -> None:
-    """token+url заданы, secret пуст → запуск (lifespan) падает."""
+    """token+url заданы, secret пуст → запуск (lifespan) падает КОНКРЕТНЫМ
+    сообщением, и webhook НЕ регистрируется (set_webhook не вызван)."""
     _sqlite_env(monkeypatch, tmp_path, "startup_no_secret")
     monkeypatch.setenv("SREDA_MAX_BOT_TOKEN", FAKE_MAX_TOKEN)
     monkeypatch.setenv("SREDA_MAX_WEBHOOK_URL", FAKE_MAX_WEBHOOK_URL)
@@ -74,9 +75,19 @@ def test_startup_fails_without_max_webhook_secret(monkeypatch, tmp_path) -> None
 
     Base.metadata.create_all(get_engine())
 
-    with pytest.raises(RuntimeError):
+    calls: list[bool] = []
+
+    async def _spy_set_webhook(self, *a, **kw):
+        calls.append(True)
+        return {"ok": True}
+
+    from sreda.integrations.max import MaxClient
+    monkeypatch.setattr(MaxClient, "set_webhook", _spy_set_webhook)
+
+    with pytest.raises(RuntimeError, match="Webhook secret misconfiguration"):
         with TestClient(create_app()):
             pass
+    assert calls == [], "startup-гейт должен упасть ДО регистрации webhook"
 
 
 def test_startup_ok_when_max_webhook_secret_present(monkeypatch, tmp_path) -> None:
@@ -122,7 +133,7 @@ def test_startup_fails_without_telegram_webhook_secret(monkeypatch, tmp_path) ->
 
     Base.metadata.create_all(get_engine())
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="Telegram: заданы telegram_bot_token"):
         with TestClient(create_app()):
             pass
 
@@ -452,3 +463,195 @@ def test_telegram_webhook_dev_fallback_without_url(monkeypatch, tmp_path) -> Non
     # Гейт НЕ должен отклонить (webhook_url не задан) — доходит до handler.
     assert resp.status_code == 202
     assert called == [True]
+
+
+# ---------------------------------------------------------------------------
+# Codex R-codex MAJOR B — whitespace-only secret трактуется как отсутствующий
+# ---------------------------------------------------------------------------
+
+
+def test_max_webhook_whitespace_secret_treated_as_absent(monkeypatch, tmp_path) -> None:
+    """Пробельный secret ('   ') при развёрнутом MAX (token+url) = отсутствует →
+    route fail-closed (401), а не литеральное сравнение с пробелами."""
+    _sqlite_env(monkeypatch, tmp_path, "max_ws_secret")
+    monkeypatch.setenv("SREDA_MAX_BOT_TOKEN", FAKE_MAX_TOKEN)
+    monkeypatch.setenv("SREDA_MAX_WEBHOOK_URL", FAKE_MAX_WEBHOOK_URL)
+    monkeypatch.setenv("SREDA_MAX_WEBHOOK_SECRET_TOKEN", "   ")
+    _clear_caches()
+
+    Base.metadata.create_all(get_engine())
+
+    called: list[bool] = []
+
+    async def _spy_handle(*a, **kw):
+        called.append(True)
+        return "in_should_not_happen"
+
+    monkeypatch.setattr(
+        "sreda.api.routes.max_webhook.handle_max_update", _spy_handle
+    )
+
+    client = TestClient(create_app())
+    # Отправляем заголовок, РАВНЫЙ пробельному секрету: старый код сравнил бы
+    # ' '==' ' и ПРИНЯЛ (дыра). Нормализация → secret отсутствует → 401.
+    resp = client.post(
+        "/api/max/webhook",
+        json={"update_type": "message_created"},
+        headers={"X-Max-Bot-Api-Secret": "   "},
+    )
+    assert resp.status_code == 401
+    assert called == []
+
+
+def test_telegram_webhook_whitespace_secret_treated_as_absent(
+    monkeypatch, tmp_path
+) -> None:
+    """TG-паритет whitespace: token+url заданы, secret=' ' → route 401."""
+    _sqlite_env(monkeypatch, tmp_path, "tg_ws_secret")
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", FAKE_TG_TOKEN)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_URL", FAKE_TG_WEBHOOK_URL)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "   ")
+    _clear_caches()
+
+    Base.metadata.create_all(get_engine())
+
+    called: list[bool] = []
+
+    async def _spy_handle(*a, **kw):
+        called.append(True)
+        return "in_should_not_happen"
+
+    monkeypatch.setattr(
+        "sreda.api.routes.telegram_webhook.handle_telegram_update", _spy_handle
+    )
+
+    client = TestClient(create_app())
+    resp = client.post(
+        "/webhooks/telegram/sreda",
+        json={"update_id": 1, "message": {"message_id": 1,
+              "chat": {"id": 123, "type": "private"}, "text": "hi"}},
+        headers={"X-Telegram-Bot-Api-Secret-Token": "   "},
+    )
+    assert resp.status_code == 401
+    assert called == []
+
+
+# ---------------------------------------------------------------------------
+# Codex R-codex MAJOR C — empty-string edge (пусто трактуется как «не задано»)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stored", [None, ""])
+def test_inbound_first_set_when_stored_absent(db_session, stored) -> None:
+    """И None, И '' трактуются как «не задано» → inbound ПРОСТАВЛЯЕТ chat_id
+    (первичная установка). Established (непустое) значение — отдельно, не тут."""
+    from sreda.services.onboarding import ensure_max_user_bundle
+
+    db_session.add(Tenant(id="tenant_max_e", name="E"))
+    db_session.add(User(
+        id="user_max_e",
+        tenant_id="tenant_max_e",
+        max_account_id="90000050",
+        max_chat_id=stored,
+    ))
+    db_session.commit()
+
+    res = ensure_max_user_bundle(
+        db_session, max_account_id="90000050", max_chat_id="70000500",
+    )
+    db_session.expire_all()
+    assert db_session.get(User, "user_max_e").max_chat_id == "70000500"
+    assert res.max_chat_id == "70000500"
+
+
+# ---------------------------------------------------------------------------
+# Codex R-codex MAJOR A — health-воркер НЕ перерегистрирует webhook без секрета
+# ---------------------------------------------------------------------------
+
+
+def test_health_worker_refuses_reregister_without_secret(monkeypatch) -> None:
+    """job-runner не исполняет lifespan → startup-гейт не защищает. Health-воркер
+    при stale-подписке и ПУСТОМ секрете НЕ зовёт set_webhook + шлёт admin-alert."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from sreda.workers import max_subscription_health as mh
+
+    set_webhook_calls: list[bool] = []
+    alerts: list[str] = []
+
+    class _FakeMaxClient:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        async def get_subscriptions(self):
+            # Stale: наш URL отсутствует в подписках.
+            return {"subscriptions": [{"url": "https://other.example/hook"}]}
+
+        async def set_webhook(self, *a, **kw):
+            set_webhook_calls.append(True)
+            return {"ok": True}
+
+    async def _fake_alert(text: str) -> None:
+        alerts.append(text)
+
+    monkeypatch.setattr("sreda.integrations.max.MaxClient", _FakeMaxClient)
+    monkeypatch.setattr(
+        "sreda.services.admin_alerts.alert_admin_async", _fake_alert
+    )
+
+    fake_settings = SimpleNamespace(
+        max_bot_token=FAKE_MAX_TOKEN,
+        max_webhook_url=FAKE_MAX_WEBHOOK_URL,
+        max_webhook_secret_token=None,
+    )
+
+    asyncio.run(mh._verify_max_subscription(fake_settings))
+
+    assert set_webhook_calls == [], (
+        "health-воркер НЕ должен перерегистрировать webhook без секрета"
+    )
+    assert len(alerts) == 1 and "#341" in alerts[0]
+
+
+def test_health_worker_reregisters_with_secret(monkeypatch) -> None:
+    """Регрессия: при заданном секрете stale-подписка перерегистрируется
+    нормализованным секретом (штатный путь не сломан)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from sreda.workers import max_subscription_health as mh
+
+    set_webhook_kwargs: list[dict] = []
+    alerts: list[str] = []
+
+    class _FakeMaxClient:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        async def get_subscriptions(self):
+            return {"subscriptions": []}
+
+        async def set_webhook(self, *a, **kw):
+            set_webhook_kwargs.append(kw)
+            return {"ok": True}
+
+    async def _fake_alert(text: str) -> None:
+        alerts.append(text)
+
+    monkeypatch.setattr("sreda.integrations.max.MaxClient", _FakeMaxClient)
+    monkeypatch.setattr(
+        "sreda.services.admin_alerts.alert_admin_async", _fake_alert
+    )
+
+    fake_settings = SimpleNamespace(
+        max_bot_token=FAKE_MAX_TOKEN,
+        max_webhook_url=FAKE_MAX_WEBHOOK_URL,
+        max_webhook_secret_token=f"  {FAKE_MAX_SECRET}  ",
+    )
+
+    asyncio.run(mh._verify_max_subscription(fake_settings))
+
+    assert len(set_webhook_kwargs) == 1
+    # Нормализованный секрет (без пробелов).
+    assert set_webhook_kwargs[0].get("secret_token") == FAKE_MAX_SECRET

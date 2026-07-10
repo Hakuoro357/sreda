@@ -8,7 +8,10 @@ from sreda.config.bot_registry import TelegramBotRegistry
 from sreda.config.settings import get_settings
 from sreda.schemas.api import TelegramWebhookAccepted
 from sreda.services.telegram_inbound import handle_telegram_update
-from sreda.services.webhook_security import webhook_secret_missing_while_deployed
+from sreda.services.webhook_security import (
+    is_webhook_deployed,
+    normalized_webhook_secret,
+)
 
 router = APIRouter(prefix="/webhooks/telegram", tags=["telegram"])
 logger = logging.getLogger(__name__)
@@ -51,17 +54,17 @@ def _verify_telegram_secret_token(
     ),
 ) -> None:
     settings = get_settings()
-    expected = settings.telegram_webhook_secret_token
+    # Codex R-codex MAJOR B: нормализуем secret + единый is_webhook_deployed.
+    expected = normalized_webhook_secret(settings.telegram_webhook_secret_token)
     if not expected:
         # #341 (F1 paritet): fail-closed, если TG развёрнут в webhook-режиме
         # (telegram_bot_token+telegram_webhook_url заданы), но secret пуст.
         # Прод-вход TG = long-poll → telegram_webhook_url не задан → этот гейт
         # инертен, dev/long-poll fallback (accept) сохраняется. Явная настройка
         # webhook-режима без секрета = отклоняем неаутентифицированный inbound.
-        if webhook_secret_missing_while_deployed(
+        if is_webhook_deployed(
             bot_token=settings.telegram_bot_token,
             webhook_url=settings.telegram_webhook_url,
-            secret=expected,
         ):
             logger.error(
                 "telegram webhook rejected: secret не настроен, но webhook-режим "

@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from sqlalchemy import or_ as sa_or, update as sa_update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
@@ -586,14 +587,27 @@ def ensure_max_user_bundle(
         # #341 (F1, CRITICAL): разрешаем ТОЛЬКО первичную установку
         # (NULL/пусто → value). НЕ перезаписываем УЖЕ заданный max_chat_id из
         # inbound: поддельный payload с чужим chat_id иначе уводил бы все
-        # уведомления/ответы жертвы в чат атакующего. Легитимная смена привязки
-        # идёт ТОЛЬКО аутентифицированными путями: channel-link flow
-        # (services.channel_linking.consume_link → User.max_chat_id) ИЛИ
-        # mini-app с HMAC-валидированным initData (api/routes/miniapp.py) —
-        # оба вне inbound и этим guard'ом не затрагиваются.
-        if chat_id_str and not existing_user.max_chat_id:
-            existing_user.max_chat_id = chat_id_str
+        # уведомления/ответы жертвы в чат атакующего. Легитимная смена уже
+        # установленной привязки — ТОЛЬКО через аутентифицированный channel-link
+        # flow (services.channel_linking.consume_link → User.max_chat_id);
+        # mini-app для этого поля тоже first-set-only (см. api/routes/miniapp.py).
+        #
+        # Codex R-codex MAJOR C: АТОМАРНЫЙ conditional UPDATE, а не
+        # read/check/write — иначе две конкурентные сессии обе читают NULL и
+        # обе коммитят разные chat_id (поздний перетирает установленное). Пишем
+        # ТОЛЬКО когда в БД сейчас NULL или '' (пусто трактуем как «не задано»).
+        # rowcount игнорируем: если строка уже непустая — UPDATE не заматчит,
+        # значение сохраняется; затем refresh + возврат ТОЛЬКО персист-значения.
+        if chat_id_str:
+            session.execute(
+                sa_update(User)
+                .where(User.id == existing_user.id)
+                .where(sa_or(User.max_chat_id.is_(None), User.max_chat_id == ""))
+                .values(max_chat_id=chat_id_str)
+                .execution_options(synchronize_session=False)
+            )
             session.commit()
+            session.refresh(existing_user)
 
         assistant = (
             session.query(Assistant)
@@ -617,11 +631,11 @@ def ensure_max_user_bundle(
         return MaxOnboardingResult(
             False,
             aid,
-            # #341: возвращаем ПЕРСИСТ-значение (safe), не payload chat_id —
-            # иначе немедленный welcome ушёл бы в чат из поддельного payload.
-            # existing_user.max_chat_id уже актуализирован guard'ом выше
-            # (NULL→value применён; non-NULL сохранён).
-            existing_user.max_chat_id or chat_id_str,
+            # #341: ТОЛЬКО персист-значение (safe), НЕ payload chat_id и НЕ
+            # `... or chat_id_str` (Codex R-codex MAJOR C: `or chat_id_str`
+            # эхнул бы payload атакующего, если персист пуст). После атомарного
+            # UPDATE+refresh здесь актуальное значение из БД.
+            existing_user.max_chat_id,
             existing_user.tenant_id,
             workspace_id,
             existing_user.id,

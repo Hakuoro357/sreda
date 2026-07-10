@@ -329,6 +329,16 @@ def consume_link(
     )
     if existing_target:
         if str(existing_target) == incoming_target:
+            # #341 (Codex R-codex MAJOR D): аутентифицированный ре-линк ТОГО ЖЕ
+            # MAX-аккаунта — единственный легитимный путь обновить established
+            # max_chat_id (inbound/mini-app для установленного значения его не
+            # трогают). Обновляем chat_id, если он изменился.
+            if (
+                target_channel == "max"
+                and target_chat_id
+                and source_user.max_chat_id != str(target_chat_id)
+            ):
+                source_user.max_chat_id = str(target_chat_id)
             session.commit()
             return ConsumeOutcome(
                 success=True,

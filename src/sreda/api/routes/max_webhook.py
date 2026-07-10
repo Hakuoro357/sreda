@@ -23,7 +23,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 
 from sreda.config.settings import get_settings
 from sreda.services.max_inbound import handle_max_update
-from sreda.services.webhook_security import webhook_secret_missing_while_deployed
+from sreda.services.webhook_security import (
+    is_webhook_deployed,
+    normalized_webhook_secret,
+)
 
 
 router = APIRouter(prefix="/api/max", tags=["max"])
@@ -47,12 +50,13 @@ def _verify_max_secret(
     НЕ концепт «prod» (такого флага в коде нет).
     """
     settings = get_settings()
-    expected = settings.max_webhook_secret_token
+    # Codex R-codex MAJOR B: нормализуем secret (пробельный → отсутствует) и
+    # ветвимся на ЕДИНЫЙ дискриминатор is_webhook_deployed — как startup/health.
+    expected = normalized_webhook_secret(settings.max_webhook_secret_token)
     if not expected:
-        if webhook_secret_missing_while_deployed(
+        if is_webhook_deployed(
             bot_token=settings.max_bot_token,
             webhook_url=settings.max_webhook_url,
-            secret=expected,
         ):
             logger.error(
                 "max webhook rejected: secret не настроен, но бот развёрнут "

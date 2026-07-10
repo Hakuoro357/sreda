@@ -12,9 +12,37 @@ webhook-secret не настроен, `_verify_*_secret`-зависимости 
 Telegram: прод-вход = long-poll (webhook-роут = rollback-путь), поэтому у TG
 нет обязательного webhook. `telegram_webhook_url` (opt-in) выступает тем же
 дискриминатором: пока он не задан (long-poll deploy), TG-гейт инертен.
+
+ЕДИНЫЙ набор предикатов (Codex R-codex MAJOR B): все call-site (роуты,
+startup-гейт, health-воркер, регистрация) обязаны ветвиться на ЭТИ функции,
+а НЕ на сырую truthiness полей — иначе пробельный secret/token обходит гейт
+в одном месте и не обходит в другом (рассинхрон дискриминатора).
 """
 
 from __future__ import annotations
+
+
+def _norm(value: str | None) -> str:
+    """Нормализует конфиг-значение: None/пробельное → ''."""
+    return (value or "").strip()
+
+
+def is_webhook_deployed(*, bot_token: str | None, webhook_url: str | None) -> bool:
+    """True, если канал развёрнут в webhook-режиме: заданы (непробельно)
+    ОБА bot_token и webhook_url. ЕДИНЫЙ дискриминатор «развёрнут» для всех
+    call-site (роут/startup/health/регистрация)."""
+    return bool(_norm(bot_token)) and bool(_norm(webhook_url))
+
+
+def normalized_webhook_secret(secret: str | None) -> str:
+    """Нормализованный secret ('' если None/пробельный). Пробельный secret
+    трактуется как ОТСУТСТВУЮЩИЙ во ВСЕХ проверках/сравнениях."""
+    return _norm(secret)
+
+
+def is_webhook_secret_configured(secret: str | None) -> bool:
+    """True, если secret реально задан (непробельный)."""
+    return bool(normalized_webhook_secret(secret))
 
 
 def webhook_secret_missing_while_deployed(
@@ -30,14 +58,12 @@ def webhook_secret_missing_while_deployed(
     - secret задан (нормальный fail-closed путь сравнения), ЛИБО
     - token/url не заданы (dev/long-poll — permissive fallback сохраняется).
 
-    Значения нормализуются `.strip()`: пробельный secret не считается
-    настроенным (иначе `secret=" "` тихо отключил бы гейт), пробельные
-    token/url не считаются «развёрнуто».
+    Значения нормализуются (`.strip()`): пробельный secret не считается
+    настроенным, пробельные token/url не считаются «развёрнуто».
     """
-    bot_token = (bot_token or "").strip()
-    webhook_url = (webhook_url or "").strip()
-    secret = (secret or "").strip()
-    return bool(bot_token) and bool(webhook_url) and not secret
+    return is_webhook_deployed(
+        bot_token=bot_token, webhook_url=webhook_url
+    ) and not is_webhook_secret_configured(secret)
 
 
 def assert_webhook_secrets_configured(settings) -> None:
@@ -46,7 +72,8 @@ def assert_webhook_secrets_configured(settings) -> None:
 
     Вызывается из FastAPI lifespan ДО регистрации webhook. RuntimeError
     останавливает старт (fail-closed) — оператор обязан настроить secret
-    прежде чем принимать внешний inbound.
+    прежде чем принимать внешний inbound. Сообщение стабильно (тесты
+    матчат конкретный текст, не «любой RuntimeError»).
     """
     problems: list[str] = []
 
