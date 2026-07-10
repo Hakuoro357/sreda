@@ -1436,7 +1436,8 @@ def _prev_open_domains(messages: Any) -> set:
     # с областью). time_not_specified СОЗНАТЕЛЬНО открывает - это и есть уточняющий
     # исход инцидента («Поставь» → time_not_specified → «Во сколько?» → «В 12:30»).
     _closed_kinds = frozenset({"domain_blocked", "search_limit", "error",
-                               "source_result_required", "schema_error"})
+                               "source_result_required", "schema_error",
+                               "withdrawn"})  # R6: #316-отзыв = не исполнялся
     domains: set = set()
     for m in reversed(msgs[:-1]):
         if isinstance(m, HumanMessage):
@@ -4376,8 +4377,9 @@ async def handle_turn(
                     # #319 sticky-by-use: ПРОШЛЫЙ ход записал в память (renewal в run_tools) → серия
                     # продолжается без confirm. Consume из _pre_vals (снап ДО хода); _init выше сбросил
                     # канал — ход докажет запись заново. Граница по смыслу (факт записи), не по времени.
-                    # #338: незакрытый ход (прошлый ответ агента - вопрос) → его области
-                    # наследуются политикой (страховка только на ПЕРВОЕ сообщение входа).
+                    # #338 R5: открытый ход = write-инструмент прошлого хода исполнен
+                    # (журнал; финальный текст агента не анализируется) → policy наследует
+                    # при ответе юзера без самостоятельной темы.
                     _pod = frozenset(_prev_open_domains(_pre_vals.get("messages")))
                     _upol = compute_unified_policy(
                         user_text, _rd285(user_text),

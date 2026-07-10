@@ -268,3 +268,48 @@ def test_r5_memory_is_sticky_jurisdiction_338():
         AIMessage(content="Записала! Продолжим?"),
     ]
     assert _prev_open_domains(hist) == set()
+
+
+# ── R6-полировка (Claude NSC + MINOR): атакующий класс и границы окна ────────
+
+def test_r6_bare_imperatives_inherit_destructive_still_confirmed_338():
+    """Голые императивы без темы («удали всё», «отмени») наследуют область -
+    осмысленно: деструктив в любом случае за своим bespoke-confirm (живая
+    проверка R6: cancel_reminder/delete-класс не обходится наследованием)."""
+    for text in ("удали всё", "отмени", "сотри последнее"):
+        pol = compute_unified_policy(
+            text, route_domains(text), prev_open_domains=frozenset({"reminders"}))
+        assert "reminders" in pol["allowed_write"], text
+
+
+def test_r6_window_is_one_turn_338():
+    """Окно наследования - ОДИН ход: скан не глубже последнего HumanMessage.
+    Ход N+1 без write («спасибо» → текст) закрывает дверь для N+2."""
+    hist = _hist_incident() + [
+        HumanMessage(content="спасибо"),
+        AIMessage(content="Пожалуйста! Обращайся."),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_r6_withdrawn_result_does_not_open_338():
+    """R6 Claude MINOR: #316-отзыв (withdrawn - инструмент НЕ исполнялся) область
+    не открывает (защита от дрейфа порядка инжекта withdrawal-сообщений)."""
+    hist = [
+        HumanMessage(content="поставь напоминание про воду"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="отозвано", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "withdrawn"}),
+        AIMessage(content="Хорошо, переключаюсь. Что нужно?"),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_r6_guard_last_message_shapes_338():
+    """Защита от дрейфа call-site: последний message = HumanMessage или AIMessage
+    с tool_calls → пустой набор (механизм считает только ФИНАЛ хода агента)."""
+    hist = _hist_incident()
+    assert _prev_open_domains(hist + [HumanMessage(content="В 15")]) == set()
+    hist2 = _hist_incident()
+    hist2[-1] = AIMessage(content="", tool_calls=[{"name": "list_reminders", "args": {}, "id": "x"}])
+    assert _prev_open_domains(hist2) == set()
