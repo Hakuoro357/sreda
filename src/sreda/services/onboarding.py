@@ -587,9 +587,10 @@ def ensure_max_user_bundle(
         # (NULL/пусто → value). НЕ перезаписываем УЖЕ заданный max_chat_id из
         # inbound: поддельный payload с чужим chat_id иначе уводил бы все
         # уведомления/ответы жертвы в чат атакующего. Легитимная смена привязки
-        # идёт ТОЛЬКО через аутентифицированный channel-link flow
-        # (services.channel_linking.consume_link → User.max_chat_id), который
-        # этот guard не затрагивает.
+        # идёт ТОЛЬКО аутентифицированными путями: channel-link flow
+        # (services.channel_linking.consume_link → User.max_chat_id) ИЛИ
+        # mini-app с HMAC-валидированным initData (api/routes/miniapp.py) —
+        # оба вне inbound и этим guard'ом не затрагиваются.
         if chat_id_str and not existing_user.max_chat_id:
             existing_user.max_chat_id = chat_id_str
             session.commit()

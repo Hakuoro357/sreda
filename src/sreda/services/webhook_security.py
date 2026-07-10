@@ -29,7 +29,14 @@ def webhook_secret_missing_while_deployed(
     поддельный inbound без секрета проходит. Возвращает False, когда:
     - secret задан (нормальный fail-closed путь сравнения), ЛИБО
     - token/url не заданы (dev/long-poll — permissive fallback сохраняется).
+
+    Значения нормализуются `.strip()`: пробельный secret не считается
+    настроенным (иначе `secret=" "` тихо отключил бы гейт), пробельные
+    token/url не считаются «развёрнуто».
     """
+    bot_token = (bot_token or "").strip()
+    webhook_url = (webhook_url or "").strip()
+    secret = (secret or "").strip()
     return bool(bot_token) and bool(webhook_url) and not secret
 
 

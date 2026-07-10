@@ -107,6 +107,26 @@ def test_startup_ok_when_max_webhook_secret_present(monkeypatch, tmp_path) -> No
 # ---------------------------------------------------------------------------
 
 
+def test_startup_fails_without_telegram_webhook_secret(monkeypatch, tmp_path) -> None:
+    """TG-паритет startup-гейта: telegram_bot_token+telegram_webhook_url заданы,
+    secret пуст → запуск (lifespan) падает. В long-poll проде url не задан →
+    гейт инертен (см. test_telegram_webhook_dev_fallback_without_url)."""
+    _sqlite_env(monkeypatch, tmp_path, "tg_startup_no_secret")
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", FAKE_TG_TOKEN)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_URL", FAKE_TG_WEBHOOK_URL)
+    monkeypatch.delenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+    # MAX не задан → его ветка гейта молчит, ловим именно TG.
+    monkeypatch.delenv("SREDA_MAX_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SREDA_MAX_WEBHOOK_URL", raising=False)
+    _clear_caches()
+
+    Base.metadata.create_all(get_engine())
+
+    with pytest.raises(RuntimeError):
+        with TestClient(create_app()):
+            pass
+
+
 def test_max_webhook_rejects_when_token_url_set_but_secret_empty(
     monkeypatch, tmp_path
 ) -> None:
@@ -248,6 +268,47 @@ def test_inbound_does_not_overwrite_existing_max_chat_id(db_session) -> None:
     assert user.max_chat_id == VICTIM_OLD_CHAT_ID, (
         "inbound не должен перезаписывать существующий max_chat_id"
     )
+
+
+def test_ensure_result_max_chat_id_reflects_persisted_not_payload(db_session) -> None:
+    """#341 (R1 MAJOR): возвращаемый MaxOnboardingResult.max_chat_id — это
+    ПЕРСИСТ-значение (safe), не payload chat_id. Иначе немедленный welcome
+    (max_inbound.py, recipient=onboarding.max_chat_id) ушёл бы в чат из
+    поддельного payload. Ветка независима от DB-guard'а — фиксируем отдельно."""
+    from sreda.services.onboarding import ensure_max_user_bundle
+
+    # non-NULL → результат несёт СТАРЫЙ (victim) chat_id, не payload attacker.
+    db_session.add(Tenant(id="tenant_max_r", name="R"))
+    db_session.add(User(
+        id="user_max_r",
+        tenant_id="tenant_max_r",
+        max_account_id=VICTIM_MAX_ACCOUNT_ID,
+        max_chat_id=VICTIM_OLD_CHAT_ID,
+    ))
+    db_session.commit()
+
+    res = ensure_max_user_bundle(
+        db_session,
+        max_account_id=VICTIM_MAX_ACCOUNT_ID,
+        max_chat_id=ATTACKER_CHAT_ID,
+    )
+    assert res.max_chat_id == VICTIM_OLD_CHAT_ID, (
+        "результат должен нести персист-значение, не payload chat_id атакующего"
+    )
+
+    # NULL → результат несёт только что установленное value.
+    db_session.add(Tenant(id="tenant_max_r2", name="R2"))
+    db_session.add(User(
+        id="user_max_r2",
+        tenant_id="tenant_max_r2",
+        max_account_id="90000003",
+        max_chat_id=None,
+    ))
+    db_session.commit()
+    res2 = ensure_max_user_bundle(
+        db_session, max_account_id="90000003", max_chat_id="70000300",
+    )
+    assert res2.max_chat_id == "70000300"
 
 
 def test_inbound_populates_null_max_chat_id_but_not_overwrites(db_session) -> None:
