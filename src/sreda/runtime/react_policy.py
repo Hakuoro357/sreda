@@ -146,6 +146,10 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     for _d in sorted(prev_open_domains):
         if w_sig and route.all_domains and _d not in route.all_domains:
             continue  # новая команда в другую область = выход из хода
+        # R2 Codex high: явный READ-запрос в другую область - тоже выход
+        # («покажи задачи» при открытом reminders-ходе = смена темы, не ответ)
+        if read_cues and _d not in read_cues:
+            continue
         allowed_write.add(_d)
         continuation.append(_d)
 

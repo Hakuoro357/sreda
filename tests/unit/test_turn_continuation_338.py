@@ -181,3 +181,27 @@ def test_prev_open_list_content_aimessage_338():
     hist = _hist_incident()
     hist[-1] = AIMessage(content=[{"type": "text", "text": "Во сколько поставить его?"}])
     assert "reminders" in _prev_open_domains(hist)
+
+
+def test_r2_multi_write_domain_fail_closed_338():
+    """R2 medium: смешанный ход (add_task + schedule_reminder + вопрос) НЕ наследует
+    ничего - иначе ошибочный task-write прошёл бы без страховки."""
+    hist = [
+        HumanMessage(content="добавь задачу и поставь напоминание"),
+        AIMessage(content="", tool_calls=[{"name": "add_task", "args": {}, "id": "t1"}]),
+        ToolMessage(content="ok:created:task_1", name="add_task", tool_call_id="t1"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t2"}]),
+        ToolMessage(content="уточни время", name="schedule_reminder", tool_call_id="t2",
+                    artifact={"result_kind": "time_not_specified"}),
+        AIMessage(content="Задачу добавила. Во сколько поставить напоминание?"),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_r2_read_cue_other_domain_exits_338():
+    """R2 Codex high: явный READ-запрос в другую область («покажи задачи» при
+    открытом reminders-ходе) - смена темы, наследование закрывается."""
+    text = "покажи задачи"
+    pol = compute_unified_policy(
+        text, route_domains(text), prev_open_domains=frozenset({"reminders"}))
+    assert "reminders" not in pol["allowed_write"]

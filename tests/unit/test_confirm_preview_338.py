@@ -304,10 +304,80 @@ def test_verify_rejects_phantom_recurrence_338():
     assert not ok
 
 
-def test_unparseable_rrule_no_facts_338():
-    """R1 high M2: RRULE не очеловечивается (BYDAY-экзотика) → facts None →
-    generic-вопрос (не рискуем переврать договор)."""
+def test_weekly_byday_pair_rendered_338():
+    """R2 high: WEEKLY;BYDAY=TU,TH рендерится полностью («по вторникам и четвергам»)."""
     f = confirm_facts("schedule_reminder",
                       {"title": "кружок", "trigger_iso": _TRIGGER,
                        "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU,TH"})
-    assert f is None
+    assert f is not None
+    assert f.recurrence_human == "по вторникам и четвергам"
+
+
+# ── R2-фиксы (Codex medium): полнота RRULE, отрицание, дни недели, ID ────────
+
+def test_r2_rrule_byday_rendered_fully_338():
+    """FREQ=WEEKLY;BYDAY=MO;COUNT=5 раньше рендерился «каждую неделю, всего 5 раз»,
+    СКРЫВАЯ понедельник → теперь понедельник ЯВНО в договоре (R2 high: рендерить,
+    не прятать за generic)."""
+    f = confirm_facts("schedule_reminder",
+                      {"title": "кружок", "trigger_iso": _TRIGGER,
+                       "recurrence_rule": "FREQ=WEEKLY;BYDAY=MO;COUNT=5"})
+    assert f is not None
+    assert f.recurrence_human == "по понедельникам, всего 5 раз"
+
+
+def test_r2_rrule_exotic_still_none_338():
+    """Неочеловечиваемая экзотика (BYMONTHDAY / BYDAY при DAILY) → None (generic)."""
+    assert confirm_facts("schedule_reminder",
+                         {"title": "x", "trigger_iso": _TRIGGER,
+                          "recurrence_rule": "FREQ=MONTHLY;BYMONTHDAY=15"}) is None
+    assert confirm_facts("schedule_reminder",
+                         {"title": "x", "trigger_iso": _TRIGGER,
+                          "recurrence_rule": "FREQ=DAILY;BYDAY=MO"}) is None
+
+
+def test_r2_verify_requires_full_recurrence_phrase_338():
+    """«каждый час» без «всего 5 раз» при COUNT=5 - юзер подтвердил бы бесконечную
+    серию как пять раз → режется."""
+    f = confirm_facts("schedule_reminder",
+                      {"title": "пить воду", "trigger_iso": _TRIGGER,
+                       "recurrence_rule": "FREQ=HOURLY;COUNT=5"})
+    ok = verify_confirm_text(
+        "Ставлю напоминание «пить воду» завтра в 15:00, повтор каждый час. Подтверждаешь?",
+        f, now=_NOW)
+    assert not ok
+
+
+def test_r2_verify_rejects_negation_338():
+    """«Не ставлю напоминание …» проходило (маркер-существительное) → отрицание режется."""
+    ok = verify_confirm_text(
+        "Не ставлю напоминание «выписка лекарств» завтра в 15:00. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_r2_verify_rejects_wrong_weekday_338():
+    """«завтра, в среду» при факте-вторнике - день недели сверяется."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание «выписка лекарств» завтра, в среду, в 15:00. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_r2_verify_rejects_short_latin_338():
+    """«ID 18» - латиница из 2 символов + число, совпавшее с днём → режется."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание «выписка лекарств» (ID 18) завтра в 15:00. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_r2_generic_mentions_recurrence_338():
+    """Неочеловечиваемый RRULE → generic-вопрос ОБЯЗАН сказать «повторяющееся»."""
+    q = generic_action_question(
+        "schedule_reminder",
+        {"title": "кружок", "trigger_iso": _TRIGGER,
+         "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU,TH"})
+    assert "повторяющ" in q
+    assert "кружок" in q
+    assert "BYDAY" not in q

@@ -1465,6 +1465,11 @@ def _prev_open_domains(messages: Any) -> set:
             # а memory-write и так идёт через confirm/sticky #319.
             domains |= set(tool_write_domains(name))
     domains.discard("web")  # web не наследуем: не user-data, страховки не касается
+    # R2 medium: смешанный ход (add_task + schedule_reminder + вопрос) открывал бы ОБА
+    # домена - ошибочный task-write прошёл бы без страховки. Вопрос агента относится
+    # к одной теме → >1 write-домена = неоднозначно = fail-closed (не наследуем).
+    if len(domains) > 1:
+        return set()
     return domains
 
 

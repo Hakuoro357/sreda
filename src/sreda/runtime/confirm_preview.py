@@ -54,9 +54,28 @@ def _recurrence_ru(rrule: str) -> str | None:
     if not r:
         return ""
     parts = dict(p.split("=", 1) for p in r.split(";") if "=" in p)
+    # R2 medium: ТОЛЬКО полностью очеловечиваемые комбинации. FREQ=WEEKLY;BYDAY=MO;COUNT=5
+    # раньше рендерился «каждую неделю, всего 5 раз», СКРЫВАЯ понедельник - юзер
+    # подтверждал не тот договор. Любой ключ вне {FREQ,BYDAY}+{COUNT|UNTIL} → None (generic).
+    if set(parts) - {"FREQ", "BYDAY", "COUNT", "UNTIL"}:
+        return None
+    if "COUNT" in parts and "UNTIL" in parts:
+        return None
     base = _FREQ_RU.get(parts.get("FREQ", ""))
     if base is None:
         return None
+    # R2 Codex high: BYDAY рендерим ЯВНО (не прячем за generic) - но только для WEEKLY
+    # и только известные дни; иначе None (не рискуем переврать расписание).
+    if "BYDAY" in parts:
+        if parts.get("FREQ") != "WEEKLY":
+            return None
+        _by = {"MO": "понедельникам", "TU": "вторникам", "WE": "средам", "TH": "четвергам",
+               "FR": "пятницам", "SA": "субботам", "SU": "воскресеньям"}
+        try:
+            days_ru = [_by[d.strip()] for d in parts["BYDAY"].split(",")]
+        except KeyError:
+            return None
+        base = "по " + " и ".join(days_ru)
     if "COUNT" in parts:
         try:
             n = int(parts["COUNT"])
@@ -70,8 +89,6 @@ def _recurrence_ru(rrule: str) -> str | None:
         except ValueError:
             return None
         return f"{base} до {u.day} {_MONTHS_RU[u.month - 1]} {u.hour}:{u.minute:02d}"
-    if len(parts) > 1:  # BYDAY и прочее не рендерим - не рискуем переврать
-        return None
     return base
 
 
@@ -204,6 +221,10 @@ def generic_action_question(tool_name: str, kwargs: dict) -> str:
     """Человеческий вопрос подтверждения для инструмента БЕЗ факт-рендера.
     БИБЛИЯ (g-075): без имени инструмента, без сырых аргументов, без ISO."""
     action = _ACTIONS_RU.get(tool_name)
+    # R2 medium: неочеловечиваемый RRULE уходит generic-путём - но юзер ОБЯЗАН
+    # знать, что подтверждает СЕРИЮ, не разовое (иначе «да» исполнит скрытый повтор)
+    if action and str(kwargs.get("recurrence_rule") or "").strip():
+        action = f"{action} (повторяющееся)"
     obj = _object_from_kwargs(kwargs)
     if action and obj:
         return f"Хочу {action} «{obj}». Подтверждаешь?"
@@ -238,7 +259,7 @@ def build_mouth_prompt(facts: ConfirmFacts, *, now: datetime) -> tuple[str, str]
 
 
 _TECH_RE = re.compile(
-    r"[a-z_]{3,}|"                # латиница подряд (имена инструментов/полей)
+    r"[a-z_]{2,}|"                # латиница подряд от 2 (R2: «ID 18»; title исключён до скана)
     r"\d{4}-\d{2}-\d{2}|"         # ISO-дата
     r"trigger_iso|title=|=",      # сырые аргументы
     re.IGNORECASE)
@@ -261,8 +282,13 @@ def _phrase_in(phrase: str, text: str) -> bool:
 # R1 medium MAJOR-4: маркеры ДЕЙСТВИЯ - «Отменяю «X»…» не должно проходить
 # договором «поставить». Хотя бы один маркер соответствующего действия.
 _ACTION_MARKERS = {
-    "поставить напоминание": ("ставлю", "поставлю", "напомню", "поставить", "напоминание"),
+    # R2 medium: только однозначные ПОЛОЖИТЕЛЬНЫЕ глаголы (существительное
+    # «напоминание» матчилось в «Не ставлю напоминание…»/«Отменяю напоминание…»)
+    "поставить напоминание": ("ставлю", "поставлю", "напомню"),
 }
+# отрицание/отмена рядом с действием = не тот договор
+_NEGATION_RE = re.compile(
+    r"(?:^|[^а-яёa-z])не\s+(?:став|буд|поставл|напомн)|отмен", re.IGNORECASE)
 # все словесные часовые формулировки (для отлова вранья «в четыре вечера» при 15:00)
 _ANY_WORD_HOUR_RE = re.compile(
     r"\bв\s+(?:час|" + "|".join(w for h, w in _HOUR_WORDS.items() if h != 1) +
@@ -286,14 +312,18 @@ def verify_confirm_text(text: str, facts: ConfirmFacts, *, now: datetime) -> boo
     if _TECH_RE.search(rest):
         return False
     lower_rest = rest.lower()
-    # R1 medium MAJOR-4: действие
+    # R1 medium MAJOR-4 + R2: действие положительным глаголом, отрицание/отмена - враньё
     markers = _ACTION_MARKERS.get(facts.action, ())
-    if markers and not any(mk in lower_rest for mk in markers):
+    if markers and not any(_phrase_in(mk, lower_rest) for mk in markers):
+        return False
+    if _NEGATION_RE.search(lower_rest):
         return False
     # R1 оба Codex: повтор в фактах → обязан быть в тексте (и наоборот - слово
     # «повтор»/«кажд» без факта повтора = враньё)
     if facts.recurrence_human:
-        if facts.recurrence_human.split(",")[0] not in lower_rest:
+        # R2 medium: ВСЯ фраза повтора дословно (раньше split(",")[0] пропускал
+        # фразу без «всего 5 раз» - юзер подтверждал бесконечную серию как 5 раз)
+        if facts.recurrence_human not in lower_rest:
             return False
     elif re.search(r"повтор|кажд", lower_rest):
         return False
@@ -309,6 +339,10 @@ def verify_confirm_text(text: str, facts: ConfirmFacts, *, now: datetime) -> boo
     # относительные дни вне допустимых - враньё («завтра, то есть послезавтра»)
     for rel in ("сегодня", "завтра", "послезавтра"):
         if _phrase_in(rel, lower_rest) and rel not in days:
+            return False
+    # R2 medium: дни недели вне допустимых («в среду» при факте-вторнике)
+    for wd in _WEEKDAYS_RU_LOC:
+        if wd in lower_rest and wd not in days:
             return False
     # словесные часы вне допустимых («в четыре вечера» при факте 15:00) - R1 high
     for m in _ANY_WORD_HOUR_RE.finditer(lower_rest):
