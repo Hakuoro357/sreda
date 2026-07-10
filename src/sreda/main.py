@@ -158,8 +158,25 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(connect_router)
     app.include_router(miniapp_router)
-    app.include_router(telegram_router)
-    app.include_router(max_router)
+    # #341 (F1, CRITICAL): webhook-ingest роуты монтируются ТОЛЬКО когда канал
+    # реально в webhook-режиме (is_webhook_deployed = bot_token+webhook_url для
+    # ЭТОГО канала). На long-poll (webhook_url пуст) роутер НЕ монтируется →
+    # внешний POST на /webhooks/telegram/* или /api/max/webhook даёт 404, а не
+    # dev-fallback accept поддельного inbound. TG и MAX — независимо. Включение
+    # webhook-режима (задать *_webhook_url) возвращает роут + активный route-гейт.
+    # Long-poll-обработка идёт мимо HTTP (handle_*_update из воркера), health
+    # читает app.state, не роут — внутренние потребители не задеты.
+    from sreda.services.webhook_security import is_webhook_deployed as _iwd
+    if _iwd(
+        bot_token=settings.telegram_bot_token,
+        webhook_url=settings.telegram_webhook_url,
+    ):
+        app.include_router(telegram_router)
+    if _iwd(
+        bot_token=settings.max_bot_token,
+        webhook_url=settings.max_webhook_url,
+    ):
+        app.include_router(max_router)
     app.include_router(approvals_router)
     feature_registry.register_api(app)
     app.state.feature_registry = feature_registry

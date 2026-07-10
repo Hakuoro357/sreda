@@ -416,14 +416,23 @@ def _require_miniapp_auth(
             if max_user.max_chat_id:
                 try:
                     from sreda.db.models.core import User
-                    user_row = session.get(User, user_id)
-                    if user_row is not None and not (user_row.max_chat_id or "").strip():
-                        logger.info(
-                            "miniapp auth: first-set max_chat_id user=%s new=%s",
-                            user_id, max_user.max_chat_id,
-                        )
-                        user_row.max_chat_id = max_user.max_chat_id
-                        session.commit()
+                    from sqlalchemy import or_ as _or, update as _update
+                    # #341 (R-final MINOR): атомарный conditional first-set —
+                    # зеркалит онбординг (пишем ТОЛЬКО когда сейчас NULL/'').
+                    # read-then-write здесь не эксплуатируем (значение из
+                    # HMAC-initData того же юзера), но держим инвариант единым.
+                    logger.info(
+                        "miniapp auth: first-set max_chat_id (if unset) user=%s",
+                        user_id,
+                    )
+                    session.execute(
+                        _update(User)
+                        .where(User.id == user_id)
+                        .where(_or(User.max_chat_id.is_(None), User.max_chat_id == ""))
+                        .values(max_chat_id=max_user.max_chat_id)
+                        .execution_options(synchronize_session=False)
+                    )
+                    session.commit()
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "miniapp auth: max_chat_id first-set failed user=%s",

@@ -432,37 +432,113 @@ def test_forged_telegram_webhook_rejected(monkeypatch, tmp_path) -> None:
         session.close()
 
 
-def test_telegram_webhook_dev_fallback_without_url(monkeypatch, tmp_path) -> None:
-    """Регрессия: bot_token задан, но webhook_url НЕ задан (long-poll deploy) →
-    dev-fallback сохраняется, TG-webhook принимает без секрета (не 401 от гейта)."""
-    _sqlite_env(monkeypatch, tmp_path, "tg_longpoll_fallback")
+# ---------------------------------------------------------------------------
+# Субагент R3 MAJOR — условный монтаж webhook-роутов (long-poll → НЕ смонтирован)
+# ---------------------------------------------------------------------------
+
+
+def test_webhook_routes_not_mounted_in_longpoll(monkeypatch, tmp_path) -> None:
+    """bot_token задан, webhook_url НЕ задан (long-poll) → webhook-роутеры НЕ
+    смонтированы: /webhooks/telegram/* и /api/max/webhook дают 404, а не
+    dev-fallback accept поддельного inbound."""
+    _sqlite_env(monkeypatch, tmp_path, "longpoll_no_mount")
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", FAKE_TG_TOKEN)
+    monkeypatch.setenv("SREDA_MAX_BOT_TOKEN", FAKE_MAX_TOKEN)
     monkeypatch.delenv("SREDA_TELEGRAM_WEBHOOK_URL", raising=False)
-    monkeypatch.delenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+    monkeypatch.delenv("SREDA_MAX_WEBHOOK_URL", raising=False)
     _clear_caches()
 
     Base.metadata.create_all(get_engine())
 
-    called: list[bool] = []
+    tg_called: list[bool] = []
+    max_called: list[bool] = []
 
-    async def _spy_handle(*a, **kw):
-        called.append(True)
-        return "in_ok"
+    async def _spy_tg(*a, **kw):
+        tg_called.append(True)
+        return "in_x"
+
+    async def _spy_max(*a, **kw):
+        max_called.append(True)
+        return "in_x"
 
     monkeypatch.setattr(
-        "sreda.api.routes.telegram_webhook.handle_telegram_update", _spy_handle
+        "sreda.api.routes.telegram_webhook.handle_telegram_update", _spy_tg
+    )
+    monkeypatch.setattr(
+        "sreda.api.routes.max_webhook.handle_max_update", _spy_max
     )
 
-    client = TestClient(create_app())
-    resp = client.post(
+    app = create_app()
+    paths = set(app.openapi()["paths"].keys())
+    assert "/webhooks/telegram/{bot_key}" not in paths
+    assert "/api/max/webhook" not in paths
+
+    client = TestClient(app)
+    tg = client.post(
         "/webhooks/telegram/sreda",
         json={"update_id": 2, "message": {"message_id": 2,
               "chat": {"id": 123, "type": "private"}, "text": "hi"}},
     )
+    mx = client.post("/api/max/webhook", json={"update_type": "message_created"})
 
-    # Гейт НЕ должен отклонить (webhook_url не задан) — доходит до handler.
-    assert resp.status_code == 202
-    assert called == [True]
+    assert tg.status_code == 404
+    assert mx.status_code == 404
+    assert tg_called == [] and max_called == []
+
+
+def test_webhook_routes_mounted_in_webhook_mode(monkeypatch, tmp_path) -> None:
+    """token+url заданы (webhook-режим) → роутеры смонтированы и гейтят
+    (без секрета — 401, не 404)."""
+    _sqlite_env(monkeypatch, tmp_path, "webhook_mounted")
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", FAKE_TG_TOKEN)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_URL", FAKE_TG_WEBHOOK_URL)
+    monkeypatch.setenv("SREDA_MAX_BOT_TOKEN", FAKE_MAX_TOKEN)
+    monkeypatch.setenv("SREDA_MAX_WEBHOOK_URL", FAKE_MAX_WEBHOOK_URL)
+    monkeypatch.delenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
+    monkeypatch.delenv("SREDA_MAX_WEBHOOK_SECRET_TOKEN", raising=False)
+    _clear_caches()
+
+    Base.metadata.create_all(get_engine())
+
+    app = create_app()
+    paths = set(app.openapi()["paths"].keys())
+    assert "/webhooks/telegram/{bot_key}" in paths
+    assert "/api/max/webhook" in paths
+
+    client = TestClient(app)
+    # Смонтированы, но deployed+no-secret → route-гейт 401 (не 404, не accept).
+    assert client.post(
+        "/webhooks/telegram/sreda",
+        json={"update_id": 2, "message": {"message_id": 2,
+              "chat": {"id": 123, "type": "private"}, "text": "hi"}},
+    ).status_code == 401
+    assert client.post(
+        "/api/max/webhook", json={"update_type": "message_created"},
+    ).status_code == 401
+
+
+def test_max_webhook_route_not_mounted_without_url(monkeypatch, tmp_path) -> None:
+    """MAX независимо: max_bot_token задан, max_webhook_url нет → /api/max/webhook
+    не смонтирован (404), даже если TG в webhook-режиме."""
+    _sqlite_env(monkeypatch, tmp_path, "max_no_mount")
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", FAKE_TG_TOKEN)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_URL", FAKE_TG_WEBHOOK_URL)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", FAKE_TG_TOKEN)
+    monkeypatch.setenv("SREDA_MAX_BOT_TOKEN", FAKE_MAX_TOKEN)
+    monkeypatch.delenv("SREDA_MAX_WEBHOOK_URL", raising=False)
+    _clear_caches()
+
+    Base.metadata.create_all(get_engine())
+
+    app = create_app()
+    paths = set(app.openapi()["paths"].keys())
+    assert "/api/max/webhook" not in paths
+    assert "/webhooks/telegram/{bot_key}" in paths  # TG независимо смонтирован
+
+    client = TestClient(app)
+    assert client.post(
+        "/api/max/webhook", json={"update_type": "message_created"},
+    ).status_code == 404
 
 
 # ---------------------------------------------------------------------------
