@@ -1396,6 +1396,37 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
     return out
 
 
+def _prev_open_domains(messages: Any) -> set:
+    """#338: области инструментов ПРОШЛОГО хода агента, если он закончился ВОПРОСОМ
+    (незакрытый ход - агент сам запросил продолжение: «Во сколько поставить его?»).
+    Ответ юзера на такой вопрос = продолжение хода, не новый вход → policy наследует
+    эти области в ярус (а) (владелец 2026-07-10, инцидент 755682022: «В 15» после
+    нашего вопроса получал кандидат-confirm с сырым schedule_reminder(...)).
+
+    Детект детерминированный: финальная реплика агента (последний AIMessage с текстом,
+    без tool_calls) оканчивается «?» → собрать домены исполненных ToolMessage этого же
+    хода (до предыдущего HumanMessage). Иначе (ход закрыт/вопроса нет/истории нет) → ∅."""
+    msgs = list(messages or [])
+    if not msgs:
+        return set()
+    last = msgs[-1]
+    if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
+        return set()
+    text = (last.content if isinstance(last.content, str) else str(last.content or "")).strip()
+    if not text.endswith("?"):
+        return set()
+    from sreda.services.tool_schemas.families import tool_read_domains, tool_write_domains
+    domains: set = set()
+    for m in reversed(msgs[:-1]):
+        if isinstance(m, HumanMessage):
+            break  # начало этого хода
+        if isinstance(m, ToolMessage) and getattr(m, "name", None):
+            name = _TOOL_NAME_ALIASES.get(m.name, m.name)
+            domains |= set(tool_write_domains(name)) | set(tool_read_domains(name))
+    domains.discard("web")  # web не наследуем: не user-data, страховки не касается
+    return domains
+
+
 def _generic_confirm_wrap(inner: Any) -> Any:
     """#285 B2b-2: универсальный confirm для КАНДИДАТА (write без детерминированного сигнала, ярус б).
     Как `_confirm_wrap`, но превью GENERIC — имя+сырые args, БЕЗ чтения БД (пилляр: превью не читает
@@ -4232,9 +4263,13 @@ async def handle_turn(
                     # #319 sticky-by-use: ПРОШЛЫЙ ход записал в память (renewal в run_tools) → серия
                     # продолжается без confirm. Consume из _pre_vals (снап ДО хода); _init выше сбросил
                     # канал — ход докажет запись заново. Граница по смыслу (факт записи), не по времени.
+                    # #338: незакрытый ход (прошлый ответ агента - вопрос) → его области
+                    # наследуются политикой (страховка только на ПЕРВОЕ сообщение входа).
+                    _pod = frozenset(_prev_open_domains(_pre_vals.get("messages")))
                     _upol = compute_unified_policy(
                         user_text, _rd285(user_text),
-                        sticky_memory_write=bool(_pre_vals.get("sticky_memory_write")))
+                        sticky_memory_write=bool(_pre_vals.get("sticky_memory_write")),
+                        prev_open_domains=_pod)
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}

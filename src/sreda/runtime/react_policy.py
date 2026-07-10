@@ -81,7 +81,8 @@ POLICY_VERSION_B2 = 2
 
 
 def compute_unified_policy(text, route, classified=None, *, base_web=True,
-                           sticky_memory_write=False):
+                           sticky_memory_write=False,
+                           prev_open_domains=frozenset()):
     """Двухъярусная политика единого пути (execute). Чистая; поведение прода не трогает (проводка — B2b).
 
     text: текст хода. route: RouteResult из route_domains(text). classified: DomainClassResult|None
@@ -131,6 +132,23 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
             allowed_write.add("memory")
             sticky_applied = True
 
+    # #338: страховка - только на ПЕРВОЕ сообщение входа в ход (владелец 2026-07-10).
+    # prev_open_domains = области инструментов ПРОШЛОГО хода агента, ЕСЛИ он закончился
+    # ВОПРОСОМ (детект - _prev_open_domains в react_loop). Ответ юзера на НАШ вопрос =
+    # продолжение хода → область в ярус (а) без кандидат-confirm (инцидент 755682022:
+    # «Во сколько поставить?» → «В 15» → сырой confirm). Отличие от sticky-memory (#319):
+    # гейт сильнее (агент САМ запросил продолжение вопросом), поэтому наследование
+    # переживает и безглагольный ответ («В 15»), и голую команду без домена («Поставь») -
+    # контракт «нет домена → кандидат» НЕ ломается, он про ходы БЕЗ открытого вопроса.
+    # Выход из хода: явная команда в ДРУГУЮ область (w_sig + route дал домены, наследуемой
+    # среди них нет) → страховка как на новый вход.
+    continuation: list = []
+    for _d in sorted(prev_open_domains):
+        if w_sig and route.all_domains and _d not in route.all_domains:
+            continue  # новая команда в другую область = выход из хода
+        allowed_write.add(_d)
+        continuation.append(_d)
+
     allowed_read: set[str] = set()
     if base_web:
         allowed_read.add("web")
@@ -144,5 +162,6 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         "allowed_write": sorted(allowed_write),   # ярус (а): прямой write без confirm
         "confirm_write": True,                    # ярус (б): write вне allowed_write → кандидат+confirm (B2b)
         "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues),
-                    "sticky_memory": sticky_applied},
+                    "sticky_memory": sticky_applied,
+                    "turn_continuation": continuation},  # #338: наблюдаемость наследования
     }
