@@ -39,6 +39,40 @@ class ConfirmFacts:
     action: str            # человеческое действие («поставить напоминание»)
     object_title: str      # название объекта (дословно в тексте)
     when_local: datetime | None  # момент (None - действию время не нужно)
+    recurrence_human: str = ""   # человеческое «каждый час [до 20:00 / 5 раз]»; "" = разовое
+
+
+_FREQ_RU = {"HOURLY": "каждый час", "DAILY": "каждый день",
+            "WEEKLY": "каждую неделю", "MONTHLY": "каждый месяц"}
+
+
+def _recurrence_ru(rrule: str) -> str | None:
+    """RRULE → человеческая фраза повтора. Не смогли безопасно очеловечить →
+    None (R1 Codex high: подтверждение НЕ должно скрывать/перевирать повтор -
+    лучше generic-вопрос, чем неверный договор)."""
+    r = (rrule or "").strip().upper()
+    if not r:
+        return ""
+    parts = dict(p.split("=", 1) for p in r.split(";") if "=" in p)
+    base = _FREQ_RU.get(parts.get("FREQ", ""))
+    if base is None:
+        return None
+    if "COUNT" in parts:
+        try:
+            n = int(parts["COUNT"])
+        except ValueError:
+            return None
+        return f"{base}, всего {n} раз"
+    if "UNTIL" in parts:
+        try:
+            u = datetime.strptime(parts["UNTIL"], "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=ZoneInfo("UTC")).astimezone(_MSK)
+        except ValueError:
+            return None
+        return f"{base} до {u.day} {_MONTHS_RU[u.month - 1]} {u.hour}:{u.minute:02d}"
+    if len(parts) > 1:  # BYDAY и прочее не рендерим - не рискуем переврать
+        return None
+    return base
 
 
 def confirm_facts(tool_name: str, kwargs: dict) -> ConfirmFacts | None:
@@ -55,9 +89,13 @@ def confirm_facts(tool_name: str, kwargs: dict) -> ConfirmFacts | None:
             return None
         if when.tzinfo is None:
             when = when.replace(tzinfo=ZoneInfo("UTC"))
+        rec = _recurrence_ru(str(kwargs.get("recurrence_rule") or ""))
+        if rec is None:  # повтор есть, но очеловечить не смогли → generic (не врать)
+            return None
         return ConfirmFacts(action="поставить напоминание",
                             object_title=title,
-                            when_local=when.astimezone(_MSK))
+                            when_local=when.astimezone(_MSK),
+                            recurrence_human=rec)
     return None
 
 
@@ -102,7 +140,11 @@ def allowed_time_phrases(when: datetime) -> list[str]:
             else:
                 hour_noun = "часа" if h12 in (2, 3, 4) else "часов"
                 out.append(f"в {word} {hour_noun} {part}")
-                out.append(f"в {word} {part}")  # разговорное «в три дня» опускаем? нет: «в три дня» двусмысленно
+                # R1 MAJOR-4: короткая форма «в {слово} {часть суток}» двусмысленна
+                # ТОЛЬКО для «дня» («в три дня» = «через три дня») - её не допускаем;
+                # «в девять утра» / «в семь вечера» - обычная речь, оставляем.
+                if part != "дня":
+                    out.append(f"в {word} {part}")
     return out
 
 
@@ -115,7 +157,10 @@ def fallback_template(facts: ConfirmFacts, *, now: datetime) -> str:
         w = facts.when_local
         day = f"{w.day} {_MONTHS_RU[w.month - 1]}"
         t = f"в {w.hour}:{w.minute:02d}"
-        return (f"Ставлю напоминание «{facts.object_title}» {day} {t}. "
+        # R1 оба Codex: повтор ОБЯЗАН быть в договоре - иначе юзер подтверждает
+        # разовое, а получает серию
+        rec = f", повтор {facts.recurrence_human}" if facts.recurrence_human else ""
+        return (f"Ставлю напоминание «{facts.object_title}» {day} {t}{rec}. "
                 f"Подтверждаешь?")
     return f"Сделать: {facts.action} «{facts.object_title}»?"
 
@@ -125,6 +170,7 @@ def fallback_template(facts: ConfirmFacts, *, now: datetime) -> str:
 # аргументов (title/name), дословно в кавычках. Реестр пополняется по мере
 # появления инструментов в candidate-потоке (канарейка покажет).
 _ACTIONS_RU = {
+    "schedule_reminder": "поставить напоминание",  # R1 MINOR-8: фолбэк при кривых аргументах
     "add_task": "добавить задачу",
     "complete_task": "отметить задачу выполненной",
     "add_checklist_items": "добавить в список",
@@ -181,9 +227,11 @@ def build_mouth_prompt(facts: ConfirmFacts, *, now: datetime) -> tuple[str, str]
     if facts.when_local is not None:
         days = " / ".join(allowed_day_phrases(facts.when_local, now=now))
         times = " / ".join(allowed_time_phrases(facts.when_local))
+        rec = (f" Повторение (вставь ДОСЛОВНО): {facts.recurrence_human}."
+               if facts.recurrence_human else "")
         user = (f"Действие: {facts.action}. Название: «{facts.object_title}». "
                 f"Допустимые формулировки дня: {days}. "
-                f"Допустимые формулировки времени: {times}.")
+                f"Допустимые формулировки времени: {times}.{rec}")
     else:
         user = f"Действие: {facts.action}. Название: «{facts.object_title}»."
     return system, user
@@ -197,36 +245,90 @@ _TECH_RE = re.compile(
 _ANY_DATE_RE = re.compile(r"\b(\d{1,2})\s+(январ|феврал|март|апрел|ма[яе]|июн|июл|"
                           r"август|сентябр|октябр|ноябр|декабр)")
 _ANY_TIME_RE = re.compile(r"\b(\d{1,2})[:.](\d{2})\b")
+# R1 MAJOR-3: месяц из стема (позиция в _ANY_DATE_RE) - для сверки посторонней даты
+_MONTH_STEM_NUM = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "мая": 5, "мае": 5,
+                   "июн": 6, "июл": 7, "август": 8, "сентябр": 9, "октябр": 10,
+                   "ноябр": 11, "декабр": 12}
+
+
+def _phrase_in(phrase: str, text: str) -> bool:
+    """Вхождение по ГРАНИЦАМ СЛОВА (R1 MAJOR-3): «завтра» не должна матчиться
+    внутри «послезавтра» - иначе верификатор пропускает перевранный день."""
+    return re.search(rf"(?<![а-яёa-z0-9]){re.escape(phrase)}(?![а-яёa-z0-9])",
+                     text, re.IGNORECASE) is not None
+
+
+# R1 medium MAJOR-4: маркеры ДЕЙСТВИЯ - «Отменяю «X»…» не должно проходить
+# договором «поставить». Хотя бы один маркер соответствующего действия.
+_ACTION_MARKERS = {
+    "поставить напоминание": ("ставлю", "поставлю", "напомню", "поставить", "напоминание"),
+}
+# все словесные часовые формулировки (для отлова вранья «в четыре вечера» при 15:00)
+_ANY_WORD_HOUR_RE = re.compile(
+    r"\bв\s+(?:час|" + "|".join(w for h, w in _HOUR_WORDS.items() if h != 1) +
+    r")(?:\s+час(?:а|ов))?\s+(?:утра|дня|вечера|ночи)\b")
 
 
 def verify_confirm_text(text: str, facts: ConfirmFacts, *, now: datetime) -> bool:
     """Железная проверка фразы «рта» перед отправкой юзеру.
-    Требования: название дословно; ровно допустимые день и время (если у действия
-    есть момент); вопрос подтверждения; НИКАКОЙ технической начинки; нет посторонних
-    дат/времён (рот не имеет права называть числа, которых нет в фактах)."""
+    Требования: «название» дословно в кавычках; маркер ДЕЙСТВИЯ; допустимые день и
+    время (по границам слова); повтор упомянут, если он есть; вопрос подтверждения;
+    НИКАКОЙ технической начинки; никаких посторонних дат/времён/чисел."""
     t = (text or "").strip()
     if not t or not t.rstrip().endswith("?"):
         return False
-    if _TECH_RE.search(t):
+    # R1 high/medium MINOR: точное «название» в кавычках обязательно; его же
+    # ИСКЛЮЧАЕМ из tech-скана и число-скана (легитимные «Zoom с командой», «3 таблетки»)
+    quoted = f"«{facts.object_title}»"
+    if quoted not in t:
         return False
-    if facts.object_title not in t:
+    rest = t.replace(quoted, " ")
+    if _TECH_RE.search(rest):
+        return False
+    lower_rest = rest.lower()
+    # R1 medium MAJOR-4: действие
+    markers = _ACTION_MARKERS.get(facts.action, ())
+    if markers and not any(mk in lower_rest for mk in markers):
+        return False
+    # R1 оба Codex: повтор в фактах → обязан быть в тексте (и наоборот - слово
+    # «повтор»/«кажд» без факта повтора = враньё)
+    if facts.recurrence_human:
+        if facts.recurrence_human.split(",")[0] not in lower_rest:
+            return False
+    elif re.search(r"повтор|кажд", lower_rest):
         return False
     if facts.when_local is None:
         return True
-    lower = t.lower()
     days = allowed_day_phrases(facts.when_local, now=now)
     times = allowed_time_phrases(facts.when_local)
-    if not any(d in lower for d in days):
+    # R1 MAJOR-3: по границам слова («послезавтра» не матчит «завтра»)
+    if not any(_phrase_in(d, lower_rest) for d in days):
         return False
-    if not any(x in lower for x in times):
+    if not any(_phrase_in(x, lower_rest) for x in times):
         return False
-    # посторонние даты: любое «D <месяц>» вне допустимого дня
-    w = facts.when_local
-    for m in _ANY_DATE_RE.finditer(lower):
-        if int(m.group(1)) != w.day:
+    # относительные дни вне допустимых - враньё («завтра, то есть послезавтра»)
+    for rel in ("сегодня", "завтра", "послезавтра"):
+        if _phrase_in(rel, lower_rest) and rel not in days:
             return False
-    # посторонние времена: любое HH:MM, отличное от факта
-    for m in _ANY_TIME_RE.finditer(lower):
+    # словесные часы вне допустимых («в четыре вечера» при факте 15:00) - R1 high
+    for m in _ANY_WORD_HOUR_RE.finditer(lower_rest):
+        if not any(_phrase_in(x, m.group(0)) or m.group(0) in x for x in times):
+            return False
+    # посторонние даты: «D <месяц>» вне допустимого дня И месяца (R1 MAJOR-3: месяц!)
+    w = facts.when_local
+    for m in _ANY_DATE_RE.finditer(lower_rest):
+        if int(m.group(1)) != w.day or _MONTH_STEM_NUM.get(m.group(2)) != w.month:
+            return False
+    # посторонние времена HH:MM
+    for m in _ANY_TIME_RE.finditer(lower_rest):
         if int(m.group(1)) != w.hour or int(m.group(2)) != w.minute:
+            return False
+    # любые прочие числа вне разрешённого набора (день/час/минуты/count) - враньё
+    # класса «ID 42» (R1 high) или чужое число
+    _allowed_nums = {str(w.day), str(w.hour), f"{w.minute:02d}", str(w.minute)}
+    if facts.recurrence_human:
+        _allowed_nums |= set(re.findall(r"\d+", facts.recurrence_human))
+    for num in re.findall(r"\d+", lower_rest):
+        if num not in _allowed_nums:
             return False
     return True

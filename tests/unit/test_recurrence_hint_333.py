@@ -83,3 +83,51 @@ def test_spec_examples_include_hourly_333():
     """Примеры-триггеры содержат почасовой кейс (инцидентная форма)."""
     examples = " ".join(SCHEDULE_REMINDER_SPEC.trigger_examples)
     assert "каждый час" in examples
+
+
+# ── R1 оба Codex (блокер): bespoke ReAct-инструмент умеет recurrence_rule ────
+
+def _schedule_tool(db_session, u):
+    from sreda.runtime.react_loop import build_slice_tools
+    tools = build_slice_tools(db_session, u.tenant_id, u.user_id)
+    return next(t for t in tools if t.name == "schedule_reminder")
+
+
+def test_bespoke_schedule_reminder_has_recurrence_in_schema_333(db_session):
+    """Схема инструмента (то, что видит модель) содержит recurrence_rule -
+    до фикса хинт велел передавать аргумент ВНЕ схемы (блокер R1)."""
+    from tests.unit.conftest import seed_telegram_user
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    tool = _schedule_tool(db_session, u)
+    assert "recurrence_rule" in tool.args
+
+
+def test_bespoke_schedule_reminder_persists_rrule_333(db_session):
+    """Интеграция (R1 medium M1): вызов с FREQ=HOURLY → строка в БД с recurrence_rule."""
+    from tests.unit.conftest import seed_telegram_user
+    from sreda.db.models.housewife import FamilyReminder
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    tool = _schedule_tool(db_session, u)
+    res = tool.invoke({"title": "собрать образцы тканей",
+                       "trigger_iso": "2030-01-01T12:30:00+03:00",
+                       "recurrence_rule": "FREQ=HOURLY"})
+    assert str(res).startswith("ok:scheduled:")
+    assert "повтор" in str(res)
+    row = (db_session.query(FamilyReminder)
+           .filter_by(tenant_id=u.tenant_id, user_id=u.user_id).one())
+    assert row.recurrence_rule == "FREQ=HOURLY"
+
+
+def test_bespoke_schedule_reminder_rejects_bad_rrule_333(db_session):
+    """Кривое правило → честная ошибка (fail-closed), НЕ молчаливое разовое."""
+    from tests.unit.conftest import seed_telegram_user
+    from sreda.db.models.housewife import FamilyReminder
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    tool = _schedule_tool(db_session, u)
+    res = tool.invoke({"title": "x", "trigger_iso": "2030-01-01T12:30:00+03:00",
+                       "recurrence_rule": "каждый час"})
+    assert "Не разобрала правило повтора" in str(res)
+    assert db_session.query(FamilyReminder).count() == 0

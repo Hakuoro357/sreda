@@ -213,3 +213,101 @@ def test_wrap_voice_mouth_down_falls_back_338(monkeypatch):
     """Рот упал/завис → шаблон, ход не падает."""
     q = _wrap_and_capture(monkeypatch, voice_on=True, mouth_raises=True)
     assert "18 августа в 15:00" in q and q.rstrip().endswith("?")
+
+
+# ── R1-фиксы: adversarial-кейсы верификатора (Claude M3/M4, Codex high M5, medium M4) ──
+
+def test_verify_rejects_poslezavtra_substring_338():
+    """R1 MAJOR-3: «послезавтра» при факте «завтра» - подстрочный обход убит."""
+    ok = verify_confirm_text(
+        "Поставлю напоминание «выписка лекарств» послезавтра в 15:00. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_verify_rejects_wrong_month_338():
+    """R1 high M5: «18 сентября» при факте 18 августа - месяц сверяется."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание «выписка лекарств» 18 сентября в 15:00. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_verify_rejects_wrong_word_hour_338():
+    """R1 high M5: правильное 15:00 + враньё «в четыре вечера» - словесные часы ловятся."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание «выписка лекарств» завтра в 15:00, то есть в четыре вечера. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_verify_rejects_wrong_action_338():
+    """R1 medium M4: «Отменяю» не проходит договором «поставить»."""
+    ok = verify_confirm_text(
+        "Отменяю «выписка лекарств» завтра в 15:00. Подтверждаешь?", _f(), now=_NOW)
+    assert not ok
+
+
+def test_verify_rejects_foreign_number_338():
+    """R1 high M5: постороннее число («и ещё 42») - класс «ID 42»."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание «выписка лекарств» завтра в 15:00 и ещё 42. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_verify_requires_quoted_title_338():
+    """R1 high M5: название обязано быть в «кавычках» (дословный объект договора)."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание выписка лекарств завтра в 15:00. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_verify_accepts_latin_title_338():
+    """R1 все три MINOR: легитимная латиница в названии («Zoom с командой») больше
+    НЕ выключает живой голос - title исключается из tech-скана."""
+    f = confirm_facts("schedule_reminder",
+                      {"title": "Zoom с командой", "trigger_iso": _TRIGGER})
+    ok = verify_confirm_text(
+        "Ставлю напоминание «Zoom с командой» завтра в 15:00. Подтверждаешь?",
+        f, now=_NOW)
+    assert ok
+
+
+# ── R1 оба Codex: повтор - часть договора ───────────────────────────────────
+
+def test_facts_and_template_carry_recurrence_338():
+    f = confirm_facts("schedule_reminder",
+                      {"title": "пить воду", "trigger_iso": _TRIGGER,
+                       "recurrence_rule": "FREQ=HOURLY;COUNT=5"})
+    assert f is not None and f.recurrence_human == "каждый час, всего 5 раз"
+    text = fallback_template(f, now=_NOW)
+    assert "каждый час, всего 5 раз" in text
+
+
+def test_verify_requires_recurrence_mention_338():
+    """Повтор в фактах есть, во фразе нет → враньё (юзер подтвердил бы разовое)."""
+    f = confirm_facts("schedule_reminder",
+                      {"title": "пить воду", "trigger_iso": _TRIGGER,
+                       "recurrence_rule": "FREQ=HOURLY"})
+    ok = verify_confirm_text(
+        "Ставлю напоминание «пить воду» завтра в 15:00. Подтверждаешь?", f, now=_NOW)
+    assert not ok
+
+
+def test_verify_rejects_phantom_recurrence_338():
+    """Повтора в фактах НЕТ, фраза говорит «каждый…» → враньё."""
+    ok = verify_confirm_text(
+        "Ставлю напоминание «выписка лекарств» завтра в 15:00, повтор каждый день. Подтверждаешь?",
+        _f(), now=_NOW)
+    assert not ok
+
+
+def test_unparseable_rrule_no_facts_338():
+    """R1 high M2: RRULE не очеловечивается (BYDAY-экзотика) → facts None →
+    generic-вопрос (не рискуем переврать договор)."""
+    f = confirm_facts("schedule_reminder",
+                      {"title": "кружок", "trigger_iso": _TRIGGER,
+                       "recurrence_rule": "FREQ=WEEKLY;BYDAY=TU,TH"})
+    assert f is None

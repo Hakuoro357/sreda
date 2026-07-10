@@ -1422,17 +1422,48 @@ def _prev_open_domains(messages: Any) -> set:
     last = msgs[-1]
     if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
         return set()
-    text = (last.content if isinstance(last.content, str) else str(last.content or "")).strip()
+    # R1 MINOR-10: блочный content провайдера (list) - вытащить текст, не str(list)
+    _c = last.content
+    if isinstance(_c, list):
+        _c = " ".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in _c)
+    text = (_c if isinstance(_c, str) else str(_c or "")).strip()
     if not text.endswith("?"):
         return set()
-    from sreda.services.tool_schemas.families import tool_read_domains, tool_write_domains
+    # R1 MAJOR-6: вежливые закрывашки («Что-нибудь ещё?») - ход ЗАКРЫТ, вопрос не
+    # по существу; наследование на них делало бы страховку липкой почти всегда.
+    _tail_low = text[-40:].lower()
+    if any(p in _tail_low for p in ("что-нибудь ещё", "чем ещё помочь", "что-то ещё",
+                                    "могу ещё чем", "ещё чем-нибудь помочь")):
+        return set()
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
+    # R1 MAJOR-6: исходы, которые ход НЕ открывают (инструмент фактически не работал
+    # с областью). time_not_specified СОЗНАТЕЛЬНО открывает - это и есть уточняющий
+    # исход инцидента («Поставь» → time_not_specified → «Во сколько?» → «В 12:30»).
+    _closed_kinds = frozenset({"domain_blocked", "search_limit",
+                               "source_result_required", "schema_error"})
     domains: set = set()
     for m in reversed(msgs[:-1]):
         if isinstance(m, HumanMessage):
             break  # начало этого хода
         if isinstance(m, ToolMessage) and getattr(m, "name", None):
             name = _TOOL_NAME_ALIASES.get(m.name, m.name)
-            domains |= set(tool_write_domains(name)) | set(tool_read_domains(name))
+            # R1 MAJOR-1 (все три): мета (ask_human/need_family) и галлюцинированные
+            # имена отсутствуют в манифесте - KeyError ронял бы ВЕСЬ unified в legacy
+            # fail-open ровно в инцидентном классе (ask_human «во сколько?»).
+            if name not in TOOL_OP_CLASS:
+                continue
+            _art = getattr(m, "artifact", None)
+            if isinstance(_art, dict) and _art.get("result_kind") in _closed_kinds:
+                continue
+            _content = m.content if isinstance(m.content, str) else ""
+            if _content.startswith("Хорошо, не делаю"):
+                continue  # R1 MAJOR-6: отказанный кандидат ход НЕ открывает
+            # R1 консенсус трёх (Claude M2, high M3, medium M3): наследуем ТОЛЬКО
+            # домены WRITE-инструментов - read (list_tasks/recall_memory) сам по себе
+            # write-грант не даёт («Вот задачи. Что-нибудь ещё?» ≠ право писать).
+            # Это же закрывает memory-идиому B2: recall_memory (read) память не откроет,
+            # а memory-write и так идёт через confirm/sticky #319.
+            domains |= set(tool_write_domains(name))
     domains.discard("web")  # web не наследуем: не user-data, страховки не касается
     return domains
 
@@ -2190,20 +2221,35 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         return "\n".join(f"- ref={r.id} | {r.title} | {_fmt(r.trigger_at)}" for r in rows)
 
     @tool
-    def schedule_reminder(title: str, trigger_iso: str) -> str:
-        """Создать напоминание. trigger_iso — АБСОЛЮТНЫЙ ISO-8601 datetime (относительные
-        даты резолвь сам по сегодняшней дате из <context>). Время ДОЛЖЕН назвать пользователь;
-        если в запросе времени нет — спроси «во сколько?», своё НЕ подставляй."""
+    def schedule_reminder(title: str, trigger_iso: str, recurrence_rule: str = "") -> str:
+        """Создать напоминание, разовое или ПОВТОРЯЮЩЕЕСЯ. trigger_iso — АБСОЛЮТНЫЙ ISO-8601
+        datetime первого срабатывания (относительные даты резолвь сам по сегодняшней дате из
+        <context>). Время ДОЛЖЕН назвать пользователь; если в запросе времени нет — спроси
+        «во сколько?», своё НЕ подставляй. recurrence_rule — RFC-5545 RRULE для повторов:
+        «каждый час» → FREQ=HOURLY, «каждый день» → FREQ=DAILY; конец серии ;COUNT=N или
+        ;UNTIL=…; пусто = разовое."""
         try:
             when = _parse_dt(trigger_iso)
         except Exception:  # noqa: BLE001
             return f"Не разобрала время: {trigger_iso!r}. Дай абсолютный момент."
-        # #174: момент уже прошёл → перекатить вперёд (анти-петля turn_pass_count/stop страхует).
-        if when <= datetime.now(timezone.utc):
+        # #333 R1 (оба Codex, блокер): у bespoke-инструмента НЕ БЫЛО recurrence_rule —
+        # хинт велел передавать аргумент вне схемы, повторы через ReAct не работали.
+        rrule = (recurrence_rule or "").strip()
+        if rrule and not rrule.upper().startswith("FREQ="):
+            return f"Не разобрала правило повтора: {rrule!r}. Нужен формат FREQ=…"
+        # #174: прошедший момент → для РАЗОВОГО перекат-подсказка; для повтора допустимо
+        # (сервис сам сдвинет на следующее срабатывание по правилу — rrule-advance).
+        if when <= datetime.now(timezone.utc) and not rrule:
             return _past_rollforward_msg(when, "schedule_reminder")
-        r = reminders.schedule(tenant_id=tenant_id, user_id=user_id,
-                               title=title, trigger_at=when)
-        return f"ok:scheduled:{r.id} | {r.title} | {_fmt(r.trigger_at)}"
+        try:
+            r = reminders.schedule(tenant_id=tenant_id, user_id=user_id,
+                                   title=title, trigger_at=when,
+                                   recurrence_rule=rrule or None)
+        except ValueError:
+            # сервис валидирует RRULE через rrulestr (fail-closed, не молча разовое)
+            return f"Не разобрала правило повтора: {rrule!r}. Нужен формат FREQ=…"
+        _rec = f" | повтор: {rrule}" if rrule else ""
+        return f"ok:scheduled:{r.id} | {r.title} | {_fmt(r.trigger_at)}{_rec}"
 
     @tool
     def update_reminder(reminder_ref: str, title: str = "", trigger_iso: str = "") -> str:
@@ -2838,16 +2884,19 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # #333: НЕЗАВИСИМО от доменной директивы — «кажд»+«напомн» в тексте =
                 # повторяющееся напоминание. Фредди без хинта отказывает «могу только
                 # однократное» (прод 2026-07-10 user_tg_755682022; probe 0/5 FREQ=HOURLY),
-                # хотя schedule_reminder умеет RRULE. Ортогонален _sec (домен) — оба могут
-                # стоять вместе. Гейт ниже (как у _sec, урок #285-канарейки 2026-07-06):
-                # хинт называет schedule_reminder — на unified при политике БЕЗ reminders
-                # это совет звать незабинженный тул → глушим.
+                # хотя schedule_reminder умеет RRULE. Ортогонален _sec (домен).
+                # ГЕЙТ (R1 Claude MAJOR-5): урок #285-канарейки («не советуй незабинженный
+                # тул») применим только к ЛЕГАСИ #221 — там write вне allowed РЕАЛЬНО
+                # вырезан из набора. На unified _apply_unified_policy биндит ЛЮБОЙ write
+                # (вне яруса (а) — кандидатом под confirm), schedule_reminder всегда
+                # доступен → глушить хинт не нужно, иначе фикс #333 гаснет ровно на
+                # прод-пути (неимперативное «хочу чтобы каждый час…» даёт allowed_write=∅).
                 from sreda.runtime.react_preflight import _recurrence_hint
                 _recur = _recurrence_hint(_text)
-                if _recur is not None and state.get("unified_execute"):
-                    _allowed_w = set(state.get("router_allowed_write_domains") or [])
-                    if "reminders" not in _allowed_w:
-                        _recur = None
+                if (_recur is not None and not state.get("unified_execute")
+                        and state.get("router_allowed_write_domains") is not None
+                        and "reminders" not in set(state.get("router_allowed_write_domains") or [])):
+                    _recur = None  # легаси #221: reminders вырезан из набора — не советуем
                 if state.get("router_allowed_read_domains") is not None:
                     from sreda.runtime.react_preflight import route_domains
                     _rr = route_domains(_text)

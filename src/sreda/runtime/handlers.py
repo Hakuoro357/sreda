@@ -515,7 +515,7 @@ def execute_skill_show(
     if manifest is None:
         raise ActionRuntimeError(
             "skill_unknown",
-            f"Такого умения не нашла. /skills покажет список доступных.",
+            "Такого умения не нашла. /skills покажет список доступных.",
         )
     repo = UserProfileRepository(session)
     config = repo.get_skill_config(action.tenant_id, user_id, feature_key)
@@ -949,7 +949,7 @@ def execute_skill_set_priority(
     if registry.get_manifest(feature_key) is None:
         raise ActionRuntimeError(
             "skill_unknown",
-            f"Такого умения не нашла. /skills покажет список доступных.",
+            "Такого умения не нашла. /skills покажет список доступных.",
         )
     repo = UserProfileRepository(session)
     repo.upsert_skill_config(

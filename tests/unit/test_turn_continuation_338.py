@@ -99,3 +99,85 @@ def test_policy_continuation_observable_in_signals_338():
     pol = compute_unified_policy(
         "В 15", route_domains("В 15"), prev_open_domains=frozenset({"reminders"}))
     assert pol["signals"].get("turn_continuation") == ["reminders"]
+
+
+# ── R1-фиксы наследования (Claude M1/M2/M6, Codex high M3/M4, medium M3/M7) ──
+
+def test_prev_open_meta_and_unknown_names_safe_338():
+    """R1 MAJOR-1 (все три): ask_human/need_family/галлюцинированное имя в истории
+    не роняют детект (раньше KeyError валил ВЕСЬ unified в legacy fail-open)."""
+    hist = [
+        HumanMessage(content="поставь напоминание про лекарства"),
+        AIMessage(content="", tool_calls=[{"name": "need_family", "args": {}, "id": "t1"}]),
+        ToolMessage(content="ok", name="need_family", tool_call_id="t1"),
+        AIMessage(content="", tool_calls=[{"name": "ask_human", "args": {}, "id": "t2"}]),
+        ToolMessage(content="во сколько?", name="ask_human", tool_call_id="t2"),
+        AIMessage(content="", tool_calls=[{"name": "set_alarm", "args": {}, "id": "t3"}]),
+        ToolMessage(content="ok", name="set_alarm", tool_call_id="t3"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t4"}]),
+        ToolMessage(content="ok:scheduled:rem_1:x", name="schedule_reminder", tool_call_id="t4"),
+        AIMessage(content="Во сколько поставить второе напоминание?"),
+    ]
+    assert _prev_open_domains(hist) == {"reminders"}
+
+
+def test_prev_open_read_tool_gives_no_write_grant_338():
+    """R1 консенсус трёх: read-инструмент (list_tasks) + вопрос НЕ открывает write -
+    «Вот задачи. Что-нибудь по ним?» не право писать без страховки."""
+    hist = [
+        HumanMessage(content="покажи задачи"),
+        AIMessage(content="", tool_calls=[{"name": "list_tasks", "args": {}, "id": "t1"}]),
+        ToolMessage(content="1. позвонить врачу", name="list_tasks", tool_call_id="t1"),
+        AIMessage(content="Вот твои задачи. Что-то поменять по ним?"),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_prev_open_closing_phrase_not_continuation_338():
+    """R1 MAJOR-6: вежливая закрывашка «Что-нибудь ещё?» - ход ЗАКРЫТ."""
+    hist = _hist_incident()
+    hist[-1] = AIMessage(content="Готово, поставила! Что-нибудь ещё?")
+    assert _prev_open_domains(hist) == set()
+
+
+def test_prev_open_declined_candidate_not_continuation_338():
+    """R1 MAJOR-6: отклонённый кандидат («Хорошо, не делаю») ход не открывает."""
+    hist = [
+        HumanMessage(content="поставь напоминание про воду"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="Хорошо, не делаю.", name="schedule_reminder", tool_call_id="t1"),
+        AIMessage(content="Не ставлю. Что-то скорректировать?"),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_prev_open_time_not_specified_opens_338():
+    """time_not_specified - УТОЧНЯЮЩИЙ исход (ход 2 инцидента: «Поставь» →
+    time_not_specified → «Во сколько?») - обязан открывать ход."""
+    hist = [
+        HumanMessage(content="Поставь"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="уточни время", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "time_not_specified"}),
+        AIMessage(content="Во сколько точно поставить напоминание?"),
+    ]
+    assert "reminders" in _prev_open_domains(hist)
+
+
+def test_prev_open_blocked_outcome_not_continuation_338():
+    """domain_blocked-исход область не открывает (инструмент не работал)."""
+    hist = [
+        HumanMessage(content="сделай что-нибудь"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="раздел недоступен", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "domain_blocked"}),
+        AIMessage(content="Уточни, что именно нужно?"),
+    ]
+    assert _prev_open_domains(hist) == set()
+
+
+def test_prev_open_list_content_aimessage_338():
+    """R1 MINOR-10: блочный content (list) - текст извлекается, вопрос детектится."""
+    hist = _hist_incident()
+    hist[-1] = AIMessage(content=[{"type": "text", "text": "Во сколько поставить его?"}])
+    assert "reminders" in _prev_open_domains(hist)
