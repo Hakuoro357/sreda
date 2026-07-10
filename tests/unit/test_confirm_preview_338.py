@@ -157,3 +157,59 @@ def test_generic_question_never_technical_338():
     assert "weird_arg" not in q
     assert "2026-08-18" not in q
     assert q.rstrip().endswith("?")
+
+
+# ── ч.2б: живой «рот» в _generic_confirm_wrap (флаг SREDA_CONFIRM_VOICE) ────
+
+def _wrap_and_capture(monkeypatch, *, voice_on, mouth_reply=None, mouth_raises=False):
+    """Прогнать _generic_confirm_wrap с мок-ртом; вернуть показанный confirm-текст."""
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime import react_loop
+
+    seen = {}
+    inner = StructuredTool.from_function(
+        func=lambda title="", trigger_iso="": "ok",
+        name="schedule_reminder", description="d")
+    monkeypatch.setattr(react_loop, "interrupt",
+                        lambda payload: seen.update(payload) or "нет")
+    monkeypatch.setattr(react_loop, "_confirm_voice_enabled", lambda: voice_on)
+    if voice_on:
+        class _Resp:
+            content = mouth_reply or ""
+
+        def _fake_invoke(llm, msgs, timeout_seconds=0):
+            if mouth_raises:
+                raise TimeoutError("рот завис")
+            return _Resp()
+        monkeypatch.setattr(react_loop, "invoke_with_per_call_timeout", _fake_invoke)
+        import sreda.services.llm as _llm_mod
+        monkeypatch.setattr(_llm_mod, "get_chat_llm", lambda provider=None: object())
+    react_loop._generic_confirm_wrap(inner).invoke(
+        {"title": "выписка лекарств", "trigger_iso": _TRIGGER})
+    return seen["confirm"]
+
+
+def test_wrap_voice_off_uses_template_338(monkeypatch):
+    """Флаг OFF (дефолт) → человеческий шаблон, рот не зовётся."""
+    q = _wrap_and_capture(monkeypatch, voice_on=False)
+    assert q == "Ставлю напоминание «выписка лекарств» 18 августа в 15:00. Подтверждаешь?"
+
+
+def test_wrap_voice_valid_live_phrase_338(monkeypatch):
+    """Флаг ON + рот дал валидную живую фразу → она и уходит юзеру."""
+    live = "Хорошо! Поставлю напоминание «выписка лекарств» 18 августа в три часа дня - подтверждаешь?"
+    q = _wrap_and_capture(monkeypatch, voice_on=True, mouth_reply=live)
+    assert q == live
+
+
+def test_wrap_voice_lying_mouth_falls_back_338(monkeypatch):
+    """Рот переврал дату (19-е) → верификатор режет → точный шаблон."""
+    lying = "Поставлю напоминание «выписка лекарств» 19 августа в 15:00 - подтверждаешь?"
+    q = _wrap_and_capture(monkeypatch, voice_on=True, mouth_reply=lying)
+    assert "18 августа" in q and "19 августа" not in q
+
+
+def test_wrap_voice_mouth_down_falls_back_338(monkeypatch):
+    """Рот упал/завис → шаблон, ход не падает."""
+    q = _wrap_and_capture(monkeypatch, voice_on=True, mouth_raises=True)
+    assert "18 августа в 15:00" in q and q.rstrip().endswith("?")

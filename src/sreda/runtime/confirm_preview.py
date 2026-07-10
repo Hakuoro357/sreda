@@ -166,6 +166,29 @@ def generic_action_question(tool_name: str, kwargs: dict) -> str:
     return "Подтверди, пожалуйста: сделать это изменение?"
 
 
+def build_mouth_prompt(facts: ConfirmFacts, *, now: datetime) -> tuple[str, str]:
+    """(system, user) для «рта»: одна живая фраза подтверждения в персоне Среды.
+    Факты и ДОПУСТИМЫЕ формулировки даны; менять факты запрещено. Результат
+    проверяет verify_confirm_text - сбой = fallback_template (рот не источник
+    истины, только голос)."""
+    system = (
+        "Ты - Среда, тёплая семейная помощница. Составь ОДНУ короткую фразу-"
+        "подтверждение действия. Правила железные: название объекта - ДОСЛОВНО в "
+        "кавычках «…»; день и время - ТОЛЬКО из списка допустимых формулировок "
+        "(выбери одну для дня, одну для времени); никаких других дат, чисел, "
+        "английских слов; закончи вопросом подтверждения (например «подтверждаешь?»). "
+        "Не добавляй ничего, кроме этой фразы.")
+    if facts.when_local is not None:
+        days = " / ".join(allowed_day_phrases(facts.when_local, now=now))
+        times = " / ".join(allowed_time_phrases(facts.when_local))
+        user = (f"Действие: {facts.action}. Название: «{facts.object_title}». "
+                f"Допустимые формулировки дня: {days}. "
+                f"Допустимые формулировки времени: {times}.")
+    else:
+        user = f"Действие: {facts.action}. Название: «{facts.object_title}»."
+    return system, user
+
+
 _TECH_RE = re.compile(
     r"[a-z_]{3,}|"                # латиница подряд (имена инструментов/полей)
     r"\d{4}-\d{2}-\d{2}|"         # ISO-дата

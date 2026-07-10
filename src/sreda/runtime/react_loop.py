@@ -166,6 +166,16 @@ def _time_in_tail_enabled() -> bool:
         return False
 
 
+def _confirm_voice_enabled() -> bool:
+    """#338 ч.2б: живая фраза «рта» в кандидат-подтверждениях (SREDA_CONFIRM_VOICE,
+    дефолт OFF = человеческий шаблон из confirm_preview; включение канарейкой по «да»)."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().confirm_voice_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
 def _checklist_querykind() -> bool:
     """#213 Срез B: предслойный query_kind + cross-check ВКЛ? (SREDA_CHECKLIST_QUERYKIND,
     дефолт OFF = fail-open). Действует ТОЛЬКО вместе с _checklist_unified()."""
@@ -1441,10 +1451,32 @@ def _generic_confirm_wrap(inner: Any) -> Any:
         # (прод-инцидент 755682022). Известный инструмент → факты + человеческий
         # шаблон (даты по-русски); иначе → русское действие из реестра; совсем
         # неизвестный → нейтральный вопрос. key НЕ меняется (контракт пауз #166B).
-        from sreda.runtime.confirm_preview import confirm_facts, fallback_template, generic_action_question
+        from sreda.runtime.confirm_preview import (
+            build_mouth_prompt, confirm_facts, fallback_template,
+            generic_action_question, verify_confirm_text,
+        )
         _facts = confirm_facts(inner.name, kwargs)
+        _now = datetime.now(_MSK)
         if _facts is not None:
-            _q = fallback_template(_facts, now=datetime.now(_MSK))
+            _q = fallback_template(_facts, now=_now)
+            # #338 ч.2б (за флагом): живая фраза «рта» в персоне ПОВЕРХ шаблона.
+            # Рот - только голос, не источник истины: verify_confirm_text гейтит
+            # (название дословно, день/время из допустимых, нет тех.начинки/чужих
+            # дат) → любой сбой/таймаут/провал проверки = точный шаблон выше.
+            if _confirm_voice_enabled():
+                try:
+                    from sreda.config.settings import get_settings as _gs338
+                    from sreda.services.llm import get_chat_llm as _gcl338
+                    _sys, _usr = build_mouth_prompt(_facts, now=_now)
+                    _resp = invoke_with_per_call_timeout(
+                        _gcl338(provider=_gs338().composer_provider),
+                        [SystemMessage(content=_sys), HumanMessage(content=_usr)],
+                        timeout_seconds=4.0)
+                    _live = str(getattr(_resp, "content", "") or "").strip()
+                    if verify_confirm_text(_live, _facts, now=_now):
+                        _q = _live
+                except Exception:  # noqa: BLE001 — рот недоступен/медленный → шаблон
+                    logger.info("confirm_voice: сбой рта → фолбэк-шаблон", exc_info=True)
         else:
             _q = generic_action_question(inner.name, kwargs)
         decision = interrupt({"confirm": _q, "key": _key})
