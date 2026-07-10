@@ -97,7 +97,8 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     деструктивных инструментов (save_core_fact/save_episode/create_memory_category)."""
     from sreda.runtime.react_preflight import compute_allowed_domains
     from sreda.runtime.react_signals import (
-        declarative_memory_signal, read_cue_domains, write_command_signal,
+        declarative_memory_signal, new_read_request_signal, read_cue_domains,
+        write_command_signal,
     )
 
     w_sig = bool(write_command_signal(text))
@@ -146,10 +147,12 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     for _d in sorted(prev_open_domains):
         if w_sig and route.all_domains and _d not in route.all_domains:
             continue  # новая команда в другую область = выход из хода
-        # R2/R3 Codex high: ЛЮБОЙ явный READ-запрос - выход из хода («покажи задачи
-        # и напоминания» тоже: юзер ушёл смотреть, а не отвечает на «во сколько?»;
-        # ответ на уточнение read-командой не бывает)
-        if read_cues:
+        # R2/R3/R4 Codex high: явный READ-ЗАПРОС - выход из хода («покажи задачи и
+        # напоминания»: юзер ушёл смотреть, не отвечает). Гейт - new_read_request_signal
+        # (#316: маркер запроса И доменный кюс), НЕ голый read_cues: слот-ответ
+        # «напоминание в 15» несёт кюс, но НЕ запрос - это валидное продолжение
+        # инцидентного класса (R4 high: read_cues-гейт ломал его).
+        if new_read_request_signal(text):
             continue
         allowed_write.add(_d)
         continuation.append(_d)

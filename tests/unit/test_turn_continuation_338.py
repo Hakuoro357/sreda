@@ -267,3 +267,13 @@ def test_r3_read_cue_including_same_domain_exits_338():
     pol = compute_unified_policy(
         text, route_domains(text), prev_open_domains=frozenset({"reminders"}))
     assert "reminders" not in pol["allowed_write"]
+
+
+def test_r4_slot_answer_with_domain_word_inherits_338():
+    """R4 high: слот-ответ с доменным словом («напоминание в 15», «для напоминания
+    в 15») - валидное продолжение, наследуется (read_cues-гейт это ломал; гейт -
+    new_read_request_signal: нужен МАРКЕР запроса, не голое доменное слово)."""
+    for text in ("напоминание в 15", "для напоминания в 15"):
+        pol = compute_unified_policy(
+            text, route_domains(text), prev_open_domains=frozenset({"reminders"}))
+        assert "reminders" in pol["allowed_write"], text
