@@ -14,6 +14,12 @@
 - ``breakdowns_shown`` — строки «ПОЛОМКА показана пользователю» в логе
   job-runner за окно (инвариант f2b9a18: каждый показ пишется ERROR).
 
+#227 (мини-спека утверждена 2026-07-10): отдельная строка «% успешных ходов
+(ReAct)» по исходам durable ``react_turn_trace`` — знаменатель = завершённые
+ходы (outcome IS NOT NULL) за 24ч-окно UTC; провал = ``safe_reply`` |
+``breakdown`` (legacy-страховка); «умершие» (in_progress старше 1ч) — отдельным
+числом, НЕ в знаменателе. В скользящий KPI по сигналам НЕ входит (аддитивно).
+
 Каденс и устойчивость — по образцу retention (#127): state-файл,
 не чаще раза в сутки, откат после провала вместо шторма.
 """
@@ -32,6 +38,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from sreda.db.models.core import InboundMessage, OutboxMessage
+from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.skill_platform import SkillAIExecution
 from sreda.db.session import privileged_session
 from sreda.services.admin_alerts import send_admin_alert
@@ -45,6 +52,19 @@ DEFAULT_STATE_FILE = "/var/lib/sreda/reliability-state.json"
 DEFAULT_LOG_GLOB = "/var/log/sreda/*.log"
 REPORT_WINDOW = timedelta(hours=24)
 STUCK_GRACE = timedelta(minutes=10)
+# #227: «умерший» ход = react_turn_trace.status='in_progress' старше часа —
+# непойманная смерть процесса mid-turn (kill/OOM/рестарт), finish-хук не
+# отработал, outcome остался NULL. Порог 1ч утверждён оркестратором
+# 2026-07-10. awaiting_confirm — НЕ умерший (пауза ждёт юзера — модель
+# react_trace.py); done без outcome — брошенная пауза #320, тоже не умерший.
+DEAD_TURN_GRACE = timedelta(hours=1)
+# #227: провальные исходы ReAct-хода — как в probe_failed_turns_rate
+# (monitor_health.py). safe_reply = юзер получил заглушку (пойманный краш /
+# таймаут / транзиент LLM); breakdown = legacy plan-execute, в
+# react_turn_trace его сейчас никто не пишет — страховка back-compat.
+# tool_error / fallback_used — НЕ провал: ход дал содержательный ответ
+# (деградации покрыты алертами #258 отдельно).
+_REACT_FAILED_OUTCOMES = ("safe_reply", "breakdown")
 FAILURE_BACKOFF = timedelta(minutes=30)
 KPI_DAYS = 14
 KPI_THRESHOLD_PCT = 95.0
@@ -62,6 +82,14 @@ class DayCounts:
     inbound_stuck: int
     outbox_failed: int
     breakdowns_shown: int
+    # #227: срез react_turn_trace за то же окно (мини-спека 2026-07-10).
+    # Дефолты держат обратную совместимость позиционных конструкторов
+    # (тесты/моки). В скользящий KPI по сигналам (failures_total) эти
+    # числа НЕ входят — строка «% успешных ходов» аддитивна.
+    react_finished: int = 0     # знаменатель: outcome IS NOT NULL за окно
+    react_safe_reply: int = 0   # провал: юзер получил заглушку
+    react_breakdown: int = 0    # провал: legacy, страховка back-compat
+    react_dead: int = 0         # in_progress старше 1ч — НЕ в знаменателе
 
     @property
     def failures_total(self) -> int:
@@ -69,6 +97,12 @@ class DayCounts:
         # для KPI v1 считаем сумму — консервативно в сторону тревоги
         return (self.runs_failed + self.inbound_stuck
                 + self.outbox_failed + self.breakdowns_shown)
+
+    @property
+    def react_success(self) -> int:
+        # успех = завершённые минус провальные исходы (мини-спека #227:
+        # числитель = outcome NOT IN ('safe_reply','breakdown'))
+        return self.react_finished - self.react_safe_reply - self.react_breakdown
 
 
 def _count(session: Session, stmt) -> int:
@@ -113,8 +147,37 @@ def gather_day_counts(
     breakdowns = (breakdowns_precounted if breakdowns_precounted is not None
                   else count_breakdown_lines(
                       log_path or DEFAULT_LOG_GLOB, since=since, until=now))
+    # #227: исходы ReAct из durable react_turn_trace (источник истины по
+    # ходам обоих путей — единого #285 и легаси-сплита; персист в общем
+    # выходе handle_turn). Завершённые = outcome IS NOT NULL: паузы
+    # (awaiting_confirm) и брошенные паузы (#320: done без outcome) — вне
+    # знаменателя, как у probe_failed_turns_rate.
+    outcome_rows = session.execute(
+        select(ReactTurnTrace.outcome, func.count(ReactTurnTrace.id))
+        .where(and_(
+            ReactTurnTrace.created_at >= since,
+            ReactTurnTrace.created_at < now,
+            ReactTurnTrace.outcome.is_not(None),
+        ))
+        .group_by(ReactTurnTrace.outcome)).all()
+    by_outcome = {str(oc): int(cnt or 0) for oc, cnt in outcome_rows}
+    react_finished = sum(by_outcome.values())
+    react_safe_reply = by_outcome.get("safe_reply", 0)
+    react_breakdown = by_outcome.get("breakdown", 0)
+    # «умершие»: непойманная смерть хода (строка навсегда in_progress).
+    # Свежие in_progress (< 1ч) ещё могут завершиться — не считаем.
+    react_dead = _count(
+        session, select(func.count(ReactTurnTrace.id)).where(and_(
+            ReactTurnTrace.created_at >= since,
+            ReactTurnTrace.created_at < now - DEAD_TURN_GRACE,
+            ReactTurnTrace.status == "in_progress",
+        )))
     return DayCounts(turns_total, runs_failed, inbound_stuck,
-                     outbox_failed, breakdowns)
+                     outbox_failed, breakdowns,
+                     react_finished=react_finished,
+                     react_safe_reply=react_safe_reply,
+                     react_breakdown=react_breakdown,
+                     react_dead=react_dead)
 
 
 def count_breakdown_lines(
@@ -177,9 +240,25 @@ def format_report(counts, history: list[dict],
         kpi_line += f" — ниже порога {kpi_threshold_pct:g}%! 🔴"
     else:
         kpi_line += f" (порог {kpi_threshold_pct:g}%) ✅"
+    # #227: «% успешных ходов за день» по исходам react_turn_trace (формат
+    # утверждён оркестратором 2026-07-10). breakdown — только если ненулевой
+    # (мёртвый легаси, страховка); «умерших» — всегда (стабильный формат).
+    if counts.react_finished > 0:
+        _fails = f"safe_reply={counts.react_safe_reply}"
+        if counts.react_breakdown:
+            _fails += f", breakdown={counts.react_breakdown}"
+        _rpct = 100.0 * counts.react_success / counts.react_finished
+        react_line = (
+            f"успешных ходов (ReAct): {counts.react_success}/"
+            f"{counts.react_finished} ({_rpct:.1f}%) - провалы: {_fails}; "
+            f"умерших (без исхода): {counts.react_dead}")
+    else:
+        react_line = ("успешных ходов (ReAct): нет завершённых ходов за "
+                      f"сутки; умерших (без исхода): {counts.react_dead}")
     return (
         "📊 Надёжность диалога за сутки\n"
         f"ходов: {counts.turns_total}\n"
+        f"{react_line}\n"
         f"провалы — исполнение: {counts.runs_failed}, "
         f"застряло: {counts.inbound_stuck}, "
         f"доставка: {counts.outbox_failed}, "

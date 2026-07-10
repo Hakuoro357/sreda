@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from sreda.db.base import Base
 from sreda.db.models.core import InboundMessage, OutboxMessage, Tenant, Workspace
+from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.db.models.runtime import AgentThread
 from sreda.db.models.skill_platform import SkillAIExecution
 from sreda.workers import reliability_report as rr_module
@@ -71,6 +72,96 @@ def _inbound(sess, mid, processing_status, hours_ago):
         processing_status=processing_status,
         created_at=NOW - timedelta(hours=hours_ago),
     ))
+
+
+_rt_seq = iter(range(100000))
+
+
+def _react_turn(sess, outcome, hours_ago, *, status="done"):
+    """Строка react_turn_trace (#227): outcome=None + status=in_progress —
+    незавершённый ход; ПД-колонки не трогаем (EncryptedString → NULL)."""
+    n = next(_rt_seq)
+    sess.add(ReactTurnTrace(
+        id=f"rtt_{n}", tenant_id="t1", turn_key=f"tk_{n}",
+        status=status, outcome=outcome,
+        created_at=NOW - timedelta(hours=hours_ago)))
+
+
+def test_react_success_rate_counts_safe_reply_as_fail(
+    session, tmp_path: Path,
+) -> None:
+    """#227 (мини-спека, approve 2026-07-10): знаменатель = завершённые ходы
+    (outcome IS NOT NULL) за 24ч-окно UTC; провал = safe_reply|breakdown;
+    tool_error/fallback_used = успех (деградация ≠ провал); «умершие»
+    (in_progress старше 1ч) — ОТДЕЛЬНЫМ числом, НЕ в знаменателе."""
+    _react_turn(session, "ok", 2)
+    _react_turn(session, "ok", 3)
+    _react_turn(session, "ok", 4)
+    _react_turn(session, "tool_error", 5)      # успех: ход дал ответ
+    _react_turn(session, "fallback_used", 6)   # успех: запасной LLM
+    _react_turn(session, "safe_reply", 7)      # провал
+    _react_turn(session, "safe_reply", 8)      # провал
+    _react_turn(session, "ok", 30)             # вне окна 24ч
+    # умерший: непойманная смерть хода → in_progress старше 1ч, outcome NULL
+    _react_turn(session, None, 2, status="in_progress")
+    # свежий in_progress (10 мин) — ещё может завершиться, НЕ умерший
+    _react_turn(session, None, 10 / 60, status="in_progress")
+    # пауза ждёт юзера — НЕ умерший (модель: awaiting_confirm = ждёт юзера)
+    _react_turn(session, None, 5, status="awaiting_confirm")
+    # брошенная пауза #320 (redirect) — done без outcome, НЕ провал и НЕ умерший
+    _react_turn(session, None, 5, status="done")
+    session.commit()
+    c = gather_day_counts(session, now=NOW, log_path=str(tmp_path / "no.log"))
+    assert c.react_finished == 7      # 3 ok + tool_error + fallback + 2 safe_reply
+    assert c.react_safe_reply == 2
+    assert c.react_breakdown == 0
+    assert c.react_success == 5       # finished - safe_reply - breakdown
+    assert c.react_dead == 1          # только старый in_progress
+
+
+def test_react_success_rate_line_format(tmp_path: Path) -> None:
+    """#227: формат строки — как утверждено оркестратором 2026-07-10."""
+    counts = SimpleNamespace(
+        turns_total=40, runs_failed=1, inbound_stuck=1,
+        outbox_failed=0, breakdowns_shown=2,
+        react_finished=7, react_safe_reply=2, react_breakdown=0,
+        react_success=5, react_dead=1,
+    )
+    text = format_report(counts, [{"date": "2026-06-12", "total": 40,
+                                   "failures": 4}])
+    assert ("успешных ходов (ReAct): 5/7 (71.4%) - провалы: safe_reply=2; "
+            "умерших (без исхода): 1") in text
+    # breakdown=0 (мёртвый легаси) строку НЕ засоряет
+    assert "breakdown" not in text
+
+
+def test_react_success_rate_line_shows_breakdown_when_present(
+    tmp_path: Path,
+) -> None:
+    """#227: legacy breakdown — страховка back-compat; виден, только если есть."""
+    counts = SimpleNamespace(
+        turns_total=10, runs_failed=0, inbound_stuck=0,
+        outbox_failed=0, breakdowns_shown=0,
+        react_finished=10, react_safe_reply=1, react_breakdown=1,
+        react_success=8, react_dead=0,
+    )
+    text = format_report(counts, [{"date": "2026-06-12", "total": 10,
+                                   "failures": 2}])
+    assert ("успешных ходов (ReAct): 8/10 (80.0%) - провалы: safe_reply=1, "
+            "breakdown=1; умерших (без исхода): 0") in text
+
+
+def test_react_success_rate_empty_day(session, tmp_path: Path) -> None:
+    """#227: ноль завершённых ходов — нет деления на 0, «умершие» видны."""
+    _react_turn(session, None, 3, status="in_progress")  # умерший
+    session.commit()
+    c = gather_day_counts(session, now=NOW, log_path=str(tmp_path / "no.log"))
+    assert c.react_finished == 0
+    assert c.react_dead == 1
+    text = format_report(c, [{"date": "2026-06-12", "total": 0,
+                              "failures": 0}])
+    assert ("успешных ходов (ReAct): нет завершённых ходов за сутки; "
+            "умерших (без исхода): 1") in text
 
 
 def test_failure_classification(session, tmp_path: Path) -> None:
@@ -129,6 +220,8 @@ def test_reliability_report_format(tmp_path: Path) -> None:
     counts = SimpleNamespace(
         turns_total=40, runs_failed=1, inbound_stuck=1,
         outbox_failed=0, breakdowns_shown=2,
+        react_finished=0, react_safe_reply=0, react_breakdown=0,
+        react_success=0, react_dead=0,
     )
     history = [
         {"date": "2026-06-11", "total": 50, "failures": 2},
@@ -177,7 +270,9 @@ async def test_reliability_report_backoff(tmp_path: Path, monkeypatch) -> None:
 def test_kpi_zero_turns_with_failures_is_alarm() -> None:
     """Codex R1 medium: сигналы без ходов ≠ «100% чистых»."""
     counts = SimpleNamespace(turns_total=0, runs_failed=0, inbound_stuck=2,
-                             outbox_failed=0, breakdowns_shown=0)
+                             outbox_failed=0, breakdowns_shown=0,
+                             react_finished=0, react_safe_reply=0,
+                             react_breakdown=0, react_success=0, react_dead=0)
     text = format_report(counts, [{"date": "2026-06-12", "total": 0,
                                    "failures": 2}])
     assert "0.0%" in text and "ниже порога" in text
@@ -186,7 +281,9 @@ def test_kpi_zero_turns_with_failures_is_alarm() -> None:
 def test_kpi_clamp_failures_above_total() -> None:
     """Субагент: классы пересекаются — провалов может быть больше ходов."""
     counts = SimpleNamespace(turns_total=1, runs_failed=1, inbound_stuck=1,
-                             outbox_failed=1, breakdowns_shown=1)
+                             outbox_failed=1, breakdowns_shown=1,
+                             react_finished=0, react_safe_reply=0,
+                             react_breakdown=0, react_success=0, react_dead=0)
     text = format_report(counts, [{"date": "2026-06-12", "total": 1,
                                    "failures": 4}])
     assert "0.0%" in text  # clamp: не уходит в минус
