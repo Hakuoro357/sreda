@@ -119,6 +119,39 @@ def test_react_success_rate_counts_safe_reply_as_fail(
     assert c.react_dead == 1          # только старый in_progress
 
 
+def test_react_dead_window_shifted_by_grace(session, tmp_path: Path) -> None:
+    """R1 Codex high+medium MAJOR: без сдвига окна на grace ход из
+    последнего часа суток не dead сегодня и вне окна завтра — терялся бы
+    навсегда. Окно dead = [since-1ч, now-1ч), как у inbound_stuck."""
+    # умер 24.5ч назад: вчерашним отчётом ещё не стал dead (0.5ч < 1ч),
+    # сегодня created_at уже старше since — ловится ТОЛЬКО сдвинутым окном
+    _react_turn(session, None, 24.5, status="in_progress")
+    # 25.5ч назад: стал dead ещё в прошлом окне (посчитан вчера) — не двоим
+    _react_turn(session, None, 25.5, status="in_progress")
+    # R1 Codex medium MINOR: полуобновлённая строка in_progress с outcome —
+    # уже в знаменателе finished, в dead не задваивается
+    _react_turn(session, "ok", 3, status="in_progress")
+    session.commit()
+    c = gather_day_counts(session, now=NOW, log_path=str(tmp_path / "no.log"))
+    assert c.react_dead == 1
+    assert c.react_finished == 1      # строка с outcome — finished
+
+
+def test_react_unknown_outcome_counts_as_success(
+    session, tmp_path: Path,
+) -> None:
+    """R1 субагент MINOR (freeze семантики): числитель мини-спеки =
+    NOT IN ('safe_reply','breakdown') — НОВЫЙ/неизвестный исход по спеке
+    успех. Если цикл начнёт писать llm_error/timeout как терминальные,
+    этот тест — напоминание пересмотреть провальный набор осознанно."""
+    _react_turn(session, "llm_error", 2)   # из словаря модели, сейчас не пишется
+    _react_turn(session, "safe_reply", 3)
+    session.commit()
+    c = gather_day_counts(session, now=NOW, log_path=str(tmp_path / "no.log"))
+    assert c.react_finished == 2
+    assert c.react_success == 1            # llm_error = успех по утверждённой спеке
+
+
 def test_react_success_rate_line_format(tmp_path: Path) -> None:
     """#227: формат строки — как утверждено оркестратором 2026-07-10."""
     counts = SimpleNamespace(

@@ -58,13 +58,6 @@ STUCK_GRACE = timedelta(minutes=10)
 # 2026-07-10. awaiting_confirm — НЕ умерший (пауза ждёт юзера — модель
 # react_trace.py); done без outcome — брошенная пауза #320, тоже не умерший.
 DEAD_TURN_GRACE = timedelta(hours=1)
-# #227: провальные исходы ReAct-хода — как в probe_failed_turns_rate
-# (monitor_health.py). safe_reply = юзер получил заглушку (пойманный краш /
-# таймаут / транзиент LLM); breakdown = legacy plan-execute, в
-# react_turn_trace его сейчас никто не пишет — страховка back-compat.
-# tool_error / fallback_used — НЕ провал: ход дал содержательный ответ
-# (деградации покрыты алертами #258 отдельно).
-_REACT_FAILED_OUTCOMES = ("safe_reply", "breakdown")
 FAILURE_BACKOFF = timedelta(minutes=30)
 KPI_DAYS = 14
 KPI_THRESHOLD_PCT = 95.0
@@ -162,15 +155,30 @@ def gather_day_counts(
         .group_by(ReactTurnTrace.outcome)).all()
     by_outcome = {str(oc): int(cnt or 0) for oc, cnt in outcome_rows}
     react_finished = sum(by_outcome.values())
+    # Провальные исходы — как в probe_failed_turns_rate (monitor_health.py):
+    # safe_reply = юзер получил заглушку (пойманный краш / таймаут / транзиент
+    # LLM); breakdown = legacy plan-execute, в react_turn_trace его сейчас
+    # никто не пишет — страховка back-compat. tool_error / fallback_used — НЕ
+    # провал: ход дал содержательный ответ (деградации алертятся #258).
+    # Сегодня цикл пишет ТОЛЬКО ok|tool_error|fallback_used|safe_reply
+    # (_turn_outcome + краш-хендлер react_loop.py); любой НОВЫЙ исход по
+    # мини-спеке #227 по умолчанию считается успехом (числитель = NOT IN
+    # ('safe_reply','breakdown')) — тест freeze: unknown outcome = success.
     react_safe_reply = by_outcome.get("safe_reply", 0)
     react_breakdown = by_outcome.get("breakdown", 0)
     # «умершие»: непойманная смерть хода (строка навсегда in_progress).
-    # Свежие in_progress (< 1ч) ещё могут завершиться — не считаем.
+    # Свежие in_progress (< 1ч) ещё могут завершиться — не считаем. Окно
+    # сдвинуто ЦЕЛИКОМ на grace (как у inbound_stuck — R1 Codex high+medium
+    # MAJOR): иначе ход из последнего часа окна не dead сегодня и уже вне
+    # окна завтра → терялся бы навсегда. Так каждый умерший считается ровно
+    # один раз — в отчёте, где он впервые простоял час. outcome IS NULL —
+    # страховка от частично обновлённой строки (не задвоить с finished).
     react_dead = _count(
         session, select(func.count(ReactTurnTrace.id)).where(and_(
-            ReactTurnTrace.created_at >= since,
+            ReactTurnTrace.created_at >= since - DEAD_TURN_GRACE,
             ReactTurnTrace.created_at < now - DEAD_TURN_GRACE,
             ReactTurnTrace.status == "in_progress",
+            ReactTurnTrace.outcome.is_(None),
         )))
     return DayCounts(turns_total, runs_failed, inbound_stuck,
                      outbox_failed, breakdowns,
