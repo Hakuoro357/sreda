@@ -325,6 +325,10 @@ def verify_confirm_text(text: str, facts: ConfirmFacts, *, now: datetime) -> boo
         # фразу без «всего 5 раз» - юзер подтверждал бесконечную серию как 5 раз)
         if facts.recurrence_human not in lower_rest:
             return False
+        # R2 Claude MINOR: фразу повтора ВЫРЕЗАЕМ до сканов дат/времён - иначе
+        # «до 20 августа 18:00» из UNTIL резался бы как «посторонняя дата» и
+        # живой голос был бы мёртв для всего UNTIL-класса (инструктируем X - режем X)
+        lower_rest = lower_rest.replace(facts.recurrence_human, " ")
     elif re.search(r"повтор|кажд", lower_rest):
         return False
     if facts.when_local is None:

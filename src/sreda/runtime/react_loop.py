@@ -1406,6 +1406,11 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
     return out
 
 
+# отказ кандидата: ЕДИНАЯ константа (R2 Claude MINOR) - её же ищет _prev_open_domains;
+# дрейф текста ломал бы фильтр молча в небезопасную сторону (freeze-тест через wrap).
+_CONFIRM_DECLINED_TEXT = "Хорошо, не делаю."
+
+
 def _prev_open_domains(messages: Any) -> set:
     """#338: области инструментов ПРОШЛОГО хода агента, если он закончился ВОПРОСОМ
     (незакрытый ход - агент сам запросил продолжение: «Во сколько поставить его?»).
@@ -1429,11 +1434,14 @@ def _prev_open_domains(messages: Any) -> set:
     text = (_c if isinstance(_c, str) else str(_c or "")).strip()
     if not text.endswith("?"):
         return set()
-    # R1 MAJOR-6: вежливые закрывашки («Что-нибудь ещё?») - ход ЗАКРЫТ, вопрос не
-    # по существу; наследование на них делало бы страховку липкой почти всегда.
-    _tail_low = text[-40:].lower()
-    if any(p in _tail_low for p in ("что-нибудь ещё", "чем ещё помочь", "что-то ещё",
-                                    "могу ещё чем", "ещё чем-нибудь помочь")):
+    # R1 MAJOR-6 + R2 Claude: вежливые закрывашки («Что-нибудь ещё?», «Ещё что-то?»)
+    # - ход ЗАКРЫТ. Подстрочный список обходился перестановкой слов и е/ё («рот»
+    # пишет как хочет), а ошибка тут в НЕбезопасную сторону (пропущенная закрывашка
+    # = write-грант без страховки). Правило: последнее предложение с токеном «еще»
+    # (е/ё нормализованы) = закрывашка. Ложное срабатывание на содержательном
+    # «Поставить ещё одно?» даёт лишний ЧЕЛОВЕЧЕСКИЙ confirm - безопасная сторона.
+    _last_sent = re.split(r"[.!?]", text.rstrip("?").replace("ё", "е"))[-1].lower()
+    if re.search(r"(?:^|[^а-яa-z0-9])еще(?:[^а-яa-z0-9]|$)", _last_sent):
         return set()
     from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
     # R1 MAJOR-6: исходы, которые ход НЕ открывают (инструмент фактически не работал
@@ -1456,7 +1464,7 @@ def _prev_open_domains(messages: Any) -> set:
             if isinstance(_art, dict) and _art.get("result_kind") in _closed_kinds:
                 continue
             _content = m.content if isinstance(m.content, str) else ""
-            if _content.startswith("Хорошо, не делаю"):
+            if _content.startswith(_CONFIRM_DECLINED_TEXT.rstrip(".")):
                 continue  # R1 MAJOR-6: отказанный кандидат ход НЕ открывает
             # R1 консенсус трёх (Claude M2, high M3, medium M3): наследуем ТОЛЬКО
             # домены WRITE-инструментов - read (list_tasks/recall_memory) сам по себе
@@ -1517,7 +1525,7 @@ def _generic_confirm_wrap(inner: Any) -> Any:
             _q = generic_action_question(inner.name, kwargs)
         decision = interrupt({"confirm": _q, "key": _key})
         if not _is_yes(str(decision)):
-            return "Хорошо, не делаю."
+            return _CONFIRM_DECLINED_TEXT
         return str(inner.invoke(kwargs))
 
     return StructuredTool.from_function(
@@ -2250,11 +2258,20 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
             r = reminders.schedule(tenant_id=tenant_id, user_id=user_id,
                                    title=title, trigger_at=when,
                                    recurrence_rule=rrule or None)
-        except ValueError:
+        except ValueError as exc:
+            # R2 Claude MINOR: исчерпанная серия (COUNT/UNTIL целиком в прошлом) -
+            # честный текст, а не «нужен формат» (правило-то разобрано)
+            if "no future occurrences" in str(exc):
+                return ("Все повторения этого правила уже в прошлом - уточни, "
+                        "с какого момента ставить.")
             # сервис валидирует RRULE через rrulestr (fail-closed, не молча разовое)
             return f"Не разобрала правило повтора: {rrule!r}. Нужен формат FREQ=…"
+        # R2 Claude MAJOR: для повтора с прошедшим стартом РЕАЛЬНОЕ срабатывание -
+        # next_trigger_at (сервис сдвинул по правилу); рендер trigger_at пересказал
+        # бы юзеру время, в которое ничего не прозвенит (класс «ложный успех»).
+        _when_shown = getattr(r, "next_trigger_at", None) or r.trigger_at
         _rec = f" | повтор: {rrule}" if rrule else ""
-        return f"ok:scheduled:{r.id} | {r.title} | {_fmt(r.trigger_at)}{_rec}"
+        return f"ok:scheduled:{r.id} | {r.title} | {_fmt(_when_shown)}{_rec}"
 
     @tool
     def update_reminder(reminder_ref: str, title: str = "", trigger_iso: str = "") -> str:

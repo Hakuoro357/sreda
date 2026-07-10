@@ -205,3 +205,40 @@ def test_r2_read_cue_other_domain_exits_338():
     pol = compute_unified_policy(
         text, route_domains(text), prev_open_domains=frozenset({"reminders"}))
     assert "reminders" not in pol["allowed_write"]
+
+
+def test_r2_closing_phrase_variants_and_yo_338():
+    """R2 Claude MAJOR: закрывашки в любых перестановках и с е/ё - ход закрыт
+    (пропуск закрывашки = write-грант без страховки, небезопасная сторона)."""
+    for phrase in ("Готово! Ещё что-нибудь?", "Ещё что-то?",
+                   "Помочь ещё с чем-нибудь?", "Что-нибудь еще?"):
+        hist = _hist_incident()
+        hist[-1] = AIMessage(content=phrase)
+        assert _prev_open_domains(hist) == set(), phrase
+
+
+def test_r2_substantive_question_with_eshe_closes_too_338():
+    """Содержательный вопрос со словом «ещё» тоже закрывает ход - ОСОЗНАННО
+    (безопасная сторона: лишний человеческий confirm, не открытый write)."""
+    hist = _hist_incident()
+    hist[-1] = AIMessage(content="Поставить ещё одно напоминание?")
+    assert _prev_open_domains(hist) == set()
+
+
+def test_r2_declined_text_freeze_via_real_wrap_338(monkeypatch):
+    """R2 Claude MINOR: текст отказа кандидата - через РЕАЛЬНЫЙ wrap (дрейф
+    литерала ломал бы фильтр наследования молча)."""
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime import react_loop
+
+    inner = StructuredTool.from_function(func=lambda title="": "ok",
+                                         name="schedule_reminder", description="d")
+    monkeypatch.setattr(react_loop, "interrupt", lambda payload: "нет")
+    declined = react_loop._generic_confirm_wrap(inner).invoke({"title": "x"})
+    hist = [
+        HumanMessage(content="поставь напоминание"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content=str(declined), name="schedule_reminder", tool_call_id="t1"),
+        AIMessage(content="Не ставлю. Скорректировать что-то?"),
+    ]
+    assert _prev_open_domains(hist) == set()

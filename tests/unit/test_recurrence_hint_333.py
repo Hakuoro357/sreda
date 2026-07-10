@@ -131,3 +131,31 @@ def test_bespoke_schedule_reminder_rejects_bad_rrule_333(db_session):
                        "recurrence_rule": "каждый час"})
     assert "Не разобрала правило повтора" in str(res)
     assert db_session.query(FamilyReminder).count() == 0
+
+
+def test_bespoke_past_start_recurrence_shows_real_time_333(db_session):
+    """R2 Claude MAJOR: прошедший старт повтора → в ответе РЕАЛЬНОЕ следующее
+    срабатывание (next_trigger_at), не прошедший trigger_at («ложный успех»)."""
+    from tests.unit.conftest import seed_telegram_user
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    tool = _schedule_tool(db_session, u)
+    res = str(tool.invoke({"title": "пить воду",
+                           "trigger_iso": "2020-01-01T12:30:00+03:00",
+                           "recurrence_rule": "FREQ=HOURLY"}))
+    assert res.startswith("ok:scheduled:")
+    assert "2020" not in res and "января" not in res  # прошедший старт не пересказан
+
+
+def test_bespoke_exhausted_series_honest_error_333(db_session):
+    """R2 Claude MINOR: серия целиком в прошлом → честный текст, не «нужен формат»."""
+    from tests.unit.conftest import seed_telegram_user
+    from sreda.db.models.housewife import FamilyReminder
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    tool = _schedule_tool(db_session, u)
+    res = str(tool.invoke({"title": "x", "trigger_iso": "2020-01-01T12:30:00+03:00",
+                           "recurrence_rule": "FREQ=HOURLY;COUNT=3"}))
+    assert "уже в прошлом" in res
+    assert "Нужен формат" not in res
+    assert db_session.query(FamilyReminder).count() == 0

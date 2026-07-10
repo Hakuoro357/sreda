@@ -381,3 +381,16 @@ def test_r2_generic_mentions_recurrence_338():
     assert "повторяющ" in q
     assert "кружок" in q
     assert "BYDAY" not in q
+
+
+def test_r2_until_recurrence_live_voice_works_338():
+    """R2 Claude MINOR: UNTIL-повтор - идеальная фраза рта (дословно по заданию)
+    ПРОХОДИТ верификатор (раньше даты из UNTIL резались как посторонние и живой
+    голос был мёртв для всего класса)."""
+    f = confirm_facts("schedule_reminder",
+                      {"title": "пить воду", "trigger_iso": _TRIGGER,
+                       "recurrence_rule": "FREQ=HOURLY;UNTIL=20260820T150000Z"})
+    assert f is not None and f.recurrence_human.startswith("каждый час до ")
+    text = (f"Ставлю напоминание «пить воду» завтра в 15:00, "
+            f"повтор {f.recurrence_human}. Подтверждаешь?")
+    assert verify_confirm_text(text, f, now=_NOW)
