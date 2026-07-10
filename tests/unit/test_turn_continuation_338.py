@@ -1,20 +1,14 @@
-"""#338 часть 1: страховка (кандидат-confirm B2b-2) - только на ПЕРВОЕ сообщение
-входа в ход (решение владельца 2026-07-10).
+"""#338 R6: страховка (кандидат-confirm B2b-2) - только на первое сообщение входа.
 
-Прод-инцидент (user_tg_755682022): Среда сама спросила «Во сколько поставить
-напоминание?» (обычным текстом, финал хода с schedule_reminder), человек ответил
-«В 15» - и получил кандидат-confirm с сырым «schedule_reminder (title=…,
-trigger_iso=…)». Глупо: ответ на НАШ ЖЕ вопрос.
-
-Механизм (R5-переделка, владелец: «не костылями»): решает ФОРМА ОТВЕТА юзера,
-не форма нашего вопроса. «Открытый ход» = прошлый ход агента реально работал с
-областью (write-инструмент исполнялся - факт журнала, не текст). Продолжение =
-сообщение юзера БЕЗ самостоятельной темы (ни доменных слов route, ни read-кюсов):
-«В 15», «завтра в 9», «Поставь». Любое доменное слово («перескажи напоминания»,
-«что с задачами», «добавь молоко в покупки») = обычный вход со страховкой.
-Финальный текст агента НЕ анализируется вообще (никаких «?» и списков закрывашек).
-Обобщение sticky-by-use #319 на все области. Ошибка строго в безопасную сторону
-(лишний ЧЕЛОВЕЧЕСКИЙ confirm).
+Финальная семантика (после CRITICAL R6 Codex medium): наследование области в ярус
+(а) - ТОЛЬКО при структурно НЕЗАКРЫТОМ СЛОТЕ прошлого хода: write-инструмент вернул
+слот-исход (time_not_specified - «нужно время», allowlist). Успешный ok-исход ход
+ЗАКРЫВАЕТ: «Готово, поставила.» → «Я буду у врача завтра в 15» (факт, не команда)
+НЕ наследует - иначе тихая мутация. Продолжение = ответ юзера без самостоятельной
+темы (нет доменных слов route/read_cues). Текст агента не анализируется вообще.
+Инцидент 755682022: «Поставь» → time_not_specified → «Во сколько?» → «В 12:30»
+ставит без переспроса; а после закрытого ok-хода уточнение идёт через ЧЕЛОВЕЧЕСКИЙ
+кандидат-confirm (1 тап) - осознанная цена безопасности.
 """
 from __future__ import annotations
 
@@ -26,16 +20,25 @@ from sreda.runtime.react_preflight import route_domains
 
 
 def _hist_incident():
-    """История инцидента: ход с schedule_reminder, финал - вопрос."""
+    """Открытый ход: schedule_reminder вернул слот-исход time_not_specified
+    (ход 2 инцидента: «Поставь» → «нужно время» → «Во сколько?»)."""
     return [
-        HumanMessage(content="Поставь напоминание на 19 августа выписка лекарства в 15 "
-                             "и напоминание на 18 августа что 19 августа в 15 выписка лекарст"),
+        HumanMessage(content="Поставь"),
         AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
-        ToolMessage(content="ok:scheduled:rem_1:2026-08-19T12:00:00Z",
-                    name="schedule_reminder", tool_call_id="t1"),
-        AIMessage(content="Ставлю напоминание: 19 августа в 15:00 - «выписка лекарства» "
-                          "(установлено). Для напоминания на 18 августа нужно уточнить "
-                          "время. Во сколько поставить его?"),
+        ToolMessage(content="уточни время", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "time_not_specified"}),
+        AIMessage(content="Во сколько точно поставить напоминание?"),
+    ]
+
+
+def _hist_closed_ok():
+    """ЗАКРЫТЫЙ ход: write исполнен успешно (ok) - слот закрыт."""
+    return [
+        HumanMessage(content="Поставь напоминание про лекарства завтра в 15"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="ok:scheduled:rem_1:x", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "ok"}),
+        AIMessage(content="Готово, поставила!"),
     ]
 
 
@@ -47,13 +50,40 @@ def test_prev_open_domains_incident_history_338():
 
 
 def test_prev_open_domains_any_final_text_338():
-    """R5: финальный текст агента НЕ анализируется - write-ход открывает область
-    независимо от формулировки финала (гейт продолжения - форма ОТВЕТА юзера)."""
-    for final in ("Готово, напоминание поставлено.", "Что-нибудь ещё?",
-                  "Во сколько поставить его?", "...?"):
+    """R6: финальный текст агента НЕ анализируется - при открытом СЛОТЕ область
+    наследуется независимо от формулировки финала."""
+    for final in ("Во сколько поставить его?", "Уточни время.", "Что-нибудь ещё?"):
         hist = _hist_incident()
         hist[-1] = AIMessage(content=final)
         assert "reminders" in _prev_open_domains(hist), final
+
+
+def test_r6_ok_outcome_closes_turn_338():
+    """R6 CRITICAL (Codex medium): успешный ok-исход ЗАКРЫВАЕТ ход - «Готово,
+    поставила.» → «Я буду у врача завтра в 15» (факт) не наследует write."""
+    assert _prev_open_domains(_hist_closed_ok()) == set()
+    pol = compute_unified_policy(
+        "Я буду у врача завтра в 15", route_domains("Я буду у врача завтра в 15"),
+        prev_open_domains=frozenset(_prev_open_domains(_hist_closed_ok())))
+    assert pol["allowed_write"] == []
+
+
+def test_r6_unavailable_does_not_open_338():
+    """R6 (оба Codex): unavailable/mode_mismatch и любые non-slot исходы ход не
+    открывают (позитивный allowlist вместо blacklist)."""
+    for kind in ("unavailable", "mode_mismatch", "ok", "search_limit"):
+        hist = _hist_incident()
+        hist[2] = ToolMessage(content="x", name="schedule_reminder", tool_call_id="t1",
+                              artifact={"result_kind": kind})
+        assert _prev_open_domains(hist) == set(), kind
+
+
+def test_r6_artifact_error_does_not_open_338():
+    """R6 medium: artifact result_kind=error (не только status) не открывает."""
+    hist = _hist_incident()
+    hist[2] = ToolMessage(content="error: сбой", name="schedule_reminder", tool_call_id="t1",
+                          artifact={"result_kind": "error"})
+    assert _prev_open_domains(hist) == set()
 
 
 def test_prev_open_domains_question_without_tools_338():
@@ -121,7 +151,8 @@ def test_prev_open_meta_and_unknown_names_safe_338():
         AIMessage(content="", tool_calls=[{"name": "set_alarm", "args": {}, "id": "t3"}]),
         ToolMessage(content="ok", name="set_alarm", tool_call_id="t3"),
         AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t4"}]),
-        ToolMessage(content="ok:scheduled:rem_1:x", name="schedule_reminder", tool_call_id="t4"),
+        ToolMessage(content="уточни время", name="schedule_reminder", tool_call_id="t4",
+                    artifact={"result_kind": "time_not_specified"}),
         AIMessage(content="Во сколько поставить второе напоминание?"),
     ]
     assert _prev_open_domains(hist) == {"reminders"}
@@ -188,13 +219,14 @@ def test_r2_multi_write_domain_fail_closed_338():
     hist = [
         HumanMessage(content="добавь задачу и поставь напоминание"),
         AIMessage(content="", tool_calls=[{"name": "add_task", "args": {}, "id": "t1"}]),
-        ToolMessage(content="ok:created:task_1", name="add_task", tool_call_id="t1"),
+        ToolMessage(content="дата?", name="add_task", tool_call_id="t1",
+                    artifact={"result_kind": "time_not_specified"}),
         AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t2"}]),
         ToolMessage(content="уточни время", name="schedule_reminder", tool_call_id="t2",
                     artifact={"result_kind": "time_not_specified"}),
-        AIMessage(content="Задачу добавила. Во сколько поставить напоминание?"),
+        AIMessage(content="Уточни дату задачи и время напоминания?"),
     ]
-    assert _prev_open_domains(hist) == set()
+    assert _prev_open_domains(hist) == set()  # два слот-домена = неоднозначно
 
 
 def test_r2_read_cue_other_domain_exits_338():

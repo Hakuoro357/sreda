@@ -1412,19 +1412,19 @@ _CONFIRM_DECLINED_TEXT = "Хорошо, не делаю."
 
 
 def _prev_open_domains(messages: Any) -> set:
-    """#338: область, с которой РЕАЛЬНО работал прошлый ход агента (write-инструмент
-    исполнялся) - «открытый ход». Слот-ответ юзера без самостоятельной темы (гейт -
-    в compute_unified_policy) продолжает его без кандидат-confirm (владелец
-    2026-07-10: «страховка только на первое сообщение входа»; инцидент 755682022:
-    «В 15» после нашего «во сколько?» получал сырой confirm).
+    """#338 R6: область НЕЗАКРЫТОГО СЛОТА прошлого хода агента. Наследование в ярус
+    (а) - ТОЛЬКО когда прошлый ход структурно запросил продолжение: write-инструмент
+    вернул слот-исход (result_kind="time_not_specified" - «нужно время»; allowlist
+    расширяем по мере появления слот-исходов). Успешный ok-исход ход ЗАКРЫВАЕТ
+    (R6 Codex medium CRITICAL: «Готово, поставила.» → «Я буду у врача завтра в 15»
+    - новый ФАКТ без доменных слов наследовал бы write → тихая мутация).
 
-    R5-переделка (владелец: «не костылями»): решает ФОРМА ОТВЕТА юзера, не форма
-    нашего вопроса. Финальный текст агента НЕ анализируется вообще (никаких
-    «?»-эвристик и списков закрывашек - R1-R5 показали, что парс собственных фраз
-    это бесконечное латание). Источник истины - журнал инструментов хода:
-    детерминированные исходы, не естественный язык. Обобщение sticky-by-use #319
-    («дверь открыта, пока областью пользуются») на все области, с более строгим
-    гейтом продолжения (текст без ЛЮБОЙ темы - см. policy)."""
+    Владелец 2026-07-10: «страховка только на первое сообщение входа» + «не
+    костылями». Финальный текст агента НЕ анализируется вообще; источник истины -
+    СТРУКТУРНЫЙ слот-исход журнала (не «?», не списки фраз). Позитивный allowlist
+    вместо blacklist (R6 оба Codex: unavailable/withdrawn/mode_mismatch и будущие
+    non-ok исходы не должны открывать ход). Гейт продолжения по тексту юзера -
+    в compute_unified_policy (нет доменных слов/read-кюсов)."""
     msgs = list(messages or [])
     if not msgs:
         return set()
@@ -1432,46 +1432,24 @@ def _prev_open_domains(messages: Any) -> set:
     if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
         return set()
     from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
-    # R1 MAJOR-6: исходы, которые ход НЕ открывают (инструмент фактически не работал
-    # с областью). time_not_specified СОЗНАТЕЛЬНО открывает - это и есть уточняющий
-    # исход инцидента («Поставь» → time_not_specified → «Во сколько?» → «В 12:30»).
-    _closed_kinds = frozenset({"domain_blocked", "search_limit", "error",
-                               "source_result_required", "schema_error",
-                               "withdrawn"})  # R6: #316-отзыв = не исполнялся
+    _SLOT_KINDS = frozenset({"time_not_specified"})
     domains: set = set()
     for m in reversed(msgs[:-1]):
         if isinstance(m, HumanMessage):
             break  # начало этого хода
         if isinstance(m, ToolMessage) and getattr(m, "name", None):
             name = _TOOL_NAME_ALIASES.get(m.name, m.name)
-            # R1 MAJOR-1 (все три): мета (ask_human/need_family) и галлюцинированные
-            # имена отсутствуют в манифесте - KeyError ронял бы ВЕСЬ unified в legacy
-            # fail-open ровно в инцидентном классе (ask_human «во сколько?»).
             if name not in TOOL_OP_CLASS:
-                continue
+                continue  # мета/галлюцинированные имена (R1 MAJOR-1)
             _art = getattr(m, "artifact", None)
-            if isinstance(_art, dict) and _art.get("result_kind") in _closed_kinds:
-                continue
-            if getattr(m, "status", None) == "error":
-                continue  # error-ToolMessage (status-атрибут, #159 исключение) ход не открывает
-            _content = m.content if isinstance(m.content, str) else ""
-            if _content.startswith(_CONFIRM_DECLINED_TEXT.rstrip(".")):
-                continue  # R1 MAJOR-6: отказанный кандидат ход НЕ открывает
-            # R1 консенсус трёх (Claude M2, high M3, medium M3): наследуем ТОЛЬКО
-            # домены WRITE-инструментов - read (list_tasks/recall_memory) сам по себе
-            # write-грант не даёт («Вот задачи. Что-нибудь ещё?» ≠ право писать).
-            # Это же закрывает memory-идиому B2: recall_memory (read) память не откроет,
-            # а memory-write и так идёт через confirm/sticky #319.
+            if not (isinstance(_art, dict) and _art.get("result_kind") in _SLOT_KINDS):
+                continue  # только СТРУКТУРНЫЙ слот-исход открывает ход
             domains |= set(tool_write_domains(name))
-    domains.discard("web")  # web не наследуем: не user-data, страховки не касается
-    # memory не наследуем: продолжение memory-серий - юрисдикция sticky-by-use #319
-    # (продление ТОЛЬКО фактом УСПЕШНОЙ записи, renewal в run_tools) - наследование
-    # с более слабым гейтом перекрывало бы его контракт (поймано смежным тестом
-    # test_sticky_not_opened_by_error_result при R5-переделке).
+    domains.discard("web")
+    # memory-продолжения - юрисдикция sticky #319 (гейт «только успешная запись»)
     domains.discard("memory")
-    # R2 medium: смешанный ход (add_task + schedule_reminder + вопрос) открывал бы ОБА
-    # домена - ошибочный task-write прошёл бы без страховки. Вопрос агента относится
-    # к одной теме → >1 write-домена = неоднозначно = fail-closed (не наследуем).
+    # >1 домена со слот-исходом = неоднозначно = fail-closed (R2 medium; R6: memory
+    # исключён ДО этой проверки осознанно - слот-исходов у memory-семьи нет)
     if len(domains) > 1:
         return set()
     return domains
