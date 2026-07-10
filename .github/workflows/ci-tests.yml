@@ -34,14 +34,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - name: Прогон unit-свита
-        # test_doc_on_disk_is_fresh читает ГЛОБАЛЬНЫЙ реестр инструментов и чувствителен к порядку
-        # (пре-существующее тест-загрязнение, отдельный follow-up) → гоним его ОТДЕЛЬНО (изолированно),
-        # из основного прогона исключаем. Это корректно для теста глобального артефакта, не заглушка.
+        # test_doc_on_disk_is_fresh — ЛОКАЛЬНО-девелоперский чек: сверяет ЛОКАЛЬНЫЙ генерируемый
+        # docs/internal/dev/SREDA_CAPABILITIES.md (он GITIGNORED, в репо не коммитится) с build_document().
+        # На CI-checkout файла НЕТ → тест неприменим (не «свежесть», а «файла нет»). Исключаем из CI.
+        # Свежесть капабилити-дока проверяется локально перед коммитом (см. vex-assistant#340).
         run: >-
           uv run --all-extras python -m pytest tests/unit -m "not pg"
           --deselect tests/unit/test_capabilities_map.py::test_doc_on_disk_is_fresh -q
-      - name: Свежесть капабилити-дока (изолированно)
-        run: uv run --all-extras python -m pytest tests/unit/test_capabilities_map.py -q
 
   pg-integration:
     name: pg-integration (реальный Postgres, класс #331)
