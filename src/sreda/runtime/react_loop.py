@@ -1444,7 +1444,9 @@ def _prev_open_domains(messages: Any) -> set:
     # пустой хвост после split - обход в небезопасную сторону)
     _segs = [x for x in re.split(r"[.!?]+", text.lower().replace("ё", "е").rstrip("?!. "))
              if x.strip()]
-    _last_sent = _segs[-1] if _segs else ""
+    if not _segs:
+        return set()  # R4 Claude: финал из чистой пунктуации («...?») - не вопрос, fail-closed
+    _last_sent = _segs[-1]
     if re.search(r"(?:^|[^а-яa-z0-9])еще(?:[^а-яa-z0-9]|$)", _last_sent):
         return set()
     from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
