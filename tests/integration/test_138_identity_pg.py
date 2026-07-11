@@ -279,8 +279,9 @@ def test_real_engine_scopes_handler_sequence(engines, monkeypatch):
     dbs.get_engine.cache_clear()
     dbs.get_session_factory.cache_clear()
     dbs._factory_for.cache_clear()
-    dbs._build_role_engine.cache_clear()
+    real_engine = None
     try:
+        real_engine = dbs.get_engine()  # реальный путь: регистрирует begin-слушатель
         tok = dbs.tenant_ctx.set(T_A)
         try:
             s = dbs.get_session_factory()()
@@ -299,6 +300,10 @@ def test_real_engine_scopes_handler_sequence(engines, monkeypatch):
                     "GUC не ре-эмитился после внутреннего commit — "
                     "handler-хвост сломался бы после флипа"
                 )
+                # R1-353 (гигиена): вернуть исходное значение колонки
+                s.execute(text(
+                    "UPDATE users SET last_bot_key=NULL WHERE tenant_id=:t"
+                ), {"t": T_A})
                 s.commit()
             finally:
                 s.close()
@@ -313,12 +318,14 @@ def test_real_engine_scopes_handler_sequence(engines, monkeypatch):
         finally:
             s2.close()
     finally:
-        # вернуть глобальные кеши в исходное (не отравить другие тесты)
+        # R1-353 (гигиена, оба Codex): dispose реального движка ДО сброса кешей
+        # (иначе pooled-соединения висят до GC); role-кеш не трогаем (не создавали).
+        if real_engine is not None:
+            real_engine.dispose()
         get_settings.cache_clear()
         dbs.get_engine.cache_clear()
         dbs.get_session_factory.cache_clear()
         dbs._factory_for.cache_clear()
-        dbs._build_role_engine.cache_clear()
 
 
 def test_existing_user_path_roles(engines):
