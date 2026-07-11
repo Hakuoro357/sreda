@@ -45,6 +45,23 @@ def db_session():
         sess.close()
 
 
+@pytest.fixture(autouse=True)
+def _identity_resolve_uses_db(db_session, monkeypatch):
+    """#138 Ф5-5b: резолв личности идёт под ОТДЕЛЬНОЙ identity-сессией
+    (privileged_session), а не под сессией вызывающего — после флипа DSN это
+    identity-роль. В юнит-тесте стабаем эту сессию на ту же sqlite-БД, где
+    засеяны данные, чтобы _resolve_direct видел их (диалект sqlite → ORM-путь)."""
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+
+    @contextmanager
+    def _stub(reason):
+        yield db_session
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+
+
 def _make_request(*, platform: str | None = "max", auth: str = "tma fake_init_data"):
     """Build a minimal FastAPI Request mock с query_params."""
     from starlette.datastructures import Headers, QueryParams

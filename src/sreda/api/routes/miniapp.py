@@ -21,6 +21,8 @@ from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
+
+from sreda.services.identity_resolve import AmbiguousExternalIdentity
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm import Session
 
@@ -276,14 +278,14 @@ def _require_miniapp_auth(
         account_id = max_user.max_user_id
         try:
             resolved = resolve_tenant_from_max_account_id(session, account_id)
-        except MultipleResultsFound:
+        except (MultipleResultsFound, AmbiguousExternalIdentity):
             # codex R2 MINOR #6: specific exception вместо bare ``Exception``.
-            # `find_user_by_max_account_id` использует one_or_none(),
-            # на duplicate `users.max_account_id` (нет UNIQUE constraint
-            # в текущей schema) бросит MultipleResultsFound. Любые другие
-            # DB ошибки пробрасываются вверх (FastAPI 500) с raw stack —
-            # это правильно: «duplicate integrity» — не маска любого
-            # falure'а, а конкретный case.
+            # На duplicate `users.max_account_id` (нет UNIQUE constraint в
+            # текущей schema): прежний путь через one_or_none() бросал
+            # MultipleResultsFound; #138 Ф5-5b резолв через DEFINER бросает
+            # AmbiguousExternalIdentity (fail-closed на n>1). Оба = «дубль,
+            # не привязывать» → 500. Любые другие DB ошибки пробрасываются
+            # вверх (FastAPI 500) с raw stack — это правильно.
             logger.exception(
                 "miniapp auth: duplicate users.max_account_id for max=%s — "
                 "DATA INTEGRITY ERROR, нужен migration с UNIQUE partial index",

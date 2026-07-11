@@ -180,9 +180,14 @@ def resolve_tenant_from_max_account_id(
     одинаковая сигнатура для unified channel-agnostic dispatch в
     `miniapp._resolve_miniapp_context`.
     """
-    from sreda.services.onboarding import find_user_by_max_account_id
+    # #138 Ф5-5b: резолв через DEFINER под identity-ролью (privileged_session
+    # внутри), не прямым SELECT users — переданный ``session`` не используется.
+    # Инертно до флипа DSN. max_account_id НЕ unique → неоднозначность возможна:
+    # helper бросает AmbiguousExternalIdentity (зеркалит прежний
+    # MultipleResultsFound-путь; вызывающий miniapp его ловит → отказ, не дубль).
+    from sreda.services.identity_resolve import resolve_external_identity
 
-    user = find_user_by_max_account_id(session, max_account_id)
-    if user is None:
+    resolved = resolve_external_identity("max", max_account_id)
+    if resolved is None:
         return None
-    return user.tenant_id, user.id
+    return resolved.tenant_id, resolved.user_id

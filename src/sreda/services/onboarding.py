@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.models.core import Assistant, Tenant, User, Workspace
-from sreda.db.repositories.seed import SeedRepository
+from sreda.db.repositories.seed import insert_only_bundle
 from sreda.services.signup_abuse import SignupAbuseGuard, SignupBlocked
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,84 @@ def _auto_approve_and_grant_free_tier(session: Session, tenant_id: str) -> None:
         updated_at=now,
     ))
     session.commit()
+
+
+def _grant_free_tier_insert_only(session: Session, tenant_id: str) -> None:
+    """#138 Ф5-5b: free-tier грант для СВЕЖЕГО тенанта — INSERT-only, без
+    pre-SELECT tenant_subscriptions (под identity-роль такой SELECT недоступен).
+
+    Вызывается ТОЛЬКО из провижн-пути нового юзера (``created=True``) — тенант
+    только что создан в той же транзакции, активной подписки быть не может,
+    idempotency-проверка не нужна. plan_id читается из subscription_plans
+    (публичный справочник, identity получил SELECT-грант в 0083). approved_at
+    уже проставлен в INSERT tenants (insert_only_bundle) — UPDATE не требуется.
+    """
+    now = datetime.now(timezone.utc)
+    free_plan = (
+        session.query(SubscriptionPlan)
+        .filter(SubscriptionPlan.plan_key == "sreda_free")
+        .one_or_none()
+    )
+    if free_plan is None:
+        logger.warning(
+            "provision: sreda_free plan не существует — пропускаю grant для "
+            "tenant=%s. Проверь migration 0041 applied.", tenant_id,
+        )
+        return
+    session.add(TenantSubscription(
+        id="sub_" + uuid.uuid4().hex[:24],
+        tenant_id=tenant_id,
+        plan_id=free_plan.id,
+        feature_key=free_plan.feature_key,
+        status="active",
+        starts_at=now,
+        active_until=None,
+        cancel_at_period_end=False,
+        quantity=1,
+        next_cycle_quantity=1,
+        created_at=now,
+        updated_at=now,
+    ))
+    session.commit()
+
+
+def provision_new_tenant_bundle(
+    session: Session,
+    *,
+    tenant_id: str,
+    display_name: str,
+    workspace_id: str,
+    user_id: str,
+    assistant_id: str,
+    telegram_account_id: str | None = None,
+    max_account_id: str | None = None,
+    max_chat_id: str | None = None,
+    last_bot_key: str | None = None,
+) -> bool:
+    """#138 Ф5-5b: единая точка провижна НОВОГО юзера под identity-скоупом.
+
+    Только INSERT-операции: bundle (insert_only_bundle, approved_at + last_bot_key
+    в INSERT) + free-tier подписка (при реальной вставке). Никаких pre-SELECT/
+    UPDATE — путь работает под ``privileged_session("inbound-provision")`` после
+    флипа DSN. Возвращает ``created`` (см. insert_only_bundle).
+    """
+    created = insert_only_bundle(
+        session,
+        tenant_id=tenant_id,
+        tenant_name=display_name,
+        workspace_id=workspace_id,
+        workspace_name=display_name,
+        user_id=user_id,
+        telegram_account_id=telegram_account_id,
+        max_account_id=max_account_id,
+        max_chat_id=max_chat_id,
+        last_bot_key=last_bot_key,
+        assistant_id=assistant_id,
+        assistant_name="Среда",
+    )
+    if created:
+        _grant_free_tier_insert_only(session, tenant_id)
+    return created
 
 
 def _stamp_last_bot_key(session: Session, user: User, bot_key: str | None) -> None:
@@ -294,26 +372,20 @@ def ensure_telegram_user_bundle_by_id(
     user_id = f"user_tg_{telegram_id}"
     assistant_id = f"assistant_tg_{telegram_id}"
 
-    SeedRepository(session).ensure_tenant_bundle(
+    # #138 Ф5-5b: провижн строго INSERT-only под identity-скоупом. approved_at
+    # (авто-одобрение) + last_bot_key (#109 маршрутизация уведомлений на бота
+    # регистрации) выставляются прямо в INSERT — прежние UPDATE tenants
+    # (_auto_approve) и UPDATE users (_stamp) для нового юзера не нужны.
+    provision_new_tenant_bundle(
+        session,
         tenant_id=tenant_id,
-        tenant_name=display_name,
+        display_name=display_name,
         workspace_id=workspace_id,
-        workspace_name=display_name,
         user_id=user_id,
-        telegram_account_id=telegram_id,
         assistant_id=assistant_id,
-        assistant_name="Среда",
+        telegram_account_id=telegram_id,
+        last_bot_key=bot_key,
     )
-
-    # Phase 2C: auto-approve + sreda_free grant. Replaces manual
-    # admin /admin/tenant/approve flow. Tenant immediately usable.
-    _auto_approve_and_grant_free_tier(session, tenant_id)
-
-    # #109: stamp current bot on the freshly-created user too, so a brand-new
-    # user's async notifications route to the bot they signed up on.
-    new_user = session.get(User, user_id)
-    if new_user is not None:
-        _stamp_last_bot_key(session, new_user, bot_key)
 
     return TelegramOnboardingResult(
         True, telegram_id, tenant_id, workspace_id, user_id, assistant_id
@@ -630,27 +702,19 @@ def ensure_max_user_bundle(
     user_id = f"user_max_{aid}"
     assistant_id = f"assistant_max_{aid}"
 
-    SeedRepository(session).ensure_tenant_bundle(
+    # #138 Ф5-5b: INSERT-only провижн под identity. max_chat_id идёт прямо в
+    # INSERT (прежний post-commit patch через session.get+UPDATE убран),
+    # approved_at — авто-одобрение в INSERT.
+    provision_new_tenant_bundle(
+        session,
         tenant_id=tenant_id,
-        tenant_name=display_name,
+        display_name=display_name,
         workspace_id=workspace_id,
-        workspace_name=display_name,
         user_id=user_id,
-        max_account_id=aid,
         assistant_id=assistant_id,
-        assistant_name="Среда",
+        max_account_id=aid,
+        max_chat_id=chat_id_str or None,
     )
-
-    # ensure_tenant_bundle commit'нул, теперь patch'им chat_id
-    if chat_id_str:
-        u = session.get(User, user_id)
-        if u is not None:
-            u.max_chat_id = chat_id_str
-            session.commit()
-
-    # Phase 2C: auto-approve + sreda_free grant. Replaces manual
-    # admin /admin/tenant/approve flow.
-    _auto_approve_and_grant_free_tier(session, tenant_id)
 
     return MaxOnboardingResult(
         True, aid, chat_id_str, tenant_id, workspace_id, user_id, assistant_id
