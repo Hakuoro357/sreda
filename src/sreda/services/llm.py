@@ -30,10 +30,13 @@ import logging
 import re
 from typing import Any, Callable, Iterator
 
+import httpx
 from langchain_core.messages.utils import message_chunk_to_message
 from langchain_openai import ChatOpenAI
 
 from sreda.config.settings import Settings, get_settings
+from sreda.services import llm_bulkhead
+from sreda.services.llm_guard_errors import LLMBulkheadFull, LLMCircuitOpen
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,7 @@ def invoke_with_per_call_timeout(
     messages: list,
     *,
     timeout_seconds: float = _PER_CALL_TIMEOUT_DEFAULT,
+    provider: str | None = None,
 ) -> Any:
     """Invoke `runnable.invoke(messages)` с жёстким wall-clock timeout.
 
@@ -80,15 +84,47 @@ def invoke_with_per_call_timeout(
         runnable: LangChain Runnable (typically `llm.bind_tools(...)`).
         messages: список Message objects для invoke.
         timeout_seconds: лимит. Default 60s (= mimo_request_timeout_seconds).
+        provider: имя провайдера для per-provider circuit breaker (#343).
+            None → общий breaker-bucket (breaker всё равно работает).
 
     Returns:
         Результат runnable.invoke(messages) (обычно AIMessage).
 
     Raises:
+        LLMCircuitOpen: breaker провайдера открыт (fast-fail без потока).
+        LLMBulkheadFull: достигнут лимит одновременных вызовов (fast-fail
+            без потока — #343 F7, бортует накопление зависших потоков).
         LLMCallTimeout: если timeout превышен. Поднимает TimeoutError-
             совместимый exception, который ловится `with_fallbacks` chain.
         Любые другие исключения от runnable пробрасываются как есть.
     """
+    # #343 F7: reliability guard (bulkhead + per-provider breaker). Snapshot the
+    # config once so all decisions in this call use the same limits. The breaker
+    # is per-provider, so it is applied ONLY when a provider name is known —
+    # conflating distinct providers into one bucket could open the breaker for
+    # the primary and then wrongly suppress the (different-provider) fallback.
+    cfg = llm_bulkhead.read_guard_config()
+    breaker = None
+    bulkhead = None
+    if cfg.enabled:
+        if provider:
+            breaker = llm_bulkhead.get_breaker(provider)
+            if not breaker.allow(
+                open_after=cfg.breaker_open_after, cooldown=cfg.breaker_cooldown
+            ):
+                raise LLMCircuitOpen(
+                    f"LLM circuit open for provider {provider!r}; skipping call"
+                )
+        bulkhead = llm_bulkhead.get_bulkhead()
+        if not bulkhead.try_acquire(cfg.max_concurrent):
+            # Fast-fail BEFORE creating a thread — this is what bounds the
+            # accumulation of hung worker threads/sockets.
+            if breaker is not None:
+                breaker.record_other_error()  # release any half-open probe slot
+            raise LLMBulkheadFull(
+                f"LLM bulkhead full ({cfg.max_concurrent} concurrent in flight)"
+            )
+
     # Per-call executor — изолируем hung thread от shared pool.
     # ВАЖНО: НЕ используем `with` block — exit() вызывает shutdown(wait=True)
     # и ждёт пока медленный thread завершится, перечёркивая весь смысл
@@ -96,15 +132,31 @@ def invoke_with_per_call_timeout(
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="llm-invoke"
     )
-    future = executor.submit(runnable.invoke, messages)
+    try:
+        future = executor.submit(runnable.invoke, messages)
+    except BaseException:
+        # submit failed → never held the thread; release the permit now.
+        if bulkhead is not None:
+            bulkhead.release()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    if bulkhead is not None:
+        # Release the permit ONLY when the worker thread actually finishes —
+        # which for a hung provider is long after our wall-clock timeout. This
+        # ties the permit to the thread's lifetime so ``max_concurrent`` bounds
+        # the number of simultaneously-alive (incl. hung) invoke threads.
+        future.add_done_callback(lambda _f: bulkhead.release())
     try:
         result = future.result(timeout=timeout_seconds)
     except concurrent.futures.TimeoutError as exc:
         # Hung thread остаётся в executor'е, его нельзя убить из Python.
         # shutdown(wait=False) не блокирует наш возврат. cancel_futures=True
         # cancel'ит pending tasks (хотя у нас одна running, она не cancel'ится).
-        # Главное: текущий turn НЕ блокируется в ожидании MiMo.
+        # Главное: текущий turn НЕ блокируется в ожидании MiMo. Permit держится
+        # до реального завершения потока (done-callback выше), НЕ здесь.
         executor.shutdown(wait=False, cancel_futures=True)
+        if breaker is not None:
+            breaker.record_timeout(open_after=cfg.breaker_open_after)
         raise LLMCallTimeout(
             f"LLM invoke exceeded {timeout_seconds}s wall time"
         ) from exc
@@ -112,10 +164,14 @@ def invoke_with_per_call_timeout(
         # Любые другие исключения (provider errors, и т.п.) — пробрасываем.
         # Executor cleanup идёт в обычном порядке после раскрутки.
         executor.shutdown(wait=False, cancel_futures=True)
+        if breaker is not None:
+            breaker.record_other_error()
         raise
     else:
         # Успех. Cleanup non-blocking.
         executor.shutdown(wait=False, cancel_futures=True)
+        if breaker is not None:
+            breaker.record_success()
         return result
 
 
@@ -154,6 +210,7 @@ async def ainvoke_with_streaming_timeout(
     *,
     timeout_seconds: float = _PER_CALL_TIMEOUT_DEFAULT,
     on_text_update: Callable[[str], None] | None = None,
+    provider: str | None = None,
 ) -> Any:
     """Async stream/invoke wrapper with the same wall-clock timeout contract.
 
@@ -161,6 +218,11 @@ async def ainvoke_with_streaming_timeout(
     runnable supports streaming. Otherwise falls back to the existing
     ``invoke_with_per_call_timeout`` path in a worker thread so the asyncio
     event loop remains free for ack-message edits.
+
+    ``provider`` feeds the per-provider circuit breaker (#343 F7). The
+    non-streaming branch delegates to ``invoke_with_per_call_timeout`` (which
+    applies the guard once); the streaming branch applies the same
+    bulkhead+breaker guard here around its own worker executor.
     """
     if on_text_update is None or not hasattr(runnable, "stream"):
         return await asyncio.to_thread(
@@ -168,7 +230,30 @@ async def ainvoke_with_streaming_timeout(
             runnable,
             messages,
             timeout_seconds=timeout_seconds,
+            provider=provider,
         )
+
+    # #343 F7 reliability guard for the streaming branch (its own executor).
+    # Breaker is per-provider → applied only when the provider name is known.
+    cfg = llm_bulkhead.read_guard_config()
+    breaker = None
+    bulkhead = None
+    if cfg.enabled:
+        if provider:
+            breaker = llm_bulkhead.get_breaker(provider)
+            if not breaker.allow(
+                open_after=cfg.breaker_open_after, cooldown=cfg.breaker_cooldown
+            ):
+                raise LLMCircuitOpen(
+                    f"LLM circuit open for provider {provider!r}; skipping stream"
+                )
+        bulkhead = llm_bulkhead.get_bulkhead()
+        if not bulkhead.try_acquire(cfg.max_concurrent):
+            if breaker is not None:
+                breaker.record_other_error()  # release any half-open probe slot
+            raise LLMBulkheadFull(
+                f"LLM bulkhead full ({cfg.max_concurrent} concurrent in flight)"
+            )
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -184,42 +269,63 @@ async def ainvoke_with_streaming_timeout(
         except BaseException as exc:  # noqa: BLE001
             loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
 
-    executor.submit(_worker)
+    worker_future = executor.submit(_worker)
+    if bulkhead is not None:
+        # Permit released when the streaming worker thread actually ends — for
+        # a hung provider that is long after our wall-clock timeout. Bounds the
+        # accumulation of hung stream threads to ``max_concurrent``.
+        worker_future.add_done_callback(lambda _f: bulkhead.release())
     deadline = loop.time() + timeout_seconds
     combined: Any | None = None
     text_so_far = ""
     saw_tool_chunk = False
 
     try:
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise LLMCallTimeout(
-                    f"LLM stream exceeded {timeout_seconds}s wall time"
-                )
-            try:
-                kind, payload = await asyncio.wait_for(queue.get(), timeout=remaining)
-            except asyncio.TimeoutError as exc:
-                raise LLMCallTimeout(
-                    f"LLM stream exceeded {timeout_seconds}s wall time"
-                ) from exc
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise LLMCallTimeout(
+                        f"LLM stream exceeded {timeout_seconds}s wall time"
+                    )
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise LLMCallTimeout(
+                        f"LLM stream exceeded {timeout_seconds}s wall time"
+                    ) from exc
 
-            if kind == "error":
-                raise payload
-            if kind == "done":
-                break
+                if kind == "error":
+                    raise payload
+                if kind == "done":
+                    break
 
-            chunk = payload
-            combined = chunk if combined is None else combined + chunk
-            if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
-                saw_tool_chunk = True
-                continue
-            text_piece = _chunk_text(chunk)
-            if text_piece and not saw_tool_chunk:
-                text_so_far += text_piece
-                on_text_update(text_so_far)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+                chunk = payload
+                combined = chunk if combined is None else combined + chunk
+                if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
+                    saw_tool_chunk = True
+                    continue
+                text_piece = _chunk_text(chunk)
+                if text_piece and not saw_tool_chunk:
+                    text_so_far += text_piece
+                    on_text_update(text_so_far)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except LLMCallTimeout:
+        if breaker is not None:
+            breaker.record_timeout(open_after=cfg.breaker_open_after)
+        raise
+    except BaseException:
+        # Provider-side / cancellation errors: neutral to the breaker (no hung
+        # thread to bound). The worker's own permit is released via its
+        # done-callback whenever the thread finishes.
+        if breaker is not None:
+            breaker.record_other_error()
+        raise
+
+    # Stream completed (broke on "done") → the provider responded, not hung.
+    if breaker is not None:
+        breaker.record_success()
 
     if combined is None:
         return await asyncio.to_thread(
@@ -227,6 +333,7 @@ async def ainvoke_with_streaming_timeout(
             runnable,
             messages,
             timeout_seconds=timeout_seconds,
+            provider=provider,
         )
     result = message_chunk_to_message(combined)
     if (
@@ -239,6 +346,7 @@ async def ainvoke_with_streaming_timeout(
             runnable,
             messages,
             timeout_seconds=timeout_seconds,
+            provider=provider,
         )
     if text_so_far and not _message_has_tool_calls(result):
         # The ack UX streams ``text_so_far`` to the user as the visible
@@ -1452,6 +1560,30 @@ _OPENROUTER_EXTRA_BODY_BY_PROVIDER: dict[str, dict] = {
 }
 
 
+def _build_request_timeout(settings: Settings) -> httpx.Timeout:
+    """Explicit, FINITE per-phase httpx timeouts for the chat-LLM client (#343
+    F7). A bare float applies the same value to every phase; naming
+    connect/read/write/pool separately bounds each — most importantly ``pool``
+    (waiting for a free connection) and ``connect`` (TCP/TLS handshake), which
+    a single hung ``read`` never covers.
+
+    ``read`` defaults to ``mimo_request_timeout_seconds`` (the historical value)
+    when ``llm_read_timeout_seconds`` is unset, so effective read behaviour is
+    unchanged; the wall-clock ThreadPoolExecutor timeout remains the real guard
+    for a provider that streams keepalive chunks (which reset httpx's per-chunk
+    read timer).
+    """
+    read = settings.llm_read_timeout_seconds
+    if read is None:
+        read = settings.mimo_request_timeout_seconds
+    return httpx.Timeout(
+        connect=settings.llm_connect_timeout_seconds,
+        read=read,
+        write=settings.llm_write_timeout_seconds,
+        pool=settings.llm_pool_timeout_seconds,
+    )
+
+
 def _build_chat_llm(
     provider: str,
     settings: Settings,
@@ -1487,7 +1619,7 @@ def _build_chat_llm(
             # (currently ``mimo-v2-pro``); ``mimo-v2.5`` → ``mimo-v2.5-pro``.
             model=model or override or settings.mimo_chat_model,
             temperature=temperature,
-            timeout=settings.mimo_request_timeout_seconds,
+            timeout=_build_request_timeout(settings),
             **kwargs,
         )
     if provider in _OPENROUTER_MODEL_BY_PROVIDER:
@@ -1520,7 +1652,7 @@ def _build_chat_llm(
             # 2026-05-11 PM: per-provider temperature override.
             # Nemotron specifically needs lower temp (0.1) to avoid drift.
             temperature=_override_temperature(provider, temperature),
-            timeout=settings.mimo_request_timeout_seconds,
+            timeout=_build_request_timeout(settings),
             **kwargs,
         )
     if provider in _INCEPTION_MODEL_BY_PROVIDER:
@@ -1534,7 +1666,7 @@ def _build_chat_llm(
             api_key=api_key,
             model=model or override,
             temperature=_override_temperature(provider, temperature),
-            timeout=settings.mimo_request_timeout_seconds,
+            timeout=_build_request_timeout(settings),
             **kwargs,
         )
     if provider in _GROQ_MODEL_BY_PROVIDER:  # #184 прямой Groq «Оса»
@@ -1551,7 +1683,7 @@ def _build_chat_llm(
             api_key=api_key,
             model=model or override,
             temperature=_override_temperature(provider, temperature),
-            timeout=settings.mimo_request_timeout_seconds,
+            timeout=_build_request_timeout(settings),
             **kwargs,
         )
     logger.warning("chat LLM: unknown provider %r — ignoring", provider)

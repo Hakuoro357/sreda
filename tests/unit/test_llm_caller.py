@@ -233,7 +233,7 @@ def test_persist_request_called_before_invoke(monkeypatch):
     async def fake_persist_request(attempt, *args, **kwargs):
         call_order.append(f"persist_request:{attempt}")
 
-    async def fake_invoke(llm, messages, *, timeout_seconds, on_text_update):
+    async def fake_invoke(llm, messages, *, timeout_seconds, on_text_update, provider=None):
         call_order.append("invoke")
         return MagicMock(name="ai_msg")
 
@@ -288,7 +288,7 @@ def test_fallback_path_args_and_ordering(monkeypatch):
 
     invoked_llms: list = []
 
-    async def fake_invoke(llm, messages, *, timeout_seconds, on_text_update):
+    async def fake_invoke(llm, messages, *, timeout_seconds, on_text_update, provider=None):
         invoked_llms.append(llm)
         call_order.append("invoke")
         if len(invoked_llms) == 1:

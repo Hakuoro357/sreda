@@ -793,7 +793,7 @@ def test_256_chat_fact_short_timeout_task_unchanged(install, monkeypatch):
     """#256: chat/fact-вызовы под КОРОТКИМ таймаутом (react_chat_llm_timeout_sec); task — под общим 60с."""
     from sreda.config import settings as sm
     cap = []
-    def _cap(runnable, msgs, timeout_seconds=None):
+    def _cap(runnable, msgs, timeout_seconds=None, provider=None):
         cap.append(timeout_seconds)
         return AIMessage(content="ок")
     monkeypatch.setattr(react_loop, "invoke_with_per_call_timeout", _cap)
@@ -816,7 +816,7 @@ def test_256_default_when_env_unset(install, monkeypatch):
     """#256: env НЕ задан → Field-дефолт 15с применяется к chat/fact (R1 субагент MINOR — ассерт значения)."""
     from sreda.config import settings as sm
     cap = []
-    def _cap(runnable, msgs, timeout_seconds=None):
+    def _cap(runnable, msgs, timeout_seconds=None, provider=None):
         cap.append(timeout_seconds)
         return AIMessage(content="ок")
     monkeypatch.setattr(react_loop, "invoke_with_per_call_timeout", _cap)
