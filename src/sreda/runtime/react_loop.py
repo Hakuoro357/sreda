@@ -2048,15 +2048,43 @@ def _turn_time_window_text(messages: Any) -> str:
             break
     if last_h < 0:
         return ""
-    human = str(getattr(msgs[last_h], "content", "") or "")
-    # R3 (субагент R2 MAJOR-1): точка МЕЖДУ цифрами — «9.30»/«08.07», НЕ граница предложения (иначе
-    # окно рвало «напомни про рейс 9.30» → «напомни про рейс 9» → ложный отказ на названном времени).
-    sents = [s.strip() for s in re.split(r"[!?;\n]+|\.(?!\d)", human) if s.strip()]
-    remind_sents = [s for s in sents if _is_remind_intent_sentence(s)]
-    parts = [" ".join(remind_sents) if remind_sents else human]
+    def _human_window(idx: int) -> str:
+        human = str(getattr(msgs[idx], "content", "") or "")
+        # R3 (субагент R2 MAJOR-1): точка МЕЖДУ цифрами — «9.30»/«08.07», НЕ граница предложения
+        # (иначе окно рвало «напомни про рейс 9.30» → ложный отказ на названном времени).
+        sents = [x.strip() for x in re.split(r"[!?;\n]+|\.(?!\d)", human) if x.strip()]
+        remind_sents = [x for x in sents if _is_remind_intent_sentence(x)]
+        return " ".join(remind_sents) if remind_sents else human
+
+    parts = [_human_window(last_h)]
     for m in msgs[last_h + 1:]:
         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_human":
             parts.append(str(getattr(m, "content", "") or ""))
+    # #349: слот-СЕРИЯ — между сообщениями юзера был структурный исход
+    # time_not_specified («Поставь напоминание с 13:30 каждый час» → слот → «до 18»:
+    # время 13:30 из ПЕРВОГО сообщения серии обязано быть видно гейту, иначе цикл
+    # переспросов «Во сколько?» — прод 2026-07-11, владелец). Расширение по
+    # ARTIFACT-факту (не тексту, в духе #338-механики); закрытый ok-ход цепочку
+    # рвёт — время ЧУЖОГО закрытого хода в окно не протекает (R2-контракт
+    # «время события ≠ время напоминания» цел).
+    hi = last_h
+    while hi > 0:
+        prev_h = -1
+        for i in range(hi - 1, -1, -1):
+            if isinstance(msgs[i], HumanMessage):
+                prev_h = i
+                break
+        if prev_h < 0:
+            break
+        _slot_between = any(
+            isinstance(m, ToolMessage)
+            and isinstance(getattr(m, "artifact", None), dict)
+            and m.artifact.get("result_kind") == "time_not_specified"
+            for m in msgs[prev_h + 1:hi])
+        if not _slot_between:
+            break
+        parts.append(_human_window(prev_h))
+        hi = prev_h
     return "\n".join(parts)
 
 
