@@ -9,12 +9,30 @@
    success-пути ДО except — telegram_inbound.py) → строка остаётся ingested/processing_started.
    Считаем такие строки старше grace в скользящем окне, группируя по (channel_type, bot_key) —
    всплеск на ЛЮБОМ срезе (в т.ч. лендинг-бот sreda_home, невидимый канарейке) даёт алерт.
+   Порог 2 на срез: одиночный transient не будит (одиночный крэш ловится лог-сигналом ниже).
 2. **Логи: класс ошибки.** Инкрементальный хвост ``/var/log/sreda/*.log`` (offset-state, без
-   пере-скана): ``psycopg.errors.<Class>`` (вкл. ActiveSqlTransaction) и строка
-   «background turn processing crashed» → алерт с ПЕРВОГО появления, с именем класса.
+   пере-скана): ``psycopg.errors.<Class>`` и маркеры проглоченного крэша хода
+   («background turn processing crashed» — telegram, «max approved turn crashed» — MAX).
+   Ярусы (ревью R1: не обесценить монитор ложными P2):
+   - порча-классы транзакций (ActiveSqlTransaction, InFailedSqlTransaction) и turn-crash маркеры
+     → P2 с ПЕРВОГО появления;
+   - прочие psycopg.errors.* → INFO и только при ≥3 за тик (обработанные/ретраящиеся одиночки
+     фоновых задач не будят).
 
-Анти-шторм: state в runtime_config (переживает рестарт) — offset'ы логов + кулдаун 60 мин на
-повторяющуюся сигнатуру. Первый запуск инициализирует offset'ы концом файлов (историю не алертим).
+Дедуп/анти-шторм — ШТАТНЫЙ механизм ``send_admin_alert`` (dedupe_key + окно по severity: P2=10мин,
+INFO=30мин; «отправлено» ставится только при успешной доставке → недоставленный алерт ретраится
+следующим тиком). Свой кулдаун НЕ держим (ревью R1 high: свой кулдаун глушил бы недоставленное).
+
+Устойчивость к прод-ротации логов (logrotate ``copytruncate``, maxsize 200M): офсеты в БАЙТАХ +
+отпечаток головы файла (sha1 зафиксированного префикса) — truncate меняет голову → поколение
+сменилось → читаем с нуля, даже если файл успел отрасти выше старого офсета. Офсет двигается
+ТОЛЬКО на фактически прочитанное (сбой чтения → ретрай с того же места); потолок 5MiB за тик —
+остаток дочитывается следующими тиками. Маркер на границе кусков ловится carry-хвостом.
+Принятый компромисс (ревью R1): строки, записанные МЕЖДУ последним тиком и copytruncate, теряются
+для лог-сигнала (окно ≤1 тика раз в ротацию); этот хвост подстраховывает БД-сигнал.
+
+Первый запуск инициализирует офсеты концом файлов (историю не алертим). State — в runtime_config
+(переживает рестарт). Инвариант деплоя: job-runner — ОДИН systemd-инстанс (state без блокировок).
 Best-effort по образцу svo_monitor: исключение тика проглатывается с логом, цикл не падает.
 
 Запуск: фоновый task в ``run_job_loop_async`` (job-runner). Выключатель: ``SREDA_CRASH_ALERT_ENABLED=0``.
@@ -23,6 +41,7 @@ Best-effort по образцу svo_monitor: исключение тика пр�
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -45,24 +64,25 @@ _RC_STATE_KEY: Final = "crash_alert_monitor_state"
 _LOG_GLOB_DEFAULT: Final = "/var/log/sreda/*.log"
 
 # Скользящее окно и порог БД-сигнала. Grace = 10 мин (как inbound_stuck в reliability_report #139:
-# штатный ход завершается за секунды; confirm-пауза помечает processed до паузы). Порог 2 на срез:
-# одиночный transient не будит, инцидент класса #331 (несколько юзеров/ретраев) — будит.
+# штатный ход завершается за секунды; confirm-пауза помечает processed до паузы).
 _DB_WINDOW: Final = timedelta(minutes=30)
 _DB_GRACE: Final = timedelta(minutes=10)
 _DB_THRESHOLD_DEFAULT: Final = 2
 
-_COOLDOWN: Final = timedelta(minutes=60)
 _TICK_SECONDS_DEFAULT: Final = 300.0
-# потолок чтения нового куска лога за тик — защита от разового скана гигантского хвоста
-_MAX_CHUNK_BYTES: Final = 5 * 1024 * 1024
+_MAX_CHUNK_BYTES: Final = 5 * 1024 * 1024   # потолок чтения за тик (остаток — следующими тиками)
+_CARRY_CHARS: Final = 300                   # хвост прошлого куска — ловит маркер на границе
+_HEAD_SIG_BYTES: Final = 256                # отпечаток головы файла (детект copytruncate)
 
-# классы ошибок в логах. NB: ActiveSqlTransaction ловится первым паттерном (psycopg.errors.*),
-# «background turn processing crashed» — маркер проглоченного крэша фона (telegram_inbound).
-_LOG_PATTERNS: Final = (
-    re.compile(r"psycopg\.errors\.(\w+)"),
-    re.compile(r"background turn processing crashed"),
+_PSYCOPG_RE: Final = re.compile(r"psycopg\.errors\.(\w+)")
+# маркеры проглоченного крэша хода по каналам (строки logger.exception в inbound-обвязке)
+_TURN_CRASH_MARKERS: Final = (
+    (re.compile(r"background turn processing crashed"), "turn_crash(telegram)"),
+    (re.compile(r"max approved turn crashed"), "turn_crash(max)"),
 )
-_TURN_CRASH_CLASS: Final = "turn_crash(background)"
+# порча-классы транзакций: P2 с первого появления (класс инцидента #331)
+_POISON_CLASSES: Final = frozenset({"ActiveSqlTransaction", "InFailedSqlTransaction"})
+_OTHER_CLASS_MIN_COUNT: Final = 3           # прочие psycopg-классы: INFO и только при >=3 за тик
 
 
 def _utcnow() -> datetime:
@@ -87,13 +107,26 @@ def _db_threshold() -> int:
         return _DB_THRESHOLD_DEFAULT
 
 
+def _head_sig(path: str, n_bytes: int = _HEAD_SIG_BYTES) -> str:
+    """Отпечаток головы файла (первые n_bytes): copytruncate переписывает содержимое с нуля →
+    отпечаток меняется. Длина префикса ФИКСИРУЕТСЯ в state (sig_len): у файла короче 256Б голова
+    растёт при дописывании, и хеш «первых size байт» ложно менялся бы на каждый append."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha1(f.read(n_bytes)).hexdigest()
+    except OSError:
+        return ""
+
+
 @dataclass
 class _State:
-    """Персистентное состояние монитора (JSON в runtime_config)."""
+    """Персистентное состояние монитора (JSON в runtime_config).
 
-    offsets: dict[str, int] = field(default_factory=dict)      # путь лога → прочитанный offset
-    cooldowns: dict[str, str] = field(default_factory=dict)    # сигнатура алерта → iso-время
-    initialized: bool = False                                   # первый запуск: offsets = EOF, историю молчим
+    files: путь → {"off": байт-офсет, "sig": отпечаток головы, "carry": хвост прошлого куска}.
+    """
+
+    files: dict[str, dict] = field(default_factory=dict)
+    initialized: bool = False  # первый запуск: офсеты = EOF, историю молчим
 
     @classmethod
     def load(cls) -> "_State":
@@ -102,39 +135,22 @@ class _State:
                 raw = rc.get_config(session, _RC_STATE_KEY)
             if raw:
                 d = json.loads(raw)
-                return cls(offsets=dict(d.get("offsets", {})),
-                           cooldowns=dict(d.get("cooldowns", {})),
-                           initialized=bool(d.get("initialized", False)))
+                files = d.get("files", {})
+                if not isinstance(files, dict):
+                    files = {}
+                return cls(files=files, initialized=bool(d.get("initialized", False)))
         except Exception:  # noqa: BLE001 — сломанный state не должен убить монитор
             logger.warning("crash_alert: state load failed, starting fresh", exc_info=True)
         return cls()
 
     def save(self) -> None:
         try:
-            payload = json.dumps({"offsets": self.offsets, "cooldowns": self.cooldowns,
-                                  "initialized": self.initialized}, ensure_ascii=False)
+            payload = json.dumps({"files": self.files, "initialized": self.initialized},
+                                 ensure_ascii=False)
             with privileged_session("monitor") as session:
                 rc.set_config(session, _RC_STATE_KEY, payload)
         except Exception:  # noqa: BLE001
             logger.warning("crash_alert: state save failed", exc_info=True)
-
-    def cooldown_passed(self, sig: str, now: datetime) -> bool:
-        raw = self.cooldowns.get(sig)
-        if not raw:
-            return True
-        try:
-            last = datetime.fromisoformat(raw)
-        except ValueError:
-            return True
-        return (now - last) >= _COOLDOWN
-
-    def stamp(self, sig: str, now: datetime) -> None:
-        self.cooldowns[sig] = now.isoformat()
-        # не копим сигнатуры бесконечно: выкидываем протухшие (>24ч)
-        stale = [k for k, v in self.cooldowns.items()
-                 if (now - datetime.fromisoformat(v)) > timedelta(hours=24)]
-        for k in stale:
-            self.cooldowns.pop(k, None)
 
 
 @dataclass(frozen=True)
@@ -148,11 +164,7 @@ class StuckSlice:
 
 
 def scan_stuck_inbound(session, now: datetime, threshold: int) -> list[StuckSlice]:  # noqa: ANN001
-    """БД-сигнал: необработанные inbound старше grace в окне, по срезам (канал, бот).
-
-    Крэш фона оставляет processing_status в ingested/processing_started (telegram_inbound: processed
-    ставится только на success-пути). Порог на СРЕЗ, не суммарно — всплеск лендинг-бота виден отдельно.
-    """
+    """БД-сигнал: необработанные inbound старше grace в окне, по срезам (канал, бот)."""
     lo = now - _DB_WINDOW
     hi = now - _DB_GRACE
     rows = session.execute(
@@ -182,23 +194,38 @@ def scan_stuck_inbound(session, now: datetime, threshold: int) -> list[StuckSlic
     return out
 
 
-def scan_log_chunk(chunk: str) -> dict[str, int]:
-    """Счёт классов ошибок в куске лога. Ключ = имя класса (psycopg.errors.X → X)."""
+def scan_log_text(text: str, offset_chars: int = 0, *, truncated_tail: bool = False) -> dict[str, int]:
+    """Счёт классов ошибок в тексте; учитываются только совпадения, ЗАКАНЧИВАЮЩИЕСЯ после
+    offset_chars (начало текста = carry прошлого тика, его совпадения уже считались).
+
+    truncated_tail=True — кусок обрезан потолком чтения: psycopg-матч, упирающийся в самый конец,
+    может нести ОБРЕЗАННОЕ имя класса (\\w+ съедает сколько есть — «ActiveSqlTr») → бросаем его,
+    полное имя дочитается следующим тиком через carry. Фиксированным turn-crash маркерам обрезка
+    не грозит (совпадение = вся строка целиком)."""
     found: dict[str, int] = {}
-    for m in _LOG_PATTERNS[0].finditer(chunk):
+    for m in _PSYCOPG_RE.finditer(text):
+        if m.end() <= offset_chars:
+            continue
+        if truncated_tail and m.end() == len(text):
+            continue
         cls = m.group(1)
         found[cls] = found.get(cls, 0) + 1
-    n_crash = len(_LOG_PATTERNS[1].findall(chunk))
-    if n_crash:
-        found[_TURN_CRASH_CLASS] = found.get(_TURN_CRASH_CLASS, 0) + n_crash
+    for rx, label in _TURN_CRASH_MARKERS:
+        n = sum(1 for m in rx.finditer(text) if m.end() > offset_chars)
+        if n:
+            found[label] = found.get(label, 0) + n
     return found
 
 
 def scan_logs(state: _State, log_glob: str) -> dict[str, dict[str, int]]:
     """Инкрементальный хвост логов: {класс_ошибки: {файл: счёт}} по НОВЫМ байтам с прошлого тика.
 
-    Первый запуск (state.initialized=False) только выставляет offset'ы в EOF — историю не алертим.
-    Ротация (size < offset) → читаем файл с нуля. Кусок больше потолка — читаем последние N байт.
+    - первый запуск монитора: только выставить офсеты в EOF (историю не алертим);
+    - НОВЫЙ файл после инициализации: читаем С НУЛА (ревью R1: файл после rename-ротации);
+    - смена поколения (size < off ИЛИ отпечаток головы изменился — copytruncate): с нуля;
+    - офсет двигается ТОЛЬКО на фактически прочитанные байты (сбой чтения → ретрай);
+    - кусок больше потолка → читаем потолок, остаток следующими тиками;
+    - маркер на границе кусков → carry-хвост прошлого куска.
     """
     results: dict[str, dict[str, int]] = {}
     for path in sorted(glob(log_glob)):
@@ -206,45 +233,70 @@ def scan_logs(state: _State, log_glob: str) -> dict[str, dict[str, int]]:
             size = os.path.getsize(path)
         except OSError:
             continue
-        prev = state.offsets.get(path, None)
-        if prev is None or not state.initialized:
-            state.offsets[path] = size  # первый взгляд на файл: начинаем с конца
-            continue
-        start = 0 if size < prev else prev  # ротация → с нуля
-        state.offsets[path] = size
+        entry = state.files.get(path)
+        if entry is None:
+            if not state.initialized:
+                n0 = min(_HEAD_SIG_BYTES, size)
+                state.files[path] = {"off": size, "sig": _head_sig(path, n0), "sig_len": n0,
+                                     "carry": ""}
+                continue
+            entry = {"off": 0, "sig": "", "sig_len": 0, "carry": ""}  # новый файл после init → с нуля
+        start = int(entry.get("off", 0))
+        carry = str(entry.get("carry", ""))
+        sig_len = int(entry.get("sig_len", 0))
+        # поколение сменилось (copytruncate/rename): файл короче офсета/отпечатка ИЛИ голова
+        # (в зафиксированной длине префикса) больше не совпадает
+        gen_changed = size < start or size < sig_len or (
+            sig_len > 0 and _head_sig(path, sig_len) != entry.get("sig"))
+        if gen_changed:
+            start, carry = 0, ""
         if size <= start:
+            new_len = min(_HEAD_SIG_BYTES, size)
+            state.files[path] = {"off": start, "sig": _head_sig(path, new_len), "sig_len": new_len,
+                                 "carry": carry}
             continue
-        if size - start > _MAX_CHUNK_BYTES:
-            start = size - _MAX_CHUNK_BYTES
+        to_read = min(size - start, _MAX_CHUNK_BYTES)
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, "rb") as f:
                 f.seek(start)
-                chunk = f.read(size - start)
+                raw = f.read(to_read)
         except OSError:
-            continue
-        for cls, n in scan_log_chunk(chunk).items():
+            continue  # офсет/отпечаток НЕ трогаем — ретрай следующим тиком
+        text = raw.decode("utf-8", errors="replace")
+        combined = carry + text
+        capped = (start + len(raw)) < size  # кусок обрезан потолком — хвост может нести обрезанный класс
+        for cls, n in scan_log_text(combined, offset_chars=len(carry),
+                                    truncated_tail=capped).items():
             results.setdefault(cls, {})[os.path.basename(path)] = n
+        new_len = min(_HEAD_SIG_BYTES, size)
+        state.files[path] = {"off": start + len(raw), "sig": _head_sig(path, new_len),
+                             "sig_len": new_len, "carry": combined[-_CARRY_CHARS:]}
     state.initialized = True
     return results
 
 
-def _format_alert(slices: list[StuckSlice], log_hits: dict[str, dict[str, int]]) -> str:
-    lines = ["⚠️ Крэши ходов [P2] (#335, монитор мера D)"]
-    for s in slices:
-        who = (" (" + ", ".join(s.tenants) + ")") if s.tenants else ""
-        lines.append(f"БД: {s.channel_type}/{s.bot_key} — {s.count} необработанных входящих "
-                     f"за {int(_DB_WINDOW.total_seconds() // 60)} мин{who}")
+def _classify_log_hits(log_hits: dict[str, dict[str, int]]) -> list[tuple[str, str, dict[str, int]]]:
+    """Ярусы лог-сигнала: [(severity, класс, {файл: счёт})]. Прочие psycopg — INFO и только >=3."""
+    out: list[tuple[str, str, dict[str, int]]] = []
     for cls, files in sorted(log_hits.items()):
-        per_file = ", ".join(f"{f}×{n}" for f, n in sorted(files.items()))
-        lines.append(f"Логи: {cls} — {per_file}")
-    lines.append("Разбор: journalctl/греп по классу; трейс — react_turn_trace (status=in_progress).")
-    return "\n".join(lines)
+        total = sum(files.values())
+        if cls in _POISON_CLASSES or cls.startswith("turn_crash"):
+            out.append(("P2", cls, files))
+        elif total >= _OTHER_CLASS_MIN_COUNT:
+            out.append(("INFO", cls, files))
+    return out
 
 
 def tick_once(state: _State, *, now: datetime | None = None,
-              log_glob: str = _LOG_GLOB_DEFAULT) -> str | None:
-    """Один проход монитора. Возвращает текст отправленного алерта (или None). Sync (гоняем в thread)."""
+              log_glob: str = _LOG_GLOB_DEFAULT) -> list[str]:
+    """Один проход. Возвращает dedupe_key отправленных алертов (пусто = тихо). Sync (гоняем в thread).
+
+    Дедуп повторов — внутри send_admin_alert (dedupe_key + окно severity; помечает «отправлено»
+    только при успешной доставке). Каждая сигнатура — ОТДЕЛЬНЫЙ алерт со своим dedupe_key, чтобы
+    новая сигнатура во время живого инцидента не глушилась ключом предыдущей.
+    """
     now = now or _utcnow()
+    sent: list[str] = []
 
     # 1) БД-сигнал по срезам
     slices: list[StuckSlice] = []
@@ -254,36 +306,49 @@ def tick_once(state: _State, *, now: datetime | None = None,
     except Exception:  # noqa: BLE001
         logger.warning("crash_alert: db scan failed", exc_info=True)
 
-    # 2) лог-сигнал (классы ошибок)
+    # 2) лог-сигнал (классы ошибок, ярусы)
     log_hits: dict[str, dict[str, int]] = {}
     try:
         log_hits = scan_logs(state, log_glob)
     except Exception:  # noqa: BLE001
         logger.warning("crash_alert: log scan failed", exc_info=True)
 
-    # 3) кулдаун по сигнатурам — алертим только новое/остывшее
-    fresh_slices = [s for s in slices
-                    if state.cooldown_passed(f"db:{s.channel_type}:{s.bot_key}", now)]
-    fresh_logs = {cls: files for cls, files in log_hits.items()
-                  if state.cooldown_passed(f"log:{cls}", now)}
-    if not fresh_slices and not fresh_logs:
-        state.save()
-        return None
+    for s in slices:
+        key = f"crash_alert:db:{s.channel_type}:{s.bot_key}"
+        who = ("; тенанты: " + ", ".join(s.tenants)) if s.tenants else ""
+        try:
+            send_admin_alert(
+                "P2",
+                f"⚠️ Крэши ходов: {s.channel_type}/{s.bot_key} (#335)",
+                (f"{s.count} необработанных входящих за "
+                 f"{int(_DB_WINDOW.total_seconds() // 60)} мин на срезе "
+                 f"{s.channel_type}/{s.bot_key}{who}.\n"
+                 f"Разбор: react_turn_trace (status=in_progress), греп логов по тенанту."),
+                dedupe_key=key,
+            )
+            sent.append(key)
+        except Exception:  # noqa: BLE001
+            logger.warning("crash_alert: send failed for %s", key, exc_info=True)
 
-    text = _format_alert(fresh_slices, fresh_logs)
-    try:
-        send_admin_alert(text)
-    except Exception:  # noqa: BLE001
-        logger.warning("crash_alert: send_admin_alert failed", exc_info=True)
-        state.save()
-        return None
-    for s in fresh_slices:
-        state.stamp(f"db:{s.channel_type}:{s.bot_key}", now)
-    for cls in fresh_logs:
-        state.stamp(f"log:{cls}", now)
+    for severity, cls, files in _classify_log_hits(log_hits):
+        key = f"crash_alert:log:{cls}"
+        per_file = ", ".join(f"{f}×{n}" for f, n in sorted(files.items()))
+        try:
+            send_admin_alert(
+                severity,
+                f"⚠️ Ошибки в логах: {cls} (#335)",
+                f"Класс {cls}: {per_file} (новые строки с прошлого тика).\n"
+                f"Разбор: греп по классу в /var/log/sreda/.",
+                dedupe_key=key,
+            )
+            sent.append(key)
+        except Exception:  # noqa: BLE001
+            logger.warning("crash_alert: send failed for %s", key, exc_info=True)
+
     state.save()
-    logger.warning("crash_alert: alert sent\n%s", text)
-    return text
+    if sent:
+        logger.warning("crash_alert: alerts sent: %s", ", ".join(sent))
+    return sent
 
 
 async def run_crash_alert_loop() -> None:
@@ -292,7 +357,8 @@ async def run_crash_alert_loop() -> None:
         logger.info("crash_alert: disabled via SREDA_CRASH_ALERT_ENABLED=0")
         return
     logger.info("crash_alert: monitor started (tick=%ss)", _tick_seconds())
-    state = _State.load()
+    # R1 субагент MAJOR: load ходит в БД синхронно — в thread, не блокировать event loop job-runner
+    state = await asyncio.to_thread(_State.load)
     while True:
         try:
             await asyncio.to_thread(tick_once, state)
