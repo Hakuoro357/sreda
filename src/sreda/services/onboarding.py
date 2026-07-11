@@ -117,7 +117,8 @@ def _grant_free_tier_insert_only(session: Session, tenant_id: str) -> None:
         created_at=now,
         updated_at=now,
     ))
-    session.commit()
+    # R2 (Codex high CRIT-3): без commit — коммитит provision_new_tenant_bundle
+    # одной транзакцией (атомарность гард+бандл+грант).
 
 
 def _resolve_free_plan(session: Session) -> tuple[str | None, str | None]:
@@ -140,6 +141,9 @@ def _resolve_free_plan(session: Session) -> tuple[str | None, str | None]:
 def provision_new_tenant_bundle(
     session: Session,
     *,
+    guard: SignupAbuseGuard,
+    channel: str,
+    external_id: str,
     tenant_id: str,
     display_name: str,
     workspace_id: str,
@@ -150,13 +154,21 @@ def provision_new_tenant_bundle(
     max_chat_id: str | None = None,
     last_bot_key: str | None = None,
 ) -> bool:
-    """#138 Ф5-5b: единая точка провижна НОВОГО юзера под identity-скоупом.
+    """#138 Ф5-5b: АТОМАРНЫЙ провижн НОВОГО юзера под identity-скоупом.
 
-    Только INSERT-операции: bundle (insert_only_bundle, approved_at + last_bot_key
-    в INSERT) + free-tier подписка (при реальной вставке). Никаких pre-SELECT/
-    UPDATE — путь работает под ``privileged_session("inbound-provision")`` после
-    флипа DSN. Возвращает ``created`` (см. insert_only_bundle).
+    Всё в ОДНОЙ транзакции ``session`` (identity/privileged), ОДИН commit в конце
+    (R2 Codex high CRIT-3): анти-абьюз-гард (advisory-лок + DEFINER-счётчики +
+    запись попытки) → bundle (INSERT-only, approved_at+last_bot_key в INSERT) →
+    free-tier подписка (при реальной вставке). Advisory-лок держится до commit —
+    cap сериализован, cap-checked-and-granted атомарно.
+
+    ``guard`` строится вызывающим на APP-сессии (читает runtime_config — identity
+    не может); значения лимитов уже внутри guard. Бросает SignupBlocked (session
+    откатится при выходе из privileged-контекста). Возвращает ``created``.
     """
+    allowed, reason = guard.check_inside_tx(session, channel, external_id)
+    if not allowed:
+        raise SignupBlocked(reason)
     created = insert_only_bundle(
         session,
         tenant_id=tenant_id,
@@ -173,6 +185,7 @@ def provision_new_tenant_bundle(
     )
     if created:
         _grant_free_tier_insert_only(session, tenant_id)
+    session.commit()  # единственный commit — атомарность гард+бандл+грант
     return created
 
 
@@ -373,12 +386,10 @@ def ensure_telegram_user_bundle_by_id(
         )
         raise SignupBlocked("signups_closed")
 
+    # Гард строится на APP-сессии (читает runtime_config — identity не может).
     guard = SignupAbuseGuard.from_runtime_config(
         session, bot_signup_open=_bot_signup_open,
     )
-    allowed, reason = guard.check_inside_tx(session, "telegram", telegram_id)
-    if not allowed:
-        raise SignupBlocked(reason)
 
     display_name = display_name or f"Пользователь {telegram_id}"
     tenant_id = f"tenant_tg_{telegram_id}"
@@ -386,24 +397,28 @@ def ensure_telegram_user_bundle_by_id(
     user_id = f"user_tg_{telegram_id}"
     assistant_id = f"assistant_tg_{telegram_id}"
 
-    # #138 Ф5-5b: провижн строго INSERT-only под identity-скоупом. approved_at
-    # (авто-одобрение) + last_bot_key (#109 маршрутизация уведомлений на бота
-    # регистрации) выставляются прямо в INSERT — прежние UPDATE tenants
-    # (_auto_approve) и UPDATE users (_stamp) для нового юзера не нужны.
-    created = provision_new_tenant_bundle(
-        session,
-        tenant_id=tenant_id,
-        display_name=display_name,
-        workspace_id=workspace_id,
-        user_id=user_id,
-        assistant_id=assistant_id,
-        telegram_account_id=telegram_id,
-        last_bot_key=bot_key,
-    )
+    # #138 Ф5-5b: identity-фаза (гард+бандл+грант) — ОДНА privileged-транзакция
+    # под ролью sreda_identity. approved_at (авто-одобрение) + last_bot_key (#109)
+    # в INSERT — прежние UPDATE tenants/users для нового юзера не нужны.
+    # Инертно до флипа DSN (privileged_session фолбэкает на общий движок).
+    from sreda.db.session import privileged_session
 
-    # R2 (Codex high MAJOR-4): is_new_user = фактический created. Проигравший
-    # гонку (created=False) → бандл создал параллельный запрос, ID валидны, но
-    # юзер НЕ новый.
+    with privileged_session("inbound-provision") as isess:
+        created = provision_new_tenant_bundle(
+            isess,
+            guard=guard,
+            channel="telegram",
+            external_id=telegram_id,
+            tenant_id=tenant_id,
+            display_name=display_name,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            telegram_account_id=telegram_id,
+            last_bot_key=bot_key,
+        )
+
+    # R2 (Codex high MAJOR-4): is_new_user = фактический created (гонку проиграл → не новый).
     return TelegramOnboardingResult(
         created, telegram_id, tenant_id, workspace_id, user_id, assistant_id
     )
@@ -706,12 +721,8 @@ def ensure_max_user_bundle(
             assistant.id if assistant is not None else None,
         )
 
-    # Phase 2C: signup abuse guard ПЕРЕД bundle creation. Raises
-    # SignupBlocked если kill-switch / global cap / rate-limit hit.
+    # Гард на APP-сессии (читает runtime_config — identity не может).
     guard = SignupAbuseGuard.from_runtime_config(session)
-    allowed, reason = guard.check_inside_tx(session, "max", aid)
-    if not allowed:
-        raise SignupBlocked(reason)
 
     display_name = display_name or f"Пользователь {aid}"
     tenant_id = f"tenant_max_{aid}"
@@ -719,19 +730,25 @@ def ensure_max_user_bundle(
     user_id = f"user_max_{aid}"
     assistant_id = f"assistant_max_{aid}"
 
-    # #138 Ф5-5b: INSERT-only провижн под identity. max_chat_id идёт прямо в
-    # INSERT (прежний post-commit patch через session.get+UPDATE убран),
-    # approved_at — авто-одобрение в INSERT.
-    created = provision_new_tenant_bundle(
-        session,
-        tenant_id=tenant_id,
-        display_name=display_name,
-        workspace_id=workspace_id,
-        user_id=user_id,
-        assistant_id=assistant_id,
-        max_account_id=aid,
-        max_chat_id=chat_id_str or None,
-    )
+    # #138 Ф5-5b: identity-фаза (гард+бандл+грант) — ОДНА privileged-транзакция.
+    # max_chat_id/approved_at в INSERT (прежний post-commit patch убран). Инертно
+    # до флипа DSN.
+    from sreda.db.session import privileged_session
+
+    with privileged_session("inbound-provision") as isess:
+        created = provision_new_tenant_bundle(
+            isess,
+            guard=guard,
+            channel="max",
+            external_id=aid,
+            tenant_id=tenant_id,
+            display_name=display_name,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            max_account_id=aid,
+            max_chat_id=chat_id_str or None,
+        )
 
     # R2 (Codex high MAJOR-4): is_new_user = фактический created (гонку проиграл → не новый).
     return MaxOnboardingResult(

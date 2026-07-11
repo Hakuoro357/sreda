@@ -112,7 +112,10 @@ def _provision(session, **kw):
         assistant_id="as_99", assistant_name="Среда",
     )
     defaults.update(kw)
-    return insert_only_bundle(session, **defaults)
+    # insert_only_bundle больше не коммитит (атомарность в provision) — коммитим тут.
+    created = insert_only_bundle(session, **defaults)
+    session.commit()
+    return created
 
 
 def test_insert_only_bundle_creates_approved_tenant(session):
@@ -159,9 +162,51 @@ def test_insert_only_bundle_tenant_name_encrypted(tmp_path):
         workspace_id="ws_5", workspace_name="Дом", user_id="user_tg_5",
         telegram_account_id="5", assistant_id="as_5", assistant_name="Среда",
     )
+    s.commit()
     raw = s.execute(text("SELECT name FROM tenants WHERE id='tenant_tg_5'")).scalar()
     s.close()
     assert "Секрет" not in raw, "tenant.name записан плейнтекстом — EncryptedString обойдён"
+
+
+def test_provision_atomic_blocked_creates_nothing(session):
+    """R2 (Codex high CRIT-3): гард блокирует → provision бросает SignupBlocked,
+    бандл НЕ создан (гард+бандл+грант одной транзакцией, единый commit в конце)."""
+    from sreda.db.models.core import Tenant
+    from sreda.services.onboarding import provision_new_tenant_bundle
+    from sreda.services.signup_abuse import SignupAbuseGuard, SignupBlocked
+
+    guard = SignupAbuseGuard(signup_open=False)  # kill-switch → блок
+    with pytest.raises(SignupBlocked):
+        provision_new_tenant_bundle(
+            session, guard=guard, channel="telegram", external_id="77",
+            tenant_id="tenant_tg_77", display_name="X", workspace_id="ws_77",
+            user_id="user_tg_77", assistant_id="as_77", telegram_account_id="77",
+        )
+    session.rollback()
+    assert session.get(Tenant, "tenant_tg_77") is None, "заблокированный провижн не должен создавать тенант"
+
+
+def test_provision_atomic_success_creates_bundle_and_sub(session):
+    """Гард пропускает → provision создаёт бандл + free-tier (если тариф засеян) + commit."""
+    from sreda.db.models.billing import SubscriptionPlan
+    from sreda.db.models.core import Tenant, User
+    from sreda.services.onboarding import provision_new_tenant_bundle
+    from sreda.services.signup_abuse import SignupAbuseGuard
+
+    session.add(SubscriptionPlan(
+        id="plan_free", plan_key="sreda_free", feature_key="housewife_assistant",
+        title="Free", description="Free tier", price_rub=0,
+    ))
+    session.commit()
+    guard = SignupAbuseGuard(signup_open=True, free_tier_active_max=100)
+    created = provision_new_tenant_bundle(
+        session, guard=guard, channel="telegram", external_id="88",
+        tenant_id="tenant_tg_88", display_name="Y", workspace_id="ws_88",
+        user_id="user_tg_88", assistant_id="as_88", telegram_account_id="88",
+    )
+    assert created is True
+    assert session.get(Tenant, "tenant_tg_88") is not None
+    assert session.get(User, "user_tg_88") is not None
 
 
 def test_insert_only_bundle_never_updates_existing(session):

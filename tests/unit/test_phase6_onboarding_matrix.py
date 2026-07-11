@@ -92,6 +92,22 @@ def session(engine):
         s.close()
 
 
+@pytest.fixture(autouse=True)
+def _identity_phase_uses_session(session, monkeypatch):
+    """#138 Ф5-5b: identity-фаза (резолв + провижн) открывает отдельную
+    privileged_session (после флипа DSN — роль sreda_identity). В юните стабаем
+    её на ту же sqlite-сессию теста, чтобы провижн писал в засеянную БД."""
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+
+    @contextmanager
+    def _stub(reason):
+        yield session
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+
+
 def _seed_plan(session) -> SubscriptionPlan:
     plan = SubscriptionPlan(
         id=f"plan_{uuid4().hex[:16]}",

@@ -117,7 +117,10 @@ def insert_only_bundle(
         "VALUES (:id, :t, 'core_assistant', :en)",
         {"id": f"{tenant_id}:core_assistant", "t": tenant_id, "en": True},
     )
-    session.commit()
+    # R2 (Codex high CRIT-3): НЕ commit'им здесь — весь identity-этап (гард +
+    # бандл + грант) коммитится ОДИН раз вызывающим (provision_new_tenant_bundle),
+    # иначе advisory-лок анти-абьюза освобождался бы до вставки подписки. flush
+    # уже сделан (_add/_exec_ignore_dup); строки видны в текущей транзакции.
     return created
 
 

@@ -33,6 +33,21 @@ def session():
         sess.close()
 
 
+@pytest.fixture(autouse=True)
+def _identity_phase_uses_session(session, monkeypatch):
+    """#138 Ф5-5b: identity-фаза (резолв+провижн) на отдельной privileged_session;
+    в юните стабаем на sqlite-сессию теста."""
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+
+    @contextmanager
+    def _stub(reason):
+        yield session
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+
+
 def test_new_max_user_creates_full_bundle(session):
     result = ensure_max_user_bundle(
         session, max_account_id="40921122", max_chat_id="320955459",
