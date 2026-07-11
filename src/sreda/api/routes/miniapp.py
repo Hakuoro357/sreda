@@ -21,10 +21,10 @@ from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from sreda.services.identity_resolve import AmbiguousExternalIdentity
-from sqlalchemy.orm.exc import StaleDataError
-from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
 from sreda.config.settings import get_settings

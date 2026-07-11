@@ -224,6 +224,46 @@ def test_counter_functions_work_under_identity(engines):
     assert isinstance(cap, int) and cap >= 0
 
 
+def test_setconfig_reemitted_per_transaction(engines):
+    """#138 Ф5-5c (Codex R4 MINOR): КЛЮЧЕВОЕ свойство обёртки inbound-хвоста —
+    begin-событие app-движка ре-эмитит set_config('sreda.tenant_id') на КАЖДОЙ
+    транзакции пока tenant_ctx выставлен (is_local=true → сбрасывается на commit,
+    ре-эмитится на следующем begin). Именно это делает persist_* (внутренний commit)
+    + последующие entitlement/status ре-скоупленными. Ломается — весь inbound после
+    флипа умрёт. Тестируем реальный механизм db/session._emit_tenant_setconfig."""
+    from sqlalchemy import event
+
+    from sreda.db.session import _emit_tenant_setconfig, tenant_ctx
+
+    app = create_engine(_DSN_APP, poolclass=NullPool)
+    event.listen(app, "begin", _emit_tenant_setconfig)
+    tok = tenant_ctx.set(T_A)
+    try:
+        with app.connect() as c:
+            with c.begin():  # txn1
+                v1 = c.execute(
+                    text("SELECT current_setting('sreda.tenant_id', true)")
+                ).scalar()
+            with c.begin():  # txn2 — после commit txn1, ре-эмит на новом begin
+                v2 = c.execute(
+                    text("SELECT current_setting('sreda.tenant_id', true)")
+                ).scalar()
+        assert v1 == T_A, "GUC не выставлен в первой транзакции"
+        assert v2 == T_A, "GUC НЕ ре-эмитился после commit — inbound-хвост сломался бы"
+    finally:
+        tenant_ctx.reset(tok)
+        app.dispose()
+    # без ctx — GUC пуст (fail-closed):
+    app2 = create_engine(_DSN_APP, poolclass=NullPool)
+    event.listen(app2, "begin", _emit_tenant_setconfig)
+    try:
+        with app2.connect() as c, c.begin():
+            v = c.execute(text("SELECT current_setting('sreda.tenant_id', true)")).scalar()
+        assert v in (None, ""), "без tenant_ctx GUC должен быть пуст"
+    finally:
+        app2.dispose()
+
+
 def test_existing_user_path_roles(engines):
     """#138 Ф5-5c: операции обслуживания СУЩЕСТВУЮЩЕГО юзера проходят под нужными
     ролями (после флипа DSN). app+ctx: UPDATE users own (last_bot_key). maintenance

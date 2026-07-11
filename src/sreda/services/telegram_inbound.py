@@ -1267,6 +1267,11 @@ async def handle_telegram_update(
             external_chat_id=str(onboarding.chat_id),
         )
         enqueued_ok = False
+        # #138 Ф5-5c (Codex high R4 / субагент MINOR): message_jobs — tenant RLS
+        # таблица; enqueue/ре-запрос под tenant_ctx (после флипа DSN app-роль без
+        # ctx: INSERT нарушит WITH CHECK, SELECT вернёт пусто). Путь за флагом
+        # SREDA_MESSAGE_QUEUE_ENABLED_TENANTS (default OFF) + само-лечится на inline.
+        _qtok = tenant_ctx.set(onboarding.tenant_id)
         try:
             with SessionLocal() as session:
                 with session.begin():
@@ -1328,6 +1333,7 @@ async def handle_telegram_update(
                 enqueued_ok = True
             # else: row really isn't there — fall through to inline
             # path as a safety net (zero-message-loss contract).
+        tenant_ctx.reset(_qtok)  # #138: снять ctx queue-ветки (оба пути: return/inline)
         if enqueued_ok:
             return inbound_message_id
         # else: fall through to inline path below as a safety net

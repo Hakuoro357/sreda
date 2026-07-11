@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from sreda.config.settings import get_settings
 from sreda.db.models.core import Tenant
-from sreda.db.session import get_session_factory, tenant_ctx
+from sreda.db.session import get_session_factory, privileged_session, tenant_ctx
 from sreda.integrations.max import MaxClient
 from sreda.integrations.max.client import MaxDeliveryError
 from sreda.services.inbound_messages import persist_max_inbound_event
@@ -1929,8 +1929,11 @@ async def _handle_max_link_start_cmd(*, raw_token: str, chat_id: str | None) -> 
         logger.warning("max link /start: missing max_bot_token или chat_id")
         return
 
-    SessionLocal = get_session_factory()
-    with SessionLocal() as session:
+    # #138 Ф5-5c (Codex high R4 MAJOR): кросс-тенантный lookup токена
+    # (channel_link_tokens — tenant-таблица; ветка ДО резолва, source-тенант чужой)
+    # под privileged("channel-link") — после флипа DSN app-роль без ctx не увидела
+    # бы токен → «ссылка недействительна». Как miniapp channel-link роуты.
+    with privileged_session("channel-link") as session:
         # #187 Phase 4a — gate source-тенант ДО показа confirm-кнопки. Column-
         # only пред-чтение ``tenant_id`` по token_hash (как confirm/cancel-ветки
         # и consume_link), НЕ через lookup_token: lookup_token возвращает None
@@ -2014,9 +2017,10 @@ async def _handle_max_link_confirm_cb(
     from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
-    SessionLocal = get_session_factory()
 
-    with SessionLocal() as session:
+    # #138 Ф5-5c (Codex high R4 MAJOR): кросс-тенантный consume токена под
+    # privileged("channel-link") (channel_link_tokens tenant-таблица, source чужой).
+    with privileged_session("channel-link") as session:
         # #187 Phase 4a — gate source-тенант ДО consume (мутации привязки).
         # ``consume_link`` имеет собственный гейт (defence-in-depth), но здесь
         # удалённый тенант = тихий no-op (без attach, без ответа юзеру), а не
@@ -2087,9 +2091,10 @@ async def _handle_max_link_cancel_cb(
     from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
-    SessionLocal = get_session_factory()
 
-    with SessionLocal() as session:
+    # #138 Ф5-5c (Codex high R4 MAJOR): кросс-тенантная отмена токена под
+    # privileged("channel-link") (channel_link_tokens tenant-таблица, source чужой).
+    with privileged_session("channel-link") as session:
         token_hash = _hash_token(raw_token)
         # #187 Phase 4a — gate source-тенант ДО мутации токена (used_at).
         # Для удалённого тенанта — тихий no-op (токен и так уже терминирован
