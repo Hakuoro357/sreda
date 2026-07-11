@@ -201,3 +201,78 @@ def test_e2e_oneshot_reminder_not_gated_350(install):
     ])
     _turn(freddie, "s4", "напомни завтра в 9 про врача")
     assert inv.get("schedule_reminder", 0) == 1
+
+
+# ── R1-фиксы (тот же класс, что #349: last-outcome + ask_human-resume) ───────
+
+def test_r1_closed_series_asks_again_350(install):
+    """R1 MAJOR-1 + MINOR-4: «Готово» (ok) закрывает серию - НОВАЯ серия без
+    конца снова получает вопрос (не молчаливое бессрочное)."""
+    inv, freddie = install(responses=[
+        _ai_call("schedule_reminder", "c1", title="вода",
+                 trigger_iso="2026-07-12T13:30:00+03:00",
+                 recurrence_rule="FREQ=HOURLY;COUNT=3"),
+        AIMessage(content="Готово, каждый час 3 раза."),
+        _ai_call("schedule_reminder", "c2", title="зарядка",
+                 trigger_iso="2026-07-12T16:00:00+03:00",
+                 recurrence_rule="FREQ=HOURLY"),
+        AIMessage(content="До какого времени повторять или сколько раз?"),
+    ])
+    _turn(freddie, "r1a", "поставь завтра напоминание с 13:30 каждый час 3 раза пить воду")
+    assert inv.get("schedule_reminder", 0) == 1
+    _turn(freddie, "r1a", "и зарядку с 16:00 каждый час напоминай")
+    assert inv.get("schedule_reminder", 0) == 1, "новая серия без конца - гейт спрашивает снова"
+
+
+def test_r1_selfcorrection_ok_closes_segment_350():
+    """R1 MAJOR-1 (чистая функция): слот + ok в ОДНОМ сегменте = серия закрыта."""
+    msgs = [
+        HumanMessage(content="поставь напоминание с 13:30 каждый час до 18"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="спроси конец", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "recurrence_end_not_specified"}),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t2"}]),
+        ToolMessage(content="ok:scheduled:rem_1:x", name="schedule_reminder", tool_call_id="t2",
+                    artifact={"result_kind": "ok"}),
+        AIMessage(content="Готово!"),
+        HumanMessage(content="и зарядку каждый час с 16"),
+    ]
+    assert not _recurrence_end_already_asked(msgs)
+
+
+def test_r1_ask_human_resume_counts_as_asked_350():
+    """R1 MAJOR-2: слот конца + ask_human-ответ в ТЕКУЩЕМ сегменте (resume без
+    нового HumanMessage) = вопрос задан и отвечен - повторный гейт запрещён."""
+    msgs = [
+        HumanMessage(content="поставь напоминание с 13:30 каждый час"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="спроси конец", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "recurrence_end_not_specified"}),
+        AIMessage(content="", tool_calls=[{"name": "ask_human", "args": {}, "id": "t2"}]),
+        ToolMessage(content="пока не отменю", name="ask_human", tool_call_id="t2"),
+    ]
+    assert _recurrence_end_already_asked(msgs)
+
+
+def test_r1_bare_slot_current_segment_not_asked_350():
+    """Голый слот текущего сегмента БЕЗ ask_human-ответа - упрямая модель, не
+    спросившая юзера: гейтим повторно (False)."""
+    msgs = [
+        HumanMessage(content="поставь напоминание с 13:30 каждый час"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="спроси конец", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "recurrence_end_not_specified"}),
+    ]
+    assert not _recurrence_end_already_asked(msgs)
+
+
+def test_r1_count_zero_still_gated_350(install):
+    """R1 MINOR-5: COUNT=0 (огрызок) - не валидный конец, гейт спрашивает."""
+    inv, freddie = install(responses=[
+        _ai_call("schedule_reminder", "c1", title="вода",
+                 trigger_iso="2026-07-12T13:30:00+03:00",
+                 recurrence_rule="FREQ=HOURLY;COUNT=0"),
+        AIMessage(content="До какого времени повторять или сколько раз?"),
+    ])
+    _turn(freddie, "r1c", "поставь завтра напоминание с 13:30 каждый час пить воду")
+    assert inv.get("schedule_reminder", 0) == 0
