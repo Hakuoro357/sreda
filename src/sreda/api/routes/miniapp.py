@@ -24,11 +24,9 @@ from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
-from sreda.services.identity_resolve import AmbiguousExternalIdentity
-
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import get_settings
-from sreda.db.session import privileged_session, tenant_session
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.repositories.memory import (
     CategoryConfirmMismatch,
@@ -38,6 +36,7 @@ from sreda.db.repositories.memory import (
     MemoryCategoryError,
     MemoryRepository,
 )
+from sreda.db.session import privileged_session, tenant_session
 from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.app_registry import get_feature_registry
 from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
@@ -53,6 +52,7 @@ from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
+from sreda.services.identity_resolve import AmbiguousExternalIdentity
 from sreda.services.max_auth import (
     MaxInitDataError,
     resolve_tenant_from_max_account_id,
@@ -63,7 +63,6 @@ from sreda.services.onboarding import (
     ensure_max_user_bundle,
     ensure_telegram_user_bundle_by_id,
 )
-from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     resolve_tenant_from_telegram_id,
@@ -1480,8 +1479,9 @@ def _batch_load_checklist_counts(
     """
     if not checklist_ids:
         return {}
+    from sqlalchemy import case, func
+
     from sreda.db.models.checklists import Checklist, ChecklistItem
-    from sqlalchemy import func, case
 
     # Ownership filter via Checklist join — defense-in-depth
     rows = (
@@ -2117,7 +2117,8 @@ def _resolve_platform_auth(
 
     if platform == "max":
         from sreda.services.max_auth import (
-            MaxInitDataError, validate_max_init_data,
+            MaxInitDataError,
+            validate_max_init_data,
         )
         if not settings.max_bot_token:
             raise HTTPException(status_code=500, detail="max_bot_token_not_configured")
@@ -2210,7 +2211,8 @@ async def channel_link_start(
         source_bot_key = "sreda"  # MAX platform; no per-bot dispatch here
 
     from sreda.services.channel_linking import (
-        ChannelLinkRateLimitedError, start_link,
+        ChannelLinkRateLimitedError,
+        start_link,
     )
 
     # Server-side recheck: if tenant already has the target channel linked,

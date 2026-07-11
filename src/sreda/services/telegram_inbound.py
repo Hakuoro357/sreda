@@ -1333,7 +1333,10 @@ async def handle_telegram_update(
                 enqueued_ok = True
             # else: row really isn't there — fall through to inline
             # path as a safety net (zero-message-loss contract).
-        tenant_ctx.reset(_qtok)  # #138: снять ctx queue-ветки (оба пути: return/inline)
+        finally:
+            # R5 (Codex medium MINOR): reset в finally — если fallback-ре-запрос
+            # бросит, ctx не утечёт в poller-таск на следующий update.
+            tenant_ctx.reset(_qtok)
         if enqueued_ok:
             return inbound_message_id
         # else: fall through to inline path below as a safety net
