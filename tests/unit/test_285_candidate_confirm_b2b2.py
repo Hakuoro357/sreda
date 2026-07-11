@@ -121,14 +121,18 @@ def test_confirm_no_does_not_execute(monkeypatch):
 
 
 def test_confirm_preview_no_db_and_has_name(monkeypatch):
-    """Превью GENERIC: имя+аргументы, без чтения БД (пилляр — превью не читает own-data до «да»)."""
+    """Превью ЧЕЛОВЕЧЕСКОЕ, без чтения БД (пилляр - превью не читает own-data до «да»).
+    #338/g-075 (БИБЛИЯ владельца 2026-07-10): имя инструмента и сырые аргументы юзеру
+    НЕ показываются (прод-инцидент 755682022: «Я поняла как «schedule_reminder»
+    (trigger_iso=…)»). Прежний ассерт «имя в превью» закреплял отменённое поведение."""
     seen = {}
     inner = StructuredTool.from_function(func=lambda x="": "ok", name="add_shopping_items", description="d")
     monkeypatch.setattr(react_loop, "interrupt",
                         lambda payload: seen.update(payload) or "нет")
     _generic_confirm_wrap(inner).invoke({"x": "молоко"})
-    assert "add_shopping_items" in seen["confirm"]  # имя в превью
-    assert "key" in seen  # анти-stale-tap ключ
+    assert "add_shopping_items" not in seen["confirm"]  # БИБЛИЯ: имени инструмента нет
+    assert seen["confirm"].rstrip().endswith("?")       # человеческий вопрос-договор
+    assert "key" in seen  # анти-stale-tap ключ (контракт #166B цел)
 
 
 # ─────────── need_family: единый путь грузит любую семью (кандидат) ───────────

@@ -103,6 +103,7 @@ class LlmCaller:
                 messages,
                 timeout_seconds=self.per_call_timeout,
                 on_text_update=on_text_update,
+                provider=self.primary_provider,
             )
             # Issue #68: fire-and-forget response envelope (primary OK).
             _lat_ms_primary = int((time.monotonic() - _t_primary_started) * 1000)
@@ -175,6 +176,7 @@ class LlmCaller:
                     messages,
                     timeout_seconds=self.per_call_timeout,
                     on_text_update=on_text_update,
+                    provider=self.fallback_provider,
                 )
                 _lat_ms_fallback = int((time.monotonic() - _t_fallback_started) * 1000)
                 await persist_response("fallback", ai_msg, _lat_ms_fallback, iter_n)

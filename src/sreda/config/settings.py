@@ -192,7 +192,100 @@ class Settings(BaseSettings):
     mimo_api_key: str | None = None
     mimo_api_key_file: str | None = None
     mimo_chat_model: str = "mimo-v2-pro"
-    mimo_request_timeout_seconds: float = 60.0
+    # Bounded finite (#343 F7, Codex R1 MAJOR): unbounded it accepted inf/nan/0/
+    # negative, which would defeat the "explicit finite read timeout" guarantee
+    # (it is the read fallback in services.llm._build_request_timeout). gt=0/le
+    # reject inf/nan/0/neg. No validation_alias → keeps the env_prefix contract
+    # (env: SREDA_MIMO_REQUEST_TIMEOUT_SECONDS), unchanged.
+    mimo_request_timeout_seconds: float = Field(default=60.0, gt=0.0, le=600.0)
+
+    # ── LLM reliability guard (#343 / F7 audit #336) ──────────────────────
+    # Explicit FINITE per-phase httpx timeouts for the chat-LLM client. A bare
+    # float applies one value to every phase; naming them separately bounds
+    # connect (handshake), write (request send), and pool (waiting for a free
+    # connection) which a single hung ``read`` never covers. ``read`` = None
+    # → falls back to ``mimo_request_timeout_seconds`` (historical behaviour).
+    # See services.llm._build_request_timeout.
+    llm_connect_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_CONNECT_TIMEOUT_SECONDS", "sreda_llm_connect_timeout_seconds"
+        ),
+    )
+    # None → falls back to mimo_request_timeout_seconds (also bounded). gt=0/le
+    # reject inf/nan/0/neg on the explicit value (Codex R1 MAJOR).
+    llm_read_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_READ_TIMEOUT_SECONDS", "sreda_llm_read_timeout_seconds"
+        ),
+    )
+    llm_write_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_WRITE_TIMEOUT_SECONDS", "sreda_llm_write_timeout_seconds"
+        ),
+    )
+    llm_pool_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=600.0,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_POOL_TIMEOUT_SECONDS", "sreda_llm_pool_timeout_seconds"
+        ),
+    )
+    # Bulkhead: max number of chat-LLM invocations concurrently in flight
+    # (hung threads included — the permit is held for the worker thread's whole
+    # lifetime). Once reached, new calls fast-fail (LLMBulkheadFull) WITHOUT
+    # spawning a thread, bounding hung-thread/socket accumulation. Finite by
+    # design; default is generous enough to be a no-op under normal load and to
+    # only catch runaway accumulation. Prod value confirmed finite per §7 п.6.
+    # le=512 is a conservative operational ceiling (Codex R1 MAJOR): a
+    # single-process misconfig cannot request tens of thousands of concurrent
+    # invoke threads/sockets and silently defeat the protection. Default 48.
+    llm_bulkhead_max_concurrent: int = Field(
+        default=48,
+        ge=1,
+        le=512,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_BULKHEAD_MAX_CONCURRENT", "sreda_llm_bulkhead_max_concurrent"
+        ),
+    )
+    # Circuit breaker: consecutive wall-clock timeouts from one provider before
+    # the breaker OPENS (fast-fail new calls to that provider for the cooldown).
+    llm_breaker_open_after_timeouts: int = Field(
+        default=5,
+        ge=1,
+        le=1000,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_BREAKER_OPEN_AFTER_TIMEOUTS",
+            "sreda_llm_breaker_open_after_timeouts",
+        ),
+    )
+    llm_breaker_cooldown_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=3600.0,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_BREAKER_COOLDOWN_SECONDS",
+            "sreda_llm_breaker_cooldown_seconds",
+        ),
+    )
+    # Master kill switch: False → bulkhead + breaker are no-ops (legacy
+    # byte-for-byte path). One-flag rollback (#343 rollout §4-F7).
+    llm_reliability_guard_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "SREDA_LLM_RELIABILITY_GUARD_ENABLED",
+            "sreda_llm_reliability_guard_enabled",
+        ),
+    )
     # Inception (api.inceptionlabs.ai) — OpenAI-compatible. Прямой провайдер
     # Mercury-2 (диффузионная LLM, 1000+ tps, cached input, tool-use). Ключ:
     # env → file → None, как у mimo. Переезд планировщика с MiMo (#60).
@@ -534,6 +627,13 @@ class Settings(BaseSettings):
     # префикс-кеш цел). Оба пути: task-граф + chat/fact. Откат = выключить флаг.
     react_time_in_tail_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_TIME_IN_TAIL"
+    )
+    # #338 ч.2б: живая фраза «рта» (composer_provider) в кандидат-подтверждениях B2b-2.
+    # OFF (дефолт) → человеческий детерминированный шаблон (confirm_preview, БИБЛИЯ g-075
+    # уже соблюдена). ON → рот оформляет фразу в персоне, verify_confirm_text гейтит
+    # (факты дословно/допустимые формулировки), любой сбой → шаблон. Откат = выключить флаг.
+    confirm_voice_enabled: bool = Field(
+        default=False, validation_alias="SREDA_CONFIRM_VOICE"
     )
     # #213 Срез A: унификация read-инструментов чек-листов. OFF (дефолт) → точный legacy: LLM видит
     # пару list_checklists/show_checklist, get_checklist не экспонирован, форма ответов байт-в-байт.

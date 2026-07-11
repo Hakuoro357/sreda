@@ -90,9 +90,15 @@ def convert_ingredients_to_shopping_list(
             out.append(row)
         return out
 
+    # #343: resolve the provider so an internally-built llm carries a
+    # per-provider circuit-breaker key. None for an injected llm (tests) →
+    # bulkhead-only, no breaker (we can't know the injected provider).
+    effective_provider: str | None = None
     if llm is None:
-        from sreda.services.llm import get_chat_llm
+        from sreda.config.settings import get_settings
+        from sreda.services.llm import get_chat_llm, resolve_provider_pair
 
+        effective_provider = resolve_provider_pair(get_settings())[0]
         llm = get_chat_llm()
         if llm is None:
             logger.warning(
@@ -138,14 +144,25 @@ def convert_ingredients_to_shopping_list(
     )
 
     try:
-        resp = llm.invoke([
-            SystemMessage(
-                content=(
-                    "Ты составляешь список покупок. Отвечай строго в JSON."
-                )
-            ),
-            HumanMessage(content=prompt),
-        ])
+        # #343: route through the guarded wrapper (wall-clock timeout + bulkhead
+        # + per-provider breaker) instead of a raw .invoke() that would bypass
+        # the finite in-flight ceiling and could hang unbounded.
+        from sreda.config.settings import get_settings
+        from sreda.services.llm import invoke_with_per_call_timeout
+
+        resp = invoke_with_per_call_timeout(
+            llm,
+            [
+                SystemMessage(
+                    content=(
+                        "Ты составляешь список покупок. Отвечай строго в JSON."
+                    )
+                ),
+                HumanMessage(content=prompt),
+            ],
+            timeout_seconds=get_settings().mimo_request_timeout_seconds,
+            provider=effective_provider,
+        )
     except Exception:  # noqa: BLE001
         logger.exception("shopping transformer: LLM invoke failed")
         return []
