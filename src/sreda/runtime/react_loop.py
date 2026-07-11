@@ -1529,6 +1529,57 @@ def _prev_open_domains(messages: Any) -> set:
     return domains
 
 
+# #352 R2 sol: структурные метки НЕисполнения — такой ToolMessage значит «инструмент НЕ ходил
+# в сервис» (галлюцинированный/заблокированный/отозванный вызов). Для _prev_turn_families это
+# НЕ «работал с разделом»: иначе галлюцинация планировщика в закрытый раздел становилась бы
+# «доверенным фактом журнала» и через LLM-фолбэк открывала бы его чтение следующим ходом.
+_NOT_EXECUTED_KINDS = frozenset({
+    "domain_blocked", "unavailable", "family_not_loaded",
+    "unknown_tool", "unknown_family", "withdrawn", "mode_mismatch"})
+
+
+def _prev_turn_families(messages: Any) -> tuple[str, ...]:
+    """#352: разделы, которыми РЕАЛЬНО работал ПРОШЛЫЙ ход - по журналу ToolMessage
+    последнего закрытого сегмента (факт, не догадка). Хинт для LLM-классификатора
+    доменов (classify_domains prev_turn_domains) - НЕ грант: доступ даёт политика.
+
+    Считаются вызванные инструменты раздела и с не-ok исходом: «отметь хлеб» →
+    not_found - разговор всё равно шёл про чек-листы, продолжение «а, оно называется
+    булка» должно видеть тот же раздел. ОТКЛОНЁННЫЕ confirm'ы («нет» на кандидата
+    или деструктив) тоже СЧИТАЮТСЯ (R2-субагент, пере-решение R1): отказ от мутации
+    не отменяет ТЕМУ хода - «нет, не удаляй… а покажи, что там» продолжает раздел;
+    открывается только чтение, мутации всегда под confirm. НЕ считаются: web (R1
+    субагент: baseline, не own-data контекст; зеркало _prev_open_domains - иначе
+    «погода + список» ходом раньше подсовывает классификатору web-дистрактор и
+    заново ломает кейс #352) и структурные неисполнения _NOT_EXECUTED_KINDS (R2
+    sol: галлюцинация планировщика в закрытый раздел - не факт разговора). Фильтр
+    по _USER_DOMAINS: семьи вне enum классификатора (onboarding/ui/utility) в хинт
+    не попадают - классификатор таких слов не знает. Пусто = прошлого контекста нет
+    (классификатор не зовём)."""
+    msgs = list(messages or [])
+    if not msgs:
+        return ()
+    last = msgs[-1]
+    if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
+        return ()  # ход не закрыт финальным текстом агента (resume/обрыв) - не считаем
+    from sreda.runtime.react_preflight import _USER_DOMAINS
+    from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+    fams: set = set()
+    for m in reversed(msgs[:-1]):
+        if isinstance(m, HumanMessage):
+            break  # начало прошлого хода
+        if isinstance(m, ToolMessage) and getattr(m, "name", None):
+            _art = getattr(m, "artifact", None)
+            if isinstance(_art, dict) and _art.get("result_kind") in _NOT_EXECUTED_KINDS:
+                continue  # R2 sol: галлюцинированный/заблокированный вызов - не факт работы
+            name = _TOOL_NAME_ALIASES.get(m.name, m.name)
+            fam = TOOL_FAMILY_MANIFEST.get(name)
+            if fam in _USER_DOMAINS:
+                fams.add(fam)
+    fams.discard("web")
+    return tuple(sorted(fams))
+
+
 def _generic_confirm_wrap(inner: Any) -> Any:
     """#285 B2b-2: универсальный confirm для КАНДИДАТА (write без детерминированного сигнала, ярус б).
     Как `_confirm_wrap`, но превью GENERIC — имя+сырые args, БЕЗ чтения БД (пилляр: превью не читает
@@ -4436,6 +4487,11 @@ async def handle_turn(
                 # лишняя латентность/сбой на legacy-пути). disabled → ничего (byte-identical). Только task-путь.
                 # Весь блок в try/except (R1 MAJOR): сбой доменного роутинга НЕ роняет ход → legacy fail-open.
                 _dsm = _domain_scope()
+                # #352: единый путь ПЕРЕЗАПИСЫВАЕТ решение этого блока → LLM-фолбэк здесь был
+                # МЁРТВЫМ вызовом (латентность+деньги в никуда; владелец 2026-07-11). На активном
+                # unified классификатор зовёт САМ unified-блок ниже (с типом предыдущего хода);
+                # здесь остаётся детерминированная часть — fallback при сбое unified.
+                _unified_active = _unified_execute_for(tenant_id)
                 if _dsm in ("shadow", "execute") and _init.get("intent") == "task" and _is_pruned(tenant_id):
                     try:
                         from sreda.runtime.react_preflight import (
@@ -4445,9 +4501,11 @@ async def handle_turn(
                         # канареечном списке; иначе (mode=shadow ЛИБО execute-но-тенант-не-в-списке) → shadow-лог.
                         _eff_execute = (_dsm == "execute") and _is_domain_execute_tenant(tenant_id)
                         if _eff_execute:
-                            # нет детерм. домена → LLM-фолбэк по домену (read-only по compute).
+                            # нет детерм. домена → LLM-фолбэк по домену (read-only по compute);
+                            # НЕ на unified-тенанте (#352: там результат был бы выброшен).
                             _classified = (await classify_domains(_recent, user_text, llm)
-                                           if not _route.all_domains else None)
+                                           if not _route.all_domains and not _unified_active
+                                           else None)
                             _ar, _aw = compute_allowed_domains(_route, _classified)
                             # active_families = разрешённые-на-ЧТЕНИЕ ленивые (R1 medium: грузить и classifier-домен,
                             # и кросс-пару — не только route.active_families, иначе фильтру нечего пропускать).
@@ -4491,9 +4549,13 @@ async def handle_turn(
             # Требует preflight (task-бинд читает intent только при preflight_enabled). Флаг ИЛИ список
             # пусты → не исполняется (byte-identical, никто не execute). Сбой → legacy fail-open (не
             # роняет ход, скоуп НЕ расширяется — остаётся #221-решение выше). Ярус (б) candidate/confirm — B2b-2.
-            if _preflight and _unified_execute_for(tenant_id):
+            if _preflight and _unified_active:
+                # R2 sol/terra: intent/intent_meta от сплита - для честного отката при сбое ниже
+                _pre352_intent = _init.get("intent")
+                _pre352_meta = _init.get("intent_meta")
                 try:
                     from sreda.runtime.react_policy import compute_unified_policy
+                    from sreda.runtime.react_preflight import classify_domains as _cd352
                     from sreda.runtime.react_preflight import route_domains as _rd285
                     # #319 sticky-by-use: ПРОШЛЫЙ ход записал в память (renewal в run_tools) → серия
                     # продолжается без confirm. Consume из _pre_vals (снап ДО хода); _init выше сбросил
@@ -4502,10 +4564,47 @@ async def handle_turn(
                     # (журнал; финальный текст агента не анализируется) → policy наследует
                     # при ответе юзера без самостоятельной темы.
                     _pod = frozenset(_prev_open_domains(_pre_vals.get("messages")))
+                    _route285 = _rd285(user_text)
+                    _sticky285 = bool(_pre_vals.get("sticky_memory_write"))
                     _upol = compute_unified_policy(
-                        user_text, _rd285(user_text),
-                        sticky_memory_write=bool(_pre_vals.get("sticky_memory_write")),
+                        user_text, _route285,
+                        sticky_memory_write=_sticky285,
                         prev_open_domains=_pod)
+                    # #352: LLM-фолбэк домена — ПОСЛЕДНИЙ слой, только когда ВСЕ код-слои молчат:
+                    # route ничего не увидел (R1 sol: route-домен без кюса — осознанное НЕоткрытие
+                    # own-data, мина #285, не молчание), кюсы/sticky/слот-наследование дали пустую
+                    # own-data политику, И у прошлого хода есть разделы в журнале (без контекста не
+                    # гадаем — «как дела?» на свежем треде own-data не открывает). Классификатор
+                    # получает тип предыдущего хода (живой замер: 5/5 вместо 7/10) и решает ТОЛЬКО
+                    # «продолжение или нет»: применяем high-домены строго ⊆ разделов прошлого хода
+                    # (R1 sol/terra: LLM на недоверенной истории НЕ авторизует НОВЫЕ разделы —
+                    # инъекция максимум переоткроет раздел, которым юзер сам работал ходом раньше;
+                    # смена темы — юрисдикция детерминированных слоёв). fail-open внутри classify
+                    # (пусто+low при сбое/таймауте) → политика остаётся первой. Даёт ТОЛЬКО
+                    # read/загрузку раздела — write идёт кандидатом под confirm (ярус б).
+                    _lf352: dict = {"ran": False}
+                    if (not _route285.all_domains
+                            and not (set(_upol["allowed_read"]) - {"web"})
+                            and not _upol["allowed_write"]):
+                        _ptf = _prev_turn_families(_pre_vals.get("messages"))
+                        if _ptf:
+                            _t0352 = _time.monotonic()
+                            _cls352 = await _cd352(_recent, user_text, llm,
+                                                   prev_turn_domains=_ptf)
+                            _applied352 = (_cls352.confidence == "high"
+                                           and set(_cls352.domains) <= set(_ptf))
+                            # наблюдаемость канарейки (R1 terra MINOR): без контента сообщений
+                            _lf352 = {"ran": True,
+                                      "duration_ms": int((_time.monotonic() - _t0352) * 1000),
+                                      "confidence": _cls352.confidence,
+                                      "domains": list(_cls352.domains),
+                                      "prev_turn": list(_ptf),
+                                      "applied": _applied352}
+                            if _applied352:
+                                _upol = compute_unified_policy(
+                                    user_text, _route285, _cls352,
+                                    sticky_memory_write=_sticky285,
+                                    prev_open_domains=_pod)
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
@@ -4515,9 +4614,23 @@ async def handle_turn(
                     _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
                     _init["router_decision_json"] = json.dumps(
                         {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
-                         "signals": _upol["signals"]}, ensure_ascii=False)
-                except Exception:  # noqa: BLE001 — единый путь не роняет ход → legacy (скоуп #221 выше)
-                    logger.warning("react_unified: policy failed → legacy fail-open", exc_info=True)
+                         "signals": _upol["signals"], "llm_fallback": _lf352}, ensure_ascii=False)
+                except Exception:  # noqa: BLE001 — единый путь не роняет ход → ПОЛНЫЙ fail-open
+                    # #352 R1 sol/terra: легаси-блок выше на unified-тенанте больше не зовёт LLM-фолбэк
+                    # → его решение для routeless-хода = deny (ложные отказы класса #352). Поэтому сбой
+                    # unified откатывает в тот же полный fail-open, что и сбой самого легаси-роутинга
+                    # (набор целиком, фильтр выключен — поведение до-#221); чистим и частичную запись.
+                    # R2 sol/terra: unified_execute — last-value канал: pop СНИМАЛ БЫ сброс, а прошлый
+                    # ход мог записать True в чекпойнт → явный False. intent/intent_meta — назад к
+                    # решению сплита (сбой мог случиться после их перезаписи на task/unified).
+                    logger.warning("react_unified: policy failed → full fail-open", exc_info=True)
+                    _init["active_families"] = base_fams
+                    _init["router_allowed_read_domains"] = None
+                    _init["router_allowed_write_domains"] = None
+                    _init["router_decision_json"] = None
+                    _init["unified_execute"] = False
+                    _init["intent"] = _pre352_intent
+                    _init["intent_meta"] = _pre352_meta
             # #285 Фаза A (SHADOW): TurnPolicy сайдкаром — выражает решения сплита (#197 интент,
             # #221 каналы, #256 таймауты, капы) явным объектом в ОТДЕЛЬНЫЙ канал. Legacy-каналы
             # router_allowed_* НЕ трогаются (контракт отката, инвентарь §2 (б)); исполнением НЕ
