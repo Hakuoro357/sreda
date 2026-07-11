@@ -290,6 +290,29 @@ for bot_key in $BOT_KEYS; do
     exit 5
 done
 
+# ============ Phase 6: onboarding smoke (отчёт, НЕ гейт) ============
+# Мера B пост-мортема vex-assistant#331 (#334): после рестарта гоняем сквозной
+# онбординг-smoke по каждому тиру (крэш free-тира был невидим канарейке основного
+# бота). ТОЛЬКО ОТЧЁТ — exit-код safe_restart НЕ меняет: деплой ручной, решение
+# принимает оператор по PASS/FAIL ниже. Скрипт сам чистит свой синтетический
+# тенант и не трогает реальные данные (ownership-пруф, см. шапку onboard_smoke.py).
+SMOKE="$(cd "$(dirname "$0")" && pwd)/onboard_smoke.py"
+if [ -f "$SMOKE" ]; then
+    for bot_key in $BOT_KEYS; do
+        log "phase 6 [${bot_key}]: онбординг-smoke"
+        smoke_rc=0
+        sudo -u sreda /opt/sreda/.venv/bin/python "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
+        case "$smoke_rc" in
+            0) log "  ✓ [${bot_key}] онбординг-smoke PASS" ;;
+            1) log "  ✗ [${bot_key}] онбординг-smoke FAIL — онбординг СЛОМАН, разберись прежде чем считать деплой успешным" ;;
+            2) log "  ⚠ [${bot_key}] онбординг-smoke ABORT/остаток — нужно ручное внимание (см. вывод выше)" ;;
+            *) log "  ⚠ [${bot_key}] онбординг-smoke неожиданный код ${smoke_rc}" ;;
+        esac
+    done
+else
+    log "phase 6: ${SMOKE} не найден — онбординг-smoke пропущен"
+fi
+
 log "DONE: safe_restart завершён успешно"
 echo
 echo "Можно отправить тестовое сообщение боту — должно дойти в течение 1-2 секунд."
