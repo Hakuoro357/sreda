@@ -852,25 +852,55 @@
     });
     var freq = parts.FREQ;
     var byday = parts.BYDAY;
-    if (freq === "DAILY") {
-      if (byday === "MO,TU,WE,TH,FR") return "по будням";
-      if (byday === "SA,SU") return "по выходным";
-      return "каждый день";
-    }
-    if (freq === "WEEKLY") {
-      if (!byday) return "каждую неделю";
-      var days = byday.split(",");
-      if (days.length === 1 && _DOW_RU[days[0]]) {
-        return "каждый " + _DOW_RU[days[0]];
+    var interval = parseInt(parts.INTERVAL || "1", 10);
+    var base = "";
+    if (freq === "HOURLY") {
+      // #342: HOURLY появился с повторяющимися напоминаниями (#333) и падал в
+      // сырой fallback — юзер видел «FREQ=HOURLY;UNTIL=…» (нарушение g-075)
+      base = interval > 1 ? "каждые " + interval + " ч." : "каждый час";
+    } else if (freq === "MINUTELY") {
+      base = interval > 1 ? "каждые " + interval + " мин." : "каждую минуту";
+    } else if (freq === "DAILY") {
+      if (byday === "MO,TU,WE,TH,FR") base = "по будням";
+      else if (byday === "SA,SU") base = "по выходным";
+      else base = interval > 1 ? "каждые " + interval + " дн." : "каждый день";
+    } else if (freq === "WEEKLY") {
+      if (!byday) {
+        base = interval > 1 ? "каждые " + interval + " нед." : "каждую неделю";
+      } else {
+        var days = byday.split(",");
+        if (days.length === 1 && _DOW_RU[days[0]]) {
+          base = "каждый " + _DOW_RU[days[0]];
+        } else {
+          var names = days.map(function(d) {
+            return _DOW_RU_PLURAL[d] || d;
+          });
+          base = "по " + names.join(", ");
+        }
       }
-      var names = days.map(function(d) {
-        return _DOW_RU_PLURAL[d] || d;
-      });
-      return "по " + names.join(", ");
+    } else if (freq === "MONTHLY") {
+      base = "каждый месяц";
+    } else if (freq === "YEARLY") {
+      base = "каждый год";
+    } else {
+      // g-075 (БИБЛИЯ): НИКОГДА не показываем сырой RRULE — нейтральное слово
+      return "повторяется";
     }
-    if (freq === "MONTHLY") return "каждый месяц";
-    if (freq === "YEARLY") return "каждый год";
-    return rule;  // fallback: still better than nothing
+    if (parts.COUNT) {
+      base += ", всего " + parts.COUNT + " раз";
+    } else if (parts.UNTIL) {
+      // UTC basic format 20260711T143000Z → локальное «до 11.07 17:30»
+      var m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})/.exec(parts.UNTIL);
+      if (m) {
+        var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+        base += " до " + d.getDate() + "." + String(d.getMonth() + 1).padStart(2, "0") +
+                " " + String(d.getHours()).padStart(2, "0") + ":" +
+                String(d.getMinutes()).padStart(2, "0");
+      } else {
+        base += " с ограничением по времени";
+      }
+    }
+    return base;
   }
 
   // --- Screen: Reminders (#/reminders) ---
