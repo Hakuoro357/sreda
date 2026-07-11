@@ -535,6 +535,13 @@ class Settings(BaseSettings):
     react_time_in_tail_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_TIME_IN_TAIL"
     )
+    # #338 ч.2б: живая фраза «рта» (composer_provider) в кандидат-подтверждениях B2b-2.
+    # OFF (дефолт) → человеческий детерминированный шаблон (confirm_preview, БИБЛИЯ g-075
+    # уже соблюдена). ON → рот оформляет фразу в персоне, verify_confirm_text гейтит
+    # (факты дословно/допустимые формулировки), любой сбой → шаблон. Откат = выключить флаг.
+    confirm_voice_enabled: bool = Field(
+        default=False, validation_alias="SREDA_CONFIRM_VOICE"
+    )
     # #213 Срез A: унификация read-инструментов чек-листов. OFF (дефолт) → точный legacy: LLM видит
     # пару list_checklists/show_checklist, get_checklist не экспонирован, форма ответов байт-в-байт.
     # ON → LLM видит ЕДИНЫЙ get_checklist(mode: items|overview, name) с result-envelope; старые имена

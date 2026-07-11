@@ -212,10 +212,10 @@ class CancelReminderInput(BaseModel):
 SCHEDULE_REMINDER_SPEC = ToolSpec(
     name="schedule_reminder",
     description=(
-        "Поставить напоминание на конкретное время в будущем. Используй "
-        "когда юзер просит «напомни через N часов», «каждый вторник в "
-        "16:00 пиши про X». ISO-8601 в UTC, относительные фразы резолви "
-        "ДО вызова."
+        "Поставить напоминание (разовое/повторное): recurrence_rule "
+        "(RFC-5545), «каждый час»→FREQ=HOURLY. trigger_iso = 1-е "
+        "срабатывание, ISO-8601 в UTC, относительное резолви ДО вызова. "
+        "Повторы есть, НЕ отказывай."
     ),
     family="reminders",
     effect="write",
@@ -231,6 +231,9 @@ SCHEDULE_REMINDER_SPEC = ToolSpec(
         "каждый вторник в 16:00 пиши про кружок",
         "поставь напоминание на пятницу 18:00",
         "напомни через полчаса проверить почту",
+        # #333: почасовой повтор (прод-инцидент - модель отказывала «могу
+        # только однократное» вместо recurrence_rule=FREQ=HOURLY)
+        "ставь каждый час с 12:30 напоминание",
     ],
     mutex_notes=[
         # Codex Sub-A4 reminders R1 MAJOR #5: previously referenced

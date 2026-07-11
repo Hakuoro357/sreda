@@ -578,3 +578,40 @@ def test_cross_intent_no_false_cross_co_occurrence(text):
     assert r.cross_intent is None
     _, aw = compute_allowed_domains(r, None)
     assert aw != frozenset({"shopping"}) or r.primary_domain == "shopping"  # cross-write shopping не навязан
+
+
+# ── #308: «запиши/сохрани В СПИСОК X» → checklists (глагол памяти не должен перебивать «в список») ──
+
+
+def test_route_zapishi_v_spisok_is_checklists_308():
+    """#308 (прод-деградация владельца 2026-07-04): «Запиши в список кино посмотреть Пикард» уходил
+    в memory (глагол «запиши»=action memory перебивал «список»=checklists) → checklists-инструменты
+    отрезаны → петля 8 проходов → «не смог». «в список» (target чек-листа) перевешивает глагол памяти."""
+    for text in (
+        "запиши в список кино посмотреть пикард",
+        "запиши в список кино к просмотру посмотреть сериал пикард",
+        "сохрани в список кино дюну",
+        "запиши в список поход палатку",
+    ):
+        assert route_domains(text).primary_domain == "checklists", text
+
+
+def test_route_v_spisok_pokupok_still_shopping_308():
+    """#308 анти-регресс: «в список покупок» остаётся shopping (более специфичный форсер, longest-match),
+    НЕ перехватывается общим «в список»→checklists."""
+    assert route_domains("запиши в список покупок молоко").primary_domain == "shopping"
+    assert route_domains("добавь в список покупок хлеб и масло").primary_domain == "shopping"
+    assert route_domains("в список покупок яйца").primary_domain == "shopping"
+
+
+def test_route_memory_verbs_without_spisok_still_memory_308():
+    """#308 анти-регресс: глагол памяти БЕЗ «в список» по-прежнему → memory (не сломать заметки)."""
+    assert route_domains("запиши что я люблю кофе").primary_domain == "memory"
+    assert route_domains("запомни номер машины 47").primary_domain == "memory"
+    assert route_domains("сохрани что встреча в пятницу").primary_domain == "memory"
+
+
+def test_route_dobav_pokazhi_v_spisok_unchanged_308():
+    """#308 анти-регресс: «добавь/покажи в список» уже давали checklists — не сломать."""
+    assert route_domains("добавь в список кино пикард").primary_domain == "checklists"
+    assert route_domains("покажи список кино к просмотру").primary_domain == "checklists"
