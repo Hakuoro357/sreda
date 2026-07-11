@@ -237,26 +237,19 @@ def _require_miniapp_auth(
             user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
-            # #187 Phase 4a — soft-delete gate ДО любой durable-мутации
-            # auth-слоя (_stamp_last_bot_key коммитит last_bot_key). Удалён
-            # existing-тенант → 410 БЕЗ мутации. Гейт только для уже
-            # резолвленного тенанта; lazy-provision-ветка (resolved is None)
-            # сюда не попадает — там тенант только что создан, всегда активен.
-            _gate_miniapp_tenant_active(session, tenant_id)
-            # #109 (Codex MAJOR): existing TG-юзер открыл Mini App, но
-            # /start не слал — здесь НЕ вызывается
-            # ensure_telegram_user_bundle_by_id, поэтому _stamp_last_bot_key
-            # не сработал бы. Мигрировавший юзер, который пользуется только
-            # Mini App'ом @sreda_home_bot, остался бы со stale/NULL
-            # last_bot_key → async-уведомления mis-route. Штампуем текущий
-            # (Telegram) bot_key напрямую: helper идемпотентен (no-op +
-            # без commit'а если значение не изменилось), пропускает пустой
-            # bot_key. resolved_bot_key в TG-ветке всегда зарегистрированный
-            # TG bot_key.
+            # #138 Ф5-5c: soft-delete гейт + last_bot_key-штамп существующего юзера —
+            # под tenant_session (app+ctx): после флипа DSN на sreda_app эти
+            # SELECT/UPDATE на неском-скоупленной сессии вернули бы 0 (RLS) и
+            # дропнули бы живого юзера / не обновили бота. Под ctx свой тенант виден.
+            # #187 Phase 4a — гейт ДО мутации; #109 — штамп текущего TG-бота
+            # (helper идемпотентен, no-op без commit'а если не изменилось).
             from sreda.db.models.core import User as _User
-            _user_row = session.get(_User, user_id)
-            if _user_row is not None:
-                _stamp_last_bot_key(session, _user_row, resolved_bot_key)
+            from sreda.db.session import tenant_session as _tenant_session
+            with _tenant_session(tenant_id) as _ts:
+                _gate_miniapp_tenant_active(_ts, tenant_id)
+                _user_row = _ts.get(_User, user_id)
+                if _user_row is not None:
+                    _stamp_last_bot_key(_ts, _user_row, resolved_bot_key)
 
     else:  # channel == "max"
         if not settings.max_bot_token:
@@ -399,39 +392,35 @@ def _require_miniapp_auth(
                 user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
-            # #187 Phase 4a — soft-delete gate ДО durable-мутации
-            # max_chat_id-refresh (session.commit ниже). Удалён existing
-            # MAX-тенант → 410 БЕЗ записи max_chat_id. Гейт только для уже
-            # резолвленного тенанта; lazy-provision/race-ветки (onboarding не
-            # None / resolved-after-race) сюда не попадают — тенант только что
-            # создан, всегда активен.
-            _gate_miniapp_tenant_active(session, tenant_id)
-            # Codex R1 MAJOR #4: refresh max_chat_id если изменился.
-            # Сценарий: Boris вручную SQL-merge'нул tenant'ы; max_chat_id
-            # был известен на момент merge'а. Если юзер удалит и пересоздаст
-            # MAX-аккаунт (новый chat_id), без refresh outbound delivery
-            # пойдёт на старый chat_id и упадёт.
-            if max_user.max_chat_id:
-                try:
-                    from sreda.db.models.core import User
-                    user_row = session.get(User, user_id)
-                    if (
-                        user_row is not None
-                        and user_row.max_chat_id != max_user.max_chat_id
-                    ):
-                        logger.info(
-                            "miniapp auth: refreshing max_chat_id user=%s "
-                            "old=%r new=%s",
-                            user_id, user_row.max_chat_id, max_user.max_chat_id,
+            # #138 Ф5-5c: soft-delete гейт + max_chat_id-refresh существующего юзера —
+            # под tenant_session (app+ctx): после флипа DSN эти SELECT/UPDATE на
+            # неском-скоупленной сессии вернули бы 0 (RLS). Под ctx свой тенант виден.
+            # #187 Phase 4a — гейт ДО мутации. Codex R1 MAJOR #4: refresh max_chat_id
+            # если изменился (пересоздание MAX-аккаунта → новый chat_id).
+            from sreda.db.models.core import User
+            from sreda.db.session import tenant_session as _tenant_session
+            with _tenant_session(tenant_id) as _ts:
+                _gate_miniapp_tenant_active(_ts, tenant_id)
+                if max_user.max_chat_id:
+                    try:
+                        user_row = _ts.get(User, user_id)
+                        if (
+                            user_row is not None
+                            and user_row.max_chat_id != max_user.max_chat_id
+                        ):
+                            logger.info(
+                                "miniapp auth: refreshing max_chat_id user=%s "
+                                "old=%r new=%s",
+                                user_id, user_row.max_chat_id, max_user.max_chat_id,
+                            )
+                            user_row.max_chat_id = max_user.max_chat_id
+                            _ts.commit()
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "miniapp auth: max_chat_id refresh failed user=%s",
+                            user_id, exc_info=True,
                         )
-                        user_row.max_chat_id = max_user.max_chat_id
-                        session.commit()
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "miniapp auth: max_chat_id refresh failed user=%s",
-                        user_id, exc_info=True,
-                    )
-                    session.rollback()
+                        _ts.rollback()
 
     # #187 Phase 4a — soft-delete gate уже применён ДО мутаций auth-слоя:
     # для existing-тенанта (обе ветки TG/MAX) через _gate_miniapp_tenant_active

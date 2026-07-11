@@ -62,10 +62,11 @@ def _identity_resolve_uses_db(db_session, monkeypatch):
     import sreda.db.session as dbs
 
     @contextmanager
-    def _stub(reason):
+    def _stub(arg):
         yield db_session
 
     monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
 
 
 def _make_request(*, platform: str | None = "max", auth: str = "tma fake_init_data"):
