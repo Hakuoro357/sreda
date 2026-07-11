@@ -172,53 +172,60 @@ class _FakeClock:
         self.t += dt
 
 
+def _admit(br, *, open_after=3, cooldown=30.0):
+    a = br.allow(cooldown=cooldown)
+    assert a is not None
+    return a
+
+
 def test_breaker_opens_after_consecutive_timeouts():
     clock = _FakeClock()
     br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
-    assert br.allow(open_after=3, cooldown=30.0) is True
-    br.record_timeout(open_after=3)
-    br.record_timeout(open_after=3)
-    assert br.allow(open_after=3, cooldown=30.0) is True  # not yet at threshold
-    br.record_timeout(open_after=3)
+    br.record_timeout(_admit(br), open_after=3)
+    br.record_timeout(_admit(br), open_after=3)
+    assert br.allow(cooldown=30.0) is not None  # not yet at threshold
+    br.record_timeout(_admit(br), open_after=3)
     assert br.is_open is True
-    assert br.allow(open_after=3, cooldown=30.0) is False  # open → fast-fail
+    assert br.allow(cooldown=30.0) is None  # open → fast-fail
 
 
 def test_breaker_half_open_after_cooldown_then_closes_on_success():
     clock = _FakeClock()
     br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
     for _ in range(2):
-        br.record_timeout(open_after=2)
-    assert br.allow(open_after=2, cooldown=30.0) is False  # open
+        br.record_timeout(_admit(br, open_after=2), open_after=2)
+    assert br.allow(cooldown=30.0) is None  # open
     clock.advance(31.0)
-    assert br.allow(open_after=2, cooldown=30.0) is True  # half-open: admit ONE probe
-    assert br.allow(open_after=2, cooldown=30.0) is False  # second probe blocked
-    br.record_success()
+    probe = br.allow(cooldown=30.0)
+    assert probe is not None and probe.is_probe  # half-open: admit ONE probe
+    assert br.allow(cooldown=30.0) is None  # second probe blocked
+    br.record_success(probe)
     assert br.is_open is False
-    assert br.allow(open_after=2, cooldown=30.0) is True  # closed again
+    assert br.allow(cooldown=30.0) is not None  # closed again
 
 
 def test_breaker_reopens_when_half_open_probe_times_out():
     clock = _FakeClock()
     br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
     for _ in range(2):
-        br.record_timeout(open_after=2)
+        br.record_timeout(_admit(br, open_after=2), open_after=2)
     clock.advance(31.0)
-    assert br.allow(open_after=2, cooldown=30.0) is True  # half-open probe
-    br.record_timeout(open_after=2)  # probe hung too
-    assert br.allow(open_after=2, cooldown=30.0) is False  # re-opened immediately
+    probe = br.allow(cooldown=30.0)
+    assert probe is not None and probe.is_probe  # half-open probe
+    br.record_timeout(probe, open_after=2)  # probe hung too
+    assert br.allow(cooldown=30.0) is None  # re-opened immediately
     clock.advance(31.0)
-    assert br.allow(open_after=2, cooldown=30.0) is True  # cooldown again
+    assert br.allow(cooldown=30.0) is not None  # cooldown again
 
 
 def test_breaker_success_resets_timeout_streak():
     clock = _FakeClock()
     br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
-    br.record_timeout(open_after=3)
-    br.record_timeout(open_after=3)
-    br.record_success()  # resets streak
-    br.record_timeout(open_after=3)
-    br.record_timeout(open_after=3)
+    br.record_timeout(_admit(br), open_after=3)
+    br.record_timeout(_admit(br), open_after=3)
+    br.record_success(_admit(br))  # healthy response while closed → reset streak
+    br.record_timeout(_admit(br), open_after=3)
+    br.record_timeout(_admit(br), open_after=3)
     assert br.is_open is False  # streak restarted → not open at 2
 
 
@@ -228,9 +235,40 @@ def test_breaker_other_error_is_neutral():
     clock = _FakeClock()
     br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
     for _ in range(10):
-        br.record_other_error()
+        br.record_other_error(_admit(br, open_after=2))
     assert br.is_open is False
-    assert br.allow(open_after=2, cooldown=30.0) is True
+    assert br.allow(cooldown=30.0) is not None
+
+
+def test_breaker_stale_nonprobe_success_does_not_close_open_breaker():
+    """Codex R1 MAJOR: a call admitted while CLOSED that finishes (success)
+    AFTER the breaker opened must NOT close it — only the admitted probe may."""
+    clock = _FakeClock()
+    br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
+    stale = _admit(br, open_after=2)  # admitted while closed
+    br.record_timeout(_admit(br, open_after=2), open_after=2)
+    br.record_timeout(_admit(br, open_after=2), open_after=2)
+    assert br.is_open is True
+    br.record_success(stale)  # stale success from before the open
+    assert br.is_open is True  # still open — not closed by a stale outcome
+
+
+def test_breaker_stale_error_does_not_release_probe_slot():
+    """Codex R1 MAJOR: only the probe owner may free the half-open slot; a
+    stale non-probe error must not admit a second concurrent probe."""
+    clock = _FakeClock()
+    br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
+    for _ in range(2):
+        br.record_timeout(_admit(br, open_after=2), open_after=2)
+    clock.advance(31.0)
+    probe = br.allow(cooldown=30.0)
+    assert probe is not None and probe.is_probe
+    stale = llm_bulkhead._BreakerAttempt(is_probe=False, token=None)
+    br.record_other_error(stale)  # stale, not the probe owner
+    assert br.allow(cooldown=30.0) is None  # probe slot still held
+    br.record_other_error(probe)  # owner releases the slot (stays open)
+    assert br.is_open is True
+    assert br.allow(cooldown=30.0) is not None  # new probe admitted
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +439,8 @@ def test_guard_disabled_is_legacy_passthrough(monkeypatch, blocker):
 def test_explicit_httpx_timeouts_are_finite():
     """connect/read/write/pool are all set to finite values (not the
     unbounded default) — §5 F7 acceptance."""
-    t = _build_request_timeout(get_settings())
+    s = get_settings().model_copy(update={"llm_reliability_guard_enabled": True})
+    t = _build_request_timeout(s)
     assert isinstance(t, httpx.Timeout)
     for field in (t.connect, t.read, t.write, t.pool):
         assert field is not None
@@ -411,7 +450,9 @@ def test_explicit_httpx_timeouts_are_finite():
 def test_build_chat_llm_passes_explicit_httpx_timeout():
     """The constructed ChatOpenAI carries the explicit httpx.Timeout, not a
     bare float, so per-phase timeouts actually reach httpx."""
-    s = get_settings().model_copy(update={"mimo_api_key": "test-key"})
+    s = get_settings().model_copy(
+        update={"mimo_api_key": "test-key", "llm_reliability_guard_enabled": True}
+    )
     llm = _build_chat_llm("mimo", s, model="mimo-v2-pro", temperature=0.3)
     assert llm is not None
     assert isinstance(llm.request_timeout, httpx.Timeout)
@@ -421,10 +462,49 @@ def test_build_chat_llm_passes_explicit_httpx_timeout():
         assert 0 < float(field) < math.inf
 
 
+def test_guard_disabled_uses_legacy_scalar_timeout():
+    """Codex R1 MAJOR: kill-switch off → exact legacy scalar timeout (single
+    value for all phases), NOT the new per-phase httpx.Timeout."""
+    s = get_settings().model_copy(update={"llm_reliability_guard_enabled": False})
+    t = _build_request_timeout(s)
+    assert not isinstance(t, httpx.Timeout)
+    assert t == s.mimo_request_timeout_seconds
+
+
+def test_build_chat_llm_disabled_uses_legacy_scalar_timeout():
+    s = get_settings().model_copy(
+        update={"mimo_api_key": "test-key", "llm_reliability_guard_enabled": False}
+    )
+    llm = _build_chat_llm("mimo", s, model="mimo-v2-pro", temperature=0.3)
+    assert llm is not None
+    assert not isinstance(llm.request_timeout, httpx.Timeout)
+    assert float(llm.request_timeout) == s.mimo_request_timeout_seconds
+
+
 def test_guard_config_defaults_are_finite():
     """Default guard config from settings is finite on every limit — a
     misconfigured prod cannot silently run unbounded."""
     cfg = llm_bulkhead.read_guard_config(get_settings())
-    assert cfg.max_concurrent >= 1 and cfg.max_concurrent < 100000
+    assert 1 <= cfg.max_concurrent <= 512  # conservative operational ceiling
     assert cfg.breaker_open_after >= 1
     assert 0 < cfg.breaker_cooldown < math.inf
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    ["SREDA_MIMO_REQUEST_TIMEOUT_SECONDS", "SREDA_LLM_READ_TIMEOUT_SECONDS"],
+)
+@pytest.mark.parametrize("bad", ["inf", "0", "-1", "1000000"])
+def test_timeout_settings_reject_nonfinite_or_out_of_range(env_name, bad, monkeypatch):
+    """Codex R1 MAJOR: the read timeout and its fallback must be bounded finite
+    — inf / 0 / negative / absurdly large are rejected at settings load."""
+    from pydantic import ValidationError
+    from sreda.config.settings import get_settings as _gs
+
+    monkeypatch.setenv(env_name, bad)
+    _gs.cache_clear()
+    try:
+        with pytest.raises(ValidationError):
+            _gs()
+    finally:
+        _gs.cache_clear()

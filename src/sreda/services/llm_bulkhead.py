@@ -132,17 +132,43 @@ class _Bulkhead:
 # ---------------------------------------------------------------------------
 
 
-class _CircuitBreaker:
-    """Three-state breaker (closed → open → half-open).
+class _BreakerAttempt:
+    """Opaque token returned by ``_CircuitBreaker.allow`` and passed back to the
+    ``record_*`` outcome methods.
 
-    - ``closed``: ``allow`` returns True; consecutive timeouts accumulate.
-    - ``open``: ``allow`` returns False until ``cooldown`` elapses.
-    - ``half-open``: after cooldown, ``allow`` admits exactly ONE probe; while
-      that probe is outstanding further calls are refused. A success closes the
-      breaker; a timeout re-opens it (fresh cooldown).
+    Ties an outcome to the exact call the breaker admitted (Codex R1 MAJOR).
+    Without it, a call admitted while the breaker was closed could later report
+    ``success`` and wrongly close an already-open breaker, or a stale error
+    could release another call's half-open probe slot. ``token`` identifies the
+    single admitted half-open probe; only its owner may close / re-open / release
+    that probe slot.
+    """
+
+    __slots__ = ("is_probe", "token")
+
+    def __init__(self, *, is_probe: bool, token: object | None) -> None:
+        self.is_probe = is_probe
+        self.token = token
+
+
+class _CircuitBreaker:
+    """Three-state breaker (closed → open → half-open), attempt-token guarded.
+
+    - ``closed``: ``allow`` admits every call (non-probe attempt); consecutive
+      wall-clock timeouts accumulate; a success resets the streak.
+    - ``open``: ``allow`` returns ``None`` (fast-fail) until ``cooldown`` elapses.
+    - ``half-open``: after cooldown, ``allow`` admits exactly ONE probe (a unique
+      ``token``); further calls are refused while it is outstanding. Only the
+      probe owner may close (on success), re-open (on timeout), or release the
+      slot (on a fast error). A non-probe outcome NEVER closes an open breaker.
 
     ``open_after`` / ``cooldown`` are passed per call so a config change takes
     effect immediately. ``clock`` is injectable for deterministic tests.
+
+    Semantics note (Codex R1 MINOR): ``_consecutive_timeouts`` counts timeouts
+    **since the last success**, not strictly back-to-back outcomes — a fast
+    (non-timeout) error is neutral (the provider responded and the worker
+    finished; nothing hung to bound), so it neither counts nor resets the streak.
     """
 
     def __init__(
@@ -156,48 +182,66 @@ class _CircuitBreaker:
         self._clock = clock
         self._consecutive_timeouts = 0
         self._opened_at: float | None = None
-        self._half_open_probe_in_flight = False
+        # Identity of the single outstanding half-open probe (None = none).
+        self._probe_token: object | None = None
 
-    def allow(self, *, open_after: int, cooldown: float) -> bool:
+    def allow(self, *, cooldown: float) -> _BreakerAttempt | None:
+        """Admit a call. Returns an attempt token, or ``None`` to fast-fail."""
         with self._lock:
             if self._opened_at is None:
-                return True  # closed
+                return _BreakerAttempt(is_probe=False, token=None)  # closed
             if self._clock() - self._opened_at < cooldown:
-                return False  # still open → fast-fail
+                return None  # still open → fast-fail
+            if self._probe_token is not None:
+                return None  # a probe is already outstanding
             # Cooldown elapsed → half-open: admit exactly one probe.
-            if self._half_open_probe_in_flight:
-                return False
-            self._half_open_probe_in_flight = True
-            return True
+            token = object()
+            self._probe_token = token
+            return _BreakerAttempt(is_probe=True, token=token)
 
-    def record_success(self) -> None:
-        with self._lock:
-            self._consecutive_timeouts = 0
-            self._opened_at = None
-            self._half_open_probe_in_flight = False
+    def _owns_probe(self, attempt: _BreakerAttempt) -> bool:
+        return (
+            attempt.is_probe
+            and attempt.token is not None
+            and attempt.token is self._probe_token
+        )
 
-    def record_timeout(self, *, open_after: int) -> None:
+    def record_success(self, attempt: _BreakerAttempt) -> None:
         with self._lock:
-            self._consecutive_timeouts += 1
-            was_half_open_probe = self._half_open_probe_in_flight
-            self._half_open_probe_in_flight = False
-            if self._opened_at is not None:
-                # Already open. A half-open probe that timed out re-arms the
-                # cooldown from now; a stray late timeout while open likewise
-                # keeps it open with a fresh window.
-                if was_half_open_probe:
-                    self._opened_at = self._clock()
-                return
-            if self._consecutive_timeouts >= open_after:
+            if self._owns_probe(attempt):
+                # Probe succeeded → close the breaker.
+                self._opened_at = None
+                self._probe_token = None
+                self._consecutive_timeouts = 0
+            elif not attempt.is_probe and self._opened_at is None:
+                # Healthy response while closed → reset the timeout streak. A
+                # non-probe success NEVER closes an open breaker (stale-success
+                # guard).
+                self._consecutive_timeouts = 0
+            # else: stale / non-owning outcome → ignore.
+
+    def record_timeout(self, attempt: _BreakerAttempt, *, open_after: int) -> None:
+        with self._lock:
+            if self._owns_probe(attempt):
+                # Probe hung → re-open with a fresh cooldown window.
                 self._opened_at = self._clock()
+                self._probe_token = None
+                self._consecutive_timeouts += 1
+            elif not attempt.is_probe and self._opened_at is None:
+                self._consecutive_timeouts += 1
+                if self._consecutive_timeouts >= open_after:
+                    self._opened_at = self._clock()
+            # else: stale, or a non-probe timeout while already open → ignore.
 
-    def record_other_error(self) -> None:
-        """A fast (non-timeout) error: neutral. It does not open the breaker
-        (no hung thread to bound) and does not reset the timeout streak; it
-        only clears an outstanding half-open probe so the next call may probe
-        again."""
+    def record_other_error(self, attempt: _BreakerAttempt) -> None:
+        """A fast (non-timeout) error or a cancellation. Neutral to the breaker
+        (nothing hung to bound). Only the probe owner acts: it releases the
+        half-open slot WITHOUT closing (the probe did not prove the provider
+        healthy) so the next call may probe again after cooldown."""
         with self._lock:
-            self._half_open_probe_in_flight = False
+            if self._owns_probe(attempt):
+                self._probe_token = None
+            # non-probe fast error: neutral (no state change).
 
     @property
     def is_open(self) -> bool:

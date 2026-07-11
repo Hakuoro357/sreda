@@ -192,7 +192,12 @@ class Settings(BaseSettings):
     mimo_api_key: str | None = None
     mimo_api_key_file: str | None = None
     mimo_chat_model: str = "mimo-v2-pro"
-    mimo_request_timeout_seconds: float = 60.0
+    # Bounded finite (#343 F7, Codex R1 MAJOR): unbounded it accepted inf/nan/0/
+    # negative, which would defeat the "explicit finite read timeout" guarantee
+    # (it is the read fallback in services.llm._build_request_timeout). gt=0/le
+    # reject inf/nan/0/neg. No validation_alias → keeps the env_prefix contract
+    # (env: SREDA_MIMO_REQUEST_TIMEOUT_SECONDS), unchanged.
+    mimo_request_timeout_seconds: float = Field(default=60.0, gt=0.0, le=600.0)
 
     # ── LLM reliability guard (#343 / F7 audit #336) ──────────────────────
     # Explicit FINITE per-phase httpx timeouts for the chat-LLM client. A bare
@@ -209,8 +214,12 @@ class Settings(BaseSettings):
             "SREDA_LLM_CONNECT_TIMEOUT_SECONDS", "sreda_llm_connect_timeout_seconds"
         ),
     )
+    # None → falls back to mimo_request_timeout_seconds (also bounded). gt=0/le
+    # reject inf/nan/0/neg on the explicit value (Codex R1 MAJOR).
     llm_read_timeout_seconds: float | None = Field(
         default=None,
+        gt=0.0,
+        le=600.0,
         validation_alias=AliasChoices(
             "SREDA_LLM_READ_TIMEOUT_SECONDS", "sreda_llm_read_timeout_seconds"
         ),
@@ -237,10 +246,13 @@ class Settings(BaseSettings):
     # spawning a thread, bounding hung-thread/socket accumulation. Finite by
     # design; default is generous enough to be a no-op under normal load and to
     # only catch runaway accumulation. Prod value confirmed finite per §7 п.6.
+    # le=512 is a conservative operational ceiling (Codex R1 MAJOR): a
+    # single-process misconfig cannot request tens of thousands of concurrent
+    # invoke threads/sockets and silently defeat the protection. Default 48.
     llm_bulkhead_max_concurrent: int = Field(
         default=48,
         ge=1,
-        le=100000,
+        le=512,
         validation_alias=AliasChoices(
             "SREDA_LLM_BULKHEAD_MAX_CONCURRENT", "sreda_llm_bulkhead_max_concurrent"
         ),
