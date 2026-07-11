@@ -11,6 +11,19 @@ queue). Ревью — дисциплина; owner-bar #138 требует МЕ�
 здесь с причиной (как rls_registry для таблиц). Ключ — (файл, функция, примитив),
 БЕЗ номеров строк (дрейф строк не триггерит).
 
+ГРАНИЦА СКАНЕРА (осознанная, R3-353): отслеживается СОЗДАНИЕ сессий/движков/пулов/
+сырых соединений (get_session_factory / sessionmaker / Session / create_engine /
+Engine / async-аналоги / psycopg|asyncpg ConnectionPool/connect + inline
+get_engine().connect|begin). НЕ отслеживается downstream `.connect()`/`.begin()` на
+переменной-движке (`e = get_engine(); e.begin()`) — и не нужно: движок ГЕЙТИТСЯ на
+создании. Шов `get_engine()` вешает begin-листенер, эмитящий set_config → ЛЮБОЕ
+соединение с него tenant-скоуплено при выставленном ctx; raw `create_engine`/psycopg
+трекается+классифицируется на создании. Статически отличить `engine.begin()` от
+`session.begin()` (~30 сайтов, большинство — транзакции сессии) требует dataflow —
+вне скоупа по дизайну (та же рамка, что «не доказываем ctx-скоупинг записей»).
+Биллинг usage_ledger/fetch_url_usage/web_search_usage: `engine.begin()` на
+ПЕРЕДАННОМ швовом движке под ctx турна — безопасно по конструкции.
+
 Это drift-гейт, не доказательство корректности записей: сами классификации
 проверены Ф2-картой (plans/138-f2-remainder-map.md) + 5 раундами трио-ревью
 Ф5-5b/5c; красный здесь = «появилась НОВАЯ неклассифицированная дверь».
@@ -52,10 +65,20 @@ _TRACKED_IMPORTS: dict[tuple[str, str], str] = {
     ("sqlalchemy.orm", "sessionmaker"): "sessionmaker",
     ("sqlalchemy.orm", "Session"): "Session",
     ("sqlalchemy", "create_engine"): "create_engine",
+    ("sqlalchemy", "Engine"): "create_engine",  # прямой Engine(...) = дверь
+    ("sqlalchemy.engine", "Engine"): "create_engine",
+    # R3-353 (medium MAJOR): async-SQLAlchemy — сейчас в src/sreda не используется,
+    # покрыто защитно (обещание «ВСЕ точки»).
+    ("sqlalchemy.ext.asyncio", "create_async_engine"): "create_engine",
+    ("sqlalchemy.ext.asyncio", "AsyncEngine"): "create_engine",
+    ("sqlalchemy.ext.asyncio", "async_sessionmaker"): "sessionmaker",
+    ("sqlalchemy.ext.asyncio", "AsyncSession"): "Session",
     # R2-353 (субагент MAJOR): сырые driver-соединения мимо SQLAlchemy И швов
     ("psycopg_pool", "ConnectionPool"): "raw-conn",
     ("psycopg_pool", "AsyncConnectionPool"): "raw-conn",
     ("psycopg", "connect"): "raw-conn",
+    ("psycopg", "Connection"): "raw-conn",  # Connection.connect() classmethod
+    ("psycopg", "AsyncConnection"): "raw-conn",
     ("psycopg2", "connect"): "raw-conn",
     ("asyncpg", "connect"): "raw-conn",
     ("asyncpg", "create_pool"): "raw-conn",
@@ -108,22 +131,52 @@ def _scan_doors() -> dict[tuple[str, str, str], int]:
                     prim = _TRACKED_IMPORTS.get((node.module, a.name))
                     if prim is not None:
                         sym_aliases[a.asname or a.name] = prim
+                    # R3-353 (medium MAJOR): submodule-алиас
+                    # `from sqlalchemy import orm as so` → so = sqlalchemy.orm
+                    mod_aliases[a.asname or a.name] = f"{node.module}.{a.name}"
             elif isinstance(node, ast.Import):
                 for a in node.names:
                     mod_aliases[a.asname or a.name.split(".")[0]] = a.name
+
+        def _dotted(expr: ast.AST) -> str | None:
+            """Плоское dotted-имя выражения (a.b.c) или None (не Name/Attribute-цепь)."""
+            if isinstance(expr, ast.Name):
+                return expr.id
+            if isinstance(expr, ast.Attribute):
+                base = _dotted(expr.value)
+                return f"{base}.{expr.attr}" if base is not None else None
+            return None
 
         def resolve(expr: ast.AST) -> str | None:
             """Каноничный примитив для Name/Attribute-выражения (или None)."""
             if isinstance(expr, ast.Name):
                 return sym_aliases.get(expr.id) or _BARE_FALLBACK.get(expr.id)
             if isinstance(expr, ast.Attribute):
-                # M.attr — через модульный алиас (import sqlalchemy.orm as so)
+                # M.attr — через модульный алиас (import sqlalchemy.orm as so;
+                # from sqlalchemy import orm as so)
                 if isinstance(expr.value, ast.Name):
                     mod = mod_aliases.get(expr.value.id)
                     if mod is not None:
                         prim = _TRACKED_IMPORTS.get((mod, expr.attr))
                         if prim is not None:
                             return prim
+                # R3-353 (high MINOR): полностью dotted-путь без алиаса
+                # (import sqlalchemy.orm; sqlalchemy.orm.Session()) — head-модуль
+                # через mod_aliases (default self под тем же именем) + прямой матч.
+                full = _dotted(expr)
+                if full is not None and "." in full:
+                    mod, _, attr = full.rpartition(".")
+                    # разрешить head-алиас модуля (import sqlalchemy.orm as X)
+                    head, _, rest = mod.partition(".")
+                    resolved_mod = (
+                        (mod_aliases.get(head, head) + ("." + rest if rest else ""))
+                    )
+                    prim = (
+                        _TRACKED_IMPORTS.get((mod, attr))
+                        or _TRACKED_IMPORTS.get((resolved_mod, attr))
+                    )
+                    if prim is not None:
+                        return prim
                 # attr-фолбэк — только отличительные sreda-имена
                 return _BARE_FALLBACK.get(expr.attr)
             return None
