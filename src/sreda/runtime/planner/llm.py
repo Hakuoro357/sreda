@@ -164,6 +164,7 @@ def call_planner(
     try:
         response = invoke_fn(
             runnable, messages, timeout_seconds=effective_timeout,
+            provider=effective_provider,  # #343: per-provider circuit breaker
         )
     except LLMCallTimeout as exc:
         # Re-wrap into planner namespace. Original cause preserved.

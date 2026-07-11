@@ -42,6 +42,7 @@ from sreda.services.budget import BudgetService, QuotaStatus
 from sreda.services import trace
 from sreda.services.embeddings import get_embeddings_client
 from sreda.services.llm import (
+    ainvoke_with_streaming_timeout,
     detect_unbacked_claim,
     get_chat_llm,
     is_capability_question,
@@ -2604,7 +2605,18 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
             with trace.step(
                 f"llm.iter.{_MAX_TOOL_ITERATIONS}.summary", model=model_name
             ) as _trace_meta:
-                final_ai = llm.invoke(messages)  # NOTE: no bind_tools
+                # #343: route the forced-summary through the guarded wrapper
+                # (wall-clock timeout + bulkhead + per-provider breaker) and OFF
+                # the event loop. A raw synchronous ``llm.invoke`` here would run
+                # on the loop thread and a hung provider could freeze every turn,
+                # bypassing the finite in-flight ceiling entirely. on_text_update
+                # is None → no streaming; behaviour matches the prior invoke.
+                final_ai = await ainvoke_with_streaming_timeout(
+                    llm,
+                    messages,
+                    timeout_seconds=get_settings().mimo_request_timeout_seconds,
+                    provider=_chat_primary_provider,
+                )
                 usage = getattr(final_ai, "usage_metadata", None) or {}
                 _trace_meta["in_tok"] = int(usage.get("input_tokens") or 0)
                 _trace_meta["out_tok"] = int(usage.get("output_tokens") or 0)

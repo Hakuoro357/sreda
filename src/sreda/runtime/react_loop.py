@@ -2853,13 +2853,15 @@ def _build_graph(llm: Any, all_tools: list, *,
             _t0 = _time.perf_counter()
             try:  # guarded bind+invoke (deepseek может не принять tool-схему); #256: КОРОТКИЙ chat-таймаут
                 resp = invoke_with_per_call_timeout(
-                    _primary.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s)
+                    _primary.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
+                    provider=_used_provider)  # #343: per-provider breaker keying
             except Exception as _e:  # noqa: BLE001 — сбой/таймаут deepseek → fallback Фредди web-only
                 logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
                 resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
-                    llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s)
+                    llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
+                    provider=provider_key)  # #343: fallback Фредди → СВОЙ breaker-bucket, не primary
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:
@@ -2987,20 +2989,23 @@ def _build_graph(llm: Any, all_tools: list, *,
             if fallback_llm is not None:
                 try:
                     resp = invoke_with_per_call_timeout(
-                        _bound_primary, _msgs, timeout_seconds=_react_timeout_s)
+                        _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
+                        provider=_used_provider)  # #343: per-provider breaker keying
                 except Exception as _e:  # noqa: BLE001 — INVOKE primary упал/завис (сеть/5xx/таймаут) → запас
                     logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
                                    type(_e).__name__, exc_info=True)
                     _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
                     resp = invoke_with_per_call_timeout(
-                        fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s)
+                        fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s,
+                        provider=_FALLBACK_PROVIDER_KEY)  # #343: Оса → СВОЙ breaker-bucket
                     _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
                     _fallback_fired = True
             else:
                 # Без запаса: зависший primary → LLMCallTimeout всплывает во внешний guard → safe-reply
                 # (раньше висел бы без ограничения по времени).
                 resp = invoke_with_per_call_timeout(
-                    _bound_primary, _msgs, timeout_seconds=_react_timeout_s)
+                    _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
+                    provider=_used_provider)  # #343: per-provider breaker keying
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
@@ -3944,7 +3949,9 @@ async def _run_post_turn_summary_inner(
                   HumanMessage(_format_history_for_summary(prev_text, chunk))]
         # вызов пересказчика — в отдельном потоке (R1 MAJOR): синхронный invoke не блокирует event loop
         resp = await asyncio.to_thread(
-            invoke_with_per_call_timeout, summary_llm, prompt, timeout_seconds=_SUMMARY_LLM_TIMEOUT_S)
+            invoke_with_per_call_timeout, summary_llm, prompt,
+            timeout_seconds=_SUMMARY_LLM_TIMEOUT_S,
+            provider=_SUMMARY_PROVIDER)  # #343: per-provider circuit breaker
         # Учёт расхода — ДО гейтов (R1 #287 субагент): отброшенная генерация тоже стоила денег
         # (length/content_filter с ненулевым usage — иначе тихий недоучёт ровно в деградации);
         # нулевой usage (live error-кейс 0/0) no-op'ится в самом _record_react_usage.
