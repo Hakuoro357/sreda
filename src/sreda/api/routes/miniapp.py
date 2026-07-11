@@ -324,6 +324,18 @@ def _require_miniapp_auth(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail=f"signup_blocked:{exc.reason}",
                 )
+            except AmbiguousExternalIdentity:
+                # R3 (Codex medium): гонка precheck↔ensure — дубль появился между
+                # ними. Fail-closed: НЕ провижнить, 500 (как duplicate-integrity выше).
+                session.rollback()
+                logger.exception(
+                    "miniapp auth: ambiguous max_account_id at ensure for max=%s — "
+                    "DATA INTEGRITY (>1 user)", account_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="duplicate_max_account_integrity",
+                )
             except IntegrityError:
                 session.rollback()
                 logger.info(
@@ -427,24 +439,29 @@ def _require_miniapp_auth(
     # сразу после резолва; lazy-provisioned тенант только что создан и всегда
     # активен. Удалённый тенант → 410 БЕЗ stamp/refresh-мутаций.
 
-    # Resolve workspace_id for connect link creation (channel-agnostic)
+    # Resolve workspace_id for connect link creation (channel-agnostic).
+    # #138 Ф5-5c (Codex medium R3 MAJOR): под tenant_session(tenant_id) — иначе
+    # после флипа DSN app-роль без ctx вернёт 0 строк → workspace_id=None →
+    # ломает connect-link. Под ctx свой тенант виден (p_{t}_tenant FOR ALL).
     from sreda.db.models.core import Assistant, Workspace
+    from sreda.db.session import tenant_session as _tenant_session
 
-    assistant = (
-        session.query(Assistant)
-        .filter(Assistant.tenant_id == tenant_id)
-        .order_by(Assistant.id.asc())
-        .first()
-    )
-    workspace_id = assistant.workspace_id if assistant else None
-    if workspace_id is None:
-        workspace = (
-            session.query(Workspace)
-            .filter(Workspace.tenant_id == tenant_id)
-            .order_by(Workspace.id.asc())
+    with _tenant_session(tenant_id) as _ts:
+        assistant = (
+            _ts.query(Assistant)
+            .filter(Assistant.tenant_id == tenant_id)
+            .order_by(Assistant.id.asc())
             .first()
         )
-        workspace_id = workspace.id if workspace else None
+        workspace_id = assistant.workspace_id if assistant else None
+        if workspace_id is None:
+            workspace = (
+                _ts.query(Workspace)
+                .filter(Workspace.tenant_id == tenant_id)
+                .order_by(Workspace.id.asc())
+                .first()
+            )
+            workspace_id = workspace.id if workspace else None
 
     return MiniAppContext(
         tenant_id=tenant_id,

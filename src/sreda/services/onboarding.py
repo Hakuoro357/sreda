@@ -255,7 +255,7 @@ class TelegramOnboardingResult:
 
 def _serve_existing_bundle_reads(
     resolved, *, tg_bot_key: str | None = None, update_max_chat_id: str | None = None
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     """#138 Ф5-5c: обслуживание СУЩЕСТВУЮЩЕГО юзера под правильными ролями (чтобы
     после флипа DSN на sreda_app не сломаться о RLS).
 
@@ -265,19 +265,24 @@ def _serve_existing_bundle_reads(
     тенанта (``_auto_approve``: UPDATE tenants — app НЕ может, ``p_tenants_self`` =
     SELECT-only) — под ``privileged_session("admin")`` (maintenance, FOR ALL), и
     ТОЛЬКО если реально pending/без активной free-подписки (для здорового юзера —
-    ноль записей). Возвращает (workspace_id, assistant_id)."""
+    ноль записей). Возвращает (workspace_id, assistant_id, effective_max_chat_id).
+    effective_max_chat_id (R3 Codex high MINOR): обновлённый ИЛИ сохранённый
+    max_chat_id — чтобы вызывающий не потерял fallback на stored при апдейте без
+    извлекаемого chat_id."""
     from sreda.db.session import privileged_session, tenant_session
 
     tid = resolved.tenant_id
+    effective_max_chat_id: str | None = update_max_chat_id
     with tenant_session(tid) as ts:
-        if tg_bot_key is not None or update_max_chat_id is not None:
-            user = ts.get(User, resolved.user_id)
-            if user is not None and tg_bot_key is not None:
+        user = ts.get(User, resolved.user_id)
+        if user is not None:
+            if tg_bot_key is not None:
                 _stamp_last_bot_key(ts, user, tg_bot_key)
-            if user is not None and update_max_chat_id is not None \
-                    and user.max_chat_id != update_max_chat_id:
+            if update_max_chat_id is not None and user.max_chat_id != update_max_chat_id:
                 user.max_chat_id = update_max_chat_id  # UPDATE users own — RLS ok
                 ts.commit()
+            if effective_max_chat_id is None:
+                effective_max_chat_id = user.max_chat_id  # fallback на stored
         assistant = (
             ts.query(Assistant)
             .filter(Assistant.tenant_id == tid)
@@ -308,7 +313,7 @@ def _serve_existing_bundle_reads(
     if resolved.approved_at is None or not has_active_sub:
         with privileged_session("admin") as ps:
             _auto_approve_and_grant_free_tier(ps, tid)
-    return workspace_id, assistant_id
+    return workspace_id, assistant_id, effective_max_chat_id
 
 
 def ensure_telegram_user_bundle(
@@ -364,16 +369,14 @@ def ensure_telegram_user_bundle_by_id(
     # под RLS без ctx → существующий юзер уехал бы в provision-путь → ложный
     # rate-limit). tenant-чтения/репаир — в _serve_existing_bundle_reads под
     # правильными ролями. Phase 2: pending/no-sub тенанты чинятся там же.
-    from sreda.services.identity_resolve import (
-        AmbiguousExternalIdentity,
-        resolve_external_identity,
-    )
-    try:
-        resolved = resolve_external_identity("telegram", telegram_id)
-    except AmbiguousExternalIdentity:
-        resolved = None  # tg_account_hash unique → не должно быть; трактуем как unresolved
+    # R3 (Codex high MINOR): Ambiguous НЕ гасим в None (fail-closed, симметрично
+    # MAX) — tg_account_hash unique, так что это не должно случиться, но если
+    # случилось (порча данных) — пробрасываем, а не провижним новую семью.
+    from sreda.services.identity_resolve import resolve_external_identity
+
+    resolved = resolve_external_identity("telegram", telegram_id)
     if resolved is not None:
-        workspace_id, assistant_id = _serve_existing_bundle_reads(
+        workspace_id, assistant_id, _ = _serve_existing_bundle_reads(
             resolved, tg_bot_key=bot_key,
         )
         return TelegramOnboardingResult(
@@ -701,22 +704,20 @@ def ensure_max_user_bundle(
 
     # #138 Ф5-5c: детекция существующего через identity-DEFINER (после флипа DSN
     # прямой app-SELECT вернул бы 0). channel linking уже мог связать max_account_id
-    # к существующему tenant'у. Неоднозначность (max_account_id НЕ unique) → тихо не
-    # резолвим (дроп/дубль решает вызывающий; max_inbound ловит Ambiguous отдельно).
-    from sreda.services.identity_resolve import (
-        AmbiguousExternalIdentity,
-        resolve_external_identity,
-    )
-    try:
-        resolved = resolve_external_identity("max", aid)
-    except AmbiguousExternalIdentity:
-        resolved = None
+    # к существующему tenant'у.
+    # R3 (Codex medium MAJOR): AmbiguousExternalIdentity НЕ гасим в None — иначе
+    # гонка precheck↔этот резолв (появился 2-й дубль между ними) увела бы в провижн
+    # ТРЕТЬЕЙ семьи. Пробрасываем (fail-closed match_count>1): вызывающий (max_inbound
+    # precheck / miniapp) уже ловит Ambiguous → дроп/отказ, НЕ провижн.
+    from sreda.services.identity_resolve import resolve_external_identity
+
+    resolved = resolve_external_identity("max", aid)
     if resolved is not None:
-        workspace_id, assistant_id = _serve_existing_bundle_reads(
+        workspace_id, assistant_id, eff_chat_id = _serve_existing_bundle_reads(
             resolved, update_max_chat_id=chat_id_str,
         )
         return MaxOnboardingResult(
-            False, aid, chat_id_str, resolved.tenant_id, workspace_id,
+            False, aid, eff_chat_id, resolved.tenant_id, workspace_id,
             resolved.user_id, assistant_id,
         )
 

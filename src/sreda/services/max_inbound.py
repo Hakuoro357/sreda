@@ -172,6 +172,14 @@ async def handle_max_update(
                 max_chat_id=chat_id,
                 display_name=display_name,
             )
+        except AmbiguousExternalIdentity:
+            # R3 (Codex medium): гонка precheck↔ensure — дубль появился между ними.
+            # Fail-closed: НЕ провижнить третью семью, тихий дроп (как precheck).
+            logger.warning(
+                "max inbound: ambiguous max_account_id at ensure — silent drop, "
+                "no provision (гонка/ручная развязка)"
+            )
+            return ""
         except SignupBlocked as exc:
             logger.info(
                 "max inbound: signup blocked reason=%s — drop update",
