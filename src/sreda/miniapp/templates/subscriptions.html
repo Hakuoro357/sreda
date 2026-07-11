@@ -584,6 +584,7 @@
   function formatDate(iso) {
     if (!iso) return "—";
     var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";  // g-075: «NaN.NaN.NaN» юзеру нельзя
     var dd = String(d.getDate()).padStart(2, "0");
     var mm = String(d.getMonth() + 1).padStart(2, "0");
     var yyyy = d.getFullYear();
@@ -596,6 +597,7 @@
   function formatDateTime(iso) {
     if (!iso) return "—";
     var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";  // g-075: «Invalid Date» юзеру нельзя
     var now = new Date();
     var sameDay = d.toDateString() === now.toDateString();
     var tmrw = new Date(now.getTime() + 86400000);
@@ -833,8 +835,8 @@
 
   // Human-readable RRULE summary for reminder cards. Covers the
   // common shapes the LLM emits (FREQ=DAILY / WEEKLY BYDAY=...).
-  // Unknown shapes fall back to the raw RRULE so the user at least
-  // sees SOMETHING rather than «undefined».
+  // Unknown shapes render as neutral «повторяется» - raw RRULE is NEVER
+  // shown to the user (g-075: no technical data in user-facing text).
   var _DOW_RU = {
     MO: "понедельник", TU: "вторник", WE: "среда", TH: "четверг",
     FR: "пятница", SA: "суббота", SU: "воскресенье",
@@ -890,10 +892,11 @@
       base += ", всего " + parts.COUNT + " раз";
     } else if (parts.UNTIL) {
       // UTC basic format 20260711T143000Z → локальное «до 11.07 17:30»
-      var m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})/.exec(parts.UNTIL);
+      // и basic (20260711T143000Z), и extended (2026-07-11T14:30Z) - модель шлёт оба
+      var m = /^(\d{4})-?(\d{2})-?(\d{2})T(\d{2}):?(\d{2})/.exec(parts.UNTIL);
       if (m) {
         var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
-        base += " до " + d.getDate() + "." + String(d.getMonth() + 1).padStart(2, "0") +
+        base += " до " + String(d.getDate()).padStart(2, "0") + "." + String(d.getMonth() + 1).padStart(2, "0") +
                 " " + String(d.getHours()).padStart(2, "0") + ":" +
                 String(d.getMinutes()).padStart(2, "0");
       } else {
@@ -1195,7 +1198,7 @@
     }
 
     if (plan.week_start_date) {
-      html += '<div class="card-subtitle" style="margin-bottom:12px">с ' + escHtml(plan.week_start_date) + '</div>';
+      html += '<div class="card-subtitle" style="margin-bottom:12px">с ' + escHtml(formatDate(plan.week_start_date)) + '</div>';
     }
 
     for (var d = 0; d < 7; d++) {
