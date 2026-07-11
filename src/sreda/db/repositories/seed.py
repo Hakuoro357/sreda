@@ -77,7 +77,10 @@ def insert_only_bundle(
     created = True
     try:
         with session.begin_nested():
+            # ORM-объекты флашим ДО зависимых сырых INSERT'ов (autoflush может быть
+            # off → сырой execute иначе выполнится раньше flush ORM → FK-violation).
             session.add(Tenant(id=tenant_id, name=tenant_name, created_at=now, approved_at=now))
+            session.flush()  # tenants до workspaces/users (FK)
             session.execute(
                 text("INSERT INTO workspaces (id, tenant_id, name) VALUES (:id, :t, :name)"),
                 {"id": workspace_id, "t": tenant_id, "name": workspace_name},
@@ -92,6 +95,7 @@ def insert_only_bundle(
                     last_bot_key=last_bot_key,
                 )
             )
+            session.flush()  # users до assistants (FK на workspace уже есть)
             session.execute(
                 text(
                     "INSERT INTO assistants (id, tenant_id, workspace_id, name) "
@@ -106,7 +110,6 @@ def insert_only_bundle(
                 ),
                 {"id": f"{tenant_id}:core_assistant", "t": tenant_id, "en": True},
             )
-            session.flush()
     except IntegrityError as ex:
         if not _is_unique_violation(ex):
             raise  # FK/NOT NULL/CHECK — не «ретрай», настоящая ошибка

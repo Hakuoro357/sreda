@@ -108,10 +108,11 @@ def _identity_phase_uses_session(session, monkeypatch):
         _seed_plan(session)
 
     @contextmanager
-    def _stub(reason):
+    def _stub(arg):
         yield session
 
     monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
 
 
 def _seed_plan(session) -> SubscriptionPlan:

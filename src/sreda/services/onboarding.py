@@ -253,6 +253,64 @@ class TelegramOnboardingResult:
     assistant_id: str | None
 
 
+def _serve_existing_bundle_reads(
+    resolved, *, tg_bot_key: str | None = None, update_max_chat_id: str | None = None
+) -> tuple[str | None, str | None]:
+    """#138 Ф5-5c: обслуживание СУЩЕСТВУЮЩЕГО юзера под правильными ролями (чтобы
+    после флипа DSN на sreda_app не сломаться о RLS).
+
+    tenant-чтения (assistant/workspace) + ``_stamp_last_bot_key`` (UPDATE users
+    СВОЕЙ строки) — под ``tenant_session(tenant_id)``: app-роль + tenant_ctx →
+    политика ``p_{t}_tenant`` (FOR ALL) пускает свой тенант. Репаир pending/no-sub
+    тенанта (``_auto_approve``: UPDATE tenants — app НЕ может, ``p_tenants_self`` =
+    SELECT-only) — под ``privileged_session("admin")`` (maintenance, FOR ALL), и
+    ТОЛЬКО если реально pending/без активной free-подписки (для здорового юзера —
+    ноль записей). Возвращает (workspace_id, assistant_id)."""
+    from sreda.db.session import privileged_session, tenant_session
+
+    tid = resolved.tenant_id
+    with tenant_session(tid) as ts:
+        if tg_bot_key is not None or update_max_chat_id is not None:
+            user = ts.get(User, resolved.user_id)
+            if user is not None and tg_bot_key is not None:
+                _stamp_last_bot_key(ts, user, tg_bot_key)
+            if user is not None and update_max_chat_id is not None \
+                    and user.max_chat_id != update_max_chat_id:
+                user.max_chat_id = update_max_chat_id  # UPDATE users own — RLS ok
+                ts.commit()
+        assistant = (
+            ts.query(Assistant)
+            .filter(Assistant.tenant_id == tid)
+            .order_by(Assistant.id.asc())
+            .first()
+        )
+        workspace_id = assistant.workspace_id if assistant is not None else None
+        if workspace_id is None:
+            ws = (
+                ts.query(Workspace)
+                .filter(Workspace.tenant_id == tid)
+                .order_by(Workspace.id.asc())
+                .first()
+            )
+            workspace_id = ws.id if ws is not None else None
+        assistant_id = assistant.id if assistant is not None else None
+        has_active_sub = (
+            ts.query(TenantSubscription)
+            .filter(
+                TenantSubscription.tenant_id == tid,
+                TenantSubscription.feature_key == "housewife_assistant",
+                TenantSubscription.status == "active",
+            )
+            .first()
+            is not None
+        )
+    # Репаир pending/no-sub — редкий legacy-случай (тенанты до approved_at-в-INSERT).
+    if resolved.approved_at is None or not has_active_sub:
+        with privileged_session("admin") as ps:
+            _auto_approve_and_grant_free_tier(ps, tid)
+    return workspace_id, assistant_id
+
+
 def ensure_telegram_user_bundle(
     session: Session,
     payload: dict,
@@ -261,41 +319,13 @@ def ensure_telegram_user_bundle(
 ) -> TelegramOnboardingResult:
     """Ensure bundle for a Telegram update payload.
 
-    Phase 6: ``bot_key`` threaded through to apply per-bot onboarding
-    policy (signup_open). Defaults to ``"sreda"`` for backward-compat.
+    #138 Ф5-5c: делегирует в ``_by_id`` (детекция существующего юзера идёт через
+    identity-DEFINER там, а не прямым app-SELECT — иначе после флипа DSN
+    существующий юзер не резолвится и уезжает в provision-путь).
     """
     chat_id = _extract_chat_id(payload)
     if chat_id is None:
         return TelegramOnboardingResult(False, None, None, None, None, None)
-
-    existing_user = find_user_by_chat_id(session, chat_id)
-    if existing_user is not None:
-        # #109: capture the bot the user is currently on so async producers
-        # route notifications here (handles sreda → sreda_home migration).
-        _stamp_last_bot_key(session, existing_user, bot_key)
-        assistant = (
-            session.query(Assistant)
-            .filter(Assistant.tenant_id == existing_user.tenant_id)
-            .order_by(Assistant.id.asc())
-            .first()
-        )
-        workspace_id = assistant.workspace_id if assistant is not None else None
-        if workspace_id is None:
-            workspace = (
-                session.query(Workspace)
-                .filter(Workspace.tenant_id == existing_user.tenant_id)
-                .order_by(Workspace.id.asc())
-                .first()
-            )
-            workspace_id = workspace.id if workspace is not None else None
-        return TelegramOnboardingResult(
-            False,
-            chat_id,
-            existing_user.tenant_id,
-            workspace_id,
-            existing_user.id,
-            assistant.id if assistant is not None else None,
-        )
 
     display_name = _extract_display_name(payload) or f"Пользователь {chat_id}"
     return ensure_telegram_user_bundle_by_id(
@@ -329,42 +359,26 @@ def ensure_telegram_user_bundle_by_id(
     if not telegram_id:
         return TelegramOnboardingResult(False, None, None, None, None, None)
 
-    existing_user = find_user_by_chat_id(session, telegram_id)
-    if existing_user is not None:
-        # #109: capture the user's current bot (Mini App / by-id entrypoint
-        # too — keeps last_bot_key fresh even if they never send /start).
-        _stamp_last_bot_key(session, existing_user, bot_key)
-        assistant = (
-            session.query(Assistant)
-            .filter(Assistant.tenant_id == existing_user.tenant_id)
-            .order_by(Assistant.id.asc())
-            .first()
+    # #138 Ф5-5c: детекция существующего юзера — через identity-DEFINER (работает
+    # после флипа DSN), НЕ прямым app-SELECT (find_user_by_chat_id вернул бы 0 строк
+    # под RLS без ctx → существующий юзер уехал бы в provision-путь → ложный
+    # rate-limit). tenant-чтения/репаир — в _serve_existing_bundle_reads под
+    # правильными ролями. Phase 2: pending/no-sub тенанты чинятся там же.
+    from sreda.services.identity_resolve import (
+        AmbiguousExternalIdentity,
+        resolve_external_identity,
+    )
+    try:
+        resolved = resolve_external_identity("telegram", telegram_id)
+    except AmbiguousExternalIdentity:
+        resolved = None  # tg_account_hash unique → не должно быть; трактуем как unresolved
+    if resolved is not None:
+        workspace_id, assistant_id = _serve_existing_bundle_reads(
+            resolved, tg_bot_key=bot_key,
         )
-        workspace_id = assistant.workspace_id if assistant is not None else None
-        if workspace_id is None:
-            workspace = (
-                session.query(Workspace)
-                .filter(Workspace.tenant_id == existing_user.tenant_id)
-                .order_by(Workspace.id.asc())
-                .first()
-            )
-            workspace_id = workspace.id if workspace is not None else None
-        # Phase 2 (Codex MAJOR-8 fix 2026-05-07): existing tenants могут
-        # быть pending (approved_at IS NULL) или без active subscription
-        # на housewife_assistant — например, оставшиеся со старого
-        # manual-approval flow до Phase 2 cutover. Helper идемпотентен:
-        # на здорового tenant'а делает 2 SELECT'а и no-op. На pending
-        # tenant'а — выставляет approved_at + создаёт sreda_free sub
-        # на первом контакте после Phase 2 deploy. Без этого они
-        # застревали бы (admin/approve route → 410, нет fallback'а).
-        _auto_approve_and_grant_free_tier(session, existing_user.tenant_id)
         return TelegramOnboardingResult(
-            False,
-            telegram_id,
-            existing_user.tenant_id,
-            workspace_id,
-            existing_user.id,
-            assistant.id if assistant is not None else None,
+            False, telegram_id, resolved.tenant_id, workspace_id,
+            resolved.user_id, assistant_id,
         )
 
     # Phase 2C: signup abuse guard ПЕРЕД bundle creation. Raises
@@ -685,42 +699,25 @@ def ensure_max_user_bundle(
     if max_chat_id is not None:
         chat_id_str = str(max_chat_id).strip() or None
 
-    # SELECT existing — channel linking уже мог связать этот max_account_id
-    # к существующему tenant'у, не создаём дубль.
-    existing_user = find_user_by_max_account_id(session, aid)
-    if existing_user is not None:
-        # Update chat_id if newly known
-        if chat_id_str and existing_user.max_chat_id != chat_id_str:
-            existing_user.max_chat_id = chat_id_str
-            session.commit()
-
-        assistant = (
-            session.query(Assistant)
-            .filter(Assistant.tenant_id == existing_user.tenant_id)
-            .order_by(Assistant.id.asc())
-            .first()
+    # #138 Ф5-5c: детекция существующего через identity-DEFINER (после флипа DSN
+    # прямой app-SELECT вернул бы 0). channel linking уже мог связать max_account_id
+    # к существующему tenant'у. Неоднозначность (max_account_id НЕ unique) → тихо не
+    # резолвим (дроп/дубль решает вызывающий; max_inbound ловит Ambiguous отдельно).
+    from sreda.services.identity_resolve import (
+        AmbiguousExternalIdentity,
+        resolve_external_identity,
+    )
+    try:
+        resolved = resolve_external_identity("max", aid)
+    except AmbiguousExternalIdentity:
+        resolved = None
+    if resolved is not None:
+        workspace_id, assistant_id = _serve_existing_bundle_reads(
+            resolved, update_max_chat_id=chat_id_str,
         )
-        workspace_id = assistant.workspace_id if assistant is not None else None
-        if workspace_id is None:
-            workspace = (
-                session.query(Workspace)
-                .filter(Workspace.tenant_id == existing_user.tenant_id)
-                .order_by(Workspace.id.asc())
-                .first()
-            )
-            workspace_id = workspace.id if workspace is not None else None
-        # Phase 2 (Codex MAJOR-8 fix 2026-05-07): repair pending/no-sub
-        # existing MAX-tenant'а на первом контакте post-Phase-2.
-        # См. подробный коммент в ensure_telegram_user_bundle_by_id.
-        _auto_approve_and_grant_free_tier(session, existing_user.tenant_id)
         return MaxOnboardingResult(
-            False,
-            aid,
-            chat_id_str or existing_user.max_chat_id,
-            existing_user.tenant_id,
-            workspace_id,
-            existing_user.id,
-            assistant.id if assistant is not None else None,
+            False, aid, chat_id_str, resolved.tenant_id, workspace_id,
+            resolved.user_id, assistant_id,
         )
 
     # Гард на APP-сессии (читает runtime_config — identity не может).

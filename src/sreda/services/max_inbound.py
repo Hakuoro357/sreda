@@ -133,29 +133,30 @@ async def handle_max_update(
         # ``_process_approved_max_turn`` — entry-гард его покрывает). Удалённый
         # существующий тенант → ТИХИЙ no-op. Новый юзер (резолв=None) → гард
         # пропускается. RuntimeError из резолва → «не резолвится», НЕ «удалён».
-        from sreda.services.tenant_lifecycle import is_tenant_active
-        from sreda.services.max_auth import resolve_tenant_from_max_account_id
+        from sreda.services.identity_resolve import (
+            AmbiguousExternalIdentity,
+            resolve_external_identity,
+        )
 
-        from sreda.services.identity_resolve import AmbiguousExternalIdentity
-
+        # #138 Ф5-5c: резолв + soft-delete гейт по identity-DEFINER (tenant_active),
+        # НЕ app-SELECT is_tenant_active — после флипа DSN он дропнул бы живого юзера.
         try:
-            _resolved = resolve_tenant_from_max_account_id(session, str(sender_user_id))
+            _resolved = resolve_external_identity("max", str(sender_user_id))
         except RuntimeError:
             _resolved = None
         except AmbiguousExternalIdentity:
-            # R2 (субагент MINOR): max_account_id матчит >1 юзера. Трактовать как
-            # None НЕЛЬЗЯ — провижн создал бы ТРЕТИЙ дубль. Тихий дроп (как
-            # soft-deleted): не привязывать по догадке, ждать channel-linking/support.
+            # max_account_id матчит >1 юзера. Трактовать как None НЕЛЬЗЯ — провижн
+            # создал бы ТРЕТИЙ дубль. Тихий дроп: ждать channel-linking/support.
             logger.warning(
                 "max inbound: ambiguous max_account_id (>1 user) — silent drop, "
                 "no provision (нужна ручная развязка)"
             )
             return ""
-        if _resolved is not None and not is_tenant_active(session, _resolved[0]):
+        if _resolved is not None and not _resolved.tenant_active:
             logger.info(
                 "max inbound: tenant %s is soft-deleted — silent drop "
                 "(no ensure/welcome/LLM/STT)",
-                _resolved[0],
+                _resolved.tenant_id,
             )
             return ""
 

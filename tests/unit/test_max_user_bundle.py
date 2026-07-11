@@ -50,10 +50,11 @@ def _identity_phase_uses_session(session, monkeypatch):
     import sreda.db.session as dbs
 
     @contextmanager
-    def _stub(reason):
+    def _stub(arg):
         yield session
 
     monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
 
 
 def test_new_max_user_creates_full_bundle(session):

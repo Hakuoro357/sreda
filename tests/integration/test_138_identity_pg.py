@@ -25,13 +25,19 @@ from sqlalchemy.pool import NullPool
 
 _DSN_OWNER = os.environ.get("SREDA_PG_TEST_DSN_OWNER")
 _DSN_IDENTITY = os.environ.get("SREDA_PG_TEST_DSN_IDENTITY")
+_DSN_APP = os.environ.get("SREDA_PG_TEST_DSN_APP")
+_DSN_MAINT = os.environ.get("SREDA_PG_TEST_DSN_MAINT")
 
-if not (_DSN_OWNER and _DSN_IDENTITY):
+if not (_DSN_OWNER and _DSN_IDENTITY and _DSN_APP and _DSN_MAINT):
     pytest.skip(
-        "SREDA_PG_TEST_DSN_OWNER/_IDENTITY не заданы — identity red-suite "
-        "гоняется только на реальном Postgres (см. docstring)",
+        "SREDA_PG_TEST_DSN_OWNER/_IDENTITY/_APP/_MAINT не заданы — identity "
+        "red-suite гоняется только на реальном Postgres (см. docstring)",
         allow_module_level=True,
     )
+
+
+def _set_tenant(conn, tenant_id: str) -> None:
+    conn.execute(text("SELECT set_config('sreda.tenant_id', :t, false)"), {"t": tenant_id})
 
 _SFX = uuid.uuid4().hex[:8]
 T_A = f"tenant_idA_{_SFX}"
@@ -44,6 +50,8 @@ MAX_AMBIG = f"max_ambig_{_SFX}"
 def engines():
     owner = create_engine(_DSN_OWNER, poolclass=NullPool)
     identity = create_engine(_DSN_IDENTITY, poolclass=NullPool)
+    app = create_engine(_DSN_APP, poolclass=NullPool)
+    maint = create_engine(_DSN_MAINT, poolclass=NullPool)
     with owner.begin() as c:
         for tid, hsh, mx in ((T_A, HASH_KNOWN, MAX_AMBIG), (T_B, None, MAX_AMBIG)):
             c.execute(text(
@@ -53,7 +61,7 @@ def engines():
                 "INSERT INTO users (id, tenant_id, tg_account_hash, max_account_id) "
                 "VALUES (:u, :t, :h, :m) ON CONFLICT (id) DO NOTHING"),
                 {"u": f"user_{tid}", "t": tid, "h": hsh, "m": mx})
-    yield {"owner": owner, "identity": identity}
+    yield {"owner": owner, "identity": identity, "app": app, "maint": maint}
     with owner.begin() as c:
         c.execute(text(
             "DELETE FROM signup_attempts WHERE source_id_hash LIKE :p"), {"p": f"%{_SFX}%"})
@@ -63,7 +71,10 @@ def engines():
             c.execute(text(f"DELETE FROM {tbl} WHERE tenant_id IN (:a, :b)"),
                       {"a": T_A, "b": T_B})
         c.execute(text("DELETE FROM tenants WHERE id IN (:a, :b)"), {"a": T_A, "b": T_B})
-    owner.dispose(); identity.dispose()
+    owner.dispose()
+    identity.dispose()
+    app.dispose()
+    maint.dispose()
 
 
 def _resolve(conn, channel: str, key: str):
@@ -211,6 +222,41 @@ def test_counter_functions_work_under_identity(engines):
         cap = c.execute(text("SELECT sreda_signup_free_tier_active_count()")).scalar()
     assert (base, after) == (0, 1)
     assert isinstance(cap, int) and cap >= 0
+
+
+def test_existing_user_path_roles(engines):
+    """#138 Ф5-5c: операции обслуживания СУЩЕСТВУЮЩЕГО юзера проходят под нужными
+    ролями (после флипа DSN). app+ctx: UPDATE users own (last_bot_key). maintenance
+    (privileged репаир): UPDATE tenants.approved_at + INSERT tenant_subscriptions.
+    Иначе existing-юзер сломался бы на флипе (тема, что нашли high+субагент)."""
+    # T_A/user засеяны фикстурой. app под ctx=A обновляет свою строку users:
+    with engines["app"].begin() as c:
+        _set_tenant(c, T_A)
+        c.execute(text("UPDATE users SET last_bot_key='sreda' WHERE tenant_id=:t"),
+                  {"t": T_A})
+    # app под ctx=A НЕ видит/не трогает чужого B:
+    with engines["app"].begin() as c:
+        _set_tenant(c, T_A)
+        r = c.execute(text("UPDATE users SET last_bot_key='x' WHERE tenant_id=:t"),
+                      {"t": T_B})
+        assert r.rowcount == 0  # чужой невидим под своим ctx
+    # maintenance (репаир pending): UPDATE tenants + прямой SELECT subscription_plans
+    # (maintenard имеет грант; _auto_approve идёт так, НЕ через identity-DEFINER) +
+    # INSERT подписки:
+    with engines["maint"].begin() as c:
+        c.execute(text("UPDATE tenants SET approved_at=now() WHERE id=:t"), {"t": T_A})
+        plan = c.execute(text(
+            "SELECT id, feature_key FROM subscription_plans WHERE plan_key='sreda_free' LIMIT 1"
+        )).first()
+        if plan is not None:
+            c.execute(text(
+                "INSERT INTO tenant_subscriptions "
+                "(id, tenant_id, plan_id, feature_key, status, starts_at, "
+                " cancel_at_period_end, quantity, next_cycle_quantity, created_at, updated_at) "
+                "VALUES (:i, :t, :p, :f, 'active', now(), false, 1, 1, now(), now())"),
+                {"i": f"sub_5c_{_SFX}", "t": T_A, "p": plan[0], "f": plan[1]})
+    with engines["owner"].begin() as c:  # cleanup sub
+        c.execute(text("DELETE FROM tenant_subscriptions WHERE id=:i"), {"i": f"sub_5c_{_SFX}"})
 
 
 def test_free_plan_via_definer_not_direct_select(engines):

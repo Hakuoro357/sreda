@@ -1041,9 +1041,11 @@ async def handle_telegram_update(
         # — до EntitlementGate/suspended (precedence: deleted > suspended, §13).
         # RuntimeError из резолва (соль не сконфигурена) → трактуем как «не
         # резолвится», НЕ как «удалён» (A16).
+        from sreda.services.identity_resolve import (
+            AmbiguousExternalIdentity,
+            resolve_external_identity,
+        )
         from sreda.services.onboarding import _extract_chat_id
-        from sreda.services.tenant_lifecycle import is_tenant_active
-        from sreda.services.telegram_auth import resolve_tenant_from_telegram_id
 
         _guard_chat_id = _extract_chat_id(payload)
 
@@ -1059,15 +1061,18 @@ async def handle_telegram_update(
             return None
 
         if _guard_chat_id is not None:
+            # #138 Ф5-5c: soft-delete гейт по данным identity-DEFINER (tenant_active
+            # из резолва), НЕ app-SELECT is_tenant_active — иначе после флипа DSN
+            # app-роль без ctx не увидит строку тенанта и дропнет ЖИВОГО юзера.
             try:
-                _resolved = resolve_tenant_from_telegram_id(session, str(_guard_chat_id))
-            except RuntimeError:
+                _resolved = resolve_external_identity("telegram", str(_guard_chat_id))
+            except (RuntimeError, AmbiguousExternalIdentity):
                 _resolved = None
-            if _resolved is not None and not is_tenant_active(session, _resolved[0]):
+            if _resolved is not None and not _resolved.tenant_active:
                 logger.info(
                     "telegram inbound: tenant %s is soft-deleted — silent drop "
                     "(no ensure/welcome/LLM)",
-                    _resolved[0],
+                    _resolved.tenant_id,
                 )
                 return None
 
