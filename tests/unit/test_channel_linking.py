@@ -349,6 +349,29 @@ def test_consume_link_invalid_token_format(session):
         )
 
 
+def test_consume_link_same_account_refreshes_chat_id(session):
+    """#341 (Codex R-codex MAJOR D): аутентифицированный ре-линк ТОГО ЖЕ
+    MAX-аккаунта со СТАРЫМ chat_id обновляет max_chat_id (единственный легит.
+    путь смены established chat_id; inbound/mini-app его не трогают)."""
+    source_user = session.get(User, "u1")
+    source_user.max_account_id = "555"
+    source_user.max_chat_id = "old_chat_555"
+    session.commit()
+
+    result = start_link(
+        session, tenant_id="t1", source_channel="telegram", source_user_id="u1",
+    )
+    outcome = consume_link(
+        session, raw_token=result.raw_token, target_channel="max",
+        target_account_id="555", target_chat_id="new_chat_555",
+    )
+
+    assert outcome.success is True
+    assert outcome.idempotent is True
+    session.expire_all()
+    assert session.get(User, "u1").max_chat_id == "new_chat_555"
+
+
 def test_consume_link_same_tenant_same_user_idempotent(session):
     source_user = session.get(User, "u1")
     source_user.max_account_id = "555"

@@ -223,11 +223,18 @@ if [ -n "$MAX_TOKEN" ]; then
             sleep 2
 
             log "phase 4b: setWebhook (MAX) — пропущен, добавится когда настроим webhook URL"
-            # TODO: после настройки MAX webhook URL раскомментировать (использует ${MAX_BASE} + $CA_OPT):
-            # curl -sS $CA_OPT -X POST "${MAX_BASE}/subscriptions" \
-            #     -H "Authorization: ${MAX_TOKEN}" \
-            #     -H "Content-Type: application/json" \
-            #     -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+            # TODO: после настройки MAX webhook URL раскомментировать (использует ${MAX_BASE} + $CA_OPT).
+            # #341 (F1, CRITICAL): НЕ регистрировать MAX webhook без секрета — иначе
+            # роут принимал бы неаутентифицированный inbound (fail-open класс). При
+            # раскомментировании ОБЯЗАТЕЛЬНО сохранить guard [ -n "$MAX_SECRET" ] ниже:
+            # if [ -z "$MAX_SECRET" ]; then
+            #     log "  ОТКАЗ: SREDA_MAX_WEBHOOK_SECRET_TOKEN пуст — setWebhook пропущен (fail-open guard #341)"
+            # else
+            #     curl -sS $CA_OPT -X POST "${MAX_BASE}/subscriptions" \
+            #         -H "Authorization: ${MAX_TOKEN}" \
+            #         -H "Content-Type: application/json" \
+            #         -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+            # fi
 
             rm -f "$MAX_CA"
             ;;

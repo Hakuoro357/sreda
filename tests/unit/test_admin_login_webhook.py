@@ -25,21 +25,30 @@ import sreda.db.models  # noqa: F401
 import sreda.db.models.admin_auth  # noqa: F401
 
 
+# #341: webhook-роут монтируется ТОЛЬКО в webhook-режиме (bot_token+webhook_url).
+# Прод-вход admin-login TG идёт через long-poll (роут не монтирован); здесь тест
+# специально бьёт по webhook-роуту → армируем webhook-режим + шлём секрет.
+_WEBHOOK_URL = "https://bot.test.local/webhooks/telegram/sreda"
+_WEBHOOK_SECRET = "wh-secret-admin-341"
+_WEBHOOK_HEADERS = {"X-Telegram-Bot-Api-Secret-Token": _WEBHOOK_SECRET}
+
+
 @pytest.fixture()
 def webhook_client(monkeypatch, tmp_path: Path):
     from sreda.config.settings import get_settings
     from sreda.db.session import get_engine, get_session_factory
-    from sreda.main import app
+    from sreda.main import create_app
 
     db_path = tmp_path / "wh.db"
     key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "tg-token")
+    # #341: webhook-режим (иначе роут не смонтирован → 404).
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_URL", _WEBHOOK_URL)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", _WEBHOOK_SECRET)
     monkeypatch.setenv("SREDA_TG_ACCOUNT_SALT", "test-salt")
     monkeypatch.setenv("SREDA_ADMIN_TG_IDS", "42")
-    # No webhook secret configured → dev-fallback accepts all requests.
-    monkeypatch.delenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", raising=False)
 
     get_settings.cache_clear()
     get_engine.cache_clear()
@@ -64,7 +73,7 @@ def webhook_client(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(ti, "telegram_client_for", lambda bot_key, reg: _FakeClient())
 
-    with TestClient(app) as c:
+    with TestClient(create_app()) as c:
         yield c
 
     get_settings.cache_clear()
@@ -97,7 +106,7 @@ def test_admin_start_via_webhook_returns_202_not_500(webhook_client):
             "text": f"/start adm_{r.challenge_id}",
         },
     }
-    resp = webhook_client.post("/webhooks/telegram/sreda", json=payload)
+    resp = webhook_client.post("/webhooks/telegram/sreda", json=payload, headers=_WEBHOOK_HEADERS)
     assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["ok"] is True
@@ -123,6 +132,6 @@ def test_admin_confirm_via_webhook_returns_202(webhook_client):
             "data": f"adm_confirm:{r.challenge_id}",
         },
     }
-    resp = webhook_client.post("/webhooks/telegram/sreda", json=payload)
+    resp = webhook_client.post("/webhooks/telegram/sreda", json=payload, headers=_WEBHOOK_HEADERS)
     assert resp.status_code == 202, resp.text
     assert resp.json()["ok"] is True

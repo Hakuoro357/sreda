@@ -8,6 +8,10 @@ from sreda.config.bot_registry import TelegramBotRegistry
 from sreda.config.settings import get_settings
 from sreda.schemas.api import TelegramWebhookAccepted
 from sreda.services.telegram_inbound import handle_telegram_update
+from sreda.services.webhook_security import (
+    is_webhook_deployed,
+    normalized_webhook_secret,
+)
 
 router = APIRouter(prefix="/webhooks/telegram", tags=["telegram"])
 logger = logging.getLogger(__name__)
@@ -49,12 +53,27 @@ def _verify_telegram_secret_token(
         alias="X-Telegram-Bot-Api-Secret-Token",
     ),
 ) -> None:
-    expected = get_settings().telegram_webhook_secret_token
+    settings = get_settings()
+    # Codex R-codex MAJOR B: нормализуем secret + единый is_webhook_deployed.
+    expected = normalized_webhook_secret(settings.telegram_webhook_secret_token)
     if not expected:
-        # Dev-fallback: when the secret is not configured, accept all requests
-        # to keep local/test setups working. Production deployments MUST set
-        # SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN and match it at Telegram's
-        # setWebhook call so every update carries this header.
+        # #341 (F1 paritet): fail-closed, если TG развёрнут в webhook-режиме
+        # (telegram_bot_token+telegram_webhook_url заданы), но secret пуст.
+        # Прод-вход TG = long-poll → telegram_webhook_url не задан → этот гейт
+        # инертен, dev/long-poll fallback (accept) сохраняется. Явная настройка
+        # webhook-режима без секрета = отклоняем неаутентифицированный inbound.
+        if is_webhook_deployed(
+            bot_token=settings.telegram_bot_token,
+            webhook_url=settings.telegram_webhook_url,
+        ):
+            logger.error(
+                "telegram webhook rejected: secret не настроен, но webhook-режим "
+                "развёрнут (telegram_bot_token+telegram_webhook_url) — "
+                "fail-closed (#341)"
+            )
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        # Dev-fallback: secret не настроен и webhook-режим не заявлен (long-poll)
+        # — принимаем, чтобы локальные/тестовые сетапы работали.
         return
     if secret_token_header is None or not hmac.compare_digest(
         secret_token_header, expected
