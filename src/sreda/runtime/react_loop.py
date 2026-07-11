@@ -2076,14 +2076,28 @@ def _turn_time_window_text(messages: Any) -> str:
                 break
         if prev_h < 0:
             break
-        _slot_between = any(
-            isinstance(m, ToolMessage)
-            and isinstance(getattr(m, "artifact", None), dict)
-            and m.artifact.get("result_kind") == "time_not_specified"
-            for m in msgs[prev_h + 1:hi])
-        if not _slot_between:
+        # R1-ревью #349 (MAJOR - тот же урок, что R7 #338): ПОСЛЕДНИЙ исход
+        # write-инструмента напоминаний в сегменте решает (слот → ask_human →
+        # ok В ТОМ ЖЕ ходе = закрыт; any() цеплял закрытый ход - время чужого
+        # хода протекало в гейт новой темы). Фильтр по имени: будущие
+        # слот-исходы других доменов временнОе окно НЕ расширяют.
+        _last_kind = None
+        for m in reversed(msgs[prev_h + 1:hi]):
+            if (isinstance(m, ToolMessage)
+                    and _TOOL_NAME_ALIASES.get(getattr(m, "name", ""),
+                                               getattr(m, "name", ""))
+                    in ("schedule_reminder", "update_reminder")
+                    and isinstance(getattr(m, "artifact", None), dict)):
+                _last_kind = m.artifact.get("result_kind")
+                break
+        if _last_kind != "time_not_specified":
             break
         parts.append(_human_window(prev_h))
+        # R1-ревью #349 (MINOR): ask_human-ответы раннего сегмента - те же слова
+        # юзера (время могло прийти resume'ом при всё ещё открытом слоте)
+        for m in msgs[prev_h + 1:hi]:
+            if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_human":
+                parts.append(str(getattr(m, "content", "") or ""))
         hi = prev_h
     return "\n".join(parts)
 

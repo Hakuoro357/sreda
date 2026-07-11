@@ -61,3 +61,54 @@ def test_window_multi_step_series_349():
     ]
     w = _turn_time_window_text(msgs)
     assert "13:30" in w and "до 18" in w and "тест" in w
+
+
+def test_r1_mixed_segment_closed_slot_does_not_leak_349():
+    """R1 MAJOR: слот → ask_human-resume → ok В ТОМ ЖЕ ходе = закрыт; время
+    «9:30» закрытого хода НЕ протекает в гейт новой темы."""
+    msgs = [
+        HumanMessage(content="напомни про рейс"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="уточни", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "time_not_specified"}),
+        AIMessage(content="", tool_calls=[{"name": "ask_human", "args": {}, "id": "t2"}]),
+        ToolMessage(content="в 9:30", name="ask_human", tool_call_id="t2"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t3"}]),
+        ToolMessage(content="ok:scheduled:rem_1:x", name="schedule_reminder", tool_call_id="t3",
+                    artifact={"result_kind": "ok"}),
+        AIMessage(content="Готово!"),
+        HumanMessage(content="и про лекарства напомни"),
+    ]
+    w = _turn_time_window_text(msgs)
+    assert "9:30" not in w
+
+
+def test_r1_early_segment_ask_human_answer_in_window_349():
+    """R1 MINOR: время из ask_human-ответа РАННЕГО сегмента (слот остался
+    открыт) - видно гейту."""
+    msgs = [
+        HumanMessage(content="поставь напоминание каждый час"),
+        AIMessage(content="", tool_calls=[{"name": "schedule_reminder", "args": {}, "id": "t1"}]),
+        ToolMessage(content="уточни", name="schedule_reminder", tool_call_id="t1",
+                    artifact={"result_kind": "time_not_specified"}),
+        AIMessage(content="", tool_calls=[{"name": "ask_human", "args": {}, "id": "t2"}]),
+        ToolMessage(content="с 13:30", name="ask_human", tool_call_id="t2"),
+        AIMessage(content="До какого времени повторять?"),
+        HumanMessage(content="до 18"),
+    ]
+    w = _turn_time_window_text(msgs)
+    assert "13:30" in w
+
+
+def test_r1_foreign_slot_kind_does_not_extend_349():
+    """R1 MINOR: слот-исход НЕ-напоминального инструмента окно не расширяет."""
+    msgs = [
+        HumanMessage(content="добавь задачу с датой 9 июля"),
+        AIMessage(content="", tool_calls=[{"name": "add_task", "args": {}, "id": "t1"}]),
+        ToolMessage(content="дата?", name="add_task", tool_call_id="t1",
+                    artifact={"result_kind": "time_not_specified"}),
+        AIMessage(content="Когда задача?"),
+        HumanMessage(content="напомни про лекарства"),
+    ]
+    w = _turn_time_window_text(msgs)
+    assert "9 июля" not in w
