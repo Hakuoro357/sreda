@@ -279,6 +279,13 @@ def test_real_engine_scopes_handler_sequence(engines, monkeypatch):
     dbs.get_engine.cache_clear()
     dbs.get_session_factory.cache_clear()
     dbs._factory_for.cache_clear()
+    # R2-353 (medium MINOR): исходное значение — ДО теста, восстановление — в
+    # внешнем finally (owner-движок, мимо RLS): упавший mutation-прогон не
+    # оставит 'doors_test' последующим тестам.
+    with engines["owner"].connect() as _oc:
+        _orig_lbk = _oc.execute(text(
+            "SELECT last_bot_key FROM users WHERE tenant_id = :t"), {"t": T_A}
+        ).scalar()
     real_engine = None
     try:
         real_engine = dbs.get_engine()  # реальный путь: регистрирует begin-слушатель
@@ -300,10 +307,6 @@ def test_real_engine_scopes_handler_sequence(engines, monkeypatch):
                     "GUC не ре-эмитился после внутреннего commit — "
                     "handler-хвост сломался бы после флипа"
                 )
-                # R1-353 (гигиена): вернуть исходное значение колонки
-                s.execute(text(
-                    "UPDATE users SET last_bot_key=NULL WHERE tenant_id=:t"
-                ), {"t": T_A})
                 s.commit()
             finally:
                 s.close()
@@ -326,6 +329,12 @@ def test_real_engine_scopes_handler_sequence(engines, monkeypatch):
         dbs.get_engine.cache_clear()
         dbs.get_session_factory.cache_clear()
         dbs._factory_for.cache_clear()
+        # R2-353: восстановить исходный last_bot_key под owner (переживает
+        # ЛЮБОЙ исход теста, вкл. намеренные mutation-фейлы).
+        with engines["owner"].begin() as _oc:
+            _oc.execute(text(
+                "UPDATE users SET last_bot_key = :v WHERE tenant_id = :t"
+            ), {"v": _orig_lbk, "t": T_A})
 
 
 def test_existing_user_path_roles(engines):

@@ -29,8 +29,10 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[2] / "src" / "sreda"
 
 #: Отслеживаемые примитивы: {(модуль, имя): каноничное-имя-примитива}.
-#: R1-353 (Codex medium MAJOR): алиасы РЕЗОЛВЯТСЯ через import-карту файла —
-#: `from sqlalchemy.orm import Session as _SASession` тоже ловится.
+#: R1/R2-353 (Codex MAJOR): идентичность символа резолвится через import-карты
+#: файла (символьные алиасы `from X import Y as Z` И модульные `import X as M;
+#: M.Y(...)`) — `Session as _SASession`, `dbs.get_session_factory()`,
+#: `so.Session()` ловятся все.
 _TRACKED_IMPORTS: dict[tuple[str, str], str] = {
     ("sreda.db.session", "get_session_factory"): "get_session_factory",
     ("sreda.db.session", "get_db_session"): "get_db_session",
@@ -38,9 +40,25 @@ _TRACKED_IMPORTS: dict[tuple[str, str], str] = {
     ("sreda.db.session", "get_app_engine"): "engine",
     ("sreda.db.session", "get_maintenance_engine"): "engine",
     ("sreda.db.session", "get_identity_engine"): "engine",
+    ("sreda.api.deps", "get_session"): "dep-provider",  # для Depends-резолва
+    ("fastapi", "Depends"): "depends-fn",  # резолв Depends вкл. алиас (as D)
     ("sqlalchemy.orm", "sessionmaker"): "sessionmaker",
     ("sqlalchemy.orm", "Session"): "Session",
     ("sqlalchemy", "create_engine"): "create_engine",
+}
+
+#: Fallback по голому имени — ТОЛЬКО отличительные sreda-имена (коллизии
+#: исключены); generic-имена sqlalchemy (Session/sessionmaker/create_engine)
+#: обязаны прийти через явный импорт (символьный или модульный алиас) — иначе
+#: requests.Session() и т.п. давали бы ложные срабатывания (R2-353 medium/high).
+_BARE_FALLBACK: dict[str, str] = {
+    "get_session_factory": "get_session_factory",
+    "get_db_session": "get_db_session",
+    "get_engine": "engine",
+    "get_app_engine": "engine",
+    "get_maintenance_engine": "engine",
+    "get_identity_engine": "engine",
+    "get_session": "dep-provider",
 }
 
 #: Шов сам — единственное место, где примитивы легитимно определяются/используются.
@@ -64,18 +82,35 @@ def _scan_doors() -> dict[tuple[str, str, str], int]:
             continue
         tree = ast.parse(py.read_text(encoding="utf-8"))
 
-        # карта алиасов файла: локальное-имя → каноничный примитив
-        aliases: dict[str, str] = {}
+        # Карты файла: символьные алиасы (from X import Y as Z) и модульные
+        # (import X.Y as M). R2-353 (high MAJOR): резолвим ПОЛНУЮ идентичность.
+        sym_aliases: dict[str, str] = {}
+        mod_aliases: dict[str, str] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
                 for a in node.names:
                     prim = _TRACKED_IMPORTS.get((node.module, a.name))
                     if prim is not None:
-                        aliases[a.asname or a.name] = prim
-        # прямые имена работают и без импорта в этом файле (защита от
-        # `import sreda.db.session as dbs; dbs.get_session_factory()`)
-        for (_mod, name), prim in _TRACKED_IMPORTS.items():
-            aliases.setdefault(name, prim)
+                        sym_aliases[a.asname or a.name] = prim
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    mod_aliases[a.asname or a.name.split(".")[0]] = a.name
+
+        def resolve(expr: ast.AST) -> str | None:
+            """Каноничный примитив для Name/Attribute-выражения (или None)."""
+            if isinstance(expr, ast.Name):
+                return sym_aliases.get(expr.id) or _BARE_FALLBACK.get(expr.id)
+            if isinstance(expr, ast.Attribute):
+                # M.attr — через модульный алиас (import sqlalchemy.orm as so)
+                if isinstance(expr.value, ast.Name):
+                    mod = mod_aliases.get(expr.value.id)
+                    if mod is not None:
+                        prim = _TRACKED_IMPORTS.get((mod, expr.attr))
+                        if prim is not None:
+                            return prim
+                # attr-фолбэк — только отличительные sreda-имена
+                return _BARE_FALLBACK.get(expr.attr)
+            return None
 
         def visit(node: ast.AST, stack: tuple[str, ...]) -> None:
             new_stack = stack
@@ -83,44 +118,40 @@ def _scan_doors() -> dict[tuple[str, str, str], int]:
                 new_stack = stack + (node.name,)
             if isinstance(node, ast.Call):
                 fn = node.func
-                name = (
-                    fn.id if isinstance(fn, ast.Name)
-                    else fn.attr if isinstance(fn, ast.Attribute)
-                    else None
-                )
-                prim = aliases.get(name or "")
-                if prim == "engine":
-                    # сами геттеры движка не дверь; дверь — .connect()/.begin()
-                    # на них: get_engine().connect() (raw connection мимо швов)
+                prim = resolve(fn)
+                if prim in ("engine", "depends-fn", None):
+                    # геттеры движка / сам Depends — не дверь сами по себе
                     pass
-                elif prim is not None:
+                elif prim == "dep-provider":
+                    # прямой ВЫЗОВ get_session() вне Depends — сырая дверь
+                    bump(rel, stack, "get_db_session")
+                else:
                     bump(rel, stack, prim)
                 if (
                     isinstance(fn, ast.Attribute)
                     and fn.attr in ("connect", "begin")
                     and isinstance(fn.value, ast.Call)
+                    and resolve(fn.value.func) == "engine"
                 ):
-                    inner = fn.value.func
-                    iname = (
-                        inner.id if isinstance(inner, ast.Name)
-                        else inner.attr if isinstance(inner, ast.Attribute)
-                        else None
-                    )
-                    if aliases.get(iname or "") == "engine":
-                        bump(rel, stack, f"engine.{fn.attr}")
-                # Depends(get_session/get_db_session) — роут на сырой сессии;
-                # позиционная, keyword- (dependency=...) и Attribute-форма
-                # (deps.get_session) — R1-353 субагент MINOR.
-                if name == "Depends":
+                    bump(rel, stack, f"engine.{fn.attr}")
+                # Depends(...) с провайдером сырой сессии — во всех формах:
+                # позиционная / keyword (dependency=...) / Attribute
+                # (deps.get_session) / алиас провайдера И самого Depends
+                # (from fastapi import Depends as D; D(raw)) — R2-353 high MAJOR:
+                # резолв обоих через карты, не литеральные имена.
+                is_depends = resolve(fn) == "depends-fn" or (
+                    isinstance(fn, ast.Name) and fn.id == "Depends"
+                ) or (isinstance(fn, ast.Attribute) and fn.attr == "Depends")
+                if is_depends:
                     dep_args = list(node.args) + [kw.value for kw in node.keywords]
                     for arg in dep_args:
-                        aname = (
-                            arg.id if isinstance(arg, ast.Name)
-                            else arg.attr if isinstance(arg, ast.Attribute)
-                            else None
-                        )
-                        if aname in ("get_session", "get_db_session"):
-                            bump(rel, stack, f"Depends({aname})")
+                        aprim = resolve(arg)
+                        if aprim in ("dep-provider", "get_db_session"):
+                            canon = (
+                                "get_session" if aprim == "dep-provider"
+                                else "get_db_session"
+                            )
+                            bump(rel, stack, f"Depends({canon})")
             for child in ast.iter_child_nodes(node):
                 visit(child, new_stack)
 
