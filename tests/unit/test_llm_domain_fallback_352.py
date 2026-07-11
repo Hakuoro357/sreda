@@ -215,19 +215,30 @@ def test_prev_families_not_executed_kinds_excluded_352():
         assert _prev_turn_families(msgs) == (), kind
 
 
-def test_prev_families_declined_confirm_excluded_352():
-    """R1 terra MAJOR: отклонённый кандидат-confirm (структурный маркер) -
-    инструмент НЕ исполнялся, раздел юзер явно не тронул."""
+def test_prev_families_declined_confirms_count_352():
+    """R2-субагент (пере-решение R1 terra): отклонённый confirm - кандидатный
+    («Хорошо, не делаю.») и деструктивный («Хорошо, не трогаю.», result_kind=ok
+    прод-формы) - СЧИТАЕТСЯ темой хода: «нет, не удаляй… а что там?» продолжает
+    раздел. Открывается только чтение; мутации всегда под confirm."""
     from sreda.runtime.react_loop import _CONFIRM_DECLINED_TEXT
-    msgs = [
+    candidate_declined = [
+        HumanMessage(content="отметь машину войны"),
+        AIMessage(content="", tool_calls=[
+            {"name": "mark_checklist_item_done", "args": {}, "id": "t1"}]),
+        ToolMessage(content=_CONFIRM_DECLINED_TEXT, name="mark_checklist_item_done",
+                    tool_call_id="t1"),
+        AIMessage(content="Хорошо, не отмечаю."),
+    ]
+    assert _prev_turn_families(candidate_declined) == ("checklists",)
+    destructive_declined = [
         HumanMessage(content="удали список кино"),
         AIMessage(content="", tool_calls=[
             {"name": "archive_checklist", "args": {}, "id": "t1"}]),
-        ToolMessage(content=_CONFIRM_DECLINED_TEXT, name="archive_checklist",
-                    tool_call_id="t1"),
+        ToolMessage(content="Хорошо, не трогаю.", name="archive_checklist",
+                    tool_call_id="t1", artifact={"result_kind": "ok"}),
         AIMessage(content="Хорошо, не трогаю."),
     ]
-    assert _prev_turn_families(msgs) == ()
+    assert _prev_turn_families(destructive_declined) == ("checklists",)
 
 
 def test_prev_families_empty_cases_352():
