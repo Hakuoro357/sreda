@@ -81,7 +81,8 @@ POLICY_VERSION_B2 = 2
 
 
 def compute_unified_policy(text, route, classified=None, *, base_web=True,
-                           sticky_memory_write=False):
+                           sticky_memory_write=False,
+                           prev_open_domains=frozenset()):
     """Двухъярусная политика единого пути (execute). Чистая; поведение прода не трогает (проводка — B2b).
 
     text: текст хода. route: RouteResult из route_domains(text). classified: DomainClassResult|None
@@ -131,6 +132,24 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
             allowed_write.add("memory")
             sticky_applied = True
 
+    # R5-переделка (владелец: «не костылями»): ЕДИНЫЙ гейт продолжения - сообщение
+    # юзера НЕ несёт самостоятельной темы: ни доменных слов (route: «покупки»,
+    # «задачи», «напоминания»...), ни read-кюсов. Тогда «В 15» / «завтра в 9» /
+    # «Поставь» / «да» = продолжение открытого хода; ЛЮБОЕ доменное слово
+    # («перескажи напоминания», «что с задачами», «добавь молоко в покупки»,
+    # и даже «напоминание в 15» - осознанный residual: лишний ЧЕЛОВЕЧЕСКИЙ confirm)
+    # = обычный вход со страховкой. Ошибка строго в безопасную сторону. Никаких
+    # списков фраз: только существующие детекторы route_domains/read_cue_domains.
+    continuation: list = []
+    if not route.all_domains and not read_cues and not sticky_applied:
+        # R7 оба Codex: sticky-серия (memory) и открытый слот НЕ складываются -
+        # два прямых write-домена на themeless-ответе неоднозначны → fail-closed:
+        # активная sticky-серия побеждает (юзер в memory-контексте), слот идёт
+        # через человеческий кандидат-confirm.
+        for _d in sorted(prev_open_domains):
+            allowed_write.add(_d)
+            continuation.append(_d)
+
     allowed_read: set[str] = set()
     if base_web:
         allowed_read.add("web")
@@ -144,5 +163,6 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         "allowed_write": sorted(allowed_write),   # ярус (а): прямой write без confirm
         "confirm_write": True,                    # ярус (б): write вне allowed_write → кандидат+confirm (B2b)
         "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues),
-                    "sticky_memory": sticky_applied},
+                    "sticky_memory": sticky_applied,
+                    "turn_continuation": continuation},  # #338: наблюдаемость наследования
     }

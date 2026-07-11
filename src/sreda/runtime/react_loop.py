@@ -166,6 +166,16 @@ def _time_in_tail_enabled() -> bool:
         return False
 
 
+def _confirm_voice_enabled() -> bool:
+    """#338 ч.2б: живая фраза «рта» в кандидат-подтверждениях (SREDA_CONFIRM_VOICE,
+    дефолт OFF = человеческий шаблон из confirm_preview; включение канарейкой по «да»)."""
+    try:
+        from sreda.config.settings import get_settings
+        return bool(get_settings().confirm_voice_enabled)
+    except Exception:  # noqa: BLE001 — флаг не валит ход
+        return False
+
+
 def _checklist_querykind() -> bool:
     """#213 Срез B: предслойный query_kind + cross-check ВКЛ? (SREDA_CHECKLIST_QUERYKIND,
     дефолт OFF = fail-open). Действует ТОЛЬКО вместе с _checklist_unified()."""
@@ -1396,6 +1406,65 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
     return out
 
 
+# отказ кандидата: ЕДИНАЯ константа (R2 Claude MINOR) - её же ищет _prev_open_domains;
+# дрейф текста ломал бы фильтр молча в небезопасную сторону (freeze-тест через wrap).
+_CONFIRM_DECLINED_TEXT = "Хорошо, не делаю."
+
+
+def _prev_open_domains(messages: Any) -> set:
+    """#338 R6: область НЕЗАКРЫТОГО СЛОТА прошлого хода агента. Наследование в ярус
+    (а) - ТОЛЬКО когда прошлый ход структурно запросил продолжение: write-инструмент
+    вернул слот-исход (result_kind="time_not_specified" - «нужно время»; allowlist
+    расширяем по мере появления слот-исходов). Успешный ok-исход ход ЗАКРЫВАЕТ
+    (R6 Codex medium CRITICAL: «Готово, поставила.» → «Я буду у врача завтра в 15»
+    - новый ФАКТ без доменных слов наследовал бы write → тихая мутация).
+
+    Владелец 2026-07-10: «страховка только на первое сообщение входа» + «не
+    костылями». Финальный текст агента НЕ анализируется вообще; источник истины -
+    СТРУКТУРНЫЙ слот-исход журнала (не «?», не списки фраз). Позитивный allowlist
+    вместо blacklist (R6 оба Codex: unavailable/withdrawn/mode_mismatch и будущие
+    non-ok исходы не должны открывать ход). Гейт продолжения по тексту юзера -
+    в compute_unified_policy (нет доменных слов/read-кюсов)."""
+    msgs = list(messages or [])
+    if not msgs:
+        return set()
+    last = msgs[-1]
+    if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
+        return set()
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
+    _SLOT_KINDS = frozenset({"time_not_specified"})
+    # R7 Codex high: слот считается открытым по ПОСЛЕДНЕМУ исходу write-инструмента
+    # домена (слот → уточнение → ok В ТОМ ЖЕ ходе = слот ЗАКРЫТ; идём с конца,
+    # первый встреченный исход по домену = последний хронологически, прочие игнор)
+    domains: set = set()
+    _seen_domains: set = set()
+    for m in reversed(msgs[:-1]):
+        if isinstance(m, HumanMessage):
+            break  # начало этого хода
+        if isinstance(m, ToolMessage) and getattr(m, "name", None):
+            name = _TOOL_NAME_ALIASES.get(m.name, m.name)
+            if name not in TOOL_OP_CLASS:
+                continue  # мета/галлюцинированные имена (R1 MAJOR-1)
+            _wd = set(tool_write_domains(name))
+            if not _wd:
+                continue  # read-инструменты состояние слота не меняют
+            _fresh = _wd - _seen_domains
+            _seen_domains |= _wd
+            if not _fresh:
+                continue  # по этому домену уже видели БОЛЕЕ ПОЗДНИЙ исход
+            _art = getattr(m, "artifact", None)
+            if isinstance(_art, dict) and _art.get("result_kind") in _SLOT_KINDS:
+                domains |= _fresh  # последний исход домена = открытый слот
+    domains.discard("web")
+    # memory-продолжения - юрисдикция sticky #319 (гейт «только успешная запись»)
+    domains.discard("memory")
+    # >1 домена со слот-исходом = неоднозначно = fail-closed (R2 medium; R6: memory
+    # исключён ДО этой проверки осознанно - слот-исходов у memory-семьи нет)
+    if len(domains) > 1:
+        return set()
+    return domains
+
+
 def _generic_confirm_wrap(inner: Any) -> Any:
     """#285 B2b-2: универсальный confirm для КАНДИДАТА (write без детерминированного сигнала, ярус б).
     Как `_confirm_wrap`, но превью GENERIC — имя+сырые args, БЕЗ чтения БД (пилляр: превью не читает
@@ -1405,12 +1474,49 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 
     def _wrapped(**kwargs: Any) -> str:
         _key = f"{inner.name}:" + "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
-        _args = ", ".join(f"{k}={kwargs[k]}" for k in sorted(kwargs)) if kwargs else "без параметров"
-        decision = interrupt({
-            "confirm": f"Я поняла как «{inner.name}» ({_args}). Подтверди, и я сделаю.",
-            "key": _key})
+        # #338 ч.2 (БИБЛИЯ g-075): юзеру - ТОЛЬКО человеческий текст. Сырой
+        # «Я поняла как «schedule_reminder» (title=…, trigger_iso=…)» уволен
+        # (прод-инцидент 755682022). Известный инструмент → факты + человеческий
+        # шаблон (даты по-русски); иначе → русское действие из реестра; совсем
+        # неизвестный → нейтральный вопрос. key НЕ меняется (контракт пауз #166B).
+        from sreda.runtime.confirm_preview import (
+            build_mouth_prompt, confirm_facts, fallback_template,
+            generic_action_question, verify_confirm_text,
+        )
+        _facts = confirm_facts(inner.name, kwargs)
+        _now = datetime.now(_MSK)
+        # R3 Codex high: расписание, которое НЕ рендерится человечески (exotic RRULE),
+        # НЕ подтверждаем вслепую - юзер сказал бы «да» правилу, которого не видел.
+        # Fail-closed: не исполняем, модель переформулирует проще.
+        if (inner.name == "schedule_reminder" and _facts is None
+                and str(kwargs.get("recurrence_rule") or "").strip()):
+            return ("Не могу безопасно подтвердить такое расписание - переформулируй "
+                    "правило проще (например: каждый час, каждый день в 9, по вторникам).")
+        if _facts is not None:
+            _q = fallback_template(_facts, now=_now)
+            # #338 ч.2б (за флагом): живая фраза «рта» в персоне ПОВЕРХ шаблона.
+            # Рот - только голос, не источник истины: verify_confirm_text гейтит
+            # (название дословно, день/время из допустимых, нет тех.начинки/чужих
+            # дат) → любой сбой/таймаут/провал проверки = точный шаблон выше.
+            if _confirm_voice_enabled():
+                try:
+                    from sreda.config.settings import get_settings as _gs338
+                    from sreda.services.llm import get_chat_llm as _gcl338
+                    _sys, _usr = build_mouth_prompt(_facts, now=_now)
+                    _resp = invoke_with_per_call_timeout(
+                        _gcl338(provider=_gs338().composer_provider),
+                        [SystemMessage(content=_sys), HumanMessage(content=_usr)],
+                        timeout_seconds=4.0)
+                    _live = str(getattr(_resp, "content", "") or "").strip()
+                    if verify_confirm_text(_live, _facts, now=_now):
+                        _q = _live
+                except Exception:  # noqa: BLE001 — рот недоступен/медленный → шаблон
+                    logger.info("confirm_voice: сбой рта → фолбэк-шаблон", exc_info=True)
+        else:
+            _q = generic_action_question(inner.name, kwargs)
+        decision = interrupt({"confirm": _q, "key": _key})
         if not _is_yes(str(decision)):
-            return "Хорошо, не делаю."
+            return _CONFIRM_DECLINED_TEXT
         return str(inner.invoke(kwargs))
 
     return StructuredTool.from_function(
@@ -2119,20 +2225,44 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         return "\n".join(f"- ref={r.id} | {r.title} | {_fmt(r.trigger_at)}" for r in rows)
 
     @tool
-    def schedule_reminder(title: str, trigger_iso: str) -> str:
-        """Создать напоминание. trigger_iso — АБСОЛЮТНЫЙ ISO-8601 datetime (относительные
-        даты резолвь сам по сегодняшней дате из <context>). Время ДОЛЖЕН назвать пользователь;
-        если в запросе времени нет — спроси «во сколько?», своё НЕ подставляй."""
+    def schedule_reminder(title: str, trigger_iso: str, recurrence_rule: str = "") -> str:
+        """Создать напоминание, разовое или ПОВТОРЯЮЩЕЕСЯ. trigger_iso — АБСОЛЮТНЫЙ ISO-8601
+        datetime первого срабатывания (относительные даты резолвь сам по сегодняшней дате из
+        <context>). Время ДОЛЖЕН назвать пользователь; если в запросе времени нет — спроси
+        «во сколько?», своё НЕ подставляй. recurrence_rule — RFC-5545 RRULE для повторов:
+        «каждый час» → FREQ=HOURLY, «каждый день» → FREQ=DAILY; конец серии ;COUNT=N или
+        ;UNTIL=…; пусто = разовое."""
         try:
             when = _parse_dt(trigger_iso)
         except Exception:  # noqa: BLE001
             return f"Не разобрала время: {trigger_iso!r}. Дай абсолютный момент."
-        # #174: момент уже прошёл → перекатить вперёд (анти-петля turn_pass_count/stop страхует).
-        if when <= datetime.now(timezone.utc):
+        # #333 R1 (оба Codex, блокер): у bespoke-инструмента НЕ БЫЛО recurrence_rule —
+        # хинт велел передавать аргумент вне схемы, повторы через ReAct не работали.
+        rrule = (recurrence_rule or "").strip()
+        if rrule and not rrule.upper().startswith("FREQ="):
+            return f"Не разобрала правило повтора: {rrule!r}. Нужен формат FREQ=…"
+        # #174: прошедший момент → для РАЗОВОГО перекат-подсказка; для повтора допустимо
+        # (сервис сам сдвинет на следующее срабатывание по правилу — rrule-advance).
+        if when <= datetime.now(timezone.utc) and not rrule:
             return _past_rollforward_msg(when, "schedule_reminder")
-        r = reminders.schedule(tenant_id=tenant_id, user_id=user_id,
-                               title=title, trigger_at=when)
-        return f"ok:scheduled:{r.id} | {r.title} | {_fmt(r.trigger_at)}"
+        try:
+            r = reminders.schedule(tenant_id=tenant_id, user_id=user_id,
+                                   title=title, trigger_at=when,
+                                   recurrence_rule=rrule or None)
+        except ValueError as exc:
+            # R2 Claude MINOR: исчерпанная серия (COUNT/UNTIL целиком в прошлом) -
+            # честный текст, а не «нужен формат» (правило-то разобрано)
+            if "no future occurrences" in str(exc):
+                return ("Все повторения этого правила уже в прошлом - уточни, "
+                        "с какого момента ставить.")
+            # сервис валидирует RRULE через rrulestr (fail-closed, не молча разовое)
+            return f"Не разобрала правило повтора: {rrule!r}. Нужен формат FREQ=…"
+        # R2 Claude MAJOR: для повтора с прошедшим стартом РЕАЛЬНОЕ срабатывание -
+        # next_trigger_at (сервис сдвинул по правилу); рендер trigger_at пересказал
+        # бы юзеру время, в которое ничего не прозвенит (класс «ложный успех»).
+        _when_shown = getattr(r, "next_trigger_at", None) or r.trigger_at
+        _rec = f" | повтор: {rrule}" if rrule else ""
+        return f"ok:scheduled:{r.id} | {r.title} | {_fmt(_when_shown)}{_rec}"
 
     @tool
     def update_reminder(reminder_ref: str, title: str = "", trigger_iso: str = "") -> str:
@@ -2763,8 +2893,25 @@ def _build_graph(llm: Any, all_tools: list, *,
             # детерм. домена → classify_domains дал скоуп) directive=None by design (строго безопаснее: не
             # подмешиваем подсказку мимо LLM-выбранного скоупа). Потенц. follow-up — директива по classified.
             _sec = None
+            _recur = None  # #333: «повторяющееся напоминание → передай recurrence_rule»
             if eff == "task":
                 _text = _last_human_text(state["messages"])
+                # #333: НЕЗАВИСИМО от доменной директивы — «кажд»+«напомн» в тексте =
+                # повторяющееся напоминание. Фредди без хинта отказывает «могу только
+                # однократное» (прод 2026-07-10 user_tg_755682022; probe 0/5 FREQ=HOURLY),
+                # хотя schedule_reminder умеет RRULE. Ортогонален _sec (домен).
+                # ГЕЙТ (R1 Claude MAJOR-5): урок #285-канарейки («не советуй незабинженный
+                # тул») применим только к ЛЕГАСИ #221 — там write вне allowed РЕАЛЬНО
+                # вырезан из набора. На unified _apply_unified_policy биндит ЛЮБОЙ write
+                # (вне яруса (а) — кандидатом под confirm), schedule_reminder всегда
+                # доступен → глушить хинт не нужно, иначе фикс #333 гаснет ровно на
+                # прод-пути (неимперативное «хочу чтобы каждый час…» даёт allowed_write=∅).
+                from sreda.runtime.react_preflight import _recurrence_hint
+                _recur = _recurrence_hint(_text)
+                if (_recur is not None and not state.get("unified_execute")
+                        and state.get("router_allowed_write_domains") is not None
+                        and "reminders" not in set(state.get("router_allowed_write_domains") or [])):
+                    _recur = None  # легаси #221: reminders вырезан из набора — не советуем
                 if state.get("router_allowed_read_domains") is not None:
                     from sreda.runtime.react_preflight import route_domains
                     _rr = route_domains(_text)
@@ -2801,7 +2948,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
                 if time_tail_line:
                     _msgs = _append_time_tail(_msgs, time_tail_line)
-                _tail = [d for d in (nudge, _avail, _sec, _stale) if d]
+                _tail = [d for d in (nudge, _avail, _sec, _recur, _stale) if d]  # #333: _recur после _sec
                 if _tail:
                     _directive = "\n\n".join(_tail)
                     # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
@@ -2818,6 +2965,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                     sp = f"{sp}\n\n{nudge}"
                 if _sec:
                     sp = f"{sp}\n\n{_sec}"
+                if _recur:  # #333: легаси-ветка (#247 OFF) — симметрично _sec
+                    sp = f"{sp}\n\n{_recur}"
                 # #194: компакция истории как prompt-view. OFF → [SystemMessage(sp), *messages] (как было).
                 # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
@@ -4223,9 +4372,14 @@ async def handle_turn(
                     # #319 sticky-by-use: ПРОШЛЫЙ ход записал в память (renewal в run_tools) → серия
                     # продолжается без confirm. Consume из _pre_vals (снап ДО хода); _init выше сбросил
                     # канал — ход докажет запись заново. Граница по смыслу (факт записи), не по времени.
+                    # #338 R5: открытый ход = write-инструмент прошлого хода исполнен
+                    # (журнал; финальный текст агента не анализируется) → policy наследует
+                    # при ответе юзера без самостоятельной темы.
+                    _pod = frozenset(_prev_open_domains(_pre_vals.get("messages")))
                     _upol = compute_unified_policy(
                         user_text, _rd285(user_text),
-                        sticky_memory_write=bool(_pre_vals.get("sticky_memory_write")))
+                        sticky_memory_write=bool(_pre_vals.get("sticky_memory_write")),
+                        prev_open_domains=_pod)
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
