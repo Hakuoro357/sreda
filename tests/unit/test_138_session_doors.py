@@ -15,6 +15,13 @@ queue). Ревью — дисциплина; owner-bar #138 требует МЕ�
 проверены Ф2-картой (plans/138-f2-remainder-map.md) + 5 раундами трио-ревью
 Ф5-5b/5c; красный здесь = «появилась НОВАЯ неклассифицированная дверь».
 
+Ложный красный на ЧУЖОМ Session/create_engine/ConnectionPool из не-БД библиотеки
+(напр. requests.Session) — ОЖИДАЕМ, fail-red by design (R2-353 субагент MINOR):
+классифицируй такую строку с причиной «не-БД примитив», НЕ ослабляй сканер.
+Generic-имена sqlalchemy ловятся только через явный импорт (basename-fallback снят) —
+requests.Session() сейчас НЕ триггерит; отличительные имена (get_session_factory,
+ConnectionPool) — и по фолбэку.
+
 Скоуп — src/sreda ЭТОГО репозитория (R1-353 субагент MINOR, осознанное решение):
 sreda-private-features (грузится тем же процессом) не сканируется — там 3 сырых
 двери в EDS-скриптах (cron_poll/manual_poll/manual_deliver_outbox), но EDS retired
@@ -45,6 +52,13 @@ _TRACKED_IMPORTS: dict[tuple[str, str], str] = {
     ("sqlalchemy.orm", "sessionmaker"): "sessionmaker",
     ("sqlalchemy.orm", "Session"): "Session",
     ("sqlalchemy", "create_engine"): "create_engine",
+    # R2-353 (субагент MAJOR): сырые driver-соединения мимо SQLAlchemy И швов
+    ("psycopg_pool", "ConnectionPool"): "raw-conn",
+    ("psycopg_pool", "AsyncConnectionPool"): "raw-conn",
+    ("psycopg", "connect"): "raw-conn",
+    ("psycopg2", "connect"): "raw-conn",
+    ("asyncpg", "connect"): "raw-conn",
+    ("asyncpg", "create_pool"): "raw-conn",
 }
 
 #: Fallback по голому имени — ТОЛЬКО отличительные sreda-имена (коллизии
@@ -59,6 +73,8 @@ _BARE_FALLBACK: dict[str, str] = {
     "get_maintenance_engine": "engine",
     "get_identity_engine": "engine",
     "get_session": "dep-provider",
+    "ConnectionPool": "raw-conn",  # отличительно (psycopg_pool)
+    "AsyncConnectionPool": "raw-conn",
 }
 
 #: Шов сам — единственное место, где примитивы легитимно определяются/используются.
@@ -294,6 +310,14 @@ _ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
         (1,
          "advisory-lock движок поллера: session-scoped pg_advisory_lock, "
          "таблиц не читает (Ф2-карта: telegram_long_poll:165)"
+         ),
+    ('runtime/graph.py', '_build_postgres_checkpointer', 'raw-conn'):
+        (1,
+         "легаси plan-execute PostgresSaver-чекпоинтер (psycopg_pool.ConnectionPool "
+         "мимо SQLAlchemy): за opt-in langgraph_persistence (default OFF, Codex "
+         "CRITICAL 2026-05-26); таблицы LangGraph — СВОИ, вне tenant-RLS, изоляцию не "
+         "рвут. Ф5-чеклист флипа: при включённом opt-in под sreda_app saver.setup() "
+         "может упасть на грантах (таблицы вне Alembic/0078-0082) — проверить на репетиции"
          ),
 }
 
