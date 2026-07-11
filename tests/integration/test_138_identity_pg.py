@@ -264,6 +264,63 @@ def test_setconfig_reemitted_per_transaction(engines):
         app2.dispose()
 
 
+def test_real_engine_scopes_handler_sequence(engines, monkeypatch):
+    """#353: усиление re-emit-теста (Codex high R5 MINOR). Прошлый тест вешал
+    слушатель вручную → прошёл бы, даже если регистрацию на get_engine() убрать.
+    Здесь — РЕАЛЬНЫЙ путь: env DSN → get_engine() (сам регистрирует begin-слушатель)
+    → get_session_factory → handler-последовательность: операция под ctx →
+    ВНУТРЕННИЙ commit (как persist_*) → следующий стейтмент ре-скоуплен →
+    reset ctx → fail-closed 0 строк."""
+    from sreda.config.settings import get_settings
+    from sreda.db import session as dbs
+
+    monkeypatch.setenv("SREDA_DATABASE_URL", _DSN_APP)
+    get_settings.cache_clear()
+    dbs.get_engine.cache_clear()
+    dbs.get_session_factory.cache_clear()
+    dbs._factory_for.cache_clear()
+    dbs._build_role_engine.cache_clear()
+    try:
+        tok = dbs.tenant_ctx.set(T_A)
+        try:
+            s = dbs.get_session_factory()()
+            try:
+                # txn1: своя строка users видна и обновляется (p_users_tenant)
+                n = s.execute(text(
+                    "UPDATE users SET last_bot_key='doors_test' WHERE tenant_id=:t"
+                ), {"t": T_A}).rowcount
+                assert n == 1, "под ctx своя строка должна обновляться"
+                s.commit()  # внутренний commit — как в persist_*
+                # txn2 (после commit): begin-слушатель обязан РЕ-эмитить set_config
+                seen = s.execute(text(
+                    "SELECT count(*) FROM users WHERE tenant_id = :t"
+                ), {"t": T_A}).scalar()
+                assert seen == 1, (
+                    "GUC не ре-эмитился после внутреннего commit — "
+                    "handler-хвост сломался бы после флипа"
+                )
+                s.commit()
+            finally:
+                s.close()
+        finally:
+            dbs.tenant_ctx.reset(tok)
+        # после reset — fail-closed: без ctx 0 строк
+        s2 = dbs.get_session_factory()()
+        try:
+            assert s2.execute(text("SELECT count(*) FROM users")).scalar() == 0, (
+                "без tenant_ctx app-роль должна видеть 0 строк (fail-closed)"
+            )
+        finally:
+            s2.close()
+    finally:
+        # вернуть глобальные кеши в исходное (не отравить другие тесты)
+        get_settings.cache_clear()
+        dbs.get_engine.cache_clear()
+        dbs.get_session_factory.cache_clear()
+        dbs._factory_for.cache_clear()
+        dbs._build_role_engine.cache_clear()
+
+
 def test_existing_user_path_roles(engines):
     """#138 Ф5-5c: операции обслуживания СУЩЕСТВУЮЩЕГО юзера проходят под нужными
     ролями (после флипа DSN). app+ctx: UPDATE users own (last_bot_key). maintenance
