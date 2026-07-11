@@ -14,6 +14,12 @@ queue). Ревью — дисциплина; owner-bar #138 требует МЕ�
 Это drift-гейт, не доказательство корректности записей: сами классификации
 проверены Ф2-картой (plans/138-f2-remainder-map.md) + 5 раундами трио-ревью
 Ф5-5b/5c; красный здесь = «появилась НОВАЯ неклассифицированная дверь».
+
+Скоуп — src/sreda ЭТОГО репозитория (R1-353 субагент MINOR, осознанное решение):
+sreda-private-features (грузится тем же процессом) не сканируется — там 3 сырых
+двери в EDS-скриптах (cron_poll/manual_poll/manual_deliver_outbox), но EDS retired
+(#181), энтрипойнты мёртвые, systemd-юниты не запускаются. При реанимации
+private-features-фич — расширить rglob на установленный пакет.
 """
 from __future__ import annotations
 
@@ -103,14 +109,18 @@ def _scan_doors() -> dict[tuple[str, str, str], int]:
                     if aliases.get(iname or "") == "engine":
                         bump(rel, stack, f"engine.{fn.attr}")
                 # Depends(get_session/get_db_session) — роут на сырой сессии;
-                # и позиционная, и keyword-форма (dependency=...)
+                # позиционная, keyword- (dependency=...) и Attribute-форма
+                # (deps.get_session) — R1-353 субагент MINOR.
                 if name == "Depends":
                     dep_args = list(node.args) + [kw.value for kw in node.keywords]
                     for arg in dep_args:
-                        if isinstance(arg, ast.Name) and arg.id in (
-                            "get_session", "get_db_session",
-                        ):
-                            bump(rel, stack, f"Depends({arg.id})")
+                        aname = (
+                            arg.id if isinstance(arg, ast.Name)
+                            else arg.attr if isinstance(arg, ast.Attribute)
+                            else None
+                        )
+                        if aname in ("get_session", "get_db_session"):
+                            bump(rel, stack, f"Depends({aname})")
             for child in ast.iter_child_nodes(node):
                 visit(child, new_stack)
 
