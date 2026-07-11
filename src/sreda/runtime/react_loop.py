@@ -1411,6 +1411,70 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
 _CONFIRM_DECLINED_TEXT = "Хорошо, не делаю."
 
 
+# #338/#349/#350: слот-исходы, структурно продолжающие серию (время не названо /
+# конец повторения не назван). Единый источник для наследования, окна гейта и
+# одноразовости вопроса о конце.
+_SERIES_SLOT_KINDS = frozenset({"time_not_specified", "recurrence_end_not_specified"})
+
+
+def _recurrence_end_already_asked(messages: Any) -> bool:
+    """#350: в текущей слот-серии УЖЕ был вопрос о конце повторения? Тогда второй
+    раз не мучаем: правило без COUNT/UNTIL после заданного вопроса ставится как
+    есть (юзер ответил неявно/«бессрочно»).
+
+    R1-ревью (два MAJOR того же класса, что #349): (а) в сегментах выше решает
+    ПОСЛЕДНИЙ исход write-инструмента напоминаний - ok закрывает серию (слот,
+    поднятый и закрытый в одном ходе, НЕ считается «уже спрашивали» для новой
+    серии); (б) ТЕКУЩИЙ сегмент (после последнего HumanMessage) тоже сканируется:
+    слот конца + ask_human-ответ ПОСЛЕ него = вопрос задан и ответ получен
+    (resume без нового HumanMessage) - иначе повторный гейт после ответа юзера
+    и ложное «поставила» (класс #288)."""
+    msgs = list(messages or [])
+    last_h = -1
+    for i in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[i], HumanMessage):
+            last_h = i
+            break
+    if last_h < 0:
+        return False
+
+    def _is_reminder_write(m: Any) -> bool:
+        name = _TOOL_NAME_ALIASES.get(getattr(m, "name", ""), getattr(m, "name", ""))
+        return (isinstance(m, ToolMessage)
+                and name in ("schedule_reminder", "update_reminder")
+                and isinstance(getattr(m, "artifact", None), dict))
+
+    # (б) текущий сегмент: слот конца, за которым следует ask_human-ответ
+    cur = msgs[last_h + 1:]
+    for j, m in enumerate(cur):
+        if _is_reminder_write(m) and m.artifact.get("result_kind") == "recurrence_end_not_specified":
+            if any(isinstance(x, ToolMessage) and getattr(x, "name", "") == "ask_human"
+                   for x in cur[j + 1:]):
+                return True
+    # (а) сегменты выше: последний исход write-инструмента напоминаний решает
+    hi = last_h
+    while hi > 0:
+        prev_h = -1
+        for i in range(hi - 1, -1, -1):
+            if isinstance(msgs[i], HumanMessage):
+                prev_h = i
+                break
+        if prev_h < 0:
+            return False
+        _last_kind = None
+        for m in reversed(msgs[prev_h + 1:hi]):
+            if _is_reminder_write(m):
+                _last_kind = m.artifact.get("result_kind")
+                break
+        if _last_kind == "recurrence_end_not_specified":
+            return True
+        if _last_kind in _SERIES_SLOT_KINDS:  # time-слот - серия продолжается выше
+            hi = prev_h
+            continue
+        return False  # ok/None/прочее = серия закрыта или её нет
+    return False
+
+
 def _prev_open_domains(messages: Any) -> set:
     """#338 R6: область НЕЗАКРЫТОГО СЛОТА прошлого хода агента. Наследование в ярус
     (а) - ТОЛЬКО когда прошлый ход структурно запросил продолжение: write-инструмент
@@ -1432,7 +1496,7 @@ def _prev_open_domains(messages: Any) -> set:
     if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
         return set()
     from sreda.services.tool_schemas.families import TOOL_OP_CLASS, tool_write_domains
-    _SLOT_KINDS = frozenset({"time_not_specified"})
+    _SLOT_KINDS = _SERIES_SLOT_KINDS
     # R7 Codex high: слот считается открытым по ПОСЛЕДНЕМУ исходу write-инструмента
     # домена (слот → уточнение → ok В ТОМ ЖЕ ходе = слот ЗАКРЫТ; идём с конца,
     # первый встреченный исход по домену = последний хронологически, прочие игнор)
@@ -2090,7 +2154,7 @@ def _turn_time_window_text(messages: Any) -> str:
                     and isinstance(getattr(m, "artifact", None), dict)):
                 _last_kind = m.artifact.get("result_kind")
                 break
-        if _last_kind != "time_not_specified":
+        if _last_kind not in _SERIES_SLOT_KINDS:
             break
         parts.append(_human_window(prev_h))
         # R1-ревью #349 (MINOR): ask_human-ответы раннего сегмента - те же слова
@@ -3248,6 +3312,26 @@ def _build_graph(llm: Any, all_tools: list, *,
                                  "«во сколько?» одним коротким вопросом"),
                         name=tc["name"], tool_call_id=tc["id"],
                         artifact={"result_kind": "time_not_specified"}))
+                    continue
+            # #350: конец повторения — СТРУКТУРНЫЙ слот (решение владельца «конец
+            # обязателен к уточнению» переносится из промпт-хинта #333 в диспатч, как
+            # гейт времени #180: хинт «сперва спроси» оставлял серию БЕЗ слот-исхода в
+            # журнале → цепочка окна #349/наследование #338 не сцеплялись → «3 раза»
+            # приходило в ход без времени → деградация, прод 2026-07-11 13:30).
+            # ОДИН раз на серию: вопрос уже задавали → правило без COUNT/UNTIL ставится
+            # как есть (юзер ответил неявно/«бессрочно» — не мучаем повтором).
+            if name == "schedule_reminder":
+                _rr350 = str((tc_args or {}).get("recurrence_rule") or "").strip().upper()
+                _has_end350 = bool(re.search(r"COUNT=0*[1-9]", _rr350)
+                                   or re.search(r"UNTIL=[0-9]", _rr350))
+                if (_rr350 and not _has_end350
+                        and not _recurrence_end_already_asked(state["messages"])):
+                    out.append(ToolMessage(
+                        content=("конец повторения не назван — спроси одним коротким "
+                                 "вопросом: «до какого времени повторять или сколько "
+                                 "раз?», потом ставь с ;COUNT=N или ;UNTIL=…"),
+                        name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "recurrence_end_not_specified"}))
                     continue
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
