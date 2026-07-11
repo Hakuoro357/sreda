@@ -220,6 +220,22 @@ class OutboxMessage(Base):
     # (без ключа) НЕ ограничены — аддитивно, ничего из легаси не схлопывается.
     idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
+    # #344 F5 — atomic-claim lease (аддитивно, миграция 0083). claim НЕ вводит
+    # новых ЗНАЧЕНИЙ status: строка остаётся 'pending' во время lease. Воркер
+    # клеймит строку атомарным UPDATE (claim_token = свой токен, lease_expires_at =
+    # now+lease) и коммитит ДО доставки → второй воркер не выберет claimed-строку
+    # (фильтр `claim_token IS NULL OR lease_expires_at < now`). Терминальные статусы
+    # (sent/failed/muted/dropped) claim игнорируют. СТАРЫЙ воркер (после отката)
+    # эти поля не читает и доставляет 'pending' как раньше → rollback-safe (§4).
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # NB: индекс объявлен в __table_args__ как ЧАСТИЧНЫЙ с ЯВНЫМ именем, совпадающим
+    # с миграцией 0083 (ix_outbox_lease_expires_at). Без index=True на колонке — иначе
+    # create_all создал бы второй, НЕчастичный индекс с другим именем (расхождение
+    # metadata↔alembic, autogenerate-churn; R1 MINOR).
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (
         Index(
             "uq_outbox_idempotency_key",
@@ -227,6 +243,16 @@ class OutboxMessage(Base):
             unique=True,
             postgresql_where=sa_text("idempotency_key IS NOT NULL"),
             sqlite_where=sa_text("idempotency_key IS NOT NULL"),
+        ),
+        # Предикат включает status='pending' (R2 MINOR): терминальные строки
+        # (sent/failed/muted/dropped) со стухшим lease НЕ попадают в индекс, даже
+        # если claim-поля на них не очистили → partial-index не пухнет доставленными.
+        # Совпадает с фильтром claim-скана (status='pending' AND lease_expires_at<now).
+        Index(
+            "ix_outbox_lease_expires_at",
+            "lease_expires_at",
+            postgresql_where=sa_text("lease_expires_at IS NOT NULL AND status = 'pending'"),
+            sqlite_where=sa_text("lease_expires_at IS NOT NULL AND status = 'pending'"),
         ),
     )
 

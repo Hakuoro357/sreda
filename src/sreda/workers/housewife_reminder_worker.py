@@ -97,6 +97,32 @@ class HousewifeReminderWorker:
                             reminder_id, tenant_id,
                         )
                         continue
+                    # #344 F5 fencing: reminder мог быть advance'нут другим воркером
+                    # или прошлым тиком МЕЖДУ scan (due_now) и этим действием. due_now
+                    # держал FOR UPDATE SKIP LOCKED только в scan-сессии — здесь строку
+                    # не лочим, поэтому перепроверяем due/status по СВЕЖЕМУ состоянию:
+                    #  - status != 'pending' (уже финализирован другим воркером) → skip;
+                    #  - next_trigger_at в БУДУЩЕМ (advance'нут в след. эскалацию/итерацию)
+                    #    → ещё не due → skip.
+                    # Без этого late-grace видит future-триггер как «не просрочено» и
+                    # фаерит преждевременно (двойной fire/advance). Двойную ДОСТАВКУ того
+                    # же fire держит idempotency_key — здесь про fencing, не про delivery.
+                    if reminder.status != "pending":
+                        logger.info(
+                            "reminder %s: status=%s (не pending) между scan и действием — "
+                            "fencing skip", reminder_id, reminder.status,
+                        )
+                        continue
+                    _ntt = reminder.next_trigger_at
+                    if _ntt is not None:
+                        if _ntt.tzinfo is None:
+                            _ntt = _ntt.replace(tzinfo=timezone.utc)
+                        if _ntt > current:
+                            logger.info(
+                                "reminder %s: next_trigger_at в будущем (advance'нут) — "
+                                "fencing skip без fire", reminder_id,
+                            )
+                            continue
                     service = HousewifeReminderService(s)
                     # 2026-04-23 «баг 2b»: если напоминание просрочено больше
                     # чем LATE_FIRE_GRACE_MINUTES — закрываем silently без

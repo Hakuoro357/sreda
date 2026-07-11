@@ -562,9 +562,15 @@ class HousewifeReminderService:
             .order_by(FamilyReminder.next_trigger_at.asc())
             .limit(limit)
         )
-        # #163 Фаза 4 — FOR UPDATE SKIP LOCKED (только PG): при будущей многопроцессности второй
-        # воркер пропустит уже залоченные due-строки → нет двойного пика/двойной постановки. Лок
-        # держится до commit тика (после mark_fired). SQLite не поддерживает — без лока (1 воркер).
+        # #163 Фаза 4 — FOR UPDATE SKIP LOCKED (только PG): при многопроцессности снижает
+        # шанс, что два воркера снимут ОДИН due-снимок в один момент. ВАЖНО (субагент-ревью
+        # #344): после #138 Ф2 scan идёт в отдельной `privileged_session("monitor")`, которая
+        # ЗАКРЫВАЕТСЯ сразу после `due_now` (reminder_worker: снимаем только id) → лок
+        # SKIP LOCKED отпускается ДО обработки/`mark_fired`, а НЕ держится «до commit тика».
+        # Поэтому корректность НЕ на локе: двойной-фаер безопасен фактически за счёт
+        # (1) fencing re-check status/next_trigger_at после scan (#344), (2) idempotency_key
+        # доставки + partial-unique, (3) детерминированного advance в единый next_trigger_at.
+        # НЕ убирать эти guard'ы, полагаясь на лок. SQLite не поддерживает — без лока (1 воркер).
         # #187 R1 MAJOR — ``of=FamilyReminder``: после добавления producer-JOIN на Tenant голый
         # FOR UPDATE лочил бы И строки tenants. На PG со SKIP LOCKED это привело бы к ложным
         # пропускам due-напоминаний из-за лока tenant-ряда (общего у многих напоминаний). ``of=``
