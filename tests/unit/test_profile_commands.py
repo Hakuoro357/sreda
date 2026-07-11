@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sreda.config.settings import get_settings
@@ -118,6 +119,14 @@ def test_profile_show_creates_profile_and_renders(monkeypatch, tmp_path: Path) -
 
 def test_quiet_hours_set_and_clear(monkeypatch, tmp_path: Path) -> None:
     session = _bootstrap(monkeypatch, tmp_path, "p2.db")
+    # Заморозка часов доставки: подтверждения тут non-interactive
+    # (inbound_message_id=None), поэтому после записи окна 22-8 второе
+    # подтверждение уходит в defer, если тест запущен ночью по МСК
+    # (wall-clock зависимость). 09:00 UTC = 12:00 MSK — вне окна.
+    monkeypatch.setattr(
+        "sreda.runtime.graph._utcnow",
+        lambda: datetime(2026, 1, 15, 9, 0, tzinfo=UTC),
+    )
     try:
         telegram = FakeTelegramClient()
         service = ActionRuntimeService(session, telegram_client=telegram)
