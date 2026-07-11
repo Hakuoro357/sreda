@@ -47,7 +47,7 @@ def _log() -> ExecutionLog:
 
 
 def _capture_invoke(captured: dict):
-    def _invoke(runnable: Any, messages: list, *, timeout_seconds: float) -> Any:
+    def _invoke(runnable: Any, messages: list, *, timeout_seconds: float, **kwargs: Any) -> Any:  # noqa: ARG001 - #343 добавил provider= в вызов; мок принимает и игнорирует
         captured["messages"] = messages
         return _FakeAIMessage("ок")
     return _invoke
