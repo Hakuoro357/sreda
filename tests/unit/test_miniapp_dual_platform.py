@@ -134,8 +134,10 @@ def test_max_invalid_init_data_returns_401(db_session, monkeypatch):
     assert exc.value.detail == "invalid_init_data"
 
 
-def test_max_chat_id_refreshed_on_change(db_session, monkeypatch):
-    """Если max_chat_id в initData != stored → update + commit (codex R1 #4)."""
+def test_max_chat_id_not_overwritten_when_established(db_session, monkeypatch):
+    """#341 (Codex R-codex MAJOR D): mini-app НЕ перезаписывает УЖЕ
+    установленный max_chat_id (инверсия прежнего refresh-on-change). Смена
+    established привязки — только через аутентифицированный consume_link."""
     from sreda.api.routes import miniapp as mi
 
     monkeypatch.setattr(
@@ -147,16 +149,44 @@ def test_max_chat_id_refreshed_on_change(db_session, monkeypatch):
         lambda: MagicMock(max_bot_token="MAX_TOK"),
     )
 
-    ctx = mi._require_miniapp_auth(
+    mi._require_miniapp_auth(
         request=_make_request(platform="max"),
         background_tasks=BackgroundTasks(),
         session=db_session,
     )
 
-    # Re-fetch user — chat_id обновился
+    # Re-fetch user — established chat_id НЕ изменился (был "22").
     db_session.expire_all()
     user = db_session.get(User, "user_max_111")
-    assert user.max_chat_id == "99_NEW"
+    assert user.max_chat_id == "22"
+
+
+def test_max_chat_id_first_set_when_empty(db_session, monkeypatch):
+    """#341: mini-app first-set — когда max_chat_id NULL/пусто, ставит значение
+    из HMAC-валидированного initData (легит. первичная установка)."""
+    from sreda.api.routes import miniapp as mi
+
+    user = db_session.get(User, "user_max_111")
+    user.max_chat_id = None
+    db_session.commit()
+
+    monkeypatch.setattr(
+        mi, "validate_max_init_data",
+        lambda *a, **k: _mock_max_user(chat_id="55_FIRST"),
+    )
+    monkeypatch.setattr(
+        "sreda.api.routes.miniapp.get_settings",
+        lambda: MagicMock(max_bot_token="MAX_TOK"),
+    )
+
+    mi._require_miniapp_auth(
+        request=_make_request(platform="max"),
+        background_tasks=BackgroundTasks(),
+        session=db_session,
+    )
+
+    db_session.expire_all()
+    assert db_session.get(User, "user_max_111").max_chat_id == "55_FIRST"
 
 
 def test_max_lazy_provision_for_new_user(db_session, monkeypatch):

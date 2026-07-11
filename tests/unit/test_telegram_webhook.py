@@ -26,6 +26,20 @@ from sreda.services.secure_storage import load_secure_json
 EXISTING_CHAT_ID = "100000003"
 NEW_USER_CHAT_ID = "100000004"
 
+# #341: webhook-роут монтируется ТОЛЬКО в webhook-режиме (bot_token+webhook_url).
+# Эти тесты бьют по /webhooks/telegram/* → армируем webhook-режим.
+WEBHOOK_URL = "https://bot.test.local/webhooks/telegram/sreda"
+WEBHOOK_SECRET = "wh-secret-tg-341"
+WEBHOOK_HEADERS = {"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET}
+
+
+def _arm_webhook_mode(monkeypatch, *, secret: str = WEBHOOK_SECRET) -> None:
+    """webhook-режим: bot_token+webhook_url (чтобы роут смонтировался) + secret
+    (иначе deployed→401). #341."""
+    monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", secret)
+
 
 def _mark_existing_user_welcome_sent(session) -> None:
     """Test fixture helper for existing approved users.
@@ -82,6 +96,7 @@ def test_telegram_webhook_persists_sanitized_and_encrypted_payload(
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
 
+    _arm_webhook_mode(monkeypatch)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -118,7 +133,9 @@ def test_telegram_webhook_persists_sanitized_and_encrypted_payload(
         },
     }
 
-    response = client.post("/webhooks/telegram/sreda", json=payload)
+    response = client.post(
+        "/webhooks/telegram/sreda", json=payload, headers=WEBHOOK_HEADERS,
+    )
 
     assert response.status_code == 202
     body = response.json()
@@ -260,6 +277,7 @@ def test_telegram_webhook_handles_status_command(
     monkeypatch.setattr(TelegramClient, "send_message", fake_send_message)
     _allow_housewife_entitlement(monkeypatch)
 
+    _arm_webhook_mode(monkeypatch)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -296,7 +314,9 @@ def test_telegram_webhook_handles_status_command(
         },
     }
 
-    response = client.post("/webhooks/telegram/sreda", json=payload)
+    response = client.post(
+        "/webhooks/telegram/sreda", json=payload, headers=WEBHOOK_HEADERS,
+    )
 
     from sreda.services.ack_messages import all_phrases
 
@@ -360,6 +380,7 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
     monkeypatch.setattr(TelegramClient, "send_message", failing_send_message)
     _allow_housewife_entitlement(monkeypatch)
 
+    _arm_webhook_mode(monkeypatch)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -399,7 +420,9 @@ def test_telegram_webhook_returns_202_when_telegram_delivery_times_out(
         },
     }
 
-    response = client.post("/webhooks/telegram/sreda", json=payload)
+    response = client.post(
+        "/webhooks/telegram/sreda", json=payload, headers=WEBHOOK_HEADERS,
+    )
 
     assert response.status_code == 202
     # The webhook returns 202 immediately (202-first), then processes in a
@@ -433,6 +456,7 @@ def test_telegram_webhook_rejects_request_without_secret_token_header(
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "expected-secret")
 
+    _arm_webhook_mode(monkeypatch, secret="expected-secret")
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -469,6 +493,7 @@ def test_telegram_webhook_rejects_request_with_wrong_secret_token(
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "expected-secret")
 
+    _arm_webhook_mode(monkeypatch, secret="expected-secret")
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -495,6 +520,7 @@ def test_telegram_webhook_accepts_request_with_matching_secret_token(
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "expected-secret")
 
+    _arm_webhook_mode(monkeypatch, secret="expected-secret")
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -587,6 +613,7 @@ def test_telegram_webhook_accepts_known_bot_key_sreda(
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
 
+    _arm_webhook_mode(monkeypatch)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -617,7 +644,9 @@ def test_telegram_webhook_accepts_known_bot_key_sreda(
         },
     }
 
-    response = client.post("/webhooks/telegram/sreda", json=payload)
+    response = client.post(
+        "/webhooks/telegram/sreda", json=payload, headers=WEBHOOK_HEADERS,
+    )
 
     # 202 means the known bot_key was accepted and ingest ran.
     assert response.status_code == 202
@@ -634,6 +663,7 @@ def test_telegram_webhook_accepts_sreda_home_when_configured(
     monkeypatch.setenv("SREDA_ENCRYPTION_KEY", key)
     monkeypatch.setenv("SREDA_HOME_BOT_TOKEN", "home-test-token-xyz")
 
+    _arm_webhook_mode(monkeypatch)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -664,7 +694,9 @@ def test_telegram_webhook_accepts_sreda_home_when_configured(
         },
     }
 
-    response = client.post("/webhooks/telegram/sreda_home", json=payload)
+    response = client.post(
+        "/webhooks/telegram/sreda_home", json=payload, headers=WEBHOOK_HEADERS,
+    )
 
     # 202 means 'sreda_home' resolved in the registry and ingest ran.
     assert response.status_code == 202
@@ -722,6 +754,7 @@ def test_telegram_webhook_rate_limits_excess_requests(
     monkeypatch.setenv("SREDA_RATE_LIMIT_TELEGRAM_MAX_REQUESTS", "2")
     monkeypatch.setenv("SREDA_RATE_LIMIT_TELEGRAM_WINDOW_SECONDS", "60")
 
+    _arm_webhook_mode(monkeypatch)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()

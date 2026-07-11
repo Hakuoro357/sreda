@@ -158,3 +158,41 @@ def test_main_with_force_webhook_mode_bypasses_guard(capsys):
     assert rc == 1
     captured = capsys.readouterr()
     assert "SREDA_TELEGRAM_BOT_TOKEN" in captured.err
+
+
+def test_main_refuses_without_telegram_webhook_url(capsys):
+    """#341: webhook-режим требует SREDA_TELEGRAM_WEBHOOK_URL — без него
+    setWebhook НЕ вызывается (иначе route-гейт остался бы permissive)."""
+    with _patch_active_pollers([]):
+        with patch("sys.argv", ["restore_webhook"]):
+            with patch.object(_rw, "get_settings") as mock_settings:
+                mock_settings.return_value.telegram_bot_token = "TG_TOK"
+                mock_settings.return_value.telegram_webhook_url = None
+                mock_settings.return_value.telegram_webhook_secret_token = "secret"
+                with patch.object(_rw.httpx, "post") as mock_post:
+                    rc = _rw.main()
+
+    assert rc == 1
+    assert not mock_post.called, "setWebhook НЕ должен вызываться без webhook_url"
+    captured = capsys.readouterr()
+    assert "SREDA_TELEGRAM_WEBHOOK_URL" in captured.err
+
+
+def test_main_refuses_with_whitespace_secret(capsys):
+    """#341: пробельный secret трактуется как отсутствующий → setWebhook не
+    вызывается (иначе зарегистрировали бы webhook с пустым секретом = fail-open)."""
+    with _patch_active_pollers([]):
+        with patch("sys.argv", ["restore_webhook"]):
+            with patch.object(_rw, "get_settings") as mock_settings:
+                mock_settings.return_value.telegram_bot_token = "TG_TOK"
+                mock_settings.return_value.telegram_webhook_url = (
+                    "https://bot.test.local/webhooks/telegram/sreda"
+                )
+                mock_settings.return_value.telegram_webhook_secret_token = "   "
+                with patch.object(_rw.httpx, "post") as mock_post:
+                    rc = _rw.main()
+
+    assert rc == 1
+    assert not mock_post.called
+    captured = capsys.readouterr()
+    assert "SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN" in captured.err
